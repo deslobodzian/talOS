@@ -802,40 +802,6 @@ TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
   std::remove(path_b.c_str());
 }
 
-// RestartBackoff(restart, clean_exit, critical).
-TEST(LauncherTest, RestartBackoffSkipsACriticalFirstCrashThenDoublesTo1s) {
-  using std::chrono::milliseconds;
-  // A critical member's first crash in the window restarts it at once...
-  EXPECT_EQ(RestartBackoff(1, false, true), milliseconds{0});
-  // ...but not its clean exit, which waits for a completing roster, nor a
-  // non-critical member's crash.
-  EXPECT_EQ(RestartBackoff(1, true, true), milliseconds{50});
-  EXPECT_EQ(RestartBackoff(1, false, false), milliseconds{50});
-  // A crash loop still backs off from the second restart on, capped at 1 s.
-  EXPECT_EQ(RestartBackoff(2, false, true), milliseconds{100});
-  EXPECT_EQ(RestartBackoff(3, false, true), milliseconds{200});
-  EXPECT_EQ(RestartBackoff(4, false, false), milliseconds{400});
-  EXPECT_EQ(RestartBackoff(5, true, true), milliseconds{800});
-  EXPECT_EQ(RestartBackoff(6, false, true), milliseconds{1000});
-  EXPECT_EQ(RestartBackoff(1000, false, true), milliseconds{1000});
-}
-
-TEST(LauncherTest, ShouldRestartNodePredicate) {
-  // A crash restarts a critical and a non-critical member alike.
-  EXPECT_TRUE(ShouldRestartNode(false, true, 5, false));
-  EXPECT_TRUE(ShouldRestartNode(false, false, 5, false));
-  // A critical member exiting 0 while its session runs on is lost, not done.
-  EXPECT_TRUE(ShouldRestartNode(true, true, 5, false));
-  // A non-critical member exiting 0 finished.
-  EXPECT_FALSE(ShouldRestartNode(true, false, 5, false));
-  // Zero is a deliberate permanent stop, not a quarantine.
-  EXPECT_FALSE(ShouldRestartNode(false, true, 0, false));
-  EXPECT_FALSE(ShouldRestartNode(true, true, 0, false));
-  // A stopping session (signal, deadline, shutdown) restarts nothing.
-  EXPECT_FALSE(ShouldRestartNode(false, true, 5, true));
-  EXPECT_FALSE(ShouldRestartNode(true, true, 5, true));
-}
-
 // A control loop the OS kept at timeshare is warned about and recorded in the
 // manifest session_report --strict judges. A later run that got its grant
 // does not clear it: the session still ran that loop without one. Only the

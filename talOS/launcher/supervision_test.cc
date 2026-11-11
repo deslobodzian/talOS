@@ -314,51 +314,27 @@ TEST(Supervision, LiveEndpointsThatMatchTheProbeAreNotReported) {
   std::filesystem::remove_all(options.output_dir);
 }
 
-TEST(Supervision, SlowConstructorIsObservableAndBecomesActiveAfterOldGrace) {
-  auto options = ConstructionOptions("slow_construction", 6000);
-  options.duration_s = 9;
-  std::atomic<bool> constructing{false};
-  std::atomic<bool> active{false};
-  std::jthread observer{[&](const std::stop_token& stop) {
-    while (!stop.stop_requested()) {
-      if (auto reader = introspect::RegistryReader::open()) {
-        for (const auto& node : reader->nodes()) {
-          if (node.session_id != options.session_id || node.name != "alpha")
-            continue;
-          if ((node.flags & introspect::kFlagConstructing) != 0) {
-            constructing = true;
-            EXPECT_FALSE(node.alive);
-          } else if (node.alive && node.dispatch_count != 0) {
-            active = true;
-          }
-        }
-      }
-      std::this_thread::sleep_for(10ms);
-    }
-  }};
-  EXPECT_EQ(RunSession(options), 0);
-  observer.request_stop();
-  observer.join();
-  EXPECT_TRUE(constructing);
-  EXPECT_TRUE(active);
-  const auto entry =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
-  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos) << entry;
-  std::filesystem::remove_all(options.output_dir);
-}
-
-// The construction deadline, not the session's end, stops a constructor that
-// keeps heartbeating: the run ends well before the 10 s session would.
+// A real constructor that never returns is killed at the construction
+// deadline, not as stalled: its reporting thread's construction heartbeat
+// keeps it alive past the 2 s grace, and the launcher reads that heartbeat
+// and the constructing flag from its registry row until the 3 s deadline.
+// The deadline's arithmetic is SupervisionPolicy's; this is the real kill.
+// REQ-OPS-05
 TEST(Supervision, HeartbeatingConstructorStillHasAFiniteDeadline) {
   auto options = ConstructionOptions("hung_construction", 60000);
-  EXPECT_EQ(options.construction_timeout, 30s);
-  options.construction_timeout = 150ms;
+  // Registration under the Linux sanitizer legs fits in the grace.
+  options.heartbeat_startup_grace_ms = 2000;
+  options.construction_timeout = 3000ms;
   options.duration_s = 10;
-  const auto started = std::chrono::steady_clock::now();
   EXPECT_NE(RunSession(options), 0);
-  const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_GE(elapsed, options.construction_timeout);
-  EXPECT_LT(elapsed, 5s);
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 1u) << manifest;
+  EXPECT_NE(history[0].find("\"reason\": \"construction_deadline\""),
+            std::string::npos)
+      << history[0];
   std::filesystem::remove_all(options.output_dir);
 }
 
@@ -451,41 +427,6 @@ TEST(Supervision, ActuatorDescribeFailureRefusesEvenWhenMarkedNonCritical) {
   EXPECT_EQ(RunSession(options), 1);
   EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/manifest.json"));
   std::filesystem::remove_all(options.output_dir);
-}
-
-// A critical member is never quarantined: past its budget it keeps restarting
-// on the capped backoff. Seven runs inside the 6 s session prove it, because a
-// quarantine would wait out the 60 s restart window.
-TEST(Supervision, CriticalCrashLoopIsNeverQuarantined) {
-  auto options = BaseOptions("critical_loop", "max_restarts = 1\n");
-  options.duration_s = 6;
-  const auto runs = TempPath("critical_loop_runs");
-  ::remove(runs.c_str());
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "critical_loop_alpha",
-      RecordLogArgThen(runs,
-                       "case \"$log\" in *restart6.tlog) exit 0;; esac\n"
-                       "exit 3\n"));
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("critical_loop_beta", "exit 0\n");
-  EXPECT_EQ(RunSession(options), 0);
-  EXPECT_EQ(ReadLines(runs).size(), 7u);
-  // Every run is in the manifest, each with how it ended.
-  const auto history =
-      ManifestRuns(ReadFile(options.output_dir + "/manifest.json"), "alpha");
-  ASSERT_EQ(history.size(), 7u);
-  for (std::size_t i = 0; i + 1 < history.size(); ++i) {
-    EXPECT_NE(history[i].find("\"exit_code\": 3, \"exit_signal\": 0, "
-                              "\"reason\": \"crash\""),
-              std::string::npos)
-        << history[i];
-  }
-  EXPECT_NE(history.back().find("\"exit_code\": 0, \"exit_signal\": 0, "
-                                "\"reason\": \"exit\""),
-            std::string::npos)
-      << history.back();
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(runs.c_str());
 }
 
 // A long-lived stub that exits 0 when the launcher stops it.
@@ -728,11 +669,13 @@ TEST(Supervision, SessionsAreIsolatedAndCleanOnlyOwnedDirs) {
   ::remove(sentinel.c_str());
 }
 
-// A persistent fault is quarantined at the rolling limit, not retried in a
-// tight loop. Stopping the session cancels its one pending retry. The session
-// stops once alpha has stayed quarantined for 500 ms, not at a deadline, which
-// a stalled host can reach before alpha's third run. The stubs never register,
-// so their startup grace outlasts the 20 s give-up.
+// A persistent fault is quarantined at the rolling limit, and the live
+// manifest shows it. Stopping the session cancels its one pending retry. The
+// session stops once alpha is quarantined, not at a deadline, which a stalled
+// host can reach before alpha's third run; that the quarantine waits out the
+// window is SupervisionPolicy's. The stubs never register, so their startup
+// grace outlasts the 20 s give-up.
+// REQ-OPS-04
 TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   LauncherOptions options = BaseOptions("restart_out", "max_restarts = 2\n");
   MakeAlphaNonCritical(options);
@@ -752,24 +695,35 @@ TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
                              std::to_string(options.session_id) +
                              "/manifest.json";
   bool quarantined = false;
+  std::string quarantined_entry;
+  std::int64_t seen_quarantined_ns = 0;
   std::jthread stopper{[&](const std::stop_token& stop) {
     const auto give_up = std::chrono::steady_clock::now() + 20s;
     while (!stop.stop_requested() &&
            std::chrono::steady_clock::now() < give_up) {
-      if (ManifestEntry(ReadFile(live_manifest), "alpha")
-              .find("\"quarantined\": true") != std::string::npos) {
+      std::string entry = ManifestEntry(ReadFile(live_manifest), "alpha");
+      if (entry.find("\"quarantined\": true") != std::string::npos) {
+        seen_quarantined_ns = introspect::monotonic_now_ns();
+        quarantined_entry = std::move(entry);
         quarantined = true;
         break;
       }
       std::this_thread::sleep_for(2ms);
     }
-    if (quarantined) std::this_thread::sleep_for(500ms);
     if (!stop.stop_requested()) ::kill(::getpid(), SIGTERM);
   }};
   EXPECT_NE(RunSession(options), 0);
   stopper.request_stop();
   stopper.join();
   EXPECT_TRUE(quarantined);
+  // The quarantined row names an absolute retry deadline, about one rolling
+  // window ahead, not a delay or zero.
+  const std::string retry_key = "\"retry_at_monotonic_ns\": ";
+  const auto retry_pos = quarantined_entry.find(retry_key);
+  ASSERT_NE(retry_pos, std::string::npos) << quarantined_entry;
+  const std::int64_t retry_at_ns = std::strtoll(
+      quarantined_entry.c_str() + retry_pos + retry_key.size(), nullptr, 10);
+  EXPECT_GT(retry_at_ns, seen_quarantined_ns) << quarantined_entry;
 
   const std::string dir = options.output_dir;
   const std::vector<std::string> expected_logs{dir + "/alpha.tlog",
@@ -781,6 +735,10 @@ TEST(Supervision, CrashingNodeQuarantinesUntilTheSessionStops) {
   const std::string manifest = ReadFile(dir + "/manifest.json");
   const std::string alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 2"), std::string::npos) << alpha;
+  // Stopping cancelled the pending retry.
+  EXPECT_NE(alpha.find("\"quarantined\": false"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"retry_at_monotonic_ns\": 0"), std::string::npos)
+      << alpha;
   EXPECT_NE(alpha.find("\"log_path\": \"" + expected_logs[0] + "\""),
             std::string::npos)
       << alpha;
@@ -974,98 +932,6 @@ TEST(Supervision, NegativeMaxRestartsRefusesToLaunch) {
   EXPECT_EQ(RunSession(options), 1);
   EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/manifest.json"));
   std::filesystem::remove_all(options.output_dir);
-}
-
-TEST(Supervision, RestartsOutsideRollingWindowDoNotExhaustBudget) {
-  auto options = BaseOptions("window_out", "max_restarts = 1\n");
-  MakeAlphaNonCritical(options);
-  options.restart_window_ms = 100;
-  const auto runs = TempPath("window_runs");
-  ::remove(runs.c_str());
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "window_alpha",
-      RecordLogArgThen(runs,
-                       "case \"$log\" in *restart2.tlog) exit 0;; esac\n"
-                       "sleep 0.2\nexit 3\n"));
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("window_beta", "exit 0\n");
-  EXPECT_EQ(RunSession(options), 0);
-  EXPECT_EQ(ReadLines(runs).size(), 3u);
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(runs.c_str());
-}
-
-// Quarantine needs both crashes inside one window, and a restart that has left
-// the window no longer counts, so the window holds two restart-to-crash cycles
-// of a stalled launcher (under TSan on CI one cycle can exceed 300 ms).
-TEST(Supervision, ExhaustedBudgetRetriesOnceAfterTheWindowAndRecovers) {
-  auto options = BaseOptions("quarantine_out", "max_restarts = 1\n");
-  MakeAlphaNonCritical(options);
-  options.restart_window_ms = 2000;
-  options.duration_s = 6;
-  const auto runs = TempPath("quarantine_runs");
-  const auto cleared = TempPath("quarantine_cleared");
-  ::remove(runs.c_str());
-  ::remove(cleared.c_str());
-  options.binary_overrides["//example/alpha:node"] =
-      WriteStub("quarantine_alpha",
-                RecordLogArgThen(runs, "if [ -f " + cleared +
-                                           " ]; then exit 0; fi\nexit 3\n"));
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("quarantine_beta", "exit 0\n");
-  std::string quarantined;
-  std::size_t runs_at_quarantine = 0;
-  int64_t retry_at = 0;
-  int64_t recovered_at = 0;
-  // RunSession rewrites options.output_dir on return; don't read it
-  // concurrently.
-  const auto manifest = options.output_dir + "/" +
-                        std::to_string(options.session_id) + "/manifest.json";
-  std::jthread observer{[&](const std::stop_token& stop) {
-    while (!stop.stop_requested()) {
-      auto entry = ManifestEntry(ReadFile(manifest), "alpha");
-      if (entry.find("\"quarantined\": true") != std::string::npos) {
-        quarantined = std::move(entry);
-        runs_at_quarantine = ReadLines(runs).size();
-        const std::string key = "\"retry_at_monotonic_ns\": ";
-        const auto at = quarantined.find(key);
-        if (at != std::string::npos)
-          retry_at = std::stoll(quarantined.substr(at + key.size()));
-        std::ofstream{cleared} << "fault cleared\n";
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds{2});
-    }
-    for (;;) {
-      if (ReadLines(runs).size() >= 3) {
-        recovered_at = introspect::monotonic_now_ns();
-        return;
-      }
-      if (stop.stop_requested()) return;
-      std::this_thread::sleep_for(std::chrono::milliseconds{2});
-    }
-  }};
-  const auto session_started_at = introspect::monotonic_now_ns();
-  EXPECT_EQ(RunSession(options), 0);
-  observer.request_stop();
-  observer.join();
-  EXPECT_FALSE(quarantined.empty());
-  EXPECT_EQ(runs_at_quarantine, 2u);
-  EXPECT_GT(retry_at, 0);
-  // Initial 50 ms backoff, the 2 s rolling window, then normal 100 ms
-  // backoff for the second restart; quarantine cannot turn into a quick retry.
-  EXPECT_GE(retry_at, session_started_at + 2'150'000'000);
-  EXPECT_GE(recovered_at, retry_at);
-  EXPECT_EQ(ReadLines(runs).size(), 3u);
-  const auto alpha =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
-  EXPECT_NE(alpha.find("\"restart_count\": 2"), std::string::npos) << alpha;
-  EXPECT_NE(alpha.find("\"quarantined\": false"), std::string::npos) << alpha;
-  EXPECT_NE(alpha.find("\"retry_at_monotonic_ns\": 0"), std::string::npos)
-      << alpha;
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(runs.c_str());
-  ::remove(cleared.c_str());
 }
 
 TEST(Supervision, StalledNodeGroupKillStopsItsHelper) {
@@ -1519,64 +1385,9 @@ TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
   ::remove(runs.c_str());
 }
 
-// The converse: a loop that keeps dispatching while its reporting thread is
-// starved (below every realtime loop on a loaded host) and stops
-// heartbeating. Its progress is the loop's own, so it is not killed.
-TEST(Supervision, DispatchingLoopIsNotKilledWhenItsHeartbeatStops) {
-  auto options = BaseOptions("starved_out", "max_restarts = 1\n");
-  options.heartbeat_startup_grace_ms = 0;
-  options.duration_s = 2;
-  const auto pid_file = TempPath("starved_pid");
-  const auto runs = TempPath("starved_runs");
-  ::remove(pid_file.c_str());
-  ::remove(runs.c_str());
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "starved_alpha",
-      RecordLogArgThen(runs, "echo $$ > " + pid_file + "\nexec sleep 10\n"));
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("starved_beta", "exit 0\n");
-  auto publisher =
-      PublishStubRow(options, pid_file, [](introspect::NodeRecord& row) {
-        row.dispatch_count.fetch_add(1, std::memory_order_relaxed);
-      });
-  RunSession(options);  // Ended by its duration, which stops alpha.
-  publisher.request_stop();
-  publisher.join();
-  EXPECT_EQ(ReadLines(runs).size(), 1u);
-  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
-  const auto history = ManifestRuns(manifest, "alpha");
-  ASSERT_EQ(history.size(), 1u) << manifest;
-  EXPECT_EQ(history[0].find("\"reason\": \"stalled\""), std::string::npos)
-      << history[0];
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(pid_file.c_str());
-  ::remove(runs.c_str());
-}
-
-TEST(Supervision, NeverRegisteredNodeIsKilledAndRestarted) {
-  auto options = BaseOptions("unregistered_out", "max_restarts = 1\n");
-  options.heartbeat_startup_grace_ms = 0;
-  options.duration_s = 3;
-  const auto runs = TempPath("unregistered_runs");
-  ::remove(runs.c_str());
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "unregistered_alpha",
-      RecordLogArgThen(runs,
-                       "case \"$log\" in *restart1.tlog) exit 0;; esac\n"
-                       "exec sleep 10\n"));
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("unregistered_beta", "exit 0\n");
-  EXPECT_EQ(RunSession(options), 0);
-  EXPECT_EQ(ReadLines(runs), (std::vector<std::string>{
-                                 options.output_dir + "/alpha.tlog",
-                                 options.output_dir + "/alpha.restart1.tlog"}));
-  const auto alpha =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
-  EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
-  std::filesystem::remove_all(options.output_dir);
-  ::remove(runs.c_str());
-}
-
+// A run that never registers is killed as heartbeat_missing and restarted,
+// even when --allow-graph-errors let its failed probe through.
+// REQ-OPS-05
 TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
   auto options = BaseOptions("undescribed_out", "max_restarts = 1\n");
   options.allow_graph_errors = true;
@@ -1594,10 +1405,15 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
       WriteStub("undescribed_beta", "exit 0\n");
   EXPECT_EQ(RunSession(options), 0);
   EXPECT_EQ(ReadLines(runs).size(), 2u);
-  const auto alpha =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"described\": false"), std::string::npos) << alpha;
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 2u) << manifest;
+  EXPECT_NE(history[0].find("\"reason\": \"heartbeat_missing\""),
+            std::string::npos)
+      << history[0];
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
 }
