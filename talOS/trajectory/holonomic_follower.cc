@@ -49,18 +49,24 @@ void HolonomicFollower::reset() {
 }
 
 double HolonomicFollower::Axis::update(const PidGains& gains, double error,
-                                       double dt_s) {
-  double derivative = 0;
-  if (dt_s > 0) {
-    if (gains.ki > 0) {
-      integral += error * dt_s;
-      // Anti-windup: hold the integral term within its limit.
-      const double limit = gains.integral_limit / gains.ki;
-      integral = std::clamp(integral, -limit, limit);
-    }
-    if (has_previous) derivative = (error - previous_error) / dt_s;
+                                       double dt_s, bool angular) {
+  if (dt_s > 0 && gains.ki > 0) {
+    integral += error * dt_s;
+    // Anti-windup: hold the integral term within its limit.
+    const double limit = gains.integral_limit / gains.ki;
+    integral = std::clamp(integral, -limit, limit);
+  }
+  pending_dt_s += dt_s;
+  if (!has_previous) {
     previous_error = error;
+    pending_dt_s = 0;
     has_previous = true;
+  } else if (pending_dt_s >= kMinDerivativePeriod_s) {
+    const double change =
+        angular ? WrapAngle(error - previous_error) : error - previous_error;
+    derivative = change / pending_dt_s;
+    previous_error = error;
+    pending_dt_s = 0;
   }
   return gains.kp * error + gains.ki * integral + gains.kd * derivative;
 }
@@ -85,12 +91,12 @@ FollowerOutput HolonomicFollower::step(const Trajectory& trajectory, double t_s,
       WrapAngle(out.reference.heading_rad - measured_heading_rad);
 
   double vx_mps = out.reference.vx_mps +
-                  x_.update(config_.translation, out.x_error_m, dt_s);
+                  x_.update(config_.translation, out.x_error_m, dt_s, false);
   double vy_mps = out.reference.vy_mps +
-                  y_.update(config_.translation, out.y_error_m, dt_s);
+                  y_.update(config_.translation, out.y_error_m, dt_s, false);
   const double omega_radps =
       out.reference.omega_radps +
-      heading_.update(config_.heading, out.heading_error_rad, dt_s);
+      heading_.update(config_.heading, out.heading_error_rad, dt_s, true);
 
   // Scale, not clip per axis, so the command keeps its direction.
   const double speed_mps = std::hypot(vx_mps, vy_mps);

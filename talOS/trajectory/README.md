@@ -4,8 +4,7 @@ Time-indexed holonomic trajectories, a loader for [Choreo](https://choreo.autos)
 `.traj` files, alliance flips, and `HolonomicFollower`, which turns a
 trajectory and a measured pose into a chassis speed. A library beside the node
 stack: it depends on `talOS/geometry` and `@nlohmann_json` only, never on
-`talOS/node` or a robot. Requirements: REQ-RT-06 for the per-tick calls;
-path following itself has no catalogued requirement yet (TODO.md SCOPE-3).
+`talOS/node` or a robot. REQ-RT-06 covers the per-tick calls.
 
 ```cpp
 #include "talOS/trajectory/choreo.h"
@@ -38,8 +37,9 @@ omega_radps, ax_mps2, ay_mps2, alpha_radps2}` with `pose()` as a
 | `sample(t_s)` | the state at `t_s`; at or before the first sample's time (or NaN) the first sample, at or after the total time the last |
 | `total_time_s()`, `initial_sample()`, `final_sample()`, `initial_pose()`, `final_pose()` | ends of the path |
 | `events()` | event markers (`{name, t_s}`) in time order |
-| `events_between(after_s, until_s)` | markers with `after_s < t_s <= until_s`: pass the previous and current elapsed time each tick and each marker is seen once |
-| `split_count()`, `split_starts()`, `split(i)` | Choreo splits; `split(i)` is segment `i` re-timed to start at 0, with its markers |
+| `EventCursor::advance(trajectory, t_s)` | fires markers: the first call after construction or `reset()` returns every marker at or before `t_s` (one at 0.0 fires on the first tick), each later call those after the previous call's up to `t_s`; it counts markers, so none is skipped or repeated |
+| `split_count()`, `split_starts()`, `split(i)` | Choreo splits; `split(i)` is segment `i` re-timed to start at 0 with the markers from its start up to, not including, its end (the last segment also keeps one at its end), so a marker on a boundary is in the later segment only and fires once when the segments run in turn |
+| `reserve(n)`, `assign(samples, interpolation)` | rebuild in place for a trajectory made inside `update()`: `assign()` validates like the constructor (unchanged on a throw), clears markers and splits, and allocates nothing while `samples.size() <= capacity()` |
 | `flipped(flip, field)`, `Flip(sample/pose, flip, field)` | the other alliance's path |
 
 Interpolation between stored samples:
@@ -50,16 +50,16 @@ Interpolation between stored samples:
   `heading` with `omega`, `alpha`), `vx = a.vx + a.ax tau`, accelerations
   copied. A Choreo solve obeys this model, so it lands on the next sample; a
   file that does not (hand-edited, rounded) can step at a sample, as it
-  does in ChoreoLib (`ChoreoTest.SamplesAsChoreoLibDoes`).
+  does in ChoreoLib (`TrajectoryTest.ConstantAccelerationSamplingIsExact`).
 - `kHermite` (no accelerations; not something Choreo writes): cubic Hermite
   on positions and velocities, heading taken the short way to the next
   sample; accelerations are its second derivative.
 
 Storage is allocated when the trajectory is built. `sample()`,
-`events_between()`, `Flip(sample)` and `HolonomicFollower::step()` never
-allocate (`no_allocation_test`), so they belong in `update()`; loading,
-`split()` and `flipped()` allocate and belong in the constructor or on a mode
-change.
+`EventCursor::advance()`, `Flip(sample)`, `HolonomicFollower::step()` and
+`assign()` within `reserve()` never allocate (`no_allocation_test`), so they
+belong in `update()`; loading, the constructor, `split()` and `flipped()`
+allocate and belong in the node's constructor or on a mode change.
 
 ## Alliance flip
 
@@ -80,7 +80,20 @@ returns the original (rotate: heading plus 2 pi).
 `LoadChoreoFile(path)` and `ParseChoreo(json, source)` return a `LoadResult`:
 `trajectory` and `ok()`, or an empty trajectory and `error`, a message that
 starts with the file name and names the JSON location
-(`auto/two_piece.traj: trajectory.samples[3]: missing "vx"`). They never throw.
+(`auto/two_piece.traj: trajectory.samples[3]: missing "vx"`). They never throw
+or crash on malformed input, however deep or large: an error never echoes a
+JSON value, only its type or the first 64 bytes of a string, so a node that
+logs it on every restart cannot be taken down by its own file.
+
+Plausibility: a sample with `|x|` or `|y|` above 100 m (`kMaxCoordinate_m`),
+a time outside 0 to 3600 s (`kMaxTime_s`), or a time not after the previous
+sample's is refused, naming the sample.
+
+Accelerations: interpolation is `kConstantAcceleration` only when every
+sample has `ax`, `ay` and `alpha`. If any sample lacks one, the whole file
+is interpolated with `kHermite`, and `LoadResult::note` says so, naming the
+first such sample, for the node to log. `note` is empty for a file Choreo
+wrote.
 
 Versions: `version` is an integer; 1 (Choreo v2025.0.x), 2 (v2026.0.0-beta-1)
 and 3 (v2026.0.0 to v2026.0.3 and current) are accepted
@@ -135,8 +148,12 @@ struct (`drivetrain::ChassisTarget`), and
 and `heading_tolerance_rad` of the final pose) and `valid` (false, with zero
 speeds and the controller state untouched, when the time, period or pose is
 not finite). The integral is held within `integral_limit` (output units); 0
-turns it off. The derivative uses the error difference over `dt_s`, starting
-from the second step. `reset()` clears both when a trajectory starts or the
+turns it off. The derivative is the change in error since it was last taken
+(the heading's wrapped, so crossing +-pi is not a 2 pi step) over the time
+since then; while that time is under `kMinDerivativePeriod_s` (1 ms) it holds
+its last value, so a near-zero `dt_s` cannot turn noise into a huge command.
+The first step after construction or `reset()` only records the error.
+`reset()` clears the integral and derivative when a trajectory starts or the
 robot was disabled. The constructor throws `std::invalid_argument` naming a
 negative or non-finite gain, limit or tolerance. Same inputs, same outputs:
 the follower is plain arithmetic, with no clock or global state.
@@ -154,14 +171,18 @@ const std::filesystem::path file =
     node.param<std::string>("trajectory", "trajectories/two_piece.traj");
 auto loaded = talos::trajectory::LoadChoreoFile(file);
 if (!loaded) throw std::invalid_argument(loaded.error);   // constructor
-trajectory_ = red ? loaded.trajectory.flipped(kRotate, field)
+if (!loaded.note.empty()) log(loaded.note);
+const auto& game = talos::trajectory::kField2026;
+trajectory_ = red ? loaded.trajectory.flipped(game.flip, game.field)
                   : std::move(loaded.trajectory);
 ```
 
-Load and flip in the constructor (or once when the alliance is known), then
-per tick: `follower.step(...)`, send the speeds on the drivetrain's `auto`
-lane, fire `events_between(previous, elapsed)` markers, and `release()` the
-lane once `finished`. The trajectory library does no actuation gating: the
+Load and flip in the constructor (or once when the alliance is known). When
+the trajectory starts, `follower.reset()` and `cursor.reset()`; then per
+tick: `follower.step(...)`, send the speeds on the drivetrain's `auto` lane,
+act on each marker in `cursor.advance(trajectory_, elapsed_s)`, and
+`release()` the lane once `finished`. A trajectory built from the live pose
+inside `update()` uses `reserve()` once and `assign()` per rebuild. The trajectory library does no actuation gating: the
 drivetrain's `Target` and `robot_enabled` still decide whether anything moves.
 
 A bundle does not carry trajectory files: `tools/sync_manifest.py` does not
@@ -173,6 +194,6 @@ does not use this library (TODO.md TRAJ-1).
 `bazel test //talOS/trajectory:all`. `testdata/choreo_v3_swerve.traj` is
 Choreo's own output (trimmed); the rest are generated: `curve.traj` (version
 3) a half circle sampled from an analytic path with a continuous heading
-past pi, `splits_events.traj` (version 2) two exact constant-acceleration
-segments with a split and waypoint-anchored events, `hermite_line.traj`
-(version 1) a constant-velocity line without accelerations.
+past pi (the follower's path), `splits_events.traj` (version 2) two
+constant-acceleration segments with a split and waypoint-anchored events
+(the allocation test's).

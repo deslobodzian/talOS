@@ -64,6 +64,11 @@ struct FollowerOutput {
 
 class HolonomicFollower {
  public:
+  // The D term differentiates over at least this long: a step whose time
+  // since the last derivative update is shorter holds the last derivative
+  // (a near-zero dt would otherwise turn noise into a huge command).
+  static constexpr double kMinDerivativePeriod_s = 1e-3;
+
   // Throws std::invalid_argument naming the field when a gain, limit or
   // tolerance is negative or not finite, or a maximum speed is zero.
   explicit HolonomicFollower(const FollowerConfig& config = {});
@@ -73,8 +78,12 @@ class HolonomicFollower {
   void reset();
 
   // One control step at `t_s` along `trajectory`, with the pose measured now
-  // and `dt_s` since the previous step (integral and derivative terms use it;
-  // 0 skips them). Deterministic; no allocation.
+  // and `dt_s` since the previous step. The integral accumulates error * dt_s.
+  // The derivative is the change in error (the heading's wrapped, so crossing
+  // +-pi is not a 2 pi step) over the time since it was last taken, held
+  // while that time is under kMinDerivativePeriod_s; the first step after
+  // construction or reset() only records the error. Deterministic; no
+  // allocation.
   FollowerOutput step(const Trajectory& trajectory, double t_s,
                       const geometry::SE2<double>& measured, double dt_s,
                       SpeedsFrame frame);
@@ -98,9 +107,14 @@ class HolonomicFollower {
   struct Axis {
     double integral = 0;
     double previous_error = 0;
+    double pending_dt_s = 0;  // time since previous_error was taken
+    double derivative = 0;    // held between updates of the D term
     bool has_previous = false;
 
-    double update(const PidGains& gains, double error, double dt_s);
+    // `angular`: the error is an angle, so its change is wrapped before it
+    // is differentiated.
+    double update(const PidGains& gains, double error, double dt_s,
+                  bool angular);
   };
 
   FollowerConfig config_;

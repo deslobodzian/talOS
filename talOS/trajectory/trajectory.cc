@@ -130,6 +130,37 @@ geometry::SE2<double> Flip(const geometry::SE2<double>& pose, AllianceFlip flip,
   return Flip(sample, flip, field).pose();
 }
 
+namespace {
+
+// Throws std::invalid_argument naming the first sample that sample() could
+// not interpolate.
+void ValidateSamples(std::span<const TrajectorySample> samples) {
+  if (samples.empty()) {
+    throw std::invalid_argument("trajectory has no samples");
+  }
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    const TrajectorySample& s = samples[i];
+    if (!Finite(s)) {
+      throw std::invalid_argument("trajectory sample " + std::to_string(i) +
+                                  " has a non-finite value");
+    }
+    if (s.t_s < 0 || (i > 0 && s.t_s <= samples[i - 1].t_s)) {
+      throw std::invalid_argument("trajectory sample " + std::to_string(i) +
+                                  " time is negative or not increasing");
+    }
+  }
+}
+
+void ZeroAccelerations(std::span<TrajectorySample> samples) {
+  for (TrajectorySample& s : samples) {
+    s.ax_mps2 = 0;
+    s.ay_mps2 = 0;
+    s.alpha_radps2 = 0;
+  }
+}
+
+}  // namespace
+
 Trajectory::Trajectory(std::vector<TrajectorySample> samples,
                        Interpolation interpolation,
                        std::vector<EventMarker> events,
@@ -138,25 +169,8 @@ Trajectory::Trajectory(std::vector<TrajectorySample> samples,
       events_(std::move(events)),
       split_starts_(std::move(split_starts)),
       interpolation_(interpolation) {
-  if (samples_.empty()) {
-    throw std::invalid_argument("trajectory has no samples");
-  }
-  for (std::size_t i = 0; i < samples_.size(); ++i) {
-    const TrajectorySample& s = samples_[i];
-    if (!Finite(s)) {
-      throw std::invalid_argument("trajectory sample " + std::to_string(i) +
-                                  " has a non-finite value");
-    }
-    if (s.t_s < 0 || (i > 0 && s.t_s <= samples_[i - 1].t_s)) {
-      throw std::invalid_argument("trajectory sample " + std::to_string(i) +
-                                  " time is negative or not increasing");
-    }
-    if (interpolation_ == Interpolation::kHermite) {
-      samples_[i].ax_mps2 = 0;
-      samples_[i].ay_mps2 = 0;
-      samples_[i].alpha_radps2 = 0;
-    }
-  }
+  ValidateSamples(samples_);
+  if (interpolation_ == Interpolation::kHermite) ZeroAccelerations(samples_);
   if (split_starts_.empty() || split_starts_.front() != 0) {
     split_starts_.insert(split_starts_.begin(), 0);
   }
@@ -177,6 +191,21 @@ Trajectory::Trajectory(std::vector<TrajectorySample> samples,
   std::stable_sort(
       events_.begin(), events_.end(),
       [](const EventMarker& a, const EventMarker& b) { return a.t_s < b.t_s; });
+}
+
+void Trajectory::reserve(std::size_t sample_count) {
+  samples_.reserve(sample_count);
+  split_starts_.reserve(1);
+}
+
+void Trajectory::assign(std::span<const TrajectorySample> samples,
+                        Interpolation interpolation) {
+  ValidateSamples(samples);
+  samples_.assign(samples.begin(), samples.end());
+  interpolation_ = interpolation;
+  if (interpolation_ == Interpolation::kHermite) ZeroAccelerations(samples_);
+  events_.clear();
+  split_starts_.assign(1, 0);
 }
 
 double Trajectory::total_time_s() const {
@@ -215,14 +244,16 @@ geometry::SE2<double> Trajectory::final_pose() const {
   return final_sample().pose();
 }
 
-std::span<const EventMarker> Trajectory::events_between(double after_s,
-                                                        double until_s) const {
-  const auto by_time = [](double t, const EventMarker& e) { return t < e.t_s; };
-  const auto first =
-      std::upper_bound(events_.begin(), events_.end(), after_s, by_time);
-  const auto last =
-      std::upper_bound(events_.begin(), events_.end(), until_s, by_time);
-  if (last <= first) return {};
+std::span<const EventMarker> EventCursor::advance(const Trajectory& trajectory,
+                                                  double t_s) {
+  const std::span<const EventMarker> events = trajectory.events();
+  next_ = std::min(next_, events.size());
+  if (std::isnan(t_s)) return {};
+  const auto first = events.begin() + static_cast<std::ptrdiff_t>(next_);
+  const auto last = std::upper_bound(
+      first, events.end(), t_s,
+      [](double t, const EventMarker& e) { return t < e.t_s; });
+  next_ = static_cast<std::size_t>(last - events.begin());
   return {first, last};
 }
 
@@ -241,9 +272,11 @@ Trajectory Trajectory::split(std::size_t index) const {
       samples_.begin() + static_cast<std::ptrdiff_t>(begin),
       samples_.begin() + static_cast<std::ptrdiff_t>(end) + 1);
   for (TrajectorySample& s : samples) s.t_s -= start_s;
+  const bool last_segment = index + 1 == split_starts_.size();
   std::vector<EventMarker> events;
   for (const EventMarker& e : events_) {
-    if (e.t_s >= start_s && e.t_s <= end_s) {
+    if (e.t_s >= start_s &&
+        (e.t_s < end_s || (last_segment && e.t_s == end_s))) {
       events.push_back({e.name, e.t_s - start_s});
     }
   }

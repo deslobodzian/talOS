@@ -141,8 +141,8 @@ TEST(HolonomicFollowerTest, IntegralRejectsConstantDrift) {
   EXPECT_TRUE(with_integral.finished);
 }
 
-// One sample: at rest at the origin, facing +x, so the command is all
-// feedback.
+// At rest at the origin for 1 s (two samples, both still), facing
+// `heading_rad`, so the command is all feedback.
 Trajectory AtOrigin(double heading_rad = 0) {
   std::vector<TrajectorySample> samples(2);
   samples[0].heading_rad = heading_rad;
@@ -165,6 +165,109 @@ TEST(HolonomicFollowerTest, ClampsOutput) {
   EXPECT_NEAR(out.speeds.vx_mps, 1.5 * 0.6, 1e-12);
   EXPECT_NEAR(out.speeds.vy_mps, 1.5 * 0.8, 1e-12);
   EXPECT_EQ(out.speeds.omega_radps, -2.0);
+}
+
+struct PidStep {
+  double x_error_m;
+  double heading_error_rad;
+  double dt_s;
+};
+
+struct PidRow {
+  const char* what;
+  PidGains translation;
+  PidGains heading;
+  std::vector<PidStep> steps;
+  double vx_mps;  // after the last step
+  double omega_radps;
+};
+
+std::vector<PidStep> Repeat(PidStep step, int count) {
+  return std::vector<PidStep>(static_cast<std::size_t>(count), step);
+}
+
+std::vector<PidStep> Join(std::vector<PidStep> a,
+                          const std::vector<PidStep>& b) {
+  a.insert(a.end(), b.begin(), b.end());
+  return a;
+}
+
+// Guards: the D term's sign and magnitude (change in error over the time
+// since it was last taken), the heading's D across +-pi (wrapped, no 2 pi
+// step), D held through a near-zero dt, and the integral held at its clamp
+// and unwinding from it at once. Flipping D's sign, dropping the wrap, the
+// minimum period or the clamp each fails a row.
+TEST(HolonomicFollowerTest, PidTermsFromKnownErrors) {
+  const double wrap_step_rad = 2 * std::numbers::pi - 6.2;  // 3.1 -> -3.1
+  const PidRow rows[] = {
+      {"D of a shrinking error opposes it",
+       {.kd = 0.5},
+       {},
+       {{1.0, 0, 0.02}, {0.9, 0, 0.02}},
+       0.5 * (0.9 - 1.0) / 0.02,
+       0},
+      {"D of a growing error follows it",
+       {.kd = 0.5},
+       {},
+       {{0.9, 0, 0.02}, {1.0, 0, 0.02}},
+       0.5 * (1.0 - 0.9) / 0.02,
+       0},
+      {"the first step only records the error",
+       {.kd = 0.5},
+       {},
+       {{1.0, 0, 0.02}},
+       0,
+       0},
+      {"heading D across +-pi is the short change",
+       {},
+       {.kd = 0.5},
+       {{0, 3.1, 0.02}, {0, -3.1, 0.02}},
+       0,
+       0.5 * wrap_step_rad / 0.02},
+      {"a near-zero dt holds the last D",
+       {.kd = 0.5},
+       {},
+       {{1.0, 0, 0.02}, {0.9, 0, 0.02}, {0.5, 0, 1e-6}},
+       0.5 * (0.9 - 1.0) / 0.02,
+       0},
+      {"after a near-zero dt, D spans both steps",
+       {.kd = 0.5},
+       {},
+       {{1.0, 0, 0.02}, {0.9, 0, 0.02}, {0.5, 0, 1e-6}, {0.4, 0, 0.02}},
+       0.5 * (0.4 - 0.9) / (0.02 + 1e-6),
+       0},
+      {"the integral is held at its clamp",
+       {.ki = 1.0, .integral_limit = 0.3},
+       {},
+       Repeat({1.0, 0, 0.02}, 100),
+       0.3,
+       0},
+      {"the integral unwinds from its clamp at once",
+       {.ki = 1.0, .integral_limit = 0.3},
+       {},
+       Join(Repeat({1.0, 0, 0.02}, 100), {{-1.0, 0, 0.02}}),
+       0.3 - 0.02,
+       0},
+  };
+  for (const PidRow& row : rows) {
+    SCOPED_TRACE(row.what);
+    FollowerConfig config;
+    config.translation = row.translation;
+    config.heading = row.heading;
+    config.max_linear_mps = 100;
+    config.max_angular_radps = 100;
+    HolonomicFollower follower(config);
+    const Trajectory trajectory = AtOrigin();
+    FollowerOutput out;
+    for (const PidStep& step : row.steps) {
+      out = follower.step(trajectory, 0.5,
+                          MakePose(-step.x_error_m, 0, -step.heading_error_rad),
+                          step.dt_s, SpeedsFrame::kField);
+    }
+    ASSERT_TRUE(out.valid);
+    EXPECT_NEAR(out.speeds.vx_mps, row.vx_mps, 1e-9);
+    EXPECT_NEAR(out.speeds.omega_radps, row.omega_radps, 1e-9);
+  }
 }
 
 // Guards: robot-relative output is the field command seen from the

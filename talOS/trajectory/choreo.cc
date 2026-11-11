@@ -79,13 +79,31 @@ std::optional<double> OptionalNumber(const Json& object, const char* key,
   return it->get<double>();
 }
 
+// A short description of `value` for an error: a string, quoted and capped
+// at 64 bytes, otherwise its JSON type. Never dump(), which recurses (a
+// deeply nested value overflows the stack) and copies the whole value.
+std::string Describe(const Json& value) {
+  if (!value.is_string()) {
+    return std::string("(a JSON ") + value.type_name() + ")";
+  }
+  constexpr std::size_t kMaxEcho = 64;
+  const auto& text = value.get_ref<const std::string&>();
+  std::string out = "\"" + text.substr(0, kMaxEcho);
+  if (text.size() > kMaxEcho) out += "...";
+  return out + "\"";
+}
+
 void CheckVersion(const Json& root) {
   const std::string supported = std::to_string(kChoreoMinVersion) + " to " +
                                 std::to_string(kChoreoMaxVersion);
   const Json& version = Member(root, "version", "file");
   if (!version.is_number_integer()) {
-    throw FormatError("\"version\" is " + version.dump() +
-                      ", not an integer (supported: " + supported + ")");
+    // type_name(), never dump(): dump() recurses, and a deeply nested or
+    // huge value would overflow the stack or the message.
+    throw FormatError(
+        std::string("\"version\" must be an integer, not ") +
+        (version.is_number() ? "a fraction" : version.type_name()) +
+        " (supported: " + supported + ")");
   }
   const auto major = version.get<std::int64_t>();
   if (major < kChoreoMinVersion || major > kChoreoMaxVersion) {
@@ -98,7 +116,25 @@ void CheckVersion(const Json& root) {
 struct Samples {
   std::vector<TrajectorySample> samples;
   Interpolation interpolation = Interpolation::kConstantAcceleration;
+  std::string note;
 };
+
+void CheckPlausible(const TrajectorySample& sample,
+                    const TrajectorySample* previous,
+                    const std::string& where) {
+  if (!(std::abs(sample.x_m) <= kMaxCoordinate_m &&
+        std::abs(sample.y_m) <= kMaxCoordinate_m)) {
+    throw FormatError(where + ": x or y beyond " +
+                      std::to_string(kMaxCoordinate_m) + " m");
+  }
+  if (!(sample.t_s >= 0 && sample.t_s <= kMaxTime_s)) {
+    throw FormatError(where + ".t: outside 0 to " + std::to_string(kMaxTime_s) +
+                      " s");
+  }
+  if (previous != nullptr && !(sample.t_s > previous->t_s)) {
+    throw FormatError(where + ".t: not after the previous sample's");
+  }
+}
 
 Samples ReadSamples(const Json& trajectory) {
   const Json& samples = Array(trajectory, "samples", "trajectory");
@@ -108,7 +144,8 @@ Samples ReadSamples(const Json& trajectory) {
   }
   Samples out;
   out.samples.reserve(samples.size());
-  bool all_accelerations = true;
+  std::size_t without_accelerations = 0;
+  std::size_t first_without = 0;
   for (std::size_t i = 0; i < samples.size(); ++i) {
     const std::string where = "trajectory.samples[" + std::to_string(i) + "]";
     const Json& s = samples[i];
@@ -128,12 +165,22 @@ Samples ReadSamples(const Json& trajectory) {
       sample.ax_mps2 = *ax;
       sample.ay_mps2 = *ay;
       sample.alpha_radps2 = *alpha;
-    } else {
-      all_accelerations = false;
+    } else if (without_accelerations++ == 0) {
+      first_without = i;
     }
+    CheckPlausible(sample, out.samples.empty() ? nullptr : &out.samples.back(),
+                   where);
     out.samples.push_back(sample);
   }
-  if (!all_accelerations) out.interpolation = Interpolation::kHermite;
+  if (without_accelerations > 0) {
+    out.interpolation = Interpolation::kHermite;
+    out.note = std::to_string(without_accelerations) + " of " +
+               std::to_string(samples.size()) +
+               " samples lack ax/ay/alpha (first: trajectory.samples[" +
+               std::to_string(first_without) +
+               "]): the whole file is interpolated with cubic Hermite, not "
+               "Choreo's constant acceleration";
+  }
   return out;
 }
 
@@ -212,8 +259,8 @@ LoadResult Parse(const Json& root) {
   const Json& trajectory = Object(root, "trajectory", "file");
   if (const auto type = trajectory.find("sampleType");
       type != trajectory.end() && !type->is_null() && *type != "Swerve") {
-    throw FormatError("trajectory.sampleType " + type->dump() +
-                      " is not supported (only \"Swerve\")");
+    throw FormatError("trajectory.sampleType " + Describe(*type) +
+                      " is not supported: holonomic (\"Swerve\") only");
   }
   Samples samples = ReadSamples(trajectory);
   std::vector<std::size_t> splits =
@@ -224,6 +271,7 @@ LoadResult Parse(const Json& root) {
       Trajectory{std::move(samples.samples), samples.interpolation,
                  std::move(events.markers), std::move(splits)};
   result.dropped_event_count = events.dropped;
+  result.note = std::move(samples.note);
   return result;
 }
 

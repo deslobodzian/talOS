@@ -49,8 +49,10 @@ Trajectory AnalyticTrajectory() {
   return Trajectory{samples};
 }
 
-// Guards: sample() between stored samples reproduces Choreo's constant-
-// acceleration motion exactly, position, velocity and acceleration.
+// Guards: sample() between stored samples is ChoreoLib's interpolation:
+// the earlier sample integrated at its constant acceleration, exact for
+// motion that obeys the model, and blind to the next sample when a file
+// does not (a blend toward it would not reproduce ChoreoLib).
 TEST(TrajectoryTest, ConstantAccelerationSamplingIsExact) {
   const Trajectory trajectory = AnalyticTrajectory();
   EXPECT_EQ(trajectory.interpolation(), Interpolation::kConstantAcceleration);
@@ -70,6 +72,14 @@ TEST(TrajectoryTest, ConstantAccelerationSamplingIsExact) {
     EXPECT_DOUBLE_EQ(s.ay_mps2, 0.4);
     EXPECT_DOUBLE_EQ(s.alpha_radps2, -0.3);
   }
+
+  std::vector<TrajectorySample> inconsistent(trajectory.samples().begin(),
+                                             trajectory.samples().end());
+  inconsistent[2].x_m += 5;  // the sample at 1.0 s no longer obeys the model
+  inconsistent[2].vx_mps += 5;
+  const Trajectory edited{inconsistent};
+  EXPECT_NEAR(edited.sample(0.9).x_m, Analytic::X(0.9), 1e-12);
+  EXPECT_NEAR(edited.sample(0.9).vx_mps, Analytic::Vx(0.9), 1e-12);
 }
 
 // Guards: without accelerations, cubic Hermite interpolation is exact for a
@@ -152,7 +162,7 @@ TEST(TrajectoryTest, SampleClampsAtBothEnds) {
   EXPECT_TRUE(empty.empty());
   EXPECT_EQ(empty.total_time_s(), 0.0);
   EXPECT_EQ(empty.sample(1.0).x_m, 0.0);
-  EXPECT_TRUE(empty.events_between(-1, 1).empty());
+  EXPECT_TRUE(EventCursor{}.advance(empty, 1.0).empty());
 }
 
 // Guards: construction refuses input sample() could not interpolate.
@@ -188,9 +198,10 @@ TEST(TrajectoryTest, ConstructorRejectsInvalidInput) {
   EXPECT_EQ(split.split_starts()[0], 0U);
 }
 
-// Guards: markers come back in time order and events_between reports each
-// marker exactly once to a caller stepping through time.
-TEST(TrajectoryTest, EventsAreTimeOrderedAndReportedOnce) {
+// Guards: markers come back in time order, and an EventCursor driven each
+// tick fires every marker exactly once, including one at 0.0 on the first
+// tick and ties together; a cursor that is not reset fires nothing again.
+TEST(TrajectoryTest, EventCursorFiresEachMarkerOnce) {
   std::vector<TrajectorySample> samples(2);
   samples[1].t_s = 3.0;
   const Trajectory trajectory{
@@ -199,25 +210,25 @@ TEST(TrajectoryTest, EventsAreTimeOrderedAndReportedOnce) {
       {{"c", 2.0}, {"a", 0.0}, {"b", 1.0}, {"b2", 1.0}}};
   ASSERT_EQ(trajectory.events().size(), 4U);
   EXPECT_EQ(trajectory.events()[0].name, "a");
-  EXPECT_EQ(trajectory.events()[1].name, "b");
-  EXPECT_EQ(trajectory.events()[2].name, "b2");
   EXPECT_EQ(trajectory.events()[3].name, "c");
 
+  EventCursor cursor;
   std::vector<std::string> fired;
-  double previous_s = -std::numeric_limits<double>::infinity();
   for (int tick = 0; tick <= 200; ++tick) {
-    const double now_s = 0.02 * tick;
-    for (const EventMarker& e : trajectory.events_between(previous_s, now_s)) {
-      fired.push_back(e.name);
+    for (const EventMarker& e : cursor.advance(trajectory, 0.02 * tick)) {
+      fired.push_back(e.name + "@" + std::to_string(tick));
     }
-    previous_s = now_s;
   }
-  EXPECT_EQ(fired, (std::vector<std::string>{"a", "b", "b2", "c"}));
-  EXPECT_TRUE(trajectory.events_between(1.0, 0.5).empty());
-  EXPECT_EQ(trajectory.events_between(0.5, 1.0).size(), 2U);
+  EXPECT_EQ(fired, (std::vector<std::string>{"a@0", "b@50", "b2@50", "c@100"}));
+  EXPECT_TRUE(cursor.advance(trajectory, 10.0).empty());
+  cursor.reset();
+  EXPECT_EQ(cursor.advance(trajectory, 0.0).size(), 1U);
+  EXPECT_TRUE(cursor.advance(trajectory, std::nan("")).empty());
 }
 
-// Guards: split(i) is the i-th segment re-timed to 0, with its markers.
+// Guards: split(i) is the i-th segment re-timed to 0, with its markers; a
+// marker on a split boundary belongs to the later segment only, so running
+// the segments in turn with a cursor fires every marker exactly once.
 TEST(TrajectoryTest, SplitReturnsRetimedSegment) {
   std::vector<TrajectorySample> samples(5);
   for (std::size_t i = 0; i < samples.size(); ++i) {
@@ -226,24 +237,64 @@ TEST(TrajectoryTest, SplitReturnsRetimedSegment) {
   }
   const Trajectory trajectory{samples,
                               Interpolation::kHermite,
-                              {{"in_first", 0.5}, {"in_second", 3.5}},
+                              {{"start", 0.0},
+                               {"in_first", 0.5},
+                               {"boundary", 2.0},
+                               {"in_second", 3.5},
+                               {"end", 4.0}},
                               {0, 2}};
   ASSERT_EQ(trajectory.split_count(), 2U);
   const Trajectory first = trajectory.split(0);
   ASSERT_EQ(first.samples().size(), 3U);
   EXPECT_EQ(first.total_time_s(), 2.0);
   EXPECT_EQ(first.final_sample().x_m, 20.0);
-  ASSERT_EQ(first.events().size(), 1U);
-  EXPECT_EQ(first.events()[0].name, "in_first");
   const Trajectory second = trajectory.split(1);
   ASSERT_EQ(second.samples().size(), 3U);
   EXPECT_EQ(second.initial_sample().t_s, 0.0);
   EXPECT_EQ(second.initial_sample().x_m, 20.0);
   EXPECT_EQ(second.total_time_s(), 2.0);
-  ASSERT_EQ(second.events().size(), 1U);
-  EXPECT_DOUBLE_EQ(second.events()[0].t_s, 1.5);
   EXPECT_EQ(second.interpolation(), Interpolation::kHermite);
   EXPECT_THROW(static_cast<void>(trajectory.split(2)), std::out_of_range);
+
+  std::vector<std::string> fired;
+  for (const Trajectory* segment : {&first, &second}) {
+    EventCursor cursor;
+    for (int tick = 0; tick <= 100; ++tick) {
+      for (const EventMarker& e : cursor.advance(*segment, 0.02 * tick)) {
+        fired.push_back(e.name);
+      }
+    }
+  }
+  EXPECT_EQ(fired, (std::vector<std::string>{"start", "in_first", "boundary",
+                                             "in_second", "end"}));
+}
+
+// Guards: assign() replaces the samples (events cleared, one split) and,
+// on invalid input, throws and leaves the trajectory as it was.
+TEST(TrajectoryTest, AssignReplacesOrLeavesUnchanged) {
+  std::vector<TrajectorySample> old_samples(2);
+  old_samples[1].t_s = 1.0;
+  Trajectory trajectory{old_samples,
+                        Interpolation::kConstantAcceleration,
+                        {{"old", 0.0}},
+                        {0, 1}};
+  std::vector<TrajectorySample> replacement(3);
+  for (std::size_t i = 0; i < replacement.size(); ++i) {
+    replacement[i].t_s = static_cast<double>(i);
+    replacement[i].x_m = 1.0 + static_cast<double>(i);
+  }
+  std::vector<TrajectorySample> bad = replacement;
+  bad[2].t_s = 0.5;
+  EXPECT_THROW(trajectory.assign(bad), std::invalid_argument);
+  EXPECT_EQ(trajectory.samples().size(), 2U);
+  EXPECT_EQ(trajectory.events().size(), 1U);
+
+  trajectory.assign(replacement);
+  EXPECT_EQ(trajectory.samples().size(), 3U);
+  EXPECT_EQ(trajectory.total_time_s(), 2.0);
+  EXPECT_EQ(trajectory.final_sample().x_m, 3.0);
+  EXPECT_TRUE(trajectory.events().empty());
+  EXPECT_EQ(trajectory.split_count(), 1U);
 }
 
 constexpr FieldDimensions kField = kField2026.field;

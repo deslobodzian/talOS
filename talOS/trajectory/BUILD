@@ -24,18 +24,6 @@ cc_library(
     ],
 )
 
-_FIXTURES = [
-    "choreo_v3_swerve",
-    "curve",
-    "hermite_line",
-    "splits_events",
-]
-
-_FIXTURE_ENV = {
-    "TALOS_TRAJECTORY_" + f.upper(): "$(rlocationpath testdata/%s.traj)" % f
-    for f in _FIXTURES
-}
-
 cc_library(
     name = "test_fixtures",
     testonly = True,
@@ -61,8 +49,10 @@ cc_test(
     name = "choreo_test",
     size = "small",
     srcs = ["choreo_test.cc"],
-    data = ["testdata/%s.traj" % f for f in _FIXTURES],
-    env = _FIXTURE_ENV,
+    data = ["testdata/choreo_v3_swerve.traj"],
+    env = {
+        "TALOS_TRAJECTORY_CHOREO_V3_SWERVE": "$(rlocationpath testdata/choreo_v3_swerve.traj)",
+    },
     deps = [
         ":test_fixtures",
         ":trajectory",
@@ -75,8 +65,10 @@ cc_test(
     name = "holonomic_follower_test",
     size = "small",
     srcs = ["holonomic_follower_test.cc"],
-    data = ["testdata/%s.traj" % f for f in _FIXTURES],
-    env = _FIXTURE_ENV,
+    data = ["testdata/curve.traj"],
+    env = {
+        "TALOS_TRAJECTORY_CURVE": "$(rlocationpath testdata/curve.traj)",
+    },
     deps = [
         ":test_fixtures",
         ":trajectory",
