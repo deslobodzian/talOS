@@ -3,8 +3,8 @@
 // Time-indexed holonomic trajectories (README.md). Field frame: x downfield,
 // y left, headings CCW+ in radians, all SI. Storage is sized when a
 // Trajectory is built (from samples or a Choreo file); sample(),
-// events_between() and the accessors never allocate, so a node can call them
-// from update().
+// EventCursor::advance(), assign() within reserve() and the accessors never
+// allocate, so a node can call them from update().
 
 #include <cstddef>
 #include <span>
@@ -99,6 +99,17 @@ class Trajectory {
       std::vector<EventMarker> events = {},
       std::vector<std::size_t> split_starts = {});
 
+  // Allocation-free rebuilding, for a trajectory made inside update() (from
+  // the live pose, say): reserve() once in the constructor, then assign()
+  // replaces the samples (no events, one split) without allocating while
+  // samples.size() <= capacity(). assign() validates as the constructor does
+  // and leaves the trajectory unchanged when it throws.
+  void reserve(std::size_t sample_count);
+  std::size_t capacity() const { return samples_.capacity(); }
+  void assign(
+      std::span<const TrajectorySample> samples,
+      Interpolation interpolation = Interpolation::kConstantAcceleration);
+
   bool empty() const { return samples_.empty(); }
   Interpolation interpolation() const { return interpolation_; }
 
@@ -118,21 +129,20 @@ class Trajectory {
 
   std::span<const TrajectorySample> samples() const { return samples_; }
 
-  // All markers, in time order.
+  // All markers, in time order. A node fires them with an EventCursor.
   std::span<const EventMarker> events() const { return events_; }
-  // The markers with after_s < t_s <= until_s, in time order: a node that
-  // passes its previous and current elapsed time each tick sees each marker
-  // once. No allocation.
-  std::span<const EventMarker> events_between(double after_s,
-                                              double until_s) const;
 
   // Choreo splits: the trajectory is split_count() segments; segment i runs
   // from sample split_starts()[i] to the next split's start (inclusive) or
   // the end.
   std::span<const std::size_t> split_starts() const { return split_starts_; }
   std::size_t split_count() const { return split_starts_.size(); }
-  // Segment `index` as its own trajectory, re-timed to start at 0, with the
-  // markers inside it. Allocates; throws std::out_of_range on a bad index.
+  // Segment `index` as its own trajectory, re-timed to start at 0. It keeps
+  // the markers from its start up to, not including, its end; the last
+  // segment also keeps a marker at its end. A marker on a split boundary is
+  // therefore in exactly one segment (the later one, at 0), so running the
+  // segments in turn fires it once. Allocates; throws std::out_of_range on a
+  // bad index.
   Trajectory split(std::size_t index) const;
 
   // The whole trajectory for the other alliance. Allocates.
@@ -143,6 +153,25 @@ class Trajectory {
   std::vector<EventMarker> events_;
   std::vector<std::size_t> split_starts_;
   Interpolation interpolation_ = Interpolation::kConstantAcceleration;
+};
+
+// Fires each marker of a trajectory once, in time order, as elapsed time
+// advances. The first advance() after construction or reset() returns every
+// marker at or before `t_s` (so one at 0.0 fires on the first tick); each
+// later call returns those after the previous call's markers up to `t_s`.
+// It counts markers, not time differences, so none is skipped or repeated.
+// reset() when starting a trajectory or a split. No allocation.
+//
+//   cursor.reset();                           // trajectory starts
+//   for (const EventMarker& m : cursor.advance(trajectory, elapsed_s)) ...
+class EventCursor {
+ public:
+  std::span<const EventMarker> advance(const Trajectory& trajectory,
+                                       double t_s);
+  void reset() { next_ = 0; }
+
+ private:
+  std::size_t next_ = 0;
 };
 
 // Wraps an angle to (-pi, pi].

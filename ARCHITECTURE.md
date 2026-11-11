@@ -50,9 +50,10 @@ Allowed dependencies:
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
 - Geometry, vision, trajectory and aiming are reusable libraries beside the
-  node stack: robot camera nodes depend on `talOS/vision`, and autonomous
-  routines on `talOS/trajectory`; both depend on `talOS/geometry`, never the
-  reverse; `talOS/aiming` depends only on `talOS/geometry` and `talOS/msgs`.
+  node stack: robot camera nodes depend on `talOS/vision`, and an autonomous
+  routine may depend on `talOS/trajectory`; both depend on `talOS/geometry`,
+  never the reverse; `talOS/aiming` depends only on `talOS/geometry` and
+  `talOS/msgs`.
 
 Beside the stack:
 
@@ -326,7 +327,7 @@ manifest fails the build with the regenerate command.
 | a mechanism | first a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block (`PositionMechanism`, `VelocityMechanism`, `RollerWithSensor`) configured in the subsystem file, wrapped by a thin node as `examples/superstructure/cpp/elevator.h` is; that node is a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
-| a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named by a parameter of the node that follows it and loaded with `talOS/trajectory`; `tools/sync_manifest.py` does not list it in `CONFIG_FILES` yet (TODO.md TRAJ-2) |
+| a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named by a parameter of the node that follows it and loaded with `talOS/trajectory`. A bundle does not include it until TODO.md TRAJ-2 (`tools/sync_manifest.py` does not list it in `CONFIG_FILES`): it works in sim and is missing on the deployed robot |
 | a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |

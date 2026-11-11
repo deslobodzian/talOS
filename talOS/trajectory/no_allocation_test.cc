@@ -1,11 +1,13 @@
-// sample(), events_between(), Flip(sample) and HolonomicFollower::step() run
-// in a control node's update() and must not allocate (RULES.md 3).
+// sample(), EventCursor::advance(), Flip(sample), HolonomicFollower::step()
+// and Trajectory::assign() within its reserve() run in a control node's
+// update() and must not allocate (RULES.md 3).
 
 #include <gtest/gtest.h>
 
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "talOS/geometry/se2.h"
 #include "talOS/node/allocation_probe.h"
@@ -20,9 +22,10 @@ namespace {
 using talos::testing::AllocationProbe;
 
 // REQ-RT-06
-// Guards: a control tick on a loaded trajectory (sample, marker lookup,
+// Guards: a control tick on a loaded trajectory (sample, marker cursor,
 // follower step with integral and derivative terms in both frames, flip of
-// one sample) allocates nothing; loading and construction may.
+// one sample, rebuilding a reserved trajectory from the live state)
+// allocates nothing; loading and construction may.
 TEST(NoAllocationTest, ControlTickDoesNotAllocate) {
   if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
     GTEST_SKIP() << why;
@@ -40,14 +43,22 @@ TEST(NoAllocationTest, ControlTickDoesNotAllocate) {
 
   double sink = 0;
   std::size_t events = 0;
-  double previous_s = -1;
+  EventCursor cursor;
+  Trajectory rebuilt;
+  rebuilt.reserve(4);
+  std::vector<TrajectorySample> fresh(4);
   AllocationProbe probe;
   probe.start();
   for (int tick = 0; tick < 300; ++tick) {
     const double t_s = 0.02 * tick - 0.5;
     const TrajectorySample reference = trajectory.sample(t_s);
-    events += trajectory.events_between(previous_s, t_s).size();
-    previous_s = t_s;
+    events += cursor.advance(trajectory, t_s).size();
+    for (std::size_t i = 0; i < fresh.size(); ++i) {
+      fresh[i] = reference;
+      fresh[i].t_s = static_cast<double>(i);
+    }
+    rebuilt.assign(fresh);
+    sink += rebuilt.sample(1.5).x_m;
     const geometry::SE2<double> measured(
         reference.heading_rad + 0.01,
         geometry::SE2<double>::Vector2(reference.x_m + 0.02, reference.y_m));

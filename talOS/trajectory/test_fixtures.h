@@ -1,8 +1,8 @@
 #pragma once
 
 // Locates the testdata/*.traj fixtures in a test's runfiles. BUILD passes
-// each fixture's rlocation in TALOS_TRAJECTORY_<NAME> (curve, splits_events,
-// hermite_line).
+// each fixture's rlocation in TALOS_TRAJECTORY_<NAME> (choreo_v3_swerve,
+// curve, splits_events).
 
 #include <cstdlib>
 #include <memory>
