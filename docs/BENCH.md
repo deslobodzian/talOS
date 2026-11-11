@@ -1,6 +1,8 @@
 # One-Kraken bench bring-up
 
-Use `bench/` for a RoboRIO, Mac mini and one restrained Kraken X60/TalonFX.
+Use `bench/` for a RoboRIO, Mac mini and one restrained Kraken X44. The bench
+config names only a TalonFX, not a motor model, and its `slot0` feedforward is
+provisional for any model.
 The RIO runs the existing generic gateway; no 2026 robot mechanisms are launched.
 Every checked-in bench config is **uncommissioned**. CAN id 1 is a placeholder,
 not a claim about the connected motor. Keep a spotter at DS disable and a safe
@@ -17,7 +19,8 @@ release all controls, and explicitly re-enable only after checking recovery.
   appropriate fused power/CAN termination, and leave DS disabled. Expected:
   no motion or exposed rotating hazards. Record wiring, power supply and guard.
 - [ ] Assign Mini `10.56.87.11` and RIO `10.56.87.2`; verify bidirectional
-  connectivity. The generic RIO's `kCompanionAddress` is the Mini address.
+  connectivity. The RIO program's default companion address is the Mini's
+  (on another network, see [below](#bench-on-another-network)).
   Inspect `bench/main_processor/configuration/robot_bench.toml`: it includes
   the base [robot config](../bench/main_processor/configuration/robot.toml)
   and overrides the controller address. Expected: boot needs no `--remote`
@@ -35,8 +38,9 @@ release all controls, and explicitly re-enable only after checking recovery.
   crashes/restarts or failed logs. Simulation overrides commissioning only in
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
 - [ ] From `2026-robot/controller_processor/rio`, run `./gradlew deploy`.
-  Expected: generic gateway starts on the RIO and targets the Mini. Record
-  deploy result and RIO console banner.
+  Expected: generic gateway starts on the RIO and its console line
+  `hardware gateway build <commit> companion 10.56.87.11:5803` names the
+  Mini. Record deploy result and RIO console banner.
 - [ ] Build `bazel build //bench/main_processor:bench_bundle`; on the Mini run
   `./tools/deploy.sh install bazel-bin/bench/main_processor/bench_bundle`.
   Expected: `/opt/talos/current` selects a read-only bundle; previous bundle
@@ -50,6 +54,43 @@ release all controls, and explicitly re-enable only after checking recovery.
 - [ ] As that account start `/opt/talos/current/run.sh --output-dir /opt/talos/logs`.
   Run `./tools/deploy.sh logs`. Expected: one unique session below the output
   root, with the deployed config hash and each node's log paths. Record paths.
+
+### Bench on another network
+
+On a LAN that is not `10.56.87.x`, build the RIO program for the main
+processor's address, from `2026-robot/controller_processor/rio`:
+`./gradlew deploy -Pcompanion=<main-processor-ipv4>` (also `buildRio`; a
+hostname or malformed address stops the build). The address is fixed in the
+binary, never learned from the network
+([RoboRIO](../talOS/hardware/README.md#roborio)); check the console line names
+it. `deploy` still finds the RIO by its team mDNS name
+(`roboRIO-5687-FRC.local`). The main processor must accept UDP on port 5803
+from the RIO.
+
+To point the main processor at the RIO without editing a tracked file, write
+`bench/main_processor/configuration/robot_lan.toml`, listed in
+`.git/info/exclude` so it stays untracked:
+
+```toml
+include = "robot.toml"
+
+[robot]
+controller_address = "<roborio-ipv4>"
+commissioned = false
+```
+
+It includes `robot.toml`, not `robot_bench.toml`: an include may not itself
+include (config load refuses it). Then, from the repo root, build the nodes and
+run it without `--sim` (one-off, `--remote <roborio-ipv4>` on the plain
+`robot.toml` does the same):
+
+```sh
+bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node //talOS/teleop:node //talOS/telemetry:node
+bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot_lan.toml --output-dir /tmp/bench-rio
+```
+
+Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
+`/hw/status` counts States received.
 
 ## Uncommissioned and disabled checks
 

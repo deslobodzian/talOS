@@ -259,9 +259,10 @@ reader's time namespace, so a node in another would judge live claims dead.
 ## RoboRIO
 
 `2026-robot/controller_processor/rio` is deployed with GradleRIO
-(`./gradlew deploy` in that directory). It sends to `kCompanionAddress`
-([Robot.cpp](../2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp),
-`10.56.87.11`), port 5803; change it if the main processor's address differs.
+(`./gradlew deploy` in that directory). It sends to the companion address it
+was built with, port 5803: `10.56.87.11` unless the main processor's address
+differs, then `./gradlew deploy -Pcompanion=<ipv4>`
+([RoboRIO](../talOS/hardware/README.md#roborio)).
 Deploy it from the same checkout as the main-processor bundle: each side
 rejects frames of another protocol version (currently 7; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once

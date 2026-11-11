@@ -334,8 +334,13 @@ DIO/analog/PWM and RIO encoder validity never sink the backend.
 ## RoboRIO
 
 `2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp` is the thin WPILib
-adapter. Set its companion address before deployment; the example is
-`10.56.87.11`. Runtime ports are 5802 on the gateway and 5803 on the companion.
+adapter. Its companion (main processor) address is fixed when it is built:
+`./gradlew deploy -Pcompanion=<ipv4>` (or `buildRio`), `10.56.87.11` without
+the property; `build.gradle` refuses anything but a dotted IPv4 literal. It is
+never learned from an incoming datagram: the gateway's socket is connected to
+that one peer, which is what keeps any other host on the network from
+commanding the robot ([protocol](../protocol/README.md)). Runtime ports are
+5802 on the gateway and 5803 on the companion.
 The other direction -- the companion finding the gateway -- is
 `[robot] controller_address` in the robot config (see [launcher addressing](../launcher/README.md#controller-addressing)),
 overridden per launch by `launcher --remote`. Real hardware uses Driver Station
@@ -419,8 +424,10 @@ with the checkout's git commit and whether it has uncommitted changes,
 untracked files included; without git or outside a checkout the commit is
 `unknown` and the State's revision 0. It reads only the local repository, so
 `--offline` builds get it, and rewrites the header only when it changes. The
-program prints the commit on its console at start (`hardware gateway build
-<commit>`), and the State reports its first 16 hex digits
+header also carries the companion address. The program prints both on its
+console at start (`hardware gateway build <commit> companion <address>:5803`,
+the address `127.0.0.1` under simulation), and the State reports the
+commit's first 16 hex digits
 ([DATA_FLOW.md](../../docs/DATA_FLOW.md#udp-frame-and-payload-sizes)), as
 `ROBORIO`, or `ROBORIO_SIMULATION` under WPILib simulation, on `/hw/status`.
 

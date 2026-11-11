@@ -30,8 +30,6 @@ uint64_t NowUs() {
       .count();
 }
 
-// Set to the companion's static address before deploying to the robot.
-constexpr const char* kCompanionAddress = "10.56.87.11";
 #ifdef __FRC_ROBORIO__
 constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 #else
@@ -132,8 +130,14 @@ void Robot::StartCompetition() {
                      : talos::hardware::GatewayProgram::kRoboRio,
       .dirty = talos::rio::kBuildDirty,
   });
-  std::printf("hardware gateway build %s%s\n", talos::rio::kBuildCommit,
-              talos::rio::kBuildDirty ? " (dirty)" : "");
+  // The main processor this program sends State to and, its socket being
+  // connected, the only host it accepts frames from: fixed at build time
+  // (-Pcompanion, build.gradle), never learned from a datagram.
+  const char* const companion_address =
+      IsSimulation() ? "127.0.0.1" : talos::rio::kCompanionAddress;
+  std::printf("hardware gateway build %s%s companion %s:5803\n",
+              talos::rio::kBuildCommit,
+              talos::rio::kBuildDirty ? " (dirty)" : "", companion_address);
   // The persisted configuration configures devices on the backend's worker,
   // polled by the loop below: a reboot with absent devices (each one a CAN
   // timeout) must not hold back robot code start or this loop's reports of
@@ -236,9 +240,9 @@ void Robot::StartCompetition() {
     const uint32_t mode_flags = DriverStationModeFlags();
     ds_mode.Observe(mode_flags, now_us);
     if (!socket_open && now_us >= next_socket_retry_us) {
-      const auto status = endpoint_->Open(
-          IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
-          IsSimulation() ? "127.0.0.1" : kCompanionAddress, 5803);
+      const auto status =
+          endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
+                          companion_address, 5803);
       socket_open = status == talos::protocol::UdpStatus::kOk;
       next_socket_retry_us = now_us + 1000000;
       if (!socket_open) {
