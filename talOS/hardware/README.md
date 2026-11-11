@@ -412,7 +412,8 @@ the State it was built from, plus `command_timeout_us`) plus two loop
 periods (one for the tick that sees the expiry, one for that tick's work
 before its beat); with no command in force it carries nothing (that tick neutralized
 every output itself). The watchdog's own thread, at `SCHED_FIFO` 30 on the
-RoboRIO (above the loop's `SCHED_FIFO` 20), checks every 5 ms. Once that
+RoboRIO (above the loop's `SCHED_FIFO` 10 and the kernel's interrupt
+threads), checks every 5 ms. Once that
 time has passed it disables PWM outputs, sets DIO outputs false and sends
 `NeutralOut` to every motor, on every check until a beat moves the time (so
 outputs a resumed loop re-applies on a stale clock reading before stalling
@@ -427,23 +428,38 @@ not running, the watchdog waits there, and so does every output after it.
 Held by the loop, the wait lasts until no thread above the loop's priority is
 runnable on its core; held by a default-scheduled thread (a vendor
 library's), the holder also waits for the CPU behind the loop and every
-other realtime thread. A refused realtime priority is reported the same way.
+other realtime thread. A refused realtime priority is reported the same
+way, and the loop then stays at default scheduling too (below).
 
-The loop thread runs at `SCHED_FIFO` 20 on the RoboRIO, below the watchdog
-(`kLoopPriority` in `Robot.cpp`, held below `kWatchdogPriority` by a
-`static_assert`), so ordinary processes such as an ssh session no longer
-delay its ticks, and sleeps to each tick's absolute deadline
-(`clock_nanosleep` on `CLOCK_MONOTONIC`, the clock of its steady time).
-Threads it starts afterwards start at default scheduling
-(`SCHED_RESET_ON_FORK`). It keeps default scheduling if
-`/home/lvuser/talos_loop_default_sched` exists when the program starts (for a
-bench comparison, or as a fallback in the field without a rebuild) or if the
-kernel refuses the request. Its start line, `hardware gateway loop <policy>
-<priority>, watchdog asks SCHED_FIFO 30`, gives what the kernel holds and,
-at default scheduling, why: `(<file> present)` or `(SCHED_FIFO 20 refused,
-errno <n>)`. Both requests need the same privilege, except under an
-`RLIMIT_RTPRIO` of 20 to 29 without `CAP_SYS_NICE`, where the loop alone
-would get its priority and the watchdog would run below it. Desktop
+Thread policies on the bench RoboRIO (2026-11-11, image
+FRC_roboRIO_2026_v1.2, two cores): every kernel interrupt thread runs at
+`SCHED_FIFO` 15 (`irq/54-eth0`, `irq/64-e000b000`, ...) except the FPGA's
+`irq/61-atomiczy` at 96; there is no kernel CAN interrupt (CAN goes through
+the FPGA interrupt and user-space threads); the robot program's `can_recv`,
+`can_psend`, `can_stat`, `frc_evnt_client`, `nirio::DeviceNo`,
+`atomiczynqu` (two), `niriodevenum` and `frc_server_mon` are `SCHED_OTHER`,
+three unnamed threads `SCHED_RR` 1, 1 and 2; every `FRC_NetCommDaemon`
+thread is `SCHED_OTHER`; and realtime throttling is off
+(`sched_rt_runtime_us` is -1).
+
+The loop thread runs at `SCHED_FIFO` 10 on the RoboRIO (`kLoopPriority` in
+`Robot.cpp`), so ordinary processes such as an ssh session no longer delay
+its ticks, and sleeps to each tick's absolute deadline (`clock_nanosleep` on
+`CLOCK_MONOTONIC`, the clock of its steady time). A `static_assert` holds it
+below the interrupt threads (`kIrqThreadPriority`, 15), which a loop that
+stopped sleeping would otherwise shut out of its CPU for good, and the
+interrupt threads below the watchdog. That order is also checked at run
+time: the loop raises itself only after `LoopWatchdog::Start` returns with
+the priority the kernel gave the watchdog thread, and only if it is a
+`SCHED_FIFO` priority above the loop's. Threads the loop starts afterwards
+start at default scheduling (`SCHED_RESET_ON_FORK`). It keeps default
+scheduling if `/home/lvuser/talos_loop_default_sched` exists when the
+program starts (for a bench comparison, or as a fallback in the field
+without a rebuild), if the watchdog holds no such priority, or if the kernel
+refuses the request. Its start line, `hardware gateway loop <policy>
+<priority>, watchdog <policy> <priority>`, gives what the kernel holds for
+both and, at default scheduling, why: `(<file> present)`, `(watchdog holds
+no SCHED_FIFO above 10)` or `(SCHED_FIFO 10 refused, errno <n>)`. Desktop
 simulation keeps default scheduling.
 
 A tick that ends by its deadline sleeps to it, so the loop keeps its phase.
@@ -451,15 +467,18 @@ One that ends past it (an overrun, or a wake more than a period late) drops
 the missed ticks instead of running them back to back, sleeps 500 µs and
 counts the next period from there, so the phase moves
 (`src/main/include/LoopSchedule.h`). Whenever it runs, the loop takes the
-CPU from every default-scheduled thread on its core: the logger and the
-companion reporter (nice 19), ssh, and NI's and Phoenix's threads whose
-policies are unrecorded. The 500 µs bounds the share a loop that overruns
-every tick takes; a loop whose work is just under the period still takes
-nearly all of its core, and only the kernel's realtime throttling
-(`/proc/sys/kernel/sched_rt_runtime_us`, unrecorded on the RoboRIO) bounds a
-loop that never reaches its sleep. The watchdog still preempts such a loop:
-it wakes on its own timer and reads the beat from atomics, so only the
-device locks above can hold it back. The effect on late ticks is unmeasured
+CPU from every thread on its core below `SCHED_FIFO` 10: the logger and the
+companion reporter (nice 19), ssh, the program's CAN threads (`can_psend`,
+`can_recv`), netcomm, and the three `SCHED_RR` threads. The 500 µs bounds
+the share a loop that overruns every tick takes; a loop whose work is just
+under the period still takes nearly all of its core, and with throttling
+off nothing bounds a loop that never reaches its sleep. The watchdog still
+preempts such a loop (it wakes on its own timer and reads the beat from
+atomics) and still calls `NeutralOut`, but that the frame then reaches the
+bus is not established: it may depend on `can_psend` or another
+`SCHED_OTHER` thread the spinning loop holds off on that core, unless the
+scheduler moves it to the other one. The interrupt threads, above the loop,
+keep running. The effect on late ticks is unmeasured
 ([bench check](../../docs/BENCH.md#fault-injection-and-timing)).
 
 The Driver Station shows green code and communications whether or not the
