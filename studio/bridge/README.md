@@ -186,7 +186,9 @@ network.
 
 The bridge does not poll. Its one thread sleeps in the uSockets loop until a
 socket event (HTTP, a WebSocket message or a drained client socket), a
-publication on the telemetry topic, or its next duty. The reader slot names a
+publication on the telemetry topic, a stop, or its next duty. SIGINT and
+SIGTERM go through `talOS/process`'s stop handlers, whose stop pipe is in the
+loop too, so a stop ends the wait at once however it lands. The reader slot names a
 `talos::WakeReceiver` whose descriptor is in the loop, so a publication wakes
 it at once
 ([wake channel](../../talOS/rtms/README.md#wake-channel)). Each wake is one

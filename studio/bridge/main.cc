@@ -5,7 +5,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <csignal>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -20,6 +19,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/rtms/wake.h"
 #include "talOS/telemetry/wire.h"
@@ -32,8 +32,6 @@ extern "C" {
 }
 namespace fs = std::filesystem;
 namespace {
-volatile std::sig_atomic_t stop = 0;
-void signal_handler(int) { stop = 1; }
 using studio::EgressBudget;
 struct Client {
   EgressBudget budget;
@@ -565,8 +563,9 @@ int main(int argc, char** argv) try {
            "exit\n";
     return 2;
   }
-  std::signal(SIGINT, signal_handler);
-  std::signal(SIGTERM, signal_handler);
+  // SIGINT and SIGTERM request a stop and make the stop pipe readable; the
+  // loop watches it, so a stop wakes the loop wherever it waits.
+  talos::process::InstallStopHandlers();
   const char* topic = count > 1 ? at(1) : "/talos/telemetry";
 
   // The declared graph: what the launcher probed with `--describe` before it
@@ -791,20 +790,29 @@ int main(int argc, char** argv) try {
           ++WatchedUser<Bridge>(callback)->publication_wakes;
         });
   }
+  // The stop pipe: readable from the moment a stop is requested, so a signal
+  // landing after the pass's check and before the wait still ends the wait.
+  // Level-triggered: the pass that sees the stop removes it.
+  us_poll_t* stop_poll = nullptr;
+  if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
+    stop_poll =
+        WatchReadable(loop, stop_fd, &bridge, [](us_internal_callback_t*) {});
+  }
   std::int64_t timer_due_ns = 0;
   bool stopping = false;
   const auto pass = [&] {
     if (stopping) return;
     ++bridge.wakes;
-    if (stop) {
+    if (talos::process::stop_requested.load()) {
       stopping = true;
       us_listen_socket_close(0, bridge.listener);
       auto clients = bridge.clients;
       for (auto* ws : clients) ws->close();
       us_timer_close(timer);
-      if (wake_poll != nullptr) {
-        us_poll_stop(wake_poll, loop);
-        us_poll_free(wake_poll, loop);
+      for (us_poll_t* poll : {wake_poll, stop_poll}) {
+        if (poll == nullptr) continue;
+        us_poll_stop(poll, loop);
+        us_poll_free(poll, loop);
       }
       return;
     }
@@ -822,7 +830,7 @@ int main(int argc, char** argv) try {
     }
   };
   pass();
-  // A stop signal interrupts the wait, which then ends in this handler.
+  // A stop makes the stop pipe readable, which ends the wait in this handler.
   uWS::Loop::get()->addPostHandler(&bridge, [&pass](uWS::Loop*) { pass(); });
   // Normal process termination is handled below; signal exit avoids freeing a
   // running loop.
