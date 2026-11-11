@@ -869,12 +869,13 @@ TEST_F(DrivetrainTest, ModuleTimestampUsesOldestConsumedSignalAcquisition) {
   for (int signal = 0; signal < 3; ++signal) {
     SCOPED_TRACE(signal);
     // Unequal ages distinguish drive position, drive velocity and azimuth.
-    // Steer velocity is not consumed and must not invalidate this solution.
+    // Steer velocity is not consumed: an age the drivetrain would reject
+    // (over 50 ms) but the gateway still counts valid (under 100 ms) must
+    // not invalidate this solution.
     hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
                  signal == 0 ? 12'000 : 2'000, signal == 1 ? 12'000 : 3'000);
     hw.set_motor("drivetrain", geometry.modules[0].steer, 0, 0,
-                 signal == 2 ? 12'000 : 4'000,
-                 std::numeric_limits<std::uint32_t>::max());
+                 signal == 2 ? 12'000 : 4'000, 60'000);
     sim.step(20ms);
     const auto state = State();
     ASSERT_TRUE(state.modules_valid());
@@ -886,13 +887,16 @@ TEST_F(DrivetrainTest, ModuleTimestampUsesOldestConsumedSignalAcquisition) {
   }
 }
 
+// Signal times the drivetrain's timestamp policy rejects while the gateway
+// still counts the feedback valid (younger than command_timeout_us, 100 ms
+// here) invalidate only the published measurement: the module keeps driving
+// and the safety gates are unchanged.
 TEST_F(DrivetrainTest, InvalidSignalTimesDoNotChangeDriveOrSafetyGates) {
   Teleop();
   Hold(ChassisTarget{1, 0, 0}, 60ms);
-  for (const std::uint32_t age : {25'000U, 60'000U, 1'000'000U,
-                                  std::numeric_limits<std::uint32_t>::max()}) {
+  for (const std::uint32_t age : {25'000U, 60'000U, 99'999U}) {
     SCOPED_TRACE(age);
-    // Respectively excessive skew, excessive age, pre-origin time, unknown.
+    // Respectively excessive skew, excessive age, the oldest still valid.
     for (int signal = 0; signal < 3; ++signal) {
       SCOPED_TRACE(signal);
       hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
@@ -919,6 +923,36 @@ TEST_F(DrivetrainTest, InvalidSignalTimesDoNotChangeDriveOrSafetyGates) {
   EXPECT_TRUE(State().modules_valid());
   EXPECT_TRUE(State().yaw_valid());
   ExpectNeutral();
+}
+
+// REQ-SAFE-22: feedback command_timeout_us old or older, or of unknown age,
+// is invalid at the gateway, so the drivetrain treats that motor as it does
+// a disconnected one: its module goes neutral, the others drive, and it
+// drives again once its feedback is fresh.
+TEST_F(DrivetrainTest, FeedbackAtTheGatewayAgeBoundNeutralizesItsModule) {
+  Teleop();
+  Hold(ChassisTarget{1, 0, 0}, 60ms);
+  constexpr std::uint32_t kUnknown = std::numeric_limits<std::uint32_t>::max();
+  for (const std::uint32_t age : {100'000U, 1'000'000U, kUnknown}) {
+    SCOPED_TRACE(age);
+    for (int signal = 0; signal < 3; ++signal) {
+      SCOPED_TRACE(signal);
+      hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
+                   signal == 0 ? age : 0, signal == 1 ? age : 0);
+      hw.set_motor("drivetrain", geometry.modules[0].steer, 0, 0,
+                   signal == 2 ? age : 0, 0);
+      Hold(ChassisTarget{1, 0, 0}, 20ms);
+      EXPECT_FALSE(State().modules_valid());
+      EXPECT_EQ(Request(geometry.modules[0].drive).mode, Mode::kNeutral);
+      EXPECT_EQ(Request(geometry.modules[0].steer).mode, Mode::kNeutral);
+      EXPECT_EQ(Request(geometry.modules[1].drive).mode, Mode::kVelocity);
+    }
+  }
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0);
+  hw.set_motor("drivetrain", geometry.modules[0].steer, 0, 0);
+  Hold(ChassisTarget{1, 0, 0}, 40ms);
+  EXPECT_TRUE(State().modules_valid());
+  EXPECT_EQ(Request(geometry.modules[0].drive).mode, Mode::kVelocity);
 }
 
 TEST_F(DrivetrainTest, EquallyOldSignalsAreRejectedEvenWithoutSkew) {
@@ -1113,8 +1147,8 @@ TEST_F(DrivetrainOnImuTest, HeadingIsThePigeonYawInRadians) {
 
 TEST_F(DrivetrainOnImuTest, TimestampIncludesYawButNotUnusedYawRate) {
   hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0, 3'000, 5'000);
-  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0, 12'000,
-              std::numeric_limits<std::uint32_t>::max());
+  // A yaw rate older than the drivetrain accepts, still valid at the gateway.
+  hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0, 12'000, 60'000);
   sim.step(kConverged);
   ASSERT_TRUE(State().modules_valid());
   ASSERT_TRUE(State().yaw_valid());
@@ -1137,8 +1171,9 @@ TEST_F(DrivetrainOnImuTest, InvalidYawTimingHoldsHeadingAndKeepsModulesUsable) {
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0);
   sim.step(kConverged);
   const double heading = State().yaw_rad();
-  for (const std::uint32_t age : {25'000U, 60'000U, 1'000'000U,
-                                  std::numeric_limits<std::uint32_t>::max()}) {
+  // Ages the drivetrain rejects; an older one invalidates the gyro at the
+  // gateway, as ADisconnectedGyroIsInvalidAndHoldsTheLastHeading covers.
+  for (const std::uint32_t age : {25'000U, 60'000U, 99'999U}) {
     SCOPED_TRACE(age);
     hw.set_gyro("drivetrain", "drivetrain_imu", 0.25, 0, age, 0);
     Hold(ChassisTarget{1, 0, 0}, 20ms);
@@ -1151,10 +1186,9 @@ TEST_F(DrivetrainOnImuTest, InvalidYawTimingHoldsHeadingAndKeepsModulesUsable) {
     EXPECT_LE(lag, std::chrono::nanoseconds{5ms}.count());
     EXPECT_EQ(Request(geometry.modules[0].drive).mode, Mode::kVelocity);
   }
-  // A good yaw remains independently usable when a module time is unknown.
+  // A good yaw remains independently usable when a module time is rejected.
   hw.set_gyro("drivetrain", "drivetrain_imu", 0.125, 0, 7'000, 0);
-  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0,
-               std::numeric_limits<std::uint32_t>::max(), 0);
+  hw.set_motor("drivetrain", geometry.modules[0].drive, 0, 0, 60'000, 0);
   sim.step(20ms);
   EXPECT_FALSE(State().modules_valid());
   EXPECT_TRUE(State().yaw_valid());

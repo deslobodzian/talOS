@@ -33,9 +33,11 @@
 // latest State, is ignored, and a motor masked by reset_device() applies
 // neutral, as does any later request observed before the State that last
 // masked it. Unlike the gateway, a motor disconnected with set_connected()
-// still applies its request, enabling or disabling does not start a new
-// epoch, and requests are not checked against the config id, motor limits or
-// soft limits.
+// or whose feedback is too old (set_motor) still applies its request, losing
+// every motor's and CAN sensor's feedback raises no hardware fault and starts
+// no new epoch, enabling or disabling does not start a new epoch, and
+// requests are not checked against the config id, motor limits or soft
+// limits.
 //
 // Each period it also publishes the bridge's /hw/status: the states and
 // Driver Station packets it sent, configured, and the exact simulated gateway
@@ -76,6 +78,10 @@ class SimHardware {
 
   // Feedback. Ages are microseconds before the gateway State sample time;
   // UINT32_MAX means unknown. Zero preserves simultaneous ideal feedback.
+  // As on the gateway (hardware::FeedbackFresh), a motor, CANcoder or gyro
+  // whose position or velocity age is command_timeout_us or more, or
+  // unknown, goes out with valid == false, so its handle reads
+  // connected() == false; a younger age is valid, whatever it is.
   void set_motor(std::string_view node, std::string_view device,
                  double position, double velocity,
                  std::uint32_t position_age_us = 0,
