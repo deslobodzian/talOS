@@ -187,24 +187,6 @@ std::string RegistryCapacityError(const introspect::RegistryReader& reader,
          "unregistered. Stop those processes first";
 }
 
-std::chrono::milliseconds RestartBackoff(int restart, bool clean_exit,
-                                         bool critical) {
-  if (restart == 1 && critical && !clean_exit) {
-    return std::chrono::milliseconds{0};
-  }
-  std::chrono::milliseconds backoff = kRestartInitialBackoff;
-  for (int i = 1; i < restart && backoff < kRestartMaxBackoff; ++i) {
-    backoff *= 2;
-  }
-  return std::min(backoff, kRestartMaxBackoff);
-}
-
-bool ShouldRestartNode(bool clean_exit, bool critical, int max_restarts,
-                       bool stopping) {
-  if (stopping || max_restarts <= 0) return false;
-  return !clean_exit || critical;
-}
-
 bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
                         const LauncherOptions& options, int& out,
                         std::string& error) {
@@ -345,7 +327,8 @@ int Launcher::Run() {
     return 1;
   }
   std::string restart_error;
-  if (!ResolveMaxRestarts(robot_config, options_, max_restarts_,
+  int max_restarts = kDefaultMaxRestarts;
+  if (!ResolveMaxRestarts(robot_config, options_, max_restarts,
                           restart_error)) {
     std::cerr << "launcher: " << restart_error << "\n";
     return 1;
@@ -357,6 +340,8 @@ int Launcher::Run() {
            "startup grace must be nonnegative\n";
     return 1;
   }
+  restart_limits_ = {max_restarts,
+                     std::chrono::milliseconds{options_.restart_window_ms}};
 
   const auto node_specs = DiscoverNodes(robot_config, options_);
   if (node_specs.empty()) {
@@ -586,7 +571,7 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
                              uint64_t log_budget, const std::string& remote,
                              uint16_t remote_port, uint16_t local_port,
                              NodeLaunch& launch) const {
-  launch.critical = spec.critical;
+  launch.restart = RestartSchedule{spec.critical};
   launch.compare_endpoints = described.answered;
   launch.declared = described.declared.sources;
   auto period_us =
@@ -594,8 +579,10 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
           .value_or<int64_t>(
               robot_config.toml_data["robot"]["period_us"].value_or<int64_t>(
                   5000));
-  launch.heartbeat_timeout = std::chrono::microseconds{
-      std::max<int64_t>(500000, period_us * options_.heartbeat_periods)};
+  launch.limits = {
+      HeartbeatTimeout(period_us, options_.heartbeat_periods),
+      std::chrono::milliseconds{options_.heartbeat_startup_grace_ms},
+      options_.construction_timeout};
   auto& args = launch.args;
   args.push_back(spec.binary_path);
   if (proc.name == kSimGatewayName) {
@@ -704,21 +691,22 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
 }
 
 std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
-                                  std::chrono::steady_clock::time_point now) {
-  const auto ms = [now](std::chrono::steady_clock::time_point since) {
+                                  SupervisionTime now) {
+  const auto ms = [now](SupervisionTime since) {
     return std::to_string(
         std::chrono::duration_cast<std::chrono::milliseconds>(now - since)
             .count());
   };
+  const RunLiveness& run = launch.liveness;
   if (constructing) {
     return " stalled: construction heartbeat unchanged for " +
-           ms(launch.heartbeat_changed_at) + " ms";
+           ms(run.heartbeat_changed_at()) + " ms";
   }
   return " stalled: dispatch count unchanged for " +
-         ms(launch.progress_changed_at) + " ms (heartbeat " +
-         (now - launch.heartbeat_changed_at < launch.heartbeat_timeout
+         ms(run.progress_changed_at()) + " ms (heartbeat " +
+         (now - run.heartbeat_changed_at() < launch.limits.heartbeat_timeout
               ? "still moving)"
-              : "unchanged too, for " + ms(launch.heartbeat_changed_at) +
+              : "unchanged too, for " + ms(run.heartbeat_changed_at()) +
                     " ms)");
 }
 
@@ -747,37 +735,43 @@ pid_t Launcher::SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch,
                       /*echo=*/true);
 }
 
-std::chrono::milliseconds Launcher::ScheduleRestart(
-    NodeProcessInfo& proc, NodeLaunch& launch,
-    std::chrono::steady_clock::time_point now) {
-  const int recent = static_cast<int>(launch.restart_times.size());
-  proc.quarantined = !launch.critical && recent >= max_restarts_;
-  launch.restart_pending = true;
-  launch.restart_at =
-      (proc.quarantined
-           ? launch.restart_times.front() +
-                 std::chrono::milliseconds{options_.restart_window_ms}
-           : now) +
-      RestartBackoff(recent + 1, launch.last_exit_clean, launch.critical);
+std::chrono::milliseconds Launcher::ScheduleRestart(NodeProcessInfo& proc,
+                                                    NodeLaunch& launch,
+                                                    SupervisionTime now) {
+  const auto delay = launch.restart.Schedule(now, restart_limits_);
+  ShowRestart(proc, launch.restart);
+  return delay;
+}
+
+void Launcher::ShowRestart(NodeProcessInfo& proc,
+                           const RestartSchedule& restart) {
+  proc.quarantined = restart.quarantined();
+  // steady_clock's epoch, which introspect::monotonic_now_ns() shares.
   proc.retry_at_monotonic_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          launch.restart_at.time_since_epoch())
-          .count();
-  return std::chrono::duration_cast<std::chrono::milliseconds>(
-      launch.restart_at - now);
+      restart.pending() ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              restart.due_at().time_since_epoch())
+                              .count()
+                        : 0;
+}
+
+void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
+  liveness.Begin(spawned);
+  kill_reason = {};
+  heartbeat_killed = false;
+  endpoints_checked = false;
+  realtime_reported = false;
 }
 
 void Launcher::SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
-                           std::chrono::steady_clock::time_point now,
-                           const std::string& error) {
+                           SupervisionTime now, const std::string& error) {
   proc.failed = true;
   proc.RecordSpawnFailure();
   std::cerr << "[launcher] cannot spawn " << proc.name << " (" << error
             << "); ";
   // Never `stopping` here: Supervise cancels a pending restart once the
   // session stops.
-  if (!ShouldRestartNode(/*clean_exit=*/false, launch.critical, max_restarts_,
-                         /*stopping=*/false)) {
+  if (!ShouldRestartNode(/*clean_exit=*/false, launch.restart.critical(),
+                         restart_limits_.max_restarts, /*stopping=*/false)) {
     std::cerr << "restarts are disabled\n";
     return;
   }
@@ -820,12 +814,12 @@ uint64_t Launcher::RestartLogBudget(NodeProcessInfo& proc, uint64_t budget) {
 }
 
 void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
-                       std::chrono::steady_clock::time_point now) {
-  launch.restart_pending = false;
-  if (proc.quarantined)
+                       SupervisionTime now) {
+  if (launch.restart.quarantined())
     std::cout << "[launcher] " << proc.name << " retrying after quarantine\n";
-  proc.quarantined = false;
-  proc.retry_at_monotonic_ns = 0;
+  // The attempt counts against the rolling budget whether or not it spawns.
+  launch.restart.Started(now);
+  ShowRestart(proc, launch.restart);
   // Only a spawned run sets a pid.
   const int restart = proc.pid > 0 ? proc.restart_count + 1 : 0;
   if (launch.log_arg != 0) {
@@ -834,7 +828,6 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
     launch.args[launch.log_arg + 2] =
         std::to_string(RestartLogBudget(proc, launch.log_budget));
   }
-  launch.restart_times.push_back(now);
   std::string error;
   const pid_t pid = SpawnNode(proc, launch, error);
   if (pid < 0) {
@@ -849,15 +842,7 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
   proc.exit_code = -1;
   proc.exit_signal = 0;
   proc.BeginRun(pid);
-  launch.kill_reason = {};
-  launch.started_at = std::chrono::steady_clock::now();
-  launch.progress_changed_at = launch.started_at;
-  launch.heartbeat_changed_at = launch.started_at;
-  launch.last_heartbeat = 0;
-  launch.last_dispatch = 0;
-  launch.heartbeat_killed = false;
-  launch.endpoints_checked = false;
-  launch.realtime_reported = false;
+  launch.NewRun(std::chrono::steady_clock::now());
 }
 
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -909,7 +894,7 @@ bool Launcher::CheckEndpoints(NodeProcessInfo& proc, NodeLaunch& launch,
             << mismatch << "; ";
   if (options_.allow_graph_errors) {
     std::cerr << "running anyway (--allow-graph-errors)\n";
-  } else if (!launch.critical) {
+  } else if (!launch.restart.critical()) {
     launch.endpoints_stopped = true;
     launch.heartbeat_killed = true;
     launch.kill_reason = kRunEndpointMismatch;
@@ -934,8 +919,8 @@ bool Launcher::RosterContinues(const std::vector<NodeProcessInfo>& procs,
                                std::size_t self) {
   for (std::size_t j = 0; j < procs.size(); ++j) {
     if (j == self || (studio && j == studio->index())) continue;
-    if (launches[j].last_exit_clean) continue;
-    if (launches[j].restart_pending) return true;
+    if (launches[j].restart.last_exit_clean()) continue;
+    if (launches[j].restart.pending()) return true;
     if (procs[j].pid > 0 && !procs[j].exited) return true;
   }
   return false;
@@ -943,10 +928,9 @@ bool Launcher::RosterContinues(const std::vector<NodeProcessInfo>& procs,
 
 bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
                         const introspect::RegistryMapping* registry,
-                        std::chrono::steady_clock::time_point now) {
+                        SupervisionTime now) {
   bool changed = false;
-  bool found = false;
-  bool constructing = false;
+  RowObservation row;
   uint32_t recording = 0;
   std::optional<std::vector<naming::SourceShape>> live;
   bool live_complete = true;
@@ -975,24 +959,12 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
           record.state.load(std::memory_order_acquire) !=
               static_cast<uint64_t>(introspect::SlotState::ACTIVE))
         continue;
-      found = true;
       live = std::move(published);
-      constructing = (flags & introspect::kFlagConstructing) != 0;
       recording = flags;
-      // Progress is the loop's dispatch count, which an event-loop
-      // node's loop thread stores itself (introspect::Reporter), so a
-      // starved reporting thread cannot make a running loop look
-      // stalled. Its heartbeat, which that thread writes, counts only
-      // while it constructs and has no loop yet.
-      const bool beat_moved = beat != launch.last_heartbeat;
-      const bool dispatch_moved = dispatch != launch.last_dispatch;
-      if (beat_moved) {
-        launch.heartbeat_changed_at = now;
-        launch.last_heartbeat = beat;
-      }
-      if (dispatch_moved) launch.last_dispatch = dispatch;
-      if (dispatch_moved || (constructing && beat_moved))
-        launch.progress_changed_at = now;
+      row = {.found = true,
+             .constructing = (flags & introspect::kFlagConstructing) != 0,
+             .heartbeat = beat,
+             .dispatch = dispatch};
       break;
     }
   }
@@ -1002,25 +974,19 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
     launch.endpoints_checked = true;
     if (CheckEndpoints(proc, launch, *live, live_complete)) changed = true;
   }
-  const bool grace_over =
-      now - launch.started_at >=
-      std::chrono::milliseconds{options_.heartbeat_startup_grace_ms};
-  // Registration is part of startup, not an opt-in to supervision:
-  // until a row arrives, the spawn time is the last progress time.
-  const bool construction_expired =
-      constructing && now - launch.started_at >= options_.construction_timeout;
-  if (construction_expired || (grace_over && now - launch.progress_changed_at >=
-                                                 launch.heartbeat_timeout)) {
+  const std::string_view reason =
+      launch.liveness.Judge(row, now, launch.limits);
+  if (!reason.empty()) {
     std::cerr << "[launcher] " << proc.name
-              << (construction_expired ? " construction deadline exceeded"
-                  : !found             ? " heartbeat missing"
-                                       : StallReport(launch, constructing, now))
+              << (reason == kRunConstructionDeadline
+                      ? " construction deadline exceeded"
+                  : reason == kRunHeartbeatMissing
+                      ? " heartbeat missing"
+                      : StallReport(launch, row.constructing, now))
               << "; killing pid " << proc.pid << "\n";
     SignalProcessGroup(proc.pid, SIGKILL);
     launch.heartbeat_killed = true;
-    launch.kill_reason = construction_expired ? kRunConstructionDeadline
-                         : found              ? kRunStalled
-                                              : kRunHeartbeatMissing;
+    launch.kill_reason = reason;
   }
   return changed;
 }
@@ -1032,12 +998,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
   bool stop_sent = false;
   auto shutdown_deadline = std::chrono::steady_clock::time_point::max();
   std::optional<introspect::RegistryMapping> registry;
+  // Every first run's liveness counts from here, not its spawn.
   const auto started = std::chrono::steady_clock::now();
-  for (auto& launch : launches) {
-    launch.started_at = started;
-    launch.progress_changed_at = started;
-    launch.heartbeat_changed_at = started;
-  }
+  for (auto& launch : launches) launch.NewRun(started);
   ServiceNotifier notifier;
   const ChildExitWakeup exits;  // A pass starts as soon as a child exits.
   notifier.Send("READY=1");
@@ -1082,11 +1045,6 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     for (std::size_t i = 0; i < procs.size(); ++i) {
       auto& proc = procs[i];
       auto& launch = launches[i];
-      while (!launch.restart_times.empty() &&
-             now - launch.restart_times.front() >=
-                 std::chrono::milliseconds{options_.restart_window_ms}) {
-        launch.restart_times.pop_front();
-      }
       if (proc.pid <= 0 || proc.exited) continue;
       // Every member but Studio's bridge, which takes no registry row, is
       // supervised by its row; the simulation gateway registers like a node.
@@ -1106,10 +1064,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status));
       const bool is_bridge = studio && i == studio->index();
       if (is_bridge && studio->Starting(i)) continue;
-      launch.last_exit_clean = clean;
+      launch.restart.RunEnded(clean);
       if (!is_bridge && !launch.endpoints_stopped &&
-          ShouldRestartNode(clean, launch.critical, max_restarts_,
-                            stop_arrived())) {
+          ShouldRestartNode(clean, launch.restart.critical(),
+                            restart_limits_.max_restarts, stop_arrived())) {
         const auto delay = ScheduleRestart(proc, launch, now);
         std::cout << "[launcher] " << proc.name << " exited ("
                   << ExitReason(status) << "); "
@@ -1123,18 +1081,17 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     }
     for (std::size_t i = 0; i < procs.size(); ++i) {
       auto& launch = launches[i];
-      if (!launch.restart_pending) continue;
+      if (!launch.restart.pending()) continue;
       // A stopping session ends with the crash as the node's last word.
       if (stop_arrived()) {
-        launch.restart_pending = false;
-        procs[i].quarantined = false;
-        procs[i].retry_at_monotonic_ns = 0;
+        launch.restart.Cancel();
+        ShowRestart(procs[i], launch.restart);
         manifest_changed = true;
-      } else if (now >= launch.restart_at) {
-        if (launch.last_exit_clean &&
+      } else if (launch.restart.Due(now)) {
+        if (launch.restart.last_exit_clean() &&
             !RosterContinues(procs, launches, studio, i)) {
-          launch.restart_pending = false;
-          procs[i].retry_at_monotonic_ns = 0;
+          launch.restart.Cancel();
+          ShowRestart(procs[i], launch.restart);
           std::cout << "[launcher] " << procs[i].name
                     << " finished with the rest of the roster; not "
                        "restarted\n";
@@ -1164,7 +1121,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     bool all_done = true;
     for (std::size_t i = 0; i < procs.size(); ++i) {
       const auto& proc = procs[i];
-      if (launches[i].restart_pending) {
+      if (launches[i].restart.pending()) {
         all_done = false;
         break;
       }

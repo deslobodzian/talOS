@@ -50,6 +50,9 @@ class PyLocalizer:
                            callback=lambda o, q=queue: self.queue(q, o),
                            optional=True)
         self.timeout_s = node.param("observation_timeout_us", 500_000) / 1e6
+        if not self.timeout_s > 0:
+            raise ValueError(
+                "py_localizer: observation_timeout_us must be positive")
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.pose = (0.0, 0.0, 0.0)  # held while no usable observation arrives
         self.sample_time_ns = 0

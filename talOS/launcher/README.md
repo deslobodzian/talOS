@@ -616,7 +616,8 @@ header:
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_merge` | `log_merge.h` | `MergeLogs`; `log_dump` links it and `:hardware_record`, not the supervisor |
-| `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), the restart policy and the Studio bridge |
+| `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the time a supervision pass sampled: `RestartSchedule` (backoff, rolling budget, quarantine), `RunLiveness` (stall, missing row, construction deadline) |
+| `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
 
 ## Session segments and logs

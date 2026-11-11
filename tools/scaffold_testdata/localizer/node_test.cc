@@ -13,12 +13,14 @@
 #include "localizer/localizer.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
 namespace localizer {
 namespace {
 
 using namespace std::chrono_literals;
+using talos::testing::AllocationProbe;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
 
@@ -35,6 +37,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// The node test matrix for an observer, docs/TESTING.md §7: the case names
+// are the matrix's, which //tools:check_node_matrix looks for.
 class LocalizerTest : public ::testing::Test {
  protected:
   using State = Localizer::State;
@@ -59,7 +63,7 @@ class LocalizerTest : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(LocalizerTest, FollowsAUsableObservation) {
+TEST_F(LocalizerTest, PublishesFromALiveInput) {
   sim.step(20ms);
   Observe("front_camera", 1.0, 2.0);
   sim.step(40ms);
@@ -79,7 +83,8 @@ TEST_F(LocalizerTest, EstimatesWhileTheRobotIsDisabled) {
   EXPECT_DOUBLE_EQ(Latest().pose().x_m(), 3.0);
 }
 
-TEST_F(LocalizerTest, StaleInputIsInvalidAndHoldsThePose) {
+// REQ-CONTRACT-25
+TEST_F(LocalizerTest, StaleInputClearsValidity) {
   sim.step(20ms);
   Observe("front_camera", 1.0, 2.0);
   sim.step(40ms);
@@ -120,6 +125,50 @@ TEST_F(LocalizerTest, CountsEveryObservationBetweenTicks) {
   const State state = Latest();
   EXPECT_EQ(state.observation_accepted_count(), 2u);
   EXPECT_EQ(state.observation_rejected_count(), 1u);
+}
+
+// REQ-CONTRACT-18
+TEST(LocalizerParameters, BadParameterFailsConstruction) {
+  const struct {
+    const char* key;
+    const char* settings;  // [subsystems.localizer]
+  } rows[] = {
+      {"cameras", "observation_timeout_us = 500000"},
+      {"cameras", "cameras = 3"},
+      {"observation_timeout_us",
+       "cameras = ['front_camera']\nobservation_timeout_us = 0"},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.settings);
+    Sim sim = Sim::FromToml(
+        std::string{"[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
+                    "[subsystems.localizer]\n"} +
+        row.settings +
+        "\n[subsystems.chassis.motors.chassis_motor]\n"
+        "type = 'TalonFX'\ncan_id = 1\n");
+    try {
+      sim.add<Localizer>("localizer");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
+// REQ-RT-06: a tick that drains a queued observation, picks it and publishes
+// the estimate allocates nothing.
+TEST_F(LocalizerTest, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  sim.step(40ms);
+  Observe("front_camera", 1.0, 2.0);
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Latest().observation_accepted_count(), 1u);
 }
 
 struct Result {
