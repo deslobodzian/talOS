@@ -512,8 +512,9 @@ void HardwareNode::Tick(uint64_t now_us) {
       }
 
       // Controller transition: reboot, reconfiguration, epoch bump, or an
-      // enabled/fault edge (the gateway invalidates its epoch on disable,
-      // re-enable, and fault recovery, so the edge check is belt and braces).
+      // enabled/fault edge (the gateway advances its epoch on disable,
+      // re-enable and total feedback loss, not when that fault clears, so the
+      // edge check is belt and braces).
       // Every cached merge dies here: motion resumes only on fresh subsystem
       // requests stamped with the new identity.
       const bool transition =
