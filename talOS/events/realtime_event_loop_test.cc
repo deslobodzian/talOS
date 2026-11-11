@@ -269,6 +269,63 @@ TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
   }
 }
 
+// What talOS/node stops a node with, so that no thread has to poll for a
+// stop: a watched fd turning readable ends the loop's wait, and its handler
+// runs on the loop thread, whether the byte was there before the run or
+// arrives while the loop runs, under each delivery an idle node can run
+// with. The loop has no timer and a 30 s backstop, so nothing but the fd
+// ends its one wait before the run's 20 s end; and the fd is no publication,
+// so nothing drains.
+// REQ-OPS-06
+TEST(RealtimeEventLoop, AWatchedFdEndsTheWaitOnTheLoopThread) {
+  int index = 0;
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    for (const bool before_run : {true, false}) {
+      SCOPED_TRACE(
+          ::testing::Message()
+          << "delivery " << static_cast<int>(delivery)
+          << (before_run ? ", byte before the run" : ", byte while it runs"));
+      int fds[2];
+      ASSERT_EQ(::pipe(fds), 0);
+      RealtimeEventLoop<> loop{on_publish()};
+      loop.set_delivery(delivery);
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.set_prompt(
+            register_sensor_watcher(loop, "/tfd_" + std::to_string(::getpid()) +
+                                              "_" + std::to_string(index++)));
+      }
+      int calls = 0;
+      std::thread::id ran_on;
+      loop.watch_fd(fds[0], [&] {
+        ++calls;
+        ran_on = std::this_thread::get_id();
+        loop.exit();
+      });
+      const char byte = 1;
+      if (before_run) ASSERT_EQ(::write(fds[1], &byte, 1), 1);
+      std::thread writer{[&] {
+        if (before_run) return;
+        if (await([&] { return loop.running(); })) {
+          EXPECT_EQ(::write(fds[1], &byte, 1), 1);
+        }
+      }};
+
+      const MonotonicTime start = Poller::now();
+      loop.run_for(20s);  // Bound only; the handler exits.
+      const Duration elapsed = Poller::now() - start;
+      writer.join();
+      ::close(fds[0]);
+      ::close(fds[1]);
+
+      EXPECT_EQ(calls, 1);
+      EXPECT_EQ(ran_on, std::this_thread::get_id());
+      EXPECT_LT(elapsed, Duration{10s}) << "the wait ended at the run's end";
+      EXPECT_EQ(loop.activity().wakeups, 1u);
+      EXPECT_EQ(loop.activity().drains, 0u);
+    }
+  }
+}
+
 TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   RealtimeEventLoop<> loop;
   std::atomic<bool> started{false};

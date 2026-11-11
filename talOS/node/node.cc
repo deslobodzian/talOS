@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +15,6 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1293,6 +1293,12 @@ int RunMain(int argc, char** argv, const char* node_name,
     // stays blocked (the handlers restart it); the launcher's SIGKILL after its
     // grace bounds that.
     process::InstallStopHandlers();
+    const int stop_fd = process::StopFd();
+    if (stop_fd < 0) {
+      throw std::runtime_error(
+          std::string{node_name} +
+          ": cannot create the stop pipe: " + std::strerror(errno));
+    }
     // The launcher bounds each node's share of the session's log budget; at
     // the cap the log drops its oldest segments to keep the newest records
     // (LogWriterOptions::max_bytes) and `<log>.capped` marks it incomplete.
@@ -1314,22 +1320,21 @@ int RunMain(int argc, char** argv, const char* node_name,
       std::printf("%s: stopped during construction\n", node_name);
       return 0;
     }
+    // A stop from here on makes the stop pipe readable, which ends the loop's
+    // wait wherever it waits, and the loop exits from its own thread: no
+    // thread polls for a stop, so an idle node is woken only by its own
+    // timers and publications. A stop that lands before the run starts is
+    // still in the pipe at the loop's first wait.
+    loop.watch_fd(stop_fd, [&loop] {
+      if (process::ConsumeStopWake()) loop.exit();
+    });
     reporter.start(loop, ByteTopicSources(*hosted->node),
                    Endpoints(*hosted->node), Selections(*hosted->node));
 
-    std::jthread stopper{[&](const std::stop_token& stop) {
-      while (!stop.stop_requested()) {
-        if (process::stop_requested.load() && loop.running()) {
-          loop.exit();
-          return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{20});
-      }
-    }};
-    // Last, from this thread: the reporter and the stopper above are
-    // bookkeeping and must not inherit the loop's realtime policy. The row
-    // carries the outcome, where the launcher and session_report look for a
-    // loop that runs without its grant.
+    // Last, from this thread: the reporter is bookkeeping and must not
+    // inherit the loop's realtime policy. The row carries the outcome, where
+    // the launcher and session_report look for a loop that runs without its
+    // grant.
     process::RealtimeOutcome realtime{.tier =
                                           NodeAccess::loop_tier(*hosted->node)};
     if (process::RealtimeRequested(flags.simulation)) {
@@ -1342,7 +1347,6 @@ int RunMain(int argc, char** argv, const char* node_name,
     } else {
       loop.run();
     }
-    stopper.request_stop();
     std::printf("%s: dispatches=%llu recording_failed=%d recording_capped=%d\n",
                 node_name,
                 static_cast<unsigned long long>(loop.dispatch_count()),

@@ -5,6 +5,10 @@
 // reads, it prints whether the stop has landed ("stop requested" or
 // "running"), which is how the test knows the signal arrived while the
 // constructor was still blocked.
+//
+// It has no update(), timer or subscription, so once constructed its loop
+// waits on nothing: node_test stops it there too, where only the stop can
+// end the wait before --duration-s.
 
 #include <unistd.h>
 
@@ -35,8 +39,6 @@ class Blocked {
       std::fflush(stdout);
     }
   }
-
-  void update() {}
 };
 
 TALOS_NODE(Blocked)

@@ -114,8 +114,8 @@ talos_cc_node(
     visibility = ["//visibility:private"],
 )
 
-# A node whose constructor blocks until stdin closes, for the stop-during-
-# construction test.
+# A node whose constructor blocks until stdin closes and whose loop has
+# nothing to run, for the stop tests: during construction, and while idle.
 talos_cc_node(
     name = "blocked_node",
     srcs = ["testdata/blocked_node.cc"],
@@ -151,6 +151,7 @@ cc_test(
         "//talOS/events",
         "//talOS/events:events_log",
         "//talOS/introspection:describe",
+        "//talOS/introspection:registry",
         "//talOS/memory:shared_memory",
         "//talOS/process",
         "//talOS/rtms",

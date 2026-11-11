@@ -5,9 +5,11 @@
 #include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "talOS/events/event_loop_base.h"
@@ -34,7 +36,9 @@ namespace talos::event {
 // receiver's fd readable and the poller return, so an idle loop sleeps until
 // its next timer or the next prompt publication. Every drained message is
 // timestamped with the drain that observed it, which is exactly what replay
-// needs to reproduce, whatever woke the loop.
+// needs to reproduce, whatever woke the loop. watch_fd() adds a descriptor
+// whose readiness ends the same waits, for what must reach the loop thread
+// from outside the program (talOS/node: a stop signal).
 template <RecorderPolicy Recorder = NullRecorder>
 class RealtimeEventLoop
     : public EventLoopBase<RealtimeEventLoop<Recorder>, Recorder> {
@@ -112,6 +116,28 @@ class RealtimeEventLoop
   }
   Delivery delivery() const { return options_.delivery; }
   const Activity& activity() const { return activity_; }
+
+  // Watches `fd` for the run: whenever a wait returns with `fd` readable,
+  // `on_readable` runs on the loop thread, outside any dispatch, before
+  // whatever else that wait returned for. For process plumbing that must
+  // reach the loop thread without a thread of its own polling for it
+  // (talOS/node watches process::StopFd() and calls exit()), not for program
+  // inputs: nothing is recorded, and replay never runs it. The watch is
+  // level-triggered: `on_readable` reads `fd` empty or calls exit(), or the
+  // loop never blocks again. A wait counts in activity().wakeups whatever
+  // woke it; this one alone drains nothing. Call before run(); throws
+  // std::logic_error after, and std::system_error when the poller refuses
+  // `fd`.
+  void watch_fd(int fd, std::function<void()> on_readable) {
+    if (this->registration_closed()) {
+      throw std::logic_error("fds are watched before the run starts");
+    }
+    if (fd < 0 || !on_readable) {
+      throw std::invalid_argument("watch_fd needs an fd and a handler");
+    }
+    poller_.add_fd(fd);
+    fd_watches_.push_back({fd, std::move(on_readable)});
+  }
 
   using SendOutcome = typename Base::SendOutcome;
 
@@ -196,7 +222,9 @@ class RealtimeEventLoop
       const MonotonicTime deadline = std::min(scheduler_.next_deadline(), end);
 
       if (!wake_) {
-        poller_.wait_until(deadline);
+        if (poller_.wait_until(deadline) == Poller::WakeReason::READABLE) {
+          serve_watched_fds();
+        }
         ++activity_.wakeups;
         continue;
       }
@@ -358,6 +386,12 @@ class RealtimeEventLoop
     const auto reason = poller_.wait_until(std::min(deadline, backstop));
     ++activity_.wakeups;
     if (reason == Poller::WakeReason::READABLE) {
+      serve_watched_fds();
+      // A watched fd alone is no publication: nothing to drain.
+      if (!this->running() || !wake_ ||
+          !poller_.reported_readable(wake_->fd())) {
+        return std::nullopt;
+      }
       wake_->drain();
       return Poller::now();
     }
@@ -365,6 +399,14 @@ class RealtimeEventLoop
       return backstop;
     }
     return std::nullopt;
+  }
+
+  // Runs the handler of each watched fd the last wait reported readable.
+  void serve_watched_fds() {
+    for (FdWatch& watch : fd_watches_) {
+      if (!this->running()) return;
+      if (poller_.reported_readable(watch.fd)) watch.on_readable();
+    }
   }
 
   void on_register(const Registration& registration) {
@@ -532,6 +574,11 @@ class RealtimeEventLoop
   std::vector<std::uint16_t> watchers_;
   // The prompt watchers, in registration order (ON_PUBLISH only).
   std::vector<std::uint16_t> prompt_watchers_;
+  struct FdWatch {
+    int fd;
+    std::function<void()> on_readable;
+  };
+  std::vector<FdWatch> fd_watches_;
   Activity activity_;
 };
 

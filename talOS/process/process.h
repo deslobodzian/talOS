@@ -17,28 +17,44 @@ namespace talos::process {
 // Defined once, in process.cc. An inline variable is defined in every shared
 // object that uses it, and one loaded RTLD_LOCAL binds to its own copy: a
 // node library hosted by talos.cpp_node would watch a flag libtalos_node.so
-// never sets.
+// never sets. Set it only through RequestStop, which also wakes the watchers
+// of StopFd(); a test may clear it between cases.
 extern std::atomic<bool> stop_requested;
 static_assert(std::atomic<bool>::is_always_lock_free);
-inline void RequestStop(int) {
-  stop_requested.store(true, std::memory_order_relaxed);
-}
-// SIGINT and SIGTERM set stop_requested instead of ending the process. The
-// handlers restart an interrupted system call (SA_RESTART): a stop must not
-// turn a blocking call in progress, such as a node constructor waiting on a
-// lock, into a spurious error. A restartable call keeps blocking until it
-// returns on its own (poll, select, sleeps and timed socket calls still return
-// EINTR); the launcher escalates to SIGKILL after its grace period. std::signal
-// already installed restarting handlers, so behaviour after construction is
-// unchanged.
-inline void InstallStopHandlers() {
-  struct sigaction action {};
-  action.sa_handler = RequestStop;
-  sigemptyset(&action.sa_mask);
-  action.sa_flags = SA_RESTART;
-  sigaction(SIGINT, &action, nullptr);
-  sigaction(SIGTERM, &action, nullptr);
-}
+
+// Requests a stop: sets stop_requested and, when it was clear, writes one
+// byte to the stop pipe, so that StopFd() reads ready and an event loop
+// watching it wakes at once wherever it waits. The SIGINT/SIGTERM handler,
+// and callable from any thread: async-signal-safe (a lock-free exchange and
+// one write(2) to a non-blocking pipe), keeps errno, never blocks and never
+// fails (a pipe too full to take the byte is readable already). Before the
+// pipe exists it sets only the flag, and the pipe starts readable.
+void RequestStop(int signal = 0) noexcept;
+
+// The read end of this process's stop pipe, for an event loop to watch
+// (event::RealtimeEventLoop::watch_fd): readable once a stop is requested.
+// Created on the first call (InstallStopHandlers makes it), non-blocking and
+// close-on-exec, so no child a node execs inherits it, and never closed. -1
+// when it could not be created (no descriptor left).
+int StopFd() noexcept;
+
+// For a watcher of StopFd() that found it readable: whether a stop is
+// requested. A stop leaves the pipe readable, so every watcher sees it. When
+// none is requested (stop_requested was cleared after an earlier stop), it
+// reads the stale bytes out, so a level-triggered watcher does not spin, and
+// then answers from the flag again, so a stop that lands meanwhile is not
+// lost.
+bool ConsumeStopWake() noexcept;
+
+// SIGINT and SIGTERM call RequestStop instead of ending the process, and the
+// stop pipe exists before either can arrive. The handlers restart an
+// interrupted system call (SA_RESTART): a stop must not turn a blocking call
+// in progress, such as a node constructor waiting on a lock, into a spurious
+// error. A restartable call keeps blocking until it returns on its own (poll,
+// select, sleeps and timed socket calls still return EINTR); the launcher
+// escalates to SIGKILL after its grace period. std::signal already installed
+// restarting handlers, so behaviour after construction is unchanged.
+void InstallStopHandlers();
 
 struct RealtimeOptions {
   std::chrono::nanoseconds period{};  // loop period (Mach time-constraint)

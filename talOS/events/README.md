@@ -44,6 +44,14 @@ the firings it produces, and those are recorded.
 
 `exit()` and `running()` are thread-safe; other API calls and lifecycle
 operations require external serialization. `exit()` is not a signal-handler API.
+What must reach a `RealtimeEventLoop` from outside the program, a signal
+above all, goes through `watch_fd(fd, handler)`, set before the run: a wait
+that finds `fd` readable runs the handler on the loop
+thread, outside any dispatch and unrecorded, and a readable `fd` alone drains
+nothing. The watch is level-triggered, so the handler reads `fd` empty or
+calls `exit()`. A node stops this way: SIGINT and SIGTERM make
+`process::StopFd()` readable and its handler calls `exit()`
+(`RealtimeEventLoop.AWatchedFdEndsTheWaitOnTheLoopThread`).
 Realtime and replay loop instances run once.
 
 ## The three loops
