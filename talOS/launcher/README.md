@@ -652,7 +652,9 @@ superseded while it was busy). A reader therefore sees a version shortly
 after the change it records, not before. A killed launcher leaves its last
 written version (`end_wall_ns = 0` means no normal shutdown). Each node's
 event log file is synced with `DurableSync` when its loop ends (the file, not
-its directory), and with a plain `fsync` once a second while it runs; a
+its directory), and with a plain `fsync` once a second while it runs (a
+killed node loses only about its last 10 ms, which its writer had not yet
+written: [log format](../events/README.md#log-format)); a
 capped log's rotation also syncs the finished segment and the next one's
 header with `DurableSync`, then the directory, so a power loss leaves whole
 segments (`LogWriter`).

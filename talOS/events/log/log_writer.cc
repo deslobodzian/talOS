@@ -484,7 +484,14 @@ void LogWriter::State::append(RecordHeader header,
   active->used += total;
   segment_used += total;
   if (options.background) {
-    active->committed.store(active->used, std::memory_order_release);
+    // Sequentially consistent, like the writer_idle check after it: either
+    // the writer, about to sleep, sees this record, or this sees it asleep
+    // and posts. A busy writer costs one atomic load per record.
+    active->committed.store(active->used, std::memory_order_seq_cst);
+    if (writer_idle.load(std::memory_order_seq_cst) &&
+        writer_idle.exchange(false, std::memory_order_seq_cst)) {
+      wake.post();
+    }
   } else if (std::chrono::steady_clock::now() - last_sync >=
              options.sync_interval) {
     submit_active();
@@ -547,50 +554,69 @@ void LogWriter::State::start_writer() {
     raw->chunk_ready.notify_all();
 
     for (;;) {
-      // Sleep, without the mutex, until a hand-off (the producer posts when
-      // it finds the writer idle), flush()/destruction (which always post),
-      // or the next periodic sync. A post that lands before the wait is kept
-      // by the semaphore, so none is lost; a stale one only makes the next
-      // wait return at once and the loop check again.
-      const auto sync_at = raw->last_sync + raw->options.sync_interval;
-      lock.unlock();
-      raw->writer_idle.store(true, std::memory_order_seq_cst);
-      if (raw->completed.load() == raw->submitted.load() &&
-          !raw->stopping.load()) {
-        raw->wake.wait_until(sync_at);
-      }
-      raw->writer_idle.store(false, std::memory_order_seq_cst);
-      lock.lock();
-
-      const bool sync_due = std::chrono::steady_clock::now() - raw->last_sync >=
-                            raw->options.sync_interval;
+      const auto now = std::chrono::steady_clock::now();
       const auto next = raw->completed.load(std::memory_order_relaxed);
       const bool submitted =
-          next != raw->submitted.load(std::memory_order_acquire);
-      if (!submitted && !sync_due) {
-        if (raw->stopping) {
-          return;
+          next != raw->submitted.load(std::memory_order_seq_cst);
+      // The oldest chunk not yet completed: a handed-over one, else the one
+      // the producer is filling.
+      Chunk* chunk = &raw->pool[next % raw->pool.size()];
+      const bool unwritten =
+          chunk->committed.load(std::memory_order_seq_cst) > chunk->written;
+      const bool sync_due = now - raw->last_sync >= raw->options.sync_interval;
+      const bool write_due =
+          unwritten && now - raw->last_write >= raw->options.write_interval;
+
+      if (submitted || write_due || sync_due) {
+        // The mutex is never held across the write, so a slow disk cannot
+        // make the loop thread's hand-off block behind it.
+        lock.unlock();
+        raw->write_chunk(*chunk);
+        lock.lock();
+        // A sync with nothing to write opens no write window.
+        if (submitted || unwritten) raw->last_write = now;
+
+        if (submitted) {
+          chunk->committed.store(0, std::memory_order_relaxed);
+          chunk->written = 0;
+          raw->completed.store(next + 1, std::memory_order_release);
+          raw->chunk_ready.notify_all();
+        }
+        if (sync_due) {
+          raw->sync(/*durable=*/false);
         }
         continue;
       }
+      if (raw->stopping) {
+        return;
+      }
 
-      Chunk* chunk = &raw->pool[next % raw->pool.size()];
-
-      // The mutex is never held across the write, so a slow disk cannot make
-      // the loop thread's hand-off block behind it.
+      // Sleep, without the mutex. Within write_interval of the last write
+      // the writer sleeps until that write is due again without telling the
+      // producer it is idle, so records arriving at a steady rate are
+      // written once per write_interval and the producer never posts. Past
+      // it with nothing to write, the writer sleeps until a hand-off or a
+      // new record (the producer posts when it finds the writer idle),
+      // flush()/destruction (which always post), or the next periodic sync.
+      // A post that lands before the wait is kept by the semaphore, so none
+      // is lost; a stale one only makes the next wait return at once and
+      // the loop check again.
+      const auto sync_at = raw->last_sync + raw->options.sync_interval;
+      const auto write_at = raw->last_write + raw->options.write_interval;
       lock.unlock();
-      raw->write_chunk(*chunk);
+      if (now < write_at) {
+        raw->wake.wait_until(std::min(write_at, sync_at));
+      } else {
+        raw->writer_idle.store(true, std::memory_order_seq_cst);
+        if (raw->completed.load() == raw->submitted.load() &&
+            chunk->committed.load(std::memory_order_seq_cst) ==
+                chunk->written &&
+            !raw->stopping.load()) {
+          raw->wake.wait_until(sync_at);
+        }
+        raw->writer_idle.store(false, std::memory_order_seq_cst);
+      }
       lock.lock();
-
-      if (submitted) {
-        chunk->committed.store(0, std::memory_order_relaxed);
-        chunk->written = 0;
-        raw->completed.store(next + 1, std::memory_order_release);
-        raw->chunk_ready.notify_all();
-      }
-      if (sync_due) {
-        raw->sync(/*durable=*/false);
-      }
     }
   }};
 }
