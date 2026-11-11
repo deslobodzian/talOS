@@ -219,6 +219,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
 | `talOS/vision` (CPU pipeline, capture, `field_sim`) | REQ-CONTRACT-27, REQ-DEV-11 |
 | `talOS/vision/metal`, `talOS/vision/recording` | none in the catalogue (TODO.md SCOPE-1) |
+| `talOS/aiming` | none in the catalogue (TODO.md AIM-1) |
 | `2026-robot/main_processor/{shooter,drivetrain,intake}` | REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-SAFE-31, REQ-SAFE-32 (intake), REQ-CONTRACT-25 |
 | `2026-robot/main_processor/driver` | REQ-SAFE-14, REQ-SAFE-31 |
 | `2026-robot/main_processor/autonomous` | REQ-SAFE-31, REQ-SAFE-33, REQ-SAFE-34 |
