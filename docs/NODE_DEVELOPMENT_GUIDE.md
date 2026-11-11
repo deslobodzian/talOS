@@ -85,16 +85,18 @@ sees:
   its next timer or on another topic's wake. Use it when the node needs every
   message (an invalid one between valid ones must not hide them) but acts on
   them only at its tick or next packet. More than 64 between two drains fall
-  behind.
+  behind. The `driver` takes `/drivetrain/state` headings this way: the
+  drivetrain's 5 ms ticks never wake it, and an invalid state cannot hide the
+  valid one before it.
 - A **latest-value read** (`subscribe(topic)`, no callback) keeps only the
   newest message per drain: for a value read at the tick whose intermediate
-  values do not matter. The `driver` reads `/drivetrain/state` this way, so
-  the drivetrain's ticks never wake it.
+  values do not matter.
 
 In each, `age()` counts from publication, not delivery, also inside a
 callback. A drain delivers in registration order, so a listener sees, in the
 same drain, the messages of the subscriptions opened before it: open those
-first.
+first (the `driver` opens `/drivetrain/state` before its Driver Station
+link, so a packet is mapped with the headings delivered in its drain).
 
 ### Realtime scheduling
 

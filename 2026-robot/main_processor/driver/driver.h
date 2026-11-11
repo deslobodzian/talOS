@@ -16,11 +16,11 @@ namespace driver {
 
 // Maps each Driver Station packet (/hw/state/driver_station, through
 // talos::DriverStation) to teleop requests as it arrives: stick scaling,
-// deadband and field-oriented rotation for the chassis, by the newest
-// /drivetrain/state heading (a read that wakes nothing). It writes only the
-// drivetrain teleop lane (/drivetrain/target/teleop); the drivetrain's
-// talos::Target decides from the match mode whether that lane is the one it
-// follows.
+// deadband and field-oriented rotation for the chassis, by the newest valid
+// /drivetrain/state heading (every state, delivered at the node's drains:
+// the drivetrain's ticks wake nothing). It writes only the drivetrain teleop
+// lane (/drivetrain/target/teleop); the drivetrain's talos::Target decides
+// from the match mode whether that lane is the one it follows.
 class Driver {
  public:
   explicit Driver(talos::Node& node)
@@ -32,12 +32,15 @@ class Driver {
         heading_timeout_{HeadingTimeout(node)},
         rezero_button_id_{node.param("rezero_button_id", 1)},
         heading_hold_radps_{node.param("heading_hold_radps", 0.0)},
-        // Read where it is used, not on arrival: a callback would wake the
-        // node on every drivetrain tick only to store a value. Opened before
-        // the Driver Station link (arming_ opens it), so a drain takes the
-        // newest state before it runs OnDriver for a packet.
+        // Every state, in sequence, so no invalid one hides a valid one, but
+        // at the node's next drain (a packet's wake or update()): waking on
+        // each drivetrain tick would only store a value. Opened before the
+        // Driver Station link (arming_ opens it), so a drain delivers the
+        // states it holds before the packet it runs OnDriver for.
         state_{node.subscribe<drivetrain::DrivetrainState>(
-            drivetrain::topics::kState)},
+            drivetrain::topics::kState,
+            [this](const drivetrain::DrivetrainState& s) { OnState(s); },
+            talos::Wake::kAtDrain)},
         arming_{node},
         chassis_{node, "drivetrain", "teleop", arming_},
         ds_{node, [this] { OnDriver(); }} {}
@@ -45,7 +48,6 @@ class Driver {
   // A Driver Station that stops talking gets the same one release per lane
   // as a disable, instead of the last request aging out downstream.
   void update() {
-    TakeHeading();
     if (!ds_.connected()) Stop();
     if (field_oriented_ && !FreshHeading() && frame_ == Frame::kField)
       SetFrame(Frame::kWaitingForNeutral);
@@ -79,19 +81,14 @@ class Driver {
 
   // The drivetrain owns the heading. A state it marks invalid (no gyro) or a
   // non-finite one carries no direction, so it is dropped and the previous
-  // heading keeps aging toward stale. Each state is taken once, by the first
-  // read after the drain that delivered it, and ages from its publication.
-  void TakeHeading() {
-    if (!state_.has_value()) return;
-    const talos::Time published = node_.now() - state_.age();
-    if (state_taken_ && published == state_published_) return;
-    state_taken_ = true;
-    state_published_ = published;
-    const drivetrain::DrivetrainState& state = *state_;
-    if (!state.yaw_valid() || !std::isfinite(state.yaw_rad())) return;
-    yaw_rad_ = state.yaw_rad();
-    measured_omega_radps_ = state.omega_radps();
-    heading_at_ = published;
+  // heading keeps aging toward stale. A valid one ages from its publication
+  // (state_.age() is this message's), not from the later drain that
+  // delivered it, so the drain's wait never stretches heading_timeout_.
+  void OnState(const drivetrain::DrivetrainState& s) {
+    if (!s.yaw_valid() || !std::isfinite(s.yaw_rad())) return;
+    yaw_rad_ = s.yaw_rad();
+    measured_omega_radps_ = s.omega_radps();
+    heading_at_ = node_.now() - state_.age();
     have_heading_ = true;
     if (arming_.armed() && translation_neutral_) SetFrame(Frame::kField);
   }
@@ -118,7 +115,6 @@ class Driver {
   }
 
   void OnDriver() {
-    TakeHeading();
     const talos::Joystick stick = ds_.joystick(0);
     // Each Target also gates on mode, but a producer that keeps talking while
     // disabled would still be publishing live requests onto its lanes.
@@ -234,8 +230,6 @@ class Driver {
   bool holding_heading_ = false;
   bool hold_settling_ = false;
   bool rezero_pressed_ = false;
-  talos::Time state_published_{};
-  bool state_taken_ = false;
   talos::Time heading_at_{};
   bool have_heading_ = false;
   bool commanding_ = false;

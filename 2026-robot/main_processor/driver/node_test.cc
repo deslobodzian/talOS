@@ -95,10 +95,14 @@ can_id = 1
   // `omega_radps` is the rotation the drivetrain's modules measure.
   void PublishHeading(double yaw_rad, bool yaw_valid = true,
                       double omega_radps = 0) {
+    PublishState(yaw_rad, yaw_valid, omega_radps);
+    sim_.step(10ms);
+  }
+  // The same state, published now, without stepping.
+  void PublishState(double yaw_rad, bool yaw_valid, double omega_radps = 0) {
     const drivetrain::DrivetrainState state{
         0, true, true, yaw_valid, 0, 0, omega_radps, yaw_rad, {}, {}, {}, {}};
     sim_.publish(drivetrain::topics::kState, state);
-    sim_.step(10ms);
   }
   void Advance(talos::Duration d) { sim_.step(d); }
   // Envelopes written on /drivetrain/target/teleop so far.
@@ -261,6 +265,31 @@ TEST(Driver, HeadingWithinTimeoutStillRotatesTheFieldRelativeRequest) {
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+}
+
+// The drivetrain marks its yaw invalid on alternate 5 ms ticks: valid at
+// 5k+1 ms, invalid at 5k+3 ms, for 200 ms with the stick held forward.
+// Every driver drain (the 5 ms Driver Station packets and its ticks) lands
+// after an invalid state, so a read of only the newest state per drain never
+// refreshes the heading, which ages past heading_timeout_s (0.1 s) and drops
+// the driver out of the field frame mid-motion (translation held at zero).
+// Every valid state must refresh it: the request stays field-oriented.
+// REQ-RT-02
+TEST(Driver, EveryValidStateRefreshesTheHeadingBetweenInvalidOnes) {
+  Harness harness{kNoDeadbandFieldOriented};
+  harness.PublishHeading(kQuarterTurnRad);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
+  ASSERT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+  for (int tick = 0; tick < 40; ++tick) {
+    harness.Advance(1ms);
+    harness.PublishState(kQuarterTurnRad, true);
+    harness.Advance(2ms);
+    harness.PublishState(0.0, false);
+    harness.Advance(2ms);
+  }
+  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
+  EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9)
+      << "the driver left the field frame";
 }
 
 TEST(Driver, WithoutFreshFiniteHeadingRearmsRobotRelativeAtNeutral) {
