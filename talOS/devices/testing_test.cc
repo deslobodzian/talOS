@@ -5,10 +5,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
@@ -41,6 +43,13 @@ channel = 0
 [subsystems.mech.sensors.angle]
 type = "CANcoder"
 can_id = 4
+[subsystems.mech.motors.remote]
+can_id = 5
+feedback = "RemoteCANcoder"
+feedback_sensor = "angle"
+[subsystems.mech.motors.follower]
+can_id = 6
+follow = "braked"
 
 [subsystems.other.motors.motor]
 can_id = 3
@@ -380,12 +389,17 @@ TEST_F(SimHardwareTest, ResetAndRebootRefuseRequestsAsTheGatewayDoes) {
   sim.step(5ms);  // the first of two masking States
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kVelocity);
-  sim.step(10ms);  // restored
+  sim.step(5ms);  // the second
+  const hardware::Command while_masked = Drive();
+  sim.step(5ms);  // restored
   ASSERT_TRUE(Motor("braked").valid);
-  // A request observed before the reset never drives the reset motor.
+  // A request observed before the reset, or on the last State that masked
+  // the motor, never drives it.
   Send("mech", before_reset);
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   EXPECT_EQ(hw.applied_motor("mech", "coasting").mode, Mode::kVelocity);
+  Send("mech", while_masked);
+  EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kNeutral);
   Send("mech", Drive());
   EXPECT_EQ(hw.applied_motor("mech", "braked").mode, Mode::kVelocity);
 
@@ -425,6 +439,64 @@ TEST_F(SimHardwareTest, FeedbackAsOldAsTheCommandTimeoutIsInvalid) {
     EXPECT_EQ(Motor("braked").valid, c.valid);
     EXPECT_EQ(Sensor("angle").valid, c.valid);
     EXPECT_TRUE(Motor("coasting").valid);
+  }
+}
+
+// REQ-SAFE-22: as on the gateway, a motor that cannot drive in a State (its
+// feedback disconnected or too old, its remote CANcoder's, or a follower's
+// master's) applies neutral from that tick, with no new request, and so does
+// a request built while it could not; the others keep driving in the same
+// epoch. After recovery the request in force, or one observed on the last
+// State that showed it unable, still leaves it neutral; one observing a
+// later State drives it.
+TEST_F(SimHardwareTest, AMotorThatCannotDriveIsNeutralFromThatTick) {
+  struct Case {
+    const char* name;
+    std::function<void(bool)> lose;
+    std::vector<std::string_view> unable;
+  };
+  const std::vector<Case> cases = {
+      {"disconnected",
+       [&](bool lost) { hw.set_connected("mech", "braked", !lost); },
+       {"braked", "follower"}},
+      {"aged",
+       [&](bool lost) {
+         hw.set_motor("mech", "braked", 0, 0, lost ? 50'000 : 0, 0);
+       },
+       {"braked", "follower"}},
+      {"remote CANcoder aged",
+       [&](bool lost) {
+         hw.set_cancoder("mech", "angle", 0, 0, lost ? 50'000 : 0, 0);
+       },
+       {"remote"}},
+  };
+  const auto expect = [&](std::string_view motor, Mode mode) {
+    EXPECT_EQ(hw.applied_motor("mech", motor).mode, mode) << motor;
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    Send("mech", Drive());
+    for (const auto motor : {"braked", "follower", "remote"}) {
+      expect(motor, Mode::kVelocity);
+    }
+    const std::uint64_t epoch = State().epoch;
+    c.lose(true);
+    sim.step(5ms);  // the first State that shows it
+    for (const auto motor : c.unable) expect(motor, Mode::kNeutral);
+    expect("coasting", Mode::kVelocity);
+    EXPECT_EQ(State().epoch, epoch);
+    const hardware::Command while_unable = Drive();
+    Send("mech", while_unable);
+    for (const auto motor : c.unable) expect(motor, Mode::kNeutral);
+    expect("coasting", Mode::kVelocity);
+
+    c.lose(false);
+    sim.step(5ms);  // recovered, the last request still in force
+    for (const auto motor : c.unable) expect(motor, Mode::kNeutral);
+    Send("mech", while_unable);
+    for (const auto motor : c.unable) expect(motor, Mode::kNeutral);
+    Send("mech", Drive());
+    for (const auto motor : c.unable) expect(motor, Mode::kVelocity);
   }
 }
 
