@@ -60,6 +60,8 @@ name = "wrist"
 
 [wrist]
 tolerance_rot = 0.01
+min_rot = 0.0          # a homed mechanism needs a finite travel
+max_rot = 0.4          # within one sensor rotation
 homing = "absolute"
 absolute_sensor = "angle"
 
@@ -78,12 +80,19 @@ built this way.
 ## Safety
 
 The framework's rules hold unchanged (ARCHITECTURE.md "The tick"). A request
-(`set_goal`, `hold`, `stop`) is for one tick and `update()` consumes it, so a
-tick without `set_goal()` drives nothing and the devices layer sends neutral.
-The library never actuates on its own: no hold after the target goes, no
-spin-down without a goal, no homing without a goal. It also drives nothing
-while `robot_enabled(node)` is false, with a disconnected motor, or on a
-non-finite goal or feedforward, and never commands from outside `update()`.
+(`set_goal`, `hold`, `stop`, `clear_fault`) is accepted only inside the
+node's `update()`; from the constructor, `every()` or a message callback it
+throws `std::logic_error` naming the mechanism, as a `Motor` setter does
+(`talos::RequireInUpdate`). It lasts only the tick it was made in: the
+mechanism's `update()` in that same tick consumes it, and one left from a
+tick whose `update()` was skipped is dropped. So a tick without `set_goal()`
+drives nothing and the devices layer sends neutral. The library never
+actuates on its own: no hold after the target goes, no spin-down without a
+goal, no homing without a goal. It also drives nothing while
+`robot_enabled(node)` is false or on a non-finite goal or feedforward;
+`PositionMechanism` and `VelocityMechanism` drive nothing with a
+disconnected motor, while `RollerWithSensor` reads no motor feedback and
+relies on the gateway, which neutralizes a motor whose feedback is invalid.
 It does not read a lane itself: gating on a live `Target` is the owner's call,
 as in the example above.
 
@@ -102,9 +111,9 @@ whenever no goal is driven.
 |---|---|---|---|
 | `tolerance_rot` | rot | required, > 0 | at goal within this |
 | `at_goal_debounce_us` | µs | 0 | continuously in tolerance this long before `kAtGoal`; leaving is immediate |
-| `min_rot`, `max_rot` | rot | -inf, +inf | goals clamp to this travel (after wrap) |
+| `min_rot`, `max_rot` | rot | -inf, +inf | goals clamp to this travel (after wrap); required and finite when `wrap_rot > 0` or `homing` is not `"none"` |
 | `units_per_rot` | your unit / rot | 1 | for `set_goal_units()` and `position_units()` |
-| `wrap_rot` | rot | 0 (off) | a goal goes to its equivalent (`goal + k * wrap_rot`) nearest the current position, inside the travel when one is: a turret |
+| `wrap_rot` | rot | 0 (off) | a goal goes to its equivalent (`goal + k * wrap_rot`) nearest the current position, inside the travel when one is: a turret (whose finite travel keeps it from winding its cables) |
 | `control` | | `"motion_magic"` | or `"position"` (plain position PID) |
 | `slot` | | 0 | the controller gain slot, 0 to 2 |
 | `gravity` | | `"elevator"` | `"elevator"`: `+gravity_v` always; `"arm"`: `gravity_v * cos(2π (position - gravity_zero_rot))` |
@@ -116,22 +125,26 @@ whenever no goal is driven.
 | `stall_current_a` | A | 0 | 0 judges by velocity alone |
 | `move_timeout_us` | µs | 0 (off) | one goal (a change beyond `tolerance_rot` restarts it) not reached this long: fault `kMoveTimeout` |
 
-Homing sets the frame; until it holds the mechanism drives no goal.
+Homing sets the frame; until it holds the mechanism drives no goal. Only
+`set_goal()` starts homing: `hold()` on an unhomed mechanism is neutral
+(`kUnhomed`), since there is no position to hold.
 
 | `homing` | Frame from | Keys |
 |---|---|---|
 | `"none"` | the motor's absolute frame; construction refuses a `"rezero"`-frame motor, which would never drive | |
 | `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
-| `"stall"` | `rezero(home_rot)` once homing has pushed a still mechanism for `homing_stall_us` | the drive keys |
-| `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1), `absolute_offset_rot` (rot, default 0) |
+| `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only after the mechanism has moved or the push has lasted `homing_min_push_us`, so a slow start is not taken for the stop | the drive keys, `homing_stall_current_a` (A, required, > 0), `homing_min_push_us` (µs, required, > 0) |
+| `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1; its magnitude must be at least `max_rot - min_rot`, so one sensor rotation covers the travel and the boot reading is unambiguous), `absolute_offset_rot` (rot, default 0) |
 
-Drive keys: `homing_v` (V, nonzero, pointing at `home_rot`, which must be the
-travel end that way: `min_rot` for a negative `homing_v`), `home_rot` (rot,
-default 0), `homing_timeout_us` (> 0), `homing_stall_rps` (> 0),
-`homing_stall_us` (> 0). Homing drives `homing_v` only on a live goal; losing
-the goal pauses the motion but not the timeout, which counts from the first
-push since the last zero or Driver Station disable. A device reset or a
-RoboRIO reboot that drops the zero sends the mechanism back to homing.
+Drive keys, all required except `home_rot`: `homing_v` (V, nonzero, at most
+half the motor's `max_voltage`, pointing at `home_rot`, which must be the
+travel end that way: `min_rot` for a negative `homing_v`, `max_rot` for a
+positive one), `home_rot` (rot, default 0), `homing_timeout_us` (> 0),
+`homing_stall_rps` (rot/s, > 0), `homing_stall_us` (> 0). Homing drives
+`homing_v` only on a live goal; losing the goal pauses the push but not the
+timeout, which counts from the first push since the last zero or Driver
+Station disable. The timeout always faults; it never homes. A device reset or
+a RoboRIO reboot that drops the zero sends the mechanism back to homing.
 
 Faults latch neutral (`kFaulted`) until `clear_fault()` or a Driver Station
 that reports disabled; a stale link does not clear them:
@@ -159,6 +172,7 @@ is `control::VelocityState` (`requested_rps` is the clamped goal).
 
 A goal of at most 1e-3 rot/s is never at speed, and a change of the asked
 goal restarts the entry count. These are the 2026 shooter's readiness rules.
+`VelocityMechanism` drives nothing with a disconnected motor.
 
 ## RollerWithSensor
 
@@ -167,10 +181,15 @@ A voltage roller and a digital piece sensor. Commands: `kIdle`, `kIntake`,
 a piece), `kHolding` (`hold_v`, or neutral without one, while the piece
 stays), `kEjecting` (`eject_v` for `eject_us`), `kFeeding` (`feed_v` for
 `feed_us`). A run starts from `kIntaking` or `kHolding` when asked, and from
-`kIdle` only with `idle_runs` and only when newly asked, so holding the
-button runs it once. With no live request the roller is neutral and the
-phases carry on as if asked for `kIdle`: a held piece stays `kHolding` and a
-timed run finishes its clock.
+`kIdle` only with `idle_runs` and only when newly asked: a command that
+differs from the last live request. Holding the button, or asking the same
+command again after a stale spell, a release or a disable, runs it once; to
+run it again the producer asks something else (`kIdle`) in between. With no
+live request the roller is neutral and the phases carry on as if asked for
+`kIdle`: a held piece stays `kHolding` and a timed run finishes its clock.
+Losing enable (`robot_enabled` false: a Driver Station disable, a stale
+link) cancels intaking and any timed run, back to `kIdle`, so a re-enable
+within `eject_us` does not resume it; a held piece stays `kHolding`.
 
 | Key | Unit | Default | Meaning |
 |---|---|---|---|
@@ -185,6 +204,9 @@ timed run finishes its clock.
 | `feed_us` | µs | `eject_us` | |
 | `idle_runs` | | false | an eject or feed newly asked in `kIdle` starts a run |
 
+The roller reads no motor feedback: a motor whose feedback is invalid is
+neutralized by the gateway, not by the roller.
+
 ## Tests
 
 ```sh
@@ -192,10 +214,14 @@ bazel test //talOS/mechanisms:all
 ```
 
 One component test per class under `testing::Sim` and `SimHardware`, with
-the library's share of the node test matrix (docs/TESTING.md §7) and each
-feature: stall and absolute homing (including a reset), gravity for elevator
-and arm, turret wrap, at-goal and at-speed edges, spin-down, faults, the
-roller's phases. Limit-switch homing and the travel clamp are tested through
-`examples/superstructure`'s elevator. The tests carry the tags of
+the library's share of the node test matrix (docs/TESTING.md §7), requests
+refused outside `update()` and dropped after a skipped one, and each
+feature: stall homing (a stop after motion, never moving, a slow start, the
+timeout), absolute homing (including a reset), upward limit-switch homing and
+a stuck switch, homing paused without a goal, hold on an unhomed mechanism,
+gravity for elevator and arm, turret wrap, at-goal and at-speed edges,
+spin-down, faults, the roller's phases, a disable cancelling a timed run and
+a held eject across a stale spell. Downward limit-switch homing and the
+travel clamp are also tested through `examples/superstructure`'s elevator. The tests carry the tags of
 REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and
 REQ-SAFE-38 (`RollerWithSensor`).

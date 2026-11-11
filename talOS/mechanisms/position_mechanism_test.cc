@@ -8,11 +8,11 @@
 // selection and generations are the owner's talos::Target, not the
 // library's.
 //
-// Limit-switch homing (consecutive samples, timeout, stall, stuck switch,
-// Driver Station clear, re-homing after a reset) and the travel clamp are
-// covered through the library's first consumer,
-// examples/superstructure/cpp/superstructure_test.cc (ElevatorAlone,
-// ElevatorHoming, ElevatorConfig); they are not repeated here.
+// Limit-switch homing toward a negative homing_v (consecutive samples,
+// timeout, stall, stuck switch, Driver Station clear, re-homing after a
+// reset) and the travel clamp are also covered through the library's first
+// consumer, examples/superstructure/cpp/superstructure_test.cc
+// (ElevatorAlone, ElevatorHoming, ElevatorConfig).
 
 #include "talOS/mechanisms/position_mechanism.h"
 
@@ -47,9 +47,9 @@ namespace ds = driver_station;
 
 // Each subsystem's mechanism is named like the subsystem: [motors.<name>]
 // and the [<name>] parameter table. arm, turret and lift command a remote
-// CANcoder's absolute frame (homing = "none"); hood and wrist home a rezero
-// frame. Device names resolve across the whole config, and a remote sensor
-// must be its own subsystem's, so each CANcoder has its own name.
+// CANcoder's absolute frame (homing = "none"); hood, wrist and top home a
+// rezero frame. Device names resolve across the whole config, and a remote
+// sensor must be its own subsystem's, so each CANcoder has its own name.
 constexpr const char* kRobotToml = R"(
 [robot]
 period_us = 5000
@@ -103,12 +103,15 @@ can_id = 7
 [subsystems.hood.hood]
 tolerance_rot = 0.01
 control = "position"
+min_rot = 0.0
+max_rot = 1.0
 homing = "stall"
 homing_v = -1.0
-min_rot = 0.0
 homing_timeout_us = 500000
 homing_stall_rps = 0.05
 homing_stall_us = 50000
+homing_stall_current_a = 20.0
+homing_min_push_us = 200000
 
 [subsystems.wrist.motors.wrist]
 can_id = 8
@@ -117,9 +120,30 @@ type = "CANcoder"
 can_id = 9
 [subsystems.wrist.wrist]
 tolerance_rot = 0.01
+min_rot = 0.0
+max_rot = 0.5
 homing = "absolute"
 absolute_sensor = "angle"
 absolute_offset_rot = 0.25
+
+[subsystems.top.motors.top]
+can_id = 10
+[subsystems.top.digital_inputs.top_switch]
+dio = 0
+[subsystems.top.top]
+tolerance_rot = 0.01
+min_rot = 0.0
+max_rot = 2.0
+homing = "limit_switch"
+limit_switch = "top_switch"
+limit_switch_closed_reads = true
+homing_v = 1.0
+home_rot = 2.0
+home_samples = 2
+home_margin_rot = 0.2
+homing_timeout_us = 500000
+homing_stall_rps = 0.05
+homing_stall_us = 200000
 )";
 
 // A robot node around one PositionMechanism: its goal is the teleop lane's,
@@ -146,10 +170,11 @@ struct PositionNode {
 
 // One subsystem of kRobotToml on an enabled robot. Set feedback, then
 // Start() puts the Driver Station in enabled teleop.
+template <class N = PositionNode>
 struct Rig {
   explicit Rig(std::string_view subsystem)
       : sim{Sim::FromToml(kRobotToml)},
-        node{sim.add<PositionNode>(subsystem)},
+        node{sim.add<N>(subsystem)},
         hw{sim},
         name{subsystem} {
     hw.enable();
@@ -158,7 +183,7 @@ struct Rig {
     hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
     sim.step(10ms);
   }
-  // The teleop lane, republished every 5 ms for `duration`.
+  // The teleop lane, republished every 5 ms (one tick) for `duration`.
   void Drive(double position_rot, std::chrono::milliseconds duration,
              double feedforward_v = 0) {
     for (auto t = 0ms; t < duration; t += 5ms) {
@@ -167,11 +192,10 @@ struct Rig {
       sim.step(5ms);
     }
   }
-  void SetMotor(double position_rot, double velocity_rps = 0) {
-    hw.set_motor(name, name, position_rot, velocity_rps);
-  }
-  hardware::MotorRequest Request() const {
-    return hw.motor_request(name, name);
+  void SetMotor(double position_rot, double velocity_rps = 0,
+                double stator_current_a = 0) {
+    hw.set_motor(name, name, position_rot, velocity_rps, 0, 0, 0, 0,
+                 stator_current_a);
   }
   hardware::MotorRequest Applied() const {
     return hw.applied_motor(name, name);
@@ -184,10 +208,16 @@ struct Rig {
     EXPECT_FALSE(state.at_goal()) << name;
     EXPECT_DOUBLE_EQ(state.goal_rot(), 0.0) << name;
   }
+  void ExpectHoming(double homing_v) const {
+    EXPECT_EQ(node.mech.phase(), PositionPhase::kHoming) << name;
+    EXPECT_EQ(Applied().mode, Mode::kVoltage) << name;
+    EXPECT_DOUBLE_EQ(Applied().demand, homing_v) << name;
+    EXPECT_FALSE(node.mech.homed()) << name;
+  }
   PositionMechanism& mech() { return node.mech; }
 
   Sim sim;
-  PositionNode& node;
+  N& node;
   SimHardware hw;
   std::string name;
 };
@@ -258,6 +288,67 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
   arm.ExpectNeutral();
 }
 
+// A request outside update() (here a message callback, which would act on
+// a goal no Target selected) is refused, naming the mechanism.
+TEST(PositionMechanism, RequestOutsideUpdateThrows) {
+  struct CallbackNode {
+    explicit CallbackNode(Node& node)
+        : mech{node, "arm"},
+          goal{node.subscribe<control::PositionTarget>(
+              "/test/goal", [this](const control::PositionTarget& t) {
+                mech.set_goal(t.position_rot());
+              })} {}
+    void update() { mech.update(); }
+    PositionMechanism mech;
+    Subscription<control::PositionTarget> goal;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<CallbackNode>("arm");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(10ms);
+  sim.publish("/test/goal", control::PositionTarget{0.2, 0.0});
+  try {
+    sim.step(10ms);
+    ADD_FAILURE() << "set_goal() from a callback was accepted";
+  } catch (const std::logic_error& e) {
+    EXPECT_NE(std::string{e.what()}.find("PositionMechanism 'arm'"),
+              std::string::npos)
+        << e.what();
+  }
+}
+
+// A request lasts the update() it was made in: made in tick N by an owner
+// whose update() then skips the mechanism's update(), it does not drive in
+// tick N + 1.
+TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
+  struct SkippingNode {
+    explicit SkippingNode(Node& node) : mech{node, "arm"} {}
+    void update() {
+      if (!armed) {
+        mech.update();
+        return;
+      }
+      if (step == 0) {
+        mech.set_goal(0.2);  // tick N: requested, but update() is skipped
+      } else {
+        mech.update();  // tick N + 1 on: nothing asked this tick
+      }
+      ++step;
+    }
+    PositionMechanism mech;
+    bool armed = false;
+    int step = 0;
+  };
+  Rig<SkippingNode> arm{"arm"};
+  arm.Start();
+  arm.node.armed = true;
+  arm.sim.step(15ms);
+  ASSERT_GE(arm.node.step, 2);
+  EXPECT_FALSE(arm.mech().driving());
+  EXPECT_EQ(arm.Applied().mode, Mode::kNeutral);
+}
+
 // Each bad [m] table throws at construction, naming the key.
 // REQ-SAFE-36
 TEST(PositionMechanism, BadParameterFailsConstruction) {
@@ -281,55 +372,81 @@ can_id = 2
   // A valid stall-homed mechanism, less homing_v and homing_stall_us.
   const std::string stall =
       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
-      "homing_timeout_us = 100000\nhoming_stall_rps = 0.1\n";
+      "max_rot = 1.0\nhoming_timeout_us = 100000\nhoming_stall_rps = 0.1\n"
+      "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n";
   const std::string ok = stall + "homing_v = -1.0\nhoming_stall_us = 50000\n";
+  const std::string absolute =
+      "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n";
   {
     auto sim = Sim::FromToml(toml(ok));
     EXPECT_NO_THROW(sim.add<PositionNode>("m"));
   }
-  const std::vector<std::pair<std::string, std::string>> bad{
-      {"tolerance_rot", "homing = \"absolute\"\nabsolute_sensor = \"cc\"\n"},
-      {"tolerance_rot",
-       "tolerance_rot = 0.0\nhoming = \"absolute\"\n"
-       "absolute_sensor = \"cc\"\n"},
-      {"homing", "tolerance_rot = 0.1\nhoming = \"magic\"\n"},
-      // "none" on a rezero-frame motor would never drive.
-      {"homing", "tolerance_rot = 0.1\n"},
-      {"limit_switch",
-       "tolerance_rot = 0.1\nhoming = \"limit_switch\"\nhoming_v = -1.0\n"},
-      // Pointing away from home_rot (0, at min_rot).
-      {"homing_v", stall + "homing_v = 1.0\nhoming_stall_us = 50000\n"},
-      {"homing_stall_us", stall + "homing_v = -1.0\n"},
-      {"max_rot", ok + "max_rot = 0.0\n"},
-      {"gravity", ok + "gravity = \"down\"\n"},
-      {"absolute_sensor", "tolerance_rot = 0.1\nhoming = \"absolute\"\n"},
-  };
-  // Gravity from one source: the motor's slot g, or gravity_v, not both.
-  const std::string slot_g = "slot0 = { g = 0.3 }\n";
-  {
-    auto sim = Sim::FromToml(toml(ok, slot_g));
-    EXPECT_NO_THROW(sim.add<PositionNode>("m"));
-  }
-  {
-    auto sim = Sim::FromToml(toml(ok + "gravity_v = 0.5\n", slot_g));
-    try {
-      sim.add<PositionNode>("m");
-      ADD_FAILURE() << "constructed with slot0 g and gravity_v";
-    } catch (const std::invalid_argument& e) {
-      EXPECT_NE(std::string{e.what()}.find("gravity_v"), std::string::npos)
-          << e.what();
-    }
-  }
-  for (const auto& [key, table] : bad) {
-    SCOPED_TRACE(key + " in:\n" + table);
-    auto sim = Sim::FromToml(toml(table));
+  const auto expect_refused = [&](const std::string& key,
+                                  const std::string& config) {
+    SCOPED_TRACE(key + " in:\n" + config);
+    auto sim = Sim::FromToml(config);
     try {
       sim.add<PositionNode>("m");
       ADD_FAILURE() << "constructed";
     } catch (const std::invalid_argument& e) {
       EXPECT_NE(std::string{e.what()}.find(key), std::string::npos) << e.what();
     }
+  };
+  const std::vector<std::pair<std::string, std::string>> bad{
+      {"tolerance_rot", "homing = \"absolute\"\nabsolute_sensor = \"cc\"\n"},
+      {"tolerance_rot", "tolerance_rot = 0.0\n"},
+      {"homing", "tolerance_rot = 0.1\nhoming = \"magic\"\n"},
+      // "none" on a rezero-frame motor would never drive.
+      {"homing", "tolerance_rot = 0.1\n"},
+      {"limit_switch",
+       "tolerance_rot = 0.1\nhoming = \"limit_switch\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_v = -1.0\n"},
+      // Pointing away from home_rot (0, at min_rot).
+      {"homing_v", stall + "homing_v = 1.0\nhoming_stall_us = 50000\n"},
+      // More than half the motor's max_voltage (12 V by default).
+      {"homing_v", stall + "homing_v = -7.0\nhoming_stall_us = 50000\n"},
+      {"homing_stall_us", stall + "homing_v = -1.0\n"},
+      {"homing_stall_current_a",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 100000\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 50000\n"
+       "homing_min_push_us = 50000\n"},
+      {"homing_min_push_us",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 100000\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 50000\n"
+       "homing_stall_current_a = 20.0\n"},
+      {"homing_timeout_us",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_stall_rps = 0.1\nhoming_v = -1.0\n"
+       "homing_stall_us = 50000\nhoming_stall_current_a = 20.0\n"
+       "homing_min_push_us = 50000\n"},
+      {"gravity", ok + "gravity = \"down\"\n"},
+      // A homed mechanism needs a finite travel.
+      {"max_rot",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "homing_timeout_us = 100000\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 50000\n"
+       "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n"},
+      {"min_rot", absolute + "max_rot = 0.5\n"},
+      // Wrap needs a finite travel, or it winds a turret's cables.
+      {"min_rot", "tolerance_rot = 0.1\nwrap_rot = 1.0\n"},
+      {"absolute_sensor",
+       "tolerance_rot = 0.1\nhoming = \"absolute\"\nmin_rot = 0.0\n"
+       "max_rot = 0.5\n"},
+      // 0.5 rot of travel, 0.1 rot per sensor rotation: ambiguous at boot.
+      {"absolute_rot_per_sensor_rot",
+       absolute + "min_rot = 0.0\nmax_rot = 0.5\n"
+                  "absolute_rot_per_sensor_rot = 0.1\n"},
+  };
+  for (const auto& [key, table] : bad) expect_refused(key, toml(table));
+  // Gravity from one source: the motor's slot g, or gravity_v, not both.
+  const std::string slot_g = "slot0 = { g = 0.3 }\n";
+  {
+    auto sim = Sim::FromToml(toml(ok, slot_g));
+    EXPECT_NO_THROW(sim.add<PositionNode>("m"));
   }
+  expect_refused("gravity_v", toml(ok + "gravity_v = 0.5\n", slot_g));
 }
 
 // REQ-RT-06
@@ -349,25 +466,117 @@ TEST(PositionMechanism, UpdateDoesNotAllocate) {
   EXPECT_EQ(lift.mech().phase(), PositionPhase::kAtGoal);
 }
 
-// Stall homing pushes homing_v until the mechanism has been still for
-// homing_stall_us, then sets the frame there (home_rot); control =
-// "position" uses the position loop.
+// Stall homing: the hood moves down under homing_v, reaches its stop and
+// stays still under load for homing_stall_us; that position becomes home
+// (home_rot 0), and control = "position" then uses the position loop.
 // REQ-SAFE-36
-TEST(PositionMechanism, StallHomingSetsTheFrameAtTheHardStop) {
+TEST(PositionMechanism, StallHomingSetsTheFrameWhereTheMechanismStopped) {
   Rig hood{"hood"};
-  hood.SetMotor(2.0);
-  hood.hw.ideal_motors();  // a voltage request does not move it
+  hood.SetMotor(2.3, -0.5, 5.0);  // moving down, light load
   hood.Start();
-  hood.Drive(0.5, 30ms);
-  EXPECT_EQ(hood.mech().phase(), PositionPhase::kHoming);
-  EXPECT_EQ(hood.Applied().mode, Mode::kVoltage);
-  EXPECT_DOUBLE_EQ(hood.Applied().demand, -1.0);
-  EXPECT_FALSE(hood.mech().homed());
+  hood.Drive(0.5, 60ms);
+  hood.ExpectHoming(-1.0);
+  hood.SetMotor(2.0, 0.0, 30.0);  // at the stop: still, high current
+  hood.Drive(0.5, 30ms);          // less than homing_stall_us still
+  hood.ExpectHoming(-1.0);
   hood.Drive(0.5, 40ms);
   EXPECT_TRUE(hood.mech().homed());
+  EXPECT_NEAR(hood.mech().position_rot(), 0.0, 1e-9);
   EXPECT_EQ(hood.Applied().mode, Mode::kPosition);
-  EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);  // 0.5 past the stop
-  EXPECT_EQ(hood.mech().phase(), PositionPhase::kAtGoal);
+  EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);  // 0.5 above the stop
+}
+
+// A mechanism that never moves and shows no load (a slipping belt, an
+// unpowered motor) is no evidence of a stop: homing times out and faults,
+// it never homes.
+TEST(PositionMechanism, StallHomingThatNeverMovesFaultsInsteadOfHoming) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.0, 0.0, 0.0);
+  hood.Start();
+  hood.Drive(0.5, 450ms);
+  hood.ExpectHoming(-1.0);
+  hood.Drive(0.5, 100ms);
+  EXPECT_FALSE(hood.mech().homed());
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kHomingTimeout);
+  hood.ExpectNeutral();
+}
+
+// Slow to get going (under load, below homing_stall_rps) is not a stop: no
+// zero before homing_min_push_us of push unless it has moved.
+TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.3, -0.02, 25.0);  // breaking away: slow, loaded
+  hood.Start();
+  hood.Drive(0.5, 150ms);  // three times homing_stall_us, under min push
+  hood.ExpectHoming(-1.0);
+  hood.SetMotor(2.2, -0.5, 5.0);  // now it moves
+  hood.Drive(0.5, 20ms);
+  hood.SetMotor(2.0, 0.0, 30.0);  // and stops at the hard stop
+  hood.Drive(0.5, 80ms);
+  EXPECT_TRUE(hood.mech().homed());
+  EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
+}
+
+// A mechanism that keeps moving (no stop within reach) times out and faults.
+TEST(PositionMechanism, StallHomingTimesOutWhileStillMoving) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.3, -0.5, 5.0);
+  hood.Start();
+  hood.Drive(0.5, 550ms);
+  EXPECT_FALSE(hood.mech().homed());
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kHomingTimeout);
+  hood.ExpectNeutral();
+}
+
+// Losing the goal pauses homing's push, not its timeout: the push stops at
+// once, and a goal back after the timeout has passed faults.
+TEST(PositionMechanism, HomingPausesWithoutAGoalButKeepsItsTimeout) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.3, -0.5, 5.0);  // moving: no stall
+  hood.Start();
+  hood.Drive(0.5, 300ms);
+  hood.ExpectHoming(-1.0);
+  hood.sim.step(300ms);  // stale after command_timeout_us
+  EXPECT_EQ(hood.mech().phase(), PositionPhase::kUnhomed);
+  hood.ExpectNeutral();
+  hood.Drive(0.5, 20ms);
+  EXPECT_EQ(hood.mech().fault(), PositionFault::kHomingTimeout);
+  hood.ExpectNeutral();
+}
+
+// hold() has no position to hold in an unknown frame: an unhomed mechanism
+// stays neutral and does not start homing.
+TEST(PositionMechanism, HoldNeverStartsHoming) {
+  Rig hood{"hood"};
+  hood.node.hold_mode = true;
+  hood.SetMotor(2.3, -0.5, 5.0);
+  hood.Start();
+  hood.Drive(0.5, 50ms);
+  EXPECT_EQ(hood.mech().phase(), PositionPhase::kUnhomed);
+  EXPECT_FALSE(hood.mech().driving());
+  hood.ExpectNeutral();
+}
+
+// Limit-switch homing upward (positive homing_v, home_rot at max_rot 2.0,
+// a switch that reads true when closed): the closed switch sets the frame,
+// a closed switch at home is fine, and one closed well below home (into the
+// travel) is stuck.
+TEST(PositionMechanism, LimitSwitchHomingUpwardAndAStuckSwitch) {
+  Rig top{"top"};
+  top.SetMotor(5.0, 0.5);  // moving up: no stall
+  top.Start();
+  top.Drive(1.0, 30ms);
+  top.ExpectHoming(1.0);
+  top.hw.set_digital_input("top", "top_switch", true);  // closed
+  top.Drive(1.0, 20ms);  // home_samples (2) closed readings
+  EXPECT_TRUE(top.mech().homed());
+  EXPECT_EQ(top.mech().fault(), PositionFault::kNone);  // closed at home
+  EXPECT_EQ(top.Applied().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(top.Applied().demand, 4.0);  // 1.0 is 1 below raw 5.0
+  top.SetMotor(4.0, 0.0);  // 1.0 below home, switch still closed
+  top.Drive(1.0, 20ms);
+  EXPECT_EQ(top.mech().fault(), PositionFault::kSwitchStuck);
+  top.ExpectNeutral();
 }
 
 // Absolute homing takes the frame from the CANcoder (scaled, offset) without

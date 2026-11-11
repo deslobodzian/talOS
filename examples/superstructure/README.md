@@ -35,9 +35,11 @@ maps the block's phase to its own status enum.
   hold voltage) → EJECTING (reverse for `eject_us`, 500000 µs by default) →
   IDLE. Roller voltages are `intake_v`, `hold_v`, and `eject_v`, in the
   `[roller]` table with `sensor = "beam_break"`. An EJECT asked while IDLE
-  does nothing (`idle_runs` is off). With no target it behaves as asked for
-  IDLE with the roller neutral; the state machine still tracks the beam break
-  and finishes a timed eject.
+  does nothing (`idle_runs` is off). With no target (stale, released or
+  never sent) it behaves as asked for IDLE with the roller neutral; the state
+  machine still tracks the beam break and finishes a timed eject. Losing
+  enable cancels an eject or intake in progress (back to IDLE); a held piece
+  stays HOLDING.
 - **elevator**: motion magic to the goal height (clamped to
   `min_rot`..`max_rot`, 0..12, in the `[lift]` table) while it has a target. It reports STOWED at 0, MOVING,
   or AT_GOAL (within `tolerance_rot`), and echoes the goal that `at_goal`
@@ -116,7 +118,8 @@ HOMING_FAILED latches, neutral, in three cases:
 It clears only when the Driver Station reports disabled; the next enabled
 target retries. A stale hardware link, which also makes `robot_enabled` false,
 does not clear it. The constructor refuses a `homing_v` that does not point
-down toward `home_rot` at `min_rot` (0), a `max_rot` not above `min_rot`, a
+down toward `home_rot` at `min_rot` (0) or exceeds half the lift's
+`max_voltage`, a `max_rot` not finite or not above `min_rot`, a
 `homing_timeout_us`, `homing_stall_rps`, `homing_stall_us` or
 `home_margin_rot` that is not positive and finite, and a `home_samples` below
 1. These are `PositionMechanism`'s limit-switch homing rules

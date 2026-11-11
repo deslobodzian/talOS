@@ -21,7 +21,6 @@ producer/consumer, rate, dynamic payload, and shared-memory slot size.
 
 ```
 robot code        2026-robot/main_processor/*, examples/*
-talOS/mechanisms  PositionMechanism, VelocityMechanism, RollerWithSensor (configured building blocks)
 talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, OperatorArming, testing::SimHardware
 talOS/node        Node, Subscription, Publisher, StateMachine, TALOS_NODE, testing::Sim
 talOS/python      the same API in Python, ctypes over talOS/node_api (libtalos_node.so)
@@ -37,9 +36,7 @@ Allowed dependencies:
   ([NAMING.md](talOS/NAMING.md#topics)), and reads the hardware config only
   for timeouts and actuator ownership (its loop tier). `talOS/devices` is
   built on `Node`'s public API (`extension<T>()`, `after_update()`) and the
-  framework hooks in `detail::NodeAccess`. `talOS/mechanisms` uses only the
-  devices layer's public handles and adds no gating of its own beyond
-  driving nothing without a goal: a node's `Target` still decides.
+  framework hooks in `detail::NodeAccess`.
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
   reimplement a wire format, a memory layout, a state machine, or a C++ node
@@ -72,6 +69,7 @@ Beside the stack:
 | `talOS/teleop` | `:node` framework teleop node; `:deadband` stick deadband calculation; declarative button/axis-to-lane mapping |
 | `talOS/schema` | `talos::Descriptor<M>` (`.bfbs` bytes, name, schema hash), `talos::schema::struct_hash`, the unit-suffix table; Python `talos_schema` and upstream `reflection` classes |
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_cc_shared_node` (C++ nodes for `talos.cpp_node`, linked against `libtalos_node.so`), `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
+| `talOS/mechanisms` | configured building blocks for robot nodes: `PositionMechanism`, `VelocityMechanism`, `RollerWithSensor`; depends only on `talOS/devices`' public API (handles, `robot_enabled`, `RequireInUpdate`), `talOS/node`, `talOS/configuration` and `//talOS/msgs:control`, and is used by robot code; a node still gates on its own `Target` |
 | `talOS/geometry` | header-only SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); C++ drivetrain kinematics and vision transforms |
 | `talOS/aiming` | shooter aiming library (no node): `ShotTable` (distance → flywheel, hood, time of flight; clamped and flagged outside its range), `TargetSolver` (static and shoot-on-the-move aim for a fixed shooter or a turret, bounded time-of-flight iteration) and `ReadinessGate` (ready to fire, first failing reason, tick debounce) |
 | `talOS/trajectory` | time-indexed holonomic trajectories (`sample(t)`, event markers, splits), the Choreo `.traj` loader (`@nlohmann_json`), alliance flips (rotate or mirror) and `HolonomicFollower` (feedforward plus PID to a chassis speed); depends only on `talOS/geometry` |
@@ -324,7 +322,7 @@ manifest fails the build with the regenerate command.
 
 | New thing | Where |
 |---|---|
-| a mechanism | first a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block (`PositionMechanism`, `VelocityMechanism`, `RollerWithSensor`) configured in the subsystem file, wrapped by a thin node as `examples/superstructure/cpp/elevator.h` is; that node is a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
+| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it, generating a self-contained node (walkthrough in [examples/superstructure](examples/superstructure/README.md)). In C++ the node can instead be a thin wrapper over a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block, as `examples/superstructure/cpp/elevator.h` is |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
 | a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named by a parameter of the node that follows it and loaded with `talOS/trajectory`. A bundle does not include it until TODO.md TRAJ-2 (`tools/sync_manifest.py` does not list it in `CONFIG_FILES`): it works in sim and is missing on the deployed robot |

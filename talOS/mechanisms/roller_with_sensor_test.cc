@@ -275,6 +275,87 @@ TEST(RollerWithSensor, StaleLaneGoesNeutral) {
   EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
 }
 
+// Losing enable cancels a timed run: re-enabled within eject_us with the
+// eject still asked, the roller does not pick the run up again.
+TEST(RollerWithSensor, DisableCancelsATimedRun) {
+  Rig intake{"intake"};
+  intake.Sensor("beam", true);
+  intake.Start();
+  intake.Drive(Command::INTAKE, 20ms);
+  intake.Drive(Command::EJECT, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  intake.Sensor("beam", false);  // the piece is leaving
+  intake.hw.enable(false);
+  intake.Drive(Command::EJECT, 20ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  intake.hw.enable();
+  intake.Drive(Command::EJECT, 50ms);  // well inside eject_us
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+}
+
+// With idle_runs, an eject held through a stale spell is still one ask: it
+// runs once, not again when the lane returns.
+TEST(RollerWithSensor, HeldEjectAcrossAStaleSpellRunsOnce) {
+  Rig intake{"intake"};
+  intake.Start();
+  intake.Drive(Command::EJECT, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  intake.sim.step(300ms);  // stale; the run finishes its clock
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  intake.Drive(Command::EJECT, 50ms);
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+}
+
+// A request is refused outside update() (here every()), naming the roller,
+// and lasts only the update() it was made in.
+TEST(RollerWithSensor, RequestIsTiedToItsUpdate) {
+  struct TimerNode {
+    explicit TimerNode(Node& node) : roller{node, "roller"} {
+      node.every(20ms, [this] { roller.set_goal(RollerCommand::kIntake); });
+    }
+    void update() { roller.update(); }
+    RollerWithSensor roller;
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<TimerNode>("intake");
+    try {
+      sim.step(50ms);
+      ADD_FAILURE() << "set_goal() from every() was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find("RollerWithSensor 'roller'"),
+                std::string::npos)
+          << e.what();
+    }
+  }
+  struct SkippingNode {
+    explicit SkippingNode(Node& node) : roller{node, "roller"} {}
+    void update() {
+      if (armed && step++ == 0) {
+        roller.set_goal(RollerCommand::kEject);  // update() skipped
+        return;
+      }
+      roller.update();
+    }
+    RollerWithSensor roller;
+    bool armed = false;
+    int step = 0;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& node = sim.add<SkippingNode>("intake");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(10ms);
+  node.armed = true;
+  sim.step(15ms);
+  ASSERT_GE(node.step, 2);
+  EXPECT_EQ(node.roller.phase(), RollerPhase::kIdle);  // the eject was dropped
+  EXPECT_EQ(hw.applied_motor("intake", "roller").mode, Mode::kNeutral);
+}
+
 // REQ-RT-06
 TEST(RollerWithSensor, UpdateDoesNotAllocate) {
   if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {

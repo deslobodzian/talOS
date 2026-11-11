@@ -7,6 +7,7 @@ namespace talos::mechanisms {
 
 RollerWithSensor::RollerWithSensor(Node& node, std::string_view name)
     : node_{&node},
+      label_{"RollerWithSensor '" + std::string{name} + "'"},
       motor_{node, name},
       sensor_{node, Params{node, name}.get<std::string>("sensor")} {
   const Params params{node, name};
@@ -27,19 +28,30 @@ RollerWithSensor::RollerWithSensor(Node& node, std::string_view name)
 }
 
 void RollerWithSensor::set_goal(RollerCommand command) {
+  RequireInUpdate(*node_, label_);
   requested_ = true;
   request_ = command;
+  request_tick_ = node_->tick();
 }
 
-void RollerWithSensor::stop() { requested_ = false; }
+void RollerWithSensor::stop() {
+  RequireInUpdate(*node_, label_);
+  requested_ = false;
+}
 
 void RollerWithSensor::update() {
+  RequireInUpdate(*node_, label_);
   const Time now = node_->now();
-  const bool live = requested_ && robot_enabled(*node_);
+  const bool enabled = robot_enabled(*node_);
+  // A request lasts the update() it was made in (see set_goal()).
+  const bool live = requested_ && request_tick_ == node_->tick() && enabled;
   const RollerCommand command = live ? request_ : RollerCommand::kIdle;
   requested_ = false;
-  const bool newly_asked = command != last_command_;
-  last_command_ = command;
+  // "Newly asked" compares live requests only: a stale spell, a release or
+  // a disable between two asks of the same command is not a new ask, so a
+  // held eject runs once.
+  const bool newly_asked = live && command != last_command_;
+  if (live) last_command_ = command;
 
   sensor_connected_ = sensor_.connected();
   has_piece_ = piece_debounce_.update(sensor_.get() != sensor_inverted_, now);
@@ -48,6 +60,15 @@ void RollerWithSensor::update() {
     phase_ = next;
     phase_since_ = now;
   };
+  // Losing enable (a Driver Station disable, a stale link, a fault) cancels
+  // intaking and any timed run: re-enabled within eject_us, the roller does
+  // not pick up where it stopped. A held piece stays kHolding (the sensor
+  // still sees it).
+  if (!enabled &&
+      (phase_ == RollerPhase::kIntaking || phase_ == RollerPhase::kEjecting ||
+       phase_ == RollerPhase::kFeeding)) {
+    go(RollerPhase::kIdle);
+  }
   // The roller output of the phase this tick starts in; transitions apply
   // from the next tick.
   std::optional<double> volts;

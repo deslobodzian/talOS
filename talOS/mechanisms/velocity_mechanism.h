@@ -21,14 +21,17 @@
 // (talOS/mechanisms/README.md). Velocities are mechanism rotations per
 // second; goals clamp to the motor's own max_velocity_rps.
 //
-// set_goal() and stop() are this tick's request, consumed by update(); a tick
-// without set_goal() drives nothing and the devices layer sends neutral (the
-// motor coasts or brakes as its `brake` config says). Call set_goal() only
+// set_goal() and stop() are this tick's request, accepted only inside the
+// node's update() (std::logic_error otherwise) and consumed by this tick's
+// update(); a tick without set_goal() drives nothing and the devices layer
+// sends neutral (the motor coasts or brakes as its `brake` config says), and
+// a request whose tick ended without update() is dropped. Call set_goal() only
 // with a live talos::Target. spin_down_rps2 limits how fast a *live* goal
 // winds down; losing the goal is neutral at once.
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "control/control_generated.h"
@@ -83,6 +86,7 @@ class VelocityMechanism {
   void readiness(double requested_rps);
 
   Node* node_;
+  std::string label_;  // "VelocityMechanism '<name>'", for errors
   Motor motor_;
 
   double max_rps_{0};
@@ -95,6 +99,7 @@ class VelocityMechanism {
   bool requested_{false};
   double request_rps_{0};
   double request_ff_v_{0};
+  std::uint64_t request_tick_{0};  // node.tick() of the update() it came from
 
   VelocityPhase phase_{VelocityPhase::kStopped};
   bool driving_{false};

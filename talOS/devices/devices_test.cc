@@ -409,13 +409,13 @@ TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
   auto hw = std::make_unique<SimHardware>(sim);
-  hw->set_motor("mech", "a", 1.5, -2.0, 0, 0, 62.5, 18.25);
+  hw->set_motor("mech", "a", 1.5, -2.0, 0, 0, 62.5, 18.25, 40.04);
   sim.step(10ms);
   EXPECT_FALSE(mech.enabled_in_update);
   EXPECT_TRUE(mech.a.connected());
   EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 62.5);
   EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 18.3);
-  EXPECT_DOUBLE_EQ(mech.a.current(), 0);
+  EXPECT_DOUBLE_EQ(mech.a.current(), 40.0);  // stator amps, in tenths
 
   hw->set_connected("mech", "a", false);
   sim.step(10ms);
@@ -1014,6 +1014,41 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
   }
   auto sim = Sim::FromToml(kRobotToml);
   EXPECT_THROW(sim.add<EagerLed>("mech"), std::logic_error);
+}
+
+// RequireInUpdate is the output setters' rule for a layer that holds a
+// request for the flush (talOS/mechanisms): accepted in update(), refused
+// from the constructor and from every(), naming what was called.
+TEST(Devices, RequireInUpdateRefusesOutsideUpdate) {
+  struct Requester {
+    explicit Requester(Node& n) : node{n} {
+      node.every(20ms, [this] { RequireInUpdate(node, "Lift::set_goal"); });
+    }
+    void update() {
+      RequireInUpdate(node, "Lift::set_goal");
+      ++updates;
+    }
+    Node& node;
+    int updates = 0;
+  };
+  struct EagerRequester {
+    explicit EagerRequester(Node& n) { RequireInUpdate(n, "Lift::set_goal"); }
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    auto& requester = sim.add<Requester>("mech");
+    try {
+      sim.step(50ms);
+      ADD_FAILURE() << "a request from every() was accepted";
+    } catch (const std::logic_error& error) {
+      EXPECT_NE(std::string{error.what()}.find("Lift::set_goal"),
+                std::string::npos)
+          << error.what();
+    }
+    EXPECT_GT(requester.updates, 0);  // accepted inside update()
+  }
+  auto sim = Sim::FromToml(kRobotToml);
+  EXPECT_THROW(sim.add<EagerRequester>("mech"), std::logic_error);
 }
 
 TEST(Devices, DisconnectedDevicesReadInvalidAndZero) {

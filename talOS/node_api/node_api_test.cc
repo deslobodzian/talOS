@@ -313,9 +313,9 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   ASSERT_NE(node, nullptr) << talos_last_error();
   TalosSimHardware* hw = talos_sim_hardware_create(sim_);
   ASSERT_NE(hw, nullptr) << talos_last_error();
-  ASSERT_EQ(
-      talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0, 0, 0),
-      TALOS_OK);
+  ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0,
+                                         0, 0, 0),
+            TALOS_OK);
 
   ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
   TalosMotorRequest request{};
@@ -375,7 +375,7 @@ TEST_F(NodeApi, HardwareSampleTimeOnceTheClockMappingConverges) {
   const auto gyro = talos_device(node, TALOS_DEVICE_GYRO, "gyro");
   ASSERT_GE(gyro, 0);
   ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3, 2, 1000,
-                                         3000, 0, 0),
+                                         3000, 0, 0, 0),
             TALOS_OK);
   ASSERT_EQ(
       talos_sim_hardware_set_gyro(hw, "roller", "gyro", 0.75, -0.5, 5000, 6000),

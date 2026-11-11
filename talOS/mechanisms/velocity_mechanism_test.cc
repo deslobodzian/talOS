@@ -233,6 +233,54 @@ TEST_F(VelocityMechanismTest, NonFiniteDemandGoesNeutral) {
   ExpectNeutral();
 }
 
+// A request is refused outside update() (here every()), naming the
+// mechanism, and lasts only the update() it was made in.
+TEST(VelocityMechanismRequest, RequestIsTiedToItsUpdate) {
+  struct TimerNode {
+    explicit TimerNode(Node& node) : flywheel{node, "flywheel"} {
+      node.every(20ms, [this] { flywheel.set_goal(60.0); });
+    }
+    void update() { flywheel.update(); }
+    VelocityMechanism flywheel;
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<TimerNode>("shooter");
+    try {
+      sim.step(50ms);
+      ADD_FAILURE() << "set_goal() from every() was accepted";
+    } catch (const std::logic_error& e) {
+      EXPECT_NE(std::string{e.what()}.find("VelocityMechanism 'flywheel'"),
+                std::string::npos)
+          << e.what();
+    }
+  }
+  struct SkippingNode {
+    explicit SkippingNode(Node& node) : flywheel{node, "flywheel"} {}
+    void update() {
+      if (armed && step++ == 0) {
+        flywheel.set_goal(60.0);  // update() skipped this tick
+        return;
+      }
+      flywheel.update();
+    }
+    VelocityMechanism flywheel;
+    bool armed = false;
+    int step = 0;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& node = sim.add<SkippingNode>("shooter");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(10ms);
+  node.armed = true;
+  sim.step(15ms);
+  ASSERT_GE(node.step, 2);
+  EXPECT_FALSE(node.flywheel.driving());
+  EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kNeutral);
+}
+
 // REQ-RT-06
 TEST_F(VelocityMechanismTest, UpdateDoesNotAllocate) {
   if (const auto why = testing::AllocationProbe::Unsupported(); !why.empty()) {

@@ -397,6 +397,15 @@ bool robot_enabled(Node& node) {
   return node.extension<HardwareLink>().enabled();
 }
 
+void RequireInUpdate(const Node& node, std::string_view what) {
+  detail::NodeAccess::require_loop_thread(node, what);
+  if (!detail::NodeAccess::in_update(node)) {
+    throw std::logic_error(std::string{node.name()} + ": " + std::string{what} +
+                           " called outside update(); make requests in "
+                           "update(), where they apply to this tick");
+  }
+}
+
 std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
                                        std::string_view name) {
   HardwareLink::Impl& impl = *link.impl_;
