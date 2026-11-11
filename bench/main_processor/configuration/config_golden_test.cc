@@ -5,7 +5,8 @@
 TEST(BenchConfig, OneConservativeUncommissionedMotor) {
   for (const auto* path :
        {"bench/main_processor/configuration/robot.toml",
-        "bench/main_processor/configuration/robot_bench.toml"}) {
+        "bench/main_processor/configuration/robot_bench.toml",
+        "bench/main_processor/configuration/robot_py.toml"}) {
     SCOPED_TRACE(path);
     const auto config = talos::config::ParseRobotConfig(path);
     EXPECT_FALSE(config.hardware.commissioned);
