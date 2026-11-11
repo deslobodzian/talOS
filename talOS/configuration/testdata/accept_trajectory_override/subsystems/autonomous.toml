@@ -1,0 +1,10 @@
+[subsystem]
+name = "autonomous"
+node = "//bot/autonomous:node"
+defaults = "../shared/autonomous_defaults.toml"
+
+[trajectories]
+taxi = "../trajectories/taxi.traj"
+
+[motors.m]
+can_id = 1
