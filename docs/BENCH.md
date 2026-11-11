@@ -180,8 +180,16 @@ sleep precision. Releasing a lane is not a mechanical brake.
 - [ ] Reboot the RIO while the Mini stays running. Expected: neutral during
   outage; DS packets carry gateway `boot_id`, and consumers follow the new boot
   despite restarted low timestamps. Old targets cannot revive motion. Disable
-  and release before any re-enable. Record old/new boot ids, clock reset count,
-  config acknowledgment and fresh DS/target acceptance after safe recovery.
+  and release before any re-enable. Expected also: once the program runs,
+  States resume within 100 ms of the RIO's network having a route to the
+  Mini; a program that started before that route prints
+  `hardware gateway socket failed: SocketError (errno 101)` (coalesced to one
+  line a second) and then `hardware gateway socket open after <n> failed
+  attempts, <s> s after the first`. Record old/new boot ids, clock reset
+  count, the RIO console as written on the RIO (a network console viewer
+  loses lines while the link is down) beside `dmesg`'s link-up lines, the
+  first State's arrival in the bridge log, config acknowledgment and fresh
+  DS/target acceptance after safe recovery.
 - [ ] Reset the TalonFX alone (briefly interrupt its power) while DS is
   disabled and the motor rests at least 10 rotations from 0, with
   `hardware_node --log` recording. Expected: in the first State whose motor
