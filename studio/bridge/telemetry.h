@@ -556,6 +556,59 @@ struct ClientFeeds {
   std::int64_t held_sent_ns_{0};    // telemetry's last send while it waits
 };
 
+// When the bridge must next run with no socket event or publication: the
+// graph refresh, the segment check, the instant a send the egress budget
+// deferred becomes affordable, and each client's due update or heartbeat
+// (ClientFeeds::NextDueNs). The bridge never polls; this is every reason
+// it wakes on its own.
+struct WakeSchedule {
+  // The system graph refreshes every 250 ms, by the clock: Studio marks the
+  // graph stale after GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts)
+  // without one.
+  static constexpr std::int64_t kSystemRefreshNs = 250'000'000;
+  // How soon the loop comes back when it cannot sleep on the wake channel.
+  static constexpr std::int64_t kFallbackNs = 1'000'000;
+
+  std::int64_t refreshed_ns = 0;  // the last graph refresh
+  std::int64_t check_due_ns = 0;  // the next segment check
+  // The earliest instant a deferred send becomes affordable this pass,
+  // kNeverNs when nothing waits for budget.
+  std::int64_t retry_ns = kNeverNs;
+
+  // Starts a pass: what it defers is recorded afresh.
+  void BeginPass() { retry_ns = kNeverNs; }
+  bool RefreshDue(std::int64_t now_ns) const {
+    return now_ns - refreshed_ns >= kSystemRefreshNs;
+  }
+  // A send the budget deferred at `now_ns` fits once `wait_ns` passes
+  // (EgressBudget::wait_ns of every bucket it is charged to, the largest):
+  // it is due again then. kNeverNs: it never fits, so it is never due.
+  void Deferred(std::int64_t now_ns, std::int64_t wait_ns) {
+    if (wait_ns != kNeverNs) retry_ns = std::min(retry_ns, now_ns + wait_ns);
+  }
+
+  // The next instant to run, after `now_ns`. `polling` (no wake channel, or
+  // pages left unread) brings it back in kFallbackNs. `for_each_feeds(f)`
+  // calls f(const ClientFeeds&) for each client. An instant already past is
+  // left out: what it was due for was done this pass or waits for budget,
+  // which retry_ns covers.
+  template <class ForEachFeeds>
+  std::int64_t NextWakeNs(std::int64_t now_ns, bool polling,
+                          const SystemGraphDocument& document,
+                          ForEachFeeds&& for_each_feeds) const {
+    if (polling) return now_ns + kFallbackNs;
+    std::int64_t next = refreshed_ns + kSystemRefreshNs;
+    const auto consider = [&next, now_ns](std::int64_t due_ns) {
+      if (due_ns > now_ns && due_ns < next) next = due_ns;
+    };
+    consider(check_due_ns);
+    consider(retry_ns);
+    for_each_feeds(
+        [&](const ClientFeeds& feeds) { consider(feeds.NextDueNs(document)); });
+    return std::max(next, now_ns + 1);
+  }
+};
+
 static_assert(EgressBudget::framed(EgressBudget::kMaxPayloadBytes) <=
                       talos::telemetry_wire::kClientBurstBytes &&
                   EgressBudget::framed(EgressBudget::kMaxPayloadBytes + 1) >

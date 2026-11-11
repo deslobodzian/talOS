@@ -657,13 +657,14 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
 }
 
 // REQ-RT-21
-// The bridge does not poll: it pumps a client when a tick arrives, when the
-// graph refreshes, and at the client's NextDueNs or the instant a deferred
-// send's budget refills (EgressBudget::wait_ns), nothing else. Pumped only
-// then, a starved client still hears from the graph before Studio would mark
-// it stale, gets its telemetry heartbeat on time once the producer goes
-// quiet, and converges on the latest graph and tick.
-TEST(ClientFeeds, PumpedOnlyWhenDueKeepsGraphHeartbeatAndConvergence) {
+// The bridge does not poll: it runs a pass when a tick is published and
+// otherwise only when its WakeSchedule says (the graph refresh, a client's
+// NextDueNs, the instant a deferred send's budget refills). Driven by that
+// schedule, as Bridge::service and Bridge::next_wake_ns drive it, a starved
+// client still hears from the graph before Studio would mark it stale, gets
+// its telemetry heartbeat on time once the producer goes quiet, and
+// converges on the latest graph and tick.
+TEST(WakeSchedule, PassesOnlyWhenDueKeepGraphHeartbeatAndConvergence) {
   constexpr std::uint32_t kChannels = 200;
   std::vector<ChannelDef> dictionary;
   std::vector<std::uint32_t> channels;
@@ -688,7 +689,6 @@ TEST(ClientFeeds, PumpedOnlyWhenDueKeepsGraphHeartbeatAndConvergence) {
   constexpr int kNodes = 9;
   constexpr std::int64_t kStaleNs = 1'000'000'000;  // GRAPH_STALE_AFTER_MS
   constexpr std::int64_t kTickNs = 10'000'000;
-  constexpr std::int64_t kRefreshNs = 250'000'000;
   constexpr std::int64_t kTicksEndNs = 3'000'000'000;
   constexpr std::int64_t kRefreshesEndNs = 8'000'000'000;
   constexpr std::int64_t kEndNs = 12'000'000'000;
@@ -699,20 +699,29 @@ TEST(ClientFeeds, PumpedOnlyWhenDueKeepsGraphHeartbeatAndConvergence) {
 
   ClientFeeds feeds;
   EgressBudget budget;
+  WakeSchedule schedule;
+  schedule.check_due_ns = kNeverNs;  // no segment to check
   Mirror mirror;
   std::string held_values;
-  std::int64_t now = 0, retry = kNeverNs, last_text = -1, last_page = -1;
+  std::int64_t now = 0, last_text = -1, last_page = -1;
   std::int64_t longest_silence = 0, longest_quiet_gap = 0;
-  std::size_t pumps = 0;
-  const auto pump = [&] {
-    ++pumps;
-    retry = kNeverNs;
+  std::size_t passes = 0;
+  // One Bridge::service pass: the refresh when due, then the client's pump,
+  // a budget deferral recorded in the schedule as Bridge::affordable does.
+  const auto pass = [&] {
+    ++passes;
+    schedule.BeginPass();
+    if (schedule.RefreshDue(now)) {
+      schedule.refreshed_ns = now;
+      if (now <= kRefreshesEndNs) {
+        document = BuildSystemGraph(Registry(kNodes, ++refresh, 0));
+      }
+    }
     feeds.Pump(
         document, state, now, kRate,
         [&](std::size_t bytes) {
           if (budget.available(bytes, kRate, now)) return true;
-          const std::int64_t wait = budget.wait_ns(bytes, kRate);
-          if (wait != kNeverNs) retry = std::min(retry, now + wait);
+          schedule.Deferred(now, budget.wait_ns(bytes, kRate));
           return false;
         },
         [&](std::string_view text) {
@@ -742,29 +751,20 @@ TEST(ClientFeeds, PumpedOnlyWhenDueKeepsGraphHeartbeatAndConvergence) {
         });
   };
 
+  pass();  // the client connects
   while (now < kEndNs) {
-    std::int64_t next = kEndNs;
-    const auto consider = [&](std::int64_t due) {
-      if (due > now && due < next) next = due;
-    };
-    const std::int64_t next_tick =
-        static_cast<std::int64_t>(tick + 1) * kTickNs;
-    const std::int64_t next_refresh =
-        static_cast<std::int64_t>(refresh + 1) * kRefreshNs;
-    if (next_tick <= kTicksEndNs) consider(next_tick);
-    if (next_refresh <= kRefreshesEndNs) consider(next_refresh);
-    consider(feeds.NextDueNs(document));
-    consider(retry);
+    std::int64_t next = schedule.NextWakeNs(
+        now, false, document, [&](const auto& visit) { visit(feeds); });
+    const auto next_tick = static_cast<std::int64_t>(tick + 1) * kTickNs;
+    const bool published = next_tick <= kTicksEndNs && next_tick <= next;
+    if (published) next = next_tick;  // the publication wakes the bridge
     now = next;
-    if (now == next_tick && now <= kTicksEndNs) {
+    if (published) {
       ++tick;
       ASSERT_TRUE(IngestAll(
           state, TickPages(kChannels, tick, channels, tick_values(tick))));
     }
-    if (now == next_refresh && now <= kRefreshesEndNs) {
-      document = BuildSystemGraph(Registry(kNodes, ++refresh, 0));
-    }
-    pump();
+    pass();
   }
   EXPECT_LT(longest_silence, kStaleNs);
   EXPECT_LE(longest_quiet_gap, ClientFeed::kHeartbeatNs);
@@ -773,7 +773,52 @@ TEST(ClientFeeds, PumpedOnlyWhenDueKeepsGraphHeartbeatAndConvergence) {
   EXPECT_EQ(mirror.sequence_id, tick);
   // Not a poll: about one pass per tick, refresh and due message, against
   // the 12000 a 1 ms timer would make.
-  EXPECT_LT(pumps, 1500u) << "pumps over " << kEndNs / 1'000'000 << " ms";
+  EXPECT_LT(passes, 1500u) << "passes over " << kEndNs / 1'000'000 << " ms";
+}
+
+// REQ-RT-21
+// An update the egress budget holds back is due again the instant the
+// budget affords it, not at the bridge's next 250 ms refresh: the schedule
+// wakes the bridge then, and the held update goes out on that pass.
+TEST(WakeSchedule, ASendHeldByTheBudgetIsDueWhenTheBudgetAffordsIt) {
+  constexpr double kRate = 4000;
+  const TelemetryState state = SmallState();
+  const SystemGraphDocument no_graph;
+  ClientFeeds feeds;
+  EgressBudget budget;
+  ASSERT_TRUE(budget.available(0, kRate, 0));
+  budget.spend(static_cast<std::size_t>(EgressBudget::kBurstBytes));  // dry
+  WakeSchedule schedule;
+  schedule.check_due_ns = kNeverNs;
+  std::size_t pages = 0;
+  const auto pass = [&](std::int64_t now) {
+    schedule.BeginPass();
+    feeds.Pump(
+        no_graph, state, now, kRate,
+        [&](std::size_t bytes) {
+          if (budget.available(bytes, kRate, now)) return true;
+          schedule.Deferred(now, budget.wait_ns(bytes, kRate));
+          return false;
+        },
+        [](std::string_view) { return true; },
+        [&](std::string_view page) {
+          budget.spend(EgressBudget::framed(page.size()));
+          ++pages;
+          return true;
+        });
+    return schedule.NextWakeNs(now, false, no_graph,
+                               [&](const auto& visit) { visit(feeds); });
+  };
+
+  const std::int64_t due = pass(0);
+  ASSERT_EQ(pages, 0u) << "the dry budget sent a page";
+  EXPECT_LT(due, WakeSchedule::kSystemRefreshNs)
+      << "a held send waits for the next refresh";
+  pass(due - 1);
+  EXPECT_EQ(pages, 0u) << "affordable before the wake the schedule set, "
+                       << due;
+  pass(due);
+  EXPECT_GE(pages, 1u) << "not sent at the wake the schedule set, " << due;
 }
 
 // The largest graph a client can be sent is the one whose framed size is the
