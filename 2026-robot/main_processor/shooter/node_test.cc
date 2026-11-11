@@ -2,6 +2,7 @@
 #include <sys/wait.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -46,10 +47,10 @@ class ShooterTest : public ::testing::Test {
     sim.step(10ms);
   }
   // Holds a lane the way a producer does: republished every 20 ms.
-  void Hold(double rps, std::chrono::milliseconds duration) {
+  void Hold(double rps, std::chrono::milliseconds duration,
+            const char* source = "teleop") {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      talos::testing::PublishTarget(sim, "shooter", "teleop",
-                                    ShooterTarget{rps});
+      talos::testing::PublishTarget(sim, "shooter", source, ShooterTarget{rps});
       sim.step(20ms);
     }
   }
@@ -222,6 +223,46 @@ TEST_F(ShooterTest, DriverStationLossGoesNeutral) {
   hw.stop_driver_station();
   Hold(80.0, 160ms);
   ExpectNeutral();
+}
+
+TEST_F(ShooterTest, AutonomousIgnoresTheTeleopLaneAndFollowsTheAutoLane) {
+  Teleop();
+  Hold(80.0, 40ms);
+  ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  hw.set_driver_station(
+      talos::testing::DsPacket(ds::kEnabled | ds::kAutonomous));
+  sim.step(10ms);
+  // Stamped with the autonomous generation: only the policy rejects it.
+  Hold(80.0, 40ms);
+  ExpectNeutral();
+  Hold(60.0, 40ms, "auto");
+  const auto request = hw.motor_request("shooter", "flywheel");
+  EXPECT_EQ(request.mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(request.demand, 60.0);
+}
+
+TEST_F(ShooterTest, TargetFromBeforeAReenableStaysNeutralInTheSameDrain) {
+  Teleop();
+  Hold(80.0, 40ms);
+  ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+  const std::uint64_t before = talos::testing::DriverStationGeneration(sim);
+  hw.set_driver_station(talos::testing::DsPacket(ds::kTeleop));  // disabled
+  sim.step(10ms);
+  // Re-enabled off the 5 ms tick grid: the packet lands just after the
+  // shooter's tick and waits for its next drain, together with a target its
+  // producer queued under the earlier enable.
+  sim.step(1ms);
+  hw.set_driver_station(talos::testing::DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(4ms);
+  ASSERT_NE(talos::testing::DriverStationGeneration(sim), before);
+  talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{80.0},
+                                before);
+  sim.step(5ms);
+  ExpectNeutral();
+  // The same word stamped with the current generation drives at once.
+  talos::testing::PublishTarget(sim, "shooter", "teleop", ShooterTarget{80.0});
+  sim.step(5ms);
+  EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
 }
 
 TEST_F(ShooterTest, NonFiniteTargetGoesNeutral) {

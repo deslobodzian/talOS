@@ -740,6 +740,42 @@ TEST_F(DrivetrainTest, DriverStationLossOrOtherModeLaneGoesNeutral) {
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 }
 
+TEST_F(DrivetrainTest, StaleLaneGoesNeutralOnTheFirstTickAtTheTimeout) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  sim.step(75ms);  // last publication is 95 ms old: still fresh
+  for (const SwerveModule& module : geometry.modules) {
+    ASSERT_EQ(Request(module.drive).mode, Mode::kVelocity) << module.name;
+  }
+  sim.step(5ms);  // exactly command_timeout_us
+  ExpectNeutral();
+}
+
+TEST_F(DrivetrainTest, TargetFromBeforeAReenableStaysNeutralInTheSameDrain) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  const std::uint64_t before = talos::testing::DriverStationGeneration(sim);
+  hw.set_driver_station(talos::testing::DsPacket(ds::kTeleop));  // disabled
+  sim.step(10ms);
+  // Re-enabled off the 5 ms tick grid: the packet lands just after the
+  // drivetrain's tick and waits for its next drain, together with a target
+  // its producer queued under the earlier enable.
+  sim.step(1ms);
+  hw.set_driver_station(talos::testing::DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(4ms);
+  ASSERT_NE(talos::testing::DriverStationGeneration(sim), before);
+  talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                ChassisTarget{1.0, 0, 0}, before);
+  sim.step(5ms);
+  ExpectNeutral();
+  // The same word stamped with the current generation drives at once.
+  talos::testing::PublishTarget(sim, "drivetrain", "teleop",
+                                ChassisTarget{1.0, 0, 0});
+  sim.step(5ms);
+  EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+}
+
 TEST_F(DrivetrainTest, ReportsTheChassisMotionTheModulesMeasure) {
   // Every wheel pointing 90 degrees left at 2 rps.
   for (const SwerveModule& module : geometry.modules) {

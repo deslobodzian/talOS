@@ -115,6 +115,70 @@ class IntakeTest(unittest.TestCase):
                 self.assertEqual(request.mode, talos.Mode.NEUTRAL)
                 self.assertEqual(state.inhibit, Inhibit.SHOOTER_NOT_READY)
 
+    def teleop(self):
+        """An enabled teleop robot with a connected, idle-beam intake."""
+        sim = Sim(CONFIG)
+        sim.add(intake.Intake, "intake")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.02)
+        return sim, hw
+
+    def hold(self, sim, source, ask, seconds=0.04):
+        """A producer republishing its lane every 20 ms."""
+        for _ in range(round(seconds / 0.02)):
+            sim.publish_target(IntakeTarget, "intake", source,
+                               roller_velocity_rps=ask)
+            sim.step(0.02)
+
+    def test_autonomous_ignores_teleop_lane_and_follows_auto(self):
+        sim, hw = self.teleop()
+        self.hold(sim, "teleop", 25.0)
+        self.assertEqual(hw.motor_request("intake", "roller").mode,
+                         talos.Mode.VELOCITY)
+        hw.set_driver_station(enabled=True, autonomous=True)
+        sim.step(0.02)
+        # Stamped with the autonomous generation: only the policy rejects it.
+        self.hold(sim, "teleop", 25.0)
+        self.assertEqual(hw.motor_request("intake", "roller").mode,
+                         talos.Mode.NEUTRAL)
+        self.assertEqual(sim.latest(IntakeState, topics.STATE).inhibit,
+                         Inhibit.TARGET_STALE)
+        self.hold(sim, "auto", 15.0)
+        request = hw.motor_request("intake", "roller")
+        self.assertEqual(request.mode, talos.Mode.VELOCITY)
+        self.assertEqual(request.demand, 15.0)
+
+    def test_target_from_before_a_reenable_stays_neutral_in_same_drain(self):
+        sim, hw = self.teleop()
+        self.hold(sim, "teleop", 25.0)
+        self.assertEqual(hw.motor_request("intake", "roller").mode,
+                         talos.Mode.VELOCITY)
+        before = sim.driver_station_generation
+        hw.set_driver_station(teleop=True)  # disabled
+        sim.step(0.04)
+        # Re-enabled off the 20 ms tick grid: the packet lands just after the
+        # intake's tick and waits for its next drain, together with a target
+        # its producer queued under the earlier enable.
+        sim.step(0.001)
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.019)
+        self.assertNotEqual(sim.driver_station_generation, before)
+        sim.publish_target(IntakeTarget, "intake", "teleop",
+                           mode_since_us=before, roller_velocity_rps=25.0)
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("intake", "roller").mode,
+                         talos.Mode.NEUTRAL)
+        self.assertEqual(sim.latest(IntakeState, topics.STATE).inhibit,
+                         Inhibit.TARGET_STALE)
+        # The same word stamped with the current generation drives at once.
+        sim.publish_target(IntakeTarget, "intake", "teleop",
+                           roller_velocity_rps=25.0)
+        sim.step(0.02)
+        self.assertEqual(hw.motor_request("intake", "roller").mode,
+                         talos.Mode.VELOCITY)
+
 
 class BinaryTest(unittest.TestCase):
     def run_binary(self, *argv):
