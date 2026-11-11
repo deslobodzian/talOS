@@ -34,7 +34,7 @@ namespace talos::event::log {
 // single-producer/single-consumer ring hands chunks to the background writer
 // without locking or waiting on the producer. The writer sleeps on a
 // semaphore until a chunk is handed over or a sync is due; the producer posts
-// it only when it finds the writer idle, and a post neither blocks nor takes a
+// it on every hand-off, asleep or not, and a post neither blocks nor takes a
 // lock (sem_post on Linux, dispatch_semaphore_signal on macOS). The writer
 // runs under the normal scheduling policy whatever the thread that
 // started it runs under, so it never competes with a realtime loop thread
@@ -48,10 +48,11 @@ namespace talos::event::log {
 // such a death loses about that much plus the writer's scheduling delay.
 // While records arrive closer together than write_interval the writer wakes
 // and writes once per write_interval (at most 100 times a second at the
-// default, whatever the tick rate) and the producer does not post; a record
-// that finds the writer idle posts once, as a hand-off does, and is written
-// at once: one wakeup per record. Once a write_interval passes with no
-// record, or after a disk error, the writer sleeps until a record, a
+// default, whatever the tick rate) and a record does not post; a record that
+// finds the writer idle posts once and is written at once: one wakeup per
+// record. write_interval never delays a full chunk: each hand-off wakes the
+// writer, so a flood costs one wakeup per chunk. Once a write_interval passes
+// with no record, or after a disk error, the writer sleeps until a record, a
 // hand-off or the periodic sync. A power loss also loses what the kernel has
 // not put on the disk: once per Options::sync_interval (a second) the writer
 // fsyncs, which leaves the data in the drive's write cache on macOS. flush()
@@ -296,7 +297,8 @@ class LogWriter {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> completed{0};
     // Set by the writer before it checks for work and sleeps on `wake`; the
-    // producer clears it and posts `wake` only when it finds it set. Both
+    // producer posts `wake` for a record only when it finds it set (and for
+    // every hand-off), clearing it. Both
     // sides use sequentially consistent operations on this, `submitted` and
     // a chunk's `committed`, so either the writer sees the submission or
     // record, or the producer sees the writer idle and posts, and the

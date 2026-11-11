@@ -1253,6 +1253,67 @@ TEST(LogCapture, UncappedWriterLeavesNoMarker) {
   ::unlink(path.c_str());
 }
 
+// write_interval bounds how long a partly filled chunk waits, never a full
+// one: a chunk handed over while the writer sleeps until its next timed
+// write must wake it. It used to wait out the interval, so a producer that
+// filled the pool within one write_interval (a replay at full speed: 1554
+// of 5998 States logged on macOS) stopped capture with the pool exhausted.
+// Here write_interval is an hour and the writer has a record waiting for
+// it; every chunk handed over must still reach the file, one at a time,
+// for five times the pool's chunks.
+// REQ-RT-11
+TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
+  const auto path = TempPath("full_chunk_wakes");
+  constexpr std::size_t kChunkBytes = 4096;
+  constexpr std::size_t kRecordBytes = sizeof(RecordHeader) + 64;
+  constexpr std::size_t kPerChunk = kChunkBytes / kRecordBytes;
+  constexpr std::size_t kChunks = 10;
+  const std::vector<std::byte> payload(64, std::byte{0x5a});
+  const auto file_size = [&] {
+    struct stat status{};
+    return ::stat(path.c_str(), &status) == 0
+               ? static_cast<std::size_t>(status.st_size)
+               : std::size_t{0};
+  };
+  std::size_t records = 0;
+  {
+    LogWriter::Options options{kChunkBytes, 2, /*background=*/true};
+    options.write_interval = std::chrono::hours{1};
+    options.sync_interval = std::chrono::hours{1};
+    LogWriter writer{path, "full_chunk", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+    const std::size_t base = file_size();
+    const auto log_one = [&] {
+      Context context{};
+      context.dispatch_index = ++records;
+      writer.dispatch(context, payload);
+    };
+    // Found idle, written at once; the next record waits for the hour.
+    log_one();
+    ASSERT_TRUE(Eventually([&] { return file_size() >= base + kRecordBytes; }));
+    log_one();
+    for (std::size_t chunk = 1; chunk <= kChunks; ++chunk) {
+      // Fill the active chunk; the record that does not fit hands it over.
+      while (records < chunk * kPerChunk + 1) log_one();
+      ASSERT_TRUE(Eventually([&] {
+        return file_size() >= base + chunk * kPerChunk * kRecordBytes;
+      })) << "chunk "
+          << chunk << " of " << kChunks
+          << " handed over and not written in 10 s (pool of 2)";
+      ASSERT_FALSE(writer.failed()) << writer.error();
+    }
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  std::size_t read = 0;
+  while (reader.next(record)) {
+    ASSERT_EQ(record.header.dispatch_index, ++read);
+  }
+  EXPECT_EQ(read, records);
+  ::unlink(path.c_str());
+}
+
 // A node whose records come less often than write_interval (here 50 ms
 // apart) finds the writer idle each time: the record's post wakes it
 // and it writes at once, one wakeup per record. A burst first (records 2 ms
