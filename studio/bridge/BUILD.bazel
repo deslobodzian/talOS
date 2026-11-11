@@ -89,6 +89,7 @@ cc_binary(
         "//talOS/configuration",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
+        "//talOS/process",
         "//talOS/rtms",
         "//talOS/rtms:wake",
         "//talOS/telemetry:schema",
