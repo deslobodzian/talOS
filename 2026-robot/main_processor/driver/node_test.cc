@@ -478,6 +478,63 @@ TEST(Driver, HeldStickWaitsForNeutralInEveryNewModeGeneration) {
   }
 }
 
+// The driver beside a plain subscription of its own node's: each drain of the
+// node delivers the probe, so the probe having a value means the node drained.
+struct ProbedDriver {
+  explicit ProbedDriver(talos::Node& node)
+      : driver{node},
+        probe{node.subscribe<drivetrain::ChassisTarget>("/test/probe")} {}
+  void update() { driver.update(); }
+  Driver driver;
+  talos::Subscription<drivetrain::ChassisTarget> probe;
+};
+
+// The drivetrain publishes every one of its ticks; the heading is needed only
+// when a Driver Station packet is mapped, so its publications must not wake
+// the driver, and the next packet must still use the newest heading. A 200 ms
+// driver period keeps the driver's own timer out of the window.
+// REQ-RT-19
+TEST(Driver, DrivetrainStateWakesNothingAndPacketsUseTheNewestHeading) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+
+[subsystems.driver]
+period_us = 200000
+deadband_frac = 0.0
+field_oriented = true
+)");
+  auto& probed = sim.add<ProbedDriver>("driver");
+  SimHardware hw{sim};
+  hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  sim.step(10ms);  // armed at neutral, robot-relative: no heading yet
+  hw.stop_driver_station();
+  sim.step(1ms);
+  sim.publish("/test/probe", drivetrain::ChassisTarget{});
+  for (const double yaw : {0.0, kQuarterTurnRad}) {
+    sim.publish(drivetrain::topics::kState,
+                drivetrain::DrivetrainState{
+                    0, true, true, true, 0, 0, 0, yaw, {}, {}, {}, {}});
+    sim.step(2ms);
+  }
+  EXPECT_FALSE(probed.probe.has_value())
+      << "a /drivetrain/state publication woke the driver";
+  // Full forward: in the driver frame latched at yaw 0, a quarter turn later.
+  hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+  sim.step(5ms);  // the next gateway tick forwards it
+  EXPECT_TRUE(probed.probe.has_value());
+  const auto lane =
+      LatestTarget<drivetrain::ChassisTarget>(sim, "drivetrain", "teleop");
+  ASSERT_TRUE(lane.has_value());
+  EXPECT_NE(lane->active, 0);
+  EXPECT_NEAR(lane->message.vx_mps(), 0.0, 1e-9);
+  EXPECT_NEAR(lane->message.vy_mps(), -kMaxLinear, 1e-9);
+}
+
 // --- the teleop chain on the real robot config ---------------------------
 
 std::string RobotConfig() {
