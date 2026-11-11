@@ -6,10 +6,14 @@
 #include <unistd.h>
 
 #include <array>
+#include <cerrno>
+#include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #include "gtest/gtest.h"
+#include "udp_test_helpers.h"
 
 namespace talos::protocol {
 namespace {
@@ -99,6 +103,73 @@ TEST(RuntimeUdpTest, ALivePeersPortIsRefusedUntilItCloses) {
   first.Close();
   EXPECT_EQ(second.Open("127.0.0.1", port, "127.0.0.1", remote),
             UdpStatus::kOk);
+}
+
+// A socket that can no longer send (shut down for writing here; on macOS
+// also one the kernel marked defunct, as around sleep and wake) fails both
+// sends with kSocketError and EPIPE, and the process lives on. The sends
+// run in a child with SIGPIPE at its default action, so a send that raises
+// it kills the child, not the test. Only macOS raises SIGPIPE for a datagram
+// socket (when SO_NOSIGPIPE is not set); Linux returns EPIPE without it, so
+// there the child lives either way and the case checks the error a caller
+// tells a lost socket by.
+// REQ-RT-22
+TEST(RuntimeUdpTest, ASendTheSocketCannotMakeFailsWithoutSigpipe) {
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  EXPECT_EXIT(
+      {
+        std::signal(SIGPIPE, SIG_DFL);
+        RuntimeUdpPeer peer;
+        if (peer.Open("127.0.0.1", 0, "127.0.0.1", remote) != UdpStatus::kOk ||
+            ::shutdown(peer.NativeFd(), SHUT_WR) != 0) {
+          std::_Exit(2);
+        }
+        const bool copied =
+            peer.SendFrame(FrameType::kClockProbe, kFlagNone, 1, nullptr, 0) ==
+                UdpStatus::kSocketError &&
+            peer.stats().last_send_error == EPIPE;
+        const bool buffered =
+            peer.SendBufferedFrame(FrameType::kClockProbe, kFlagNone, 2, 0) ==
+                UdpStatus::kSocketError &&
+            peer.stats().last_send_error == EPIPE;
+        std::_Exit(copied && buffered ? 0 : 3);
+      },
+      ::testing::ExitedWithCode(0), "");
+}
+
+// A peer whose socket was lost opens a new one on the same ports and numbers
+// its frames on from the old sequence, so the gateway's replay gate
+// (Gateway::Accept) takes the next command at once.
+// REQ-RT-22
+TEST(RuntimeUdpTest, ReopenKeepsThePortsAndTheSendSequence) {
+  const uint16_t port = FreeLoopbackPort();
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(port, 0);
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer mac;
+  RuntimeUdpPeer rio;
+  // The RoboRIO end is connected to the bridge's port: it receives only
+  // from that port, so a frame it receives proves the reopened socket kept
+  // it.
+  ASSERT_EQ(rio.Open("127.0.0.1", remote, "127.0.0.1", port), UdpStatus::kOk);
+  ASSERT_EQ(mac.Open("127.0.0.1", port, "127.0.0.1", remote), UdpStatus::kOk);
+
+  DecodedFrame received;
+  ASSERT_EQ(mac.SendFrame(FrameType::kClockProbe, kFlagNone, 1, nullptr, 0),
+            UdpStatus::kOk);
+  ASSERT_EQ(testing::ReceiveFrame(rio, &received), UdpStatus::kOk);
+  EXPECT_EQ(received.header.sequence, 1u);
+
+  ASSERT_EQ(::shutdown(mac.NativeFd(), SHUT_WR), 0);
+  ASSERT_EQ(mac.SendFrame(FrameType::kClockProbe, kFlagNone, 2, nullptr, 0),
+            UdpStatus::kSocketError);
+  ASSERT_EQ(mac.Reopen(), UdpStatus::kOk);
+  ASSERT_EQ(mac.SendFrame(FrameType::kClockProbe, kFlagNone, 3, nullptr, 0),
+            UdpStatus::kOk);
+  ASSERT_EQ(testing::ReceiveFrame(rio, &received), UdpStatus::kOk);
+  EXPECT_EQ(received.header.monotonic_time_us, 3u);
+  EXPECT_EQ(received.header.sequence, 2u);
 }
 
 }  // namespace

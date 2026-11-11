@@ -1,10 +1,12 @@
 #include "node.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -291,15 +293,90 @@ void HardwareNode::PublishIntrospection() {
 void HardwareNode::PushConfig(uint64_t now_us) {
   auto chunks = CreateConfigChunks(config_);
   for (std::size_t i = 0; i < chunks.size(); ++i) {
-    peer_.SendFrame(protocol::FrameType::kHardwareConfig, 0, now_us,
-                    chunks[i].data(), chunks[i].size());
+    SendToGateway(protocol::FrameType::kHardwareConfig, now_us,
+                  chunks[i].data(), chunks[i].size());
   }
   last_push_time_us_ = now_us;
+}
+
+namespace {
+
+// Whether a send error means this socket will never send again, whatever
+// the network does, so only a new socket can: shut down for writing, or
+// marked defunct by macOS (EPIPE; seen after sleep and wake); no longer
+// connected (ENOTCONN, EDESTADDRREQ); its source address removed from the
+// host (EADDRNOTAVAIL; a new socket's connect picks a current one); or no
+// socket at all (EBADF). Every other error is the network's, and the same
+// socket sends again once it clears: ECONNREFUSED (an ICMP port unreachable
+// from an earlier datagram, reported once: the gateway program is not
+// running yet), ENETDOWN, ENETUNREACH, EHOSTUNREACH (no interface or
+// route; a connected socket looks the route up again on each send) and
+// ENOBUFS (a full interface queue). A new socket would fail those the same
+// way, so reopening for them would only churn sockets.
+bool SocketCannotSend(int error) {
+  return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
+         error == EADDRNOTAVAIL || error == EBADF;
+}
+
+}  // namespace
+
+protocol::UdpStatus HardwareNode::SendToGateway(protocol::FrameType type,
+                                                uint64_t now_us,
+                                                const void* payload,
+                                                std::size_t payload_size) {
+  if (!peer_.IsOpen()) return protocol::UdpStatus::kSocketError;
+  int error = seams_.send_error != nullptr ? seams_.send_error() : 0;
+  const protocol::UdpStatus status =
+      error != 0 ? protocol::UdpStatus::kSocketError
+                 : peer_.SendFrame(type, 0, now_us, payload, payload_size);
+  if (status == protocol::UdpStatus::kOk) {
+    if (socket_lost_) {
+      socket_lost_ = false;
+      std::fprintf(stderr,
+                   "hardware_node: the UDP socket to the gateway sends again "
+                   "(%llu reopened so far)\n",
+                   static_cast<unsigned long long>(socket_counters_.reopens));
+    }
+    return status;
+  }
+  if (status != protocol::UdpStatus::kSocketError) return status;
+  if (error == 0) error = peer_.stats().last_send_error;
+  ++socket_counters_.send_failures;
+  socket_counters_.last_send_error = error;
+  if (!SocketCannotSend(error)) return status;
+  if (poller_) poller_->remove_fd(peer_.NativeFd());
+  peer_.Close();
+  if (!socket_lost_) {
+    socket_lost_ = true;
+    std::fprintf(stderr,
+                 "hardware_node: the UDP socket to the gateway cannot send "
+                 "(%s); replacing it, nothing is sent until then\n",
+                 std::strerror(error));
+  }
+  return status;
+}
+
+void HardwareNode::ReopenSocket(uint64_t now_us) {
+  if (peer_.IsOpen() || !socket_lost_) return;
+  if (reopen_attempted_ && now_us - last_reopen_us_ < kReopenRetryUs) return;
+  reopen_attempted_ = true;
+  last_reopen_us_ = now_us;
+  // A failure (the port taken meanwhile, out of descriptors) is retried
+  // kReopenRetryUs later.
+  if (peer_.Reopen() != protocol::UdpStatus::kOk) return;
+  ++socket_counters_.reopens;
+  if (!poller_) return;
+  try {
+    poller_->add_fd(peer_.NativeFd());
+  } catch (const std::exception& e) {
+    FallBackToPolling(e.what());
+  }
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
   tick_datagrams_ = 0;
   tick_requests_ = 0;
+  ReopenSocket(now_us);
   // Tick's timestamp precedes socket reads. Complete the previous tick's
   // exchange now, so the upper endpoint is definitely after receipt (Run()
   // ticks again at once for it: NextDutyUs).
@@ -312,8 +389,8 @@ void HardwareNode::Tick(uint64_t now_us) {
   if ((!probe_waiting_ && (last_probe_send_us_ == 0 ||
                            now_us - last_probe_send_us_ >= kProbePeriodUs)) ||
       (probe_waiting_ && now_us - last_probe_send_us_ > kProbeRetryUs)) {
-    if (peer_.SendFrame(protocol::FrameType::kClockProbe, 0, now_us, nullptr,
-                        0) == protocol::UdpStatus::kOk) {
+    if (SendToGateway(protocol::FrameType::kClockProbe, now_us, nullptr, 0) ==
+        protocol::UdpStatus::kOk) {
       last_probe_send_us_ = now_us;
       probe_waiting_ = true;
     }
@@ -323,6 +400,11 @@ void HardwareNode::Tick(uint64_t now_us) {
   // ticks again without waiting when the budget runs out.
   tick_receive_capped_ = true;
   for (int i = 0; i < kReceiveBudget; ++i) {
+    // Closed (SocketCounters), maybe by a config push below: nothing to read.
+    if (!peer_.IsOpen()) {
+      tick_receive_capped_ = false;
+      break;
+    }
     protocol::DecodedFrame frame;
     const auto status = peer_.TryReceive(&frame);
     if (status == protocol::UdpStatus::kWouldBlock) {
@@ -594,9 +676,9 @@ void HardwareNode::Tick(uint64_t now_us) {
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
         if (cmd_pub_) cmd_pub_->write(cmd_pkt);
-        if (peer_.SendFrame(protocol::FrameType::kHardwareCommand, 0, now_us,
-                            cmd_pkt.data.data(),
-                            cmd_pkt.size) == protocol::UdpStatus::kOk) {
+        if (SendToGateway(protocol::FrameType::kHardwareCommand, now_us,
+                          cmd_pkt.data.data(),
+                          cmd_pkt.size) == protocol::UdpStatus::kOk) {
           ++commands_sent_;
           LogPacket(1, cmd_pkt, now_us, commands_sent_);
           last_sent_cmd_ = full_cmd_;
@@ -748,8 +830,12 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
     next_us = std::min(next_us, at_us > now_us ? at_us : now_us + kRetryUs);
   };
   // Clock probe: every kProbePeriodUs, replaced once more than kProbeRetryUs
-  // goes unanswered.
-  if (!probe_waiting_) {
+  // goes unanswered. A closed socket's reopen stands in for it, and for the
+  // command below: neither can go out before it.
+  const bool socket_closed = socket_lost_ && !peer_.IsOpen();
+  if (socket_closed) {
+    due(reopen_attempted_ ? last_reopen_us_ + kReopenRetryUs : now_us);
+  } else if (!probe_waiting_) {
     due(last_probe_send_us_ == 0 ? now_us
                                  : last_probe_send_us_ + kProbePeriodUs);
   } else {
@@ -767,7 +853,7 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
       any_subsystem_active = true;
     }
   }
-  if (last_boot_id_ != 0 &&
+  if (!socket_closed && last_boot_id_ != 0 &&
       (any_subsystem_active || last_sent_had_active_subsystem_)) {
     // ShouldSendCommand: a changed merge at once, else the heartbeat.
     due(!have_last_sent_ || full_cmd_ != last_sent_cmd_
@@ -875,17 +961,21 @@ bool HardwareNode::OpenWaits() {
     max_wait_us_ = kMaxWaitUs;
     return true;
   } catch (const std::exception& e) {
-    // Out of descriptors, say: the bridge still runs, at the cost of a
-    // pass every kRetryUs, as a node's loop falls back to polling.
-    CloseWaits();
-    max_wait_us_ = kRetryUs;
-    ++wakeups_.wait_fallbacks;
-    std::fprintf(stderr,
-                 "hardware_node: cannot wait for input (%s); polling it "
-                 "every %llu us\n",
-                 e.what(), static_cast<unsigned long long>(kRetryUs));
+    FallBackToPolling(e.what());
     return false;
   }
+}
+
+void HardwareNode::FallBackToPolling(const char* reason) {
+  // Out of descriptors, say: the bridge still runs, at the cost of a
+  // pass every kRetryUs, as a node's loop falls back to polling.
+  CloseWaits();
+  max_wait_us_ = kRetryUs;
+  ++wakeups_.wait_fallbacks;
+  std::fprintf(stderr,
+               "hardware_node: cannot wait for input (%s); polling it "
+               "every %llu us\n",
+               reason, static_cast<unsigned long long>(kRetryUs));
 }
 
 void HardwareNode::CloseWaits() {
@@ -987,6 +1077,9 @@ int HardwareNode::Run(int duration_s) {
       static_cast<unsigned long long>(wakeups_.deadline),
       static_cast<unsigned long long>(wakeups_.throttled),
       static_cast<unsigned long long>(wakeups_.wait_fallbacks));
+  std::printf("hardware_node: send_failures=%llu socket_reopens=%llu\n",
+              static_cast<unsigned long long>(socket_counters_.send_failures),
+              static_cast<unsigned long long>(socket_counters_.reopens));
   // A log that failed exits 1, as RunMain does for event-loop nodes.
   bool log_failed = false;
   if (log_) {

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
@@ -1672,6 +1674,112 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   const HardwareNode::Wait wait = node.Pass(now_us);
   EXPECT_FALSE(wait.ignore_input);
   EXPECT_EQ(wait.until_us, now_us + 10'000);  // the longest wait
+}
+
+// The send time of the next clock probe the gateway receives, skipping other
+// frames; nullopt when none arrives within 200 ms.
+std::optional<uint64_t> NextProbeUs(protocol::RuntimeUdpPeer& gateway) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  protocol::DecodedFrame frame;
+  while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type == protocol::FrameType::kClockProbe) {
+      return frame.header.monotonic_time_us;
+    }
+  }
+  return std::nullopt;
+}
+
+// A UDP socket bound to `port` on every address, so binding the port again
+// fails; -1 when it cannot be bound.
+int HoldPort(uint16_t port) {
+  const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+  if (fd < 0) return -1;
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_ANY);
+  address.sin_port = htons(port);
+  if (bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+// A socket that can no longer send (shut down for writing: EPIPE, as from a
+// macOS socket the kernel marked defunct around sleep and wake) is closed by
+// the send that finds it and replaced on the same ports: the first attempt
+// on the next Tick, any later one kReopenRetryUs after the last. Nothing is
+// sent while it is closed, and the duty that could not be sent goes out on the
+// new socket. On macOS without SO_NOSIGPIPE that first send kills the test
+// with SIGPIPE instead.
+// REQ-RT-22
+TEST(HardwareNodeTest, ASocketThatCannotSendIsReplacedAndFramesFlowAgain) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  constexpr uint64_t kStartUs = 1'000'000;
+  node.Tick(kStartUs);
+  ASSERT_EQ(NextProbeUs(gateway), kStartUs);
+
+  // The unanswered probe's retry, 100001 us on, finds the socket broken.
+  ASSERT_EQ(shutdown(node.udp_fd(), SHUT_WR), 0);
+  const uint64_t lost_us = kStartUs + 100'001;
+  node.Tick(lost_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().last_send_error, EPIPE);
+  // The first reopen is the next Tick's, kRetryUs (1 ms) on at the latest.
+  const uint64_t first_us = lost_us + 1'000;
+  EXPECT_EQ(node.NextDutyUs(lost_us), first_us);
+
+  // It fails: another socket holds the port meanwhile.
+  int holder = HoldPort(link.node_port);
+  ASSERT_GE(holder, 0);
+  node.Tick(first_us);
+  EXPECT_EQ(node.udp_fd(), -1);
+  Release(holder);
+
+  // The port is free again, but no attempt is made before the retry.
+  const uint64_t retry_us = first_us + HardwareNode::kReopenRetryUs;
+  node.Tick(retry_us - 1);
+  EXPECT_EQ(node.udp_fd(), -1);
+  EXPECT_EQ(node.socket_counters().reopens, 0u);
+
+  node.Tick(retry_us);
+  EXPECT_GE(node.udp_fd(), 0);
+  EXPECT_EQ(node.socket_counters().reopens, 1u);
+  EXPECT_EQ(NextProbeUs(gateway), retry_us);
+}
+
+int pending_send_error = 0;
+int TakeSendError() { return std::exchange(pending_send_error, 0); }
+
+// A send error the network clears by itself keeps the socket: the failed
+// probe goes out on the same socket kRetryUs (1 ms) later, and nothing is
+// reopened.
+// REQ-RT-22
+TEST(HardwareNodeTest, ATransientSendErrorKeepsTheSocket) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  node.set_seams({.send_error = &TakeSendError});
+  uint64_t now_us = 1'000'000;
+  for (const int error :
+       {ECONNREFUSED, ENETDOWN, ENETUNREACH, EHOSTUNREACH, ENOBUFS}) {
+    SCOPED_TRACE(std::strerror(error));
+    pending_send_error = error;
+    node.Tick(now_us);  // the probe is due, and fails
+    EXPECT_EQ(node.socket_counters().last_send_error, error);
+    node.Tick(now_us + 1'000);
+    EXPECT_EQ(node.socket_counters().reopens, 0u);
+    EXPECT_EQ(NextProbeUs(gateway), now_us + 1'000);
+    now_us += 200'000;  // past the next unanswered probe's retry
+  }
 }
 
 // This process's bridge row's heartbeat in the live registry, which a

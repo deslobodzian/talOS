@@ -58,6 +58,22 @@ For processor ownership and layer boundaries, see
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz, each tick as one or more value pages; dictionary pages before the first tick and every 100th (1 Hz at this rate). |
 | studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. HTTP requests are not the value stream. |
 
+A failed send never kills the bridge (`RuntimeUdpPeer` raises no
+`SIGPIPE`). When a send to the gateway fails with an error its socket never
+recovers from (`EPIPE`, as from a socket macOS marked defunct around sleep
+and wake; `ENOTCONN`, `EDESTADDRREQ`, `EADDRNOTAVAIL`, `EBADF`), the bridge
+closes the socket and opens a new one on the same ports (`Reopen()`, which
+keeps the frame sequence the gateway's replay gate checks): on its next pass,
+at most 1000 µs later, then at most every 100000 µs
+(`HardwareNode::kReopenRetryUs`). While it is closed nothing is sent or
+received, so the RoboRIO neutralizes at its command timeout and `/hw/status`
+`state_age_us` grows, as for an unplugged cable. Any other send error
+(`ECONNREFUSED` while the RoboRIO program is down, `ENETDOWN`,
+`ENETUNREACH`, `EHOSTUNREACH`, `ENOBUFS`) keeps the socket, and the failed
+send's duty is retried 1000 µs later. The bridge prints the errno once per
+outage and one line when a send succeeds again; its exit line counts
+`send_failures` and `socket_reopens`.
+
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).
 Every live and simulated stamp subtracts `camera.latency_offset_us`, after

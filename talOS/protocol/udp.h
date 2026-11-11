@@ -41,6 +41,10 @@ struct UdpStats {
   DecodeStatus last_decode_status = DecodeStatus::kOk;
   // The header version of the last kUnsupportedVersion frame; 0 before one.
   uint16_t last_unsupported_version = 0;
+  // The OS error (errno; WSAGetLastError() on Windows) of the last send that
+  // returned kSocketError from an open socket; 0 before one, or when that
+  // send was short with no error.
+  int last_send_error = 0;
 };
 
 // Connected UDP runtime peer for the Mac<->Rio hot path.
@@ -49,6 +53,12 @@ struct UdpStats {
 // buffer and sends immediately. TryReceive() decodes in place from the RX
 // buffer; the returned DecodedFrame payload pointer stays valid until the next
 // receive call on this peer.
+//
+// A send never raises SIGPIPE: the socket is opened with SO_NOSIGPIPE where
+// the OS has it (macOS) and every send passes MSG_NOSIGNAL where it is
+// defined (Linux), so a socket that can no longer send (EPIPE) fails the
+// send with kSocketError and stats().last_send_error instead of killing the
+// process.
 class RuntimeUdpPeer {
  public:
   RuntimeUdpPeer();
@@ -63,6 +73,13 @@ class RuntimeUdpPeer {
   UdpStatus Open(const char* local_address, uint16_t local_port,
                  const char* remote_address, uint16_t remote_port,
                  const UdpSocketOptions& options = {});
+
+  // Closes the socket and opens a new one as the last successful Open()
+  // asked (same addresses, ports and options), keeping the send sequence and
+  // the stats: the remote's replay gate (Gateway::Accept) still takes the
+  // frames that follow. kInvalidArgument when Open() never succeeded; on any
+  // other failure the peer is left closed.
+  UdpStatus Reopen();
 
   void Close();
 
@@ -89,13 +106,25 @@ class RuntimeUdpPeer {
   uint64_t next_send_sequence() const { return next_send_sequence_; }
 
  private:
+  // Creates, configures, binds and connects socket_ from the addresses and
+  // options Open() stored; closes it again on failure.
+  UdpStatus OpenSocket();
   UdpStatus ConfigureSocket(const UdpSocketOptions& options);
+  UdpStatus Send(std::size_t frame_size);
 
   uintptr_t socket_;
   uint64_t next_send_sequence_;
   UdpStats stats_;
   std::array<uint8_t, kMaxFrameSize> tx_buffer_;
   std::array<uint8_t, kMaxFrameSize> rx_buffer_;
+  // What the last successful Open() asked for, for Reopen(): IPv4 addresses
+  // and ports in network byte order.
+  bool opened_{false};
+  uint32_t local_address_{0};
+  uint16_t local_port_{0};
+  uint32_t remote_address_{0};
+  uint16_t remote_port_{0};
+  UdpSocketOptions options_{};
 };
 
 const char* UdpStatusName(UdpStatus status);

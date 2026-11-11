@@ -896,8 +896,8 @@ with several owners the merged
 observation can be an older request's, overstating it. The row is
 informational: REQ-RT-20's 1 ms bound is verified by the bridge's component
 test. The bridge's wake counters (`passes`, `throttled`, `wait_fallbacks`)
-are only in its exit line on stderr, in its [node output](#node-output) log,
-not in the report.
+and socket counters (`send_failures`, `socket_reopens`) are only in its exit
+lines on stdout, in its [node output](#node-output) log, not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
