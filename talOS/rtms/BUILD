@@ -17,6 +17,15 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+# The cross-process wake channel a publisher uses to wake a reader asleep on
+# its topic (README.md "Wake channel").
+cc_library(
+    name = "wake",
+    srcs = ["wake.cc"],
+    hdrs = ["wake.h"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "rtms",
     srcs = ["rtms.cc"],
@@ -24,6 +33,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":process_liveness",
+        ":wake",
         "//talOS/memory:shared_memory",
         "//talOS/schema:identity",
     ],
@@ -35,6 +45,16 @@ cc_test(
     srcs = ["process_liveness_test.cc"],
     deps = [
         ":process_liveness",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "wake_test",
+    size = "small",
+    srcs = ["wake_test.cc"],
+    deps = [
+        ":wake",
         "@googletest//:gtest_main",
     ],
 )
@@ -55,8 +75,10 @@ cc_test(
         for v in _VARIANTS
     },
     deps = [
+        ":process_liveness",
         ":rtms",
         ":test_message_fbs",
+        ":wake",
         "//talOS/schema:schema_hash",
         "@flatbuffers",
         "@googletest//:gtest",

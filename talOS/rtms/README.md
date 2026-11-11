@@ -83,10 +83,66 @@ claims a slot again. All claims of one process carry the same word, so a slot
 freed and claimed again by another queue of the same process before this one
 reads goes unnoticed.
 
+## Wake channel
+
+A reader need not poll a topic: it can sleep on a `talos::WakeReceiver`
+(`wake.h`, `//talOS/rtms:wake`) until the topic's writer publishes. A
+notification is only a hint to go read; what arrived, and whether anything
+did, is still decided by the sequence numbers, so a spurious wake costs one
+empty read and nothing else.
+
+A receiver is a non-blocking, close-on-exec `AF_UNIX` datagram socket bound to
+an address derived only from its random nonzero 64-bit id: on Linux the
+abstract name `\0talos-wake-<16 hex digits>` (no filesystem entry), on macOS
+`/tmp/talos-wake-<16 hex digits>` (`sun_path` holds 104 bytes, too few for
+`TEST_TMPDIR`), unlinked when the receiver is destroyed; a killed receiver's
+file stays until `/tmp` is cleaned, and a new receiver whose address is taken
+draws another id. Its fd is readable while notifications are pending;
+`drain()` consumes them. A `talos::WakeSender` keeps one socket connected to
+the last id it notified and sends one byte, never blocking or raising
+`SIGPIPE`: a full receiver queue means a wake is already pending (`true`); a
+refused or missing address means the receiver is gone (`false`).
+
+The protocol has two header words: `Reader::wake_id`, the receiver a reader
+slot's holder sleeps on (`set_reader_wake()`), and `Writer::waiters`, bit *i*
+set while slot *i* waits for the next publication.
+
+- **Reader.** On waking: `drain()`, then read every topic sharing the receiver
+  until `EMPTY`, then `arm_wake()` each; sleep only if every `arm_wake()`
+  returned `true`. `arm_wake()` sets the slot's bit (a sequentially
+  consistent read-modify-write, skipped while the bit is still set) and then
+  loads the writer sequence (sequentially consistent), returning `false` when
+  there is something to read or the slot is no longer held.
+- **Writer.** After the publication's sequence store, itself sequentially
+  consistent, it loads `waiters`. Zero, the common case, ends the write: no
+  exchange and no system call. Otherwise it exchanges the word for 0 and
+  notifies each set slot's `wake_id`, so one sleep of a reader costs the
+  writer at most one send however many publications follow.
+  `wakes_sent()` counts the sends of one queue object.
+- **Why no wake is lost.** The reader stores its bit before loading the
+  sequence; the writer stores the sequence before loading the bits. Under
+  sequential consistency at least one sees the other: the reader finds the
+  publication and does not sleep, or the writer finds the bit and wakes it.
+- A `DROP_NEWEST` write refused with `BUFFER_FULL` publishes nothing and wakes
+  nobody.
+
+**Crash window.** A writer killed after exchanging `waiters` but before
+sending leaves a reader asleep beside an unread message. Whichever writer next
+claims the topic (a publisher opening it, replacing a dead owner, or a queue's
+first write) therefore notifies every slot with a nonzero `wake_id`, armed or
+not.
+
+**Slot reuse.** `register_reader()` and `release_reader()` clear the slot's
+`wake_id` and bit, so no writer notifies a receiver its holder may have closed
+or wakes the slot's next holder for the previous one's arm. Reclaiming a dead
+reader clears only the dead holder's `wake_id` (compare-and-swap); it leaves
+the bit, which a new claimant may already have set, and a set bit with no
+receiver costs a writer one exchange and no send.
+
 ## Memory layout
 
 `RTMSHeader` (`rtms.h`) records slot geometry, schema identity, lifetime state,
-writer ownership/sequence and reader positions. Publication timestamps are
+writer ownership/sequence, reader positions and the wake channel's words. Publication timestamps are
 stored separately from message payloads. The exact segment version, header
 size, alignment and slot-stride formulas live in the
 [data-flow reference](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots).
