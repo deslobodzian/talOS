@@ -621,14 +621,19 @@ void LogWriter::State::start_writer() {
       if (unwritten || (streaming && now < write_at)) {
         timed = true;
         raw->wake.wait_until(std::min(write_at, sync_at));
+        raw->wakeups.fetch_add(1, std::memory_order_relaxed);
       } else {
+        // An empty timed wake ends the stream: the next record finds the
+        // writer idle and is written at once, with no timed wait after it.
         streaming = false;
+        timed = false;
         raw->writer_idle.store(true, std::memory_order_seq_cst);
         if (raw->completed.load() == raw->submitted.load() &&
             (raw->failed || chunk->committed.load(std::memory_order_seq_cst) ==
                                 chunk->written) &&
             !raw->stopping.load()) {
           raw->wake.wait_until(sync_at);
+          raw->wakeups.fetch_add(1, std::memory_order_relaxed);
         }
         raw->writer_idle.store(false, std::memory_order_seq_cst);
       }
@@ -823,6 +828,10 @@ std::string LogWriter::error() const {
 
 bool LogWriter::capture_stopped() const noexcept {
   return state_->capture_error.load() != State::CaptureError::NONE;
+}
+
+std::uint64_t LogWriter::wakeups() const noexcept {
+  return state_->wakeups.load(std::memory_order_relaxed);
 }
 
 bool LogWriter::capped() const noexcept {
