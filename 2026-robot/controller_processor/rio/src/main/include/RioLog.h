@@ -32,7 +32,24 @@
 // command-timeout enforcement however short the work), with that window's
 // longest work and longest interval. None has a field in State, so all stay
 // RIO-local.
+//
+// Every 10 s it also prints where the backend's part of the ticks went
+// (TickPhase), when that window had ticks: per phase the mean and longest
+// time per tick, and the device counts. The loop thread adds a tick's phases
+// with plain arithmetic and hands a finished window over on the first tick
+// after the logger asks for it: relaxed stores between an acquire fence and a
+// release store, once per window.
 namespace talos::rio {
+
+// Where the backend's share of a tick goes (PhoenixBackend measures it).
+enum class TickPhase : uint8_t {
+  kRefresh,  // BaseStatusSignal::RefreshAll over every device signal
+  kDevices,  // per-device validity, latency and reset (HasResetOccurred) pass
+  kControl,  // TalonFX SetControl for every motor (Apply or Neutral)
+  kHealth,   // CAN status, battery voltage, brownout
+  kOther,    // the rest of Read, Apply, ApplyOutputs and Neutral
+  kCount,
+};
 
 // "[<seconds>.<milliseconds>] ", the prefix of this program's own console
 // lines: `steady_us` on the steady clock, the gateway's clock (State's
@@ -103,8 +120,17 @@ class RioLog {
   // start to this one's (0 for the first), `duration_us` from wake to sleep.
   // Work longer than `period_us` is an overrun; an interval longer than 1.5
   // periods is a late tick. Single writer.
+  // It also closes the tick's phases (AddPhase): the tick joins the current
+  // phase window, after handing the logger the previous window if it asked.
   void RecordTick(uint64_t interval_us, uint64_t duration_us,
                   uint64_t period_us);
+
+  // The loop thread, during a tick: adds `duration_ns` to this tick's
+  // `phase`, and records the device counts the phase line reports. Plain
+  // arithmetic on loop-thread state; RecordTick closes the tick.
+  void AddPhase(TickPhase phase, uint64_t duration_ns);
+  void SetTickDevices(std::size_t motors, std::size_t sensors);
+  static constexpr uint64_t kPhaseWindowUs = 10'000'000;
 
   // Starts the logger thread (nice 19 on Linux, best effort), which
   // drains every 20 ms. Stop() (also the destructor) drains, flushes the
@@ -172,7 +198,37 @@ class RioLog {
   std::atomic<uint64_t> max_interval_us_{0};
   std::atomic<uint64_t> period_us_{0};
 
+  // Tick phases. Loop-thread state: this tick's phases and the open window.
+  static constexpr std::size_t kPhaseCount =
+      static_cast<std::size_t>(TickPhase::kCount);
+  struct PhaseWindow {
+    uint64_t ticks{0};
+    std::array<uint64_t, kPhaseCount> sum_ns{};
+    std::array<uint64_t, kPhaseCount> max_ns{};
+    uint32_t motors{0};
+    uint32_t sensors{0};
+  };
+  std::array<uint64_t, kPhaseCount> tick_phase_ns_{};
+  uint32_t tick_motors_{0};
+  uint32_t tick_sensors_{0};
+  PhaseWindow phase_window_{};
+  uint32_t phase_served_local_{0};
+  // The handed-over window: the loop thread stores it, then `phase_served_`
+  // (release) once `phase_request_` differs from what it last served.
+  std::atomic<uint32_t> phase_request_{0};
+  std::atomic<uint32_t> phase_served_{0};
+  std::atomic<uint64_t> published_ticks_{0};
+  std::array<std::atomic<uint64_t>, kPhaseCount> published_sum_ns_{};
+  std::array<std::atomic<uint64_t>, kPhaseCount> published_max_ns_{};
+  std::atomic<uint32_t> published_motors_{0};
+  std::atomic<uint32_t> published_sensors_{0};
+  void WritePhases(uint64_t now_us, bool force);
+
   // Logger-thread state.
+  bool phase_clock_started_{false};
+  bool phase_awaiting_{false};
+  uint32_t phase_requested_{0};
+  uint64_t next_phase_us_{0};
   std::unique_ptr<std::array<std::array<Window, kKeysPerKind>,
                              static_cast<std::size_t>(LogKind::kCount)>>
       windows_;

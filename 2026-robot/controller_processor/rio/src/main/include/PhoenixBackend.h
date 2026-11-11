@@ -32,6 +32,9 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // Reports go to `log`, which must outlive the backend; without one the
   // backend starts its own. Read, Apply and Neutral run on the RoboRIO loop
   // thread, so they only post fixed-size events (RioLog.h), never write.
+  // They and PollDeviceResets and ApplyOutputs also time their phases into
+  // `log` (RioLog::AddPhase, TickPhase): one steady-clock read per phase
+  // boundary, ten per disabled tick on the RoboRIO.
   explicit PhoenixBackend(bool is_simulation = false,
                           talos::rio::RioLog* log = nullptr);
 

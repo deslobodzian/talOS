@@ -376,7 +376,22 @@ in any second that saw them, it also prints the dropped-event count and the
 loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
 the period) and late ticks (a tick starting more than 1.5 periods after the
 previous, a starved loop however short its work), with that second's longest
-work and interval. `State` has no field for these, so they are RIO-local.
+work and interval. Every 10 s, when the loop ticked in that window, it
+prints where the backend's part of those ticks went:
+
+```
+[rio] tick phases: refresh mean/max <a>/<b> us, devices <a>/<b> us, control <a>/<b> us, health <a>/<b> us, other <a>/<b> us over <n> ticks (motors=<m> sensors=<s>)
+```
+
+per tick, the mean and longest time in `BaseStatusSignal::RefreshAll`
+(refresh), the per-device validity, latency and `HasResetOccurred` pass
+(devices), TalonFX `SetControl` for every motor, whether a command's or
+neutral (control), the CAN status and battery reads (health), and the rest
+of the backend's tick calls (other). `PhoenixBackend` takes one
+steady-clock reading per phase boundary, ten per disabled tick, and adds
+them on the loop thread without locks; the window passes to the logger at
+the loop's next tick ([bench measurement](../../docs/BENCH.md#fault-injection-and-timing)).
+`State` has no field for these, so they are RIO-local.
 Each of these lines, and the program's two start lines, begins with
 `[<seconds>.<milliseconds>]` on the gateway's steady clock: on the RoboRIO,
 time since its kernel booted, the clock of State's `sample_time_us`, so a
