@@ -46,16 +46,19 @@ namespace talos::event::log {
 // keeps: the writer writes the committed prefix of a chunk that is not full
 // within Options::write_interval (10 ms) of its first unwritten record, so
 // such a death loses about that much plus the writer's scheduling delay.
-// While records keep arriving the writer wakes and writes once per
-// write_interval (100 writes a second at the default, whatever the tick
-// rate) and the producer never posts; a record that finds the writer idle
-// (no record in the last write_interval) posts once, as a hand-off does. A
-// power loss also loses what the kernel has not put on the disk: once per
-// Options::sync_interval (a second) the writer fsyncs, which leaves the data in
-// the drive's write cache on macOS. flush() and destruction sync with
-// process::DurableSync, which also flushes that cache. If the pool fills,
-// capture stops permanently and failed() becomes true. Previously accepted
-// chunks are drained, preserving a prefix without holes.
+// While records arrive closer together than write_interval the writer wakes
+// and writes once per write_interval (at most 100 times a second at the
+// default, whatever the tick rate) and the producer does not post; a record
+// that finds the writer idle posts once, as a hand-off does, and is written
+// at once: one wakeup per record. Once a write_interval passes with no
+// record, or after a disk error, the writer sleeps until a record, a
+// hand-off or the periodic sync. A power loss also loses what the kernel has
+// not put on the disk: once per Options::sync_interval (a second) the writer
+// fsyncs, which leaves the data in the drive's write cache on macOS. flush()
+// and destruction sync with process::DurableSync, which also flushes that
+// cache. If the pool fills, capture stops permanently and failed() becomes
+// true. Previously accepted chunks are drained, preserving a prefix without
+// holes.
 //
 // With the background writer the thread that runs the loop never waits on
 // the log file: the writer thread creates `path` and writes the header,

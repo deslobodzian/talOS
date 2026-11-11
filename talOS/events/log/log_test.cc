@@ -1338,6 +1338,72 @@ TEST(LogBackgroundWriter, IdleWriterDoesNotPoll) {
   }
   ::unlink(path.c_str());
 }
+
+// A node whose records come less often than write_interval (a 50 Hz loop,
+// 20 ms apart) finds the writer idle each time: the record's post wakes it
+// and it writes at once. It used to then also sleep until the next write
+// was due and wake to find nothing, two wakeups per record.
+// REQ-RT-21
+TEST(LogBackgroundWriter, SparseRecordsWakeTheWriterOncePerRecord) {
+  const auto path = TempPath("sparse_wakeups");
+  {
+    const std::set<pid_t> before = ThreadIds();
+    LogWriter::Options options{};
+    options.sync_interval = std::chrono::hours{1};
+    LogWriter writer{path, "sparse", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+    const pid_t id = NewThread(before);
+    ASSERT_NE(id, 0);
+    constexpr long kRecords = 20;
+    const long start = VoluntarySwitches(id);
+    for (long i = 1; i <= kRecords; ++i) {
+      Context context{};
+      context.dispatch_index = static_cast<std::uint64_t>(i);
+      writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+      // At least 20 ms apart however loaded the host: a later record only
+      // finds the writer idle sooner.
+      std::this_thread::sleep_for(std::chrono::milliseconds{20});
+    }
+    const long wakeups = VoluntarySwitches(id) - start;
+    ASSERT_GE(start, 0);
+    // One per record, and a few for the scheduler; the empty timed wake
+    // made it about 2 per record.
+    EXPECT_LE(wakeups, kRecords + 3)
+        << kRecords << " records 20 ms apart, write_interval 10 ms";
+  }
+  ::unlink(path.c_str());
+}
+
+// A writer whose disk refused a write while a chunk held unwritten records
+// accepts nothing more, so it must not keep waking to retry: it used to
+// wake every write_interval for ever.
+// REQ-RT-21
+TEST(LogBackgroundWriter, FailedWriterGoesQuiet) {
+  const auto path = TempPath("failed_wakeups");
+  {
+    const std::set<pid_t> before = ThreadIds();
+    LogWriter::Options options{};
+    options.sync_interval = std::chrono::hours{1};
+    LogWriter writer{path, "failed", options};
+    writer.start({}, {});
+    writer.flush();  // The writer thread creates the file.
+    const pid_t id = NewThread(before);
+    ASSERT_NE(id, 0);
+    ASSERT_TRUE(CloseLogDescriptor(path));
+    Context context{};
+    context.dispatch_index = 1;
+    writer.dispatch(context, MakePayload(16, 1));
+    ASSERT_TRUE(Eventually([&] { return writer.failed(); }));
+    const long start = VoluntarySwitches(id);
+    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    const long wakeups = VoluntarySwitches(id) - start;
+    ASSERT_GE(start, 0);
+    // None is due for an hour; retrying every write_interval gave about 20.
+    EXPECT_LE(wakeups, 2) << "over 200 ms after the failure";
+  }
+  ::unlink(path.c_str());
+}
 #endif
 
 }  // namespace

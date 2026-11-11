@@ -552,6 +552,10 @@ void LogWriter::State::start_writer() {
     std::unique_lock lock{raw->mutex};
     raw->file_ready = true;
     raw->chunk_ready.notify_all();
+    // The last wait was a timed one (see the sleep below), and the last
+    // record write was one such a wait held back.
+    bool timed = false;
+    bool streaming = false;
 
     for (;;) {
       const auto now = std::chrono::steady_clock::now();
@@ -561,7 +565,10 @@ void LogWriter::State::start_writer() {
       // The oldest chunk not yet completed: a handed-over one, else the one
       // the producer is filling.
       Chunk* chunk = &raw->pool[next % raw->pool.size()];
+      // A failed writer drops what is left (write_chunk), so it has nothing
+      // to wait for.
       const bool unwritten =
+          !raw->failed &&
           chunk->committed.load(std::memory_order_seq_cst) > chunk->written;
       const bool sync_due = now - raw->last_sync >= raw->options.sync_interval;
       const bool write_due =
@@ -575,6 +582,10 @@ void LogWriter::State::start_writer() {
         lock.lock();
         // A sync with nothing to write opens no write window.
         if (submitted || unwritten) raw->last_write = now;
+        // Records are streaming when the write was one a timed wait held
+        // back; a record written at once found the writer idle.
+        if (unwritten && !submitted) streaming = timed;
+        timed = false;
 
         if (submitted) {
           chunk->committed.store(0, std::memory_order_relaxed);
@@ -591,26 +602,31 @@ void LogWriter::State::start_writer() {
         return;
       }
 
-      // Sleep, without the mutex. Within write_interval of the last write
-      // the writer sleeps until that write is due again without telling the
-      // producer it is idle, so records arriving at a steady rate are
-      // written once per write_interval and the producer never posts. Past
-      // it with nothing to write, the writer sleeps until a hand-off or a
-      // new record (the producer posts when it finds the writer idle),
-      // flush()/destruction (which always post), or the next periodic sync.
-      // A post that lands before the wait is kept by the semaphore, so none
-      // is lost; a stale one only makes the next wait return at once and
-      // the loop check again.
+      // Sleep, without the mutex. A record that arrived within
+      // write_interval of the last write waits for the next write to be
+      // due; while records are streaming (the last write was such a wait's)
+      // the writer also sleeps until then without telling the producer it
+      // is idle, so a steady stream is written once per write_interval and
+      // the producer never posts. Otherwise, with nothing to write, the
+      // writer sleeps until a hand-off or a new record (the producer posts
+      // when it finds the writer idle, and that record is written at once),
+      // flush()/destruction (which always post), or the next periodic sync,
+      // so a record sparser than write_interval costs one wakeup. A post
+      // that lands before the wait is kept by the semaphore, so none is
+      // lost; a stale one only makes the next wait return at once and the
+      // loop check again.
       const auto sync_at = raw->last_sync + raw->options.sync_interval;
       const auto write_at = raw->last_write + raw->options.write_interval;
       lock.unlock();
-      if (now < write_at) {
+      if (unwritten || (streaming && now < write_at)) {
+        timed = true;
         raw->wake.wait_until(std::min(write_at, sync_at));
       } else {
+        streaming = false;
         raw->writer_idle.store(true, std::memory_order_seq_cst);
         if (raw->completed.load() == raw->submitted.load() &&
-            chunk->committed.load(std::memory_order_seq_cst) ==
-                chunk->written &&
+            (raw->failed || chunk->committed.load(std::memory_order_seq_cst) ==
+                                chunk->written) &&
             !raw->stopping.load()) {
           raw->wake.wait_until(sync_at);
         }
