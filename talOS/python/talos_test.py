@@ -132,6 +132,39 @@ class TwoNodesTest(unittest.TestCase):
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
 
+    # REQ-RT-02
+    def test_an_at_drain_callback_hears_every_message_at_the_next_tick(self):
+        """wake=Wake.AT_DRAIN reaches the node: goals published at 2 and 3
+        ms reach the callback in order at the 10 ms tick's drain, not as
+        they are published."""
+        sim = Sim.from_toml(ROBOT_TOML)
+        collector = sim.add(AtDrainCollector, "collector")
+        sim.step(0.002)
+        for tick in (7, 8):
+            sim.publish(Goal, "/planner/goal", height_rot=0.0, enabled=True,
+                        tick_count=tick)
+            sim.step(0.001)
+        self.assertEqual(collector.heard, [])
+        sim.step(0.007)
+        self.assertEqual(collector.heard, [(7, 10), (8, 10)])
+
+
+class AtDrainCollector:
+    """Hears every /planner/goal at the node's drains, never woken by one:
+    (tick_count, node time in ms) per goal."""
+
+    def __init__(self, node):
+        self.node = node
+        self.heard = []
+        node.subscribe(Goal, "/planner/goal", callback=self.hear,
+                       wake=talos.Wake.AT_DRAIN)
+
+    def hear(self, goal):
+        self.heard.append((goal.tick_count, round(self.node.now * 1000)))
+
+    def update(self):
+        pass
+
 
 class RunTest(unittest.TestCase):
     def test_run_freezes_the_built_node_out_of_collection(self):

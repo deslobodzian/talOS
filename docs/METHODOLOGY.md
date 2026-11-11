@@ -116,9 +116,12 @@ There are exactly two kinds of input, and they are treated differently.
 - Never hold a last value past its freshness ("keep the last goal"). A
   mechanism that must hold position is told to hold by a producer that keeps
   publishing. **[review]**
-- Use a message callback (`subscribe(topic, fn)`) only when the node must react
-  as each message arrives rather than at its next tick. A callback makes every
-  publication on that topic wake the node (§10). **[review]**
+- Use a waking message callback (`subscribe(topic, fn)`) only when the node
+  must react as each message arrives rather than at its next tick: it makes
+  every publication on that topic wake the node (§10). A node that needs every
+  message but acts at its tick opens the callback with `Wake::kAtDrain`, which
+  wakes nothing ([when messages arrive](NODE_DEVELOPMENT_GUIDE.md#when-messages-arrive)).
+  **[review]**
 - Read another subsystem only through its messages and topics, or a configured
   value it owns through `param_of` in the constructor. Never include
   its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[review; gap: ARCH-2]**

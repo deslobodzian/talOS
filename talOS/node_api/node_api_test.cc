@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -82,7 +83,7 @@ int32_t BuildRelay(TalosNode* node, void* user) {
   }
   r.gain = gain.number;
   r.in = talos_node_subscribe(node, "/relay/in", sizeof(Value), &kValueSchema,
-                              0, &RelayMessage, &r);
+                              0, TALOS_WAKE_ON_PUBLISH, &RelayMessage, &r);
   r.out = talos_node_publish(node, "/relay/out", sizeof(Value), &kValueSchema);
   if (r.in < 0 || r.out < 0) return 1;
   return talos_node_set_update(node, &RelayUpdate, &r);
@@ -134,8 +135,58 @@ int32_t BuildImpostor(TalosNode* node, void* user) {
   constexpr TalosSchema kOther{"node_api_test.Other", 0xbadULL, nullptr, 0};
   auto& i = *static_cast<Impostor*>(user);
   i.in = talos_node_subscribe(node, "/relay/out", sizeof(Value), &kOther, 0,
-                              nullptr, nullptr);
+                              TALOS_WAKE_ON_PUBLISH, nullptr, nullptr);
   return i.in < 0 ? 1 : 0;
+}
+
+// Records the node time of each /waiter/in message its at-drain callback
+// hears, and what a subscription with an undefined wake returned.
+struct Waiter {
+  TalosNode* node = nullptr;
+  std::vector<int64_t> heard_ns;
+  int64_t refused = 0;
+  std::string refusal;
+};
+
+int32_t WaiterMessage(const void* /*data*/, uint32_t /*size*/, void* user) {
+  auto& w = *static_cast<Waiter*>(user);
+  w.heard_ns.push_back(talos_node_now_ns(w.node));
+  return 0;
+}
+
+int32_t WaiterUpdate(void* /*user*/) { return 0; }
+
+int32_t BuildWaiter(TalosNode* node, void* user) {
+  auto& w = *static_cast<Waiter*>(user);
+  w.node = node;
+  w.refused = talos_node_subscribe(node, "/waiter/other", sizeof(Value),
+                                   &kValueSchema, 0, 2, &WaiterMessage, &w);
+  w.refusal = talos_last_error();
+  if (talos_node_subscribe(node, "/waiter/in", sizeof(Value), &kValueSchema, 0,
+                           TALOS_WAKE_AT_DRAIN, &WaiterMessage, &w) < 0) {
+    return 1;
+  }
+  return talos_node_set_update(node, &WaiterUpdate, &w);
+}
+
+// TALOS_WAKE_AT_DRAIN keeps the callback but wakes nothing: a message
+// published between ticks reaches it at the next tick's drain (10 ms), not
+// at its publication (2 ms). A wake the enum lacks is refused, naming it.
+TEST_F(NodeApi, AnAtDrainCallbackHearsAMessageAtTheNextTick) {
+  Waiter waiter;
+  ASSERT_NE(talos_sim_add(sim_, "waiter", &BuildWaiter, &waiter), nullptr)
+      << talos_last_error();
+  EXPECT_EQ(waiter.refused, -1);
+  EXPECT_NE(waiter.refusal.find("wake"), std::string::npos) << waiter.refusal;
+
+  ASSERT_EQ(talos_sim_step(sim_, 2 * kMs), TALOS_OK) << talos_last_error();
+  const Value in{1.0, 0};
+  ASSERT_EQ(talos_sim_publish_raw(sim_, "/waiter/in", &in, sizeof in),
+            TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 7 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_TRUE(waiter.heard_ns.empty()) << "the publication woke the node";
+  ASSERT_EQ(talos_sim_step(sim_, 2 * kMs), TALOS_OK) << talos_last_error();
+  EXPECT_EQ(waiter.heard_ns, std::vector<int64_t>{10 * kMs});
 }
 
 TEST_F(NodeApi, ATopicRefusesAnEndpointOfAnotherSchema) {

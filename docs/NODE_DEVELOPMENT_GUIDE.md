@@ -12,6 +12,7 @@ the constructor; `update()` runs every period.
 | C++ (`talos::Node& node`) | Python (`node`) | |
 |---|---|---|
 | `node.subscribe<M>(topic, {.optional = true})` | `node.subscribe(M, topic, optional=True)` | latest value; optional callback argument |
+| `node.subscribe<M>(topic, fn, talos::Wake::kAtDrain)` | `node.subscribe(M, topic, callback=fn, wake=talos.Wake.AT_DRAIN)` | every message to the callback, in sequence, at the node's next drain; wakes nothing ([when messages arrive](#when-messages-arrive)) |
 | `node.publish<M>(topic)` | `node.publish(M, topic)` | |
 | `node.param<T>("key")`, `param<T>("key", fallback)` | `node.param("key")`, `param("key", fallback)` | this subsystem's TOML keys; dotted keys reach nested tables and an index reaches an array element (`"geometry.modules[0].x_m"`; past the end is absent). `T`: `bool`, integers, `double`, `std::string`, and TOML arrays as `std::vector<std::string>` / `std::vector<double>` (integer elements convert; `[]` is valid). Python returns arrays as `list[str]` / `list[float]`; a list default asks for an array. A wrong element type is an error naming the key and element index |
 | `node.param_of<T>("sub", "key")`, `param_of<T>("sub", "key", fallback)` | `node.param_of("sub", "key")`, `param_of("sub", "key", fallback)` | the same, read-only, from another subsystem's table (`[subsystems.<sub>]`), for a value that subsystem owns so it is configured once (the pose estimator reads the drivetrain's module offsets). Constructor only: later it throws `std::logic_error` (`TalosError`). A subsystem the config lacks is an error even with a fallback, so the node fails construction and its launcher `--describe` probe |
@@ -71,15 +72,29 @@ anywhere on the loop thread.
 See [Architecture: Targets](../ARCHITECTURE.md#targets) for drain scheduling
 and publication-age semantics.
 
-A callback costs a wake (a context switch) per publication, so give one only
-to a topic whose handler must run as the message arrives or must see every
-message in sequence (a Driver Station listener, the pose estimator's camera
-queues). A value read at the node's next tick or packet is a plain
-subscription read there: every drain, a wake's included, delivers its newest
-value, and `age()` still counts from publication. A drain delivers in
-registration order, so a listener that reads such a value sees the same
-drain's newest only if that subscription was opened first. The `driver`
-reads `/drivetrain/state` this way, so the drivetrain's ticks never wake it.
+Each subscription picks what a publication on it costs and what the node
+sees:
+
+- A **waking callback** (`subscribe(topic, fn)`: `Wake::kOnPublish`, the
+  default) runs as each message arrives, in sequence, and each publication
+  wakes the node (a context switch). Use it only for a handler that must act
+  at once, such as a Driver Station listener.
+- An **at-drain callback** (`subscribe(topic, fn, talos::Wake::kAtDrain)`;
+  Python `wake=talos.Wake.AT_DRAIN`) also gets every message in sequence but
+  wakes nothing: the messages wait for the node's next drain, right before
+  its next timer or on another topic's wake. Use it when the node needs every
+  message (an invalid one between valid ones must not hide them) but acts on
+  them only at its tick or next packet. More than 64 between two drains fall
+  behind.
+- A **latest-value read** (`subscribe(topic)`, no callback) keeps only the
+  newest message per drain: for a value read at the tick whose intermediate
+  values do not matter. The `driver` reads `/drivetrain/state` this way, so
+  the drivetrain's ticks never wake it.
+
+In each, `age()` counts from publication, not delivery, also inside a
+callback. A drain delivers in registration order, so a listener sees, in the
+same drain, the messages of the subscriptions opened before it: open those
+first.
 
 ### Realtime scheduling
 

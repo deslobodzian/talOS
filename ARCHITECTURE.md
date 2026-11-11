@@ -197,9 +197,13 @@ job.
 Messages reach a node when its loop drains its topics. Every node drains right
 before each of its own timers (`update()`, `every()`), so a timer sees what was
 published by its deadline whether or not the node has callbacks, and otherwise
-sleeps. A `subscribe` callback, or a Driver Station listener, makes that topic
-wake the node: its publisher notifies the sleeping loop, which drains every
-subscription at once. In a node with no timer every subscription wakes it.
+sleeps. A `subscribe` callback (`Wake::kOnPublish`, the default), or a Driver
+Station listener, makes that topic wake the node: its publisher notifies the
+sleeping loop, which drains every subscription at once. A callback opened with
+`Wake::kAtDrain` (`wake=talos.Wake.AT_DRAIN`) still receives every message in
+sequence but wakes nothing: its messages wait for the node's next drain, before
+a timer or on another topic's wake. In a node with no timer every subscription
+wakes it, `kAtDrain` included, since nothing else would drain it.
 While it waits on such a topic the loop also drains at least once a second, in
 case a publisher died before notifying. `testing::Sim` models a wake as a
 drain at the publication's instant.
@@ -223,8 +227,10 @@ Messages become visible when the consumer drains its topics, but `age()` and
 message cannot revive it. Subscriptions without per-message callbacks dispatch
 only the newest available message, counting skipped messages as dropped;
 callback subscriptions retain sequence delivery, capped at 64 messages per
-topic per drain. Each realtime timer dispatch samples its own clock. Simulation
-and replay preserve publication-age semantics. Simulated topics retain RTMS's
+topic per drain (a waking topic's rest drains again at once; a `kAtDrain`
+callback's rest waits for the next drain). Each realtime timer dispatch samples
+its own clock. Simulation and replay preserve publication-age semantics.
+Simulated topics retain RTMS's
 1024-slot overwrite window (1023 guaranteed readable messages), with identical
 latest-value skips and sequence-drop accounting. `testing::Sim::pause(name,
 duration)` stops one node's drains and timers while its clock and peers advance;

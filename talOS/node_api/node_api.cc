@@ -94,6 +94,8 @@ static_assert(SameMode(TALOS_MODE_NEUTRAL, hardware::Mode::kNeutral) &&
               SameMode(TALOS_MODE_VELOCITY, hardware::Mode::kVelocity) &&
               SameMode(TALOS_MODE_POSITION, hardware::Mode::kPosition) &&
               SameMode(TALOS_MODE_MOTION_MAGIC, hardware::Mode::kMotionMagic));
+static_assert(TALOS_WAKE_ON_PUBLISH == static_cast<int>(Wake::kOnPublish) &&
+              TALOS_WAKE_AT_DRAIN == static_cast<int>(Wake::kAtDrain));
 
 TalosSample* Out(TalosSample* out) {
   if (out == nullptr) throw std::invalid_argument("null TalosSample");
@@ -395,10 +397,15 @@ static talos::schema::Identity Schema(const TalosSchema* schema) {
 
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, const TalosSchema* schema,
-                             int32_t optional, TalosMessageCallback on_message,
-                             void* user) {
+                             int32_t optional, int32_t wake,
+                             TalosMessageCallback on_message, void* user) {
   return Guard<int64_t>(-1, [&] {
     talos::Node& n = AsNode(node);
+    if (wake != TALOS_WAKE_ON_PUBLISH && wake != TALOS_WAKE_AT_DRAIN) {
+      throw std::invalid_argument(
+          "wake must be TALOS_WAKE_ON_PUBLISH or TALOS_WAKE_AT_DRAIN, got " +
+          std::to_string(wake));
+    }
     talos::detail::MessageCallback callback;
     if (on_message != nullptr) {
       callback = [on_message, user, message_bytes](const void* data) {
@@ -408,7 +415,9 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
     const std::size_t index = NodeAccess::add_subscription(
         n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
         Schema(schema), optional != 0, std::move(callback));
-    if (on_message != nullptr) {
+    // talos::Node::subscribe's rule: a callback wakes the node unless it is
+    // opened to wait for the next drain.
+    if (on_message != nullptr && wake == TALOS_WAKE_ON_PUBLISH) {
       NodeAccess::require_immediate_delivery(n, index);
     }
     return static_cast<int64_t>(index);
