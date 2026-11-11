@@ -433,10 +433,12 @@ cc_test(
     tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
+        ":log_budget",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/hardware",
+        "//talOS/introspection:describe",
         "//talOS/protocol",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
