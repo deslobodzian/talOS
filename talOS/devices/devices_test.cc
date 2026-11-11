@@ -566,6 +566,30 @@ TEST(Devices, RezeroSharesSoftwareFramesAndPreservesHardwareLimits) {
   EXPECT_DOUBLE_EQ(other_gyro.yaw(), 0);
 }
 
+// REQ-SAFE-05: a rezero pairs the motor's position with inputs read as of the
+// State (a switch, a stop, a constant), so it takes only a position sampled
+// at most two status periods (10 ms at the default 200 Hz) before that
+// State; an older one is refused, zeroed() stays false, and a later call on
+// a fresh sample takes.
+TEST(Devices, RezeroRefusesAPositionOlderThanTwoStatusPeriods) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  const auto& link = sim.node("mech").extension<HardwareLink>();
+  EXPECT_EQ(RezeroAgeBound(link.config().hardware), 10ms);
+  hw.set_motor("mech", "b", 3, 1, 10'001, 0);
+  sim.step(10ms);
+  ASSERT_TRUE(mech.b.connected());
+  mech.b.rezero(1);
+  EXPECT_FALSE(mech.b.zeroed());
+  EXPECT_DOUBLE_EQ(mech.b.position(), 3);
+  hw.set_motor("mech", "b", 3, 1, 10'000, 0);
+  sim.step(10ms);
+  mech.b.rezero(1);
+  EXPECT_TRUE(mech.b.zeroed());
+  EXPECT_DOUBLE_EQ(mech.b.position(), 1);
+}
+
 // A zero holds only in the hardware frame it was taken in: a node restart
 // (a new node) starts unzeroed, a disconnect keeps it, a reset seen in
 // consecutive gateway States drops only the zero of the device it masked

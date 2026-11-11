@@ -50,6 +50,9 @@ namespace talos {
 namespace detail {
 class DriverStationLink;  // devices.cc
 }  // namespace detail
+namespace hardware {
+struct Config;  // talOS/hardware/config.h
+}  // namespace hardware
 
 // One node's end of the hardware link, attached as node.extension<
 // HardwareLink>() by the first handle.
@@ -98,6 +101,16 @@ bool robot_enabled(Node& node);
 // a direct device command would be.
 void RequireInUpdate(const Node& node, std::string_view what);
 
+// How old, at the State it arrived in, a motor's position sample may be for
+// Motor::rezero to take it, and how far apart two samples a rezero combines
+// may be (PositionMechanism's CANcoder homing): two status periods of
+// [robot] status_hz (10 ms at 200 Hz). A status frame is under one period
+// old when the RoboRIO reads it, so two devices' samples in one State are
+// under one period apart; the second period absorbs jitter. Any wider gap
+// is a late frame, and a mechanism moving at v would take a frame off by v
+// times the gap (0.1 rot at 1 rot/s and the 100 ms feedback bound).
+Duration RezeroAgeBound(const hardware::Config& config);
+
 // Hardware handles: cheap copyable values. Output setters (Motor's set_* and
 // stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the
 // node's update() and apply to the flush right after it; anything not set in
@@ -119,9 +132,11 @@ class Motor {
   // Commands adjusted to configured limits or neutralized for non-finite
   // values, counted once per setter call over this handle's device lifetime.
   std::uint64_t clamped_count() const;
-  // Node-shared software frame; ignored unless the sample is connected and
-  // both input and resulting offset are finite. No hardware reset is sent.
-  // Position goals use this frame; soft limits remain in the hardware frame.
+  // Node-shared software frame; ignored unless the sample is connected, its
+  // position at most RezeroAgeBound old at its State, and both input and
+  // resulting offset finite: zeroed() then stays as it was, so a homing
+  // caller retries on a later tick. No hardware reset is sent. Position
+  // goals use this frame; soft limits remain in the hardware frame.
   void rezero(double position_rot = 0);
   // Whether a rezero holds. The zero lives in this node, so a restarted node
   // starts unzeroed. It is dropped when its frame may have restarted: on a

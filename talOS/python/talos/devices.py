@@ -142,7 +142,9 @@ class Motor(_Input):
         """Set the node-shared software position on connected finite feedback.
 
         Position goals use this frame; soft limits remain hardware coordinates.
-        Disconnected/non-finite feedback or input leaves the offset unchanged.
+        Disconnected/non-finite feedback or input, or a position sample older
+        than two status periods at its State (C++ RezeroAgeBound), leaves the
+        offset unchanged: zeroed stays as it was, so retry on a later tick.
         """
         _abi.ok(lib.talos_motor_rezero(self._node, self._index, position_rot))
 

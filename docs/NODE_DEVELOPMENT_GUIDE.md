@@ -290,6 +290,19 @@ reverse)` asserts them; it does not stop the request or the ideal motor.
 methods in Python) set a software offset shared by all handles for that device
 on the node. They do not reset hardware and work while disabled. Disconnected,
 stale, or non-finite feedback and non-finite inputs leave the offset unchanged.
+`Motor::rezero` also refuses a position sample older, at the State it
+arrived in, than `RezeroAgeBound` (`devices.h`): two status periods of
+`[robot] status_hz`, 10 ms at 200 Hz. Whatever a rezero pairs the position
+with (a switch, a hard stop, a constant) is as of that State, and feedback
+stays valid up to `command_timeout_us` old, so a mechanism moving at 1 rot/s
+on a 100 ms-old position would take a frame 0.1 rot off. A frame is under
+one status period old when the RoboRIO reads it; the second period absorbs
+jitter. A refused rezero changes nothing (`zeroed()` stays as it was), so a
+homing node calls it again on a later tick, as `PositionMechanism` does.
+`PositionMechanism`'s absolute homing also requires the CANcoder and motor
+positions it combines to have been acquired within the same bound of each
+other (`position_time()`, so not before the bridge's clock mapping
+converges).
 Motor position and gyro yaw subtract the offset; velocity/rate are unchanged.
 Motor position and motion-magic goals translate back to hardware coordinates
 before clamping. Configured soft limits remain in the **hardware frame**,
