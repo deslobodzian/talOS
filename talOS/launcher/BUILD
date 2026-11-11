@@ -94,7 +94,7 @@ cc_library(
 )
 
 # Restart backoff, budget and quarantine, and the stall, missing-row and
-# construction kills, as functions of the `now` a supervision pass sampled.
+# construction kills, as functions of the supervision clock's times.
 cc_library(
     name = "supervision_policy",
     srcs = ["supervision_policy.cc"],

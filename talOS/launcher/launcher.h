@@ -315,10 +315,11 @@ class Launcher {
   // finds its run's row in `registry` (null while unattached), records its
   // progress, recording and realtime flags, checks its live endpoints once,
   // and kills a run whose construction deadline passed or whose progress
-  // stopped past the startup grace. Returns whether `proc` changed.
+  // stopped past the startup grace, judged at the times the supervision
+  // clock reads around that row read (RunLiveness::Watch). Returns whether
+  // `proc` changed.
   bool WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
-                const introspect::RegistryMapping* registry,
-                SupervisionTime now);
+                const introspect::RegistryMapping* registry);
 
   // Fills `launch` for a member's first run: its supervision settings and
   // the command line it is spawned with, its event log capped at

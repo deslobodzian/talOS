@@ -3,8 +3,9 @@
 // Supervision decisions as functions of time: a member's restart backoff,
 // rolling budget and quarantine (RestartSchedule), and the stall,
 // missing-row and construction kills of one run (RunLiveness). Nothing here
-// reads a clock: each call takes the `now` its supervision pass sampled from
-// the supervision clock (SupervisionClock).
+// reads a real clock: each call takes the `now` its supervision pass sampled
+// from the supervision clock (SupervisionClock), or, for a run's liveness
+// (RunLiveness::Watch), that clock itself.
 //
 // Restarts
 //
@@ -118,21 +119,46 @@ struct LivenessLimits {
   std::chrono::milliseconds construction_timeout;  // from spawn
 };
 
+// What one pass's look at a run (RunLiveness::Watch) decided.
+struct LivenessCheck {
+  std::string_view kill;      // as RunLiveness::Judge returns it
+  SupervisionTime judged_at;  // the time the decision was taken at
+};
+
 // One run's progress, judged once per supervision pass.
+//
+// A run is killed for a stall only when the launcher itself saw its progress
+// unchanged over at least the heartbeat timeout: progress is stamped with
+// the time the clock reads after the read that saw it move, and judged at
+// the time read before the read that sees it unchanged. The launcher's own
+// stall at any point of a pass therefore lengthens no run's measured stall;
+// it can only delay a kill.
 class RunLiveness {
  public:
   // A run spawned at `spawned`: its grace and construction deadline start.
   void Begin(SupervisionTime spawned);
-  // Records `row`'s progress at `now` (a running row's dispatch count; a
-  // constructing row's heartbeat too) and returns why the run must be
-  // killed: kRunConstructionDeadline, kRunStalled or kRunHeartbeatMissing
-  // (session.h), or empty.
+  // One supervision pass's look at the run: reads `clock`, then the run's
+  // row (`read_row`), then `clock` again. The row's progress is recorded at
+  // the second time, and the run is judged (Judge) at the first.
+  LivenessCheck Watch(const SupervisionClock& clock,
+                      const std::function<RowObservation()>& read_row,
+                      const LivenessLimits& limits);
+  // For a row read at `now`: records its progress at `now` (a running
+  // row's dispatch count; a constructing row's heartbeat too) and returns
+  // why the run must be killed: kRunConstructionDeadline, kRunStalled or
+  // kRunHeartbeatMissing (session.h), or empty.
   std::string_view Judge(const RowObservation& row, SupervisionTime now,
                          const LivenessLimits& limits);
   SupervisionTime progress_changed_at() const { return progress_changed_at_; }
   SupervisionTime heartbeat_changed_at() const { return heartbeat_changed_at_; }
 
  private:
+  // Records `row`'s progress as seen at `read_at`.
+  void Record(const RowObservation& row, SupervisionTime read_at);
+  // Why the run must be killed at `now`, given what Record kept.
+  std::string_view Verdict(const RowObservation& row, SupervisionTime now,
+                           const LivenessLimits& limits) const;
+
   SupervisionTime started_at_{};
   SupervisionTime progress_changed_at_{};
   SupervisionTime heartbeat_changed_at_{};

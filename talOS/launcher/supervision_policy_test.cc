@@ -1,8 +1,8 @@
 // The supervisor's restart and kill decisions as functions of time: every
-// case steps a simulated `now` by hand from SupervisionTime{} + 1h, with the
-// limits the launcher builds from LauncherOptions{} and kDefaultMaxRestarts,
-// so a production constant that moves turns a case red. No file, process or
-// clock is touched.
+// case steps a simulated `now` (or a scripted clock) by hand from
+// SupervisionTime{} + 1h, with the limits the launcher builds from
+// LauncherOptions{} and kDefaultMaxRestarts, so a production constant that
+// moves turns a case red. No file, process or real clock is touched.
 
 #include "talOS/launcher/supervision_policy.h"
 
@@ -290,6 +290,51 @@ TEST(SupervisionPolicy, StalledLoopIsKilledThoughItsHeartbeatMoves) {
             std::string_view{});
   row.heartbeat += 10'000'000;
   EXPECT_EQ(run.Judge(row, last_dispatch + 500ms, limits), kRunStalled);
+}
+
+// The launcher's own stall inside a pass -- after it samples the clock and
+// before it reads a row (its stderr behind a full pipe, a page fault, the
+// host descheduling it) -- never counts against a run that dispatched
+// throughout, even when the next pass follows at once. A run whose dispatch
+// count then really stops is still killed one heartbeat timeout after the
+// last read that saw it move, not 1 ns sooner.
+// REQ-OPS-05
+TEST(SupervisionPolicy, LaunchersOwnStallInsideAPassIsNotARunStall) {
+  const LivenessLimits limits = SessionLivenessLimits();
+  ASSERT_EQ(limits.heartbeat_timeout, 500ms);
+  SupervisionTime now = kT0;
+  const SupervisionClock clock = [&now] { return now; };
+  RowObservation row{.found = true};
+  const auto read = [&row] { return row; };
+  RunLiveness run;
+  run.Begin(kT0);
+  for (; now < kT0 + 6s; now += 10ms) {
+    ++row.dispatch;
+    ASSERT_EQ(run.Watch(clock, read, limits).kill, std::string_view{})
+        << At(now);
+  }
+  // The pass samples the clock, then stalls 600 ms before the row is read;
+  // the run dispatched all along.
+  const auto read_after_stall = [&] {
+    now += 600ms;
+    row.dispatch += 60;
+    return row;
+  };
+  EXPECT_EQ(run.Watch(clock, read_after_stall, limits).kill,
+            std::string_view{});
+  const SupervisionTime last_moved_read = now;
+  // The next pass follows 1 ms later, before the run's next dispatch.
+  now += 1ms;
+  EXPECT_EQ(run.Watch(clock, read, limits).kill, std::string_view{}) << At(now);
+  // From here the dispatch count does not move.
+  for (; now < last_moved_read + 500ms; now += 10ms) {
+    ASSERT_EQ(run.Watch(clock, read, limits).kill, std::string_view{})
+        << At(now);
+  }
+  now = last_moved_read + 500ms - 1ns;
+  EXPECT_EQ(run.Watch(clock, read, limits).kill, std::string_view{});
+  now = last_moved_read + 500ms;
+  EXPECT_EQ(run.Watch(clock, read, limits).kill, kRunStalled);
 }
 
 // The converse: a loop that keeps dispatching while its reporting thread is

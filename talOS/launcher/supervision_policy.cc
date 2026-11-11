@@ -63,25 +63,48 @@ void RunLiveness::Begin(SupervisionTime spawned) {
   last_dispatch_ = 0;
 }
 
+LivenessCheck RunLiveness::Watch(
+    const SupervisionClock& clock,
+    const std::function<RowObservation()>& read_row,
+    const LivenessLimits& limits) {
+  // A row that shows progress shows it no later than `after`, and one that
+  // shows none showed none since at least `before`: a launcher stalled
+  // before or after the read can only shorten the stall it measures.
+  const SupervisionTime before = clock();
+  const RowObservation row = read_row();
+  const SupervisionTime after = clock();
+  Record(row, after);
+  return {Verdict(row, before, limits), before};
+}
+
 std::string_view RunLiveness::Judge(const RowObservation& row,
                                     SupervisionTime now,
                                     const LivenessLimits& limits) {
-  if (row.found) {
-    // Progress is the loop's dispatch count, which an event-loop node's loop
-    // thread stores itself (introspect::Reporter), so a starved reporting
-    // thread cannot make a running loop look stalled. Its heartbeat, which
-    // that thread writes, counts only while it constructs and has no loop
-    // yet.
-    const bool beat_moved = row.heartbeat != last_heartbeat_;
-    const bool dispatch_moved = row.dispatch != last_dispatch_;
-    if (beat_moved) {
-      heartbeat_changed_at_ = now;
-      last_heartbeat_ = row.heartbeat;
-    }
-    if (dispatch_moved) last_dispatch_ = row.dispatch;
-    if (dispatch_moved || (row.constructing && beat_moved))
-      progress_changed_at_ = now;
+  Record(row, now);
+  return Verdict(row, now, limits);
+}
+
+void RunLiveness::Record(const RowObservation& row, SupervisionTime read_at) {
+  if (!row.found) return;
+  // Progress is the loop's dispatch count, which an event-loop node's loop
+  // thread stores itself (introspect::Reporter), so a starved reporting
+  // thread cannot make a running loop look stalled. Its heartbeat, which
+  // that thread writes, counts only while it constructs and has no loop
+  // yet.
+  const bool beat_moved = row.heartbeat != last_heartbeat_;
+  const bool dispatch_moved = row.dispatch != last_dispatch_;
+  if (beat_moved) {
+    heartbeat_changed_at_ = read_at;
+    last_heartbeat_ = row.heartbeat;
   }
+  if (dispatch_moved) last_dispatch_ = row.dispatch;
+  if (dispatch_moved || (row.constructing && beat_moved))
+    progress_changed_at_ = read_at;
+}
+
+std::string_view RunLiveness::Verdict(const RowObservation& row,
+                                      SupervisionTime now,
+                                      const LivenessLimits& limits) const {
   const bool grace_over = now - started_at_ >= limits.startup_grace;
   // Registration is part of startup, not an opt-in to supervision:
   // until a row arrives, the spawn time is the last progress time.

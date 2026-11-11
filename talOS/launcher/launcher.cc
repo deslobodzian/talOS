@@ -939,14 +939,13 @@ bool Launcher::RosterContinues(const std::vector<NodeProcessInfo>& procs,
 }
 
 bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
-                        const introspect::RegistryMapping* registry,
-                        SupervisionTime now) {
+                        const introspect::RegistryMapping* registry) {
   bool changed = false;
-  RowObservation row;
   uint32_t recording = 0;
   std::optional<std::vector<naming::SourceShape>> live;
   bool live_complete = true;
-  if (registry != nullptr) {
+  const auto read_row = [&]() -> RowObservation {
+    if (registry == nullptr) return {};
     for (const auto& record : registry->header()->nodes) {
       if (record.state.load(std::memory_order_acquire) !=
           static_cast<uint64_t>(introspect::SlotState::ACTIVE))
@@ -973,32 +972,36 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
         continue;
       live = std::move(published);
       recording = flags;
-      row = {.found = true,
-             .constructing = (flags & introspect::kFlagConstructing) != 0,
-             .heartbeat = beat,
-             .dispatch = dispatch};
-      break;
+      return {.found = true,
+              .constructing = (flags & introspect::kFlagConstructing) != 0,
+              .heartbeat = beat,
+              .dispatch = dispatch};
     }
-  }
+    return {};
+  };
+  // The clock is read around the row read, not taken from the pass's
+  // start: the launcher's own stall earlier in the pass must not count
+  // against this run (RunLiveness).
+  const LivenessCheck check = launch.liveness.Watch(options_.supervision_clock,
+                                                    read_row, launch.limits);
   if (NoteRecording(proc, launch, recording)) changed = true;
   if (NoteRealtime(proc, launch, recording)) changed = true;
   if (live) {
     launch.endpoints_checked = true;
     if (CheckEndpoints(proc, launch, *live, live_complete)) changed = true;
   }
-  const std::string_view reason =
-      launch.liveness.Judge(row, now, launch.limits);
-  if (!reason.empty()) {
+  if (!check.kill.empty()) {
+    const bool constructing = (recording & introspect::kFlagConstructing) != 0;
     std::cerr << "[launcher] " << proc.name
-              << (reason == kRunConstructionDeadline
+              << (check.kill == kRunConstructionDeadline
                       ? " construction deadline exceeded"
-                  : reason == kRunHeartbeatMissing
+                  : check.kill == kRunHeartbeatMissing
                       ? " heartbeat missing"
-                      : StallReport(launch, row.constructing, now))
+                      : StallReport(launch, constructing, check.judged_at))
               << "; killing pid " << proc.pid << "\n";
     SignalProcessGroup(proc.pid, SIGKILL);
     launch.heartbeat_killed = true;
-    launch.kill_reason = reason;
+    launch.kill_reason = check.kill;
   }
   return changed;
 }
@@ -1062,7 +1065,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // supervised by its row; the simulation gateway registers like a node.
       if (!stopping && !launch.heartbeat_killed &&
           !(studio && i == studio->index())) {
-        if (WatchRun(proc, launch, registry ? &*registry : nullptr, now))
+        if (WatchRun(proc, launch, registry ? &*registry : nullptr))
           manifest_changed = true;
       }
       int status = 0;

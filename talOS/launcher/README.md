@@ -397,6 +397,11 @@ hardware bridge from its own loop), never the heartbeat: the reporting thread
 that heartbeats runs below every realtime loop, so a host busy with them can
 starve it for longer than the timeout while the loop keeps time. While a node
 constructs it has no loop yet, so its heartbeat (or a first dispatch) counts.
+The launcher measures that interval between its own reads of the row: progress
+is stamped with the time it reads just after the read that saw it move, and
+judged at the time it reads just before each later read, so its own stall
+anywhere in a supervision pass (its output blocked, a page fault, the host
+descheduling it) can delay a kill but never causes one.
 The kill's stderr line names the signal that stopped: the dispatch count, and
 whether the heartbeat still moved or was unchanged too, or the construction
 heartbeat. The heartbeat still bounds a running node at 5 s
@@ -629,7 +634,7 @@ header:
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_merge` | `log_merge.h` | `MergeLogs`; `log_dump` links it and `:hardware_record`, not the supervisor |
-| `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the time a supervision pass sampled: `RestartSchedule` (backoff, rolling budget, quarantine), `RunLiveness` (stall, missing row, construction deadline) |
+| `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
 
