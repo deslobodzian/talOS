@@ -50,6 +50,10 @@ single_version_override(
     version = "3.4.0",
 )
 
+# Choreo .traj (JSON) trajectories, read by //talOS/trajectory at load time.
+# 3.11.3 is the version the module graph already resolves transitively.
+bazel_dep(name = "nlohmann_json", version = "3.11.3")
+
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
 bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
