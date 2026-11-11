@@ -344,10 +344,11 @@ motion feedback, or a missing or invalid remote CANcoder, neutralizes only that
 motor and its followers; healthy motors in the same command continue driving.
 The neutral starts in the tick that finds the feedback invalid, while a command
 is in force (between commands a backend keeps the last request it sent), and
-holds in every command accepted until one observes a State in which the motor
-may drive again: neither the command in force nor one built on a State that
-showed it invalid moves it once its feedback returns (`Gateway::MayDrive`; the
-same floor as a reset, above). Neutralized demands in accepted commands
+holds in every command accepted until one observes a State later than the
+last one in which the motor could not drive: neither the command in force nor
+one built on any earlier State moves it once its feedback returns, even a State
+that showed it valid between two invalid spells (`Gateway::MayDrive`;
+the same floor as a reset, above). Neutralized demands in accepted commands
 increment `neutralized_motor_count`; the tick's neutral does not. The backend
 remains healthy while any configured motor or CAN sensor has valid feedback
 (or none are configured). Total loss of all configured motor/CAN-sensor
