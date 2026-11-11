@@ -163,14 +163,24 @@ the follower is plain arithmetic, with no clock or global state.
 
 Trajectory files live in the robot's configuration directory,
 `<robot>/main_processor/configuration/trajectories/` (the Choreo project
-`.chor` beside its `.traj` files). The routine names its file in a subsystem
-parameter and resolves it against the config:
+`.chor` beside its `.traj` files). The routine's subsystem file names each
+one under `[trajectories]`, relative to that subsystem file:
+
+```toml
+[trajectories]
+two_piece = "../trajectories/two_piece.traj"
+```
+
+Config load checks each entry and the bundle ships each file
+([Configuration](../../ARCHITECTURE.md#configuration)); regenerate the
+manifest after adding one. The node opens it by name: `TrajectoryPath`
+returns the absolute path, or throws naming `trajectories.<name>` when the
+subsystem does not declare it:
 
 ```cpp
-const std::filesystem::path file =
-    std::filesystem::path(node.config_path()).parent_path() /
-    node.param<std::string>("trajectory", "trajectories/two_piece.traj");
-auto loaded = talos::trajectory::LoadChoreoFile(file);
+const auto config = talos::config::ParseRobotConfig(node.config_path());
+auto loaded = talos::trajectory::LoadChoreoFile(
+    config.TrajectoryPath(node.name(), "two_piece"));
 if (!loaded) throw std::invalid_argument(loaded.error);   // constructor
 if (!loaded.note.empty()) log(loaded.note);
 const auto& game = talos::trajectory::kField2026;
@@ -186,9 +196,8 @@ act on each marker in `cursor.advance(trajectory_, elapsed_s)`, and
 inside `update()` uses `reserve()` once and `assign()` per rebuild. The trajectory library does no actuation gating: the
 drivetrain's `Target` and `robot_enabled` still decide whether anything moves.
 
-A bundle does not carry trajectory files: `tools/sync_manifest.py` does not
-list them in `CONFIG_FILES` (TODO.md TRAJ-2). `2026-robot/main_processor/autonomous`
-does not use this library (TODO.md TRAJ-1).
+`2026-robot/main_processor/autonomous` does not use this library (TODO.md
+TRAJ-1).
 
 ## Tests
 

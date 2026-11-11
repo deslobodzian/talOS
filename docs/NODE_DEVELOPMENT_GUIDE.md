@@ -45,6 +45,13 @@ pose estimator validates both backends' tables); a key read only in
 `update()` or a callback is undeclared, and a table read without `param`
 declares nothing.
 
+A data file a node opens, such as a Choreo `.traj`, is not a parameter: list
+it in the subsystem file's `[trajectories]` table (`name = "path"`, relative
+to that file) and open it by name with
+`config::ParseRobotConfig(node.config_path()).TrajectoryPath(node.name(),
+"<name>")`, so config load checks it exists and the bundle ships it
+([talOS/trajectory](../talOS/trajectory/README.md#using-it-from-a-node)).
+
 ### Threads
 
 A node belongs to the thread that builds it, which also runs its loop (a
