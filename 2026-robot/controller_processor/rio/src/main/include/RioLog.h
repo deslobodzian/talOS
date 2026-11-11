@@ -34,6 +34,11 @@
 // RIO-local.
 namespace talos::rio {
 
+// "[<seconds>.<milliseconds>] ", the prefix of this program's own console
+// lines: `steady_us` on the steady clock, the gateway's clock (State's
+// sample_time_us), which on Linux counts from kernel boot.
+std::string ConsoleTime(uint64_t steady_us);
+
 enum class LogKind : uint8_t {
   kMotorFault,      // fault field changed: value, previous, motion sample
   kMotorFeedback,   // motion feedback valid/invalid (flag = valid)
@@ -81,8 +86,10 @@ class RioLog {
   static constexpr std::size_t kCapacity = 256;
   static constexpr uint64_t kWindowUs = 1'000'000;
 
-  // Lines go to `sink` (default: stderr), only ever from the thread that
-  // calls Drain/Flush: the logger thread once Start() has run.
+  // Lines go to `sink` (default: stderr, each prefixed with ConsoleTime of
+  // its writing, within one 20 ms drain of the event unless the logger
+  // thread is starved), only ever from the thread that calls Drain/Flush:
+  // the logger thread once Start() has run.
   explicit RioLog(Sink sink = {});
   ~RioLog();
   RioLog(const RioLog&) = delete;

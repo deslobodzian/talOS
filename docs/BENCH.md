@@ -187,7 +187,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   line a second) and then `hardware gateway socket open after <n> failed
   attempts, <s> s after the first`. Record old/new boot ids, clock reset
   count, the RIO console as written on the RIO (a network console viewer
-  loses lines while the link is down) beside `dmesg`'s link-up lines, the
+  loses lines while the link is down; the program's lines carry the RIO's
+  seconds since boot, which the first State's `sample_time_us` in the
+  bridge log maps to session time) beside `dmesg`'s link-up lines, the
   first State's arrival in the bridge log, config acknowledgment and fresh
   DS/target acceptance after safe recovery.
 - [ ] Reset the TalonFX alone (briefly interrupt its power) while DS is

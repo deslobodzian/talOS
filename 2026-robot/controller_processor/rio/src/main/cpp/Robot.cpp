@@ -138,7 +138,10 @@ void Robot::StartCompetition() {
   // (-Pcompanion, build.gradle), never learned from a datagram.
   const char* const companion_address =
       IsSimulation() ? "127.0.0.1" : talos::rio::kCompanionAddress;
-  std::printf("hardware gateway build %s%s companion %s:5803\n",
+  // Prefixed, like every RioLog line, with the gateway's clock: on the
+  // RoboRIO, seconds since its kernel booted.
+  std::printf("%shardware gateway build %s%s companion %s:5803\n",
+              talos::rio::ConsoleTime(NowUs()).c_str(),
               talos::rio::kBuildCommit,
               talos::rio::kBuildDirty ? " (dirty)" : "", companion_address);
   // The persisted configuration configures devices on the backend's worker,
@@ -174,8 +177,9 @@ void Robot::StartCompetition() {
 
   // The configuration being restored, if any; the push still follows.
   std::printf(
-      "hardware gateway config=%llu commissioned=%d (waiting for config "
+      "%shardware gateway config=%llu commissioned=%d (waiting for config "
       "push)\n",
+      talos::rio::ConsoleTime(NowUs()).c_str(),
       static_cast<unsigned long long>(restoring_id),
       restoring ? restoring->commissioned : 0);
 

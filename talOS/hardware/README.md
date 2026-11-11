@@ -369,6 +369,14 @@ loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
 the period) and late ticks (a tick starting more than 1.5 periods after the
 previous, a starved loop however short its work), with that second's longest
 work and interval. `State` has no field for these, so they are RIO-local.
+Each of these lines, and the program's two start lines, begins with
+`[<seconds>.<milliseconds>]` on the gateway's steady clock: on the RoboRIO,
+time since its kernel booted, the clock of State's `sample_time_us`, so a
+`hardware_node --log` record of a State places the RIO's lines on the
+session's time. A RioLog line's time is when the logger wrote it, within one
+20 ms drain of the event unless that thread is starved. Driver Station
+messages (`talos companion link`, `talos loop watchdog`) and the WPILib and
+Phoenix libraries' own lines carry no such time.
 
 If the loop stops ticking right after it applied a command, nothing else
 stops the outputs: its TalonFX controls are one-shot (their device-side
