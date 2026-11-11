@@ -11,6 +11,7 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -436,6 +438,25 @@ TEST(Config, RejectsAmbiguousHardwareAndInvalidFeedback) {
   c = SwerveConfig(true);
   c.motors[0].slots[0].p = std::numeric_limits<double>::quiet_NaN();
   EXPECT_THROW(Validate(c), std::invalid_argument);
+}
+// Feedback command_timeout_us old is invalid, so a status rate with fewer than
+// four frames in that time would read as a dropout at every frame: 40 Hz at
+// the 100 ms timeout loads, anything slower is refused naming both keys.
+// REQ-SAFE-26
+TEST(Config, StatusRateBelowFourPerTimeoutIsRefused) {
+  auto c = SwerveConfig(true);
+  ASSERT_EQ(c.command_timeout_us, 100000u);
+  c.status_hz = 40;
+  EXPECT_NO_THROW(Validate(c));
+  c.status_hz = std::nextafter(40.0, 0.0);
+  try {
+    Validate(c);
+    ADD_FAILURE() << "status_hz just below 40 at 100000 us loaded";
+  } catch (const std::invalid_argument& error) {
+    const std::string message = error.what();
+    EXPECT_NE(message.find("status_hz"), std::string::npos) << message;
+    EXPECT_NE(message.find("command_timeout_us"), std::string::npos) << message;
+  }
 }
 TEST(Config, FingerprintIncludesCalibrationAndGains) {
   auto c = SwerveConfig(true);

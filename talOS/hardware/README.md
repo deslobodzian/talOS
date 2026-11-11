@@ -69,8 +69,10 @@ remote without it keeps the configured value.
 Both endpoints compute a canonical configuration fingerprint. Changing a CAN
 address, offset, limit, or gain changes that ID; commands with a different ID
 are refused. This is a compatibility check, not authentication. Configuration
-validation rejects duplicate IDs/names/addresses, invalid numeric values, and
-remote encoder references that do not exist on the motor's bus.
+validation rejects duplicate IDs/names/addresses, invalid numeric values,
+remote encoder references that do not exist on the motor's bus, and a
+`status_hz` giving fewer than four status periods per `command_timeout_us`
+(feedback that old is invalid; see "Fault scope" below).
 
 Device tables reject unknown keys in both runtime parsing and manifest checking.
 CANcoder and Pigeon2 accept `type`, `bus`, `can_id`, `inverted`, and `offset_rot`.

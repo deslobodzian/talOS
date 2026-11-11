@@ -139,7 +139,10 @@ packet gaps, `2 × (20000 + [robot] period_us)` µs (a node's Driver Station vie
 expires at the timeout, and consecutive packets can be 20 ms plus one gateway
 tick apart), or longer than 500000 µs. It also refuses a subsystem owning a
 motor, digital output or PWM output whose `period_us` exceeds a quarter of the
-timeout.
+timeout, and a `[robot] status_hz` giving fewer than four status periods per
+timeout (`status_hz × command_timeout_us < 4000000`), since the gateway counts
+motion feedback that is `command_timeout_us` old as invalid
+([fault scope](talOS/hardware/README.md#runtime-contract)).
 
 ## Targets
 
