@@ -204,6 +204,11 @@ class LogWriter {
 
   std::uint64_t session_id() const noexcept;
 
+  // How many times the writer thread has returned from a sleep (a post, a
+  // write coming due or the periodic sync), whether or not it then found
+  // work: what REQ-RT-21 bounds. A write that blocks is not counted.
+  std::uint64_t wakeups() const noexcept;
+
  private:
   // A counting semaphore: post() never blocks, never takes a lock and is never
   // lost -- a post before the wait makes the wait return at once.
@@ -297,6 +302,7 @@ class LogWriter {
     // record, or the producer sees the writer idle and posts, and the
     // semaphore keeps a post that lands before the wait.
     std::atomic<bool> writer_idle{false};
+    std::atomic<std::uint64_t> wakeups{0};  // See LogWriter::wakeups().
     Wakeup wake;
 
     enum class CaptureError { NONE, POOL_FULL, RECORD_TOO_LARGE, BYTE_CAP };
