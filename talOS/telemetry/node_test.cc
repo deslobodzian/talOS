@@ -17,6 +17,7 @@
 #include "schema_test/shapes_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 #include "talOS/rtms/rtms.h"
 #include "talOS/schema/identity.h"
@@ -1098,6 +1099,102 @@ stale_timeout_us = 50000
   EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 0.0);
   // Pose estimator channels are absent (not carried) when stale
   EXPECT_FALSE(channels.contains("pose_estimator/state/twist/vx_mps"));
+}
+
+// Sources whose every topic changes on each of their ticks: nested structs,
+// arrays and enums, a pose, a Driver Station packet, and enough topics that
+// one telemetry tick takes several value pages.
+class LiveSources {
+ public:
+  static constexpr int kPagingTopics = 300;
+
+  explicit LiveSources(talos::Node& node)
+      : node_{node},
+        mixed_{node.publish<schema_test::Mixed>("/demo/state")},
+        arrays_{node.publish<schema_test::Arrays>("/demo/status")},
+        pose_{node.publish<::geometry::PoseEstimate>("/pose_estimator/state")},
+        driver_station_{
+            node.publish<hardware::Packet>("/hw/state/driver_station")} {
+    for (int i = 0; i < kPagingTopics; ++i) {
+      paging_.push_back(
+          node.publish<schema_test::Inner>("/demo/state/" + std::to_string(i)));
+    }
+  }
+
+  void update() {
+    const auto tick = static_cast<double>(node_.tick());
+    mixed_.send(schema_test::Mixed{
+        node_.tick() % 2 == 0, tick, schema_test::Level::TOP,
+        static_cast<std::uint32_t>(node_.tick()),
+        schema_test::Inner{schema_test::Mode::HIGH, static_cast<float>(tick)},
+        0.5f});
+    arrays_.send(schema_test::Arrays{});
+    pose_.send(::geometry::PoseEstimate{0, ::geometry::Pose2d{tick, 1.0, 0.5},
+                                        ::geometry::Twist2d{0.0, 0.0, 0.0},
+                                        true, true, 0, 0});
+    driver_station::DriverStationData data{};
+    data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
+                     driver_station::kTeleop;
+    data.fms.match_time_s = static_cast<float>(tick);
+    hardware::Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(driver_station::Encode(data, packet.data));
+    driver_station_.send(packet);
+    for (auto& publisher : paging_) {
+      publisher.send(
+          schema_test::Inner{schema_test::Mode::LOW, static_cast<float>(tick)});
+    }
+  }
+
+ private:
+  talos::Node& node_;
+  talos::Publisher<schema_test::Mixed> mixed_;
+  talos::Publisher<schema_test::Arrays> arrays_;
+  talos::Publisher<::geometry::PoseEstimate> pose_;
+  talos::Publisher<hardware::Packet> driver_station_;
+  std::vector<talos::Publisher<schema_test::Inner>> paging_;
+};
+
+// RULES.md 3: with every source changing each tick, the producer's reads,
+// value pages and its dictionary resend (every 100th tick) allocate nothing.
+TEST(TelemetryTest, SteadyStateTickDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/pose_estimator/state"
+[subsystems.demo]
+node = "//demo:node"
+[subsystems.demo.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+  sim.add<LiveSources>("demo");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  ASSERT_GE(MeasurePages(telemetry.dictionary()).value_pages, 2u);
+  // Warm up through the dictionary resend at sequence 100: the first send,
+  // at sequence 0, omits the zero sequence field, so its pages are smaller.
+  sim.step(1030ms);
+  const auto before = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(before, nullptr);
+  const std::uint64_t first_sequence = before->sequence_id();
+
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  // Past the next dictionary resend, at sequence 200.
+  sim.step(1100ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+
+  const auto after = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(after, nullptr);
+  EXPECT_GE(after->sequence_id(), first_sequence + 105);
+  EXPECT_GE(after->page_count(), 2u);
 }
 
 // The viewer stream outlives its viewers: a reader that registered and then

@@ -21,6 +21,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
@@ -1655,6 +1656,114 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
     ASSERT_TRUE(InjectState(node, gateway, TrustState(id, 11, 1, now), now));
     ASSERT_EQ(ReceiveConfigs(gateway), 1u);
   }
+}
+
+// RULES.md 3: the bridge's 1 kHz tick allocates nothing in steady state: a
+// configured link with a State every tick (answering each clock probe), a
+// Driver Station packet every 20 ms, two owners' requests every 5 ms, the
+// merged command, /hw/status and the registry sample Run() takes. Tick() runs
+// on this thread, which is the only one AllocationProbe counts.
+TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
+  const uint16_t drive = cfg.hardware.motors[0].id;
+  const uint16_t roller = cfg.hardware.motors[1].id;
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  const uint64_t config_id = NodeConfigId(cfg);
+  // The gateway clock runs 999'000 us behind the bridge's.
+  constexpr uint64_t kBehindUs = 999'000;
+  uint64_t now_us = 1'000'000;
+  State state = TrustState(config_id, 11, 1, now_us - kBehindUs);
+  ASSERT_TRUE(InjectState(node, gateway, state, now_us));
+  ASSERT_GE(ReceiveConfigs(gateway), 1u);
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  std::array<uint8_t, 128> ack_bytes{};
+  const auto ack_size = EncodeConfigAck(ack, ack_bytes);
+  ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0,
+                              now_us, ack_bytes.data(), ack_size),
+            protocol::UdpStatus::kOk);
+
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  Command drive_request{};
+  drive_request.config_id = config_id;
+  drive_request.boot_id = 11;
+  drive_request.epoch = 1;
+  drive_request.count = 1;
+  drive_request.motors[0] = {drive, Mode::kVelocity, 0, 15.0, 0.0};
+  Command intake_request = drive_request;
+  intake_request.motors[0] = {roller, Mode::kDutyCycle, 0, 0.4, 0.0};
+  driver_station::DriverStationData driver_station{};
+  driver_station.boot_id = 11;
+  driver_station.fms.flags = driver_station::kDsAttached |
+                             driver_station::kEnabled | driver_station::kTeleop;
+  std::array<uint8_t, 256> driver_station_bytes{};
+
+  uint64_t echo = 0;
+  // One bridge millisecond; false if the State never arrived.
+  const auto tick = [&](unsigned i) {
+    now_us += 1000;
+    protocol::DecodedFrame frame;
+    while (gateway.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+      if (frame.header.type == protocol::FrameType::kClockProbe) {
+        echo = frame.header.monotonic_time_us;
+      }
+    }
+    state.sample_time_us = now_us - kBehindUs;
+    state.clock_probe_time_us = echo;
+    echo = 0;
+    if (i % 20 == 0) {
+      driver_station.sample_time_us = state.sample_time_us;
+      driver_station.fms.match_time_s = static_cast<float>(i) / 1000.0f;
+      const std::size_t size =
+          driver_station::Encode(driver_station, driver_station_bytes);
+      if (gateway.SendFrame(protocol::FrameType::kDriverStation, 0, now_us,
+                            driver_station_bytes.data(),
+                            size) != protocol::UdpStatus::kOk) {
+        return false;
+      }
+    }
+    if (!InjectState(node, gateway, state, now_us)) return false;
+    if (i % 5 == 0) {
+      drive_request.observed_time_us = state.sample_time_us;
+      drive_request.motors[0].demand = 15.0 + i;
+      intake_request.observed_time_us = state.sample_time_us;
+      PublishCommand(drive_pub, drive_request);
+      PublishCommand(intake_pub, intake_request);
+    }
+    if (i % 250 == 0) node.PublishIntrospection();
+    return true;
+  };
+  for (unsigned i = 0; i < 300; ++i) ASSERT_TRUE(tick(i)) << i;
+  ASSERT_TRUE(node.is_configured());
+  ASSERT_TRUE(node.Status(now_us).clock_offset_valid());
+  const uint64_t states = node.states_received();
+  const uint64_t commands = node.commands_sent();
+  const uint64_t driver_station_packets =
+      node.driver_station_packets_received();
+
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  bool delivered = true;
+  for (unsigned i = 300; i < 600 && delivered; ++i) delivered = tick(i);
+  const uint64_t allocations = probe.stop();
+  ASSERT_TRUE(delivered);
+  EXPECT_EQ(allocations, 0u) << probe.sites();
+
+  EXPECT_EQ(node.states_received(), states + 300);
+  EXPECT_GT(node.commands_sent(), commands + 50);
+  EXPECT_GT(node.driver_station_packets_received(), driver_station_packets);
+  EXPECT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.identity_rejected(), 0u);
+  EXPECT_DOUBLE_EQ(node.current_command().motors[0].demand, 15.0 + 595);
 }
 
 }  // namespace

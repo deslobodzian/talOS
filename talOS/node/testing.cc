@@ -45,8 +45,14 @@ class LatestBytes final : public detail::ByteTopic {
  public:
   explicit LatestBytes(std::optional<std::vector<std::byte>>& latest)
       : latest_{latest} {}
+  // Reuses the held message's buffer, so a steady stream of messages no
+  // larger than the largest seen allocates nothing (AllocationProbe windows).
   bool write(std::span<const std::byte> message) override {
-    latest_.emplace(message.begin(), message.end());
+    if (latest_) {
+      latest_->assign(message.begin(), message.end());
+    } else {
+      latest_.emplace(message.begin(), message.end());
+    }
     return true;
   }
 

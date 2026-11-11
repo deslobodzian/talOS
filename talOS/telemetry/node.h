@@ -206,6 +206,8 @@ class Telemetry {
     // update() fills these without reallocating.
     tick_channels_.reserve(dictionary_.size());
     tick_values_.reserve(dictionary_.size());
+    dictionary_scratch_.entries.reserve(dictionary_.size());
+    dictionary_scratch_.labels.reserve(telemetry_wire::kMaxEnumLabels);
 
     ReportPages(graph != nullptr);
   }
@@ -311,7 +313,8 @@ class Telemetry {
     };
     // The dictionary on the first tick and every 100th, before its values.
     if (sequence_ % 100 == 0) {
-      EncodeDictionaryPages(builder_, header, dictionary_, send);
+      EncodeDictionaryPages(builder_, dictionary_scratch_, header, dictionary_,
+                            send);
     }
     // A producer tick is a keyframe: a channel it does not carry is absent.
     // It cannot fail: every page is bounded (frames_test) and the dictionary
@@ -775,6 +778,7 @@ class Telemetry {
   std::vector<std::uint32_t> tick_channels_;
   std::vector<std::uint64_t> tick_values_;
   flatbuffers::FlatBufferBuilder builder_{2048};
+  DictionaryScratch dictionary_scratch_;
   std::uint64_t sequence_ = 0;
   bool last_frame_had_fresh_{false};
 

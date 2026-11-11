@@ -83,6 +83,7 @@ cc_test(
         ":node_lib",
         "//talOS/driver_station",
         "//talOS/events:events_log",
+        "//talOS/node:allocation_probe",
         "//talOS/protocol:udp_test_helpers",
         "@googletest//:gtest",
         "@googletest//:gtest_main",

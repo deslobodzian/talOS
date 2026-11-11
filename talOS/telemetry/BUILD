@@ -91,6 +91,7 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/msgs:geometry",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "//talOS/rtms",
         "//talOS/schema:identity",

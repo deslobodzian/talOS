@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "flatbuffers/flatbuffers.h"
@@ -89,6 +90,15 @@ struct PageSpan {
   std::size_t absent_count{0};
 };
 
+// The offsets one dictionary page collects while it is built. A producer
+// that resends its dictionary keeps one and passes it to every
+// EncodeDictionaryPages, so a resend allocates nothing once the scratch has
+// held the largest page (RULES.md 3).
+struct DictionaryScratch {
+  std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> entries;
+  std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
+};
+
 namespace detail {
 
 inline constexpr std::size_t kSampleBytes = telemetry_wire::kSampleBytes;
@@ -161,14 +171,16 @@ inline std::size_t DictionaryEntryBytes(const ChannelDef& channel) {
 }
 
 inline void FinishDictionaryPage(flatbuffers::FlatBufferBuilder& builder,
+                                 DictionaryScratch& scratch,
                                  const PageHeader& header, std::uint16_t page,
                                  std::uint16_t page_count,
                                  std::uint32_t first_channel,
                                  std::span<const ChannelDef> entries) {
   builder.Clear();
-  std::vector<flatbuffers::Offset<Talos::Telemetry::ChannelInfo>> offsets;
+  auto& offsets = scratch.entries;
+  auto& labels = scratch.labels;
+  offsets.clear();
   offsets.reserve(entries.size());
-  std::vector<flatbuffers::Offset<flatbuffers::String>> labels;
   for (const ChannelDef& channel : entries) {
     labels.clear();
     for (const std::string& label : channel.labels) {
@@ -199,8 +211,9 @@ inline void FinishDictionaryPage(flatbuffers::FlatBufferBuilder& builder,
 inline std::size_t DictionaryPageOverhead() {
   static const std::size_t overhead = [] {
     flatbuffers::FlatBufferBuilder builder{256};
+    DictionaryScratch scratch;
     const PageHeader header{~0ull, ~0ull, ~0ull, ~0u, ~0u};
-    FinishDictionaryPage(builder, header, 0xffff, 0xffff, ~0u, {});
+    FinishDictionaryPage(builder, scratch, header, 0xffff, 0xffff, ~0u, {});
     return static_cast<std::size_t>(builder.GetSize()) + kPageSlackBytes;
   }();
   return overhead;
@@ -274,7 +287,7 @@ template <class Emit>
 // channel, when one channel's entry cannot fit a page alone.
 template <class Emit>
 void EncodeDictionaryPages(flatbuffers::FlatBufferBuilder& builder,
-                           const PageHeader& header,
+                           DictionaryScratch& scratch, const PageHeader& header,
                            std::span<const ChannelDef> dictionary,
                            Emit&& emit) {
   const std::size_t room = telemetry_wire::kMaxDictionaryPageBytes -
@@ -312,7 +325,7 @@ void EncodeDictionaryPages(flatbuffers::FlatBufferBuilder& builder,
   }
   partition([&](std::size_t page, std::size_t first, std::size_t count) {
     detail::FinishDictionaryPage(
-        builder, header, static_cast<std::uint16_t>(page),
+        builder, scratch, header, static_cast<std::uint16_t>(page),
         static_cast<std::uint16_t>(page_count),
         static_cast<std::uint32_t>(first), dictionary.subspan(first, count));
     if (builder.GetSize() > telemetry_wire::kMaxDictionaryPageBytes) {
@@ -320,6 +333,18 @@ void EncodeDictionaryPages(flatbuffers::FlatBufferBuilder& builder,
     }
     emit(detail::Bytes(builder));
   });
+}
+
+// The same, with scratch of its own: for an encoder off the realtime path
+// (the mock producer, its test, MeasurePages).
+template <class Emit>
+void EncodeDictionaryPages(flatbuffers::FlatBufferBuilder& builder,
+                           const PageHeader& header,
+                           std::span<const ChannelDef> dictionary,
+                           Emit&& emit) {
+  DictionaryScratch scratch;
+  EncodeDictionaryPages(builder, scratch, header, dictionary,
+                        std::forward<Emit>(emit));
 }
 
 // The pages a dictionary takes on the wire: every channel present (the
