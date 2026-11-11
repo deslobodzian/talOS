@@ -60,6 +60,17 @@ void Validate(const Config& c) {
   }
   Require(Positive(c.status_hz) && c.status_hz <= 1000,
           "invalid status frequency");
+  // The gateway counts motion feedback command_timeout_us old as invalid
+  // (FeedbackFresh, gate.h). Four status periods inside it, the factor an
+  // actuator owner's period has too, keep a slow rate from reading as a
+  // dropout at every frame.
+  if (c.status_hz * static_cast<double>(c.command_timeout_us) < 4'000'000) {
+    throw std::invalid_argument(
+        "status_hz " + std::to_string(c.status_hz) +
+        " gives fewer than four status periods per command_timeout_us " +
+        std::to_string(c.command_timeout_us) +
+        ": it must be at least 4000000 / command_timeout_us");
+  }
   std::set<uint16_t> ids;
   std::set<std::string> names;
   std::set<std::pair<std::string, int>> addresses;
