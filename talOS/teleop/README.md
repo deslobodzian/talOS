@@ -41,7 +41,7 @@ selects POVs 0–3; it is valid only for a POV trigger.
 Button and POV triggers require exactly one non-empty scalar assignment table:
 `while_held` or `on_toggle`. Values are checked against the target's reflected
 schema, including numeric types, booleans and enum labels; nested struct fields
-use slash-separated paths. Axis triggers instead require a floating-point `field`
+use slash-separated paths ([field paths](../schema/README.md)). Axis triggers instead require a floating-point `field`
 and `scale`, with optional `deadband_frac` in [0, 1), and reject action tables
 and `pov_index`.
 

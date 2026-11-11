@@ -16,3 +16,11 @@ FlatBuffers schema identity, unit linting, and reflection decoding.
 - **Decoding:** `//talOS/schema:decode` (`decode.h`, `DecodeToText`) parses
   raw binary payloads into named fields using reflection schema bytes without
   compile-time types.
+- **Field paths:** `//talOS/schema:field_path` (`field_path.h`) resolves a
+  slash-separated path (`inner/offset_m`) through nested structs of a
+  reflection schema to the leaf scalar's offset, type, size and enum
+  (`ResolveField`, with `ScalarPaths` listing every path), encodes a bool,
+  number or enum label into a message at it with range checks
+  (`EncodeField`, `EncodeNumber`), and reads it back per tick without
+  allocating (`ReadDouble`, `ReadInt64`, `ReadBool`). The teleop node encodes
+  its TOML bindings with it; the telemetry node reads its channels with it.

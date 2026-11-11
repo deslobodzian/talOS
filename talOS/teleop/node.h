@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <limits>
 #include <map>
 #include <optional>
 #include <span>
@@ -16,9 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/reflection.h"
-#include "flatbuffers/verifier.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
 #include "talOS/devices/devices.h"
@@ -27,6 +24,7 @@
 #include "talOS/introspection/names.h"
 #include "talOS/node/access.h"
 #include "talOS/node/node.h"
+#include "talOS/schema/field_path.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/schema_hash.h"
 #include "talOS/teleop/deadband.h"
@@ -34,215 +32,6 @@
 namespace talos::teleop {
 
 namespace detail {
-
-inline std::size_t TypeSize(reflection::BaseType type) {
-  using reflection::BaseType;
-  switch (type) {
-    case BaseType::Bool:
-    case BaseType::Byte:
-    case BaseType::UByte:
-      return 1;
-    case BaseType::Short:
-    case BaseType::UShort:
-      return 2;
-    case BaseType::Int:
-    case BaseType::UInt:
-    case BaseType::Float:
-      return 4;
-    case BaseType::Long:
-    case BaseType::ULong:
-    case BaseType::Double:
-      return 8;
-    default:
-      return 0;
-  }
-}
-
-template <typename T>
-inline void CheckAndCopyInt(std::byte* dest, int64_t val,
-                            std::string_view where) {
-  if (val < static_cast<int64_t>(std::numeric_limits<T>::lowest()) ||
-      val > static_cast<int64_t>(std::numeric_limits<T>::max())) {
-    throw std::invalid_argument(std::string{where} + ": value " +
-                                std::to_string(val) +
-                                " does not fit integer field");
-  }
-  auto v = static_cast<T>(val);
-  std::memcpy(dest, &v, sizeof(v));
-}
-
-inline void EncodeIntegerBytes(std::byte* dest, reflection::BaseType type,
-                               int64_t val, std::string_view where = "") {
-  using reflection::BaseType;
-  switch (type) {
-    case BaseType::Byte:
-      CheckAndCopyInt<int8_t>(dest, val, where);
-      break;
-    case BaseType::UByte:
-      CheckAndCopyInt<uint8_t>(dest, val, where);
-      break;
-    case BaseType::Short:
-      CheckAndCopyInt<int16_t>(dest, val, where);
-      break;
-    case BaseType::UShort:
-      CheckAndCopyInt<uint16_t>(dest, val, where);
-      break;
-    case BaseType::Int:
-      CheckAndCopyInt<int32_t>(dest, val, where);
-      break;
-    case BaseType::UInt:
-      CheckAndCopyInt<uint32_t>(dest, val, where);
-      break;
-    case BaseType::Long:
-      std::memcpy(dest, &val, sizeof(val));
-      break;
-    case BaseType::ULong: {
-      if (val < 0) {
-        throw std::invalid_argument(std::string{where} +
-                                    ": negative value for unsigned field");
-      }
-      auto v = static_cast<uint64_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
-      break;
-    }
-    default:
-      break;
-  }
-}
-
-inline bool FitsFloatingPoint(reflection::BaseType type, double val) {
-  return std::isfinite(val) &&
-         (type != reflection::BaseType::Float ||
-          std::abs(val) <= std::numeric_limits<float>::max());
-}
-
-inline void EncodeNumericBytes(std::byte* dest, reflection::BaseType type,
-                               double val, std::string_view where = "") {
-  using reflection::BaseType;
-  if ((type == BaseType::Float || type == BaseType::Double) &&
-      !FitsFloatingPoint(type, val)) {
-    throw std::invalid_argument(
-        std::string{where} +
-        ": value must be finite and fit floating-point field");
-  }
-  if (type == BaseType::Float) {
-    auto f = static_cast<float>(val);
-    std::memcpy(dest, &f, sizeof(float));
-  } else if (type == BaseType::Double) {
-    std::memcpy(dest, &val, sizeof(double));
-  } else {
-    if (!std::isfinite(val) || std::trunc(val) != val) {
-      throw std::invalid_argument(
-          std::string{where} +
-          ": non-finite or fractional value for integer field");
-    }
-    if (type == BaseType::ULong) {
-      // UINT64_MAX rounds up to 2^64 as a double, so use an exclusive
-      // power-of-two upper bound before converting.
-      if (val < 0.0 || val >= std::ldexp(1.0, 64)) {
-        throw std::invalid_argument(
-            std::string{where} + ": value does not fit unsigned integer field");
-      }
-      const auto v = static_cast<std::uint64_t>(val);
-      std::memcpy(dest, &v, sizeof(v));
-      return;
-    }
-    if (val < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
-        val >= std::ldexp(1.0, 63)) {
-      throw std::invalid_argument(std::string{where} +
-                                  ": value does not fit integer field");
-    }
-    EncodeIntegerBytes(dest, type, static_cast<std::int64_t>(val), where);
-  }
-}
-
-inline void WriteScalar(std::byte* dest, reflection::BaseType type,
-                        double val) {
-  EncodeNumericBytes(dest, type, val);
-}
-
-struct ResolvedField {
-  std::size_t offset{0};
-  reflection::BaseType base_type{reflection::BaseType::None};
-  const reflection::Enum* enum_def{nullptr};
-  std::string leaf_name;
-  std::string enclosing_name;
-};
-
-inline ResolvedField ResolveField(const reflection::Schema& schema,
-                                  const reflection::Object& root_obj,
-                                  std::string_view field_path,
-                                  std::string_view entry_where) {
-  const reflection::Object* curr_obj = &root_obj;
-  std::size_t curr_offset = 0;
-  std::string path_str{field_path};
-  std::vector<std::string> segments;
-  std::size_t pos = 0;
-  while (pos < path_str.size()) {
-    auto next = path_str.find('/', pos);
-    if (next == std::string::npos) {
-      segments.push_back(path_str.substr(pos));
-      break;
-    }
-    segments.push_back(path_str.substr(pos, next - pos));
-    pos = next + 1;
-  }
-  if (segments.empty()) {
-    throw std::invalid_argument(std::string{entry_where} +
-                                ": empty field path");
-  }
-
-  for (std::size_t s = 0; s < segments.size(); ++s) {
-    const std::string& seg = segments[s];
-    const reflection::Field* field = nullptr;
-    for (const auto* f : *curr_obj->fields()) {
-      if (f->name()->str() == seg) {
-        field = f;
-        break;
-      }
-    }
-    if (field == nullptr) {
-      throw std::invalid_argument(std::string{entry_where} + ": no field '" +
-                                  seg + "' in " + curr_obj->name()->str());
-    }
-    if (s + 1 < segments.size()) {
-      if (field->type()->base_type() != reflection::BaseType::Obj) {
-        throw std::invalid_argument(std::string{entry_where} + ": '" + seg +
-                                    "' is not a nested struct");
-      }
-      const auto* next_obj = schema.objects()->Get(field->type()->index());
-      if (next_obj == nullptr || !next_obj->is_struct()) {
-        throw std::invalid_argument(std::string{entry_where} + ": '" + seg +
-                                    "' is not a struct");
-      }
-      curr_offset += field->offset();
-      curr_obj = next_obj;
-    } else {
-      const auto base = field->type()->base_type();
-      if (base == reflection::BaseType::Obj ||
-          base == reflection::BaseType::Vector ||
-          base == reflection::BaseType::Array ||
-          base == reflection::BaseType::None) {
-        throw std::invalid_argument(std::string{entry_where} + ": field '" +
-                                    seg + "' must be a scalar");
-      }
-      const reflection::Enum* enum_def = nullptr;
-      if (field->type()->index() >= 0 &&
-          field->type()->index() <
-              static_cast<int32_t>(schema.enums()->size())) {
-        enum_def = schema.enums()->Get(field->type()->index());
-      }
-      return ResolvedField{
-          .offset = curr_offset + field->offset(),
-          .base_type = base,
-          .enum_def = enum_def,
-          .leaf_name = seg,
-          .enclosing_name = curr_obj->name()->str(),
-      };
-    }
-  }
-  throw std::logic_error("unreachable");
-}
 
 struct ButtonFieldAction {
   uint32_t field_id{0};
@@ -256,63 +45,6 @@ struct AxisFieldAction {
   std::size_t offset{0};
   reflection::BaseType base_type{reflection::BaseType::None};
 };
-
-inline void EncodeAssignment(ButtonFieldAction& action, const ResolvedField& rf,
-                             const config::TeleopValue& fv,
-                             const std::string& field_where) {
-  if (rf.base_type == reflection::BaseType::Bool) {
-    if (!std::holds_alternative<bool>(fv)) {
-      throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
-                                  "' is bool but value is not a boolean");
-    }
-    action.bytes[0] = static_cast<std::byte>(std::get<bool>(fv) ? 1 : 0);
-  } else if (rf.enum_def != nullptr) {
-    if (!std::holds_alternative<std::string>(fv)) {
-      throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
-                                  "' is enum but value is not a string");
-    }
-    const std::string& label = std::get<std::string>(fv);
-    const reflection::EnumVal* ev = nullptr;
-    for (const auto* val : *rf.enum_def->values()) {
-      if (val->name()->str() == label) {
-        ev = val;
-        break;
-      }
-    }
-    if (ev == nullptr) {
-      throw std::invalid_argument(field_where + ": unknown enum label '" +
-                                  label + "' in " + rf.enum_def->name()->str());
-    }
-    EncodeIntegerBytes(action.bytes.data(), rf.base_type, ev->value(),
-                       field_where);
-  } else {
-    double val = 0.0;
-    if (std::holds_alternative<int64_t>(fv)) {
-      val = static_cast<double>(std::get<int64_t>(fv));
-    } else if (std::holds_alternative<double>(fv)) {
-      val = std::get<double>(fv);
-    } else {
-      throw std::invalid_argument(field_where + ": field '" + rf.leaf_name +
-                                  "' is numeric but value is not a number");
-    }
-    EncodeNumericBytes(action.bytes.data(), rf.base_type, val, field_where);
-  }
-}
-
-inline void ScalarPaths(const reflection::Schema& schema,
-                        const reflection::Object& object,
-                        const std::string& prefix,
-                        std::vector<std::string>& paths) {
-  for (const auto* field : *object.fields()) {
-    const std::string path = prefix + field->name()->str();
-    if (field->type()->base_type() == reflection::BaseType::Obj) {
-      ScalarPaths(schema, *schema.objects()->Get(field->type()->index()),
-                  path + "/", paths);
-    } else {
-      paths.push_back(path);
-    }
-  }
-}
 
 struct PrecomputedBinding {
   bool is_button{true};
@@ -459,12 +191,12 @@ class Teleop {
               sub.field_set[b.axis_field.field_id] = 1;
               const double rescaled = Deadband(raw, b.deadband_frac);
               const double val = rescaled * b.scale;
-              if (!detail::FitsFloatingPoint(b.axis_field.base_type, val)) {
+              if (!schema::FitsFloatingPoint(b.axis_field.base_type, val)) {
                 invalid_axis = true;
                 break;
               }
-              detail::WriteScalar(sub.buffer.data() + b.axis_field.offset,
-                                  b.axis_field.base_type, val);
+              schema::EncodeNumber(sub.buffer.data() + b.axis_field.offset,
+                                   b.axis_field.base_type, val);
             }
           }
         }
@@ -542,15 +274,11 @@ class Teleop {
                                   "' in the graph");
     }
 
-    flatbuffers::Verifier verifier{
-        reinterpret_cast<const std::uint8_t*>(reader->bfbs.data()),
-        reader->bfbs.size()};
-    if (!reflection::VerifySchemaBuffer(verifier)) {
+    const reflection::Schema* schema = schema::VerifySchema(reader->bfbs);
+    if (schema == nullptr) {
       throw std::invalid_argument("[subsystems." + sub_name +
                                   "] teleop: invalid reflection schema");
     }
-    const reflection::Schema* schema =
-        reflection::GetSchema(reader->bfbs.data());
     const std::string_view inner_name = schema::EnvelopeInner(reader->schema);
     if (inner_name.empty()) {
       throw std::invalid_argument(
@@ -582,6 +310,9 @@ class Teleop {
     state.message_bytes = inner_bytes;
     state.buffer.resize(inner_bytes, std::byte{0});
 
+    // Each button assignment is encoded here, then its bytes kept for the
+    // tick's copy.
+    std::vector<std::byte> scratch(inner_bytes, std::byte{0});
     std::map<std::string, uint32_t> field_ids;
     auto get_field_id = [&](const std::string& path) {
       auto it = field_ids.find(path);
@@ -611,15 +342,16 @@ class Teleop {
             binding.on_toggle ? ".on_toggle." : ".while_held.";
         for (const auto& [fk, fv] : assignments) {
           const std::string field_where = entry_where + action_name + fk;
-          detail::ResolvedField rf =
-              detail::ResolveField(*schema, *object, fk, field_where);
+          const schema::ResolvedField rf =
+              schema::ResolveField(*schema, *object, fk, field_where);
 
           detail::ButtonFieldAction action;
           action.field_id = get_field_id(fk);
           action.offset = rf.offset;
-          action.size = detail::TypeSize(rf.base_type);
+          action.size = rf.size;
 
-          detail::EncodeAssignment(action, rf, fv, field_where);
+          schema::EncodeField(scratch.data(), rf, fv, field_where);
+          std::memcpy(action.bytes.data(), scratch.data() + rf.offset, rf.size);
 
           binding.button_fields.push_back(action);
         }
@@ -640,7 +372,7 @@ class Teleop {
         }
 
         const std::string field_where = entry_where + ".field";
-        detail::ResolvedField rf = detail::ResolveField(
+        const schema::ResolvedField rf = schema::ResolveField(
             *schema, *object, parsed_binding.field, field_where);
         if (rf.base_type == reflection::BaseType::Bool ||
             rf.enum_def != nullptr) {
@@ -668,19 +400,12 @@ class Teleop {
       for (const auto& [path, value] : defaults_it->second) {
         const std::string where =
             "[subsystems." + sub_name + "] teleop.defaults." + path;
-        const auto rf = detail::ResolveField(*schema, *object, path, where);
-        detail::ButtonFieldAction action;
-        action.offset = rf.offset;
-        action.size = detail::TypeSize(rf.base_type);
-        detail::EncodeAssignment(action, rf, value, where);
-        std::memcpy(state.defaults.data() + action.offset, action.bytes.data(),
-                    action.size);
+        const auto rf = schema::ResolveField(*schema, *object, path, where);
+        schema::EncodeField(state.defaults.data(), rf, value, where);
         default_fields[path] = true;
       }
     }
-    std::vector<std::string> paths;
-    detail::ScalarPaths(*schema, *object, "", paths);
-    for (const auto& path : paths) {
+    for (const auto& path : schema::ScalarPaths(*schema, *object)) {
       // A lane publishes only while some binding is live, so a field is
       // always written when every binding writes it.
       const bool always_assigned = std::all_of(

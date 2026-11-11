@@ -22,6 +22,7 @@
 #include "talOS/hardware/packet.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
+#include "talOS/schema/field_path.h"
 #include "talOS/teleop/deadband.h"
 #include "talOS/teleop/node.h"
 
@@ -810,20 +811,19 @@ TEST(TeleopNode, FloatingPointEncodingAcceptsFiniteLimitsWithoutOverflow) {
   std::array<std::byte, 8> bytes{};
   const double float_max = std::numeric_limits<float>::max();
   for (const double value : {float_max, -float_max}) {
-    EXPECT_NO_THROW(
-        detail::EncodeNumericBytes(bytes.data(), BaseType::Float, value));
+    EXPECT_NO_THROW(schema::EncodeNumber(bytes.data(), BaseType::Float, value));
     float decoded{};
     std::memcpy(&decoded, bytes.data(), sizeof(decoded));
     EXPECT_TRUE(std::isfinite(decoded));
     EXPECT_DOUBLE_EQ(decoded, value);
   }
   EXPECT_THROW(
-      detail::EncodeNumericBytes(
+      schema::EncodeNumber(
           bytes.data(), BaseType::Float,
           std::nextafter(float_max, std::numeric_limits<double>::infinity())),
       std::invalid_argument);
-  EXPECT_NO_THROW(detail::EncodeNumericBytes(
-      bytes.data(), BaseType::Double, std::numeric_limits<double>::max()));
+  EXPECT_NO_THROW(schema::EncodeNumber(bytes.data(), BaseType::Double,
+                                       std::numeric_limits<double>::max()));
 }
 
 TEST(TeleopNode, ConstructionRejectsNonFiniteAxisParameters) {
@@ -874,32 +874,31 @@ TEST(TeleopNode, NumericIntegerEncodingChecksBoundsBeforeConversion) {
         -std::numeric_limits<double>::infinity(), std::ldexp(1.0, 63),
         std::nextafter(-std::ldexp(1.0, 63),
                        -std::numeric_limits<double>::infinity())}) {
-    EXPECT_THROW(
-        detail::EncodeNumericBytes(bytes.data(), BaseType::Long, value),
-        std::invalid_argument);
+    EXPECT_THROW(schema::EncodeNumber(bytes.data(), BaseType::Long, value),
+                 std::invalid_argument);
   }
-  EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Long,
-                                             -std::ldexp(1.0, 63)));
+  EXPECT_NO_THROW(
+      schema::EncodeNumber(bytes.data(), BaseType::Long, -std::ldexp(1.0, 63)));
   std::int64_t signed_value{};
   std::memcpy(&signed_value, bytes.data(), sizeof(signed_value));
   EXPECT_EQ(signed_value, std::numeric_limits<std::int64_t>::min());
   const double largest_signed = std::nextafter(std::ldexp(1.0, 63), 0.0);
   EXPECT_NO_THROW(
-      detail::EncodeNumericBytes(bytes.data(), BaseType::Long, largest_signed));
-  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong,
-                                          std::ldexp(1.0, 64)),
-               std::invalid_argument);
-  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong, -1.0),
+      schema::EncodeNumber(bytes.data(), BaseType::Long, largest_signed));
+  EXPECT_THROW(
+      schema::EncodeNumber(bytes.data(), BaseType::ULong, std::ldexp(1.0, 64)),
+      std::invalid_argument);
+  EXPECT_THROW(schema::EncodeNumber(bytes.data(), BaseType::ULong, -1.0),
                std::invalid_argument);
   const double largest_unsigned = std::nextafter(std::ldexp(1.0, 64), 0.0);
-  EXPECT_NO_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::ULong,
-                                             largest_unsigned));
+  EXPECT_NO_THROW(
+      schema::EncodeNumber(bytes.data(), BaseType::ULong, largest_unsigned));
   std::uint64_t unsigned_value{};
   std::memcpy(&unsigned_value, bytes.data(), sizeof(unsigned_value));
   EXPECT_EQ(unsigned_value, static_cast<std::uint64_t>(largest_unsigned));
-  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::Byte, 128.0),
+  EXPECT_THROW(schema::EncodeNumber(bytes.data(), BaseType::Byte, 128.0),
                std::invalid_argument);
-  EXPECT_THROW(detail::EncodeNumericBytes(bytes.data(), BaseType::UInt, -1.0),
+  EXPECT_THROW(schema::EncodeNumber(bytes.data(), BaseType::UInt, -1.0),
                std::invalid_argument);
 }
 
