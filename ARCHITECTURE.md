@@ -59,7 +59,7 @@ Beside the stack:
 | `talOS/configuration` | parses `robot.toml` and the subsystem files |
 | `talOS/hardware` | hardware config, request/state messages, the gateway the RoboRIO and sim run |
 | `talOS/protocol` | frame and UDP wire format |
-| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power/CAN health, gateway counters and build, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `:merge` holds the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command sent and state received |
+| `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power/CAN health, gateway counters and build, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `:merge` holds the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command and State it publishes, with the sequence and stamp its readers see |
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s and `:tlog_to_wpilog` converts them to `.wpilog` |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |

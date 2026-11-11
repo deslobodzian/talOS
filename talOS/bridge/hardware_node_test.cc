@@ -10,7 +10,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <set>
 #include <span>
@@ -27,7 +29,13 @@
 #include "talOS/bridge/merge.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/context.h"
+#include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/events/log/log_writer.h"
+#include "talOS/events/manifest.h"
+#include "talOS/events/os/poller.h"
+#include "talOS/events/time.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/protocol/udp_test_helpers.h"
@@ -431,6 +439,95 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   EXPECT_TRUE(logged_command);
   EXPECT_TRUE(logged_neutral);
   EXPECT_TRUE(logged_state);
+}
+
+// REQ-OPS-14: replaying a session into a node that did not watch /hw/state
+// feeds it every State the bridge published once, with the transport
+// sequence and publish stamp a live reader saw, including after a State the
+// bridge received and refused (a duplicate). The session holds the bridge's
+// --log and the log of one live reader, written as a node's loop writes it.
+TEST(HardwareNodeTest, ReplayFeedsEachPublishedStateOnceAsReadersSawIt) {
+  constexpr uint64_t kSession = 41;
+  const std::filesystem::path session = ::testing::TempDir() +
+                                        "/bridge_replay_session_" +
+                                        std::to_string(::getpid());
+  std::filesystem::remove_all(session);
+  std::filesystem::create_directories(session);
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, true, (session / "hardware_node.tlog").string(),
+                        kSession));
+  HardwareNode& node = link.node.value();
+
+  RTMSQueue reader{
+      kStateTopic,
+      sizeof(Packet),
+      alignof(Packet),
+      schema::Of<Packet>(),
+      MAX_SLOTS,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE}};
+  const std::optional<std::size_t> reader_id = reader.register_reader();
+  ASSERT_TRUE(reader_id);
+  constexpr std::uint16_t kWatcher = 0;
+  auto reader_log = std::make_unique<event::log::LogWriter>(
+      (session / "state_reader.tlog").string(), "state_reader",
+      event::log::LogWriter::Options{}, kSession);
+  reader_log->start(event::Manifest{event::Registration{
+                        .id = kWatcher,
+                        .kind = event::SourceKind::WATCHER,
+                        .name = kStateTopic,
+                        .message_bytes = sizeof(Packet),
+                        .alignment = alignof(Packet),
+                        .schema = schema::Of<Packet>(),
+                    }},
+                    event::Poller::now());
+
+  // What the live reader saw: (sequence, publish time), in order.
+  std::vector<std::pair<uint64_t, int64_t>> seen;
+  const auto read_all = [&] {
+    Packet packet{};
+    MessageInfo info{};
+    while (reader.read_next(*reader_id,
+                            std::as_writable_bytes(std::span{&packet, 1}),
+                            info) == ReadResult::OK) {
+      seen.emplace_back(info.sequence, info.publish_time_ns);
+      const event::MonotonicTime now = event::Poller::now();
+      reader_log->dispatch(
+          event::Context{
+              .kind = event::EventKind::MESSAGE,
+              .source_id = kWatcher,
+              .event_time = now,
+              .now = now,
+              .publish_time =
+                  event::MonotonicTime::from_nanos(info.publish_time_ns),
+              .sequence = info.sequence,
+          },
+          std::as_bytes(std::span{&packet, 1}));
+    }
+  };
+
+  const uint64_t config_id = NodeConfigId(cfg);
+  // The third State repeats the second's sample time: received, refused.
+  for (const auto& [sample_us, now_us] :
+       std::vector<std::pair<uint64_t, uint64_t>>{
+           {1000, 1000}, {2000, 2000}, {2000, 3000}, {4000, 4000}}) {
+    ASSERT_TRUE(InjectState(node, link.gateway,
+                            TrustState(config_id, 11, 1, sample_us), now_us));
+    read_all();
+  }
+  ASSERT_EQ(node.states_received(), 4u);
+  ASSERT_EQ(seen.size(), 3u);
+  link.node.reset();  // flushes the bridge's log
+  reader_log.reset();
+
+  const event::RecordedSession replay{session.string(), "replay_consumer"};
+  std::vector<std::pair<uint64_t, int64_t>> fed;
+  for (const event::RecordedMessage& message : replay.messages()) {
+    if (replay.topics()[message.topic].name == kStateTopic) {
+      fed.emplace_back(message.sequence, message.time.nanos());
+    }
+  }
+  EXPECT_EQ(fed, seen);
 }
 
 TEST(HardwareNodeTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {

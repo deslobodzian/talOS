@@ -251,8 +251,12 @@ bridge prints the build once for each new gateway boot
 (`hardware_node: gateway boot <id>: roborio build <revision>`). A State
 that does not decode is dropped, with one stderr line until a State decodes
 again.
-`hardware_node --log PATH` records merged `/hw/command` and decoded `/hw/state`
-as raw `Packet` topics in a `.tlog` (format in [talOS/events](../events/README.md)).
+`hardware_node --log PATH` records each `/hw/command` and `/hw/state` it
+publishes (the merged command, every accepted State; a refused State is not
+published) as raw `Packet` `SEND`s in a `.tlog` (format in
+[talOS/events](../events/README.md)), each with the transport sequence and
+publication time its readers receive, and the pass that produced it as its
+event time.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python

@@ -532,8 +532,7 @@ void HardwareNode::Tick(uint64_t now_us) {
 
       talos::hardware::Packet pkt{};
       pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
-      if (state_pub_) state_pub_->write(pkt);
-      LogPacket(0, pkt, now_us, states_received_);
+      if (state_pub_) Publish(*state_pub_, 0, pkt, now_us);
       continue;
     }
 
@@ -675,12 +674,11 @@ void HardwareNode::Tick(uint64_t now_us) {
       talos::hardware::Packet cmd_pkt{};
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
-        if (cmd_pub_) cmd_pub_->write(cmd_pkt);
+        if (cmd_pub_) Publish(*cmd_pub_, 1, cmd_pkt, now_us);
         if (SendToGateway(protocol::FrameType::kHardwareCommand, now_us,
                           cmd_pkt.data.data(),
                           cmd_pkt.size) == protocol::UdpStatus::kOk) {
           ++commands_sent_;
-          LogPacket(1, cmd_pkt, now_us, commands_sent_);
           last_sent_cmd_ = full_cmd_;
           last_send_us_ = now_us;
           have_last_sent_ = true;
@@ -795,14 +793,30 @@ void HardwareNode::ReportGatewayBuild(const State& state) {
                state.build.dirty ? " (dirty)" : "");
 }
 
-void HardwareNode::LogPacket(uint16_t source_id, const Packet& packet,
-                             uint64_t now_us, uint64_t sequence) {
+void HardwareNode::Publish(ipc::Publisher<Packet>& publisher,
+                           uint16_t source_id, const Packet& packet,
+                           uint64_t now_us) {
+  // RTMS stamps a publication with the Poller clock when not given one; the
+  // stamp is taken here so the log can carry it.
+  const event::MonotonicTime published = event::Poller::now();
+  const WriteStatus status = publisher.write(packet, published.nanos());
   if (!log_) return;
-  const auto now = event::MonotonicTime::from_nanos(
-      static_cast<std::int64_t>(now_us * 1000));
-  const event::Context context{.event_time = now, .now = now};
+  // The SEND record's aux is the event loop's SendStatus
+  // (talOS/events/event_loop_base.h): 0 OK, 1 refused, 2 failed.
+  std::uint32_t aux = 0;
+  if (status.result == WriteResult::BUFFER_FULL) {
+    aux = 1;
+  } else if (status.result != WriteResult::SUCCESS) {
+    aux = 2;
+  }
+  const event::Context context{
+      .event_time = event::MonotonicTime::from_nanos(
+          static_cast<std::int64_t>(now_us * 1000)),
+      .now = published,
+  };
   log_->send(context, source_id,
-             std::as_bytes(std::span{&packet, std::size_t{1}}), 0, sequence);
+             std::as_bytes(std::span{&packet, std::size_t{1}}), aux,
+             status.sequence);
   ReportLogFailure();
 }
 

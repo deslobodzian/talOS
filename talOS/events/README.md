@@ -290,10 +290,11 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
 
 - `RecordedSession` reads every log of a session directory. A topic's
   messages come from whichever logs recorded them: the writer's accepted
-  `SEND`s or readers' receipts. An event loop's `SEND` and its readers'
-  receipts carry the same transport sequence and publication time; the
-  hardware bridge's log does not (its `/hw/state` `SEND`s carry its receive
-  time, in microseconds, and its count of States received). One message seen
+  `SEND`s or readers' receipts. A writer's `SEND` (an event loop's, or the
+  hardware bridge's `--log` of `/hw/state` and `/hw/command`) and its
+  readers' receipts carry the same transport sequence and publication time,
+  so a program that did not watch a topic live is fed each of its
+  publications once, at its publication time. One message seen
   in several logs is kept once, by topic and transport sequence, at the
   earliest time recorded. Logs from two sessions, or a topic recorded with
   two schemas, are refused.

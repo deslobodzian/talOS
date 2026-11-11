@@ -526,7 +526,11 @@ session. The node runs under `--sim` exactly when the session did (its
 `--sim`): under `--sim` the devices layer treats the config as commissioned,
 which is part of the config id every recorded State carries, so a replay that
 differed from the session would accept no State. A node binary run directly
-with `--replay-inputs` takes `--sim` only as given. A node the session ran
+with `--replay-inputs` takes `--sim` only as given. A topic the node did not
+watch live (all of them, for a node the session did not run) is fed from
+every log that recorded it, the writer's `SEND`s (the hardware bridge's
+`--log` included) and readers' receipts, each publication once, with the
+sequence and publication time live readers saw. A node the session ran
 replays on its own recorded timeline: its
 timers fire at the deadlines they fired at live, and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
