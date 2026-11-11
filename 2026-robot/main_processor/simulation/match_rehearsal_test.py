@@ -20,7 +20,6 @@ class MatchRehearsal(unittest.TestCase):
     window = support.FullStackSimulation.window
     assert_driving = support.FullStackSimulation.assert_driving
     assert_neutral = support.FullStackSimulation.assert_neutral
-    assert_neutral_by = support.FullStackSimulation.assert_neutral_by
 
     def print_restart_timeline(self, manifest_path, kill_ns):
         """Show whether the old exit/spawn or the new node's startup was slow."""
@@ -41,9 +40,11 @@ class MatchRehearsal(unittest.TestCase):
         config_dir = root / "2026-robot/main_processor/configuration"
         config = config_dir / "robot_physics_sim.toml"
         robot = support.tomllib.loads((config_dir / "robot.toml").read_text())
-        # The consumer tick, not two ticks, is the allowed scheduling margin.
-        bound = (robot["robot"]["command_timeout_us"] +
-                 robot["robot"]["period_us"]) / 1000
+        timeout = robot["robot"]["command_timeout_us"] / 1000
+        # The drivetrain's own tick, which its first neutral request must keep.
+        period = support.tomllib.loads(
+            (config_dir / "subsystems/drivetrain.toml").read_text())["subsystem"].get(
+                "period_us", robot["robot"]["period_us"]) / 1000
         layout = support.device_layout(config_dir / "robot.toml")
         motor_ids = [i for i, sub, _, kind in layout
                      if sub == "drivetrain" and kind == "motors"]
@@ -280,8 +281,9 @@ class MatchRehearsal(unittest.TestCase):
             restarted = [r for r in requests if kill + 10 < r["now_ms"] < first_resume]
             self.assertGreater(len(restarted), 5, "consumer did not restart during pause")
             self.assert_neutral(requests, restarted[0]["now_ms"], first_resume, motor_ids)
-            # Every non-neutral post-restart output must follow a freshly
-            # received active target, published after the crash (not retained).
+            # Every non-neutral post-restart output must follow a received
+            # active target, published after the crash (not retained) and
+            # still younger than the timeout when the output was sent.
             targets = [r for r in rows if r["process"] == "drivetrain" and
                        r["topic"] == "/drivetrain/target/teleop" and
                        r["kind"] == "MESSAGE" and r["now_ms"] > kill]
@@ -290,12 +292,25 @@ class MatchRehearsal(unittest.TestCase):
                                                                   support.motor_requests(row).values()):
                     continue
                 fresh = [t for t in targets if t["now_ms"] <= row["now_ms"] and
-                         0 <= row["now_ms"] - t["publish_ms"] <= bound and
+                         0 <= row["now_ms"] - t["publish_ms"] < timeout and
                          t["publish_ms"] > kill and
                          bytes.fromhex(t["payload_hex"])[8] != 0]
                 self.assertTrue(fresh, f"output without fresh post-crash target: {row}")
             self.assert_driving(requests, stop - 150, stop, drive_ids)
-            self.assert_neutral_by(requests, stop, stop + bound, resume, motor_ids)
+            # The lane expires a timeout after the last active target the
+            # drivetrain received, not after the harness's SIGSTOP, which can
+            # follow that target by a producer tick or more. From the expiry
+            # on every request is neutral, and the first one was due on the
+            # drivetrain's first tick after it (a skipped flush would leave
+            # the bridge holding the last demand).
+            expiry = max(t["publish_ms"] for t in targets
+                         if t["now_ms"] < resume and
+                         bytes.fromhex(t["payload_hex"])[8] != 0) + timeout
+            self.assert_neutral(requests, expiry, resume, motor_ids)
+            first = next(r for r in requests if r["now_ms"] >= expiry)
+            self.assertLess(first["event_ms"], expiry + period,
+                            f"the lane outlived the first tick due after its "
+                            f"expiry at {expiry:.1f} ms: {first}")
             center = next(r["now_ms"] for r in ds if r["now_ms"] > resume and
                           support.ds_snapshot(r)[1] == 0)
             self.assert_neutral(requests, resume, center, motor_ids)

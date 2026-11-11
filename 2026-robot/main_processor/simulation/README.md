@@ -213,15 +213,18 @@ diagnostics and (when export succeeds) `match.jsonl`; successful runs remove it.
 four seconds of the configured autonomous routine, disabled, teleop with
 drive and shooter/feed buttons, then disabled. It kills drivetrain with
 `SIGKILL` while briefly pausing its driver producer, checks that only
-drivetrain restarts, and proves its resumed output follows a fresh,
-post-crash active target. A separate 250 ms driver pause must neutralize
-all drivetrain motors within `command_timeout_us + period_us`; held input
-cannot rearm until centered. The recording checks every motor request
-against its consumer's latest disabled DS snapshot, nonzero autonomous
-and teleop mechanism actuation, clean manifest closure, and all nodes'
-recorder/exit status. Each actuator owner must send one request per period
-from the first Driver Station receipt to the bridge's last command, less 1 s
-(the recording a `SIGKILL` discards) and, for drivetrain, its restart gap.
+drivetrain restarts, and proves each resumed actuating request follows a
+post-crash active target younger than `command_timeout_us`. In a separate
+250 ms driver pause, every drivetrain request from `command_timeout_us` after
+the last active target the drivetrain received (not after the harness's
+`SIGSTOP`) must be neutral, the first of them due on the drivetrain's first
+tick after that expiry; held input cannot rearm until centered. The
+recording checks every motor request against its consumer's latest disabled
+DS snapshot, nonzero autonomous and teleop mechanism actuation, clean
+manifest closure, and all nodes' recorder/exit status. Each actuator owner
+must send one request per period from the first Driver Station receipt to
+the bridge's last command, less 1 s (the recording a `SIGKILL` discards)
+and, for drivetrain, its restart gap.
 Once every node's loop runs (its log exists) and the gateway is up, the
 harness writes a node-clock start 1 s ahead to the gateway's
 `--schedule-start-file`, times its signals from it and stops the session 17 s
