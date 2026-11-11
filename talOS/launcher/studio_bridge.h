@@ -26,7 +26,7 @@ namespace talos::launcher {
 // interval, inside the supervision loop, within a bounded window; while it is
 // still starting it neither holds the session open nor reports its exits. A
 // bridge that survives one interval is stable and supervised like any node,
-// except that a crash is not restarted (see Restarts in launcher.h).
+// except that a crash is not restarted (see Restarts in supervision_policy.h).
 // One that never comes up is a degraded session, not a broken robot: it is
 // marked failed and the session runs on without Studio.
 // ---------------------------------------------------------------------------

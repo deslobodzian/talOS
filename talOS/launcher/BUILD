@@ -92,6 +92,29 @@ cc_library(
     ],
 )
 
+# Restart backoff, budget and quarantine, and the stall, missing-row and
+# construction kills, as functions of the `now` a supervision pass sampled.
+cc_library(
+    name = "supervision_policy",
+    srcs = ["supervision_policy.cc"],
+    hdrs = ["supervision_policy.h"],
+    deps = [":session"],
+)
+
+# The policy's decisions stepped by hand through simulated hours: no file,
+# process or clock.
+cc_test(
+    name = "supervision_policy_test",
+    size = "small",
+    srcs = ["supervision_policy_test.cc"],
+    deps = [
+        ":roster",
+        ":session",
+        ":supervision_policy",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The supervisor (Launcher) and the Studio bridge it supervises.
 cc_library(
     name = "launcher_lib",
@@ -112,6 +135,7 @@ cc_library(
         ":roster",
         ":session",
         ":spawn",
+        ":supervision_policy",
         "//talOS/configuration",
         "//talOS/events:events_core",
         "//talOS/events:events_log",

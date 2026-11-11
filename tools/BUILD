@@ -68,3 +68,24 @@ py_test(
     tags = ["no_tsan"],
     deps = [":sync_manifest_lib"],
 )
+
+# bazel run //tools:check_node_matrix -- [PATH...]
+# Reports each node test's docs/TESTING.md §7 matrix cases: present, n/a
+# with its reason, or missing (exit 1).
+py_binary(
+    name = "check_node_matrix",
+    srcs = ["check_node_matrix.py"],
+)
+
+py_test(
+    name = "check_node_matrix_test",
+    size = "small",
+    srcs = [
+        "check_node_matrix.py",
+        "check_node_matrix_test.py",
+        "new_subsystem.py",
+    ],
+    legacy_create_init = False,
+    main = "check_node_matrix_test.py",
+    deps = [":sync_manifest_lib"],
+)

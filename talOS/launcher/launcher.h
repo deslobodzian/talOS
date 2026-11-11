@@ -4,7 +4,8 @@
 // (describe and lint, session directory and retention, spawn, supervision,
 // restarts, manifest). The libraries it is built on have narrower headers:
 // roster.h, describe_graph.h, spawn.h, child_output.h, session.h,
-// studio_bridge.h; log_merge.h is log_dump's.
+// supervision_policy.h (the restart and kill decisions), studio_bridge.h;
+// log_merge.h is log_dump's.
 
 #include <sys/types.h>
 
@@ -12,7 +13,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -33,6 +33,7 @@
 #include "talOS/launcher/session_retention.h"
 #include "talOS/launcher/spawn.h"
 #include "talOS/launcher/studio_bridge.h"
+#include "talOS/launcher/supervision_policy.h"
 
 namespace talos::launcher {
 
@@ -43,46 +44,6 @@ namespace talos::launcher {
 // roster that does not fit is refused before anything starts.
 std::string RegistryCapacityError(const introspect::RegistryReader& reader,
                                   std::size_t registering);
-
-// ---------------------------------------------------------------------------
-// Restarts
-//
-// A roster member other than the Studio bridge that crashes -- exits nonzero
-// or by a signal -- while the session is not stopping is respawned after a
-// backoff of 50 ms, doubling within a rolling restart window, capped at 1 s.
-// A critical member's first crash in that window restarts it at once: the
-// robot cannot run without it, and a crash loop still backs off from its
-// second restart on.
-// max_restarts limits starts within that window, not the session lifetime.
-// A critical member that exits cleanly (status 0) while the session is not
-// stopping did not finish anything -- its peers still run -- so it restarts,
-// always after the backoff; a non-critical clean exit is a node that finished.
-// A run that cannot be spawned at all (fork or pipe failing, as under EAGAIN
-// or EMFILE) is rescheduled like a crash, against the same budget, so a
-// transient shortage never leaves a member down for the rest of a session
-// the launcher -- and so its service -- outlives.
-// When a clean exit's restart falls due and every other live member's latest
-// run also exited 0, the whole roster has completed and the restart is
-// dropped (see RosterContinues); the backoff gives such a roster's other
-// members the time to exit. The backoff is scheduled inside the
-// supervision loop, so a restarting node never delays another node or the
-// session deadline. Every run writes its own event log.
-// ---------------------------------------------------------------------------
-
-inline constexpr int kDefaultMaxRestarts = 5;
-inline constexpr std::chrono::milliseconds kRestartInitialBackoff{50};
-inline constexpr std::chrono::milliseconds kRestartMaxBackoff{1000};
-
-// The wait before restart `restart` (1 for the first in the rolling window)
-// of a `critical` member or not, after a `clean_exit` or a crash.
-std::chrono::milliseconds RestartBackoff(int restart, bool clean_exit,
-                                         bool critical);
-
-// Requested stop, the session deadline and launcher shutdown (`stopping`)
-// never restart; zero disables all retries. Crashes remain retryable after a
-// budget quarantine. A clean exit restarts only a critical member.
-bool ShouldRestartNode(bool clean_exit, bool critical, int max_restarts,
-                       bool stopping);
 
 // `--max-restarts` wins, then `[robot] max_restarts`, then the default.
 // Only the flag may be 0, which disables every restart, critical members'
@@ -210,21 +171,13 @@ class Launcher {
     // Bytes all of this member's runs may log together (its share of the
     // session budget); a restart gets what earlier runs left.
     uint64_t log_budget{0};
-    bool restart_pending{false};
-    bool last_exit_clean{false};  // Its latest run exited 0.
-    bool critical{true};
-    std::chrono::steady_clock::time_point restart_at{};
-    std::deque<std::chrono::steady_clock::time_point> restart_times;
+    // Its restarts across runs: backoff, rolling budget, quarantine.
+    RestartSchedule restart;
+    // The current run's progress (its row's dispatch count, or, while it
+    // constructs, its heartbeat). Begun only by NewRun.
+    RunLiveness liveness;
+    LivenessLimits limits{};
     bool heartbeat_killed{false};
-    std::chrono::nanoseconds heartbeat_timeout{std::chrono::milliseconds{500}};
-    std::chrono::steady_clock::time_point started_at{};
-    // When the run last made progress (its row's dispatch count moved, or,
-    // while it constructs, its heartbeat), and when its heartbeat last moved,
-    // which a stall report names.
-    std::chrono::steady_clock::time_point progress_changed_at{};
-    std::chrono::steady_clock::time_point heartbeat_changed_at{};
-    int64_t last_heartbeat{0};
-    uint64_t last_dispatch{0};
     // Event log flags of its registry rows already reported (NoteRecording).
     uint32_t recording_reported{0};
     // This run's realtime outcome was seen in its row (NoteRealtime).
@@ -240,6 +193,13 @@ class Launcher {
     // Why the launcher ended the current run (kRunStalled, kRunStop, ...);
     // empty while it has not tried. Its run is recorded with this reason.
     std::string_view kill_reason;
+
+    // A run of this member was spawned at `spawned`, or, for every first
+    // run, supervision starts then: starts its liveness (grace,
+    // construction deadline, progress) and clears what the launcher noted
+    // of the run before. The one place a run's liveness begins, so a path
+    // that starts a run without it also keeps the last run's kill reason.
+    void NewRun(SupervisionTime spawned);
   };
 
   // --replay-inputs: runs the one roster member --only names on the topics
@@ -254,7 +214,7 @@ class Launcher {
   // one, with whether its reporting thread's heartbeat still moved or was
   // unchanged too.
   static std::string StallReport(const NodeLaunch& launch, bool constructing,
-                                 std::chrono::steady_clock::time_point now);
+                                 SupervisionTime now);
 
   static void InstallSignals();
 
@@ -264,21 +224,25 @@ class Launcher {
   pid_t SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch,
                   std::string& error);
 
-  // Schedules `proc`'s next start: after a backoff that doubles with each
-  // start in the rolling window (none for a critical member's first crash
-  // there) or, for a non-critical member that has spent its budget there,
-  // quarantined until the oldest of those starts leaves the window. Only for
-  // a restart ShouldRestartNode allows. Returns the delay.
-  std::chrono::milliseconds ScheduleRestart(
-      NodeProcessInfo& proc, NodeLaunch& launch,
-      std::chrono::steady_clock::time_point now);
+  // Schedules `proc`'s next start (RestartSchedule::Schedule) and shows it
+  // in the manifest. Only for a restart ShouldRestartNode allows. Returns
+  // the delay.
+  std::chrono::milliseconds ScheduleRestart(NodeProcessInfo& proc,
+                                            NodeLaunch& launch,
+                                            SupervisionTime now);
 
-  // A run that cannot be spawned is rescheduled like a crash (see Restarts
-  // above); with restarts disabled it stays down, as a crashed one does.
+  // The manifest's view of `restart`: `quarantined`, and
+  // `retry_at_monotonic_ns` (0 with no pending start). Written after every
+  // change to it.
+  static void ShowRestart(NodeProcessInfo& proc,
+                          const RestartSchedule& restart);
+
+  // A run that cannot be spawned is rescheduled like a crash (Restarts in
+  // supervision_policy.h); with restarts disabled it stays down, as a
+  // crashed one does.
   // `error` names the failed step and its errno (SpawnProcess).
   void SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
-                   std::chrono::steady_clock::time_point now,
-                   const std::string& error);
+                   SupervisionTime now, const std::string& error);
 
   // The byte cap for a member's next run: what its earlier runs left of its
   // share `budget`, but never less than half of it, so a run restarted after
@@ -291,8 +255,7 @@ class Launcher {
   // Starts `proc`'s pending run: restart `restart_count + 1` into a fresh
   // event log or, when no run has spawned yet, the first. The attempt counts
   // against the rolling budget whether or not it spawns.
-  void Restart(NodeProcessInfo& proc, NodeLaunch& launch,
-               std::chrono::steady_clock::time_point now);
+  void Restart(NodeProcessInfo& proc, NodeLaunch& launch, SupervisionTime now);
 
   // A run's registry row reports its loop's realtime outcome once the node
   // asked for it, or decided not to (introspect::RealtimeOf; introspection
@@ -339,10 +302,10 @@ class Launcher {
                               std::size_t self);
 
   // Waits until every node has exited, SIGINTing them all once on a signal or
-  // at the deadline. A crashed node is restarted per the policy above without
-  // blocking the loop; a pending restart holds the session open until it
-  // fires or the session stops. A bridge that is still starting does not hold
-  // it open.
+  // at the deadline. A crashed node is restarted per supervision_policy.h
+  // without blocking the loop; a pending restart holds the session open until
+  // it fires or the session stops. A bridge that is still starting does not
+  // hold it open.
   void Supervise(std::vector<NodeProcessInfo>& procs,
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
@@ -355,7 +318,7 @@ class Launcher {
   // stopped past the startup grace. Returns whether `proc` changed.
   bool WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
                 const introspect::RegistryMapping* registry,
-                std::chrono::steady_clock::time_point now);
+                SupervisionTime now);
 
   // Fills `launch` for a member's first run: its supervision settings and
   // the command line it is spawned with, its event log capped at
@@ -370,7 +333,8 @@ class Launcher {
   LauncherOptions options_;
   SessionManifest session_manifest_;
   std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
-  int max_restarts_{kDefaultMaxRestarts};
+  // Set by Run from --max-restarts or the config, and the window.
+  RestartLimits restart_limits_{};
   // Drains every member's output for the session (Run); empty before it.
   std::optional<ChildOutput> output_;
   // Held by Run for the session, refreshed by Supervise; null without one.
