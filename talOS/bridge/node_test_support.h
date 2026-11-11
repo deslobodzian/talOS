@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 
@@ -65,8 +66,10 @@ struct Link {
 
   // Opens the bridge and, when `open_gateway`, the gateway; a test whose
   // bridge must first run with no gateway listening calls OpenGateway()
-  // later, keeping the gateway port reserved until then.
-  bool Open(const config::RobotConfig& cfg, bool open_gateway = true) {
+  // later, keeping the gateway port reserved until then. A non-empty
+  // `log_path` is the bridge's --log, in session `session_id`.
+  bool Open(const config::RobotConfig& cfg, bool open_gateway = true,
+            const std::string& log_path = {}, uint64_t session_id = 0) {
     for (int attempt = 0; attempt < 64; ++attempt) {
       node.reset();
       gateway.Close();
@@ -77,7 +80,8 @@ struct Link {
       if (gateway_reservation < 0 || node_reservation < 0) return false;
       if (open_gateway && !OpenGateway()) continue;
       Release(node_reservation);
-      node.emplace(cfg, "127.0.0.1", gateway_port, node_port, true);
+      node.emplace(cfg, "127.0.0.1", gateway_port, node_port, true, session_id,
+                   log_path);
       if (node->Open()) return true;
     }
     return false;
