@@ -102,6 +102,7 @@ void ModeTracker::Observe(uint32_t flags, uint64_t now_us) {
 }
 
 void ModeTracker::Stamp(DriverStationData& ds) {
+  ds.fms.flags = ShownFlags(ds.fms.flags);
   Observe(ds.fms.flags, ds.sample_time_us);
   ds.mode_since_us = since_us_;
 }

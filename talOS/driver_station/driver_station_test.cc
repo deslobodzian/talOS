@@ -126,6 +126,23 @@ TEST(ModeTrackerTest, SteadyHardwareTicksKeepThePublishedGeneration) {
   EXPECT_EQ(Stamp(tracker, 40000, kTeleopEnabled), 20000u);
 }
 
+// REQ-SAFE-10
+TEST(ModeTrackerTest, DetachedDriverStationShowsNoMode) {
+  // Bench, RoboRIO 2026 image, no Driver Station attached: WPILib's HAL
+  // reports teleop as its default control word, so every packet carried
+  // kTeleop with kDsAttached clear (TODO RT-16). A detached packet must name
+  // no mode, and the hardware ticks that observe the raw flags must agree
+  // with the packets on the generation.
+  ModeTracker tracker;
+  DriverStationData detached = Sample(1000, kTeleop);
+  tracker.Stamp(detached);
+  EXPECT_EQ(detached.fms.flags & (kAutonomous | kTeleop | kTest), 0u)
+      << "flags " << detached.fms.flags;
+  tracker.Observe(kTeleop, 1005);
+  tracker.Observe(0, 1010);
+  EXPECT_EQ(Stamp(tracker, 1020, kTeleop), 1000u);
+}
+
 TEST(ModeTrackerTest, GenerationIsNeverZeroAndAlwaysMovesForward) {
   ModeTracker tracker;
   // A sampler whose clock starts at 0 still stamps a generation no target
