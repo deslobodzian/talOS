@@ -109,15 +109,38 @@ if (project.hasProperty("ubsan")) {
     }
 }
 
+// The companion (main processor) address the program sends State to and
+// accepts frames from: -Pcompanion=<IPv4 literal> on deploy or buildRio,
+// 10.56.87.11 without it. It is fixed in the binary, never learned from a
+// datagram, because the gateway's connected socket is what keeps every other
+// host on the network from commanding the robot (talOS/protocol/README.md).
+// The socket resolves no hostname and refuses the unspecified 0.0.0.0, so
+// anything else than a dotted IPv4 literal in inet_pton's form (four decimal
+// octets, no leading zeros), and 0.0.0.0, stop the build here instead of
+// failing every socket open on the RoboRIO.
+def companionAddress = project.findProperty('companion')?.toString() ?: '10.56.87.11'
+def validIpv4 = { String text ->
+    def octets = text.split('\\.', -1)
+    octets.length == 4 && octets.every { it ==~ /0|[1-9][0-9]{0,2}/ && it.toInteger() <= 255 } &&
+            text != '0.0.0.0'
+}
+if (!validIpv4(companionAddress)) {
+    throw new GradleException(
+            "-Pcompanion=${companionAddress}: the companion address must be a dotted IPv4 " +
+            "literal such as 10.56.87.11 (the RoboRIO program resolves no hostname)")
+}
+
 // The build this program reports in every State (talOS/hardware/messages.h,
 // GatewayBuild): RioBuild.h, written before any compile, holds the git commit
 // of this checkout and whether it has uncommitted changes, untracked files
 // included (the rule tools/workspace_status.sh applies to the main
 // processor). Without git, or outside a git checkout, the commit is "unknown"
 // and the program reports revision 0. It reads only the local repository, so
-// --offline builds get it too. The task runs every build but rewrites the
-// header only when its text changes, so an unchanged checkout recompiles
-// nothing.
+// --offline builds get it too. The header also holds the companion address
+// above: a generated constant rather than a -D define, so no compiler's
+// quoting of a string define is involved. The task runs every build but
+// rewrites the header only when its text changes, so an unchanged checkout
+// and address recompile nothing, and a changed address recompiles Robot.cpp.
 def rioBuildHeaderDir = layout.buildDirectory.dir('generated/talos/include').get().asFile
 def runGit = { List<String> args ->
     try {
@@ -132,9 +155,10 @@ def runGit = { List<String> args ->
 }
 
 tasks.register("generateRioBuild") {
-    description = 'Write the checkout\'s git commit and dirty flag to RioBuild.h'
+    description = 'Write the checkout\'s git commit, dirty flag and companion address to RioBuild.h'
     group = 'build'
     def header = new File(rioBuildHeaderDir, 'RioBuild.h')
+    inputs.property('companion', companionAddress)
     outputs.file(header)
     outputs.upToDateWhen { false }
     doLast {
@@ -158,6 +182,9 @@ inline constexpr const char* kBuildCommit = "${commit}";
 inline constexpr uint64_t kBuildRevision = ${revision}ull;
 // Built with uncommitted changes, untracked files included.
 inline constexpr bool kBuildDirty = ${dirty};
+// The companion (main processor) this program sends State to and accepts
+// frames from, set by -Pcompanion at build time.
+inline constexpr const char* kCompanionAddress = "${companionAddress}";
 }  // namespace talos::rio
 """
         if (!header.exists() || header.text != text) {
