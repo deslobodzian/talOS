@@ -96,7 +96,10 @@ Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
 
 - [ ] Keep `commissioned = false` and exercise controls while DS disabled.
   Expected: RIO console reports `commissioned=0`, `/hw/status.configured` is
-  false, and no motor motion occurs. Record console and `/motor/state`.
+  true (the RoboRIO acknowledged the uncommissioned config) while the
+  `/hw/state` flag `configured` (SmartDashboard `companion/configured`) is
+  false (it also requires `commissioned`), and no motor motion occurs. Record
+  console and `/motor/state`.
   Refusal is intentional, not a CAN fault to bypass.
 - [ ] Inspect `/hw/status`: receive counters should advance and identity and
   ownership rejection counters should not grow. Expected: low state age once
@@ -119,8 +122,9 @@ Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
 - [ ] Only a human, after those checks, sets commissioning true in the base
   and deployment configs and updates [the golden config test](../bench/main_processor/configuration/config_golden_test.cc) to the measured
   configuration in the same change. Repeat Mini build/test, bundle install and
-  launch. Expected: RIO acknowledges configuration, `/hw/status.configured`
-  becomes true. Record reviewed change/config hash and RIO acknowledgment.
+  launch. Expected: RIO acknowledges configuration, the `/hw/state` flag
+  `configured` (`companion/configured`, `companion/commissioned`) becomes
+  true. Record reviewed change/config hash and RIO acknowledgment.
 - [ ] With DS disabled move joystick 0 axis 1 and hold buttons 1/2. Expected:
   neutral mode/source NONE, zero drive, no motion. Release all controls before
   enabling teleop; startup/recovery requires a neutral-input evaluation. Record
