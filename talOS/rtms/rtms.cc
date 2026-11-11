@@ -411,7 +411,8 @@ RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
       counted_{std::exchange(other.counted_, false)},
       registered_{std::exchange(other.registered_, {})},
       wake_senders_{std::move(other.wake_senders_)},
-      wakes_sent_{std::exchange(other.wakes_sent_, 0)} {}
+      wakes_sent_{std::exchange(other.wakes_sent_, 0)},
+      wake_failures_{std::exchange(other.wake_failures_, 0)} {}
 
 RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
   if (this != &other) {
@@ -431,6 +432,7 @@ RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
     registered_ = std::exchange(other.registered_, {});
     wake_senders_ = std::move(other.wake_senders_);
     wakes_sent_ = std::exchange(other.wakes_sent_, 0);
+    wake_failures_ = std::exchange(other.wake_failures_, 0);
   }
   return *this;
 }
@@ -791,10 +793,20 @@ void RTMSQueue::notify_readers(std::uint64_t mask) {
     const std::uint64_t wake_id =
         header_->readers[i].wake_id.load(std::memory_order_acquire);
     if (wake_id == 0) continue;
-    // False means its receiver is gone; the slot's holder, or the reclaim of
-    // its dead process, clears the id.
-    wake_senders_[i].notify(wake_id);
+    // A receiver that is gone needs nothing: the slot's holder, or the
+    // reclaim of its dead process, clears the id. Any other failure lost the
+    // hint, and the reader waits for its loop's backstop.
+    const talos::WakeStatus status = wake_senders_[i].send(wake_id);
     ++wakes_sent_;
+    if (status.outcome == talos::WakeOutcome::FAILED) {
+      if (wake_failures_++ == 0) {
+        std::fprintf(stderr,
+                     "talos: RTMS %s: a wake notification failed (%s); a "
+                     "reader may wait for its backstop. Further failures on "
+                     "this topic are counted, not logged.\n",
+                     path_.c_str(), std::strerror(status.error));
+      }
+    }
   }
 }
 

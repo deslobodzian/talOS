@@ -72,8 +72,8 @@ when, it also drains between timers:
   so the tick bounds message latency. A tick due at a timer's deadline adds
   nothing to that timer: the timer's own drain ran first.
 - `Delivery::BEFORE_TIMERS` arms no poll timer, so a loop with only periodic
-  work wakes once per period. `activity()` counts wakeups and drains; at
-  100 Hz that is about 20 of each over 200 ms against about 200 wakeups and
+  work wakes once per period. `activity()` counts wakeups and drains; over
+  20 ticks at 100 Hz that is about 20 of each against about 200 wakeups and
   220 drains under `POLL`
   (`RealtimeEventLoop.OnlyPollWakesBetweenTimersForAQuietTopic`).
 - `Delivery::ON_PUBLISH` also drains when a publication on a *prompt* watcher
@@ -94,13 +94,18 @@ when, it also drains between timers:
   drain. A notification is only a hint, and a publisher that dies between
   publishing and notifying sends none, so while it has prompt watchers the
   loop never blocks longer than `Options::wake_backstop` (1 s) without
-  draining; a loop whose next timer is nearer never reaches it. If three
+  draining (`RealtimeEventLoop.TheBackstopDrainsWhatNoNotificationAnnounced`);
+  a loop whose next timer is nearer never reaches it. If three
   drains in a row, each run because one watcher's arm reported something to
   read, deliver nothing from it, that watcher's failed arm stops keeping the
   loop awake until a drain delivers from it again (counted once in
   `activity().stalled_arms`), so a transport that misreports unread data
-  cannot make the loop spin. With no prompt watcher it runs as
-  `BEFORE_TIMERS` and holds no receiver.
+  cannot make the loop spin
+  (`RealtimeEventLoop.AnArmThatKeepsFailingWithNothingToReadStopsSpinning`). With no prompt watcher it runs as
+  `BEFORE_TIMERS` and holds no receiver. A loop that cannot build its
+  receiver (no descriptor left, say) runs that run under `POLL` instead,
+  says so once on stderr, and counts it in `activity().wake_fallbacks`
+  (`RealtimeEventLoop.WithoutAWakeReceiverTheLoopFallsBackToPolling`).
 
 The macOS wait also passes `kevent()` that coalesced relative timeout, as a
 backstop: XNU delivers every `EVFILT_TIMER` through one shared kernel worker
@@ -113,7 +118,16 @@ Each dispatch samples its own `now`, frozen for that callback; a slow timer
 callback cannot hide elapsed time from the next due timer. Messages retain the
 writer's publication time separately from their drain/dispatch time. Message
 age is `now - publish_time`, including any wait before draining, while
-`Context::latency()` remains drain scheduling latency.
+`Context::latency()` is `now - event_time`. A message's `event_time` is the
+drain that delivered it: a timer's or poll tick's deadline, or the moment a
+woken loop saw its wake, or the backstop's deadline. The exception is a
+prompt watcher's message in a drain the loop ran because it was woken (a
+wake, an arm that found it unread, or the backstop): the loop owed it a
+dispatch from its publication, so its `event_time` is its publication time
+and `latency()`, and the source's max latency, include the whole wait from
+publication. A watcher that is not prompt in that same drain waited by
+design and keeps the drain's time
+(`RealtimeEventLoop.AWakeStampsOnlyPromptMessagesWithTheirPublication`).
 
 Subscriptions without a per-message callback skip directly to the newest
 available value once per drain, counting skipped messages as dropped. Callback
@@ -129,10 +143,9 @@ in the source's `SourceCounters::dropped`.
 
 The log records dispatch and publication times and the resulting order, so
 replay reproduces every delivery policy and ages. A drain leaves no record of
-its own, only the messages it dispatched: each carries the drain's time as
-`event_time` (a poll tick's or timer's deadline, the moment a woken loop saw
-the publication, or the backstop's deadline) and its own `now`, so a wake
-drain needs no new record kind and a replay re-records the log byte for byte
+its own, only the messages it dispatched, each with its `event_time` (above)
+and its own `now`, so a wake drain needs no new record kind and a replay,
+which takes both from the log, re-records it byte for byte
 (`RealtimeEventLoop.RealtimeRunReplaysForEveryDeliveryPolicy`).
 `SimulatedEventLoop` takes the same options and stamps messages at simulated
 send time; it has no wake channel, so under `ON_PUBLISH` it drains on its

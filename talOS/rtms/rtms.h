@@ -257,6 +257,11 @@ class RTMSQueue {
   bool arm_wake(std::size_t reader_id);
   // Notifications this queue object has sent as a writer (process-local).
   std::uint64_t wakes_sent() const { return wakes_sent_; }
+  // Of those, the ones lost for a reason other than the receiver being gone
+  // (WakeOutcome::FAILED: no descriptor left, a permission refused, an
+  // unexpected errno). Process-local; the first is also logged to stderr
+  // with the topic and the error.
+  std::uint64_t wake_failures() const { return wake_failures_; }
   // Frees every reader slot whose claiming process has died. Returns how
   // many it freed.
   std::size_t reclaim_dead_readers();
@@ -366,4 +371,5 @@ class RTMSQueue {
   // notifications went out.
   std::array<talos::WakeSender, MAX_READERS> wake_senders_{};
   std::uint64_t wakes_sent_{0};
+  std::uint64_t wake_failures_{0};
 };

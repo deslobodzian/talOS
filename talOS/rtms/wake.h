@@ -43,6 +43,23 @@ class WakeReceiver {
   std::uint64_t id_{0};
 };
 
+// What one notification came to.
+enum class WakeOutcome : std::uint8_t {
+  // The receiver has a notification pending: this one, or an earlier one
+  // its full queue already held.
+  DELIVERED,
+  // No receiver is bound at the id any more.
+  RECEIVER_GONE,
+  // The hint was lost for another reason (no descriptor left, a permission
+  // refused, an unexpected errno); the receiver is not known to be gone.
+  FAILED,
+};
+
+struct WakeStatus {
+  WakeOutcome outcome{WakeOutcome::DELIVERED};
+  int error{0};  // the errno behind RECEIVER_GONE or FAILED, else 0
+};
+
 // The notifying side: one cached endpoint. Default-constructible, move-only.
 class WakeSender {
  public:
@@ -54,13 +71,15 @@ class WakeSender {
   WakeSender(const WakeSender&) = delete;
   WakeSender& operator=(const WakeSender&) = delete;
 
-  // Notifies receiver `id` (nonzero). Connects on first use and reconnects
-  // when `id` differs from the cached one. Never blocks, never raises a
-  // signal. Returns false when the receiver no longer exists; true
-  // otherwise, including when the receiver already has notifications pending
-  // (its queue is full) and when this process cannot open a socket (the hint
-  // is then lost; the receiver is not known to be gone).
-  bool notify(std::uint64_t id) noexcept;
+  // Notifies receiver `id`. Connects on first use and reconnects when `id`
+  // differs from the cached one. Never blocks, never raises a signal. An id
+  // of 0 names no receiver: RECEIVER_GONE with error 0.
+  WakeStatus send(std::uint64_t id) noexcept;
+  // send(), as false only when the receiver no longer exists: a FAILED
+  // notification is true, since the receiver may still be there.
+  bool notify(std::uint64_t id) noexcept {
+    return send(id).outcome != WakeOutcome::RECEIVER_GONE;
+  }
   // Closes the cached endpoint.
   void reset() noexcept;
 
