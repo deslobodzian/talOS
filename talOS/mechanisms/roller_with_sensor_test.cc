@@ -277,6 +277,7 @@ TEST(RollerWithSensor, StaleLaneGoesNeutral) {
 
 // Losing enable cancels a timed run: re-enabled within eject_us with the
 // eject still asked, the roller does not pick the run up again.
+// REQ-SAFE-38
 TEST(RollerWithSensor, DisableCancelsATimedRun) {
   Rig intake{"intake"};
   intake.Sensor("beam", true);
@@ -296,6 +297,7 @@ TEST(RollerWithSensor, DisableCancelsATimedRun) {
 
 // With idle_runs, an eject held through a stale spell is still one ask: it
 // runs once, not again when the lane returns.
+// REQ-SAFE-38
 TEST(RollerWithSensor, HeldEjectAcrossAStaleSpellRunsOnce) {
   Rig intake{"intake"};
   intake.Start();
@@ -310,6 +312,7 @@ TEST(RollerWithSensor, HeldEjectAcrossAStaleSpellRunsOnce) {
 
 // A request is refused outside update() (here every()), naming the roller,
 // and lasts only the update() it was made in.
+// REQ-SAFE-38
 TEST(RollerWithSensor, RequestIsTiedToItsUpdate) {
   struct TimerNode {
     explicit TimerNode(Node& node) : roller{node, "roller"} {

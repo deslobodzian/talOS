@@ -290,6 +290,7 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
 
 // A request outside update() (here a message callback, which would act on
 // a goal no Target selected) is refused, naming the mechanism.
+// REQ-SAFE-36
 TEST(PositionMechanism, RequestOutsideUpdateThrows) {
   struct CallbackNode {
     explicit CallbackNode(Node& node)
@@ -321,6 +322,7 @@ TEST(PositionMechanism, RequestOutsideUpdateThrows) {
 // A request lasts the update() it was made in: made in tick N by an owner
 // whose update() then skips the mechanism's update(), it does not drive in
 // tick N + 1.
+// REQ-SAFE-36
 TEST(PositionMechanism, RequestDoesNotCarryIntoTheNextTick) {
   struct SkippingNode {
     explicit SkippingNode(Node& node) : mech{node, "arm"} {}
@@ -489,6 +491,7 @@ TEST(PositionMechanism, StallHomingSetsTheFrameWhereTheMechanismStopped) {
 // A mechanism that never moves and shows no load (a slipping belt, an
 // unpowered motor) is no evidence of a stop: homing times out and faults,
 // it never homes.
+// REQ-SAFE-36
 TEST(PositionMechanism, StallHomingThatNeverMovesFaultsInsteadOfHoming) {
   Rig hood{"hood"};
   hood.SetMotor(2.0, 0.0, 0.0);
@@ -503,6 +506,7 @@ TEST(PositionMechanism, StallHomingThatNeverMovesFaultsInsteadOfHoming) {
 
 // Slow to get going (under load, below homing_stall_rps) is not a stop: no
 // zero before homing_min_push_us of push unless it has moved.
+// REQ-SAFE-36
 TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
   Rig hood{"hood"};
   hood.SetMotor(2.3, -0.02, 25.0);  // breaking away: slow, loaded
@@ -518,6 +522,7 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
 }
 
 // A mechanism that keeps moving (no stop within reach) times out and faults.
+// REQ-SAFE-36
 TEST(PositionMechanism, StallHomingTimesOutWhileStillMoving) {
   Rig hood{"hood"};
   hood.SetMotor(2.3, -0.5, 5.0);
@@ -530,6 +535,7 @@ TEST(PositionMechanism, StallHomingTimesOutWhileStillMoving) {
 
 // Losing the goal pauses homing's push, not its timeout: the push stops at
 // once, and a goal back after the timeout has passed faults.
+// REQ-SAFE-36
 TEST(PositionMechanism, HomingPausesWithoutAGoalButKeepsItsTimeout) {
   Rig hood{"hood"};
   hood.SetMotor(2.3, -0.5, 5.0);  // moving: no stall
@@ -546,6 +552,7 @@ TEST(PositionMechanism, HomingPausesWithoutAGoalButKeepsItsTimeout) {
 
 // hold() has no position to hold in an unknown frame: an unhomed mechanism
 // stays neutral and does not start homing.
+// REQ-SAFE-36
 TEST(PositionMechanism, HoldNeverStartsHoming) {
   Rig hood{"hood"};
   hood.node.hold_mode = true;

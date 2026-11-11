@@ -864,6 +864,7 @@ TEST_F(TlogToWpilogTest, FailedWriteKeepsThePreviousOutput) {
 // Guards: an output whose directory takes no new file fails before any
 // input is read, naming the output, and leaves an existing output there
 // unchanged.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, UnwritableOutputDirectoryFailsFirst) {
   const std::string directory = root_ + "/read_only";
   std::filesystem::create_directories(directory);
