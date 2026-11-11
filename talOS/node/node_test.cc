@@ -952,12 +952,17 @@ struct SilentAtDrain {
 
 // Every message its callbacks heard, in order, with the instant of the
 // drain that delivered it: /feed/state's with Wake::kAtDrain, then
-// /poke/state's (heard as -1) with the default Wake::kOnPublish.
+// /poke/state's (heard as -1) with the default Wake::kOnPublish; and the
+// feed subscription's age() inside each of its callbacks.
 struct Collector {
   explicit Collector(Node& n)
       : node{n},
         feed{n.subscribe<Count>(
-            "/feed/state", [this](const Count& c) { Hear(c.tick_count()); },
+            "/feed/state",
+            [this](const Count& c) {
+              feed_ages.push_back(feed.age());
+              Hear(c.tick_count());
+            },
             Wake::kAtDrain)},
         poke{n.subscribe<Count>("/poke/state",
                                 [this](const Count&) { Hear(-1); })} {}
@@ -969,6 +974,7 @@ struct Collector {
   Subscription<Count> feed;
   Subscription<Count> poke;
   std::vector<std::pair<std::int64_t, Duration>> heard;  // (value, delivered)
+  std::vector<Duration> feed_ages;
 };
 
 // A node that only reads latched values at its own timers drains
@@ -1008,8 +1014,10 @@ TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
 // node's next drain, here its 5 ms update(): publications between ticks wake
 // nothing. A drain delivers at most 64 of them, and one that stops there is
 // followed at once by another, so a backlog over the cap is heard whole at
-// that instant, as a waking callback's is, not one batch per tick.
+// that instant, as a waking callback's is, not one batch per tick. Inside
+// the callback age() is that message's, counted from its publication.
 // REQ-RT-02
+// REQ-RT-19
 TEST(Node, AnAtDrainCallbackHearsEveryMessageInOrderAtTheNextDrain) {
   using Heard = std::vector<std::pair<std::int64_t, Duration>>;
   auto sim = Sim::FromToml(kRobotToml);
@@ -1023,6 +1031,7 @@ TEST(Node, AnAtDrainCallbackHearsEveryMessageInOrderAtTheNextDrain) {
       << "a publication at 6, 7 or 8 ms woke the node";
   sim.step(1ms);
   EXPECT_EQ(collector.heard, (Heard{{0, 10ms}, {1, 10ms}, {2, 10ms}}));
+  EXPECT_EQ(collector.feed_ages, (std::vector<Duration>{4ms, 3ms, 2ms}));
 
   collector.heard.clear();
   for (std::int64_t i = 0; i < 70; ++i) {
