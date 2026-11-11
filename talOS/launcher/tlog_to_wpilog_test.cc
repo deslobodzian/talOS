@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <bit>
 #include <csignal>
 #include <cstddef>
@@ -819,17 +820,72 @@ TEST_F(TlogToWpilogTest, LogNamedTwiceIsReadOnce) {
   EXPECT_EQ(AsInt64(dropped[1].payload), 3);
 }
 
+// The names in `directory`, sorted.
+std::vector<std::string> Listing(const std::string& directory) {
+  std::vector<std::string> names;
+  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    names.push_back(entry.path().filename().string());
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
 // Guards: a write that fails part way (the file size limit standing in for
-// a full disk) exits 1 and leaves no partial output behind.
+// a full disk) exits 1, leaves a previous output byte-identical and no
+// temporary file, and creates nothing where there was no output; a
+// successful run replaces the previous output.
 // REQ-OPS-26
-TEST_F(TlogToWpilogTest, FailedWriteLeavesNoPartialOutput) {
-  const std::string out = root_ + "/full.wpilog";
-  const Result result = Run({session_, "-o", out}, rlim_t{1024});
-  EXPECT_EQ(result.exit_code, 1) << result.output;
-  EXPECT_FALSE(std::filesystem::exists(out));
+TEST_F(TlogToWpilogTest, FailedWriteKeepsThePreviousOutput) {
+  const std::string directory = root_ + "/outputs";
+  std::filesystem::create_directories(directory);
+  const std::string out = directory + "/match.wpilog";
+  const std::string previous = "a previous conversion";
+  std::ofstream{out, std::ios::binary} << previous;
+
+  const Result failed = Run({session_, "-o", out}, rlim_t{1024});
+  EXPECT_EQ(failed.exit_code, 1) << failed.output;
+  {
+    std::ifstream stream{out, std::ios::binary};
+    EXPECT_EQ(std::string(std::istreambuf_iterator<char>{stream}, {}),
+              previous);
+  }
+  EXPECT_EQ(Listing(directory), std::vector<std::string>{"match.wpilog"});
+  const std::string fresh = directory + "/fresh.wpilog";
+  EXPECT_EQ(Run({session_, "-o", fresh}, rlim_t{1024}).exit_code, 1);
+  EXPECT_EQ(Listing(directory), std::vector<std::string>{"match.wpilog"});
+
   // The whole conversion is larger than the limit, so the write did fail.
   ASSERT_EQ(Run({session_, "-o", out}).exit_code, 0);
   EXPECT_GT(std::filesystem::file_size(out), 1024u);
+  EXPECT_FALSE(Read(out).entries.empty());
+  EXPECT_EQ(Listing(directory), std::vector<std::string>{"match.wpilog"});
+}
+
+// Guards: an output whose directory takes no new file fails before any
+// input is read, naming the output, and leaves an existing output there
+// unchanged.
+TEST_F(TlogToWpilogTest, UnwritableOutputDirectoryFailsFirst) {
+  const std::string directory = root_ + "/read_only";
+  std::filesystem::create_directories(directory);
+  const std::string out = directory + "/match.wpilog";
+  std::ofstream{out, std::ios::binary} << "kept";
+  std::filesystem::permissions(
+      directory,
+      std::filesystem::perms::owner_read | std::filesystem::perms::owner_exec);
+  if (access(directory.c_str(), W_OK) == 0) {
+    std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+    GTEST_SKIP() << "permissions do not bind this user (root)";
+  }
+  // An unreadable input too: the output is what fails, before it is read.
+  const Result result = Run({root_ + "/missing.tlog", "-o", out});
+  std::filesystem::permissions(directory, std::filesystem::perms::owner_all);
+  EXPECT_EQ(result.exit_code, 1);
+  EXPECT_NE(result.output.find("cannot write " + out), std::string::npos)
+      << result.output;
+  EXPECT_EQ(result.output.find("missing.tlog"), std::string::npos)
+      << result.output;
+  std::ifstream stream{out, std::ios::binary};
+  EXPECT_EQ(std::string(std::istreambuf_iterator<char>{stream}, {}), "kept");
 }
 
 }  // namespace
