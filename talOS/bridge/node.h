@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -80,7 +81,9 @@ class HardwareNode {
   // echoed probe (now_us itself), /hw/status, each merged owner's timeout,
   // and the command heartbeat while one would be sent. Each is solved from
   // the condition Tick tests. A duty already due at now_us, which that Tick
-  // could not do (a failed send), is retried kRetryUs later.
+  // could not do (a failed send), is retried kRetryUs later. While the UDP
+  // socket is closed (SocketCounters) the probe and the command, which
+  // cannot be sent, give way to its reopen.
   uint64_t NextDutyUs(uint64_t now_us) const;
   // What Run() does after a Pass(): wait until `until_us` (bridge clock),
   // returning early on input unless `ignore_input`, when the CPU budget is
@@ -114,9 +117,13 @@ class HardwareNode {
   // it to reach the polling fallback). `arm_request` stands in for
   // Subscriber::arm_wake in Pass() (a test reports unread data no read
   // returns, to reach the kMaxIdlePasses guard).
+  // `send_error`, when set, is asked before each send to the gateway: a
+  // nonzero errno fails that send with it, unsent, as if the OS had
+  // returned it (a test reaches the errors a loopback socket never gives).
   struct Seams {
     WakeReceiver (*make_wake_receiver)(){nullptr};
     bool (*arm_request)(ipc::Subscriber<Packet>& subscriber){nullptr};
+    int (*send_error)(){nullptr};
   };
   void set_seams(Seams seams) { seams_ = seams; }
 
@@ -155,6 +162,29 @@ class HardwareNode {
     uint64_t wait_fallbacks{0};
   };
   const Wakeups& wakeups() const { return wakeups_; }
+
+  // The UDP socket to the gateway. A send that fails with an error the
+  // socket never recovers from (SocketCannotSend in node.cc: EPIPE,
+  // ENOTCONN, EDESTADDRREQ, EADDRNOTAVAIL, EBADF) closes it; Tick() then
+  // opens a new one on the same ports (RuntimeUdpPeer::Reopen): the first
+  // attempt on the next Tick (NextDutyUs: kRetryUs later at the latest),
+  // then at most once per kReopenRetryUs.
+  // While it is closed nothing is sent or received, so the gateway times
+  // the command out and /hw/status's state_age_us grows, as for any lost
+  // link. Any other send error (ECONNREFUSED while the gateway is down,
+  // ENETDOWN, ENETUNREACH, EHOSTUNREACH, ENOBUFS) keeps the socket: it
+  // clears by itself, and the failed duty is retried kRetryUs later.
+  // stderr gets one line when an outage starts, with its errno, and one when
+  // a send succeeds again. Read only while Run() is not running.
+  struct SocketCounters {
+    uint64_t send_failures{0};  // sends that failed, of either kind
+    int last_send_error{0};     // the errno of the last; 0 before one
+    uint64_t reopens{0};        // sockets opened to replace a lost one
+  };
+  const SocketCounters& socket_counters() const { return socket_counters_; }
+  // The socket's fd, -1 while it is closed (a test breaks it through this).
+  int udp_fd() const { return peer_.NativeFd(); }
+  static constexpr uint64_t kReopenRetryUs = 100'000;
 
   bool is_configured() const { return is_configured_; }
   uint64_t states_received() const { return states_received_; }
@@ -241,6 +271,17 @@ class HardwareNode {
   // from the last send, otherwise only on the bounded heartbeat. Timeout
   // neutralization changes the merge, so it always sends immediately.
   bool ShouldSendCommand(uint64_t now_us);
+  // Every frame to the gateway leaves here: a send that fails with an error
+  // the socket never recovers from closes it (SocketCounters). Returns the
+  // send's status; kSocketError while the socket is closed.
+  protocol::UdpStatus SendToGateway(protocol::FrameType type, uint64_t now_us,
+                                    const void* payload,
+                                    std::size_t payload_size);
+  // Opens the replacement socket once one is due (SocketCounters), and
+  // watches it in Run()'s poller.
+  void ReopenSocket(uint64_t now_us);
+  // OpenWaits()'s fallback: no poller, inputs polled every kRetryUs.
+  void FallBackToPolling(const char* reason);
   void LogPacket(uint16_t source_id, const Packet& packet, uint64_t now_us,
                  uint64_t sequence);
   // One stderr line per gateway boot naming its program and build (the
@@ -305,6 +346,14 @@ class HardwareNode {
   // on its inputs and polls them instead.
   uint64_t max_wait_us_{kMaxWaitUs};
   Wakeups wakeups_{};
+  SocketCounters socket_counters_{};
+  // An outage: from a send that closed the socket to the first send that
+  // succeeds after it.
+  bool socket_lost_{false};
+  // The last reopen attempt, on the bridge clock; none yet while
+  // !reopen_attempted_.
+  bool reopen_attempted_{false};
+  uint64_t last_reopen_us_{0};
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};

@@ -71,6 +71,15 @@ bool SetNonBlocking(uintptr_t socket_handle) {
 }
 #endif
 
+// A send that fails returns its error, never SIGPIPE: MSG_NOSIGNAL where it is
+// defined (Linux), SO_NOSIGPIPE on the socket where it is not (macOS;
+// ConfigureSocket), as talOS/rtms/wake.cc does. Windows raises no signal.
+#if defined(MSG_NOSIGNAL)
+constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+constexpr int kSendFlags = 0;
+#endif
+
 NativeSocket ToNativeSocket(uintptr_t socket_handle) {
   return static_cast<NativeSocket>(socket_handle);
 }
@@ -101,7 +110,13 @@ RuntimeUdpPeer::RuntimeUdpPeer(RuntimeUdpPeer&& other) noexcept
       next_send_sequence_(other.next_send_sequence_),
       stats_(other.stats_),
       tx_buffer_(other.tx_buffer_),
-      rx_buffer_(other.rx_buffer_) {}
+      rx_buffer_(other.rx_buffer_),
+      opened_(other.opened_),
+      local_address_(other.local_address_),
+      local_port_(other.local_port_),
+      remote_address_(other.remote_address_),
+      remote_port_(other.remote_port_),
+      options_(other.options_) {}
 
 RuntimeUdpPeer& RuntimeUdpPeer::operator=(RuntimeUdpPeer&& other) noexcept {
   if (this != &other) {
@@ -111,6 +126,12 @@ RuntimeUdpPeer& RuntimeUdpPeer::operator=(RuntimeUdpPeer&& other) noexcept {
     stats_ = other.stats_;
     tx_buffer_ = other.tx_buffer_;
     rx_buffer_ = other.rx_buffer_;
+    opened_ = other.opened_;
+    local_address_ = other.local_address_;
+    local_port_ = other.local_port_;
+    remote_address_ = other.remote_address_;
+    remote_port_ = other.remote_port_;
+    options_ = other.options_;
   }
   return *this;
 }
@@ -119,6 +140,7 @@ UdpStatus RuntimeUdpPeer::Open(const char* local_address, uint16_t local_port,
                                const char* remote_address, uint16_t remote_port,
                                const UdpSocketOptions& options) {
   Close();
+  opened_ = false;
   if (!EnsureSocketRuntime()) {
     return UdpStatus::kSocketError;
   }
@@ -128,7 +150,37 @@ UdpStatus RuntimeUdpPeer::Open(const char* local_address, uint16_t local_port,
   if (!local_ok || remote_address == nullptr || remote_address[0] == '\0') {
     return UdpStatus::kInvalidArgument;
   }
+  bool remote_ok = false;
+  const sockaddr_in remote =
+      MakeAddress(remote_address, remote_port, &remote_ok);
+  if (!remote_ok || remote.sin_addr.s_addr == htonl(INADDR_ANY)) {
+    return UdpStatus::kInvalidArgument;
+  }
+  local_address_ = local.sin_addr.s_addr;
+  local_port_ = local.sin_port;
+  remote_address_ = remote.sin_addr.s_addr;
+  remote_port_ = remote.sin_port;
+  options_ = options;
 
+  const UdpStatus status = OpenSocket();
+  if (status != UdpStatus::kOk) {
+    return status;
+  }
+  opened_ = true;
+  next_send_sequence_ = 1;
+  stats_ = {};
+  return UdpStatus::kOk;
+}
+
+UdpStatus RuntimeUdpPeer::Reopen() {
+  if (!opened_) {
+    return UdpStatus::kInvalidArgument;
+  }
+  Close();
+  return OpenSocket();
+}
+
+UdpStatus RuntimeUdpPeer::OpenSocket() {
   const uintptr_t new_socket =
       static_cast<uintptr_t>(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
   if (new_socket == kInvalidSocket) {
@@ -136,40 +188,37 @@ UdpStatus RuntimeUdpPeer::Open(const char* local_address, uint16_t local_port,
   }
   socket_ = new_socket;
 
-  UdpStatus status = ConfigureSocket(options);
+  const UdpStatus status = ConfigureSocket(options_);
   if (status != UdpStatus::kOk) {
     Close();
     return status;
   }
 
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  local.sin_addr.s_addr = local_address_;
+  local.sin_port = local_port_;
   if (bind(ToNativeSocket(socket_), reinterpret_cast<const sockaddr*>(&local),
            sizeof(local)) != 0) {
     Close();
     return UdpStatus::kSocketError;
   }
 
-  bool remote_ok = false;
-  const sockaddr_in remote =
-      MakeAddress(remote_address, remote_port, &remote_ok);
-  if (!remote_ok || remote.sin_addr.s_addr == htonl(INADDR_ANY)) {
-    Close();
-    return UdpStatus::kInvalidArgument;
-  }
-
-  if (options.connect_peer) {
+  if (options_.connect_peer) {
+    sockaddr_in remote{};
+    remote.sin_family = AF_INET;
+    remote.sin_addr.s_addr = remote_address_;
+    remote.sin_port = remote_port_;
     if (connect(ToNativeSocket(socket_),
                 reinterpret_cast<const sockaddr*>(&remote),
                 sizeof(remote)) != 0) {
       const int error = LastSocketError();
-      if (!options.non_blocking || !IsWouldBlockError(error)) {
+      if (!options_.non_blocking || !IsWouldBlockError(error)) {
         Close();
         return UdpStatus::kSocketError;
       }
     }
   }
-
-  next_send_sequence_ = 1;
-  stats_ = {};
   return UdpStatus::kOk;
 }
 
@@ -204,29 +253,7 @@ UdpStatus RuntimeUdpPeer::SendFrame(FrameType type, uint16_t flags,
     return UdpStatus::kInvalidArgument;
   }
 
-#if defined(_WIN32)
-  const int sent = send(ToNativeSocket(socket_),
-                        reinterpret_cast<const char*>(tx_buffer_.data()),
-                        static_cast<int>(actual_frame_size), 0);
-#else
-  const ssize_t sent =
-      send(ToNativeSocket(socket_), tx_buffer_.data(), actual_frame_size, 0);
-#endif
-  if (sent < 0) {
-    const int error = LastSocketError();
-    if (IsWouldBlockError(error)) {
-      return UdpStatus::kWouldBlock;
-    }
-    return UdpStatus::kSocketError;
-  }
-  if (static_cast<std::size_t>(sent) != actual_frame_size) {
-    return UdpStatus::kSocketError;
-  }
-
-  ++next_send_sequence_;
-  ++stats_.sent_frames;
-  stats_.sent_bytes += actual_frame_size;
-  return UdpStatus::kOk;
+  return Send(actual_frame_size);
 }
 
 uint8_t* RuntimeUdpPeer::MutablePayloadBuffer(std::size_t payload_size) {
@@ -249,22 +276,28 @@ UdpStatus RuntimeUdpPeer::SendBufferedFrame(FrameType type, uint16_t flags,
     return UdpStatus::kInvalidArgument;
   }
 
+  return Send(frame_size);
+}
+
+UdpStatus RuntimeUdpPeer::Send(std::size_t frame_size) {
 #if defined(_WIN32)
   const int sent = send(ToNativeSocket(socket_),
                         reinterpret_cast<const char*>(tx_buffer_.data()),
-                        static_cast<int>(frame_size), 0);
+                        static_cast<int>(frame_size), kSendFlags);
 #else
   const ssize_t sent =
-      send(ToNativeSocket(socket_), tx_buffer_.data(), frame_size, 0);
+      send(ToNativeSocket(socket_), tx_buffer_.data(), frame_size, kSendFlags);
 #endif
   if (sent < 0) {
     const int error = LastSocketError();
     if (IsWouldBlockError(error)) {
       return UdpStatus::kWouldBlock;
     }
+    stats_.last_send_error = error;
     return UdpStatus::kSocketError;
   }
   if (static_cast<std::size_t>(sent) != frame_size) {
+    stats_.last_send_error = 0;  // short, with no error to report
     return UdpStatus::kSocketError;
   }
 
@@ -321,6 +354,14 @@ UdpStatus RuntimeUdpPeer::TryReceive(DecodedFrame* out) {
 }
 
 UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
+#if defined(SO_NOSIGPIPE)
+  int no_sigpipe = 1;
+  if (setsockopt(ToNativeSocket(socket_), SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
+                 sizeof(no_sigpipe)) != 0) {
+    return UdpStatus::kSocketError;
+  }
+#endif
+
   if (options.reuse_address) {
     int enabled = 1;
     if (setsockopt(ToNativeSocket(socket_), SOL_SOCKET, SO_REUSEADDR,

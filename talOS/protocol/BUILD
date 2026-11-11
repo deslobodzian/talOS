@@ -37,6 +37,7 @@ cc_test(
     tags = ["exclusive"],
     deps = [
         ":protocol",
+        ":udp_test_helpers",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
