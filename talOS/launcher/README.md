@@ -690,8 +690,10 @@ hardware packet its size word and encoded bytes from the config's devices,
 not the 1436 B `hardware::Packet` (`/hw/state` once per gateway tick, the
 Driver Station and `/hw/status` at 50 Hz, `/hw/request/<node>` at its node's
 rate). The hardware bridge logs only the State it publishes and the commands
-it sends (at most one per actuator owner's request), so only those count for
-it. Byte topics are never logged. A member that did not answer `--describe`
+it sends, so only those count for it, the commands at one per actuator
+owner's request: the rate while owners change their demands. While they do
+not, the bridge sends only on a change of the oldest owner observation or its
+heartbeat, so its log keeps a longer tail than the others. Byte topics are never logged. A member that did not answer `--describe`
 weighs as the mean of the others, and every member gets at least the
 smallest share at which its log rotates (two segments of its prefix and
 largest record) while those fit in the budget. Restarts share their member's remaining budget, but never

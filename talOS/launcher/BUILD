@@ -384,6 +384,65 @@ cc_test(
     ],
 )
 
+# A session of members that log at very different rates, against the real
+# bridge and a gateway in the test process: every capped log keeps about the
+# same tail (REQ-OPS-32).
+talos_cc_node(
+    name = "budget_fast",
+    srcs = ["testdata/budget_motor.cc"],
+    node_name = "budget_fast",
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/devices"],
+)
+
+talos_cc_node(
+    name = "budget_slow",
+    srcs = ["testdata/budget_motor.cc"],
+    node_name = "budget_slow",
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/devices"],
+)
+
+talos_cc_node(
+    name = "budget_listener",
+    srcs = ["testdata/budget_listener.cc"],
+    node_name = "budget_listener",
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/devices"],
+)
+
+cc_test(
+    name = "log_budget_test",
+    size = "medium",
+    srcs = ["log_budget_test.cc"],
+    data = [
+        ":budget_fast",
+        ":budget_listener",
+        ":budget_slow",
+        "//talOS/bridge:hardware_node",
+    ],
+    env = {
+        "TALOS_BRIDGE": "$(rlocationpath //talOS/bridge:hardware_node)",
+        "TALOS_BUDGET_FAST": "$(rlocationpath :budget_fast)",
+        "TALOS_BUDGET_SLOW": "$(rlocationpath :budget_slow)",
+        "TALOS_BUDGET_LISTENER": "$(rlocationpath :budget_listener)",
+    },
+    # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
+    # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
+    # The Linux sanitizer legs still run this test.
+    tags = ["no_macos_sanitizer"],
+    deps = [
+        ":launcher_lib",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/events:events_log",
+        "//talOS/hardware",
+        "//talOS/protocol",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 talos_cc_node(
     name = "alpha",
     srcs = ["testdata/construction_node.cc"],
