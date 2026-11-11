@@ -132,8 +132,8 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
   direction agree after the supervised spin. Record measured id, inversion and
   firmware. Do not reuse an unchecked placeholder.
 - [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling 4 V, node
-  `max_bench_voltage_v = 2.0`, ratio 1.0, velocity ceiling 30 rps and provisional
-  slot0 gains (feedforward 0.12 V/rotor-rps). Expected: these match the bare
+  `max_bench_voltage_v = 2.0`, ratio 1.0, velocity ceiling 30 rps and slot0 gains
+  (measured feedforward 0.095 V/rotor-rps). Expected: these match the bare
   motor and power source. Record reviewed limits; raise deliberately only after
   the first spin, never to hide a fault.
 - [ ] Only a human, after those checks, sets commissioning true in the base
