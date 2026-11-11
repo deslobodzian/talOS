@@ -55,8 +55,17 @@ int main(int argc, char** argv) {
       }
       return document;
     };
-    // A [trajectories] file is a dependency too, so the bundle ships it.
-    auto data = [&](const std::string& path) { track(path); };
+    // A [trajectories] file is a dependency too, so the bundle ships it. A
+    // path that has no Bazel label names the entry that set it.
+    auto data = [&](const std::string& path, const std::string& label) {
+      try {
+        track(path);
+      } catch (const std::invalid_argument& error) {
+        const std::string message = error.what();
+        if (message.starts_with("UNLISTED:")) throw;
+        throw std::invalid_argument(label + ": " + message);
+      }
+    };
     auto effective = talos::config::ResolveRobotConfig(config, read, data);
     // Manifest/scaffold planning accepts incomplete hardware inventories while
     // sharing all parsing and schema validation with the launcher.

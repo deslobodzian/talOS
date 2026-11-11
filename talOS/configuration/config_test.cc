@@ -417,6 +417,7 @@ TEST_F(ManifestTest, RefusesABadTrajectoryEntryNamingTheFileAndKey) {
     const char* name;
     const char* section;
     std::vector<std::string> named;  // what the error must contain
+    bool top_level = false;  // a bare key, so written before [subsystem]
   };
   const Case cases[] = {
       {"missing file",
@@ -432,15 +433,24 @@ TEST_F(ManifestTest, RefusesABadTrajectoryEntryNamingTheFileAndKey) {
       {"not a segment name",
        "[trajectories]\nTwoPiece = \"a.traj\"\n",
        {"trajectories.TwoPiece"}},
-      {"not a table", "trajectories = \"a.traj\"\n", {"'trajectories'"}},
+      {"not a table",
+       "trajectories = \"a.traj\"\n",
+       {"'trajectories'"},
+       /*top_level=*/true},
       {"singular section",
        "[trajectory]\ntwo_piece = \"a.traj\"\n",
        {"'trajectory'"}},
+      // Merged into the subsystem's table and then replaced by a top-level
+      // [trajectories], it would be resolved and bundled but never read.
+      {"under the header",
+       "[subsystem.trajectories]\ntwo_piece = \"a.traj\"\n",
+       {"[subsystem.trajectories]"}},
   };
   for (const auto& c : cases) {
     SCOPED_TRACE(c.name);
+    const std::string header = "[subsystem]\nname = \"auto\"\n";
     Write("subsystems/auto.toml",
-          std::string("[subsystem]\nname = \"auto\"\n") + c.section);
+          c.top_level ? c.section + header : header + c.section);
     try {
       ParseRobotConfig(Robot());
       ADD_FAILURE() << "accepted";

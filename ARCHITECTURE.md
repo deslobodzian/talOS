@@ -306,9 +306,12 @@ parameters by reading them in its constructor (`param`, `param_of`), which
 its `--describe` reports, and the launcher refuses a key no node read
 ([parameter keys](talOS/launcher/README.md#parameter-keys)).
 `[trajectories]` maps a name to a data file (a Choreo `.traj`), its path
-relative to the file that sets it; config load refuses a missing file, a
-non-string path or a name that is not a topic segment, naming the file and
-`trajectories.<name>`, and a node opens it by name
+relative to the file that sets it (a subsystem file's entry overrides its
+defaults file's, and only the effective entries are required and bundled);
+config load refuses a missing file, a non-string or empty path, a name that
+is not a topic segment, a section that is not a table and a
+`[subsystem.trajectories]` under a subsystem file's header, naming the file
+and `trajectories.<name>`, and a node opens it by name
 (`RobotConfig::TrajectoryPath`, [talOS/trajectory](talOS/trajectory/README.md#using-it-from-a-node)).
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.

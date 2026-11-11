@@ -1,0 +1,9 @@
+# A [trajectories] entry the subsystem file overrides is not read: only the
+# effective entry is a dependency (and required), not its defaults' one.
+accept = true
+nodes = ["//bot/autonomous:node"]
+files = [
+    "shared/autonomous_defaults.toml",
+    "subsystems/autonomous.toml",
+    "trajectories/taxi.traj",
+]

@@ -377,12 +377,17 @@ inline void RequireTrajectoryFile(const std::string& where,
   }
 }
 
-// Rewrites `holder`'s [trajectories] paths relative to `file`'s directory and
-// requires each file. `data` sees each resolved path first, so a build tool
-// can list it (resolve.cc) before its absence is an error.
-template <typename DataFile>
-void ResolveTrajectories(toml::table& holder, const std::string& file,
-                         const std::string& where, DataFile& data) {
+// Where each [trajectories] entry (by name) was set, for the errors of the
+// check that runs once files are merged.
+using TrajectorySources = std::map<std::string, std::string>;
+
+// Rewrites `holder`'s [trajectories] paths relative to `file`'s directory,
+// validating each entry, and records into `sources` where each was set
+// (`where`). Existence is checked later, on the merged result, so an entry a
+// later file overrides is never required or listed.
+inline void RebaseTrajectories(toml::table& holder, const std::string& file,
+                               const std::string& where,
+                               TrajectorySources& sources) {
   namespace fs = std::filesystem;
   const fs::path base = fs::path(file).parent_path();
   for (auto& [name, path] : ReadTrajectories(holder, where)) {
@@ -392,39 +397,60 @@ void ResolveTrajectories(toml::table& holder, const std::string& file,
             .lexically_normal()
             .string();
     holder["trajectories"].as_table()->insert_or_assign(name, resolved);
-    data(resolved);
-    RequireTrajectoryFile(where, name, resolved);
+    sources.insert_or_assign(name, where);
   }
 }
 
-// A subsystem (or defaults) file: its top level and its [subsystem] header.
+// The effective entries of `holder`'s [trajectories] (already rebased):
+// `data` sees each path with its label (where it was set and
+// trajectories.<name>), so a build tool can list it (resolve.cc) before its
+// absence is an error; then the file must exist.
 template <typename DataFile>
-void ResolveSubsystemFileTrajectories(toml::table& document,
-                                      const std::string& file, DataFile& data) {
-  ResolveTrajectories(document, file, file, data);
-  if (auto* header = document["subsystem"].as_table()) {
-    ResolveTrajectories(*header, file, file + " [subsystem]", data);
+void RequireTrajectories(const toml::table& holder,
+                         const TrajectorySources& sources,
+                         const std::string& fallback, DataFile& data) {
+  for (const auto& [name, path] : ReadTrajectories(holder, fallback)) {
+    const auto source = sources.find(name);
+    const std::string& where =
+        source == sources.end() ? fallback : source->second;
+    data(path, where + ": trajectories." + name);
+    RequireTrajectoryFile(where, name, path);
   }
 }
 
-// The [subsystems.<name>] tables of one robot file.
-template <typename DataFile>
-void ResolveSubsystemTablesTrajectories(toml::table& document,
-                                        const std::string& file,
-                                        DataFile& data) {
+// [trajectories] belongs at a subsystem file's top level. Under its
+// [subsystem] header it would be merged into the subsystem's table and then
+// replaced by a top-level [trajectories], so it is refused, not dropped.
+inline void RefuseHeaderTrajectories(const toml::table& document,
+                                     const std::string& file) {
+  if (const auto* header = document["subsystem"].as_table();
+      header != nullptr && header->contains("trajectories")) {
+    throw std::invalid_argument(
+        file +
+        ": [subsystem.trajectories] is not read; put the entries in a "
+        "top-level [trajectories] table");
+  }
+}
+
+// The [subsystems.<name>] tables of one robot file: rebased, with where each
+// entry was set recorded per subsystem (a later call overrides).
+inline void RebaseSubsystemTablesTrajectories(
+    toml::table& document, const std::string& file,
+    std::map<std::string, TrajectorySources>& sources) {
   if (auto* subs = document["subsystems"].as_table()) {
     for (auto&& [name, value] : *subs) {
       if (auto* sub = value.as_table()) {
-        ResolveTrajectories(
-            *sub, file, file + " [subsystems." + std::string(name.str()) + "]",
-            data);
+        const std::string subsystem{name.str()};
+        RebaseTrajectories(*sub, file, file + " [subsystems." + subsystem + "]",
+                           sources[subsystem]);
       }
     }
   }
 }
 
 // The default DataFile: config load needs only each file's existence.
-inline void IgnoreDataFile(const std::string& /*path*/) {}
+inline void IgnoreDataFile(const std::string& /*path*/,
+                           const std::string& /*label*/) {}
 
 inline void MergeTables(toml::table& base, const toml::table& over) {
   for (auto&& [k, v] : over) {
@@ -1437,7 +1463,9 @@ inline toml::table ExpandManifest(const toml::array& manifest,
     const std::string file = resolve_entry_path(*rel_view);
     toml::table sub_file = read(file);
     CheckSubsystemFileKeys(sub_file, file);
-    ResolveSubsystemFileTrajectories(sub_file, file, data);
+    RefuseHeaderTrajectories(sub_file, file);
+    TrajectorySources sources;
+    RebaseTrajectories(sub_file, file, file, sources);
 
     auto* header = sub_file["subsystem"].as_table();
     if (!header || (*header)["name"].value<std::string_view>() != name) {
@@ -1464,11 +1492,22 @@ inline toml::table ExpandManifest(const toml::array& manifest,
     if (defaults_file) {
       toml::table merged = read(*defaults_file);
       CheckSubsystemFileKeys(merged, *defaults_file);
-      ResolveSubsystemFileTrajectories(merged, *defaults_file, data);
+      RefuseHeaderTrajectories(merged, *defaults_file);
+      TrajectorySources defaults_sources;
+      RebaseTrajectories(merged, *defaults_file, *defaults_file,
+                         defaults_sources);
+      // The subsystem file's entries override its defaults' entries.
+      for (auto& [entry, where] : sources) {
+        defaults_sources.insert_or_assign(entry, where);
+      }
+      sources = std::move(defaults_sources);
       MergeTables(merged, sub_file);
       sub_file = std::move(merged);
       header = sub_file["subsystem"].as_table();
     }
+    // Only the effective entries, after the defaults merge, are listed and
+    // required.
+    RequireTrajectories(sub_file, sources, file, data);
     toml::table view;
     for (auto&& [k, v] : *header) {
       if (k.str() != "name" && k.str() != "defaults") {
@@ -1489,8 +1528,10 @@ inline toml::table ExpandManifest(const toml::array& manifest,
 
 // Resolve once for runtime and build tools. Readers may track dependencies or
 // supply pending file contents without changing include/manifest semantics.
-// `data` sees every non-TOML file the config names ([trajectories]), resolved
-// against the file that names it, before config load requires it to exist.
+// `data(path, label)` sees every non-TOML file the config names (the
+// effective [trajectories] entries), resolved against the file that names
+// it, with a label naming that file and trajectories.<name>, before config
+// load requires it to exist.
 template <typename Reader = decltype(&detail::ParseTomlFile),
           typename DataFile = decltype(&detail::IgnoreDataFile)>
 inline toml::table ResolveRobotConfig(const std::string& path,
@@ -1499,7 +1540,11 @@ inline toml::table ResolveRobotConfig(const std::string& path,
   namespace fs = std::filesystem;
   toml::table tbl = read(path);
   detail::CheckTopLevelKeys(tbl);
-  detail::ResolveSubsystemTablesTrajectories(tbl, path, data);
+  // [subsystems.<name>.trajectories] in this file and its include: rebased
+  // now, required once the include is merged, so an entry this file
+  // overrides is never required.
+  std::map<std::string, detail::TrajectorySources> table_sources;
+  detail::RebaseSubsystemTablesTrajectories(tbl, path, table_sources);
   if (auto* manifest = tbl["subsystems"].as_array()) {
     detail::NormalizeManifestPaths(*manifest, path);
   }
@@ -1514,7 +1559,14 @@ inline toml::table ResolveRobotConfig(const std::string& path,
             .string();
     toml::table base = read(inc_file);
     detail::CheckTopLevelKeys(base);
-    detail::ResolveSubsystemTablesTrajectories(base, inc_file, data);
+    std::map<std::string, detail::TrajectorySources> base_sources;
+    detail::RebaseSubsystemTablesTrajectories(base, inc_file, base_sources);
+    for (auto& [subsystem, entries] : table_sources) {
+      for (auto& [entry, where] : entries) {
+        base_sources[subsystem].insert_or_assign(entry, where);
+      }
+    }
+    table_sources = std::move(base_sources);
     if (base.contains("include")) {
       throw std::invalid_argument("nested 'include' is not supported in " +
                                   inc_file);
@@ -1536,6 +1588,14 @@ inline toml::table ResolveRobotConfig(const std::string& path,
     }
     detail::MergeTables(base, tbl);
     tbl = std::move(base);
+  }
+  if (auto* subs = tbl["subsystems"].as_table()) {
+    for (const auto& [subsystem, entries] : table_sources) {
+      if (const auto* sub = (*subs)[subsystem].as_table()) {
+        detail::RequireTrajectories(
+            *sub, entries, path + " [subsystems." + subsystem + "]", data);
+      }
+    }
   }
   if (auto* manifest = tbl["subsystems"].as_array()) {
     tbl.insert_or_assign(
