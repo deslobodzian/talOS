@@ -1,6 +1,7 @@
 #include "talOS/mechanisms/position_mechanism.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <numbers>
@@ -75,6 +76,9 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
   }
 
   const hardware::MotorConfig& motor = MotorConfigOf(node, name);
+  // The fastest the motor can turn the mechanism, for telling a homing
+  // push's frame jump from motion.
+  max_velocity_rps_ = motor.max_velocity_rps;
   // One gravity source: the controller's slot g (with its gravity_type) or
   // gravity_v here, never both, or the mechanism gets twice the feedforward.
   if (gravity_v_ != 0 && motor.slots[static_cast<std::size_t>(slot_)].g != 0) {
@@ -137,10 +141,13 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
                   "must be less than the travel, max_rot - min_rot");
     }
     // A stop found no sooner than the minimum push plus the still time
-    // must leave time before the timeout faults.
-    if (homing_min_push_ + homing_stall_time_ >= homing_timeout_) {
+    // must leave time before the timeout faults, with a tick of slack at
+    // each end for when the push and the stillness are first seen.
+    if (homing_timeout_ <=
+        homing_min_push_ + homing_stall_time_ + 2 * node.period()) {
       params.fail("homing_timeout_us",
-                  "must exceed homing_min_push_us + homing_stall_us");
+                  "must exceed homing_min_push_us + homing_stall_us + 2 "
+                  "periods");
     }
   }
   if (homing_ == Homing::kAbsolute) {
@@ -148,25 +155,25 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
     absolute_rot_per_sensor_rot_ =
         params.number("absolute_rot_per_sensor_rot", 1.0);
     absolute_offset_rot_ = params.number("absolute_offset_rot", 0.0);
+    absolute_margin_rot_ = params.positive("absolute_margin_rot");
     // The CANcoder reads absolute position in [-0.5, 0.5) rotations (the
     // RoboRIO sets its discontinuity at 0.5), so the frame can name only
     // positions in the one sensor rotation around absolute_offset_rot. The
-    // whole travel must lie inside it, or a reading past the discontinuity
-    // names a position a rotation away.
+    // whole physical range, the travel plus absolute_margin_rot beyond each
+    // end for hard stops and overshoot, must lie strictly inside it, or a
+    // mechanism resting past an end reads across the discontinuity and
+    // takes a frame a rotation away.
     const double half_rot = 0.5 * std::abs(absolute_rot_per_sensor_rot_);
     const double low = absolute_offset_rot_ - half_rot;
     const double high = absolute_offset_rot_ + half_rot;
-    // Reading -0.5 maps to the low end for a positive ratio, to the high end
-    // for a negative one; the other end is never read.
-    const bool inside = absolute_rot_per_sensor_rot_ > 0
-                            ? min_rot_ >= low && max_rot_ < high
-                            : min_rot_ > low && max_rot_ <= high;
-    if (!inside) {
+    if (!(min_rot_ - absolute_margin_rot_ > low &&
+          max_rot_ + absolute_margin_rot_ < high)) {
       params.fail("absolute_offset_rot",
                   "with absolute_rot_per_sensor_rot maps sensor readings in "
                   "[-0.5, 0.5) to (" +
                       std::to_string(low) + ", " + std::to_string(high) +
-                      "); the travel min_rot..max_rot must lie inside it");
+                      "); min_rot - absolute_margin_rot .. max_rot + "
+                      "absolute_margin_rot must lie strictly inside it");
     }
   }
 
@@ -278,8 +285,8 @@ void PositionMechanism::update() {
                     std::isfinite(request_ff_v);
   if (!homed()) {
     // Only a goal homes: hold() has no position to hold in an unknown
-    // frame, so it is neutral, and so is losing the goal (which pauses the
-    // push but not the homing timeout).
+    // frame, so it is neutral, and so is losing the goal (which ends the
+    // push and its evidence, but not the homing timeout).
     if (!drives_home() || !live || request != Request::kGoal) {
       push_since_.reset();
       homing_still_since_.reset();
@@ -300,10 +307,22 @@ void PositionMechanism::update() {
 // faulted.
 bool PositionMechanism::home(Time now) {
   if (!homing_since_) homing_since_ = now;
+  // A position step faster than the motor can turn the mechanism in the
+  // time since the last push tick is a frame jump (a reset, a glitch), not
+  // motion: the push starts over from here, and its evidence with it.
+  if (push_since_ &&
+      std::abs(position_rot_ - push_last_rot_) >
+          max_velocity_rps_ *
+              std::chrono::duration<double>(now - push_last_at_).count()) {
+    push_since_.reset();
+    homing_still_since_.reset();
+  }
   if (!push_since_) {
     push_since_ = now;
     push_start_rot_ = position_rot_;
   }
+  push_last_rot_ = position_rot_;
+  push_last_at_ = now;
   // The timeout faults, and never homes, whatever else this tick shows.
   if (now - *homing_since_ >= homing_timeout_) {
     fault(PositionFault::kHomingTimeout);

@@ -62,6 +62,7 @@ name = "wrist"
 tolerance_rot = 0.01
 min_rot = 0.0          # a homed mechanism needs a finite travel
 max_rot = 0.4          # inside the sensor rotation around offset 0
+absolute_margin_rot = 0.05  # hard stops and overshoot beyond the travel
 homing = "absolute"
 absolute_sensor = "angle"
 
@@ -133,21 +134,24 @@ Homing sets the frame; until it holds the mechanism drives no goal. Only
 |---|---|---|
 | `"none"` | the motor's absolute frame; construction refuses a `"rezero"`-frame motor, which would never drive | |
 | `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
-| `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only once the current push has moved it `homing_min_travel_rot` from where that push began or has lasted `homing_min_push_us`, so a slow start is not taken for the stop; a goal lost mid-push ends the push, and its motion does not count for the next | the drive keys, `homing_stall_current_a` (A, required, > 0 and below the motor's `stator_limit_a`), `homing_min_push_us` (µs, required, > 0), `homing_min_travel_rot` (rot, required, > 0 and less than the travel); `homing_timeout_us` must exceed `homing_min_push_us + homing_stall_us` |
-| `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1), `absolute_offset_rot` (rot, default 0). The RoboRIO configures every CANcoder's discontinuity at 0.5, so it reads absolute position in [-0.5, 0.5) rotations (`PhoenixBackend.cpp`); the frame can name only the one sensor rotation `absolute_offset_rot ± 0.5·|absolute_rot_per_sensor_rot|` (the end a reading of -0.5 maps to included), and the travel `min_rot..max_rot` must lie inside it. The simulators do not wrap a CANcoder reading at 0.5 (TODO.md MECH-4), so the check is what keeps a sim-tested travel valid on the robot |
+| `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only once the current push has moved it `homing_min_travel_rot` from where that push began or has lasted `homing_min_push_us`, so a slow start is not taken for the stop; a goal lost mid-push ends the push, and its motion does not count for the next, and a one-tick position step faster than the motor's `max_velocity_rps` allows (a frame jump, not motion) starts the push over | the drive keys, `homing_stall_current_a` (A, required, > 0 and below the motor's `stator_limit_a`), `homing_min_push_us` (µs, required, > 0), `homing_min_travel_rot` (rot, required, > 0 and less than the travel); `homing_timeout_us` must exceed `homing_min_push_us + homing_stall_us` plus two node periods. Since stillness under load after the minimum push is taken as the stop, `homing_v` must be enough to move the mechanism against its worst-case load (friction, gravity, a held piece) anywhere in its travel; a push too weak to move it homes wherever it sticks |
+| `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1), `absolute_offset_rot` (rot, default 0), `absolute_margin_rot` (rot, required, > 0). The RoboRIO configures every CANcoder's discontinuity at 0.5, so it reads absolute position in [-0.5, 0.5) rotations (`PhoenixBackend.cpp`); the frame can name only the one sensor rotation `absolute_offset_rot ± 0.5·|absolute_rot_per_sensor_rot|`. The whole physical range must lie strictly inside it: the travel `min_rot..max_rot` widened by `absolute_margin_rot` at each end, which must cover the hard stops and any overshoot past the travel, since a mechanism resting just past the window reads across the discontinuity and takes a frame a whole sensor rotation away. The simulators do not wrap a CANcoder reading at 0.5 (TODO.md MECH-4), so the check is what keeps a sim-tested travel valid on the robot |
 
-Stall homing reads stator current: the physics simulator
+Stall homing reads stator current. Component tests set it with
+`SimHardware::set_motor(..., stator_current_a)`. The physics simulator
 (`sim_gateway --physics`) models it with back-EMF, so it peaks at stall and
-falls with speed, and component tests set it with
-`SimHardware::set_motor(..., stator_current_a)`.
+falls with speed, but scaled so that 12 V at stall draws `stator_limit_a`: a
+homing push of a volt or two draws a small fraction of the limit, so stall
+homing with a realistic `homing_stall_current_a` does not home there
+(TODO.md MECH-5).
 
 Drive keys, all required except `home_rot`: `homing_v` (V, nonzero, at most
 half the motor's `max_voltage`, pointing at `home_rot`, which must be the
 travel end that way: `min_rot` for a negative `homing_v`, `max_rot` for a
 positive one), `home_rot` (rot, default 0), `homing_timeout_us` (> 0),
 `homing_stall_rps` (rot/s, > 0), `homing_stall_us` (> 0). Homing drives
-`homing_v` only on a live goal; losing the goal pauses the push but not the
-timeout, which counts from the first push since the last zero or Driver
+`homing_v` only on a live goal; losing the goal ends the push (its motion
+evidence starts over with the next) but not the timeout, which counts from the first push since the last zero or Driver
 Station disable. The timeout always faults; it never homes. A device reset or
 a RoboRIO reboot that drops the zero sends the mechanism back to homing.
 

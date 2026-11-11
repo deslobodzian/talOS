@@ -183,11 +183,13 @@ class PositionMechanism {
   double homing_stall_current_a_{0};
   Duration homing_min_push_{};
   double homing_min_travel_rot_{0};
+  double max_velocity_rps_{0};  // the motor's, for frame-jump detection
   bool switch_closed_reads_{false};
   int home_samples_{1};
   double home_margin_rot_{0};
   double absolute_rot_per_sensor_rot_{1};
   double absolute_offset_rot_{0};
+  double absolute_margin_rot_{0};
   double stall_velocity_rps_{0};
   double stall_current_a_{0};
   Duration stall_time_{};
@@ -212,6 +214,8 @@ class PositionMechanism {
   std::optional<Time> homing_since_;  // first push since a zero or disable
   std::optional<Time> push_since_;    // start of the current, unbroken push
   double push_start_rot_{0};          // position where that push began
+  double push_last_rot_{0};           // position at the last push tick
+  Time push_last_at_{};
   std::optional<Time> homing_still_since_;
   std::optional<double> held_rot_;
   std::optional<double> goal_anchor_rot_;  // move timer restarts past it

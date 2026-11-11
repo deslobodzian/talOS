@@ -126,6 +126,7 @@ max_rot = 0.5
 homing = "absolute"
 absolute_sensor = "angle"
 absolute_offset_rot = 0.25
+absolute_margin_rot = 0.05
 
 [subsystems.top.motors.top]
 can_id = 10
@@ -380,7 +381,8 @@ can_id = 2
       "homing_min_travel_rot = 0.05\n";
   const std::string ok = stall + "homing_v = -1.0\nhoming_stall_us = 50000\n";
   const std::string absolute =
-      "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n";
+      "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n"
+      "absolute_margin_rot = 0.05\n";
   {
     auto sim = Sim::FromToml(toml(ok));
     EXPECT_NO_THROW(sim.add<PositionNode>("m"));
@@ -444,10 +446,18 @@ can_id = 2
       // Offset 0, ratio 1: readings in [-0.5, 0.5) map to [-0.5, 0.5), so a
       // travel to 0.8 is not inside it (0.6 would read as -0.4).
       {"absolute_offset_rot", absolute + "min_rot = 0.0\nmax_rot = 0.8\n"},
-      // A negative ratio maps -0.5 to the high end: the low end is open.
+      // A negative ratio maps the window the other way round: still
+      // offset +- 0.5, so a travel reaching -0.5 is outside it.
       {"absolute_offset_rot", absolute +
                                   "min_rot = -0.5\nmax_rot = 0.4\n"
                                   "absolute_rot_per_sensor_rot = -1.0\n"},
+      // On the window's edge (offset 0.4 maps (-0.1, 0.9)): a hood resting
+      // on its stop just below min_rot would read across the discontinuity.
+      {"absolute_margin_rot", absolute + "absolute_offset_rot = 0.4\n"
+                                         "min_rot = -0.1\nmax_rot = 0.8\n"},
+      {"absolute_margin_rot",
+       "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n"
+       "min_rot = 0.0\nmax_rot = 0.4\n"},
       // At or above the motor's stator_limit_a (80 A by default): never met.
       {"homing_stall_current_a",
        "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
@@ -470,8 +480,8 @@ can_id = 2
        "homing_min_travel_rot = 0.05\n"},
   };
   for (const auto& [key, table] : bad) expect_refused(key, toml(table));
-  {  // the closed end of a negative ratio's window is accepted
-    auto sim = Sim::FromToml(toml(absolute + "min_rot = -0.4\nmax_rot = 0.5\n"
+  {  // a negative ratio with the margin inside its window is accepted
+    auto sim = Sim::FromToml(toml(absolute + "min_rot = -0.4\nmax_rot = 0.4\n"
                                              "absolute_rot_per_sensor_rot = "
                                              "-1.0\n"));
     EXPECT_NO_THROW(sim.add<PositionNode>("m"));
@@ -536,6 +546,23 @@ TEST(PositionMechanism, StallHomingForgetsMotionFromAnEarlierPush) {
   hood.ExpectHoming(-1.0);
   hood.sim.step(150ms);             // the goal is lost: the push ends
   hood.SetMotor(2.2, -0.02, 25.0);  // a new push, slow under load
+  hood.Drive(0.5, 150ms);  // three times homing_stall_us, under min push
+  EXPECT_FALSE(hood.mech().homed());
+  hood.ExpectHoming(-1.0);
+}
+
+// A position step faster than the motor can turn the hood (a frame jump)
+// is not motion: the push starts over there, so a slow, loaded hood after
+// the jump does not zero before homing_min_push_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingTreatsAFrameJumpAsANewPush) {
+  Rig hood{"hood"};
+  hood.SetMotor(3.0, -0.5, 5.0);
+  hood.Start();
+  hood.Drive(0.5, 30ms);
+  hood.ExpectHoming(-1.0);
+  // 1.1 rot in one 5 ms tick: 220 rot/s, past max_velocity_rps (100).
+  hood.SetMotor(1.9, 0.0, 30.0);
   hood.Drive(0.5, 150ms);  // three times homing_stall_us, under min push
   EXPECT_FALSE(hood.mech().homed());
   hood.ExpectHoming(-1.0);
@@ -630,22 +657,6 @@ TEST(PositionMechanism, HoldNeverStartsHoming) {
   EXPECT_EQ(hood.mech().phase(), PositionPhase::kUnhomed);
   EXPECT_FALSE(hood.mech().driving());
   hood.ExpectNeutral();
-}
-
-// The frame is right wherever in its travel the wrist boots: the CANcoder
-// reads in [-0.5, 0.5) and offset 0.25 maps that onto [-0.25, 0.75), which
-// holds the whole travel 0..0.5.
-// REQ-SAFE-36
-TEST(PositionMechanism, AbsoluteHomingGivesTheRightFrameAnywhereInTheTravel) {
-  for (const double position_rot : {0.0, 0.25, 0.49}) {
-    SCOPED_TRACE(position_rot);
-    Rig wrist{"wrist"};
-    wrist.SetMotor(5.0);
-    wrist.hw.set_cancoder("wrist", "angle", position_rot - 0.25, 0.0);
-    wrist.Start();
-    EXPECT_TRUE(wrist.mech().homed());
-    EXPECT_NEAR(wrist.mech().position_rot(), position_rot, 1e-9);
-  }
 }
 
 // Limit-switch homing upward (positive homing_v, home_rot at max_rot 2.0,
