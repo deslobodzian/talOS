@@ -23,7 +23,6 @@
 
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/reflection.h"
-#include "flatbuffers/verifier.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
@@ -31,6 +30,7 @@
 #include "talOS/introspection/names.h"
 #include "talOS/node/access.h"
 #include "talOS/node/node.h"
+#include "talOS/schema/field_path.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
 #include "talOS/telemetry/frames.h"
@@ -40,13 +40,6 @@
 namespace talos::telemetry {
 
 namespace detail {
-
-template <class T>
-inline T Read(const std::uint8_t* data) {
-  T value;
-  std::memcpy(&value, data, sizeof value);
-  return value;
-}
 
 // The channel kind a reflected scalar travels as: integers keep their
 // width's exact value, floats become doubles.
@@ -76,47 +69,19 @@ inline ChannelKind KindOf(reflection::BaseType base) {
 // absence.
 inline bool ReadScalarRaw(reflection::BaseType base, const std::uint8_t* data,
                           std::uint64_t& raw) {
-  using reflection::BaseType;
-  const auto signed_raw = [](std::int64_t value) {
-    return static_cast<std::uint64_t>(value);
-  };
-  switch (base) {
-    case BaseType::Bool:
-      raw = Read<std::uint8_t>(data) != 0 ? 1 : 0;
+  if (schema::ScalarSize(base) == 0) return false;
+  const auto* bytes = reinterpret_cast<const std::byte*>(data);
+  switch (KindOf(base)) {
+    case Talos::Telemetry::ChannelKind_Bool:
+      raw = schema::ReadBool(base, bytes) ? 1 : 0;
       return true;
-    case BaseType::UByte:
-    case BaseType::UType:
-      raw = Read<std::uint8_t>(data);
-      return true;
-    case BaseType::Byte:
-      raw = signed_raw(Read<std::int8_t>(data));
-      return true;
-    case BaseType::Short:
-      raw = signed_raw(Read<std::int16_t>(data));
-      return true;
-    case BaseType::UShort:
-      raw = Read<std::uint16_t>(data);
-      return true;
-    case BaseType::Int:
-      raw = signed_raw(Read<std::int32_t>(data));
-      return true;
-    case BaseType::UInt:
-      raw = Read<std::uint32_t>(data);
-      return true;
-    case BaseType::Long:
-      raw = signed_raw(Read<std::int64_t>(data));
-      return true;
-    case BaseType::ULong:
-      raw = Read<std::uint64_t>(data);
-      return true;
-    case BaseType::Float:
-      raw = RawFromDouble(Read<float>(data));
-      return true;
-    case BaseType::Double:
-      raw = RawFromDouble(Read<double>(data));
+    case Talos::Telemetry::ChannelKind_Int:
+    case Talos::Telemetry::ChannelKind_UInt:
+      raw = static_cast<std::uint64_t>(schema::ReadInt64(base, bytes));
       return true;
     default:
-      return false;
+      raw = RawFromDouble(schema::ReadDouble(base, bytes));
+      return true;
   }
 }
 
@@ -533,17 +498,12 @@ class Telemetry {
                                   "' has no schema");
     }
 
-    flatbuffers::Verifier verifier{
-        reinterpret_cast<const std::uint8_t*>(source.bfbs.data()),
-        source.bfbs.size()};
-    if (!reflection::VerifySchemaBuffer(verifier)) {
+    const reflection::Schema* schema = schema::VerifySchema(source.bfbs);
+    if (schema == nullptr) {
       throw std::invalid_argument(
           "telemetry: failed to verify schema for pose topic '" + source.name +
           "'");
     }
-
-    const reflection::Schema* schema =
-        reflection::GetSchema(source.bfbs.data());
     const reflection::Object* object =
         schema->objects()->LookupByKey(source.schema.c_str());
     if (!object) {
@@ -638,16 +598,11 @@ class Telemetry {
   void ObserveDescribedTopic(const introspect::naming::SourceShape& source) {
     using talos::detail::NodeAccess;
 
-    flatbuffers::Verifier verifier{
-        reinterpret_cast<const std::uint8_t*>(source.bfbs.data()),
-        source.bfbs.size()};
-    if (!reflection::VerifySchemaBuffer(verifier)) {
+    const reflection::Schema* schema = schema::VerifySchema(source.bfbs);
+    if (schema == nullptr) {
       throw std::invalid_argument(
           "telemetry: failed to verify schema for topic '" + source.name + "'");
     }
-
-    const reflection::Schema* schema =
-        reflection::GetSchema(source.bfbs.data());
     const reflection::Object* object =
         schema->objects()->LookupByKey(source.schema.c_str());
     if (!object) {

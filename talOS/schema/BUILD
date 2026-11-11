@@ -43,6 +43,29 @@ cc_test(
     ],
 )
 
+# talos::schema::ResolveField and friends: a struct's scalar fields by
+# slash-separated path from its .bfbs, encoded from configuration values
+# (teleop) and read per tick (telemetry).
+cc_library(
+    name = "field_path",
+    srcs = ["field_path.cc"],
+    hdrs = ["field_path.h"],
+    deps = ["@flatbuffers//:runtime_cc"],
+)
+
+cc_test(
+    name = "field_path_test",
+    size = "small",
+    srcs = ["field_path_test.cc"],
+    deps = [
+        ":field_path",
+        ":identity",
+        ":test_messages",
+        "@flatbuffers//:runtime_cc",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The METHODOLOGY §6 unit suffixes the field-name lint checks against.
 cc_library(
     name = "unit_suffix",
