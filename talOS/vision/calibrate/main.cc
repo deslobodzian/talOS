@@ -17,11 +17,19 @@ int main(int argc, char** argv) {
   try {
     std::string directory, device, update, board;
     double interval = 1.0, seconds = 120;
+    // Live capture opens exactly this mode (or fails naming it); intrinsics
+    // hold only at the size the camera will run at.
+    talos::vision::CameraSourceConfig capture;
+    capture.width = 0;
+    capture.height = 0;
+    capture.fps = 0;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
       if (arg == "--help") {
-        std::cout << "calibrate_camera --images DIR | --device ID [--interval "
-                     "SECONDS] [--seconds SECONDS] [--update FILE]\n"
+        std::cout << "calibrate_camera --images DIR | --device ID --width W "
+                     "--height H --fps F [--exposure-ms MS] [--gain G]\n"
+                     "    [--interval SECONDS] [--seconds SECONDS] "
+                     "[--update FILE]\n"
                      "calibrate_camera --board OUTPUT.png\n"
                      "calibrate_camera --list-devices\n";
         return 0;
@@ -62,6 +70,16 @@ int main(int argc, char** argv) {
         interval = std::stod(value);
       } else if (arg == "--seconds") {
         seconds = std::stod(value);
+      } else if (arg == "--width") {
+        capture.width = static_cast<uint32_t>(std::stoul(value));
+      } else if (arg == "--height") {
+        capture.height = static_cast<uint32_t>(std::stoul(value));
+      } else if (arg == "--fps") {
+        capture.fps = std::stod(value);
+      } else if (arg == "--exposure-ms") {
+        capture.exposure_ms = std::stod(value);
+      } else if (arg == "--gain") {
+        capture.gain = std::stod(value);
       } else {
         throw std::runtime_error("Unknown option: " + arg);
       }
@@ -92,8 +110,15 @@ int main(int argc, char** argv) {
         }
       }
     } else {
+      if (capture.width == 0 || capture.height == 0 || !(capture.fps > 0)) {
+        throw std::runtime_error(
+            "--device needs --width, --height and --fps: the mode the camera "
+            "will run at");
+      }
+      capture.device_path = device;
+      capture.auto_exposure = capture.exposure_ms == 0;
       talos::vision::FrameMailbox mailbox;
-      auto source = talos::vision::CreateCaptureSource(0, device);
+      auto source = talos::vision::CreatePlatformCameraSource(capture);
       if (!source) throw std::runtime_error("Unsupported capture platform");
       source->SetFrameCallback(
           [&](const auto& frame) { mailbox.Publish(frame); });
