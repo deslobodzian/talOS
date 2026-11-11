@@ -865,7 +865,20 @@ digest and runs with the reason each ended
 ([session manifest](#session-manifest)), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
-lateness, and every scalar `/hw/status` field.
+lateness, the bridge's request-to-command delay, and every scalar
+`/hw/status` field.
+The bridge has no timer (it sleeps until a datagram, a request or a duty is
+due), so it is measured instead by request to command: for each observation
+(`boot_id`, `observed_time_us`) a `/hw/command` carries, its first command's
+time minus the first `/hw/request/<node>` carrying it; a heartbeat repeating
+an observation, or a command no request carried, is not counted. Both times
+are stamped before the work (the requesting tick, the bridge pass), so a
+value can be slightly negative, and with several owners the merged
+observation can be an older request's, overstating it. The row is
+informational: REQ-RT-20's 1 ms bound is verified by the bridge's component
+test. The bridge's wake counters (`passes`, `throttled`, `wait_fallbacks`)
+are only in its exit line on stderr, in its [node output](#node-output) log,
+not in the report.
 Counter deltas sum nonnegative increments and separately count resets.
 `clock_offset_valid` includes its observed valid fraction. JSONL `log_dump`
 exports also carry `ds_enabled`, the Driver Station `hardware.enabled` bit,
@@ -889,7 +902,11 @@ Observers, nodes that never reported, and manifests that predate the fields
 (*NOT RECORDED*) are listed but not judged.
 It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
-lateness row is informational and not required.
+lateness and bridge request-to-command rows are informational and not
+required. The enabled-only verdicts (enabled state median, p99 and gaps,
+target age at tick) cannot be measured in a session that never enabled, and
+the report says so in one line; `--strict` still fails them, so acceptance
+needs an enabled session.
 
 Target receipt age is `now - publish_time` of a target MESSAGE dispatch, not
 target age at a control tick. Target age at the tick comes from the READ record

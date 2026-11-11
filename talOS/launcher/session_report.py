@@ -96,6 +96,33 @@ def realtime_issue(node, simulation):
             + realtime_summary(node))
 
 
+def request_to_command(records):
+    """The event-driven bridge's reaction to requests (REQ-RT-20), as
+    (process, delays): for each observation (boot_id, observed_time_us) a
+    merged /hw/command carries, its first command's time minus the first
+    /hw/request/<node> carrying it. A command repeating an observation (the
+    heartbeat) is no reaction, and one no request carried (a timeout's neutral
+    command adopting the State) is skipped."""
+    first_request, commands, process = {}, [], None
+    for r in records:
+        hardware = r.get("hardware")
+        if r["kind"] != "SEND" or not isinstance(hardware, dict) \
+                or "observed_time_us" not in hardware:
+            continue
+        key = (hardware.get("boot_id"), hardware["observed_time_us"])
+        if r["topic"].startswith("/hw/request/"):
+            first_request[key] = min(first_request.get(key, r["now_ms"]), r["now_ms"])
+        elif r["topic"] == "/hw/command":
+            commands.append((r["now_ms"], key))
+            process = r["process"]
+    delays, seen = [], set()
+    for now, key in sorted(commands, key=lambda c: c[0]):
+        if key not in seen and key in first_request:
+            delays.append(now - first_request[key])
+        seen.add(key)
+    return process, delays
+
+
 def analyze(manifest, records, log_damage=()):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
@@ -191,6 +218,13 @@ def analyze(manifest, records, log_damage=()):
     verdict("timer lateness", False, False,
             "Measured where TIMER dispatches exist; no acceptance threshold is specified.",
             required=False)
+    bridge, bridge_delays = request_to_command(records)
+    # The enabled-only rows above stay required (REQ-RT-15); in a session
+    # that never enabled they cannot be measured, which is no tool fault.
+    never_enabled = None
+    if not enabled and not any(r["ds_enabled"] for r in ds):
+        never_enabled = ("robot never enabled (no Driver Station packet with enabled set)"
+                         if ds else "no Driver Station packet recorded")
     issues = [] if manifest.get("end_wall_ns") else [
         "session unfinished (end_wall_ns = 0: no normal shutdown)"]
     # Only recording nodes (non-empty log_path) are acceptance evidence. Host
@@ -233,9 +267,12 @@ def analyze(manifest, records, log_damage=()):
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
             "target_age_at_tick": {k: stats(v) for k, v in sorted(tick_ages.items())},
             "timer_lateness": {k: stats(v) for k, v in sorted(timers.items())},
+            "bridge_request_to_command": {"process": bridge, "latency": stats(bridge_delays)},
+            "never_enabled": never_enabled,
             "status_stream": status_source, "status": status_summary, "verdicts": verdicts,
             "limitations": ["State timing is bridge IPC publication or one consumer dispatch stream, not raw UDP arrival; never pooled duplicate readers.",
                             "Enabled uses the logged DS enabled bit, held until its next observation; DS silence is not proof of continued physical enablement.",
+                            "Bridge request to command subtracts the requesting tick's time from the bridge pass's start, both stamped before the work, so a value can be slightly negative; with several owners the merged observation can be another owner's older request, overstating it.",
                             "Counter deltas exclude unknown increments before the first sample and during resets; clock mapping is not absolute synchronization.",
                             "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."]}
 
@@ -286,6 +323,9 @@ def markdown(report):
                **{"receipt " + k: v for k, v in report["target_receipt_age"].items()},
                **{"target at tick " + k: v for k, v in report["target_age_at_tick"].items()},
                **{"timer " + k: v for k, v in report["timer_lateness"].items()}}
+    bridge = report["bridge_request_to_command"]
+    if bridge["process"]:
+        entries["bridge request to command " + bridge["process"]] = bridge["latency"]
     for name, s in entries.items():
         lines.append(f"| {name} | " + ("NOT MEASURED | — | — | — |" if s is None else
                      f"{s['count']} | {s['median_ms']:.6g} | {s['p99_ms']:.6g} | {s['max_ms']:.6g} |"))
@@ -294,8 +334,16 @@ def markdown(report):
     if not report["target_age_at_tick"]:
         lines.append("Target age at tick: NOT MEASURED (no Target selected a lane).")
     for n in report["nodes"]:
-        if not any(k.startswith(n["name"] + ":") for k in report["timer_lateness"]):
+        if any(k.startswith(n["name"] + ":") for k in report["timer_lateness"]):
+            continue
+        if n["name"] == bridge["process"]:
+            # The bridge sleeps until a datagram, a request or a duty is due.
+            lines.append(f"{n['name']}: no timer (event-driven bridge); "
+                         "see bridge request to command.")
+        else:
             lines.append(f"{n['name']} timer lateness: NOT MEASURED (no TIMER dispatches).")
+    if not bridge["process"]:
+        lines.append("Bridge request to command: NOT MEASURED (no /hw/command SEND records).")
     lines += ["", "## /hw/status", f"Stream: {report['status_stream'] or 'NOT MEASURED'}"]
     for field, values in report["status"].items():
         lines.append(f"- {field}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
@@ -303,6 +351,10 @@ def markdown(report):
     lines += [f"- **{v['verdict']}** {v['measurement']}" +
               ("" if v["required"] else " (informational, not required)") + f": {v['detail']}"
               for v in report["verdicts"]]
+    if report["never_enabled"]:
+        lines.append("- Enabled state and target age at tick are NOT MEASURED: "
+                     f"{report['never_enabled']}; --strict still fails them, so "
+                     "acceptance needs an enabled session.")
     lines += ["", "## Measurement limits"] + ["- " + s for s in report["limitations"]]
     return "\n".join(lines)
 

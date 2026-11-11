@@ -40,6 +40,37 @@ class SessionReportTest(unittest.TestCase):
             self.assertEqual(report["nodes"][0]["exit_signal"], 9)
             self.assertEqual(verdicts["target age at tick"], "PASS")
 
+    # REQ-RT-20 (the bridge acts on a request when it arrives), REQ-OPS-16.
+    def test_disabled_session_of_an_event_driven_bridge(self):
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory, "disabled-bridge"], check=True)
+            result = subprocess.run([binary, "--strict", directory],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            report = json.loads(subprocess.run(
+                [binary, "--json", directory], capture_output=True, text=True,
+                check=True).stdout)
+        # The bridge has no timer: it is judged on the time from a request to
+        # the first command carrying its observation; the heartbeat that
+        # repeats an observation 20 ms later is not a reaction to a request.
+        bridge = report["bridge_request_to_command"]
+        self.assertEqual(bridge["process"], "hardware_node")
+        self.assertEqual(bridge["latency"]["count"], 5)
+        self.assertAlmostEqual(bridge["latency"]["max_ms"], 0.25)
+        self.assertNotIn("hardware_node timer lateness: NOT MEASURED", result.stdout)
+        # Never enabled: only the enabled-only rows stay unmeasured, each
+        # still failing --strict (REQ-RT-15), and the report says why.
+        self.assertEqual(sorted(line for line in result.stderr.splitlines()
+                                if line.startswith("session_report: strict:")),
+                         ["session_report: strict: enabled state gaps: NOT MEASURED",
+                          "session_report: strict: enabled state median: NOT MEASURED",
+                          "session_report: strict: enabled state p99: NOT MEASURED",
+                          "session_report: strict: target age at tick: NOT MEASURED"])
+        self.assertIn("robot never enabled", result.stdout)
+
     def test_strict_names_a_damaged_log_and_its_offset(self):
         files = runfiles.Create()
         fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
