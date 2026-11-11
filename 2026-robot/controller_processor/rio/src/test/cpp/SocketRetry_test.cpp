@@ -22,6 +22,7 @@ constexpr uint64_t kStartUs = 7'000'000;
 // The socket must open, and State leave, within one retry period and one
 // loop tick of the route appearing; the open reports how many attempts
 // failed since when, for the console line that times the outage.
+// REQ-OPS-28
 TEST(SocketRetry, OpensWithinOneRetryPeriodOfTheRouteAppearing) {
   constexpr uint64_t kRouteUpUs = kStartUs + 2'001'300;
   constexpr uint64_t kBoundUs = 100'000 + kLoopPeriodUs;

@@ -185,6 +185,7 @@ numbered section, a number in RULES a rule:
 | REQ-OPS-25 | The controller endpoint resolves `--remote` over `[robot] controller_address` and is passed to `hardware_node` explicitly, and a bundle records each node's binary, the config's hash and the source revision. | P1 | LR "Controller addressing", "Session manifest", "Building" | launcher output; manifests | unit + integration |
 | REQ-OPS-26 | `tlog_to_wpilog` converts the `.tlog` files of one session into one WPILOG that AdvantageScope reads: each publication is one value at its publish time, taken from the writer's log or else a reader's copy, fields are typed entries named by topic and field path, and a `geometry.Pose2d` is also a `double[]` pose array. Damaged records are skipped and a cut log converts its intact records; an unreadable input fails with an error naming the file, an unwritable output fails before any input is read, and a failed conversion leaves no partial output and a previous output at that path unchanged. | P2 | LR "Converting a session to WPILOG" | `.wpilog` entries, timestamps and values; exit code; output file | unit |
 | REQ-OPS-27 | The RoboRIO program sends to, and accepts frames only from, the companion address fixed when it is built (`-Pcompanion`, a dotted IPv4 literal; any other value, and `0.0.0.0`, fails the build at configuration; default the robot network's main-processor address), never one learned from a datagram, and prints it at start. | P1 | HR "RoboRIO" | build failure on an invalid address; console start line; frames from another host dropped by the connected socket | bench (RoboRIO build and console) |
+| REQ-OPS-28 | After a RoboRIO boot, the program opens its gateway socket, and so sends State, within 100 ms plus one loop tick of its network having a route to the companion: it retries the open every 100 ms without blocking its loop, and its console reports each failed attempt with its errno and the open with the failed-attempt count and elapsed time. | P1 | HR "RoboRIO" | open time against the route's appearance; failed-attempt count; console lines | unit (RoboRIO `phoenixTest`) |
 
 ### DEV: scaffold, simulation, describe-only, standalone subsystem, robot libraries
 
@@ -248,7 +249,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/main_processor/vision` | REQ-CONTRACT-27 |
 | `2026-robot/main_processor/simulation` | REQ-DEV-05, REQ-DEV-06; composition evidence for REQ-SAFE-31, REQ-SAFE-33 |
 | `2026-robot/main_processor/configuration`, `bench` | REQ-SAFE-26, REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15 |
-| `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 |
+| `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27, REQ-OPS-28 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
 | `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12 |
