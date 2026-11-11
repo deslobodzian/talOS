@@ -71,6 +71,16 @@ anywhere on the loop thread.
 See [Architecture: Targets](../ARCHITECTURE.md#targets) for drain scheduling
 and publication-age semantics.
 
+A callback costs a wake (a context switch) per publication, so give one only
+to a topic whose handler must run as the message arrives or must see every
+message in sequence (a Driver Station listener, the pose estimator's camera
+queues). A value read at the node's next tick or packet is a plain
+subscription read there: every drain, a wake's included, delivers its newest
+value, and `age()` still counts from publication. A drain delivers in
+registration order, so a listener that reads such a value sees the same
+drain's newest only if that subscription was opened first. The `driver`
+reads `/drivetrain/state` this way, so the drivetrain's ticks never wake it.
+
 ### Realtime scheduling
 
 On the robot (not `--sim`, `--describe` or `--replay`) a node binary runs its
