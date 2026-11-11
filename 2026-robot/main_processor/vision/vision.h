@@ -35,6 +35,7 @@
 #include "talOS/vision/field_sim/tag_rasterizer.h"
 #include "talOS/vision/frame_mailbox.h"
 #include "talOS/vision/pipeline.h"
+#include "talOS/vision/playback/recorded_source.h"
 #include "talOS/vision/recording/recorder.h"
 #include "talOS/vision/recording/recording.h"
 #include "vision/data/field_layout_2026.h"
@@ -62,7 +63,7 @@ class Vision {
         state_(node.publish<geometry::PoseObservation>("state")),
         status_(node.publish<VisionStatus>("status")) {
     source_factory_ = factory ? std::move(factory)
-                              : talos::vision::CreatePlatformCameraSource;
+                              : talos::vision::playback::CreateCameraSource;
     if (simulated_) {
       truth_.emplace(node.subscribe<geometry::OdometrySample>(
           sim::topics::kState, {.optional = true}));
