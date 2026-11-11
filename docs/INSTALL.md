@@ -86,9 +86,9 @@ bazel test //...
 ./sim.sh --sim-gateway --no-studio
 ```
 
-The CI workflow's `sanitizers` job runs the C++ suite with AddressSanitizer +
-UndefinedBehaviorSanitizer and ThreadSanitizer, with one leg per sanitizer on
-Linux and on macOS. Run sanitizer builds in their own output
+CI runs the C++ suite with AddressSanitizer + UndefinedBehaviorSanitizer and
+ThreadSanitizer, one leg per sanitizer: on Linux on every push
+(`continuous-integration.yaml`), on macOS nightly (`nightly.yaml`). Run sanitizer builds in their own output
 bases so they do not evict the default build's cache (`--config=asan`/`tsan` already filter the
 `no_asan`/`no_tsan` tags):
 
@@ -109,7 +109,7 @@ Tests loading native libraries into an uninstrumented Python process via ctypes
 carry `no_asan` and `no_tsan`, with the reason beside each BUILD tag.
 `talOS/launcher` session tests that time fork-heavy launches carry
 `no_macos_sanitizer`: under macOS ASan/TSan one `fork()` costs about 30/375 ms,
-so their windows cannot hold. The macOS CI legs filter that tag (locally, add
+so their windows cannot hold. The nightly macOS sanitizer legs filter that tag (locally, add
 `--test_tag_filters=-no_asan,-no_macos_sanitizer` or the `tsan` equivalent);
 the Linux legs run them. No
 project-code sanitizer findings are suppressed. Linux `metal` tests exercise CPU
