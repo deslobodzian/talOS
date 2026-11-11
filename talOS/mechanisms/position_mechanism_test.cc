@@ -532,6 +532,25 @@ TEST(PositionMechanism, StallHomingSetsTheFrameWhereTheMechanismStopped) {
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);  // 0.5 above the stop
 }
 
+// REQ-SAFE-05: a stall-homing rezero refused for a late motor position
+// (20 ms old, over RezeroAgeBound's 10 ms at 200 Hz, yet valid at the
+// gateway) is not home: the push goes on, and the frame is taken as soon
+// as a recent position arrives.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingKeepsPushingWhileTheRezeroIsRefused) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.3, -0.5, 5.0);
+  hood.Start();
+  hood.Drive(0.5, 60ms);
+  hood.hw.set_motor("hood", "hood", 2.0, 0.0, 20'000, 0, 0, 0, 30.0);
+  hood.Drive(0.5, 70ms);  // still under load past homing_stall_us
+  hood.ExpectHoming(-1.0);
+  hood.SetMotor(2.0, 0.0, 30.0);
+  hood.Drive(0.5, 10ms);
+  EXPECT_TRUE(hood.mech().homed());
+  EXPECT_NEAR(hood.mech().position_rot(), 0.0, 1e-9);
+}
+
 // Motion belongs to the push that made it: a push that moved the hood, then
 // a released goal leaving it 0.2 rot above its stop, then a new push that
 // starts slowly under load does not zero before homing_min_push_us.
@@ -710,6 +729,29 @@ TEST(PositionMechanism, AbsoluteHomingFollowsTheCancoderAcrossAReset) {
   EXPECT_TRUE(wrist.mech().homed());
   EXPECT_EQ(wrist.Applied().mode, Mode::kMotionMagic);
   EXPECT_NEAR(wrist.Applied().demand, 1.0, 1e-9);
+}
+
+// REQ-SAFE-05: absolute homing pairs the motor's position with the
+// CANcoder's, so it takes the frame only from samples acquired within
+// RezeroAgeBound (10 ms at 200 Hz) of each other. With the CANcoder 30 ms
+// behind (late, yet valid at the gateway) a wrist turning at 1 rot/s would
+// take a frame 0.03 rot off: it stays unhomed and neutral, and homes once
+// the samples line up.
+// REQ-SAFE-36
+TEST(PositionMechanism, AbsoluteHomingWaitsForAlignedSamples) {
+  Rig wrist{"wrist"};
+  wrist.SetMotor(5.0, 1.0);
+  wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, 30'000, 0);
+  wrist.Start();
+  wrist.Drive(0.35, 80ms);  // the bridge's clock mapping converges in it
+  EXPECT_EQ(wrist.mech().phase(), PositionPhase::kUnhomed);
+  wrist.ExpectNeutral();
+
+  wrist.hw.set_cancoder("wrist", "angle", 0.1, 1.0, 4'000, 0);
+  wrist.Drive(0.35, 20ms);
+  EXPECT_TRUE(wrist.mech().homed());
+  EXPECT_NEAR(wrist.mech().position_rot(), 0.35, 1e-9);
+  EXPECT_EQ(wrist.Applied().mode, Mode::kMotionMagic);
 }
 
 // A goal short of the target that stops moving faults (stall), latched

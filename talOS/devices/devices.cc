@@ -406,6 +406,12 @@ void RequireInUpdate(const Node& node, std::string_view what) {
   }
 }
 
+Duration RezeroAgeBound(const hardware::Config& config) {
+  constexpr double kStatusPeriods = 2;
+  return std::chrono::microseconds{
+      std::llround(kStatusPeriods * 1e6 / config.status_hz)};
+}
+
 std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
                                        std::string_view name) {
   HardwareLink::Impl& impl = *link.impl_;
@@ -527,8 +533,14 @@ void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
   const auto sample = FindSample(impl.state.motors, impl.state.motor_count,
                                  device.id, device.sample_index);
   const double offset = sample.position_rot - position_rot;
-  if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
-      std::isfinite(position_rot) && std::isfinite(offset)) {
+  // What a rezero pairs the position with (a switch, a stop, a constant, a
+  // CANcoder its caller checked) is as of the State, so the position must
+  // be too (RezeroAgeBound); an unknown age never is.
+  const bool recent = std::chrono::microseconds{sample.position_age_us} <=
+                      RezeroAgeBound(impl.config.hardware);
+  if (impl.Fresh() && sample.valid && recent &&
+      std::isfinite(sample.position_rot) && std::isfinite(position_rot) &&
+      std::isfinite(offset)) {
     device.position_offset = offset;
     device.zeroed = true;
   }

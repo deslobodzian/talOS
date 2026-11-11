@@ -224,8 +224,9 @@ int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
 // Monotonic per-device count of adjusted/neutralized motor setter calls.
 int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out);
-// Node-shared software offsets; ignored for disconnected/non-finite samples
-// or non-finite inputs. Motor goals translate to hardware coordinates before
+// Node-shared software offsets; ignored for disconnected/non-finite samples,
+// a motor position older than RezeroAgeBound (devices.h), or non-finite
+// inputs. Motor goals translate to hardware coordinates before
 // applying configured soft limits, which remain in the hardware frame.
 int32_t talos_motor_rezero(TalosNode* node, int64_t index, double position_rot);
 int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot);

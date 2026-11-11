@@ -5,7 +5,10 @@
 #include <cmath>
 #include <cstddef>
 #include <numbers>
+#include <optional>
 #include <string>
+
+#include "talOS/configuration/config_parser.h"
 
 namespace talos::mechanisms {
 namespace {
@@ -32,6 +35,12 @@ bool ParseMotionMagic(const Params& params) {
   if (value == "motion_magic") return true;
   if (value == "position") return false;
   params.fail("control", "must be \"motion_magic\" or \"position\"");
+}
+
+// Both acquisition times known and at most `bound` apart.
+bool Aligned(std::optional<Time> a, std::optional<Time> b, Duration bound) {
+  return a.has_value() && b.has_value() &&
+         (*a > *b ? *a - *b : *b - *a) <= bound;
 }
 
 Duration PositiveMicros(const Params& params, std::string_view key) {
@@ -79,6 +88,8 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
   // The fastest the motor can turn the mechanism, for telling a homing
   // push's frame jump from motion.
   max_velocity_rps_ = motor.max_velocity_rps;
+  rezero_skew_ =
+      RezeroAgeBound(node.extension<HardwareLink>().config().hardware);
   // One gravity source: the controller's slot g (with its gravity_type) or
   // gravity_v here, never both, or the mechanism gets twice the feedforward.
   if (gravity_v_ != 0 && motor.slots[static_cast<std::size_t>(slot_)].g != 0) {
@@ -255,7 +266,11 @@ void PositionMechanism::update() {
 
   // The frame. A switch zeroes only after home_samples consecutive closed
   // readings while unzeroed, so one glitch mid-travel does not; a CANcoder
-  // zeroes as soon as both read.
+  // zeroes as soon as both read samples acquired within rezero_skew_ of
+  // each other, so a late frame of either never sets a frame off by the
+  // mechanism's motion in between. A refused rezero (Motor::rezero also
+  // refuses a late motor position) leaves the motor unzeroed, so the next
+  // tick tries again.
   bool switch_closed = false;
   if (limit_switch_.has_value()) {
     switch_closed = limit_switch_->get() == switch_closed_reads_;
@@ -263,7 +278,9 @@ void PositionMechanism::update() {
     if (home_count_ >= home_samples_) motor_.rezero(home_rot_);
   }
   if (absolute_.has_value() && !motor_.zeroed() && connected_ &&
-      absolute_->connected()) {
+      absolute_->connected() &&
+      Aligned(motor_.position_time(), absolute_->position_time(),
+              rezero_skew_)) {
     motor_.rezero(absolute_->position() * absolute_rot_per_sensor_rot_ +
                   absolute_offset_rot_);
   }
@@ -351,11 +368,14 @@ bool PositionMechanism::home(Time now) {
                      now - *homing_still_since_ >= homing_stall_time_;
   if (homing_ == Homing::kStall && still) {
     motor_.rezero(home_rot_);  // pushed still against the stop: home
-    position_rot_ = motor_.position();
-    reset_homing_run();
-    return false;
-  }
-  if (still) {  // limit-switch homing pushing a mechanism that does not move
+    if (motor_.zeroed()) {
+      position_rot_ = motor_.position();
+      reset_homing_run();
+      return false;
+    }
+    // Refused (a late position, RezeroAgeBound): push on, keeping the
+    // stillness, and retry on the next tick.
+  } else if (still) {  // limit-switch homing pushing a still mechanism
     fault(PositionFault::kHomingStall);
     return true;
   }

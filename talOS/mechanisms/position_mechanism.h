@@ -184,6 +184,7 @@ class PositionMechanism {
   Duration homing_min_push_{};
   double homing_min_travel_rot_{0};
   double max_velocity_rps_{0};  // the motor's, for frame-jump detection
+  Duration rezero_skew_{};      // RezeroAgeBound: CANcoder vs motor sample
   bool switch_closed_reads_{false};
   int home_samples_{1};
   double home_margin_rot_{0};
