@@ -61,7 +61,8 @@ uint64_t SmallestRotatingShare(const introspect::Description& declared);
 // Shares of `budget` proportional to `rates` (negative: unknown, weighted as
 // the mean of the known), each at least floors[i] while the floors fit in the
 // budget (else in proportion to the floors); non-logging members get 0 and
-// every logging member at least 1 byte. The shares never exceed the budget.
+// every logging member at least 1 byte. The shares never exceed the budget
+// unless it is smaller than one byte per logging member.
 std::vector<uint64_t> SplitLogBudget(uint64_t budget,
                                      const std::vector<bool>& logs,
                                      const std::vector<double>& rates,

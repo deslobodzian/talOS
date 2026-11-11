@@ -693,7 +693,9 @@ rate). The hardware bridge logs only the State it publishes and the commands
 it sends, so only those count for it, the commands at one per actuator
 owner's request: the rate while owners change their demands. While they do
 not, the bridge sends only on a change of the oldest owner observation or its
-heartbeat, so its log keeps a longer tail than the others. Byte topics are never logged. A member that did not answer `--describe`
+heartbeat, so its log keeps a longer tail than the others; the model keeps
+that worst case because how often owners change their demands is not known
+at launch, and over-counting only lengthens the bridge's own tail. Byte topics are never logged. A member that did not answer `--describe`
 weighs as the mean of the others, and every member gets at least the
 smallest share at which its log rotates (two segments of its prefix and
 largest record) while those fit in the budget. Restarts share their member's remaining budget, but never
