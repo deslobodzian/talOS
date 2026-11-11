@@ -251,6 +251,7 @@ cc_test(
     deps = [
         ":@NAME@",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
@@ -481,6 +482,7 @@ CC_TEST = """\
 #include <sys/wait.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -495,6 +497,8 @@ namespace {
 
 using namespace std::chrono_literals;
 using talos::hardware::Mode;
+using talos::testing::AllocationProbe;
+using talos::testing::DriverStationGeneration;
 using talos::testing::DsPacket;
 using talos::testing::PublishTarget;
 using talos::testing::ReleaseTarget;
@@ -515,6 +519,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// The node test matrix, docs/TESTING.md §7: the case names are the matrix's,
+// which //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
  protected:
   using Target = @PASCAL@::Target;
@@ -526,15 +532,21 @@ class @PASCAL@Test : public ::testing::Test {
     hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
     sim.step(10ms);  // the mode is current before any lane arrives
   }
-  // Holds the teleop lane the way a producer does: republished every 20 ms.
-  void Hold(double demand, std::chrono::milliseconds duration) {
+  // Holds a lane the way a producer does: republished every 20 ms.
+  void Hold(double demand, std::chrono::milliseconds duration,
+            const char* source = "teleop") {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      PublishTarget(sim, "@NAME@", "teleop", Target{demand});
+      PublishTarget(sim, "@NAME@", source, Target{demand});
       sim.step(20ms);
     }
   }
+  // What the node asked for (the flush sends neutral for an unset motor).
   Mode Request() const {
     return hw.motor_request("@NAME@", "@NAME@_motor").mode;
+  }
+  // What the gateway applies, after its enable and expiry gates.
+  Mode Applied() const {
+    return hw.applied_motor("@NAME@", "@NAME@_motor").mode;
   }
   State Latest() const {
     const auto state = sim.latest<State>(topics::kState);
@@ -547,12 +559,13 @@ class @PASCAL@Test : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(@PASCAL@Test, DrivesTheMotorAtALiveLane) {
+// REQ-SAFE-07
+TEST_F(@PASCAL@Test, DrivesAtALiveLane) {
   hw.ideal_motors();
   Teleop();
   Hold(30.0, 60ms);
 
-  const auto request = hw.motor_request("@NAME@", "@NAME@_motor");
+  const auto request = hw.applied_motor("@NAME@", "@NAME@_motor");
   EXPECT_EQ(request.mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(request.demand, 30.0);
   const State state = Latest();
@@ -561,15 +574,18 @@ TEST_F(@PASCAL@Test, DrivesTheMotorAtALiveLane) {
   EXPECT_TRUE(state.connected());
 }
 
+// REQ-SAFE-02
 TEST_F(@PASCAL@Test, DisabledRobotGoesNeutral) {
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
   hw.enable(false);
   sim.step(10ms);
   Hold(30.0, 60ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_FALSE(Latest().enabled());
+  EXPECT_EQ(Applied(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -577,9 +593,11 @@ TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
 
   sim.step(150ms);  // past command_timeout_us: the lane is stale
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -590,6 +608,7 @@ TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
   EXPECT_EQ(Request(), Mode::kNeutral);
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
@@ -597,6 +616,7 @@ TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -607,11 +627,86 @@ TEST_F(@PASCAL@Test, DriverStationLossGoesNeutral) {
   EXPECT_EQ(Request(), Mode::kNeutral);
 }
 
+// REQ-CONTRACT-25
+TEST_F(@PASCAL@Test, DisconnectedFeedbackGoesNeutral) {
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Request(), Mode::kVelocity);
+
+  hw.set_connected("@NAME@", "@NAME@_motor", false);
+  Hold(30.0, 40ms);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  const State state = Latest();
+  EXPECT_FALSE(state.connected());
+  EXPECT_FALSE(state.enabled());
+}
+
+// REQ-SAFE-04
 TEST_F(@PASCAL@Test, NonFiniteDemandGoesNeutral) {
   Teleop();
   Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_FALSE(Latest().enabled());
+}
+
+// matrix: n/a 9 (the @NAME@ reads no parameters)
+
+// REQ-SAFE-07
+TEST_F(@PASCAL@Test, OtherModesLaneIsIgnored) {
+  Teleop();
+  Hold(30.0, 40ms, "auto");  // autonomous's lane, live, in teleop
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  ReleaseTarget<Target>(sim, "@NAME@", "auto");
+
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kAutonomous));
+  sim.step(10ms);
+  Hold(30.0, 40ms);  // teleop's lane, live, in autonomous
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  Hold(20.0, 40ms, "auto");
+  const auto request = hw.motor_request("@NAME@", "@NAME@_motor");
+  EXPECT_EQ(request.mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(request.demand, 20.0);
+}
+
+// REQ-SAFE-09
+TEST_F(@PASCAL@Test, EarlierGenerationTargetIsIgnored) {
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Request(), Mode::kVelocity);
+  const std::uint64_t before = DriverStationGeneration(sim);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  // Re-enabled. SimHardware publishes the packet at its next 20 ms hook,
+  // which the Sim runs after the node's tick at that instant, so the packet
+  // waits for the node's next drain; a target its producer queued under the
+  // earlier enable, published before that drain, arrives in the same one.
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(20ms);
+  ASSERT_NE(DriverStationGeneration(sim), before);
+  PublishTarget(sim, "@NAME@", "teleop", Target{30.0}, before);
+  sim.step(20ms);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  // The same target stamped with the current generation drives at once.
+  PublishTarget(sim, "@NAME@", "teleop", Target{30.0});
+  sim.step(20ms);
+  EXPECT_EQ(Request(), Mode::kVelocity);
+}
+
+// REQ-RT-06: the steady-state tick (target read, request, flush, state
+// publish) allocates nothing. The target is published before the window and
+// stays fresh through it (60 ms < command_timeout_us).
+TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Teleop();
+  Hold(30.0, 40ms);
+  PublishTarget(sim, "@NAME@", "teleop", Target{30.0});
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Request(), Mode::kVelocity);
 }
 
 struct Result {
@@ -668,6 +763,58 @@ CC_POSITION_FIXTURE = """\
     hw.set_motor("@NAME@", "@NAME@_motor", 0.0, -1.0);
   }
 };
+"""
+
+# Replaces CC_TEST's case 9 for a position mechanism, which reads parameters.
+CC_POSITION_PARAMETERS = """\
+// REQ-CONTRACT-18
+TEST(@PASCAL@Parameters, BadParameterFailsConstruction) {
+  // testdata/@NAME@.toml's values; each row drops or replaces one.
+  const char* const valid[][2] = {
+      {"max_position_rot", "100.0"},   {"homing_v", "-1.0"},
+      {"homing_timeout_us", "500000"}, {"homing_stall_rps", "0.1"},
+      {"homing_stall_us", "200000"},   {"home_margin_rot", "0.5"},
+  };
+  const struct {
+    const char* key;
+    const char* value;  // nullptr: the key is missing
+  } rows[] = {
+      {"max_position_rot", nullptr}, {"max_position_rot", "0.0"},
+      {"max_position_rot", "inf"},   {"homing_v", nullptr},
+      {"homing_v", "0.0"},           {"homing_timeout_us", nullptr},
+      {"homing_timeout_us", "0"},    {"homing_stall_rps", nullptr},
+      {"homing_stall_rps", "nan"},   {"homing_stall_us", nullptr},
+      {"homing_stall_us", "-1"},     {"home_margin_rot", nullptr},
+      {"home_margin_rot", "0.0"},    {"home_samples", "0"},
+  };
+  for (const auto& row : rows) {
+    const std::string setting = std::string{row.key} + " = " +
+                                (row.value != nullptr ? row.value : "missing");
+    SCOPED_TRACE(setting);
+    std::string toml =
+        "[robot]\\nperiod_us = 20000\\ncommand_timeout_us = 100000\\n"
+        "[subsystems.@NAME@]\\n";
+    for (const auto& [key, value] : valid) {
+      if (std::string{key} != row.key) {
+        toml += std::string{key} + " = " + value + "\\n";
+      }
+    }
+    if (row.value != nullptr) toml += setting + "\\n";
+    toml +=
+        "[subsystems.@NAME@.motors.@NAME@_motor]\\n"
+        "type = \\"TalonFX\\"\\ncan_id = 1\\nposition_frame = \\"rezero\\"\\n"
+        "[subsystems.@NAME@.digital_inputs.@NAME@_home]\\n"
+        "dio = 0\\n";
+    Sim sim = Sim::FromToml(toml);
+    try {
+      sim.add<@PASCAL@>("@NAME@");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
+  }
+}
 """
 
 CC_POSITION_TESTS = """\
@@ -1037,7 +1184,11 @@ class @PASCAL@:
 '''
 
 PY_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary."""
+"""Node tests: the class on talos.testing.Sim, and the binary.
+
+@PASCAL@Test is the node test matrix, docs/TESTING.md §7: the case names are
+the matrix's, which //tools:check_node_matrix looks for.
+"""
 
 import os
 import subprocess
@@ -1066,23 +1217,36 @@ class @PASCAL@Test(unittest.TestCase):
         self.hw.set_driver_station(enabled=True, teleop=True)
         self.sim.step(0.01)
 
-    def hold(self, demand, seconds):
-        """Republishes the teleop lane every 20 ms, as a producer does."""
+    def send(self, demand, source="teleop", mode_since_us=None):
+        """One target on a lane, stamped like a producer that has drained
+        the newest Driver Station packet, or with `mode_since_us`."""
+        self.sim.publish_target(@PASCAL@Target, "@NAME@", source,
+                                mode_since_us=mode_since_us,
+                                velocity_rps=demand)
+
+    def hold(self, demand, seconds, source="teleop"):
+        """Republishes a lane every 20 ms, as a producer does."""
         for _ in range(round(seconds / 0.02)):
-            self.sim.publish_target(@PASCAL@Target, "@NAME@", "teleop",
-                                    velocity_rps=demand)
+            self.send(demand, source)
             self.sim.step(0.02)
 
     def mode(self):
+        """What the node asked for (the flush sends neutral for an unset
+        motor)."""
         return self.hw.motor_request("@NAME@", "@NAME@_motor").mode
+
+    def applied(self):
+        """What the gateway applies, after its enable and expiry gates."""
+        return self.hw.applied_motor("@NAME@", "@NAME@_motor").mode
 
     def state(self):
         return self.sim.latest(@PASCAL@State, topics.STATE)
 
-    def test_live_lane_drives_the_motor(self):
+    # REQ-SAFE-07
+    def test_drives_at_a_live_lane(self):
         self.teleop()
         self.hold(30.0, 0.06)
-        request = self.hw.motor_request("@NAME@", "@NAME@_motor")
+        request = self.hw.applied_motor("@NAME@", "@NAME@_motor")
         self.assertEqual(request.mode, talos.Mode.VELOCITY)
         self.assertEqual(request.demand, 30.0)
         state = self.state()
@@ -1090,21 +1254,26 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertEqual(state.velocity_rps, 12.5)
         self.assertTrue(state.connected)
 
-    def test_disabled_robot_sends_neutral(self):
+    # REQ-SAFE-02
+    def test_disabled_robot_goes_neutral(self):
         self.teleop(enabled=False)
         self.hold(30.0, 0.06)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertFalse(self.state().enabled)
+        self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
+        self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    def test_stale_lane_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_stale_lane_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
         self.sim.step(0.15)  # past command_timeout_us
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    def test_released_lane_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_released_lane_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
@@ -1112,13 +1281,15 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim.step(0.04)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
 
-    def test_never_sent_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_never_sent_goes_neutral(self):
         self.teleop()
         self.sim.step(0.06)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
 
-    def test_driver_station_loss_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_driver_station_loss_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
@@ -1126,11 +1297,67 @@ class @PASCAL@Test(unittest.TestCase):
         self.hold(30.0, 0.16)  # past command_timeout_us: the DS is stale
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
 
-    def test_non_finite_demand_sends_neutral(self):
+    # REQ-CONTRACT-25
+    def test_disconnected_feedback_goes_neutral(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        self.hw.set_connected("@NAME@", "@NAME@_motor", False)
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        state = self.state()
+        self.assertFalse(state.connected)
+        self.assertFalse(state.enabled)
+
+    # REQ-SAFE-04
+    def test_non_finite_demand_goes_neutral(self):
         self.teleop()
         self.hold(float("nan"), 0.04)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
+
+    # matrix: n/a 9 (the @NAME@ reads no parameters)
+
+    # REQ-SAFE-07
+    def test_other_modes_lane_is_ignored(self):
+        self.teleop()
+        self.hold(30.0, 0.04, source="auto")  # autonomous's lane, in teleop
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.sim.release_target(@PASCAL@Target, "@NAME@", "auto")
+        self.hw.set_driver_station(enabled=True, autonomous=True)
+        self.sim.step(0.02)
+        self.hold(30.0, 0.04)  # teleop's lane, live, in autonomous
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.hold(20.0, 0.04, source="auto")
+        request = self.hw.motor_request("@NAME@", "@NAME@_motor")
+        self.assertEqual(request.mode, talos.Mode.VELOCITY)
+        self.assertEqual(request.demand, 20.0)
+
+    # REQ-SAFE-09
+    def test_earlier_generation_target_is_ignored(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        before = self.sim.driver_station_generation
+        self.hw.set_driver_station(teleop=True)  # disabled
+        self.sim.step(0.04)
+        # Re-enabled. SimHardware publishes the packet at its next 20 ms hook,
+        # which the Sim runs after the node's tick at that instant, so the
+        # packet waits for the node's next drain; a target its producer
+        # queued under the earlier enable, published before that drain,
+        # arrives in the same one.
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.02)
+        self.assertNotEqual(self.sim.driver_station_generation, before)
+        self.send(30.0, mode_since_us=before)
+        self.sim.step(0.02)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        # The same target stamped with the current generation drives at once.
+        self.send(30.0)
+        self.sim.step(0.02)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
 class BinaryTest(unittest.TestCase):
@@ -1155,6 +1382,40 @@ class BinaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+'''
+
+# Replaces PY_TEST's case 9 for a position mechanism, which reads parameters.
+PY_POSITION_PARAMETERS = '''\
+    # REQ-CONTRACT-18
+    def test_bad_parameter_fails_construction(self):
+        # testdata/robot.toml's values; each row drops or replaces one.
+        valid = {"max_position_rot": "100.0", "homing_v": "-1.0",
+                 "homing_timeout_us": "500000", "homing_stall_rps": "0.1",
+                 "homing_stall_us": "200000", "home_margin_rot": "0.5"}
+        rows = (("max_position_rot", None), ("max_position_rot", "0.0"),
+                ("max_position_rot", "inf"), ("homing_v", None),
+                ("homing_v", "0.0"), ("homing_timeout_us", None),
+                ("homing_timeout_us", "0"), ("homing_stall_rps", None),
+                ("homing_stall_rps", "nan"), ("homing_stall_us", None),
+                ("homing_stall_us", "-1"), ("home_margin_rot", None),
+                ("home_margin_rot", "0.0"), ("home_samples", "0"))
+        for key, value in rows:
+            with self.subTest(key=key, value=value):
+                settings = {**valid, key: value}
+                table = "".join(f"{k} = {v}\\n"
+                                for k, v in settings.items() if v is not None)
+                sim = Sim.from_toml(
+                    "[robot]\\nperiod_us = 20000\\n"
+                    "command_timeout_us = 100000\\n"
+                    f"[subsystems.@NAME@]\\n{table}"
+                    "[subsystems.@NAME@.motors.@NAME@_motor]\\n"
+                    'type = "TalonFX"\\ncan_id = 1\\n'
+                    'position_frame = "rezero"\\n'
+                    "[subsystems.@NAME@.digital_inputs.@NAME@_home]\\n"
+                    "dio = 0\\n")
+                with self.assertRaisesRegex((ValueError, talos.TalosError),
+                                            key):
+                    sim.add(node_py.@PASCAL@, "@NAME@")
 '''
 
 # Inserted into PY_TEST for a position mechanism before BinaryTest.
@@ -1568,6 +1829,7 @@ CC_ESTIMATOR_HEADER = """\
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -1596,6 +1858,10 @@ class @PASCAL@ {
         timeout_{std::chrono::microseconds{
             node.param<std::int64_t>("observation_timeout_us", 500'000)}},
         state_{node.publish<State>(topics::kState)} {
+    if (timeout_ <= talos::Duration::zero()) {
+      throw std::invalid_argument(
+          "@NAME@: observation_timeout_us must be positive");
+    }
     const auto names = node.param<std::vector<std::string>>("cameras");
     pending_.resize(names.size());
     for (std::size_t i = 0; i < names.size(); ++i) {
@@ -1700,6 +1966,7 @@ namespace @NAME@ {
 namespace {
 
 using namespace std::chrono_literals;
+using talos::testing::AllocationProbe;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
 
@@ -1716,6 +1983,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// The node test matrix for an observer, docs/TESTING.md §7: the case names
+// are the matrix's, which //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
  protected:
   using State = @PASCAL@::State;
@@ -1740,7 +2009,7 @@ class @PASCAL@Test : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(@PASCAL@Test, FollowsAUsableObservation) {
+TEST_F(@PASCAL@Test, PublishesFromALiveInput) {
   sim.step(20ms);
   Observe("front_camera", 1.0, 2.0);
   sim.step(40ms);
@@ -1760,7 +2029,8 @@ TEST_F(@PASCAL@Test, EstimatesWhileTheRobotIsDisabled) {
   EXPECT_DOUBLE_EQ(Latest().pose().x_m(), 3.0);
 }
 
-TEST_F(@PASCAL@Test, StaleInputIsInvalidAndHoldsThePose) {
+// REQ-CONTRACT-25
+TEST_F(@PASCAL@Test, StaleInputClearsValidity) {
   sim.step(20ms);
   Observe("front_camera", 1.0, 2.0);
   sim.step(40ms);
@@ -1801,6 +2071,50 @@ TEST_F(@PASCAL@Test, CountsEveryObservationBetweenTicks) {
   const State state = Latest();
   EXPECT_EQ(state.observation_accepted_count(), 2u);
   EXPECT_EQ(state.observation_rejected_count(), 1u);
+}
+
+// REQ-CONTRACT-18
+TEST(@PASCAL@Parameters, BadParameterFailsConstruction) {
+  const struct {
+    const char* key;
+    const char* settings;  // [subsystems.@NAME@]
+  } rows[] = {
+      {"cameras", "observation_timeout_us = 500000"},
+      {"cameras", "cameras = 3"},
+      {"observation_timeout_us",
+       "cameras = ['front_camera']\\nobservation_timeout_us = 0"},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.settings);
+    Sim sim = Sim::FromToml(
+        std::string{"[robot]\\nperiod_us = 20000\\ncommand_timeout_us = 100000\\n"
+                    "[subsystems.@NAME@]\\n"} +
+        row.settings +
+        "\\n[subsystems.chassis.motors.chassis_motor]\\n"
+        "type = 'TalonFX'\\ncan_id = 1\\n");
+    try {
+      sim.add<@PASCAL@>("@NAME@");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
+// REQ-RT-06: a tick that drains a queued observation, picks it and publishes
+// the estimate allocates nothing.
+TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  sim.step(40ms);
+  Observe("front_camera", 1.0, 2.0);
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Latest().observation_accepted_count(), 1u);
 }
 
 struct Result {
@@ -1882,6 +2196,9 @@ class @PASCAL@:
                            callback=lambda o, q=queue: self.queue(q, o),
                            optional=True)
         self.timeout_s = node.param("observation_timeout_us", 500_000) / 1e6
+        if not self.timeout_s > 0:
+            raise ValueError(
+                "@NAME@: observation_timeout_us must be positive")
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.pose = (0.0, 0.0, 0.0)  # held while no usable observation arrives
         self.sample_time_ns = 0
@@ -1922,7 +2239,12 @@ class @PASCAL@:
 '''
 
 PY_ESTIMATOR_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary."""
+"""Node tests: the class on talos.testing.Sim, and the binary.
+
+@PASCAL@Test is the node test matrix for an observer, docs/TESTING.md
+§7: the case names are the matrix's, which //tools:check_node_matrix looks
+for.
+"""
 
 import math
 import os
@@ -1955,7 +2277,7 @@ class @PASCAL@Test(unittest.TestCase):
     def state(self):
         return self.sim.latest(PoseEstimate, topics.STATE)
 
-    def test_follows_a_usable_observation(self):
+    def test_publishes_from_a_live_input(self):
         self.sim.step(0.02)
         self.observe("front_camera", 1.0, 2.0)
         self.sim.step(0.04)
@@ -1972,7 +2294,8 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertTrue(self.state().valid)
         self.assertEqual(self.state().pose_x_m, 3.0)
 
-    def test_stale_input_is_invalid_and_holds_the_pose(self):
+    # REQ-CONTRACT-25
+    def test_stale_input_clears_validity(self):
         self.sim.step(0.02)
         self.observe("front_camera", 1.0, 2.0)
         self.sim.step(0.04)
@@ -2008,6 +2331,26 @@ class @PASCAL@Test(unittest.TestCase):
         state = self.state()
         self.assertEqual((state.observation_accepted_count,
                           state.observation_rejected_count), (2, 1))
+
+    # REQ-CONTRACT-18
+    def test_bad_parameter_fails_construction(self):
+        for key, settings in (
+                ("cameras", "observation_timeout_us = 500000"),
+                ("cameras", "cameras = 3"),
+                ("observation_timeout_us",
+                 'cameras = ["front_camera"]\\nobservation_timeout_us = 0')):
+            with self.subTest(settings=settings):
+                sim = Sim.from_toml(
+                    "[robot]\\nperiod_us = 20000\\n"
+                    "command_timeout_us = 100000\\n"
+                    f"[subsystems.@NAME@]\\n{settings}\\n"
+                    "[subsystems.chassis.motors.chassis_motor]\\n"
+                    'type = "TalonFX"\\ncan_id = 1\\n')
+                with self.assertRaisesRegex((ValueError, talos.TalosError),
+                                            key):
+                    sim.add(node_py.@PASCAL@, "@NAME@")
+
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
 class BinaryTest(unittest.TestCase):
@@ -2092,6 +2435,7 @@ def estimator_files(name, lang):
                          "talOS/node/node.h"]
         test_includes = ["rules_cc/cc/runfiles/runfiles.h",
                          f"{name}/{name}.h", "talOS/devices/testing.h",
+                         "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(["testdata/robot.toml", ":node"],
@@ -2173,6 +2517,7 @@ def mechanism_files(name, lang, kind):
                          "talOS/devices/devices.h", "talOS/node/node.h"]
         test_includes = ["rules_cc/cc/runfiles/runfiles.h",
                          f"{name}/{name}.h", "talOS/devices/testing.h",
+                         "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
         data = ["testdata/robot.toml", f"testdata/{name}.toml", ":node"]
         build = fill(CC_BUILD, MESSAGES=messages,
@@ -2198,6 +2543,8 @@ def mechanism_files(name, lang, kind):
                  "  Teleop();\n"
                  "  SetHome(false);  // zeroed on the switch, it leaves it\n"
                  "  Hold(30.0, 60ms);\n"),
+                (f"// matrix: n/a 9 (the {name} reads no parameters)\n",
+                 fill(CC_POSITION_PARAMETERS, **values)),
                 ("struct Result {",
                  fill(CC_POSITION_TESTS, **values) + "struct Result {"),
             ])
@@ -2235,6 +2582,8 @@ def mechanism_files(name, lang, kind):
         if kind == "position":
             py_test = edited(py_test, [
                 ("velocity_rps=demand", "position_rot=demand"),
+                (f"    # matrix: n/a 9 (the {name} reads no parameters)\n",
+                 fill(PY_POSITION_PARAMETERS, **values)),
                 # A motor on its home switch zeroes after home_samples ticks.
                 ("        self.sim.step(0.01)\n",
                  "        self.sim.step(0.06)  # home_samples ticks on a switch\n"),

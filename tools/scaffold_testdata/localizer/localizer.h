@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,10 @@ class Localizer {
         timeout_{std::chrono::microseconds{
             node.param<std::int64_t>("observation_timeout_us", 500'000)}},
         state_{node.publish<State>(topics::kState)} {
+    if (timeout_ <= talos::Duration::zero()) {
+      throw std::invalid_argument(
+          "localizer: observation_timeout_us must be positive");
+    }
     const auto names = node.param<std::vector<std::string>>("cameras");
     pending_.resize(names.size());
     for (std::size_t i = 0; i < names.size(); ++i) {

@@ -192,8 +192,10 @@ Where RULES.md 12 is read too broadly or too narrowly:
 ## 7. The node test matrix
 
 Every node gets a `Sim`/`SimHardware` (C++) or `talos.testing` (Python) test
-file with these cases. New cases use these names (Python:
-`test_<snake_case>`) so a lint can find them. **[review; gap: MATRIX-1]**
+file with these cases, under these names (Python: `test_<snake_case>`).
+`bazel run //tools:check_node_matrix -- [PATH...]` reports each node test's
+cases as present, n/a or missing and fails on a missing one; CI does not run
+it yet, and existing nodes still miss cases. **[review; gap: MATRIX-1]**
 
 | # | Case | Arrange | Expect |
 |---|---|---|---|
@@ -215,8 +217,17 @@ Required cases by role:
 | Role | Cases |
 |---|---|
 | actuator node (owns a motor, DIO or PWM) | 1 to 12 |
-| producer (`TargetLane` writer: `driver`, `teleop`, `autonomous`) | 1; 2 and 6 as "releases its lanes"; 9; 11 as "disarms on a new generation"; 12 |
-| observer (`vision`, `pose_estimator`) | 1, 9, 12, and "publishes `state` with validity cleared when its input is stale" |
+| producer (`TargetLane` writer: `driver`, `teleop`, `autonomous`) | 1 as `SendsAtALiveInput`; 2 and 6 as `DisabledRobotReleasesItsLanes` and `DriverStationLossReleasesItsLanes`; 9; 11 as `NewGenerationDisarms`; 12 |
+| observer (`vision`, `pose_estimator`) | 1 as `PublishesFromALiveInput`; 3 as `StaleInputClearsValidity` (`state` still published, validity cleared, when its input is stale); 9; 12 |
+
+The lint checks the node packages under the robot, example, bench and
+scaffold directories and every package their configs' manifests launch. It
+takes the role from the package's sources (a `Motor`, `DigitalOutput` or
+`PwmOutput`: actuator; else a `TargetLane`, `OperatorArming` or
+`detail::TargetAccess`: producer; else observer). A
+`// matrix: role <role> (reason)` comment overrides it, never away from
+actuator; a Python package that only wraps C++ nodes (`talos.cpp_node`) is
+checked in its C++ package.
 
 A case that does not apply is a comment in the test file naming why:
 `// matrix: n/a 7 (no feedback device)`. Case 12 does not apply to:
@@ -245,10 +256,8 @@ producer that has drained it would.
 
 `bazel run //tools:new_subsystem` generates the matrix skeleton; its golden
 packages (`tools/scaffold_testdata/*`) are the reference, checked by
-`new_subsystem_test` **[enforced]**. The templates generate cases 1 to 6
-and 8, with case 1 named `DrivesTheMotorAtALiveLane` and the Python cases
-named `test_*_sends_neutral`; they lack cases 7, 9, 10 and 11, and both C++
-goldens lack case 12 (MATRIX-1).
+`new_subsystem_test` **[enforced]**, and every one has its whole matrix
+(`check_node_matrix_test` **[enforced]**).
 
 ## 8. Flakes
 
