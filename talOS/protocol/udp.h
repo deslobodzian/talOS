@@ -68,6 +68,11 @@ class RuntimeUdpPeer {
 
   bool IsOpen() const;
 
+  // The socket's file descriptor, for a poller to wait on until a datagram
+  // is readable (talos::event::Poller::add_fd); -1 while closed, and always
+  // -1 on Windows, whose SOCKET is no fd. The peer keeps ownership.
+  int NativeFd() const;
+
   UdpStatus SendFrame(FrameType type, uint16_t flags,
                       uint64_t monotonic_time_us, const void* payload,
                       std::size_t payload_size);

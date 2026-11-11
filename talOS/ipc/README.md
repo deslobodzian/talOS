@@ -29,6 +29,13 @@ Typed single-producer / multi-consumer pub/sub on top of
   gone, or by a later one while none is free (`registered()` is false
   meanwhile); messages published while the subscriber had no slot count in
   the next `Received::dropped`.
+- A subscriber can sleep on a `talos::WakeReceiver` instead of polling
+  ([RTMS "Wake channel"](../rtms/README.md#wake-channel)):
+  `set_wake_receiver(id)` names the receiver for its reader slot, and for
+  any slot it claims again after a freed one; `arm_wake()` asks for a
+  notification on the next publication and returns `true` only when it is
+  caught up, so `false` (unread data, or no slot held) means read instead
+  of sleeping.
 - The publisher passes `RTMSOptions::publisher`: a live publisher
   exclusively owns the topic; another publisher throws with the topic and
   both pids.

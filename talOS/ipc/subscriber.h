@@ -2,6 +2,7 @@
 
 #include <flatbuffers/flatbuffers.h>
 
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
@@ -61,6 +62,7 @@ class Subscriber {
         queue_{std::move(other.queue_)},
         reader_id_{std::exchange(other.reader_id_, std::nullopt)},
         rejoining_{std::exchange(other.rejoining_, false)},
+        wake_id_{std::exchange(other.wake_id_, 0)},
         next_sequence_{other.next_sequence_},
         lost_{other.lost_},
         failed_reads_{other.failed_reads_} {}
@@ -72,6 +74,7 @@ class Subscriber {
       queue_ = std::move(other.queue_);
       reader_id_ = std::exchange(other.reader_id_, std::nullopt);
       rejoining_ = std::exchange(other.rejoining_, false);
+      wake_id_ = std::exchange(other.wake_id_, 0);
       next_sequence_ = other.next_sequence_;
       lost_ = other.lost_;
       failed_reads_ = other.failed_reads_;
@@ -141,6 +144,18 @@ class Subscriber {
   std::uint64_t failed_reads() const { return failed_reads_; }
   RTMSQueue& queue() { return queue_; }
 
+  // Wake channel (talOS/rtms README.md "Wake channel"). Names the
+  // talos::WakeReceiver this subscriber's reader slot sleeps on, 0 for none;
+  // a slot claimed again after being freed names it too.
+  void set_wake_receiver(std::uint64_t wake_id) {
+    wake_id_ = wake_id;
+    if (reader_id_) queue_.set_reader_wake(*reader_id_, wake_id_);
+  }
+  // Asks for a notification on the next publication. True when caught up,
+  // so blocking on the receiver is safe; false when there is something to
+  // read, or while no reader slot is held (a read retries the claim).
+  bool arm_wake() { return reader_id_ && queue_.arm_wake(*reader_id_); }
+
  private:
   void release() {
     if (reader_id_) {
@@ -158,6 +173,8 @@ class Subscriber {
       return;
     }
     rejoining_ = false;
+    // A claimed slot names no receiver; the next arm covers the new slot.
+    if (wake_id_ != 0) queue_.set_reader_wake(*reader_id_, wake_id_);
     const std::uint64_t start = queue_.reader_sequence(*reader_id_);
     if (start > next_sequence_) {
       lost_ += start - next_sequence_;
@@ -171,6 +188,8 @@ class Subscriber {
   // Set from a freed slot until a rejoin succeeds; false in a moved-from
   // subscriber, which has no queue to claim one from.
   bool rejoining_{false};
+  // The wake receiver this end's slot names (set_wake_receiver), 0 for none.
+  std::uint64_t wake_id_{0};
   // The next undelivered sequence, and the messages published while this
   // end had no reader slot, owed to the next message's dropped count.
   std::uint64_t next_sequence_{0};

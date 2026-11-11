@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <memory>
@@ -8,11 +9,18 @@
 #include "ipc_test/ipc_test_message_generated.h"
 #include "publisher.h"
 #include "subscriber.h"
+#include "talOS/rtms/wake.h"
 
 namespace {
 
 std::string Topic(const char* name) {
   return std::string{"/ipc_"} + name + "_" + std::to_string(::getpid());
+}
+
+// Whether the receiver's fd turns readable within `ms`.
+bool WakePending(const talos::WakeReceiver& receiver, int ms) {
+  pollfd entry{.fd = receiver.fd(), .events = POLLIN, .revents = 0};
+  return ::poll(&entry, 1, ms) == 1 && (entry.revents & POLLIN) != 0;
 }
 
 }  // namespace
@@ -60,4 +68,34 @@ TEST(SubscriberTest, ASubscriberWhoseSlotIsFreedClaimsOneAgain) {
   EXPECT_EQ(received->dropped, 2u);      // 1 and 2, published without a slot
   EXPECT_FALSE(subscriber.read_next());  // caught up: not a failed read
   EXPECT_EQ(subscriber.failed_reads(), 1u);
+}
+
+// A subscriber that sleeps on a wake receiver must still be woken after
+// another process freed its reader slot: the slot it claims again starts
+// with no receiver, and a reader that armed it would otherwise sleep through
+// every publication.
+// REQ-RT-19
+TEST(SubscriberTest, AWakeReceiverOutlivesAFreedReaderSlot) {
+  const std::string topic = Topic("wake");
+  ipc::Publisher<IPCMessage::TestMessage> publisher{topic};
+  ipc::Subscriber<IPCMessage::TestMessage> subscriber{topic};
+  talos::WakeReceiver receiver;
+  subscriber.set_wake_receiver(receiver.id());
+
+  subscriber.queue().release_reader(
+      subscriber.reader_id().value_or(MAX_READERS));
+  ASSERT_EQ(publisher.write(IPCMessage::TestMessage{1, 0.0F}),
+            WriteResult::SUCCESS);
+  EXPECT_FALSE(subscriber.read_next());  // finds the slot freed, claims one
+  ASSERT_TRUE(subscriber.registered());
+  ASSERT_TRUE(subscriber.arm_wake()) << "caught up on the new slot";
+  receiver.drain();
+
+  ASSERT_EQ(publisher.write(IPCMessage::TestMessage{2, 0.0F}),
+            WriteResult::SUCCESS);
+  EXPECT_TRUE(WakePending(receiver, 10'000))
+      << "a publication after the arm woke nobody";
+  EXPECT_FALSE(subscriber.arm_wake()) << "one message unread";
+  EXPECT_TRUE(subscriber.read_next());
+  EXPECT_TRUE(subscriber.arm_wake());
 }

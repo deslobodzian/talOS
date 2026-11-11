@@ -32,7 +32,8 @@ decoding. Clock probes do not authorize actuation and work while disabled.
 `RuntimeUdpPeer` is the hot-path socket wrapper for both sides:
 
 - connected UDP, so the kernel filters packets from unexpected peers;
-- non-blocking by default for control-loop polling;
+- non-blocking by default: a loop waits for a datagram on `NativeFd()`
+  (POSIX) with its poller, then drains with `TryReceive()`;
 - fixed TX/RX packet buffers, no allocation per send or receive;
 - explicit sequence numbers and sequence-gap counters;
 - version/header validation before payload interpretation;

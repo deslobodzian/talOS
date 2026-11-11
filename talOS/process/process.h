@@ -51,10 +51,10 @@ struct RealtimeOptions {
 // by a loop; all above every SCHED_OTHER thread. Gaps leave room for a tier
 // between them.
 //
-// A node's event-loop tick waits in epoll_pwait2 (talOS/events
-// epoll_poller) and the bridge's in clock_nanosleep, sleeper hrtimers that
+// A node's event-loop tick, and the bridge between its inputs, waits in
+// epoll_pwait2 (talOS/events epoll_poller), a sleeper hrtimer that
 // PREEMPT_RT expires in hard interrupt context for a realtime thread. On a
-// kernel before 5.11 the node's tick falls back to a timerfd, whose hrtimer
+// kernel before 5.11 that wait falls back to a timerfd, whose hrtimer
 // PREEMPT_RT expires in softirq context, in ktimers/N at SCHED_FIFO 1
 // (ksoftirqd, SCHED_OTHER, on some older RT kernels), behind any loop running
 // on that CPU, a lower tier included, until it sleeps. On a kernel without

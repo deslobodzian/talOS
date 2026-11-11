@@ -59,6 +59,7 @@ cc_library(
         "//talOS/ipc",
         "//talOS/process",
         "//talOS/protocol",
+        "//talOS/rtms:wake",
     ],
 )
 
@@ -79,11 +80,14 @@ cc_test(
     data = [":hardware_node"],
     env = {"HARDWARE_NODE": "$(rlocationpath :hardware_node)"},
     deps = [
+        ":merge",
         ":messages",
         ":node_lib",
         "//talOS/driver_station",
         "//talOS/events:events_log",
+        "//talOS/ipc",
         "//talOS/node:allocation_probe",
+        "//talOS/process",
         "//talOS/protocol:udp_test_helpers",
         "@googletest//:gtest",
         "@googletest//:gtest_main",

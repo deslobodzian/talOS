@@ -19,8 +19,8 @@
 //     = true offset between the clocks + that sample's latency,
 //
 // where the latency (>= 0) is how long the sample took from the gateway's
-// sampler to the bridge's receive: gateway processing, UDP, and up to one
-// bridge tick. The estimate is the minimum d over the window, so
+// sampler to the bridge's receive: gateway processing, UDP, and the bridge
+// waking for it. The estimate is the minimum d over the window, so
 //
 //   node time of gateway time t  =  t + offset_us()
 //

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <chrono>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -23,6 +22,7 @@
 #include "talOS/ipc/publisher.h"
 #include "talOS/ipc/subscriber.h"
 #include "talOS/protocol/udp.h"
+#include "talOS/rtms/wake.h"
 
 namespace talos::hardware {
 
@@ -68,8 +68,37 @@ class HardwareNode {
   ~HardwareNode() = default;
 
   bool Open();
+  // One merge step at `now_us` (the bridge clock): receives every waiting
+  // gateway datagram up to kReceiveBudget, reads each request topic, merges,
+  // sends the command when it changed or the heartbeat is due, and runs the
+  // time-driven duties (clock probe, owner timeouts, /hw/status). Run() calls
+  // it on every wakeup; tests call it with synthetic time.
   void Tick(uint64_t now_us);
+  // The earliest bridge-clock instant after a Tick(now_us) at which Tick has
+  // time-driven work: the next clock probe or its retry, the completion of an
+  // echoed probe (now_us itself), /hw/status, each merged owner's timeout,
+  // and the command heartbeat while one would be sent. Each is solved from
+  // the condition Tick tests. A duty already due at now_us, which that Tick
+  // could not do (a failed send), is retried kRetryUs later.
+  uint64_t NextDutyUs(uint64_t now_us) const;
+  // Run()'s loop body, without its wait: Tick(now_us), the registry refresh
+  // Run() owes, then arming every request subscriber's wake. Returns the
+  // bridge-clock instant Run() may sleep until: now_us when input is known
+  // to be waiting (an arm found an unread request, or Tick stopped at its
+  // receive budget), otherwise the next duty, refresh or kMaxWaitUs.
+  uint64_t Pass(uint64_t now_us);
   int Run(int duration_s = 0);
+
+  // Run()'s wakeups, by what the loop then found: a gateway datagram, a
+  // request, or neither and the wait reached its deadline. A wakeup that
+  // found both counts in both. Read only while Run() is not running.
+  struct Wakeups {
+    uint64_t passes{0};    // every Pass(), immediate ones included
+    uint64_t udp{0};       // woken readable; Tick received a datagram
+    uint64_t request{0};   // woken readable; Tick read a request
+    uint64_t deadline{0};  // the wait reached its deadline
+  };
+  const Wakeups& wakeups() const { return wakeups_; }
 
   bool is_configured() const { return is_configured_; }
   uint64_t states_received() const { return states_received_; }
@@ -115,7 +144,7 @@ class HardwareNode {
   // The sum of the per-topic counters: the registry's dispatch count.
   std::uint64_t DispatchCount() const;
   // Heartbeat and dispatch count alone, one registry sample; Run() calls it
-  // every 10 ms between PublishIntrospection() calls.
+  // every kLivenessPeriodUs between PublishIntrospection() calls.
   void RefreshLiveness();
 
   // Describes this node to the live registry. The hardware node predates the
@@ -174,6 +203,10 @@ class HardwareNode {
   bool simulation_;
 
   protocol::RuntimeUdpPeer peer_;
+  // What every request subscriber's reader slot names while Run() waits.
+  // Declared before subsystems_, so their slots are released first and no
+  // publisher notifies a closed receiver.
+  std::optional<WakeReceiver> request_wake_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> state_pub_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> cmd_pub_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> ds_pub_;
@@ -195,8 +228,20 @@ class HardwareNode {
   std::unique_ptr<event::log::LogWriter> log_;
   bool log_failure_reported_{false};
   State latest_state_{};
-  std::chrono::steady_clock::time_point next_introspection_{};
-  std::chrono::steady_clock::time_point next_liveness_{};
+  // Run()'s registry refreshes, on the bridge clock.
+  uint64_t next_introspection_us_{0};
+  uint64_t next_liveness_us_{0};
+  // What the last Tick did: datagrams it received, requests it read, and
+  // whether it stopped at kReceiveBudget rather than an empty socket.
+  uint32_t tick_datagrams_{0};
+  uint32_t tick_requests_{0};
+  bool tick_receive_capped_{false};
+  // Consecutive passes that found input waiting but consumed none.
+  uint32_t idle_passes_{0};
+  // The longest single wait: kMaxWaitUs, or kRetryUs when Run() cannot wait
+  // on its inputs and polls them instead.
+  uint64_t max_wait_us_{kMaxWaitUs};
+  Wakeups wakeups_{};
 
   bool is_configured_{false};
   uint64_t last_boot_id_{0};
@@ -228,9 +273,29 @@ class HardwareNode {
   uint64_t last_push_time_us_{0};
   uint64_t config_push_backoff_us_{50000};
 
-  // Explicit periodic scheduling: 1 kHz tick period as a
-  // named deadline, not an implicit sleep constant.
-  static constexpr uint64_t kTickPeriodUs = 1000;
+  // Run() sleeps until a gateway datagram, a request publication or the next
+  // time-driven duty. kMaxWaitUs caps one wait: the stop handler only sets
+  // process::stop_requested and cannot wake the poller, so the loop looks at
+  // the flag at least this often (and --duration-s ends on time).
+  static constexpr uint64_t kMaxWaitUs = 10'000;
+  // A duty Tick could not do (a failed send) is retried this much later,
+  // so a refused send costs at most a 1 kHz retry, never a busy loop.
+  static constexpr uint64_t kRetryUs = 1'000;
+  // The macOS time-constraint period ConfigureRealtime is given: after each
+  // wakeup the bridge's work (computation half of it) is due within it. Not
+  // a polling period; the kernel orders time-constraint threads by deadline,
+  // so a longer one would put the bridge behind the control nodes.
+  static constexpr uint64_t kWakeBudgetUs = 1'000;
+  // Datagrams one Tick receives at most, so a burst under overload delays
+  // rather than stalls the merge; Run() then ticks again without waiting.
+  static constexpr int kReceiveBudget = 32;
+  // Passes that may skip the wait on a failed arm without consuming input
+  // (a read the writer keeps tearing), before the loop waits anyway: the
+  // arm still requested a notification, and kMaxWaitUs bounds the wait.
+  static constexpr uint32_t kMaxIdlePasses = 3;
+  // Registry: heartbeat and dispatch count, and the full sample.
+  static constexpr uint64_t kLivenessPeriodUs = 10'000;
+  static constexpr uint64_t kIntrospectionPeriodUs = 250'000;
   static constexpr uint64_t kStatusPeriodUs = 20000;
   // Clock probes: one outstanding, at most every kProbePeriodUs. An
   // unanswered probe (or a lost echo) is replaced after kProbeRetryUs, well

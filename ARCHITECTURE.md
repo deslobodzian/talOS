@@ -113,8 +113,9 @@ a node that stops hearing its target goes neutral on its own.
 A node that stops sending requests goes neutral at the bridge once its last
 accepted request is older than its owner timeout,
 `max(2 × period_us, command_timeout_us / 2)` and never more than
-`command_timeout_us` (50 ms for every 2026-robot subsystem), checked on the
-bridge's 1 ms tick; a shorter gap, such as a late or missed tick, keeps its
+`command_timeout_us` (50 ms for every 2026-robot subsystem): the bridge,
+which otherwise sleeps until a gateway datagram or a request arrives, wakes
+for that instant. A shorter gap, such as a late or missed tick, keeps its
 last demand. Whatever the bridge does, the RoboRIO neutralizes it within
 `command_timeout_us` of the State its last request was built from (plus
 the RoboRIO loop's lateness; if that loop stalls, its
