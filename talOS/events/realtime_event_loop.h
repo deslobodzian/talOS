@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -67,6 +68,16 @@ class RealtimeEventLoop
     // notifying leaves its message unannounced, and this bounds how long it
     // waits. A loop whose next timer is nearer never pays for it.
     Duration wake_backstop{std::chrono::seconds{1}};
+
+    // A stop flag the loop reads between dispatches, null for none. Once it
+    // reads true the loop exits on its own thread: before its next timer,
+    // its next message (a burst or a run of woken drains included) and its
+    // next wait, so a stop takes effect after the current dispatch even
+    // while overdue timers would never let it wait. One relaxed load per
+    // dispatch; the flag only ever wakes the loop through a watched fd
+    // (watch_fd), which a sleeping loop needs. talOS/node passes
+    // &process::stop_requested.
+    const std::atomic<bool>* stop{nullptr};
 
     // Test seams, null in production. `make_wake_receiver` builds the
     // receiver under Delivery::ON_PUBLISH instead of WakeReceiver's
@@ -190,7 +201,7 @@ class RealtimeEventLoop
                           options_.tick_period);
     }
 
-    while (this->running()) {
+    while (keep_running()) {
       now = Poller::now();
 
       if (now >= end) {
@@ -198,7 +209,7 @@ class RealtimeEventLoop
       }
 
       Expiration expiration{};
-      while (this->running()) {
+      while (keep_running()) {
         now = Poller::now();
         if (!scheduler_.pop_expired(now, expiration)) break;
         if (expiration.id == INTERNAL_POLL_TIMER_ID) {
@@ -209,13 +220,13 @@ class RealtimeEventLoop
         // run after the timer (ties break on id), and update() would see
         // inputs one tick late, and later than a node without callbacks.
         drain_messages(expiration.deadline, now);
-        if (!this->running()) break;
+        if (!keep_running()) break;
         now = Poller::now();
         this->dispatch_timer(expiration.id, expiration.deadline, now,
                              expiration.cycles);
       }
 
-      if (!this->running()) {
+      if (!keep_running()) {
         break;
       }
 
@@ -401,6 +412,15 @@ class RealtimeEventLoop
     return std::nullopt;
   }
 
+  // running(), after exiting once the stop flag (Options::stop) reads true.
+  bool keep_running() {
+    if (options_.stop != nullptr && this->running() &&
+        options_.stop->load(std::memory_order_relaxed)) {
+      this->exit();
+    }
+    return this->running();
+  }
+
   // Runs the handler of each watched fd the last wait reported readable.
   void serve_watched_fds() {
     for (FdWatch& watch : fd_watches_) {
@@ -536,7 +556,7 @@ class RealtimeEventLoop
                                info.dropped + std::exchange(transport.lost, 0),
                                sources[id].buffer, published);
 
-        if (!this->running()) {
+        if (!keep_running()) {
           return;
         }
         if (sources[id].latest_only) break;

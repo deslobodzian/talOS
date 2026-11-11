@@ -49,8 +49,12 @@ above all, goes through `watch_fd(fd, handler)`, set before the run: a wait
 that finds `fd` readable runs the handler on the loop
 thread, outside any dispatch and unrecorded, and a readable `fd` alone drains
 nothing. The watch is level-triggered, so the handler reads `fd` empty or
-calls `exit()`. A node stops this way: SIGINT and SIGTERM make
-`process::StopFd()` readable and its handler calls `exit()`
+calls `exit()`. A loop behind its timers never waits, so a stop also needs
+`Options::stop`, a flag the loop reads before each timer, each message and
+each wait, exiting once it is true: one relaxed load per dispatch
+(`RealtimeEventLoop.AStopFlagEndsTheRunAfterTheCurrentDispatch`). A node
+stops with both: SIGINT and SIGTERM set `process::stop_requested`, its flag,
+and make `process::StopFd()` readable, whose handler calls `exit()`
 (`RealtimeEventLoop.AWatchedFdEndsTheWaitOnTheLoopThread`).
 Realtime and replay loop instances run once.
 

@@ -163,9 +163,11 @@ call: start none whose work is unbounded.
 ### Stopping
 
 Once `talos::Run` / `talos.run` starts a live node, SIGINT or SIGTERM stops it
-cleanly, at once: the signal makes the process's stop pipe
-(`process::StopFd()`) readable, which ends the loop's wait wherever it waits,
-and the loop exits from its own thread, so no thread polls for a stop. A stop
+cleanly, after the current dispatch, or at once when the loop is asleep: the
+loop reads the stop flag between dispatches (so an `update()` that overruns
+its period still stops after it returns), and the signal makes the process's
+stop pipe (`process::StopFd()`) readable, which ends a wait wherever it
+waits. The loop exits from its own thread; no thread polls for a stop. A stop
 received while the constructor runs is held until the
 constructor returns; the binary then exits 0 without running its loop. A
 constructor blocked in a restartable system call keeps blocking (the call

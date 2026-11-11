@@ -54,9 +54,11 @@ void WriteStopByte() noexcept {
   errno = saved_errno;
 }
 
-// Both ends non-blocking and close-on-exec. macOS has no pipe2(), so there
-// a fork-and-exec on another thread between pipe() and fcntl() could still
-// inherit the ends; a node binary creates the pipe before it starts threads.
+// Both ends non-blocking and close-on-exec. macOS has no pipe2(), so there a
+// fork-and-exec on another thread between pipe() and fcntl() (a Python
+// node's interpreter may already run threads) can leave a child holding an
+// end. Harmless: the child never reads it, and a write end it holds only
+// keeps the pipe open, which it always is.
 int CreateStopPipe() noexcept {
   int fds[2] = {-1, -1};
 #if defined(__linux__)
