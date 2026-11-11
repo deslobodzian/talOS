@@ -35,6 +35,14 @@ const char* Or(const char* value, const char* fallback) {
 
 }  // namespace
 
+std::string ConsoleTime(uint64_t steady_us) {
+  char text[32];
+  std::snprintf(text, sizeof(text), "[%llu.%03llu] ",
+                static_cast<unsigned long long>(steady_us / 1'000'000),
+                static_cast<unsigned long long>(steady_us / 1'000 % 1'000));
+  return text;
+}
+
 void LogEvent::SetName(std::string_view value) { CopyBounded(name, value); }
 void LogEvent::SetBus(std::string_view value) { CopyBounded(bus, value); }
 void LogEvent::SetText(std::string_view value) { CopyBounded(text, value); }
@@ -51,7 +59,10 @@ RioLog::RioLog(Sink sink)
     (*cells_)[i].sequence.store(i, std::memory_order_relaxed);
   if (!sink_) {
     sink_ = [](std::string_view line) {
-      std::fwrite(line.data(), 1, line.size(), stderr);
+      // One write, so another thread's console line cannot split it.
+      std::string timed = ConsoleTime(SteadyNowUs());
+      timed.append(line);
+      std::fwrite(timed.data(), 1, timed.size(), stderr);
       std::fflush(stderr);
     };
   }
