@@ -551,11 +551,13 @@ rules (`//talOS/bridge:merge`), so a node's outputs go neutral at its
 gateway's do, once the oldest observation of any node still merged is
 `command_timeout_us` old; omitted outputs are neutral, and disabled hardware
 applies neutral outputs. As on the bridge and gateway, a request built from
-another boot's or epoch's State is ignored, and a motor masked by
-`reset_device` applies neutral (so does a later request observed before the
-State that masked it); a motor disconnected with `set_connected`, or whose
-feedback is too old, still applies its request, and losing every device's
-feedback raises no hardware fault. Inspection never refreshes
+another boot's or epoch's State is ignored. As on the gateway, a motor that
+cannot drive in a State (its feedback invalid: disconnected with
+`set_connected`, too old, or masked by `reset_device`; its remote
+CANcoder's; or a follower's master's) applies neutral from that tick while
+the others keep driving, and only a request observed after the last such
+State drives it again. Unlike the gateway, losing every device's feedback
+raises no hardware fault. Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
 velocity below `0.01 rps` snaps to zero. Position continues integrating during

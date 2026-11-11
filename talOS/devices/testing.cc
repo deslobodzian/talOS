@@ -102,9 +102,12 @@ struct SimHardware::Impl {
   static constexpr int kRestoreStates = 2;
   std::map<std::pair<Kind, std::uint16_t>, int> resetting;
   std::set<std::pair<Kind, std::uint16_t>> masked;
-  // Per masked motor, the sample time of the last State that masked it: like
-  // the gateway, a request observed before it never drives that motor.
-  std::map<std::uint16_t, std::uint64_t> motor_reset_at;
+  // As the gateway keeps them (Gateway::MaskUnavailable): the motors that
+  // could not drive in the latest State (MayDrive false), and per motor the
+  // earliest observation a request may drive it on, one past the last State
+  // in which it could not.
+  std::set<std::uint16_t> unable;
+  std::map<std::uint16_t, std::uint64_t> motor_drives_from;
   std::uint32_t device_reset_count = 0;
   std::uint64_t sequence = 0;  // gateway ticks this boot
   // The gateway's epoch: Invalidate() moves it on, and a request built from
@@ -216,12 +219,13 @@ struct SimHardware::Impl {
         for (std::size_t i = 0; i < command.count; ++i) {
           const hardware::MotorRequest& request = command.motors[i];
           motor_requests[request.id] = request;
-          // As the gateway does, a masked motor, or one masked after the
-          // State this request observed, applies neutral.
+          // As the gateway does, a motor that could not drive in the latest
+          // State, or in one this request observed or followed, applies
+          // neutral.
           const bool unavailable =
-              masked.contains({Kind::kMotor, request.id}) ||
+              unable.contains(request.id) ||
               command.observed_time_us <
-                  ValueOr(motor_reset_at, request.id, std::uint64_t{0});
+                  ValueOr(motor_drives_from, request.id, std::uint64_t{0});
           applied_motors[request.id] =
               unavailable ? hardware::MotorRequest{.id = request.id} : request;
         }
@@ -322,6 +326,45 @@ struct SimHardware::Impl {
     std::erase_if(resetting, [](auto& entry) { return --entry.second <= 0; });
   }
 
+  // Gateway::FeedbackValid: motor i's own sample, and its remote CANcoder's.
+  bool FeedbackValid(const hardware::State& state, std::size_t i) const {
+    const hardware::MotorConfig& m = config.hardware.motors[i];
+    if (!state.motors[i].valid) return false;
+    if (m.feedback != hardware::Feedback::kRemoteCANcoder) return true;
+    for (std::size_t j = 0; j < state.sensor_count; ++j) {
+      if (state.sensors[j].id == m.feedback_sensor_id) {
+        return state.sensors[j].valid;
+      }
+    }
+    return false;
+  }
+  // Gateway::MayDrive: FeedbackValid, and for a follower its master's.
+  bool MayDrive(const hardware::State& state, std::size_t i) const {
+    if (!FeedbackValid(state, i)) return false;
+    const std::uint16_t master_id = config.hardware.motors[i].master_id;
+    if (master_id == 0) return true;
+    for (std::size_t j = 0; j < config.hardware.motors.size(); ++j) {
+      if (config.hardware.motors[j].id == master_id) {
+        return FeedbackValid(state, j);
+      }
+    }
+    return false;
+  }
+  // The gateway's tick (MaskUnavailable, NeutralUnavailable): a motor that
+  // cannot drive in this State applies neutral now, not at the next
+  // request, and only a request observing a later State drives it again.
+  // Other motors and the epoch are untouched.
+  void MaskUnable(const hardware::State& state) {
+    unable.clear();
+    for (std::size_t i = 0; i < state.motor_count; ++i) {
+      if (MayDrive(state, i)) continue;
+      const std::uint16_t id = state.motors[i].id;
+      unable.insert(id);
+      motor_drives_from[id] = state.sample_time_us + 1;
+      applied_motors[id] = hardware::MotorRequest{.id = id};
+    }
+  }
+
   void Publish() {
     Collect();
     CheckMergedObservation();
@@ -335,12 +378,6 @@ struct SimHardware::Impl {
     state.counters.device_reset_count = device_reset_count;
     state.epoch = epoch;
     state.sample_time_us = GatewayUs(latency);
-    // The gateway neutralizes a motor in the tick that masks it.
-    for (const auto& [kind, id] : masked) {
-      if (kind != Kind::kMotor) continue;
-      motor_reset_at[id] = state.sample_time_us;
-      applied_motors[id] = hardware::MotorRequest{.id = id};
-    }
     state.flags = hardware::kConfigured | (enabled ? hardware::kEnabled : 0u);
 
     auto fill = [](auto& samples, auto& count, const auto& configs,
@@ -424,6 +461,7 @@ struct SimHardware::Impl {
            return hardware::PwmSample{c.id, true,
                                       ValueOr(applied_pwm_outputs, c.id, 0.0)};
          });
+    MaskUnable(state);
 
     if (lost_states > 0) {
       // The RoboRIO samples the Driver Station mode every tick whether or not
@@ -634,7 +672,8 @@ void SimHardware::reboot() {
   impl_->device_reset_count = 0;
   impl_->sequence = 0;
   impl_->resetting.clear();
-  impl_->motor_reset_at.clear();
+  impl_->unable.clear();
+  impl_->motor_drives_from.clear();
   impl_->ds_mode = driver_station::ModeTracker{};
 }
 

@@ -30,14 +30,15 @@
 // applied output: omitted devices are neutral, and disabled hardware applies
 // only neutral outputs. As on the bridge and gateway, a request built from
 // another boot's or epoch's State, or observed command_timeout_us before the
-// latest State, is ignored, and a motor masked by reset_device() applies
-// neutral, as does any later request observed before the State that last
-// masked it. Unlike the gateway, a motor disconnected with set_connected()
-// or whose feedback is too old (set_motor) still applies its request, losing
-// every motor's and CAN sensor's feedback raises no hardware fault and starts
-// no new epoch, enabling or disabling does not start a new epoch, and
-// requests are not checked against the config id, motor limits or soft
-// limits.
+// latest State, is ignored. As on the gateway, a motor that cannot drive in
+// a State (its feedback invalid: disconnected, too old, or masked by
+// reset_device(); its remote CANcoder's; or a follower's master's) applies
+// neutral from that tick, other motors and the epoch untouched, and only a
+// request observed after the last such State drives it again. Unlike the
+// gateway, losing every motor's and CAN sensor's feedback raises no
+// hardware fault and starts no new epoch, enabling or disabling does not
+// start a new epoch, and requests are not checked against the config id,
+// motor limits or soft limits.
 //
 // Each period it also publishes the bridge's /hw/status: the states and
 // Driver Station packets it sent, configured, and the exact simulated gateway
