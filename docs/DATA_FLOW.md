@@ -337,7 +337,8 @@ per `update()` that selects a lane, however often it calls `get()` or
 `source()`: 6.4 KB/s for a 100 Hz consumer of one target.
 
 A byte-capped log (`LogWriterOptions::max_bytes`, the launcher's per-member
-share of `[robot] log_max_bytes`) is split into n = min(8, cap / (prefix +
+share of `[robot] log_max_bytes`, in proportion to the bytes the member's log
+is expected to store per second: [log budget](../talOS/launcher/README.md#session-segments-and-logs)) is split into n = min(8, cap / (prefix +
 largest record)) segments of cap / n bytes, each a complete version-7 log
 (its own header, manifest and schema block, then whole records). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting

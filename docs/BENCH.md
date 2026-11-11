@@ -313,7 +313,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   writer's share. Expected: control continues, each log keeps its newest
   records in whole-record segments within its share (oldest
   `<stem>.segment<k>.tlog` deleted), completed manifest reports
-  `log_capped: true`. Record cap/file sizes and
+  `log_capped: true`, and every capped member's kept records span about the
+  same time, within 1.5x of each other (REQ-OPS-32; `log_dump` on the session
+  directory: each process's first record). Record cap/file sizes, the spans and
   manifest, restore normal limits and reserve disk for session metadata.
 - [ ] Stop the stack and fetch into a fresh destination with
   `./tools/deploy.sh fetch <archive-directory>`. Expected: complete session

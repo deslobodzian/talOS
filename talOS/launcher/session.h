@@ -94,23 +94,6 @@ class ManifestWriter {
   std::thread worker_;
 };
 
-// A member's expected event-log bytes per second, from what it declared
-// (--describe): one record per source per `period_us` tick, each a record
-// header plus the source's message. Byte topics (Node::publish_bytes) are
-// left out: the loop never logs them. An estimate to weight log shares by,
-// not a bound: callback topics can record more often, idle ones less.
-double ExpectedLogRate(const introspect::Description& declared,
-                       int64_t period_us);
-
-// Splits a session's log budget among the members that write an event log
-// (`logs[i]`): a quarter of it in equal parts, so no member starves, and the
-// rest by expected rate (`rates[i]`; negative when unknown, as for a member
-// that did not answer --describe, which is weighted as the mean of the
-// known). Every logging member gets at least 1 byte; others get 0.
-std::vector<uint64_t> SplitLogBudget(uint64_t budget,
-                                     const std::vector<bool>& logs,
-                                     const std::vector<double>& rates);
-
 // Why a run of a roster member ended (NodeRun::reason), as the supervisor
 // saw it. The first five are the launcher's own kills.
 inline constexpr std::string_view kRunStalled = "stalled";
