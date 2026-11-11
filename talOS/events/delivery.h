@@ -6,7 +6,9 @@ namespace talos::event {
 
 // When a loop hands queued messages to its watchers. Every policy drains
 // immediately before each timer dispatch, so a timer handler sees everything
-// published by its deadline.
+// published by its deadline. Under BEFORE_TIMERS and ON_PUBLISH a drain that
+// stops at the per-drain cap on a sequence watcher is also followed at once
+// by another, before the loop waits (talOS/events/README.md).
 enum class Delivery : std::uint8_t {
   // Also on the internal poll timer, every tick_period. A watcher's handler
   // runs within one tick of the message arriving, whatever else is scheduled,

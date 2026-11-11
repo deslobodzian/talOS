@@ -103,9 +103,10 @@ enum class Wake : std::uint8_t {
   // Publications never wake the node: the messages wait, in sequence, for
   // its next drain, right before its next timer (update(), every()) or on
   // another topic's wake. For a node that needs every message but acts on
-  // them only at its tick. Over 64 between two drains fall behind by the
-  // excess at each drain; past the ring's 1023 unread they are lost and
-  // counted as dropped.
+  // them only at its tick. A drain that stops at the 64-message cap is
+  // followed at once by another, as for kOnPublish, so a fast topic does
+  // not fall behind by a batch per tick; only more than the ring's 1023
+  // unread between two drains are lost, counted as dropped.
   kAtDrain,
 };
 

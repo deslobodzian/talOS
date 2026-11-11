@@ -230,6 +230,16 @@ class RealtimeEventLoop
         break;
       }
 
+      // The last drain stopped at the cap on a sequence watcher that no
+      // publication wakes the loop for: drain again now rather than leave the
+      // rest for the next timer, as a prompt watcher's failed arm does (see
+      // drain_messages). Each drain stays capped, and due timers run between.
+      if (backlog_) {
+        const MonotonicTime at = Poller::now();
+        drain_messages(at, at);
+        continue;
+      }
+
       const MonotonicTime deadline = std::min(scheduler_.next_deadline(), end);
 
       if (!wake_) {
@@ -498,9 +508,16 @@ class RealtimeEventLoop
   // published, so its event time is its publication time (not after the
   // dispatch's now), and latency() is publish-to-dispatch. A watcher that is
   // not prompt waited for the drain by design and keeps the drain's time.
+  //
+  // Under Delivery::BEFORE_TIMERS and ON_PUBLISH, a sequence watcher that is
+  // not prompt and stops at max_messages_per_tick sets backlog_, and the run
+  // drains again at once (POLL's next tick drains it anyway). Without that,
+  // such a watcher fed faster than the cap per drain would fall further
+  // behind at every drain until the ring overwrote what it had not read.
   void drain_messages(MonotonicTime tick_deadline, MonotonicTime now,
                       bool woken = false) {
     ++activity_.drains;
+    backlog_ = false;
     auto& sources = this->sources();
 
     // Registration order, which is the order the log records and replay
@@ -520,8 +537,8 @@ class RealtimeEventLoop
       }
       const std::size_t reader_id = *transport.reader_id;
 
-      for (std::size_t drained = 0; drained < options_.max_messages_per_tick;
-           ++drained) {
+      std::size_t drained = 0;
+      for (; drained < options_.max_messages_per_tick; ++drained) {
         MessageInfo info{};
 
         const ReadResult result =
@@ -560,6 +577,10 @@ class RealtimeEventLoop
           return;
         }
         if (sources[id].latest_only) break;
+      }
+      if (drained == options_.max_messages_per_tick && !transport.prompt &&
+          options_.delivery != Delivery::POLL) {
+        backlog_ = true;
       }
     }
   }
@@ -600,6 +621,9 @@ class RealtimeEventLoop
   };
   std::vector<FdWatch> fd_watches_;
   Activity activity_;
+  // The last drain left a backlog the run drains again at once (see
+  // drain_messages).
+  bool backlog_{false};
 };
 
 }  // namespace talos::event
