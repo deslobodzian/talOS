@@ -148,6 +148,7 @@ TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
 // request waits for the previous one's command, so the bridge has gone back
 // to sleep before it, and the wakeup that finds it is counted as a
 // request's. A loop that only polled counts none.
+// REQ-RT-20
 TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const uint16_t roller = cfg.subsystems.at("intake").motors[0];
@@ -181,6 +182,7 @@ TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
 
 // A State arriving while Run() is asleep wakes it and reaches /hw/state at
 // once. Each State waits for the previous one on /hw/state, as above.
+// REQ-RT-20
 TEST(HardwareNodeTest, RunForwardsAStateWhenItArrives) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -213,6 +215,7 @@ TEST(HardwareNodeTest, RunForwardsAStateWhenItArrives) {
 // on a loaded host, where a late wake does every duty then due), where a
 // 1 ms poll made one a millisecond. The window ends on an event, the 25th
 // /hw/status, and nothing arrives during it.
+// REQ-RT-20
 TEST(HardwareNodeTest, RunSleepsWhileNothingArrives) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -246,6 +249,7 @@ TEST(HardwareNodeTest, RunSleepsWhileNothingArrives) {
 // pass with work due at once) or ends on the stop pipe; none after the stop
 // reaches its deadline.
 // REQ-OPS-06
+// REQ-RT-20
 TEST(HardwareNodeTest, RunEndsItsWaitOnAStop) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -279,6 +283,7 @@ TEST(HardwareNodeTest, RunEndsItsWaitOnAStop) {
 // NextDutyUsIsWhenTickNextHasWork pins the exact instants; this proves Run()
 // sleeps until them rather than past them.
 // REQ-SAFE-15
+// REQ-RT-20
 TEST(HardwareNodeTest, RunSendsHeartbeatsAndTheTimeoutNeutralOnItsOwn) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const uint16_t roller = cfg.subsystems.at("intake").motors[0];

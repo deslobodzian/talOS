@@ -1295,6 +1295,7 @@ TEST(Binary, StopDuringConstructionExitsCleanlyOnceConstructed) {
 // once the registry row shows the loop running (endpoints are published only
 // then).
 // REQ-OPS-06
+// REQ-RT-21
 TEST(Binary, StopEndsARunningNodeThatWaitsOnNothing) {
   const std::string binary = Runfile("TALOS_BLOCKED_NODE");
   const std::string config = Runfile("TALOS_TEST_CONFIG");

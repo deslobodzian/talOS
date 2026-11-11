@@ -972,6 +972,7 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
 // Each refresh still moves the heartbeat, which keeps the row alive
 // (kLivenessTimeout). The loop runs until the heartbeat has moved twice and
 // half a second has passed since the row was published.
+// REQ-RT-21
 TEST_F(Registry, ARunningReporterWakesOnlyToRefresh) {
   constexpr auto kPeriod = 50ms;
   event::RealtimeEventLoop<> loop;
