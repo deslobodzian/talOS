@@ -46,10 +46,10 @@ Allowed dependencies:
   `telemetry`) is driven by TOML configuration.
 - Nodes share only messages and topic names (`talos_messages`), never each
   other's classes.
-- Geometry, vision and aiming are reusable libraries beside the node stack:
-  robot camera nodes depend on `talOS/vision`, which depends on
-  `talOS/geometry`, never the reverse; `talOS/aiming` depends only on
-  `talOS/geometry` and `talOS/msgs`.
+- Geometry, vision, trajectory and aiming are reusable libraries beside the
+  node stack: robot camera nodes depend on `talOS/vision`, and autonomous
+  routines on `talOS/trajectory`; both depend on `talOS/geometry`, never the
+  reverse; `talOS/aiming` depends only on `talOS/geometry` and `talOS/msgs`.
 
 Beside the stack:
 
@@ -70,6 +70,7 @@ Beside the stack:
 | `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_cc_shared_node` (C++ nodes for `talos.cpp_node`, linked against `libtalos_node.so`), `talos_messages`, `talos_bundle`, `talos_graph_test` (both fed by a config's generated `robot_manifest.bzl`, `tools/sync_manifest.py`) |
 | `talOS/geometry` | header-only SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); C++ drivetrain kinematics and vision transforms |
 | `talOS/aiming` | shooter aiming library (no node): `ShotTable` (distance → flywheel, hood, time of flight; clamped and flagged outside its range), `TargetSolver` (static and shoot-on-the-move aim for a fixed shooter or a turret, bounded time-of-flight iteration) and `ReadinessGate` (ready to fire, first failing reason, tick debounce) |
+| `talOS/trajectory` | time-indexed holonomic trajectories (`sample(t)`, event markers, splits), the Choreo `.traj` loader (`@nlohmann_json`), alliance flips (rotate or mirror) and `HolonomicFollower` (feedforward plus PID to a chassis speed); depends only on `talOS/geometry` |
 | `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, field simulation and fixtures; OpenCV 4.12 image conversion/IO |
 | `talOS/python/requirements.txt` | Python `robotpy-wpimath` pose estimation and GTSAM factor graphs; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy wheels, not C++ dependencies |
 
@@ -320,6 +321,7 @@ manifest fails the build with the regenerate command.
 | a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
+| a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named by a parameter of the node that follows it and loaded with `talOS/trajectory`; `tools/sync_manifest.py` does not list it in `CONFIG_FILES` yet (TODO.md TRAJ-2) |
 | a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
