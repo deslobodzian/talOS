@@ -205,7 +205,9 @@ std::string AllocationProbe::sites() const {
       out += symbols != nullptr ? symbols[i] : "?";
       out += '\n';
     }
-    std::free(static_cast<void*>(symbols));
+    // reinterpret_cast: clang-tidy 18's multi-level-pointer check flags the
+    // operand of a static_cast to void*.
+    std::free(reinterpret_cast<void*>(symbols));
   }
   return out;
 }

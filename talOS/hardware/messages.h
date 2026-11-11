@@ -205,9 +205,9 @@ inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
 inline constexpr std::size_t kGatewayCountersSize = std::size_t{4} * 4;
 // Revision u64, program u8, dirty u8.
 inline constexpr std::size_t kGatewayBuildSize = 8 + 1 + 1;
-inline constexpr std::size_t kStateBaseSize = 7 * 8 + kGatewayBuildSize + 4 +
-                                              7 * 2 + kHealthSampleSize +
-                                              kGatewayCountersSize;
+inline constexpr std::size_t kStateBaseSize =
+    std::size_t{7} * 8 + kGatewayBuildSize + 4 + std::size_t{7} * 2 +
+    kHealthSampleSize + kGatewayCountersSize;
 // Current and temperature use signed tenths (saturating int16) on the wire.
 inline constexpr std::size_t kMotorSampleSize = 2 + 1 + 3 * 8 + 3 * 2 + 3 * 4;
 inline constexpr std::size_t kSensorSampleSize = 2 + 1 + 2 * 8 + 2 * 4;
