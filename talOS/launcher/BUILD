@@ -256,6 +256,67 @@ cc_binary(
     ],
 )
 
+# A self-contained WPILib DataLog (.wpilog) writer: no WPILib dependency.
+cc_library(
+    name = "wpilog",
+    srcs = ["wpilog.cc"],
+    hdrs = ["wpilog.h"],
+)
+
+cc_test(
+    name = "wpilog_test",
+    size = "small",
+    srcs = ["wpilog_test.cc"],
+    deps = [
+        ":wpilog",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# .tlog dispatch logs (or a session directory) as one .wpilog for
+# AdvantageScope; README.md, "Converting a session to WPILOG".
+cc_binary(
+    name = "tlog_to_wpilog",
+    srcs = ["tlog_to_wpilog.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":log_merge",
+        ":wpilog",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/schema:identity",
+        "//talOS/schema:unit_suffix",
+        "@flatbuffers//:runtime_cc",
+    ],
+)
+
+# Every scalar base type, fixed arrays, an enum and a nested geometry.Pose2d.
+talos_messages(
+    name = "wpilog_message",
+    srcs = ["testdata/wpilog_message.fbs"],
+    include_prefix = "wpilog_test",
+    visibility = ["//visibility:private"],
+    deps = ["//talOS/msgs:geometry"],
+)
+
+cc_test(
+    name = "tlog_to_wpilog_test",
+    size = "small",
+    srcs = ["tlog_to_wpilog_test.cc"],
+    data = [":tlog_to_wpilog"],
+    env = {"TALOS_TLOG_TO_WPILOG": "$(rlocationpath :tlog_to_wpilog)"},
+    deps = [
+        ":wpilog_message",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/msgs:geometry",
+        "//talOS/schema:identity",
+        "@flatbuffers//:runtime_cc",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 cc_test(
     name = "launcher_test",
     size = "small",
