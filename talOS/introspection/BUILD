@@ -77,6 +77,7 @@ cc_test(
     srcs = ["describe_test.cc"],
     deps = [
         ":describe",
+        "//talOS/events",
         "@googletest//:gtest_main",
     ],
 )

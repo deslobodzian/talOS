@@ -370,7 +370,8 @@ void* SimAccess::add_instance(Sim& sim, std::string_view node_name,
         for (const auto& other : impl.nodes) {
           if (NodeAccess::reads_graph(*other->node)) continue;
           self->graph.push_back(
-              detail::DescribeNode(*other->node, "", other->loop->manifest()));
+              detail::DescribeNode(*other->node, "", other->loop->manifest(),
+                                   introspect::LoopSourceFlags(*other->loop)));
         }
         return &self->graph;
       },

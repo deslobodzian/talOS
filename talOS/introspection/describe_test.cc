@@ -2,12 +2,18 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "talOS/events/callback.h"
+#include "talOS/events/context.h"
 #include "talOS/events/manifest.h"
+#include "talOS/events/simulated_event_loop.h"
 #include "talOS/introspection/names.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::introspect {
 namespace {
@@ -212,6 +218,36 @@ TEST(Describe, RejectsOutputThatIsNotACompleteDescription) {
     EXPECT_FALSE(DescribeReader::Parse(output, out, error)) << what;
     EXPECT_FALSE(error.empty()) << what;
   }
+}
+
+// REQ-OPS-32: the launcher sizes a member's log share from its describe, and
+// a latest-only watcher logs at most one message per drain where a sequence
+// watcher logs every message. --describe must therefore say which is which,
+// as the loop decided it (an empty callback, or latest_only asked for).
+TEST(Describe, MarksExactlyTheLoopsLatestOnlyWatchers) {
+  event::SimulationEnvironment environment;
+  event::SimulatedEventLoop<> loop{environment};
+  const schema::Identity schema{"test.Count", 7};
+  const event::Thunk callback{
+      nullptr, [](void*, const event::Context&, std::span<const std::byte>) {}};
+  const auto sequence =
+      loop.register_watcher("/a/state", 8, 8, schema, callback);
+  const auto empty = loop.register_watcher("/b/state", 8, 8, schema, {});
+  const auto asked =
+      loop.register_watcher("/c/state", 8, 8, schema, callback, true);
+  const auto sender = loop.register_sender("/d/state", 8, 8, schema);
+
+  const Description written = DescribeManifest(
+      "n", "//n:n", loop.manifest(), kSlots, {}, LoopSourceFlags(loop));
+  Description read;
+  std::string error;
+  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
+      << error;
+  ASSERT_EQ(read.sources.size(), 4u);
+  EXPECT_EQ(read.sources[sequence].flags & naming::kSourceFlagLatestOnly, 0u);
+  EXPECT_EQ(read.sources[empty].flags, naming::kSourceFlagLatestOnly);
+  EXPECT_EQ(read.sources[asked].flags, naming::kSourceFlagLatestOnly);
+  EXPECT_EQ(read.sources[sender].flags, 0u);
 }
 
 }  // namespace

@@ -70,9 +70,12 @@ the launcher checks and the live graph a viewer shows agree about which
 dead ends are designed.
 
 `kSourceFlagLatestOnly` is the one source flag the node does not declare: the
-`Reporter` sets it from the loop (`EventLoopBase::latest_only`) for each
+loop sets it (`LoopSourceFlags`, from `EventLoopBase::latest_only`) for each
 watcher that delivers only the newest message, so a reader can tell that
-watcher's `dropped` includes skips by design. `--describe` does not carry it.
+watcher's `dropped` includes skips by design. The `Reporter` publishes it in
+the registry, and `--describe` writes it as `"latest_only": true` on that
+watcher alone (absent means a sequence watcher), which the launcher's log
+budget reads ([log budget](../launcher/README.md#session-segments-and-logs)).
 It is a bit of the existing `flags` word, needing no layout or version
 change: an older writer leaves it clear, and an older reader ignores it.
 
