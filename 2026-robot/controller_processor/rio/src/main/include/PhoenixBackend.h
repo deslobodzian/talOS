@@ -98,6 +98,12 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::array<uint32_t, talos::hardware::kMaxMotors> last_fault_flags_{};
   std::array<bool, talos::hardware::kMaxMotors> last_motor_valid_{};
   std::array<bool, talos::hardware::kMaxSensors> last_sensor_valid_{};
+  // Whether a device's motion feedback is four status periods old (the LATE
+  // line), and the oldest age of its current late spell.
+  std::array<bool, talos::hardware::kMaxMotors> motor_late_{};
+  std::array<uint32_t, talos::hardware::kMaxMotors> motor_peak_age_us_{};
+  std::array<bool, talos::hardware::kMaxSensors> sensor_late_{};
+  std::array<uint32_t, talos::hardware::kMaxSensors> sensor_peak_age_us_{};
   uint32_t last_motor_fault_mask_{0};
   std::array<bool, talos::hardware::kMaxMotors> neutral_send_failing_{};
   uint64_t neutral_send_failure_count_{0};

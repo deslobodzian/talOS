@@ -430,11 +430,27 @@ std::string RioLog::Format(const LogEvent& e) {
           << (e.kind == LogKind::kMotorFeedback ? "motor" : "sensor") << " "
           << e.name << " (id=" << e.id << ", bus=" << e.bus
           << ", can_id=" << e.can_id << ") feedback "
-          << (e.flag ? "RECOVERED" : "INVALID/STALE")
+          << (e.flag ? "RECOVERED" : "INVALID")
           << " (position_status=" << Or(e.status, "?")
           << ", velocity_status=" << Or(e.status2, "?")
           << ", position_age_us=" << e.age_us
           << ", velocity_age_us=" << e.age2_us << ")";
+      break;
+    case LogKind::kMotorFeedbackLate:
+    case LogKind::kSensorFeedbackLate:
+      out << "[phoenix] "
+          << (e.kind == LogKind::kMotorFeedbackLate ? "motor" : "sensor") << " "
+          << e.name << " (id=" << e.id << ", bus=" << e.bus
+          << ", can_id=" << e.can_id << ") feedback ";
+      if (e.flag) {
+        out << "LATE (position_age_us=" << e.age_us
+            << ", velocity_age_us=" << e.age2_us << ", late from " << e.previous
+            << " us, four status periods";
+      } else {
+        out << "ON TIME (peak_age_us=" << e.value;
+      }
+      out << ", position_status=" << Or(e.status, "?")
+          << ", velocity_status=" << Or(e.status2, "?") << ")";
       break;
     case LogKind::kMotorFaultMask:
       out << "[phoenix] motor_fault_mask changed: 0x" << std::hex << e.previous

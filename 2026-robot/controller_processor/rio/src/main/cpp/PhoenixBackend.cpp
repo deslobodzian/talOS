@@ -14,6 +14,8 @@
 #include <limits>
 #include <string>
 
+#include "hardware/gate.h"
+
 namespace ph = ctre::phoenix6;
 namespace hw = talos::hardware;
 using namespace units::literals;
@@ -32,16 +34,13 @@ void SetGains(Slot& slot, const hw::Gains& gains) {
                          ? ph::signals::GravityTypeValue::Arm_Cosine
                          : ph::signals::GravityTypeValue::Elevator_Static;
 }
+// Diagnostics only (effort, fault field, temperature). Motion feedback is not
+// held to an age here: Read reports its ages and the gateway judges them
+// (Backend::Read, FeedbackFresh).
 bool Fresh(const ph::BaseStatusSignal& signal,
            units::second_t max_age = 50_ms) {
   return signal.GetStatus().IsOK() &&
          signal.GetTimestamp().GetLatency() < max_age;
-}
-template <typename Position, typename Velocity>
-bool ValidMotionFeedback(const Position& position, const Velocity& velocity) {
-  return Fresh(position) && Fresh(velocity) &&
-         std::isfinite(position.GetValue().value()) &&
-         std::isfinite(velocity.GetValue().value());
 }
 // One clock_gettime(CLOCK_MONOTONIC) per phase boundary of the tick.
 uint64_t NowNs() {
@@ -71,6 +70,17 @@ uint32_t Age(const ph::BaseStatusSignal& signal) {
     return std::numeric_limits<uint32_t>::max();
   return static_cast<uint32_t>(std::max(0.0, std::ceil(age)));
 }
+// Apply's follower check, between the gateway's judgements: the master's or
+// the follower's own (or remote) feedback, by the gateway's rule.
+template <typename Position, typename Velocity>
+bool ValidMotionFeedback(const Position& position, const Velocity& velocity,
+                         uint64_t command_timeout_us) {
+  return position.GetStatus().IsOK() && velocity.GetStatus().IsOK() &&
+         hw::FeedbackFresh(Age(position), command_timeout_us) &&
+         hw::FeedbackFresh(Age(velocity), command_timeout_us) &&
+         std::isfinite(position.GetValue().value()) &&
+         std::isfinite(velocity.GetValue().value());
+}
 
 // Posts a feedback validity change: the loop thread only copies it.
 void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
@@ -91,6 +101,39 @@ void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
   event.SetName(name);
   event.SetBus(bus);
   log.Post(event);
+}
+
+// Posts LATE when the older of a device's position and velocity samples
+// reaches `late_us` (four status periods), and ON TIME, with the oldest age of
+// that spell, once both are younger again: a CAN silence shorter than the
+// gateway's bound changes no validity, so this line is what shows it.
+// Loop thread: a copy into the queue, never a write.
+void NoteLateness(talos::rio::RioLog& log, talos::rio::LogKind kind,
+                  std::size_t index, const std::string& name, uint16_t id,
+                  const std::string& bus, int can_id, uint32_t late_us,
+                  const ph::BaseStatusSignal& p, const ph::BaseStatusSignal& v,
+                  bool& late, uint32_t& peak_age_us) {
+  const uint32_t age_us = std::max(Age(p), Age(v));
+  const bool now_late = age_us >= late_us;
+  if (now_late) peak_age_us = std::max(peak_age_us, age_us);
+  if (now_late == late) return;
+  talos::rio::LogEvent event;
+  event.kind = kind;
+  event.index = static_cast<uint16_t>(index);
+  event.id = id;
+  event.can_id = can_id;
+  event.flag = now_late;
+  event.value = peak_age_us;
+  event.previous = late_us;
+  event.status = p.GetStatus().GetName();
+  event.status2 = v.GetStatus().GetName();
+  event.age_us = Age(p);
+  event.age2_us = Age(v);
+  event.SetName(name);
+  event.SetBus(bus);
+  log.Post(event);
+  late = now_late;
+  if (!now_late) peak_age_us = 0;
 }
 
 // A config apply or a signal-rate change can miss its reply window while a
@@ -153,6 +196,10 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   last_fault_flags_.fill(0);
   last_motor_valid_.fill(true);
   last_sensor_valid_.fill(true);
+  motor_late_.fill(false);
+  motor_peak_age_us_.fill(0);
+  sensor_late_.fill(false);
+  sensor_peak_age_us_.fill(0);
   last_motor_fault_mask_ = 0;
   neutral_send_failing_.fill(false);
   apply_failing_.fill(false);
@@ -574,6 +621,9 @@ bool PhoenixBackend::Read(hw::State& s) {
   const uint64_t devices_start_ns = NowNs();
   log_->AddPhase(TickPhase::kRefresh, devices_start_ns - refresh_start_ns);
   bool healthy = motors_.empty() && sensors_.empty();
+  // Four status periods: the LATE line's threshold (NoteLateness).
+  const auto late_us =
+      static_cast<uint32_t>(std::ceil(4'000'000.0 / config_.status_hz));
   for (std::size_t i = 0; i < motors_.size(); ++i) {
     auto& motor = *motors_[i];
     auto& out = s.motors[i];
@@ -649,16 +699,22 @@ bool PhoenixBackend::Read(hw::State& s) {
       log_->Post(event);
       last_fault_flags_[i] = out.fault_flags;
     }
-    out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
-                std::isfinite(out.velocity_rps) &&
-                std::find(unavailable_.begin(), unavailable_.end(),
-                          motor_config.id) == unavailable_.end();
+    // Status, value and isolation only: the gateway judges the ages.
+    out.valid =
+        p.GetStatus().IsOK() && v.GetStatus().IsOK() &&
+        std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps) &&
+        std::find(unavailable_.begin(), unavailable_.end(), motor_config.id) ==
+            unavailable_.end();
     if (out.valid != last_motor_valid_[i]) {
       LogFeedbackChange(*log_, talos::rio::LogKind::kMotorFeedback, i,
                         motor_config.name, motor_config.id, motor_config.bus,
                         motor_config.can_id, out.valid, p, v);
       last_motor_valid_[i] = out.valid;
     }
+    NoteLateness(*log_, talos::rio::LogKind::kMotorFeedbackLate, i,
+                 motor_config.name, motor_config.id, motor_config.bus,
+                 motor_config.can_id, late_us, p, v, motor_late_[i],
+                 motor_peak_age_us_[i]);
     healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
@@ -679,7 +735,7 @@ bool PhoenixBackend::Read(hw::State& s) {
       velocity_signal = &v;
       out.position_rot = p.GetValue().value();
       out.velocity_rps = v.GetValue().value();
-      out.valid = Fresh(p) && Fresh(v);
+      out.valid = p.GetStatus().IsOK() && v.GetStatus().IsOK();
       out.position_age_us = Age(p);
       out.velocity_age_us = Age(v);
     } else {
@@ -690,19 +746,24 @@ bool PhoenixBackend::Read(hw::State& s) {
       const double sign = config_.sensors[i].inverted ? -1.0 : 1.0;
       out.position_rot = sign * p.GetValue().value() / 360.0;
       out.velocity_rps = sign * v.GetValue().value() / 360.0;
-      out.valid = Fresh(p) && Fresh(v);
+      out.valid = p.GetStatus().IsOK() && v.GetStatus().IsOK();
       out.position_age_us = Age(p);
       out.velocity_age_us = Age(v);
     }
+    // Status and value only: the gateway judges the ages.
     out.valid &=
         std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps);
+    const auto& sensor = config_.sensors[i];
     if (out.valid != last_sensor_valid_[i]) {
-      const auto& sensor = config_.sensors[i];
       LogFeedbackChange(*log_, talos::rio::LogKind::kSensorFeedback, i,
                         sensor.name, sensor.id, sensor.bus, sensor.can_id,
                         out.valid, *position_signal, *velocity_signal);
       last_sensor_valid_[i] = out.valid;
     }
+    NoteLateness(*log_, talos::rio::LogKind::kSensorFeedbackLate, i,
+                 sensor.name, sensor.id, sensor.bus, sensor.can_id, late_us,
+                 *position_signal, *velocity_signal, sensor_late_[i],
+                 sensor_peak_age_us_[i]);
     healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
@@ -850,8 +911,9 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
           static_cast<std::size_t>(master - config_.motors.begin());
       auto& position = motors_[master_index]->GetPosition(false);
       auto& velocity = motors_[master_index]->GetVelocity(false);
-      bool feedback_valid =
-          ValidMotionFeedback(m.GetPosition(false), m.GetVelocity(false));
+      const uint64_t bound = config_.command_timeout_us;
+      bool feedback_valid = ValidMotionFeedback(m.GetPosition(false),
+                                                m.GetVelocity(false), bound);
       if (config.feedback == hw::Feedback::kRemoteCANcoder) {
         bool sensor_valid = false;
         for (std::size_t j = 0; j < config_.sensors.size(); ++j) {
@@ -859,7 +921,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
               sensors_[j].encoder) {
             sensor_valid = ValidMotionFeedback(
                 sensors_[j].encoder->GetAbsolutePosition(false),
-                sensors_[j].encoder->GetVelocity(false));
+                sensors_[j].encoder->GetVelocity(false), bound);
             break;
           }
         }
@@ -867,7 +929,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
       }
       const bool neutral = r.mode == hw::Mode::kNeutral ||
                            commands[master_index].mode == hw::Mode::kNeutral ||
-                           !ValidMotionFeedback(position, velocity) ||
+                           !ValidMotionFeedback(position, velocity, bound) ||
                            !feedback_valid;
       sim_neutral_[i] = neutral;
       if (neutral) {

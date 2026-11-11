@@ -61,6 +61,10 @@ enum class LogKind : uint8_t {
                     // previous, motion sample
   kMotorFeedback,   // motion feedback valid/invalid (flag = valid)
   kSensorFeedback,  // CAN sensor feedback valid/invalid (flag = valid)
+  // Feedback four status periods old, or younger again (flag = late;
+  // value = the spell's oldest age, previous = the threshold, both in us).
+  kMotorFeedbackLate,
+  kSensorFeedbackLate,
   kMotorFaultMask,  // faulted-motor mask changed: value, previous
   kBrownout,        // flag = active, a = battery volts
   kApplyControl,    // control send failed/recovered (flag = failed)
