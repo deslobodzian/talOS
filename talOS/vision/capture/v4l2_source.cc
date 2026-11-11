@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <stop_token>
@@ -33,6 +34,60 @@ int Ioctl(int fd, unsigned long request, void* arg) {
   } while (result < 0 && errno == EINTR);
   return result;
 }
+// The pixel format a frame is delivered in for a V4L2 pixel format.
+PixelFormat DeliveredFormat(uint32_t pixel_format) {
+  return pixel_format == V4L2_PIX_FMT_YUYV ? PixelFormat::kYuyv
+                                           : PixelFormat::kGray8;
+}
+
+// Every discrete size and interval `fd` offers in the formats the source
+// opens. A stepwise or continuous range contributes its two ends.
+std::vector<V4L2Mode> EnumerateModes(int fd) {
+  std::vector<V4L2Mode> modes;
+  for (const uint32_t pixel : kV4L2PixelFormats) {
+    bool listed = false;
+    v4l2_fmtdesc description{};
+    description.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    for (; Ioctl(fd, VIDIOC_ENUM_FMT, &description) == 0; ++description.index) {
+      listed = listed || description.pixelformat == pixel;
+    }
+    if (!listed) continue;
+    v4l2_frmsizeenum size{};
+    size.pixel_format = pixel;
+    for (; Ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &size) == 0; ++size.index) {
+      std::vector<std::pair<uint32_t, uint32_t>> sizes;
+      if (size.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+        sizes.emplace_back(size.discrete.width, size.discrete.height);
+      } else {
+        sizes.emplace_back(size.stepwise.min_width, size.stepwise.min_height);
+        sizes.emplace_back(size.stepwise.max_width, size.stepwise.max_height);
+      }
+      for (const auto& [width, height] : sizes) {
+        v4l2_frmivalenum interval{};
+        interval.pixel_format = pixel;
+        interval.width = width;
+        interval.height = height;
+        for (; Ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &interval) == 0;
+             ++interval.index) {
+          if (interval.type == V4L2_FRMIVAL_TYPE_DISCRETE) {
+            modes.push_back({pixel, width, height, interval.discrete.numerator,
+                             interval.discrete.denominator});
+          } else {
+            for (const auto& fraction :
+                 {interval.stepwise.min, interval.stepwise.max}) {
+              modes.push_back({pixel, width, height, fraction.numerator,
+                               fraction.denominator});
+            }
+            break;
+          }
+        }
+      }
+      if (size.type != V4L2_FRMSIZE_TYPE_DISCRETE) break;
+    }
+  }
+  return modes;
+}
+
 class Source final : public CameraSource {
  public:
   explicit Source(CameraSourceConfig config) : config_(std::move(config)) {
@@ -50,7 +105,17 @@ class Source final : public CameraSource {
                : config_.device_path;
   }
   std::string name() const override { return device_id(); }
-  std::vector<CameraMode> SupportedModes() const override { return {}; }
+  std::vector<CameraMode> SupportedModes() const override {
+    const int fd = open(device_id().c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) return {};
+    std::vector<CameraMode> modes;
+    for (const auto& mode : EnumerateModes(fd)) {
+      modes.push_back({mode.width, mode.height, mode.fps(),
+                       DeliveredFormat(mode.pixel_format)});
+    }
+    close(fd);
+    return modes;
+  }
   CameraMode CurrentMode() const override { return mode_; }
   bool SetMode(const CameraMode& mode) override {
     if (worker_.joinable() || !mode.width || !mode.height ||
@@ -105,50 +170,59 @@ class Source final : public CameraSource {
     driver_.assign(reinterpret_cast<const char*>(caps.driver),
                    strnlen(reinterpret_cast<const char*>(caps.driver),
                            sizeof(caps.driver)));
-    v4l2_format format{};
-    bool selected = false;
-    const uint32_t preferred = mode_.format == PixelFormat::kGray8
-                                   ? V4L2_PIX_FMT_GREY
-                                   : V4L2_PIX_FMT_YUYV;
-    for (uint32_t pixel :
-         {preferred, preferred == V4L2_PIX_FMT_GREY ? V4L2_PIX_FMT_YUYV
-                                                    : V4L2_PIX_FMT_GREY}) {
-      format = {};
-      format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-      format.fmt.pix.width = mode_.width;
-      format.fmt.pix.height = mode_.height;
-      format.fmt.pix.pixelformat = pixel;
-      format.fmt.pix.field = V4L2_FIELD_ANY;
-      if (Ioctl(fd_, VIDIOC_S_FMT, &format) == 0 &&
-          (format.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY ||
-           format.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)) {
-        selected = true;
-        break;
-      }
-    }
+    const auto offered = EnumerateModes(fd_);
+    const auto selected =
+        SelectV4L2Mode(mode_.width, mode_.height, mode_.fps, offered);
     if (!selected) {
-      return Fail("neither GREY nor YUYV is available", 0);
+      char wanted[64];
+      std::snprintf(wanted, sizeof(wanted), "%ux%u@%g", mode_.width,
+                    mode_.height, mode_.fps);
+      std::string message = std::string("mode ") + wanted +
+                            " is not offered by the device; it offers:";
+      for (const auto& mode : offered) {
+        message += ' ' + DescribeV4L2Mode(mode) + ',';
+      }
+      if (!offered.empty()) message.pop_back();
+      return Fail(message.c_str(), 0);
     }
-    if (mode_.width > 0 && mode_.height > 0 &&
-        (format.fmt.pix.width != mode_.width ||
-         format.fmt.pix.height != mode_.height)) {
-      return Fail("requested width x height is not supported", 0);
+    v4l2_format format{};
+    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    format.fmt.pix.width = selected->width;
+    format.fmt.pix.height = selected->height;
+    format.fmt.pix.pixelformat = selected->pixel_format;
+    format.fmt.pix.field = V4L2_FIELD_NONE;
+    if (Ioctl(fd_, VIDIOC_S_FMT, &format) < 0) {
+      return Fail("VIDIOC_S_FMT", errno);
     }
-    mode_.width = format.fmt.pix.width;
-    mode_.height = format.fmt.pix.height;
-    mode_.format = format.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY
-                       ? PixelFormat::kGray8
-                       : PixelFormat::kYuyv;
+    v4l2_streamparm parm{};
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    parm.parm.capture.timeperframe = {selected->interval_numerator,
+                                      selected->interval_denominator};
+    if (Ioctl(fd_, VIDIOC_S_PARM, &parm) < 0) {
+      return Fail("VIDIOC_S_PARM", errno);
+    }
+    if (!(parm.parm.capture.capability & V4L2_CAP_TIMEPERFRAME)) {
+      return Fail("device cannot set its frame interval", 0);
+    }
+    const V4L2Mode granted{format.fmt.pix.pixelformat, format.fmt.pix.width,
+                           format.fmt.pix.height,
+                           parm.parm.capture.timeperframe.numerator,
+                           parm.parm.capture.timeperframe.denominator};
+    if (!V4L2Granted(*selected, granted)) {
+      const std::string message = "driver granted " +
+                                  DescribeV4L2Mode(granted) + " for " +
+                                  DescribeV4L2Mode(*selected);
+      return Fail(message.c_str(), 0);
+    }
+    mode_.width = granted.width;
+    mode_.height = granted.height;
+    mode_.fps = granted.fps();
+    mode_.format = DeliveredFormat(granted.pixel_format);
     stride_ = format.fmt.pix.bytesperline;
     if (!mode_.height || stride_ < mode_.width * BytesPerPixel(mode_.format)) {
       return Fail("driver reported an invalid stride", 0);
     }
     const size_t size = static_cast<size_t>(stride_) * mode_.height;
-    v4l2_streamparm parm{};
-    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    parm.parm.capture.timeperframe = {
-        1000, static_cast<uint32_t>(std::lround(mode_.fps * 1000))};
-    Ioctl(fd_, VIDIOC_S_PARM, &parm);
     controls_applied_ =
         ApplyV4L2Controls(controls_, [this](uint32_t id, int32_t value) {
           v4l2_control control{};

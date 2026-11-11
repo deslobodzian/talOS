@@ -44,6 +44,53 @@ TEST(Capture, LinuxTimestampFlagsRetainSourceMeaning) {
             TimestampKind::kDelivery);
 }
 
+// FIELD-4 (no REQ row covers live capture modes yet): a live camera opens
+// only the configured size and rate. Scenario: an Arducam OV9281 (uvcvideo)
+// offers YUYV 1280x800 at 20/15 fps and 640x480 at 30/20 fps; asked for
+// 640x480 at 25 fps the source opened, reported 25 fps and delivered 30, and
+// asked for 1280x800 at 120 fps it reported 120 and delivered nothing.
+TEST(Capture, LinuxOpensOnlyAnOfferedSizeAndRate) {
+  // As uvcvideo enumerates them: intervals in 100 ns units.
+  const auto mode = [](uint32_t format, uint32_t w, uint32_t h,
+                       uint32_t interval_100ns) {
+    return V4L2Mode{format, w, h, interval_100ns, 10000000};
+  };
+  const V4L2Mode offered[] = {
+      mode(V4L2_PIX_FMT_YUYV, 1280, 800, 500000),
+      mode(V4L2_PIX_FMT_YUYV, 1280, 800, 666666),
+      mode(V4L2_PIX_FMT_YUYV, 640, 480, 333333),
+      mode(V4L2_PIX_FMT_YUYV, 640, 480, 500000),
+      mode(V4L2_PIX_FMT_GREY, 640, 480, 500000),
+  };
+  const struct {
+    uint32_t width, height;
+    double fps;
+    std::optional<V4L2Mode> expected;
+  } cases[] = {
+      {640, 480, 30, offered[2]},
+      // GREY needs no conversion: preferred over YUYV at the same mode.
+      {640, 480, 20, offered[4]},
+      {1280, 800, 20, offered[0]},
+      {1280, 800, 15, offered[1]},
+      {640, 480, 25, std::nullopt},
+      {1280, 800, 30, std::nullopt},
+      {1280, 720, 20, std::nullopt},
+      {640, 480, 30.01, std::nullopt},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(testing::Message()
+                 << c.width << "x" << c.height << "@" << c.fps);
+    EXPECT_EQ(SelectV4L2Mode(c.width, c.height, c.fps, offered), c.expected);
+  }
+  // What the driver grants after S_FMT/S_PARM must be what was selected.
+  const V4L2Mode selected = offered[2];
+  EXPECT_TRUE(V4L2Granted(selected, selected));
+  EXPECT_TRUE(V4L2Granted(selected, {V4L2_PIX_FMT_YUYV, 640, 480, 1, 30}));
+  EXPECT_FALSE(V4L2Granted(selected, offered[3]));
+  EXPECT_FALSE(V4L2Granted(selected, {V4L2_PIX_FMT_GREY, 640, 480, 1, 30}));
+  EXPECT_FALSE(V4L2Granted(selected, {V4L2_PIX_FMT_YUYV, 640, 400, 1, 30}));
+}
+
 TEST(Capture, LinuxExposureUsesDeviceUnitsAndReportsFailures) {
   std::vector<std::pair<uint32_t, int32_t>> writes;
   CameraControls controls;
