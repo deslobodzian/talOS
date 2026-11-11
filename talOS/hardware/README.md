@@ -336,7 +336,15 @@ DIO/analog/PWM and RIO encoder validity never sink the backend.
 `2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp` is the thin WPILib
 adapter. Its companion (main processor) address is fixed when it is built:
 `./gradlew deploy -Pcompanion=<ipv4>` (or `buildRio`), `10.56.87.11` without
-the property; `build.gradle` refuses anything but a dotted IPv4 literal. It is
+the property. `build.gradle` takes it only from the command line: a
+`companion` set in a `gradle.properties` or `ORG_GRADLE_PROJECT_companion`
+fails the build, so a bench address cannot carry into a later deploy from the
+same laptop. It also fails the build on an empty value (a bare `-Pcompanion`
+or an unset shell variable) and on anything but a dotted IPv4 literal without
+leading zeros outside `0.0.0.0/8`, loopback `127.0.0.0/8` and `224.0.0.0/3`
+(multicast, reserved, broadcast), addresses the RoboRIO's socket could not
+open or send to. Every Gradle run prints the address it builds in and whether
+it is the default (`RoboRIO companion address built in: ...`). It is
 never learned from an incoming datagram: the gateway's socket is connected to
 that one peer, which is what keeps any other host on the network from
 commanding the robot ([protocol](../protocol/README.md)). Runtime ports are

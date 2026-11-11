@@ -110,25 +110,57 @@ if (project.hasProperty("ubsan")) {
 }
 
 // The companion (main processor) address the program sends State to and
-// accepts frames from: -Pcompanion=<IPv4 literal> on deploy or buildRio,
-// 10.56.87.11 without it. It is fixed in the binary, never learned from a
-// datagram, because the gateway's connected socket is what keeps every other
-// host on the network from commanding the robot (talOS/protocol/README.md).
-// The socket resolves no hostname and refuses the unspecified 0.0.0.0, so
-// anything else than a dotted IPv4 literal in inet_pton's form (four decimal
-// octets, no leading zeros), and 0.0.0.0, stop the build here instead of
-// failing every socket open on the RoboRIO.
-def companionAddress = project.findProperty('companion')?.toString() ?: '10.56.87.11'
-def validIpv4 = { String text ->
-    def octets = text.split('\\.', -1)
-    octets.length == 4 && octets.every { it ==~ /0|[1-9][0-9]{0,2}/ && it.toInteger() <= 255 } &&
-            text != '0.0.0.0'
-}
-if (!validIpv4(companionAddress)) {
+// accepts frames from: -Pcompanion=<IPv4 literal> on the command line of
+// deploy or buildRio, 10.56.87.11 without it. It is fixed in the binary,
+// never learned from a datagram, because the gateway's connected socket is
+// what keeps every other host on the network from commanding the robot
+// (talOS/protocol/README.md).
+//
+// Only the command line may set it. Gradle would also take it from
+// ~/.gradle/gradle.properties, a project gradle.properties or
+// ORG_GRADLE_PROJECT_companion, where a bench address would silently carry
+// into a later competition deploy from the same laptop; those fail the build.
+// A present but empty value (a bare -Pcompanion, or -Pcompanion=$UNSET) fails
+// too rather than falling back to the default.
+//
+// The value must be one RuntimeUdpPeer::Open can connect to and send to on
+// the RoboRIO, so the build stops here instead of every socket open failing
+// or every State going nowhere: a dotted IPv4 literal in inet_pton's form
+// (four decimal octets, no leading zeros), not in 0.0.0.0/8 ("this network",
+// 0.0.0.0 refused by Open), 127.0.0.0/8 (loopback, the RoboRIO itself) or
+// 224.0.0.0/3 (multicast, reserved, and the broadcast 255.255.255.255, whose
+// connect fails with EACCES on every retry).
+def companionFromCommandLine = gradle.startParameter.projectProperties.containsKey('companion')
+if (project.hasProperty('companion') && !companionFromCommandLine) {
     throw new GradleException(
-            "-Pcompanion=${companionAddress}: the companion address must be a dotted IPv4 " +
-            "literal such as 10.56.87.11 (the RoboRIO program resolves no hostname)")
+            "companion=${project.property('companion')} is set outside the command line " +
+            "(gradle.properties or ORG_GRADLE_PROJECT_companion); remove it there: the " +
+            "RoboRIO companion address is accepted only as -Pcompanion=<ipv4> on the command " +
+            "line, so a bench address cannot persist into another deploy")
 }
+def companionAddress = companionFromCommandLine ?
+        gradle.startParameter.projectProperties['companion'].toString() : '10.56.87.11'
+def companionRefusal = { String text ->
+    if (text.isEmpty()) return 'it is empty (a bare -Pcompanion, or an unset variable)'
+    def octets = text.split('\\.', -1)
+    if (octets.length != 4 ||
+            !octets.every { it ==~ /0|[1-9][0-9]{0,2}/ && it.toInteger() <= 255 }) {
+        return 'it is not a dotted IPv4 literal such as 10.56.87.11 (the RoboRIO program ' +
+                'resolves no hostname; no leading zeros)'
+    }
+    def first = octets[0].toInteger()
+    if (first == 0) return 'it is in 0.0.0.0/8, which names no host'
+    if (first == 127) return 'it is a loopback address, the RoboRIO itself'
+    if (first >= 224) return 'it is a multicast, reserved or broadcast address'
+    return null
+}
+def refusal = companionRefusal(companionAddress)
+if (refusal != null) {
+    throw new GradleException("-Pcompanion=${companionAddress} refused: ${refusal}")
+}
+logger.quiet("RoboRIO companion address built in: ${companionAddress}" +
+        (companionFromCommandLine ? ' (from -Pcompanion)' :
+                ' (default, the robot network; -Pcompanion=<ipv4> to change)'))
 
 // The build this program reports in every State (talOS/hardware/messages.h,
 // GatewayBuild): RioBuild.h, written before any compile, holds the git commit

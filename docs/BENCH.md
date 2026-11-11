@@ -59,8 +59,10 @@ release all controls, and explicitly re-enable only after checking recovery.
 
 On a LAN that is not `10.56.87.x`, build the RIO program for the main
 processor's address, from `2026-robot/controller_processor/rio`:
-`./gradlew deploy -Pcompanion=<main-processor-ipv4>` (also `buildRio`; a
-hostname or malformed address stops the build). The address is fixed in the
+`./gradlew deploy -Pcompanion=<main-processor-ipv4>` (also `buildRio`), on
+the command line each time: Gradle refuses it from a `gradle.properties` or
+the environment, and an empty, hostname or unusable address stops the build. Check that the build's
+`RoboRIO companion address built in:` line names it. The address is fixed in the
 binary, never learned from the network
 ([RoboRIO](../talOS/hardware/README.md#roborio)); check the console line names
 it. `deploy` still finds the RIO by its team mDNS name
