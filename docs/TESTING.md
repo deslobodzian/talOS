@@ -222,9 +222,10 @@ Required cases by role:
 
 The lint checks the node packages under the robot, example, bench and
 scaffold directories and every package their configs' manifests launch. It
-takes the role from the package's sources (a `Motor`, `DigitalOutput` or
-`PwmOutput`: actuator; else a `TargetLane`, `OperatorArming` or
-`detail::TargetAccess`: producer; else observer). A
+takes the role from the package's sources (a `Motor`, `DigitalOutput`,
+`PwmOutput` or a `talos::mechanisms` block owning a motor: actuator; else a
+`TargetLane`, `OperatorArming` or `detail::TargetAccess`: producer; else
+observer). A
 `// matrix: role <role> (reason)` comment overrides it, never away from
 actuator; a Python package that only wraps C++ nodes (`talos.cpp_node`) is
 checked in its C++ package.

@@ -59,6 +59,9 @@ class CheckNodeMatrixTest(unittest.TestCase):
                 (["from talos.devices import (\n    DigitalInput,\n"
                   "    Motor,\n)\n"], "actuator"),
                 (["from talos import Motor\n"], "actuator"),
+                # examples/superstructure: the Motor is the block's.
+                (["talos::mechanisms::PositionMechanism lift_;\n"],
+                 "actuator"),
                 # talOS/teleop writes its lanes through the framework hooks.
                 (["arming_{talos::detail::TargetAccess::open_arming(node)}"],
                  "producer"),

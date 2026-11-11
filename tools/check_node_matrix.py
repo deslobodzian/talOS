@@ -13,7 +13,9 @@ Python test of a C++ node tests the binding), or each file given, is checked
 for the cases its role requires, by the matrix's names (Python:
 test_<snake_case>). The role comes from the package's non-test sources:
 
-- actuator: it constructs a Motor, DigitalOutput or PwmOutput;
+- actuator: it constructs a Motor, DigitalOutput or PwmOutput, or a
+  talOS/mechanisms block that owns a Motor (PositionMechanism,
+  VelocityMechanism, RollerWithSensor);
 - producer: otherwise it writes target lanes (TargetLane, OperatorArming,
   detail::TargetAccess);
 - observer: otherwise;
@@ -80,6 +82,9 @@ LABEL = re.compile(r'"//([^:"]*):[^"]*"')
 ACTUATORS = r"(?:Motor|DigitalOutput|PwmOutput)"
 ACTUATOR = (
     re.compile(rf"\btalos(?:::|\.(?:devices\.)?){ACTUATORS}\b"),
+    # A talOS/mechanisms block constructs its Motor inside the library.
+    re.compile(r"\btalos::mechanisms::(?:PositionMechanism|VelocityMechanism"
+               r"|RollerWithSensor)\b"),
     # Python: from talos import Motor / from talos.devices import (Motor, ...)
     re.compile(rf"^\s*from\s+talos(?:\.devices)?\s+import\s+"
                rf"(?:\([^)]*|[^\n(]*)\b{ACTUATORS}\b", re.MULTILINE),
