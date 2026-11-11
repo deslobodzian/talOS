@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/imgproc.hpp>
 #include <utility>
+#include <vector>
 
 #include "talOS/vision/capture/avfoundation_source.h"
 #include "talOS/vision/capture/v4l2_source.h"
@@ -89,6 +93,36 @@ TEST(Capture, LinuxOpensOnlyAnOfferedSizeAndRate) {
   EXPECT_FALSE(V4L2Granted(selected, offered[3]));
   EXPECT_FALSE(V4L2Granted(selected, {V4L2_PIX_FMT_GREY, 640, 480, 1, 30}));
   EXPECT_FALSE(V4L2Granted(selected, {V4L2_PIX_FMT_YUYV, 640, 400, 1, 30}));
+}
+
+// FIELD-4: an OV9281 offers 1280x800 above 20 fps only as MJPG, a colour
+// (4:2:2 YCbCr) JPEG with zero padding after its end marker. A frame decodes
+// to the mode's gray image; one cut short on the bus, or of another size, is
+// refused rather than delivered as a partial or wrong image.
+TEST(Capture, LinuxMjpegFramesDecodeToGrayOrAreRefused) {
+  cv::Mat bgr(80, 128, CV_8UC3);
+  for (int y = 0; y < bgr.rows; ++y) {
+    for (int x = 0; x < bgr.cols; ++x) {
+      const auto v = static_cast<uint8_t>(x + y);
+      bgr.at<cv::Vec3b>(y, x) = {v, v, v};
+    }
+  }
+  std::vector<uint8_t> jpeg;
+  ASSERT_TRUE(cv::imencode(".jpg", bgr, jpeg, {cv::IMWRITE_JPEG_QUALITY, 95}));
+  cv::Mat expected;
+  cv::cvtColor(bgr, expected, cv::COLOR_BGR2GRAY);
+  std::vector<uint8_t> padded = jpeg;
+  padded.resize(jpeg.size() + 64, 0);
+  std::vector<uint8_t> gray(128 * 80, 0);
+  ASSERT_TRUE(DecodeMjpegGray(padded.data(), padded.size(), 128, 80, gray));
+  const cv::Mat decoded(80, 128, CV_8UC1, gray.data());
+  EXPECT_LE(cv::norm(decoded, expected, cv::NORM_INF), 4.0);
+
+  std::vector<uint8_t> truncated(jpeg.begin(), jpeg.end() - 200);
+  EXPECT_FALSE(
+      DecodeMjpegGray(truncated.data(), truncated.size(), 128, 80, gray));
+  std::vector<uint8_t> other_size(64 * 80, 0);
+  EXPECT_FALSE(DecodeMjpegGray(jpeg.data(), jpeg.size(), 64, 80, other_size));
 }
 
 TEST(Capture, LinuxExposureUsesDeviceUnitsAndReportsFailures) {

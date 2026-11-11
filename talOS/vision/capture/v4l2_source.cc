@@ -17,7 +17,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -39,6 +42,37 @@ PixelFormat DeliveredFormat(uint32_t pixel_format) {
   return pixel_format == V4L2_PIX_FMT_YUYV ? PixelFormat::kYuyv
                                            : PixelFormat::kGray8;
 }
+}  // namespace
+
+bool DecodeMjpegGray(const uint8_t* data, size_t size, uint32_t width,
+                     uint32_t height, std::vector<uint8_t>& gray) {
+  // uvcvideo pads a frame with zeros after its end-of-image marker; a frame
+  // without one was cut short on the bus.
+  while (size > 0 && data[size - 1] == 0) --size;
+  if (size < 4 || data[0] != 0xff || data[1] != 0xd8 ||
+      data[size - 2] != 0xff || data[size - 1] != 0xd9 ||
+      gray.size() != static_cast<size_t>(width) * height ||
+      size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+    return false;
+  }
+  // Wrapping `gray` makes imdecode write into it when the JPEG has the
+  // expected size and reallocate (detected below) when it does not. A colour
+  // JPEG decodes its luma only: libjpeg skips the chroma IDCT and colour
+  // conversion for a grayscale output.
+  cv::Mat out(static_cast<int>(height), static_cast<int>(width), CV_8UC1,
+              gray.data());
+  try {
+    cv::imdecode(
+        cv::Mat(1, static_cast<int>(size), CV_8UC1, const_cast<uint8_t*>(data)),
+        cv::IMREAD_GRAYSCALE | cv::IMREAD_IGNORE_ORIENTATION, &out);
+  } catch (const cv::Exception&) {
+    return false;
+  }
+  return out.data == gray.data() && out.cols == static_cast<int>(width) &&
+         out.rows == static_cast<int>(height) && out.type() == CV_8UC1;
+}
+
+namespace {
 
 // Every discrete size and interval `fd` offers in the formats the source
 // opens. A stepwise or continuous range contributes its two ends.
@@ -218,11 +252,16 @@ class Source final : public CameraSource {
     mode_.height = granted.height;
     mode_.fps = granted.fps();
     mode_.format = DeliveredFormat(granted.pixel_format);
-    stride_ = format.fmt.pix.bytesperline;
+    mjpeg_ = granted.pixel_format == V4L2_PIX_FMT_MJPEG;
+    // A compressed frame's size varies; it is decoded into `decoded_`.
+    stride_ = mjpeg_ ? mode_.width : format.fmt.pix.bytesperline;
     if (!mode_.height || stride_ < mode_.width * BytesPerPixel(mode_.format)) {
       return Fail("driver reported an invalid stride", 0);
     }
-    const size_t size = static_cast<size_t>(stride_) * mode_.height;
+    const size_t size =
+        mjpeg_ ? 1 : static_cast<size_t>(stride_) * mode_.height;
+    decoded_.assign(mjpeg_ ? static_cast<size_t>(stride_) * mode_.height : 0,
+                    0);
     controls_applied_ =
         ApplyV4L2Controls(controls_, [this](uint32_t id, int32_t value) {
           v4l2_control control{};
@@ -353,17 +392,26 @@ class Source final : public CameraSource {
                                       ? node_delivery - (delivery - driver_time)
                                       : node_delivery;
       const size_t size = static_cast<size_t>(stride_) * mode_.height;
-      if (buffer.index < mappings_.size() &&
-          !(buffer.flags & V4L2_BUF_FLAG_ERROR) && buffer.bytesused >= size) {
+      const bool delivered =
+          buffer.index < mappings_.size() &&
+          !(buffer.flags & V4L2_BUF_FLAG_ERROR) &&
+          (mjpeg_
+               ? DecodeMjpegGray(
+                     static_cast<const uint8_t*>(mappings_[buffer.index].data),
+                     buffer.bytesused, mode_.width, mode_.height, decoded_)
+               : buffer.bytesused >= size);
+      if (delivered) {
         // The frame borrows the dequeued driver buffer until it is queued
         // again below; the consumer copies what it keeps (FrameMailbox).
         // Preserve source meaning; the camera publication boundary converts
         // it to a midpoint once (CaptureMidpoint).
-        Frame frame(config_.camera_id, session_, sequence_++,
-                    event::MonotonicTime::from_nanos(capture_end), mode_.width,
-                    mode_.height, stride_, mode_.format,
-                    static_cast<const uint8_t*>(mappings_[buffer.index].data),
-                    size);
+        Frame frame(
+            config_.camera_id, session_, sequence_++,
+            event::MonotonicTime::from_nanos(capture_end), mode_.width,
+            mode_.height, stride_, mode_.format,
+            mjpeg_ ? decoded_.data()
+                   : static_cast<const uint8_t*>(mappings_[buffer.index].data),
+            size);
         frame.set_raw_timestamp_ns(driver_monotonic ? driver_time : delivery);
         frame.set_timestamp_kind(V4L2TimestampKind(buffer.flags, driver_));
         frame.set_mapping_quality(TimestampMappingQuality::kEstimated);
@@ -371,8 +419,9 @@ class Source final : public CameraSource {
           callback_(frame);
         }
       } else {
-        // An errored or short driver buffer; counted by the consumer through
-        // dropped_frames().
+        // An errored or short driver buffer, or an MJPG frame that is
+        // truncated or does not decode to the mode's size; counted by the
+        // consumer through dropped_frames().
         ++dropped_frames_;
       }
       if (Ioctl(fd_, VIDIOC_QBUF, &buffer) < 0) {
@@ -404,6 +453,8 @@ class Source final : public CameraSource {
   uint32_t stride_{0};
   uint64_t session_{0}, sequence_{0};
   std::string driver_;  // VIDIOC_QUERYCAP driver name; set before streaming.
+  bool mjpeg_{false};
+  std::vector<uint8_t> decoded_;  // MJPG frames decode here, gray, stride_.
 };
 }  // namespace
 std::unique_ptr<CameraSource> CreatePlatformCameraSource(

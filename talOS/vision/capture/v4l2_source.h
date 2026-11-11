@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace talos::vision {
 // One frame size and frame interval a V4L2 device offers in one pixel format
@@ -33,8 +34,18 @@ struct V4L2Mode {
 };
 
 // The pixel formats the source opens, in preference order.
-inline constexpr uint32_t kV4L2PixelFormats[] = {V4L2_PIX_FMT_GREY,
-                                                 V4L2_PIX_FMT_YUYV};
+// GREY and YUYV arrive uncompressed (exact pixels); MJPG, often the only
+// format at a high rate (an OV9281's YUYV tops out at 20 fps at 1280x800),
+// is decoded to gray on the capture thread.
+inline constexpr uint32_t kV4L2PixelFormats[] = {
+    V4L2_PIX_FMT_GREY, V4L2_PIX_FMT_YUYV, V4L2_PIX_FMT_MJPEG};
+
+// Decodes one MJPG frame's luma into `gray` (`width` x `height`, sized by the
+// caller, stride `width`). False, with `gray` unspecified, when the frame has
+// no end-of-image marker (zero padding after it is allowed), does not decode,
+// or is another size.
+bool DecodeMjpegGray(const uint8_t* data, size_t size, uint32_t width,
+                     uint32_t height, std::vector<uint8_t>& gray);
 
 // Whether `offered` runs at `fps`. UVC states intervals in 100 ns units, so a
 // camera's 120 fps is 83333 / 10000000 s (120.0005 fps); the same relative
