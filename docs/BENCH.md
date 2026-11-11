@@ -30,7 +30,8 @@ release all controls, and explicitly re-enable only after checking recovery.
   not merely Linux CI. Record revision, architecture and command results.
 - [ ] Run `bazel test --test_output=errors //bench/...`, then
   `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --describe-only`
-  and repeat with `bench/main_processor/configuration/robot_bench.toml`. Expected: valid graphs. Record output.
+  and repeat with `bench/main_processor/configuration/robot_bench.toml` and
+  `bench/main_processor/configuration/robot_py.toml`. Expected: valid graphs. Record output.
 - [ ] Before hardware deployment, run
   `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --sim --start-sim-gateway --output-dir /tmp/bench-smoke --duration-s 20`.
   Expected: motor, teleop, telemetry, hardware_node and the generic ideal sim
@@ -93,6 +94,19 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
 
 Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
 `/hw/status` counts States received.
+
+### Bench with the Python motor node
+
+[`robot_py.toml`](../bench/main_processor/configuration/robot_py.toml) is
+`robot.toml` with the motor node swapped for its Python twin,
+[`motor.py`](../bench/main_processor/motor/motor.py) (same subsystem files,
+parameters, gating and `/motor/state`). Every check in this file applies
+unchanged; run it against the RIO with:
+
+```sh
+bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node_py //talOS/teleop:node //talOS/telemetry:node
+bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot_py.toml --remote <roborio-ipv4> --output-dir /tmp/bench-rio-py
+```
 
 ## Uncommissioned and disabled checks
 
