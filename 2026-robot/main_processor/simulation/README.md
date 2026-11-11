@@ -266,11 +266,14 @@ run fits Bazel's 900 s `long` timeout) with the stick centred for the first
   except across a fault on that node, and a killed owner sends again within
   5 s;
 - no request actuates under a disabled Driver Station view, and no drivetrain
-  request actuates without an active teleop target published after its latest
-  crash and within `command_timeout_us + period_us`;
-- a stalled driver neutralizes the drivetrain's requests within that bound, a
-  stalled `hardware_node` within one more period, and a stalled drivetrain is
-  neutralized in `/hw/command` within its owner timeout plus a period;
+  request actuates without a received active teleop target published after
+  its latest crash and younger than `command_timeout_us`;
+- across a stalled driver, every drivetrain request is neutral from
+  `command_timeout_us` after the newest active target the drivetrain received
+  (across a stalled `hardware_node`, the newest `/hw/state`), not after the
+  `SIGSTOP`, and the first of them was due (`event_ms`) before that expiry
+  plus the drivetrain's `period_us`; a stalled drivetrain is neutralized in
+  `/hw/command` within its owner timeout plus a period of its last request;
 - the launcher exits 0, nothing is quarantined, and each node's
   `restart_count` equals the number of times it was killed.
 

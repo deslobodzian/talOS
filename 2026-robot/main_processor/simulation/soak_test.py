@@ -14,11 +14,14 @@ Checked from the recorded session, over the whole run:
   timeout except across a fault injected into that node, and a killed owner
   sends again within RESTART_LIMIT_MS;
 - no request actuates while that node's latest Driver Station view is
-  disabled, and no drivetrain request actuates without an active teleop target
-  published after its latest crash and within command_timeout + one period;
-- a stalled driver or hardware bridge neutralizes the drivetrain's own
-  requests within the stale-input bound, and a stalled drivetrain is
-  neutralized by the bridge's /hw/command within its owner timeout;
+  disabled, and no drivetrain request actuates without a received active
+  teleop target published after its latest crash and younger than
+  command_timeout;
+- across a stalled driver (or hardware bridge) every drivetrain request is
+  neutral from command_timeout after the newest active target (or /hw/state)
+  the drivetrain received, and the first was due on its first tick after that;
+  a stalled drivetrain is neutralized by the bridge's /hw/command within its
+  owner timeout plus a period of its last request;
 - the launcher exits 0, nothing is quarantined, and each node's restart_count
   equals the number of times it was killed.
 """
@@ -105,7 +108,7 @@ class Soak(unittest.TestCase):
 
     def neutral_by(self, rows, start, deadline, end, motor_ids, gap_ms, what):
         """rows: sorted (now_ms, motors). Neutral from some row <= deadline to end."""
-        window = [r for r in rows if start <= r[0] < end]
+        window = [r[:2] for r in rows if start <= r[0] < end]
         times = [start] + [t for t, _ in window] + [end]
         gap = max(b - a for a, b in zip(times, times[1:]))
         self.assertLessEqual(gap, gap_ms, f"{what}: output gap in [{start:.1f}, {end:.1f})")
@@ -117,8 +120,27 @@ class Soak(unittest.TestCase):
                 self.assertTrue(all(motors[i] == NEUTRAL for i in motor_ids),
                                 f"{what}: active output at {t:.1f} ms")
 
+    def neutral_from(self, rows, expiry, end, motor_ids, gap_ms, period_ms, what):
+        """rows: sorted (now_ms, motors, event_ms). An input expired at
+        `expiry`: every output from then to end is neutral, and the first was
+        due (event_ms) on the node's first tick after it. A skipped flush
+        would leave the bridge holding the last demand; a late tick still
+        reports the deadline it missed, so host lateness is not bounded."""
+        window = [r for r in rows if expiry <= r[0] < end]
+        self.assertTrue(window, f"{what}: no output in [{expiry:.1f}, {end:.1f})")
+        times = [expiry] + [r[0] for r in window] + [end]
+        gap = max(b - a for a, b in zip(times, times[1:]))
+        self.assertLessEqual(gap, gap_ms, f"{what}: output gap in [{expiry:.1f}, {end:.1f})")
+        self.assertLess(window[0][2], expiry + period_ms,
+                        f"{what}: the first output after the expiry at {expiry:.1f} ms "
+                        f"was due at {window[0][2]:.1f} ms")
+        for t, motors, _ in window:
+            self.assertTrue(all(motors[i] == NEUTRAL for i in motor_ids),
+                            f"{what}: active output at {t:.1f} ms, after the expiry "
+                            f"at {expiry:.1f} ms")
+
     def driving(self, rows, start, end, drive_ids, what):
-        window = [m for t, m in rows if start <= t < end]
+        window = [r[1] for r in rows if start <= r[0] < end]
         self.assertGreater(len(window), 2, f"{what}: no outputs in [{start:.1f}, {end:.1f})")
         self.assertTrue(all(m[i][0] == "velocity" and abs(m[i][2]) > 0.1
                             for m in window for i in drive_ids),
@@ -136,15 +158,14 @@ class Soak(unittest.TestCase):
         config = config_dir / "robot_physics_sim.toml"
         robot = support.tomllib.loads((config_dir / "robot.toml").read_text())
         timeout_ms = robot["robot"]["command_timeout_us"] / 1000
-        period_ms = robot["robot"]["period_us"] / 1000
-        # A consumer tick past the timeout (ARCHITECTURE.md "The tick").
-        stale_bound = timeout_ms + period_ms
+        period_ms = {}
         owner_timeout = {}
         for name in OWNERS:
             sub = support.tomllib.loads(
                 (config_dir / "subsystems" / f"{name}.toml").read_text())
-            period = sub["subsystem"].get("period_us", robot["robot"]["period_us"]) / 1000
-            owner_timeout[name] = min(max(2 * period, timeout_ms / 2), timeout_ms)
+            period_ms[name] = sub["subsystem"].get(
+                "period_us", robot["robot"]["period_us"]) / 1000
+            owner_timeout[name] = min(max(2 * period_ms[name], timeout_ms / 2), timeout_ms)
         layout = support.device_layout(config_dir / "robot.toml")
         motor_ids = {name: [i for i, sub, _, kind in layout
                             if sub == name and kind == "motors"] for name in OWNERS}
@@ -262,7 +283,8 @@ class Soak(unittest.TestCase):
                                  "/drivetrain/target/teleop"):
                 name, topic = row["process"], row["topic"]
                 if topic == f"/hw/request/{name}" and row["kind"] == "SEND":
-                    requests[name].append((row["now_ms"], support.motor_requests(row)))
+                    requests[name].append((row["now_ms"], support.motor_requests(row),
+                                           row["event_ms"]))
                 elif topic == "/hw/state/driver_station" and row["kind"] == "MESSAGE":
                     ds[name].append((row["now_ms"], support.ds_snapshot(row)[0] & 4))
                 elif (name == "drivetrain" and topic == "/drivetrain/target/teleop" and
@@ -275,11 +297,11 @@ class Soak(unittest.TestCase):
             for name in OWNERS:
                 rows = requests[name]
                 self.assertGreater(len(rows), 100, name)
-                times = [t for t, _ in rows]
+                times = [r[0] for r in rows]
                 own = [(s, e) for _, n, s, e in events if n == name]
                 # Gaps, excluding the span from a fault on this node to its
                 # next request.
-                for (a, _), (b, _) in zip(rows, rows[1:]):
+                for a, b in zip(times, times[1:]):
                     if any(s <= b and e >= a for s, e in own):
                         continue
                     self.assertLessEqual(b - a, owner_timeout[name],
@@ -297,25 +319,28 @@ class Soak(unittest.TestCase):
                 # Disabled Driver Station view -> neutral request.
                 views = ds[name]
                 view_times = [t for t, _ in views]
-                for t, motors in rows:
+                for t, motors, _ in rows:
                     index = bisect.bisect_right(view_times, t) - 1
                     if index < 0 or not views[index][1]:
                         self.assertTrue(all(m == NEUTRAL for m in motors.values()),
                                         f"{name} active while disabled at {t:.1f} ms")
 
-            # No drivetrain actuation without a fresh, post-crash active target.
+            # No drivetrain actuation without a received active target,
+            # published after the latest crash (not retained) and younger than
+            # the timeout when the request was sent, as Target::get() judges.
             target_times = [t for t, _ in targets]
             crashes = sorted(s for a, n, s, _ in events
                              if a == "kill" and n == "drivetrain")
-            for t, motors in requests["drivetrain"]:
+            for t, motors, _ in requests["drivetrain"]:
                 if all(m[0] == "neutral" for m in motors.values()):
                     continue
                 crash = crashes[bisect.bisect_right(crashes, t) - 1] if (
                     crashes and crashes[0] <= t) else float("-inf")
                 j = bisect.bisect_right(target_times, t) - 1
                 fresh = False
-                while j >= 0 and targets[j][0] >= t - stale_bound:
-                    if t - targets[j][1] <= stale_bound and targets[j][1] > crash:
+                # A target received before t - timeout was published before it.
+                while j >= 0 and targets[j][0] >= t - timeout_ms:
+                    if 0 <= t - targets[j][1] < timeout_ms and targets[j][1] > crash:
                         fresh = True
                         break
                     j -= 1
@@ -326,27 +351,45 @@ class Soak(unittest.TestCase):
                 what = f"{action} {name} at {s:.1f} ms"
                 if action != "stop":
                     continue
+                # Each stall is judged from the input it starves, as recorded,
+                # not from the harness's SIGSTOP: the last target (or State)
+                # can precede the stop by a producer tick or more.
                 if name == "driver":
                     self.driving(drive_rows, s - 150, s, drive_ids, what)
-                    self.neutral_by(drive_rows, s, s + stale_bound, e,
-                                    motor_ids["drivetrain"], owner_timeout["drivetrain"], what)
+                    # The lane expires a timeout after the newest active
+                    # target the drivetrain received before the resume.
+                    newest = max((p for r, p in targets if r < e), default=None)
+                    self.assertIsNotNone(newest, f"{what}: no active target received")
+                    self.neutral_from(drive_rows, newest + timeout_ms, e,
+                                      motor_ids["drivetrain"], owner_timeout["drivetrain"],
+                                      period_ms["drivetrain"], what)
                 elif name == "hardware_node":
-                    # The last State can be one gateway tick old when the
-                    # bridge stops; the node then needs a tick to notice.
                     self.driving(drive_rows, s - 150, s, drive_ids, what)
-                    self.neutral_by(drive_rows, s, s + stale_bound + period_ms, e,
-                                    motor_ids["drivetrain"], owner_timeout["drivetrain"], what)
+                    # robot_enabled() turns false a timeout after the
+                    # publication of the newest /hw/state the drivetrain
+                    # received before the resume.
+                    states = [r["publish_ms"] for r in self.dump(
+                        root, session, "drivetrain", "/hw/state", s - 300, e)
+                        if r["kind"] == "MESSAGE" and r["now_ms"] < e]
+                    self.assertTrue(states, f"{what}: no /hw/state received")
+                    self.neutral_from(drive_rows, max(states) + timeout_ms, e,
+                                      motor_ids["drivetrain"], owner_timeout["drivetrain"],
+                                      period_ms["drivetrain"], what)
                 elif name == "drivetrain":
                     commands = [(r["now_ms"], support.motor_requests(r)) for r in self.dump(
                         root, session, "hardware_node", "/hw/command", s - 300, e + 300)
                         if r["kind"] == "SEND"]
                     commands.sort(key=lambda r: r[0])
                     self.driving(commands, s - 150, s, drive_ids, what)
-                    # Owner timeout plus the bridge's 1 ms check, with a
-                    # consumer period of margin for the stop's delivery.
-                    self.neutral_by(commands, s, s + owner_timeout["drivetrain"] + period_ms,
-                                    e, motor_ids["drivetrain"], owner_timeout["drivetrain"],
-                                    what)
+                    # The bridge times the drivetrain out an owner timeout
+                    # after it read the last request, on its 1 ms check; it
+                    # does not record that read, so a drivetrain period past
+                    # the request's send covers the read and the check.
+                    last = drive_rows[bisect.bisect_left(
+                        [r[0] for r in drive_rows], e) - 1][0]
+                    self.neutral_by(commands, s, last + owner_timeout["drivetrain"] +
+                                    period_ms["drivetrain"], e, motor_ids["drivetrain"],
+                                    owner_timeout["drivetrain"], what)
             success = True
         finally:
             if stopped is not None:
