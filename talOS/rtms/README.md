@@ -98,10 +98,14 @@ abstract name `\0talos-wake-<16 hex digits>` (no filesystem entry), on macOS
 `TEST_TMPDIR`), unlinked when the receiver is destroyed. A receiver killed
 before its destructor runs leaves its file; as a dead reader's slot is freed
 when the next reader claims one, every new macOS receiver first removes each
-`/tmp/talos-wake-*` socket file whose connect is refused
-(`ReclaimDeadWakeFiles`). A live receiver accepts the connect from its bind
-until its destructor unlinks the file, so its file is never removed. A new
-receiver whose address is taken draws another id. Its fd is readable while
+`/tmp/talos-wake-*` socket file at least 10 s old (inode change time,
+`kWakeFileReclaimAgeS`) whose connect is refused (`ReclaimDeadWakeFiles`).
+The age matters because macOS's `bind()` creates the file before it attaches
+the socket, and a connect in between is refused; a bound receiver accepts
+every connect until its destructor unlinks the file. A receiver also checks,
+after its bind, that its file is still there, and binds afresh with a new id
+if it is not, so a receiver never lives without a file. A new receiver whose
+address is taken draws another id. Its fd is readable while
 notifications are pending;
 `drain()` consumes them. A `talos::WakeSender` keeps one socket connected to
 the last id it notified and sends one byte, never blocking or raising

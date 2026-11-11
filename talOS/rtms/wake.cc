@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <random>
 #include <string_view>
 #include <system_error>
@@ -134,7 +135,8 @@ std::uint64_t NewId(std::random_device& random) {
 
 }  // namespace
 
-std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept {
+std::size_t ReclaimDeadWakeFiles(const char* directory,
+                                 std::int64_t now_wall_s) noexcept {
   DIR* entries = ::opendir(directory);
   if (entries == nullptr) return 0;
   std::size_t removed = 0;
@@ -154,6 +156,13 @@ std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept {
     path[directory_bytes + 1 + name.size()] = '\0';
     struct stat status {};
     if (::lstat(path, &status) != 0 || !S_ISSOCK(status.st_mode)) continue;
+    // Young, or from the future after a clock step: a bind may still be
+    // attaching its socket (kWakeFileReclaimAgeS), so a refusal proves
+    // nothing yet.
+    if (static_cast<std::int64_t>(status.st_ctime) >
+        now_wall_s - kWakeFileReclaimAgeS) {
+      continue;
+    }
     const int fd = OpenSocket();
     if (fd < 0) break;  // No descriptor left: the next open tries again.
     int connected = 0;
@@ -163,9 +172,10 @@ std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept {
     } while (connected != 0 && errno == EINTR);
     const int error = connected == 0 ? 0 : errno;
     ::close(fd);
-    // Refused: nothing is bound there. A live receiver accepts the connect
-    // from its bind until its destructor unlinks the file, so a live file is
-    // never removed, and no new receiver can bind this path while it exists.
+    // Refused, and old enough that no bind is still attaching: nothing is
+    // bound there. A bound receiver accepts the connect until its destructor
+    // unlinks the file, and no new receiver can bind this path while it
+    // exists.
     if (error == ECONNREFUSED && ::unlink(path) == 0) ++removed;
   }
   ::closedir(entries);
@@ -173,33 +183,59 @@ std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept {
 }
 
 WakeReceiver::WakeReceiver() {
-  fd_ = OpenSocket();
-  if (fd_ < 0) {
-    throw std::system_error(errno, std::generic_category(),
-                            "talos wake receiver: socket");
-  }
-  const int size = kReceiveBufferBytes;
-  // Best effort: the default only lets more redundant datagrams queue.
-  (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
-
 #if !defined(__linux__)
   // The files of receivers killed before their destructor ran, as RTMS
   // frees a dead reader's slot when the next reader claims one.
-  (void)ReclaimDeadWakeFiles("/tmp");
+  (void)ReclaimDeadWakeFiles("/tmp",
+                             static_cast<std::int64_t>(::time(nullptr)));
 #endif
   std::random_device random;
   int error = 0;
   for (int attempt = 0; attempt < kBindAttempts; ++attempt) {
+    if (fd_ < 0) {
+      fd_ = OpenSocket();
+      if (fd_ < 0) {
+        throw std::system_error(errno, std::generic_category(),
+                                "talos wake receiver: socket");
+      }
+      const int size = kReceiveBufferBytes;
+      // Best effort: the default only lets more redundant datagrams queue.
+      (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+    }
     const std::uint64_t id = NewId(random);
     const Address address = AddressOf(id);
-    if (::bind(fd_, AsSockaddr(address), address.length) == 0) {
-      id_ = id;
-      return;
+    if (::bind(fd_, AsSockaddr(address), address.length) != 0) {
+      error = errno;
+      if (error != EADDRINUSE) break;
+      continue;
     }
-    error = errno;
-    if (error != EADDRINUSE) break;
+#if !defined(__linux__)
+    // A reclaim elsewhere may have removed the file while this bind was
+    // still attaching its socket (it refuses connects until then): only one
+    // that passed the age guard, so against a binder stalled that long.
+    // Bound without a file, no sender could reach this receiver, so it
+    // binds afresh. Once bind() has returned the socket accepts every
+    // connect, so no later reclaim can judge the file dead: one check
+    // suffices, unless a reclaim's refused connect fell inside the bind and
+    // its unlink lands after this check, which also needs the file to look
+    // kWakeFileReclaimAgeS old within the bind (a wall clock step that size
+    // at that instant).
+    if (detail::after_wake_bind_for_testing != nullptr) {
+      detail::after_wake_bind_for_testing(address.address.sun_path);
+    }
+    struct stat status {};
+    if (::lstat(address.address.sun_path, &status) != 0 ||
+        !S_ISSOCK(status.st_mode)) {
+      error = ENOENT;
+      ::close(fd_);
+      fd_ = -1;
+      continue;
+    }
+#endif
+    id_ = id;
+    return;
   }
-  ::close(fd_);
+  if (fd_ >= 0) ::close(fd_);
   fd_ = -1;
   throw std::system_error(error, std::generic_category(),
                           "talos wake receiver: bind");

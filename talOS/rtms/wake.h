@@ -10,7 +10,9 @@
 // ("\0talos-wake-<16 hex>", no filesystem entry), or on macOS
 // /tmp/talos-wake-<16 hex> (sun_path holds 104 bytes), unlinked when the
 // receiver is destroyed; the file of a receiver killed before that is removed
-// by the next receiver to open (ReclaimDeadWakeFiles).
+// by a later receiver's open once it is kWakeFileReclaimAgeS old
+// (ReclaimDeadWakeFiles), and a receiver that finds its own file gone right
+// after its bind binds afresh.
 
 #include <cstddef>
 #include <cstdint>
@@ -45,13 +47,30 @@ class WakeReceiver {
   std::uint64_t id_{0};
 };
 
+// How old (inode change time, wall-clock seconds) a socket file must be
+// before ReclaimDeadWakeFiles judges it. macOS's bind() creates the file
+// before it attaches the socket, and a connect in between is refused, so a
+// refused connect proves a file dead only once no bind can still be in
+// progress on it: bind is one system call, so a binder stays in that window
+// only while it is preempted, far below this on a working host.
+inline constexpr std::int64_t kWakeFileReclaimAgeS = 10;
+
 // Removes each `talos-wake-<16 hex digits>` socket file in `directory` that
-// no socket is bound to any more, as a connect to it proves (refused): the
-// file a receiver killed before its destructor ran leaves on macOS. A live
+// changed at least kWakeFileReclaimAgeS before `now_wall_s` and that no
+// socket is bound to any more, as a connect to it proves (refused): the file
+// a receiver killed before its destructor ran leaves on macOS. A live
 // receiver's file accepts the connect and is kept. Returns how many it
-// removed. Every WakeReceiver runs it on /tmp before it binds there (not on
-// Linux, whose receivers make no file).
-std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept;
+// removed. Every WakeReceiver runs it on /tmp, with the wall clock, before it
+// binds there (not on Linux, whose receivers make no file).
+std::size_t ReclaimDeadWakeFiles(const char* directory,
+                                 std::int64_t now_wall_s) noexcept;
+
+namespace detail {
+// Test seam: called with a receiver's path between its bind and its check
+// that the file is still there (macOS only; a Linux receiver has no file).
+// nullptr outside tests.
+inline void (*after_wake_bind_for_testing)(const char* path) = nullptr;
+}  // namespace detail
 
 // What one notification came to.
 enum class WakeOutcome : std::uint8_t {
