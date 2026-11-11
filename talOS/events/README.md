@@ -363,12 +363,20 @@ Readers reject unsupported versions with both recorded and supported versions
 in the error.
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
-The writer sleeps on a semaphore until a chunk is handed over or its
-once-per-second sync is due. Handing over a chunk costs the loop thread an
-atomic increment and load, plus, when the writer is idle, one semaphore post
-(`sem_post` on Linux, `dispatch_semaphore_signal` on macOS): it may enter the
-kernel to wake the writer, but never blocks or takes a lock, and a post made
-before the writer waits is kept. The writer runs under the normal scheduling
+The writer writes a record to the file within `write_interval` (10 ms) of
+committing it, chunk full or not, so a node killed by a signal (the launcher's
+stall kill, a segfault, an abort), which runs no flush, loses only its last
+10 ms or so plus the writer's scheduling delay: the kernel keeps what was
+written. While records keep arriving the writer wakes and writes once per
+`write_interval` (100 writes a second, whatever the tick rate); otherwise it
+sleeps on a semaphore until a chunk is handed over, a record finds it idle,
+or its once-per-second `fsync` (what a power loss can lose) is due. Handing
+over a chunk costs the loop thread an atomic increment and load, and
+committing a record one atomic store and load, plus, when the writer is
+idle, one semaphore post (`sem_post` on Linux, `dispatch_semaphore_signal` on
+macOS): it may enter the kernel to wake the writer, but never blocks or takes
+a lock, and a post made before the writer waits is kept. A node logging more
+often than every 10 ms never posts. The writer runs under the normal scheduling
 policy (`SCHED_OTHER` on Linux, the standard policy on macOS) even when the
 thread that started it runs realtime. If the pool is exhausted,
 capture stops permanently: `failed()` becomes true and `error()` explains why.

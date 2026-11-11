@@ -38,10 +38,21 @@ namespace talos::event::log {
 // lock (sem_post on Linux, dispatch_semaphore_signal on macOS). The writer
 // runs under the normal scheduling policy whatever the thread that
 // started it runs under, so it never competes with a realtime loop thread
-// for the CPU. Once per Options::sync_interval (a second) the writer also
-// writes the committed prefix of the active chunk before fsync, so quiet logs
-// do not remain buffered indefinitely; that fsync leaves the data in the
-// drive's write cache on macOS. flush() and destruction sync with
+// for the CPU.
+//
+// Two losses are bounded separately. A process killed by a signal (the
+// launcher's stall kill, a segfault, an abort) runs no flush, so its log
+// keeps what the writer had already written to the file, which the kernel
+// keeps: the writer writes the committed prefix of a chunk that is not full
+// within Options::write_interval (10 ms) of its first unwritten record, so
+// such a death loses about that much plus the writer's scheduling delay.
+// While records keep arriving the writer wakes and writes once per
+// write_interval (100 writes a second at the default, whatever the tick
+// rate) and the producer never posts; a record that finds the writer idle
+// (no record in the last write_interval) posts once, as a hand-off does. A
+// power loss also loses what the kernel has not put on the disk: once per
+// Options::sync_interval (a second) the writer fsyncs, which leaves the data in
+// the drive's write cache on macOS. flush() and destruction sync with
 // process::DurableSync, which also flushes that cache. If the pool fills,
 // capture stops permanently and failed() becomes true. Previously accepted
 // chunks are drained, preserving a prefix without holes.
@@ -95,10 +106,16 @@ struct LogWriterOptions {
   // file is left; only the empty cap marker is created.
   std::uint64_t max_bytes{0};
 
-  // How often the writer writes the committed prefix of the active chunk and
-  // fsyncs it (see LogWriter). Tests shorten it; it must exceed one write and
-  // fsync, or a stopping writer finds the next sync already due.
+  // How often the writer fsyncs the file, after writing the committed prefix
+  // of the active chunk (see LogWriter): what a power loss can lose. Tests
+  // shorten it; it must exceed one write and fsync, or a stopping writer
+  // finds the next sync already due.
   std::chrono::nanoseconds sync_interval{std::chrono::seconds{1}};
+
+  // How long a committed record may wait in a chunk that is not full before
+  // the writer writes it to the file (see LogWriter): what a process killed
+  // by a signal can lose, plus the writer's scheduling delay.
+  std::chrono::nanoseconds write_interval{std::chrono::milliseconds{10}};
 };
 
 // The marker a byte-capped writer leaves next to its log (see max_bytes).
@@ -265,15 +282,17 @@ class LogWriter {
     std::deque<Chunk> pool;
     std::chrono::steady_clock::time_point last_sync{
         std::chrono::steady_clock::now()};
+    // Writer only: when it last wrote (see Options::write_interval).
+    std::chrono::steady_clock::time_point last_write{};
     Chunk* active{nullptr};
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> completed{0};
     // Set by the writer before it checks for work and sleeps on `wake`; the
     // producer clears it and posts `wake` only when it finds it set. Both
-    // sides use sequentially consistent operations on this and `submitted`,
-    // so either the writer sees the submission or the producer sees the
-    // writer idle and posts, and the semaphore keeps a post that lands before
-    // the wait.
+    // sides use sequentially consistent operations on this, `submitted` and
+    // a chunk's `committed`, so either the writer sees the submission or
+    // record, or the producer sees the writer idle and posts, and the
+    // semaphore keeps a post that lands before the wait.
     std::atomic<bool> writer_idle{false};
     Wakeup wake;
 
