@@ -1,7 +1,8 @@
 #pragma once
 
 // Shared gating predicates for hardware-owning subsystem nodes, and the
-// gateway's feedback age bound (FeedbackFresh).
+// gateway's feedback age bound (FeedbackFresh) and per-motor drive rules
+// (MotorMayDrive).
 //
 // Every subsystem node that turns hardware state into a command repeats the
 // same preamble: accept the sample only if it is newer than the last one from
@@ -46,6 +47,51 @@ inline bool AcceptState(bool have_prev, const State& prev, uint64_t config_id,
 inline bool FeedbackFresh(uint32_t age_us, uint64_t command_timeout_us) {
   return age_us != std::numeric_limits<uint32_t>::max() &&
          age_us < command_timeout_us;
+}
+
+// The gateway's per-motor rules, shared with testing::SimHardware. `motors`
+// is the configuration in manifest order, the order of `state.motors`.
+//
+// Whether motor `i` follows a master whose sample is invalid in `state`: the
+// gateway publishes such a follower's sample invalid too (MaskUnavailable).
+inline bool MasterSampleInvalid(std::span<const MotorConfig> motors,
+                                const State& state, std::size_t i) {
+  const uint16_t master_id = motors[i].master_id;
+  if (master_id == 0) return false;
+  for (std::size_t j = 0; j < motors.size(); ++j) {
+    if (motors[j].id == master_id) return !state.motors[j].valid;
+  }
+  return false;
+}
+
+// Whether motor `i`'s own sample, and its remote CANcoder's, is valid.
+inline bool MotorFeedbackValid(std::span<const MotorConfig> motors,
+                               const State& state, std::size_t i) {
+  if (!state.motors[i].valid) return false;
+  if (motors[i].feedback != Feedback::kRemoteCANcoder) return true;
+  for (std::size_t j = 0; j < state.sensor_count; ++j) {
+    if (state.sensors[j].id == motors[i].feedback_sensor_id) {
+      return state.sensors[j].valid;
+    }
+  }
+  return false;
+}
+
+// Whether motor `i` may drive in `state`: MotorFeedbackValid for it and, for a
+// follower, for its master (config refuses follower chains). A motor that may
+// not is neutral from that tick and drives again only on a command observing
+// a later State.
+inline bool MotorMayDrive(std::span<const MotorConfig> motors,
+                          const State& state, std::size_t i) {
+  if (!MotorFeedbackValid(motors, state, i)) return false;
+  const uint16_t master_id = motors[i].master_id;
+  if (master_id == 0) return true;
+  for (std::size_t j = 0; j < motors.size(); ++j) {
+    if (motors[j].id == master_id) {
+      return MotorFeedbackValid(motors, state, j);
+    }
+  }
+  return false;
 }
 
 // Whether the gateway is ready to be commanded: configured and enabled, with

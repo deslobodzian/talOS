@@ -556,7 +556,8 @@ cannot drive in a State (its feedback invalid: disconnected with
 `set_connected`, too old, or masked by `reset_device`; its remote
 CANcoder's; or a follower's master's) applies neutral from that tick while
 the others keep driving, and only a request observed after the last such
-State drives it again. Unlike the gateway, losing every device's feedback
+State drives it again; a follower's sample reads invalid while its master's
+does. Unlike the gateway, losing every device's feedback
 raises no hardware fault. Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;

@@ -446,9 +446,10 @@ TEST_F(SimHardwareTest, FeedbackAsOldAsTheCommandTimeoutIsInvalid) {
 // feedback disconnected or too old, its remote CANcoder's, or a follower's
 // master's) applies neutral from that tick, with no new request, and so does
 // a request built while it could not; the others keep driving in the same
-// epoch. After recovery the request in force, or one observed on the last
-// State that showed it unable, still leaves it neutral; one observing a
-// later State drives it.
+// epoch. A follower's sample reads invalid while its master's does, as the
+// gateway publishes it. After recovery the request in force, or one observed
+// on the last State that showed it unable, still leaves it neutral; one
+// observing a later State drives it.
 TEST_F(SimHardwareTest, AMotorThatCannotDriveIsNeutralFromThatTick) {
   struct Case {
     const char* name;
@@ -482,6 +483,7 @@ TEST_F(SimHardwareTest, AMotorThatCannotDriveIsNeutralFromThatTick) {
     const std::uint64_t epoch = State().epoch;
     c.lose(true);
     sim.step(5ms);  // the first State that shows it
+    EXPECT_EQ(Motor("follower").valid, Motor("braked").valid);
     for (const auto motor : c.unable) expect(motor, Mode::kNeutral);
     expect("coasting", Mode::kVelocity);
     EXPECT_EQ(State().epoch, epoch);
