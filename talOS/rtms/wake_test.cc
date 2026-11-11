@@ -2,10 +2,19 @@
 
 #include <gtest/gtest.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <csignal>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 namespace {
 
@@ -110,6 +119,110 @@ TEST(Wake, AnotherProcessWakesAReceiverByItsId) {
   ASSERT_EQ(::waitpid(child, &status, 0), child);
   ASSERT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 0) << "the child was not woken";
+}
+
+// Binds an AF_UNIX datagram socket at `path`, as a macOS receiver binds
+// /tmp/talos-wake-<id>; -1 on failure.
+int BindAt(const std::string& path) {
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  if (path.size() >= sizeof(address.sun_path)) return -1;
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+  const int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd < 0) return -1;
+  if (::bind(fd, reinterpret_cast<const sockaddr*>(&address),
+             sizeof(address)) != 0) {
+    ::close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+bool Exists(const std::string& path) {
+  struct stat status {};
+  return ::lstat(path.c_str(), &status) == 0;
+}
+
+// A process killed with SIGKILL never runs its receiver's destructor, so on
+// macOS its socket file stays; a restarted node would add one per crash.
+// The reclaim the next receiver runs removes the file nothing is bound to
+// and keeps a live receiver's.
+// REQ-RT-19
+TEST(Wake, ADeadReceiversSocketFileIsReclaimedAndALiveOnesKept) {
+  // A directory of its own, short enough for sun_path on every OS, so the
+  // reclaim sees only this test's files.
+  std::string directory = "/tmp/talos-wake-test-XXXXXX";
+  ASSERT_NE(::mkdtemp(directory.data()), nullptr) << std::strerror(errno);
+  const std::string dead = directory + "/talos-wake-00000000000000d1";
+  const std::string live = directory + "/talos-wake-00000000000000a1";
+
+  int ready[2];
+  ASSERT_EQ(::pipe(ready), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(ready[0]);
+    const char bound = BindAt(dead) >= 0 ? 1 : 0;
+    (void)::write(ready[1], &bound, 1);
+    ::pause();
+    ::_exit(0);
+  }
+  ::close(ready[1]);
+  char bound = 0;
+  ASSERT_EQ(::read(ready[0], &bound, 1), 1);
+  ::close(ready[0]);
+  ::kill(child, SIGKILL);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_EQ(bound, 1) << "the child could not bind " << dead;
+  ASSERT_TRUE(Exists(dead)) << "SIGKILL removed the file itself";
+  const int holder = BindAt(live);
+  ASSERT_GE(holder, 0) << live;
+
+  EXPECT_EQ(talos::ReclaimDeadWakeFiles(directory.c_str()), 1u);
+  EXPECT_FALSE(Exists(dead)) << dead << " outlived its killed receiver";
+  EXPECT_TRUE(Exists(live)) << live << " was removed while bound";
+
+  ::close(holder);
+  ::unlink(live.c_str());
+  ::unlink(dead.c_str());
+  ::rmdir(directory.c_str());
+}
+
+// End to end on the address receivers really use: after a receiver's process
+// is killed, no file of it remains once the next receiver opens (on Linux
+// there never was one).
+// REQ-RT-19
+TEST(Wake, AReceiverKilledWithSigkillLeavesNoFileOnceTheNextOpens) {
+  int id_pipe[2];
+  ASSERT_EQ(::pipe(id_pipe), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(id_pipe[0]);
+    try {
+      talos::WakeReceiver receiver;
+      const std::uint64_t id = receiver.id();
+      (void)::write(id_pipe[1], &id, sizeof(id));
+      ::pause();
+    } catch (...) {
+    }
+    ::_exit(3);
+  }
+  ::close(id_pipe[1]);
+  std::uint64_t id = 0;
+  const ssize_t got = ::read(id_pipe[0], &id, sizeof(id));
+  ::close(id_pipe[0]);
+  ::kill(child, SIGKILL);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_EQ(got, static_cast<ssize_t>(sizeof(id)));
+
+  char name[64];
+  std::snprintf(name, sizeof(name), "/tmp/talos-wake-%016llx",
+                static_cast<unsigned long long>(id));
+  talos::WakeReceiver next;
+  EXPECT_FALSE(Exists(name)) << name << " outlived its killed receiver";
 }
 
 }  // namespace

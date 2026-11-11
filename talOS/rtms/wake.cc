@@ -1,7 +1,9 @@
 #include "talOS/rtms/wake.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -22,9 +24,13 @@ namespace {
 // while one is pending carry no information. The kernel rounds this up to
 // its minimum.
 constexpr int kReceiveBufferBytes = 1024;
-// Draws of a new id when the address is taken: on macOS a crashed
-// receiver's socket file stays in /tmp until the machine restarts.
+// Draws of a new id when the address is taken (two receivers drew one id,
+// or on macOS a killed receiver's file not yet reclaimed holds it).
 constexpr int kBindAttempts = 16;
+// Every receiver's name: this, then its id as 16 lowercase hex digits.
+constexpr std::string_view kPrefix = "talos-wake-";
+constexpr std::string_view kDigits = "0123456789abcdef";
+constexpr std::size_t kNameBytes = kPrefix.size() + 16;
 
 #if defined(MSG_NOSIGNAL)
 constexpr int kSendFlags = MSG_DONTWAIT | MSG_NOSIGNAL;
@@ -38,9 +44,6 @@ struct Address {
 };
 
 Address AddressOf(std::uint64_t id) {
-  constexpr std::string_view kPrefix = "talos-wake-";
-  constexpr std::string_view kDigits = "0123456789abcdef";
-  constexpr std::size_t kNameBytes = kPrefix.size() + 16;
   std::array<char, kNameBytes> name{};
   std::memcpy(name.data(), kPrefix.data(), kPrefix.size());
   for (std::size_t i = 0; i < 16; ++i) {
@@ -114,6 +117,13 @@ bool AlreadyPending(int error) {
   return error == EAGAIN || error == ENOBUFS;
 }
 
+// Whether `name` is a receiver's: kPrefix and 16 lowercase hex digits.
+bool IsReceiverName(std::string_view name) {
+  if (name.size() != kNameBytes || !name.starts_with(kPrefix)) return false;
+  name.remove_prefix(kPrefix.size());
+  return name.find_first_not_of(kDigits) == std::string_view::npos;
+}
+
 std::uint64_t NewId(std::random_device& random) {
   for (;;) {
     const std::uint64_t id = (static_cast<std::uint64_t>(random()) << 32U) ^
@@ -123,6 +133,44 @@ std::uint64_t NewId(std::random_device& random) {
 }
 
 }  // namespace
+
+std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept {
+  DIR* entries = ::opendir(directory);
+  if (entries == nullptr) return 0;
+  std::size_t removed = 0;
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  const std::size_t directory_bytes = std::strlen(directory);
+  while (const dirent* entry = ::readdir(entries)) {
+    const std::string_view name = entry->d_name;
+    if (!IsReceiverName(name) ||
+        directory_bytes + 1 + name.size() >= sizeof(address.sun_path)) {
+      continue;
+    }
+    char* path = address.sun_path;
+    std::memcpy(path, directory, directory_bytes);
+    path[directory_bytes] = '/';
+    std::memcpy(path + directory_bytes + 1, name.data(), name.size());
+    path[directory_bytes + 1 + name.size()] = '\0';
+    struct stat status {};
+    if (::lstat(path, &status) != 0 || !S_ISSOCK(status.st_mode)) continue;
+    const int fd = OpenSocket();
+    if (fd < 0) break;  // No descriptor left: the next open tries again.
+    int connected = 0;
+    do {
+      connected = ::connect(fd, reinterpret_cast<const sockaddr*>(&address),
+                            sizeof(address));
+    } while (connected != 0 && errno == EINTR);
+    const int error = connected == 0 ? 0 : errno;
+    ::close(fd);
+    // Refused: nothing is bound there. A live receiver accepts the connect
+    // from its bind until its destructor unlinks the file, so a live file is
+    // never removed, and no new receiver can bind this path while it exists.
+    if (error == ECONNREFUSED && ::unlink(path) == 0) ++removed;
+  }
+  ::closedir(entries);
+  return removed;
+}
 
 WakeReceiver::WakeReceiver() {
   fd_ = OpenSocket();
@@ -134,6 +182,11 @@ WakeReceiver::WakeReceiver() {
   // Best effort: the default only lets more redundant datagrams queue.
   (void)::setsockopt(fd_, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 
+#if !defined(__linux__)
+  // The files of receivers killed before their destructor ran, as RTMS
+  // frees a dead reader's slot when the next reader claims one.
+  (void)ReclaimDeadWakeFiles("/tmp");
+#endif
   std::random_device random;
   int error = 0;
   for (int attempt = 0; attempt < kBindAttempts; ++attempt) {

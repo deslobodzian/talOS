@@ -9,8 +9,10 @@
 // from its random 64-bit id: Linux's abstract namespace
 // ("\0talos-wake-<16 hex>", no filesystem entry), or on macOS
 // /tmp/talos-wake-<16 hex> (sun_path holds 104 bytes), unlinked when the
-// receiver is destroyed.
+// receiver is destroyed; the file of a receiver killed before that is removed
+// by the next receiver to open (ReclaimDeadWakeFiles).
 
+#include <cstddef>
 #include <cstdint>
 
 namespace talos {
@@ -42,6 +44,14 @@ class WakeReceiver {
   int fd_{-1};
   std::uint64_t id_{0};
 };
+
+// Removes each `talos-wake-<16 hex digits>` socket file in `directory` that
+// no socket is bound to any more, as a connect to it proves (refused): the
+// file a receiver killed before its destructor ran leaves on macOS. A live
+// receiver's file accepts the connect and is kept. Returns how many it
+// removed. Every WakeReceiver runs it on /tmp before it binds there (not on
+// Linux, whose receivers make no file).
+std::size_t ReclaimDeadWakeFiles(const char* directory) noexcept;
 
 // What one notification came to.
 enum class WakeOutcome : std::uint8_t {

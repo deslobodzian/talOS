@@ -95,9 +95,14 @@ A receiver is a non-blocking, close-on-exec `AF_UNIX` datagram socket bound to
 an address derived only from its random nonzero 64-bit id: on Linux the
 abstract name `\0talos-wake-<16 hex digits>` (no filesystem entry), on macOS
 `/tmp/talos-wake-<16 hex digits>` (`sun_path` holds 104 bytes, too few for
-`TEST_TMPDIR`), unlinked when the receiver is destroyed; a killed receiver's
-file stays until `/tmp` is cleaned, and a new receiver whose address is taken
-draws another id. Its fd is readable while notifications are pending;
+`TEST_TMPDIR`), unlinked when the receiver is destroyed. A receiver killed
+before its destructor runs leaves its file; as a dead reader's slot is freed
+when the next reader claims one, every new macOS receiver first removes each
+`/tmp/talos-wake-*` socket file whose connect is refused
+(`ReclaimDeadWakeFiles`). A live receiver accepts the connect from its bind
+until its destructor unlinks the file, so its file is never removed. A new
+receiver whose address is taken draws another id. Its fd is readable while
+notifications are pending;
 `drain()` consumes them. A `talos::WakeSender` keeps one socket connected to
 the last id it notified and sends one byte, never blocking or raising
 `SIGPIPE`. `send()` reports a `WakeOutcome`: `DELIVERED` (also when a full
