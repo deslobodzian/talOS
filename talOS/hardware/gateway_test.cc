@@ -739,9 +739,11 @@ struct FollowedSwerve {
 // A motor whose feedback goes invalid while a command drives it is sent
 // neutral in the tick that finds it invalid, with its follower, without
 // waiting for the next command; the other motors keep their demands, no
-// hardware fault is raised and the command stays in force. FeedbackFresh
-// makes an age one microsecond under command_timeout_us fresh and an age at
-// it invalid, so the first stops nothing.
+// hardware fault is raised and the command stays in force. That neutral is
+// not counted in neutralized_motor_count (which counts sanitized demands of
+// accepted commands). FeedbackFresh makes an age one microsecond under
+// command_timeout_us fresh and an age at it invalid, so the first stops
+// nothing.
 // REQ-SAFE-22
 TEST(Gateway, InvalidFeedbackNeutralizesAtThatTick) {
   const FollowedSwerve swerve;
@@ -786,10 +788,39 @@ TEST(Gateway, InvalidFeedbackNeutralizesAtThatTick) {
     EXPECT_FALSE(s.flags & kHardwareFault);
     EXPECT_TRUE(s.flags & kCommandActive);
     EXPECT_EQ(s.epoch, epoch);
+    EXPECT_EQ(s.counters.neutralized_motor_count, 0u);
     EXPECT_EQ(backend.neutral, neutrals);
     applied = backend.applied;
     g.Tick(8000, true);  // Already neutral: nothing more to send.
     EXPECT_EQ(backend.applied, applied);
+  }
+}
+
+// With no command in force (expired, or disabled), a motor whose feedback
+// goes invalid sends no Apply: the gateway still holds the last command's
+// demands, and the tick's neutral pass must not resend them; Tick's
+// Neutral() already stops every output.
+// REQ-SAFE-22
+TEST(Gateway, InvalidFeedbackWithNoCommandInForceAppliesNothing) {
+  const FollowedSwerve swerve;
+  const auto& config = swerve.config;
+  for (const bool disable : {false, true}) {
+    SCOPED_TRACE(disable ? "disabled" : "expired");
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+    const int applied = backend.applied;
+    const uint64_t idle = disable ? 6000 : 1000 + config.command_timeout_us;
+    g.Tick(idle, !disable);
+    ASSERT_FALSE(g.snapshot().flags & kCommandActive);
+    backend.position_ages[config.motors[swerve.drive].id] =
+        config.command_timeout_us;
+    const int neutrals = backend.neutral;
+    g.Tick(idle + 5000, !disable);
+    ASSERT_FALSE(g.snapshot().motors[swerve.drive].valid);
+    EXPECT_EQ(backend.applied, applied);
+    EXPECT_GT(backend.neutral, neutrals);
   }
 }
 
