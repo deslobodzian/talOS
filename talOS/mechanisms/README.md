@@ -61,7 +61,7 @@ name = "wrist"
 [wrist]
 tolerance_rot = 0.01
 min_rot = 0.0          # a homed mechanism needs a finite travel
-max_rot = 0.4          # within one sensor rotation
+max_rot = 0.4          # inside the sensor rotation around offset 0
 homing = "absolute"
 absolute_sensor = "angle"
 
@@ -133,8 +133,13 @@ Homing sets the frame; until it holds the mechanism drives no goal. Only
 |---|---|---|
 | `"none"` | the motor's absolute frame; construction refuses a `"rezero"`-frame motor, which would never drive | |
 | `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
-| `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only after the mechanism has moved or the push has lasted `homing_min_push_us`, so a slow start is not taken for the stop | the drive keys, `homing_stall_current_a` (A, required, > 0), `homing_min_push_us` (µs, required, > 0) |
-| `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1; its magnitude must be at least `max_rot - min_rot`, so one sensor rotation covers the travel and the boot reading is unambiguous), `absolute_offset_rot` (rot, default 0) |
+| `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only once the current push has moved it `homing_min_travel_rot` from where that push began or has lasted `homing_min_push_us`, so a slow start is not taken for the stop; a goal lost mid-push ends the push, and its motion does not count for the next | the drive keys, `homing_stall_current_a` (A, required, > 0 and below the motor's `stator_limit_a`), `homing_min_push_us` (µs, required, > 0), `homing_min_travel_rot` (rot, required, > 0 and less than the travel); `homing_timeout_us` must exceed `homing_min_push_us + homing_stall_us` |
+| `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1), `absolute_offset_rot` (rot, default 0). The RoboRIO configures every CANcoder's discontinuity at 0.5, so it reads absolute position in [-0.5, 0.5) rotations (`PhoenixBackend.cpp`); the frame can name only the one sensor rotation `absolute_offset_rot ± 0.5·|absolute_rot_per_sensor_rot|` (the end a reading of -0.5 maps to included), and the travel `min_rot..max_rot` must lie inside it. The simulators do not wrap a CANcoder reading at 0.5 (TODO.md MECH-4), so the check is what keeps a sim-tested travel valid on the robot |
+
+Stall homing reads stator current: the physics simulator
+(`sim_gateway --physics`) models it with back-EMF, so it peaks at stall and
+falls with speed, and component tests set it with
+`SimHardware::set_motor(..., stator_current_a)`.
 
 Drive keys, all required except `home_rot`: `homing_v` (V, nonzero, at most
 half the motor's `max_voltage`, pointing at `home_rot`, which must be the
@@ -182,9 +187,11 @@ a piece), `kHolding` (`hold_v`, or neutral without one, while the piece
 stays), `kEjecting` (`eject_v` for `eject_us`), `kFeeding` (`feed_v` for
 `feed_us`). A run starts from `kIntaking` or `kHolding` when asked, and from
 `kIdle` only with `idle_runs` and only when newly asked: a command that
-differs from the last live request. Holding the button, or asking the same
-command again after a stale spell, a release or a disable, runs it once; to
-run it again the producer asks something else (`kIdle`) in between. With no
+differs from the last tick's request, where a tick with no live request (a
+release or a stale lane) counts as `kIdle`. A held button runs once; press,
+release, press runs twice. Refusing a press held through a disable or a
+stale spell is the producer's job (`talos::OperatorArming`, which teleop
+producers use). With no
 live request the roller is neutral and the phases carry on as if asked for
 `kIdle`: a held piece stays `kHolding` and a timed run finishes its clock.
 Losing enable (`robot_enabled` false: a Driver Station disable, a stale
@@ -220,8 +227,8 @@ feature: stall homing (a stop after motion, never moving, a slow start, the
 timeout), absolute homing (including a reset), upward limit-switch homing and
 a stuck switch, homing paused without a goal, hold on an unhomed mechanism,
 gravity for elevator and arm, turret wrap, at-goal and at-speed edges,
-spin-down, faults, the roller's phases, a disable cancelling a timed run and
-a held eject across a stale spell. Downward limit-switch homing and the
-travel clamp are also tested through `examples/superstructure`'s elevator. The tests carry the tags of
-REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and
+spin-down, faults, the roller's phases, a disable cancelling a timed run,
+and a held eject running once while release-then-press runs again. Downward limit-switch homing and the
+travel clamp are also tested through `examples/superstructure`'s elevator.
+The tests carry the tags of REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and
 REQ-SAFE-38 (`RollerWithSensor`).

@@ -112,6 +112,7 @@ homing_stall_rps = 0.05
 homing_stall_us = 50000
 homing_stall_current_a = 20.0
 homing_min_push_us = 200000
+homing_min_travel_rot = 0.05
 
 [subsystems.wrist.motors.wrist]
 can_id = 8
@@ -374,8 +375,9 @@ can_id = 2
   // A valid stall-homed mechanism, less homing_v and homing_stall_us.
   const std::string stall =
       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
-      "max_rot = 1.0\nhoming_timeout_us = 100000\nhoming_stall_rps = 0.1\n"
-      "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n";
+      "max_rot = 1.0\nhoming_timeout_us = 500000\nhoming_stall_rps = 0.1\n"
+      "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n"
+      "homing_min_travel_rot = 0.05\n";
   const std::string ok = stall + "homing_v = -1.0\nhoming_stall_us = 50000\n";
   const std::string absolute =
       "tolerance_rot = 0.1\nhoming = \"absolute\"\nabsolute_sensor = \"cc\"\n";
@@ -437,11 +439,43 @@ can_id = 2
        "tolerance_rot = 0.1\nhoming = \"absolute\"\nmin_rot = 0.0\n"
        "max_rot = 0.5\n"},
       // 0.5 rot of travel, 0.1 rot per sensor rotation: ambiguous at boot.
-      {"absolute_rot_per_sensor_rot",
-       absolute + "min_rot = 0.0\nmax_rot = 0.5\n"
-                  "absolute_rot_per_sensor_rot = 0.1\n"},
+      {"absolute_offset_rot", absolute + "min_rot = 0.0\nmax_rot = 0.5\n"
+                                         "absolute_rot_per_sensor_rot = 0.1\n"},
+      // Offset 0, ratio 1: readings in [-0.5, 0.5) map to [-0.5, 0.5), so a
+      // travel to 0.8 is not inside it (0.6 would read as -0.4).
+      {"absolute_offset_rot", absolute + "min_rot = 0.0\nmax_rot = 0.8\n"},
+      // A negative ratio maps -0.5 to the high end: the low end is open.
+      {"absolute_offset_rot", absolute +
+                                  "min_rot = -0.5\nmax_rot = 0.4\n"
+                                  "absolute_rot_per_sensor_rot = -1.0\n"},
+      // At or above the motor's stator_limit_a (80 A by default): never met.
+      {"homing_stall_current_a",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 500000\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 50000\n"
+       "homing_stall_current_a = 80.0\nhoming_min_push_us = 50000\n"
+       "homing_min_travel_rot = 0.05\n"},
+      {"homing_min_travel_rot",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 500000\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 50000\n"
+       "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n"
+       "homing_min_travel_rot = 1.0\n"},
+      // No time left to find the stop before the timeout faults.
+      {"homing_timeout_us",
+       "tolerance_rot = 0.1\nhoming = \"stall\"\nmin_rot = 0.0\n"
+       "max_rot = 1.0\nhoming_timeout_us = 100000\nhoming_stall_rps = 0.1\n"
+       "homing_v = -1.0\nhoming_stall_us = 50000\n"
+       "homing_stall_current_a = 20.0\nhoming_min_push_us = 50000\n"
+       "homing_min_travel_rot = 0.05\n"},
   };
   for (const auto& [key, table] : bad) expect_refused(key, toml(table));
+  {  // the closed end of a negative ratio's window is accepted
+    auto sim = Sim::FromToml(toml(absolute + "min_rot = -0.4\nmax_rot = 0.5\n"
+                                             "absolute_rot_per_sensor_rot = "
+                                             "-1.0\n"));
+    EXPECT_NO_THROW(sim.add<PositionNode>("m"));
+  }
   // Gravity from one source: the motor's slot g, or gravity_v, not both.
   const std::string slot_g = "slot0 = { g = 0.3 }\n";
   {
@@ -486,6 +520,40 @@ TEST(PositionMechanism, StallHomingSetsTheFrameWhereTheMechanismStopped) {
   EXPECT_NEAR(hood.mech().position_rot(), 0.0, 1e-9);
   EXPECT_EQ(hood.Applied().mode, Mode::kPosition);
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);  // 0.5 above the stop
+}
+
+// Motion belongs to the push that made it: a push that moved the hood, then
+// a released goal leaving it 0.2 rot above its stop, then a new push that
+// starts slowly under load does not zero before homing_min_push_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingForgetsMotionFromAnEarlierPush) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.5, -0.5, 5.0);
+  hood.Start();
+  hood.Drive(0.5, 30ms);
+  hood.SetMotor(2.2, -0.5, 5.0);  // 0.3 rot of travel in this push
+  hood.Drive(0.5, 30ms);
+  hood.ExpectHoming(-1.0);
+  hood.sim.step(150ms);             // the goal is lost: the push ends
+  hood.SetMotor(2.2, -0.02, 25.0);  // a new push, slow under load
+  hood.Drive(0.5, 150ms);  // three times homing_stall_us, under min push
+  EXPECT_FALSE(hood.mech().homed());
+  hood.ExpectHoming(-1.0);
+}
+
+// Homing can succeed with no motion at all: a hood already resting on its
+// stop at boot homes once the push has lasted homing_min_push_us and it has
+// stayed still under load for homing_stall_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingFromRestOnTheStopHomesAfterTheMinimumPush) {
+  Rig hood{"hood"};
+  hood.SetMotor(2.0, 0.0, 30.0);
+  hood.Start();
+  hood.Drive(0.5, 150ms);
+  hood.ExpectHoming(-1.0);
+  hood.Drive(0.5, 150ms);  // past 200 ms of push plus 50 ms still
+  EXPECT_TRUE(hood.mech().homed());
+  EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
 }
 
 // A mechanism that never moves and shows no load (a slipping belt, an
@@ -564,10 +632,27 @@ TEST(PositionMechanism, HoldNeverStartsHoming) {
   hood.ExpectNeutral();
 }
 
+// The frame is right wherever in its travel the wrist boots: the CANcoder
+// reads in [-0.5, 0.5) and offset 0.25 maps that onto [-0.25, 0.75), which
+// holds the whole travel 0..0.5.
+// REQ-SAFE-36
+TEST(PositionMechanism, AbsoluteHomingGivesTheRightFrameAnywhereInTheTravel) {
+  for (const double position_rot : {0.0, 0.25, 0.49}) {
+    SCOPED_TRACE(position_rot);
+    Rig wrist{"wrist"};
+    wrist.SetMotor(5.0);
+    wrist.hw.set_cancoder("wrist", "angle", position_rot - 0.25, 0.0);
+    wrist.Start();
+    EXPECT_TRUE(wrist.mech().homed());
+    EXPECT_NEAR(wrist.mech().position_rot(), position_rot, 1e-9);
+  }
+}
+
 // Limit-switch homing upward (positive homing_v, home_rot at max_rot 2.0,
 // a switch that reads true when closed): the closed switch sets the frame,
 // a closed switch at home is fine, and one closed well below home (into the
 // travel) is stuck.
+// REQ-SAFE-36
 TEST(PositionMechanism, LimitSwitchHomingUpwardAndAStuckSwitch) {
   Rig top{"top"};
   top.SetMotor(5.0, 0.5);  // moving up: no stall

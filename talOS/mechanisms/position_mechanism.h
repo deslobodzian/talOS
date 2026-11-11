@@ -182,6 +182,7 @@ class PositionMechanism {
   Duration homing_stall_time_{};
   double homing_stall_current_a_{0};
   Duration homing_min_push_{};
+  double homing_min_travel_rot_{0};
   bool switch_closed_reads_{false};
   int home_samples_{1};
   double home_margin_rot_{0};
@@ -210,8 +211,8 @@ class PositionMechanism {
   int home_count_{0};  // consecutive closed switch readings while unzeroed
   std::optional<Time> homing_since_;  // first push since a zero or disable
   std::optional<Time> push_since_;    // start of the current, unbroken push
+  double push_start_rot_{0};          // position where that push began
   std::optional<Time> homing_still_since_;
-  bool homing_moved_{false};  // this homing run has seen the mechanism move
   std::optional<double> held_rot_;
   std::optional<double> goal_anchor_rot_;  // move timer restarts past it
   Time goal_since_{};

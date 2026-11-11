@@ -290,24 +290,28 @@ TEST(RollerWithSensor, DisableCancelsATimedRun) {
   intake.Drive(Command::EJECT, 20ms);
   EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
   intake.hw.enable();
-  intake.Drive(Command::EJECT, 50ms);  // well inside eject_us
+  intake.Drive(Command::IDLE, 50ms);  // well inside eject_us
   EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
   EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
 }
 
-// With idle_runs, an eject held through a stale spell is still one ask: it
-// runs once, not again when the lane returns.
+// With idle_runs, a release ends an ask: press, release (the lane released,
+// as declarative teleop does with no binding live), press runs twice, while
+// the held press before it ran once.
 // REQ-SAFE-38
-TEST(RollerWithSensor, HeldEjectAcrossAStaleSpellRunsOnce) {
+TEST(RollerWithSensor, ReleaseThenPressRunsAgain) {
   Rig intake{"intake"};
   intake.Start();
   intake.Drive(Command::EJECT, 20ms);
   ASSERT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
-  intake.sim.step(300ms);  // stale; the run finishes its clock
+  intake.Drive(Command::EJECT, 300ms);  // held: the run ends, no second
   ASSERT_EQ(intake.roller().phase(), RollerPhase::kIdle);
-  intake.Drive(Command::EJECT, 50ms);
-  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
-  EXPECT_EQ(intake.Applied().mode, Mode::kNeutral);
+  ReleaseTarget<roller_test::Goal>(intake.sim, "intake", "teleop");
+  intake.sim.step(20ms);
+  intake.Drive(Command::EJECT, 20ms);  // pressed again
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kEjecting);
+  EXPECT_EQ(intake.Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(intake.Applied().demand, -8.0);
 }
 
 // A request is refused outside update() (here every()), naming the roller,
