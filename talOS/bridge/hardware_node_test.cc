@@ -886,7 +886,7 @@ TEST(HardwareNodeTest, RequiresFreshRequestsAfterControllerTransitions) {
   EXPECT_EQ(node.current_command().motors[0].mode, Mode::kNeutral);
   EXPECT_EQ(node.commands_sent(), sent_after_disable);
 
-  // Fault recovery (fault bit clears, epoch advances) needs fresh requests too.
+  // Re-enable (enabled bit returns, epoch advances) needs fresh requests too.
   State recovered = TrustState(config_id, 12, 3, 5000);
   ASSERT_TRUE(InjectState(node, gateway, recovered, 1010000));
   const uint64_t sent_after_recovery = node.commands_sent();
