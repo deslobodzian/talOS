@@ -764,16 +764,24 @@ TEST_F(ElevatorHoming, AStalledLiftStopsHoming) {
 }
 
 // config/subsystems/elevator.toml's elevator, as a single-file config with
-// one [subsystem] key replaced.
+// one [lift] key replaced.
 std::string ElevatorConfig(const std::string& key, const std::string& value) {
   std::vector<std::pair<std::string, std::string>> params{
-      {"tolerance_rot", "0.1"},    {"max_height_rot", "12.0"},
-      {"homing_v", "-3.0"},        {"homing_timeout_us", "6000000"},
-      {"homing_stall_rps", "0.2"}, {"homing_stall_us", "500000"},
-      {"home_margin_rot", "0.5"},  {"home_samples", "3"}};
+      {"tolerance_rot", "0.1"},
+      {"min_rot", "0.0"},
+      {"max_rot", "12.0"},
+      {"homing", "\"limit_switch\""},
+      {"limit_switch", "\"bottom_limit\""},
+      {"homing_v", "-3.0"},
+      {"homing_timeout_us", "6000000"},
+      {"homing_stall_rps", "0.2"},
+      {"homing_stall_us", "500000"},
+      {"home_margin_rot", "0.5"},
+      {"home_samples", "3"}};
   std::string toml =
       "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
-      "[subsystems.elevator]\nperiod_us = 10000\n";
+      "[subsystems.elevator]\nperiod_us = 10000\n\n"
+      "[subsystems.elevator.lift]\n";
   for (const auto& [k, v] : params)
     toml += k + " = " + (k == key ? value : v) + "\n";
   return toml + R"(
@@ -795,7 +803,7 @@ TEST(ElevatorConfig, RefusesUnsafeHomingParameters) {
   }
   const std::vector<std::pair<std::string, std::string>> bad{
       {"homing_v", "0.0"},        {"homing_v", "2.0"},
-      {"max_height_rot", "0.0"},  {"max_height_rot", "nan"},
+      {"max_rot", "0.0"},         {"max_rot", "nan"},
       {"homing_timeout_us", "0"}, {"homing_stall_rps", "0.0"},
       {"homing_stall_us", "0"},   {"home_margin_rot", "-0.5"},
       {"home_samples", "0"}};

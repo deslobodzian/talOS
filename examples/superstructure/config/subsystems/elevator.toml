@@ -4,11 +4,19 @@
 [subsystem]
 name = "elevator"
 period_us = 10000
+
+# The lift's talos::mechanisms::PositionMechanism parameters (keys and units:
+# talOS/mechanisms/README.md).
+[lift]
 tolerance_rot = 0.1     # at_goal when within this of the goal
-max_height_rot = 12.0   # goals clamp to 0..this, in the homed frame
-# Homing: drives at homing_v (negative: down, toward the switch at the bottom)
-# until the switch closes. It gives up, neutral, after homing_timeout_us, or
-# once the lift has moved slower than homing_stall_rps for homing_stall_us.
+min_rot = 0.0           # goals clamp to min_rot..max_rot, in the homed frame
+max_rot = 12.0
+# Homing: drives at homing_v (negative: down, toward the switch at the bottom,
+# home_rot = 0) until the switch closes. It gives up, neutral, after
+# homing_timeout_us, or once the lift has moved slower than homing_stall_rps
+# for homing_stall_us.
+homing = "limit_switch"
+limit_switch = "bottom_limit"
 homing_v = -3.0
 homing_timeout_us = 6000000
 homing_stall_rps = 0.2
@@ -43,7 +51,7 @@ acceleration_rps2 = 24.0
 jerk_rps3 = 0.0
 # No hardware soft limits: they act in the TalonFX's power-on frame on every
 # control mode, so after a reset at height the reverse limit (0 at that
-# height) would stop homing at once. max_height_rot bounds the goals instead.
+# height) would stop homing at once. [lift] max_rot bounds the goals instead.
 soft_limits = false
 # A switch on the TalonFX's own forward limit input stops upward output in
 # every control mode, whatever the frame. "NormallyOpen" is also Phoenix's

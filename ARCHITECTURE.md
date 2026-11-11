@@ -21,6 +21,7 @@ producer/consumer, rate, dynamic payload, and shared-memory slot size.
 
 ```
 robot code        2026-robot/main_processor/*, examples/*
+talOS/mechanisms  PositionMechanism, VelocityMechanism, RollerWithSensor (configured building blocks)
 talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, OperatorArming, testing::SimHardware
 talOS/node        Node, Subscription, Publisher, StateMachine, TALOS_NODE, testing::Sim
 talOS/python      the same API in Python, ctypes over talOS/node_api (libtalos_node.so)
@@ -36,7 +37,9 @@ Allowed dependencies:
   ([NAMING.md](talOS/NAMING.md#topics)), and reads the hardware config only
   for timeouts and actuator ownership (its loop tier). `talOS/devices` is
   built on `Node`'s public API (`extension<T>()`, `after_update()`) and the
-  framework hooks in `detail::NodeAccess`.
+  framework hooks in `detail::NodeAccess`. `talOS/mechanisms` uses only the
+  devices layer's public handles and adds no gating of its own beyond
+  driving nothing without a goal: a node's `Target` still decides.
 - `talOS/` never depends on a robot, an example or `studio/`.
 - Python reaches talOS only through the C ABI in `talOS/node_api`; it does not
   reimplement a wire format, a memory layout, a state machine, or a C++ node
@@ -320,7 +323,7 @@ manifest fails the build with the regenerate command.
 
 | New thing | Where |
 |---|---|
-| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
+| a mechanism | first a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block (`PositionMechanism`, `VelocityMechanism`, `RollerWithSensor`) configured in the subsystem file, wrapped by a thin node as `examples/superstructure/cpp/elevator.h` is; that node is a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)) |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
 | a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named by a parameter of the node that follows it and loaded with `talOS/trajectory`; `tools/sync_manifest.py` does not list it in `CONFIG_FILES` yet (TODO.md TRAJ-2) |
