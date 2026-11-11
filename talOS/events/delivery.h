@@ -19,10 +19,9 @@ enum class Delivery : std::uint8_t {
   BEFORE_TIMERS,
   // Also whenever a publication on a prompt watcher (set_prompt) wakes the
   // loop; nothing wakes it otherwise, so an idle loop sleeps until its next
-  // timer. The realtime loop is woken by the publisher (talOS/rtms/wake.h),
-  // and with no prompt watcher runs as BEFORE_TIMERS. The simulated loop
-  // drains every watcher on its 1 ms poll tick instead, exactly as under
-  // POLL, prompt watchers or not (TODO.md RT-6).
+  // timer. The realtime loop is woken by the publisher (talOS/rtms/wake.h);
+  // the simulated loop treats the publication as an event at its
+  // publication time. With no prompt watcher either runs as BEFORE_TIMERS.
   ON_PUBLISH,
 };
 

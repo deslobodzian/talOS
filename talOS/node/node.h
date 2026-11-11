@@ -172,7 +172,7 @@ class Node {
   // A node receives messages right before each of its timers (update(),
   // every()), and otherwise sleeps; passing `on_message` makes a publication
   // on that topic also wake the node, so the callback runs as the message
-  // arrives (testing::Sim models this as a 1 ms drain). Each wake drains
+  // arrives (testing::Sim, at the publication's instant). Each wake drains
   // every subscription. Without a callback, each drain keeps only the newest
   // available message and counts skipped messages as dropped. Callbacks
   // receive messages in sequence, up to 64 per topic per drain. age() counts

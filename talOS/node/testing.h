@@ -11,18 +11,28 @@
 //   EXPECT_TRUE(sim.latest<elevator::ElevatorStatus>("/elevator/status"));
 //
 // Each node runs on its own simulated loop, with the process's delivery
-// policy (see Node::subscribe) and bounded RTMS topic/drop semantics. Time is
-// virtual and advances on one chronological frontier: step() repeatedly takes
-// the earliest pending deadline of any node's loop, periodic hook or pause
+// policy (see Node::subscribe) and bounded RTMS topic/drop semantics: a node
+// drains right before each of its timers, and a publication on a
+// subscription that wakes it (a callback, a Driver Station listener, any
+// subscription of a node with no timer) drains it at the publication's
+// instant, as the robot's wake does. Time is virtual and advances on one
+// chronological frontier: step() repeatedly takes the earliest pending event
+// of any node's loop (a timer or such a publication), periodic hook or pause
 // end, and runs every loop exactly up to it, so no node sees a publication
-// from its future. At one instant the nodes run in the order they were added
-// (an earlier-added node's publications reach a later-added one at that same
-// instant, the reverse at the reader's next drain), and the Sim's own
-// periodic hooks (SimHardware) after them. pause(name, duration) stops only
-// that node's timers and deliveries; resume(name) ends the pause early.
-// Serial stepping proves causality and ordering, not concurrent RTMS
-// behaviour or scheduler jitter. Hardware is a layer on top:
-// talOS/devices/testing.h plays the bridge.
+// from its future. At one instant the nodes run in rounds: each round runs
+// them in the order they were added, then the Sim's own periodic hooks
+// (SimHardware), so an earlier-added node's publications reach a later-added
+// one's timers and wakes in the same round. A node woken by a publication
+// made after it ran (by a later-added node, a hook or a callback) runs again
+// at that instant in another round, until no node is due there; more than
+// 1000 rounds at one instant throw std::runtime_error naming the nodes and
+// topics still due (a zero-time publish cycle). A message the test publishes
+// between steps is stamped now() and wakes its readers at the start of the
+// next step(), at that instant. pause(name, duration) stops only that node's
+// timers and deliveries; at its end, or at resume(name), the node runs its
+// overdue timers and pending wakes at once. Serial stepping proves causality
+// and ordering, not concurrent RTMS behaviour or scheduler jitter. Hardware
+// is a layer on top: talOS/devices/testing.h plays the bridge.
 
 #include <cstddef>
 #include <cstdint>

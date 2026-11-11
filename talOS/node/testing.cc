@@ -134,9 +134,83 @@ struct Sim::Impl {
   Duration now{0};
   bool started = false;
 
+  // Rounds at one instant before step() gives up on nodes that keep
+  // publishing to each other's prompt subscriptions without time passing.
+  static constexpr int kMaxRoundsPerInstant = 1000;
+
   ~Impl() {
     nodes.clear();
     if (owns_config_file) std::filesystem::remove(config_path);
+  }
+
+  // Runs every node's loop up to `until` in the order the nodes were added,
+  // ending a pause that ends by then, and then the periodic hooks due by
+  // then.
+  void Round(Duration until) {
+    const Time at = Time::from_nanos(until.count());
+    for (const auto& hosted : nodes) {
+      if (hosted->paused_until) {
+        hosted->loop->advance_until(at);
+        if (at < *hosted->paused_until) continue;
+        hosted->paused_until.reset();
+      }
+      hosted->loop->run_until(at);
+    }
+    now = until;
+    RunPeriodic();
+  }
+
+  // Whether a running node has something due by now: a prompt publication
+  // made at this instant after the node had run, by a node added after it,
+  // a hook or the harness.
+  bool Due(const Hosted& hosted) const {
+    return !hosted.paused_until && hosted.loop->started() &&
+           hosted.loop->next_deadline() <= Time::from_nanos(now.count());
+  }
+
+  // Starts every loop not yet started and not paused at now, in add order,
+  // arming its timers and delivering what it is due there. A loop's start
+  // can run prompt handlers that publish to a loop started before it, so
+  // Settle() must follow before any next deadline is read.
+  void StartLoops() {
+    const Time at = Time::from_nanos(now.count());
+    for (const auto& hosted : nodes) {
+      if (!hosted->paused_until && !hosted->loop->started()) {
+        hosted->loop->run_until(at);
+      }
+    }
+  }
+
+  // Runs rounds at now until no node is due there.
+  void Settle() {
+    for (int rounds = 0;; ++rounds) {
+      bool due = false;
+      for (const auto& hosted : nodes) due = due || Due(*hosted);
+      if (!due) return;
+      if (rounds == kMaxRoundsPerInstant) {
+        throw std::runtime_error(NotSettling());
+      }
+      Round(now);
+    }
+  }
+
+  std::string NotSettling() const {
+    const Time at = Time::from_nanos(now.count());
+    std::string message = "Sim: " + std::to_string(kMaxRoundsPerInstant) +
+                          " rounds at " + std::to_string(now.count()) +
+                          " ns did not settle (a zero-time publish cycle?); "
+                          "still due:";
+    for (const auto& hosted : nodes) {
+      if (!Due(*hosted)) continue;
+      message += " node '" + hosted->name + "' (";
+      const char* separator = "";
+      for (const std::string& topic : hosted->loop->due_prompt_topics(at)) {
+        message += separator + topic;
+        separator = ", ";
+      }
+      message += ")";
+    }
+    return message;
   }
 
   void RunPeriodic() {
@@ -227,17 +301,22 @@ std::optional<std::vector<std::byte>> Sim::latest_bytes(
 }
 
 // One chronological frontier: each round finds the earliest pending instant
-// across every hosted loop's scheduler, Sim::every hooks and pause ends, and
-// runs each loop exactly up to it, in the order the nodes were added. No
-// loop therefore runs past a time another has not reached, and at one
-// instant an earlier-added node's publications are visible to later ones.
+// across every hosted loop (a timer, or a prompt publication), Sim::every
+// hooks and pause ends, and runs each loop exactly up to it, in the order the
+// nodes were added, then the hooks. No loop therefore runs past a time
+// another has not reached, and at one instant an earlier-added node's
+// publications are visible to later ones. Rounds then repeat at that instant
+// while a node is due there, so a prompt publication reaches an earlier-added
+// node (or arrives from a hook or the harness) at the instant it was made.
 void Sim::step(Duration d) {
   if (d < Duration::zero()) throw std::invalid_argument("Sim: negative step");
   Impl& impl = *impl_;
   impl.started = true;
   const Duration end = impl.now + d;
+  impl.RunPeriodic();
+  impl.StartLoops();
   for (;;) {
-    impl.RunPeriodic();
+    impl.Settle();
     if (impl.now >= end) break;
     Duration next = end;
     for (const auto& p : impl.periodic) next = std::min(next, p.next);
@@ -246,22 +325,9 @@ void Sim::step(Duration d) {
         next = std::min(next, Duration{hosted->paused_until->nanos()});
         continue;
       }
-      // Arms the loop's timers and poll tick, dispatching nothing later
-      // than now, so its next deadline counts.
-      if (!hosted->loop->started()) hosted->loop->run_until(now());
       next = std::min(next, Duration{hosted->loop->next_deadline().nanos()});
     }
-    next = std::max(next, impl.now);
-    const Time until = Time::from_nanos(next.count());
-    for (const auto& hosted : impl.nodes) {
-      if (hosted->paused_until) {
-        hosted->loop->advance_until(until);
-        if (until < *hosted->paused_until) continue;
-        hosted->paused_until.reset();
-      }
-      hosted->loop->run_until(until);
-    }
-    impl.now = next;
+    impl.Round(std::max(next, impl.now));
   }
 }
 
