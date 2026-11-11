@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <csignal>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -20,13 +21,21 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/rtms/rtms.h"
+#include "talOS/rtms/wake.h"
 #include "talOS/telemetry/wire.h"
 #include "telemetry.h"
+// uSockets' callback poll (`us_internal_callback_t`, POLL_TYPE_CALLBACK): how
+// its own timers and UDP sockets put a descriptor in the loop. Its public API
+// has no other way to watch a descriptor it did not open.
+extern "C" {
+#include "internal/internal.h"
+}
 namespace fs = std::filesystem;
 namespace {
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }
 using studio::EgressBudget;
+using studio::kNeverNs;
 struct Client {
   EgressBudget budget;
   // What this client has been sent of the graph and the telemetry; its
@@ -70,8 +79,19 @@ struct Bridge {
   std::optional<RTMSQueue> queue;
   std::size_t reader = 0;
   std::uint64_t segment_id = 0;
-  unsigned watch_ticks = 0;
+  // When check_segment() is next due (watch()).
+  std::int64_t check_due_ns = 0;
   bool announced_wait = false;
+  // The wake channel (talOS/rtms README "Wake channel"): the reader slot
+  // names this receiver, so a publication wakes the loop. Empty when none
+  // could be made; the loop then reads every kFallbackNs.
+  std::optional<talos::WakeReceiver> wake;
+  // The last read stopped at its page budget, or could not arm the wake:
+  // there may be pages to read, so the loop comes back in kFallbackNs.
+  bool backlog = false;
+  // The earliest instant a send the egress budget deferred becomes
+  // affordable (affordable()), kNeverNs when nothing waits for budget.
+  std::int64_t retry_ns = kNeverNs;
   std::string attach_error;
   std::vector<Socket*> clients;
   // Where the next fan-out starts. The shared bucket goes to whichever client
@@ -96,6 +116,9 @@ struct Bridge {
   std::size_t max_clients = 4;
   std::uint64_t refused = 0, egress_bytes = 0;
   EgressBudget budget;
+  // Returns from the event loop's wait (every one, whatever woke it), and of
+  // them the ones a telemetry publication or a deadline timer woke.
+  std::uint64_t wakes = 0, publication_wakes = 0, deadline_wakes = 0;
 
   Bridge() = default;
   Bridge(const Bridge&) = delete;
@@ -124,6 +147,7 @@ struct Bridge {
       detach();
       queue.emplace(std::move(next));
       reader = *claimed;
+      if (wake) queue->set_reader_wake(reader, wake->id());
       segment_id = id;
       attach_error.clear();
       std::cerr << "attached to " << topic << '\n';
@@ -155,12 +179,14 @@ struct Bridge {
     attach(*id);
   }
 
-  // Called every poll tick: checks every 100 ticks while waiting, every
-  // 1000 once attached (a replacement is rare; each check is a few syscalls).
-  void watch() {
-    if (++watch_ticks < (queue ? 1000u : 100u)) return;
-    watch_ticks = 0;
+  // Checks every 100 ms while waiting, every second once attached (a
+  // replacement is rare; each check is a few syscalls).
+  static constexpr std::int64_t kWaitingCheckNs = 100'000'000;
+  static constexpr std::int64_t kAttachedCheckNs = 1'000'000'000;
+  void watch(std::int64_t now_ns) {
+    if (now_ns < check_due_ns) return;
     check_segment();
+    check_due_ns = now_ns + (queue ? kAttachedCheckNs : kWaitingCheckNs);
   }
 
   // Each client's own refill rate, B/s.
@@ -169,16 +195,24 @@ struct Bridge {
   }
 
   // Whether `framed_bytes` fit the client's and the shared bucket now, and
-  // the client has nothing buffered. Spends nothing.
+  // the client has nothing buffered. Spends nothing. A send the budget
+  // defers sets retry_ns to when both buckets will hold it; one deferred for
+  // buffered output is retried by the socket's drain handler.
   bool affordable(Socket* client, std::size_t framed_bytes) {
     const std::int64_t now = talos::introspect::monotonic_now_ns();
     auto& local = client->getUserData()->budget;
-    if (client->getBufferedAmount() != 0 ||
-        !local.available(framed_bytes, client_rate(), now) ||
-        !budget.available(framed_bytes, EgressBudget::kBytesPerSecond, now)) {
+    const double rate = client_rate();
+    const bool own = local.available(framed_bytes, rate, now);
+    const bool shared =
+        budget.available(framed_bytes, EgressBudget::kBytesPerSecond, now);
+    if (!own || !shared) {
+      const std::int64_t wait_ns =
+          std::max(local.wait_ns(framed_bytes, rate),
+                   budget.wait_ns(framed_bytes, EgressBudget::kBytesPerSecond));
+      if (wait_ns != kNeverNs) retry_ns = std::min(retry_ns, now + wait_ns);
       return false;
     }
-    return true;
+    return client->getBufferedAmount() == 0;
   }
 
   // Sends one message the caller found affordable and charges it.
@@ -310,10 +344,17 @@ struct Bridge {
     return node;
   }
 
+  // Reads what the topic holds, up to a page budget (`backlog` when it stops
+  // there), and brings every client toward it.
   void poll() {
+    backlog = false;
     if (queue) {
       // Bound work so HTTP and client socket processing cannot starve.
-      for (unsigned count = 0; count < 256; ++count) {
+      for (unsigned count = 0;; ++count) {
+        if (count == 256) {
+          backlog = true;
+          break;
+        }
         MessageInfo info;
         const auto result = queue->read_next(reader, frame, info);
         if (result == ReadResult::TORN) {
@@ -340,12 +381,93 @@ struct Bridge {
         }
       }
     }
-    // Every poll, not only on a new tick: an update the budget deferred goes
-    // out as soon as the budget refills, and a quiet stream still sends its
-    // heartbeat.
+    // Every pass, not only on a new tick: a pass woken by the budget's refill
+    // or a client's heartbeat (next_wake_ns) sends what is due.
     for_each_client([this](Socket* client) { pump(client); });
   }
+
+  // The system graph refreshes every 250 ms, by the clock: Studio marks the
+  // graph stale after GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts)
+  // without one. Each client is sent its changed counters at most every
+  // GraphFeed::kUpdateNs (or a deferral notice), so Studio keeps measuring
+  // node rates from successive graphs' counters and never marks a merely
+  // deferred graph stale.
+  static constexpr std::int64_t kSystemRefreshNs = 250'000'000;
+  // How soon the loop comes back when it cannot sleep on the wake channel.
+  static constexpr std::int64_t kFallbackNs = 1'000'000;
+  std::int64_t refreshed_ns = 0;
+
+  // One pass of the loop, whatever woke it: the wake channel's protocol
+  // (drain, read until empty, arm, and read again while an arm finds a
+  // page), the segment check, the graph refresh, and every client's due
+  // sends.
+  void service(std::int64_t now_ns) {
+    if (wake) wake->drain();
+    watch(now_ns);
+    retry_ns = kNeverNs;
+    poll();
+    if (now_ns - refreshed_ns >= kSystemRefreshNs) {
+      refreshed_ns = now_ns;
+      refresh_system();
+    }
+    if (!queue || !wake) return;
+    // Three tries: a slot this queue no longer holds never arms, and must
+    // not make the loop spin; it falls back to reading every kFallbackNs.
+    for (int attempt = 0; !backlog; ++attempt) {
+      if (queue->arm_wake(reader)) return;
+      if (attempt == 2) {
+        backlog = true;
+        return;
+      }
+      poll();
+    }
+  }
+
+  // When the loop must next run with no socket event or publication: the
+  // graph refresh, the segment check, a deferred send's refill, and each
+  // client's due update or heartbeat (studio::ClientFeeds::NextDueNs). An
+  // instant already past is left out: what it was due for was done this
+  // pass or waits for budget, which retry_ns covers.
+  std::int64_t next_wake_ns(std::int64_t now_ns) {
+    if (!wake || backlog) return now_ns + kFallbackNs;
+    std::int64_t next = refreshed_ns + kSystemRefreshNs;
+    const auto consider = [&next, now_ns](std::int64_t due_ns) {
+      if (due_ns > now_ns && due_ns < next) next = due_ns;
+    };
+    consider(check_due_ns);
+    consider(retry_ns);
+    for (Socket* client : clients) {
+      consider(client->getUserData()->feeds.NextDueNs(system_graph));
+    }
+    return std::max(next, now_ns + 1);
+  }
 };
+
+// Puts `fd` in the uSockets loop as a callback poll that runs `on_ready`
+// while it is readable, leaving the descriptor for the caller to drain. The
+// poll's extension holds `user`.
+us_poll_t* WatchReadable(us_loop_t* loop, int fd, void* user,
+                         void (*on_ready)(us_internal_callback_t*)) {
+  auto* poll =
+      us_create_poll(loop, 0, sizeof(us_internal_callback_t) + sizeof(user));
+  us_poll_init(poll, fd, POLL_TYPE_CALLBACK);
+  auto* callback = reinterpret_cast<us_internal_callback_t*>(poll);
+  callback->loop = loop;
+  callback->cb_expects_the_loop = 0;
+  callback->leave_poll_ready = 1;
+  callback->cb = on_ready;
+  std::memcpy(callback + 1, &user, sizeof(user));
+  us_poll_start(poll, loop, LIBUS_SOCKET_READABLE);
+  return poll;
+}
+
+// The `user` WatchReadable stored with the poll.
+template <class T>
+T* WatchedUser(us_internal_callback_t* callback) {
+  void* user = nullptr;
+  std::memcpy(&user, callback + 1, sizeof(user));
+  return static_cast<T*>(user);
+}
 std::string mime(const fs::path& p) {
   auto ext = p.extension().string();
   if (ext == ".html") return "text/html; charset=utf-8";
@@ -508,7 +630,12 @@ int main(int argc, char** argv) try {
   // once the segment exists: an empty ring of its own would wait for a
   // publisher that might disagree with its layout.
   bridge.segment = ShmObjectName(topic);
-  bridge.check_segment();
+  try {
+    bridge.wake.emplace();
+  } catch (const std::exception& e) {
+    std::cerr << "no wake channel (" << e.what()
+              << "); reading the topic every 1 ms\n";
+  }
   if (!config_path.empty()) {
     bridge.max_clients =
         talos::config::ParseRobotConfig(config_path).studio.max_clients;
@@ -539,6 +666,11 @@ int main(int argc, char** argv) try {
     // received -- possibly from before telemetry stopped -- so the client
     // treats its first update as of unknown age.
     bridge.pump(ws);
+  };
+  // A client held back by buffered output is sent what is due as soon as
+  // its socket drains.
+  behavior.drain = [&](auto* ws) {
+    if (ws->getBufferedAmount() == 0) bridge.pump(ws);
   };
   behavior.close = [&](auto* ws, int, std::string_view) {
     std::erase(bridge.clients, ws);
@@ -659,47 +791,68 @@ int main(int argc, char** argv) try {
                    0, reinterpret_cast<us_socket_t*>(bridge.listener))
             << '\n'
             << std::flush;
-  auto* timer = us_create_timer(reinterpret_cast<us_loop_t*>(uWS::Loop::get()),
-                                0, sizeof(Bridge*));
-  if (!timer) throw std::runtime_error("poll timer allocation failed");
+  // The loop sleeps until a socket event, a publication on the topic (the
+  // wake channel's descriptor) or the timer, which is set before each wait
+  // to the bridge's next duty (Bridge::next_wake_ns). Every return from the
+  // wait ends in the post handler below, which makes the bridge's pass.
+  auto* loop = reinterpret_cast<us_loop_t*>(uWS::Loop::get());
+  auto* timer = us_create_timer(loop, 0, sizeof(Bridge*));
+  if (!timer) throw std::runtime_error("deadline timer allocation failed");
   *static_cast<Bridge**>(us_timer_ext(timer)) = &bridge;
-  // One timer at the telemetry rate; the system graph is structure, not
-  // signal, so it refreshes every 250 ms instead, by the clock: under load a
-  // 1 ms timer fires late, and counting ticks stretched the refresh past
-  // GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts). Each client is sent
-  // its changed counters at most every GraphFeed::kUpdateNs (or a deferral
-  // notice), so Studio keeps measuring node rates from successive graphs'
-  // counters and never marks a merely deferred graph stale.
-  static constexpr std::int64_t kSystemRefreshNs = 250'000'000;
-  static std::int64_t refreshed_ns = talos::introspect::monotonic_now_ns();
-  bridge.refresh_system();
-  us_timer_set(
-      timer,
-      [](us_timer_t* t) {
-        auto* b = *static_cast<Bridge**>(us_timer_ext(t));
-        if (stop) {
-          us_listen_socket_close(0, b->listener);
-          auto clients = b->clients;
-          for (auto* ws : clients) ws->close();
-          us_timer_close(t);
-          return;
-        }
-        b->watch();
-        b->poll();
-        const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
-        if (now_ns - refreshed_ns >= kSystemRefreshNs) {
-          refreshed_ns = now_ns;
-          b->refresh_system();
-        }
-      },
-      1, 1);
+  const auto on_deadline = [](us_timer_t* t) {
+    ++(*static_cast<Bridge**>(us_timer_ext(t)))->deadline_wakes;
+  };
+  us_poll_t* wake_poll = nullptr;
+  if (bridge.wake) {
+    wake_poll = WatchReadable(
+        loop, bridge.wake->fd(), &bridge, [](us_internal_callback_t* callback) {
+          ++WatchedUser<Bridge>(callback)->publication_wakes;
+        });
+  }
+  std::int64_t timer_due_ns = 0;
+  bool stopping = false;
+  const auto pass = [&] {
+    if (stopping) return;
+    ++bridge.wakes;
+    if (stop) {
+      stopping = true;
+      us_listen_socket_close(0, bridge.listener);
+      auto clients = bridge.clients;
+      for (auto* ws : clients) ws->close();
+      us_timer_close(timer);
+      if (wake_poll != nullptr) {
+        us_poll_stop(wake_poll, loop);
+        us_poll_free(wake_poll, loop);
+      }
+      return;
+    }
+    bridge.service(talos::introspect::monotonic_now_ns());
+    const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+    const std::int64_t next_ns = bridge.next_wake_ns(now_ns);
+    // Set again only when it would fire too late, or has fired: one that
+    // fires early costs a pass that finds nothing due.
+    if (timer_due_ns <= now_ns || next_ns < timer_due_ns) {
+      // Whole milliseconds, rounded up, so it never fires before the duty.
+      const auto ms =
+          static_cast<int>((next_ns - now_ns + 999'999) / 1'000'000);
+      us_timer_set(timer, on_deadline, ms, 0);
+      timer_due_ns = now_ns + std::int64_t{ms} * 1'000'000;
+    }
+  };
+  pass();
+  // A stop signal interrupts the wait, which then ends in this handler.
+  uWS::Loop::get()->addPostHandler(&bridge, [&pass](uWS::Loop*) { pass(); });
   // Normal process termination is handled below; signal exit avoids freeing a
   // running loop.
   app.run();
+  uWS::Loop::get()->removePostHandler(&bridge);
   std::cerr << "forwarded=" << bridge.forwarded << " invalid=" << bridge.invalid
             << " lapped=" << bridge.lapped << " ws_drops=" << bridge.ws_drops
             << " refused=" << bridge.refused
-            << " egress_bytes=" << bridge.egress_bytes << '\n';
+            << " egress_bytes=" << bridge.egress_bytes
+            << " wakes=" << bridge.wakes
+            << " publication_wakes=" << bridge.publication_wakes
+            << " deadline_wakes=" << bridge.deadline_wakes << '\n';
 } catch (const std::exception& e) {
   std::cerr << e.what() << '\n';
   return 1;

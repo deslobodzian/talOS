@@ -90,10 +90,14 @@ cc_binary(
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/rtms",
+        "//talOS/rtms:wake",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
         "@flatbuffers",
         "@studio_uws//:uws",
+        # internal/internal.h: the callback poll that puts the wake channel's
+        # descriptor in the loop (main.cc WatchReadable).
+        "@studio_usockets//:usockets",
     ],
 )
 
