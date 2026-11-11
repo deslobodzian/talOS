@@ -3,7 +3,7 @@
 # talos developer environment: install (or just check) what building, testing
 # and simulating this repo needs, on Linux (apt, dnf, pacman) and macOS
 # (Homebrew). Development only; robot deployment is tools/deploy.sh. Windows
-# runs this inside WSL2 via tools/setup.ps1. Reference: docs/INSTALL.md.
+# Windows users run this script inside a WSL2 Ubuntu shell. Reference: docs/INSTALL.md.
 #
 #   ./tools/setup.sh [--check] [--yes] [--no-studio] [--no-rio] [--no-lint] [--verify]
 #
@@ -153,7 +153,7 @@ detect_os() {
         *) die "unsupported distribution: $DISTRO. Supported: Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch (apt/dnf/pacman), macOS (brew). Elsewhere install by hand: git curl unzip zip, g++ >= $GCC_MIN, python3, bazelisk as 'bazel', Node $NODE_MAJOR + pnpm $PNPM_VERSION (corepack), JDK $JDK_MAJOR, clang-format/clang-tidy $LLVM_MAJOR, buildifier $BUILDIFIER_VERSION — see docs/INSTALL.md" ;;
       esac
       ;;
-    *) die "unsupported OS: $(uname -s). Windows: run tools/setup.ps1 (sets up WSL2)" ;;
+    *) die "unsupported OS: $(uname -s). On Windows, run this script inside WSL2 (Ubuntu 24.04)" ;;
   esac
   [ "$YES" = 1 ] || YFLAG=""
 }
@@ -520,7 +520,7 @@ detect_rio() {
 install_rio() {
   [ -n "$JDK17_HOME" ] || { warn "RoboRIO toolchain needs JDK $JDK_MAJOR first"; return 1; }
   if LC_ALL=C grep -q $'\r' "$RIO_DIR/gradlew"; then
-    hint "gradlew has CRLF line endings (Windows checkout): run git ls-files -z -- '*.sh' '*gradlew' | xargs -0 sed -i 's/\\r\$//' from the repo root (or rerun tools\\setup.ps1 on Windows)"
+    hint "gradlew has CRLF line endings (Windows checkout): run git ls-files -z -- '*.sh' '*gradlew' | xargs -0 sed -i 's/\\r\$//' from the repo root"
     return 1
   fi
   (cd "$RIO_DIR" && run env JAVA_HOME="$JDK17_HOME" bash ./gradlew installRoboRioToolchain)

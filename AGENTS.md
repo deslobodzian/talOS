@@ -15,7 +15,7 @@ test matrix, open source first): `docs/METHODOLOGY.md`. Mechanism walkthrough:
 
 ## Build, test, lint
 
-Dev environment: `tools/setup.sh` (Linux/macOS) or `tools/setup.ps1` (Windows → WSL2); see docs/INSTALL.md.
+Dev environment: `tools/setup.sh` (Linux/macOS; on Windows, inside WSL2); see docs/INSTALL.md.
 
 ```sh
 bazel build //...

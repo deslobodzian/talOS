@@ -12,8 +12,7 @@ Robot bring-up checklist: [docs/BRINGUP.md](docs/BRINGUP.md).
 
 ## Install
 
-Linux/macOS: `./tools/setup.sh`. Windows: `powershell -ExecutionPolicy Bypass -File tools\setup.ps1`
-(talOS builds inside WSL2). Details, flags and troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
+Linux, macOS, or Windows inside WSL2: `./tools/setup.sh`. Details, flags and troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Build and test
 
