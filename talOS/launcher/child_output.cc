@@ -329,7 +329,8 @@ void ChildOutput::EchoLoop() {
       echo_dropped_ = 0;
     }
     lock.unlock();
-    // Lost if stdout is closed.
+    // A write error drops the echo, except a pipe whose reader closed it:
+    // the launcher leaves SIGPIPE at its default, so that ends the launcher.
     WriteAll(STDOUT_FILENO, echo);
     lock.lock();
   }
