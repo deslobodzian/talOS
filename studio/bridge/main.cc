@@ -35,7 +35,6 @@ namespace {
 volatile std::sig_atomic_t stop = 0;
 void signal_handler(int) { stop = 1; }
 using studio::EgressBudget;
-using studio::kNeverNs;
 struct Client {
   EgressBudget budget;
   // What this client has been sent of the graph and the telemetry; its
@@ -79,19 +78,16 @@ struct Bridge {
   std::optional<RTMSQueue> queue;
   std::size_t reader = 0;
   std::uint64_t segment_id = 0;
-  // When check_segment() is next due (watch()).
-  std::int64_t check_due_ns = 0;
   bool announced_wait = false;
   // The wake channel (talOS/rtms README "Wake channel"): the reader slot
   // names this receiver, so a publication wakes the loop. Empty when none
-  // could be made; the loop then reads every kFallbackNs.
+  // could be made; the loop then reads every WakeSchedule::kFallbackNs.
   std::optional<talos::WakeReceiver> wake;
   // The last read stopped at its page budget, or could not arm the wake:
   // there may be pages to read, so the loop comes back in kFallbackNs.
   bool backlog = false;
-  // The earliest instant a send the egress budget deferred becomes
-  // affordable (affordable()), kNeverNs when nothing waits for budget.
-  std::int64_t retry_ns = kNeverNs;
+  // Every duty the loop wakes for on its own (next_wake_ns).
+  studio::WakeSchedule schedule;
   std::string attach_error;
   std::vector<Socket*> clients;
   // Where the next fan-out starts. The shared bucket goes to whichever client
@@ -184,9 +180,10 @@ struct Bridge {
   static constexpr std::int64_t kWaitingCheckNs = 100'000'000;
   static constexpr std::int64_t kAttachedCheckNs = 1'000'000'000;
   void watch(std::int64_t now_ns) {
-    if (now_ns < check_due_ns) return;
+    if (now_ns < schedule.check_due_ns) return;
     check_segment();
-    check_due_ns = now_ns + (queue ? kAttachedCheckNs : kWaitingCheckNs);
+    schedule.check_due_ns =
+        now_ns + (queue ? kAttachedCheckNs : kWaitingCheckNs);
   }
 
   // Each client's own refill rate, B/s.
@@ -196,8 +193,8 @@ struct Bridge {
 
   // Whether `framed_bytes` fit the client's and the shared bucket now, and
   // the client has nothing buffered. Spends nothing. A send the budget
-  // defers sets retry_ns to when both buckets will hold it; one deferred for
-  // buffered output is retried by the socket's drain handler.
+  // defers is due again when both buckets will hold it (schedule); one
+  // deferred for buffered output is retried by the socket's drain handler.
   bool affordable(Socket* client, std::size_t framed_bytes) {
     const std::int64_t now = talos::introspect::monotonic_now_ns();
     auto& local = client->getUserData()->budget;
@@ -206,10 +203,10 @@ struct Bridge {
     const bool shared =
         budget.available(framed_bytes, EgressBudget::kBytesPerSecond, now);
     if (!own || !shared) {
-      const std::int64_t wait_ns =
-          std::max(local.wait_ns(framed_bytes, rate),
-                   budget.wait_ns(framed_bytes, EgressBudget::kBytesPerSecond));
-      if (wait_ns != kNeverNs) retry_ns = std::min(retry_ns, now + wait_ns);
+      schedule.Deferred(
+          now, std::max(local.wait_ns(framed_bytes, rate),
+                        budget.wait_ns(framed_bytes,
+                                       EgressBudget::kBytesPerSecond)));
       return false;
     }
     return client->getBufferedAmount() == 0;
@@ -386,30 +383,24 @@ struct Bridge {
     for_each_client([this](Socket* client) { pump(client); });
   }
 
-  // The system graph refreshes every 250 ms, by the clock: Studio marks the
-  // graph stale after GRAPH_STALE_AFTER_MS (studio/src/data/freshness.ts)
-  // without one. Each client is sent its changed counters at most every
-  // GraphFeed::kUpdateNs (or a deferral notice), so Studio keeps measuring
-  // node rates from successive graphs' counters and never marks a merely
-  // deferred graph stale.
-  static constexpr std::int64_t kSystemRefreshNs = 250'000'000;
-  // How soon the loop comes back when it cannot sleep on the wake channel.
-  static constexpr std::int64_t kFallbackNs = 1'000'000;
-  std::int64_t refreshed_ns = 0;
-
   // One pass of the loop, whatever woke it: the wake channel's protocol
   // (drain, read until empty, arm, and read again while an arm finds a
   // page), the segment check, the graph refresh, and every client's due
-  // sends.
+  // sends. Each client is sent its changed counters at most every
+  // GraphFeed::kUpdateNs (or a deferral notice), so Studio keeps measuring
+  // node rates from successive graphs' counters and never marks a merely
+  // deferred graph stale.
   void service(std::int64_t now_ns) {
     if (wake) wake->drain();
     watch(now_ns);
-    retry_ns = kNeverNs;
-    poll();
-    if (now_ns - refreshed_ns >= kSystemRefreshNs) {
-      refreshed_ns = now_ns;
+    schedule.BeginPass();
+    // Refreshed before the clients are pumped, so a graph update due with
+    // the refresh goes out on this pass, not on the next wake.
+    if (schedule.RefreshDue(now_ns)) {
+      schedule.refreshed_ns = now_ns;
       refresh_system();
     }
+    poll();
     if (!queue || !wake) return;
     // Three tries: a slot this queue no longer holds never arms, and must
     // not make the loop spin; it falls back to reading every kFallbackNs.
@@ -423,23 +414,14 @@ struct Bridge {
     }
   }
 
-  // When the loop must next run with no socket event or publication: the
-  // graph refresh, the segment check, a deferred send's refill, and each
-  // client's due update or heartbeat (studio::ClientFeeds::NextDueNs). An
-  // instant already past is left out: what it was due for was done this
-  // pass or waits for budget, which retry_ns covers.
-  std::int64_t next_wake_ns(std::int64_t now_ns) {
-    if (!wake || backlog) return now_ns + kFallbackNs;
-    std::int64_t next = refreshed_ns + kSystemRefreshNs;
-    const auto consider = [&next, now_ns](std::int64_t due_ns) {
-      if (due_ns > now_ns && due_ns < next) next = due_ns;
-    };
-    consider(check_due_ns);
-    consider(retry_ns);
-    for (Socket* client : clients) {
-      consider(client->getUserData()->feeds.NextDueNs(system_graph));
-    }
-    return std::max(next, now_ns + 1);
+  // When the loop must next run with no socket event or publication
+  // (studio::WakeSchedule::NextWakeNs).
+  std::int64_t next_wake_ns(std::int64_t now_ns) const {
+    return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
+                               [this](const auto& visit) {
+                                 for (Socket* client : clients)
+                                   visit(client->getUserData()->feeds);
+                               });
   }
 };
 
