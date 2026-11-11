@@ -218,6 +218,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22 |
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
 | `talOS/trajectory` | REQ-RT-06 for the calls an `update()` makes (`sample`, `events_between`, `HolonomicFollower::step`); otherwise none in the catalogue (TODO.md SCOPE-3) |
+| `talOS/mechanisms` | REQ-SAFE-01, REQ-SAFE-02, REQ-SAFE-04, REQ-SAFE-05 through the node test matrix, REQ-RT-06 |
 | `talOS/vision` (CPU pipeline, capture, `field_sim`) | REQ-CONTRACT-27, REQ-DEV-11 |
 | `talOS/vision/metal`, `talOS/vision/recording` | none in the catalogue (TODO.md SCOPE-1) |
 | `talOS/aiming` | none in the catalogue (TODO.md AIM-1) |

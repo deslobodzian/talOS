@@ -203,6 +203,20 @@ Handles are named by their device key in the subsystem config
 Actuator flush and disable semantics are in
 [Architecture: The tick](../ARCHITECTURE.md#the-tick).
 
+### Mechanism building blocks
+
+Before writing a mechanism's control by hand, check
+[talOS/mechanisms](../talOS/mechanisms/README.md): `PositionMechanism`
+(elevator, arm, hood, wrist, turret: motion magic, soft limits, gravity
+feedforward, limit-switch, stall or CANcoder homing, wrap, at-goal debounce,
+stall and timeout faults), `VelocityMechanism` (flywheel, roller: clamp,
+at-speed bands, spin-down) and `RollerWithSensor` (intake, indexer: intake,
+hold, eject and feed with a beam break). Each is a member of the node,
+configured by a `[<name>]` table in the subsystem file, given this tick's
+goal (`set_goal`) only while the node's `Target` is live, and stepped with
+`update()`. C++ only for now; a Python node uses one through a C++ node
+exported with `TALOS_EXPORT_NODE`.
+
 Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
 is supply-side current, not `current` (stator current). All three use 0.1-unit
 wire resolution. They are observations, not automatic thermal derating.

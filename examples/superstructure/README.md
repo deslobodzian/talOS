@@ -24,19 +24,28 @@ them, in both modes:
 | elevator | `/elevator/target/superstructure` | `/elevator/target/superstructure` | `[targets]` in `subsystems/elevator.toml` |
 
 
+The intake and elevator are thin wrappers over
+[`talOS/mechanisms`](../../talOS/mechanisms/README.md) building blocks: the
+intake's roller is a `RollerWithSensor` and the elevator's lift a
+`PositionMechanism`. Each node maps its own goal message to the block's
+`set_goal()` (or `stop()` without a live target), calls its `update()`, and
+maps the block's phase to its own status enum.
+
 - **intake**: IDLE → INTAKING (roller in) → HOLDING once the beam breaks (small
   hold voltage) → EJECTING (reverse for `eject_us`, 500000 µs by default) →
-  IDLE. Roller voltages are `intake_v`, `hold_v`, and `eject_v`. With no
-  target it behaves as asked for IDLE with the roller neutral; the state
-  machine still tracks the beam break and finishes a timed eject.
+  IDLE. Roller voltages are `intake_v`, `hold_v`, and `eject_v`, in the
+  `[roller]` table with `sensor = "beam_break"`. An EJECT asked while IDLE
+  does nothing (`idle_runs` is off). With no target it behaves as asked for
+  IDLE with the roller neutral; the state machine still tracks the beam break
+  and finishes a timed eject.
 - **elevator**: motion magic to the goal height (clamped to
-  0..`max_height_rot`) while it has a target. It reports STOWED at 0, MOVING,
+  `min_rot`..`max_rot`, 0..12, in the `[lift]` table) while it has a target. It reports STOWED at 0, MOVING,
   or AT_GOAL (within `tolerance_rot`), and echoes the goal that `at_goal`
   refers to. With no target the lift is neutral (it never holds an old goal);
   its status echoes goal 0 with `at_goal` false, and reads STOWED within
   `tolerance_rot` of 0, MOVING elsewhere. See [Homing](#homing) for HOMING and
-  HOMING_FAILED. A goal above `max_height_rot` is clamped and echoed as
-  `max_height_rot`, so a `high_rot` set above it keeps the superstructure in
+  HOMING_FAILED. A goal above `max_rot` is clamped and echoed as
+  `max_rot`, so a `high_rot` set above it keeps the superstructure in
   RAISING, waiting for a height it never asked for.
 - **superstructure**: STOWED → INTAKING (on INTAKE) → HOLDING (the intake
   has the piece) → RAISING (on SCORE_HIGH, elevator to `high_rot`) → SCORING
@@ -54,8 +63,10 @@ them, in both modes:
   every tick.
 
 Every tunable (voltages, eject time, tolerance, heights, homing) is a parameter read
-from the robot config: `node.param<T>("key")` in C++, `node.param("key")` in
-Python.
+from the robot config: the intake's and elevator's by their building block
+from its `[roller]` or `[lift]` table (`node.param<T>("lift.tolerance_rot")`),
+the superstructure's with `node.param<T>("key")` in C++, `node.param("key")`
+in Python.
 
 The nodes are implemented once in C++ (`cpp/`) and wrapped in Python (`py/`)
 via `TALOS_EXPORT_NODE` and `talos.cpp_node`, so both sets of binaries and
@@ -69,8 +80,8 @@ For node APIs and message/build conventions, see the
 A TalonFX counts rotations from where it powered on, and a reset (brownout,
 CAN fault) restarts that count at 0 wherever the carriage is. A goal of 10 in
 that frame is 10 rotations above the carriage, not 10 above the bottom. So
-heights count from a bottom limit switch (`[digital_inputs.bottom_limit]`),
-and the lift keeps the default `position_frame = "rezero"`: the devices layer
+heights count from a bottom limit switch (`[digital_inputs.bottom_limit]`,
+named by `[lift] limit_switch` with `homing = "limit_switch"`), and the lift keeps the default `position_frame = "rezero"`: the devices layer
 sends its motion-magic goals neutral until `Motor::rezero` has zeroed it, and
 again whenever a TalonFX reset or a RoboRIO reboot drops that zero
 (`zeroed()` false; see the node development guide's rezero paragraph).
@@ -104,10 +115,12 @@ HOMING_FAILED latches, neutral, in three cases:
 
 It clears only when the Driver Station reports disabled; the next enabled
 target retries. A stale hardware link, which also makes `robot_enabled` false,
-does not clear it. The constructor refuses a `homing_v` that is not negative
-and a `max_height_rot`, `homing_timeout_us`, `homing_stall_rps`,
-`homing_stall_us` or `home_margin_rot` that is not positive and finite, and a
-`home_samples` below 1.
+does not clear it. The constructor refuses a `homing_v` that does not point
+down toward `home_rot` at `min_rot` (0), a `max_rot` not above `min_rot`, a
+`homing_timeout_us`, `homing_stall_rps`, `homing_stall_us` or
+`home_margin_rot` that is not positive and finite, and a `home_samples` below
+1. These are `PositionMechanism`'s limit-switch homing rules
+([talOS/mechanisms](../../talOS/mechanisms/README.md#positionmechanism)).
 
 Homing runs on any live target while unzeroed rather than on a separate
 operator request. Like every other motion it needs `robot_enabled` and a
@@ -126,7 +139,7 @@ power-on frame, from thresholds the RoboRIO applies once with the static
 motor config; no request carries them, so no rezero moves them. After a reset
 at height the reverse limit of 0 sits at the carriage, so it would stop
 homing at once, and the forward limit would allow travel past the top.
-`max_height_rot` bounds goals in the homed frame instead.
+`max_rot` bounds goals in the homed frame instead.
 
 In software that clamp is the only protection at the top of travel: it bounds
 the goals, not a carriage that overshoots, coasts or is driven by a bad gain.
@@ -221,6 +234,13 @@ until its stall or timeout stop.
 
 ## Write your own mechanism
 
+Start from a building block: most mechanisms are a
+[`talOS/mechanisms`](../../talOS/mechanisms/README.md) class plus a target
+lane and a state publisher, as `cpp/elevator.h` and `cpp/intake.h` are; the
+library's README has a minimal node. Write the control yourself only for
+what no block covers.
+
+The scaffolder below still generates a self-contained node (TODO.md MECH-3).
 Generate a position-controlled wrist package from the repo root:
 
 ```sh

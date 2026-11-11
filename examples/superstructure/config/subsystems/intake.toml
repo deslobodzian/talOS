@@ -2,10 +2,15 @@
 [subsystem]
 name = "intake"
 period_us = 20000
-intake_v = 8.0       # roller voltage while intaking
-hold_v = 1.0         # keeps a held piece seated
-eject_v = -10.0      # reverse, to spit the piece out
-eject_us = 500000    # how long EJECTING runs before IDLE (500 ms)
+
+# The roller's talos::mechanisms::RollerWithSensor parameters
+# (talOS/mechanisms/README.md).
+[roller]
+sensor = "beam_break"  # the [digital_inputs] entry that sees a piece
+intake_v = 8.0         # roller voltage while intaking
+hold_v = 1.0           # keeps a held piece seated
+eject_v = -10.0        # reverse, to spit the piece out
+eject_us = 500000      # how long EJECTING runs before IDLE (500 ms)
 
 # Who drives the intake, per Driver Station mode (highest priority first):
 # only the superstructure's lane, /intake/target/superstructure, in both
