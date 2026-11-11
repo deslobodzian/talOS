@@ -56,7 +56,13 @@ Realtime and replay loop instances run once.
 
 `RealtimeEventLoop` waits on kqueue plus an absolute-deadline `EVFILT_TIMER`
 with `NOTE_CRITICAL` (macOS; a relative `kevent()` timeout is coalesced, waking
-1-2 ms late) or epoll plus an absolute-deadline timerfd (Linux). Messages are
+1-2 ms late) or `epoll_pwait2` given the time left to the deadline (Linux).
+On PREEMPT_RT that wait is a sleeper hrtimer, expired in hard interrupt
+context for a realtime thread, where a timerfd's expiry waits in `ktimers/N`
+at `SCHED_FIFO` 1 behind any loop on that CPU. A kernel before 5.11
+(`ENOSYS`) or a seccomp filter refusing the call (`EPERM`) falls back to
+epoll plus an absolute-deadline timerfd, with the same deadlines, and the
+poller says so once on stderr (`epoll_pwait2 unavailable`). Messages are
 drained rather than woken by the transport: RTMS carries no notification
 channel and adding one would change its shared-memory layout.
 Every loop drains immediately before each timer dispatch, so a timer handler

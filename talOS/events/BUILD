@@ -63,7 +63,7 @@ cc_test(
     ],
 )
 
-# Platform readiness backend. kqueue on macOS, epoll + timerfd on Linux; the
+# Platform readiness backend. kqueue on macOS, epoll_pwait2 on Linux; the
 # concrete type is picked at compile time so there is no virtual dispatch.
 cc_library(
     name = "events_os",

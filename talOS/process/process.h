@@ -51,16 +51,16 @@ struct RealtimeOptions {
 // by a loop; all above every SCHED_OTHER thread. Gaps leave room for a tier
 // between them.
 //
-// Not every wakeup a loop waits for comes from those handlers. On
-// PREEMPT_RT a timerfd's hrtimer expires in softirq context, in ktimers/N at
-// SCHED_FIFO 1 (ksoftirqd, SCHED_OTHER, on some older RT kernels), so a node's
-// event-loop tick (talOS/events epoll_poller, a timerfd) can wait behind
-// any loop running on that CPU, a lower tier included, until it sleeps. The
-// bridge's tick sleeps in clock_nanosleep, which PREEMPT_RT expires in hard
-// interrupt context for a realtime thread. On a kernel without PREEMPT_RT
-// hrtimers expire in hard interrupt context, but softirq work deferred to
-// ksoftirqd (SCHED_OTHER), such as network receive under load, waits behind
-// every loop on that CPU. TODO.md RT-4.
+// A node's event-loop tick waits in epoll_pwait2 (talOS/events
+// epoll_poller) and the bridge's in clock_nanosleep, sleeper hrtimers that
+// PREEMPT_RT expires in hard interrupt context for a realtime thread. On a
+// kernel before 5.11 the node's tick falls back to a timerfd, whose hrtimer
+// PREEMPT_RT expires in softirq context, in ktimers/N at SCHED_FIFO 1
+// (ksoftirqd, SCHED_OTHER, on some older RT kernels), behind any loop running
+// on that CPU, a lower tier included, until it sleeps. On a kernel without
+// PREEMPT_RT hrtimers expire in hard interrupt context, but softirq work
+// deferred to ksoftirqd (SCHED_OTHER), such as network receive under load,
+// waits behind every loop on that CPU. TODO.md RT-4.
 inline constexpr int kObserverFifoPriority = 40;
 inline constexpr int kControlFifoPriority = 45;
 inline constexpr int kBridgeFifoPriority = 49;

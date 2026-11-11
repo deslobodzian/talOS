@@ -23,6 +23,17 @@
 #include <pthread.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/epoll.h>
+#include <sys/utsname.h>
+
+#include <cerrno>
+#include <charconv>
+#include <ctime>
+#include <string_view>
+#include <system_error>
+#endif
+
 namespace talos::event {
 namespace {
 
@@ -272,6 +283,88 @@ TEST(PollerTest, RealtimeDeadlinesWakeWithoutCoalescingLeeway) {
   auto median = lateness.begin() + kWaits / 2;
   std::nth_element(lateness.begin(), median, lateness.end());
   EXPECT_LT(*median, kMillisecond / 2);
+}
+#endif
+
+#if defined(__linux__)
+// Lateness of `waits` consecutive absolute deadlines `period` apart, the way
+// RealtimeEventLoop waits for its next timer.
+std::vector<Duration> PeriodicLateness(Poller& poller, Duration period,
+                                       std::size_t waits) {
+  std::vector<Duration> lateness;
+  lateness.reserve(waits);
+  MonotonicTime deadline = Poller::now() + period;
+  for (std::size_t i = 0; i < waits; ++i, deadline += period) {
+    EXPECT_EQ(poller.wait_until(deadline), Poller::WakeReason::DEADLINE);
+    lateness.push_back(Poller::now() - deadline);
+  }
+  return lateness;
+}
+
+Duration Median(std::vector<Duration> values) {
+  auto median = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+  std::nth_element(values.begin(), median, values.end());
+  return *median;
+}
+
+// epoll_pwait2 arrived in Linux 5.11.
+bool KernelHasEpollPwait2() {
+  utsname name{};
+  if (::uname(&name) != 0) return false;
+  const std::string_view release(name.release);
+  int major = 0;
+  int minor = 0;
+  const char* end = release.data() + release.size();
+  const auto parsed_major = std::from_chars(release.data(), end, major);
+  if (parsed_major.ec != std::errc{} || parsed_major.ptr == end ||
+      *parsed_major.ptr != '.') {
+    return false;
+  }
+  const auto parsed_minor = std::from_chars(parsed_major.ptr + 1, end, minor);
+  if (parsed_minor.ec != std::errc{}) return false;
+  return major > 5 || (major == 5 && minor >= 11);
+}
+
+// On a 5.11+ kernel the default poller waits with epoll_pwait2 (whose
+// hrtimer PREEMPT_RT expires in hard interrupt context for a realtime thread,
+// unlike a timerfd's), never wakes before a deadline, and is not grossly
+// late. Fails if the build stops compiling epoll_pwait2 in, or the relative
+// timeout is computed in the wrong unit or from a stale clock reading.
+TEST(PollerTest, PeriodicDeadlinesWakeOnTimeWithEpollPwait2) {
+  if (!KernelHasEpollPwait2()) GTEST_SKIP() << "kernel before 5.11";
+  Poller poller;
+  const std::vector<Duration> lateness =
+      PeriodicLateness(poller, 2 * kMillisecond, 50);
+
+  EXPECT_TRUE(poller.waits_with_pwait2());
+  for (const Duration late : lateness) EXPECT_GE(late, Duration::zero());
+  // A gross bound: a timeshare thread on a loaded CI runner can wait a
+  // scheduler slice (about 2 ms) for its CPU, so this only catches a
+  // timeout in the wrong unit, not milliseconds of jitter.
+  EXPECT_LT(Median(lateness), 2 * kMillisecond);
+}
+
+int unsupported_pwait2_calls = 0;
+
+int UnsupportedPwait2(int /*epoll_fd*/, epoll_event* /*events*/,
+                      int /*max_events*/, const timespec* /*timeout*/) {
+  ++unsupported_pwait2_calls;
+  errno = ENOSYS;
+  return -1;
+}
+
+// A kernel before 5.11 answers ENOSYS: the poller must fall back to the
+// timerfd on the first wait, keep its deadlines, and not probe again.
+TEST(PollerTest, KernelWithoutEpollPwait2FallsBackToTheTimerfd) {
+  unsupported_pwait2_calls = 0;
+  Poller poller(&UnsupportedPwait2);
+  const std::vector<Duration> lateness =
+      PeriodicLateness(poller, 2 * kMillisecond, 50);
+
+  EXPECT_FALSE(poller.waits_with_pwait2());
+  EXPECT_EQ(unsupported_pwait2_calls, 1);
+  for (const Duration late : lateness) EXPECT_GE(late, Duration::zero());
+  EXPECT_LT(Median(lateness), 2 * kMillisecond);
 }
 #endif
 

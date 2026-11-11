@@ -85,15 +85,17 @@ lane (`driver`, `teleop`, `auto`), is a control node; every other node
   for observers, so a runnable loop preempts every loop of a lower tier. All
   are below the `SCHED_FIFO` 50 PREEMPT_RT gives threaded interrupt handlers
   (among them the NIC's, which carries the RoboRIO's packets), so no loop
-  holds off an interrupt. A wakeup that does not come from those handlers is
-  not ordered by tier: on PREEMPT_RT a node's tick timer (a timerfd) expires
-  in `ktimers/N` at `SCHED_FIFO` 1 (`ksoftirqd`, `SCHED_OTHER`, on some
-  older RT kernels), so a control node's tick can wait until whatever loop
-  holds that CPU, an observer included, sleeps; the bridge's tick sleeps in
-  `clock_nanosleep`, which PREEMPT_RT expires in hard interrupt context. On a
-  kernel without PREEMPT_RT timers expire in hard interrupt context, but
-  softirq work deferred to `ksoftirqd` (`SCHED_OTHER`), such as network
-  receive under load, waits behind every loop on that CPU (TODO.md RT-4).
+  holds off an interrupt. A node's tick waits in `epoll_pwait2` and the
+  bridge's in `clock_nanosleep`, sleeper timers that PREEMPT_RT expires in
+  hard interrupt context for a realtime thread, so the woken loop runs by its
+  tier. On a kernel before 5.11 the node's tick falls back to a timerfd
+  ([talOS/events](../talOS/events/README.md)), which PREEMPT_RT expires in
+  `ktimers/N` at `SCHED_FIFO` 1 (`ksoftirqd`, `SCHED_OTHER`, on some older
+  RT kernels), so there a control node's tick can wait until whatever loop
+  holds that CPU, an observer included, sleeps. On a kernel without
+  PREEMPT_RT timers expire in hard interrupt context, but softirq work
+  deferred to `ksoftirqd` (`SCHED_OTHER`), such as network receive under
+  load, waits behind every loop on that CPU (TODO.md RT-4).
 - macOS: the bridge and control nodes run under the Mach time-constraint
   policy for their period (computation half of it, constraint all of it);
   observers run timeshare at `QOS_CLASS_USER_INTERACTIVE`, below every
