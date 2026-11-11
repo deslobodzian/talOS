@@ -184,7 +184,13 @@ environment see each other's prompt publications through `next_deadline()`:
 a loop already run to an instant is due there again when another publishes
 to it at that instant (`talos::testing::Sim` runs it again). The node layer
 chooses delivery timing and which watchers are prompt: see
-`NodeAccess::require_immediate_delivery` in `talOS/node/access.h`.
+`NodeAccess::require_immediate_delivery` in `talOS/node/access.h`. A
+`Node::subscribe` callback opened with `talos::Wake::kAtDrain` is a sequence
+watcher that is not prompt: its messages wait for a timer's drain or another
+watcher's wake, and a drain that reaches the 64-message cap leaves the rest
+for the next drain rather than draining again
+(`RealtimeEventLoop.RealtimeRunReplaysForEveryDeliveryPolicy` replays such a
+mix byte for byte).
 
 
 ## Recording and replaying

@@ -495,8 +495,10 @@ std::vector<char> read_file(const std::string& path) {
 // output exactly, whichever way the run delivered its messages. Recording the
 // replay gives the same log again, byte for byte: a drain is recorded only as
 // the messages it dispatched, whether a poll tick, a timer or a publication
-// woke the loop, so replay needs nothing more.
-void ExpectRealtimeRunReplays(Delivery delivery) {
+// woke the loop, so replay needs nothing more. Without `sensor_prompt` only
+// the setpoint watcher is prompt and the sensor's sequence watcher waits for
+// the next drain, as a node's Wake::kAtDrain callback does.
+void ExpectRealtimeRunReplays(Delivery delivery, bool sensor_prompt = true) {
   const Topics topics = realtime_topics();
   const std::string path = temp_path("run");
   const std::string replayed_path = temp_path("rerun");
@@ -509,10 +511,13 @@ void ExpectRealtimeRunReplays(Delivery delivery) {
     RecordingLoop loop{log::LogWriter{path, "realtime_robot"}};
     loop.set_delivery(delivery);
     TestRobot<RecordingLoop> robot{loop, topics, 3.0F};
-    // Both watchers, so that under ON_PUBLISH each publication wakes the
+    // The watchers, so that under ON_PUBLISH their publications wake the
     // loop; the other policies ignore it.
     for (const Registration& source : loop.manifest()) {
-      if (source.kind == SourceKind::WATCHER) loop.set_prompt(source.id);
+      if (source.kind == SourceKind::WATCHER &&
+          (sensor_prompt || source.name != topics.sensor)) {
+        loop.set_prompt(source.id);
+      }
     }
 
     // Derived from the loop's clock, not the OS clock, which is what lets the
@@ -605,6 +610,8 @@ TEST(RealtimeEventLoop, RealtimeRunReplaysForEveryDeliveryPolicy) {
     SCOPED_TRACE(static_cast<int>(delivery));
     ExpectRealtimeRunReplays(delivery);
   }
+  SCOPED_TRACE("ON_PUBLISH, the sensor waiting for the next drain");
+  ExpectRealtimeRunReplays(Delivery::ON_PUBLISH, /*sensor_prompt=*/false);
 }
 
 struct Wakeups {

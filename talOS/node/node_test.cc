@@ -933,11 +933,50 @@ Wakes DeliveryFor() {
   return wakes;
 }
 
+// A Wake::kAtDrain callback subscription, with a timer (AtDrain) or without
+// one (SilentAtDrain).
+struct AtDrain {
+  explicit AtDrain(Node& n)
+      : in{n.subscribe<Count>(
+            "/feed/state", [](const Count&) {}, Wake::kAtDrain)} {}
+  void update() {}
+  Subscription<Count> in;
+};
+
+struct SilentAtDrain {
+  explicit SilentAtDrain(Node& n)
+      : in{n.subscribe<Count>(
+            "/feed/state", [](const Count&) {}, Wake::kAtDrain)} {}
+  Subscription<Count> in;
+};
+
+// Every message its callbacks heard, in order, with the instant of the
+// drain that delivered it: /feed/state's with Wake::kAtDrain, then
+// /poke/state's (heard as -1) with the default Wake::kOnPublish.
+struct Collector {
+  explicit Collector(Node& n)
+      : node{n},
+        feed{n.subscribe<Count>(
+            "/feed/state", [this](const Count& c) { Hear(c.tick_count()); },
+            Wake::kAtDrain)},
+        poke{n.subscribe<Count>("/poke/state",
+                                [this](const Count&) { Hear(-1); })} {}
+  void update() {}
+  void Hear(std::int64_t value) {
+    heard.emplace_back(value, Duration{node.now().nanos()});
+  }
+  Node& node;
+  Subscription<Count> feed;
+  Subscription<Count> poke;
+  std::vector<std::pair<std::int64_t, Duration>> heard;  // (value, delivered)
+};
+
 // A node that only reads latched values at its own timers drains
 // right before them and is never woken by a publication. A subscribe
 // callback, or a listener on one raw subscription, makes that one
-// subscription wake the node, not the node's other callback subscriptions;
-// a node with no timer to drain before is woken by every subscription.
+// subscription wake the node, not the node's other callback subscriptions,
+// unless it is opened with Wake::kAtDrain; a node with no timer to drain
+// before is woken by every subscription.
 // REQ-RT-19
 TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
   constexpr auto BEFORE_TIMERS = event::Delivery::BEFORE_TIMERS;
@@ -957,7 +996,63 @@ TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
   expect("a listener on the second", DeliveryFor<RawCallbacks<true>>(),
          ON_PUBLISH, {false, true});
   expect("subscribe callback", DeliveryFor<Listener>(), ON_PUBLISH, {true});
+  expect("at-drain callback", DeliveryFor<AtDrain>(), BEFORE_TIMERS, {false});
+  expect("at-drain beside a waking callback", DeliveryFor<Collector>(),
+         ON_PUBLISH, {false, true});
   expect("no timer", DeliveryFor<Silent>(), ON_PUBLISH, {true});
+  expect("no timer, at-drain callback", DeliveryFor<SilentAtDrain>(),
+         ON_PUBLISH, {true});
+}
+
+// A Wake::kAtDrain callback hears every message, in order, but only at the
+// node's next drain, here its 5 ms update(): publications between ticks wake
+// nothing. A drain delivers at most 64 of them; the rest wait for the next
+// drain, not for a wake at the same instant.
+// REQ-RT-02
+TEST(Node, AnAtDrainCallbackHearsEveryMessageInOrderAtTheNextDrain) {
+  using Heard = std::vector<std::pair<std::int64_t, Duration>>;
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& collector = sim.add<Collector>("listener");  // update() every 5 ms
+  sim.step(6ms);
+  for (std::int64_t i = 0; i < 3; ++i) {
+    sim.publish("/feed/state", Count{i, 0});
+    sim.step(1ms);
+  }
+  EXPECT_EQ(collector.heard, Heard{})
+      << "a publication at 6, 7 or 8 ms woke the node";
+  sim.step(1ms);
+  EXPECT_EQ(collector.heard, (Heard{{0, 10ms}, {1, 10ms}, {2, 10ms}}));
+
+  collector.heard.clear();
+  for (std::int64_t i = 0; i < 70; ++i) {
+    sim.publish("/feed/state", Count{i, 0});
+  }
+  sim.step(5ms);
+  EXPECT_EQ(collector.heard.size(), 64u) << "the 15 ms drain";
+  sim.step(5ms);
+  ASSERT_EQ(collector.heard.size(), 70u) << "the 20 ms drain";
+  for (std::size_t i = 0; i < collector.heard.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(collector.heard[i].first, static_cast<std::int64_t>(i));
+    EXPECT_EQ(collector.heard[i].second, i < 64 ? 15ms : 20ms);
+  }
+}
+
+// A wake from another topic drains every subscription, so the Wake::kAtDrain
+// messages waiting then are heard at that wake, first (registration order),
+// not at the next tick.
+// REQ-RT-02
+TEST(Node, AnotherTopicsWakeDeliversWaitingAtDrainMessages) {
+  using Heard = std::vector<std::pair<std::int64_t, Duration>>;
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& collector = sim.add<Collector>("listener");
+  sim.step(6ms);
+  sim.publish("/feed/state", Count{7, 0});
+  sim.step(1ms);
+  EXPECT_EQ(collector.heard, Heard{});
+  sim.publish("/poke/state", Count{0, 0});
+  sim.step(1ms);
+  EXPECT_EQ(collector.heard, (Heard{{7, 7ms}, {-1, 7ms}}));
 }
 
 struct LateSubscriber {

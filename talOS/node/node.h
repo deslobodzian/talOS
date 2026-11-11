@@ -92,6 +92,23 @@ struct SubscribeOptions {
   bool optional = false;  // the graph lint tolerates no publisher
 };
 
+// When a callback subscription's messages reach its callback
+// (Node::subscribe). Either way the callback receives every message in
+// sequence, at most 64 per topic per drain.
+enum class Wake : std::uint8_t {
+  // Each publication wakes the node, so the callback runs as the message
+  // arrives: for a handler that must act at once (a Driver Station
+  // listener).
+  kOnPublish,
+  // Publications never wake the node: the messages wait, in sequence, for
+  // its next drain, right before its next timer (update(), every()) or on
+  // another topic's wake. For a node that needs every message but acts on
+  // them only at its tick. Over 64 between two drains fall behind by the
+  // excess at each drain; past the ring's 1023 unread they are lost and
+  // counted as dropped.
+  kAtDrain,
+};
+
 // Node::publish_bytes options.
 struct BytePublishOptions {
   // Ring slots; a power of two, at most 1024 (what loop topics use). Every
@@ -173,19 +190,27 @@ class Node {
   // resolves under /hw/request: only the devices layer writes a hardware
   // request (talOS/devices, RULES.md 2), and its request is never remapped.
   // A node receives messages right before each of its timers (update(),
-  // every()), and otherwise sleeps; passing `on_message` makes a publication
-  // on that topic also wake the node, so the callback runs as the message
-  // arrives (testing::Sim, at the publication's instant). Each wake drains
-  // every subscription. Without a callback, each drain keeps only the newest
-  // available message and counts skipped messages as dropped. Callbacks
-  // receive messages in sequence, up to 64 per topic per drain. age() counts
-  // from publication, not delivery, for both subscription kinds.
+  // every()), and otherwise sleeps; passing `on_message` with
+  // Wake::kOnPublish (the default) makes a publication on that topic also
+  // wake the node, so the callback runs as the message arrives
+  // (testing::Sim, at the publication's instant). Each wake drains every
+  // subscription. Wake::kAtDrain keeps the callback's sequence delivery but
+  // wakes nothing: its messages wait for the node's next drain. A node with
+  // no timer has no drain to wait for, so every subscription wakes it,
+  // kAtDrain and plain ones included. Without a callback, each drain keeps
+  // only the newest available message and counts skipped messages as
+  // dropped. Callbacks receive messages in sequence, up to 64 per topic per
+  // drain. age() counts from publication, not delivery, for both
+  // subscription kinds; inside a callback it is that message's age.
   using SubscribeOptions = talos::SubscribeOptions;
   template <Message M>
   Subscription<M> subscribe(std::string_view topic,
                             SubscribeOptions options = {});
   template <Message M, std::invocable<const M&> F>
   Subscription<M> subscribe(std::string_view topic, F on_message,
+                            SubscribeOptions options = {});
+  template <Message M, std::invocable<const M&> F>
+  Subscription<M> subscribe(std::string_view topic, F on_message, Wake wake,
                             SubscribeOptions options = {});
   template <Message M>
   Publisher<M> publish(std::string_view topic);
@@ -411,6 +436,12 @@ Subscription<M> Node::subscribe(std::string_view topic,
 template <Message M, std::invocable<const M&> F>
 Subscription<M> Node::subscribe(std::string_view topic, F on_message,
                                 SubscribeOptions options) {
+  return subscribe<M>(topic, std::move(on_message), Wake::kOnPublish, options);
+}
+
+template <Message M, std::invocable<const M&> F>
+Subscription<M> Node::subscribe(std::string_view topic, F on_message, Wake wake,
+                                SubscribeOptions options) {
   detail::MessageCallback callback =
       [fn = std::move(on_message)](const void* data) {
         fn(*static_cast<const M*>(data));
@@ -418,7 +449,9 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
   const std::size_t index = detail::NodeAccess::add_subscription(
       *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>(),
       options.optional, std::move(callback));
-  detail::NodeAccess::require_immediate_delivery(*this, index);
+  if (wake != Wake::kAtDrain) {
+    detail::NodeAccess::require_immediate_delivery(*this, index);
+  }
   return Subscription<M>{this, index};
 }
 
