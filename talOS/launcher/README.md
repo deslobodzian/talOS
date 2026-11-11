@@ -514,7 +514,13 @@ bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay/<new-session-i
 
 Only the selected node starts; its output is a new log, not a comparison with
 the recorded outputs. The output directory must not be inside the input
-session. A node the session ran replays on its own recorded timeline: its
+session. The node runs under `--sim` exactly when the session did (its
+`manifest.json`'s `simulation`; a session without one follows this launch's
+`--sim`): under `--sim` the devices layer treats the config as commissioned,
+which is part of the config id every recorded State carries, so a replay that
+differed from the session would accept no State. A node binary run directly
+with `--replay-inputs` takes `--sim` only as given. A node the session ran
+replays on its own recorded timeline: its
 timers fire at the deadlines they fired at live, and it is handed what it
 received live, at the ticks it received it, so an unchanged node sends what it
 sent, except for what its loop's wake-up latency put into it (`now()`, and

@@ -14,6 +14,14 @@ struct Impostor {
   distance_m:float;
 }
 
+// /replay_motor/state: its motor as the devices layer reads it each tick;
+// sample_time_ns is -1 while HardwareLink::sample_time() has no value.
+struct MotorReading {
+  connected:bool;
+  position_rot:double;
+  sample_time_ns:long;
+}
+
 // /replay_consumer/state: what the consumer made of every reading so far.
 struct Summary {
   reading_count:uint;
