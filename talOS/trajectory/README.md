@@ -1,15 +1,17 @@
 # talOS trajectory
 
 Time-indexed holonomic trajectories, a loader for [Choreo](https://choreo.autos)
-`.traj` files, alliance flips, and `HolonomicFollower`, which turns a
-trajectory and a measured pose into a chassis speed. A library beside the node
+`.traj` files, a straight-line generator, alliance flips, and
+`HolonomicFollower`, which turns a trajectory and a measured pose into a
+chassis speed. A library beside the node
 stack: it depends on `talOS/geometry` and `@nlohmann_json` only, never on
-`talOS/node` or a robot. REQ-DEV-13 (loading), REQ-DEV-14 (markers, flip) and REQ-DEV-15 (follower)
-state what it does; REQ-RT-06 covers the per-tick calls.
+`talOS/node` or a robot. REQ-DEV-13 (loading), REQ-DEV-14 (markers, flip), REQ-DEV-15 (follower) and
+REQ-DEV-20 (straight lines) state what it does; REQ-RT-06 covers the per-tick calls.
 
 ```cpp
 #include "talOS/trajectory/choreo.h"
 #include "talOS/trajectory/holonomic_follower.h"
+#include "talOS/trajectory/straight_line.h"
 ```
 
 `//talOS/trajectory` (`cc_library`, public).
@@ -40,7 +42,7 @@ omega_radps, ax_mps2, ay_mps2, alpha_radps2}` with `pose()` as a
 | `events()` | event markers (`{name, t_s}`) in time order |
 | `EventCursor::advance(trajectory, t_s)` | fires markers: the first call after construction or `reset()` returns every marker at or before `t_s` (one at 0.0 fires on the first tick), each later call those after the previous call's up to `t_s`; it counts markers, so none is skipped or repeated |
 | `split_count()`, `split_starts()`, `split(i)` | Choreo splits; `split(i)` is segment `i` re-timed to start at 0 with the markers from its start up to, not including, its end (the last segment also keeps one at its end), so a marker on a boundary is in the later segment only and fires once when the segments run in turn |
-| `reserve(n)`, `assign(samples, interpolation)` | rebuild in place for a trajectory made inside `update()`: `assign()` validates like the constructor (unchanged on a throw), clears markers and splits, and allocates nothing while `samples.size() <= capacity()` |
+| `reserve(n)`, `assign(samples, interpolation)`, `clear()` | rebuild in place for a trajectory made inside `update()`: `assign()` validates like the constructor (unchanged on a throw), clears markers and splits, and allocates nothing while `samples.size() <= capacity()`; `clear()` empties it and keeps the capacity |
 | `flipped(flip, field)`, `Flip(sample/pose, flip, field)` | the other alliance's path |
 
 Interpolation between stored samples:
@@ -57,10 +59,55 @@ Interpolation between stored samples:
   sample; accelerations are its second derivative.
 
 Storage is allocated when the trajectory is built. `sample()`,
-`EventCursor::advance()`, `Flip(sample)`, `HolonomicFollower::step()` and
-`assign()` within `reserve()` never allocate (`no_allocation_test`), so they
+`EventCursor::advance()`, `Flip(sample)`, `HolonomicFollower::step()`,
+`assign()` within `reserve()` and `MakeStraightLine()` into a trajectory with
+`kStraightLineSamples` reserved never allocate (`no_allocation_test`), so they
 belong in `update()`; loading, the constructor, `split()` and `flipped()`
 allocate and belong in the node's constructor or on a mode change.
+
+## Straight lines
+
+`MakeStraightLine(start, end, limits, out)` fills `out` with a move from
+`start` to `end` (field-frame `SE2` poses) along the segment between them,
+for a path built from the live pose (taxi, drive to a pose):
+
+```cpp
+talos::trajectory::Trajectory line_;            // member
+line_.reserve(talos::trajectory::kStraightLineSamples);   // constructor
+// update():
+const talos::trajectory::StraightLineLimits limits{
+    .max_linear_mps = 2.0, .max_linear_accel_mps2 = 3.0,
+    .max_angular_radps = 3.0, .max_angular_accel_radps2 = 6.0};
+if (const auto made = MakeStraightLine(pose, goal, limits, line_); !made) {
+  log(ToString(made.error));   // line_ is empty: the follower commands zero
+}
+```
+
+- Translation (distance along the segment) and heading each run a
+  trapezoidal profile from rest to rest within their speed and acceleration
+  limits, triangular when the move is too short to reach the speed limit.
+- The duration is the longer of the two axes' minimum times. The other axis
+  keeps its acceleration limit and lowers its cruise speed, so both arrive
+  together; the heading is therefore not proportional to the distance
+  covered.
+- The heading turns the short way (`WrapAngle` of the difference; exactly
+  pi turns CCW), continuous from `start.angle()`.
+- The last sample is `end`'s position, at rest, at the total time; a move
+  with no translation and no turn is one sample at t = 0.
+- Samples sit at every acceleration change of either axis (at most
+  `kStraightLineSamples`, 6) with `kConstantAcceleration`, so `sample()`
+  reproduces the profile between them to rounding: the reference adds no
+  discretisation error, and tracking error is the follower's alone.
+- A non-finite pose (`kNonFinitePose`), a limit that is not finite and
+  positive (`kInvalidLimits`), a capacity below `kStraightLineSamples`
+  (`kCapacity`, checked whatever the move, so a short move in a test cannot
+  hide it) or an overflowing move (`kUnrepresentable`) returns that error and
+  leaves `out` empty, so `HolonomicFollower::step` gives zero speeds and
+  `valid` false rather than the previous path. It never throws.
+
+The line follows unchanged with `HolonomicFollower`, and flipping it gives
+the line between the flipped poses, so a node may flip the goal
+(`Flip(pose, ...)`) before building instead of flipping the trajectory.
 
 ## Alliance flip
 
@@ -193,7 +240,8 @@ the trajectory starts, `follower.reset()` and `cursor.reset()`; then per
 tick: `follower.step(...)`, send the speeds on the drivetrain's `auto` lane,
 act on each marker in `cursor.advance(trajectory_, elapsed_s)`, and
 `release()` the lane once `finished`. A trajectory built from the live pose
-inside `update()` uses `reserve()` once and `assign()` per rebuild. The trajectory library does no actuation gating: the
+inside `update()` uses `reserve()` once and `assign()` (or
+`MakeStraightLine()`) per rebuild. The trajectory library does no actuation gating: the
 drivetrain's `Target` and `robot_enabled` still decide whether anything moves.
 
 `2026-robot/main_processor/autonomous` does not use this library (TODO.md
@@ -201,7 +249,8 @@ TRAJ-1).
 
 ## Tests
 
-`bazel test //talOS/trajectory:all`. `testdata/choreo_v3_swerve.traj` is
+`bazel test //talOS/trajectory:all`. `straight_line_test` checks generated
+lines against trapezoids worked by hand. `testdata/choreo_v3_swerve.traj` is
 Choreo's own output (trimmed); the rest are generated: `curve.traj` (version
 3) a half circle sampled from an analytic path with a continuous heading
 past pi (the follower's path), `splits_events.traj` (version 2) two
