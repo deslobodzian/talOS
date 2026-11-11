@@ -192,7 +192,7 @@ void Gateway::CommitConfiguration(const Config& config) {
   restore_retry_at_ = state_.sample_time_us + kRestoreInitialBackoffUs;
   restore_backoff_us_ = kRestoreInitialBackoffUs;
   last_requests_.fill(MotorRequest{});
-  motor_reset_at_.fill(0);
+  motor_drives_from_.fill(0);
   position_reference_.fill(PositionReference{});
   Invalidate();
 }
@@ -225,13 +225,39 @@ void Gateway::MaskUnavailable() {
       }
       if (unavailable) {
         state_.motors[i].valid = false;
-        motor_reset_at_[i] = state_.sample_time_us;
         // Its frame may restart before it returns: the first sample after
         // that is a new reference, not a jump from this one.
         position_reference_[i].valid = false;
       }
     }
   }
+  // A command observed no later than a State in which a motor could not
+  // drive never drives it, whatever its feedback shows when it arrives.
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    if (!MayDrive(i)) motor_drives_from_[i] = state_.sample_time_us + 1;
+  }
+}
+
+bool Gateway::FeedbackValid(std::size_t i) const {
+  const auto& motor = config_.motors[i];
+  if (!state_.motors[i].valid) return false;
+  if (motor.feedback != Feedback::kRemoteCANcoder) return true;
+  for (std::size_t j = 0; j < state_.sensor_count; ++j) {
+    if (state_.sensors[j].id == motor.feedback_sensor_id)
+      return state_.sensors[j].valid;
+  }
+  return false;
+}
+
+bool Gateway::MayDrive(std::size_t i) const {
+  if (!FeedbackValid(i)) return false;
+  const auto master_id = config_.motors[i].master_id;
+  if (master_id == 0) return true;
+  // Config refuses follower chains, so a master is never a follower.
+  for (std::size_t j = 0; j < config_.motors.size(); ++j) {
+    if (config_.motors[j].id == master_id) return FeedbackValid(j);
+  }
+  return false;
 }
 
 bool Gateway::ApplyMotors(std::span<const MotorRequest> requests) {
@@ -249,7 +275,7 @@ void Gateway::NeutralUnavailable() {
   // at least one more configured motor, so this is bounded by the motor count.
   while (true) {
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-      if (!state_.motors[i].valid) {
+      if (!MayDrive(i)) {
         last_requests_[i] = MotorRequest{config_.motors[i].id, Mode::kNeutral};
       }
     }
@@ -323,7 +349,14 @@ void Gateway::PollResets() {
     restore_retry_at_ = state_.sample_time_us;
   }
   MaskUnavailable();
-  if (!reset_ids.empty()) NeutralUnavailable();
+  // A motor that cannot drive goes neutral in this tick, not at the next
+  // command: between commands the backend keeps the last request it sent.
+  bool neutralize = !reset_ids.empty();
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    neutralize = neutralize ||
+                 (last_requests_[i].mode != Mode::kNeutral && !MayDrive(i));
+  }
+  if (neutralize) NeutralUnavailable();
   if (!restoring_ && restore_waiting_ &&
       state_.sample_time_us >= restore_retry_at_) {
     restore_waiting_ = false;
@@ -498,19 +531,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
-    bool feedback_valid =
-        state_.motors[i].valid && c.observed_time_us >= motor_reset_at_[i];
-    if (m.feedback == Feedback::kRemoteCANcoder) {
-      bool sensor_valid = false;
-      for (std::size_t j = 0; j < state_.sensor_count; ++j) {
-        const auto& sensor = state_.sensors[j];
-        if (sensor.id == m.feedback_sensor_id) {
-          sensor_valid = sensor.valid;
-          break;
-        }
-      }
-      feedback_valid &= sensor_valid;
-    }
+    const bool feedback_valid =
+        FeedbackValid(i) && c.observed_time_us >= motor_drives_from_[i];
     const bool invalid =
         (r.mode != Mode::kNeutral && !feedback_valid) ||
         !std::isfinite(r.demand) || !std::isfinite(r.feedforward_v) ||
@@ -533,15 +555,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto master_id = config_.motors[i].master_id;
     if (master_id == 0) continue;
-    bool valid =
-        state_.motors[i].valid && c.observed_time_us >= motor_reset_at_[i];
-    if (config_.motors[i].feedback == Feedback::kRemoteCANcoder) {
-      bool sensor_valid = false;
-      for (std::size_t j = 0; j < state_.sensor_count; ++j)
-        if (state_.sensors[j].id == config_.motors[i].feedback_sensor_id)
-          sensor_valid = state_.sensors[j].valid;
-      valid &= sensor_valid;
-    }
+    const bool valid =
+        FeedbackValid(i) && c.observed_time_us >= motor_drives_from_[i];
     for (std::size_t j = 0; j < c.count; ++j) {
       if (config_.motors[j].id != master_id) continue;
       // Backends follow the master's output only for a non-neutral follower
