@@ -1,6 +1,7 @@
 #pragma once
 
-// Shared gating predicates for hardware-owning subsystem nodes.
+// Shared gating predicates for hardware-owning subsystem nodes, and the
+// gateway's feedback age bound (FeedbackFresh).
 //
 // Every subsystem node that turns hardware state into a command repeats the
 // same preamble: accept the sample only if it is newer than the last one from
@@ -15,9 +16,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <span>
 
-#include "talOS/hardware/messages.h"
+// Relative, as in the rest of the gateway: the RoboRIO's GradleRIO build
+// compiles gateway.cc with talOS/, not the repository root, on its path.
+#include "messages.h"
 
 namespace talos::hardware {
 
@@ -32,6 +36,16 @@ inline bool AcceptState(bool have_prev, const State& prev, uint64_t config_id,
       next.sample_time_us <= prev.sample_time_us)
     return false;
   return true;
+}
+
+// Whether a motor's or CAN sensor's position or velocity sample `age_us` old
+// still counts for actuation: younger than `command_timeout_us`, the bound a
+// command, its State and a target are held to. A backend's unknown age
+// (UINT32_MAX) never does. The gateway applies it to every such sample after
+// Backend::Read.
+inline bool FeedbackFresh(uint32_t age_us, uint64_t command_timeout_us) {
+  return age_us != std::numeric_limits<uint32_t>::max() &&
+         age_us < command_timeout_us;
 }
 
 // Whether the gateway is ready to be commanded: configured and enabled, with

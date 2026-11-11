@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "config_wire.h"
+#include "gate.h"
 
 namespace talos::hardware {
 namespace {
@@ -386,6 +387,30 @@ void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
   }
 }
 
+// The backend judged each sample's status, value and isolation; the age bound
+// is the gateway's, the same for every backend. Returns whether any configured
+// motor or CAN sensor still has valid feedback (true with none configured):
+// false is total loss.
+bool Gateway::JudgeFeedbackAge() {
+  const uint64_t bound = config_.command_timeout_us;
+  const auto fresh = [bound](const auto& sample) {
+    return FeedbackFresh(sample.position_age_us, bound) &&
+           FeedbackFresh(sample.velocity_age_us, bound);
+  };
+  bool any_valid = config_.motors.empty() && config_.sensors.empty();
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    auto& sample = state_.motors[i];
+    sample.valid = sample.valid && fresh(sample);
+    any_valid = any_valid || sample.valid;
+  }
+  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+    auto& sample = state_.sensors[i];
+    sample.valid = sample.valid && fresh(sample);
+    any_valid = any_valid || sample.valid;
+  }
+  return any_valid;
+}
+
 void Gateway::Tick(uint64_t now, bool enabled) {
   // Every tick, whether or not its State reaches the link, so a consumer
   // that sees sequence + 1 knows it missed nothing in between.
@@ -421,7 +446,8 @@ void Gateway::Tick(uint64_t now, bool enabled) {
     Invalidate();
   }
   state_.sample_time_us = now;
-  healthy_ = configured_ && backend_.Read(state_);
+  const bool read = configured_ && backend_.Read(state_);
+  healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
   if (!healthy_ && active_) Invalidate();
   PollResets();

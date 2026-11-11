@@ -27,9 +27,15 @@ class Backend {
   }
   // A successful Configure may leave individual devices unavailable.
   virtual std::vector<uint16_t> UnavailableDevices() const { return {}; }
-  // Return false for a failed read pass or total motor/CAN-sensor feedback
-  // loss, not an individual dropout. With no such devices configured, return
-  // true. Individual sample validity gates only the affected motor in Accept().
+  // A backend marks a sample invalid only for a signal error, a non-finite
+  // value or an isolated device, and reports each sample's ages. The gateway
+  // invalidates a motor or CAN-sensor sample whose position or velocity age is
+  // at least `command_timeout_us` (UINT32_MAX: unknown; FeedbackFresh in
+  // gate.h) and treats every configured motor and CAN sensor invalid as total
+  // loss. Return false for a failed read pass or total motor/CAN-sensor
+  // feedback loss, not an individual dropout. With no such devices configured,
+  // return true. Individual sample validity gates only the affected motor in
+  // Accept().
   virtual bool Read(State&) = 0;
   // Followers ignore demand values, but kNeutral explicitly gates their output.
   // Gateway resolves a live follower's mode from its sanitized master.
@@ -153,6 +159,7 @@ class Gateway {
 
  private:
   void Invalidate();
+  bool JudgeFeedbackAge();
   void PollResets();
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);
   bool DeviceUnavailable(uint16_t id) const;
