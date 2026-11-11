@@ -392,7 +392,7 @@ steady-clock reading per phase boundary, ten per disabled tick, and adds
 them on the loop thread without locks; the window passes to the logger at
 the loop's next tick ([bench measurement](../../docs/BENCH.md#fault-injection-and-timing)).
 `State` has no field for these, so they are RIO-local.
-Each of these lines, and the program's two start lines, begins with
+Each of these lines, and the program's three start lines, begins with
 `[<seconds>.<milliseconds>]` on the gateway's steady clock: on the RoboRIO,
 time since its kernel booted, the clock of State's `sample_time_us`, so a
 `hardware_node --log` record of a State places the RIO's lines on the
@@ -412,7 +412,7 @@ the State it was built from, plus `command_timeout_us`) plus two loop
 periods (one for the tick that sees the expiry, one for that tick's work
 before its beat); with no command in force it carries nothing (that tick neutralized
 every output itself). The watchdog's own thread, at `SCHED_FIFO` 30 on the
-RoboRIO (above the loop's default scheduling), checks every 5 ms. Once that
+RoboRIO (above the loop's `SCHED_FIFO` 20), checks every 5 ms. Once that
 time has passed it disables PWM outputs, sets DIO outputs false and sends
 `NeutralOut` to every motor, on every check until a beat moves the time (so
 outputs a resumed loop re-applies on a stale clock reading before stalling
@@ -421,18 +421,46 @@ again are neutralized again), and sends one Driver Station error per stall,
 the device handles (Phoenix 6 serializes each device's control sends behind
 a per-device mutex; HAL DIO and PWM writes are safe from any thread), skips
 devices a configure is rebuilding, and does not act while the loop ticks on
-time. It is not a hard bound: if the loop was preempted inside a device call
-holding that device's lock (Phoenix's control mutex, the HAL DIO mutex;
-neither inherits priority), the watchdog waits there until the loop runs
-again, and so does every output after it. A refused realtime priority is
-reported the same way.
+time. It is not a hard bound: if a device's lock (Phoenix's control mutex,
+the HAL DIO mutex; neither inherits priority) is held by a thread that is
+not running, the watchdog waits there, and so does every output after it.
+Held by the loop, the wait lasts until no thread above the loop's priority is
+runnable on its core; held by a default-scheduled thread (a vendor
+library's), the holder also waits for the CPU behind the loop and every
+other realtime thread. A refused realtime priority is reported the same way.
 
-The loop thread itself keeps default scheduling. A realtime loop would no
-longer be starved by ordinary processes, but it does UDP I/O, refreshes the
-Driver Station and, while disabled, syncs the configuration file, and a
-realtime thread that overruns or spins starves every thread below it,
-which may include the Driver Station link and CAN handling; its effect on
-late ticks is unmeasured ([bench check](../../docs/BENCH.md#fault-injection-and-timing)).
+The loop thread runs at `SCHED_FIFO` 20 on the RoboRIO, below the watchdog
+(`kLoopPriority` in `Robot.cpp`, held below `kWatchdogPriority` by a
+`static_assert`), so ordinary processes such as an ssh session no longer
+delay its ticks, and sleeps to each tick's absolute deadline
+(`clock_nanosleep` on `CLOCK_MONOTONIC`, the clock of its steady time).
+Threads it starts afterwards start at default scheduling
+(`SCHED_RESET_ON_FORK`). It keeps default scheduling if
+`/home/lvuser/talos_loop_default_sched` exists when the program starts (for a
+bench comparison, or as a fallback in the field without a rebuild) or if the
+kernel refuses the request. Its start line, `hardware gateway loop <policy>
+<priority>, watchdog asks SCHED_FIFO 30`, gives what the kernel holds and,
+at default scheduling, why: `(<file> present)` or `(SCHED_FIFO 20 refused,
+errno <n>)`. Both requests need the same privilege, except under an
+`RLIMIT_RTPRIO` of 20 to 29 without `CAP_SYS_NICE`, where the loop alone
+would get its priority and the watchdog would run below it. Desktop
+simulation keeps default scheduling.
+
+A tick that ends by its deadline sleeps to it, so the loop keeps its phase.
+One that ends past it (an overrun, or a wake more than a period late) drops
+the missed ticks instead of running them back to back, sleeps 500 µs and
+counts the next period from there, so the phase moves
+(`src/main/include/LoopSchedule.h`). Whenever it runs, the loop takes the
+CPU from every default-scheduled thread on its core: the logger and the
+companion reporter (nice 19), ssh, and NI's and Phoenix's threads whose
+policies are unrecorded. The 500 µs bounds the share a loop that overruns
+every tick takes; a loop whose work is just under the period still takes
+nearly all of its core, and only the kernel's realtime throttling
+(`/proc/sys/kernel/sched_rt_runtime_us`, unrecorded on the RoboRIO) bounds a
+loop that never reaches its sleep. The watchdog still preempts such a loop:
+it wakes on its own timer and reads the beat from atomics, so only the
+device locks above can hold it back. The effect on late ticks is unmeasured
+([bench check](../../docs/BENCH.md#fault-injection-and-timing)).
 
 The Driver Station shows green code and communications whether or not the
 companion is talking, so the adapter also reports the companion link
@@ -474,7 +502,7 @@ Build without deploying:
 ```sh
 cd 2026-robot/controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway

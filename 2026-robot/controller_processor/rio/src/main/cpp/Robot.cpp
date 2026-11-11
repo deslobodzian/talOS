@@ -14,11 +14,19 @@
 
 #include "ConfigStore.h"
 #include "DriverStationReader.h"
+#include "LoopSchedule.h"
 #include "PhoenixBackend.h"
 #include "RioBuild.h"
 #include "SocketRetry.h"
 
-#ifndef __FRC_ROBORIO__
+#ifdef __linux__
+#include <time.h>
+#endif
+
+#ifdef __FRC_ROBORIO__
+#include <sched.h>
+#include <unistd.h>
+#else
 #include <cstdlib>
 
 #include "SimDriverStation.h"
@@ -26,11 +34,14 @@
 
 namespace {
 
-uint64_t NowUs() {
+uint64_t SteadyUs(std::chrono::steady_clock::time_point time) {
   return std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
+             time.time_since_epoch())
       .count();
 }
+
+// The gateway's clock and the loop's: microseconds of steady_clock.
+uint64_t NowUs() { return SteadyUs(std::chrono::steady_clock::now()); }
 
 #ifdef __FRC_ROBORIO__
 constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
@@ -79,17 +90,101 @@ uint32_t DriverStationModeFlags() {
   return flags;
 }
 
-// The loop watchdog's SCHED_FIFO priority: any realtime priority runs above
-// the loop thread (default scheduling). This one is meant to stay below the
-// kernel's threaded interrupt handlers (SCHED_FIFO 50 by default on
-// PREEMPT_RT), which may carry the CAN frames its NeutralOut needs; the
-// RoboRIO's actual thread priorities are unrecorded (docs/BENCH.md, loop stall
-// check). Desktop simulation keeps the default scheduling.
+// The loop watchdog's SCHED_FIFO priority: above the loop thread's, so it
+// preempts a loop that never sleeps, and meant to stay below the kernel's
+// threaded interrupt handlers (SCHED_FIFO 50 by default on PREEMPT_RT), which
+// may carry the CAN frames its NeutralOut needs; the RoboRIO's actual thread
+// priorities are unrecorded (docs/BENCH.md, loop stall check). Desktop
+// simulation keeps the default scheduling.
 #ifdef __FRC_ROBORIO__
 constexpr int kWatchdogPriority = 30;
 #else
 constexpr int kWatchdogPriority = 0;
 #endif
+
+#ifdef __FRC_ROBORIO__
+// The loop thread's SCHED_FIFO priority, so ordinary processes (an ssh
+// session, top) no longer delay its ticks. Strictly below the watchdog, which
+// must still preempt it when it spins.
+constexpr int kLoopPriority = 20;
+static_assert(kLoopPriority > 0 && kLoopPriority < kWatchdogPriority);
+
+// Present at program start: the loop keeps the default scheduling (a bench
+// comparison, or a field fallback that needs no rebuild).
+constexpr const char* kLoopDefaultSchedulingFile =
+    "/home/lvuser/talos_loop_default_sched";
+
+const char* PolicyName(int policy) {
+  switch (policy) {
+    case SCHED_OTHER:
+      return "SCHED_OTHER";
+    case SCHED_FIFO:
+      return "SCHED_FIFO";
+    case SCHED_RR:
+      return "SCHED_RR";
+    default:
+      return "other policy";
+  }
+}
+
+// Puts the calling thread, the loop, on SCHED_FIFO kLoopPriority, unless
+// kLoopDefaultSchedulingFile exists, and prints its policy and priority, with
+// the reason when it stays at the default scheduling. A refusal leaves it
+// there; nothing else changes.
+//
+// SCHED_RESET_ON_FORK: a thread the loop creates later (a vendor library's
+// lazily started thread) starts at the default scheduling instead of
+// inheriting SCHED_FIFO, where a busy one would starve everything below it.
+// Otherwise it is the request frc::SetCurrentThreadPriority makes (with which
+// LoopWatchdog::Run raises the watchdog), made directly to pass that flag and
+// to print the refusal's errno.
+void ScheduleLoopThread() {
+  char reason[160] = "";
+  if (access(kLoopDefaultSchedulingFile, F_OK) == 0) {
+    std::snprintf(reason, sizeof(reason), " (%s present)",
+                  kLoopDefaultSchedulingFile);
+  } else {
+    sched_param param{};
+    param.sched_priority = kLoopPriority;
+    if (sched_setscheduler(0, SCHED_FIFO | SCHED_RESET_ON_FORK, &param) != 0) {
+      std::snprintf(reason, sizeof(reason),
+                    " (SCHED_FIFO %d refused, errno %d)", kLoopPriority, errno);
+    }
+  }
+  // What the kernel holds now, whatever was asked.
+  const int policy = sched_getscheduler(0);
+  sched_param actual{};
+  sched_getparam(0, &actual);
+  std::printf(
+      "%shardware gateway loop %s %d, watchdog asks SCHED_FIFO %d%s\n",
+      talos::rio::ConsoleTime(NowUs()).c_str(),
+      policy < 0 ? "unknown policy" : PolicyName(policy & ~SCHED_RESET_ON_FORK),
+      actual.sched_priority, kWatchdogPriority, reason);
+}
+#endif
+
+// Sleeps until `wake_us` on NowUs' clock.
+void SleepUntilUs(uint64_t wake_us) {
+#if defined(__linux__) && defined(_GLIBCXX_USE_CLOCK_MONOTONIC)
+  // libstdc++'s steady_clock, NowUs' clock, reads CLOCK_MONOTONIC. An absolute
+  // sleep on it wakes at the deadline however long the thread was preempted
+  // before sleeping; std::this_thread::sleep_until sleeps a relative time
+  // computed before that preemption.
+  timespec wake{};
+  wake.tv_sec = static_cast<time_t>(wake_us / 1'000'000);
+  wake.tv_nsec = static_cast<long>((wake_us % 1'000'000) * 1'000);
+  int result = 0;
+  do {
+    result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
+  } while (result == EINTR);
+  if (result == 0) return;
+  // Not reachable with a valid time; never let the loop spin.
+#elif defined(__FRC_ROBORIO__)
+#error "the RoboRIO loop needs libstdc++'s steady_clock on CLOCK_MONOTONIC"
+#endif
+  std::this_thread::sleep_until(std::chrono::steady_clock::time_point{
+      std::chrono::microseconds{wake_us}});
+}
 
 class RioWatchdogOutputs final : public talos::rio::WatchdogOutputs {
  public:
@@ -190,18 +285,26 @@ void Robot::StartCompetition() {
   // Disarmed until a tick ends with a command in force.
   watchdog_->Start(NowUs, kWatchdogPriority);
 
-  auto period = std::chrono::microseconds{5000};
-  auto next = std::chrono::steady_clock::now();
+#ifdef __FRC_ROBORIO__
+  // After every other thread of this program has started, at the default
+  // scheduling: none inherits the loop's.
+  ScheduleLoopThread();
+#endif
+
+  uint64_t period_us = 5000;
+  const auto loop_start = std::chrono::steady_clock::now();
+  // The next tick's deadline, on NowUs' clock.
+  uint64_t next_us = SteadyUs(loop_start);
 
 #ifndef __FRC_ROBORIO__
   talos::rio::SimDriverStation simulated_driver_station{
-      talos::rio::SimDriverStation::SettingsFromEnvironment(), next};
+      talos::rio::SimDriverStation::SettingsFromEnvironment(), loop_start};
 
   // A bounded simulation run, so an automated test does not have to race a
   // kill signal to get a clean summary out.
   std::optional<std::chrono::steady_clock::time_point> stop_at;
   if (const char* ms = std::getenv("TALOS_SIM_RUN_MS")) {
-    stop_at = next + std::chrono::milliseconds{std::atoi(ms)};
+    stop_at = loop_start + std::chrono::milliseconds{std::atoi(ms)};
   }
   uint64_t active_ticks = 0;
 #endif
@@ -216,21 +319,16 @@ void Robot::StartCompetition() {
 
   // Tick starts, so the logger can report a loop woken late (starved of the
   // CPU) even when each tick's own work is short.
-  std::optional<std::chrono::steady_clock::time_point> previous_tick_start;
+  std::optional<uint64_t> previous_tick_start_us;
   while (running_.load(std::memory_order_relaxed)) {
-    const auto tick_start = std::chrono::steady_clock::now();
+    const uint64_t tick_start_us = NowUs();
     const uint64_t tick_interval_us =
-        previous_tick_start
-            ? static_cast<uint64_t>(
-                  std::chrono::duration_cast<std::chrono::microseconds>(
-                      tick_start - *previous_tick_start)
-                      .count())
-            : 0;
-    previous_tick_start = tick_start;
+        previous_tick_start_us ? tick_start_us - *previous_tick_start_us : 0;
+    previous_tick_start_us = tick_start_us;
     if (gateway_->configured()) {
-      period = std::chrono::microseconds{gateway_->config().period_us};
+      period_us = gateway_->config().period_us;
     }
-    next += period;
+    next_us += period_us;
 
 #ifndef __FRC_ROBORIO__
     simulated_driver_station.Update(std::chrono::steady_clock::now(),
@@ -320,10 +418,7 @@ void Robot::StartCompetition() {
     // expiry, plus one period for the tick that sees it and one more for that
     // tick's own work before its beat, so an on-time loop is never acted on.
     const uint64_t expiry_us = gateway_->command_expiry_us();
-    watchdog_->Beat(
-        now_us, expiry_us == 0
-                    ? 0
-                    : expiry_us + 2 * static_cast<uint64_t>(period.count()));
+    watchdog_->Beat(now_us, expiry_us == 0 ? 0 : expiry_us + 2 * period_us);
 
     // What the endpoint last heard, for the drive team's link report; atomic
     // stores only, the reporter thread does the publishing.
@@ -348,22 +443,17 @@ void Robot::StartCompetition() {
       unsaved.reset();
     }
 
-    // An overrun must not turn into a burst of catch-up iterations that starve
-    // the Driver Station refresh; give up the missed cycles and stay on phase.
-    const auto now = std::chrono::steady_clock::now();
+    const uint64_t end_us = NowUs();
     // Start-to-start interval and wake-to-sleep work against the period,
     // which the logger thread reports once a second as late ticks and
     // overruns.
-    log_->RecordTick(tick_interval_us,
-                     static_cast<uint64_t>(
-                         std::chrono::duration_cast<std::chrono::microseconds>(
-                             now - tick_start)
-                             .count()),
-                     static_cast<uint64_t>(period.count()));
-    if (next < now) {
-      next = now;
-    }
-    std::this_thread::sleep_until(next);
+    log_->RecordTick(tick_interval_us, end_us - tick_start_us, period_us);
+    // On time, the loop keeps its phase; past the deadline it drops the
+    // missed ticks instead of catching up in a burst, yields the CPU for
+    // kOverrunSleepUs and counts the next period from there, so the phase
+    // moves (LoopSchedule.h).
+    next_us = talos::rio::NextWakeUs(next_us, end_us);
+    SleepUntilUs(next_us);
   }
 
   // The loop no longer beats; the shutdown below neutralizes on its own.
