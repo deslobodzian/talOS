@@ -33,6 +33,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <mutex>
@@ -49,6 +50,23 @@
 #include "talOS/introspection/registry.h"
 
 namespace talos::introspect {
+
+// How often a running node's reporter refreshes its row: the heartbeat, the
+// source counters, the selections and the event log flags. Once a loop
+// runs, the one deadline the heartbeat must meet is liveness: a viewer's
+// `alive`, and the next claim freeing a row whose heartbeat is
+// kLivenessTimeout old. The launcher's stall check reads the dispatch count,
+// which the loop thread stores itself, and counts the heartbeat as progress
+// only while a node constructs, when the reporter beats on a cadence of its
+// own (Reporter's constructor). So the refresh owes the heartbeat only a wide
+// margin under kLivenessTimeout, for a reporting thread starved below the
+// realtime loops: 20 refreshes per timeout. Each refresh is the reporting
+// thread's only wake while the loop runs; nothing else it writes has a
+// deadline (Studio's view and the launcher's recording and realtime notes
+// read it as it comes).
+inline constexpr std::chrono::milliseconds kRefreshPeriod{250};
+static_assert(kRefreshPeriod * 20 <= kLivenessTimeout,
+              "a starved reporter must not lose its row");
 
 class Reporter {
  public:
@@ -117,7 +135,7 @@ class Reporter {
 
     // Full refresh cadence: heartbeat, source counters and selections. The
     // dispatch count the launcher supervises is the loop thread's own.
-    std::chrono::milliseconds period{250};
+    std::chrono::milliseconds period{kRefreshPeriod};
 
     std::string registry_path{kRegistryPath};
   };
@@ -139,6 +157,10 @@ class Reporter {
       std::fprintf(stderr, "%s: node registry unavailable: %s\n",
                    options_.name.c_str(), e.what());
     }
+    // The construction heartbeat: while a node constructs, the launcher's
+    // stall check reads it as progress, against a timeout of at least
+    // 500 ms. Its 10 ms cadence lasts only as long as construction, which
+    // the launcher bounds (kConstructionTimeout); start() ends it.
     thread_ = std::jthread{[this](const std::stop_token& stop) {
       while (!stop.stop_requested()) {
         if (registration_) registration_->heartbeat();
@@ -207,6 +229,13 @@ class Reporter {
   // on this rather than sleeping.
   bool published() const { return published_.load(std::memory_order_acquire); }
 
+  // How many times the reporting thread has woken from its waits, for
+  // measuring what reporting costs a node: once per `period` while its loop
+  // runs.
+  std::uint64_t wakeups() const {
+    return wakeups_.load(std::memory_order_relaxed);
+  }
+
   const std::string& error() const { return error_; }
 
  private:
@@ -214,7 +243,8 @@ class Reporter {
   void run(Loop& loop, const std::stop_token& stop) {
     // The loop publishes its counters array before it stores running(), and
     // that store synchronizes with this load, so a visible `true` means the
-    // manifest is frozen and the counters exist.
+    // manifest is frozen and the counters exist. The 2 ms polls last only
+    // from start() to the run, a few calls in talos::Run.
     while (!stop.stop_requested() && !loop.running()) {
       pause(stop, std::chrono::milliseconds{2});
       if (registration_) registration_->heartbeat();
@@ -224,7 +254,7 @@ class Reporter {
     }
 
     if (!registration_) return;
-    auto& registration = registration_;
+    NodeRegistration& registration = *registration_;
 
     // The loop's own sources first, keeping their ids, then anything the node
     // owns outside the loop.
@@ -259,26 +289,22 @@ class Reporter {
       }
     }
 
-    registration->publish(manifest, endpoints, source_flags);
-    registration->publish_selections(options_.selections);
-    registration->activate();
+    registration.publish(manifest, endpoints, source_flags);
+    registration.publish_selections(options_.selections);
+    registration.activate();
     published_.store(true, std::memory_order_release);
 
+    // One wait per refresh. The end of the loop is not polled for: the row
+    // stays until this Reporter goes, which talos::Run does right after its
+    // loop returns, and stop() wakes the wait at once.
     while (!stop.stop_requested() && loop.running()) {
-      sample(loop, *registration);
-      // Short waits rather than one long one, so the end of the loop is seen
-      // promptly: a node that has exited should leave the viewer immediately,
-      // not a quarter second later. stop() itself wakes the wait.
-      const auto deadline = std::chrono::steady_clock::now() + options_.period;
-      while (!stop.stop_requested() && loop.running() &&
-             std::chrono::steady_clock::now() < deadline) {
-        pause(stop, std::chrono::milliseconds{10});
-      }
+      sample(loop, registration);
+      pause(stop, options_.period);
     }
 
     // A final sample so the last cycle's counts are not lost when a node exits
     // between refreshes.
-    sample(loop, *registration);
+    sample(loop, registration);
   }
 
   template <typename Loop>
@@ -349,11 +375,13 @@ class Reporter {
   void pause(const std::stop_token& stop, std::chrono::milliseconds period) {
     std::unique_lock lock{pause_mutex_};
     pause_.wait_for(lock, stop, period, [] { return false; });
+    wakeups_.fetch_add(1, std::memory_order_relaxed);
   }
 
   Options options_;
   std::size_t loop_sources_{0};
   std::atomic<bool> published_{false};
+  std::atomic<std::uint64_t> wakeups_{0};
   std::string error_;
   std::optional<NodeRegistration> registration_;
   ProgressObserver progress_;
