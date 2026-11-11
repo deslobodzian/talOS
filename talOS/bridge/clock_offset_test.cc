@@ -240,13 +240,15 @@ TEST(ClockOffset, RetainedMinimumRoundTripBoundPropagatesOscillatorDrift) {
   }
 }
 
-// The bridge's real cadence (HardwareNode::Tick): a 1 ms bridge tick, one
-// probe outstanding and at most one every 20 ms, completed on the bridge tick
-// after the State that echoes it. The gateway samples every 5 ms of its own
-// clock and echoes a probe on the tick after the one that received it. Both
-// one-way delays jitter between 0.1 and 3.1 ms, so each exchange's RTT
-// differs, and the gateway clock runs 500 ppm fast. Once valid, the mapping
-// stays valid on every State for a minute, and its bound always holds.
+// A bridge cadence no finer than the real one: one probe outstanding and at
+// most one every 20 ms, States received on a 1 ms grid (the real bridge
+// wakes for each), and each exchange completed on the tick after the State
+// that echoes it (the real bridge makes that tick at once). The gateway samples
+// every 5 ms of its own clock and echoes a probe on the tick after the one that
+// received it. Both one-way delays jitter between 0.1 and 3.1 ms, so each
+// exchange's RTT differs, and the gateway clock runs 500 ppm fast. Once valid,
+// the mapping stays valid on every State for a minute, and its bound always
+// holds.
 TEST(ClockOffset, BridgeCadenceExchangesKeepTheBoundValidWithoutGaps) {
   constexpr std::uint64_t kBoot = 7;
   // Gateway microseconds per bridge microsecond, and the bridge time of the

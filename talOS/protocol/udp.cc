@@ -182,6 +182,14 @@ void RuntimeUdpPeer::Close() {
 
 bool RuntimeUdpPeer::IsOpen() const { return socket_ != kInvalidSocket; }
 
+int RuntimeUdpPeer::NativeFd() const {
+#if defined(_WIN32)
+  return -1;
+#else
+  return IsOpen() ? ToNativeSocket(socket_) : -1;
+#endif
+}
+
 UdpStatus RuntimeUdpPeer::SendFrame(FrameType type, uint16_t flags,
                                     uint64_t monotonic_time_us,
                                     const void* payload,

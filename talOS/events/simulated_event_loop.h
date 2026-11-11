@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -115,11 +117,14 @@ class SimulationEnvironment {
 
 // A loop on a virtual clock.
 //
-// Without an injected pause, time jumps straight to the next deadline: no
-// jitter, scheduling latency or wall-clock dependence. Pauses advance the
-// clock without dispatch, reproducing overdue timers and transport overflow.
-// Identical inputs and pauses produce identical logs; the realtime loop then
-// proves the same dispatch contract holds when timing is messy.
+// Without an injected pause, time jumps straight to the next event: a timer's
+// deadline or, under Delivery::ON_PUBLISH, an unread publication on a prompt
+// watcher, which the realtime loop would be woken for, or, at once, the
+// backlog a capped drain left (drain_messages). No jitter, scheduling
+// latency or wall-clock dependence. Pauses advance the clock without
+// dispatch, reproducing overdue timers and transport overflow. Identical
+// inputs and pauses produce identical logs; the realtime loop then proves the
+// same dispatch contract holds when timing is messy.
 template <RecorderPolicy Recorder = NullRecorder>
 class SimulatedEventLoop
     : public EventLoopBase<SimulatedEventLoop<Recorder>, Recorder> {
@@ -130,10 +135,11 @@ class SimulatedEventLoop
   struct Options {
     Duration tick_period{std::chrono::milliseconds{1}};
     std::size_t max_messages_per_tick{64};
-    // As on the realtime loop, so a simulation delivers when the robot would,
-    // except that Delivery::ON_PUBLISH drains on the poll tick, as POLL
-    // does: an upper bound on when the realtime loop, woken by the
-    // publication itself, delivers.
+    // As on the realtime loop, so a simulation delivers when the robot would.
+    // Under Delivery::ON_PUBLISH a prompt watcher's publication is an event
+    // at its publication time that drains the loop, as the realtime loop's
+    // wake does; no notification can be lost, so there is no backstop.
+    // tick_period matters only under Delivery::POLL.
     Delivery delivery{Delivery::POLL};
     // The clock's origin: where it starts and what the manifest's timer
     // offsets count from. Input replay (input_replay.h) starts at the
@@ -209,11 +215,51 @@ class SimulatedEventLoop
   // poll tick); before it next_deadline() is not yet meaningful.
   bool started() const { return started_; }
 
-  // The earliest armed deadline: when the next run would first dispatch, or
-  // MonotonicTime::max() with nothing armed. A harness stepping several
-  // loops advances them all to the earliest of theirs, so none runs past a
-  // time another has not reached (talos::testing::Sim).
-  MonotonicTime next_deadline() const { return scheduler_.next_deadline(); }
+  // When the next run would first dispatch: the earliest armed deadline or,
+  // under Delivery::ON_PUBLISH, the earliest publication time of a prompt
+  // watcher's next unread message (at or before now when one is already
+  // waiting, such as one another loop published at this instant after this
+  // loop ran); MonotonicTime::max() with nothing pending, or once the loop
+  // has exited. A harness stepping several loops advances them all to the
+  // earliest of theirs, so none runs past a time another has not reached,
+  // and runs a loop again at one instant while it is due there
+  // (talos::testing::Sim).
+  // A drain that left a backlog (see drain_messages) makes the loop due at
+  // now.
+  MonotonicTime next_deadline() const {
+    if (started_ && !this->running()) return MonotonicTime::max();
+    return std::min({scheduler_.next_deadline(), next_publication(),
+                     backlog_ ? now_ : MonotonicTime::max()});
+  }
+
+  // The topics of the prompt watchers with an unread message published by
+  // `at`, then, after a drain that left a backlog, those of the other
+  // sequence watchers with one, in registration order: what keeps the loop
+  // due at `at`. For an error that names them; it allocates.
+  std::vector<std::string> due_prompt_topics(MonotonicTime at) const {
+    std::vector<std::string> topics;
+    for (const std::uint16_t id : prompt_watchers_) {
+      if (next_publication(id) <= at) {
+        topics.push_back(this->manifest()[id].name);
+      }
+    }
+    if (!backlog_) return topics;
+    for (std::size_t id = 0; id < this->sources().size(); ++id) {
+      const auto watcher = static_cast<std::uint16_t>(id);
+      if (redrains(watcher) && next_publication(watcher) <= at) {
+        topics.push_back(this->manifest()[id].name);
+      }
+    }
+    return topics;
+  }
+
+  // Drains between timers (woken, or for a backlog) one run_until() makes at
+  // one instant before it throws std::runtime_error: a handler that
+  // publishes on a prompt watcher of its own loop, or on a backlogged one,
+  // directly or through another of its handlers, at every delivery would
+  // otherwise never let simulated time advance. A legitimate backlog needs a
+  // few (a full ring is 16 drains of 64).
+  static constexpr std::size_t kMaxWokenDrainsPerInstant = 1000;
 
   // A stopped process's clock advances without draining or firing timers.
   void advance_until(MonotonicTime end) {
@@ -225,27 +271,64 @@ class SimulatedEventLoop
   // Runs to `end` and returns. The loop is quiescent between calls, which is
   // what makes stepping useful: the test can inject messages and re-arm timers
   // in between, exactly as the outside world would.
+  //
+  // Events run in time order, and at one instant as the realtime loop runs
+  // them: every timer due by now first, each after its drain (which
+  // delivers any prompt publication made by then, stamped with the timer's
+  // deadline), then, under Delivery::ON_PUBLISH, a woken drain for a prompt
+  // publication still unread, as the realtime loop's wake after its timer
+  // pass. So a publication at a timer's deadline costs one drain, not two,
+  // and one a handler makes on a prompt watcher of this loop is delivered at
+  // that same instant. Throws std::runtime_error naming the prompt topics
+  // still due after kMaxWokenDrainsPerInstant woken drains at one instant.
   void run_until(MonotonicTime end) {
     typename Base::RunScope in_run{*this};
 
     if (!started_) {
       scheduler_.reserve(this->manifest().size() + 1);
       this->begin_run();
-      if (options_.delivery != Delivery::BEFORE_TIMERS) {
+      if (options_.delivery == Delivery::POLL) {
         scheduler_.schedule(INTERNAL_POLL_TIMER_ID,
                             options_.start + options_.tick_period,
                             options_.tick_period);
+      } else if (options_.delivery == Delivery::ON_PUBLISH) {
+        // With no prompt watcher only timers are events: the loop runs as
+        // BEFORE_TIMERS, as the realtime loop does.
+        for (const auto& source : this->sources()) {
+          if (source.prompt) {
+            prompt_watchers_.push_back(source.registration.id);
+          }
+        }
       }
       started_ = true;
     }
 
+    std::optional<MonotonicTime> woken_at;
+    std::size_t woken_drains = 0;
     while (this->running_state()) {
-      const MonotonicTime deadline = scheduler_.next_deadline();
+      const MonotonicTime timer = scheduler_.next_deadline();
+      const MonotonicTime deadline = std::min(
+          {timer, next_publication(), backlog_ ? now_ : MonotonicTime::max()});
       if (deadline > end) {
         break;
       }
 
       now_ = std::max(now_, deadline);
+
+      // Nothing but a prompt publication is due: the realtime loop's wake. A
+      // backlog the last drain left goes first, as the realtime loop drains
+      // it before it waits: a drain it was not woken for.
+      if (timer > now_) {
+        if (woken_at != now_) {
+          woken_at = now_;
+          woken_drains = 0;
+        }
+        if (++woken_drains > kMaxWokenDrainsPerInstant) {
+          throw std::runtime_error(not_settling(now_));
+        }
+        drain_messages(now_, /*woken=*/!backlog_);
+        continue;
+      }
 
       Expiration expiration{};
       while (this->running_state() &&
@@ -254,7 +337,7 @@ class SimulatedEventLoop
           drain_messages(expiration.deadline);
           continue;
         }
-        // Under either delivery, as on the realtime loop.
+        // Under every delivery, as on the realtime loop.
         drain_messages(expiration.deadline);
         if (!this->running_state()) break;
         this->dispatch_timer(expiration.id, expiration.deadline, now_,
@@ -309,14 +392,58 @@ class SimulatedEventLoop
                        cursor.channel->publish(bytes, this->monotonic_now())};
   }
 
+  // Under Delivery::ON_PUBLISH, the publication time of prompt watcher
+  // `id`'s next unread message, or MonotonicTime::max() when it has none.
+  MonotonicTime next_publication(std::uint16_t id) const {
+    const Cursor& cursor = cursors_[id];
+    const SimulatedChannel& channel = *cursor.channel;
+    if (cursor.sequence >= channel.next_sequence()) {
+      return MonotonicTime::max();
+    }
+    return channel.publish_time(
+        std::max(cursor.sequence, channel.oldest_sequence()));
+  }
+
+  // The earliest of those over every prompt watcher: when the realtime loop
+  // would next be woken.
+  MonotonicTime next_publication() const {
+    MonotonicTime earliest = MonotonicTime::max();
+    for (const std::uint16_t id : prompt_watchers_) {
+      earliest = std::min(earliest, next_publication(id));
+    }
+    return earliest;
+  }
+
+  std::string not_settling(MonotonicTime at) const {
+    std::string message =
+        "simulated loop drained " + std::to_string(kMaxWokenDrainsPerInstant) +
+        " times at " + std::to_string(at.nanos()) +
+        " ns and these topics are still due (a zero-time publish cycle?):";
+    for (const std::string& topic : due_prompt_topics(at)) {
+      message += " " + topic;
+    }
+    return message;
+  }
+
   // Normally deadlines and observation times coincide; a paused process
   // instead observes overdue dispatches with its advanced clock. Only
   // publications made by now_ are visible: loops sharing an environment may
   // stand at different times, and a reader never sees its future. A
   // latest-only watcher takes the newest visible message; an ordered one
   // stops at the first invisible one.
-  void drain_messages(MonotonicTime tick_deadline) {
+  //
+  // Every watcher is drained, in registration order. A message's event time
+  // is `tick_deadline`, except in a `woken` drain (one a prompt publication
+  // caused) for a prompt watcher: as on the realtime loop, the loop owed it
+  // a dispatch from its publication, so its event time is its publication
+  // time. A watcher that is not prompt keeps the drain's time.
+  //
+  // As on the realtime loop, a drain that stops at max_messages_per_tick on
+  // a watcher that redrains() sets backlog_, which makes the loop due again
+  // at now (next_deadline, run_until).
+  void drain_messages(MonotonicTime tick_deadline, bool woken = false) {
     ++drains_;
+    backlog_ = false;
     auto& sources = this->sources();
 
     for (std::size_t id = 0; id < sources.size(); ++id) {
@@ -326,9 +453,9 @@ class SimulatedEventLoop
 
       Cursor& cursor = cursors_[id];
 
-      for (std::size_t drained = 0;
-           drained < options_.max_messages_per_tick &&
-           cursor.sequence < cursor.channel->next_sequence();
+      std::size_t drained = 0;
+      for (; drained < options_.max_messages_per_tick &&
+             cursor.sequence < cursor.channel->next_sequence();
            ++drained) {
         const std::uint64_t first =
             std::max(cursor.sequence, cursor.channel->oldest_sequence());
@@ -345,26 +472,48 @@ class SimulatedEventLoop
         cursor.channel->copy_to(sequence, sources[id].buffer);
         cursor.sequence = sequence + 1;
 
-        this->dispatch_message(static_cast<std::uint16_t>(id), tick_deadline,
-                               now_, sequence, dropped, sources[id].buffer,
-                               cursor.channel->publish_time(sequence));
+        const MonotonicTime published = cursor.channel->publish_time(sequence);
+        this->dispatch_message(
+            static_cast<std::uint16_t>(id),
+            woken && sources[id].prompt ? published : tick_deadline, now_,
+            sequence, dropped, sources[id].buffer, published);
 
         if (!this->running()) {
           return;
         }
         if (sources[id].latest_only) break;
       }
+      if (drained == options_.max_messages_per_tick &&
+          redrains(static_cast<std::uint16_t>(id))) {
+        backlog_ = true;
+      }
     }
+  }
+
+  // Whether a drain that stops at the cap on watcher `id` is followed at
+  // once by another: a sequence watcher no publication drains the loop for,
+  // under Delivery::BEFORE_TIMERS or ON_PUBLISH (POLL's next tick drains it
+  // anyway), as on the realtime loop.
+  bool redrains(std::uint16_t id) const {
+    const auto& source = this->sources()[id];
+    return source.registration.kind == SourceKind::WATCHER &&
+           !source.latest_only && options_.delivery != Delivery::POLL &&
+           std::find(prompt_watchers_.begin(), prompt_watchers_.end(), id) ==
+               prompt_watchers_.end();
   }
 
   SimulationEnvironment* environment_;
   Options options_;
   Scheduler scheduler_;
   std::vector<Cursor> cursors_;
+  // The prompt watchers, in registration order (Delivery::ON_PUBLISH only).
+  std::vector<std::uint16_t> prompt_watchers_;
   MonotonicTime now_{};
   bool started_{false};
   bool finished_{false};
   std::uint64_t drains_{0};
+  // The last drain left a backlog (see drain_messages).
+  bool backlog_{false};
 };
 
 }  // namespace talos::event

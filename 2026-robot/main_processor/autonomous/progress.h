@@ -87,7 +87,8 @@ class ProgressStore {
  public:
   enum class Loaded { kNone, kValid, kCorrupt };
 
-  // No store without a session directory (tests, --describe, --replay).
+  // No store without a session directory (tests, --describe, --replay,
+  // --replay-inputs), so a replay never reads or writes the robot's record.
   explicit ProgressStore(const std::optional<std::filesystem::path>& session) {
     if (!session) return;
     boot_ = BootId();

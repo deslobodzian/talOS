@@ -1,6 +1,8 @@
 #include "talOS/process/process.h"
 
+#include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -34,6 +36,50 @@ namespace talos::process {
 std::atomic<bool> stop_requested{false};
 
 namespace {
+
+// The stop pipe's write end, which the signal handler reads; -1 until the
+// pipe exists.
+std::atomic<int> stop_write_fd{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+// Async-signal-safe: one write(2), errno kept. EAGAIN means the pipe is full,
+// and so already readable.
+void WriteStopByte() noexcept {
+  const int fd = stop_write_fd.load(std::memory_order_acquire);
+  if (fd < 0) return;
+  const int saved_errno = errno;
+  const char byte = 1;
+  while (::write(fd, &byte, 1) < 0 && errno == EINTR) {
+  }
+  errno = saved_errno;
+}
+
+// Both ends non-blocking and close-on-exec. macOS has no pipe2(), so there a
+// fork-and-exec on another thread between pipe() and fcntl() (a Python
+// node's interpreter may already run threads) can leave a child holding an
+// end. Harmless: the child never reads it, and a write end it holds only
+// keeps the pipe open, which it always is.
+int CreateStopPipe() noexcept {
+  int fds[2] = {-1, -1};
+#if defined(__linux__)
+  if (::pipe2(fds, O_NONBLOCK | O_CLOEXEC) != 0) return -1;
+#else
+  if (::pipe(fds) != 0) return -1;
+  for (const int fd : fds) {
+    const int status = ::fcntl(fd, F_GETFL);
+    if (::fcntl(fd, F_SETFD, FD_CLOEXEC) == -1 || status == -1 ||
+        ::fcntl(fd, F_SETFL, status | O_NONBLOCK) == -1) {
+      ::close(fds[0]);
+      ::close(fds[1]);
+      return -1;
+    }
+  }
+#endif
+  stop_write_fd.store(fds[1], std::memory_order_release);
+  // A stop requested before the pipe existed set only the flag.
+  if (stop_requested.load()) WriteStopByte();
+  return fds[0];
+}
 
 // The refusals so far, as kStep* bits and as one line. Fixed storage: this
 // runs where an allocation failure must not turn into an exception.
@@ -304,6 +350,44 @@ bool RealtimeRequested(bool simulation) noexcept {
   if (setting != nullptr && std::strcmp(setting, "0") == 0) return false;
   if (setting != nullptr && std::strcmp(setting, "1") == 0) return true;
   return !simulation;
+}
+
+void RequestStop(int /*signal*/) noexcept {
+  // Only the first request since the flag was clear writes, so repeated
+  // signals cannot fill the pipe.
+  if (stop_requested.exchange(true)) return;
+  WriteStopByte();
+}
+
+int StopFd() noexcept {
+  static const int read_fd = CreateStopPipe();
+  return read_fd;
+}
+
+bool ConsumeStopWake() noexcept {
+  if (stop_requested.load()) return true;
+  const int fd = StopFd();
+  if (fd >= 0) {
+    char stale[64];
+    for (;;) {
+      const ssize_t got = ::read(fd, stale, sizeof stale);
+      if (got > 0 || (got < 0 && errno == EINTR)) continue;
+      break;
+    }
+  }
+  // A byte read above whose stop was requested after the first load: its
+  // flag store came before its write, so this load sees it.
+  return stop_requested.load();
+}
+
+void InstallStopHandlers() {
+  StopFd();
+  struct sigaction action {};
+  action.sa_handler = RequestStop;
+  sigemptyset(&action.sa_mask);
+  action.sa_flags = SA_RESTART;
+  sigaction(SIGINT, &action, nullptr);
+  sigaction(SIGTERM, &action, nullptr);
 }
 
 LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept {

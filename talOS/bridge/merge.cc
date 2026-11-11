@@ -37,6 +37,12 @@ bool MergeOwner::Expire(std::uint64_t now_us) {
   return timed_out;
 }
 
+std::optional<std::uint64_t> MergeOwner::ExpiresAtUs() const {
+  // Expire()'s test, solved for now_us: the first instant past timeout_us.
+  if (timed_out || !seen) return std::nullopt;
+  return last_seen_us + timeout_us + 1;
+}
+
 void MergeOwner::Reset() {
   seen = false;
   last_seen_us = 0;

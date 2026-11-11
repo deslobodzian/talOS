@@ -44,9 +44,20 @@ __all__ = [
     "DigitalOutput", "DriverStation", "Encoder", "Gyro", "HardwareLink", "Joystick", "Message",
     "Mode", "Motor", "Node", "OperatorArming", "Publisher", "PwmOutput",
     "StateMachine",
-    "Subscription", "TalosError", "Target", "TargetLane", "cpp_node", "load",
-    "hardware_sample_time_ns", "robot_enabled", "run",
+    "Subscription", "TalosError", "Target", "TargetLane", "Wake", "cpp_node",
+    "load", "hardware_sample_time_ns", "robot_enabled", "run",
 ]
+
+
+class Wake(enum.IntEnum):
+    """When a subscription's callback runs (talos::Wake). Either way it gets
+    every message in sequence, at most 64 per topic per drain."""
+    # Each publication wakes the node to run the callback as it arrives.
+    ON_PUBLISH = _abi.WAKE_ON_PUBLISH
+    # Publications wake nothing: the messages wait for the node's next
+    # drain (before its next update() or every(), or another topic's wake).
+    AT_DRAIN = _abi.WAKE_AT_DRAIN
+
 
 _NS = 1e9
 _REQUIRED = object()
@@ -137,7 +148,7 @@ class Node:
     @property
     def session_dir(self):
         """The session output directory (parent of --log), or None without
-        --log (tests, --describe, --replay)."""
+        --log (tests) and in --describe, --replay and --replay-inputs."""
         path = lib.talos_node_session_dir(self._handle)
         return None if path is None else path.decode()
 
@@ -170,10 +181,15 @@ class Node:
             default is _REQUIRED, out))
         return _param_value(out) if found else default
 
-    def subscribe(self, msg, topic, callback=None, optional=False):
+    def subscribe(self, msg, topic, callback=None, optional=False, *,
+                  wake=Wake.ON_PUBLISH):
         """The latest `msg` on `topic`; callback(message) on each arrival.
 
-        optional: the graph lint tolerates no publisher.
+        optional: the graph lint tolerates no publisher. wake, with a
+        callback: Wake.ON_PUBLISH (the default) wakes the node on each
+        publication to run it; Wake.AT_DRAIN wakes nothing and runs it at
+        the node's next drain, for a node that needs every message but acts
+        on them at its tick. A node with no timer is woken either way.
         """
         mtype = message_type(msg)
         on_message = _abi.MESSAGE_CALLBACK()
@@ -183,7 +199,8 @@ class Node:
                     mtype.decode(ctypes.string_at(data, size))))))
         index = _abi.index(lib.talos_node_subscribe(
             self._handle, _abi.encode(topic), mtype.size,
-            _abi.schema_of(mtype), bool(optional), on_message, None))
+            _abi.schema_of(mtype), bool(optional), int(Wake(wake)),
+            on_message, None))
         return Subscription(self, mtype, index)
 
     def publish(self, msg, topic):

@@ -52,6 +52,10 @@ class KqueuePoller {
   // Stops watching `fd`. A no-op if `fd` was not being watched.
   void remove_fd(int fd);
 
+  // Whether the last wait_until() reported `fd` readable, for a caller
+  // watching several fds that must tell which one returned READABLE.
+  bool reported_readable(int fd) const noexcept;
+
   // Monotonic clock reading on the same timeline wait_until()'s deadline is
   // measured against.
   static MonotonicTime now();
@@ -76,6 +80,9 @@ class KqueuePoller {
   void close_fd() noexcept;
 
   bool arm_deadline_timer_{true};
+  // The watched fds the last wait_until() reported readable.
+  int readable_[kMaxEvents]{};
+  int readable_count_{0};
   int kq_fd_{-1};
 };
 

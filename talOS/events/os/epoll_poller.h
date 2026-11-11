@@ -72,6 +72,10 @@ class EpollPoller {
   // Stops watching `fd`. A no-op if `fd` was not being watched.
   void remove_fd(int fd);
 
+  // Whether the last wait_until() reported `fd` readable, for a caller
+  // watching several fds that must tell which one returned READABLE.
+  bool reported_readable(int fd) const noexcept;
+
   // Whether wait_until() waits with epoll_pwait2() rather than the timerfd:
   // false once a call has reported it unsupported.
   bool waits_with_pwait2() const { return pwait2_ != nullptr; }
@@ -96,6 +100,9 @@ class EpollPoller {
   void close_all() noexcept;
 
   Pwait2 pwait2_{nullptr};
+  // The watched fds the last wait_until() reported readable.
+  int readable_[kMaxEvents]{};
+  int readable_count_{0};
   int epoll_fd_{-1};
   int timer_fd_{-1};
   int wake_fd_{-1};
