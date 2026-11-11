@@ -36,6 +36,29 @@ std::string TempPath(std::string_view suffix) {
          std::to_string(::getpid()) + "_" + std::string{suffix} + ".tlog";
 }
 
+// A periodic sync interval short enough that a test waiting for one finishes
+// in milliseconds, and still long against one write and fsync.
+constexpr auto kShortSyncInterval = std::chrono::milliseconds{10};
+
+LogWriter::Options ShortSyncOptions() {
+  LogWriter::Options options{4096, 2, /*background=*/true};
+  options.sync_interval = kShortSyncInterval;
+  return options;
+}
+
+// Polls `done` until it holds. The deadline only bounds a hang
+// (docs/TESTING.md §6.3); no test asserts how long a wait took.
+template <typename Done>
+bool Eventually(Done done) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= deadline) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return true;
+}
+
 Manifest MakeManifest() {
   Manifest manifest;
 
@@ -643,7 +666,7 @@ TEST(LogBackgroundWriter, RoundTripsThroughTheWriterThread) {
 TEST(LogBackgroundWriter, IdlePartialChunkReachesFileAndIsNotDuplicated) {
   const auto path = TempPath("periodic_partial");
   {
-    LogWriter writer{path, "periodic", LogWriter::Options{4096, 2, true}};
+    LogWriter writer{path, "periodic", ShortSyncOptions()};
     writer.start({}, {});
     for (std::uint64_t i = 1; i <= 2; ++i) {
       Context context{};
@@ -651,17 +674,14 @@ TEST(LogBackgroundWriter, IdlePartialChunkReachesFileAndIsNotDuplicated) {
       writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
       // No further producer activity and no flush: the worker must write the
       // committed prefix of a chunk that is nowhere near full.
-      const auto deadline =
-          std::chrono::steady_clock::now() + std::chrono::seconds{3};
       struct stat status {};
       const auto expected = static_cast<off_t>(sizeof(FileHeader) +
                                                i * (sizeof(RecordHeader) + 16));
-      do {
-        // The writer thread creates the file, so it may not exist yet.
-        if (::stat(path.c_str(), &status) == 0 && status.st_size >= expected)
-          break;
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-      } while (std::chrono::steady_clock::now() < deadline);
+      // The writer thread creates the file, so it may not exist yet.
+      EXPECT_TRUE(Eventually([&] {
+        return ::stat(path.c_str(), &status) == 0 && status.st_size >= expected;
+      }));
+      // Every periodic pass since has written nothing again.
       ASSERT_EQ(status.st_size, expected);
       ASSERT_FALSE(writer.failed()) << writer.error();
     }
@@ -723,16 +743,11 @@ TEST(LogDurability, FlushReportsFsyncFailure) {
 TEST(LogDurability, IdleBackgroundWriterFsyncsWithoutExplicitFlush) {
   const auto path = TempPath("periodic_sync_closed");
   {
-    LogWriter writer{path, "periodic_sync"};
+    LogWriter writer{path, "periodic_sync", ShortSyncOptions()};
     writer.start({}, {});
     writer.flush();  // The writer thread creates the file.
     ASSERT_TRUE(CloseLogDescriptor(path));
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds{3};
-    while (!writer.failed() && std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{10});
-    }
-    EXPECT_TRUE(writer.failed());
+    EXPECT_TRUE(Eventually([&] { return writer.failed(); }));
   }
   ::unlink(path.c_str());
 }
@@ -863,14 +878,14 @@ TEST(LogBackgroundWriter, ProducerNeverWaitsForTheLogFile) {
 // A log file the writer cannot create does not stop the node: the
 // constructor returns, records are dropped rather than waited on, the
 // failure names the path, and the writer, with no file to sync, still stops
-// after its periodic sync (a writer spinning on it never returns from the
-// destructor).
+// once its periodic sync is due (a writer spinning on it never returns from
+// the destructor).
 TEST(LogBackgroundWriter, UncreatableLogFailsWithoutThrowing) {
   const std::string path = ::testing::TempDir() + "/talos_log_test_missing_" +
                            std::to_string(::getpid()) + "/node.tlog";
   std::optional<LogWriter> writer;
-  ASSERT_NO_THROW(
-      writer.emplace(path, "missing", LogWriter::Options{4096, 2, true}));
+  const auto created = std::chrono::steady_clock::now();
+  ASSERT_NO_THROW(writer.emplace(path, "missing", ShortSyncOptions()));
   writer->start(MakeManifest(), {});
   Context context{};
   context.dispatch_index = 1;
@@ -878,7 +893,11 @@ TEST(LogBackgroundWriter, UncreatableLogFailsWithoutThrowing) {
   writer->flush();
   EXPECT_TRUE(writer->failed());
   EXPECT_NE(writer->error().find(path), std::string::npos) << writer->error();
-  std::this_thread::sleep_for(std::chrono::milliseconds{1200});
+  // Not a delay to let something happen: the case needs a sync to be due when
+  // the writer stops, and one is due an interval after construction.
+  ASSERT_TRUE(Eventually([&] {
+    return std::chrono::steady_clock::now() - created > kShortSyncInterval;
+  }));
   writer->flush();
   writer.reset();
 }

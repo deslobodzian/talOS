@@ -486,7 +486,7 @@ void LogWriter::State::append(RecordHeader header,
   if (options.background) {
     active->committed.store(active->used, std::memory_order_release);
   } else if (std::chrono::steady_clock::now() - last_sync >=
-             std::chrono::seconds{1}) {
+             options.sync_interval) {
     submit_active();
     sync(/*durable=*/false);
   }
@@ -552,7 +552,7 @@ void LogWriter::State::start_writer() {
       // or the next periodic sync. A post that lands before the wait is kept
       // by the semaphore, so none is lost; a stale one only makes the next
       // wait return at once and the loop check again.
-      const auto sync_at = raw->last_sync + std::chrono::seconds{1};
+      const auto sync_at = raw->last_sync + raw->options.sync_interval;
       lock.unlock();
       raw->writer_idle.store(true, std::memory_order_seq_cst);
       if (raw->completed.load() == raw->submitted.load() &&
@@ -563,7 +563,7 @@ void LogWriter::State::start_writer() {
       lock.lock();
 
       const bool sync_due = std::chrono::steady_clock::now() - raw->last_sync >=
-                            std::chrono::seconds{1};
+                            raw->options.sync_interval;
       const auto next = raw->completed.load(std::memory_order_relaxed);
       const bool submitted =
           next != raw->submitted.load(std::memory_order_acquire);

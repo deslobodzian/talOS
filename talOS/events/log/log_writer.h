@@ -38,7 +38,7 @@ namespace talos::event::log {
 // lock (sem_post on Linux, dispatch_semaphore_signal on macOS). The writer
 // runs under the normal scheduling policy whatever the thread that
 // started it runs under, so it never competes with a realtime loop thread
-// for the CPU. Once per second the writer also
+// for the CPU. Once per Options::sync_interval (a second) the writer also
 // writes the committed prefix of the active chunk before fsync, so quiet logs
 // do not remain buffered indefinitely; that fsync leaves the data in the
 // drive's write cache on macOS. flush() and destruction sync with
@@ -77,7 +77,7 @@ struct LogWriterOptions {
 
   // Write from a background thread. Turn off for tests that want writes to
   // land synchronously, or for a process where an extra thread is not wanted.
-  // Without a background thread, the one-second sync is checked on append;
+  // Without a background thread, the periodic sync is checked on append;
   // an idle synchronous writer must be flushed explicitly.
   bool background{true};
 
@@ -94,6 +94,11 @@ struct LogWriterOptions {
   // every whole record before it. If the header/manifest cannot fit, no log
   // file is left; only the empty cap marker is created.
   std::uint64_t max_bytes{0};
+
+  // How often the writer writes the committed prefix of the active chunk and
+  // fsyncs it (see LogWriter). Tests shorten it; it must exceed one write and
+  // fsync, or a stopping writer finds the next sync already due.
+  std::chrono::nanoseconds sync_interval{std::chrono::seconds{1}};
 };
 
 // The marker a byte-capped writer leaves next to its log (see max_bytes).
