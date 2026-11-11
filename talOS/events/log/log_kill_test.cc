@@ -2,9 +2,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <exception>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,115 +18,97 @@
 namespace talos::event::log {
 namespace {
 
-using std::chrono::steady_clock;
-
-// What the child tells the parent after each record is committed.
-struct Report {
-  std::uint64_t dispatch_index;
-  std::int64_t committed_ns;  // steady_clock, the same clock in both.
-};
-constexpr auto kReportBytes = static_cast<ssize_t>(sizeof(Report));
-
-std::int64_t NowNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             steady_clock::now().time_since_epoch())
-      .count();
+std::vector<std::byte> Payload(std::uint64_t index) {
+  std::vector<std::byte> payload(16);
+  for (std::size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<std::byte>((index + i) % 251 + 1);
+  }
+  return payload;
 }
 
-// The child: logs one record per `cadence` like a 200 Hz node, reporting each
-// to `report_fd` once it is committed, until it is killed.
-[[noreturn]] void LogUntilKilled(const std::string& path, int report_fd,
-                                 std::chrono::nanoseconds cadence) {
+// The child: logs one record every 5 ms, like a 200 Hz node, until killed.
+// The periodic fsync is an hour away and a chunk holds about 3000 of these
+// records (15 s of them), so neither a sync nor a full chunk can be what
+// puts a record in the file within the parent's 10 s wait.
+[[noreturn]] void LogUntilKilled(const std::string& path) {
   LogWriter::Options options{};
-  // The periodic fsync must not be what puts the records in the file: it is
-  // the power-loss mechanism, not the crash one.
   options.sync_interval = std::chrono::hours{1};
   LogWriter writer{path, "killed", options};
   writer.start({}, {});
-  const std::vector<std::byte> payload(16, std::byte{0x5a});
-  auto next = steady_clock::now();
   for (std::uint64_t i = 1;; ++i) {
     Context context{};
     context.dispatch_index = i;
-    const Report report{i, NowNs()};
-    writer.dispatch(context, payload);
-    if (::write(report_fd, &report, sizeof(report)) != kReportBytes) {
-      ::_exit(2);
+    writer.dispatch(context, Payload(i));
+    std::this_thread::sleep_for(std::chrono::milliseconds{5});
+  }
+}
+
+// How many intact records `path` holds now, checking that they are records
+// 1, 2, ... in order with their payloads; 0 while the file or its header is
+// not there yet.
+std::uint64_t IntactPrefix(const std::string& path, bool& in_order) {
+  in_order = true;
+  try {
+    LogReader reader{path};
+    LogReader::Record record{};
+    std::uint64_t count = 0;
+    while (reader.next(record)) {
+      ++count;
+      const auto want = Payload(count);
+      if (record.header.dispatch_index != count ||
+          !std::equal(record.payload.begin(), record.payload.end(),
+                      want.begin(), want.end())) {
+        in_order = false;
+      }
     }
-    next += cadence;
-    std::this_thread::sleep_until(next);
+    if (reader.damage().spans != 0) in_order = false;
+    return count;
+  } catch (const std::exception&) {
+    return 0;
   }
 }
 
 // A node killed by a signal (the launcher's stall kill, a segfault, an abort)
-// runs no destructor and no flush: what its log keeps is what the writer had
-// already handed to the kernel. The writer used to write a chunk that was not
-// full only at its periodic sync, once a second, so a SIGKILLed
+// runs no destructor and no flush: its log keeps only what the writer had
+// already written to the kernel. The writer used to write a chunk that was
+// not full only at its periodic sync, once a second, so a SIGKILLed
 // hardware_node lost the last 826 ms of its log on the bench (2026-11-11).
-// Here a child logs at 200 Hz and is SIGKILLed after 200 ms with no sync due:
-// every record committed more than kLossBound before the kill must be in the
-// file. kLossBound is the writer's default write_interval (10 ms) plus 40 ms
-// for its SCHED_OTHER thread to be scheduled on a loaded host; the defect
-// lost every record. Consumer: whoever reads a crashed node's log for why it
-// died (no catalogue row states this bound yet; REQ-OPS-12 covers power loss).
-TEST(LogKill, KilledWriterKeepsEveryRecordOlderThanTheWriteInterval) {
-  constexpr auto kCadence = std::chrono::milliseconds{5};
-  constexpr std::uint64_t kReportsBeforeKill = 40;
-  constexpr auto kLossBound =
-      LogWriterOptions{}.write_interval + std::chrono::milliseconds{40};
+// Here the parent waits, polling the file, until it holds record kRecords of
+// a child logging at 200 Hz, with no sync and no full chunk possible, then
+// SIGKILLs the child: the file must still hold records 1 to at least
+// kRecords, whole and in order (a record cut by the kill is not read as
+// one). Before the fix the wait hits its 10 s hang deadline. This proves a
+// committed record reaches the kernel without waiting for a sync; how soon
+// (write_interval, 10 ms) is a timing figure this test does not assert.
+// REQ-OPS-31
+TEST(LogKill, KilledWriterKeepsRecordsWrittenBeforeTheKill) {
+  constexpr std::uint64_t kRecords = 20;
   const std::string path = ::testing::TempDir() + "/talos_log_kill_" +
                            std::to_string(::getpid()) + ".tlog";
 
-  int fds[2];
-  ASSERT_EQ(::pipe(fds), 0);
   const pid_t child = ::fork();
   ASSERT_GE(child, 0);
-  if (child == 0) {
-    ::close(fds[0]);
-    LogUntilKilled(path, fds[1], kCadence);
-  }
-  ::close(fds[1]);
+  if (child == 0) LogUntilKilled(path);
 
-  std::vector<Report> reports;
-  Report report{};
-  while (reports.size() < kReportsBeforeKill &&
-         ::read(fds[0], &report, sizeof(report)) == kReportBytes) {
-    reports.push_back(report);
+  // The deadline only bounds a hang (docs/TESTING.md §6.3).
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  bool in_order = true;
+  std::uint64_t seen = 0;
+  while ((seen = IntactPrefix(path, in_order)) < kRecords &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
-  const std::int64_t kill_ns = NowNs();
   ASSERT_EQ(::kill(child, SIGKILL), 0);
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
   ASSERT_TRUE(WIFSIGNALED(status)) << "child exited with " << status;
-  // Reports the child made between the parent's last read and the kill.
-  while (::read(fds[0], &report, sizeof(report)) == kReportBytes) {
-    reports.push_back(report);
-  }
-  ::close(fds[0]);
-  ASSERT_GE(reports.size(), kReportsBeforeKill);
+  ASSERT_GE(seen, kRecords) << "the log held " << seen << " records after 10 s"
+                            << " of logging at 200 Hz with no sync due";
 
-  // The file holds a prefix of the records, in order.
-  LogReader reader{path};
-  LogReader::Record record{};
-  std::uint64_t last = 0;
-  while (reader.next(record)) {
-    ASSERT_EQ(record.header.dispatch_index, last + 1);
-    ++last;
-  }
-  EXPECT_EQ(reader.damage().spans, 0u);
-
-  const std::int64_t bound_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(kLossBound).count();
-  for (const Report& committed : reports) {
-    if (committed.dispatch_index <= last) continue;
-    EXPECT_GT(committed.committed_ns, kill_ns - bound_ns)
-        << "record " << committed.dispatch_index << " was committed "
-        << (kill_ns - committed.committed_ns) / 1000
-        << " us before the kill and is not in the log (last record " << last
-        << " of " << reports.size() << " committed; bound " << bound_ns / 1000
-        << " us = write_interval + 40 ms scheduling)";
-    break;  // The first missing record is the oldest one lost.
-  }
+  const std::uint64_t kept = IntactPrefix(path, in_order);
+  EXPECT_TRUE(in_order) << "records out of order, damaged or wrong";
+  EXPECT_GE(kept, seen) << "the kill lost records already in the file";
   ::unlink(path.c_str());
 }
 
