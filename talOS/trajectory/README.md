@@ -4,7 +4,8 @@ Time-indexed holonomic trajectories, a loader for [Choreo](https://choreo.autos)
 `.traj` files, alliance flips, and `HolonomicFollower`, which turns a
 trajectory and a measured pose into a chassis speed. A library beside the node
 stack: it depends on `talOS/geometry` and `@nlohmann_json` only, never on
-`talOS/node` or a robot. REQ-RT-06 covers the per-tick calls.
+`talOS/node` or a robot. REQ-DEV-13 (loading), REQ-DEV-14 (markers, flip) and REQ-DEV-15 (follower)
+state what it does; REQ-RT-06 covers the per-tick calls.
 
 ```cpp
 #include "talOS/trajectory/choreo.h"

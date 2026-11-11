@@ -196,4 +196,6 @@ the library's share of the node test matrix (docs/TESTING.md §7) and each
 feature: stall and absolute homing (including a reset), gravity for elevator
 and arm, turret wrap, at-goal and at-speed edges, spin-down, faults, the
 roller's phases. Limit-switch homing and the travel clamp are tested through
-`examples/superstructure`'s elevator.
+`examples/superstructure`'s elevator. The tests carry the tags of
+REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and
+REQ-SAFE-38 (`RollerWithSensor`).

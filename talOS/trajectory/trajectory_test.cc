@@ -201,6 +201,7 @@ TEST(TrajectoryTest, ConstructorRejectsInvalidInput) {
 // Guards: markers come back in time order, and an EventCursor driven each
 // tick fires every marker exactly once, including one at 0.0 on the first
 // tick and ties together; a cursor that is not reset fires nothing again.
+// REQ-DEV-14
 TEST(TrajectoryTest, EventCursorFiresEachMarkerOnce) {
   std::vector<TrajectorySample> samples(2);
   samples[1].t_s = 3.0;
@@ -313,6 +314,7 @@ void ExpectSameSample(const TrajectorySample& a, const TrajectorySample& b) {
 }
 
 // Guards: each flip maps a blue pose to the red one it names.
+// REQ-DEV-14
 TEST(FlipTest, MapsPosesForEachSymmetry) {
   TrajectorySample s;
   s.x_m = 2.0;
@@ -356,6 +358,7 @@ TEST(FlipTest, MapsPosesForEachSymmetry) {
 // Guards: flipping twice is the identity, and flipping a trajectory commutes
 // with sampling it (velocities and accelerations flip consistently with
 // positions), for both symmetries.
+// REQ-DEV-14
 TEST(FlipTest, RoundTripsAndCommutesWithSampling) {
   const Trajectory trajectory = AnalyticTrajectory();
   for (const AllianceFlip flip :

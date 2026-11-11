@@ -53,6 +53,7 @@ TEST(InterpolatingTable, ExactAtRowsAndLinearBetween) {
 
 // outside the keys a lookup clamps to the end row and says so,
 // so a caller can refuse to shoot.
+// REQ-DEV-16
 TEST(InterpolatingTable, OutOfRangeClampsAndFlags) {
   const Table table(kRows);
   const Table::Lookup below = table.at(0.5);
@@ -68,6 +69,7 @@ TEST(InterpolatingTable, OutOfRangeClampsAndFlags) {
 }
 
 // a NaN key never yields NaN values or an in-range answer.
+// REQ-DEV-16
 TEST(InterpolatingTable, NaNKeyIsOutOfRangeWithFiniteValues) {
   const Table table(kRows);
   const Table::Lookup at = table.at(kNaN);
@@ -86,6 +88,7 @@ TEST(InterpolatingTable, SingleRowIsConstant) {
 
 // bad tables are refused at construction, with the reason and
 // the offending row.
+// REQ-DEV-16
 TEST(InterpolatingTable, ValidationErrors) {
   EXPECT_EQ(Table::Validate({}).error, TableError::kEmpty);
 

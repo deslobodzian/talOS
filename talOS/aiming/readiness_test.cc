@@ -45,6 +45,7 @@ ReadinessInput AllGood() {
 // Every condition can block the shot, and the reason named is the first
 // failing one in the documented order (staleness first; convergence before
 // range, since a non-converged distance means nothing).
+// REQ-DEV-19
 TEST(Readiness, EachConditionBlocksWithItsReasonInOrder) {
   const ReadinessLimits limits = Limits();
   EXPECT_EQ(CheckReadiness(AllGood(), limits), ReadinessReason::kReady);
@@ -82,6 +83,7 @@ TEST(Readiness, EachConditionBlocksWithItsReasonInOrder) {
 // A field the caller never fills blocks the shot: a default input is
 // stale, and with only the age and solution flags filled in each numeric
 // check still fails in turn.
+// REQ-DEV-19
 TEST(Readiness, UnfilledFieldsFail) {
   const ReadinessLimits limits = Limits();
   EXPECT_EQ(CheckReadiness(ReadinessInput{}, limits), ReadinessReason::kStale);
@@ -105,6 +107,7 @@ TEST(Readiness, UnfilledFieldsFail) {
 }
 
 // A pose the gate cannot date, or one from the future, is stale too.
+// REQ-DEV-19
 TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
   const ReadinessLimits limits = Limits();
   ReadinessInput in = AllGood();
@@ -115,6 +118,7 @@ TEST(Readiness, UnknownOrNegativePoseAgeIsStale) {
 }
 
 // A NaN measurement never reads as within tolerance.
+// REQ-DEV-19
 TEST(Readiness, NaNMeasurementFails) {
   const ReadinessLimits limits = Limits();
   ReadinessInput in = AllGood();
@@ -128,6 +132,7 @@ TEST(Readiness, NaNMeasurementFails) {
 // Ready only after every condition has held on settle_tick_count
 // consecutive ticks; one failing tick drops it at once and restarts the
 // count.
+// REQ-DEV-19
 TEST(ReadinessGate, DebouncesInTicksAndDropsImmediately) {
   ReadinessGate gate(Limits(3));
   Readiness r = gate.Update(AllGood(), 10);
@@ -161,6 +166,7 @@ TEST(ReadinessGate, DebouncesInTicksAndDropsImmediately) {
 // Ticks the caller skipped (disabled, paused) do not count: a gap in the
 // tick index, a repeated index or a step back restarts the settle count, so
 // a re-enable cannot report ready without settling again.
+// REQ-DEV-19
 TEST(ReadinessGate, SkippedTicksRestartTheSettleCount) {
   ReadinessGate gate(Limits(3));
   gate.Update(AllGood(), 1);

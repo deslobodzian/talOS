@@ -43,6 +43,9 @@ numbered section, a number in RULES a rule:
 | INSTALL | [INSTALL.md](INSTALL.md) |
 | STU | [studio/README.md](../studio/README.md) |
 | TODO | [TODO.md](../TODO.md) |
+| MECHR | [talOS/mechanisms/README.md](../talOS/mechanisms/README.md) |
+| TRAJR | [talOS/trajectory/README.md](../talOS/trajectory/README.md) |
+| AIMR | [talOS/aiming/README.md](../talOS/aiming/README.md) |
 
 ## Catalogue
 
@@ -85,6 +88,9 @@ numbered section, a number in RULES a rule:
 | REQ-SAFE-33 | An autonomous routine fires each action at most once per match across DS outages, re-enables and restarts, resets only on a new match as R26 "Nodes" defines it, and holds on an unreadable record. | P1 | R26 "Nodes"; METH §9 | `/autonomous/state` phase; lanes | component |
 | REQ-SAFE-34 | Autonomous drive and collection stop on the tick the pose is invalid, unlocalized or stale, while both deadlines keep counting through outages. | P1 | R26 "Nodes"; METH §9 | auto lanes released | component |
 | REQ-SAFE-35 | No viewer path (Studio bridge, Studio agent) writes any topic or sends any hardware frame. | P0 | DF "Processes and links"; TODO "Optional work" | Studio bridge `--describe` has no SENDER; no RTMS writer opened | contract |
+| REQ-SAFE-36 | A `PositionMechanism` drives its motor only on a tick in which its owner called `set_goal` with a finite goal and feedforward, or `hold`, only to the goal clamped to its travel and wrapped, and only in a frame homing has set (limit switch, stall or absolute); once faulted it stays neutral until a Driver Station reports disabled or `clear_fault()`. A bad parameter fails construction naming `<name>.<key>`. | P0 | MECHR "Safety", "PositionMechanism" | motor request mode and demand; `state()` phase | component |
+| REQ-SAFE-37 | A `VelocityMechanism` drives its motor only on a tick with a finite goal from its owner, clamped to the motor's `max_velocity_rps`, and reports at speed only after `at_speed_entry_tick_count` consecutive ticks inside the entry band, keeping it only while the error stays inside the exit band and the asked goal is unchanged. A bad parameter fails construction naming `<name>.<key>`. | P0 | MECHR "Safety", "VelocityMechanism" | motor request mode and demand; `state()` phase | component |
+| REQ-SAFE-38 | A `RollerWithSensor` drives its roller only on a tick with a live request, at its phase's voltage; with none it is neutral while the piece sensor is still tracked and a timed eject or feed still finishes its clock, and an eject or feed newly asked in idle runs at most once per ask however long the button is held. A bad parameter fails construction naming `<name>.<key>`. | P0 | MECHR "Safety", "RollerWithSensor" | motor request mode and voltage; `has_piece()`; phase | component |
 
 ### CONTRACT: wire format, schema identity, C ABI/Python parity, naming/graph rules, config validation
 
@@ -174,8 +180,9 @@ numbered section, a number in RULES a rule:
 | REQ-OPS-23 | Studio shows each client whole producer ticks only, marks stale readings, continues history across a producer restart within a session, and holds all clients within DF's shared radio budget. | P2 | DF "Telemetry, Studio, and the radio boundary"; STU "Freshness" | WebSocket frames; UI state | component |
 | REQ-OPS-24 | The RoboRIO publishes `companion/*` dashboard values and one DS message per change for each link condition HR "RoboRIO" lists. | P1 | HR "RoboRIO" | SmartDashboard values; DS messages | component |
 | REQ-OPS-25 | The controller endpoint resolves `--remote` over `[robot] controller_address` and is passed to `hardware_node` explicitly, and a bundle records each node's binary, the config's hash and the source revision. | P1 | LR "Controller addressing", "Session manifest", "Building" | launcher output; manifests | unit + integration |
+| REQ-OPS-26 | `tlog_to_wpilog` converts the `.tlog` files of one session into one WPILOG that AdvantageScope reads: each publication is one value at its publish time, taken from the writer's log or else a reader's copy, fields are typed entries named by topic and field path, and a `geometry.Pose2d` is also a `double[]` pose array. Damaged records are skipped and a cut log converts its intact records; an unreadable input fails with an error naming the file, and a failed write leaves no output file. | P2 | LR "Converting a session to WPILOG" | `.wpilog` entries, timestamps and values; exit code; output file | unit |
 
-### DEV: scaffold, simulation, describe-only, standalone subsystem
+### DEV: scaffold, simulation, describe-only, standalone subsystem, robot libraries
 
 | ID | Requirement | P | Source | Observable | Cheapest tier |
 |---|---|---|---|---|---|
@@ -191,6 +198,13 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-10 | The physics backend closes the Talon's control loops through gearing and inversion, enforces soft limits and followers, decays neutral per brake mode, and publishes truth on `/sim/state` with deterministic modelled errors. | P2 | HR "Simulation Backends: Ideal vs Physics-Backed" | backend state; `/sim/state` | component |
 | REQ-DEV-11 | Under `--sim`, camera nodes render (`rasterize = true`) or project (`false`) observations from `/sim/state` truth and publish invalid observations without it. | P2 | R26 "Nodes"; HR "Ground truth and odometry error" | `/<camera>/state` validity | component |
 | REQ-DEV-12 | `tools/setup.sh` installs a working dev environment on Linux, macOS and Windows inside WSL2. | P2 | AGENTS.md; INSTALL | `--check` result | integration |
+| REQ-DEV-13 | A Choreo `.traj` of version 1, 2 or 3 loads with its samples, event markers and splits; a malformed, implausible (coordinate beyond 100 m, time outside 0 to 3600 s or not increasing) or unsupported file, or a missing one, is refused with an error naming the file and the JSON location, without throwing or crashing. | P1 | TRAJR "Choreo files" | `LoadResult` fields and error text | unit |
+| REQ-DEV-14 | An `EventCursor` fires each event marker of a trajectory exactly once as time advances, including one at 0.0 on the first tick, and a trajectory flipped for the other alliance is that alliance's path under the game's symmetry (rotate or mirror), flipping twice returning the original. | P1 | TRAJR "`Trajectory`", "Alliance flip" | markers fired per tick; flipped samples | unit |
+| REQ-DEV-15 | A `HolonomicFollower` brings the robot onto the path and recovers from a disturbance, reports `finished` only once the path's time has ended and the pose is within the position and heading tolerances of the final pose, and gives zero speeds with `valid` false, leaving its controller state undisturbed, for a non-finite pose, time or period. | P1 | TRAJR "`HolonomicFollower`" | `FollowerOutput` (`speeds`, `finished`, `valid`) over a simulated run | unit |
+| REQ-DEV-16 | A shot-table lookup outside its measured distances returns the nearest end row's values and reports itself out of range, and at a NaN distance returns the first row's values, finite and out of range; a table with no rows, a non-finite key or value, unsorted or duplicate keys, or more rows than its capacity is refused at construction, naming the row. | P1 | AIMR "Frames, signs, units"; "Tuning a table from field shots" | `Lookup` (`values`, `in_range`); exception text | unit |
+| REQ-DEV-17 | For a robot moving at a constant field velocity and yaw rate, the `TargetSolver`'s commanded aim makes a ball that follows the shot table land within 2 cm of the target whenever the solve reports `converged` and `in_range`; a solve that does not settle within `max_iteration_count` returns its last iterate with `converged` false; a non-finite input or degenerate geometry gives `valid` false; no output is NaN and a solve allocates nothing. | P1 | AIMR "The maths", "Shooting on the move" | `Solution` against a simulated ball; `AllocationProbe` | unit |
+| REQ-DEV-18 | A turret solution is the equivalent angle inside the turret's travel nearest its measured angle; when the target is unreachable it holds a travel limit (the one the needed angle just crossed within `seam_hysteresis_rad`, else the one nearest the turret), so noise on the needed angle never commands the turret across its travel. | P1 | AIMR "Frames, signs, units" | `Solution.turret_rad`, `turret_reachable` | unit |
+| REQ-DEV-19 | The `ReadinessGate` reports ready only when a fresh, valid, converged, in-range and turret-reachable solution, a robot slower than its speed and spin limits and every measured error within tolerance have held on `settle_tick_count` consecutive caller ticks; an unset, NaN, stale or failing input, or a skipped tick, withholds or drops readiness at once, reporting the first failing reason. | P1 | AIMR "Readiness" | `ReadinessGate::Update` result and reason | unit |
 
 ## Package scope
 
@@ -209,7 +223,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/protocol` | REQ-CONTRACT-01, REQ-CONTRACT-03 |
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-CONTRACT-10, REQ-CONTRACT-17 |
-| `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-DEV-04 |
+| `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-26 (`tlog_to_wpilog`), REQ-DEV-04 |
 | `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-RT-18, REQ-OPS-17, REQ-OPS-18 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09 |
@@ -217,11 +231,11 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27 |
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22 |
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
-| `talOS/trajectory` | REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`) |
-| `talOS/mechanisms` | REQ-SAFE-01, REQ-SAFE-02, REQ-SAFE-04, REQ-SAFE-05 through the node test matrix, REQ-RT-06 |
+| `talOS/trajectory` | REQ-DEV-13 to REQ-DEV-15; REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`) |
+| `talOS/mechanisms` | REQ-SAFE-36 to REQ-SAFE-38; REQ-SAFE-01, REQ-SAFE-02, REQ-SAFE-04, REQ-SAFE-05 through the node test matrix, REQ-RT-06 |
 | `talOS/vision` (CPU pipeline, capture, `field_sim`) | REQ-CONTRACT-27, REQ-DEV-11 |
 | `talOS/vision/metal`, `talOS/vision/recording` | none in the catalogue (TODO.md SCOPE-1) |
-| `talOS/aiming` | none in the catalogue (TODO.md AIM-1) |
+| `talOS/aiming` | REQ-DEV-16 to REQ-DEV-19 |
 | `2026-robot/main_processor/{shooter,drivetrain,intake}` | REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-SAFE-31, REQ-SAFE-32 (intake), REQ-CONTRACT-25 |
 | `2026-robot/main_processor/driver` | REQ-SAFE-14, REQ-SAFE-31 |
 | `2026-robot/main_processor/autonomous` | REQ-SAFE-31, REQ-SAFE-33, REQ-SAFE-34 |

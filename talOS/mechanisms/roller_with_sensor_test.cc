@@ -143,6 +143,7 @@ struct Rig {
 
 // REQ-SAFE-01: intake until the sensor sees a piece, hold it with hold_v, eject
 // for eject_us, then idle neutral.
+// REQ-SAFE-38
 TEST(RollerWithSensor, DrivesAtALiveLane) {
   Rig intake{"intake"};
   intake.Start();
@@ -174,6 +175,7 @@ TEST(RollerWithSensor, DrivesAtALiveLane) {
 // With idle_runs, an eject asked in kIdle runs once however long it is
 // held; asking again (after another command) runs it again. Without it
 // (the indexer) kIdle ignores an eject.
+// REQ-SAFE-38
 TEST(RollerWithSensor, IdleRunsAnEjectOncePerAsk) {
   Rig intake{"intake"};
   intake.Start();
@@ -236,6 +238,7 @@ TEST(RollerWithSensor, InvertedDebouncedSensorAndNoHoldVoltage) {
 
 // REQ-SAFE-02: a disabled robot drives nothing, while the state machine keeps
 // the held piece.
+// REQ-SAFE-38
 TEST(RollerWithSensor, DisabledRobotGoesNeutral) {
   Rig intake{"intake"};
   intake.Sensor("beam", true);
@@ -252,6 +255,7 @@ TEST(RollerWithSensor, DisabledRobotGoesNeutral) {
 
 // REQ-SAFE-07: a stale or released target drives nothing; a timed eject still
 // finishes its clock, without driving.
+// REQ-SAFE-38
 TEST(RollerWithSensor, StaleLaneGoesNeutral) {
   Rig intake{"intake"};
   intake.Start();
@@ -291,6 +295,7 @@ TEST(RollerWithSensor, UpdateDoesNotAllocate) {
 }
 
 // Each bad parameter throws at construction, naming the key.
+// REQ-SAFE-38
 TEST(RollerWithSensor, BadParameterFailsConstruction) {
   const auto add = [](const std::string& table) {
     auto sim = Sim::FromToml(std::string{R"(

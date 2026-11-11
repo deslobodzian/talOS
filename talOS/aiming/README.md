@@ -3,7 +3,7 @@
 Shooter aiming maths as a library: where to point, how fast to spin, and
 whether to fire, for a robot standing still or moving. No node, no topics,
 no clock: a node feeds it a pose and publishes the results. No node uses it
-yet, and no requirement in docs/REQUIREMENTS.md names it (TODO.md AIM-1). `//talOS/aiming`, include
+yet (TODO.md AIM-1). It serves REQ-DEV-16 to REQ-DEV-19. `//talOS/aiming`, include
 `talOS/aiming/target_solver.h` and `talOS/aiming/readiness.h`.
 
 | Piece | Header | What it does |
@@ -208,5 +208,5 @@ debounce.
   undated poses, NaN, tick debounce, skipped ticks and reset, limit
   validation.
 
-The tests carry no `REQ-` tag: no catalogue requirement covers aiming yet
-(TODO.md AIM-1).
+The tests carry the tags of REQ-DEV-16 (table), REQ-DEV-17 (solver),
+REQ-DEV-18 (turret) and REQ-DEV-19 (readiness).

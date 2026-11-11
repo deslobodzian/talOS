@@ -904,6 +904,7 @@ AdvantageScope and WPILib's DataLogTool open. It reads and merges the logs
 with the same reader and `MergeLogs` as `log_dump`, decodes payloads from the
 schemas the logs carry (no recording build needed), and writes the file with
 its own small writer (`wpilog.h`; no WPILib dependency). Offline only.
+REQ-OPS-26 states what it guarantees.
 
 ```sh
 bazel run //talOS/launcher:tlog_to_wpilog -- /tmp/talos_logs/<session> \
