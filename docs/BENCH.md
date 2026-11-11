@@ -224,13 +224,17 @@ sleep precision. Releasing a lane is not a mechanical brake.
   restart count and recovery behavior; no automatic motion is acceptable.
 - [ ] Stall the RoboRIO loop (its watchdog). Over SSH on the RoboRIO as
   `admin`, record every thread's scheduling class and realtime priority
-  (`ps -eLo pid,tid,cls,rtprio,comm`): the robot program's loop thread
-  (default, `TS`), `talos_watchdog` (`FF` 30), the CAN and Driver Station
-  (netcomm) threads and the interrupt threads; note whether `talos_watchdog`
-  sits above the threads that carry CAN frames. While applying a small
-  voltage, starve every default-scheduled thread with one `SCHED_FIFO` 20
-  spinner per core for a measured 300 ms:
-  `for c in 0 1; do taskset -c $c chrt -f 20 timeout 0.3 sh -c 'while :; do :; done' & done; wait`
+  (`ps -eLo pid,tid,cls,rtprio,comm`): the robot program's loop thread (its
+  main thread, named after the program, `FF` 20, below the watchdog),
+  `talos_watchdog` (`FF` 30), the robot program's other threads (`TS`), the
+  CAN and Driver Station (netcomm) threads, Phoenix's threads and the
+  interrupt threads; note whether `talos_watchdog` sits above the threads
+  that carry CAN frames and whether any thread runs between `FF` 20 and 30,
+  and record `cat /proc/sys/kernel/sched_rt_runtime_us`. While applying a
+  small voltage, starve the loop and every default-scheduled thread with one
+  `SCHED_FIFO` 25 spinner per core (above the loop, below the watchdog) for a
+  measured 300 ms:
+  `for c in 0 1; do taskset -c $c chrt -f 25 timeout 0.3 sh -c 'while :; do :; done' & done; wait`
   (if the image lacks `taskset` or `chrt`, record that and skip). Expected:
   the motor goes neutral within two loop periods plus 5 ms of the command's
   expiry (`command_timeout_us`, 100 ms, after the older of its acceptance and
@@ -247,14 +251,18 @@ sleep precision. Releasing a lane is not a mechanical brake.
   check of whether a lapse in the program's mode reports disables it, so
   note which threads the listing shows the spinners also starved. Disable
   and release before any re-enable.
-- [ ] RoboRIO loop priority. The loop runs at default scheduling. In the
-  same enabled session as the representative captures below, record the RIO
-  console's late-tick and longest-interval summaries over several minutes
-  of driving, then repeat the session and the stall check above with a
-  disposable build whose loop thread calls
-  `frc::SetCurrentThreadPriority(true, 20)` (below the watchdog's 30) before
-  its loop. Record late ticks, Driver Station and CAN health under both;
-  the decision is TODO.md RT-5.
+- [ ] RoboRIO loop priority. The loop runs at `SCHED_FIFO` 20; its start
+  line on the RIO console must read `hardware gateway loop SCHED_FIFO 20`.
+  In the same enabled session as the representative captures below, record
+  the RIO console's loop timing lines (overruns, late ticks, max work, max
+  interval) over 10 minutes of driving with an ssh session running `top` on
+  the RoboRIO, and the gateway's State sample intervals (p50, p90, p99, max)
+  from the session. Then `touch /home/lvuser/talos_loop_default_sched`,
+  restart robot code (the start line must read `hardware gateway loop
+  SCHED_OTHER 0 (/home/lvuser/talos_loop_default_sched present)`), repeat
+  the session and the stall check above, and `rm` the file. Record late
+  ticks, State intervals, Driver Station and CAN health under both; the
+  decision is TODO.md RT-5.
 - [ ] Per-device tick cost. With the one motor configured and the robot
   disabled, record three consecutive `[rio] tick phases` console lines
   (one per 10 s; [format](../talOS/hardware/README.md)): each phase's mean
