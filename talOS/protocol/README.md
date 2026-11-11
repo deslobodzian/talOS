@@ -38,8 +38,9 @@ decoding. Clock probes do not authorize actuation and work while disabled.
 - explicit sequence numbers and sequence-gap counters;
 - version/header validation before payload interpretation;
 - DSCP EF (`0xB8`) requested through `IP_TOS` where the OS honors it;
-- a send never raises `SIGPIPE` (`SO_NOSIGPIPE` on macOS, `MSG_NOSIGNAL` on
-  Linux): a socket that can no longer send fails it with `kSocketError` and
+- a send never raises `SIGPIPE` (`MSG_NOSIGNAL` on every send where the SDK
+  defines it, Linux and current macOS SDKs, and `SO_NOSIGPIPE` on the socket
+  on macOS, which alone covers an SDK without `MSG_NOSIGNAL`): a socket that can no longer send fails it with `kSocketError` and
   the errno in `stats().last_send_error`, and `Reopen()` replaces the socket
   on the same addresses and ports, keeping the send sequence and stats. The
   bridge's use of it is in the
