@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -29,13 +30,24 @@
 
 namespace talos::vision {
 namespace {
+// The duration to set for `fps` in `range`, or nullopt (FrameDurationFor).
+std::optional<CMTime> Duration(double fps, AVFrameRateRange* range) {
+  const auto duration = FrameDurationFor(
+      fps, range.minFrameRate, range.maxFrameRate,
+      {range.minFrameDuration.value, range.minFrameDuration.timescale},
+      {range.maxFrameDuration.value, range.maxFrameDuration.timescale});
+  if (!duration) return std::nullopt;
+  return CMTimeMake(duration->value, duration->timescale);
+}
 std::vector<CameraMode> Modes(AVCaptureDevice* device) {
   std::vector<CameraMode> modes;
   for (AVCaptureDeviceFormat* format in device.formats) {
     auto d = CMVideoFormatDescriptionGetDimensions(format.formatDescription);
     for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
-      for (double fps : {15., 30., 60.}) {
-        if (fps < range.minFrameRate || fps > range.maxFrameRate) continue;
+      for (double fps : {15., 30., 60., 90., 100., 120.,
+                         std::round(range.minFrameRate),
+                         std::round(range.maxFrameRate)}) {
+        if (!Duration(fps, range)) continue;
         CameraMode mode{static_cast<uint32_t>(d.width),
                         static_cast<uint32_t>(d.height), fps,
                         PixelFormat::kBgra8};
@@ -146,13 +158,11 @@ class Source final : public CameraSource {
             CMVideoFormatDescriptionGetDimensions(format.formatDescription);
         if (d.width != mode_.width || d.height != mode_.height) continue;
         for (AVFrameRateRange* range in format.videoSupportedFrameRateRanges) {
-          if (mode_.fps < range.minFrameRate || mode_.fps > range.maxFrameRate)
-            continue;
+          const auto duration = Duration(mode_.fps, range);
+          if (!duration) continue;
           device_.activeFormat = format;
-          device_.activeVideoMinFrameDuration = CMTimeMake(
-              1000, static_cast<int32_t>(std::lround(mode_.fps * 1000.0)));
-          device_.activeVideoMaxFrameDuration =
-              device_.activeVideoMinFrameDuration;
+          device_.activeVideoMinFrameDuration = *duration;
+          device_.activeVideoMaxFrameDuration = *duration;
           selected = true;
           break;
         }

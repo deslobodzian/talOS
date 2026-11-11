@@ -70,6 +70,49 @@ TEST(Capture, LinuxExposureUsesDeviceUnitsAndReportsFailures) {
   EXPECT_EQ(writes[0].second, V4L2_EXPOSURE_AUTO);
 }
 #endif
+TEST(Capture, FrameDurationIsOneTheRangeAccepts) {
+  // An Arducam OV9281 (UVC) reports single-rate ranges through AVFoundation,
+  // measured: 1 / fps itself (1000 / 60000) is refused with an exception.
+  struct Range {
+    double min_fps, max_fps;
+    FrameDuration shortest, longest;
+  };
+  constexpr FrameDuration k30{1000000, 30000030}, k60{1000000, 60000240},
+      k120{1000000, 120000480}, k100{1000000, 100000000};
+  const Range uvc30{30.000030000030002, 30.000030000030002, k30, k30};
+  const Range uvc60{60.000240000960005, 60.000240000960005, k60, k60};
+  const Range uvc120{120.00048000192001, 120.00048000192001, k120, k120};
+  const Range uvc100{100, 100, k100, k100};
+  // A continuous range; its slow end is 3.75 fps as a UVC interval.
+  const Range wide{3.7500009375002343, 30, {1, 30}, {2666666, 10000000}};
+  const struct {
+    double fps;
+    Range range;
+    std::optional<FrameDuration> expected;
+  } cases[] = {
+      {30, uvc30, k30},
+      {60, uvc60, k60},
+      {120, uvc120, k120},
+      {100, uvc100, k100},
+      {60, uvc30, std::nullopt},
+      {59.9, uvc60, std::nullopt},
+      {120.1, uvc120, std::nullopt},
+      {15, wide, FrameDuration{1000, 15000}},
+      {30, wide, FrameDuration{1, 30}},
+      {3.75, wide, FrameDuration{2666666, 10000000}},
+      // 1 / fps would be 1000 / 3750, longer than the range allows.
+      {3.7504, wide, FrameDuration{2666666, 10000000}},
+      {3.7, wide, std::nullopt},
+      {31, wide, std::nullopt},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(testing::Message() << c.fps << " fps in [" << c.range.min_fps
+                                    << ", " << c.range.max_fps << "]");
+    EXPECT_EQ(FrameDurationFor(c.fps, c.range.min_fps, c.range.max_fps,
+                               c.range.shortest, c.range.longest),
+              c.expected);
+  }
+}
 TEST(Capture, MissingDeviceFailsAndStopIsIdempotent) {
   CameraSourceConfig config;
   config.device_path = "/talos-nonexistent-camera-device";
