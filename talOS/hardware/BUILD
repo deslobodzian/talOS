@@ -35,6 +35,10 @@ cc_library(
         "config_error.h",
         "config_wire.h",
         "endpoint.h",
+        # Shared gating predicates, for the gateway and for hardware-owning
+        # nodes: pure functions over State, so gate_test needs no loop and no
+        # transport.
+        "gate.h",
         "gateway.h",
         "messages.h",
         "packet.h",
@@ -80,21 +84,12 @@ cc_test(
     ],
 )
 
-# Shared gating predicates for hardware-owning subsystem nodes: pure
-# functions over State, so the test needs no loop and no transport.
-cc_library(
-    name = "gate",
-    hdrs = ["gate.h"],
-    visibility = ["//visibility:public"],
-    deps = [":hardware"],
-)
-
 cc_test(
     name = "gate_test",
     size = "small",
     srcs = ["gate_test.cc"],
     deps = [
-        ":gate",
+        ":hardware",
         "@googletest//:gtest_main",
     ],
 )

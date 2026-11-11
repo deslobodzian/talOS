@@ -208,12 +208,21 @@ class FakeBackend : public Backend {
       if (const auto it = positions.find(m.id); it != positions.end()) {
         m.position_rot = it->second;
       }
+      m.position_age_us = m.velocity_age_us = age_us;
       if (const auto it = position_ages.find(m.id); it != position_ages.end()) {
         m.position_age_us = it->second;
+      }
+      if (const auto it = velocity_ages.find(m.id); it != velocity_ages.end()) {
+        m.velocity_age_us = it->second;
       }
     }
     for (auto& sensor : s.sensors) {
       sensor.valid = healthy && sensor.id != invalid_sensor;
+      sensor.position_age_us = sensor.velocity_age_us = age_us;
+      if (const auto it = position_ages.find(sensor.id);
+          it != position_ages.end()) {
+        sensor.position_age_us = it->second;
+      }
     }
     return healthy;
   }
@@ -285,9 +294,13 @@ class FakeBackend : public Backend {
   std::vector<uint16_t> restoring_ids;
   std::vector<uint16_t> unavailable;
   std::optional<ConfigError> config_error{};
-  // Reported motor positions and position ages by id; others keep theirs.
+  // Reported motor positions by id; others keep theirs. Every motor's and
+  // sensor's ages are `age_us`, except a position age (motor or sensor) or a
+  // motor velocity age named here. The fake never judges an age itself: the
+  // gateway does, for every backend.
   std::map<uint16_t, double> positions;
-  std::map<uint16_t, uint32_t> position_ages;
+  uint32_t age_us{};
+  std::map<uint16_t, uint32_t> position_ages, velocity_ages;
 };
 Command Request(const Gateway& g) {
   const auto s = g.snapshot();
@@ -301,6 +314,12 @@ Command Request(const Gateway& g) {
     c.motors[i] = {s.motors[i].id, Mode::kVelocity, 0, 1, 0};
   }
   return c;
+}
+std::size_t MotorIndex(const Config& config, Feedback feedback) {
+  const auto motor = std::find_if(
+      config.motors.begin(), config.motors.end(),
+      [feedback](const auto& m) { return m.feedback == feedback; });
+  return static_cast<std::size_t>(motor - config.motors.begin());
 }
 TEST(Config, ValidatesFollowersAndFingerprintsTheirSettings) {
   auto c = SwerveConfig(true);
@@ -604,6 +623,94 @@ TEST(Gateway, InvalidRemoteFeedbackIsolatesOnlyItsMotor) {
   EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, 1u);
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
 }
+
+// The bench's CAN silences froze every device's feedback for 64-66 ms
+// (TODO.md RESET-3). Feedback younger than command_timeout_us still counts:
+// every motor drives, with no fault and no new epoch.
+// REQ-SAFE-22
+TEST(Gateway, LateFeedbackUnderTheTimeoutKeepsDriving) {
+  FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  const auto epoch = g.snapshot().epoch;
+  backend.age_us = 65000;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 6000));
+  for (std::size_t i = 0; i < config.motors.size(); ++i) {
+    EXPECT_EQ(backend.last_requests[i].mode, Mode::kVelocity)
+        << config.motors[i].name;
+  }
+  const auto s = g.snapshot();
+  EXPECT_FALSE(s.flags & kHardwareFault);
+  EXPECT_EQ(s.epoch, epoch);
+  EXPECT_EQ(s.counters.neutralized_motor_count, 0u);
+}
+
+// A position or velocity sample command_timeout_us old, of a motor or of the
+// remote CANcoder a motor steers by, is invalid whatever the backend says:
+// that motor goes neutral and is counted, the rest drive, and with other
+// devices still valid it is no hardware fault.
+// REQ-SAFE-22
+TEST(Gateway, FeedbackAtTheTimeoutIsolatesItsMotor) {
+  const auto config = SwerveConfig(true);
+  const auto drive = MotorIndex(config, Feedback::kRotor);
+  const auto steer = MotorIndex(config, Feedback::kRemoteCANcoder);
+  const uint16_t drive_id = config.motors[drive].id;
+  const uint16_t encoder_id = config.motors[steer].feedback_sensor_id;
+  for (int row = 0; row < 3; ++row) {
+    SCOPED_TRACE(row == 0   ? "motor position age"
+                 : row == 1 ? "motor velocity age"
+                            : "remote CANcoder position age");
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    const uint32_t bound = config.command_timeout_us;
+    if (row == 0) backend.position_ages[drive_id] = bound;
+    if (row == 1) backend.velocity_ages[drive_id] = bound;
+    if (row == 2) backend.position_ages[encoder_id] = bound;
+    const std::size_t isolated = row == 2 ? steer : drive;
+    g.Tick(6000, true);
+    ASSERT_TRUE(g.Accept(Request(g), 1, 6000));
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      EXPECT_EQ(backend.last_requests[i].mode,
+                i == isolated ? Mode::kNeutral : Mode::kVelocity)
+          << config.motors[i].name;
+    }
+    const auto s = g.snapshot();
+    EXPECT_EQ(s.counters.neutralized_motor_count, 1u);
+    EXPECT_FALSE(s.flags & kHardwareFault);
+  }
+}
+
+// Every motor and CAN sensor command_timeout_us old is total loss, though the
+// backend reports each sample valid: the State carries the hardware fault,
+// the epoch advances and outputs go neutral, so a command built before the
+// loss never drives after the feedback returns.
+// REQ-SAFE-22, REQ-SAFE-18
+TEST(Gateway, EveryDeviceAtTheTimeoutIsTotalLoss) {
+  FakeBackend backend;
+  const auto config = SwerveConfig(true);
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  const auto before = Request(g);
+  ASSERT_TRUE(g.Accept(before, 1, 1000));
+  const auto epoch = g.snapshot().epoch;
+  const int neutrals = backend.neutral;
+  backend.age_us = config.command_timeout_us;
+  g.Tick(6000, true);
+  const auto s = g.snapshot();
+  EXPECT_TRUE(s.flags & kHardwareFault);
+  EXPECT_FALSE(s.flags & kCommandActive);
+  EXPECT_GT(s.epoch, epoch);
+  EXPECT_GT(backend.neutral, neutrals);
+  backend.age_us = 0;
+  g.Tick(11000, true);
+  EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+  EXPECT_FALSE(g.Accept(before, 2, 11000));
+  EXPECT_TRUE(g.Accept(Request(g), 3, 11000));
+}
+
 TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -1636,13 +1743,6 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].voltage, 0.0);
-}
-
-std::size_t MotorIndex(const Config& config, Feedback feedback) {
-  const auto motor = std::find_if(
-      config.motors.begin(), config.motors.end(),
-      [feedback](const auto& m) { return m.feedback == feedback; });
-  return static_cast<std::size_t>(motor - config.motors.begin());
 }
 
 // A TalonFX reset restarts its rotor position at zero, and the restarted

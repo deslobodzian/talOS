@@ -25,7 +25,6 @@ cc_library(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/hardware",
-        "//talOS/hardware:gate",
         "//talOS/introspection:names",
         "//talOS/node",
     ],

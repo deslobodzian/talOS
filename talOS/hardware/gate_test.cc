@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace talos::hardware {
@@ -45,6 +46,17 @@ TEST(GateTest, AcceptStateRejectsOtherConfigAndStaleSamplesOfOneBoot) {
   // A new boot restarts the clock.
   older.boot_id = 4;
   EXPECT_TRUE(AcceptState(true, prev, 7, older));
+}
+
+// REQ-SAFE-22
+TEST(GateTest, FeedbackFreshBoundary) {
+  constexpr uint64_t kTimeoutUs = 100000;
+  EXPECT_TRUE(FeedbackFresh(kTimeoutUs - 1, kTimeoutUs));
+  EXPECT_FALSE(FeedbackFresh(kTimeoutUs, kTimeoutUs));
+  // Unknown is stale under any bound, even one above every reportable age.
+  constexpr uint32_t kUnknown = std::numeric_limits<uint32_t>::max();
+  EXPECT_FALSE(FeedbackFresh(kUnknown, kTimeoutUs));
+  EXPECT_FALSE(FeedbackFresh(kUnknown, uint64_t{kUnknown} + 1));
 }
 
 TEST(GateTest, GatewayReadyNeedsConfiguredAndEnabledWithoutFault) {

@@ -324,7 +324,13 @@ repeat failures do not count as `apply_failure_count`, but the motor stays
 invalid and its demands count in `neutralized_motor_count`.
 
 Fault scope: stale motor current/voltage zeroes the effort fields but keeps the
-sample valid; an invalid RIO encoder invalidates only that sample. Invalid motor
+sample valid; an invalid RIO encoder invalidates only that sample. A motor's or
+CAN sensor's motion feedback is invalid when the backend reports a signal
+error, a non-finite value or an isolated device, or when its position or
+velocity sample is `command_timeout_us` old or older (an unknown age,
+`UINT32_MAX`, included); the gateway applies that age bound after
+`Backend::Read`, the same for every backend (`FeedbackFresh`, `gate.h`), so a
+shorter gap in the feedback stops nothing. Invalid motor
 motion feedback neutralizes only that motor's non-neutral demands. A missing or
 invalid remote CANcoder also neutralizes only motors using it; healthy motors in
 the same command continue driving. These neutralizations increment
