@@ -71,6 +71,18 @@ class SessionReportTest(unittest.TestCase):
                           "session_report: strict: target age at tick: NOT MEASURED"])
         self.assertIn("robot never enabled", result.stdout)
 
+    # REQ-RT-20, REQ-OPS-16: an owner timeout's neutral command adopts State
+    # S; the node resumes with a request observing S after that command. The
+    # request is not what the command reacted to, so it yields no sample (and
+    # never a negative one).
+    def test_a_request_after_its_command_is_no_reaction(self):
+        def send(topic, now):
+            return dict(process="hardware_node", kind="SEND", topic=topic, now_ms=now,
+                        hardware={"boot_id": 1, "observed_time_us": 5000})
+        _, delays = session_report.request_to_command(
+            [send("/hw/command", 10.0), send("/hw/request/lift", 12.0)])
+        self.assertEqual(delays, [])
+
     def test_strict_names_a_damaged_log_and_its_offset(self):
         files = runfiles.Create()
         fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
