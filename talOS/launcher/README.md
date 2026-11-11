@@ -244,8 +244,9 @@ Every key shown is optional. The watched topic comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`
 overrides `[studio] http_port` for one run. The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
-`[studio] webroot`, or the bridge cannot start and the session runs on
-without Studio (below). The bridge answers `--describe`
+`[studio] webroot`. The bridge needs both the binary (`[studio] bridge`,
+resolved under `bazel-bin/` like a node's) and the webroot: with either missing the bridge cannot start and the session
+runs on without Studio (below). An installed bundle contains neither. The bridge answers `--describe`
 like any other node, and the launcher starts it with the session's `graph.json`
 as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
 and stderr land in `<output_dir>/<session_id>/studio_bridge.log`

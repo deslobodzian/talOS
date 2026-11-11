@@ -336,7 +336,9 @@ error, a non-finite value or an isolated device, or when its position or
 velocity sample is `command_timeout_us` old or older (an unknown age,
 `UINT32_MAX`, included); the gateway applies that age bound after
 `Backend::Read`, the same for every backend (`FeedbackFresh`, `gate.h`), so a
-shorter gap in the feedback stops nothing. Invalid motor
+gap shorter than that bound does not invalidate the feedback at the gateway;
+a consumer's own, tighter age bound still applies (the drivetrain drops
+odometry samples older than 50 ms, see its [README](../../2026-robot/main_processor/drivetrain/README.md)). Invalid motor
 motion feedback neutralizes only that motor's non-neutral demands. A missing or
 invalid remote CANcoder also neutralizes only motors using it; healthy motors in
 the same command continue driving. These neutralizations increment
