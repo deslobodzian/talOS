@@ -211,7 +211,7 @@ class SyncManifestTest(unittest.TestCase):
         with open(manifest, encoding="utf-8") as f:
             self.assertEqual(f.read(), original)
 
-    # REQ-CONTRACT-19: a [trajectories] file is a config dependency, so the
+    # REQ-CONTRACT-19, REQ-CONTRACT-31: a [trajectories] file is a config dependency, so the
     # bundle ships it and a manifest that omits it is stale.
     def test_trajectory_file_is_listed_and_its_omission_is_stale(self):
         sync_manifest.write(self.root, "bot/robot.toml")
