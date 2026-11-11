@@ -91,6 +91,11 @@ TEST(RioLog, FaultTogglesCoalesceToOneLinePerSecondPerMotor) {
   ASSERT_TRUE(log.Post(FaultChange(3, kSupplyLimit, 0)));
   log.Drain(0);
   ASSERT_EQ(lines.size(), 1u);
+  // The limiter engaging is a limit acting as configured, not a fault
+  // (hardware::kMotorNotFaultFlags).
+  EXPECT_NE(lines[0].find("limit raised=[SupplyCurrLimit"), std::string::npos)
+      << lines[0];
+  EXPECT_NE(lines[0].find("faults=[none]"), std::string::npos) << lines[0];
 
   // 50 Hz of toggles through three full seconds, drained every 20 ms.
   uint32_t flags = kSupplyLimit;

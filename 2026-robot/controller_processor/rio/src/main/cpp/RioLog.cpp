@@ -6,6 +6,8 @@
 #include <cstring>
 #include <sstream>
 
+#include "hardware/messages.h"
+
 #ifdef __linux__
 #include <pthread.h>
 #include <sys/resource.h>
@@ -398,17 +400,25 @@ std::string RioLog::Format(const LogEvent& e) {
   std::ostringstream out;
   switch (e.kind) {
     case LogKind::kMotorFault: {
+      // A limit or current limiter acting as configured is reported as a
+      // limit, never as a fault (hardware::kMotorNotFaultFlags).
+      constexpr uint32_t kLimits = hardware::kMotorNotFaultFlags;
       const uint32_t raised = e.value & ~e.previous;
       const uint32_t cleared = e.previous & ~e.value;
       out << "[phoenix] motor " << e.name << " (mask_bit=" << e.index
           << ", id=" << e.id << ", bus=" << e.bus << ", can_id=" << e.can_id
-          << ") fault_flags=0x" << std::hex << e.value << " (was 0x"
-          << e.previous << ")" << std::dec;
-      if (raised != 0)
-        out << " raised=[" << DecodeTalonFaultBits(raised) << "]";
-      if (cleared != 0)
-        out << " cleared=[" << DecodeTalonFaultBits(cleared) << "]";
-      out << " active=[" << DecodeTalonFaultBits(e.value) << "]"
+          << ") flags=0x" << std::hex << e.value << " (was 0x" << e.previous
+          << ")" << std::dec;
+      const auto changed = [&out](const char* label, uint32_t bits) {
+        if (bits != 0)
+          out << " " << label << "=[" << DecodeTalonFaultBits(bits) << "]";
+      };
+      changed("fault raised", raised & ~kLimits);
+      changed("fault cleared", cleared & ~kLimits);
+      changed("limit raised", raised & kLimits);
+      changed("limit cleared", cleared & kLimits);
+      out << " faults=[" << DecodeTalonFaultBits(e.value & ~kLimits) << "]"
+          << " limits=[" << DecodeTalonFaultBits(e.value & kLimits) << "]"
           << " pos=" << e.a << " rot vel=" << e.b << " rps V=" << e.c
           << "V I=" << e.d << "A (limits: supply=" << e.limit1
           << "A stator=" << e.limit2 << "A)";

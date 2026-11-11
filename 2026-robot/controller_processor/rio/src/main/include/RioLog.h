@@ -15,8 +15,8 @@
 // That one thread enforces the command timeout and DIO/PWM neutral
 // (Gateway::Tick); LoopWatchdog only backstops it once it stops ticking with
 // a command in force. A report written from it (std::cerr is unit-buffered:
-// one write syscall per <<) can block on the console, and fault bits such as
-// the current limits toggle at the fault-field rate while the robot
+// one write syscall per <<) can block on the console, and FaultField bits such
+// as the current limits toggle at the fault-field rate while the robot
 // accelerates hard. So the loop thread only copies a fixed-size
 // LogEvent into a preallocated bounded queue, never waiting: a full queue
 // drops the event and counts it. A low-priority logger thread formats and
@@ -57,7 +57,8 @@ enum class TickPhase : uint8_t {
 std::string ConsoleTime(uint64_t steady_us);
 
 enum class LogKind : uint8_t {
-  kMotorFault,      // fault field changed: value, previous, motion sample
+  kMotorFault,      // FaultField (faults and limits) changed: value,
+                    // previous, motion sample
   kMotorFeedback,   // motion feedback valid/invalid (flag = valid)
   kSensorFeedback,  // CAN sensor feedback valid/invalid (flag = valid)
   kMotorFaultMask,  // faulted-motor mask changed: value, previous
