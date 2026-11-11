@@ -9,11 +9,18 @@
 // mapping, the clock and the caveats are in talOS/launcher/README.md,
 // "Converting a session to WPILOG".
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -697,7 +704,85 @@ Totals WriteItems(const std::vector<MergedRecord>& records,
   return totals;
 }
 
+// The output is written to a temporary file beside it (same directory, so
+// same filesystem) and renamed over it only once complete, so a failed
+// conversion leaves no partial file and any previous output unchanged.
+// Created before anything is converted: an output that cannot be written
+// fails first. The destructor removes the temporary file unless commit()
+// renamed it into place.
+class TempOutput {
+ public:
+  TempOutput() = default;
+  TempOutput(const TempOutput&) = delete;
+  TempOutput& operator=(const TempOutput&) = delete;
+  ~TempOutput() {
+    if (!path_.empty()) {
+      std::error_code ignored;
+      std::filesystem::remove(path_, ignored);
+    }
+  }
+
+  // Creates the temporary file for `output`; false with `error` set when
+  // `output` is something other than a regular file (a device, a
+  // directory) or its directory cannot take a new file.
+  bool create(const std::string& output, std::string& error) {
+    std::error_code ec;
+    const auto status = std::filesystem::status(output, ec);
+    if (std::filesystem::exists(status) &&
+        !std::filesystem::is_regular_file(status)) {
+      error = "cannot write " + output + ": not a regular file";
+      return false;
+    }
+    const std::filesystem::path target{output};
+    const std::filesystem::path directory = target.has_parent_path()
+                                                ? target.parent_path()
+                                                : std::filesystem::path{"."};
+    std::string pattern =
+        (directory / ("." + target.filename().string() + ".tmp.XXXXXX"))
+            .string();
+    const int fd = ::mkstemp(pattern.data());
+    if (fd < 0) {
+      error = "cannot write " + output + ": " + std::strerror(errno);
+      return false;
+    }
+    path_ = pattern;
+    // mkstemp creates the file 0600; give it what a new file gets.
+    const mode_t mask = ::umask(0);
+    ::umask(mask);
+    const int chmod_result =
+        ::fchmod(fd, static_cast<mode_t>(0666U & ~static_cast<unsigned>(mask)));
+    const int saved = errno;
+    ::close(fd);
+    if (chmod_result != 0) {
+      error = "cannot write " + output + ": " + std::strerror(saved);
+      return false;
+    }
+    return true;
+  }
+
+  const std::string& path() const { return path_; }
+
+  // Renames the temporary file over `output`; false with `error` set.
+  bool commit(const std::string& output, std::string& error) {
+    std::error_code ec;
+    std::filesystem::rename(path_, output, ec);
+    if (ec) {
+      error = "cannot write " + output + ": " + ec.message();
+      return false;
+    }
+    path_.clear();
+    return true;
+  }
+
+ private:
+  std::string path_;
+};
+
 int Convert(const Options& options) {
+  TempOutput temp;
+  std::string error;
+  if (!temp.create(options.output, error)) return Fail(error);
+
   const std::vector<std::string> files = InputFiles(options.inputs);
   if (files.empty()) return Fail("no .tlog files found");
 
@@ -723,38 +808,26 @@ int Convert(const Options& options) {
   }
 
   std::vector<MergedRecord> records;
-  std::string error;
   if (!talos::launcher::MergeLogs(files, records, error)) return Fail(error);
   const std::vector<Item> items = SelectItems(records);
 
-  // Nothing is left behind on failure: the output is removed if it is a
-  // file this run created or replaced (never, say, a device it was given).
-  std::error_code ec;
-  const auto status = std::filesystem::status(options.output, ec);
-  const bool removable = !std::filesystem::exists(status) ||
-                         std::filesystem::is_regular_file(status);
-  std::ofstream out{options.output, std::ios::binary | std::ios::trunc};
+  std::ofstream out{temp.path(), std::ios::binary | std::ios::trunc};
   if (!out) return Fail("cannot write " + options.output);
-  const auto abandon = [&](const std::string& why) {
-    out.close();
-    if (removable) {
-      std::error_code ignored;
-      std::filesystem::remove(options.output, ignored);
-    }
-    return Fail(why);
-  };
   Totals totals;
   try {
     talos::wpilog::Writer writer{
         out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
     totals = WriteItems(records, items, start_ns, writer);
     out.flush();
-    if (!writer.ok() || !out) {
-      return abandon("writing " + options.output + " failed");
+    const bool written = writer.ok() && out.good();
+    out.close();
+    if (!written || out.fail()) {
+      return Fail("writing " + options.output + " failed");
     }
   } catch (const std::exception& e) {
-    return abandon(options.output + ": " + e.what());
+    return Fail(options.output + ": " + e.what());
   }
+  if (!temp.commit(options.output, error)) return Fail(error);
   for (const auto& [topic, why] : totals.skipped) {
     std::fprintf(stderr, "tlog_to_wpilog: skipped %s: %s\n", topic.c_str(),
                  why.c_str());

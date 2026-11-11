@@ -977,9 +977,17 @@ tail is skipped with a warning naming the log, and a log cut inside its
 header is skipped. A file that is not a `.tlog`, a manifest that fails its
 checksum, an unsupported format version, a mismatched session id, or no
 readable log is an error: the converter prints `tlog_to_wpilog: error: ...`
-naming the file and exits 1 without writing the output. A write that fails
-(a full disk) also exits 1, and the partial output is removed. Usage errors
-also exit 1.
+naming the file and exits 1 without writing the output. Usage errors also
+exit 1.
+
+The output is written to a temporary file in its directory
+(`.<name>.tmp.XXXXXX`) and renamed over the output only once it is complete,
+so a write that fails (a full disk) exits 1, removes the temporary file and
+leaves no partial output and any previous output unchanged. The output path
+is checked before any input is read: one that names something other than a
+regular file (a device, a directory), or a directory that cannot take a new
+file, fails with `cannot write <output>`. A symlink at the output path is
+replaced by the new file, not written through.
 
 Memory: the merge holds the whole session at once, every input file's bytes
 while it reads them and every record decoded (its 64-byte header, the node
