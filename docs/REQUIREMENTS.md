@@ -245,7 +245,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/trajectory` | REQ-DEV-13 to REQ-DEV-15, REQ-DEV-20; REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`, `MakeStraightLine`) |
 | `talOS/mechanisms` | REQ-SAFE-36 to REQ-SAFE-38; REQ-SAFE-01, REQ-SAFE-02, REQ-SAFE-04, REQ-SAFE-05 through the node test matrix, REQ-RT-06 |
 | `talOS/vision` (CPU pipeline, capture, `field_sim`) | REQ-CONTRACT-27, REQ-DEV-11 |
-| `talOS/vision/metal`, `talOS/vision/recording`, `talOS/vision/playback` | none in the catalogue (TODO.md SCOPE-1) |
+| `talOS/vision/metal`, `talOS/vision/recording`, `talOS/vision/playback`, `talOS/vision/evaluation` | none in the catalogue (TODO.md SCOPE-1) |
 | `talOS/aiming` | REQ-DEV-16 to REQ-DEV-19 |
 | `2026-robot/main_processor/{shooter,drivetrain,intake}` | REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-SAFE-31, REQ-SAFE-32 (intake), REQ-CONTRACT-25 |
 | `2026-robot/main_processor/driver` | REQ-SAFE-14, REQ-SAFE-31 |
