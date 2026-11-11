@@ -72,9 +72,7 @@ class BenchMotor:
                 mode = ControlMode.VELOCITY
         position_time = self.motor.position_time
         velocity_time = self.motor.velocity_time
-        # node.now is float seconds; its integer nanoseconds round-trip
-        # exactly below 2**51 ns (26 days of node clock).
-        now_ns = round(self.node.now * _NS)
+        now_ns = self.node.now_ns
 
         def age(time):
             return _UNKNOWN if time is None else _micros(now_ns - time)

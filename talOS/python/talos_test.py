@@ -113,7 +113,27 @@ class Stepper:
             self.sm.go(Stepper.State.MOVING)
 
 
+class Clock:
+    """No update(), so stepping weeks of virtual time runs no timer."""
+
+    def __init__(self, node):
+        self.node = node
+
+
 class TwoNodesTest(unittest.TestCase):
+    # REQ-CONTRACT-14: Python reads the node clock as integer nanoseconds,
+    # as a C++ node does with node.now().nanos().
+    def test_now_ns_is_the_exact_node_clock(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        clock = sim.add(Clock, "planner")
+        # 50.7 days, where float seconds no longer round-trip: each step
+        # converts exactly, their sum does not.
+        sim.step(4_000_000.0)
+        sim.step(378_605.124704419)
+        expected = 4_378_605_124_704_419
+        self.assertEqual(clock.node.now_ns, expected)
+        self.assertNotEqual(round(clock.node.now * 1e9), expected)
+
     def test_python_nodes_talk_over_a_topic(self):
         sim = Sim.from_toml(ROBOT_TOML)
         sim.add(Planner, "planner")

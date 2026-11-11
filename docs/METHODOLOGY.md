@@ -164,7 +164,7 @@ code the table is `talOS/schema/unit_suffix.h`.
 
 | Quantity | Suffix | Unit | Used for |
 |---|---|---|---|
-| timestamp | `_ns` | ns, talos monotonic clock (`node.now()`), `uint64` | when a sample was taken |
+| timestamp | `_ns` | ns, talos monotonic clock (`node.now().nanos()`; Python `node.now_ns`), `uint64` | when a sample was taken |
 | duration | `_us` | µs, integer | periods, timeouts, ages, in TOML and messages |
 | length | `_m`, `_mps`, `_mps2` | m, m/s, m/s² | field and chassis |
 | image distance | `_px` | pixels | image corners, reprojection noise, detector size gates |
