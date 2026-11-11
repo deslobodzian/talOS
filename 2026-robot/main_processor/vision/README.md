@@ -64,6 +64,11 @@ publish invalid observations, never an unsigned-wrapped future timestamp. So
 does a live stamp older than `frame_timeout_us` when published; one diagnostic
 names the camera when its stamps turn stale and one when they recover.
 
+AVFoundation opens the format with the configured `width` × `height` whose
+frame-rate range holds `camera.fps` within a relative 1e-4, since UVC cameras
+report their rates from 100 ns intervals (30 fps as 30.00003), and sets that
+range end's own frame duration when `camera.fps` is at an end of the range,
+otherwise `1 / camera.fps` clamped into the range.
 V4L2 applies automatic/manual exposure mode, manual exposure in 100 µs units,
 and requested gain controls before streaming. macOS AVFoundation supports
 automatic exposure mode, but not custom duration/ISO; manual requests remain
