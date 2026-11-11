@@ -69,9 +69,24 @@ inline constexpr uint32_t kMotorLimitAssertedFlags = uint32_t{0xF} << 14;
 // toward it neutral (Motor::forward_limit, reverse_limit).
 inline constexpr uint32_t kMotorForwardHardLimitFlag = uint32_t{1} << 16;
 inline constexpr uint32_t kMotorReverseHardLimitFlag = uint32_t{1} << 17;
-// Whether the controller reports a fault other than an asserted limit.
+// Bits 8-9 (SupplyCurrLimit, StatorCurrLimit) say the TalonFX's configured
+// supply or stator current limiter is holding current at its limit, as it does
+// for a few milliseconds on any hard acceleration from rest: the limiter
+// working as configured, not a failure.
+inline constexpr uint32_t kMotorCurrentLimitFlags = uint32_t{0x3} << 8;
+// The FaultField bits that report a limit or limiter acting as configured and
+// so are not a motor fault: the asserted soft and hard limits and the active
+// current limits. They stay in `fault_flags` for display; MotorFaulted, and so
+// `/hw/status` `motor_fault_mask`, the hardware log's `faulted` and the
+// RoboRIO's faulted-motor console line, ignore them. Every other bit,
+// including StaticBrakeDisabled (bit 6, a protective release the
+// configuration did not ask for), is a fault.
+inline constexpr uint32_t kMotorNotFaultFlags =
+    kMotorLimitAssertedFlags | kMotorCurrentLimitFlags;
+// Whether the controller reports a fault other than a limit or limiter acting
+// as configured (kMotorNotFaultFlags).
 inline constexpr bool MotorFaulted(uint32_t fault_flags) {
-  return (fault_flags & ~kMotorLimitAssertedFlags) != 0;
+  return (fault_flags & ~kMotorNotFaultFlags) != 0;
 }
 struct SensorSample {
   uint16_t id{};

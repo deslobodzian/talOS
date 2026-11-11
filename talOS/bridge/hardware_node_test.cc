@@ -241,6 +241,19 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   EXPECT_EQ(node.Status(1002000).motor_fault_mask(), 0u);
   EXPECT_EQ(node.Status(1002000).motor_forward_limit_mask(), 2u);
   EXPECT_EQ(node.Status(1002000).motor_reverse_limit_mask(), 2u);
+  // REQ-OPS-20: the supply or stator current limiter engaging (FaultField
+  // bits 8 and 9), as it does for a few milliseconds on any hard acceleration,
+  // is the limit working as configured, not a fault; with a real fault bit
+  // beside it the motor is faulted.
+  state.motors[0].fault_flags = (1u << 8) | (1u << 9);
+  state.sample_time_us++;
+  ASSERT_TRUE(InjectState(node, gateway, state, 1002100));
+  EXPECT_EQ(node.Status(1002100).motor_fault_mask(), 0u);
+  state.motors[0].fault_flags = (1u << 9) | 1u;  // StatorCurrLimit, Hardware
+  state.sample_time_us++;
+  ASSERT_TRUE(InjectState(node, gateway, state, 1002200));
+  EXPECT_EQ(node.Status(1002200).motor_fault_mask(), 2u);
+  state.motors[0].fault_flags = 0x3C000;
   // An invalid sample needs attention even without a controller fault code,
   // and its limit bits say nothing. IDs are deliberately in reverse order:
   // mask bits follow configuration.

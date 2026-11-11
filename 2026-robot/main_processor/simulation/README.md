@@ -95,7 +95,8 @@ neutral and reports the asserted limit (`Motor::forward_limit()` /
 whole run to rehearse a normally closed switch with a cut wire.
 The bridge's `/hw/status.motor_fault_mask` uses configured motor order and
 marks invalid feedback as well as controller fault flags other than an
-asserted soft or hard limit (`talos::hardware::MotorFaulted`);
+asserted soft or hard limit or an active current limit
+(`talos::hardware::MotorFaulted`);
 `motor_forward_limit_mask` and `motor_reverse_limit_mask`, in the same order,
 mark the asserted switches.
 

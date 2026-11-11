@@ -843,7 +843,8 @@ object in JSONL, its text in CSV and the text dump, absent (JSONL) or empty
   `gateway_build_dirty`), the flags (`configured`, `enabled`,
   `command_active`, `hardware_fault`), and per motor `valid`, position,
   velocity, applied `voltage`, stator/supply current, temperature, sample
-  ages, `fault_flags`, `faulted` (a fault other than an asserted limit),
+  ages, `fault_flags`, `faulted` (a fault other than an asserted limit or
+  an active current limit),
   `forward_limit` and `reverse_limit` (hard limit switches); every other
   device's samples, health and gateway counters.
 - `driver_station`: `mode` (`teleop`, `autonomous`, `test`, `none`),

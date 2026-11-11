@@ -117,7 +117,13 @@ Phoenix fault bitfield (`kMotorForwardHardLimitFlag`,
 normally closed switch whose wire is cut holds its direction neutral without
 raising `/hw/status` `motor_fault_mask`, but it shows, as a switch that stays
 asserted away from the end of travel, in `motor_forward_limit_mask` /
-`motor_reverse_limit_mask`.
+`motor_reverse_limit_mask`. Nor are the soft limits or the active supply and
+stator current limits (SupplyCurrLimit, StatorCurrLimit), which the TalonFX
+raises for a few milliseconds on a hard acceleration from rest: a limit or
+limiter acting as configured is not a fault (`kMotorNotFaultFlags` in
+`messages.h`, the one list the bridge, the hardware log and the RoboRIO's
+console share). Those bits stay in each sample's `fault_flags`; every other
+FaultField bit faults the motor.
 `sim::PhysicsSimBackend` holds forward or reverse output neutral, and reports
 the bit, while a test presses a switch
 (`SetForwardLimitPressed`/`SetReverseLimitPressed`; `sim_gateway`'s
@@ -371,7 +377,11 @@ send transitions, device resets, brownout) to `RioLog`
 waits, dropping and counting events when full. A logger thread at nice 19
 (Linux) writes them to stderr, at most one line per second for each kind and
 device: the first change at once, then, while changes continue, one line a
-second with their count and, for the fault field, the bits that toggled. Once
+second with their count and, for the fault field, the bits that toggled. A
+fault-field line lists the changed bits as `fault raised`/`fault cleared` or,
+for the bits that are not faults (`kMotorNotFaultFlags`), `limit
+raised`/`limit cleared`, then the active `faults=[...]` and `limits=[...]`;
+the `motor_fault_mask changed` line counts faults only. Once
 in any second that saw them, it also prints the dropped-event count and the
 loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
 the period) and late ticks (a tick starting more than 1.5 periods after the
