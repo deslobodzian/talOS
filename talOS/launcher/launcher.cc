@@ -665,15 +665,28 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   }
 
   const std::string log_path = NodeLogPath(options_.output_dir, spec->name, 0);
+  // The node runs as it ran in the session: --sim changes what it accepts
+  // (the devices layer treats the config as commissioned, which is part of
+  // the config id every recorded State carries). The session's manifest
+  // says; without one, this launch's --sim does.
+  const bool simulation =
+      SessionSimulation(options_.replay_inputs).value_or(options_.simulation);
   std::cout << "[launcher] Replaying session " << options_.replay_inputs
-            << " into " << spec->name << " (" << spec->target << "); log "
-            << log_path << "\n";
+            << " into " << spec->name << " (" << spec->target << ")"
+            << (simulation ? " under --sim" : "") << "; log " << log_path
+            << "\n";
+  std::vector<std::string> args{spec->binary_path,
+                                "--replay-inputs",
+                                options_.replay_inputs,
+                                "--session-id",
+                                std::to_string(options_.session_id),
+                                "--log",
+                                log_path,
+                                "--config",
+                                options_.config_path};
+  if (simulation) args.push_back("--sim");
   std::string error;
-  const pid_t pid = SpawnProcess(
-      {spec->binary_path, "--replay-inputs", options_.replay_inputs,
-       "--session-id", std::to_string(options_.session_id), "--log", log_path,
-       "--config", options_.config_path, "--sim"},
-      error);
+  const pid_t pid = SpawnProcess(std::move(args), error);
   if (pid < 0) {
     std::cerr << "[launcher] cannot spawn " << spec->name << " (" << error
               << ")\n";

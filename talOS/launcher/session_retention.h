@@ -2,7 +2,8 @@
 
 // What retention (Launcher::ApplyRetention, launcher_retention.cc) needs to
 // know about a recorded session beyond its size: when it started, and whether
-// it ran a match; and how much room the log root's filesystem has left.
+// it ran a match; and how much room the log root's filesystem has left. Also
+// whether it ran under --sim, which input replay repeats.
 
 #include <cstdint>
 #include <filesystem>
@@ -49,6 +50,11 @@ struct SessionFacts {
 // RecordedMatch. Never throws; a manifest that cannot be read reads as
 // absent.
 SessionFacts InspectSession(const std::filesystem::path& dir);
+
+// Whether the session in `dir` was launched with --sim, as its manifest.json
+// records; nullopt when it holds no readable manifest that says. Never
+// throws.
+std::optional<bool> SessionSimulation(const std::filesystem::path& dir);
 
 // Whether the session recorded in `dir` saw a Driver Station attached to the
 // FMS: a /hw/state/driver_station packet with kFmsAttached received by any

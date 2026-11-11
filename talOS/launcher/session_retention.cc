@@ -125,6 +125,16 @@ SessionFacts InspectSession(const fs::path& dir) {
   return facts;
 }
 
+std::optional<bool> SessionSimulation(const fs::path& dir) {
+  std::error_code error;
+  if (!fs::is_regular_file(dir / "manifest.json", error)) return std::nullopt;
+  const std::string manifest = ReadSmallFile(dir / "manifest.json");
+  const std::string_view simulation = JsonValue(manifest, "simulation");
+  if (simulation == "true") return true;
+  if (simulation == "false") return false;
+  return std::nullopt;
+}
+
 MatchVerdict RecordedMatch(const fs::path& dir) {
   struct Log {
     std::string path;
