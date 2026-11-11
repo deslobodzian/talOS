@@ -930,6 +930,7 @@ class Vision {
         ++received_;
         last_received_ns_.store(worker_now_ns_.load(std::memory_order_acquire),
                                 std::memory_order_release);
+        awaiting_first_frame_.store(false, std::memory_order_release);
       }
       wake_.notify_one();
     });
@@ -951,6 +952,10 @@ class Vision {
   static constexpr std::int64_t kFirstRetryNs = 100000000;
   // Bounded so a camera plugged back in mid-match resumes within about 1 s.
   static constexpr std::int64_t kMaxRetryNs = 1000000000;
+  // An open's silence deadline until its first frame, when longer than
+  // frame_timeout_us: a UVC camera's first frame arrives 0.6-1.8 s after it
+  // starts streaming (Arducam OV9281 on Linux, measured).
+  static constexpr std::int64_t kFirstFrameTimeoutNs = 3000000000;
 
   void Work() {
     std::int64_t serviced_ns = -1;
@@ -978,9 +983,13 @@ class Vision {
       CollectSourceDrops();
       const auto last_received =
           last_received_ns_.load(std::memory_order_acquire);
+      const std::int64_t silence_limit_ns =
+          awaiting_first_frame_.load(std::memory_order_acquire)
+              ? std::max(frame_timeout_ns_, kFirstFrameTimeoutNs)
+              : frame_timeout_ns_;
       const bool stalled = source_ && connected_.load() &&
                            serviced_ns >= last_received &&
-                           serviced_ns - last_received >= frame_timeout_ns_;
+                           serviced_ns - last_received >= silence_limit_ns;
       if (stalled) {
         ++stalls_;
         ReportConnection(talos::vision::ConnectionState::kDisconnected,
@@ -1020,6 +1029,7 @@ class Vision {
         if (opened) {
           if (opened_once) ++reconnects_;
           opened_once = true;
+          awaiting_first_frame_.store(true, std::memory_order_release);
           last_received_ns_.store(serviced_ns, std::memory_order_release);
         }
         retry_at_ns = serviced_ns + retry_delay_ns;
@@ -1112,6 +1122,8 @@ class Vision {
   std::uint64_t readout_ns_ = 0;
   std::int64_t frame_timeout_ns_ = 500000000;
   std::atomic<std::int64_t> last_received_ns_{0};
+  // Set at each successful open, cleared by its first frame.
+  std::atomic<bool> awaiting_first_frame_{true};
   std::atomic<std::uint64_t> reconnects_{0}, stalls_{0}, control_failures_{0};
   std::atomic<bool> controls_applied_{true};
   std::thread worker_;

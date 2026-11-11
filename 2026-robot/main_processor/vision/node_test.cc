@@ -1473,30 +1473,93 @@ TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
 TEST(VisionTest, SilentLiveCameraReopensWithBackoffAndCountsRecovery) {
   auto device = std::make_shared<FakeCameraDevice>();
   LiveTestVision::device = device;
-  auto sim =
-      MakeSim(false, true, "device = \"fake\"\nframe_timeout_us = 50000\n",
-              "period_us = 1000\n");
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 50000\n",
+                     "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
-  AdvanceLive(sim, camera, 30);
-  ASSERT_EQ(device->starts, 1);
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
+  AdvanceLive(sim, camera, 20);
+  // One frame, so silence is measured against frame_timeout_us rather than
+  // the first-frame deadline; processing it sets the 100 ms retry deadline.
+  device->Emit(sim.now().nanos() - 1000000,
+               talos::vision::TimestampKind::kDelivery);
+  ASSERT_TRUE(AdvanceLiveUntil(sim, camera, [&] {
+    const auto s = sim.latest<VisionStatus>("/rear_right_camera/status");
+    return s && s->frames_processed_count() == 1;
+  }));
   device->allow_start = false;
-  AdvanceLive(sim, camera, 50);
+  AdvanceLive(sim, camera, 55);
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
   ASSERT_TRUE(status);
   EXPECT_EQ(status->stall_count(), 1);
   EXPECT_EQ(device->starts, 1);  // Initial 100 ms retry deadline.
   AdvanceLive(sim, camera, 50);
   EXPECT_EQ(device->starts, 2);
-  AdvanceLive(sim, camera, 120);
-  EXPECT_EQ(device->starts, 2);  // Failed reopen doubled backoff to 200 ms.
+  AdvanceLive(sim, camera, 100);
+  EXPECT_EQ(device->starts, 3);  // 100 ms after the first failed reopen.
+  AdvanceLive(sim, camera, 150);
+  EXPECT_EQ(device->starts, 3);  // Failed reopens doubled backoff to 200 ms.
   device->allow_start = true;
-  AdvanceLive(sim, camera, 90);
-  ASSERT_EQ(device->starts, 3);
+  AdvanceLive(sim, camera, 60);
+  ASSERT_EQ(device->starts, 4);
   status = sim.latest<VisionStatus>("/rear_right_camera/status");
   ASSERT_TRUE(status);
   EXPECT_EQ(status->reconnect_count(), 1);
   EXPECT_EQ(status->stall_count(), 1);
-  EXPECT_GE(device->stops, 2);
+  EXPECT_GE(device->stops, 3);
+}
+
+// FIELD-4: a UVC camera's first frame arrives 0.6-1.8 s after it starts
+// streaming (Arducam OV9281 on Linux, measured from VIDIOC_STREAMON), longer
+// than the default 500 ms frame_timeout_us. Scenario: the silence timer ran
+// from the open, so the node retired every open before its first frame: a
+// 40 s session captured 0 frames with 29 stalls. Until an open's first frame
+// the deadline is kFirstFrameTimeoutNs (3 s); after it, frame_timeout_us.
+TEST(VisionTest, LiveCameraGetsTimeForItsFirstFrame) {
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 500000\n",
+                     "period_us = 1000\n");
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
+  AdvanceLive(sim, camera, 1500);
+  auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->stall_count(), 0);
+  EXPECT_EQ(device->starts, 1);
+  device->Emit(sim.now().nanos() - 1000000,
+               talos::vision::TimestampKind::kDelivery);
+  ASSERT_TRUE(AdvanceLiveUntil(sim, camera, [&] {
+    const auto s = sim.latest<VisionStatus>("/rear_right_camera/status");
+    return s && s->frames_processed_count() == 1;
+  }));
+  // Frames flowed: silence now stalls after frame_timeout_us, and the stall
+  // reopens at once (the retry deadline passed while frames flowed).
+  const auto received = sim.now().nanos();
+  ASSERT_TRUE(AdvanceLiveUntil(
+      sim, camera,
+      [&] {
+        const auto s = sim.latest<VisionStatus>("/rear_right_camera/status");
+        return s && s->stall_count() == 1;
+      },
+      600));
+  EXPECT_LE(sim.now().nanos() - received, 510000000);
+  ASSERT_EQ(device->starts, 2);
+  // A reopened camera that never delivers stalls at the first-frame deadline.
+  const auto reopened = sim.now().nanos();
+  ASSERT_TRUE(AdvanceLiveUntil(
+      sim, camera,
+      [&] {
+        const auto s = sim.latest<VisionStatus>("/rear_right_camera/status");
+        return s && s->stall_count() == 2;
+      },
+      3100));
+  EXPECT_GE(sim.now().nanos() - reopened, 2990000000);
 }
 
 TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
