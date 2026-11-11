@@ -1032,10 +1032,24 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
 }
 
 // The declared graph from --graph, read on first use. Without the flag:
-// none yet under --describe (the launcher's first pass), and an error
-// otherwise, since a node that reads the graph cannot be built without one.
+// under --replay-inputs, the one the replayed session was launched with
+// (<session dir>/declared_graph.json, which the launcher writes into a
+// session that runs a graph reader); none yet under --describe (the
+// launcher's first pass); and an error otherwise, since a node that reads the
+// graph cannot be built without one.
 GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
-  if (flags.graph_path.empty()) {
+  std::string path = flags.graph_path;
+  std::string unreadable = "cannot read --graph " + path;
+  if (path.empty() && !flags.replay_inputs.empty()) {
+    path = (std::filesystem::path{flags.replay_inputs} / "declared_graph.json")
+               .string();
+    unreadable = std::string{node_name} +
+                 " reads the declared graph, and the replayed session has "
+                 "none: cannot read " +
+                 path +
+                 " (a session without a graph reader has none); pass --graph";
+  }
+  if (path.empty()) {
     if (flags.describe) return [] { return nullptr; };
     return [name = std::string{node_name}]() -> const DeclaredGraph* {
       throw std::runtime_error(
@@ -1045,10 +1059,11 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
     };
   }
   auto graph = std::make_shared<std::optional<DeclaredGraph>>();
-  return [graph, path = flags.graph_path]() -> const DeclaredGraph* {
+  return [graph, path = std::move(path),
+          unreadable = std::move(unreadable)]() -> const DeclaredGraph* {
     if (!graph->has_value()) {
       std::ifstream file{path};
-      if (!file) throw std::runtime_error("cannot read --graph " + path);
+      if (!file) throw std::runtime_error(unreadable);
       const std::string text{std::istreambuf_iterator<char>{file}, {}};
       DeclaredGraph parsed;
       std::string error;
@@ -1075,8 +1090,14 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
             const Flags& flags, const InstanceFactory& make) {
   Hosted hosted;
   hosted.port = std::move(port);
+  // An offline run has no session, even with --log (--replay-inputs always
+  // has one): state a node keeps per session or across restarts (the 2026
+  // autonomous node's selection and progress) must not be read or written by
+  // a replay or a probe.
+  const bool offline = flags.describe || !flags.replay_path.empty() ||
+                       !flags.replay_inputs.empty();
   std::optional<std::filesystem::path> session_dir;
-  if (flags.log_set) {
+  if (flags.log_set && !offline) {
     session_dir.emplace(std::filesystem::path{flags.log_path}.parent_path());
   }
   NodeSetup setup;

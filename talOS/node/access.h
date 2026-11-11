@@ -60,7 +60,8 @@ struct NodeSetup {
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
   // The session output directory the launcher started this node under (the
-  // parent of --log), or nullopt without --log (tests, --describe, replay).
+  // parent of --log), or nullopt without --log (tests) and in an offline run
+  // (--describe, --replay, --replay-inputs): Node::session_dir().
   std::optional<std::filesystem::path> session_dir;
 };
 

@@ -137,7 +137,7 @@ class Node:
     @property
     def session_dir(self):
         """The session output directory (parent of --log), or None without
-        --log (tests, --describe, --replay)."""
+        --log (tests) and in --describe, --replay and --replay-inputs."""
         path = lib.talos_node_session_dir(self._handle)
         return None if path is None else path.decode()
 

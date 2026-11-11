@@ -517,6 +517,17 @@ the recorded outputs. The output directory must not be inside the input
 session. See [input replay](../events/README.md#replaying-another-sessions-inputs)
 for timing and schema checks.
 
+A node that reads the declared graph (`telemetry`, `teleop`) replays on the
+one the session was launched with, the session's `declared_graph.json` (a
+node binary run directly with `--replay-inputs` also takes `--graph PATH`
+instead). The launcher writes that file
+only into a session that ran a graph reader, so replaying such a node from a
+session without one fails, naming the missing file. The replayed node has no
+session directory (`Node::session_dir()` is null, although the launcher
+passes it `--log`), so state a node keeps per session or across restarts,
+such as the autonomous node's routine selection and progress record, is
+neither read nor written.
+
 ## graph.json
 
 Phase one writes `<output_dir>/<session_id>/graph.json` beside the session's
