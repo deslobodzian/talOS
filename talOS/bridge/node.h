@@ -13,6 +13,7 @@
 #include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/os/poller.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/messages.h"
@@ -81,13 +82,61 @@ class HardwareNode {
   // the condition Tick tests. A duty already due at now_us, which that Tick
   // could not do (a failed send), is retried kRetryUs later.
   uint64_t NextDutyUs(uint64_t now_us) const;
+  // What Run() does after a Pass(): wait until `until_us` (bridge clock),
+  // returning early on input unless `ignore_input`, when the CPU budget is
+  // spent and it sleeps through any input.
+  struct Wait {
+    uint64_t until_us;
+    bool ignore_input;
+  };
   // Run()'s loop body, without its wait: Tick(now_us), the registry refresh
-  // Run() owes, then arming every request subscriber's wake. Returns the
-  // bridge-clock instant Run() may sleep until: now_us when input is known
-  // to be waiting (an arm found an unread request, or Tick stopped at its
-  // receive budget), otherwise the next duty, refresh or kMaxWaitUs.
-  uint64_t Pass(uint64_t now_us);
+  // Run() owes, then arming every request subscriber's wake. Waits until
+  // now_us when input is known to be waiting (an arm found an unread
+  // request, or Tick stopped at kReceiveBudget), otherwise until the next
+  // duty, refresh or the longest wait. Once the CPU budget is spent (see
+  // kCpuWindowUs) it sleeps through input until the window ends, or until
+  // the next duty or refresh if that is sooner.
+  Wait Pass(uint64_t now_us);
   int Run(int duration_s = 0);
+
+  // Run()'s waits. OpenWaits() builds the poller and watches the UDP socket
+  // and a wake receiver every request subscriber names; when any of that
+  // fails it says so on stderr, counts a fallback, and the loop polls its
+  // inputs every kRetryUs instead (false). CloseWaits() undoes it. Run()
+  // calls both; they are public so a test can reach the fallback.
+  bool OpenWaits();
+  void CloseWaits();
+
+  // Test seams, null in production. `make_wake_receiver` builds the request
+  // wake receiver instead of WakeReceiver's constructor (a test throws from
+  // it to reach the polling fallback). `arm_request` stands in for
+  // Subscriber::arm_wake in Pass() (a test reports unread data no read
+  // returns, to reach the kMaxIdlePasses guard).
+  struct Seams {
+    WakeReceiver (*make_wake_receiver)(){nullptr};
+    bool (*arm_request)(ipc::Subscriber<Packet>& subscriber){nullptr};
+  };
+  void set_seams(Seams seams) { seams_ = seams; }
+
+  // Run()'s CPU budget. In each kCpuWindowUs window (starting at the first
+  // pass after the last one ended) the loop makes at most kPassBudget passes
+  // and receives at most kDatagramBudget datagrams before it sleeps through
+  // input to the window's end: a gateway flooding datagrams, or a node
+  // publishing requests without pause, cannot hold the highest-priority
+  // loop runnable. Duties are not delayed: the sleep ends at the next one.
+  // Normal traffic (a State every 5 ms, a request per actuator subsystem per
+  // period, Driver Station packets every 20 ms) stays far below both.
+  static constexpr uint64_t kCpuWindowUs = 1'000;
+  static constexpr uint64_t kPassBudget = 8;
+  static constexpr uint64_t kDatagramBudget = 64;
+  // Datagrams one Tick receives at most, so a burst delays rather than
+  // stalls the merge; Run() then ticks again without waiting, within the
+  // CPU budget.
+  static constexpr int kReceiveBudget = 32;
+  // Passes that may skip the wait on a failed arm without consuming input
+  // (a read the writer keeps tearing), before the loop waits anyway: the
+  // arm still requested a notification, and the longest wait bounds it.
+  static constexpr uint32_t kMaxIdlePasses = 3;
 
   // Run()'s wakeups, by what the loop then found: a gateway datagram, a
   // request, or neither and the wait reached its deadline. A wakeup that
@@ -97,6 +146,11 @@ class HardwareNode {
     uint64_t udp{0};       // woken readable; Tick received a datagram
     uint64_t request{0};   // woken readable; Tick read a request
     uint64_t deadline{0};  // the wait reached its deadline
+    // Passes that spent the CPU budget, each followed by a sleep through
+    // input. Stays 0 under normal traffic.
+    uint64_t throttled{0};
+    // OpenWaits() calls that fell back to polling. Stays 0.
+    uint64_t wait_fallbacks{0};
   };
   const Wakeups& wakeups() const { return wakeups_; }
 
@@ -207,6 +261,9 @@ class HardwareNode {
   // Declared before subsystems_, so their slots are released first and no
   // publisher notifies a closed receiver.
   std::optional<WakeReceiver> request_wake_;
+  // Run()'s waits (OpenWaits); empty while it cannot build one.
+  std::optional<event::Poller> poller_;
+  Seams seams_{};
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> state_pub_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> cmd_pub_;
   std::unique_ptr<ipc::Publisher<talos::hardware::Packet>> ds_pub_;
@@ -238,6 +295,10 @@ class HardwareNode {
   bool tick_receive_capped_{false};
   // Consecutive passes that found input waiting but consumed none.
   uint32_t idle_passes_{0};
+  // The current CPU budget window: its start, and its passes and datagrams.
+  uint64_t cpu_window_start_us_{0};
+  uint64_t cpu_window_passes_{0};
+  uint64_t cpu_window_datagrams_{0};
   // The longest single wait: kMaxWaitUs, or kRetryUs when Run() cannot wait
   // on its inputs and polls them instead.
   uint64_t max_wait_us_{kMaxWaitUs};
@@ -286,13 +347,6 @@ class HardwareNode {
   // a polling period; the kernel orders time-constraint threads by deadline,
   // so a longer one would put the bridge behind the control nodes.
   static constexpr uint64_t kWakeBudgetUs = 1'000;
-  // Datagrams one Tick receives at most, so a burst under overload delays
-  // rather than stalls the merge; Run() then ticks again without waiting.
-  static constexpr int kReceiveBudget = 32;
-  // Passes that may skip the wait on a failed arm without consuming input
-  // (a read the writer keeps tearing), before the loop waits anyway: the
-  // arm still requested a notification, and kMaxWaitUs bounds the wait.
-  static constexpr uint32_t kMaxIdlePasses = 3;
   // Registry: heartbeat and dispatch count, and the full sample.
   static constexpr uint64_t kLivenessPeriodUs = 10'000;
   static constexpr uint64_t kIntrospectionPeriodUs = 250'000;

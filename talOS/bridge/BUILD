@@ -73,6 +73,21 @@ cc_binary(
     ],
 )
 
+# The bridge and fake gateway on loopback ports, the test configs, and the
+# frames the two ends exchange, for the two test targets below.
+cc_library(
+    name = "node_test_support",
+    testonly = True,
+    hdrs = ["node_test_support.h"],
+    deps = [
+        ":node_lib",
+        "//talOS/configuration",
+        "//talOS/ipc",
+        "//talOS/protocol",
+        "//talOS/protocol:udp_test_helpers",
+    ],
+)
+
 cc_test(
     name = "node_test",
     size = "small",
@@ -83,15 +98,36 @@ cc_test(
         ":merge",
         ":messages",
         ":node_lib",
+        ":node_test_support",
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/ipc",
         "//talOS/node:allocation_probe",
-        "//talOS/process",
         "//talOS/protocol:udp_test_helpers",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
+    ],
+)
+
+# Run() on real time and loopback UDP: the integration tier
+# (docs/TESTING.md §2), kept out of node_test's synthetic-time logic tests.
+# Its bounds are ratios of counts, or a requirement's margin judged only on a
+# host whose measured stalls are inside it (§6).
+cc_test(
+    name = "run_test",
+    size = "medium",
+    srcs = ["run_test.cc"],
+    deps = [
+        ":merge",
+        ":messages",
+        ":node_lib",
+        ":node_test_support",
+        "//talOS/introspection:registry",
+        "//talOS/ipc",
+        "//talOS/process",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
     ],
 )
 
