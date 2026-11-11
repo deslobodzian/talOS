@@ -379,8 +379,8 @@ attempts, <s> s after the first`.
 
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
-post fixed-size events (fault-field, feedback-validity, apply and neutral
-send transitions, device resets, brownout) to `RioLog`
+post fixed-size events (fault-field, feedback-validity, late-feedback, apply
+and neutral send transitions, device resets, brownout) to `RioLog`
 (`src/main/include/RioLog.h`): a preallocated 256-event queue that never
 waits, dropping and counting events when full. A logger thread at nice 19
 (Linux) writes them to stderr, at most one line per second for each kind and
@@ -418,6 +418,18 @@ session's time. A RioLog line's time is when the logger wrote it, within one
 20 ms drain of the event unless that thread is starved. Driver Station
 messages (`talos companion link`, `talos loop watchdog`) and the WPILib and
 Phoenix libraries' own lines carry no such time.
+
+`PhoenixBackend` marks a motor or CAN sensor invalid only for a signal error,
+a non-finite value or an isolated device (`feedback INVALID`, then
+`RECOVERED`); the age of its feedback is the gateway's to judge
+([fault scope](#runtime-contract)). A CAN silence shorter than that bound
+therefore changes no validity and shows as `feedback LATE
+(position_age_us=..., velocity_age_us=..., late from <t> us, ...)` once the
+device's older motion sample is four status periods old (`4 / status_hz`,
+20 ms at 200 Hz), then `feedback ON TIME (peak_age_us=..., ...)`, with the
+spell's oldest age, once both are younger again. `Apply`'s own follower
+check holds a follower neutral while its master's, its own or its remote
+CANcoder's feedback is `command_timeout_us` old.
 
 If the loop stops ticking right after it applied a command, nothing else
 stops the outputs: its TalonFX controls are one-shot (their device-side

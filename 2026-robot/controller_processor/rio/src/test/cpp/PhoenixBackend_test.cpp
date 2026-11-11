@@ -2,8 +2,8 @@
 // honesty: quadrature scaling from counts_per_rev, duty-cycle offsets, wrap
 // and connection validity, no demand teleport when controller voltage is zero
 // (missing gains exposed), neutral keeping rotor momentum with
-// brake/coast-dependent decay, follower gating, per-device recovery and the
-// loop watchdog's neutral.
+// brake/coast-dependent decay, follower gating, late feedback left valid for
+// the gateway to judge, per-device recovery and the loop watchdog's neutral.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -23,10 +23,13 @@
 #include <iostream>
 #include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <tuple>
+#include <vector>
 
+#include "hardware/gate.h"
 #include "hardware/gateway.h"
 
 namespace hw = talos::hardware;
@@ -96,15 +99,19 @@ bool ReadUntil(PhoenixBackend& backend, hw::State& state, Done done) {
 }
 
 // Phoenix stamps feedback with the host clock, so a stall of its simulator
-// thread or of this one (a loaded host) ages every device's feedback: past
-// 50 ms the backend rightly reports it invalid and holds followers neutral,
-// and the devices can sit at 0 V for tens of milliseconds after the stall.
-// Feedback is fresh here while every motor and sensor reads younger than
-// kFreshAgeUs (unused slots read 0), which leaves the rest of the 50 ms window
-// for this thread's next call; a pump ends only after kSteadyReads fresh reads
-// in a row, so the state it leaves follows 100 ms without a stall.
+// thread or of this one (a loaded host) ages every device's feedback: at
+// command_timeout_us the gateway rightly counts it invalid and the backend
+// holds followers neutral, and the devices can sit at 0 V for tens of
+// milliseconds after the stall. Feedback is fresh here while every motor and
+// sensor reads younger than kFreshAgeUs (unused slots read 0), which leaves
+// the rest of the kFeedbackBoundUs window for this thread's next call; a pump
+// ends only after kSteadyReads fresh reads in a row, so the state it leaves
+// follows 100 ms without a stall.
 constexpr uint32_t kFreshAgeUs = 20'000;
 constexpr int kSteadyReads = 10;
+// The age at which the gateway, and Apply's follower check, count feedback
+// invalid: every config here keeps the default command_timeout_us.
+const uint32_t kFeedbackBoundUs = hw::Config{}.command_timeout_us;
 
 bool FeedbackFresh(const hw::State& s) {
   const auto fresh = [](const auto& sample) {
@@ -116,7 +123,7 @@ bool FeedbackFresh(const hw::State& s) {
 }
 
 // Until the returned instant, Apply still finds the motor feedback this read
-// got fresh (the backend's window is 50 ms); `read_start` when any was stale.
+// got fresh (younger than kFeedbackBoundUs); `read_start` when any was not.
 std::chrono::steady_clock::time_point FreshUntil(
     const hw::State& s, std::chrono::steady_clock::time_point read_start) {
   uint32_t age_us = 0;
@@ -124,8 +131,8 @@ std::chrono::steady_clock::time_point FreshUntil(
     if (!m.valid && m.id != 0) return read_start;
     age_us = std::max({age_us, m.position_age_us, m.velocity_age_us});
   }
-  if (age_us >= 50'000) return read_start;
-  return read_start + std::chrono::microseconds(50'000 - age_us);
+  if (age_us >= kFeedbackBoundUs) return read_start;
+  return read_start + std::chrono::microseconds(kFeedbackBoundUs - age_us);
 }
 
 // Reads every 10 ms and after each read calls `step(fresh_until)`, which
@@ -215,11 +222,17 @@ ctre::phoenix::StatusCode AwaitAnswer(Request request) {
       restoring = restored = true;
     }
     if (restoring) return false;
+    // Valid as the gateway would judge it: the backend leaves age to it.
+    const auto valid = [](const auto& sample) {
+      return sample.valid &&
+             hw::FeedbackFresh(sample.position_age_us, kFeedbackBoundUs) &&
+             hw::FeedbackFresh(sample.velocity_age_us, kFeedbackBoundUs);
+    };
     for (std::size_t i = 0; i < config.motors.size(); ++i)
-      if (!state.motors[i].valid || state.motors[i].voltage != 0.0)
+      if (!valid(state.motors[i]) || state.motors[i].voltage != 0.0)
         return false;
     for (std::size_t i = 0; i < config.sensors.size(); ++i)
-      if (!state.sensors[i].valid) return false;
+      if (!valid(state.sensors[i])) return false;
     return true;
   });
   const auto waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -717,12 +730,14 @@ TEST_P(PhoenixBackendFollowerFeedback,
   ASSERT_GT(state.motors[0].voltage, 3.0);
   ASSERT_GT(state.motors[1].voltage, 3.0);
 
-  // Stop refreshing exactly one cached feedback signal. Read would refresh it,
-  // so inspect physical sim voltage directly instead of masked state fields.
+  // Stop refreshing exactly one cached feedback signal until it is older than
+  // kFeedbackBoundUs. Read would refresh it, so inspect physical sim voltage
+  // directly instead of masked state fields.
   auto& stale = StaleSignal(backend, remote, position);
   // As Pump does, end only after kSteadyReads fresh refreshes of the master in
   // a row, so a simulator stall cannot leave it at 0 V when sampled.
-  std::this_thread::sleep_for(std::chrono::milliseconds(70));
+  std::this_thread::sleep_for(std::chrono::microseconds(kFeedbackBoundUs) +
+                              std::chrono::milliseconds(20));
   const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
   for (int i = 0, fresh_reads = 0; i < 20 || fresh_reads < kSteadyReads; ++i) {
     ASSERT_LT(std::chrono::steady_clock::now(), deadline);
@@ -731,7 +746,7 @@ TEST_P(PhoenixBackendFollowerFeedback,
     ASSERT_TRUE(backend.Apply(commands));
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
-  EXPECT_GE(stale.GetTimestamp().GetLatency().value(), 0.05);
+  EXPECT_GE(stale.GetTimestamp().GetLatency().value(), kFeedbackBoundUs * 1e-6);
   ctre::phoenix6::hardware::TalonFX follower_device{
       2, ctre::phoenix6::CANBus{"rio"}};
   ctre::phoenix6::hardware::TalonFX master_device{
@@ -761,6 +776,10 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static void StopRefreshing(PhoenixBackend& backend,
                              ctre::phoenix6::BaseStatusSignal& signal) {
     std::erase(backend.signals_, &signal);
+  }
+  static void ResumeRefreshing(PhoenixBackend& backend,
+                               ctre::phoenix6::BaseStatusSignal& signal) {
+    backend.signals_.push_back(&signal);
   }
   static void StopRefreshingHealth(PhoenixBackend& backend) {
     auto& motor = Motor(backend, 0);
@@ -849,6 +868,53 @@ TEST_F(PhoenixBackendRecovery, StaleHealthDoesNotInvalidateMotionFeedback) {
   EXPECT_GT(state.motors[0].voltage, 3.0);
   EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 0.0);
   EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
+}
+
+// A CAN silence shorter than the gateway's bound (the bench's 64-66 ms gaps)
+// leaves the backend's sample valid: it reports the age and the gateway
+// judges it, the same for every backend. The console shows the spell instead:
+// LATE once the feedback is four status periods old, then ON TIME with the
+// spell's oldest age.
+// REQ-SAFE-22
+TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
+  EnsureHal();
+  std::vector<std::string> lines;
+  talos::rio::RioLog log{
+      [&](std::string_view line) { lines.emplace_back(line); }};
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "motor", 1));
+  PhoenixBackend backend(true, &log);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  log.Flush(0);
+  lines.clear();
+  auto& position = Motor(backend, 0).GetPosition(false);
+  StopRefreshing(backend, position);
+  hw::State state;
+  // About the bench's gaps: past the LATE threshold (20 ms at 200 Hz) and the
+  // 50 ms diagnostics bound, short of the gateway's.
+  constexpr uint32_t kGapUs = 70'000;
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    return state.motors[0].position_age_us >= kGapUs;
+  }));
+  EXPECT_TRUE(state.motors[0].valid)
+      << "position age " << state.motors[0].position_age_us << " us";
+  ResumeRefreshing(backend, position);
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    return state.motors[0].position_age_us < kFreshAgeUs;
+  }));
+  EXPECT_TRUE(state.motors[0].valid);
+  log.Flush(0);
+  bool late = false;
+  uint64_t peak_age_us = 0;
+  for (const auto& line : lines) {
+    late = late || line.find("feedback LATE") != std::string::npos;
+    constexpr std::string_view kOnTime = "feedback ON TIME (peak_age_us=";
+    if (const auto at = line.find(kOnTime); at != std::string::npos)
+      peak_age_us = std::stoull(line.substr(at + kOnTime.size()));
+  }
+  EXPECT_TRUE(late);
+  EXPECT_GE(peak_age_us, kGapUs);
 }
 
 // FaultField is a separate signal from the motion feedback that keeps the
