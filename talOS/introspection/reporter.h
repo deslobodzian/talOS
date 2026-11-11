@@ -282,14 +282,7 @@ class Reporter {
     // What only the loop knows about its own sources, by id: which watchers
     // skip to the newest message, so a viewer does not read their skips as
     // loss.
-    std::vector<std::uint32_t> source_flags(loop_sources_, 0u);
-    for (std::size_t id = 0; id < loop_sources_; ++id) {
-      if (loop.latest_only(static_cast<std::uint16_t>(id))) {
-        source_flags[id] = naming::kSourceFlagLatestOnly;
-      }
-    }
-
-    registration.publish(manifest, endpoints, source_flags);
+    registration.publish(manifest, endpoints, LoopSourceFlags(loop));
     registration.publish_selections(options_.selections);
     registration.activate();
     published_.store(true, std::memory_order_release);

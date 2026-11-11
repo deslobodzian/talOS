@@ -137,7 +137,8 @@ checks that each run did. Once per run of every member that answered
 active with its sources published, it compares the row's topic ends with the
 probe's: kind, topic, message size, alignment and the `external`, `optional`
 and `observer` attributes, as multisets. Timers are not endpoints, and the
-loop's latest-only flag is not declared by a probe. The schema hash is not in
+loop's latest-only flag, which a probe reports, is a delivery detail, not an
+endpoint attribute. The schema hash is not in
 the registry; it needs no comparison, because every declared topic's
 session-owned segment was created with its declared schema and an end with
 another one fails at attach, while an undeclared topic differs by name. A row

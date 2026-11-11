@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "talOS/events/callback.h"
 #include "talOS/events/delivery.h"
@@ -130,11 +131,14 @@ class LoopPortFor : public LoopPort {
 };
 
 // What `--describe` prints for `node`, built on a loop whose registrations
-// are `manifest`: every topic end with its schema (bytes included), ring
-// layout and endpoint flags, the byte topics the loop does not carry, and
-// whether the node read the declared graph. testing::Sim builds the declared
-// graph it hands its nodes the same way.
-introspect::Description DescribeNode(const Node& node, std::string_view target,
-                                     const event::Manifest& manifest);
+// are `manifest` and whose own source flags are `source_flags`
+// (introspect::LoopSourceFlags): every topic end with its schema (bytes
+// included), ring layout and endpoint flags, which watchers are latest-only,
+// the byte topics the loop does not carry, and whether the node read the
+// declared graph. testing::Sim builds the declared graph it hands its nodes
+// the same way.
+introspect::Description DescribeNode(
+    const Node& node, std::string_view target, const event::Manifest& manifest,
+    const std::vector<std::uint32_t>& source_flags);
 
 }  // namespace talos::detail

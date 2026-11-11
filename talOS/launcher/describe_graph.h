@@ -116,13 +116,14 @@ std::vector<naming::Diagnostic> DescribeGraph(
 // or empty when they agree. An endpoint is a topic end: its kind (SENDER,
 // WATCHER, ...), topic, message size, alignment and the graph lint's
 // attributes (external, optional, observer). Timers are not endpoints, and
-// kSourceFlagLatestOnly is the loop's delivery detail, which no probe
-// reports. The schema is not compared because the registry does not carry
-// it: a declared topic's session segment was created with its declared
-// schema, so a live end with another one already failed at attach, and an
-// undeclared topic differs here by name. Ends are compared as multisets.
-// `live_complete` is false when the registry row held only part of the
-// node's sources (kMaxSourcesPerNode): only live-only ends are reported then.
+// kSourceFlagLatestOnly, which a probe reports, is the loop's delivery
+// detail, not an endpoint attribute. The schema is not compared because the
+// registry does not carry it: a declared topic's session segment was created
+// with its declared schema, so a live end with another one already failed at
+// attach, and an undeclared topic differs here by name. Ends are compared as
+// multisets. `live_complete` is false when the registry row held only part of
+// the node's sources (kMaxSourcesPerNode): only live-only ends are reported
+// then.
 std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
                              const std::vector<naming::SourceShape>& live,
                              bool live_complete = true);

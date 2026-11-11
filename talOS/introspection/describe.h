@@ -209,6 +209,9 @@ inline std::string DescribeToJson(const Description& description) {
     // Only on the devices layer's request publisher; absent means false.
     if ((source.flags & naming::kSourceFlagHardwareRequest) != 0)
       out += ", \"hardware_request\": true";
+    // Only on a latest-only watcher; absent means a sequence watcher.
+    if ((source.flags & naming::kSourceFlagLatestOnly) != 0)
+      out += ", \"latest_only\": true";
     if (source.kind != event::SourceKind::TIMER) {
       // The hash as a hex string: a JSON number is a double.
       out += ", \"schema\": ";
@@ -240,21 +243,42 @@ inline std::string DeclaredGraphToJson(const DeclaredGraph& graph) {
 // Builds a description from a loop's manifest, whose topics are rings of
 // `slots` slots. Endpoint attributes are not something the loop knows --
 // `/hw/command` looks like any other sender to it -- so the node supplies
-// them by topic name.
+// them by topic name. `source_flags`, indexed by registration id, carries
+// what only the loop knows (LoopSourceFlags); shorter than the manifest
+// means none for the rest.
 struct EndpointAttribute {
   std::string_view topic;
   std::uint32_t flags{0};
 };
 
+// What only `loop` knows about its own sources, indexed by source id:
+// naming::kSourceFlagLatestOnly on each watcher that delivers only the newest
+// message (event::EventLoopBase::latest_only). The Reporter publishes it to
+// the registry and `--describe` writes it, so the launcher can tell a watcher
+// that logs at most one message per drain from one that logs every message.
+template <class Loop>
+std::vector<std::uint32_t> LoopSourceFlags(const Loop& loop) {
+  std::vector<std::uint32_t> flags(loop.manifest().size(), 0u);
+  for (std::size_t id = 0; id < flags.size(); ++id) {
+    if (loop.latest_only(static_cast<std::uint16_t>(id))) {
+      flags[id] = naming::kSourceFlagLatestOnly;
+    }
+  }
+  return flags;
+}
+
 inline Description DescribeManifest(
     std::string name, std::string target, const event::Manifest& manifest,
-    std::uint32_t slots,
-    const std::vector<EndpointAttribute>& attributes = {}) {
+    std::uint32_t slots, const std::vector<EndpointAttribute>& attributes = {},
+    const std::vector<std::uint32_t>& source_flags = {}) {
   Description description{std::move(name), std::move(target), {}};
   for (const auto& registration : manifest) {
     std::uint32_t flags = 0;
     for (const auto& attribute : attributes) {
       if (attribute.topic == registration.name) flags |= attribute.flags;
+    }
+    if (registration.id < source_flags.size()) {
+      flags |= source_flags[registration.id];
     }
     naming::SourceShape source{registration.kind, registration.name,
                                registration.message_bytes, flags};
@@ -389,6 +413,9 @@ class DescribeReader {
       if (Field(entry, "hardware_request", attribute) &&
           Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagHardwareRequest;
+      attribute = 0;
+      if (Field(entry, "latest_only", attribute) && Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagLatestOnly;
 
       // Every topic end names its schema and ring layout: the launcher
       // creates the segment from them.

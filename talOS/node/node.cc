@@ -1253,12 +1253,13 @@ std::vector<introspect::Reporter::Selection> Selections(const Node& node) {
 
 }  // namespace
 
-introspect::Description DescribeNode(const Node& node, std::string_view target,
-                                     const event::Manifest& manifest) {
+introspect::Description DescribeNode(
+    const Node& node, std::string_view target, const event::Manifest& manifest,
+    const std::vector<std::uint32_t>& source_flags) {
   auto description = introspect::DescribeManifest(
       std::string{node.name()}, std::string{target}, manifest,
       static_cast<std::uint32_t>(event::RealtimeEventLoop<>::Options{}.slots),
-      Endpoints(node));
+      Endpoints(node), source_flags);
   const schema::Identity bytes = schema::Bytes();
   for (const auto& topic : NodeAccess::byte_topics(node)) {
     introspect::naming::SourceShape source{
@@ -1294,7 +1295,8 @@ int RunMain(int argc, char** argv, const char* node_name,
                node_name, flags, make);
       std::printf("%s",
                   introspect::DescribeToJson(
-                      DescribeNode(*hosted.node, node_target, loop.manifest()))
+                      DescribeNode(*hosted.node, node_target, loop.manifest(),
+                                   introspect::LoopSourceFlags(loop)))
                       .c_str());
       return 0;
     }

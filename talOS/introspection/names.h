@@ -83,8 +83,10 @@ inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
 inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
 // Not about the far end: a watcher that delivers only the newest message
 // (event::EventLoopBase::latest_only), whose dropped count therefore includes
-// the messages it skipped by design. Set by the Reporter from the loop, never
-// declared by a node, and absent from a `--describe`.
+// the messages it skipped by design, and whose log records at most one
+// message per drain. Set from the loop (introspect::LoopSourceFlags) by the
+// Reporter and by `--describe` (`"latest_only": true`), never declared by a
+// node.
 inline constexpr std::uint32_t kSourceFlagLatestOnly = 1u << 3;
 // Not about the far end either: the publisher the devices layer's flush writes
 // its node's hardware request on (detail::NodeAccess::add_hardware_request),
