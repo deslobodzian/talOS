@@ -100,3 +100,13 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "merge_test",
+    size = "small",
+    srcs = ["merge_test.cc"],
+    deps = [
+        ":merge",
+        "@googletest//:gtest_main",
+    ],
+)
