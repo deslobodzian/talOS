@@ -178,8 +178,8 @@ const DEMO_NODES: DemoNode[] = [
     name: 'hardware_node',
     target: '//talOS/bridge:hardware_node',
     pid: 4131,
-    // Drives its own 1 kHz tick rather than an event loop, so unlike every
-    // other node it declares no timer source.
+    // Drives its own loop, woken by input and its duties, rather than an
+    // event loop, so unlike every other node it declares no timer source.
     periodUs: 1000,
     // Same order as the node's own manifest: state, command, driver station,
     // then one request topic per subsystem.

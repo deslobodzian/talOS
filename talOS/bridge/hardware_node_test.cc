@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,9 +20,11 @@
 #include "bridge/topics.h"
 #include "node.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/bridge/merge.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/node/allocation_probe.h"
+#include "talOS/process/process.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
@@ -1323,6 +1326,9 @@ TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   state.clock_probe_time_us = sent;
   ASSERT_TRUE(InjectState(node, gateway, state, 2005000));
   EXPECT_FALSE(node.Status(2005000).clock_offset_valid());
+  // The echo is completed by the next Tick, the first whose clock reading
+  // follows receipt; Run() makes it at once rather than at a later duty.
+  EXPECT_EQ(node.NextDutyUs(2005000), 2005000u);
   node.Tick(2006000);  // First known bridge-clock instant after receipt.
   for (uint64_t i = 1; i < 8; ++i) {
     state.sample_time_us = 1000 + i * 1000;
@@ -1536,11 +1542,379 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
   }
 }
 
-// RULES.md 3: the bridge's 1 kHz tick allocates nothing in steady state: a
-// configured link with a State every tick (answering each clock probe), a
-// Driver Station packet every 20 ms, two owners' requests every 5 ms, the
-// merged command, /hw/status and the registry sample Run() takes. Tick() runs
-// on this thread, which is the only one AllocationProbe counts.
+// Runs the bridge's Run() on its own thread until Stop() or destruction,
+// which stop it as SIGTERM does (process::stop_requested) and join it. The
+// node's counters are read only once it has stopped.
+class RunningBridge {
+ public:
+  explicit RunningBridge(HardwareNode& node)
+      : thread_{[&node] { node.Run(); }} {}
+  RunningBridge(const RunningBridge&) = delete;
+  RunningBridge& operator=(const RunningBridge&) = delete;
+  ~RunningBridge() { Stop(); }
+
+  void Stop() {
+    if (!thread_.joinable()) return;
+    process::stop_requested.store(true);
+    thread_.join();
+    process::stop_requested.store(false);
+  }
+
+ private:
+  std::thread thread_;
+};
+
+// Polls `done` until it holds; false after 10 s, a bound on a hang only.
+template <class Done>
+bool WaitFor(Done done) {
+  const auto give_up =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (!done()) {
+    if (std::chrono::steady_clock::now() >= give_up) return false;
+    std::this_thread::sleep_for(std::chrono::microseconds{100});
+  }
+  return true;
+}
+
+// Sends one State from the fake gateway without ticking the bridge, for a
+// bridge that Run() drives.
+bool SendState(protocol::RuntimeUdpPeer& gateway, const State& state) {
+  Packet packet{};
+  packet.size = static_cast<uint32_t>(Encode(state, packet.data));
+  return gateway.SendFrame(protocol::FrameType::kHardwareState, 0,
+                           state.sample_time_us, packet.data.data(),
+                           packet.size) == protocol::UdpStatus::kOk;
+}
+
+// Whether /hw/state now carries the State sampled at `sample_time_us`.
+bool Forwarded(ipc::Subscriber<Packet>& states, uint64_t sample_time_us) {
+  const auto packet = states.read();
+  State state{};
+  return packet && Decode(packet->bytes(), state) &&
+         state.sample_time_us == sample_time_us;
+}
+
+// A command the fake gateway received, with the bridge-clock time it was
+// sent at (the frame header's).
+struct SentCommand {
+  uint64_t sent_us;
+  Command command;
+};
+
+// The next command frame the gateway receives, skipping every other frame;
+// nullopt after 10 s, a bound on a hang only.
+std::optional<SentCommand> NextCommand(protocol::RuntimeUdpPeer& gateway) {
+  const auto give_up =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  protocol::DecodedFrame frame;
+  while (protocol::testing::ReceiveFrame(gateway, &frame, give_up) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type != protocol::FrameType::kHardwareCommand) continue;
+    SentCommand sent{frame.header.monotonic_time_us, {}};
+    if (!Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                sent.command)) {
+      return std::nullopt;
+    }
+    return sent;
+  }
+  return std::nullopt;
+}
+
+// The merged command's entry for motor `id`; a neutral default when absent.
+MotorRequest MotorOf(const Command& command, uint16_t id) {
+  for (std::size_t i = 0; i < command.count; ++i) {
+    if (command.motors[i].id == id) return command.motors[i];
+  }
+  return MotorRequest{};
+}
+
+// An intake request built on the State of boot 11, epoch 1, sampled at 1000.
+Command IntakeRequest(const config::RobotConfig& cfg, double demand) {
+  Command request{};
+  request.config_id = NodeConfigId(cfg);
+  request.boot_id = 11;
+  request.epoch = 1;
+  request.observed_time_us = 1000;
+  request.count = 1;
+  request.motors[0] = {cfg.subsystems.at("intake").motors[0], Mode::kVoltage, 0,
+                       demand, 0.0};
+  return request;
+}
+
+// Run() sleeps between inputs, so every time-driven duty must wake it at the
+// instant Tick would do it. NextDutyUs() is that instant: ticking just
+// before it does nothing, and ticking only at it sends each command, probe
+// and /hw/status exactly when Tick's own conditions fall due. With a
+// gateway that sends one State and then nothing: the request's command,
+// heartbeats every heartbeat_us(), the neutral command one microsecond past
+// the intake's 50 ms owner timeout, and nothing after it. The request lands
+// 7 ms after the first status, so no duty shares another's instant.
+// REQ-SAFE-15, REQ-RT-13
+TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  ipc::Subscriber<bridge::BridgeStatus> statuses{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  constexpr uint64_t kStartUs = 1'000'000;
+  ASSERT_TRUE(InjectState(
+      node, gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000), kStartUs));
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  constexpr uint64_t kRequestUs = kStartUs + 7000;
+  PublishCommand(pub, IntakeRequest(cfg, 4.0));
+  node.Tick(kRequestUs);
+  ASSERT_EQ(node.commands_sent(), 1u);
+  while (statuses.read()) {
+  }
+
+  std::vector<uint64_t> status_us;
+  uint64_t now_us = kRequestUs;
+  while (now_us < kStartUs + 300'000) {
+    const uint64_t due_us = node.NextDutyUs(now_us);
+    ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
+    if (due_us - 1 > now_us) {
+      const uint64_t commands = node.commands_sent();
+      node.Tick(due_us - 1);
+      EXPECT_EQ(node.commands_sent(), commands) << "early, at " << due_us - 1;
+      EXPECT_FALSE(statuses.read()) << "early, at " << due_us - 1;
+    }
+    now_us = due_us;
+    node.Tick(now_us);
+    if (statuses.read()) status_us.push_back(now_us);
+  }
+
+  // Every frame went out at a duty instant: the request's command, the two
+  // heartbeats, the timeout's neutral command, and the clock probe with its
+  // retries (unanswered, each 100 ms and 1 us after the last).
+  std::vector<SentCommand> commands;
+  std::vector<uint64_t> probe_us;
+  protocol::DecodedFrame frame;
+  while (protocol::testing::ReceiveFrame(gateway, &frame) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type == protocol::FrameType::kClockProbe) {
+      probe_us.push_back(frame.header.monotonic_time_us);
+    } else if (frame.header.type == protocol::FrameType::kHardwareCommand) {
+      SentCommand sent{frame.header.monotonic_time_us, {}};
+      ASSERT_TRUE(
+          Decode(std::span<const uint8_t>{frame.payload, frame.payload_size},
+                 sent.command));
+      commands.push_back(sent);
+    }
+  }
+  const uint64_t heartbeat_us = node.heartbeat_us();
+  ASSERT_EQ(heartbeat_us, 20'000u);
+  const uint64_t timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  ASSERT_EQ(commands.size(), 4u);
+  const std::array<uint64_t, 4> expected_us = {
+      kRequestUs, kRequestUs + heartbeat_us, kRequestUs + (2 * heartbeat_us),
+      kRequestUs + timeout_us + 1};
+  for (std::size_t i = 0; i < commands.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(commands[i].sent_us, expected_us[i]);
+    EXPECT_EQ(MotorOf(commands[i].command, roller).mode,
+              i + 1 < commands.size() ? Mode::kVoltage : Mode::kNeutral);
+  }
+  EXPECT_EQ(probe_us, (std::vector<uint64_t>{kStartUs, kStartUs + 100'001,
+                                             kStartUs + 200'002}));
+  ASSERT_EQ(status_us.size(), 15u);
+  for (std::size_t i = 0; i < status_us.size(); ++i) {
+    EXPECT_EQ(status_us[i], kStartUs + ((i + 1) * 20'000)) << i;
+  }
+}
+
+// A request published while Run() is asleep wakes it: the command goes out
+// when the request is published, not at the loop's next deadline. Each
+// request waits for the previous one's command, so the bridge has gone back
+// to sleep before it, and the wakeup that finds it is counted as a
+// request's. A loop that only polled counts none.
+// REQ-RT-13
+TEST(HardwareNodeTest, RunSendsTheCommandWhenARequestIsPublished) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> states{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  constexpr int kRequests = 20;
+  {
+    RunningBridge run{node};
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 1000); }));
+    for (int i = 1; i <= kRequests; ++i) {
+      PublishCommand(pub, IntakeRequest(cfg, i));
+      std::optional<SentCommand> sent;
+      do {
+        sent = NextCommand(link.gateway);
+        ASSERT_TRUE(sent) << "no command for request " << i;
+      } while (MotorOf(sent->command, roller).demand != i);
+    }
+  }
+  const auto& wakeups = node.wakeups();
+  EXPECT_GE(wakeups.request, uint64_t{kRequests / 2})
+      << "passes " << wakeups.passes << ", udp " << wakeups.udp << ", deadline "
+      << wakeups.deadline;
+}
+
+// A State arriving while Run() is asleep wakes it and reaches /hw/state at
+// once. Each State waits for the previous one on /hw/state, as above.
+// REQ-RT-13
+TEST(HardwareNodeTest, RunForwardsAStateWhenItArrives) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> states{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  constexpr uint64_t kStates = 20;
+  {
+    RunningBridge run{node};
+    for (uint64_t i = 1; i <= kStates; ++i) {
+      const uint64_t sample_us = i * 1000;
+      ASSERT_TRUE(SendState(link.gateway,
+                            TrustState(NodeConfigId(cfg), 11, 1, sample_us)));
+      ASSERT_TRUE(WaitFor([&] { return Forwarded(states, sample_us); }))
+          << "State " << i;
+    }
+  }
+  const auto& wakeups = node.wakeups();
+  EXPECT_GE(wakeups.udp, kStates / 2)
+      << "passes " << wakeups.passes << ", request " << wakeups.request
+      << ", deadline " << wakeups.deadline;
+}
+
+// An idle bridge sleeps until its next duty. Its duties: the registry's
+// liveness every 10 ms, /hw/status every 20 ms, an unanswered clock probe
+// every 100 ms and the full registry sample every 250 ms, at most 164 passes
+// a second (fewer where they coincide), where a 1 ms poll made 1000. The
+// sleep below is the measured window, not a synchronisation.
+// REQ-RT-13
+TEST(HardwareNodeTest, RunSleepsWhileNothingArrives) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  const auto start = std::chrono::steady_clock::now();
+  {
+    RunningBridge run{node};
+    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+  }
+  const double seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  const auto& wakeups = node.wakeups();
+  const double per_second = static_cast<double>(wakeups.passes) / seconds;
+  EXPECT_LT(per_second, 300.0)
+      << wakeups.passes << " passes in " << seconds << " s: udp " << wakeups.udp
+      << ", request " << wakeups.request << ", deadline " << wakeups.deadline;
+}
+
+// Under Run(), with one request and nothing after it, the heartbeats and the
+// owner timeout's neutral command still go out on their own. The bounds are
+// the requirement's: each frame no earlier than its duty, and before the
+// gateway's command_timeout_us would have expired the last one.
+// NextDutyUsIsWhenTickNextHasWork pins the exact instants; this proves Run()
+// sleeps until them rather than past them.
+// REQ-SAFE-15, REQ-RT-13
+TEST(HardwareNodeTest, RunSendsHeartbeatsAndTheTimeoutNeutralOnItsOwn) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  ipc::Subscriber<Packet> states{
+      kStateTopic,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  std::vector<SentCommand> commands;
+  {
+    RunningBridge run{node};
+    ASSERT_TRUE(
+        SendState(link.gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000)));
+    ASSERT_TRUE(WaitFor([&] { return Forwarded(states, 1000); }));
+    PublishCommand(pub, IntakeRequest(cfg, 4.0));
+    do {
+      auto sent = NextCommand(link.gateway);
+      ASSERT_TRUE(sent) << "after " << commands.size() << " commands";
+      commands.push_back(*sent);
+    } while (MotorOf(commands.back().command, roller).mode != Mode::kNeutral);
+  }
+  const uint64_t heartbeat_us = node.heartbeat_us();
+  const uint64_t command_timeout_us = cfg.hardware.command_timeout_us;
+  const uint64_t timeout_us = OwnerTimeoutUs(5000, command_timeout_us);
+  // The request's command, at least one heartbeat, the neutral command.
+  ASSERT_GE(commands.size(), 3u);
+  for (std::size_t i = 1; i + 1 < commands.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(MotorOf(commands[i].command, roller).mode, Mode::kVoltage);
+    const uint64_t gap_us = commands[i].sent_us - commands[i - 1].sent_us;
+    EXPECT_GE(gap_us, heartbeat_us);
+    EXPECT_LT(gap_us, command_timeout_us);
+  }
+  const uint64_t neutral_after_us =
+      commands.back().sent_us - commands.front().sent_us;
+  EXPECT_GT(neutral_after_us, timeout_us);
+  EXPECT_LT(neutral_after_us, command_timeout_us);
+}
+
+// A burst beyond one Tick's receive budget (32 datagrams) is drained pass
+// after pass without sleeping in between: Pass() returns its own instant,
+// so Run() ticks again at once rather than at the next deadline.
+// REQ-RT-13
+TEST(HardwareNodeTest, PassDoesNotSleepOnAReceiveBacklog) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  constexpr uint64_t kStartUs = 1'000'000;
+  ASSERT_TRUE(InjectState(
+      node, gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000), kStartUs));
+  // Many more than the budget, so the first pass after the sends finds a
+  // full budget queued even where loopback delivery lags the send.
+  constexpr uint64_t kBurst = 100;
+  constexpr uint64_t kReceiveBudget = 32;
+  driver_station::DriverStationData data{};
+  data.boot_id = 11;
+  std::array<uint8_t, 256> bytes{};
+  for (uint64_t i = 1; i <= kBurst; ++i) {
+    data.sample_time_us = 1000 + i;
+    const std::size_t size = driver_station::Encode(data, bytes);
+    ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kDriverStation, 0,
+                                kStartUs, bytes.data(), size),
+              protocol::UdpStatus::kOk);
+  }
+  bool saw_full_budget = false;
+  const bool drained = WaitFor([&] {
+    const uint64_t before = node.driver_station_packets_received();
+    const uint64_t until_us = node.Pass(kStartUs);
+    if (node.driver_station_packets_received() - before == kReceiveBudget) {
+      saw_full_budget = true;
+      EXPECT_EQ(until_us, kStartUs) << "slept with datagrams queued";
+    }
+    return node.driver_station_packets_received() == kBurst;
+  });
+  ASSERT_TRUE(drained) << node.driver_station_packets_received() << " of "
+                       << kBurst;
+  EXPECT_TRUE(saw_full_budget);
+}
+
+// RULES.md 3: the bridge's loop allocates nothing in steady state: a
+// configured link with a State every millisecond (answering each clock
+// probe), a Driver Station packet every 20 ms, two owners' requests every
+// 5 ms, the merged command, /hw/status, and each Pass() Run() makes: the
+// registry samples, arming the request wakes and the next deadline. Tick()
+// and Pass() run on this thread, which is the only one AllocationProbe
+// counts.
 TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
@@ -1616,7 +1990,7 @@ TEST(HardwareNodeTest, SteadyStateTickDoesNotAllocate) {
       PublishCommand(drive_pub, drive_request);
       PublishCommand(intake_pub, intake_request);
     }
-    if (i % 250 == 0) node.PublishIntrospection();
+    node.Pass(now_us);
     return true;
   };
   for (unsigned i = 0; i < 300; ++i) ASSERT_TRUE(tick(i)) << i;
