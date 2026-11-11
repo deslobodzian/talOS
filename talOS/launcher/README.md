@@ -916,11 +916,16 @@ due), so it is measured instead by request to command: for each observation
 time minus the first `/hw/request/<node>` carrying it; a heartbeat repeating
 an observation, or a command no request carried by then (such as an owner
 timeout's neutral command, even when the node's next request observes the
-same State), is not counted, so no value is negative. Both times are stamped
-before the work (the requesting tick, the bridge pass), so a pass that began
-just before the request it answered was stamped is not counted either, and
-with several owners the merged
-observation can be an older request's, overstating it. The row is
+same State), is not counted, so no value is negative. The request's time is
+its tick's, stamped before that tick's work; the command's is its publication
+on `/hw/command`, after the bridge's merge. So the row measures request tick
+to command publication, the requesting node's work included, not delivery to
+the RoboRIO: a command is logged when published whether or not its UDP send
+succeeded (its record's status is the shared-memory write's), so after a
+failed send, and while a socket is being replaced, the row still counts a
+command the RoboRIO received later or never; the bridge's `send_failures`
+(exit line, below) says whether that happened. With several owners the
+merged observation can be an older request's, overstating it. The row is
 informational: REQ-RT-20's 1 ms bound is verified by the bridge's component
 test. The bridge's wake counters (`passes`, `throttled`, `wait_fallbacks`)
 and socket counters (`send_failures`, `socket_reopens`) are only in its exit
