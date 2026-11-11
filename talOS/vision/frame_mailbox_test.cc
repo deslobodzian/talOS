@@ -37,8 +37,8 @@ bool Uniform(const Frame& frame, uint8_t value) {
 // replaced frame is counted.
 TEST(FrameMailboxTest, SlowConsumerGetsNewestFrameAndDropsAreCounted) {
   FrameMailbox mailbox;
-  mailbox.Reserve(kWidth * kHeight);
-  std::vector<uint8_t> driver(kWidth * kHeight);
+  mailbox.Reserve(std::size_t{kWidth} * kHeight);
+  std::vector<uint8_t> driver(std::size_t{kWidth} * kHeight);
   EXPECT_EQ(mailbox.TakeNewest(), nullptr);
 
   ASSERT_TRUE(mailbox.Publish(Borrowed(driver, 1)));
@@ -74,10 +74,10 @@ TEST(FrameMailboxTest, SlowConsumerGetsNewestFrameAndDropsAreCounted) {
 TEST(FrameMailboxTest, ConcurrentHandoffNeverTearsOrLosesCount) {
   constexpr uint64_t kFrames = 5000;
   FrameMailbox mailbox;
-  mailbox.Reserve(kWidth * kHeight);
+  mailbox.Reserve(std::size_t{kWidth} * kHeight);
   std::atomic<bool> done{false};
   std::thread producer([&] {
-    std::vector<uint8_t> driver(kWidth * kHeight);
+    std::vector<uint8_t> driver(std::size_t{kWidth} * kHeight);
     for (uint64_t sequence = 1; sequence <= kFrames; ++sequence) {
       mailbox.Publish(Borrowed(driver, sequence));
     }

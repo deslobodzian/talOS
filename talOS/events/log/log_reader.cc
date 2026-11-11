@@ -520,8 +520,10 @@ LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
       header.schema_bytes;
   std::optional<RecordHeader> last;
   std::vector<std::byte> payload;
-  while (const std::optional<RecordHeader> record =
-             locate(source, cursor, scan_payload_bytes, summary.damage, last)) {
+  while (true) {
+    const std::optional<RecordHeader> record =
+        locate(source, cursor, scan_payload_bytes, summary.damage, last);
+    if (!record.has_value()) break;
     const std::uint64_t body = cursor + sizeof(RecordHeader);
     cursor = body + record->stored_bytes;
     ++summary.record_count;

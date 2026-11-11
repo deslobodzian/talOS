@@ -25,7 +25,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size) {
         talos::protocol::DecodeFrame(encoded.data(), written, &again) !=
             talos::protocol::DecodeStatus::kOk)
       std::abort();
-    std::vector<uint8_t> canonical(encoded.begin(), encoded.begin() + written);
+    std::vector<uint8_t> canonical(
+        encoded.begin(),
+        encoded.begin() + static_cast<std::ptrdiff_t>(written));
     std::vector<uint8_t> roundtrip(talos::protocol::kMaxFrameSize);
     roundtrip.resize(talos::protocol::EncodeFrame(
         again.header.type, again.header.flags, again.header.sequence,

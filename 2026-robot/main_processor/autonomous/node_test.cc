@@ -100,7 +100,7 @@ class AutonomousTest : public ::testing::Test {
     auto packet = talos::testing::DsPacket(flags);
     packet.joysticks[0].connected = true;
     packet.joysticks[0].pov_count = 1;
-    packet.joysticks[0].povs[0] = angle;
+    packet.joysticks[0].povs[0] = static_cast<std::int16_t>(angle);
     hw.set_driver_station(packet);
     sim.step(20ms);
   }
@@ -854,7 +854,7 @@ TEST(AutonomousSelection, PersistsAcrossRestartAndCorruptionUsesDefault) {
           enabled ? ds::kEnabled | ds::kAutonomous : 0);
       data.joysticks[0].connected = true;
       data.joysticks[0].pov_count = 1;
-      data.joysticks[0].povs[0] = angle;
+      data.joysticks[0].povs[0] = static_cast<std::int16_t>(angle);
       hw.set_driver_station(data);
       sim.step(20ms);
     };
@@ -974,7 +974,9 @@ void DamageProgress(const std::function<void(ProgressFile&)>& damage) {
   ASSERT_GE(fd, 0);
   struct stat status {};
   ASSERT_EQ(::fstat(fd, &status), 0);
-  if (status.st_size == 0) ASSERT_EQ(::ftruncate(fd, sizeof(ProgressFile)), 0);
+  if (status.st_size == 0) {
+    ASSERT_EQ(::ftruncate(fd, sizeof(ProgressFile)), 0);
+  }
   void* memory = ::mmap(nullptr, sizeof(ProgressFile), PROT_READ | PROT_WRITE,
                         MAP_SHARED, fd, 0);
   ::close(fd);

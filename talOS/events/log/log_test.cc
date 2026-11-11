@@ -1091,7 +1091,7 @@ long PeakRssKiB() {
 // Counting a log streams it: peak memory does not grow by the log's size.
 TEST(LogSummary, PeakMemoryDoesNotScaleWithTheLog) {
   const std::string path = TempPath("summary_large");
-  constexpr std::size_t kRecords = 64 * 1024;
+  constexpr std::size_t kRecords = std::size_t{64} * 1024;
   constexpr std::size_t kPayload = 1000;  // ~68 MB of records
   {
     Manifest manifest = MakeManifest();

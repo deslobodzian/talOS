@@ -205,7 +205,7 @@ std::string AllocationProbe::sites() const {
       out += symbols != nullptr ? symbols[i] : "?";
       out += '\n';
     }
-    std::free(symbols);
+    std::free(static_cast<void*>(symbols));
   }
   return out;
 }

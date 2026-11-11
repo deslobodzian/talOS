@@ -361,7 +361,7 @@ TEST(Devices, PwmClampsFiniteOutputsWithoutRejectingMotorCommands) {
   SimHardware hw{sim};
   hw.enable();
   mech.a_velocity = 10;
-  for (const auto [output, expected] :
+  for (const auto& [output, expected] :
        {std::pair{2.0, 1.0}, std::pair{-2.0, -1.0}, std::pair{0.25, 0.25},
         std::pair{std::numeric_limits<double>::infinity(), 0.0},
         std::pair{std::numeric_limits<double>::quiet_NaN(), 0.0}}) {

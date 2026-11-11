@@ -586,7 +586,7 @@ TEST(TeleopNode, BoundPovMustBeReleasedBeforeArmingEvenFromAnotherDirection) {
     const auto packet = [&](int angle) {
       auto stick = MakeStick();
       stick.pov_count = 1;
-      stick.povs[0] = angle;
+      stick.povs[0] = static_cast<std::int16_t>(angle);
       Push(hw, sim, DsPacket(kTeleopEnabled, stick));
     };
     packet(0);  // A different direction is still not a released POV.

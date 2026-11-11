@@ -16,7 +16,8 @@ void RunCorpus(const std::vector<std::vector<uint8_t>>& seeds, Decode decode) {
   std::mt19937 random(0x74616c6f);
   for (const auto& seed : seeds) {
     for (std::size_t size = 0; size <= seed.size(); ++size) {
-      const std::vector<uint8_t> input(seed.begin(), seed.begin() + size);
+      const std::vector<uint8_t> input(
+          seed.begin(), seed.begin() + static_cast<std::ptrdiff_t>(size));
       decode(input.data(), input.size());
     }
     // Visit every possible length/count-field byte, including multi-byte
@@ -44,15 +45,19 @@ void RunCorpus(const std::vector<std::vector<uint8_t>>& seeds, Decode decode) {
             }
             break;
           case 1:
-            input.insert(input.begin() + position,
+            input.insert(input.begin() + static_cast<std::ptrdiff_t>(position),
                          static_cast<uint8_t>(random()));
             break;
           case 2:
-            if (position < input.size()) input.erase(input.begin() + position);
+            if (position < input.size())
+              input.erase(input.begin() +
+                          static_cast<std::ptrdiff_t>(position));
             break;
           case 3:
             if (position < input.size())
               input[position] = static_cast<uint8_t>(random());
+            break;
+          default:
             break;
         }
       }

@@ -150,7 +150,7 @@ struct SimHardware::Impl {
       try {
         keys.emplace_back(TableOf(kind), Id(node, kind, device));
       } catch (const std::invalid_argument&) {
-        // not a device of this kind
+        continue;  // not a device of this kind
       }
     }
     if (keys.empty()) {

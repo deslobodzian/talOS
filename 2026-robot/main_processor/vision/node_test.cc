@@ -139,6 +139,7 @@ void CheckPose(bool rasterize) {
   // retains production sensor/exposure noise.
   auto sim = MakeSim(rasterize, !rasterize);
   std::vector<Vision*> cameras;
+  cameras.reserve(std::size(kCameras));
   for (const auto* name : kCameras) cameras.push_back(&sim.add<Vision>(name));
   // No driver station, targets, estimator or drivetrain: sensing runs disabled
   // from gateway truth, without requiring fresh actuation.
@@ -1743,7 +1744,9 @@ TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
     device->Emit(first + static_cast<std::int64_t>(i) * 1000000,
                  talos::vision::TimestampKind::kExposure);
     // The first frame wakes the worker, which then stays busy.
-    if (i == 0) ASSERT_TRUE(device->WaitBlocked());
+    if (i == 0) {
+      ASSERT_TRUE(device->WaitBlocked());
+    }
   }
   device->Hold(false);
   const auto newest =
