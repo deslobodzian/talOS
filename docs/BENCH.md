@@ -272,7 +272,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   `clock_offset_uncertainty_us` and `clock_min_round_trip_us`. Expected:
   mapping valid after the new boot; the uncertainty is the error bound,
   `clock_offset_spread_us` is not. Record the bound and the round trip.
-  Review per-node timer lateness in the report; no
+  Review per-node timer lateness and the bridge's request to command (the
+  bridge has no timer) in the report, and `throttled=0 wait_fallbacks=0` on
+  the bridge's exit line in `hardware_node.log`; no
   node should log `realtime scheduling incomplete`. Do not use
   `TALOS_REALTIME=0` for acceptance.
 - [ ] In a disposable session lower `[robot] log_max_bytes` and exceed each
