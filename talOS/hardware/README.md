@@ -339,7 +339,8 @@ the same command continue driving. These neutralizations increment
 `neutralized_motor_count`. The backend remains healthy while any configured
 motor or CAN sensor has valid feedback (or none are configured). Total loss of
 all configured motor/CAN-sensor feedback neutralizes every output and advances
-the command epoch. Failed global Apply or backend configuration failure also
+the command epoch on the tick it is found, whether or not a command is in
+force. Failed global Apply or backend configuration failure also
 neutralizes every output; individual device configuration or control-send
 failures do not. A rejected configuration push need not invalidate the active
 configuration.

@@ -446,10 +446,13 @@ void Gateway::Tick(uint64_t now, bool enabled) {
     Invalidate();
   }
   state_.sample_time_us = now;
+  const bool was_healthy = healthy_;
   const bool read = configured_ && backend_.Read(state_);
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
-  if (!healthy_ && active_) Invalidate();
+  // Total loss starts a new epoch whether or not a command is in force: a
+  // request built from a State before it must never drive after it.
+  if (!healthy_ && (was_healthy || active_)) Invalidate();
   PollResets();
   // A watchdog stop is not a one-shot: with no accepted command in force,
   // refresh neutral every tick (as disabled/fault do) so a dropped neutral is
