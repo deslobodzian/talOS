@@ -349,6 +349,10 @@ Software rezero does not change these timestamps.
 `SimHardware.set_motor`, `.set_cancoder` accept optional `position_age_us`,
 `velocity_age_us`; `.set_gyro` accepts `yaw_age_us`, `yaw_rate_age_us` (C++ and
 Python). Defaults are zero; `UINT32_MAX` injects unknown acquisition age.
+SimHardware judges these ages by the gateway's own rule (`FeedbackFresh`,
+[fault scope](../talOS/hardware/README.md#runtime-contract)): a device with
+any age `command_timeout_us` or more, or unknown, goes out invalid, so its
+handle reads `connected()` false and has no acquisition time.
 
 The robot-specific odometry timing policy is documented in the
 [drivetrain README](../2026-robot/main_processor/drivetrain/README.md).
@@ -536,8 +540,9 @@ gateway's do, once the oldest observation of any node still merged is
 applies neutral outputs. As on the bridge and gateway, a request built from
 another boot's or epoch's State is ignored, and a motor masked by
 `reset_device` applies neutral (so does a later request observed before the
-State that masked it); a motor disconnected with `set_connected` still
-applies its request. Inspection never refreshes
+State that masked it); a motor disconnected with `set_connected`, or whose
+feedback is too old, still applies its request, and losing every device's
+feedback raises no hardware fault. Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
 velocity below `0.01 rps` snaps to zero. Position continues integrating during

@@ -120,7 +120,10 @@ the hardware says:
   the unsigned message timestamp. Before clock convergence or with stale
   hardware, neither product is valid.
   Timing rejection does **not** alter connectivity-based degraded driving,
-  target freshness or enable gating. Rejected module times stop heading
+  target freshness or enable gating. Any signal of a motor or the Pigeon
+  (used or not) `command_timeout_us` old or older, or of unknown age, is not
+  a timing rejection: the gateway marks that device invalid, so it counts as
+  disconnected (a motor's module goes neutral). Rejected module times stop heading
   integration; ideal simulation still accumulates an untrusted heading
   during initial clock convergence.
 

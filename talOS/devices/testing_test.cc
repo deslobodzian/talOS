@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -37,6 +38,9 @@ brake = false
 dio = 0
 [subsystems.mech.pwm_outputs.servo]
 channel = 0
+[subsystems.mech.sensors.angle]
+type = "CANcoder"
+can_id = 4
 
 [subsystems.other.motors.motor]
 can_id = 3
@@ -73,6 +77,16 @@ class SimHardwareTest : public ::testing::Test {
       if (state.motors[i].id == id) return state.motors[i];
     }
     ADD_FAILURE() << "No state for motor " << device;
+    return {};
+  }
+
+  hardware::SensorSample Sensor(std::string_view device) const {
+    const auto state = State();
+    const auto id = Id("mech", Kind::kCANcoder, device);
+    for (std::size_t i = 0; i < state.sensor_count; ++i) {
+      if (state.sensors[i].id == id) return state.sensors[i];
+    }
+    ADD_FAILURE() << "No state for sensor " << device;
     return {};
   }
 
@@ -385,6 +399,33 @@ TEST_F(SimHardwareTest, ResetAndRebootRefuseRequestsAsTheGatewayDoes) {
   EXPECT_DOUBLE_EQ(hw.motor_request("mech", "braked").demand, 40.0);
 
   EXPECT_THROW(hw.reset_device("mech", "led"), std::invalid_argument);
+}
+
+// REQ-SAFE-22: the gateway's feedback age bound (hardware::FeedbackFresh),
+// applied here too: a motor or CAN sensor whose position or velocity sample
+// is command_timeout_us (50 ms here) old or older, or of unknown age, is
+// invalid in the State; a microsecond younger is valid. Only that device.
+TEST_F(SimHardwareTest, FeedbackAsOldAsTheCommandTimeoutIsInvalid) {
+  constexpr std::uint32_t kUnknown = std::numeric_limits<std::uint32_t>::max();
+  struct Case {
+    std::uint32_t position_age_us;
+    std::uint32_t velocity_age_us;
+    bool valid;
+  };
+  for (const Case c : {Case{49'999, 49'999, true}, Case{50'000, 0, false},
+                       Case{0, 50'000, false}, Case{kUnknown, 0, false},
+                       Case{0, kUnknown, false}}) {
+    SCOPED_TRACE(std::to_string(c.position_age_us) + " " +
+                 std::to_string(c.velocity_age_us));
+    hw.set_motor("mech", "braked", 1.0, 2.0, c.position_age_us,
+                 c.velocity_age_us);
+    hw.set_cancoder("mech", "angle", 0.25, 0.5, c.position_age_us,
+                    c.velocity_age_us);
+    sim.step(5ms);
+    EXPECT_EQ(Motor("braked").valid, c.valid);
+    EXPECT_EQ(Sensor("angle").valid, c.valid);
+    EXPECT_TRUE(Motor("coasting").valid);
+  }
 }
 
 // The RoboRIO observes the mode every tick, delivered or not: a disable lost

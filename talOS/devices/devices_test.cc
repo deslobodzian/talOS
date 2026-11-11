@@ -494,14 +494,16 @@ TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   EXPECT_EQ(mech.cc.velocity_time(), sampled - 4ms);
   EXPECT_EQ(mech.gyro.yaw_time(), sampled - 5ms);
   EXPECT_EQ(mech.gyro.yaw_rate_time(), sampled - 6ms);
+  // An unknown age invalidates the whole sample, as at the gateway.
   hw->set_motor("mech", "a", 1.5, -2.0, UINT32_MAX, 0);
   hw->set_cancoder("mech", "cc", 0.2, 0.3, 0, UINT32_MAX);
   hw->set_gyro("mech", "gyro", 0.125, -0.5, UINT32_MAX, 0);
   sim.step(10ms);
-  EXPECT_EQ(mech.a.position_time(), std::nullopt);
-  EXPECT_TRUE(mech.a.velocity_time());
-  EXPECT_EQ(mech.cc.velocity_time(), std::nullopt);
-  EXPECT_EQ(mech.gyro.yaw_time(), std::nullopt);
+  EXPECT_FALSE(mech.a.connected());
+  EXPECT_EQ(mech.a.velocity_time(), std::nullopt);
+  EXPECT_EQ(mech.cc.position_time(), std::nullopt);
+  EXPECT_EQ(mech.gyro.yaw_rate_time(), std::nullopt);
+  hw->set_motor("mech", "a", 1.5, -2.0, 1000, 3000);
   hw->set_connected("mech", "a", false);
   sim.step(10ms);
   EXPECT_EQ(mech.a.velocity_time(), std::nullopt);

@@ -19,6 +19,7 @@
 #include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
+#include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
 
@@ -139,6 +140,14 @@ struct SimHardware::Impl {
   bool Connected(Kind kind, std::uint16_t id) const {
     return !disconnected.contains({TableOf(kind), id}) &&
            !masked.contains({TableOf(kind), id});
+  }
+  // The gateway's feedback age bound (Gateway::JudgeFeedbackAge), by its own
+  // rule: a motor or CAN sensor sample is valid only while both its ages
+  // are.
+  bool Fresh(const Axis& axis) const {
+    const std::uint64_t bound = config.hardware.command_timeout_us;
+    return hardware::FeedbackFresh(axis.position_age_us, bound) &&
+           hardware::FeedbackFresh(axis.velocity_age_us, bound);
   }
   // Every device of `node` named `device`, whatever its kind, keyed by
   // table; throws std::invalid_argument when there is none.
@@ -349,7 +358,7 @@ struct SimHardware::Impl {
       const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
       return hardware::MotorSample{
           .id = c.id,
-          .valid = true,
+          .valid = Fresh(axis),
           .position_rot = axis.position,
           .velocity_rps = axis.velocity,
           .stator_current_a = axis.stator_current_a,
@@ -365,7 +374,7 @@ struct SimHardware::Impl {
       }
       const Axis axis = ValueOr(sensors, c.id, Axis{});
       return hardware::SensorSample{.id = c.id,
-                                    .valid = true,
+                                    .valid = Fresh(axis),
                                     .position_rot = axis.position,
                                     .velocity_rps = axis.velocity,
                                     .position_age_us = axis.position_age_us,

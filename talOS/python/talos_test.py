@@ -451,14 +451,16 @@ can_id = 3
                 (signals.gyro.yaw_time, 5000),
                 (signals.gyro.yaw_rate_time, 6000)):
             self.assertEqual(actual, sampled - age * 1000)
+        # An unknown age invalidates the whole sample, as at the gateway.
         hw.set_motor("lift", "lift", 3, 2, 0xffffffff, 0)
         hw.set_cancoder("lift", "cc", 0.2, 0.3, 0, 0xffffffff)
         hw.set_gyro("lift", "gyro", 0.75, -0.5, 0xffffffff, 0)
         sim.step(0.02)
-        self.assertIsNone(signals.motor.position_time)
-        self.assertIsNotNone(signals.motor.velocity_time)
-        self.assertIsNone(signals.encoder.velocity_time)
-        self.assertIsNone(signals.gyro.yaw_time)
+        self.assertFalse(signals.motor.connected)
+        self.assertIsNone(signals.motor.velocity_time)
+        self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.gyro.yaw_rate_time)
+        hw.set_motor("lift", "lift", 3, 2, 1000, 3000)
         hw.set_connected("lift", "lift", False)
         sim.step(0.02)
         self.assertIsNone(signals.motor.velocity_time)
