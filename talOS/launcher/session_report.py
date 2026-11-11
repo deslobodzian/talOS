@@ -101,8 +101,9 @@ def request_to_command(records):
     (process, delays): for each observation (boot_id, observed_time_us) a
     merged /hw/command carries, its first command's time minus the first
     /hw/request/<node> carrying it. A command repeating an observation (the
-    heartbeat) is no reaction, and one no request carried (a timeout's neutral
-    command adopting the State) is skipped."""
+    heartbeat) is no reaction, and one no request carried by then (a timeout's
+    neutral command adopting the State, even if a request observing that State
+    follows it) is skipped."""
     first_request, commands, process = {}, [], None
     for r in records:
         hardware = r.get("hardware")
@@ -117,7 +118,7 @@ def request_to_command(records):
             process = r["process"]
     delays, seen = [], set()
     for now, key in sorted(commands, key=lambda c: c[0]):
-        if key not in seen and key in first_request:
+        if key not in seen and first_request.get(key, math.inf) <= now:
             delays.append(now - first_request[key])
         seen.add(key)
     return process, delays
