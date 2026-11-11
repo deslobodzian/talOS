@@ -1068,12 +1068,12 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
 }
 
 // REQ-OPS-20: /hw/status.configured is the current gateway boot's
-// acknowledgement of this bridge's configuration. A RoboRIO program restart
-// (a new boot id) sends States carrying config id 0 until the bridge's push is
-// acknowledged (measured on a RoboRIO: 19 States, 94 ms); an
-// acknowledgement from the retired boot must not report the new one
-// configured, and neither may a State naming our config id, which a gateway
-// reports even when applying it failed.
+// acknowledgement of this bridge's configuration. A RoboRIO program restart (a
+// new boot id) voids the last boot's acknowledgement, even when the new boot's
+// States name our config id (restored from its saved copy, or named after a
+// failed apply); so does a State naming another config id within one boot.
+// Either holds until the next acknowledgement. Measured on a RoboRIO: a new
+// boot's first 19 States (94 ms) carried config id 0.
 TEST(HardwareNodeTest, ConfiguredDropsOnGatewayRebootUntilAcknowledged) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -1086,17 +1086,16 @@ TEST(HardwareNodeTest, ConfiguredDropsOnGatewayRebootUntilAcknowledged) {
   ack.status = ConfigAckStatus::kOk;
   std::array<uint8_t, 128> ack_bytes{};
   const auto ack_size = EncodeConfigAck(ack, ack_bytes);
+  // Only Tick reads the socket, so the ack crosses real loopback; WaitFor's
+  // 10 s deadline bounds a hang only (docs/TESTING.md §6).
   const auto acknowledge = [&](uint64_t now_us) {
-    if (gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0, now_us,
-                          ack_bytes.data(),
-                          ack_size) != protocol::UdpStatus::kOk) {
-      return false;
-    }
-    for (int i = 0; i < 200 && !node.is_configured(); ++i) {
-      node.Tick(now_us);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return node.is_configured();
+    return gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 0, now_us,
+                             ack_bytes.data(),
+                             ack_size) == protocol::UdpStatus::kOk &&
+           WaitFor([&] {
+             node.Tick(now_us);
+             return node.is_configured();
+           });
   };
 
   ASSERT_TRUE(
@@ -1106,23 +1105,24 @@ TEST(HardwareNodeTest, ConfiguredDropsOnGatewayRebootUntilAcknowledged) {
       InjectState(node, gateway, TrustState(config_id, 11, 1, 2000), 1001000));
   ASSERT_TRUE(node.Status(1001000).configured());
 
-  // The RoboRIO program restarts: boot 12 has no configuration yet.
-  State unconfigured = TrustState(0, 12, 1, 500);
-  unconfigured.flags = 0;
-  ASSERT_TRUE(InjectState(node, gateway, unconfigured, 1050000));
+  // The RoboRIO program restarts; boot 12 names our config before it acks.
+  ASSERT_TRUE(
+      InjectState(node, gateway, TrustState(config_id, 12, 1, 500), 1050000));
   EXPECT_FALSE(node.Status(1050000).configured());
-  unconfigured.sample_time_us = 5500;
-  ASSERT_TRUE(InjectState(node, gateway, unconfigured, 1055000));
-  EXPECT_FALSE(node.Status(1055000).configured());
-  // It applies the push; its State names our config before its ack arrives.
+  ASSERT_TRUE(acknowledge(1050500));
   ASSERT_TRUE(
-      InjectState(node, gateway, TrustState(config_id, 12, 1, 10500), 1060000));
-  EXPECT_FALSE(node.Status(1060000).configured());
+      InjectState(node, gateway, TrustState(config_id, 12, 1, 1500), 1051000));
+  EXPECT_TRUE(node.Status(1051000).configured());
 
-  ASSERT_TRUE(acknowledge(1060500));
+  // Within boot 12 the gateway takes another configuration, then ours again.
+  ASSERT_TRUE(InjectState(node, gateway, TrustState(config_id + 1, 12, 2, 2500),
+                          1052000));
+  EXPECT_FALSE(node.Status(1052000).configured());
   ASSERT_TRUE(
-      InjectState(node, gateway, TrustState(config_id, 12, 1, 11500), 1061000));
-  EXPECT_TRUE(node.Status(1061000).configured());
+      InjectState(node, gateway, TrustState(config_id, 12, 3, 3500), 1053000));
+  EXPECT_FALSE(node.Status(1053000).configured());
+  ASSERT_TRUE(acknowledge(1053500));
+  EXPECT_TRUE(node.Status(1053500).configured());
 }
 
 // REQ-RT-20
