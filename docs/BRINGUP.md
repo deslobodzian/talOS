@@ -51,15 +51,23 @@ run inside a node. Timing from a busy host is not evidence (TESTING.md §6).
    `bazel run //talOS/vision/calibrate:calibrate_camera -- --board /tmp/charuco.png`.
    Print at exactly 200 pixels per 40 mm square (280 × 200 mm total), without
    scaling or cropping; mount it flat on rigid backing. The board uses 7 × 5
-   squares, 40 mm square length, 30 mm markers and `DICT_4X4_50`.
+   squares, 40 mm square length, 30 mm markers and `DICT_4X4_50`. The PNG
+   carries no print size: print it at 127 pixels per inch (e.g.
+   `magick charuco.png -units PixelsPerInch -density 127 charuco.pdf`, then
+   "actual size"). 280 mm does not fit US Letter (279.4 mm); use A4, A3 or
+   tabloid. Measure five squares along each axis: both must read the same
+   (200.0 mm); an overall scale error leaves the intrinsics unchanged, an
+   aspect error does not.
 2. Capture sharp, well-lit views at varied distances and tilts, moving the board
    across all image edges and the center. Keep the camera focus fixed. Use at
    least 12 distinct views, preferably 20–30; avoid motion blur and reflections.
    Existing image files must all have the same dimensions.
 3. For an image directory run
    `bazel run //talOS/vision/calibrate:calibrate_camera -- --images /absolute/path/images`.
-   Alternatively use `--device DEVICE_ID --seconds 120 --interval 1` for native
-   AVFoundation (macOS) or V4L2 (Linux) capture. On macOS, run
+   Alternatively use `--device DEVICE_ID --width W --height H --fps F
+   --seconds 120 --interval 1` (optionally `--exposure-ms MS --gain G`, Linux
+   only) for native AVFoundation (macOS) or V4L2 (Linux) capture, at the mode
+   the camera's config will run (an OV9281: 1280 × 800). On macOS, run
    `bazel run //talOS/vision/calibrate:calibrate_camera -- --list-devices` to
    print each camera's `DiscoverCaptureDevices()` uniqueID and name; camera
    permission is required. On Linux, use `ls -l /dev/v4l/by-id/` to find the
@@ -68,8 +76,9 @@ run inside a node. Timing from a busy host is not evidence (TESTING.md §6).
    Live robot vision refuses an empty device (no index fallback), logs one
    diagnostic, and publishes invalid observations and unhealthy status until
    configured and restarted. `--sim` does not require device ids.
-   Live capture requests the existing source default mode (1280 × 720). Match the resulting
-   width/height in deployment. Frames are sampled at the interval.
+   Live capture opens exactly that mode or fails naming it; set the camera
+   file's `width`/`height` to it (`--update` does). Frames are sampled at the
+   interval.
    Near-duplicate rejection compares the RMS
    displacement of corresponding board points when at least eight overlap;
    the threshold is 2.5% of image width.
