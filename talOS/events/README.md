@@ -278,33 +278,58 @@ session, or a changed version of one that was -- have done in that match?
 `input_replay.h` answers it without comparing anything:
 
 ```cpp
-const RecordedSession session{"/tmp/talos_logs/<session>"};  // every *.tlog
+// Every *.tlog; "estimator" is the replayed program's process name.
+const RecordedSession session{"/tmp/talos_logs/<session>", "estimator"};
 SimulationEnvironment environment;
 SimulatedEventLoop<log::LogWriter> loop{
     environment, log::LogWriter{"/tmp/out/estimator.tlog", "estimator"},
-    {.start = session.start()}};
+    {.start = session.loop_start(), .run_start = session.run_start()}};
 Estimator estimator{loop};                 // registers its watchers
 const InputReplayReport report = ReplayInputs(loop, environment, session);
 ```
 
 - `RecordedSession` reads every log of a session directory. A topic's
   messages come from whichever logs recorded them: the writer's accepted
-  `SEND`s or readers' receipts. Both preserve the writer's publication time.
-  One message seen in several logs is kept once, by topic and transport
-  sequence. Logs from two sessions, or a topic recorded with two schemas,
-  are refused.
-- `ReplayInputs` runs the loop on its virtual clock from the session's origin
-  to its last recorded time. Each recorded message on a topic the program
-  watches is published at the writer's publication time, so the next drain
-  delivers it with its original age. Topics the program sends are its own
-  output and are not fed; what it sends goes to its recorder, a new log.
+  `SEND`s or readers' receipts. An event loop's `SEND` and its readers'
+  receipts carry the same transport sequence and publication time; the
+  hardware bridge's log does not (its `/hw/state` `SEND`s carry its receive
+  time, in microseconds, and its count of States received). One message seen
+  in several logs is kept once, by topic and transport sequence, at the
+  earliest time recorded. Logs from two sessions, or a topic recorded with
+  two schemas, are refused.
+- A program the session ran (logs carrying its process name) replays on its
+  own recorded timeline. Each process's log has its own origin, and its
+  loop's schedule counts from when its `run()` began, after construction
+  (`RealtimeEventLoop`), so the loop starts at its first run's origin
+  (`loop_start()`) with its run starting where that run's did (`run_start()`:
+  its first timer firing's deadline minus the timer's manifest offset): its
+  timers fire at the recorded deadlines. A topic it watched live is fed from
+  its own receipts alone, each at the drain that delivered it live (its
+  `MESSAGE` record's event time), with its recorded publication time; the
+  replayed drain runs at its deadline, without the live loop's wake-up
+  latency, so a message published during that latency is stamped with the
+  deadline. A message one live drain missed, and the next took, is taken by
+  that next drain again. A watcher that took only the newest message sees no
+  skipped message, so its dropped count is zero. The replay ends at the program's
+  last record (`loop_end()`).
+- `ReplayInputs` runs the loop on its virtual clock to `loop_end()`, the end
+  of the session for a program it did not run. Each recorded message on a
+  topic the program watches is published with its publication time at its
+  delivery instant (`RecordedMessage::delivered`: its publication time, or
+  its live drain), so the drain there delivers it with its original age.
+  Topics the program sends are its own output and are not fed; what it sends
+  goes to its recorder, a new log.
 - A watched topic recorded with another schema (name or hash in the
   per-topic descriptors) throws `ReplayError` before anything runs, naming
   both types and who recorded it. Watched topics no log recorded are listed in
   `InputReplayReport::unrecorded`; nothing arrives on them.
 
-Replay feeds inputs from the session origin, including messages a live node
-missed during startup; its output may differ from the live log at the beginning.
+Replay feeds a topic the program did not watch live from the session origin,
+including messages it would have missed during startup; its output may differ
+from the live log at the beginning. An unchanged program replayed from its
+own session sends what it sent live, at the same deadlines, except for what
+the live loop's wake-up latency put into it (`now()` at a dispatch is the
+deadline, not the deadline plus that latency).
 Pass an explicit `--session-id` to keep that header field stable. The log's
 wall-clock start timestamp remains informational.
 

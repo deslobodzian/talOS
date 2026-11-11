@@ -514,8 +514,13 @@ bazel run //talOS/launcher:log_dump -- /tmp/pose_estimator_replay/<new-session-i
 
 Only the selected node starts; its output is a new log, not a comparison with
 the recorded outputs. The output directory must not be inside the input
-session. See [input replay](../events/README.md#replaying-another-sessions-inputs)
-for timing and schema checks.
+session. A node the session ran replays on its own recorded timeline: its
+timers fire at the deadlines they fired at live, and it is handed what it
+received live, at the ticks it received it, so an unchanged node sends what it
+sent, except for what its loop's wake-up latency put into it (`now()`, and
+ages measured from it). See
+[input replay](../events/README.md#replaying-another-sessions-inputs) for
+timing and schema checks.
 
 A node that reads the declared graph (`telemetry`, `teleop`) replays on the
 one the session was launched with, the session's `declared_graph.json` (a

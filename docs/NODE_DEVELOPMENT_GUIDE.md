@@ -593,7 +593,10 @@ odometry plus cameras, with `backend = "kalman"` (wpimath
 smoother), and tests that run its scenarios against both.
 
 Tune or verify offline with `launcher --replay-inputs <session> --only <node>`.
-The node runs on a simulated loop fed recorded inputs from the session origin
-(monotonic t = 0), including messages missed during live startup. Two replays
+The node runs on a simulated loop fed recorded inputs from the session origin,
+including messages missed during live startup; a node the session ran runs on
+its own recorded timeline and is handed what it received live, at the ticks it
+received it ([input replay](../talOS/events/README.md#replaying-another-sessions-inputs)).
+Two replays
 of a session yield bit-identical records; pass `--session-id <id>` if you need
 to pin the header session ID as well.

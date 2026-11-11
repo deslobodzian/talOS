@@ -1145,21 +1145,25 @@ class OfflinePort final : public LoopPortFor<Loop> {
   }
 };
 
-// --replay-inputs: this node, on a simulated loop starting at the recorded
-// session's origin, fed every message the session logged on a topic it
-// watches at its recorded time (talOS/events/input_replay.h). What it sends
-// is logged to --log. A topic recorded with another schema fails before
-// anything runs; topics nobody recorded are listed.
+// --replay-inputs: this node, on a simulated loop on the recorded clock, fed
+// every message the session logged on a topic it watches at its recorded
+// time (talOS/events/input_replay.h). A node the session logged runs on its
+// own recorded timeline (origin and run start, so its timers fire at the
+// recorded deadlines) and is handed what it received live, at the drains it
+// received it in. What it sends is logged to --log. A topic recorded with
+// another schema fails before anything runs; topics nobody recorded are
+// listed.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
-  const event::RecordedSession session{flags.replay_inputs};
+  const event::RecordedSession session{flags.replay_inputs, node_name};
   event::SimulationEnvironment environment;
   Loop loop{
       environment,
       event::log::LogWriter{flags.log_path, node_name,
                             event::log::LogWriterOptions{}, flags.session_id},
-      Loop::Options{.start = session.start()}};
+      Loop::Options{.start = session.loop_start(),
+                    .run_start = session.run_start()}};
   const Hosted hosted =
       Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =

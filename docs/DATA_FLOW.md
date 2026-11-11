@@ -311,7 +311,8 @@ feedback—is fresh and finite; invalid feedback neutralizes the follower.
 
 `.tlog` version **7** carries a publication timestamp on each message dispatch
 and send, separate from event/dispatch time. Exact replay preserves publication
-age; input replay injects at the recorded publication time rather than receipt.
+age; input replay injects with the recorded publication time, at that time,
+or, for a node the session ran, at the drain that received it.
 Older formats are rejected with the recorded and supported versions. The packed
 file header is **120 B**, manifest entry **112 B**, and record header **64 B**,
 followed by stored payload bytes (`talOS/events/log/format.h`).
