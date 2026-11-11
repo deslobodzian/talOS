@@ -82,6 +82,25 @@ cc_library(
     ],
 )
 
+# Each member's share of the session's event-log budget.
+cc_library(
+    name = "log_budget",
+    srcs = ["log_budget.cc"],
+    hdrs = ["log_budget.h"],
+    deps = [
+        ":describe_graph",
+        "//talOS/bridge:messages",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/hardware",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
+        "//talOS/schema:identity",
+    ],
+)
+
 # One session's event logs merged by time, for log_dump.
 cc_library(
     name = "log_merge",
@@ -133,6 +152,7 @@ cc_library(
     deps = [
         ":child_output",
         ":describe_graph",
+        ":log_budget",
         ":roster",
         ":session",
         ":spawn",
@@ -352,6 +372,7 @@ cc_test(
     tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
+        ":log_budget",
         ":log_merge",
         "//talOS/driver_station",
         "//talOS/events:events_log",

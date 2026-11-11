@@ -16,9 +16,6 @@
 #include <sstream>
 #include <utility>
 
-#include "talOS/events/log/format.h"
-#include "talOS/schema/identity.h"
-
 namespace talos::launcher {
 
 uint64_t GenerateSessionId() {
@@ -134,55 +131,6 @@ void ManifestWriter::Persist(const std::string& contents,
     std::cerr << "[launcher] " << path_ << " persisted again\n";
     failing_ = false;
   }
-}
-
-double ExpectedLogRate(const introspect::Description& declared,
-                       int64_t period_us) {
-  double per_tick = sizeof(event::log::RecordHeader);
-  for (const auto& source : declared.sources) {
-    if (source.schema_hash == schema::BytesHash()) continue;
-    per_tick += static_cast<double>(sizeof(event::log::RecordHeader) +
-                                    source.message_bytes);
-  }
-  return per_tick * 1e6 / static_cast<double>(std::max<int64_t>(period_us, 1));
-}
-
-std::vector<uint64_t> SplitLogBudget(uint64_t budget,
-                                     const std::vector<bool>& logs,
-                                     const std::vector<double>& rates) {
-  std::vector<uint64_t> shares(logs.size(), 0);
-  std::size_t loggers = 0;
-  std::size_t known = 0;
-  double known_sum = 0;
-  for (std::size_t i = 0; i < logs.size(); ++i) {
-    if (!logs[i]) continue;
-    ++loggers;
-    if (rates[i] >= 0) {
-      ++known;
-      known_sum += rates[i];
-    }
-  }
-  if (loggers == 0) return shares;
-  const double mean = known > 0 ? known_sum / static_cast<double>(known) : 1;
-  double total = 0;
-  std::vector<double> weights(logs.size(), 0);
-  for (std::size_t i = 0; i < logs.size(); ++i) {
-    if (!logs[i]) continue;
-    weights[i] = rates[i] >= 0 ? rates[i] : mean;
-    total += weights[i];
-  }
-  const double equal =
-      static_cast<double>(budget) / 4.0 / static_cast<double>(loggers);
-  const double weighted =
-      static_cast<double>(budget) - equal * static_cast<double>(loggers);
-  for (std::size_t i = 0; i < logs.size(); ++i) {
-    if (!logs[i]) continue;
-    const double share =
-        equal + (total > 0 ? weighted * weights[i] / total
-                           : weighted / static_cast<double>(loggers));
-    shares[i] = std::max<uint64_t>(1, static_cast<uint64_t>(share));
-  }
-  return shares;
 }
 
 int64_t WallClockNanos() {

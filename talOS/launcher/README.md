@@ -677,10 +677,24 @@ At startup, retention removes older sessions: directories holding a
 that id (what `--replay-inputs` leaves). `[robot] log_keep_sessions` defaults
 to 50, including the new session; `log_max_bytes` defaults to 2 GiB. Both must
 be positive integers; config load refuses another type or value. Half the byte budget is reserved for the new session's event logs
-and divided among logging members: a quarter of it equally, the rest by each
-member's expected record rate (one record per declared source per
-`period_us` tick, byte topics excluded since they are never logged;
-`SplitLogBudget`). Restarts share their member's remaining budget, but never
+and divided among logging members in proportion to the bytes each member's
+log is expected to store per second, so every capped member keeps about the
+same length of the session's history (REQ-OPS-32; `log_budget.h`). From the
+member's `--describe` and the config: a timer or sender records once per
+`period_us` tick; a sequence watcher (a subscription with a callback)
+records every message at its writer's rate, and a latest-only watcher at
+most once per tick (`--describe`'s `latest_only`); a target-lane reader adds
+one payload-free READ per tick. Each record is its 64 B header plus the
+payload without trailing zeros: a user topic's message size, and for a
+hardware packet its size word and encoded bytes from the config's devices,
+not the 1436 B `hardware::Packet` (`/hw/state` once per gateway tick, the
+Driver Station and `/hw/status` at 50 Hz, `/hw/request/<node>` at its node's
+rate). The hardware bridge logs only the State it publishes and the commands
+it sends (at most one per actuator owner's request), so only those count for
+it. Byte topics are never logged. A member that did not answer `--describe`
+weighs as the mean of the others, and every member gets at least the
+smallest share at which its log rotates (two segments of its prefix and
+largest record) while those fit in the budget. Restarts share their member's remaining budget, but never
 get less than half of its share: to make that room the launcher deletes the
 earlier runs' oldest log files (never the newest file of the run that just
 ended) and marks those runs `log_capped`. Older sessions are retained within

@@ -29,6 +29,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/file_digest.h"
+#include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/log_merge.h"
 
 namespace talos::launcher {
@@ -379,6 +380,9 @@ introspect::naming::SourceShape Sender(std::string topic,
                                        std::uint32_t bytes = 48);
 introspect::naming::SourceShape Watcher(std::string topic,
                                         std::uint32_t bytes = 48);
+introspect::naming::SourceShape Endpoint(event::SourceKind kind,
+                                         std::string topic,
+                                         std::uint32_t bytes);
 std::string ReadFile(const std::string& path);
 
 TEST(LauncherTest, DescribeDeadlineAppliesAfterStdoutCloses) {
@@ -774,20 +778,90 @@ TEST(LauncherTest, SessionReadersSkipALogCutBeforeItsHeader) {
   std::filesystem::remove_all(dir);
 }
 
-// A quarter of the budget is split equally, the rest by rate; an unknown
-// rate weighs as the mean of the known ones; a member without a log gets
-// nothing; the shares never exceed the budget.
-TEST(LauncherTest, SplitLogBudgetWeightsByRateAboveAnEqualFloor) {
-  const uint64_t budget = 4000;
-  const auto shares = SplitLogBudget(budget, {true, true, true, false},
-                                     {300.0, 0.0, -1.0, 500.0});
+// REQ-OPS-32: a member's expected log bytes count what its log stores, at
+// the rate it stores it: /hw/state once per gateway tick and trimmed to its
+// encoded State (not the 1436 B Packet), for a 10 ms member too; a
+// latest-only watcher at most once per tick; the bridge only the State and
+// commands it logs, not the ends it declares and never logs.
+TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
+  const auto robot = config::ParseRobotConfigString(kFixtureToml);
+  using event::SourceKind;
+  using introspect::naming::SourceShape;
+  const auto packet = [](SourceKind kind, std::string topic) {
+    return Endpoint(kind, std::move(topic), sizeof(hardware::Packet));
+  };
+  SourceShape latest = Watcher("/alpha/state", 48);
+  latest.flags = introspect::naming::kSourceFlagLatestOnly;
+  NodeDescription alpha{.roster_name = "alpha", .answered = true};
+  alpha.declared = {"alpha", "", {Sender("/alpha/state", 48)}};
+  NodeDescription beta{.roster_name = "beta", .answered = true};
+  beta.declared = {
+      "beta",
+      "",
+      {packet(SourceKind::WATCHER, hardware::kStateTopic), latest,
+       packet(SourceKind::SENDER, hardware::RequestTopic("beta"))}};
+  NodeDescription bridge{.roster_name = "hardware_node", .answered = true};
+  bridge.declared = {
+      "hardware_node",
+      "",
+      {packet(SourceKind::SENDER, hardware::kStateTopic),
+       packet(SourceKind::SENDER, hardware::kCommandTopic),
+       packet(SourceKind::SENDER, hardware::kDriverStationTopic),
+       packet(SourceKind::FETCHER, hardware::RequestTopic("alpha")),
+       packet(SourceKind::FETCHER, hardware::RequestTopic("beta"))}};
+  const TopicLoads loads = DeclaredTopicLoads({alpha, beta, bridge}, robot);
+
+  // Two motors: 84 + 2 x 45 + 34 encoded bytes after the Packet's size word.
+  const TopicLoad state = loads.at(hardware::kStateTopic);
+  EXPECT_DOUBLE_EQ(state.per_second, 200);
+  EXPECT_DOUBLE_EQ(state.stored_bytes, 4 + 84 + 2 * 45 + 34);
+  // A request carries its owner's one motor: 38 + 20.
+  EXPECT_DOUBLE_EQ(loads.at(hardware::RequestTopic("beta")).stored_bytes,
+                   4 + 38 + 20);
+  // At most one command per owner request: here only beta's (alpha's
+  // describe sends none).
+  const TopicLoad command = loads.at(hardware::kCommandTopic);
+  EXPECT_DOUBLE_EQ(command.per_second, 100);
+  EXPECT_DOUBLE_EQ(command.stored_bytes, 4 + 38 + 20);
+
+  // beta at 100 Hz: every State (200/s), the newest /alpha/state per tick
+  // (100 of 200/s), and its request per tick.
+  EXPECT_DOUBLE_EQ(
+      ExpectedLogRate(beta.declared, 10000, false, loads),
+      200 * (64 + state.stored_bytes) + 100 * (64 + 48) + 100 * (64 + 62));
+  // The bridge: the States it publishes and the commands it sends, nothing
+  // for the Driver Station packets or the requests it only relays.
+  EXPECT_DOUBLE_EQ(ExpectedLogRate(bridge.declared, 5000, true, loads),
+                   200 * (64 + state.stored_bytes) + 100 * (64 + 62));
+}
+
+// REQ-OPS-32: shares are in proportion to the expected rates, so equal
+// rates of history fit each share; an unknown rate weighs as the mean of the
+// known; a member whose share would not rotate gets its floor and the others
+// share the rest; a member without a log gets nothing; the shares never
+// exceed the budget, and floors that do not fit are scaled into it.
+TEST(LauncherTest, SplitLogBudgetIsProportionalAboveEachFloor) {
+  const auto shares = SplitLogBudget(4000, {true, true, true, false},
+                                     {300.0, 100.0, -1.0, 500.0}, {0, 0, 0, 0});
   ASSERT_EQ(shares.size(), 4u);
-  // Floor 4000 / 4 / 3 = 333; the 3000 left go 2:0:1 (unknown = mean 150).
-  EXPECT_EQ(shares[0], 333u + 2000u);
-  EXPECT_EQ(shares[1], 333u);
-  EXPECT_EQ(shares[2], 333u + 1000u);
+  // 300 : 100 : 200 (the mean).
+  EXPECT_EQ(shares[0], 2000u);
+  EXPECT_EQ(shares[1], 666u);
+  EXPECT_EQ(shares[2], 1333u);
   EXPECT_EQ(shares[3], 0u);
-  EXPECT_LE(shares[0] + shares[1] + shares[2], budget);
+
+  // The second member's proportional 400 is below its 1000 floor: it is
+  // held there and the other two share the remaining 3000 as 3 : 2.
+  const auto floored = SplitLogBudget(4000, {true, true, true},
+                                      {300.0, 40.0, 200.0}, {100, 1000, 100});
+  EXPECT_EQ(floored[0], 1800u);
+  EXPECT_EQ(floored[1], 1000u);
+  EXPECT_EQ(floored[2], 1200u);
+
+  const auto tight =
+      SplitLogBudget(1000, {true, true}, {1.0, 1.0}, {1500, 500});
+  EXPECT_EQ(tight[0], 750u);
+  EXPECT_EQ(tight[1], 250u);
 }
 
 TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
@@ -1587,7 +1661,9 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
 
   // A manifest that is not TOML is an error, not a silently empty bundle.
-  { std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n"; }
+  {
+    std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n";
+  }
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));

@@ -17,6 +17,7 @@
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/launcher/log_budget.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -114,26 +115,27 @@ void PrintManifest(const SessionManifest& manifest) {
   std::cout << "==================================================\n";
 }
 
-// Each logging member's share of the session's log budget, weighted by its
-// expected record rate (SplitLogBudget); its restarts draw on what its
-// earlier runs left (Launcher::Restart).
+// Each logging member's share of the session's log budget, in proportion to
+// the bytes its log is expected to store per second, and at least what
+// rotates (log_budget.h); its restarts draw on what its earlier runs left
+// (Launcher::Restart).
 std::vector<uint64_t> LogBudgets(const std::vector<NodeProcessInfo>& procs,
                                  const std::vector<NodeDescription>& described,
                                  const config::RobotConfig& robot_config,
                                  uint64_t session_log_budget) {
+  const TopicLoads loads = DeclaredTopicLoads(described, robot_config);
   std::vector<bool> logs(procs.size());
   std::vector<double> rates(procs.size(), -1);
+  std::vector<uint64_t> floors(procs.size(), 0);
   for (std::size_t i = 0; i < procs.size(); ++i) {
     logs[i] = !procs[i].log_path.empty();
     if (!described[i].answered) continue;
-    const auto period_us =
-        robot_config.toml_data["subsystems"][procs[i].name]["period_us"]
-            .value_or<int64_t>(
-                robot_config.toml_data["robot"]["period_us"].value_or<int64_t>(
-                    5000));
-    rates[i] = ExpectedLogRate(described[i].declared, period_us);
+    rates[i] = ExpectedLogRate(described[i].declared,
+                               MemberPeriodUs(robot_config, procs[i].name),
+                               procs[i].name == kHardwareNodeName, loads);
+    floors[i] = SmallestRotatingShare(described[i].declared);
   }
-  return SplitLogBudget(session_log_budget, logs, rates);
+  return SplitLogBudget(session_log_budget, logs, rates, floors);
 }
 
 // Totals every run's event log into `procs` once the session has ended --
