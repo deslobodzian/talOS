@@ -322,8 +322,9 @@ largest record)) segments of cap / n bytes, each a complete version-7 log
 (its own header, manifest and schema block, then whole records). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
-`log_dump` and `--replay-inputs` read every segment in a session directory,
-and `log_dump` given one log's file reads that log's kept segments with it;
+`log_dump`, `tlog_to_wpilog` and `--replay-inputs` read every segment in a
+session directory, and `log_dump` or `tlog_to_wpilog` given one log's file
+reads that log's kept segments with it;
 exact `--replay` needs the first segment, since a later one starts
 mid-session. Rotation syncs each finished segment and the next one's header
 before renaming it into place, and the cap marker before deleting the oldest,

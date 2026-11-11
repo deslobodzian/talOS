@@ -220,7 +220,9 @@ a dispatch `record_read()` records nothing. An early shutdown stops
 further dispatch even when collecting divergences. External shutdown is
 represented by the terminal `EXIT` record.
 
-Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`.
+Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`, or
+convert it for AdvantageScope with `bazel run //talOS/launcher:tlog_to_wpilog --
+/tmp/run.tlog -o /tmp/run.wpilog` (talOS/launcher/README.md).
 
 ## Replaying another session's inputs
 

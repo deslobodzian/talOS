@@ -896,6 +896,99 @@ DS silence, missing topics and unknown intervals limit acceptance; retain the
 raw session. Clock offset ranges measure the estimator, not absolute clock
 synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.
 
+### Converting a session to WPILOG
+
+`tlog_to_wpilog` (`//talOS/launcher:tlog_to_wpilog`) writes a session's
+`.tlog`s as one WPILib DataLog (`.wpilog`, format 1.0), the file
+AdvantageScope and WPILib's DataLogTool open. It reads and merges the logs
+with the same reader and `MergeLogs` as `log_dump`, decodes payloads from the
+schemas the logs carry (no recording build needed), and writes the file with
+its own small writer (`wpilog.h`; no WPILib dependency). Offline only.
+
+```sh
+bazel run //talOS/launcher:tlog_to_wpilog -- /tmp/talos_logs/<session> \
+  -o /tmp/match.wpilog
+bazel run //talOS/launcher:tlog_to_wpilog -- a.tlog b.tlog -o /tmp/ab.wpilog
+```
+
+Inputs are `.tlog` files (with their kept rotated segments, as `log_dump`
+reads them) or session directories (every `*.tlog` in one, restarts
+included), all from one session; a log named twice (its directory and
+the file) is read once. Then open the file in AdvantageScope
+(File > Open Log(s)...): topics appear under their names, and a pose entry
+(below) can be dragged onto the 2D Field view as a robot pose.
+
+Mapping:
+
+| Recorded | WPILOG entry | Type |
+|---|---|---|
+| a scalar field of a struct message | `<topic>/<field>`, nested structs joined with `/` (`/drivetrain/state/module0/angle_rad`) | from the FlatBuffers base type: `double`, `float`, `boolean`; every integer and enum `int64` |
+| a fixed array of scalars | `<topic>/<field>` | `double[]`, `float[]`, `boolean[]`, `int64[]` |
+| a fixed array of structs | `<topic>/<field>/<index>/<subfield>` | per element field, as above |
+| a target lane (`TargetEnvelope<M>`) | `<topic>/mode_since_us`, `<topic>/active`, `<topic>/message/<field>` | `int64`, `boolean`, as above |
+| a `geometry.Pose2d` (talOS/msgs), as well as its three fields | `<topic>/<path to it>`, or `<topic>/pose` when the Pose2d is the whole message | `double[]` `[x_m, y_m, yaw_rad]`, AdvantageScope's legacy number-array pose |
+| a reader's dropped count (`aux` of a MESSAGE record) | `/talos_log/dropped/<node><topic>`, cumulative | `int64` |
+
+Field names keep their unit suffix (`position_m`), and each entry's metadata
+is JSON naming the schema and, from the suffix, the unit
+(`{"source":"talos.tlog","schema":"geometry.PoseEstimate","unit":"m"}`).
+Pose2d is the only extra mapping; other messages (a swerve module position,
+an odometry sample) appear only as their fields.
+
+An entry name belongs to the first topic to publish a value under it. A
+topic whose field path lands on a name another topic owns (`/arm/state`
+field `left.angle_rad` and topic `/arm/state/left` field `angle_rad` are
+both `/arm/state/left/angle_rad`) gets `<topic>:<field path>` instead
+(`/arm/state/left:angle_rad`), which no topic or field name can spell, and
+the converter prints one warning naming both.
+
+Which records, and when:
+
+- Each publication is written once. A publication is its topic, RTMS
+  sequence and publish time, which its writer's `SEND` record and every
+  reader's `MESSAGE` record of it share. Its values come from the `SEND`
+  when the writer's log holds it, otherwise from the first `MESSAGE` of it
+  in merge order, from any reader. So a reader's copy fills what the
+  writer's log lacks (the oldest segments a byte cap deleted, a tail cut by
+  a crash or a stopped capture), and a writer that was not logged at all is
+  rebuilt from everything its readers received. A send the transport
+  refused (`aux` not OK) was never published and is skipped.
+- Each value is stamped with the message's publish time, the record's
+  `publish_time_ns` (a SEND's is the publishing dispatch's `now`; a
+  MESSAGE's is the writer's, carried with the payload), so a writer's copy
+  and a reader's copy carry the same time. That is the recording machine's
+  monotonic clock (`CLOCK_MONOTONIC` in a live session, the simulated clock
+  under `--sim` or replay), in microseconds after the earliest log start
+  (`FileHeader::start_monotonic_ns`) of the input. A dropped count is
+  stamped with the publish time of the message after the gap. Wall-clock
+  time is not used.
+- Timer, exit, scheduling and READ records carry no message and are skipped. Byte
+  topics (`talos.Bytes`, such as `/talos/telemetry`), the hardware packet, and
+  any topic whose schema cannot be read are skipped, each named once on
+  stderr.
+
+Caveats: a `ulong` field becomes `int64` with its bits kept, so a value above
+2^63 - 1 reads negative (a `sample_time_ns` never gets there); enums are their
+numeric value, not their name; hardware packets (`/hw/state`,
+`/hw/request/<node>`), which `log_dump` decodes with the wire codecs, are not
+converted. Damage is read as `log_dump` reads it: a damaged record or a cut
+tail is skipped with a warning naming the log, and a log cut inside its
+header is skipped. A file that is not a `.tlog`, a manifest that fails its
+checksum, an unsupported format version, a mismatched session id, or no
+readable log is an error: the converter prints `tlog_to_wpilog: error: ...`
+naming the file and exits 1 without writing the output. A write that fails
+(a full disk) also exits 1, and the partial output is removed. Usage errors
+also exit 1.
+
+Memory: the merge holds the whole session at once, every input file's bytes
+while it reads them and every record decoded (its 64-byte header, the node
+and topic names, the payload), and the converter adds its per-publication
+bookkeeping. Estimated from those structures, not measured: the input's
+`.tlog` bytes plus about 0.4 KB and the payload per record. Convert on a
+development machine, not the robot. With records of about 120 bytes on
+disk, that is roughly five times the logs' size: a 300 MB session needs
+about 1.5 GB.
+
 ## If you change the shape of `graph.json`
 
 Studio parses this document in TypeScript (`studio/src/system.ts`), and neither
