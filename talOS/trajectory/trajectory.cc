@@ -208,6 +208,12 @@ void Trajectory::assign(std::span<const TrajectorySample> samples,
   split_starts_.assign(1, 0);
 }
 
+void Trajectory::clear() {
+  samples_.clear();
+  events_.clear();
+  split_starts_.clear();
+}
+
 double Trajectory::total_time_s() const {
   return samples_.empty() ? 0 : samples_.back().t_s;
 }

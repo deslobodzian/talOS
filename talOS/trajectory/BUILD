@@ -3,19 +3,21 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Time-indexed holonomic trajectories, the Choreo .traj loader, alliance
-# flips and HolonomicFollower (README.md). Beside the node stack: no
+# Time-indexed holonomic trajectories, the Choreo .traj loader, straight
+# lines, alliance flips and HolonomicFollower (README.md). Beside the node stack: no
 # dependency on talOS/node or any robot.
 cc_library(
     name = "trajectory",
     srcs = [
         "choreo.cc",
         "holonomic_follower.cc",
+        "straight_line.cc",
         "trajectory.cc",
     ],
     hdrs = [
         "choreo.h",
         "holonomic_follower.h",
+        "straight_line.h",
         "trajectory.h",
     ],
     deps = [
@@ -39,6 +41,16 @@ cc_test(
     name = "trajectory_test",
     size = "small",
     srcs = ["trajectory_test.cc"],
+    deps = [
+        ":trajectory",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "straight_line_test",
+    size = "small",
+    srcs = ["straight_line_test.cc"],
     deps = [
         ":trajectory",
         "@googletest//:gtest_main",

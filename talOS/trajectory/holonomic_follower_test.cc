@@ -1,5 +1,6 @@
 // HolonomicFollower: convergence on a simulated holonomic point mass along
-// the curved fixture (with an initial offset, a shove and a drift), output
+// the curved fixture and a generated straight line (with an initial offset,
+// a shove and a drift), output
 // clamps and frames, heading wrap, validation and determinism.
 
 #include "talOS/trajectory/holonomic_follower.h"
@@ -17,6 +18,7 @@
 
 #include "talOS/geometry/se2.h"
 #include "talOS/trajectory/choreo.h"
+#include "talOS/trajectory/straight_line.h"
 #include "talOS/trajectory/test_fixtures.h"
 #include "talOS/trajectory/trajectory.h"
 
@@ -111,6 +113,26 @@ TEST(HolonomicFollowerTest, ConvergesOnCurvedPath) {
     EXPECT_LT(result.final_heading_error_rad, 0.01);
     EXPECT_TRUE(result.finished);
     EXPECT_GE(result.finished_at_s, trajectory.total_time_s());
+  }
+}
+
+// Guards: a generated straight line (3.6 m and a 2.5 rad turn, built from
+// the pose a node would hold) is followed unchanged: from the same start
+// offset the follower converges onto it and finishes at its end.
+// REQ-DEV-20
+TEST(HolonomicFollowerTest, ConvergesOnStraightLine) {
+  Trajectory line;
+  line.reserve(kStraightLineSamples);
+  ASSERT_TRUE(MakeStraightLine(MakePose(1, 1, 0), MakePose(4, 3, 2.5),
+                               {2.0, 3.0, 3.0, 6.0}, line));
+  for (const SpeedsFrame frame : {SpeedsFrame::kField, SpeedsFrame::kRobot}) {
+    SCOPED_TRACE(frame == SpeedsFrame::kField ? "field" : "robot");
+    const RunResult result = Simulate(line, {}, frame, {}, 1.5);
+    EXPECT_LT(result.max_error_after_m, 0.06);
+    EXPECT_LT(result.final_error_m, 0.01);
+    EXPECT_LT(result.final_heading_error_rad, 0.01);
+    EXPECT_TRUE(result.finished);
+    EXPECT_GE(result.finished_at_s, line.total_time_s());
   }
 }
 

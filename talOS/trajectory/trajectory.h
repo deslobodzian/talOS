@@ -103,12 +103,14 @@ class Trajectory {
   // the live pose, say): reserve() once in the constructor, then assign()
   // replaces the samples (no events, one split) without allocating while
   // samples.size() <= capacity(). assign() validates as the constructor does
-  // and leaves the trajectory unchanged when it throws.
+  // and leaves the trajectory unchanged when it throws. clear() empties it
+  // and keeps the reserved capacity.
   void reserve(std::size_t sample_count);
   std::size_t capacity() const { return samples_.capacity(); }
   void assign(
       std::span<const TrajectorySample> samples,
       Interpolation interpolation = Interpolation::kConstantAcceleration);
+  void clear();
 
   bool empty() const { return samples_.empty(); }
   Interpolation interpolation() const { return interpolation_; }
