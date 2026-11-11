@@ -73,7 +73,7 @@ Beside the stack:
 | `talOS/geometry` | header-only SO2/SE2/SO3/SE3 on Eigen 3.4 (`@eigen3`); C++ drivetrain kinematics and vision transforms |
 | `talOS/aiming` | shooter aiming library (no node): `ShotTable` (distance → flywheel, hood, time of flight; clamped and flagged outside its range), `TargetSolver` (static and shoot-on-the-move aim for a fixed shooter or a turret, bounded time-of-flight iteration) and `ReadinessGate` (ready to fire, first failing reason, tick debounce) |
 | `talOS/trajectory` | time-indexed holonomic trajectories (`sample(t)`, event markers, splits), the Choreo `.traj` loader (`@nlohmann_json`), straight-line moves between two poses (`MakeStraightLine`, trapezoidal, allocation-free into a reserved trajectory), alliance flips (rotate or mirror) and `HolonomicFollower` (feedforward plus PID to a chassis speed); depends only on `talOS/geometry` |
-| `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, field simulation and fixtures; OpenCV 4.12 image conversion/IO |
+| `talOS/vision` | camera/frame/backend contracts, calibration, localization and pipeline; AprilTag 3.4.5 CPU detection, macOS Metal preprocessing/CCL, AVFoundation/V4L2 capture, recorded-footage playback (`playback`, a `camera.device = "recording:<dir>"`), field simulation and fixtures; OpenCV 4.12 image conversion/IO |
 | `talOS/python/requirements.txt` | Python `robotpy-wpimath` pose estimation and GTSAM factor graphs; `wpilib_lockstep_test` aligns GradleRIO with the RobotPy wheels, not C++ dependencies |
 
 Live node identity is registered before user construction, with the
