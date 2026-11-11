@@ -33,10 +33,14 @@ constexpr std::string_view kPrefix = "talos-wake-";
 constexpr std::string_view kDigits = "0123456789abcdef";
 constexpr std::size_t kNameBytes = kPrefix.size() + 16;
 
+// No send raises SIGPIPE: MSG_NOSIGNAL where the SDK defines it (Linux, and
+// macOS SDKs that define it, as macOS 26.3's does), and on macOS also
+// SO_NOSIGPIPE on the socket (OpenSocket), which alone covers an SDK
+// without MSG_NOSIGNAL. Either guard suffices.
 #if defined(MSG_NOSIGNAL)
 constexpr int kSendFlags = MSG_DONTWAIT | MSG_NOSIGNAL;
 #else
-constexpr int kSendFlags = MSG_DONTWAIT;  // SO_NOSIGPIPE is set instead.
+constexpr int kSendFlags = MSG_DONTWAIT;
 #endif
 
 struct Address {

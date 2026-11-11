@@ -71,9 +71,12 @@ bool SetNonBlocking(uintptr_t socket_handle) {
 }
 #endif
 
-// A send that fails returns its error, never SIGPIPE: MSG_NOSIGNAL where it is
-// defined (Linux), SO_NOSIGPIPE on the socket where it is not (macOS;
-// ConfigureSocket), as talOS/rtms/wake.cc does. Windows raises no signal.
+// A send that fails returns its error, never SIGPIPE: MSG_NOSIGNAL on every
+// send where the SDK defines it (Linux, and macOS SDKs that define it, as
+// macOS 26.3's does), and SO_NOSIGPIPE on the socket where the OS has it
+// (macOS; ConfigureSocket), which alone covers an SDK without MSG_NOSIGNAL.
+// Either guard suffices; talOS/rtms/wake.cc does the same. Windows raises no
+// signal.
 #if defined(MSG_NOSIGNAL)
 constexpr int kSendFlags = MSG_NOSIGNAL;
 #else
