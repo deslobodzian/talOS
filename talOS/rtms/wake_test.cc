@@ -23,7 +23,7 @@ int Readable(const talos::WakeReceiver& receiver, int ms) {
 
 // A reader sleeps on the fd, so the fd must turn readable on a notification
 // and only then, and drain() must leave it ready to sleep on again.
-// REQ-RT-02
+// REQ-RT-19
 TEST(Wake, TheFdIsReadableOnlyBetweenANotificationAndADrain) {
   talos::WakeReceiver receiver;
   ASSERT_NE(receiver.id(), 0u);
@@ -40,7 +40,7 @@ TEST(Wake, TheFdIsReadableOnlyBetweenANotificationAndADrain) {
 
 // A publisher notifies on its control loop: once a reader has a wake pending,
 // further notifications must neither block nor report the receiver gone.
-// REQ-RT-02
+// REQ-RT-19
 TEST(Wake, NotificationsToAFullReceiverNeitherBlockNorFail) {
   talos::WakeReceiver receiver;
   talos::WakeSender sender;
@@ -57,7 +57,7 @@ TEST(Wake, NotificationsToAFullReceiverNeitherBlockNorFail) {
 // A reader that exits leaves its id in shared memory: notifying it must
 // report it gone, through a cached endpoint or a fresh one, and must not
 // spoil the sender for the slot's next reader.
-// REQ-RT-02
+// REQ-RT-19
 TEST(Wake, ANotificationToADestroyedReceiverReportsItGone) {
   talos::WakeSender cached;
   std::uint64_t gone = 0;
@@ -78,7 +78,7 @@ TEST(Wake, ANotificationToADestroyedReceiverReportsItGone) {
 
 // Publisher and reader are different processes; the receiver's id is all
 // the publisher knows of it.
-// REQ-RT-02
+// REQ-RT-19
 TEST(Wake, AnotherProcessWakesAReceiverByItsId) {
   int id_pipe[2];
   ASSERT_EQ(::pipe(id_pipe), 0);

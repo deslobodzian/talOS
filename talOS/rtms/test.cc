@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1618,7 +1619,7 @@ std::size_t RegisterReader(RTMSQueue& queue) {
 
 // An idle process must cost nothing: a publication no reader is asleep on
 // makes no system call, even when readers have registered receivers.
-// REQ-RT-02
+// REQ-RT-19
 TEST(RTMSWake, APublicationNoReaderIsAsleepOnSendsNothing) {
   const std::string path = make_test_path("wake_idle");
   RTMSQueue writer = WakeQueue(path, publisher_options());
@@ -1636,7 +1637,7 @@ TEST(RTMSWake, APublicationNoReaderIsAsleepOnSendsNothing) {
 
 // arm_wake() is the reader's last check before it sleeps: it must say
 // "read instead" whenever read_next() would not return EMPTY.
-// REQ-RT-02
+// REQ-RT-19
 TEST(RTMSWake, ArmReportsWhetherTheReaderIsCaughtUp) {
   const std::string path = make_test_path("wake_arm");
   RTMSQueue writer = WakeQueue(path, publisher_options());
@@ -1658,7 +1659,7 @@ TEST(RTMSWake, ArmReportsWhetherTheReaderIsCaughtUp) {
 
 // Each armed reader is woken by the next publication, and only once per arm
 // however many follow: the writer takes the arms with one exchange.
-// REQ-RT-02
+// REQ-RT-19
 TEST(RTMSWake, EachArmedReaderIsWokenOncePerArm) {
   const std::string path = make_test_path("wake_once");
   RTMSQueue writer = WakeQueue(path, publisher_options());
@@ -1695,9 +1696,67 @@ TEST(RTMSWake, EachArmedReaderIsWokenOncePerArm) {
       << "the second reader did not arm again";
 }
 
+// A hint lost for a reason other than a gone receiver -- here no descriptor
+// is left for the sender's socket -- is counted (and logged once), so a
+// reader left to its backstop is visible; a receiver that is gone is not a
+// failure. The descriptor limit is lowered in a child, which owns the
+// whole scenario.
+// REQ-RT-19
+TEST(RTMSWake, ANotificationLostForAnotherReasonThanAGoneReceiverIsCounted) {
+  const std::string path = make_test_path("wake_fail");
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    int code = 1;
+    try {
+      RTMSQueue writer = WakeQueue(path, publisher_options());
+      RTMSQueue subscriber = WakeQueue(path, sequence_options());
+      const auto reader = subscriber.register_reader();
+      talos::WakeReceiver receiver;
+      // The lowest free descriptor: with the limit there, none can open.
+      const int lowest = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+      rlimit limit{};
+      if (reader && lowest >= 0 && ::close(lowest) == 0 &&
+          ::getrlimit(RLIMIT_NOFILE, &limit) == 0) {
+        subscriber.set_reader_wake(*reader, receiver.id());
+        limit.rlim_cur = static_cast<rlim_t>(lowest);
+        code = 2;
+        if (subscriber.arm_wake(*reader) &&
+            ::setrlimit(RLIMIT_NOFILE, &limit) == 0 &&
+            writer.write(BytesOf({1, 1.0F})) == WriteResult::SUCCESS) {
+          const bool counted =
+              writer.wakes_sent() == 1 && writer.wake_failures() == 1;
+          code = counted ? 0 : 3;
+        }
+      }
+    } catch (...) {
+      code = 4;
+    }
+    ::_exit(code);
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0)
+      << "1: setup, 2: limit or write, 3: failure not counted, 4: threw";
+
+  const std::string gone_path = make_test_path("wake_gone");
+  RTMSQueue writer = WakeQueue(gone_path, publisher_options());
+  RTMSQueue subscriber = WakeQueue(gone_path, sequence_options());
+  const std::size_t reader = RegisterReader(subscriber);
+  {
+    talos::WakeReceiver receiver;
+    subscriber.set_reader_wake(reader, receiver.id());
+    ASSERT_TRUE(subscriber.arm_wake(reader));
+  }
+  ASSERT_EQ(writer.write(BytesOf({2, 2.0F})), WriteResult::SUCCESS);
+  EXPECT_EQ(writer.wakes_sent(), 1u);
+  EXPECT_EQ(writer.wake_failures(), 0u) << "a gone receiver is not a failure";
+}
+
 // A slot's receiver belongs to its holder: once the slot is released, or
 // freed because its holder died, no publication notifies that receiver.
-// REQ-RT-02
+// REQ-RT-19
 TEST(RTMSWake, AFreedSlotIsNotWoken) {
   const std::string path = make_test_path("wake_freed");
   RTMSQueue writer = WakeQueue(path, publisher_options());
@@ -1735,7 +1794,7 @@ TEST(RTMSWake, AFreedSlotIsNotWoken) {
 // leaves a reader asleep with a message to read. Whichever writer claims the
 // topic next -- a publisher opening it, or a queue's first write -- wakes
 // every reader with a receiver.
-// REQ-RT-02
+// REQ-RT-19
 TEST(RTMSWake, AWriterTakingOverATopicWakesItsReaders) {
   for (const bool lazy : {false, true}) {
     SCOPED_TRACE(lazy ? "claimed by a first write" : "claimed on open");
@@ -1775,7 +1834,7 @@ TEST(RTMSWake, AWriterTakingOverATopicWakesItsReaders) {
 // hang bound: with the writer's sequence store made release and its waiters
 // load relaxed, an x86-64 run oversleeps within the first few thousand
 // rounds.
-// REQ-RT-02
+// REQ-RT-19
 TEST(RTMSWake, AReaderThatSleepsBetweenReadsMissesNoPublication) {
   const std::string path = make_test_path("wake_race");
   RTMSQueue writer = WakeQueue(path, publisher_options());

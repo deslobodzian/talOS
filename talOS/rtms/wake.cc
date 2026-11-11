@@ -211,30 +211,40 @@ void WakeSender::reset() noexcept {
   id_ = 0;
 }
 
-bool WakeSender::notify(std::uint64_t id) noexcept {
-  if (id == 0) return false;
+WakeStatus WakeSender::send(std::uint64_t id) noexcept {
+  if (id == 0) return WakeStatus{WakeOutcome::RECEIVER_GONE, 0};
+  const auto failed = [](int error) {
+    const WakeOutcome outcome =
+        ReceiverGone(error) ? WakeOutcome::RECEIVER_GONE : WakeOutcome::FAILED;
+    return WakeStatus{outcome, error};
+  };
   if (fd_ < 0 || id_ != id) {
     reset();
     const int fd = OpenSocket();
-    if (fd < 0) return true;  // Out of descriptors: the hint is lost.
+    // Out of descriptors, typically: the hint is lost.
+    if (fd < 0) return WakeStatus{WakeOutcome::FAILED, errno};
     const Address address = AddressOf(id);
-    if (::connect(fd, AsSockaddr(address), address.length) != 0) {
+    int connected = 0;
+    do {
+      connected = ::connect(fd, AsSockaddr(address), address.length);
+    } while (connected != 0 && errno == EINTR);
+    if (connected != 0) {
       const int error = errno;
       ::close(fd);
-      return !ReceiverGone(error);
+      return failed(error);
     }
     fd_ = fd;
     id_ = id;
   }
   const char byte = 1;
   for (;;) {
-    if (::send(fd_, &byte, sizeof(byte), kSendFlags) >= 0) return true;
+    if (::send(fd_, &byte, sizeof(byte), kSendFlags) >= 0) return {};
     const int error = errno;
     if (error == EINTR) continue;
-    if (AlreadyPending(error)) return true;
+    if (AlreadyPending(error)) return {};
     // Gone, or a socket in an unknown state: the next call reconnects.
     reset();
-    return !ReceiverGone(error);
+    return failed(error);
   }
 }
 

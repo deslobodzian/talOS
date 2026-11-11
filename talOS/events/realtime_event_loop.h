@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <exception>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -61,6 +63,14 @@ class RealtimeEventLoop
     // notifying leaves its message unannounced, and this bounds how long it
     // waits. A loop whose next timer is nearer never pays for it.
     Duration wake_backstop{std::chrono::seconds{1}};
+
+    // Test seams, null in production. `make_wake_receiver` builds the
+    // receiver under Delivery::ON_PUBLISH instead of WakeReceiver's
+    // constructor (a test throws from it to reach the POLL fallback).
+    // `arm_wake` stands in for RTMSQueue::arm_wake before each block (a test
+    // reports unread data the read never returns, to reach the stall guard).
+    WakeReceiver (*make_wake_receiver)(){nullptr};
+    bool (*arm_wake)(RTMSQueue& queue, std::size_t reader_id){nullptr};
   };
 
   // How often the loop has done each thing so far, for measuring what a
@@ -73,6 +83,10 @@ class RealtimeEventLoop
     // because the watcher's arm reported something to read, delivered
     // nothing from it. Should stay 0; see wait_for_publication.
     std::uint64_t stalled_arms{0};
+    // Runs that asked for Delivery::ON_PUBLISH but could not build their
+    // wake receiver, and ran under Delivery::POLL instead (said once on
+    // stderr). Should stay 0.
+    std::uint64_t wake_fallbacks{0};
   };
 
   // The origin is fixed here rather than in run(), so that a program can build
@@ -188,7 +202,7 @@ class RealtimeEventLoop
       }
 
       if (const auto drain = wait_for_publication(deadline)) {
-        drain_messages(*drain, Poller::now());
+        drain_messages(*drain, Poller::now(), /*woken=*/true);
       }
     }
 
@@ -258,8 +272,33 @@ class RealtimeEventLoop
       if (transports_[id].prompt) prompt_watchers_.push_back(id);
     }
     if (prompt_watchers_.empty()) return;
-    wake_.emplace();
-    poller_.add_fd(wake_->fd());
+    try {
+      if (options_.make_wake_receiver != nullptr) {
+        wake_.emplace(options_.make_wake_receiver());
+      } else {
+        wake_.emplace();
+      }
+      poller_.add_fd(wake_->fd());
+    } catch (const std::exception& error) {
+      // Out of descriptors, say: a node that cannot be woken still runs,
+      // at the cost of POLL's wakeups.
+      wake_.reset();
+      for (const std::uint16_t id : prompt_watchers_) {
+        transports_[id].prompt = false;
+      }
+      prompt_watchers_.clear();
+      options_.delivery = Delivery::POLL;
+      ++activity_.wake_fallbacks;
+      std::fprintf(stderr,
+                   "talos: event loop cannot be woken on publish (%s); it "
+                   "drains every %lld us instead\n",
+                   error.what(),
+                   static_cast<long long>(
+                       std::chrono::duration_cast<std::chrono::microseconds>(
+                           options_.tick_period)
+                           .count()));
+      return;
+    }
     for (const std::uint16_t id : prompt_watchers_) {
       Transport& transport = transports_[id];
       if (transport.queue && transport.reader_id) {
@@ -290,7 +329,11 @@ class RealtimeEventLoop
       // A watcher without a slot cannot be armed; each drain retries its
       // rejoin, and the backstop bounds the wait for the next one.
       if (!transport.queue || !transport.reader_id) continue;
-      if (transport.queue->arm_wake(*transport.reader_id)) {
+      const bool armed =
+          options_.arm_wake != nullptr
+              ? options_.arm_wake(*transport.queue, *transport.reader_id)
+              : transport.queue->arm_wake(*transport.reader_id);
+      if (armed) {
         transport.stalls = 0;
         continue;
       }
@@ -385,7 +428,16 @@ class RealtimeEventLoop
 
   // Dispatch scheduling latency remains separate from age: the slot supplies
   // the publication timestamp even when a consumer has stalled before draining.
-  void drain_messages(MonotonicTime tick_deadline, MonotonicTime now) {
+  //
+  // A message's event time is the drain's `tick_deadline` (a timer's or poll
+  // tick's deadline, or when a woken loop saw its wake), except in a drain
+  // that is `woken` (a wake, a failed arm or the backstop) for a prompt
+  // watcher: the loop owed that message a dispatch from the moment it was
+  // published, so its event time is its publication time (not after the
+  // dispatch's now), and latency() is publish-to-dispatch. A watcher that is
+  // not prompt waited for the drain by design and keeps the drain's time.
+  void drain_messages(MonotonicTime tick_deadline, MonotonicTime now,
+                      bool woken = false) {
     ++activity_.drains;
     auto& sources = this->sources();
 
@@ -432,10 +484,15 @@ class RealtimeEventLoop
         transport.next_sequence = info.sequence + 1;
         ++transport.progress;
         now = Poller::now();
-        this->dispatch_message(
-            static_cast<std::uint16_t>(id), tick_deadline, now, info.sequence,
-            info.dropped + std::exchange(transport.lost, 0), sources[id].buffer,
-            MonotonicTime::from_nanos(info.publish_time_ns));
+        const MonotonicTime published =
+            MonotonicTime::from_nanos(info.publish_time_ns);
+        const MonotonicTime event_time = woken && transport.prompt
+                                             ? std::min(published, now)
+                                             : tick_deadline;
+        this->dispatch_message(static_cast<std::uint16_t>(id), event_time, now,
+                               info.sequence,
+                               info.dropped + std::exchange(transport.lost, 0),
+                               sources[id].buffer, published);
 
         if (!this->running()) {
           return;

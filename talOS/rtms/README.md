@@ -100,8 +100,12 @@ file stays until `/tmp` is cleaned, and a new receiver whose address is taken
 draws another id. Its fd is readable while notifications are pending;
 `drain()` consumes them. A `talos::WakeSender` keeps one socket connected to
 the last id it notified and sends one byte, never blocking or raising
-`SIGPIPE`: a full receiver queue means a wake is already pending (`true`); a
-refused or missing address means the receiver is gone (`false`).
+`SIGPIPE`. `send()` reports a `WakeOutcome`: `DELIVERED` (also when a full
+receiver queue means a wake is already pending), `RECEIVER_GONE` (a refused
+or missing address), or `FAILED` with the errno (no descriptor left for the
+socket, a permission refused, an unexpected error: the hint is lost though
+the receiver may be there). `notify()` is `send()` as a bool, false only for
+`RECEIVER_GONE`.
 
 The protocol has two header words: `Reader::wake_id`, the receiver a reader
 slot's holder sleeps on (`set_reader_wake()`), and `Writer::waiters`, bit *i*
@@ -118,7 +122,13 @@ set while slot *i* waits for the next publication.
   exchange and no system call. Otherwise it exchanges the word for 0 and
   notifies each set slot's `wake_id`, so one sleep of a reader costs the
   writer at most one send however many publications follow.
-  `wakes_sent()` counts the sends of one queue object.
+  `wakes_sent()` counts the sends of one queue object, and `wake_failures()`
+  those of them that were `FAILED`; the first failure of a queue is also
+  printed once on stderr with the topic and the error. The reader it missed
+  is drained by its loop's backstop
+  ([talOS/events](../events/README.md#the-three-loops)). Each reader slot
+  holds one connected socket in every process that writes the topic, so a
+  topic costs a writer up to `MAX_READERS` (8) descriptors.
 - **Why no wake is lost.** The reader stores its bit before loading the
   sequence; the writer stores the sequence before loading the bits. Under
   sequential consistency at least one sees the other: the reader finds the

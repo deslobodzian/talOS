@@ -772,7 +772,7 @@ Wakes DeliveryFor() {
 // callback, or a listener on one raw subscription, makes that one
 // subscription wake the node, not the node's other callback subscriptions;
 // a node with no timer to drain before is woken by every subscription.
-// REQ-RT-02
+// REQ-RT-19
 TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
   constexpr auto BEFORE_TIMERS = event::Delivery::BEFORE_TIMERS;
   constexpr auto ON_PUBLISH = event::Delivery::ON_PUBLISH;
