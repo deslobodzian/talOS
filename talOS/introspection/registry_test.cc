@@ -966,6 +966,88 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_EQ(node.selections[0].selected_source(), "auto");
 }
 
+// While its loop runs, a node's reporting thread wakes once per refresh and
+// for nothing else: it used to wake every 10 ms to look for the loop's end,
+// 100 wakeups/s in every process, which a host running many nodes pays for.
+// Each refresh still moves the heartbeat, which keeps the row alive
+// (kLivenessTimeout). The loop runs until the heartbeat has moved twice and
+// half a second has passed since the row was published.
+TEST_F(Registry, ARunningReporterWakesOnlyToRefresh) {
+  constexpr auto kPeriod = 50ms;
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+  Reporter reporter{
+      {.name = "quiet", .period = kPeriod, .registry_path = path_}};
+  reporter.start(loop);
+  RegistryReader reader{path_};
+  const auto heartbeat = [&] {
+    const auto nodes = reader.nodes();
+    return nodes.size() == 1 ? nodes.front().heartbeat_monotonic_ns : 0;
+  };
+  std::optional<std::chrono::steady_clock::time_point> since;
+  std::uint64_t wakeups_before = 0;
+  std::uint64_t wakeups = 0;
+  std::int64_t last_beat = 0;
+  int beats = 0;
+  std::chrono::steady_clock::duration window{};
+  handler.on_tick = [&] {
+    if (!reporter.published()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!since) {
+      since = now;
+      wakeups_before = reporter.wakeups();
+      last_beat = heartbeat();
+      return;
+    }
+    if (const std::int64_t beat = heartbeat(); beat != last_beat) {
+      last_beat = beat;
+      ++beats;
+    }
+    if (beats < 2 || now - *since < 500ms) return;
+    wakeups = reporter.wakeups() - wakeups_before;
+    window = now - *since;
+    loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 5ms);
+  loop.run_for(10s);  // Bound only; exits after two refreshes.
+
+  ASSERT_GE(beats, 2) << "the heartbeat stopped moving while the loop ran";
+  // One wake per period, and one more at each end of the window.
+  const auto allowed = static_cast<std::uint64_t>(window / kPeriod) + 2;
+  EXPECT_LE(wakeups, allowed)
+      << "over "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(window).count()
+      << " ms at a " << kPeriod.count() << " ms refresh";
+}
+
+// talos::Run stops its reporter as soon as the loop returns; the stop must
+// not wait out the refresh in progress, here 30 s long.
+TEST_F(Registry, StoppingAReporterEndsItsRefreshWaitAtOnce) {
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+  Reporter reporter{{.name = "patient", .period = 30s, .registry_path = path_}};
+  reporter.start(loop);
+  handler.on_tick = [&] {
+    if (reporter.published()) loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 1ms);
+  loop.run_for(10s);  // Bound only; exits once the row is published.
+  ASSERT_TRUE(reporter.published()) << reporter.error();
+
+  const auto before = std::chrono::steady_clock::now();
+  reporter.stop();
+  EXPECT_LT(std::chrono::steady_clock::now() - before, 10s)
+      << "stop() waited for the 30 s refresh";
+}
+
 TEST_F(Registry, LoopCountsPublishesAndTimerDispatchesPerSource) {
   const std::string topic = "/tc_" + std::to_string(::getpid());
   event::RealtimeEventLoop<> loop;
