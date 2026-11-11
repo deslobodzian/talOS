@@ -43,6 +43,28 @@ bool ValidMotionFeedback(const Position& position, const Velocity& velocity) {
          std::isfinite(position.GetValue().value()) &&
          std::isfinite(velocity.GetValue().value());
 }
+// One clock_gettime(CLOCK_MONOTONIC) per phase boundary of the tick.
+uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+// Adds the time from construction to destruction to `phase`, for a call
+// with several returns.
+class PhaseTimer {
+ public:
+  PhaseTimer(talos::rio::RioLog& log, talos::rio::TickPhase phase)
+      : log_{log}, phase_{phase}, start_ns_{NowNs()} {}
+  ~PhaseTimer() { log_.AddPhase(phase_, NowNs() - start_ns_); }
+  PhaseTimer(const PhaseTimer&) = delete;
+  PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+ private:
+  talos::rio::RioLog& log_;
+  talos::rio::TickPhase phase_;
+  uint64_t start_ns_;
+};
 uint32_t Age(const ph::BaseStatusSignal& signal) {
   const double age = signal.GetTimestamp().GetLatency().value() * 1e6;
   if (!std::isfinite(age) || age >= std::numeric_limits<uint32_t>::max())
@@ -438,6 +460,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
 }
 
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
+  const PhaseTimer timer{*log_, talos::rio::TickPhase::kDevices};
   // HasResetOccurred reports (and clears) one device's reset latch.
   reset_ids.clear();
   for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size();
@@ -526,9 +549,13 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
+  using talos::rio::TickPhase;
+  const uint64_t read_start_ns = NowNs();
   s.health = {true, frc::RobotController::GetBatteryVoltage().value(),
               frc::RobotController::IsBrownedOut(),
               frc::RobotController::GetCANStatus().percentBusUtilization};
+  uint64_t refresh_start_ns = NowNs();
+  log_->AddPhase(TickPhase::kHealth, refresh_start_ns - read_start_ns);
   if (is_simulation_) {
     const auto now = std::chrono::steady_clock::now();
     double dt =
@@ -538,9 +565,14 @@ bool PhoenixBackend::Read(hw::State& s) {
     if (dt <= 0.0 || dt > 0.05) dt = 0.005;
     last_sim_time_ = now;
     UpdateSimulation(dt);
+    const uint64_t simulated_ns = NowNs();
+    log_->AddPhase(TickPhase::kOther, simulated_ns - refresh_start_ns);
+    refresh_start_ns = simulated_ns;
   }
   ph::BaseStatusSignal::RefreshAll(
       false, std::span<ph::BaseStatusSignal* const>{signals_});
+  const uint64_t devices_start_ns = NowNs();
+  log_->AddPhase(TickPhase::kRefresh, devices_start_ns - refresh_start_ns);
   bool healthy = motors_.empty() && sensors_.empty();
   for (std::size_t i = 0; i < motors_.size(); ++i) {
     auto& motor = *motors_[i];
@@ -677,6 +709,9 @@ bool PhoenixBackend::Read(hw::State& s) {
       out.velocity_rps = 0;
     }
   }
+  const uint64_t devices_end_ns = NowNs();
+  log_->AddPhase(TickPhase::kDevices, devices_end_ns - devices_start_ns);
+  log_->SetTickDevices(motors_.size(), sensors_.size());
   for (std::size_t i = 0; i < digital_inputs_.size(); ++i) {
     auto& out = s.digital_inputs[i];
     out.value = digital_inputs_[i]->Get();
@@ -761,9 +796,11 @@ bool PhoenixBackend::Read(hw::State& s) {
     log_->Post(event);
     last_brownout_ = s.health.brownout;
   }
+  log_->AddPhase(TickPhase::kOther, NowNs() - devices_end_ns);
   return healthy;
 }
 bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
+  const PhaseTimer timer{*log_, talos::rio::TickPhase::kControl};
   apply_failed_.clear();
   if (commands.size() != motors_.size()) return false;
   // A failed send is local to its motor: try neutral on that motor only, keep
@@ -892,6 +929,7 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
 bool PhoenixBackend::ApplyOutputs(
     std::span<const hw::DigitalOutputRequest> digital_outputs,
     std::span<const hw::PwmRequest> pwm_outputs) {
+  const PhaseTimer timer{*log_, talos::rio::TickPhase::kOther};
   for (std::size_t i = 0;
        i < digital_outputs.size() && i < digital_outputs_.size(); ++i) {
     digital_outputs_[i]->Set(digital_outputs[i].value);
@@ -906,6 +944,7 @@ void PhoenixBackend::Neutral() {
   // Gateway refreshes neutral every tick without an active command, so a
   // failed send here is retried on the next tick. Count every failure and log
   // only each motor's ok<->failing transition to avoid a 200 Hz log flood.
+  const uint64_t control_start_ns = NowNs();
   for (std::size_t i = 0; i < motors_.size(); ++i) {
     const auto status = motors_[i]->SetControl(
         ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
@@ -924,11 +963,15 @@ void PhoenixBackend::Neutral() {
     }
     neutral_send_failing_[i] = failed;
   }
+  const uint64_t control_end_ns = NowNs();
+  log_->AddPhase(talos::rio::TickPhase::kControl,
+                 control_end_ns - control_start_ns);
   for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
   // Support matrix: DIO outputs de-energize on every safe-state transition.
   for (auto& dio : digital_outputs_) dio->Set(false);
   // Sim: neutral keeps rotor momentum; UpdateSimulation decays it per brake.
   if (is_simulation_) sim_neutral_.fill(true);
+  log_->AddPhase(talos::rio::TickPhase::kOther, NowNs() - control_end_ns);
 }
 
 bool PhoenixBackend::WatchdogNeutral() {

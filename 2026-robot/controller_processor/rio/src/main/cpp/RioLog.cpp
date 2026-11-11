@@ -131,6 +131,97 @@ void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
   };
   raise(max_tick_us_, duration_us);
   raise(max_interval_us_, interval_us);
+
+  // Hand the logger the window it asked for, without this tick, which opens
+  // the next one. The fence runs only on a new request, once per window.
+  const uint32_t request = phase_request_.load(std::memory_order_relaxed);
+  if (request != phase_served_local_) {
+    std::atomic_thread_fence(std::memory_order_acquire);
+    published_ticks_.store(phase_window_.ticks, std::memory_order_relaxed);
+    for (std::size_t i = 0; i < kPhaseCount; ++i) {
+      published_sum_ns_[i].store(phase_window_.sum_ns[i],
+                                 std::memory_order_relaxed);
+      published_max_ns_[i].store(phase_window_.max_ns[i],
+                                 std::memory_order_relaxed);
+    }
+    published_motors_.store(phase_window_.motors, std::memory_order_relaxed);
+    published_sensors_.store(phase_window_.sensors, std::memory_order_relaxed);
+    phase_served_.store(request, std::memory_order_release);
+    phase_served_local_ = request;
+    phase_window_ = {};
+  }
+  ++phase_window_.ticks;
+  for (std::size_t i = 0; i < kPhaseCount; ++i) {
+    phase_window_.sum_ns[i] += tick_phase_ns_[i];
+    phase_window_.max_ns[i] =
+        std::max(phase_window_.max_ns[i], tick_phase_ns_[i]);
+    tick_phase_ns_[i] = 0;
+  }
+  phase_window_.motors = tick_motors_;
+  phase_window_.sensors = tick_sensors_;
+}
+
+void RioLog::AddPhase(TickPhase phase, uint64_t duration_ns) {
+  const auto i = static_cast<std::size_t>(phase);
+  if (i < kPhaseCount) tick_phase_ns_[i] += duration_ns;
+}
+
+void RioLog::SetTickDevices(std::size_t motors, std::size_t sensors) {
+  tick_motors_ = static_cast<uint32_t>(motors);
+  tick_sensors_ = static_cast<uint32_t>(sensors);
+}
+
+void RioLog::WritePhases(uint64_t now_us, bool force) {
+  if (phase_awaiting_ &&
+      phase_served_.load(std::memory_order_acquire) == phase_requested_) {
+    phase_awaiting_ = false;
+    const uint64_t ticks = published_ticks_.load(std::memory_order_relaxed);
+    if (ticks > 0) {
+      std::array<double, kPhaseCount> mean_us{};
+      std::array<double, kPhaseCount> max_us{};
+      for (std::size_t i = 0; i < kPhaseCount; ++i) {
+        mean_us[i] = static_cast<double>(
+                         published_sum_ns_[i].load(std::memory_order_relaxed)) /
+                     static_cast<double>(ticks) / 1e3;
+        max_us[i] = static_cast<double>(
+                        published_max_ns_[i].load(std::memory_order_relaxed)) /
+                    1e3;
+      }
+      const auto at = [](TickPhase phase) {
+        return static_cast<std::size_t>(phase);
+      };
+      char text[256];
+      std::snprintf(
+          text, sizeof(text),
+          "[rio] tick phases: refresh mean/max %.1f/%.1f us, devices "
+          "%.1f/%.1f us, control %.1f/%.1f us, health %.1f/%.1f us, other "
+          "%.1f/%.1f us over %llu ticks (motors=%u sensors=%u)\n",
+          mean_us[at(TickPhase::kRefresh)], max_us[at(TickPhase::kRefresh)],
+          mean_us[at(TickPhase::kDevices)], max_us[at(TickPhase::kDevices)],
+          mean_us[at(TickPhase::kControl)], max_us[at(TickPhase::kControl)],
+          mean_us[at(TickPhase::kHealth)], max_us[at(TickPhase::kHealth)],
+          mean_us[at(TickPhase::kOther)], max_us[at(TickPhase::kOther)],
+          static_cast<unsigned long long>(ticks),
+          static_cast<unsigned>(
+              published_motors_.load(std::memory_order_relaxed)),
+          static_cast<unsigned>(
+              published_sensors_.load(std::memory_order_relaxed)));
+      sink_(text);
+    }
+  }
+  // A flush asks for nothing: the stopped loop would never answer.
+  if (force) return;
+  if (!phase_clock_started_) {
+    phase_clock_started_ = true;
+    next_phase_us_ = now_us + kPhaseWindowUs;
+    return;
+  }
+  if (phase_awaiting_ || now_us < next_phase_us_) return;
+  // The window closes at the loop's next tick, which the next drain prints.
+  ++phase_requested_;
+  phase_request_.store(phase_requested_, std::memory_order_release);
+  phase_awaiting_ = true;
+  next_phase_us_ = now_us + kPhaseWindowUs;
 }
 
 void RioLog::Start() {
@@ -222,6 +313,7 @@ void RioLog::WriteDue(uint64_t now_us, bool force) {
     }
   }
 
+  WritePhases(now_us, force);
   if (!force && now_us < next_summary_us_) return;
   next_summary_us_ = now_us + kWindowUs;
   const uint64_t dropped = dropped_.load(std::memory_order_relaxed);

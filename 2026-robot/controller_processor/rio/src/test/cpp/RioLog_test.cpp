@@ -166,4 +166,68 @@ TEST(RioLog, LoopOverrunsAndLateTicksAreReportedOncePerSecond) {
       << lines[1];
 }
 
+// Where a tick's backend time goes, the measurement TODO.md RT-5 sizes a
+// robot from: each 10 s window reports every phase's mean and longest time
+// per tick over that window's ticks only, with the device counts.
+TEST(RioLog, TickPhasesReportEachWindowsMeanAndMaxThenReset) {
+  using talos::rio::TickPhase;
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);  // starts the window clock
+
+  log.SetTickDevices(16, 4);
+  log.AddPhase(TickPhase::kRefresh, 1'000);
+  log.AddPhase(TickPhase::kControl, 3'000);
+  log.AddPhase(TickPhase::kHealth, 500);
+  log.AddPhase(TickPhase::kHealth, 500);  // phases add within a tick
+  log.RecordTick(0, 4'000, 5'000);
+  log.AddPhase(TickPhase::kRefresh, 2'000);
+  log.AddPhase(TickPhase::kDevices, 7'000);
+  log.AddPhase(TickPhase::kOther, 400);
+  log.RecordTick(5'000, 4'000, 5'000);
+
+  log.Drain(9'999'999);
+  log.Drain(RioLog::kPhaseWindowUs);  // asks the loop for the window
+  EXPECT_TRUE(lines.empty());
+  // The next tick hands it over and opens the next window.
+  log.AddPhase(TickPhase::kRefresh, 9'000);
+  log.RecordTick(5'000, 4'000, 5'000);
+  log.Drain(RioLog::kPhaseWindowUs + 20'000);
+  ASSERT_EQ(lines.size(), 1u);
+  for (const char* expected :
+       {"refresh mean/max 1.5/2.0 us", "devices 3.5/7.0 us",
+        "control 1.5/3.0 us", "health 0.5/1.0 us", "other 0.2/0.4 us",
+        "over 2 ticks", "(motors=16 sensors=4)"}) {
+    EXPECT_NE(lines[0].find(expected), std::string::npos)
+        << "expected \"" << expected << "\" in: " << lines[0];
+  }
+
+  // The next window holds only the handover tick: nothing carried over.
+  log.Drain(2 * RioLog::kPhaseWindowUs + 20'000);
+  log.RecordTick(5'000, 4'000, 5'000);
+  log.Drain(2 * RioLog::kPhaseWindowUs + 40'000);
+  ASSERT_EQ(lines.size(), 2u);
+  for (const char* expected :
+       {"refresh mean/max 9.0/9.0 us", "devices 0.0/0.0 us",
+        "control 0.0/0.0 us", "over 1 ticks"}) {
+    EXPECT_NE(lines[1].find(expected), std::string::npos)
+        << "expected \"" << expected << "\" in: " << lines[1];
+  }
+}
+
+// A window in which the loop never ticked prints no phase line: neither while
+// the loop does not answer, nor once its first tick hands over the empty
+// window.
+TEST(RioLog, TickPhasesWindowWithoutTicksPrintsNothing) {
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);
+  log.Drain(RioLog::kPhaseWindowUs);
+  log.Drain(RioLog::kPhaseWindowUs + 20'000);
+  EXPECT_TRUE(lines.empty()) << lines.front();
+  log.RecordTick(0, 4'000, 5'000);
+  log.Drain(RioLog::kPhaseWindowUs + 40'000);
+  EXPECT_TRUE(lines.empty()) << lines.front();
+}
+
 }  // namespace

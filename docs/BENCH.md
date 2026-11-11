@@ -255,6 +255,18 @@ sleep precision. Releasing a lane is not a mechanical brake.
   `frc::SetCurrentThreadPriority(true, 20)` (below the watchdog's 30) before
   its loop. Record late ticks, Driver Station and CAN health under both;
   the decision is TODO.md RT-5.
+- [ ] Per-device tick cost. With the one motor configured and the robot
+  disabled, record three consecutive `[rio] tick phases` console lines
+  (one per 10 s; [format](../talOS/hardware/README.md)): each phase's mean
+  and max in µs, and the motor and sensor counts. Then, with the bridge
+  running, record `/hw/status` `can_utilization_frac` with the config's
+  `status_hz` at 200, then at 50 (reconfigure between). For a robot
+  estimate (16 Talon FX and 4 CANcoders) scale the refresh and devices
+  phases per device by 20, control per motor by 16, keep health and other
+  as measured, and scale `can_utilization_frac` per device at each rate by
+  20; compare with the 5 ms period and a full bus. A one-motor bench gives
+  no per-device slope (a fixed cost per call is counted as per device), so
+  the estimate is an upper bound. The decision is TODO.md RT-5.
 - [ ] Capture representative enabled sessions, fetch them (below) and run
   `bazel run //talOS/launcher:session_report -- --strict <session-dir>`.
   Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
