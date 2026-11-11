@@ -16,6 +16,7 @@
 
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/rtms/process_liveness.h"
+#include "talOS/rtms/wake.h"
 #include "talOS/schema/identity.h"
 
 inline constexpr size_t CACHE_LINE = 64;  // C++ I think as a function for this.
@@ -134,7 +135,7 @@ struct RTMSOptions {
 // The segment format, checked before any other header field is trusted.
 inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
-inline constexpr std::uint64_t kRtmsVersion = 7;
+inline constexpr std::uint64_t kRtmsVersion = 8;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
 // of queues attached to a segment that is not session-owned.
@@ -157,6 +158,10 @@ struct alignas(CACHE_LINE) Writer {
   // Exact completed DROP_NEWEST publication, or 0 when overwriting may have
   // touched its oldest slot. Allows reliable readers to use the full ring.
   std::atomic<uint64_t> reliable_sequence{};
+  // Bit i set: reader slot i is asleep until the next publication and wants
+  // a wake (RTMSQueue::arm_wake). The writer takes the whole word with one
+  // exchange after publishing and notifies each set slot's wake_id.
+  std::atomic<uint64_t> waiters{};
 };
 
 static_assert(sizeof(Writer) == CACHE_LINE);
@@ -164,7 +169,11 @@ static_assert(sizeof(Writer) == CACHE_LINE);
 struct alignas(CACHE_LINE) Reader {
   std::atomic<uint64_t> sequence{};
   std::atomic<uint64_t> state{};  // (process word << 2) | ReaderState
+  // The talos::WakeReceiver id the slot's holder sleeps on, 0 for none.
+  std::atomic<uint64_t> wake_id{};
 };
+
+static_assert(sizeof(Reader) == CACHE_LINE);
 
 struct RTMSHeader {
   // kRtmsMagic, stored last (release) by the creator: an attacher trusts no
@@ -237,6 +246,17 @@ class RTMSQueue {
   std::optional<std::size_t> register_reader();
   // Frees reader slot `id` if this queue claimed it and still holds it.
   void release_reader(std::size_t id);
+
+  // Wake channel (README.md "Wake channel"). Records the wake receiver for
+  // a reader slot this queue holds; 0 disables.
+  void set_reader_wake(std::size_t reader_id, std::uint64_t wake_id);
+  // Asks to be notified on the next publication, then reports whether the
+  // reader is caught up: true means read_next() would return EMPTY and it is
+  // safe to block on the receiver; false means there is something to read
+  // (or the slot is no longer held: INACTIVE), so read instead of blocking.
+  bool arm_wake(std::size_t reader_id);
+  // Notifications this queue object has sent as a writer (process-local).
+  std::uint64_t wakes_sent() const { return wakes_sent_; }
   // Frees every reader slot whose claiming process has died. Returns how
   // many it freed.
   std::size_t reclaim_dead_readers();
@@ -318,6 +338,13 @@ class RTMSQueue {
 
   const std::byte* slot_address(std::uint64_t message_sequence) const;
 
+  // Notifies the wake receiver of each reader slot in `mask` that has one.
+  void notify_readers(std::uint64_t mask);
+  // Run by a writer that has just claimed the topic: its predecessor may
+  // have died between taking the waiters word and notifying, so every slot
+  // with a wake receiver is notified, armed or not.
+  void wake_all_readers();
+
   std::string path_{""};
   std::uint64_t slots_{0};
   std::uint64_t message_size_{0};
@@ -335,4 +362,8 @@ class RTMSQueue {
   // The state word register_reader() claimed each reader slot with, 0 for a
   // slot this queue does not hold.
   std::array<std::uint64_t, MAX_READERS> registered_{};
+  // As a writer: one cached endpoint per reader slot, and how many
+  // notifications went out.
+  std::array<talos::WakeSender, MAX_READERS> wake_senders_{};
+  std::uint64_t wakes_sent_{0};
 };

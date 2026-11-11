@@ -220,7 +220,7 @@ sizes asserted above.
 
 Fixed message topics store their complete native FlatBuffers struct/envelope
 plus a writer publication timestamp; there is no UDP frame header. RTMS segment
-version **7** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
+version **8** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
 For payload size M and alignment A, timestamp offset is `align_up(M, 8)` and
 slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **832 B** ring
 header is additional; data starts at `align_up(832, max(A, 8))`. These sizes
@@ -240,6 +240,9 @@ milliseconds) and a 20-bit pid-namespace code (`kProcessPidBits` in
 `talOS/rtms/process_liveness.h`), so a reused pid
 holds no claim and a claim from another pid namespace sharing `/dev/shm` is
 never probed in this one; a reader state word is that word above 2 state bits.
+Two header words carry the [wake channel](../talOS/rtms/README.md#wake-channel)
+within the same 64-byte writer and reader lines: the writer's `waiters`
+bitmask and each reader's `wake_id`; neither changes a size.
 
 `age()` and `fresh()` count from publication, never delivery. A stalled consumer
 cannot revive an expired command by draining it. Latest-value subscriptions

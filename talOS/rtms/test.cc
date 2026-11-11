@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <flatbuffers/flatbuffers.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -17,6 +18,7 @@
 #include <iterator>
 #include <latch>
 #include <memory>
+#include <random>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -24,7 +26,9 @@
 
 #include "rtms.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/rtms/process_liveness.h"
 #include "talOS/rtms/test_message_generated.h"
+#include "talOS/rtms/wake.h"
 #include "talOS/schema/schema_hash.h"
 
 namespace {
@@ -112,7 +116,7 @@ TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
     RTMSQueue queue{path, layout.message_size, layout.alignment, kSchema, 2};
     SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
     const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
-    EXPECT_EQ(header->version, 7u);
+    EXPECT_EQ(header->version, 8u);
     EXPECT_EQ(header->slot_stride, layout.stride);
     EXPECT_EQ(header->data_offset % rtms_slot_alignment(layout.alignment), 0u);
     EXPECT_EQ(rtms_publish_time_offset(layout.message_size),
@@ -1571,4 +1575,278 @@ TEST(RTMSProcessIdentity, NeitherAReusedPidNorAZombieKeepsAClaim) {
   int status = 0;
   ASSERT_EQ(::waitpid(child, &status, 0), child);
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+// --- wake channel
+// ---------------------------------------------------------------
+
+namespace {
+
+// Bounds a hang only (docs/TESTING.md §6.3); never the assertion.
+constexpr int kWakeHangBoundMs = 10'000;
+// The lost-wake race: how long the writer busy-waits for the reader before
+// yielding (so one core still makes progress), and the spread of the
+// reader's delay between a read and its next attempt.
+constexpr std::uint32_t kSpinsBeforeYield = 1U << 16;
+constexpr std::uint32_t kMaxJitterSpins = 1024;
+
+// poll(2) on the receiver's fd: 1 when readable, 0 when not within `ms`, -1
+// on an error or an fd that turned ready without being readable.
+int WakeReadable(const talos::WakeReceiver& receiver, int ms) {
+  pollfd entry{.fd = receiver.fd(), .events = POLLIN, .revents = 0};
+  const int ready = ::poll(&entry, 1, ms);
+  if (ready != 1) return ready;
+  return (entry.revents & POLLIN) != 0 ? 1 : -1;
+}
+
+RTMSQueue WakeQueue(const std::string& path, RTMSOptions options) {
+  return RTMSQueue{path,
+                   sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage),
+                   kSchema,
+                   16,
+                   options};
+}
+
+std::size_t RegisterReader(RTMSQueue& queue) {
+  const auto reader = queue.register_reader();
+  EXPECT_TRUE(reader.has_value()) << "no free reader slot";
+  return reader.value_or(0);
+}
+
+}  // namespace
+
+// An idle process must cost nothing: a publication no reader is asleep on
+// makes no system call, even when readers have registered receivers.
+// REQ-RT-02
+TEST(RTMSWake, APublicationNoReaderIsAsleepOnSendsNothing) {
+  const std::string path = make_test_path("wake_idle");
+  RTMSQueue writer = WakeQueue(path, publisher_options());
+  RTMSQueue subscriber = WakeQueue(path, sequence_options());
+  const std::size_t reader = RegisterReader(subscriber);
+  talos::WakeReceiver receiver;
+  subscriber.set_reader_wake(reader, receiver.id());
+
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(writer.write(BytesOf({i, 0.0F})), WriteResult::SUCCESS);
+  }
+  EXPECT_EQ(writer.wakes_sent(), 0u);
+  EXPECT_EQ(WakeReadable(receiver, 0), 0);
+}
+
+// arm_wake() is the reader's last check before it sleeps: it must say
+// "read instead" whenever read_next() would not return EMPTY.
+// REQ-RT-02
+TEST(RTMSWake, ArmReportsWhetherTheReaderIsCaughtUp) {
+  const std::string path = make_test_path("wake_arm");
+  RTMSQueue writer = WakeQueue(path, publisher_options());
+  RTMSQueue subscriber = WakeQueue(path, sequence_options());
+  const std::size_t reader = RegisterReader(subscriber);
+  talos::WakeReceiver receiver;
+  subscriber.set_reader_wake(reader, receiver.id());
+
+  EXPECT_TRUE(subscriber.arm_wake(reader)) << "nothing published yet";
+  ASSERT_EQ(writer.write(BytesOf({1, 1.0F})), WriteResult::SUCCESS);
+  EXPECT_FALSE(subscriber.arm_wake(reader)) << "one message unread";
+  EXPECT_EQ(ReadOne(subscriber, reader).id(), 1);
+  EXPECT_TRUE(subscriber.arm_wake(reader)) << "the message was read";
+
+  subscriber.release_reader(reader);
+  EXPECT_FALSE(subscriber.arm_wake(reader))
+      << "a released slot must be read (INACTIVE), not slept on";
+}
+
+// Each armed reader is woken by the next publication, and only once per arm
+// however many follow: the writer takes the arms with one exchange.
+// REQ-RT-02
+TEST(RTMSWake, EachArmedReaderIsWokenOncePerArm) {
+  const std::string path = make_test_path("wake_once");
+  RTMSQueue writer = WakeQueue(path, publisher_options());
+  RTMSQueue first_queue = WakeQueue(path, sequence_options());
+  RTMSQueue second_queue = WakeQueue(path, sequence_options());
+  const std::size_t first = RegisterReader(first_queue);
+  const std::size_t second = RegisterReader(second_queue);
+  talos::WakeReceiver first_receiver;
+  talos::WakeReceiver second_receiver;
+  first_queue.set_reader_wake(first, first_receiver.id());
+  second_queue.set_reader_wake(second, second_receiver.id());
+  ASSERT_TRUE(first_queue.arm_wake(first));
+  ASSERT_TRUE(second_queue.arm_wake(second));
+
+  constexpr int kPublications = 5;
+  for (int i = 0; i < kPublications; ++i) {
+    ASSERT_EQ(writer.write(BytesOf({i, 0.0F})), WriteResult::SUCCESS);
+  }
+  EXPECT_EQ(writer.wakes_sent(), 2u) << kPublications << " publications";
+  EXPECT_EQ(WakeReadable(first_receiver, kWakeHangBoundMs), 1);
+  EXPECT_EQ(WakeReadable(second_receiver, kWakeHangBoundMs), 1);
+  first_receiver.drain();
+  second_receiver.drain();
+
+  // Only the first reader catches up and sleeps again.
+  for (int i = 0; i < kPublications; ++i) {
+    EXPECT_EQ(ReadOne(first_queue, first).id(), i);
+  }
+  ASSERT_TRUE(first_queue.arm_wake(first));
+  ASSERT_EQ(writer.write(BytesOf({kPublications, 0.0F})), WriteResult::SUCCESS);
+  EXPECT_EQ(writer.wakes_sent(), 3u);
+  EXPECT_EQ(WakeReadable(first_receiver, kWakeHangBoundMs), 1);
+  EXPECT_EQ(WakeReadable(second_receiver, 0), 0)
+      << "the second reader did not arm again";
+}
+
+// A slot's receiver belongs to its holder: once the slot is released, or
+// freed because its holder died, no publication notifies that receiver.
+// REQ-RT-02
+TEST(RTMSWake, AFreedSlotIsNotWoken) {
+  const std::string path = make_test_path("wake_freed");
+  RTMSQueue writer = WakeQueue(path, publisher_options());
+  talos::WakeReceiver receiver;
+  {
+    SCOPED_TRACE("released");
+    RTMSQueue subscriber = WakeQueue(path, sequence_options());
+    const std::size_t reader = RegisterReader(subscriber);
+    subscriber.set_reader_wake(reader, receiver.id());
+    ASSERT_TRUE(subscriber.arm_wake(reader));
+    subscriber.release_reader(reader);
+    ASSERT_EQ(writer.write(BytesOf({1, 1.0F})), WriteResult::SUCCESS);
+    EXPECT_EQ(writer.wakes_sent(), 0u);
+    EXPECT_EQ(WakeReadable(receiver, 0), 0);
+  }
+  {
+    SCOPED_TRACE("reclaimed from a killed reader");
+    const std::uint64_t receiver_id = receiver.id();
+    RunInChildThenKill([&path, receiver_id] {
+      // Leaked on purpose: the child dies armed, holding the slot.
+      auto* subscriber = new RTMSQueue{WakeQueue(path, sequence_options())};
+      const auto reader = subscriber->register_reader();
+      if (!reader) ::_exit(1);
+      subscriber->set_reader_wake(*reader, receiver_id);
+      if (!subscriber->arm_wake(*reader)) ::_exit(1);
+    });
+    ASSERT_EQ(writer.reclaim_dead_readers(), 1u);
+    ASSERT_EQ(writer.write(BytesOf({2, 2.0F})), WriteResult::SUCCESS);
+    EXPECT_EQ(writer.wakes_sent(), 0u);
+    EXPECT_EQ(WakeReadable(receiver, 0), 0);
+  }
+}
+
+// A writer that died after taking the waiters word but before notifying
+// leaves a reader asleep with a message to read. Whichever writer claims the
+// topic next -- a publisher opening it, or a queue's first write -- wakes
+// every reader with a receiver.
+// REQ-RT-02
+TEST(RTMSWake, AWriterTakingOverATopicWakesItsReaders) {
+  for (const bool lazy : {false, true}) {
+    SCOPED_TRACE(lazy ? "claimed by a first write" : "claimed on open");
+    const std::string path =
+        make_test_path(lazy ? "wake_takeover_lazy" : "wake_takeover");
+    RTMSQueue subscriber = WakeQueue(path, sequence_options());
+    const std::size_t reader = RegisterReader(subscriber);
+    talos::WakeReceiver receiver;
+    subscriber.set_reader_wake(reader, receiver.id());
+    ASSERT_TRUE(subscriber.arm_wake(reader));
+
+    // The dead writer: this pid at another start time, its exchange done.
+    SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
+    auto* header = static_cast<RTMSHeader*>(mapping.ptr());
+    ASSERT_NE(header, nullptr);
+    header->writer.owner_pid.store(talos::OwnProcessWord() ^
+                                   (1ULL << kProcessPidBits));
+    header->writer.waiters.exchange(0);
+
+    RTMSQueue writer = WakeQueue(
+        path, lazy ? overwrite_sequence_options() : publisher_options());
+    if (lazy) {
+      ASSERT_EQ(writer.write(BytesOf({1, 1.0F})), WriteResult::SUCCESS);
+    }
+    EXPECT_EQ(writer.wakes_sent(), 1u);
+    EXPECT_EQ(WakeReadable(receiver, 0), 1);
+  }
+}
+
+// The lost-wake property: a reader that reads only after poll(2) reports its
+// receiver readable sees every publication of a concurrent writer, never
+// sleeping past one. Each round the writer publishes as soon as the reader
+// has read the previous message, and the reader waits a seeded random spin
+// before reading again, so the publication lands before, during and after
+// its arm. Without the sequentially consistent store-then-load on both sides
+// a round ends with the reader asleep beside an unread message until the
+// hang bound: with the writer's sequence store made release and its waiters
+// load relaxed, an x86-64 run oversleeps within the first few thousand
+// rounds.
+// REQ-RT-02
+TEST(RTMSWake, AReaderThatSleepsBetweenReadsMissesNoPublication) {
+  const std::string path = make_test_path("wake_race");
+  RTMSQueue writer = WakeQueue(path, publisher_options());
+  RTMSQueue subscriber = WakeQueue(path, sequence_options());
+  const std::size_t reader = RegisterReader(subscriber);
+  talos::WakeReceiver receiver;
+  subscriber.set_reader_wake(reader, receiver.id());
+
+  constexpr int kRounds = 20'000;
+  // TALOS_WAKE_SEED replays a failing run's seed.
+  const char* seed_text = std::getenv("TALOS_WAKE_SEED");
+  const std::uint32_t seed =
+      seed_text != nullptr
+          ? static_cast<std::uint32_t>(std::strtoul(seed_text, nullptr, 10))
+          : std::random_device{}();
+  SCOPED_TRACE("TALOS_WAKE_SEED=" + std::to_string(seed));
+  std::atomic<int> consumed{0};
+  std::atomic<bool> stop{false};
+  std::atomic<int> write_failures{0};
+  std::thread publisher{[&] {
+    for (int i = 0; i < kRounds; ++i) {
+      // Publish only once the previous message is read, so the publication
+      // meets the reader going to sleep rather than reading. Spin first:
+      // a yield would let the reader fall asleep every round.
+      for (std::uint32_t spins = 0;
+           consumed.load(std::memory_order_acquire) < i; ++spins) {
+        if (stop.load(std::memory_order_acquire)) return;
+        if (spins >= kSpinsBeforeYield) std::this_thread::yield();
+      }
+      if (writer.write(BytesOf({i, 0.0F})) != WriteResult::SUCCESS) {
+        write_failures.fetch_add(1);
+      }
+    }
+  }};
+
+  std::minstd_rand jitter{seed};
+  int expected = 0;
+  int sleeps = 0;
+  bool overslept = false;
+  ReadResult last = ReadResult::OK;
+  while (expected < kRounds) {
+    Message::TestMessage received{};
+    MessageInfo info{};
+    last = subscriber.read_next(
+        reader, std::as_writable_bytes(std::span{&received, 1}), info);
+    if (last == ReadResult::OK) {
+      if (received.id() != expected) break;
+      consumed.store(++expected, std::memory_order_release);
+      // An atomic load per spin, which the compiler cannot elide.
+      for (std::uint32_t spin = jitter() % kMaxJitterSpins; spin > 0; --spin) {
+        (void)stop.load(std::memory_order_relaxed);
+      }
+      continue;
+    }
+    if (last != ReadResult::EMPTY) break;
+    if (!subscriber.arm_wake(reader)) continue;
+    ++sleeps;
+    if (WakeReadable(receiver, kWakeHangBoundMs) != 1) {
+      overslept = true;
+      break;
+    }
+    receiver.drain();
+  }
+  stop.store(true, std::memory_order_release);
+  publisher.join();
+
+  EXPECT_FALSE(overslept) << "asleep past publication " << expected << " of "
+                          << kRounds << " for " << kWakeHangBoundMs << " ms";
+  EXPECT_EQ(expected, kRounds)
+      << "stopped on read result " << static_cast<int>(last);
+  EXPECT_EQ(write_failures.load(), 0);
+  // Otherwise the race was never run.
+  EXPECT_GT(sleeps, 0);
 }

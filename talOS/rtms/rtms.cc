@@ -260,9 +260,11 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
       header->writer.owner_pid.store(options_.publisher ? OwnProcess() : 0,
                                      std::memory_order_relaxed);
       header->writer.reliable_sequence.store(0, std::memory_order_relaxed);
+      header->writer.waiters.store(0, std::memory_order_relaxed);
       for (auto& reader : header->readers) {
         reader.sequence.store(0, std::memory_order_relaxed);
         reader.state.store(0, std::memory_order_relaxed);
+        reader.wake_id.store(0, std::memory_order_relaxed);
       }
       // Last, so an attacher that sees the magic sees everything above.
       header->magic.store(kRtmsMagic, std::memory_order_release);
@@ -357,6 +359,7 @@ void RTMSQueue::open(const talos::schema::Identity& schema) {
     }
     ptr_ = std::move(ptr);
     header_ = header;
+    if (options_.publisher) wake_all_readers();
     return;
   }
   throw std::runtime_error(
@@ -406,7 +409,9 @@ RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
       header_{std::exchange(other.header_, nullptr)},
       ptr_{std::move(other.ptr_)},
       counted_{std::exchange(other.counted_, false)},
-      registered_{std::exchange(other.registered_, {})} {}
+      registered_{std::exchange(other.registered_, {})},
+      wake_senders_{std::move(other.wake_senders_)},
+      wakes_sent_{std::exchange(other.wakes_sent_, 0)} {}
 
 RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
   if (this != &other) {
@@ -424,6 +429,8 @@ RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
     ptr_ = std::move(other.ptr_);
     counted_ = std::exchange(other.counted_, false);
     registered_ = std::exchange(other.registered_, {});
+    wake_senders_ = std::move(other.wake_senders_);
+    wakes_sent_ = std::exchange(other.wakes_sent_, 0);
   }
   return *this;
 }
@@ -458,9 +465,17 @@ std::size_t RTMSQueue::reclaim_dead_readers() {
   for (auto& reader : header_->readers) {
     std::uint64_t word = reader.state.load(std::memory_order_acquire);
     if (word == 0 || ProcessAlive(word >> 2)) continue;
+    // Read while the dead holder still has the slot: nothing changes it.
+    std::uint64_t wake_id = reader.wake_id.load(std::memory_order_acquire);
     if (reader.state.compare_exchange_strong(word, 0,
                                              std::memory_order_acq_rel)) {
       ++freed;
+      // Only the dead holder's receiver: a new claimant may already have
+      // recorded its own. The waiters bit stays: clearing it here could
+      // erase a new claimant's arm, and a set bit with no receiver costs a
+      // writer one exchange and no notification.
+      reader.wake_id.compare_exchange_strong(wake_id, 0,
+                                             std::memory_order_acq_rel);
     }
   }
   return freed;
@@ -485,6 +500,7 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
   if (!options_.publisher) {
     ClaimWriter(*header_, path_);
     options_.publisher = true;
+    wake_all_readers();
   }
   const std::uint64_t slot_mask = slots_ - 1;
 
@@ -511,7 +527,9 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
     //
     // A reader whose process died holds its position forever, which would
     // wedge this writer for good; it is freed before the write is refused.
-    // Only on the full path, so the steady state makes no system call.
+    // Only on the full path, so the steady state makes no system call: a
+    // publication makes one only to wake a reader that armed (below). A
+    // refused write publishes nothing and wakes nobody.
     if (next_position - minimum_read_position() > slots_ &&
         (reclaim_dead_readers() == 0 ||
          next_position - minimum_read_position() > slots_)) {
@@ -544,7 +562,17 @@ WriteStatus RTMSQueue::write(std::span<const std::byte> message,
     header_->writer.reliable_sequence.store(next_position,
                                             std::memory_order_release);
   }
-  header_->writer.sequence.store(next_position, std::memory_order_release);
+  // Sequentially consistent, pairing with arm_wake(): a reader sets its
+  // waiters bit and then loads the sequence, the writer stores the sequence
+  // and then loads the waiters word, so either the reader sees this
+  // publication and does not sleep, or the writer sees the bit and wakes it.
+  header_->writer.sequence.store(next_position, std::memory_order_seq_cst);
+  // No reader asleep: no exchange and no system call.
+  if (header_->writer.waiters.load(std::memory_order_seq_cst) != 0) {
+    // Exchange, then notify: each sleep of a reader costs at most one send.
+    notify_readers(
+        header_->writer.waiters.exchange(0, std::memory_order_seq_cst));
+  }
   return {WriteResult::SUCCESS, writer_position};
 }
 
@@ -674,6 +702,11 @@ std::optional<std::size_t> RTMSQueue::register_reader() {
         continue;
       }
 
+      // A previous holder's receiver and arm do not carry over to this one.
+      header_->writer.waiters.fetch_and(~(std::uint64_t{1} << i),
+                                        std::memory_order_acq_rel);
+      reader.wake_id.store(0, std::memory_order_release);
+
       const auto current =
           header_->writer.sequence.load(std::memory_order_acquire);
 
@@ -706,6 +739,69 @@ void RTMSQueue::release_reader(std::size_t id) {
   // inherits its parent's registrations -- and only while it still holds it.
   std::uint64_t expected = std::exchange(registered_[id], 0);
   if (expected != ReaderWord(ReaderState::ACTIVE)) return;
-  header_->readers[id].state.compare_exchange_strong(
-      expected, 0, std::memory_order_acq_rel, std::memory_order_acquire);
+  auto& reader = header_->readers[id];
+  if (reader.state.load(std::memory_order_acquire) != expected) return;
+  // Disarmed before the slot is freed, so no writer notifies a receiver its
+  // holder may close, nor the slot's next holder for this one's arm.
+  header_->writer.waiters.fetch_and(~(std::uint64_t{1} << id),
+                                    std::memory_order_acq_rel);
+  reader.wake_id.store(0, std::memory_order_release);
+  reader.state.compare_exchange_strong(expected, 0, std::memory_order_acq_rel,
+                                       std::memory_order_acquire);
+}
+
+void RTMSQueue::set_reader_wake(std::size_t reader_id, std::uint64_t wake_id) {
+  if (header_ == nullptr || reader_id >= MAX_READERS ||
+      !holds_reader(reader_id)) {
+    return;
+  }
+  // Release: a writer that takes this slot's waiters bit with its acquiring
+  // exchange then reads this receiver.
+  header_->readers[reader_id].wake_id.store(wake_id, std::memory_order_release);
+  if (wake_id == 0) {
+    header_->writer.waiters.fetch_and(~(std::uint64_t{1} << reader_id),
+                                      std::memory_order_acq_rel);
+  }
+}
+
+bool RTMSQueue::arm_wake(std::size_t reader_id) {
+  if (header_ == nullptr || reader_id >= MAX_READERS ||
+      !holds_reader(reader_id)) {
+    return false;
+  }
+  const std::uint64_t bit = std::uint64_t{1} << reader_id;
+  // A bit still set from an earlier arm was stored by an earlier
+  // sequentially consistent read-modify-write, which orders it before the
+  // load below just as a new one would; a writer that has since taken it
+  // has notified, and that notification is still pending.
+  if ((header_->writer.waiters.load(std::memory_order_relaxed) & bit) == 0) {
+    header_->writer.waiters.fetch_or(bit, std::memory_order_seq_cst);
+  }
+  // The same comparison select_sequence() makes to report EMPTY.
+  const std::uint64_t reader_position =
+      header_->readers[reader_id].sequence.load(std::memory_order_relaxed);
+  const std::uint64_t writer_position =
+      header_->writer.sequence.load(std::memory_order_seq_cst);
+  return reader_position >= writer_position;
+}
+
+void RTMSQueue::notify_readers(std::uint64_t mask) {
+  for (std::size_t i = 0; i < MAX_READERS; ++i) {
+    if ((mask & (std::uint64_t{1} << i)) == 0) continue;
+    const std::uint64_t wake_id =
+        header_->readers[i].wake_id.load(std::memory_order_acquire);
+    if (wake_id == 0) continue;
+    // False means its receiver is gone; the slot's holder, or the reclaim of
+    // its dead process, clears the id.
+    wake_senders_[i].notify(wake_id);
+    ++wakes_sent_;
+  }
+}
+
+void RTMSQueue::wake_all_readers() {
+  // An exchange, not a store: reading the waiters word through the chain of
+  // read-modify-writes on it (a reader's arm, a dead writer's exchange)
+  // makes each armed reader's wake_id visible here.
+  header_->writer.waiters.exchange(0, std::memory_order_seq_cst);
+  notify_readers(~std::uint64_t{0});
 }
