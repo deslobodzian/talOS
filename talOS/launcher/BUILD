@@ -453,8 +453,9 @@ cc_test(
 )
 
 # --replay-inputs: a producer recorded in a session, a consumer that was not
-# in it, a reader of the producer's topic as another type of the same size,
-# and a reader of the declared graph that keeps a record under its session.
+# in it, a sampler that was, a reader of the producer's topic as another type
+# of the same size, and a reader of the declared graph that keeps a record
+# under its session.
 talos_messages(
     name = "replay_message",
     srcs = ["testdata/replay_message.fbs"],
@@ -474,6 +475,14 @@ talos_cc_node(
     name = "replay_consumer",
     srcs = ["testdata/replay_consumer.cc"],
     node_name = "replay_consumer",
+    visibility = ["//visibility:private"],
+    deps = [":replay_message"],
+)
+
+talos_cc_node(
+    name = "replay_sampler",
+    srcs = ["testdata/replay_sampler.cc"],
+    node_name = "replay_sampler",
     visibility = ["//visibility:private"],
     deps = [":replay_message"],
 )
@@ -505,6 +514,7 @@ cc_test(
         ":replay_consumer",
         ":replay_graph_reader",
         ":replay_impostor",
+        ":replay_sampler",
         ":replay_source",
     ],
     env = {
@@ -512,6 +522,7 @@ cc_test(
         "TALOS_CONSUMER_NODE": "$(rlocationpath :replay_consumer)",
         "TALOS_IMPOSTOR_NODE": "$(rlocationpath :replay_impostor)",
         "TALOS_GRAPH_READER_NODE": "$(rlocationpath :replay_graph_reader)",
+        "TALOS_SAMPLER_NODE": "$(rlocationpath :replay_sampler)",
     },
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.

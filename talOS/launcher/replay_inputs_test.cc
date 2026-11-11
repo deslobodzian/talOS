@@ -1,13 +1,15 @@
 // launcher --replay-inputs: a session recorded by the launcher with real
 // node processes on real shared memory, then replayed into a node that was
-// not in it (testdata/replay_consumer.cc), twice, into one that reads the
-// recorded topic as another type (testdata/replay_impostor.cc), and into one
-// that reads the declared graph and keeps a record under its session
-// directory (testdata/replay_graph_reader.cc).
+// not in it (testdata/replay_consumer.cc), twice, into one that was
+// (testdata/replay_sampler.cc), into one that reads the recorded topic as
+// another type (testdata/replay_impostor.cc), and into one that reads the
+// declared graph and keeps a record under its session directory
+// (testdata/replay_graph_reader.cc).
 
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -15,15 +17,19 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "replay_inputs_test/replay_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/events/manifest.h"
 #include "talOS/launcher/launcher.h"
 
 namespace talos::launcher {
@@ -52,6 +58,31 @@ std::string TempPath(std::string_view name) {
          std::to_string(::getpid()) + "_" + std::string{name};
 }
 
+// Calls `visit(header, payload)` for each `kind` record of `log_path`'s
+// source on `topic` (a watcher by MESSAGE, a sender by SEND), in log order.
+template <class Visit>
+void ForEachRecord(const std::string& log_path, std::string_view topic,
+                   event::EventKind kind, Visit visit) {
+  event::log::LogReader reader{log_path};
+  std::uint16_t id = 0xFFFF;
+  for (const auto& registration : reader.manifest()) {
+    const bool sender = registration.kind == event::SourceKind::SENDER;
+    if (registration.name == topic &&
+        sender == (kind == event::EventKind::SEND)) {
+      id = registration.id;
+    }
+  }
+  EXPECT_NE(id, 0xFFFF) << log_path << " has no " << topic;
+  event::log::LogReader::Record record;
+  while (reader.next(record)) {
+    if (record.header.kind == static_cast<std::uint16_t>(kind) &&
+        record.header.source_id == id) {
+      visit(record.header, std::vector<std::byte>{record.payload.begin(),
+                                                  record.payload.end()});
+    }
+  }
+}
+
 struct Sent {
   std::int64_t now_ns;
   std::vector<std::byte> payload;
@@ -60,23 +91,43 @@ struct Sent {
 
 // What `log_path`'s node sent on `topic`, with when.
 std::vector<Sent> Sends(const std::string& log_path, std::string_view topic) {
-  event::log::LogReader reader{log_path};
-  std::uint16_t id = 0xFFFF;
-  for (const auto& registration : reader.manifest()) {
-    if (registration.name == topic) id = registration.id;
-  }
-  EXPECT_NE(id, 0xFFFF) << log_path << " has no " << topic;
   std::vector<Sent> sent;
-  event::log::LogReader::Record record;
-  while (reader.next(record)) {
-    if (record.header.kind ==
-            static_cast<std::uint16_t>(event::EventKind::SEND) &&
-        record.header.source_id == id) {
-      sent.push_back({record.header.now_ns,
-                      {record.payload.begin(), record.payload.end()}});
-    }
-  }
+  ForEachRecord(log_path, topic, event::EventKind::SEND,
+                [&](const auto& header, std::vector<std::byte> payload) {
+                  sent.push_back({header.now_ns, std::move(payload)});
+                });
   return sent;
+}
+
+// The same, by the deadline of the dispatch that sent it.
+std::map<std::int64_t, std::vector<std::byte>> SendsByDeadline(
+    const std::string& log_path, std::string_view topic) {
+  std::map<std::int64_t, std::vector<std::byte>> sent;
+  ForEachRecord(log_path, topic, event::EventKind::SEND,
+                [&](const auto& header, std::vector<std::byte> payload) {
+                  sent[header.event_time_ns] = std::move(payload);
+                });
+  return sent;
+}
+
+struct Delivery {
+  std::int64_t event_ns;    // the drain that delivered it
+  std::int64_t publish_ns;  // when it was published
+  std::vector<std::byte> payload;
+  bool operator==(const Delivery&) const = default;
+};
+
+// What `log_path`'s node received on `topic`, in the order it received it.
+std::vector<Delivery> Deliveries(const std::string& log_path,
+                                 std::string_view topic) {
+  std::vector<Delivery> received;
+  ForEachRecord(
+      log_path, topic, event::EventKind::MESSAGE,
+      [&](const auto& header, std::vector<std::byte> payload) {
+        received.push_back(
+            {header.event_time_ns, header.publish_time_ns, std::move(payload)});
+      });
+  return received;
 }
 
 template <class M>
@@ -106,13 +157,17 @@ can_id = 1
 [subsystems.replay_consumer]
 node = "//talOS/launcher:replay_consumer"
 
+[subsystems.replay_sampler]
+node = "//talOS/launcher:replay_sampler"
+
 [subsystems.replay_impostor]
 node = "//talOS/launcher:replay_impostor"
 
 [subsystems.replay_graph_reader]
 node = "//talOS/launcher:replay_graph_reader"
 )";
-    // The recorded session runs the source and the graph reader.
+    // The recorded session runs the source, the sampler and the graph
+    // reader.
     std::ofstream{record_config_} << R"([robot]
 name = "replay_inputs"
 period_us = 5000
@@ -124,6 +179,9 @@ node = "//talOS/launcher:replay_source"
 type = "TalonFX"
 bus = "rio"
 can_id = 1
+
+[subsystems.replay_sampler]
+node = "//talOS/launcher:replay_sampler"
 
 [subsystems.replay_graph_reader]
 node = "//talOS/launcher:replay_graph_reader"
@@ -171,6 +229,8 @@ node = "//talOS/launcher:replay_graph_reader"
         Runfile("TALOS_IMPOSTOR_NODE");
     options.binary_overrides["//talOS/launcher:replay_graph_reader"] =
         Runfile("TALOS_GRAPH_READER_NODE");
+    options.binary_overrides["//talOS/launcher:replay_sampler"] =
+        Runfile("TALOS_SAMPLER_NODE");
     return options;
   }
 
@@ -241,6 +301,67 @@ TEST_F(ReplayInputsTest, ANodeThatWasNotInTheSessionRunsOnItsTopics) {
   std::filesystem::remove_all(second);
 }
 
+// REQ-OPS-14: a node the session ran replays on its own recorded timeline.
+// Each process's log has its own origin (the sampler was spawned after the
+// source, and its loop began running after its construction), and the
+// sampler saw each reading at the tick that drained it live. Replayed, it
+// sees the same readings at the same ticks, in the same order, with their
+// recorded publication times; a replay counted from the session's earliest
+// origin lands each reading published between the two timelines' ticks on a
+// neighbouring tick. The replayed loop drains at each deadline, without the
+// live loop's wake-up latency, so a reading the live drain read although it
+// was published during that latency is stamped with the drain's deadline.
+TEST_F(ReplayInputsTest, ANodeThatWasInTheSessionSeesItsInputsWhenItDid) {
+  Record();
+  const std::string recorded_log = session_dir_ + "/replay_sampler.tlog";
+  ASSERT_NE(
+      event::log::LogReader{recorded_log}.start_time(),
+      event::log::LogReader{session_dir_ + "/replay_source.tlog"}.start_time());
+  std::vector<Delivery> expected =
+      Deliveries(recorded_log, "/replay_source/state");
+  ASSERT_FALSE(expected.empty());
+  for (Delivery& delivery : expected) {
+    delivery.publish_ns = std::min(delivery.publish_ns, delivery.event_ns);
+  }
+
+  const std::string out = TempPath("sampler");
+  std::filesystem::remove_all(out);
+  ASSERT_EQ(Replay("replay_sampler", out), 0);
+  const std::vector<Delivery> replayed =
+      Deliveries(out + "/1/replay_sampler.tlog", "/replay_source/state");
+  EXPECT_EQ(replayed.size(), expected.size());
+  const auto [want, got] = std::mismatch(expected.begin(), expected.end(),
+                                         replayed.begin(), replayed.end());
+  if (want != expected.end() && got != replayed.end()) {
+    ADD_FAILURE() << "delivery " << (want - expected.begin())
+                  << ": recorded at " << want->event_ns << " ns, published "
+                  << want->publish_ns << " ns; replayed at " << got->event_ns
+                  << " ns, published " << got->publish_ns << " ns"
+                  << (want->payload == got->payload ? "" : ", another reading");
+  }
+  // So it sends what it sent, at each deadline it sent at live (the replay
+  // also ticks at any deadline a late live tick coalesced).
+  const auto replayed_sends =
+      SendsByDeadline(out + "/1/replay_sampler.tlog", "/replay_sampler/state");
+  const auto recorded_sends =
+      SendsByDeadline(recorded_log, "/replay_sampler/state");
+  ASSERT_FALSE(recorded_sends.empty());
+  for (const auto& [deadline_ns, payload] : recorded_sends) {
+    const auto replayed_send = replayed_sends.find(deadline_ns);
+    if (replayed_send == replayed_sends.end() ||
+        replayed_send->second != payload) {
+      ADD_FAILURE() << "the tick at " << deadline_ns << " ns sent "
+                    << (replayed_send == replayed_sends.end()
+                            ? "nothing"
+                            : "another summary")
+                    << " in the replay";
+      break;
+    }
+  }
+
+  std::filesystem::remove_all(out);
+}
+
 TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
   Record();
   const std::string out = TempPath("impostor");
@@ -252,9 +373,9 @@ TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
 
 // REQ-OPS-14: a node whose endpoints come from the declared graph (teleop,
 // telemetry) replays on the graph its session was launched with, read from
-// the replayed session's declared_graph.json: here one state topic besides
-// its own, the source's. A session without that file is refused, not
-// replayed on an empty graph.
+// the replayed session's declared_graph.json: here two state topics besides
+// its own, the source's and the sampler's. A session without that file is
+// refused, not replayed on an empty graph.
 TEST_F(ReplayInputsTest, AGraphReaderReplaysOnTheSessionsDeclaredGraph) {
   Record();
   const std::string out = TempPath("graph_reader");
@@ -263,7 +384,7 @@ TEST_F(ReplayInputsTest, AGraphReaderReplaysOnTheSessionsDeclaredGraph) {
   const std::vector<Sent> summaries =
       Sends(out + "/1/replay_graph_reader.tlog", "/replay_graph_reader/state");
   ASSERT_FALSE(summaries.empty());
-  EXPECT_EQ(As<Summary>(summaries.back()).reading_count(), 1u);
+  EXPECT_EQ(As<Summary>(summaries.back()).reading_count(), 2u);
 
   std::filesystem::remove_all(out);
   ASSERT_TRUE(std::filesystem::remove(session_dir_ + "/declared_graph.json"));

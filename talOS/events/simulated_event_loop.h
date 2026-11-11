@@ -143,8 +143,15 @@ class SimulatedEventLoop
     Delivery delivery{Delivery::POLL};
     // The clock's origin: where it starts and what the manifest's timer
     // offsets count from. Input replay (input_replay.h) starts at the
-    // recorded session's, so recorded times mean what they meant live.
+    // recorded node's, so recorded times mean what they meant live.
     MonotonicTime start{};
+    // When the run begins, if after `start`: the schedule set up before the
+    // run counts from here, and the clock jumps here at the first run, as
+    // the realtime loop's schedule counts from its run() rather than its
+    // origin (construction runs between the two). Input replay sets it to
+    // the recorded node's run start (RecordedSession::run_start), so its
+    // timers fire at the recorded deadlines.
+    std::optional<MonotonicTime> run_start;
   };
 
   // How often the loop has drained its watched topics, as on the realtime
@@ -153,7 +160,9 @@ class SimulatedEventLoop
 
   explicit SimulatedEventLoop(SimulationEnvironment& environment,
                               Options options = Options{})
-      : environment_{&environment}, options_{options}, now_{options.start} {
+      : environment_{&environment},
+        options_{Checked(options)},
+        now_{options.start} {
     this->set_start_time(options.start);
   }
 
@@ -161,7 +170,7 @@ class SimulatedEventLoop
                      Options options = Options{})
       : Base{std::move(recorder)},
         environment_{&environment},
-        options_{options},
+        options_{Checked(options)},
         now_{options.start} {
     this->set_start_time(options.start);
   }
@@ -287,9 +296,13 @@ class SimulatedEventLoop
     if (!started_) {
       scheduler_.reserve(this->manifest().size() + 1);
       this->begin_run();
+      const MonotonicTime run_start =
+          options_.run_start.value_or(options_.start);
+      scheduler_.shift(run_start - options_.start);
+      now_ = std::max(now_, run_start);
       if (options_.delivery == Delivery::POLL) {
         scheduler_.schedule(INTERNAL_POLL_TIMER_ID,
-                            options_.start + options_.tick_period,
+                            run_start + options_.tick_period,
                             options_.tick_period);
       } else if (options_.delivery == Delivery::ON_PUBLISH) {
         // With no prompt watcher only timers are events: the loop runs as
@@ -365,6 +378,14 @@ class SimulatedEventLoop
     SimulatedChannel* channel{nullptr};
     std::uint64_t sequence{0};
   };
+
+  static Options Checked(Options options) {
+    if (options.run_start && *options.run_start < options.start) {
+      throw std::invalid_argument(
+          "a simulated loop's run cannot start before its origin");
+    }
+    return options;
+  }
 
   bool running_state() const { return this->running(); }
 
