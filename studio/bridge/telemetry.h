@@ -306,11 +306,19 @@ struct EgressBudget {
     return tokens >= static_cast<double>(bytes);
   }
   void spend(std::size_t bytes) { tokens -= static_cast<double>(bytes); }
+  // How long after the last available() `bytes` fit, refilling at `rate`;
+  // 0 when they fit now, kNeverNs when they exceed the burst.
+  std::int64_t wait_ns(std::size_t bytes, double rate) const {
+    const auto needed = static_cast<double>(bytes);
+    if (needed > kBurstBytes) return kNeverNs;
+    if (tokens >= needed) return 0;
+    return static_cast<std::int64_t>(std::ceil((needed - tokens) / rate * 1e9));
+  }
 };
 
 // What one client has been sent, so its next update carries only what
 // changed. Pump is called whenever there may be something to send (each new
-// tick, each bridge poll); it never sends what the client already has.
+// tick, each bridge pass); it never sends what the client already has.
 class ClientFeed {
  public:
   // With nothing changed, an empty update still goes out this often, so the
@@ -405,6 +413,12 @@ class ClientFeed {
     sequence_id_ = state.sequence_id;
     chassis_ = state.chassis;
     last_send_ns_ = now_ns;
+  }
+
+  // When an update is next due with nothing new published: the heartbeat,
+  // once the client holds a tick; kNeverNs before.
+  std::int64_t NextHeartbeatNs() const {
+    return has_values_ ? last_send_ns_ + kHeartbeatNs : kNeverNs;
   }
 
   // True when the client holds exactly the state's latest tick.
@@ -524,6 +538,17 @@ struct ClientFeeds {
           return ok;
         });
     if (sent) held_sent_ns_ = now_ns;
+  }
+
+  // The earliest instant Pump, called with nothing new published, may send:
+  // the graph's next due message, the telemetry heartbeat, and the end of
+  // the hold on telemetry while a graph message waits. Sends deferred only
+  // for budget are due when it refills, which the caller tracks.
+  std::int64_t NextDueNs(const SystemGraphDocument& document) const {
+    std::int64_t due =
+        std::min(graph.NextDueNs(document), telemetry.NextHeartbeatNs());
+    if (held_since_ns_ >= 0) due = std::min(due, held_sent_ns_ + kHoldNs);
+    return due;
   }
 
  private:

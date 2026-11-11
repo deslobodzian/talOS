@@ -335,6 +335,89 @@ class BridgeIntegration(unittest.TestCase):
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
+    # REQ-RT-21
+    def test_sleeps_until_a_publication_or_a_deadline(self):
+        """An idle bridge wakes only for its deadlines; a publication wakes it.
+
+        Before this, a 1 ms timer drained the topic, so the bridge woke about
+        1000 times a second with nothing published, and a page waited for the
+        next tick of that timer.
+        """
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        binaries = workspace / "studio/bridge"
+        topic = f"/test/telemetry/w{os.getpid()}"
+        processes = []
+        with tempfile.TemporaryDirectory() as webroot:
+            try:
+                # The publisher first, so the bridge attaches at once and the
+                # idle window below is the attached, idle state; it publishes
+                # only when the test writes a line.
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic, "--on-stdin"],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
+                bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic, "0", webroot],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                          text=True)
+                processes.append(bridge)
+                started = time.monotonic()
+                port = bound_port(bridge)
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as ws:
+                    key = base64.b64encode(os.urandom(16)).decode()
+                    ws.sendall((f"GET /telemetry HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+                    headers = b""
+                    while not headers.endswith(b"\r\n\r\n"):
+                        headers += receive(ws, 1)
+                    self.assertIn(b"101 Switching Protocols", headers)
+                    # The idle window is measured in the bridge's own graph
+                    # updates (one per GraphFeed::kUpdateNs), not slept out.
+                    for _ in range(4):
+                        self.assertIn(json.loads(frame_of(ws, TEXT).decode())["kind"],
+                                      ("talos.system_graph", "talos.system_graph.update"))
+                    # One tick published into the idle topic reaches the
+                    # client: its dictionary, then its keyframe.
+                    mock.stdin.write("tick\n")
+                    mock.stdin.flush()
+                    self.assertEqual(mock.stdout.readline().strip(), "published 0")
+                    self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
+                    self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
+                bridge.send_signal(signal.SIGTERM)
+                _, errors = bridge.communicate(timeout=5)
+                elapsed_s = time.monotonic() - started
+                self.assertEqual(bridge.returncode, 0, errors)
+                summary = dict(field.split("=", 1) for field in errors.split()
+                               if field.count("=") == 1)
+                # The bridge's deadlines, idle with one client: the graph
+                # refresh (4/s), the segment check (1/s), the client's graph
+                # update (2/s), and uWebSockets' own date (1/s) and socket
+                # sweep (1/4 s) timers: under 9 a second. 25 a second and 20
+                # for the connection, the publication and the stop leave
+                # room for an early or doubled wake; the 1 ms timer made
+                # about 1000 a second.
+                bound = 25 * elapsed_s + 20
+                self.assertLessEqual(int(summary["wakes"]), bound,
+                                     f"{summary['wakes']} wakes in {elapsed_s:.2f} s; "
+                                     f"bound {bound:.0f} (25/s + 20): {errors}")
+                # The page was read because its publication woke the loop.
+                self.assertGreaterEqual(int(summary["publication_wakes"]), 1, errors)
+            finally:
+                if mock.stdin:
+                    mock.stdin.close()
+                for process in reversed(processes):
+                    if process.poll() is None:
+                        process.send_signal(signal.SIGTERM)
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                    if process.stdout:
+                        process.stdout.close()
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

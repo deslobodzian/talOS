@@ -16,6 +16,9 @@ bazel-bin/studio/bridge/studio_mock /talos/telemetry
 bazel-bin/studio/bridge/studio_bridge /talos/telemetry 5800 studio/dist
 ```
 
+The mock publishes a tick every 5 ms; with `--on-stdin` it publishes one per
+line read from stdin instead, so a test controls when the topic is idle.
+
 ## Arguments
 
 The optional positions are topic (default `/talos/telemetry`), HTTP/WebSocket
@@ -79,7 +82,7 @@ sees fewer, never inconsistent, ticks. A page the socket refuses resynchronizes
 that client with a fresh keyframe.
 
 The system graph includes the bridge itself and refreshes every 250 ms of
-the monotonic clock, checked on the 1 ms poll timer. `/system.json` serves the whole document,
+the monotonic clock (see [Waking](#waking)). `/system.json` serves the whole document,
 with a `structure` id covering everything but its fast values (wall time,
 counters, heartbeats, liveness, selected sources, topic verdicts). Each
 WebSocket client (`GraphFeed` in [`system.h`](system.h)) is sent the whole
@@ -164,17 +167,39 @@ during the copy is retried, never applied. See
 page sizes and [shared-memory geometry](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots).
 
 The bridge may start before the publisher. It serves HTTP and the system graph
-at once, checks for the topic's shared-memory segment every 100 poll ticks and
+at once, checks for the topic's shared-memory segment every 100 ms and
 attaches when it appears. It does not create the segment to wait on it: if the
 name is unlinked between that check and the attach, the attach creates an
 empty segment for an instant, sees the id change, closes it (removing it, as
 its only holder) and retries at the next check. Once attached it
-checks every 1000 ticks whether the name now holds a different segment (a new
+checks every second whether the name now holds a different segment (a new
 launcher session, or one created after the old one's last holder closed it) and
 re-attaches. A segment whose name was unlinked is kept until a new one appears.
 Each wait, attachment and replacement is logged once to stderr.
 Graceful SIGINT/SIGTERM releases the reader slot. Static files are read
-synchronously on the thread that polls telemetry and capped at 4 MiB each
+synchronously on the thread that reads telemetry and capped at 4 MiB each
 (413 above it), a few times the built Studio bundle's largest asset. The server
 has no authentication or TLS; use it only on a trusted robot/development
 network.
+
+## Waking
+
+The bridge does not poll. Its one thread sleeps in the uSockets loop until a
+socket event (HTTP, a WebSocket message or a drained client socket), a
+publication on the telemetry topic, or its next duty. The reader slot names a
+`talos::WakeReceiver` whose descriptor is in the loop, so a publication wakes
+it at once
+([wake channel](../../talOS/rtms/README.md#wake-channel)). Each wake is one
+pass: drain the receiver, read the topic (at most 256 pages a pass), check the
+segment and refresh the graph when due, send each client what is due, and arm
+the wake. A timer is then set to the earliest duty: the 250 ms graph refresh,
+the segment check (100 ms waiting, 1 s attached), and for each client its
+graph update (500 ms) or deferral notice (750 ms), its telemetry heartbeat
+(100 ms after its last update), the end of a telemetry hold (250 ms), and the
+instant the egress budget can afford a deferred send. Idle and attached, with
+no client, that is about six wakes a second: four refreshes, one segment check
+and uWebSockets' own one-second date timer. A pass that stops at its page
+budget, an arm that keeps finding pages (three tries), or a wake receiver that
+cannot be made sends the bridge back every 1 ms instead. The shutdown summary
+adds `wakes` (every return from the wait), `publication_wakes` and
+`deadline_wakes`.

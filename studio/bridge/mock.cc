@@ -28,8 +28,13 @@ void signal_handler(int) { stop = 1; }
 int main(int argc, char** argv) try {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
-  RTMSQueue queue(argc > 1 ? argv[1] : "/talos/telemetry", wire::slot_bytes, 8,
-                  talos::schema::Bytes(), wire::slot_count,
+  // `--on-stdin`: publish one tick per line read from stdin, and exit at its
+  // end, instead of one every 5 ms: a test then decides when the topic is
+  // idle and when it publishes.
+  std::vector<std::string> args(argv, argv + argc);
+  const bool on_stdin = std::erase(args, "--on-stdin") > 0;
+  RTMSQueue queue(args.size() > 1 ? args[1] : "/talos/telemetry",
+                  wire::slot_bytes, 8, talos::schema::Bytes(), wire::slot_count,
                   {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
                    .read_mode = ReadMode::SEQUENCE,
                    .publisher = true});
@@ -45,7 +50,8 @@ int main(int argc, char** argv) try {
        Talos::Telemetry::ChannelKind_UInt},
       {"pose/valid", "", {}, Talos::Telemetry::ChannelKind_Bool},
   };
-  const auto channels = argc > 2 ? std::stoul(argv[2]) : dictionary.size();
+  const auto channels =
+      args.size() > 2 ? std::stoul(args[2]) : dictionary.size();
   if (channels < dictionary.size() ||
       channels > talos::telemetry_wire::kMaxChannels) {
     throw std::runtime_error(
@@ -83,6 +89,10 @@ int main(int argc, char** argv) try {
   }
   auto next = std::chrono::steady_clock::now();
   for (std::uint64_t seq = 0; !stop; ++seq) {
+    if (on_stdin) {
+      std::string line;
+      if (!std::getline(std::cin, line)) break;
+    }
     const double t = static_cast<double>(seq) * 0.005;
     const Talos::Telemetry::Pose pose(8 + 3 * std::cos(t * .25),
                                       4 + 2 * std::sin(t * .25), 0, 0, 0,
@@ -113,6 +123,11 @@ int main(int argc, char** argv) try {
             [&publish](std::span<const std::uint8_t> page,
                        const talos::telemetry::PageSpan&) { publish(page); })) {
       throw std::logic_error("mock: a value page outgrew its bound");
+    }
+    if (on_stdin) {
+      // Tells the test the tick is in the topic.
+      std::cout << "published " << seq << '\n' << std::flush;
+      continue;
     }
     next += std::chrono::milliseconds(5);
     std::this_thread::sleep_until(next);

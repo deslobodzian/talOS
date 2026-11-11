@@ -656,6 +656,126 @@ TEST(ClientFeeds, StarvedClientKeepsTheGraphCurrentAndNeverStale) {
       EgressBudget::kBurstBytes + kRate * static_cast<double>(now) * 1e-9);
 }
 
+// REQ-RT-21
+// The bridge does not poll: it pumps a client when a tick arrives, when the
+// graph refreshes, and at the client's NextDueNs or the instant a deferred
+// send's budget refills (EgressBudget::wait_ns), nothing else. Pumped only
+// then, a starved client still hears from the graph before Studio would mark
+// it stale, gets its telemetry heartbeat on time once the producer goes
+// quiet, and converges on the latest graph and tick.
+TEST(ClientFeeds, PumpedOnlyWhenDueKeepsGraphHeartbeatAndConvergence) {
+  constexpr std::uint32_t kChannels = 200;
+  std::vector<ChannelDef> dictionary;
+  std::vector<std::uint32_t> channels;
+  for (std::uint32_t i = 0; i < kChannels; ++i) {
+    dictionary.push_back({"test/state/channel_" + std::to_string(i),
+                          "",
+                          {},
+                          Talos::Telemetry::ChannelKind_Double});
+    channels.push_back(i);
+  }
+  const auto tick_values = [&](std::uint64_t tick) {
+    std::vector<std::uint64_t> values;
+    for (std::uint32_t i = 0; i < kChannels; ++i) {
+      values.push_back(RawFromDouble(static_cast<double>(tick * 1000 + i)));
+    }
+    return values;
+  };
+
+  // As in StarvedClientKeepsTheGraphCurrentAndNeverStale: telemetry alone
+  // would exhaust the share, and the whole graph takes over a second.
+  constexpr double kRate = 20000;
+  constexpr int kNodes = 9;
+  constexpr std::int64_t kStaleNs = 1'000'000'000;  // GRAPH_STALE_AFTER_MS
+  constexpr std::int64_t kTickNs = 10'000'000;
+  constexpr std::int64_t kRefreshNs = 250'000'000;
+  constexpr std::int64_t kTicksEndNs = 3'000'000'000;
+  constexpr std::int64_t kRefreshesEndNs = 8'000'000'000;
+  constexpr std::int64_t kEndNs = 12'000'000'000;
+  TelemetryState state;
+  ASSERT_TRUE(IngestAll(state, DictionaryPages(dictionary)));
+  std::uint64_t tick = 0, refresh = 0;
+  SystemGraphDocument document = BuildSystemGraph(Registry(kNodes, 0, 0));
+
+  ClientFeeds feeds;
+  EgressBudget budget;
+  Mirror mirror;
+  std::string held_values;
+  std::int64_t now = 0, retry = kNeverNs, last_text = -1, last_page = -1;
+  std::int64_t longest_silence = 0, longest_quiet_gap = 0;
+  std::size_t pumps = 0;
+  const auto pump = [&] {
+    ++pumps;
+    retry = kNeverNs;
+    feeds.Pump(
+        document, state, now, kRate,
+        [&](std::size_t bytes) {
+          if (budget.available(bytes, kRate, now)) return true;
+          const std::int64_t wait = budget.wait_ns(bytes, kRate);
+          if (wait != kNeverNs) retry = std::min(retry, now + wait);
+          return false;
+        },
+        [&](std::string_view text) {
+          budget.spend(EgressBudget::framed(text.size()));
+          if (last_text >= 0) {
+            longest_silence = std::max(longest_silence, now - last_text);
+          }
+          last_text = now;
+          if (text == document.json) {
+            held_values = document.values;
+          } else if (text.starts_with(
+                         "{\"kind\":\"talos.system_graph.update\"")) {
+            held_values = Between(text, "\"values\":", "}");
+          }
+          return true;
+        },
+        [&](std::string_view page) {
+          budget.spend(EgressBudget::framed(page.size()));
+          mirror.Apply(page);
+          // Once the producer has been quiet long enough for the client to
+          // catch up, its updates are heartbeats.
+          if (now >= kTicksEndNs + kStaleNs && last_page >= 0) {
+            longest_quiet_gap = std::max(longest_quiet_gap, now - last_page);
+          }
+          last_page = now;
+          return true;
+        });
+  };
+
+  while (now < kEndNs) {
+    std::int64_t next = kEndNs;
+    const auto consider = [&](std::int64_t due) {
+      if (due > now && due < next) next = due;
+    };
+    const std::int64_t next_tick =
+        static_cast<std::int64_t>(tick + 1) * kTickNs;
+    const std::int64_t next_refresh =
+        static_cast<std::int64_t>(refresh + 1) * kRefreshNs;
+    if (next_tick <= kTicksEndNs) consider(next_tick);
+    if (next_refresh <= kRefreshesEndNs) consider(next_refresh);
+    consider(feeds.NextDueNs(document));
+    consider(retry);
+    now = next;
+    if (now == next_tick && now <= kTicksEndNs) {
+      ++tick;
+      ASSERT_TRUE(IngestAll(
+          state, TickPages(kChannels, tick, channels, tick_values(tick))));
+    }
+    if (now == next_refresh && now <= kRefreshesEndNs) {
+      document = BuildSystemGraph(Registry(kNodes, ++refresh, 0));
+    }
+    pump();
+  }
+  EXPECT_LT(longest_silence, kStaleNs);
+  EXPECT_LE(longest_quiet_gap, ClientFeed::kHeartbeatNs);
+  EXPECT_EQ(held_values, document.values);
+  EXPECT_TRUE(mirror.Equals(state));
+  EXPECT_EQ(mirror.sequence_id, tick);
+  // Not a poll: about one pass per tick, refresh and due message, against
+  // the 12000 a 1 ms timer would make.
+  EXPECT_LT(pumps, 1500u) << "pumps over " << kEndNs / 1'000'000 << " ms";
+}
+
 // The largest graph a client can be sent is the one whose framed size is the
 // burst. One byte larger it can never be afforded, so it must never be
 // treated as waiting for budget either: that would hold the client's

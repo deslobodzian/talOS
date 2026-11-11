@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <string>
 #include <string_view>
@@ -34,6 +35,10 @@ namespace studio {
 namespace event = talos::event;
 namespace introspect = talos::introspect;
 namespace naming = talos::introspect::naming;
+
+// A deadline that never comes: nothing is due.
+inline constexpr std::int64_t kNeverNs =
+    std::numeric_limits<std::int64_t>::max();
 
 // Bumped for the per-source `external`/`optional` booleans and the per-topic
 // `health` string. A version-1 reader would ignore the new fields and keep
@@ -569,6 +574,18 @@ class GraphFeed {
     }
     Notice(now_ns, afford, send);
     return true;
+  }
+
+  // The earliest instant Pump would send something `document` holds that it
+  // has not, once a waiting interval ends (whole resend, update, notice);
+  // kNeverNs when the client holds it. A message deferred only for budget
+  // is due when the budget refills, which the caller tracks.
+  std::int64_t NextDueNs(const SystemGraphDocument& document) const {
+    if (document.json.empty() || structure_.empty()) return kNeverNs;
+    const bool whole = structure_ != document.structure;
+    if (!whole && values_ == document.values) return kNeverNs;
+    return std::min(whole ? whole_ns_ + kResendNs : updated_ns_ + kUpdateNs,
+                    sent_ns_ + kNoticeNs);
   }
 
  private:
