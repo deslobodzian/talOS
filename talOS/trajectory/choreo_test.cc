@@ -67,6 +67,7 @@ TEST(ChoreoTest, MapsSampleFieldsToMembers) {
 // Guards: a file Choreo itself wrote (schema 3, trimmed from Choreo's
 // test-jsons/trajectory/3/swerve.traj, with trajectory.config, waypoint
 // times and forces) loads, with its unwrapped end heading and both markers.
+// REQ-DEV-13
 TEST(ChoreoTest, LoadsChoreoSchema3File) {
   const LoadResult result =
       LoadChoreoFile(FixturePath("TALOS_TRAJECTORY_CHOREO_V3_SWERVE"));
@@ -88,6 +89,7 @@ TEST(ChoreoTest, LoadsChoreoSchema3File) {
 // Guards: driven the natural way (reset at the start, advance with elapsed
 // time each 20 ms tick, from t = 0), an EventCursor fires the real file's
 // marker at 0.0 on the first tick and the one at 1.19616 s exactly once.
+// REQ-DEV-14
 TEST(ChoreoTest, CursorFiresChoreoMarkersOnceIncludingAtZero) {
   const LoadResult result =
       LoadChoreoFile(FixturePath("TALOS_TRAJECTORY_CHOREO_V3_SWERVE"));
@@ -109,6 +111,7 @@ TEST(ChoreoTest, CursorFiresChoreoMarkersOnceIncludingAtZero) {
 // Guards: every released schema version (1, 2, 3) is accepted; the inline
 // document is valid, so each failure below is caused by the one thing it
 // changes.
+// REQ-DEV-13
 TEST(ChoreoTest, AcceptsVersionsOneToThree) {
   for (const char* version : {"1", "2", "3"}) {
     SCOPED_TRACE(version);
@@ -214,6 +217,7 @@ std::string Sample(std::string_view t, std::string_view x) {
 // naming the source and the offending location or key, short whatever the
 // input's size; nothing throws or crashes (a node that crashed on its file
 // would crash again on every restart).
+// REQ-DEV-13
 TEST(ChoreoTest, RejectsMalformedInputWithAClearError) {
   constexpr std::size_t kDeep = 200000;
   constexpr std::size_t kHuge = 1000000;
@@ -294,6 +298,7 @@ TEST(ChoreoTest, RejectsMalformedInputWithAClearError) {
 }
 
 // Guards: a file that cannot be read is an error naming it.
+// REQ-DEV-13
 TEST(ChoreoTest, MissingFileIsAnError) {
   const LoadResult result = LoadChoreoFile("/nonexistent/talos/path.traj");
   EXPECT_FALSE(result);

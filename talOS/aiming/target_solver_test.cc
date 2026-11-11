@@ -235,6 +235,7 @@ TEST(TargetSolverStatic, OffsetTurret) {
 }
 
 // no aim exists -> valid is false and no number is NaN.
+// REQ-DEV-17
 TEST(TargetSolverStatic, InvalidInputsAndDegenerateGeometry) {
   const ShotTable table = RealisticTable();
   const TargetSolver centred(Fixed(0.0, 0.0, 0.0), table);
@@ -344,6 +345,7 @@ TEST(TargetSolver, ChassisVelocityIsRotatedIntoTheFieldFrame) {
 // among equivalent turret angles, the one inside the travel and
 // nearest the measured angle; outside the travel, the nearest limit and
 // turret_reachable false.
+// REQ-DEV-18
 TEST(TargetSolverTurret, TravelLimits) {
   const ShotTable table = RealisticTable();
   const Eigen::Vector2d at_minus_3(4.0 * std::cos(-3.0), 4.0 * std::sin(-3.0));
@@ -386,6 +388,7 @@ TEST(TargetSolverTurret, TravelLimits) {
 // An unreachable target holds the limit the turret is at, so noise that
 // moves the needed angle across the middle of the dead zone cannot swing it
 // to the other limit.
+// REQ-DEV-18
 TEST(TargetSolverTurret, UnreachableHoldsTheLimitNearestTheTurret) {
   const ShotTable table = RealisticTable();
   const SE2<double> origin = Pose(0.0, 0.0, 0.0);
@@ -410,6 +413,7 @@ TEST(TargetSolverTurret, UnreachableHoldsTheLimitNearestTheTurret) {
 // A full-turn travel: the needed angle jittering across the +-pi seam while
 // the turret sits there holds the turret at the seam limit instead of
 // sweeping it to the other end; past the hysteresis it does go around.
+// REQ-DEV-18
 TEST(TargetSolverTurret, SeamHysteresisStopsAFullTurnSweep) {
   const ShotTable table = RealisticTable();
   const SE2<double> origin = Pose(0.0, 0.0, 0.0);
@@ -447,6 +451,7 @@ struct MovingCase {
 // shooting on the move lands on the target (the compensated
 // shot hits where the naive standing solution misses), including the lead
 // for the exit point's tangential velocity when the robot rotates.
+// REQ-DEV-17
 TEST(TargetSolverMoving, CompensatedShotLandsWhereNaiveShotMisses) {
   const ShotTable table = RealisticTable();
   const std::array<MovingCase, 4> cases = {{
@@ -489,6 +494,7 @@ TEST(TargetSolverMoving, CompensatedShotLandsWhereNaiveShotMisses) {
 // the iteration is bounded, and when it does not settle the
 // result says so (converged false, iteration_count at the bound) without
 // NaN, so readiness refuses the shot.
+// REQ-DEV-17
 TEST(TargetSolverMoving, NonConvergenceIsBoundedAndFlagged) {
   // Time of flight jumps from 0.1 s to 2.0 s over one metre: at 2 m/s
   // toward the target, the virtual target leaps between 3.3 m ahead and
@@ -523,6 +529,7 @@ TEST(TargetSolverMoving, NonConvergenceIsBoundedAndFlagged) {
 
 // Solving runs inside a control node's update(), so it allocates nothing
 // (RULES.md 3).
+// REQ-DEV-17
 TEST(TargetSolverAllocation, SolveDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {

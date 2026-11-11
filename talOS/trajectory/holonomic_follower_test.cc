@@ -100,6 +100,7 @@ RunResult Simulate(const Trajectory& trajectory, const FollowerConfig& config,
 // Guards: from a 0.36 m, 0.2 rad start offset, the follower converges onto
 // the curved path (heading through +-pi) and finishes at the end within
 // tolerance, with field- and robot-relative output alike.
+// REQ-DEV-15
 TEST(HolonomicFollowerTest, ConvergesOnCurvedPath) {
   const Trajectory trajectory = Curve();
   for (const SpeedsFrame frame : {SpeedsFrame::kField, SpeedsFrame::kRobot}) {
@@ -114,6 +115,7 @@ TEST(HolonomicFollowerTest, ConvergesOnCurvedPath) {
 }
 
 // Guards: a 0.25 m sideways shove mid-path is recovered within a second.
+// REQ-DEV-15
 TEST(HolonomicFollowerTest, RecoversFromAShove) {
   const RunResult result =
       Simulate(Curve(), {}, SpeedsFrame::kRobot,
@@ -125,6 +127,7 @@ TEST(HolonomicFollowerTest, RecoversFromAShove) {
 
 // Guards: the integral term removes the steady error a constant 0.3 m/s
 // drift leaves under P alone.
+// REQ-DEV-15
 TEST(HolonomicFollowerTest, IntegralRejectsConstantDrift) {
   const Disturbance drift{.drift_x_mps = 0.3};
   const RunResult p_only =
@@ -294,6 +297,7 @@ TEST(HolonomicFollowerTest, HeadingErrorWrapsTheShortWay) {
 }
 
 // Guards: finished needs both the end of time and both tolerances.
+// REQ-DEV-15
 TEST(HolonomicFollowerTest, FinishesOnlyAtTheEndAndInTolerance) {
   HolonomicFollower follower;
   const Trajectory trajectory = AtOrigin();
@@ -316,6 +320,7 @@ TEST(HolonomicFollowerTest, FinishesOnlyAtTheEndAndInTolerance) {
 
 // Guards: a non-finite pose, time or period gives zero speeds and !valid,
 // and does not disturb the integrator.
+// REQ-DEV-15
 TEST(HolonomicFollowerTest, NonFiniteInputCommandsZero) {
   FollowerConfig config;
   config.translation.ki = 1.0;

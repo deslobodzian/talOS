@@ -194,6 +194,7 @@ struct Rig {
 
 // REQ-SAFE-01: a live goal drives the motor's motion-magic loop; the state
 // reflects it.
+// REQ-SAFE-36
 TEST(PositionMechanism, DrivesAtALiveLane) {
   Rig arm{"arm"};
   arm.hw.ideal_motors();
@@ -211,6 +212,7 @@ TEST(PositionMechanism, DrivesAtALiveLane) {
 }
 
 // REQ-SAFE-02
+// REQ-SAFE-36
 TEST(PositionMechanism, DisabledRobotGoesNeutral) {
   Rig arm{"arm"};
   arm.hw.ideal_motors();
@@ -224,6 +226,7 @@ TEST(PositionMechanism, DisabledRobotGoesNeutral) {
 }
 
 // REQ-SAFE-07: no live target is stop(): neutral, never the old goal.
+// REQ-SAFE-36
 TEST(PositionMechanism, StaleLaneGoesNeutral) {
   Rig arm{"arm"};
   arm.hw.ideal_motors();
@@ -234,6 +237,7 @@ TEST(PositionMechanism, StaleLaneGoesNeutral) {
   arm.ExpectNeutral();
 }
 
+// REQ-SAFE-36
 TEST(PositionMechanism, DisconnectedFeedbackGoesNeutral) {
   Rig arm{"arm"};
   arm.Start();
@@ -244,6 +248,7 @@ TEST(PositionMechanism, DisconnectedFeedbackGoesNeutral) {
 }
 
 // REQ-SAFE-04
+// REQ-SAFE-36
 TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
   Rig arm{"arm"};
   arm.Start();
@@ -254,6 +259,7 @@ TEST(PositionMechanism, NonFiniteDemandGoesNeutral) {
 }
 
 // Each bad [m] table throws at construction, naming the key.
+// REQ-SAFE-36
 TEST(PositionMechanism, BadParameterFailsConstruction) {
   const auto toml =
       [](const std::string& table, const std::string& motor = "") {
@@ -346,6 +352,7 @@ TEST(PositionMechanism, UpdateDoesNotAllocate) {
 // Stall homing pushes homing_v until the mechanism has been still for
 // homing_stall_us, then sets the frame there (home_rot); control =
 // "position" uses the position loop.
+// REQ-SAFE-36
 TEST(PositionMechanism, StallHomingSetsTheFrameAtTheHardStop) {
   Rig hood{"hood"};
   hood.SetMotor(2.0);
@@ -366,6 +373,7 @@ TEST(PositionMechanism, StallHomingSetsTheFrameAtTheHardStop) {
 // Absolute homing takes the frame from the CANcoder (scaled, offset) without
 // moving, waits while it is disconnected, and takes it again after a device
 // reset drops the zero.
+// REQ-SAFE-36
 TEST(PositionMechanism, AbsoluteHomingFollowsTheCancoderAcrossAReset) {
   Rig wrist{"wrist"};
   wrist.SetMotor(5.0);
@@ -394,6 +402,7 @@ TEST(PositionMechanism, AbsoluteHomingFollowsTheCancoderAcrossAReset) {
 
 // A goal short of the target that stops moving faults (stall), latched
 // neutral; a stale link does not clear it, a Driver Station disable does.
+// REQ-SAFE-36
 TEST(PositionMechanism, StallFaultLatchesUntilTheDriverStationDisables) {
   Rig lift{"lift"};
   lift.Start();
@@ -421,6 +430,7 @@ TEST(PositionMechanism, StallFaultLatchesUntilTheDriverStationDisables) {
 
 // A goal not reached within move_timeout_us faults, even while the motor
 // keeps moving (no stall).
+// REQ-SAFE-36
 TEST(PositionMechanism, MoveTimeoutFaults) {
   Rig lift{"lift"};
   lift.SetMotor(0.2, 1.0);  // moving, never arriving
@@ -464,6 +474,7 @@ TEST(PositionMechanism, ArmGravityFollowsTheCosine) {
 
 // With wrap_rot a turret goes to the equivalent of the goal nearest where it
 // is, inside its limits.
+// REQ-SAFE-36
 TEST(PositionMechanism, TurretWrapPicksTheNearestEquivalentInRange) {
   Rig turret{"turret"};
   turret.Start();
@@ -500,6 +511,7 @@ TEST(PositionMechanism, AtGoalDebounceEdges) {
 
 // hold() keeps the position it had when the hold began, not where the
 // mechanism drifts to; a new hold starts from the new position.
+// REQ-SAFE-36
 TEST(PositionMechanism, HoldLatchesThePositionAtTheStart) {
   Rig arm{"arm"};
   arm.node.hold_mode = true;

@@ -450,6 +450,7 @@ class TlogToWpilogTest : public testing::Test {
 // FlatBuffers base type, with its unit suffix kept and the unit in the
 // metadata; arrays of scalars become WPILOG arrays, arrays of structs
 // per-index entries; a ulong keeps its bits as int64.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, FieldsBecomeTypedEntries) {
   const Wpilog log = Convert({session_});
   EXPECT_EQ(log.extra_header, "talos tlog_to_wpilog session_id=42");
@@ -522,6 +523,7 @@ TEST_F(TlogToWpilogTest, FieldsBecomeTypedEntries) {
 // Guards: the one pose mapping row, geometry.Pose2d as AdvantageScope's
 // legacy [x, y, heading_rad] double[], nested (at its field path) or as the
 // whole message (`<topic>/pose`).
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, Pose2dAlsoBecomesAdvantageScopePoseArray) {
   const Wpilog log = Convert({session_});
   const auto nested = log.of("/robot/state/pose");
@@ -542,6 +544,7 @@ TEST_F(TlogToWpilogTest, Pose2dAlsoBecomesAdvantageScopePoseArray) {
 // start; a topic's values come from its writer's sends
 // when the writer was logged (not again from each reader), a refused send
 // is not a value, and an unlogged writer's topic comes from one reader.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, OneValuePerPublicationAtItsPublishTime) {
   const Wpilog log = Convert({session_});
   const auto position = log.of("/robot/state/position_m");
@@ -560,6 +563,7 @@ TEST_F(TlogToWpilogTest, OneValuePerPublicationAtItsPublishTime) {
 
 // Guards: a target lane's envelope header and message, as DecodeToText
 // names them.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, TargetEnvelopeHeaderAndMessage) {
   const Wpilog log = Convert({session_});
   const auto mode = log.of("/arm/target/teleop/mode_since_us");
@@ -603,6 +607,7 @@ TEST_F(TlogToWpilogTest, DroppedCountersAndSkippedTopics) {
 
 // Guards: bad input is a clear error and exit status 1, never a crash or a
 // silently empty output.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, MalformedInputFailsCleanly) {
   const std::string out = root_ + "/bad.wpilog";
   const std::string robot = session_ + "/robot.tlog";
@@ -654,6 +659,7 @@ TEST_F(TlogToWpilogTest, MalformedInputFailsCleanly) {
 
 // Guards: a log cut mid-record (power lost while writing) converts its
 // intact records, as log_dump and replay read it, with a warning naming it.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, CutLogConvertsItsIntactRecords) {
   const std::string robot = session_ + "/robot.tlog";
   Copy(robot, root_ + "/tail/robot.tlog",
@@ -670,6 +676,7 @@ TEST_F(TlogToWpilogTest, CutLogConvertsItsIntactRecords) {
 
 // Guards: a fixed array of structs inside a target-lane envelope is named
 // per index below `message`, and a Pose2d element there is also a pose.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, PoseArrayInsideEnvelopeIsNamedPerIndex) {
   const Wpilog log = Convert({session_});
   const Entry* x = log.entry("/path/target/auto/message/poses/1/x_m");
@@ -692,6 +699,7 @@ TEST_F(TlogToWpilogTest, PoseArrayInsideEnvelopeIsNamedPerIndex) {
 // publish time), not per topic. A reader's copy fills what the writer's log
 // lacks (here its head, as a byte cap deletes it), and a publication both
 // logs hold is one value, with the writer's bytes.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, ReaderCopyFillsWhatTheWriterLogLacks) {
   using talos::event::EventKind;
   using talos::event::SourceKind;
@@ -813,6 +821,7 @@ TEST_F(TlogToWpilogTest, LogNamedTwiceIsReadOnce) {
 
 // Guards: a write that fails part way (the file size limit standing in for
 // a full disk) exits 1 and leaves no partial output behind.
+// REQ-OPS-26
 TEST_F(TlogToWpilogTest, FailedWriteLeavesNoPartialOutput) {
   const std::string out = root_ + "/full.wpilog";
   const Result result = Run({session_, "-o", out}, rlim_t{1024});

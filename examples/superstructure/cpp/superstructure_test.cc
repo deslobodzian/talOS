@@ -608,6 +608,7 @@ TEST_F(ElevatorAlone, NeutralOnANonFiniteGoal) {
   ExpectNeutral();
 }
 
+// REQ-SAFE-36
 TEST_F(ElevatorAlone, ClampsGoalsToTheTravel) {
   Drive(kMaxHeightRot + 8.0, 30ms);
   EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
@@ -620,6 +621,7 @@ TEST_F(ElevatorAlone, ClampsGoalsToTheTravel) {
 
 // A switch stuck closed zeroed the lift at the bottom; the first move up
 // shows it still closed well above 0, and the elevator stops.
+// REQ-SAFE-36
 TEST_F(ElevatorAlone, AStuckSwitchStopsTheFirstMoveUp) {
   LiftAtBottom(hw);
   Drive(kHighRot, 30ms);  // ideal motors: up at once
@@ -649,6 +651,7 @@ class ElevatorHoming : public ElevatorAlone {
   }
 };
 
+// REQ-SAFE-36
 TEST_F(ElevatorHoming, HomesOnALiveTargetThenReachesTheGoal) {
   // Unhomed: a goal drives the lift down, never to a motion-magic goal in
   // the power-on frame.
@@ -669,6 +672,7 @@ TEST_F(ElevatorHoming, HomesOnALiveTargetThenReachesTheGoal) {
 // A one-tick closed reading mid-travel (EMI on the switch wire) is not the
 // bottom: homing keeps driving down and the lift stays unzeroed, so the next
 // goal does not go out in a frame zeroed partway up.
+// REQ-SAFE-36
 TEST_F(ElevatorHoming, OneClosedSampleMidTravelDoesNotZero) {
   Drive(kHighRot, 50ms);
   hw.set_motor("elevator", "lift", -2.0, -1.0);  // partway down
@@ -684,6 +688,7 @@ TEST_F(ElevatorHoming, OneClosedSampleMidTravelDoesNotZero) {
   EXPECT_DOUBLE_EQ(Lift().demand, kHighRot - 4.0);
 }
 
+// REQ-SAFE-36
 TEST_F(ElevatorAlone, AResetAtHeightRehomesBeforeAnyGoal) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Status().state(), ElevatorState::AT_GOAL);
@@ -705,6 +710,7 @@ TEST_F(ElevatorAlone, AResetAtHeightRehomesBeforeAnyGoal) {
   EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);
 }
 
+// REQ-SAFE-36
 TEST_F(ElevatorHoming, NoHomingMotionWithoutALiveFiniteTarget) {
   sim.step(100ms);  // never sent
   EXPECT_EQ(Lift().mode, Mode::kNeutral);
@@ -732,6 +738,7 @@ TEST_F(ElevatorHoming, NoHomingMotionWithoutALiveFiniteTarget) {
   EXPECT_EQ(Status().state(), ElevatorState::HOMING);
 }
 
+// REQ-SAFE-36
 TEST_F(ElevatorHoming, TimeoutStopsHomingUntilTheDriverStationDisables) {
   Drive(kHighRot, kHomingTimeout - 100ms);
   ExpectHoming();
@@ -754,6 +761,7 @@ TEST_F(ElevatorHoming, TimeoutStopsHomingUntilTheDriverStationDisables) {
   ExpectHoming();
 }
 
+// REQ-SAFE-36
 TEST_F(ElevatorHoming, AStalledLiftStopsHoming) {
   hw.set_motor("elevator", "lift", 0.0, 0.0);  // pushed, but not moving
   Drive(kHighRot, kHomingStall - 100ms);
@@ -796,6 +804,7 @@ dio = 1
 )";
 }
 
+// REQ-SAFE-36
 TEST(ElevatorConfig, RefusesUnsafeHomingParameters) {
   {
     auto sim = Sim::FromToml(ElevatorConfig("", ""));

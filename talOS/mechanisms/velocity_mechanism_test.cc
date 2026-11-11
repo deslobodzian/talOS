@@ -107,6 +107,7 @@ class VelocityMechanismTest : public ::testing::Test {
 
 // REQ-SAFE-01: a live goal drives the velocity loop with its feedforward
 // and reaches at_speed.
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, DrivesAtALiveLane) {
   hw.ideal_motors();
   Drive(60.0, 40ms, 1.5);
@@ -123,6 +124,7 @@ TEST_F(VelocityMechanismTest, DrivesAtALiveLane) {
 
 // Goals clamp to the motor's own max_velocity_rps, and readiness is judged
 // against the clamped goal.
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, ClampsToTheMotorMaxAndIsReadyThere) {
   hw.ideal_motors();
   Drive(120.0, 40ms);
@@ -132,6 +134,7 @@ TEST_F(VelocityMechanismTest, ClampsToTheMotorMaxAndIsReadyThere) {
 }
 
 // Entry takes at_speed_entry_tick_count consecutive ticks in the entry band.
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, AtSpeedNeedsConsecutiveEntryTicks) {
   SetVelocity(59.0);  // inside at_speed_entry_rps
   Drive(60.0, 10ms);  // two ticks
@@ -143,6 +146,7 @@ TEST_F(VelocityMechanismTest, AtSpeedNeedsConsecutiveEntryTicks) {
 
 // Once at speed it stays inside the exit band, leaves past it, and must
 // re-enter the entry band for the full count.
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, ExitBandHysteresis) {
   SetVelocity(60.0);
   Drive(60.0, 20ms);
@@ -164,6 +168,7 @@ TEST_F(VelocityMechanismTest, ExitBandHysteresis) {
 }
 
 // A changed goal restarts readiness, even inside the entry band.
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, ChangedGoalRestartsReadiness) {
   SetVelocity(60.0);
   Drive(60.0, 20ms);
@@ -190,6 +195,7 @@ TEST_F(VelocityMechanismTest, SpinDownLimitsALiveDropButNotNeutral) {
 }
 
 // REQ-SAFE-02
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, DisabledRobotGoesNeutral) {
   hw.ideal_motors();
   Drive(60.0, 40ms);
@@ -200,6 +206,7 @@ TEST_F(VelocityMechanismTest, DisabledRobotGoesNeutral) {
 }
 
 // REQ-SAFE-07
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, StaleLaneGoesNeutral) {
   hw.ideal_motors();
   Drive(60.0, 40ms);
@@ -209,6 +216,7 @@ TEST_F(VelocityMechanismTest, StaleLaneGoesNeutral) {
   EXPECT_EQ(flywheel().phase(), VelocityPhase::kStopped);
 }
 
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, DisconnectedFeedbackGoesNeutral) {
   hw.set_connected("shooter", "flywheel", false);
   Drive(60.0, 30ms);
@@ -217,6 +225,7 @@ TEST_F(VelocityMechanismTest, DisconnectedFeedbackGoesNeutral) {
 }
 
 // REQ-SAFE-04
+// REQ-SAFE-37
 TEST_F(VelocityMechanismTest, NonFiniteDemandGoesNeutral) {
   Drive(std::numeric_limits<double>::quiet_NaN(), 30ms);
   ExpectNeutral();
@@ -240,6 +249,7 @@ TEST_F(VelocityMechanismTest, UpdateDoesNotAllocate) {
 }
 
 // Each bad parameter throws at construction, naming the key.
+// REQ-SAFE-37
 TEST(VelocityMechanismConfig, BadParameterFailsConstruction) {
   const auto add = [](const std::string& table) {
     auto sim = Sim::FromToml(std::string{R"(
