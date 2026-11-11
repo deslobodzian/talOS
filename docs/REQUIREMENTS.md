@@ -206,6 +206,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-17 | For a robot moving at a constant field velocity and yaw rate, the `TargetSolver`'s commanded aim makes a ball that follows the shot table land within 2 cm of the target whenever the solve reports `converged` and `in_range`; a solve that does not settle within `max_iteration_count` returns its last iterate with `converged` false; a non-finite input or degenerate geometry gives `valid` false; no output is NaN and a solve allocates nothing. | P1 | AIMR "The maths", "Shooting on the move" | `Solution` against a simulated ball; `AllocationProbe` | unit |
 | REQ-DEV-18 | A turret solution is the equivalent angle inside the turret's travel nearest its measured angle; when the target is unreachable it holds a travel limit (the one the needed angle just crossed within `seam_hysteresis_rad`, else the one nearest the turret), so noise on the needed angle never commands the turret across its travel. | P1 | AIMR "Frames, signs, units" | `Solution.turret_rad`, `turret_reachable` | unit |
 | REQ-DEV-19 | The `ReadinessGate` reports ready only when a fresh, valid, converged, in-range and turret-reachable solution, a robot slower than its speed and spin limits and every measured error within tolerance have held on `settle_tick_count` consecutive caller ticks; an unset, NaN, stale or failing input, or a skipped tick, withholds or drops readiness at once, reporting the first failing reason. | P1 | AIMR "Readiness" | `ReadinessGate::Update` result and reason | unit |
+| REQ-DEV-20 | `MakeStraightLine` produces a rest-to-rest straight move whose speed and acceleration stay within its limits, whose translation and heading (turning the short way) reach the end pose together at rest at the total time, which handles zero-length moves and pure rotations, and which refuses non-finite or invalid input or too little reserved space by leaving the trajectory empty, without throwing or allocating. | P1 | TRAJR "Straight lines" | `StraightLineResult` error, sampled `Trajectory` | unit |
 
 ## Package scope
 
@@ -232,7 +233,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27 |
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22 |
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
-| `talOS/trajectory` | REQ-DEV-13 to REQ-DEV-15; REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`) |
+| `talOS/trajectory` | REQ-DEV-13 to REQ-DEV-15, REQ-DEV-20; REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`, `MakeStraightLine`) |
 | `talOS/mechanisms` | REQ-SAFE-36 to REQ-SAFE-38; REQ-SAFE-01, REQ-SAFE-02, REQ-SAFE-04, REQ-SAFE-05 through the node test matrix, REQ-RT-06 |
 | `talOS/vision` (CPU pipeline, capture, `field_sim`) | REQ-CONTRACT-27, REQ-DEV-11 |
 | `talOS/vision/metal`, `talOS/vision/recording` | none in the catalogue (TODO.md SCOPE-1) |
