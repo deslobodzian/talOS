@@ -35,6 +35,7 @@ numbered section, a number in RULES a rule:
 | HR | [talOS/hardware/README.md](../talOS/hardware/README.md) |
 | IR | [talOS/introspection/README.md](../talOS/introspection/README.md) |
 | ER | [talOS/events/README.md](../talOS/events/README.md) |
+| RTMS | [talOS/rtms/README.md](../talOS/rtms/README.md) |
 | R26 | [2026-robot/README.md](../2026-robot/README.md) |
 | SR | [2026-robot/main_processor/simulation/README.md](../2026-robot/main_processor/simulation/README.md) |
 | DEP | [DEPLOYMENT.md](DEPLOYMENT.md) |
@@ -125,7 +126,7 @@ numbered section, a number in RULES a rule:
 | ID | Requirement | P | Source | Observable | Cheapest tier |
 |---|---|---|---|---|---|
 | REQ-RT-01 | Every node drains its topics immediately before each of its timers (`update()`, `every()`), so a timer sees everything published by its deadline whether or not the node has callbacks. | P0 | ARCH "Targets"; ER "The three loops" | value seen in the tick at the deadline | component |
-| REQ-RT-02 | Latest-value subscriptions dispatch only the newest message per drain and count skips; callback subscriptions deliver in sequence up to the per-drain cap; between its timers a node is woken to drain only by a publication on a topic ARCH "Targets" says wakes it, and is otherwise asleep. | P1 | ARCH "Targets"; ER "The three loops" | `Context::dropped`; delivery count; `activity()` | component |
+| REQ-RT-02 | Latest-value subscriptions dispatch only the newest message per drain and count skips; callback subscriptions deliver in sequence up to the per-drain cap; between its timers a node is woken to drain only by a publication on a topic ARCH "Targets" says wakes it, by a writer taking over such a topic, or by its loop's wake backstop (at most once per `wake_backstop`, 1 s, while it waits on such a topic), and is otherwise asleep. | P1 | ARCH "Targets"; ER "The three loops" | `Context::dropped`; delivery count; `activity()` | component |
 | REQ-RT-03 | Each dispatch samples its own `now`, frozen for the callback; an overdue periodic timer coalesces on its original phase and reports missed periods in `sequence`/`dropped`. | P1 | ARCH "Targets"; ER "The three loops", "Lateness" | `context.sequence`; counters | component |
 | REQ-RT-04 | Dispatch is single-threaded and never re-entrant, expired timers run in (deadline, id) order before watched topics in registration order, and a timer change from another thread throws `std::logic_error`. | P1 | ER "Dispatch and replay" | dispatch order; exception | unit |
 | REQ-RT-05 | `testing::Sim` dispatches nodes serially on one chronological frontier, so no node sees a publication from its future, same-instant nodes run in add order, and `pause`/`resume` stop one node's drains and timers while its peers advance. | P1 | ARCH "Targets" | ordering of published values | component |
@@ -142,6 +143,7 @@ numbered section, a number in RULES a rule:
 | REQ-RT-16 | A driver-input to actuator path crosses at most two node hops. | P1 | METH §10 | declared graph | contract (gap: TODO LINT-2) |
 | REQ-RT-17 | Node code takes time only from `node.now()` (no `steady_clock`, `time.time()`, sleeps) and makes no random decisions, so Sim and replay match the robot. | P1 | METH §9 | source scan | contract (gap: TODO LINT-1) |
 | REQ-RT-18 | Observation never perturbs control: registry fields are lock-free atomics, readers take no lock, writers touch only their own slot, and the launcher's stall evidence is the dispatch count the loop thread stores itself, never the reporter's heartbeat. | P1 | IR "Observing must not perturb"; LR "Restarts" | `static_assert`s; no stall kill while the reporter is starved | unit + integration |
+| REQ-RT-19 | Wake on publish: a prompt subscription's handler (a `subscribe` callback, a Driver Station listener) is run by a drain its publication wakes, with `latency()` counted from the publication; a publication with no armed reader makes no system call; and delivery never depends on a wake: a drain precedes every timer, a loop waiting on a prompt topic drains at least once per `wake_backstop`, a stalled arm cannot make it spin, a loop that cannot build its wake receiver falls back to polling, and a notification lost other than to a gone receiver is counted (`wake_failures`). | P1 | ARCH "Targets"; ER "The three loops"; RTMS "Wake channel" | `activity()` wakeups, drains, `stalled_arms`, `wake_fallbacks`; `wakes_sent()`, `wake_failures()`; `Context::event_time` | component |
 
 ### OPS: launcher supervision, restarts, sessions, logs/replay, observability
 
@@ -198,9 +200,9 @@ serves none is listed as such with the TODO.md item that settles it
 
 | Package | Serves |
 |---|---|
-| `talOS/rtms`, `talOS/memory`, `talOS/ipc` | REQ-SAFE-08, REQ-CONTRACT-07, REQ-CONTRACT-21, REQ-CONTRACT-22, REQ-RT-12, REQ-OPS-03 |
-| `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-CONTRACT-20, REQ-OPS-12 to REQ-OPS-14 |
-| `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-DEV-08 |
+| `talOS/rtms`, `talOS/memory`, `talOS/ipc` | REQ-SAFE-08, REQ-CONTRACT-07, REQ-CONTRACT-21, REQ-CONTRACT-22, REQ-RT-12, REQ-RT-19, REQ-OPS-03 |
+| `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-RT-19, REQ-CONTRACT-20, REQ-OPS-12 to REQ-OPS-14 |
+| `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-RT-19, REQ-DEV-08 |
 | `talOS/devices` | REQ-SAFE-01 to REQ-SAFE-09, REQ-SAFE-12, REQ-SAFE-13, REQ-CONTRACT-23, REQ-DEV-07 |
 | `talOS/bridge` | REQ-SAFE-11, REQ-SAFE-15, REQ-SAFE-16, REQ-SAFE-19, REQ-CONTRACT-04, REQ-RT-13, REQ-OPS-20, REQ-OPS-21 |
 | `talOS/hardware` | REQ-SAFE-17 to REQ-SAFE-24, REQ-CONTRACT-02, REQ-CONTRACT-05, REQ-CONTRACT-06, REQ-CONTRACT-30, REQ-DEV-10 |
