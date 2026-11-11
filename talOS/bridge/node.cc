@@ -839,7 +839,7 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
 bool HardwareNode::OpenWaits() {
   // The loop sleeps until there is something to do: a datagram from the
   // gateway, a request on any /hw/request topic (each subscriber's slot
-  // names request_wake_), or the next time-driven duty.
+  // names request_wake_), a stop, or the next time-driven duty.
   try {
     poller_.emplace();
     if (peer_.NativeFd() < 0) {
@@ -852,6 +852,11 @@ bool HardwareNode::OpenWaits() {
       request_wake_.emplace();
     }
     poller_->add_fd(request_wake_->fd());
+    // A stop (SIGINT, SIGTERM, process::RequestStop) makes the stop pipe
+    // readable, which ends the wait at once.
+    if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
+      poller_->add_fd(stop_fd);
+    }
     for (auto& [name, tracker] : subsystems_) {
       if (tracker.subscriber) {
         tracker.subscriber->set_wake_receiver(request_wake_->id());
@@ -941,6 +946,11 @@ int HardwareNode::Run(int duration_s) {
       ++wakeups_.deadline;
     } else {
       woke_readable = true;
+      // A stop ends the loop at its check above. Bytes a cleared stop left
+      // are read out, or the level-triggered wait would never block again.
+      if (poller_->reported_readable(talos::process::StopFd())) {
+        static_cast<void>(talos::process::ConsumeStopWake());
+      }
     }
   }
   CloseWaits();

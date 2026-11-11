@@ -99,8 +99,9 @@ class HardwareNode {
   Wait Pass(uint64_t now_us);
   int Run(int duration_s = 0);
 
-  // Run()'s waits. OpenWaits() builds the poller and watches the UDP socket
-  // and a wake receiver every request subscriber names; when any of that
+  // Run()'s waits. OpenWaits() builds the poller and watches the UDP socket,
+  // a wake receiver every request subscriber names and the stop pipe
+  // (process::StopFd(), when it exists); when any of the first two
   // fails it says so on stderr, counts a fallback, and the loop polls its
   // inputs every kRetryUs instead (false). CloseWaits() undoes it. Run()
   // calls both; they are public so a test can reach the fallback.
@@ -334,10 +335,11 @@ class HardwareNode {
   uint64_t last_push_time_us_{0};
   uint64_t config_push_backoff_us_{50000};
 
-  // Run() sleeps until a gateway datagram, a request publication or the next
-  // time-driven duty. kMaxWaitUs caps one wait: the stop handler only sets
-  // process::stop_requested and cannot wake the poller, so the loop looks at
-  // the flag at least this often (and --duration-s ends on time).
+  // Run() sleeps until a gateway datagram, a request publication, a stop (the
+  // poller watches process::StopFd()) or the next time-driven duty.
+  // kMaxWaitUs caps one wait as a backstop: the loop still checks
+  // process::stop_requested at least this often should the stop pipe be
+  // missing or a stop leave it unreadable.
   static constexpr uint64_t kMaxWaitUs = 10'000;
   // A duty Tick could not do (a failed send) is retried this much later,
   // so a refused send costs at most a 1 kHz retry, never a busy loop.

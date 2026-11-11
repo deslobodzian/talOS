@@ -1304,8 +1304,15 @@ int RunMain(int argc, char** argv, const char* node_name,
     // (LogWriterOptions::max_bytes) and `<log>.capped` marks it incomplete.
     event::log::LogWriterOptions log_options;
     log_options.max_bytes = flags.log_max_bytes;
-    event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
-        flags.log_path, node_name, log_options, flags.session_id}};
+    // The loop reads the stop flag between dispatches, so a stop takes effect
+    // after the current dispatch even when overdue timers never let it wait
+    // (an update() that overruns its period).
+    event::RealtimeEventLoop<event::log::LogWriter>::Options loop_options;
+    loop_options.stop = &process::stop_requested;
+    event::RealtimeEventLoop<event::log::LogWriter> loop{
+        event::log::LogWriter{flags.log_path, node_name, log_options,
+                              flags.session_id},
+        loop_options};
     // Keep the hosted node alive until the reporting thread has joined, while
     // publishing identity before any user constructor or backend
     // initialization.
@@ -1320,11 +1327,11 @@ int RunMain(int argc, char** argv, const char* node_name,
       std::printf("%s: stopped during construction\n", node_name);
       return 0;
     }
-    // A stop from here on makes the stop pipe readable, which ends the loop's
-    // wait wherever it waits, and the loop exits from its own thread: no
-    // thread polls for a stop, so an idle node is woken only by its own
+    // A stop from here on also makes the stop pipe readable, which ends the
+    // loop's wait wherever it waits, and the loop exits from its own thread:
+    // no thread polls for a stop, so an idle node is woken only by its own
     // timers and publications. A stop that lands before the run starts is
-    // still in the pipe at the loop's first wait.
+    // seen by the run's first flag check.
     loop.watch_fd(stop_fd, [&loop] {
       if (process::ConsumeStopWake()) loop.exit();
     });

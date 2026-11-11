@@ -51,6 +51,21 @@ class RunningBridge {
   std::thread thread_;
 };
 
+// The arm seam of RunEndsItsWaitOnAStop: on the first arm after
+// `stop_at_next_arm`, it notes the deadline wakes so far and requests a stop
+// from the loop thread, after the loop's flag check and before its wait.
+std::atomic<bool> stop_at_next_arm{false};
+const HardwareNode* stopping_node = nullptr;
+uint64_t deadline_wakes_at_stop = 0;
+
+bool StopWhileArming(ipc::Subscriber<Packet>& subscriber) {
+  if (stop_at_next_arm.exchange(false)) {
+    deadline_wakes_at_stop = stopping_node->wakeups().deadline;
+    process::RequestStop();
+  }
+  return subscriber.arm_wake();
+}
+
 // The host's scheduling noise over a test: the longest a 1 ms sleep of an
 // ordinary thread overran, for a timed test to read before it judges
 // (docs/TESTING.md §6.7), so a stalled host fails as unqualified.
@@ -223,6 +238,38 @@ TEST(HardwareNodeTest, RunSleepsWhileNothingArrives) {
   EXPECT_EQ(wakeups.udp + wakeups.request, 0u);
   EXPECT_LE(static_cast<double>(wakeups.passes), duty_instants)
       << "in " << elapsed_ms << " ms: deadline " << wakeups.deadline;
+}
+
+// A stop ends the bridge's wait at once rather than at its kMaxWaitUs cap:
+// the poller watches the stop pipe. The stop lands inside a pass, after the
+// loop's flag check and before its wait, so that wait either is skipped (a
+// pass with work due at once) or ends on the stop pipe; none after the stop
+// reaches its deadline.
+// REQ-OPS-06
+TEST(HardwareNodeTest, RunEndsItsWaitOnAStop) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  stopping_node = &node;
+  node.set_seams({.arm_request = &StopWhileArming});
+  ipc::Subscriber<bridge::BridgeStatus> statuses{bridge::topics::kStatus};
+  std::thread runner{[&node] { node.Run(); }};
+  uint64_t seen = 0;
+  const bool running = WaitFor([&] {
+    while (statuses.read()) ++seen;
+    return seen >= 3;
+  });
+  stop_at_next_arm.store(true);
+  const bool armed = WaitFor([] { return !stop_at_next_arm.load(); });
+  if (!armed) process::RequestStop();  // ends the run either way
+  runner.join();
+  process::stop_requested.store(false);
+
+  ASSERT_TRUE(running) << "no /hw/status while Run() ran";
+  ASSERT_TRUE(armed) << "Run() never armed a request subscriber";
+  EXPECT_EQ(node.wakeups().deadline, deadline_wakes_at_stop)
+      << "a wait begun after the stop ran to its deadline";
 }
 
 // Under Run(), with one request and nothing after it, the heartbeats and the

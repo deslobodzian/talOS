@@ -326,6 +326,63 @@ TEST(RealtimeEventLoop, AWatchedFdEndsTheWaitOnTheLoopThread) {
   }
 }
 
+// A loop behind its timers never waits, so a stop it learned of only in a
+// wait would never land: a node whose update() overran its period would run
+// on until the launcher's SIGKILL. With a stop flag the run ends after the
+// dispatch during which the stop came (here the handler requests it, as a
+// signal landing mid-handler does), for a 1 ms timer whose handler takes
+// 2 ms, and for a burst of callback messages delivered by woken drains back
+// to back. Each handler exits at its 100th call, so a loop that ignored the
+// flag fails instead of hanging.
+// REQ-OPS-06
+TEST(RealtimeEventLoop, AStopFlagEndsTheRunAfterTheCurrentDispatch) {
+  constexpr int kStopAt = 3;
+  constexpr int kGiveUpAt = 100;
+  {
+    SCOPED_TRACE("overrunning timer");
+    std::atomic<bool> stop{false};
+    RealtimeEventLoop<>::Options options;
+    options.stop = &stop;
+    RealtimeEventLoop<> loop{options};
+    loop.set_delivery(Delivery::BEFORE_TIMERS);
+    int calls = 0;
+    auto handler = [&](const Context&) {
+      const MonotonicTime until = Poller::now() + 2ms;
+      while (Poller::now() < until) {
+      }
+      if (++calls == kStopAt) stop.store(true);
+      if (calls == kGiveUpAt) loop.exit();
+    };
+    const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
+    Timer<RealtimeEventLoop<>> timer{&loop, id};
+    timer.setup_periodic(Poller::now(), 1ms);
+    loop.run_for(20s);  // Bound only.
+    EXPECT_EQ(calls, kStopAt);
+    // At most the wait for the first deadline: never one once behind.
+    EXPECT_LE(loop.activity().wakeups, 1u);
+  }
+  {
+    SCOPED_TRACE("message burst");
+    constexpr int kBurst = 200;  // over max_messages_per_tick, under the ring
+    const std::string topic = "/tstop_" + std::to_string(::getpid());
+    std::atomic<bool> stop{false};
+    RealtimeEventLoop<>::Options options = on_publish();
+    options.stop = &stop;
+    RealtimeEventLoop<> loop{options};
+    int calls = 0;
+    auto on_message = [&](const Context&) {
+      if (++calls == kStopAt) stop.store(true);
+      if (calls == kGiveUpAt) loop.exit();
+    };
+    loop.set_prompt(
+        register_sensor_watcher(loop, topic, make_thunk(&on_message)));
+    SensorWriter writer{topic};
+    for (int i = 0; i < kBurst; ++i) ASSERT_TRUE(writer.publish(i));
+    loop.run_for(20s);  // Bound only.
+    EXPECT_EQ(calls, kStopAt);
+  }
+}
+
 TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   RealtimeEventLoop<> loop;
   std::atomic<bool> started{false};
