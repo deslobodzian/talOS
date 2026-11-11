@@ -91,11 +91,13 @@ uint32_t DriverStationModeFlags() {
 }
 
 // The loop watchdog's SCHED_FIFO priority: above the loop thread's, so it
-// preempts a loop that never sleeps, and meant to stay below the kernel's
-// threaded interrupt handlers (SCHED_FIFO 50 by default on PREEMPT_RT), which
-// may carry the CAN frames its NeutralOut needs; the RoboRIO's actual thread
-// priorities are unrecorded (docs/BENCH.md, loop stall check). Desktop
-// simulation keeps the default scheduling.
+// preempts a loop that never sleeps. It is also above the kernel's interrupt
+// threads (kIrqThreadPriority), which it delays on its CPU only for the length
+// of one poll, since it sleeps kPollPeriod between them. Its priority buys
+// detection, not delivery: whether its NeutralOut reaches the bus depends on
+// threads below it (the program's SCHED_OTHER CAN threads, can_psend and
+// can_recv, and the interrupt threads), which a loop that never sleeps can
+// starve (TODO.md RT-5). Desktop simulation keeps the default scheduling.
 #ifdef __FRC_ROBORIO__
 constexpr int kWatchdogPriority = 30;
 #else
@@ -103,11 +105,22 @@ constexpr int kWatchdogPriority = 0;
 #endif
 
 #ifdef __FRC_ROBORIO__
+// The SCHED_FIFO priority of every kernel interrupt thread on the RoboRIO
+// (irq/54-eth0, irq/64-e000b000 and the rest; the FPGA's irq/61-atomiczy
+// alone runs at 96), read from the bench RoboRIO's thread table on
+// 2026-11-11, image FRC_roboRIO_2026_v1.2. Not the PREEMPT_RT default of 50.
+constexpr int kIrqThreadPriority = 15;
+
 // The loop thread's SCHED_FIFO priority, so ordinary processes (an ssh
-// session, top) no longer delay its ticks. Strictly below the watchdog, which
-// must still preempt it when it spins.
-constexpr int kLoopPriority = 20;
-static_assert(kLoopPriority > 0 && kLoopPriority < kWatchdogPriority);
+// session, top) no longer delay its ticks. Below the interrupt threads: with
+// realtime throttling off (sched_rt_runtime_us -1), a loop above them that
+// stopped sleeping would keep its CPU's interrupt threads, softirq and
+// timer work from ever running again, and with them every default-scheduled
+// thread whose wakeups they deliver, the CAN senders and receivers among
+// them. Below the watchdog, which must still preempt it.
+constexpr int kLoopPriority = 10;
+static_assert(kLoopPriority > 0 && kLoopPriority < kIrqThreadPriority &&
+              kIrqThreadPriority < kWatchdogPriority);
 
 // Present at program start: the loop keeps the default scheduling (a bench
 // comparison, or a field fallback that needs no rebuild).
@@ -128,9 +141,12 @@ const char* PolicyName(int policy) {
 }
 
 // Puts the calling thread, the loop, on SCHED_FIFO kLoopPriority, unless
-// kLoopDefaultSchedulingFile exists, and prints its policy and priority, with
-// the reason when it stays at the default scheduling. A refusal leaves it
-// there; nothing else changes.
+// kLoopDefaultSchedulingFile exists or the watchdog thread does not hold a
+// SCHED_FIFO priority above it (`watchdog_priority`, read back from the
+// kernel: the order is a run-time fact, not only a compile-time one, since
+// the watchdog's request can be refused where the loop's is not), and prints
+// both threads' scheduling, with the reason when the loop stays at the
+// default scheduling. A refusal leaves it there; nothing else changes.
 //
 // SCHED_RESET_ON_FORK: a thread the loop creates later (a vendor library's
 // lazily started thread) starts at the default scheduling instead of
@@ -138,11 +154,14 @@ const char* PolicyName(int policy) {
 // Otherwise it is the request frc::SetCurrentThreadPriority makes (with which
 // LoopWatchdog::Run raises the watchdog), made directly to pass that flag and
 // to print the refusal's errno.
-void ScheduleLoopThread() {
+void ScheduleLoopThread(int watchdog_priority) {
   char reason[160] = "";
   if (access(kLoopDefaultSchedulingFile, F_OK) == 0) {
     std::snprintf(reason, sizeof(reason), " (%s present)",
                   kLoopDefaultSchedulingFile);
+  } else if (watchdog_priority <= kLoopPriority) {
+    std::snprintf(reason, sizeof(reason),
+                  " (watchdog holds no SCHED_FIFO above %d)", kLoopPriority);
   } else {
     sched_param param{};
     param.sched_priority = kLoopPriority;
@@ -156,10 +175,12 @@ void ScheduleLoopThread() {
   sched_param actual{};
   sched_getparam(0, &actual);
   std::printf(
-      "%shardware gateway loop %s %d, watchdog asks SCHED_FIFO %d%s\n",
+      "%shardware gateway loop %s %d, watchdog %s %d%s\n",
       talos::rio::ConsoleTime(NowUs()).c_str(),
       policy < 0 ? "unknown policy" : PolicyName(policy & ~SCHED_RESET_ON_FORK),
-      actual.sched_priority, kWatchdogPriority, reason);
+      actual.sched_priority,
+      watchdog_priority > 0 ? "SCHED_FIFO" : "not realtime", watchdog_priority,
+      reason);
 }
 #endif
 
@@ -287,8 +308,9 @@ void Robot::StartCompetition() {
 
 #ifdef __FRC_ROBORIO__
   // After every other thread of this program has started, at the default
-  // scheduling: none inherits the loop's.
-  ScheduleLoopThread();
+  // scheduling: none inherits the loop's. Start has returned with the
+  // watchdog's priority request made.
+  ScheduleLoopThread(watchdog_->held_priority());
 #endif
 
   uint64_t period_us = 5000;

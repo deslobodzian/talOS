@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <string_view>
 #include <thread>
 
@@ -63,9 +64,21 @@ class LoopWatchdog {
   // loop beats with). `realtime_priority` 1-99 asks for SCHED_FIFO at that
   // priority (frc::SetCurrentThreadPriority); 0 keeps the default
   // scheduling. A refused request is reported once and the thread runs on.
+  // Returns once the thread has made that request (or after
+  // kStartHandshakeTimeout), so held_priority() is then the outcome.
   // Stop() (also the destructor) joins it.
   void Start(std::function<uint64_t()> clock, int realtime_priority);
   void Stop();
+
+  // The SCHED_FIFO priority the watchdog thread holds, read back from the
+  // kernel after its request; 0 when it holds none (refused, not asked,
+  // not started, or not on Linux). The loop raises itself only below it.
+  int held_priority() const {
+    return held_priority_.load(std::memory_order_acquire);
+  }
+
+  // How long Start waits for the thread's priority request.
+  static constexpr std::chrono::milliseconds kStartHandshakeTimeout{1000};
 
   // Deadlines passed (stalls) since construction.
   uint64_t stall_count() const {
@@ -73,7 +86,8 @@ class LoopWatchdog {
   }
 
  private:
-  void Run(const std::function<uint64_t()>& clock, int realtime_priority);
+  void Run(const std::function<uint64_t()>& clock, int realtime_priority,
+           std::promise<void>& requested);
 
   WatchdogOutputs& outputs_;
   // The latest beat's deadline, 0 while disarmed: one word, so the watchdog
@@ -86,6 +100,7 @@ class LoopWatchdog {
   uint64_t reported_deadline_us_{0};
   std::atomic<uint64_t> stalls_{0};
 
+  std::atomic<int> held_priority_{0};
   std::atomic<bool> stop_{false};
   std::thread thread_;
 };

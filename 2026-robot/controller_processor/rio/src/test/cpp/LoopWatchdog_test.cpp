@@ -4,9 +4,16 @@
 // never touched.
 #include "LoopWatchdog.h"
 
+#ifdef __linux__
+#include <dirent.h>
+#include <sched.h>
+#include <sys/types.h>
+#endif
+
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <fstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -114,5 +121,50 @@ TEST(LoopWatchdog, AResumedLoopReArmsIt) {
   EXPECT_EQ(watchdog.stall_count(), 2u);
   EXPECT_EQ(outputs.reports.size(), 2u);
 }
+
+#ifdef __linux__
+// The SCHED_FIFO priority the kernel holds for this process's thread named
+// `name` (0 for any other policy), -1 when no thread has that name.
+int KernelFifoPriority(const std::string& name) {
+  DIR* tasks = opendir("/proc/self/task");
+  if (tasks == nullptr) return -1;
+  int found = -1;
+  while (const dirent* entry = readdir(tasks)) {
+    if (entry->d_name[0] == '.') continue;
+    std::ifstream comm(std::string("/proc/self/task/") + entry->d_name +
+                       "/comm");
+    std::string comm_name;
+    if (!std::getline(comm, comm_name) || comm_name != name) continue;
+    const auto tid = static_cast<pid_t>(std::stol(entry->d_name));
+    sched_param param{};
+    const int policy = sched_getscheduler(tid);
+    found = policy == SCHED_FIFO && sched_getparam(tid, &param) == 0
+                ? param.sched_priority
+                : 0;
+    break;
+  }
+  closedir(tasks);
+  return found;
+}
+
+// Robot.cpp raises the loop to SCHED_FIFO only below the priority the
+// watchdog holds, so what Start reports must be what the kernel gave the
+// watchdog thread, not what it asked for: a refused request (no
+// CAP_SYS_NICE, an RLIMIT_RTPRIO below it; on the desktop the simulated HAL
+// does not ask the kernel at all) must read 0, or a loop could outrank its
+// watchdog.
+// REQ-SAFE-25
+TEST(LoopWatchdog, StartReportsThePriorityTheKernelGaveTheThread) {
+  constexpr int kAsked = 30;
+  RecordingOutputs outputs;
+  LoopWatchdog watchdog{outputs};
+  watchdog.Start([] { return uint64_t{0}; }, kAsked);
+  const int kernel = KernelFifoPriority("talos_watchdog");
+  ASSERT_GE(kernel, 0) << "no talos_watchdog thread after Start";
+  EXPECT_EQ(watchdog.held_priority(), kernel)
+      << "asked SCHED_FIFO " << kAsked << "; the kernel holds " << kernel;
+  watchdog.Stop();
+}
+#endif
 
 }  // namespace
