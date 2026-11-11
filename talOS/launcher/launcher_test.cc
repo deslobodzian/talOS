@@ -29,6 +29,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/file_digest.h"
+#include "talOS/launcher/log_merge.h"
 
 namespace talos::launcher {
 namespace {

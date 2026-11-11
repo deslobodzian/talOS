@@ -24,7 +24,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/hardware_record.h"
-#include "talOS/launcher/launcher.h"
+#include "talOS/launcher/log_merge.h"
 #include "talOS/schema/decode.h"
 
 namespace {
@@ -238,7 +238,7 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
   }
 }
 
-// The "config_path" string of a session's manifest.json (launcher.h
+// The "config_path" string of a session's manifest.json (session.cc
 // SessionManifest::ToJson, escaped by introspect::AppendJsonString), or empty.
 std::string ManifestConfigPath(const std::filesystem::path& session) {
   std::ifstream stream{session / "manifest.json"};

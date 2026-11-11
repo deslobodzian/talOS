@@ -4,33 +4,122 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
 
+# A session's records: its manifest, run history, lock, retention facts and
+# the atomic writes that keep them.
 cc_library(
-    name = "launcher_lib",
-    srcs = ["session_retention.cc"],
+    name = "session",
+    srcs = [
+        "session.cc",
+        "session_retention.cc",
+    ],
     hdrs = [
         "file_digest.h",
-        "launcher.h",
-        "service_notifier.h",
+        "session.h",
         "session_lock.h",
         "session_retention.h",
     ],
-    visibility = ["//visibility:public"],
     deps = [
-        "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
         "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:lock_file",
+        "//talOS/memory:shared_memory",
+        "//talOS/process:realtime_outcome",
+        "//talOS/schema:identity",
+    ],
+)
+
+# fork + exec into a process group with a guardian, and the child's reports.
+cc_library(
+    name = "spawn",
+    srcs = ["spawn.cc"],
+    hdrs = ["spawn.h"],
+)
+
+# Drains every roster member's stdout and stderr into its <name>.log.
+cc_library(
+    name = "child_output",
+    srcs = ["child_output.cc"],
+    hdrs = ["child_output.h"],
+    deps = [":spawn"],
+)
+
+# LauncherOptions, the bundle manifest, and the roster a config names.
+cc_library(
+    name = "roster",
+    srcs = ["roster.cc"],
+    hdrs = ["roster.h"],
+    deps = [
+        ":session",
+        "//talOS/configuration",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
-        "//talOS/memory:shared_memory",
         "//talOS/process:durable_sync",
-        "//talOS/process:realtime_outcome",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
+# Phase one: --describe probes, the declared graph, its lint and segments.
+cc_library(
+    name = "describe_graph",
+    srcs = ["describe_graph.cc"],
+    hdrs = ["describe_graph.h"],
+    deps = [
+        ":roster",
+        ":session",
+        ":spawn",
+        "//talOS/configuration",
+        "//talOS/events:events_core",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:names",
         "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
+# One session's event logs merged by time, for log_dump.
+cc_library(
+    name = "log_merge",
+    srcs = ["log_merge.cc"],
+    hdrs = ["log_merge.h"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+    ],
+)
+
+# The supervisor (Launcher) and the Studio bridge it supervises.
+cc_library(
+    name = "launcher_lib",
+    srcs = [
+        "launcher.cc",
+        "launcher_retention.cc",
+        "studio_bridge.cc",
+    ],
+    hdrs = [
+        "launcher.h",
+        "service_notifier.h",
+        "studio_bridge.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":child_output",
+        ":describe_graph",
+        ":roster",
+        ":session",
+        ":spawn",
+        "//talOS/configuration",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/introspection:describe",
+        "//talOS/introspection:lock_file",
+        "//talOS/introspection:names",
+        "//talOS/introspection:registry",
+        "//talOS/rtms",
         "@tomlplusplus//:toml++",
     ],
 )
@@ -74,7 +163,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":hardware_record",
-        ":launcher_lib",
+        ":log_merge",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
@@ -128,7 +217,7 @@ cc_binary(
     testonly = True,
     srcs = ["testdata/session_report_fixture.cc"],
     deps = [
-        ":launcher_lib",
+        ":session",
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/hardware",
@@ -177,6 +266,7 @@ cc_test(
     tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
+        ":log_merge",
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:input_replay",

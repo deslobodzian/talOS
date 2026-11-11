@@ -7,6 +7,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -318,7 +319,7 @@ TEST(Supervision, SlowConstructorIsObservableAndBecomesActiveAfterOldGrace) {
   options.duration_s = 9;
   std::atomic<bool> constructing{false};
   std::atomic<bool> active{false};
-  std::jthread observer{[&](std::stop_token stop) {
+  std::jthread observer{[&](const std::stop_token& stop) {
     while (!stop.stop_requested()) {
       if (auto reader = introspect::RegistryReader::open()) {
         for (const auto& node : reader->nodes()) {
@@ -674,6 +675,7 @@ TEST(Supervision, RosterThatDoesNotFitTheRegistryIsRefused) {
   // The roster registers three nodes (hardware_node, alpha, beta): one too
   // many once 30 of the 32 rows are held.
   std::vector<std::unique_ptr<introspect::NodeRegistration>> held;
+  held.reserve(30);
   for (int i = 0; i < 30; ++i) {
     held.push_back(std::make_unique<introspect::NodeRegistration>(
         introspect::NodeRegistration::Identity{.name = "held" +

@@ -1,8 +1,9 @@
-// The launcher owns every declared topic (launcher.h CreateSessionSegments):
-// a publisher killed with SIGKILL is restarted (max_restarts) and its
-// subscriber keeps receiving on the same segment, and a publisher's clean
-// exit leaves the topic in place for whoever publishes next. Real nodes, real
-// shared memory: continuity_source and continuity_sink in testdata/.
+// The launcher owns every declared topic (describe_graph.h
+// CreateSessionSegments): a publisher killed with SIGKILL is restarted
+// (max_restarts) and its subscriber keeps receiving on the same segment, and
+// a publisher's clean exit leaves the topic in place for whoever publishes
+// next. Real nodes, real shared memory: continuity_source and continuity_sink
+// in testdata/.
 
 #include <fcntl.h>
 #include <gtest/gtest.h>

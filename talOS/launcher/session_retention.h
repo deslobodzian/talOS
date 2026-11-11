@@ -1,8 +1,8 @@
 #pragma once
 
-// What retention (Launcher::ApplyRetention, launcher.h) needs to know about a
-// recorded session beyond its size: when it started, and whether it ran a
-// match; and how much room the log root's filesystem has left.
+// What retention (Launcher::ApplyRetention, launcher_retention.cc) needs to
+// know about a recorded session beyond its size: when it started, and whether
+// it ran a match; and how much room the log root's filesystem has left.
 
 #include <cstdint>
 #include <filesystem>
@@ -15,7 +15,7 @@ namespace talos::launcher {
 // retention protects: never removed for log_keep_sessions or the byte budget
 // older sessions get, which does not count them; only, last and oldest first,
 // to keep room for the new session free on the log root's filesystem
-// (Launcher::FreeFloor).
+// (FreeFloor, launcher_retention.cc).
 inline constexpr int kProtectedMatches = 16;
 
 // Where a launch records, in its own session directory, every session its

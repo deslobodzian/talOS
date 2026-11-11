@@ -9,7 +9,7 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/packet.h"
-#include "talOS/launcher/launcher.h"
+#include "talOS/launcher/session.h"
 
 int main(int argc, char** argv) {
   if (argc != 2) return 1;

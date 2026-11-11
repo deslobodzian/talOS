@@ -62,7 +62,7 @@ const SIGNAL_NAMES: Record<number, string> = {
   14: 'SIGALRM', 15: 'SIGTERM'
 };
 
-// The launcher's own spelling (SignalText in talOS/launcher/launcher.h).
+// The launcher's own spelling (SignalText in talOS/launcher/spawn.h).
 export function signalText(signal: number): string {
   const name = SIGNAL_NAMES[signal];
   return name ? `signal ${signal} ${name}` : `signal ${signal}`;

@@ -251,7 +251,7 @@ and stderr land in `<output_dir>/<session_id>/studio_bridge.log`
 [output](#node-output), but are not echoed to the launcher's stdout.
 
 The bridge is the one roster member supervised differently (`StudioBridge` in
-`launcher.h`); it waits for the telemetry segment itself (see the
+`studio_bridge.h`); it waits for the telemetry segment itself (see the
 [bridge README](../../studio/bridge/README.md#publisher-and-serving-constraints)). Its
 first attempt spawns with the nodes; a quick exit is retried at most once a
 second for up to 60 seconds, inside the supervision loop, so it never delays the
@@ -594,6 +594,19 @@ workspace as its working directory; `bazel run` starts a binary in its
 runfiles tree instead, and `main.cc` chases `BUILD_WORKSPACE_DIRECTORY` back so
 both spellings behave the same.
 
+The sources are split into libraries along these seams, each with its own
+header:
+
+| Library | Files | Holds |
+|---|---|---|
+| `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock, what retention reads of a recorded session, the log budget split |
+| `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `ChildExitWakeup` |
+| `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output) |
+| `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
+| `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
+| `:log_merge` | `log_merge.h` | `MergeLogs`; `log_dump` links it and `:hardware_record`, not the supervisor |
+| `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), the restart policy and the Studio bridge |
+
 
 ## Session segments and logs
 
@@ -731,7 +744,7 @@ Simulation is only permitted with effective remote `127.0.0.1`. `--sim` with a
 different configured or overridden remote is refused before any process starts.
 
 
-Before spawning nodes, phase two calls `CreateSessionSegments` (`launcher.h`),
+Before spawning nodes, phase two calls `CreateSessionSegments` (`describe_graph.h`),
 which creates every declared topic as a session-owned RTMS segment with its
 schema name, schema hash, alignment, and slots. Nodes only attach. When the
 session ends, the launcher destroys its queues and unlinks all session segments.
