@@ -3,7 +3,8 @@
 // Supervision decisions as functions of time: a member's restart backoff,
 // rolling budget and quarantine (RestartSchedule), and the stall,
 // missing-row and construction kills of one run (RunLiveness). Nothing here
-// reads a clock: each call takes the `now` its supervision pass sampled.
+// reads a clock: each call takes the `now` its supervision pass sampled from
+// the supervision clock (SupervisionClock).
 //
 // Restarts
 //
@@ -31,11 +32,16 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <string_view>
 
 namespace talos::launcher {
 
 using SupervisionTime = std::chrono::steady_clock::time_point;
+// The supervisor's one clock (LauncherOptions::supervision_clock):
+// steady_clock in production, whose epoch introspect::monotonic_now_ns()
+// shares; a scripted one in tests.
+using SupervisionClock = std::function<SupervisionTime()>;
 
 inline constexpr int kDefaultMaxRestarts = 5;
 inline constexpr std::chrono::milliseconds kRestartInitialBackoff{50};
