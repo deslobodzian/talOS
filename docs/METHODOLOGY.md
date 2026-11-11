@@ -117,7 +117,8 @@ There are exactly two kinds of input, and they are treated differently.
   mechanism that must hold position is told to hold by a producer that keeps
   publishing. **[review]**
 - Use a message callback (`subscribe(topic, fn)`) only when the node must react
-  within 1 ms. A callback switches the node to 1 ms polling (§10). **[review]**
+  as each message arrives rather than at its next tick. A callback makes every
+  publication on that topic wake the node (§10). **[review]**
 - Read another subsystem only through its messages and topics, or a configured
   value it owns through `param_of` in the constructor. Never include
   its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[review; gap: ARCH-2]**

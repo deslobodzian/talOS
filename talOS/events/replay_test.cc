@@ -169,8 +169,9 @@ void ExpectReRecordingIsByteIdentical(Delivery delivery) {
   std::remove(replayed_path.c_str());
 }
 
-TEST(Replay, ReRecordingIsByteIdenticalForBothDeliveryPolicies) {
-  for (const auto delivery : {Delivery::POLL, Delivery::BEFORE_TIMERS}) {
+TEST(Replay, ReRecordingIsByteIdenticalForEveryDeliveryPolicy) {
+  for (const auto delivery :
+       {Delivery::POLL, Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
     ExpectReRecordingIsByteIdentical(delivery);
   }
 }

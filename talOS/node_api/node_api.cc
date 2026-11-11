@@ -408,7 +408,9 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
     const std::size_t index = NodeAccess::add_subscription(
         n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
         Schema(schema), optional != 0, std::move(callback));
-    if (on_message != nullptr) NodeAccess::require_immediate_delivery(n);
+    if (on_message != nullptr) {
+      NodeAccess::require_immediate_delivery(n, index);
+    }
     return static_cast<int64_t>(index);
   });
 }

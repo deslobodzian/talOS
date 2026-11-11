@@ -47,6 +47,8 @@ struct Node::Impl {
     std::unique_ptr<std::byte[]> data;  // operator new[]: aligned for M
     bool optional;
     bool observer = false;
+    // Its publications wake the node (require_immediate_delivery).
+    bool prompt = false;
     detail::MessageCallback on_message;
     std::uint16_t watcher = 0;  // the loop's source id
     bool has_value = false;
@@ -112,7 +114,6 @@ struct Node::Impl {
   std::function<void()> update;
   std::vector<std::function<void()>> after_update;
   bool started = false;
-  bool immediate_delivery = false;
   bool in_update = false;
   std::uint64_t ticks = 0;
   // The thread that built the node, which also runs its loop: talos::Run,
@@ -368,13 +369,20 @@ void NodeAccess::start(Node& node) {
   Node::Impl& impl = *node.impl_;
   if (impl.started) throw std::logic_error(impl.name + ": started twice");
   impl.started = true;
-  // Draining before timers needs a timer: a node with none (it only lets
-  // its extensions latch values for someone else to read) keeps the tick.
+  // Draining before timers needs a timer: in a node with none (it only lets
+  // its extensions latch values for someone else to read) nothing else would
+  // ever drain, so every subscription wakes it.
   const bool has_tick = impl.update || !impl.after_update.empty();
   const bool timed = has_tick || !impl.timers.empty();
-  impl.loop->set_delivery(impl.immediate_delivery || !timed
-                              ? event::Delivery::POLL
-                              : event::Delivery::BEFORE_TIMERS);
+  bool prompt = false;
+  for (const auto& slot : impl.subscriptions) {
+    if (slot->prompt || !timed) {
+      impl.loop->set_prompt(slot->watcher);
+      prompt = true;
+    }
+  }
+  impl.loop->set_delivery(prompt || !timed ? event::Delivery::ON_PUBLISH
+                                           : event::Delivery::BEFORE_TIMERS);
   if (!has_tick) return;
   const std::uint16_t id = impl.loop->register_timer(
       impl.name, event::Thunk{&impl, &Node::Impl::OnTick});
@@ -390,13 +398,15 @@ void NodeAccess::require_loop_thread(const Node& node, std::string_view what) {
 
 bool NodeAccess::in_update(const Node& node) { return node.impl_->in_update; }
 
-void NodeAccess::require_immediate_delivery(Node& node) {
-  node.impl_->CheckOpen("subscribe with a callback");
-  node.impl_->immediate_delivery = true;
-}
-
-bool NodeAccess::immediate_delivery(const Node& node) {
-  return node.impl_->immediate_delivery;
+void NodeAccess::require_immediate_delivery(Node& node,
+                                            std::size_t subscription) {
+  Node::Impl& impl = *node.impl_;
+  impl.CheckOpen("subscribe with a callback");
+  if (subscription >= impl.subscriptions.size()) {
+    throw std::out_of_range(impl.name + ": no subscription at index " +
+                            std::to_string(subscription));
+  }
+  impl.subscriptions[subscription]->prompt = true;
 }
 
 std::uint64_t NodeAccess::next_update(const Node& node) {

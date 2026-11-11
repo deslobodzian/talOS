@@ -103,14 +103,16 @@ struct NodeAccess {
   // each update() sends neutral for every output that update() did not set.
   // Read it only on the loop thread (after require_loop_thread).
   static bool in_update(const Node& node);
-  // Some handler must see each message as it arrives (a subscribe callback,
-  // a Driver Station listener), so the loop drains every tick. Without it,
-  // a node with a timer (update(), an after_update hook or every()) drains
-  // only right before its own timers, which is all a node that reads latched
-  // values there needs; a node with no timer drains every tick regardless.
-  // Call before start().
-  static void require_immediate_delivery(Node& node);
-  static bool immediate_delivery(const Node& node);
+  // Some handler must see each message on subscription `subscription` as it
+  // arrives (a subscribe callback, a Driver Station listener), so its
+  // publications wake the node: start() marks its watcher prompt and picks
+  // Delivery::ON_PUBLISH. A node with a timer (update(), an after_update
+  // hook or every()) and no such subscription drains only right before its
+  // own timers (Delivery::BEFORE_TIMERS), which is all a node that reads
+  // latched values there needs; in a node with no timer every subscription
+  // wakes it regardless. Call before start(); throws std::out_of_range for
+  // an index add_subscription did not return.
+  static void require_immediate_delivery(Node& node, std::size_t subscription);
   // Index of the update() currently running, or of the next one between
   // ticks. State machines stamp transitions with it.
   static std::uint64_t next_update(const Node& node);

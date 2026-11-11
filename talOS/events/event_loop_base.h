@@ -182,6 +182,27 @@ class EventLoopBase {
                       schema, callback, latest_only);
   }
 
+  // Marks watcher `id` prompt: under Delivery::ON_PUBLISH a publication on
+  // it wakes the loop to drain, because its handler must run as the message
+  // arrives. Other watchers are drained only when something else drains. Not
+  // part of the manifest: it changes when messages are drained, which the log
+  // already records, not what the program is. Before run(); throws
+  // std::logic_error after, std::invalid_argument for an id that is not a
+  // watcher.
+  void set_prompt(std::uint16_t id) {
+    if (registration_closed_) {
+      throw std::logic_error("a watcher is marked prompt only before the run");
+    }
+    if (id >= sources_.size() ||
+        sources_[id].registration.kind != SourceKind::WATCHER) {
+      throw std::invalid_argument("only a watcher can be prompt");
+    }
+    sources_[id].prompt = true;
+  }
+  bool prompt(std::uint16_t id) const {
+    return id < sources_.size() && sources_[id].prompt;
+  }
+
   std::uint16_t register_sender(std::string_view topic,
                                 std::uint32_t message_bytes,
                                 std::uint32_t alignment,
@@ -257,6 +278,7 @@ class EventLoopBase {
     Thunk callback;
     std::vector<std::byte> buffer;  // staging for watcher payloads
     bool latest_only{false};
+    bool prompt{false};  // set_prompt
   };
 
   std::vector<Source>& sources() { return sources_; }

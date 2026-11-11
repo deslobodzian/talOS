@@ -66,6 +66,10 @@ class LoopPort {
   // Chosen by NodeAccess::start, once the node has registered everything.
   // A loop that has no choice (replay delivers what the log says) ignores it.
   virtual void set_delivery(event::Delivery delivery) = 0;
+  // Marks watcher `watcher` prompt (EventLoopBase::set_prompt): under
+  // Delivery::ON_PUBLISH its publications wake the loop. By
+  // NodeAccess::start.
+  virtual void set_prompt(std::uint16_t watcher) = 0;
 
   // The world outside the loop: a byte topic, which the loop neither
   // dispatches nor logs. By default an RTMS queue, opened here while the node
@@ -119,6 +123,7 @@ class LoopPortFor : public LoopPort {
       loop_.set_delivery(delivery);
     }
   }
+  void set_prompt(std::uint16_t watcher) override { loop_.set_prompt(watcher); }
 
  private:
   Loop& loop_;

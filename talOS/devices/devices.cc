@@ -834,9 +834,10 @@ class DriverStationLink {
         [this](const void* data) { OnPacket(data); });
   }
 
-  // A listener runs as each packet arrives, so its node drains every tick.
+  // A listener runs as each packet arrives, so the packet's publications
+  // wake the node; without one the link is drained before the node's timers.
   void Listen(std::function<void()> on_packet) {
-    NodeAccess::require_immediate_delivery(node_);
+    NodeAccess::require_immediate_delivery(node_, subscription_);
     listeners_.push_back(std::move(on_packet));
   }
 

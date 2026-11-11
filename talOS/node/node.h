@@ -169,13 +169,14 @@ class Node {
   // publish and publish_bytes throw std::invalid_argument for a topic that
   // resolves under /hw/request: only the devices layer writes a hardware
   // request (talOS/devices, RULES.md 2), and its request is never remapped.
-  // A node without message callbacks receives messages right before each of
-  // its timers (update(), every()); passing `on_message` to any subscription
-  // makes the node also drain every 1 ms, so the callback runs promptly.
-  // Without a callback, each drain keeps only the newest available message
-  // and counts skipped messages as dropped. Callbacks receive messages in
-  // sequence, up to 64 per topic per drain. age() counts from publication,
-  // not delivery, for both subscription kinds.
+  // A node receives messages right before each of its timers (update(),
+  // every()), and otherwise sleeps; passing `on_message` makes a publication
+  // on that topic also wake the node, so the callback runs as the message
+  // arrives (testing::Sim models this as a 1 ms drain). Each wake drains
+  // every subscription. Without a callback, each drain keeps only the newest
+  // available message and counts skipped messages as dropped. Callbacks
+  // receive messages in sequence, up to 64 per topic per drain. age() counts
+  // from publication, not delivery, for both subscription kinds.
   using SubscribeOptions = talos::SubscribeOptions;
   template <Message M>
   Subscription<M> subscribe(std::string_view topic,
@@ -414,7 +415,7 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
   const std::size_t index = detail::NodeAccess::add_subscription(
       *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>(),
       options.optional, std::move(callback));
-  detail::NodeAccess::require_immediate_delivery(*this);
+  detail::NodeAccess::require_immediate_delivery(*this, index);
   return Subscription<M>{this, index};
 }
 

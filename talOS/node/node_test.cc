@@ -415,7 +415,8 @@ struct Consumer {
   std::vector<Seen> seen;
 };
 
-// A callback subscription: the node drains every 1 ms tick, in sequence.
+// A callback subscription: each publication wakes the node, which the Sim
+// models as a drain every 1 ms, in sequence.
 struct Hearer {
   explicit Hearer(Node& n)
       : node{n},
@@ -713,10 +714,35 @@ struct Silent {
   Subscription<Count> in;
 };
 
+// Two raw callback subscriptions, as the devices layer opens /hw/state and
+// the Driver Station link; only the second has a handler that must run as
+// each message arrives (a Driver Station listener), when `listen`.
+template <bool listen>
+struct RawCallbacks {
+  explicit RawCallbacks(Node& n) {
+    const auto open = [&n](std::string_view topic) {
+      return detail::NodeAccess::add_subscription(
+          n, topic, sizeof(Count), kMessageAlignment, schema::Of<Count>(),
+          /*optional=*/false, [](const void*) {});
+    };
+    open("/feed/state");
+    [[maybe_unused]] const std::size_t link = open("/link/state");
+    if constexpr (listen) {
+      detail::NodeAccess::require_immediate_delivery(n, link);
+    }
+  }
+  void update() {}
+};
+
+struct Wakes {
+  event::Delivery policy;
+  std::vector<bool> prompt;  // per watcher, in registration order
+};
+
 // The loop's delivery as NodeAccess::start picks it for T on node
-// "listener".
+// "listener", and which of its watchers wake it.
 template <class T>
-event::Delivery DeliveryFor() {
+Wakes DeliveryFor() {
   auto sim = Sim::FromToml(kRobotToml);
   const std::string& config_path = detail::SimAccess::config_path(sim);
   event::SimulationEnvironment environment;
@@ -732,17 +758,40 @@ event::Delivery DeliveryFor() {
   });
   const detail::Instance user = detail::MakeInstance<T>()(*node);
   detail::NodeAccess::start(*node);
-  return loop.delivery();
+  Wakes wakes{.policy = loop.delivery(), .prompt = {}};
+  for (const event::Registration& source : loop.manifest()) {
+    if (source.kind == event::SourceKind::WATCHER) {
+      wakes.prompt.push_back(loop.prompt(source.id));
+    }
+  }
+  return wakes;
 }
 
-// A node that only reads latched values at its own timers drains right
-// before them; a message callback, or having no timer to drain before, keeps
-// the 1 ms drain.
-TEST(Node, DeliveryWaitsForTimersUnlessAHandlerNeedsEveryMessage) {
-  EXPECT_EQ(DeliveryFor<Watcher>(), event::Delivery::BEFORE_TIMERS);
-  EXPECT_EQ(DeliveryFor<Beats>(), event::Delivery::BEFORE_TIMERS);
-  EXPECT_EQ(DeliveryFor<Listener>(), event::Delivery::POLL);
-  EXPECT_EQ(DeliveryFor<Silent>(), event::Delivery::POLL);
+// A node that only reads latched values at its own timers drains
+// right before them and is never woken by a publication. A subscribe
+// callback, or a listener on one raw subscription, makes that one
+// subscription wake the node, not the node's other callback subscriptions;
+// a node with no timer to drain before is woken by every subscription.
+// REQ-RT-02
+TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
+  constexpr auto BEFORE_TIMERS = event::Delivery::BEFORE_TIMERS;
+  constexpr auto ON_PUBLISH = event::Delivery::ON_PUBLISH;
+  const auto expect = [](const char* node, const Wakes& got,
+                         event::Delivery policy,
+                         const std::vector<bool>& prompt) {
+    SCOPED_TRACE(node);
+    EXPECT_EQ(got.policy, policy);
+    EXPECT_EQ(got.prompt, prompt);
+  };
+  expect("timer reads a latched value", DeliveryFor<Watcher>(), BEFORE_TIMERS,
+         {false});
+  expect("timers only", DeliveryFor<Beats>(), BEFORE_TIMERS, {});
+  expect("callbacks without a listener", DeliveryFor<RawCallbacks<false>>(),
+         BEFORE_TIMERS, {false, false});
+  expect("a listener on the second", DeliveryFor<RawCallbacks<true>>(),
+         ON_PUBLISH, {false, true});
+  expect("subscribe callback", DeliveryFor<Listener>(), ON_PUBLISH, {true});
+  expect("no timer", DeliveryFor<Silent>(), ON_PUBLISH, {true});
 }
 
 struct LateSubscriber {
