@@ -185,8 +185,9 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
     }
   }
 
-  // 4. The Studio bridge: a host-side viewer named by [studio], sim only.
-  if (options.start_studio_bridge && options.simulation) {
+  // 4. The Studio bridge: a viewer named by [studio], in any session, so a
+  // deployed robot is viewable too (an observer: see StudioBridge).
+  if (options.start_studio_bridge) {
     specs.push_back(
         MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge, options));
   }

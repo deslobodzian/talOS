@@ -227,10 +227,11 @@ is driven under the robot's scheduling policy.
 
 ## Studio bridge
 
-Sim sessions can put the Studio viewer bridge under launcher supervision with
-`--start-studio-bridge` (what `sim.sh` passes unless `--no-studio`), so the
-bridge is a declared node in `graph.json` instead of a process running behind
-the launcher's back:
+Any session, with `--sim` or against the real controller, can put the Studio
+viewer bridge under launcher supervision with `--start-studio-bridge` (what
+`sim.sh` passes unless `--no-studio`), so the bridge is a declared node in
+`graph.json` and a member in the manifest instead of a process running behind
+the launcher's back; without the flag it is not started:
 
 ```toml
 [studio]
@@ -241,9 +242,10 @@ webroot = "bazel-bin/studio/dist"         # static web directory, relative to th
 
 Every key shown is optional. The watched topic comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`
-overrides `[studio] http_port` for one run. Supervision is sim-only: without
-`--sim` the flag has no effect, since a deployed session has no build tree
-serving the webroot and no browser to open. The bridge answers `--describe`
+overrides `[studio] http_port` for one run. The default webroot exists only
+in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
+`[studio] webroot`, or the bridge cannot start and the session runs on
+without Studio (below). The bridge answers `--describe`
 like any other node, and the launcher starts it with the session's `graph.json`
 as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
 and stderr land in `<output_dir>/<session_id>/studio_bridge.log`

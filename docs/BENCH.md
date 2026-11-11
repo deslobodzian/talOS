@@ -93,7 +93,11 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
 ```
 
 Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
-`/hw/status` counts States received.
+`/hw/status` counts States received. To watch it in Studio, build
+`//studio/bridge:studio_bridge //studio:web_dist` too and add
+`--start-studio-bridge`; the launcher then runs the
+[Studio bridge](../talOS/launcher/README.md#studio-bridge) at
+`http://<main-processor>:5800`.
 
 ### Bench with the Python motor node
 
