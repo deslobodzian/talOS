@@ -17,7 +17,7 @@ enum class Mode : uint8_t {
   kMotionMagic
 };
 enum StateFlags : uint32_t {
-  kConfigured = 1,
+  kConfigured = 1,  // a config applied and commissioned
   kEnabled = 2,
   kCommandActive = 4,
   kHardwareFault = 8
