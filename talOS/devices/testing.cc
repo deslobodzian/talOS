@@ -175,7 +175,7 @@ struct SimHardware::Impl {
 
   // Every request each subsystem flushed since the last look, in order,
   // merged as the bridge merges them. Inspection calls this too, so it
-  // changes nothing the bridge would not on its own 1 ms tick.
+  // changes nothing the bridge would not when the requests arrive.
   void Collect() {
     const std::uint64_t timeout_us = config.hardware.command_timeout_us;
     for (auto& [subsystem, tracker] : requests) {

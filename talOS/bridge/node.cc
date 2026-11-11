@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include "bridge/topics.h"
@@ -769,7 +770,7 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
   return next_us;
 }
 
-uint64_t HardwareNode::Pass(uint64_t now_us) {
+HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   Tick(now_us);
   ++wakeups_.passes;
 
@@ -793,25 +794,91 @@ uint64_t HardwareNode::Pass(uint64_t now_us) {
   bool input_waiting = tick_receive_capped_;
   for (auto& [name, tracker] : subsystems_) {
     // One without a slot cannot be armed; each Tick's read retries the
-    // claim, and kMaxWaitUs bounds the wait for the next Tick.
-    if (tracker.subscriber && tracker.subscriber->registered() &&
-        !tracker.subscriber->arm_wake()) {
-      input_waiting = true;
-    }
+    // claim, and the longest wait bounds the time to the next Tick.
+    if (!tracker.subscriber || !tracker.subscriber->registered()) continue;
+    const bool caught_up = seams_.arm_request != nullptr
+                               ? seams_.arm_request(*tracker.subscriber)
+                               : tracker.subscriber->arm_wake();
+    if (!caught_up) input_waiting = true;
   }
+
+  const uint64_t timed_us =
+      std::min({NextDutyUs(now_us), next_liveness_us_, next_introspection_us_,
+                now_us + max_wait_us_});
+
+  // CPU budget: the window restarts at the first pass after it ended.
+  if (now_us - cpu_window_start_us_ >= kCpuWindowUs) {
+    cpu_window_start_us_ = now_us;
+    cpu_window_passes_ = 0;
+    cpu_window_datagrams_ = 0;
+  }
+  ++cpu_window_passes_;
+  cpu_window_datagrams_ += tick_datagrams_;
+  if (cpu_window_passes_ >= kPassBudget ||
+      cpu_window_datagrams_ >= kDatagramBudget) {
+    // Spent: input waits for the window's end, a duty does not.
+    ++wakeups_.throttled;
+    idle_passes_ = 0;
+    return {std::min(cpu_window_start_us_ + kCpuWindowUs, timed_us), true};
+  }
+
   if (input_waiting) {
     if (tick_datagrams_ > 0 || tick_requests_ > 0) {
       idle_passes_ = 0;
-      return now_us;
+      return {now_us, false};
     }
     if (idle_passes_ < kMaxIdlePasses) {
       ++idle_passes_;
-      return now_us;
+      return {now_us, false};
     }
   }
   idle_passes_ = 0;
-  return std::min({NextDutyUs(now_us), next_liveness_us_,
-                   next_introspection_us_, now_us + max_wait_us_});
+  return {timed_us, false};
+}
+
+bool HardwareNode::OpenWaits() {
+  // The loop sleeps until there is something to do: a datagram from the
+  // gateway, a request on any /hw/request topic (each subscriber's slot
+  // names request_wake_), or the next time-driven duty.
+  try {
+    poller_.emplace();
+    if (peer_.NativeFd() < 0) {
+      throw std::runtime_error("the UDP socket has no fd");
+    }
+    poller_->add_fd(peer_.NativeFd());
+    if (seams_.make_wake_receiver != nullptr) {
+      request_wake_.emplace(seams_.make_wake_receiver());
+    } else {
+      request_wake_.emplace();
+    }
+    poller_->add_fd(request_wake_->fd());
+    for (auto& [name, tracker] : subsystems_) {
+      if (tracker.subscriber) {
+        tracker.subscriber->set_wake_receiver(request_wake_->id());
+      }
+    }
+    max_wait_us_ = kMaxWaitUs;
+    return true;
+  } catch (const std::exception& e) {
+    // Out of descriptors, say: the bridge still runs, at the cost of a
+    // pass every kRetryUs, as a node's loop falls back to polling.
+    CloseWaits();
+    max_wait_us_ = kRetryUs;
+    ++wakeups_.wait_fallbacks;
+    std::fprintf(stderr,
+                 "hardware_node: cannot wait for input (%s); polling it "
+                 "every %llu us\n",
+                 e.what(), static_cast<unsigned long long>(kRetryUs));
+    return false;
+  }
+}
+
+void HardwareNode::CloseWaits() {
+  for (auto& [name, tracker] : subsystems_) {
+    if (tracker.subscriber) tracker.subscriber->set_wake_receiver(0);
+  }
+  request_wake_.reset();
+  poller_.reset();
 }
 
 int HardwareNode::Run(int duration_s) {
@@ -819,7 +886,8 @@ int HardwareNode::Run(int duration_s) {
   // The merge runs in the highest loop tier: on Linux above every node's
   // SCHED_FIFO priority, so a busy node cannot delay the command the RoboRIO
   // is waiting for (its loop waits in epoll_pwait2, a hard hrtimer for a
-  // realtime thread on PREEMPT_RT, and wakes on the RoboRIO's datagram).
+  // realtime thread on PREEMPT_RT, and wakes on the RoboRIO's datagram); the
+  // CPU budget (kCpuWindowUs) keeps it from starving those nodes in turn.
   // macOS has no priority among time-constraint threads, so there the
   // bridge shares that band with the control nodes and is ahead only of the
   // observers (talOS/process LoopPolicy); its kWakeBudgetUs constraint is
@@ -835,31 +903,7 @@ int HardwareNode::Run(int duration_s) {
          .tier = realtime.tier});
   }
   if (registration_) registration_->set_realtime(realtime);
-
-  // The loop sleeps until there is something to do: a datagram from the
-  // gateway, a request on any /hw/request topic (each subscriber's slot
-  // names request_wake_), or the next time-driven duty. Unable to wait on
-  // both inputs, it polls them every kRetryUs instead.
-  event::Poller poller;
-  try {
-    if (peer_.NativeFd() < 0) {
-      throw std::runtime_error("the UDP socket has no fd");
-    }
-    poller.add_fd(peer_.NativeFd());
-    request_wake_.emplace();
-    poller.add_fd(request_wake_->fd());
-    for (auto& [name, tracker] : subsystems_) {
-      if (tracker.subscriber) {
-        tracker.subscriber->set_wake_receiver(request_wake_->id());
-      }
-    }
-  } catch (const std::exception& e) {
-    std::fprintf(stderr,
-                 "hardware_node: cannot wait for input (%s); polling it "
-                 "every %llu us\n",
-                 e.what(), static_cast<unsigned long long>(kRetryUs));
-    max_wait_us_ = kRetryUs;
-  }
+  OpenWaits();
 
   // The node clock (Node::now() reads the same Poller clock), not
   // std::chrono::steady_clock: on macOS the two differ by time asleep, and
@@ -876,25 +920,30 @@ int HardwareNode::Run(int duration_s) {
     if (request_wake_) request_wake_->drain();
     const uint64_t now_us = clock_us();
     if (now_us >= end_us) break;
-    const uint64_t until_us = Pass(now_us);
+    const Wait wait = Pass(now_us);
     if (woke_readable) {
       if (tick_datagrams_ > 0) ++wakeups_.udp;
       if (tick_requests_ > 0) ++wakeups_.request;
       woke_readable = false;
     }
+    const uint64_t until_us = std::min(wait.until_us, end_us);
     if (until_us <= now_us) continue;
-    const auto reason = poller.wait_until(event::MonotonicTime::from_nanos(
-        static_cast<std::int64_t>(std::min(until_us, end_us) * 1000)));
+    if (wait.ignore_input || !poller_) {
+      // A sleep no datagram or request cuts short: the CPU budget is spent,
+      // or there is no poller to wait on.
+      std::this_thread::sleep_for(std::chrono::microseconds{until_us - now_us});
+      if (!wait.ignore_input) ++wakeups_.deadline;
+      continue;
+    }
+    const auto reason = poller_->wait_until(event::MonotonicTime::from_nanos(
+        static_cast<std::int64_t>(until_us * 1000)));
     if (reason == event::Poller::WakeReason::DEADLINE) {
       ++wakeups_.deadline;
     } else {
       woke_readable = true;
     }
   }
-  for (auto& [name, tracker] : subsystems_) {
-    if (tracker.subscriber) tracker.subscriber->set_wake_receiver(0);
-  }
-  request_wake_.reset();
+  CloseWaits();
 
   PublishIntrospection();
 
@@ -911,11 +960,13 @@ int HardwareNode::Run(int duration_s) {
   }
   std::printf(
       "hardware_node: passes=%llu wakeups udp=%llu request=%llu "
-      "deadline=%llu\n",
+      "deadline=%llu throttled=%llu wait_fallbacks=%llu\n",
       static_cast<unsigned long long>(wakeups_.passes),
       static_cast<unsigned long long>(wakeups_.udp),
       static_cast<unsigned long long>(wakeups_.request),
-      static_cast<unsigned long long>(wakeups_.deadline));
+      static_cast<unsigned long long>(wakeups_.deadline),
+      static_cast<unsigned long long>(wakeups_.throttled),
+      static_cast<unsigned long long>(wakeups_.wait_fallbacks));
   // A log that failed exits 1, as RunMain does for event-loop nodes.
   bool log_failed = false;
   if (log_) {
