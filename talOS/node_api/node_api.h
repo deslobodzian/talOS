@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 27u
+#define TALOS_NODE_ABI_VERSION 28u
 
 enum {
   TALOS_OK = 0,
@@ -83,8 +83,9 @@ uint64_t talos_node_next_update(const TalosNode* node);
 int64_t talos_node_period_ns(const TalosNode* node);
 const char* talos_node_config_path(const TalosNode* node);
 // The session output directory (the parent of --log), or NULL when there is
-// none (no --log: tests, --describe, --replay). The pointer is valid until
-// the next talos_node_session_dir call on this thread.
+// none: without --log (tests), and under --describe, --replay and
+// --replay-inputs with or without it. The pointer is valid until the next
+// talos_node_session_dir call on this thread.
 const char* talos_node_session_dir(const TalosNode* node);
 
 // Parameter kinds. ANY takes the key's own type; LIST takes an array of
@@ -127,11 +128,19 @@ int32_t talos_node_param_of(const TalosNode* node, const char* subsystem,
 // error. `schema` names the message type; the topic refuses another.
 // No on_message: each drain keeps only the newest message, counting skipped
 // messages as dropped. With on_message: sequence delivery, capped at 64
-// messages per topic per drain. Both kinds measure freshness from publication.
+// messages per topic per drain, and `wake` (talos::Wake) says when:
+// TALOS_WAKE_ON_PUBLISH makes each publication wake the node to run it;
+// TALOS_WAKE_AT_DRAIN wakes nothing and delivers at the node's next drain.
+// `wake` is ignored without on_message; another value is an error. Both
+// kinds measure freshness from publication.
+enum {  // talos::Wake
+  TALOS_WAKE_ON_PUBLISH = 0,
+  TALOS_WAKE_AT_DRAIN = 1,
+};
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, const TalosSchema* schema,
-                             int32_t optional, TalosMessageCallback on_message,
-                             void* user);
+                             int32_t optional, int32_t wake,
+                             TalosMessageCallback on_message, void* user);
 int64_t talos_node_publish(TalosNode* node, const char* topic,
                            uint32_t message_bytes, const TalosSchema* schema);
 int64_t talos_node_publish_bytes(TalosNode* node, const char* topic,

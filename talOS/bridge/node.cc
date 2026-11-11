@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -296,8 +298,11 @@ void HardwareNode::PushConfig(uint64_t now_us) {
 }
 
 void HardwareNode::Tick(uint64_t now_us) {
+  tick_datagrams_ = 0;
+  tick_requests_ = 0;
   // Tick's timestamp precedes socket reads. Complete the previous tick's
-  // exchange now, so the upper endpoint is definitely after receipt.
+  // exchange now, so the upper endpoint is definitely after receipt (Run()
+  // ticks again at once for it: NextDutyUs).
   if (pending_probe_send_us_ != 0) {
     clock_.ObserveExchange(pending_probe_boot_id_, pending_probe_send_us_,
                            pending_probe_sample_us_, now_us);
@@ -313,13 +318,23 @@ void HardwareNode::Tick(uint64_t now_us) {
       probe_waiting_ = true;
     }
   }
-  // 1. Process incoming UDP frames from Gateway. Bounded receive budget:
-  // at most 32 frames per tick, so a burst under overload delays rather than
-  // stalls the merge below.
-  for (int i = 0; i < 32; ++i) {
+  // 1. Process incoming UDP frames from Gateway, at most kReceiveBudget, so
+  // a burst under overload delays rather than stalls the merge below; Run()
+  // ticks again without waiting when the budget runs out.
+  tick_receive_capped_ = true;
+  for (int i = 0; i < kReceiveBudget; ++i) {
     protocol::DecodedFrame frame;
     const auto status = peer_.TryReceive(&frame);
-    if (status == protocol::UdpStatus::kWouldBlock) break;
+    if (status == protocol::UdpStatus::kWouldBlock) {
+      tick_receive_capped_ = false;
+      break;
+    }
+    // A datagram consumed, decodable or not. A socket error need not have
+    // consumed one, so a loop of them is not input.
+    if (status == protocol::UdpStatus::kOk ||
+        status == protocol::UdpStatus::kDecodeError) {
+      ++tick_datagrams_;
+    }
     if (status == protocol::UdpStatus::kDecodeError &&
         peer_.stats().last_decode_status ==
             protocol::DecodeStatus::kUnsupportedVersion) {
@@ -461,6 +476,7 @@ void HardwareNode::Tick(uint64_t now_us) {
 
     if (pkt) {
       ++tracker.requests;
+      ++tick_requests_;
       Command partial{};
       if (Decode(pkt->bytes(), partial)) {
         // Trust gates, in this order: an obsolete request must never merge,
@@ -556,12 +572,12 @@ void HardwareNode::Tick(uint64_t now_us) {
   // 3. Send unified command if we have observed state. Active demands retain
   // their request observation; only the final timeout's fully neutral command
   // adopts the latest state so the gateway accepts it. Publication is
-  // change-driven with a bounded heartbeat: each new sample changes the merge's
-  // observation headers, so a live 200 Hz link sends at the 200 Hz sample
-  // rate instead of the 1 kHz tick rate, and an unchanged merge resends only
-  // when the heartbeat elapses. The gateway's 100 ms timeout keeps 5x margin
-  // over the heartbeat. Subsystem timeouts still neutralize through the
-  // merge, and a changed merge always sends immediately.
+  // change-driven with a bounded heartbeat: each request that changes the
+  // merge (a new sample changes its observation headers) sends at once, and
+  // an unchanged merge resends only when the heartbeat elapses. The
+  // gateway's 100 ms timeout keeps 5x margin over the heartbeat. Subsystem
+  // timeouts still neutralize through the merge, and a changed merge always
+  // sends immediately.
   if (last_boot_id_ != 0 &&
       (any_subsystem_active || last_sent_had_active_subsystem_)) {
     if (ShouldSendCommand(now_us)) {
@@ -714,65 +730,230 @@ bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
   return now_us - last_send_us_ >= heartbeat_us_;
 }
 
+uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
+  // Tick completes an echoed probe with its own clock reading, taken before
+  // it receives anything; the next one is the first known to follow receipt.
+  if (pending_probe_send_us_ != 0) return now_us;
+  uint64_t next_us = std::numeric_limits<uint64_t>::max();
+  const auto due = [&next_us, now_us](uint64_t at_us) {
+    next_us = std::min(next_us, at_us > now_us ? at_us : now_us + kRetryUs);
+  };
+  // Clock probe: every kProbePeriodUs, replaced once more than kProbeRetryUs
+  // goes unanswered.
+  if (!probe_waiting_) {
+    due(last_probe_send_us_ == 0 ? now_us
+                                 : last_probe_send_us_ + kProbePeriodUs);
+  } else {
+    due(last_probe_send_us_ + kProbeRetryUs + 1);
+  }
+  if (status_pub_) {
+    due(statuses_published_ == 0 ? now_us : last_status_us_ + kStatusPeriodUs);
+  }
+  // Each merged owner's timeout. That some owner is merged is Tick's
+  // any_subsystem_active, which with the boot gates every command.
+  bool any_subsystem_active = false;
+  for (const auto& [name, tracker] : subsystems_) {
+    if (const auto expires_us = tracker.merge.ExpiresAtUs()) {
+      due(*expires_us);
+      any_subsystem_active = true;
+    }
+  }
+  if (last_boot_id_ != 0 &&
+      (any_subsystem_active || last_sent_had_active_subsystem_)) {
+    // ShouldSendCommand: a changed merge at once, else the heartbeat.
+    due(!have_last_sent_ || full_cmd_ != last_sent_cmd_
+            ? now_us
+            : last_send_us_ + heartbeat_us_);
+  }
+  // No config push: Tick pushes only on receiving a State, which wakes the
+  // loop itself.
+  return next_us;
+}
+
+HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
+  Tick(now_us);
+  ++wakeups_.passes;
+
+  // The per-source counters four times a second, which is enough for a
+  // viewer. Heartbeat and dispatch count every 10 ms, from this loop, as an
+  // event-loop node's loop thread stores its own dispatch count: the
+  // launcher's stall check samples it, and a sample up to 250 ms old plus a
+  // short pause would read as a stall.
+  if (now_us >= next_introspection_us_) {
+    PublishIntrospection();
+    next_introspection_us_ = now_us + kIntrospectionPeriodUs;
+    next_liveness_us_ = now_us + kLivenessPeriodUs;
+  } else if (now_us >= next_liveness_us_) {
+    RefreshLiveness();
+    next_liveness_us_ = now_us + kLivenessPeriodUs;
+  }
+
+  // Every request subscriber is armed before the loop may sleep: a request
+  // published after its arm notifies request_wake_, and one published
+  // before it fails the arm (talOS/rtms README.md "Wake channel").
+  bool input_waiting = tick_receive_capped_;
+  for (auto& [name, tracker] : subsystems_) {
+    // One without a slot cannot be armed; each Tick's read retries the
+    // claim, and the longest wait bounds the time to the next Tick.
+    if (!tracker.subscriber || !tracker.subscriber->registered()) continue;
+    const bool caught_up = seams_.arm_request != nullptr
+                               ? seams_.arm_request(*tracker.subscriber)
+                               : tracker.subscriber->arm_wake();
+    if (!caught_up) input_waiting = true;
+  }
+
+  const uint64_t timed_us =
+      std::min({NextDutyUs(now_us), next_liveness_us_, next_introspection_us_,
+                now_us + max_wait_us_});
+
+  // CPU budget: the window restarts at the first pass after it ended.
+  if (now_us - cpu_window_start_us_ >= kCpuWindowUs) {
+    cpu_window_start_us_ = now_us;
+    cpu_window_passes_ = 0;
+    cpu_window_datagrams_ = 0;
+  }
+  ++cpu_window_passes_;
+  cpu_window_datagrams_ += tick_datagrams_;
+  if (cpu_window_passes_ >= kPassBudget ||
+      cpu_window_datagrams_ >= kDatagramBudget) {
+    // Spent: input waits for the window's end, a duty does not.
+    ++wakeups_.throttled;
+    idle_passes_ = 0;
+    return {std::min(cpu_window_start_us_ + kCpuWindowUs, timed_us), true};
+  }
+
+  if (input_waiting) {
+    if (tick_datagrams_ > 0 || tick_requests_ > 0) {
+      idle_passes_ = 0;
+      return {now_us, false};
+    }
+    if (idle_passes_ < kMaxIdlePasses) {
+      ++idle_passes_;
+      return {now_us, false};
+    }
+  }
+  idle_passes_ = 0;
+  return {timed_us, false};
+}
+
+bool HardwareNode::OpenWaits() {
+  // The loop sleeps until there is something to do: a datagram from the
+  // gateway, a request on any /hw/request topic (each subscriber's slot
+  // names request_wake_), a stop, or the next time-driven duty.
+  try {
+    poller_.emplace();
+    if (peer_.NativeFd() < 0) {
+      throw std::runtime_error("the UDP socket has no fd");
+    }
+    poller_->add_fd(peer_.NativeFd());
+    if (seams_.make_wake_receiver != nullptr) {
+      request_wake_.emplace(seams_.make_wake_receiver());
+    } else {
+      request_wake_.emplace();
+    }
+    poller_->add_fd(request_wake_->fd());
+    // A stop (SIGINT, SIGTERM, process::RequestStop) makes the stop pipe
+    // readable, which ends the wait at once.
+    if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
+      poller_->add_fd(stop_fd);
+    }
+    for (auto& [name, tracker] : subsystems_) {
+      if (tracker.subscriber) {
+        tracker.subscriber->set_wake_receiver(request_wake_->id());
+      }
+    }
+    max_wait_us_ = kMaxWaitUs;
+    return true;
+  } catch (const std::exception& e) {
+    // Out of descriptors, say: the bridge still runs, at the cost of a
+    // pass every kRetryUs, as a node's loop falls back to polling.
+    CloseWaits();
+    max_wait_us_ = kRetryUs;
+    ++wakeups_.wait_fallbacks;
+    std::fprintf(stderr,
+                 "hardware_node: cannot wait for input (%s); polling it "
+                 "every %llu us\n",
+                 e.what(), static_cast<unsigned long long>(kRetryUs));
+    return false;
+  }
+}
+
+void HardwareNode::CloseWaits() {
+  for (auto& [name, tracker] : subsystems_) {
+    if (tracker.subscriber) tracker.subscriber->set_wake_receiver(0);
+  }
+  request_wake_.reset();
+  poller_.reset();
+}
+
 int HardwareNode::Run(int duration_s) {
   talos::process::InstallStopHandlers();
-  // The 1 kHz merge runs in the highest loop tier: on Linux above every
-  // node's SCHED_FIFO priority, so a busy node cannot delay the command the
-  // RoboRIO is waiting for (its tick sleeps in clock_nanosleep, a hard
-  // hrtimer for a realtime thread on PREEMPT_RT). macOS has no priority among
-  // time-constraint threads, so there the bridge shares that band with the
-  // control nodes and is ahead only of the observers (talOS/process
-  // LoopPolicy). Best
-  // effort: a refusal is reported once, on stderr and in the registry row,
-  // and the bridge runs unprivileged. Simulation stays an ordinary process
-  // unless TALOS_REALTIME=1 asks otherwise.
+  // The merge runs in the highest loop tier: on Linux above every node's
+  // SCHED_FIFO priority, so a busy node cannot delay the command the RoboRIO
+  // is waiting for (its loop waits in epoll_pwait2, a hard hrtimer for a
+  // realtime thread on PREEMPT_RT, and wakes on the RoboRIO's datagram); the
+  // CPU budget (kCpuWindowUs) keeps it from starving those nodes in turn.
+  // macOS has no priority among time-constraint threads, so there the
+  // bridge shares that band with the control nodes and is ahead only of the
+  // observers (talOS/process LoopPolicy); its kWakeBudgetUs constraint is
+  // the shortest in that band. Best effort: a refusal is reported once, on
+  // stderr and in the registry row, and the bridge runs unprivileged.
+  // Simulation stays an ordinary process unless TALOS_REALTIME=1 asks
+  // otherwise.
   talos::process::RealtimeOutcome realtime{
       .tier = talos::process::LoopTier::kBridge};
   if (talos::process::RealtimeRequested(simulation_)) {
     realtime = talos::process::ConfigureRealtime(
-        {.period = std::chrono::microseconds{kTickPeriodUs},
+        {.period = std::chrono::microseconds{kWakeBudgetUs},
          .tier = realtime.tier});
   }
   if (registration_) registration_->set_realtime(realtime);
-  const auto end =
-      std::chrono::steady_clock::now() + std::chrono::seconds{duration_s};
+  OpenWaits();
 
-  // Explicit periodic scheduling: each tick has a deadline
-  // one period after the previous, so work time does not accumulate drift
-  // the way work-then-sleep(1 ms) does. An overrun skips the sleep once and
-  // re-anchors the deadline instead of queuing catch-up ticks.
-  auto next_tick = std::chrono::steady_clock::now();
-  while (!talos::process::stop_requested.load() &&
-         (!duration_s || std::chrono::steady_clock::now() < end)) {
-    // The node clock (Node::now() reads the same Poller clock), not
-    // std::chrono::steady_clock: on macOS the two differ by time asleep, and
-    // the clock mapping on /hw/status must land in the nodes' time.
-    const auto now_us =
-        static_cast<uint64_t>(talos::event::Poller::now().nanos() / 1000);
-    Tick(now_us);
-
-    // The per-source counters four times a second, which is enough for a
-    // viewer. Heartbeat and dispatch count every 10 ms, from this loop, as an
-    // event-loop node's loop thread stores its own dispatch count: the
-    // launcher's stall check samples it, and a sample up to 250 ms old plus a
-    // short pause would read as a stall.
-    const auto steady_now = std::chrono::steady_clock::now();
-    if (steady_now >= next_introspection_) {
-      PublishIntrospection();
-      next_introspection_ = steady_now + std::chrono::milliseconds{250};
-      next_liveness_ = steady_now + std::chrono::milliseconds{10};
-    } else if (steady_now >= next_liveness_) {
-      RefreshLiveness();
-      next_liveness_ = steady_now + std::chrono::milliseconds{10};
+  // The node clock (Node::now() reads the same Poller clock), not
+  // std::chrono::steady_clock: on macOS the two differ by time asleep, and
+  // the clock mapping on /hw/status must land in the nodes' time.
+  const auto clock_us = [] {
+    return static_cast<uint64_t>(event::Poller::now().nanos() / 1000);
+  };
+  const uint64_t end_us =
+      duration_s > 0
+          ? clock_us() + (static_cast<uint64_t>(duration_s) * 1'000'000)
+          : std::numeric_limits<uint64_t>::max();
+  bool woke_readable = false;
+  while (!talos::process::stop_requested.load()) {
+    if (request_wake_) request_wake_->drain();
+    const uint64_t now_us = clock_us();
+    if (now_us >= end_us) break;
+    const Wait wait = Pass(now_us);
+    if (woke_readable) {
+      if (tick_datagrams_ > 0) ++wakeups_.udp;
+      if (tick_requests_ > 0) ++wakeups_.request;
+      woke_readable = false;
     }
-
-    next_tick += std::chrono::microseconds{kTickPeriodUs};
-    if (next_tick > std::chrono::steady_clock::now()) {
-      std::this_thread::sleep_until(next_tick);
+    const uint64_t until_us = std::min(wait.until_us, end_us);
+    if (until_us <= now_us) continue;
+    if (wait.ignore_input || !poller_) {
+      // A sleep no datagram or request cuts short: the CPU budget is spent,
+      // or there is no poller to wait on.
+      std::this_thread::sleep_for(std::chrono::microseconds{until_us - now_us});
+      if (!wait.ignore_input) ++wakeups_.deadline;
+      continue;
+    }
+    const auto reason = poller_->wait_until(event::MonotonicTime::from_nanos(
+        static_cast<std::int64_t>(until_us * 1000)));
+    if (reason == event::Poller::WakeReason::DEADLINE) {
+      ++wakeups_.deadline;
     } else {
-      next_tick = std::chrono::steady_clock::now();
+      woke_readable = true;
+      // A stop ends the loop at its check above. Bytes a cleared stop left
+      // are read out, or the level-triggered wait would never block again.
+      if (poller_->reported_readable(talos::process::StopFd())) {
+        static_cast<void>(talos::process::ConsumeStopWake());
+      }
     }
   }
+  CloseWaits();
 
   PublishIntrospection();
 
@@ -787,6 +968,15 @@ int HardwareNode::Run(int duration_s) {
                 name.c_str(), static_cast<unsigned long long>(tracker.requests),
                 tracker.merge.timed_out ? 1 : 0);
   }
+  std::printf(
+      "hardware_node: passes=%llu wakeups udp=%llu request=%llu "
+      "deadline=%llu throttled=%llu wait_fallbacks=%llu\n",
+      static_cast<unsigned long long>(wakeups_.passes),
+      static_cast<unsigned long long>(wakeups_.udp),
+      static_cast<unsigned long long>(wakeups_.request),
+      static_cast<unsigned long long>(wakeups_.deadline),
+      static_cast<unsigned long long>(wakeups_.throttled),
+      static_cast<unsigned long long>(wakeups_.wait_fallbacks));
   // A log that failed exits 1, as RunMain does for event-loop nodes.
   bool log_failed = false;
   if (log_) {

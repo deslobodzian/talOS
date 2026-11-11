@@ -48,12 +48,13 @@ constexpr const char* to_string(EventKind kind) {
 // `event_time` is when the event should have happened: a timer's deadline,
 // or for a message the drain that delivered it (a timer's or poll tick's
 // deadline, or when a woken loop saw its wake). A prompt watcher's message
-// delivered because the loop was woken for it (realtime_event_loop.h,
-// Delivery::ON_PUBLISH) instead takes its publication time, so latency() is
-// how long it waited from publication. `now` is the loop's observation time,
-// frozen for the whole dispatch. In realtime `now >= event_time` and the
-// difference is the scheduling latency; in replay both come from the log, so
-// handler logic that keys off either is reproduced exactly.
+// delivered because the loop was woken for it (Delivery::ON_PUBLISH, on the
+// realtime and simulated loops) instead takes its publication time, so
+// latency() is how long it waited from publication. `now` is the loop's
+// observation time, frozen for the whole dispatch. In realtime
+// `now >= event_time` and the difference is the scheduling latency; in replay
+// both come from the log, so handler logic that keys off either is reproduced
+// exactly.
 struct Context {
   EventKind kind{EventKind::TIMER};
   std::uint16_t source_id{0};

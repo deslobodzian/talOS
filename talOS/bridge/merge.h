@@ -59,6 +59,9 @@ struct MergeOwner {
   // Times the owner out once its last admitted request is more than
   // timeout_us old (or there is none); returns timed_out.
   bool Expire(std::uint64_t now_us);
+  // The first instant at which Expire() times the owner out, nullopt while
+  // it is already timed out: a caller that sleeps between calls wakes then.
+  std::optional<std::uint64_t> ExpiresAtUs() const;
   // Forgets every admitted request: a controller transition (boot, epoch,
   // configuration) that makes them obsolete.
   void Reset();

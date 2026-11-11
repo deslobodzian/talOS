@@ -14,6 +14,7 @@
 #include <iterator>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -266,6 +267,121 @@ TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
     stopper.join();
 
     EXPECT_LT(elapsed, Duration{std::chrono::seconds{5}});
+  }
+}
+
+// What talOS/node stops a node with, so that no thread has to poll for a
+// stop: a watched fd turning readable ends the loop's wait, and its handler
+// runs on the loop thread, whether the byte was there before the run or
+// arrives while the loop runs, under each delivery an idle node can run
+// with. The loop has no timer and a 30 s backstop, so nothing but the fd
+// ends its one wait before the run's 20 s end; and the fd is no publication,
+// so nothing drains.
+// REQ-OPS-06
+// REQ-RT-21
+TEST(RealtimeEventLoop, AWatchedFdEndsTheWaitOnTheLoopThread) {
+  int index = 0;
+  for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    for (const bool before_run : {true, false}) {
+      SCOPED_TRACE(
+          ::testing::Message()
+          << "delivery " << static_cast<int>(delivery)
+          << (before_run ? ", byte before the run" : ", byte while it runs"));
+      int fds[2];
+      ASSERT_EQ(::pipe(fds), 0);
+      RealtimeEventLoop<> loop{on_publish()};
+      loop.set_delivery(delivery);
+      if (delivery == Delivery::ON_PUBLISH) {
+        loop.set_prompt(
+            register_sensor_watcher(loop, "/tfd_" + std::to_string(::getpid()) +
+                                              "_" + std::to_string(index++)));
+      }
+      int calls = 0;
+      std::thread::id ran_on;
+      loop.watch_fd(fds[0], [&] {
+        ++calls;
+        ran_on = std::this_thread::get_id();
+        loop.exit();
+      });
+      const char byte = 1;
+      if (before_run) ASSERT_EQ(::write(fds[1], &byte, 1), 1);
+      std::thread writer{[&] {
+        if (before_run) return;
+        if (await([&] { return loop.running(); })) {
+          EXPECT_EQ(::write(fds[1], &byte, 1), 1);
+        }
+      }};
+
+      const MonotonicTime start = Poller::now();
+      loop.run_for(20s);  // Bound only; the handler exits.
+      const Duration elapsed = Poller::now() - start;
+      writer.join();
+      ::close(fds[0]);
+      ::close(fds[1]);
+
+      EXPECT_EQ(calls, 1);
+      EXPECT_EQ(ran_on, std::this_thread::get_id());
+      EXPECT_LT(elapsed, Duration{10s}) << "the wait ended at the run's end";
+      EXPECT_EQ(loop.activity().wakeups, 1u);
+      EXPECT_EQ(loop.activity().drains, 0u);
+    }
+  }
+}
+
+// A loop behind its timers never waits, so a stop it learned of only in a
+// wait would never land: a node whose update() overran its period would run
+// on until the launcher's SIGKILL. With a stop flag the run ends after the
+// dispatch during which the stop came (here the handler requests it, as a
+// signal landing mid-handler does), for a 1 ms timer whose handler takes
+// 2 ms, and for a burst of callback messages delivered by woken drains back
+// to back. Each handler exits at its 100th call, so a loop that ignored the
+// flag fails instead of hanging.
+// REQ-OPS-06
+TEST(RealtimeEventLoop, AStopFlagEndsTheRunAfterTheCurrentDispatch) {
+  constexpr int kStopAt = 3;
+  constexpr int kGiveUpAt = 100;
+  {
+    SCOPED_TRACE("overrunning timer");
+    std::atomic<bool> stop{false};
+    RealtimeEventLoop<>::Options options;
+    options.stop = &stop;
+    RealtimeEventLoop<> loop{options};
+    loop.set_delivery(Delivery::BEFORE_TIMERS);
+    int calls = 0;
+    auto handler = [&](const Context&) {
+      const MonotonicTime until = Poller::now() + 2ms;
+      while (Poller::now() < until) {
+      }
+      if (++calls == kStopAt) stop.store(true);
+      if (calls == kGiveUpAt) loop.exit();
+    };
+    const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
+    Timer<RealtimeEventLoop<>> timer{&loop, id};
+    timer.setup_periodic(Poller::now(), 1ms);
+    loop.run_for(20s);  // Bound only.
+    EXPECT_EQ(calls, kStopAt);
+    // At most the wait for the first deadline: never one once behind.
+    EXPECT_LE(loop.activity().wakeups, 1u);
+  }
+  {
+    SCOPED_TRACE("message burst");
+    constexpr int kBurst = 200;  // over max_messages_per_tick, under the ring
+    const std::string topic = "/tstop_" + std::to_string(::getpid());
+    std::atomic<bool> stop{false};
+    RealtimeEventLoop<>::Options options = on_publish();
+    options.stop = &stop;
+    RealtimeEventLoop<> loop{options};
+    int calls = 0;
+    auto on_message = [&](const Context&) {
+      if (++calls == kStopAt) stop.store(true);
+      if (calls == kGiveUpAt) loop.exit();
+    };
+    loop.set_prompt(
+        register_sensor_watcher(loop, topic, make_thunk(&on_message)));
+    SensorWriter writer{topic};
+    for (int i = 0; i < kBurst; ++i) ASSERT_TRUE(writer.publish(i));
+    loop.run_for(20s);  // Bound only.
+    EXPECT_EQ(calls, kStopAt);
   }
 }
 
@@ -555,6 +671,7 @@ TEST(RealtimeEventLoop, OnlyPollWakesBetweenTimersForAQuietTopic) {
 // With nothing but a prompt watcher and nobody publishing, the
 // loop sleeps for the whole run: a 1 ms poll would wake about 200 times.
 // REQ-RT-19
+// REQ-RT-21
 TEST(RealtimeEventLoop, OnPublishSleepsWhileNothingIsPublished) {
   RealtimeEventLoop<> loop{on_publish()};
   loop.set_prompt(
@@ -676,6 +793,52 @@ TEST(RealtimeEventLoop, AWakeStampsOnlyPromptMessagesWithTheirPublication) {
   EXPECT_GE(waited->event_time, woke->publish_time);  // the drain's time
   EXPECT_GE(waited->now, waited->event_time);
   EXPECT_EQ(loop.activity().drains, 1u);
+}
+
+// A drain that stops at the per-drain cap on a sequence watcher that is not
+// prompt (a node's Wake::kAtDrain callback) is followed at once by another,
+// without waiting for a wake or a timer: 100 waiting messages, woken by one
+// on a prompt topic, arrive 64 in that drain and 36 in the next, in order,
+// with no return from the poller in between. Left for the next timer or
+// wake instead, a topic faster than 64 per drain would fall further behind
+// at every drain until the ring overwrote it.
+// REQ-RT-02
+TEST(RealtimeEventLoop, ADrainCappedOnAQuietWatcherDrainsAgainAtOnce) {
+  constexpr int kWaiting = 100;  // over max_messages_per_tick, under the ring
+  const std::string pid = std::to_string(::getpid());
+  const std::string prompt = "/tcp_" + pid;
+  const std::string quiet = "/tcq_" + pid;
+  RealtimeEventLoop<> loop{on_publish()};
+  struct Heard {
+    std::int32_t value;
+    std::uint64_t drains;
+    std::uint64_t wakeups;
+  };
+  std::vector<Heard> heard;
+  auto on_quiet = [&](const Context&, std::span<const std::byte> bytes) {
+    const auto* message =
+        reinterpret_cast<const EventsTest::SensorMessage*>(bytes.data());
+    heard.push_back({message->sensor_id(), loop.activity().drains,
+                     loop.activity().wakeups});
+    if (heard.size() == static_cast<std::size_t>(kWaiting)) loop.exit();
+  };
+  loop.set_prompt(register_sensor_watcher(loop, prompt));
+  register_sensor_watcher(loop, quiet, make_thunk(&on_quiet));
+  SensorWriter quiet_writer{quiet};
+  SensorWriter prompt_writer{prompt};
+  for (int i = 0; i < kWaiting; ++i) ASSERT_TRUE(quiet_writer.publish(i));
+  ASSERT_TRUE(prompt_writer.publish(0));  // its failed arm drains the loop
+
+  loop.run_for(5s);  // Bound only; the quiet handler exits.
+
+  ASSERT_EQ(heard.size(), static_cast<std::size_t>(kWaiting))
+      << "the rest waited for a wake or a timer";
+  for (std::size_t i = 0; i < heard.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(heard[i].value, static_cast<std::int32_t>(i));
+    EXPECT_EQ(heard[i].drains, i < 64 ? 1u : 2u);
+    EXPECT_EQ(heard[i].wakeups, 0u);
+  }
 }
 
 // A message no notification announces (a publisher that died between

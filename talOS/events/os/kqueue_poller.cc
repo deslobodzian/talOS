@@ -154,6 +154,11 @@ void KqueuePoller::remove_fd(int fd) {
   ::kevent(kq_fd_, &kev, 1, nullptr, 0, nullptr);
 }
 
+bool KqueuePoller::reported_readable(int fd) const noexcept {
+  return std::find(readable_, readable_ + readable_count_, fd) !=
+         readable_ + readable_count_;
+}
+
 KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
   struct kevent events[kMaxEvents];
 
@@ -219,22 +224,30 @@ KqueuePoller::WakeReason KqueuePoller::wait_until(MonotonicTime deadline) {
   // event is the EVFILT_TIMER, or there is none because the timeout expired:
   // DEADLINE.
   bool woken = false;
+  bool timer_failed = false;
+  std::intptr_t timer_error = 0;
+  readable_count_ = 0;
   for (int i = 0; i < n; ++i) {
     if ((events[i].flags & EV_ERROR) != 0) {
       // Only the timer change can fail here: a finite deadline is the only
       // wait that passes a changelist (the infinite wait's EV_DELETE is a
-      // separate call). Returning DEADLINE for it would spin the caller's
-      // loop without ever waiting.
-      throw std::system_error(static_cast<int>(events[i].data),
-                              std::generic_category(),
-                              "kevent EV_ADD deadline timer");
-    }
-    if (events[i].filter == EVFILT_READ) {
-      return WakeReason::READABLE;
-    }
-    if (events[i].filter == EVFILT_USER) {
+      // separate call).
+      timer_failed = true;
+      timer_error = events[i].data;
+    } else if (events[i].filter == EVFILT_READ) {
+      readable_[readable_count_++] = static_cast<int>(events[i].ident);
+    } else if (events[i].filter == EVFILT_USER) {
       woken = true;
     }
+  }
+  if (readable_count_ > 0) return WakeReason::READABLE;
+  if (timer_failed) {
+    // Returning DEADLINE for it would spin the caller's loop without ever
+    // waiting. Behind a readable fd it surfaces on the next wait, which
+    // passes the same change again.
+    throw std::system_error(static_cast<int>(timer_error),
+                            std::generic_category(),
+                            "kevent EV_ADD deadline timer");
   }
   return woken ? WakeReason::WOKEN : WakeReason::DEADLINE;
 }

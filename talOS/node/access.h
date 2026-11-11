@@ -60,7 +60,8 @@ struct NodeSetup {
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
   // The session output directory the launcher started this node under (the
-  // parent of --log), or nullopt without --log (tests, --describe, replay).
+  // parent of --log), or nullopt without --log (tests) and in an offline run
+  // (--describe, --replay, --replay-inputs): Node::session_dir().
   std::optional<std::filesystem::path> session_dir;
 };
 
@@ -104,14 +105,16 @@ struct NodeAccess {
   // Read it only on the loop thread (after require_loop_thread).
   static bool in_update(const Node& node);
   // Some handler must see each message on subscription `subscription` as it
-  // arrives (a subscribe callback, a Driver Station listener), so its
-  // publications wake the node: start() marks its watcher prompt and picks
-  // Delivery::ON_PUBLISH. A node with a timer (update(), an after_update
-  // hook or every()) and no such subscription drains only right before its
-  // own timers (Delivery::BEFORE_TIMERS), which is all a node that reads
-  // latched values there needs; in a node with no timer every subscription
-  // wakes it regardless. Call before start(); throws std::out_of_range for
-  // an index add_subscription did not return.
+  // arrives (a subscribe callback with Wake::kOnPublish, a Driver Station
+  // listener), so its publications wake the node: start() marks its watcher
+  // prompt and picks Delivery::ON_PUBLISH. A callback subscription without
+  // it (Wake::kAtDrain, the devices layer's /hw/state) is a sequence watcher
+  // that waits for the next drain. A node with a timer (update(), an
+  // after_update hook or every()) and no such subscription drains only right
+  // before its own timers (Delivery::BEFORE_TIMERS), which is all a node
+  // that reads latched values there needs; in a node with no timer every
+  // subscription wakes it regardless. Call before start(); throws
+  // std::out_of_range for an index add_subscription did not return.
   static void require_immediate_delivery(Node& node, std::size_t subscription);
   // Index of the update() currently running, or of the next one between
   // ticks. State machines stamp transitions with it.

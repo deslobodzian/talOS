@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +15,6 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1032,10 +1032,24 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
 }
 
 // The declared graph from --graph, read on first use. Without the flag:
-// none yet under --describe (the launcher's first pass), and an error
-// otherwise, since a node that reads the graph cannot be built without one.
+// under --replay-inputs, the one the replayed session was launched with
+// (<session dir>/declared_graph.json, which the launcher writes into a
+// session that runs a graph reader); none yet under --describe (the
+// launcher's first pass); and an error otherwise, since a node that reads the
+// graph cannot be built without one.
 GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
-  if (flags.graph_path.empty()) {
+  std::string path = flags.graph_path;
+  std::string unreadable = "cannot read --graph " + path;
+  if (path.empty() && !flags.replay_inputs.empty()) {
+    path = (std::filesystem::path{flags.replay_inputs} / "declared_graph.json")
+               .string();
+    unreadable = std::string{node_name} +
+                 " reads the declared graph, and the replayed session has "
+                 "none: cannot read " +
+                 path +
+                 " (a session without a graph reader has none); pass --graph";
+  }
+  if (path.empty()) {
     if (flags.describe) return [] { return nullptr; };
     return [name = std::string{node_name}]() -> const DeclaredGraph* {
       throw std::runtime_error(
@@ -1045,10 +1059,11 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
     };
   }
   auto graph = std::make_shared<std::optional<DeclaredGraph>>();
-  return [graph, path = flags.graph_path]() -> const DeclaredGraph* {
+  return [graph, path = std::move(path),
+          unreadable = std::move(unreadable)]() -> const DeclaredGraph* {
     if (!graph->has_value()) {
       std::ifstream file{path};
-      if (!file) throw std::runtime_error("cannot read --graph " + path);
+      if (!file) throw std::runtime_error(unreadable);
       const std::string text{std::istreambuf_iterator<char>{file}, {}};
       DeclaredGraph parsed;
       std::string error;
@@ -1075,8 +1090,14 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
             const Flags& flags, const InstanceFactory& make) {
   Hosted hosted;
   hosted.port = std::move(port);
+  // An offline run has no session, even with --log (--replay-inputs always
+  // has one): state a node keeps per session or across restarts (the 2026
+  // autonomous node's selection and progress) must not be read or written by
+  // a replay or a probe.
+  const bool offline = flags.describe || !flags.replay_path.empty() ||
+                       !flags.replay_inputs.empty();
   std::optional<std::filesystem::path> session_dir;
-  if (flags.log_set) {
+  if (flags.log_set && !offline) {
     session_dir.emplace(std::filesystem::path{flags.log_path}.parent_path());
   }
   NodeSetup setup;
@@ -1293,13 +1314,26 @@ int RunMain(int argc, char** argv, const char* node_name,
     // stays blocked (the handlers restart it); the launcher's SIGKILL after its
     // grace bounds that.
     process::InstallStopHandlers();
+    const int stop_fd = process::StopFd();
+    if (stop_fd < 0) {
+      throw std::runtime_error(
+          std::string{node_name} +
+          ": cannot create the stop pipe: " + std::strerror(errno));
+    }
     // The launcher bounds each node's share of the session's log budget; at
     // the cap the log drops its oldest segments to keep the newest records
     // (LogWriterOptions::max_bytes) and `<log>.capped` marks it incomplete.
     event::log::LogWriterOptions log_options;
     log_options.max_bytes = flags.log_max_bytes;
-    event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
-        flags.log_path, node_name, log_options, flags.session_id}};
+    // The loop reads the stop flag between dispatches, so a stop takes effect
+    // after the current dispatch even when overdue timers never let it wait
+    // (an update() that overruns its period).
+    event::RealtimeEventLoop<event::log::LogWriter>::Options loop_options;
+    loop_options.stop = &process::stop_requested;
+    event::RealtimeEventLoop<event::log::LogWriter> loop{
+        event::log::LogWriter{flags.log_path, node_name, log_options,
+                              flags.session_id},
+        loop_options};
     // Keep the hosted node alive until the reporting thread has joined, while
     // publishing identity before any user constructor or backend
     // initialization.
@@ -1314,22 +1348,21 @@ int RunMain(int argc, char** argv, const char* node_name,
       std::printf("%s: stopped during construction\n", node_name);
       return 0;
     }
+    // A stop from here on also makes the stop pipe readable, which ends the
+    // loop's wait wherever it waits, and the loop exits from its own thread:
+    // no thread polls for a stop, so an idle node is woken only by its own
+    // timers and publications. A stop that lands before the run starts is
+    // seen by the run's first flag check.
+    loop.watch_fd(stop_fd, [&loop] {
+      if (process::ConsumeStopWake()) loop.exit();
+    });
     reporter.start(loop, ByteTopicSources(*hosted->node),
                    Endpoints(*hosted->node), Selections(*hosted->node));
 
-    std::jthread stopper{[&](const std::stop_token& stop) {
-      while (!stop.stop_requested()) {
-        if (process::stop_requested.load() && loop.running()) {
-          loop.exit();
-          return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{20});
-      }
-    }};
-    // Last, from this thread: the reporter and the stopper above are
-    // bookkeeping and must not inherit the loop's realtime policy. The row
-    // carries the outcome, where the launcher and session_report look for a
-    // loop that runs without its grant.
+    // Last, from this thread: the reporter is bookkeeping and must not
+    // inherit the loop's realtime policy. The row carries the outcome, where
+    // the launcher and session_report look for a loop that runs without its
+    // grant.
     process::RealtimeOutcome realtime{.tier =
                                           NodeAccess::loop_tier(*hosted->node)};
     if (process::RealtimeRequested(flags.simulation)) {
@@ -1342,7 +1375,6 @@ int RunMain(int argc, char** argv, const char* node_name,
     } else {
       loop.run();
     }
-    stopper.request_stop();
     std::printf("%s: dispatches=%llu recording_failed=%d recording_capped=%d\n",
                 node_name,
                 static_cast<unsigned long long>(loop.dispatch_count()),

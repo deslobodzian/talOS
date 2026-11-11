@@ -202,7 +202,8 @@ does not exist: no nodes running is an ordinary viewer startup state.
 The reporter claims its slot synchronously before user construction, setting
 `kFlagConstructing` in the existing atomic flags field (no layout change).
 `SlotState::ACTIVE` means the slot is owned; the lifecycle flag distinguishes
-construction from dispatching. A bookkeeping thread heartbeats identity only.
+construction from dispatching. A bookkeeping thread heartbeats identity only,
+every 10 ms while the node constructs, which the launcher bounds.
 `RegistryReader` includes these rows with `alive = false`, so Studio can show
 initialization without treating it as an active node.
 
@@ -213,15 +214,19 @@ publishes endpoints and clears the constructing flag only when the manifest
 and counters exist. The launcher bounds construction from process spawn;
 see [launcher supervision](../launcher/README.md#restarts).
 The reporter samples the heartbeat, source counters, selections and event log
-state every 250 ms. The dispatch count is not the reporter's: `start` attaches
-an `event::DispatchObserver` to the loop, and the loop thread stores the count
+state every 250 ms (`kRefreshPeriod`, a twentieth of `kLivenessTimeout`, the
+one deadline the heartbeat must meet once the loop runs), and while the loop
+runs that refresh is the reporting thread's only wake. The dispatch count is not the
+reporter's: `start` attaches an `event::DispatchObserver` to the loop, and the
+loop thread stores the count
 in the row at every dispatch, outside the sample sequence. It is the launcher's
 evidence of progress ([supervision](../launcher/README.md#restarts)), and the
 reporting thread runs below every realtime loop, so a loaded host can starve it
 for longer than the stall timeout while the loop keeps time. Source counters
 can lag the dispatch count until the next full sample.
-Short sleeps let a node which exits leave the viewer promptly; a final full
-sample preserves its last counters.
+It does not poll for the loop's end: the row stays until the reporter is
+destroyed, which `talos::Run` does as soon as its loop returns, and stopping it
+ends the refresh wait at once. A final full sample preserves the last counters.
 
 It must be constructed after the loop so that reverse destruction order joins
 the thread before the counters it samples are destroyed. `talos::Run`

@@ -95,10 +95,14 @@ can_id = 1
   // `omega_radps` is the rotation the drivetrain's modules measure.
   void PublishHeading(double yaw_rad, bool yaw_valid = true,
                       double omega_radps = 0) {
+    PublishState(yaw_rad, yaw_valid, omega_radps);
+    sim_.step(10ms);
+  }
+  // The same state, published now, without stepping.
+  void PublishState(double yaw_rad, bool yaw_valid, double omega_radps = 0) {
     const drivetrain::DrivetrainState state{
         0, true, true, yaw_valid, 0, 0, omega_radps, yaw_rad, {}, {}, {}, {}};
     sim_.publish(drivetrain::topics::kState, state);
-    sim_.step(10ms);
   }
   void Advance(talos::Duration d) { sim_.step(d); }
   // Envelopes written on /drivetrain/target/teleop so far.
@@ -261,6 +265,31 @@ TEST(Driver, HeadingWithinTimeoutStillRotatesTheFieldRelativeRequest) {
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
   EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+}
+
+// The drivetrain marks its yaw invalid on alternate 5 ms ticks: valid at
+// 5k+1 ms, invalid at 5k+3 ms, for 200 ms with the stick held forward.
+// Every driver drain (the 5 ms Driver Station packets and its ticks) lands
+// after an invalid state, so a read of only the newest state per drain never
+// refreshes the heading, which ages past heading_timeout_s (0.1 s) and drops
+// the driver out of the field frame mid-motion (translation held at zero).
+// Every valid state must refresh it: the request stays field-oriented.
+// REQ-RT-02
+TEST(Driver, EveryValidStateRefreshesTheHeadingBetweenInvalidOnes) {
+  Harness harness{kNoDeadbandFieldOriented};
+  harness.PublishHeading(kQuarterTurnRad);
+  harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
+  ASSERT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9);
+  for (int tick = 0; tick < 40; ++tick) {
+    harness.Advance(1ms);
+    harness.PublishState(kQuarterTurnRad, true);
+    harness.Advance(2ms);
+    harness.PublishState(0.0, false);
+    harness.Advance(2ms);
+  }
+  EXPECT_NEAR(harness.chassis().vx_mps(), 0.0, 1e-9);
+  EXPECT_NEAR(harness.chassis().vy_mps(), -kMaxLinear, 1e-9)
+      << "the driver left the field frame";
 }
 
 TEST(Driver, WithoutFreshFiniteHeadingRearmsRobotRelativeAtNeutral) {
@@ -476,6 +505,63 @@ TEST(Driver, HeldStickWaitsForNeutralInEveryNewModeGeneration) {
     harness.Push(held);
     EXPECT_DOUBLE_EQ(harness.chassis().vx_mps(), kMaxLinear);
   }
+}
+
+// The driver beside a plain subscription of its own node's: each drain of the
+// node delivers the probe, so the probe having a value means the node drained.
+struct ProbedDriver {
+  explicit ProbedDriver(talos::Node& node)
+      : driver{node},
+        probe{node.subscribe<drivetrain::ChassisTarget>("/test/probe")} {}
+  void update() { driver.update(); }
+  Driver driver;
+  talos::Subscription<drivetrain::ChassisTarget> probe;
+};
+
+// The drivetrain publishes every one of its ticks; the heading is needed only
+// when a Driver Station packet is mapped, so its publications must not wake
+// the driver, and the next packet must still use the newest heading. A 200 ms
+// driver period keeps the driver's own timer out of the window.
+// REQ-RT-19
+TEST(Driver, DrivetrainStateWakesNothingAndPacketsUseTheNewestHeading) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+
+[subsystems.driver]
+period_us = 200000
+deadband_frac = 0.0
+field_oriented = true
+)");
+  auto& probed = sim.add<ProbedDriver>("driver");
+  SimHardware hw{sim};
+  hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, 0, 0)));
+  sim.step(10ms);  // armed at neutral, robot-relative: no heading yet
+  hw.stop_driver_station();
+  sim.step(1ms);
+  sim.publish("/test/probe", drivetrain::ChassisTarget{});
+  for (const double yaw : {0.0, kQuarterTurnRad}) {
+    sim.publish(drivetrain::topics::kState,
+                drivetrain::DrivetrainState{
+                    0, true, true, true, 0, 0, 0, yaw, {}, {}, {}, {}});
+    sim.step(2ms);
+  }
+  EXPECT_FALSE(probed.probe.has_value())
+      << "a /drivetrain/state publication woke the driver";
+  // Full forward: in the driver frame latched at yaw 0, a quarter turn later.
+  hw.set_driver_station(DsState(kTeleopEnabled, Stick(0, -1, 0)));
+  sim.step(5ms);  // the next gateway tick forwards it
+  EXPECT_TRUE(probed.probe.has_value());
+  const auto lane =
+      LatestTarget<drivetrain::ChassisTarget>(sim, "drivetrain", "teleop");
+  ASSERT_TRUE(lane.has_value());
+  EXPECT_NE(lane->active, 0);
+  EXPECT_NEAR(lane->message.vx_mps(), 0.0, 1e-9);
+  EXPECT_NEAR(lane->message.vy_mps(), -kMaxLinear, 1e-9);
 }
 
 // --- the teleop chain on the real robot config ---------------------------

@@ -519,12 +519,15 @@ class PoseEstimator:
                              f"names, got {cameras!r}")
         self.relocalization_camera_count = min(2, len(set(cameras)))
         # One sequence-delivering subscription and queue per distinct camera.
+        # Only update() reads the queues, so the frames wait for the drain
+        # before it (AT_DRAIN) instead of waking the node one by one.
         self.pending = {}
         for camera in dict.fromkeys(cameras):
             queue = self.pending[camera] = collections.deque()
             node.subscribe(
                 PoseObservation, f"/{camera}/state", optional=True,
-                callback=lambda o, queue=queue: self.enqueue(queue, o))
+                callback=lambda o, queue=queue: self.enqueue(queue, o),
+                wake=talos.Wake.AT_DRAIN)
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.first_ns = None  # first integrated sample; None before it
         self.latest_ns = 0
@@ -546,8 +549,8 @@ class PoseEstimator:
         self.ds = talos.DriverStation(node)
 
     def enqueue(self, queue, o):
-        """Camera callback, every arrival in sequence: queue a measurement
-        for the next update()."""
+        """Camera callback, every arrival in sequence, at the drain before
+        the next update(): queue a measurement for it."""
         if not o.valid or o.tag_count < 1:
             return  # no measurement: neither fused nor counted
         if len(queue) >= MAX_PENDING_OBSERVATIONS:

@@ -44,6 +44,18 @@ the firings it produces, and those are recorded.
 
 `exit()` and `running()` are thread-safe; other API calls and lifecycle
 operations require external serialization. `exit()` is not a signal-handler API.
+What must reach a `RealtimeEventLoop` from outside the program, a signal
+above all, goes through `watch_fd(fd, handler)`, set before the run: a wait
+that finds `fd` readable runs the handler on the loop
+thread, outside any dispatch and unrecorded, and a readable `fd` alone drains
+nothing. The watch is level-triggered, so the handler reads `fd` empty or
+calls `exit()`. A loop behind its timers never waits, so a stop also needs
+`Options::stop`, a flag the loop reads before each timer, each message and
+each wait, exiting once it is true: one relaxed load per dispatch
+(`RealtimeEventLoop.AStopFlagEndsTheRunAfterTheCurrentDispatch`). A node
+stops with both: SIGINT and SIGTERM set `process::stop_requested`, its flag,
+and make `process::StopFd()` readable, whose handler calls `exit()`
+(`RealtimeEventLoop.AWatchedFdEndsTheWaitOnTheLoopThread`).
 Realtime and replay loop instances run once.
 
 ## The three loops
@@ -51,7 +63,7 @@ Realtime and replay loop instances run once.
 | Loop | Clock | Transport | Use |
 |---|---|---|---|
 | `RealtimeEventLoop` | OS monotonic clock via the poller | RTMS shared memory | On the robot |
-| `SimulatedEventLoop` | Virtual, jumps to the next deadline | In-memory channels | Deterministic tests |
+| `SimulatedEventLoop` | Virtual, jumps to the next deadline or prompt publication | In-memory channels | Deterministic tests |
 | `ReplayEventLoop` | Timestamps from the log | The log itself | Reproducing a run |
 
 `RealtimeEventLoop` waits on kqueue plus an absolute-deadline `EVFILT_TIMER`
@@ -132,8 +144,18 @@ design and keeps the drain's time
 Subscriptions without a per-message callback skip directly to the newest
 available value once per drain, counting skipped messages as dropped. Callback
 subscriptions retain sequence delivery with `max_messages_per_tick` (64 by
-default) bounding each drain. The node's internal storage callback does not
-turn a plain latest-value subscription into sequence delivery.
+default) bounding each drain. A drain that stops at that cap is followed at
+once by another, never by a wait: a prompt watcher's failed arm drains again
+under `ON_PUBLISH`, and under `BEFORE_TIMERS` and `ON_PUBLISH` a sequence
+watcher that is not prompt makes the loop drain again before it waits
+(`POLL`'s next tick drains it anyway). Each drain stays capped and due timers
+run between them, so a burst costs one drain per 64 messages per watcher, and
+a watcher fed faster than 64 per drain never falls behind by a batch per
+timer (`RealtimeEventLoop.ADrainCappedOnAQuietWatcherDrainsAgainAtOnce`).
+`SimulatedEventLoop` makes the loop due again at that instant
+(`next_deadline()`); such drains count toward `kMaxWokenDrainsPerInstant`.
+The node's internal storage callback does not turn a plain latest-value
+subscription into sequence delivery.
 
 A watcher whose reader slot another process frees (having judged this one dead)
 claims one again when a drain finds it gone, and at each later drain while none
@@ -148,11 +170,34 @@ and its own `now`, so a wake drain needs no new record kind and a replay,
 which takes both from the log, re-records it byte for byte
 (`RealtimeEventLoop.RealtimeRunReplaysForEveryDeliveryPolicy`).
 `SimulatedEventLoop` takes the same options and stamps messages at simulated
-send time; it has no wake channel, so under `ON_PUBLISH` it drains on its
-1 ms poll tick exactly as under `POLL`, an upper bound on when the realtime
-loop delivers. The node layer chooses delivery timing and which watchers are
-prompt: see `NodeAccess::require_immediate_delivery` in
-`talOS/node/access.h`.
+send time. Under `ON_PUBLISH` it has no wake channel and needs none: a prompt
+watcher's unread message is itself an event at its publication time, which
+`next_deadline()` reports and `run_until()` handles in time order. With no
+timer due by then, it is a wake drain as above (every watcher, in
+registration order; a prompt watcher's message stamped with its publication
+time, so `latency()` is 0), so a simulated callback runs at the instant of
+the publication and a watcher that is not prompt is drained only before a
+timer or by such a drain
+(`SimulatedEventLoop.OnPublishRunsAPromptHandlerAtThePublicationInstant`,
+`SimulatedEventLoop.OnPublishDrainsAQuietWatcherOnlyBeforeATimerOrWithAWake`).
+At one instant it runs every due timer first, as the realtime loop's timer
+pass does before it waits: a publication at a timer's deadline is delivered
+by that timer's drain, stamped with the deadline (the same instant), in one
+drain, and the timer's handler sees it
+(`SimulatedEventLoop.APublicationAtATimersDeadlineIsDeliveredByThatTimersDrain`).
+A message a handler publishes on a prompt watcher of the same loop drains at
+that instant too, the 64-message cap included (the rest is due again at
+once), and `run_until()` throws `std::runtime_error`, naming the topics,
+after `kMaxWokenDrainsPerInstant` (1000) such drains at one instant, a
+zero-time publish cycle that would never let time advance. Loops sharing an
+environment see each other's prompt publications through `next_deadline()`:
+a loop already run to an instant is due there again when another publishes
+to it at that instant (`talos::testing::Sim` runs it again). The node layer
+chooses delivery timing and which watchers are prompt: see
+`NodeAccess::require_immediate_delivery` in `talOS/node/access.h`. A
+`Node::subscribe` callback opened with `talos::Wake::kAtDrain` is a sequence
+watcher that is not prompt: its messages wait for a timer's drain or another
+watcher's wake, and a backlog over the cap drains again at once, as above.
 
 
 ## Recording and replaying

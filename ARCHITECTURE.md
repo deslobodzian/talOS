@@ -63,7 +63,7 @@ Beside the stack:
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s and `:tlog_to_wpilog` converts them to `.wpilog` |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
-| `talOS/process` | stop handlers, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
+| `talOS/process` | stop handlers and the stop pipe a node's loop watches, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |
 | `talOS/telemetry` | `:node` framework node, telemetry frame schema, byte-topic wire format; schema-less `/hw/state` is excluded because `/hw/status` (`bridge::BridgeStatus`) already reports link health. |
 | `talOS/teleop` | `:node` framework teleop node; `:deadband` stick deadband calculation; declarative button/axis-to-lane mapping |
@@ -118,8 +118,9 @@ a node that stops hearing its target goes neutral on its own.
 A node that stops sending requests goes neutral at the bridge once its last
 accepted request is older than its owner timeout,
 `max(2 × period_us, command_timeout_us / 2)` and never more than
-`command_timeout_us` (50 ms for every 2026-robot subsystem), checked on the
-bridge's 1 ms tick; a shorter gap, such as a late or missed tick, keeps its
+`command_timeout_us` (50 ms for every 2026-robot subsystem): the bridge,
+which otherwise sleeps until a gateway datagram or a request arrives, wakes
+for that instant. A shorter gap, such as a late or missed tick, keeps its
 last demand. Whatever the bridge does, the RoboRIO neutralizes it within
 `command_timeout_us` of the State its last request was built from (plus
 the RoboRIO loop's lateness; if that loop stalls, its
@@ -201,12 +202,16 @@ job.
 Messages reach a node when its loop drains its topics. Every node drains right
 before each of its own timers (`update()`, `every()`), so a timer sees what was
 published by its deadline whether or not the node has callbacks, and otherwise
-sleeps. A `subscribe` callback, or a Driver Station listener, makes that topic
-wake the node: its publisher notifies the sleeping loop, which drains every
-subscription at once. In a node with no timer every subscription wakes it.
+sleeps. A `subscribe` callback (`Wake::kOnPublish`, the default), or a Driver
+Station listener, makes that topic wake the node: its publisher notifies the
+sleeping loop, which drains every subscription at once. A callback opened with
+`Wake::kAtDrain` (`wake=talos.Wake.AT_DRAIN`) still receives every message in
+sequence but wakes nothing: its messages wait for the node's next drain, before
+a timer or on another topic's wake. In a node with no timer every subscription
+wakes it, `kAtDrain` included, since nothing else would drain it.
 While it waits on such a topic the loop also drains at least once a second, in
-case a publisher died before notifying. `testing::Sim` models a wake as a 1 ms
-drain.
+case a publisher died before notifying. `testing::Sim` models a wake as a
+drain at the publication's instant.
 Off-simulation the loop thread runs realtime, best effort, in one of three
 tiers the process picks itself: the bridge above control nodes (a node whose
 own subsystem owns a motor, digital or PWM output, or that writes a target
@@ -227,16 +232,22 @@ Messages become visible when the consumer drains its topics, but `age()` and
 message cannot revive it. Subscriptions without per-message callbacks dispatch
 only the newest available message, counting skipped messages as dropped;
 callback subscriptions retain sequence delivery, capped at 64 messages per
-topic per drain. Each realtime timer dispatch samples its own clock. Simulation
-and replay preserve publication-age semantics. Simulated topics retain RTMS's
+topic per drain; a drain that stops at the cap is followed at once by another,
+for a waking topic and a `kAtDrain` callback alike, with due timers between.
+Each realtime timer dispatch samples its own clock. Simulation and replay
+preserve publication-age semantics.
+Simulated topics retain RTMS's
 1024-slot overwrite window (1023 guaranteed readable messages), with identical
 latest-value skips and sequence-drop accounting. `testing::Sim::pause(name,
 duration)` stops one node's drains and timers while its clock and peers advance;
 `resume(name)` resumes early. Overdue periodic timers coalesce on their original
 phase, as after SIGSTOP/SIGCONT. Simulation dispatches nodes serially on one
 chronological frontier: each step runs every node's loop up to the earliest
-pending deadline of any of them, so no node sees a publication from its future,
-and at one instant nodes run in the order they were added. It does not model
+pending timer or waking publication of any of them, so no node sees a
+publication from its future, and at one instant nodes run in the order they
+were added, in rounds that repeat while a node is woken by a publication made
+there after it ran (bounded at 1000; a zero-time publish cycle fails the
+step). It does not model
 concurrent copies, torn reads, OS scheduling jitter, or the CPU cost of
 handlers.
 

@@ -137,6 +137,34 @@ TEST(PollerTest, WatchedFdReportsReadableThenDeadlineAfterDraining) {
   ::close(read_fd);
 }
 
+// A loop watching several fds (its wake receiver and the process's stop
+// pipe) acts on the one that woke it, and only that one: READABLE names it,
+// and the next wait's answer replaces the report.
+TEST(PollerTest, AReadableWakeNamesOnlyTheFdsThatWereReady) {
+  int ready[2];
+  int quiet[2];
+  ASSERT_EQ(::pipe(ready), 0);
+  ASSERT_EQ(::pipe(quiet), 0);
+  Poller poller;
+  poller.add_fd(ready[0]);
+  poller.add_fd(quiet[0]);
+  const char byte = 'x';
+  ASSERT_EQ(::write(ready[1], &byte, 1), 1);
+
+  EXPECT_EQ(poller.wait_until(Poller::now() + 5 * kSecond),
+            Poller::WakeReason::READABLE);
+  EXPECT_TRUE(poller.reported_readable(ready[0]));
+  EXPECT_FALSE(poller.reported_readable(quiet[0]));
+
+  char buf;
+  ASSERT_EQ(::read(ready[0], &buf, 1), 1);
+  EXPECT_EQ(poller.wait_until(Poller::now() + kMillisecond),
+            Poller::WakeReason::DEADLINE);
+  EXPECT_FALSE(poller.reported_readable(ready[0]));
+
+  for (const int fd : {ready[0], ready[1], quiet[0], quiet[1]}) ::close(fd);
+}
+
 TEST(PollerTest, RemoveFdStopsItFromWakingThePoller) {
   int fds[2];
   ASSERT_EQ(::pipe(fds), 0);

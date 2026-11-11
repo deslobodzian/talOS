@@ -12,12 +12,13 @@ the constructor; `update()` runs every period.
 | C++ (`talos::Node& node`) | Python (`node`) | |
 |---|---|---|
 | `node.subscribe<M>(topic, {.optional = true})` | `node.subscribe(M, topic, optional=True)` | latest value; optional callback argument |
+| `node.subscribe<M>(topic, fn, talos::Wake::kAtDrain)` | `node.subscribe(M, topic, callback=fn, wake=talos.Wake.AT_DRAIN)` | every message to the callback, in sequence, at the node's next drain; wakes nothing ([when messages arrive](#when-messages-arrive)) |
 | `node.publish<M>(topic)` | `node.publish(M, topic)` | |
 | `node.param<T>("key")`, `param<T>("key", fallback)` | `node.param("key")`, `param("key", fallback)` | this subsystem's TOML keys; dotted keys reach nested tables and an index reaches an array element (`"geometry.modules[0].x_m"`; past the end is absent). `T`: `bool`, integers, `double`, `std::string`, and TOML arrays as `std::vector<std::string>` / `std::vector<double>` (integer elements convert; `[]` is valid). Python returns arrays as `list[str]` / `list[float]`; a list default asks for an array. A wrong element type is an error naming the key and element index |
 | `node.param_of<T>("sub", "key")`, `param_of<T>("sub", "key", fallback)` | `node.param_of("sub", "key")`, `param_of("sub", "key", fallback)` | the same, read-only, from another subsystem's table (`[subsystems.<sub>]`), for a value that subsystem owns so it is configured once (the pose estimator reads the drivetrain's module offsets). Constructor only: later it throws `std::logic_error` (`TalosError`). A subsystem the config lacks is an error even with a fallback, so the node fails construction and its launcher `--describe` probe |
 | `node.every(period, fn)` | `node.every(seconds, fn)` | extra timer |
 | `name()`, `now()`, `tick()`, `period()`, `simulation()`, `config_path()` | same, as properties (seconds) | |
-| `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests, `--describe`, `--replay`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/` |
+| `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests) and in every offline run, `--log` or not (`--describe`, `--replay`, `--replay-inputs`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/`; state a node keeps per session or across restarts (the 2026 autonomous node's selection and progress) is gated on it, so a replay never reads or writes the robot's copy |
 | `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (the pose estimator imports neither wpimath nor gtsam then). Validate every parameter and declare every subscription and publication either way: the endpoints must be identical, since the launcher builds the graph from the probe, and it [compares each run's live endpoints with the probe](../talOS/launcher/README.md#live-endpoints) and refuses a run that differs |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
@@ -78,6 +79,35 @@ anywhere on the loop thread.
 See [Architecture: Targets](../ARCHITECTURE.md#targets) for drain scheduling
 and publication-age semantics.
 
+Each subscription picks what a publication on it costs and what the node
+sees:
+
+- A **waking callback** (`subscribe(topic, fn)`: `Wake::kOnPublish`, the
+  default) runs as each message arrives, in sequence, and each publication
+  wakes the node (a context switch). Use it only for a handler that must act
+  at once, such as a Driver Station listener.
+- An **at-drain callback** (`subscribe(topic, fn, talos::Wake::kAtDrain)`;
+  Python `wake=talos.Wake.AT_DRAIN`) also gets every message in sequence but
+  wakes nothing: the messages wait for the node's next drain, right before
+  its next timer or on another topic's wake. Use it when the node needs every
+  message (an invalid one between valid ones must not hide them) but acts on
+  them only at its tick or next packet. A backlog over the 64-per-drain cap
+  is drained in further batches at once, as for a waking callback; only more
+  than 1023 unread between two drains are lost (counted as dropped). The
+  `driver` takes `/drivetrain/state` headings this way: the
+  drivetrain's 5 ms ticks never wake it, and an invalid state cannot hide the
+  valid one before it. The pose estimator queues its camera frames this way
+  for `update()` to fuse.
+- A **latest-value read** (`subscribe(topic)`, no callback) keeps only the
+  newest message per drain: for a value read at the tick whose intermediate
+  values do not matter.
+
+In each, `age()` counts from publication, not delivery, also inside a
+callback. A drain delivers in registration order, so a listener sees, in the
+same drain, the messages of the subscriptions opened before it: open those
+first (the `driver` opens `/drivetrain/state` before its Driver Station
+link, so a packet is mapped with the headings delivered in its drain).
+
 ### Realtime scheduling
 
 On the robot (not `--sim`, `--describe` or `--replay`) a node binary runs its
@@ -92,19 +122,21 @@ lane (`driver`, `teleop`, `auto`), is a control node; every other node
   for observers, so a runnable loop preempts every loop of a lower tier. All
   are below the `SCHED_FIFO` 50 PREEMPT_RT gives threaded interrupt handlers
   (among them the NIC's, which carries the RoboRIO's packets), so no loop
-  holds off an interrupt. A node's tick waits in `epoll_pwait2` and the
-  bridge's in `clock_nanosleep`, sleeper timers that PREEMPT_RT expires in
-  hard interrupt context for a realtime thread, so the woken loop runs by its
-  tier. On a kernel before 5.11 the node's tick falls back to a timerfd
+  holds off an interrupt. A node's tick, and the bridge between its inputs,
+  waits in `epoll_pwait2`, a sleeper timer that PREEMPT_RT expires in hard
+  interrupt context for a realtime thread, so the woken loop runs by its
+  tier. On a kernel before 5.11 that wait falls back to a timerfd
   ([talOS/events](../talOS/events/README.md)), which PREEMPT_RT expires in
   `ktimers/N` at `SCHED_FIFO` 1 (`ksoftirqd`, `SCHED_OTHER`, on some older
-  RT kernels), so there a control node's tick can wait until whatever loop
-  holds that CPU, an observer included, sleeps. On a kernel without
+  RT kernels), so there a control node's tick, or the bridge's next
+  time-driven duty, can wait until whatever loop holds that CPU, an observer
+  included, sleeps. On a kernel without
   PREEMPT_RT timers expire in hard interrupt context, but softirq work
   deferred to `ksoftirqd` (`SCHED_OTHER`), such as network receive under
   load, waits behind every loop on that CPU (TODO.md RT-4).
 - macOS: the bridge and control nodes run under the Mach time-constraint
-  policy for their period (computation half of it, constraint all of it);
+  policy for their period (the bridge, which has none, for 1 ms after each
+  wakeup; computation half of it, constraint all of it);
   observers run timeshare at `QOS_CLASS_USER_INTERACTIVE`, below every
   time-constraint thread and above helper threads. The public time-constraint
   policy has no priority (the variant with one is private, and refused
@@ -168,7 +200,12 @@ call: start none whose work is unbounded.
 ### Stopping
 
 Once `talos::Run` / `talos.run` starts a live node, SIGINT or SIGTERM stops it
-cleanly. A stop received while the constructor runs is held until the
+cleanly, after the current dispatch, or at once when the loop is asleep: the
+loop reads the stop flag between dispatches (so an `update()` that overruns
+its period still stops after it returns), and the signal makes the process's
+stop pipe (`process::StopFd()`) readable, which ends a wait wherever it
+waits. The loop exits from its own thread; no thread polls for a stop. A stop
+received while the constructor runs is held until the
 constructor returns; the binary then exits 0 without running its loop. A
 constructor blocked in a restartable system call keeps blocking (the call
 restarts), so the launcher's SIGKILL after its stop grace is what ends one that
