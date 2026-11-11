@@ -144,6 +144,8 @@ numbered section, a number in RULES a rule:
 | REQ-RT-17 | Node code takes time only from `node.now()` (no `steady_clock`, `time.time()`, sleeps) and makes no random decisions, so Sim and replay match the robot. | P1 | METH §9 | source scan | contract (gap: TODO LINT-1) |
 | REQ-RT-18 | Observation never perturbs control: registry fields are lock-free atomics, readers take no lock, writers touch only their own slot, and the launcher's stall evidence is the dispatch count the loop thread stores itself, never the reporter's heartbeat. | P1 | IR "Observing must not perturb"; LR "Restarts" | `static_assert`s; no stall kill while the reporter is starved | unit + integration |
 | REQ-RT-19 | Wake on publish: a prompt subscription's handler (a `subscribe` callback, a Driver Station listener) is run by a drain its publication wakes, with `latency()` counted from the publication; a publication with no armed reader makes no system call; and delivery never depends on a wake: a drain precedes every timer, a loop waiting on a prompt topic drains at least once per `wake_backstop`, a stalled arm cannot make it spin, a loop that cannot build its wake receiver falls back to polling, and a notification lost other than to a gone receiver is counted (`wake_failures`). | P1 | ARCH "Targets"; ER "The three loops"; RTMS "Wake channel" | `activity()` wakeups, drains, `stalled_arms`, `wake_fallbacks`; `wakes_sent()`, `wake_failures()`; `Context::event_time` | component |
+| REQ-RT-20 | The hardware bridge sleeps between inputs. It acts on a gateway datagram or a `/hw/request/<node>` publication when it arrives, never more than 1 ms later even under a flood; it runs each time-driven duty (clock probe and exchange, `/hw/status`, heartbeat, owner timeout) no later than its instant; it spends at most 8 passes and 64 received datagrams per millisecond whatever arrives; and it polls its inputs every 1 ms when it cannot wait on them. | P1 | ARCH "The tick"; DF "Link rates and endpoints" | `wakeups()` counts (deadline, throttled, fallbacks); time from arrival to command or State | component |
+| REQ-RT-21 | An idle node wakes only for its own timers, the publications it must act on (its prompt subscriptions and their 1 s backstop), its registry refresh every 250 ms and its event-log sync; no helper thread polls. | P1 | NDG "Stopping"; ER "The three loops"; IR | reporter `wakeups()`; loop `activity()` wakeups over an idle run | component |
 
 ### OPS: launcher supervision, restarts, sessions, logs/replay, observability
 
@@ -154,7 +156,7 @@ numbered section, a number in RULES a rule:
 | REQ-OPS-03 | Every declared topic is created as a session-owned segment (schema, hash, alignment, slots) before any node spawns and unlinked at session end. | P1 | ARCH "Topics and messages"; LR "Session segments and logs" | `/dev/shm` contents | integration |
 | REQ-OPS-04 | A non-critical member restarts at most `max_restarts` times per rolling window, then is quarantined with exactly one later retry; its clean exit is not restarted; nothing restarts once a stop has begun. | P1 | LR "Restarts" | manifest `quarantined`, `retry_at_monotonic_ns` | unit + integration |
 | REQ-OPS-05 | A registered node whose dispatch count stops advancing for its heartbeat timeout is killed and restarted, a process with no registry row is killed after the startup grace, and construction past the construction deadline is killed (LR "Restarts"). | P1 | LR "Restarts"; ARCH "Layers" | `runs[].reason` `stalled` / `heartbeat_missing` / `construction_deadline` | integration |
-| REQ-OPS-06 | SIGINT/SIGTERM stops a live node cleanly; a stop during construction is held until the constructor returns and the binary exits 0; a member still alive after the stop timeout is SIGKILLed. | P1 | NDG "Stopping"; LR "Session manifest" | exit status; reason | integration |
+| REQ-OPS-06 | SIGINT/SIGTERM stops a live node cleanly, after the current dispatch or at once when its loop is asleep, however far the loop is behind its timers; a stop during construction is held until the constructor returns and the binary exits 0; a member still alive after the stop timeout is SIGKILLed. | P1 | NDG "Stopping"; LR "Session manifest" | exit status; reason | integration |
 | REQ-OPS-07 | With `NOTIFY_SOCKET` set the launcher sends `READY=1` on entering supervision and `WATCHDOG=1` every loop iteration, and that loop waits on no lock a node can hold and never on disk. | P1 | LR "Restarts"; DEP "Supervision and service recovery" | datagrams on a test socket | integration |
 | REQ-OPS-08 | `manifest.json` is written before spawn and replaced atomically at each lifecycle change by a writer thread, never the supervision loop, durably synced, with the per-node fields LR lists. | P1 | LR "Session manifest", "Session segments and logs" | manifest JSON | integration |
 | REQ-OPS-09 | Each run writes its own `.tlog` (`<name>.tlog`, `<name>.restart<k>.tlog`) within its share of `log_max_bytes`, a restart keeps at least half its member's share, and a capped log keeps its tail in rotating whole segments. | P1 | LR "Restarts", "Session segments and logs"; DF "Dispatch logs" | files; manifest `log_capped` | component |
@@ -201,17 +203,17 @@ serves none is listed as such with the TODO.md item that settles it
 | Package | Serves |
 |---|---|
 | `talOS/rtms`, `talOS/memory`, `talOS/ipc` | REQ-SAFE-08, REQ-CONTRACT-07, REQ-CONTRACT-21, REQ-CONTRACT-22, REQ-RT-12, REQ-RT-19, REQ-OPS-03 |
-| `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-RT-19, REQ-CONTRACT-20, REQ-OPS-12 to REQ-OPS-14 |
-| `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-RT-19, REQ-DEV-08 |
+| `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-RT-19, REQ-RT-21, REQ-CONTRACT-20, REQ-OPS-12 to REQ-OPS-14 |
+| `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-RT-19, REQ-RT-21, REQ-DEV-08 |
 | `talOS/devices` | REQ-SAFE-01 to REQ-SAFE-09, REQ-SAFE-12, REQ-SAFE-13, REQ-CONTRACT-23, REQ-DEV-07 |
-| `talOS/bridge` | REQ-SAFE-11, REQ-SAFE-15, REQ-SAFE-16, REQ-SAFE-19, REQ-CONTRACT-04, REQ-RT-13, REQ-OPS-20, REQ-OPS-21 |
+| `talOS/bridge` | REQ-SAFE-11, REQ-SAFE-15, REQ-SAFE-16, REQ-SAFE-19, REQ-CONTRACT-04, REQ-RT-13, REQ-RT-20, REQ-OPS-20, REQ-OPS-21 |
 | `talOS/hardware` | REQ-SAFE-17 to REQ-SAFE-24, REQ-CONTRACT-02, REQ-CONTRACT-05, REQ-CONTRACT-06, REQ-CONTRACT-30, REQ-DEV-10 |
 | `talOS/protocol` | REQ-CONTRACT-01, REQ-CONTRACT-03 |
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-CONTRACT-10, REQ-CONTRACT-17 |
 | `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-DEV-04 |
-| `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-RT-18, REQ-OPS-17, REQ-OPS-18 |
-| `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-OPS-06, REQ-OPS-12 |
+| `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18 |
+| `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09 |
 | `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09 |
 | `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27 |

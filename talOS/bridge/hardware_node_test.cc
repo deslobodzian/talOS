@@ -1067,6 +1067,7 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_TRUE(later.configured());
 }
 
+// REQ-RT-20
 TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -1311,6 +1312,7 @@ TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
 // 1 us after a status, so no duty shares another's instant: the answered
 // probe's successor is due 20 ms after it, not with the next status.
 // REQ-SAFE-15
+// REQ-RT-20
 TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const uint16_t roller = cfg.subsystems.at("intake").motors[0];
@@ -1407,6 +1409,7 @@ TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
 // then the loop sleeps through input to the end of the window, and drains
 // the rest after it. The old 1 ms poll took 32 datagrams a millisecond;
 // this takes at most kDatagramBudget plus the one pass that crosses it.
+// REQ-RT-20
 TEST(HardwareNodeTest, PassDrainsABacklogWithinItsCpuBudget) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -1471,6 +1474,7 @@ TEST(HardwareNodeTest, PassDrainsABacklogWithinItsCpuBudget) {
 // late. The windows start mid-way between statuses, so a status falls in a
 // window's sleep and must end it.
 // REQ-SAFE-15
+// REQ-RT-20
 TEST(HardwareNodeTest, AFloodOfRequestsIsHeldToThePassBudget) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const uint16_t roller = cfg.subsystems.at("intake").motors[0];
@@ -1550,6 +1554,7 @@ WakeReceiver NoDescriptorsLeft() {
 // runs: it says so on stderr, counts it, and polls its inputs every kRetryUs
 // where it would otherwise sleep until its next duty (here the registry's
 // liveness sample, 10 ms on).
+// REQ-RT-20
 TEST(HardwareNodeTest, WithoutAWakeReceiverTheBridgePollsItsInputs) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -1578,6 +1583,7 @@ bool NeverCaughtUp(ipc::Subscriber<Packet>& /*subscriber*/) { return false; }
 // An arm that keeps reporting unread data no read returns (a read the
 // writer keeps tearing) holds the loop awake for kMaxIdlePasses passes, then
 // the loop waits for its next duty anyway: it cannot spin.
+// REQ-RT-20
 TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;

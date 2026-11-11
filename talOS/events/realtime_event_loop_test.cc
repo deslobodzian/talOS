@@ -277,6 +277,7 @@ TEST(RealtimeEventLoop, ExitFromAnotherThreadReturnsPromptly) {
 // ends its one wait before the run's 20 s end; and the fd is no publication,
 // so nothing drains.
 // REQ-OPS-06
+// REQ-RT-21
 TEST(RealtimeEventLoop, AWatchedFdEndsTheWaitOnTheLoopThread) {
   int index = 0;
   for (const auto delivery : {Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
@@ -669,6 +670,7 @@ TEST(RealtimeEventLoop, OnlyPollWakesBetweenTimersForAQuietTopic) {
 // With nothing but a prompt watcher and nobody publishing, the
 // loop sleeps for the whole run: a 1 ms poll would wake about 200 times.
 // REQ-RT-19
+// REQ-RT-21
 TEST(RealtimeEventLoop, OnPublishSleepsWhileNothingIsPublished) {
   RealtimeEventLoop<> loop{on_publish()};
   loop.set_prompt(
