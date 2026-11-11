@@ -47,11 +47,12 @@ void RollerWithSensor::update() {
   const bool live = requested_ && request_tick_ == node_->tick() && enabled;
   const RollerCommand command = live ? request_ : RollerCommand::kIdle;
   requested_ = false;
-  // "Newly asked" compares live requests only: a stale spell, a release or
-  // a disable between two asks of the same command is not a new ask, so a
-  // held eject runs once.
+  // A tick with no live request counts as kIdle, so a release or a stale
+  // lane ends an ask: press, release, press is two asks, a held button one.
+  // Refusing a press held through a disable or a stale spell is the
+  // producer's talos::OperatorArming.
   const bool newly_asked = live && command != last_command_;
-  if (live) last_command_ = command;
+  last_command_ = command;
 
   sensor_connected_ = sensor_.connected();
   has_piece_ = piece_debounce_.update(sensor_.get() != sensor_inverted_, now);

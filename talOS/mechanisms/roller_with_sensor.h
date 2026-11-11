@@ -18,9 +18,9 @@
 //   phase      roller    leaves on
 //   kIdle      neutral   kIntake -> kIntaking; with idle_runs, a newly asked
 //                        kEject or kFeed -> kEjecting / kFeeding: one that
-//                        differs from the last live request, so holding the
-//                        command, or asking it again after a stale spell,
-//                        release or disable, runs it once
+//                        differs from the last tick's request (no live
+//                        request counts as kIdle), so a held command runs
+//                        once and press, release, press runs twice
 //   kIntaking  intake_v  piece -> kHolding; kIdle -> kIdle; kEject, kFeed
 //   kHolding   hold_v    kEject, kFeed; piece gone -> kIdle
 //   kEjecting  eject_v   after eject_us -> kIdle

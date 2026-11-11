@@ -343,8 +343,7 @@ class PhysicsSimBackend final : public Backend {
       out.position_rot = mech_pos;
       out.velocity_rps = mech_vel;
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
-      // Placeholder current proportional to effort; not a winding model.
-      out.stator_current_a = std::abs(out.voltage) / 12.0 * m.stator_limit_a;
+      out.stator_current_a = StatorCurrent(i, m);
       // Placeholder supply current proportional to effort and constant
       // ambient temperature; not electrical or thermal models.
       out.supply_current_a = std::abs(out.voltage) / 12.0 * m.supply_limit_a;
@@ -769,6 +768,25 @@ class PhysicsSimBackend final : public Backend {
     if (reverse_pressed_[i] && m.reverse_limit_switch != LimitSwitch::kDisabled)
       flags |= kMotorReverseHardLimitFlag;
     return flags;
+  }
+
+  // Stator current from the winding's net voltage: the applied volts less
+  // the back-EMF of the rotor's speed (supply volts at the motor's free
+  // speed), scaled so a stalled rotor at 12 V draws stator_limit_a and
+  // clamped to it. It peaks at stall and falls toward 0 at free speed, so a
+  // mechanism pushed against a stop reads loaded and one spinning freely
+  // does not. 0 while unpowered (no braking current is modelled).
+  double StatorCurrent(std::size_t i, const MotorConfig& m) const {
+    if (!powered_[i]) return 0.0;
+    const MotorModel motor{};
+    const double supply = supply_v_ > 0.0 ? supply_v_ : 12.0;
+    const double free_rotor = motor.free_speed_rps_at_12v * (supply / 12.0);
+    const double back_emf_v =
+        free_rotor > 0.0 ? supply * axes_[i].rotor_velocity_rps / free_rotor
+                         : 0.0;
+    const double net_v = Direction(i) * applied_volts_[i] - back_emf_v;
+    return std::min(m.stator_limit_a,
+                    std::abs(net_v) / 12.0 * m.stator_limit_a);
   }
 
   bool FeedbackValid(std::size_t i) const {

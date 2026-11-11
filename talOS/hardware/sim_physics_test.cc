@@ -242,6 +242,28 @@ TEST(SimHealth, PowerVisibleWhileDisabledAndStale) {
   CheckPowerHealth<PhysicsSimBackend>();
 }
 
+// Stator current follows the winding's net voltage: a rotor that has not yet
+// moved draws the most (a mechanism pushed against a stop reads loaded),
+// and one near free speed for its voltage draws almost none.
+TEST(SimMotorDiagnostics, StatorCurrentPeaksAtStallAndFallsWithSpeed) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].stator_limit_a = 80.0;
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 6.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  // One 5 ms step from rest: barely moving, near the 40 A of 6 V at stall.
+  StepBackend(backend, s, now_us, 5000, 2);
+  EXPECT_GT(s.motors[0].stator_current_a, 24.0);
+  EXPECT_LE(s.motors[0].stator_current_a, 40.0);
+  StepBackend(backend, s, now_us, 5000, 400);  // 2 s: near free speed
+  EXPECT_LT(s.motors[0].stator_current_a, 4.0);
+  EXPECT_GT(s.motors[0].velocity_rps, 0.0);
+}
+
 // Voltage ramps the mechanism rather than snapping it to demand; position
 // integrates velocity.
 TEST(SimBelievability, VoltageRampsMechanismAndPositionIntegrates) {

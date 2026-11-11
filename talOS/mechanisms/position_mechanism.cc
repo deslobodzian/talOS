@@ -123,20 +123,51 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
   }
   if (homing_ == Homing::kStall) {
     homing_stall_current_a_ = params.positive("homing_stall_current_a");
+    // The controller limits stator current to stator_limit_a, so a
+    // threshold at or above it could never be reached: homing never homes.
+    if (homing_stall_current_a_ >= motor.stator_limit_a) {
+      params.fail("homing_stall_current_a",
+                  "must be below the motor's stator_limit_a (" +
+                      std::to_string(motor.stator_limit_a) + " A)");
+    }
     homing_min_push_ = PositiveMicros(params, "homing_min_push_us");
+    homing_min_travel_rot_ = params.positive("homing_min_travel_rot");
+    if (homing_min_travel_rot_ >= max_rot_ - min_rot_) {
+      params.fail("homing_min_travel_rot",
+                  "must be less than the travel, max_rot - min_rot");
+    }
+    // A stop found no sooner than the minimum push plus the still time
+    // must leave time before the timeout faults.
+    if (homing_min_push_ + homing_stall_time_ >= homing_timeout_) {
+      params.fail("homing_timeout_us",
+                  "must exceed homing_min_push_us + homing_stall_us");
+    }
   }
   if (homing_ == Homing::kAbsolute) {
     absolute_.emplace(node, params.get<std::string>("absolute_sensor"));
     absolute_rot_per_sensor_rot_ =
         params.number("absolute_rot_per_sensor_rot", 1.0);
-    // One sensor rotation must cover the travel, or the boot reading names
-    // more than one position.
-    if (max_rot_ - min_rot_ > std::abs(absolute_rot_per_sensor_rot_)) {
-      params.fail("absolute_rot_per_sensor_rot",
-                  "must be at least max_rot - min_rot in magnitude: one "
-                  "sensor rotation has to cover the travel");
-    }
     absolute_offset_rot_ = params.number("absolute_offset_rot", 0.0);
+    // The CANcoder reads absolute position in [-0.5, 0.5) rotations (the
+    // RoboRIO sets its discontinuity at 0.5), so the frame can name only
+    // positions in the one sensor rotation around absolute_offset_rot. The
+    // whole travel must lie inside it, or a reading past the discontinuity
+    // names a position a rotation away.
+    const double half_rot = 0.5 * std::abs(absolute_rot_per_sensor_rot_);
+    const double low = absolute_offset_rot_ - half_rot;
+    const double high = absolute_offset_rot_ + half_rot;
+    // Reading -0.5 maps to the low end for a positive ratio, to the high end
+    // for a negative one; the other end is never read.
+    const bool inside = absolute_rot_per_sensor_rot_ > 0
+                            ? min_rot_ >= low && max_rot_ < high
+                            : min_rot_ > low && max_rot_ <= high;
+    if (!inside) {
+      params.fail("absolute_offset_rot",
+                  "with absolute_rot_per_sensor_rot maps sensor readings in "
+                  "[-0.5, 0.5) to (" +
+                      std::to_string(low) + ", " + std::to_string(high) +
+                      "); the travel min_rot..max_rot must lie inside it");
+    }
   }
 
   stall_velocity_rps_ = params.number("stall_velocity_rps", 0.05);
@@ -269,22 +300,28 @@ void PositionMechanism::update() {
 // faulted.
 bool PositionMechanism::home(Time now) {
   if (!homing_since_) homing_since_ = now;
-  if (!push_since_) push_since_ = now;
+  if (!push_since_) {
+    push_since_ = now;
+    push_start_rot_ = position_rot_;
+  }
   // The timeout faults, and never homes, whatever else this tick shows.
   if (now - *homing_since_ >= homing_timeout_) {
     fault(PositionFault::kHomingTimeout);
     return true;
   }
   const bool slow = std::abs(velocity_rps_) < homing_stall_rps_;
-  if (!slow) homing_moved_ = true;
   bool still_counts = slow;
   if (homing_ == Homing::kStall) {
-    // A stop is stillness under load, after the push has had the chance to
-    // move the mechanism: it moved, or it has pushed for homing_min_push_us
-    // (a mechanism that starts slowly is not yet at its stop).
+    // A stop is stillness under load once this push has had the chance to
+    // move the mechanism: it has travelled homing_min_travel_rot since the
+    // push began, or the push has lasted homing_min_push_us (a mechanism
+    // that starts slowly is not yet at its stop). Motion from an earlier,
+    // interrupted push does not count.
+    const bool moved =
+        std::abs(position_rot_ - push_start_rot_) >= homing_min_travel_rot_;
     still_counts = slow &&
                    std::abs(motor_.current()) >= homing_stall_current_a_ &&
-                   (homing_moved_ || now - *push_since_ >= homing_min_push_);
+                   (moved || now - *push_since_ >= homing_min_push_);
   }
   if (!still_counts) {
     homing_still_since_.reset();
@@ -313,7 +350,6 @@ void PositionMechanism::reset_homing_run() {
   homing_since_.reset();
   push_since_.reset();
   homing_still_since_.reset();
-  homing_moved_ = false;
 }
 
 void PositionMechanism::drive_goal(Request request, double request_rot,
