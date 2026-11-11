@@ -211,6 +211,28 @@ class SyncManifestTest(unittest.TestCase):
         with open(manifest, encoding="utf-8") as f:
             self.assertEqual(f.read(), original)
 
+    # REQ-CONTRACT-19: a [trajectories] file is a config dependency, so the
+    # bundle ships it and a manifest that omits it is stale.
+    def test_trajectory_file_is_listed_and_its_omission_is_stale(self):
+        sync_manifest.write(self.root, "bot/robot.toml")
+        put(self.root, "bot/trajectories/taxi.traj", "{}\n")
+        put(self.root, "bot/subsystems/intake.toml",
+            '[subsystem]\nname = "intake"\nnode = "//bot/intake:node"\n'
+            '[trajectories]\ntaxi = "../trajectories/taxi.traj"\n')
+        with mock.patch.dict(os.environ,
+                             {"BUILD_WORKSPACE_DIRECTORY": self.root}):
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors):
+                self.assertEqual(
+                    sync_manifest.main(["--check", "bot/robot.toml"]), 1)
+            self.assertIn("bot/trajectories/taxi.traj", errors.getvalue())
+            self.assertIn(sync_manifest.COMMAND, errors.getvalue())
+            sync_manifest.write(self.root, "bot/robot.toml")
+            with open(os.path.join(self.root, "bot/robot_manifest.bzl"),
+                      encoding="utf-8") as f:
+                self.assertIn('    "//bot:trajectories/taxi.traj",\n', f.read())
+            self.assertEqual(sync_manifest.main(["--check", "bot/robot.toml"]), 0)
+
 
 
     def test_refuses_paths_without_labels(self):

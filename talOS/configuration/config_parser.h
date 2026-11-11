@@ -16,6 +16,10 @@
 // uniqueness, and exclusive ownership are enforced by hardware::Validate; the
 // parser only checks what Validate cannot see (types, names, references, and
 // each actuator owner's period_us against command_timeout_us).
+//
+// A subsystem's [trajectories] table names data files (name = "path",
+// relative to the file that sets it); config load requires each to exist,
+// and the build lists each in the config's CONFIG_FILES (resolve.cc).
 
 #include <arpa/inet.h>
 
@@ -159,6 +163,36 @@ struct RobotConfig {
   std::map<std::string, std::vector<TeleopBinding>> teleop;
   std::map<std::string, std::vector<std::pair<std::string, TeleopValue>>>
       teleop_defaults;
+
+  // Each subsystem's [trajectories]: name -> file, resolved against the file
+  // that set it (in a config parsed from a string, the working directory).
+  // Config load refused a file that does not exist.
+  std::map<std::string, std::map<std::string, std::string, std::less<>>,
+           std::less<>>
+      trajectories;
+
+  // The absolute path of `subsystem`'s [trajectories] entry `name`; throws
+  // std::invalid_argument naming the subsystem and `trajectories.<name>` when
+  // the config does not declare it.
+  std::filesystem::path TrajectoryPath(std::string_view subsystem,
+                                       std::string_view name) const {
+    const auto sub = trajectories.find(subsystem);
+    if (sub != trajectories.end()) {
+      if (const auto it = sub->second.find(name); it != sub->second.end()) {
+        return std::filesystem::absolute(it->second).lexically_normal();
+      }
+    }
+    std::string declared;
+    if (sub != trajectories.end()) {
+      for (const auto& [known, path] : sub->second) {
+        declared += (declared.empty() ? "" : ", ") + known;
+      }
+    }
+    throw std::invalid_argument(
+        "[subsystems." + std::string(subsystem) +
+        "] declares no 'trajectories." + std::string(name) +
+        "' (declared: " + (declared.empty() ? "none" : declared) + ")");
+  }
 };
 
 // The keys of a [subsystems.<name>] table the framework reads: config load,
@@ -169,7 +203,7 @@ inline constexpr std::string_view kFrameworkSubsystemKeys[] = {
     "node",        "critical",       "period_us",       "remap",
     "targets",     "teleop",         "motors",          "sensors",
     "encoders",    "digital_inputs", "digital_outputs", "analog_inputs",
-    "pwm_outputs",
+    "pwm_outputs", "trajectories",
 };
 
 constexpr bool IsFrameworkSubsystemKey(std::string_view key) {
@@ -277,6 +311,7 @@ inline void CheckSubsystemKeys(const toml::table& tbl,
       {"digital_output", "digital_outputs"},
       {"analog_input", "analog_inputs"},
       {"pwm_output", "pwm_outputs"},
+      {"trajectory", "trajectories"},
   };
   static_assert(std::ranges::all_of(kSections, [](const auto& section) {
     return IsFrameworkSubsystemKey(section.second);
@@ -302,6 +337,94 @@ inline void CheckSubsystemFileKeys(const toml::table& file,
     CheckSubsystemKeys(*header, path + " [subsystem]");
   }
 }
+
+// The entries of `holder`'s [trajectories] table as (name, path), refusing a
+// non-table section, a name that is not a topic segment (talOS/NAMING.md) and
+// a value that is not a non-empty string. `where` names the file or table.
+inline std::vector<std::pair<std::string, std::string>> ReadTrajectories(
+    const toml::table& holder, const std::string& where) {
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!holder.contains("trajectories")) return out;
+  const auto* section = holder["trajectories"].as_table();
+  if (section == nullptr) {
+    throw std::invalid_argument(
+        where + ": 'trajectories' must be a table of name = \"path\"");
+  }
+  for (auto&& [key, value] : *section) {
+    const std::string name(key.str());
+    const std::string field = where + ": trajectories." + name;
+    if (auto problem =
+            introspect::naming::CheckSegmentName(name, "trajectory name")) {
+      throw std::invalid_argument(field + ": " + *problem);
+    }
+    const auto path = value.value_exact<std::string>();
+    if (!path || path->empty()) {
+      throw std::invalid_argument(field + " must be a non-empty string path");
+    }
+    out.emplace_back(name, *path);
+  }
+  return out;
+}
+
+// A [trajectories] file must exist; the error names where it was set, the
+// key and the path as resolved.
+inline void RequireTrajectoryFile(const std::string& where,
+                                  const std::string& name,
+                                  const std::string& path) {
+  if (!std::filesystem::is_regular_file(path)) {
+    throw std::invalid_argument(where + ": trajectories." + name +
+                                ": no such file '" + path + "'");
+  }
+}
+
+// Rewrites `holder`'s [trajectories] paths relative to `file`'s directory and
+// requires each file. `data` sees each resolved path first, so a build tool
+// can list it (resolve.cc) before its absence is an error.
+template <typename DataFile>
+void ResolveTrajectories(toml::table& holder, const std::string& file,
+                         const std::string& where, DataFile& data) {
+  namespace fs = std::filesystem;
+  const fs::path base = fs::path(file).parent_path();
+  for (auto& [name, path] : ReadTrajectories(holder, where)) {
+    const fs::path rel{path};
+    const std::string resolved =
+        (rel.is_absolute() || base.empty() ? rel : base / rel)
+            .lexically_normal()
+            .string();
+    holder["trajectories"].as_table()->insert_or_assign(name, resolved);
+    data(resolved);
+    RequireTrajectoryFile(where, name, resolved);
+  }
+}
+
+// A subsystem (or defaults) file: its top level and its [subsystem] header.
+template <typename DataFile>
+void ResolveSubsystemFileTrajectories(toml::table& document,
+                                      const std::string& file, DataFile& data) {
+  ResolveTrajectories(document, file, file, data);
+  if (auto* header = document["subsystem"].as_table()) {
+    ResolveTrajectories(*header, file, file + " [subsystem]", data);
+  }
+}
+
+// The [subsystems.<name>] tables of one robot file.
+template <typename DataFile>
+void ResolveSubsystemTablesTrajectories(toml::table& document,
+                                        const std::string& file,
+                                        DataFile& data) {
+  if (auto* subs = document["subsystems"].as_table()) {
+    for (auto&& [name, value] : *subs) {
+      if (auto* sub = value.as_table()) {
+        ResolveTrajectories(
+            *sub, file, file + " [subsystems." + std::string(name.str()) + "]",
+            data);
+      }
+    }
+  }
+}
+
+// The default DataFile: config load needs only each file's existence.
+inline void IgnoreDataFile(const std::string& /*path*/) {}
 
 inline void MergeTables(toml::table& base, const toml::table& over) {
   for (auto&& [k, v] : over) {
@@ -950,6 +1073,13 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
       }
       detail::ApplyTargetPolicy(*targets, policy, where);
     }
+    {
+      const std::string where = "[subsystems." + sub_name + "]";
+      for (auto& [name, path] : detail::ReadTrajectories(*sub_tbl, where)) {
+        detail::RequireTrajectoryFile(where, name, path);
+        result.trajectories[sub_name].insert_or_assign(name, std::move(path));
+      }
+    }
     auto bindings = detail::ParseTeleop(*sub_tbl, sub_name);
     if (!bindings.empty()) {
       result.teleop[sub_name] = std::move(bindings);
@@ -1258,11 +1388,13 @@ inline void MergeManifests(toml::array& base_arr, const toml::array& child_arr,
   }
 }
 
-template <typename Reader = decltype(&ParseTomlFile)>
+template <typename Reader = decltype(&ParseTomlFile),
+          typename DataFile = decltype(&IgnoreDataFile)>
 inline toml::table ExpandManifest(const toml::array& manifest,
                                   const std::string& path,
                                   bool paths_normalized = false,
-                                  Reader read = ParseTomlFile) {
+                                  Reader read = ParseTomlFile,
+                                  DataFile data = IgnoreDataFile) {
   namespace fs = std::filesystem;
   const fs::path base = fs::path(path).parent_path();
   auto resolve_entry_path = [&](std::string_view p) {
@@ -1305,6 +1437,7 @@ inline toml::table ExpandManifest(const toml::array& manifest,
     const std::string file = resolve_entry_path(*rel_view);
     toml::table sub_file = read(file);
     CheckSubsystemFileKeys(sub_file, file);
+    ResolveSubsystemFileTrajectories(sub_file, file, data);
 
     auto* header = sub_file["subsystem"].as_table();
     if (!header || (*header)["name"].value<std::string_view>() != name) {
@@ -1331,6 +1464,7 @@ inline toml::table ExpandManifest(const toml::array& manifest,
     if (defaults_file) {
       toml::table merged = read(*defaults_file);
       CheckSubsystemFileKeys(merged, *defaults_file);
+      ResolveSubsystemFileTrajectories(merged, *defaults_file, data);
       MergeTables(merged, sub_file);
       sub_file = std::move(merged);
       header = sub_file["subsystem"].as_table();
@@ -1355,12 +1489,17 @@ inline toml::table ExpandManifest(const toml::array& manifest,
 
 // Resolve once for runtime and build tools. Readers may track dependencies or
 // supply pending file contents without changing include/manifest semantics.
-template <typename Reader = decltype(&detail::ParseTomlFile)>
+// `data` sees every non-TOML file the config names ([trajectories]), resolved
+// against the file that names it, before config load requires it to exist.
+template <typename Reader = decltype(&detail::ParseTomlFile),
+          typename DataFile = decltype(&detail::IgnoreDataFile)>
 inline toml::table ResolveRobotConfig(const std::string& path,
-                                      Reader read = detail::ParseTomlFile) {
+                                      Reader read = detail::ParseTomlFile,
+                                      DataFile data = detail::IgnoreDataFile) {
   namespace fs = std::filesystem;
   toml::table tbl = read(path);
   detail::CheckTopLevelKeys(tbl);
+  detail::ResolveSubsystemTablesTrajectories(tbl, path, data);
   if (auto* manifest = tbl["subsystems"].as_array()) {
     detail::NormalizeManifestPaths(*manifest, path);
   }
@@ -1375,6 +1514,7 @@ inline toml::table ResolveRobotConfig(const std::string& path,
             .string();
     toml::table base = read(inc_file);
     detail::CheckTopLevelKeys(base);
+    detail::ResolveSubsystemTablesTrajectories(base, inc_file, data);
     if (base.contains("include")) {
       throw std::invalid_argument("nested 'include' is not supported in " +
                                   inc_file);
@@ -1391,7 +1531,7 @@ inline toml::table ResolveRobotConfig(const std::string& path,
         base.insert_or_assign(
             "subsystems",
             detail::ExpandManifest(*base_subs, inc_file,
-                                   /*paths_normalized=*/true, read));
+                                   /*paths_normalized=*/true, read, data));
       }
     }
     detail::MergeTables(base, tbl);
@@ -1399,8 +1539,9 @@ inline toml::table ResolveRobotConfig(const std::string& path,
   }
   if (auto* manifest = tbl["subsystems"].as_array()) {
     tbl.insert_or_assign(
-        "subsystems", detail::ExpandManifest(*manifest, path,
-                                             /*paths_normalized=*/true, read));
+        "subsystems",
+        detail::ExpandManifest(*manifest, path,
+                               /*paths_normalized=*/true, read, data));
   }
   return tbl;
 }

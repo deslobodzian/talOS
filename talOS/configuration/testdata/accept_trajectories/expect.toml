@@ -1,0 +1,10 @@
+# [trajectories] paths resolve against the file that sets them (a subsystem
+# file and its defaults file), and each file is a dependency of the config.
+accept = true
+nodes = ["//bot/autonomous:node"]
+files = [
+    "shared/autonomous_defaults.toml",
+    "shared/taxi.traj",
+    "subsystems/autonomous.toml",
+    "trajectories/two_piece.traj",
+]

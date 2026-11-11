@@ -289,7 +289,8 @@ configuration/robot.toml        [robot] period, timeouts, controller address
                                 [[subsystems]] name + path, one per subsystem
 configuration/subsystems/*.toml [subsystem] name, node = "//...:node", period_us,
                                 custom keys (node.param), [motors.*] and other devices,
-                                [targets] lane priorities per mode
+                                [targets] lane priorities per mode,
+                                [trajectories] name = "path" data files
 ```
 
 A manifest entry may also set `node = "//...:target"`, which overrides the
@@ -304,6 +305,11 @@ refuses only a framework section spelled in the singular (`target`, `motor`,
 parameters by reading them in its constructor (`param`, `param_of`), which
 its `--describe` reports, and the launcher refuses a key no node read
 ([parameter keys](talOS/launcher/README.md#parameter-keys)).
+`[trajectories]` maps a name to a data file (a Choreo `.traj`), its path
+relative to the file that sets it; config load refuses a missing file, a
+non-string path or a name that is not a topic segment, naming the file and
+`trajectories.<name>`, and a node opens it by name
+(`RobotConfig::TrajectoryPath`, [talOS/trajectory](talOS/trajectory/README.md#using-it-from-a-node)).
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.
 
@@ -311,7 +317,8 @@ physical ones and sets `commissioned = true` only after checking them.
 so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
 `<dir>/robot_manifest.bzl` (`<stem>_manifest.bzl` for any other config name):
 `NODES`, every node label the config launches, and `CONFIG_FILES`, every file
-it reads besides itself (`include`, `path`, `defaults`). `talos_bundle` and
+it reads besides itself (`include`, `path`, `defaults`, `[trajectories]`
+files). `talos_bundle`, which ships them at the same relative layout, and
 `talos_graph_test` take those constants; no BUILD file lists nodes or
 subsystem files. Each config package has a `manifest_sync_test`
 (`tools/sync_manifest.bzl`). `talos_bundle` additionally runs the same check as
@@ -325,7 +332,7 @@ manifest fails the build with the regenerate command.
 | a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it, generating a self-contained node (walkthrough in [examples/superstructure](examples/superstructure/README.md)). In C++ the node can instead be a thin wrapper over a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block, as `examples/superstructure/cpp/elevator.h` is |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
 | a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
-| a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named by a parameter of the node that follows it and loaded with `talOS/trajectory`. A bundle does not include it until TODO.md TRAJ-2 (`tools/sync_manifest.py` does not list it in `CONFIG_FILES`): it works in sim and is missing on the deployed robot |
+| a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named in the following node's subsystem file under `[trajectories]` and loaded with `talOS/trajectory`; regenerate the manifest so `CONFIG_FILES`, and the bundle, carry it |
 | a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |

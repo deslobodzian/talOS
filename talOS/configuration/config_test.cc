@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "config_parser.h"
@@ -403,6 +404,87 @@ TEST_F(ManifestTest, RefusesASingularSectionNamingTheKeyAndFile) {
                                       "[\"align\"]\n" +
                                       std::string(kMotor)),
                std::invalid_argument);
+}
+
+// A [trajectories] entry a node could not open on the robot fails config load
+// instead, naming the file that sets it and the key (REQ-CONTRACT-10).
+TEST_F(ManifestTest, RefusesABadTrajectoryEntryNamingTheFileAndKey) {
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n");
+  const std::string missing =
+      (dir_ / "trajectories" / "two_piece.traj").lexically_normal().string();
+  struct Case {
+    const char* name;
+    const char* section;
+    std::vector<std::string> named;  // what the error must contain
+  };
+  const Case cases[] = {
+      {"missing file",
+       "[trajectories]\ntwo_piece = \"../trajectories/"
+       "two_piece.traj\"\n",
+       {"trajectories.two_piece", missing}},
+      {"not a string",
+       "[trajectories]\ntwo_piece = 3\n",
+       {"trajectories.two_piece"}},
+      {"empty path",
+       "[trajectories]\ntwo_piece = \"\"\n",
+       {"trajectories.two_piece"}},
+      {"not a segment name",
+       "[trajectories]\nTwoPiece = \"a.traj\"\n",
+       {"trajectories.TwoPiece"}},
+      {"not a table", "trajectories = \"a.traj\"\n", {"'trajectories'"}},
+      {"singular section",
+       "[trajectory]\ntwo_piece = \"a.traj\"\n",
+       {"'trajectory'"}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.name);
+    Write("subsystems/auto.toml",
+          std::string("[subsystem]\nname = \"auto\"\n") + c.section);
+    try {
+      ParseRobotConfig(Robot());
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("subsystems/auto.toml"), std::string::npos) << what;
+      for (const auto& part : c.named) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  }
+}
+
+// Paths resolve against the subsystem file, not robot.toml, so the node opens
+// the same file the manifest lists; an undeclared name throws naming it
+// (REQ-CONTRACT-19).
+TEST_F(ManifestTest, TrajectoryPathResolvesAgainstTheSubsystemFile) {
+  std::filesystem::create_directories(dir_ / "trajectories");
+  Write("trajectories/two_piece.traj", "{}\n");
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"auto\"\npath = \"subsystems/auto.toml\"\n");
+  Write("subsystems/auto.toml",
+        "[subsystem]\nname = \"auto\"\n"
+        "[trajectories]\ntwo_piece = \"../trajectories/two_piece.traj\"\n"
+        "[motors.m]\ncan_id = 1\n");
+  const auto cfg = ParseRobotConfig(Robot());
+  const auto path = cfg.TrajectoryPath("auto", "two_piece");
+  EXPECT_TRUE(path.is_absolute()) << path;
+  EXPECT_TRUE(
+      std::filesystem::equivalent(path, dir_ / "trajectories/two_piece.traj"))
+      << path;
+  for (const auto& [subsystem, name] :
+       {std::pair{"auto", "three_piece"}, std::pair{"other", "two_piece"}}) {
+    try {
+      cfg.TrajectoryPath(subsystem, name);
+      ADD_FAILURE() << subsystem << " " << name << " was found";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find(std::string("trajectories.") + name),
+                std::string::npos)
+          << what;
+      EXPECT_NE(what.find(subsystem), std::string::npos) << what;
+    }
+  }
 }
 
 // The TalonFX applies soft limits in its own position frame, which a reset

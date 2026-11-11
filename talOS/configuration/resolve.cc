@@ -4,6 +4,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "talOS/configuration/config_parser.h"
 
@@ -25,7 +26,9 @@ int main(int argc, char** argv) {
       if (!input) throw std::invalid_argument("cannot read available files");
       for (std::string line; std::getline(input, line);) available.insert(line);
     }
-    auto read = [&](const std::string& path) {
+    // Lists a file the config reads; under --check (AVAILABLE_FILES) a file
+    // the manifest does not list is reported before anything opens it.
+    auto track = [&](const std::string& path) {
       const fs::path normalized = fs::path(path).lexically_normal();
       const std::string name = normalized.generic_string();
       if (normalized.is_absolute() || name == ".." || name.starts_with("../")) {
@@ -39,6 +42,11 @@ int main(int argc, char** argv) {
           !fs::is_regular_file(overlay)) {
         throw std::invalid_argument("UNLISTED:" + name);
       }
+      return std::pair{normalized, overlay};
+    };
+    auto read = [&](const std::string& path) {
+      const auto [normalized, overlay] = track(path);
+      const std::string name = normalized.generic_string();
       auto document = talos::config::detail::ParseTomlFile(
           !overlay.empty() && fs::is_regular_file(overlay) ? overlay.string()
                                                            : name);
@@ -47,7 +55,9 @@ int main(int argc, char** argv) {
       }
       return document;
     };
-    auto effective = talos::config::ResolveRobotConfig(config, read);
+    // A [trajectories] file is a dependency too, so the bundle ships it.
+    auto data = [&](const std::string& path) { track(path); };
+    auto effective = talos::config::ResolveRobotConfig(config, read, data);
     // Manifest/scaffold planning accepts incomplete hardware inventories while
     // sharing all parsing and schema validation with the launcher.
     talos::config::ParseRobotConfigTable(effective,
