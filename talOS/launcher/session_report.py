@@ -273,7 +273,7 @@ def analyze(manifest, records, log_damage=()):
             "status_stream": status_source, "status": status_summary, "verdicts": verdicts,
             "limitations": ["State timing is bridge IPC publication or one consumer dispatch stream, not raw UDP arrival; never pooled duplicate readers.",
                             "Enabled uses the logged DS enabled bit, held until its next observation; DS silence is not proof of continued physical enablement.",
-                            "Bridge request to command subtracts the requesting tick's time from the bridge pass's start, both stamped before the work, so a value can be slightly negative; with several owners the merged observation can be another owner's older request, overstating it.",
+                            "Bridge request to command runs from the requesting tick's start to the command's publication on /hw/command, not its delivery to the RoboRIO: a command whose UDP send failed is still counted (the bridge's send_failures, on its exit line, says whether any did); with several owners the merged observation can be another owner's older request, overstating it.",
                             "Counter deltas exclude unknown increments before the first sample and during resets; clock mapping is not absolute synchronization.",
                             "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."]}
 
