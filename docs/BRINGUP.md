@@ -22,6 +22,28 @@ each match, the drive team runs [PRE_MATCH.md](PRE_MATCH.md).
 - [ ] On a disposable session with a small `[robot] log_max_bytes`, exceed each event writer's share. Expected: control processes continue, each log keeps its newest records in whole-record segments within its share (the oldest `<stem>.segment<k>.tlog` deleted), the completed manifest reports `log_capped: true` for incomplete captures, and every capped member's kept records span about the same time, within 1.5x of each other (REQ-OPS-32; `log_dump` on the session directory: each process's first record). Every roster member, the Studio bridge included, also writes `<name>.log` (its stdout and stderr), up to 64 MiB per member per session outside the event-log share, and each recording camera up to its `[recording] max_bytes` of frames. Older sessions count all of it within the other half of `log_max_bytes`, except the 16 newest matches, which only a disk without room for the next session (retention's free floor) removes: size the disk by the [retention sizing](../talOS/launcher/README.md#session-segments-and-logs), and after a session in which retention removed anything read its `retention.txt`.
 - [ ] For live inspection, run the launcher from a checkout of this repository (`bazel run //talOS/launcher -- ... --start-studio-bridge`, after `bazel build //studio:web_dist //studio/bridge:studio_bridge`, as [BENCH.md](BENCH.md) does). The installed bundle does not support it: it contains neither the `studio_bridge` binary nor the Studio webroot, so `--start-studio-bridge` on `/opt/talos/current/run.sh` leaves the session running without Studio. Open `http://127.0.0.1:5800` and select Studio's system view. Expected: live node rows, source selections and loop timing are visible. Run only one bridge; follow its [operating limits and load probe](../studio/bridge/README.md#websocket-operating-limits) on the field link with other traffic.
 
+## Camera capture check
+
+Before calibrating, check what each camera delivers through talOS's own
+capture backend, at the mode its config will ask for:
+
+```sh
+bazel run //talOS/vision/capture:capture_check -- --device /dev/v4l/by-id/... --list
+bazel run //talOS/vision/capture:capture_check -- --device /dev/v4l/by-id/... \
+  --width 1280 --height 800 --fps 120 --seconds 20 --detect --decimate 2 --threads 2
+```
+
+`--list` prints the modes the source can open. A run prints the mode the
+source opened (it fails naming the mode when the device does not offer it),
+delivered and steady frame rate, frame-interval percentiles, frames missing
+from interval gaps and those the source dropped, capture-thread CPU per frame
+with that thread's scheduling, and process CPU; `--detect` adds the CPU
+AprilTag backend's stage times and capture-to-result latency on the newest
+frame, `--save DIR --save-count N` saves one gray PNG per second. Expected:
+the steady rate within 1% of the requested one, no missing or dropped frames
+on an idle host, and the capture thread below the node loops (`nice 10`) when
+run inside a node. Timing from a busy host is not evidence (TESTING.md §6).
+
 ## Camera intrinsics calibration
 
 1. With the robot disabled and the camera at its deployment focus and resolution,
