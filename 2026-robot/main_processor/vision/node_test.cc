@@ -349,7 +349,6 @@ TEST(VisionTest, CatchUpTickPublishesEveryDueObservationInCaptureOrder) {
       EXPECT_TRUE(observer.frames.empty());
     }
   }
-  sim.step(1ms);  // Deliver both publications to the callback observer.
   ASSERT_EQ(observer.frames.size(), 2u);
   EXPECT_EQ(observer.frames[0].observation.sample_time_ns(), 0u);
   EXPECT_EQ(observer.frames[1].observation.sample_time_ns(), 17'000'000u);
@@ -733,7 +732,6 @@ TEST(VisionTest, SimulatedCaptureFollowsTruthTimeWithoutPhaseDrift) {
     sim.publish(sim::topics::kState, Truth(sim));
     sim.step(10ms);
   }
-  sim.step(1ms);  // Deliver the final captured observation to the callback.
   auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
   if (!status.has_value()) {
     FAIL() << "missing camera status";

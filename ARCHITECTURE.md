@@ -201,8 +201,8 @@ sleeps. A `subscribe` callback, or a Driver Station listener, makes that topic
 wake the node: its publisher notifies the sleeping loop, which drains every
 subscription at once. In a node with no timer every subscription wakes it.
 While it waits on such a topic the loop also drains at least once a second, in
-case a publisher died before notifying. `testing::Sim` models a wake as a 1 ms
-drain.
+case a publisher died before notifying. `testing::Sim` models a wake as a
+drain at the publication's instant.
 Off-simulation the loop thread runs realtime, best effort, in one of three
 tiers the process picks itself: the bridge above control nodes (a node whose
 own subsystem owns a motor, digital or PWM output, or that writes a target
@@ -231,8 +231,11 @@ duration)` stops one node's drains and timers while its clock and peers advance;
 `resume(name)` resumes early. Overdue periodic timers coalesce on their original
 phase, as after SIGSTOP/SIGCONT. Simulation dispatches nodes serially on one
 chronological frontier: each step runs every node's loop up to the earliest
-pending deadline of any of them, so no node sees a publication from its future,
-and at one instant nodes run in the order they were added. It does not model
+pending timer or waking publication of any of them, so no node sees a
+publication from its future, and at one instant nodes run in the order they
+were added, in rounds that repeat while a node is woken by a publication made
+there after it ran (bounded at 1000; a zero-time publish cycle fails the
+step). It does not model
 concurrent copies, torn reads, OS scheduling jitter, or the CPU cost of
 handlers.
 

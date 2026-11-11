@@ -59,6 +59,14 @@ std::vector<float> record_run(const std::string& path, float gain,
 
   TestRobot<SimulatedEventLoop<log::LogWriter>> robot{loop, test_topics(),
                                                       gain};
+  // Under ON_PUBLISH the sensor wakes the loop, so each reading is delivered
+  // by a drain of its own at its publication instant, ahead of the control
+  // timer, and recorded with its publication time as its event time.
+  if (delivery == Delivery::ON_PUBLISH) {
+    for (const Registration& source : loop.manifest()) {
+      if (source.name == test_topics().sensor) loop.set_prompt(source.id);
+    }
+  }
 
   robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
                                        1ms);
