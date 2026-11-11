@@ -131,7 +131,15 @@ class Node:
 
     @property
     def now(self):
+        """The node clock in float seconds. round(now * 1e9) recovers the
+        integer clock only below 2**51 ns (26 days); a message time such as
+        sample_time_ns takes now_ns."""
         return lib.talos_node_now_ns(self._handle) / _NS
+
+    @property
+    def now_ns(self):
+        """The node clock in integer nanoseconds (C++ node.now().nanos())."""
+        return lib.talos_node_now_ns(self._handle)
 
     @property
     def tick(self):  # update() calls completed so far
