@@ -235,6 +235,7 @@ TEST_F(VelocityMechanismTest, NonFiniteDemandGoesNeutral) {
 
 // A request is refused outside update() (here every()), naming the
 // mechanism, and lasts only the update() it was made in.
+// REQ-SAFE-37
 TEST(VelocityMechanismRequest, RequestIsTiedToItsUpdate) {
   struct TimerNode {
     explicit TimerNode(Node& node) : flywheel{node, "flywheel"} {
