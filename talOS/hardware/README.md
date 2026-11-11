@@ -345,8 +345,15 @@ The other direction -- the companion finding the gateway -- is
 `[robot] controller_address` in the robot config (see [launcher addressing](../launcher/README.md#controller-addressing)),
 overridden per launch by `launcher --remote`. Real hardware uses Driver Station
 enable and e-stop.
-The adapter retries a failed gateway socket open once per second from its main
-loop, ticking the gateway disabled (all outputs neutral) until the socket opens.
+The socket is opened from the adapter's main loop. After a RoboRIO boot the
+program can start before the network has a route to the companion, and the
+open's `connect()` fails (`ENETUNREACH`, errno 101); the loop retries every
+100 ms (`src/main/include/SocketRetry.h`; an attempt is a few non-blocking
+calls), ticking the gateway disabled (all outputs neutral, no State sent)
+until the socket opens. The console reports the failures
+(`hardware gateway socket failed: <status> (errno <n>)`, coalesced to one line
+a second) and, once it opens, `hardware gateway socket open after <n> failed
+attempts, <s> s after the first`.
 
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
@@ -436,7 +443,7 @@ Build without deploying:
 ```sh
 cd 2026-robot/controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway

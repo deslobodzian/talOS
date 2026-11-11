@@ -241,7 +241,8 @@ model {
     testSuites {
         // Desktop tests of this program's sources (src/test/cpp): the
         // PhoenixBackend simulation regressions, ConfigStore,
-        // SimDriverStation, RioLog, CompanionLink and LoopWatchdog.
+        // SimDriverStation, RioLog, CompanionLink, LoopWatchdog and
+        // SocketRetry.
         // The suite itself is auto-created per component by the google-test
         // plugin; this only points it at our sources and dependencies.
         frcUserProgramTest {
@@ -266,12 +267,12 @@ tasks.register("buildRio") {
 
 // Stable entry point for the desktop tests in src/test/cpp (PhoenixBackend
 // simulation regressions, ConfigStore, SimDriverStation, RioLog,
-// CompanionLink, LoopWatchdog). The google-test plugin creates one
+// CompanionLink, LoopWatchdog, SocketRetry). The google-test plugin creates one
 // RunTestExecutable task per
 // desktop variant (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
 // so CI pins this aggregator instead of a platform-specific variant name.
 tasks.register("phoenixTest") {
-    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog)'
+    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry)'
     group = 'verification'
     def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
     dependsOn runTasks

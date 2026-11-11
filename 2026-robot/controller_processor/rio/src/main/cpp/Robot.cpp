@@ -4,6 +4,7 @@
 #include <hal/DriverStation.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <optional>
@@ -15,6 +16,7 @@
 #include "DriverStationReader.h"
 #include "PhoenixBackend.h"
 #include "RioBuild.h"
+#include "SocketRetry.h"
 
 #ifndef __FRC_ROBORIO__
 #include <cstdlib>
@@ -40,6 +42,7 @@ constexpr const char* kConfigPath = "talos_config.bin";
 // PhoenixBackend's configure failure.
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
+constexpr uint16_t kSocketOpenMessage = 3;
 
 void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
   talos::rio::LogEvent event;
@@ -164,8 +167,10 @@ void Robot::StartCompetition() {
           unsaved = config;
       });
 
-  bool socket_open = false;
-  uint64_t next_socket_retry_us = 0;
+  // Opened from the loop, retried every SocketRetry::kPeriodUs until the
+  // network has a route to the companion (after a RoboRIO boot, the program
+  // can start before it does).
+  talos::rio::SocketRetry socket_retry;
 
   // The configuration being restored, if any; the push still follows.
   std::printf(
@@ -239,20 +244,38 @@ void Robot::StartCompetition() {
     const uint64_t now_us = NowUs();
     const uint32_t mode_flags = DriverStationModeFlags();
     ds_mode.Observe(mode_flags, now_us);
-    if (!socket_open && now_us >= next_socket_retry_us) {
-      const auto status =
-          endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
-                          companion_address, 5803);
-      socket_open = status == talos::protocol::UdpStatus::kOk;
-      next_socket_retry_us = now_us + 1000000;
-      if (!socket_open) {
-        char text[96];
-        std::snprintf(text, sizeof(text), "hardware gateway socket failed: %s",
-                      talos::protocol::UdpStatusName(status));
-        Report(*log_, kSocketMessage, text);
-      }
+    auto open_status = talos::protocol::UdpStatus::kOk;
+    int open_errno = 0;
+    const auto socket_event = socket_retry.Poll(now_us, [&] {
+      // The failing call's errno (Open's close of the half-made socket
+      // leaves it): ENETUNREACH while the network has no route yet.
+      errno = 0;
+      open_status = endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0",
+                                    5802, companion_address, 5803);
+      open_errno = errno;
+      return open_status == talos::protocol::UdpStatus::kOk;
+    });
+    if (socket_event == talos::rio::SocketRetry::Event::kFailed) {
+      // RioLog coalesces these to one line a second with their count. The
+      // errno is printed as a number (101 is ENETUNREACH): strerror may take
+      // a locale lock on this thread.
+      char text[128];
+      std::snprintf(text, sizeof(text),
+                    "hardware gateway socket failed: %s (errno %d)",
+                    talos::protocol::UdpStatusName(open_status), open_errno);
+      Report(*log_, kSocketMessage, text);
+    } else if (socket_event == talos::rio::SocketRetry::Event::kOpened &&
+               socket_retry.failures() > 0) {
+      char text[128];
+      std::snprintf(
+          text, sizeof(text),
+          "hardware gateway socket open after %u failed attempts, %.3f s "
+          "after the first",
+          static_cast<unsigned>(socket_retry.failures()),
+          static_cast<double>(now_us - socket_retry.first_failure_us()) / 1e6);
+      Report(*log_, kSocketOpenMessage, text);
     }
-    if (socket_open) {
+    if (socket_retry.open()) {
       // Endpoint handles clock probes even disabled/uncommissioned, echoing
       // only on a subsequent tick so its sample stamp follows probe receipt.
       endpoint_->Tick(now_us,
