@@ -54,7 +54,11 @@ cc_library(
         "//talOS/vision:frame",
     ] + select({
         "@platforms//os:macos": [":avfoundation"],
-        "@platforms//os:linux": ["//talOS/events:events_os"],
+        "@platforms//os:linux": [
+            "//talOS/events:events_os",
+            "@opencv//:core",
+            "@opencv//:imgcodecs",
+        ],
         "//conditions:default": [],
     }),
 )
@@ -65,6 +69,9 @@ cc_test(
     deps = [
         ":capture",
         "@googletest//:gtest_main",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+        "@opencv//:imgproc",
     ],
 )
 
