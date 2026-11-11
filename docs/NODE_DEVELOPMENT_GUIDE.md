@@ -87,7 +87,8 @@ sees:
   them only at its tick or next packet. More than 64 between two drains fall
   behind. The `driver` takes `/drivetrain/state` headings this way: the
   drivetrain's 5 ms ticks never wake it, and an invalid state cannot hide the
-  valid one before it.
+  valid one before it. The pose estimator queues its camera frames this way
+  for `update()` to fuse.
 - A **latest-value read** (`subscribe(topic)`, no callback) keeps only the
   newest message per drain: for a value read at the tick whose intermediate
   values do not matter.
