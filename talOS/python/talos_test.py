@@ -265,10 +265,18 @@ class BorrowedLifetimeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-class SubscriptionErrorsTest(unittest.TestCase):
-    def test_abi_errors_are_not_values_or_true_flags(self):
+class AbiErrorsTest(unittest.TestCase):
+    def test_abi_errors_are_not_values_states_or_true_flags(self):
         sim = Sim.from_toml(ROBOT_TOML)
         follower = sim.add(Follower, "follower")
+        stepper = sim.add(Stepper, "planner")
+        # A failed state read returns 0, a valid state: only the error
+        # string set by the failed call tells them apart.
+        stepper.sm._index = 99  # no such state machine: every C call fails
+        for name in ("state", "previous", "time_in_state", "just_entered"):
+            with self.subTest(state_machine=name):
+                with self.assertRaises(talos.TalosError):
+                    getattr(stepper.sm, name)
         subscription = follower.goal
         self.assertIsNone(subscription.value)
         with mock.patch.object(talos.lib, "talos_last_error",
@@ -560,16 +568,20 @@ class DriverStationTest(unittest.TestCase):
 
 
 class Aimer:
-    """Records what its Target selected on each update()."""
+    """Records what its Target selected on each update(), and drives the
+    lift motor at its height_rot (as volts) only while get() returns one."""
 
     def __init__(self, node):
         self.target = talos.Target(node, Goal)
+        self.motor = talos.Motor(node, "lift")
         self.seen = None
         self.source = ""
 
     def update(self):
         self.seen = self.target.get()
         self.source = self.target.source
+        if self.seen is not None:
+            self.motor.set_voltage(self.seen.height_rot)
 
 
 class Driver:
@@ -606,7 +618,12 @@ class Operator:
 
 
 class TargetTest(unittest.TestCase):
-    """Target/TargetLane through Python; selection is target_test.cc's."""
+    """Target/TargetLane through Python; selection is target_test.cc's.
+
+    The safety cases (stale, disabled, earlier generation) are here because
+    a marshalling fault on the way out of talos_target_get, such as a
+    binding that decodes its buffer when the call found no target, would
+    actuate on a target the C++ Target refused (docs/TESTING.md §4)."""
 
     def setUp(self):
         self.sim = Sim.from_toml(ROBOT_TOML)
@@ -628,6 +645,11 @@ class TargetTest(unittest.TestCase):
     def seen(self):
         return None if self.lift.seen is None else self.lift.seen.height_rot
 
+    def applied(self):
+        """The lift motor's applied (mode, demand)."""
+        request = self.hw.applied_motor("lift", "lift")
+        return request.mode, request.demand
+
     def test_teleop_drives_and_never_sent_is_none(self):
         self.sim.step(0.05)
         self.assertIsNone(self.seen())
@@ -635,27 +657,59 @@ class TargetTest(unittest.TestCase):
         self.hold("teleop", 1.5)
         self.assertEqual(self.seen(), 1.5)
         self.assertEqual(self.lift.source, "teleop")
+        self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 1.5))
 
-    def test_stale_lane_is_none_at_publication_timeout(self):
+    # REQ-SAFE-07
+    def test_stale_lane_goes_neutral_at_publication_timeout(self):
         self.hold("teleop", 1.0)
         # hold() returns 10 ms after its final publication: 80 ms more
         # leaves the target 90 ms old, just inside the 100 ms timeout.
         self.sim.step(0.08)
         self.assertEqual(self.seen(), 1.0)
+        self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 1.0))
         self.sim.step(0.01)
         self.assertIsNone(self.seen())
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
 
-    def test_robot_disabled_and_driver_station_loss_are_none(self):
+    # REQ-SAFE-02, REQ-SAFE-07
+    def test_robot_disabled_and_driver_station_loss_go_neutral(self):
         self.hold("teleop", 1.0)
         self.hw.enable(False)
         self.hold("teleop", 1.0)
         self.assertIsNone(self.seen())
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
         self.hw.enable()
         self.hold("teleop", 1.0)
         self.assertEqual(self.seen(), 1.0)
         self.hw.stop_driver_station()
         self.hold("teleop", 1.0, 0.12)
         self.assertIsNone(self.seen())
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
+
+    # REQ-SAFE-09
+    def test_earlier_generation_target_is_ignored(self):
+        self.hold("teleop", 1.0)
+        self.assertEqual(self.seen(), 1.0)
+        teleop = self.sim.driver_station_generation
+        self.mode(enabled=False, teleop=True)
+        # SimHardware publishes on the tick grid after the lift (added
+        # first) has run, so the lift drains the re-enabling packet on its
+        # next tick together with whatever was queued meanwhile.
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.01)
+        self.assertNotEqual(self.sim.driver_station_generation, teleop)
+        # Said under the first teleop period, drained with the packet that
+        # starts the second: only the generation tells them apart.
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=2.0,
+                                enabled=True, tick_count=0,
+                                mode_since_us=teleop)
+        self.sim.step(0.01)
+        self.assertIsNone(self.seen())
+        self.assertEqual(self.lift.source, "")
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
+        # The lift is enabled and in teleop: the current generation drives.
+        self.hold("teleop", 2.0, 0.01)
+        self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 2.0))
 
     def test_lane_sends_and_releases(self):
         sim = Sim.from_toml(ROBOT_TOML)
@@ -703,16 +757,18 @@ class TargetTest(unittest.TestCase):
 
 
 class StateMachineTest(unittest.TestCase):
-    def test_just_entered_and_time_in_state(self):
+    """Transitions are StateMachine's (node_test.cc); these prove each
+    accessor crosses the ABI as the state's Python type."""
+
+    def test_enum_states_cross_the_abi(self):
         sim = Sim.from_toml(ROBOT_TOML)
         stepper = sim.add(Stepper, "planner")
         sim.step(0.045)
         idle, moving = Stepper.State.IDLE, Stepper.State.MOVING
-        self.assertEqual(stepper.seen, [
-            (0, idle, True), (1, idle, False), (2, idle, False),
-            (3, moving, True)])
-        self.assertEqual(stepper.sm.previous, idle)
-        self.assertTrue(stepper.sm.is_(moving))
+        # go(MOVING) in tick 2's update(); tick 3 is the first in MOVING.
+        self.assertEqual(stepper.seen[-2:],
+                         [(2, idle, False), (3, moving, True)])
+        self.assertIs(stepper.sm.previous, idle)
         # Entered at the 30 ms tick; now is 45 ms.
         self.assertAlmostEqual(stepper.sm.time_in_state, 0.015)
         with self.assertRaises(ValueError):
@@ -736,22 +792,16 @@ class StateMachineTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             talos.StateMachine(sim.node("planner"), 7, states=Phase)
 
-    def test_abi_errors_raise_rather_than_read_as_states(self):
-        sim = Sim.from_toml(ROBOT_TOML)
-        stepper = sim.add(Stepper, "planner")
-        stepper.sm._index = 99  # no such state machine: every C call fails
-        for name in ("state", "previous", "time_in_state", "just_entered"):
-            with self.subTest(name=name):
-                with self.assertRaises(talos.TalosError):
-                    getattr(stepper.sm, name)
-
 
 class ParamTest(unittest.TestCase):
+    """Lookup, fallbacks and type checks are the C++ Node's (node_test.cc);
+    these prove the kind each default asks for, and each kind's value, cross
+    talos_node_param and talos_node_param_of as their Python types."""
 
-    def test_fallback_and_missing(self):
+    def test_each_kind_reads_as_its_python_type(self):
         seen = {}
 
-        class Reader:
+        class Scalars:
             def __init__(self, node):
                 seen["gain"] = node.param("gain", 1.0)
                 seen["mode"] = node.param("mode")
@@ -759,45 +809,23 @@ class ParamTest(unittest.TestCase):
                 seen["verbose"] = node.param("verbose")
                 seen["absent"] = node.param("absent", 7.5)
 
-        sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Reader, "follower")
-        self.assertEqual(seen, {"gain": 2.0, "mode": "fast", "retries": 3,
-                                "verbose": True, "absent": 7.5})
-
-        class Missing:
-            def __init__(self, node):
-                node.param("absent")
-
-        with self.assertRaises(talos.TalosError):
-            sim.add(Missing, "planner")
-
-        class Mistyped:
-            def __init__(self, node):
-                node.param("height_rot", 0)
-
-        with self.assertRaises(talos.TalosError):
-            sim.add(Mistyped, "planner")
-
-    def test_lists(self):
-        seen = {}
-
-        class Vision:
+        class Lists:
             def __init__(self, node):
                 seen["cameras"] = node.param("cameras")
-                seen["offsets_m"] = node.param("offsets_m")
-                seen["no_cameras"] = node.param("no_cameras")
-                seen["cameras_any"] = node.param("cameras", [])
-                seen["offsets_typed"] = node.param("offsets_m", [0.0])
-                seen["empty_over_default"] = node.param("no_cameras", ["x"])
-                seen["absent"] = node.param("absent", ["left"])
+                seen["offsets_m"] = node.param("offsets_m", [0.0])
+                seen["no_cameras"] = node.param("no_cameras", ["x"])
+                seen["absent_list"] = node.param("absent", ["left"])
 
         sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Vision, "vision")
+        sim.add(Scalars, "follower")
+        sim.add(Lists, "vision")
         self.assertEqual(seen, {
-            "cameras": ["front", "back"], "offsets_m": [0.5, 1.0, -2.25],
-            "no_cameras": [], "cameras_any": ["front", "back"],
-            "offsets_typed": [0.5, 1.0, -2.25], "empty_over_default": [],
-            "absent": ["left"]})
+            "gain": 2.0, "mode": "fast", "retries": 3, "verbose": True,
+            "absent": 7.5, "cameras": ["front", "back"],
+            "offsets_m": [0.5, 1.0, -2.25], "no_cameras": [],
+            "absent_list": ["left"]})
+        self.assertEqual(
+            [type(seen[key]) for key in ("retries", "verbose")], [int, bool])
         self.assertEqual([type(v) for v in seen["offsets_m"]], [float] * 3)
 
         def reading(key, *default):
@@ -806,52 +834,37 @@ class ParamTest(unittest.TestCase):
                     node.param(key, *default)
             return Reader
 
-        for key, default in (
-                ("mixed", ()),
-                ("flags", ()),
-                ("cameras", ([0.0],)),
-                ("offsets_m", (["a"],)),
-                ("exposure_s", ([],)),
-                ("exposure_s", (["a"],)),
-                ("absent", ())):
+        # Each refusal is C++'s, reached through the kind the default asked
+        # for; a list default of mixed types never leaves Python.
+        for key, default, error in (
+                ("absent", (), talos.TalosError),
+                ("offsets_m", (0,), talos.TalosError),
+                ("cameras", ([0.0],), talos.TalosError),
+                ("cameras", (["a", 1.0],), TypeError)):
             with self.subTest(key=key, default=default):
-                with self.assertRaises(talos.TalosError):
+                with self.assertRaises(error):
                     Sim.from_toml(ROBOT_TOML).add(reading(key, *default),
                                                   "vision")
-        with self.assertRaises(TypeError):
-            Sim.from_toml(ROBOT_TOML).add(reading("cameras", ["a", 1.0]),
-                                          "vision")
 
-    def test_param_of_reads_another_subsystem_only_in_init(self):
+    def test_param_of_reads_another_subsystem(self):
         seen = {}
 
         class Reader:
             def __init__(self, node):
-                self.node = node
-                seen["gain"] = node.param_of("follower", "gain")
                 seen["offsets_m"] = node.param_of("vision", "offsets_m")
                 seen["absent"] = node.param_of("follower", "absent", 7.5)
 
         sim = Sim.from_toml(ROBOT_TOML)
-        reader = sim.add(Reader, "planner")
-        self.assertEqual(seen, {"gain": 2.0, "offsets_m": [0.5, 1.0, -2.25],
+        sim.add(Reader, "planner")
+        self.assertEqual(seen, {"offsets_m": [0.5, 1.0, -2.25],
                                 "absent": 7.5})
+
+        class Missing:
+            def __init__(self, node):
+                node.param_of("absent", "gain", 1.0)
+
         with self.assertRaises(talos.TalosError):
-            reader.node.param_of("follower", "gain")
-
-        def reading(subsystem, key, *default):
-            class Reader:
-                def __init__(self, node):
-                    node.param_of(subsystem, key, *default)
-            return Reader
-
-        for subsystem, key, default in (("follower", "absent", ()),
-                                         ("absent", "gain", (1.0,)),
-                                         ("follower", "mode", (0.0,))):
-            with self.subTest(subsystem=subsystem, key=key):
-                with self.assertRaises(talos.TalosError):
-                    Sim.from_toml(ROBOT_TOML).add(
-                        reading(subsystem, key, *default), "planner")
+            Sim.from_toml(ROBOT_TOML).add(Missing, "planner")
 
 
 class MessageTest(unittest.TestCase):

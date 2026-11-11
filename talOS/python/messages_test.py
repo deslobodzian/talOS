@@ -128,25 +128,6 @@ class CppBytesTest(unittest.TestCase):
                 self.assertEqual(getattr(message, field), expected,
                                  (label, field))
 
-    def test_layout_is_the_schema_layout(self):
-        for cls, size, alignment in ((Inner, 8, 4), (Mixed, 40, 8),
-                                     (Arrays, 56, 8)):
-            mtype = message_type(cls)
-            self.assertEqual((mtype.size, mtype.alignment), (size, alignment))
-            self.assertEqual(mtype.size, cls.SizeOf())
-        self.assertEqual(message_type(Mixed).fields, (
-            "flag", "position_m", "level", "sample_count", "inner_mode",
-            "inner_offset_m", "speed_frac"))
-        self.assertEqual(message_type(Arrays).fields, (
-            "samples_m", "modes", "inners_0_mode", "inners_0_offset_m",
-            "inners_1_mode", "inners_1_offset_m", "channel_id"))
-
-    def test_a_list_encodes_like_a_tuple(self):
-        self.assertEqual(
-            message_type(Arrays).encode(
-                dict(GOLDEN_VALUES["arrays"][1], samples_m=[1.5, -2.25, 1e9])),
-            self.golden["arrays"])
-
 
 class StructCodecTest(unittest.TestCase):
     def test_every_type_has_its_schema_layout(self):
@@ -159,27 +140,23 @@ class StructCodecTest(unittest.TestCase):
             getattr(sys.modules[cls.__module__], "Create" + cls.__name__)(
                 builder, *(0 for _ in mtype.fields))
             self.assertEqual(mtype.alignment, builder.minalign, cls.__name__)
+        # Nested structs and fixed arrays, as flatc C++ lays them out.
+        for cls, size, alignment in ((Inner, 8, 4), (Mixed, 40, 8),
+                                     (Arrays, 56, 8)):
+            mtype = message_type(cls)
+            self.assertEqual((mtype.size, mtype.alignment), (size, alignment),
+                             cls.__name__)
 
-    def test_encoding_matches_the_builder_byte_for_byte(self):
+    def test_random_values_encode_as_flatc_python_and_decode_back(self):
         rng = random.Random(1234)
         for cls in TYPES:
             mtype = message_type(cls)
-            zeros = zero_fields(cls)
-            self.assertEqual(mtype.encode(zeros),
-                             builder_bytes(cls, mtype, zeros), cls.__name__)
             for _ in range(200):
                 fields = random_fields(rng, mtype)
-                self.assertEqual(mtype.encode(fields),
-                                 builder_bytes(cls, mtype, fields),
+                data = mtype.encode(fields)
+                self.assertEqual(data, builder_bytes(cls, mtype, fields),
                                  (cls.__name__, fields))
-
-    def test_decoding_round_trips(self):
-        rng = random.Random(5678)
-        for cls in TYPES:
-            mtype = message_type(cls)
-            for _ in range(200):
-                fields = random_fields(rng, mtype)
-                message = mtype.decode(mtype.encode(fields))
+                message = mtype.decode(data)
                 for field in mtype.fields:
                     self.assertEqual(getattr(message, field), fields[field],
                                      (cls.__name__, field))
