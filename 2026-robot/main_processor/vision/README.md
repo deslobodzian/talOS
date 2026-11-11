@@ -69,6 +69,13 @@ frame-rate range holds `camera.fps` within a relative 1e-4, since UVC cameras
 report their rates from 100 ns intervals (30 fps as 30.00003), and sets that
 range end's own frame duration when `camera.fps` is at an end of the range,
 otherwise `1 / camera.fps` clamped into the range.
+V4L2 opens `width` × `height` at `camera.fps` (the same relative 1e-4, since
+uvcvideo states intervals in 100 ns: 120 fps is 83333 / 10000000 s) in the
+first pixel format, GREY then YUYV, the device enumerates at that size and
+rate, and reports the format, size and interval `VIDIOC_S_FMT` and
+`VIDIOC_S_PARM` granted. A size or rate the device does not offer, or a grant
+other than the one asked for, fails the open naming the mode and listing the
+modes the device offers; it never opens another size or rate.
 V4L2 applies automatic/manual exposure mode, manual exposure in 100 µs units,
 and requested gain controls before streaming. macOS AVFoundation supports
 automatic exposure mode, but not custom duration/ISO; manual requests remain
