@@ -367,16 +367,19 @@ The writer writes a record to the file within `write_interval` (10 ms) of
 committing it, chunk full or not, so a node killed by a signal (the launcher's
 stall kill, a segfault, an abort), which runs no flush, loses only its last
 10 ms or so plus the writer's scheduling delay: the kernel keeps what was
-written. While records keep arriving the writer wakes and writes once per
-`write_interval` (100 writes a second, whatever the tick rate); otherwise it
-sleeps on a semaphore until a chunk is handed over, a record finds it idle,
-or its once-per-second `fsync` (what a power loss can lose) is due. Handing
+written. While records arrive closer together than `write_interval` the
+writer wakes and writes once per `write_interval` (at most 100 times a
+second, whatever the tick rate); a record that finds it idle is written at
+once, one wakeup per record (50 a second for a 50 Hz node). Once a
+`write_interval` passes with no record, and after a disk error, it sleeps on
+a semaphore until a chunk is handed over, a record finds it idle, or its
+once-per-second `fsync` (what a power loss can lose) is due. Handing
 over a chunk costs the loop thread an atomic increment and load, and
 committing a record one atomic store and load, plus, when the writer is
 idle, one semaphore post (`sem_post` on Linux, `dispatch_semaphore_signal` on
 macOS): it may enter the kernel to wake the writer, but never blocks or takes
-a lock, and a post made before the writer waits is kept. A node logging more
-often than every 10 ms never posts. The writer runs under the normal scheduling
+a lock, and a post made before the writer waits is kept. A node logging
+more often than every 10 ms posts only when its stream starts. The writer runs under the normal scheduling
 policy (`SCHED_OTHER` on Linux, the standard policy on macOS) even when the
 thread that started it runs realtime. If the pool is exhausted,
 capture stops permanently: `failed()` becomes true and `error()` explains why.
