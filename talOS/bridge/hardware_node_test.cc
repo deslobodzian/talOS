@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <system_error>
@@ -25,6 +26,7 @@
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
@@ -1572,10 +1574,11 @@ TEST(HardwareNodeTest, AFloodOfRequestsIsHeldToThePassBudget) {
   EXPECT_EQ(node.identity_rejected() - rejected_before, passes)
       << "a pass that did not read the flood";
   // kPassBudget a window, plus one pass per duty that ends a sleep early
-  // (100 ms: 10 liveness samples, 5 statuses, 3 heartbeats or the neutral,
-  // a probe retry); unbudgeted, the flood makes kFloodUs / kPassCostUs.
+  // (100 ms: 5 statuses, 3 heartbeats or the neutral, a probe retry; the
+  // registry's liveness rides the passes); unbudgeted, the flood makes
+  // kFloodUs / kPassCostUs.
   const uint64_t windows = kFloodUs / HardwareNode::kCpuWindowUs + 1;
-  EXPECT_LE(passes, (windows * HardwareNode::kPassBudget) + 20)
+  EXPECT_LE(passes, (windows * HardwareNode::kPassBudget) + 10)
       << passes << " passes, " << node.wakeups().throttled << " throttled";
 
   std::vector<SentCommand> commands;
@@ -1610,8 +1613,8 @@ WakeReceiver NoDescriptorsLeft() {
 
 // A bridge that cannot build its wake receiver (out of descriptors) still
 // runs: it says so on stderr, counts it, and polls its inputs every kRetryUs
-// where it would otherwise sleep until its next duty (here the registry's
-// liveness sample, 10 ms on).
+// where it would otherwise sleep until its next duty (here its longest
+// wait, 10 ms on).
 // REQ-RT-20
 TEST(HardwareNodeTest, WithoutAWakeReceiverTheBridgePollsItsInputs) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -1632,7 +1635,7 @@ TEST(HardwareNodeTest, WithoutAWakeReceiverTheBridgePollsItsInputs) {
 
   node.set_seams({});
   ASSERT_TRUE(node.OpenWaits());
-  EXPECT_EQ(node.Pass(kStartUs + 200).until_us, kStartUs + 10'000);
+  EXPECT_EQ(node.Pass(kStartUs + 200).until_us, kStartUs + 10'200);
   node.CloseWaits();
 }
 
@@ -1655,7 +1658,95 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   const uint64_t now_us = kStartUs + HardwareNode::kMaxIdlePasses;
   const HardwareNode::Wait wait = node.Pass(now_us);
   EXPECT_FALSE(wait.ignore_input);
-  EXPECT_EQ(wait.until_us, kStartUs + 10'000);  // the liveness sample
+  EXPECT_EQ(wait.until_us, now_us + 10'000);  // the longest wait
+}
+
+// This process's bridge row's heartbeat in the live registry, which a
+// liveness sample stamps; 0 while it has no row.
+std::int64_t BridgeHeartbeat(const introspect::RegistryReader& reader) {
+  std::int64_t heartbeat_ns = 0;
+  std::uint64_t generation = 0;
+  for (const auto& row : reader.nodes()) {
+    if (row.name != kNodeName ||
+        row.pid != static_cast<std::uint64_t>(getpid()) ||
+        row.generation < generation)
+      continue;
+    generation = row.generation;
+    heartbeat_ns = row.heartbeat_monotonic_ns;
+  }
+  return heartbeat_ns;
+}
+
+// The registry's liveness sample (heartbeat and dispatch count, which the
+// launcher's stall check reads) rides every pass rather than waking the
+// bridge on a timer of its own. Driven as Run() drives it, with a State
+// every 5 ms (a few hundred microseconds of jitter) for 1 s: every pass
+// stores the sample, and the bridge wakes at a deadline only for /hw/status
+// (every 20 ms), the unanswered clock probe's retry (every 100001 us) and
+// the full registry sample (every 250 ms), never between States for the
+// liveness sample alone. Then 200 ms with no input at all: every pass
+// still stores it, and none is more than kLivenessBackstopUs (50 ms) after
+// the last.
+// REQ-RT-18
+// REQ-RT-20
+TEST(HardwareNodeTest, TheLivenessSampleRidesEveryPass) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  protocol::RuntimeUdpPeer& gateway = link.gateway;
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  constexpr uint64_t kStartUs = 1'000'000;
+  ASSERT_TRUE(InjectState(
+      node, gateway, TrustState(NodeConfigId(cfg), 11, 1, 1000), kStartUs));
+
+  uint64_t now_us = kStartUs;
+  std::int64_t heartbeat_ns = 0;
+  const auto pass = [&](uint64_t at_us) {
+    EXPECT_LE(at_us - now_us, 50'000u) << "no pass from " << now_us;
+    now_us = at_us;
+    const HardwareNode::Wait wait = node.Pass(now_us);
+    EXPECT_FALSE(wait.ignore_input) << "at " << now_us;
+    EXPECT_GT(wait.until_us, now_us) << "input waiting at " << now_us;
+    const std::int64_t stored_ns = BridgeHeartbeat(*reader);
+    EXPECT_NE(stored_ns, heartbeat_ns) << "no liveness sample at " << now_us;
+    heartbeat_ns = stored_ns;
+    return wait;
+  };
+
+  constexpr uint64_t kStates = 200;
+  HardwareNode::Wait wait = pass(kStartUs);
+  std::vector<uint64_t> deadline_us;
+  uint64_t state_us = kStartUs;
+  for (uint64_t k = 1; k <= kStates; ++k) {
+    state_us = kStartUs + (5000 * k) - 2500 + ((k % 4) * 100);
+    while (wait.until_us < state_us) {
+      deadline_us.push_back(wait.until_us);
+      wait = pass(wait.until_us);
+    }
+    const State state = TrustState(NodeConfigId(cfg), 11, 1, 1000 + (5000 * k));
+    ASSERT_TRUE(InjectState(node, gateway, state, state_us));
+    wait = pass(state_us);
+  }
+  // Every instant a timed duty other than the liveness sample falls due
+  // before the last State. No State shares one: States land 2500-2800 us
+  // into each 5 ms.
+  std::set<uint64_t> duties_us;
+  for (uint64_t t = kStartUs + 20'000; t < state_us; t += 20'000) {
+    duties_us.insert(t);
+  }
+  for (uint64_t t = kStartUs + 100'001; t < state_us; t += 100'001) {
+    duties_us.insert(t);
+  }
+  for (uint64_t t = kStartUs + 250'000; t < state_us; t += 250'000) {
+    duties_us.insert(t);
+  }
+  EXPECT_EQ(deadline_us,
+            std::vector<uint64_t>(duties_us.begin(), duties_us.end()));
+
+  const uint64_t idle_end_us = state_us + 200'000;
+  while (now_us < idle_end_us) wait = pass(wait.until_us);
 }
 
 // RULES.md 3: the bridge's loop allocates nothing in steady state: a

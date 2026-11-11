@@ -89,13 +89,14 @@ class HardwareNode {
     uint64_t until_us;
     bool ignore_input;
   };
-  // Run()'s loop body, without its wait: Tick(now_us), the registry refresh
-  // Run() owes, then arming every request subscriber's wake. Waits until
-  // now_us when input is known to be waiting (an arm found an unread
-  // request, or Tick stopped at kReceiveBudget), otherwise until the next
-  // duty, refresh or the longest wait. Once the CPU budget is spent (see
-  // kCpuWindowUs) it sleeps through input until the window ends, or until
-  // the next duty or refresh if that is sooner.
+  // Run()'s loop body, without its wait: Tick(now_us), the registry's
+  // liveness sample (on every pass, whatever woke it), then arming every
+  // request subscriber's wake. Waits until now_us when input is known to be
+  // waiting (an arm found an unread request, or Tick stopped at
+  // kReceiveBudget), otherwise until the next duty, the full registry
+  // sample, the liveness backstop or the longest wait. Once the CPU budget
+  // is spent (see kCpuWindowUs) it sleeps through input until the window
+  // ends, or until the next duty or registry sample if that is sooner.
   Wait Pass(uint64_t now_us);
   int Run(int duration_s = 0);
 
@@ -198,8 +199,8 @@ class HardwareNode {
  private:
   // The sum of the per-topic counters: the registry's dispatch count.
   std::uint64_t DispatchCount() const;
-  // Heartbeat and dispatch count alone, one registry sample; Run() calls it
-  // every kLivenessPeriodUs between PublishIntrospection() calls.
+  // Heartbeat and dispatch count alone, one registry sample; Pass() calls it
+  // on every pass that does not call PublishIntrospection().
   void RefreshLiveness();
 
   // Describes this node to the live registry. The hardware node predates the
@@ -349,8 +350,13 @@ class HardwareNode {
   // a polling period; the kernel orders time-constraint threads by deadline,
   // so a longer one would put the bridge behind the control nodes.
   static constexpr uint64_t kWakeBudgetUs = 1'000;
-  // Registry: heartbeat and dispatch count, and the full sample.
-  static constexpr uint64_t kLivenessPeriodUs = 10'000;
+  // Registry: every pass stores the heartbeat and dispatch count, so a wake
+  // for them alone is due only once no pass has come for
+  // kLivenessBackstopUs (never while waits work, kMaxWaitUs being shorter),
+  // far inside the launcher's 500 ms minimum stall timeout.
+  static constexpr uint64_t kLivenessBackstopUs = 50'000;
+  static_assert(kMaxWaitUs <= kLivenessBackstopUs);
+  // The full sample, per-source counters included.
   static constexpr uint64_t kIntrospectionPeriodUs = 250'000;
   static constexpr uint64_t kStatusPeriodUs = 20000;
   // Clock probes: one outstanding, at most every kProbePeriodUs. An

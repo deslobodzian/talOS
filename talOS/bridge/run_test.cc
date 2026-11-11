@@ -99,8 +99,8 @@ class StallMeter {
 
 // The launcher kills a running node whose dispatch count stops for its stall
 // timeout (500 ms for the bridge). Run() must store it far more often than
-// its 250 ms counter publish (RefreshLiveness), or a 300 ms pause on top of an
-// old sample reads as a stall. With no gateway the count still moves:
+// its 250 ms full sample (PublishIntrospection), or a 300 ms pause on top of
+// an old sample reads as a stall. With no gateway the count still moves:
 // /hw/status is published every kStatusPeriodUs (20 ms).
 TEST(HardwareNodeTest, RunKeepsRegistryProgressCurrent) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
@@ -208,9 +208,9 @@ TEST(HardwareNodeTest, RunForwardsAStateWhenItArrives) {
       << ", deadline " << wakeups.deadline;
 }
 
-// An idle bridge sleeps until its next duty: the registry's liveness every
-// 10 ms, /hw/status every 20 ms, a clock probe retried every 100 ms and the
-// full registry sample every 250 ms. Over any window it makes at most one
+// An idle bridge sleeps until its next duty or its longest wait: that wait
+// every 10 ms, /hw/status every 20 ms, a clock probe retried every 100 ms and
+// the full registry sample every 250 ms. Over any window it makes at most one
 // pass per duty instant (fewer where they coincide, and fewer, never more,
 // on a loaded host, where a late wake does every duty then due), where a
 // 1 ms poll made one a millisecond. The window ends on an event, the 25th

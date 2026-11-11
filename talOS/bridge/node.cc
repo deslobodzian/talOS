@@ -784,18 +784,19 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   ++wakeups_.passes;
 
   // The per-source counters four times a second, which is enough for a
-  // viewer. Heartbeat and dispatch count every 10 ms, from this loop, as an
-  // event-loop node's loop thread stores its own dispatch count: the
-  // launcher's stall check samples it, and a sample up to 250 ms old plus a
-  // short pause would read as a stall.
+  // viewer. Heartbeat and dispatch count on every pass, from this loop, as an
+  // event-loop node's loop thread stores its own dispatch count at each
+  // dispatch: the launcher's stall check samples it, and a sample up to
+  // 250 ms old plus a short pause would read as a stall. A pass costs them a
+  // few atomic stores; a wake of their own (kLivenessBackstopUs) would cost a
+  // context switch.
   if (now_us >= next_introspection_us_) {
     PublishIntrospection();
     next_introspection_us_ = now_us + kIntrospectionPeriodUs;
-    next_liveness_us_ = now_us + kLivenessPeriodUs;
-  } else if (now_us >= next_liveness_us_) {
+  } else {
     RefreshLiveness();
-    next_liveness_us_ = now_us + kLivenessPeriodUs;
   }
+  next_liveness_us_ = now_us + kLivenessBackstopUs;
 
   // Every request subscriber is armed before the loop may sleep: a request
   // published after its arm notifies request_wake_, and one published

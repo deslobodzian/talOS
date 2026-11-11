@@ -101,6 +101,7 @@ cc_test(
         ":node_test_support",
         "//talOS/driver_station",
         "//talOS/events:events_log",
+        "//talOS/introspection:registry",
         "//talOS/ipc",
         "//talOS/node:allocation_probe",
         "//talOS/protocol:udp_test_helpers",
