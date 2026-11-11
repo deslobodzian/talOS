@@ -200,6 +200,11 @@ void EpollPoller::register_internal_fd(int fd) {
 
 void EpollPoller::add_fd(int fd) { register_internal_fd(fd); }
 
+bool EpollPoller::reported_readable(int fd) const noexcept {
+  return std::find(readable_, readable_ + readable_count_, fd) !=
+         readable_ + readable_count_;
+}
+
 void EpollPoller::remove_fd(int fd) {
   // Errors are ignored here rather than thrown: ENOENT/EBADF just mean `fd`
   // was never watched or already closed (the documented no-op case), and
@@ -296,7 +301,7 @@ EpollPoller::WakeReason EpollPoller::wait_until(MonotonicTime deadline) {
   // chance to observe; a deferred WOKEN or DEADLINE simply surfaces (or, in
   // the timer's case, gets rearmed and re-evaluated) on the next call.
   bool woken = false;
-  bool readable = false;
+  readable_count_ = 0;
   for (int i = 0; i < n; ++i) {
     const int fd = events[i].data.fd;
     if (fd == timer_fd_) {
@@ -305,11 +310,11 @@ EpollPoller::WakeReason EpollPoller::wait_until(MonotonicTime deadline) {
       Drain(wake_fd_);
       woken = true;
     } else {
-      readable = true;
+      readable_[readable_count_++] = fd;
     }
   }
 
-  if (readable) return WakeReason::READABLE;
+  if (readable_count_ > 0) return WakeReason::READABLE;
   if (woken) return WakeReason::WOKEN;
   return WakeReason::DEADLINE;
 }

@@ -1,6 +1,8 @@
 #include "talOS/process/process.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <poll.h>
 #include <pthread.h>
 
 #include <chrono>
@@ -24,19 +26,69 @@ namespace {
 
 using namespace std::chrono_literals;
 
-TEST(ProcessTest, StopHandlersSetStopRequestedOnSigintAndSigterm) {
-  stop_requested.store(false, std::memory_order_relaxed);
+// Whether `fd` has something to read, without waiting.
+bool Readable(int fd) {
+  pollfd entry{.fd = fd, .events = POLLIN, .revents = 0};
+  return ::poll(&entry, 1, 0) == 1 && (entry.revents & POLLIN) != 0;
+}
+
+// A stop signal must reach a node's event loop wherever it waits: SIGINT and
+// SIGTERM set the flag and make the stop pipe readable, which is what the
+// loop watches.
+// REQ-OPS-06
+TEST(ProcessTest, StopSignalsSetTheFlagAndWakeTheStopFd) {
   InstallStopHandlers();
-  EXPECT_FALSE(stop_requested.load(std::memory_order_relaxed));
+  stop_requested.store(false);
+  ASSERT_FALSE(ConsumeStopWake());
+  ASSERT_GE(StopFd(), 0);
+  EXPECT_FALSE(Readable(StopFd()));
 
-  std::raise(SIGINT);
-  EXPECT_TRUE(stop_requested.load(std::memory_order_relaxed));
+  for (const int signal : {SIGINT, SIGTERM}) {
+    SCOPED_TRACE(signal);
+    std::raise(signal);
+    EXPECT_TRUE(stop_requested.load());
+    EXPECT_TRUE(Readable(StopFd()));
+    EXPECT_TRUE(ConsumeStopWake());
+    stop_requested.store(false);
+    EXPECT_FALSE(ConsumeStopWake());
+    EXPECT_FALSE(Readable(StopFd()));
+  }
+}
 
-  stop_requested.store(false, std::memory_order_relaxed);
-  std::raise(SIGTERM);
-  EXPECT_TRUE(stop_requested.load(std::memory_order_relaxed));
+// A storm of stops never blocks the handler, which would hang the signalled
+// thread, however full the pipe: here more stale bytes than a pipe holds
+// (64 KiB on Linux and macOS), each left by a stop the flag was then cleared
+// of. The next watcher reads them out instead of spinning on them, and a stop
+// requested from code afterwards still wakes it and stays visible.
+// REQ-OPS-06
+TEST(ProcessTest, RepeatedStopsNeverBlockAndStaleWakesAreReadOut) {
+  InstallStopHandlers();
+  stop_requested.store(false);
+  ASSERT_FALSE(ConsumeStopWake());
+  constexpr int kStops = 70'000;
+  for (int i = 0; i < kStops; ++i) {
+    std::raise(SIGTERM);
+    stop_requested.store(false);
+  }
+  EXPECT_TRUE(Readable(StopFd()));
+  EXPECT_FALSE(ConsumeStopWake());
+  EXPECT_FALSE(Readable(StopFd()));
 
-  stop_requested.store(false, std::memory_order_relaxed);
+  RequestStop();
+  EXPECT_TRUE(Readable(StopFd()));
+  EXPECT_TRUE(ConsumeStopWake());
+  EXPECT_TRUE(Readable(StopFd()));  // for every other watcher
+  stop_requested.store(false);
+  EXPECT_FALSE(ConsumeStopWake());
+}
+
+// A child a node execs must not inherit the stop pipe, and a watcher reading
+// it out must never block.
+TEST(ProcessTest, TheStopFdIsCloseOnExecAndNonBlocking) {
+  const int fd = StopFd();
+  ASSERT_GE(fd, 0);
+  EXPECT_NE(::fcntl(fd, F_GETFD) & FD_CLOEXEC, 0);
+  EXPECT_NE(::fcntl(fd, F_GETFL) & O_NONBLOCK, 0);
 }
 
 // Bridge above control above observers on Linux, all below the SCHED_FIFO 50
