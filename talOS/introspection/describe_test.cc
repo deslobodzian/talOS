@@ -117,7 +117,8 @@ TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
       DescribeManifest("empty", "//e:empty", event::Manifest{}, kSlots),
       DescribeManifest("shooter", "//s:shooter", sample_manifest(), kSlots)};
   // Reported, reported as none, and not reported (nullopt) stay distinct.
-  written[0].params = {{"describe_version", "describe_version"}};
+  written[0].params =
+      std::vector<ParamRead>{ParamRead{"describe_version", "describe_version"}};
   written[1].params.emplace();
   DeclaredGraph read;
   std::string error;

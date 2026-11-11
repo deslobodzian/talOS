@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <numbers>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1257,17 +1258,18 @@ TEST(VisionTest, InvalidMountUncertaintyParamsFailConstruction) {
 
 TEST(VisionTest, ShutdownWithRecordingActiveCompletesPromptly) {
   const auto session = RecordingTempDir("shutdown");
+  std::optional<talos::testing::Sim> sim{MakeSim(true, true)};
+  sim->set_session_dir(session);
+  sim->add<Vision>("rear_right_camera");
+  sim->step(1ms);
+  sim->publish(sim::topics::kState, Truth(*sim));
+  sim->step(50ms);
+  sim->publish(sim::topics::kState, Truth(*sim));
+  sim->step(50ms);
+  // Only the shutdown is timed: construction and the steps are not what
+  // this guards, and a sanitizer build spends seconds in them.
   const auto start = std::chrono::steady_clock::now();
-  {
-    auto sim = MakeSim(true, true);
-    sim.set_session_dir(session);
-    sim.add<Vision>("rear_right_camera");
-    sim.step(1ms);
-    sim.publish(sim::topics::kState, Truth(sim));
-    sim.step(50ms);
-    sim.publish(sim::topics::kState, Truth(sim));
-    sim.step(50ms);
-  }  // Vision destructor joins the worker, then the bounded recorder
+  sim.reset();  // Vision destructor joins the worker, then the bounded recorder
   const auto elapsed = std::chrono::steady_clock::now() - start;
   EXPECT_LT(elapsed, std::chrono::seconds{5})
       << "shutdown with recording active took "

@@ -216,11 +216,11 @@ TEST(PollerTest, DeadlineHoldsWhenTimerDeliveryStalls) {
   ASSERT_EQ(lateness.size(), kWaits);
   for (const Duration late : lateness) EXPECT_GE(late, Duration::zero());
   // A gross bound: the timeout's coalescing leeway is about a fifth of the
-  // wait, and a loaded runner adds scheduling delay; an unbounded wait is
-  // what this catches.
+  // wait, and a loaded or sanitizer runner adds scheduling delay (7.4 ms
+  // seen under macOS TSan); an unbounded wait is what this catches.
   auto median = lateness.begin() + kWaits / 2;
   std::nth_element(lateness.begin(), median, lateness.end());
-  EXPECT_LT(*median, 5 * kMillisecond);
+  EXPECT_LT(*median, kWait);
 }
 
 // The time-constraint policy talos::process::ConfigureRealtime gives a control
