@@ -163,39 +163,35 @@ can_id = 1
       0);
 }
 
-TEST(LauncherTest, StudioBridgeNeedsFlagAndSim) {
+// REQ-OPS-30: the flag alone decides; --sim does not.
+TEST(LauncherTest, StudioBridgeNeedsOnlyTheFlag) {
   const auto has_bridge = [](const std::vector<NodeSpec>& nodes) {
     return std::count_if(nodes.begin(), nodes.end(), [](const NodeSpec& n) {
       return n.name == "studio_bridge";
     });
   };
-  // Neither flag nor sim: the bridge stays outside the session, as before.
-  EXPECT_EQ(
-      has_bridge(DiscoverNodes(config::ParseRobotConfigString(kFixtureToml),
-                               LauncherOptions{})),
-      0);
-  // Flag without sim (a deployed session): no webroot, no browser, no bridge.
-  LauncherOptions flag_only;
-  flag_only.start_studio_bridge = true;
-  EXPECT_EQ(has_bridge(DiscoverNodes(
-                config::ParseRobotConfigString(kFixtureToml), flag_only)),
-            0);
-  // Sim without the flag (--no-studio): the session runs headless.
-  LauncherOptions sim_only;
-  sim_only.simulation = true;
-  EXPECT_EQ(has_bridge(DiscoverNodes(
-                config::ParseRobotConfigString(kFixtureToml), sim_only)),
-            0);
-  // Both: declared with the framework default target.
-  LauncherOptions both;
-  both.simulation = true;
-  both.start_studio_bridge = true;
-  auto nodes =
-      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), both);
-  ASSERT_EQ(has_bridge(nodes), 1);
-  for (const auto& n : nodes) {
-    if (n.name == "studio_bridge") {
-      EXPECT_EQ(n.target, "//studio/bridge:studio_bridge");
+  // Without the flag (sim.sh --no-studio, or a deployed session that did
+  // not ask), the session runs headless, sim or not.
+  for (const bool simulation : {false, true}) {
+    LauncherOptions no_flag;
+    no_flag.simulation = simulation;
+    EXPECT_EQ(has_bridge(DiscoverNodes(
+                  config::ParseRobotConfigString(kFixtureToml), no_flag)),
+              0)
+        << "simulation=" << simulation;
+  }
+  // With it, declared with the framework default target, sim or not.
+  for (const bool simulation : {false, true}) {
+    LauncherOptions flag;
+    flag.simulation = simulation;
+    flag.start_studio_bridge = true;
+    const auto nodes =
+        DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), flag);
+    ASSERT_EQ(has_bridge(nodes), 1) << "simulation=" << simulation;
+    for (const auto& n : nodes) {
+      if (n.name == "studio_bridge") {
+        EXPECT_EQ(n.target, "//studio/bridge:studio_bridge");
+      }
     }
   }
 }
@@ -653,8 +649,10 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
 }
 
 // A bridge that survives its grace second joins the session: it is not failed
-// and the session runs to the deadline with it.
-TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
+// and the session runs to the deadline with it. A session against the real
+// controller (no --sim) starts it too, so a deployed robot is viewable in
+// Studio (REQ-OPS-30).
+TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   const std::string tag = "bridge_stable";
   const std::string out_dir = TempPath(tag + "_out");
   std::filesystem::create_directories(out_dir);
@@ -662,7 +660,6 @@ TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
   LauncherOptions options;
   options.output_dir = out_dir;
   options.session_id = 0x57AB1EULL;
-  options.simulation = true;
   options.start_studio_bridge = true;
   options.describe_timeout_ms = 4000;
   options.duration_s = 3;
@@ -692,7 +689,15 @@ TEST(LauncherTest, StableBridgeJoinsSessionUntilDeadline) {
       out_dir + "/" + std::to_string(options.session_id);
   ASSERT_TRUE(std::filesystem::exists(session + "/manifest.json"));
   const std::string manifest = ReadFile(session + "/manifest.json");
-  EXPECT_NE(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
+  EXPECT_NE(manifest.find("\"simulation\": false"), std::string::npos)
+      << manifest;
+  const std::size_t bridge = manifest.find("\"name\": \"studio_bridge\"");
+  ASSERT_NE(bridge, std::string::npos) << manifest;
+  // Its first run was a spawned process (a run never spawned has pid -1).
+  const std::size_t runs = manifest.find("\"runs\": [", bridge);
+  ASSERT_NE(runs, std::string::npos) << manifest;
+  EXPECT_NE(manifest.find("{\"pid\": ", runs),
+            manifest.find("{\"pid\": -1", runs))
       << manifest;
   // A stable viewer is a session member, not a failure.
   EXPECT_EQ(manifest.find("\"recorder_failed\": true"), std::string::npos)

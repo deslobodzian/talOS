@@ -47,9 +47,9 @@ struct LauncherOptions {
   int duration_s{0};
   bool start_sim_gateway{false};
   std::vector<std::string> sim_gateway_args;
-  // Sim sessions only: run the Studio viewer bridge as a supervised member of
-  // the session (see "Studio bridge" in studio_bridge.h and [studio] in the
-  // robot config).
+  // Run the Studio viewer bridge as a supervised member of the session, with
+  // or without --sim (see "Studio bridge" in studio_bridge.h and [studio] in
+  // the robot config).
   bool start_studio_bridge{false};
 
   // Controller addressing. Empty/zero means "take it from [robot]".
