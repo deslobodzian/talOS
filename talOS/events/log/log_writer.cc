@@ -386,13 +386,13 @@ void LogWriter::State::submit_active() noexcept {
   // Publishes both the chunk bytes and used count to the writer. Sequentially
   // consistent, like the writer_idle check after it (see writer_idle).
   submitted.fetch_add(1, std::memory_order_seq_cst);
-  // A post only when the writer may be asleep, so a busy writer costs the
-  // producer one atomic load per chunk. The post takes no lock and does not
-  // block; at most it wakes the writer.
-  if (writer_idle.load(std::memory_order_seq_cst) &&
-      writer_idle.exchange(false, std::memory_order_seq_cst)) {
-    wake.post();
-  }
+  // Always a post, idle or not: a writer asleep until its next timed write
+  // (writer_idle false) must not leave a full chunk waiting write_interval,
+  // or a producer filling the pool within one would exhaust it. One post per
+  // chunk; it takes no lock and does not block, and a post to a writer
+  // already awake only makes its next wait return at once.
+  writer_idle.store(false, std::memory_order_seq_cst);
+  wake.post();
 }
 
 // Only the producer selects free chunks. The consumer returns ownership by
@@ -607,7 +607,8 @@ void LogWriter::State::start_writer() {
       // due; while records are streaming (the last write was such a wait's)
       // the writer also sleeps until then without telling the producer it
       // is idle, so a steady stream is written once per write_interval and
-      // the producer never posts. Otherwise, with nothing to write, the
+      // its records never post (a hand-off always does, so a full chunk is
+      // written at once). Otherwise, with nothing to write, the
       // writer sleeps until a hand-off or a new record (the producer posts
       // when it finds the writer idle, and that record is written at once),
       // flush()/destruction (which always post), or the next periodic sync,

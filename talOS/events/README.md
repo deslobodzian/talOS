@@ -374,13 +374,15 @@ second, whatever the tick rate); a record that finds it idle is written at
 once, one wakeup per record (50 a second for a 50 Hz node). Once a
 `write_interval` passes with no record, and after a disk error, it sleeps on
 a semaphore until a chunk is handed over, a record finds it idle, or its
-once-per-second `fsync` (what a power loss can lose) is due. Handing
-over a chunk costs the loop thread an atomic increment and load, and
-committing a record one atomic store and load, plus, when the writer is
-idle, one semaphore post (`sem_post` on Linux, `dispatch_semaphore_signal` on
+once-per-second `fsync` (what a power loss can lose) is due. A full chunk
+never waits for `write_interval`: handing it over costs the loop thread an
+atomic increment and one semaphore post whether or not the writer sleeps, so
+a flood wakes the writer once per chunk. Committing a record costs one
+atomic store and load, plus, when the writer is idle, one semaphore post (`sem_post` on Linux, `dispatch_semaphore_signal` on
 macOS): it may enter the kernel to wake the writer, but never blocks or takes
 a lock, and a post made before the writer waits is kept. A node logging
-more often than every 10 ms posts only when its stream starts. The writer runs under the normal scheduling
+more often than every 10 ms posts a record only when its stream starts.
+The writer runs under the normal scheduling
 policy (`SCHED_OTHER` on Linux, the standard policy on macOS) even when the
 thread that started it runs realtime. If the pool is exhausted,
 capture stops permanently: `failed()` becomes true and `error()` explains why.
