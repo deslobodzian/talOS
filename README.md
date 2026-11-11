@@ -25,6 +25,9 @@ bazel test //examples/superstructure/...
 The RoboRIO program (`2026-robot/controller_processor/rio`) builds with
 GradleRIO, not Bazel.
 
+How tests are chosen and run: [docs/TESTING.md](docs/TESTING.md). How a
+change is made and verified: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
 ## Run in simulation
 
 ```sh

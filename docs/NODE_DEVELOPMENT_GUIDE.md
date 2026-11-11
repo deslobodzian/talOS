@@ -431,6 +431,8 @@ framework already links but does not export fails at analysis.
 
 ## Testing
 
+Which cases every node tests, and how: [TESTING.md](TESTING.md#7-the-node-test-matrix).
+
 `talos::testing::Sim` (`//talOS/node:testing`) runs nodes on one simulated clock
 with in-memory topics; `talos::testing::SimHardware` (`//talOS/devices:testing`)
 stands in for the bridge.

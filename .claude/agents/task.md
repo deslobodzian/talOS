@@ -13,7 +13,10 @@ on. Stay inside the file set and do not change a fixed interface; if the slice
 cannot be done without that, stop and report what would have to change.
 
 The slice is done when its code, its test (RULES.md 10 and 12) and every doc
-it makes untrue (RULES.md 13) are updated. Match the repo's `.clang-format`,
+it makes untrue (RULES.md 13) are updated. Read docs/TESTING.md §2, §4 and §7
+before writing a test, and tag it with the requirement it guards. For a
+defect, see the new test fail for the reported reason before fixing, and
+quote that failure in your report. Match the repo's `.clang-format`,
 `.clang-tidy` and buildifier conventions.
 
 Do not run `bazel build` or `bazel test` unless the brief names one narrow

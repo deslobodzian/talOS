@@ -51,10 +51,14 @@ Breaking one of these is a review blocker.
 
 ## Verification
 
-10. New node behaviour gets a `Sim`/`SimHardware` (or `talos.testing`) test
-    covering the disabled and stale-target cases.
-11. Before a commit the main session runs, after integrating all slices:
-    `bazel build //...` and `bazel test --test_output=errors //...`;
+10. New node behaviour gets the node test matrix
+    ([docs/TESTING.md §7](docs/TESTING.md#7-the-node-test-matrix)): every
+    applicable case, or its stated n/a.
+11. Before each commit the main session runs, after integrating all slices,
+    the tests the change affects and launcher `--describe-only` on every
+    affected config ([docs/DEVELOPMENT.md §5](docs/DEVELOPMENT.md#5-verification-ladder)).
+    Before each push it runs, from a clean worktree of the commits to be
+    pushed: `bazel build //...` and `bazel test --test_output=errors //...`;
     launcher `--describe-only` on every affected config for topic, node or
     config changes; `./gradlew phoenixTest` and `./gradlew buildRio` for
     RoboRIO program changes; `pnpm test` and `pnpm build` for `studio/`
@@ -66,6 +70,9 @@ Breaking one of these is a review blocker.
     wiring, forwarding, incidental defaults or tautologies, and no second test
     of the same path; delete such tests when found. Never fix a test by
     raising a timeout or deleting an assertion that guards real behaviour.
+    A flake is a defect: no `flaky`, no retries, no rerunning to green, and
+    never widen a bound a requirement states. Method and examples:
+    [docs/TESTING.md](docs/TESTING.md) §4 and §8.
 
 ## Documentation and scope
 
@@ -79,3 +86,6 @@ Breaking one of these is a review blocker.
 14. One commit is one logical fix (format in AGENTS.md). Problems found
     outside the task are reported, and recorded in TODO.md if left open, not
     folded into the current commit.
+15. A feature or fix names the requirement it serves
+    ([docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)). Code that serves none is
+    not written; see [docs/DESIGN.md §6](docs/DESIGN.md#6-scope-serve-a-requirement-or-go).

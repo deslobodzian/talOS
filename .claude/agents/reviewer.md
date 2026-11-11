@@ -21,10 +21,13 @@ Check the change against every rule in RULES.md, then these traps:
   message layout change with a C++, Python or Studio consumer left behind; a
   size change without `docs/DATA_FLOW.md` and its assert; `talOS/` reaching
   into a robot, example or `studio/`.
-- **Verification gaps (10–12), concern:** new node behaviour without its
-  disabled and stale-target test; graph or config changes without
+- **Verification gaps (10–12, 15), concern:** new node behaviour without
+  its matrix cases (docs/TESTING.md §7); graph or config changes without
   `--describe-only`; RoboRIO edits without the gradle checks; a test that
-  pins wording, wiring or defaults, or repeats a covered path.
+  fails docs/TESTING.md §4's four checks or matches its banned table; a test
+  guarding a requirement without its `REQ-` tag; a wall-clock wait in a
+  unit, component or contract test; a retry, `flaky` or widened bound; a
+  feature or fix that names no requirement.
 - **Docs (13), concern:** any doc or comment the change makes untrue.
 - **Commit (14), nit unless misleading:** message missing the AGENTS.md
   Problem / Fix / Why / Tests / Docs fields, or unrelated fixes in one commit.

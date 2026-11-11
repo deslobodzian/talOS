@@ -9,9 +9,11 @@ topics; the RoboRIO is only the hardware layer, reached over UDP.
 
 @talOS/NAMING.md
 
-API reference: `docs/NODE_DEVELOPMENT_GUIDE.md`. Method (units, node anatomy,
-test matrix, open source first): `docs/METHODOLOGY.md`. Mechanism walkthrough:
-`examples/superstructure/README.md`.
+API reference: `docs/NODE_DEVELOPMENT_GUIDE.md`. Node conventions (units,
+node anatomy, open source first): `docs/METHODOLOGY.md`. Testing (tiers, node
+test matrix, flakes, CI lanes): `docs/TESTING.md`. Requirements:
+`docs/REQUIREMENTS.md`. Design notes and fitness functions: `docs/DESIGN.md`.
+Mechanism walkthrough: `examples/superstructure/README.md`.
 
 ## Build, test, lint
 
@@ -32,13 +34,12 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
   not Bazel: `./gradlew phoenixTest` and `./gradlew buildRio` from that directory.
 - Studio (`studio/`): `pnpm test`, `pnpm build` (runs `tsc --noEmit`);
   regenerate TS bindings with `pnpm generate` after editing `talOS/telemetry/telemetry.fbs`.
-- CI also checks changed files (a pull request: since its merge base with
-  `main`; a push: since the previous push, or since the merge base with `main`
-  for a new branch or force push) with `clang-format-18 --dry-run --Werror`,
+- CI also checks changed files with `clang-format-18 --dry-run --Werror`,
   `clang-tidy-18` (repo `.clang-format` / `.clang-tidy`; tests included; a
   changed header is analyzed through sources that include it), and
   `buildifier --mode=check --lint=warn` on changed BUILD, `.bzl` and
-  `MODULE.bazel` files. Match them.
+  `MODULE.bazel` files. Match them. What CI runs where:
+  `docs/TESTING.md` §9.
 
 ## Run in simulation
 
@@ -63,21 +64,9 @@ model, effort and tools. The main session runs on Opus at high effort.
 
 Plan mode uses the built-in `Plan` agent; a security pass is `/security-review`.
 
-Dispatch by default; the main session coordinates instead of doing every step itself:
+## Development workflow
 
-- Unknown code: spawn `scout`s in parallel (one per package or question)
-  before opening files.
-- Multi-file or multi-package work: split into independent slices with their
-  file sets and shared interfaces (messages, topics, C ABI signatures) fixed in
-  each brief, and spawn all `task`s in one message. A node-API feature or
-  device type (RULES.md 6) is one slice per layer only when the interface is
-  fixed first; otherwise one `task` owns it.
-- Effort: pass `effort: "lower"` for mechanical or fully specified slices and
-  `"higher"` for safety paths (actuation gating, `Target`, mode generations,
-  wire formats, shared-memory layout) or an open root cause.
-- Subagents do not run `bazel build`/`bazel test`; the main session runs the
-  RULES.md 11 checks once after integrating.
-- Before committing a non-trivial change, run `reviewer` on the diff.
+@docs/DEVELOPMENT.md
 
 ## Implementation rules
 
@@ -100,5 +89,5 @@ Deferred: known follow-ups, also recorded in TODO.md.
 ```
 
 Work lands on a topic branch (`hardening/...`, `feature/...`), one commit per
-fix, verified with the checks above before committing. Do not squash
+fix, verified per RULES.md 11 (the ladder in `docs/DEVELOPMENT.md` §5). Do not squash
 unrelated fixes together; do not rewrite published history.

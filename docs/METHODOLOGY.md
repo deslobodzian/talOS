@@ -11,13 +11,14 @@ Each rule carries its status:
 |---|---|
 | **[enforced]** | the build, the graph lint or a test fails when it is broken |
 | **[review]** | a convention; the `reviewer` agent (`.claude/agents/reviewer.md`) checks it |
+| **[gap]** | stated, but nothing checks it yet; names the TODO.md item that adds the check |
 
 ## 1. What the four goals mean here
 
 | Goal | Means | Checked by |
 |---|---|---|
-| Robust | A node never moves a motor on a disabled robot, a stale target, missing feedback or a non-finite number; bad config fails at construction, before anything moves. | §5, §8, the test matrix in §11 |
-| Reliable | A node does the same thing on the robot, in `Sim` and in replay; a restart mid-match does nothing unsafe; one dead node stops only what it owns. | §9, §11 |
+| Robust | A node never moves a motor on a disabled robot, a stale target, missing feedback or a non-finite number; bad config fails at construction, before anything moves. | §5, §8, the [node test matrix](TESTING.md#7-the-node-test-matrix) |
+| Reliable | A node does the same thing on the robot, in `Sim` and in replay; a restart mid-match does nothing unsafe; one dead node stops only what it owns. | §9, the [node test matrix](TESTING.md#7-the-node-test-matrix) |
 | Performant | `update()` is bounded, allocation-free and I/O-free; every control path has a known latency. | §10 |
 | Easy | Adding a subsystem means a node package, its TOML and one manifest line. Nothing else changes, in any language. | §12 |
 
@@ -119,7 +120,7 @@ There are exactly two kinds of input, and they are treated differently.
   within 1 ms. A callback switches the node to 1 ms polling (§10). **[review]**
 - Read another subsystem only through its messages and topics, or a configured
   value it owns through `param_of` in the constructor. Never include
-  its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[enforced: Bazel visibility, review]**
+  its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[review; gap: ARCH-2]**
 
 ## 4. Outputs
 
@@ -145,7 +146,7 @@ There are exactly two kinds of input, and they are treated differently.
    backend-wide pulse suppression are different operations; verify the
    attached device's physical response. **[enforced; hardware qualification]**
 4. Never write `/hw/request/<node>` and never send hardware requests outside
-   `update()`. **[enforced: graph lint, one writer]**
+   `update()`. **[enforced: `publish` refuses `/hw/request`, graph lint; gap: ARCH-2, node code can still reach `detail::NodeAccess` and raw RTMS publishers]**
 5. Closed loops run on the Talon (`set_velocity`, `set_position`,
    `set_motion_magic`). Run a loop in the node only when it needs data the Talon
    does not have, such as pose or vision. **[review]**
@@ -181,7 +182,7 @@ Rules:
   shaft units (`_rot`). A node that turns a shaft angle into a field-frame
   angle (a gyro yaw into a heading) converts there and publishes `_rad`. In
   C++ math, use plain `double` with unit-suffixed names and
-  `talos::geometry` types for frame transforms (§14); in Python, `math.tau`.
+  `talos::geometry` types for frame transforms (§13); in Python, `math.tau`.
   talos adds no units library of its own. **[review]**
 - **TalonFX gains** (`slot0..2`) are in Phoenix units per **mechanism** unit,
   because `sensor_to_mechanism_ratio` is applied: `v` is volts per mechanism
@@ -279,8 +280,8 @@ Rules:
 
 | Rule | Budget | Status |
 |---|---|---|
-| `update()` p99 wall time | ≤ 10 % of `period_us` | [review]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
-| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the `drivetrain`, `shooter`, `autonomous`, `driver`, `vision` (live camera and direct-projection sim), `talOS/teleop` and `talOS/telemetry` `node_test`s, and over the bridge's `Tick()` on a live gateway link in `talOS/bridge`'s `hardware_node_test`; macOS and glibc, skipped under sanitizers; §13]; the rest [review] |
+| `update()` p99 wall time | ≤ 10 % of `period_us` | [review; gap: SPEC-4, no benchmark asserts it]; measure callback entry-to-exit duration in a dedicated benchmark, using a monotonic wall clock, and compute the percentile from those durations. Registry / Studio `max_latency` measures maximum dispatch-start lateness, not callback duration or p99. Benchmark clocks must not replace `node.now()` in control logic. |
+| Allocations, locks, file or socket I/O, logging, `print` in `update()` | none (allocate in the constructor, reuse members) | allocations [enforced: `talos::testing::AllocationProbe` (`//talOS/node:allocation_probe`) counts the loop thread's allocations over a window of steady-state ticks in the `drivetrain`, `shooter`, `autonomous`, `driver`, `vision` (live camera and direct-projection sim), `talOS/teleop` and `talOS/telemetry` `node_test`s, and over the bridge's `Tick()` on a live gateway link in `talOS/bridge`'s `hardware_node_test`; macOS and glibc, skipped under sanitizers ([TESTING.md §7](TESTING.md#7-the-node-test-matrix))]; the rest [review] |
 | Python nodes | cost memory (≈ 30 MB) and add GC/interpreter jitter: hard 5 ms actuator loops belong in C++, while 20 ms supervisory/estimator nodes monitor age and watchdog timeouts | [review] |
 | Hops on a control path | each timer-drained hop adds up to one consumer period; keep driver input → actuator to ≤ 2 node hops | [review]; producer → consumer is one hop (`Target` resolves lanes in the consumer) |
 | Per-tick work | O(devices), never O(history); bound every loop | [review] |
@@ -291,62 +292,20 @@ Prefer timer-drained inputs unless prompt callback reaction is required.
 
 ## 11. Testing
 
-Every node gets a `Sim`/`SimHardware` (C++) or `talos.testing` (Python) test
-with **all** of these cases **[review; the scaffold generates the skeleton]**:
-
-| Case | Expect |
-|---|---|
-| Happy path | the right mode and demand on each actuator; `state` reflects it |
-| Robot disabled (`hw.enable(false)`) | every actuator neutral, `state.enabled == false`, `state` still published |
-| Target stale (stop publishing; step past `command_timeout_us`) | neutral within one period after the timeout |
-| Target released (`ReleaseTarget` / `sim.release_target`) | neutral (or the next lane in priority) on the next tick |
-| Target never sent | neutral; no exception |
-| Driver Station lost (`hw.stop_driver_station()`) | neutral once the DS is stale |
-| Feedback disconnected (`hw.set_connected(node, dev, false)`) | neutral; validity flag cleared |
-| Non-finite demand | neutral; no NaN in `state` |
-| Bad parameter | the constructor throws, naming the key |
-| Source switch (a node with several lanes) | the old mode's lane is ignored after a mode change |
-| Target from an earlier mode generation (`PublishTarget(..., message, before)` / `sim.publish_target(..., mode_since_us=before)` after a re-enable) | neutral, even when it lands in the same drain as the re-enabling packet |
-
-Publish targets with `talos::testing::PublishTarget` / `sim.publish_target`,
-with `hw.enable()` and a teleop-enabled Driver Station
-(`hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop))` /
-`hw.set_driver_station(enabled=True, teleop=True)`). They stamp the mode
-generation of the newest Driver Station packet
-(`DriverStationGeneration(sim)` / `sim.driver_station_generation`), as a
-producer that has drained it would.
-
-- Test behaviour through topics and `SimHardware`. Never test private methods
-  or log text.
-- A config change runs `talos_graph_test` (CI) and launcher `--describe-only`
-  **[enforced]**.
-- A C ABI change keeps `node_api_test` and `talos_test` exercising the new
-  symbol from both languages. `HardwareLink::fresh()` and `age()` are exposed
-  in both languages; `//talOS/python:api_parity_test` enforces matching ABI
-  versions, exports, return and parameter types, and `TALOS_*` constant
-  values between `node_api.h` and `_abi.py` (and that `talos.Mode` takes its
-  values from `_abi.py`); `node_api.cc` static_asserts the header's device
-  kinds, motor modes and Driver Station flags against the C++ enums.
+The node test matrix and the rest of the testing method: [TESTING.md](TESTING.md).
 
 ## 12. Adding things
 
 | Adding | Do | Never |
 |---|---|---|
-| A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the §11 tests | edit `operator_interface` or `telemetry` code |
+| A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the [node test matrix](TESTING.md#7-the-node-test-matrix) | edit `operator_interface` or `telemetry` code |
 | A producer of a target (auto routine, auto-align, operator input) | a `talos::TargetLane` on `/<sub>/target/<source>`, opened with a `talos::OperatorArming` for operator input; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
 | A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish state with validity while disabled too; [estimator walkthrough](NODE_DEVELOPMENT_GUIDE.md#adding-a-pose-estimator) | duplicate shared geometry or hand-roll a Kalman filter |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |
 | A device type | `talOS/hardware`, `talOS/devices`, `devices.py`, the RoboRIO program, in one change | |
 | A node-API feature | `talOS/node` (or `devices`), `talOS/node_api`, `talOS/python/talos`, tests in both languages, in one change | a Python-only reimplementation |
 
-## 13. Implementation qualifications
-
-| Where | Deviation | Rule | Fix |
-|---|---|---|---|
-| `talOS/node/allocation_probe.cc` | counts nothing under a sanitizer, whose allocator bypasses `malloc_logger` and cannot sit beside a replaced glibc `malloc`; those tests skip | §10 | none: plain builds run it |
-| `intake`, `pose_estimator` | no allocation check: a Python tick allocates in the interpreter | §10 | none: Python nodes stay [review] |
-
-## 14. Open source first
+## 13. Open source first
 
 Before writing a library, a format or an algorithm, use a maintained
 open-source one if it fits. talos code is the glue the robot needs: nodes,
