@@ -102,9 +102,13 @@ run inside a node. Timing from a busy host is not evidence (TESTING.md §6).
    `sim_timestamp_lag_us = 0` on the robot; it is a sim-only injection, ignored
    live, not a calibration setting.
 7. Set positive `camera.exposure_ms` / `camera.gain` for manual capture (or
-   explicitly set `auto_exposure` / `auto_gain`). Confirm status
-   `controls_applied = true` and `control_failure_count = 0`; macOS does not
-   expose custom duration/ISO, so manual requests report failure. Verify with a
+   explicitly set `auto_exposure` / `auto_gain`). On Linux a control the
+   camera lacks, refuses or cannot hold fails the open, naming it in the
+   node's log; `v4l2-ctl -d <device> -L` lists what it offers. Check with
+   `v4l2-ctl -d <device> -C auto_exposure,exposure_time_absolute,gain` while
+   the node runs. On macOS confirm status `controls_applied = true` and
+   `control_failure_count = 0`; AVFoundation does not expose custom
+   duration/ISO, so manual requests report failure there. Verify with a
    blink/motion test rather than assuming a configured value reached hardware.
 8. Test a USB stall/unplug while disabled. With a connected source,
    `frame_timeout_us` of silence (default 500,000 µs) increments `stall_count`
