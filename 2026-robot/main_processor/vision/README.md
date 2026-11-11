@@ -29,7 +29,7 @@ the code's value when no file sets the key.
 | `camera.latency_offset_us` | `0` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
 | `camera.sim_timestamp_lag_us` | `0` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
 | `camera.readout_us` | — | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
-| `camera.frame_timeout_us` | — | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker, and is the maximum live stamp age (see timestamps below) and the maximum age of a rasterized sim result. |
+| `camera.frame_timeout_us` | — | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker (before an open's first frame the deadline is at least 3 s, below), and is the maximum live stamp age (see timestamps below) and the maximum age of a rasterized sim result. |
 | `camera.exposure_ms` | `5.0` | `0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
 | `camera.gain` | — | `0` | Backend-native manual gain; zero leaves gain unspecified. |
 | `camera.auto_exposure`, `camera.auto_gain` | — | `exposure_ms == 0`, `gain == 0` | True only when duration/gain is zero; with the shared values auto exposure is off and auto gain on. |
@@ -315,6 +315,9 @@ backoff of 0.1, 0.2, 0.4, 0.8, then at most 1 second, resetting after a
 processed frame. This also recovers permission denial,
 capture-loop exits, and connected cameras with no frame for `frame_timeout_us`.
 The silence timer starts at successful open and resets on frame receipt;
+until an open's first frame its deadline is the longer of `frame_timeout_us`
+and 3 s, since a UVC camera's first frame arrives 0.6–1.8 s after it starts
+streaming (an OV9281 on Linux, measured);
 `stall_count` counts silence retirements and `reconnect_count` counts successful
 opens after the first successful connection. Each connection state change
 (`Connected`, `Disconnected`, `Error`) logs one line naming the node and the
