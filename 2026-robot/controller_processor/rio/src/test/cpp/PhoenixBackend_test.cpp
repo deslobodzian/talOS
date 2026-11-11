@@ -76,17 +76,6 @@ struct EnabledDs {
   }
 };
 
-// The bridge heartbeat (at most 20 ms), not Gateway ticks, refreshes one-shot
-// requests in production. Refresh here too so requests do not age out mid-test.
-void PumpReads(PhoenixBackend& backend, hw::State& s,
-               std::span<const hw::MotorRequest> cmd, int iters = 20) {
-  for (int i = 0; i < iters; ++i) {
-    backend.Apply(cmd);
-    backend.Read(s);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-}
-
 // Because one simulator thread serves every device (see main()), anything that
 // delays it (host scheduling, or disk I/O where no RAM directory exists) stops
 // every device from answering requests (TxFailed, RxTimeout) and publishing
@@ -104,6 +93,81 @@ bool ReadUntil(PhoenixBackend& backend, hw::State& state, Done done) {
     if (std::chrono::steady_clock::now() >= deadline) return false;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
+}
+
+// Phoenix stamps feedback with the host clock, so a stall of its simulator
+// thread or of this one (a loaded host) ages every device's feedback: past
+// 50 ms the backend rightly reports it invalid and holds followers neutral,
+// and the devices can sit at 0 V for tens of milliseconds after the stall.
+// Feedback is fresh here while every motor and sensor reads younger than
+// kFreshAgeUs (unused slots read 0), which leaves the rest of the 50 ms window
+// for this thread's next call; a pump ends only after kSteadyReads fresh reads
+// in a row, so the state it leaves follows 100 ms without a stall.
+constexpr uint32_t kFreshAgeUs = 20'000;
+constexpr int kSteadyReads = 10;
+
+bool FeedbackFresh(const hw::State& s) {
+  const auto fresh = [](const auto& sample) {
+    return sample.position_age_us < kFreshAgeUs &&
+           sample.velocity_age_us < kFreshAgeUs;
+  };
+  return std::all_of(s.motors.begin(), s.motors.end(), fresh) &&
+         std::all_of(s.sensors.begin(), s.sensors.end(), fresh);
+}
+
+// Until the returned instant, Apply still finds the motor feedback this read
+// got fresh (the backend's window is 50 ms); `read_start` when any was stale.
+std::chrono::steady_clock::time_point FreshUntil(
+    const hw::State& s, std::chrono::steady_clock::time_point read_start) {
+  uint32_t age_us = 0;
+  for (const auto& m : s.motors) {
+    if (!m.valid && m.id != 0) return read_start;
+    age_us = std::max({age_us, m.position_age_us, m.velocity_age_us});
+  }
+  if (age_us >= 50'000) return read_start;
+  return read_start + std::chrono::microseconds(50'000 - age_us);
+}
+
+// Reads every 10 ms and after each read calls `step(fresh_until)`, which
+// applies the requests: they are one-shot, refreshed in production by the
+// bridge heartbeat (at most 20 ms), not by Gateway ticks, so they are re-sent
+// on stale reads too. An Apply finished before `fresh_until` saw every motor's
+// feedback fresh. Stops at the first failed step, or once `iters` steps ran
+// and the last kSteadyReads reads, `s` among them, were fresh; fails once
+// kReadyTimeout has passed.
+template <typename Step>
+::testing::AssertionResult Pump(PhoenixBackend& backend, hw::State& s,
+                                int iters, Step step) {
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  int fresh_reads = 0;
+  for (int i = 0;; ++i) {
+    const auto read_start = std::chrono::steady_clock::now();
+    backend.Read(s);
+    fresh_reads = FeedbackFresh(s) ? fresh_reads + 1 : 0;
+    if (i >= iters && fresh_reads >= kSteadyReads)
+      return ::testing::AssertionSuccess();
+    if (std::chrono::steady_clock::now() >= deadline) break;
+    if (auto result = step(FreshUntil(s, read_start)); !result) return result;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  auto failure = ::testing::AssertionFailure()
+                 << "no " << kSteadyReads << " fresh reads in a row within "
+                 << kReadyTimeout.count() << " s; last read:";
+  for (std::size_t i = 0; i < s.motors.size(); ++i)
+    failure << " motor slot " << i << " age "
+            << std::max(s.motors[i].position_age_us,
+                        s.motors[i].velocity_age_us)
+            << " us;";
+  return failure;
+}
+
+void PumpReads(PhoenixBackend& backend, hw::State& s,
+               std::span<const hw::MotorRequest> cmd, int iters = 20) {
+  const auto pumped = Pump(backend, s, iters, [&](auto) {
+    backend.Apply(cmd);
+    return ::testing::AssertionSuccess();
+  });
+  if (!pumped) ADD_FAILURE() << pumped.message();
 }
 
 bool IsTransportTimeout(int status) {
@@ -599,6 +663,12 @@ class PhoenixBackendFollowerFeedback
     return backend.motors_[0]->GetVelocity(false);
   }
 
+  // The refreshed feedback of motor `i`, as FeedbackFresh judges a read.
+  static bool Fresh(PhoenixBackend& backend, std::size_t i) {
+    return backend.motors_[i]->GetPosition(false).GetTimestamp().GetLatency() <
+           units::microsecond_t{kFreshAgeUs};
+  }
+
   static void RefreshExcept(PhoenixBackend& backend,
                             ctre::phoenix6::BaseStatusSignal& stale) {
     std::vector<ctre::phoenix6::BaseStatusSignal*> signals;
@@ -650,9 +720,14 @@ TEST_P(PhoenixBackendFollowerFeedback,
   // Stop refreshing exactly one cached feedback signal. Read would refresh it,
   // so inspect physical sim voltage directly instead of masked state fields.
   auto& stale = StaleSignal(backend, remote, position);
+  // As Pump does, end only after kSteadyReads fresh refreshes of the master in
+  // a row, so a simulator stall cannot leave it at 0 V when sampled.
   std::this_thread::sleep_for(std::chrono::milliseconds(70));
-  for (int i = 0; i < 20; ++i) {
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  for (int i = 0, fresh_reads = 0; i < 20 || fresh_reads < kSteadyReads; ++i) {
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline);
     RefreshExcept(backend, stale);
+    fresh_reads = Fresh(backend, 1) ? fresh_reads + 1 : 0;
     ASSERT_TRUE(backend.Apply(commands));
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
@@ -865,15 +940,25 @@ TEST_F(PhoenixBackendRecovery, SendFailureNeutralizesOnlyThatMotor) {
     ASSERT_TRUE(state.motors[i].valid) << i;
   // Test-only fault injection: an out-of-range master CAN id makes Phoenix
   // reject the follower's Follower request, a genuine SetControl failure.
+  // Only a send on fresh feedback is held to it: on stale feedback the
+  // backend rightly holds the follower neutral and sends no Follower request.
   MotorConfig(backend, 0).can_id = 99;
-  for (int i = 0; i < 30; ++i) {
-    ASSERT_TRUE(backend.Apply(commands));
+  int checked = 0;
+  ASSERT_TRUE(Pump(backend, state, 30, [&](auto fresh_until) {
+    if (!backend.Apply(commands))
+      return ::testing::AssertionFailure() << "Apply refused";
+    if (std::chrono::steady_clock::now() >= fresh_until)
+      return ::testing::AssertionSuccess();
+    ++checked;
     const auto failed = backend.ApplyFailedDevices();
-    ASSERT_EQ(std::vector<uint16_t>(failed.begin(), failed.end()),
-              std::vector<uint16_t>{20});
-    backend.Read(state);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+    if (std::vector<uint16_t>(failed.begin(), failed.end()) ==
+        std::vector<uint16_t>{20})
+      return ::testing::AssertionSuccess();
+    auto failure = ::testing::AssertionFailure() << "failed sends {";
+    for (const auto id : failed) failure << " " << id;
+    return failure << " }, want only the follower's { 20 }";
+  }));
+  ASSERT_GT(checked, 0);
   ctre::phoenix6::hardware::TalonFX master{1, ctre::phoenix6::CANBus{"rio"}};
   ctre::phoenix6::hardware::TalonFX follower_device{
       2, ctre::phoenix6::CANBus{"rio"}};
@@ -886,12 +971,13 @@ TEST_F(PhoenixBackendRecovery, SendFailureNeutralizesOnlyThatMotor) {
 
   // The next successful send clears the report and following resumes.
   MotorConfig(backend, 0).can_id = 1;
-  for (int i = 0; i < 30; ++i) {
-    ASSERT_TRUE(backend.Apply(commands));
-    EXPECT_TRUE(backend.ApplyFailedDevices().empty());
-    backend.Read(state);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  ASSERT_TRUE(Pump(backend, state, 30, [&](auto) {
+    if (!backend.Apply(commands))
+      return ::testing::AssertionFailure() << "Apply refused";
+    if (!backend.ApplyFailedDevices().empty())
+      return ::testing::AssertionFailure() << "a send still failed";
+    return ::testing::AssertionSuccess();
+  }));
   EXPECT_GT(follower_device.GetSimState().GetMotorVoltage().value(), 3.0);
 }
 
