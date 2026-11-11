@@ -58,7 +58,7 @@ times the time and adds a source of nondeterminism.
 | Target selection, mode generations, arming | component, in `talOS/devices` | written once in the framework; a node proves only that it uses `Target` (the matrix, §7) |
 | Owner timeout, request merge, boot and epoch rejection | component on `//talOS/bridge:merge` and `SimHardware` | the bridge runs the same code; UDP adds nothing |
 | Wire layout, slot size, ABI, grammar | contract + compile-time `static_assert` | a size change must fail the build (RULES.md 9) |
-| Supervision: restart, quarantine, deadlines | component with an injected clock for the policy; integration for one real spawn or kill per mechanism **[gap: TEST-2]** | a policy test should not wait out a real deadline |
+| Supervision: restart, quarantine, deadlines | component with an injected clock for the policy; integration for one real spawn or kill per mechanism **[gap: TEST-3]** | a policy test should not wait out a real deadline |
 | No node moves a motor while disabled, whole graph | e2e, judged from the log | only the session log sees every process |
 | A latency number a requirement states | perf, on a qualified host (§6) | a shared runner cannot hold it |
 
