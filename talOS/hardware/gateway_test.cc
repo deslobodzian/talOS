@@ -645,27 +645,43 @@ TEST(Gateway, InvalidRemoteFeedbackIsolatesOnlyItsMotor) {
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
 }
 
-// The bench's CAN silences froze every device's feedback for 64-66 ms
-// (TODO.md RESET-3). Feedback younger than command_timeout_us still counts:
-// every motor drives, with no fault and no new epoch.
+// The bench's CAN silences froze the feedback of its one Talon FX for
+// 64-66 ms (TODO.md RESET-3). Feedback younger than command_timeout_us still
+// counts: through the gap the command in force keeps driving, with no
+// neutral, no fault and no new epoch, and a command built during it drives.
 // REQ-SAFE-22
 TEST(Gateway, LateFeedbackUnderTheTimeoutKeepsDriving) {
+  Config config;
+  config.commissioned = true;
+  MotorConfig motor;
+  motor.id = 1;
+  motor.name = "motor";
+  motor.can_id = 1;
+  motor.max_velocity_rps = 20;
+  config.motors.push_back(motor);
+  ASSERT_EQ(config.command_timeout_us, 100000u);
   FakeBackend backend;
-  const auto config = SwerveConfig(true);
   Gateway g{config, backend, 1};
   g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
   const auto epoch = g.snapshot().epoch;
-  backend.age_us = 65000;
-  g.Tick(6000, true);
-  ASSERT_TRUE(g.Accept(Request(g), 1, 6000));
-  for (std::size_t i = 0; i < config.motors.size(); ++i) {
-    EXPECT_EQ(backend.last_requests[i].mode, Mode::kVelocity)
-        << config.motors[i].name;
+  const int applied = backend.applied;
+  const int neutrals = backend.neutral;
+  for (uint64_t now = 6000; now <= 66000; now += 5000) {
+    backend.age_us = static_cast<uint32_t>(now - 1000);
+    g.Tick(now, true);
+    const auto s = g.snapshot();
+    ASSERT_TRUE(s.motors[0].valid) << now;
+    EXPECT_TRUE(s.flags & kCommandActive) << now;
+    EXPECT_FALSE(s.flags & kHardwareFault) << now;
+    EXPECT_EQ(s.epoch, epoch) << now;
   }
-  const auto s = g.snapshot();
-  EXPECT_FALSE(s.flags & kHardwareFault);
-  EXPECT_EQ(s.epoch, epoch);
-  EXPECT_EQ(s.counters.neutralized_motor_count, 0u);
+  EXPECT_EQ(backend.applied, applied);
+  EXPECT_EQ(backend.neutral, neutrals);
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kVelocity);
+  ASSERT_TRUE(g.Accept(Request(g), 2, 66000));
+  EXPECT_EQ(backend.last_requests[0].mode, Mode::kVelocity);
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, 0u);
 }
 
 // A position or velocity sample command_timeout_us old, of a motor or of the
@@ -701,6 +717,129 @@ TEST(Gateway, FeedbackAtTheTimeoutIsolatesItsMotor) {
     const auto s = g.snapshot();
     EXPECT_EQ(s.counters.neutralized_motor_count, 1u);
     EXPECT_FALSE(s.flags & kHardwareFault);
+  }
+}
+
+// The swerve config plus a follower of its first rotor-feedback motor.
+struct FollowedSwerve {
+  Config config = SwerveConfig(true);
+  std::size_t drive = MotorIndex(config, Feedback::kRotor);
+  std::size_t steer = MotorIndex(config, Feedback::kRemoteCANcoder);
+  std::size_t follower = config.motors.size();
+  FollowedSwerve() {
+    auto motor = config.motors[drive];
+    motor.id = 100;
+    motor.name = "drive_follower";
+    motor.can_id = 60;
+    motor.master_id = config.motors[drive].id;
+    config.motors.push_back(motor);
+  }
+};
+
+// A motor whose feedback goes invalid while a command drives it is sent
+// neutral in the tick that finds it invalid, with its follower, without
+// waiting for the next command; the other motors keep their demands, no
+// hardware fault is raised and the command stays in force. FeedbackFresh
+// makes an age one microsecond under command_timeout_us fresh and an age at
+// it invalid, so the first stops nothing.
+// REQ-SAFE-22
+TEST(Gateway, InvalidFeedbackNeutralizesAtThatTick) {
+  const FollowedSwerve swerve;
+  const auto& config = swerve.config;
+  const uint32_t bound = config.command_timeout_us;
+  for (int row = 0; row < 3; ++row) {
+    SCOPED_TRACE(row == 0   ? "motor position age"
+                 : row == 1 ? "remote CANcoder position age"
+                            : "backend reports it invalid");
+    const uint16_t aged = row == 0
+                              ? config.motors[swerve.drive].id
+                              : config.motors[swerve.steer].feedback_sensor_id;
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+    const auto epoch = g.snapshot().epoch;
+    const int neutrals = backend.neutral;
+    int applied = backend.applied;
+    if (row < 2) {
+      backend.position_ages[aged] = bound - 1;
+      g.Tick(6000, true);
+      EXPECT_EQ(backend.applied, applied);
+      for (const auto& request : backend.last_requests) {
+        EXPECT_EQ(request.mode, Mode::kVelocity) << request.id;
+      }
+      backend.position_ages[aged] = bound;
+    } else {
+      backend.invalid_motor = config.motors[swerve.drive].id;
+    }
+    g.Tick(7000, true);
+    EXPECT_EQ(backend.applied, applied + 1);
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      const bool isolated = row == 1
+                                ? i == swerve.steer
+                                : i == swerve.drive || i == swerve.follower;
+      EXPECT_EQ(backend.last_requests[i].mode,
+                isolated ? Mode::kNeutral : Mode::kVelocity)
+          << config.motors[i].name;
+    }
+    const auto s = g.snapshot();
+    EXPECT_FALSE(s.flags & kHardwareFault);
+    EXPECT_TRUE(s.flags & kCommandActive);
+    EXPECT_EQ(s.epoch, epoch);
+    EXPECT_EQ(backend.neutral, neutrals);
+    applied = backend.applied;
+    g.Tick(8000, true);  // Already neutral: nothing more to send.
+    EXPECT_EQ(backend.applied, applied);
+  }
+}
+
+// A motor whose feedback was invalid drives again only on a command whose
+// observed State shows it valid: neither the command in force when it went
+// invalid nor one built on a State that showed it invalid moves it once its
+// feedback returns, while the other motors drive on both; the first command
+// observing a State with it valid drives it.
+// REQ-SAFE-22
+TEST(Gateway, RecoveredMotorNeedsALaterObservation) {
+  const FollowedSwerve swerve;
+  const auto& config = swerve.config;
+  for (int row = 0; row < 2; ++row) {
+    SCOPED_TRACE(row == 0 ? "motor position age"
+                          : "remote CANcoder position age");
+    const uint16_t aged = row == 0
+                              ? config.motors[swerve.drive].id
+                              : config.motors[swerve.steer].feedback_sensor_id;
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    const auto expect_isolated = [&](const char* phase, bool neutral) {
+      SCOPED_TRACE(phase);
+      for (std::size_t i = 0; i < config.motors.size(); ++i) {
+        const bool isolated = row == 1
+                                  ? i == swerve.steer
+                                  : i == swerve.drive || i == swerve.follower;
+        EXPECT_EQ(backend.last_requests[i].mode,
+                  neutral && isolated ? Mode::kNeutral : Mode::kVelocity)
+            << config.motors[i].name;
+      }
+    };
+    g.Tick(1000, true);
+    const auto before = Request(g);
+    ASSERT_TRUE(g.Accept(before, 1, 1000));
+    backend.position_ages[aged] = config.command_timeout_us;
+    g.Tick(6000, true);
+    const auto during = Request(g);
+    expect_isolated("invalid", true);
+    backend.position_ages.erase(aged);
+    const int applied = backend.applied;
+    g.Tick(11000, true);
+    ASSERT_TRUE(g.snapshot().flags & kCommandActive);
+    EXPECT_EQ(backend.applied, applied);
+    expect_isolated("recovered, command in force", true);
+    ASSERT_TRUE(g.Accept(before, 2, 11000));
+    expect_isolated("command observed before it went invalid", true);
+    ASSERT_TRUE(g.Accept(during, 3, 11000));
+    expect_isolated("command observed while it was invalid", true);
+    ASSERT_TRUE(g.Accept(Request(g), 4, 11000));
+    expect_isolated("command observed after it recovered", false);
   }
 }
 

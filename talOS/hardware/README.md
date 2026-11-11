@@ -316,12 +316,13 @@ whose positions are not physical (the ideal `SimBackend`) opts out through
 `Backend::PositionsArePhysical()`. A reset neutralizes only affected motors and
 their followers or remote-feedback dependents before starting
 `BeginRestoreAfterReset(ids)`. The global epoch and unrelated commands survive;
-pre-reset observations cannot authorize the affected motors after recovery.
+observations up to the last State that masked the affected motors cannot
+authorize them after recovery.
 `PollRestore()` never blocks: Phoenix reapplies only the affected device chain
 on a worker while ticks, state publication and unrelated outputs continue.
 Failed devices retry after 250 ms, doubling to 2 s. A successful restore requires
-a fresh command observation before resuming. `Gateway::restore_attempt_count()`
-counts all restore starts per boot. Motors whose control send failed join the
+a command observing a State after the last masked one before resuming.
+`Gateway::restore_attempt_count()` counts all restore starts per boot. Motors whose control send failed join the
 same unavailable set: their followers and dependents go neutral at once, the
 rest of the command keeps applying, and restore re-applies the chain's config
 before a fresh command retries the send. A motor that keeps failing is
@@ -339,12 +340,18 @@ velocity sample is `command_timeout_us` old or older (an unknown age,
 gap shorter than that bound does not invalidate the feedback at the gateway;
 a consumer's own, tighter age bound still applies (the drivetrain drops
 odometry samples older than 50 ms, see its [README](../../2026-robot/main_processor/drivetrain/README.md)). Invalid motor
-motion feedback neutralizes only that motor's non-neutral demands. A missing or
-invalid remote CANcoder also neutralizes only motors using it; healthy motors in
-the same command continue driving. These neutralizations increment
-`neutralized_motor_count`. The backend remains healthy while any configured
-motor or CAN sensor has valid feedback (or none are configured). Total loss of
-all configured motor/CAN-sensor feedback neutralizes every output and advances
+motion feedback, or a missing or invalid remote CANcoder, neutralizes only that
+motor and its followers; healthy motors in the same command continue driving.
+The neutral starts in the tick that finds the feedback invalid, while a command
+is in force (between commands a backend keeps the last request it sent), and
+holds in every command accepted until one observes a State in which the motor
+may drive again: neither the command in force nor one built on a State that
+showed it invalid moves it once its feedback returns (`Gateway::MayDrive`; the
+same floor as a reset, above). Neutralized demands in accepted commands
+increment `neutralized_motor_count`; the tick's neutral does not. The backend
+remains healthy while any configured motor or CAN sensor has valid feedback
+(or none are configured). Total loss of all configured motor/CAN-sensor
+feedback neutralizes every output and advances
 the command epoch on the tick it is found, whether or not a command is in
 force. Failed global Apply or backend configuration failure also
 neutralizes every output; individual device configuration or control-send

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -34,8 +35,9 @@ class Backend {
   // gate.h) and treats every configured motor and CAN sensor invalid as total
   // loss. Return false for a failed read pass or total motor/CAN-sensor
   // feedback loss, not an individual dropout. With no such devices configured,
-  // return true. Individual sample validity gates only the affected motor in
-  // Accept().
+  // return true. An invalid sample gates only the affected motor and its
+  // followers and dependents: neutral from the Tick that finds it, and driven
+  // again only by a command observing a later State.
   virtual bool Read(State&) = 0;
   // Followers ignore demand values, but kNeutral explicitly gates their output.
   // Gateway resolves a live follower's mode from its sanitized master.
@@ -164,6 +166,11 @@ class Gateway {
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);
   bool DeviceUnavailable(uint16_t id) const;
   void MaskUnavailable();
+  // Whether motor i's own feedback, and its remote CANcoder's, is valid in
+  // this tick's State.
+  bool FeedbackValid(std::size_t i) const;
+  // FeedbackValid for the motor and, for a follower, for its master.
+  bool MayDrive(std::size_t i) const;
   void NeutralUnavailable();
   bool ApplyMotors(std::span<const MotorRequest> requests);
   bool IsolateFailedMotors();
@@ -182,7 +189,10 @@ class Gateway {
   std::vector<uint16_t> unavailable_;
   std::vector<uint16_t> restoring_ids_;
   std::array<MotorRequest, kMaxMotors> last_requests_{};
-  std::array<uint64_t, kMaxMotors> motor_reset_at_{};
+  // Per motor, the earliest observation time a command may drive it on: one
+  // past the last State in which it could not drive (MayDrive false: invalid
+  // or masked feedback, or a follower's master's).
+  std::array<uint64_t, kMaxMotors> motor_drives_from_{};
   // A rotor-feedback motor's last valid position since the gateway last
   // masked it, and the earliest time that sample can have been taken.
   struct PositionReference {
