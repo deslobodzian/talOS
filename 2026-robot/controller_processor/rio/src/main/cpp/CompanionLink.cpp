@@ -7,6 +7,7 @@
 #include <cinttypes>
 #include <cstdio>
 
+#include "RioLog.h"
 #include "protocol/types.h"
 
 #ifdef __linux__
@@ -133,16 +134,22 @@ void CompanionReporter::Poll(uint64_t now_us) {
   status.config_id = config_id_.load(std::memory_order_relaxed);
   sink_.Publish(status);
 
+  // Every message starts with the console's time prefix (RioLog's
+  // ConsoleTime), so it can be placed against the program's console lines.
+  char time[kConsoleTimeSize];
+  FormatConsoleTime(now_us, time);
   char text[160];
   if (status.protocol_ok != reported_protocol_ok_) {
     reported_protocol_ok_ = status.protocol_ok;
     if (status.protocol_ok) {
-      sink_.Report(false, "companion protocol mismatch cleared");
+      std::snprintf(text, sizeof(text), "%scompanion protocol mismatch cleared",
+                    time);
+      sink_.Report(false, text);
     } else {
       std::snprintf(text, sizeof(text),
-                    "companion speaks protocol %u, this RoboRIO program %u: "
+                    "%scompanion speaks protocol %u, this RoboRIO program %u: "
                     "deploy both from one build",
-                    static_cast<unsigned>(status.peer_protocol),
+                    time, static_cast<unsigned>(status.peer_protocol),
                     static_cast<unsigned>(protocol::kProtocolVersion));
       sink_.Report(true, text);
     }
@@ -151,22 +158,23 @@ void CompanionReporter::Poll(uint64_t now_us) {
     reported_connected_ = true;
     reported_unheard_ = false;
     connected_since_us_ = now_us;
-    sink_.Report(false, "companion connected");
+    std::snprintf(text, sizeof(text), "%scompanion connected", time);
+    sink_.Report(false, text);
   } else if (!status.connected && reported_connected_) {
     reported_connected_ = false;
     reported_unheard_ = true;
     std::snprintf(text, sizeof(text),
-                  "companion lost: no frame for %.1f s; every output is "
+                  "%scompanion lost: no frame for %.1f s; every output is "
                   "neutral",
-                  status.frame_age_s);
+                  time, status.frame_age_s);
     sink_.Report(true, text);
   } else if (!status.connected && !reported_unheard_ && status.protocol_ok &&
              now_us - first_poll_us_ >= kStartupGraceUs) {
     // A mismatch already says why nothing is heard.
     reported_unheard_ = true;
     std::snprintf(text, sizeof(text),
-                  "companion not heard in %.0f s since robot code start",
-                  static_cast<double>(now_us - first_poll_us_) / 1e6);
+                  "%scompanion not heard in %.0f s since robot code start",
+                  time, static_cast<double>(now_us - first_poll_us_) / 1e6);
     sink_.Report(true, text);
   }
 
@@ -181,13 +189,14 @@ void CompanionReporter::Poll(uint64_t now_us) {
     reported_no_commands_ = true;
     if (command_us == 0) {
       std::snprintf(text, sizeof(text),
-                    "companion up, but no actuator commands since it "
-                    "connected: are its nodes running?");
+                    "%scompanion up, but no actuator commands since it "
+                    "connected: are its nodes running?",
+                    time);
     } else {
       std::snprintf(text, sizeof(text),
-                    "companion up, but no actuator commands for %.1f s: are "
+                    "%scompanion up, but no actuator commands for %.1f s: are "
                     "its nodes running?",
-                    status.command_age_s);
+                    time, status.command_age_s);
     }
     sink_.Report(false, text);
   }

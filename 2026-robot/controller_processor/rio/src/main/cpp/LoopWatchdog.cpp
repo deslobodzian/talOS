@@ -12,6 +12,8 @@
 #include <memory>
 #include <utility>
 
+#include "RioLog.h"
+
 namespace talos::rio {
 
 LoopWatchdog::~LoopWatchdog() { Stop(); }
@@ -34,12 +36,15 @@ void LoopWatchdog::Poll(uint64_t now_us) {
   const uint64_t stall = stalls_.fetch_add(1, std::memory_order_relaxed) + 1;
   // Possibly a newer beat's time than the deadline's; the text only.
   const uint64_t beat_us = beat_us_.load(std::memory_order_relaxed);
+  char time[kConsoleTimeSize];
+  FormatConsoleTime(now_us, time);
   char text[256];
   std::snprintf(
       text, sizeof(text),
-      "RoboRIO loop stalled past an expired command: no tick for %llu ms, "
+      "%sRoboRIO loop stalled past an expired command: no tick for %llu ms, "
       "%llu ms past its deadline; watchdog %s every output each poll until "
       "it ticks (stall %llu)",
+      time,
       static_cast<unsigned long long>(
           now_us > beat_us ? (now_us - beat_us) / 1000 : 0),
       static_cast<unsigned long long>((now_us - deadline) / 1000),
@@ -76,11 +81,13 @@ void LoopWatchdog::Run(const std::function<uint64_t()>& clock,
 #endif
   if (realtime_priority > 0 &&
       !frc::SetCurrentThreadPriority(true, realtime_priority)) {
-    char text[128];
+    char time[kConsoleTimeSize];
+    FormatConsoleTime(clock(), time);
+    char text[160];
     std::snprintf(text, sizeof(text),
-                  "RoboRIO loop watchdog: realtime priority %d refused; it "
+                  "%sRoboRIO loop watchdog: realtime priority %d refused; it "
                   "runs at default scheduling, and so does the loop",
-                  realtime_priority);
+                  time, realtime_priority);
     outputs_.Report(text);
   }
 #ifdef __linux__

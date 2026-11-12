@@ -52,9 +52,15 @@ enum class TickPhase : uint8_t {
 };
 
 // "[<seconds>.<milliseconds>] ", the prefix of this program's own console
-// lines: `steady_us` on the steady clock, the gateway's clock (State's
-// sample_time_us), which on Linux counts from kernel boot.
+// lines and Driver Station messages: `steady_us` on the steady clock, the
+// gateway's clock (State's sample_time_us), which on Linux counts from kernel
+// boot.
 std::string ConsoleTime(uint64_t steady_us);
+
+// The same prefix in a caller's buffer, NUL-terminated, for a thread that
+// must not allocate (the loop watchdog's).
+inline constexpr std::size_t kConsoleTimeSize = 32;
+void FormatConsoleTime(uint64_t steady_us, char (&out)[kConsoleTimeSize]);
 
 enum class LogKind : uint8_t {
   kMotorFault,      // FaultField (faults and limits) changed: value,

@@ -37,11 +37,15 @@ const char* Or(const char* value, const char* fallback) {
 
 }  // namespace
 
-std::string ConsoleTime(uint64_t steady_us) {
-  char text[32];
-  std::snprintf(text, sizeof(text), "[%llu.%03llu] ",
+void FormatConsoleTime(uint64_t steady_us, char (&out)[kConsoleTimeSize]) {
+  std::snprintf(out, sizeof(out), "[%llu.%03llu] ",
                 static_cast<unsigned long long>(steady_us / 1'000'000),
                 static_cast<unsigned long long>(steady_us / 1'000 % 1'000));
+}
+
+std::string ConsoleTime(uint64_t steady_us) {
+  char text[kConsoleTimeSize];
+  FormatConsoleTime(steady_us, text);
   return text;
 }
 

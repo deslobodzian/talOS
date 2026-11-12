@@ -534,6 +534,9 @@ void Robot::StartCompetition() {
 #ifndef __FRC_ROBORIO__
   // The same summary line the standalone sim_gateway prints, so the drivetrain
   // integration test can make the identical assertions about either gateway.
+  // Alone among this program's lines it has no ConsoleTime prefix: it is a
+  // record for that test, which finds it by its start
+  // (tools/test_drivetrain.py SUMMARY), not a line to place in time.
   const auto final_state = gateway_->snapshot();
   std::printf(
       "sim_robot: active_ticks=%llu first_wheel_rotations=%.6f "

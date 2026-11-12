@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "RioLog.h"
+
 namespace {
 
 using talos::rio::CompanionContact;
@@ -82,6 +84,14 @@ TEST(CompanionReporter, ReportsEachLinkChangeOnce) {
   ASSERT_EQ(reports.size(), 1u);
   EXPECT_TRUE(reports[0].first);
   EXPECT_NE(reports[0].second.find("lost"), std::string::npos);
+  // Stamped with the poll's time on the console's clock, so the message
+  // lines up with the program's time-stamped console lines.
+  EXPECT_EQ(reports[0].second.rfind(
+                talos::rio::ConsoleTime(last_frame +
+                                        CompanionReporter::kLinkTimeoutUs),
+                0),
+            0u)
+      << reports[0].second;
   EXPECT_FALSE(sink.last.connected);
 
   now = last_frame + 2 * CompanionReporter::kLinkTimeoutUs;
