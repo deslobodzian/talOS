@@ -1430,6 +1430,133 @@ TEST(LogCapture, BudgetTooSmallForHeaderDoesNotGrowOrStopTheNode) {
   }
 }
 
+// A capped log written with `options`, one 16-byte record at each of
+// `times_ns` (its record time, Context::now). Returns the kept files.
+std::vector<std::string> WriteTimedLog(const std::string& path,
+                                       const LogWriter::Options& options,
+                                       const std::vector<std::int64_t>& times) {
+  for (const auto& file : LogSegmentFiles(path)) ::unlink(file.c_str());
+  ::unlink(CappedMarkerPath(path).c_str());
+  {
+    LogWriter writer{path, "timed", options};
+    writer.start(MakeManifest(), {});
+    for (std::size_t i = 0; i < times.size(); ++i) {
+      Context context{};
+      context.dispatch_index = i + 1;
+      context.now = MonotonicTime::from_nanos(times[i]);
+      writer.dispatch(context, MakePayload(16, static_cast<int>(i + 1)));
+    }
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+    EXPECT_FALSE(writer.capture_stopped());
+  }
+  return LogSegmentFiles(path);
+}
+
+// Seconds from the first kept record to the last.
+double KeptSpanSeconds(const std::vector<std::string>& files) {
+  std::int64_t first = 0;
+  std::int64_t last = 0;
+  bool any = false;
+  for (const auto& file : files) {
+    LogReader reader{file};
+    LogReader::Record record;
+    while (reader.next(record)) {
+      if (!any) first = record.header.now_ns;
+      last = record.header.now_ns;
+      any = true;
+    }
+    EXPECT_FALSE(reader.truncated()) << file;
+  }
+  return static_cast<double>(last - first) / 1e9;
+}
+
+std::vector<std::int64_t> EveryPeriod(std::int64_t period_ns,
+                                      std::int64_t until_ns) {
+  std::vector<std::int64_t> times;
+  for (std::int64_t t = 0; t < until_ns; t += period_ns) times.push_back(t);
+  return times;
+}
+
+// REQ-OPS-32. With a window W, a capped log keeps between 7/8 of W and W of
+// its newest record time whatever its rate, while its bytes fit: a log at
+// 10 records/s and one at 1000/s, 60.5 s each, under a cap that holds 8 s of
+// the fast one, both keep 7 to 8 s of a W = 8 s window. Without the window
+// (or uncapped) the slow log keeps all of its 60.5 s, as before; a cap too
+// small for W / 8 of the fast log's records still ends its segments on
+// bytes, so it keeps less.
+TEST(LogCapture, WindowEndsSegmentsOnRecordTime) {
+  constexpr std::int64_t kSecond = 1'000'000'000;
+  constexpr std::int64_t kRecord = sizeof(RecordHeader) + 16;
+  const auto slow = EveryPeriod(kSecond / 10, 60 * kSecond + kSecond / 2);
+  const auto fast = EveryPeriod(kSecond / 1000, 60 * kSecond + kSecond / 2);
+  // Eight segments, each 1.25 s of the fast log's records.
+  const std::uint64_t cap =
+      8 * (RecordsOffset() + static_cast<std::uint64_t>(1250 * kRecord));
+  // Synchronous: the rule is the producer's, the same for a background
+  // writer, which here could run out of chunks with sixty rotations queued.
+  LogWriter::Options options{64u << 10, 1, /*background=*/false, cap};
+  options.window = std::chrono::seconds{8};
+  const auto path = TempPath("window");
+  for (const auto* times : {&slow, &fast}) {
+    const auto files = WriteTimedLog(path, options, *times);
+    EXPECT_EQ(files.size(), kLogSegments);
+    // From the first record of the oldest kept segment, seven segments of
+    // 1 s at least, to the last record, 8 s at most.
+    const double span = KeptSpanSeconds(files);
+    EXPECT_GE(span, 7.0) << times->size() << " records";
+    EXPECT_LE(span, 8.0) << times->size() << " records";
+    EXPECT_TRUE(std::ifstream{CappedMarkerPath(path)}.good());
+  }
+
+  // Bytes still bind: half the cap holds under 5 s of the fast log in all.
+  LogWriter::Options small = options;
+  small.max_bytes = cap / 2;
+  std::uint64_t total = 0;
+  const auto bound = WriteTimedLog(path, small, fast);
+  for (const auto& file : bound) total += FileSize(file);
+  EXPECT_LE(total, small.max_bytes);
+  EXPECT_LT(KeptSpanSeconds(bound), 5.0);
+
+  // No window, or no cap: the slow log is one file, all 60.5 s of it.
+  LogWriter::Options bytes_only = options;
+  bytes_only.window = {};
+  LogWriter::Options uncapped = options;
+  uncapped.max_bytes = 0;
+  for (const auto& unrotated : {bytes_only, uncapped}) {
+    const auto files = WriteTimedLog(path, unrotated, slow);
+    EXPECT_EQ(files.size(), 1u);
+    EXPECT_GT(KeptSpanSeconds(files), 60.0);
+  }
+  for (const auto& file : LogSegmentFiles(path)) ::unlink(file.c_str());
+  ::unlink(CappedMarkerPath(path).c_str());
+}
+
+// The time rule compares each record with its segment's first, by record
+// time only: a clock that does not advance or a record older than the
+// segment's first never ends it; the first record a window / n past it does,
+// however long the gap.
+TEST(LogCapture, WindowIgnoresAClockThatDoesNotAdvance) {
+  constexpr std::int64_t kSecond = 1'000'000'000;
+  const auto path = TempPath("window_clock");
+  LogWriter::Options options{256, 1, /*background=*/false,
+                             8 * (RecordsOffset() + 16384)};
+  options.window = std::chrono::seconds{8};
+  // A frozen clock, then records older than the segment's first, then one a
+  // 30 s gap later, which starts the second segment.
+  std::vector<std::int64_t> times(100, 5 * kSecond);
+  times.insert(times.end(), {4 * kSecond, 0, 5 * kSecond + kSecond / 2,
+                             35 * kSecond, 35 * kSecond});
+  const auto files = WriteTimedLog(path, options, times);
+  ASSERT_EQ(files.size(), 2u);
+  LogReader reader{files.back()};
+  LogReader::Record record;
+  std::vector<std::int64_t> newest;
+  while (reader.next(record)) newest.push_back(record.header.now_ns);
+  EXPECT_EQ(newest, (std::vector<std::int64_t>{35 * kSecond, 35 * kSecond}));
+  for (const auto& file : files) ::unlink(file.c_str());
+}
+
 TEST(LogCapture, UncappedWriterLeavesNoMarker) {
   const auto path = TempPath("uncapped");
   WriteFixture(path, LogWriter::kDefaultBufferBytes);

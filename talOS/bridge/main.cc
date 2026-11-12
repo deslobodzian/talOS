@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,7 @@ int main(int argc, char** argv) {
     bool describe = false;
     std::string log_path;
     uint64_t log_max_bytes = 0;
+    uint64_t log_window_us = 0;
 
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -42,14 +44,16 @@ int main(int argc, char** argv) {
         log_path = argv[++i];
       } else if (arg == "--log-max-bytes" && i + 1 < argc) {
         log_max_bytes = std::stoull(argv[++i]);
+      } else if (arg == "--log-window-us" && i + 1 < argc) {
+        log_window_us = std::stoull(argv[++i]);
       } else if (arg == "--session-id" && i + 1 < argc) {
         session_id = std::stoull(argv[++i]);
       } else {
         throw std::invalid_argument(
             "usage: hardware_node --config PATH [--remote IP] "
             "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-            "[--sim] [--log PATH] [--log-max-bytes N] [--session-id ID] "
-            "[--describe]");
+            "[--sim] [--log PATH] [--log-max-bytes N] [--log-window-us N] "
+            "[--session-id ID] [--describe]");
       }
     }
 
@@ -57,8 +61,13 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "usage: hardware_node --config PATH [--remote IP] "
           "[--remote-port PORT] [--local-port PORT] [--duration-s N] "
-          "[--sim] [--log PATH] [--log-max-bytes N] [--session-id ID] "
-          "[--describe]");
+          "[--sim] [--log PATH] [--log-max-bytes N] [--log-window-us N] "
+          "[--session-id ID] [--describe]");
+    }
+    // Held as nanoseconds by the log writer.
+    if (log_window_us >
+        static_cast<uint64_t>(std::chrono::nanoseconds::max().count()) / 1000) {
+      throw std::invalid_argument("--log-window-us is out of range");
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
@@ -68,14 +77,16 @@ int main(int argc, char** argv) {
         talos::config::ResolveControllerPort(robot_config, remote_port_cli);
     const uint16_t local_port =
         talos::config::ResolveLocalPort(robot_config, local_port_cli);
-    talos::hardware::HardwareNode node{std::move(robot_config),
-                                       remote_ip,
-                                       remote_port,
-                                       local_port,
-                                       simulation,
-                                       session_id,
-                                       std::move(log_path),
-                                       log_max_bytes};
+    talos::hardware::HardwareNode node{
+        std::move(robot_config),
+        remote_ip,
+        remote_port,
+        local_port,
+        simulation,
+        session_id,
+        std::move(log_path),
+        log_max_bytes,
+        std::chrono::microseconds{static_cast<int64_t>(log_window_us)}};
 
     // --describe answers out of the constructor alone: no socket, no shared
     // memory, no registry slot, nothing the real node holds. That is what lets

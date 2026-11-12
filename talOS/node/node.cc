@@ -988,6 +988,8 @@ struct Flags {
   int duration_s = 0;
   std::uint64_t session_id = 0;
   std::uint64_t log_max_bytes = 0;  // --log-max-bytes; 0 is unbounded
+  // --log-window-us: LogWriterOptions::window; 0 ends segments on bytes only.
+  std::uint64_t log_window_us = 0;
   bool simulation = false;
   bool describe = false;
   bool log_set = false;  // --log was passed (vs. the /tmp default)
@@ -1007,6 +1009,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
       flags.log_set = true;
     } else if (arg == "--log-max-bytes" && i + 1 < argc) {
       flags.log_max_bytes = std::stoull(argv[++i]);
+    } else if (arg == "--log-window-us" && i + 1 < argc) {
+      flags.log_window_us = std::stoull(argv[++i]);
     } else if (arg == "--session-id" && i + 1 < argc) {
       flags.session_id = std::stoull(argv[++i]);
     } else if (arg == "--config" && i + 1 < argc) {
@@ -1022,7 +1026,8 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else {
       throw std::invalid_argument(
           "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
-          "[--log-max-bytes N] [--session-id ID] [--config PATH] "
+          "[--log-max-bytes N] [--log-window-us N] [--session-id ID] "
+          "[--config PATH] "
           "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR]");
     }
   }
@@ -1032,6 +1037,12 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
   }
   if (flags.duration_s < 0) {
     throw std::invalid_argument("duration must be nonnegative");
+  }
+  // Held as nanoseconds by the log writer.
+  if (flags.log_window_us >
+      static_cast<std::uint64_t>(std::chrono::nanoseconds::max().count()) /
+          1000) {
+    throw std::invalid_argument("--log-window-us is out of range");
   }
   if (flags.config_path.empty()) {
     throw std::invalid_argument("missing --config PATH");
@@ -1337,8 +1348,12 @@ int RunMain(int argc, char** argv, const char* node_name,
     // The launcher bounds each node's share of the session's log budget; at
     // the cap the log drops its oldest segments to keep the newest records
     // (LogWriterOptions::max_bytes) and `<log>.capped` marks it incomplete.
+    // It also passes the session's log window, so every capped member keeps
+    // about the same record time (LogWriterOptions::window).
     event::log::LogWriterOptions log_options;
     log_options.max_bytes = flags.log_max_bytes;
+    log_options.window = std::chrono::microseconds{
+        static_cast<std::int64_t>(flags.log_window_us)};
     // The loop reads the stop flag between dispatches, so a stop takes effect
     // after the current dispatch even when overdue timers never let it wait
     // (an update() that overruns its period).
