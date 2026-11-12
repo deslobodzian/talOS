@@ -40,7 +40,8 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
                            std::string remote_ip, uint16_t remote_port,
                            uint16_t local_port, bool simulation,
                            uint64_t session_id, std::string log_path,
-                           uint64_t log_max_bytes)
+                           uint64_t log_max_bytes,
+                           std::chrono::nanoseconds log_window)
     : robot_config_{std::move(robot_config)},
       config_{robot_config_.hardware},
       remote_ip_{std::move(remote_ip)},
@@ -49,7 +50,8 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
       simulation_{simulation},
       session_id_{session_id},
       log_path_{std::move(log_path)},
-      log_max_bytes_{log_max_bytes} {
+      log_max_bytes_{log_max_bytes},
+      log_window_{log_window} {
   if (simulation_ && remote_ip_ != "127.0.0.1") {
     throw std::invalid_argument(
         "--sim requires --remote 127.0.0.1, got --remote " + remote_ip_);
@@ -163,6 +165,7 @@ bool HardwareNode::Open() {
   if (!log_path_.empty()) {
     event::log::LogWriter::Options options;
     options.max_bytes = log_max_bytes_;
+    options.window = log_window_;
     log_ = std::make_unique<event::log::LogWriter>(log_path_, kNodeName,
                                                    options, session_id_);
     log_->start(introspection_manifest_, event::Poller::now());

@@ -436,11 +436,21 @@ void LogWriter::State::append(RecordHeader header,
   const std::size_t total = sizeof(RecordHeader) + payload.size();
   const std::uint64_t limit =
       segment_bytes != 0 ? segment_bytes : options.max_bytes;
-  if (limit != 0 && segment_used + total > limit) {
-    if (segment_bytes == 0 || prefix.size() + total > segment_bytes) {
-      capture_error.store(CaptureError::BYTE_CAP);
-      return;
-    }
+  const bool full = limit != 0 && segment_used + total > limit;
+  if (full && (segment_bytes == 0 || prefix.size() + total > segment_bytes)) {
+    capture_error.store(CaptureError::BYTE_CAP);
+    return;
+  }
+  // Options::window: the segment's records span a window / n of record time.
+  // Nonzero only for a rotating log; the segment holds a record (the first
+  // set segment_first_ns); a time at or before the first never ends it, and
+  // the difference is taken unsigned only once it is positive.
+  const bool elapsed = segment_span_ns != 0 && segment_used > prefix.size() &&
+                       header.now_ns > segment_first_ns &&
+                       static_cast<std::uint64_t>(header.now_ns) -
+                               static_cast<std::uint64_t>(segment_first_ns) >=
+                           segment_span_ns;
+  if (full || elapsed) {
     // This record starts the next segment, in a chunk of its own; the writer
     // rotates the file before writing it.
     submit_active();
@@ -482,6 +492,7 @@ void LogWriter::State::append(RecordHeader header,
                 payload.data(), payload.size());
   }
   active->used += total;
+  if (segment_used == prefix.size()) segment_first_ns = header.now_ns;
   segment_used += total;
   if (options.background) {
     // Sequentially consistent, like the writer_idle check after it: either
@@ -744,6 +755,11 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
     if (count >= 2) {
       state.segment_count = count;
       state.segment_bytes = state.options.max_bytes / count;
+      if (state.options.window.count() > 0) {
+        state.segment_span_ns = std::max<std::uint64_t>(
+            1,
+            static_cast<std::uint64_t>(state.options.window.count()) / count);
+      }
     }
   }
 

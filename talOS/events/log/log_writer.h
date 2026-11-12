@@ -74,7 +74,9 @@ namespace talos::event::log {
 // (header, manifest and schema block, then whole records). The segment being
 // written is always at `path`; a full one is renamed to LogSegmentPath(path,
 // k) and the oldest is deleted once the cap would be crossed, all on the
-// writer thread. The producer only decides where a segment ends.
+// writer thread. The producer only decides where a segment ends: when the
+// next record would cross max_bytes / n, or (Options::window) when its time
+// is a window / n past the segment's first record.
 //
 // dispatch()/send()/finish() never throw: a full disk or a transient
 // EIO must not bring down a control loop that is otherwise healthy. Such
@@ -109,6 +111,16 @@ struct LogWriterOptions {
   // every whole record before it. If the header/manifest cannot fit, no log
   // file is left; only the empty cap marker is created.
   std::uint64_t max_bytes{0};
+
+  // The record time a capped log keeps (RecordHeader::now_ns, the loop's
+  // clock when the record was made). Nonzero with a rotating cap (n >= 2
+  // segments): a segment also ends at the first record at least window / n
+  // after the segment's first record, so the log keeps between (n - 1) / n
+  // of `window` and `window` of its newest records, unless a segment reaches
+  // max_bytes / n first. A record whose time is not past the segment's first
+  // (a clock that did not advance, or an older record) never ends it. Zero,
+  // or an uncapped log: segments end on bytes only.
+  std::chrono::nanoseconds window{0};
 
   // How often the writer fsyncs the file, after writing the committed prefix
   // of the active chunk (see LogWriter): what a power loss can lose. Tests
@@ -281,6 +293,11 @@ class LogWriter {
     // and its bytes so far, prefix included.
     std::uint64_t segment{0};
     std::uint64_t segment_used{0};
+    // Record time per segment (Options::window / segment_count, at least
+    // 1 ns); zero when segments end on bytes only.
+    std::uint64_t segment_span_ns{0};
+    // Producer only: the now_ns of the segment's first record.
+    std::int64_t segment_first_ns{0};
     // Writer only (or the only thread): the segment `fd` holds.
     std::uint64_t file_segment{0};
     // Writer only: the oldest segment rotation has not deleted yet.
