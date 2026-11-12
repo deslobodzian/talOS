@@ -2,6 +2,13 @@ load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
+# //tools:new_subsystem_test compares new_subsystem's copy of the subsystem
+# file keys with the header's.
+exports_files(
+    ["config_parser.h"],
+    visibility = ["//tools:__pkg__"],
+)
+
 cc_library(
     name = "configuration",
     hdrs = ["config_parser.h"],
