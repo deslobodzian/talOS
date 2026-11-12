@@ -3,8 +3,8 @@
 // The playhead is an event time inside the session's bounds. Value panels read
 // the snapshot at the playhead: each channel's newest value at or before it,
 // with its own sample time, so the live staleness rule (freshness.ts) applies
-// unchanged. Plots read decimated series: min, max and last per bucket, as
-// many buckets as the plot is pixels wide.
+// unchanged. Plots read decimated series: min, max and last per bucket, the plot's pixel
+// width rounded up to one of POINT_SIZES buckets.
 //
 // Requests: a getter that misses starts a fetch and returns what it has (the
 // last result for that consumer, else nothing); the arrival bumps `version`
@@ -66,8 +66,16 @@ export const PLAY_RATES = [1, 2, 4] as const;
 export type PlayRate = typeof PLAY_RATES[number];
 
 export const SERIES_CACHE_ENTRIES = 32;
+// Consumers whose last result is kept, least recently used dropped first.
+export const SERIES_SLOTS = 64;
 // Buckets for a consumer that does not say how wide it is.
 export const DEFAULT_POINTS = 400;
+// The bucket counts a series is requested at: a width rounds up to the next
+// one (the last for anything wider), so resizing a plot changes its request
+// only where it crosses one.
+export const POINT_SIZES = [256, 512, 1024, 2048, 4096] as const;
+export const quantizePoints = (width: number) =>
+    POINT_SIZES.find(size => size >= width) ?? POINT_SIZES[POINT_SIZES.length - 1];
 // A window's fetched range ends on a grid of 1/16 of the window, so a playing
 // cursor refetches once per 1/16 window rather than every frame.
 const GRID_DIVISIONS = 16n;
@@ -119,7 +127,8 @@ export class RecordedSource implements DataSource {
   private readonly cache = new Map<string, SeriesBuckets>();
   private readonly inFlight = new Map<string, Request>();
   private readonly failed = new Set<string>();
-  // Per consumer (channels, window, width): its pending key, its last result.
+  // Per consumer (channels, window, bucket count): its pending key, its last
+  // result (at most SERIES_SLOTS).
   private readonly slotPending = new Map<string, string>();
   private readonly slotLast = new Map<string, SeriesBuckets>();
 
@@ -186,7 +195,6 @@ export class RecordedSource implements DataSource {
     this.error = '';
     this.failed.clear();
     this.snapshot = null;
-    this.playback = this.makePlayback(this.playback.mode);
     this.version++;
     this.requestSnapshot(this.playhead.toString(), true);
     this.changed();
@@ -359,7 +367,7 @@ export class RecordedSource implements DataSource {
     if (cached) {
       this.cache.delete(key);
       this.cache.set(key, cached);
-      this.slotLast.set(owner, cached);
+      this.keepLast(owner, cached);
       return Promise.resolve(cached);
     }
     let request = this.inFlight.get(key);
@@ -376,7 +384,7 @@ export class RecordedSource implements DataSource {
             this.cache.set(key, buckets);
             while (this.cache.size > SERIES_CACHE_ENTRIES)
               this.cache.delete(this.cache.keys().next().value!);
-            for (const s of created.slots) this.slotLast.set(s, buckets);
+            for (const s of created.slots) this.keepLast(s, buckets);
             this.version++;
             this.changed();
             return buckets;
@@ -393,6 +401,18 @@ export class RecordedSource implements DataSource {
     request.slots.add(owner);
     this.slotPending.set(owner, key);
     return request.promise;
+  }
+
+  private keepLast(slot: string, buckets: SeriesBuckets) {
+    this.slotLast.delete(slot);
+    this.slotLast.set(slot, buckets);
+    while (this.slotLast.size > SERIES_SLOTS)
+      this.slotLast.delete(this.slotLast.keys().next().value!);
+  }
+
+  // How many consumers' last results are kept: at most SERIES_SLOTS.
+  get keptSlots() {
+    return this.slotLast.size;
   }
 
   private settle(key: string, request: Request) {
@@ -435,11 +455,11 @@ export class RecordedSource implements DataSource {
          points = DEFAULT_POINTS): Series {
     if (!channels.length || cursor_ns === null || this.end === this.start)
       return emptySeries(this.bounds.start_ns, channels);
-    const width = Math.max(1, Math.round(points));
-    const plan = this.plan(window, BigInt(cursor_ns), width);
+    const size = quantizePoints(points);
+    const plan = this.plan(window, BigInt(cursor_ns), size);
     const start = plan.start.toString(), end = plan.end.toString();
     const key = seriesKey(channels, start, end, plan.points);
-    const slot = `${channels.join(',')}|${window === 'all' ? 'all' : window.seconds}|${width}`;
+    const slot = `${channels.join(',')}|${window === 'all' ? 'all' : window.seconds}|${size}`;
     if (!this.failed.has(key) && !this.error && !this.closed)
       void this.fetchSeries(channels, start, end, plan.points, slot);
     const buckets = this.cache.get(key) ?? this.slotLast.get(slot);

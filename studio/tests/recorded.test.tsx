@@ -11,7 +11,14 @@ import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
 import {useChannelStale, useChassis, usePlayback} from '../src/data/hooks';
-import {bucketSeries, RecordedSource, type ReviewClock} from '../src/data/recorded';
+import {
+  bucketSeries,
+  POINT_SIZES,
+  quantizePoints,
+  RecordedSource,
+  SERIES_SLOTS,
+  type ReviewClock
+} from '../src/data/recorded';
 import {
   decodeSeries,
   detectReviewServer,
@@ -196,6 +203,44 @@ test('a consumer\'s newer series request aborts its superseded one', async () =>
   assert.equal(current.aborted, false);
   assert.equal(await old, null);
   assert.equal(recorded.error, '');
+});
+
+// Dragging a split handle re-renders a plot at every pixel width from 400 to
+// 800: one request per bucket size crossed (512, then 1024), not one per
+// width, and a newer request of the same plot (the cursor moving a grid
+// step) aborts its superseded one. Results kept per consumer stay bounded
+// however many channel sets are plotted.
+test('a plot resize sweep requests per bucket size and keeps a bounded set', async () => {
+  const server = fakeServer(echoSnapshot);
+  const recorded = source(server);
+  const cursor = START + 5_050_000_000n;
+  for (let width = 400; width <= 800; width++)
+    recorded.series(['x'], {seconds: 2}, cursor.toString(), width);
+  const sweep = server.of('/series');
+  assert.deepEqual(sweep.map(c => c.url.searchParams.get('points')),
+                   [String(512 + 32), String(1024 + 64)]);
+  assert.equal(quantizePoints(800), 1024);
+  assert.equal(quantizePoints(100_000), POINT_SIZES[POINT_SIZES.length - 1]);
+
+  // One grid step (2 s / 16) later, at the same width.
+  recorded.series(['x'], {seconds: 2}, (cursor + 125_000_000n).toString(), 800);
+  assert.equal(server.of('/series').length, 3);
+  assert.equal(sweep[1].aborted, true);
+  assert.equal(sweep[0].aborted, false);
+
+  for (let i = 0; i < 3 * SERIES_SLOTS; i++)
+    recorded.series([`c${i}`], {seconds: 2}, cursor.toString(), 400);
+  for (const call of server.of('/series')) {
+    if (call.aborted) continue;
+    const channels = call.url.searchParams.get('c')!.split(',').length;
+    const points = Number(call.url.searchParams.get('points'));
+    const zeros = () => Array.from({length: points}, () => 0);
+    call.respond(new Response(seriesBuffer(Array.from({length: channels}, () => (
+        {t: zeros(), min: zeros(), max: zeros(), last: zeros(), count: zeros()})))));
+  }
+  await settle();
+  assert.equal(recorded.error, '');
+  assert.ok(recorded.keptSlots <= SERIES_SLOTS, `${recorded.keptSlots} kept`);
 });
 
 test('steps clamp to the session and play advances at the chosen rate', async () => {
