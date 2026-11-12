@@ -89,3 +89,16 @@ py_test(
     main = "check_node_matrix_test.py",
     deps = [":sync_manifest_lib"],
 )
+
+# python3 tools/check_layers.py (CI: the Linux job, after the build)
+# Checks the Bazel graph against ARCHITECTURE.md's layers with bazel query.
+py_test(
+    name = "check_layers_test",
+    size = "small",
+    srcs = [
+        "check_layers.py",
+        "check_layers_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_layers_test.py",
+)

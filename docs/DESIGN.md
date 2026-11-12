@@ -66,11 +66,11 @@ The rules are ARCHITECTURE.md
 
 | Rule | Status |
 |---|---|
-| Layers depend only downward (rtms → events → node → devices → robot code) | **[gap: ARCH-2]** `talOS/devices` depends on `talOS/bridge`, `talOS/node` reads `hardware::Config` through `talOS/configuration`, and core libraries are public |
-| `talOS/` never depends on a robot, an example or `studio/` | **[gap: ARCH-2]** |
-| Nodes share only messages and topic names | **[review]**; **[gap: ARCH-2]** for making node libraries package-private |
-| `talOS/vision` → `talOS/geometry`, never the reverse | **[gap: ARCH-2]** |
-| Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI: `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s; **[review]** for "reimplements no wire format" |
+| Layers depend only downward (rtms → events → node → devices → robot code) | **[enforced]**: `tools/check_layers.py` in CI, whose allowlist holds today's exceptions (`talOS/devices:testing` on `talOS/bridge:merge`; `talOS/node` on `talOS/hardware` through `talOS/configuration` and `talOS/introspection`); **[gap: ARCH-2]** to remove them and make core libraries non-public |
+| `talOS/` never depends on a robot, an example or `studio/` | **[enforced]**: `tools/check_layers.py` |
+| Nodes share only messages and topic names | **[enforced]** for Bazel dependencies: `tools/check_layers.py` (a node package depends on another only through its `talos_messages` targets or its `talos_cc_shared_node`; `driver`'s `node_test` on `drivetrain` is allowlisted); **[gap: ARCH-2]** for making node libraries package-private |
+| `talOS/vision` → `talOS/geometry`, never the reverse | **[enforced]**: `tools/check_layers.py` |
+| Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI: `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s; for Bazel dependencies: `tools/check_layers.py`; **[review]** for "reimplements no wire format" |
 | Only the devices-layer flush writes `/hw/request/<node>` | **[enforced]** for `publish`/`publish_bytes` and `LintGraph`; **[gap: ARCH-2]** for `detail::NodeAccess` and raw RTMS publishers, which node code can still reach |
 | Output setters only inside `update()` | **[enforced]**: they throw elsewhere |
 | One writer per topic; naming; schema identity; reader cap | **[enforced]**: `LintGraph` at launch and `--describe-only`, `talos_graph_test`, `talos_messages` at BUILD load, `//talOS/build:topic_grammar_test` |
@@ -170,6 +170,7 @@ Automated checks that keep the architecture honest.
 | config load refusals (timeouts, periods, singular sections, soft limits) | "The tick" numbers |
 | `wpilib_lockstep_test` | GradleRIO and RobotPy wheel versions agree |
 | `new_subsystem_test` golden packages | the scaffold's output builds and passes |
+| `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies"; its allowlist only shrinks |
 | `check_runfiles_collisions.py`, read-only sources and "checkout unchanged" in CI | the build never writes the source tree |
 | `clang-format-18`, `clang-tidy-18`, `buildifier` on changed files | style and bug-prone patterns |
 | `input_replay_test`, `replay_inputs_test`, the `*Binary` replay cases | a node is a function of its inputs and their times |
