@@ -111,7 +111,6 @@ cc_binary(
     name = "review_bench",
     testonly = True,
     srcs = ["tests/review_bench.cc"],
-    tags = ["manual"],
     deps = [
         ":review",
         ":review_test_message",
