@@ -98,7 +98,11 @@ class LauncherOutput {
   LauncherOutput& operator=(const LauncherOutput&) = delete;
 
   // From here on every launcher line also goes to `path` (talos.log).
-  // Lines before it go to the descriptors only.
+  // Lines before it go to the descriptors only. A note this object writes
+  // there about the stdout or stderr (a drop, a stream given up, what the
+  // end left unwritten) starts at a line boundary: it waits for a launcher
+  // line in progress there to end, at the latest for Stop, which ends that
+  // line first.
   void Record(const std::string& path);
 
   // Node output for descriptor 1 only (ChildOutput's echo). Never waits.

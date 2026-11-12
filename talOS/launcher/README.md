@@ -307,7 +307,10 @@ says so. At the end the launcher gives its stdout and stderr 1 s to take
 what is left, then drops it and says how much in `talos.log` (an upper
 bound: the part a write is still inside may yet arrive), and exits:
 a write still in progress then (a terminal nobody reads takes part of it
-and holds the rest) is abandoned 100 ms later, not waited for. A member's
+and holds the rest) is abandoned 100 ms later, not waited for. Each such
+note about the stdout or stderr is a line of its own in `talos.log`: one
+that comes while a launcher line is half written there waits for that
+line to end, or, at the latest, for the session's end. A member's
 log, and `talos.log`, keep at most 64 MiB per session, then say so and drop
 the rest. The child's end of the pipe stays blocking: a nonblocking one
 would make a full pipe an error inside the node (lost data and an error flag
