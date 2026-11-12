@@ -181,7 +181,7 @@ py_test(
     main = "trace_test.py",
 )
 
-# python3 tools/slow_tests.py [--threshold 5] (not a CI check)
+# python3 tools/slow_tests.py [--threshold 5] [--check] (not a CI check yet)
 # Lists the tests over a time budget, slowest first, from bazel-testlogs.
 py_test(
     name = "slow_tests_test",
