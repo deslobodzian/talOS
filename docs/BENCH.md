@@ -292,8 +292,12 @@ sleep precision. Releasing a lane is not a mechanical brake.
   Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
   enabled (PASS lines); `--strict` exits 2 unless every required verdict
   passes and the manifest shows a finished session with no quarantined,
-  recorder-failed or log-capped recording node (Studio is exempt) and no
-  damaged log. Keep the
+  recorder-failed or log-capped recording node (Studio is exempt), no
+  damaged log, and a "Delivery loss" section with no node's
+  `wake_failures`, `requests_skipped` or `wake_fallbacks` above 0 (NOT
+  RECORDED there means a manifest written before the launcher recorded
+  them). Its "Launcher output" section names any output whose bytes
+  `talos.log` says were dropped. Keep the
   report with the session. Target age at the tick (from `Target::get` READ
   records) is required to be at most 25 ms on every lane; see
   [session_report](../talOS/launcher/README.md) for its NOT MEASURED and FAIL
