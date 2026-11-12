@@ -415,6 +415,21 @@ until the socket opens. The console reports the failures
 (`hardware gateway socket failed: <status> (errno <n>)`, coalesced to one line
 a second) and, once it opens, `hardware gateway socket open after <n> failed
 attempts, <s> s after the first`.
+A send that fails with an error the socket never recovers from
+(`protocol::SendErrorNeedsNewSocket`: `EPIPE`, `ENOTCONN`, `EDESTADDRREQ`,
+`EADDRNOTAVAIL`, `EBADF`, the bridge's rule in
+[data flow](../../docs/DATA_FLOW.md#link-rates-and-endpoints)) loses the
+socket: the loop ticks the gateway disabled again, sends nothing, and opens a
+new socket on the same ports (`Endpoint::Reopen`, keeping the frame sequence)
+on the same 100 ms cadence, at once when no attempt was made in the last
+100 ms, so a condition that breaks every new socket costs at most ten sockets
+a second. The console prints `hardware gateway socket cannot send (errno
+<n>); replacing it, nothing is sent until then` and, once replaced,
+`hardware gateway socket replaced after <n> failed attempts, <s> s after it
+could not send` (each coalesced to one line a second). Any other send error
+(`ENOBUFS`, `ECONNREFUSED`, `ENETDOWN`, `ENETUNREACH`, `EHOSTUNREACH`) keeps
+the socket. A send raises no `SIGPIPE` on either end
+([protocol](../protocol/README.md)).
 
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter

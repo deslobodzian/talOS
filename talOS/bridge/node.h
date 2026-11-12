@@ -177,7 +177,7 @@ class HardwareNode {
   const Wakeups& wakeups() const { return wakeups_; }
 
   // The UDP socket to the gateway. A send that fails with an error the
-  // socket never recovers from (SocketCannotSend in node.cc: EPIPE,
+  // socket never recovers from (protocol::SendErrorNeedsNewSocket: EPIPE,
   // ENOTCONN, EDESTADDRREQ, EADDRNOTAVAIL, EBADF) closes it; Tick() then
   // opens a new one on the same ports (RuntimeUdpPeer::Reopen): the first
   // attempt on the next Tick (NextDutyUs: kRetryUs later at the latest),

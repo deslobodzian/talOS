@@ -72,7 +72,9 @@ received, so the RoboRIO neutralizes at its command timeout and `/hw/status`
 `ENETUNREACH`, `EHOSTUNREACH`, `ENOBUFS`) keeps the socket, and the failed
 send's duty is retried 1000 µs later. The bridge prints the errno once per
 outage and one line when a send succeeds again; its exit line counts
-`send_failures` and `socket_reopens`.
+`send_failures` and `socket_reopens`. The RoboRIO program replaces its own
+socket by the same rule (`protocol::SendErrorNeedsNewSocket`), on its 100 ms
+open-retry cadence ([talOS/hardware](../talOS/hardware/README.md#roborio)).
 
 Camera observation timestamps describe exposure, not publication. Measure
 timestamp bias during [camera bring-up](BRINGUP.md#camera-intrinsics-calibration).

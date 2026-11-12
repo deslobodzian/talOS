@@ -401,6 +401,28 @@ UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
   return UdpStatus::kOk;
 }
 
+// Shut down for writing, or marked defunct by macOS (EPIPE; seen after sleep
+// and wake); no longer connected (ENOTCONN, EDESTADDRREQ); its source address
+// removed from the host (EADDRNOTAVAIL; a new socket's connect picks a
+// current one); or no socket at all (EBADF). Every other error is the
+// network's, and the same socket sends again once it clears: ECONNREFUSED (an
+// ICMP port unreachable from an earlier datagram, reported once: the peer
+// program is not running yet), ENETDOWN, ENETUNREACH, EHOSTUNREACH (no
+// interface or route; a connected socket looks the route up again on each
+// send) and ENOBUFS (a full interface queue). A new socket would fail those
+// the same way, so reopening for them would only churn sockets. EAGAIN never
+// gets here: Send() returns it as kWouldBlock.
+bool SendErrorNeedsNewSocket(int error) {
+#if defined(_WIN32)
+  return error == WSAESHUTDOWN || error == WSAENOTCONN ||
+         error == WSAEDESTADDRREQ || error == WSAEADDRNOTAVAIL ||
+         error == WSAENOTSOCK;
+#else
+  return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
+         error == EADDRNOTAVAIL || error == EBADF;
+#endif
+}
+
 const char* UdpStatusName(UdpStatus status) {
   switch (status) {
     case UdpStatus::kOk:

@@ -42,9 +42,12 @@ decoding. Clock probes do not authorize actuation and work while disabled.
   defines it, Linux and current macOS SDKs, and `SO_NOSIGPIPE` on the socket
   on macOS, which alone covers an SDK without `MSG_NOSIGNAL`): a socket that can no longer send fails it with `kSocketError` and
   the errno in `stats().last_send_error`, and `Reopen()` replaces the socket
-  on the same addresses and ports, keeping the send sequence and stats. The
-  bridge's use of it is in the
-  [data-flow reference](../../docs/DATA_FLOW.md#link-rates-and-endpoints).
+  on the same addresses and ports, keeping the send sequence and stats.
+  `SendErrorNeedsNewSocket(errno)` tells an error only a new socket clears
+  from one the network clears on the same socket; both ends decide with it.
+  The bridge's use of it is in the
+  [data-flow reference](../../docs/DATA_FLOW.md#link-rates-and-endpoints), the
+  RoboRIO program's in [talOS/hardware](../hardware/README.md#roborio).
 
 Use `MutablePayloadBuffer()` plus `SendBufferedFrame()` to build the payload
 directly inside the outgoing datagram buffer, avoiding an extra copy.

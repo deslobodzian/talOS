@@ -34,6 +34,12 @@ class Endpoint {
                            const char* remote, uint16_t remote_port) {
     return peer_.Open(local, local_port, remote, remote_port);
   }
+  // A new socket on the ports of the last successful Open(), keeping the
+  // frame sequence (RuntimeUdpPeer::Reopen): for a caller whose sends found
+  // the socket unable to send again (protocol::SendErrorNeedsNewSocket on
+  // udp_stats().last_send_error).
+  protocol::UdpStatus Reopen() { return peer_.Reopen(); }
+  const protocol::UdpStats& udp_stats() const { return peer_.stats(); }
   // Link fault injection drops outbound traffic, never inbound commands or
   // gateway safety ticks. Suppressed datagrams are not queued for recovery.
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
