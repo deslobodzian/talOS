@@ -68,11 +68,11 @@ class PositionCppTest : public ::testing::Test {
   }
   // What the node asked for (the flush sends neutral for an unset motor).
   Mode Request() const {
-    return hw.motor_request("position_cpp", "position_cpp_motor").mode;
+    return hw.motor_request("position_cpp", "position_cpp").mode;
   }
   // What the gateway applies, after its enable and expiry gates.
   Mode Applied() const {
-    return hw.applied_motor("position_cpp", "position_cpp_motor").mode;
+    return hw.applied_motor("position_cpp", "position_cpp").mode;
   }
   State Latest() const {
     const auto state = sim.latest<State>(topics::kState);
@@ -93,7 +93,7 @@ class PositionCppTest : public ::testing::Test {
   // Powered on off the switch, unzeroed, and moving when pushed.
   void StartOffHome() {
     SetHome(false);
-    hw.set_motor("position_cpp", "position_cpp_motor", 0.0, -1.0);
+    hw.set_motor("position_cpp", "position_cpp", 0.0, -1.0);
   }
 };
 
@@ -104,7 +104,7 @@ TEST_F(PositionCppTest, DrivesAtALiveLane) {
   SetHome(false);  // zeroed on the switch, it leaves it
   Hold(30.0, 60ms);
 
-  const auto request = hw.applied_motor("position_cpp", "position_cpp_motor");
+  const auto request = hw.applied_motor("position_cpp", "position_cpp");
   EXPECT_EQ(request.mode, Mode::kMotionMagic);
   EXPECT_DOUBLE_EQ(request.demand, 30.0);
   const State state = Latest();
@@ -172,7 +172,7 @@ TEST_F(PositionCppTest, DisconnectedFeedbackGoesNeutral) {
   Hold(30.0, 40ms);
   ASSERT_EQ(Request(), Mode::kMotionMagic);
 
-  hw.set_connected("position_cpp", "position_cpp_motor", false);
+  hw.set_connected("position_cpp", "position_cpp", false);
   Hold(30.0, 40ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
   const State state = Latest();
@@ -188,54 +188,7 @@ TEST_F(PositionCppTest, NonFiniteDemandGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
-// REQ-CONTRACT-18
-TEST(PositionCppParameters, BadParameterFailsConstruction) {
-  // testdata/position_cpp.toml's values; each row drops or replaces one.
-  const char* const valid[][2] = {
-      {"max_position_rot", "100.0"},   {"homing_v", "-1.0"},
-      {"homing_timeout_us", "500000"}, {"homing_stall_rps", "0.1"},
-      {"homing_stall_us", "200000"},   {"home_margin_rot", "0.5"},
-  };
-  const struct {
-    const char* key;
-    const char* value;  // nullptr: the key is missing
-  } rows[] = {
-      {"max_position_rot", nullptr}, {"max_position_rot", "0.0"},
-      {"max_position_rot", "inf"},   {"homing_v", nullptr},
-      {"homing_v", "0.0"},           {"homing_timeout_us", nullptr},
-      {"homing_timeout_us", "0"},    {"homing_stall_rps", nullptr},
-      {"homing_stall_rps", "nan"},   {"homing_stall_us", nullptr},
-      {"homing_stall_us", "-1"},     {"home_margin_rot", nullptr},
-      {"home_margin_rot", "0.0"},    {"home_samples", "0"},
-  };
-  for (const auto& row : rows) {
-    const std::string setting = std::string{row.key} + " = " +
-                                (row.value != nullptr ? row.value : "missing");
-    SCOPED_TRACE(setting);
-    std::string toml =
-        "[robot]\nperiod_us = 20000\ncommand_timeout_us = 100000\n"
-        "[subsystems.position_cpp]\n";
-    for (const auto& [key, value] : valid) {
-      if (std::string{key} != row.key) {
-        toml += std::string{key} + " = " + value + "\n";
-      }
-    }
-    if (row.value != nullptr) toml += setting + "\n";
-    toml +=
-        "[subsystems.position_cpp.motors.position_cpp_motor]\n"
-        "type = \"TalonFX\"\ncan_id = 1\nposition_frame = \"rezero\"\n"
-        "[subsystems.position_cpp.digital_inputs.position_cpp_home]\n"
-        "dio = 0\n";
-    Sim sim = Sim::FromToml(toml);
-    try {
-      sim.add<PositionCpp>("position_cpp");
-      ADD_FAILURE() << "constructed";
-    } catch (const std::invalid_argument& error) {
-      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
-          << error.what();
-    }
-  }
-}
+// matrix: n/a 9 (PositionMechanism's parameters, tested in talOS/mechanisms)
 
 // REQ-SAFE-07
 TEST_F(PositionCppTest, OtherModesLaneIsIgnored) {
@@ -249,7 +202,7 @@ TEST_F(PositionCppTest, OtherModesLaneIsIgnored) {
   Hold(30.0, 40ms);  // teleop's lane, live, in autonomous
   EXPECT_EQ(Request(), Mode::kNeutral);
   Hold(20.0, 40ms, "auto");
-  const auto request = hw.motor_request("position_cpp", "position_cpp_motor");
+  const auto request = hw.motor_request("position_cpp", "position_cpp");
   EXPECT_EQ(request.mode, Mode::kMotionMagic);
   EXPECT_DOUBLE_EQ(request.demand, 20.0);
 }
@@ -297,107 +250,46 @@ TEST_F(PositionCppTest, UpdateDoesNotAllocate) {
 
 // Homing. The values are testdata/position_cpp.toml's.
 constexpr double kHomingVolts = -1.0;
-constexpr double kMaxPositionRot = 100.0;
+constexpr double kMaxRot = 100.0;
 
+// REQ-SAFE-36
 TEST_F(PositionCppTest, HomesBeforeTheFirstGoal) {
   StartOffHome();
   hw.ideal_motors();
   Teleop();
   Hold(30.0, 60ms);  // toward the switch, not to 30 in the power-on frame
-  auto request = hw.motor_request("position_cpp", "position_cpp_motor");
+  auto request = hw.motor_request("position_cpp", "position_cpp");
   EXPECT_EQ(request.mode, Mode::kVoltage);
   EXPECT_DOUBLE_EQ(request.demand, kHomingVolts);
   EXPECT_EQ(Latest().homing(), PositionCppHoming::HOMING);
 
   // The switch closes 0.5 rotations below where the motor powered on: that
   // is position 0, and targets go out in that frame, clamped to the travel.
-  hw.set_motor("position_cpp", "position_cpp_motor", -0.5, 0.0);
+  hw.set_motor("position_cpp", "position_cpp", -0.5, 0.0);
   // It zeroes after home_samples (3) consecutive closed readings.
   SetHome(true);
   Hold(30.0, 60ms);
   SetHome(false);  // the motor leaves the switch
   Hold(30.0, 20ms);
-  request = hw.motor_request("position_cpp", "position_cpp_motor");
+  request = hw.motor_request("position_cpp", "position_cpp");
   EXPECT_EQ(request.mode, Mode::kMotionMagic);
   EXPECT_DOUBLE_EQ(request.demand, 30.0 - 0.5);
   EXPECT_EQ(Latest().homing(), PositionCppHoming::HOMED);
   Hold(1000.0, 40ms);
-  request = hw.motor_request("position_cpp", "position_cpp_motor");
-  EXPECT_DOUBLE_EQ(request.demand, kMaxPositionRot - 0.5);
+  request = hw.motor_request("position_cpp", "position_cpp");
+  EXPECT_DOUBLE_EQ(request.demand, kMaxRot - 0.5);
   Hold(-5.0, 40ms);
-  request = hw.motor_request("position_cpp", "position_cpp_motor");
+  request = hw.motor_request("position_cpp", "position_cpp");
   EXPECT_DOUBLE_EQ(request.demand, -0.5);  // position 0
 }
 
-// One closed reading mid-travel (a glitch on the switch wire) is not home:
-// homing keeps driving and the motor stays unzeroed.
-TEST_F(PositionCppTest, OneClosedSampleMidTravelDoesNotZero) {
-  StartOffHome();
-  Teleop();
-  Hold(30.0, 60ms);
-  SetHome(true);
-  Hold(30.0, 20ms);  // one tick
-  SetHome(false);
-  Hold(30.0, 60ms);
-  EXPECT_EQ(Request(), Mode::kVoltage);
-  EXPECT_EQ(Latest().homing(), PositionCppHoming::HOMING);
-}
-
-TEST_F(PositionCppTest, HomingNeedsALiveFiniteTarget) {
-  StartOffHome();
-  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
-  hw.enable(false);
-  sim.step(10ms);
-  Hold(30.0, 60ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);  // disabled
-
-  Teleop();
-  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  Hold(30.0, 40ms);
-  ASSERT_EQ(Request(), Mode::kVoltage);
-  sim.step(150ms);  // past command_timeout_us: the lane is stale
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_EQ(Latest().homing(), PositionCppHoming::HOMING);
-}
-
-TEST_F(PositionCppTest, HomingFailsUntilTheDriverStationDisables) {
-  StartOffHome();
-  Teleop();
-  Hold(30.0, 400ms);
-  ASSERT_EQ(Request(), Mode::kVoltage);
-  Hold(30.0, 200ms);  // past homing_timeout_us (500 ms), switch still open
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_EQ(Latest().homing(), PositionCppHoming::FAILED);
-
-  // A stale hardware link (robot_enabled false) does not clear it.
-  hw.lose_states(8);
-  Hold(30.0, 160ms);
-  Hold(30.0, 60ms);
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_EQ(Latest().homing(), PositionCppHoming::FAILED);
-
-  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
-  sim.step(40ms);
-  Teleop();
-  Hold(30.0, 40ms);
-  EXPECT_EQ(Request(), Mode::kVoltage);
-}
-
+// REQ-SAFE-36
 TEST_F(PositionCppTest, HomingThatDoesNotMoveFails) {
   SetHome(false);  // velocity stays 0
   Teleop();
   Hold(30.0, 100ms);
   ASSERT_EQ(Request(), Mode::kVoltage);
   Hold(30.0, 200ms);  // past homing_stall_us (200 ms)
-  EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_EQ(Latest().homing(), PositionCppHoming::FAILED);
-}
-
-TEST_F(PositionCppTest, AStuckHomeSwitchStopsTheFirstMove) {
-  hw.ideal_motors();
-  Teleop();
-  Hold(30.0, 60ms);  // the switch still reads closed at 30
   EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_EQ(Latest().homing(), PositionCppHoming::FAILED);
 }

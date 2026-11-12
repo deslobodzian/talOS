@@ -243,7 +243,6 @@ lane and a state publisher, as `cpp/elevator.h` and `cpp/intake.h` are; the
 library's README has a minimal node. Write the control yourself only for
 what no block covers.
 
-The scaffolder below still generates a self-contained node (TODO.md MECH-3).
 Generate a position-controlled wrist package from the repo root:
 
 ```sh
@@ -269,30 +268,35 @@ testdata/wrist.toml
 ```
 
 The package's `:messages` target uses `include_prefix = "wrist"` and declares
-`/wrist/state`; its node target is `:node`. The position mechanism uses
-`wrist_motor`, Motion Magic, and `tolerance_rot` (default `0.05`).
-It drives only a finite target with connected motor feedback. It homes the way
-the elevator does (see [Homing](#homing)), with the same switch wiring,
-`home_samples` debounce, failure latches and parameter checks: a home switch, `wrist_home`, at the
-reverse end of travel zeroes it, `position_frame = "rezero"` holds its goals
-until then, and `/wrist/state` reports HOMING, HOMED or FAILED. Targets clamp to
-`0..max_position_rot`; the motor has no hardware soft limits.
+`/wrist/state`; its node target is `:node`. `wrist::Wrist` is a thin node
+over a `talos::mechanisms::PositionMechanism` named `wrist`, as the elevator
+is (see [Homing](#homing)): it passes a live target to `set_goal()`, calls
+`stop()` otherwise, and maps the mechanism's phase to `/wrist/state`'s
+HOMING, HOMED or FAILED. The mechanism does the rest, with the elevator's
+switch wiring, `home_samples` debounce, failure latches and parameter
+checks: Motion Magic on the motor `wrist`, at goal within `tolerance_rot`, a
+home switch, `wrist_home`, at the reverse end of travel that zeroes it,
+`position_frame = "rezero"` holding its goals until then, and goals clamped
+to `min_rot..max_rot`; the motor has no hardware soft limits.
 
 The subsystem file is
 `2026-robot/main_processor/configuration/subsystems/wrist.toml`: it contains
 `node = "//2026-robot/main_processor/wrist:node"`, a 20000 µs node period,
-a TalonFX with the lowest unused CAN id in `1..62` and a home switch with the
-lowest unused DIO channel in `0..31`, both explicitly marked as placeholders.
-The rest of its homing setup is placeholder too: `max_position_rot = 0.001`
-confines every target to within 0.001 rotations of the switch until you set
-the measured travel, and `homing_v = -0.5` (with `homing_timeout_us`, 3 s by
-default) needs its direction checked before the first enable. The
-generator appends the subsystem name and path to
-`configuration/robot.toml` and regenerates that config's manifest plus
-manifests of configs that include it.
+the mechanism's `[wrist]` parameter table, a TalonFX with the lowest unused
+CAN id in `1..62` and a home switch with the lowest unused DIO channel in
+`0..31`, both explicitly marked as placeholders. The rest of its homing
+setup is placeholder too: `max_rot = 0.001` confines every target to within
+0.001 rotations of the switch until you set the measured travel, and
+`homing_v = -0.5` (with `homing_timeout_us`, 3 s by default) needs its
+direction checked before the first enable. The generator appends the
+subsystem name and path to `configuration/robot.toml` and regenerates that
+config's manifest plus manifests of configs that include it.
 
 The Python variant puts `wrist.py` and `node_test.py` in the same package,
-not in a separate `py/` directory. It uses the same schema and `:node` target.
+not in a separate `py/` directory. It uses the same schema and `:node` target,
+but writes the homing itself, against the motor `wrist_motor` and the
+`[subsystem]` keys `tolerance_rot`, `max_position_rot` and the homing keys
+above; Python cannot construct the mechanism classes.
 For implementing and wiring additional behavior, use the
 [node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md).
 
