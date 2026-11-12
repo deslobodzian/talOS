@@ -134,16 +134,22 @@ in [Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
 
 The bridge sends nothing to a client that already has buffered userspace
 output, and never queues old observations for it: its telemetry waits and
-resumes from the latest values. A stalled client holds its slot until
-disconnected. Already accepted TCP bytes can still be buffered, so reconnect a
-stalled viewer for fresh data.
+resumes from the latest values. Each client's kernel send buffer is fixed
+([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)),
+so a client that stops reading backs up within a fraction of a second of its
+output and is held from then on, costing the others no turn and the budget no
+byte. A stalled client holds its slot until disconnected. What its send
+buffer already holds is stale when it resumes, so reconnect a stalled viewer
+for fresh data.
 The graph's bridge statistics include `clients`, `refused`, `ws_drops`,
 `frames_forwarded` (complete producer ticks) and `egress_bytes`. `ws_drops`
 counts only sends the socket refused (graph messages and telemetry pages); a
 graph message or telemetry update the budget deferred is not a drop. The bridge's own
 telemetry source counts as `dropped` the pages the publisher overwrote before
 the bridge read them plus the ticks it discarded for a missing page. The
-shutdown summary prints the cumulative counters, including `lapped`.
+shutdown summary prints the cumulative counters, including `lapped` and
+`held` (passes in which a client was sent nothing because its output was
+still buffered).
 
 ### Load probe
 
@@ -156,10 +162,11 @@ python studio/bridge/bandwidth_test.py --measure bazel-bin/studio/bridge --secon
 ```
 
 [`bandwidth_test.py`](bandwidth_test.py) checks client admission, the shared
-egress budget, continued delivery to readers alongside a stalled client, and
-that the shared budget is granted in rotation: over one window of producer
-ticks, two readers' updates differ by at most one, plus the turns a reader
-was sent a graph message instead.
+egress budget, that the shared budget is granted in rotation (over one window
+of producer ticks, two readers' updates differ by at most one, plus the turns
+a reader was sent a graph message instead), and that a client which stops
+reading backs up and is then held: the bridge counts it `held`, and it is
+sent nothing while every reader is sent at least four updates.
 
 ## Publisher and serving constraints
 

@@ -35,6 +35,13 @@ def connect(port, stalled=False):
     return sock, headers
 
 
+# Frames every reader receives before the probe ends. The non-reading client
+# takes its turns beside them until its send buffer (main.cc
+# kClientSendBufferBytes) is full, about 11 updates in; 20 leave at least
+# nine in which the bridge holds it, before the wait for the next graph
+# refresh adds more.
+SERVED_FRAMES = 20
+
 # Vtable offsets of Frame's sequence_id and timestamp_ns (talOS/telemetry/telemetry.fbs).
 SEQUENCE, TIMESTAMP = 6, 8
 
@@ -110,7 +117,7 @@ def read_all(sockets, stop, served, end):
                     reader["ages"].append((time.monotonic_ns() - field(payload, TIMESTAMP)) / 1e6)
                     reader["received"].append(("binary", field(payload, SEQUENCE)))
                 reader["frames"] += 1
-        if all(reader["frames"] >= 16 for reader in readers):
+        if all(reader["frames"] >= SERVED_FRAMES for reader in readers):
             served.set()
     selector.close()
     results = []
@@ -137,9 +144,11 @@ def count_window(results):
     """
     sequences = [[s for kind, s in r["received"] if kind == "binary"] for r in results]
     complete = all(sequences)
+    low = high = None
     if complete:
         low, high = max(s[0] for s in sequences), min(s[-1] for s in sequences)
     for result in results:
+        result["sequences"] = sequences.pop(0)
         updates = graph = 0
         inside = False
         for kind, sequence in result.pop("received"):
@@ -154,6 +163,33 @@ def count_window(results):
                 graph += 1
         result["updates"] = updates if complete else None
         result["graph"] = graph if complete else None
+    return low, high
+
+
+def last_before(sock, high):
+    """The newest tick a non-reading client was sent before `high`.
+
+    Reads the client's backlog in order: what it was sent before it backed
+    up, then, once reading lets it drain, an update of a tick at or past
+    `high`, the latest when the window closed. None if no update before
+    `high` arrived.
+    """
+    buffer, frames, last = bytearray(), 0, None
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            raise EOFError("WebSocket closed")
+        buffer += chunk
+        for opcode, payload, _ in frames_in(buffer):
+            if opcode != BINARY:
+                continue
+            frames += 1
+            if frames == 1:  # the dictionary page
+                continue
+            sequence = field(payload, SEQUENCE)
+            if sequence >= high:
+                return last
+            last = sequence
 
 
 def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4):
@@ -174,7 +210,8 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
             bridge = subprocess.Popen([str(binaries / "studio_bridge"),
                                        topic, "0", root,
                                        "--config", str(config)],
-                                      stdout=subprocess.PIPE, text=True)
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                      text=True)
             processes.append(bridge)
             port = bound_port(bridge)
             deadline = time.monotonic() + 10
@@ -235,25 +272,44 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
             stop.close()
             stopped.close()
             elapsed = time.monotonic() - started
-            count_window(results)
+            low, high = count_window(results)
+            stall = None
+            if stalled and high is not None:
+                last = last_before(sockets[0], high)
+                # Each reader's updates after the non-reading client's last,
+                # while the bridge sent that client nothing.
+                stall = {"last": last,
+                         "reader_updates": [sum(last is None or last < s < high
+                                                for s in r["sequences"])
+                                            for r in results]}
             for result in results:
+                del result["sequences"]
                 result["bytes_s"] = round(result["bytes"] / elapsed)
             rss = None
             status = Path(f"/proc/{bridge.pid}/status")
             if status.exists():
                 rss = next(int(line.split()[1]) for line in status.read_text().splitlines()
                            if line.startswith("VmRSS:"))
+            for sock in sockets:
+                sock.close()
+            bridge.send_signal(signal.SIGTERM)
+            _, errors = bridge.communicate(timeout=5)
+            summary = dict(pair.split("=", 1) for pair in errors.split()
+                           if pair.count("=") == 1)
             return {"clients": clients, "elapsed_s": elapsed,
-                    "stalled": stalled, "excess_refused": refused,
-                    "rss_kib": rss, "readers": results, "stats": stats}
+                    "stalled": stalled, "excess_refused": refused, "stall": stall,
+                    "rss_kib": rss, "readers": results, "stats": stats,
+                    "held": int(summary["held"])}
         finally:
             for sock in sockets:
                 sock.close()
             for process in reversed(processes):
-                process.send_signal(signal.SIGTERM)
-                process.wait(timeout=5)
-                if process.stdout:
-                    process.stdout.close()
+                if process.poll() is None:
+                    process.send_signal(signal.SIGTERM)
+                    process.wait(timeout=5)
+                for stream in (process.stdout, process.stderr):
+                    if stream:
+                        stream.close()
 
 
 class BandwidthTest(unittest.TestCase):
@@ -268,7 +324,7 @@ class BandwidthTest(unittest.TestCase):
         self.assertLessEqual(int(result["stats"]["egress_bytes"]),
                              160000 * result["elapsed_s"] + 64000)
         for reader in result["readers"]:
-            self.assertGreaterEqual(reader["frames"], 16)
+            self.assertGreaterEqual(reader["frames"], SERVED_FRAMES)
         # The shared bucket is granted in rotation: of the readers, each able
         # to take a send throughout the window, none is sent to twice before
         # every other one is sent to once. So two readers' updates differ by
@@ -278,6 +334,18 @@ class BandwidthTest(unittest.TestCase):
         for a in readers:
             for b in readers:
                 self.assertLessEqual(a["updates"], b["updates"] + 1 + b["graph"], readers)
+        # The client that stopped reading backed up and was held: the bridge
+        # counted passes it held for buffered output, and after its last
+        # update every reader was sent at least four while it was sent none.
+        # Able to take a send, it would have had a turn between any two of
+        # theirs, and its own budget alone affords about three updates in
+        # such a span; held, it costs the readers no turn and the budget no
+        # byte.
+        self.assertGreater(result["held"], 0)
+        stall = result["stall"]
+        self.assertIsNotNone(stall["last"], stall)
+        for updates in stall["reader_updates"]:
+            self.assertGreaterEqual(updates, 4, stall)
 
     def test_configured_client_limit(self):
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")

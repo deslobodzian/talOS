@@ -1,12 +1,14 @@
 #include <App.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -110,6 +112,9 @@ struct Bridge {
   // Frames the publisher overwrote before this bridge read them: it never
   // waits for the bridge, so a stalled bridge is lapped instead.
   std::uint64_t lapped = 0;
+  // Client passes held because the client still had output buffered: a
+  // client that stopped reading costs the others no turn and no budget.
+  std::uint64_t held = 0;
   // read_next() copies each page here and validates the copy before
   // ingesting commits side effects (client sends, counters).
   std::vector<std::byte> frame =
@@ -214,7 +219,11 @@ struct Bridge {
                                        EgressBudget::kBytesPerSecond)));
       return false;
     }
-    return client->getBufferedAmount() == 0;
+    if (client->getBufferedAmount() != 0) {
+      ++held;
+      return false;
+    }
+    return true;
   }
 
   // Sends one message the caller found affordable and charges it.
@@ -476,6 +485,14 @@ std::string mime(const fs::path& p) {
 // larger anyway.
 constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
+// The kernel send buffer of each WebSocket client. Left to autotuning it grew
+// to 4 MiB on Linux, so a client that stopped reading was sent about 100 s of
+// its 40 kB/s share, all stale on arrival and all charged to the shared
+// budget, before the bridge saw any output buffered and held it. This holds
+// what the bridge's whole 160 kB/s budget sends in 100 ms (a link's bandwidth
+// times its round trip, at a slow radio's), so it never limits a client that
+// reads.
+constexpr int kClientSendBufferBytes = 16 * 1024;
 }  // namespace
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
@@ -651,6 +668,13 @@ int main(int argc, char** argv) try {
   };
   behavior.open = [&](auto* ws) {
     bridge.clients.push_back(ws);
+    const int fd = static_cast<int>(
+        reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &kClientSendBufferBytes,
+                     sizeof kClientSendBufferBytes) != 0) {
+      std::cerr << "client send buffer not set: " << std::strerror(errno)
+                << '\n';
+    }
     // The current graph at once, so the client does not open on an empty
     // system view, then the dictionary and a keyframe of the latest tick, so
     // it starts with every channel instead of waiting for the next dictionary
@@ -848,8 +872,8 @@ int main(int argc, char** argv) try {
   app.run();
   uWS::Loop::get()->removePostHandler(&bridge);
   std::cerr << "forwarded=" << bridge.forwarded << " invalid=" << bridge.invalid
-            << " lapped=" << bridge.lapped << " ws_drops=" << bridge.ws_drops
-            << " refused=" << bridge.refused
+            << " lapped=" << bridge.lapped << " held=" << bridge.held
+            << " ws_drops=" << bridge.ws_drops << " refused=" << bridge.refused
             << " egress_bytes=" << bridge.egress_bytes
             << " wakes=" << bridge.wakes
             << " publication_wakes=" << bridge.publication_wakes
