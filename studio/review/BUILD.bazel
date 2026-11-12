@@ -109,6 +109,7 @@ cc_test(
         ":review_test_message",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
         "@nlohmann_json//:json",
         "@rules_cc//cc/runfiles",
