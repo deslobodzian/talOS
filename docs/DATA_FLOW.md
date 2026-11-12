@@ -445,7 +445,12 @@ burst (`EgressBudget` in `studio/bridge/telemetry.h`). Each client also has a
 defaults to **4** (range **1–64**). Each pass over the clients starts just
 after the last client sent anything, so the shared bucket is granted in
 rotation: of the clients able to take a send, none is sent to twice before
-every other one has been sent to once. HTTP snapshots and static files are outside this budget.
+every other one has been sent to once. A client that still has output
+buffered is sent nothing; each client's kernel send buffer is set to
+**16 KiB** (`kClientSendBufferBytes` in `studio/bridge/main.cc`; Linux
+accounts twice that), what the whole budget sends in 100 ms, so a client
+that stops reading backs up after that much instead of after the 4 MiB
+Linux autotuning reached, about 100 s of a 40,000 B/s share. HTTP snapshots and static files are outside this budget.
 
 160,000 B/s is **1.28 Mbit/s, 32 %** of the **4 Mbit/s** per-team field
 bandwidth limit that WPILib's networking documentation and the FMS whitepaper
