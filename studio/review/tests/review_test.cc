@@ -692,9 +692,9 @@ TEST_F(ReviewTest, ResponsesEqualTheGoldenFiles) {
         rules_cc::cc::runfiles::Runfiles::CreateForTest(
             BAZEL_CURRENT_REPOSITORY, &error));
     ASSERT_NE(runfiles, nullptr) << error;
-    golden = std::filesystem::path{runfiles->Rlocation(
-                                       std::getenv("TALOS_GOLDEN_BOUNDS"))}
-                 .parent_path();
+    const char* bounds = std::getenv("TALOS_GOLDEN_BOUNDS");
+    if (bounds == nullptr) FAIL() << "TALOS_GOLDEN_BOUNDS is not set";
+    golden = std::filesystem::path{runfiles->Rlocation(bounds)}.parent_path();
   }
   for (const auto& [file, request] : GoldenRequests()) {
     SCOPED_TRACE(file);
