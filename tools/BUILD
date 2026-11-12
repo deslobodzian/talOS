@@ -102,3 +102,17 @@ py_test(
     legacy_create_init = False,
     main = "check_layers_test.py",
 )
+
+# python3 tools/lint_test_time.py (CI: the lint job)
+# No wall clock in tests or node code, no test retries; exceptions with their
+# reasons in lint_test_time_allowlist.txt.
+py_test(
+    name = "lint_test_time_test",
+    size = "small",
+    srcs = [
+        "lint_test_time.py",
+        "lint_test_time_test.py",
+    ],
+    legacy_create_init = False,
+    main = "lint_test_time_test.py",
+)

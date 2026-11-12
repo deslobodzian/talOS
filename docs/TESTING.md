@@ -160,7 +160,10 @@ Where RULES.md 12 is read too broadly or too narrowly:
 
 1. **No wall clock below integration.** Unit, component and contract tests
    never sleep, read `steady_clock::now` or `time.time`, or wait on a real
-   timer. Nodes use `node.now()`; `Sim` owns time. **[review; gap: LINT-1]**
+   timer. Nodes use `node.now()`; `Sim` owns time. **[enforced:
+   `tools/lint_test_time.py` over every test source; a test of a higher tier
+   that uses the real clock is listed with its reason in
+   `tools/lint_test_time_allowlist.txt`]**
 2. **Logic with a deadline takes its clock as a parameter**, so the policy
    (supervision deadlines, restart windows, retry intervals) is a component
    test in milliseconds and integration keeps one real spawn per mechanism.
@@ -268,8 +271,9 @@ the host can run it. It is never noise.
 
 1. **No retries.** No `flaky = True`, no `--flaky_test_attempts`, no
    rerunning a job until it is green. A rerun is allowed only for a host
-   failure the log shows (runner lost, download failed). **[review; gap:
-   LINT-1]**
+   failure the log shows (runner lost, download failed). **[enforced:
+   `tools/lint_test_time.py` for `flaky = True` and `--flaky_test_attempts`;
+   review for reruns]**
 2. **Diagnose from the artifact.** `soak_test` and `match_rehearsal_test`
    write their session directories to Bazel's undeclared test outputs; the
    other e2e and perf tests write theirs to temporary directories that do

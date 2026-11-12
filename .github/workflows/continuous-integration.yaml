@@ -600,6 +600,19 @@ jobs:
           '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' ':!third_party/' \
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
+  lint:
+    name: Source lints (no Bazel)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: No wall clock in tests or node code, no test retries
+      # docs/TESTING.md §6.1, §8.1; exceptions with their reasons in
+      # tools/lint_test_time_allowlist.txt, which may only shrink.
+      run: python3 tools/lint_test_time.py
+
   gate:
     name: CI gate
     # The one check to require: it fails unless every job above succeeded.
@@ -615,6 +628,7 @@ jobs:
       - rio-in-the-loop
       - buildifier
       - clang-format
+      - lint
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

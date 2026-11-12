@@ -1,0 +1,52 @@
+# tools/lint_test_time.py allowlist: `<path> sleep|clock|retry <reason>`.
+# A line lets that file use the real clock (sleep, clock) or a test retry
+# (retry). Only an integration, e2e, soak or perf test, or code outside a
+# node, belongs here (docs/TESTING.md §2, §6). "seeded:" marks a line
+# carried over when the lint was added and not yet audited. A line whose
+# hits are gone fails the lint, so the list only shrinks.
+
+2026-robot/main_processor/drivetrain/monitor.cc sleep operator CLI beside the node, paced on the real clock; not node code
+2026-robot/main_processor/drivetrain/send_target.cc clock operator CLI beside the node, sends for a wall-clock duration; not node code
+2026-robot/main_processor/drivetrain/send_target.cc sleep operator CLI beside the node, sends for a wall-clock duration; not node code
+2026-robot/main_processor/simulation/match_rehearsal_test.py clock e2e: paces scripted inputs against the running graph (TESTING.md §2)
+2026-robot/main_processor/simulation/match_rehearsal_test.py sleep e2e: paces scripted inputs against the running graph (TESTING.md §2)
+2026-robot/main_processor/simulation/soak_test.py clock soak: injected kills and stalls on the real clock (TESTING.md §2)
+2026-robot/main_processor/simulation/soak_test.py sleep soak: injected kills and stalls on the real clock (TESTING.md §2)
+2026-robot/main_processor/simulation/startup_test.py clock e2e: waits on the launched graph with deadlines (TESTING.md §2)
+2026-robot/main_processor/simulation/startup_test.py sleep e2e: waits on the launched graph with deadlines (TESTING.md §2)
+2026-robot/main_processor/vision/node_test.cc clock seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
+2026-robot/main_processor/vision/node_test.cc sleep seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
+studio/bridge/bandwidth_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/bandwidth_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/integration_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/integration_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+talOS/bridge/hardware_node_test.cc clock seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
+talOS/bridge/hardware_node_test.cc sleep seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
+talOS/bridge/run_test.cc clock seeded: integration, bridge loop over UDP; wake latency on the real clock
+talOS/bridge/run_test.cc sleep seeded: integration, bridge loop over UDP; wake latency on the real clock
+talOS/events/log/log_kill_test.cc clock integration: kills a writer process, waits with a deadline
+talOS/events/log/log_kill_test.cc sleep integration: kills a writer process, waits with a deadline
+talOS/events/log/log_test.cc clock seeded: integration, writer thread; TEST-8 replaces the IdleWriterDoesNotPoll and ProducerNeverWaitsForTheLogFile sleeps
+talOS/events/log/log_test.cc sleep seeded: integration, writer thread; TEST-8 replaces the IdleWriterDoesNotPoll and ProducerNeverWaitsForTheLogFile sleeps
+talOS/events/os/poller_test.cc sleep integration: real kqueue/epoll timer delivery across threads
+talOS/events/realtime_event_loop_test.cc clock seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
+talOS/events/realtime_event_loop_test.cc sleep seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
+talOS/hardware/gateway_test.cc clock seeded: a UDP wait helper in a component target; move the case to its own target (TESTING.md §2)
+talOS/hardware/gateway_test.cc sleep seeded: a UDP wait helper in a component target; move the case to its own target (TESTING.md §2)
+talOS/introspection/registry_test.cc clock seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
+talOS/introspection/registry_test.cc sleep seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/continuity_test.cc sleep seeded: integration, spawned processes; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/launcher_test.cc clock seeded: integration, spawned processes and their deadlines
+talOS/launcher/launcher_test.cc sleep seeded: integration, spawned processes and their deadlines
+talOS/launcher/log_budget_test.cc clock seeded: integration, paces a real writer process
+talOS/launcher/log_budget_test.cc sleep seeded: integration, paces a real writer process
+talOS/launcher/supervision_test.cc clock seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/supervision_test.cc sleep seeded: integration, one real spawn or kill per mechanism; sleeps unaudited against TESTING.md §6.3
+talOS/node/node_test.cc clock seeded: an integration case (signals a spawned node) in a component target; move it to its own target
+talOS/node/node_test.cc sleep seeded: an integration case (signals a spawned node) in a component target; move it to its own target
+talOS/vision/pipeline_test.cc clock integration: pipeline worker threads, condition wait with a deadline
+talOS/vision/pipeline_test.cc sleep integration: pipeline worker threads, condition wait with a deadline
+talOS/vision/recording/recorder_test.cc clock integration: recorder thread, condition wait with a deadline
+talOS/vision/recording/recorder_test.cc sleep integration: recorder thread, condition wait with a deadline
+tools/test_drivetrain.py clock manual WPILib bring-up script, not a test
+tools/test_drivetrain.py sleep manual WPILib bring-up script, not a test
