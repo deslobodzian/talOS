@@ -449,7 +449,8 @@ with eight autonomous seconds for the baseline and four seconds for each lag
 session. For each backend, fused replay must improve on that backend's
 odometry-only RMS when all baseline
 cameras capture at least two thirds of scheduled deadlines (at least 40 of the
-requested 60 fps), report a positive mean frame period no larger than 25 ms,
+requested 60 fps; a deadline ends either processed or dropped, so the
+scheduled count is processed + dropped), report a positive mean frame period no larger than 25 ms,
 and process at least 95% of captured frames. These are input-health prerequisites,
 chosen to require a majority of the requested stream and near-complete processing,
 not fitted to position RMS or CPU architecture. Every run reports each backend's

@@ -229,9 +229,9 @@ Rendering still uses the original truth instant. Lagged observations wait until
 the offset cancels the lag; this prevents unrealistic future-stamped fusion.
 The lag window uses a preallocated, bounded queue sized from the configured
 capture period (`ceil(lag * fps) + 2` slots); overflow drops the oldest pending
-observation and increments the dropped-frame count. Every due observation is
+observation and moves it from the processed to the dropped-frame count. Every due observation is
 published in order, including batches after a late update. Stale/missing truth
-clears pending observations and publishes invalid immediately.
+clears pending observations (counted dropped) and publishes invalid immediately.
 The first fresh truth captures immediately and anchors a `1 / camera.fps`
 deadline grid. Subsequent captures use the first drained truth at or after the
 next deadline, advancing the grid rather than resetting it to the actual truth
@@ -244,11 +244,11 @@ unless lagged observations become due (or, rasterized, a worker result arrives).
 With `rasterize = true` a due capture posts one request, a copy of its
 `/sim/state` sample, into a single slot the worker takes from; a request still
 untaken when the next capture is due is replaced and counted in
-`frames_dropped_count`, as is a finished result the worker replaces before the
-loop collected it. Each update collects at most one finished result with a
-nonblocking try-lock and handles it like a direct-projection capture (counted
-processed, then the lag queue). Its observation therefore arrives one or more
-updates after its capture, still stamped with the truth instant it was rendered
+`frames_dropped_count`. Finished results wait in the bounded result queue
+described under live capture below; each update takes all of them with a
+nonblocking try-lock and handles each, in capture order, like a
+direct-projection capture (counted processed, then the lag queue). Its
+observation therefore arrives one or more updates after its capture, still stamped with the truth instant it was rendered
 from; `last_latency_us` includes the render and detection time. A result
 collected more than `frame_timeout_us` after its truth instant (node clock) is
 dropped and counted in `frames_dropped_count`, never published.
@@ -324,7 +324,7 @@ opens after the first successful connection. Each connection state change
 reason, the source's own (missing device, permission, unsupported mode, a
 failed V4L2 call with its errno) when it gives one; a retry that fails the same
 way logs nothing. The loop passes
-time atomically and uses a nonblocking result-slot try-lock; it never opens a
+time atomically and uses a nonblocking result-queue try-lock; it never opens a
 device, spawns a thread, or waits for worker work. A test driving a live
 source calls `Vision::WaitForLiveWorker` after each step, which blocks in wall
 time until the worker has serviced that tick and every delivered frame, so a
@@ -339,15 +339,28 @@ and the frame it is processing is never overwritten. Each slot is sized by
 the first frame it holds, in the format the source negotiated when it opened
 (V4L2 delivers at most 2 B/px, AVFoundation BGRA 4 B/px), and grows only for a
 larger frame, so steady-state capture does not allocate.
-Processing replaces one fixed-size completed observation. `frames_dropped_count`
+Each finished observation joins a fixed-capacity FIFO, sized at construction to
+`ceil(2 * period_us * fps / 1e6) + 2` (4 at 10 ms and 60 fps): the results that
+finish between two collections, one per frame period plus the one in progress,
+over two node periods (a late tick, or a collection whose try-lock met the
+worker storing), and one more slot so a disconnect's invalid observation never
+evicts a frame. Each update takes every queued result and publishes them in
+capture order, each with its own stamp, so a result is never replaced by a
+newer one while the loop keeps up; when the queue is full the oldest is
+dropped and counted, keeping the newest. `frames_processed_count` counts the
+observations the loop took. `frames_dropped_count`
 is the mailbox's single count of every frame that never reached a published
 observation: a ready frame replaced before the worker took it, a frame without
 an image, errored or short driver buffers the source reports, frames discarded
-with a retired capture session, and a completed observation replaced before
-the loop published it. Shutdown wakes and joins the worker,
+with a retired capture session, and a finished observation evicted from the
+full result queue. Once no frame is in flight (mailbox, worker, result queue),
+processed + dropped equals captured plus the driver buffers the source
+dropped; for a simulated camera, captured plus the deadlines a slow tick
+skipped. Shutdown wakes and joins the worker,
 which stops capture before exiting. `--describe` never opens a camera.
 
-One observation is published per processed frame delivered to the loop, stamped
+One observation is published per processed frame delivered to the loop (an
+update may publish several), stamped
 with the best-estimate mid-exposure time under the source-kind rule above.
 Missing tags and rejected estimates publish
 `valid = false`, never a held valid pose. Invalid detections are excluded from

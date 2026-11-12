@@ -288,11 +288,17 @@ def camera_health_issues(timings):
     The deadline counters cover the whole session, unlike estimator accepts,
     which also depend on visibility and innovation gating. This prerequisite
     is independent of whether fusion happened to beat odometry.
+
+    Each scheduled deadline ends processed or dropped exactly once, whether
+    it was skipped before capture or its result was lost after it, so
+    processed + dropped counts every deadline once (less the few still in
+    flight at the final status). captured + dropped would count a capture
+    dropped after its capture twice.
     """
     issues = []
     for camera in CAMERAS:
         timing = timings[camera]
-        scheduled = timing.captured + timing.dropped
+        scheduled = timing.processed + timing.dropped
         if (not scheduled or timing.captured * 3 < scheduled * 2
                 or not 0 < timing.frame_period_us <= 25_000
                 or not timing.captured

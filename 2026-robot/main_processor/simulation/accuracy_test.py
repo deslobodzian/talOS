@@ -127,13 +127,16 @@ class ScoringTest(unittest.TestCase):
             camera_timing([])
 
     def test_camera_health_is_per_camera_and_independent_of_fusion_error(self):
-        healthy = {camera: CameraTiming(25_000, 100, 200, 190)
+        # 300 deadlines: 100 skipped before capture, 10 of the 200 captures
+        # dropped after it. Exactly two thirds captured, which counting
+        # scheduled as captured + dropped (310) failed.
+        healthy = {camera: CameraTiming(25_000, 110, 200, 190)
                    for camera in CAMERAS}
         self.assertEqual(camera_health_issues(healthy), [])
         for timing in (
-                CameraTiming(25_001, 100, 200, 190),
-                CameraTiming(25_000, 101, 200, 190),
-                CameraTiming(25_000, 100, 200, 189),
+                CameraTiming(25_001, 110, 200, 190),
+                CameraTiming(25_000, 111, 200, 190),
+                CameraTiming(25_000, 110, 200, 189),
                 CameraTiming(0, 0, 0, 0),
                 # macOS follow-up: only ~28% of scheduled captures survived.
                 CameraTiming(58_710, 353, 141, 141)):

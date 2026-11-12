@@ -109,7 +109,7 @@ class FrameMailbox {
   }
 
   // Counts frames lost outside the mailbox (driver errors, a taken frame
-  // abandoned unprocessed, a result replaced before publication).
+  // abandoned unprocessed, a result evicted from a full result queue).
   void CountDropped(uint64_t frames) {
     dropped_.fetch_add(frames, std::memory_order_relaxed);
   }

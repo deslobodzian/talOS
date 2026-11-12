@@ -199,6 +199,28 @@ class Vision {
     }
     sim_tags_.reserve(256);
     detections_.reserve(256);
+    {
+      // The worker finishes at most one result per frame period (it takes one
+      // frame or request at a time, and they come no faster than camera.fps),
+      // and every update() takes all of them. Between two collections a
+      // period_us apart: ceil(period_us * fps) results, plus the one in
+      // progress at the earlier collection. A late tick, or a collection
+      // whose try_lock met the worker storing, doubles the window:
+      // ceil(2 * period_us * fps) + 1. One more slot keeps the live
+      // disconnect marker from evicting a frame. 10 ms ticks at 60 fps: 4.
+      constexpr std::size_t kMargin = 2;
+      const auto frames = std::ceil(
+          2.0L * std::chrono::duration<long double>{node.period()}.count() *
+          capture_config_.fps);
+      if (!(frames <=
+            static_cast<long double>(finished_.max_size() - kMargin))) {
+        throw std::invalid_argument(
+            std::string(node_.name()) +
+            ": camera.fps requires too many queued results");
+      }
+      finished_.resize(static_cast<std::size_t>(frames) + kMargin);
+      collected_.resize(finished_.size());
+    }
     if (CanCapture(simulated_, device_)) {
       // No up-front mailbox reservation: the pixel format (V4L2 at most
       // 2 B/px, AVFoundation BGRA) is negotiated only when the worker opens
@@ -310,6 +332,8 @@ class Vision {
   void update() {
     const auto now = node_.now();
     const auto now_ns = static_cast<std::uint64_t>(now.nanos());
+    // An invalid observation that stands for no capture (no truth, no
+    // camera); captures publish as they are admitted, oldest first.
     std::optional<Completed> completed;
     // truth_ exists exactly when simulated_.
     if (truth_.has_value()) {
@@ -317,7 +341,7 @@ class Vision {
         truth_outage_ = false;
         // Deliver ready frames before admitting a new capture.
         DrainSimPending(now_ns);
-        if (rasterize_) CollectSimResult(now_ns, completed);
+        if (rasterize_) CollectSimResults(now_ns);
         const auto& truth = truth_->value();
         if (SimCaptureDue(truth.sample_time_ns())) {
           if (rasterize_) {
@@ -325,12 +349,15 @@ class Vision {
             PostSimRequest(truth);
           } else {
             // Bounded, O(visible tags): stays inline and deterministic.
-            AdmitSimCapture(Simulate(truth, captured_), completed);
+            AdmitSimCapture(Simulate(truth, captured_), now_ns);
           }
           ++captured_;
         }
         DrainSimPending(now_ns);
       } else {
+        // Delayed observations of the retired truth are never delivered.
+        processed_ -= sim_pending_count_;
+        dropped_ += sim_pending_count_;
         sim_pending_count_ = 0;
         completed = Completed{
             truth_->has_value() ? truth_->value().sample_time_ns() : 0};
@@ -351,15 +378,24 @@ class Vision {
     } else {
       worker_now_ns_.store(now.nanos(), std::memory_order_release);
       wake_.notify_one();
-      std::unique_lock lock(mutex_, std::try_to_lock);
-      if (lock.owns_lock()) {
-        completed = completed_;
-        completed_.reset();
-        captured_ = received_;
-        processed_ = worker_processed_;
-        dropped_ = mailbox_.dropped();
-        rejected_range_ = worker_rejected_range_;
-        frame_period_us_ = worker_period_us_;
+      std::size_t collected = 0;
+      {
+        // Never waits for the worker: what it is still storing is taken on a
+        // later tick.
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (lock.owns_lock()) {
+          collected = TakeFinished();
+          captured_ = received_;
+          dropped_ = mailbox_.dropped();
+        }
+      }
+      for (std::size_t i = 0; i < collected; ++i) {
+        const auto& result = collected_[i];
+        if (result.frame) {
+          RecordProcessed(result.completed.capture_ns);
+          rejected_range_ += result.completed.rejected_range;
+        }
+        PublishObservation(result.completed, now_ns);
       }
     }
     if (completed) PublishObservation(*completed, now_ns);
@@ -398,9 +434,13 @@ class Vision {
     std::uint64_t epoch = 0;
     std::uint64_t sequence = 0;
   };
-  struct SimResult {
+  // A result on its way from the worker to update(). `frame` is false only
+  // for the live worker's disconnect marker, an invalid observation that is
+  // no capture; `epoch` is the raster sim's outage epoch of its request.
+  struct Finished {
     Completed completed;
     std::uint64_t epoch = 0;
+    bool frame = true;
   };
 
   // What the recorder needs per frame beyond the detections already produced:
@@ -698,18 +738,19 @@ class Vision {
   }
 
   // Counts a processed capture and queues it behind the timestamp lag, or
-  // hands it to this update when there is none.
-  void AdmitSimCapture(const Completed& capture,
-                       std::optional<Completed>& completed) {
+  // publishes it now when there is none. A capture the full lag queue evicts
+  // moves from processed to dropped.
+  void AdmitSimCapture(const Completed& capture, std::uint64_t now_ns) {
     RecordProcessed(capture.capture_ns);
     rejected_range_ += capture.rejected_range;
     if (sim_pending_.empty()) {
-      completed = capture;
+      PublishObservation(capture, now_ns);
       return;
     }
     if (sim_pending_count_ == sim_pending_.size()) {
       sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
       --sim_pending_count_;
+      --processed_;
       ++dropped_;
     }
     sim_pending_[(sim_pending_head_ + sim_pending_count_) %
@@ -728,30 +769,61 @@ class Vision {
     wake_.notify_one();
   }
 
+  // Worker side, under mutex_. A full queue means update() fell behind: the
+  // oldest result is dropped and counted, and the newest kept.
+  void PushFinished(const Finished& result) {
+    if (finished_count_ == finished_.size()) {
+      if (finished_[finished_head_].frame) {
+        if (simulated_) {
+          ++finished_overflow_;
+        } else {
+          mailbox_.CountDropped(1);
+        }
+      }
+      finished_head_ = (finished_head_ + 1) % finished_.size();
+      --finished_count_;
+    }
+    finished_[(finished_head_ + finished_count_) % finished_.size()] = result;
+    ++finished_count_;
+  }
+
+  // Loop side, under mutex_: moves every queued result into collected_,
+  // oldest first, and returns how many (at most the queue's capacity).
+  std::size_t TakeFinished() {
+    const auto count = finished_count_;
+    for (std::size_t i = 0; i < count; ++i) {
+      collected_[i] = finished_[(finished_head_ + i) % finished_.size()];
+    }
+    finished_head_ = (finished_head_ + count) % finished_.size();
+    finished_count_ = 0;
+    return count;
+  }
+
   // Never waits for the worker: a result it is still storing is taken on a
-  // later tick. A result from before the latest truth outage, or whose truth
-  // stamp is older than frame_timeout_us on the node clock (a worker that
-  // fell that far behind), is discarded and counted as dropped.
-  void CollectSimResult(std::uint64_t now_ns,
-                        std::optional<Completed>& completed) {
-    std::optional<SimResult> result;
+  // later tick. Admits every queued result in capture order. One from before
+  // the latest truth outage, or whose truth stamp is older than
+  // frame_timeout_us on the node clock (a worker that fell that far behind),
+  // is discarded and counted as dropped.
+  void CollectSimResults(std::uint64_t now_ns) {
+    std::size_t collected = 0;
     {
       std::unique_lock lock(mutex_, std::try_to_lock);
       if (!lock.owns_lock()) return;
-      result = sim_result_;
-      sim_result_.reset();
-      dropped_ += sim_results_replaced_;
-      sim_results_replaced_ = 0;
+      collected = TakeFinished();
+      dropped_ += std::exchange(finished_overflow_, 0);
     }
-    if (!result) return;
-    const auto capture_ns = result->completed.capture_ns;
-    if (result->epoch != sim_epoch_ ||
-        (capture_ns <= now_ns &&
-         now_ns - capture_ns > static_cast<std::uint64_t>(frame_timeout_ns_))) {
-      ++dropped_;
-      return;
+    for (std::size_t i = 0; i < collected; ++i) {
+      const auto& result = collected_[i];
+      const auto capture_ns = result.completed.capture_ns;
+      if (result.epoch != sim_epoch_ ||
+          (capture_ns <= now_ns &&
+           now_ns - capture_ns >
+               static_cast<std::uint64_t>(frame_timeout_ns_))) {
+        ++dropped_;
+        continue;
+      }
+      AdmitSimCapture(result.completed, now_ns);
     }
-    AdmitSimCapture(result->completed, completed);
   }
 
   // Renders, detects, solves and records one requested capture at a time.
@@ -777,9 +849,7 @@ class Vision {
       }
       {
         std::lock_guard lock(mutex_);
-        // The loop has not taken the previous result: it is lost.
-        if (sim_result_) ++sim_results_replaced_;
-        sim_result_ = SimResult{result, request->epoch};
+        PushFinished(Finished{result, request->epoch, true});
         sim_busy_ = false;
       }
       sim_idle_.notify_all();
@@ -787,11 +857,12 @@ class Vision {
   }
 
   void RecordProcessed(std::uint64_t capture_ns) {
-    if (processed_ == 0) first_capture_ns_ = capture_ns;
+    if (period_samples_ == 0) first_capture_ns_ = capture_ns;
+    ++period_samples_;
     ++processed_;
     frame_period_us_ =
-        processed_ > 1 && capture_ns >= first_capture_ns_
-            ? (capture_ns - first_capture_ns_) / (processed_ - 1) / 1000
+        period_samples_ > 1 && capture_ns >= first_capture_ns_
+            ? (capture_ns - first_capture_ns_) / (period_samples_ - 1) / 1000
             : 0;
   }
 
@@ -1015,7 +1086,8 @@ class Vision {
         }
         if (was_connected) {
           std::lock_guard lock(mutex_);
-          completed_ = Completed{static_cast<std::uint64_t>(serviced_ns)};
+          PushFinished(Finished{
+              Completed{static_cast<std::uint64_t>(serviced_ns)}, 0, false});
         }
         if (serviced_ns < retry_at_ns) continue;
         bool opened = false;
@@ -1041,7 +1113,8 @@ class Vision {
             source_.reset();
           }
           std::lock_guard lock(mutex_);
-          completed_ = Completed{static_cast<std::uint64_t>(serviced_ns)};
+          PushFinished(Finished{
+              Completed{static_cast<std::uint64_t>(serviced_ns)}, 0, false});
         }
         continue;
       }
@@ -1057,19 +1130,7 @@ class Vision {
       retry_at_ns = serviced_ns + retry_delay_ns;
       {
         std::lock_guard lock(mutex_);
-        // The loop has not published the previous result: it is lost.
-        if (completed_) mailbox_.CountDropped(1);
-        if (worker_processed_ == 0)
-          worker_first_capture_ns_ = result.capture_ns;
-        ++worker_processed_;
-        worker_period_us_ =
-            worker_processed_ > 1 &&
-                    result.capture_ns >= worker_first_capture_ns_
-                ? (result.capture_ns - worker_first_capture_ns_) /
-                      (worker_processed_ - 1) / 1000
-                : 0;
-        worker_rejected_range_ += result.rejected_range;
-        completed_ = result;
+        PushFinished(Finished{result, 0, true});
       }
     }
     connected_.store(false, std::memory_order_release);
@@ -1136,7 +1197,11 @@ class Vision {
   std::atomic<std::uint64_t> source_reports_{0};
   std::mutex connection_mutex_;
   std::optional<talos::vision::ConnectionState> logged_connection_;
-  std::optional<Completed> completed_;
+  // Worker-to-loop results, a fixed-capacity FIFO guarded by mutex_, and the
+  // loop's copy of what it took from it.
+  std::vector<Finished> finished_;
+  std::size_t finished_head_ = 0, finished_count_ = 0;
+  std::vector<Finished> collected_;
   bool healthy_ = false, stale_stamps_ = false;
   std::atomic<bool> stopping_{false}, connected_{false};
   std::atomic<std::int64_t> worker_now_ns_{-1};
@@ -1147,18 +1212,20 @@ class Vision {
   std::condition_variable live_idle_;  // Notified when the worker goes idle.
   // Raster sim handoff, guarded by mutex_. sim_epoch_ is the loop's alone.
   std::optional<SimRequest> sim_request_;
-  std::optional<SimResult> sim_result_;
   bool sim_busy_ = false;  // The worker is simulating a request it took.
   std::condition_variable sim_idle_;  // Notified when sim_busy_ clears.
-  std::uint64_t sim_results_replaced_ = 0;
+  // Raster sim results the full queue evicted, not yet in dropped_.
+  std::uint64_t finished_overflow_ = 0;
   std::uint64_t sim_epoch_ = 0;
-  std::uint64_t received_ = 0, worker_processed_ = 0;
-  std::uint64_t worker_first_capture_ns_ = 0, worker_period_us_ = 0,
-                worker_rejected_range_ = 0;
+  std::uint64_t received_ = 0;  // Live frames delivered; guarded by mutex_.
+  // The loop's. Once nothing is in flight (a request, the worker, the result
+  // queue, the mailbox), processed + dropped == captured + the deadlines lost
+  // before capture (sim: skipped by a slow tick; live: driver buffers the
+  // source dropped). Observations waiting out a sim lag count as processed.
   std::uint64_t captured_ = 0, processed_ = 0, dropped_ = 0,
                 rejected_range_ = 0;
-  std::uint64_t first_capture_ns_ = 0, frame_period_us_ = 0,
-                last_latency_us_ = 0;
+  std::uint64_t first_capture_ns_ = 0, period_samples_ = 0,
+                frame_period_us_ = 0, last_latency_us_ = 0;
   std::uint32_t visible_ = 0;
 };
 
