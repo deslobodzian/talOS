@@ -118,7 +118,7 @@ class Drivetrain:
         self.sim.publish(DrivetrainState, drivetrain_topics.STATE, **fields)
 
     def sim_ns(self):
-        return round(self.sim.now * 1e9)
+        return self.sim.now_ns
 
 
 class Camera:
