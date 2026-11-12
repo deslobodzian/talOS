@@ -9,6 +9,11 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -94,7 +99,8 @@ std::string ReadFile(const std::string& path) {
 // hardware stub writes "hardware ready" to kEventFd, and each alpha run
 // "alpha <run>"; run 1 also writes "alpha 1 ticked" once it has printed
 // twenty ticks. Once `crash` exists, run 0 exits 1. A stop signalled before
-// both are ready could end a stub by the signal rather than its trap.
+// both are ready could end a stub by the signal rather than its trap. Each
+// alpha run starts with a 16 KiB line, more than a terminal holds.
 struct Fixture {
   LauncherOptions options;
   std::string crash;
@@ -121,6 +127,7 @@ struct Fixture {
                   "hardware_node");
     std::string alpha = "trap 'exit 0' INT TERM\nrun=0\n";
     alpha += "[ -e " + crashed + " ] && run=1\n";
+    alpha += "head -c 16384 /dev/zero | tr '\\0' x\necho\n";
     alpha += "echo \"alpha $run\" >&" + events + "\nticks=0\nwhile :; do\n";
     alpha += "  echo tick\n  ticks=$((ticks + 1))\n";
     alpha += "  if [ $run = 1 ] && [ $ticks = 20 ]; then\n";
@@ -252,7 +259,8 @@ bool HasLine(const std::string& text, std::string_view first,
   return false;
 }
 
-// Fills `writer`'s pipe until a write would block, leaving it blocking.
+// Fills `writer`'s pipe (or terminal) until a write would block, leaving it
+// blocking.
 void FillPipe(int writer) {
   const int flags = ::fcntl(writer, F_GETFL);
   ::fcntl(writer, F_SETFL, flags | O_NONBLOCK);
@@ -275,19 +283,37 @@ void FillPipe(int writer) {
 // must reach alpha.log, SIGTERM must still stop the session in order
 // (status 0, manifest finalized, the hardware stub's and alpha's last runs
 // "stop"), and the session's talos.log must hold the launcher's line about
-// alpha's exit.
+// alpha's exit. Row "terminal": stdout and stderr are a pseudo-terminal
+// nobody reads (an interactive ssh session whose client's network dropped),
+// full but for a few bytes: poll() calls it writable, and a blocking write
+// of more than that room never returns. The stop must still end the
+// launcher within the descriptors' linger.
 TEST(ClosedOutput, SessionOutlivesAnUnreadStdout) {
+  enum class Output { kClosed, kFull, kTerminal };
   struct Row {
     const char* name;
-    bool full;  // Else closed once alpha's echo came through.
+    Output output;
   };
-  for (const Row row : {Row{"closed", false}, Row{"full", true}}) {
+  for (const Row row :
+       {Row{"closed", Output::kClosed}, Row{"full", Output::kFull},
+        Row{"terminal", Output::kTerminal}}) {
     SCOPED_TRACE(row.name);
     Fixture fixture{row.name};
     const std::string alpha_log = NodeOutputPath(fixture.session_dir, "alpha");
+    // output[0] the test's end, output[1] the launcher's.
     int output[2];
-    ASSERT_EQ(::pipe(output), 0);
-    if (row.full) FillPipe(output[1]);
+    if (row.output == Output::kTerminal) {
+      ASSERT_EQ(::openpty(&output[0], &output[1], nullptr, nullptr, nullptr),
+                0);
+      FillPipe(output[1]);
+      // One read, once: some room, so that poll() calls the terminal
+      // writable, but less than the launcher's output will need.
+      char taken[4096];
+      ASSERT_GT(::read(output[0], taken, sizeof taken), 0);
+    } else {
+      ASSERT_EQ(::pipe(output), 0);
+      if (row.output == Output::kFull) FillPipe(output[1]);
+    }
     const Forked launcher = ForkLauncher(fixture.options, output[1], output[0]);
     ::close(output[1]);
     ASSERT_GT(launcher.pid, 0);
@@ -295,7 +321,7 @@ TEST(ClosedOutput, SessionOutlivesAnUnreadStdout) {
     std::string seen;
     std::string events;
     bool started = false;
-    if (row.full) {
+    if (row.output != Output::kClosed) {
       started = AwaitText(launcher.events, events, "alpha 0") &&
                 AwaitText(launcher.events, events, "hardware ready");
     } else {
@@ -314,17 +340,18 @@ TEST(ClosedOutput, SessionOutlivesAnUnreadStdout) {
     ::close(launcher.events);
     if (!ended) ::kill(launcher.pid, SIGKILL);
     if (alive) status = Reap(launcher.pid);
-    if (row.full) ::close(output[0]);
+    if (row.output != Output::kClosed) ::close(output[0]);
 
-    ASSERT_TRUE(started) << (row.full ? "alpha never started; events: "
-                                      : "alpha's output never reached the "
-                                        "launcher's stdout: ")
-                         << (row.full ? events : seen);
+    ASSERT_TRUE(started) << (row.output != Output::kClosed
+                                 ? "alpha never started; events: "
+                                 : "alpha's output never reached the "
+                                   "launcher's stdout: ")
+                         << (row.output != Output::kClosed ? events : seen);
     EXPECT_TRUE(alive) << "the launcher ended: " << ExitReason(status);
     EXPECT_TRUE(restarted) << "alpha's second run never printed twenty "
                               "lines; events: "
                            << events;
-    EXPECT_TRUE(ended) << "the session did not end after SIGTERM";
+    EXPECT_TRUE(ended) << "the launcher did not exit after SIGTERM";
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
         << "the stop ended with " << ExitReason(status);
     const std::string manifest =

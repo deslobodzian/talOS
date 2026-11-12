@@ -559,6 +559,11 @@ cc_test(
     srcs = ["closed_output_test.cc"],
     data = [":signal_probe"],
     env = {"TALOS_SIGNAL_PROBE": "$(rlocationpath :signal_probe)"},
+    # openpty: libutil before glibc 2.34, libc on macOS.
+    linkopts = select({
+        "@platforms//os:linux": ["-lutil"],
+        "//conditions:default": [],
+    }),
     # Each spawn is two fork()s; see launcher_test.
     tags = ["no_macos_sanitizer"],
     deps = [
