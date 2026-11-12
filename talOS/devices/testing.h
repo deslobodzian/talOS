@@ -108,6 +108,9 @@ class SimHardware {
                         double volts);
   void set_encoder(std::string_view node, std::string_view device,
                    double position, double velocity);
+  // A CANcoder's position goes out wrapped to [-0.5, 0.5) rotations, its
+  // absolute position as the RoboRIO reports it
+  // (hardware::CANcoderAbsoluteRot); a gyro's yaw is not wrapped.
   void set_cancoder(std::string_view node, std::string_view device,
                     double position, double velocity,
                     std::uint32_t position_age_us = 0,

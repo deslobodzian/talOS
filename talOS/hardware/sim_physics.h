@@ -33,8 +33,10 @@
 // motor/CANcoder direction mismatch runs away here as on a robot.
 //
 // Sensors cross the hardware boundary. CANcoder samples mirror the linked
-// mechanism. Swerve ground motion determines the true field pose; the Pigeon
-// reports true yaw plus optional drift, unless explicitly overridden.
+// mechanism, the position wrapped to [-0.5, 0.5) rotations as the RoboRIO
+// reports it (CANcoderAbsoluteRot). Swerve ground motion determines the true
+// field pose; the Pigeon reports true yaw plus optional drift, unless
+// explicitly overridden.
 //
 // Stopping is consistent. Commanded neutral (Mode::kNeutral, and
 // Neutral() on disable/timeout/failure) removes drive and lets the rotor
@@ -66,6 +68,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "feedback.h"
 #include "gateway.h"
 
 namespace talos::hardware::sim {
@@ -391,6 +394,7 @@ class PhysicsSimBackend final : public Backend {
           out.position_rot = -out.position_rot;
           out.velocity_rps = -out.velocity_rps;
         }
+        out.position_rot = CANcoderAbsoluteRot(out.position_rot);
       }
     }
     for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {

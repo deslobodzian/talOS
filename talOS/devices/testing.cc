@@ -632,7 +632,8 @@ void SimHardware::set_cancoder(std::string_view node, std::string_view device,
                                std::uint32_t position_age_us,
                                std::uint32_t velocity_age_us) {
   impl_->sensors[impl_->Id(node, Kind::kCANcoder, device)] = {
-      position, velocity, position_age_us, velocity_age_us};
+      hardware::CANcoderAbsoluteRot(position), velocity, position_age_us,
+      velocity_age_us};
 }
 
 void SimHardware::set_gyro(std::string_view node, std::string_view device,
