@@ -616,7 +616,7 @@ or without a live command. On the real backend, neutral disables PWM pulses
 | Neutral | Velocity snaps to 0 | Unpowered decay: brake stops fast, coast rolls on |
 | Gearing/inversion | Ignored | Rotor/gearing division, inversion flips direction; a follower drives in its master's direction (reversed if opposed), ignoring its own `inverted`; a remote-CANcoder motor reports and closes its loops on the CANcoder in the CANcoder's direction |
 | Soft limits | Ignored | Clamped, axis stopped at the limit |
-| CANcoder position | Its motor's position, unwrapped | The linked mechanism's, wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it |
+| CANcoder position | Its motor's position, wrapped to [-0.5, 0.5) rotations as the RoboRIO reports it | The linked mechanism's, wrapped the same way |
 | Pigeon yaw | Zero raw yaw, then mounting offset/inversion | True chassis yaw relative to boot, plus optional drift; explicit gyro overrides remain available |
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
 | Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |

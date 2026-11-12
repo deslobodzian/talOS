@@ -220,6 +220,31 @@ TEST(SimFollowers, IdealMirrorsPositionVelocityAndNeutralInEitherOrder) {
   }
 }
 
+// The RoboRIO reports a CANcoder's absolute position in [-0.5, 0.5)
+// rotations (CANcoderAbsoluteRot); the ideal backend's CANcoder, which
+// mirrors its motor's position, wraps the same way, so an absolute-homing
+// node under sim_gateway sees the reading the robot gives.
+// REQ-DEV-07
+TEST(SimBackend, CancoderReadsItsAbsolutePositionWrapped) {
+  auto cfg = SingleMotorConfig();
+  cfg.sensors.push_back({2, "angle", SensorKind::kCANcoder, 2, "rio"});
+  cfg.motors[0].feedback = Feedback::kRemoteCANcoder;
+  cfg.motors[0].feedback_sensor_id = 2;
+  SimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  for (const auto& [demand, reported] :
+       {std::pair{0.25, 0.25}, std::pair{0.75, -0.25}, std::pair{0.5, -0.5},
+        std::pair{-0.75, 0.25}, std::pair{2.25, 0.25}}) {
+    SCOPED_TRACE(demand);
+    std::array<MotorRequest, 1> command{{{1, Mode::kPosition, 0, demand, 0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    State s{};
+    ASSERT_TRUE(backend.Read(s));
+    EXPECT_DOUBLE_EQ(s.motors[0].position_rot, demand);  // continuous
+    EXPECT_DOUBLE_EQ(s.sensors[0].position_rot, reported);
+  }
+}
+
 template <typename Sim>
 void CheckPowerHealth() {
   Sim backend;
