@@ -42,6 +42,17 @@ struct LocalMotorSetting {
   bool operator==(const LocalMotorSetting&) const { return true; }
 };
 
+// The motor a TalonFX drives. Only the physics simulator reads it, for its
+// winding model (sim_physics.h MotorModelFor).
+enum class MotorType : uint8_t { kKrakenX60 = 0, kKrakenX44, kFalcon500 };
+
+// A motor type only the main processor reads: like LocalMotorSetting, not on
+// the config wire and equal whatever its value.
+struct LocalMotorType {
+  MotorType value{MotorType::kKrakenX60};
+  bool operator==(const LocalMotorType&) const { return true; }
+};
+
 struct MotorConfig {
   uint16_t id{};  // Logical ID, independent of CAN address and array index.
   std::string name;
@@ -75,6 +86,10 @@ struct MotorConfig {
   // positions in the sensor's frame, which survives a reset, from its first
   // state, and keeps its rezero across resets.
   LocalMotorSetting absolute_position_frame{};
+  // Main processor only, not part of ConfigurationId: the motor type, which
+  // sets the physics simulator's stall current and free speed. Kraken X60
+  // unless set; the robot config does not name it yet.
+  LocalMotorType motor_type{};
   bool operator==(const MotorConfig&) const = default;
 };
 

@@ -31,6 +31,7 @@
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
+#include "talOS/hardware/sim_physics.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
@@ -633,6 +634,57 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
   hood.Drive(0.5, 80ms);
   EXPECT_TRUE(hood.mech().homed());
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
+}
+
+// Stall homing on the physics simulator's motor (sim_gateway --physics):
+// the hood's 1 V push runs it down into a hard stop 0.3 rot below where it
+// starts (the physics soft limit), where the winding model draws 1 V / R,
+// about 30 A on a Kraken X60, past its realistic 20 A homing_stall_current_a,
+// so it homes there well inside homing_timeout_us.
+// REQ-SAFE-36
+TEST(PositionMechanism, StallHomingCompletesOnThePhysicsMotor) {
+  Rig hood{"hood"};
+  hardware::Config physics_config =
+      hood.sim.node("hood").extension<HardwareLink>().config().hardware;
+  physics_config.commissioned = true;
+  std::size_t index = physics_config.motors.size();
+  for (std::size_t i = 0; i < physics_config.motors.size(); ++i) {
+    if (physics_config.motors[i].name == "hood") index = i;
+  }
+  ASSERT_LT(index, physics_config.motors.size());
+  hardware::MotorConfig& motor = physics_config.motors[index];
+  ASSERT_EQ(motor.motor_type.value, hardware::MotorType::kKrakenX60);
+  motor.soft_limits = true;  // the physical stop
+  motor.reverse_limit_rot = -0.3;
+  motor.forward_limit_rot = 10.0;
+  hardware::sim::PhysicsSimBackend physics;
+  ASSERT_TRUE(physics.Configure(physics_config));
+  std::vector<hardware::MotorRequest> requests(physics_config.motors.size());
+  hardware::State state{};
+  state.motor_count = static_cast<std::uint16_t>(requests.size());
+  std::uint64_t now_us = 0;
+  // Each tick the physics motor runs what the gateway applied last tick and
+  // reports to the hood through SimHardware.
+  const auto tick = [&] {
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      requests[i] = {.id = physics_config.motors[i].id};
+    }
+    requests[index] = hood.Applied();
+    ASSERT_TRUE(physics.Apply(requests));
+    state.sample_time_us = now_us += 5000;
+    physics.Read(state);
+    const hardware::MotorSample& sample = state.motors[index];
+    hood.SetMotor(sample.position_rot, sample.velocity_rps,
+                  sample.stator_current_a);
+    hood.Drive(0.5, 5ms);
+  };
+  hood.Start();
+  for (int i = 0; i < 100 && !hood.mech().homed(); ++i) tick();
+  ASSERT_TRUE(hood.mech().homed())
+      << "fault " << static_cast<int>(hood.mech().fault());
+  EXPECT_LT(now_us, 400'000u);  // homing_timeout_us is 500 ms
+  EXPECT_NEAR(state.motors[index].position_rot, -0.3, 1e-9);
+  EXPECT_NEAR(hood.mech().position_rot(), 0.0, 1e-9);
 }
 
 // A mechanism that keeps moving (no stop within reach) times out and faults.
