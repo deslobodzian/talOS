@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# One command to run this robot in simulation.
+# One command to run a robot in simulation (2026-robot unless --config).
 #
 # Starts the WPILib simulation (which stands in for the RoboRIO and is the
 # Driver Station), the talOS node graph, and Studio, in dependency order.
@@ -20,10 +20,14 @@
 #   ./sim.sh --sim-gateway --gateway-arg ARG
 #                            forward ARG to the lightweight simulator
 #   ./sim.sh --duration-s 30 stop the node graph after 30 seconds
+#   ./sim.sh --config my_robot/main_processor/configuration/robot.toml \
+#       --sim-gateway --no-studio
+#                            another robot (bazel run //tools:new_robot)
 #
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CALLER_DIR="$PWD"
 cd "$ROOT" || exit 1
 
 HEADLESS=0
@@ -36,6 +40,7 @@ MODE_SCHEDULE=""
 JOYSTICK_SCHEDULE=""
 ALLIANCE=""
 GATEWAY_ARGS=()
+CONFIG=""
 # HTTP port only: the telemetry topic lives in the robot config
 # ([subsystems.telemetry] topic), read by the nodes that own each end, so this
 # script never spells it twice.
@@ -49,7 +54,11 @@ usage() {
   cat <<'USAGE'
 
 Options:
-  --headless        run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
+  --config FILE     the robot config to run, relative to the repository root
+                    or the current directory (default: 2026-robot's robot.toml,
+                    or robot_physics_sim.toml with --sim-gateway); its
+                    generated manifest must be current
+  --headless       run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
   --mode-schedule S script the Driver Station as mode:seconds phases
                     (disabled, auto, teleop, test; the last is held). With
                     --headless it sets TALOS_SIM_DS_SCHEDULE, counted from the
@@ -77,6 +86,11 @@ USAGE
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --config)
+      [ $# -ge 2 ] || { echo "sim.sh: --config needs an argument" >&2; exit 2; }
+      CONFIG="$2"
+      shift
+      ;;
     --headless)    HEADLESS=1 ;;
     --no-studio)   WANT_STUDIO=0 ;;
     --no-rio)      WANT_RIO=0 ;;
@@ -149,6 +163,54 @@ if [ "$WANT_RIO" = "1" ] && [ "$WANT_GATEWAY" = "1" ]; then
   die "--sim-gateway conflicts with the WPILib simulation; pass --no-rio to use the lightweight simulator instead"
 fi
 
+# --- the robot config -------------------------------------------------------
+# Every target follows the config: the nodes its manifest lists, its [robot]
+# hardware_node and sim_gateway, and its [studio] bridge. Bazel and the
+# launcher take it relative to the repository root.
+if [ -z "$CONFIG" ]; then
+  CONFIG="2026-robot/main_processor/configuration/robot.toml"
+  if [ "$WANT_GATEWAY" = "1" ]; then
+    CONFIG="2026-robot/main_processor/configuration/robot_physics_sim.toml"
+  fi
+else
+  case "$CONFIG" in
+    /*) ;;
+    *) [ -f "$CONFIG" ] || CONFIG="$CALLER_DIR/$CONFIG" ;;
+  esac
+  [ -f "$CONFIG" ] || die "no robot config at $CONFIG"
+  CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"
+  case "$CONFIG" in
+    "$ROOT"/*) CONFIG="${CONFIG#"$ROOT"/}" ;;
+    *) die "$CONFIG is outside the repository ($ROOT)" ;;
+  esac
+fi
+
+# A stale manifest would build the wrong nodes; sync_manifest prints the
+# command that regenerates it. Its run also builds the resolver used below.
+say "checking $CONFIG"
+CHECK_OUTPUT="$(bazel run --noshow_progress --ui_event_filters=-info \
+  //tools:sync_manifest -- --check "$CONFIG" 2>&1)" || {
+  printf '%s\n' "$CHECK_OUTPUT" >&2
+  die "$CONFIG cannot run as it stands (above)"
+}
+# The effective config, through the launcher's own parser: the manifest's
+# node labels (current, per the check) and the labels of [robot] and
+# [studio], defaults where unset.
+TARGETS="$(./bazel-bin/talOS/configuration/resolve "$CONFIG" | python3 -c '
+import json, sys
+config = json.load(sys.stdin)
+robot = config["effective"].get("robot", {})
+studio = config["effective"].get("studio", {})
+print("nodes", *config["nodes"])
+print("hardware_node", robot.get("hardware_node", "//talOS/bridge:hardware_node"))
+print("sim_gateway", robot.get("sim_gateway", ""))
+print("studio_bridge", studio.get("bridge", "//studio/bridge:studio_bridge"))
+')" || die "cannot resolve $CONFIG"
+target() { printf '%s\n' "$TARGETS" | sed -n "s|^$1 ||p"; }
+if [ "$WANT_GATEWAY" = "1" ] && [ -z "$(target sim_gateway)" ]; then
+  die "$CONFIG sets no [robot] sim_gateway for --sim-gateway to start"
+fi
+
 SESSION_ID="$(date +%s)"
 OUT_DIR="/tmp/talos_logs"
 SESSION_DIR="${OUT_DIR}/${SESSION_ID}"
@@ -196,16 +258,28 @@ track() { PIDS="$PIDS $1"; NAMES="$NAMES $2"; }
 # One bazel invocation for everything, so a compile error stops the run before
 # any process starts rather than halfway through bringing the system up.
 say "building"
-BUILD_TARGETS="//talOS/launcher:launcher //talOS/bridge:hardware_node //2026-robot/main_processor/..."
+BUILD_TARGETS="//talOS/launcher:launcher $(target hardware_node) $(target nodes)"
+if [ "$WANT_GATEWAY" = "1" ]; then
+  BUILD_TARGETS="$BUILD_TARGETS $(target sim_gateway)"
+fi
 if [ "$WANT_STUDIO" = "1" ]; then
-  BUILD_TARGETS="$BUILD_TARGETS //studio/bridge:studio_bridge //studio:web_dist"
+  BUILD_TARGETS="$BUILD_TARGETS $(target studio_bridge) //studio:web_dist"
 fi
 # shellcheck disable=SC2086
 bazel build $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
 
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then
+  # The robot's own RoboRIO program when it has one beside its
+  # main_processor/, else 2026-robot's; the bridge sends either its hardware
+  # config.
   RIO_DIR="$ROOT/2026-robot/controller_processor/rio"
+  case "$CONFIG" in
+    */main_processor/configuration/*)
+      OWN_RIO="$ROOT/${CONFIG%%/main_processor/configuration/*}/controller_processor/rio"
+      [ -x "$OWN_RIO/gradlew" ] && RIO_DIR="$OWN_RIO"
+      ;;
+  esac
   [ -x "$RIO_DIR/gradlew" ] || die "no gradlew at $RIO_DIR"
   # --no-daemon keeps the build, and the simulation it runs, inside this
   # script's process tree; a Gradle daemon is detached, so cleanup could
@@ -262,10 +336,6 @@ fi
 
 # --- 2. the node graph ------------------------------------------------------
 say "starting node graph (log: $LOG_DIR/launcher.log)"
-CONFIG="2026-robot/main_processor/configuration/robot.toml"
-if [ "$WANT_GATEWAY" = "1" ]; then
-  CONFIG="2026-robot/main_processor/configuration/robot_physics_sim.toml"
-fi
 LAUNCH_ARGS="--config $CONFIG --sim --session-id $SESSION_ID --output-dir $OUT_DIR"
 [ -n "$DURATION" ] && LAUNCH_ARGS="$LAUNCH_ARGS --duration-s $DURATION"
 # Studio's bridge is a declared node in the launcher's graph ([studio] in the
