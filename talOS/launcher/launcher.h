@@ -75,6 +75,7 @@ class Launcher {
   // the duration passes or a signal arrives, and writes manifest.json.
   // Returns 0, or the last nonzero exit code of a node. With --replay-inputs
   // it runs only the --only node, on recorded topics (RunOnRecordedInputs).
+  // Sets the process's SIGPIPE disposition to ignored, for good.
   int Run();
 
  private:

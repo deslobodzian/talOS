@@ -497,6 +497,20 @@ cc_test(
     ],
 )
 
+# A session whose stdout and stderr reader closes, and the SIGPIPE
+# disposition its children start with (REQ-OPS-33).
+cc_test(
+    name = "closed_output_test",
+    size = "small",
+    srcs = ["closed_output_test.cc"],
+    # Each spawn is two fork()s; see launcher_test.
+    tags = ["no_macos_sanitizer"],
+    deps = [
+        ":launcher_lib",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # A publisher that kills itself (SIGKILL) on its first run and exits cleanly
 # on its second, and a subscriber that logs what it receives: the launcher's
 # session-owned segments keep the subscriber's topic across both.

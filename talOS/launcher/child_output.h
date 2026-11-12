@@ -31,7 +31,9 @@ namespace talos::launcher {
 // disk writers on the Mac mini), and so can stdout when it is a file or a
 // pipe read slowly. While a writer is behind, a member's buffer (or the
 // echo's) grows to kChildOutputBufferBytes; what arrives beyond it is
-// dropped, counted, and marked where it was lost.
+// dropped, counted, and marked where it was lost. A write to stdout that
+// cannot succeed later (a pipe whose reader closed it: EPIPE, since the
+// launcher ignores SIGPIPE) ends the echo for the session; the logs go on.
 //
 // The child's end of the pipe stays blocking. A nonblocking one would turn a
 // full pipe into EAGAIN inside the child: stdio loses the data and sets the
@@ -143,6 +145,7 @@ class ChildOutput {
   std::map<std::string, Pending> pending_;
   std::string echo_;
   uint64_t echo_dropped_{0};
+  bool echo_closed_{false};  // A write to stdout failed for good (EchoLoop).
   bool dirty_{false};
   bool stopping_{false};
   bool reader_done_{false};

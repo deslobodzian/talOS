@@ -127,7 +127,7 @@ void ChildOutput::Deliver(const Stream& stream, const char* data,
     pending.bytes.append(data, kept);
     pending.dropped += size - kept;
     pending.dropped_total += size - kept;
-    if (stream.echo) {
+    if (stream.echo && !echo_closed_) {
       const std::size_t echo_room =
           kChildOutputBufferBytes -
           std::min(kChildOutputBufferBytes, echo_.size());
@@ -329,9 +329,21 @@ void ChildOutput::EchoLoop() {
       echo_dropped_ = 0;
     }
     lock.unlock();
-    // A write error drops the echo, except a pipe whose reader closed it:
-    // the launcher leaves SIGPIPE at its default, so that ends the launcher.
-    WriteAll(STDOUT_FILENO, echo);
+    // A write that fails drops the echo. One that cannot succeed later (a
+    // pipe whose reader closed it: EPIPE, as the launcher ignores SIGPIPE; a
+    // closed or broken descriptor) ends it for the session; only a
+    // nonblocking stdout's EAGAIN drops just this batch.
+    if (WriteAll(STDOUT_FILENO, echo) != 0 && errno != EAGAIN &&
+        errno != EWOULDBLOCK) {
+      const int error = errno;
+      lock.lock();
+      echo_closed_ = true;
+      echo_.clear();
+      echo_dropped_ = 0;
+      lock.unlock();
+      std::cerr << "[launcher] stdout: " << std::strerror(error)
+                << "; node output is no longer echoed, only logged\n";
+    }
     lock.lock();
   }
 }

@@ -278,6 +278,9 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
   if (::getppid() != parent) ::_exit(127);
   std::signal(SIGINT, SIG_DFL);
   std::signal(SIGTERM, SIG_DFL);
+  // The launcher ignores SIGPIPE, and an ignored signal stays ignored across
+  // exec: a program expects the default.
+  std::signal(SIGPIPE, SIG_DFL);
   const pid_t group = ::getpid();
   const pid_t guardian = ::fork();
   if (guardian < 0) ReportChildFailure(errors[1], ChildStep::kGuardian);
