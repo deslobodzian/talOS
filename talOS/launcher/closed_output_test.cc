@@ -550,6 +550,70 @@ TEST(ClosedOutput, StdoutDropsMidSessionAreNotedInTalosLog) {
   EXPECT_EQ(in_log[2].str(), in_stream[1].str()) << talos_log;
 }
 
+// REQ-OPS-33
+// talos.log is read by line (session_report, a person grepping for a
+// member's exit), so the launcher's note about one of its streams never
+// lands inside another line. A forked launcher-to-be prints the first piece
+// of a line ("[launcher] alpha") to a stdout whose reader is gone, waits
+// until the stream's failure has been noted (on stderr, which the test
+// reads), then prints the rest. talos.log must hold the whole line, then
+// the note on a line of its own.
+TEST(ClosedOutput, StreamNoteWaitsForTheLineInProgress) {
+  const std::string log = TempPath("note_line.log");
+  ::remove(log.c_str());
+  int errors[2];
+  int resume[2];
+  ASSERT_EQ(::pipe(errors), 0);
+  ASSERT_EQ(::pipe(resume), 0);
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(errors[0]);
+    ::close(resume[1]);
+    int closed[2];
+    if (::pipe(closed) != 0) ::_exit(100);
+    ::close(closed[0]);             // Every write to stdout fails with EPIPE.
+    std::signal(SIGPIPE, SIG_IGN);  // As Launcher::Run sets it.
+    if (::dup2(closed[1], STDOUT_FILENO) < 0 ||
+        ::dup2(errors[1], STDERR_FILENO) < 0)
+      ::_exit(101);
+    ::close(closed[1]);
+    ::close(errors[1]);
+    {
+      LauncherOutput launcher;
+      launcher.Record(log);
+      std::cout << "[launcher] alpha";
+      // Until the test has seen the failure noted and closes its end.
+      char go = 0;
+      if (::read(resume[0], &go, 1) != 0) ::_exit(102);
+      std::cout << " exited (exit code 1)\n";
+      launcher.Stop(std::chrono::milliseconds{kHangMs});
+    }
+    ::_exit(0);
+  }
+  ::close(errors[1]);
+  ::close(resume[0]);
+  std::string seen;
+  const bool noted = AwaitText(errors[0], seen, "no longer writes to it");
+  ::close(resume[1]);
+  AwaitEnd(errors[0], seen);
+  ::close(errors[0]);
+  const int status = Reap(child);
+  const std::string talos_log = ReadFile(log);
+  ::remove(log.c_str());
+
+  ASSERT_TRUE(noted) << "the stream's failure was never noted: " << seen;
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  const std::string line = "[launcher] alpha exited (exit code 1)\n";
+  const std::size_t whole = talos_log.find(line);
+  ASSERT_NE(whole, std::string::npos) << "talos.log:\n" << talos_log;
+  const std::size_t note = talos_log.find("[launcher] stdout: ");
+  ASSERT_NE(note, std::string::npos) << "talos.log:\n" << talos_log;
+  EXPECT_EQ(note, whole + line.size()) << "talos.log:\n" << talos_log;
+}
+
 std::string Runfile(const char* env) {
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(

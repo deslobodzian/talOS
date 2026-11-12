@@ -186,6 +186,19 @@ struct LauncherOutput::State {
   // never took.
   void NoteUnwritten();
 
+  // Under mutex: appends launcher output to talos.log's buffer, and once it
+  // ends a line, the notes held for that line's end.
+  void AppendToFile(std::string_view bytes);
+
+  // Under mutex: a note about one of the launcher's streams, one whole line,
+  // for talos.log: at once when no line is in progress there, else held
+  // until that line ends (AppendToFile), at the latest until Stop
+  // (FlushHeldNotes). Without talos.log, none.
+  void NoteInFile(const std::string& line);
+
+  // Under mutex: writes the held notes, ending a line still in progress.
+  void FlushHeldNotes();
+
   // Writes the descriptors' buffers, waiting on poll() for each to take
   // more; its poll() never waits past the stop's linger.
   void DescriptorLoop();
@@ -205,6 +218,10 @@ struct LauncherOutput::State {
   std::string file_path;
   std::string file_pending;
   uint64_t file_dropped{0};
+  // The last byte given to talos.log's buffer did not end a line.
+  bool file_line_open{false};
+  // Notes waiting for that line to end (NoteInFile).
+  std::string file_held_notes;
   bool stopping{false};
   std::chrono::milliseconds linger{0};
   Clock::time_point give_up{};
@@ -300,10 +317,37 @@ void LauncherOutput::State::Say(int fd, const char* data, std::size_t size) {
     const std::lock_guard lock{mutex};
     Descriptor& to = descriptors[target[fd == 1 ? 0 : 1]];
     if (!to.closed) to.dropped += Append(to.pending, data, size);
-    if (!file_path.empty()) file_dropped += Append(file_pending, data, size);
+    if (!file_path.empty()) AppendToFile({data, size});
   }
   file_wake.notify_one();
   Wake();
+}
+
+void LauncherOutput::State::AppendToFile(std::string_view bytes) {
+  if (bytes.empty()) return;
+  file_dropped += Append(file_pending, bytes.data(), bytes.size());
+  file_line_open = bytes.back() != '\n';
+  if (file_line_open || file_held_notes.empty()) return;
+  file_dropped +=
+      Append(file_pending, file_held_notes.data(), file_held_notes.size());
+  file_held_notes.clear();
+}
+
+void LauncherOutput::State::NoteInFile(const std::string& line) {
+  if (file_path.empty()) return;
+  if (file_line_open) {
+    file_held_notes += line;
+  } else {
+    AppendToFile(line);
+  }
+}
+
+void LauncherOutput::State::FlushHeldNotes() {
+  if (file_held_notes.empty()) return;
+  if (file_line_open) AppendToFile("\n");
+  // Ending the line wrote them.
+  if (!file_held_notes.empty()) AppendToFile(std::string{file_held_notes});
+  file_held_notes.clear();
 }
 
 std::size_t LauncherOutput::State::Append(std::string& to, const char* data,
@@ -333,7 +377,7 @@ void LauncherOutput::State::NoteUnwritten() {
         descriptor.name + " were not written" + in_write +
         "; it did not drain within " + std::to_string(linger.count()) +
         " ms of the end\n";
-    file_dropped += Append(file_pending, line.data(), line.size());
+    NoteInFile(line);
   }
 }
 
@@ -358,6 +402,7 @@ void LauncherOutput::Stop(std::chrono::milliseconds linger) {
       state.abandoned = true;
       state.NoteUnwritten();
     }
+    state.FlushHeldNotes();
     state.file_done = true;
   }
   state.file_wake.notify_all();
@@ -403,11 +448,9 @@ void LauncherOutput::State::DescriptorLoop() {
             // talos.log is what session_report reads. One per drain; none
             // once Stop has left this writer behind.
             if (!file_path.empty() && !abandoned) {
-              const std::string line =
-                  "[launcher] " + std::to_string(descriptor.dropped) +
-                  " bytes for the launcher's " + descriptor.name +
-                  " were not written: its reader fell behind\n";
-              file_dropped += Append(file_pending, line.data(), line.size());
+              NoteInFile("[launcher] " + std::to_string(descriptor.dropped) +
+                         " bytes for the launcher's " + descriptor.name +
+                         " were not written: its reader fell behind\n");
               noted = true;
             }
             descriptor.dropped = 0;
@@ -484,7 +527,17 @@ void LauncherOutput::State::DescriptorLoop() {
                                "; the launcher no longer writes to it (its "
                                "lines are in talos.log, node output in each "
                                "<name>.log)\n";
-      Say(i == 0 ? 2 : 1, line.data(), line.size());
+      {
+        // On the other stream, and in talos.log once the line in progress
+        // there has ended.
+        const std::lock_guard lock{mutex};
+        Descriptor& other = descriptors[i == 0 ? target[1] : 0];
+        if (!other.closed)
+          other.dropped += Append(other.pending, line.data(), line.size());
+        NoteInFile(line);
+      }
+      file_wake.notify_one();
+      Wake();
     }
   }
   // Stopped: what the descriptors did not take within the linger, unless
