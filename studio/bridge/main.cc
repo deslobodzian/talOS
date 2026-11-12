@@ -196,8 +196,11 @@ struct Bridge {
   // the client has nothing buffered. Spends nothing. A send the budget
   // defers is due again when both buckets will hold it (schedule); one
   // deferred for buffered output is retried by the socket's drain handler.
-  bool affordable(Socket* client, std::size_t framed_bytes) {
-    const std::int64_t now = talos::introspect::monotonic_now_ns();
+  // `now` is the pass's instant, not each client's: every client in a pass
+  // sees the buckets at one level, so a refill landing between two clients
+  // cannot hand the turn of one that could not yet afford a message to a
+  // later one with a message of the same size.
+  bool affordable(Socket* client, std::size_t framed_bytes, std::int64_t now) {
     auto& local = client->getUserData()->budget;
     const double rate = client_rate();
     const bool own = local.available(framed_bytes, rate, now);
@@ -232,15 +235,15 @@ struct Bridge {
 
   // Brings one client toward the latest graph and tick: each whole on join,
   // then change-only updates, the graph first (studio::ClientFeeds).
-  // Returns whether it sent the client anything. Only a pass calls it.
-  bool pump(Socket* client) {
+  // Returns whether it sent the client anything. Only a pass calls it, with
+  // the pass's instant.
+  bool pump(Socket* client, std::int64_t now_ns) {
     // Every successful send is charged to egress_bytes (send_now).
     const std::uint64_t charged = egress_bytes;
     client->getUserData()->feeds.Pump(
-        system_graph, telemetry_state, talos::introspect::monotonic_now_ns(),
-        client_rate(),
-        [this, client](std::size_t framed_bytes) {
-          return affordable(client, framed_bytes);
+        system_graph, telemetry_state, now_ns, client_rate(),
+        [this, client, now_ns](std::size_t framed_bytes) {
+          return affordable(client, framed_bytes, now_ns);
         },
         [this, client](std::string_view text) {
           return send_now(client, text, uWS::OpCode::TEXT);
@@ -253,7 +256,18 @@ struct Bridge {
 
   // Offers every client what is due, in rotation (studio::ClientRotation).
   void pass_clients() {
-    clients.Pass([this](Socket* client) { return pump(client); });
+    const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+    clients.Pass(
+        [this, now_ns](Socket* client) { return pump(client, now_ns); });
+  }
+
+  // A client's output drained: a pass, which offers it its turn
+  // (studio::ClientRotation::Drained).
+  void drained(Socket* client) {
+    const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+    clients.Drained(client, [this, now_ns](Socket* offered) {
+      return pump(offered, now_ns);
+    });
   }
 
   // The decoded feed: latest dictionary and latest complete tick, backing
@@ -668,10 +682,7 @@ int main(int argc, char** argv) try {
   // A client held back by buffered output is offered what is due as soon as
   // its socket drains, in a pass: behind any client owed a turn before it,
   // so a client whose writes keep draining is not sent to twice in a turn.
-  behavior.drain = [&](auto* ws) {
-    bridge.clients.Drained(
-        ws, [&bridge](Socket* client) { return bridge.pump(client); });
-  };
+  behavior.drain = [&](auto* ws) { bridge.drained(ws); };
   behavior.close = [&](auto* ws, int, std::string_view) {
     bridge.clients.Remove(ws);
   };

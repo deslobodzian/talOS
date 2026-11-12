@@ -446,7 +446,8 @@ defaults to **4** (range **1–64**). Every send leaves in a pass over the
 clients (a client that joins or drains is offered its turn by one), and each
 pass starts just after the last client sent anything, so the shared bucket is
 granted in rotation: of the clients able to take a send (nothing buffered,
-and both buckets hold its whole next message), none is sent to twice before
+and both buckets, as they stood when the pass began, hold its whole next
+message), none is sent to twice before
 every other one has been sent to once (`ClientRotation` in
 `studio/bridge/telemetry.h`). Messages differ in size, so a client whose
 next update is larger than another's can be passed over while the shared
