@@ -71,6 +71,8 @@ class Publisher {
         publish_time_ns);
   }
 
+  RTMSQueue& queue() { return publisher_.queue(); }
+
  private:
   RawPublisher publisher_;
 };
