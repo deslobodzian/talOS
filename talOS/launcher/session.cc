@@ -151,7 +151,7 @@ uint64_t DeliveryCounts::requests_skipped_total() const {
   return total;
 }
 
-bool NodeProcessInfo::RecordDeliveryLoss(DeliveryCounts seen) {
+bool NodeProcessInfo::RecordDeliveryLoss(const DeliveryCounts& seen) {
   if (runs.empty() || runs.back().end_wall_ns != 0) return false;
   NodeRun& run = runs.back();
   DeliveryCounts& was = run.delivery ? *run.delivery : run.delivery.emplace();
