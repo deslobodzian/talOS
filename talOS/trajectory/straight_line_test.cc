@@ -224,7 +224,7 @@ TEST(StraightLineTest, RefusesInvalidInputAndClears) {
     std::size_t capacity;
     StraightLineError error;
   };
-  const auto with = [](double StraightLineLimits::* field, double value) {
+  const auto with = [](double StraightLineLimits::*field, double value) {
     StraightLineLimits limits = kLimits;
     limits.*field = value;
     return limits;
