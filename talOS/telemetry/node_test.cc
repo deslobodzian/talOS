@@ -771,6 +771,27 @@ node = "//talOS/telemetry:node"
 )" + std::string{telemetry_keys};
 }
 
+// A node may declare a message of more scalars than a dictionary holds; the
+// config's exclude brings it within the cap, as for any large source. Here
+// /budget/state has 2100 doubles (fields "0xxx" to "2099") and excluding
+// the names starting with 1
+// leaves 989: telemetry constructs and serves exactly those. Counting the
+// excluded channels against the topic cap refused the whole node.
+// REQ-CONTRACT-28
+TEST(TelemetryTest, ExcludedChannelsDoNotCountAgainstATopicsCap) {
+  Sim sim = Sim::FromToml(
+      LongNamesConfig(2100, 4, R"(exclude = ["budget/state/1*"])"));
+  sim.add<LongNamesNode>("budget");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  std::size_t served = 0;
+  for (const ChannelDef& channel : telemetry.dictionary()) {
+    if (!channel.name.starts_with(kLongNamesPrefix)) continue;
+    ++served;
+    EXPECT_NE(channel.name[kLongNamesPrefix.size()], '1') << channel.name;
+  }
+  EXPECT_EQ(served, 2100u - 1111u);
+}
+
 TEST(TelemetryTest, DictionaryPastOneSlotPagesAndOneChannelMustFitAPage) {
   // 64 channels of the longest name Studio decodes: more dictionary than one
   // slot holds, so it takes several pages.
