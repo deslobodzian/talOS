@@ -963,46 +963,65 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 }
 
 // FaultField is a separate signal from the motion feedback that keeps the
-// sample valid, so a stale FaultField must not keep reporting a limit or an
-// active current limiter: a motor driven into its pressed forward switch, or
-// stalled at its stator limit, shows that bit until the signal goes stale,
-// then no limit or limiter bit at all.
-TEST_F(PhoenixBackendRecovery, StaleFaultFieldReportsNoLimitOrLimiter) {
-  for (const bool limiter : {false, true}) {
-    SCOPED_TRACE(limiter ? "stator current limit" : "forward hard limit");
+// sample valid. Once it is 50 ms old the backend reports no limit or limiter
+// bit, since an old switch or limiter state is a wrong display (a motor
+// driven into its pressed forward switch, or stalled at its stator limit),
+// but keeps the fault bits it last had: losing the signal never un-faults a
+// motor (BootDuringEnable here: that row's TalonFX, CAN id 57, which no other
+// test uses, first boots inside it, while enabled). Each row first waits
+// until a read shows its bit: the reads that PumpReads gates on fresh motion
+// feedback say nothing of the separate 50 Hz FaultField, and one that finds
+// it 50 ms old reports no limit by this same rule.
+TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
+  enum class Row { kForwardHardLimit, kStatorLimiter, kBootFault };
+  // FaultField bit 4, BootDuringEnable: a fault (hw::MotorFaulted).
+  constexpr uint32_t kBootDuringEnableFlag = uint32_t{1} << 4;
+  for (const Row row :
+       {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kBootFault}) {
+    const uint32_t bit =
+        row == Row::kForwardHardLimit ? hw::kMotorForwardHardLimitFlag
+        : row == Row::kStatorLimiter  ? hw::kMotorCurrentLimitFlags
+                                      : kBootDuringEnableFlag;
+    SCOPED_TRACE(row == Row::kForwardHardLimit ? "forward hard limit"
+                 : row == Row::kStatorLimiter  ? "stator current limit"
+                                               : "boot fault");
     EnsureHal();
     EnabledDs ds;
     hw::Config config;
-    auto motor = TestMotor(1, "motor", 1);
+    auto motor = TestMotor(1, "motor", row == Row::kBootFault ? 57 : 1);
     motor.stator_limit_a = 10;
     config.motors.push_back(motor);
     PhoenixBackend backend(true);
     ASSERT_TRUE(backend.Configure(config));
     ASSERT_TRUE(AwaitReady(backend, config));
     const std::array<hw::MotorRequest, 1> commands{
-        Request(1, hw::Mode::kVoltage, limiter ? 6.0 : 2.0)};
+        Request(1, hw::Mode::kVoltage, row == Row::kStatorLimiter ? 6.0 : 2.0)};
     hw::State state;
-    if (limiter) {
-      StallRotor(backend);
-    } else {
-      Motor(backend, 0).GetSimState().SetForwardLimit(true);
-    }
+    auto& sim = Motor(backend, 0).GetSimState();
+    if (row == Row::kStatorLimiter) StallRotor(backend);
+    if (row == Row::kForwardHardLimit) sim.SetForwardLimit(true);
     PumpReads(backend, state, commands, 30);
-    ASSERT_TRUE(state.motors[0].valid);
-    ASSERT_NE(state.motors[0].fault_flags &
-                  (limiter ? hw::kMotorCurrentLimitFlags
-                           : hw::kMotorForwardHardLimitFlag),
-              0u)
-        << "fault_flags " << state.motors[0].fault_flags << ", stator "
-        << state.motors[0].stator_current_a << " A";
     auto& faults = Motor(backend, 0).GetFaultField(false);
+    ASSERT_TRUE(ReadUntil(backend, state,
+                          [&] {
+                            backend.Apply(commands);
+                            return state.motors[0].valid &&
+                                   (state.motors[0].fault_flags & bit) != 0;
+                          }))
+        << "fault_flags " << state.motors[0].fault_flags << ", FaultField "
+        << faults.GetTimestamp().GetLatency().value() * 1e3 << " ms old";
     StopRefreshing(backend, faults);
     PumpReads(backend, state, commands, 30);
     ASSERT_GE(faults.GetTimestamp().GetLatency().value(), 0.05);
     EXPECT_TRUE(state.motors[0].valid);
-    EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorNotFaultFlags, 0u)
-        << "fault_flags " << state.motors[0].fault_flags;
-    Motor(backend, 0).GetSimState().SetForwardLimit(false);
+    if (row == Row::kBootFault) {
+      EXPECT_NE(state.motors[0].fault_flags & bit, 0u)
+          << "fault_flags " << state.motors[0].fault_flags;
+    } else {
+      EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorNotFaultFlags, 0u)
+          << "fault_flags " << state.motors[0].fault_flags;
+    }
+    sim.SetForwardLimit(false);
   }
 }
 
