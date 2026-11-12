@@ -422,6 +422,15 @@ cc_test(
     ],
 )
 
+# What the launcher's process tests wait on instead of a duration: the
+# supervision loop's passes and a supervision clock the test moves ahead.
+cc_library(
+    name = "supervision_events",
+    testonly = True,
+    hdrs = ["testdata/supervision_events.h"],
+    deps = [":supervision_policy"],
+)
+
 cc_test(
     name = "launcher_test",
     size = "small",
@@ -434,6 +443,7 @@ cc_test(
         ":launcher_lib",
         ":log_budget",
         ":log_merge",
+        ":supervision_events",
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:input_replay",
@@ -528,12 +538,17 @@ cc_test(
         "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
     },
+    # Independent cases; HeartbeatingConstructorStillHasAFiniteDeadline alone
+    # waits out a real 3 s construction deadline (its 2 s grace covers a
+    # sanitizer build's registration), so shards cut the wall time.
+    shard_count = 3,
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
     tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
+        ":supervision_events",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

@@ -40,6 +40,7 @@
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/launcher/launcher.h"
+#include "talOS/launcher/testdata/supervision_events.h"
 
 namespace talos::launcher {
 namespace {
@@ -50,6 +51,10 @@ std::string TempPath(std::string_view name) {
   return ::testing::TempDir() + "/talos_supervision_" +
          std::to_string(::getpid()) + "_" + std::string{name};
 }
+
+// A session that ends on an event, not a duration, sets this: it only
+// bounds a hang (docs/TESTING.md §6.3).
+constexpr int kHangSeconds = 20;
 
 // Framework-owned fixture config: robot-agnostic, two stub subsystems.
 constexpr std::string_view kFixtureToml = R"(
@@ -224,7 +229,7 @@ LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
 LauncherOptions EndpointOptions(std::string_view tag, bool drift) {
   auto options = BaseOptions(tag);
   options.max_restarts = 0;
-  options.duration_s = 3;
+  options.duration_s = kHangSeconds;
   auto config = toml::parse_file(options.config_path);
   config["subsystems"]["alpha"].as_table()->insert_or_assign("drift",
                                                              drift ? 1 : 0);
@@ -256,58 +261,6 @@ std::chrono::nanoseconds SessionLength(const std::string& manifest) {
                                   field("start_wall_ns")};
 }
 
-// A session that ends on an event, not a duration, sets this: it only
-// bounds a hang (docs/TESTING.md §6.3).
-constexpr int kHangSeconds = 20;
-
-// The supervision loop's passes, as its service watchdog sees them: the
-// launcher sends WATCHDOG=1 to $NOTIFY_SOCKET at the start of every pass
-// (Launcher::Supervise), so a second datagram received after a moment means
-// a whole pass ran after it. Points NOTIFY_SOCKET at itself while it lives;
-// one at a time.
-class SupervisionPasses {
- public:
-  SupervisionPasses() {
-    static int serial = 0;
-    path_ = "/tmp/tsp_" + std::to_string(::getpid()) + "_" +
-            std::to_string(serial++);
-    ::unlink(path_.c_str());
-    fd_ = ::socket(AF_UNIX, SOCK_DGRAM, 0);
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, path_.c_str(), path_.size() + 1);
-    if (fd_ < 0 || ::fcntl(fd_, F_SETFL, O_NONBLOCK) < 0 ||
-        ::bind(fd_, reinterpret_cast<const sockaddr*>(&address),
-               static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
-                                      path_.size() + 1)) != 0)
-      throw std::runtime_error("cannot bind " + path_);
-    ::setenv("NOTIFY_SOCKET", path_.c_str(), 1);
-  }
-  ~SupervisionPasses() {
-    ::unsetenv("NOTIFY_SOCKET");
-    ::close(fd_);
-    ::unlink(path_.c_str());
-  }
-  SupervisionPasses(const SupervisionPasses&) = delete;
-  SupervisionPasses& operator=(const SupervisionPasses&) = delete;
-
-  // Passes started so far that were received; never waits.
-  uint64_t Started() {
-    char buffer[64];
-    for (ssize_t size; (size = ::recv(fd_, buffer, sizeof buffer, 0)) >= 0;) {
-      if (std::string_view{buffer, static_cast<std::size_t>(size)} ==
-          "WATCHDOG=1")
-        ++started_;
-    }
-    return started_;
-  }
-
- private:
-  std::string path_;
-  int fd_{-1};
-  uint64_t started_{0};
-};
-
 // Whether `manifest` is the running session's: its end is not recorded yet.
 bool Running(const std::string& manifest) {
   return manifest.find("\n  \"end_wall_ns\": 0,") != std::string::npos;
@@ -326,7 +279,7 @@ int RunSessionUntil(LauncherOptions& options,
   const std::string live = options.output_dir + "/" +
                            std::to_string(options.session_id) +
                            "/manifest.json";
-  SupervisionPasses passes;
+  testing::SupervisionPasses passes;
   std::jthread stopper{[&](const std::stop_token& stop) {
     std::optional<uint64_t> stop_at;
     for (; !stop.stop_requested(); std::this_thread::sleep_for(2ms)) {
@@ -349,24 +302,37 @@ int RunSessionUntil(LauncherOptions& options,
   return status;
 }
 
-// Whether the registry holds an active row named `name` of `session`.
+// Whether the registry holds an active row named `name` of `session` that
+// is no longer constructing.
 bool Registered(std::string_view name, uint64_t session) {
   const auto registry = introspect::RegistryReader::open();
   if (!registry) return false;
   const auto nodes = registry->nodes();
   return std::any_of(nodes.begin(), nodes.end(), [&](const auto& node) {
-    return node.name == name && node.session_id == session;
+    return node.name == name && node.session_id == session &&
+           (node.flags & introspect::kFlagConstructing) == 0;
   });
 }
 
+// A stub body that sets its stop trap (exit 0 on SIGINT or SIGTERM), then
+// appends its --log argument to `record`, then runs `then`: a recorded run
+// can be stopped without dying of the signal.
+std::string TrappedRun(const std::string& record, std::string_view then) {
+  return "trap 'exit 0' INT TERM\n" + RecordLogArgThen(record, then);
+}
+
+// A stub's tail that runs until the session stops it.
+constexpr std::string_view kLoopUntilStopped = "while :; do sleep 0.05; done\n";
+
 // A run whose live endpoints differ from its probe's is reported, recorded
-// in the manifest, and stops the session (exit 1) before its 3 s duration;
-// --allow-graph-errors records it and runs the session out.
+// in the manifest, and stops the session (exit 1) on its own, before its
+// duration; --allow-graph-errors records it and the session runs on until
+// it is stopped, alpha's run ending with that stop, not the mismatch.
 TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
   auto options = EndpointOptions("endpoint_drift", true);
   EXPECT_EQ(RunSession(options), 1);
   auto manifest = ReadFile(options.output_dir + "/manifest.json");
-  EXPECT_LT(SessionLength(manifest), 3s);
+  EXPECT_LT(SessionLength(manifest), std::chrono::seconds{kHangSeconds});
   auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"endpoint_mismatch\": true"), std::string::npos)
       << alpha;
@@ -374,45 +340,83 @@ TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
 
   auto allowed = EndpointOptions("endpoint_drift_allowed", true);
   allowed.allow_graph_errors = true;
-  // Not stopped: the session runs out (its exit status is alpha's, which a
-  // slow log sync at shutdown can turn into a SIGKILL under disk load).
-  RunSession(allowed);
+  std::string seen;
+  // Its exit status is alpha's, which a slow log sync at shutdown can turn
+  // into a SIGKILL under disk load.
+  EXPECT_NE(RunSessionUntil(
+                allowed,
+                [](const std::string& live) {
+                  return ManifestEntry(live, "alpha")
+                             .find("\"endpoint_mismatch\": true") !=
+                         std::string::npos;
+                },
+                seen),
+            1);
+  ASSERT_FALSE(seen.empty()) << "no running session recorded the mismatch";
   manifest = ReadFile(allowed.output_dir + "/manifest.json");
-  EXPECT_GE(SessionLength(manifest), 3s);
   alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"endpoint_mismatch\": true"), std::string::npos)
       << alpha;
+  const auto runs = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(runs.size(), 1u) << manifest;
+  EXPECT_EQ(runs[0].find("\"reason\": \"endpoint_mismatch\""),
+            std::string::npos)
+      << runs[0];
   std::filesystem::remove_all(allowed.output_dir);
 }
 
 // A non-critical member's mismatch costs only that member: it is killed and,
-// though restarts are enabled, not restarted, while the session (beta, which
-// runs until stopped) runs out its 3 s.
+// though restarts are enabled, not restarted (no retry pending in the
+// manifest that records its kill), while the session (beta, which runs
+// until stopped) runs on until it is stopped.
 TEST(Supervision, LiveEndpointMismatchStopsOnlyANonCriticalMember) {
   auto options = EndpointOptions("endpoint_drift_optional", true);
   MakeAlphaNonCritical(options);
   options.max_restarts = 5;
   options.binary_overrides["//example/beta:node"] =
-      WriteStub("endpoint_drift_optional_beta", "exec sleep 10\n");
-  RunSession(options);
+      WriteStub("endpoint_drift_optional_beta", "exec sleep 30\n");
+  std::string seen;
+  // 1 is a session the mismatch stopped (Launcher::CheckEndpoints).
+  EXPECT_NE(
+      RunSessionUntil(
+          options,
+          [](const std::string& live) {
+            return ManifestEntry(live, "alpha").find("\"exit_signal\": 9") !=
+                   std::string::npos;
+          },
+          seen),
+      1);
+  ASSERT_FALSE(seen.empty()) << "no running session recorded alpha's kill";
+  const auto killed = ManifestEntry(seen, "alpha");
+  EXPECT_NE(killed.find("\"retry_at_monotonic_ns\": 0"), std::string::npos)
+      << killed;
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
-  EXPECT_GE(SessionLength(manifest), 3s);
   const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"endpoint_mismatch\": true"), std::string::npos)
       << alpha;
   EXPECT_NE(alpha.find("\"exit_signal\": 9"), std::string::npos) << alpha;
   EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  const auto beta = ManifestRuns(manifest, "beta");
+  ASSERT_EQ(beta.size(), 1u) << manifest;
+  EXPECT_NE(beta[0].find("\"reason\": \"stop\""), std::string::npos) << beta[0];
   std::filesystem::remove_all(options.output_dir);
 }
 
 // The same node without drift: its live ends (a publication and a
 // latest-only subscription, which the loop flags and the probe does not)
-// compare equal to its probe's, and the session runs out undisturbed.
+// compare equal to its probe's. The session is stopped once a whole
+// supervision pass has run after alpha's row was constructed, the pass that
+// compares them (Launcher::WatchRun), and nothing was reported.
 TEST(Supervision, LiveEndpointsThatMatchTheProbeAreNotReported) {
   auto options = EndpointOptions("endpoint_match", false);
-  RunSession(options);  // Not stopped: the session runs out (as above).
+  const uint64_t session = options.session_id;
+  std::string seen;
+  RunSessionUntil(
+      options,
+      [session](const std::string&) { return Registered("alpha", session); },
+      seen);
+  ASSERT_FALSE(seen.empty()) << "alpha's row was never constructed";
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
-  EXPECT_GE(SessionLength(manifest), 3s);
   const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"endpoint_mismatch\": false"), std::string::npos)
       << alpha;
@@ -463,28 +467,19 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
   auto config = toml::parse_file(options.config_path);
   config["robot"].as_table()->insert_or_assign("log_max_bytes", 2);
   std::ofstream{options.config_path} << config;
-  options.duration_s = 3;
-  // RunSession rewrites options.output_dir on return; don't read it
-  // concurrently.
-  const auto manifest = options.output_dir + "/" +
-                        std::to_string(options.session_id) + "/manifest.json";
-  std::string live;  // alpha's entry from a manifest of the running session
-  std::jthread observer{[&](const std::stop_token& stop) {
-    while (!stop.stop_requested()) {
-      const std::string text = ReadFile(manifest);
-      auto entry = ManifestEntry(text, "alpha");
-      if (text.find("\n  \"end_wall_ns\": 0,") != std::string::npos &&
-          entry.find("\"log_capped\": true") != std::string::npos) {
-        live = std::move(entry);
-        return;
-      }
-      std::this_thread::sleep_for(2ms);
-    }
-  }};
-  EXPECT_EQ(RunSession(options), 0);
-  observer.request_stop();
-  observer.join();
-  ASSERT_FALSE(live.empty()) << "no live manifest recorded the capped log";
+  options.duration_s = kHangSeconds;
+  std::string seen;
+  EXPECT_EQ(
+      RunSessionUntil(
+          options,
+          [](const std::string& live) {
+            return ManifestEntry(live, "alpha").find("\"log_capped\": true") !=
+                   std::string::npos;
+          },
+          seen),
+      0);
+  ASSERT_FALSE(seen.empty()) << "no live manifest recorded the capped log";
+  const auto live = ManifestEntry(seen, "alpha");
   EXPECT_NE(live.find("\"recorder_failed\": false"), std::string::npos) << live;
   std::filesystem::remove_all(options.output_dir);
 }
@@ -633,19 +628,35 @@ constexpr std::string_view kRunUntilStopped =
     "trap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";
 
 // A critical node that exits 0 while its peers run on is lost, not finished:
-// it restarts. Its restart then exits 0 at the deadline and is not restarted.
-TEST(Supervision, CriticalCleanExitRestartsButDeadlineStopDoesNot) {
+// it restarts. Its restart then exits 0 when the session stops and is not
+// restarted. Every stub records its --log argument once its stop trap is
+// set, and the session is stopped once all four runs have.
+TEST(Supervision, CriticalCleanExitRestartsButAStoppedRestartDoesNot) {
   auto options = BaseOptions("clean_exit");
-  options.duration_s = 2;
+  options.duration_s = kHangSeconds;
   const auto runs = TempPath("clean_exit_runs");
+  const auto peers = TempPath("clean_exit_peers");
   ::remove(runs.c_str());
+  ::remove(peers.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("clean_exit_hardware", TrappedRun(peers, kLoopUntilStopped),
+                "hardware_node");
   options.binary_overrides["//example/alpha:node"] = WriteStub(
       "clean_exit_alpha",
-      RecordLogArgThen(runs, "case \"$log\" in *alpha.tlog) exit 0;; esac\n" +
-                                 std::string{kRunUntilStopped}));
+      TrappedRun(runs, "case \"$log\" in *alpha.tlog) exit 0;; esac\n" +
+                           std::string{kLoopUntilStopped}));
   options.binary_overrides["//example/beta:node"] =
-      WriteStub("clean_exit_beta", kRunUntilStopped);
-  EXPECT_EQ(RunSession(options), 0);
+      WriteStub("clean_exit_beta", TrappedRun(peers, kLoopUntilStopped));
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [&](const std::string&) {
+                  return ReadLines(runs).size() == 2 &&
+                         ReadLines(peers).size() == 2;
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty()) << "alpha never restarted";
   EXPECT_EQ(ReadLines(runs), (std::vector<std::string>{
                                  options.output_dir + "/alpha.tlog",
                                  options.output_dir + "/alpha.restart1.tlog"}));
@@ -655,28 +666,43 @@ TEST(Supervision, CriticalCleanExitRestartsButDeadlineStopDoesNot) {
   EXPECT_NE(alpha.find("\"exit_code\": 0"), std::string::npos) << alpha;
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+  ::remove(peers.c_str());
 }
 
 // A run that cannot be spawned -- fork or pipe failing, as under EAGAIN -- is
 // retried on the restart backoff instead of abandoned: a critical member whose
-// first spawn and first retry both fail still runs, as its first run.
+// first spawn and first retry both fail still runs, as its first run. The
+// session is stopped once every member's run has set its stop trap.
 TEST(Supervision, FailedSpawnIsRetriedNotAbandoned) {
   auto options = BaseOptions("spawn_failure");
-  options.duration_s = 2;
+  options.duration_s = kHangSeconds;
   options.spawn_failures["alpha"] = 2;
   const auto runs = TempPath("spawn_failure_runs");
+  const auto peers = TempPath("spawn_failure_peers");
   ::remove(runs.c_str());
+  ::remove(peers.c_str());
   options.binary_overrides["//talOS/bridge:hardware_node"] =
-      WriteStub("spawn_failure_hardware", kRunUntilStopped, "hardware_node");
-  options.binary_overrides["//example/alpha:node"] = WriteStub(
-      "spawn_failure_alpha", RecordLogArgThen(runs, kRunUntilStopped));
+      WriteStub("spawn_failure_hardware", TrappedRun(peers, kLoopUntilStopped),
+                "hardware_node");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("spawn_failure_alpha", TrappedRun(runs, kLoopUntilStopped));
   options.binary_overrides["//example/beta:node"] =
-      WriteStub("spawn_failure_beta", kRunUntilStopped);
-  EXPECT_EQ(RunSession(options), 0);
+      WriteStub("spawn_failure_beta", TrappedRun(peers, kLoopUntilStopped));
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [&](const std::string&) {
+                  return !ReadLines(runs).empty() &&
+                         ReadLines(peers).size() == 2;
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty()) << "alpha never ran";
   EXPECT_EQ(ReadLines(runs),
             std::vector<std::string>{options.output_dir + "/alpha.tlog"});
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+  ::remove(peers.c_str());
 }
 
 // A run whose exec fails is a spawn failure that names its cause, as the
@@ -1321,21 +1347,18 @@ TEST(Supervision, NotifierSupportsAbstractSocketNames) {
 // and a node can hold it for good: stopped or stuck mid-registration. The
 // launcher's loop, which feeds the service watchdog, must not wait on it.
 // With the lock held all session, every member starts and the session still
-// ends at its deadline.
+// stops when asked (SIGTERM, once every member has set its stop trap).
 TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
   auto options = BaseOptions("held_lock");
-  options.duration_s = 2;
+  options.duration_s = kHangSeconds;
   const auto runs = TempPath("held_lock_runs");
   ::remove(runs.c_str());
   for (const std::string name : {"hardware_node", "alpha", "beta"}) {
     const std::string target = name == "hardware_node"
                                    ? "//talOS/bridge:hardware_node"
                                    : "//example/" + name + ":node";
-    options.binary_overrides[target] =
-        WriteStub("held_lock_" + name,
-                  "trap 'exit 0' INT TERM\n" +
-                      RecordLogArgThen(runs, "while :; do sleep 0.05; done\n"),
-                  name);
+    options.binary_overrides[target] = WriteStub(
+        "held_lock_" + name, TrappedRun(runs, kLoopUntilStopped), name);
   }
   // The launcher waits on this lock at startup only to create the registry
   // (PrepareRegistry); here it exists, as after any earlier session.
@@ -1344,17 +1367,24 @@ TEST(Supervision, HeldRegistryLockDoesNotStallSupervision) {
   const pid_t launcher = ::fork();
   ASSERT_GE(launcher, 0);
   if (launcher == 0) ::_exit(Launcher{options}.Run());
+  const auto give_up =
+      std::chrono::steady_clock::now() + std::chrono::seconds{kHangSeconds};
+  while (ReadLines(runs).size() < 3 &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(10ms);
+  const bool started = ReadLines(runs).size() == 3;
+  ::kill(launcher, SIGTERM);
   int status = 0;
   pid_t reaped = 0;
-  const auto give_up = std::chrono::steady_clock::now() + 20s;
   while ((reaped = ::waitpid(launcher, &status, WNOHANG)) == 0 &&
-         std::chrono::steady_clock::now() < give_up)
+         std::chrono::steady_clock::now() < give_up + 10s)
     std::this_thread::sleep_for(10ms);
   if (reaped != launcher) {
     ::kill(launcher, SIGKILL);
     while (::waitpid(launcher, &status, 0) < 0 && errno == EINTR) {
     }
   }
+  EXPECT_TRUE(started) << "not every member started";
   EXPECT_EQ(reaped, launcher) << "supervision stalled on the registry lock";
   EXPECT_TRUE(WIFEXITED(status));
   EXPECT_EQ(WEXITSTATUS(status), 0);
