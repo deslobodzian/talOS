@@ -297,8 +297,10 @@ class Telemetry {
   // a keyframe of every channel, must fit its burst: refuse a dictionary past
   // kMaxChannels, naming the topics with the most channels to exclude.
   void CheckChannelCap() const {
-    if (dictionary_.size() <= telemetry_wire::kMaxChannels) return;
-    std::map<std::string, std::size_t> per_topic;
+    std::size_t total = dictionary_.size();
+    for (const auto& [topic, count] : uncounted_) total += count;
+    if (total <= telemetry_wire::kMaxChannels) return;
+    std::map<std::string, std::size_t> per_topic = uncounted_;
     for (const ChannelDef& channel : dictionary_) {
       const std::size_t owner = channel.name.find('/');
       const std::size_t role = owner == std::string::npos
@@ -318,12 +320,12 @@ class Telemetry {
       names +=
           largest[i].second + " (" + std::to_string(largest[i].first) + ")";
     }
-    throw std::runtime_error(
-        "telemetry: " + std::to_string(dictionary_.size()) +
-        " channels, over the " + std::to_string(telemetry_wire::kMaxChannels) +
-        "-channel cap; largest sources: " + names +
-        "; exclude channels in telemetry.toml (see "
-        "talOS/telemetry/README.md)");
+    throw std::runtime_error("telemetry: " + std::to_string(total) +
+                             " channels, over the " +
+                             std::to_string(telemetry_wire::kMaxChannels) +
+                             "-channel cap; largest sources: " + names +
+                             "; exclude channels in telemetry.toml (see "
+                             "talOS/telemetry/README.md)");
   }
 
   // Pages the dictionary once, which throws, naming the channel, when one
@@ -495,17 +497,24 @@ class Telemetry {
   void ObserveDescribedTopic(const introspect::naming::SourceShape& source) {
     using talos::detail::NodeAccess;
 
-    // Excluded channels are not flattened or counted; past one more than a
-    // dictionary holds the topic stops, and CheckChannelCap refuses the
-    // dictionary naming it, as for any source too large to serve whole.
+    // Excluded channels are not flattened or counted. Past one more than a
+    // dictionary holds, the rest are counted, not built, and CheckChannelCap
+    // refuses the dictionary naming the topic with every channel it keeps,
+    // as for any source too large to serve whole.
     FlattenOptions options;
     options.keep = [this](std::string_view name) {
       return !detail::MatchesAnyGlob(std::string{name}, exclude_globs_);
     };
     options.max_channels = telemetry_wire::kMaxChannels + 1;
     options.truncate = true;
+    std::size_t kept = 0;
     std::vector<Channel> channels =
-        FlattenTopic(source.name, source.schema, source.bfbs, options);
+        FlattenTopic(source.name, source.schema, source.bfbs, options, &kept);
+    if (kept > channels.size()) {
+      std::string_view owner = source.name;
+      if (owner.starts_with('/')) owner.remove_prefix(1);
+      uncounted_[std::string{owner}] += kept - channels.size();
+    }
 
     std::size_t sub_idx = 0;
     if (has_pose_ && source.name == pose_topic_) {
@@ -539,6 +548,9 @@ class Telemetry {
   BytePublisher studio_;
 
   std::vector<ChannelDef> dictionary_;
+  // Per topic (without its leading slash), channels kept past the cap and
+  // so not built: they count in CheckChannelCap's refusal.
+  std::map<std::string, std::size_t> uncounted_;
   std::uint32_t dictionary_id_{0};
   std::uint64_t stream_id_{0};
   // This tick's carried channels and their raw samples, index-aligned.
