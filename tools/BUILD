@@ -180,3 +180,16 @@ py_test(
     legacy_create_init = False,
     main = "trace_test.py",
 )
+
+# python3 tools/slow_tests.py [--threshold 5] (not a CI check)
+# Lists the tests over a time budget, slowest first, from bazel-testlogs.
+py_test(
+    name = "slow_tests_test",
+    size = "small",
+    srcs = [
+        "slow_tests.py",
+        "slow_tests_test.py",
+    ],
+    legacy_create_init = False,
+    main = "slow_tests_test.py",
+)

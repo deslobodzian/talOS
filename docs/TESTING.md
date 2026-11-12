@@ -321,6 +321,12 @@ target's tags only exclude it from a configuration (`manual`, `no_asan`,
 unsandboxed (`local`), and
 `bazel test //...` runs every lane but the soak.
 
+A target that takes more than 5 s states why in a comment on its BUILD
+rule: what it waits for in real time and its lane. `python3
+tools/slow_tests.py --threshold 5` lists, slowest first, every test action in
+`bazel-testlogs` (the last result of each, cached or not) over the
+threshold; it reports and does not fail.
+
 CI policy:
 
 - CI runs on pushes to `main`, `hardening/**` and `feature/**` and on pull
