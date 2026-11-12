@@ -442,9 +442,10 @@ Studio's bridge charges every WebSocket send, with conservative framing
 overhead, against a shared **160,000 B/s** token bucket with a **64,000 B**
 burst (`EgressBudget` in `studio/bridge/telemetry.h`). Each client also has a
 `160000 / max_clients` B/s bucket with the same burst; `[studio] max_clients`
-defaults to **4** (range **1–64**). Each pass over the clients starts one
-client later than the last, so every client gets first claim on the shared
-bucket in turn. HTTP snapshots and static files are outside this budget.
+defaults to **4** (range **1–64**). Each pass over the clients starts just
+after the last client sent anything, so the shared bucket is granted in
+rotation: of the clients able to take a send, none is sent to twice before
+every other one has been sent to once. HTTP snapshots and static files are outside this budget.
 
 160,000 B/s is **1.28 Mbit/s, 32 %** of the **4 Mbit/s** per-team field
 bandwidth limit that WPILib's networking documentation and the FMS whitepaper

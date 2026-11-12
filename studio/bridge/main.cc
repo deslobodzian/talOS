@@ -91,11 +91,15 @@ struct Bridge {
   studio::WakeSchedule schedule;
   std::string attach_error;
   std::vector<Socket*> clients;
-  // Where the next fan-out starts. The shared bucket goes to whichever client
-  // asks first, and every client's own burst equals the shared one, so in a
-  // fixed order the clients ahead of the last would spend the shared bucket
-  // and starve it for seconds; starting one place later each time gives every
-  // client first claim in turn.
+  // Where the next fan-out starts: just after the last client sent anything.
+  // The shared bucket goes to whichever client asks first, and every client's
+  // own burst equals the shared one, so in a fixed order the clients ahead of
+  // the last would spend the shared bucket and starve it for seconds. Moving
+  // on per pass is not enough either: most passes find the bucket short and
+  // send nothing, so which client the refill reaches would depend on how many
+  // wakes came between, and one client could win it again and again. Moving
+  // on per send grants the bucket in rotation: of the clients able to take a
+  // send, none is served twice before each other one is served once.
   std::size_t first_client = 0;
   us_listen_socket_t* listener = nullptr;
   // ws_drops counts messages the socket refused; that client is then
@@ -247,9 +251,12 @@ struct Bridge {
   void for_each_client(Send&& send_to) {
     const std::size_t count = clients.size();
     if (count == 0) return;
-    const std::size_t first = first_client++ % count;
+    const std::size_t first = first_client % count;
     for (std::size_t i = 0; i < count; ++i) {
+      // Every successful send is charged to egress_bytes (send_now).
+      const std::uint64_t charged = egress_bytes;
       send_to(clients[(first + i) % count]);
+      if (egress_bytes != charged) first_client = (first + i + 1) % count;
     }
   }
 
