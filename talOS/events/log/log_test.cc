@@ -1706,7 +1706,11 @@ TEST(LogCapture, UncappedWriterLeavesNoMarker) {
 // of 5998 States logged on macOS) stopped capture with the pool exhausted.
 // Here write_interval is an hour and the writer has a record waiting for
 // it; every chunk handed over must still reach the file, one at a time,
-// for five times the pool's chunks.
+// for more than three times the pool's chunks. The pool holds three: the
+// file shows chunk k written before the writer returns it to the pool, so
+// with two the producer's next hand-over could find the pool full; with
+// three it needs only chunk k - 1, which the writer returned before it
+// wrote chunk k.
 // REQ-RT-11
 TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
   const auto path = TempPath("full_chunk_wakes");
@@ -1723,7 +1727,7 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
   };
   std::size_t records = 0;
   {
-    LogWriter::Options options{kChunkBytes, 2, /*background=*/true};
+    LogWriter::Options options{kChunkBytes, 3, /*background=*/true};
     options.write_interval = std::chrono::hours{1};
     options.sync_interval = std::chrono::hours{1};
     LogWriter writer{path, "full_chunk", options};
@@ -1746,7 +1750,7 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
         return file_size() >= base + chunk * kPerChunk * kRecordBytes;
       })) << "chunk "
           << chunk << " of " << kChunks
-          << " handed over and not written in 10 s (pool of 2)";
+          << " handed over and not written in 10 s (pool of 3)";
       ASSERT_FALSE(writer.failed()) << writer.error();
     }
   }
