@@ -197,11 +197,13 @@ origin (`http://127.0.0.1:<port>`, `http://localhost:<port>`,
 origin back in `Access-Control-Allow-Origin`; any other origin gets none, so
 its page cannot read a session.
 
-The server never writes into the library, which may be a read-only copy: a
-session's class (`match`, `other`, `unknown`) is the launcher's
-`session_class` file when that is current, else read from its logs and
-remembered by the server until the session's files change size, never
-written back.
+The server never writes into the library, which may be a read-only copy.
+Listing sessions reads each one's `manifest.json` (up to 4 MiB; a larger
+one is listed without its times) and file sizes, never a log: a session's
+class (`match`, `other`, `unknown`) is `other` for a simulation or a
+session without a manifest, else the launcher's `session_class` file when
+that is current, else `unknown` until the launcher's retention classifies
+it.
 
 Values are what `log_dump --format jsonl` decodes from the same records,
 named as live telemetry names them (`talOS/telemetry:channels`): each
@@ -238,9 +240,17 @@ per source, however long ago the topic was last published. Source ids from 63 on
 share one bit of the checkpoint, so such a source may also read seconds that
 hold only another's values. No log file is read whole.
 Series buckets (min, max, last, count) are kept for repeated requests in an
-LRU of at most `--cache-mb`. So the heap is the index, plus that cache, plus
-one read window per open log (REQ-OPS-42). On a generated 203 MiB session
-(8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,
+LRU of at most `--cache-mb`. One series request asks for at most 262,144
+values (channels × points, `kMaxSeriesValues`; 400 past it) and holds at
+most 80 B per value while it is answered (its buckets, each bucket's last
+time and the response), so at most 20 MiB (`kMaxSeriesRequestBytes`). At
+most 4 sessions are open at once (`kMaxOpenSessions`); opening another
+closes the least recently used, whose index is rebuilt when it is opened
+again. So the heap is the open sessions' indexes (24 B per log-file second,
+plus their channel names), plus that cache, plus one request's ceiling (a
+series' 20 MiB; a snapshot's answer, about 100 B per channel of its
+session), plus one read window per log being read (REQ-OPS-42). On a
+generated 203 MiB session (8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,
 Linux x86-64, a loaded host) the index pass took 0.49 s and kept 66,240 B
 (2,760 log-file seconds), a series of 8 channels over the whole session
 0.46 s, and peak resident memory was 5.7 MiB.
