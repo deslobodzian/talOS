@@ -53,6 +53,7 @@ bool MergeLogs(const std::vector<std::string>& log_paths,
     MergedRecord& current = member.current;
     current.header = record.header;
     current.payload = record.payload;
+    current.offset = record.offset;
     current.source =
         record.header.kind == static_cast<std::uint16_t>(event::EventKind::EXIT)
             ? nullptr

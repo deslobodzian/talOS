@@ -70,6 +70,9 @@ class LogReader {
     // The full header.payload_bytes, zero-filled past what the file stores.
     // Owned by the reader: valid until the next call to next() or rewind().
     std::span<const std::byte> payload;
+    // Where the record's header starts in its file (a rotated log's segment
+    // is a file of its own): what WindowedLogReader::seek resumes at.
+    std::uint64_t offset{0};
   };
 
   // Reads and validates the header and manifest block. Throws
@@ -144,6 +147,22 @@ class WindowedLogReader {
   // As LogReader::next. The payload is valid until the next call.
   bool next(LogReader::Record& out);
 
+  // Continues at `offset`, the Record::offset of a record a reader of this
+  // same file returned: next() then returns that record and every record
+  // after it exactly as a reader from the start does, damage skipped alike,
+  // and damage() and record_count() count from there. The header, manifest
+  // and schemas stay as the constructor read them, so resuming costs one
+  // header read and no record before `offset`. Throws std::invalid_argument
+  // naming the file and the offset where no intact record (magic, lengths
+  // and checksum) starts at `offset`, or `offset` is inside the header,
+  // manifest or schema block. A check cannot tell an intact record a full
+  // read would not have returned from one it would: a record nested whole in
+  // another's payload, an intact record inside a span a full read skipped as
+  // damage (one from another log, or past the scan's size limit), or a
+  // boundary of another file of the same layout. An offset is therefore kept
+  // with the path of the file it came from.
+  void seek(std::uint64_t offset);
+
   const LogDamage& damage() const noexcept;
   bool truncated() const noexcept { return damage().tail_bytes != 0; }
   std::size_t record_count() const noexcept;
@@ -175,9 +194,17 @@ struct LogVisitor {
   // valid only during the call. False stops the walk.
   std::function<bool(const LogReader::Record&)> record;
 };
-// Throws what SummarizeLog throws. The summary counts the records walked:
-// fewer than the log holds when a callback stopped the walk.
-LogSummary VisitLog(std::string_view path, const LogVisitor& visitor);
+struct VisitOptions {
+  // Where the records start: 0 for the first, else a Record::offset a reader
+  // of this file returned (WindowedLogReader::seek, which refuses any other
+  // before the manifest callback runs).
+  std::uint64_t start_offset{0};
+};
+// Throws what SummarizeLog throws, and what seek throws. The summary counts
+// the records walked, and the damage skipped, from `start_offset`: fewer
+// than the log holds when a callback stopped the walk.
+LogSummary VisitLog(std::string_view path, const LogVisitor& visitor,
+                    const VisitOptions& options = {});
 
 // A session directory's event logs: every `*.tlog` in it (the launcher
 // writes one per node run, restarts included), sorted by path. A path that is

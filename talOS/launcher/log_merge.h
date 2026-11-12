@@ -39,6 +39,9 @@ struct MergedRecord {
   event::log::RecordHeader header{};
   // The full header.payload_bytes; valid only during the visit.
   std::span<const std::byte> payload;
+  // Where the record starts in `log->path`: a WindowedLogReader of that file
+  // resumes there (seek).
+  std::uint64_t offset{0};
 
   const std::string& process_name() const { return log->process_name; }
   std::string_view source_name() const {

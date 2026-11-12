@@ -367,6 +367,25 @@ as it does a truncated log's.
 through a fixed 64 KiB window, so a reader of a whole session (`log_dump`,
 `tlog_to_wpilog`) holds memory per log, not per record.
 
+Every record a reader returns carries its byte offset in its file
+(`Record::offset`; a rotated log's segment is a file of its own, and the
+session merge passes it on as `MergedRecord::offset`). An index of a log
+keeps those offsets with the file's path and reads from one later: a
+`WindowedLogReader` opened on the file reads its header, manifest and schema
+block, and `seek(offset)` (or `VisitLog` with `VisitOptions::start_offset`)
+continues at that record, so the manifest and schemas are available and no
+earlier record is read. From there it returns exactly the records,
+and skips exactly the damage, that a read from the start does, and counts
+records and damage from the offset. It refuses, with
+`std::invalid_argument` naming the file and the offset, an offset inside
+the header, manifest or schema block, or one where no intact record starts
+(magic, lengths and checksum). The checksum cannot tell a record a read from
+the start returns from another intact record: one nested whole in another
+record's payload, one inside a span a read skipped as damage (from another
+log, or larger than the scan accepts), or a record boundary of another file
+with the same layout. So an offset is only meaningful for the file it came
+from, and only one a reader returned.
+
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
 Readers reject unsupported versions with both recorded and supported versions
