@@ -278,10 +278,21 @@ second 3 to second 6 ([syntax](../2026-robot/main_processor/simulation/README.md
 A **session** is one run of the launcher; its directory, the one `sim.sh`
 prints last, holds each node's log (`wrist.tlog`), its text output
 (`wrist.log`) and the graph. `log_dump` reads the logs and decodes every
-message:
+message. Its summary answers "did the wrist move" in a few lines:
 
 ```sh
 bazel build //talOS/launcher:log_dump
+./bazel-bin/talOS/launcher/log_dump --format summary --node wrist --topic /wrist/state /tmp/talos_logs/1794458306
+```
+
+It prints how many records the wrist logged on `/wrist/state`, the first and
+last publication times, the `latest` value, and one `range <field> <min>
+<max>` line per numeric or bool field: `range velocity_rps 0 ...` with a
+maximum near 20 means it spun up, `range enabled false true` that it was
+enabled at some point ([summary format](../talOS/launcher/README.md#filtering-and-exporting-logs)).
+To see the trajectory, sample the full dump:
+
+```sh
 ./bazel-bin/talOS/launcher/log_dump --node wrist --topic /wrist/state /tmp/talos_logs/1794458306 \
   | grep WristState | awk 'NR%50==1'
 ```
@@ -363,6 +374,7 @@ The `sim.sh` and `log_dump` commands from the Python track work unchanged;
 read the `claw` node instead, from the session directory `sim.sh` printed:
 
 ```sh
+./bazel-bin/talOS/launcher/log_dump --format summary --node claw --topic /claw/state /tmp/talos_logs/<session>
 ./bazel-bin/talOS/launcher/log_dump --node claw --topic /claw/state /tmp/talos_logs/<session> \
   | grep ClawState | awk 'NR%50==1'
 ```

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "talOS/configuration/config_parser.h"
@@ -88,7 +91,8 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
     } else if (arg == "--config") {
       options.config = value;
     } else if (arg == "--format") {
-      if (value != "text" && value != "jsonl" && value != "csv") {
+      if (value != "text" && value != "jsonl" && value != "csv" &&
+          value != "summary") {
         error = "invalid --format: " + value;
         return false;
       }
@@ -266,6 +270,179 @@ std::string ManifestConfigPath(const std::filesystem::path& session) {
   return "";
 }
 
+// Every scalar of a DecodeToText string (talOS/schema/decode.h) with its
+// field path: `{a: 1, b: {c: [2, 3]}}` gives a=1, b.c[0]=2 and b.c[1]=3. A
+// `<...>` (a payload the schema could not decode) is one scalar. Text of any
+// other shape ends the walk early; it never reads past the string.
+class DecodedFields {
+ public:
+  using Visit = std::function<void(const std::string&, std::string_view)>;
+
+  static void Walk(std::string_view text, const Visit& visit) {
+    DecodedFields walker{text, visit};
+    std::string path;
+    walker.Value(path);
+  }
+
+ private:
+  DecodedFields(std::string_view text, const Visit& visit)
+      : text_{text}, visit_{visit} {}
+
+  // Past the separator after a member; false when nothing was consumed
+  // since `before`, which only malformed text does.
+  bool Next(std::size_t before) {
+    if (text_.substr(at_).starts_with(", ")) at_ += 2;
+    return at_ > before;
+  }
+
+  void Value(std::string& path) {
+    if (at_ >= text_.size()) return;
+    const std::size_t length = path.size();
+    if (text_[at_] == '{') {
+      ++at_;
+      while (at_ < text_.size() && text_[at_] != '}') {
+        const std::size_t before = at_;
+        const std::size_t colon = text_.find(": ", at_);
+        if (colon == std::string_view::npos) {
+          at_ = text_.size();
+          return;
+        }
+        if (length != 0) path += '.';
+        path.append(text_.substr(at_, colon - at_));
+        at_ = colon + 2;
+        Value(path);
+        path.resize(length);
+        if (!Next(before)) {
+          at_ = text_.size();
+          return;
+        }
+      }
+      ++at_;
+    } else if (text_[at_] == '[') {
+      ++at_;
+      for (std::size_t i = 0; at_ < text_.size() && text_[at_] != ']'; ++i) {
+        const std::size_t before = at_;
+        path += "[" + std::to_string(i) + "]";
+        Value(path);
+        path.resize(length);
+        if (!Next(before)) {
+          at_ = text_.size();
+          return;
+        }
+      }
+      ++at_;
+    } else {
+      std::size_t end = text_[at_] == '<' ? text_.find('>', at_)
+                                          : text_.find_first_of(",}]", at_);
+      if (end == std::string_view::npos) {
+        end = text_.size();
+      } else if (text_[at_] == '<') {
+        ++end;
+      }
+      visit_(path, text_.substr(at_, end - at_));
+      at_ = end;
+    }
+  }
+
+  std::string_view text_;
+  const Visit& visit_;
+  std::size_t at_{0};
+};
+
+// --format summary: one topic's records folded in as they stream past, so a
+// session of any length takes memory in proportion to its topics and their
+// fields, not its records.
+class TopicSummary {
+ public:
+  void Add(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
+           const talos::launcher::DeviceNames* names) {
+    ++records_[{r.process_name(), EventKindName(r.header.kind)}];
+    // A timer's record has no publication; its event time stands in.
+    const std::int64_t published = r.header.publish_time_ns != 0
+                                       ? r.header.publish_time_ns
+                                       : r.header.event_time_ns;
+    first_ms_ = std::min(first_ms_, ToMillis(base_ns, published));
+    last_ms_ = std::max(last_ms_, ToMillis(base_ns, published));
+    if (r.source == nullptr || r.payload.empty()) return;
+    if (const auto hardware = HardwareJson(r, names); !hardware.empty()) {
+      hardware_ = hardware;
+    }
+    if (r.source->schema.name.empty()) return;
+    schema_ = r.source->schema.name;
+    latest_ = talos::schema::DecodeToText(r.source->schema, r.payload);
+    if (latest_.starts_with("bytes=")) return;  // A byte layout: no fields.
+    DecodedFields::Walk(
+        latest_, [this](const std::string& path, std::string_view token) {
+          Widen(path, token);
+        });
+  }
+
+  void Print(const std::string& topic) const {
+    std::printf("topic %s%s%s\n", topic.c_str(), schema_.empty() ? "" : " ",
+                schema_.c_str());
+    for (const auto& [key, count] : records_) {
+      std::printf("  records %s %s %zu\n", key.first.c_str(),
+                  key.second.c_str(), count);
+    }
+    std::printf("  first_ms %.3f\n  last_ms %.3f\n", first_ms_, last_ms_);
+    if (!latest_.empty()) std::printf("  latest %s\n", latest_.c_str());
+    if (!hardware_.empty()) std::printf("  hardware %s\n", hardware_.c_str());
+    for (const auto& range : ranges_) {
+      std::printf("  range %s %s %s\n", range.path.c_str(),
+                  range.min_text.c_str(), range.max_text.c_str());
+    }
+  }
+
+ private:
+  struct Range {
+    std::string path;
+    double min;
+    double max;
+    std::string min_text;  // As decoded, so no digit is lost in a double.
+    std::string max_text;
+  };
+
+  // A number or a bool (false below true) widens its field's range; an
+  // enum's name or an undecodable payload has none.
+  void Widen(const std::string& path, std::string_view token) {
+    double value = 0;
+    if (token == "true" || token == "false") {
+      value = token == "true" ? 1 : 0;
+    } else {
+      const auto [end, error] =
+          std::from_chars(token.data(), token.data() + token.size(), value);
+      if (error != std::errc{} || end != token.data() + token.size() ||
+          std::isnan(value)) {
+        return;
+      }
+    }
+    const auto [at, added] = range_index_.try_emplace(path, ranges_.size());
+    if (added) {
+      ranges_.push_back(
+          {path, value, value, std::string{token}, std::string{token}});
+      return;
+    }
+    Range& range = ranges_[at->second];
+    if (value < range.min) {
+      range.min = value;
+      range.min_text = token;
+    }
+    if (value > range.max) {
+      range.max = value;
+      range.max_text = token;
+    }
+  }
+
+  std::map<std::pair<std::string, std::string>, std::size_t> records_;
+  double first_ms_{std::numeric_limits<double>::infinity()};
+  double last_ms_{-std::numeric_limits<double>::infinity()};
+  std::string schema_;
+  std::string latest_;
+  std::string hardware_;
+  std::vector<Range> ranges_;  // In the order their fields first appeared.
+  std::map<std::string, std::size_t> range_index_;
+};
+
 // A relative config path is the launcher's or the user's, relative to where
 // they ran: under `bazel run` that is BUILD_WORKING_DIRECTORY, since this
 // binary then runs in its runfiles directory; otherwise the working directory.
@@ -314,7 +491,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "log_dump: %s\nusage: %s [--node name[,name...]] "
                  "[--topic pattern[,pattern...]] [--since-ms ms] "
-                 "[--until-ms ms] [--format text|jsonl|csv] "
+                 "[--until-ms ms] [--format text|jsonl|csv|summary] "
                  "[--config robot.toml] "
                  "<log-file-or-dir> [more-log-files...]\n",
                  error.c_str(), argv[0]);
@@ -364,6 +541,26 @@ int main(int argc, char** argv) {
     }
     return true;
   };
+
+  if (options.format == "summary") {
+    std::map<std::string, TopicSummary, std::less<>> topics;
+    const bool read = print([&](const MergedRecord& r) {
+      if (r.header.kind == static_cast<std::uint16_t>(EventKind::EXIT)) return;
+      auto at = topics.find(r.source_name());
+      if (at == topics.end()) {
+        at = topics.emplace(std::string{r.source_name()}, TopicSummary{}).first;
+      }
+      at->second.Add(r, base_ns, names);
+    });
+    if (!read) return 1;
+    const char* separator = "";
+    for (const auto& [topic, summary] : topics) {
+      std::printf("%s", separator);
+      separator = "\n";
+      summary.Print(topic);
+    }
+    return 0;
+  }
 
   if (options.format != "text") {
     if (options.format == "csv") {
