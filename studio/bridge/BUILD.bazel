@@ -127,7 +127,10 @@ py_test(
         ":studio_mock",
     ],
     main = "bandwidth_test.py",
-    tags = ["local"],
+    tags = [
+        "integration",
+        "local",
+    ],
 )
 
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
