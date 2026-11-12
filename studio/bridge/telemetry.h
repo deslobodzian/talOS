@@ -319,18 +319,13 @@ struct EgressBudget {
 
 // The kernel send buffer the bridge sets on each client (SO_SNDBUF). The
 // bridge holds a client only once a write leaves output buffered, which
-// happens only when this buffer is full; left to autotuning it grew to
-// 4 MiB on Linux, so a client that stopped reading kept its turns for about
-// 100 s of a 40,000 B/s share, all stale on arrival. Sized as what the
-// client's share sends in kSeconds, it holds at most that much of a stalled
-// client's output, and it limits a reading client below its share only
-// when its round trip exceeds kSeconds (macOS uses the value as given;
-// Linux reserves twice it, about the value in payload). Larger sends, such
-// as the 64,000 B burst of a joining client's dictionary and keyframe, take
-// several round trips: meanwhile the client is held (it skips passes, and
-// its telemetry resumes from the latest values), and it is disconnected
-// only past uWebSockets' 512 KiB maxBackpressure. kMinBytes keeps a client
-// on a small share from being held on every update: a dozen value pages.
+// happens only when this buffer is full. Sized as what the client's share
+// sends in kSeconds, it holds at most that much of a stalled client's
+// output, and it limits a reading client below its share only when its
+// round trip exceeds kSeconds. kMinBytes keeps a client on a small share
+// from being held on every update: a dozen value pages. What being held
+// costs, and what disconnects a client, are in
+// docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary.
 struct ClientSendBuffer {
   static constexpr double kSeconds = 0.25;
   static constexpr int kMinBytes = 16 * 1024;
