@@ -29,8 +29,8 @@ class Flattener {
         channels_{channels},
         open_(schema.objects()->size()) {}
 
-  // A truncating flattening stopped at its cap.
-  bool truncated() const { return truncated_; }
+  // Every channel kept, those past a truncating flattening's cap included.
+  std::size_t kept() const { return kept_; }
 
   // Flattens object `index` (reached through `field`) at `base_offset`.
   void Struct(std::size_t index, std::string_view field,
@@ -56,7 +56,6 @@ class Flattener {
               });
 
     for (const auto* field_def : fields) {
-      if (truncated_) break;
       const std::string field_name = field_def->name()->str();
       const std::string channel_name = std::string{prefix} + "/" + field_name;
       const auto& type = *field_def->type();
@@ -79,7 +78,7 @@ class Flattener {
                              ->Get(static_cast<flatbuffers::uoffset_t>(element))
                              ->bytesize())
                    : flatbuffers::GetTypeSize(type.element());
-        for (std::size_t i = 0; i < count && !truncated_; ++i) {
+        for (std::size_t i = 0; i < count; ++i) {
           const std::string element_name =
               channel_name + "/" + std::to_string(i);
           const std::size_t element_offset = field_offset + i * element_bytes;
@@ -120,11 +119,10 @@ class Flattener {
                  std::string_view field_name, std::string name,
                  std::size_t offset) {
     if (options_.keep && !options_.keep(name)) return;
+    ++kept_;
     if (channels_.size() >= options_.max_channels) {
-      if (options_.truncate) {
-        truncated_ = true;
-        return;
-      }
+      // Counted, not kept: the walk is bounded by kMaxTopicStructs.
+      if (options_.truncate) return;
       Refuse(field_name, "is past the topic's " +
                              std::to_string(options_.max_channels) +
                              " channels");
@@ -148,7 +146,7 @@ class Flattener {
   std::string_view topic_;
   const FlattenOptions& options_;
   std::vector<Channel>& channels_;
-  bool truncated_{false};
+  std::size_t kept_{0};
   std::vector<bool> open_;  // by object index: being flattened now
   std::size_t structs_{0};
 };
@@ -193,7 +191,7 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
                                   std::string_view schema_name,
                                   std::string_view bfbs,
                                   const FlattenOptions& options,
-                                  bool* truncated) {
+                                  std::size_t* kept) {
   const reflection::Schema* schema = schema::VerifySchema(bfbs);
   if (schema == nullptr) {
     throw std::invalid_argument(
@@ -217,7 +215,7 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
   }
   Flattener flattener{*schema, topic, options, channels};
   flattener.Struct(root, schema_name, prefix, 0, 0);
-  if (truncated != nullptr) *truncated = flattener.truncated();
+  if (kept != nullptr) *kept = flattener.kept();
   return channels;
 }
 

@@ -790,6 +790,19 @@ TEST(TelemetryTest, ExcludedChannelsDoNotCountAgainstATopicsCap) {
     EXPECT_NE(channel.name[kLongNamesPrefix.size()], '1') << channel.name;
   }
   EXPECT_EQ(served, 2100u - 1111u);
+
+  // Excluding nothing keeps all 2100: the refusal names that many, not the
+  // cap plus one, so the author knows how much to exclude.
+  Sim over = Sim::FromToml(LongNamesConfig(2100, 4));
+  over.add<LongNamesNode>("budget");
+  try {
+    over.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "a dictionary past the channel cap constructed";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string_view{error.what()}.find("budget/state (2100)"),
+              std::string_view::npos)
+        << error.what();
+  }
 }
 
 TEST(TelemetryTest, DictionaryPastOneSlotPagesAndOneChannelMustFitAPage) {

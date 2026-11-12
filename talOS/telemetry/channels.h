@@ -130,8 +130,8 @@ struct FlattenOptions {
   // nor counted against max_channels.
   std::function<bool(std::string_view)> keep;
   std::size_t max_channels{kMaxTopicChannels};
-  // Past max_channels kept channels: stop and report it (FlattenTopic's
-  // `truncated`) instead of throwing.
+  // Past max_channels kept channels: return the first max_channels and go on
+  // counting (FlattenTopic's `kept`) instead of throwing.
   bool truncate{false};
 };
 
@@ -142,13 +142,14 @@ struct FlattenOptions {
 // a field names an object the schema does not hold, a struct contains
 // itself, structs nest deeper than kMaxNestingDepth, the walk passes
 // kMaxTopicStructs struct instances, or (unless options.truncate) the kept
-// channels pass options.max_channels. `truncated`, when given, is set to
-// whether a truncating flattening stopped at its cap.
+// channels pass options.max_channels. `kept`, when given, is set to how many
+// channels `options` kept, those past a truncating flattening's cap
+// included.
 std::vector<Channel> FlattenTopic(std::string_view topic,
                                   std::string_view schema_name,
                                   std::string_view bfbs,
                                   const FlattenOptions& options = {},
-                                  bool* truncated = nullptr);
+                                  std::size_t* kept = nullptr);
 
 // The Driver Station topic's channels, decoded from its packet rather than
 // read from a struct: connected, enabled, autonomous, teleop, test, estop,
