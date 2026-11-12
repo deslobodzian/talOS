@@ -60,6 +60,46 @@ dio = 1
 channel = 1
 )";
 
+hardware::State LatestState(const Sim& sim) {
+  const auto packet = sim.latest<hardware::Packet>(hardware::kStateTopic);
+  EXPECT_TRUE(packet.has_value());
+  hardware::State state{};
+  if (packet) EXPECT_TRUE(hardware::Decode(packet->bytes(), state));
+  return state;
+}
+
+// A request observing `state` that drives every output of `devices`.
+hardware::Command DriveAll(const hardware::State& state,
+                           const hardware::Devices& devices) {
+  hardware::Command command{};
+  command.config_id = state.config_id;
+  command.boot_id = state.boot_id;
+  command.epoch = state.epoch;
+  command.observed_time_us = state.sample_time_us;
+  for (const auto id : devices.motors) {
+    command.motors[command.count++] = {
+        .id = id, .mode = Mode::kVelocity, .demand = 40.0};
+  }
+  for (const auto id : devices.digital_outputs) {
+    command.digital_outputs[command.digital_output_count++] = {id, true};
+  }
+  for (const auto id : devices.pwm_outputs) {
+    command.pwm_outputs[command.pwm_output_count++] = {id, 0.75};
+  }
+  return command;
+}
+
+// Stand in for a node that can stop publishing entirely. No hosted node
+// remains alive to keep flushing neutral requests on its behalf.
+void SendRequest(Sim& sim, std::string_view node,
+                 const hardware::Command& command) {
+  hardware::Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(hardware::Encode(command, packet.data));
+  ASSERT_GT(packet.size, 0u);
+  sim.publish(hardware::RequestTopic(node), packet);
+}
+
 class SimHardwareTest : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -72,13 +112,7 @@ class SimHardwareTest : public ::testing::Test {
     return detail::HardwareAccess::device_id(config, node, kind, device);
   }
 
-  hardware::State State() const {
-    const auto packet = sim.latest<hardware::Packet>(hardware::kStateTopic);
-    EXPECT_TRUE(packet.has_value());
-    hardware::State state{};
-    if (packet) EXPECT_TRUE(hardware::Decode(packet->bytes(), state));
-    return state;
-  }
+  hardware::State State() const { return LatestState(sim); }
 
   hardware::MotorSample Motor(std::string_view device) const {
     const auto state = State();
@@ -101,34 +135,11 @@ class SimHardwareTest : public ::testing::Test {
   }
 
   hardware::Command Drive(std::string_view node = "mech") const {
-    const auto state = State();
-    hardware::Command command{};
-    command.config_id = state.config_id;
-    command.boot_id = state.boot_id;
-    command.epoch = state.epoch;
-    command.observed_time_us = state.sample_time_us;
-    const auto& devices = config.subsystems.at(std::string{node});
-    for (const auto id : devices.motors) {
-      command.motors[command.count++] = {
-          .id = id, .mode = Mode::kVelocity, .demand = 40.0};
-    }
-    for (const auto id : devices.digital_outputs) {
-      command.digital_outputs[command.digital_output_count++] = {id, true};
-    }
-    for (const auto id : devices.pwm_outputs) {
-      command.pwm_outputs[command.pwm_output_count++] = {id, 0.75};
-    }
-    return command;
+    return DriveAll(State(), config.subsystems.at(std::string{node}));
   }
 
-  // Stand in for a node that can stop publishing entirely. No hosted node
-  // remains alive to keep flushing neutral requests on its behalf.
   void Send(std::string_view node, const hardware::Command& command) {
-    hardware::Packet packet{};
-    packet.size =
-        static_cast<std::uint32_t>(hardware::Encode(command, packet.data));
-    ASSERT_GT(packet.size, 0u);
-    sim.publish(hardware::RequestTopic(node), packet);
+    SendRequest(sim, node, command);
   }
 
   Sim sim = Sim::FromToml(kRobotToml);
@@ -577,7 +588,8 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
 
   // Every motor and the CANcoder: one aged, the rest disconnected.
   hw.set_motor("other", "motor", 2.0, 3.0, 50'000, 0, 30.0, 4.0, 5.0);
-  for (const auto device : {"braked", "coasting", "remote", "angle"}) {
+  for (const auto device :
+       {"braked", "coasting", "remote", "follower", "angle"}) {
     hw.set_connected("mech", device, false);
   }
   sim.step(5ms);  // the State that finds total loss
@@ -612,6 +624,83 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
   sim.step(10ms);
   EXPECT_TRUE(other.enabled);
   expect_outputs(true);
+}
+
+// REQ-SAFE-22, REQ-DEV-07: the gateway judges total loss on the samples the
+// RoboRIO reports, before it masks a follower of an invalid master or the
+// motor a reset CANcoder feeds (Gateway::Tick judges, PollResets masks
+// after). With such a pair as the only CAN devices, disconnecting the master
+// or resetting the CANcoder leaves the other sample valid where the gateway
+// judges: the dependent reads invalid, but there is no kHardwareFault, no new
+// epoch, and the digital output keeps its request. The gateway's side of the
+// same two scenarios: Gateway.AMaskedDependentIsNotTotalLoss.
+TEST(SimHardwareTotalLoss, AMaskedDependentIsNotTotalLoss) {
+  struct Case {
+    const char* name;
+    std::string_view toml;
+    const char* lost;       // disconnected (a motor) or reset (a CANcoder)
+    const char* dependent;  // masked with it, after the judgment
+  };
+  constexpr std::string_view kFollowed = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 50000
+[subsystems.mech.motors.master]
+can_id = 1
+[subsystems.mech.motors.follower]
+can_id = 2
+follow = "master"
+[subsystems.mech.digital_outputs.led]
+dio = 0
+)";
+  constexpr std::string_view kRemote = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 50000
+[subsystems.mech.sensors.angle]
+type = "CANcoder"
+can_id = 4
+[subsystems.mech.motors.remote]
+can_id = 5
+feedback = "RemoteCANcoder"
+feedback_sensor = "angle"
+[subsystems.mech.digital_outputs.led]
+dio = 0
+)";
+  for (const Case& c :
+       {Case{"master disconnected", kFollowed, "master", "follower"},
+        Case{"remote CANcoder reset", kRemote, "angle", "remote"}}) {
+    SCOPED_TRACE(c.name);
+    auto sim = Sim::FromToml(c.toml);
+    const auto config =
+        config::ParseRobotConfig(detail::SimAccess::config_path(sim));
+    const auto& devices = config.subsystems.at("mech");
+    SimHardware hw{sim};
+    sim.step(0ms);
+    hw.enable();
+    SendRequest(sim, "mech", DriveAll(LatestState(sim), devices));
+    sim.step(5ms);
+    ASSERT_TRUE(hw.applied_digital_output("mech", "led"));
+    const std::uint64_t epoch = LatestState(sim).epoch;
+
+    if (std::string_view{c.lost} == "master") {
+      hw.set_connected("mech", c.lost, false);
+    } else {
+      hw.reset_device("mech", c.lost);
+    }
+    sim.step(5ms);
+    const auto state = LatestState(sim);
+    const auto dependent = detail::HardwareAccess::device_id(
+        config, "mech", Kind::kMotor, c.dependent);
+    for (std::size_t i = 0; i < state.motor_count; ++i) {
+      if (state.motors[i].id == dependent) {
+        EXPECT_FALSE(state.motors[i].valid) << c.dependent;
+      }
+    }
+    EXPECT_EQ(state.flags & hardware::kHardwareFault, 0u);
+    EXPECT_EQ(state.epoch, epoch);
+    EXPECT_TRUE(hw.applied_digital_output("mech", "led"));
+  }
 }
 
 // The RoboRIO observes the mode every tick, delivered or not: a disable lost
