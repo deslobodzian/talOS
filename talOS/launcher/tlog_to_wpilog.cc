@@ -40,6 +40,7 @@
 #include "flatbuffers/verifier.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/launcher/log_inputs.h"
 #include "talOS/launcher/log_merge.h"
 #include "talOS/launcher/wpilog.h"
 #include "talOS/schema/identity.h"
@@ -534,33 +535,6 @@ int Fail(const std::string& message) {
   return 1;
 }
 
-// The input's log files: a directory is every *.tlog in it, a log file that
-// log's kept segments too, oldest first (as log_dump reads them); each file
-// once, by canonical path, however many inputs name it.
-std::vector<std::string> InputFiles(const std::vector<std::string>& inputs) {
-  std::vector<std::string> files;
-  std::set<std::string> seen;
-  const auto add = [&](const std::string& file) {
-    std::error_code ec;
-    const std::filesystem::path canonical =
-        std::filesystem::weakly_canonical(file, ec);
-    if (seen.insert(ec ? file : canonical.string()).second) {
-      files.push_back(file);
-    }
-  };
-  for (const auto& input : inputs) {
-    std::error_code ec;
-    if (std::filesystem::is_directory(input, ec)) {
-      for (const auto& file : talos::event::log::FindLogFiles(input)) add(file);
-      continue;
-    }
-    const auto found = talos::event::log::LogSegmentFiles(input);
-    if (found.empty()) add(input);  // Reported when opened.
-    for (const auto& file : found) add(file);
-  }
-  return files;
-}
-
 // One publication: its topic (an index into the topic table), RTMS
 // sequence and publish time. A SEND and every reader's MESSAGE of it carry
 // the same three.
@@ -783,7 +757,8 @@ int Convert(const Options& options) {
   std::string error;
   if (!temp.create(options.output, error)) return Fail(error);
 
-  const std::vector<std::string> files = InputFiles(options.inputs);
+  const std::vector<std::string> files =
+      talos::launcher::LogInputFiles(options.inputs);
   if (files.empty()) return Fail("no .tlog files found");
 
   // Each file's header: its session and loop start. A file that cannot be

@@ -101,6 +101,15 @@ cc_library(
     ],
 )
 
+# The log files a log tool's inputs name, each once (log_dump,
+# tlog_to_wpilog).
+cc_library(
+    name = "log_inputs",
+    srcs = ["log_inputs.cc"],
+    hdrs = ["log_inputs.h"],
+    deps = ["//talOS/events:events_log"],
+)
+
 # One session's event logs merged by time, for log_dump.
 cc_library(
     name = "log_merge",
@@ -208,11 +217,11 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":hardware_record",
+        ":log_inputs",
         ":log_merge",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
-        "//talOS/events:events_log",
         "//talOS/hardware",
         "//talOS/schema:decode",
     ],
@@ -325,6 +334,7 @@ cc_binary(
     srcs = ["tlog_to_wpilog.cc"],
     visibility = ["//visibility:public"],
     deps = [
+        ":log_inputs",
         ":log_merge",
         ":wpilog",
         "//talOS/events:events_core",

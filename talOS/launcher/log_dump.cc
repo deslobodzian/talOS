@@ -21,9 +21,9 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
-#include "talOS/events/log/log_reader.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/hardware_record.h"
+#include "talOS/launcher/log_inputs.h"
 #include "talOS/launcher/log_merge.h"
 #include "talOS/schema/decode.h"
 
@@ -320,18 +320,8 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::vector<std::string> log_files;
-  for (const auto& path : options.paths) {
-    // A directory is every *.tlog in it; a log file is that log's kept
-    // segments too, oldest first (LogSegmentFiles).
-    std::error_code ec;
-    auto found = std::filesystem::is_directory(path, ec)
-                     ? talos::event::log::FindLogFiles(path)
-                     : talos::event::log::LogSegmentFiles(path);
-    if (found.empty()) found.push_back(path);  // Reported when opened.
-    log_files.insert(log_files.end(), found.begin(), found.end());
-  }
-
+  const std::vector<std::string> log_files =
+      talos::launcher::LogInputFiles(options.paths);
   if (log_files.empty()) {
     std::fprintf(stderr, "log_dump: no .tlog files found\n");
     return 1;
