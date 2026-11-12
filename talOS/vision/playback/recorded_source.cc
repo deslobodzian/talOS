@@ -29,7 +29,7 @@ std::string RecordingPath(std::string_view device) {
 // Linux, CLOCK_MONOTONIC_RAW (mach continuous time) on macOS. Not
 // std::chrono::steady_clock, which on macOS stops during sleep.
 std::int64_t HostNowNs() {
-  struct timespec ts{};
+  struct timespec ts {};
 #if defined(__APPLE__)
   ::clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
 #else

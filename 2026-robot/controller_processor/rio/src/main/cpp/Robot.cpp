@@ -199,7 +199,7 @@ void SleepUntilUs(uint64_t wake_us) {
     result = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, nullptr);
   } while (result == EINTR);
   if (result == 0) return;
-  // Not reachable with a valid time; never let the loop spin.
+    // Not reachable with a valid time; never let the loop spin.
 #elif defined(__FRC_ROBORIO__)
 #error "the RoboRIO loop needs libstdc++'s steady_clock on CLOCK_MONOTONIC"
 #endif
