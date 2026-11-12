@@ -33,7 +33,7 @@ class PyLocalizerTest(unittest.TestCase):
         """A camera's observation of (x, y), taken now."""
         self.sim.publish(
             PoseObservation, f"/{camera}/state",
-            sample_time_ns=round(self.sim.now * 1e9), pose_x_m=x, pose_y_m=y,
+            sample_time_ns=self.sim.now_ns, pose_x_m=x, pose_y_m=y,
             pose_yaw_rad=0.5, x_std_m=std_m, y_std_m=std_m, yaw_std_rad=0.05,
             tag_count=2, valid=valid)
 
