@@ -239,8 +239,9 @@ can_id = 1
   options.remote = "127.0.0.1";
   options.remote_port = gateway_port;
   options.local_port = bridge_port;
-  // A ceiling only: the test stops the session once every log rotated.
-  options.duration_s = 60;
+  // A ceiling only: the test stops the session once every log rotated, or
+  // gives up at kGiveUp; both well inside the target's 60 s timeout.
+  options.duration_s = 40;
   options.describe_timeout_ms = 10000;
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       Runfile("TALOS_BRIDGE");
@@ -262,10 +263,18 @@ can_id = 1
           event::log::LogSegmentPath(session + "/" + member + ".tlog", 0));
     });
   };
-  while (!ended && !all_rotated()) std::this_thread::sleep_for(20ms);
-  ASSERT_FALSE(ended) << "the session ended before every log rotated";
+  constexpr auto kGiveUp = 30s;
+  const auto give_up = std::chrono::steady_clock::now() + kGiveUp;
+  bool rotated = false;
+  while (!ended && !(rotated = all_rotated()) &&
+         std::chrono::steady_clock::now() < give_up)
+    std::this_thread::sleep_for(20ms);
+  const bool ended_first = ended;
   ::kill(::getpid(), SIGTERM);
   run.join();
+  ASSERT_FALSE(ended_first) << "the session ended before every log rotated";
+  ASSERT_TRUE(rotated) << "not every log rotated within "
+                       << std::chrono::seconds{kGiveUp}.count() << " s";
   EXPECT_EQ(status, 0);
 
   // What each member declared, probed as the launcher probes it.
