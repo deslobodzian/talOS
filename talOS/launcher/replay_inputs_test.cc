@@ -22,6 +22,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -239,7 +240,6 @@ class RealGateway {
 class ReplayInputsTest : public ::testing::Test {
  protected:
   void SetUp() override {
-    std::filesystem::remove_all(session_dir_);
     std::ofstream{config_} << R"([robot]
 name = "replay_inputs"
 period_us = 5000
@@ -314,7 +314,6 @@ node = "//talOS/launcher:replay_graph_reader"
   }
 
   void TearDown() override {
-    std::filesystem::remove_all(session_dir_);
     std::filesystem::remove(config_);
     std::filesystem::remove(record_config_);
     std::filesystem::remove(record_config_ + ".hardware.sh");
@@ -342,13 +341,36 @@ node = "//talOS/launcher:replay_graph_reader"
     return options;
   }
 
+  // The recorded session, shared by the suite: recorded by the first test
+  // that needs it and read by each. A test that changes a session changes a
+  // copy of it (CopyOfSession). Recording it once per test only repeated
+  // its 2 s.
   void Record() {
-    LauncherOptions options = Options();
-    options.config_path = record_config_;
-    options.output_dir =
-        std::filesystem::path{session_dir_}.parent_path().string();
-    options.duration_s = 2;
-    ASSERT_EQ(Launcher{options}.Run(), 0);
+    if (!recorded_) {
+      std::filesystem::remove_all(session_dir_);
+      LauncherOptions options = Options();
+      options.config_path = record_config_;
+      options.output_dir =
+          std::filesystem::path{session_dir_}.parent_path().string();
+      options.duration_s = 2;
+      recorded_ = Launcher{options}.Run();
+    }
+    ASSERT_EQ(*recorded_, 0);
+  }
+
+  static void TearDownTestSuite() {
+    std::filesystem::remove_all(TempPath("session"));
+    recorded_.reset();
+  }
+
+  // A private copy of the recorded session, as `<name>/1`.
+  std::string CopyOfSession(std::string_view name) const {
+    const std::string copy = TempPath(name) + "/1";
+    std::filesystem::remove_all(TempPath(name));
+    std::filesystem::create_directories(copy);
+    std::filesystem::copy(session_dir_, copy,
+                          std::filesystem::copy_options::recursive);
+    return copy;
   }
 
   // `node` on the recorded session's topics, its log in `out_dir`.
@@ -365,6 +387,8 @@ node = "//talOS/launcher:replay_graph_reader"
     return Launcher{options}.Run();
   }
 
+  // The launcher's exit status for the shared recording, once it ran.
+  static inline std::optional<int> recorded_;
   const std::string session_dir_ = TempPath("session") + "/1";
   const std::string config_ = TempPath("robot.toml");
   const std::string record_config_ = TempPath("record.toml");
@@ -561,19 +585,21 @@ TEST_F(ReplayInputsTest, AReaderOfAnotherSchemaIsRefused) {
 // refused, not replayed on an empty graph.
 TEST_F(ReplayInputsTest, AGraphReaderReplaysOnTheSessionsDeclaredGraph) {
   Record();
+  const std::string session = CopyOfSession("graph_session");
   const std::string out = TempPath("graph_reader");
   std::filesystem::remove_all(out);
-  ASSERT_EQ(Replay("replay_graph_reader", out), 0);
+  ASSERT_EQ(Replay("replay_graph_reader", out, session), 0);
   const std::vector<Sent> summaries =
       Sends(out + "/1/replay_graph_reader.tlog", "/replay_graph_reader/state");
   ASSERT_FALSE(summaries.empty());
   EXPECT_EQ(As<Summary>(summaries.back()).reading_count(), 2u);
 
   std::filesystem::remove_all(out);
-  ASSERT_TRUE(std::filesystem::remove(session_dir_ + "/declared_graph.json"));
-  EXPECT_NE(Replay("replay_graph_reader", out), 0);
+  ASSERT_TRUE(std::filesystem::remove(session + "/declared_graph.json"));
+  EXPECT_NE(Replay("replay_graph_reader", out, session), 0);
 
   std::filesystem::remove_all(out);
+  std::filesystem::remove_all(TempPath("graph_session"));
 }
 
 // REQ-OPS-14: a replayed node has no session directory, although the launcher
@@ -595,8 +621,10 @@ TEST_F(ReplayInputsTest, AReplayedNodeKeepsNoSessionState) {
 
 TEST_F(ReplayInputsTest, RefusesToWriteIntoTheSessionItReads) {
   Record();
-  EXPECT_NE(Replay("replay_consumer", session_dir_), 0);
-  EXPECT_FALSE(std::filesystem::exists(session_dir_ + "/replay_consumer.tlog"));
+  const std::string session = CopyOfSession("refused_session");
+  EXPECT_NE(Replay("replay_consumer", session, session), 0);
+  EXPECT_FALSE(std::filesystem::exists(session + "/replay_consumer.tlog"));
+  std::filesystem::remove_all(TempPath("refused_session"));
 }
 
 }  // namespace
