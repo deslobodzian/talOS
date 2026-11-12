@@ -144,9 +144,11 @@ LAUNCHER_DROPS = (
      lambda m: f"{m[2]} bytes dropped from {Path(m[3]).name}"),
     (re.compile(r"^\[launcher\] (\d+) bytes of output dropped here: (.+)$", re.MULTILINE),
      lambda m: f"{m[1]} bytes dropped from talos.log ({m[2]})"),
-    (re.compile(r"^\[launcher\] (\d+) bytes for the launcher's (\w+) were not written",
-                re.MULTILINE),
-     lambda m: f"{m[1]} bytes dropped from the launcher's {m[2]}"),
+    # ", at most": part of the count was inside a write that may yet finish.
+    (re.compile(r"^\[launcher\] (\d+) bytes for the launcher's (\w+) were not "
+                r"written(, at most)?", re.MULTILINE),
+     lambda m: f"{'up to ' if m[3] else ''}{m[1]} bytes dropped from the "
+               f"launcher's {m[2]}"),
     (re.compile(r"^\[launcher\] output log reached (\d+) bytes; later output is dropped$",
                 re.MULTILINE),
      lambda m: f"talos.log reached its {m[1]}-byte cap; later lines dropped"),
