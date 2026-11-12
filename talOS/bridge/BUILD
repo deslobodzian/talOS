@@ -75,7 +75,7 @@ cc_binary(
 )
 
 # The bridge and fake gateway on loopback ports, the test configs, and the
-# frames the two ends exchange, for the two test targets below.
+# frames the two ends exchange, for the test targets below.
 cc_library(
     name = "node_test_support",
     testonly = True,
@@ -89,6 +89,43 @@ cc_library(
     ],
 )
 
+# The gateway end of a HardwareNode's link in process (HardwareNode's
+# friend), for trust_test: testonly and private to this package, so no
+# production code can reach it.
+cc_library(
+    name = "in_process_gateway",
+    testonly = True,
+    hdrs = ["in_process_gateway.h"],
+    deps = [
+        ":node_lib",
+        "//talOS/hardware",
+        "//talOS/protocol",
+    ],
+)
+
+# The request trust rules on HardwareNode through the in-process gateway:
+# no socket, synthetic time, so the component tier and the fast lane
+# (docs/TESTING.md §2, §9).
+cc_test(
+    name = "trust_test",
+    size = "small",
+    srcs = ["trust_test.cc"],
+    deps = [
+        ":in_process_gateway",
+        ":messages",
+        ":node_lib",
+        ":node_test_support",
+        "//talOS/configuration",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/ipc",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# The UDP path: States, Driver Station packets and acknowledgements in, and
+# probes, configurations and commands out, through a loopback fake gateway.
 cc_test(
     name = "node_test",
     size = "small",

@@ -1,8 +1,8 @@
 #pragma once
 
-// Helpers shared by the bridge's tests (hardware_node_test.cc, run_test.cc):
-// a bridge and fake gateway on loopback ports, the test configs, and
-// requests, States and commands as the two ends exchange them.
+// Helpers shared by the bridge's tests (hardware_node_test.cc, run_test.cc,
+// trust_test.cc): a bridge and fake gateway on loopback ports, the test
+// configs, and requests, States and commands as the two ends exchange them.
 
 #include <netinet/in.h>
 #include <sys/socket.h>

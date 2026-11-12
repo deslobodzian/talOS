@@ -144,7 +144,11 @@ bool HardwareNode::Open() {
       protocol::UdpStatus::kOk) {
     return false;
   }
+  OpenTopics();
+  return true;
+}
 
+void HardwareNode::OpenTopics() {
   state_pub_ =
       std::make_unique<ipc::Publisher<talos::hardware::Packet>>(kStateTopic);
   cmd_pub_ =
@@ -186,8 +190,6 @@ bool HardwareNode::Open() {
     std::fprintf(stderr, "hardware_node: node registry unavailable: %s\n",
                  e.what());
   }
-
-  return true;
 }
 
 const std::vector<introspect::EndpointAttribute>&
@@ -341,6 +343,12 @@ protocol::UdpStatus HardwareNode::SendToGateway(protocol::FrameType type,
                                                 uint64_t now_us,
                                                 const void* payload,
                                                 std::size_t payload_size) {
+  if (frame_sink_.send != nullptr) {
+    frame_sink_.send(frame_sink_.context, type, now_us,
+                     {static_cast<const uint8_t*>(payload),
+                      payload == nullptr ? 0 : payload_size});
+    return protocol::UdpStatus::kOk;
+  }
   if (!peer_.IsOpen()) return protocol::UdpStatus::kSocketError;
   int error = seams_.send_error != nullptr ? seams_.send_error() : 0;
   const protocol::UdpStatus status =
@@ -417,7 +425,8 @@ void HardwareNode::Tick(uint64_t now_us) {
   // ticks again without waiting when the budget runs out.
   tick_receive_capped_ = true;
   for (int i = 0; i < kReceiveBudget; ++i) {
-    // Closed (SocketCounters), maybe by a config push below: nothing to read.
+    // Closed (SocketCounters), maybe by a State's config push: nothing to
+    // read.
     if (!peer_.IsOpen()) {
       tick_receive_capped_ = false;
       break;
@@ -452,128 +461,7 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (status != protocol::UdpStatus::kOk) continue;
     version_mismatch_logged_ = false;
 
-    if (frame.header.type == protocol::FrameType::kHardwareConfigAck) {
-      ConfigAckPayload ack{};
-      if (DecodeConfigAck({frame.payload, frame.payload_size}, ack)) {
-        if (ack.config_id == config_id_) {
-          if (ack.status == ConfigAckStatus::kOk) {
-            is_configured_ = true;
-            config_push_backoff_us_ = 50000;
-          } else {
-            is_configured_ = false;
-            config_push_backoff_us_ =
-                std::min<uint64_t>(config_push_backoff_us_ * 2, 2000000);
-            last_push_time_us_ = now_us;
-          }
-        }
-      }
-      continue;
-    }
-
-    if (frame.header.type == protocol::FrameType::kHardwareState) {
-      State state;
-      if (!Decode({frame.payload, frame.payload_size}, state)) {
-        // Once per stretch: a gateway sending malformed States sends them
-        // every tick, and dropping them silently looks like a dead link.
-        if (!state_decode_failure_logged_) {
-          std::fprintf(stderr,
-                       "hardware_node: dropping a State that does not decode "
-                       "(%zu bytes)\n",
-                       frame.payload_size);
-          state_decode_failure_logged_ = true;
-        }
-        continue;
-      }
-      state_decode_failure_logged_ = false;
-
-      ++states_received_;
-      // Ordering first, before anything is touched: the clock mapping takes
-      // a State only when it is newer than the last one of its gateway boot
-      // or opens a boot never seen. A duplicate, a reordered frame (with
-      // whatever older epoch or enable edge it carries) or a datagram delayed
-      // from a retired boot is dropped whole, counted in
-      // clock_ignored_count: it must not roll back the identity, refresh
-      // freshness, invalidate healthy requests or trigger a config push.
-      if (!clock_.Observe(state.boot_id, state.sample_time_us, now_us)) {
-        continue;
-      }
-      if (probe_waiting_ && state.clock_probe_time_us != 0 &&
-          state.clock_probe_time_us == last_probe_send_us_ &&
-          pending_probe_send_us_ == 0) {
-        pending_probe_send_us_ = state.clock_probe_time_us;
-        pending_probe_sample_us_ = state.sample_time_us;
-        pending_probe_boot_id_ = state.boot_id;
-      }
-      last_state_receipt_us_ = now_us;
-      if (state.boot_id != last_boot_id_) {
-        config_push_backoff_us_ = 50000;
-        // The new boot's Driver Station clock restarted with it.
-        last_ds_sample_time_us_ = 0;
-        ReportGatewayBuild(state);
-      }
-      // Configured means the current gateway boot acknowledged our config.
-      // A new boot (not the first State this bridge sees, which an earlier
-      // ack may precede) or a State naming another config voids it until the
-      // next kOk ack; a State naming ours does not restore it, since the
-      // gateway reports that id even when applying the config failed.
-      if ((last_boot_id_ != 0 && state.boot_id != last_boot_id_) ||
-          state.config_id != config_id_) {
-        is_configured_ = false;
-      }
-      if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
-          !is_configured_) {
-        if (now_us - last_push_time_us_ >= config_push_backoff_us_ ||
-            state.boot_id != last_boot_id_) {
-          PushConfig(now_us);
-        }
-      }
-
-      // Controller transition: reboot, reconfiguration, epoch bump, or an
-      // enabled/fault edge (the gateway advances its epoch on disable,
-      // re-enable and total feedback loss, not when that fault clears, so the
-      // edge check is belt and braces).
-      // Every cached merge dies here: motion resumes only on fresh subsystem
-      // requests stamped with the new identity.
-      const bool transition =
-          (state.boot_id != last_boot_id_) || (state.config_id != config_id_) ||
-          (state.epoch != last_epoch_) ||
-          ((state.flags ^ last_state_flags_) & (kEnabled | kHardwareFault));
-      if (transition) {
-        InvalidateRequests();
-      }
-
-      last_boot_id_ = state.boot_id;
-      last_epoch_ = state.epoch;
-      last_sample_time_us_ = state.sample_time_us;
-      last_state_flags_ = state.flags;
-      latest_state_ = state;
-
-      talos::hardware::Packet pkt{};
-      pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
-      if (state_pub_) Publish(*state_pub_, 0, pkt, now_us);
-      continue;
-    }
-
-    // Driver Station packets are forwarded only from the boot the accepted
-    // State is in (a retired boot's delayed packet, or one from a boot whose
-    // State has not arrived yet, is dropped), in sample order within it.
-    if (frame.header.type == protocol::FrameType::kDriverStation) {
-      driver_station::DriverStationData data{};
-      if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
-          data.boot_id != last_boot_id_ ||
-          data.sample_time_us < last_ds_sample_time_us_) {
-        continue;
-      }
-      last_ds_sample_time_us_ = data.sample_time_us;
-      talos::hardware::Packet pkt{};
-      const std::size_t n =
-          std::min<std::size_t>(frame.payload_size, pkt.data.size());
-      pkt.size = static_cast<uint32_t>(n);
-      std::memcpy(pkt.data.data(), frame.payload, n);
-      if (ds_pub_) ds_pub_->write(pkt);
-      ++driver_station_packets_received_;
-      continue;
-    }
+    HandleGatewayFrame(frame, now_us);
   }
 
   // 2. Read subsystem requests and perform timeout neutralization
@@ -713,6 +601,131 @@ void HardwareNode::Tick(uint64_t now_us) {
     status_pub_->write(Status(now_us));
     ++statuses_published_;
     last_status_us_ = now_us;
+  }
+}
+
+void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
+                                      uint64_t now_us) {
+  if (frame.header.type == protocol::FrameType::kHardwareConfigAck) {
+    ConfigAckPayload ack{};
+    if (DecodeConfigAck({frame.payload, frame.payload_size}, ack)) {
+      if (ack.config_id == config_id_) {
+        if (ack.status == ConfigAckStatus::kOk) {
+          is_configured_ = true;
+          config_push_backoff_us_ = 50000;
+        } else {
+          is_configured_ = false;
+          config_push_backoff_us_ =
+              std::min<uint64_t>(config_push_backoff_us_ * 2, 2000000);
+          last_push_time_us_ = now_us;
+        }
+      }
+    }
+    return;
+  }
+
+  if (frame.header.type == protocol::FrameType::kHardwareState) {
+    State state;
+    if (!Decode({frame.payload, frame.payload_size}, state)) {
+      // Once per stretch: a gateway sending malformed States sends them
+      // every tick, and dropping them silently looks like a dead link.
+      if (!state_decode_failure_logged_) {
+        std::fprintf(stderr,
+                     "hardware_node: dropping a State that does not decode "
+                     "(%zu bytes)\n",
+                     frame.payload_size);
+        state_decode_failure_logged_ = true;
+      }
+      return;
+    }
+    state_decode_failure_logged_ = false;
+
+    ++states_received_;
+    // Ordering first, before anything is touched: the clock mapping takes
+    // a State only when it is newer than the last one of its gateway boot
+    // or opens a boot never seen. A duplicate, a reordered frame (with
+    // whatever older epoch or enable edge it carries) or a datagram delayed
+    // from a retired boot is dropped whole, counted in
+    // clock_ignored_count: it must not roll back the identity, refresh
+    // freshness, invalidate healthy requests or trigger a config push.
+    if (!clock_.Observe(state.boot_id, state.sample_time_us, now_us)) {
+      return;
+    }
+    if (probe_waiting_ && state.clock_probe_time_us != 0 &&
+        state.clock_probe_time_us == last_probe_send_us_ &&
+        pending_probe_send_us_ == 0) {
+      pending_probe_send_us_ = state.clock_probe_time_us;
+      pending_probe_sample_us_ = state.sample_time_us;
+      pending_probe_boot_id_ = state.boot_id;
+    }
+    last_state_receipt_us_ = now_us;
+    if (state.boot_id != last_boot_id_) {
+      config_push_backoff_us_ = 50000;
+      // The new boot's Driver Station clock restarted with it.
+      last_ds_sample_time_us_ = 0;
+      ReportGatewayBuild(state);
+    }
+    // Configured means the current gateway boot acknowledged our config.
+    // A new boot (not the first State this bridge sees, which an earlier
+    // ack may precede) or a State naming another config voids it until the
+    // next kOk ack; a State naming ours does not restore it, since the
+    // gateway reports that id even when applying the config failed.
+    if ((last_boot_id_ != 0 && state.boot_id != last_boot_id_) ||
+        state.config_id != config_id_) {
+      is_configured_ = false;
+    }
+    if (state.boot_id != last_boot_id_ || state.config_id != config_id_ ||
+        !is_configured_) {
+      if (now_us - last_push_time_us_ >= config_push_backoff_us_ ||
+          state.boot_id != last_boot_id_) {
+        PushConfig(now_us);
+      }
+    }
+
+    // Controller transition: reboot, reconfiguration, epoch bump, or an
+    // enabled/fault edge (the gateway advances its epoch on disable,
+    // re-enable and total feedback loss, not when that fault clears, so the
+    // edge check is belt and braces).
+    // Every cached merge dies here: motion resumes only on fresh subsystem
+    // requests stamped with the new identity.
+    const bool transition =
+        (state.boot_id != last_boot_id_) || (state.config_id != config_id_) ||
+        (state.epoch != last_epoch_) ||
+        ((state.flags ^ last_state_flags_) & (kEnabled | kHardwareFault));
+    if (transition) {
+      InvalidateRequests();
+    }
+
+    last_boot_id_ = state.boot_id;
+    last_epoch_ = state.epoch;
+    last_sample_time_us_ = state.sample_time_us;
+    last_state_flags_ = state.flags;
+    latest_state_ = state;
+
+    talos::hardware::Packet pkt{};
+    pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
+    if (state_pub_) Publish(*state_pub_, 0, pkt, now_us);
+    return;
+  }
+
+  // Driver Station packets are forwarded only from the boot the accepted
+  // State is in (a retired boot's delayed packet, or one from a boot whose
+  // State has not arrived yet, is dropped), in sample order within it.
+  if (frame.header.type == protocol::FrameType::kDriverStation) {
+    driver_station::DriverStationData data{};
+    if (!driver_station::Decode({frame.payload, frame.payload_size}, data) ||
+        data.boot_id != last_boot_id_ ||
+        data.sample_time_us < last_ds_sample_time_us_) {
+      return;
+    }
+    last_ds_sample_time_us_ = data.sample_time_us;
+    talos::hardware::Packet pkt{};
+    const std::size_t n =
+        std::min<std::size_t>(frame.payload_size, pkt.data.size());
+    pkt.size = static_cast<uint32_t>(n);
+    std::memcpy(pkt.data.data(), frame.payload, n);
+    if (ds_pub_) ds_pub_->write(pkt);
+    ++driver_station_packets_received_;
   }
 }
 
