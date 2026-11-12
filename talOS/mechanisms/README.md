@@ -184,7 +184,9 @@ is `control::VelocityState` (`requested_rps` is the clamped goal).
 | `slot` | | 0 | gain slot |
 
 A goal of at most 1e-3 rot/s is never at speed, and a change of the asked
-goal restarts the entry count. These are the 2026 shooter's readiness rules.
+goal restarts the entry count. The 2026 shooter
+(`2026-robot/main_processor/shooter`) is one `VelocityMechanism`, keyed by
+its `[flywheel]` table.
 `VelocityMechanism` drives nothing with a disconnected motor.
 
 ## RollerWithSensor
