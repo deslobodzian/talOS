@@ -103,6 +103,17 @@ cc_library(
     ],
 )
 
+# The split and its window as a pure function.
+cc_test(
+    name = "log_budget_split_test",
+    size = "small",
+    srcs = ["log_budget_split_test.cc"],
+    deps = [
+        ":log_budget",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # The log files a log tool's inputs name, each once (log_dump,
 # tlog_to_wpilog).
 cc_library(

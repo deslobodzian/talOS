@@ -63,12 +63,15 @@ uint64_t SmallestRotatingShare(const introspect::Description& declared);
 // Shares of `budget` and the window they hold (see SplitLogBudget).
 struct LogSplit {
   std::vector<uint64_t> shares;
-  // The record time each member not held at a floor keeps at its expected
-  // rate: the budget left after the floors over those members' summed
-  // weights, less what each one's segments spend on their prefix (half its
-  // floor per segment, up to kLogSegments segments), the least over them.
-  // Zero when the floors do not fit, when every logging member is held at
-  // its floor, or when no logging member's rate is known.
+  // T, the budget left after the floors over the summed weights of the
+  // members not held at a floor, less the largest prefix cost of any
+  // logging member (kLogSegments x half its floor over its weight), and
+  // never less than 7/8 of T. A member whose prefix cost is within
+  // T - window keeps the window at its expected rate; any other (a member
+  // held at its floor among them) ends its segments on bytes first and
+  // keeps less. A larger budget never shortens it. Zero when the floors do
+  // not fit, when every logging member is held at its floor, or when no
+  // logging member's rate is known.
   std::chrono::microseconds window{0};
 };
 
@@ -78,8 +81,9 @@ struct LogSplit {
 // every logging member at least 1 byte; and the window those shares hold.
 // The shares never exceed the budget unless it is smaller than one byte per
 // logging member. Each member's log ends a segment at least every window / n
-// (LogWriterOptions::window), so a member storing no more than its rate keeps
-// between (n - 1) / n of the window and the window.
+// (LogWriterOptions::window), so a member storing no more than its rate,
+// whose prefix cost is within T - window, keeps between (n - 1) / n of the
+// window and the window.
 LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
                         const std::vector<double>& rates,
                         const std::vector<uint64_t>& floors);
