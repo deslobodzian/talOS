@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "feedback.h"
 #include "gateway.h"
 
 namespace talos::hardware {
@@ -86,7 +87,10 @@ class SimBackend final : public Backend {
       }
       for (std::size_t j = 0; j < config_.motors.size(); ++j) {
         if (config_.motors[j].feedback_sensor_id == config_.sensors[i].id) {
-          state.sensors[i].position_rot = samples_[j].position_rot;
+          // Absolute, as the RoboRIO reports a CANcoder; the motor's own
+          // position stays continuous.
+          state.sensors[i].position_rot =
+              CANcoderAbsoluteRot(samples_[j].position_rot);
           state.sensors[i].velocity_rps = samples_[j].velocity_rps;
         }
       }
