@@ -19,6 +19,11 @@ subsystem inherited through `include`, `defaults` or a custom `path` counts.
 Everything is checked before anything is written, so a refused run leaves the
 tree untouched. --standalone writes the package as its own Bzlmod repository
 in DIR instead, building against this checkout.
+
+Run it with `bazel run` (`bazel run //tools:new_subsystem -- --help` lists the
+options): it imports //tools:sync_manifest, which finds the configuration
+resolver in Bazel runfiles, so `python3 tools/new_subsystem.py` fails with
+`No module named 'tools'`.
 """
 
 import argparse
@@ -26,6 +31,7 @@ import difflib
 import keyword
 import os
 import sys
+import textwrap
 import tomllib
 
 from tools import sync_manifest
@@ -2574,34 +2580,135 @@ def show(root, writes):
                 f"a/{name}", f"b/{name}")))
 
 
-def next_steps(robot, name, can_id, kind="velocity", lang="cpp"):
+# What ./sim.sh drives a scaffold with: teleop after a second disabled, and
+# joystick 0's button 3 (bit 2) pressed from second 3 to second 6, after a
+# neutral sample that arms the teleop lane (talos::OperatorArming).
+SIM_RUN = ("--sim-gateway --no-studio --duration-s 8 "
+           "--mode-schedule 'disabled:1,teleop:10' \\\n      "
+           "--joystick-schedule "
+           "'0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|"
+           "6:axes=0;buttons=0;pov=-1'")
+
+
+def simulation_edits(name, kind):
+    """The edits to a scaffolded mechanism's subsystem file, in order, that
+    make it move under `./sim.sh --sim-gateway` with button 3 held.
+
+    The scaffold leaves them undone on purpose: a fresh scaffold must never
+    drive a real mechanism from a button or on gains nobody tuned. Each edit
+    is (key, what to do, what happens if it is skipped, [(old, new)] text
+    replacements in the generated file); next_steps prints them and
+    new_robot_test applies them.
+    """
+    lane = f"/{name}/target/teleop"
+    if kind == "position":
+        motor, demand, field = name, "position_rot = 0.0", "position_rot"
+        moved = "position_rot = 1.0"
+    else:
+        motor, demand, field = f"{name}_motor", "velocity_rps = 20.0", None
+        moved = demand
+    binding = ("# [[teleop.bindings]]\n# button = 3\n"
+               f"# while_held = {{ {demand} }}\n")
+    edits = [(
+        "[[teleop.bindings]]",
+        "uncomment it" + (f", with {moved}" if field else "")
+        + f": holding joystick button 3 writes {moved} on {lane}.",
+        f"nothing writes {lane}, so the {name} never gets a target; with "
+        "[robot] require_target_coverage = true the launcher refuses the "
+        f"graph: \"target coverage required for mode 'teleop', but none of "
+        f"its policy lanes has a writer: {lane}\".",
+        [(binding, binding.replace("# ", "").replace(demand, moved))],
+    ), (
+        "[targets]",
+        "uncomment it, with autonomous = []: until an autonomous node writes "
+        f"/{name}/target/auto, the teleop binding is the {name}'s only "
+        "producer.",
+        "where [robot.targets] autonomous lists \"auto\" (2026-robot's "
+        "does) and require_target_coverage = true, the launcher refuses the "
+        "graph: \"target coverage required for mode 'autonomous', but none "
+        f"of its policy lanes has a writer: /{name}/target/auto\".",
+        [('# [targets]\n# teleop = ["teleop"]\n# autonomous = ["auto"]\n',
+          '[targets]\nteleop = ["teleop"]\nautonomous = []\n')],
+    )]
+    zero = ("slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, "
+            "a = 0.0, g = 0.0 }")
+    if kind == "position":
+        edits += [(
+            f"[{name}] max_rot",
+            "set 2.0 (in simulation; on the robot, the measured travel).",
+            "every target is clamped to within 0.001 rotations of the home "
+            "switch, so the mechanism stays there.",
+            [("max_rot = 0.001\n", "max_rot = 2.0\n")],
+        ), (
+            f"[motors.{motor}] slot0",
+            "set p = 1.0, d = 0.05, v = 0.12, the simulated motor's gains.",
+            "with every gain zero the motor does not follow the profile, so "
+            "the physics simulation never moves it.",
+            [(zero, zero.replace("p = 0.0", "p = 1.0")
+              .replace("d = 0.0", "d = 0.05").replace("v = 0.0", "v = 0.12"))],
+        )]
+    else:
+        edits.append((
+            f"[motors.{motor}] slot0",
+            "set v = 0.12 (volts per rps), the simulated motor's feedforward.",
+            f"with every gain zero the physics simulation stalls the motor: "
+            f"/{name}/state velocity_rps stays 0.",
+            [(zero, zero.replace("v = 0.0", "v = 0.12"))],
+        ))
+    return edits
+
+
+def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
+               golden_test=False):
+    """What to do after scaffolding `name` into `robot`. `golden_test`: the
+    robot pins its hardware config in configuration/config_golden_test.cc
+    (2026-robot does; a new_robot robot does not)."""
+    del lang  # both languages' nodes read the same keys
     package = f"//{robot}/main_processor/{name}"
     configuration = f"{robot}/main_processor/configuration"
-    common = f"""\
-Next:
-  bazel test {package}:all
+    subsystem = f"{configuration}/subsystems/{name}.toml"
+    check = f"""
   bazel build //talOS/launcher //talOS/bridge:hardware_node //{robot}/main_processor/...
-  bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only
-  {configuration}/subsystems/{name}.toml"""
+  bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only"""
     if can_id is None:  # an estimator
-        return common + f"""
+        return f"""\
+Next:
+  bazel test {package}:all{check}
+  {subsystem}
     List the camera nodes in `cameras`; point telemetry at the pose with
     [studio] pose_topic = "/{name}/state"."""
-    del lang  # both languages' position nodes read the same keys
+    edits = "".join(
+        "\n" + textwrap.fill(f"{i}. {key}: {what}", 79,
+                             initial_indent="    ",
+                             subsequent_indent="       ",
+                             break_on_hyphens=False)
+        + "\n" + textwrap.fill(f"Skipped: {skipped}", 79,
+                               initial_indent="       ",
+                               subsequent_indent="       ",
+                               break_on_hyphens=False)
+        for i, (key, what, skipped, _) in enumerate(
+            simulation_edits(name, kind), 1))
     travel = """
     The home switch's dio is a placeholder too: replace it with its physical
-    channel. The travel (max_rot) confines every target to within
-    0.001 rotations of the switch: set the measured travel. Wire the switch
-    normally open to ground; check that homing_v (-0.5 V) moves toward it,
-    and set homing_timeout_us.
+    channel. Set max_rot to the measured travel. Wire the switch normally
+    open to ground; check that homing_v (-0.5 V) moves toward it, and set
+    homing_timeout_us.
     Only the node's clamp stops the mechanism past the top: wire a forward
     limit switch to the TalonFX's limit input and set
     forward_limit_switch.""" if kind == "position" else ""
-    return common + f"""
-    can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
-    The gains are zero (untuned): tune slot0 there.
+    golden = f"""
   {configuration}/config_golden_test.cc
-    pins the hardware config: update it once a human has checked the CAN id."""
+    pins the hardware config: update it once a human has checked the CAN id.""" \
+        if golden_test else ""
+    return f"""\
+Next:
+  bazel test {package}:all
+  To see it move in simulation, edit {subsystem}, in order:{edits}
+  Then check the graph and run it (button 3 held from second 3 to 6):{check}
+  ./sim.sh --config {configuration}/robot.toml {SIM_RUN}
+  Before a real robot drives the motor, in {subsystem}:
+    can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
+    The simulation's gains are not the mechanism's: tune slot0 on it.{golden}"""
 
 
 def standalone_next_steps(target_dir, name, kind="velocity"):
@@ -2681,7 +2788,11 @@ def main(argv):
         print(standalone_next_steps(shown(root, target_dir), args.name,
                                     args.kind))
     else:
-        print(next_steps(args.robot, args.name, can_id, args.kind, args.lang))
+        golden_test = os.path.isfile(os.path.join(
+            root, args.robot, "main_processor", "configuration",
+            "config_golden_test.cc"))
+        print(next_steps(args.robot, args.name, can_id, args.kind, args.lang,
+                         golden_test))
     return 0
 
 

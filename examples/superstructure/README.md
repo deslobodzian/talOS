@@ -298,7 +298,12 @@ direction checked before the first enable. The generator appends the
 subsystem name and path to `configuration/robot.toml` and regenerates that
 config's manifest plus manifests of configs that include it.
 `./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway`
-runs the robot.
+runs the robot. The wrist moves there only after the edits the generator's
+`Next:` output lists, in order: uncomment the `[[teleop.bindings]]` (with a
+`position_rot` inside the travel), set `[targets]` for a robot whose
+autonomous policy has no writer, set `max_rot`, and give `slot0` gains. It
+also prints the `sim.sh` command that holds button 3, and what the launcher
+says if a step is skipped.
 
 The Python variant puts `wrist.py` and `node_test.py` in the same package,
 not in a separate `py/` directory. It uses the same schema, `:node` target

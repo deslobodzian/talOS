@@ -23,6 +23,11 @@ mechanisms come from new_subsystem, and `./sim.sh --config <robot.toml>`
 runs the robot. The robot name follows the node-name rules (talOS/NAMING.md,
 new_subsystem's check_name): it becomes a Bazel package and a Python import
 root. Everything is checked before anything is written.
+
+Run it with `bazel run` (`bazel run //tools:new_robot -- --help` lists the
+options): it imports //tools:sync_manifest, which finds the configuration
+resolver in Bazel runfiles, so `python3 tools/new_robot.py` fails with
+`No module named 'tools'`.
 """
 
 import argparse
@@ -261,13 +266,10 @@ def plan(root, name, mechanism, lang, kind="velocity", parent="."):
 
 
 def next_steps(robot, mechanism, can_id, kind, lang):
-    config = f"{robot}/main_processor/configuration/robot.toml"
+    # A new robot has no config_golden_test.cc (only 2026-robot and bench
+    # do).
     steps = new_subsystem.next_steps(robot, mechanism, can_id, kind, lang)
-    # The new robot has no config_golden_test.cc (only 2026-robot does).
-    steps = steps.split(f"\n  {robot}/main_processor/configuration/"
-                        "config_golden_test.cc")[0]
     return steps + f"""
-  ./sim.sh --config {config} --sim-gateway --no-studio
   More mechanisms:
     bazel run //tools:new_subsystem -- <name> --lang cpp|py --robot {robot}"""
 
