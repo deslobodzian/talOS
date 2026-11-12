@@ -2,3 +2,9 @@ exports_files([
     "MODULE.bazel",
     "REPO.bazel",
 ])
+
+# //tools:sim_sh_test runs it with a stub bazel.
+exports_files(
+    ["sim.sh"],
+    visibility = ["//tools:__pkg__"],
+)

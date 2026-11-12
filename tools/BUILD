@@ -68,9 +68,33 @@ py_test(
         # new_subsystem's C++ velocity and position mechanisms, built.
         "//tools/scaffold_testdata/gripper:node",
         "//tools/scaffold_testdata/position_cpp:node",
+        # Its message modules, under the generated Python node.
+        "//tools/scaffold_testdata/scaffold_py:node",
     ],
     legacy_create_init = False,
     main = "new_robot_test.py",
+    # The launcher runs a Python node, which cannot load the sanitizer
+    # runtimes through ctypes.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":sync_manifest_lib",
+        "//talOS/python:talos",
+        "@rules_python//python/runfiles",
+    ],
+)
+
+# ./sim.sh --config: which file a path names, and its refusals (missing,
+# outside the repository, ambiguous, stale manifest), with a stub bazel and
+# resolver so nothing builds or starts.
+py_test(
+    name = "sim_sh_test",
+    size = "small",
+    srcs = ["sim_sh_test.py"],
+    data = ["//:sim.sh"],
+    legacy_create_init = False,
     deps = [
         ":sync_manifest_lib",
         "@rules_python//python/runfiles",
