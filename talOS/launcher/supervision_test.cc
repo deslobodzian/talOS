@@ -29,8 +29,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -254,6 +256,109 @@ std::chrono::nanoseconds SessionLength(const std::string& manifest) {
                                   field("start_wall_ns")};
 }
 
+// A session that ends on an event, not a duration, sets this: it only
+// bounds a hang (docs/TESTING.md §6.3).
+constexpr int kHangSeconds = 20;
+
+// The supervision loop's passes, as its service watchdog sees them: the
+// launcher sends WATCHDOG=1 to $NOTIFY_SOCKET at the start of every pass
+// (Launcher::Supervise), so a second datagram received after a moment means
+// a whole pass ran after it. Points NOTIFY_SOCKET at itself while it lives;
+// one at a time.
+class SupervisionPasses {
+ public:
+  SupervisionPasses() {
+    static int serial = 0;
+    path_ = "/tmp/tsp_" + std::to_string(::getpid()) + "_" +
+            std::to_string(serial++);
+    ::unlink(path_.c_str());
+    fd_ = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, path_.c_str(), path_.size() + 1);
+    if (fd_ < 0 || ::fcntl(fd_, F_SETFL, O_NONBLOCK) < 0 ||
+        ::bind(fd_, reinterpret_cast<const sockaddr*>(&address),
+               static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                      path_.size() + 1)) != 0)
+      throw std::runtime_error("cannot bind " + path_);
+    ::setenv("NOTIFY_SOCKET", path_.c_str(), 1);
+  }
+  ~SupervisionPasses() {
+    ::unsetenv("NOTIFY_SOCKET");
+    ::close(fd_);
+    ::unlink(path_.c_str());
+  }
+  SupervisionPasses(const SupervisionPasses&) = delete;
+  SupervisionPasses& operator=(const SupervisionPasses&) = delete;
+
+  // Passes started so far that were received; never waits.
+  uint64_t Started() {
+    char buffer[64];
+    for (ssize_t size; (size = ::recv(fd_, buffer, sizeof buffer, 0)) >= 0;) {
+      if (std::string_view{buffer, static_cast<std::size_t>(size)} ==
+          "WATCHDOG=1")
+        ++started_;
+    }
+    return started_;
+  }
+
+ private:
+  std::string path_;
+  int fd_{-1};
+  uint64_t started_{0};
+};
+
+// Whether `manifest` is the running session's: its end is not recorded yet.
+bool Running(const std::string& manifest) {
+  return manifest.find("\n  \"end_wall_ns\": 0,") != std::string::npos;
+}
+
+// RunSession, stopped as an operator stops it (SIGTERM, which the launcher's
+// handler takes) once `ready` has held for the running session's manifest
+// and one whole supervision pass more has run, so whatever that pass reads
+// of a running member the session has recorded. `seen` gets the manifest
+// `ready` held for: empty when the session ended first. Set
+// options.duration_s to kHangSeconds.
+int RunSessionUntil(LauncherOptions& options,
+                    const std::function<bool(const std::string&)>& ready,
+                    std::string& seen) {
+  // RunSession rewrites options.output_dir on return; not read concurrently.
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  SupervisionPasses passes;
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    std::optional<uint64_t> stop_at;
+    for (; !stop.stop_requested(); std::this_thread::sleep_for(2ms)) {
+      if (!stop_at) {
+        std::string text = ReadFile(live);
+        if (!Running(text) || !ready(text)) continue;
+        seen = std::move(text);
+        // Datagrams sent before now are drained here; two more mean the
+        // first of them started a pass that has ended.
+        stop_at = passes.Started() + 2;
+      }
+      if (passes.Started() >= *stop_at) {
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+    }
+  }};
+  const int status = RunSession(options);
+  stopper.request_stop();
+  return status;
+}
+
+// Whether the registry holds an active row named `name` of `session`.
+bool Registered(std::string_view name, uint64_t session) {
+  const auto registry = introspect::RegistryReader::open();
+  if (!registry) return false;
+  const auto nodes = registry->nodes();
+  return std::any_of(nodes.begin(), nodes.end(), [&](const auto& node) {
+    return node.name == name && node.session_id == session;
+  });
+}
+
 // A run whose live endpoints differ from its probe's is reported, recorded
 // in the manifest, and stops the session (exit 1) before its 3 s duration;
 // --allow-graph-errors records it and runs the session out.
@@ -387,16 +492,20 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
 // What each run's registry row says it lost reaches the manifest per run and
 // summed per node, and outlives the processes. alpha's first run shows lost
 // wakes, waits until the live manifest carries them (posted when a count
-// first leaves 0) and crashes; its restart shows none, from its own row. The
-// bridge's row shows requests skipped on alpha's request topic. beta loses
-// nothing and records zeros. The stubs (testdata/delivery_loss_node.cc)
-// declare no endpoints but the bridge publishes its request watcher, so the
-// session runs with --allow-graph-errors.
+// first leaves 0) and crashes; its restart shows other nonzero counts, from
+// its own row, so only a sum over both runs gives alpha's totals (not the
+// first run's, the last's or the larger). The bridge's row shows requests
+// skipped on alpha's request topic. beta loses nothing and records zeros.
+// The session stops once the manifest carries the restart's counts and the
+// bridge's, and a pass has read beta's row. The stubs
+// (testdata/delivery_loss_node.cc) declare no endpoints but the bridge
+// publishes its request watcher, so the session runs with
+// --allow-graph-errors.
 // REQ-OPS-43, REQ-OPS-16, REQ-RT-19
 TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
   auto options = BaseOptions("delivery_loss");
   options.allow_graph_errors = true;
-  options.duration_s = 3;
+  options.duration_s = kHangSeconds;
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
       rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
@@ -418,10 +527,26 @@ TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
   options.binary_overrides["//talOS/bridge:hardware_node"] =
       member("hardware_node", "//talOS/bridge:hardware_node", "0,0,0,4,run");
   options.binary_overrides["//example/alpha:node"] =
-      member("alpha", "//example/alpha:node", "3,1,2,0,exit 0,0,0,0,run");
+      member("alpha", "//example/alpha:node", "3,1,2,0,exit 5,4,7,0,run");
   options.binary_overrides["//example/beta:node"] =
       member("beta", "//example/beta:node", "0,0,0,0,run");
-  EXPECT_EQ(RunSession(options), 0);
+  const uint64_t session = options.session_id;
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [session](const std::string& live) {
+                  const auto runs = ManifestRuns(live, "alpha");
+                  return runs.size() == 2 &&
+                         runs[1].find("\"wake_failures\": 5,") !=
+                             std::string::npos &&
+                         ManifestEntry(live, "hardware_node")
+                                 .find("\"requests_skipped\": 4,\n") !=
+                             std::string::npos &&
+                         Registered("beta", session);
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty()) << "no live manifest carried every count";
   const auto manifest = ReadFile(options.output_dir + "/manifest.json");
 
   const auto alpha = ManifestRuns(manifest, "alpha");
@@ -431,15 +556,16 @@ TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
                           "\"requests_skipped\": 0}"),
             std::string::npos)
       << "the crashed run keeps its last counts: " << alpha[0];
-  EXPECT_NE(alpha[1].find("\"wake_failures\": 0, \"stalled_arms\": 0, "
-                          "\"wake_fallbacks\": 0, \"requests_skipped\": 0}"),
+  EXPECT_NE(alpha[1].find("\"wake_failures\": 5, \"stalled_arms\": 4, "
+                          "\"wake_fallbacks\": 7, \"requests_skipped\": 0}"),
             std::string::npos)
       << "the restart counts from its own row: " << alpha[1];
   const auto alpha_entry = ManifestEntry(manifest, "alpha");
-  EXPECT_NE(alpha_entry.find("\"wake_failures\": 3,\n"), std::string::npos)
-      << alpha_entry;
-  EXPECT_NE(alpha_entry.find("\"wake_fallbacks\": 2,\n"), std::string::npos)
-      << alpha_entry;
+  for (const char* sum : {"\"wake_failures\": 8,\n", "\"stalled_arms\": 5,\n",
+                          "\"wake_fallbacks\": 9,\n"}) {
+    EXPECT_NE(alpha_entry.find(sum), std::string::npos)
+        << sum << " in " << alpha_entry;
+  }
 
   const auto beta = ManifestEntry(manifest, "beta");
   for (const char* zero :
