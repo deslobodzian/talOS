@@ -280,10 +280,10 @@ LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
     }
     const double window_s = t - std::min(t / 8, cost);
     // Whole microseconds, rounded down, within a log writer's nanoseconds.
+    constexpr int64_t kMaxWindowUs =
+        std::chrono::nanoseconds::max().count() / 1000 / 2;
     const double window_us =
-        std::min(window_s * 1e6,
-                 static_cast<double>(std::chrono::nanoseconds::max().count() /
-                                     1000 / 2));
+        std::min(window_s * 1e6, static_cast<double>(kMaxWindowUs));
     split.window = std::chrono::microseconds{
         static_cast<int64_t>(std::max(window_us, 0.0))};
   }

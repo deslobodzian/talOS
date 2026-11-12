@@ -82,6 +82,7 @@ double PeakMiB(const std::vector<std::string>& argv) {
     const int null = ::open("/dev/null", O_WRONLY);
     ::dup2(null, STDOUT_FILENO);
     std::vector<char*> args;
+    args.reserve(argv.size() + 1);
     for (const auto& arg : argv) args.push_back(const_cast<char*>(arg.c_str()));
     args.push_back(nullptr);
     ::execv(args[0], args.data());
