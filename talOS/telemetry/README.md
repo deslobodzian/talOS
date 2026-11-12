@@ -6,8 +6,9 @@ size-prefixed FlatBuffer pages on the byte topic configured by `[studio] topic`
 (default `/talos/telemetry`); the Studio bridge (`//studio/bridge`) assembles
 them and sends each browser or agent its own change-only updates. This package
 owns the framework node, `telemetry.fbs` (the page schema), `frames.h` (page
-encoding, used by the producer, the bridge and the mock) and `wire.h` (slot
-geometry, page and dictionary limits, header validation).
+encoding, used by the producer, the bridge and the mock), `wire.h` (slot
+geometry, page and dictionary limits, header validation) and `channels.h`
+(`:channels`, the channel model below).
 
 ## Pages
 
@@ -118,7 +119,16 @@ boundary does not guarantee a TCP/IP packet boundary.
 
 ## Automatic channels and units
 
-Channels are discovered automatically from the graph descriptors:
+Channels are discovered automatically from the graph descriptors. Rules 1 to
+4 are `//talOS/telemetry:channels` (`channels.h`), the one implementation of
+the channel model: `FlattenTopic(topic, schema_name, bfbs)` lists a topic's
+channels (name, kind, unit, labels, and the scalar's offset and type) from
+its schema, `ReadChannel` reads one channel's raw sample from a message's
+bytes (absent when the message ends before it), and `DriverStationChannels`
+and `ReadDriverStation` do the same for the Driver Station packet. The node
+builds its dictionary and reads every tick through it, so anything that
+names or decodes a recorded message with it uses the live names. Rules 5
+and 6 are the node's own.
 
 1. **Naming**: Channel names follow wire conventions `<owner>/<role>/<field>`
    (for example `drivetrain/state/vx_mps`, `pose/valid`).
