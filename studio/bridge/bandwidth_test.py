@@ -326,7 +326,8 @@ class BandwidthTest(unittest.TestCase):
         for reader in result["readers"]:
             self.assertGreaterEqual(reader["frames"], SERVED_FRAMES)
         # The shared bucket is granted in rotation: of the readers, each able
-        # to take a send throughout the window, none is sent to twice before
+        # to take a send throughout the window (they read promptly, and the
+        # mock makes every update the same size), none is sent to twice before
         # every other one is sent to once. So two readers' updates differ by
         # at most one, plus the turns the one with fewer spent on a graph
         # message instead.

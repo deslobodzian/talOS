@@ -112,7 +112,12 @@ int main(int argc, char** argv) try {
                                               publish);
     }
     samples[0] = talos::telemetry::RawFromDouble(0.75 + 0.25 * std::sin(t));
-    samples[1] = (seq / 200) % dictionary[1].labels.size();
+    // Every channel but pose/valid changes every tick, so every client's next
+    // update is the same size whichever tick it was last sent:
+    // bandwidth_test judges the rotation among clients that are all able to
+    // take a send, which a client with a larger update is not while the
+    // shared bucket holds the smaller one but not its own.
+    samples[1] = seq % dictionary[1].labels.size();
     samples[2] = 1;
     for (std::size_t i = 3; i < samples.size(); ++i) {
       samples[i] =
