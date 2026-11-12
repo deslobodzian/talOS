@@ -327,7 +327,8 @@ Linux (`/proc/<pid>/fd`: stdio and log pipes, the event-log file, the poller,
 the stop pipe, its wake receiver; the bridge's UDP socket). The peak, the
 bridge's 27, leaves 229 of macOS's default soft `RLIMIT_NOFILE` of 256 (and
 997 of Linux's usual 1024), so nodes do not raise the limit. A node that did
-run out would show it in its registry row's `wake_failures`.
+run out would show it in its registry row's `wake_failures`, and in the
+session manifest, where `session_report --strict` rejects it.
 
 ### Gateway clock accuracy
 

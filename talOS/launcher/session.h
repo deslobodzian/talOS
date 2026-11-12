@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "talOS/introspection/describe.h"
@@ -113,6 +114,21 @@ inline constexpr std::string_view kRunRunning = "running";
 // this many in all; older ones are counted in runs_dropped.
 inline constexpr std::size_t kMaxRecordedRuns = 32;
 
+// What a run's registry row says its node lost of what it should have
+// delivered or been woken for (introspect::DeliveryLoss), as the launcher
+// last read it: each count cumulative over the run and normally 0
+// (introspection README "Wake loss").
+struct DeliveryCounts {
+  uint64_t wake_failures{0};
+  uint64_t stalled_arms{0};
+  uint64_t wake_fallbacks{0};
+  // The bridge's: per subsystem, the requests its reads of
+  // `/hw/request/<subsystem>` passed over. Only nonzero counts are kept.
+  std::vector<std::pair<std::string, uint64_t>> requests_skipped;
+
+  uint64_t requests_skipped_total() const;
+};
+
 // One run of a roster member: one spawn attempt, and how it ended.
 struct NodeRun {
   pid_t pid{-1};  // -1 for a spawn that failed.
@@ -121,6 +137,10 @@ struct NodeRun {
   int exit_code{-1};       // -1 while it runs, and after a signal ended it.
   int exit_signal{0};
   std::string_view reason{kRunRunning};
+  // The last counts its registry row showed; empty while the launcher has
+  // seen no row of it (a spawn that failed, a run that never registered,
+  // Studio's bridge).
+  std::optional<DeliveryCounts> delivery;
 };
 
 int64_t WallClockNanos();
@@ -175,6 +195,16 @@ struct NodeProcessInfo {
   std::vector<NodeRun> runs;
   uint64_t runs_dropped{0};
 
+  // Every run's DeliveryCounts summed, dropped runs included; empty while
+  // no run's row was seen.
+  std::optional<DeliveryCounts> delivery;
+
+  // Records what the newest run's registry row now shows it lost. Returns
+  // whether a count of that run became nonzero: the one change worth a
+  // manifest version of its own, since a count only grows within a run and
+  // is normally 0. A later increase waits for the next version.
+  bool RecordDeliveryLoss(DeliveryCounts seen);
+
   // Records the start of a run (`pid` -1 for a spawn that failed).
   void BeginRun(pid_t run_pid);
 
@@ -204,6 +234,9 @@ struct SessionManifest {
   std::string git_revision;
   bool git_dirty{false};
   std::string output_dir;
+  // The launcher's own output log, talos.log (README "Node output"); empty
+  // for none.
+  std::string launcher_log;
   bool simulation{false};
   int64_t start_wall_ns{0};
   int64_t end_wall_ns{0};

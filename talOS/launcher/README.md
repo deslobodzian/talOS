@@ -624,6 +624,25 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   `exit_code`, `exit_signal` (as for the node's last run, above) and `reason`.
   At most 32 are kept, the first run and the newest; `runs_dropped` counts
   those dropped between them.
+- per node and per run, `wake_failures`, `stalled_arms`, `wake_fallbacks`
+  and `requests_skipped`: what the run's registry row last showed it lost
+  ([wake loss](../introspection/README.md#wake-loss),
+  `introspect::DeliveryLossOf`), each normally 0. The launcher reads them
+  in the supervision pass that already reads the row for liveness, so a
+  run's values are the last that pass saw before it ended or the session
+  stopped. The node's fields sum every run, dropped ones included, and
+  `requests_skipped_by_subsystem` splits the bridge's `requests_skipped` by
+  the subsystem whose `/hw/request/<subsystem>` it passed over (only
+  nonzero ones). A run, or a node, whose row was never seen (a spawn that
+  failed, Studio's bridge) has none of these fields. A count leaving 0
+  posts a manifest version of its own; a later increase waits for the next
+  version the launcher posts anyway, at the latest the one the run's end
+  posts, so a healthy session adds no version, and a killed launcher loses
+  only the increases after a count's first.
+- `launcher_log`: the launcher's own `talos.log` ([node output](#node-output)).
+  A member's output log is not listed: it is always
+  `<output_dir>/<session_id>/<name>.log`, and the launcher's end-of-session
+  note of the bytes one lost is in `talos.log`.
 
 | `reason` | the run |
 |---|---|
@@ -683,8 +702,10 @@ header:
 the root is `/tmp/talos_logs`. Use persistent storage on a deployed robot.
 `manifest.json` is written before nodes start, then replaced atomically
 (written beside it, then renamed over it) at each process lifecycle change,
-when a node reports a stopped event log and when a run's endpoints differ from
-its probe: a reader always sees one complete version. `graph.json`,
+when a node reports a stopped event log, when a run's endpoints differ from
+its probe and when a run's delivery-loss count first leaves 0
+([session manifest](#session-manifest)): a reader always sees one complete
+version. `graph.json`,
 `declared_graph.json` and every manifest version from the roster about to
 start on are synced (`talos::process::DurableSync`, file
 then directory: `fsync`, and on macOS `F_FULLFSYNC`, which also flushes the

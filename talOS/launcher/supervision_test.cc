@@ -384,6 +384,79 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// What each run's registry row says it lost reaches the manifest per run and
+// summed per node, and outlives the processes. alpha's first run shows lost
+// wakes, waits until the live manifest carries them (posted when a count
+// first leaves 0) and crashes; its restart shows none, from its own row. The
+// bridge's row shows requests skipped on alpha's request topic. beta loses
+// nothing and records zeros. The stubs (testdata/delivery_loss_node.cc)
+// declare no endpoints but the bridge publishes its request watcher, so the
+// session runs with --allow-graph-errors.
+// REQ-OPS-16, REQ-RT-19
+TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
+  auto options = BaseOptions("delivery_loss");
+  options.allow_graph_errors = true;
+  options.duration_s = 3;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* stub = std::getenv("TALOS_DELIVERY_LOSS_NODE");
+  ASSERT_NE(stub, nullptr);
+  const std::string binary = runfiles->Rlocation(stub);
+  // Each run: wake_failures, stalled_arms, wake_fallbacks, requests skipped
+  // on /hw/request/alpha, and how it ends.
+  const auto member = [&](std::string_view name, std::string_view target,
+                          std::string_view runs) {
+    return WriteStub("delivery_loss_" + std::string{name},
+                     "exec " + binary + " " + std::string{name} + " " +
+                         std::string{target} + " " + std::string{runs} +
+                         " \"$@\"\n",
+                     name);
+  };
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      member("hardware_node", "//talOS/bridge:hardware_node", "0,0,0,4,run");
+  options.binary_overrides["//example/alpha:node"] =
+      member("alpha", "//example/alpha:node", "3,1,2,0,exit 0,0,0,0,run");
+  options.binary_overrides["//example/beta:node"] =
+      member("beta", "//example/beta:node", "0,0,0,0,run");
+  EXPECT_EQ(RunSession(options), 0);
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+
+  const auto alpha = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha.size(), 2u) << manifest;
+  EXPECT_NE(alpha[0].find("\"reason\": \"crash\", \"wake_failures\": 3, "
+                          "\"stalled_arms\": 1, \"wake_fallbacks\": 2, "
+                          "\"requests_skipped\": 0}"),
+            std::string::npos)
+      << "the crashed run keeps its last counts: " << alpha[0];
+  EXPECT_NE(alpha[1].find("\"wake_failures\": 0, \"stalled_arms\": 0, "
+                          "\"wake_fallbacks\": 0, \"requests_skipped\": 0}"),
+            std::string::npos)
+      << "the restart counts from its own row: " << alpha[1];
+  const auto alpha_entry = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha_entry.find("\"wake_failures\": 3,\n"), std::string::npos)
+      << alpha_entry;
+  EXPECT_NE(alpha_entry.find("\"wake_fallbacks\": 2,\n"), std::string::npos)
+      << alpha_entry;
+
+  const auto beta = ManifestEntry(manifest, "beta");
+  for (const char* zero :
+       {"\"wake_failures\": 0,\n", "\"stalled_arms\": 0,\n",
+        "\"wake_fallbacks\": 0,\n", "\"requests_skipped\": 0,\n"}) {
+    EXPECT_NE(beta.find(zero), std::string::npos) << zero << " in " << beta;
+  }
+
+  const auto bridge = ManifestEntry(manifest, "hardware_node");
+  EXPECT_NE(bridge.find("\"requests_skipped\": 4,\n"), std::string::npos)
+      << bridge;
+  EXPECT_NE(bridge.find("\"requests_skipped_by_subsystem\": {\"alpha\": 4}"),
+            std::string::npos)
+      << bridge;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 TEST(Supervision,
      NonCriticalDescribeFailureWarnsAndRestartsWithoutBlockingPeers) {
   auto options = BaseOptions("optional_probe");

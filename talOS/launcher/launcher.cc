@@ -52,6 +52,35 @@ std::optional<std::vector<naming::SourceShape>> PublishedEndpoints(
   return out;
 }
 
+// What a row says its run lost (introspect::DeliveryLossOf), with the
+// bridge's skipped requests split per subsystem, read from its request
+// sources only when DeliveryLossOf found any.
+DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
+  const introspect::DeliveryLoss loss = introspect::DeliveryLossOf(record);
+  DeliveryCounts counts{.wake_failures = loss.wake_failures,
+                        .stalled_arms = loss.stalled_arms,
+                        .wake_fallbacks = loss.wake_fallbacks,
+                        .requests_skipped = {}};
+  if (loss.requests_skipped == 0) return counts;
+  const auto held =
+      std::min<uint32_t>(record.source_count.load(std::memory_order_acquire),
+                         static_cast<uint32_t>(introspect::kMaxSourcesPerNode));
+  for (uint32_t s = 0; s < held; ++s) {
+    const introspect::SourceRecord& source = record.sources[s];
+    std::string name =
+        introspect::read_name(source.name, introspect::kMaxNameBytes);
+    const uint64_t dropped = source.dropped.load(std::memory_order_relaxed);
+    if (dropped == 0 || !introspect::IsRequestRead(
+                            static_cast<event::SourceKind>(source.kind), name))
+      continue;
+    // `/hw/request/<subsystem>`, as the bridge reads it.
+    const std::string_view prefix{hardware::kRequestTopicPrefix};
+    if (name.starts_with(prefix)) name.erase(0, prefix.size());
+    counts.requests_skipped.emplace_back(std::move(name), dropped);
+  }
+  return counts;
+}
+
 // Phase one's report, warnings included.
 void PrintDeclaredGraph(const std::vector<NodeDescription>& described,
                         const std::vector<naming::Diagnostic>& diagnostics,
@@ -502,6 +531,9 @@ int Launcher::RunSession() {
   manifest.git_revision = options_.bundle_git_revision;
   manifest.git_dirty = options_.bundle_git_dirty;
   manifest.output_dir = options_.output_dir;
+  // Recorded since the session directory's creation (above).
+  manifest.launcher_log =
+      options_.output_dir + "/" + std::string{kLauncherOutputFile};
   manifest.simulation = options_.simulation;
   manifest.declared_topics = declared_topics;
   manifest.start_wall_ns = WallClockNanos();
@@ -997,6 +1029,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   uint32_t recording = 0;
   std::optional<std::vector<naming::SourceShape>> live;
   bool live_complete = true;
+  std::optional<DeliveryCounts> delivery;
   const auto read_row = [&]() -> RowObservation {
     if (registry == nullptr) return {};
     for (const auto& record : registry->header()->nodes) {
@@ -1019,11 +1052,13 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
           (flags & introspect::kFlagConstructing) == 0) {
         published = PublishedEndpoints(record, live_complete);
       }
+      DeliveryCounts loss = DeliveryCountsOf(record);
       if (record.generation.load(std::memory_order_acquire) != generation ||
           record.state.load(std::memory_order_acquire) !=
               static_cast<uint64_t>(introspect::SlotState::ACTIVE))
         continue;
       live = std::move(published);
+      delivery = std::move(loss);
       recording = flags;
       return {.found = true,
               .constructing = (flags & introspect::kFlagConstructing) != 0,
@@ -1039,6 +1074,11 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
                                                     read_row, launch.limits);
   if (NoteRecording(proc, launch, recording)) changed = true;
   if (NoteRealtime(proc, launch, recording)) changed = true;
+  // Kept every pass, posted only when a count first leaves 0: a later
+  // increase rides the next version the launcher posts anyway (at the
+  // latest the one the run's end posts), so a healthy session's counts add
+  // no manifest version.
+  if (delivery && proc.RecordDeliveryLoss(std::move(*delivery))) changed = true;
   if (live) {
     launch.endpoints_checked = true;
     if (CheckEndpoints(proc, launch, *live, live_complete)) changed = true;
