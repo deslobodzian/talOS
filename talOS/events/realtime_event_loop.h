@@ -104,6 +104,19 @@ class RealtimeEventLoop
     std::uint64_t wake_fallbacks{0};
   };
 
+  // What the loop's wake channel lost so far, safe to read from any thread
+  // once the run has started (the registry reporter samples it; RT-7):
+  // notifications this loop's senders failed to send for a reason other than
+  // a gone receiver (RTMSQueue::wake_failures(), summed over its senders),
+  // and Activity's stalled_arms and wake_fallbacks. Each should stay 0; a
+  // nonzero one means some reader waited for its backstop, or this loop
+  // drained on a poll tick, instead of on a publication.
+  struct WakeLoss {
+    std::uint64_t wake_failures{0};
+    std::uint64_t stalled_arms{0};
+    std::uint64_t wake_fallbacks{0};
+  };
+
   // The origin is fixed here rather than in run(), so that a program can build
   // its initial schedule out of monotonic_now() during setup and have replay
   // arrive at the same numbers.
@@ -126,7 +139,26 @@ class RealtimeEventLoop
     options_.delivery = delivery;
   }
   Delivery delivery() const { return options_.delivery; }
-  const Activity& activity() const { return activity_; }
+  Activity activity() const {
+    Activity counts = activity_;
+    counts.stalled_arms = stalled_arms_.load(std::memory_order_relaxed);
+    counts.wake_fallbacks = wake_fallbacks_.load(std::memory_order_relaxed);
+    return counts;
+  }
+  // Reads only atomics and the transports registration fixed, so another
+  // thread may call it while the loop runs; before the run, call it from the
+  // loop's thread.
+  WakeLoss wake_loss() const {
+    WakeLoss loss{
+        .stalled_arms = stalled_arms_.load(std::memory_order_relaxed),
+        .wake_fallbacks = wake_fallbacks_.load(std::memory_order_relaxed)};
+    for (const Transport& transport : transports_) {
+      if (transport.queue) {
+        loss.wake_failures += transport.queue->wake_failures();
+      }
+    }
+    return loss;
+  }
 
   // Watches `fd` for the run: whenever a wait returns with `fd` readable,
   // `on_readable` runs on the loop thread, outside any dispatch, before
@@ -337,7 +369,7 @@ class RealtimeEventLoop
       }
       prompt_watchers_.clear();
       options_.delivery = Delivery::POLL;
-      ++activity_.wake_fallbacks;
+      wake_fallbacks_.fetch_add(1, std::memory_order_relaxed);
       std::fprintf(stderr,
                    "talos: event loop cannot be woken on publish (%s); it "
                    "drains every %lld us instead\n",
@@ -396,7 +428,7 @@ class RealtimeEventLoop
       }
       if (transport.stalls == kMaxStalledArms) {
         ++transport.stalls;
-        ++activity_.stalled_arms;
+        stalled_arms_.fetch_add(1, std::memory_order_relaxed);
       }
     }
     const MonotonicTime now = Poller::now();
@@ -620,7 +652,11 @@ class RealtimeEventLoop
     std::function<void()> on_readable;
   };
   std::vector<FdWatch> fd_watches_;
+  // Activity's wakeups and drains; its stalled_arms and wake_fallbacks are
+  // the atomics below, which wake_loss() reads from another thread.
   Activity activity_;
+  std::atomic<std::uint64_t> stalled_arms_{0};
+  std::atomic<std::uint64_t> wake_fallbacks_{0};
   // The last drain left a backlog the run drains again at once (see
   // drain_messages).
   bool backlog_{false};

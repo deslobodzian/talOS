@@ -294,6 +294,16 @@ The `/sim/state` payload is pinned by `static_assert(sizeof(geometry::OdometrySa
 == 56)` in `simulation/sim_gateway.cc`; RTMS adds its 8 B publication timestamp.
 This truth topic is local to the main processor and never crosses hardware UDP.
 
+The live node registry ([talOS/introspection](../talOS/introspection/README.md))
+is one more segment, `/talos_registry.6` (the number is its layout version):
+a 64 B header and 32 `NodeRecord` rows of **11136 B**, alignment 64, for
+**356416 B**. A row holds its node's identity, 64 source records of 136 B,
+4 Target selection records of 524 B and, at its end, the wake counters
+(`wake_failures`, `stalled_arms`, `wake_fallbacks`, 3 × 8 B in what was tail
+padding). Every node writes its own row about four times a second; the
+launcher and `studio_bridge` read it. Both sizes are compile-time asserted in
+`registry.h`.
+
 ### Gateway clock accuracy
 
 For a bridge probe sent at t1, echoed gateway sample t2, and bridge t4 sampled

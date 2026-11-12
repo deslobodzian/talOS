@@ -412,7 +412,8 @@ RTMSQueue::RTMSQueue(RTMSQueue&& other) noexcept
       registered_{std::exchange(other.registered_, {})},
       wake_senders_{std::move(other.wake_senders_)},
       wakes_sent_{std::exchange(other.wakes_sent_, 0)},
-      wake_failures_{std::exchange(other.wake_failures_, 0)} {}
+      wake_failures_{
+          other.wake_failures_.exchange(0, std::memory_order_relaxed)} {}
 
 RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
   if (this != &other) {
@@ -432,7 +433,9 @@ RTMSQueue& RTMSQueue::operator=(RTMSQueue&& other) noexcept {
     registered_ = std::exchange(other.registered_, {});
     wake_senders_ = std::move(other.wake_senders_);
     wakes_sent_ = std::exchange(other.wakes_sent_, 0);
-    wake_failures_ = std::exchange(other.wake_failures_, 0);
+    wake_failures_.store(
+        other.wake_failures_.exchange(0, std::memory_order_relaxed),
+        std::memory_order_relaxed);
   }
   return *this;
 }
@@ -799,7 +802,7 @@ void RTMSQueue::notify_readers(std::uint64_t mask) {
     const talos::WakeStatus status = wake_senders_[i].send(wake_id);
     ++wakes_sent_;
     if (status.outcome == talos::WakeOutcome::FAILED) {
-      if (wake_failures_++ == 0) {
+      if (wake_failures_.fetch_add(1, std::memory_order_relaxed) == 0) {
         std::fprintf(stderr,
                      "talos: RTMS %s: a wake notification failed (%s); a "
                      "reader may wait for its backstop. Further failures on "

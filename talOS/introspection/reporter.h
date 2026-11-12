@@ -8,8 +8,9 @@
  * on would refuse to replay against a build with it off, and every node's
  * source ids would shift. Observability must not change the program being
  * observed. So this runs on its own thread and reads only the loop's atomics
- * -- its counters, and its recorder's capture state -- plus its manifest and
- * which watchers are latest-only, both immutable once the run has started.
+ * -- its counters, its wake loss and its recorder's capture state -- plus its
+ * manifest and which watchers are latest-only, both immutable once the run
+ * has started.
  *
  * The one exception is the row's dispatch count, the launcher's evidence that
  * the node is not stalled. The loop thread stores it at every dispatch
@@ -339,6 +340,14 @@ class Reporter {
                               events,
                               /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
                               /*max_latency_ns=*/0);
+    }
+
+    // What the loop's wake channel lost (RealtimeEventLoop::wake_loss); a
+    // simulated or replayed loop has no wake channel to lose.
+    if constexpr (requires { loop.wake_loss(); }) {
+      const auto loss = loop.wake_loss();
+      registration.set_wake_loss(loss.wake_failures, loss.stalled_arms,
+                                 loss.wake_fallbacks);
     }
 
     for (std::size_t i = 0; i < options_.selections.size(); ++i) {

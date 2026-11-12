@@ -118,6 +118,10 @@ when, it also drains between timers:
   receiver (no descriptor left, say) runs that run under `POLL` instead,
   says so once on stderr, and counts it in `activity().wake_fallbacks`
   (`RealtimeEventLoop.WithoutAWakeReceiverTheLoopFallsBackToPolling`).
+  `wake_loss()` returns both counts with the notifications its senders
+  failed to send (`RTMSQueue::wake_failures()`), from any thread once the
+  run has started; the node's registry row carries them
+  ([wake loss](../introspection/README.md#wake-loss)).
 
 The macOS wait also passes `kevent()` that coalesced relative timeout, as a
 backstop: XNU delivers every `EVFILT_TIMER` through one shared kernel worker
