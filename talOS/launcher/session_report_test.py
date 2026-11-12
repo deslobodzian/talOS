@@ -289,11 +289,19 @@ class SessionReportTest(unittest.TestCase):
                           "[launcher] 812 bytes of output dropped here: the "
                           "launcher's log writer fell behind\n"
                           "[launcher] arm: 4096 bytes of output dropped (marked in "
-                          "/robot/logs/7/arm.log)\n")
+                          "/robot/logs/7/arm.log)\n"
+                          "[launcher] 300 bytes for the launcher's stdout were not "
+                          "written: its reader fell behind\n"
+                          "[launcher] 9000 bytes for the launcher's stderr were not "
+                          "written, at most: the last 512 were in a write that may "
+                          "still deliver them; it did not drain within 1000 ms of "
+                          "the end\n")
             self.assertEqual(session_report.launcher_drops(directory, manifest),
                              ["812 bytes dropped from talos.log (the launcher's log "
                               "writer fell behind)",
-                              "4096 bytes dropped from arm.log"])
+                              "4096 bytes dropped from arm.log",
+                              "300 bytes dropped from the launcher's stdout",
+                              "up to 9000 bytes dropped from the launcher's stderr"])
 
     def test_missing_log_dump_is_an_input_error(self):
         with tempfile.TemporaryDirectory() as directory, \
