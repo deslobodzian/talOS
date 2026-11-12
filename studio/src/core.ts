@@ -36,7 +36,7 @@ export function poseValid(s: Snapshot|null|undefined): boolean {
 }
 
 // Telemetry removes the topic's leading slash and joins nested struct fields
-// with slashes (talOS/telemetry/node.h, ObserveDescribedTopic/FlattenStruct).
+// with slashes (talOS/telemetry/channels.h, FlattenTopic).
 // Missing or stale samples are absent from Snapshot.channels, not zero poses.
 export function simTruthPose(s: Snapshot|null|undefined): PlanarPose|null {
   if (!s) return null;
