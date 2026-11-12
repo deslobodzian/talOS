@@ -14,6 +14,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -31,6 +32,7 @@
 #include "talOS/launcher/file_digest.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/log_merge.h"
+#include "talOS/launcher/testdata/supervision_events.h"
 
 namespace talos::launcher {
 namespace {
@@ -39,6 +41,11 @@ std::string TempPath(std::string_view name) {
   return ::testing::TempDir() + "/talos_launcher_test_" +
          std::to_string(::getpid()) + "_" + std::string{name};
 }
+
+// A wait for an event gives up after this, and a session that ends on an
+// event sets it as its duration: it only bounds a hang (docs/TESTING.md
+// §6.3).
+constexpr std::chrono::seconds kHang{20};
 
 // A framework-owned fixture: the launcher's discovery logic is robot-agnostic,
 // so its tests must not read any particular robot's configuration.
@@ -445,7 +452,9 @@ std::string NodeDescribeThenSleep(
 // A failing bridge must not delay the session: the first attempt spawns with
 // the nodes and retries happen inside the supervision loop while the session
 // runs. The counter proves a retry fired; the elapsed bound proves nothing
-// blocked for the old ~60s startup wait.
+// blocked for the old ~60s startup wait. The test moves the supervision
+// clock one retry interval ahead once the first attempt has failed, and the
+// nodes exit once the second has.
 TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   const std::string tag = "bridge_nonblock";
   const std::string out_dir = TempPath(tag + "_out");
@@ -459,24 +468,44 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   options.simulation = true;
   options.start_studio_bridge = true;
   options.describe_timeout_ms = 4000;
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
       DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+  const auto until_retried = [&](std::string_view node, std::string_view target,
+                                 introspect::naming::SourceShape source) {
+    std::string script = NodeDescribeThenSleep(node, target, {source}, 0);
+    script.erase(script.rfind("exec sleep"));
+    return script + "tries=0\nwhile [ \"$(wc -l < '" + counter +
+           "' 2>/dev/null || echo 0)\" -lt 2 ] && [ $tries -lt 2000 ]; do\n"
+           "  tries=$((tries + 1))\n  sleep 0.01\ndone\nexit 0\n";
+  };
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
-                                            {Sender("/alpha/state")}, 3));
+      tag + "_alpha",
+      until_retried("alpha", "//example/alpha:node", Sender("/alpha/state")));
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
-                                           {Watcher("/alpha/state")}, 3));
+      tag + "_beta",
+      until_retried("beta", "//example/beta:node", Watcher("/alpha/state")));
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge",
                     BridgeDescribeThen("echo x >> " + counter + "\nexit 1\n"));
 
+  std::jthread advance{[&](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + kHang;
+    while (!stop.stop_requested() && ReadFile(counter).empty() &&
+           std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    clock.Advance(kStudioBridgeRetryInterval);
+  }};
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
   launcher.Run();
   const auto elapsed = std::chrono::steady_clock::now() - started;
+  advance.request_stop();
 
   EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
             20)
@@ -510,7 +539,7 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
   options.output_dir = root;
   options.session_id = 12345;
   options.simulation = true;
-  options.duration_s = 2;
+  options.duration_s = static_cast<int>(kHang.count());
   options.config_path = root + "/robot.toml";
   std::string config{kFixtureToml};
   config.insert(config.find("name ="), "log_max_bytes = 1200\n");
@@ -545,17 +574,30 @@ TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
       "if [ \"$runs\" -eq 2 ]; then\n"
       " dd if=/dev/zero of=\"$log\" bs=1 count=\"$cap\" 2>/dev/null\n"
       " exit 1\nfi\n"
-      "exec sleep 5\n";
+      "exec sleep 30\n";
   options.binary_overrides["//example/alpha:node"] =
       WriteStubNode("budget_alpha", script);
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
       "budget_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
-                                           {Watcher("/alpha/state")}, 5));
+                                           {Watcher("/alpha/state")}, 30));
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
-      "budget_hw", NodeDescribeThenSleep(
-                       "hardware_node", "//talOS/bridge:hardware_node", {}, 5));
+      "budget_hw",
+      NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node", {},
+                            30));
+  // Stopped (SIGTERM, as an operator) once the third run has its cap.
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    while (!stop.stop_requested()) {
+      const std::string caps = ReadFile(attempts);
+      if (std::count(caps.begin(), caps.end(), '\n') >= 3) {
+        ::kill(::getpid(), SIGTERM);
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+  }};
   Launcher launcher{options};
   launcher.Run();
+  stopper.request_stop();
   // The first restart gets alpha's rate-weighted share less the 100 bytes
   // its first run wrote. The second, with the share used up, gets half of
   // it: the first run's log is deleted (and marked capped) to make room,
@@ -590,7 +632,7 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   options.simulation = true;
   options.start_studio_bridge = true;
   options.describe_timeout_ms = 4000;
-  options.duration_s = 2;
+  options.duration_s = 1;
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
@@ -618,44 +660,105 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   std::filesystem::remove_all(out_dir);
 }
 
+// A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
+// at the stop's 2 s timeout, not before. The test holds the supervision
+// clock short of that timeout from before the stop until its peer has died
+// of the stop's SIGINT and a whole pass more has run, then moves it past
+// the timeout: alpha's run must end after that release.
 TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   const std::string tag = "ignore_interrupt";
   const std::string out_dir = TempPath(tag + "_out");
   std::filesystem::create_directories(out_dir);
+  const std::string trapped = TempPath(tag + "_trapped");
+  ::remove(trapped.c_str());
   LauncherOptions options;
   options.output_dir = out_dir;
   options.session_id = 0xDEAD2200ULL;
   options.simulation = true;
   options.describe_timeout_ms = 4000;
-  options.duration_s = 1;
+  options.duration_s = static_cast<int>(kHang.count());
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
-      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
+      NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node", {},
+                            30));
   auto stubborn = NodeDescribeThenSleep("alpha", "//example/alpha:node",
                                         {Sender("/alpha/state")}, 30);
-  stubborn.insert(stubborn.find("exec sleep"), "trap '' INT\n");
+  stubborn.insert(stubborn.find("exec sleep"),
+                  "trap '' INT\n: > '" + trapped + "'\n");
   const auto alpha = WriteStubNode(tag + "_alpha", stubborn);
   const auto beta = WriteStubNode(
       tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
                                            {Watcher("/alpha/state")}, 30));
   options.binary_overrides["//example/alpha:node"] = alpha;
   options.binary_overrides["//example/beta:node"] = beta;
+  const std::string live =
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json";
+  // `name`'s runs as `manifest` lists them.
+  const auto runs_of = [](const std::string& manifest, std::string_view name) {
+    const auto at = manifest.find("\"name\": \"" + std::string{name} + "\"");
+    if (at == std::string::npos) return std::string{};
+    const auto runs = manifest.find("\"runs\": [", at);
+    if (runs == std::string::npos) return std::string{};
+    return manifest.substr(runs, manifest.find(']', runs) - runs);
+  };
+  testing::SupervisionPasses passes;
+  int64_t released_ns = 0;  // Wall time the clock was let past the timeout.
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    const auto wait = [&](const std::function<bool()>& done) {
+      const auto give_up = std::chrono::steady_clock::now() + kHang;
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+      return !stop.stop_requested() && done();
+    };
+    if (!wait([&] { return std::filesystem::exists(trapped); })) return;
+    clock.Hold(std::chrono::seconds{1});
+    ::kill(::getpid(), SIGTERM);
+    if (!wait([&] {
+          return runs_of(ReadFile(live), "beta").find("\"reason\": \"stop\"") !=
+                 std::string::npos;
+        }))
+      return;
+    const uint64_t pass = passes.Started() + 2;
+    if (!wait([&] { return passes.Started() >= pass; })) return;
+    released_ns = WallClockNanos();
+    clock.Release();
+    clock.Advance(std::chrono::seconds{2});
+  }};
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
   EXPECT_EQ(launcher.Run(), -1);
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  EXPECT_GE(elapsed, std::chrono::seconds{3});
+  stopper.request_stop();
+  stopper.join();
   EXPECT_LT(elapsed, std::chrono::seconds{10});
+  ASSERT_NE(released_ns, 0) << "the stop's SIGINT ended no peer";
+  const auto run = runs_of(ReadFile(live), "alpha");
+  EXPECT_NE(run.find("\"exit_signal\": 9, \"reason\": \"stop_timeout\""),
+            std::string::npos)
+      << run;
+  const std::string end_key = "\"end_wall_ns\": ";
+  const auto end_at = run.find(end_key);
+  ASSERT_NE(end_at, std::string::npos) << run;
+  EXPECT_GE(std::stoll(run.substr(end_at + end_key.size())), released_ns)
+      << "alpha was killed before the stop timeout: " << run;
   std::filesystem::remove(alpha);
   std::filesystem::remove(beta);
   std::filesystem::remove_all(out_dir);
+  ::remove(trapped.c_str());
 }
 
 // A bridge that survives its grace second joins the session: it is not failed
 // and the session runs to the deadline with it. A session against the real
 // controller (no --sim) starts it too, so a deployed robot is viewable in
-// Studio (REQ-OPS-30).
+// Studio (REQ-OPS-30). Once the bridge has spawned, the test moves the
+// supervision clock past the 3 s deadline, a whole retry interval after the
+// spawn: the deadline's pass finds the bridge up that long, so stable.
 TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   const std::string tag = "bridge_stable";
   const std::string out_dir = TempPath(tag + "_out");
@@ -667,6 +770,10 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   options.start_studio_bridge = true;
   options.describe_timeout_ms = 4000;
   options.duration_s = 3;
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
   options.config_path = WriteFixtureToml();
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
@@ -679,18 +786,41 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
                                            {Watcher("/alpha/state")}, 30));
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge", BridgeDescribeThen("exec sleep 30\n"));
+  const std::string session =
+      out_dir + "/" + std::to_string(options.session_id);
+  // The bridge's first run in the running session's manifest: spawned.
+  const auto bridge_spawned = [](const std::string& manifest) {
+    const auto bridge = manifest.find("\"name\": \"studio_bridge\"");
+    const auto runs = manifest.find("\"runs\": [", bridge);
+    return bridge != std::string::npos && runs != std::string::npos &&
+           manifest.find("\n  \"end_wall_ns\": 0,") != std::string::npos &&
+           manifest.find("{\"pid\": ", runs) < manifest.find(']', runs) &&
+           manifest.find("{\"pid\": -1", runs) > manifest.find(']', runs);
+  };
+  bool advanced = false;
+  std::jthread advance{[&](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + kHang;
+    while (!stop.stop_requested() &&
+           !bridge_spawned(ReadFile(session + "/manifest.json"))) {
+      if (std::chrono::steady_clock::now() >= give_up) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    }
+    if (stop.stop_requested()) return;
+    advanced = true;
+    clock.Advance(std::chrono::seconds{options.duration_s});
+  }};
 
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
   launcher.Run();
   const auto elapsed = std::chrono::steady_clock::now() - started;
-  const auto elapsed_s =
-      std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+  advance.request_stop();
+  advance.join();
 
-  EXPECT_GE(elapsed_s, 2) << "session must run to the deadline with Studio";
-  EXPECT_LT(elapsed_s, 20) << "session must end at the deadline";
-  const std::string session =
-      out_dir + "/" + std::to_string(options.session_id);
+  EXPECT_TRUE(advanced) << "the bridge never spawned";
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
+            20)
+      << "session must end at the deadline";
   ASSERT_TRUE(std::filesystem::exists(session + "/manifest.json"));
   const std::string manifest = ReadFile(session + "/manifest.json");
   EXPECT_NE(manifest.find("\"simulation\": false"), std::string::npos)
@@ -1097,31 +1227,34 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
             10);
 }
 
-// The roster is probed in parallel: three binaries that each take two
-// seconds to answer cost the launch about two seconds, not six.
+// The roster is probed in parallel: each of three probes answers only once
+// all three have started, so a launcher that probed one at a time would see
+// its first probe miss the describe deadline.
 TEST(LauncherGraphTest, ProbesRunInParallel) {
-  if (std::thread::hardware_concurrency() < 3)
-    GTEST_SKIP() << "fewer than three hardware threads";
-  const auto slow = [](std::string_view node, std::string_view target) {
+  const std::string started = TempPath("parallel_started");
+  std::filesystem::remove_all(started);
+  std::filesystem::create_directories(started);
+  const auto together = [&](std::string_view node, std::string_view target) {
     const std::string stub = DescribingStub(node, target, {});
     const std::string shebang = "#!/bin/sh\n";
-    return shebang + "sleep 2\n" + stub.substr(shebang.size());
+    return shebang + ": > '" + started + "/" + std::string{node} +
+           "'\nwhile [ \"$(ls '" + started +
+           "' | wc -l)\" -lt 3 ]; do sleep 0.01; done\n" +
+           stub.substr(shebang.size());
   };
-  GraphFixture fixture{"parallel", slow("alpha", "//example/alpha:node"),
-                       slow("beta", "//example/beta:node")};
+  GraphFixture fixture{"parallel", together("alpha", "//example/alpha:node"),
+                       together("beta", "//example/beta:node")};
   fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
       WriteStubNode("parallel_hardware",
-                    slow("hardware_node", "//talOS/bridge:hardware_node"));
+                    together("hardware_node", "//talOS/bridge:hardware_node"));
   const auto specs = DiscoverNodes(
       config::ParseRobotConfig(fixture.options.config_path), fixture.options);
   ASSERT_EQ(specs.size(), 3u);
   std::vector<NodeDescription> described;
-  const auto started = std::chrono::steady_clock::now();
   DescribeGraph(specs, fixture.options, described);
-  const auto elapsed = std::chrono::steady_clock::now() - started;
   for (const auto& node : described)
     EXPECT_TRUE(node.answered) << node.roster_name << ": " << node.error;
-  EXPECT_LT(elapsed, std::chrono::milliseconds{4500});
+  std::filesystem::remove_all(started);
 }
 
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
