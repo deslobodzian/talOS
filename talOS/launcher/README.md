@@ -874,8 +874,9 @@ cannot read or remove (another user's, unreadable, removed meanwhile) is
 reported and passed over; it never stops a launch.
 
 Sizing: the new session's event logs stay within half of `log_max_bytes`,
-but its members' output logs (`<name>.log`, [node output](#node-output), up
-to 64 MiB each), its camera frames (each camera's `[recording] max_bytes`)
+but its members' output logs (`<name>.log`) and the launcher's
+`talos.log` ([node output](#node-output), up to 64 MiB each), its camera
+frames (each camera's `[recording] max_bytes`)
 and its metadata are outside the event-writer caps. Older unprotected
 sessions, everything counted, stay within the other half. The 16 protected
 sessions are bounded only by their number, each up to one session's size.
