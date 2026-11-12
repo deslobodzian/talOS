@@ -569,8 +569,10 @@ the same methods (`Sim.from_toml`, `sim.step(seconds)`,
 `sim.publish(M, topic, **fields)`, `sim.latest(M, topic)`,
 `sim.publish_target(M, sub, source, **fields)`, `sim.release_target(M, sub,
 source)`, `sim.latest_target(M, sub, source)`, `hw.set_driver_station(enabled=True,
-teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). See
-`2026-robot/main_processor/intake/node_test.py`.
+teleop=True)`, `hw.stop_driver_station()`, `sim.latest_bytes(topic)`). The
+Sim clock is `sim.now_ns`, integer nanoseconds equal to each node's
+`now_ns` (use it to compare times and build message times), and `sim.now`,
+float seconds. See `2026-robot/main_processor/intake/node_test.py`.
 
 ## Adding a pose estimator
 

@@ -121,8 +121,8 @@ class Clock:
 
 
 class TwoNodesTest(unittest.TestCase):
-    # REQ-CONTRACT-14: Python reads the node clock as integer nanoseconds,
-    # as a C++ node does with node.now().nanos().
+    # REQ-CONTRACT-14: Python reads the node clock, and a test the Sim
+    # clock, as integer nanoseconds, as C++ does with now().nanos().
     def test_now_ns_is_the_exact_node_clock(self):
         sim = Sim.from_toml(ROBOT_TOML)
         clock = sim.add(Clock, "planner")
@@ -132,6 +132,7 @@ class TwoNodesTest(unittest.TestCase):
         sim.step(378_605.124704419)
         expected = 4_378_605_124_704_419
         self.assertEqual(clock.node.now_ns, expected)
+        self.assertEqual(sim.now_ns, expected)
         self.assertNotEqual(round(clock.node.now * 1e9), expected)
 
     def test_python_nodes_talk_over_a_topic(self):
