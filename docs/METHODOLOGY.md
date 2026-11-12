@@ -248,7 +248,9 @@ Rules:
 ## 9. Time, determinism, restart
 
 - Use `node.now()` only. Never `steady_clock`, `time.time()` or sleeps. This is
-  what makes `Sim` and replay match the robot. **[review]**
+  what makes `Sim` and replay match the robot. **[enforced:
+  `tools/lint_test_time.py` over the node packages under the robot, example,
+  bench and scaffold directories; review for framework nodes]**
 - Estimators integrate on measurement sample times (`sample_time_ns`), never
   on arrival or publish time, and call wpimath's time-taking entry points
   (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
