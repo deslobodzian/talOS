@@ -353,8 +353,11 @@ The schema block carries each manifest entry's topic schema
 (`talOS/schema/identity.h`): its name and embedded `.bfbs` reflection schema
 bytes. Stored payloads omit trailing zero bytes; readers restore the declared
 payload size with zero padding. Complete records before a truncated final
-record remain readable. A record whose magic, lengths or checksum are wrong is
-skipped: the reader scans to the next record magic whose header and checksum
+record remain readable. A record whose magic, lengths or checksum are wrong,
+or whose payload is larger than its source allows (a MESSAGE or SEND its
+topic's declared message size; any other record the larger of 64 KiB and the
+manifest's largest message; never more than `kMaxRecordPayloadBytes`, 1 MiB),
+is skipped: the reader scans to the next record magic whose header and checksum
 validate, and counts what it skipped (`LogReader::damage()`), so one damaged
 record, or a garbage or zero-filled tail left by a power loss, costs only
 itself. `--replay-inputs` replays the intact records and warns with the file

@@ -997,6 +997,107 @@ TEST(LogCorruption, ScanSkipsAnIntactRecordFromAnotherLog) {
   ::unlink(other.c_str());
 }
 
+// Appends a record whose header checksum is right, as anyone who crafts a
+// log (or a writer that went wrong) can compute it.
+void AppendRecord(const std::string& path, RecordHeader header,
+                  std::span<const std::byte> stored) {
+  header.magic = RECORD_MAGIC;
+  header.stored_bytes = static_cast<std::uint32_t>(stored.size());
+  header.crc32 = 0;
+  header.crc32 =
+      crc32(stored,
+            crc32(std::span<const std::byte>{
+                reinterpret_cast<const std::byte*>(&header), sizeof(header)}));
+  std::ofstream out{path, std::ios::binary | std::ios::app};
+  out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+  out.write(reinterpret_cast<const char*>(stored.data()),
+            static_cast<std::streamsize>(stored.size()));
+}
+
+// A log from a USB stick may be crafted. A record claiming 4 GiB of zero
+// padding (stored_bytes 0), with a checksum its author computed, is damage
+// whatever its source -- a topic, a timer or an id the manifest does not
+// list -- so no reader allocates what it claims.
+// REQ-OPS-41
+TEST(LogCorruption, RecordClaimingGigabytesIsDamage) {
+  const std::string path = TempPath("huge_claim");
+  for (const std::uint16_t source_id : {1, 0, 7}) {
+    SCOPED_TRACE(source_id);
+    const std::vector<ExpectedRecord> expected =
+        WriteFixture(path, LogWriter::kDefaultBufferBytes);
+    const std::size_t intact = FileSize(path);
+    RecordHeader huge{};
+    huge.kind = static_cast<std::uint16_t>(EventKind::MESSAGE);
+    huge.source_id = source_id;
+    huge.dispatch_index = 51;
+    huge.now_ns = 60'000;
+    huge.payload_bytes = 0xFFFF'FFFFu;
+    AppendRecord(path, huge, {});
+
+    LogReader reader{path};
+    LogReader::Record record;
+    std::size_t count = 0;
+    while (reader.next(record)) ++count;
+    EXPECT_EQ(count, expected.size());
+    EXPECT_EQ(reader.damage().tail_offset, intact);
+    EXPECT_EQ(reader.damage().tail_bytes, sizeof(RecordHeader));
+
+    const LogSummary summary = SummarizeLog(path);
+    EXPECT_EQ(summary.record_count, expected.size());
+    EXPECT_EQ(summary.damage.tail_bytes, sizeof(RecordHeader));
+  }
+  ::unlink(path.c_str());
+}
+
+// A topic's records carry that topic's message: one claiming more than its
+// source declares is damage, skipped like any other, and the record after
+// it still reads.
+// REQ-OPS-41
+TEST(LogCorruption, RecordLargerThanItsSourceIsDamage) {
+  const std::string path = TempPath("oversized_for_source");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  const std::size_t bad_offset = FileSize(path);
+  RecordHeader header{};
+  header.kind = static_cast<std::uint16_t>(EventKind::SEND);
+  header.source_id = 2;  // the sender: 32-byte messages
+  header.dispatch_index = 51;
+  header.now_ns = 60'000;
+  header.payload_bytes = 33;
+  const std::vector<std::byte> oversized = MakePayload(33, 5);
+  AppendRecord(path, header, oversized);
+  header.dispatch_index = 52;
+  header.payload_bytes = 32;
+  AppendRecord(path, header, MakePayload(32, 6));
+
+  for (const bool windowed : {false, true}) {
+    SCOPED_TRACE(windowed);
+    std::vector<std::uint64_t> dispatches;
+    LogDamage damage;
+    if (windowed) {
+      WindowedLogReader reader{path};
+      LogReader::Record record;
+      while (reader.next(record)) {
+        dispatches.push_back(record.header.dispatch_index);
+      }
+      damage = reader.damage();
+    } else {
+      LogReader reader{path};
+      LogReader::Record record;
+      while (reader.next(record)) {
+        dispatches.push_back(record.header.dispatch_index);
+      }
+      damage = reader.damage();
+    }
+    ASSERT_EQ(dispatches.size(), expected.size() + 1);
+    EXPECT_EQ(dispatches.back(), 52u);
+    EXPECT_EQ(damage.spans, 1u);
+    EXPECT_EQ(damage.first_offset, bad_offset);
+    EXPECT_EQ(damage.skipped_bytes, sizeof(RecordHeader) + oversized.size());
+  }
+  ::unlink(path.c_str());
+}
+
 // SummarizeLog agrees with LogReader read to its end, on a whole log, a
 // truncated one, a damaged one, and the corruptions LogReader rejects.
 TEST(LogSummary, MatchesTheReaderAndRejectsTheSameCorruption) {
