@@ -73,23 +73,18 @@
 
 namespace talos::hardware::sim {
 
-// One reusable motor/mechanism model.
-enum class MotorType : uint8_t {
-  kKrakenX60 = 0,
-  kKrakenX44,
-  kFalcon500,
-  kGeneric
-};
-
 // Load reflected onto the rotor shaft. Roller/flywheel first; arm/elevator
 // gravity loads are future work.
 enum class LoadKind : uint8_t { kRoller = 0, kFlywheel };
 
+// One reusable motor/mechanism model.
 struct MotorModel {
-  MotorType type{MotorType::kKrakenX60};
   // Rotor free speed at 12 V. Kraken X60 default; matches the PhoenixBackend
   // desktop model so both sims agree on unloaded speed.
   double free_speed_rps_at_12v{100.0};
+  // Stall current at 12 V, which sets the winding resistance,
+  // R = 12 V / stall current.
+  double stall_current_a_at_12v{366.0};
   // First-order lag at nominal_inertia_kg_m2.
   double time_constant_s{0.02};
   double nominal_inertia_kg_m2{0.002};
@@ -99,6 +94,30 @@ struct MotorModel {
   // below this. Kept at 0 by default so small signals stay observable.
   double static_friction_v{0.0};
 };
+
+// The published 12 V free speed and stall current of each motor type
+// (manufacturer data, as tabulated by ReCalc, reca.lc): Kraken X60 6000 rpm
+// and 366 A, Kraken X44 7530 rpm and 275 A, Falcon 500 6380 rpm and 257 A.
+// Free current (1.5-2 A) is neglected: back-EMF at free speed is taken as
+// the full 12 V.
+inline MotorModel MotorModelFor(MotorType type) {
+  MotorModel model;
+  switch (type) {
+    case MotorType::kKrakenX60:
+      model.free_speed_rps_at_12v = 6000.0 / 60.0;
+      model.stall_current_a_at_12v = 366.0;
+      break;
+    case MotorType::kKrakenX44:
+      model.free_speed_rps_at_12v = 7530.0 / 60.0;
+      model.stall_current_a_at_12v = 275.0;
+      break;
+    case MotorType::kFalcon500:
+      model.free_speed_rps_at_12v = 6380.0 / 60.0;
+      model.stall_current_a_at_12v = 257.0;
+      break;
+  }
+  return model;
+}
 
 struct MechanismModel {
   // Rotor revolutions per mechanism revolution, normally
@@ -346,13 +365,14 @@ class PhysicsSimBackend final : public Backend {
       out.position_rot = mech_pos;
       out.velocity_rps = mech_vel;
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
-      out.stator_current_a = StatorCurrent(i, m);
       // Placeholder supply current proportional to effort and constant
       // ambient temperature; not electrical or thermal models.
       out.supply_current_a = std::abs(out.voltage) / 12.0 * m.supply_limit_a;
       out.temperature_c = 25.0;
       out.fault_flags = HardLimitFlags(i);
       EnforceSoftLimits(m, out, i);
+      // After the limit stops the rotor: a motor held at it is stalled.
+      out.stator_current_a = StatorCurrent(i, m);
       held_[i] = out;
       held_at_us_[i] = state.sample_time_us;
     }
@@ -774,23 +794,22 @@ class PhysicsSimBackend final : public Backend {
     return flags;
   }
 
-  // Stator current from the winding's net voltage: the applied volts less
-  // the back-EMF of the rotor's speed (supply volts at the motor's free
-  // speed), scaled so a stalled rotor at 12 V draws stator_limit_a and
-  // clamped to it. It peaks at stall and falls toward 0 at free speed, so a
-  // mechanism pushed against a stop reads loaded and one spinning freely
-  // does not. 0 while unpowered (no braking current is modelled).
+  // Stator current from the winding model: the applied volts less the
+  // back-EMF of the rotor's speed (12 V at the motor type's 12 V free speed),
+  // over the winding resistance (12 V over its stall current), clamped to
+  // stator_limit_a as the TalonFX's limiter reports it. It peaks at stall and
+  // falls toward 0 at free speed, so a mechanism pushed against a stop reads
+  // loaded (a 1 V push on a Kraken X60 draws about 30 A) and one spinning
+  // freely does not. 0 while unpowered (no braking current is modelled).
+  // The limit is not fed back into the rotor dynamics.
   double StatorCurrent(std::size_t i, const MotorConfig& m) const {
     if (!powered_[i]) return 0.0;
-    const MotorModel motor{};
-    const double supply = supply_v_ > 0.0 ? supply_v_ : 12.0;
-    const double free_rotor = motor.free_speed_rps_at_12v * (supply / 12.0);
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
     const double back_emf_v =
-        free_rotor > 0.0 ? supply * axes_[i].rotor_velocity_rps / free_rotor
-                         : 0.0;
+        12.0 * axes_[i].rotor_velocity_rps / motor.free_speed_rps_at_12v;
     const double net_v = Direction(i) * applied_volts_[i] - back_emf_v;
-    return std::min(m.stator_limit_a,
-                    std::abs(net_v) / 12.0 * m.stator_limit_a);
+    const double resistance_ohm = 12.0 / motor.stall_current_a_at_12v;
+    return std::min(m.stator_limit_a, std::abs(net_v) / resistance_ohm);
   }
 
   bool FeedbackValid(std::size_t i) const {
@@ -869,7 +888,7 @@ class PhysicsSimBackend final : public Backend {
     }
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
-      MotorModel motor;
+      const MotorModel motor = MotorModelFor(m.motor_type.value);
       MechanismModel mech;
       mech.gear_ratio = Gear(i);
       mech.brake = m.brake;

@@ -242,26 +242,53 @@ TEST(SimHealth, PowerVisibleWhileDisabledAndStale) {
   CheckPowerHealth<PhysicsSimBackend>();
 }
 
-// Stator current follows the winding's net voltage: a rotor that has not yet
-// moved draws the most (a mechanism pushed against a stop reads loaded),
-// and one near free speed for its voltage draws almost none.
-TEST(SimMotorDiagnostics, StatorCurrentPeaksAtStallAndFallsWithSpeed) {
+// Stator current is the winding model, (applied volts - back-EMF) / R with
+// R = 12 V / the motor type's stall current, clamped to stator_limit_a: a
+// stalled rotor draws stall_current / 12 per volt (a 1 V homing push into a
+// stop reads loaded), one at its free speed for the applied volts draws
+// none, and 12 V at half the 12 V free speed draws half the stall current.
+TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
+  struct Case {
+    MotorType type;
+    double stall_a;
+  };
+  for (const Case c :
+       {Case{MotorType::kKrakenX60, 366.0}, Case{MotorType::kKrakenX44, 275.0},
+        Case{MotorType::kFalcon500, 257.0}}) {
+    SCOPED_TRACE(c.stall_a);
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].stator_limit_a = 1000.0;  // above stall: unclamped
+    cfg.motors[0].motor_type.value = c.type;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 1.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    State s{};
+    s.motor_count = 1;
+    uint64_t now_us = 0;
+    StepBackend(backend, s, now_us, 5000, 1);  // the first Read: at rest
+    EXPECT_NEAR(s.motors[0].stator_current_a, c.stall_a / 12.0, 1e-9);
+    command[0].demand = 6.0;
+    ASSERT_TRUE(backend.Apply(command));
+    StepBackend(backend, s, now_us, 5000, 400);  // 2 s: free speed for 6 V
+    EXPECT_NEAR(s.motors[0].stator_current_a, 0.0, 0.01 * c.stall_a);
+    command[0].demand = 12.0;
+    ASSERT_TRUE(backend.Apply(command));
+    StepBackend(backend, s, now_us, 1, 1);  // 1 us later: still that speed
+    EXPECT_NEAR(s.motors[0].stator_current_a, c.stall_a / 2.0,
+                0.01 * c.stall_a);
+  }
   auto cfg = SingleMotorConfig();
   cfg.motors[0].stator_limit_a = 80.0;
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(cfg));
-  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 6.0, 0.0}}};
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
   ASSERT_TRUE(backend.Apply(command));
   State s{};
   s.motor_count = 1;
   uint64_t now_us = 0;
-  // One 5 ms step from rest: barely moving, near the 40 A of 6 V at stall.
-  StepBackend(backend, s, now_us, 5000, 2);
-  EXPECT_GT(s.motors[0].stator_current_a, 24.0);
-  EXPECT_LE(s.motors[0].stator_current_a, 40.0);
-  StepBackend(backend, s, now_us, 5000, 400);  // 2 s: near free speed
-  EXPECT_LT(s.motors[0].stator_current_a, 4.0);
-  EXPECT_GT(s.motors[0].velocity_rps, 0.0);
+  StepBackend(backend, s, now_us, 5000, 1);
+  EXPECT_DOUBLE_EQ(s.motors[0].stator_current_a, 80.0);
 }
 
 // Voltage ramps the mechanism rather than snapping it to demand; position
