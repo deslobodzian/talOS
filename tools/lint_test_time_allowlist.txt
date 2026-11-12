@@ -36,6 +36,7 @@ talOS/hardware/gateway_test.cc sleep seeded: a UDP wait helper in a component ta
 talOS/introspection/registry_test.cc clock seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
 talOS/introspection/registry_test.cc sleep seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
 talOS/launcher/continuity_test.cc sleep seeded: integration, spawned processes; sleeps unaudited against TESTING.md §6.3
+talOS/launcher/launcher_death_test.cc clock integration: deadlines of waits on a spawned launcher's processes, and the measured kill latency
 talOS/launcher/launcher_test.cc clock seeded: integration, spawned processes and their deadlines
 talOS/launcher/launcher_test.cc sleep seeded: integration, spawned processes and their deadlines
 talOS/launcher/log_budget_test.cc clock seeded: integration, paces a real writer process
