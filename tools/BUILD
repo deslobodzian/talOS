@@ -129,3 +129,17 @@ py_test(
     legacy_create_init = False,
     main = "check_links_test.py",
 )
+
+# python3 tools/trace.py --check (CI: the lint job)
+# Every SAFE, CONTRACT and P0 requirement has a tagged test or a cited
+# verification; gaps are listed with their TODO item in trace_waivers.txt.
+py_test(
+    name = "trace_test",
+    size = "small",
+    srcs = [
+        "trace.py",
+        "trace_test.py",
+    ],
+    legacy_create_init = False,
+    main = "trace_test.py",
+)
