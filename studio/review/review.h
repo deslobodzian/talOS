@@ -6,7 +6,8 @@
 //
 //   GET /review/sessions.json
 //       [{"id","start_wall_ns","end_wall_ns","class","files":[{"path","bytes"}]}]
-//       newest first; class is match, other or unknown (RecordedMatch)
+//       newest first; class is match, other or unknown (RecordedMatch,
+//       read-only: nothing is ever written into the library)
 //   GET /review/<id>/channels.json
 //       the bridge's /channels.json document ("alert" comes with slice S3a)
 //   GET /review/<id>/bounds.json       {"start_ns","end_ns","origin_wall_ns"}
@@ -75,7 +76,7 @@ class Review {
   // set to the response for an unknown id or a session that cannot be read.
   const Session* Open(std::string_view id, Response& error);
 
-  Response Sessions() const;
+  Response Sessions();
   Response Channels(const Session& session) const;
   Response Bounds(const Session& session) const;
   Response Snapshot(const Session& session, std::string_view query);
@@ -86,6 +87,8 @@ class Review {
   SeriesCache cache_;
   ReadStats last_read_;
   std::map<std::string, std::unique_ptr<Session>, std::less<>> sessions_;
+  // Per session id: its files' total bytes when classified, and the class.
+  std::map<std::string, std::pair<std::uintmax_t, std::string_view>> classes_;
 };
 
 }  // namespace studio::review

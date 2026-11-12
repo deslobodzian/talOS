@@ -175,6 +175,12 @@ Their shapes are in [`review/review.h`](review/review.h); anything else is
 404. A session id is one directory name of the library; a parent, hidden or
 symlinked one is refused.
 
+The server never writes into the library, which may be a read-only copy: a
+session's class (`match`, `other`, `unknown`) is the launcher's
+`session_class` file when that is current, else read from its logs and
+remembered by the server until the session's files change size, never
+written back.
+
 Values are what `log_dump --format jsonl` decodes from the same records,
 named as live telemetry names them (`talOS/telemetry:channels`): each
 talos_messages struct by field path, a target lane's envelope as

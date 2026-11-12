@@ -508,5 +508,69 @@ TEST_F(ReviewTest, ResponsesEqualTheGoldenFiles) {
   }
 }
 
+// One file's name, size and modification time.
+using Listing =
+    std::map<std::string,
+             std::pair<std::uintmax_t, std::filesystem::file_time_type>>;
+Listing List(const std::filesystem::path& root) {
+  Listing listing;
+  for (const auto& entry :
+       std::filesystem::recursive_directory_iterator{root}) {
+    listing[entry.path().string()] = {
+        entry.is_regular_file() ? entry.file_size() : 0,
+        entry.last_write_time()};
+  }
+  return listing;
+}
+
+// Guards that review never writes into the library it reads: a library may
+// be a read-only copy, and classifying a session is the launcher's
+// retention's business. A non-simulation session (whose class is read from
+// its logs) is served by every endpoint and its files are unchanged, no
+// session_class added; then, with every mode bit made read-only, every
+// endpoint still answers.
+// REQ-OPS-41
+TEST_F(ReviewTest, LibraryIsNeverWritten) {
+  const std::filesystem::path library = Directory() + "/read_only";
+  testing::WriteFixtureSession((library / "s1").string());
+  std::string manifest = ReadFile(library / "s1/manifest.json");
+  const auto at = manifest.find("\"simulation\": true");
+  ASSERT_NE(at, std::string::npos);
+  manifest.replace(at, 18, "\"simulation\": false");
+  std::ofstream{library / "s1/manifest.json"} << manifest;
+
+  const auto every_endpoint = [&library] {
+    Review review{library, 1u << 20};
+    for (const auto& [file, request] : GoldenRequests()) {
+      SCOPED_TRACE(file);
+      const Response response = review.Get(request.first, request.second);
+      EXPECT_EQ(response.status, 200) << response.body;
+    }
+    const json sessions =
+        json::parse(review.Get("/review/sessions.json", "").body);
+    ASSERT_EQ(sessions.size(), 1u);
+    EXPECT_EQ(sessions[0]["class"], "other");
+  };
+  const Listing before = List(library);
+  every_endpoint();
+  EXPECT_EQ(List(library), before);
+  EXPECT_FALSE(std::filesystem::exists(library / "s1/session_class"));
+
+  using std::filesystem::perms;
+  const auto read_only = [&library](perms dir, perms file) {
+    for (const auto& entry :
+         std::filesystem::recursive_directory_iterator{library}) {
+      std::filesystem::permissions(entry.path(),
+                                   entry.is_directory() ? dir : file);
+    }
+    std::filesystem::permissions(library, dir);
+  };
+  read_only(perms::owner_read | perms::owner_exec, perms::owner_read);
+  every_endpoint();
+  read_only(perms::owner_all, perms::owner_read | perms::owner_write);
+  EXPECT_EQ(List(library), before);
+  std::filesystem::remove_all(library);
+}
+
 }  // namespace
 }  // namespace studio::review
