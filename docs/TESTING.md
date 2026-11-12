@@ -69,11 +69,18 @@ A test that guards a requirement carries its ID in a comment on the line
 above it: `// REQ-SAFE-09` (C++), `# REQ-SAFE-09` (Python),
 `// REQ-SAFE-09` (TypeScript). The `REQ-` prefix keeps catalogue IDs apart
 from TODO.md item IDs (`REQ-RT-01` is not `RT-1`). The catalogue never lists
-test names; the tags are the link.
+test names; the tags are the link. A tag line starts with its first ID
+(`// REQ-SAFE-01, REQ-SAFE-02: why` tags both; a line of a Python docstring
+counts too); an ID later in a sentence is prose, not a tag.
 
 - Every SAFE and CONTRACT requirement has a tagged test at its cheapest tier
   or below, or names the bench procedure ([BENCH.md](BENCH.md)) or open
-  TODO.md item that verifies it. **[gap: TRACE-1]**
+  TODO.md item that verifies it. **[enforced: `tools/trace.py --check`
+  (CI lint job) for a tagged test or a cited bench section or open TODO.md
+  item; known gaps are listed with their TODO item in
+  `tools/trace_waivers.txt`, which only shrinks; gap: LANE-1 for the tier,
+  which nothing in the tree records yet]** `python3 tools/trace.py --report`
+  prints each requirement's tests.
 - Most SAFE requirements are provable in process on a deterministic clock
   (the catalogue's last column), so the safety case rests on unit and
   component tests. e2e and soak are **composition evidence**: they do not
@@ -286,6 +293,8 @@ the host can run it. It is never noise.
    date at most **14 days** out. On that date it is fixed or deleted. A
    quarantined test that guards a SAFE requirement leaves that requirement
    unverified until it returns.
+   **[enforced: `tools/trace.py --check` finds the TODO.md item by the
+   target's label and takes its latest date as the expiry]**
 4. **Never widen a bound a requirement states** (the owner timeout, the
    stall floor). If the bound cannot hold on a
    host, the host is unqualified for that test (§6.7).

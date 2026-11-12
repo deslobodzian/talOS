@@ -125,7 +125,8 @@ Every line is something an agent must keep true, so scope is managed, not
 accumulated.
 
 1. **Every package and optional feature names the requirement it serves** in
-   REQUIREMENTS.md's package scope table. **[gap: TRACE-1]**
+   REQUIREMENTS.md's package scope table. **[enforced: `tools/trace.py
+   --check`, for every Bazel package]**
 2. A package or feature with no requirement gets one of three states, chosen
    by the user:
    - **adopted:** a requirement is written for it;
@@ -173,6 +174,7 @@ Automated checks that keep the architecture honest.
 | `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies"; its allowlist only shrinks |
 | `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
+| `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |
 | `check_runfiles_collisions.py`, read-only sources and "checkout unchanged" in CI | the build never writes the source tree |
 | `clang-format-18`, `clang-tidy-18`, `buildifier` on changed files | style and bug-prone patterns |
 | `input_replay_test`, `replay_inputs_test`, the `*Binary` replay cases | a node is a function of its inputs and their times |

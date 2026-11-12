@@ -617,6 +617,12 @@ jobs:
       if: ${{ !cancelled() }}
       run: python3 tools/check_links.py
 
+    - name: Every SAFE, CONTRACT and P0 requirement has a tagged test
+      # docs/TESTING.md §3, docs/DESIGN.md §6; known gaps with their TODO
+      # item in tools/trace_waivers.txt, which may only shrink.
+      if: ${{ !cancelled() }}
+      run: python3 tools/trace.py --check
+
   gate:
     name: CI gate
     # The one check to require: it fails unless every job above succeeded.
