@@ -36,11 +36,37 @@ def connect(port, stalled=False):
 
 
 # Frames every reader receives before the probe ends. The non-reading client
-# takes its turns beside them until its send buffer (16 KiB at four clients,
-# telemetry.h ClientSendBuffer) is full, about 11 updates in; 20 leave at least
-# nine in which the bridge holds it, before the wait for the next graph
-# refresh adds more.
+# takes its turns beside them until it backs up: at the latest once every
+# reader has FILL_AT frames, when it pings to fill its window (fill_window);
+# the other ten, and those the wait for the next graph refresh adds, are
+# sent while the bridge holds it.
 SERVED_FRAMES = 20
+FILL_AT = 10
+
+# A server's pong (RFC 6455 section 5.5.3).
+PONG = 0x8A
+
+
+def fill_window(sock):
+    """Makes the bridge back up on a client that stopped reading.
+
+    The bridge sees a client backed up once the kernel takes no more for it:
+    its own send buffer (telemetry.h ClientSendBuffer, 16 KiB at four
+    clients, which Linux doubles) and the client's receive window are full.
+    Linux honours the client's 1 KiB SO_RCVBUF, so that is about 11 updates
+    in. macOS keeps a loopback window of about 20 segments of its 16 KiB
+    MSS, about 320 KiB however small a buffer the client asks for, which at
+    the client's 40 kB/s share takes eight seconds. So the client pings, and
+    the bridge's WebSocket answers every ping with a pong (uWS, outside the
+    budget) until the window and send buffer are full and output is
+    buffered: the state a client that stopped reading long ago is in.
+    """
+    payload = b"p" * 125  # the largest control frame payload
+    # A client masks its frames; a zero key leaves the payload as it is.
+    ping = bytes([0x89, 0x80 | len(payload)]) + bytes(4) + payload
+    window = sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    pongs = (window + 4 * 16 * 1024) // (2 + len(payload)) + 1
+    sock.sendall(ping * pongs)
 
 # Vtable offsets of Frame's sequence_id and timestamp_ns (talOS/telemetry/telemetry.fbs).
 SEQUENCE, TIMESTAMP = 6, 8
@@ -65,7 +91,7 @@ def frames_in(buffer):
     """Removes and yields each whole WebSocket frame at the front of `buffer`."""
     while len(buffer) >= 2:
         first, length = buffer[0], buffer[1]
-        assert first in (TEXT, BINARY), first
+        assert first in (TEXT, BINARY, PONG), first
         # A server never masks its frames (RFC 6455 section 5.1).
         assert not length & 0x80, "server frame is masked"
         header, length = 2, length & 127
@@ -84,13 +110,14 @@ def frames_in(buffer):
         yield first, payload, header + length
 
 
-def read_all(sockets, stop, served, end):
+def read_all(sockets, stop, served, end, filling=None):
     """Drains every reader's socket on one thread until `stop` is readable.
 
     One thread reads whichever socket has bytes, so no reader falls behind
     because another reader's thread was scheduled first. Returns, per
     reader, what arrived in order: ("binary", sequence) for each telemetry
     update after the dictionary page, ("text", None) for each graph message.
+    Sets `filling`, if given, once every reader has FILL_AT frames.
     """
     selector = selectors.DefaultSelector()
     selector.register(stop, selectors.EVENT_READ)
@@ -123,6 +150,8 @@ def read_all(sockets, stop, served, end):
                         (time.clock_gettime_ns(STEADY_CLOCK) - field(payload, TIMESTAMP)) / 1e6)
                     reader["received"].append(("binary", field(payload, SEQUENCE)))
                 reader["frames"] += 1
+        if filling and all(reader["frames"] >= FILL_AT for reader in readers):
+            filling.set()
         if all(reader["frames"] >= SERVED_FRAMES for reader in readers):
             served.set()
     selector.close()
@@ -243,18 +272,21 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
                 sock, headers = connect(port)
                 sockets.append(sock)
                 refused = b"503 " in headers
-            served = threading.Event()
+            served, filling = threading.Event(), threading.Event()
             stop, stopped = socket.socketpair()
             end = time.monotonic() + (seconds if seconds is not None else 5)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 reading = pool.submit(read_all, sockets[int(stalled):int(stalled) + active],
-                                      stopped, served, end)
-                served_ns = None
+                                      stopped, served, end, filling if stalled else None)
+                served_ns, filled = None, False
                 try:
                     while True:
                         with urllib.request.urlopen(f"http://127.0.0.1:{port}/system.json") as response:
                             document = json.load(response)
                         stats = document["bridge"]
+                        if filling.is_set() and not filled:
+                            fill_window(sockets[0])
+                            filled = True
                         if seconds is None:
                             # Finish on evidence, not an eight-second latency sample:
                             # every healthy reader has kept receiving beside the

@@ -469,7 +469,9 @@ at 1. macOS uses that size as given; Linux reserves twice it, about the size
 in payload. A client that stops reading therefore backs up after that much
 of its output (0.4 s of a 40,000 B/s share; up to 6.6 s of the 2,500 B/s
 share at 64 clients), not after the 4 MiB Linux autotuning reached, about
-100 s of a 40,000 B/s share. A reading client is limited below its share only
+100 s of a 40,000 B/s share, plus whatever its own receive window takes,
+which its OS sets and the bridge cannot; so those times are lower bounds.
+A reading client is limited below its share only
 when its round trip exceeds 250 ms; a send larger than the buffer, such as a
 joining client's 64,000 B dictionary and keyframe, takes several round trips,
 during which the client is held. HTTP snapshots and static files are outside
