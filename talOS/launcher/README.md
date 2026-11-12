@@ -275,8 +275,9 @@ member appended to that one file after a line naming it, such as
 echoed to the launcher's stdout. Every line the launcher prints itself, from
 the session directory's creation on, also goes to that directory's
 `talos.log` (a line printed before it exists, such as a refused config, goes
-to the terminal only). A deployed robot therefore keeps its nodes' output and
-the launcher's beside their event logs, whatever happens to the launcher's
+to the terminal only). A roster member named `talos`, whose output would be
+`talos.log`, is refused even with `--allow-graph-errors`. A deployed robot
+therefore keeps its nodes' output and the launcher's beside their event logs, whatever happens to the launcher's
 stdout and stderr.
 
 Neither a print nor the launcher waits for a disk or for the launcher's
