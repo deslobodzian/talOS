@@ -30,6 +30,9 @@ a port).
 These named options are removed before positional parsing:
 
 - `--config PATH`: read `[studio] max_clients` from robot configuration.
+- `--idle-timeout-s S`: a client's idle timeout, 8 to 960 s (default 16; see
+  [WebSocket operating limits](#websocket-operating-limits)). Tests pass 8 to
+  keep their runtime short.
 - `--declared PATH` or `--declared=PATH`: cache the file at startup for
   `/declared.json`.
 - `--manifest PATH` or `--manifest=PATH`: read the file on each
@@ -139,9 +142,13 @@ quarter second of its share, at least 16 KiB
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)),
 so a client that stops reading backs up after that much of its output and
 whatever its own receive window takes, and is held from then on, costing
-the others no turn and the budget no byte. A stalled client holds its slot until uWebSockets' idle timeout closes it,
-about two minutes after the last data it sent (the same Data flow section
-gives the timings). What its send
+the others no turn and the budget no byte. A client that stops answering
+(a laptop that dropped off the network, or a stalled viewer) holds its slot
+until the bridge's 16 s idle timeout closes it, at most 16 s after the last
+data it sent; a client that only receives keeps its slot by answering the
+bridge's pings, as browsers do (the same Data flow section gives the
+derivation). [`client_timeout_test.py`](client_timeout_test.py) checks both
+at the 8 s timeout. What its send
 buffer already holds is stale when it resumes, so reconnect a stalled viewer
 for fresh data.
 The graph's bridge statistics include `clients`, `refused`, `ws_drops`,

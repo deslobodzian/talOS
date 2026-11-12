@@ -458,11 +458,17 @@ bridge sends nothing while output is buffered, so at most one graph message
 or update, never more than the **64,000 B** burst, is ever buffered, below
 uWebSockets' **512 KiB** `maxBackpressure` (past which a send would be
 dropped, not the client closed: `closeOnBackpressureLimit` is off). What
-does disconnect a client that stops reading is uWebSockets' default idle
-timeout (**120 s**): **104 s** after the last data it received from the
-client it sends a ping, and it closes the client if nothing arrives in the
-next **16 s**. Studio's browser answers pings, so a client that is reading
-stays connected. Each client's kernel send buffer is what its
+does disconnect a client that stops answering is the bridge's uWebSockets
+idle timeout of **16 s** (`kIdleTimeoutS` in `studio/bridge/main.cc`). It
+pings a client **4 to 8 s** after its last data or the last drain of its
+backlog (uSockets checks timeouts every 4 s), and closes it if nothing
+arrives in the next **8 s**, so the client's slot comes free **12 to 16 s**
+after the last data it sent: a Driver Station laptop that drops Wi-Fi and
+reconnects cannot keep every slot filled with its own dead sockets for
+longer. 16 s is the
+smallest timeout whose pong window (8 s) covers five retransmissions of a
+lost pong at TCP's 200 ms minimum RTO (sent by 6.2 s). Studio's browser
+answers pings, so a client that only receives stays connected. Each client's kernel send buffer is what its
 share sends in **250 ms**, at least **16 KiB** (`ClientSendBuffer` in
 `studio/bridge/telemetry.h`): 16,384 B at the default 4 clients, 40,000 B
 at 1. macOS uses that size as given; Linux reserves twice it, about the size
