@@ -483,42 +483,45 @@ function emptySeries(t0_ns: string, channels: string[]): Series {
   return {t0_ns, times: new Float64Array(0), values};
 }
 
-// Buckets as a Series: one row per bucket, aligned by index across channels
-// (the server buckets every channel of one request over the same edges). A
-// row's time is the bucket time of the first channel with a sample in it.
-// Rows outside [from, to] are left out; an empty bucket is NaN, a gap.
+// Buckets as a Series. Each channel's point for a bucket sits at its own
+// t_ns, its last sample's publication time: channels of one request share
+// bucket edges, not times. The rows are every distinct point time in
+// [from, to], ascending; a channel is NaN (count 0) in a row that is not one
+// of its points, which the plot draws through, and has no row for an empty
+// bucket.
 export function bucketSeries(channels: string[], buckets: SeriesBuckets, t0_ns: string,
                              from: bigint, to: bigint): Series {
-  const rows: {i: number; t: number}[] = [];
   const lo = Number(from), hi = Number(to);
-  let previous = -Infinity;
-  for (let i = 0; i < buckets.buckets; i++) {
-    let t = NaN;
-    for (const column of buckets.channels)
-      if (column.count[i] > 0 && Number.isFinite(column.t_ns[i])) {
-        t = column.t_ns[i];
-        break;
-      }
-    if (Number.isNaN(t))
-      t = buckets.channels.map(c => c.t_ns[i]).find(Number.isFinite) ?? NaN;
-    if (!Number.isFinite(t) || t < lo || t > hi || t <= previous) continue;
-    rows.push({i, t});
-    previous = t;
-  }
+  const times = new Set<number>();
+  channels.forEach((_, c) => {
+    const column = buckets.channels[c];
+    for (let i = 0; i < buckets.buckets; i++) {
+      const t = column.t_ns[i];
+      if (column.count[i] > 0 && Number.isFinite(t) && t >= lo && t <= hi) times.add(t);
+    }
+  });
+  const rowTimes = [...times].sort((a, b) => a - b);
+  const rowOf = new Map(rowTimes.map((t, row) => [t, row]));
   const t0 = Number(t0_ns);
-  const times = Float64Array.from(rows, r => (r.t - t0) / 1e9);
   const values: Record<string, Float64Array> = {};
   const min: Record<string, Float64Array> = {};
   const max: Record<string, Float64Array> = {};
   const count: Record<string, Uint32Array> = {};
   channels.forEach((name, c) => {
     const column = buckets.channels[c];
-    const pick = (source: Float64Array) =>
-        Float64Array.from(rows, r => column.count[r.i] > 0 ? source[r.i] : NaN);
-    values[name] = pick(column.last);
-    min[name] = pick(column.min);
-    max[name] = pick(column.max);
-    count[name] = Uint32Array.from(rows, r => column.count[r.i]);
+    values[name] = new Float64Array(rowTimes.length).fill(NaN);
+    min[name] = new Float64Array(rowTimes.length).fill(NaN);
+    max[name] = new Float64Array(rowTimes.length).fill(NaN);
+    count[name] = new Uint32Array(rowTimes.length);
+    for (let i = 0; i < buckets.buckets; i++) {
+      const row = column.count[i] > 0 ? rowOf.get(column.t_ns[i]) : undefined;
+      if (row === undefined) continue;
+      values[name][row] = column.last[i];
+      min[name][row] = column.min[i];
+      max[name][row] = column.max[i];
+      count[name][row] = column.count[i];
+    }
   });
-  return {t0_ns, times, values, min, max, count};
+  return {t0_ns, times: Float64Array.from(rowTimes, t => (t - t0) / 1e9),
+          values, min, max, count};
 }

@@ -116,11 +116,11 @@ test('series decode keeps empty buckets and a channel with no data as gaps', () 
   assert.deepEqual([...decoded.channels[1].count], [0, 0, 0]);
 
   const series = bucketSeries(['a', 'b'], decoded, '0', 0n, 3_000_000_000n);
-  assert.deepEqual([...series.times], [1, 2, 3]);
-  assert.deepEqual([...series.values.a], [1, NaN, 4]);
-  assert.deepEqual([...series.min!.a], [0, NaN, 4]);
-  assert.deepEqual([...series.values.b], [NaN, NaN, NaN]);
-  assert.deepEqual([...series.count!.b], [0, 0, 0]);
+  assert.deepEqual([...series.times], [1, 3]);
+  assert.deepEqual([...series.values.a], [1, 4]);
+  assert.deepEqual([...series.min!.a], [0, 4]);
+  assert.deepEqual([...series.values.b], [NaN, NaN]);
+  assert.deepEqual([...series.count!.b], [0, 0]);
 
   // A response for other channels, or with a byte missing, is refused.
   assert.throws(() => decodeSeries(buffer, 1), ReviewError);
@@ -131,6 +131,21 @@ test('series decode keeps empty buckets and a channel with no data as gaps', () 
 test('identical series requests share one fetch and then the cache', async () => {
   const server = fakeServer(echoSnapshot);
   const recorded = source(server);
+// The server's t_ns is each channel's own last sample's publication time
+// (studio/review/review.h): two channels of one bucket are drawn where each
+// was published, never one at the other's time.
+test('each channel\'s point sits at its own sample time', () => {
+  const decoded = decodeSeries(seriesBuffer([
+    {t: [1.0e9, 2.2e9], min: [5, 7], max: [5, 7], last: [5, 7], count: [1, 1]},
+    {t: [1.5e9, 2.2e9], min: [9, 8], max: [9, 8], last: [9, 8], count: [1, 1]}
+  ]), 2);
+  const series = bucketSeries(['a', 'b'], decoded, '0', 0n, 3_000_000_000n);
+  assert.deepEqual([...series.times], [1, 1.5, 2.2]);
+  assert.deepEqual([...series.values.a], [5, NaN, 7]);
+  assert.deepEqual([...series.values.b], [NaN, 9, 8]);
+  assert.deepEqual([...series.count!.b], [0, 1, 1]);
+});
+
   const a = recorded.fetchSeries(['x'], '0', '10', 100);
   const b = recorded.fetchSeries(['x'], '0', '10', 100);
   assert.equal(server.of('/series').length, 1);
