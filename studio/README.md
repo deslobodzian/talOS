@@ -204,6 +204,19 @@ Linux x86-64, a loaded host) the index pass took 0.49 s and kept 66,240 B
 (2,760 log-file seconds), a series of 8 channels over the whole session
 0.46 s, and peak resident memory was 5.7 MiB.
 
+The API's shapes are pinned by golden responses for the review tests'
+fixture session, [`review/testdata/golden`](review/testdata/golden):
+`//studio/review:review_test` requires the server to reproduce them byte for
+byte, and `//studio:review_golden_test` decodes them with
+`src/data/review.ts`, so a shape change on one side fails the other's test.
+For an intended change, regenerate them and change the other side in the
+same commit:
+
+```sh
+TALOS_UPDATE_GOLDEN=1 bazel run //studio/review:review_test -- \
+    --gtest_filter=ReviewTest.ResponsesEqualTheGoldenFiles
+```
+
 ## Tests
 
 Every `tests/*.test.ts*` file runs under `pnpm test`, and under Bazel through

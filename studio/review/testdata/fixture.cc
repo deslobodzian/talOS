@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -15,6 +16,7 @@
 #include "review_test/review_message_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
+#include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/messages.h"
@@ -37,10 +39,18 @@ constexpr std::int64_t kMs = 1'000'000;
 constexpr std::uint16_t kTick = 1;
 constexpr std::uint16_t kShot = 2;
 constexpr std::uint16_t kRequest = 3;
+constexpr std::uint16_t kStatus = 4;
 constexpr std::uint16_t kDriverStation = 3;
 
 talos::schema::Identity ShotSchema() {
   using D = talos::Descriptor<review_test::Shot>;
+  return {std::string{D::kName}, D::kHash,
+          std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                      D::kBfbs.size()}};
+}
+
+talos::schema::Identity StatusSchema() {
+  using D = talos::Descriptor<review_test::Status>;
   return {std::string{D::kName}, D::kHash,
           std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
                       D::kBfbs.size()}};
@@ -64,7 +74,8 @@ Registration Source(std::uint16_t id, SourceKind kind, std::string name,
 
 review_test::Shot ShotOf(int k) {
   return review_test::Shot{ShotPosition(k), static_cast<std::uint32_t>(k),
-                           static_cast<review_test::Mode>(k % 3), k % 2 == 1};
+                           static_cast<review_test::Mode>(k % 3), k % 2 == 1,
+                           ShotId(k)};
 }
 
 talos::hardware::Packet RequestOf(int k) {
@@ -109,7 +120,9 @@ void WriteShooterRun(const std::string& path, int first, int last,
                 Source(kShot, SourceKind::SENDER, "/shooter/state",
                        sizeof(review_test::Shot), ShotSchema()),
                 Source(kRequest, SourceKind::SENDER, "/hw/request/shooter",
-                       sizeof(talos::hardware::Packet), PacketSchema())},
+                       sizeof(talos::hardware::Packet), PacketSchema()),
+                Source(kStatus, SourceKind::SENDER, "/shooter/status",
+                       sizeof(review_test::Status), StatusSchema())},
                MonotonicTime::from_nanos(kStartNs + first * 20 * kMs));
   std::uint64_t index = 0;
   for (int k = first; k <= last; ++k) {
@@ -126,6 +139,10 @@ void WriteShooterRun(const std::string& path, int first, int last,
     const talos::hardware::Packet request = RequestOf(k);
     writer.send(tick, kRequest, Bytes(request), 0,
                 static_cast<std::uint64_t>(k));
+    if (k == 0) {
+      const review_test::Status status{kBootId};
+      writer.send(tick, kStatus, Bytes(status), 0, 0);
+    }
   }
   writer.flush();
   Check(writer);
@@ -210,6 +227,28 @@ void DamagePacket(const std::string& path, int k) {
   if (!file) throw std::runtime_error("cannot damage " + path);
 }
 
+// Sets every log header's wall clock to kStartWallNs at kStartNs, in place
+// of the time the fixture was written (the header's CRC does not cover it).
+void FixWallClock(const std::string& dir) {
+  namespace tlog = talos::event::log;
+  for (const auto& entry : std::filesystem::directory_iterator{dir}) {
+    if (entry.path().extension() != ".tlog") continue;
+    std::fstream file{entry.path(),
+                      std::ios::in | std::ios::out | std::ios::binary};
+    tlog::FileHeader header{};
+    file.read(reinterpret_cast<char*>(&header), sizeof header);
+    header.start_wall_ns =
+        kStartWallNs + (header.start_monotonic_ns - kStartNs);
+    file.seekp(offsetof(tlog::FileHeader, start_wall_ns));
+    file.write(reinterpret_cast<const char*>(&header.start_wall_ns),
+               sizeof header.start_wall_ns);
+    if (!file) {
+      throw std::runtime_error("cannot set the wall clock of " +
+                               entry.path().string());
+    }
+  }
+}
+
 }  // namespace
 
 double ShotPosition(int k) {
@@ -223,11 +262,12 @@ void WriteFixtureSession(const std::string& dir) {
   WriteShooterRun(dir + "/shooter.restart1.tlog", 350, 499, 0);
   WriteObserver(dir + "/observer.tlog");
   DamagePacket(dir + "/observer.tlog", kDamagedPacket);
+  FixWallClock(dir);
   std::ofstream{dir + "/manifest.json"}
       << "{\n  \"session_id\": " << kSessionId
-      << ",\n  \"simulation\": true,\n  \"start_wall_ns\": "
-         "1767225600000000000,\n  \"end_wall_ns\": 1767225610000000000,\n"
-         "  \"nodes\": []\n}\n";
+      << ",\n  \"simulation\": true,\n  \"start_wall_ns\": " << kStartWallNs
+      << ",\n  \"end_wall_ns\": " << kStartWallNs + 10'000'000'000
+      << ",\n  \"nodes\": []\n}\n";
   if (!std::filesystem::exists(
           talos::event::log::LogSegmentPath(dir + "/shooter.tlog", 0))) {
     throw std::runtime_error("the shooter's first run did not rotate");

@@ -124,6 +124,7 @@ STUDIO_TESTS = {
     "panels_test": "panels.test.tsx",
     "plot_test": "plot.test.tsx",
     "recorded_test": "recorded.test.tsx",
+    "review_golden_test": "review_golden.test.ts",
     "robot_panel_test": "robot_panel.test.tsx",
     "robot_test": "robot.test.ts",
     "session_test": "session.test.tsx",
@@ -135,11 +136,17 @@ STUDIO_TESTS = {
     "worker_test": "worker.test.ts",
 }
 
+# A test's data beyond the sources. review_golden: the review server's golden
+# responses, which //studio/review:review_test holds the server to.
+STUDIO_TEST_DATA = {
+    "review_golden_test": ["//studio/review:golden"],
+}
+
 [
     js_test(
         name = name,
         chdir = "studio",
-        data = [":sources"],
+        data = [":sources"] + STUDIO_TEST_DATA.get(name, []),
         entry_point = "tests/run.mjs",
         fixed_args = [test_file],
         patch_node_fs = False,

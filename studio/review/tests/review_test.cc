@@ -11,11 +11,14 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "nlohmann/json.hpp"
@@ -437,6 +440,72 @@ TEST_F(ReviewTest, UnknownLogVersionIsRefusedNamingFileAndVersions) {
         << response.body;
   }
   std::filesystem::remove_all(dir);
+}
+
+// The golden responses (testdata/golden), by file name, and the request each
+// answers. The series covers [9.9 s, 10.1 s) in four buckets: the position
+// ends its second bucket on the last shot's NaN and has two empty buckets
+// after the last shot, shot_id is past 2^53, and the status, sent once at
+// 0 s, has no data in it.
+std::vector<std::pair<std::string, std::pair<std::string, std::string>>>
+GoldenRequests() {
+  const std::string end = std::to_string(kStartNs + 10 * kSecond + 2 * kMs);
+  return {
+      {"sessions.json", {"/review/sessions.json", ""}},
+      {"channels.json", {"/review/s1/channels.json", ""}},
+      {"bounds.json", {"/review/s1/bounds.json", ""}},
+      {"snapshot.json", {"/review/s1/snapshot", "t_ns=" + end}},
+      {"series.bin",
+       {"/review/s1/series",
+        "c=shooter/state/position_m,shooter/state/shot_id,"
+        "shooter/status/boot_id&start_ns=" +
+            std::to_string(kStartNs + 9 * kSecond + 900 * kMs) + "&end_ns=" +
+            std::to_string(kStartNs + 10 * kSecond + 100 * kMs) + "&points=4"}},
+  };
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+  std::ifstream stream{path, std::ios::binary};
+  return {std::istreambuf_iterator<char>{stream}, {}};
+}
+
+// Guards the review API's shapes against the checked-in golden responses,
+// which //studio:review_golden_test decodes with Studio's review.ts: a field
+// renamed, reordered or re-encoded on the server changes these bytes, and
+// the same change on the browser side fails that test. An intentional change
+// regenerates them (studio/README.md, "Reviewing a session"):
+//   TALOS_UPDATE_GOLDEN=1 bazel run //studio/review:review_test --
+//       --gtest_filter=ReviewTest.ResponsesEqualTheGoldenFiles
+// REQ-OPS-41
+TEST_F(ReviewTest, ResponsesEqualTheGoldenFiles) {
+  Review review{Library(), 1u << 20};
+  const char* update = std::getenv("TALOS_UPDATE_GOLDEN");
+  std::filesystem::path golden;
+  if (update != nullptr && std::string_view{update} == "1") {
+    const char* workspace = std::getenv("BUILD_WORKSPACE_DIRECTORY");
+    ASSERT_NE(workspace, nullptr) << "update the golden files with bazel run";
+    golden = std::filesystem::path{workspace} / "studio/review/testdata/golden";
+  } else {
+    std::string error;
+    std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+        rules_cc::cc::runfiles::Runfiles::CreateForTest(
+            BAZEL_CURRENT_REPOSITORY, &error));
+    ASSERT_NE(runfiles, nullptr) << error;
+    golden = std::filesystem::path{runfiles->Rlocation(
+                                       std::getenv("TALOS_GOLDEN_BOUNDS"))}
+                 .parent_path();
+  }
+  for (const auto& [file, request] : GoldenRequests()) {
+    SCOPED_TRACE(file);
+    const Response response = review.Get(request.first, request.second);
+    ASSERT_EQ(response.status, 200) << response.body;
+    if (update != nullptr && std::string_view{update} == "1") {
+      std::ofstream{golden / file, std::ios::binary} << response.body;
+      continue;
+    }
+    EXPECT_EQ(response.body, ReadFile(golden / file))
+        << "the response differs from " << (golden / file).string();
+  }
 }
 
 }  // namespace

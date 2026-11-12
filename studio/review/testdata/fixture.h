@@ -9,7 +9,9 @@
 //       a tick every 20 ms (shots 0..299 from 0 s, 350..499 from 7 s) that
 //       sends /shooter/state (review_test.Shot) and /hw/request/shooter (a
 //       hardware Command), each published 0.5 ms after its tick; the last
-//       shot's position is NaN
+//       shot's position is NaN, and shot k's shot_id is ShotId(k), past
+//       2^53; the first tick of the first run alone also sends
+//       /shooter/status (review_test.Status, boot_id kBootId)
 //   observer.tlog                          the reader, whose loop started
 //                                          0.5 s before the first record
 //       every 5th /shooter/state, received 1 ms after its publication, and
@@ -19,7 +21,9 @@
 //   manifest.json                          a finished --sim session
 //
 // Times are kStartNs plus the offsets above, on the recording's monotonic
-// clock.
+// clock. Every log header's wall clock is kStartWallNs at kStartNs, as the
+// manifest's start_wall_ns, so the session is the same bytes every time it
+// is written (the golden responses, testdata/golden).
 
 #include <cstdint>
 #include <string>
@@ -31,6 +35,13 @@ inline constexpr std::uint64_t kSessionId = 0x5E55;
 inline constexpr int kDamagedPacket = 40;
 inline constexpr int kLastShot = 499;
 inline constexpr std::int64_t kObserverOriginNs = -500'000'000;
+inline constexpr std::int64_t kStartWallNs = 1'767'225'600'000'000'000;
+inline constexpr std::uint64_t kBootId = 42;
+
+// The shot_id of tick `k`: 2^60 + k, which a double cannot hold exactly.
+inline constexpr std::uint64_t ShotId(int k) {
+  return (std::uint64_t{1} << 60) + static_cast<std::uint64_t>(k);
+}
 
 // The shot of tick `k`: position_m, shot_count, mode and ready.
 double ShotPosition(int k);

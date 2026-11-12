@@ -1,3 +1,4 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -72,14 +73,29 @@ cc_library(
     ],
 )
 
-# Values against log_dump --format jsonl, the index's seeks, the cache's
-# bound and the session id check, with no socket.
+# The review API's responses for the fixture session, byte for byte:
+# review_test regenerates and compares them, and //studio:review_golden_test
+# decodes them with studio/src/data/review.ts, so a shape change on either
+# side fails the other side's test (studio/README.md, "Reviewing a
+# session", says how to update them).
+js_library(
+    name = "golden",
+    srcs = glob(["testdata/golden/*"]),
+    visibility = ["//studio:__pkg__"],
+)
+
+# Values against log_dump --format jsonl, the golden responses, the index's
+# seeks and bytes, the cache's bound, the session id check, a read-only
+# library and the static files, with no socket.
 cc_test(
     name = "review_test",
     size = "small",
     srcs = ["tests/review_test.cc"],
-    data = ["//talOS/launcher:log_dump"],
-    env = {"TALOS_LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)"},
+    data = ["//talOS/launcher:log_dump"] + glob(["testdata/golden/*"]),
+    env = {
+        "TALOS_GOLDEN_BOUNDS": "$(rlocationpath testdata/golden/bounds.json)",
+        "TALOS_LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)",
+    },
     deps = [
         ":fixture",
         ":review",
