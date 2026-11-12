@@ -724,6 +724,7 @@ TEST(TargetLane, SendsAndReleasesTheEnvelope) {
   EXPECT_EQ(lift.seen, std::nullopt);
 }
 
+// REQ-SAFE-12: a lane stamps 0 while the Driver Station is disabled
 TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Producer>("producer");
@@ -836,6 +837,7 @@ struct Operator {
 
 // A button held through any break in what the operator saw must be released
 // once, in the new view, before the lane drives again.
+// REQ-SAFE-13: a held input is released once after each break, then re-arms
 TEST(OperatorArming, HeldInputWaitsForNeutralAfterEveryBreak) {
   enum class Break { kDisable, kReboot, kEvaluationGap, kUnsampledRecovery };
   for (const Break disturbance :

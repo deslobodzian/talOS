@@ -89,6 +89,7 @@ class ApiParityTest(unittest.TestCase):
                         values[target.id] = statement.value
         return values
 
+    # REQ-CONTRACT-13: the Python ABI table matches node_api.h
     def test_functions_version_and_types(self):
         assignments = self._abi_assignments()
         version = ast.literal_eval(assignments["_EXPECTED_ABI_VERSION"])
