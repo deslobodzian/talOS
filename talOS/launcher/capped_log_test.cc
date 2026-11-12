@@ -64,7 +64,8 @@ std::uint64_t PrefixBytes() {
 // REQ-OPS-32
 // Each row writes a log under a byte share until its writer reports it
 // capped -- the moment the member's registry row gains kFlagLogCapped -- and
-// asks whether it stopped. A share of four segments rotates: it must read as
+// asks whether it stopped. Shares of four segments, and of exactly two (the
+// fewest that rotate, which keeps just two files), rotate: they must read as
 // recording on. A share below two segments, and one too small for the log's
 // header, cannot rotate: those stopped. Each row also holds the answer to
 // the writer's own capture_stopped().
@@ -78,6 +79,7 @@ TEST(CappedLog, RotatingLogRecordsOnAndOneThatCannotRotateStopped) {
   };
   const Row rows[] = {
       {"rotating", 4 * segment, false},
+      {"two_segments", 2 * segment, false},
       {"one_segment", segment + record / 2, true},
       {"no_room_for_header", 1, true},
   };
