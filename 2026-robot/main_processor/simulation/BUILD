@@ -62,6 +62,7 @@ py_test(
     ] + CONFIG_FILES + NODES,
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
+        "e2e",
         "exclusive",
         "no_asan",
         "no_tsan",
@@ -89,6 +90,7 @@ py_test(
     ] + CONFIG_FILES + NODES,
     imports = ["."],
     tags = [
+        "e2e",
         "exclusive",
         "no_asan",
         "no_tsan",
@@ -127,6 +129,7 @@ py_test(
     srcs = ["accuracy_test.py"],
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
+        "e2e",
         "exclusive",
         "no_asan",
         "no_tsan",

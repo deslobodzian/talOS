@@ -68,6 +68,7 @@ cc_test(
     name = "log_kill_test",
     size = "small",
     srcs = ["log/log_kill_test.cc"],
+    tags = ["integration"],
     deps = [
         ":events_log",
         "@googletest//:gtest",

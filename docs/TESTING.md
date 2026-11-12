@@ -79,7 +79,7 @@ counts too); an ID later in a sentence is prose, not a tag.
   (CI lint job) for a tagged test or a cited bench section or open TODO.md
   item; known gaps are listed with their TODO item in
   `tools/trace_waivers.txt`, which only shrinks; gap: LANE-1 for the tier,
-  which nothing in the tree records yet]** `python3 tools/trace.py --report`
+  which the lane tags (§9) record but nothing checks]** `python3 tools/trace.py --report`
   prints each requirement's tests.
 - Most SAFE requirements are provable in process on a deterministic clock
   (the catalogue's last column), so the safety case rests on unit and
@@ -315,17 +315,30 @@ A **lane** is a set of tests run together at one cost. Lanes, by tier:
 | perf | perf, `exclusive` | 60 s |
 | soak | soak, `manual` | set by `TALOS_SOAK_SECONDS` |
 
-The lanes are not yet Bazel tags or `.bazelrc` configs (LANE-1). Today a
-target's tags only exclude it from a configuration (`manual`, `no_asan`,
-`no_tsan`, `no_macos_sanitizer`), serialize it (`exclusive`) or run it
-unsandboxed (`local`), and
-`bazel test //...` runs every lane but the soak.
+A target's lane is its tag: `heavy`, `integration`, `e2e` or `perf`. An
+untagged test is in the fast lane, so a new test lands there unless its rule
+says otherwise; the soak is `manual`. Choose the tag from what the test does:
+waits on real time with real processes (integration), runs a whole robot graph
+through the launcher (e2e), CPU-bound calibration or render-and-detect
+(heavy), measures timing (perf). Other tags only exclude a target from a
+configuration (`manual`, `no_asan`, `no_tsan`, `no_macos_sanitizer`),
+serialize it (`exclusive`) or run it unsandboxed (`local`).
+
+Each lane has a `.bazelrc` config: `bazel test --config=fast //...` is the
+everyday loop; `--config=heavy`, `--config=integration`, `--config=e2e` and
+`--config=perf` run one lane. `bazel test //...` runs every lane but the soak;
+it is what runs before a push ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)).
+Bazel keeps only the last `--test_tag_filters`, so a lane is combined with a
+sanitizer in one filter, not two configs:
+`bazel test --config=asan --test_tag_filters=-no_asan,-heavy,-integration,-e2e,-perf //...`.
 
 A target that takes more than 5 s states why in a comment on its BUILD
 rule: what it waits for in real time and its lane. `python3
 tools/slow_tests.py --threshold 5` lists, slowest first, every test action in
 `bazel-testlogs` (the last result of each, cached or not) over the
-threshold; it reports and does not fail.
+threshold. With `--check` it exits 1 when an action exceeds its lane's
+budget above (lane tags from `bazel query`, or `--lanes FILE`); CI does not
+run it yet (LANE-1).
 
 CI policy:
 

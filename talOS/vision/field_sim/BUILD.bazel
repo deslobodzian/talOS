@@ -55,6 +55,7 @@ cc_test(
     name = "render_detect_test",
     size = "medium",
     srcs = ["render_detect_test.cc"],
+    tags = ["heavy"],
     deps = [
         ":field_sim",
         ":field_sim_patterns",

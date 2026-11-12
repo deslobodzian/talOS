@@ -59,3 +59,16 @@ test:tsan --test_tag_filters=-no_tsan
 # bundle_manifest.toml, and from there in every session manifest. Unstamped
 # builds never read the status, so they stay cached across commits.
 build:release --stamp --workspace_status_command=tools/workspace_status.sh
+
+# Test lanes (docs/TESTING.md §9). A test's lane is its tag: `heavy`,
+# `integration`, `e2e` or `perf`; an untagged test is in the fast lane, and
+# the soak is `manual`. `bazel test --config=fast //...` is the everyday loop.
+# Bazel keeps only the last --test_tag_filters, so a lane config and a
+# sanitizer config (or a CI job's own filter) must not be combined: pass one
+# filter naming both, e.g.
+#   bazel test --config=asan --test_tag_filters=-no_asan,-heavy,-integration,-e2e,-perf //...
+test:fast --test_tag_filters=-heavy,-integration,-e2e,-perf
+test:heavy --test_tag_filters=heavy
+test:integration --test_tag_filters=integration
+test:e2e --test_tag_filters=e2e
+test:perf --test_tag_filters=perf
