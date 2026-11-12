@@ -109,7 +109,10 @@ py_test(
         ":studio_bridge",
         ":studio_mock",
     ],
-    tags = ["local"],
+    tags = [
+        "integration",
+        "local",
+    ],
 )
 
 py_test(

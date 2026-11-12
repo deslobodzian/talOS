@@ -403,10 +403,8 @@ jobs:
       id: test
       run: |
         set -o pipefail
-        bazel test --noshow_progress --test_output=errors -- //... \
-          -//2026-robot/main_processor/simulation:startup_test \
-          -//2026-robot/main_processor/simulation:match_rehearsal_test \
-          -//2026-robot/main_processor/simulation:accuracy_test 2>&1 \
+        bazel test --noshow_progress --test_output=errors \
+          --test_tag_filters=-e2e //... 2>&1 \
           | tee "$RUNNER_TEMP/bazel-test.log"
 
     - name: Process limits and counts after a failure
