@@ -359,7 +359,9 @@ TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
       << alpha;
   const auto runs = ManifestRuns(manifest, "alpha");
   ASSERT_EQ(runs.size(), 1u) << manifest;
-  EXPECT_NE(runs[0].find("\"reason\": \"stop\""), std::string::npos) << runs[0];
+  // Ended by the session's stop, not by the mismatch: "stop", or
+  // "stop_timeout" when that slow sync outlasted the stop timeout.
+  EXPECT_NE(runs[0].find("\"reason\": \"stop"), std::string::npos) << runs[0];
   std::filesystem::remove_all(allowed.output_dir);
 }
 
