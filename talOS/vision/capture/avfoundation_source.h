@@ -43,8 +43,7 @@ struct FrameDuration {
 // two rates a camera offers. AVFoundation throws on a duration outside the
 // range, so a rate at an end gets that end's own duration and any other gets
 // 1 / fps clamped into the range.
-inline std::optional<FrameDuration> FrameDurationFor(double fps,
-                                                     double min_fps,
+inline std::optional<FrameDuration> FrameDurationFor(double fps, double min_fps,
                                                      double max_fps,
                                                      FrameDuration shortest,
                                                      FrameDuration longest) {
@@ -55,8 +54,8 @@ inline std::optional<FrameDuration> FrameDurationFor(double fps,
   if (near(max_fps)) return shortest;
   if (near(min_fps)) return longest;
   if (!(fps > min_fps && fps < max_fps)) return std::nullopt;
-  const FrameDuration duration{
-      1000, static_cast<int32_t>(std::lround(fps * 1000.0))};
+  const FrameDuration duration{1000,
+                               static_cast<int32_t>(std::lround(fps * 1000.0))};
   if (duration.seconds() < shortest.seconds()) return shortest;
   if (duration.seconds() > longest.seconds()) return longest;
   return duration;

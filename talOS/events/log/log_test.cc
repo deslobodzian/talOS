@@ -1270,7 +1270,7 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
   constexpr std::size_t kChunks = 10;
   const std::vector<std::byte> payload(64, std::byte{0x5a});
   const auto file_size = [&] {
-    struct stat status{};
+    struct stat status {};
     return ::stat(path.c_str(), &status) == 0
                ? static_cast<std::size_t>(status.st_size)
                : std::size_t{0};

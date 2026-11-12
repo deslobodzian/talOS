@@ -80,7 +80,7 @@ std::string ReadFile(const std::string& path) {
 }
 
 double NowMs() {
-  struct timespec ts{};
+  struct timespec ts {};
   ::clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<double>(ts.tv_sec) * 1e3 +
          static_cast<double>(ts.tv_nsec) / 1e6;
