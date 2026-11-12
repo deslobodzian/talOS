@@ -663,7 +663,7 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
 // A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
 // at the stop timeout (kStopTimeout), neither before nor after. The test
 // freezes the supervision clock at the stop, holds it 100 ms short of the
-// timeout for two passes after its peer died of the stop's SIGINT (alpha
+// timeout for four passes after its peer died of the stop's SIGINT (alpha
 // must outlive them), then at the timeout itself (alpha must be killed, and
 // the session end, within four passes).
 TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
@@ -708,10 +708,13 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
     return manifest.substr(runs, manifest.find(']', runs) - runs);
   };
   testing::SupervisionPasses passes;
-  // When the clock had been held just short of the stop timeout for two
-  // passes: alpha's run must outlive it.
+  bool beta_stopped = false;  // The stop's SIGINT ended alpha's peers.
+  // Four passes ran with the clock 100 ms short of the timeout and the
+  // session still on: a kill in any of the first three would have been
+  // reaped and ended the session (alpha is its last member) before the
+  // fourth. And when that was: alpha's run must end after it.
+  bool held_short = false;
   int64_t short_of_timeout_ns = 0;
-  bool at_timeout = false;  // The clock was then held at the timeout.
   // Four passes ran with the clock at the timeout and the session still on:
   // one may have read the clock before it moved, one kills alpha, one reaps
   // it and ends the session, and a fourth means it was not killed.
@@ -735,16 +738,19 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
     // The stop's pass reads exactly `stopped_at`.
     const SupervisionTime stopped_at = clock.Freeze();
     ::kill(::getpid(), SIGTERM);
-    if (!wait([&] {
-          return runs_of(ReadFile(live), "beta").find("\"reason\": \"stop\"") !=
+    beta_stopped = wait([&] {
+      const std::string manifest = ReadFile(live);
+      return runs_of(manifest, "beta").find("\"reason\": \"stop\"") !=
+                 std::string::npos &&
+             runs_of(manifest, "hardware_node").find("\"reason\": \"stop\"") !=
                  std::string::npos;
-        }))
-      return;
+    });
+    if (!beta_stopped) return;
     clock.HoldAt(stopped_at + kStopTimeout - std::chrono::milliseconds{100});
-    if (!passes_from_now(2)) return;
+    held_short = passes_from_now(4);
+    if (!held_short) return;
     short_of_timeout_ns = WallClockNanos();
     clock.HoldAt(stopped_at + kStopTimeout);
-    at_timeout = true;
     late = passes_from_now(4);
   }};
   const auto started = std::chrono::steady_clock::now();
@@ -754,8 +760,10 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   stopper.request_stop();
   stopper.join();
   EXPECT_LT(elapsed, std::chrono::seconds{10});
-  ASSERT_TRUE(at_timeout)
-      << "the stop's SIGINT ended no peer, or the session ended first";
+  ASSERT_TRUE(beta_stopped) << "the stop's SIGINT ended no peer";
+  ASSERT_TRUE(held_short) << "alpha was killed before the stop timeout: the "
+                             "session ended while the clock was held short "
+                             "of it";
   EXPECT_FALSE(late)
       << "alpha was not killed once the clock reached the stop timeout";
   const auto run = runs_of(ReadFile(live), "alpha");

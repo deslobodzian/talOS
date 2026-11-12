@@ -481,8 +481,8 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
   ASSERT_FALSE(seen.empty()) << "no live manifest recorded the capped log";
   const auto live = ManifestEntry(seen, "alpha");
   EXPECT_NE(live.find("\"recorder_failed\": false"), std::string::npos) << live;
-  // The real node kept no more than its 1-byte share: every file of its
-  // event log, segments included.
+  // The real node kept no bytes: a 1-byte share admits no record or prefix
+  // of one, in any file of its event log, segments included.
   std::uintmax_t kept = 0;
   for (const auto& file :
        std::filesystem::directory_iterator{options.output_dir}) {
