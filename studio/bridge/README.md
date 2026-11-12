@@ -137,9 +137,9 @@ output, and never queues old observations for it: its telemetry waits and
 resumes from the latest values. Each client's kernel send buffer holds a
 quarter second of its share, at least 16 KiB
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)),
-so a client that stops reading backs up after that much of its output and is
-held from then on, costing the others no turn and the budget no byte. A
-stalled client holds its slot until uWebSockets' idle timeout closes it,
+so a client that stops reading backs up after that much of its output and
+whatever its own receive window takes, and is held from then on, costing
+the others no turn and the budget no byte. A stalled client holds its slot until uWebSockets' idle timeout closes it,
 about two minutes after the last data it sent (the same Data flow section
 gives the timings). What its send
 buffer already holds is stale when it resumes, so reconnect a stalled viewer
@@ -168,8 +168,11 @@ python studio/bridge/bandwidth_test.py --measure bazel-bin/studio/bridge --secon
 egress budget, that the shared budget is granted in rotation (over one window
 of producer ticks, two readers' updates differ by at most one, plus the turns
 a reader was sent a graph message instead), and that a client which stops
-reading backs up and is then held: the bridge counts it `held`, and it is
-sent nothing while every reader is sent at least four updates.
+reading with output buffered is held: the bridge counts it `held`, and it is
+sent nothing while every reader is sent at least four updates. The test
+fills that client's receive window with pongs to its pings, since macOS
+gives a loopback client a window of about 320 KiB however small a buffer it
+asks for.
 
 ## Publisher and serving constraints
 
