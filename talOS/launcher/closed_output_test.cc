@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <regex>
 #include <string>
 #include <string_view>
 
@@ -474,6 +476,78 @@ TEST(ClosedOutput, MisnamedMemberIsRefusedEvenAllowingGraphErrors) {
     EXPECT_EQ(started, !row.refused);
     EXPECT_EQ(session, !row.refused);
   }
+}
+
+// REQ-OPS-33
+// Output the launcher's stdout drops mid-session, because its reader fell
+// behind, is noted in talos.log as well as in the stream: the stream's note
+// may never be read, and talos.log is what session_report reads. A forked
+// launcher-to-be echoes 2 MiB, twice what its stdout's buffer holds, into a
+// pipe the test does not read yet; the test then reads until the stream's
+// note of the drop arrives, and only then lets it stop. talos.log must note
+// the same count, in the line session_report parses.
+TEST(ClosedOutput, StdoutDropsMidSessionAreNotedInTalosLog) {
+  const std::string log = TempPath("dropped_stdout.log");
+  ::remove(log.c_str());
+  int output[2];
+  int echoed[2];
+  int stop[2];
+  ASSERT_EQ(::pipe(output), 0);
+  ASSERT_EQ(::pipe(echoed), 0);
+  ASSERT_EQ(::pipe(stop), 0);
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(output[0]);
+    ::close(echoed[0]);
+    ::close(stop[1]);
+    const int null = ::open("/dev/null", O_WRONLY);
+    if (null < 0 || ::dup2(output[1], STDOUT_FILENO) < 0 ||
+        ::dup2(null, STDERR_FILENO) < 0)
+      ::_exit(100);
+    ::close(output[1]);
+    {
+      LauncherOutput launcher;
+      launcher.Record(log);
+      launcher.Echo(std::string(std::size_t{2} << 20, 'e'));
+      // Waits for the test to close its end.
+      char go = 0;
+      if (::write(echoed[1], "e", 1) != 1 || ::read(stop[0], &go, 1) != 0)
+        ::_exit(101);
+      launcher.Stop(std::chrono::milliseconds{kHangMs});
+    }
+    ::_exit(0);
+  }
+  ::close(output[1]);
+  ::close(echoed[1]);
+  ::close(stop[0]);
+  std::string ready;
+  const bool echoed_all = AwaitText(echoed[0], ready, "e");
+  std::string seen;
+  const bool noted = echoed_all && AwaitText(output[0], seen, " here: ");
+  ::close(stop[1]);  // Lets the child stop.
+  AwaitEnd(output[0], seen);
+  ::close(output[0]);
+  ::close(echoed[0]);
+  const int status = Reap(child);
+  const std::string talos_log = ReadFile(log);
+  ::remove(log.c_str());
+
+  ASSERT_TRUE(noted) << "the stream never noted a drop";
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  const std::regex stream_note{
+      R"(\[launcher\] (\d+) bytes of output dropped here: )"};
+  std::smatch in_stream;
+  ASSERT_TRUE(std::regex_search(seen, in_stream, stream_note));
+  // session_report.py's pattern for a drop on the launcher's own stdout.
+  const std::regex log_note{
+      R"((^|\n)\[launcher\] (\d+) bytes for the launcher's stdout were not written)"};
+  std::smatch in_log;
+  ASSERT_TRUE(std::regex_search(talos_log, in_log, log_note)) << "talos.log:\n"
+                                                              << talos_log;
+  EXPECT_EQ(in_log[2].str(), in_stream[1].str()) << talos_log;
 }
 
 std::string Runfile(const char* env) {

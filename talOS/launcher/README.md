@@ -299,11 +299,13 @@ buffer when they are the same file, as with `2>&1` or a terminal) wait in
 memory: a 1 MiB batch the writer has taken and a refilled 1 MiB pending
 buffer. Beyond that output is dropped, and the log (or the stdout or
 stderr) says how many bytes where they were lost, as does a launcher line
-at the end of the session for a member's log. A stdout or stderr whose
+at the end of the session for a member's log, and a `talos.log` line, at
+the drain that finds them, for the stdout or stderr. A stdout or stderr whose
 write fails for good (its reader closed it: EPIPE, as the launcher ignores
 SIGPIPE) is not written again; a line on the other one and in `talos.log`
 says so. At the end the launcher gives its stdout and stderr 1 s to take
-what is left, then drops it and says how much in `talos.log`, and exits:
+what is left, then drops it and says how much in `talos.log` (an upper
+bound: the part a write is still inside may yet arrive), and exits:
 a write still in progress then (a terminal nobody reads takes part of it
 and holds the rest) is abandoned 100 ms later, not waited for. A member's
 log, and `talos.log`, keep at most 64 MiB per session, then say so and drop

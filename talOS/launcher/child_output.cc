@@ -321,10 +321,18 @@ void LauncherOutput::State::NoteUnwritten() {
     const uint64_t left =
         descriptor.taken + descriptor.pending.size() + descriptor.dropped;
     if (left == 0 || file_path.empty()) continue;
+    // The chunk a write is still inside may yet be delivered: `left` is an
+    // upper bound. The count stays first, where session_report reads it.
+    const std::string in_write =
+        descriptor.taken == 0
+            ? std::string{}
+            : ", at most: the last " + std::to_string(descriptor.taken) +
+                  " were in a write that may still deliver them";
     const std::string line =
         "[launcher] " + std::to_string(left) + " bytes for the launcher's " +
-        descriptor.name + " were not written: it did not drain within " +
-        std::to_string(linger.count()) + " ms of the end\n";
+        descriptor.name + " were not written" + in_write +
+        "; it did not drain within " + std::to_string(linger.count()) +
+        " ms of the end\n";
     file_dropped += Append(file_pending, line.data(), line.size());
   }
 }
@@ -375,6 +383,7 @@ void LauncherOutput::State::DescriptorLoop() {
   for (;;) {
     bool any = false;
     bool stopped = false;
+    bool noted = false;  // talos.log's buffer got a drop note.
     Clock::time_point until;
     {
       const std::lock_guard lock{mutex};
@@ -390,6 +399,17 @@ void LauncherOutput::State::DescriptorLoop() {
             batch[i] += DropNote(batch[i], descriptor.dropped,
                                  std::string{"the launcher's "} +
                                      descriptor.name + " fell behind");
+            // In talos.log too: nobody may ever read the stream's note, and
+            // talos.log is what session_report reads. One per drain; none
+            // once Stop has left this writer behind.
+            if (!file_path.empty() && !abandoned) {
+              const std::string line =
+                  "[launcher] " + std::to_string(descriptor.dropped) +
+                  " bytes for the launcher's " + descriptor.name +
+                  " were not written: its reader fell behind\n";
+              file_dropped += Append(file_pending, line.data(), line.size());
+              noted = true;
+            }
             descriptor.dropped = 0;
           }
         }
@@ -399,6 +419,7 @@ void LauncherOutput::State::DescriptorLoop() {
       stopped = stopping;
       until = give_up;
     }
+    if (noted) file_wake.notify_one();
     if (stopped && !any) break;
     int timeout = -1;
     if (stopped) {
