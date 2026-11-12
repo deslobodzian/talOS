@@ -6,6 +6,7 @@
 // Every wait here is on an event -- a pipe's data or its end -- bounded by
 // kHangMs, which only bounds a hang (docs/TESTING.md §6.3).
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <pthread.h>
@@ -145,8 +146,10 @@ struct Forked {
 
 // `reader`, when not -1, is the test's end of an `output` pipe: closed in
 // the launcher, so that the test's close leaves the pipe without a reader.
-Forked ForkLauncher(const LauncherOptions& options, int output,
-                    int reader = -1) {
+// With `ignore_hangup` the launcher starts with SIGHUP ignored, as `nohup`
+// starts it.
+Forked ForkLauncher(const LauncherOptions& options, int output, int reader = -1,
+                    bool ignore_hangup = false) {
   int events[2];
   if (::pipe(events) != 0) return {};
   // Nothing the test buffered may reach the launcher's output twice.
@@ -164,6 +167,7 @@ Forked ForkLauncher(const LauncherOptions& options, int output,
     // Started as a shell starts it, whatever this test inherited (a harness
     // may ignore SIGPIPE).
     std::signal(SIGPIPE, SIG_DFL);
+    std::signal(SIGHUP, ignore_hangup ? SIG_IGN : SIG_DFL);
     const int code = Launcher{options}.Run();
     // As main's return would.
     std::cout.flush();
@@ -265,6 +269,69 @@ TEST(ClosedOutput, SessionOutlivesItsStdoutReader) {
   EXPECT_GE(ticks, 20u) << alpha_log << ":\n" << log;
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "a stop after the close ended with " << ExitReason(status);
+}
+
+// REQ-OPS-33
+// A terminal hangup (an interactive ssh session or a terminal window
+// closing) sends the launcher SIGHUP. Row "hangup": a launcher started with
+// SIGHUP at its default stops the session in order on it, as on SIGTERM:
+// members stopped (each run's reason "stop"), the manifest finalized (its
+// end_wall_ns set), exit status 0. Killed by the default action instead,
+// it ends with signal 1, its guardians kill the members and the manifest
+// is never finalized. Row "nohup": a launcher started with SIGHUP ignored
+// keeps supervising after one: alpha's crash after it is restarted, and
+// SIGTERM then stops the session.
+TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
+  struct Row {
+    const char* name;
+    bool ignored;
+  };
+  for (const Row row : {Row{"hangup", false}, Row{"nohup", true}}) {
+    SCOPED_TRACE(row.name);
+    Fixture fixture{row.name};
+    const std::string output_path = TempPath(std::string{row.name} + ".out");
+    const int output = ::open(output_path.c_str(),
+                              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    ASSERT_GE(output, 0);
+    const Forked launcher =
+        ForkLauncher(fixture.options, output, -1, row.ignored);
+    ::close(output);
+    ASSERT_GT(launcher.pid, 0);
+    std::string events;
+    // Alpha starts after the launcher has installed its signal handlers.
+    const bool started = AwaitText(launcher.events, events, "alpha 0");
+    ::kill(launcher.pid, SIGHUP);
+    bool restarted = false;
+    if (row.ignored) {
+      std::ofstream{fixture.crash}.close();
+      restarted = AwaitText(launcher.events, events, "alpha 1");
+      ::kill(launcher.pid, SIGTERM);
+    }
+    const bool ended = AwaitEnd(launcher.events, events);
+    ::close(launcher.events);
+    const int status = Reap(launcher.pid);
+    const std::string manifest =
+        ReadFile(fixture.session_dir + "/manifest.json");
+    ::remove(output_path.c_str());
+
+    ASSERT_TRUE(started) << "alpha never started; events: " << events;
+    if (row.ignored)
+      EXPECT_TRUE(restarted)
+          << "no restart after an ignored SIGHUP; events: " << events;
+    EXPECT_TRUE(ended) << "the session did not end";
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "the launcher ended with " << ExitReason(status);
+    EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
+        << "the manifest was not finalized:\n"
+        << manifest;
+    std::size_t stopped = 0;
+    for (std::size_t at = manifest.find("\"reason\": \"stop\"");
+         at != std::string::npos;
+         at = manifest.find("\"reason\": \"stop\"", at + 1))
+      ++stopped;
+    // The hardware stub's run and alpha's last.
+    EXPECT_EQ(stopped, 2u) << manifest;
+  }
 }
 
 std::string Runfile(const char* env) {

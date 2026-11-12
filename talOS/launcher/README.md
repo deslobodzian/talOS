@@ -275,7 +275,7 @@ member appended to that one file after a line naming it, such as
 echoed to the launcher's stdout. A deployed robot therefore keeps its nodes'
 output beside their event logs, whatever happens to the launcher's own.
 
-A launcher whose stdout or stderr reader closes (an ssh session or a `tee`
+A launcher whose stdout or stderr reader closes (a `tee` or a log pipe
 ending) keeps supervising: it ignores SIGPIPE, ends the echo at its first
 write that fails that way, and keeps writing every member's log. Every
 process it spawns starts with every signal at its default disposition and
@@ -284,6 +284,12 @@ none blocked, whatever the launcher inherited (`nohup`'s ignored SIGHUP,
 open but stops reading is different: once the pipe or terminal is full, the
 launcher's own next line blocks its supervision loop (no restart, stall kill
 or stop) until the reader reads again.
+
+A terminal hangup (an interactive ssh session or a terminal window closing
+sends SIGHUP) stops the session in order, as SIGTERM does, unless the
+launcher started with SIGHUP ignored (`nohup`), which it then keeps
+ignoring. A session that must outlive its terminal runs under the boot
+service ([deployment](../../docs/DEPLOYMENT.md)) or `nohup`.
 
 A print never waits for a disk or for the launcher's stdout: a one-line write
 to a file on a loaded disk can take hundreds of milliseconds, far past a
