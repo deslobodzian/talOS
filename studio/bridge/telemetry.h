@@ -588,8 +588,11 @@ struct ClientFeeds {
 // for seconds. Each pass therefore starts just after the last client sent
 // anything, and no send leaves outside a pass (a client that joins or
 // drains is offered its turn by one), so the bucket is granted in rotation:
-// of the clients able to take a send, none is sent to twice before every
-// other one has been sent to once.
+// of the clients able to take a send (nothing buffered, and both buckets
+// hold its whole next message), none is sent to twice before every other
+// one has been sent to once. A client whose next message is larger than
+// another's can therefore be passed over while the shared bucket holds the
+// smaller but not its own.
 template <class Client>
 class ClientRotation {
  public:

@@ -445,9 +445,12 @@ burst (`EgressBudget` in `studio/bridge/telemetry.h`). Each client also has a
 defaults to **4** (range **1–64**). Every send leaves in a pass over the
 clients (a client that joins or drains is offered its turn by one), and each
 pass starts just after the last client sent anything, so the shared bucket is
-granted in rotation: of the clients able to take a send, none is sent to
-twice before every other one has been sent to once
-(`ClientRotation` in `studio/bridge/telemetry.h`). A client that still has
+granted in rotation: of the clients able to take a send (nothing buffered,
+and both buckets hold its whole next message), none is sent to twice before
+every other one has been sent to once (`ClientRotation` in
+`studio/bridge/telemetry.h`). Messages differ in size, so a client whose
+next update is larger than another's can be passed over while the shared
+bucket holds the smaller one but not its own. A client that still has
 output buffered is held: it skips passes, and its telemetry resumes from the
 latest values once it drains; uWebSockets disconnects it only past its
 **512 KiB** `maxBackpressure`. Each client's kernel send buffer is what its
