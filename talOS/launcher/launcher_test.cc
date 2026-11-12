@@ -476,14 +476,15 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
       tag + "_hardware",
       DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
-  const auto until_retried = [&](std::string_view node, std::string_view target,
-                                 introspect::naming::SourceShape source) {
-    std::string script = NodeDescribeThenSleep(node, target, {source}, 0);
-    script.erase(script.rfind("exec sleep"));
-    return script + "tries=0\nwhile [ \"$(wc -l < '" + counter +
-           "' 2>/dev/null || echo 0)\" -lt 2 ] && [ $tries -lt 2000 ]; do\n"
-           "  tries=$((tries + 1))\n  sleep 0.01\ndone\nexit 0\n";
-  };
+  const auto until_retried =
+      [&](std::string_view node, std::string_view target,
+          const introspect::naming::SourceShape& source) {
+        std::string script = NodeDescribeThenSleep(node, target, {source}, 0);
+        script.erase(script.rfind("exec sleep"));
+        return script + "tries=0\nwhile [ \"$(wc -l < '" + counter +
+               "' 2>/dev/null || echo 0)\" -lt 2 ] && [ $tries -lt 2000 ]; do\n"
+               "  tries=$((tries + 1))\n  sleep 0.01\ndone\nexit 0\n";
+      };
   options.binary_overrides["//example/alpha:node"] = WriteStubNode(
       tag + "_alpha",
       until_retried("alpha", "//example/alpha:node", Sender("/alpha/state")));
