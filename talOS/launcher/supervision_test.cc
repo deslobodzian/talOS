@@ -1190,7 +1190,9 @@ TEST(Supervision, StalledNodeGroupKillStopsItsHelper) {
   const int result = ::poll(&ready, 1, 1000);
   char byte = 0;
   EXPECT_GT(result, 0);
-  if (result > 0) EXPECT_EQ(::read(lifetime[0], &byte, 1), 0);
+  if (result > 0) {
+    EXPECT_EQ(::read(lifetime[0], &byte, 1), 0);
+  }
   ::close(lifetime[0]);
   pid_t helper = 0;
   std::ifstream{helper_pid} >> helper;
@@ -1231,7 +1233,9 @@ TEST(Supervision, KillingLauncherKillsNodeAndItsHelper) {
   EXPECT_GT(started, 0);
   EXPECT_GT(size, 0);
   EXPECT_GT(stopped, 0);
-  if (stopped > 0) EXPECT_EQ(::read(output[0], &byte, 1), 0);
+  if (stopped > 0) {
+    EXPECT_EQ(::read(output[0], &byte, 1), 0);
+  }
   if (size > 0) {
     SignalProcessGroup(static_cast<pid_t>(std::strtol(text, nullptr, 10)),
                        SIGKILL);

@@ -2696,9 +2696,10 @@ TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
           << "commands " << sequence_before + 1 << " to " << sequence
           << " were drained by one tick";
       EXPECT_FALSE(backend.last_requests.empty());
-      if (!backend.last_requests.empty())
+      if (!backend.last_requests.empty()) {
         EXPECT_DOUBLE_EQ(backend.last_requests[0].demand,
                          static_cast<double>(sequence));
+      }
       return true;
     }
     if (sequence == companion.next_send_sequence() - 1) send_backlog();

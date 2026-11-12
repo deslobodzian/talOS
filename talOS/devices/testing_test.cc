@@ -64,7 +64,9 @@ hardware::State LatestState(const Sim& sim) {
   const auto packet = sim.latest<hardware::Packet>(hardware::kStateTopic);
   EXPECT_TRUE(packet.has_value());
   hardware::State state{};
-  if (packet) EXPECT_TRUE(hardware::Decode(packet->bytes(), state));
+  if (packet) {
+    EXPECT_TRUE(hardware::Decode(packet->bytes(), state));
+  }
   return state;
 }
 
@@ -712,7 +714,9 @@ TEST_F(SimHardwareTest, ModeChangeOnALostTickStartsANewGeneration) {
         sim.latest<hardware::Packet>(hardware::kDriverStationTopic);
     EXPECT_TRUE(packet.has_value());
     driver_station::DriverStationData data{};
-    if (packet) EXPECT_TRUE(driver_station::Decode(packet->bytes(), data));
+    if (packet) {
+      EXPECT_TRUE(driver_station::Decode(packet->bytes(), data));
+    }
     return data.mode_since_us;
   };
   driver_station::DriverStationData teleop{};

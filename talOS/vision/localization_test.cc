@@ -215,7 +215,9 @@ TEST(LocalizationTest, ReusedSolverMatchesFreshSolveWithoutAllocating) {
     if (counting) probe.start();
     const auto reused = solver.Solve(fixture->tags, 1, fixture->mount,
                                      fixture->layout, fixture->intr);
-    if (counting) EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+    if (counting) {
+      EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+    }
     const auto fresh = SolveMultiTagRobotPose(fixture->tags, 1, fixture->mount,
                                               fixture->layout, fixture->intr);
     EXPECT_EQ(reused.validity.valid, fixture != &none);
