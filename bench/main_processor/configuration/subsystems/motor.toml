@@ -9,6 +9,7 @@ type = "TalonFX"
 bus = "rio"
 # Placeholder only: a human must set the physical CAN id before commissioning.
 can_id = 1
+motor_type = "kraken_x44"
 inverted = false
 brake = false
 supply_limit_a = 30.0

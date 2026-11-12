@@ -537,6 +537,41 @@ soft_limits = true
   EXPECT_TRUE(arm->soft_limits);
 }
 
+// The physics simulator models each motor's windings by its type, so a bench
+// Kraken X44 must not stall at a Kraken X60's current. An absent key is a
+// Kraken X60; any other value is refused naming the key, the motor and its
+// file.
+TEST_F(ManifestTest, MotorTypeSetsThePhysicsModelAndRefusesUnknownTypes) {
+  using hardware::MotorType;
+  EXPECT_EQ(Parse("").hardware.motors.at(0).motor_type.value,
+            MotorType::kKrakenX60);
+  for (const auto& [value, type] :
+       {std::pair{"kraken_x60", MotorType::kKrakenX60},
+        std::pair{"kraken_x44", MotorType::kKrakenX44},
+        std::pair{"falcon_500", MotorType::kFalcon500}}) {
+    SCOPED_TRACE(value);
+    EXPECT_EQ(Parse(std::string{"motor_type = \""} + value + "\"\n")
+                  .hardware.motors.at(0)
+                  .motor_type.value,
+              type);
+  }
+  ExpectRejected("motor_type = 60\n");
+  Write("robot.toml",
+        "[[subsystems]]\nname = \"lift\"\npath = \"subsystems/lift.toml\"\n");
+  Write("subsystems/lift.toml",
+        "[subsystem]\nname = \"lift\"\n[motors.winch]\ncan_id = 1\n"
+        "motor_type = \"KrakenX44\"\n");
+  try {
+    ParseRobotConfig(Robot());
+    ADD_FAILURE() << "an unknown motor_type was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    for (const char* part : {"motor_type", "winch", "subsystems/lift.toml"}) {
+      EXPECT_NE(what.find(part), std::string::npos) << what;
+    }
+  }
+}
+
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {
   Write("robot.toml", R"(
 [robot]

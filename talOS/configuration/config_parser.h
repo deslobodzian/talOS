@@ -498,6 +498,27 @@ inline hardware::LimitSwitch ReadLimitSwitch(const toml::table& t,
                               value + "\"");
 }
 
+// The motor the TalonFX drives (MotorConfig::motor_type); absent is a Kraken
+// X60.
+inline hardware::MotorType ReadMotorType(const toml::table& t,
+                                         const std::string& name) {
+  const auto value = Read<std::string>(t, "motor_type", "kraken_x60");
+  if (value == "kraken_x60") return hardware::MotorType::kKrakenX60;
+  if (value == "kraken_x44") return hardware::MotorType::kKrakenX44;
+  if (value == "falcon_500") return hardware::MotorType::kFalcon500;
+  std::string message = "motor_type for " + name +
+                        " must be \"kraken_x60\", \"kraken_x44\" or "
+                        "\"falcon_500\", not \"" +
+                        value + "\"";
+  // The key keeps its source through table copies; a value node does not.
+  for (auto&& [key, node] : t) {
+    if (key.str() == "motor_type" && key.source().path) {
+      message += " in " + *key.source().path;
+    }
+  }
+  throw std::invalid_argument(message);
+}
+
 inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   for (auto&& [key, value] : t) {
     const auto k = key.str();
@@ -511,7 +532,8 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
         k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
         k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
         k != "slot1" && k != "slot2" && k != "position_frame" &&
-        k != "forward_limit_switch" && k != "reverse_limit_switch") {
+        k != "forward_limit_switch" && k != "reverse_limit_switch" &&
+        k != "motor_type") {
       throw std::invalid_argument("unknown motor key '" + std::string(k) +
                                   "' for " + name);
     }
@@ -542,6 +564,7 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
       Read(t, "cruise_velocity_rps", std::min(20.0, m.max_velocity_rps));
   m.acceleration_rps2 = Read(t, "acceleration_rps2", m.acceleration_rps2);
   m.jerk_rps3 = Read(t, "jerk_rps3", m.jerk_rps3);
+  m.motor_type.value = ReadMotorType(t, name);
   for (int s = 0; s < 3; ++s) {
     const auto slot_name = "slot" + std::to_string(s);
     if (t.contains(slot_name) && !t[slot_name].is_table()) {

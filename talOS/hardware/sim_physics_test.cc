@@ -11,6 +11,7 @@
 #include <memory>
 #include <tuple>
 
+#include "config_wire.h"
 #include "gateway.h"
 #include "sim_backend.h"
 
@@ -289,6 +290,34 @@ TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
   uint64_t now_us = 0;
   StepBackend(backend, s, now_us, 5000, 1);
   EXPECT_DOUBLE_EQ(s.motors[0].stator_current_a, 80.0);
+}
+
+// The wire config carries no motor type, so a config the bridge pushes to
+// sim_gateway that differs from the one it holds reconfigures the physics
+// backend with every motor a Kraken X60. Each motor keeps the type of the
+// motor of the same name in sim_gateway's own parse: after such a push, a
+// Kraken X44 still stalls at the X44's current.
+// REQ-DEV-07
+TEST(SimMotorDiagnostics, PushedConfigKeepsTheLocalMotorType) {
+  auto local = SingleMotorConfig();  // 80 A stator limit: 1 V stays under it
+  local.motors[0].motor_type.value = MotorType::kKrakenX44;
+  PhysicsSimBackend backend;
+  backend.SetLocalMotorTypes(local);  // as sim_gateway does from its parse
+  Gateway gateway{backend, 1};
+  ASSERT_TRUE(gateway.Reconfigure(local));
+  auto pushed = local;
+  pushed.motors[0].max_voltage = 11.0;  // differs: Configure runs again
+  Config wire;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(pushed), wire));
+  ASSERT_EQ(wire.motors[0].motor_type.value, MotorType::kKrakenX60);
+  ASSERT_TRUE(gateway.Reconfigure(wire));
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 1.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 1);  // the first Read: at rest
+  EXPECT_NEAR(s.motors[0].stator_current_a, 275.0 / 12.0, 1e-9);
 }
 
 // Voltage ramps the mechanism rather than snapping it to demand; position
