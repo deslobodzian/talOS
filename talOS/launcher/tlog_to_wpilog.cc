@@ -3,7 +3,7 @@
 //
 //   tlog_to_wpilog <log-file-or-session-dir> [more ...] -o <out.wpilog>
 //
-// The logs are read and merged with MergeLogs (log_merge.h, as log_dump
+// The logs are streamed through MergeLogs (log_merge.h, as log_dump
 // reads them), and each payload is walked with flatbuffers/reflection.h
 // from the schema the log carries, so no recording build is needed. The
 // mapping, the clock and the caveats are in talOS/launcher/README.md,
@@ -24,8 +24,10 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -50,6 +52,7 @@ namespace {
 
 using reflection::BaseType;
 using talos::event::EventKind;
+using talos::launcher::MergedLog;
 using talos::launcher::MergedRecord;
 
 // Per-reader dropped-message counters are entries of this owner, named
@@ -540,10 +543,17 @@ int Fail(const std::string& message) {
 // the same three.
 using Publication = std::tuple<std::size_t, std::uint64_t, std::int64_t>;
 
+// A record that becomes values or a dropped count, kept past the merge: its
+// log (process and manifest, shared, not copied), source, kind, dropped
+// count, and its payload only when it carries values.
 struct Item {
   std::int64_t time_ns;
-  std::size_t index;
+  std::shared_ptr<const MergedLog> log;
+  const talos::event::Registration* source;
+  std::uint16_t kind;
+  std::uint32_t aux;
   bool values;
+  std::vector<std::byte> payload;
 };
 
 // The records that become values or dropped counts, in publish-time order.
@@ -552,47 +562,75 @@ struct Item {
 // reader's MESSAGE of it in merge order. So a reader's copy fills what the
 // writer's log lacks (a capped log's deleted head, a cut tail) and every
 // reader contributes what it received. Every MESSAGE with a dropped count
-// is an item, for that reader's counter.
-std::vector<Item> SelectItems(const std::vector<MergedRecord>& records) {
-  std::map<std::string, std::size_t> topics;
+// is an item, for that reader's counter. The session is streamed twice:
+// once for the logged SENDs, warning about damage then, and once to select.
+// False, with `error` set, when the merge fails; `records` counts the
+// records read.
+bool SelectItems(const std::vector<std::string>& files,
+                 std::vector<Item>& items, std::size_t& records,
+                 std::string& error) {
+  std::map<std::string, std::size_t, std::less<>> topics;
   const auto key = [&](const MergedRecord& r) {
-    const std::size_t topic =
-        topics.try_emplace(r.source_name, topics.size()).first->second;
-    return Publication{topic, r.header.sequence, r.header.publish_time_ns};
+    auto topic = topics.find(r.source_name());
+    if (topic == topics.end()) {
+      topic = topics.emplace(std::string{r.source_name()}, topics.size()).first;
+    }
+    return Publication{topic->second, r.header.sequence,
+                       r.header.publish_time_ns};
   };
   const auto is = [](const MergedRecord& r, EventKind kind) {
     return r.header.kind == static_cast<std::uint16_t>(kind);
   };
   std::set<Publication> sent;
-  for (const auto& r : records) {
-    if (r.source != nullptr && is(r, EventKind::SEND) &&
-        r.header.aux == kSendOk) {
-      sent.insert(key(r));
-    }
+  if (!talos::launcher::MergeLogs(
+          files,
+          [&](const MergedRecord& r) {
+            if (r.source != nullptr && is(r, EventKind::SEND) &&
+                r.header.aux == kSendOk) {
+              sent.insert(key(r));
+            }
+            return true;
+          },
+          error)) {
+    return false;
   }
   std::set<Publication> taken;
-  std::vector<Item> items;
-  for (std::size_t i = 0; i < records.size(); ++i) {
-    const MergedRecord& r = records[i];
-    if (r.source == nullptr) continue;
-    if (is(r, EventKind::SEND)) {
-      if (r.header.aux == kSendOk && taken.insert(key(r)).second) {
-        items.push_back({r.header.publish_time_ns, i, true});
-      }
-    } else if (is(r, EventKind::MESSAGE)) {
-      const Publication publication = key(r);
-      const bool values =
-          !sent.contains(publication) && taken.insert(publication).second;
-      if (values || r.header.aux > 0) {
-        items.push_back({r.header.publish_time_ns, i, values});
-      }
-    }
+  records = 0;
+  const auto keep = [&](const MergedRecord& r, bool values) {
+    Item& item = items.emplace_back(Item{r.header.publish_time_ns,
+                                         r.log,
+                                         r.source,
+                                         r.header.kind,
+                                         r.header.aux,
+                                         values,
+                                         {}});
+    if (values) item.payload.assign(r.payload.begin(), r.payload.end());
+  };
+  if (!talos::launcher::MergeLogs(
+          files,
+          [&](const MergedRecord& r) {
+            ++records;
+            if (r.source == nullptr) return true;
+            if (is(r, EventKind::SEND)) {
+              if (r.header.aux == kSendOk && taken.insert(key(r)).second) {
+                keep(r, true);
+              }
+            } else if (is(r, EventKind::MESSAGE)) {
+              const Publication publication = key(r);
+              const bool values = !sent.contains(publication) &&
+                                  taken.insert(publication).second;
+              if (values || r.header.aux > 0) keep(r, values);
+            }
+            return true;
+          },
+          error, talos::launcher::MergeWarnings::kQuiet)) {
+    return false;
   }
   // MergeLogs orders by event time; a WPILOG is stamped by publication.
   std::stable_sort(
       items.begin(), items.end(),
       [](const Item& a, const Item& b) { return a.time_ns < b.time_ns; });
-  return items;
+  return true;
 }
 
 struct Totals {
@@ -602,8 +640,7 @@ struct Totals {
 };
 
 // Writes `items` to `writer`; see README.md for the mapping.
-Totals WriteItems(const std::vector<MergedRecord>& records,
-                  const std::vector<Item>& items, std::int64_t start_ns,
+Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
                   talos::wpilog::Writer& writer) {
   Totals totals;
   Entries entries{writer};
@@ -625,21 +662,21 @@ Totals WriteItems(const std::vector<MergedRecord>& records,
   };
 
   for (const Item& item : items) {
-    const MergedRecord& r = records[item.index];
     const std::uint64_t time_us = Micros(item.time_ns, start_ns);
-    const std::string& topic = r.source_name;
-    if (r.header.kind == static_cast<std::uint16_t>(EventKind::MESSAGE) &&
-        r.header.aux > 0) {
-      std::int64_t& total = dropped[{r.process_name, topic}];
-      total += r.header.aux;
+    const std::string& process = item.log->process_name;
+    const std::string& topic = item.source->name;
+    if (item.kind == static_cast<std::uint16_t>(EventKind::MESSAGE) &&
+        item.aux > 0) {
+      std::int64_t& total = dropped[{process, topic}];
+      total += item.aux;
       payload.clear();
       talos::wpilog::AppendInt64(payload, total);
-      const std::string suffix = DroppedSuffix(r.process_name, topic);
+      const std::string suffix = DroppedSuffix(process, topic);
       write(Join(kCounterOwner, suffix), kCounterOwner, suffix, "int64",
             dropped_metadata, time_us);
     }
     if (!item.values) continue;
-    const talos::schema::Identity& identity = r.source->schema;
+    const talos::schema::Identity& identity = item.source->schema;
     auto plan_at = plans.find({topic, identity.name, identity.hash});
     if (plan_at == plans.end()) {
       plan_at = plans
@@ -652,11 +689,12 @@ Totals WriteItems(const std::vector<MergedRecord>& records,
       totals.skipped.try_emplace(topic, plan.why);
       continue;
     }
-    if (r.payload.size() != plan.bytes) {
-      totals.skipped.try_emplace(topic, SizeMismatch(r.payload.size(), plan));
+    if (item.payload.size() != plan.bytes) {
+      totals.skipped.try_emplace(topic,
+                                 SizeMismatch(item.payload.size(), plan));
       continue;
     }
-    const std::byte* data = r.payload.data();
+    const std::byte* data = item.payload.data();
     for (const Leaf& leaf : plan.leaves) {
       payload.clear();
       const std::size_t element_bytes = flatbuffers::GetTypeSize(leaf.base);
@@ -769,7 +807,7 @@ int Convert(const Options& options) {
   std::uint64_t session_id = 0;
   for (const auto& file : files) {
     try {
-      const talos::event::log::LogReader reader{file};
+      const talos::event::log::WindowedLogReader reader{file};
       start_ns = std::min(start_ns, reader.start_time().nanos());
       session_id = reader.session_id();
     } catch (const talos::event::log::IncompleteLogHeader&) {
@@ -782,9 +820,9 @@ int Convert(const Options& options) {
     return Fail("no readable .tlog files");
   }
 
-  std::vector<MergedRecord> records;
-  if (!talos::launcher::MergeLogs(files, records, error)) return Fail(error);
-  const std::vector<Item> items = SelectItems(records);
+  std::vector<Item> items;
+  std::size_t records = 0;
+  if (!SelectItems(files, items, records, error)) return Fail(error);
 
   std::ofstream out{temp.path(), std::ios::binary | std::ios::trunc};
   if (!out) return Fail("cannot write " + options.output);
@@ -792,7 +830,7 @@ int Convert(const Options& options) {
   try {
     talos::wpilog::Writer writer{
         out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
-    totals = WriteItems(records, items, start_ns, writer);
+    totals = WriteItems(items, start_ns, writer);
     out.flush();
     const bool written = writer.ok() && out.good();
     out.close();
@@ -810,7 +848,7 @@ int Convert(const Options& options) {
   std::printf(
       "tlog_to_wpilog: %zu files, %zu records -> %zu entries, %zu "
       "values in %s\n",
-      files.size(), records.size(), totals.entries, totals.values,
+      files.size(), records, totals.entries, totals.values,
       options.output.c_str());
   return 0;
 }

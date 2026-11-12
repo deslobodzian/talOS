@@ -1,109 +1,114 @@
 #include "talOS/launcher/log_merge.h"
 
 #include <exception>
+#include <functional>
 #include <iostream>
+#include <optional>
+#include <queue>
 #include <tuple>
 #include <utility>
 
+#include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 
 namespace talos::launcher {
 
-std::shared_ptr<const event::Registration> ResolveSource(
-    const std::shared_ptr<const event::Manifest>& manifest,
-    std::uint16_t source_id) {
-  for (const auto& reg : *manifest) {
-    if (reg.id == source_id) return {manifest, &reg};
+const event::Registration* MergedLog::source(std::uint16_t source_id) const {
+  for (const auto& reg : manifest) {
+    if (reg.id == source_id) return &reg;
   }
   return nullptr;
 }
 
 bool MergeLogs(const std::vector<std::string>& log_paths,
-               std::vector<MergedRecord>& out_records, std::string& error) {
-  out_records.clear();
+               const std::function<bool(const MergedRecord&)>& visit,
+               std::string& error, MergeWarnings warnings) {
   error.clear();
   if (log_paths.empty()) {
     error = "no log files provided";
     return false;
   }
+  const bool warn = warnings == MergeWarnings::kPrint;
 
-  struct ReaderState {
-    std::string path;
-    std::unique_ptr<event::log::LogReader> reader;
-    std::shared_ptr<const event::Manifest> manifest;
-    event::log::LogReader::Record current;
-    bool has_record{false};
+  // One open log: its reader's fixed window and the record at its head.
+  struct Member {
+    event::log::WindowedLogReader reader;
+    MergedRecord current;
   };
-  std::vector<ReaderState> states;
-  states.reserve(log_paths.size());
-  // Reads the next intact record. A log the reader skipped damage in still
-  // merges, and its damage is named once, when it ends; session_report
-  // parses this line.
-  const auto advance = [](ReaderState& state) {
-    state.has_record = state.reader->next(state.current);
-    if (state.has_record) return;
-    if (const std::string damage =
-            event::log::DescribeDamage(state.reader->damage());
-        !damage.empty()) {
-      std::cerr << "warning: damaged log " << state.path << ": " << damage
-                << "\n";
+  std::vector<Member> members;
+  members.reserve(log_paths.size());
+  // Reads the member's next intact record. A log the reader skipped damage
+  // in still merges, and its damage is named once, when it ends.
+  const auto advance = [warn](Member& member) {
+    event::log::LogReader::Record record;
+    if (!member.reader.next(record)) {
+      if (const std::string damage =
+              event::log::DescribeDamage(member.reader.damage());
+          warn && !damage.empty()) {
+        std::cerr << "warning: damaged log " << member.current.log->path << ": "
+                  << damage << "\n";
+      }
+      return false;
     }
+    MergedRecord& current = member.current;
+    current.header = record.header;
+    current.payload = record.payload;
+    current.source =
+        record.header.kind == static_cast<std::uint16_t>(event::EventKind::EXIT)
+            ? nullptr
+            : current.log->source(record.header.source_id);
+    return true;
   };
 
   for (const auto& path : log_paths) {
-    ReaderState state;
+    std::optional<event::log::WindowedLogReader> reader;
     try {
-      state.reader = std::make_unique<event::log::LogReader>(path);
+      reader.emplace(path);
     } catch (const event::log::IncompleteLogHeader& e) {
       // A log cut while it was being created holds no records.
-      std::cerr << "warning: skipping " << path << ": " << e.what() << "\n";
+      if (warn) {
+        std::cerr << "warning: skipping " << path << ": " << e.what() << "\n";
+      }
       continue;
     } catch (const std::exception& e) {
       error = "failed to open " + path + ": " + e.what();
       return false;
     }
-    if (!states.empty() &&
-        state.reader->session_id() != states.front().reader->session_id()) {
+    if (!members.empty() &&
+        reader->session_id() != members.front().reader.session_id()) {
       error = "session_id mismatch: file '" + path + "' has session_id " +
-              std::to_string(state.reader->session_id()) + ", expected " +
-              std::to_string(states.front().reader->session_id());
+              std::to_string(reader->session_id()) + ", expected " +
+              std::to_string(members.front().reader.session_id());
       return false;
     }
-    state.manifest =
-        std::make_shared<const event::Manifest>(state.reader->manifest());
-    state.path = path;
-    advance(state);
-    states.push_back(std::move(state));
+    auto log = std::make_shared<MergedLog>();
+    log->path = path;
+    log->process_name = reader->process_name();
+    log->manifest = reader->manifest();
+    members.push_back(Member{std::move(*reader), MergedRecord{.log = log}});
   }
 
-  const auto key = [](const ReaderState& state) {
-    const auto& header = state.current.header;
-    return std::tuple{header.event_time_ns, header.now_ns,
-                      header.dispatch_index};
+  // The members with a record at their head, the earliest on top: by event
+  // time, now, dispatch index, then input order.
+  using Key =
+      std::tuple<std::int64_t, std::int64_t, std::uint64_t, std::size_t>;
+  const auto key = [&](std::size_t index) {
+    const auto& header = members[index].current.header;
+    return Key{header.event_time_ns, header.now_ns, header.dispatch_index,
+               index};
   };
-  for (;;) {
-    ReaderState* best = nullptr;
-    for (auto& state : states) {
-      if (state.has_record && (best == nullptr || key(state) < key(*best))) {
-        best = &state;
-      }
-    }
-    if (best == nullptr) return true;
-
-    MergedRecord record;
-    record.process_name = best->reader->process_name();
-    if (best->current.header.kind !=
-        static_cast<std::uint16_t>(event::EventKind::EXIT)) {
-      record.source =
-          ResolveSource(best->manifest, best->current.header.source_id);
-    }
-    record.source_name = record.source ? record.source->name : "?";
-    record.header = best->current.header;
-    record.payload.assign(best->current.payload.begin(),
-                          best->current.payload.end());
-    out_records.push_back(std::move(record));
-    advance(*best);
+  std::priority_queue<Key, std::vector<Key>, std::greater<>> heads;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    if (advance(members[i])) heads.push(key(i));
   }
+  while (!heads.empty()) {
+    const std::size_t index = std::get<3>(heads.top());
+    heads.pop();
+    Member& member = members[index];
+    if (!visit(member.current)) return true;
+    if (advance(member)) heads.push(key(index));
+  }
+  return true;
 }
 
 }  // namespace talos::launcher

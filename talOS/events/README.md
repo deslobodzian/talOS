@@ -358,6 +358,11 @@ and byte offsets; exact replay (`ReplayEventLoop`, `--replay`) refuses a log
 with records missing between intact ones, and replays a damaged tail's prefix
 as it does a truncated log's.
 
+`log::LogReader` holds the whole file; `log::WindowedLogReader` (and
+`VisitLog` on it) reads the same records, damage skipped the same way,
+through a fixed 64 KiB window, so a reader of a whole session (`log_dump`,
+`tlog_to_wpilog`) holds memory per log, not per record.
+
 Format details live in `log/format.h`. The version field is checked on read;
 readers reject a version they do not know rather than guessing.
 Readers reject unsupported versions with both recorded and supported versions
