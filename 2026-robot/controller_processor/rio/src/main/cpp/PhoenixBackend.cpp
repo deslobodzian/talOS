@@ -641,12 +641,13 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
     // FaultField is its own 50 Hz signal, separate from the motion feedback
-    // that sets `valid`. A stale FaultField reports no asserted limit, so a
-    // limit getter never reports an old switch state, but keeps its last
-    // fault bits: losing the signal must not un-fault a faulted motor.
+    // that sets `valid`. A stale FaultField reports no asserted limit and no
+    // active current limiter (kMotorNotFaultFlags), so neither a limit getter
+    // nor a display shows an old state, but keeps its last fault bits: losing
+    // the signal must not un-fault a faulted motor.
     auto& faults = motor.GetFaultField(false);
     out.fault_flags = faults.GetValue();
-    if (!Fresh(faults)) out.fault_flags &= ~hw::kMotorLimitAssertedFlags;
+    if (!Fresh(faults)) out.fault_flags &= ~hw::kMotorNotFaultFlags;
     // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
     // healthy; lost motion feedback isolates only the affected motor.
@@ -719,11 +720,14 @@ bool PhoenixBackend::Read(hw::State& s) {
                  motor_config.can_id, late_us, p, v, motor_late_[i],
                  motor_peak_age_us_[i]);
     healthy |= out.valid;
+    // An invalid sample carries zero in every measured field
+    // (talOS/hardware/README.md, fault scope).
     if (!out.valid) {
       out.position_rot = 0;
       out.velocity_rps = 0;
       out.voltage = 0;
       out.stator_current_a = 0;
+      out.supply_current_a = 0;
     }
   }
   for (std::size_t i = 0; i < sensors_.size(); ++i) {
