@@ -29,8 +29,14 @@ traffic, but not while faulted or while configuration/restoration is pending.
 The RoboRIO atomically and durably (synced file, rename, synced directory)
 saves acknowledged configuration bytes with a CRC32 to
 `/home/lvuser/talos_config.bin` (`talos_config.bin` in desktop simulation;
-`ConfigStore` in the RoboRIO program), on its first disabled tick after the
-acknowledgement, since the storage sync blocks the loop. Startup validates
+`ConfigStore` in the RoboRIO program). The loop hands the acknowledged
+configuration over on its first disabled tick after the acknowledgement, and
+a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
+on: the loop only try-locks the handover, never waits on the save, and polls
+its outcome on later ticks. A configuration acknowledged while a save runs is
+saved after it, newest last; a failed save prints `cannot persist hardware
+configuration`, keeps the previous file, and an identical push saves it
+again. Startup validates
 them and starts their restoration on the configure worker without waiting for
 it, so robot code reports ready at once; the gateway stays unconfigured,
 refusing commands, until the worker finishes. Missing or corrupt files leave
@@ -530,8 +536,8 @@ One that ends past it (an overrun, or a wake more than a period late) drops
 the missed ticks instead of running them back to back, sleeps 500 µs and
 counts the next period from there, so the phase moves
 (`src/main/include/LoopSchedule.h`). Whenever it runs, the loop takes the
-CPU from every thread on its core below `SCHED_FIFO` 10: the logger and the
-companion reporter (nice 19), ssh, the program's CAN threads (`can_psend`,
+CPU from every thread on its core below `SCHED_FIFO` 10: the logger, the
+companion reporter and the config saver (nice 19), ssh, the program's CAN threads (`can_psend`,
 `can_recv`), netcomm, and the three `SCHED_RR` threads. The 500 µs bounds
 the share a loop that overruns every tick takes; a loop whose work is just
 under the period still takes nearly all of its core, and with throttling
