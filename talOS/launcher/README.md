@@ -982,11 +982,16 @@ descriptor decoder, without robot-specific schemas. It reports manifest config
 identity and source revision, node exits/restarts/quarantine/recorder
 failures/caps, each node's loop tier and realtime outcome, each node's
 delivery loss (its nonzero `wake_failures`, `stalled_arms`, `wake_fallbacks`
-and `requests_skipped`, the registry row's counts summed over its runs as
-the manifest's per-node fields of those names carry them, or NOT RECORDED
-without them; [wake loss](../introspection/README.md#wake-loss)), each node's binary
+and `requests_skipped`, the bridge's split per subsystem, as the manifest's
+per-node fields of those names carry them; "none" when all are 0, NOT
+RECORDED without them; [wake loss](../introspection/README.md#wake-loss)),
+each node's binary
 digest and runs with the reason each ended
-([session manifest](#session-manifest)), an unfinished
+([session manifest](#session-manifest)), each output whose bytes the
+launcher's `talos.log` says were dropped (a member's `<name>.log`,
+`talos.log` itself, the launcher's stdout or stderr, with the count; NOT
+RECORDED for a manifest without `launcher_log`; informational, since the
+output logs are not the measured record), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, the bridge's request-to-command delay, and every scalar
@@ -1032,10 +1037,13 @@ and with every bridge and control loop holding its full realtime grant. Off
 only a loop that asked (`TALOS_REALTIME=1`) and was refused a step does.
 Observers, nodes that never reported, and manifests that predate the fields
 (*NOT RECORDED*) are listed but not judged. It also fails on any node's
-nonzero `wake_failures` (a reader left asleep until its backstop) or
-`requests_skipped` (a request its subsystem never merged); `stalled_arms`
-and `wake_fallbacks` are shown but lose nothing published, and a manifest
-without the fields is not judged.
+nonzero `wake_failures` (a reader left asleep until its backstop),
+`requests_skipped` (a request its subsystem never merged) or
+`wake_fallbacks` (a run that drained on a poll tick instead of on
+publication, so its prompt handlers' latency and the no-polling guarantee
+did not hold); `stalled_arms` (the guard against a transport misreporting
+unread data, which still drains that watcher on timers and the backstop)
+is shown but not judged, and neither is a manifest without the fields.
 It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
 lateness and bridge request-to-command rows are informational and not

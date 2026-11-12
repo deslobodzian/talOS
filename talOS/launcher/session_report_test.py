@@ -241,30 +241,59 @@ class SessionReportTest(unittest.TestCase):
             node("hardware_node", "bridge", "refused", "policy")]}), {"hardware_node"})
 
     # REQ-OPS-16, REQ-RT-19, REQ-RT-20 (TODO.md RT-7): a wake a writer lost
-    # left a reader asleep until its backstop, and a request the bridge
-    # passed over is one its subsystem never merged; either rejects the
-    # session. The registry row's counts, as the launcher records them.
-    def test_strict_rejects_a_lost_wake_or_a_skipped_request(self):
-        def report(**counters):
-            node = {"name": "drivetrain", "log_path": "/s/drivetrain.tlog", **counters}
-            return session_report.analyze({"end_wall_ns": 1, "nodes": [node]}, [])
-        def failing(**counters):
-            result = report(**counters)
-            failures = session_report.strict_failures(result)
-            return [issue for issue in result["delivery_issues"] if issue in failures]
-        clean = dict(wake_failures=0, stalled_arms=0, wake_fallbacks=0, requests_skipped=0)
-        self.assertEqual(failing(**clean), [])
-        self.assertEqual(len(failing(**{**clean, "wake_failures": 3})), 1)
-        self.assertEqual(len(failing(**{**clean, "requests_skipped": 2})), 1)
-        # Shown, but not a loss of anything published: a stalled arm still
-        # waits on its backstop, and a fallback polls.
-        self.assertEqual(failing(**{**clean, "stalled_arms": 1, "wake_fallbacks": 1}), [])
-        self.assertEqual(report(**{**clean, "stalled_arms": 1, "wake_fallbacks": 1})
-                         ["nodes"][0]["delivery"], "stalled_arms=1, wake_fallbacks=1")
-        self.assertEqual(report(**clean)["nodes"][0]["delivery"], "none")
-        # A manifest that predates the counts is not judged.
-        self.assertEqual(report()["nodes"][0]["delivery"], "NOT RECORDED")
-        self.assertEqual(failing(), [])
+    # left a reader asleep until its backstop, a request the bridge passed
+    # over is one its subsystem never merged, and a wake fallback polled;
+    # each rejects the session, naming the node and the count. The registry
+    # row's counts as the launcher records them: absent in a manifest that
+    # predates them, recorded zeros, and recorded losses.
+    def test_delivery_loss_is_reported_and_strict_rejects_a_loss(self):
+        def strict(nodes):
+            report = session_report.analyze({"end_wall_ns": 1, "nodes": nodes}, [])
+            failures = session_report.strict_failures(report)
+            section = session_report.markdown(report).split("## Delivery loss\n")[1]
+            return ([issue for issue in report["delivery_issues"] if issue in failures],
+                    section.split("\n\n")[0].splitlines())
+        def node(name, **counters):
+            return {"name": name, "log_path": f"/s/{name}.tlog", **counters}
+        zeros = dict(wake_failures=0, stalled_arms=0, wake_fallbacks=0,
+                     requests_skipped=0, requests_skipped_by_subsystem={})
+        for label, nodes, failures, shown in (
+                ("not recorded", [node("drivetrain")], [],
+                 ["- drivetrain: NOT RECORDED"]),
+                ("recorded zeros", [node("drivetrain", **zeros)], [],
+                 ["- drivetrain: none"]),
+                ("recorded losses", [
+                    node("drivetrain", **{**zeros, "wake_failures": 3, "stalled_arms": 1}),
+                    node("intake", **{**zeros, "wake_fallbacks": 1}),
+                    node("hardware_node", **{**zeros, "requests_skipped": 2,
+                                             "requests_skipped_by_subsystem": {"intake": 2}})],
+                 ["drivetrain: wake_failures=3", "intake: wake_fallbacks=1",
+                  "hardware_node: requests_skipped=2 (intake=2)"],
+                 ["- drivetrain: wake_failures=3, stalled_arms=1",
+                  "- intake: wake_fallbacks=1",
+                  "- hardware_node: requests_skipped=2 (intake=2)"])):
+            with self.subTest(label):
+                # A stalled arm is shown, never rejected: the loop still
+                # drains that watcher on its timers and backstop.
+                self.assertEqual(strict(nodes), (failures, shown))
+
+    # REQ-OPS-10: a line the launcher could not keep leaves the terminal
+    # record incomplete, so the report names each output that lost bytes
+    # from the launcher's notes in its talos.log, read beside the manifest.
+    def test_reports_the_output_talos_log_says_was_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = {"launcher_log": "/robot/logs/7/talos.log"}
+            self.assertEqual(session_report.launcher_drops(directory, {}), None)
+            with open(os.path.join(directory, "talos.log"), "w") as log:
+                log.write("[launcher] Starting session 7 with 2 nodes...\n"
+                          "[launcher] 812 bytes of output dropped here: the "
+                          "launcher's log writer fell behind\n"
+                          "[launcher] arm: 4096 bytes of output dropped (marked in "
+                          "/robot/logs/7/arm.log)\n")
+            self.assertEqual(session_report.launcher_drops(directory, manifest),
+                             ["812 bytes dropped from talos.log (the launcher's log "
+                              "writer fell behind)",
+                              "4096 bytes dropped from arm.log"])
 
     def test_missing_log_dump_is_an_input_error(self):
         with tempfile.TemporaryDirectory() as directory, \

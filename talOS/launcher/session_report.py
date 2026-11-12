@@ -98,28 +98,77 @@ def realtime_issue(node, simulation):
 
 # What each node's registry row says it lost (talOS/introspection README
 # "Wake loss"), as the launcher records it per node, summed over its runs:
-# each should stay 0. NOT RECORDED in a manifest that predates the counts.
+# each should stay 0. NOT RECORDED in a manifest that predates the counts,
+# and for a member whose row the launcher never saw (Studio's bridge).
 DELIVERY_COUNTERS = ("wake_failures", "stalled_arms", "wake_fallbacks", "requests_skipped")
-# The counts --strict rejects: a wake notification a writer could not send
+# The counts --strict rejects. A wake notification a writer could not send
 # left its reader asleep until its backstop, and a request the bridge's
-# latest-value read passed over is one its subsystem never merged. A stalled
-# arm still waits on its backstop and a fallback polls, so those two are
-# shown but lose nothing published.
-STRICT_DELIVERY = ("wake_failures", "requests_skipped")
+# latest-value read passed over is one its subsystem never merged. A wake
+# fallback lost nothing, but its run drained on a poll tick instead of on
+# publication: the no-polling guarantee (REQ-RT-02, REQ-RT-21) and the
+# latency of every prompt handler (REQ-RT-19) did not hold for it. A stalled
+# arm is the loop's guard against a transport that misreports unread data:
+# it still drains that watcher on timers and its backstop and never polls,
+# so it is shown but not rejected.
+STRICT_DELIVERY = ("wake_failures", "requests_skipped", "wake_fallbacks")
 
 
 def delivery_summary(node):
     """A node's nonzero delivery counters, "none", or NOT RECORDED."""
     if not any(key in node for key in DELIVERY_COUNTERS):
         return "NOT RECORDED"
-    return ", ".join(f"{key}={node[key]}" for key in DELIVERY_COUNTERS
+    return ", ".join(delivery_count(node, key) for key in DELIVERY_COUNTERS
                      if node.get(key)) or "none"
 
 
+def delivery_count(node, key):
+    """`key=value`; the bridge's skipped requests also per subsystem."""
+    split = node.get("requests_skipped_by_subsystem") if key == "requests_skipped" else None
+    detail = f" ({', '.join(f'{k}={v}' for k, v in split.items())})" if split else ""
+    return f"{key}={node[key]}{detail}"
+
+
 def delivery_issues(node):
-    """Why a node's run lost published input, one line per nonzero count."""
-    return [f"{node.get('name')}: {key} = {node[key]}"
+    """Why --strict rejects a node's runs, one line per nonzero count."""
+    return [f"{node.get('name')}: {delivery_count(node, key)}"
             for key in STRICT_DELIVERY if node.get(key)]
+
+
+# The launcher's own notes in talos.log (talOS/launcher child_output.cc) of
+# output it could not keep, each with its byte count and the output it was
+# lost from: a member's <name>.log, talos.log itself, or the launcher's
+# stdout or stderr.
+LAUNCHER_DROPS = (
+    (re.compile(r"^\[launcher\] (\S+): (\d+) bytes of output dropped \(marked in (.+)\)$",
+                re.MULTILINE),
+     lambda m: f"{m[2]} bytes dropped from {Path(m[3]).name}"),
+    (re.compile(r"^\[launcher\] (\d+) bytes of output dropped here: (.+)$", re.MULTILINE),
+     lambda m: f"{m[1]} bytes dropped from talos.log ({m[2]})"),
+    (re.compile(r"^\[launcher\] (\d+) bytes for the launcher's (\w+) were not written",
+                re.MULTILINE),
+     lambda m: f"{m[1]} bytes dropped from the launcher's {m[2]}"),
+    (re.compile(r"^\[launcher\] output log reached (\d+) bytes; later output is dropped$",
+                re.MULTILINE),
+     lambda m: f"talos.log reached its {m[1]}-byte cap; later lines dropped"),
+)
+
+
+def launcher_drops(session, manifest):
+    """One line per output the launcher's talos.log says lost bytes, in the
+    order noted; None when the manifest names no launcher log (written before
+    it did). The file is read beside the manifest, wherever the session was
+    copied."""
+    name = manifest.get("launcher_log")
+    if not name:
+        return None
+    path = Path(session) / Path(name).name
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as error:
+        return [f"{path.name} unreadable ({error.strerror})"]
+    found = [(m.start(), describe(m)) for pattern, describe in LAUNCHER_DROPS
+             for m in pattern.finditer(text)]
+    return [line for _, line in sorted(found)]
 
 
 def request_to_command(records):
@@ -150,7 +199,7 @@ def request_to_command(records):
     return process, delays
 
 
-def analyze(manifest, records, log_damage=()):
+def analyze(manifest, records, log_damage=(), output_drops=None):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
     ds = [r for r in ds if "ds_enabled" in r]
@@ -292,6 +341,9 @@ def analyze(manifest, records, log_damage=()):
             "realtime_issues": realtime_issues,
             "realtime_exempt": realtime_exempt,
             "delivery_issues": delivery,
+            # launcher_drops(); informational: output logs are not
+            # acceptance evidence, the event logs are.
+            "output_drops": output_drops,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
@@ -346,9 +398,12 @@ def markdown(report):
     if report["realtime_exempt"]:
         lines.append("- not judged (--sim, realtime never requested): "
                      + ", ".join(report["realtime_exempt"]))
-    lines += ["", "## Delivery loss"] + (
-        ["- " + s for s in report["delivery_issues"]] or
-        ["- no node recorded a lost wake or a skipped request"])
+    lines += ["", "## Delivery loss"] + [f"- {n['name']}: {n['delivery']}"
+                                         for n in report["nodes"]]
+    drops = report["output_drops"]
+    lines += ["", "## Launcher output"] + (
+        ["- NOT RECORDED (the manifest names no launcher log)"] if drops is None else
+        ["- " + s for s in drops] or ["- talos.log notes no dropped output"])
     lines += ["", "## Timing (ms)", f"State stream: {report['state_stream'] or 'NOT MEASURED'}",
               "| Measurement | Count | Median | p99 | Max |", "|---|---:|---:|---:|---:|"]
     entries = {"/hw/state overall": report["state_overall"],
@@ -413,7 +468,8 @@ def main():
         result = subprocess.run([log_dump_path(), "--format", "jsonl", str(args.session)],
                                 capture_output=True, text=True, check=True)
         report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()],
-                         DAMAGED_LOG.findall(result.stderr))
+                         DAMAGED_LOG.findall(result.stderr),
+                         launcher_drops(args.session, manifest))
         print(json.dumps(report, indent=2) if args.json else markdown(report))
         if not args.strict:
             return 0
