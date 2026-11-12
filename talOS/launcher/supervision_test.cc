@@ -328,6 +328,7 @@ constexpr std::string_view kLoopUntilStopped = "while :; do sleep 0.05; done\n";
 // in the manifest, and stops the session (exit 1) on its own, before its
 // duration; --allow-graph-errors records it and the session runs on until
 // it is stopped, alpha's run ending with that stop, not the mismatch.
+// REQ-CONTRACT-11: live endpoints differing from the probe stop the session
 TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
   auto options = EndpointOptions("endpoint_drift", true);
   EXPECT_EQ(RunSession(options), 1);

@@ -323,6 +323,7 @@ TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
 }
 
+// REQ-SAFE-03: DIO and PWM go neutral while disabled or after requests stop
 TEST(Devices, DigitalAndPwmOutputsNeutralizeWhileDisabledOrStale) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -1023,6 +1024,7 @@ TEST(Devices, UnknownDeviceThrows) {
 // did not set, so a 20 ms every() on a 5 ms node would drive its motor one
 // tick in four. Outputs set outside update() are refused, naming the device;
 // a constructor command (flushed at most once, on the first tick) is too.
+// REQ-SAFE-06: setters called outside update() throw, naming the device
 TEST(Devices, OutputSettersOutsideUpdateThrow) {
   struct Pulser {
     explicit Pulser(Node& node) : motor{node, "a"} {

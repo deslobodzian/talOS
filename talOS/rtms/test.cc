@@ -86,6 +86,7 @@ TEST(LayoutValidation, RejectsInvalidOptionsBeforeMapping) {
   }
 }
 
+// REQ-CONTRACT-21: an attach rejects a segment whose offset or stride is wrong
 TEST(LayoutValidation, RejectsCorruptOffsetAndStride) {
   const auto path = make_test_path("layout");
   RTMSQueue owner{path, 8, 8, kSchema, 2, {.session_owner = true}};

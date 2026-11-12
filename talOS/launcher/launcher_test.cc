@@ -1287,6 +1287,7 @@ TEST(LauncherGraphTest, ProbesRunInParallel) {
   std::filesystem::remove_all(started);
 }
 
+// REQ-SAFE-28: a non-critical node that sends a target lane is a graph error.
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
   GraphFixture fixture{"optional_target",
                        DescribingStub("alpha", "//example/alpha:node",
@@ -1379,6 +1380,7 @@ TEST(LauncherGraphTest, DescribeOnlyLintsWithoutStartingAnything) {
   EXPECT_NE(fixture.graph_json().find("\"name\": \"beta\""), std::string::npos);
 }
 
+// REQ-OPS-01: a graph error makes --describe-only exit non-zero, no manifest
 TEST(LauncherGraphTest, DescribeOnlyReportsABrokenGraphAsAFailure) {
   GraphFixture fixture{
       "preflight_broken",

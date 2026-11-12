@@ -585,6 +585,7 @@ TEST(HardwareNodeTest, ReplayFeedsEachPublishedStateOnceAsReadersSawIt) {
   EXPECT_EQ(fed, seen);
 }
 
+// REQ-SAFE-19: a request for another subsystem's device is rejected whole
 TEST(HardwareNodeTest, RejectsRequestsForDevicesOwnedByAnotherSubsystem) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   ASSERT_EQ(cfg.hardware.motors.size(), 2u);
@@ -1087,6 +1088,7 @@ TEST(HardwareNodeTest, ReorderedAndRetiredBootStatesChangeNothing) {
 // the accepted State's boot, so a low-uptime boot B's packets go through
 // right after the reboot, and a boot-A packet delayed past it, or one from a
 // boot whose State has not arrived, does not.
+// REQ-SAFE-11: only Driver Station packets of the accepted boot are forwarded
 TEST(HardwareNodeTest, ForwardsDriverStationPacketsOnlyFromTheCurrentBoot) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
   const uint64_t config_id = NodeConfigId(cfg);

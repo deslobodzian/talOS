@@ -314,6 +314,7 @@ TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
 
 // One writer per topic keeps the dispatch log replayable. Both writers are
 // named, because one of them has to be moved to its own lane.
+// REQ-CONTRACT-09: two writers on one topic are a lint error naming both.
 TEST(LintGraph, TwoWritersIsAnErrorNamingBoth) {
   const std::vector<NodeShape> nodes = {
       {"autonomous",

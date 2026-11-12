@@ -472,6 +472,7 @@ std::size_t FixtureRecordOffset(const std::vector<ExpectedRecord>& expected,
 
 // One damaged record mid-log costs only itself: the reader resynchronises at
 // the next intact record and counts the bytes it skipped.
+// REQ-CONTRACT-20: a damaged record is skipped and its bytes counted
 TEST(LogCorruption, DamagedRecordIsSkippedAndCounted) {
   const std::string path = TempPath("payload_corrupt");
   const std::vector<ExpectedRecord> expected =

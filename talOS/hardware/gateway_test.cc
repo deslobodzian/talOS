@@ -66,6 +66,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
 // The build identity sits after the seven u64 words of the State prefix. A
 // program value this build does not know, or a dirty byte other than 0 or 1,
 // is a malformed State, not a guess; and an unknown program never encodes.
+// REQ-CONTRACT-30: unknown program or dirty byte other than 0/1 is rejected
 TEST(Messages, GatewayBuildRejectsUnknownProgramsAndNonBooleanDirty) {
   State state;
   state.build = {0xfedcba9876543210ull, GatewayProgram::kSimGateway, false};
@@ -487,6 +488,7 @@ TEST(Gateway, SequenceCountsEveryTick) {
   EXPECT_EQ(g.snapshot().sequence, 3u);
 }
 
+// REQ-SAFE-20: refused while disabled, uncommissioned or mismatched
 TEST(Gateway, RequiresEnableCommissioningAndMatchingManifest) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -530,6 +532,7 @@ TEST(Gateway, NeutralRefusedWhileUnableToDriveIsNotARejection) {
     EXPECT_EQ(backend.applied, 0);
   }
 }
+// REQ-SAFE-17: a command with a wrong boot, epoch, sequence or age is rejected
 TEST(Gateway, RejectsOldBootEpochSequenceAndDelayedCommands) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -1045,6 +1048,7 @@ TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
   EXPECT_EQ(backend.configure_calls, configures + 1);
   EXPECT_NE(g.snapshot().epoch, epoch);
 }
+// REQ-SAFE-21: a config change applies only while disabled
 TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -1300,6 +1304,7 @@ TEST(ConfigWire, FullyCappedSerializationMatchesAssemblyLimit) {
   EXPECT_EQ(assembler.config(), config);
 }
 
+// REQ-CONTRACT-04: oversized chunk metadata is rejected before allocation
 TEST(ConfigWire, RejectsUnboundedChunkMetadataAndRecovers) {
   const auto config = SwerveConfig(false);
   const auto chunks = CreateConfigChunks(config, 200);
@@ -2239,6 +2244,7 @@ TEST(Gateway, FailedDeviceConfigureAndRestoreLeaveOthersDriving) {
 // A control-send failure on one motor quarantines only that motor and its
 // follower; the rest of the command, DIO and PWM keep applying and no global
 // fault latches however often it repeats. Restore brings the motor back.
+// REQ-SAFE-23: a device-local apply failure neutralizes only its motor chain
 TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
   FakeBackend backend;
   auto config = SwerveConfig(true);
