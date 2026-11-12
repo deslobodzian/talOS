@@ -317,6 +317,7 @@ wrote my_robot/main_processor/claw/claw.cc
 wrote my_robot/main_processor/claw/node_test.cc
 wrote my_robot/main_processor/claw/testdata/robot.toml
 wrote my_robot/main_processor/claw/testdata/claw.toml
+wrote my_robot/main_processor/claw/testdata/neighbor.toml
 wrote my_robot/main_processor/configuration/subsystems/claw.toml
 ...
 ```
