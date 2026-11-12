@@ -3,6 +3,8 @@
     python3 tools/slow_tests.py                 # bazel-testlogs, over 3 s
     python3 tools/slow_tests.py --threshold 5
     python3 tools/slow_tests.py --bep events.json
+    python3 tools/slow_tests.py --check          # fail on a lane budget
+    python3 tools/slow_tests.py --check --lanes lanes.txt
 
 By default it reads every `test.xml` under `bazel-testlogs` (from the
 workspace root), so it needs no extra `bazel test` flag: each file is the
@@ -14,13 +16,18 @@ action's wall time in whole seconds, refined by Python unittest's own
 `bazel test --build_event_json_file=FILE`) it reads that invocation's
 attempt durations instead, in milliseconds.
 
-The budget is docs/TESTING.md §9. It reports and exits 0; it is not a check.
+The budgets are docs/TESTING.md §9. Without `--check` it reports and exits
+0. With `--check` it exits 1 when a test action exceeds its lane's budget: a
+target with no lane tag is in the fast lane (5 s). The lane tags come from
+`--lanes FILE` (lines of `<label> <lane>`; unlisted labels are fast), or,
+without it, from one `bazel query` per lane.
 """
 
 import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ElementTree
 
@@ -100,6 +107,45 @@ def from_bep(lines):
     return results
 
 
+# Lane budgets in seconds (docs/TESTING.md §9). An untagged test is fast.
+BUDGETS = {"fast": 5.0, "heavy": 120.0, "integration": 30.0, "e2e": 180.0,
+           "perf": 60.0}
+LANE_TAGS = ("heavy", "integration", "e2e", "perf")
+
+
+def read_lanes(lines):
+    """{label: lane} from `<label> <lane>` lines."""
+    lanes = {}
+    for line in lines:
+        fields = line.split()
+        if len(fields) == 2:
+            lanes[fields[0]] = fields[1]
+    return lanes
+
+
+def query_lanes():
+    """{label: lane} for every test carrying a lane tag, from bazel query."""
+    lanes = {}
+    for lane in LANE_TAGS:
+        expression = f"attr(tags, '[\\[ ]{lane}[,\\]]', tests(//...))"
+        output = subprocess.run(
+            ["bazel", "query", "--keep_going", "--noshow_progress", expression],
+            capture_output=True, text=True, check=False).stdout
+        for label in output.split():
+            lanes[label] = lane
+    return lanes
+
+
+def over_budget(results, lanes):
+    """(label, seconds, lane) for each action over its lane's budget."""
+    over = []
+    for label, seconds in results:
+        lane = lanes.get(label.split(" ", 1)[0], "fast")
+        if seconds > BUDGETS.get(lane, BUDGETS["fast"]):
+            over.append((label, seconds, lane))
+    return sorted(over, key=lambda r: (-r[1], r[0]))
+
+
 def report(results, threshold, out):
     """Prints the results over `threshold` seconds, slowest first."""
     slow = sorted((r for r in results if r[1] > threshold),
@@ -118,6 +164,9 @@ def main(argv=None):
     parser.add_argument("--testlogs", default="bazel-testlogs",
                         help="the test logs tree (default bazel-testlogs)")
     parser.add_argument("--bep", help="a --build_event_json_file to read instead")
+    parser.add_argument("--check", action="store_true",
+                        help="exit 1 when a test exceeds its lane's budget")
+    parser.add_argument("--lanes", help="`<label> <lane>` lines (default: bazel query)")
     args = parser.parse_args(argv)
     if args.bep:
         with open(args.bep, encoding="utf-8") as handle:
@@ -126,8 +175,20 @@ def main(argv=None):
         if not os.path.isdir(args.testlogs):
             parser.error(f"{args.testlogs}: no test logs; run bazel test first")
         results = from_testlogs(args.testlogs)
-    report(results, args.threshold, sys.stdout)
-    return 0
+    if not args.check:
+        report(results, args.threshold, sys.stdout)
+        return 0
+    if args.lanes:
+        with open(args.lanes, encoding="utf-8") as handle:
+            lanes = read_lanes(handle)
+    else:
+        lanes = query_lanes()
+    over = over_budget(results, lanes)
+    for label, seconds, lane in over:
+        print(f"{seconds:8.1f} s  {label}  over the {lane} lane's "
+              f"{BUDGETS.get(lane, BUDGETS['fast']):g} s", file=sys.stdout)
+    print(f"{len(over)} of {len(results)} test actions over their lane budget")
+    return 1 if over else 0
 
 
 if __name__ == "__main__":

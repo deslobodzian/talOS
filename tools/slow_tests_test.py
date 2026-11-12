@@ -68,6 +68,16 @@ class SlowTestsTest(unittest.TestCase):
         self.assertEqual(slow_tests.from_bep(lines), [
             ("//a:slow_test (run 2)", 4.25), ("//a:new_test", 3.5)])
 
+    def test_check_holds_untagged_tests_to_five_seconds_and_tagged_to_their_lane(self):
+        results = [("//a:unit_test", 5.5), ("//a:ok_test", 4.9),
+                   ("//a:sim_test (shard_1_of_2)", 29.0), ("//a:sim_test", 31.0),
+                   ("//a:render_test", 100.0)]
+        lanes = slow_tests.read_lanes(io.StringIO(
+            "//a:sim_test integration\n//a:render_test heavy\n"))
+        self.assertEqual(slow_tests.over_budget(results, lanes), [
+            ("//a:sim_test", 31.0, "integration"),
+            ("//a:unit_test", 5.5, "fast")])
+
 
 if __name__ == "__main__":
     unittest.main()
