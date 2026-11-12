@@ -1480,16 +1480,16 @@ std::vector<std::int64_t> EveryPeriod(std::int64_t period_ns,
 
 // REQ-OPS-32. With a window W, a capped log keeps between 7/8 of W and W of
 // its newest record time whatever its rate, while its bytes fit: a log at
-// 10 records/s and one at 1000/s, 60.5 s each, under a cap that holds 8 s of
+// 10 records/s and one at 1000/s, 10.5 s each, under a cap that holds 8 s of
 // the fast one, both keep 7 to 8 s of a W = 8 s window. Without the window
-// (or uncapped) the slow log keeps all of its 60.5 s, as before; a cap too
+// (or uncapped) the slow log keeps all of its 10.5 s, as before; a cap too
 // small for W / 8 of the fast log's records still ends its segments on
 // bytes, so it keeps less.
 TEST(LogCapture, WindowEndsSegmentsOnRecordTime) {
   constexpr std::int64_t kSecond = 1'000'000'000;
   constexpr std::int64_t kRecord = sizeof(RecordHeader) + 16;
-  const auto slow = EveryPeriod(kSecond / 10, 60 * kSecond + kSecond / 2);
-  const auto fast = EveryPeriod(kSecond / 1000, 60 * kSecond + kSecond / 2);
+  const auto slow = EveryPeriod(kSecond / 10, 10 * kSecond + kSecond / 2);
+  const auto fast = EveryPeriod(kSecond / 1000, 10 * kSecond + kSecond / 2);
   // Eight segments, each 1.25 s of the fast log's records.
   const std::uint64_t cap =
       8 * (RecordsOffset() + static_cast<std::uint64_t>(1250 * kRecord));
@@ -1518,7 +1518,7 @@ TEST(LogCapture, WindowEndsSegmentsOnRecordTime) {
   EXPECT_LE(total, small.max_bytes);
   EXPECT_LT(KeptSpanSeconds(bound), 5.0);
 
-  // No window, or no cap: the slow log is one file, all 60.5 s of it.
+  // No window, or no cap: the slow log is one file, all 10.5 s of it.
   LogWriter::Options bytes_only = options;
   bytes_only.window = {};
   LogWriter::Options uncapped = options;
@@ -1526,7 +1526,7 @@ TEST(LogCapture, WindowEndsSegmentsOnRecordTime) {
   for (const auto& unrotated : {bytes_only, uncapped}) {
     const auto files = WriteTimedLog(path, unrotated, slow);
     EXPECT_EQ(files.size(), 1u);
-    EXPECT_GT(KeptSpanSeconds(files), 60.0);
+    EXPECT_GT(KeptSpanSeconds(files), 10.0);
   }
   for (const auto& file : LogSegmentFiles(path)) ::unlink(file.c_str());
   ::unlink(CappedMarkerPath(path).c_str());
@@ -1555,6 +1555,40 @@ TEST(LogCapture, WindowIgnoresAClockThatDoesNotAdvance) {
   while (reader.next(record)) newest.push_back(record.header.now_ns);
   EXPECT_EQ(newest, (std::vector<std::int64_t>{35 * kSecond, 35 * kSecond}));
   for (const auto& file : files) ::unlink(file.c_str());
+}
+
+// REQ-OPS-32. Every rotation syncs durably on the writer thread and takes a
+// chunk from the pool, so a window too small for that (a 1 ns window, or a
+// budget whose window collapsed) once ended a segment at every record, and
+// a pool exhausted by rotations stops capture for the session. No window
+// ends a segment sooner than sync_interval of record time after its first
+// record: 10.5 s of records every 1 ms under a 1 ns window keeps eight
+// segments that each start at least sync_interval after the one before.
+TEST(LogCapture, WindowNeverEndsASegmentSoonerThanTheSyncInterval) {
+  constexpr std::int64_t kSecond = 1'000'000'000;
+  constexpr std::int64_t kRecord = sizeof(RecordHeader) + 16;
+  const auto path = TempPath("window_floor");
+  // Room for 2 s of records per segment: only time can end one sooner.
+  LogWriter::Options options{
+      64u << 10, 1, /*background=*/false,
+      8 * (RecordsOffset() + static_cast<std::uint64_t>(2000 * kRecord))};
+  options.window = std::chrono::nanoseconds{1};
+  options.sync_interval = std::chrono::milliseconds{500};
+  const auto files = WriteTimedLog(
+      path, options, EveryPeriod(kSecond / 1000, 10 * kSecond + kSecond / 2));
+  ASSERT_EQ(files.size(), kLogSegments);
+  std::vector<std::int64_t> starts;
+  for (const auto& file : files) {
+    LogReader reader{file};
+    LogReader::Record record;
+    ASSERT_TRUE(reader.next(record)) << file;
+    starts.push_back(record.header.now_ns);
+  }
+  for (std::size_t i = 1; i < starts.size(); ++i) {
+    EXPECT_EQ(starts[i] - starts[i - 1], kSecond / 2) << files[i];
+  }
+  for (const auto& file : files) ::unlink(file.c_str());
+  ::unlink(CappedMarkerPath(path).c_str());
 }
 
 TEST(LogCapture, UncappedWriterLeavesNoMarker) {

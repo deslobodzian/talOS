@@ -118,8 +118,13 @@ struct LogWriterOptions {
   // after the segment's first record, so the log keeps between (n - 1) / n
   // of `window` and `window` of its newest records, unless a segment reaches
   // max_bytes / n first. A record whose time is not past the segment's first
-  // (a clock that did not advance, or an older record) never ends it. Zero,
-  // or an uncapped log: segments end on bytes only.
+  // (a clock that did not advance, or an older record) never ends it. A
+  // segment's time never ends it sooner than sync_interval after its first
+  // record, whatever the window: each rotation syncs durably on the writer
+  // thread and takes a chunk, so faster rotation could exhaust the pool and
+  // stop capture. A smaller window is clamped, not refused, so a small
+  // budget degrades a node's tail rather than its start. Zero, or an
+  // uncapped log: segments end on bytes only.
   std::chrono::nanoseconds window{0};
 
   // How often the writer fsyncs the file, after writing the committed prefix
@@ -133,6 +138,12 @@ struct LogWriterOptions {
   // by a signal can lose, plus the writer's scheduling delay.
   std::chrono::nanoseconds write_interval{std::chrono::milliseconds{10}};
 };
+
+// LogWriterOptions::window from a `--log-window-us` value (microseconds; 0
+// ends segments on bytes only), as node and bridge binaries take it from the
+// launcher. Throws std::invalid_argument for a value that is not a whole
+// number or does not fit the window's nanoseconds.
+std::chrono::nanoseconds ParseLogWindowUs(const std::string& value);
 
 // The marker a byte-capped writer leaves next to its log (see max_bytes).
 inline std::string CappedMarkerPath(std::string_view log_path) {
@@ -294,7 +305,7 @@ class LogWriter {
     std::uint64_t segment{0};
     std::uint64_t segment_used{0};
     // Record time per segment (Options::window / segment_count, at least
-    // 1 ns); zero when segments end on bytes only.
+    // Options::sync_interval); zero when segments end on bytes only.
     std::uint64_t segment_span_ns{0};
     // Producer only: the now_ns of the segment's first record.
     std::int64_t segment_first_ns{0};

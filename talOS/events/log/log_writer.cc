@@ -6,10 +6,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <stdexcept>
 #include <system_error>
 #include <utility>
 
@@ -66,6 +68,23 @@ void UseNormalScheduling() noexcept {
 }
 
 }  // namespace
+
+std::chrono::nanoseconds ParseLogWindowUs(const std::string& value) {
+  constexpr std::uint64_t kLargest =
+      static_cast<std::uint64_t>(std::chrono::nanoseconds::max().count()) /
+      1000;
+  std::uint64_t us = 0;
+  const auto [end, error] =
+      std::from_chars(value.data(), value.data() + value.size(), us);
+  if (error != std::errc{} || end != value.data() + value.size() ||
+      us > kLargest) {
+    throw std::invalid_argument(
+        "--log-window-us: not a window in "
+        "microseconds: " +
+        value);
+  }
+  return std::chrono::microseconds{static_cast<std::int64_t>(us)};
+}
 
 #if defined(__APPLE__)
 
@@ -756,8 +775,12 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       state.segment_count = count;
       state.segment_bytes = state.options.max_bytes / count;
       if (state.options.window.count() > 0) {
+        // Never sooner than sync_interval: each rotation syncs durably and
+        // takes a chunk, so a window whose segments end faster than the
+        // writer syncs could exhaust the pool and stop capture for good.
         state.segment_span_ns = std::max<std::uint64_t>(
-            1,
+            static_cast<std::uint64_t>(
+                std::max<std::int64_t>(1, state.options.sync_interval.count())),
             static_cast<std::uint64_t>(state.options.window.count()) / count);
       }
     }
