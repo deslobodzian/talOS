@@ -1,0 +1,121 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("//talOS/build:contract.bzl", "talos_messages")
+
+# A recorded session's index, channels, series and snapshots, and the review
+# API over them as a function of a request: everything but the socket.
+cc_library(
+    name = "review",
+    srcs = [
+        "hardware_channels.cc",
+        "review.cc",
+        "session.cc",
+    ],
+    hdrs = [
+        "hardware_channels.h",
+        "review.h",
+        "series_cache.h",
+        "session.h",
+    ],
+    deps = [
+        "//studio/bridge:system",
+        "//studio/bridge:telemetry",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/launcher:hardware_record",
+        "//talOS/launcher:log_inputs",
+        "//talOS/launcher:log_merge",
+        "//talOS/launcher:session",
+        "//talOS/schema:identity",
+        "//talOS/schema:unit_suffix",
+        "//talOS/telemetry:channels",
+        "//talOS/telemetry:frames",
+        "@flatbuffers//:runtime_cc",
+        "@nlohmann_json//:json",
+    ],
+)
+
+# studio_review --library DIR [--port 5805] [--cache-mb 256]; README.md,
+# "Reviewing a session".
+cc_binary(
+    name = "studio_review",
+    srcs = ["main.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":review",
+        "@studio_usockets//:usockets",
+        "@studio_uws//:uws",
+    ],
+)
+
+talos_messages(
+    name = "review_test_message",
+    srcs = ["testdata/review_message.fbs"],
+    include_prefix = "review_test",
+    visibility = ["//visibility:private"],
+)
+
+# The fixture session both tests read: two members, a rotated log, a
+# restart, a damaged record, a schema'd topic and hardware packets.
+cc_library(
+    name = "fixture",
+    testonly = True,
+    srcs = ["testdata/fixture.cc"],
+    hdrs = ["testdata/fixture.h"],
+    deps = [
+        ":review_test_message",
+        "//talOS/driver_station",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/hardware",
+    ],
+)
+
+# Values against log_dump --format jsonl, the index's seeks, the cache's
+# bound and the session id check, with no socket.
+cc_test(
+    name = "review_test",
+    size = "small",
+    srcs = ["tests/review_test.cc"],
+    data = ["//talOS/launcher:log_dump"],
+    env = {"TALOS_LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)"},
+    deps = [
+        ":fixture",
+        ":review",
+        "//talOS/events:events_log",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# The binary over loopback: the HTTP shapes, and no listener off loopback.
+cc_test(
+    name = "http_test",
+    size = "small",
+    srcs = ["tests/http_test.cc"],
+    data = [":studio_review"],
+    env = {"TALOS_STUDIO_REVIEW": "$(rlocationpath :studio_review)"},
+    deps = [
+        ":fixture",
+        "@googletest//:gtest_main",
+        "@nlohmann_json//:json",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+# Open time and peak resident memory on a generated session of at least
+# 200 MB; run by hand on an idle host (README.md, "Reviewing a session").
+cc_binary(
+    name = "review_bench",
+    testonly = True,
+    srcs = ["tests/review_bench.cc"],
+    tags = ["manual"],
+    deps = [
+        ":review",
+        ":review_test_message",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+    ],
+)
