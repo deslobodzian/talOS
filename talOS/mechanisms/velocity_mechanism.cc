@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <optional>
 #include <string>
 
 namespace talos::mechanisms {
 
 VelocityMechanism::VelocityMechanism(Node& node, std::string_view name)
     : node_{&node},
+      link_{&node.extension<HardwareLink>()},
       label_{"VelocityMechanism '" + std::string{name} + "'"},
       motor_{node, name},
+      velocity_age_bound_{RezeroAgeBound(link_->config().hardware)},
       max_rps_{MotorConfigOf(node, name).max_velocity_rps} {
   const Params params{node, name};
   entry_rps_ = params.positive("at_speed_entry_rps", 2.0);
@@ -77,8 +80,18 @@ void VelocityMechanism::update() {
     driving_ = true;
   }
   velocity_rps_ = motor_.velocity();
+  velocity_recent_ = velocity_recent();
   current_a_ = motor_.current();
   readiness(spin ? request_rps_ : 0.0);
+}
+
+// The velocity's age at its State, judged as Motor::rezero judges a
+// position's (RezeroAgeBound); unknown (no sample time, no clock mapping)
+// is never recent.
+bool VelocityMechanism::velocity_recent() const {
+  const std::optional<Time> sampled = motor_.velocity_time();
+  const std::optional<Time> state = link_->sample_time();
+  return sampled && state && *state - *sampled <= velocity_age_bound_;
 }
 
 // The shooter's readiness rule: consecutive ticks inside the entry band of
@@ -98,7 +111,10 @@ void VelocityMechanism::readiness(double requested_rps) {
     const double error_rps = std::abs(velocity_rps_ - goal_rps_);
     const double exit_rps =
         std::max(entry_rps_, exit_frac_ * std::abs(goal_rps_));
-    if (at_speed) {
+    if (!velocity_recent_) {
+      at_speed = false;
+      entry_ticks_ = 0;
+    } else if (at_speed) {
       if (error_rps > exit_rps) {
         at_speed = false;
         entry_ticks_ = 0;
