@@ -143,6 +143,12 @@ void WriteShooterRun(const std::string& path, int first, int last,
       const review_test::Status status{kBootId};
       writer.send(tick, kStatus, Bytes(status), 0, 0);
     }
+    if (k == kFailedShot) {
+      // A send the transport failed (SendStatus 2): logged, never received.
+      review_test::Shot failed = ShotOf(k);
+      failed.mutate_position_m(-1.0);
+      writer.send(tick, kShot, Bytes(failed), 2, 0);
+    }
   }
   writer.flush();
   Check(writer);

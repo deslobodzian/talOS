@@ -101,14 +101,16 @@ std::map<std::string, std::string> Fields(const std::string& decoded) {
 }
 
 // The values of the records of `topic` that `process` logged as `kind`, by
-// `value` (which returns false for a record without one).
+// `value` (which returns false for a record without one); a SEND only when
+// its transport accepted it (aux 0), as only those reached a reader.
 std::vector<Expected> Values(
     const std::vector<json>& records, const std::string& process,
     const std::string& kind, const std::string& topic,
     const std::function<bool(const json&, double&)>& value) {
   std::vector<Expected> out;
   for (const json& r : records) {
-    if (r["process"] != process || r["kind"] != kind || r["topic"] != topic) {
+    if (r["process"] != process || r["kind"] != kind || r["topic"] != topic ||
+        (kind == "SEND" && r["aux"] != 0)) {
       continue;
     }
     double v = 0;
@@ -245,11 +247,11 @@ void ExpectSameBuckets(const std::vector<Bucket>& actual,
 // record: a schema'd struct field, a Driver Station channel under its live
 // telemetry name, and a decoded hardware request. Reading a reader's copy
 // instead of the writer's, a receipt time instead of the publication time,
-// a skipped segment or restart, or a damaged record decoded anyway, changes
-// a count, a value or a time. Every channel shares the same bucket edges,
-// dividing [start_ns, end_ns) evenly: a shot published exactly at end_ns is
-// in no bucket.
-// REQ-OPS-41
+// a skipped segment or restart, a damaged record decoded anyway, or a failed
+// send (tick kFailedShot's, logged after the accepted one, at 4 s) taken as
+// a value, changes a count, a value or a time. Every channel shares the same
+// bucket edges, dividing [start_ns, end_ns) evenly: a shot published exactly at
+// end_ns is in no bucket. REQ-OPS-41
 TEST_F(ReviewTest, SnapshotAndSeriesEqualLogDump) {
   Review review{Library(), 1u << 20};
   const std::vector<std::pair<std::string, std::vector<Expected>>> channels{

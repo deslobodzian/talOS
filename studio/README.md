@@ -211,7 +211,9 @@ Station packet as its live `hw/state/driver_station/*` channels, and the other
 hardware packets (`/hw/state`, `/hw/command`, `/hw/request/<node>`) by
 `log_dump`'s own decoder, a device by its logical id
 (`hw/request/shooter/motors/1/demand`). A topic is read from its writer's
-SEND records, else from the first reader's MESSAGE records. Every time is
+accepted SEND records (a send the transport refused or failed is logged
+too, and reached no reader), else from the first reader's MESSAGE records.
+Every time is
 nanoseconds on the recording's monotonic clock (the merge's event time), and
 every value carries its publication time; `origin_wall_ns + t_ns` is the
 wall-clock time. A damaged log is read and warned about as `log_dump` reads

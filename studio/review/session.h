@@ -15,15 +15,17 @@
 // read window per log), and keeps per log file one Checkpoint per second of
 // event time that holds a record: where that second's first record starts
 // (an offset meaningful only with its file's path) and which of the file's
-// sources recorded a value (a SEND or MESSAGE record) that second. That is 24 B
-// per log-file second whatever the record rate, and nothing per record: every
-// later read seeks to a checkpoint (event::log::VisitLog's start_offset) and
-// reads only the seconds it needs, through one window.
+// sources recorded a value (an accepted SEND or a MESSAGE record) that
+// second. That is 24 B per log-file second whatever the record rate, and
+// nothing per record: every later read seeks to a checkpoint
+// (event::log::VisitLog's start_offset) and reads only the seconds it needs,
+// through one window.
 //
 // Values. A topic is read from one process's logs, all its segments and
-// restarts: the writer's, whose SEND records hold every message it
-// published, else the first reader's (by log path) MESSAGE records, as
-// event::RecordedSession chooses. A value is decoded as log_dump decodes it:
+// restarts: the writer's, whose accepted SEND records
+// (event::log::IsAcceptedSend) hold every message it published, else the
+// first reader's (by log path) MESSAGE records, as event::RecordedSession
+// chooses. A value is decoded as log_dump decodes it:
 // a talos_messages struct (and a target envelope's header and message) by
 // its recorded schema, named by talOS/telemetry:channels as live telemetry
 // names it; the Driver Station packet as telemetry reads it; the other
@@ -53,7 +55,8 @@ namespace studio::review {
 
 // One second of one log file: the second (event time, floor of ns / 1e9),
 // where its first record starts, and bit i set when source id i (ids from
-// 63 on share bit 63) has a value record (SEND or MESSAGE) in it. A READ or
+// 63 on share bit 63) has a value record (a SEND its transport accepted, or a
+// MESSAGE) in it; a failed send reached no reader and is no value. A READ or
 // HANDLER_EXIT record sets no bit: a watcher read every tick holds no new
 // value, so it must not make a snapshot read that second.
 struct Checkpoint {

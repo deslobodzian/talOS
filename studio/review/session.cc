@@ -40,9 +40,11 @@ std::uint64_t SourceBit(std::uint16_t source_id) {
   return std::uint64_t{1} << std::min<std::uint16_t>(source_id, 63);
 }
 
-bool IsValueRecord(std::uint16_t kind) {
-  return kind == static_cast<std::uint16_t>(EventKind::SEND) ||
-         kind == static_cast<std::uint16_t>(EventKind::MESSAGE);
+// A value a reader received: a MESSAGE, or a SEND its transport accepted
+// (a failed send is logged too, and reached no reader).
+bool IsValueRecord(const tlog::RecordHeader& header) {
+  return header.kind == static_cast<std::uint16_t>(EventKind::MESSAGE) ||
+         tlog::IsAcceptedSend(header);
 }
 
 // The header and message channels of a target envelope (schema.h
@@ -229,7 +231,7 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (r.header.kind == static_cast<std::uint16_t>(EventKind::EXIT)) {
       return true;
     }
-    if (!IsValueRecord(r.header.kind)) return true;
+    if (!IsValueRecord(r.header)) return true;
     log_file.checkpoints.back().sources |= SourceBit(r.header.source_id);
     if (r.source == nullptr || r.payload.empty()) return true;
     FileBuild& build = builds[file];
@@ -502,7 +504,10 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
           [&](const auto& s) { return s.first == header.source_id; });
       if (source == sources.end()) return true;
       const Topic& topic = topics_[source->second];
-      if (header.kind != static_cast<std::uint16_t>(topic.kind)) return true;
+      if (header.kind != static_cast<std::uint16_t>(topic.kind) ||
+          !IsValueRecord(header)) {
+        return true;
+      }
       const std::int64_t publish_ns = header.publish_time_ns;
       if (publish_ns < start_ns || publish_ns >= end_ns) return true;
       if (!Decode(topic, record.payload, raw, present)) return true;
@@ -600,7 +605,7 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
           if (item.candidate != second || item.id != header.source_id) continue;
           const Topic& topic = topics_[item.topic];
           if (header.kind != static_cast<std::uint16_t>(topic.kind) ||
-              header.publish_time_ns > t_ns ||
+              !IsValueRecord(header) || header.publish_time_ns > t_ns ||
               header.publish_time_ns < item.found.publish_ns) {
             continue;
           }
