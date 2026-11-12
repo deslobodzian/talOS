@@ -59,6 +59,7 @@ change is made and verified: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 ./sim.sh --sim-gateway --no-studio   # lightweight simulator, no WPILib needed
 ./sim.sh                             # WPILib simulation of the RoboRIO + Studio
 ./sim.sh --help
+./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway --no-studio  # another robot
 ```
 
 Check a robot's graph without starting it:
