@@ -85,6 +85,26 @@ def bound_port(bridge):
     return int(line.split()[1])
 
 
+def stop(processes):
+    """SIGTERM every process still running, then reap each (SIGKILL after 5 s).
+
+    All are signalled before any is waited for: a bridge exits at its next
+    loop wake, up to a second after the signal, and waiting for each in turn
+    added those seconds up.
+    """
+    for process in processes:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+    for process in reversed(processes):
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        if process.stdout:
+            process.stdout.close()
+
+
 class BridgeIntegration(unittest.TestCase):
     def test_transports(self):
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
@@ -324,16 +344,7 @@ class BridgeIntegration(unittest.TestCase):
                         f"http://127.0.0.1:{http_port}/oversized.js", timeout=3)
                 self.assertEqual(too_large.exception.code, 413)
             finally:
-                for process in reversed(processes):
-                    if process.poll() is None:
-                        process.send_signal(signal.SIGTERM)
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                    if process.stdout:
-                        process.stdout.close()
+                stop(processes)
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
@@ -407,16 +418,7 @@ class BridgeIntegration(unittest.TestCase):
             finally:
                 if mock.stdin:
                     mock.stdin.close()
-                for process in reversed(processes):
-                    if process.poll() is None:
-                        process.send_signal(signal.SIGTERM)
-                        try:
-                            process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                    if process.stdout:
-                        process.stdout.close()
+                stop(processes)
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
