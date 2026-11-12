@@ -54,10 +54,12 @@ usage() {
   cat <<'USAGE'
 
 Options:
-  --config FILE     the robot config to run, relative to the repository root
-                    or the current directory (default: 2026-robot's robot.toml,
-                    or robot_physics_sim.toml with --sim-gateway); its
-                    generated manifest must be current
+  --config FILE     the robot config to run, inside the repository: absolute,
+                    or relative to the repository root, else to the current
+                    directory (refused when it names a different file under
+                    each); default: 2026-robot's robot.toml, or
+                    robot_physics_sim.toml with --sim-gateway. Its generated
+                    manifest must be current
   --headless       run the WPILib sim without its GUI (sets TALOS_SIM_DS=auto)
   --mode-schedule S script the Driver Station as mode:seconds phases
                     (disabled, auto, teleop, test; the last is held). With
@@ -173,9 +175,18 @@ if [ -z "$CONFIG" ]; then
     CONFIG="2026-robot/main_processor/configuration/robot_physics_sim.toml"
   fi
 else
+  # A relative path names the file under the repository root, else the one
+  # under the caller's directory; one that names a different file under each
+  # is refused rather than silently taking the root's.
   case "$CONFIG" in
     /*) ;;
-    *) [ -f "$CONFIG" ] || CONFIG="$CALLER_DIR/$CONFIG" ;;
+    *)
+      if [ -f "$CONFIG" ] && [ -f "$CALLER_DIR/$CONFIG" ] &&
+         ! [ "$CONFIG" -ef "$CALLER_DIR/$CONFIG" ]; then
+        die "--config $CONFIG is ambiguous: it names both $ROOT/$CONFIG and $CALLER_DIR/$CONFIG; pass an absolute path"
+      fi
+      [ -f "$CONFIG" ] || CONFIG="$CALLER_DIR/$CONFIG"
+      ;;
   esac
   [ -f "$CONFIG" ] || die "no robot config at $CONFIG"
   CONFIG="$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG")"

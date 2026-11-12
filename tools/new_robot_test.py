@@ -4,7 +4,9 @@ mechanism drivable, and a name that cannot be a robot is refused."""
 
 import json
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -43,17 +45,43 @@ def workspace(tmp):
     return work, launcher, env
 
 
-def stand_in_binary(work, mechanism):
-    """Puts the C++ mechanism's binary where `bazel build` of the generated
-    package would: the package is new_subsystem's output, which
+def stand_in_binary(work, mechanism, lang):
+    """Puts a node binary where `bazel build` of the generated package would.
+
+    A C++ mechanism is new_subsystem's output, which
     tools/scaffold_testdata/<mechanism> holds built (new_subsystem_test keeps
-    the two equal)."""
+    the two equal), so its binary stands in. A Python mechanism runs the
+    generated file itself, the way talos_py_node's runner does, with the
+    message modules talos_messages built from the golden package's identical
+    schema: a test cannot run flatc and descriptor_gen on the new one.
+    """
     package = os.path.join(work, "bazel-bin", "my_robot", "main_processor",
                            mechanism)
     os.makedirs(package)
-    os.symlink(os.path.join(work, "tools", "scaffold_testdata", mechanism,
-                            "node"),
-               os.path.join(package, "node"))
+    node = os.path.join(package, "node")
+    golden = os.path.join(work, "tools", "scaffold_testdata", mechanism)
+    if lang == "cpp":
+        os.symlink(os.path.join(golden, "node"), node)
+        return
+    source = os.path.join(work, "my_robot", "main_processor", mechanism,
+                          f"{mechanism}.py")
+    runner = (
+        "import sys, talos\n"
+        f"node = talos.load({source!r})\n"
+        f"sys.exit(talos.run(node.{new_subsystem.pascal(mechanism)}, "
+        f"{mechanism!r}, '//my_robot/main_processor/{mechanism}:node'))\n")
+    with open(os.path.join(package, "node_runner.py"), "w",
+              encoding="utf-8") as f:
+        f.write(runner)
+    path = os.pathsep.join(
+        [os.path.join(golden, "messages_py_gen")] + sys.path[1:])
+    with open(node, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n"
+                f"PYTHONPATH={shlex.quote(path)} exec "
+                f"{shlex.quote(sys.executable)} "
+                f"{shlex.quote(os.path.join(package, 'node_runner.py'))} "
+                '"$@"\n')
+    os.chmod(node, 0o755)
 
 
 def generate(work, mechanism, lang, kind="velocity"):
@@ -62,7 +90,7 @@ def generate(work, mechanism, lang, kind="velocity"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-    stand_in_binary(work, mechanism)
+    stand_in_binary(work, mechanism, lang)
     return can_id
 
 
@@ -97,7 +125,8 @@ def edit(path, replacements):
 class NewRobotTest(unittest.TestCase):
     # REQ-DEV-23
     def test_generated_robot_passes_the_graph_lint(self):
-        for mechanism, lang in (("gripper", "cpp"),):
+        # C++ with the golden binary; Python with the generated node file.
+        for mechanism, lang in (("gripper", "cpp"), ("scaffold_py", "py")):
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
                 work, launcher, env = workspace(tmp)
                 self.assertEqual(generate(work, mechanism, lang), 1)
