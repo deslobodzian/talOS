@@ -453,8 +453,16 @@ every other one has been sent to once (`ClientRotation` in
 next update is larger than another's can be passed over while the shared
 bucket holds the smaller one but not its own. A client that still has
 output buffered is held: it skips passes, and its telemetry resumes from the
-latest values once it drains; uWebSockets disconnects it only past its
-**512 KiB** `maxBackpressure`. Each client's kernel send buffer is what its
+latest values once it drains. Being held never disconnects a client: the
+bridge sends nothing while output is buffered, so at most one graph message
+or update, never more than the **64,000 B** burst, is ever buffered, below
+uWebSockets' **512 KiB** `maxBackpressure` (past which a send would be
+dropped, not the client closed: `closeOnBackpressureLimit` is off). What
+does disconnect a client that stops reading is uWebSockets' default idle
+timeout (**120 s**): **104 s** after the last data it received from the
+client it sends a ping, and it closes the client if nothing arrives in the
+next **16 s**. Studio's browser answers pings, so a client that is reading
+stays connected. Each client's kernel send buffer is what its
 share sends in **250 ms**, at least **16 KiB** (`ClientSendBuffer` in
 `studio/bridge/telemetry.h`): 16,384 B at the default 4 clients, 40,000 B
 at 1. macOS uses that size as given; Linux reserves twice it, about the size

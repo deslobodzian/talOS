@@ -139,7 +139,9 @@ quarter second of its share, at least 16 KiB
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)),
 so a client that stops reading backs up after that much of its output and is
 held from then on, costing the others no turn and the budget no byte. A
-stalled client holds its slot until disconnected. What its send
+stalled client holds its slot until uWebSockets' idle timeout closes it,
+about two minutes after the last data it sent (the same Data flow section
+gives the timings). What its send
 buffer already holds is stale when it resumes, so reconnect a stalled viewer
 for fresh data.
 The graph's bridge statistics include `clients`, `refused`, `ws_drops`,
