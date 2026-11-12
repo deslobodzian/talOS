@@ -60,6 +60,18 @@ export type SystemSource = {
 // does: robot disabled, Driver Station stale, or no live lane in the mode.
 export type SystemSelection = {sources: string[]; selected: string|null};
 
+// What a node lost of what it should have been woken for or delivered, from
+// its registry row (talOS/introspection README "Wake loss"), each cumulative
+// since the node started and normally 0: wake notifications its writers could
+// not send, prompt watchers whose stalled arms stopped holding its loop
+// awake, runs that fell back to polling, and (the hardware bridge) requests
+// its latest-value reads passed over.
+export const DELIVERY_COUNTERS = [
+  'wake_failures', 'stalled_arms', 'wake_fallbacks', 'requests_skipped'
+] as const;
+export type DeliveryCounter = typeof DELIVERY_COUNTERS[number];
+export type DeliveryLoss = Record<DeliveryCounter, string>;
+
 export type SystemNode = {
   name: string; target: string; slot: number; pid: string; session_id: string;
   generation: string;
@@ -74,7 +86,16 @@ export type SystemNode = {
   // The node's Targets, in the order it opened them. Empty for a node that
   // drives nothing, and for a bridge that predates the field.
   selections: SystemSelection[];
+  // Null (or absent) from a bridge that predates the counters: not
+  // reported, not zero.
+  delivery?: DeliveryLoss|null;
 };
+
+// The node's nonzero delivery counters, in DELIVERY_COUNTERS order; empty
+// when it lost nothing or did not report.
+export const deliveryLoss = (node: SystemNode): [DeliveryCounter, string][] =>
+    DELIVERY_COUNTERS.filter(key => (node.delivery?.[key] ?? '0') !== '0')
+        .map(key => [key, node.delivery![key]]);
 
 export type SystemTopic = {
   name: string; message_bytes: number; publishers: string[];
@@ -255,6 +276,16 @@ function selections(node: Record<string, unknown>,
       .map((entry, i) => parseSelection(entry, `${where}.selections[${i}]`));
 }
 
+// Absent is read as not reported rather than refused, the rule `flag`
+// follows: a bridge built before the counters sends no `delivery`.
+function delivery(node: Record<string, unknown>): DeliveryLoss|null {
+  if (node.delivery === undefined) return null;
+  const counters = record(node.delivery, 'delivery');
+  return Object.fromEntries(
+             DELIVERY_COUNTERS.map(key => [key, u64(counters, key)])) as
+      DeliveryLoss;
+}
+
 function parseNode(value: unknown, where: string): SystemNode {
   const node = record(value, where);
   return {
@@ -274,7 +305,8 @@ function parseNode(value: unknown, where: string): SystemNode {
     sources:
         list(node, 'sources', MAX_SOURCES)
             .map((entry, i) => parseSource(entry, `${where}.sources[${i}]`)),
-    selections: selections(node, where)
+    selections: selections(node, where),
+    delivery: delivery(node)
   };
 }
 
@@ -349,6 +381,10 @@ function fastSlots(root: Record<string, unknown>): [Record<string, unknown>, str
     const node = record(entry, `nodes[${i}]`);
     for (const key of ['heartbeat_wall_ns', 'dispatch_count', 'alive'])
       slots.push([node, key]);
+    if (node.delivery !== undefined) {
+      const counters = record(node.delivery, `nodes[${i}].delivery`);
+      for (const key of DELIVERY_COUNTERS) slots.push([counters, key]);
+    }
     list(node, 'sources', MAX_SOURCES).forEach((source, j) => {
       const fields = record(source, `nodes[${i}].sources[${j}]`);
       for (const key of ['events', 'dropped', 'sequence', 'last_monotonic_ns',

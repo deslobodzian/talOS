@@ -349,6 +349,26 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
   out += std::to_string(node.declared_source_count);
   out += ",\"alive\":";
   AppendFast(out, fast, [&] { out += node.alive ? "true" : "false"; });
+  // What the node lost of what it should have been woken for or delivered,
+  // each normally 0 (introspect::DeliveryLoss). Not a version bump: a reader
+  // that predates it ignores it, and one that knows it reads its absence as
+  // "not reported", what an older bridge could say.
+  const introspect::DeliveryLoss loss = node.delivery_loss();
+  out += ",\"delivery\":{";
+  const char* separator = "";
+  for (const auto& [key, value] :
+       {std::pair{"wake_failures", loss.wake_failures},
+        std::pair{"stalled_arms", loss.stalled_arms},
+        std::pair{"wake_fallbacks", loss.wake_fallbacks},
+        std::pair{"requests_skipped", loss.requests_skipped}}) {
+    out += separator;
+    out += '"';
+    out += key;
+    out += "\":";
+    AppendFast(out, fast, [&] { AppendU64(out, value); });
+    separator = ",";
+  }
+  out += '}';
   out += ",\"simulation\":";
   out += (node.flags & introspect::kFlagSimulation) ? "true" : "false";
   out += ",\"replay\":";

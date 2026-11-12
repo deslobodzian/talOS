@@ -1,11 +1,20 @@
-// A single node card: liveness, cadence, dispatch count, and who drives its
-// subsystem. Pure at render (data arrives as props), so react-dom/server can
+// A single node card: liveness, cadence, dispatch count, who drives its
+// subsystem, and what its wake channel lost (quiet at zero). Pure at render (data arrives as props), so react-dom/server can
 // render it in tests. `stale`: the graph is last-known, so liveness is unknown.
 
 import {nodeLiveness} from '../../data/freshness';
-import {drivenBy, isSubscriber, rateKey, type SystemGraph, type SystemNode} from '../../system';
+import {deliveryLoss, drivenBy, isSubscriber, rateKey, type DeliveryCounter,
+        type SystemGraph, type SystemNode} from '../../system';
 import {duration, hertz, integer, staleness} from '../../ui/formatters';
 import {Badge, StatusDot} from '../../ui/primitives';
+
+// Each delivery counter as the card names it: what a person would look for.
+const DELIVERY_LABELS: Record<DeliveryCounter, string> = {
+  wake_failures: 'LOST WAKES',
+  stalled_arms: 'STALLED ARMS',
+  wake_fallbacks: 'POLLING',
+  requests_skipped: 'SKIPPED REQUESTS'
+};
 
 export function NodeCard(
     {graph, node, stale, rates, selected, onSelect}: {
@@ -27,6 +36,7 @@ export function NodeCard(
                       .filter((r): r is number => r !== undefined)
                       .sort((a, b) => b - a)[0];
   const driver = drivenBy(node);
+  const lost = deliveryLoss(node);
   const liveness = nodeLiveness(node, {stale});
 
   return <button
@@ -41,6 +51,8 @@ export function NodeCard(
       {liveness === 'stopped' && <Badge tone="dead">STALE</Badge>}
       {liveness === 'unknown' &&
        <Badge>{`UNKNOWN · last known ${node.alive ? 'alive' : 'stopped'}`}</Badge>}
+      {lost.map(([key, count]) =>
+           <Badge key={key} tone="loss">{`${DELIVERY_LABELS[key]} ${integer(count)}`}</Badge>)}
     </div>
     <code>{node.target || '—'}</code>
     <dl>

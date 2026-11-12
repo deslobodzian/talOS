@@ -200,6 +200,7 @@
 
 .ui-badge.sim { border-color: #7a6bd0; color: #c4b8ff; }
 .ui-badge.dead { border-color: #8a4a58; color: #ffb3c1; }
+.ui-badge.loss { border-color: var(--warn); color: var(--warn); }
 
 .health {
   font-size: 7.5px;

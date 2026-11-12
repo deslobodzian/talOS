@@ -393,6 +393,13 @@ function demoNode(node: DemoNode, slot: number, elapsed: number,
     dispatch_count: String(dispatches),
     declared_sources: sources.length,
     alive: elapsed - live < LIVENESS_SECONDS,
+    // A healthy demo loses no wake and skips no request.
+    delivery: {
+      wake_failures: '0',
+      stalled_arms: '0',
+      wake_fallbacks: '0',
+      requests_skipped: '0'
+    },
     // Nothing here is driving real hardware, and saying so is better than
     // letting the demo pass for a robot.
     simulation: true,

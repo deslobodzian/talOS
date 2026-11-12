@@ -756,6 +756,11 @@ function fastValues(doc: Json): unknown[] {
     values.push(bridge[key]);
   for (const node of doc.nodes as Json[]) {
     values.push(node.heartbeat_wall_ns, node.dispatch_count, node.alive);
+    const delivery = node.delivery as Json|undefined;
+    if (delivery)
+      for (const key of ['wake_failures', 'stalled_arms', 'wake_fallbacks',
+                         'requests_skipped'])
+        values.push(delivery[key]);
     for (const source of node.sources as Json[])
       values.push(source.events, source.dropped, source.sequence,
                   source.last_monotonic_ns, source.last_latency_ns,

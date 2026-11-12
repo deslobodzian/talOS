@@ -135,6 +135,27 @@ test('a node card says who drives its subsystem, and none when nobody does',
      });
 
 
+// REQ-OPS-18, TODO.md RT-7: a node whose wakes were lost, or a bridge that
+// skipped requests, says so on its card; a healthy node, or one from a
+// bridge that predates the counters, shows nothing.
+test('a node card shows lost wakes and skipped requests only when nonzero', () => {
+  const graph = parseSystemGraph(demoSystemGraph(50n));
+  const card = (node: typeof graph.nodes[number]) =>
+      render(<NodeCard graph={graph} stale={false} node={node} rates={{}}
+                       selected={false} onSelect={() => {}}/>);
+  const bridge = graph.nodes.find(n => n.name === 'hardware_node')!;
+  const quiet = card(bridge);
+  assert.ok(!/LOST WAKES|STALLED ARMS|POLLING|SKIPPED REQUESTS/.test(quiet), quiet);
+  assert.equal(card({...bridge, delivery: null}), quiet);
+
+  const lossy = card({...bridge, delivery: {wake_failures: '3', stalled_arms: '0',
+                                            wake_fallbacks: '0',
+                                            requests_skipped: '12'}});
+  assert.match(lossy, /LOST WAKES 3/);
+  assert.match(lossy, /SKIPPED REQUESTS 12/);
+  assert.ok(!/STALLED ARMS|POLLING/.test(lossy), lossy);
+});
+
 test('a malformed document is reported in place of the graph it replaced', () => {
   const html = renderPanel(systemPanel, {
     graph: null,
