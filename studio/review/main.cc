@@ -27,9 +27,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -123,9 +125,9 @@ std::filesystem::path BuiltStudio(const char* argv0) {
                                                       : std::filesystem::path{};
 }
 
-}  // namespace
-
-int main(int argc, char** argv) {
+// Serves until stopped. A failure once the uWS::App exists is thrown, not
+// returned: main reports it with the same status.
+int Run(int argc, char** argv) {
   std::filesystem::path library;
   std::filesystem::path webroot;
   std::uint64_t port = 5805;
@@ -194,19 +196,28 @@ int main(int argc, char** argv) {
   app.listen(kLoopback, static_cast<int>(port),
              [&listener](us_listen_socket_t* token) { listener = token; });
   if (listener == nullptr) {
-    std::cerr << "studio_review: cannot listen on " << kLoopback << ':' << port
-              << '\n';
-    return 1;
+    throw std::runtime_error("cannot listen on " + std::string{kLoopback} +
+                             ':' + std::to_string(port));
   }
   const std::string bound = BoundAddress(listener);
   std::uint64_t parsed_port = 0;
   if (!ParseUnsigned(std::string_view{bound}.substr(bound.rfind(':') + 1),
                      65535, parsed_port)) {
-    std::cerr << "studio_review: cannot read the bound port\n";
-    return 1;
+    throw std::runtime_error("cannot read the bound port");
   }
   bound_port = static_cast<std::uint16_t>(parsed_port);
   std::cout << "listening " << bound << '\n' << std::flush;
   app.run();
   return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  try {
+    return Run(argc, argv);
+  } catch (const std::exception& error) {
+    std::cerr << "studio_review: " << error.what() << '\n';
+    return 1;
+  }
 }
