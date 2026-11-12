@@ -261,6 +261,15 @@ can_id = 2
       << json;
 }
 
+// Guards: a log named more than once (as itself, twice, and through its
+// session directory) is merged once, so each record prints once.
+// REQ-OPS-15
+TEST_F(LogDumpTest, LogNamedTwiceIsReadOnce) {
+  const std::string alpha = directory_ + "/alpha.tlog";
+  const auto records = Run({"--format", "jsonl", alpha, alpha});
+  EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 4) << records;
+}
+
 TEST_F(LogDumpTest, RejectsInvalidOptions) {
   for (const auto& args :
        std::vector<std::vector<std::string>>{{"--unknown"},

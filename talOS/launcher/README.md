@@ -639,6 +639,7 @@ header:
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output) |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
+| `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and `tlog_to_wpilog`'s inputs name, each once |
 | `:log_merge` | `log_merge.h` | `MergeLogs`; `log_dump` links it and `:hardware_record`, not the supervisor |
 | `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
@@ -813,7 +814,10 @@ without the original robot build. Log format details live in
 ### Filtering and exporting logs
 
 Passing only file or session-directory paths retains the human-readable dump,
-decoded payloads, and summary. Paths can be combined with:
+decoded payloads, and summary. A directory is every `*.tlog` in it, a file
+is that log with its kept segments, and a log named more than once (its
+session directory and the file, or the file twice) is merged once
+(`LogInputFiles`, `log_inputs.h`). Paths can be combined with:
 
 - `--node name`: match a process name exactly.
 - `--topic pattern`: match a topic exactly, or match its prefix when the pattern
@@ -994,10 +998,9 @@ bazel run //talOS/launcher:tlog_to_wpilog -- /tmp/talos_logs/<session> \
 bazel run //talOS/launcher:tlog_to_wpilog -- a.tlog b.tlog -o /tmp/ab.wpilog
 ```
 
-Inputs are `.tlog` files (with their kept rotated segments, as `log_dump`
-reads them) or session directories (every `*.tlog` in one, restarts
-included), all from one session; a log named twice (its directory and
-the file) is read once. Then open the file in AdvantageScope
+Inputs are `.tlog` files or session directories, all from one session,
+read as [`log_dump`](#filtering-and-exporting-logs) reads them: kept
+segments and restarts included, and a log named twice read once. Then open the file in AdvantageScope
 (File > Open Log(s)...): topics appear under their names, and a pose entry
 (below) can be dragged onto the 2D Field view as a robot pose.
 
