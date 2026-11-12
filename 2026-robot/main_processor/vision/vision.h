@@ -90,12 +90,9 @@ class Vision {
       const auto frames =
           std::ceil(static_cast<long double>(sim_timestamp_lag_ns_) *
                     capture_config_.fps / 1.0e9L);
-      if (frames >
-          static_cast<long double>(sim_pending_.max_size() - kMargin)) {
-        throw std::invalid_argument(
-            std::string(node_.name()) +
-            ": camera.fps requires too many delayed frames");
-      }
+      RequireQueueSize(frames + kMargin, "camera.sim_timestamp_lag_us",
+                       static_cast<long double>(sim_timestamp_lag_ns_) / 1000,
+                       "delayed observations");
       sim_pending_.resize(static_cast<std::size_t>(frames) + kMargin);
     }
     solver_options_.pixel_std_px =
@@ -206,18 +203,19 @@ class Vision {
       // period_us apart: ceil(period_us * fps) results, plus the one in
       // progress at the earlier collection. A late tick, or a collection
       // whose try_lock met the worker storing, doubles the window:
-      // ceil(2 * period_us * fps) + 1. One more slot keeps the live
-      // disconnect marker from evicting a frame. 10 ms ticks at 60 fps: 4.
+      // ceil(2 * period_us * fps) + 1, plus one slot for a live disconnect
+      // marker. 10 ms ticks at 60 fps: 4. This is the bound for a camera
+      // delivering at camera.fps whose frames are all captured inside the
+      // window; a live window can also finish the frame in progress and the
+      // one waiting in the mailbox from before it, and a camera faster than
+      // camera.fps finishes more. Past the capacity the oldest result is
+      // evicted and counted dropped (PushFinished), never lost silently.
       constexpr std::size_t kMargin = 2;
-      const auto frames = std::ceil(
-          2.0L * std::chrono::duration<long double>{node.period()}.count() *
-          capture_config_.fps);
-      if (!(frames <=
-            static_cast<long double>(finished_.max_size() - kMargin))) {
-        throw std::invalid_argument(
-            std::string(node_.name()) +
-            ": camera.fps requires too many queued results");
-      }
+      const auto period_s =
+          std::chrono::duration<long double>{node.period()}.count();
+      const auto frames = std::ceil(2.0L * period_s * capture_config_.fps);
+      RequireQueueSize(frames + kMargin, "period_us", period_s * 1.0e6L,
+                       "queued results");
       finished_.resize(static_cast<std::size_t>(frames) + kMargin);
       collected_.resize(finished_.size());
     }
@@ -249,6 +247,14 @@ class Vision {
     wake_.notify_one();
     if (worker_.joinable()) worker_.join();
   }
+
+  // Bounds every per-camera frame queue, sized from camera.fps at
+  // construction: 240 fps (four times the configured 60) across
+  // the longest accepted sim lag (just under 1 s), or doubled across a
+  // 500 ms tick, needs at most 242 slots. A larger product is a typo
+  // (fps = 1e9 would fill gigabytes before the node failed), so it is
+  // refused at construction, before anything is allocated.
+  static constexpr std::size_t kMaxQueuedFrames = 256;
 
   static bool CanCapture(bool simulated, std::string_view device) {
     return !simulated && !device.empty();
@@ -454,6 +460,20 @@ class Vision {
     const talos::vision::Frame* gray;
     std::optional<talos::vision::recording::TruthRecord> truth;
   };
+
+  // Refuses a queue of `slots` (from camera.fps and `key` = `value`) larger
+  // than kMaxQueuedFrames.
+  void RequireQueueSize(long double slots, const char* key, long double value,
+                        const char* what) const {
+    if (slots <= static_cast<long double>(kMaxQueuedFrames)) return;
+    char message[256];
+    std::snprintf(message, sizeof(message),
+                  ": camera.fps = %.6Lg with %s = %.6Lg needs %.6Lg %s; at "
+                  "most %zu",
+                  static_cast<long double>(capture_config_.fps), key, value,
+                  slots, what, kMaxQueuedFrames);
+    throw std::invalid_argument(std::string(node_.name()) + message);
+  }
 
   bool SimCaptureDue(std::uint64_t stamp) {
     if (!first_sim_capture_ns_) {

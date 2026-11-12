@@ -725,6 +725,40 @@ TEST(VisionTest, RejectsInvalidDetectorAndCaptureSettings) {
   }
 }
 
+// A typo such as fps = 1e9 sized the result queue at 2e7 slots per vector
+// (gigabytes filled at construction) before anything failed. Queue sizes past
+// the bound are refused, naming both settings; 240 fps at a 500 ms tick, or
+// across the largest accepted sim lag, still constructs.
+TEST(VisionTest, RefusesQueuesSizedPastTheBound) {
+  struct Case {
+    const char* camera;
+    const char* node;
+    const char* second_key;
+  };
+  for (const auto& test :
+       {Case{"fps = 12800\n", "period_us = 10000\n", "period_us"},
+        Case{"fps = 300\nsim_timestamp_lag_us = 999000\n",
+             "period_us = 10000\n", "sim_timestamp_lag_us"}}) {
+    SCOPED_TRACE(test.camera);
+    auto sim = MakeSim(false, true, test.camera, test.node);
+    try {
+      sim.add<Vision>("rear_right_camera");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      const std::string message = error.what();
+      EXPECT_NE(message.find("camera.fps"), std::string::npos) << message;
+      EXPECT_NE(message.find(test.second_key), std::string::npos) << message;
+    }
+  }
+  for (const auto& test : {Case{"fps = 240\n", "period_us = 500000\n", ""},
+                           Case{"fps = 240\nsim_timestamp_lag_us = 999000\n",
+                                "period_us = 10000\n", ""}}) {
+    SCOPED_TRACE(test.camera);
+    auto sim = MakeSim(false, true, test.camera, test.node);
+    EXPECT_NO_THROW(sim.add<Vision>("rear_right_camera"));
+  }
+}
+
 TEST(VisionTest, SimulatedCaptureFollowsTruthTimeWithoutPhaseDrift) {
   auto sim = MakeSim(false, true, "fps = 60\n", "period_us = 10000\n");
   sim.add<Vision>("rear_right_camera");
@@ -1896,8 +1930,8 @@ TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
 
 // REQ-CONTRACT-27. A live camera's computed observation is published even
 // when the next frame finishes before update() collects it: both go out in
-// capture order with their own stamps. Today's queue holds three results at a
-// 1 ms period and 60 fps; when the loop falls further behind, the oldest is
+// capture order with their own stamps. At a 1 ms period and 60 fps the queue
+// holds three results; when more finish between two ticks, the oldest is
 // dropped and counted and the newest kept.
 TEST(VisionTest, LiveResultsFinishedBetweenTicksPublishInOrderOrDropOldest) {
   auto device = std::make_shared<FakeCameraDevice>();
