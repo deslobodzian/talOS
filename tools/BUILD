@@ -65,8 +65,9 @@ py_test(
         "//talOS/launcher",
         "//talOS/telemetry:node",
         "//talOS/teleop:node",
-        # new_subsystem's C++ velocity mechanism, built.
+        # new_subsystem's C++ velocity and position mechanisms, built.
         "//tools/scaffold_testdata/gripper:node",
+        "//tools/scaffold_testdata/position_cpp:node",
     ],
     legacy_create_init = False,
     main = "new_robot_test.py",

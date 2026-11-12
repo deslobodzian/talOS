@@ -162,7 +162,12 @@ class Wrist:
 ### Configure the subsystem
 
 `my_robot/main_processor/configuration/subsystems/wrist.toml` describes the
-motor and the node's inputs. Two edits make it move. Uncomment the teleop
+motor and the node's inputs. The scaffold leaves it unable to move on its
+own, so that it never drives a real mechanism untuned; its `Next:` output
+lists each edit, in order, with what happens if it is skipped. Here two
+edits make it move (a robot that requires target coverage and lists `auto`
+in autonomous, as `2026-robot` does, also needs the `[targets]` table
+uncommented with `autonomous = []`). Uncomment the teleop
 binding, which tells the framework's `teleop` node to write a target on
 `/wrist/target/teleop` while Driver Station joystick button 3 is held:
 
