@@ -172,6 +172,7 @@ Automated checks that keep the architecture honest.
 | `new_subsystem_test` golden packages | the scaffold's output builds and passes |
 | `tools/check_layers.py` (`bazel query`, CI Linux job) | ARCHITECTURE.md "Allowed dependencies"; its allowlist only shrinks |
 | `tools/lint_test_time.py` (CI lint job) | no wall clock in tests or node code and no test retries (TESTING.md §6.1, §8.1); its allowlist only shrinks |
+| `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
 | `check_runfiles_collisions.py`, read-only sources and "checkout unchanged" in CI | the build never writes the source tree |
 | `clang-format-18`, `clang-tidy-18`, `buildifier` on changed files | style and bug-prone patterns |
 | `input_replay_test`, `replay_inputs_test`, the `*Binary` replay cases | a node is a function of its inputs and their times |
