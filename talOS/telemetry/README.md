@@ -125,8 +125,11 @@ the channel model: `FlattenTopic(topic, schema_name, bfbs)` lists a topic's
 channels (name, kind, unit, labels, and the scalar's offset and type) from
 its schema, refusing a schema that names an object it does not hold, holds
 a struct that contains itself, nests structs more than 16 deep, or expands
-to more than 2048 channels or 4096 struct instances (`channels.h`; a
-recorded log's schema may be damaged or crafted), `ReadChannel` reads one
+to more than 4096 struct instances (`channels.h`; a recorded log's schema
+may be damaged or crafted). The review server also refuses a topic of more
+than 2048 channels; the node flattens only the channels its `exclude` keeps,
+so a large message can be brought within the dictionary cap below by
+excluding part of it. `ReadChannel` reads one
 channel's raw sample from a message's
 bytes (absent when the message ends before it), and `DriverStationChannels`
 and `ReadDriverStation` do the same for the Driver Station packet. The node

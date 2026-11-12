@@ -495,8 +495,17 @@ class Telemetry {
   void ObserveDescribedTopic(const introspect::naming::SourceShape& source) {
     using talos::detail::NodeAccess;
 
+    // Excluded channels are not flattened or counted; past one more than a
+    // dictionary holds the topic stops, and CheckChannelCap refuses the
+    // dictionary naming it, as for any source too large to serve whole.
+    FlattenOptions options;
+    options.keep = [this](std::string_view name) {
+      return !detail::MatchesAnyGlob(std::string{name}, exclude_globs_);
+    };
+    options.max_channels = telemetry_wire::kMaxChannels + 1;
+    options.truncate = true;
     std::vector<Channel> channels =
-        FlattenTopic(source.name, source.schema, source.bfbs);
+        FlattenTopic(source.name, source.schema, source.bfbs, options);
 
     std::size_t sub_idx = 0;
     if (has_pose_ && source.name == pose_topic_) {

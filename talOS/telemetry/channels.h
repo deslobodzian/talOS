@@ -21,6 +21,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -120,16 +121,34 @@ inline constexpr std::size_t kMaxTopicChannels = telemetry_wire::kMaxChannels;
 // walk of structs that hold no scalar.
 inline constexpr std::size_t kMaxTopicStructs = 4096;
 
-// Every scalar of struct `schema_name` in `bfbs` (a reflection.Schema), in
-// field id order with nested structs and arrays expanded in place, named
-// under `topic`. Throws std::invalid_argument naming the topic when `bfbs`
-// does not verify or lacks the struct, or when a field names an object the
-// schema does not hold, a struct contains itself, structs nest deeper than
-// kMaxNestingDepth, or the topic expands past kMaxTopicChannels channels or
-// kMaxTopicStructs struct instances.
+// What a caller keeps of a topic. The review server takes the defaults: a
+// recorded schema past the cap is refused. Live telemetry keeps only the
+// channels its config does not exclude, and truncates rather than throws,
+// so its own dictionary cap (node.h) names the topic to exclude.
+struct FlattenOptions {
+  // When set, a channel it returns false for (by name) is neither returned
+  // nor counted against max_channels.
+  std::function<bool(std::string_view)> keep;
+  std::size_t max_channels{kMaxTopicChannels};
+  // Past max_channels kept channels: stop and report it (FlattenTopic's
+  // `truncated`) instead of throwing.
+  bool truncate{false};
+};
+
+// Every scalar of struct `schema_name` in `bfbs` (a reflection.Schema) that
+// `options` keeps, in field id order with nested structs and arrays
+// expanded in place, named under `topic`. Throws std::invalid_argument
+// naming the topic when `bfbs` does not verify or lacks the struct, or when
+// a field names an object the schema does not hold, a struct contains
+// itself, structs nest deeper than kMaxNestingDepth, the walk passes
+// kMaxTopicStructs struct instances, or (unless options.truncate) the kept
+// channels pass options.max_channels. `truncated`, when given, is set to
+// whether a truncating flattening stopped at its cap.
 std::vector<Channel> FlattenTopic(std::string_view topic,
                                   std::string_view schema_name,
-                                  std::string_view bfbs);
+                                  std::string_view bfbs,
+                                  const FlattenOptions& options = {},
+                                  bool* truncated = nullptr);
 
 // The Driver Station topic's channels, decoded from its packet rather than
 // read from a struct: connected, enabled, autonomous, teleop, test, estop,
