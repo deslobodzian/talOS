@@ -602,7 +602,8 @@ void LogWriter::State::start_writer() {
           chunk->committed.load(std::memory_order_seq_cst) > chunk->written;
       const bool sync_due = now - raw->last_sync >= raw->options.sync_interval;
       const bool write_due =
-          unwritten && now - raw->last_write >= raw->options.write_interval;
+          unwritten && (!raw->last_write ||
+                        now - *raw->last_write >= raw->options.write_interval);
 
       if (submitted || write_due || sync_due) {
         // The mutex is never held across the write, so a slow disk cannot
@@ -647,7 +648,10 @@ void LogWriter::State::start_writer() {
       // lost; a stale one only makes the next wait return at once and the
       // loop check again.
       const auto sync_at = raw->last_sync + raw->options.sync_interval;
-      const auto write_at = raw->last_write + raw->options.write_interval;
+      // A writer that has never written has nothing unwritten and no
+      // stream here (an unwritten record would have been due above).
+      const auto write_at =
+          raw->last_write.value_or(now) + raw->options.write_interval;
       lock.unlock();
       if (unwritten || (streaming && now < write_at)) {
         timed = true;
