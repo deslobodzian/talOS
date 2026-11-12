@@ -42,6 +42,7 @@ cc_test(
     srcs = ["node_test.cc"],
     data = [
         "testdata/gripper.toml",
+        "testdata/neighbor.toml",
         "testdata/robot.toml",
         ":node",
     ],

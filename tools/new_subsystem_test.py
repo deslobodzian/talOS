@@ -241,6 +241,23 @@ class NewSubsystemTest(unittest.TestCase):
         self.assertIsNone(new_subsystem.check_kind("wrist", "py", "position"))
         self.assertIsNone(new_subsystem.check_kind("targets", "py", "velocity"))
 
+    def test_test_robot_has_a_neighbor_even_for_a_subsystem_so_named(self):
+        # The generated feedback case disconnects the node's motor while
+        # another subsystem's stays valid; a scaffold named like that
+        # neighbor must not merge into it (its test would lose the
+        # neighbor, or the config would name one subsystem twice).
+        for lang in ("cpp", "py"):
+            for kind in ("velocity", "position"):
+                with self.subTest(lang=lang, kind=kind):
+                    files = new_subsystem.package_files("neighbor", lang,
+                                                        kind=kind)
+                    robot = tomllib.loads(files["testdata/robot.toml"])
+                    subsystems = robot["subsystems"]
+                    names = ([entry["name"] for entry in subsystems]
+                             if lang == "cpp" else list(subsystems))
+                    self.assertEqual(len(set(names)), 2, names)
+                    self.assertIn("neighbor", names)
+
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and
         # tested by `bazel test //...`: the templates compile and their

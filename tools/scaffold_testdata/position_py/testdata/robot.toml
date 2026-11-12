@@ -1,4 +1,7 @@
-# PositionPy test robot: one subsystem, one motor homed on one switch.
+# PositionPy test robot: one motor homed on one switch, and a neighbor.
+# The neighbor subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "position_py_test"
 period_us = 20000
@@ -25,3 +28,8 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.position_py.digital_inputs.position_py_home]
 dio = 0
+
+[subsystems.neighbor.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2

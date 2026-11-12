@@ -1,0 +1,8 @@
+[subsystem]
+name = "neighbor"
+period_us = 20000
+
+[motors.wheel]
+type = "TalonFX"
+bus = "rio"
+can_id = 2

@@ -122,6 +122,9 @@ class ScaffoldPyTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
         self.hw.set_connected("scaffold_py", "scaffold_py_motor", False)
         self.hold(30.0, 0.04)
+        # The neighbor's motor keeps the robot enabled (testdata/robot.toml),
+        # so the node's own feedback gate is what stops it.
+        self.assertTrue(talos.robot_enabled(self.sim.node("scaffold_py")))
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         state = self.state()
         self.assertFalse(state.connected)

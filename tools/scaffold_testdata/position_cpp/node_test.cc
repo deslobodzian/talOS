@@ -12,6 +12,7 @@
 
 #include "position_cpp/position_cpp.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/devices/devices.h"
 #include "talOS/devices/testing.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
@@ -174,6 +175,9 @@ TEST_F(PositionCppTest, DisconnectedFeedbackGoesNeutral) {
 
   hw.set_connected("position_cpp", "position_cpp", false);
   Hold(30.0, 40ms);
+  // The neighbor's motor keeps the robot enabled (testdata/robot.toml), so
+  // the node's own feedback gate is what stops it.
+  ASSERT_TRUE(talos::robot_enabled(sim.node("position_cpp")));
   EXPECT_EQ(Request(), Mode::kNeutral);
   const State state = Latest();
   EXPECT_FALSE(state.connected());
