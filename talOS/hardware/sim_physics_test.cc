@@ -317,6 +317,29 @@ TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
   EXPECT_DOUBLE_EQ(s.motors[0].stator_current_a, 80.0);
 }
 
+// A motor driven into its soft limit is held there with its rotor stopped,
+// so it reads the stall current of its applied volts, as a mechanism pushed
+// into a stop does: stall homing (PositionMechanism) relies on it. The
+// current is taken after the limit stops the rotor, not before.
+// REQ-DEV-07
+TEST(SimMotorDiagnostics, MotorHeldAtASoftLimitReadsStalled) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].soft_limits = true;
+  cfg.motors[0].reverse_limit_rot = -1.0;
+  cfg.motors[0].forward_limit_rot = 1.0;
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 1.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 400);  // 2 s at ~8 rps: at the limit
+  ASSERT_DOUBLE_EQ(s.motors[0].position_rot, 1.0);
+  EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+  EXPECT_NEAR(s.motors[0].stator_current_a, 366.0 / 12.0, 1e-9);  // X60
+}
+
 // The wire config carries no motor type, so a config the bridge pushes to
 // sim_gateway that differs from the one it holds reconfigures the physics
 // backend with every motor a Kraken X60. Each motor keeps the type of the
