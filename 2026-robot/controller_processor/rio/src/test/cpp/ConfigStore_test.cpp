@@ -52,6 +52,7 @@ hw::Command DutyCycle(const hw::Gateway& gateway) {
   return command;
 }
 
+// REQ-CONTRACT-06
 TEST(ConfigStore, StartupRestoreDoesNotWaitForDevicesAndDrivesOnlyAfter) {
   hw::Config config;
   config.commissioned = true;

@@ -132,6 +132,7 @@ TEST(TeleopNode, ButtonDrivesLaneWithEncodedValue) {
   EXPECT_FALSE(roller.seen.has_value());
 }
 
+// REQ-CONTRACT-24
 TEST(TeleopNode, PovAndToggleEdgesResetOnSafetyTransitions) {
   for (const std::string trigger : {"button = 1", "pov = 90\npov_index = 1"}) {
     for (const std::string action : {"while_held", "on_toggle"}) {
@@ -602,6 +603,7 @@ TEST(TeleopNode, BoundPovMustBeReleasedBeforeArmingEvenFromAnotherDirection) {
   }
 }
 
+// REQ-SAFE-14
 TEST(TeleopNode, HeldAxisMustReturnToNeutralAfterDsLossOrDisable) {
   Sim sim = MakeSim(kAxisToml);
   auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
@@ -639,6 +641,7 @@ struct PausableTeleop {
   bool paused{false};
 };
 
+// REQ-SAFE-14
 TEST(TeleopNode, OwnEvaluationGapRequiresNeutralEvenWithFreshDs) {
   Sim sim = MakeSim(kAxisToml);
   auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
@@ -902,6 +905,7 @@ TEST(TeleopNode, NumericIntegerEncodingChecksBoundsBeforeConversion) {
                std::invalid_argument);
 }
 
+// REQ-CONTRACT-24
 TEST(TeleopNode, ConstructionErrorUnknownFieldInButton) {
   constexpr const char* kToml = R"(
 [robot]

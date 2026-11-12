@@ -8,6 +8,7 @@
 namespace talos::driver_station {
 namespace {
 
+// REQ-CONTRACT-02
 TEST(DriverStationTest, FullyPopulatedEncodingReachesMaximumSize) {
   DriverStationData original{};
   original.sample_time_us = 123456789;

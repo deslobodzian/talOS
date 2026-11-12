@@ -289,6 +289,7 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_TRUE(watcher.in.has_value());
 }
 
+// REQ-SAFE-08
 TEST(Node, PausingOneNodeStopsItsTimersAndDeliveriesButNotItsClock) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Talker>("talker");
@@ -756,6 +757,7 @@ struct RemappedRequest {
   Publisher<Count> request;
 };
 
+// REQ-SAFE-27
 TEST(Node, APlainPublisherOnAHardwareRequestIsRefused) {
   auto sim = Sim::FromToml(R"(
 [robot]
@@ -1177,6 +1179,7 @@ std::string ConfigFlag() {
   return "--config '" + Runfile("TALOS_TEST_CONFIG") + "'";
 }
 
+// REQ-CONTRACT-12
 TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   const Result result = RunBinary("--describe " + ConfigFlag());
   ASSERT_EQ(result.status, 0) << result.output;

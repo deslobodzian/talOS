@@ -98,6 +98,7 @@ class IntakeTest(unittest.TestCase):
                 if inputs.get("lane") == "release":
                     self.assertEqual(state.requested_velocity_rps, 0.0)
 
+    # REQ-SAFE-32
     def test_feed_requires_continuously_fresh_ready_shooter(self):
         ready = dict(at_speed=True, target_velocity_rps=60.0,
                      flywheel_velocity_rps=60.0, enabled=True)
