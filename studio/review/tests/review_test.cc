@@ -428,7 +428,7 @@ TEST(SeriesCacheTest, StaysUnderItsCapacityEvictingLeastRecentlyUsed) {
     series->count.assign(points, 0);
     return series;
   };
-  constexpr std::size_t kCapacity = 16 * 1024;
+  constexpr std::size_t kCapacity = std::size_t{16} * 1024;
   SeriesCache cache{kCapacity};
   cache.Put("first", entry(64));
   for (int i = 0; i < 100; ++i) {

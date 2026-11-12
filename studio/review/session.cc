@@ -474,6 +474,7 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
     wants[channels[i].topic].emplace_back(i, channels[i].channel);
   }
   std::vector<std::uint32_t> wanted_topics;
+  wanted_topics.reserve(wants.size());
   for (const auto& [topic, unused] : wants) wanted_topics.push_back(topic);
 
   const std::int64_t first_second = FloorSecond(start_ns) - 1;

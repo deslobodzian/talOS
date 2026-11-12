@@ -103,7 +103,7 @@ int Usage(const std::string& error) {
 
 // `path` from the directory `bazel run` was started in, when it set one.
 std::filesystem::path FromInvocation(std::string_view path) {
-  const std::filesystem::path given{path};
+  std::filesystem::path given{path};
   const char* invoked = std::getenv("BUILD_WORKING_DIRECTORY");
   if (given.is_absolute() || invoked == nullptr) return given;
   return std::filesystem::path{invoked} / given;

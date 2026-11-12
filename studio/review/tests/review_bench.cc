@@ -65,7 +65,8 @@ void WriteMember(const std::string& directory, int member) {
     ctx.kind = talos::event::EventKind::TIMER;
     ctx.dispatch_index = i + 1;
     ctx.event_time = talos::event::MonotonicTime::from_nanos(
-        kStartNs + static_cast<std::int64_t>(i) * 1'000'000 + member * 1'000);
+        kStartNs + static_cast<std::int64_t>(i) * 1'000'000 +
+        std::int64_t{member} * 1'000);
     ctx.now = ctx.event_time;
     writer.send(ctx, 1, std::as_bytes(std::span{&shot, 1}), 0, i + 1);
   }
@@ -86,6 +87,7 @@ int Review(const std::string& directory) {
   const auto session = studio::review::Session::Open(directory);
   const double open_s = Seconds(open_start);
   std::vector<studio::review::ChannelRef> channels;
+  channels.reserve(kMembers);
   for (int member = 0; member < kMembers; ++member) {
     channels.push_back(*session->Find("member" + std::to_string(member) +
                                       "/state/position_m"));
