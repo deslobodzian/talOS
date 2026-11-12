@@ -5,6 +5,9 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -436,7 +439,8 @@ us_poll_t* WatchReadable(us_loop_t* loop, int fd, void* user,
   callback->cb_expects_the_loop = 0;
   callback->leave_poll_ready = 1;
   callback->cb = on_ready;
-  std::memcpy(callback + 1, &user, sizeof(user));
+  const auto bytes = std::bit_cast<std::array<std::byte, sizeof(user)>>(user);
+  std::memcpy(callback + 1, bytes.data(), bytes.size());
   us_poll_start(poll, loop, LIBUS_SOCKET_READABLE);
   return poll;
 }
@@ -444,9 +448,9 @@ us_poll_t* WatchReadable(us_loop_t* loop, int fd, void* user,
 // The `user` WatchReadable stored with the poll.
 template <class T>
 T* WatchedUser(us_internal_callback_t* callback) {
-  void* user = nullptr;
-  std::memcpy(&user, callback + 1, sizeof(user));
-  return static_cast<T*>(user);
+  std::array<std::byte, sizeof(void*)> bytes{};
+  std::memcpy(bytes.data(), callback + 1, bytes.size());
+  return static_cast<T*>(std::bit_cast<void*>(bytes));
 }
 std::string mime(const fs::path& p) {
   auto ext = p.extension().string();

@@ -356,16 +356,17 @@ inline void AppendNode(std::string& out, const introspect::NodeSnapshot& node,
   const introspect::DeliveryLoss loss = node.delivery_loss();
   out += ",\"delivery\":{";
   const char* separator = "";
-  for (const auto& [key, value] :
-       {std::pair{"wake_failures", loss.wake_failures},
-        std::pair{"stalled_arms", loss.stalled_arms},
-        std::pair{"wake_fallbacks", loss.wake_fallbacks},
-        std::pair{"requests_skipped", loss.requests_skipped}}) {
+  const std::pair<const char*, std::uint64_t> counts[] = {
+      {"wake_failures", loss.wake_failures},
+      {"stalled_arms", loss.stalled_arms},
+      {"wake_fallbacks", loss.wake_fallbacks},
+      {"requests_skipped", loss.requests_skipped}};
+  for (const auto& count : counts) {
     out += separator;
     out += '"';
-    out += key;
+    out += count.first;
     out += "\":";
-    AppendFast(out, fast, [&] { AppendU64(out, value); });
+    AppendFast(out, fast, [&] { AppendU64(out, count.second); });
     separator = ",";
   }
   out += '}';
