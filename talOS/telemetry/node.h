@@ -3,6 +3,7 @@
 #include <fnmatch.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -24,15 +25,13 @@
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/reflection.h"
 #include "talOS/configuration/config_parser.h"
-#include "talOS/driver_station/driver_station.h"
-#include "talOS/hardware/packet.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/node/access.h"
 #include "talOS/node/node.h"
 #include "talOS/schema/field_path.h"
 #include "talOS/schema/identity.h"
-#include "talOS/schema/unit_suffix.h"
+#include "talOS/telemetry/channels.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/telemetry_generated.h"
 #include "talOS/telemetry/wire.h"
@@ -40,75 +39,6 @@
 namespace talos::telemetry {
 
 namespace detail {
-
-// The channel kind a reflected scalar travels as: integers keep their
-// width's exact value, floats become doubles.
-inline ChannelKind KindOf(reflection::BaseType base) {
-  using reflection::BaseType;
-  switch (base) {
-    case BaseType::Bool:
-      return Talos::Telemetry::ChannelKind_Bool;
-    case BaseType::Byte:
-    case BaseType::Short:
-    case BaseType::Int:
-    case BaseType::Long:
-      return Talos::Telemetry::ChannelKind_Int;
-    case BaseType::UByte:
-    case BaseType::UType:
-    case BaseType::UShort:
-    case BaseType::UInt:
-    case BaseType::ULong:
-      return Talos::Telemetry::ChannelKind_UInt;
-    default:
-      return Talos::Telemetry::ChannelKind_Double;
-  }
-}
-
-// The raw sample of one reflected scalar, or false for a type telemetry does
-// not carry. A NaN or infinite float travels as itself: a reading, not an
-// absence.
-inline bool ReadScalarRaw(reflection::BaseType base, const std::uint8_t* data,
-                          std::uint64_t& raw) {
-  if (schema::ScalarSize(base) == 0) return false;
-  const auto* bytes = reinterpret_cast<const std::byte*>(data);
-  switch (KindOf(base)) {
-    case Talos::Telemetry::ChannelKind_Bool:
-      raw = schema::ReadBool(base, bytes) ? 1 : 0;
-      return true;
-    case Talos::Telemetry::ChannelKind_Int:
-    case Talos::Telemetry::ChannelKind_UInt:
-      raw = static_cast<std::uint64_t>(schema::ReadInt64(base, bytes));
-      return true;
-    default:
-      raw = RawFromDouble(schema::ReadDouble(base, bytes));
-      return true;
-  }
-}
-
-// Labels index by value, so an enum whose largest value is negative or not
-// below kMaxEnumLabels (wide bit flags, sparse codes) carries none.
-inline std::vector<std::string> ExtractEnumLabels(
-    const reflection::Schema& schema, std::int32_t enum_index) {
-  std::vector<std::string> labels;
-  if (enum_index >= 0 &&
-      enum_index < static_cast<std::int32_t>(schema.enums()->size())) {
-    const auto* enum_def = schema.enums()->Get(enum_index);
-    std::int64_t max_val = -1;
-    for (const auto* val : *enum_def->values()) {
-      if (val->value() > max_val) max_val = val->value();
-    }
-    if (max_val >= 0 &&
-        max_val < static_cast<std::int64_t>(telemetry_wire::kMaxEnumLabels)) {
-      labels.resize(max_val + 1);
-      for (const auto* val : *enum_def->values()) {
-        if (val->value() >= 0) {
-          labels[val->value()] = val->name()->str();
-        }
-      }
-    }
-  }
-  return labels;
-}
 
 inline bool MatchesAnyGlob(std::string_view name,
                            const std::vector<std::string>& patterns) {
@@ -232,35 +162,22 @@ class Telemetry {
           NodeAccess::subscription_fresh(node_, topic.sub_index, stale_after_);
       if (!fresh) continue;
 
-      const auto* raw = static_cast<const std::uint8_t*>(
-          NodeAccess::subscription_value(node_, topic.sub_index));
+      const std::span<const std::byte> message{
+          static_cast<const std::byte*>(
+              NodeAccess::subscription_value(node_, topic.sub_index)),
+          topic.message_bytes};
 
       if (topic.is_driver_station) {
-        const auto* packet = reinterpret_cast<const hardware::Packet*>(raw);
-        driver_station::DriverStationData ds_data;
-        if (driver_station::Decode(packet->bytes(), ds_data)) {
-          const uint32_t flags = ds_data.fms.flags;
-          const auto& channels = topic.ds_channels;
-          SetBool(channels.connected,
-                  (flags & driver_station::kDsAttached) != 0);
-          SetBool(channels.enabled, (flags & driver_station::kEnabled) != 0);
-          SetBool(channels.autonomous,
-                  (flags & driver_station::kAutonomous) != 0);
-          SetBool(channels.teleop, (flags & driver_station::kTeleop) != 0);
-          SetBool(channels.test, (flags & driver_station::kTest) != 0);
-          SetBool(channels.estop, (flags & driver_station::kEStop) != 0);
-          SetBool(channels.fms_attached,
-                  (flags & driver_station::kFmsAttached) != 0);
-          SetRaw(channels.alliance,
-                 static_cast<std::uint8_t>(ds_data.fms.alliance));
-          SetRaw(channels.match_time_s,
-                 RawFromDouble(ds_data.fms.match_time_s));
+        std::array<std::uint64_t, kDriverStationChannelCount> values{};
+        if (ReadDriverStation(message, values)) {
+          for (std::size_t i = 0; i < values.size(); ++i) {
+            SetRaw(topic.ds_channels[i], values[i]);
+          }
         }
       } else {
         for (const auto& reader : topic.readers) {
           std::uint64_t value = 0;
-          if (detail::ReadScalarRaw(reader.base_type, raw + reader.offset,
-                                    value)) {
+          if (ReadChannel(reader.channel, message, value)) {
             SetRaw(reader.channel_index, value);
           }
         }
@@ -294,30 +211,20 @@ class Telemetry {
   }
 
  private:
+  // A dictionary channel and the scalar it reads (channels.h).
   struct FieldReader {
     std::size_t channel_index;
-    std::size_t offset;
-    reflection::BaseType base_type;
-  };
-
-  struct DriverStationChannels {
-    std::size_t connected{std::numeric_limits<std::size_t>::max()};
-    std::size_t enabled{std::numeric_limits<std::size_t>::max()};
-    std::size_t autonomous{std::numeric_limits<std::size_t>::max()};
-    std::size_t teleop{std::numeric_limits<std::size_t>::max()};
-    std::size_t test{std::numeric_limits<std::size_t>::max()};
-    std::size_t estop{std::numeric_limits<std::size_t>::max()};
-    std::size_t fms_attached{std::numeric_limits<std::size_t>::max()};
-    std::size_t alliance{std::numeric_limits<std::size_t>::max()};
-    std::size_t match_time_s{std::numeric_limits<std::size_t>::max()};
+    Channel channel;
   };
 
   struct ObservedTopic {
     std::string name;
     std::size_t sub_index;
+    std::size_t message_bytes{0};
     std::vector<FieldReader> readers;
     bool is_driver_station = false;
-    DriverStationChannels ds_channels;
+    // Each DriverStationChannels() channel's dictionary index, in order.
+    std::array<std::size_t, kDriverStationChannelCount> ds_channels{};
   };
 
   static std::string ResolveTopic(Node& node) {
@@ -360,7 +267,8 @@ class Telemetry {
     }
     // Studio refuses a whole dictionary over one channel it cannot decode,
     // blanking the stream; refuse that channel here instead, by name, so it
-    // can be excluded. ExtractEnumLabels keeps label counts within the limit.
+    // can be excluded. EnumLabels (channels.h) keeps label counts within the
+    // limit.
     if (name.starts_with("derived/")) {
       throw std::invalid_argument(
           "telemetry: channel '" + name +
@@ -572,25 +480,14 @@ class Telemetry {
     ObservedTopic topic;
     topic.name = source.name;
     topic.sub_index = sub_idx;
+    topic.message_bytes = source.message_bytes;
     topic.is_driver_station = true;
 
-    constexpr auto kBool = Talos::Telemetry::ChannelKind_Bool;
-    auto& channels = topic.ds_channels;
-    channels.connected = AddChannel("hw/state/driver_station/connected", kBool);
-    channels.enabled = AddChannel("hw/state/driver_station/enabled", kBool);
-    channels.autonomous =
-        AddChannel("hw/state/driver_station/autonomous", kBool);
-    channels.teleop = AddChannel("hw/state/driver_station/teleop", kBool);
-    channels.test = AddChannel("hw/state/driver_station/test", kBool);
-    channels.estop = AddChannel("hw/state/driver_station/estop", kBool);
-    channels.fms_attached =
-        AddChannel("hw/state/driver_station/fms_attached", kBool);
-    channels.alliance = AddChannel("hw/state/driver_station/alliance",
-                                   Talos::Telemetry::ChannelKind_UInt, "",
-                                   {"unknown", "red", "blue"});
-    channels.match_time_s =
-        AddChannel("hw/state/driver_station/match_time_s",
-                   Talos::Telemetry::ChannelKind_Double, "s");
+    const std::vector<Channel> channels = DriverStationChannels();
+    for (std::size_t i = 0; i < channels.size(); ++i) {
+      topic.ds_channels[i] = AddChannel(channels[i].name, channels[i].kind,
+                                        channels[i].unit, channels[i].labels);
+    }
 
     observed_topics_.push_back(std::move(topic));
   }
@@ -598,18 +495,8 @@ class Telemetry {
   void ObserveDescribedTopic(const introspect::naming::SourceShape& source) {
     using talos::detail::NodeAccess;
 
-    const reflection::Schema* schema = schema::VerifySchema(source.bfbs);
-    if (schema == nullptr) {
-      throw std::invalid_argument(
-          "telemetry: failed to verify schema for topic '" + source.name + "'");
-    }
-    const reflection::Object* object =
-        schema->objects()->LookupByKey(source.schema.c_str());
-    if (!object) {
-      throw std::invalid_argument("telemetry: root schema object '" +
-                                  source.schema + "' for topic '" +
-                                  source.name + "' is missing");
-    }
+    std::vector<Channel> channels =
+        FlattenTopic(source.name, source.schema, source.bfbs);
 
     std::size_t sub_idx = 0;
     if (has_pose_ && source.name == pose_topic_) {
@@ -623,99 +510,15 @@ class Telemetry {
     ObservedTopic topic;
     topic.name = source.name;
     topic.sub_index = sub_idx;
-
-    const std::string prefix =
-        (!source.name.empty() && source.name.front() == '/')
-            ? source.name.substr(1)
-            : source.name;
-
-    FlattenStruct(*schema, *object, prefix, 0, topic.readers);
+    topic.message_bytes = source.message_bytes;
+    for (Channel& channel : channels) {
+      const std::size_t index =
+          AddChannel(channel.name, channel.kind, channel.unit, channel.labels);
+      if (index == std::numeric_limits<std::size_t>::max()) continue;
+      topic.readers.push_back(FieldReader{index, std::move(channel)});
+    }
 
     observed_topics_.push_back(std::move(topic));
-  }
-
-  void FlattenStruct(const reflection::Schema& schema,
-                     const reflection::Object& object, std::string_view prefix,
-                     std::size_t base_offset,
-                     std::vector<FieldReader>& readers) {
-    std::vector<const reflection::Field*> fields(object.fields()->begin(),
-                                                 object.fields()->end());
-    std::sort(fields.begin(), fields.end(),
-              [](const reflection::Field* a, const reflection::Field* b) {
-                return a->id() < b->id();
-              });
-
-    for (const auto* field : fields) {
-      const std::string field_name = field->name()->str();
-      const std::string channel_name = std::string{prefix} + "/" + field_name;
-      const auto& type = *field->type();
-      const std::size_t field_offset = base_offset + field->offset();
-
-      if (type.base_type() == reflection::BaseType::Obj) {
-        const auto* nested_obj = schema.objects()->Get(type.index());
-        if (nested_obj != nullptr) {
-          FlattenStruct(schema, *nested_obj, channel_name, field_offset,
-                        readers);
-        }
-        continue;
-      }
-
-      if (type.base_type() == reflection::BaseType::Array) {
-        const std::size_t count = type.fixed_length();
-        const std::size_t element_bytes =
-            type.element() == reflection::BaseType::Obj
-                ? schema.objects()->Get(type.index())->bytesize()
-                : flatbuffers::GetTypeSize(type.element());
-
-        for (std::size_t i = 0; i < count; ++i) {
-          const std::string elem_prefix =
-              channel_name + "/" + std::to_string(i);
-          const std::size_t elem_offset = field_offset + i * element_bytes;
-
-          if (type.element() == reflection::BaseType::Obj) {
-            const auto* nested_obj = schema.objects()->Get(type.index());
-            if (nested_obj != nullptr) {
-              FlattenStruct(schema, *nested_obj, elem_prefix, elem_offset,
-                            readers);
-            }
-          } else {
-            AddScalarField(schema, type.element(), type.index(), field_name,
-                           elem_prefix, elem_offset, readers);
-          }
-        }
-        continue;
-      }
-
-      AddScalarField(schema, type.base_type(), type.index(), field_name,
-                     channel_name, field_offset, readers);
-    }
-  }
-
-  void AddScalarField(const reflection::Schema& schema,
-                      reflection::BaseType base, std::int32_t type_index,
-                      std::string_view field_name, std::string channel_name,
-                      std::size_t offset, std::vector<FieldReader>& readers) {
-    std::string unit;
-    std::vector<std::string> labels;
-
-    if (base == reflection::BaseType::Bool) {
-      // Bool: unit is empty
-    } else if (type_index >= 0) {
-      // Enum: extract labels from reflection
-      labels = detail::ExtractEnumLabels(schema, type_index);
-    } else {
-      unit = std::string{schema::unit_for_field(field_name)};
-    }
-
-    const std::size_t channel_idx =
-        AddChannel(std::move(channel_name), detail::KindOf(base),
-                   std::move(unit), std::move(labels));
-    if (channel_idx == std::numeric_limits<std::size_t>::max()) return;
-    readers.push_back(FieldReader{
-        .channel_index = channel_idx,
-        .offset = offset,
-        .base_type = base,
-    });
   }
 
   Node& node_;
