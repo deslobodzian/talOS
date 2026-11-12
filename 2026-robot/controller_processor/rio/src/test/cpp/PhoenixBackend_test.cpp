@@ -781,6 +781,17 @@ class PhoenixBackendRecovery : public ::testing::Test {
                                ctre::phoenix6::BaseStatusSignal& signal) {
     backend.signals_.push_back(&signal);
   }
+  // Holds the rotor still under whatever voltage the TalonFX applies, so it
+  // draws stall current, by taking the backend's rotor model out of the loop.
+  static void StallRotor(PhoenixBackend& backend) {
+    backend.is_simulation_ = false;
+    Motor(backend, 0)
+        .GetSimState()
+        .SetRotorVelocity(units::turns_per_second_t{0});
+  }
+  static void MarkUnavailable(PhoenixBackend& backend, uint16_t id) {
+    backend.unavailable_.push_back(id);
+  }
   static void StopRefreshingHealth(PhoenixBackend& backend) {
     auto& motor = Motor(backend, 0);
     std::erase_if(backend.signals_, [&](auto* signal) {
@@ -870,6 +881,40 @@ TEST_F(PhoenixBackendRecovery, StaleHealthDoesNotInvalidateMotionFeedback) {
   EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
 }
 
+// A stalled motor draws supply current. Once its motion feedback is invalid
+// (here, an isolated device), the sample carries zero in every measured
+// field, supply current included, although that signal is still fresh.
+// REQ-CONTRACT-32
+TEST_F(PhoenixBackendRecovery, InvalidMotionFeedbackZeroesSupplyCurrent) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "motor", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  const std::array<hw::MotorRequest, 1> commands{
+      Request(1, hw::Mode::kVoltage, 6.0)};
+  StallRotor(backend);
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  ASSERT_TRUE(state.motors[0].valid);
+  ASSERT_GT(std::abs(state.motors[0].supply_current_a), 1.0);
+  MarkUnavailable(backend, 1);
+  auto& supply = Motor(backend, 0).GetSupplyCurrent(false);
+  // A read whose supply current is fresh, so only validity can zero it.
+  ASSERT_TRUE(ReadUntil(backend, state, [&] {
+    return supply.GetTimestamp().GetLatency().value() < 0.02;
+  }));
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0)
+      << "fresh signal reads " << supply.GetValue().value() << " A";
+  EXPECT_DOUBLE_EQ(state.motors[0].stator_current_a, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].voltage, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].position_rot, 0.0);
+  EXPECT_DOUBLE_EQ(state.motors[0].velocity_rps, 0.0);
+}
+
 // A CAN silence shorter than the gateway's bound (the bench's 64-66 ms gaps)
 // leaves the backend's sample valid: it reports the age and the gateway
 // judges it, the same for every backend. The console shows the spell instead:
@@ -918,28 +963,47 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 }
 
 // FaultField is a separate signal from the motion feedback that keeps the
-// sample valid, so a stale FaultField must not keep reporting a limit.
-TEST_F(PhoenixBackendRecovery, StaleFaultFieldReportsNoLimit) {
-  EnsureHal();
-  EnabledDs ds;
-  hw::Config config;
-  config.motors.push_back(TestMotor(1, "motor", 1));
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(config));
-  ASSERT_TRUE(AwaitReady(backend, config));
-  const std::array<hw::MotorRequest, 1> commands{
-      Request(1, hw::Mode::kVoltage, 2.0)};
-  hw::State state;
-  Motor(backend, 0).GetSimState().SetForwardLimit(true);
-  PumpReads(backend, state, commands, 30);
-  ASSERT_TRUE(state.motors[0].valid);
-  ASSERT_NE(state.motors[0].fault_flags & hw::kMotorForwardHardLimitFlag, 0u);
-  auto& faults = Motor(backend, 0).GetFaultField(false);
-  StopRefreshing(backend, faults);
-  PumpReads(backend, state, commands, 30);
-  ASSERT_GE(faults.GetTimestamp().GetLatency().value(), 0.05);
-  EXPECT_TRUE(state.motors[0].valid);
-  EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorLimitAssertedFlags, 0u);
+// sample valid, so a stale FaultField must not keep reporting a limit or an
+// active current limiter: a motor driven into its pressed forward switch, or
+// stalled at its stator limit, shows that bit until the signal goes stale,
+// then no limit or limiter bit at all.
+TEST_F(PhoenixBackendRecovery, StaleFaultFieldReportsNoLimitOrLimiter) {
+  for (const bool limiter : {false, true}) {
+    SCOPED_TRACE(limiter ? "stator current limit" : "forward hard limit");
+    EnsureHal();
+    EnabledDs ds;
+    hw::Config config;
+    auto motor = TestMotor(1, "motor", 1);
+    motor.stator_limit_a = 10;
+    config.motors.push_back(motor);
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(config));
+    ASSERT_TRUE(AwaitReady(backend, config));
+    const std::array<hw::MotorRequest, 1> commands{
+        Request(1, hw::Mode::kVoltage, limiter ? 6.0 : 2.0)};
+    hw::State state;
+    if (limiter) {
+      StallRotor(backend);
+    } else {
+      Motor(backend, 0).GetSimState().SetForwardLimit(true);
+    }
+    PumpReads(backend, state, commands, 30);
+    ASSERT_TRUE(state.motors[0].valid);
+    ASSERT_NE(state.motors[0].fault_flags &
+                  (limiter ? hw::kMotorCurrentLimitFlags
+                           : hw::kMotorForwardHardLimitFlag),
+              0u)
+        << "fault_flags " << state.motors[0].fault_flags << ", stator "
+        << state.motors[0].stator_current_a << " A";
+    auto& faults = Motor(backend, 0).GetFaultField(false);
+    StopRefreshing(backend, faults);
+    PumpReads(backend, state, commands, 30);
+    ASSERT_GE(faults.GetTimestamp().GetLatency().value(), 0.05);
+    EXPECT_TRUE(state.motors[0].valid);
+    EXPECT_EQ(state.motors[0].fault_flags & hw::kMotorNotFaultFlags, 0u)
+        << "fault_flags " << state.motors[0].fault_flags;
+    Motor(backend, 0).GetSimState().SetForwardLimit(false);
+  }
 }
 
 TEST_F(PhoenixBackendRecovery, RestoreDoesNotReconfigureUnrelatedMotor) {

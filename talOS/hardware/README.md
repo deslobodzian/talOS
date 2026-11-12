@@ -125,7 +125,10 @@ raises for a few milliseconds on a hard acceleration from rest: a limit or
 limiter acting as configured is not a fault (`kMotorNotFaultFlags` in
 `messages.h`, the one list the bridge, the hardware log and the RoboRIO's
 console share). Those bits stay in each sample's `fault_flags`; every other
-FaultField bit faults the motor.
+FaultField bit faults the motor. `PhoenixBackend` reports none of them from a
+FaultField signal 50 ms old or older, since an old switch or limiter state is
+a wrong display, but keeps that signal's last fault bits: losing the signal
+does not un-fault a motor.
 `sim::PhysicsSimBackend` holds forward or reverse output neutral, and reports
 the bit, while a test presses a switch
 (`SetForwardLimitPressed`/`SetReverseLimitPressed`; `sim_gateway`'s
