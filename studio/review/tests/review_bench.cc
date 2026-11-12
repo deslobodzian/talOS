@@ -60,7 +60,7 @@ void WriteMember(const std::string& directory, int member) {
   for (std::uint64_t i = 0; i < records; ++i) {
     const review_test::Shot shot{static_cast<double>(i) * 0.001,
                                  static_cast<std::uint32_t>(i),
-                                 review_test::Mode::SPINNING, (i & 1) != 0};
+                                 review_test::Mode::SPINNING, (i & 1) != 0, i};
     talos::event::Context ctx{};
     ctx.kind = talos::event::EventKind::TIMER;
     ctx.dispatch_index = i + 1;

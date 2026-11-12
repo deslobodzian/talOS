@@ -8,4 +8,9 @@ struct Shot {
   shot_count:uint;
   mode:Mode;
   ready:bool;
+  shot_id:ulong;
+}
+
+struct Status {
+  boot_id:ulong;
 }
