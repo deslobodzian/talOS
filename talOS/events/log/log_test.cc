@@ -18,6 +18,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1094,6 +1095,189 @@ TEST(LogSummary, VisitorSeesWhatTheReaderReturns) {
   summary = VisitLog(
       path, {.record = [](const LogReader::Record&) { return false; }});
   EXPECT_EQ(summary.record_count, 1u);
+  ::unlink(path.c_str());
+}
+
+// What a walk of one log file hands its visitor: each record's offset,
+// header and payload, the manifest's size, and the summary.
+struct Walk {
+  struct Visited {
+    std::uint64_t offset{0};
+    RecordHeader header{};
+    std::vector<std::byte> payload;
+  };
+  std::vector<Visited> records;
+  std::size_t manifest_entries{0};
+  LogSummary summary;
+};
+
+Walk WalkLog(const std::string& path, std::uint64_t start_offset) {
+  Walk walk;
+  walk.summary =
+      VisitLog(path,
+               {.manifest =
+                    [&](std::span<const ManifestEntry> entries) {
+                      walk.manifest_entries = entries.size();
+                      return true;
+                    },
+                .record =
+                    [&](const LogReader::Record& record) {
+                      walk.records.push_back(
+                          {record.offset, record.header,
+                           std::vector<std::byte>(record.payload.begin(),
+                                                  record.payload.end())});
+                      return true;
+                    }},
+               {.start_offset = start_offset});
+  return walk;
+}
+
+// The session review server (proposed REQ-OPS-41, REQ-OPS-42) indexes a log
+// by record offsets and later reads from one instead of from the start.
+// Resuming at any offset a reader returned must hand over exactly the
+// records, payloads and damage a read from the start does from that record
+// on: in every segment of a rotated log, and before, at and after a damaged
+// record.
+TEST(LogResume, EveryReturnedOffsetResumesWhereAFullReadWas) {
+  const std::string path = TempPath("resume");
+  // Segments of ten 16-byte records (the cap's arithmetic is
+  // ByteCapKeepsTheNewestRecords'); 50 records fill fewer than kLogSegments
+  // segments, so none is deleted.
+  const std::uint64_t cap =
+      kLogSegments * (RecordsOffset() + 10 * (sizeof(RecordHeader) + 16));
+  {
+    LogWriter writer{path, "resume",
+                     LogWriter::Options{256, 64, /*background=*/false, cap}};
+    writer.start(MakeManifest(), {});
+    for (std::uint64_t i = 1; i <= 50; ++i) {
+      Context context{};
+      context.kind = EventKind::MESSAGE;
+      context.source_id = 1;
+      context.dispatch_index = i;
+      context.event_time =
+          MonotonicTime::from_nanos(static_cast<std::int64_t>(i));
+      writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  const std::vector<std::string> files = LogSegmentFiles(path);
+  ASSERT_GE(files.size(), 4u);
+
+  // A record in the middle of a middle segment loses its first stored byte.
+  const std::string& damaged_file = files[files.size() / 2];
+  const Walk before_damage = WalkLog(damaged_file, 0);
+  ASSERT_GE(before_damage.records.size(), 3u);
+  const std::uint64_t damaged_offset =
+      before_damage.records[before_damage.records.size() / 2].offset;
+  FlipByte(damaged_file, damaged_offset + sizeof(RecordHeader));
+
+  for (const std::string& file : files) {
+    SCOPED_TRACE(file);
+    const Walk full = WalkLog(file, 0);
+    ASSERT_FALSE(full.records.empty());
+    ASSERT_EQ(full.summary.damage.spans, file == damaged_file ? 1u : 0u);
+    // LogReader, holding the whole file, reports the same offsets.
+    LogReader whole{file};
+    LogReader::Record record;
+    for (const Walk::Visited& visited : full.records) {
+      ASSERT_TRUE(whole.next(record));
+      EXPECT_EQ(record.offset, visited.offset);
+    }
+
+    for (std::size_t i = 0; i < full.records.size(); ++i) {
+      const std::uint64_t offset = full.records[i].offset;
+      SCOPED_TRACE("resumed at record " + std::to_string(i) + ", byte " +
+                   std::to_string(offset));
+      const Walk resumed = WalkLog(file, offset);
+      EXPECT_EQ(resumed.manifest_entries, MakeManifest().size());
+      ASSERT_EQ(resumed.records.size(), full.records.size() - i);
+      for (std::size_t k = 0; k < resumed.records.size(); ++k) {
+        const Walk::Visited& expected = full.records[i + k];
+        const Walk::Visited& actual = resumed.records[k];
+        EXPECT_EQ(actual.offset, expected.offset) << "record " << i + k;
+        EXPECT_EQ(
+            std::memcmp(&actual.header, &expected.header, sizeof(RecordHeader)),
+            0)
+            << "record " << i + k;
+        EXPECT_EQ(actual.payload, expected.payload) << "record " << i + k;
+      }
+      const bool skips_damage = file == damaged_file && offset < damaged_offset;
+      EXPECT_EQ(resumed.summary.damage.spans, skips_damage ? 1u : 0u);
+      EXPECT_EQ(resumed.summary.damage.skipped_bytes,
+                skips_damage ? full.summary.damage.skipped_bytes : 0u);
+      EXPECT_EQ(resumed.summary.record_count, resumed.records.size());
+    }
+  }
+  for (const std::string& file : files) ::unlink(file.c_str());
+  ::unlink(CappedMarkerPath(path).c_str());
+}
+
+// An offset that is not where an intact record starts is refused, naming the
+// file, rather than read as a record or scanned past as damage: one byte
+// into a record, a damaged record, the end of the file, and an intact record
+// inside the schema block, which a reader never returns.
+TEST(LogResume, OffsetThatIsNotARecordIsRefused) {
+  const std::string path = TempPath("resume_refused");
+  // A schema whose reflection bytes happen to hold an intact empty record.
+  RecordHeader embedded{};
+  embedded.magic = RECORD_MAGIC;
+  embedded.crc32 = crc32(std::span<const std::byte>{
+      reinterpret_cast<const std::byte*>(&embedded), sizeof(embedded)});
+  Manifest manifest = MakeManifest();
+  manifest[1].schema.bfbs.assign(reinterpret_cast<const char*>(&embedded),
+                                 sizeof(embedded));
+  const std::uint64_t embedded_offset =
+      sizeof(FileHeader) + manifest.size() * sizeof(ManifestEntry) +
+      manifest[0].schema.name.size() + manifest[0].schema.bfbs.size() +
+      manifest[1].schema.name.size();
+  std::vector<std::uint64_t> offsets;
+  {
+    LogWriter writer{path, "resume_refused", LogWriter::kDefaultBufferBytes};
+    writer.start(manifest, {});
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+      Context context{};
+      context.kind = EventKind::MESSAGE;
+      context.source_id = 1;
+      context.dispatch_index = i;
+      writer.dispatch(context, MakePayload(16, static_cast<int>(i)));
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  for (const auto& visited : WalkLog(path, 0).records) {
+    offsets.push_back(visited.offset);
+  }
+  ASSERT_EQ(offsets.size(), 3u);
+  FlipByte(path, offsets[2] + sizeof(RecordHeader));
+
+  const struct {
+    const char* what;
+    std::uint64_t offset;
+  } cases[] = {
+      {"an intact record in the schema block", embedded_offset},
+      {"one byte into a record", offsets[0] + 1},
+      {"a damaged record", offsets[2]},
+      {"the end of the file", FileSize(path)},
+  };
+  for (const auto& bad : cases) {
+    SCOPED_TRACE(bad.what);
+    WindowedLogReader reader{path};
+    try {
+      reader.seek(bad.offset);
+      ADD_FAILURE() << "seek(" << bad.offset << ") was accepted";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find(path),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+  // The records themselves still resume.
+  WindowedLogReader reader{path};
+  reader.seek(offsets[1]);
+  LogReader::Record record;
+  ASSERT_TRUE(reader.next(record));
+  EXPECT_EQ(record.header.dispatch_index, 2u);
   ::unlink(path.c_str());
 }
 

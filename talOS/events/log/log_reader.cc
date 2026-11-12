@@ -450,6 +450,7 @@ bool LogReader::next(Record& out) {
   const std::span<const std::byte> stored{
       data_.data() + cursor_ + sizeof(RecordHeader), header->stored_bytes};
   out.header = *header;
+  out.offset = cursor_;
   if (header->stored_bytes == header->payload_bytes) {
     out.payload = stored;
   } else {
@@ -467,7 +468,8 @@ bool LogReader::next(Record& out) {
 LogSummary SummarizeLog(std::string_view path) { return VisitLog(path, {}); }
 
 struct WindowedLogReader::State {
-  explicit State(std::string_view path) : stream{path} {}
+  explicit State(std::string_view path) : path{path}, stream{path} {}
+  std::string path;
   LogStream stream;
   std::optional<FileSource> source;
   std::vector<ManifestEntry> entries;
@@ -475,6 +477,7 @@ struct WindowedLogReader::State {
   MonotonicTime start_time;
   std::uint64_t session_id{0};
   std::string process_name;
+  std::uint64_t records_offset{0};  // where the first record would start
   std::uint64_t cursor{0};
   std::uint64_t scan_payload_bytes{kMinScanPayloadBytes};
   LogDamage damage;
@@ -549,9 +552,11 @@ WindowedLogReader::WindowedLogReader(std::string_view path)
   state.process_name = read_name(header.process_name);
   // The records, through a fixed window that a resynchronising scan can
   // also move back over.
-  state.cursor = std::uint64_t{header.header_bytes} +
-                 std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
-                 header.schema_bytes;
+  state.records_offset =
+      std::uint64_t{header.header_bytes} +
+      std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
+      header.schema_bytes;
+  state.cursor = state.records_offset;
   state.source.emplace(stream.fd());
 }
 
@@ -589,6 +594,7 @@ bool WindowedLogReader::next(LogReader::Record& out) {
   const std::optional<RecordHeader> record = locate(
       source, state.cursor, state.scan_payload_bytes, state.damage, state.last);
   if (!record.has_value()) return false;
+  out.offset = state.cursor;
   const std::uint64_t body = state.cursor + sizeof(RecordHeader);
   state.cursor = body + record->stored_bytes;
   ++state.record_count;
@@ -607,8 +613,30 @@ bool WindowedLogReader::next(LogReader::Record& out) {
   return true;
 }
 
-LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
+void WindowedLogReader::seek(std::uint64_t offset) {
+  State& state = *state_;
+  // The fast path of locate(): a record next() would accept without a scan.
+  RecordHeader header{};
+  if (offset < state.records_offset ||
+      !intact_at(*state.source, offset, kAnyPayload, header)) {
+    throw std::invalid_argument(
+        "LogReader: " + state.path + ": no intact record starts at byte " +
+        std::to_string(offset) +
+        "; resume only at an offset a reader of this file returned");
+  }
+  // From here next() is a reader from the start that has just reached
+  // `offset`: the record there is accepted as is and becomes the one later
+  // records must be able to follow (can_follow), as it did in that reader.
+  state.cursor = offset;
+  state.damage = LogDamage{};
+  state.last.reset();
+  state.record_count = 0;
+}
+
+LogSummary VisitLog(std::string_view path, const LogVisitor& visitor,
+                    const VisitOptions& options) {
   WindowedLogReader reader{path};
+  if (options.start_offset != 0) reader.seek(options.start_offset);
   LogSummary summary;
   if (visitor.manifest && !visitor.manifest(reader.manifest_entries())) {
     return summary;
