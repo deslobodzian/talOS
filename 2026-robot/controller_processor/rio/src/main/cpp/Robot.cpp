@@ -54,6 +54,8 @@ constexpr const char* kConfigPath = "talos_config.bin";
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;
+constexpr uint16_t kSocketLostMessage = 4;
+constexpr uint16_t kSocketReplacedMessage = 5;
 
 void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
   talos::rio::LogEvent event;
@@ -292,7 +294,8 @@ void Robot::StartCompetition() {
 
   // Opened from the loop, retried every SocketRetry::kPeriodUs until the
   // network has a route to the companion (after a RoboRIO boot, the program
-  // can start before it does).
+  // can start before it does), and replaced on the same cadence when a send
+  // finds it unable to send again.
   talos::rio::SocketRetry socket_retry;
 
   // The configuration being restored, if any; the push still follows.
@@ -376,10 +379,14 @@ void Robot::StartCompetition() {
     int open_errno = 0;
     const auto socket_event = socket_retry.Poll(now_us, [&] {
       // The failing call's errno (Open's close of the half-made socket
-      // leaves it): ENETUNREACH while the network has no route yet.
+      // leaves it): ENETUNREACH while the network has no route yet. A lost
+      // socket is replaced on the same ports, its frame sequence carried on.
       errno = 0;
-      open_status = endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0",
-                                    5802, companion_address, 5803);
+      open_status =
+          socket_retry.replacing()
+              ? endpoint_->Reopen()
+              : endpoint_->Open(IsSimulation() ? "127.0.0.1" : "0.0.0.0", 5802,
+                                companion_address, 5803);
       open_errno = errno;
       return open_status == talos::protocol::UdpStatus::kOk;
     });
@@ -402,13 +409,37 @@ void Robot::StartCompetition() {
           static_cast<unsigned>(socket_retry.failures()),
           static_cast<double>(now_us - socket_retry.first_failure_us()) / 1e6);
       Report(*log_, kSocketOpenMessage, text);
+    } else if (socket_event == talos::rio::SocketRetry::Event::kReplaced) {
+      char text[128];
+      std::snprintf(
+          text, sizeof(text),
+          "hardware gateway socket replaced after %u failed attempts, %.3f s "
+          "after it could not send",
+          static_cast<unsigned>(socket_retry.failures()),
+          static_cast<double>(now_us - socket_retry.lost_us()) / 1e6);
+      Report(*log_, kSocketReplacedMessage, text);
     }
+    // A send that finds the socket unable to send again loses it
+    // (SocketRetry::SendFailed): from there this loop ticks the gateway
+    // disabled and sends nothing, as before the first open, until a Poll
+    // replaces it. Any other send error keeps it.
+    const auto sent = [&](talos::protocol::UdpStatus status) {
+      if (status != talos::protocol::UdpStatus::kSocketError) return;
+      const int error = endpoint_->udp_stats().last_send_error;
+      if (!socket_retry.SendFailed(now_us, error)) return;
+      char text[128];
+      std::snprintf(text, sizeof(text),
+                    "hardware gateway socket cannot send (errno %d); "
+                    "replacing it, nothing is sent until then",
+                    error);
+      Report(*log_, kSocketLostMessage, text);
+    };
     if (socket_retry.open()) {
       // Endpoint handles clock probes even disabled/uncommissioned, echoing
       // only on a subsequent tick so its sample stamp follows probe receipt.
-      endpoint_->Tick(now_us,
-                      (mode_flags & talos::driver_station::kEnabled) != 0 &&
-                          (mode_flags & talos::driver_station::kEStop) == 0);
+      sent(endpoint_->Tick(
+          now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
+                      (mode_flags & talos::driver_station::kEStop) == 0));
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and
@@ -419,7 +450,8 @@ void Robot::StartCompetition() {
       const uint32_t mode = talos::driver_station::ModeKey(mode_flags);
       const bool sample_due =
           now_us - last_ds_sample_us >= talos::driver_station::kSamplePeriodUs;
-      if (mode != last_ds_mode || sample_due) {
+      // Not on a socket the State send just lost: the replacement sends it.
+      if (socket_retry.open() && (mode != last_ds_mode || sample_due)) {
         last_ds_sample_us = now_us;
         last_ds_mode = mode;
         auto ds = talos::driver_station::SampleDriverStation(now_us);
@@ -430,8 +462,8 @@ void Robot::StartCompetition() {
         // Encode() returns 0 if the payload will not fit; send nothing rather
         // than an empty frame the receiver would forward as a decode failure.
         if (const auto ds_size = talos::driver_station::Encode(ds, ds_buffer)) {
-          endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
-                               now_us, ds_buffer.data(), ds_size);
+          sent(endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
+                                    now_us, ds_buffer.data(), ds_size));
         }
       }
     } else {

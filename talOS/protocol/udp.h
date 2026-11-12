@@ -127,6 +127,15 @@ class RuntimeUdpPeer {
   UdpSocketOptions options_{};
 };
 
+// Whether a send that failed with OS error `error` (UdpStats::last_send_error)
+// left a socket that will never send again, whatever the network does, so
+// only a new one can (Reopen): EPIPE, ENOTCONN, EDESTADDRREQ, EADDRNOTAVAIL
+// and EBADF (on Windows their WSA equivalents: WSAESHUTDOWN, WSAENOTCONN,
+// WSAEDESTADDRREQ, WSAEADDRNOTAVAIL, WSAENOTSOCK). Any other error clears by
+// itself on the same socket. Both ends' callers (the bridge's HardwareNode,
+// the RoboRIO program) decide with this one function.
+bool SendErrorNeedsNewSocket(int error);
+
 const char* UdpStatusName(UdpStatus status);
 
 }  // namespace talos::protocol

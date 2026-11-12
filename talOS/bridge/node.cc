@@ -1,7 +1,6 @@
 #include "node.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -318,27 +317,6 @@ void HardwareNode::PushConfig(uint64_t now_us) {
   last_push_time_us_ = now_us;
 }
 
-namespace {
-
-// Whether a send error means this socket will never send again, whatever
-// the network does, so only a new socket can: shut down for writing, or
-// marked defunct by macOS (EPIPE; seen after sleep and wake); no longer
-// connected (ENOTCONN, EDESTADDRREQ); its source address removed from the
-// host (EADDRNOTAVAIL; a new socket's connect picks a current one); or no
-// socket at all (EBADF). Every other error is the network's, and the same
-// socket sends again once it clears: ECONNREFUSED (an ICMP port unreachable
-// from an earlier datagram, reported once: the gateway program is not
-// running yet), ENETDOWN, ENETUNREACH, EHOSTUNREACH (no interface or
-// route; a connected socket looks the route up again on each send) and
-// ENOBUFS (a full interface queue). A new socket would fail those the same
-// way, so reopening for them would only churn sockets.
-bool SocketCannotSend(int error) {
-  return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
-         error == EADDRNOTAVAIL || error == EBADF;
-}
-
-}  // namespace
-
 protocol::UdpStatus HardwareNode::SendToGateway(protocol::FrameType type,
                                                 uint64_t now_us,
                                                 const void* payload,
@@ -368,7 +346,7 @@ protocol::UdpStatus HardwareNode::SendToGateway(protocol::FrameType type,
   if (error == 0) error = peer_.stats().last_send_error;
   ++socket_counters_.send_failures;
   socket_counters_.last_send_error = error;
-  if (!SocketCannotSend(error)) return status;
+  if (!protocol::SendErrorNeedsNewSocket(error)) return status;
   if (poller_) poller_->remove_fd(peer_.NativeFd());
   peer_.Close();
   if (!socket_lost_) {
