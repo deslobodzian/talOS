@@ -90,9 +90,11 @@ std::string ReadFile(const std::string& path) {
 }
 
 // A session of the fixture: a hardware stub that runs until stopped, and
-// alpha, which prints "tick" every 20 ms. Each alpha run writes
-// "alpha <run>" to kEventFd as it starts, and run 1 also "alpha 1 ticked"
-// once it has printed twenty ticks. Once `crash` exists, run 0 exits 1.
+// alpha, which prints "tick" every 20 ms. Once its stop trap is set, the
+// hardware stub writes "hardware ready" to kEventFd, and each alpha run
+// "alpha <run>"; run 1 also writes "alpha 1 ticked" once it has printed
+// twenty ticks. Once `crash` exists, run 0 exits 1. A stop signalled before
+// both are ready could end a stub by the signal rather than its trap.
 struct Fixture {
   LauncherOptions options;
   std::string crash;
@@ -111,11 +113,12 @@ struct Fixture {
     crashed = TempPath(std::string{tag} + "_crashed");
     ::remove(crash.c_str());
     ::remove(crashed.c_str());
+    const std::string events = std::to_string(kEventFd);
     options.binary_overrides["//talOS/bridge:hardware_node"] =
         WriteStub(std::string{tag} + "_hardware",
-                  "trap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n",
+                  "trap 'exit 0' INT TERM\necho 'hardware ready' >&" + events +
+                      "\nwhile :; do sleep 0.05; done\n",
                   "hardware_node");
-    const std::string events = std::to_string(kEventFd);
     std::string alpha = "trap 'exit 0' INT TERM\nrun=0\n";
     alpha += "[ -e " + crashed + " ] && run=1\n";
     alpha += "echo \"alpha $run\" >&" + events + "\nticks=0\nwhile :; do\n";
@@ -298,8 +301,9 @@ TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
     ::close(output);
     ASSERT_GT(launcher.pid, 0);
     std::string events;
-    // Alpha starts after the launcher has installed its signal handlers.
-    const bool started = AwaitText(launcher.events, events, "alpha 0");
+    // The members start after the launcher has installed its handlers.
+    const bool started = AwaitText(launcher.events, events, "alpha 0") &&
+                         AwaitText(launcher.events, events, "hardware ready");
     ::kill(launcher.pid, SIGHUP);
     bool restarted = false;
     if (row.ignored) {
