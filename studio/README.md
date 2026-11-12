@@ -123,7 +123,7 @@ shown in the footer with **Retry**; panels keep what they last showed.
 
 | Panel | On a recording |
 |---|---|
-| Plot | Each channel decimated to the plot's pixel width: the line is each bucket's last sample, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
+| Plot | Each channel decimated to the plot's pixel width: the line is each bucket's last sample, at that sample's own publication time, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
 | Field | The pose estimator's pose at the playhead (no pose while its `valid` is false), the trail and camera observations over the window. |
 | Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the playhead; the system graph, events and node selections are live-only and show as absent. |
 | Every other panel | "Not available for recorded sessions yet." |

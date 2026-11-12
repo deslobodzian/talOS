@@ -36,7 +36,9 @@ export type ReviewSample = {value: number; exact?: string; sample_ns: string};
 export type ReviewSnapshot = {t_ns: string; channels: Map<string, ReviewSample>};
 
 // One channel's decimated columns, index-aligned: `count[i]` samples fell in
-// bucket i, which spans min[i]..max[i] and ends at last[i] (NaN when empty).
+// bucket i, which spans min[i]..max[i] and ends at last[i], published at
+// t_ns[i] (NaN when empty). Every channel shares the bucket edges, not the
+// times: each channel's t_ns is its own last sample's.
 export type SeriesColumns = {
   t_ns: Float64Array;
   min: Float64Array;
