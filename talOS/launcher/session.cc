@@ -145,6 +145,45 @@ bool NodeProcessInfo::RecordRealtime(const process::RealtimeOutcome& outcome) {
   return true;
 }
 
+uint64_t DeliveryCounts::requests_skipped_total() const {
+  uint64_t total = 0;
+  for (const auto& [subsystem, count] : requests_skipped) total += count;
+  return total;
+}
+
+bool NodeProcessInfo::RecordDeliveryLoss(DeliveryCounts seen) {
+  if (runs.empty() || runs.back().end_wall_ns != 0) return false;
+  NodeRun& run = runs.back();
+  DeliveryCounts& was = run.delivery ? *run.delivery : run.delivery.emplace();
+  DeliveryCounts& total = delivery ? *delivery : delivery.emplace();
+  bool became_nonzero = false;
+  // A count only grows within a run; one read lower than before (never
+  // expected) keeps the higher.
+  const auto note = [&became_nonzero](uint64_t& run_count, uint64_t now,
+                                      uint64_t& total) {
+    if (now <= run_count) return;
+    became_nonzero = became_nonzero || run_count == 0;
+    total += now - run_count;
+    run_count = now;
+  };
+  note(was.wake_failures, seen.wake_failures, total.wake_failures);
+  note(was.stalled_arms, seen.stalled_arms, total.stalled_arms);
+  note(was.wake_fallbacks, seen.wake_fallbacks, total.wake_fallbacks);
+  const auto entry = [](std::vector<std::pair<std::string, uint64_t>>& counts,
+                        const std::string& subsystem) -> uint64_t& {
+    for (auto& [name, count] : counts) {
+      if (name == subsystem) return count;
+    }
+    return counts.emplace_back(subsystem, 0).second;
+  };
+  for (const auto& [subsystem, count] : seen.requests_skipped) {
+    if (count == 0) continue;
+    note(entry(was.requests_skipped, subsystem), count,
+         entry(total.requests_skipped, subsystem));
+  }
+  return became_nonzero;
+}
+
 void NodeProcessInfo::BeginRun(pid_t run_pid) {
   if (runs.size() >= kMaxRecordedRuns) {
     runs.erase(runs.begin() + 1);
@@ -198,6 +237,7 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"git_revision\": " << Quoted(git_revision) << ",\n";
   ss << "  \"git_dirty\": " << (git_dirty ? "true" : "false") << ",\n";
   ss << "  \"output_dir\": " << Quoted(output_dir) << ",\n";
+  ss << "  \"launcher_log\": " << Quoted(launcher_log) << ",\n";
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
   ss << "  \"start_wall_ns\": " << start_wall_ns << ",\n";
   ss << "  \"end_wall_ns\": " << end_wall_ns << ",\n";
@@ -240,9 +280,26 @@ std::string SessionManifest::ToJson() const {
        << Quoted(n.realtime ? process::RefusedStepNames(n.realtime->refused)
                             : "")
        << ",\n";
+    // Absent until a run's registry row was seen, so a reader can tell
+    // nothing lost from never watched.
+    if (n.delivery) {
+      const DeliveryCounts& d = *n.delivery;
+      ss << "      \"wake_failures\": " << d.wake_failures << ",\n";
+      ss << "      \"stalled_arms\": " << d.stalled_arms << ",\n";
+      ss << "      \"wake_fallbacks\": " << d.wake_fallbacks << ",\n";
+      ss << "      \"requests_skipped\": " << d.requests_skipped_total()
+         << ",\n";
+      ss << "      \"requests_skipped_by_subsystem\": {";
+      for (std::size_t j = 0; j < d.requests_skipped.size(); ++j) {
+        ss << (j ? ", " : "") << Quoted(d.requests_skipped[j].first) << ": "
+           << d.requests_skipped[j].second;
+      }
+      ss << "},\n";
+    }
     ss << "      \"record_count\": " << n.record_count << ",\n";
     ss << "      \"runs_dropped\": " << n.runs_dropped << ",\n";
-    // Last: a run is the only nested object in a node's entry.
+    // Last: a run holds no nested object or array, and no node field
+    // follows the runs.
     ss << "      \"runs\": [";
     for (std::size_t j = 0; j < n.runs.size(); ++j) {
       const NodeRun& run = n.runs[j];
@@ -251,7 +308,15 @@ std::string SessionManifest::ToJson() const {
          << ", \"end_wall_ns\": " << run.end_wall_ns
          << ", \"exit_code\": " << run.exit_code
          << ", \"exit_signal\": " << run.exit_signal
-         << ", \"reason\": " << Quoted(run.reason) << "}";
+         << ", \"reason\": " << Quoted(run.reason);
+      if (run.delivery) {
+        ss << ", \"wake_failures\": " << run.delivery->wake_failures
+           << ", \"stalled_arms\": " << run.delivery->stalled_arms
+           << ", \"wake_fallbacks\": " << run.delivery->wake_fallbacks
+           << ", \"requests_skipped\": "
+           << run.delivery->requests_skipped_total();
+      }
+      ss << "}";
     }
     ss << (n.runs.empty() ? "]\n" : "\n      ]\n");
     ss << "    }" << (i + 1 < nodes.size() ? "," : "") << "\n";

@@ -512,16 +512,30 @@ talos_cc_node(
     deps = [":continuity_message"],
 )
 
+# A member that only keeps a registry row with the delivery-loss counts its
+# command line gives (supervision_test's manifest check).
+cc_binary(
+    name = "delivery_loss_node",
+    testonly = True,
+    srcs = ["testdata/delivery_loss_node.cc"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/introspection:registry",
+    ],
+)
+
 cc_test(
     name = "supervision_test",
     size = "medium",
     srcs = ["supervision_test.cc"],
     data = [
         ":alpha",
+        ":delivery_loss_node",
         ":endpoint_drift",
     ],
     env = {
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
+        "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
     },
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about

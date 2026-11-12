@@ -172,8 +172,11 @@ latest-value read of `/hw/request/<node>` then passes over: each counts in
 `dropped` of that subsystem's request source in the bridge's row, which is
 not latest-only, so Studio calls the topic `lossy`.
 `NodeSnapshot::delivery_loss()` (and `DeliveryLossOf(const NodeRecord&)`,
-for a reader that copies no snapshot) gathers them with `requests_skipped`,
-the `dropped` of the node's readers of `/hw/request/<node>` summed. The fields took the record's tail
+for a reader that copies no snapshot, such as the launcher's supervision
+pass, which keeps them per run in the
+[session manifest](../launcher/README.md#session-manifest)) gathers them
+with `requests_skipped`, the `dropped` of the node's readers of
+`/hw/request/<node>` summed. The fields took the record's tail
 padding, so `sizeof(NodeRecord)` stayed 11136 B, but a claim by an older
 build would not have cleared them, so they are registry version 6
 ([data flow](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots)).
