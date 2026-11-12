@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "talOS/bridge/in_process_gateway.h"
+#include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
 #include "talOS/bridge/node_test_support.h"
 #include "talOS/configuration/config_parser.h"
@@ -391,6 +392,53 @@ TEST(HardwareNodeTrustTest, RejectsWrongIdentityWordsEvenWithinBound) {
   EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
   EXPECT_DOUBLE_EQ(node.current_command().motors[1].demand, 30.0);
   EXPECT_EQ(node.current_command().observed_time_us, 5000u);
+}
+
+// A request merges only while the State it was built from is younger than
+// command_timeout_us against the latest State (MergeOwner::Admits, given
+// HardwareNode's bound): the age bound the gateway itself applies to a
+// command's observation. A wider bound would merge a request the gateway
+// must refuse, and its observation, the oldest merged, would then make the
+// gateway refuse every owner's outputs; a narrower one, such as the 50 ms
+// owner timeout, would drop a live owner whose request lags the latest State
+// by less than the timeout. One request built from the State sampled at
+// 1000: admitted while the latest State is command_timeout_us - 1 newer,
+// refused once it is command_timeout_us newer, its demand left out.
+// REQ-SAFE-16
+TEST(HardwareNodeTrustTest,
+     AdmitsARequestOnlyWhileItsStateIsYoungerThanTheTimeout) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint16_t roller = cfg.subsystems.at("intake").motors[0];
+  const uint64_t config_id = NodeConfigId(cfg);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  ASSERT_LT(OwnerTimeoutUs(5000, timeout_us), timeout_us)
+      << "the owner timeout must differ from the bound for this to tell them "
+         "apart";
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+  // IntakeRequest is built from boot 11, epoch 1, sample 1000.
+  constexpr uint64_t kBuiltUs = 1000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, kBuiltUs), 1000000));
+  ipc::Publisher<Packet> intake{RequestTopic("intake")};
+
+  ASSERT_TRUE(gateway.Deliver(
+      TrustState(config_id, 11, 1, kBuiltUs + timeout_us - 1), 1001000));
+  PublishCommand(intake, IntakeRequest(cfg, 4.0));
+  node.Tick(1002000);
+  EXPECT_EQ(node.identity_rejected(), 0u)
+      << "built " << timeout_us - 1 << " us before the latest State";
+  EXPECT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(MotorOf(node.current_command(), roller).mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
+
+  ASSERT_TRUE(gateway.Deliver(
+      TrustState(config_id, 11, 1, kBuiltUs + timeout_us), 1003000));
+  PublishCommand(intake, IntakeRequest(cfg, 5.0));
+  node.Tick(1004000);
+  EXPECT_EQ(node.identity_rejected(), 1u)
+      << "built " << timeout_us << " us before the latest State";
+  EXPECT_DOUBLE_EQ(MotorOf(node.current_command(), roller).demand, 4.0);
 }
 
 TEST(HardwareNodeTrustTest, RequiresFreshRequestsAfterControllerTransitions) {

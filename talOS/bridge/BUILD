@@ -112,6 +112,7 @@ cc_test(
     srcs = ["trust_test.cc"],
     deps = [
         ":in_process_gateway",
+        ":merge",
         ":messages",
         ":node_lib",
         ":node_test_support",
