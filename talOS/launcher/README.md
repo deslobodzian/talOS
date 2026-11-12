@@ -702,7 +702,11 @@ killed node loses only about its last 10 ms, which its writer had not yet
 written: [log format](../events/README.md#log-format)); a
 capped log's rotation also syncs the finished segment and the next one's
 header with `DurableSync`, then the directory, so a power loss leaves whole
-segments (`LogWriter`).
+segments (`LogWriter`). The output logs, each member's `<name>.log` and the
+launcher's `talos.log` ([node output](#node-output)), are never synced: a
+power loss can cut the end of either. The launcher's lines before the
+session directory exists (the session lock, the config, retention) go to
+its terminal only.
 
 At startup, retention removes older sessions: directories holding a
 `manifest.json`, or, named by a session id, an event log whose header carries
