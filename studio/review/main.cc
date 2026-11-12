@@ -207,8 +207,15 @@ int Run(int argc, char** argv) {
   }
   bound_port = static_cast<std::uint16_t>(parsed_port);
   std::cout << "listening " << bound << '\n' << std::flush;
+  // The loop returns only once every socket, the listener included, has
+  // closed, and the server then ends. It leaves through std::exit, which
+  // does not destroy this frame's uWS::App: its destructor deletes the
+  // topic tree and then hands the freed pointer to Loop::removePostHandler
+  // as a map key, which clang-analyzer-cplusplus.NewDelete reports as a use
+  // after free (the key is never dereferenced, and this server never
+  // creates a topic tree). Returning would run it for nothing.
   app.run();
-  return 0;
+  std::exit(0);
 }
 
 }  // namespace
