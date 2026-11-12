@@ -72,6 +72,10 @@ std::string_view RunEndReason(std::string_view kill_reason, bool stopping,
 // one. Reads the log's directory.
 bool CappedLogStopped(const std::string& log_path);
 
+// How long a stopping session gives a member after its SIGINT before it
+// kills the member's group (SIGKILL; run reason stop_timeout).
+inline constexpr std::chrono::seconds kStopTimeout{2};
+
 // ---------------------------------------------------------------------------
 // Launcher
 // ---------------------------------------------------------------------------
