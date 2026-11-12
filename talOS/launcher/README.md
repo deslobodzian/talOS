@@ -248,7 +248,14 @@ overrides `[studio] http_port` for one run. The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
 `[studio] webroot`. The bridge needs both the binary (`[studio] bridge`,
 resolved under `bazel-bin/` like a node's) and the webroot: with either missing the bridge cannot start and the session
-runs on without Studio (below). An installed bundle contains neither. The bridge answers `--describe`
+runs on without Studio (below). A bundle built with `talos_bundle`'s
+`studio_bridge` and `studio_webroot` carries both
+([DEPLOYMENT.md](../../docs/DEPLOYMENT.md#build-a-bundle)): its manifest's
+`[studio]` table registers the bundled bridge under its label and the name
+`studio_bridge`, and the bundle's webroot replaces a relative
+`[studio] webroot` (an absolute one is kept). A bundle built without them has
+no bridge: the flag adds none to the roster and the launcher says the bundle
+carries no Studio. The bridge answers `--describe`
 like any other node, and the launcher starts it with the session's `graph.json`
 as `--declared` and the session's `manifest.json` as `--manifest`; its stdout
 and stderr land in `<output_dir>/<session_id>/studio_bridge.log`

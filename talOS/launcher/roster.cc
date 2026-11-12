@@ -64,6 +64,29 @@ bool LoadBundle(LauncherOptions& options, std::string& error) {
         }
       }
     }
+
+    if (const auto* studio = manifest["studio"].as_table()) {
+      const auto bridge = (*studio)["bridge"].value<std::string>();
+      const auto webroot = (*studio)["webroot"].value<std::string>();
+      if (!bridge || !webroot) {
+        error = manifest_path.string() +
+                ": [studio] needs both `bridge` and `webroot`";
+        return false;
+      }
+      const std::string path = (root / *bridge).string();
+      options.binary_overrides[std::string{kStudioBridgeName}] = path;
+      if (const auto* targets = (*studio)["targets"].as_array()) {
+        for (const auto& target : *targets) {
+          if (auto label = target.value<std::string>()) {
+            options.binary_overrides[*label] = path;
+          }
+        }
+      }
+      options.bundle_has_studio = true;
+      options.bundle_studio_webroot = std::filesystem::absolute(root / *webroot)
+                                          .lexically_normal()
+                                          .string();
+    }
   }
 
   if (options.config_path.empty()) {
@@ -186,12 +209,17 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   }
 
   // 4. The Studio bridge: a viewer named by [studio], in any session, so a
-  // deployed robot is viewable too (an observer: see StudioBridge).
-  if (options.start_studio_bridge) {
+  // deployed robot is viewable too (an observer: see StudioBridge). A bundle
+  // without Studio has none; probing a binary it lacks would fail the graph.
+  if (options.start_studio_bridge && !BundleWithoutStudio(options)) {
     specs.push_back(
         MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge, options));
   }
   return specs;
+}
+
+bool BundleWithoutStudio(const LauncherOptions& options) {
+  return !options.bundle_dir.empty() && !options.bundle_has_studio;
 }
 
 std::string EffectiveRemoteAddress(const config::RobotConfig& config,
@@ -213,6 +241,16 @@ uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
                                  const LauncherOptions& options) {
   return options.studio_http_port != 0 ? options.studio_http_port
                                        : config.studio.http_port;
+}
+
+std::string EffectiveStudioWebroot(const config::RobotConfig& config,
+                                   const LauncherOptions& options) {
+  const std::string& configured = config.studio.webroot;
+  if (!options.bundle_has_studio ||
+      std::filesystem::path{configured}.is_absolute()) {
+    return configured;
+  }
+  return options.bundle_studio_webroot;
 }
 
 }  // namespace talos::launcher

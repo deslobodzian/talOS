@@ -1754,6 +1754,69 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   std::filesystem::remove_all(bundle_dir);
 }
 
+// REQ-OPS-30: a deployed bundle that carries Studio starts its own bridge and
+// serves its own webroot, through the [studio] keys a checkout uses; one that
+// carries none runs its session without a bridge rather than failing the
+// graph on a probe of a binary it lacks.
+TEST(LauncherBundleTest, BundledStudioResolvesThroughTheStudioKeys) {
+  const std::string bundle_dir = TempPath("test_bundle_studio");
+  std::filesystem::create_directories(bundle_dir + "/config");
+  std::filesystem::create_directories(bundle_dir + "/studio/webroot");
+  { std::ofstream{bundle_dir + "/config/robot.toml"} << "[robot]\n"; }
+  const auto write_manifest = [&](bool studio) {
+    std::ofstream mf(bundle_dir + "/bundle_manifest.toml");
+    mf << "bundle_version = 1\nconfig_path = \"config/robot.toml\"\n";
+    if (studio) {
+      mf << "\n[studio]\nbridge = \"studio/studio_bridge\"\n"
+         << "targets = [\"//viewer:bridge\"]\n"
+         << "webroot = \"studio/webroot\"\n";
+    }
+  };
+  {
+    std::ofstream b(bundle_dir + "/studio/studio_bridge");
+    b << "#!/bin/sh\nexit 0\n";
+  }
+  ::chmod((bundle_dir + "/studio/studio_bridge").c_str(), 0755);
+  const std::string bridge = bundle_dir + "/studio/studio_bridge";
+
+  write_manifest(true);
+  LauncherOptions options;
+  options.bundle_dir = bundle_dir;
+  options.start_studio_bridge = true;
+  std::string error;
+  ASSERT_TRUE(LoadBundle(options, error)) << error;
+
+  config::RobotConfig robot;  // webroot: the checkout's relative default
+  robot.studio.bridge = "//viewer:bridge";
+  EXPECT_EQ(
+      MakeNodeSpec(kStudioBridgeName, robot.studio.bridge, options).binary_path,
+      bridge);
+  // The framework's default label, unset in the config: found by name.
+  EXPECT_EQ(
+      MakeNodeSpec(kStudioBridgeName, "//studio/bridge:studio_bridge", options)
+          .binary_path,
+      bridge);
+  EXPECT_EQ(std::filesystem::path{EffectiveStudioWebroot(robot, options)},
+            std::filesystem::absolute(bundle_dir + "/studio/webroot")
+                .lexically_normal());
+  robot.studio.webroot = "/srv/studio";
+  EXPECT_EQ(EffectiveStudioWebroot(robot, options), "/srv/studio");
+
+  write_manifest(false);
+  LauncherOptions bare;
+  bare.bundle_dir = bundle_dir;
+  bare.start_studio_bridge = true;
+  ASSERT_TRUE(LoadBundle(bare, error)) << error;
+  const auto nodes =
+      DiscoverNodes(config::ParseRobotConfigString(kFixtureToml), bare);
+  EXPECT_EQ(std::count_if(
+                nodes.begin(), nodes.end(),
+                [](const NodeSpec& n) { return n.name == kStudioBridgeName; }),
+            0);
+
+  std::filesystem::remove_all(bundle_dir);
+}
+
 // A binary's digest is the SHA-256 sha256sum and the bundle builder's
 // hashlib write, across the padding boundary and FileSha256's read chunks.
 TEST(LauncherBundleTest, FileSha256MatchesTheStandardDigest) {

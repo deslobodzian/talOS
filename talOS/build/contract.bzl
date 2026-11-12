@@ -888,6 +888,21 @@ def _talos_bundle_impl(ctx):
         for f in ctx.files.config_files
     ]
 
+    # Studio: the bridge binary and the built webroot, both or neither. The
+    # robot's BUILD names them; talOS names no studio/ label.
+    studio_spec = None
+    if bool(ctx.attr.studio_bridge) != bool(ctx.attr.studio_webroot):
+        fail("talos_bundle: set studio_bridge and studio_webroot together, or neither")
+    if ctx.attr.studio_bridge:
+        bridge_exec = ctx.executable.studio_bridge
+        webroot = ctx.file.studio_webroot
+        direct_inputs.extend([bridge_exec, webroot])
+        studio_spec = {
+            "bridge_path": bridge_exec.path,
+            "bridge_label": _bundle_label(ctx.attr.studio_bridge.label),
+            "webroot_path": webroot.path,
+        }
+
     spec = {
         "bundle_name": ctx.label.name,
         "bundle_version": 1,
@@ -896,6 +911,7 @@ def _talos_bundle_impl(ctx):
         "config_files": config_files_spec,
         "nodes": nodes_spec,
         "default_hardware_node": _bundle_label(_HARDWARE_NODE),
+        "studio": studio_spec,
     }
 
     spec_file = ctx.actions.declare_file(ctx.label.name + "_spec.json")
@@ -1023,6 +1039,17 @@ _talos_bundle = rule(
             cfg = "target",
             doc = "The launcher binary",
         ),
+        "studio_bridge": attr.label(
+            executable = True,
+            cfg = "target",
+            doc = "The Studio bridge binary (the robot's [studio] bridge) that " +
+                  "--start-studio-bridge starts from the bundle. Set with studio_webroot.",
+        ),
+        "studio_webroot": attr.label(
+            allow_single_file = True,
+            doc = "The built Studio site, one directory holding index.html, that " +
+                  "the bundled bridge serves. Set with studio_bridge.",
+        ),
         "_builder": attr.label(
             default = Label("//talOS/build:bundle_builder"),
             executable = True,
@@ -1056,7 +1083,10 @@ def talos_bundle(name, config, **kwargs):
       name: bundle target name.
       config: robot TOML label; its generated manifest must live beside it.
       **kwargs: passed to the bundle rule: nodes, the hardware node plus the
-        manifest's NODES, and config_files, its CONFIG_FILES.
+        manifest's NODES; config_files, its CONFIG_FILES; and, for a robot
+        viewed with Studio, studio_bridge and studio_webroot (the bridge
+        binary and the built site), which put Studio in the bundle for
+        `run.sh --start-studio-bridge`.
     """
     config_label = native.package_relative_label(config)
     manifest = config_label.same_package_label(

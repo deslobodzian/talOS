@@ -105,6 +105,25 @@ def check_nodes(spec, resolved):
             [f"  in nodes but not launched: {label}" for label in extra]))
 
 
+def check_studio(spec, resolved):
+    """Exits when the bundle carries a Studio bridge other than the one its
+    config's `[studio] bridge` names, or a webroot with no index.html. Unset,
+    the launcher's default label is used and falls back to the bundled bridge
+    by name."""
+    studio = spec.get("studio")
+    if not studio:
+        return
+    configured = resolved["effective"].get("studio", {}).get("bridge")
+    targets = node_targets({"target": studio["bridge_label"]})
+    if isinstance(configured, str) and configured not in targets:
+        sys.exit(f"bundle: studio_bridge {studio['bridge_label']} is not the "
+                 f"[studio] bridge {configured} that "
+                 f"{spec['config']['short_path']} names")
+    if not os.path.isfile(os.path.join(studio["webroot_path"], "index.html")):
+        sys.exit(f"bundle: studio_webroot {studio['webroot_path']} holds no "
+                 "index.html")
+
+
 def source_revision(path):
     """The bundle_manifest.toml lines naming the source revision, from a --stamp
     build's stable status file (tools/workspace_status.sh); none when it has
@@ -135,7 +154,9 @@ def main():
     with open(args.spec, "r") as f:
         spec = json.load(f)
     with open(args.resolved, "r") as f:
-        check_nodes(spec, json.load(f))
+        resolved = json.load(f)
+    check_nodes(spec, resolved)
+    check_studio(spec, resolved)
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -263,7 +284,31 @@ def main():
             "language": lang,
         })
 
-    # 5. bundle_manifest.toml, read by the launcher's LoadBundle. A JSON string
+    # 5. Studio: the bridge binary and the built site it serves, which the
+    # launcher's LoadBundle registers for --start-studio-bridge.
+    studio_lines = []
+    studio = spec.get("studio")
+    if studio:
+        bridge_rel = "studio/studio_bridge"
+        bridge_dest = os.path.join(out_dir, bridge_rel)
+        safe_copy(studio["bridge_path"], bridge_dest)
+        make_executable(bridge_dest)
+        with open(bridge_dest, "rb") as f:
+            bridge_sha256 = hashlib.sha256(f.read()).hexdigest()
+        webroot_rel = "studio/webroot"
+        safe_copy(studio["webroot_path"], os.path.join(out_dir, webroot_rel))
+        studio_lines = [
+            "",
+            "[studio]",
+            f"bridge = {json.dumps(bridge_rel)}",
+            f"bridge_sha256 = {json.dumps(bridge_sha256)}",
+            "targets = [" + ", ".join(
+                json.dumps(t) for t in
+                node_targets({"target": studio["bridge_label"]})) + "]",
+            f"webroot = {json.dumps(webroot_rel)}",
+        ]
+
+    # 6. bundle_manifest.toml, read by the launcher's LoadBundle. A JSON string
     # literal (ASCII, \uXXXX escapes) is also a valid TOML basic string.
     lines = [
         "bundle_version = 1",
@@ -272,6 +317,7 @@ def main():
     ]
     if args.stable_status:
         lines += source_revision(args.stable_status)
+    lines += studio_lines
     for entry in manifest_nodes:
         lines += [
             "",
@@ -285,7 +331,7 @@ def main():
     with open(os.path.join(out_dir, "bundle_manifest.toml"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
-    # 6. run.sh
+    # 7. run.sh
     run_sh_path = os.path.join(out_dir, "run.sh")
     with open(run_sh_path, "w") as f:
         f.write(f"""#!/usr/bin/env bash
