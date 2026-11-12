@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 28u
+#define TALOS_NODE_ABI_VERSION 29u
 
 enum {
   TALOS_OK = 0,
@@ -87,6 +87,13 @@ const char* talos_node_config_path(const TalosNode* node);
 // --replay-inputs with or without it. The pointer is valid until the next
 // talos_node_session_dir call on this thread.
 const char* talos_node_session_dir(const TalosNode* node);
+// Copies this subsystem's [trajectories] entry `name`, as an absolute path
+// (talos::Node::trajectory_path), NUL-terminated into `out`. TALOS_ERR, with
+// `out` untouched, when the config does not declare `name` (the error names
+// the node, subsystem and key) or when the path and its NUL do not fit in
+// `out_size` bytes (the error gives the size needed); never truncates.
+int32_t talos_node_trajectory_path(const TalosNode* node, const char* name,
+                                   char* out, uint32_t out_size);
 
 // Parameter kinds. ANY takes the key's own type; LIST takes an array of
 // either element kind (an empty array reports DOUBLE_LIST).

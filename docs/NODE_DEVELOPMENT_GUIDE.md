@@ -20,6 +20,7 @@ the constructor; `update()` runs every period.
 | `name()`, `now()`, `tick()`, `period()`, `simulation()`, `config_path()` | same, as properties (seconds) | |
 | `now().nanos()` | `node.now_ns` | the node clock in integer ns, for a message time such as `sample_time_ns` (`round(node.now * 1e9)` is exact only below 2^51 ns, 26 days of node clock) |
 | `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests) and in every offline run, `--log` or not (`--describe`, `--replay`, `--replay-inputs`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/`; state a node keeps per session or across restarts (the 2026 autonomous node's selection and progress) is gated on it, so a replay never reads or writes the robot's copy |
+| `trajectory_path("name")` → `std::filesystem::path` | `node.trajectory_path("name")` → `str` | the absolute path of this subsystem's [`[trajectories]`](#parameters) entry; an undeclared name is an error naming the subsystem and `trajectories.<name>` |
 | `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (the pose estimator imports neither wpimath nor gtsam then). Validate every parameter and declare every subscription and publication either way: the endpoints must be identical, since the launcher builds the graph from the probe, and it [compares each run's live endpoints with the probe](../talOS/launcher/README.md#live-endpoints) and refuses a run that differs |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
@@ -49,9 +50,8 @@ declares nothing.
 
 A data file a node opens, such as a Choreo `.traj`, is not a parameter: list
 it in the subsystem file's `[trajectories]` table (`name = "path"`, relative
-to that file) and open it by name with
-`config::ParseRobotConfig(node.config_path()).TrajectoryPath(node.name(),
-"<name>")`, so config load checks it exists and the bundle ships it
+to that file) and open it by name with `node.trajectory_path("<name>")` (the same in Python),
+so config load checks it exists and the bundle ships it
 ([talOS/trajectory](../talOS/trajectory/README.md#using-it-from-a-node)).
 
 ### Threads

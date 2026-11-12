@@ -348,6 +348,22 @@ const char* talos_node_session_dir(const TalosNode* node) {
   });
 }
 
+int32_t talos_node_trajectory_path(const TalosNode* node, const char* name,
+                                   char* out, uint32_t out_size) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out == nullptr) throw std::invalid_argument("out is NULL");
+    const std::string path =
+        AsNode(node).trajectory_path(NonNull(name, "name")).string();
+    if (path.size() >= out_size) {
+      throw std::invalid_argument(
+          "trajectory path needs " + std::to_string(path.size() + 1) +
+          " bytes, out_size is " + std::to_string(out_size));
+    }
+    std::memcpy(out, path.c_str(), path.size() + 1);
+    return TALOS_OK;
+  });
+}
+
 // talos_node_param and talos_node_param_of: `key` of this node's table, or
 // of `subsystem`'s.
 static int32_t ReadParam(const TalosNode* node,

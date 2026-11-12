@@ -220,14 +220,14 @@ two_piece = "../trajectories/two_piece.traj"
 
 Config load checks each entry and the bundle ships each file
 ([Configuration](../../ARCHITECTURE.md#configuration)); regenerate the
-manifest after adding one. The node opens it by name: `TrajectoryPath`
-returns the absolute path, or throws naming `trajectories.<name>` when the
-subsystem does not declare it:
+manifest after adding one. The node opens it by name:
+`node.trajectory_path(name)` (the same in Python, as a `str`) returns the
+absolute path, or throws naming `trajectories.<name>`
+when the subsystem does not declare it:
 
 ```cpp
-const auto config = talos::config::ParseRobotConfig(node.config_path());
 auto loaded = talos::trajectory::LoadChoreoFile(
-    config.TrajectoryPath(node.name(), "two_piece"));
+    node.trajectory_path("two_piece"));
 if (!loaded) throw std::invalid_argument(loaded.error);   // constructor
 if (!loaded.note.empty()) log(loaded.note);
 const auto& game = talos::trajectory::kField2026;

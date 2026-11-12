@@ -155,6 +155,12 @@ class Node {
   // read or written by a replay. Frame recorders write under
   // <session_dir>/frames/<name>/.
   std::optional<std::filesystem::path> session_dir() const;
+  // The absolute path of this subsystem's [trajectories] entry `name` (a data
+  // file such as a Choreo .traj), resolved against the file that set it, a
+  // subsystem file's entry overriding its defaults file's. A name the config
+  // does not declare throws std::invalid_argument naming the node, the
+  // subsystem and `trajectories.<name>`.
+  std::filesystem::path trajectory_path(std::string_view name) const;
 
   // Custom keys of this subsystem's TOML table. Dotted keys reach nested
   // tables ("geometry.wheelbase_m") and an index reaches an array element
