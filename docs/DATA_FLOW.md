@@ -304,6 +304,32 @@ padding). Every node writes its own row about four times a second; the
 launcher and `studio_bridge` read it. Both sizes are compile-time asserted in
 `registry.h`.
 
+### Wake-channel descriptors
+
+A writer holds one connected socket per reader slot it has notified, per
+topic it writes ([wake channel](../talOS/rtms/README.md#wake-channel)), so a
+node's wake sockets are at most the readers of the topics it writes, and never
+more than `MAX_READERS` (8) per topic. For the field config
+(`2026-robot/main_processor/configuration/robot.toml`, its `--describe-only`
+graph), counting every reader as armed:
+
+| Node | Topics written (with readers) | Wake sockets, worst case |
+|---|---|---:|
+| `hardware_node` | `/hw/state` 3, `/hw/state/driver_station` 8, `/hw/status` 5 | 16 |
+| `drivetrain`, `shooter` | own state 3, `/hw/request/<node>` 1 | 4 |
+| `autonomous` | three target lanes and its state, 1 each | 4 |
+| `intake`, each camera | own state 2, request or status 1 | 3 |
+| `pose_estimator`, `teleop` | own state 2; two target lanes, 1 each | 2 |
+| `driver`, `telemetry` | a target lane 1; `/talos/telemetry` (`studio_bridge`) 1 | 1 |
+
+Every node held 9 to 11 descriptors otherwise in a running `--sim` session on
+Linux (`/proc/<pid>/fd`: stdio and log pipes, the event-log file, the poller,
+the stop pipe, its wake receiver; the bridge's UDP socket). The peak, the
+bridge's 27, leaves 229 of macOS's default soft `RLIMIT_NOFILE` of 256 (and
+997 of Linux's usual 1024), so nodes do not raise the limit. A node that did
+run out would show it in its registry row's `wake_failures`, which
+`session_report --strict` rejects.
+
 ### Gateway clock accuracy
 
 For a bridge probe sent at t1, echoed gateway sample t2, and bridge t4 sampled
