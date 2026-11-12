@@ -69,6 +69,7 @@ cc_binary(
     visibility = ["//visibility:public"],
     deps = [
         ":node_lib",
+        "//talOS/events:events_log",
         "//talOS/introspection:describe",
     ],
 )
