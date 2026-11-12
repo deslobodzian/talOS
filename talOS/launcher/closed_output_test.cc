@@ -432,17 +432,20 @@ TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
 }
 
 // REQ-OPS-33
-// A roster member named `talos` would drain its output into talos.log, the
-// launcher's own. The graph lint refuses the name (a reserved owner), but
-// --allow-graph-errors overrides the lint; the launch must still be refused,
-// before any session directory or member exists. Row "gamma", the same
-// roster under a legal name, launches and runs its member.
-TEST(ClosedOutput, MemberNamedTalosIsRefusedEvenAllowingGraphErrors) {
+// A roster member's name is its output and event log file names. One named
+// `talos` would drain its output into talos.log, the launcher's own, and so
+// would `Talos` on a case-insensitive file system (macOS's default APFS).
+// The graph lint refuses both (a reserved owner; a segment of lowercase
+// letters), but --allow-graph-errors overrides the lint; the launch must
+// still be refused, before any session directory or member exists. Row
+// "gamma", the same roster under a legal name, launches and runs its member.
+TEST(ClosedOutput, MisnamedMemberIsRefusedEvenAllowingGraphErrors) {
   struct Row {
     const char* name;
     bool refused;
   };
-  for (const Row row : {Row{"talos", true}, Row{"gamma", false}}) {
+  for (const Row row :
+       {Row{"talos", true}, Row{"Talos", true}, Row{"gamma", false}}) {
     SCOPED_TRACE(row.name);
     const std::string name{row.name};
     LauncherOptions options;

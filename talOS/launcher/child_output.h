@@ -67,9 +67,10 @@ inline constexpr std::size_t kChildOutputBufferBytes = std::size_t{1} << 20;
 // What one member's output log, or talos.log, may hold in a session; later
 // output is dropped, counted, and the log says so.
 inline constexpr uint64_t kChildOutputLogMaxBytes = uint64_t{64} << 20;
-// The launcher's own lines in a session directory. `talos` is a reserved
-// owner, so no member's `<name>.log` takes this name; `launcher` is a legal
-// node name.
+// The launcher's own lines in a session directory. The launcher refuses a
+// roster member whose name breaks the node-name rule, `talos` (a reserved
+// owner) and `Talos` included, so no member's `<name>.log` takes this name;
+// `launcher` is a legal node name.
 inline constexpr std::string_view kLauncherOutputFile = "talos.log";
 // How long LauncherOutput::Stop waits for descriptors 1 and 2 to take what
 // is buffered for them before it drops the rest.
