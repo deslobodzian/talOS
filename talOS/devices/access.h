@@ -66,6 +66,10 @@ struct HardwareAccess {
       const HardwareLink& link, std::size_t index, bool velocity);
   static std::optional<event::MonotonicTime> sensor_time(
       const HardwareLink& link, std::size_t index, bool velocity);
+  // Motor::position_age / velocity_age.
+  static std::optional<event::Duration> motor_age(const HardwareLink& link,
+                                                  std::size_t index,
+                                                  bool velocity);
   // The latched sample for a device; all zeros (valid == false) until an
   // accepted hardware state carries it.
   static hardware::MotorSample motor_sample(const HardwareLink& link,

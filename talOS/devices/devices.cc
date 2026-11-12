@@ -535,12 +535,12 @@ void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
   const double offset = sample.position_rot - position_rot;
   // What a rezero pairs the position with (a switch, a stop, a constant, a
   // CANcoder its caller checked) is as of the State, so the position must
-  // be too (RezeroAgeBound); an unknown age never is.
-  const bool recent = std::chrono::microseconds{sample.position_age_us} <=
-                      RezeroAgeBound(impl.config.hardware);
-  if (impl.Fresh() && sample.valid && recent &&
-      std::isfinite(sample.position_rot) && std::isfinite(position_rot) &&
-      std::isfinite(offset)) {
+  // be too (RezeroAgeBound); an unknown age, or a disconnected sample, never
+  // is.
+  const std::optional<Duration> age = motor_age(link, index, false);
+  const bool recent = age && *age <= RezeroAgeBound(impl.config.hardware);
+  if (recent && std::isfinite(sample.position_rot) &&
+      std::isfinite(position_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
     device.zeroed = true;
   }
@@ -621,6 +621,15 @@ std::optional<Time> HardwareAccess::sensor_time(const HardwareLink& link,
                                                 std::size_t index,
                                                 bool velocity) {
   return AcquisitionTime(link, sensor_sample(link, index), velocity);
+}
+
+std::optional<Duration> HardwareAccess::motor_age(const HardwareLink& link,
+                                                  std::size_t index,
+                                                  bool velocity) {
+  const auto sample = motor_sample(link, index);
+  const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
+  if (!sample.valid || age == UINT32_MAX) return std::nullopt;
+  return std::chrono::microseconds{age};
 }
 
 hardware::DigitalInputSample HardwareAccess::digital_input_sample(
@@ -745,6 +754,12 @@ std::optional<Time> Motor::position_time() const {
 }
 std::optional<Time> Motor::velocity_time() const {
   return HardwareAccess::motor_time(*link_, index_, true);
+}
+std::optional<Duration> Motor::position_age() const {
+  return HardwareAccess::motor_age(*link_, index_, false);
+}
+std::optional<Duration> Motor::velocity_age() const {
+  return HardwareAccess::motor_age(*link_, index_, true);
 }
 
 CANcoder::CANcoder(Node& node, std::string_view name)

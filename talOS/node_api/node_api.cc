@@ -740,6 +740,18 @@ int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
   });
 }
 
+int32_t talos_motor_age(TalosNode* node, int64_t index, int32_t velocity,
+                        int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const auto age =
+        HardwareAccess::motor_age(Link(node), Index(index), velocity != 0);
+    if (!age) return 0;
+    *out_ns = age->count();
+    return 1;
+  });
+}
+
 int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {

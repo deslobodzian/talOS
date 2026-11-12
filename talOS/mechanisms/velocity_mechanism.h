@@ -69,12 +69,12 @@ class VelocityMechanism {
   // at_speed_entry_rps of the clamped goal; kept while within the exit band,
   // max(at_speed_entry_rps, at_speed_exit_frac * |goal|); lost when the
   // error leaves it, the asked goal changes, or the goal stops. A tick
-  // counts only on a recent velocity sample: one acquired at most
-  // RezeroAgeBound (two status periods) before its State, by
-  // Motor::velocity_time() against HardwareLink::sample_time(). Any other
-  // sample, an unknown age included, loses at_speed and restarts the entry
-  // count, so a velocity frozen by a CAN gap, which the gateway keeps valid
-  // up to command_timeout_us, does not hold it.
+  // counts only on a recent velocity sample: Motor::velocity_age(), read
+  // from its State and so known without the bridge's clock mapping, at most
+  // RezeroAgeBound (two status periods). Any other sample, an unknown age
+  // included, loses at_speed and restarts the entry count, so a velocity
+  // frozen by a CAN gap, which the gateway keeps valid up to
+  // command_timeout_us, does not hold it.
   bool at_speed() const { return phase_ == VelocityPhase::kAtSpeed; }
   bool driving() const { return driving_; }
   bool connected() const { return connected_; }
@@ -93,7 +93,6 @@ class VelocityMechanism {
   bool velocity_recent() const;
 
   Node* node_;
-  HardwareLink* link_;
   std::string label_;  // "VelocityMechanism '<name>'", for errors
   Motor motor_;
   Duration velocity_age_bound_;  // RezeroAgeBound of [robot] status_hz

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 29u
+#define TALOS_NODE_ABI_VERSION 30u
 
 enum {
   TALOS_OK = 0,
@@ -274,6 +274,12 @@ int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
                          int64_t* out_ns);
 int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
                           int64_t* out_ns);
+// Motor::position_age / velocity_age (velocity selects the rate): the
+// signal's age (ns) at the State it arrived in, read from that State, so
+// without the clock mapping. Returns 1 with *out_ns, 0 unless the motor is
+// connected or when the age is unknown, TALOS_ERR on error.
+int32_t talos_motor_age(TalosNode* node, int64_t index, int32_t velocity,
+                        int64_t* out_ns);
 int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out);
 int32_t talos_analog_input_sample(TalosNode* node, int64_t index,

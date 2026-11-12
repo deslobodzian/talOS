@@ -101,10 +101,13 @@ bool robot_enabled(Node& node);
 // a direct device command would be.
 void RequireInUpdate(const Node& node, std::string_view what);
 
-// How old, at the State it arrived in, a motor's position sample may be for
-// Motor::rezero to take it, and how far apart two samples a rezero combines
-// may be (PositionMechanism's CANcoder homing): two status periods of
-// [robot] status_hz (10 ms at 200 Hz). A status frame is under one period
+// How old a motor sample may be at the State it arrived in (Motor::
+// position_age, velocity_age) to count as recent: two status periods of
+// [robot] status_hz (10 ms at 200 Hz). Motor::rezero takes a position only
+// within it, and talos::mechanisms::VelocityMechanism counts a tick toward
+// at_speed only on a velocity within it; neither needs the bridge's clock
+// mapping. It also bounds how far apart two samples a rezero combines may be
+// (PositionMechanism's CANcoder homing). A status frame is under one period
 // old when the RoboRIO reads it, so two devices' samples in one State are
 // under one period apart; the second period absorbs jitter. Any wider gap
 // is a late frame, and a mechanism moving at v would take a frame off by v
@@ -175,6 +178,12 @@ class Motor {
   // stale or invalid, or age unknown (UINT32_MAX).
   std::optional<Time> position_time() const;
   std::optional<Time> velocity_time() const;
+  // How old each signal's sample was at the State it arrived in (the
+  // gateway's per-signal age, carried in that State). Unlike *_time() it
+  // needs no clock mapping, so it is known from the first accepted State.
+  // nullopt unless connected(), or when the age is unknown (UINT32_MAX).
+  std::optional<Duration> position_age() const;
+  std::optional<Duration> velocity_age() const;
 
  private:
   HardwareLink* link_{nullptr};
