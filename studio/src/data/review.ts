@@ -31,7 +31,11 @@ export type ReviewSession = {
 
 // Event-time bounds of a session, and the wall time its clock's origin maps
 // to (see wallTimeNs).
-export type ReviewBounds = {start_ns: string; end_ns: string; origin_wall_ns: string};
+// The session's bounds, and the server's series limits (studio/review/review.h
+// kMaxSeriesValues, kMaxSeriesChannels): a series request asks for at most
+// max_series_values channels x points over at most max_series_channels.
+export type ReviewBounds = {start_ns: string; end_ns: string; origin_wall_ns: string;
+                            max_series_values: number; max_series_channels: number};
 
 export type ReviewSample = {value: number; exact?: string; sample_ns: string};
 export type ReviewSnapshot = {t_ns: string; channels: Map<string, ReviewSample>};
@@ -121,12 +125,20 @@ export function parseChannels(raw: unknown): ChannelInfo[] {
   });
 }
 
+function limit(value: unknown, where: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1)
+    fail(`${where} must be a positive integer`);
+  return value as number;
+}
+
 export function parseBounds(raw: unknown): ReviewBounds {
   const source = record(raw, 'bounds.json');
   const bounds = {
     start_ns: u64(source.start_ns, 'bounds.start_ns'),
     end_ns: u64(source.end_ns, 'bounds.end_ns'),
-    origin_wall_ns: u64(source.origin_wall_ns, 'bounds.origin_wall_ns')
+    origin_wall_ns: u64(source.origin_wall_ns, 'bounds.origin_wall_ns'),
+    max_series_values: limit(source.max_series_values, 'bounds.max_series_values'),
+    max_series_channels: limit(source.max_series_channels, 'bounds.max_series_channels')
   };
   if (BigInt(bounds.end_ns) < BigInt(bounds.start_ns))
     fail('bounds.end_ns is before bounds.start_ns');

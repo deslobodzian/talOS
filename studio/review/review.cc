@@ -361,6 +361,10 @@ Response Review::Bounds(const Session& session) const {
   AppendI64(out, session.end_ns());
   out += ",\"origin_wall_ns\":";
   AppendI64(out, session.origin_wall_ns());
+  out += ",\"max_series_values\":";
+  out += std::to_string(kMaxSeriesValues);
+  out += ",\"max_series_channels\":";
+  out += std::to_string(kMaxSeriesChannels);
   out += '}';
   return {200, "application/json", std::move(out)};
 }

@@ -35,8 +35,13 @@ import {ReviewPicker} from '../src/shell/ReviewPicker';
 const SERVER = 'http://review.test';
 const START = 1_000_000_000n;
 const END = 11_000_000_000n;  // a 10 s session
+// The server's series limits, as its bounds.json reports them
+// (review_golden.test.ts pins them against the golden response).
+const MAX_SERIES_VALUES = 262_144;
+const MAX_SERIES_CHANNELS = 256;
 const BOUNDS: ReviewBounds = {
-  start_ns: START.toString(), end_ns: END.toString(), origin_wall_ns: '0'
+  start_ns: START.toString(), end_ns: END.toString(), origin_wall_ns: '0',
+  max_series_values: MAX_SERIES_VALUES, max_series_channels: MAX_SERIES_CHANNELS
 };
 
 type Column = {t: number[]; min: number[]; max: number[]; last: number[]; count: number[]};
@@ -244,6 +249,43 @@ test('a plot resize sweep requests per bucket size and keeps a bounded set', asy
   assert.ok(recorded.keptSlots <= SERIES_SLOTS, `${recorded.keptSlots} kept`);
 });
 
+// A plot of 200 channels at 4096 px asks 4352 points (4096 and the window's
+// extra 1/16): one request of them all would be 870,400 values, past the
+// server's 262,144 (a 400, and an empty plot). The channels are split into
+// requests that each fit, and every channel gets its data.
+test('a wide plot of many channels splits its series within the server cap', async () => {
+  const server = fakeServer(echoSnapshot);
+  const recorded = source(server);
+  const channels = Array.from({length: 200}, (_, i) => `c${i}`);
+  const cursor = (START + 5_000_000_000n).toString();
+  recorded.series(channels, {seconds: 2}, cursor, 4096);
+  const calls = server.of('/series');
+  assert.ok(calls.length > 1);
+  const asked: string[] = [];
+  for (const call of calls) {
+    const names = call.url.searchParams.get('c')!.split(',');
+    const points = Number(call.url.searchParams.get('points'));
+    assert.ok(names.length * points <= MAX_SERIES_VALUES, `${names.length} x ${points}`);
+    assert.ok(names.length <= MAX_SERIES_CHANNELS);
+    asked.push(...names);
+    const t = Array.from({length: points}, (_, i) => Number(START) + 4e9 + i * 1e5);
+    call.respond(new Response(seriesBuffer(names.map(name => {
+      const value = Number(name.slice(1));
+      return {t, min: t.map(() => value), max: t.map(() => value),
+              last: t.map(() => value), count: t.map(() => 1)};
+    }))));
+  }
+  assert.deepEqual(asked, channels);
+  await settle();
+  const series = recorded.series(channels, {seconds: 2}, cursor, 4096);
+  assert.equal(server.of('/series').length, calls.length);
+  for (const [i, name] of channels.entries()) {
+    const values = [...series.values[name]].filter(Number.isFinite);
+    assert.ok(values.length > 0, name);
+    assert.ok(values.every(v => v === i), name);
+  }
+});
+
 test('steps clamp to the session and play advances at the chosen rate', async () => {
   const server = fakeServer(echoSnapshot);
   const time = fakeClock();
@@ -384,6 +426,16 @@ test('an HTTP error or malformed payload is an error state, never a throw', asyn
   assert.match(plot.error, /truncated/);
   assert.equal(plot.series(['x'], {seconds: 1}, cursor).times.length, 0);
   assert.equal(truncated.of('/series').length, 1);
+  // A different request (the cursor moved two seconds) is issued: a failure
+  // does not strand the plot.
+  plot.series(['x'], {seconds: 1}, (START + 3_000_000_000n).toString());
+  assert.equal(truncated.of('/series').length, 2);
+  await settle();
+  // retry() clears the error and the footer's error status.
+  plot.retry();
+  assert.equal(plot.error, '');
+  assert.equal(plot.playback.connection, 'replay');
+  assert.doesNotMatch(plot.playback.status, /Review error/);
 });
 
 // A Studio served by studio_review reviews its own origin's sessions: found

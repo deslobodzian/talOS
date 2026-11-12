@@ -12,7 +12,11 @@
 //       nothing is ever written into the library)
 //   GET /review/<id>/channels.json
 //       the bridge's /channels.json document ("alert" comes with slice S3a)
-//   GET /review/<id>/bounds.json       {"start_ns","end_ns","origin_wall_ns"}
+//   GET /review/<id>/bounds.json
+//       {"start_ns","end_ns","origin_wall_ns","max_series_values",
+//        "max_series_channels"}: the last two, plain numbers, are
+//       kMaxSeriesValues and kMaxSeriesChannels, which a client splits its
+//       series requests by
 //       wall time of a session time t_ns is origin_wall_ns + t_ns
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}
