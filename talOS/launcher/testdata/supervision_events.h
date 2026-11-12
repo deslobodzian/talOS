@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 
+#include "talOS/launcher/spawn.h"
 #include "talOS/launcher/supervision_policy.h"
 
 namespace talos::launcher::testing {
@@ -28,8 +29,9 @@ namespace talos::launcher::testing {
 // The supervision loop's passes, as its service watchdog sees them: the
 // launcher sends WATCHDOG=1 to $NOTIFY_SOCKET at the start of every pass
 // (Launcher::Supervise), so a second datagram received after a moment means
-// a whole pass ran after it. Points NOTIFY_SOCKET at itself while it lives,
-// for a launcher run in this process; one at a time.
+// a whole pass ran after it. A pass runs at the loop's next deadline, or at
+// once on SupervisionWakeup::Wake(). Points NOTIFY_SOCKET at itself while it
+// lives, for a launcher run in this process; one at a time.
 class SupervisionPasses {
  public:
   SupervisionPasses() {
@@ -80,7 +82,9 @@ class SupervisionPasses {
 // measures on it (restart backoff, the Studio bridge's retry interval, the
 // session duration, the stop's SIGKILL) passes when the test says, neither
 // after a real wait nor, while held, before. It never reads less than it
-// has read. Copies share one state.
+// has read. Every move wakes the supervision loop (SupervisionWakeup::Wake),
+// which otherwise sleeps the real time its next deadline was away when it
+// last looked. Copies share one state.
 class SteppedClock {
  public:
   SupervisionClock clock() const {
@@ -88,6 +92,7 @@ class SteppedClock {
   }
   void Advance(std::chrono::nanoseconds by) {
     state_->ahead.fetch_add(by.count());
+    SupervisionWakeup::Wake();
   }
   // Holds the clock where it reads now, which it returns.
   SupervisionTime Freeze() {
@@ -99,6 +104,7 @@ class SteppedClock {
   // HoldAt again or Release.
   void HoldAt(SupervisionTime at) {
     state_->held.store(at.time_since_epoch().count());
+    SupervisionWakeup::Wake();
   }
   // The clock runs on from where it is held.
   void Release() {
@@ -108,6 +114,7 @@ class SteppedClock {
         std::chrono::steady_clock::now().time_since_epoch().count();
     state_->ahead.store(std::max(state_->ahead.load(), held - real));
     state_->held.store(kFree);
+    SupervisionWakeup::Wake();
   }
 
   // Releases the clock when it goes out of scope: a test that gives up

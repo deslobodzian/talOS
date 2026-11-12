@@ -338,7 +338,9 @@ class Launcher {
   // at the deadline. A crashed node is restarted per supervision_policy.h
   // without blocking the loop; a pending restart holds the session open until
   // it fires or the session stops. A bridge that is still starting does not
-  // hold it open.
+  // hold it open. Between passes it sleeps until the earliest deadline a
+  // pass decides on, woken at once by a child's exit or a stop signal
+  // (SupervisionWakeup; README "Supervision passes").
   void Supervise(std::vector<NodeProcessInfo>& procs,
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
@@ -389,7 +391,8 @@ class Launcher {
   // Far inside macOS clean-tmps' 3 unused days (introspect::TouchLockFile).
   static constexpr std::chrono::hours kSessionLockRefresh{1};
   // Set by the stop signals' handler (InstallSignals), which may run on any
-  // thread, and read by the supervision thread: a lock-free atomic is both
+  // thread and then wakes the supervision loop (SupervisionWakeup::Wake), and
+  // read by the supervision thread: a lock-free atomic is both
   // async-signal-safe and race-free across threads, which volatile
   // sig_atomic_t is not.
   static inline std::atomic<int> stop_requested_{0};

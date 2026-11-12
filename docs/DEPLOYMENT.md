@@ -233,8 +233,12 @@ Watchdog notifications begin only after READY, from the supervision loop,
 never an independent heartbeat.
 
 On Linux the launcher sends `READY=1` when the graph has started and enters
-supervision, then `WATCHDOG=1` on each supervision iteration (normally every
-20 ms). With `WatchdogSec=3`, systemd treats three seconds without a
+supervision, then `WATCHDOG=1` on each supervision iteration, which runs at
+least every half of the unit's watchdog interval (1.5 s) and, while nodes
+run, at least every quarter of their shortest heartbeat timeout (125 ms at
+its 500 ms floor;
+[supervision passes](../talOS/launcher/README.md#supervision-passes)).
+With `WatchdogSec=3`, systemd treats three seconds without a
 notification as a hung launcher and restarts it, leaving ample scheduling
 headroom: the loop never waits for a disk sync. A stalled loop cannot be
 masked by an independent watchdog thread. `Restart=always` starts a fresh

@@ -125,7 +125,15 @@ struct LivenessCheck {
   SupervisionTime judged_at;  // the time the decision was taken at
 };
 
-// One run's progress, judged once per supervision pass.
+// How many times per heartbeat timeout the launcher looks at a run's row
+// at least (RunLiveness::NextLook).
+inline constexpr int kLivenessLooksPerTimeout = 4;
+
+// The longest gap between two looks at a run with these limits: its
+// heartbeat timeout / kLivenessLooksPerTimeout (125 ms at the 500 ms floor).
+std::chrono::nanoseconds LivenessLookInterval(const LivenessLimits& limits);
+
+// One run's progress, judged at each supervision pass that looks at it.
 //
 // A run is killed for a stall only when the launcher itself saw its progress
 // unchanged over at least the heartbeat timeout: progress is stamped with
@@ -133,6 +141,14 @@ struct LivenessCheck {
 // the time read before the read that sees it unchanged. The launcher's own
 // stall at any point of a pass therefore lengthens no run's measured stall;
 // it can only delay a kill.
+//
+// The launcher looks at a run when NextLook says, not on a fixed poll. A
+// look one LivenessLookInterval after the last follows a stall's onset by at
+// most that interval, so a run whose progress stops at S is killed by
+// S + heartbeat timeout + one look interval (plus the launcher's own lateness
+// waking); every deadline a look decides on (the stall, the startup grace,
+// the construction deadline) is itself a look time, so none waits for the
+// next interval.
 class RunLiveness {
  public:
   // A run spawned at `spawned`: its grace and construction deadline start.
@@ -149,6 +165,13 @@ class RunLiveness {
   // kRunHeartbeatMissing (session.h), or empty.
   std::string_view Judge(const RowObservation& row, SupervisionTime now,
                          const LivenessLimits& limits);
+  // When the next look (Watch) is due, given the last: the earliest of one
+  // LivenessLookInterval after the last look was judged, the stall deadline
+  // (the startup grace's end or one heartbeat timeout after the progress
+  // last seen, whichever is later), and, unless the last look found the row
+  // done constructing, the construction deadline. A deadline the last look
+  // was already judged at or after does not count: it was decided there.
+  SupervisionTime NextLook(const LivenessLimits& limits) const;
   SupervisionTime progress_changed_at() const { return progress_changed_at_; }
   SupervisionTime heartbeat_changed_at() const { return heartbeat_changed_at_; }
 
@@ -158,10 +181,16 @@ class RunLiveness {
   // Why the run must be killed at `now`, given what Record kept.
   std::string_view Verdict(const RowObservation& row, SupervisionTime now,
                            const LivenessLimits& limits) const;
+  // Notes the look judged at `judged_at` that saw `row`, for NextLook.
+  void Looked(const RowObservation& row, SupervisionTime judged_at);
 
   SupervisionTime started_at_{};
   SupervisionTime progress_changed_at_{};
   SupervisionTime heartbeat_changed_at_{};
+  SupervisionTime looked_at_{};
+  // The last look found a row that had finished constructing: no
+  // construction deadline is left to look at.
+  bool constructed_{false};
   int64_t last_heartbeat_{0};
   uint64_t last_dispatch_{0};
 };

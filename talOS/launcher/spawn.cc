@@ -10,10 +10,13 @@
 #include <sys/syscall.h>
 #endif
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <thread>
 #include <utility>
@@ -364,49 +367,66 @@ std::string ExitReason(int status) {
          std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1);
 }
 
-ChildExitWakeup::ChildExitWakeup() {
+SupervisionWakeup::SupervisionWakeup() {
   {
     const std::lock_guard lock{SpawnMutex()};
-    if (pipe_[0] < 0) {
+    if (read_end_.load() < 0) {
       int fds[2];
       if (CloseOnExecPipe(fds)) {
         for (const int fd : fds)
           ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL) | O_NONBLOCK);
-        pipe_[0] = fds[0];
-        pipe_[1] = fds[1];
+        read_end_.store(fds[0]);
+        write_end_.store(fds[1]);
       }
     }
   }
-  if (pipe_[0] < 0) return;  // Wait() then sleeps, as a poll would.
+  if (read_end_.load() < 0) return;  // Wait() then sleeps, as a poll would.
   struct sigaction action {};
-  action.sa_handler = &ChildExitWakeup::OnSignal;
+  action.sa_handler = &SupervisionWakeup::OnSignal;
   sigemptyset(&action.sa_mask);
   action.sa_flags = SA_RESTART | SA_NOCLDSTOP;
   installed_ = ::sigaction(SIGCHLD, &action, &previous_) == 0;
 }
 
-ChildExitWakeup::~ChildExitWakeup() {
+SupervisionWakeup::~SupervisionWakeup() {
   if (installed_) ::sigaction(SIGCHLD, &previous_, nullptr);
 }
 
-void ChildExitWakeup::Wait(std::chrono::milliseconds timeout) const {
+bool SupervisionWakeup::Wait(std::chrono::nanoseconds timeout) const {
+  using std::chrono::milliseconds;
+  using std::chrono::nanoseconds;
   if (!installed_) {
-    std::this_thread::sleep_for(timeout);
-    return;
+    std::this_thread::sleep_for(
+        std::clamp(timeout, nanoseconds::zero(), nanoseconds{kUnwokenWait}));
+    return false;
   }
-  ::pollfd ready{pipe_[0], POLLIN, 0};
-  if (::poll(&ready, 1, static_cast<int>(timeout.count())) > 0) {
-    char drained[64];
-    while (::read(pipe_[0], drained, sizeof drained) > 0) {
-    }
+  int wait_ms = -1;  // Until woken.
+  if (timeout != nanoseconds::max()) {
+    const auto rounded =
+        std::chrono::ceil<milliseconds>(std::max(timeout, nanoseconds::zero()))
+            .count();
+    wait_ms = static_cast<int>(
+        std::min<int64_t>(rounded, std::numeric_limits<int>::max()));
   }
+  ::pollfd ready{read_end_.load(), POLLIN, 0};
+  // A signal that interrupts the poll (EINTR) is one of the wakes, or
+  // another signal: either way the caller's next pass looks.
+  bool woken = ::poll(&ready, 1, wait_ms) > 0;
+  char drained[64];
+  while (::read(ready.fd, drained, sizeof drained) > 0) woken = true;
+  return woken;
 }
 
-void ChildExitWakeup::OnSignal(int /*signal*/) {
+void SupervisionWakeup::Wake() {
+  const int fd = write_end_.load();
+  if (fd < 0) return;
   const int saved = errno;
   const char byte = 0;
-  [[maybe_unused]] const ssize_t wrote = ::write(pipe_[1], &byte, 1);
+  // A full pipe (EAGAIN) already holds a wake.
+  [[maybe_unused]] const ssize_t wrote = ::write(fd, &byte, 1);
   errno = saved;
 }
+
+void SupervisionWakeup::OnSignal(int /*signal*/) { Wake(); }
 
 }  // namespace talos::launcher

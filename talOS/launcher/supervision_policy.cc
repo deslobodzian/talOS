@@ -55,12 +55,34 @@ void RestartSchedule::Cancel() {
   quarantined_ = false;
 }
 
+std::chrono::nanoseconds LivenessLookInterval(const LivenessLimits& limits) {
+  return limits.heartbeat_timeout / kLivenessLooksPerTimeout;
+}
+
 void RunLiveness::Begin(SupervisionTime spawned) {
   started_at_ = spawned;
   progress_changed_at_ = spawned;
   heartbeat_changed_at_ = spawned;
+  looked_at_ = spawned;
+  constructed_ = false;
   last_heartbeat_ = 0;
   last_dispatch_ = 0;
+}
+
+SupervisionTime RunLiveness::NextLook(const LivenessLimits& limits) const {
+  SupervisionTime next = looked_at_ + LivenessLookInterval(limits);
+  const auto consider = [&](SupervisionTime deadline) {
+    if (deadline > looked_at_) next = std::min(next, deadline);
+  };
+  consider(std::max(started_at_ + limits.startup_grace,
+                    progress_changed_at_ + limits.heartbeat_timeout));
+  if (!constructed_) consider(started_at_ + limits.construction_timeout);
+  return next;
+}
+
+void RunLiveness::Looked(const RowObservation& row, SupervisionTime judged_at) {
+  looked_at_ = judged_at;
+  if (row.found && !row.constructing) constructed_ = true;
 }
 
 LivenessCheck RunLiveness::Watch(
@@ -74,6 +96,7 @@ LivenessCheck RunLiveness::Watch(
   const RowObservation row = read_row();
   const SupervisionTime after = clock();
   Record(row, after);
+  Looked(row, before);
   return {Verdict(row, before, limits), before};
 }
 
@@ -81,6 +104,7 @@ std::string_view RunLiveness::Judge(const RowObservation& row,
                                     SupervisionTime now,
                                     const LivenessLimits& limits) {
   Record(row, now);
+  Looked(row, now);
   return Verdict(row, now, limits);
 }
 

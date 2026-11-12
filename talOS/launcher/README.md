@@ -501,11 +501,45 @@ race: a signal before its executable starts can legitimately terminate it.
 
 With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
 and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
-(including Linux `@` abstract names). A hung loop therefore stops feeding the
-service watchdog. The loop waits on no lock a node can hold: its registry
-attach is read-only, which [takes no lock](../introspection/README.md#the-segment).
+(including Linux `@` abstract names), and, when systemd sets `WATCHDOG_USEC`,
+runs an iteration at least every half of it ([supervision passes](#supervision-passes)).
+A hung loop therefore stops feeding the service watchdog. The loop waits on no
+lock a node can hold: its registry attach is read-only, which
+[takes no lock](../introspection/README.md#the-segment).
 See [deployment](../../docs/DEPLOYMENT.md) for the generated systemd watchdog
 policy and macOS's launchd limitations.
+
+### Supervision passes
+
+The supervision loop does not poll. After each pass it sleeps until the
+earliest time a pass has something to decide, and a child's exit (`SIGCHLD`)
+or a stop signal (`SIGINT`, `SIGTERM`, `SIGHUP`) starts a pass at once. Both
+handlers write one byte to a self-pipe the loop sleeps on
+(`SupervisionWakeup` in `spawn.h`), on Linux and macOS alike, so a signal
+that lands between a pass's last look and its sleep is not lost, whichever
+thread runs the handler. The sleep adds no thread, takes no lock a node can
+hold and touches no disk. The times it sleeps until:
+
+| Deadline | Decides |
+|---|---|
+| each running member's next look at its registry row (`RunLiveness::NextLook`): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
+| each pending restart's start | the restart backoff, a quarantined member's retry |
+| one retry interval (1 s) after the Studio bridge's last spawn, while it starts | its stability, retry or abandonment ([Studio bridge](#studio-bridge)) |
+| `--duration-s`'s end, until the stop is sent | the stop |
+| the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
+| half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
+| the session lock's hourly refresh | [one session per namespace](#one-session-per-namespace) |
+
+Everything else a pass does follows an event or another pass: reaping exits,
+sending the stop, retrying a registry attach (at the next look), and handing
+the manifest writer a version. A member's look interval bounds how late a
+stall is seen: a run whose dispatch count stops at time S is killed by S plus
+its heartbeat timeout plus one look interval (625 ms after S for the 500 ms
+floor), plus however late the launcher wakes, and never before one heartbeat
+timeout after the last look that saw it move. An idle session therefore
+makes one pass per shortest look interval among its members, 8 a second when
+every timeout is the 500 ms floor, whatever the number of members, since each
+pass looks at every one.
 
 ### Restart latency
 
@@ -705,13 +739,13 @@ header:
 | Library | Files | Holds |
 |---|---|---|
 | `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock and session directory lock, what retention reads of a recorded session, the log budget split |
-| `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `ChildExitWakeup` |
+| `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `SupervisionWakeup` |
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and `tlog_to_wpilog`'s inputs name, each once |
 | `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and `tlog_to_wpilog` link it, not the supervisor |
-| `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read |
+| `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read, and when to look at the row next ([supervision passes](#supervision-passes)) |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
 

@@ -428,7 +428,10 @@ cc_library(
     name = "supervision_events",
     testonly = True,
     hdrs = ["testdata/supervision_events.h"],
-    deps = [":supervision_policy"],
+    deps = [
+        ":spawn",
+        ":supervision_policy",
+    ],
 )
 
 cc_test(
