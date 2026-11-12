@@ -84,9 +84,9 @@ uint16_t FreeUdpPort() {
 }
 
 // The RoboRIO's part, in this process, as sim_gateway plays it: one State
-// per 5 ms tick, enabled in teleop, and a Driver Station packet every 20 ms
-// with one joystick at its largest encoding (the size the launcher's model
-// takes for a Driver Station packet).
+// per 5 ms tick, disabled, and a Driver Station packet every 20 ms with one
+// joystick at its largest encoding (the size the launcher's model takes for
+// a Driver Station packet).
 class Controller {
  public:
   Controller(const std::string& config_path, uint16_t port,
@@ -125,9 +125,9 @@ class Controller {
               std::chrono::steady_clock::now().time_since_epoch())
               .count();
       data_.sample_time_us = now_us;
-      data_.fms.flags = ds::kDsAttached | ds::kEnabled | ds::kTeleop;
+      data_.fms.flags = ds::kDsAttached;
       tracker_.Stamp(data_);
-      endpoint_.Tick(now_us, true);
+      endpoint_.Tick(now_us, false);
       if (last_packet_us == 0 ||
           now_us - last_packet_us >= ds::kSamplePeriodUs) {
         const auto size = ds::Encode(data_, buffer);
@@ -150,23 +150,13 @@ class Controller {
   std::jthread thread_;
 };
 
-// A member's kept log: its first run's segment files (the oldest ones
-// deleted by rotation).
+// A member's kept log: its first run's segment files, oldest first (the
+// oldest ones deleted by rotation).
 std::vector<std::string> KeptFiles(const std::string& session,
                                    const std::string& member) {
-  std::vector<std::string> files;
-  for (const std::string& path : event::log::FindLogFiles(session)) {
-    const std::string file = std::filesystem::path{path}.filename().string();
-    if (file.starts_with(member + ".tlog") ||
-        file.starts_with(member + ".segment")) {
-      files.push_back(path);
-    }
-  }
-  return files;
+  return event::log::LogSegmentFiles(session + "/" + member + ".tlog");
 }
 
-// The bytes a member's kept log holds on disk: between (n - 1) / n of its
-// share and its share once it rotated, whatever rate it logged at.
 std::uintmax_t KeptBytes(const std::string& session,
                          const std::string& member) {
   std::uintmax_t bytes = 0;
@@ -176,21 +166,32 @@ std::uintmax_t KeptBytes(const std::string& session,
   return bytes;
 }
 
-// The time a member's kept log covers: from the first record of its oldest
-// kept segment to its last record. Reported only: it depends on the rate the
-// member achieved, which a loaded host lowers.
-double KeptSeconds(const std::string& session, const std::string& member) {
-  int64_t first = std::numeric_limits<int64_t>::max();
-  int64_t last = std::numeric_limits<int64_t>::min();
+// The record time a member's kept log covers, from the first record of its
+// oldest kept segment to its last record, and the longest step between two
+// consecutive records in it (how far past window / n a segment can run on
+// before the record that ends it).
+struct KeptTime {
+  double seconds{0};
+  double longest_step_s{0};
+};
+
+KeptTime KeptSeconds(const std::string& session, const std::string& member) {
+  bool any = false;
+  int64_t first = 0;
+  int64_t last = 0;
+  int64_t step = 0;
   for (const std::string& path : KeptFiles(session, member)) {
     event::log::LogReader reader{path};
     event::log::LogReader::Record record;
     while (reader.next(record)) {
-      first = std::min(first, record.header.now_ns);
-      last = std::max(last, record.header.now_ns);
+      if (!any) first = record.header.now_ns;
+      if (any) step = std::max(step, record.header.now_ns - last);
+      last = record.header.now_ns;
+      any = true;
     }
   }
-  return first < last ? static_cast<double>(last - first) / 1e9 : 0;
+  return {static_cast<double>(last - first) / 1e9,
+          static_cast<double>(step) / 1e9};
 }
 
 // Every message and send record in a member's kept log is on a topic the
@@ -231,16 +232,21 @@ void ExpectRecordsWithinModel(const std::string& session,
   }
 }
 
-// REQ-OPS-32. A 5 ms and a 20 ms motor owner (each logging every 200 Hz
-// State), the hardware bridge (State and commands only) and a 20 ms Driver
-// Station reader (no State at all) log between about 15 and 110 kB/s. Under
-// a cap that rotates every log, each member keeps the tail its share holds
-// at its modelled rate, and those are equal: kept bytes / modelled bytes per
-// second within the segment granularity (one segment in 8) of each other.
-// Bytes, not seconds, so a host that delays ticks does not move the bound;
-// that the model fits what these real nodes store is checked per record,
-// also independently of the rates achieved. The session is stopped once
-// every log has dropped its oldest segment, not after a fixed time.
+// REQ-OPS-32. A disabled session: a 5 ms and a 20 ms motor owner (each
+// logging every 200 Hz State), the hardware bridge (State and commands only),
+// a 20 ms Driver Station reader (no State at all), a 20 ms sender that sends
+// its 512-byte state only while enabled (like teleop: it stores about a
+// third of its predicted rate) and one that sends it eight times a tick
+// (eight times the one send the model counts). Under a cap that rotates
+// every log, every member that stores no more than predicted keeps between
+// 7/8 of the launcher's window and the window (plus the longest step
+// between its records, by which a segment can overrun window / 8); with
+// shares in bytes alone the quiet sender kept about three times the others'
+// tail. The flooding sender keeps less, and the others' tails do not depend
+// on it. Kept record time, not wall time: a host that delays ticks does not
+// move the bound. That the model fits what these real nodes store is checked
+// per record. The session is stopped once every log has dropped its oldest
+// segment, not after a fixed time.
 TEST(LogBudget, EveryCappedMemberKeepsTheSameTail) {
   const std::string root = TempPath("out");
   std::filesystem::remove_all(root);
@@ -276,6 +282,18 @@ can_id = 2
 [subsystems.budget_listener]
 node = "//talOS/launcher:budget_listener"
 period_us = 20000
+
+[subsystems.budget_quiet]
+node = "//talOS/launcher:budget_quiet"
+period_us = 20000
+only_enabled = true
+sends_per_tick = 1
+
+[subsystems.budget_flood]
+node = "//talOS/launcher:budget_flood"
+period_us = 20000
+only_enabled = false
+sends_per_tick = 8
 )";
 
   const uint16_t gateway_port = FreeUdpPort();
@@ -299,9 +317,15 @@ period_us = 20000
       Runfile("TALOS_BUDGET_SLOW");
   options.binary_overrides["//talOS/launcher:budget_listener"] =
       Runfile("TALOS_BUDGET_LISTENER");
+  options.binary_overrides["//talOS/launcher:budget_quiet"] =
+      Runfile("TALOS_BUDGET_QUIET");
+  options.binary_overrides["//talOS/launcher:budget_flood"] =
+      Runfile("TALOS_BUDGET_FLOOD");
 
+  const std::string flood = "budget_flood";
   const std::vector<std::string> members = {"hardware_node", "budget_fast",
-                                            "budget_slow", "budget_listener"};
+                                            "budget_slow",   "budget_listener",
+                                            "budget_quiet",  flood};
   const std::string session = root + "/1";
   Controller controller{config, gateway_port, bridge_port};
   std::atomic<bool> ended{false};
@@ -338,30 +362,49 @@ period_us = 20000
     node.answered = true;
     described.push_back(std::move(node));
   }
+  // The window the launcher's split gives, from the same model.
   const auto robot = config::ParseRobotConfig(config);
   const TopicLoads loads = DeclaredTopicLoads(described, robot);
-  std::map<std::string, double> modelled_tail;
+  const uint64_t budget = static_cast<uint64_t>(robot.log_max_bytes) / 2;
+  std::vector<double> rates;
+  std::vector<uint64_t> floors;
   for (const NodeDescription& node : described) {
     const std::string& member = node.roster_name;
+    rates.push_back(ExpectedLogRate(node.declared,
+                                    MemberPeriodUs(robot, member),
+                                    member == kHardwareNodeName, loads));
+    floors.push_back(SmallestRotatingShare(node.declared));
+  }
+  const LogSplit split = SplitLogBudget(
+      budget, std::vector<bool>(members.size(), true), rates, floors);
+  const double window_s = std::chrono::duration<double>(split.window).count();
+  ASSERT_GT(window_s, 0);
+  std::printf("window %.3f s\n", window_s);
+
+  std::uintmax_t kept_bytes = 0;
+  for (std::size_t i = 0; i < members.size(); ++i) {
+    const std::string& member = members[i];
+    SCOPED_TRACE(member);
     const bool bridge = member == kHardwareNodeName;
-    const double rate = ExpectedLogRate(
-        node.declared, MemberPeriodUs(robot, member), bridge, loads);
-    ASSERT_GT(rate, 0) << member;
-    modelled_tail[member] =
-        static_cast<double>(KeptBytes(session, member)) / rate;
-    std::printf("%s kept %.2f s, %.2f s at its modelled rate\n", member.c_str(),
-                KeptSeconds(session, member), modelled_tail[member]);
+    const KeptTime kept = KeptSeconds(session, member);
+    kept_bytes += KeptBytes(session, member);
+    std::printf("%s kept %.3f s (longest step %.3f s), %ju of %ju B\n",
+                member.c_str(), kept.seconds, kept.longest_step_s,
+                KeptBytes(session, member),
+                static_cast<std::uintmax_t>(split.shares[i]));
+    EXPECT_EQ(KeptFiles(session, member).size(), event::log::kLogSegments);
+    if (member == flood) {
+      // Its bytes end its segments well before window / 8.
+      EXPECT_LT(kept.seconds, 7.0 / 8.0 * window_s);
+    } else {
+      // Seven whole segments of at least window / 8, each overrun by at most
+      // one step, and the one being written, under window / 8.
+      EXPECT_GE(kept.seconds, 7.0 / 8.0 * window_s);
+      EXPECT_LE(kept.seconds, window_s + 7 * kept.longest_step_s);
+    }
     ExpectRecordsWithinModel(session, member, bridge, loads);
   }
-  ASSERT_EQ(modelled_tail.size(), members.size());
-  const auto [shortest, longest] = std::ranges::minmax_element(
-      modelled_tail, {}, [](const auto& entry) { return entry.second; });
-  ASSERT_GT(shortest->second, 0) << shortest->first << " kept nothing";
-  // n = 8 segments: a rotated log holds 7/8 to 8/8 of its share.
-  EXPECT_LE(longest->second / shortest->second, 8.0 / 7.0 + 0.05)
-      << longest->first << " kept " << longest->second << " s, "
-      << shortest->first << " " << shortest->second
-      << " s at their modelled rates";
+  EXPECT_LE(kept_bytes, budget);
   std::filesystem::remove_all(root);
 }
 

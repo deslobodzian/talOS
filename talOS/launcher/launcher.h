@@ -347,13 +347,15 @@ class Launcher {
 
   // Fills `launch` for a member's first run: its supervision settings and
   // the command line it is spawned with, its event log capped at
-  // `log_budget`; the hardware bridge also gets the controller's addresses.
+  // `log_budget` and cut into segments of `log_window` / n of record time
+  // (zero: bytes only; LogSplit); the hardware bridge also gets the
+  // controller's addresses.
   void PrepareLaunch(const NodeSpec& spec, const NodeDescription& described,
                      const NodeProcessInfo& proc,
                      const config::RobotConfig& robot_config,
-                     uint64_t log_budget, const std::string& remote,
-                     uint16_t remote_port, uint16_t local_port,
-                     NodeLaunch& launch) const;
+                     uint64_t log_budget, std::chrono::microseconds log_window,
+                     const std::string& remote, uint16_t remote_port,
+                     uint16_t local_port, NodeLaunch& launch) const;
 
   LauncherOptions options_;
   SessionManifest session_manifest_;

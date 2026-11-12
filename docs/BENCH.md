@@ -317,10 +317,12 @@ sleep precision. Releasing a lane is not a mechanical brake.
   writer's share. Expected: control continues, each log keeps its newest
   records in whole-record segments within its share (oldest
   `<stem>.segment<k>.tlog` deleted), completed manifest reports
-  `log_capped: true`, and every capped member's kept records span about the
-  same time, within 1.5x of each other (REQ-OPS-32; `log_dump` on the session
-  directory: each process's first record). Record cap/file sizes, the spans and
-  manifest, restore normal limits and reserve disk for session metadata.
+  `log_capped: true`, and every capped member's kept records span between
+  7/8 of the session's log window and the window, whatever the robot state
+  (REQ-OPS-32; `log_dump` on the session directory: each process's first
+  record; the window is `talos.log`'s `Event-log window` line). A member that stores more than its expected rate
+  keeps less. Record cap/file sizes, the window, the spans and manifest,
+  restore normal limits and reserve disk for session metadata.
 - [ ] Stop the stack and fetch into a fresh destination with
   `./tools/deploy.sh fetch <archive-directory>`. Expected: complete session
   directories including restarted-node log attempts. Record config hash and

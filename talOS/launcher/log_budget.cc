@@ -1,12 +1,14 @@
 #include "talOS/launcher/log_budget.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <set>
 
 #include "bridge/topics.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/log/format.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/messages.h"
@@ -197,11 +199,12 @@ uint64_t SmallestRotatingShare(const introspect::Description& declared) {
   return 2 * (prefix + largest);
 }
 
-std::vector<uint64_t> SplitLogBudget(uint64_t budget,
-                                     const std::vector<bool>& logs,
-                                     const std::vector<double>& rates,
-                                     const std::vector<uint64_t>& floors) {
-  std::vector<uint64_t> shares(logs.size(), 0);
+LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
+                        const std::vector<double>& rates,
+                        const std::vector<uint64_t>& floors) {
+  LogSplit split;
+  std::vector<uint64_t>& shares = split.shares;
+  shares.assign(logs.size(), 0);
   std::size_t known = 0;
   double known_sum = 0;
   std::vector<std::size_t> loggers;
@@ -213,7 +216,7 @@ std::vector<uint64_t> SplitLogBudget(uint64_t budget,
       known_sum += rates[i];
     }
   }
-  if (loggers.empty()) return shares;
+  if (loggers.empty()) return split;
   const double mean = known > 0 ? known_sum / static_cast<double>(known) : 1;
   const auto weight = [&](std::size_t i) {
     return rates[i] >= 0 ? rates[i] : mean;
@@ -225,9 +228,11 @@ std::vector<uint64_t> SplitLogBudget(uint64_t budget,
   std::set<std::size_t> held;
   double floor_sum = 0;
   std::vector<double> share(logs.size(), 0);
+  double rest = 0;
+  double total = 0;
   for (;;) {
-    const double rest = static_cast<double>(budget) - floor_sum;
-    double total = 0;
+    rest = static_cast<double>(budget) - floor_sum;
+    total = 0;
     std::size_t free = 0;
     for (const std::size_t i : loggers) {
       if (held.contains(i)) continue;
@@ -254,11 +259,34 @@ std::vector<uint64_t> SplitLogBudget(uint64_t budget,
       share[i] = static_cast<double>(budget) * static_cast<double>(floors[i]) /
                  floor_sum;
     }
+  } else if (known > 0 && total > 0 && rest > 0) {
+    // The record time every free member's share holds at its weight: the
+    // share less what its segments spend on their prefix (each segment
+    // repeats it; half a floor bounds the prefix and the largest record),
+    // over its weight, the least over the free members. A held member's
+    // floor is more than its weight asks, so it holds at least as long.
+    double window_s = rest / total;
+    for (const std::size_t i : loggers) {
+      if (held.contains(i)) continue;
+      const double unit = static_cast<double>(floors[i]) / 2;
+      const double segments =
+          unit > 0 ? std::min(static_cast<double>(event::log::kLogSegments),
+                              std::floor(share[i] / unit))
+                   : 0;
+      window_s = std::min(window_s, (share[i] - segments * unit) / weight(i));
+    }
+    // Whole microseconds, rounded down, within a log writer's nanoseconds.
+    const double window_us =
+        std::min(window_s * 1e6,
+                 static_cast<double>(std::chrono::nanoseconds::max().count() /
+                                     1000 / 2));
+    split.window = std::chrono::microseconds{
+        static_cast<int64_t>(std::max(window_us, 0.0))};
   }
   for (const std::size_t i : loggers) {
     shares[i] = std::max<uint64_t>(1, static_cast<uint64_t>(share[i]));
   }
-  return shares;
+  return split;
 }
 
 }  // namespace talos::launcher
