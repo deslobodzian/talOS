@@ -23,10 +23,11 @@ namespace localizer {
 // which delivers every observation in sequence (a latest-value read would lose
 // all but the newest per tick); the callback queues at most 64 per camera (the
 // oldest is dropped and counted as rejected) and update() checks every queued
-// one. As generated it follows the most certain usable observation of the tick
-// and is valid while one arrived within observation_timeout_us; fuse odometry
-// here (see
-// 2026-robot/main_processor/pose_estimator, which runs wpimath's
+// one. Only update() reads the queues, so the callback waits for the drain
+// before it (at-drain) instead of waking the node for every frame. As
+// generated it follows the most certain usable observation of the tick and is
+// valid while one arrived within observation_timeout_us; fuse odometry here
+// (see 2026-robot/main_processor/pose_estimator, which runs wpimath's
 // SwerveDrive4PoseEstimator or a GTSAM smoother). It drives nothing, so it
 // runs whether the robot is enabled or not.
 class Localizer {
@@ -55,11 +56,13 @@ class Localizer {
     const auto names = node.param<std::vector<std::string>>("cameras");
     pending_.resize(names.size());
     for (std::size_t i = 0; i < names.size(); ++i) {
-      // A callback sees every observation in sequence; update() reads them.
+      // The callback sees every observation in sequence. Only update() reads
+      // the queue, so kAtDrain delivers them at the drain before update()
+      // instead of waking the node for each camera frame.
       cameras_.push_back(node.subscribe<Observation>(
           "/" + names[i] + "/state",
           [this, i](const Observation& o) { pending_[i].Push(o, rejected_); },
-          {.optional = true}));
+          talos::Wake::kAtDrain, {.optional = true}));
     }
   }
 
