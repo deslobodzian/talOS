@@ -359,9 +359,7 @@ TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
       << alpha;
   const auto runs = ManifestRuns(manifest, "alpha");
   ASSERT_EQ(runs.size(), 1u) << manifest;
-  EXPECT_EQ(runs[0].find("\"reason\": \"endpoint_mismatch\""),
-            std::string::npos)
-      << runs[0];
+  EXPECT_NE(runs[0].find("\"reason\": \"stop\""), std::string::npos) << runs[0];
   std::filesystem::remove_all(allowed.output_dir);
 }
 
@@ -481,6 +479,15 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
   ASSERT_FALSE(seen.empty()) << "no live manifest recorded the capped log";
   const auto live = ManifestEntry(seen, "alpha");
   EXPECT_NE(live.find("\"recorder_failed\": false"), std::string::npos) << live;
+  // The real node kept no more than its 1-byte share: every file of its
+  // event log, segments included.
+  std::uintmax_t kept = 0;
+  for (const auto& file :
+       std::filesystem::directory_iterator{options.output_dir}) {
+    if (file.path().filename().string().starts_with("alpha.tlog"))
+      kept += file.file_size();
+  }
+  EXPECT_LE(kept, 1u) << "alpha's event log kept more than its share";
   std::filesystem::remove_all(options.output_dir);
 }
 
@@ -628,10 +635,13 @@ constexpr std::string_view kRunUntilStopped =
     "trap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";
 
 // A critical node that exits 0 while its peers run on is lost, not finished:
-// it restarts. Its restart then exits 0 when the session stops and is not
-// restarted. Every stub records its --log argument once its stop trap is
-// set, and the session is stopped once all four runs have.
-TEST(Supervision, CriticalCleanExitRestartsButAStoppedRestartDoesNot) {
+// it restarts, once, into its next log. Every stub records its --log
+// argument once its stop trap is set, and the session is stopped once all
+// four runs have. That a clean exit while stopping is not restarted is
+// RequestedStopDoesNotRestartCleanExits's; the session deadline takes the
+// same path: its pass sends the stop (stop_sent) before any member can
+// react, so every later exit is reaped with the session stopping.
+TEST(Supervision, CriticalCleanExitRestarts) {
   auto options = BaseOptions("clean_exit");
   options.duration_s = kHangSeconds;
   const auto runs = TempPath("clean_exit_runs");
@@ -663,7 +673,6 @@ TEST(Supervision, CriticalCleanExitRestartsButAStoppedRestartDoesNot) {
   const auto alpha =
       ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
-  EXPECT_NE(alpha.find("\"exit_code\": 0"), std::string::npos) << alpha;
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(peers.c_str());
