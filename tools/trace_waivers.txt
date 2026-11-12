@@ -24,7 +24,6 @@ REQ-CONTRACT-11 2026-11-11 TRACE-1 tag talOS/launcher/supervision_test.cc LiveEn
 REQ-CONTRACT-13 2026-11-11 TRACE-1 tag talOS/python/api_parity_test.py test_functions_version_and_types
 REQ-CONTRACT-20 2026-11-11 TRACE-1 tag talOS/events/log/log_test.cc DamagedRecordIsSkippedAndCounted
 REQ-CONTRACT-21 2026-11-11 TRACE-1 tag talOS/rtms/test.cc RejectsCorruptOffsetAndStride
-REQ-CONTRACT-23 2026-11-11 TRACE-1 tag talOS/devices/devices_test.cc SimHardwareSampleTimeConvergesFollowsLatencyAndGoesStale
 REQ-CONTRACT-30 2026-11-11 TRACE-1 tag talOS/hardware/gateway_test.cc GatewayBuildRejectsUnknownProgramsAndNonBooleanDirty
 REQ-OPS-01 2026-11-11 TRACE-1 tag talOS/launcher/launcher_test.cc DescribeOnlyReportsABrokenGraphAsAFailure
 #
