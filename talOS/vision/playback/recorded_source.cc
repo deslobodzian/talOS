@@ -148,10 +148,11 @@ void RecordedCameraSource::Finish() {
   Report(ConnectionState::kDisconnected, "end of recording");
 }
 
-bool RecordedCameraSource::Decode(std::size_t index) {
+bool RecordedCameraSource::Decode(const ImageSequence& sequence,
+                                  std::size_t index) {
   int width = 0, height = 0;
   std::string error;
-  if (!sequence_->LoadGray(index, &pixels_, &width, &height, &error) ||
+  if (!sequence.LoadGray(index, &pixels_, &width, &height, &error) ||
       static_cast<uint32_t>(width) != config_.width ||
       static_cast<uint32_t>(height) != config_.height) {
     dropped_.fetch_add(1);
@@ -178,7 +179,7 @@ std::size_t RecordedCameraSource::DeliverUntil(std::int64_t now_ns) {
   std::size_t delivered = 0;
   while (next_ < sequence_->size() &&
          *manual_start_ns_ + (*sequence_)[next_].pts_ns <= now_ns) {
-    if (Decode(next_)) {
+    if (Decode(*sequence_, next_)) {
       Emit(next_, *manual_start_ns_ + (*sequence_)[next_].pts_ns);
       ++delivered;
     }
@@ -200,15 +201,18 @@ bool RecordedCameraSource::WaitUntil(std::int64_t due_ns) {
 }
 
 void RecordedCameraSource::Play(std::int64_t start_ns) {
-  const auto period = sequence_->mean_period_ns();
-  for (std::size_t i = 0; i < sequence_->size(); ++i) {
-    const auto due_ns = start_ns + (*sequence_)[i].pts_ns;
+  // Play starts only once Open() has loaded the sequence.
+  if (!sequence_) return;
+  const ImageSequence& sequence = *sequence_;
+  const auto period = sequence.mean_period_ns();
+  for (std::size_t i = 0; i < sequence.size(); ++i) {
+    const auto due_ns = start_ns + sequence[i].pts_ns;
     if (i > 0 && HostNowNs() > due_ns + period) {
       dropped_.fetch_add(1);
       continue;
     }
     // Decode ahead of the frame's time, then deliver it at that time.
-    const bool decoded = Decode(i);
+    const bool decoded = Decode(sequence, i);
     if (!WaitUntil(due_ns)) return;
     if (decoded) Emit(i, due_ns);
   }

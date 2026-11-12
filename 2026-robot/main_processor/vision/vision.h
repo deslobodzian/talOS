@@ -90,7 +90,8 @@ class Vision {
       const auto frames =
           std::ceil(static_cast<long double>(sim_timestamp_lag_ns_) *
                     capture_config_.fps / 1.0e9L);
-      if (frames > sim_pending_.max_size() - kMargin) {
+      if (frames >
+          static_cast<long double>(sim_pending_.max_size() - kMargin)) {
         throw std::invalid_argument(
             std::string(node_.name()) +
             ": camera.fps requires too many delayed frames");
