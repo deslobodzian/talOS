@@ -215,7 +215,7 @@ test('a consumer\'s newer series request aborts its superseded one', async () =>
 // 800: one request per bucket size crossed (512, then 1024), not one per
 // width, and a newer request of the same plot (the cursor moving a grid
 // step) aborts its superseded one. Results kept per consumer stay bounded
-// however many channel sets are plotted.
+// however many channel sets are plotted one view after another.
 test('a plot resize sweep requests per bucket size and keeps a bounded set', async () => {
   const server = fakeServer(echoSnapshot);
   const recorded = source(server);
@@ -234,15 +234,16 @@ test('a plot resize sweep requests per bucket size and keeps a bounded set', asy
   assert.equal(sweep[1].aborted, true);
   assert.equal(sweep[0].aborted, false);
 
-  for (let i = 0; i < 3 * SERIES_SLOTS; i++)
+  // Channel sets plotted one view after another (each answered before the
+  // next): what earlier views kept is dropped past SERIES_SLOTS.
+  const zeros = Array.from({length: 512 + 32}, () => 0);
+  const body = seriesBuffer([{t: zeros, min: zeros, max: zeros, last: zeros, count: zeros}]);
+  for (let i = 0; i < SERIES_SLOTS + 8; i++) {
     recorded.series([`c${i}`], {seconds: 2}, cursor.toString(), 400);
-  for (const call of server.of('/series')) {
-    if (call.aborted) continue;
-    const channels = call.url.searchParams.get('c')!.split(',').length;
-    const points = Number(call.url.searchParams.get('points'));
-    const zeros = () => Array.from({length: points}, () => 0);
-    call.respond(new Response(seriesBuffer(Array.from({length: channels}, () => (
-        {t: zeros(), min: zeros(), max: zeros(), last: zeros(), count: zeros()})))));
+    server.of('/series').at(-1)!.respond(new Response(body.slice(0)));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
   }
   await settle();
   assert.equal(recorded.error, '');
@@ -253,6 +254,40 @@ test('a plot resize sweep requests per bucket size and keeps a bounded set', asy
 // extra 1/16): one request of them all would be 870,400 values, past the
 // server's 262,144 (a 400, and an empty plot). The channels are split into
 // requests that each fit, and every channel gets its data.
+// A static view whose plots need more requests than the result cache and
+// the per-consumer slots hold (a server cap of one channel a request makes
+// 70 channels 70 requests): every completion re-renders, and a render must not refetch
+// what an earlier completion of this view evicted. Each request is issued
+// once, then no more however often the unchanged view renders.
+test('a static view needing many requests settles after one of each', async () => {
+  // Every request is 1 channel of 256 + 16 points: one body serves them all.
+  const t = Array.from({length: 256 + 16}, (_, i) => Number(START) + 4e9 + i * 1e6);
+  const ones = t.map(() => 1);
+  const body = seriesBuffer([{t, min: ones, max: ones, last: ones, count: ones}]);
+  const answer = (url: URL) => url.pathname.endsWith('/series') ?
+      new Response(body.slice(0)) : echoSnapshot(url);
+  const server = fakeServer(answer);
+  const recorded = new RecordedSource(
+      SERVER, 's1', [], {...BOUNDS, max_series_values: 256 + 16},
+      server.fetchFn, fakeClock().clock);
+  const channels = Array.from({length: 70}, (_, i) => `c${i}`);
+  const cursor = (START + 5_000_000_000n).toString();
+  let rendered = recorded.series(channels, {seconds: 2}, cursor, 256);
+  // Each completion re-renders; past 500 the view has not settled (the bound
+  // keeps an unsettled view from spinning the test forever).
+  let renders = 0;
+  recorded.subscribe(() => {
+    if (++renders > 500) return;
+    rendered = recorded.series(channels, {seconds: 2}, cursor, 256);
+  });
+  for (let i = 0; i < 10; i++) await settle();
+  const urls = server.of('/series').map(c => c.url.searchParams.get('c'));
+  assert.equal(urls.length, 70);
+  assert.equal(new Set(urls).size, 70);
+  for (const name of channels)
+    assert.ok([...rendered.values[name]].some(Number.isFinite), name);
+});
+
 test('a wide plot of many channels splits its series within the server cap', async () => {
   const server = fakeServer(echoSnapshot);
   const recorded = source(server);

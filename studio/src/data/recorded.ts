@@ -72,7 +72,10 @@ export const PLAY_RATES = [1, 2, 4] as const;
 export type PlayRate = typeof PLAY_RATES[number];
 
 export const SERIES_CACHE_ENTRIES = 32;
-// Consumers whose last result is kept, least recently used dropped first.
+// Consumers whose last result is kept, least recently used dropped first,
+// beyond those the latest render showed, which are never dropped: so the
+// kept results are at most max(SERIES_SLOTS, the requests on screen) plus
+// SERIES_CACHE_ENTRIES, each within the server's max_series_values.
 export const SERIES_SLOTS = 64;
 // Buckets for a consumer that does not say how wide it is.
 export const DEFAULT_POINTS = 400;
@@ -136,7 +139,10 @@ export class RecordedSource implements DataSource {
   // Per consumer (channels, window, bucket count): its pending key, its last
   // result (at most SERIES_SLOTS).
   private readonly slotPending = new Map<string, string>();
-  private readonly slotLast = new Map<string, SeriesBuckets>();
+  private readonly slotLast = new Map<string, {key: string; buckets: SeriesBuckets}>();
+  // The consumers one render pass (series() calls at one `version`) asked
+  // for, and those of the latest pass that asked for any: what is on screen.
+  private pass = {version: -1, slots: new Set<string>()};
 
   static async open(server: string, id: string,
                     options: RecordedOptions = {}): Promise<RecordedSource> {
@@ -376,7 +382,7 @@ export class RecordedSource implements DataSource {
     if (cached) {
       this.cache.delete(key);
       this.cache.set(key, cached);
-      this.keepLast(owner, cached);
+      this.keepLast(owner, key, cached);
       return Promise.resolve(cached);
     }
     let request = this.inFlight.get(key);
@@ -393,7 +399,7 @@ export class RecordedSource implements DataSource {
             this.cache.set(key, buckets);
             while (this.cache.size > SERIES_CACHE_ENTRIES)
               this.cache.delete(this.cache.keys().next().value!);
-            for (const s of created.slots) this.keepLast(s, buckets);
+            for (const s of created.slots) this.keepLast(s, key, buckets);
             this.version++;
             this.changed();
             return buckets;
@@ -412,11 +418,15 @@ export class RecordedSource implements DataSource {
     return request.promise;
   }
 
-  private keepLast(slot: string, buckets: SeriesBuckets) {
+  private keepLast(slot: string, key: string, buckets: SeriesBuckets) {
     this.slotLast.delete(slot);
-    this.slotLast.set(slot, buckets);
-    while (this.slotLast.size > SERIES_SLOTS)
-      this.slotLast.delete(this.slotLast.keys().next().value!);
+    this.slotLast.set(slot, {key, buckets});
+    // Least recently kept first, never one the latest render showed: a
+    // completion must not evict what the unchanged view will ask for again.
+    for (const old of this.slotLast.keys()) {
+      if (this.slotLast.size <= SERIES_SLOTS) break;
+      if (!this.pass.slots.has(old)) this.slotLast.delete(old);
+    }
   }
 
   // How many consumers' last results are kept: at most SERIES_SLOTS.
@@ -478,11 +488,18 @@ export class RecordedSource implements DataSource {
       const group = channels.slice(at, at + perRequest);
       const key = seriesKey(group, start, end, plan.points);
       const slot = `${group.join(',')}|${windowName}|${size}`;
+      if (this.pass.version !== this.version) {
+        this.pass = {version: this.version, slots: new Set()};
+      }
+      this.pass.slots.add(slot);
+      const last = this.slotLast.get(slot);
+      const have = this.cache.get(key) ?? (last?.key === key ? last.buckets : undefined);
       // A failed request is not issued again until retry(); another one
-      // (the cursor or the plot moved) is.
-      if (!this.failed.has(key) && !this.closed)
+      // (the cursor or the plot moved) is. One already answered and kept for
+      // this consumer is not asked again.
+      if (!have && !this.failed.has(key) && !this.closed)
         void this.fetchSeries(group, start, end, plan.points, slot);
-      parts.push(this.cache.get(key) ?? this.slotLast.get(slot));
+      parts.push(have ?? last?.buckets);
     }
     const buckets = mergeParts(parts, channels.length, perRequest);
     return buckets ?
