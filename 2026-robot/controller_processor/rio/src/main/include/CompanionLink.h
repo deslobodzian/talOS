@@ -62,6 +62,7 @@ class CompanionSink {
   // Every poll, with the current status.
   virtual void Publish(const CompanionStatus& status) = 0;
   // Once per change; `error` marks a lost link or a protocol mismatch.
+  // `text` starts with the poll's ConsoleTime (RioLog.h).
   virtual void Report(bool error, std::string_view text) = 0;
 };
 

@@ -18,6 +18,8 @@
 #include <string_view>
 #include <vector>
 
+#include "RioLog.h"
+
 namespace {
 
 using talos::rio::LoopWatchdog;
@@ -61,7 +63,13 @@ TEST(LoopWatchdog, ActsOnlyOnceTheLastArmedDeadlinePasses) {
   watchdog.Poll(deadline_us);
   EXPECT_EQ(outputs.neutralize_calls, 1);
   EXPECT_EQ(watchdog.stall_count(), 1u);
-  EXPECT_EQ(outputs.reports.size(), 1u);
+  ASSERT_EQ(outputs.reports.size(), 1u);
+  // Stamped with the acting poll's time on the console's clock, so the
+  // Driver Station message and its console copy line up with the program's
+  // time-stamped console lines (the loop's late ticks among them).
+  EXPECT_EQ(outputs.reports[0].rfind(talos::rio::ConsoleTime(deadline_us), 0),
+            0u)
+      << outputs.reports[0];
 }
 
 // A tick that ends with no command in force neutralized the outputs itself:

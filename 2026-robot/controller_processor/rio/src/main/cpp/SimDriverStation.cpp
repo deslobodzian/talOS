@@ -5,6 +5,7 @@
 #include <frc/simulation/DriverStationSim.h>
 #include <hal/DriverStationTypes.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +13,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "RioLog.h"
 
 namespace talos::rio {
 
@@ -29,6 +32,14 @@ const char* ModeName(const SimMode& mode) {
   if (mode.autonomous) return "autonomous";
   if (mode.test) return "test";
   return "teleop";
+}
+
+// The console prefix of this program's lines (RioLog's ConsoleTime) at `now`,
+// the loop's steady clock.
+std::string TimeOf(SimDriverStation::Clock::time_point now) {
+  return ConsoleTime(std::chrono::duration_cast<std::chrono::microseconds>(
+                         now.time_since_epoch())
+                         .count());
 }
 
 }  // namespace
@@ -113,7 +124,7 @@ void SimDriverStation::Update(Clock::time_point now, bool configured) {
     configured_at_ = now;
   }
   if (configured_at_) {
-    UpdateJoystick(now - *configured_at_);
+    UpdateJoystick(now);
   }
   if (!settings_.schedule.empty()) {
     if (!configured_at_) return;
@@ -124,15 +135,16 @@ void SimDriverStation::Update(Clock::time_point now, bool configured) {
     }
     const SimMode mode = ModeOf(settings_.schedule[phase_].flags);
     if (mode != published_) {
-      std::printf("simulated Driver Station: %s (schedule phase %zu)\n",
-                  ModeName(mode), phase_ + 1);
+      std::printf("%ssimulated Driver Station: %s (schedule phase %zu)\n",
+                  TimeOf(now).c_str(), ModeName(mode), phase_ + 1);
       std::fflush(stdout);
       Publish(mode);
     }
     return;
   }
   if (settings_.enable_when_configured && !published_.enabled && configured) {
-    std::printf("simulated Driver Station: enabling (gateway configured)\n");
+    std::printf("%ssimulated Driver Station: enabling (gateway configured)\n",
+                TimeOf(now).c_str());
     settings_.enable_when_configured = false;
     Publish({.enabled = true, .autonomous = false, .test = false});
   }
@@ -142,11 +154,12 @@ void SimDriverStation::Update(Clock::time_point now, bool configured) {
   if (now - started_ < *settings_.disable_after) {
     return;
   }
-  std::printf("simulated Driver Station: disabling\n");
+  std::printf("%ssimulated Driver Station: disabling\n", TimeOf(now).c_str());
   Publish({});
 }
 
-void SimDriverStation::UpdateJoystick(Clock::duration elapsed) {
+void SimDriverStation::UpdateJoystick(Clock::time_point now) {
+  const auto elapsed = now - *configured_at_;
   const auto& events = settings_.joysticks;
   const std::size_t before = joystick_event_;
   while (joystick_event_ < events.size() &&
@@ -168,8 +181,8 @@ void SimDriverStation::UpdateJoystick(Clock::duration elapsed) {
     DriverStationSim::SetJoystickPOV(0, pov, stick.povs[pov]);
   }
   DriverStationSim::NotifyNewData();
-  std::printf("simulated Driver Station: joystick event %zu\n",
-              joystick_event_);
+  std::printf("%ssimulated Driver Station: joystick event %zu\n",
+              TimeOf(now).c_str(), joystick_event_);
   std::fflush(stdout);
 }
 

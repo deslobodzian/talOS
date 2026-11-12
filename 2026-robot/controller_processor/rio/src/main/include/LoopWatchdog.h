@@ -34,7 +34,8 @@ class WatchdogOutputs {
   // devices are being rebuilt by a configure, or a send failed); the
   // watchdog retries on its next poll.
   virtual bool Neutralize() = 0;
-  // Once per deadline passed, after the first Neutralize attempt.
+  // Once per deadline passed, after the first Neutralize attempt. `text`
+  // starts with the acting poll's ConsoleTime (RioLog.h).
   virtual void Report(std::string_view text) = 0;
 };
 

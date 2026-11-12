@@ -469,9 +469,15 @@ Each of these lines, and the program's three start lines, begins with
 time since its kernel booted, the clock of State's `sample_time_us`, so a
 `hardware_node --log` record of a State places the RIO's lines on the
 session's time. A RioLog line's time is when the logger wrote it, within one
-20 ms drain of the event unless that thread is starved. Driver Station
-messages (`talos companion link`, `talos loop watchdog`) and the WPILib and
-Phoenix libraries' own lines carry no such time.
+20 ms drain of the event unless that thread is starved. The program's Driver
+Station messages (`talos companion link`, `talos loop watchdog`) begin their
+text with the same prefix (one function, `ConsoleTime` in `RioLog.h`), the
+time of the check that found the change or the stall, and so does their
+console copy (`Error at talos loop watchdog: [<s>.<ms>] ...`); so do the
+desktop simulation's `simulated Driver Station: ...` lines. Two lines carry
+none: the desktop simulation's exit summary (`sim_robot: ...`, a record that
+`tools/test_drivetrain.py` finds by its start), and the WPILib and Phoenix
+libraries' own lines, which this program does not write.
 
 `PhoenixBackend` marks a motor or CAN sensor invalid only for a signal error,
 a non-finite value or an isolated device (`feedback INVALID`, then

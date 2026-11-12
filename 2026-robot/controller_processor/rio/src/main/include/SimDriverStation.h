@@ -88,7 +88,8 @@ class SimDriverStation {
 
  private:
   void Publish(SimMode mode);
-  void UpdateJoystick(Clock::duration elapsed);
+  // Applies the joystick events due at `now`; configured_at_ is set.
+  void UpdateJoystick(Clock::time_point now);
 
   Settings settings_;
   Clock::time_point started_;

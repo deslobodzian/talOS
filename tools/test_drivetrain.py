@@ -64,11 +64,12 @@ WPILIB_STARTUP_TIMEOUT = 180
 SUMMARY = re.compile(r"^sim_(?:gateway|robot):.*$", re.MULTILINE)
 
 # RioLog's periodic timing report and LoopWatchdog's stall report (through
-# HAL_SendError, "Error at talos loop watchdog: ...").
+# HAL_SendError, "Error at talos loop watchdog: [<s>.<ms>] RoboRIO loop
+# stalled ...").
 LOOP_TIMING = re.compile(
     r"\[rio\] loop timing: (\d+) overruns .*?, (\d+) late ticks .*"
     r"max interval (\d+) us")
-LOOP_STALLED = "talos loop watchdog: RoboRIO loop stalled"
+LOOP_STALLED = "RoboRIO loop stalled past an expired command"
 
 
 def host_sleep_seconds():
