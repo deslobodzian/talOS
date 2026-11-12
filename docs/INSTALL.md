@@ -46,7 +46,13 @@ Both take `--base <ref>` and `--all`. `tools/tidy.sh` runs CI's own selection
 script, and needs `compile_commands.json` (it runs
 `bazel run @hedron_compile_commands//:refresh_all` when missing, or with
 `--refresh`) and the generated headers from a prior `bazel build` of the
-touched packages. It exits 3 when it cannot run: no bazel to make the database, or a host C++ standard library too new for clang 18 (Arch with GCC 16), where it says so.
+touched packages. It first checks that clang 18 parses the host's C++
+standard library. On macOS the newest SDK's libc++ may need a newer clang
+(the 26.x SDKs do); it then analyses against the newest installed SDK
+(Command Line Tools or Xcode) that clang 18 parses, and prints which. It
+exits 3 when it cannot run: no bazel to make the database, or a standard
+library clang 18 cannot parse (Arch's GCC 16 libstdc++, or no installed macOS
+SDK), where it says so and names what it tried.
 Homebrew buildifier and the distribution's buildifier may differ from 8.2.1;
 setup warns about this.
 

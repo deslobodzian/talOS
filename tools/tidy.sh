@@ -21,9 +21,12 @@
 # touched packages first (`bazel build //talOS/...` or the package's
 # targets), as CI's build step does before tidy.
 #
+# On macOS, when clang 18 cannot parse the default SDK's libc++, it analyses
+# against the newest installed SDK that it can parse, and says which.
+#
 # Exit: 0 clean, 1 findings, 2 usage or tool error, 3 cannot run on this host
-# (no bazel, the database could not be produced, or the host libstdc++ is too
-# new for clang 18).
+# (no bazel, the database could not be produced, or clang 18 cannot parse the
+# host's C++ standard library: a libstdc++ too new, or no macOS SDK it parses).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 . "$(dirname "${BASH_SOURCE[0]}")/clang18.sh"
@@ -52,13 +55,84 @@ command -v python3 >/dev/null 2>&1 || clang18_die "need python3"
 clang18_setup
 clang-tidy-18 --version >/dev/null 2>&1 || clang18_die "clang-tidy-18 does not run"
 
-# clang 18 cannot parse a libstdc++ newer than its era (GCC 16 on Arch: atomic_wait.h,
-# stl_iterator.h errors), which makes every finding noise. Say so instead of running.
-printf '#include <atomic>\n#include <vector>\n#include <string>\nint main() {}\n' > "$tmp/probe.cc"
-if ! clang-tidy-18 --checks='-*,clang-diagnostic-*' --quiet "$tmp/probe.cc" -- -std=c++23 >/dev/null 2>&1; then
-  echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library" >&2
-  echo "tidy: (libstdc++ too new; CI uses Ubuntu's GCC 13/14). Run it on macOS or rely on CI." >&2
-  exit 3
+# clang 18 cannot parse a standard library newer than its era (GCC 16's
+# libstdc++ on Arch: atomic_wait.h, stl_iterator.h; the macOS 26 SDK's libc++:
+# __builtin_clzg), which makes every finding noise. Probe one translation unit
+# that includes standard headers, with one real check enabled (a list of only
+# clang-diagnostic-* is "no checks enabled", an error on every host).
+printf '#include <atomic>\n#include <string>\n#include <vector>\nint main() { return 0; }\n' > "$tmp/probe.cc"
+# probe_std [extra clang args...]: 0 parses; 1 the standard library does not
+# (an error outside the probe, or a standard header not found); 2 anything
+# else, with clang-tidy's output in $tmp/probe.out.
+probe_std() {
+  if clang-tidy-18 --checks='-*,readability-braces-around-statements' --quiet \
+      "$tmp/probe.cc" -- -std=c++23 "$@" >"$tmp/probe.out" 2>&1; then
+    return 0
+  fi
+  if grep -Eq "^[^ ]+:[0-9]+:[0-9]+: (fatal )?error: " "$tmp/probe.out" &&
+     ! grep -E "^[^ ]+:[0-9]+:[0-9]+: (fatal )?error: " "$tmp/probe.out" |
+       grep -v "file not found" | grep -q "^$tmp/probe.cc:"; then
+    return 1
+  fi
+  return 2
+}
+probe_failed() {  # probe_failed <status> <what was probed>
+  if [ "$1" = 2 ]; then
+    echo "tidy: the clang-tidy-18 probe failed for another reason ($2):" >&2
+    head -20 "$tmp/probe.out" | sed 's/^/  /' >&2
+    exit 2
+  fi
+}
+
+# CI's step runs clang-tidy-18 by name, so extra arguments go through a
+# wrapper ahead of it on PATH. (Arrays are not used: macOS's bash 3.2 treats
+# an empty one as unbound under set -u.)
+sysroot=""
+if [ "$(uname -s)" = Darwin ]; then
+  # The compilation database builds against the default SDK; Apple's newest
+  # may need a newer clang. Then try the installed SDKs, newest first (the
+  # unversioned and major-only names are links to one of them).
+  default_sdk="$(xcrun --show-sdk-path 2>/dev/null || true)"
+  status=0; probe_std ${default_sdk:+-isysroot "$default_sdk"} || status=$?
+  probe_failed "$status" "default SDK ${default_sdk:-(none)}"
+  if [ "$status" != 0 ]; then
+    tried="${default_sdk:-(no default SDK)}"
+    dev="$(xcode-select -p 2>/dev/null || true)"
+    for sdk in $( { ls -d /Library/Developer/CommandLineTools/SDKs/MacOSX[0-9]*.[0-9]*.sdk
+                    [ -n "$dev" ] && ls -d "$dev"/Platforms/MacOSX.platform/Developer/SDKs/MacOSX[0-9]*.[0-9]*.sdk
+                  } 2>/dev/null |
+                  awk -F/ '{v=$NF; sub(/^MacOSX/, "", v); sub(/\.sdk$/, "", v); split(v, n, ".");
+                            printf "%06d.%06d\t%s\n", n[1], n[2], $0}' |
+                  sort -r | cut -f2 | awk '!seen[$0]++'); do
+      tried="$tried $sdk"
+      status=0; probe_std -isysroot "$sdk" || status=$?
+      probe_failed "$status" "$sdk"
+      if [ "$status" = 0 ]; then sysroot="$sdk"; break; fi
+    done
+    if [ -z "$sysroot" ]; then
+      echo "tidy: cannot run here: clang 18 cannot parse the C++ standard library of any installed macOS SDK; tried:" >&2
+      for sdk in $tried; do echo "  $sdk" >&2; done
+      grep -E "error: " "$tmp/probe.out" | head -3 | sed 's/^/  last: /' >&2
+      exit 3
+    fi
+    echo "tidy: clang 18 cannot parse the default SDK ($default_sdk); using $sysroot" >&2
+  fi
+else
+  status=0; probe_std || status=$?
+  probe_failed "$status" "host standard library"
+  if [ "$status" != 0 ]; then
+    echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library:" >&2
+    grep -E "error: " "$tmp/probe.out" | head -3 | sed 's/^/  /' >&2
+    echo "tidy: (CI uses Ubuntu's GCC 13/14 libstdc++.) Run it on macOS or rely on CI." >&2
+    exit 3
+  fi
+fi
+if [ -n "$sysroot" ]; then
+  mkdir -p "$tmp/bin"
+  printf '#!/bin/sh\nexec %q --extra-arg=-isysroot --extra-arg=%q "$@"\n' \
+    "$(command -v clang-tidy-18)" "$sysroot" > "$tmp/bin/clang-tidy-18"
+  chmod +x "$tmp/bin/clang-tidy-18"
+  export PATH="$tmp/bin:$PATH"
 fi
 
 if [ "$refresh" = 1 ] || [ ! -f compile_commands.json ]; then
