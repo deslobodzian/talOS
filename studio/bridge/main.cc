@@ -92,17 +92,8 @@ struct Bridge {
   // Every duty the loop wakes for on its own (next_wake_ns).
   studio::WakeSchedule schedule;
   std::string attach_error;
-  std::vector<Socket*> clients;
-  // Where the next fan-out starts: just after the last client sent anything.
-  // The shared bucket goes to whichever client asks first, and every client's
-  // own burst equals the shared one, so in a fixed order the clients ahead of
-  // the last would spend the shared bucket and starve it for seconds. Moving
-  // on per pass is not enough either: most passes find the bucket short and
-  // send nothing, so which client the refill reaches would depend on how many
-  // wakes came between, and one client could win it again and again. Moving
-  // on per send grants the bucket in rotation: of the clients able to take a
-  // send, none is served twice before each other one is served once.
-  std::size_t first_client = 0;
+  // Every send to a client leaves in one of its passes (pass_clients).
+  studio::ClientRotation<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
   // ws_drops counts messages the socket refused; that client is then
   // resynchronized (the whole graph, a telemetry keyframe). A graph or
@@ -241,7 +232,10 @@ struct Bridge {
 
   // Brings one client toward the latest graph and tick: each whole on join,
   // then change-only updates, the graph first (studio::ClientFeeds).
-  void pump(Socket* client) {
+  // Returns whether it sent the client anything. Only a pass calls it.
+  bool pump(Socket* client) {
+    // Every successful send is charged to egress_bytes (send_now).
+    const std::uint64_t charged = egress_bytes;
     client->getUserData()->feeds.Pump(
         system_graph, telemetry_state, talos::introspect::monotonic_now_ns(),
         client_rate(),
@@ -254,19 +248,12 @@ struct Bridge {
         [this, client](std::string_view page) {
           return send_now(client, page, uWS::OpCode::BINARY);
         });
+    return egress_bytes != charged;
   }
 
-  template <typename Send>
-  void for_each_client(Send&& send_to) {
-    const std::size_t count = clients.size();
-    if (count == 0) return;
-    const std::size_t first = first_client % count;
-    for (std::size_t i = 0; i < count; ++i) {
-      // Every successful send is charged to egress_bytes (send_now).
-      const std::uint64_t charged = egress_bytes;
-      send_to(clients[(first + i) % count]);
-      if (egress_bytes != charged) first_client = (first + i + 1) % count;
-    }
+  // Offers every client what is due, in rotation (studio::ClientRotation).
+  void pass_clients() {
+    clients.Pass([this](Socket* client) { return pump(client); });
   }
 
   // The decoded feed: latest dictionary and latest complete tick, backing
@@ -289,7 +276,7 @@ struct Bridge {
 
     studio::SystemGraphInput input;
     input.bridge = {.topic = topic,
-                    .clients = clients.size(),
+                    .clients = clients.clients().size(),
                     .frames_forwarded = forwarded,
                     .invalid = invalid,
                     .ws_drops = ws_drops,
@@ -397,7 +384,7 @@ struct Bridge {
     }
     // Every pass, not only on a new tick: a pass woken by the budget's refill
     // or a client's heartbeat (next_wake_ns) sends what is due.
-    for_each_client([this](Socket* client) { pump(client); });
+    pass_clients();
   }
 
   // One pass of the loop, whatever woke it: the wake channel's protocol
@@ -436,7 +423,7 @@ struct Bridge {
   std::int64_t next_wake_ns(std::int64_t now_ns) const {
     return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
                                [this](const auto& visit) {
-                                 for (Socket* client : clients)
+                                 for (Socket* client : clients.clients())
                                    visit(client->getUserData()->feeds);
                                });
   }
@@ -654,7 +641,7 @@ int main(int argc, char** argv) try {
   behavior.maxPayloadLength = 1024;
   behavior.maxBackpressure = 512 * 1024;
   behavior.upgrade = [&](auto* response, auto* request, auto* context) {
-    if (bridge.clients.size() >= bridge.max_clients) {
+    if (bridge.clients.clients().size() >= bridge.max_clients) {
       ++bridge.refused;
       response->writeStatus("503 Studio client limit")
           ->writeHeader("Retry-After", "5")
@@ -667,7 +654,7 @@ int main(int argc, char** argv) try {
         request->getHeader("sec-websocket-extensions"), context);
   };
   behavior.open = [&](auto* ws) {
-    bridge.clients.push_back(ws);
+    bridge.clients.Add(ws);
     const int fd = static_cast<int>(
         reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
     if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &kClientSendBufferBytes,
@@ -681,15 +668,18 @@ int main(int argc, char** argv) try {
     // the producer schedules. That tick is as old as the last telemetry
     // received -- possibly from before telemetry stopped -- so the client
     // treats its first update as of unknown age.
-    bridge.pump(ws);
+    // It is offered all that in this pass, in its turn.
+    bridge.pass_clients();
   };
-  // A client held back by buffered output is sent what is due as soon as
-  // its socket drains.
+  // A client held back by buffered output is offered what is due as soon as
+  // its socket drains, in a pass: behind any client owed a turn before it,
+  // so a client whose writes keep draining is not sent to twice in a turn.
   behavior.drain = [&](auto* ws) {
-    if (ws->getBufferedAmount() == 0) bridge.pump(ws);
+    bridge.clients.Drained(
+        ws, [&bridge](Socket* client) { return bridge.pump(client); });
   };
   behavior.close = [&](auto* ws, int, std::string_view) {
-    std::erase(bridge.clients, ws);
+    bridge.clients.Remove(ws);
   };
   app.ws<Client>("/telemetry", std::move(behavior));
   app.get("/telemetry.json", [&](auto* res, auto*) {
@@ -841,7 +831,7 @@ int main(int argc, char** argv) try {
     if (talos::process::stop_requested.load()) {
       stopping = true;
       us_listen_socket_close(0, bridge.listener);
-      auto clients = bridge.clients;
+      auto clients = bridge.clients.clients();
       for (auto* ws : clients) ws->close();
       us_timer_close(timer);
       for (us_poll_t* poll : {wake_poll, stop_poll}) {

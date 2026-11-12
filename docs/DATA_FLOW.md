@@ -442,10 +442,12 @@ Studio's bridge charges every WebSocket send, with conservative framing
 overhead, against a shared **160,000 B/s** token bucket with a **64,000 B**
 burst (`EgressBudget` in `studio/bridge/telemetry.h`). Each client also has a
 `160000 / max_clients` B/s bucket with the same burst; `[studio] max_clients`
-defaults to **4** (range **1–64**). Each pass over the clients starts just
-after the last client sent anything, so the shared bucket is granted in
-rotation: of the clients able to take a send, none is sent to twice before
-every other one has been sent to once. A client that still has output
+defaults to **4** (range **1–64**). Every send leaves in a pass over the
+clients (a client that joins or drains is offered its turn by one), and each
+pass starts just after the last client sent anything, so the shared bucket is
+granted in rotation: of the clients able to take a send, none is sent to
+twice before every other one has been sent to once
+(`ClientRotation` in `studio/bridge/telemetry.h`). A client that still has output
 buffered is sent nothing; each client's kernel send buffer is set to
 **16 KiB** (`kClientSendBufferBytes` in `studio/bridge/main.cc`; Linux
 accounts twice that), what the whole budget sends in 100 ms, so a client

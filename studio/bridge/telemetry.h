@@ -25,6 +25,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "studio/bridge/system.h"
@@ -554,6 +555,56 @@ struct ClientFeeds {
  private:
   std::int64_t held_since_ns_{-1};  // when the waiting graph message began
   std::int64_t held_sent_ns_{0};    // telemetry's last send while it waits
+};
+
+// The order in which the bridge offers its clients sends, and the one place
+// that offers them. The shared bucket goes to whichever client asks first,
+// and every client's own burst equals the shared one, so in a fixed order
+// the clients ahead of the last would spend the shared bucket and starve it
+// for seconds. Each pass therefore starts just after the last client sent
+// anything, and no send leaves outside a pass (a client that joins or
+// drains is offered its turn by one), so the bucket is granted in rotation:
+// of the clients able to take a send, none is sent to twice before every
+// other one has been sent to once.
+template <class Client>
+class ClientRotation {
+ public:
+  void Add(Client client) { clients_.push_back(client); }
+  // The client owed the next turn keeps it when one ahead of it leaves.
+  void Remove(Client client) {
+    const auto found = std::find(clients_.begin(), clients_.end(), client);
+    if (found == clients_.end()) return;
+    const auto index = static_cast<std::size_t>(found - clients_.begin());
+    clients_.erase(found);
+    if (index < next_) --next_;
+    if (next_ >= clients_.size()) next_ = 0;
+  }
+
+  // Offers every client a send, starting with the one owed the next turn;
+  // `send(client)` returns whether it sent that client anything.
+  template <class Send>
+  void Pass(Send&& send) {
+    const std::size_t count = clients_.size();
+    if (count == 0) return;
+    const std::size_t first = next_ % count;
+    for (std::size_t i = 0; i < count; ++i) {
+      const std::size_t index = (first + i) % count;
+      if (send(clients_[index])) next_ = (index + 1) % count;
+    }
+  }
+
+  // A client's output drained, so it can take a send again: a pass, in
+  // which it is offered its turn behind any client owed one before it.
+  template <class Send>
+  void Drained(Client /*drained*/, Send&& send) {
+    Pass(std::forward<Send>(send));
+  }
+
+  const std::vector<Client>& clients() const { return clients_; }
+
+ private:
+  std::vector<Client> clients_;
+  std::size_t next_ = 0;
 };
 
 // When the bridge must next run with no socket event or publication: the
