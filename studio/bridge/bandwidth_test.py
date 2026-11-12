@@ -45,6 +45,11 @@ SERVED_FRAMES = 20
 # Vtable offsets of Frame's sequence_id and timestamp_ns (talOS/telemetry/telemetry.fbs).
 SEQUENCE, TIMESTAMP = 6, 8
 
+# The clock a frame's timestamp_ns counts on: the producer's
+# std::chrono::steady_clock, CLOCK_MONOTONIC on Linux and CLOCK_MONOTONIC_RAW
+# on macOS, where time.monotonic (mach_absolute_time) does not count sleep.
+STEADY_CLOCK = time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin" else time.CLOCK_MONOTONIC
+
 
 def field(payload, voffset):
     table = 4 + struct.unpack_from("<I", payload, 4)[0]
@@ -114,7 +119,8 @@ def read_all(sockets, stop, served, end):
                 # The first binary is the dictionary page, whose
                 # timestamp is the tick it was published on.
                 if reader["frames"]:
-                    reader["ages"].append((time.monotonic_ns() - field(payload, TIMESTAMP)) / 1e6)
+                    reader["ages"].append(
+                        (time.clock_gettime_ns(STEADY_CLOCK) - field(payload, TIMESTAMP)) / 1e6)
                     reader["received"].append(("binary", field(payload, SEQUENCE)))
                 reader["frames"] += 1
         if all(reader["frames"] >= SERVED_FRAMES for reader in readers):
