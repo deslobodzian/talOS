@@ -823,7 +823,12 @@ std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
 void Launcher::InstallSignals() {
   stop_requested_ = 0;
   struct sigaction stop {};
-  stop.sa_handler = [](int) { stop_requested_ = 1; };
+  // The flag first: the wake it writes makes the sleeping supervision loop
+  // run a pass, which reads the flag (SupervisionWakeup).
+  stop.sa_handler = [](int) {
+    stop_requested_ = 1;
+    SupervisionWakeup::Wake();
+  };
   sigemptyset(&stop.sa_mask);
   stop.sa_flags = SA_RESTART;
   ::sigaction(SIGINT, &stop, nullptr);
@@ -1135,7 +1140,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
   const auto started = options_.supervision_clock();
   for (auto& launch : launches) launch.NewRun(started);
   ServiceNotifier notifier;
-  const ChildExitWakeup exits;  // A pass starts as soon as a child exits.
+  const auto watchdog = notifier.watchdog_interval();
+  // A pass starts as soon as a child exits or a stop signal arrives.
+  const SupervisionWakeup wakeup;
   notifier.Send("READY=1");
   auto next_lock_refresh = std::chrono::steady_clock::time_point::min();
   bool lock_lost_reported = false;
@@ -1292,7 +1299,35 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
           launches[i].kill_reason = kRunStopTimeout;
       }
     }
-    exits.Wait(std::chrono::milliseconds(20));
+
+    // Sleeps until the earliest time a pass has something to decide without
+    // an event; a child's exit and a stop signal wake it at once. Every
+    // timed decision above must be here, or it waits for an unrelated wake.
+    auto wake = SupervisionTime::max();
+    const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
+    // The pass's WATCHDOG=1 went out at about `now`.
+    if (watchdog) due(now + *watchdog);
+    if (session_lock_ != nullptr) due(next_lock_refresh);
+    if (stop_sent) {
+      // Once passed, its SIGKILLs are sent; the exits they cause wake it.
+      if (now < shutdown_deadline) due(shutdown_deadline);
+    } else {
+      due(deadline);
+      // Each run the next pass watches (WatchRun): its row's next look.
+      for (std::size_t i = 0; i < procs.size(); ++i) {
+        if (procs[i].pid <= 0 || procs[i].exited ||
+            launches[i].heartbeat_killed || (studio && i == studio->index()))
+          continue;
+        due(launches[i].liveness.NextLook(launches[i].limits));
+      }
+    }
+    for (const auto& launch : launches) {
+      if (launch.restart.pending()) due(launch.restart.due_at());
+    }
+    if (studio) due(studio->NextCheck());
+    wakeup.Wait(wake == SupervisionTime::max()
+                    ? std::chrono::nanoseconds::max()
+                    : wake - options_.supervision_clock());
   }
 }
 

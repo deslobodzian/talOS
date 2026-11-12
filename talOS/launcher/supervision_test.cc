@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -268,7 +269,8 @@ bool Running(const std::string& manifest) {
 
 // RunSession, stopped as an operator stops it (SIGTERM, which the launcher's
 // handler takes) once `ready` has held for the running session's manifest
-// and one whole supervision pass more has run, so whatever that pass reads
+// and one whole supervision pass more has run (woken for it, not waited
+// for at the loop's next deadline), so whatever that pass reads
 // of a running member the session has recorded. `seen` gets the manifest
 // `ready` held for: empty when the session ended first. Set
 // options.duration_s to kHangSeconds.
@@ -295,6 +297,8 @@ int RunSessionUntil(LauncherOptions& options,
         ::kill(::getpid(), SIGTERM);
         return;
       }
+      // Those passes now, not at the loop's next deadline.
+      SupervisionWakeup::Wake();
     }
   }};
   const int status = RunSession(options);
@@ -1661,6 +1665,141 @@ TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
       << history[0];
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+}
+
+// An idle session -- every member running, none registered, nothing due --
+// is supervised at its members' look interval, not on a fixed poll: no two
+// passes start closer than one look interval (LivenessLookInterval of the
+// 500 ms heartbeat timeout every member here has, its floor), so a window in
+// which k passes started is at least k - 1 intervals long. Load only spaces
+// passes further apart. The window ends at an event (the kth pass), not a
+// duration. The 20 ms poll this replaced started 8 passes in 163 ms.
+// REQ-OPS-45
+TEST(Supervision, IdleSessionPassesOncePerLookIntervalNotOnAPoll) {
+  auto options = BaseOptions("idle_passes");
+  options.max_restarts = 0;
+  options.duration_s = kHangSeconds;
+  // The stubs never register; no heartbeat_missing kill ends the window.
+  options.heartbeat_startup_grace_ms = 60'000;
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] =
+        WriteStub("idle_passes_" + name, "exec sleep 60\n", name);
+  }
+  // The shortest period here (alpha's, the robot's) gives the shortest
+  // timeout, and with it the shortest look interval.
+  const std::chrono::nanoseconds look = LivenessLookInterval(
+      {HeartbeatTimeout(5000, options.heartbeat_periods), {}, {}});
+  constexpr uint64_t kPasses = 8;
+  testing::SupervisionPasses passes;
+  uint64_t counted = 0;
+  std::chrono::nanoseconds window{};
+  std::jthread stopper{[&](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    const auto wait = [&](const std::function<bool()>& done) {
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(1ms);
+    };
+    // The first pass runs once every member has spawned.
+    wait([&] { return passes.Started() > 0; });
+    const uint64_t base = passes.Started();
+    const auto from = std::chrono::steady_clock::now();
+    wait([&] { return passes.Started() - base >= kPasses; });
+    counted = passes.Started() - base;
+    window = std::chrono::steady_clock::now() - from;
+    if (!stop.stop_requested()) ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  stopper.request_stop();
+  stopper.join();
+  ASSERT_GE(counted, kPasses) << "the session made too few passes to judge";
+  const auto ms = [](std::chrono::nanoseconds d) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+  };
+  EXPECT_GE(window, (static_cast<int64_t>(counted) - 1) * look)
+      << counted << " passes started within " << ms(window)
+      << " ms; one look per " << ms(look) << " ms allows at most "
+      << ms(window) / ms(look) + 1;
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// With nothing due for a minute -- heartbeat timeouts of hours, the startup
+// grace and construction deadline an hour off, the session's duration 60 s
+// -- the loop sleeps, and still a child's exit and a stop signal each start
+// a pass at once: alpha exits (no restart: max_restarts 0) and the live
+// manifest records the crash; then SIGTERM ends the session. The launcher
+// runs on a thread that blocks both signals, so their handlers run on
+// another thread, as they may in a launcher with its output threads, and
+// cannot wake the loop by interrupting its sleep: only the wake they write
+// can. Each is awaited for 10 s, which only bounds a hang: a loop they did
+// not wake would see either only at its next deadline, a minute after the
+// start.
+// REQ-OPS-06, REQ-OPS-45
+TEST(Supervision, ChildExitAndStopSignalWakeTheSleepingLoop) {
+  auto options = BaseOptions("long_sleep");
+  options.max_restarts = 0;
+  options.duration_s = 60;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 3'600'000;
+  options.construction_timeout = 1h;
+  const auto runs = TempPath("long_sleep_runs");
+  const auto trigger = TempPath("long_sleep_exit");
+  ::remove(runs.c_str());
+  ::remove(trigger.c_str());
+  for (const std::string name : {"hardware_node", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] = WriteStub(
+        "long_sleep_" + name, RecordLogArgThen(runs, "exec sleep 60\n"), name);
+  }
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "long_sleep_alpha",
+      RecordLogArgThen(runs, "while [ ! -e " + trigger +
+                                 " ]; do sleep 0.01; done\nexit 3\n"));
+  // RunSession rewrites options.output_dir on return; not read concurrently.
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  std::atomic<bool> returned{false};
+  std::thread launcher{[&] {
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, SIGCHLD);
+    sigaddset(&blocked, SIGTERM);
+    ::pthread_sigmask(SIG_BLOCK, &blocked, nullptr);
+    RunSession(options);
+    returned = true;
+  }};
+  const auto wait = [](const std::function<bool()>& done) {
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (!done() && std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(2ms);
+    return done();
+  };
+  bool reaped = false;
+  bool stopped = false;
+  if (wait([&] { return ReadLines(runs).size() == 3; })) {
+    std::ofstream{trigger}.close();
+    reaped = wait([&live] {
+      const auto history = ManifestRuns(ReadFile(live), "alpha");
+      return !history.empty() &&
+             history.back().find("\"reason\": \"crash\"") != std::string::npos;
+    });
+  }
+  if (reaped) {
+    ::kill(::getpid(), SIGTERM);
+    stopped = wait([&] { return returned.load(); });
+  }
+  launcher.join();
+  EXPECT_TRUE(reaped) << "alpha's exit waited for the loop's next deadline";
+  EXPECT_TRUE(stopped) << "SIGTERM waited for the loop's next deadline";
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(trigger.c_str());
 }
 
 }  // namespace

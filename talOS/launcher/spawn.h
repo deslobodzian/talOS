@@ -2,12 +2,13 @@
 
 // Spawning a roster member or probe: fork + exec into a process group of its
 // own with a guardian that kills the group if the launcher dies, the child's
-// reports of a failed setup step, and SIGCHLD wakeups.
+// reports of a failed setup step, and the supervision loop's wakeups.
 
 #include <limits.h>
 #include <signal.h>
 #include <sys/types.h>
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <optional>
@@ -163,27 +164,43 @@ std::string SignalText(int signal);
 // "exit code N" or "signal N SIGNAME", from a waitpid status.
 std::string ExitReason(int status);
 
-// While it lives, a SIGCHLD wakes Wait(): the supervision loop reaps an exit
-// as it happens rather than at its next pass. The self-pipe is created once
-// per process and never closed, so a late signal can never write into a
-// descriptor number another file has reused; the previous SIGCHLD action is
-// restored on destruction. The handler only writes one byte (SA_RESTART;
-// errno preserved), so it is safe on any thread that receives it.
-class ChildExitWakeup {
+// What the supervision loop sleeps on between passes: while it lives, a
+// SIGCHLD wakes Wait(), so the loop reaps an exit as it happens, and so does
+// Wake(), which the launcher's stop signal handlers call. A self-pipe: the
+// wake writes one byte and Wait() polls the read end, so a wake that lands
+// after the loop last looked and before it sleeps is not lost. The pipe is
+// created once per process and never closed, so a late signal can never
+// write into a descriptor number another file has reused; the previous
+// SIGCHLD action is restored on destruction. The handler only writes one
+// byte (SA_RESTART; errno preserved), so it is safe on any thread that
+// receives it. The same on Linux and macOS: no signalfd, pidfd or kqueue.
+class SupervisionWakeup {
  public:
-  ChildExitWakeup();
-  ~ChildExitWakeup();
-  ChildExitWakeup(const ChildExitWakeup&) = delete;
-  ChildExitWakeup& operator=(const ChildExitWakeup&) = delete;
+  SupervisionWakeup();
+  ~SupervisionWakeup();
+  SupervisionWakeup(const SupervisionWakeup&) = delete;
+  SupervisionWakeup& operator=(const SupervisionWakeup&) = delete;
 
-  // Returns after `timeout`, or sooner once a child has exited since the
-  // last call.
-  void Wait(std::chrono::milliseconds timeout) const;
+  // Returns after `timeout` (rounded up to whole milliseconds; a negative
+  // one returns at once, and nanoseconds::max() waits for a wake alone), or
+  // sooner once a child has exited or Wake() was called since the last call;
+  // true when it was woken. Without its pipe or SIGCHLD handler nothing can
+  // wake it, so it then returns after at most kUnwokenWait, as a poll.
+  bool Wait(std::chrono::nanoseconds timeout) const;
+
+  // Wakes the current or next Wait(), in this process. Async-signal-safe;
+  // does nothing before the first SupervisionWakeup made the pipe.
+  static void Wake();
+
+  static constexpr std::chrono::milliseconds kUnwokenWait{20};
 
  private:
   static void OnSignal(int /*signal*/);
 
-  static inline int pipe_[2]{-1, -1};
+  static inline std::atomic<int> read_end_{-1};
+  // Read by Wake() in a signal handler: lock-free, so async-signal-safe.
+  static inline std::atomic<int> write_end_{-1};
+  static_assert(std::atomic<int>::is_always_lock_free);
   struct sigaction previous_ {};
   bool installed_{false};
 };

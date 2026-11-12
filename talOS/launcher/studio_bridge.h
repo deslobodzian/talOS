@@ -76,6 +76,14 @@ class StudioBridge {
   // survivor, respawn a startup failure, or give up when budget runs out.
   void Supervise(NodeProcessInfo& proc, Clock::time_point now, bool stopping);
 
+  // When Supervise next has something to decide without an exit: one retry
+  // interval after the last spawn while the bridge is starting (stabilize,
+  // retry or give up); time_point::max() once it is stable or given up.
+  Clock::time_point NextCheck() const {
+    return active_ && !stable_ ? last_spawn_ + kStudioBridgeRetryInterval
+                               : Clock::time_point::max();
+  }
+
   // The session ended while the bridge was still starting: it never served
   // Studio. An attempt still running is killed and reaped, so its run ends
   // with the session. A stop-driven ending is not a bridge failure.

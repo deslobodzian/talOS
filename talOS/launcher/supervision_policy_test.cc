@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
 #include <random>
 #include <string>
 #include <string_view>
@@ -369,6 +370,101 @@ TEST(SupervisionPolicy, UnregisteredRunIsKilledOnceTheGraceAndTimeoutPass) {
   EXPECT_EQ(ungraced.Judge(none, kT0 + 500ms - 1ns, limits),
             std::string_view{});
   EXPECT_EQ(ungraced.Judge(none, kT0 + 500ms, limits), kRunHeartbeatMissing);
+}
+
+// What the supervision loop's looks at one run decided, and when.
+struct Killed {
+  std::string_view reason;
+  SupervisionTime at;
+};
+
+// Looks at `run` only when its NextLook says, from kT0, at each look reading
+// the row `row_at` gives for that time, until a look kills it. Every look
+// must fall after the last and at most one look interval later.
+Killed LookUntilKilled(
+    RunLiveness& run, const LivenessLimits& limits,
+    const std::function<RowObservation(SupervisionTime)>& row_at) {
+  SupervisionTime now = kT0;
+  for (int looks = 0; looks < 100'000; ++looks) {
+    const SupervisionTime next = run.NextLook(limits);
+    if (next <= now || next - now > LivenessLookInterval(limits)) {
+      ADD_FAILURE() << "after the look at " << At(now) << " the next is at "
+                    << At(next);
+      return {{}, now};
+    }
+    now = next;
+    const std::string_view kill = run.Judge(row_at(now), now, limits);
+    if (!kill.empty()) return {kill, now};
+  }
+  ADD_FAILURE() << "no look killed the run by " << At(now);
+  return {{}, now};
+}
+
+// Looking only when NextLook says, never on a poll, a stalled run is killed
+// at least one heartbeat timeout and at most that plus one look interval
+// after its last dispatch, wherever in a look interval the stall begins.
+// REQ-OPS-05
+TEST(SupervisionPolicy, ScheduledLooksKillAStallWithinTheTimeoutAndOneLook) {
+  const LivenessLimits limits = SessionLivenessLimits();
+  const auto look = LivenessLookInterval(limits);
+  for (auto offset = 0ms; offset < look; offset += 1ms) {
+    // Dispatches every millisecond from kT0 through `last`.
+    const SupervisionTime last = kT0 + 6s + offset;
+    SCOPED_TRACE("last dispatch at " + At(last));
+    RunLiveness run;
+    run.Begin(kT0);
+    const Killed killed = LookUntilKilled(run, limits, [&](SupervisionTime t) {
+      return RowObservation{
+          .found = true,
+          .dispatch = static_cast<uint64_t>((std::min(t, last) - kT0) / 1ms)};
+    });
+    ASSERT_EQ(killed.reason, kRunStalled) << At(killed.at);
+    EXPECT_GE(killed.at - last, limits.heartbeat_timeout) << At(killed.at);
+    EXPECT_LE(killed.at - last, limits.heartbeat_timeout + look)
+        << At(killed.at);
+  }
+}
+
+// The deadlines a look decides on are look times themselves, not the next
+// look interval after them: the startup grace's end for a run that never
+// registered, the construction deadline for one still constructing; and a
+// deadline already decided (the construction deadline of a run that has no
+// row, which only the grace ends) never holds the next look back.
+// REQ-OPS-05
+TEST(SupervisionPolicy, ScheduledLooksFallOnTheGraceAndConstructionDeadlines) {
+  const RowObservation none;
+  int64_t beat = 0;
+  const auto constructing = [&beat](SupervisionTime) {
+    return RowObservation{
+        .found = true, .constructing = true, .heartbeat = ++beat};
+  };
+  struct Case {
+    const char* name;
+    std::chrono::milliseconds grace;
+    std::chrono::milliseconds construction;
+    std::function<RowObservation(SupervisionTime)> row_at;
+    std::string_view reason;
+    std::chrono::milliseconds at;
+  };
+  const Case cases[] = {
+      {"unregistered", 5001ms, 30s, [&](SupervisionTime) { return none; },
+       kRunHeartbeatMissing, 5001ms},
+      {"constructing", 5s, 30001ms, constructing, kRunConstructionDeadline,
+       30001ms},
+      {"unregistered past the construction deadline", 60s, 30s,
+       [&](SupervisionTime) { return none; }, kRunHeartbeatMissing, 60s},
+  };
+  for (const Case& c : cases) {
+    SCOPED_TRACE(c.name);
+    LivenessLimits limits = SessionLivenessLimits();
+    limits.startup_grace = c.grace;
+    limits.construction_timeout = c.construction;
+    RunLiveness run;
+    run.Begin(kT0);
+    const Killed killed = LookUntilKilled(run, limits, c.row_at);
+    EXPECT_EQ(killed.reason, c.reason) << At(killed.at);
+    EXPECT_EQ(killed.at, kT0 + c.at) << At(killed.at);
+  }
 }
 
 // --heartbeat-periods periods of the member's period_us, never under 500 ms.
