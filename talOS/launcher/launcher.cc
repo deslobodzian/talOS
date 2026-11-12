@@ -244,10 +244,27 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
 
 int Launcher::Run() {
   // A session must not end because whoever reads the launcher's stdout or
-  // stderr went away (an ssh session or a `tee` closing): its writes then
-  // fail with EPIPE, which every writer here survives (REQ-OPS-33). Children
-  // start with the default again (SpawnProcess).
+  // stderr went away (a `tee` or a log pipe closing): its writes then fail
+  // with EPIPE, which LauncherOutput survives (REQ-OPS-33). Children start
+  // with the default again (SpawnProcess).
   std::signal(SIGPIPE, SIG_IGN);
+  // From here no launcher thread writes to descriptors 1 and 2 itself.
+  try {
+    launcher_output_.emplace();
+  } catch (const std::exception& e) {
+    std::cerr << "launcher: " << e.what() << "; nothing was started\n";
+    return 1;
+  }
+  const int status = RunSession();
+  // Every member has been reaped, so its pipe has ended; then the
+  // launcher's own lines get the descriptors' linger.
+  if (output_) output_->Stop();
+  output_.reset();
+  launcher_output_.reset();
+  return status;
+}
+
+int Launcher::RunSession() {
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
     std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;
@@ -381,6 +398,8 @@ int Launcher::Run() {
                               pruning != Pruning::kNone, retention_record)) {
     return 1;
   }
+  launcher_output_->Record(options_.output_dir + "/" +
+                           std::string{kLauncherOutputFile});
   if (!options_.replay_inputs.empty()) {
     return RunOnRecordedInputs(node_specs);
   }
@@ -481,7 +500,7 @@ int Launcher::Run() {
 
   // Every member's stdout and stderr, drained into its <name>.log.
   try {
-    output_.emplace();
+    output_.emplace(&*launcher_output_);
   } catch (const std::exception& e) {
     std::cerr << "launcher: " << e.what() << "; nothing was started\n";
     return 1;

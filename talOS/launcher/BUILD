@@ -38,7 +38,8 @@ cc_library(
     hdrs = ["spawn.h"],
 )
 
-# Drains every roster member's stdout and stderr into its <name>.log.
+# Drains every roster member's stdout and stderr into its <name>.log, and
+# relays the launcher's own stdout and stderr (and talos.log) off its threads.
 cc_library(
     name = "child_output",
     srcs = ["child_output.cc"],
@@ -545,8 +546,9 @@ cc_test(
     ],
 )
 
-# A session whose stdout and stderr reader closes, and the signal
-# dispositions and mask its children start with (REQ-OPS-33).
+# A session whose stdout and stderr are closed or full and never read, a
+# terminal hangup, and the signal dispositions and mask its children start
+# with (REQ-OPS-33).
 cc_test(
     name = "closed_output_test",
     size = "small",

@@ -1,7 +1,7 @@
-// The launcher's stdout and stderr readers going away mid-session (an ssh
-// session or a `tee` closing): the session runs on, and what it spawns
-// starts with default signal dispositions and an empty mask whatever the
-// launcher's are.
+// The launcher's stdout and stderr closed or never read, and its terminal
+// hanging up: the session runs on (or, on the hangup, stops in order), and
+// what it spawns starts with default signal dispositions and an empty mask
+// whatever the launcher's are.
 //
 // Every wait here is on an event -- a pipe's data or its end -- bounded by
 // kHangMs, which only bounds a hang (docs/TESTING.md §6.3).
@@ -221,57 +221,129 @@ int Reap(pid_t pid) {
   return status;
 }
 
+// Whether the session's manifest was finalized: its end_wall_ns is set.
+bool Finalized(const std::string& manifest) {
+  return manifest.find("\n  \"end_wall_ns\": 0,") == std::string::npos;
+}
+
+// The runs a manifest records as ended by the session's stop.
+std::size_t StoppedRuns(const std::string& manifest) {
+  std::size_t stopped = 0;
+  for (std::size_t at = manifest.find("\"reason\": \"stop\"");
+       at != std::string::npos;
+       at = manifest.find("\"reason\": \"stop\"", at + 1))
+    ++stopped;
+  return stopped;
+}
+
+// Whether `text` has a line holding both `first` and `second`.
+bool HasLine(const std::string& text, std::string_view first,
+             std::string_view second) {
+  std::size_t start = 0;
+  while (start < text.size()) {
+    std::size_t end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+    const std::string_view line{text.data() + start, end - start};
+    if (line.find(first) != std::string_view::npos &&
+        line.find(second) != std::string_view::npos)
+      return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+// Fills `writer`'s pipe until a write would block, leaving it blocking.
+void FillPipe(int writer) {
+  const int flags = ::fcntl(writer, F_GETFL);
+  ::fcntl(writer, F_SETFL, flags | O_NONBLOCK);
+  const std::string filler(4096, 'f');
+  while (::write(writer, filler.data(), filler.size()) > 0) {
+  }
+  ::fcntl(writer, F_SETFL, flags);
+}
+
 // REQ-OPS-33
 // A session whose launcher stdout and stderr are one pipe (`launcher 2>&1 |
-// tee`): once alpha's output has been echoed through it, the test closes the
-// pipe's only reader, then makes alpha's first run exit 1. The launcher's
-// lines about that exit and the restart, the echo of alpha's output, and its
-// lines at the stop and its exit all write into a pipe nobody reads. A
-// launcher that dies of SIGPIPE ends the session, and its nodes' guardians
-// kill them. It must keep supervising: alpha is restarted, its second run's
-// output reaches its log, and SIGTERM still stops the session with status 0.
-TEST(ClosedOutput, SessionOutlivesItsStdoutReader) {
-  Fixture fixture{"closed"};
-  const std::string alpha_log = NodeOutputPath(fixture.session_dir, "alpha");
-  int output[2];
-  ASSERT_EQ(::pipe(output), 0);
-  const Forked launcher = ForkLauncher(fixture.options, output[1], output[0]);
-  ::close(output[1]);
-  ASSERT_GT(launcher.pid, 0);
+// tee`) that is not read. Row "closed": once alpha's output has been echoed
+// through it, the test closes the pipe's only reader, so every later write
+// fails with EPIPE; a launcher that dies of SIGPIPE ends the session. Row
+// "full": the pipe is full before the launcher starts and nobody ever reads
+// it (a paused pager, an ssh session sshd has not noticed is gone), so every
+// write to it blocks; a launcher that writes its own lines there from its
+// supervision thread stops supervising. In both, alpha's first run exits 1
+// once it has started: alpha must be restarted, its second run's output
+// must reach alpha.log, SIGTERM must still stop the session in order
+// (status 0, manifest finalized, the hardware stub's and alpha's last runs
+// "stop"), and the session's talos.log must hold the launcher's line about
+// alpha's exit.
+TEST(ClosedOutput, SessionOutlivesAnUnreadStdout) {
+  struct Row {
+    const char* name;
+    bool full;  // Else closed once alpha's echo came through.
+  };
+  for (const Row row : {Row{"closed", false}, Row{"full", true}}) {
+    SCOPED_TRACE(row.name);
+    Fixture fixture{row.name};
+    const std::string alpha_log = NodeOutputPath(fixture.session_dir, "alpha");
+    int output[2];
+    ASSERT_EQ(::pipe(output), 0);
+    if (row.full) FillPipe(output[1]);
+    const Forked launcher = ForkLauncher(fixture.options, output[1], output[0]);
+    ::close(output[1]);
+    ASSERT_GT(launcher.pid, 0);
 
-  // Read the launcher's output until alpha's echo shows up in it.
-  std::string seen;
-  const bool echoed = AwaitText(output[0], seen, "tick");
-  ::close(output[0]);
-  std::ofstream{fixture.crash}.close();
+    std::string seen;
+    std::string events;
+    bool started = false;
+    if (row.full) {
+      started = AwaitText(launcher.events, events, "alpha 0") &&
+                AwaitText(launcher.events, events, "hardware ready");
+    } else {
+      // Read the launcher's output until alpha's echo shows up in it.
+      started = AwaitText(output[0], seen, "tick");
+      ::close(output[0]);
+    }
+    std::ofstream{fixture.crash}.close();
+    // Each wait that fails costs kHangMs: the later ones are skipped.
+    const bool restarted =
+        started && AwaitText(launcher.events, events, "alpha 1 ticked");
+    int status = 0;
+    const bool alive = ::waitpid(launcher.pid, &status, WNOHANG) == 0;
+    if (alive) ::kill(launcher.pid, SIGTERM);
+    const bool ended = AwaitEnd(launcher.events, events);
+    ::close(launcher.events);
+    if (!ended) ::kill(launcher.pid, SIGKILL);
+    if (alive) status = Reap(launcher.pid);
+    if (row.full) ::close(output[0]);
 
-  std::string events;
-  const bool restarted = AwaitText(launcher.events, events, "alpha 1 ticked");
-  int status = 0;
-  const bool alive = ::waitpid(launcher.pid, &status, WNOHANG) == 0;
-  if (alive) ::kill(launcher.pid, SIGTERM);
-  const bool ended = AwaitEnd(launcher.events, events);
-  ::close(launcher.events);
-  if (alive) status = Reap(launcher.pid);
-
-  ASSERT_TRUE(echoed) << "alpha's output never reached the launcher's stdout: "
-                      << seen;
-  EXPECT_TRUE(alive) << "the launcher ended once its stdout reader closed: "
-                     << ExitReason(status);
-  EXPECT_TRUE(restarted) << "alpha's second run never printed twenty lines; "
-                            "events: "
-                         << events;
-  EXPECT_TRUE(ended) << "the session did not end after SIGTERM";
-  const std::string log = ReadFile(alpha_log);
-  const std::size_t second_run = log.find("[launcher] alpha run 1,");
-  ASSERT_NE(second_run, std::string::npos) << alpha_log << ":\n" << log;
-  std::size_t ticks = 0;
-  for (std::size_t at = log.find("tick", second_run); at != std::string::npos;
-       at = log.find("tick", at + 1))
-    ++ticks;
-  EXPECT_GE(ticks, 20u) << alpha_log << ":\n" << log;
-  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
-      << "a stop after the close ended with " << ExitReason(status);
+    ASSERT_TRUE(started) << (row.full ? "alpha never started; events: "
+                                      : "alpha's output never reached the "
+                                        "launcher's stdout: ")
+                         << (row.full ? events : seen);
+    EXPECT_TRUE(alive) << "the launcher ended: " << ExitReason(status);
+    EXPECT_TRUE(restarted) << "alpha's second run never printed twenty "
+                              "lines; events: "
+                           << events;
+    EXPECT_TRUE(ended) << "the session did not end after SIGTERM";
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "the stop ended with " << ExitReason(status);
+    const std::string manifest =
+        ReadFile(fixture.session_dir + "/manifest.json");
+    EXPECT_TRUE(Finalized(manifest)) << manifest;
+    EXPECT_EQ(StoppedRuns(manifest), 2u) << manifest;
+    const std::string log = ReadFile(alpha_log);
+    const std::size_t second_run = log.find("[launcher] alpha run 1,");
+    ASSERT_NE(second_run, std::string::npos) << alpha_log << ":\n" << log;
+    std::size_t ticks = 0;
+    for (std::size_t at = log.find("tick", second_run); at != std::string::npos;
+         at = log.find("tick", at + 1))
+      ++ticks;
+    EXPECT_GE(ticks, 20u) << alpha_log << ":\n" << log;
+    const std::string launcher_log =
+        ReadFile(fixture.session_dir + "/" + std::string{kLauncherOutputFile});
+    EXPECT_TRUE(HasLine(launcher_log, "alpha", "exit code 1")) << "talos.log:\n"
+                                                               << launcher_log;
+  }
 }
 
 // REQ-OPS-33
@@ -325,16 +397,10 @@ TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
     EXPECT_TRUE(ended) << "the session did not end";
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
         << "the launcher ended with " << ExitReason(status);
-    EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
-        << "the manifest was not finalized:\n"
-        << manifest;
-    std::size_t stopped = 0;
-    for (std::size_t at = manifest.find("\"reason\": \"stop\"");
-         at != std::string::npos;
-         at = manifest.find("\"reason\": \"stop\"", at + 1))
-      ++stopped;
+    EXPECT_TRUE(Finalized(manifest)) << "the manifest was not finalized:\n"
+                                     << manifest;
     // The hardware stub's run and alpha's last.
-    EXPECT_EQ(stopped, 2u) << manifest;
+    EXPECT_EQ(StoppedRuns(manifest), 2u) << manifest;
   }
 }
 
