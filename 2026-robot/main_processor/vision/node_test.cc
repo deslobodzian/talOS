@@ -409,8 +409,10 @@ TEST(VisionTest, FullDelayedQueueDropsAndCountsOnlyItsOldestCapture) {
   if (!status.has_value()) {
     FAIL() << "missing camera status";
   }
+  // The evicted capture counts once, as dropped: processed + dropped ==
+  // captured.
   EXPECT_EQ(status->frames_captured_count(), 6u);
-  EXPECT_EQ(status->frames_processed_count(), 6u);
+  EXPECT_EQ(status->frames_processed_count(), 5u);
   EXPECT_EQ(status->frames_dropped_count(), 1u);
   EXPECT_EQ(status->frame_period_us(), 17000u);
   EXPECT_EQ(status->last_latency_us(), 40000u);
@@ -836,6 +838,7 @@ class GatedBackend final : public talos::vision::ComputeBackend {
       std::unique_lock lock(mutex_);
       threads_.push_back(std::this_thread::get_id());
       frames_.push_back(frame.capture_timestamp_ns());
+      changed_.notify_all();
       // A cap that expires releases the gate, so a failing run stays short.
       if (!changed_.wait_for(lock, 5s, [this] { return !held_; })) {
         held_ = false;
@@ -857,6 +860,12 @@ class GatedBackend final : public talos::vision::ComputeBackend {
   std::vector<std::uint64_t> frames() {
     std::lock_guard lock(mutex_);
     return frames_;
+  }
+  // Blocks until `count` frames have entered Execute(); the 5 s cap only ends
+  // a failing run.
+  bool WaitForFrames(std::size_t count) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, 5s, [&] { return frames_.size() >= count; });
   }
 
  private:
@@ -979,6 +988,62 @@ TEST(VisionTest, SimResultOlderThanFrameTimeoutIsDropped) {
                next.sample_time_ns();
   }));
   EXPECT_TRUE(observer.frames.back().observation.valid());
+}
+
+// REQ-CONTRACT-27, REQ-DEV-11. Scenario: at 10 ms ticks and 60 fps, a slow
+// raster frame (sensor speckle, 12-14 ms) finished just before the next, fast
+// one; the newer result replaced it before any tick collected it, so 5-7% of
+// computed frames per camera were lost. Two results the worker finishes
+// between two collections must both publish, in capture order, each with its
+// own capture stamp, and processed + dropped == captured once none is in
+// flight.
+TEST(VisionTest, SimResultsFinishedBetweenTicksAllPublishInCaptureOrder) {
+  auto backend = std::make_shared<GatedBackend>();
+  GatedSimVision::backend = backend;
+  auto sim = MakeSim(true, true, {}, "period_us = 10000\n");
+  auto& camera = sim.add<GatedSimVision>("rear_right_camera");
+  auto& observer = sim.add<CameraObserver>("pose_estimator");
+  struct Release {
+    GatedBackend& backend;
+    ~Release() { backend.Hold(false); }
+  } release{*backend};
+  backend->Hold(true);
+  auto captured = [&] {
+    const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+    return status ? status->frames_captured_count() : 0u;
+  };
+  // The first capture is held in the detector, so no tick can collect it;
+  // the second is posted behind it.
+  std::vector<geometry::OdometrySample> truths;
+  for (int i = 0; i < 10 && captured() < 2; ++i) {
+    const auto truth = Truth(sim);
+    sim.publish(sim::topics::kState, truth);
+    sim.step(10ms);
+    if (captured() > truths.size()) truths.push_back(truth);
+    if (truths.size() == 1) {
+      ASSERT_TRUE(backend->WaitForFrames(1));
+    }
+  }
+  ASSERT_EQ(truths.size(), 2u);
+  ASSERT_TRUE(observer.frames.empty());
+  // Both finish before the next tick.
+  backend->Hold(false);
+  ASSERT_TRUE(camera.WaitForSimWorker(60s));
+  ASSERT_EQ(backend->frames().size(), 2u);
+  // The same truth stays fresh without making a capture due.
+  sim.publish(sim::topics::kState, truths.back());
+  sim.step(10ms);
+  ASSERT_EQ(observer.frames.size(), 2u);
+  for (std::size_t i = 0; i < truths.size(); ++i) {
+    EXPECT_EQ(observer.frames[i].observation.sample_time_ns(),
+              truths[i].sample_time_ns());
+  }
+  EXPECT_EQ(observer.frames[0].delivery_ns, observer.frames[1].delivery_ns);
+  const auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
+  ASSERT_TRUE(status);
+  EXPECT_EQ(status->frames_captured_count(), 2u);
+  EXPECT_EQ(status->frames_processed_count(), 2u);
+  EXPECT_EQ(status->frames_dropped_count(), 0u);
 }
 
 TEST(VisionTest, RejectsOutOfBoundsHighErrorAndNonfiniteEstimates) {
@@ -1827,6 +1892,58 @@ TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
   // reach a result; the frames in between are counted, not silently lost.
   EXPECT_GE(status->frames_dropped_count(), kFrames - 2);
   EXPECT_LE(status->frames_processed_count(), 2u);
+}
+
+// REQ-CONTRACT-27. A live camera's computed observation is published even
+// when the next frame finishes before update() collects it: both go out in
+// capture order with their own stamps. Today's queue holds three results at a
+// 1 ms period and 60 fps; when the loop falls further behind, the oldest is
+// dropped and counted and the newest kept.
+TEST(VisionTest, LiveResultsFinishedBetweenTicksPublishInOrderOrDropOldest) {
+  auto device = std::make_shared<FakeCameraDevice>();
+  LiveTestVision::device = device;
+  auto sim = MakeSim(false, true,
+                     "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "frame_timeout_us = 10000000\n",
+                     "period_us = 1000\n");
+  auto& camera = sim.add<LiveTestVision>("rear_right_camera");
+  auto& observer = sim.add<CameraObserver>("pose_estimator");
+  ASSERT_TRUE(
+      AdvanceLiveUntil(sim, camera, [&] { return device->starts == 1; }));
+  AdvanceLive(sim, camera, 30);
+  // ceil(2 * 1 ms * 60 fps) + 2 slots.
+  constexpr std::size_t kCapacity = 3;
+  for (const std::size_t frames : {std::size_t{2}, kCapacity + 2}) {
+    SCOPED_TRACE(frames);
+    const auto before = sim.latest<VisionStatus>("/rear_right_camera/status");
+    ASSERT_TRUE(before);
+    observer.frames.clear();
+    std::vector<std::uint64_t> stamps;
+    for (std::size_t i = 0; i < frames; ++i) {
+      stamps.push_back(static_cast<std::uint64_t>(sim.now().nanos()) -
+                       10'000'000u + i * 1'000u);
+      device->Emit(static_cast<std::int64_t>(stamps.back()),
+                   talos::vision::TimestampKind::kExposure);
+      // Finished, and not collected: no tick runs between these frames.
+      ASSERT_TRUE(camera.WaitForLiveWorker(60s));
+    }
+    AdvanceLive(sim, camera, 1);
+    const auto kept = std::min(frames, kCapacity);
+    ASSERT_EQ(observer.frames.size(), kept);
+    for (std::size_t i = 0; i < kept; ++i) {
+      EXPECT_EQ(observer.frames[i].observation.sample_time_ns(),
+                stamps[frames - kept + i]);
+    }
+    const auto after = sim.latest<VisionStatus>("/rear_right_camera/status");
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->frames_captured_count() - before->frames_captured_count(),
+              frames);
+    EXPECT_EQ(
+        after->frames_processed_count() - before->frames_processed_count(),
+        kept);
+    EXPECT_EQ(after->frames_dropped_count() - before->frames_dropped_count(),
+              frames - kept);
+  }
 }
 
 // A camera that keeps failing to open logs its reason once, not on every
