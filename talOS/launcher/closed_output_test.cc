@@ -1,12 +1,14 @@
 // The launcher's stdout and stderr readers going away mid-session (an ssh
-// session or a `tee` closing): the session runs on, and what it spawns does
-// not inherit the launcher's indifference to SIGPIPE.
+// session or a `tee` closing): the session runs on, and what it spawns
+// starts with default signal dispositions and an empty mask whatever the
+// launcher's are.
 //
 // Every wait here is on an event -- a pipe's data or its end -- bounded by
 // kHangMs, which only bounds a hang (docs/TESTING.md §6.3).
 
 #include <gtest/gtest.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -14,13 +16,16 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <string_view>
 
+#include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/launcher/launcher.h"
 
 namespace talos::launcher {
@@ -262,26 +267,76 @@ TEST(ClosedOutput, SessionOutlivesItsStdoutReader) {
       << "a stop after the close ended with " << ExitReason(status);
 }
 
-// REQ-OPS-33
-// Ignored signals stay ignored across exec. A launcher that ignores SIGPIPE
-// must not pass that on: a program writing to a pipe whose reader is gone
-// would get EPIPE where it expects to die, and one that ignores write errors
-// would run on. A child that sends itself SIGPIPE dies of it with the default
-// disposition; with SIGPIPE inherited ignored it exits 3.
-TEST(ClosedOutput, SpawnedChildStartsWithDefaultSigpipe) {
-  const auto previous = std::signal(SIGPIPE, SIG_IGN);
-  ASSERT_NE(previous, SIG_ERR);
+std::string Runfile(const char* env) {
   std::string error;
-  const pid_t child =
-      SpawnProcess({"/bin/sh", "-c", "kill -s PIPE $$; exit 3"}, error);
-  std::signal(SIGPIPE, previous);
-  ASSERT_GT(child, 0) << error;
-  int status = 0;
-  while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  const char* location = std::getenv(env);
+  if (!runfiles || location == nullptr) return {};
+  return runfiles->Rlocation(location);
+}
+
+// REQ-OPS-33
+// Ignored signals stay ignored across exec, and the signal mask passes
+// through it. Each row is a way a launcher comes to hold a disposition or
+// mask its programs must not get: it ignores SIGPIPE itself; `nohup` ignores
+// SIGHUP; `&` from a non-interactive shell ignores SIGINT and SIGQUIT (a
+// node that ignores SIGINT no longer stops when the session does); and a
+// caller's blocked signals. With all of them set on the spawning thread, a
+// spawned program must report no signal ignored and none blocked.
+TEST(ClosedOutput, SpawnedChildStartsWithDefaultSignals) {
+  const std::string probe = Runfile("TALOS_SIGNAL_PROBE");
+  ASSERT_FALSE(probe.empty()) << "TALOS_SIGNAL_PROBE";
+  struct Row {
+    const char* why;
+    int signal;
+    bool block;  // Else ignore.
+  };
+  const Row rows[] = {
+      {"the launcher ignores SIGPIPE", SIGPIPE, false},
+      {"nohup", SIGHUP, false},
+      {"& from a non-interactive shell", SIGINT, false},
+      {"& from a non-interactive shell", SIGQUIT, false},
+      {"a caller's blocked signal", SIGUSR1, true},
+      {"a caller's blocked signal", SIGTERM, true},
+  };
+  struct sigaction ignore {};
+  ignore.sa_handler = SIG_IGN;
+  sigemptyset(&ignore.sa_mask);
+  struct sigaction previous[NSIG]{};
+  sigset_t blocked;
+  sigset_t mask;
+  sigemptyset(&blocked);
+  std::string set;
+  for (const Row& row : rows) {
+    set += std::string{"\n  "} + row.why + ": " +
+           (row.block ? "blocks " : "ignores ") + SignalText(row.signal);
+    if (row.block) {
+      sigaddset(&blocked, row.signal);
+    } else {
+      ASSERT_EQ(::sigaction(row.signal, &ignore, &previous[row.signal]), 0);
+    }
   }
+  ASSERT_EQ(::pthread_sigmask(SIG_BLOCK, &blocked, &mask), 0);
+  std::string error;
+  int reader = -1;
+  const pid_t child =
+      SpawnProcess({probe}, error, SpawnOutput::kStdoutPipe, &reader);
+  ::pthread_sigmask(SIG_SETMASK, &mask, nullptr);
+  for (const Row& row : rows) {
+    if (!row.block) ::sigaction(row.signal, &previous[row.signal], nullptr);
+  }
+  ASSERT_GT(child, 0) << error;
+  std::string report;
+  ASSERT_TRUE(AwaitEnd(reader, report)) << report;
+  ::close(reader);
+  const int status = Reap(child);
   FinishProcessGroup(child);
-  EXPECT_TRUE(WIFSIGNALED(status) && WTERMSIG(status) == SIGPIPE)
-      << "the child ended with " << ExitReason(status);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  EXPECT_EQ(report, "ignored:\nblocked:\n")
+      << "spawned from a thread set up so:" << set;
 }
 
 }  // namespace
