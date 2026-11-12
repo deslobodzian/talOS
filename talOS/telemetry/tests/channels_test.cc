@@ -113,6 +113,7 @@ TEST(TelemetryChannels, HostileSchemaIsRefusedNamingTheTopic) {
   using reflection::BaseType;
   constexpr BaseType kNone = BaseType::None;
   std::vector<std::vector<CraftedField>> deep;
+  deep.reserve(19);
   for (std::int32_t i = 0; i < 18; ++i) {
     deep.push_back({{BaseType::Obj, kNone, i + 1, 0}});
   }
