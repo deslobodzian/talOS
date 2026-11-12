@@ -282,6 +282,9 @@ TEST(Wake, AReceiverKilledWithSigkillLeavesNoFileOnceReclaimed) {
       (void)::write(id_pipe[1], &id, sizeof(id));
       ::pause();
     } catch (...) {
+      // No receiver: write no id, so the parent's read returns short and its
+      // ASSERT_EQ on it fails. A forked child must not unwind into gtest.
+      ::_exit(4);
     }
     ::_exit(3);
   }
