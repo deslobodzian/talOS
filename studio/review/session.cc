@@ -229,11 +229,9 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (r.header.kind == static_cast<std::uint16_t>(EventKind::EXIT)) {
       return true;
     }
+    if (!IsValueRecord(r.header.kind)) return true;
     log_file.checkpoints.back().sources |= SourceBit(r.header.source_id);
-    if (r.source == nullptr || !IsValueRecord(r.header.kind) ||
-        r.payload.empty()) {
-      return true;
-    }
+    if (r.source == nullptr || r.payload.empty()) return true;
     FileBuild& build = builds[file];
     const std::uint16_t id = r.header.source_id;
     if (id >= build.topic.size()) {
@@ -423,6 +421,12 @@ namespace {
 using FileSources =
     std::map<std::size_t, std::vector<std::pair<std::uint16_t, std::uint32_t>>>;
 
+void Count(const tlog::LogReader::Record& record, ReadStats* stats) {
+  if (stats == nullptr) return;
+  ++stats->records;
+  stats->bytes += sizeof(tlog::RecordHeader) + record.header.stored_bytes;
+}
+
 FileSources SourcesByFile(const std::vector<Topic>& topics,
                           const std::vector<std::uint32_t>& wanted) {
   FileSources by_file;
@@ -492,7 +496,7 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
     visitor.record = [&](const tlog::LogReader::Record& record) {
       const auto& header = record.header;
       if (FloorSecond(header.event_time_ns) > last_second) return false;
-      if (stats != nullptr) ++stats->records;
+      Count(record, stats);
       const auto source = std::find_if(
           sources.begin(), sources.end(),
           [&](const auto& s) { return s.first == header.source_id; });
@@ -590,7 +594,7 @@ std::vector<Sample> Session::Snapshot(std::int64_t t_ns,
       };
       visitor.record = [&](const tlog::LogReader::Record& record) {
         if (record.offset >= stop) return false;
-        if (stats != nullptr) ++stats->records;
+        Count(record, stats);
         const auto& header = record.header;
         for (Item& item : items) {
           if (item.candidate != second || item.id != header.source_id) continue;

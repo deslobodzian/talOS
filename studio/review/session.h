@@ -15,10 +15,10 @@
 // read window per log), and keeps per log file one Checkpoint per second of
 // event time that holds a record: where that second's first record starts
 // (an offset meaningful only with its file's path) and which of the file's
-// sources recorded that second. That is 24 B per log-file second whatever
-// the record rate, and nothing per record: every later read seeks to a
-// checkpoint (event::log::VisitLog's start_offset) and reads only the
-// seconds it needs, through one window.
+// sources recorded a value (a SEND or MESSAGE record) that second. That is 24 B
+// per log-file second whatever the record rate, and nothing per record: every
+// later read seeks to a checkpoint (event::log::VisitLog's start_offset) and
+// reads only the seconds it needs, through one window.
 //
 // Values. A topic is read from one process's logs, all its segments and
 // restarts: the writer's, whose SEND records hold every message it
@@ -53,7 +53,9 @@ namespace studio::review {
 
 // One second of one log file: the second (event time, floor of ns / 1e9),
 // where its first record starts, and bit i set when source id i (ids from
-// 63 on share bit 63) has a record in it.
+// 63 on share bit 63) has a value record (SEND or MESSAGE) in it. A READ or
+// HANDLER_EXIT record sets no bit: a watcher read every tick holds no new
+// value, so it must not make a snapshot read that second.
 struct Checkpoint {
   std::int64_t second{0};
   std::uint64_t offset{0};
@@ -121,6 +123,7 @@ struct Sample {
 // What a read walked, from its seeks onward.
 struct ReadStats {
   std::uint64_t records{0};  // intact records visited
+  std::uint64_t bytes{0};    // their headers and stored payloads
   std::uint64_t seeks{0};    // reads started at a checkpoint
 };
 
@@ -162,7 +165,11 @@ class Session {
 
   // Every channel of each topic with a record published at or before
   // `t_ns`, from its latest such record, by topic then channel; a topic with
-  // none is absent.
+  // none is absent. Per log file it reads, once each, only the seconds that
+  // hold a value record of one of its topics' sources at or before
+  // floor(t_ns) + 1 s, latest first, stopping per source at the first that
+  // yields its value: normally one second per source however long ago it was
+  // last published (studio/README.md, "Reviewing a session").
   std::vector<Sample> Snapshot(std::int64_t t_ns,
                                ReadStats* stats = nullptr) const;
 
