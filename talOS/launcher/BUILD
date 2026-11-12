@@ -377,7 +377,6 @@ cc_binary(
         ":log_dump",
         ":tlog_to_wpilog",
     ],
-    tags = ["manual"],
     deps = [
         "//talOS/events:events_core",
         "//talOS/events:events_log",
