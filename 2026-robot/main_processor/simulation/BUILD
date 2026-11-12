@@ -115,6 +115,9 @@ py_binary(
     deps = [":accuracy"],
 )
 
+# Over 5 s, e2e lane: three live sessions of the whole graph run 9 s and
+# twice 5 s of scheduled time in real time; the eight estimator replays of
+# them run at once on the virtual clock (under 1 s).
 py_test(
     name = "accuracy_test",
     srcs = ["accuracy_test.py"],

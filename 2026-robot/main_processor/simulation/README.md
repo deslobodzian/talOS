@@ -369,7 +369,9 @@ The report has one row per run and `pose_estimator` backend (`kalman` and
 estimator on the same recorded sessions with
 `launcher --replay-inputs SESSION --only pose_estimator`, on the same
 virtual-clock timer schedule and recorded inputs, so backend rows of one run
-compare identical inputs:
+compare identical inputs. Nothing in a replay depends on host timing, so the
+replays run at once after the last live session, not between them, where
+they would compete with its cameras for the CPU:
 
 - **odometry-only** and **fused** replay the baseline session. Only
   **odometry-only** withholds camera observations: it keeps the estimator's

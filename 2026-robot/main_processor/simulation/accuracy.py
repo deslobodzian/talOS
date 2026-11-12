@@ -1,6 +1,7 @@
 """Run a physical robot session and score fused/replayed poses via log_dump."""
 
 from bisect import bisect_left, bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import math
@@ -554,6 +555,7 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
     env.pop("BUILD_WORKSPACE_DIRECTORY", None)
     live_backend = configured_backend(config)
     results = {"metrics": {}, "timing": {}}
+    replays = []  # (run, backend, session, estimator config)
     with tempfile.TemporaryDirectory(prefix="accuracy-launcher-") as temporary:
         cwd = Path(temporary)
         (cwd / "bazel-bin").symlink_to(root, target_is_directory=True)
@@ -594,37 +596,50 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                                    session / "pose_estimator.tlog", env)
             live_name = "fused-live" if name == "fused" else name
             results["timing"][live_name] = camera_timing(records)
-            replays = [(name, backend, scenario_config(
-                config, min_yaw_std_rad, lag_us, offset_us, backend))
-                for backend in backends]
+            replays.extend(
+                (name, backend, session, scenario_config(
+                    config, min_yaw_std_rad, lag_us, offset_us, backend))
+                for backend in backends)
             if name == "fused":
                 results["metrics"][("fused-live", live_backend)] = score(records)
                 results["cameras"] = score_cameras(records)
                 replays.extend(
-                    ("odometry-only", backend, replay_config(config, backend))
+                    ("odometry-only", backend, session,
+                     replay_config(config, backend))
                     for backend in backends)
-            # Every backend and odometry-only run on the same virtual-clock
-            # schedule and inputs. Comparing live fusion with offline odometry
-            # also compares host scheduling: live polling can skip different
-            # drivetrain samples and deliver cameras at different
-            # odometry-buffer positions.
-            for run, backend, text in replays:
-                label = f"{run}-{backend}-replay"
-                replay_config_path = destination / f"{label}.toml"
-                replay_config_path.write_text(text, encoding="utf-8")
-                run_launcher(
-                    launcher,
-                    ["--config", str(replay_config_path),
-                     "--replay-inputs", str(session),
-                     "--only", "pose_estimator", "--session-id", session.name,
-                     "--output-dir", str(destination / label)],
-                    cwd, env, destination / f"{label}.txt", 90)
-                # Input replay writes a node log, not a session manifest.
-                replayed = dump_records(
-                    dumper, cameras, drivetrain,
-                    destination / label / session.name / "pose_estimator.tlog",
-                    env)
-                results["metrics"][(run, backend)] = score(replayed)
+
+        # Every backend and odometry-only run on the same virtual-clock
+        # schedule and inputs. Comparing live fusion with offline odometry
+        # also compares host scheduling: live polling can skip different
+        # drivetrain samples and deliver cameras at different
+        # odometry-buffer positions. Nothing in a replay depends on host
+        # timing, so they run at once, after the live sessions (whose camera
+        # throughput they would otherwise share the CPU with), each in its
+        # own shared-memory namespace: the launcher refuses a second launch
+        # in a namespace that one holds.
+        def replay(run, backend, session, text):
+            label = f"{run}-{backend}-replay"
+            replay_config_path = destination / f"{label}.toml"
+            replay_config_path.write_text(text, encoding="utf-8")
+            replay_env = dict(env, TALOS_SHM_NAMESPACE=f"accuracy-{uuid.uuid4().hex}")
+            run_launcher(
+                launcher,
+                ["--config", str(replay_config_path),
+                 "--replay-inputs", str(session),
+                 "--only", "pose_estimator", "--session-id", session.name,
+                 "--output-dir", str(destination / label)],
+                cwd, replay_env, destination / f"{label}.txt", 90)
+            # Input replay writes a node log, not a session manifest.
+            replayed = dump_records(
+                dumper, [session / f"{camera}.tlog" for camera in CAMERAS],
+                session / "drivetrain.tlog",
+                destination / label / session.name / "pose_estimator.tlog",
+                replay_env)
+            return (run, backend), score(replayed)
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+            for key, metrics in pool.map(lambda args: replay(*args), replays):
+                results["metrics"][key] = metrics
     results["runtime_s"] = time.monotonic() - started
     (destination / "report.md").write_text(markdown(results) + "\n", encoding="utf-8")
     return results, destination
