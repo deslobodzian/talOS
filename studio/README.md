@@ -215,8 +215,12 @@ SEND records, else from the first reader's MESSAGE records. Every time is
 nanoseconds on the recording's monotonic clock (the merge's event time), and
 every value carries its publication time; `origin_wall_ns + t_ns` is the
 wall-clock time. A damaged log is read and warned about as `log_dump` reads
-it; a log of another format version is refused (422) naming the file and
-both versions.
+it, a record claiming more payload than its source declares being damage
+([dispatch log](../talOS/events/README.md)); a topic whose recorded schema
+the channel model refuses ([telemetry](../talOS/telemetry/README.md#automatic-channels-and-units))
+is not reviewed and is named on stderr; a log of another format version, or
+a session with no intact record, is refused (422) naming the file, and only
+that session's requests fail.
 
 Opening a session streams it once, merged, and keeps per log file one
 24-byte checkpoint per second of event time that holds records (where that

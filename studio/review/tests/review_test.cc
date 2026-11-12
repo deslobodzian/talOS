@@ -21,6 +21,8 @@
 #include <utility>
 #include <vector>
 
+#include "flatbuffers/flatbuffers.h"
+#include "flatbuffers/reflection_generated.h"
 #include "nlohmann/json.hpp"
 #include "review_test/review_message_descriptor.h"
 #include "review_test/review_message_generated.h"
@@ -444,6 +446,96 @@ TEST_F(ReviewTest, UnknownLogVersionIsRefusedNamingFileAndVersions) {
         << response.body;
   }
   std::filesystem::remove_all(dir);
+}
+
+// A reflection schema whose one struct, "t.Loop", holds a field of its own
+// type: one a crafted log can carry, never flatc.
+std::string SelfContainingSchema() {
+  flatbuffers::FlatBufferBuilder fbb;
+  const auto type = reflection::CreateType(fbb, reflection::BaseType::Obj,
+                                           reflection::BaseType::None, 0, 0, 1);
+  std::vector<flatbuffers::Offset<reflection::Field>> fields{
+      reflection::CreateFieldDirect(fbb, "inner", type, 0, 0)};
+  std::vector<flatbuffers::Offset<reflection::Object>> objects{
+      reflection::CreateObjectDirect(fbb, "t.Loop", &fields, true, 1, 1)};
+  std::vector<flatbuffers::Offset<reflection::Enum>> enums;
+  reflection::FinishSchemaBuffer(
+      fbb, reflection::CreateSchemaDirect(fbb, &objects, &enums));
+  return {reinterpret_cast<const char*>(fbb.GetBufferPointer()), fbb.GetSize()};
+}
+
+// Guards that a crafted log (a library may come from a USB stick) fails only
+// its own session: "huge" holds one record claiming 4 GiB of payload with a
+// checksum its author computed, so it holds no intact record and is refused
+// (422) without allocating what the record claims; "loop" sends a topic
+// whose schema contains itself, which is not reviewed (no channels) instead
+// of recursing until the stack overflows. The server answers s1 throughout.
+// REQ-OPS-41
+TEST_F(ReviewTest, CraftedLogFailsOnlyItsSession) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  const auto write = [](const std::string& dir,
+                        talos::event::Registration source,
+                        std::span<const std::byte> payload) {
+    std::filesystem::create_directories(dir);
+    source.id = 2;
+    source.kind = SourceKind::SENDER;
+    tlog::LogWriter writer{dir + "/crafted.tlog", "crafted",
+                           tlog::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({source}, MonotonicTime::from_nanos(kStartNs));
+    if (!payload.empty()) {
+      Context tick{};
+      tick.dispatch_index = 1;
+      tick.event_time = tick.now = MonotonicTime::from_nanos(kStartNs);
+      writer.send(tick, 2, payload, 0, 1);
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  };
+
+  talos::event::Registration shot;
+  shot.name = "/huge/state";
+  shot.message_bytes = sizeof(review_test::Shot);
+  {
+    using D = talos::Descriptor<review_test::Shot>;
+    shot.schema = {std::string{D::kName}, D::kHash,
+                   std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                               D::kBfbs.size()}};
+  }
+  write(Library() + "/huge", shot, {});
+  tlog::RecordHeader huge{};
+  huge.magic = tlog::RECORD_MAGIC;
+  huge.kind = static_cast<std::uint16_t>(EventKind::SEND);
+  huge.source_id = 2;
+  huge.dispatch_index = 1;
+  huge.event_time_ns = huge.now_ns = huge.publish_time_ns = kStartNs;
+  huge.payload_bytes = 0xFFFF'FFFFu;
+  huge.crc32 = tlog::crc32(std::span<const std::byte>{
+      reinterpret_cast<const std::byte*>(&huge), sizeof huge});
+  std::ofstream{Library() + "/huge/crafted.tlog",
+                std::ios::binary | std::ios::app}
+      .write(reinterpret_cast<const char*>(&huge), sizeof huge);
+
+  talos::event::Registration loop;
+  loop.name = "/loop/state";
+  loop.message_bytes = 1;
+  loop.schema = {"t.Loop", 1, SelfContainingSchema()};
+  const std::byte one{1};
+  write(Library() + "/loop", loop, std::span{&one, 1});
+
+  Review review{Library(), 1u << 20};
+  EXPECT_EQ(review.Get("/review/huge/bounds.json", "").status, 422);
+  const Response channels = review.Get("/review/loop/channels.json", "");
+  ASSERT_EQ(channels.status, 200) << channels.body;
+  EXPECT_EQ(channels.body.find("loop/state"), std::string::npos)
+      << channels.body;
+  EXPECT_EQ(review.Get("/review/s1/bounds.json", "").status, 200);
+  EXPECT_EQ(review.Get("/review/sessions.json", "").status, 200);
+  std::filesystem::remove_all(Library() + "/huge");
+  std::filesystem::remove_all(Library() + "/loop");
 }
 
 // The golden responses (testdata/golden), by file name, and the request each
