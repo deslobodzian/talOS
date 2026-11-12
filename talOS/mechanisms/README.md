@@ -13,9 +13,38 @@ does the control, homing, readiness and fault handling.
 The layer sits between `talOS/devices` and robot code and uses only the
 devices layer's public API (`Motor`, `DigitalInput`, `CANcoder`,
 `DriverStation`, `robot_enabled`). The messages are `//talOS/msgs:control`.
-Python has no binding yet (TODO.md MECH-2); a Python robot uses a C++ node
-built on these classes through `TALOS_EXPORT_NODE` and `talos.cpp_node`, as
-`examples/superstructure/py/` does.
+A Python node composes the same classes through `talOS/node_api`'s C ABI as
+`talos.mechanisms.PositionMechanism`, `VelocityMechanism` and
+`RollerWithSensor` (`//talOS/python:mechanisms`, enums `PositionPhase`,
+`PositionFault`, `VelocityPhase`, `RollerCommand`, `RollerPhase`): the same
+method names, the getters as properties, `state()` returning the `control`
+message. A Python robot can also host a whole C++ node built on them through
+`TALOS_EXPORT_NODE` and `talos.cpp_node`, as `examples/superstructure/py/`
+does.
+
+```python
+from control.PositionTarget import PositionTarget
+from control.PositionState import PositionState
+import talos
+from talos.mechanisms import PositionMechanism
+
+class Wrist:
+    def __init__(self, node):
+        self.wrist = PositionMechanism(node, "wrist")
+        self.target = talos.Target(node, PositionTarget)
+        self.state = node.publish(PositionState, "state")
+
+    def update(self):
+        t = self.target.get()
+        if t is not None:
+            self.wrist.set_goal(t.position_rot, t.feedforward_v)
+        else:
+            self.wrist.stop()
+        self.wrist.update()
+        self.state.send(self.wrist.state())
+```
+
+Build it with `talos_py_node(..., deps = ["//talOS/python:mechanisms"])`.
 
 ## Using one
 
@@ -252,4 +281,6 @@ of unknown age, and reached before the clock mapping converges, REQ-DEV-22), spi
 and a held eject running once while release-then-press runs again. Downward limit-switch homing and the
 travel clamp are also tested through `examples/superstructure`'s elevator.
 The tests carry the tags of REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and
-REQ-SAFE-38 (`RollerWithSensor`).
+REQ-SAFE-38 (`RollerWithSensor`). `//talOS/python:mechanisms_test` proves
+only that `talos.mechanisms` reaches these classes (requests, state, errors,
+a stale lane and a disable); the behaviour is proven here once.

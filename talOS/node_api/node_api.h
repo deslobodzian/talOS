@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 30u
+#define TALOS_NODE_ABI_VERSION 31u
 
 enum {
   TALOS_OK = 0,
@@ -379,6 +379,116 @@ int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
                                        int32_t neutral);
 int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming);
 int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming);
+
+// --- mechanisms (talOS/mechanisms) -----------------------------------------
+//
+// PositionMechanism, VelocityMechanism and RollerWithSensor, each opened by
+// name on a node (call while the factory runs; the mechanism lives as long
+// as the node) and addressed by the index the open returns. Each call is the
+// C++ method of the same name: requests (set_goal, hold, stop, clear_fault)
+// and update fail, naming the mechanism, outside the node's update(), and
+// the open fails, naming the key, on a missing or invalid parameter. *_state
+// fills what the getters return as of the last update().
+
+enum {  // talos::mechanisms::PositionPhase
+  TALOS_POSITION_PHASE_UNHOMED = 0,
+  TALOS_POSITION_PHASE_HOMING = 1,
+  TALOS_POSITION_PHASE_READY = 2,
+  TALOS_POSITION_PHASE_MOVING = 3,
+  TALOS_POSITION_PHASE_AT_GOAL = 4,
+  TALOS_POSITION_PHASE_FAULTED = 5,
+};
+enum {  // talos::mechanisms::PositionFault
+  TALOS_POSITION_FAULT_NONE = 0,
+  TALOS_POSITION_FAULT_HOMING_TIMEOUT = 1,
+  TALOS_POSITION_FAULT_HOMING_STALL = 2,
+  TALOS_POSITION_FAULT_SWITCH_STUCK = 3,
+  TALOS_POSITION_FAULT_STALL = 4,
+  TALOS_POSITION_FAULT_MOVE_TIMEOUT = 5,
+};
+enum {  // talos::mechanisms::VelocityPhase
+  TALOS_VELOCITY_PHASE_STOPPED = 0,
+  TALOS_VELOCITY_PHASE_SPINNING_UP = 1,
+  TALOS_VELOCITY_PHASE_AT_SPEED = 2,
+};
+enum {  // talos::mechanisms::RollerCommand
+  TALOS_ROLLER_COMMAND_IDLE = 0,
+  TALOS_ROLLER_COMMAND_INTAKE = 1,
+  TALOS_ROLLER_COMMAND_EJECT = 2,
+  TALOS_ROLLER_COMMAND_FEED = 3,
+};
+enum {  // talos::mechanisms::RollerPhase
+  TALOS_ROLLER_PHASE_IDLE = 0,
+  TALOS_ROLLER_PHASE_INTAKING = 1,
+  TALOS_ROLLER_PHASE_HOLDING = 2,
+  TALOS_ROLLER_PHASE_EJECTING = 3,
+  TALOS_ROLLER_PHASE_FEEDING = 4,
+};
+
+typedef struct TalosPositionMechanismState {
+  int32_t phase;  // TALOS_POSITION_PHASE_*
+  int32_t fault;  // TALOS_POSITION_FAULT_*
+  int32_t homed;
+  int32_t at_goal;
+  int32_t driving;
+  int32_t connected;
+  double position_rot;
+  double position_units;
+  double velocity_rps;
+  double goal_rot;
+  double gravity_v;
+  double tolerance_rot;
+} TalosPositionMechanismState;
+int64_t talos_position_mechanism_open(TalosNode* node, const char* name);
+int32_t talos_position_mechanism_set_goal(TalosNode* node, int64_t index,
+                                          double position_rot,
+                                          double feedforward_v);
+int32_t talos_position_mechanism_set_goal_units(TalosNode* node, int64_t index,
+                                                double position_units,
+                                                double feedforward_v);
+int32_t talos_position_mechanism_hold(TalosNode* node, int64_t index,
+                                      double feedforward_v);
+int32_t talos_position_mechanism_stop(TalosNode* node, int64_t index);
+int32_t talos_position_mechanism_update(TalosNode* node, int64_t index);
+int32_t talos_position_mechanism_clear_fault(TalosNode* node, int64_t index);
+int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
+                                       TalosPositionMechanismState* out);
+
+// current_a is VelocityMechanism::state()'s (stator amps).
+typedef struct TalosVelocityMechanismState {
+  int32_t phase;  // TALOS_VELOCITY_PHASE_*
+  int32_t at_speed;
+  int32_t driving;
+  int32_t connected;
+  double velocity_rps;
+  double goal_rps;
+  double commanded_rps;
+  double current_a;
+} TalosVelocityMechanismState;
+int64_t talos_velocity_mechanism_open(TalosNode* node, const char* name);
+int32_t talos_velocity_mechanism_set_goal(TalosNode* node, int64_t index,
+                                          double velocity_rps,
+                                          double feedforward_v);
+int32_t talos_velocity_mechanism_stop(TalosNode* node, int64_t index);
+int32_t talos_velocity_mechanism_update(TalosNode* node, int64_t index);
+int32_t talos_velocity_mechanism_state(TalosNode* node, int64_t index,
+                                       TalosVelocityMechanismState* out);
+
+typedef struct TalosRollerWithSensorState {
+  int32_t phase;  // TALOS_ROLLER_PHASE_*
+  int32_t has_piece;
+  int32_t sensor_connected;
+  int32_t driving;
+  double output_v;
+} TalosRollerWithSensorState;
+int64_t talos_roller_with_sensor_open(TalosNode* node, const char* name);
+// `command` is a TALOS_ROLLER_COMMAND_*; another value is an error.
+int32_t talos_roller_with_sensor_set_goal(TalosNode* node, int64_t index,
+                                          int32_t command);
+int32_t talos_roller_with_sensor_stop(TalosNode* node, int64_t index);
+int32_t talos_roller_with_sensor_update(TalosNode* node, int64_t index);
+int32_t talos_roller_with_sensor_state(TalosNode* node, int64_t index,
+                                       TalosRollerWithSensorState* out);
 
 // --- test harness (libtalos_node_testing.so only) ------------------------
 

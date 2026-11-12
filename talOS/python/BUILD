@@ -42,6 +42,37 @@ py_library(
     deps = [":talos"],
 )
 
+# `talos.mechanisms`: the talOS/mechanisms classes, through libtalos_node.
+py_library(
+    name = "mechanisms",
+    srcs = ["talos/mechanisms.py"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":talos",
+        "//talOS/msgs:control_py",
+    ],
+)
+
+# talos.mechanisms reaches the C++ classes: marshalling, stale and disabled
+# paths; behaviour is //talOS/mechanisms' tests.
+py_test(
+    name = "mechanisms_test",
+    size = "small",
+    srcs = ["mechanisms_test.py"],
+    legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":mechanisms",
+        ":testing",
+        "//talOS/msgs:control_py",
+    ],
+)
+
 talos_messages(
     name = "test_messages",
     srcs = ["testdata/talos_test_message.fbs"],
