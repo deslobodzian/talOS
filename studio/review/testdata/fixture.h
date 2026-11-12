@@ -11,7 +11,9 @@
 //       hardware Command), each published 0.5 ms after its tick; the last
 //       shot's position is NaN, and shot k's shot_id is ShotId(k), past
 //       2^53; the first tick of the first run alone also sends
-//       /shooter/status (review_test.Status, boot_id kBootId)
+//       /shooter/status (review_test.Status, boot_id kBootId); tick
+//       kFailedShot also logs a failed send (aux 2) of its shot with
+//       position_m -1, after the accepted one
 //   observer.tlog                          the reader, whose loop started
 //                                          0.5 s before the first record
 //       every 5th /shooter/state, received 1 ms after its publication, and
@@ -34,6 +36,7 @@ inline constexpr std::int64_t kStartNs = 1'000'000'000'000;  // 1000 s
 inline constexpr std::uint64_t kSessionId = 0x5E55;
 inline constexpr int kDamagedPacket = 40;
 inline constexpr int kLastShot = 499;
+inline constexpr int kFailedShot = 200;
 inline constexpr std::int64_t kObserverOriginNs = -500'000'000;
 inline constexpr std::int64_t kStartWallNs = 1'767'225'600'000'000'000;
 inline constexpr std::uint64_t kBootId = 42;

@@ -75,6 +75,15 @@ class PayloadBounds {
 };
 }  // namespace detail
 
+// Whether `header` is a SEND its transport accepted: LogWriter::send logs a
+// refused or failed send too, its aux the loop's SendStatus (0 OK; the
+// bridge logs its own write the same way). Only an accepted send's payload
+// is a value a reader could have received.
+inline bool IsAcceptedSend(const RecordHeader& header) noexcept {
+  return header.kind == static_cast<std::uint16_t>(EventKind::SEND) &&
+         header.aux == 0;
+}
+
 // One line naming what `damage` skipped, offsets included; empty if clean.
 std::string DescribeDamage(const LogDamage& damage);
 
