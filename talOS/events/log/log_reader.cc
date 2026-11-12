@@ -590,6 +590,8 @@ std::size_t WindowedLogReader::record_count() const noexcept {
 
 bool WindowedLogReader::next(LogReader::Record& out) {
   State& state = *state_;
+  // The constructor's last step makes the source; a reader always has one.
+  if (!state.source.has_value()) return false;
   FileSource& source = *state.source;
   const std::optional<RecordHeader> record = locate(
       source, state.cursor, state.scan_payload_bytes, state.damage, state.last);
@@ -617,7 +619,7 @@ void WindowedLogReader::seek(std::uint64_t offset) {
   State& state = *state_;
   // The fast path of locate(): a record next() would accept without a scan.
   RecordHeader header{};
-  if (offset < state.records_offset ||
+  if (!state.source.has_value() || offset < state.records_offset ||
       !intact_at(*state.source, offset, kAnyPayload, header)) {
     throw std::invalid_argument(
         "LogReader: " + state.path + ": no intact record starts at byte " +
