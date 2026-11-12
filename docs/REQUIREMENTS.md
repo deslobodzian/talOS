@@ -219,6 +219,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-19 | The `ReadinessGate` reports ready only when a fresh, valid, converged, in-range and turret-reachable solution, a robot slower than its speed and spin limits and every measured error within tolerance have held on `settle_tick_count` consecutive caller ticks; an unset, NaN, stale or failing input, or a skipped tick, withholds or drops readiness at once, reporting the first failing reason. | P1 | AIMR "Readiness" | `ReadinessGate::Update` result and reason | unit |
 | REQ-DEV-20 | `MakeStraightLine` produces a rest-to-rest straight move whose speed and acceleration stay within its limits, whose translation and heading (turning the short way) reach the end pose together at rest at the total time, which handles zero-length moves and pure rotations, and which refuses non-finite or invalid input or too little reserved space by leaving the trajectory empty, without throwing or allocating. | P1 | TRAJR "Straight lines" | `StraightLineResult` error, sampled `Trajectory` | unit |
 | REQ-DEV-22 | `VelocityMechanism::at_speed` is false unless the velocity sample it was judged on is no older than four of that motor's status periods at its State; an unknown age reads not ready. | P1 | MECHR | `at_speed` at the bound and one microsecond past it | unit |
+| REQ-DEV-23 | `new_robot <name> --mechanism <m> --lang cpp\|py` writes a robot beside `2026-robot/` (config with teleop and telemetry, generated manifest, `manifest_sync_test`, `talos_graph_test`, `talos_bundle`, its first mechanism) that passes `--describe-only` and its own tests as generated. `sim.sh --config` runs any robot config and refuses a stale manifest, naming the regenerate command. | P1 | ARCH "Where a new thing goes" | generated tree; `--describe-only` exit status | integration |
 
 ## Package scope
 
@@ -260,5 +261,5 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
-| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12 |
+| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23 |
 

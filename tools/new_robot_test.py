@@ -41,7 +41,7 @@ def workspace(tmp):
 
 
 class NewRobotTest(unittest.TestCase):
-    # REQ-DEV-01
+    # REQ-DEV-23
     def test_generated_robot_passes_the_graph_lint(self):
         with tempfile.TemporaryDirectory() as tmp:
             work, launcher, env = workspace(tmp)
@@ -83,7 +83,7 @@ class NewRobotTest(unittest.TestCase):
                 sorted(n["name"] for n in graph["nodes"]),
                 ["gripper", "hardware_node", "telemetry", "teleop"])
 
-    # REQ-DEV-01
+    # REQ-DEV-23
     def test_refuses_a_bad_name_or_an_existing_directory(self):
         with tempfile.TemporaryDirectory() as root:
             for name in ("My_robot", "my-robot", "hw", "robot_", "sys"):
