@@ -1772,6 +1772,7 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
 // committed, even when the stop lands between the writer's read of the
 // hand-off count and its stop check: ~State hands the last chunk over and
 // then stops, so the writer must not take the stop for "nothing left".
+// REQ-OPS-44
 TEST(LogBackgroundWriter, StopAfterTheWritersHandOffCheckKeepsTheLastChunk) {
   const auto path = TempPath("stop_after_check");
   constexpr std::uint64_t kRecords = 5;
