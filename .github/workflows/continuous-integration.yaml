@@ -613,6 +613,10 @@ jobs:
       # tools/lint_test_time_allowlist.txt, which may only shrink.
       run: python3 tools/lint_test_time.py
 
+    - name: Every relative markdown link and anchor resolves
+      if: ${{ !cancelled() }}
+      run: python3 tools/check_links.py
+
   gate:
     name: CI gate
     # The one check to require: it fails unless every job above succeeded.

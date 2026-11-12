@@ -116,3 +116,16 @@ py_test(
     legacy_create_init = False,
     main = "lint_test_time_test.py",
 )
+
+# python3 tools/check_links.py (CI: the lint job)
+# Every relative markdown link and #anchor in the tracked files resolves.
+py_test(
+    name = "check_links_test",
+    size = "small",
+    srcs = [
+        "check_links.py",
+        "check_links_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_links_test.py",
+)

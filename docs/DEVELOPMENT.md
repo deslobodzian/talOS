@@ -88,8 +88,8 @@ t=$(bazel query --keep_going 'tests(rdeps(//..., set(//touched/package/...))) ex
 `--keep_going` is needed because some external packages cannot load on every
 host; the query then exits 3 with a usable partial result. A change with no
 affected tests (docs only) skips the test step: rung 2 is then
-`--describe-only` if a config changed and a check that every changed
-relative link resolves.
+`--describe-only` if a config changed and `python3 tools/check_links.py`
+(every relative link and anchor resolves).
 
 A local macOS run does not exercise the Linux paths (`epoll`, glibc
 allocation counting, `clang-tidy`): say so in `Tests:`; such a change is
