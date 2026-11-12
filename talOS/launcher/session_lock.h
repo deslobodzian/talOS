@@ -1,14 +1,20 @@
 #pragma once
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <utility>
 
 #include "talOS/introspection/lock_file.h"
@@ -155,6 +161,148 @@ class SessionLock {
 
   int fd_{-1};
   std::string path_;
+};
+
+// The file in a session directory whose lock the launch writing that
+// directory holds while it runs (SessionDirectoryLock).
+inline constexpr std::string_view kSessionDirectoryLockFile = "session.lock";
+
+// Whether a session directory's launch is still running, read from the
+// directory itself. SessionLock is per shared-memory namespace, and launches
+// in different namespaces (a simulation beside a deployed or bench session,
+// two developers' simulations) may write one log root, so holding it says
+// nothing about another namespace's sessions there. Every launch holds an
+// exclusive flock(2) on its session directory's kSessionDirectoryLockFile
+// from before the directory holds anything until the launch ends, and
+// retention (launcher_retention.cc) removes a directory only while it holds
+// that lock itself.
+//
+// flock, not a record lock: it belongs to the open file description, so a
+// probe from another descriptor conflicts with it even in the holder's own
+// process, and closing some other descriptor of the file does not drop it.
+// The descriptor is close-on-exec (introspect::OpenLockFile) and a node's
+// guardian closes every descriptor, so only the launcher holds it: the
+// kernel releases it when the launcher exits or is killed, and nothing the
+// launcher started (whose guardian SIGKILLs its process group when the
+// launcher dies) or a helper such a process daemonized keeps a dead session
+// from being removed.
+class SessionDirectoryLock {
+ public:
+  // Creates a directory and its parents, setting the error when it cannot
+  // (LauncherOptions::create_session_directory).
+  using CreateDirectory =
+      std::function<void(const std::filesystem::path&, std::error_code&)>;
+
+  // Creates `dir` with `create` (nothing when it exists) and takes its lock,
+  // or returns nullopt with `error` set: create's error, the lock file's
+  // open error, or std::errc::device_or_resource_busy when another launch
+  // (one given the same --session-id) holds it. Retention removing `dir`
+  // meanwhile holds the lock and moves `dir` away before removing it, so an
+  // attempt that finds the lock held, or that locked a file the path no
+  // longer names, creates `dir` again and retries: when this returns the
+  // lock, `dir` is the directory the launch writes, and no retention can
+  // remove it while the lock is held.
+  static std::optional<SessionDirectoryLock> Create(
+      const std::filesystem::path& dir, const CreateDirectory& create,
+      std::error_code& error) {
+    const std::string path = (dir / kSessionDirectoryLockFile).string();
+    constexpr int kAttempts = 100;
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+      error.clear();
+      create(dir, error);
+      if (error) return std::nullopt;
+      const int fd = introspect::OpenLockFile(path, O_RDONLY);
+      if (fd < 0) {
+        error = {errno, std::generic_category()};
+        // Moved away by retention since it was created: create it again.
+        if (errno == ENOENT) continue;
+        return std::nullopt;
+      }
+      if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        if (introspect::LockFileIsCurrent(fd, path)) {
+          return SessionDirectoryLock{fd};
+        }
+        ::close(fd);
+        continue;
+      }
+      const int code = errno;
+      ::close(fd);
+      if (code != EWOULDBLOCK && code != EINTR) {
+        error = {code, std::generic_category()};
+        return std::nullopt;
+      }
+      // Retention holds it for the instant it takes to move `dir` away.
+      error = std::make_error_code(std::errc::device_or_resource_busy);
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return std::nullopt;
+  }
+
+  // Whether a launch (or a retention removing it) holds `dir`'s lock now.
+  // False when `dir` holds no lock file: a launch holds one from before its
+  // directory holds anything. Creates nothing.
+  static bool Held(const std::filesystem::path& dir) {
+    const int fd = ::open((dir / kSessionDirectoryLockFile).c_str(),
+                          O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return false;
+    const bool held =
+        ::flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    ::close(fd);
+    return held;
+  }
+
+  // Takes `dir`'s lock to remove `dir`, creating the lock file when it is
+  // absent (a session recorded before launches held one). Returns nullopt
+  // with `held` set when a launch, or another retention, holds it or `dir`
+  // has become another directory meanwhile; with `error` set when the lock
+  // file cannot be opened or `dir` is gone.
+  static std::optional<SessionDirectoryLock> TakeIdle(
+      const std::filesystem::path& dir, bool& held, std::error_code& error) {
+    held = false;
+    const std::string path = (dir / kSessionDirectoryLockFile).string();
+    const int fd = introspect::OpenLockFile(path, O_RDONLY);
+    if (fd < 0) {
+      error = {errno, std::generic_category()};
+      return std::nullopt;
+    }
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+      const int code = errno;
+      ::close(fd);
+      held = code == EWOULDBLOCK;
+      if (!held) error = {code, std::generic_category()};
+      return std::nullopt;
+    }
+    if (!introspect::LockFileIsCurrent(fd, path)) {
+      ::close(fd);
+      struct stat named {};
+      held = ::lstat(path.c_str(), &named) == 0;
+      if (!held)
+        error = std::make_error_code(std::errc::no_such_file_or_directory);
+      return std::nullopt;
+    }
+    return SessionDirectoryLock{fd};
+  }
+
+  ~SessionDirectoryLock() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  SessionDirectoryLock(const SessionDirectoryLock&) = delete;
+  SessionDirectoryLock& operator=(const SessionDirectoryLock&) = delete;
+  SessionDirectoryLock(SessionDirectoryLock&& other) noexcept
+      : fd_{std::exchange(other.fd_, -1)} {}
+  SessionDirectoryLock& operator=(SessionDirectoryLock&& other) noexcept {
+    if (this != &other) {
+      if (fd_ >= 0) ::close(fd_);
+      fd_ = std::exchange(other.fd_, -1);
+    }
+    return *this;
+  }
+
+ private:
+  explicit SessionDirectoryLock(int fd) : fd_{fd} {}
+
+  int fd_{-1};
 };
 
 }  // namespace talos::launcher

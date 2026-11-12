@@ -152,28 +152,33 @@ class Launcher {
   // A session that cannot be read or removed (another user's, unreadable,
   // removed meanwhile) is passed over, never counted against the others:
   // retention never stops a launch.
-  // Only a launch that may prune removes anything. Pruning::kLocked holds
-  // the session lock: that proves no other launch in this shared-memory
-  // namespace is recording, so a manifest without an end_wall_ns is one
-  // whose launcher died (a power loss), not a live one. Pruning::kUnlocked
-  // found the lock file absent with no room to create it, so no launcher
-  // holds the lock it would take, but one in the same state may take it
-  // while this lists: it removes only sessions whose manifest records an
-  // end_wall_ns, and no abandoned launch (which may be that launch
-  // describing). --describe-only and --replay-inputs (Pruning::kNone) run
-  // beside a live session and only get the budget.
-  // Runs before the new session's directory exists, so a full disk does not
-  // stop it; `record` gets kRetentionRecordFile's lines, which Run writes
-  // once that directory exists (CreateSessionDirectory).
+  // A directory whose lock a launch holds (SessionDirectoryLock), in any
+  // shared-memory namespace, is passed over: neither counted nor read, and
+  // recorded. Any other is removed only while retention holds that lock
+  // itself, after moving the directory out of its session's path, so a
+  // manifest without an end_wall_ns is one whose launcher died (a power
+  // loss, a kill), not a live one. Directories such a move left behind when
+  // a removal was cut short are removed.
+  // Only a launch that may prune removes anything: Pruning::kLocked holds
+  // the session lock. Pruning::kUnlocked found the lock file absent with no
+  // room to create it, so no launcher holds the lock it would take, but one
+  // in the same state may take it while this lists: it removes only
+  // sessions whose manifest records an end_wall_ns, and no abandoned launch
+  // (which may be that launch describing). --describe-only and --replay-inputs
+  // (Pruning::kNone) run beside a live session and only get the budget. Runs
+  // before the new session's directory exists, so a full disk does not stop it;
+  // `record` gets kRetentionRecordFile's lines, which Run writes once that
+  // directory exists (CreateSessionDirectory).
   uint64_t ApplyRetention(const config::RobotConfig& config, std::size_t roster,
                           Pruning pruning, std::string& record);
 
-  // Creates the new session's directory, then writes retention's `record`
-  // in it (kRetentionRecordFile, synced; none when empty). When the
-  // directory cannot be created, says why and returns false: nothing is
-  // started. When the disk is full after a launch that `pruned` removed what
-  // it could, that names the free space and the floor a new session of
-  // `roster` members may need (FreeFloor).
+  // Creates the new session's directory and takes its lock
+  // (SessionDirectoryLock::Create, held in session_directory_), then writes
+  // retention's `record` in it (kRetentionRecordFile, synced; none when
+  // empty). When the directory cannot be created or locked, says why and
+  // returns false: nothing is started. When the disk is full after a launch
+  // that `pruned` removed what it could, that names the free space and the
+  // floor a new session of `roster` members may need (FreeFloor).
   bool CreateSessionDirectory(const config::RobotConfig& config,
                               std::size_t roster, bool pruned,
                               const std::string& record);
@@ -373,6 +378,10 @@ class Launcher {
   std::optional<ChildOutput> output_;
   // Held by Run for the session, refreshed by Supervise; null without one.
   const SessionLock* session_lock_{nullptr};
+  // The new session directory's lock (CreateSessionDirectory), held until
+  // Run returns, so no launch's retention, in any shared-memory namespace,
+  // removes the directory while this launch writes it.
+  std::optional<SessionDirectoryLock> session_directory_;
   // A critical member's first run's live endpoints differed from its probe
   // and --allow-graph-errors was not given (CheckEndpoints): Supervise stops
   // the session and Run returns 1.
