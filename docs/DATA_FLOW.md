@@ -447,12 +447,21 @@ clients (a client that joins or drains is offered its turn by one), and each
 pass starts just after the last client sent anything, so the shared bucket is
 granted in rotation: of the clients able to take a send, none is sent to
 twice before every other one has been sent to once
-(`ClientRotation` in `studio/bridge/telemetry.h`). A client that still has output
-buffered is sent nothing; each client's kernel send buffer is set to
-**16 KiB** (`kClientSendBufferBytes` in `studio/bridge/main.cc`; Linux
-accounts twice that), what the whole budget sends in 100 ms, so a client
-that stops reading backs up after that much instead of after the 4 MiB
-Linux autotuning reached, about 100 s of a 40,000 B/s share. HTTP snapshots and static files are outside this budget.
+(`ClientRotation` in `studio/bridge/telemetry.h`). A client that still has
+output buffered is held: it skips passes, and its telemetry resumes from the
+latest values once it drains; uWebSockets disconnects it only past its
+**512 KiB** `maxBackpressure`. Each client's kernel send buffer is what its
+share sends in **250 ms**, at least **16 KiB** (`ClientSendBuffer` in
+`studio/bridge/telemetry.h`): 16,384 B at the default 4 clients, 40,000 B
+at 1. macOS uses that size as given; Linux reserves twice it, about the size
+in payload. A client that stops reading therefore backs up after that much
+of its output (0.4 s of a 40,000 B/s share; up to 6.6 s of the 2,500 B/s
+share at 64 clients), not after the 4 MiB Linux autotuning reached, about
+100 s of a 40,000 B/s share. A reading client is limited below its share only
+when its round trip exceeds 250 ms; a send larger than the buffer, such as a
+joining client's 64,000 B dictionary and keyframe, takes several round trips,
+during which the client is held. HTTP snapshots and static files are outside
+this budget.
 
 160,000 B/s is **1.28 Mbit/s, 32 %** of the **4 Mbit/s** per-team field
 bandwidth limit that WPILib's networking documentation and the FMS whitepaper

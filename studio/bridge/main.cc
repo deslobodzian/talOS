@@ -472,14 +472,6 @@ std::string mime(const fs::path& p) {
 // larger anyway.
 constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
-// The kernel send buffer of each WebSocket client. Left to autotuning it grew
-// to 4 MiB on Linux, so a client that stopped reading was sent about 100 s of
-// its 40 kB/s share, all stale on arrival and all charged to the shared
-// budget, before the bridge saw any output buffered and held it. This holds
-// what the bridge's whole 160 kB/s budget sends in 100 ms (a link's bandwidth
-// times its round trip, at a slow radio's), so it never limits a client that
-// reads.
-constexpr int kClientSendBufferBytes = 16 * 1024;
 }  // namespace
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
@@ -657,8 +649,10 @@ int main(int argc, char** argv) try {
     bridge.clients.Add(ws);
     const int fd = static_cast<int>(
         reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
-    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &kClientSendBufferBytes,
-                     sizeof kClientSendBufferBytes) != 0) {
+    const int send_buffer =
+        studio::ClientSendBuffer::Bytes(bridge.client_rate());
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                     sizeof send_buffer) != 0) {
       std::cerr << "client send buffer not set: " << std::strerror(errno)
                 << '\n';
     }
