@@ -136,11 +136,12 @@ uintmax_t TreeBytes(const std::filesystem::path& dir, std::error_code& error) {
 // The free space retention keeps on the log root's filesystem for a new
 // session of `roster` members, without reading any node's parameters: its
 // event-log half of `log_max_bytes`, kChildOutputLogMaxBytes of output log
-// per member, and the other half for camera frames and metadata. A
-// session whose frame recording exceeds that half is not covered.
+// per member and for the launcher's own (kLauncherOutputFile), and the
+// other half for camera frames and metadata. A session whose frame
+// recording exceeds that half is not covered.
 uint64_t FreeFloor(const config::RobotConfig& config, std::size_t roster) {
   return static_cast<uint64_t>(config.log_max_bytes) +
-         kChildOutputLogMaxBytes * static_cast<uint64_t>(roster);
+         kChildOutputLogMaxBytes * (static_cast<uint64_t>(roster) + 1);
 }
 
 // Whether `error` says the filesystem has no room (ENOSPC, EDQUOT).
@@ -362,7 +363,8 @@ bool Launcher::CreateSessionDirectory(const config::RobotConfig& config,
                 << " once retention removed what it could, and a new "
                    "session may need "
                 << FreeFloor(config, roster) << " ([robot] log_max_bytes plus "
-                << kChildOutputLogMaxBytes << " per roster member)";
+                << kChildOutputLogMaxBytes
+                << " per roster member and for talos.log)";
     }
     std::cerr << "; nothing was started\n";
     ReportUnwrittenRetention(record);

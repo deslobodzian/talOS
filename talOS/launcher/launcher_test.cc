@@ -2100,10 +2100,10 @@ TEST(LauncherSessions, RetentionKeepsTheNewestMatchesBeyondTheBudgets) {
 }
 
 // When the log root's filesystem lacks room for the new session (log_max_bytes
-// and 64 MiB of output log per roster member), sessions go in retention's
-// order, a pit session before older matches and the protected matches oldest
-// first, only until removing them frees enough; the launch records each
-// removal in its own session directory.
+// and 64 MiB of output log per roster member and for talos.log), sessions go in
+// retention's order, a pit session before older matches and the protected
+// matches oldest first, only until removing them frees enough; the launch
+// records each removal in its own session directory.
 TEST(LauncherSessions, RetentionRemovesProtectedMatchesLastForFreeSpace) {
   auto options = SessionFixture("free_floor");
   const std::string root = options.output_dir;
@@ -2121,8 +2121,9 @@ TEST(LauncherSessions, RetentionRemovesProtectedMatchesLastForFreeSpace) {
   // The pit session 3 is the newest.
   WriteSessionManifest(dir(3), 3, 1005);
   WriteDriverStationLog(dir(3), "late", 3, {false}, 1'000'000);
-  // The fixture's roster: hardware_node, alpha, beta.
-  const uint64_t floor = 10'000'000 + 3 * kChildOutputLogMaxBytes;
+  // An output log for each of the fixture's roster (hardware_node, alpha,
+  // beta) and talos.log.
+  const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
   // One byte short of the floor once the pit session 3 and the oldest match
   // 1 are gone.
   const uintmax_t needed = DirectoryBytes(dir(3)) + DirectoryBytes(dir(1));
@@ -2161,8 +2162,9 @@ TEST(LauncherSessions, FullDiskLaunchFreesRoomBeforeCreatingItsSession) {
   const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
   WriteSessionManifest(dir(1), 1, 1001);
   WriteDriverStationLog(dir(1), "late", 1, {false}, 1'000'000);
-  // The fixture's roster: hardware_node, alpha, beta.
-  const uint64_t floor = 10'000'000 + 3 * kChildOutputLogMaxBytes;
+  // An output log for each of the fixture's roster (hardware_node, alpha,
+  // beta) and talos.log.
+  const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
   options.available_bytes = [available =
                                  floor - 1](const std::filesystem::path&) {
     return std::optional<uint64_t>{available};
@@ -2219,7 +2221,7 @@ TEST(LauncherSessions, LockFileWithoutRoomPrunesOnlyFinishedSessions) {
   // Unfinished: a launch that lost power, or one recording now.
   WriteSessionManifest(dir(2), 2, 1002);
   WriteDriverStationLog(dir(2), "late", 2, {false}, 1'000'000);
-  const uint64_t floor = 10'000'000 + 3 * kChildOutputLogMaxBytes;
+  const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
   // Short of the floor until both are gone.
   const uintmax_t both = DirectoryBytes(dir(1)) + DirectoryBytes(dir(2));
   options.available_bytes = [available = floor - both +
