@@ -30,6 +30,7 @@
 #include "talOS/schema/field_path.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/telemetry_generated.h"
+#include "talOS/telemetry/wire.h"
 
 namespace talos::telemetry {
 
@@ -107,10 +108,25 @@ inline bool ReadChannel(const Channel& channel,
 std::vector<std::string> EnumLabels(const reflection::Schema& schema,
                                     std::int32_t enum_index);
 
+// Bounds on one topic's flattening, so a damaged or crafted schema (a
+// recorded log's) is refused rather than read out of bounds or expanded
+// without end. Real messages are far inside them: the deepest nests one
+// struct in another (drivetrain.DrivetrainState's modules), the largest
+// (bridge.BridgeStatus) has under 50 channels, and a topic cannot have more
+// channels than a whole dictionary holds (kMaxChannels).
+inline constexpr std::size_t kMaxNestingDepth = 16;
+inline constexpr std::size_t kMaxTopicChannels = telemetry_wire::kMaxChannels;
+// Struct instances visited, arrays of structs counted per element: bounds a
+// walk of structs that hold no scalar.
+inline constexpr std::size_t kMaxTopicStructs = 4096;
+
 // Every scalar of struct `schema_name` in `bfbs` (a reflection.Schema), in
 // field id order with nested structs and arrays expanded in place, named
 // under `topic`. Throws std::invalid_argument naming the topic when `bfbs`
-// does not verify or lacks the struct.
+// does not verify or lacks the struct, or when a field names an object the
+// schema does not hold, a struct contains itself, structs nest deeper than
+// kMaxNestingDepth, or the topic expands past kMaxTopicChannels channels or
+// kMaxTopicStructs struct instances.
 std::vector<Channel> FlattenTopic(std::string_view topic,
                                   std::string_view schema_name,
                                   std::string_view bfbs);
