@@ -165,7 +165,12 @@ left, say); `stalled_arms`, prompt watchers whose failed arms stopped
 holding its loop awake; and `wake_fallbacks`, runs that could not build
 their wake receiver and drain on a poll tick instead. The `Reporter` copies
 `RealtimeEventLoop::wake_loss()` in each full sample
-(`NodeRegistration::set_wake_loss`).
+(`NodeRegistration::set_wake_loss`); the hardware bridge, whose loop is its
+own, stores its publishers' failures and its `OpenWaits()` fallbacks, and
+no stalled arms. A wake to the bridge that is lost shows as the requests its
+latest-value read of `/hw/request/<node>` then passes over: each counts in
+`dropped` of that subsystem's request source in the bridge's row, which is
+not latest-only, so Studio calls the topic `lossy`.
 `NodeSnapshot::delivery_loss()` (and `DeliveryLossOf(const NodeRecord&)`,
 for a reader that copies no snapshot) gathers them with `requests_skipped`,
 the `dropped` of the node's readers of `/hw/request/<node>` summed. The fields took the record's tail

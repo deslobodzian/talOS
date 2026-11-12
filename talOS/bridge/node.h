@@ -50,6 +50,12 @@ struct SubsystemTracker {
   // useful thing to see when actuators stop responding.
   uint64_t requests{0};
   std::size_t source_index{0};
+  // Requests the latest-value read passed over: published while an earlier
+  // one waited unread, the sum of ipc::Received::dropped over this topic's
+  // reads. Its registry source row's `dropped`. Normally 0; nonzero when the
+  // node's wakes to the bridge fail or the bridge falls behind, and this
+  // subsystem merges at a fraction of its rate (TODO.md RT-7).
+  uint64_t requests_skipped{0};
 
   // Positions in the merged command of the actuators this subsystem owns,
   // resolved from `devices` by HardwareNode::IndexActuators so a timeout
@@ -222,8 +228,11 @@ class HardwareNode {
   // so the declared graph and the running one differ only when the node does.
   introspect::Description Describe();
 
-  // Copies the counters above into this node's registry slot. Called from
-  // Run(); exposed so a test can drive it without a real event loop.
+  // Copies the counters above into this node's registry slot: each topic's
+  // traffic, each subsystem's skipped requests (SubsystemTracker), and the
+  // wake loss (the wake notifications its publishers failed to send, and
+  // OpenWaits() fallbacks). Called from Run(); exposed so a test can drive
+  // it without a real event loop.
   void PublishIntrospection();
 
  private:

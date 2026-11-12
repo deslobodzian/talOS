@@ -216,6 +216,61 @@ TEST(HardwareNodeTest, LatestRequestNeutralizesOmittedOutputs) {
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kNeutral);
 }
 
+// The bridge reads each /hw/request/<node> latest-value, so a request
+// published while an earlier one waits unread is passed over: when that
+// node's wakes to the bridge fail, the bridge reads it only on passes
+// something else starts, and its subsystem merges at a fraction of its rate.
+// Each such skip counts in that subsystem's request row of the bridge's
+// registry row, which the launcher and Studio read (TODO.md RT-7).
+// REQ-RT-20, REQ-OPS-18
+TEST(HardwareNodeTest, ARequestPassedOverBetweenTwoReadsIsCounted) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  // This process's bridge row.
+  const auto row = [&reader] {
+    std::optional<introspect::NodeSnapshot> bridge;
+    for (auto& node : reader->nodes()) {
+      if (node.name == kNodeName &&
+          node.pid == static_cast<std::uint64_t>(getpid()) &&
+          (!bridge || node.generation > bridge->generation))
+        bridge = std::move(node);
+    }
+    return bridge;
+  };
+  const auto skipped = [](const introspect::NodeSnapshot& bridge,
+                          std::string_view topic) {
+    std::optional<std::uint64_t> dropped;
+    for (const auto& source : bridge.sources) {
+      if (source.name == topic) dropped = source.dropped;
+    }
+    return dropped;
+  };
+  ipc::Publisher<Packet> intake{RequestTopic("intake")};
+  ipc::Publisher<Packet> drivetrain{RequestTopic("drivetrain")};
+  Command request{};
+  request.config_id = NodeConfigId(cfg);
+
+  // One request per read skips nothing; two between reads skip the first.
+  PublishCommand(intake, request);
+  node.Tick(1'000'000);
+  PublishCommand(intake, request);
+  PublishCommand(intake, request);
+  PublishCommand(drivetrain, request);
+  node.Tick(1'001'000);
+  node.PublishIntrospection();
+
+  const auto bridge = row();
+  ASSERT_TRUE(bridge.has_value());
+  EXPECT_EQ(skipped(*bridge, RequestTopic("intake")), 1u);
+  EXPECT_EQ(skipped(*bridge, RequestTopic("drivetrain")), 0u)
+      << "per subsystem";
+  EXPECT_EQ(bridge->delivery_loss().requests_skipped, 1u);
+}
+
 TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;

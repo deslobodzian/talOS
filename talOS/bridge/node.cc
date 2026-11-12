@@ -273,9 +273,10 @@ void HardwareNode::PublishIntrospection() {
   registration_->set_dispatch_count(DispatchCount());
   if (log_) registration_->set_recording(log_->failed(), log_->capped());
 
-  const auto set = [this](std::size_t index, std::uint64_t events) {
+  const auto set = [this](std::size_t index, std::uint64_t events,
+                          std::uint64_t dropped = 0) {
     registration_->set_source(static_cast<std::uint32_t>(index), events,
-                              /*dropped=*/0, /*sequence=*/events,
+                              dropped, /*sequence=*/events,
                               /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
                               /*max_latency_ns=*/0);
   };
@@ -285,8 +286,21 @@ void HardwareNode::PublishIntrospection() {
   set(2, driver_station_packets_received_);
   set(3, statuses_published_);
   for (const auto& [name, tracker] : subsystems_) {
-    set(tracker.source_index, tracker.requests);
+    set(tracker.source_index, tracker.requests, tracker.requests_skipped);
   }
+
+  // The bridge's loop is its own, so its wake loss is too: the wake
+  // notifications its publishers failed to send, and the runs that could
+  // not wait on their inputs (OpenWaits). Its idle-pass guard
+  // (kMaxIdlePasses) is not counted, so stalled_arms stays 0.
+  std::uint64_t wake_failures = 0;
+  for (auto* publisher : {state_pub_.get(), cmd_pub_.get(), ds_pub_.get()}) {
+    if (publisher != nullptr)
+      wake_failures += publisher->queue().wake_failures();
+  }
+  if (status_pub_) wake_failures += status_pub_->queue().wake_failures();
+  registration_->set_wake_loss(wake_failures, /*stalled_arms=*/0,
+                               wakeups_.wait_fallbacks);
   registration_->end_sample();
 }
 
@@ -562,14 +576,15 @@ void HardwareNode::Tick(uint64_t now_us) {
   // 2. Read subsystem requests and perform timeout neutralization
   bool any_subsystem_active = false;
   for (auto& [name, tracker] : subsystems_) {
-    std::optional<talos::hardware::Packet> pkt;
-    if (tracker.subscriber) pkt = tracker.subscriber->read();
+    std::optional<ipc::Received<talos::hardware::Packet>> received;
+    if (tracker.subscriber) received = tracker.subscriber->read_next();
 
-    if (pkt) {
+    if (received) {
       ++tracker.requests;
       ++tick_requests_;
+      tracker.requests_skipped += received->dropped;
       Command partial{};
-      if (Decode(pkt->bytes(), partial)) {
+      if (Decode(received->message.bytes(), partial)) {
         // Trust gates, in this order: an obsolete request must never merge,
         // and a current one must still own every device it addresses. Either
         // rejection drops the whole request without proving liveness, so a
