@@ -40,7 +40,8 @@ shutdown adds final log counts.
 — in CI, in a pit before a match, or after a rename that touched two packages.
 
 `--allow-graph-errors` overrides graph-error refusal, and the refusal of a
-[live endpoint mismatch](#live-endpoints). Missing descriptions cannot create
+[live endpoint mismatch](#live-endpoints), but not the refusal of a misnamed
+roster member ([node output](#node-output)). Missing descriptions cannot create
 segments for undeclared topics.
 
 ## One session per namespace
@@ -275,8 +276,11 @@ member appended to that one file after a line naming it, such as
 echoed to the launcher's stdout. Every line the launcher prints itself, from
 the session directory's creation on, also goes to that directory's
 `talos.log` (a line printed before it exists, such as a refused config, goes
-to the terminal only). A roster member named `talos`, whose output would be
-`talos.log`, is refused even with `--allow-graph-errors`. A deployed robot
+to the terminal only). A roster member whose name breaks the
+[node-name rule](../NAMING.md#nodes) is refused before anything is written,
+even with `--allow-graph-errors`: its name is its file names, and `talos`
+(or `Talos`, on a case-insensitive file system such as macOS's default APFS)
+would write `talos.log`. A deployed robot
 therefore keeps its nodes' output and the launcher's beside their event logs, whatever happens to the launcher's
 stdout and stderr.
 

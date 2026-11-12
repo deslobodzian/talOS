@@ -406,14 +406,20 @@ int Launcher::RunSession() {
     std::cerr << "launcher: no nodes declared in config\n";
     return 1;
   }
-  // Its output log would be the launcher's own talos.log. The graph lint
-  // refuses the name as a reserved owner (introspect::kReservedOwners,
-  // names.h), but --allow-graph-errors overrides the lint; this does not.
+  // A member's name is its file names (<name>.log, <name>.tlog). One that
+  // breaks the node-name rule is a graph error the lint reports, but
+  // --allow-graph-errors overrides the lint, and such a name can take a file
+  // that is not its own: `talos` writes the launcher's talos.log, and so does
+  // `Talos` on a case-insensitive file system (macOS's default APFS). This
+  // refusal is unconditional.
   for (const NodeSpec& spec : node_specs) {
-    if (spec.name + ".log" != kLauncherOutputFile) continue;
-    std::cerr << "launcher: roster member '" << spec.name
-              << "' is a reserved name (its output log would be "
-              << kLauncherOutputFile << ", the launcher's own); rename it\n";
+    const auto problem = naming::CheckNodeName(spec.name);
+    if (!problem) continue;
+    std::cerr << "launcher: roster member '" << spec.name << "': " << *problem
+              << "; refused even with --allow-graph-errors, since the name "
+                 "is its output and event log file names (the launcher's own "
+                 "is "
+              << kLauncherOutputFile << ")\n";
     return 1;
   }
   // Checked again right before retention lists the log root: another
