@@ -240,7 +240,7 @@ class SessionReportTest(unittest.TestCase):
             node("shooter", "control", "not_requested"),
             node("hardware_node", "bridge", "refused", "policy")]}), {"hardware_node"})
 
-    # REQ-OPS-16, REQ-RT-19, REQ-RT-20 (TODO.md RT-7): a wake a writer lost
+    # REQ-OPS-43, REQ-OPS-16, REQ-RT-19, REQ-RT-20 (TODO.md RT-7): a wake a writer lost
     # left a reader asleep until its backstop, a request the bridge passed
     # over is one its subsystem never merged, and a wake fallback polled;
     # each rejects the session, naming the node and the count. The registry
