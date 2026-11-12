@@ -20,9 +20,9 @@ Mechanism walkthrough: `examples/superstructure/README.md`.
 Dev environment: `tools/setup.sh` (Linux/macOS; on Windows, inside WSL2); see docs/INSTALL.md.
 
 ```sh
-bazel build //...
 bazel test --config=fast //...       # everyday loop: skips heavy, integration, e2e, perf lanes
-bazel test //...                      # CI runs both with --test_output=errors
+bazel build //...
+bazel test //...                      # CI runs build and test with --test_output=errors
 bazel test //examples/superstructure/...
 bazel test //path/to/package:all      # narrow loop while iterating
 bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configuration/robot.toml --describe-only

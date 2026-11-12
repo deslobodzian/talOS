@@ -95,6 +95,7 @@ cc_test(
     srcs = ["hardware_node_test.cc"],
     data = [":hardware_node"],
     env = {"HARDWARE_NODE": "$(rlocationpath :hardware_node)"},
+    tags = ["integration"],
     deps = [
         ":merge",
         ":messages",
