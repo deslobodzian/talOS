@@ -1,5 +1,6 @@
 """motor.py, the Python bench motor node, on talos.testing.Sim, configured by
-configuration/robot_py.toml and its subsystems/motor.toml.
+testdata/robot.toml: configuration/robot.toml (whose subsystems/motor.toml
+robot_py.toml also launches) plus a neighbor motor that stays connected.
 
 BenchMotorTest is the node test matrix, docs/TESTING.md §7 (the case names
 are the matrix's, which //tools:check_node_matrix looks for), plus the cases
@@ -181,6 +182,8 @@ class BenchMotorTest(unittest.TestCase):
         self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
         self.assert_neutral()
         state = self.bench.state()
+        # The neighbor keeps the robot enabled: the node's own gate decides.
+        self.assertTrue(state.enabled)
         self.assertFalse(state.connected)
         self.assertFalse(state.acquisition_valid)
 

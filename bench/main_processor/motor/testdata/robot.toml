@@ -1,0 +1,12 @@
+# The bench robot (configuration/robot.toml, its motor and teleop files) plus
+# a neighbor motor that stays connected, so a disconnected kraken is the loss
+# of one device, as on a robot with more than one, and only the motor node's
+# own feedback gate stops it; losing every device is the gateway's fault
+# (which disables the robot). Ids sort by (subsystem, device): kraken = 1,
+# wheel = 2.
+include = "../../configuration/robot.toml"
+
+[subsystems.neighbor.motors.wheel]
+type = "TalonFX"
+bus = "rio"
+can_id = 2

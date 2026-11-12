@@ -42,6 +42,7 @@ cc_test(
     size = "small",
     srcs = ["node_test.cc"],
     data = [
+        "testdata/neighbor.toml",
         "testdata/position_cpp.toml",
         "testdata/robot.toml",
         ":node",

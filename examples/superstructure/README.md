@@ -269,6 +269,8 @@ wrist.cc                TALOS_NODE entry point
 node_test.cc
 testdata/robot.toml
 testdata/wrist.toml
+testdata/neighbor.toml  another subsystem's motor, valid while the test
+                        disconnects the wrist's
 ```
 
 The package's `:messages` target uses `include_prefix = "wrist"` and declares

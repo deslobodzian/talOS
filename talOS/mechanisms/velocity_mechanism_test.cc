@@ -38,7 +38,10 @@ using testing::Sim;
 using testing::SimHardware;
 namespace ds = driver_station;
 
-// Exit band: max(2, 0.1 * |goal|), 6 rps at 60.
+// Exit band: max(2, 0.1 * |goal|), 6 rps at 60. The neighbor's wheel stays
+// connected, so a lost flywheel is the loss of one device, as on a robot,
+// and only the mechanism's own feedback gate stops it; losing every device
+// is the gateway's fault (SimHardwareTotalLoss), which disables the robot.
 constexpr const char* kRobotToml = R"(
 [robot]
 period_us = 5000
@@ -52,6 +55,9 @@ at_speed_entry_rps = 2.0
 at_speed_exit_frac = 0.1
 at_speed_entry_tick_count = 3
 spin_down_rps2 = 100.0
+
+[subsystems.neighbor.motors.wheel]
+can_id = 2
 )";
 
 // A robot node around one VelocityMechanism, driven by its teleop lane.
@@ -204,6 +210,8 @@ TEST_F(VelocityMechanismTest, AtSpeedDropsOnAVelocitySampleOlderThanTheBound) {
     ASSERT_TRUE(flywheel().at_speed());
     hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, row.velocity_age_us);
     Drive(60.0, 10ms);
+    // The neighbor keeps the robot enabled: the flywheel's gate decides.
+    ASSERT_TRUE(robot_enabled(sim.node("shooter")));
     EXPECT_EQ(flywheel().at_speed(), row.at_speed);
     EXPECT_EQ(flywheel().driving(), row.driving);
     if (row.driving) {
@@ -280,6 +288,8 @@ TEST_F(VelocityMechanismTest, StaleLaneGoesNeutral) {
 TEST_F(VelocityMechanismTest, DisconnectedFeedbackGoesNeutral) {
   hw.set_connected("shooter", "flywheel", false);
   Drive(60.0, 30ms);
+  // The neighbor keeps the robot enabled: the flywheel's gate decides.
+  ASSERT_TRUE(robot_enabled(sim.node("shooter")));
   ExpectNeutral();
   EXPECT_FALSE(flywheel().state().connected());
 }

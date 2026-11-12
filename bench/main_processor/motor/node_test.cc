@@ -13,6 +13,9 @@ namespace motor {
 namespace {
 using namespace std::chrono_literals;
 using talos::hardware::Mode;
+// The bench config plus a neighbor motor that stays connected (see the file).
+constexpr const char* kConfig =
+    "bench/main_processor/motor/testdata/robot.toml";
 class MotorTest : public ::testing::Test {
  protected:
   void Enable() {
@@ -31,7 +34,7 @@ class MotorTest : public ::testing::Test {
     EXPECT_EQ(State().mode(), ControlMode::NEUTRAL);
     EXPECT_EQ(State().source(), TargetSource::NONE);
   }
-  talos::testing::Sim sim{"bench/main_processor/configuration/robot.toml"};
+  talos::testing::Sim sim{kConfig};
   BenchMotor& motor = sim.add<BenchMotor>("motor");
   talos::testing::SimHardware hw{sim};
 };
@@ -138,9 +141,11 @@ TEST_F(MotorTest, NonFiniteAndDisconnectedInputsNeutralize) {
   hw.set_connected("motor", "kraken", false);
   Send(MotorTarget{ControlMode::VELOCITY, 0.0, 10.0, 0.0});
   Neutral();
+  // The neighbor keeps the robot enabled: the node's own gate decides.
+  EXPECT_TRUE(State().enabled());
 }
 TEST(BenchTeleop, ConfiguredAxisButtonsReleaseAndDisable) {
-  talos::testing::Sim sim{"bench/main_processor/configuration/robot.toml"};
+  talos::testing::Sim sim{kConfig};
   sim.add<BenchMotor>("motor");
   sim.add<talos::teleop::Teleop>("teleop");
   talos::testing::SimHardware hw{sim};

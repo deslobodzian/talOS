@@ -167,6 +167,8 @@ TEST_F(ShooterTest, DisconnectedMotorClearsReadiness) {
   sim.step(5ms);  // publish the disconnected feedback after the node's timer
   sim.step(5ms);  // the first node tick receiving it must clear readiness
   ExpectNeutral();
+  // The neighbor keeps the robot enabled: the flywheel's own gate decides.
+  EXPECT_TRUE(State().enabled());
   hw.set_connected("shooter", "flywheel", true);
   sim.step(5ms);  // publish reconnected feedback before counting entry ticks
   sim.step(10ms);

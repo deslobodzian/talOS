@@ -557,6 +557,9 @@ TEST_F(@PASCAL@Test, DisconnectedFeedbackGoesNeutral) {
 
   hw.set_connected("@NAME@", "@NAME@_motor", false);
   Hold(30.0, 40ms);
+  // The neighbor's motor keeps the robot enabled (testdata/robot.toml), so
+  // the node's own feedback gate is what stops it.
+  ASSERT_TRUE(talos::robot_enabled(sim.node("@NAME@")));
   EXPECT_EQ(Request(), Mode::kNeutral);
   const State state = Latest();
   EXPECT_FALSE(state.connected());
@@ -746,6 +749,9 @@ TEST_F(@PASCAL@Test, HomingThatDoesNotMoveFails) {
 
 CC_TESTDATA_ROBOT = """\
 # Local @NAME@ fixture. Device IDs are assigned by the normal parser.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "@NAME@_test"
 period_us = @PERIOD@
@@ -756,6 +762,22 @@ commissioned = false
 [[subsystems]]
 name = "@NAME@"
 path = "@NAME@.toml"
+
+[[subsystems]]
+name = "@NEIGHBOR@"
+path = "@NEIGHBOR@.toml"
+"""
+
+# Another subsystem's motor, which a test never disconnects.
+CC_TESTDATA_NEIGHBOR = """\
+[subsystem]
+name = "@NEIGHBOR@"
+period_us = @PERIOD@
+
+[motors.wheel]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
 """
 
 CC_TESTDATA_SUBSYSTEM = """\
@@ -1043,6 +1065,9 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
         self.hw.set_connected("@NAME@", "@NAME@_motor", False)
         self.hold(30.0, 0.04)
+        # The neighbor's motor keeps the robot enabled (testdata/robot.toml),
+        # so the node's own feedback gate is what stops it.
+        self.assertTrue(talos.robot_enabled(self.sim.node("@NAME@")))
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         state = self.state()
         self.assertFalse(state.connected)
@@ -1182,7 +1207,10 @@ PY_POSITION_TESTS = '''
 '''
 
 PY_POSITION_TESTDATA_ROBOT = """\
-# @PASCAL@ test robot: one subsystem, one motor homed on one switch.
+# @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "@NAME@_test"
 period_us = @PERIOD@
@@ -1209,10 +1237,18 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.@NAME@.digital_inputs.@NAME@_home]
 dio = 0
+
+[subsystems.@NEIGHBOR@.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2
 """
 
 PY_TESTDATA_ROBOT = """\
-# @PASCAL@ test robot: one subsystem, one motor.
+# @PASCAL@ test robot: one motor, and a neighbor.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "@NAME@_test"
 period_us = @PERIOD@
@@ -1223,6 +1259,11 @@ type = "TalonFX"
 bus = "test"
 can_id = 1
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[subsystems.@NEIGHBOR@.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2
 """
 
 SUBSYSTEM_TOML = """\
@@ -2190,9 +2231,15 @@ def package_files(name, lang, standalone=False, kind="velocity"):
     return files
 
 
+def neighbor_of(name):
+    """The test robot's other subsystem: any name but the package's."""
+    return "bystander" if name == "neighbor" else "neighbor"
+
+
 def mechanism_files(name, lang, kind):
     """{relative path: content} of a one-motor velocity/position package."""
-    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
+    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US,
+                  NEIGHBOR=neighbor_of(name))
     messages = fill(MESSAGES_BUILD, **values)
     fbs_template = POSITION_FBS if kind == "position" else FBS
     files = {f"{name}_message.fbs": fill(fbs_template, **values)}
@@ -2201,10 +2248,13 @@ def mechanism_files(name, lang, kind):
                          f"{name}/{name}_message_generated.h",
                          "talOS/devices/devices.h", "talOS/node/node.h"]
         test_includes = ["rules_cc/cc/runfiles/runfiles.h",
-                         f"{name}/{name}.h", "talOS/devices/testing.h",
+                         f"{name}/{name}.h", "talOS/devices/devices.h",
+                         "talOS/devices/testing.h",
                          "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
-        data = ["testdata/robot.toml", f"testdata/{name}.toml", ":node"]
+        neighbor = values["NEIGHBOR"]
+        data = ["testdata/robot.toml", f"testdata/{name}.toml",
+                f"testdata/{neighbor}.toml", ":node"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
@@ -2251,6 +2301,7 @@ def mechanism_files(name, lang, kind):
             "node_test.cc": cc_test,
             "testdata/robot.toml": fill(CC_TESTDATA_ROBOT, **values),
             f"testdata/{name}.toml": fill(testdata_subsystem, **values),
+            f"testdata/{neighbor}.toml": fill(CC_TESTDATA_NEIGHBOR, **values),
         })
     else:
         data = [f"{name}.py", "testdata/robot.toml", ":node"]

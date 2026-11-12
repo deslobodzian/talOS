@@ -216,7 +216,7 @@ it yet, and existing nodes still miss cases. **[review; gap: MATRIX-1]**
 | 4 | `ReleasedLaneGoesNeutral` | `ReleaseTarget` / `sim.release_target` | neutral (or the next lane in priority) on the next tick |
 | 5 | `NeverSentGoesNeutral` | no target | neutral; no exception |
 | 6 | `DriverStationLossGoesNeutral` | `hw.stop_driver_station()` | neutral once the Driver Station view is stale |
-| 7 | `DisconnectedFeedbackGoesNeutral` | `hw.set_connected(node, dev, false)` | neutral; validity flag cleared |
+| 7 | `DisconnectedFeedbackGoesNeutral` | `hw.set_connected(node, dev, false)`, with another motor or CAN sensor in the test config still valid (losing every one is the gateway's fault, which would neutralize the node without its own gate) | neutral while `robot_enabled` stays true; validity flag cleared |
 | 8 | `NonFiniteDemandGoesNeutral` | NaN or infinity in the target | neutral; no NaN in `state` |
 | 9 | `BadParameterFailsConstruction` | each required parameter missing or out of range (a table) | the constructor throws; the message contains the key |
 | 10 | `OtherModesLaneIsIgnored` | a live lane of another mode's source (autonomous lane in teleop, and the reverse) | neutral, or the current mode's lane |

@@ -33,7 +33,10 @@ cc_test(
     name = "node_test",
     size = "small",
     srcs = ["node_test.cc"],
-    data = ["//bench/main_processor/configuration:robot_config"],
+    data = [
+        "testdata/robot.toml",
+        "//bench/main_processor/configuration:robot_config",
+    ],
     deps = [
         ":motor",
         "//talOS/devices:testing",
@@ -71,11 +74,11 @@ py_test(
     srcs = ["node_py_test.py"],
     data = [
         "motor.py",
+        "testdata/robot.toml",
         ":libbench_motor.so",
-        "//bench/main_processor/configuration:robot_py.toml",
-        "//bench/main_processor/configuration:robot_py_config",
+        "//bench/main_processor/configuration:robot_config",
     ],
-    env = {"TALOS_TEST_CONFIG": "$(rlocationpath //bench/main_processor/configuration:robot_py.toml)"},
+    env = {"TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)"},
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [
