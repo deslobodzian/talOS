@@ -304,7 +304,7 @@ TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {
 [robot]
 period_us = 5000
 command_timeout_us = 100000
-[subsystems.shooter]
+[subsystems.shooter.flywheel]
 )"} + setting + R"(
 [subsystems.shooter.motors.flywheel]
 type = "TalonFX"

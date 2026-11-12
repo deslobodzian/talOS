@@ -22,8 +22,8 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         ":messages",
-        "//talOS/configuration",
         "//talOS/devices",
+        "//talOS/mechanisms",
         "//talOS/node",
     ],
 )
