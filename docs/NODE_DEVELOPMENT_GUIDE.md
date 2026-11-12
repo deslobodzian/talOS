@@ -244,6 +244,7 @@ Handles are named by their device key in the subsystem config
 | `node.extension<talos::HardwareLink>().sample_time()`: node-clock `Time` the latest hardware state was sampled at, `nullopt` while stale or before the bridge's clock mapping converges (8 states) | `talos.hardware_sample_time_ns(node)` (int ns, or `None`) |
 | `node.extension<talos::HardwareLink>().fresh()` / `.fresh(max_age)` and `.age()` | `link = talos.HardwareLink(node)`; `link.fresh()` / `link.fresh(max_age)` (`None` uses command timeout; seconds or `datetime.timedelta`); `link.age` (float seconds, `math.inf` before the first state); `link.sample_time` (int ns or `None`) |
 | `Motor` / `CANcoder`: `position_time()`, `velocity_time()`; `Gyro`: `yaw_time()`, `yaw_rate_time()` | same names as properties: integer node-clock nanoseconds, or `None` |
+| `Motor`: `position_age()`, `velocity_age()`: the sample's age at the State it arrived in, `std::optional<Duration>`, read from that State (no clock mapping needed); `nullopt` unless `connected()` or when the age is unknown | same names as properties: integer nanoseconds, or `None` |
 
 Actuator flush and disable semantics are in
 [Architecture: The tick](../ARCHITECTURE.md#the-tick).
@@ -291,8 +292,11 @@ methods in Python) set a software offset shared by all handles for that device
 on the node. They do not reset hardware and work while disabled. Disconnected,
 stale, or non-finite feedback and non-finite inputs leave the offset unchanged.
 `Motor::rezero` also refuses a position sample older, at the State it
-arrived in, than `RezeroAgeBound` (`devices.h`): two status periods of
-`[robot] status_hz`, 10 ms at 200 Hz. Whatever a rezero pairs the position
+arrived in (`Motor::position_age()`), than `RezeroAgeBound` (`devices.h`):
+two status periods of `[robot] status_hz`, 10 ms at 200 Hz. The same bound
+decides whether a velocity sample counts toward `VelocityMechanism`'s at
+speed (`Motor::velocity_age()`). Both ages are read from the State, so
+neither use waits for the bridge's clock mapping. Whatever a rezero pairs the position
 with (a switch, a hard stop, a constant) is as of that State, and feedback
 stays valid up to `command_timeout_us` old, so a mechanism moving at 1 rot/s
 on a 100 ms-old position would take a frame 0.1 rot off. A frame is under

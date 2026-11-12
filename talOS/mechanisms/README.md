@@ -185,11 +185,11 @@ is `control::VelocityState` (`requested_rps` is the clamped goal).
 
 A goal of at most 1e-3 rot/s is never at speed, and a change of the asked
 goal restarts the entry count. A tick counts toward at speed only on a
-recent velocity sample: acquired at most `RezeroAgeBound` (two status
-periods, 10 ms at 200 Hz) before the State it arrived in, judged by
-`Motor::velocity_time()` against `HardwareLink::sample_time()`. Any other
-sample, an unknown age included (so also until the bridge's clock mapping
-has converged, eight States), loses at speed and restarts the entry count.
+recent velocity sample: `Motor::velocity_age()`, its age at the State it
+arrived in, at most `RezeroAgeBound` (two status periods, 10 ms at 200 Hz).
+That age is read from the State, so at speed does not wait for the bridge's
+clock mapping. Any other sample, an unknown age included, loses at speed and
+restarts the entry count.
 During a CAN gap the gateway keeps reporting the last velocity, valid until
 its age reaches `command_timeout_us`; this rule keeps a frozen in-band
 reading from holding at speed. The 2026 shooter
@@ -245,8 +245,8 @@ feature: stall homing (a stop after motion, never moving, a slow start, the
 timeout), absolute homing (including a reset), upward limit-switch homing and
 a stuck switch, homing paused without a goal, hold on an unhomed mechanism,
 gravity for elevator and arm, turret wrap, at-goal and at-speed edges
-(including at speed lost on a velocity sample past `RezeroAgeBound`,
-REQ-DEV-22), spin-down, faults, the roller's phases, a disable cancelling a timed run,
+(including at speed lost on a velocity sample past `RezeroAgeBound`, and
+reached before the clock mapping converges, REQ-DEV-22), spin-down, faults, the roller's phases, a disable cancelling a timed run,
 and a held eject running once while release-then-press runs again. Downward limit-switch homing and the
 travel clamp are also tested through `examples/superstructure`'s elevator.
 The tests carry the tags of REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and

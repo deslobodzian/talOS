@@ -471,6 +471,8 @@ TEST(Devices, MotorLimitSwitchesReadOnlyFromAConnectedSample) {
   EXPECT_FALSE(mech.a.reverse_limit());
 }
 
+// REQ-CONTRACT-23
+// REQ-DEV-22: Motor::*_age() reads the State's age, without the mapping.
 TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -484,6 +486,9 @@ TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   EXPECT_EQ(mech.a.position_time(), std::nullopt);
   EXPECT_EQ(mech.cc.velocity_time(), std::nullopt);
   EXPECT_EQ(mech.gyro.yaw_time(), std::nullopt);
+  // A motor's ages come from the State itself: known before the mapping.
+  EXPECT_EQ(mech.a.position_age(), 1ms);
+  EXPECT_EQ(mech.a.velocity_age(), 3ms);
   sim.step(40ms);
   ASSERT_TRUE(link.sample_time());
   const Time sampled = *link.sample_time();
@@ -501,15 +506,21 @@ TEST(Devices, AcquisitionTimesSubtractEachSignalsAge) {
   sim.step(10ms);
   EXPECT_FALSE(mech.a.connected());
   EXPECT_EQ(mech.a.velocity_time(), std::nullopt);
+  EXPECT_EQ(mech.a.velocity_age(), std::nullopt);
   EXPECT_EQ(mech.cc.position_time(), std::nullopt);
   EXPECT_EQ(mech.gyro.yaw_rate_time(), std::nullopt);
   hw->set_motor("mech", "a", 1.5, -2.0, 1000, 3000);
   hw->set_connected("mech", "a", false);
   sim.step(10ms);
   EXPECT_EQ(mech.a.velocity_time(), std::nullopt);
+  EXPECT_EQ(mech.a.position_age(), std::nullopt);
+  hw->set_connected("mech", "a", true);
+  sim.step(10ms);
+  ASSERT_EQ(mech.a.velocity_age(), 3ms);
   hw.reset();
   sim.step(150ms);
   EXPECT_EQ(mech.a.position_time(), std::nullopt);
+  EXPECT_EQ(mech.a.velocity_age(), std::nullopt) << "stale State";
   EXPECT_EQ(mech.cc.position_time(), std::nullopt);
   EXPECT_EQ(mech.gyro.yaw_rate_time(), std::nullopt);
 }

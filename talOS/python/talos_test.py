@@ -440,6 +440,9 @@ can_id = 3
         hw.set_gyro("lift", "gyro", 0.75, -0.5, 5000, 6000)
         sim.step(0.02)
         self.assertIsNone(signals.motor.position_time)
+        # Motor ages come from the State: known before the clock mapping.
+        self.assertEqual((signals.motor.position_age,
+                          signals.motor.velocity_age), (1_000_000, 3_000_000))
         sim.step(0.08)
         sampled = talos.hardware_sample_time_ns(node)
         self.assertIsInstance(sampled, int)
@@ -459,6 +462,7 @@ can_id = 3
         sim.step(0.02)
         self.assertFalse(signals.motor.connected)
         self.assertIsNone(signals.motor.velocity_time)
+        self.assertIsNone(signals.motor.velocity_age)
         self.assertIsNone(signals.encoder.position_time)
         self.assertIsNone(signals.gyro.yaw_rate_time)
         hw.set_motor("lift", "lift", 3, 2, 1000, 3000)

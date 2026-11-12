@@ -10,10 +10,10 @@ namespace talos::mechanisms {
 
 VelocityMechanism::VelocityMechanism(Node& node, std::string_view name)
     : node_{&node},
-      link_{&node.extension<HardwareLink>()},
       label_{"VelocityMechanism '" + std::string{name} + "'"},
       motor_{node, name},
-      velocity_age_bound_{RezeroAgeBound(link_->config().hardware)},
+      velocity_age_bound_{
+          RezeroAgeBound(node.extension<HardwareLink>().config().hardware)},
       max_rps_{MotorConfigOf(node, name).max_velocity_rps} {
   const Params params{node, name};
   entry_rps_ = params.positive("at_speed_entry_rps", 2.0);
@@ -86,12 +86,10 @@ void VelocityMechanism::update() {
 }
 
 // The velocity's age at its State, judged as Motor::rezero judges a
-// position's (RezeroAgeBound); unknown (no sample time, no clock mapping)
-// is never recent.
+// position's (RezeroAgeBound); an unknown age is never recent.
 bool VelocityMechanism::velocity_recent() const {
-  const std::optional<Time> sampled = motor_.velocity_time();
-  const std::optional<Time> state = link_->sample_time();
-  return sampled && state && *state - *sampled <= velocity_age_bound_;
+  const std::optional<Duration> age = motor_.velocity_age();
+  return age && *age <= velocity_age_bound_;
 }
 
 // The shooter's readiness rule: consecutive ticks inside the entry band of

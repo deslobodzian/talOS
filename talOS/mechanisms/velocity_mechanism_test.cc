@@ -70,12 +70,10 @@ struct Shooter {
 
 class VelocityMechanismTest : public ::testing::Test {
  protected:
-  // Past the bridge's clock mapping (eight States): until it converges no
-  // velocity sample has a known age, so none counts toward at_speed.
   VelocityMechanismTest() {
     hw.enable();
     hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
-    sim.step(40ms);
+    sim.step(10ms);
   }
   // The teleop lane, republished every 5 ms (one tick) for `duration`.
   void Drive(double velocity_rps, std::chrono::milliseconds duration,
@@ -207,6 +205,28 @@ TEST_F(VelocityMechanismTest, AtSpeedDropsOnAVelocitySampleOlderThanTheBound) {
   EXPECT_FALSE(flywheel().at_speed());
   Drive(60.0, 5ms);
   EXPECT_TRUE(flywheel().at_speed());
+}
+
+// The velocity's age comes from the State, so at_speed does not wait for
+// the bridge's clock mapping (eight States after a gateway boot or bridge
+// start): three in-band ticks right after the first States reach it while
+// HardwareLink::sample_time() is still unknown.
+// REQ-DEV-22
+TEST(VelocityMechanismMapping, AtSpeedBeforeTheClockMappingConverges) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& shooter = sim.add<Shooter>("shooter");
+  const auto& link = sim.node("shooter").extension<HardwareLink>();
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  hw.set_motor("shooter", "flywheel", 0.0, 60.0);
+  sim.step(5ms);
+  for (int tick = 0; tick < 3; ++tick) {
+    PublishTarget(sim, "shooter", "teleop", control::VelocityTarget{60.0, 0});
+    sim.step(5ms);
+  }
+  ASSERT_FALSE(link.sample_time()) << "the mapping has converged already";
+  EXPECT_TRUE(shooter.flywheel.at_speed());
 }
 
 // A live goal that drops winds down at spin_down_rps2; losing the goal is

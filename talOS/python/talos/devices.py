@@ -138,6 +138,26 @@ class Motor(_Input):
         """Acquisition time, integer node-clock ns, or None if unavailable."""
         return self._time(True)
 
+    def _age(self, velocity):
+        age = ctypes.c_int64()
+        found = _abi.ok(lib.talos_motor_age(
+            self._node, self._index, velocity, ctypes.byref(age)))
+        return age.value if found else None
+
+    @property
+    def position_age(self):
+        """The position sample's age at the State it arrived in, integer ns
+        (Motor::position_age): read from the State, so known without the
+        clock mapping position_time needs. None unless connected, or when
+        the age is unknown."""
+        return self._age(False)
+
+    @property
+    def velocity_age(self):
+        """The velocity sample's age at its State, integer ns, or None, as
+        position_age."""
+        return self._age(True)
+
     def rezero(self, position_rot=0):
         """Set the node-shared software position on connected finite feedback.
 
