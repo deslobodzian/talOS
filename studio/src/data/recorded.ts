@@ -13,7 +13,10 @@
 // and notifies. Identical requests share one fetch, completed ones are kept in
 // a small LRU, and a consumer's newer request aborts its superseded one. A
 // failed request, HTTP or payload, sets `error` and pauses playback; nothing is
-// thrown into a panel, and the failed request is not retried until `retry()`.
+// thrown into a panel, and the failed request is not issued again until
+// `retry()` (a different one, after the cursor or the plot moved, is). A plot's
+// series is split into requests within the server's limits (bounds.json) and
+// merged.
 
 import type {Pose, Snapshot} from '../core';
 import {discoverEstimate, type EstimateChannels} from './discovery';
@@ -30,7 +33,8 @@ import {
   type FetchLike,
   type ReviewBounds,
   type ReviewSnapshot,
-  type SeriesBuckets
+  type SeriesBuckets,
+  type SeriesColumns
 } from './review';
 import type {ChannelSample, DataSource} from './source';
 import type {
@@ -463,11 +467,24 @@ export class RecordedSource implements DataSource {
     const size = quantizePoints(points);
     const plan = this.plan(window, BigInt(cursor_ns), size);
     const start = plan.start.toString(), end = plan.end.toString();
-    const key = seriesKey(channels, start, end, plan.points);
-    const slot = `${channels.join(',')}|${window === 'all' ? 'all' : window.seconds}|${size}`;
-    if (!this.failed.has(key) && !this.error && !this.closed)
-      void this.fetchSeries(channels, start, end, plan.points, slot);
-    const buckets = this.cache.get(key) ?? this.slotLast.get(slot);
+    const windowName = window === 'all' ? 'all' : window.seconds;
+    // Requests within the server's limits (bounds.json): the channels split
+    // into groups that each fit at full resolution, merged back below.
+    const perRequest = Math.max(1, Math.min(
+        this.bounds.max_series_channels,
+        Math.floor(this.bounds.max_series_values / plan.points)));
+    const parts: (SeriesBuckets|undefined)[] = [];
+    for (let at = 0; at < channels.length; at += perRequest) {
+      const group = channels.slice(at, at + perRequest);
+      const key = seriesKey(group, start, end, plan.points);
+      const slot = `${group.join(',')}|${windowName}|${size}`;
+      // A failed request is not issued again until retry(); another one
+      // (the cursor or the plot moved) is.
+      if (!this.failed.has(key) && !this.closed)
+        void this.fetchSeries(group, start, end, plan.points, slot);
+      parts.push(this.cache.get(key) ?? this.slotLast.get(slot));
+    }
+    const buckets = mergeParts(parts, channels.length, perRequest);
     return buckets ?
         bucketSeries(channels, buckets, this.bounds.start_ns, plan.from, plan.to) :
         emptySeries(this.bounds.start_ns, channels);
@@ -500,6 +517,29 @@ export class RecordedSource implements DataSource {
   modeBands() {
     return NO_BANDS;
   }
+}
+
+// One request's columns per group of `perRequest` channels, in order, as one
+// SeriesBuckets of `count` channels; a group with no result yet is empty
+// columns. Undefined when no group has one.
+function mergeParts(parts: (SeriesBuckets|undefined)[], count: number,
+                    perRequest: number): SeriesBuckets|undefined {
+  const present = parts.find(p => p !== undefined);
+  if (!present) return undefined;
+  if (parts.length === 1) return present;
+  const buckets = present.buckets;
+  const empty = (): SeriesColumns => ({
+    t_ns: new Float64Array(buckets).fill(NaN), min: new Float64Array(buckets).fill(NaN),
+    max: new Float64Array(buckets).fill(NaN), last: new Float64Array(buckets).fill(NaN),
+    count: new Uint32Array(buckets)
+  });
+  const channels: SeriesColumns[] = [];
+  parts.forEach((part, i) => {
+    const size = Math.min(perRequest, count - i * perRequest);
+    for (let c = 0; c < size; c++)
+      channels.push(part && part.buckets === buckets ? part.channels[c] : empty());
+  });
+  return {buckets, channels};
 }
 
 function emptySeries(t0_ns: string, channels: string[]): Series {

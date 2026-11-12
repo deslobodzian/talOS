@@ -53,6 +53,9 @@ test('sessions, channels and bounds decode to the fixture session', () => {
   assert.equal(bounds.start_ns, START_NS.toString());
   assert.equal(bounds.end_ns, (START_NS + 10_002_000_000n).toString());
   assert.equal(wallTimeNs(bounds, bounds.start_ns), START_WALL_NS);
+  // The server's series limits (review.h), which RecordedSource splits by.
+  assert.equal(bounds.max_series_values, 262_144);
+  assert.equal(bounds.max_series_channels, 256);
 });
 
 test('a snapshot keeps NaN, an integer past 2^53 exactly, and each sample time', () => {
