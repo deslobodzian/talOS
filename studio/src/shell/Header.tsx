@@ -9,7 +9,7 @@ import {useState} from 'react';
 import {usePlayback} from '../data/hooks';
 import {StatusDot} from '../ui/primitives';
 
-export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, onReset}: {
+export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, onReset, onReview}: {
   url: string;
   onUrl: (url: string) => void;
   onConnect: () => void;
@@ -17,6 +17,7 @@ export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, 
   onImportClick: () => void;
   onExport: () => void;
   onReset: () => void;
+  onReview: () => void;
 }) {
   const playback = usePlayback();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -37,6 +38,7 @@ export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, 
              onChange={e => onUrl(e.target.value)}/>
       <button className="primary" onClick={onConnect}>Connect</button>
       <button onClick={onDemo}>Demo data</button>
+      <button onClick={onReview}>Open recording…</button>
     </div>
     <div className="workspace-menu">
       <button onClick={() => setMenuOpen(o => !o)} aria-haspopup="menu"

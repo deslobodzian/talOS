@@ -1064,7 +1064,54 @@ th.sortable i {
   padding: 3px 7px;
 }
 
+.review-picker {
+  width: min(720px, calc(100vw - 40px));
+  max-height: 70vh;
+  overflow: auto;
+  background: var(--surface-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 24px 70px #00000077;
+  padding: 20px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.review-picker h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+.review-picker form {
+  display: flex;
+  gap: 8px;
+}
+.review-picker form input {
+  flex: 1;
+  min-width: 0;
+}
+.review-sessions {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.review-sessions th,
+.review-sessions td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.review-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* --- 10. Timeline footer -------------------------------------------------- */
+
+.scrub-range {
+  width: 100%;
+  accent-color: var(--accent);
+}
 
 .timeline {
   flex-shrink: 0;

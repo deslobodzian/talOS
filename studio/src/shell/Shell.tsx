@@ -5,7 +5,8 @@
 
 import {useEffect, useMemo, useRef, useState} from 'react';
 
-import {useActions, useEvents, usePlayback} from '../data/hooks';
+import {useActions, useEvents, usePlayback, useRecorded} from '../data/hooks';
+import {useStudio} from '../data/studio';
 import {PanelNavigationProvider} from '../layout/navigation';
 import {buildPresetPage, buildPresetRoot, defaultWorkspace, PRESETS, presetByName} from '../layout/presets';
 import {
@@ -35,6 +36,8 @@ import {
 import {CommandPalette} from './CommandPalette';
 import {Header} from './Header';
 import {PageTabs} from './PageTabs';
+import {RecordedTransport} from './RecordedTransport';
+import {ReviewPicker} from './ReviewPicker';
 import {ShortcutsOverlay} from './Shortcuts';
 import {StatusStrip} from './StatusStrip';
 import {Timeline} from './Timeline';
@@ -78,8 +81,11 @@ export function Shell() {
   const [renamingPage, setRenamingPage] = useState<string|null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
   const [focusedPanelId, setFocusedPanelId] = useState<string|null>(null);
 
+  const studio = useStudio();
+  const recorded = useRecorded();
   const actions = useActions();
   const playback = usePlayback();
   const events = useEvents();
@@ -291,7 +297,7 @@ export function Shell() {
       }
 
       // A modal owns its own keys; the transport shortcuts below stay quiet.
-      if (paletteOpen || shortcutsOpen) return;
+      if (paletteOpen || shortcutsOpen || reviewOpen) return;
 
       const playing = playback.mode === 'REPLAY_PLAYING' ||
           playback.mode === 'LIVE_STREAMING';
@@ -308,13 +314,13 @@ export function Shell() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [actions, playback.mode, stepNs, paletteOpen, shortcutsOpen]);
+  }, [actions, playback.mode, stepNs, paletteOpen, shortcutsOpen, reviewOpen]);
 
   return <PanelNavigationProvider value={navigation}>
     <div className="app">
       <Header url={url} onUrl={setUrl} onConnect={onConnect} onDemo={onDemo}
               onImportClick={onImportClick} onExport={onExport}
-              onReset={onReset}/>
+              onReset={onReset} onReview={() => setReviewOpen(true)}/>
       <StatusStrip/>
       <PageTabs pages={workspace.pages} activePageId={workspace.activePage}
                 renamingId={renamingPage} onSelect={setActivePage}
@@ -326,9 +332,12 @@ export function Shell() {
                             callbacks={callbacks}/> :
              <div className="empty-state">No pages. Add a page to begin.</div>}
       </main>
-      <Timeline stepNs={stepNs} onStepNs={setStepNs}
-                transportError={transportError}
-                onTransportError={setTransportError}/>
+      {recorded ?
+           <RecordedTransport source={recorded} stepNs={stepNs} onStepNs={setStepNs}
+                              onClose={studio.closeRecorded}/> :
+           <Timeline stepNs={stepNs} onStepNs={setStepNs}
+                     transportError={transportError}
+                     onTransportError={setTransportError}/>}
       <input ref={importFileRef} type="file" accept=".json" hidden
              aria-label="Import workspace JSON"
              onChange={async e => {
@@ -338,6 +347,7 @@ export function Shell() {
              }}/>
       {paletteOpen &&
        <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)}/>}
+      {reviewOpen && <ReviewPicker onClose={() => setReviewOpen(false)}/>}
       {shortcutsOpen &&
        <ShortcutsOverlay onClose={() => setShortcutsOpen(false)}/>}
     </div>

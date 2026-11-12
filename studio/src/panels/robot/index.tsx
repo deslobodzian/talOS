@@ -461,5 +461,6 @@ export const robotPanel: PanelDefinition<RobotConfig> = {
   description: 'At a glance: Driver Station, routine, power, link, pose, subsystems, cameras and events.',
   defaultConfig,
   parseConfig,
-  component: RobotPanel
+  component: RobotPanel,
+  recorded: true
 };

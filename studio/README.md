@@ -26,6 +26,10 @@ The complete panel list is [`src/panels/registry.ts`](src/panels/registry.ts).
 - [`src/data/store.ts`](src/data/store.ts) holds the columnar render cache.
 - [`src/data/studio.ts`](src/data/studio.ts) provides the worker-backed or static
   Studio context; [`src/data/hooks.ts`](src/data/hooks.ts) exposes React bindings.
+- Panels read through a [`DataSource`](src/data/source.ts): `LiveSource` (the
+  worker and store above) or, while a recording is open,
+  [`RecordedSource`](src/data/recorded.ts) over the
+  [review API](src/data/review.ts). One source is shown at a time.
 - [`src/shell/`](src/shell/) renders the workspace and connection controls.
 - [`src/layout/tree.ts`](src/layout/tree.ts) implements workspace operations.
   [`src/layout/workspace.ts`](src/layout/workspace.ts) persists the workspace in
@@ -86,7 +90,9 @@ With no graph naming the session (no registry), a restart always continues it.
    };
    ```
 
-2. Add its import and array entry to `src/panels/registry.ts`.
+2. Add its import and array entry to `src/panels/registry.ts`. Set
+   `recorded: true` once the panel renders from a recorded session (below);
+   until then it shows that it is not available there.
 3. Import panel-specific CSS from the module. Scope selectors under the panel's
    root class to avoid affecting other panels.
 
@@ -97,6 +103,35 @@ wrote it, and only a Studio of the same format version imports it; an older
 export is refused by name. A match from before a format change stays
 readable through the nodes' event logs (`log_dump`), which are the complete
 record, unlike the live view.
+
+## Reviewing a recorded session
+
+Studio opens a session the launcher recorded, through the review server
+(`studio_review` in `studio/review`, which reads the session's event logs
+directly; no conversion step). With the server running on the same machine
+(default `http://127.0.0.1:5805`), choose **Open recording…** in the header,
+list the sessions (start time, length and class), and open one. The address
+is remembered in this browser.
+
+While a recording is open it replaces the live view on every page, and the
+footer becomes its transport: step back and forward by the step size, play
+and pause at 1x, 2x or 4x, a slider over the whole session, and the playhead
+as session time (from the session's start) and wall time. **Close recording**,
+going live (`L`) or connecting returns to live data. A failed request (the
+server unreachable, an HTTP error, a malformed answer) pauses playback and is
+shown in the footer with **Retry**; panels keep what they last showed.
+
+| Panel | On a recording |
+|---|---|
+| Plot | Each channel decimated to the plot's pixel width: the line is each bucket's last sample, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
+| Field | The pose estimator's pose at the playhead (no pose while its `valid` is false), the trail and camera observations over the window. |
+| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the playhead; the system graph, events and node selections are live-only and show as absent. |
+| Every other panel | "Not available for recorded sessions yet." |
+
+Values carry the channel names live telemetry uses. The chassis pose differs:
+live, it is the topic `[studio] pose_topic` names; on a recording, it is the
+estimator that the dictionary shows (the one with
+`<owner>/state/observation_accepted_count`).
 
 ## Run
 
