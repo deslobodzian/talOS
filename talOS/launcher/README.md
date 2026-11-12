@@ -752,22 +752,30 @@ weighs as the mean of the others, and every member gets at least the
 smallest share at which its log rotates (two segments of its prefix and
 largest record) while those fit in the budget.
 
-The shares give the session's log window: the record time each member not
-held at its floor keeps at its expected rate (the budget left after the
-floors over their summed rates, less what each one's segments spend on
-their prefix, the least over them), printed as the `Event-log window`
-line. Every logging member is started with
+The shares give the session's log window, printed as the `Event-log window`
+line. T is the budget left after the floors over the summed rates of the
+members not held at a floor: what each of their shares holds at its rate.
+A member's prefix cost is the time its eight segments' prefixes (header,
+manifest and schemas, repeated per segment) take of its share at its rate.
+The window is T less the largest prefix cost, but never less than 7/8 of T,
+so a larger budget never shortens it and one member with large prefixes
+cannot shrink every member's window. Every logging member is started with
 `--log-window-us <window>` beside `--log-max-bytes <share>`, and its capped
 log also ends a segment once its records span window / n
-(`LogWriterOptions::window`; n = 8 segments while the share holds them). So
-in every robot state a member that stores no more than its expected rate
-keeps between 7/8 of the window and the window of record time, whatever it
+(`LogWriterOptions::window`; n = 8 segments while the share holds them). So in every
+robot state a member that stores no more than its expected rate, and whose
+prefix cost is within T less the window, keeps between 7/8 of the window
+and the window of record time, whatever it
 actually stores (a disabled `teleop` that sends nothing, a bridge whose
 owners hold their demands), and leaves the rest of its share unused; a
 member that stores more ends its segments on bytes and keeps a shorter tail
 in proportion, and no other member's tail depends on it; a member that
-records nothing for a while keeps a longer one. A member held at its floor
-keeps between (n - 1) / n of the window and the window. No window is passed
+records nothing for a while keeps a longer one. A member whose prefix cost
+is larger ends its segments on bytes and keeps less. That includes every
+member held at its floor: its share is two segments of its prefix and
+largest record, so each segment holds about one largest record after its
+prefix, and the log keeps about two records' worth of time (a 20 KB prefix
+with 100 B records at 100 Hz keeps about 20 ms). No window is passed
 (segments end on bytes only) when the floors do not fit or no member's rate
 is known. Time-ended segments are smaller, never more numerous: a log still
 holds at most n segment files of at most share / n bytes. Restarts share their member's remaining budget, but never

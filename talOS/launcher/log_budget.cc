@@ -1,7 +1,6 @@
 #include "talOS/launcher/log_budget.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstddef>
 #include <set>
 
@@ -260,21 +259,26 @@ LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
                  floor_sum;
     }
   } else if (known > 0 && total > 0 && rest > 0) {
-    // The record time every free member's share holds at its weight: the
-    // share less what its segments spend on their prefix (each segment
-    // repeats it; half a floor bounds the prefix and the largest record),
-    // over its weight, the least over the free members. A held member's
-    // floor is more than its weight asks, so it holds at least as long.
-    double window_s = rest / total;
+    // T = rest / total: what every free member's share holds at its weight,
+    // before its segments' prefixes. It never falls as the budget grows: the
+    // shares are max(floor, T x weight) summing to the budget. A member's
+    // prefix cost is the time its kLogSegments segments' prefixes take of
+    // its share at its weight (half a floor bounds a prefix and the largest
+    // record): it does not depend on the budget. The window is T less the
+    // largest prefix cost, but never less than 7/8 of T, so it never falls
+    // as the budget grows either, and one member with large prefixes
+    // (a member held at its floor among them) cannot shrink every log's
+    // window: its own segments end on bytes, as a member that stores more
+    // than predicted does, and it keeps a shorter tail.
+    const double t = rest / total;
+    double cost = 0;
     for (const std::size_t i : loggers) {
-      if (held.contains(i)) continue;
-      const double unit = static_cast<double>(floors[i]) / 2;
-      const double segments =
-          unit > 0 ? std::min(static_cast<double>(event::log::kLogSegments),
-                              std::floor(share[i] / unit))
-                   : 0;
-      window_s = std::min(window_s, (share[i] - segments * unit) / weight(i));
+      const double w = weight(i);
+      if (w <= 0) continue;
+      cost = std::max(cost, static_cast<double>(event::log::kLogSegments) *
+                                (static_cast<double>(floors[i]) / 2) / w);
     }
+    const double window_s = t - std::min(t / 8, cost);
     // Whole microseconds, rounded down, within a log writer's nanoseconds.
     const double window_us =
         std::min(window_s * 1e6,

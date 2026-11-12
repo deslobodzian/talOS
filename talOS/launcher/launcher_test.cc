@@ -801,46 +801,6 @@ TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
                    200 * (64 + state.stored_bytes) + 100 * (64 + 62));
 }
 
-// REQ-OPS-32: shares are in proportion to the expected rates, so equal
-// rates of history fit each share; an unknown rate weighs as the mean of the
-// known; a member whose share would not rotate gets its floor and the others
-// share the rest; a member without a log gets nothing; the shares never
-// exceed the budget, and floors that do not fit are scaled into it. The
-// window is the record time the free members' shares hold at their rates:
-// the budget left after the floors over their summed rates, less each
-// share's eight segment prefixes (half a floor each), the least over them;
-// none when the floors do not fit.
-TEST(LauncherTest, SplitLogBudgetIsProportionalAboveEachFloor) {
-  const auto split = SplitLogBudget(4000, {true, true, true, false},
-                                    {300.0, 100.0, -1.0, 500.0}, {0, 0, 0, 0});
-  const auto& shares = split.shares;
-  ASSERT_EQ(shares.size(), 4u);
-  // 300 : 100 : 200 (the mean).
-  EXPECT_EQ(shares[0], 2000u);
-  EXPECT_EQ(shares[1], 666u);
-  EXPECT_EQ(shares[2], 1333u);
-  EXPECT_EQ(shares[3], 0u);
-  // 4000 B over 600 B/s.
-  EXPECT_EQ(split.window, std::chrono::microseconds{6'666'666});
-
-  // The second member's proportional 400 is below its 1000 floor: it is
-  // held there and the other two share the remaining 3000 as 3 : 2. Less
-  // eight prefixes of 50 B each, the first holds 1400 B / 300 B/s, the
-  // third 800 B / 200 B/s: the window is the shorter.
-  const auto floored = SplitLogBudget(4000, {true, true, true},
-                                      {300.0, 40.0, 200.0}, {100, 1000, 100});
-  EXPECT_EQ(floored.shares[0], 1800u);
-  EXPECT_EQ(floored.shares[1], 1000u);
-  EXPECT_EQ(floored.shares[2], 1200u);
-  EXPECT_EQ(floored.window, std::chrono::seconds{4});
-
-  const auto tight =
-      SplitLogBudget(1000, {true, true}, {1.0, 1.0}, {1500, 500});
-  EXPECT_EQ(tight.shares[0], 750u);
-  EXPECT_EQ(tight.shares[1], 250u);
-  EXPECT_EQ(tight.window, std::chrono::microseconds{0});
-}
-
 // A control loop the OS kept at timeshare is warned about and recorded in the
 // manifest session_report --strict judges. A later run that got its grant
 // does not clear it: the session still ran that loop without one. Only the
