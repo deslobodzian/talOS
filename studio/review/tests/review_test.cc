@@ -22,9 +22,12 @@
 #include <vector>
 
 #include "nlohmann/json.hpp"
+#include "review_test/review_message_descriptor.h"
+#include "review_test/review_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "studio/review/series_cache.h"
 #include "studio/review/testdata/fixture.h"
+#include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_writer.h"
 
@@ -569,6 +572,84 @@ TEST_F(ReviewTest, LibraryIsNeverWritten) {
   every_endpoint();
   read_only(perms::owner_all, perms::owner_read | perms::owner_write);
   EXPECT_EQ(List(library), before);
+  std::filesystem::remove_all(library);
+}
+
+// Guards the bound on a snapshot's reads (studio/README.md, "Reviewing a
+// session"): a topic published once at the session's start, then only read
+// every tick (a watcher's READ records, which hold no value), costs a
+// snapshot at the end one second of reading, not a walk back over every
+// second its reader touched it.
+// REQ-OPS-42
+TEST(SnapshotCostTest, TopicPublishedOnceIsReadFromItsOneSecond) {
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  const std::string library = Directory() + "/once";
+  std::filesystem::create_directories(library + "/s1");
+  const auto shot = [](std::uint16_t id, std::string name) {
+    using D = talos::Descriptor<review_test::Shot>;
+    talos::event::Registration source;
+    source.id = id;
+    source.kind = SourceKind::WATCHER;
+    source.name = std::move(name);
+    source.message_bytes = sizeof(review_test::Shot);
+    source.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+    return source;
+  };
+  constexpr int kSeconds = 60;
+  constexpr int kTicksPerSecond = 50;
+  {
+    talos::event::Registration tick;
+    tick.id = 1;
+    tick.kind = SourceKind::TIMER;
+    tick.name = "update";
+    talos::event::log::LogWriter writer{
+        library + "/s1/reader.tlog", "reader",
+        talos::event::log::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({tick, shot(2, "/once/state"), shot(3, "/every/state")},
+                 MonotonicTime::from_nanos(kStartNs));
+    const review_test::Shot value{1.5, 1, review_test::Mode::IDLE, false, 7};
+    const auto bytes = std::as_bytes(std::span{&value, 1});
+    std::uint64_t index = 0;
+    for (int k = 0; k < kSeconds * kTicksPerSecond; ++k) {
+      const std::int64_t t = kStartNs + k * (kSecond / kTicksPerSecond);
+      Context context{};
+      context.dispatch_index = ++index;
+      context.event_time = context.now = MonotonicTime::from_nanos(t);
+      context.publish_time = MonotonicTime::from_nanos(t);
+      context.sequence = static_cast<std::uint64_t>(k) + 1;
+      context.kind = EventKind::MESSAGE;
+      context.source_id = k == 0 ? 2 : 3;
+      writer.dispatch(context, bytes);
+      context.kind = EventKind::READ;
+      context.source_id = 2;
+      context.publish_time = MonotonicTime::from_nanos(kStartNs);
+      context.sequence = 1;
+      writer.dispatch(context, {});
+    }
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  Review review{library, 1u << 20};
+  const Response response =
+      review.Get("/review/s1/snapshot",
+                 "t_ns=" + std::to_string(kStartNs + kSeconds * kSecond));
+  ASSERT_EQ(response.status, 200) << response.body;
+  const json channels = json::parse(response.body)["channels"];
+  ASSERT_TRUE(channels.contains("once/state/position_m")) << response.body;
+  EXPECT_EQ(channels["once/state/position_m"]["sample_ns"],
+            std::to_string(kStartNs));
+  // Each second holds 50 ticks of two records; the once topic's second and
+  // the every topic's last are read, one seek each.
+  const std::uint64_t second_bytes =
+      kTicksPerSecond *
+      (2 * sizeof(talos::event::log::RecordHeader) + sizeof(review_test::Shot));
+  EXPECT_EQ(review.last_read().seeks, 2u);
+  EXPECT_LE(review.last_read().bytes, 2 * second_bytes);
   std::filesystem::remove_all(library);
 }
 

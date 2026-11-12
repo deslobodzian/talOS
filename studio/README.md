@@ -198,10 +198,17 @@ both versions.
 
 Opening a session streams it once, merged, and keeps per log file one
 24-byte checkpoint per second of event time that holds records (where that
-second starts, and which sources it holds). A series or snapshot seeks to
-the checkpoints it needs and reads those seconds only, one second either
-side of its range by event time: a message received or sent more than a
-second from its publication time is not found. No log file is read whole.
+second starts, and which sources recorded a value in it, a SEND or MESSAGE
+record). A series seeks to the checkpoints it needs and reads those seconds
+only, one second either side of its range by event time: a message received
+or sent more than a second from its publication time is not found. A
+snapshot at `t` reads, per log file and per topic source in it, the latest
+second (up to the one after `t`'s) that holds a value of that source, each
+such second once, and the source's next earlier such second only when that
+one yields none (every value in it published after `t`): normally one second
+per source, however long ago the topic was last published. Source ids from 63 on
+share one bit of the checkpoint, so such a source may also read seconds that
+hold only another's values. No log file is read whole.
 Series buckets (min, max, last, count) are kept for repeated requests in an
 LRU of at most `--cache-mb`. So the heap is the index, plus that cache, plus
 one read window per open log (REQ-OPS-42). On a generated 203 MiB session
