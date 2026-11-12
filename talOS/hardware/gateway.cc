@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "config_wire.h"
+#include "feedback.h"
 #include "gate.h"
 
 namespace talos::hardware {
@@ -412,18 +413,15 @@ bool Gateway::JudgeFeedbackAge() {
     return FeedbackFresh(sample.position_age_us, bound) &&
            FeedbackFresh(sample.velocity_age_us, bound);
   };
-  bool any_valid = config_.motors.empty() && config_.sensors.empty();
   for (std::size_t i = 0; i < config_.motors.size(); ++i) {
     auto& sample = state_.motors[i];
     sample.valid = sample.valid && fresh(sample);
-    any_valid = any_valid || sample.valid;
   }
   for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
     auto& sample = state_.sensors[i];
     sample.valid = sample.valid && fresh(sample);
-    any_valid = any_valid || sample.valid;
   }
-  return any_valid;
+  return AnyFeedbackValid(state_);
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
@@ -601,12 +599,10 @@ State Gateway::snapshot() const {
   // a mask), so no reader takes a frozen value for a measurement. Only the
   // published copy: reset detection skips invalid samples either way.
   for (auto& m : s.motors) {
-    if (m.valid) continue;
-    m.position_rot = m.velocity_rps = m.voltage = m.stator_current_a =
-        m.supply_current_a = 0;
+    if (!m.valid) MarkInvalid(m);
   }
   for (auto& sensor : s.sensors) {
-    if (!sensor.valid) sensor.position_rot = sensor.velocity_rps = 0;
+    if (!sensor.valid) MarkInvalid(sensor);
   }
   s.flags = (configured_ && config_.commissioned ? kConfigured : 0u) |
             (configured_ && enabled_ ? kEnabled : 0u) |

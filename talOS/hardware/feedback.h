@@ -1,8 +1,8 @@
 #pragma once
 
 // The gateway's rules for an invalid feedback sample and for total feedback
-// loss, shared with testing::SimHardware so a node test sees what the robot
-// reports for the same condition.
+// loss. The gateway and testing::SimHardware both call these, so a node test
+// sees what the robot reports for the same condition.
 
 // Relative, as in the rest of the gateway: the RoboRIO's GradleRIO build
 // compiles the gateway with talOS/, not the repository root, on its path.
