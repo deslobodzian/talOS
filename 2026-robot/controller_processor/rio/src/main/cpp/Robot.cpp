@@ -268,23 +268,27 @@ void Robot::StartCompetition() {
   const auto restoring = talos::rio::BeginRestore(*gateway_, kConfigPath);
   const uint64_t restoring_id =
       restoring ? talos::hardware::ConfigurationId(*restoring) : 0;
-  // An acknowledged configuration not yet on disk. The save syncs storage on
-  // this loop thread, so it waits for a disabled tick: an acknowledgement can
-  // come while enabled (a configure finishing after enable, or an identical
-  // push after a failed save), and nothing may stall the loop while devices
-  // hold their last demand.
-  std::optional<talos::hardware::Config> unsaved;
-  uint64_t saved_id = restoring_id;
+  // Acknowledged configurations go to disk on the persister's own thread:
+  // the save syncs storage twice, and this loop must not wait on it. The
+  // loop hands one over only on a disabled tick (an acknowledgement can come
+  // while enabled: a configure finishing after enable, or an identical push
+  // after a failed save) and collects the outcome on later ticks, never
+  // waiting (ConfigStore.h). Started here, before the loop raises itself
+  // below, so it keeps the default scheduling.
+  talos::rio::ConfigPersister persister{
+      [](const talos::hardware::Config& config) {
+        return talos::rio::SaveConfigFile(kConfigPath, config);
+      },
+      restoring_id};
+  persister.Start();
   endpoint_ = std::make_unique<talos::hardware::Endpoint>(*gateway_);
   companion_sink_ = talos::rio::MakeDashboardSink();
   companion_ =
       std::make_unique<talos::rio::CompanionReporter>(*companion_sink_);
   companion_->Start();
-  endpoint_->OnConfigured(
-      [&unsaved, &saved_id](const talos::hardware::Config& config) {
-        if (talos::hardware::ConfigurationId(config) != saved_id)
-          unsaved = config;
-      });
+  endpoint_->OnConfigured([&persister](const talos::hardware::Config& config) {
+    persister.Acknowledged(config);
+  });
 
   // Opened from the loop, retried every SocketRetry::kPeriodUs until the
   // network has a route to the companion (after a RoboRIO boot, the program
@@ -457,12 +461,9 @@ void Robot::StartCompetition() {
       companion_->Observe(observed);
     }
 
-    if (unsaved && !(gateway_->snapshot().flags & talos::hardware::kEnabled)) {
-      if (talos::rio::SaveConfigFile(kConfigPath, *unsaved))
-        saved_id = talos::hardware::ConfigurationId(*unsaved);
-      else
-        Report(*log_, kPersistMessage, "cannot persist hardware configuration");
-      unsaved.reset();
+    if (persister.Tick(
+            !(gateway_->snapshot().flags & talos::hardware::kEnabled)) > 0) {
+      Report(*log_, kPersistMessage, "cannot persist hardware configuration");
     }
 
     const uint64_t end_us = NowUs();
@@ -489,6 +490,14 @@ void Robot::StartCompetition() {
     std::this_thread::sleep_for(std::chrono::milliseconds{5});
   }
   backend_->Neutral();
+
+  // Only after the outputs are neutral: a save handed over finishes first
+  // (the file stays whole either way), and its wait must not hold them. One
+  // still waiting for a disabled tick is dropped; it was never handed over.
+  persister.Stop();
+  if (persister.Tick(false) > 0) {
+    Report(*log_, kPersistMessage, "cannot persist hardware configuration");
+  }
 
 #ifndef __FRC_ROBORIO__
   // The same summary line the standalone sim_gateway prints, so the drivetrain

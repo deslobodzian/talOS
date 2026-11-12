@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iterator>
 #include <system_error>
+#include <utility>
 #include <vector>
 
 #include "hardware/config_wire.h"
@@ -15,6 +16,12 @@
 #include <cerrno>
 
 #include "process/durable_sync.h"
+#endif
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #endif
 
 namespace talos::rio {
@@ -95,6 +102,82 @@ std::optional<hardware::Config> BeginRestore(hardware::Gateway& gateway,
   auto config = LoadConfigFile(path);
   if (!config || !gateway.BeginReconfigure(*config)) return std::nullopt;
   return config;
+}
+
+ConfigPersister::ConfigPersister(Save save, uint64_t on_disk_id)
+    : save_{std::move(save)}, on_disk_id_{on_disk_id}, saved_id_{on_disk_id} {}
+
+ConfigPersister::~ConfigPersister() { Stop(); }
+
+void ConfigPersister::Start() {
+  if (thread_.joinable()) return;
+  stop_ = false;
+  thread_ = std::thread([this] { Run(); });
+}
+
+void ConfigPersister::Stop() {
+  if (!thread_.joinable()) return;
+  {
+    std::lock_guard lock{mutex_};
+    stop_ = true;
+  }
+  wake_.notify_one();
+  thread_.join();
+}
+
+void ConfigPersister::Acknowledged(const hardware::Config& config) {
+  // Already on disk, with nothing handed over since that could be written
+  // after it: nothing to save. Otherwise this is the newest, even when the
+  // file holds it (A on disk, B in flight, A acknowledged: A must follow B).
+  if (outstanding_ == 0 && !unsaved_ &&
+      hardware::ConfigurationId(config) == on_disk_id_)
+    return;
+  unsaved_ = config;
+}
+
+uint32_t ConfigPersister::Tick(bool disabled) {
+  if (!unsaved_ && outstanding_ == 0) return 0;
+  std::unique_lock lock{mutex_, std::try_to_lock};
+  if (!lock.owns_lock()) return 0;  // the saver is moving one; next tick
+  outstanding_ -= finished_ - collected_finished_;
+  collected_finished_ = finished_;
+  const auto failed = static_cast<uint32_t>(failed_ - collected_failed_);
+  collected_failed_ = failed_;
+  on_disk_id_ = saved_id_;
+  if (!unsaved_ || !disabled) return failed;
+  // A configuration handed over but not yet started is superseded: its save
+  // never runs, so it was never outstanding twice.
+  if (!pending_) ++outstanding_;
+  pending_ = std::move(unsaved_);
+  unsaved_.reset();
+  lock.unlock();
+  wake_.notify_one();
+  return failed;
+}
+
+void ConfigPersister::Run() {
+#ifdef __linux__
+  // Below the loop thread, like the logger: a save is not urgent.
+  pthread_setname_np(pthread_self(), "talos-config");
+  setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+#endif
+  std::unique_lock lock{mutex_};
+  for (;;) {
+    wake_.wait(lock, [this] { return pending_.has_value() || stop_; });
+    // Stop saves what was handed over first.
+    if (!pending_) return;
+    const hardware::Config config = std::move(*pending_);
+    pending_.reset();
+    lock.unlock();
+    const bool ok = save_(config);
+    lock.lock();
+    ++finished_;
+    if (ok) {
+      saved_id_ = hardware::ConfigurationId(config);
+    } else {
+      ++failed_;
+    }
+  }
 }
 
 }  // namespace talos::rio
