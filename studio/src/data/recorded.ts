@@ -2,8 +2,10 @@
 //
 // The playhead is an event time inside the session's bounds. Value panels read
 // the snapshot at the playhead: each channel's newest value at or before it,
-// with its own sample time, so the live staleness rule (freshness.ts) applies
-// unchanged. Plots read decimated series: min, max and last per bucket, the plot's pixel
+// with its own sample time, and its age is measured against the snapshot's
+// own t_ns (playback.clock_ns), as live measures it against its frame's time:
+// a snapshot that lags a playing playhead does not make its readings stale.
+// Plots read decimated series: min, max and last per bucket, the plot's pixel
 // width rounded up to one of POINT_SIZES buckets.
 //
 // Requests: a getter that misses starts a fetch and returns what it has (the
@@ -175,7 +177,8 @@ export class RecordedSource implements DataSource {
     return {
       mode,
       cursor_ns: cursor,
-      clock_ns: cursor,
+      // Readings are as old as their snapshot's time, not the playhead's.
+      clock_ns: this.snapshot?.timestamp_ns ?? null,
       bounds: {start: this.bounds.start_ns, end: this.bounds.end_ns},
       stats: {skipped: 0, late: 0, invalid: 0},
       status: this.error ? `Review error: ${this.error}` : `Recorded session ${this.id}`,
@@ -195,6 +198,7 @@ export class RecordedSource implements DataSource {
     this.error = '';
     this.failed.clear();
     this.snapshot = null;
+    this.playback = this.makePlayback(this.playback.mode);
     this.version++;
     this.requestSnapshot(this.playhead.toString(), true);
     this.changed();
@@ -330,6 +334,7 @@ export class RecordedSource implements DataSource {
     };
     this.samples = samples;
     this.chassisReading = this.readChassis();
+    this.playback = this.makePlayback(this.playback.mode);
     this.version++;
     this.changed();
   }

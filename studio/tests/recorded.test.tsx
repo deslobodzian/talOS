@@ -10,6 +10,7 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
+import {readingClock, sampleStale} from '../src/data/freshness';
 import {useChannelStale, useChassis, usePlayback} from '../src/data/hooks';
 import {
   bucketSeries,
@@ -324,6 +325,35 @@ test('a recorded value one second older than the playhead is stale, as live', as
   assert.deepEqual(await read(), {chassis: true, battery: true});
   valid = 0;
   assert.deepEqual(await read(), {chassis: null, battery: true});
+});
+
+// At 4x the playhead runs ahead of the snapshot in flight: a reading's age is
+// measured against its snapshot's own time (live measures it against its
+// frame's), so a value 0.5 s old there stays fresh with the playhead a
+// second further on, and one a second old there is stale.
+test('a lagging snapshot during 4x playback ages its readings by its own time', async () => {
+  const at = START + 5_000_000_000n;
+  const server = fakeServer(url => {
+    if (!url.pathname.endsWith('/snapshot') || url.searchParams.get('t_ns') !== at.toString())
+      return undefined;  // later snapshots stay in flight
+    const sample = (age: bigint) => ({value: 1, sample_ns: (at - age).toString()});
+    return json({t_ns: at.toString(),
+                 channels: {fresh: sample(500_000_000n), old: sample(1_000_000_000n)}});
+  });
+  const time = fakeClock();
+  const recorded = source(server, [info('fresh'), info('old')], time.clock);
+  recorded.seek(at.toString());
+  await settle();
+  recorded.setRate(4);
+  recorded.play();
+  for (let i = 0; i < 4; i++) time.advance(62.5);
+  assert.equal(BigInt(recorded.playback.cursor_ns!), at + 1_000_000_000n);
+  assert.equal(recorded.snapshotAtCursor()?.timestamp_ns, at.toString());
+  const stale = (name: string) => sampleStale(
+      recorded.channelSample(name)?.timestamp_ns ?? null, readingClock(recorded.playback));
+  assert.equal(stale('fresh'), false);
+  assert.equal(stale('old'), true);
+  recorded.close();
 });
 
 test('an HTTP error or malformed payload is an error state, never a throw', async () => {
