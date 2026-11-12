@@ -111,7 +111,7 @@ class Controller {
     stick.axes.fill(0.25f);
     stick.povs.fill(90);
     std::memset(stick.name, 'x', ds::kMaxNameLength - 1);
-    thread_ = std::jthread{[this](std::stop_token stop) { Run(stop); }};
+    thread_ = std::jthread{[this](const std::stop_token& stop) { Run(stop); }};
   }
 
  private:
