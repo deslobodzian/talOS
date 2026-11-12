@@ -124,7 +124,9 @@ There are exactly two kinds of input, and they are treated differently.
   **[review]**
 - Read another subsystem only through its messages and topics, or a configured
   value it owns through `param_of` in the constructor. Never include
-  its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[review; gap: ARCH-2]**
+  its headers beyond `<pkg>/*_generated.h` and `<pkg>/topics.h`. **[enforced:
+  `tools/check_layers.py` refuses a Bazel dependency on another node package's
+  library; gap: ARCH-2, package-private visibility]**
 
 ## 4. Outputs
 
