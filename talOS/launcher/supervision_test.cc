@@ -392,7 +392,7 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
 // nothing and records zeros. The stubs (testdata/delivery_loss_node.cc)
 // declare no endpoints but the bridge publishes its request watcher, so the
 // session runs with --allow-graph-errors.
-// REQ-OPS-16, REQ-RT-19
+// REQ-OPS-43, REQ-OPS-16, REQ-RT-19
 TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
   auto options = BaseOptions("delivery_loss");
   options.allow_graph_errors = true;

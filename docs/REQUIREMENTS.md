@@ -195,6 +195,7 @@ numbered section, a number in RULES a rule:
 | REQ-OPS-33 | The launcher's supervision never waits on its own stdout or stderr: a closed, full or unread descriptor costs only the echo. Every line the launcher prints once its session directory exists, and every member's output, are kept in that directory (not synced on each write). A terminal hangup (SIGHUP) is an orderly stop, like SIGTERM, unless SIGHUP was ignored when the launcher started (`nohup`). Every process the launcher spawns starts with default signal dispositions and an empty signal mask. | P1 | LR "Node output" | session outlives a closed reader; restart and stop with an unread full stdout; child signal state | integration |
 | REQ-OPS-41 | `studio_review` opens a session of version-7 logs (all segments and restarts) with no conversion. It serves every logged schema'd topic by field path and the decoded hardware packets, each value with its publication time and equal to `log_dump`'s decoding of that record, under the channel names live telemetry uses (`talOS/telemetry:channels`). Damaged logs are read and named as `log_dump` reads them. | P1 | ER "Log format"; LR "Filtering and exporting logs"; STU | review API against `log_dump --format jsonl` | contract (gap: TODO STUDIO-2) |
 | REQ-OPS-42 | `studio_review`'s heap stays within 24 B per log-file second, plus `--cache-mb` (default 256), plus one read window per open log, and it never reads a log file whole. | P2 | STU | allocation accounting; resident memory on a recorded session | unit + perf (gap: TODO STUDIO-2) |
+| REQ-OPS-43 | Every session manifest records, per run and summed per node, the wake failures, stalled arms and wake fallbacks that run's registry row last showed, and the bridge's skipped requests per subsystem; a node whose row was never seen records none. `session_report --strict` fails a session with any lost wake, skipped request or wake fallback. | P1 | LR "Session segments and logs"; INT | manifest fields; report verdict | integration + unit |
 
 ### DEV: scaffold, simulation, describe-only, standalone subsystem, robot libraries
 
@@ -240,7 +241,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/protocol` | REQ-CONTRACT-01, REQ-CONTRACT-03, REQ-RT-22 |
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31 |
-| `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-26 (`tlog_to_wpilog`), REQ-OPS-30, REQ-OPS-32, REQ-DEV-04, REQ-OPS-33 |
+| `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-26 (`tlog_to_wpilog`), REQ-OPS-30, REQ-OPS-32, REQ-DEV-04, REQ-OPS-33, REQ-OPS-43 |
 | `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09 |
