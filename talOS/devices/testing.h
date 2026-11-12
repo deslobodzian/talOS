@@ -35,11 +35,16 @@
 // reset_device(); its remote CANcoder's; or a follower's master's) applies
 // neutral from that tick, other motors and the epoch untouched, and only a
 // request observed after the last such State drives it again; a follower's
-// sample reads invalid while its master's does. Unlike the
-// gateway, losing every motor's and CAN sensor's feedback raises no
-// hardware fault and starts no new epoch, enabling or disabling does not
-// start a new epoch, and requests are not checked against the config id,
-// motor limits or soft limits.
+// sample reads invalid while its master's does. An invalid motor or CAN
+// sensor sample carries zero position, velocity, voltage and stator and
+// supply current (hardware::MarkInvalid). As on the gateway, a State in which
+// every motor and CAN sensor is invalid carries kHardwareFault (so
+// robot_enabled() is false) and, the first time, starts a new epoch with
+// every output neutral, digital and PWM included; requests are refused until
+// a State shows valid feedback again, which clears the fault in that epoch.
+// Unlike the gateway, enabling or disabling does not start a new epoch, and
+// requests are not checked against the config id, motor limits or soft
+// limits.
 //
 // Each period it also publishes the bridge's /hw/status: the states and
 // Driver Station packets it sent, configured, and the exact simulated gateway
@@ -82,8 +87,9 @@ class SimHardware {
   // UINT32_MAX means unknown. Zero preserves simultaneous ideal feedback.
   // As on the gateway (hardware::FeedbackFresh), a motor, CANcoder or gyro
   // whose position or velocity age is command_timeout_us or more, or
-  // unknown, goes out with valid == false, so its handle reads
-  // connected() == false; a younger age is valid, whatever it is.
+  // unknown, goes out with valid == false and zero measurements, so its
+  // handle reads connected() == false; a younger age is valid, whatever it
+  // is.
   void set_motor(std::string_view node, std::string_view device,
                  double position, double velocity,
                  std::uint32_t position_age_us = 0,
