@@ -1,0 +1,8 @@
+// log_budget_test's sender topics, /budget_quiet/state and
+// /budget_flood/state.
+namespace budget_test;
+
+// 512 bytes the sender keeps nonzero to the end, so a log stores all of them.
+struct Block {
+  fill_count:[uint:128];
+}

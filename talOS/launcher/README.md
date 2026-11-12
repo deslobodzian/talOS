@@ -735,8 +735,7 @@ that id (what `--replay-inputs` leaves). `[robot] log_keep_sessions` defaults
 to 50, including the new session; `log_max_bytes` defaults to 2 GiB. Both must
 be positive integers; config load refuses another type or value. Half the byte budget is reserved for the new session's event logs
 and divided among logging members in proportion to the bytes each member's
-log is expected to store per second, so every capped member keeps about the
-same length of the session's history (REQ-OPS-32; `log_budget.h`). From the
+log is expected to store per second (REQ-OPS-32; `log_budget.h`). From the
 member's `--describe` and the config: a timer or sender records once per
 `period_us` tick; a sequence watcher (a subscription with a callback)
 records every message at its writer's rate, and a latest-only watcher at
@@ -748,17 +747,35 @@ not the 1436 B `hardware::Packet` (`/hw/state` once per gateway tick, the
 Driver Station and `/hw/status` at 50 Hz, `/hw/request/<node>` at its node's
 rate). The hardware bridge logs only the State it publishes and the commands
 it sends, so only those count for it, the commands at one per actuator
-owner's request: the rate while owners change their demands. While they do
-not, the bridge sends only on a change of the oldest owner observation or its
-heartbeat, so its log keeps a longer tail than the others; the model keeps
-that worst case because how often owners change their demands is not known
-at launch, and over-counting only lengthens the bridge's own tail. Byte topics are never logged. A member that did not answer `--describe`
+owner's request: the rate while owners change their demands. Byte topics are never logged. A member that did not answer `--describe`
 weighs as the mean of the others, and every member gets at least the
 smallest share at which its log rotates (two segments of its prefix and
-largest record) while those fit in the budget. Restarts share their member's remaining budget, but never
+largest record) while those fit in the budget.
+
+The shares give the session's log window: the record time each member not
+held at its floor keeps at its expected rate (the budget left after the
+floors over their summed rates, less what each one's segments spend on
+their prefix, the least over them), printed as the `Event-log window`
+line. Every logging member is started with
+`--log-window-us <window>` beside `--log-max-bytes <share>`, and its capped
+log also ends a segment once its records span window / n
+(`LogWriterOptions::window`; n = 8 segments while the share holds them). So
+in every robot state a member that stores no more than its expected rate
+keeps between 7/8 of the window and the window of record time, whatever it
+actually stores (a disabled `teleop` that sends nothing, a bridge whose
+owners hold their demands), and leaves the rest of its share unused; a
+member that stores more ends its segments on bytes and keeps a shorter tail
+in proportion, and no other member's tail depends on it; a member that
+records nothing for a while keeps a longer one. A member held at its floor
+keeps between (n - 1) / n of the window and the window. No window is passed
+(segments end on bytes only) when the floors do not fit or no member's rate
+is known. Time-ended segments are smaller, never more numerous: a log still
+holds at most n segment files of at most share / n bytes. Restarts share their member's remaining budget, but never
 get less than half of its share: to make that room the launcher deletes the
 earlier runs' oldest log files (never the newest file of the run that just
-ended) and marks those runs `log_capped`. Older sessions are retained within
+ended) and marks those runs `log_capped`. A restarted run gets the same
+window; with less than its member's share, its segments may end on bytes
+first. Older sessions are retained within
 the other half, every file in them counted (event logs, output logs, camera
 frames, metadata), except the protected matches below.
 

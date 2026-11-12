@@ -460,13 +460,46 @@ talos_cc_node(
     deps = ["//talOS/devices"],
 )
 
+# A member that stores a fraction of its predicted rate while disabled, and
+# one that stores several times it.
+talos_messages(
+    name = "budget_message",
+    srcs = ["testdata/budget_message.fbs"],
+    include_prefix = "budget_test",
+    visibility = ["//visibility:private"],
+)
+
+talos_cc_node(
+    name = "budget_quiet",
+    srcs = ["testdata/budget_sender.cc"],
+    node_name = "budget_quiet",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":budget_message",
+        "//talOS/devices",
+    ],
+)
+
+talos_cc_node(
+    name = "budget_flood",
+    srcs = ["testdata/budget_sender.cc"],
+    node_name = "budget_flood",
+    visibility = ["//visibility:private"],
+    deps = [
+        ":budget_message",
+        "//talOS/devices",
+    ],
+)
+
 cc_test(
     name = "log_budget_test",
     size = "medium",
     srcs = ["log_budget_test.cc"],
     data = [
         ":budget_fast",
+        ":budget_flood",
         ":budget_listener",
+        ":budget_quiet",
         ":budget_slow",
         "//talOS/bridge:hardware_node",
     ],
@@ -475,6 +508,8 @@ cc_test(
         "TALOS_BUDGET_FAST": "$(rlocationpath :budget_fast)",
         "TALOS_BUDGET_SLOW": "$(rlocationpath :budget_slow)",
         "TALOS_BUDGET_LISTENER": "$(rlocationpath :budget_listener)",
+        "TALOS_BUDGET_QUIET": "$(rlocationpath :budget_quiet)",
+        "TALOS_BUDGET_FLOOD": "$(rlocationpath :budget_flood)",
     },
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.

@@ -146,12 +146,12 @@ void PrintManifest(const SessionManifest& manifest) {
 
 // Each logging member's share of the session's log budget, in proportion to
 // the bytes its log is expected to store per second, and at least what
-// rotates (log_budget.h); its restarts draw on what its earlier runs left
-// (Launcher::Restart).
-std::vector<uint64_t> LogBudgets(const std::vector<NodeProcessInfo>& procs,
-                                 const std::vector<NodeDescription>& described,
-                                 const config::RobotConfig& robot_config,
-                                 uint64_t session_log_budget) {
+// rotates (log_budget.h), and the window of record time every member's log
+// keeps; its restarts draw on what its earlier runs left (Launcher::Restart).
+LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
+                    const std::vector<NodeDescription>& described,
+                    const config::RobotConfig& robot_config,
+                    uint64_t session_log_budget) {
   const TopicLoads loads = DeclaredTopicLoads(described, robot_config);
   std::vector<bool> logs(procs.size());
   std::vector<double> rates(procs.size(), -1);
@@ -569,8 +569,13 @@ int Launcher::RunSession() {
     }
     if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
   }
-  const std::vector<uint64_t> log_budgets =
+  const LogSplit log_split =
       LogBudgets(procs, described, robot_config, session_log_budget);
+  std::cout << "[launcher] Event-log window "
+            << (log_split.window.count() > 0
+                    ? std::to_string(log_split.window.count()) + " us"
+                    : std::string{"none (segments end on bytes)"})
+            << "\n";
   // Synced before any node starts; from here on every version is synced,
   // off this thread (PersistManifest).
   PersistManifest(procs, /*durable=*/true);
@@ -598,7 +603,8 @@ int Launcher::RunSession() {
     if (studio && i == studio->index()) continue;
     auto& proc = procs[i];
     PrepareLaunch(node_specs[i], described[i], proc, robot_config,
-                  log_budgets[i], remote, remote_port, local_port, launches[i]);
+                  log_split.shares[i], log_split.window, remote, remote_port,
+                  local_port, launches[i]);
 
     std::string spawn_error;
     const pid_t pid = SpawnNode(proc, launches[i], spawn_error);
@@ -640,9 +646,10 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
                              const NodeDescription& described,
                              const NodeProcessInfo& proc,
                              const config::RobotConfig& robot_config,
-                             uint64_t log_budget, const std::string& remote,
-                             uint16_t remote_port, uint16_t local_port,
-                             NodeLaunch& launch) const {
+                             uint64_t log_budget,
+                             std::chrono::microseconds log_window,
+                             const std::string& remote, uint16_t remote_port,
+                             uint16_t local_port, NodeLaunch& launch) const {
   launch.restart = RestartSchedule{spec.critical};
   launch.compare_endpoints = described.answered;
   launch.declared = described.declared.sources;
@@ -668,8 +675,14 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
     launch.log_arg = args.size();
     launch.log_budget = log_budget;
     args.insert(args.end(),
-                {proc.log_path, "--log-max-bytes", std::to_string(log_budget),
-                 "--config", options_.config_path});
+                {proc.log_path, "--log-max-bytes", std::to_string(log_budget)});
+    // The same window for every run, a restart's included (Restart rewrites
+    // only the path and the cap); absent, the log ends segments on bytes.
+    if (log_window.count() > 0) {
+      args.insert(args.end(),
+                  {"--log-window-us", std::to_string(log_window.count())});
+    }
+    args.insert(args.end(), {"--config", options_.config_path});
     if (options_.simulation) args.push_back("--sim");
     // Started with the graph it was described with (DescribeGraph).
     if (described.answered && described.declared.reads_graph) {

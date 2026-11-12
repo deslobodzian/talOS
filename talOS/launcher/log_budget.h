@@ -2,10 +2,12 @@
 
 // How a session's event-log budget is divided among its members: each
 // member's expected stored bytes per second, from what it declared
-// (--describe) and the config, and shares proportional to them, so every
-// capped member keeps a tail of the session of about the same length
-// (REQ-OPS-32).
+// (--describe) and the config, shares proportional to them, and the window
+// of record time those shares hold, after which every capped log ends a
+// segment, so every capped member keeps a tail of the session of about the
+// same length (REQ-OPS-32).
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -58,14 +60,28 @@ double ExpectedLogRate(const introspect::Description& declared,
 // schemas) and its largest record (LogWriter's segment rule).
 uint64_t SmallestRotatingShare(const introspect::Description& declared);
 
+// Shares of `budget` and the window they hold (see SplitLogBudget).
+struct LogSplit {
+  std::vector<uint64_t> shares;
+  // The record time each member not held at a floor keeps at its expected
+  // rate: the budget left after the floors over those members' summed
+  // weights, less what each one's segments spend on their prefix (half its
+  // floor per segment, up to kLogSegments segments), the least over them.
+  // Zero when the floors do not fit, when every logging member is held at
+  // its floor, or when no logging member's rate is known.
+  std::chrono::microseconds window{0};
+};
+
 // Shares of `budget` proportional to `rates` (negative: unknown, weighted as
 // the mean of the known), each at least floors[i] while the floors fit in the
 // budget (else in proportion to the floors); non-logging members get 0 and
-// every logging member at least 1 byte. The shares never exceed the budget
-// unless it is smaller than one byte per logging member.
-std::vector<uint64_t> SplitLogBudget(uint64_t budget,
-                                     const std::vector<bool>& logs,
-                                     const std::vector<double>& rates,
-                                     const std::vector<uint64_t>& floors);
+// every logging member at least 1 byte; and the window those shares hold.
+// The shares never exceed the budget unless it is smaller than one byte per
+// logging member. Each member's log ends a segment at least every window / n
+// (LogWriterOptions::window), so a member storing no more than its rate keeps
+// between (n - 1) / n of the window and the window.
+LogSplit SplitLogBudget(uint64_t budget, const std::vector<bool>& logs,
+                        const std::vector<double>& rates,
+                        const std::vector<uint64_t>& floors);
 
 }  // namespace talos::launcher
