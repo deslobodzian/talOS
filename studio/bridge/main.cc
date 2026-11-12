@@ -9,6 +9,7 @@
 #include <array>
 #include <bit>
 #include <cerrno>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "system.h"
@@ -486,6 +488,20 @@ std::string mime(const fs::path& p) {
 // larger anyway.
 constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
 constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
+// uWebSockets' idle timeout for a client, in seconds. With T - m seconds
+// gone without data from the client (or a drain of its backlog) it pings,
+// and it closes the client if nothing arrives in the next m: m is 4, 8 or
+// 16 s, 8 at T = 16 (WebSocketContextData::calculateIdleTimeoutCompnents).
+// uSockets checks timeouts every 4 s, so the ping can go up to 4 s early,
+// and a client that stopped answering loses its slot 12 to 16 s after the
+// last data it sent. 16 is the smallest T with an 8 s pong window, which
+// covers five retransmissions of a lost pong at TCP's 200 ms minimum RTO
+// (sent by 6.2 s). The bound and its reason: docs/DATA_FLOW.md "Telemetry,
+// Studio, and the radio boundary". uWebSockets refuses T below 8 or above
+// 960.
+constexpr unsigned kIdleTimeoutS = 16;
+constexpr unsigned kMinIdleTimeoutS = 8;
+constexpr unsigned kMaxIdleTimeoutS = 960;
 }  // namespace
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
@@ -536,12 +552,24 @@ int main(int argc, char** argv) try {
   std::string declared_path;
   std::string manifest_path;
   std::string config_path;
+  unsigned idle_timeout_s = kIdleTimeoutS;
+  bool bad_idle_timeout = false;
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
     if (argument == "--config" && i + 1 < argc) {
       config_path = argv[++i];
+      continue;
+    }
+    if (argument == "--idle-timeout-s" && i + 1 < argc) {
+      const std::string_view value = argv[++i];
+      const auto [end, error] = std::from_chars(
+          value.data(), value.data() + value.size(), idle_timeout_s);
+      bad_idle_timeout = error != std::errc{} ||
+                         end != value.data() + value.size() ||
+                         idle_timeout_s < kMinIdleTimeoutS ||
+                         idle_timeout_s > kMaxIdleTimeoutS;
       continue;
     }
     if (argument == kDeclared && i + 1 < argc) {
@@ -571,7 +599,7 @@ int main(int argc, char** argv) try {
       std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
         return std::string_view(argument).starts_with("--");
       });
-  if (count > 4 || unknown_option) {
+  if (count > 4 || unknown_option || bad_idle_timeout) {
     std::cerr
         << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
@@ -580,6 +608,8 @@ int main(int argc, char** argv) try {
            "       [--manifest PATH]   the launcher's manifest.json, served at "
            "/manifest.json\n"
            "       [--config PATH]     reads [studio] max_clients\n"
+           "       [--idle-timeout-s S]  client idle timeout, 8 to 960 "
+           "(default 16)\n"
            "       [--describe]          print the --describe envelope and "
            "exit\n";
     return 2;
@@ -646,6 +676,11 @@ int main(int argc, char** argv) try {
   uWS::App::WebSocketBehavior<Client> behavior{};
   behavior.maxPayloadLength = 1024;
   behavior.maxBackpressure = 512 * 1024;
+  // A client that stopped answering (a laptop that dropped off the network)
+  // gives up its slot within the idle timeout (kIdleTimeoutS); one that only
+  // receives keeps it by answering the pings, as browsers do.
+  behavior.idleTimeout = static_cast<unsigned short>(idle_timeout_s);
+  behavior.sendPingsAutomatically = true;
   behavior.upgrade = [&](auto* response, auto* request, auto* context) {
     if (bridge.clients.clients().size() >= bridge.max_clients) {
       ++bridge.refused;

@@ -134,6 +134,22 @@ py_test(
     ],
 )
 
+# Runs the bridge at its smallest idle timeout (8 s), so it takes about 9 s.
+py_test(
+    name = "client_timeout_test",
+    size = "medium",
+    srcs = [
+        "client_timeout_test.py",
+        "integration_test.py",
+    ],
+    data = [":studio_bridge"],
+    main = "client_timeout_test.py",
+    tags = [
+        "integration",
+        "local",
+    ],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",

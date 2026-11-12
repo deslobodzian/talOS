@@ -18,6 +18,7 @@
 2026-robot/main_processor/vision/node_test.cc sleep seeded: integration cases (capture threads) in a node logic target; move them to their own target (TESTING.md §2)
 studio/bridge/bandwidth_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
 studio/bridge/bandwidth_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/client_timeout_test.py clock integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
 studio/bridge/integration_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
 studio/bridge/integration_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
 talOS/bridge/hardware_node_test.cc clock seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
