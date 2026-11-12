@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 30
+_EXPECTED_ABI_VERSION = 31
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -60,6 +60,30 @@ DS_AUTONOMOUS = 1 << 3
 DS_TELEOP = 1 << 4
 DS_TEST = 1 << 5
 DS_ESTOP = 1 << 6
+POSITION_PHASE_UNHOMED = 0
+POSITION_PHASE_HOMING = 1
+POSITION_PHASE_READY = 2
+POSITION_PHASE_MOVING = 3
+POSITION_PHASE_AT_GOAL = 4
+POSITION_PHASE_FAULTED = 5
+POSITION_FAULT_NONE = 0
+POSITION_FAULT_HOMING_TIMEOUT = 1
+POSITION_FAULT_HOMING_STALL = 2
+POSITION_FAULT_SWITCH_STUCK = 3
+POSITION_FAULT_STALL = 4
+POSITION_FAULT_MOVE_TIMEOUT = 5
+VELOCITY_PHASE_STOPPED = 0
+VELOCITY_PHASE_SPINNING_UP = 1
+VELOCITY_PHASE_AT_SPEED = 2
+ROLLER_COMMAND_IDLE = 0
+ROLLER_COMMAND_INTAKE = 1
+ROLLER_COMMAND_EJECT = 2
+ROLLER_COMMAND_FEED = 3
+ROLLER_PHASE_IDLE = 0
+ROLLER_PHASE_INTAKING = 1
+ROLLER_PHASE_HOLDING = 2
+ROLLER_PHASE_EJECTING = 3
+ROLLER_PHASE_FEEDING = 4
 
 
 class TalosError(RuntimeError):
@@ -107,6 +131,28 @@ class DriverStationPacket(ctypes.Structure):
     _fields_ = [("flags", c_uint32), ("alliance", c_int32),
                 ("station", c_int32), ("match_time_s", c_float),
                 ("joysticks", Joystick * DS_MAX_JOYSTICKS)]
+
+
+class PositionMechanismState(ctypes.Structure):
+    _fields_ = [("phase", c_int32), ("fault", c_int32), ("homed", c_int32),
+                ("at_goal", c_int32), ("driving", c_int32),
+                ("connected", c_int32), ("position_rot", c_double),
+                ("position_units", c_double), ("velocity_rps", c_double),
+                ("goal_rot", c_double), ("gravity_v", c_double),
+                ("tolerance_rot", c_double)]
+
+
+class VelocityMechanismState(ctypes.Structure):
+    _fields_ = [("phase", c_int32), ("at_speed", c_int32),
+                ("driving", c_int32), ("connected", c_int32),
+                ("velocity_rps", c_double), ("goal_rps", c_double),
+                ("commanded_rps", c_double), ("current_a", c_double)]
+
+
+class RollerWithSensorState(ctypes.Structure):
+    _fields_ = [("phase", c_int32), ("has_piece", c_int32),
+                ("sensor_connected", c_int32), ("driving", c_int32),
+                ("output_v", c_double)]
 
 
 class Schema(ctypes.Structure):
@@ -204,6 +250,32 @@ _SIGNATURES = {
     "talos_operator_arming_evaluate": (c_int32, [c_void_p, c_int64, c_int32]),
     "talos_operator_arming_armed": (c_int32, [c_void_p, c_int64]),
     "talos_operator_arming_disarm": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_open": (c_int64, [c_void_p, c_char_p]),
+    "talos_position_mechanism_set_goal": (c_int32, [c_void_p, c_int64,
+                                                    c_double, c_double]),
+    "talos_position_mechanism_set_goal_units": (c_int32, [c_void_p, c_int64,
+                                                          c_double,
+                                                          c_double]),
+    "talos_position_mechanism_hold": (c_int32, [c_void_p, c_int64, c_double]),
+    "talos_position_mechanism_stop": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_update": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_clear_fault": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_state": (c_int32, [
+        c_void_p, c_int64, _P(PositionMechanismState)]),
+    "talos_velocity_mechanism_open": (c_int64, [c_void_p, c_char_p]),
+    "talos_velocity_mechanism_set_goal": (c_int32, [c_void_p, c_int64,
+                                                    c_double, c_double]),
+    "talos_velocity_mechanism_stop": (c_int32, [c_void_p, c_int64]),
+    "talos_velocity_mechanism_update": (c_int32, [c_void_p, c_int64]),
+    "talos_velocity_mechanism_state": (c_int32, [
+        c_void_p, c_int64, _P(VelocityMechanismState)]),
+    "talos_roller_with_sensor_open": (c_int64, [c_void_p, c_char_p]),
+    "talos_roller_with_sensor_set_goal": (c_int32, [c_void_p, c_int64,
+                                                    c_int32]),
+    "talos_roller_with_sensor_stop": (c_int32, [c_void_p, c_int64]),
+    "talos_roller_with_sensor_update": (c_int32, [c_void_p, c_int64]),
+    "talos_roller_with_sensor_state": (c_int32, [
+        c_void_p, c_int64, _P(RollerWithSensorState)]),
 }
 _TESTING_SIGNATURES = {
     "talos_sim_create": (c_void_p, [c_char_p]),

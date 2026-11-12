@@ -263,8 +263,12 @@ goal (`set_goal`) only while the node's `Target` is live, and stepped with
 `update()`. Like a `Motor` setter, a request is accepted only inside the
 node's `update()` (`talos::RequireInUpdate(node, what)` in `devices.h` is
 that check, for any layer that holds a request for the flush) and lasts only
-that tick. C++ only for now; a Python node uses one through a C++ node
-exported with `TALOS_EXPORT_NODE`.
+that tick. A Python node composes the same C++ classes as
+`talos.mechanisms.PositionMechanism`, `VelocityMechanism` and
+`RollerWithSensor` (`//talOS/python:mechanisms`): the same method names,
+the C++ getters as properties (`phase`, `at_speed`, `position_rot`, ...),
+`state()` returning the `control` message, and a request outside
+`update()` raising `TalosError`.
 
 Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
 is supply-side current, not `current` (stator current). All three use 0.1-unit

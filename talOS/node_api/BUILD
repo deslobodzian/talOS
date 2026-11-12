@@ -22,17 +22,22 @@ cc_library(
     visibility = ["//visibility:private"],
 )
 
-# C ABI over talos::Node and the devices layer, for nodes written in other
-# languages (//talOS/python:talos).
+# C ABI over talos::Node, the devices layer and talOS/mechanisms, for nodes
+# written in other languages (//talOS/python:talos).
 cc_library(
     name = "node_api",
-    srcs = ["node_api.cc"],
+    srcs = [
+        "mechanisms_api.cc",
+        "node_api.cc",
+    ],
     hdrs = ["node_api.h"],
     deps = [
         ":internal",
         "//talOS/devices",
         "//talOS/driver_station",
         "//talOS/hardware",
+        "//talOS/mechanisms",
+        "//talOS/msgs:control",
         "//talOS/node",
     ],
     # Every exported symbol must reach the shared objects below, even though
@@ -93,6 +98,7 @@ cc_shared_library(
         "//talOS/events:input_replay",
         "//talOS/hardware",
         "//talOS/hardware:config",
+        "//talOS/mechanisms",
         "//talOS/memory:residency",
         "//talOS/node",
         "//talOS/process",
