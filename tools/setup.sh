@@ -12,7 +12,8 @@
 #   --yes        no prompts (passes -y / --noconfirm to the package manager)
 #   --no-studio  skip Node 22 + pnpm (Studio's pnpm loop)
 #   --no-rio     skip JDK 17 and ./gradlew installRoboRioToolchain
-#   --no-lint    skip clang-format-18, clang-tidy-18, buildifier
+#   --no-lint    skip clang-format/clang-tidy 18 (pip wheels, used by
+#                tools/format.sh and tools/tidy.sh), buildifier
 #   --verify     afterwards build the launcher and the robot's nodes, then run
 #                the launcher with --describe-only on the 2026 robot config
 #   -h, --help   this text
@@ -58,7 +59,6 @@ DISTRO=""
 APT_UPDATED=0
 CLT_OK=1
 JDK17_HOME=""
-LLVM18_BIN=""
 ORIG_PATH="$PATH"
 
 NAMES=()
@@ -527,49 +527,22 @@ install_rio() {
 }
 
 # --- lint: clang-format/clang-tidy 18, buildifier ---------------------------
-llvm_major() { "$1" --version 2>/dev/null | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p' | sed -n '1p'; }
-set_llvm18_bin() {
-  LLVM18_BIN=""
-  [ "$OS" = macos ] && have brew || return 0
-  local d
-  d="$(brew --prefix llvm@$LLVM_MAJOR 2>/dev/null)/bin"
-  [ -x "$d/clang-format" ] && LLVM18_BIN="$d"
-  return 0
-}
-find_llvm_tool() {
-  if have "$1-$LLVM_MAJOR"; then command -v "$1-$LLVM_MAJOR"; return 0; fi
-  if [ -n "$LLVM18_BIN" ] && [ -x "$LLVM18_BIN/$1" ]; then printf '%s\n' "$LLVM18_BIN/$1"; return 0; fi
-  if have "$1"; then command -v "$1"; return 0; fi
+# CI's clang 18 comes from the PyPI wheels in a private venv (tools/clang18.sh),
+# so no system package and the same binaries on Linux and macOS arm64.
+detect_llvm() {
+  local home="${XDG_CACHE_HOME:-$HOME/.cache}/talos/clang-18"
+  . "$ROOT/tools/clang18.sh"
+  if [ -x "$home/venv/bin/clang-format" ] && [ -x "$home/venv/bin/clang-tidy" ] &&
+     [ "$(cat "$home/version" 2>/dev/null)" = "$CLANG18_VERSION" ]; then
+    DETAIL="clang-format/clang-tidy $CLANG18_VERSION ($home)"
+    return 0
+  fi
+  DETAIL="clang-format/clang-tidy $CLANG18_VERSION wheels not installed"
   return 1
 }
-detect_llvm() {
-  set_llvm18_bin
-  local n p m missing=0 other=0 out=""
-  for n in clang-format clang-tidy; do
-    if ! p="$(find_llvm_tool "$n")"; then out="$out, $n missing"; missing=1; continue; fi
-    m="$(llvm_major "$p")"
-    out="$out, $n ${m:-?} ($p)"
-    [ "$m" = "$LLVM_MAJOR" ] || other=1
-  done
-  DETAIL="${out#, }"
-  [ "$missing" = 0 ] || return 1
-  [ "$other" = 1 ] || {
-    case "$LLVM18_BIN" in "") ;; *) hint "clang-format/clang-tidy $LLVM_MAJOR are keg-only in $LLVM18_BIN; add it to PATH" ;; esac
-    return 0
-  }
-  # apt and brew can provide 18; elsewhere it's the distro's LLVM or nothing.
-  case "$PM" in
-    apt|brew) DETAIL="$DETAIL; CI uses $LLVM_MAJOR"; return 2 ;;
-    *) DETAIL="$DETAIL; CI uses $LLVM_MAJOR, results may differ"; return 3 ;;
-  esac
-}
 install_llvm() {
-  case "$PM" in
-    apt) pkg_install "clang-format-$LLVM_MAJOR" "clang-tidy-$LLVM_MAJOR" ;;
-    dnf) pkg_install clang-tools-extra ;;
-    pacman) pkg_install clang ;;
-    brew) pkg_install "llvm@$LLVM_MAJOR" ;;
-  esac
+  have uv || have python3 || { warn "need uv or python3 for the clang wheels"; return 1; }
+  run bash -c ". '$ROOT/tools/clang18.sh' && clang18_setup"
 }
 
 detect_buildifier() {
