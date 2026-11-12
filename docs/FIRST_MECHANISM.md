@@ -24,102 +24,73 @@ which takes the longest of anything here. Later builds reuse that work.
 
 All commands below run from the repository root.
 
-## 2. Make a scratch robot
+## 2. Make your robot
 
 `2026-robot/` is the project's simulation testbed, and its graph is full: the
 launcher refuses more than eight readers of one topic, and `/hw/state/driver_station`
 already has eight. A ninth node there makes `--describe-only` fail with
 `/hw/state/driver_station: has 9 readers; RTMS reader limit is 8`. So the
-walkthrough builds on a small robot of its own. Create three files.
-
-`my_robot/main_processor/configuration/robot.toml`:
-
-```toml
-[robot]
-name = "my_robot"
-period_us = 5000
-command_timeout_us = 100000
-status_hz = 200.0
-commissioned = false
-require_target_coverage = true
-sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
-
-controller_address = "127.0.0.1"
-controller_port = 5802
-local_port = 5803
-
-[robot.targets]
-teleop = ["teleop"]
-autonomous = []
-test = []
-
-[[subsystems]]
-name = "teleop"
-path = "subsystems/teleop.toml"
-```
-
-`my_robot/main_processor/configuration/subsystems/teleop.toml`:
-
-```toml
-[subsystem]
-name = "teleop"
-node = "//talOS/teleop:node"
-period_us = 20000
-```
-
-`my_robot/main_processor/configuration/BUILD`:
-
-```python
-package(default_visibility = ["//visibility:public"])
-
-exports_files(["robot.toml"] + glob(["subsystems/*.toml"]))
-```
-
-What these say:
-
-- A **node** is one program (one process) that does one job; a **subsystem**
-  is the robot's name for a node plus its configuration. `[[subsystems]]` in
-  `robot.toml` is the only list of a robot's nodes. `teleop` is the framework's
-  node that turns Driver Station buttons and sticks into targets; it needs no
-  code from you ([architecture: configuration](../ARCHITECTURE.md#configuration)).
-- `[robot] period_us` is the default **tick**: how often a node's `update()`
-  runs. `command_timeout_us` is how old data may be before the robot goes
-  neutral ([architecture: the tick](../ARCHITECTURE.md#the-tick)).
-- `[robot.targets]` says which **target lanes** each Driver Station mode
-  listens to. Here a subsystem obeys the `teleop` lane in teleop and nothing in
-  autonomous. `require_target_coverage = true` makes the launcher refuse a
-  subsystem nobody can drive.
-- `sim_gateway` names the program that stands in for the RoboRIO, the robot's
-  hardware layer, when you simulate.
-
-## 3. Python track
-
-### Generate the node
+walkthrough builds a robot of its own, `my_robot`, with the wrist as its first
+mechanism:
 
 ```sh
-bazel run //tools:new_subsystem -- wrist --lang py --robot my_robot
+bazel run //tools:new_robot -- my_robot --mechanism wrist --lang py
 ```
 
 ```text
+wrote my_robot/README.md
+wrote my_robot/main_processor/configuration/robot.toml
+wrote my_robot/main_processor/configuration/subsystems/teleop.toml
+wrote my_robot/main_processor/configuration/subsystems/telemetry.toml
+wrote my_robot/main_processor/configuration/BUILD
 wrote my_robot/main_processor/wrist/wrist_message.fbs
 wrote my_robot/main_processor/wrist/BUILD
 wrote my_robot/main_processor/wrist/wrist.py
 wrote my_robot/main_processor/wrist/node_test.py
 wrote my_robot/main_processor/wrist/testdata/robot.toml
 wrote my_robot/main_processor/configuration/subsystems/wrist.toml
-wrote my_robot/main_processor/configuration/robot.toml
 wrote my_robot/main_processor/configuration/robot_manifest.bzl
+Next:
+  ...
 ```
 
-Run it through `bazel run`; `python3 tools/new_subsystem.py` alone fails with
-`No module named 'tools'`. `--dry-run` prints every file and edit without
-writing. The tool also added a `[[subsystems]]` entry for `wrist` to
-`robot.toml` and rewrote `robot_manifest.bzl`: the **manifest**, a generated
-list of the node binaries and config files this robot needs. Bazel cannot read
-TOML, so it reads this file instead. Edit `robot.toml` or a subsystem file in a
-way that adds or removes a node or file, and regenerate it with
-`bazel run //tools:sync_manifest -- my_robot/main_processor/configuration/robot.toml`
-(a stale manifest fails the build with that command).
+Run it through `bazel run`; `python3 tools/new_robot.py` alone fails with
+`No module named 'tools'`. `--dry-run` prints every file without writing. A
+robot needs a mechanism from the start: the hardware configuration refuses a
+robot with no motor. `my_robot/README.md` says what each file is; the ones that
+matter now:
+
+- A **node** is one program (one process) that does one job; a **subsystem**
+  is the robot's name for a node plus its configuration. `[[subsystems]]` in
+  `robot.toml` is the only list of a robot's nodes: here `teleop`,
+  `telemetry` and `wrist`. `teleop` is the framework's node that turns Driver
+  Station buttons and sticks into targets, and `telemetry` feeds the logs and
+  Studio; neither needs code from you
+  ([architecture: configuration](../ARCHITECTURE.md#configuration)).
+- `[robot] period_us` is the default **tick**: how often a node's `update()`
+  runs. `command_timeout_us` is how old data may be before the robot goes
+  neutral ([architecture: the tick](../ARCHITECTURE.md#the-tick)).
+- `[robot.targets]` says which **target lanes** each Driver Station mode
+  listens to. Here a subsystem obeys the `teleop` lane in teleop and nothing in
+  autonomous. `require_target_coverage = true`, once every mechanism has a
+  producer, makes the launcher refuse a subsystem nobody can drive.
+- `sim_gateway` names the program that stands in for the RoboRIO, the robot's
+  hardware layer, when you simulate.
+- `robot_manifest.bzl` is the **manifest**: a generated list of the node
+  binaries and config files the robot needs. Bazel cannot read TOML, so it
+  reads this file instead. Edit `robot.toml` or a subsystem file in a way
+  that adds or removes a node or file, and regenerate it with
+  `bazel run //tools:sync_manifest -- my_robot/main_processor/configuration/robot.toml`
+  (a stale manifest fails the build, and `sim.sh`, with that command).
+- The configuration `BUILD` holds the robot's checks (`manifest_sync_test`,
+  `graph_test`) and `robot_bundle`, what [deployment](DEPLOYMENT.md)
+  installs on the main processor.
+
+## 3. Python track
+
+The wrist's package is `my_robot/main_processor/wrist/`, written by
+`//tools:new_subsystem`, which `new_robot` runs for the first mechanism. A
+second mechanism comes from that tool directly, as in the C++ track.
 
 ### The message
 
@@ -213,8 +184,9 @@ The `can_id` there is a placeholder. On a real robot a person sets the
 physical id and `commissioned = true` at the robot; nobody does it from a
 desk ([bring-up](BRINGUP.md#human-commissioning)).
 
-Without the binding, nothing writes the wrist's lane and the launcher refuses
-the graph (`target coverage required for mode 'teleop'`).
+Without the binding, nothing writes the wrist's lane: the launcher warns
+(`/wrist/target/teleop: is in the target policy of wrist but nothing writes it
+yet`), and with `require_target_coverage = true` it refuses the graph.
 
 ### Run the generated test
 
@@ -237,21 +209,24 @@ process. When you change what the node does, change `node_test.py` with it.
 ### Check the graph
 
 ```sh
-bazel build //talOS/launcher //talOS/bridge:hardware_node \
-  //2026-robot/main_processor/simulation:sim_gateway //my_robot/main_processor/...
+bazel build //talOS/launcher //talOS/bridge:hardware_node //my_robot/main_processor/...
 bazel run //talOS/launcher -- --config $PWD/my_robot/main_processor/configuration/robot.toml --describe-only
 ```
 
 ```text
 ================ Declared Graph ==================
-Nodes described: 3/3, topics: 7
+Nodes described: 4/4, topics: 8
   • hardware_node (5 sources)
+  • telemetry (5 sources)
   • teleop (3 sources)
   • wrist (7 sources)
   warning: /wrist/state: is published but nothing subscribes to it
 ==================================================
 [launcher] describe-only: nothing was started
 ```
+
+`bazel test //my_robot/...` runs the same check (`graph_test`), the
+manifest's `manifest_sync_test` and the node test together.
 
 The launcher runs every node binary with `--describe`, which makes the node
 build itself, report the topics it reads and writes, and exit, then checks the
@@ -264,59 +239,71 @@ A warning is fine; an `error:` line means the launcher would refuse to start.
 ### Run it in simulation
 
 ```sh
-mkdir -p /tmp/talos_tutorial
-./bazel-bin/talOS/launcher/launcher \
-  --config $PWD/my_robot/main_processor/configuration/robot.toml \
-  --sim --session-id 1 --output-dir /tmp/talos_tutorial --duration-s 8 \
-  --start-sim-gateway --sim-gateway-arg --physics \
-  --sim-gateway-arg --mode-schedule --sim-gateway-arg 'disabled:1,teleop:10' \
-  --sim-gateway-arg --joystick-schedule \
-  --sim-gateway-arg '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
+./sim.sh --config my_robot/main_processor/configuration/robot.toml \
+  --sim-gateway --no-studio --duration-s 8 \
+  --mode-schedule 'disabled:1,teleop:10' \
+  --joystick-schedule '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
 ```
 
-This is what `./sim.sh --sim-gateway --no-studio` runs for `2026-robot`, with
-the same scripting options spelled for the launcher; `sim.sh` is fixed to the
-2026 config, so a robot of your own uses the launcher directly. The simulator
-plays the Driver Station and the RoboRIO. The mode schedule is `mode:seconds`
-phases (disabled for 1 s, then teleop). The joystick schedule is
+```text
+==> checking my_robot/main_processor/configuration/robot.toml
+==> building
+INFO: Build completed successfully, 107 total actions
+==> starting node graph (log: /tmp/talos_logs/1794458306/sim/launcher.log)
+==>   declared graph: /tmp/talos_logs/1794458306/graph.json
+==> running. Ctrl-C stops everything.
+
+sim.sh: shutting down
+sim.sh: session logs in /tmp/talos_logs/1794458306 (launcher/RIO output in /tmp/talos_logs/1794458306/sim)
+```
+
+`sim.sh` checks that the robot's manifest is current (a stale one stops it
+with the regenerate command), builds the nodes it lists, and starts them with
+the launcher and `--sim-gateway`'s simulator, which plays the Driver Station
+and the RoboRIO. Without `--config` it runs `2026-robot`. The mode schedule is
+`mode:seconds` phases (disabled for 1 s, then teleop). The joystick schedule is
 `seconds:axes=...;buttons=MASK;pov=DEG` snapshots of joystick 0, each held
 until the next: button 3 is bit 2 of the mask, so `buttons=4` presses it from
 second 3 to second 6 ([syntax](../2026-robot/main_processor/simulation/README.md#scripted-joystick-and-fault-schedules)).
-Use a new `--session-id` each run, or delete `/tmp/talos_tutorial/1`.
+`./sim.sh --help` lists the rest.
 
 ### See the result
 
-A **session** is one run of the launcher; its directory,
-`<output-dir>/<session-id>/`, holds each node's log (`wrist.tlog`), its text
-output (`wrist.log`) and the graph. `log_dump` reads the logs and decodes
-every message:
+A **session** is one run of the launcher; its directory, the one `sim.sh`
+prints last, holds each node's log (`wrist.tlog`), its text output
+(`wrist.log`) and the graph. `log_dump` reads the logs and decodes every
+message:
 
 ```sh
-./bazel-bin/talOS/launcher/log_dump --node wrist --topic /wrist/state /tmp/talos_tutorial/1 \
+bazel build //talOS/launcher:log_dump
+./bazel-bin/talOS/launcher/log_dump --node wrist --topic /wrist/state /tmp/talos_logs/1794458306 \
   | grep WristState | awk 'NR%50==1'
 ```
 
 ```text
       wrist.WristState {enabled: false, velocity_rps: 0, connected: true}
       wrist.WristState {enabled: false, velocity_rps: 0, connected: true}
-      wrist.WristState {enabled: true, velocity_rps: 10.433849447220124, connected: true}
-      wrist.WristState {enabled: true, velocity_rps: 19.999745921323143, connected: true}
-      wrist.WristState {enabled: true, velocity_rps: 19.999999993251436, connected: true}
-      wrist.WristState {enabled: false, velocity_rps: 2.66967771064453, connected: true}
+      wrist.WristState {enabled: false, velocity_rps: 0, connected: true}
+      wrist.WristState {enabled: true, velocity_rps: 5.4203240144, connected: true}
+      wrist.WristState {enabled: true, velocity_rps: 19.999999990144765, connected: true}
+      wrist.WristState {enabled: true, velocity_rps: 19.999999999999986, connected: true}
+      wrist.WristState {enabled: false, velocity_rps: 8.438062162477493, connected: true}
       wrist.WristState {enabled: false, velocity_rps: 0, connected: true}
 ```
 
 The wrist sat neutral while disabled, spun up to 20 rps while button 3 was
 held, and coasted down when the button released. Remove the `buttons=4`
 snapshot, or the mode schedule's `teleop`, and it stays neutral: that is the
-safety path working. [Studio](../studio/README.md) is the live viewer;
-`./sim.sh --sim-gateway` starts it for `2026-robot`. Reading a log is the
-same on every robot ([launcher: filtering and exporting logs](../talOS/launcher/README.md#filtering-and-exporting-logs)).
+safety path working. [Studio](../studio/README.md) is the live viewer:
+leave out `--no-studio` and `sim.sh` starts it. Reading a log is the same on
+every robot ([launcher: filtering and exporting logs](../talOS/launcher/README.md#filtering-and-exporting-logs)).
 
 ## 4. C++ track
 
-Everything in sections 1 and 2 is the same. Use a different name if the Python
-track already took `wrist`; this track uses `claw`.
+Section 1 is the same. Without a robot yet, make it with a C++ mechanism,
+`bazel run //tools:new_robot -- my_robot --mechanism claw --lang cpp`. If the
+Python track already made `my_robot`, add a second mechanism to it; this
+track uses `claw`:
 
 ```sh
 bazel run //tools:new_subsystem -- claw --lang cpp --robot my_robot
@@ -362,17 +349,14 @@ call in both languages). Do the same two edits to
 `subsystems/claw.toml` (the teleop binding and `v = 0.12`), then:
 
 ```sh
-bazel test //my_robot/main_processor/claw:all
-bazel build //talOS/launcher //talOS/bridge:hardware_node \
-  //2026-robot/main_processor/simulation:sim_gateway //my_robot/main_processor/...
-bazel run //talOS/launcher -- --config $PWD/my_robot/main_processor/configuration/robot.toml --describe-only
+bazel test //my_robot/...
 ```
 
-The launch and `log_dump` commands from the Python track work unchanged; read
-the `claw` node instead:
+The `sim.sh` and `log_dump` commands from the Python track work unchanged;
+read the `claw` node instead, from the session directory `sim.sh` printed:
 
 ```sh
-./bazel-bin/talOS/launcher/log_dump --node claw --topic /claw/state /tmp/talos_tutorial/1 \
+./bazel-bin/talOS/launcher/log_dump --node claw --topic /claw/state /tmp/talos_logs/<session> \
   | grep ClawState | awk 'NR%50==1'
 ```
 
@@ -393,9 +377,10 @@ the `claw` node instead:
 - Settings read from the config (`node.param`), the full API, and the
   rules every node follows: [node guide](NODE_DEVELOPMENT_GUIDE.md) and
   [methodology](METHODOLOGY.md).
-- Putting a mechanism on `2026-robot`, or any robot with a full graph: the
-  scaffold takes `--robot DIR`; keep each topic at eight readers or fewer and
-  give the new subsystem a `[targets]` table if autonomous has no writer for it.
+- Putting a mechanism on another robot, such as `2026-robot`, whose graph is
+  full: the scaffold takes `--robot DIR`; keep each topic at eight readers or
+  fewer and give the new subsystem a `[targets]` table if autonomous has no
+  writer for it.
 
 When a step fails, the launcher's message names the rule; the
 [glossary](GLOSSARY.md) points to the section that defines each term in it.

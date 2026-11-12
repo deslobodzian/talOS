@@ -354,6 +354,6 @@ manifest fails the build with the regenerate command.
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
 | a node-API feature | `talOS/node`, mirrored in `talOS/node_api` and `talOS/python/talos` |
-| a robot | a sibling of `2026-robot/` |
+| a robot | a sibling of `2026-robot/`: `bazel run //tools:new_robot -- <name> --mechanism <mech> --lang cpp\|py` writes its configuration (teleop, telemetry), manifest, graph test, bundle and first mechanism (the hardware config refuses a robot with no motor); `./sim.sh --config <name>/main_processor/configuration/robot.toml` runs it |
 | a controller processor | a sibling of `controller_processor/rio/` speaking `talOS/protocol` |
 | a viewer tab | `studio/` |

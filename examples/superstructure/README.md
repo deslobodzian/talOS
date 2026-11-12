@@ -243,18 +243,22 @@ lane and a state publisher, as `cpp/elevator.h` and `cpp/intake.h` are; the
 library's README has a minimal node. Write the control yourself only for
 what no block covers.
 
-Generate a position-controlled wrist package from the repo root:
+Generate a robot of your own whose first mechanism is a position-controlled
+wrist, from the repo root:
 
 ```sh
-bazel run //tools:new_subsystem -- wrist --lang cpp --type position
+bazel run //tools:new_robot -- my_robot --mechanism wrist --lang cpp --type position
 ```
 
-The default robot is `2026-robot`; use `--robot DIR` to select another robot
-and `--dry-run` to inspect the changes without writing them. Use `--lang py`
-for a Python implementation. Omitting `--type position` generates a velocity
+To add the wrist to a robot that exists, run
+`bazel run //tools:new_subsystem -- wrist --lang cpp --type position --robot my_robot`
+instead. Do not scaffold into `2026-robot`, the project's testbed: its graph
+is full ([first mechanism](../../docs/FIRST_MECHANISM.md#2-make-your-robot)).
+`--dry-run` inspects the changes without writing them. Use `--lang py` for a
+Python implementation. Omitting `--type position` generates a velocity
 mechanism, not an angle-controlled wrist.
 
-The generator writes `2026-robot/main_processor/wrist/`:
+The generator writes `my_robot/main_processor/wrist/`:
 
 ```text
 BUILD
@@ -280,8 +284,8 @@ home switch, `wrist_home`, at the reverse end of travel that zeroes it,
 to `min_rot..max_rot`; the motor has no hardware soft limits.
 
 The subsystem file is
-`2026-robot/main_processor/configuration/subsystems/wrist.toml`: it contains
-`node = "//2026-robot/main_processor/wrist:node"`, a 20000 µs node period,
+`my_robot/main_processor/configuration/subsystems/wrist.toml`: it contains
+`node = "//my_robot/main_processor/wrist:node"`, a 20000 µs node period,
 the mechanism's `[wrist]` parameter table, a TalonFX with the lowest unused
 CAN id in `1..62` and a home switch with the lowest unused DIO channel in
 `0..31`, both explicitly marked as placeholders. The rest of its homing
@@ -291,6 +295,8 @@ setup is placeholder too: `max_rot = 0.001` confines every target to within
 direction checked before the first enable. The generator appends the
 subsystem name and path to `configuration/robot.toml` and regenerates that
 config's manifest plus manifests of configs that include it.
+`./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway`
+runs the robot.
 
 The Python variant puts `wrist.py` and `node_test.py` in the same package,
 not in a separate `py/` directory. It uses the same schema, `:node` target

@@ -38,6 +38,43 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
+# bazel run //tools:new_robot -- <name> --mechanism M --lang cpp|py [--dir DIR]
+# Writes a robot beside 2026-robot/: its configuration (teleop, telemetry),
+# generated manifest, graph test and bundle, and its first mechanism through
+# new_subsystem.
+py_binary(
+    name = "new_robot",
+    srcs = [
+        "new_robot.py",
+        "new_subsystem.py",
+    ],
+    deps = [":sync_manifest_lib"],
+)
+
+py_test(
+    name = "new_robot_test",
+    size = "small",
+    srcs = [
+        "new_robot.py",
+        "new_robot_test.py",
+        "new_subsystem.py",
+    ],
+    data = [
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+        "//talOS/telemetry:node",
+        "//talOS/teleop:node",
+        # new_subsystem's C++ velocity mechanism, built.
+        "//tools/scaffold_testdata/gripper:node",
+    ],
+    legacy_create_init = False,
+    main = "new_robot_test.py",
+    deps = [
+        ":sync_manifest_lib",
+        "@rules_python//python/runfiles",
+    ],
+)
+
 # bazel run //tools:sync_manifest -- [--check] <robot.toml>...
 # Writes <stem>_manifest.bzl (NODES, CONFIG_FILES) beside each robot config.
 py_binary(

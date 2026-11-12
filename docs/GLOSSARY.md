@@ -193,7 +193,8 @@ something it builds or runs; a label is its name. `BUILD` files declare them.
 [Install](INSTALL.md#what-bazel-provides-vs-what-the-host-needs).
 
 **Scaffold.** `bazel run //tools:new_subsystem`: writes a node package, its
-subsystem file and manifest entry.
+subsystem file and manifest entry. `bazel run //tools:new_robot` writes a
+whole robot around its first one.
 [Where a new thing goes](../ARCHITECTURE.md#where-a-new-thing-goes).
 
 **Bundle.** One directory holding every node binary and config for a robot,
