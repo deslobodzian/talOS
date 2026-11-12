@@ -7,6 +7,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -105,7 +106,134 @@ def stop(processes):
             process.stdout.close()
 
 
+def upgrade(sock):
+    """Sends a WebSocket upgrade for /telemetry and returns the reply headers."""
+    key = base64.b64encode(os.urandom(16)).decode()
+    sock.sendall((f"GET /telemetry HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                  f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                  f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
+    headers = b""
+    while not headers.endswith(b"\r\n\r\n"):
+        headers += receive(sock, 1)
+    return headers
+
+
+# An RTMS segment's header (talOS/rtms/rtms.h RTMSHeader, 832 B): the magic at
+# 0; ten u64 fields, the 128 B schema name and the lifetime word, then the
+# 64 B-aligned Writer, whose owner process word is at 256 + 8; reader slot i
+# at 320 + 64 i, its state word at + 8, holding its claimant's process word
+# above two state bits. A process word's low 22 bits are the pid
+# (talOS/rtms/process_liveness.h kProcessPidBits).
+RTMS_MAGIC = 0x32534D54534F4C41
+RTMS_HEADER_BYTES = 832
+RTMS_WRITER_OWNER = 264
+RTMS_READERS, RTMS_MAX_READERS = 320, 8
+PID_MASK = (1 << 22) - 1
+
+
+def rtms_segments():
+    """(name, writer pid, reader pids) of every RTMS segment this user can read."""
+    segments = []
+    for entry in os.scandir("/dev/shm"):
+        try:
+            with open(entry.path, "rb") as handle:
+                header = handle.read(RTMS_HEADER_BYTES)
+        except OSError:
+            continue
+        if len(header) < RTMS_HEADER_BYTES or struct.unpack_from("<Q", header)[0] != RTMS_MAGIC:
+            continue
+        owner = struct.unpack_from("<Q", header, RTMS_WRITER_OWNER)[0]
+        readers = {(struct.unpack_from("<Q", header, RTMS_READERS + 64 * i + 8)[0] >> 2) & PID_MASK
+                   for i in range(RTMS_MAX_READERS)}
+        segments.append((entry.name, owner & PID_MASK if owner else None, readers - {0}))
+    return segments
+
+
+def socket_inodes(pid):
+    """The inode of every socket process `pid` holds open."""
+    inodes = set()
+    for fd in os.scandir(f"/proc/{pid}/fd"):
+        try:
+            target = os.readlink(fd.path)
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            inodes.add(int(target[len("socket:["):-1]))
+    return inodes
+
+
+def table_inodes(*tables):
+    """The socket inodes /proc/net/<table> lists, for each table given."""
+    inodes = set()
+    for table in tables:
+        path = Path("/proc/net", table)
+        if not path.exists():
+            continue
+        lines = path.read_text().splitlines()[1:]
+        # The inode is column 9 of the inet tables and column 6 of unix.
+        column = 6 if table == "unix" else 9
+        inodes |= {int(line.split()[column]) for line in lines if len(line.split()) > column}
+    return inodes
+
+
 class BridgeIntegration(unittest.TestCase):
+    # REQ-SAFE-35
+    @unittest.skipUnless(sys.platform.startswith("linux"),
+                         "reads /dev/shm and /proc, which only Linux has")
+    def test_running_bridge_opens_no_writer_and_no_datagram_socket(self):
+        """A bridge serving a client holds no RTMS writer and no UDP or raw socket.
+
+        A viewer that wrote a topic (a target lane, /hw/request/<node>) or
+        sent a frame to the RoboRIO (UDP) could move the robot. Every RTMS
+        segment on the host records its live writer's process, so none may
+        name the bridge; every socket the bridge holds must be TCP (HTTP and
+        WebSocket) or Unix-domain (the wake channel). Neither check can pass
+        by reading nothing: the telemetry segment must show the mock as its
+        writer and the bridge as a reader, and the bridge's listener must be
+        found among its TCP sockets.
+        """
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        binaries = workspace / "studio/bridge"
+        topic = f"/test/telemetry/s{os.getpid()}"
+        processes = []
+        with tempfile.TemporaryDirectory() as webroot:
+            try:
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
+                bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic, "0", webroot],
+                                          stdout=subprocess.PIPE, text=True)
+                processes.append(bridge)
+                port = bound_port(bridge)
+                with socket.create_connection(("127.0.0.1", port), timeout=10) as ws:
+                    self.assertIn(b"101 Switching Protocols", upgrade(ws))
+                    # A telemetry page reached the client: the bridge has
+                    # attached, read the topic and sent on the socket.
+                    self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
+
+                    segments = rtms_segments()
+                    written = [name for name, writer, _ in segments if writer == bridge.pid]
+                    self.assertEqual(written, [], f"bridge pid {bridge.pid} writes {written}")
+                    telemetry = [(writer, readers) for _, writer, readers in segments
+                                 if bridge.pid in readers]
+                    self.assertIn((mock.pid, {bridge.pid}), telemetry,
+                                  f"no segment written by the mock ({mock.pid}) and read by "
+                                  f"the bridge ({bridge.pid}): {segments}")
+
+                    held = socket_inodes(bridge.pid)
+                    datagram = held & table_inodes("udp", "udp6", "udplite", "udplite6",
+                                                   "raw", "raw6")
+                    self.assertEqual(datagram, set(), f"bridge holds UDP or raw sockets {datagram}")
+                    tcp, unix = table_inodes("tcp", "tcp6"), table_inodes("unix")
+                    self.assertTrue(held & tcp, f"none of {held} is TCP: the listener is missing")
+                    self.assertEqual(held - tcp - unix, set(),
+                                     f"bridge sockets neither TCP nor Unix: {held - tcp - unix}")
+            finally:
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
     def test_transports(self):
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
         binaries = workspace / "studio/bridge"

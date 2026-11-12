@@ -41,6 +41,27 @@ class BridgeDescribe(unittest.TestCase):
         self.assertEqual(source["alignment"], 8)
         self.assertEqual(source["slots"], 64)
 
+    # REQ-SAFE-35
+    def test_describe_declares_no_writer(self):
+        """The bridge declares only reader ends: no SENDER, no hardware request.
+
+        The launcher's graph lint and the live endpoint comparison judge the
+        bridge by this description, so a writer declared here is a writer the
+        session would accept.
+        """
+        for args in ([], ["--config", str(testdata("robot.toml")), "--sim"]):
+            with self.subTest(args=args):
+                proc = subprocess.run(
+                    [str(bridge_binary()), "--describe", *args],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                sources = json.loads(proc.stdout)["sources"]
+                self.assertTrue(sources, proc.stdout)
+                for source in sources:
+                    self.assertIn(source["kind"], ("WATCHER", "FETCHER", "TIMER"),
+                                  source)
+                    self.assertFalse(source.get("hardware_request", False), source)
+
     def test_describe_without_config_uses_default_topic(self):
         proc = subprocess.run(
             [str(bridge_binary()), "--describe"],
