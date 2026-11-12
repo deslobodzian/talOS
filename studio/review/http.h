@@ -19,7 +19,8 @@
 namespace studio::review {
 
 // Whether `host` (a request's Host header) names this server: 127.0.0.1,
-// localhost or [::1], with `port`, the port the server listens on.
+// localhost or [::1], with `port`, the port the server listens on; on port
+// 80, also the bare name (a browser omits the default port).
 bool AllowedHost(std::string_view host, std::uint16_t port);
 
 // The Access-Control-Allow-Origin a request with Origin header `origin` gets:

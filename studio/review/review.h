@@ -22,8 +22,9 @@
 //       application/octet-stream, little-endian: u32 channels, u32 buckets,
 //       then per channel f64 t_ns[buckets], f64 min[], f64 max[], f64 last[],
 //       u32 count[]; buckets divide [start_ns, end_ns) evenly, the same for
-//       every channel; an empty bucket has count 0 and NaN elsewhere; 400
-//       past kMaxSeriesChannels, kMaxSeriesPoints or kMaxSeriesValues
+//       every channel; an empty bucket has count 0 and NaN elsewhere, and
+//       one whose every sample is NaN its count and NaN elsewhere but t_ns;
+//       400 past kMaxSeriesChannels, kMaxSeriesPoints or kMaxSeriesValues
 //
 // A session that cannot be read (a log of another format version, no
 // intact record) answers 422 with the reason; other sessions are unaffected.

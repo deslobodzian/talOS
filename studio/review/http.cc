@@ -1,5 +1,6 @@
 #include "studio/review/http.h"
 
+#include <algorithm>
 #include <charconv>
 #include <fstream>
 #include <iterator>
@@ -52,6 +53,13 @@ Response Plain(int status, std::string message) {
 }  // namespace
 
 bool AllowedHost(std::string_view host, std::uint16_t port) {
+  // A browser omits the scheme's default port from Host.
+  constexpr std::uint16_t kHttpPort = 80;
+  if (port == kHttpPort &&
+      std::find(std::begin(kLoopbackNames), std::end(kLoopbackNames), host) !=
+          std::end(kLoopbackNames)) {
+    return true;
+  }
   return LoopbackPort(host) == port;
 }
 

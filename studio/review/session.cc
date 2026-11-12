@@ -539,7 +539,11 @@ std::vector<Series> Session::ReadSeries(std::span<const ChannelRef> channels,
   }
   for (Series& series : out) {
     for (std::size_t b = 0; b < points; ++b) {
-      if (series.count[b] == 0) series.min[b] = series.max[b] = kNaN;
+      // Empty, or every sample NaN (fmin and fmax skip one, so min stays
+      // +Inf above max's -Inf): no extremes. The count stays.
+      if (series.count[b] == 0 || series.min[b] > series.max[b]) {
+        series.min[b] = series.max[b] = kNaN;
+      }
     }
   }
   return out;

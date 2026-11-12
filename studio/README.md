@@ -121,7 +121,10 @@ straight into its session list (start time, length and class) and offers no
 live connection; open a session from it, or later from **Open recording…**
 in the header. A Studio served by the live bridge reaches a review server
 through **Open recording…** too, with the server's address in the picker
-(default `http://127.0.0.1:5805`, remembered in this browser).
+(default `http://127.0.0.1:5805`, remembered in this browser). A Studio
+the review server served is its own origin, apart from one the live bridge
+served: layouts saved in the live Studio, and the review server address it
+remembers, are not there (the browser keeps them per origin).
 
 While a recording is open it replaces the live view on every page, and the
 footer becomes its transport: step back and forward by the step size, play
@@ -190,7 +193,8 @@ the webroot is refused. A session id is one directory name of the library; a
 parent, hidden or symlinked one is refused.
 
 A request whose `Host` is not `127.0.0.1`, `localhost` or `[::1]` with the
-server's port is refused (403): a web page cannot reach the server by
+server's port (or, on `--port 80`, without one, as a browser sends it) is
+refused (403): a web page cannot reach the server by
 resolving its own name to this machine. A request from another loopback
 origin (`http://127.0.0.1:<port>`, `http://localhost:<port>`,
 `http://[::1]:<port>`, such as a Studio the live bridge served) gets that

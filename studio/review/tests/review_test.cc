@@ -372,6 +372,50 @@ TEST_F(ReviewTest, LateRangeReadsOnlyItsSeconds) {
   EXPECT_GT(ParseSeries(response.body)[0][0].count, 0u);
 }
 
+// Guards a bucket whose every sample is NaN (here only the last shot's,
+// published at 9.9805 s): it counts its sample and reports NaN for min, max
+// and last, not +Inf and -Inf (fmin and fmax skip a NaN, leaving their
+// starting values).
+// REQ-OPS-41
+TEST_F(ReviewTest, AllNaNBucketHasNaNExtremes) {
+  Review review{Library(), 1u << 20};
+  const Response response = review.Get(
+      "/review/s1/series",
+      "c=shooter/state/position_m&start_ns=" +
+          std::to_string(kStartNs + 9 * kSecond + 970 * kMs) + "&end_ns=" +
+          std::to_string(kStartNs + 9 * kSecond + 990 * kMs) + "&points=1");
+  ASSERT_EQ(response.status, 200) << response.body;
+  const Bucket bucket = ParseSeries(response.body)[0][0];
+  EXPECT_EQ(bucket.count, 1u);
+  EXPECT_TRUE(std::isnan(bucket.min)) << bucket.min;
+  EXPECT_TRUE(std::isnan(bucket.max)) << bucket.max;
+  EXPECT_TRUE(std::isnan(bucket.last)) << bucket.last;
+}
+
+// Guards the Host check on port 80, where a browser omits the default port
+// from Host: a bare loopback name is this server only there.
+// REQ-OPS-41
+TEST(HostTest, BareLoopbackNameIsThisServerOnlyOnPort80) {
+  const struct {
+    std::string_view host;
+    std::uint16_t port;
+    bool allowed;
+  } rows[] = {
+      {"127.0.0.1:5805", 5805, true},
+      {"127.0.0.1", 5805, false},
+      {"127.0.0.1", 80, true},
+      {"localhost", 80, true},
+      {"[::1]", 80, true},
+      {"127.0.0.1:80", 80, true},
+      {"evil.example", 80, false},
+      {"127.0.0.1:81", 80, false},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(std::string{row.host} + " on " + std::to_string(row.port));
+    EXPECT_EQ(AllowedHost(row.host, row.port), row.allowed);
+  }
+}
+
 // Guards the cache's bound (--cache-mb): its accounted bytes never pass the
 // capacity, the least recently used entry goes first, and an entry larger
 // than the whole capacity is not kept.

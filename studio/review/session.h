@@ -106,7 +106,8 @@ struct ChannelRef {
 // same edges for every channel of a request): per
 // bucket the smallest, largest and last sample (by publication time) and
 // how many; `t_ns` is the last sample's publication time. An empty bucket
-// has count 0 and NaN for the rest.
+// has count 0 and NaN for the rest; one whose every sample is NaN keeps its
+// count and t_ns, with NaN min, max and last.
 struct Series {
   std::vector<double> t_ns, min, max, last;
   std::vector<std::uint32_t> count;
