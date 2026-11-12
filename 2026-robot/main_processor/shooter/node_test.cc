@@ -41,10 +41,12 @@ std::string Runfile(const char* env) {
 class ShooterTest : public ::testing::Test {
  protected:
   // An enabled robot in teleop: the policy selects /shooter/target/teleop.
+  // 40 ms passes the bridge's clock mapping (eight States), before which no
+  // velocity sample has a known age and none counts toward at_speed.
   void Teleop() {
     hw.enable();
     hw.set_driver_station(talos::testing::DsPacket(ds::kEnabled | ds::kTeleop));
-    sim.step(10ms);
+    sim.step(40ms);
   }
   // Holds a lane the way a producer does: republished every 20 ms.
   void Hold(double rps, std::chrono::milliseconds duration,
