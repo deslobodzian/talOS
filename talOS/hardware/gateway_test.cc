@@ -932,6 +932,55 @@ TEST(Gateway, TotalLossWhileInactiveAdvancesTheEpoch) {
   EXPECT_TRUE(g.Accept(Request(g), 2, 11000));
 }
 
+// Total loss is judged on the backend's samples, before the gateway masks a
+// follower of an invalid master or the motor a reset CANcoder feeds. With
+// such a pair as the only CAN devices, an invalid master, or a reset
+// CANcoder, leaves the other sample valid at that judgment: the dependent is
+// published invalid, but there is no hardware fault and no new epoch.
+// SimHardwareTotalLoss.AMaskedDependentIsNotTotalLoss holds SimHardware to
+// the same two scenarios.
+// REQ-SAFE-22, REQ-DEV-07
+TEST(Gateway, AMaskedDependentIsNotTotalLoss) {
+  for (const bool remote : {false, true}) {
+    SCOPED_TRACE(remote ? "remote CANcoder reset" : "master invalid");
+    Config config;
+    config.commissioned = true;
+    MotorConfig first;
+    first.id = 1;
+    first.name = remote ? "remote" : "master";
+    first.can_id = 1;
+    first.max_velocity_rps = 20;
+    if (remote) {
+      config.sensors.push_back({2, "angle", SensorKind::kCANcoder, 2, "rio"});
+      first.feedback = Feedback::kRemoteCANcoder;
+      first.feedback_sensor_id = 2;
+      config.motors.push_back(first);
+    } else {
+      MotorConfig follower = first;
+      follower.id = 2;
+      follower.name = "follower";
+      follower.can_id = 2;
+      follower.master_id = first.id;
+      config.motors = {first, follower};
+    }
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+    const auto epoch = g.snapshot().epoch;
+    if (remote) {
+      backend.resets = {2};
+    } else {
+      backend.invalid_motor = 1;
+    }
+    g.Tick(6000, true);
+    const auto s = g.snapshot();
+    EXPECT_FALSE(s.motors[remote ? 0 : 1].valid);  // the masked dependent
+    EXPECT_FALSE(s.flags & kHardwareFault);
+    EXPECT_EQ(s.epoch, epoch);
+  }
+}
+
 TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};

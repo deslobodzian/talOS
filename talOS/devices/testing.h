@@ -38,10 +38,14 @@
 // sample reads invalid while its master's does. An invalid motor or CAN
 // sensor sample carries zero position, velocity, voltage and stator and
 // supply current (hardware::MarkInvalid). As on the gateway, a State in which
-// every motor and CAN sensor is invalid carries kHardwareFault (so
-// robot_enabled() is false) and, the first time, starts a new epoch with
-// every output neutral, digital and PWM included; requests are refused until
-// a State shows valid feedback again, which clears the fault in that epoch.
+// every motor and CAN sensor sample the RoboRIO reports is invalid
+// (disconnected, too old, or a motor of a chain reset_device() is restoring)
+// carries kHardwareFault (so robot_enabled() is false) and, the first time,
+// starts a new epoch with every output neutral, digital and PWM included;
+// requests are refused until a State shows valid feedback again, which
+// clears the fault in that epoch. Like the gateway, it judges this before
+// masking a follower of an invalid master or a reset CANcoder, so a sample
+// only those masks invalidate still counts as feedback.
 // Unlike the gateway, enabling or disabling does not start a new epoch, and
 // requests are not checked against the config id, motor limits or soft
 // limits.
