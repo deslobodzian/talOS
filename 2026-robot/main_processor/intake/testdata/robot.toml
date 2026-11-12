@@ -1,5 +1,7 @@
-# Intake test robot: one subsystem. Ids sort by (subsystem, device):
-# intake_beam = 1, roller = 2.
+# Intake test robot. Ids sort by (subsystem, device): intake_beam = 1,
+# roller = 2. The neighbor's motor stays connected, so a disconnected roller
+# is the loss of one device, as on a robot, not of all feedback (which the
+# gateway and SimHardware answer with a fault).
 [robot]
 name = "intake_test"
 period_us = 20000
@@ -13,3 +15,8 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 
 [subsystems.intake.digital_inputs.intake_beam]
 dio = 0
+
+[subsystems.neighbor.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2
