@@ -165,32 +165,24 @@ inline std::string ApplyV4L2Controls(const CameraControls& controls,
       }
     }
     if (mode < 0) return "auto_exposure: device offers no automatic mode";
-    if (!(error = set(V4L2_CID_EXPOSURE_AUTO, "auto_exposure", mode)).empty()) {
-      return error;
-    }
+    error = set(V4L2_CID_EXPOSURE_AUTO, "auto_exposure", mode);
+    if (!error.empty()) return error;
   } else if (has_mode) {
-    if (!(error = set(V4L2_CID_EXPOSURE_AUTO, "auto_exposure",
-                      V4L2_EXPOSURE_MANUAL))
-             .empty()) {
-      return error;
-    }
+    error = set(V4L2_CID_EXPOSURE_AUTO, "auto_exposure", V4L2_EXPOSURE_MANUAL);
+    if (!error.empty()) return error;
   }
-  if (device.Query(V4L2_CID_EXPOSURE_AUTO_PRIORITY) &&
-      !(error = set(V4L2_CID_EXPOSURE_AUTO_PRIORITY,
-                    "exposure_dynamic_framerate", 0))
-           .empty()) {
-    return error;
+  if (device.Query(V4L2_CID_EXPOSURE_AUTO_PRIORITY)) {
+    error =
+        set(V4L2_CID_EXPOSURE_AUTO_PRIORITY, "exposure_dynamic_framerate", 0);
+    if (!error.empty()) return error;
   }
   if (!controls.auto_exposure && controls.exposure_ms > 0) {
     int32_t units = 0;
-    if (!(error = in_range(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute",
-                           controls.exposure_ms * 10, units))
-             .empty() ||
-        !(error =
-              set(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute", units))
-             .empty()) {
-      return error;
-    }
+    error = in_range(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute",
+                     controls.exposure_ms * 10, units);
+    if (!error.empty()) return error;
+    error = set(V4L2_CID_EXPOSURE_ABSOLUTE, "exposure_time_absolute", units);
+    if (!error.empty()) return error;
   }
   const bool has_auto_gain = device.Query(V4L2_CID_AUTOGAIN).has_value();
   if (controls.auto_gain) {
@@ -201,15 +193,13 @@ inline std::string ApplyV4L2Controls(const CameraControls& controls,
     return set(V4L2_CID_AUTOGAIN, "gain_automatic", 1);
   }
   if (controls.gain > 0) {
-    if (has_auto_gain &&
-        !(error = set(V4L2_CID_AUTOGAIN, "gain_automatic", 0)).empty()) {
-      return error;
+    if (has_auto_gain) {
+      error = set(V4L2_CID_AUTOGAIN, "gain_automatic", 0);
+      if (!error.empty()) return error;
     }
     int32_t value = 0;
-    if (!(error = in_range(V4L2_CID_GAIN, "gain", controls.gain, value))
-             .empty()) {
-      return error;
-    }
+    error = in_range(V4L2_CID_GAIN, "gain", controls.gain, value);
+    if (!error.empty()) return error;
     return set(V4L2_CID_GAIN, "gain", value);
   }
   return {};
