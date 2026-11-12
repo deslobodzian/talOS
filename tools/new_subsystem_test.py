@@ -181,40 +181,69 @@ class NewSubsystemTest(unittest.TestCase):
         # in that frame and can stop homing), and its placeholder travel,
         # clamped by the node, is narrower than the at-goal tolerance. The
         # homing parameters pass the node's checks (homing_v toward the
-        # switch, positive bounds), and the switch gets the lowest free DIO
-        # channel, as the motor gets the lowest free CAN id.
-        with tempfile.TemporaryDirectory() as root:
-            configuration = os.path.join(root, "bot", "main_processor",
-                                         "configuration")
-            os.makedirs(os.path.join(configuration, "subsystems"))
-            for path, text in (
-                    ("BUILD", ""),
-                    ("robot.toml", '[robot]\nname = "bot"\n\n[[subsystems]]\n'
-                     'name = "shooter"\npath = "subsystems/shooter.toml"\n'),
-                    ("subsystems/shooter.toml",
-                     '[subsystem]\nname = "shooter"\n'
-                     '[digital_inputs.beam]\ndio = 0\n'
-                     '[encoders.angle]\ndio_a = 1\ndio_b = 3\n')):
-                with open(os.path.join(configuration, path), "w",
-                          encoding="utf-8") as f:
-                    f.write(text)
-            writes, _ = new_subsystem.plan(root, "bot", "wrist", "cpp",
-                                           kind="position")
-            subsystem = tomllib.loads(next(
-                new for path, _, new in writes
-                if path == os.path.join(configuration, "subsystems",
-                                        "wrist.toml")))
-        motor = subsystem["motors"]["wrist_motor"]
-        self.assertEqual(motor["position_frame"], "rezero")
-        self.assertIs(motor["soft_limits"], False)
-        params = subsystem["subsystem"]
-        self.assertGreater(params["max_position_rot"], 0)
-        self.assertLess(params["max_position_rot"], params["tolerance_rot"])
-        self.assertLess(params["homing_v"], 0)
-        for key in ("homing_timeout_us", "homing_stall_rps", "homing_stall_us",
-                    "home_margin_rot"):
-            self.assertGreater(params[key], 0, key)
-        self.assertEqual(subsystem["digital_inputs"]["wrist_home"]["dio"], 2)
+        # switch, positive bounds; in C++ PositionMechanism's: home at
+        # min_rot, |homing_v| at most half max_voltage, homing on the
+        # generated switch), and the switch gets the lowest free DIO channel,
+        # as the motor gets the lowest free CAN id.
+        for lang in ("cpp", "py"):
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as root:
+                configuration = os.path.join(root, "bot", "main_processor",
+                                             "configuration")
+                os.makedirs(os.path.join(configuration, "subsystems"))
+                for path, text in (
+                        ("BUILD", ""),
+                        ("robot.toml",
+                         '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                         'name = "shooter"\npath = "subsystems/shooter.toml"\n'),
+                        ("subsystems/shooter.toml",
+                         '[subsystem]\nname = "shooter"\n'
+                         '[digital_inputs.beam]\ndio = 0\n'
+                         '[encoders.angle]\ndio_a = 1\ndio_b = 3\n')):
+                    with open(os.path.join(configuration, path), "w",
+                              encoding="utf-8") as f:
+                        f.write(text)
+                writes, _ = new_subsystem.plan(root, "bot", "wrist", lang,
+                                               kind="position")
+                subsystem = tomllib.loads(next(
+                    new for path, _, new in writes
+                    if path == os.path.join(configuration, "subsystems",
+                                            "wrist.toml")))
+                if lang == "cpp":
+                    motor = subsystem["motors"]["wrist"]
+                    params = subsystem["wrist"]
+                    self.assertEqual(params["homing"], "limit_switch")
+                    self.assertIn(params["limit_switch"],
+                                  subsystem["digital_inputs"])
+                    self.assertEqual(params["min_rot"], 0)
+                    travel = params["max_rot"] - params["min_rot"]
+                    self.assertLessEqual(abs(params["homing_v"]),
+                                         motor["max_voltage"] / 2)
+                else:
+                    motor = subsystem["motors"]["wrist_motor"]
+                    params = subsystem["subsystem"]
+                    travel = params["max_position_rot"]
+                self.assertEqual(motor["position_frame"], "rezero")
+                self.assertIs(motor["soft_limits"], False)
+                self.assertGreater(travel, 0)
+                self.assertLess(travel, params["tolerance_rot"])
+                self.assertLess(params["homing_v"], 0)
+                for key in ("homing_timeout_us", "homing_stall_rps",
+                            "homing_stall_us", "home_margin_rot"):
+                    self.assertGreater(params[key], 0, key)
+                self.assertEqual(
+                    subsystem["digital_inputs"]["wrist_home"]["dio"], 2)
+
+    def test_cpp_position_name_cannot_shadow_a_subsystem_file_key(self):
+        # A C++ position node's parameter table is [<name>] in its subsystem
+        # file, so a name the framework reads there ([targets]), refuses
+        # ([motor]) or heads it with ([subsystem]) is refused.
+        for name in ("targets", "motor", "subsystem"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(
+                    new_subsystem.check_kind(name, "cpp", "position"))
+                self.assertIsNone(
+                    new_subsystem.check_kind(name, "py", "position"))
+        self.assertIsNone(new_subsystem.check_kind("wrist", "cpp", "position"))
 
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and

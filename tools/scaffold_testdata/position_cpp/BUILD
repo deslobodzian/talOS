@@ -25,6 +25,7 @@ cc_library(
     deps = [
         ":messages",
         "//talOS/devices",
+        "//talOS/mechanisms",
         "//talOS/node",
     ],
 )
