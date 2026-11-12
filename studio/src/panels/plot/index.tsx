@@ -10,7 +10,8 @@
 // effects; the render body only lays out the toolbar, the channel drawer and
 // the plot container, so react-dom/server can render the empty panel in tests.
 //
-// From a recorded session the series is decimated to the plot's pixel width:
+// From a recorded session the series is decimated to the plot's pixel width
+// (rounded up to a bucket size, recorded.ts POINT_SIZES):
 // each point is a bucket's last sample, and a bucket of more than one sample
 // also draws its min..max range as a vertical bar in the series colour.
 

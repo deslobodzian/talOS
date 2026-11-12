@@ -32,7 +32,8 @@ export interface DataSource {
   // The channel's newest reading at or before the cursor, with its own time.
   channelSample(name: string, cursor_ns?: string|null): ChannelSample|null;
   // History ending at the cursor. `points` is the plot's pixel width: a
-  // recorded source decimates to it, the live store ignores it.
+  // recorded source decimates to it rounded up to a bucket size (recorded.ts
+  // POINT_SIZES), the live store ignores it.
   series(channels: string[], window: SeriesWindow, cursor_ns: string|null,
          points?: number): Series;
   // The chassis pose at the cursor and the time it was sampled, or null when
