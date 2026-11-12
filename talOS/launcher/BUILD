@@ -438,7 +438,10 @@ cc_test(
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
-    tags = ["no_macos_sanitizer"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
     deps = [
         ":launcher_lib",
         ":log_budget",
@@ -479,7 +482,10 @@ cc_test(
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
-    tags = ["no_macos_sanitizer"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
     deps = [
         ":launcher_lib",
         ":log_budget",
@@ -545,7 +551,10 @@ cc_test(
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
-    tags = ["no_macos_sanitizer"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
     deps = [
         ":launcher_lib",
         ":supervision_events",
@@ -560,6 +569,7 @@ cc_test(
     name = "capped_log_test",
     size = "small",
     srcs = ["capped_log_test.cc"],
+    tags = ["integration"],
     deps = [
         ":launcher_lib",
         "//talOS/events:events_core",
@@ -583,7 +593,10 @@ cc_test(
         "//conditions:default": [],
     }),
     # Each spawn is two fork()s; see launcher_test.
-    tags = ["no_macos_sanitizer"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
     deps = [
         ":launcher_lib",
         "@googletest//:gtest_main",
@@ -636,6 +649,7 @@ cc_test(
         "TALOS_SOURCE_NODE": "$(rlocationpath :continuity_source)",
         "TALOS_SINK_NODE": "$(rlocationpath :continuity_sink)",
     },
+    tags = ["integration"],
     deps = [
         ":continuity_message",
         ":launcher_lib",
@@ -734,7 +748,10 @@ cc_test(
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
-    tags = ["no_macos_sanitizer"],
+    tags = [
+        "integration",
+        "no_macos_sanitizer",
+    ],
     deps = [
         ":launcher_lib",
         ":replay_message",
