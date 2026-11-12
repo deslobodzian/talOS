@@ -1704,8 +1704,11 @@ TEST(LogCapture, UncappedWriterLeavesNoMarker) {
 // write must wake it. It used to wait out the interval, so a producer that
 // filled the pool within one write_interval (a replay at full speed: 1554
 // of 5998 States logged on macOS) stopped capture with the pool exhausted.
-// Here write_interval is an hour and the writer has a record waiting for
-// it; every chunk handed over must still reach the file, one at a time,
+// Here write_interval is a century, longer than any host has been up (the
+// steady clock counts from boot, and a writer that took "never wrote" for
+// "wrote at boot" passed this on a workstation and failed on a freshly
+// booted CI machine), and the writer has a record waiting for it; every
+// chunk handed over must still reach the file, one at a time,
 // for more than three times the pool's chunks. The pool holds three: the
 // file shows chunk k written before the writer returns it to the pool, so
 // with two the producer's next hand-over could find the pool full; with
@@ -1728,7 +1731,7 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
   std::size_t records = 0;
   {
     LogWriter::Options options{kChunkBytes, 3, /*background=*/true};
-    options.write_interval = std::chrono::hours{1};
+    options.write_interval = std::chrono::hours{24 * 365 * 100};
     options.sync_interval = std::chrono::hours{1};
     LogWriter writer{path, "full_chunk", options};
     writer.start({}, {});
@@ -1739,7 +1742,8 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
       context.dispatch_index = ++records;
       writer.dispatch(context, payload);
     };
-    // Found idle, written at once; the next record waits for the hour.
+    // Found idle and never written before: written at once. The next
+    // record waits out the interval.
     log_one();
     ASSERT_TRUE(Eventually([&] { return file_size() >= base + kRecordBytes; }));
     log_one();

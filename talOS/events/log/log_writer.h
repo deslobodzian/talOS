@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -319,8 +320,10 @@ class LogWriter {
     std::deque<Chunk> pool;
     std::chrono::steady_clock::time_point last_sync{
         std::chrono::steady_clock::now()};
-    // Writer only: when it last wrote (see Options::write_interval).
-    std::chrono::steady_clock::time_point last_write{};
+    // Writer only: when it last wrote (see Options::write_interval); empty
+    // until its first write, so that a first record is written at once
+    // however recently the host booted (the steady clock counts from boot).
+    std::optional<std::chrono::steady_clock::time_point> last_write;
     Chunk* active{nullptr};
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<std::uint64_t> completed{0};
