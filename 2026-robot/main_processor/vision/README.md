@@ -25,7 +25,7 @@ the code's value when no file sets the key.
 | Key | Shared | Fallback | Units and meaning |
 | --- | --- | --- | --- |
 | `subsystem.period_us` | `10000` | `[robot] period_us` | Node/status period in microseconds (100 Hz), not the capture period. |
-| `camera.fps` | `60` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. |
+| `camera.fps` | `60` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. Construction refuses a value whose frame queues (`ceil(2 * period_us * fps / 1e6) + 2` results, `ceil(sim_timestamp_lag_us * fps / 1e6) + 2` delayed observations) would exceed 256 slots, naming both settings: 240 fps across a 500 ms tick or the longest sim lag needs 242. |
 | `camera.latency_offset_us` | `0` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
 | `camera.sim_timestamp_lag_us` | `0` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
 | `camera.readout_us` | — | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
@@ -343,8 +343,12 @@ Each finished observation joins a fixed-capacity FIFO, sized at construction to
 `ceil(2 * period_us * fps / 1e6) + 2` (4 at 10 ms and 60 fps): the results that
 finish between two collections, one per frame period plus the one in progress,
 over two node periods (a late tick, or a collection whose try-lock met the
-worker storing), and one more slot so a disconnect's invalid observation never
-evicts a frame. Each update takes every queued result and publishes them in
+worker storing), and one more slot for a disconnect's invalid observation.
+That covers a camera delivering at `camera.fps` whose frames are all captured
+inside the window; a live window can also finish the frame in progress and
+the one waiting in the mailbox from before it, and a camera faster than
+`camera.fps` finishes more, so a frame can still be evicted (and counted).
+Each update takes every queued result and publishes them in
 capture order, each with its own stamp, so a result is never replaced by a
 newer one while the loop keeps up; when the queue is full the oldest is
 dropped and counted, keeping the newest. `frames_processed_count` counts the
