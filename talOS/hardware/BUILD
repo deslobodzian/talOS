@@ -35,6 +35,9 @@ cc_library(
         "config_error.h",
         "config_wire.h",
         "endpoint.h",
+        # Invalid samples and total feedback loss, shared with
+        # testing::SimHardware.
+        "feedback.h",
         # Shared gating predicates, for the gateway and for hardware-owning
         # nodes: pure functions over State, so gate_test needs no loop and no
         # transport.

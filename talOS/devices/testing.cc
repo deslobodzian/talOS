@@ -19,6 +19,7 @@
 #include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
+#include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
@@ -113,6 +114,10 @@ struct SimHardware::Impl {
   // The gateway's epoch: Invalidate() moves it on, and a request built from
   // a State of another epoch never merges.
   std::uint64_t epoch = 1;
+  // As the gateway's healthy_: whether the latest State had any valid motor
+  // or CAN sensor sample (hardware::AnyFeedbackValid). While it is false the
+  // gateway refuses every request.
+  bool healthy = false;
   // Sample time of the latest State the bridge accepted this boot, against
   // which a request's observation is admitted.
   std::uint64_t latest_sample_us = 0;
@@ -209,6 +214,20 @@ struct SimHardware::Impl {
                                   timeout_us)) {
           continue;
         }
+        for (std::size_t i = 0; i < command.count; ++i) {
+          motor_requests[command.motors[i].id] = command.motors[i];
+        }
+        for (std::size_t i = 0; i < command.digital_output_count; ++i) {
+          digital_outputs[command.digital_outputs[i].id] =
+              command.digital_outputs[i].value;
+        }
+        for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
+          pwm_outputs[command.pwm_outputs[i].id] =
+              command.pwm_outputs[i].output;
+        }
+        // The gateway refuses every request while the latest State showed
+        // total feedback loss, so none enters the merge.
+        if (!healthy) continue;
         tracker.owner.Accept(
             Micros(SimAccess::publish_time(sim, tracker.topic, sizeof packet,
                                            tracker.cursor)),
@@ -218,7 +237,6 @@ struct SimHardware::Impl {
         Neutralize(devices);
         for (std::size_t i = 0; i < command.count; ++i) {
           const hardware::MotorRequest& request = command.motors[i];
-          motor_requests[request.id] = request;
           // As the gateway does, a motor that could not drive in the latest
           // State, or in one this request observed or followed, applies
           // neutral.
@@ -230,14 +248,10 @@ struct SimHardware::Impl {
               unavailable ? hardware::MotorRequest{.id = request.id} : request;
         }
         for (std::size_t i = 0; i < command.digital_output_count; ++i) {
-          digital_outputs[command.digital_outputs[i].id] =
-              command.digital_outputs[i].value;
           applied_digital_outputs[command.digital_outputs[i].id] =
               command.digital_outputs[i].value;
         }
         for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
-          pwm_outputs[command.pwm_outputs[i].id] =
-              command.pwm_outputs[i].output;
           applied_pwm_outputs[command.pwm_outputs[i].id] =
               command.pwm_outputs[i].output;
         }
@@ -335,7 +349,7 @@ struct SimHardware::Impl {
     const auto& motors = config.hardware.motors;
     for (std::size_t i = 0; i < state.motor_count; ++i) {
       if (hardware::MasterSampleInvalid(motors, state, i)) {
-        state.motors[i].valid = false;
+        hardware::MarkInvalid(state.motors[i]);
       }
     }
     unable.clear();
@@ -345,6 +359,28 @@ struct SimHardware::Impl {
       unable.insert(id);
       motor_drives_from[id] = state.sample_time_us + 1;
       applied_motors[id] = hardware::MotorRequest{.id = id};
+    }
+  }
+
+  // The gateway's total-loss rule (Gateway::Tick): a State with no valid
+  // motor or CAN sensor sample carries kHardwareFault, and the first such
+  // State (or one while a request is merged) starts a new epoch with every
+  // output neutral. Recovery clears the fault in the same epoch.
+  void JudgeTotalLoss(hardware::State& state) {
+    const bool was_healthy = healthy;
+    healthy = hardware::AnyFeedbackValid(state);
+    if (healthy) return;
+    state.flags |= hardware::kHardwareFault;
+    const bool active = std::any_of(
+        requests.begin(), requests.end(),
+        [](const auto& entry) { return !entry.second.owner.timed_out; });
+    if (was_healthy || active) Invalidate();
+    state.epoch = epoch;
+    for (std::size_t i = 0; i < state.digital_output_count; ++i) {
+      state.digital_outputs[i].value = false;
+    }
+    for (std::size_t i = 0; i < state.pwm_output_count; ++i) {
+      state.pwm_outputs[i].output = 0.0;
     }
   }
 
@@ -376,9 +412,9 @@ struct SimHardware::Impl {
         return hardware::MotorSample{.id = c.id};
       }
       const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
-      return hardware::MotorSample{
+      hardware::MotorSample sample{
           .id = c.id,
-          .valid = Fresh(axis),
+          .valid = true,
           .position_rot = axis.position,
           .velocity_rps = axis.velocity,
           .stator_current_a = axis.stator_current_a,
@@ -387,18 +423,22 @@ struct SimHardware::Impl {
           .fault_flags = ValueOr(motor_limit_flags, c.id, 0u),
           .temperature_c = axis.temperature_c,
           .supply_current_a = axis.supply_current_a};
+      if (!Fresh(axis)) hardware::MarkInvalid(sample);
+      return sample;
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
       if (!Connected(Kind::kCANcoder, c.id)) {
         return hardware::SensorSample{.id = c.id};
       }
       const Axis axis = ValueOr(sensors, c.id, Axis{});
-      return hardware::SensorSample{.id = c.id,
-                                    .valid = Fresh(axis),
+      hardware::SensorSample sample{.id = c.id,
+                                    .valid = true,
                                     .position_rot = axis.position,
                                     .velocity_rps = axis.velocity,
                                     .position_age_us = axis.position_age_us,
                                     .velocity_age_us = axis.velocity_age_us};
+      if (!Fresh(axis)) hardware::MarkInvalid(sample);
+      return sample;
     });
     fill(state.digital_inputs, state.digital_input_count, hw.digital_inputs,
          [&](const auto& c) {
@@ -445,6 +485,7 @@ struct SimHardware::Impl {
                                       ValueOr(applied_pwm_outputs, c.id, 0.0)};
          });
     MaskUnable(state);
+    JudgeTotalLoss(state);
 
     if (lost_states > 0) {
       // The RoboRIO samples the Driver Station mode every tick whether or not
@@ -650,6 +691,7 @@ void SimHardware::reboot() {
   // gateway starts neutral at epoch 1.
   impl_->Invalidate();
   impl_->epoch = 1;
+  impl_->healthy = false;
   impl_->latest_sample_us = 0;
   ++impl_->boot_id;
   impl_->device_reset_count = 0;

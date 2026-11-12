@@ -364,7 +364,8 @@ Software rezero does not change these timestamps.
 Python). Defaults are zero; `UINT32_MAX` injects unknown acquisition age.
 SimHardware judges these ages by the gateway's own rule (`FeedbackFresh`,
 [fault scope](../talOS/hardware/README.md#runtime-contract)): a device with
-any age `command_timeout_us` or more, or unknown, goes out invalid, so its
+any age `command_timeout_us` or more, or unknown, goes out invalid with zero
+measurements, so its
 handle reads `connected()` false and has no acquisition time.
 
 The robot-specific odometry timing policy is documented in the
@@ -557,8 +558,11 @@ cannot drive in a State (its feedback invalid: disconnected with
 CANcoder's; or a follower's master's) applies neutral from that tick while
 the others keep driving, and only a request observed after the last such
 State drives it again; a follower's sample reads invalid while its master's
-does. Unlike the gateway, losing every device's feedback
-raises no hardware fault. Inspection never refreshes
+does. An invalid motor or CAN sensor sample reads zero in every measured
+field. As on the gateway, a State in which every motor and CAN sensor is
+invalid raises the hardware fault (`robot_enabled` false) and starts a new
+epoch with every output neutral, digital and PWM included, until feedback
+returns. Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
 velocity below `0.01 rps` snaps to zero. Position continues integrating during

@@ -14,6 +14,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
+#include "talOS/devices/devices.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/sim_access.h"
@@ -500,6 +501,99 @@ TEST_F(SimHardwareTest, AMotorThatCannotDriveIsNeutralFromThatTick) {
     Send("mech", Drive());
     for (const auto motor : c.unable) expect(motor, Mode::kVelocity);
   }
+}
+
+// REQ-SAFE-22, REQ-SAFE-18: as on the gateway (Gateway::Tick), the State
+// that finds every motor and CAN sensor invalid raises kHardwareFault and
+// starts a new epoch, every output goes neutral, including digital and PWM
+// outputs no feedback gates, and the node's robot_enabled() falls. An invalid
+// sample reads zero. When feedback returns, the fault clears in the same
+// epoch and a request built from a State after it drives again.
+TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
+  struct Other {
+    explicit Other(Node& n)
+        : node{n},
+          motor{n, "motor"},
+          led{n, "other_led"},
+          servo{n, "other_servo"} {}
+    void update() {
+      enabled = robot_enabled(node);
+      motor.set_voltage(3.0);
+      led.set(true);
+      servo.set(0.5);
+    }
+    Node& node;
+    Motor motor;
+    DigitalOutput led;
+    PwmOutput servo;
+    bool enabled = false;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& other = sim.add<Other>("other");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_motor("other", "motor", 2.0, 3.0, 0, 0, 30.0, 4.0, 5.0);
+  const auto state = [&] {
+    const auto packet = sim.latest<hardware::Packet>(hardware::kStateTopic);
+    hardware::State s{};
+    if (packet) {
+      EXPECT_TRUE(hardware::Decode(packet->bytes(), s));
+    }
+    return s;
+  };
+  const auto faulted = [&] {
+    return (state().flags & hardware::kHardwareFault) != 0;
+  };
+  const auto expect_outputs = [&](bool driving) {
+    EXPECT_EQ(hw.applied_motor("other", "motor").mode,
+              driving ? Mode::kVoltage : Mode::kNeutral);
+    EXPECT_EQ(hw.applied_digital_output("other", "other_led"), driving);
+    EXPECT_DOUBLE_EQ(hw.applied_pwm("other", "other_servo"),
+                     driving ? 0.5 : 0.0);
+  };
+  sim.step(20ms);
+  ASSERT_TRUE(other.enabled);
+  ASSERT_FALSE(faulted());
+  expect_outputs(true);
+  const std::uint64_t epoch = state().epoch;
+
+  // Every motor and the CANcoder: one aged, the rest disconnected.
+  hw.set_motor("other", "motor", 2.0, 3.0, 50'000, 0, 30.0, 4.0, 5.0);
+  for (const auto device : {"braked", "coasting", "remote", "angle"}) {
+    hw.set_connected("mech", device, false);
+  }
+  sim.step(5ms);  // the State that finds total loss
+  EXPECT_TRUE(faulted());
+  EXPECT_EQ(state().epoch, epoch + 1);
+  const std::uint16_t aged_id = detail::HardwareAccess::device_id(
+      config::ParseRobotConfig(detail::SimAccess::config_path(sim)), "other",
+      Kind::kMotor, "motor");
+  hardware::MotorSample aged{.valid = true};
+  for (std::size_t i = 0; i < state().motor_count; ++i) {
+    if (state().motors[i].id == aged_id) aged = state().motors[i];
+  }
+  EXPECT_FALSE(aged.valid);
+  EXPECT_EQ(aged.position_rot, 0.0);
+  EXPECT_EQ(aged.velocity_rps, 0.0);
+  EXPECT_EQ(aged.stator_current_a, 0.0);
+  EXPECT_EQ(aged.supply_current_a, 0.0);
+  expect_outputs(false);
+  sim.step(10ms);  // every output stays neutral while the fault holds
+  EXPECT_FALSE(other.enabled);
+  expect_outputs(false);
+  for (const auto& sample : state().digital_outputs) EXPECT_FALSE(sample.value);
+  for (const auto& sample : state().pwm_outputs) {
+    EXPECT_DOUBLE_EQ(sample.output, 0.0);
+  }
+  EXPECT_EQ(state().epoch, epoch + 1);  // one new epoch, not one per tick
+
+  hw.set_motor("other", "motor", 2.0, 3.0);
+  sim.step(5ms);  // recovered: no fault, same epoch
+  EXPECT_FALSE(faulted());
+  EXPECT_EQ(state().epoch, epoch + 1);
+  sim.step(10ms);
+  EXPECT_TRUE(other.enabled);
+  expect_outputs(true);
 }
 
 // The RoboRIO observes the mode every tick, delivered or not: a disable lost
