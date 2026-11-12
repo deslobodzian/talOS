@@ -276,8 +276,9 @@ class TlogToWpilogTest : public testing::Test {
         rules_cc::cc::runfiles::Runfiles::CreateForTest(
             BAZEL_CURRENT_REPOSITORY, &error));
     ASSERT_NE(runfiles, nullptr) << error;
-    ASSERT_NE(std::getenv("TALOS_TLOG_TO_WPILOG"), nullptr);
-    binary_ = runfiles->Rlocation(std::getenv("TALOS_TLOG_TO_WPILOG"));
+    const char* const binary = std::getenv("TALOS_TLOG_TO_WPILOG");
+    ASSERT_NE(binary, nullptr);
+    binary_ = runfiles->Rlocation(binary);
     WriteSession();
   }
 
