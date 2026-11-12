@@ -238,6 +238,11 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
 }
 
 int Launcher::Run() {
+  // A session must not end because whoever reads the launcher's stdout or
+  // stderr went away (an ssh session or a `tee` closing): its writes then
+  // fail with EPIPE, which every writer here survives (REQ-OPS-33). Children
+  // start with the default again (SpawnProcess).
+  std::signal(SIGPIPE, SIG_IGN);
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
     std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;

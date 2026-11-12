@@ -275,6 +275,14 @@ member appended to that one file after a line naming it, such as
 echoed to the launcher's stdout. A deployed robot therefore keeps its nodes'
 output beside their event logs, whatever happens to the launcher's own.
 
+A launcher whose stdout or stderr reader closes (an ssh session or a `tee`
+ending) keeps supervising: it ignores SIGPIPE, ends the echo at its first
+write that fails that way, and keeps writing every member's log; every
+process it spawns starts with SIGPIPE at its default. A reader that stays
+open but stops reading is different: once the pipe or terminal is full, the
+launcher's own next line blocks its supervision loop (no restart, stall kill
+or stop) until the reader reads again.
+
 A print never waits for a disk or for the launcher's stdout: a one-line write
 to a file on a loaded disk can take hundreds of milliseconds, far past a
 node's `command_timeout_us`. One launcher

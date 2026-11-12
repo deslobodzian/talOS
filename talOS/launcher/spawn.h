@@ -139,7 +139,9 @@ enum class SpawnOutput {
 inline constexpr int kChildOutputPipeBytes = 256 * 1024;
 
 // fork + execv of args[0], in its own process group, its output as `output`
-// says; for a pipe, `*reader` receives the read end (close-on-exec). Returns
+// says, with SIGINT, SIGTERM and SIGPIPE at their default dispositions
+// whatever the launcher's are; for a pipe, `*reader` receives the read end
+// (close-on-exec). Returns
 // the child's pid once it has exec'd, which the close-on-exec error pipe it
 // shares with the launcher shows by closing. A child that fails before or at
 // its exec reports the step and errno there instead, exits 127 and is reaped;
