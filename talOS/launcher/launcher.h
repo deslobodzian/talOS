@@ -88,7 +88,9 @@ class Launcher {
   // runs, std::cout, std::cerr and std::clog write into a LauncherOutput
   // (child_output.h), never into descriptors 1 and 2 directly, and from the
   // session directory's creation also into its talos.log; it returns once
-  // they have taken what was written, or kLauncherOutputLinger has passed.
+  // they have taken what was written, or at most kLauncherOutputLinger plus
+  // kLauncherOutputWriterGrace after the session ended, whatever they do
+  // (LauncherOutput::Stop).
   int Run();
 
  private:

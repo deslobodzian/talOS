@@ -141,53 +141,129 @@ std::string NodeOutputPath(const std::string& output_dir,
 // LauncherOutput
 // ---------------------------------------------------------------------------
 
+// Everything the writer threads touch.
+struct LauncherOutput::State {
+  // One real descriptor: 1, or 2 unless it is the same file as 1, whose
+  // lines then share 1's queue and keep their order.
+  struct Descriptor {
+    int fd{-1};           // A close-on-exec copy; -1 when unusable.
+    std::size_t chunk{};  // Bytes per write (PIPE_BUF for a pipe or socket).
+    const char* name{""};
+    // Under mutex:
+    std::string pending;
+    uint64_t dropped{0};   // Since the writer last took `pending`.
+    std::size_t taken{0};  // Taken by the writer and not yet written.
+    bool closed{false};
+  };
+
+  State() = default;
+  // Only once no thread holds it: a writer left inside a write() keeps its
+  // descriptor open, so the number is never reused under it.
+  ~State() {
+    for (Descriptor& descriptor : descriptors)
+      if (descriptor.fd >= 0) ::close(descriptor.fd);
+    for (const int fd : wake)
+      if (fd >= 0) ::close(fd);
+  }
+  State(const State&) = delete;
+  State& operator=(const State&) = delete;
+
+  // Appends `size` bytes written to std::cout (fd 1) or std::cerr and
+  // std::clog (fd 2) to that descriptor's buffer and to talos.log's.
+  void Say(int fd, const char* data, std::size_t size);
+
+  // Node output for descriptor 1 only.
+  void Echo(std::string_view bytes);
+
+  // Appends to `to` up to the buffer bound; returns the bytes dropped.
+  static std::size_t Append(std::string& to, const char* data,
+                            std::size_t size);
+
+  // A full wake pipe already holds a wakeup.
+  void Wake() const { WakeUp(wake); }
+
+  // Under mutex: puts in talos.log's buffer how many bytes each descriptor
+  // never took.
+  void NoteUnwritten();
+
+  // Writes the descriptors' buffers, waiting on poll() for each to take
+  // more; its poll() never waits past the stop's linger.
+  void DescriptorLoop();
+
+  // Writes talos.log's buffer until the stop has let it finish and nothing
+  // is left.
+  void FileLoop();
+
+  // Descriptor 2's lines go to `descriptors[target[1]]`.
+  Descriptor descriptors[2];
+  std::size_t target[2]{0, 1};
+  int wake[2]{-1, -1};
+  std::mutex mutex;
+  std::condition_variable file_wake;
+  std::condition_variable writer_ended;
+  // Guarded by mutex:
+  std::string file_path;
+  std::string file_pending;
+  uint64_t file_dropped{0};
+  bool stopping{false};
+  std::chrono::milliseconds linger{0};
+  Clock::time_point give_up{};
+  bool descriptors_ended{false};  // DescriptorLoop has returned.
+  bool abandoned{false};          // Stop stopped waiting for it.
+  bool file_done{false};          // FileLoop may end once it is empty.
+};
+
 LauncherOutput::Sink::int_type LauncherOutput::Sink::overflow(int_type c) {
   if (traits_type::eq_int_type(c, traits_type::eof()))
     return traits_type::not_eof(c);
   const char byte = traits_type::to_char_type(c);
-  owner_.Say(fd_, &byte, 1);
+  state_.Say(fd_, &byte, 1);
   return c;
 }
 
 std::streamsize LauncherOutput::Sink::xsputn(const char* data,
                                              std::streamsize size) {
-  if (size > 0) owner_.Say(fd_, data, static_cast<std::size_t>(size));
+  if (size > 0) state_.Say(fd_, data, static_cast<std::size_t>(size));
   return size;
 }
 
-LauncherOutput::LauncherOutput() {
-  WakePipe(wake_, "launcher output wake pipe");
+LauncherOutput::LauncherOutput()
+    : state_{std::make_shared<State>()}, out_{*state_, 1}, err_{*state_, 2} {
+  State& state = *state_;
+  WakePipe(state.wake, "launcher output wake pipe");
   struct stat seen[2]{};
-  bool usable[2]{false, false};
   for (std::size_t i = 0; i < 2; ++i) {
-    Descriptor& descriptor = descriptors_[i];
+    State::Descriptor& descriptor = state.descriptors[i];
     descriptor.name = i == 0 ? "stdout" : "stderr";
     const int fd = static_cast<int>(i) + 1;
-    usable[i] = ::fstat(fd, &seen[i]) == 0;
     // Its own copy: the descriptor number cannot be reused under it.
-    descriptor.fd = usable[i] ? ::fcntl(fd, F_DUPFD_CLOEXEC, 3) : -1;
+    descriptor.fd =
+        ::fstat(fd, &seen[i]) == 0 ? ::fcntl(fd, F_DUPFD_CLOEXEC, 3) : -1;
     descriptor.closed = descriptor.fd < 0;
     const mode_t type = seen[i].st_mode & S_IFMT;
     // A pipe that poll() calls writable takes PIPE_BUF bytes without
-    // blocking (Linux: a free page; macOS: PIPE_BUF free); a socket's send
-    // buffer, a terminal's too, in practice. A file takes what it is given.
+    // blocking (Linux: a free page; macOS: PIPE_BUF free), unless another
+    // process writes to it in between. A socket or a terminal may take less
+    // and block on the rest, which Stop does not wait for. A file takes
+    // what it is given.
     descriptor.chunk = type == S_IFIFO || type == S_IFSOCK || type == S_IFCHR
                            ? std::size_t{PIPE_BUF}
                            : std::numeric_limits<std::size_t>::max();
   }
-  if (!descriptors_[0].closed && !descriptors_[1].closed &&
+  if (!state.descriptors[0].closed && !state.descriptors[1].closed &&
       seen[0].st_dev == seen[1].st_dev && seen[0].st_ino == seen[1].st_ino) {
     // `2>&1`, a terminal: one queue keeps stdout's and stderr's lines in
     // the order they were written.
-    target_[1] = 0;
-    ::close(descriptors_[1].fd);
-    descriptors_[1].fd = -1;
-    descriptors_[1].closed = true;
+    state.target[1] = 0;
+    ::close(state.descriptors[1].fd);
+    state.descriptors[1].fd = -1;
+    state.descriptors[1].closed = true;
   }
   try {
     const SignalsBlocked blocked;
-    descriptor_writer_ = std::thread{[this] { DescriptorLoop(); }};
-    file_writer_ = std::thread{[this] { FileLoop(); }};
+    descriptor_writer_ =
+        std::thread{[held = state_] { held->DescriptorLoop(); }};
+    file_writer_ = std::thread{[held = state_] { held->FileLoop(); }};
   } catch (...) {
     Stop(std::chrono::milliseconds{0});
     throw;
@@ -203,33 +279,35 @@ LauncherOutput::LauncherOutput() {
 LauncherOutput::~LauncherOutput() { Stop(); }
 
 void LauncherOutput::Record(const std::string& path) {
-  const std::lock_guard lock{mutex_};
-  file_path_ = path;
+  const std::lock_guard lock{state_->mutex};
+  state_->file_path = path;
 }
 
-void LauncherOutput::Echo(std::string_view bytes) {
+void LauncherOutput::Echo(std::string_view bytes) { state_->Echo(bytes); }
+
+void LauncherOutput::State::Echo(std::string_view bytes) {
   {
-    const std::lock_guard lock{mutex_};
-    Descriptor& out = descriptors_[0];
+    const std::lock_guard lock{mutex};
+    Descriptor& out = descriptors[0];
     if (!out.closed)
       out.dropped += Append(out.pending, bytes.data(), bytes.size());
   }
   Wake();
 }
 
-void LauncherOutput::Say(int fd, const char* data, std::size_t size) {
+void LauncherOutput::State::Say(int fd, const char* data, std::size_t size) {
   {
-    const std::lock_guard lock{mutex_};
-    Descriptor& to = descriptors_[target_[fd == 1 ? 0 : 1]];
+    const std::lock_guard lock{mutex};
+    Descriptor& to = descriptors[target[fd == 1 ? 0 : 1]];
     if (!to.closed) to.dropped += Append(to.pending, data, size);
-    if (!file_path_.empty()) file_dropped_ += Append(file_pending_, data, size);
+    if (!file_path.empty()) file_dropped += Append(file_pending, data, size);
   }
-  file_wake_.notify_one();
+  file_wake.notify_one();
   Wake();
 }
 
-std::size_t LauncherOutput::Append(std::string& to, const char* data,
-                                   std::size_t size) {
+std::size_t LauncherOutput::State::Append(std::string& to, const char* data,
+                                          std::size_t size) {
   const std::size_t room =
       kChildOutputBufferBytes - std::min(kChildOutputBufferBytes, to.size());
   const std::size_t kept = std::min(size, room);
@@ -237,52 +315,71 @@ std::size_t LauncherOutput::Append(std::string& to, const char* data,
   return size - kept;
 }
 
-void LauncherOutput::Wake() { WakeUp(wake_); }
+void LauncherOutput::State::NoteUnwritten() {
+  for (const Descriptor& descriptor : descriptors) {
+    if (descriptor.closed) continue;
+    const uint64_t left =
+        descriptor.taken + descriptor.pending.size() + descriptor.dropped;
+    if (left == 0 || file_path.empty()) continue;
+    const std::string line =
+        "[launcher] " + std::to_string(left) + " bytes for the launcher's " +
+        descriptor.name + " were not written: it did not drain within " +
+        std::to_string(linger.count()) + " ms of the end\n";
+    file_dropped += Append(file_pending, line.data(), line.size());
+  }
+}
 
 void LauncherOutput::Stop(std::chrono::milliseconds linger) {
   if (stopped_) return;
   stopped_ = true;
+  State& state = *state_;
+  bool ended = false;
   {
-    const std::lock_guard lock{mutex_};
-    stopping_ = true;
-    linger_ = linger;
-    give_up_ = Clock::now() + linger;
+    std::unique_lock lock{state.mutex};
+    state.stopping = true;
+    state.linger = linger;
+    state.give_up = Clock::now() + linger;
+    state.Wake();
+    // The writer's poll() returns by give_up; only a write() it is inside
+    // can keep it longer.
+    ended = state.writer_ended.wait_until(
+        lock, state.give_up + kLauncherOutputWriterGrace,
+        [&state] { return state.descriptors_ended; });
+    if (!ended) {
+      // From here the writer adds nothing to talos.log.
+      state.abandoned = true;
+      state.NoteUnwritten();
+    }
+    state.file_done = true;
   }
-  Wake();
-  if (descriptor_writer_.joinable()) descriptor_writer_.join();
-  {
-    const std::lock_guard lock{mutex_};
-    descriptors_done_ = true;
+  state.file_wake.notify_all();
+  if (descriptor_writer_.joinable()) {
+    if (ended) {
+      descriptor_writer_.join();
+    } else {
+      descriptor_writer_.detach();
+    }
   }
-  file_wake_.notify_all();
   if (file_writer_.joinable()) file_writer_.join();
   if (previous_[0] != nullptr) {
     std::cout.rdbuf(previous_[0]);
     std::cerr.rdbuf(previous_[1]);
     std::clog.rdbuf(previous_[2]);
   }
-  for (Descriptor& descriptor : descriptors_) {
-    if (descriptor.fd >= 0) ::close(descriptor.fd);
-    descriptor.fd = -1;
-  }
-  for (int& fd : wake_) {
-    if (fd >= 0) ::close(fd);
-    fd = -1;
-  }
 }
 
-void LauncherOutput::DescriptorLoop() {
+void LauncherOutput::State::DescriptorLoop() {
   // What each descriptor's writer has taken, and how much of it is written.
   std::string batch[2];
   std::size_t written[2]{0, 0};
   for (;;) {
     bool any = false;
-    bool stopping = false;
-    Clock::time_point give_up;
+    bool stopped = false;
+    Clock::time_point until;
     {
-      const std::lock_guard lock{mutex_};
+      const std::lock_guard lock{mutex};
       for (std::size_t i = 0; i < 2; ++i) {
-        Descriptor& descriptor = descriptors_[i];
+        Descriptor& descriptor = descriptors[i];
         if (descriptor.closed) continue;
         if (written[i] == batch[i].size() &&
             (!descriptor.pending.empty() || descriptor.dropped != 0)) {
@@ -296,27 +393,28 @@ void LauncherOutput::DescriptorLoop() {
             descriptor.dropped = 0;
           }
         }
-        if (written[i] < batch[i].size()) any = true;
+        descriptor.taken = batch[i].size() - written[i];
+        if (descriptor.taken != 0) any = true;
       }
-      stopping = stopping_;
-      give_up = give_up_;
+      stopped = stopping;
+      until = give_up;
     }
-    if (stopping && !any) break;
+    if (stopped && !any) break;
     int timeout = -1;
-    if (stopping) {
+    if (stopped) {
       const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            give_up - Clock::now())
+                            until - Clock::now())
                             .count();
       if (left <= 0) break;
       timeout = static_cast<int>(left) + 1;
     }
-    ::pollfd fds[3]{{wake_[0], POLLIN, 0}};
+    ::pollfd fds[3]{{wake[0], POLLIN, 0}};
     std::size_t which[3]{};
     nfds_t count = 1;
     for (std::size_t i = 0; i < 2; ++i) {
       if (written[i] >= batch[i].size()) continue;
       which[count] = i;
-      fds[count++] = ::pollfd{descriptors_[i].fd, POLLOUT, 0};
+      fds[count++] = ::pollfd{descriptors[i].fd, POLLOUT, 0};
     }
     const int ready = ::poll(fds, count, timeout);
     if (ready < 0 && errno == EINTR) continue;
@@ -324,17 +422,21 @@ void LauncherOutput::DescriptorLoop() {
       // Nothing says which is writable: try each, which may block here.
       for (nfds_t f = 1; f < count; ++f) fds[f].revents = POLLOUT;
     }
-    if (fds[0].revents != 0) DrainWakes(wake_[0]);
+    if (fds[0].revents != 0) DrainWakes(wake[0]);
     for (nfds_t f = 1; f < count; ++f) {
       if (fds[f].revents == 0) continue;
       const std::size_t i = which[f];
-      Descriptor& descriptor = descriptors_[i];
+      Descriptor& descriptor = descriptors[i];
       const std::size_t size =
           std::min(descriptor.chunk, batch[i].size() - written[i]);
+      // May block on what the descriptor cannot take at once (a terminal);
+      // Stop does not wait for that.
       const ssize_t wrote =
           ::write(descriptor.fd, batch[i].data() + written[i], size);
       if (wrote > 0) {
         written[i] += static_cast<std::size_t>(wrote);
+        const std::lock_guard lock{mutex};
+        descriptor.taken = batch[i].size() - written[i];
         continue;
       }
       if (wrote < 0 &&
@@ -344,14 +446,18 @@ void LauncherOutput::DescriptorLoop() {
       // pipe, the launcher ignoring SIGPIPE; a broken descriptor): nothing
       // more goes to it this session.
       const int error = wrote < 0 ? errno : EIO;
+      bool left_behind = false;
       {
-        const std::lock_guard lock{mutex_};
+        const std::lock_guard lock{mutex};
         descriptor.closed = true;
         descriptor.pending.clear();
         descriptor.dropped = 0;
+        descriptor.taken = 0;
+        left_behind = abandoned;
       }
       batch[i].clear();
       written[i] = 0;
+      if (left_behind) continue;
       const std::string line = std::string{"[launcher] "} + descriptor.name +
                                ": " + std::strerror(error) +
                                "; the launcher no longer writes to it (its "
@@ -360,38 +466,34 @@ void LauncherOutput::DescriptorLoop() {
       Say(i == 0 ? 2 : 1, line.data(), line.size());
     }
   }
-  // Stopped: what the descriptors did not take within the linger.
-  const std::lock_guard lock{mutex_};
-  for (std::size_t i = 0; i < 2; ++i) {
-    Descriptor& descriptor = descriptors_[i];
-    if (descriptor.closed) continue;
-    const uint64_t left = batch[i].size() - written[i] +
-                          descriptor.pending.size() + descriptor.dropped;
-    if (left == 0 || file_path_.empty()) continue;
-    const std::string line =
-        "[launcher] " + std::to_string(left) + " bytes for the launcher's " +
-        descriptor.name + " were not written: it did not drain within " +
-        std::to_string(linger_.count()) + " ms of the end\n";
-    file_dropped_ += Append(file_pending_, line.data(), line.size());
+  // Stopped: what the descriptors did not take within the linger, unless
+  // Stop, no longer waiting, has said so itself.
+  {
+    const std::lock_guard lock{mutex};
+    for (std::size_t i = 0; i < 2; ++i)
+      descriptors[i].taken = batch[i].size() - written[i];
+    if (!abandoned) NoteUnwritten();
+    descriptors_ended = true;
   }
+  writer_ended.notify_all();
 }
 
-void LauncherOutput::FileLoop() {
+void LauncherOutput::State::FileLoop() {
   LogFile file;
-  std::unique_lock lock{mutex_};
+  std::unique_lock lock{mutex};
   for (;;) {
-    file_wake_.wait(lock, [this] {
-      return !file_pending_.empty() || file_dropped_ != 0 || descriptors_done_;
+    file_wake.wait(lock, [this] {
+      return !file_pending.empty() || file_dropped != 0 || file_done;
     });
-    if (file_pending_.empty() && file_dropped_ == 0) break;  // Done.
-    std::string bytes = std::move(file_pending_);
-    file_pending_.clear();
-    if (file_dropped_ != 0) {
-      bytes += DropNote(bytes, file_dropped_,
+    if (file_pending.empty() && file_dropped == 0) break;  // file_done.
+    std::string bytes = std::move(file_pending);
+    file_pending.clear();
+    if (file_dropped != 0) {
+      bytes += DropNote(bytes, file_dropped,
                         "the launcher's log writer fell behind");
-      file_dropped_ = 0;
+      file_dropped = 0;
     }
-    const std::string path = file_path_;
+    const std::string path = file_path;
     lock.unlock();
     WriteLog(file, path, std::move(bytes));
     lock.lock();

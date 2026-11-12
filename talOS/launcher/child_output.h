@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <streambuf>
 #include <string>
@@ -73,6 +74,9 @@ inline constexpr std::string_view kLauncherOutputFile = "talos.log";
 // How long LauncherOutput::Stop waits for descriptors 1 and 2 to take what
 // is buffered for them before it drops the rest.
 inline constexpr std::chrono::milliseconds kLauncherOutputLinger{1000};
+// How much longer LauncherOutput::Stop waits for its descriptor writer to
+// see the linger end (its poll() returns then) before leaving it behind.
+inline constexpr std::chrono::milliseconds kLauncherOutputWriterGrace{100};
 
 // The log a member's stdout and stderr are drained into, all runs together.
 std::string NodeOutputPath(const std::string& output_dir,
@@ -99,20 +103,27 @@ class LauncherOutput {
   // Node output for descriptor 1 only (ChildOutput's echo). Never waits.
   void Echo(std::string_view bytes);
 
-  // Waits up to `linger` for descriptors 1 and 2 to take what is buffered
-  // for them and drops the rest (counted in talos.log), writes everything
-  // left to talos.log, stops the threads and gives std::cout, std::cerr and
-  // std::clog back. A write already in progress to a terminal whose output
-  // is stopped (Ctrl-S) still holds it until it returns. Idempotent.
+  // Gives descriptors 1 and 2 `linger` to take what is buffered for them,
+  // then drops the rest (counted in talos.log), writes everything left to
+  // talos.log, stops the file writer and gives std::cout, std::cerr and
+  // std::clog back. Returns within `linger` plus kLauncherOutputWriterGrace
+  // and the disk's time for talos.log, whatever the descriptors do: a
+  // descriptor writer still inside a write() then (a terminal nobody reads
+  // takes part of a chunk and blocks on the rest) is left to finish or die
+  // with the process. It owns, with this object, everything it touches
+  // (State), so it never reaches freed memory or a closed descriptor
+  // number, and it writes nothing more to talos.log. Idempotent.
   void Stop(std::chrono::milliseconds linger = kLauncherOutputLinger);
 
  private:
-  // A streambuf that hands every byte written to it to Say. Unbuffered, so
-  // several threads may write through one (each call is atomic, as on a
-  // descriptor; their lines can interleave).
+  struct State;
+
+  // A streambuf that hands every byte written to it to State::Say.
+  // Unbuffered, so several threads may write through one (each call is
+  // atomic, as on a descriptor; their lines can interleave).
   class Sink : public std::streambuf {
    public:
-    Sink(LauncherOutput& owner, int fd) : owner_{owner}, fd_{fd} {}
+    Sink(State& state, int fd) : state_{state}, fd_{fd} {}
 
    protected:
     int_type overflow(int_type c) override;
@@ -120,59 +131,17 @@ class LauncherOutput {
     int sync() override { return 0; }
 
    private:
-    LauncherOutput& owner_;
+    State& state_;
     const int fd_;
   };
 
-  // One real descriptor: 1, or 2 unless it is the same file as 1, whose
-  // lines then share 1's queue and keep their order.
-  struct Descriptor {
-    int fd{-1};           // A close-on-exec copy; -1 when unusable.
-    std::size_t chunk{};  // Bytes per write (PIPE_BUF for a pipe or socket).
-    const char* name{""};
-    // Under mutex_:
-    std::string pending;
-    uint64_t dropped{0};  // Since the writer last took `pending`.
-    bool closed{false};
-  };
-
-  // Appends `size` bytes written to std::cout (fd 1) or std::cerr and
-  // std::clog (fd 2) to that descriptor's buffer and to talos.log's.
-  void Say(int fd, const char* data, std::size_t size);
-
-  // Appends to `to` up to the buffer bound; returns the bytes dropped.
-  static std::size_t Append(std::string& to, const char* data,
-                            std::size_t size);
-
-  // A full wake pipe already holds a wakeup.
-  void Wake();
-
-  // Writes the descriptors' buffers, waiting on poll() for each to take
-  // more; never longer than the stop's linger once stopping.
-  void DescriptorLoop();
-
-  // Writes talos.log's buffer until the descriptor loop has ended and
-  // nothing is left.
-  void FileLoop();
-
-  // Descriptor 2's lines go to `descriptors_[target_[1]]`.
-  Descriptor descriptors_[2];
-  std::size_t target_[2]{0, 1};
-  Sink out_{*this, 1};
-  Sink err_{*this, 2};
+  // Shared with the threads, each holding a reference, so that it outlives
+  // a descriptor writer Stop leaves behind.
+  std::shared_ptr<State> state_;
+  Sink out_;
+  Sink err_;
   std::streambuf* previous_[3]{nullptr, nullptr, nullptr};
-  int wake_[2]{-1, -1};
-  std::mutex mutex_;
-  std::condition_variable file_wake_;
-  // Guarded by mutex_.
-  std::string file_path_;
-  std::string file_pending_;
-  uint64_t file_dropped_{0};
-  bool stopping_{false};
-  std::chrono::milliseconds linger_{0};
-  Clock::time_point give_up_{};
-  bool descriptors_done_{false};
-  bool stopped_{false};  // The owner's: Stop has run.
+  bool stopped_{false};
   std::thread descriptor_writer_;
   std::thread file_writer_;
 };
