@@ -596,6 +596,18 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
 }
 State Gateway::snapshot() const {
   State s = state_;
+  // A motor or CAN sensor sample marked invalid carries zero in every
+  // measured field, wherever it was invalidated (the backend, the age bound,
+  // a mask), so no reader takes a frozen value for a measurement. Only the
+  // published copy: reset detection skips invalid samples either way.
+  for (auto& m : s.motors) {
+    if (m.valid) continue;
+    m.position_rot = m.velocity_rps = m.voltage = m.stator_current_a =
+        m.supply_current_a = 0;
+  }
+  for (auto& sensor : s.sensors) {
+    if (!sensor.valid) sensor.position_rot = sensor.velocity_rps = 0;
+  }
   s.flags = (configured_ && config_.commissioned ? kConfigured : 0u) |
             (configured_ && enabled_ ? kEnabled : 0u) |
             (active_ ? kCommandActive : 0u) |

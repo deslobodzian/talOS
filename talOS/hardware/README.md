@@ -339,7 +339,13 @@ velocity sample is `command_timeout_us` old or older (an unknown age,
 `Backend::Read`, the same for every backend (`FeedbackFresh`, `gate.h`), so a
 gap shorter than that bound does not invalidate the feedback at the gateway;
 a consumer's own, tighter age bound still applies (the drivetrain drops
-odometry samples older than 50 ms, see its [README](../../2026-robot/main_processor/drivetrain/README.md)). Invalid motor
+odometry samples older than 50 ms, see its [README](../../2026-robot/main_processor/drivetrain/README.md)).
+A motor or CAN sensor sample marked invalid, by the backend, the age bound
+or the gateway's mask of an unavailable device or its follower, carries zero
+in every measured field (position, velocity, applied voltage, stator and
+supply current; `Gateway::snapshot`), never its last values; its ages,
+temperature and fault bits are the backend's. Reset detection (above)
+skips an invalid sample, so its zero is never a position step. Invalid motor
 motion feedback, or a missing or invalid remote CANcoder, neutralizes only that
 motor and its followers; healthy motors in the same command continue driving.
 The neutral starts in the tick that finds the feedback invalid, while a command

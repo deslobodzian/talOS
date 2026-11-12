@@ -210,6 +210,8 @@ class FakeBackend : public Backend {
       if (const auto it = positions.find(m.id); it != positions.end()) {
         m.position_rot = it->second;
       }
+      m.velocity_rps = m.voltage = m.stator_current_a = m.supply_current_a =
+          measurement;
       m.position_age_us = m.velocity_age_us = age_us;
       if (const auto it = position_ages.find(m.id); it != position_ages.end()) {
         m.position_age_us = it->second;
@@ -220,6 +222,7 @@ class FakeBackend : public Backend {
     }
     for (auto& sensor : s.sensors) {
       sensor.valid = healthy && sensor.id != invalid_sensor;
+      sensor.position_rot = sensor.velocity_rps = measurement;
       sensor.position_age_us = sensor.velocity_age_us = age_us;
       if (const auto it = position_ages.find(sensor.id);
           it != position_ages.end()) {
@@ -301,6 +304,9 @@ class FakeBackend : public Backend {
   // motor velocity age named here. The fake never judges an age itself: the
   // gateway does, for every backend.
   std::map<uint16_t, double> positions;
+  // Every motor's velocity, voltage, stator and supply current, and every
+  // sensor's position and velocity, valid or not.
+  double measurement{};
   uint32_t age_us{};
   std::map<uint16_t, uint32_t> position_ages, velocity_ages;
 };
@@ -1948,16 +1954,22 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   }
   const auto stale = Request(gateway);
   const auto epoch = gateway.snapshot().epoch;
+  const double before = gateway.snapshot().motors[0].position_rot;
+  ASSERT_GT(before, 0.0);
   backend.SimulateDeviceReset(gateway.snapshot().motors[0].id);
   gateway.Tick(106000, true);
-  const double position = gateway.snapshot().motors[0].position_rot;
-  ASSERT_NE(position, 0.0);
+  // Masked, and so carrying no measurement, while it restores.
+  ASSERT_FALSE(gateway.snapshot().motors[0].valid);
   EXPECT_EQ(gateway.snapshot().epoch, epoch);
   EXPECT_TRUE(gateway.Accept(stale, 200000, 106000));
   gateway.Tick(111000, true);
-  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].position_rot, position);
-  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].velocity_rps, 0.0);
-  EXPECT_DOUBLE_EQ(gateway.snapshot().motors[0].voltage, 0.0);
+  // Restored where the reset tick left it, past `before` rather than
+  // restarted at zero, and the stale demand drives nothing.
+  const auto restored = gateway.snapshot().motors[0];
+  ASSERT_TRUE(restored.valid);
+  EXPECT_GT(restored.position_rot, before);
+  EXPECT_DOUBLE_EQ(restored.velocity_rps, 0.0);
+  EXPECT_DOUBLE_EQ(restored.voltage, 0.0);
 }
 
 // A TalonFX reset restarts its rotor position at zero, and the restarted
@@ -2053,6 +2065,91 @@ TEST(Gateway, PositionStepsWithinMotorSpeedOrOnRemoteFeedbackAreNoReset) {
   EXPECT_TRUE(s.motors[drive].valid);
   EXPECT_TRUE(s.motors[steer].valid);
   EXPECT_TRUE(backend.restoring_ids.empty());
+}
+
+// A sample the gateway invalidates carries zero in every measured field, as
+// one the backend invalidated does: a motor whose position is
+// command_timeout_us old, a masked (unavailable) motor and a gyro whose yaw is
+// that old all read zero position, velocity, voltage and currents, so a reader
+// that skips connected() never takes the frozen values for a measurement.
+// Valid samples in the same State keep theirs.
+// REQ-CONTRACT-32
+TEST(Gateway, InvalidSamplesCarryZeroMeasurements) {
+  const auto config = SwerveConfig(true);
+  const auto index_of = [&config](uint16_t id) {
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      if (config.motors[i].id == id) return i;
+    }
+    return config.motors.size();
+  };
+  const auto aged = index_of(1);    // back_left_drive
+  const auto masked = index_of(4);  // back_right_drive
+  const auto valid = index_of(8);   // front_left_drive
+  std::size_t gyro = 0;
+  while (config.sensors[gyro].kind != SensorKind::kPigeon2) ++gyro;
+  FakeBackend backend;
+  backend.measurement = 3;
+  backend.unavailable = {config.motors[masked].id};
+  for (const auto& motor : config.motors) backend.positions[motor.id] = 30;
+  backend.position_ages[config.motors[aged].id] = config.command_timeout_us;
+  backend.position_ages[config.sensors[gyro].id] = config.command_timeout_us;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  const auto s = g.snapshot();
+  for (const auto i : {aged, masked}) {
+    SCOPED_TRACE(config.motors[i].name);
+    const auto& m = s.motors[i];
+    EXPECT_FALSE(m.valid);
+    EXPECT_EQ(m.position_rot, 0.0);
+    EXPECT_EQ(m.velocity_rps, 0.0);
+    EXPECT_EQ(m.voltage, 0.0);
+    EXPECT_EQ(m.stator_current_a, 0.0);
+    EXPECT_EQ(m.supply_current_a, 0.0);
+  }
+  EXPECT_FALSE(s.sensors[gyro].valid);
+  EXPECT_EQ(s.sensors[gyro].position_rot, 0.0);
+  EXPECT_EQ(s.sensors[gyro].velocity_rps, 0.0);
+  ASSERT_TRUE(s.motors[valid].valid);
+  EXPECT_EQ(s.motors[valid].position_rot, 30.0);
+  EXPECT_EQ(s.motors[valid].velocity_rps, 3.0);
+  EXPECT_EQ(s.motors[valid].supply_current_a, 3.0);
+}
+
+// The zero an invalid sample carries is no position: a rotor-feedback motor at
+// 30 rotations whose next sample is invalid (zeroed by the backend, or aged
+// out at the gateway) and whose sample after that is valid at 30 again has not
+// moved, so no reset is counted (a count change drops every Motor::rezero of
+// a node) and nothing is restored; read as a position, the zero would be a
+// step of 30 where 0.8 rotations is the bound.
+// REQ-CONTRACT-32
+TEST(Gateway, InvalidSampleBetweenEqualPositionsIsNoReset) {
+  const auto config = SwerveConfig(true);
+  const auto drive = MotorIndex(config, Feedback::kRotor);
+  const uint16_t id = config.motors[drive].id;
+  for (const bool aged : {false, true}) {
+    SCOPED_TRACE(aged ? "aged out at the gateway" : "invalid from the backend");
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    backend.positions[id] = 30;
+    g.Tick(1000, true);
+    ASSERT_TRUE(g.snapshot().motors[drive].valid);
+    if (aged) {
+      backend.position_ages[id] = config.command_timeout_us;
+    } else {
+      backend.invalid_motor = id;
+      backend.positions[id] = 0;
+    }
+    g.Tick(2000, true);
+    ASSERT_FALSE(g.snapshot().motors[drive].valid);
+    backend.position_ages.clear();
+    backend.invalid_motor = 0;
+    backend.positions[id] = 30;
+    g.Tick(3000, true);
+    const auto s = g.snapshot();
+    EXPECT_TRUE(s.motors[drive].valid);
+    EXPECT_EQ(s.counters.device_reset_count, 0u);
+    EXPECT_TRUE(backend.restoring_ids.empty());
+  }
 }
 
 TEST(Gateway, FailedDeviceConfigureAndRestoreLeaveOthersDriving) {
