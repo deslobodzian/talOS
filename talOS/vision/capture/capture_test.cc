@@ -117,7 +117,7 @@ TEST(Capture, LinuxMjpegFramesDecodeToGrayOrAreRefused) {
   cv::cvtColor(bgr, expected, cv::COLOR_BGR2GRAY);
   std::vector<uint8_t> padded = jpeg;
   padded.resize(jpeg.size() + 64, 0);
-  std::vector<uint8_t> gray(128 * 80, 0);
+  std::vector<uint8_t> gray(size_t{128} * 80, 0);
   ASSERT_TRUE(DecodeMjpegGray(padded.data(), padded.size(), 128, 80, gray));
   const cv::Mat decoded(80, 128, CV_8UC1, gray.data());
   EXPECT_LE(cv::norm(decoded, expected, cv::NORM_INF), 4.0);
@@ -125,7 +125,7 @@ TEST(Capture, LinuxMjpegFramesDecodeToGrayOrAreRefused) {
   std::vector<uint8_t> truncated(jpeg.begin(), jpeg.end() - 200);
   EXPECT_FALSE(
       DecodeMjpegGray(truncated.data(), truncated.size(), 128, 80, gray));
-  std::vector<uint8_t> other_size(64 * 80, 0);
+  std::vector<uint8_t> other_size(size_t{64} * 80, 0);
   EXPECT_FALSE(DecodeMjpegGray(jpeg.data(), jpeg.size(), 64, 80, other_size));
 }
 
