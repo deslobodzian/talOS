@@ -74,8 +74,7 @@ Response StaticFile(const fs::path& root, std::string_view url) {
   const fs::path relative =
       fs::path{url == "/" ? std::string_view{"index.html"} : url.substr(1)}
           .lexically_normal();
-  if (relative.empty() || relative.is_absolute() ||
-      *relative.begin() == "..") {
+  if (relative.empty() || relative.is_absolute() || *relative.begin() == "..") {
     return Plain(404, "not found");
   }
   std::error_code error;
