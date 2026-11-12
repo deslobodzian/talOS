@@ -22,7 +22,8 @@
 # targets), as CI's build step does before tidy.
 #
 # Exit: 0 clean, 1 findings, 2 usage or tool error, 3 cannot run on this host
-# (no bazel, or the compilation database could not be produced).
+# (no bazel, the database could not be produced, or the host libstdc++ is too
+# new for clang 18).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 . "$(dirname "${BASH_SOURCE[0]}")/clang18.sh"
@@ -50,6 +51,15 @@ grep -q 'clang-tidy-18' "$tmp/tidy.py" ||
 command -v python3 >/dev/null 2>&1 || clang18_die "need python3"
 clang18_setup
 clang-tidy-18 --version >/dev/null 2>&1 || clang18_die "clang-tidy-18 does not run"
+
+# clang 18 cannot parse a libstdc++ newer than its era (GCC 16 on Arch: atomic_wait.h,
+# stl_iterator.h errors), which makes every finding noise. Say so instead of running.
+printf '#include <atomic>\n#include <vector>\n#include <string>\nint main() {}\n' > "$tmp/probe.cc"
+if ! clang-tidy-18 --checks='-*,clang-diagnostic-*' --quiet "$tmp/probe.cc" -- -std=c++23 >/dev/null 2>&1; then
+  echo "tidy: cannot run here: clang 18 cannot parse this host's C++ standard library" >&2
+  echo "tidy: (libstdc++ too new; CI uses Ubuntu's GCC 13/14). Run it on macOS or rely on CI." >&2
+  exit 3
+fi
 
 if [ "$refresh" = 1 ] || [ ! -f compile_commands.json ]; then
   if ! command -v bazel >/dev/null 2>&1; then
