@@ -762,7 +762,9 @@ so a larger budget never shortens it and one member with large prefixes
 cannot shrink every member's window. Every logging member is started with
 `--log-window-us <window>` beside `--log-max-bytes <share>`, and its capped
 log also ends a segment once its records span window / n
-(`LogWriterOptions::window`; n = 8 segments while the share holds them). So in every
+(`LogWriterOptions::window`; n = 8 segments while the share holds them;
+never sooner than the writer's 1 s sync interval, so a window under 8 s
+keeps more than the window where the bytes hold it). So in every
 robot state a member that stores no more than its expected rate, and whose
 prefix cost is within T less the window, keeps between 7/8 of the window
 and the window of record time, whatever it

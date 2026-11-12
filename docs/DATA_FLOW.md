@@ -381,7 +381,10 @@ ends when the next record would cross cap / n, or, with a window
 (`LogWriterOptions::window`, the launcher's `--log-window-us`), at the first
 record whose time (`now_ns`) is window / n or more past the segment's first,
 so a log that stays within its bytes keeps between (n - 1) / n of the window
-and the window. The newest
+and the window. Time never ends a segment sooner than the writer's
+`sync_interval` (1 s) after its first record, whatever the window: a
+rotation syncs durably and takes a buffer chunk, so faster rotation could
+exhaust the writer's pool and stop capture. The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
 `log_dump`, `tlog_to_wpilog` and `--replay-inputs` read every segment in a
