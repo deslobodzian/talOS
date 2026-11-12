@@ -14,6 +14,7 @@
 #include <iostream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -432,6 +433,7 @@ std::vector<naming::Diagnostic> DescribeGraph(
     if (options.simulation) args.push_back("--sim");
     if (!graph_path.empty()) args.insert(args.end(), {"--graph", graph_path});
     args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
+    if (described.missing) return;
     const auto injected = options.probe_spawn_failures.find(spec.name);
     try {
       described.answered = ProbeDescribe(
@@ -450,6 +452,13 @@ std::vector<naming::Diagnostic> DescribeGraph(
     described.roster_name = spec.name;
     described.target = spec.target;
     described.binary_path = spec.binary_path;
+    std::error_code ignored;
+    described.missing =
+        std::filesystem::status(spec.binary_path, ignored).type() ==
+        std::filesystem::file_type::not_found;
+    if (described.missing) {
+      described.error = "no binary at " + spec.binary_path;
+    }
   }
   ForEachInParallel(specs.size(),
                     [&](std::size_t i) { probe(specs[i], out[i], ""); });
@@ -484,6 +493,7 @@ std::vector<naming::Diagnostic> DescribeGraph(
   }
 
   std::vector<naming::NodeShape> shapes;
+  std::vector<NodeSpec> missing;
   for (std::size_t i = 0; i < out.size(); ++i) {
     const auto& described = out[i];
     const auto& spec = specs[i];
@@ -512,6 +522,8 @@ std::vector<naming::Diagnostic> DescribeGraph(
                  "' but the binary describes itself as '" +
                  described.declared.name + "'"});
       }
+    } else if (described.missing) {
+      missing.push_back(spec);
     } else {
       probe_findings.push_back(
           {spec.critical || spec.owns_actuators ? naming::Severity::ERROR
@@ -526,11 +538,53 @@ std::vector<naming::Diagnostic> DescribeGraph(
     }
   }
 
+  if (auto finding = MissingBinariesFinding(missing, options.bundle_dir)) {
+    probe_findings.push_back(std::move(*finding));
+  }
+
   auto diagnostics = naming::LintGraph(
       shapes, target_sources, target_mode_sources, require_target_coverage);
   diagnostics.insert(diagnostics.end(), probe_findings.begin(),
                      probe_findings.end());
   return diagnostics;
+}
+
+std::optional<naming::Diagnostic> MissingBinariesFinding(
+    const std::vector<NodeSpec>& missing, const std::string& bundle_dir) {
+  if (missing.empty()) return std::nullopt;
+  std::string names;
+  std::string labels;
+  bool fatal = false;
+  for (const auto& spec : missing) {
+    names += (names.empty() ? "" : ", ") + spec.name;
+    if (spec.target.starts_with("//") || spec.target.starts_with("@")) {
+      labels += " " + spec.target;
+    }
+    fatal = fatal || spec.critical || spec.owns_actuators;
+  }
+  const std::string& first = missing.front().binary_path;
+  std::string where = "no binary at " + first;
+  if (missing.size() > 1) {
+    where += " and " + std::to_string(missing.size() - 1) + " more";
+  }
+  if (std::filesystem::path{first}.is_relative()) {
+    std::error_code ignored;
+    where += ", relative to " + std::filesystem::current_path(ignored).string();
+  }
+  std::string message;
+  if (!bundle_dir.empty()) {
+    message = "missing from the bundle " + bundle_dir + " (" + where +
+              "); rebuild and deploy the bundle";
+  } else {
+    message = "not built (" + where + ")";
+    if (!labels.empty()) message += "; build them first: bazel build" + labels;
+  }
+  if (!fatal) {
+    message += "; NON-CRITICAL: launching the rest under restart supervision";
+  }
+  return naming::Diagnostic{
+      fatal ? naming::Severity::ERROR : naming::Severity::WARNING,
+      std::move(names), std::move(message)};
 }
 
 std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,

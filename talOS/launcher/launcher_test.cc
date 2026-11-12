@@ -1257,6 +1257,68 @@ TEST(LauncherGraphTest, ANodeThatHangsOnDescribeDoesNotHangTheLaunch) {
             10);
 }
 
+// The error diagnostics graph.json records, one per line.
+std::vector<std::string> GraphErrors(const std::string& graph) {
+  std::vector<std::string> errors;
+  std::istringstream lines{graph};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("\"severity\": \"error\"") != std::string::npos) {
+      errors.push_back(line);
+    }
+  }
+  return errors;
+}
+
+// TOOLS-3: a launch before the build finds no binaries. That is one refusal
+// carrying the build command for every missing node, not one "did not
+// answer" per node; a binary that exists but does not answer keeps its own.
+// REQ-OPS-01
+TEST(LauncherGraphTest, MissingBinariesAreOneRefusalWithTheBuildCommand) {
+  GraphFixture fixture{"not_built", kStubWithoutDescribe, kStubWithoutDescribe};
+  fixture.options.describe_only = true;
+  fixture.options.binary_overrides["//example/alpha:node"] =
+      TempPath("never_built_alpha");
+  fixture.options.binary_overrides["//example/beta:node"] =
+      TempPath("never_built_beta");
+
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+  EXPECT_FALSE(fixture.has_manifest());
+  const auto errors = GraphErrors(fixture.graph_json());
+  ASSERT_EQ(errors.size(), 1u) << fixture.graph_json();
+  EXPECT_NE(errors[0].find("//example/alpha:node"), std::string::npos)
+      << errors[0];
+  EXPECT_NE(errors[0].find("//example/beta:node"), std::string::npos)
+      << errors[0];
+  EXPECT_EQ(errors[0].find("//talOS/bridge:hardware_node"), std::string::npos)
+      << "the built bridge is not to be rebuilt: " << errors[0];
+}
+
+// REQ-OPS-01
+TEST(LauncherGraphTest, MissingBinaryDoesNotHideOneThatDoesNotAnswer) {
+  GraphFixture fixture{"half_built", kStubWithoutDescribe,
+                       kStubWithoutDescribe};
+  fixture.options.describe_only = true;
+  fixture.options.binary_overrides["//example/alpha:node"] =
+      TempPath("never_built_alpha");
+
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+  const auto errors = GraphErrors(fixture.graph_json());
+  ASSERT_EQ(errors.size(), 2u) << fixture.graph_json();
+  const auto missing =
+      std::find_if(errors.begin(), errors.end(), [](const std::string& error) {
+        return error.find("//example/alpha:node") != std::string::npos;
+      });
+  ASSERT_NE(missing, errors.end()) << fixture.graph_json();
+  EXPECT_EQ(missing->find("//example/beta:node"), std::string::npos)
+      << *missing;
+  EXPECT_TRUE(std::any_of(errors.begin(), errors.end(),
+                          [](const std::string& error) {
+                            return error.find("\"subject\": \"beta\"") !=
+                                   std::string::npos;
+                          }))
+      << fixture.graph_json();
+}
+
 // The roster is probed in parallel: each of three probes answers only once
 // all three have started, so a launcher that probed one at a time would see
 // its first probe miss the describe deadline.

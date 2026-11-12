@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,9 @@ struct NodeDescription {
   std::string target;
   std::string binary_path;
   bool answered{false};
+  // No file at binary_path: not built, or not in the bundle. Such a node is
+  // not probed, and DescribeGraph reports every one in a single finding.
+  bool missing{false};
   std::string error;  // Why not, when it did not answer.
   introspect::Description declared;
 };
@@ -105,12 +109,27 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // as its slowest probe rather than the sum of them.
 // Throws when that file cannot be written: a graph reader is never described,
 // or started, without the graph.
+//
+// A roster member with no file at its binary path is not probed. All such
+// members make one finding (MissingBinariesFinding) instead of one "did not
+// answer" per node: before a build that is every node, and the cure is one
+// command. A binary that exists but does not answer keeps its own finding.
 std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
     const naming::TargetSources& target_sources = {},
     const naming::TargetModeSources& target_mode_sources = {},
     bool require_target_coverage = false);
+
+// The one finding for roster members whose binary is missing, or nullopt when
+// none is. Its subject lists their names. Outside a bundle its message ends
+// with the command that builds them, `bazel build` of their labels (members
+// named by a path, not a label, are listed but not in the command); in a
+// bundle (`bundle_dir` nonempty) it says the bundle lacks them. An error when
+// any of them is critical or owns actuators, as a failed probe would be;
+// otherwise a warning.
+std::optional<naming::Diagnostic> MissingBinariesFinding(
+    const std::vector<NodeSpec>& missing, const std::string& bundle_dir);
 
 // How a run's live endpoints differ from what its --describe probe declared,
 // or empty when they agree. An endpoint is a topic end: its kind (SENDER,

@@ -90,6 +90,10 @@ file that its nodes could not open.
 ## When a binary does not answer
 
 A failed critical probe is an error; a failed non-critical probe is a warning.
+A member with no file at its binary path, as before a build, is not probed:
+all such members make one finding that names them and ends with the command
+that builds them, `bazel build` of their labels (in a bundle, it says the
+bundle lacks them); it is an error unless every one of them is non-critical.
 `--describe-timeout-ms MS` sets the per-binary deadline. A binary that cannot
 be run at all is reported with the step and errno that stopped it, as a spawn
 is ([restarts](#restarts)): `did not answer --describe (execv <path>: Exec
