@@ -296,7 +296,8 @@ sleep precision. Releasing a lane is not a mechanical brake.
   damaged log, and a "Delivery loss" section with no node's
   `wake_failures`, `requests_skipped` or `wake_fallbacks` above 0 (NOT
   RECORDED there means a manifest written before the launcher recorded
-  them). Its "Launcher output" section names any output whose bytes
+  them, or a member whose registry row the launcher never saw: Studio's
+  bridge, which takes none, or a run that failed to spawn). Its "Launcher output" section names any output whose bytes
   `talos.log` says were dropped. Keep the
   report with the session. Target age at the tick (from `Target::get` READ
   records) is required to be at most 25 ms on every lane; see
