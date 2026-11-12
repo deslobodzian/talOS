@@ -81,6 +81,7 @@ MAX_DIO = 31  # talOS/hardware/config.cc: DIO channels 0..31
 # (talOS/configuration/config_parser.h: kFrameworkSubsystemKeys and
 # CheckSubsystemKeys' singular spellings), and its [subsystem] header. A
 # position mechanism's parameter table is [<name>], so <name> cannot be one.
+# new_subsystem_test parses the header and fails when the two differ.
 SUBSYSTEM_FILE_KEYS = {
     "subsystem", "node", "critical", "period_us", "remap", "targets", "teleop",
     "motors", "sensors", "encoders", "digital_inputs", "digital_outputs",

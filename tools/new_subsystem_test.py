@@ -68,6 +68,27 @@ class NewSubsystemTest(unittest.TestCase):
         self.assertEqual(set(strings("kDirectionSuffixes")),
                          set(new_subsystem.DIRECTION_SUFFIXES))
 
+    # REQ-DEV-01
+    def test_subsystem_file_keys_are_the_keys_of_config_parser_h(self):
+        # A position node's parameter table is [<name>], so check_kind
+        # refuses a name the config parser reads or refuses in a subsystem
+        # file. SUBSYSTEM_FILE_KEYS copies those lists; a key added on one
+        # side only fails here, before a scaffold's table collides with it.
+        with open(os.path.join("talOS", "configuration", "config_parser.h"),
+                  encoding="utf-8") as f:
+            header = f.read()
+
+        def strings(pattern):
+            body = re.search(pattern, header, re.DOTALL).group(1)
+            return re.findall(r'"([^"]*)"', body)
+
+        framework = strings(
+            r"\bkFrameworkSubsystemKeys\[\] = \{(.*?)\};")
+        pairs = strings(r"\bkSections\[\] = \{(.*?)\};")
+        self.assertTrue(framework and pairs)
+        self.assertEqual(new_subsystem.SUBSYSTEM_FILE_KEYS,
+                         {"subsystem", *framework, *pairs[::2]})
+
     def test_plan_scaffolds_into_custom_robot_and_assigns_lowest_free_can_id(self):
         with tempfile.TemporaryDirectory() as root:
             proc = os.path.join(root, "custom-bot", "main_processor")

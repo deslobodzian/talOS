@@ -25,6 +25,7 @@ py_test(
         "new_subsystem_test.py",
     ],
     data = [
+        "//talOS/configuration:config_parser.h",
         "//talOS/introspection:names.h",
         "//tools/scaffold_testdata/gripper:golden",
         "//tools/scaffold_testdata/localizer:golden",
