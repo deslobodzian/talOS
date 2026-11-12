@@ -108,10 +108,20 @@ record, unlike the live view.
 
 Studio opens a session the launcher recorded, through the review server
 (`studio_review` in `studio/review`, which reads the session's event logs
-directly; no conversion step). With the server running on the same machine
-(default `http://127.0.0.1:5805`), choose **Open recording…** in the header,
-list the sessions (start time, length and class), and open one. The address
-is remembered in this browser.
+directly; no conversion step). One command builds Studio and the server and
+serves a log root (`./sim.sh` records into `/tmp/talos_logs`, one directory
+per session):
+
+```sh
+bazel run -c opt //studio/review:studio_review -- --library /tmp/talos_logs
+```
+
+Then open `http://127.0.0.1:5805`. A Studio the review server served opens
+straight into its session list (start time, length and class) and offers no
+live connection; open a session from it, or later from **Open recording…**
+in the header. A Studio served by the live bridge reaches a review server
+through **Open recording…** too, with the server's address in the picker
+(default `http://127.0.0.1:5805`, remembered in this browser).
 
 While a recording is open it replaces the live view on every page, and the
 footer becomes its transport: step back and forward by the step size, play
@@ -162,18 +172,30 @@ transport and frame budgets.
 event logs with no conversion step:
 
 ```sh
-bazel run -c opt //studio/review:studio_review -- --library /tmp/talos_logs [--port 5805] [--cache-mb 256]
+bazel run -c opt //studio/review:studio_review -- --library /tmp/talos_logs [--port 5805] [--cache-mb 256] [--webroot DIR]
 ```
 
 `--library` is a log root as the launcher writes it: one directory per
 session holding its `manifest.json` and event logs, rotated segments and
 restarts included ([session segments and logs](../talOS/launcher/README.md#session-segments-and-logs)).
-The server listens on 127.0.0.1 only (there is no flag to change that) and
-serves only `/review/*`: `sessions.json`, and per session `channels.json`,
-`bounds.json`, `snapshot?t_ns=` and `series?c=a,b&start_ns=&end_ns=&points=N`.
-Their shapes are in [`review/review.h`](review/review.h); anything else is
-404. A session id is one directory name of the library; a parent, hidden or
-symlinked one is refused.
+Relative paths are taken from where `bazel run` was invoked. The server
+listens on 127.0.0.1 only (there is no flag to change that). It serves the
+review API under `/review/`: `sessions.json`, and per session
+`channels.json`, `bounds.json`, `snapshot?t_ns=` and
+`series?c=a,b&start_ns=&end_ns=&points=N`, whose shapes are in
+[`review/review.h`](review/review.h). Every other path is a file of the built
+Studio (`//studio:web_dist`, from the binary's runfiles, or `--webroot`), so a
+Studio opened there reads the API from its own origin; a path that leaves
+the webroot is refused. A session id is one directory name of the library; a
+parent, hidden or symlinked one is refused.
+
+A request whose `Host` is not `127.0.0.1`, `localhost` or `[::1]` with the
+server's port is refused (403): a web page cannot reach the server by
+resolving its own name to this machine. A request from another loopback
+origin (`http://127.0.0.1:<port>`, `http://localhost:<port>`,
+`http://[::1]:<port>`, such as a Studio the live bridge served) gets that
+origin back in `Access-Control-Allow-Origin`; any other origin gets none, so
+its page cannot read a session.
 
 The server never writes into the library, which may be a read-only copy: a
 session's class (`match`, `other`, `unknown`) is the launcher's

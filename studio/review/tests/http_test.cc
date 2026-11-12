@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "nlohmann/json.hpp"
@@ -35,8 +36,10 @@ struct Reply {
 };
 
 // One GET over a fresh connection (the server closes nothing, so the body
-// is read by its Content-Length).
-Reply Get(std::uint16_t port, const std::string& target) {
+// is read by its Content-Length), with Host `host` (by default this server's
+// 127.0.0.1:<port>) and any `headers` ("Name: value\r\n" each).
+Reply Get(std::uint16_t port, const std::string& target,
+          const std::string& host = "", const std::string& headers = "") {
   const int fd = socket(AF_INET, SOCK_STREAM, 0);
   sockaddr_in address{};
   address.sin_family = AF_INET;
@@ -48,7 +51,9 @@ Reply Get(std::uint16_t port, const std::string& target) {
     return reply;
   }
   const std::string request =
-      "GET " + target + " HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+      "GET " + target + " HTTP/1.1\r\nHost: " +
+      (host.empty() ? "127.0.0.1:" + std::to_string(port) : host) + "\r\n" +
+      headers + "\r\n";
   (void)!write(fd, request.data(), request.size());
   std::string data;
   char buffer[65536];
@@ -92,6 +97,11 @@ class HttpTest : public testing::Test {
     ASSERT_EQ(pipe(out), 0);
     child_ = fork();
     if (child_ == 0) {
+      // The server finds the built Studio it serves at "/" in these
+      // runfiles, as it finds its own under bazel run.
+      for (const auto& [name, value] : runfiles->EnvVars()) {
+        setenv(name.c_str(), value.c_str(), 1);
+      }
       dup2(out[1], STDOUT_FILENO);
       close(out[0]);
       execl(binary.c_str(), binary.c_str(), "--library", directory_.c_str(),
@@ -126,8 +136,9 @@ class HttpTest : public testing::Test {
 };
 
 // Guards the API's transport: JSON documents, the binary series body's
-// header and length, and 404 for what is not served (timeline and fetch
-// belong to later slices).
+// header and length, 404 for what is not served (timeline and fetch belong
+// to later slices), and the built Studio at "/", so a browser opening the
+// server reads the API from its own origin.
 // REQ-OPS-41
 TEST_F(HttpTest, ServesTheReviewShapes) {
   const Reply sessions = Get(port_, "/review/sessions.json");
@@ -160,8 +171,60 @@ TEST_F(HttpTest, ServesTheReviewShapes) {
   EXPECT_EQ(header[1], 5u);
 
   for (const std::string path :
-       {"/review/s1/timeline.json", "/review/robot/fetch", "/index.html"}) {
+       {"/review/s1/timeline.json", "/review/robot/fetch", "/missing.js"}) {
     EXPECT_EQ(Get(port_, path).status, 404) << path;
+  }
+  const Reply studio = Get(port_, "/");
+  ASSERT_EQ(studio.status, 200) << studio.headers;
+  EXPECT_NE(studio.headers.find("text/html"), std::string::npos);
+  EXPECT_NE(studio.body.find("<div id=\"root\">"), std::string::npos)
+      << studio.body;
+}
+
+// Guards the DNS-rebinding defence: a request whose Host is not a loopback
+// name with this server's port (a page that resolved its own name to
+// 127.0.0.1) is refused before it reaches a session or a file.
+// REQ-OPS-41
+TEST_F(HttpTest, RefusesAHostThatIsNotThisServer) {
+  const std::string port = std::to_string(port_);
+  for (const std::string& host :
+       {"127.0.0.1:" + port, "localhost:" + port, "[::1]:" + port}) {
+    EXPECT_EQ(Get(port_, "/review/sessions.json", host).status, 200) << host;
+  }
+  for (const std::string& host :
+       {"evil.example:" + port, std::string{"evil.example"},
+        std::string{"127.0.0.1"}, "127.0.0.1:" + std::to_string(port_ + 1),
+        "localhost.evil:" + port, "127.0.0.2:" + port}) {
+    EXPECT_EQ(Get(port_, "/review/sessions.json", host).status, 403) << host;
+    EXPECT_EQ(Get(port_, "/", host).status, 403) << host;
+  }
+}
+
+// Guards CORS: a Studio served from another loopback port (the live bridge,
+// the dev server) may read the API, its origin echoed and never "*"; any
+// other origin gets no Access-Control-Allow-Origin, so its page cannot read
+// a session.
+// REQ-OPS-41
+TEST_F(HttpTest, AllowsOnlyLoopbackOrigins) {
+  const auto allowed = [this](const std::string& origin) {
+    const Reply reply =
+        Get(port_, "/review/sessions.json", "", "Origin: " + origin + "\r\n");
+    EXPECT_EQ(reply.status, 200) << origin;
+    constexpr std::string_view kHeader = "Access-Control-Allow-Origin: ";
+    const auto at = reply.headers.find(kHeader);
+    if (at == std::string::npos) return std::string{};
+    const auto from = at + kHeader.size();
+    return reply.headers.substr(from, reply.headers.find("\r\n", from) - from);
+  };
+  for (const std::string origin :
+       {"http://127.0.0.1:5800", "http://localhost:5173",
+        "http://[::1]:5800"}) {
+    EXPECT_EQ(allowed(origin), origin);
+  }
+  for (const std::string origin :
+       {"http://evil.example", "https://127.0.0.1:5800", "null",
+        "http://127.0.0.1.evil.example:5800", "http://localhost"}) {
+    EXPECT_EQ(allowed(origin), "") << origin;
   }
 }
 

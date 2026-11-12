@@ -4,17 +4,20 @@ load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_messages")
 
-# A recorded session's index, channels, series and snapshots, and the review
-# API over them as a function of a request: everything but the socket.
+# A recorded session's index, channels, series and snapshots, the review API
+# over them, and the Host, CORS and static-file decisions, each as a function
+# of a request: everything but the socket.
 cc_library(
     name = "review",
     srcs = [
         "hardware_channels.cc",
+        "http.cc",
         "review.cc",
         "session.cc",
     ],
     hdrs = [
         "hardware_channels.h",
+        "http.h",
         "review.h",
         "series_cache.h",
         "session.h",
@@ -37,14 +40,18 @@ cc_library(
     ],
 )
 
-# studio_review --library DIR [--port 5805] [--cache-mb 256]; README.md,
-# "Reviewing a session".
+# studio_review --library DIR [--port 5805] [--cache-mb 256] [--webroot DIR];
+# studio/README.md, "Reviewing a recorded session". Serves the Studio it was
+# built with, from its runfiles.
 cc_binary(
     name = "studio_review",
     srcs = ["main.cc"],
+    data = ["//studio:web_dist"],
+    local_defines = ["TALOS_WEB_DIST=\\\"$(rlocationpath //studio:web_dist)\\\""],
     visibility = ["//visibility:public"],
     deps = [
         ":review",
+        "@rules_cc//cc/runfiles",
         "@studio_usockets//:usockets",
         "@studio_uws//:uws",
     ],
@@ -99,6 +106,8 @@ cc_test(
     deps = [
         ":fixture",
         ":review",
+        ":review_test_message",
+        "//talOS/events:events_core",
         "//talOS/events:events_log",
         "@googletest//:gtest_main",
         "@nlohmann_json//:json",
@@ -106,7 +115,8 @@ cc_test(
     ],
 )
 
-# The binary over loopback: the HTTP shapes, and no listener off loopback.
+# The binary over loopback: the HTTP shapes, the built Studio at /, the
+# Host check and loopback-only CORS, and no listener off loopback.
 cc_test(
     name = "http_test",
     size = "small",
