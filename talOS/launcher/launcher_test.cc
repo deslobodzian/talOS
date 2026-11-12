@@ -710,46 +710,6 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   std::filesystem::remove_all(out_dir);
 }
 
-TEST(LauncherTest, MergedLogsMonotonicOrder) {
-  const std::string path_a = TempPath("log_a.tlog");
-  const std::string path_b = TempPath("log_b.tlog");
-  const uint64_t session_id = 0xCAFEBABE12345678ULL;
-
-  // Proc A writes events at 1ms, 3ms, 5ms
-  WriteTestLog(path_a, "proc_a", session_id, {1'000'000, 3'000'000, 5'000'000});
-
-  // Proc B writes events at 2ms, 4ms, 6ms
-  WriteTestLog(path_b, "proc_b", session_id, {2'000'000, 4'000'000, 6'000'000});
-
-  std::vector<MergedRecord> merged;
-  std::string error;
-  ASSERT_TRUE(MergeLogs({path_a, path_b}, merged, error)) << error;
-
-  ASSERT_EQ(merged.size(), 6u);
-
-  // Check monotonic order and interleaving
-  EXPECT_EQ(merged[0].process_name, "proc_a");
-  EXPECT_EQ(merged[0].header.event_time_ns, 1'000'000);
-
-  EXPECT_EQ(merged[1].process_name, "proc_b");
-  EXPECT_EQ(merged[1].header.event_time_ns, 2'000'000);
-
-  EXPECT_EQ(merged[2].process_name, "proc_a");
-  EXPECT_EQ(merged[2].header.event_time_ns, 3'000'000);
-
-  EXPECT_EQ(merged[3].process_name, "proc_b");
-  EXPECT_EQ(merged[3].header.event_time_ns, 4'000'000);
-
-  EXPECT_EQ(merged[4].process_name, "proc_a");
-  EXPECT_EQ(merged[4].header.event_time_ns, 5'000'000);
-
-  EXPECT_EQ(merged[5].process_name, "proc_b");
-  EXPECT_EQ(merged[5].header.event_time_ns, 6'000'000);
-
-  std::remove(path_a.c_str());
-  std::remove(path_b.c_str());
-}
-
 // A log cut while it was being created (a short or zero-filled header) is
 // skipped by every session reader, not taken for corruption of the session.
 TEST(LauncherTest, SessionReadersSkipALogCutBeforeItsHeader) {
@@ -764,11 +724,17 @@ TEST(LauncherTest, SessionReadersSkipALogCutBeforeItsHeader) {
   std::ofstream{dir + "/zeros.tlog", std::ios::binary}
       << std::string(sizeof(event::log::FileHeader) + 64, '\0');
 
-  std::vector<MergedRecord> merged;
+  std::vector<std::string> merged;
   std::string error;
-  ASSERT_TRUE(MergeLogs(event::log::FindLogFiles(dir), merged, error)) << error;
-  ASSERT_EQ(merged.size(), 1u);
-  EXPECT_EQ(merged[0].process_name, "whole");
+  ASSERT_TRUE(MergeLogs(
+      event::log::FindLogFiles(dir),
+      [&](const MergedRecord& r) {
+        merged.push_back(r.process_name());
+        return true;
+      },
+      error))
+      << error;
+  EXPECT_EQ(merged, std::vector<std::string>{"whole"});
 
   const event::RecordedSession session{dir};
   EXPECT_EQ(session.session_id(), session_id);
@@ -862,23 +828,6 @@ TEST(LauncherTest, SplitLogBudgetIsProportionalAboveEachFloor) {
       SplitLogBudget(1000, {true, true}, {1.0, 1.0}, {1500, 500});
   EXPECT_EQ(tight[0], 750u);
   EXPECT_EQ(tight[1], 250u);
-}
-
-TEST(LauncherTest, MergedLogsRejectsSessionIdMismatch) {
-  const std::string path_a = TempPath("mismatch_a.tlog");
-  const std::string path_b = TempPath("mismatch_b.tlog");
-
-  WriteTestLog(path_a, "proc_a", 1001ULL, {1'000'000});
-  WriteTestLog(path_b, "proc_b", 2002ULL, {2'000'000});
-
-  std::vector<MergedRecord> merged;
-  std::string error;
-  bool ok = MergeLogs({path_a, path_b}, merged, error);
-
-  EXPECT_FALSE(ok);
-
-  std::remove(path_a.c_str());
-  std::remove(path_b.c_str());
 }
 
 // A control loop the OS kept at timeshare is warned about and recorded in the
@@ -1661,9 +1610,7 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
   EXPECT_EQ(options.bundle_config_sha256, "abc123");
 
   // A manifest that is not TOML is an error, not a silently empty bundle.
-  {
-    std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n";
-  }
+  { std::ofstream{bundle_dir + "/bundle_manifest.toml"} << "nodes = [\n"; }
   LauncherOptions broken;
   broken.bundle_dir = bundle_dir;
   EXPECT_FALSE(LoadBundle(broken, error));

@@ -648,7 +648,7 @@ header:
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and `tlog_to_wpilog`'s inputs name, each once |
-| `:log_merge` | `log_merge.h` | `MergeLogs`; `log_dump` links it and `:hardware_record`, not the supervisor |
+| `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and `tlog_to_wpilog` link it, not the supervisor |
 | `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
 
@@ -855,6 +855,21 @@ can leave; see [log format](../events/README.md#log-format)), and once it ends
 `log_dump` prints `warning: damaged log <path>: <what was skipped, with byte
 offsets>` on stderr, which `session_report` reads.
 
+Records are printed in merge order: by event time, then the record's `now`,
+then its dispatch index, and on a full tie in the order the files are listed
+(sorted by path within a directory, so a rotated log's older segments come
+first). Every log is read through a fixed window (`WindowedLogReader`), never
+whole, so memory grows with the number of logs, not with their length. Each
+mode reads the session twice: once for the earliest event time every printed
+time is relative to and for the record count, printing the damage warnings
+then, before any output; once to print. On a generated 210 MiB session (8
+logs, 1.72 million 128-byte records; `bazel run -c opt
+//talOS/launcher:log_memory_bench`, Linux x86-64) `log_dump`'s peak resident
+memory is 5.6 MiB, text or JSONL, where reading every log whole and holding
+each record took 632 MiB. Each open log costs about 128 KiB (its window and
+header buffer) plus its manifest and schemas, and keeps a file descriptor
+open for the whole read.
+
 ```sh
 bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
   --node drivetrain,pose_estimator --topic '/drivetrain/*' \
@@ -994,8 +1009,8 @@ synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.
 
 `tlog_to_wpilog` (`//talOS/launcher:tlog_to_wpilog`) writes a session's
 `.tlog`s as one WPILib DataLog (`.wpilog`, format 1.0), the file
-AdvantageScope and WPILib's DataLogTool open. It reads and merges the logs
-with the same reader and `MergeLogs` as `log_dump`, decodes payloads from the
+AdvantageScope and WPILib's DataLogTool open. It streams the logs through
+the same `MergeLogs` as `log_dump`, decodes payloads from the
 schemas the logs carry (no recording build needed), and writes the file with
 its own small writer (`wpilog.h`; no WPILib dependency). Offline only.
 REQ-OPS-26 states what it guarantees.
@@ -1082,14 +1097,15 @@ regular file (a device, a directory), or a directory that cannot take a new
 file, fails with `cannot write <output>`. A symlink at the output path is
 replaced by the new file, not written through.
 
-Memory: the merge holds the whole session at once, every input file's bytes
-while it reads them and every record decoded (its 64-byte header, the node
-and topic names, the payload), and the converter adds its per-publication
-bookkeeping. Estimated from those structures, not measured: the input's
-`.tlog` bytes plus about 0.4 KB and the payload per record. Convert on a
-development machine, not the robot. With records of about 120 bytes on
-disk, that is roughly five times the logs' size: a 300 MB session needs
-about 1.5 GB.
+Memory: the merge itself holds a window per log, as `log_dump`'s does
+([filtering and exporting](#filtering-and-exporting-logs)), and reads the
+session twice: once for the publications a writer logged, once to select.
+The converter keeps, per publication, its key in the dedup sets and, until
+it has sorted them by publish time, each selected value's payload and
+source. On the same generated 210 MiB session (1.72 million publications of
+64 bytes, each a value; `log_memory_bench`) its peak resident memory is
+525 MiB, where holding the whole merged session took 681 MiB. Convert on a
+development machine, not the robot.
 
 ## If you change the shape of `graph.json`
 

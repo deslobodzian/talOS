@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -113,7 +114,7 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
 bool Matches(const Options& options, const talos::launcher::MergedRecord& r,
              std::int64_t base_ns) {
   if (!options.nodes.empty() &&
-      std::find(options.nodes.begin(), options.nodes.end(), r.process_name) ==
+      std::find(options.nodes.begin(), options.nodes.end(), r.process_name()) ==
           options.nodes.end()) {
     return false;
   }
@@ -121,10 +122,10 @@ bool Matches(const Options& options, const talos::launcher::MergedRecord& r,
       !std::any_of(options.topics.begin(), options.topics.end(),
                    [&](const std::string& pattern) {
                      return pattern.ends_with('*')
-                                ? r.source_name.starts_with(
+                                ? r.source_name().starts_with(
                                       std::string_view{pattern}.substr(
                                           0, pattern.size() - 1))
-                                : r.source_name == pattern;
+                                : r.source_name() == pattern;
                    })) {
     return false;
   }
@@ -180,7 +181,7 @@ std::string HardwareJson(const talos::launcher::MergedRecord& r,
                          const talos::launcher::DeviceNames* names) {
   if (r.source == nullptr || r.payload.empty()) return "";
   const auto kind =
-      talos::launcher::HardwareRecordOf(r.source_name, r.source->schema.name);
+      talos::launcher::HardwareRecordOf(r.source_name(), r.source->schema.name);
   if (kind == talos::launcher::HardwareRecord::kNone) return "";
   return talos::launcher::HardwareRecordJson(kind, r.payload, names);
 }
@@ -196,11 +197,11 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
   const auto quote = json ? JsonString : CsvString;
   std::cout << std::setprecision(std::numeric_limits<double>::max_digits10);
   if (json) {
-    std::cout << "{\"process\":" << quote(r.process_name)
+    std::cout << "{\"process\":" << quote(r.process_name())
               << ",\"dispatch_index\":" << r.header.dispatch_index
               << ",\"kind\":" << quote(EventKindName(r.header.kind))
               << ",\"source_id\":" << r.header.source_id
-              << ",\"topic\":" << quote(r.source_name)
+              << ",\"topic\":" << quote(r.source_name())
               << ",\"event_ms\":" << ToMillis(base_ns, r.header.event_time_ns)
               << ",\"now_ms\":" << ToMillis(base_ns, r.header.now_ns)
               << ",\"publish_ms\":"
@@ -212,7 +213,7 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
     ExportPayloadHex(r.payload);
     std::cout << ",\"decoded\":" << quote(decoded);
     if (!hardware.empty()) std::cout << ",\"hardware\":" << hardware;
-    if (r.source_name == talos::hardware::kDriverStationTopic &&
+    if (r.source_name() == talos::hardware::kDriverStationTopic &&
         r.payload.size() == sizeof(talos::hardware::Packet)) {
       talos::hardware::Packet packet{};
       std::memcpy(&packet, r.payload.data(), sizeof(packet));
@@ -226,9 +227,9 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
     }
     std::cout << "}\n";
   } else {
-    std::cout << quote(r.process_name) << ',' << r.header.dispatch_index << ','
-              << quote(EventKindName(r.header.kind)) << ','
-              << r.header.source_id << ',' << quote(r.source_name) << ','
+    std::cout << quote(r.process_name()) << ',' << r.header.dispatch_index
+              << ',' << quote(EventKindName(r.header.kind)) << ','
+              << r.header.source_id << ',' << quote(r.source_name()) << ','
               << ToMillis(base_ns, r.header.event_time_ns) << ','
               << ToMillis(base_ns, r.header.now_ns) << ','
               << ToMillis(base_ns, r.header.publish_time_ns) << ','
@@ -331,19 +332,38 @@ int main(int argc, char** argv) {
   const talos::launcher::DeviceNames* names =
       device_names ? &*device_names : nullptr;
 
-  std::vector<talos::launcher::MergedRecord> records;
-  if (!talos::launcher::MergeLogs(log_files, records, error)) {
+  // The session is streamed twice, a fixed window per log, never held: once
+  // for the baseline every time is relative to (the earliest event time of
+  // any record, not necessarily the first merged) and the record count,
+  // warning about damage then, before any output; once to print.
+  using talos::launcher::MergedRecord;
+  std::int64_t base_ns = 0;
+  std::size_t total_count = 0;
+  if (!talos::launcher::MergeLogs(
+          log_files,
+          [&](const MergedRecord& r) {
+            if (total_count++ == 0 || r.header.event_time_ns < base_ns) {
+              base_ns = r.header.event_time_ns;
+            }
+            return true;
+          },
+          error)) {
     std::fprintf(stderr, "log_dump error: %s\n", error.c_str());
     return 1;
   }
-
-  // Find baseline earliest monotonic timestamp across records
-  int64_t base_ns = records.empty() ? 0 : records.front().header.event_time_ns;
-  for (const auto& r : records) {
-    if (r.header.event_time_ns < base_ns) {
-      base_ns = r.header.event_time_ns;
+  const auto print = [&](const std::function<void(const MergedRecord&)>& each) {
+    if (!talos::launcher::MergeLogs(
+            log_files,
+            [&](const MergedRecord& r) {
+              if (Matches(options, r, base_ns)) each(r);
+              return true;
+            },
+            error, talos::launcher::MergeWarnings::kQuiet)) {
+      std::fprintf(stderr, "log_dump error: %s\n", error.c_str());
+      return false;
     }
-  }
+    return true;
+  };
 
   if (options.format != "text") {
     if (options.format == "csv") {
@@ -352,16 +372,15 @@ int main(int argc, char** argv) {
              "publish_ms,sequence,aux,payload_bytes,schema,decoded,"
              "hardware\r\n";
     }
-    for (const auto& r : records) {
-      if (Matches(options, r, base_ns)) {
-        ExportRecord(r, base_ns, options.format == "jsonl", names);
-      }
-    }
-    return 0;
+    return print([&](const MergedRecord& r) {
+      ExportRecord(r, base_ns, options.format == "jsonl", names);
+    })
+               ? 0
+               : 1;
   }
 
   std::printf("merged log dump: %zu files, %zu total records\n",
-              log_files.size(), records.size());
+              log_files.size(), total_count);
   for (std::size_t i = 0; i < log_files.size(); ++i) {
     std::printf("  [%zu] %s\n", i, log_files[i].c_str());
   }
@@ -371,10 +390,9 @@ int main(int argc, char** argv) {
   std::map<std::uint16_t, std::size_t> counts_by_kind;
   std::size_t matched_count = 0;
 
-  for (const auto& r : records) {
-    if (!Matches(options, r, base_ns)) continue;
+  const bool printed = print([&](const MergedRecord& r) {
     ++matched_count;
-    ++counts_by_process[r.process_name];
+    ++counts_by_process[r.process_name()];
     ++counts_by_kind[r.header.kind];
 
     const bool has_source =
@@ -383,12 +401,12 @@ int main(int argc, char** argv) {
     const std::string source_id =
         has_source ? std::to_string(r.header.source_id) : std::string{"-"};
     const std::string source_name =
-        has_source ? r.source_name : std::string{"-"};
+        has_source ? std::string{r.source_name()} : std::string{"-"};
 
     std::printf(
         "  [%-12s] #%-6llu %-8s src=%-3s (%-16s) event=%9.3fms now=%9.3fms "
         "publish=%9.3fms seq=%-6llu aux=%-6u payload=%uB\n",
-        r.process_name.c_str(),
+        r.process_name().c_str(),
         static_cast<unsigned long long>(r.header.dispatch_index),
         EventKindName(r.header.kind), source_id.c_str(), source_name.c_str(),
         ToMillis(base_ns, r.header.event_time_ns),
@@ -407,7 +425,8 @@ int main(int argc, char** argv) {
     if (const auto hardware = HardwareJson(r, names); !hardware.empty()) {
       std::printf("      hardware %s\n", hardware.c_str());
     }
-  }
+  });
+  if (!printed) return 1;
 
   std::printf("\nsummary: %zu records across %zu processes\n", matched_count,
               counts_by_process.size());

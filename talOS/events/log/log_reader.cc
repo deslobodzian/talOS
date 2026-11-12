@@ -274,6 +274,26 @@ std::optional<RecordHeader> locate(Source& source, std::uint64_t& cursor,
   return std::nullopt;
 }
 
+// The source `entry` describes, its schema name and bfbs at `schema`.
+Registration registration_of(const ManifestEntry& entry,
+                             const std::byte* schema) {
+  Registration reg{};
+  reg.id = entry.id;
+  reg.kind = static_cast<SourceKind>(entry.kind);
+  reg.name = read_name(entry.name);
+  reg.message_bytes = entry.message_bytes;
+  reg.alignment = entry.alignment;
+  reg.period_ns = entry.period_ns;
+  reg.offset_ns = entry.offset_ns;
+  reg.armed = entry.armed != 0;
+  const char* text = reinterpret_cast<const char*>(schema);
+  reg.schema.name.assign(text, entry.schema_name_bytes);
+  reg.schema.hash = entry.schema_hash;
+  reg.schema.bfbs.assign(text + entry.schema_name_bytes,
+                         entry.schema_bfbs_bytes);
+  return reg;
+}
+
 // A log file's header, manifest and schema block, read front to back
 // through one fixed buffer.
 class LogStream {
@@ -314,14 +334,19 @@ class LogStream {
         std::span<std::byte>{reinterpret_cast<std::byte*>(&out), sizeof(out)});
   }
 
-  // Reads the next `size` bytes, folding them into `crc`. False if the file
+  // Reads the next `size` bytes, folding them into `crc` and, given `keep`,
+  // appending them to it (only as many as the file holds). False if the file
   // ends first.
-  bool fold(std::uint64_t size, std::uint32_t& crc) {
+  bool fold(std::uint64_t size, std::uint32_t& crc,
+            std::vector<std::byte>* keep = nullptr) {
     while (size > 0) {
       const auto want =
           static_cast<std::size_t>(std::min<std::uint64_t>(size, kBuffer));
       const std::size_t got = read(std::span{buffer_}.first(want));
-      crc = crc32(std::span<const std::byte>{buffer_}.first(got), crc);
+      const auto bytes = std::span<const std::byte>{buffer_}.first(got);
+      crc = crc32(bytes, crc);
+      if (keep != nullptr)
+        keep->insert(keep->end(), bytes.begin(), bytes.end());
       if (got < want) return false;
       size -= got;
     }
@@ -377,30 +402,15 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
                 data_.data() + manifest_offset + i * sizeof(ManifestEntry),
                 sizeof(entry));
 
-    Registration reg{};
-    reg.id = entry.id;
-    reg.kind = static_cast<SourceKind>(entry.kind);
-    reg.name = read_name(entry.name);
-    reg.message_bytes = entry.message_bytes;
-    reg.alignment = entry.alignment;
-    reg.period_ns = entry.period_ns;
-    reg.offset_ns = entry.offset_ns;
-    reg.armed = entry.armed != 0;
-
     const std::size_t schema_size = std::size_t{entry.schema_name_bytes} +
                                     std::size_t{entry.schema_bfbs_bytes};
     if (schema_bytes.size() - schema_at < schema_size) {
       throw std::runtime_error("LogReader: source " + std::to_string(i) +
                                "'s schema runs past the schema block");
     }
-    const char* schema =
-        reinterpret_cast<const char*>(schema_bytes.data()) + schema_at;
-    reg.schema.name.assign(schema, entry.schema_name_bytes);
-    reg.schema.hash = entry.schema_hash;
-    reg.schema.bfbs.assign(schema + entry.schema_name_bytes,
-                           entry.schema_bfbs_bytes);
+    manifest_.push_back(
+        registration_of(entry, schema_bytes.data() + schema_at));
     schema_at += schema_size;
-    manifest_.push_back(std::move(reg));
   }
   if (schema_at != schema_bytes.size()) {
     throw std::runtime_error(
@@ -456,8 +466,27 @@ bool LogReader::next(Record& out) {
 
 LogSummary SummarizeLog(std::string_view path) { return VisitLog(path, {}); }
 
-LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
-  LogStream stream{path};
+struct WindowedLogReader::State {
+  explicit State(std::string_view path) : stream{path} {}
+  LogStream stream;
+  std::optional<FileSource> source;
+  std::vector<ManifestEntry> entries;
+  Manifest manifest;
+  MonotonicTime start_time;
+  std::uint64_t session_id{0};
+  std::string process_name;
+  std::uint64_t cursor{0};
+  std::uint64_t scan_payload_bytes{kMinScanPayloadBytes};
+  LogDamage damage;
+  std::optional<RecordHeader> last;  // the last record next() returned
+  std::vector<std::byte> payload;
+  std::size_t record_count{0};
+};
+
+WindowedLogReader::WindowedLogReader(std::string_view path)
+    : state_{std::make_unique<State>(path)} {
+  State& state = *state_;
+  LogStream& stream = state.stream;
   constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
   FileHeader header{};
   const std::size_t header_read = stream.read(header);
@@ -472,28 +501,28 @@ LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
     throw IncompleteLogHeader("LogReader: file too short for its header");
   }
 
-  // The manifest entries stream one at a time, the schema block in chunks.
+  // The manifest entries stream one at a time, the schema block in chunks,
+  // so a damaged count or size claims no more memory than the file holds.
   std::uint32_t crc = 0;
   std::uint64_t schemas = 0;
   std::optional<std::uint32_t> overrun;
-  std::uint64_t scan_payload_bytes = kMinScanPayloadBytes;
-  std::vector<ManifestEntry> entries;
   for (std::uint32_t i = 0; i < header.manifest_count; ++i) {
     ManifestEntry entry{};
     if (stream.read(entry) < sizeof(entry)) {
       throw IncompleteLogHeader("LogReader: file too short for its manifest");
     }
-    if (visitor.manifest) entries.push_back(entry);
+    state.entries.push_back(entry);
     crc = crc32(
         std::span<const std::byte>{reinterpret_cast<const std::byte*>(&entry),
                                    sizeof(entry)},
         crc);
     schemas += std::uint64_t{entry.schema_name_bytes} + entry.schema_bfbs_bytes;
     if (!overrun && schemas > header.schema_bytes) overrun = i;
-    scan_payload_bytes =
-        std::max<std::uint64_t>(scan_payload_bytes, entry.message_bytes);
+    state.scan_payload_bytes =
+        std::max<std::uint64_t>(state.scan_payload_bytes, entry.message_bytes);
   }
-  if (!stream.fold(header.schema_bytes, crc)) {
+  std::vector<std::byte> schema_block;
+  if (!stream.fold(header.schema_bytes, crc, &schema_block)) {
     throw IncompleteLogHeader("LogReader: file too short for its manifest");
   }
   if (crc != header.crc32) {
@@ -507,40 +536,90 @@ LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
     throw std::runtime_error(
         "LogReader: schema block longer than its manifest's schemas");
   }
+  state.manifest.reserve(state.entries.size());
+  std::size_t schema_at = 0;
+  for (const ManifestEntry& entry : state.entries) {
+    state.manifest.push_back(
+        registration_of(entry, schema_block.data() + schema_at));
+    schema_at += std::size_t{entry.schema_name_bytes} + entry.schema_bfbs_bytes;
+  }
 
-  LogSummary summary;
-  if (visitor.manifest && !visitor.manifest(entries)) return summary;
-
+  state.start_time = MonotonicTime::from_nanos(header.start_monotonic_ns);
+  state.session_id = header.session_id;
+  state.process_name = read_name(header.process_name);
   // The records, through a fixed window that a resynchronising scan can
   // also move back over.
-  FileSource source{stream.fd()};
-  std::uint64_t cursor =
-      std::uint64_t{header.header_bytes} +
-      std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
-      header.schema_bytes;
-  std::optional<RecordHeader> last;
-  std::vector<std::byte> payload;
-  while (true) {
-    const std::optional<RecordHeader> record =
-        locate(source, cursor, scan_payload_bytes, summary.damage, last);
-    if (!record.has_value()) break;
-    const std::uint64_t body = cursor + sizeof(RecordHeader);
-    cursor = body + record->stored_bytes;
-    ++summary.record_count;
-    if (!visitor.record) continue;
-    // locate() checked that the stored bytes are within the file.
-    payload.assign(record->payload_bytes, std::byte{0});
-    for (std::size_t at = 0; at < record->stored_bytes;) {
-      const std::span<const std::byte> bytes = source.view(
-          body + at,
-          std::min<std::size_t>(record->stored_bytes - at, FileSource::kChunk));
-      if (bytes.empty()) break;
-      std::memcpy(payload.data() + at, bytes.data(), bytes.size());
-      at += bytes.size();
-    }
-    if (!visitor.record(LogReader::Record{*record, payload})) break;
+  state.cursor = std::uint64_t{header.header_bytes} +
+                 std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
+                 header.schema_bytes;
+  state.source.emplace(stream.fd());
+}
+
+WindowedLogReader::~WindowedLogReader() = default;
+WindowedLogReader::WindowedLogReader(WindowedLogReader&&) noexcept = default;
+WindowedLogReader& WindowedLogReader::operator=(WindowedLogReader&&) noexcept =
+    default;
+
+const Manifest& WindowedLogReader::manifest() const noexcept {
+  return state_->manifest;
+}
+std::span<const ManifestEntry> WindowedLogReader::manifest_entries()
+    const noexcept {
+  return state_->entries;
+}
+MonotonicTime WindowedLogReader::start_time() const noexcept {
+  return state_->start_time;
+}
+const std::string& WindowedLogReader::process_name() const noexcept {
+  return state_->process_name;
+}
+std::uint64_t WindowedLogReader::session_id() const noexcept {
+  return state_->session_id;
+}
+const LogDamage& WindowedLogReader::damage() const noexcept {
+  return state_->damage;
+}
+std::size_t WindowedLogReader::record_count() const noexcept {
+  return state_->record_count;
+}
+
+bool WindowedLogReader::next(LogReader::Record& out) {
+  State& state = *state_;
+  FileSource& source = *state.source;
+  const std::optional<RecordHeader> record = locate(
+      source, state.cursor, state.scan_payload_bytes, state.damage, state.last);
+  if (!record.has_value()) return false;
+  const std::uint64_t body = state.cursor + sizeof(RecordHeader);
+  state.cursor = body + record->stored_bytes;
+  ++state.record_count;
+  // locate() checked that the stored bytes are within the file.
+  state.payload.assign(record->payload_bytes, std::byte{0});
+  for (std::size_t at = 0; at < record->stored_bytes;) {
+    const std::span<const std::byte> bytes = source.view(
+        body + at,
+        std::min<std::size_t>(record->stored_bytes - at, FileSource::kChunk));
+    if (bytes.empty()) break;
+    std::memcpy(state.payload.data() + at, bytes.data(), bytes.size());
+    at += bytes.size();
   }
-  summary.truncated = summary.damage.tail_bytes != 0;
+  out.header = *record;
+  out.payload = state.payload;
+  return true;
+}
+
+LogSummary VisitLog(std::string_view path, const LogVisitor& visitor) {
+  WindowedLogReader reader{path};
+  LogSummary summary;
+  if (visitor.manifest && !visitor.manifest(reader.manifest_entries())) {
+    return summary;
+  }
+  LogReader::Record record;
+  while (reader.next(record)) {
+    if (visitor.record && !visitor.record(record)) break;
+  }
+  summary.record_count = reader.record_count();
+  summary.damage = reader.damage();
+  summary.truncated = reader.truncated();
   return summary;
 }
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -118,6 +119,40 @@ class LogReader {
   std::size_t record_count_{0};
 };
 
+// Reads a log as LogReader does, but through a fixed window instead of the
+// whole file: it holds the header, manifest and schema block, a 64 KiB
+// window and the current record's payload, however long the log. It
+// validates exactly what LogReader does, throws the same errors, and skips
+// damage exactly as LogReader::next does. Each reader keeps its file open.
+// A reader of many logs at once (a session's merge) uses one per log.
+class WindowedLogReader {
+ public:
+  explicit WindowedLogReader(std::string_view path);
+  ~WindowedLogReader();
+  WindowedLogReader(WindowedLogReader&&) noexcept;
+  WindowedLogReader& operator=(WindowedLogReader&&) noexcept;
+  WindowedLogReader(const WindowedLogReader&) = delete;
+  WindowedLogReader& operator=(const WindowedLogReader&) = delete;
+
+  const Manifest& manifest() const noexcept;
+  // The manifest block's entries as stored, in order.
+  std::span<const ManifestEntry> manifest_entries() const noexcept;
+  MonotonicTime start_time() const noexcept;
+  const std::string& process_name() const noexcept;
+  std::uint64_t session_id() const noexcept;
+
+  // As LogReader::next. The payload is valid until the next call.
+  bool next(LogReader::Record& out);
+
+  const LogDamage& damage() const noexcept;
+  bool truncated() const noexcept { return damage().tail_bytes != 0; }
+  std::size_t record_count() const noexcept;
+
+ private:
+  struct State;
+  std::unique_ptr<State> state_;
+};
+
 // What LogReader would report after reading a log to its end -- record
 // count, truncation and damage -- without holding the file: it reads through
 // a fixed buffer, so memory does not grow with the log. It validates exactly
@@ -129,9 +164,10 @@ struct LogSummary {
 };
 LogSummary SummarizeLog(std::string_view path);
 
-// What SummarizeLog walks, handed to a caller as it goes, through the same
-// fixed window: the manifest block once its checksum validates, then each
-// intact record (resynchronised past damage exactly as LogReader::next is).
+// What SummarizeLog walks, handed to a caller as it goes, through a
+// WindowedLogReader: the manifest block once its checksum validates, then
+// each intact record (resynchronised past damage exactly as LogReader::next
+// is).
 struct LogVisitor {
   // The manifest's entries, before any record; false skips the records.
   std::function<bool(std::span<const ManifestEntry>)> manifest;

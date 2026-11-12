@@ -110,7 +110,8 @@ cc_library(
     deps = ["//talOS/events:events_log"],
 )
 
-# One session's event logs merged by time, for log_dump.
+# One session's event logs streamed in time order, a fixed window per log,
+# for log_dump and tlog_to_wpilog.
 cc_library(
     name = "log_merge",
     srcs = ["log_merge.cc"],
@@ -118,6 +119,19 @@ cc_library(
     deps = [
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+    ],
+)
+
+cc_test(
+    name = "log_merge_test",
+    size = "small",
+    srcs = ["log_merge_test.cc"],
+    deps = [
+        ":log_inputs",
+        ":log_merge",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -342,6 +356,27 @@ cc_binary(
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
         "@flatbuffers//:runtime_cc",
+    ],
+)
+
+# Peak resident memory of log_dump and tlog_to_wpilog on a generated 200 MB
+# session; run by hand (README.md, "Filtering and exporting logs").
+cc_binary(
+    name = "log_memory_bench",
+    srcs = ["log_memory_bench.cc"],
+    args = [
+        "$(rlocationpath :log_dump)",
+        "$(rlocationpath :tlog_to_wpilog)",
+    ],
+    data = [
+        ":log_dump",
+        ":tlog_to_wpilog",
+    ],
+    tags = ["manual"],
+    deps = [
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
