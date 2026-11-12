@@ -704,7 +704,7 @@ header:
 
 | Library | Files | Holds |
 |---|---|---|
-| `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock, what retention reads of a recorded session, the log budget split |
+| `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock and session directory lock, what retention reads of a recorded session, the log budget split |
 | `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `ChildExitWakeup` |
 | `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
@@ -812,18 +812,44 @@ frames, metadata), except the protected matches below.
 Retention runs once the config and roster are read and before the launch
 writes anything to the log root, its session directory included: a flag or
 config refusal removes nothing, and a launch on a full log disk frees room
-before it needs any. The launch then creates `DIR/<session_id>/`; when it
-cannot, it is refused, and the retention record goes to stderr. When the
+before it needs any. The launch then creates `DIR/<session_id>/` and takes
+its lock (below); when it cannot, it is refused, and the retention record
+goes to stderr. When the
 disk is still full once retention removed what it could, the refusal names
 the free space and the free floor.
 
 Only a launch that starts the roster, and so holds the session lock (or
 finds its lock file absent with no room to create it, with the limits
 [above](#one-session-per-namespace)), removes anything; `--describe-only` and `--replay-inputs` launches, which run
-beside a live session, remove nothing. Holding the lock is what tells a
-session whose manifest has no `end_wall_ns` (its launcher lost power) from a
-live one in the same shared-memory namespace (`TALOS_SHM_NAMESPACE`); a
-launcher in another namespace must not share the log root. The newest 16
+beside a live session, remove nothing.
+
+Whether a session is still being written is read from its own directory,
+not from the session lock, which covers one shared-memory namespace
+(`TALOS_SHM_NAMESPACE`): launches in different namespaces, such as a
+simulation beside a bench session or two developers' simulations, may share
+a log root, the default `/tmp/talos_logs` included. Every launch,
+`--describe-only` and `--replay-inputs` included, holds an exclusive `flock`
+on its session directory's `session.lock` (`SessionDirectoryLock`,
+`session_lock.h`) from before it writes anything there until it exits, and
+the kernel releases it when the launcher exits or is killed. The descriptor
+is close-on-exec and a guardian closes every descriptor, so no node or
+helper holds it: a node that outlives its launcher (its guardian kills its
+process group at once) or a process it daemonized never keeps a dead
+session. Retention passes over every directory whose lock is held, without
+counting or reading it, and records each in `retention.txt`; a session
+whose manifest has no `end_wall_ns` and whose lock nobody holds was left by
+a launcher that died (a power loss, a kill) and is retained like any other.
+To remove a directory, retention takes its lock (creating `session.lock`
+when it is absent), renames it to `.talos-removing-<session_id>` while
+holding the lock, and removes it there; a launch creating that path
+meanwhile finds the lock held or the directory gone and creates it again,
+so no launch writes into a directory being removed. A
+`.talos-removing-<session_id>` directory a removal cut short goes at the
+next launch's retention. A running launcher that holds no `session.lock`
+(one built before it existed) is protected only from launches in its own
+namespace.
+
+The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or
 that this build cannot classify are protected. Sessions are removed in this
 order, each group oldest first by the `start_wall_ns` its manifest records
@@ -847,12 +873,13 @@ recording (each camera's `[recording] max_bytes`, summed) exceeds half of
 
 Each launch records in its own session directory's `retention.txt` (written
 once that directory exists, synced with `DurableSync`) every session it
-removed, with its size, its class and the limit it exceeded, every session
-it could not read or remove, a free floor it could not reach, and free space
-it could not read; a launch with nothing to record writes none. A
-directory holding a `retention.txt` is never removed as a launch that
-recorded nothing (below), so the record outlives a launch that died before
-its manifest. All but the removal of a session that ran no match are also a
+removed, with its size, its class and the limit it exceeded, every running
+session it passed over, every session it could not read or remove, a free
+floor it could not reach, and free space it could not read; a launch with
+nothing to record writes none. A directory holding a `retention.txt` is
+never removed as a launch that recorded nothing (below), so the record
+outlives a launch that died before its manifest. All but the removal of a
+session that ran no match and a running session passed over are also a
 line on the launcher's stderr. Start times are the main processor's wall
 clock, so a coprocessor without a real-time clock or time sync orders
 sessions only as well as its clock survives a reboot.
@@ -872,7 +899,8 @@ written.
 
 A directory named
 by a session id that holds nothing, or only what a launch writes before it
-starts its nodes (`graph.json`, `declared_graph.json`, `talos.log`, the
+starts its nodes (`graph.json`, `declared_graph.json`, `talos.log`,
+`session.lock`, the
 `.tmp` of an interrupted write, and the empty `.tlog` a node leaves when it dies between
 its log writer creating the file and writing the header), is a launch that
 recorded nothing:
@@ -883,7 +911,7 @@ once another session directory is newer: one newer than every other (a
 the next launch, and a crash loop, refused graphs included, leaves one such
 directory instead of evicting recorded sessions. Symlinks, other directories
 (including one named by a session id that holds another session's log or any
-other file) and the current session are not deleted. A session retention
+other file), a running session and the current session are not deleted. A session retention
 cannot read or remove (another user's, unreadable, removed meanwhile) is
 reported and passed over; it never stops a launch.
 

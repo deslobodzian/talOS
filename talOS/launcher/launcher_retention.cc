@@ -70,10 +70,10 @@ uint64_t LogSessionId(const std::filesystem::path& path) {
 // holds nothing, or only what a launch writes before it starts its nodes
 // -- graph.json, the declared graph, an interrupted atomic write's
 // temporary, an empty event log, the launcher's own lines
-// (kLauncherOutputFile) -- is an abandoned launch: --describe-only,
-// a refused graph, or a launch that failed or died before its manifest.
-// Any other content (another session's log, a retention record of what
-// that launch removed, any other file or directory) makes it no session.
+// (kLauncherOutputFile), its directory's lock file -- is an abandoned launch:
+// --describe-only, a refused graph, or a launch that failed or died before its
+// manifest. Any other content (another session's log, a retention record of
+// what that launch removed, any other file or directory) makes it no session.
 // Sets `error` when it cannot be read.
 Retained Classify(const std::filesystem::directory_entry& entry,
                   std::error_code& error) {
@@ -91,7 +91,7 @@ Retained Classify(const std::filesystem::directory_entry& entry,
       "graph.json",        "declared_graph.json",
       "graph.json.tmp",    "declared_graph.json.tmp",
       "manifest.json.tmp", "retention.txt.tmp",
-      kLauncherOutputFile};
+      kLauncherOutputFile, kSessionDirectoryLockFile};
   bool abandoned = true;
   for (fs::directory_iterator file{entry.path(), error};
        !error && file != fs::directory_iterator{}; file.increment(error)) {
@@ -150,6 +150,23 @@ bool IsNoRoom(const std::error_code& error) {
          error == std::error_condition{EDQUOT, std::generic_category()};
 }
 
+// Where retention moves a session directory to remove it:
+// <log root>/<kRemovingPrefix><session directory's name>. Not a session
+// name, so no launch ever creates or locks a directory there.
+constexpr std::string_view kRemovingPrefix = ".talos-removing-";
+
+// Whether `entry` of the log root is a directory retention moved there to
+// remove (kRemovingPrefix), which a removal cut short left behind.
+bool IsRemoving(const std::filesystem::directory_entry& entry,
+                std::error_code& error) {
+  const std::string name = entry.path().filename().string();
+  return name.starts_with(kRemovingPrefix) &&
+         SessionIdNamed(std::string_view{name}.substr(kRemovingPrefix.size()))
+             .has_value() &&
+         entry.symlink_status(error).type() ==
+             std::filesystem::file_type::directory;
+}
+
 }  // namespace
 
 uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
@@ -193,8 +210,49 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                    (time - file_now) + wall_now.time_since_epoch())
             .count();
       };
+  // Removes the session directory `dir` unless a launch holds its lock, in
+  // any shared-memory namespace: takes the lock itself
+  // (SessionDirectoryLock::TakeIdle), and while holding it moves the
+  // directory out of the session's path, then removes it there. A launch
+  // creating that path meanwhile (SessionDirectoryLock::Create) finds the
+  // lock held or the directory gone and creates it anew, so no removal
+  // reaches a directory a launch has locked. True when it is gone; a launch
+  // holding it is recorded, any other failure reported.
+  const auto remove_idle = [&](const fs::path& dir) {
+    bool running = false;
+    std::error_code removal;
+    const std::optional<SessionDirectoryLock> lock =
+        SessionDirectoryLock::TakeIdle(dir, running, removal);
+    if (running) {
+      note("retention passes over running session " + dir.string() +
+               " (a launch holds its " +
+               std::string{kSessionDirectoryLockFile} + ")",
+           false);
+      return false;
+    }
+    // A directory with no lock file and no room to create one: no launch
+    // could create one to hold either.
+    if (!lock && !IsNoRoom(removal)) {
+      report("cannot remove", dir, removal);
+      return false;
+    }
+    removal.clear();
+    const fs::path removing =
+        dir.parent_path() /
+        (std::string{kRemovingPrefix} + dir.filename().string());
+    fs::rename(dir, removing, removal);
+    if (removal) {
+      report("cannot remove", dir, removal);
+      return false;
+    }
+    fs::remove_all(removing, removal);
+    if (removal) report("cannot remove", removing, removal);
+    return !removal;
+  };
   std::vector<Session> sessions;
   std::vector<Session> abandoned;
+  // Directories a removal cut short left behind (kRemovingPrefix).
+  std::vector<fs::path> leftovers;
   // The newest session directory other than the new one. A launch still
   // describing has no manifest.json yet and reads as abandoned; one is
   // removed only when another session directory is newer, so the newest
@@ -212,9 +270,23 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
        !error && entry != fs::directory_iterator{}; entry.increment(error)) {
     if (entry->path() == current) continue;  // Counted below.
     std::error_code unreadable;
-    const Retained kind = Classify(*entry, unreadable);
+    if (IsRemoving(*entry, unreadable)) {
+      leftovers.push_back(entry->path());
+      continue;
+    }
+    const Retained kind =
+        unreadable ? Retained::kNo : Classify(*entry, unreadable);
     if (kind == Retained::kNo) {
       if (unreadable) report("skips", entry->path(), unreadable);
+      continue;
+    }
+    // A launch in any shared-memory namespace is writing it: neither counted
+    // nor read.
+    if (SessionDirectoryLock::Held(entry->path())) {
+      note("retention passes over running session " + entry->path().string() +
+               " (a launch holds its " +
+               std::string{kSessionDirectoryLockFile} + ")",
+           false);
       continue;
     }
     const auto time = entry->last_write_time(unreadable);
@@ -245,11 +317,16 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     report("removes nothing; cannot list", current.parent_path(), error);
     return session_budget;
   }
+  // Held only by a retention removing it now.
+  for (const auto& leftover : leftovers) {
+    if (SessionDirectoryLock::Held(leftover)) continue;
+    std::error_code removal;
+    fs::remove_all(leftover, removal);
+    if (removal) report("cannot remove", leftover, removal);
+  }
   for (const auto& launch : abandoned) {
     if (launch.time >= newest) continue;
-    std::error_code removal;
-    fs::remove_all(launch.path, removal);
-    if (removal) report("cannot remove", launch.path, removal);
+    remove_idle(launch.path);
   }
   std::sort(
       sessions.begin(), sessions.end(), [](const Session& a, const Session& b) {
@@ -274,10 +351,13 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                      };
                      return group(a) < group(b);
                    });
-  // Removes `session`; false when it stays in place, which passes it over
-  // like an unreadable one rather than costing a newer session its place.
+  // Removes `session`; false when it stays in place (a launch started
+  // writing it since it was listed, or it cannot be removed), which passes
+  // it over like an unreadable one rather than costing a newer session its
+  // place.
   const auto remove_session = [&](const Session& session,
                                   const std::string& why) {
+    if (!remove_idle(session.path)) return false;
     const bool warn = session.verdict != MatchVerdict::kOther;
     note(
         std::string{warn ? "WARNING: " : ""} + "retention removes " +
@@ -291,10 +371,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                                            " matches or unclassifiable sessions"
                                      : std::string{}),
         warn);
-    std::error_code removal;
-    fs::remove_all(session.path, removal);
-    if (removal) report("cannot remove", session.path, removal);
-    return !removal;
+    return true;
   };
   // The new session counts too, before it holds anything.
   std::size_t count = sessions.size() + 1;
@@ -349,10 +426,14 @@ bool Launcher::CreateSessionDirectory(const config::RobotConfig& config,
                                       const std::string& record) {
   const std::filesystem::path current{options_.output_dir};
   std::error_code error;
-  options_.create_session_directory(current, error);
-  if (error) {
+  session_directory_ = SessionDirectoryLock::Create(
+      current, options_.create_session_directory, error);
+  if (!session_directory_) {
     std::cerr << "launcher: cannot create the session directory "
               << current.string() << " (" << error.message() << ")";
+    if (error == std::errc::device_or_resource_busy) {
+      std::cerr << "; another launch holds its " << kSessionDirectoryLockFile;
+    }
     if (pruned && IsNoRoom(error)) {
       const std::optional<uint64_t> available =
           options_.available_bytes(current.parent_path());

@@ -1,7 +1,9 @@
 #include "talOS/launcher/launcher.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -2528,6 +2531,126 @@ TEST(LauncherSessions, LockFileWithoutRoomPrunesOnlyFinishedSessions) {
   EXPECT_FALSE(std::filesystem::exists(dir(1)));
   EXPECT_TRUE(std::filesystem::exists(dir(2) + "/manifest.json"));
   EXPECT_TRUE(std::filesystem::exists(dir(4) + "/manifest.json"));
+  std::filesystem::remove_all(root);
+}
+
+// Every regular file under `dir`, by path relative to it, with its bytes.
+std::map<std::string, std::string> DirectoryContents(const std::string& dir) {
+  std::map<std::string, std::string> contents;
+  for (const auto& file : std::filesystem::recursive_directory_iterator{dir}) {
+    if (!file.is_regular_file()) continue;
+    contents[std::filesystem::relative(file.path(), dir).string()] =
+        ReadFile(file.path().string());
+  }
+  return contents;
+}
+
+// REQ-OPS-11: a launch in another shared-memory namespace records into the
+// same log root (the default /tmp/talos_logs: a simulation beside a bench
+// session) and holds its own namespace's session lock, not this one's. Its
+// running session's manifest has no end_wall_ns, as a launch that lost power
+// leaves, and log_keep_sessions = 2 makes it old enough to remove. A launch
+// here, holding this namespace's session lock, must leave every byte of it
+// in place and record that it passed it over; trusting its own session lock,
+// it removed the session while it was being written. A session of the other
+// namespace whose launcher died is still removed.
+TEST(LauncherSessions, RetentionKeepsAnotherNamespacesRunningSession) {
+  auto options = SessionFixture("other_namespace");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 2\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  // Close-on-exec: no node the launch below starts holds them.
+  int ready[2];
+  int release[2];
+  for (int* fds : {ready, release}) {
+    ASSERT_EQ(::pipe(fds), 0);
+    for (int end = 0; end < 2; ++end) {
+      ASSERT_EQ(::fcntl(fds[end], F_SETFD, FD_CLOEXEC), 0);
+    }
+  }
+  // A launch of session `id` in the other namespace, as the launcher starts
+  // one: its namespace's session lock, then its session directory, then an
+  // unfinished manifest and an event log. A running one reports on `ready`,
+  // then runs until `release` closes; the other dies at once, as a killed
+  // launcher does.
+  const std::string other_namespace =
+      "talos_launcher_test_other_" + std::to_string(::getpid());
+  const auto launch = [&](int id, bool runs) {
+    const pid_t child = ::fork();
+    if (child != 0) return child;
+    ::close(ready[0]);
+    ::close(release[1]);
+    ::setenv("TALOS_SHM_NAMESPACE", other_namespace.c_str(), 1);
+    std::string error;
+    const auto namespace_lock = SessionLock::Acquire(error);
+    const std::string lock_path =
+        namespace_lock ? namespace_lock->path() : std::string{};
+    std::error_code created;
+    const auto session = SessionDirectoryLock::Create(
+        dir(id),
+        [](const std::filesystem::path& path, std::error_code& failed) {
+          std::filesystem::create_directories(path, failed);
+        },
+        created);
+    if (!namespace_lock || !session) ::_exit(1);
+    WriteSessionManifest(dir(id), id, 1000 + id);
+    WriteDriverStationLog(dir(id), "late", id, {false}, 4096);
+    // Lock files outside TEST_TMPDIR are not removed with the test.
+    ::unlink(lock_path.c_str());
+    if (runs) {
+      const char byte = 1;
+      if (::write(ready[1], &byte, 1) != 1) ::_exit(1);
+      char unused = 0;
+      while (::read(release[0], &unused, 1) < 0 && errno == EINTR) {
+      }
+    }
+    ::_exit(0);
+  };
+  const pid_t dead = launch(1, false);
+  ASSERT_GT(dead, 0);
+  int status = 0;
+  ASSERT_EQ(::waitpid(dead, &status, 0), dead);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+  const pid_t running = launch(2, true);
+  ASSERT_GT(running, 0);
+  ::close(ready[1]);
+  ::close(release[0]);
+  char byte = 0;
+  ASSERT_EQ(::read(ready[0], &byte, 1), 1) << "the running launch failed";
+  ::close(ready[0]);
+  // This namespace's own session, newer and finished.
+  WriteSessionManifest(dir(3), 3, 1003, 1103);
+  WriteDriverStationLog(dir(3), "late", 3, {false});
+  const auto before = DirectoryContents(dir(2));
+  ASSERT_TRUE(before.contains("manifest.json"));
+
+  options.session_id = 4;
+  const int result = Launcher{options}.Run();
+  const bool survived = std::filesystem::exists(dir(2));
+  const auto after = survived ? DirectoryContents(dir(2)) : decltype(before){};
+  ::close(release[1]);
+  ASSERT_EQ(::waitpid(running, &status, 0), running);
+  EXPECT_EQ(result, 0);
+  EXPECT_TRUE(survived) << "retention removed the running session " << dir(2);
+  std::vector<std::string> changed;
+  for (const auto& [file, bytes] : before) {
+    const auto now = after.find(file);
+    if (now == after.end() || now->second != bytes) changed.push_back(file);
+  }
+  for (const auto& [file, bytes] : after) {
+    if (!before.contains(file)) changed.push_back(file);
+  }
+  EXPECT_EQ(changed, std::vector<std::string>{}) << dir(2);
+  EXPECT_FALSE(std::filesystem::exists(dir(1)));
+  EXPECT_TRUE(std::filesystem::exists(dir(3) + "/manifest.json"));
+  EXPECT_TRUE(std::filesystem::exists(dir(4) + "/manifest.json"));
+  EXPECT_NE(
+      ReadFile(dir(4) + "/" + std::string{kRetentionRecordFile}).find(dir(2)),
+      std::string::npos);
   std::filesystem::remove_all(root);
 }
 

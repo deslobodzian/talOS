@@ -290,6 +290,7 @@ int Launcher::Run() {
   if (output_) output_->Stop();
   output_.reset();
   launcher_output_.reset();
+  session_directory_.reset();
   return status;
 }
 
