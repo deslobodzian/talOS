@@ -5,6 +5,7 @@
 #include <signal.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -34,6 +35,8 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/reporter.h"
+#include "talOS/rtms/rtms.h"
+#include "talOS/rtms/wake.h"
 
 namespace talos::introspect {
 namespace {
@@ -833,6 +836,95 @@ TEST_F(Registry, ARefusedRealtimeGrantIsVisibleInTheRow) {
   EXPECT_NE(node.flags & kFlagSimulation, 0u);
   EXPECT_NE(node.flags & kFlagLogCapped, 0u);
   EXPECT_EQ(node.flags & kFlagRecorderFailed, 0u);
+}
+
+// A notification its writer could not send -- here no descriptor is left for
+// the sender's socket -- leaves the reader asleep until its backstop, and the
+// row is the only place outside the process that can say why: the reporter
+// copies the loop's count there, where the launcher and Studio read it
+// (TODO.md RT-7). The descriptor limit is lowered in a child, which owns the
+// whole scenario: a loop sending on a topic whose reader, in the same child,
+// is armed on a receiver.
+// REQ-RT-19, REQ-OPS-18
+TEST_F(Registry, AWakeItsWriterCouldNotSendIsCountedInTheRow) {
+  const std::string topic = "/waker/state/p" + std::to_string(::getpid());
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    int code = 1;
+    try {
+      event::RealtimeEventLoop<> loop;
+      struct Handler {
+        std::function<void()> on_tick;
+        void OnTick(const event::Context&) { on_tick(); }
+      } handler;
+      auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+      const std::uint16_t sender = loop.register_sender(
+          topic, sizeof(std::uint64_t), alignof(std::uint64_t), kCountSchema);
+      RTMSQueue subscriber{topic,
+                           sizeof(std::uint64_t),
+                           alignof(std::uint64_t),
+                           kCountSchema,
+                           MAX_SLOTS,
+                           {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                            .read_mode = ReadMode::SEQUENCE}};
+      const auto reader = subscriber.register_reader();
+      WakeReceiver receiver;
+      Reporter reporter{
+          {.name = "waker", .period = 10ms, .registry_path = path_}};
+      RegistryReader rows{path_};
+      reporter.start(loop);
+      rlimit limit{};
+      bool sent = false;
+      code = 2;
+      handler.on_tick = [&] {
+        if (!sent) {
+          // The lowest free descriptor: with the soft limit there, the
+          // sender's socket cannot open. Raised again at once, so nothing
+          // else in the child is refused one.
+          const int lowest = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+          if (!reader || lowest < 0 || ::close(lowest) != 0 ||
+              ::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            loop.exit();
+            return;
+          }
+          subscriber.set_reader_wake(*reader, receiver.id());
+          const rlimit lowered{.rlim_cur = static_cast<rlim_t>(lowest),
+                               .rlim_max = limit.rlim_max};
+          const std::uint64_t value = 1;
+          sent =
+              subscriber.arm_wake(*reader) &&
+              ::setrlimit(RLIMIT_NOFILE, &lowered) == 0 &&
+              loop.send_message(sender, std::as_bytes(std::span{&value, 1})) &&
+              ::setrlimit(RLIMIT_NOFILE, &limit) == 0;
+          if (!sent) loop.exit();
+          code = 3;
+          return;
+        }
+        const auto nodes = rows.nodes();
+        if (nodes.size() == 1 && nodes.front().delivery_loss().any()) {
+          const DeliveryLoss loss = nodes.front().delivery_loss();
+          code = loss.wake_failures == 1 && loss.stalled_arms == 0 &&
+                         loss.wake_fallbacks == 0 && loss.requests_skipped == 0
+                     ? 0
+                     : 5;
+          loop.exit();
+        }
+      };
+      timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+      loop.run_for(5s);  // Bound only; exits once the row shows the count.
+    } catch (...) {
+      code = 4;
+    }
+    ::_exit(code);
+  }
+  children.add(pid);
+  const int status = children.reap(pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0)
+      << "2: setup, 3: the row never showed the failed wake, 4: threw, "
+         "5: the row counted something else";
 }
 
 TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {

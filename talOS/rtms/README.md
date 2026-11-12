@@ -133,7 +133,9 @@ set while slot *i* waits for the next publication.
   writer at most one send however many publications follow.
   `wakes_sent()` counts the sends of one queue object, and `wake_failures()`
   those of them that were `FAILED`; the first failure of a queue is also
-  printed once on stderr with the topic and the error. The reader it missed
+  printed once on stderr with the topic and the error, and the count reaches
+  the writing node's registry row
+  ([wake loss](../introspection/README.md#wake-loss)). The reader it missed
   is drained by its loop's backstop
   ([talOS/events](../events/README.md#the-three-loops)). Each reader slot
   holds one connected socket in every process that writes the topic, so a

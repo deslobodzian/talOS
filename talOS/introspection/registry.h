@@ -13,7 +13,8 @@
  * into it -- every timer, watcher, fetcher and sender, by name and message size
  * -- and then, while it runs, keeps current a heartbeat, a set of counters,
  * the lane each of its Targets selected, whether its event log stopped
- * early, and the realtime scheduling its loop got. Studio and any agent map
+ * early, the realtime scheduling its loop got, and what its wake channel
+ * lost. Studio and any agent map
  * the segment read-only and get the whole system: which processes exist,
  * which topics each one publishes and subscribes to, how much traffic has
  * actually moved, who drives each subsystem, which recordings are incomplete
@@ -104,6 +105,11 @@ namespace talos::introspect {
 // Version 5 narrows the pid to 22 bits of the process word and records the
 // claimant's pid namespace above its start (process_liveness.h): a version-4
 // reader would misread the start and free live rows.
+// Version 6 adds the wake counters at NodeRecord's end (wake_failures,
+// stalled_arms, wake_fallbacks). They sit in what was tail padding, so
+// sizeof(NodeRecord) stays 11136 B, but no earlier writer zeroes that
+// padding on a claim: a slot one build wrote and an older build reclaimed
+// would show the first node's counts against the second.
 //
 // The event log flags (kFlagRecorderFailed, kFlagLogCapped) did not bump it:
 // they are bits of `flags` that every earlier writer left clear, which reads
@@ -120,8 +126,8 @@ namespace talos::introspect {
 //
 // Nor did counting a timer's missed periods in SourceRecord::dropped: a
 // timer's `dropped` was always 0, which still reads as "no overrun".
-inline constexpr std::uint32_t kRegistryVersion = 5;
-inline constexpr const char* kRegistryPath = "/talos_registry.5";
+inline constexpr std::uint32_t kRegistryVersion = 6;
+inline constexpr const char* kRegistryPath = "/talos_registry.6";
 // The segment's mode, whatever the creator's umask: every node registers,
 // whichever user runs it, and the registry provides no authentication.
 inline constexpr mode_t kRegistryMode = 0666;
@@ -313,6 +319,18 @@ struct alignas(64) NodeRecord {
   std::atomic<std::uint32_t> selection_count;
   std::atomic<std::uint32_t> declared_selection_count;
   SelectionRecord selections[kMaxSelectionsPerNode];
+
+  // What the node's wake channel lost, cumulative since the claim, written in
+  // each sample (NodeRegistration::set_wake_loss; TODO.md RT-7). Each should
+  // stay 0. wake_failures: notifications its writers failed to send for a
+  // reason other than a gone receiver (RTMSQueue::wake_failures(): no
+  // descriptor left, say), each leaving a reader asleep until its backstop.
+  // stalled_arms: prompt watchers whose failed arms stopped holding its loop
+  // awake. wake_fallbacks: runs that could not build their wake receiver and
+  // drain on a poll tick instead (the bridge: OpenWaits() fallbacks).
+  std::atomic<std::uint64_t> wake_failures;
+  std::atomic<std::uint64_t> stalled_arms;
+  std::atomic<std::uint64_t> wake_fallbacks;
 };
 
 struct RegistryHeader {
@@ -354,6 +372,12 @@ static_assert(offsetof(NodeRecord, sample_seq) ==
                   sizeof(std::uint32_t));
 static_assert(offsetof(NodeRecord, start_wall_ns) ==
               offsetof(NodeRecord, sample_seq) + sizeof(std::uint32_t));
+
+// The segment's layout, as docs/DATA_FLOW.md states it: a change to either
+// size is a change of layout, which bumps kRegistryVersion and that table.
+static_assert(alignof(NodeRecord) == 64);
+static_assert(sizeof(NodeRecord) == 11136);
+static_assert(sizeof(RegistryHeader) == 356416);
 
 inline std::int64_t wall_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -882,6 +906,16 @@ class NodeRegistration {
                                               std::memory_order_relaxed);
   }
 
+  // Copies the node's wake counters into the row (NodeRecord::wake_failures
+  // and after). Called from the reporting thread inside a sample.
+  void set_wake_loss(std::uint64_t wake_failures, std::uint64_t stalled_arms,
+                     std::uint64_t wake_fallbacks) {
+    if (!owns_slot()) return;
+    record_->wake_failures.store(wake_failures, std::memory_order_relaxed);
+    record_->stalled_arms.store(stalled_arms, std::memory_order_relaxed);
+    record_->wake_fallbacks.store(wake_fallbacks, std::memory_order_relaxed);
+  }
+
   // Sets kFlagRecorderFailed / kFlagLogCapped for an event log that failed or
   // reached its cap; neither is ever cleared. Called inside a sample.
   void set_recording(bool failed, bool capped) {
@@ -1092,6 +1126,9 @@ class NodeRegistration {
     record->selection_count.store(0, std::memory_order_relaxed);
     record->declared_selection_count.store(0, std::memory_order_relaxed);
     record->dispatch_count.store(0, std::memory_order_relaxed);
+    record->wake_failures.store(0, std::memory_order_relaxed);
+    record->stalled_arms.store(0, std::memory_order_relaxed);
+    record->wake_fallbacks.store(0, std::memory_order_relaxed);
     // A recycled slot may hold an odd sequence from a writer that died
     // mid-sample; a fresh claim is quiescent by definition.
     record->sample_seq.store(0, std::memory_order_relaxed);
@@ -1187,6 +1224,54 @@ struct SelectionSnapshot {
   }
 };
 
+// What a row says its node lost of what it should have delivered or been
+// woken for, all cumulative since the claim and all normally 0 (TODO.md
+// RT-7): the row's wake counters (NodeRecord::wake_failures and after), and
+// requests_skipped, the requests the hardware bridge's latest-value reads of
+// `/hw/request/<node>` passed over (its per-subsystem source rows' `dropped`,
+// summed; 0 for every other node).
+struct DeliveryLoss {
+  std::uint64_t wake_failures{0};
+  std::uint64_t stalled_arms{0};
+  std::uint64_t wake_fallbacks{0};
+  std::uint64_t requests_skipped{0};
+
+  bool any() const {
+    return (wake_failures | stalled_arms | wake_fallbacks | requests_skipped) !=
+           0;
+  }
+};
+
+// A reader of a hardware request topic: the bridge's per-subsystem source,
+// whose `dropped` counts the requests its reads skipped.
+inline bool IsRequestRead(event::SourceKind kind, std::string_view name) {
+  return (kind == event::SourceKind::FETCHER ||
+          kind == event::SourceKind::WATCHER) &&
+         naming::IsHardwareRequest(name);
+}
+
+// The same, read straight from a row by a reader that copies no snapshot
+// (the launcher's supervision pass). Relaxed loads: each counter only grows,
+// and a value one sample old is as good as the next.
+inline DeliveryLoss DeliveryLossOf(const NodeRecord& record) {
+  DeliveryLoss loss{
+      .wake_failures = record.wake_failures.load(std::memory_order_relaxed),
+      .stalled_arms = record.stalled_arms.load(std::memory_order_relaxed),
+      .wake_fallbacks = record.wake_fallbacks.load(std::memory_order_relaxed)};
+  const std::uint32_t count =
+      record.source_count.load(std::memory_order_acquire);
+  for (std::uint32_t s = 0; s < count && s < kMaxSourcesPerNode; ++s) {
+    const SourceRecord& source = record.sources[s];
+    if (IsRequestRead(
+            static_cast<event::SourceKind>(source.kind),
+            std::string_view{source.name,
+                             ::strnlen(source.name, kMaxNameBytes)})) {
+      loss.requests_skipped += source.dropped.load(std::memory_order_relaxed);
+    }
+  }
+  return loss;
+}
+
 struct NodeSnapshot {
   std::size_t slot{0};
   std::string name;
@@ -1207,6 +1292,22 @@ struct NodeSnapshot {
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
   std::vector<SelectionSnapshot> selections;
+  // NodeRecord's wake counters.
+  std::uint64_t wake_failures{0};
+  std::uint64_t stalled_arms{0};
+  std::uint64_t wake_fallbacks{0};
+
+  DeliveryLoss delivery_loss() const {
+    DeliveryLoss loss{.wake_failures = wake_failures,
+                      .stalled_arms = stalled_arms,
+                      .wake_fallbacks = wake_fallbacks};
+    for (const SourceSnapshot& source : sources) {
+      if (IsRequestRead(source.kind, source.name)) {
+        loss.requests_skipped += source.dropped;
+      }
+    }
+    return loss;
+  }
 };
 
 // Read-only view of the registry. Safe to poll at any rate: it takes no locks
@@ -1347,6 +1448,9 @@ class RegistryReader {
     node.dispatch_count = record.dispatch_count.load(std::memory_order_relaxed);
     node.declared_source_count =
         record.declared_source_count.load(std::memory_order_relaxed);
+    node.wake_failures = record.wake_failures.load(std::memory_order_relaxed);
+    node.stalled_arms = record.stalled_arms.load(std::memory_order_relaxed);
+    node.wake_fallbacks = record.wake_fallbacks.load(std::memory_order_relaxed);
 
     // Acquire pairs with publish(): a visible count means the records it
     // describes are visible too.

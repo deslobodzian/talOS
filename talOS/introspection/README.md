@@ -1,13 +1,14 @@
 # Live node registry
 
 `registry.h` exposes a shared-memory registry of node identities, endpoints,
-heartbeats, source counters, Target selections and event log state.
+heartbeats, source counters, Target selections, event log state and wake
+loss.
 `RegistryReader` maps it read-only; `Reporter` publishes a node's event-loop
 data.
 
 ## The segment
 
-The logical path is `/talos_registry.5`, and the trailing number is
+The logical path is `/talos_registry.6`, and the trailing number is
 `kRegistryVersion`. Registry opens and explicit unlinks apply `ShmObjectName`,
 just like topics: `TALOS_SHM_NAMESPACE` (or Bazel's `TEST_TMPDIR` fallback)
 isolates tests and their children, while production retains the ordinary name.
@@ -150,6 +151,27 @@ refused: the loop runs at timeshare) or `not_requested`. Like the event log
 flags, these are bits every earlier writer left clear and every earlier reader
 ignores, so the layout and version are unchanged. A ring whose lock is
 refused after the loop starts is not in the row (stderr only).
+
+## Wake loss
+
+A node sleeps until a publication wakes it ([wake channel](../rtms/README.md#wake-channel)),
+so a lost wake costs a reader its loop's backstop with nothing in the
+process to show it but one stderr line. The row counts it, in three
+`uint64` fields at the end of `NodeRecord`, cumulative since the claim and
+each normally 0: `wake_failures`, the notifications this node's writers
+could not send for a reason other than a gone receiver
+(`RTMSQueue::wake_failures()` summed over the loop's senders: no descriptor
+left, say); `stalled_arms`, prompt watchers whose failed arms stopped
+holding its loop awake; and `wake_fallbacks`, runs that could not build
+their wake receiver and drain on a poll tick instead. The `Reporter` copies
+`RealtimeEventLoop::wake_loss()` in each full sample
+(`NodeRegistration::set_wake_loss`).
+`NodeSnapshot::delivery_loss()` (and `DeliveryLossOf(const NodeRecord&)`,
+for a reader that copies no snapshot) gathers them with `requests_skipped`,
+the `dropped` of the node's readers of `/hw/request/<node>` summed. The fields took the record's tail
+padding, so `sizeof(NodeRecord)` stayed 11136 B, but a claim by an older
+build would not have cleared them, so they are registry version 6
+([data flow](../../docs/DATA_FLOW.md#main-processor-shared-memory-slots)).
 
 How late the loop runs is in its timer sources: a periodic timer's worst
 dispatch lateness and the periods it missed ([the counters](#the-counters)),

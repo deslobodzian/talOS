@@ -91,6 +91,8 @@ cc_test(
         ":registry",
         ":reporter",
         "//talOS/events",
+        "//talOS/rtms",
+        "//talOS/rtms:wake",
         "@googletest//:gtest_main",
     ],
 )
