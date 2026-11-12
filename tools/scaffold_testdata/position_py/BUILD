@@ -20,7 +20,10 @@ talos_py_node(
     class_name = "PositionPy",
     main = "position_py.py",
     node_name = "position_py",
-    deps = [":messages_py"],
+    deps = [
+        ":messages_py",
+        "//talOS/python:mechanisms",
+    ],
 )
 
 py_test(
@@ -41,6 +44,7 @@ py_test(
     ],
     deps = [
         ":messages_py",
+        "//talOS/python:mechanisms",
         "//talOS/python:testing",
         "@rules_python//python/runfiles",
     ],

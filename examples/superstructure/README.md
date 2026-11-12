@@ -293,10 +293,10 @@ subsystem name and path to `configuration/robot.toml` and regenerates that
 config's manifest plus manifests of configs that include it.
 
 The Python variant puts `wrist.py` and `node_test.py` in the same package,
-not in a separate `py/` directory. It uses the same schema and `:node` target,
-but writes the homing itself, against the motor `wrist_motor` and the
-`[subsystem]` keys `tolerance_rot`, `max_position_rot` and the homing keys
-above; Python cannot construct the mechanism classes.
+not in a separate `py/` directory. It uses the same schema, `:node` target
+and subsystem file, and is the same thin node over
+`talos.mechanisms.PositionMechanism` (`//talOS/python:mechanisms`), the
+C++ mechanism through the node API.
 For implementing and wiring additional behavior, use the
 [node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md).
 

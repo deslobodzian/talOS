@@ -4,15 +4,19 @@ name = "position_py_test"
 period_us = 20000
 command_timeout_us = 100000
 
-[subsystems.position_py]
-max_position_rot = 100.0
+[subsystems.position_py.position_py]
+tolerance_rot = 0.05
+min_rot = 0.0
+max_rot = 100.0
+homing = "limit_switch"
+limit_switch = "position_py_home"
 homing_v = -1.0
 homing_timeout_us = 500000
 homing_stall_rps = 0.1
 homing_stall_us = 200000
 home_margin_rot = 0.5
 
-[subsystems.position_py.motors.position_py_motor]
+[subsystems.position_py.motors.position_py]
 type = "TalonFX"
 bus = "test"
 can_id = 1

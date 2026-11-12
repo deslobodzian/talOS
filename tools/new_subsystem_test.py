@@ -180,11 +180,11 @@ class NewSubsystemTest(unittest.TestCase):
         # the motor requires a zero, has no hardware soft limits (which act
         # in that frame and can stop homing), and its placeholder travel,
         # clamped by the node, is narrower than the at-goal tolerance. The
-        # homing parameters pass the node's checks (homing_v toward the
-        # switch, positive bounds; in C++ PositionMechanism's: home at
-        # min_rot, |homing_v| at most half max_voltage, homing on the
-        # generated switch), and the switch gets the lowest free DIO channel,
-        # as the motor gets the lowest free CAN id.
+        # homing parameters pass PositionMechanism's checks (home at
+        # min_rot, |homing_v| toward the switch and at most half max_voltage,
+        # homing on the generated switch), in both languages, and the switch
+        # gets the lowest free DIO channel, as the motor gets the lowest free
+        # CAN id.
         for lang in ("cpp", "py"):
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as root:
                 configuration = os.path.join(root, "bot", "main_processor",
@@ -208,20 +208,15 @@ class NewSubsystemTest(unittest.TestCase):
                     new for path, _, new in writes
                     if path == os.path.join(configuration, "subsystems",
                                             "wrist.toml")))
-                if lang == "cpp":
-                    motor = subsystem["motors"]["wrist"]
-                    params = subsystem["wrist"]
-                    self.assertEqual(params["homing"], "limit_switch")
-                    self.assertIn(params["limit_switch"],
-                                  subsystem["digital_inputs"])
-                    self.assertEqual(params["min_rot"], 0)
-                    travel = params["max_rot"] - params["min_rot"]
-                    self.assertLessEqual(abs(params["homing_v"]),
-                                         motor["max_voltage"] / 2)
-                else:
-                    motor = subsystem["motors"]["wrist_motor"]
-                    params = subsystem["subsystem"]
-                    travel = params["max_position_rot"]
+                motor = subsystem["motors"]["wrist"]
+                params = subsystem["wrist"]
+                self.assertEqual(params["homing"], "limit_switch")
+                self.assertIn(params["limit_switch"],
+                              subsystem["digital_inputs"])
+                self.assertEqual(params["min_rot"], 0)
+                travel = params["max_rot"] - params["min_rot"]
+                self.assertLessEqual(abs(params["homing_v"]),
+                                     motor["max_voltage"] / 2)
                 self.assertEqual(motor["position_frame"], "rezero")
                 self.assertIs(motor["soft_limits"], False)
                 self.assertGreater(travel, 0)
@@ -233,17 +228,18 @@ class NewSubsystemTest(unittest.TestCase):
                 self.assertEqual(
                     subsystem["digital_inputs"]["wrist_home"]["dio"], 2)
 
-    def test_cpp_position_name_cannot_shadow_a_subsystem_file_key(self):
-        # A C++ position node's parameter table is [<name>] in its subsystem
-        # file, so a name the framework reads there ([targets]), refuses
-        # ([motor]) or heads it with ([subsystem]) is refused.
+    def test_position_name_cannot_shadow_a_subsystem_file_key(self):
+        # A position node's parameter table is [<name>] in its subsystem
+        # file (C++ and Python alike), so a name the framework reads there
+        # ([targets]), refuses ([motor]) or heads it with ([subsystem]) is
+        # refused.
         for name in ("targets", "motor", "subsystem"):
-            with self.subTest(name=name):
-                self.assertIsNotNone(
-                    new_subsystem.check_kind(name, "cpp", "position"))
-                self.assertIsNone(
-                    new_subsystem.check_kind(name, "py", "position"))
-        self.assertIsNone(new_subsystem.check_kind("wrist", "cpp", "position"))
+            for lang in ("cpp", "py"):
+                with self.subTest(name=name, lang=lang):
+                    self.assertIsNotNone(
+                        new_subsystem.check_kind(name, lang, "position"))
+        self.assertIsNone(new_subsystem.check_kind("wrist", "py", "position"))
+        self.assertIsNone(new_subsystem.check_kind("targets", "py", "velocity"))
 
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and
