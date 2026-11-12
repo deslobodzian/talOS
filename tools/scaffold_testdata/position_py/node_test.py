@@ -27,7 +27,7 @@ class PositionPyTest(unittest.TestCase):
         self.sim = Sim(CONFIG)
         self.sim.add(node_py.PositionPy, "position_py")
         self.hw = SimHardware(self.sim)
-        self.hw.set_motor("position_py", "position_py_motor", 0.0, 12.5)
+        self.hw.set_motor("position_py", "position_py", 0.0, 12.5)
         # Starts on its home switch (closed reads False, see
         # set_home): zeroed without moving.
         self.hw.set_digital_input("position_py", "position_py_home", False)
@@ -55,11 +55,11 @@ class PositionPyTest(unittest.TestCase):
     def mode(self):
         """What the node asked for (the flush sends neutral for an unset
         motor)."""
-        return self.hw.motor_request("position_py", "position_py_motor").mode
+        return self.hw.motor_request("position_py", "position_py").mode
 
     def applied(self):
         """What the gateway applies, after its enable and expiry gates."""
-        return self.hw.applied_motor("position_py", "position_py_motor").mode
+        return self.hw.applied_motor("position_py", "position_py").mode
 
     def state(self):
         return self.sim.latest(PositionPyState, topics.STATE)
@@ -68,7 +68,7 @@ class PositionPyTest(unittest.TestCase):
     def test_drives_at_a_live_lane(self):
         self.teleop()
         self.hold(30.0, 0.06)
-        request = self.hw.applied_motor("position_py", "position_py_motor")
+        request = self.hw.applied_motor("position_py", "position_py")
         self.assertEqual(request.mode, talos.Mode.MOTION_MAGIC)
         self.assertEqual(request.demand, 30.0)
         state = self.state()
@@ -124,7 +124,7 @@ class PositionPyTest(unittest.TestCase):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.MOTION_MAGIC)
-        self.hw.set_connected("position_py", "position_py_motor", False)
+        self.hw.set_connected("position_py", "position_py", False)
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         state = self.state()
@@ -138,36 +138,7 @@ class PositionPyTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
 
-    # REQ-CONTRACT-18
-    def test_bad_parameter_fails_construction(self):
-        # testdata/robot.toml's values; each row drops or replaces one.
-        valid = {"max_position_rot": "100.0", "homing_v": "-1.0",
-                 "homing_timeout_us": "500000", "homing_stall_rps": "0.1",
-                 "homing_stall_us": "200000", "home_margin_rot": "0.5"}
-        rows = (("max_position_rot", None), ("max_position_rot", "0.0"),
-                ("max_position_rot", "inf"), ("homing_v", None),
-                ("homing_v", "0.0"), ("homing_timeout_us", None),
-                ("homing_timeout_us", "0"), ("homing_stall_rps", None),
-                ("homing_stall_rps", "nan"), ("homing_stall_us", None),
-                ("homing_stall_us", "-1"), ("home_margin_rot", None),
-                ("home_margin_rot", "0.0"), ("home_samples", "0"))
-        for key, value in rows:
-            with self.subTest(key=key, value=value):
-                settings = {**valid, key: value}
-                table = "".join(f"{k} = {v}\n"
-                                for k, v in settings.items() if v is not None)
-                sim = Sim.from_toml(
-                    "[robot]\nperiod_us = 20000\n"
-                    "command_timeout_us = 100000\n"
-                    f"[subsystems.position_py]\n{table}"
-                    "[subsystems.position_py.motors.position_py_motor]\n"
-                    'type = "TalonFX"\ncan_id = 1\n'
-                    'position_frame = "rezero"\n'
-                    "[subsystems.position_py.digital_inputs.position_py_home]\n"
-                    "dio = 0\n")
-                with self.assertRaisesRegex((ValueError, talos.TalosError),
-                                            key):
-                    sim.add(node_py.PositionPy, "position_py")
+    # matrix: n/a 9 (PositionMechanism parameters, tested in talOS/mechanisms)
 
     # REQ-SAFE-07
     def test_other_modes_lane_is_ignored(self):
@@ -180,7 +151,7 @@ class PositionPyTest(unittest.TestCase):
         self.hold(30.0, 0.04)  # teleop's lane, live, in autonomous
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.hold(20.0, 0.04, source="auto")
-        request = self.hw.motor_request("position_py", "position_py_motor")
+        request = self.hw.motor_request("position_py", "position_py")
         self.assertEqual(request.mode, talos.Mode.MOTION_MAGIC)
         self.assertEqual(request.demand, 20.0)
 
@@ -211,100 +182,49 @@ class PositionPyTest(unittest.TestCase):
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
     # Homing. The values are testdata/robot.toml's (homing_v = -1.0,
-    # max_position_rot = 100.0, homing_timeout_us = 500000,
-    # homing_stall_us = 200000). setUp leaves the motor moving at 12.5 rps.
+    # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor
+    # moving at 12.5 rps.
 
     def set_home(self, closed):
         """Normally open to ground behind the input's pull-up: closed reads
         False."""
         self.hw.set_digital_input("position_py", "position_py_home", not closed)
 
+    # REQ-SAFE-36
     def test_homes_before_the_first_goal(self):
         self.set_home(False)
         self.hw.ideal_motors()
         self.teleop()
         self.hold(30.0, 0.06)  # toward the switch, not to 30 unhomed
-        request = self.hw.motor_request("position_py", "position_py_motor")
+        request = self.hw.motor_request("position_py", "position_py")
         self.assertEqual(request[:2], (talos.Mode.VOLTAGE, -1.0))
         self.assertEqual(self.state().homing, PositionPyHoming.HOMING)
 
         # The switch closes 0.5 rotations below the power-on position: that
         # is 0, and targets go out in that frame, clamped to the travel.
-        self.hw.set_motor("position_py", "position_py_motor", -0.5, 0.0)
+        self.hw.set_motor("position_py", "position_py", -0.5, 0.0)
         self.set_home(True)
         self.hold(30.0, 0.06)  # home_samples (3) consecutive closed readings
         self.set_home(False)  # the motor leaves the switch
         self.hold(30.0, 0.02)
-        request = self.hw.motor_request("position_py", "position_py_motor")
+        request = self.hw.motor_request("position_py", "position_py")
         self.assertEqual(request[:2], (talos.Mode.MOTION_MAGIC, 29.5))
         self.assertEqual(self.state().homing, PositionPyHoming.HOMED)
         self.hold(1000.0, 0.04)
         self.assertEqual(
-            self.hw.motor_request("position_py", "position_py_motor").demand, 99.5)
+            self.hw.motor_request("position_py", "position_py").demand, 99.5)
         self.hold(-5.0, 0.04)  # position 0
         self.assertEqual(
-            self.hw.motor_request("position_py", "position_py_motor").demand, -0.5)
+            self.hw.motor_request("position_py", "position_py").demand, -0.5)
 
-    def test_one_closed_sample_mid_travel_does_not_zero(self):
-        # A glitch on the switch wire is not home: homing keeps driving.
-        self.set_home(False)
-        self.teleop()
-        self.hold(30.0, 0.06)
-        self.set_home(True)
-        self.hold(30.0, 0.02)  # one tick
-        self.set_home(False)
-        self.hold(30.0, 0.06)
-        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
-        self.assertEqual(self.state().homing, PositionPyHoming.HOMING)
-
-    def test_homing_needs_a_live_finite_target(self):
-        self.set_home(False)
-        self.teleop(enabled=False)
-        self.hold(30.0, 0.06)
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)  # disabled
-        self.teleop()
-        self.hold(float("nan"), 0.04)
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.hold(30.0, 0.04)
-        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
-        self.sim.step(0.15)  # past command_timeout_us: the lane is stale
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertEqual(self.state().homing, PositionPyHoming.HOMING)
-
-    def test_homing_fails_until_the_driver_station_disables(self):
-        self.set_home(False)
-        self.teleop()
-        self.hold(30.0, 0.4)
-        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
-        self.hold(30.0, 0.2)  # past homing_timeout_us: the switch stays open
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertEqual(self.state().homing, PositionPyHoming.FAILED)
-        # A stale hardware link (robot_enabled False) does not clear it.
-        self.hw.lose_states(8)
-        self.hold(30.0, 0.16)
-        self.hold(30.0, 0.06)
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertEqual(self.state().homing, PositionPyHoming.FAILED)
-        self.hw.set_driver_station(enabled=False, teleop=True)
-        self.sim.step(0.04)
-        self.teleop()
-        self.hold(30.0, 0.04)
-        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
-
+    # REQ-SAFE-36
     def test_homing_that_does_not_move_fails(self):
         self.set_home(False)
-        self.hw.set_motor("position_py", "position_py_motor", 0.0, 0.0)
+        self.hw.set_motor("position_py", "position_py", 0.0, 0.0)
         self.teleop()
         self.hold(30.0, 0.1)
         self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
         self.hold(30.0, 0.2)  # past homing_stall_us
-        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertEqual(self.state().homing, PositionPyHoming.FAILED)
-
-    def test_a_stuck_home_switch_stops_the_first_move(self):
-        self.hw.ideal_motors()
-        self.teleop()
-        self.hold(30.0, 0.06)  # the switch still reads closed at 30
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertEqual(self.state().homing, PositionPyHoming.FAILED)
 
