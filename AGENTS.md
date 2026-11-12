@@ -38,7 +38,8 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
   `clang-tidy-18` (repo `.clang-format` / `.clang-tidy`; tests included; a
   changed header is analyzed through sources that include it), and
   `buildifier --mode=check --lint=warn` on changed BUILD, `.bzl` and
-  `MODULE.bazel` files. Match them. What CI runs where:
+  `MODULE.bazel` files. Match them (`tools/format.sh`, `tools/tidy.sh` run the
+  CI versions locally). What CI runs where:
   `docs/TESTING.md` §9.
 
 ## Run in simulation

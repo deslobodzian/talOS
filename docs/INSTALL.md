@@ -29,14 +29,26 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | JDK 17 | RoboRIO Gradle project, `./sim.sh` WPILib sim | package (OpenJDK) | `brew install --cask temurin@17` | in WSL |
 | Node 22 + pnpm 9.15.9 (corepack) | Studio dev loop outside Bazel | package | brew | in WSL |
 | `flatc` | none: `pnpm generate` runs Bazel's pinned `@flatbuffers//:flatc` (same as the `//studio:telemetry_ts` genrule) | – | – | run `pnpm generate` in WSL |
-| clang-format-18, clang-tidy-18, buildifier | lint | package / GitHub release (sha256-verified) | brew (`llvm@18`, `buildifier`) | in WSL |
+| clang-format 18, clang-tidy 18 | lint (`tools/format.sh`, `tools/tidy.sh`) | PyPI wheels `==18.1.8` in a private venv under `~/.cache/talos/clang-18` (via `uv` if present, else `python3 -m venv`); no system package | same | in WSL |
+| buildifier | lint | GitHub release (sha256-verified) | brew | in WSL |
 | WPILib 2026 | Glass, AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
 
-CI uses clang-format/clang-tidy 18 and buildifier 8.2.1. Homebrew buildifier and
-the distribution LLVM on Arch/Fedora may differ; setup warns about these.
-For clang-format 18, use the pinned wheel:
-`python3 -m venv ~/.local/share/clang-format-18 && ~/.local/share/clang-format-18/bin/pip install clang-format==18.1.8`,
-then format with `~/.local/share/clang-format-18/bin/clang-format -i <files>`.
+CI uses clang-format/clang-tidy 18 and buildifier 8.2.1. `tools/setup.sh`
+installs the 18.1.8 wheels, which are the same upstream release line as CI's
+`clang-{format,tidy}-18` packages and need no system LLVM. Before committing:
+
+```sh
+tools/format.sh --check    # or --fix; changed C/C++ files vs the merge base with origin/main
+tools/tidy.sh              # clang-tidy over the files CI would analyze (commit first)
+```
+
+Both take `--base <ref>` and `--all`. `tools/tidy.sh` runs CI's own selection
+script, and needs `compile_commands.json` (it runs
+`bazel run @hedron_compile_commands//:refresh_all` when missing, or with
+`--refresh`) and the generated headers from a prior `bazel build` of the
+touched packages. It exits 3 when bazel is unavailable to make the database.
+Homebrew buildifier and the distribution's buildifier may differ from 8.2.1;
+setup warns about this.
 
 ## Flags
 
@@ -46,7 +58,7 @@ then format with `~/.local/share/clang-format-18/bin/clang-format -i <files>`.
 | `--yes` | non-interactive: answers prompts (incl. Homebrew install on macOS), passes `-y`/`--noconfirm` to package managers |
 | `--no-studio` | skip Node 22/pnpm |
 | `--no-rio` | skip JDK 17 and `./gradlew installRoboRioToolchain` |
-| `--no-lint` | skip clang-format-18, clang-tidy-18, buildifier |
+| `--no-lint` | skip clang-format/clang-tidy 18 wheels, buildifier |
 | `--verify` | build the launcher, `//talOS/bridge:hardware_node` and every node the 2026 config names, then run `--describe-only` on it |
 | `-h`, `--help` | usage |
 
