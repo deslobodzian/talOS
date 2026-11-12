@@ -736,8 +736,18 @@ std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
 
 void Launcher::InstallSignals() {
   stop_requested_ = 0;
-  std::signal(SIGINT, [](int) { stop_requested_ = 1; });
-  std::signal(SIGTERM, [](int) { stop_requested_ = 1; });
+  struct sigaction stop {};
+  stop.sa_handler = [](int) { stop_requested_ = 1; };
+  sigemptyset(&stop.sa_mask);
+  stop.sa_flags = SA_RESTART;
+  ::sigaction(SIGINT, &stop, nullptr);
+  ::sigaction(SIGTERM, &stop, nullptr);
+  // A hangup is a stop too, unless the launcher started with it ignored
+  // (`nohup`): Run changes no disposition but SIGPIPE's before this.
+  struct sigaction hangup {};
+  if (::sigaction(SIGHUP, nullptr, &hangup) == 0 &&
+      hangup.sa_handler != SIG_IGN)
+    ::sigaction(SIGHUP, &stop, nullptr);
 }
 
 pid_t Launcher::SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch,
