@@ -629,7 +629,15 @@ void LogWriter::State::start_writer() {
         }
         continue;
       }
-      if (raw->stopping) {
+      if (raw->options.before_stop_check) {
+        raw->options.before_stop_check(raw->stopping);
+      }
+      if (raw->stopping.load(std::memory_order_seq_cst)) {
+        // The owner hands over its last chunk before it sets stopping
+        // (~State: submit_active, then stop_writer), so a hand-off this
+        // pass's read of `submitted` missed is visible now: write it on
+        // another pass rather than return without it.
+        if (raw->submitted.load(std::memory_order_seq_cst) != next) continue;
         return;
       }
 
