@@ -932,7 +932,11 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
 identity and source revision, node exits/restarts/quarantine/recorder
-failures/caps, each node's loop tier and realtime outcome, each node's binary
+failures/caps, each node's loop tier and realtime outcome, each node's
+delivery loss (its nonzero `wake_failures`, `stalled_arms`, `wake_fallbacks`
+and `requests_skipped`, the registry row's counts summed over its runs as
+the manifest's per-node fields of those names carry them, or NOT RECORDED
+without them; [wake loss](../introspection/README.md#wake-loss)), each node's binary
 digest and runs with the reason each ended
 ([session manifest](#session-manifest)), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
@@ -979,7 +983,11 @@ and with every bridge and control loop holding its full realtime grant. Off
 `--sim` a `partial`, `refused` or `not_requested` outcome fails; under `--sim`
 only a loop that asked (`TALOS_REALTIME=1`) and was refused a step does.
 Observers, nodes that never reported, and manifests that predate the fields
-(*NOT RECORDED*) are listed but not judged.
+(*NOT RECORDED*) are listed but not judged. It also fails on any node's
+nonzero `wake_failures` (a reader left asleep until its backstop) or
+`requests_skipped` (a request its subsystem never merged); `stalled_arms`
+and `wake_fallbacks` are shown but lose nothing published, and a manifest
+without the fields is not judged.
 It names each reason on stderr. It exits 1 for input/reader errors (including a missing `log_dump`
 runfile) and 0 otherwise. NOT MEASURED is never a pass; only the timer
 lateness and bridge request-to-command rows are informational and not

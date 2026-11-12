@@ -240,6 +240,32 @@ class SessionReportTest(unittest.TestCase):
             node("shooter", "control", "not_requested"),
             node("hardware_node", "bridge", "refused", "policy")]}), {"hardware_node"})
 
+    # REQ-OPS-16, REQ-RT-19, REQ-RT-20 (TODO.md RT-7): a wake a writer lost
+    # left a reader asleep until its backstop, and a request the bridge
+    # passed over is one its subsystem never merged; either rejects the
+    # session. The registry row's counts, as the launcher records them.
+    def test_strict_rejects_a_lost_wake_or_a_skipped_request(self):
+        def report(**counters):
+            node = {"name": "drivetrain", "log_path": "/s/drivetrain.tlog", **counters}
+            return session_report.analyze({"end_wall_ns": 1, "nodes": [node]}, [])
+        def failing(**counters):
+            result = report(**counters)
+            failures = session_report.strict_failures(result)
+            return [issue for issue in result["delivery_issues"] if issue in failures]
+        clean = dict(wake_failures=0, stalled_arms=0, wake_fallbacks=0, requests_skipped=0)
+        self.assertEqual(failing(**clean), [])
+        self.assertEqual(len(failing(**{**clean, "wake_failures": 3})), 1)
+        self.assertEqual(len(failing(**{**clean, "requests_skipped": 2})), 1)
+        # Shown, but not a loss of anything published: a stalled arm still
+        # waits on its backstop, and a fallback polls.
+        self.assertEqual(failing(**{**clean, "stalled_arms": 1, "wake_fallbacks": 1}), [])
+        self.assertEqual(report(**{**clean, "stalled_arms": 1, "wake_fallbacks": 1})
+                         ["nodes"][0]["delivery"], "stalled_arms=1, wake_fallbacks=1")
+        self.assertEqual(report(**clean)["nodes"][0]["delivery"], "none")
+        # A manifest that predates the counts is not judged.
+        self.assertEqual(report()["nodes"][0]["delivery"], "NOT RECORDED")
+        self.assertEqual(failing(), [])
+
     def test_missing_log_dump_is_an_input_error(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(session_report.runfiles, "Create", return_value=None), \

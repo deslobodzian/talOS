@@ -96,6 +96,32 @@ def realtime_issue(node, simulation):
             + realtime_summary(node))
 
 
+# What each node's registry row says it lost (talOS/introspection README
+# "Wake loss"), as the launcher records it per node, summed over its runs:
+# each should stay 0. NOT RECORDED in a manifest that predates the counts.
+DELIVERY_COUNTERS = ("wake_failures", "stalled_arms", "wake_fallbacks", "requests_skipped")
+# The counts --strict rejects: a wake notification a writer could not send
+# left its reader asleep until its backstop, and a request the bridge's
+# latest-value read passed over is one its subsystem never merged. A stalled
+# arm still waits on its backstop and a fallback polls, so those two are
+# shown but lose nothing published.
+STRICT_DELIVERY = ("wake_failures", "requests_skipped")
+
+
+def delivery_summary(node):
+    """A node's nonzero delivery counters, "none", or NOT RECORDED."""
+    if not any(key in node for key in DELIVERY_COUNTERS):
+        return "NOT RECORDED"
+    return ", ".join(f"{key}={node[key]}" for key in DELIVERY_COUNTERS
+                     if node.get(key)) or "none"
+
+
+def delivery_issues(node):
+    """Why a node's run lost published input, one line per nonzero count."""
+    return [f"{node.get('name')}: {key} = {node[key]}"
+            for key in STRICT_DELIVERY if node.get(key)]
+
+
 def request_to_command(records):
     """The event-driven bridge's reaction to requests (REQ-RT-20), as
     (process, delays): for each observation (boot_id, observed_time_us) a
@@ -237,6 +263,7 @@ def analyze(manifest, records, log_damage=()):
     simulation = bool(manifest.get("simulation"))
     realtime_issues = [issue for issue in (realtime_issue(n, simulation)
                                            for n in manifest["nodes"]) if issue]
+    delivery = [issue for n in manifest["nodes"] for issue in delivery_issues(n)]
     # Bridge and control loops --sim excuses: they never asked for realtime.
     realtime_exempt = [n.get("name") for n in manifest["nodes"] if simulation
                        and n.get("loop_tier") in ACTUATION_TIERS
@@ -252,7 +279,8 @@ def analyze(manifest, records, log_damage=()):
                        **{k: n.get(k) for k in ("quarantined", "recorder_failed", "log_capped")},
                        # Older manifests lack both (NOT RECORDED).
                        "loop_tier": n.get("loop_tier") or "—",
-                       "realtime": realtime_summary(n)}
+                       "realtime": realtime_summary(n),
+                       "delivery": delivery_summary(n)}
                       for n in manifest["nodes"]],
             # Every run and why it ended (launcher README "Session manifest");
             # absent in manifests written before the launcher recorded runs.
@@ -263,6 +291,7 @@ def analyze(manifest, records, log_damage=()):
             "session_issues": issues,
             "realtime_issues": realtime_issues,
             "realtime_exempt": realtime_exempt,
+            "delivery_issues": delivery,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
@@ -282,7 +311,7 @@ def strict_failures(report):
     """Reasons a --strict run rejects the session; empty means acceptance."""
     return [f"{v['measurement']}: {v['verdict']}" for v in report["verdicts"]
             if v["required"] and v["verdict"] != "PASS"] + report["session_issues"] \
-        + report["realtime_issues"]
+        + report["realtime_issues"] + report["delivery_issues"]
 
 
 def markdown(report):
@@ -290,8 +319,8 @@ def markdown(report):
              f"Config SHA-256: {report['config_sha256']}",
              f"Source revision: {report['git_revision']}", "", "## Nodes",
              "| Node | Restarts | Exit code | Exit signal | quarantined | recorder_failed | log_capped "
-             "| Loop tier | Realtime |",
-             "|---|---:|---:|---:|---|---|---|---|---|"]
+             "| Loop tier | Realtime | Delivery loss |",
+             "|---|---:|---:|---:|---|---|---|---|---|---|"]
     for n in report["nodes"]:
         lines.append("| " + " | ".join(str(n[k]) for k in n) + " |")
     lines += ["", "## Runs", "| Node | Binary SHA-256 | Run | PID | Seconds | Exit code | Exit signal | Reason |",
@@ -317,6 +346,9 @@ def markdown(report):
     if report["realtime_exempt"]:
         lines.append("- not judged (--sim, realtime never requested): "
                      + ", ".join(report["realtime_exempt"]))
+    lines += ["", "## Delivery loss"] + (
+        ["- " + s for s in report["delivery_issues"]] or
+        ["- no node recorded a lost wake or a skipped request"])
     lines += ["", "## Timing (ms)", f"State stream: {report['state_stream'] or 'NOT MEASURED'}",
               "| Measurement | Count | Median | p99 | Max |", "|---|---:|---:|---:|---:|"]
     entries = {"/hw/state overall": report["state_overall"],
