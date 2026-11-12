@@ -766,9 +766,9 @@ launch. They go only when the filesystem holding the log root (`statvfs`)
 has less free than the free floor once those limits are met: then sessions
 continue in the same order, protected last, each removal counted as freeing
 its bytes, until the floor is free. The floor is `log_max_bytes` plus
-64 MiB per roster member: the new session's event-log half, an output log
-of 64 MiB per member, and the other half for its camera frames and
-metadata. The launcher reads no node's parameters, so a session whose frame
+64 MiB per roster member plus 64 MiB: the new session's event-log half, an
+output log of 64 MiB per member and `talos.log`'s 64 MiB, and the other
+half for its camera frames and metadata. The launcher reads no node's parameters, so a session whose frame
 recording (each camera's `[recording] max_bytes`, summed) exceeds half of
 `log_max_bytes` is not covered by the floor.
 
