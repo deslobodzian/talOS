@@ -604,6 +604,23 @@ cc_test(
     ],
 )
 
+# The launcher binary SIGKILLed under a live roster of shell stubs: every
+# member's process group, grandchildren included, dies with it (REQ-SAFE-30).
+cc_test(
+    name = "launcher_death_test",
+    size = "small",
+    srcs = ["launcher_death_test.cc"],
+    data = [":launcher"],
+    env = {"TALOS_LAUNCHER": "$(rlocationpath :launcher)"},
+    tags = ["integration"],
+    deps = [
+        "//talOS/introspection:describe",
+        "//talOS/introspection:registry",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 # Prints the signals it started with ignored or blocked.
 cc_binary(
     name = "signal_probe",
