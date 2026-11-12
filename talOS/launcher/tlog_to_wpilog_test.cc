@@ -26,6 +26,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -39,6 +40,8 @@
 #include "talOS/schema/identity.h"
 #include "wpilog_test/wpilog_message_descriptor.h"
 #include "wpilog_test/wpilog_message_generated.h"
+
+extern char** environ;  // POSIX; <unistd.h> declares it only on some hosts
 
 namespace {
 
@@ -366,10 +369,32 @@ class TlogToWpilogTest : public testing::Test {
 
   // Runs the converter. With `file_size_bytes`, a write past that size
   // fails (RLIMIT_FSIZE, SIGXFSZ ignored): a disk that fills mid-write.
+  // The limit binds every file the process writes, and ThreadSanitizer's
+  // runtime writes one at startup: a 512 KiB file in $TMPDIR (else
+  // $TEST_TMPDIR, else /tmp) that it maps as read-only data's shadow
+  // without checking the write's length, so a cut file faults (SIGBUS) on
+  // the first read of a string literal. Under the limit TMPDIR names a
+  // directory that does not exist, where the runtime skips that file; the
+  // converter itself reads no TMPDIR.
   Result Run(std::vector<std::string> args,
              std::optional<rlim_t> file_size_bytes = std::nullopt) {
     args.insert(args.begin(), binary_);
     const std::string output = root_ + "/output.txt";
+    std::vector<std::string> environment;
+    for (char** variable = environ; *variable != nullptr; ++variable) {
+      if (!std::string_view{*variable}.starts_with("TMPDIR=")) {
+        environment.emplace_back(*variable);
+      }
+    }
+    if (file_size_bytes) environment.push_back("TMPDIR=" + root_ + "/absent");
+    std::vector<char*> envp;
+    envp.reserve(environment.size() + 1);
+    for (auto& variable : environment) envp.push_back(variable.data());
+    envp.push_back(nullptr);
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (auto& arg : args) argv.push_back(arg.data());
+    argv.push_back(nullptr);
     const pid_t child = fork();
     if (child == 0) {
       if (freopen(output.c_str(), "w", stdout) == nullptr ||
@@ -383,11 +408,7 @@ class TlogToWpilogTest : public testing::Test {
           _exit(125);
         }
       }
-      std::vector<char*> argv;
-      argv.reserve(args.size() + 1);
-      for (auto& arg : args) argv.push_back(arg.data());
-      argv.push_back(nullptr);
-      execv(binary_.c_str(), argv.data());
+      execve(binary_.c_str(), argv.data(), envp.data());
       _exit(127);
     }
     if (child < 0) throw std::runtime_error("fork failed");
