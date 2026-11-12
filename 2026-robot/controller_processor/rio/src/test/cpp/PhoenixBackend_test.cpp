@@ -972,6 +972,7 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 // until a read shows its bit: the reads that PumpReads gates on fresh motion
 // feedback say nothing of the separate 50 Hz FaultField, and one that finds
 // it 50 ms old reports no limit by this same rule.
+// REQ-CONTRACT-32
 TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
   enum class Row { kForwardHardLimit, kStatorLimiter, kBootFault };
   // FaultField bit 4, BootDuringEnable: a fault (hw::MotorFaulted).

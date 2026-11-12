@@ -224,7 +224,7 @@ TEST(SimFollowers, IdealMirrorsPositionVelocityAndNeutralInEitherOrder) {
 // rotations (CANcoderAbsoluteRot); the ideal backend's CANcoder, which
 // mirrors its motor's position, wraps the same way, so an absolute-homing
 // node under sim_gateway sees the reading the robot gives.
-// REQ-DEV-07
+// REQ-DEV-05
 TEST(SimBackend, CancoderReadsItsAbsolutePositionWrapped) {
   auto cfg = SingleMotorConfig();
   cfg.sensors.push_back({2, "angle", SensorKind::kCANcoder, 2, "rio"});
@@ -321,7 +321,7 @@ TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
 // so it reads the stall current of its applied volts, as a mechanism pushed
 // into a stop does: stall homing (PositionMechanism) relies on it. The
 // current is taken after the limit stops the rotor, not before.
-// REQ-DEV-07
+// REQ-DEV-10
 TEST(SimMotorDiagnostics, MotorHeldAtASoftLimitReadsStalled) {
   auto cfg = SingleMotorConfig();
   cfg.motors[0].soft_limits = true;
@@ -345,7 +345,7 @@ TEST(SimMotorDiagnostics, MotorHeldAtASoftLimitReadsStalled) {
 // backend with every motor a Kraken X60. Each motor keeps the type of the
 // motor of the same name in sim_gateway's own parse: after such a push, a
 // Kraken X44 still stalls at the X44's current.
-// REQ-DEV-07
+// REQ-DEV-10
 TEST(SimMotorDiagnostics, PushedConfigKeepsTheLocalMotorType) {
   auto local = SingleMotorConfig();  // 80 A stator limit: 1 V stays under it
   local.motors[0].motor_type.value = MotorType::kKrakenX44;
