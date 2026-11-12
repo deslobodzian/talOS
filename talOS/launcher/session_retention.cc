@@ -105,7 +105,7 @@ Seen ScanLog(const std::string& path) {
 
 }  // namespace
 
-SessionFacts InspectSession(const fs::path& dir) {
+SessionFacts InspectSession(const fs::path& dir, ClassCache cache) {
   SessionFacts facts;
   std::error_code error;
   if (!fs::is_regular_file(dir / "manifest.json", error)) return facts;
@@ -121,7 +121,7 @@ SessionFacts InspectSession(const fs::path& dir) {
   const std::string_view end_ns = JsonValue(manifest, "end_wall_ns");
   facts.finished = !end_ns.empty() && end_ns != "0";
   if (JsonValue(manifest, "simulation") != "true")
-    facts.verdict = RecordedMatch(dir);
+    facts.verdict = RecordedMatch(dir, cache);
   return facts;
 }
 
@@ -135,7 +135,7 @@ std::optional<bool> SessionSimulation(const fs::path& dir) {
   return std::nullopt;
 }
 
-MatchVerdict RecordedMatch(const fs::path& dir) {
+MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {
   struct Log {
     std::string path;
     std::uintmax_t bytes;
@@ -200,6 +200,7 @@ MatchVerdict RecordedMatch(const fs::path& dir) {
                                : seen == Seen::kUnreadable
                                    ? MatchVerdict::kUnknown
                                    : MatchVerdict::kOther;
+  if (cache_mode == ClassCache::kReadOnly) return verdict;
   // A cache that cannot be written costs a rescan at the next launch.
   std::ofstream out{cache};
   switch (verdict) {

@@ -34,6 +34,11 @@ enum class MatchVerdict : std::uint8_t {
   kUnknown,  // A log that may hold the answer cannot be read by this build.
 };
 
+// Whether RecordedMatch may write its verdict to kSessionClassFile. A
+// reader of a library it does not own (studio_review, which may serve a
+// read-only copy) reads a cached verdict but never writes one.
+enum class ClassCache : std::uint8_t { kReadWrite, kReadOnly };
+
 struct SessionFacts {
   // The manifest's start_wall_ns: the session's age key. 0 when the
   // directory holds no manifest.json or it records none (replay output, a
@@ -49,7 +54,8 @@ struct SessionFacts {
 // Reads `dir`'s manifest.json and, for a launch that was not a simulation,
 // RecordedMatch. Never throws; a manifest that cannot be read reads as
 // absent.
-SessionFacts InspectSession(const std::filesystem::path& dir);
+SessionFacts InspectSession(const std::filesystem::path& dir,
+                            ClassCache cache = ClassCache::kReadWrite);
 
 // Whether the session in `dir` was launched with --sim, as its manifest.json
 // records; nullopt when it holds no readable manifest that says. Never
@@ -65,8 +71,10 @@ std::optional<bool> SessionSimulation(const std::filesystem::path& dir);
 // decode. The verdict is cached in kSessionClassFile and read before any log
 // is opened: a match for good, kOther until the session's event log bytes
 // change, kUnknown until they change or this build's reader (log format,
-// Packet size, Driver Station codec) differs. Never throws.
-MatchVerdict RecordedMatch(const std::filesystem::path& dir);
+// Packet size, Driver Station codec) differs; with ClassCache::kReadOnly it
+// is read but never written. Never throws.
+MatchVerdict RecordedMatch(const std::filesystem::path& dir,
+                           ClassCache cache = ClassCache::kReadWrite);
 
 // The bytes an unprivileged writer may still use on the filesystem holding
 // `path` (statvfs: f_bavail * f_frsize), or nullopt when it cannot be read.

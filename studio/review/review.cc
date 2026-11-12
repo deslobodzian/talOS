@@ -141,7 +141,6 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
       }
     }
   }
-  entry.verdict = ClassName(talos::launcher::InspectSession(dir).verdict);
   return entry;
 }
 
@@ -232,15 +231,28 @@ const Session* Review::Open(std::string_view id, Response& error) {
   }
 }
 
-Response Review::Sessions() const {
+Response Review::Sessions() {
   std::vector<SessionEntry> entries;
   std::error_code error;
   for (fs::directory_iterator it{library_, error};
        !error && it != fs::directory_iterator{}; it.increment(error)) {
     std::error_code type_error;
     if (!it->is_directory(type_error) || it->is_symlink(type_error)) continue;
-    if (auto entry = ReadEntry(it->path()))
-      entries.push_back(std::move(*entry));
+    auto entry = ReadEntry(it->path());
+    if (!entry) continue;
+    // Classified read-only (the library is not ours to write, and may be
+    // read-only), so remembered here until the session's files change size.
+    std::uintmax_t bytes = 0;
+    for (const auto& file : entry->files) bytes += file.second;
+    auto& known = classes_[entry->id];
+    if (known.first != bytes || known.second.empty()) {
+      known = {bytes,
+               ClassName(talos::launcher::InspectSession(
+                             it->path(), talos::launcher::ClassCache::kReadOnly)
+                             .verdict)};
+    }
+    entry->verdict = known.second;
+    entries.push_back(std::move(*entry));
   }
   std::sort(entries.begin(), entries.end(),
             [](const SessionEntry& a, const SessionEntry& b) {
