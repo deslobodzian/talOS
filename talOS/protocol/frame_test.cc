@@ -36,6 +36,7 @@ TEST(FrameTest, RoundTripsHeaderAndMaximumPayload) {
 
 // The header layout the RoboRIO and the companion agree on, byte for byte,
 // whatever either host's byte order.
+// REQ-CONTRACT-03
 TEST(FrameTest, HeaderIsLittleEndianOnTheWire) {
   std::array<uint8_t, kMaxFrameSize> frame{};
   const std::size_t size = EncodeFrame(
@@ -89,6 +90,7 @@ TEST(FrameTest, EncodesInPlaceAroundThePayloadAndZeroesReserved) {
   EXPECT_DOUBLE_EQ(decoded_value, 4.75);
 }
 
+// REQ-CONTRACT-01
 TEST(FrameTest, RejectsPreviousProtocolVersion) {
   std::array<uint8_t, kMaxFrameSize> frame{};
   const auto size = EncodeFrame(FrameType::kHardwareState, kFlagNone, 1, 2,

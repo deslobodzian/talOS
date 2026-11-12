@@ -718,6 +718,7 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (1, 0))
                 self.assertAlmostEqual(self.pose()[0], chassis.x, delta=1e-3)
 
+    # REQ-CONTRACT-26
     def test_bad_observations_are_rejected_and_leave_the_pose_alone(self):
         nan, inf = math.nan, math.inf
         cases = [
@@ -775,6 +776,7 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (0, 1))
                 self.assertEqual(self.pose(), (0.0, 0.0, 0.0))
 
+    # REQ-CONTRACT-26
     def test_stale_drivetrain_input_is_invalid_and_holds_the_pose(self):
         for backend in BACKENDS:
             with self.subTest(backend):

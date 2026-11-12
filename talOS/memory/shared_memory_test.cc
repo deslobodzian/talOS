@@ -139,6 +139,7 @@ TEST(SharedMemory, SecondMappingAttachesAndNeitherUnlinksTheName) {
 
 // Every talOS topic has two or three segments, so this mapping is on the path
 // of every topic in the robot rather than being an edge case.
+// REQ-CONTRACT-22
 TEST(ShmObjectNameTest, ProducesAPortablePosixName) {
   for (const auto* topic : {"/hw/state", "/hw/state/driver_station",
                             "/drivetrain/target/teleop", "/talos/telemetry"}) {
@@ -176,6 +177,7 @@ TEST(ShmObjectNameTest, IsInjectiveOverTheTopicGrammar) {
             ShmObjectName("/operator/interface/state", ""));
 }
 
+// REQ-CONTRACT-22
 TEST(ShmObjectNameTest, NamespacesAreStableIsolatedAndIdempotent) {
   const auto first = ShmObjectName("/hw/state", "run-a");
   const auto second = ShmObjectName("/hw/state", "run-b");

@@ -32,6 +32,7 @@ def _reported(stderr):
 
 
 class FieldNameLintTest(unittest.TestCase):
+    # REQ-CONTRACT-08
     def test_unsuffixed_numbers_fail_and_exempt_kinds_pass(self):
         result = _lint("TALOS_LINT_BAD", "//lint_test/bad.fbs")
         self.assertEqual(result.returncode, 1, result.stderr)

@@ -447,6 +447,7 @@ TEST(Driver, FreshHeadingCannotArmAStartupHeldFieldRelativeStick) {
   EXPECT_DOUBLE_EQ(harness.chassis().omega_radps(), 3.0);
 }
 
+// REQ-SAFE-14
 TEST(Driver, HeldStickDoesNotResumeAfterDsLossOrDisable) {
   Harness harness{kNoDeadbandRobotRelative};
   for (const bool stale : {false, true}) {
@@ -467,6 +468,7 @@ TEST(Driver, HeldStickDoesNotResumeAfterDsLossOrDisable) {
   }
 }
 
+// REQ-SAFE-14
 TEST(Driver, OwnEvaluationGapRequiresNeutralWithoutObservingStaleDs) {
   // No periodic update runs in this gap. The next evaluation receives a
   // fresh DS packet, just as a suspended process would on resumption.

@@ -422,6 +422,7 @@ TEST(VisionTest, FullDelayedQueueDropsAndCountsOnlyItsOldestCapture) {
   }
 }
 
+// REQ-CONTRACT-27
 TEST(VisionTest, LatencyOffsetUnderflowPublishesInvalid) {
   auto sim = MakeSim(false, true, "latency_offset_us = 40000\n");
   sim.add<Vision>("rear_right_camera");
@@ -1016,6 +1017,7 @@ TEST(VisionTest, InvalidDetectionsDoNotCountAsVisibleOrRangeRejected) {
   EXPECT_EQ(detections.capacity(), capacity);
 }
 
+// REQ-CONTRACT-12, REQ-CONTRACT-27
 TEST(VisionBinary, DescribeDoesNotOpenLiveCameraAndSimulationReplays) {
   auto run = [](const std::string& arguments,
                 const std::string& config = Runfile("TALOS_TEST_CONFIG")) {

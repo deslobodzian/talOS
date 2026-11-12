@@ -62,6 +62,7 @@ std::set<std::string> Entries(const std::vector<Probe>& probes,
   return out;
 }
 
+// REQ-CONTRACT-08
 TEST(TopicGrammar, StarlarkAgreesWithCheckTopicName) {
   const std::vector<Probe> probes = ReadProbes();
   int accepted = 0;

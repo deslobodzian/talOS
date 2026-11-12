@@ -24,6 +24,7 @@ def _variant(name):
 
 
 class ParityTest(unittest.TestCase):
+    # REQ-CONTRACT-07
     def test_python_hash_equals_the_generated_cpp_hash(self):
         # Inner: an enum field; Mixed: mixed alignment and a nested struct;
         # Arrays: arrays of scalars, enums and structs.
@@ -51,6 +52,7 @@ class ParityTest(unittest.TestCase):
 class VariantTest(unittest.TestCase):
     NAMES = ("schema_variant.Reading", "schema_variant.Holder")
 
+    # REQ-CONTRACT-07
     def test_comments_and_formatting_do_not_change_it(self):
         base = _variant("float_level")
         reformatted = _variant("float_level_reformatted")

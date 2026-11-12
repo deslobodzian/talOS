@@ -646,6 +646,7 @@ exclude = ["budget/state/*/offset_m"]
 // The channel cap is exact: a dictionary of kMaxChannels constructs, one more
 // is refused naming the largest source (a keyframe of it could not fit the
 // Studio bridge's burst, so no client could ever be sent one whole).
+// REQ-CONTRACT-28
 TEST(TelemetryTest, ChannelCapAdmitsExactlyMaxChannels) {
   const auto config = [](std::string_view exclude) {
     return std::string{R"(

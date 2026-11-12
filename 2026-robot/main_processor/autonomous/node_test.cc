@@ -206,6 +206,7 @@ class AutonomousPhaseTest
     : public AutonomousTest,
       public ::testing::WithParamInterface<autonomous::Phase> {};
 
+// REQ-SAFE-31
 TEST_F(AutonomousTest, RestartIntoEnabledAutoIsInhibitedUntilRearmed) {
   // A fresh process cannot know whether a prior routine already fired.
   talos::testing::Sim restarted{Runfile("TALOS_TEST_CONFIG")};
@@ -306,6 +307,7 @@ TEST_F(AutonomousTest, DriverStationOutageDoesNotCountReleasedFeedTime) {
   EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
 }
 
+// REQ-SAFE-33
 TEST_P(AutonomousPhaseTest, ReenableInSameMatchResumesStepWithoutRefiring) {
   ReachPhase(GetParam());
   const auto generation = talos::testing::DriverStationGeneration(sim);
@@ -543,6 +545,7 @@ INSTANTIATE_TEST_SUITE_P(
 class AutonomousPoseTest : public AutonomousTest,
                            public ::testing::WithParamInterface<bool> {};
 
+// REQ-SAFE-34
 TEST_P(AutonomousPoseTest, UnusablePosePausesTrajectoryUntilRecovery) {
   StartDrive();
   const auto before = Drive();
@@ -668,6 +671,7 @@ TEST_F(AutonomousTest, UnreachableWaypointAbortsAtDriveDeadline) {
   ExpectReleased();
 }
 
+// REQ-SAFE-34
 TEST_F(AutonomousTest, PoseOutageDoesNotExtendDriveDeadline) {
   StartDrive();
   sim.step(10s);
@@ -989,6 +993,7 @@ class AutonomousRestartTest
     : public ::testing::WithParamInterface<autonomous::Phase>,
       public ::testing::Test {};
 
+// REQ-SAFE-31, REQ-SAFE-33
 TEST_P(AutonomousRestartTest, RestartInSameMatchResumesWithoutRefiring) {
   const bool drive = GetParam() == autonomous::Phase::DRIVE;
   const auto output = OutputDir(drive ? "restart-drive" : "restart-feed");
@@ -1023,6 +1028,7 @@ INSTANTIATE_TEST_SUITE_P(Steps, AutonomousRestartTest,
                          ::testing::Values(autonomous::Phase::FEED,
                                            autonomous::Phase::DRIVE));
 
+// REQ-SAFE-33
 TEST(AutonomousRestart, CorruptRecordHoldsUntilANewMatch) {
   const auto output = OutputDir("restart-corrupt");
   DamageProgress([](ProgressFile& file) {

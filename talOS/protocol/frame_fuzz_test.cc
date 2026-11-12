@@ -39,6 +39,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, std::size_t size) {
 }
 
 #ifndef TALOS_LIBFUZZER
+// REQ-CONTRACT-01
 TEST(FrameFuzzTest, BoundedMutations) {
   using namespace talos::protocol;
   std::array<uint8_t, kMaxPayloadSize> payload{};

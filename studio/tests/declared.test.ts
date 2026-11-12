@@ -32,6 +32,7 @@ const fixture = readFileSync(new URL('./launcher_graph.json', import.meta.url), 
 const faults =
     readFileSync(new URL('./launcher_graph_faults.json', import.meta.url), 'utf8');
 
+// REQ-CONTRACT-29
 test('the parser accepts what the launcher actually writes', () => {
   const graph = parseDeclaredGraph(fixture);
 

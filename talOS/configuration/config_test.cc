@@ -35,6 +35,7 @@ TEST(ConfigTest, RejectsNonBooleanCriticalFlag) {
   }
 }
 
+// REQ-CONTRACT-17
 TEST(ConfigTest, RejectsMalformedStructuralTablesAndUnknownMotorKeys) {
   for (const auto* text :
        {"robot = 1\n[subsystems.test]\n", "[subsystems]\ntest = 1\n"}) {
@@ -249,6 +250,7 @@ TEST(ConfigTest, ActuatorOwnerPeriodIsAtMostAQuarterOfTheCommandTimeout) {
             std::string{kMotor}));
 }
 
+// REQ-CONTRACT-17
 TEST(ConfigTest, ControllerAddressOverridesAndRejectsInvalidEndpoints) {
   const auto config = Parse(R"(
 [robot]
@@ -377,6 +379,7 @@ TEST_F(ManifestTest, RejectsUnknownDeviceKeysInDefaults) {
 
 // `[target]` for `[targets]` would otherwise parse as a node parameter and
 // leave the subsystem on the default target policy.
+// REQ-CONTRACT-10
 TEST_F(ManifestTest, RefusesASingularSectionNamingTheKeyAndFile) {
   Write("robot.toml",
         "[[subsystems]]\nname = \"arm\"\npath = \"subsystems/arm.toml\"\n");
