@@ -3,9 +3,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <utility>
 #include <vector>
 
@@ -13,6 +15,7 @@
 #include "talOS/mechanisms/position_mechanism.h"
 #include "talOS/mechanisms/roller_with_sensor.h"
 #include "talOS/mechanisms/velocity_mechanism.h"
+#include "talOS/node/access.h"
 #include "talOS/node/node.h"
 #include "talOS/node_api/internal.h"
 #include "talOS/node_api/node_api.h"
@@ -96,14 +99,17 @@ std::int64_t Open(TalosNode* node, const char* name) {
   return static_cast<std::int64_t>(list.size() - 1);
 }
 
+// A lookup: it never adds the Mechanisms extension to a node without one.
 template <class M>
 M& Get(TalosNode* node, std::int64_t index) {
-  auto& list = All<M>(AsNode(node).extension<Mechanisms>());
-  if (index < 0 || static_cast<std::size_t>(index) >= list.size()) {
+  auto* all = static_cast<Mechanisms*>(
+      detail::NodeAccess::find_extension(AsNode(node), typeid(Mechanisms)));
+  if (all == nullptr || index < 0 ||
+      static_cast<std::size_t>(index) >= All<M>(*all).size()) {
     throw std::out_of_range("no mechanism " + std::to_string(index) +
                             " of that kind on this node");
   }
-  return *list[static_cast<std::size_t>(index)];
+  return *All<M>(*all)[static_cast<std::size_t>(index)];
 }
 
 template <class M, class F>
@@ -121,6 +127,18 @@ Out& Clear(Out* out) {
   return *out;
 }
 
+// Copies the C++ state() message into `out`, unless it is null.
+template <class Message>
+void CopyMessage(const Message& message, void* out, std::uint32_t size) {
+  if (out == nullptr) return;
+  if (size != sizeof(Message)) {
+    throw std::invalid_argument("state message buffer of " +
+                                std::to_string(size) + " bytes, not " +
+                                std::to_string(sizeof(Message)));
+  }
+  std::memcpy(out, &message, sizeof(Message));
+}
+
 }  // namespace
 }  // namespace talos::node_api
 
@@ -131,7 +149,8 @@ extern "C" {
 // --- PositionMechanism -------------------------------------------------------
 
 int64_t talos_position_mechanism_open(TalosNode* node, const char* name) {
-  return Guard<int64_t>(-1, [&] { return Open<PositionMechanism>(node, name); });
+  return Guard<int64_t>(-1,
+                        [&] { return Open<PositionMechanism>(node, name); });
 }
 
 int32_t talos_position_mechanism_set_goal(TalosNode* node, int64_t index,
@@ -167,12 +186,13 @@ int32_t talos_position_mechanism_update(TalosNode* node, int64_t index) {
 }
 
 int32_t talos_position_mechanism_clear_fault(TalosNode* node, int64_t index) {
-  return Call<PositionMechanism>(
-      node, index, [](PositionMechanism& m) { m.clear_fault(); });
+  return Call<PositionMechanism>(node, index,
+                                 [](PositionMechanism& m) { m.clear_fault(); });
 }
 
 int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
-                                       TalosPositionMechanismState* out) {
+                                       TalosPositionMechanismState* out,
+                                       void* message, uint32_t message_size) {
   return Call<PositionMechanism>(node, index, [&](PositionMechanism& m) {
     TalosPositionMechanismState& o = Clear(out);
     o.phase = static_cast<int32_t>(m.phase());
@@ -187,13 +207,15 @@ int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
     o.goal_rot = m.goal_rot();
     o.gravity_v = m.gravity_v();
     o.tolerance_rot = m.tolerance_rot();
+    CopyMessage(m.state(), message, message_size);
   });
 }
 
 // --- VelocityMechanism -------------------------------------------------------
 
 int64_t talos_velocity_mechanism_open(TalosNode* node, const char* name) {
-  return Guard<int64_t>(-1, [&] { return Open<VelocityMechanism>(node, name); });
+  return Guard<int64_t>(-1,
+                        [&] { return Open<VelocityMechanism>(node, name); });
 }
 
 int32_t talos_velocity_mechanism_set_goal(TalosNode* node, int64_t index,
@@ -215,7 +237,8 @@ int32_t talos_velocity_mechanism_update(TalosNode* node, int64_t index) {
 }
 
 int32_t talos_velocity_mechanism_state(TalosNode* node, int64_t index,
-                                       TalosVelocityMechanismState* out) {
+                                       TalosVelocityMechanismState* out,
+                                       void* message, uint32_t message_size) {
   return Call<VelocityMechanism>(node, index, [&](VelocityMechanism& m) {
     TalosVelocityMechanismState& o = Clear(out);
     o.phase = static_cast<int32_t>(m.phase());
@@ -226,6 +249,7 @@ int32_t talos_velocity_mechanism_state(TalosNode* node, int64_t index,
     o.goal_rps = m.goal_rps();
     o.commanded_rps = m.commanded_rps();
     o.current_a = m.state().current_a();
+    CopyMessage(m.state(), message, message_size);
   });
 }
 

@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 31
+_EXPECTED_ABI_VERSION = 32
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -261,14 +261,14 @@ _SIGNATURES = {
     "talos_position_mechanism_update": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_clear_fault": (c_int32, [c_void_p, c_int64]),
     "talos_position_mechanism_state": (c_int32, [
-        c_void_p, c_int64, _P(PositionMechanismState)]),
+        c_void_p, c_int64, _P(PositionMechanismState), c_void_p, c_uint32]),
     "talos_velocity_mechanism_open": (c_int64, [c_void_p, c_char_p]),
     "talos_velocity_mechanism_set_goal": (c_int32, [c_void_p, c_int64,
                                                     c_double, c_double]),
     "talos_velocity_mechanism_stop": (c_int32, [c_void_p, c_int64]),
     "talos_velocity_mechanism_update": (c_int32, [c_void_p, c_int64]),
     "talos_velocity_mechanism_state": (c_int32, [
-        c_void_p, c_int64, _P(VelocityMechanismState)]),
+        c_void_p, c_int64, _P(VelocityMechanismState), c_void_p, c_uint32]),
     "talos_roller_with_sensor_open": (c_int64, [c_void_p, c_char_p]),
     "talos_roller_with_sensor_set_goal": (c_int32, [c_void_p, c_int64,
                                                     c_int32]),
