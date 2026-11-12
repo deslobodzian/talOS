@@ -36,6 +36,7 @@ TEST(MetricsTest, DropoutIsAGapBetweenSightingsNotEntryOrExit) {
 TEST(MetricsTest, JitterIgnoresConstantVelocityAndSkipsGaps) {
   using V = Eigen::Matrix<double, 1, 1>;
   std::vector<std::optional<V>> track;
+  track.reserve(9);
   // Constant velocity with +-1 alternating noise: residual 1, 2, 2, ...
   for (int i = 0; i < 6; ++i) track.push_back(V(10.0 * i + (i % 2 ? 1 : -1)));
   track.push_back(std::nullopt);  // a dropout ends the run

@@ -80,9 +80,10 @@ class RecordedCameraSource final : public CameraSource {
   std::size_t frame_count() const;
 
  private:
-  // Decodes frame `index` into pixels_; false (counted dropped) when it
-  // cannot be decoded or its size differs from the first frame's.
-  bool Decode(std::size_t index);
+  // Decodes frame `index` of `sequence` (the opened sequence_) into pixels_;
+  // false (counted dropped) when it cannot be decoded or its size differs
+  // from the first frame's.
+  bool Decode(const ImageSequence& sequence, std::size_t index);
   // Hands the decoded frame to the frame callback, stamped `capture_ns`.
   void Emit(std::size_t index, std::int64_t capture_ns);
   void Play(std::int64_t start_ns);

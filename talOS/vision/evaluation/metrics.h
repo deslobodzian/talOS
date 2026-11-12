@@ -89,9 +89,11 @@ JitterStats SecondDifferenceJitter(
   JitterStats stats;
   double sum_sq = 0;
   for (std::size_t i = 1; i + 1 < track.size(); ++i) {
-    if (!track[i - 1] || !track[i] || !track[i + 1]) continue;
-    const Eigen::Matrix<double, N, 1> residual =
-        *track[i] - 0.5 * (*track[i - 1] + *track[i + 1]);
+    const auto& before = track[i - 1];
+    const auto& at = track[i];
+    const auto& after = track[i + 1];
+    if (!before || !at || !after) continue;
+    const Eigen::Matrix<double, N, 1> residual = *at - 0.5 * (*before + *after);
     sum_sq += residual.squaredNorm();
     ++stats.samples;
   }

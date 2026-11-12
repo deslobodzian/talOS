@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -368,10 +369,17 @@ Projected Project(const FieldLayout& layout, int id,
   return out;
 }
 
+// part / whole in percent, 0 for an empty whole.
+double Percent(std::size_t part, std::size_t whole) {
+  return whole == 0
+             ? 0.0
+             : 100.0 * static_cast<double>(part) / static_cast<double>(whole);
+}
+
 double MinSide(const std::array<float, 8>& c) {
   double side = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < 4; ++i) {
-    const int j = (i + 1) % 4;
+  for (std::size_t i = 0; i < 4; ++i) {
+    const std::size_t j = (i + 1) % 4;
     side = std::min(
         side, std::hypot(static_cast<double>(c[2 * i] - c[2 * j]),
                          static_cast<double>(c[2 * i + 1] - c[2 * j + 1])));
@@ -389,10 +397,14 @@ struct FrameResult {
 
 struct Summary {
   std::ostringstream text;
-  template <typename... Args>
-  void Line(const char* format, Args... args) {
+  // printf-style; the attribute has the compiler check every call's format
+  // literal against its arguments.
+  __attribute__((format(printf, 2, 3))) void Line(const char* format, ...) {
     char buffer[512];
-    std::snprintf(buffer, sizeof buffer, format, args...);
+    std::va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof buffer, format, args);
+    va_end(args);
     text << buffer << '\n';
   }
 };
@@ -621,7 +633,7 @@ int Run(const Options& o) {
         const auto expected =
             Project(field.layout, d.tag_id, T_layout_camera, k, 0);
         double worst = 0;
-        for (int c = 0; c < 4; ++c) {
+        for (std::size_t c = 0; c < 4; ++c) {
           worst = std::max(
               worst,
               (expected.corners[c] -
@@ -717,7 +729,8 @@ int Run(const Options& o) {
   out.Line("recording: %s%s%s", o.frames.c_str(),
            o.label.empty() ? "" : "  label: ", o.label.c_str());
   out.Line("frames: %zu over %.2f s (%.1f fps), %dx%d", count, duration_s,
-           duration_s > 0 ? (count - 1) / duration_s : 0.0, width, height);
+           duration_s > 0 ? static_cast<double>(count - 1) / duration_s : 0.0,
+           width, height);
   out.Line(
       "intrinsics: fx %.1f fy %.1f cx %.1f cy %.1f k1 %.4f k2 %.4f p1 %.5f "
       "p2 %.5f k3 %.4f%s%s",
@@ -743,12 +756,11 @@ int Run(const Options& o) {
   }
   out.Line("");
   out.Line("frames with >=1 valid layout tag: %zu (%.1f%%)", frames_with_valid,
-           100.0 * frames_with_valid / std::max<std::size_t>(count, 1));
+           Percent(frames_with_valid, count));
   out.Line(
       "frames the node would publish valid: %zu (%.1f%%), single-tag %zu, "
       "multi-tag %zu",
-      frames_published,
-      100.0 * frames_published / std::max<std::size_t>(count, 1),
+      frames_published, Percent(frames_published, count),
       frames_single_published, frames_multi);
   out.Line(
       "detector failures: %zu; unknown ids decoded (false positives): %zu; "
@@ -795,9 +807,8 @@ int Run(const Options& o) {
     out.Line(
         "%4d %6zu %6zu %8.1f %7zu %6.3f %6.0f %6.2f %5.2f %5zu %8zu %9.3f "
         "%9.3f %8zu",
-        id, s.detected, s.expected,
-        s.expected ? 100.0 * s.expected_detected / s.expected : 0.0, dropout,
-        jitter.sigma_estimate, Quantile(s.margin, 0.5),
+        id, s.detected, s.expected, Percent(s.expected_detected, s.expected),
+        dropout, jitter.sigma_estimate, Quantile(s.margin, 0.5),
         Quantile(s.reprojection, 0.5), Quantile(s.ambiguity, 0.5), s.flips,
         s.single_valid, Quantile(s.single_vs_multi_m, 0.5),
         Quantile(s.single_vs_multi_m, 0.95), s.misplaced);
@@ -823,8 +834,7 @@ int Run(const Options& o) {
   out.Line(
       "expected-in-view detection rate (tags the multi-tag pose puts in view, "
       ">=12 px): %zu / %zu = %.1f%%",
-      expected_detected, expected,
-      expected ? 100.0 * expected_detected / expected : 0.0);
+      expected_detected, expected, Percent(expected_detected, expected));
   out.Line("corner jitter per tag, sigma px (second difference): %s",
            Dist(all_jitter).c_str());
   out.Line(
