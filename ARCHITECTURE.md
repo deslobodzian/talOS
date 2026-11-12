@@ -326,7 +326,7 @@ config load refuses a missing file, a non-string or empty path, a name that
 is not a topic segment, a section that is not a table and a
 `[subsystem.trajectories]` under a subsystem file's header, naming the file
 and `trajectories.<name>`, and a node opens it by name
-(`RobotConfig::TrajectoryPath`, [talOS/trajectory](talOS/trajectory/README.md#using-it-from-a-node)).
+(`Node::trajectory_path`, [talOS/trajectory](talOS/trajectory/README.md#using-it-from-a-node)).
 Example configs carry placeholder CAN ids; the robot's config carries the
 physical ones and sets `commissioned = true` only after checking them.
 

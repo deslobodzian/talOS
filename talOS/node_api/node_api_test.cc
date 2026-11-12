@@ -6,7 +6,9 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -212,6 +214,36 @@ TEST_F(NodeApi, ParamsRejectMissingAndMistypedValues) {
             TALOS_ERR);
   EXPECT_EQ(talos_node_param(node, "label", TALOS_PARAM_BOOL, 0, &p),
             TALOS_ERR);
+}
+
+// A path that does not fit with its NUL is refused, never truncated, so a
+// binding cannot open a prefix of the configured file.
+// REQ-CONTRACT-14 REQ-CONTRACT-31
+TEST(NodeApiTrajectory, PathCopiesWholeOrNotAtAll) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::string traj = std::string{tmp} + "/two_piece.traj";
+  std::ofstream{traj} << "{}\n";
+  const std::string toml = std::string{kRobotToml} +
+                           "[subsystems.relay.trajectories]\ntwo_piece = \"" +
+                           traj + "\"\n";
+  TalosSim* sim = talos_sim_from_toml(toml.c_str());
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  Relay relay;
+  TalosNode* node = talos_sim_add(sim, "relay", &BuildRelay, &relay);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+
+  std::vector<char> out(traj.size() + 1, 'x');
+  EXPECT_EQ(talos_node_trajectory_path(node, "two_piece", out.data(),
+                                       static_cast<uint32_t>(traj.size())),
+            TALOS_ERR);
+  EXPECT_EQ(std::string(out.begin(), out.end()), std::string(out.size(), 'x'));
+  ASSERT_EQ(talos_node_trajectory_path(node, "two_piece", out.data(),
+                                       static_cast<uint32_t>(out.size())),
+            TALOS_OK)
+      << talos_last_error();
+  EXPECT_STREQ(out.data(), traj.c_str());
+  talos_sim_destroy(sim);
 }
 
 TEST_F(NodeApi, ListParamsComeBackAsCountedArrays) {

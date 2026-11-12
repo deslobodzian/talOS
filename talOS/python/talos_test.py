@@ -922,6 +922,35 @@ class ParamTest(unittest.TestCase):
             Sim.from_toml(ROBOT_TOML).add(Missing, "planner")
 
 
+class TrajectoryPathTest(unittest.TestCase):
+    """Resolution is the C++ config's (config_test.cc); this proves a Python
+    node gets the path and the refusal through the C ABI.
+    REQ-CONTRACT-14 REQ-CONTRACT-31"""
+
+    def test_a_node_opens_its_configured_trajectory(self):
+        traj = Path(os.environ["TEST_TMPDIR"]) / "two_piece.traj"
+        traj.write_text('{"version": 3}\n')
+        toml = (ROBOT_TOML + "[subsystems.planner.trajectories]\n"
+                f'two_piece = "{traj}"\n')
+        opened = {}
+
+        class Auto:
+            def __init__(self, node):
+                with open(node.trajectory_path("two_piece")) as f:
+                    opened["two_piece"] = json.load(f)
+
+        Sim.from_toml(toml).add(Auto, "planner")
+        self.assertEqual(opened, {"two_piece": {"version": 3}})
+
+        class Undeclared:
+            def __init__(self, node):
+                node.trajectory_path("three_piece")
+
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"planner.*trajectories\.three_piece"):
+            Sim.from_toml(toml).add(Undeclared, "planner")
+
+
 class MessageTest(unittest.TestCase):
     def test_forwarding_checks_schema_and_payload_in_every_send_path(self):
         from talos._messages import message_type

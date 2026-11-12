@@ -61,6 +61,7 @@ class Wake(enum.IntEnum):
 
 _NS = 1e9
 _REQUIRED = object()
+_PATH_BYTES = 4096  # Linux PATH_MAX, NUL included
 _PARAM_KINDS = {bool: _abi.PARAM_BOOL, int: _abi.PARAM_INT,
                 float: _abi.PARAM_DOUBLE, str: _abi.PARAM_STRING}
 
@@ -159,6 +160,15 @@ class Node:
         --log (tests) and in --describe, --replay and --replay-inputs."""
         path = lib.talos_node_session_dir(self._handle)
         return None if path is None else path.decode()
+
+    def trajectory_path(self, name):
+        """The absolute path (str) of this subsystem's [trajectories] entry
+        `name`, resolved by the C++ config (Node::trajectory_path); raises
+        TalosError naming the key when the config does not declare it."""
+        out = ctypes.create_string_buffer(_PATH_BYTES)
+        _abi.ok(lib.talos_node_trajectory_path(
+            self._handle, _abi.encode(name), out, _PATH_BYTES))
+        return out.value.decode()
 
     def param(self, key, default=_REQUIRED):
         """A key of this subsystem's config table, typed like `default`.

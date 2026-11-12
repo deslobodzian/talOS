@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 28
+_EXPECTED_ABI_VERSION = 29
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -136,6 +136,8 @@ _SIGNATURES = {
     "talos_node_period_ns": (c_int64, [c_void_p]),
     "talos_node_config_path": (c_char_p, [c_void_p]),
     "talos_node_session_dir": (c_char_p, [c_void_p]),
+    "talos_node_trajectory_path": (c_int32, [c_void_p, c_char_p, c_char_p,
+                                             c_uint32]),
     "talos_node_param": (c_int32, [c_void_p, c_char_p, c_int32, c_int32,
                                    _P(Param)]),
     "talos_node_param_of": (c_int32, [c_void_p, c_char_p, c_char_p, c_int32,

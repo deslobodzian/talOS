@@ -323,6 +323,14 @@ std::optional<std::filesystem::path> Node::session_dir() const {
   return impl_->session_dir;
 }
 
+std::filesystem::path Node::trajectory_path(std::string_view name) const {
+  try {
+    return impl_->config->TrajectoryPath(impl_->name, name);
+  } catch (const std::invalid_argument& error) {
+    throw std::invalid_argument(impl_->name + ": " + error.what());
+  }
+}
+
 void Node::after_update(std::function<void()> fn) {
   impl_->CheckOpen("after_update");
   if (!fn) throw std::invalid_argument(impl_->name + ": empty after_update");
