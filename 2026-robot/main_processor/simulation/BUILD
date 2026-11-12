@@ -46,6 +46,8 @@ py_library(
 )
 
 # Startup and a bounded scripted match with link/device faults.
+# Over 5 s, e2e lane: the whole graph runs the 8 s scripted match in real
+# time (the gateway has no faster-than-real-time mode).
 py_test(
     name = "startup_test",
     size = "medium",
@@ -68,6 +70,8 @@ py_test(
 )
 
 # Full graph match rehearsal, with an intentional critical-node restart.
+# Over 5 s, e2e lane: the whole graph runs the 17 s match schedule, plus
+# the harness's 1 s start, in real time.
 py_test(
     name = "match_rehearsal_test",
     size = "medium",
