@@ -304,7 +304,9 @@ TEST(RealtimeEventLoop, AWatchedFdEndsTheWaitOnTheLoopThread) {
         loop.exit();
       });
       const char byte = 1;
-      if (before_run) ASSERT_EQ(::write(fds[1], &byte, 1), 1);
+      if (before_run) {
+        ASSERT_EQ(::write(fds[1], &byte, 1), 1);
+      }
       std::thread writer{[&] {
         if (before_run) return;
         if (await([&] { return loop.running(); })) {

@@ -420,9 +420,10 @@ TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
     ::remove(output_path.c_str());
 
     ASSERT_TRUE(started) << "alpha never started; events: " << events;
-    if (row.ignored)
+    if (row.ignored) {
       EXPECT_TRUE(restarted)
           << "no restart after an ignored SIGHUP; events: " << events;
+    }
     EXPECT_TRUE(ended) << "the session did not end";
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
         << "the launcher ended with " << ExitReason(status);

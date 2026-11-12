@@ -1457,7 +1457,9 @@ TEST(Binary, StopEndsARunningNodeThatWaitsOnNothing) {
     printed.append(buffer, static_cast<std::size_t>(got));
   }
   ::close(output[0]);
-  if (!exited) ASSERT_EQ(::waitpid(child, &status, 0), child);
+  if (!exited) {
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+  }
   const auto stopped_after = std::chrono::steady_clock::now() - signalled;
 
   ASSERT_TRUE(live) << "the node's loop never showed running: " << printed;
