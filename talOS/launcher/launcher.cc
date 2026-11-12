@@ -230,6 +230,11 @@ std::string_view RunEndReason(std::string_view kill_reason, bool stopping,
   return clean || signal == SIGINT || signal == SIGTERM ? kRunStop : kRunCrash;
 }
 
+bool CappedLogStopped(const std::string& log_path) {
+  // The kept segments and, unless it is mid-rotation, `log_path` itself.
+  return event::log::LogSegmentFiles(log_path).size() < 2;
+}
+
 Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
   if (options_.session_id == 0) options_.session_id = GenerateSessionId();
   const std::filesystem::path root =
@@ -894,8 +899,10 @@ bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
   if ((fresh & introspect::kFlagLogCapped) != 0) {
     proc.log_capped = true;
     std::cerr << "[launcher] " << proc.name << " event log " << log
-              << " reached its byte budget; the rest of this run is not "
-                 "recorded\n";
+              << " reached its byte budget; "
+              << (CappedLogStopped(log)
+                      ? "the rest of this run is not recorded\n"
+                      : "it keeps recording, deleting its oldest records\n");
   }
   return true;
 }

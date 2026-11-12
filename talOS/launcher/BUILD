@@ -497,6 +497,19 @@ cc_test(
     ],
 )
 
+# Whether a capped event log stopped or records on, from real logs.
+cc_test(
+    name = "capped_log_test",
+    size = "small",
+    srcs = ["capped_log_test.cc"],
+    deps = [
+        ":launcher_lib",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # A session whose stdout and stderr reader closes, and the SIGPIPE
 # disposition its children start with (REQ-OPS-33).
 cc_test(

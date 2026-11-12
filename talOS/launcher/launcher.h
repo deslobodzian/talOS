@@ -63,6 +63,15 @@ bool ResolveMaxRestarts(const config::RobotConfig& robot_config,
 std::string_view RunEndReason(std::string_view kill_reason, bool stopping,
                               int status);
 
+// Whether the event log at `log_path`, once its writer reports it capped
+// (introspect::kFlagLogCapped), has stopped recording rather than deleted its
+// oldest segment and recorded on. Only a log whose byte share holds two
+// segments rotates (event::log::LogWriterOptions::max_bytes), and it has
+// renamed at least one segment beside `log_path` before it deletes one, and
+// keeps one beside it from then on; a log that cannot rotate never leaves
+// one. Reads the log's directory.
+bool CappedLogStopped(const std::string& log_path);
+
 // ---------------------------------------------------------------------------
 // Launcher
 // ---------------------------------------------------------------------------
@@ -267,9 +276,11 @@ class Launcher {
   bool NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
                     uint32_t flags) const;
 
-  // A run's registry row says its event log stopped early
-  // (introspect::kFlagRecorderFailed, kFlagLogCapped): the rest of that run
-  // is not recorded. Reported once per member and kind, and recorded as the
+  // A run's registry row says its event log failed
+  // (introspect::kFlagRecorderFailed): the rest of that run is not recorded;
+  // or reached its byte share (kFlagLogCapped): it either stopped there too
+  // or deletes its oldest records as it records on, which the line says
+  // (CappedLogStopped). Reported once per member and kind, and recorded as the
   // member's recorder_failed or log_capped while the node still runs -- in
   // the live manifest Studio reads, and so in the final one, where a log
   // that stopped at a record boundary would otherwise read as complete.
