@@ -5,12 +5,14 @@
 
 import {Fragment, useRef} from 'react';
 
+import {useSourceKind} from '../data/hooks';
 import {findPanel, MIN_PANEL_SIZE} from '../layout/tree';
 import type {LayoutNode, PanelNode, SplitDirection, SplitNode} from '../layout/types';
 import {panelById} from '../panels/registry';
 import {UnknownPanel} from '../panels/unknown';
 import {PanelChrome} from '../ui/PanelChrome';
 import {PanelErrorBoundary} from '../ui/PanelErrorBoundary';
+import {EmptyState} from '../ui/primitives';
 
 export type WorkspaceCallbacks = {
   onSplit: (instanceId: string, direction: SplitDirection) => void;
@@ -89,17 +91,25 @@ function SplitHandle({path, index, direction, sizes, onResize}: {
               onPointerCancel={end} onKeyDown={key}/>;
 }
 
+function NotForRecorded({children}: {children: React.ReactNode}) {
+  return useSourceKind() === 'recorded' ?
+      <EmptyState>Not available for recorded sessions yet.</EmptyState> :
+      <>{children}</>;
+}
+
 function renderPanel(node: PanelNode, callbacks: WorkspaceCallbacks,
                      maximized: string|null) {
   const def = panelById(node.panelId);
   const Component = def?.component;
   const config = def ? def.parseConfig(node.config) : undefined;
 
-  const content = Component ?
+  const panel = Component ?
       <Component key={`${node.instanceId}:${node.panelId}`}
                  config={config} instanceId={node.instanceId}
                  setConfig={c => callbacks.onConfig(node.instanceId, c)}/> :
       <UnknownPanel panelId={node.panelId} config={node.config}/>;
+  const content = def?.recorded ? panel :
+      <NotForRecorded key={`${node.instanceId}:${node.panelId}`}>{panel}</NotForRecorded>;
 
   return <PanelChrome key={node.instanceId}
       panelId={node.panelId}

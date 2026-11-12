@@ -2,12 +2,17 @@
 // cursor and system graph, and the actions that drive the worker. One
 // subscription covers all three, so `useSyncExternalStore` hooks can read a
 // narrow slice and re-render only when that slice changes.
+//
+// Panels read data through `source` (source.ts): the live store, or a recorded
+// session while one is open (`openRecorded`). One source is shown at a time.
 
 import {createContext, createElement, useContext} from 'react';
 import type {ReactNode} from 'react';
 
 import type {Snapshot} from '../core';
 import type {SessionManifest} from './manifest';
+import type {RecordedSource} from './recorded';
+import {LiveSource, type DataSource} from './source';
 import {TelemetryStore} from './store';
 import {WorkerClient} from './worker-client';
 import type {
@@ -28,6 +33,12 @@ export type Studio = {
   manifest: SessionManifest|null;
   manifestError: string;
   actions: StudioActions;
+  // The source panels read: `recorded` while one is open, else live.
+  readonly source: DataSource;
+  readonly recorded: RecordedSource|null;
+  // Shows a recorded session in place of live data, closing any previous one.
+  openRecorded(source: RecordedSource): void;
+  closeRecorded(): void;
   subscribe(listener: () => void): () => void;
 };
 
@@ -61,6 +72,9 @@ class StudioImpl implements Studio {
   manifest: SessionManifest|null;
   manifestError: string;
   actions: StudioActions;
+  recorded: RecordedSource|null = null;
+  private readonly live: LiveSource;
+  private unsubscribeRecorded: (() => void)|null = null;
   private readonly listeners = new Set<() => void>();
   private notifyScheduled = false;
   private readonly scheduler: (cb: () => void) => void;
@@ -76,7 +90,28 @@ class StudioImpl implements Studio {
     this.system = system;
     this.manifest = manifest;
     this.manifestError = manifestError;
+    this.live = new LiveSource(store, () => this.playback);
   }
+
+  get source(): DataSource {
+    return this.recorded ?? this.live;
+  }
+
+  openRecorded = (source: RecordedSource): void => {
+    this.closeRecorded();
+    this.recorded = source;
+    this.unsubscribeRecorded = source.subscribe(this.notify);
+    this.notify();
+  };
+
+  closeRecorded = (): void => {
+    if (!this.recorded) return;
+    this.unsubscribeRecorded?.();
+    this.unsubscribeRecorded = null;
+    this.recorded.close();
+    this.recorded = null;
+    this.notify();
+  };
 
   subscribe = (listener: () => void): () => void => {
     this.listeners.add(listener);

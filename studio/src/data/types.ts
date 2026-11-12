@@ -65,10 +65,18 @@ export type ChannelInfo = {name: string; unit: string; labels: string[]};
 // the frames of two streams (a producer restart) the series holds one extra
 // sample, NaN for every channel, so plots break there rather than draw the
 // restart as continuous operation.
+//
+// A recorded source's series is decimated: each row is one bucket of samples,
+// `values` its last sample, and `min`, `max` and `count` its envelope (NaN and
+// 0 for an empty bucket). The live store's rows are single samples and carry
+// no envelope.
 export type Series = {
   t0_ns: string;
   times: Float64Array;
   values: Record<string, Float64Array>;
+  min?: Record<string, Float64Array>;
+  max?: Record<string, Float64Array>;
+  count?: Record<string, Uint32Array>;
 };
 
 // How much history a series covers, ending at the playback cursor.

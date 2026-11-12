@@ -16,17 +16,16 @@ import {useEffect, useMemo, useRef, useState} from 'react';
 import type {ChangeEvent, PointerEvent as RPointerEvent} from 'react';
 
 import {simTruthPose} from '../../core';
-import {discoverCameras, discoverEstimators} from '../../data/discovery';
-import {chassisReading} from '../../data/freshness';
+import {discoverCameras, discoverEstimate} from '../../data/discovery';
 import {
   useActions,
   useChannelValue,
+  useChassis,
   useDictionary,
   usePlayback,
   useSeries,
   useSnapshot
 } from '../../data/hooks';
-import type {ChannelInfo} from '../../data/types';
 import {number} from '../../ui/formatters';
 import {FreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition, PanelProps} from '../types';
@@ -100,38 +99,6 @@ const cameraPalette =
 const MIN_ZOOM = 0.06;  // about 1 m across, the tightest useful zoom
 const MAX_ZOOM = 2.5;
 
-type EstimateChannels = {
-  x: string; y: string; yaw: string; vx: string|null; vy: string|null;
-};
-
-// The estimate pose (and, when present, velocity) channels. The estimator
-// publishes the estimated pose; discover it by its accepted-observation
-// counter rather than by name. Falls back to the old `/pose/x_m` suffix rule
-// for recordings whose estimator predates that shape (the demo).
-function discoverEstimate(dictionary: ChannelInfo[]): EstimateChannels|null {
-  const names = new Set(dictionary.map(c => c.name));
-  for (const est of discoverEstimators(dictionary)) {
-    const x = `${est.name}/state/pose/x_m`;
-    if (!names.has(x)) continue;
-    const vx = `${est.name}/state/velocity/vx_mps`;
-    const vy = `${est.name}/state/velocity/vy_mps`;
-    return {
-      x,
-      y: `${est.name}/state/pose/y_m`,
-      yaw: `${est.name}/state/pose/yaw_rad`,
-      vx: names.has(vx) ? vx : null,
-      vy: names.has(vy) ? vy : null
-    };
-  }
-  const x = dictionary.find(c => c.name.endsWith('/pose/x_m'));
-  if (!x) return null;
-  const prefix = x.name.slice(0, -'pose/x_m'.length);
-  return {
-    x: x.name, y: prefix + 'pose/y_m', yaw: prefix + 'pose/yaw_rad',
-    vx: null, vy: null
-  };
-}
-
 type TrailPoint = PointM & {tNs: string};
 type CameraObs = {
   name: string; color: string; x: number; y: number; yaw: number|null;
@@ -170,8 +137,8 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const velocityVx = useChannelValue(estimate?.vx ?? '');
   const velocityVy = useChannelValue(estimate?.vy ?? '');
 
-  // The estimate pose, and whether its frame is current by the reading clock.
-  const reading = chassisReading(snapshot, playback);
+  // The estimate pose, and whether it is current by the reading clock.
+  const reading = useChassis();
   const truth = simTruthPose(snapshot);
   const chassis = reading?.pose ?? null;
   const stale = reading?.stale ?? false;
@@ -482,5 +449,6 @@ export const fieldPanel: PanelDefinition<FieldConfig> = {
   description: 'Top-down field view: estimate, truth, cameras and velocity.',
   defaultConfig,
   parseConfig,
-  component: FieldPanel
+  component: FieldPanel,
+  recorded: true
 };
