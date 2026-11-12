@@ -377,6 +377,16 @@ int Launcher::RunSession() {
     std::cerr << "launcher: no nodes declared in config\n";
     return 1;
   }
+  // Its output log would be the launcher's own talos.log. The graph lint
+  // refuses the name as a reserved owner (introspect::kReservedOwners,
+  // names.h), but --allow-graph-errors overrides the lint; this does not.
+  for (const NodeSpec& spec : node_specs) {
+    if (spec.name + ".log" != kLauncherOutputFile) continue;
+    std::cerr << "launcher: roster member '" << spec.name
+              << "' is a reserved name (its output log would be "
+              << kLauncherOutputFile << ", the launcher's own); rename it\n";
+    return 1;
+  }
   // Checked again right before retention lists the log root: another
   // launch may have taken the lock meanwhile.
   if (lock_needs_room && !take_lock()) {

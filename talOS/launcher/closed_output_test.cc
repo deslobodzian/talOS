@@ -431,6 +431,48 @@ TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
   }
 }
 
+// REQ-OPS-33
+// A roster member named `talos` would drain its output into talos.log, the
+// launcher's own. The graph lint refuses the name (a reserved owner), but
+// --allow-graph-errors overrides the lint; the launch must still be refused,
+// before any session directory or member exists. Row "gamma", the same
+// roster under a legal name, launches and runs its member.
+TEST(ClosedOutput, MemberNamedTalosIsRefusedEvenAllowingGraphErrors) {
+  struct Row {
+    const char* name;
+    bool refused;
+  };
+  for (const Row row : {Row{"talos", true}, Row{"gamma", false}}) {
+    SCOPED_TRACE(row.name);
+    const std::string name{row.name};
+    LauncherOptions options;
+    options.session_id = GenerateSessionId();
+    options.output_dir = TempPath(name + "_member_session");
+    options.allow_graph_errors = true;
+    options.config_path = TempPath(name + "_member") + ".toml";
+    std::ofstream{options.config_path}
+        << "[robot]\nname = \"member_fixture\"\nperiod_us = 5000\n\n"
+        << "[subsystems." << name << "]\nnode = \"//example/" << name
+        << ":node\"\nperiod_us = 5000\n\n[subsystems." << name
+        << ".motors.m1]\ntype = \"TalonFX\"\nbus = \"rio\"\ncan_id = 1\n";
+    const std::string ran = TempPath(name + "_member_ran");
+    ::remove(ran.c_str());
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStub(name + "_member_hardware", "exit 0\n", "hardware_node");
+    options.binary_overrides["//example/" + name + ":node"] =
+        WriteStub(name + "_member", ": > " + ran + "\nexit 0\n", name);
+    const int status = Launcher{options}.Run();
+    const bool started = std::filesystem::exists(ran);
+    const bool session = std::filesystem::exists(
+        options.output_dir + "/" + std::to_string(options.session_id));
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(ran.c_str());
+    EXPECT_EQ(status, row.refused ? 1 : 0);
+    EXPECT_EQ(started, !row.refused);
+    EXPECT_EQ(session, !row.refused);
+  }
+}
+
 std::string Runfile(const char* env) {
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
