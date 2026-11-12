@@ -778,6 +778,58 @@ TEST_F(ReviewTest, ListingClassifiesFromTheLauncherCacheOnly) {
   std::filesystem::remove_all(library);
 }
 
+// Guards which reader a topic with no writer log is read from: the one whose
+// log path sorts first (session.h), whatever its records' times. Here
+// b_reader's log starts first in merge order and logged the same message
+// with another position; picking the first log in merge order shows 2.
+// REQ-OPS-41
+TEST(ReaderChoiceTest, TopicIsReadFromTheFirstReaderByLogPath) {
+  using talos::event::Context;
+  using talos::event::EventKind;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  const std::string library = Directory() + "/readers";
+  std::filesystem::create_directories(library + "/s1");
+  const auto write = [&library](const std::string& name, std::int64_t at_ns,
+                                double position) {
+    using D = talos::Descriptor<review_test::Shot>;
+    talos::event::Registration source;
+    source.id = 2;
+    source.kind = SourceKind::WATCHER;
+    source.name = "/x/state";
+    source.message_bytes = sizeof(review_test::Shot);
+    source.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+    talos::event::log::LogWriter writer{
+        library + "/s1/" + name + ".tlog", name,
+        talos::event::log::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({source}, MonotonicTime::from_nanos(kStartNs));
+    const review_test::Shot value{position, 1, review_test::Mode::IDLE, false,
+                                  7};
+    Context context{};
+    context.kind = EventKind::MESSAGE;
+    context.source_id = 2;
+    context.dispatch_index = 1;
+    context.event_time = context.now = MonotonicTime::from_nanos(at_ns);
+    context.publish_time = MonotonicTime::from_nanos(kStartNs);
+    context.sequence = 1;
+    writer.dispatch(context, std::as_bytes(std::span{&value, 1}));
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  };
+  write("a_reader", kStartNs + 2 * kMs, 1.0);
+  write("b_reader", kStartNs + kMs, 2.0);
+  Review review{library, 1u << 20};
+  const Response response = review.Get(
+      "/review/s1/snapshot", "t_ns=" + std::to_string(kStartNs + kSecond));
+  ASSERT_EQ(response.status, 200) << response.body;
+  const json channels = json::parse(response.body)["channels"];
+  ASSERT_TRUE(channels.contains("x/state/position_m")) << response.body;
+  EXPECT_EQ(channels["x/state/position_m"]["value"], 1.0);
+  std::filesystem::remove_all(library);
+}
+
 // Guards the bound on a snapshot's reads (studio/README.md, "Reviewing a
 // session"): a topic published once at the session's start, then only read
 // every tick (a watcher's READ records, which hold no value), costs a

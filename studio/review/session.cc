@@ -266,8 +266,8 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   }
   if (!any) throw std::runtime_error("no records in " + dir.string());
 
-  // Each topic's process: the one that sent it, else the first (in file
-  // order) that received it.
+  // Each topic's process: the one that sent it, else the one whose log
+  // path sorts first among those that received it.
   for (std::size_t t = 0; t < indexer.topics.size(); ++t) {
     TopicBuild& build = indexer.topics[t];
     std::optional<std::size_t> sender;
@@ -277,7 +277,13 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       for (std::size_t id = 0; id < file_build.topic.size(); ++id) {
         if (file_build.topic[id] != static_cast<std::int32_t>(t)) continue;
         if ((file_build.kinds[id] & 1) != 0 && !sender) sender = f;
-        if ((file_build.kinds[id] & 2) != 0 && !receiver) receiver = f;
+        // The reader whose log path sorts first, as RecordedSession orders
+        // logs: not the first in merge order, which depends on record times.
+        if ((file_build.kinds[id] & 2) != 0 &&
+            (!receiver ||
+             session->files_[f].path < session->files_[*receiver].path)) {
+          receiver = f;
+        }
       }
     }
     if (!sender && !receiver) continue;
