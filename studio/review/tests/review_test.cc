@@ -25,6 +25,7 @@
 #include "review_test/review_message_descriptor.h"
 #include "review_test/review_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "studio/review/http.h"
 #include "studio/review/series_cache.h"
 #include "studio/review/testdata/fixture.h"
 #include "talOS/events/context.h"
@@ -651,6 +652,35 @@ TEST(SnapshotCostTest, TopicPublishedOnceIsReadFromItsOneSecond) {
   EXPECT_EQ(review.last_read().seeks, 2u);
   EXPECT_LE(review.last_read().bytes, 2 * second_bytes);
   std::filesystem::remove_all(library);
+}
+
+// Guards the static handler that serves the built Studio: "/" is
+// index.html, a file has its content type, and nothing outside the root is
+// served, whether named by ".." or encoded.
+// REQ-OPS-41
+TEST(StaticFileTest, ServesOnlyFilesInsideTheRoot) {
+  namespace fs = std::filesystem;
+  const fs::path dir = Directory() + "/static";
+  fs::create_directories(dir / "root/assets");
+  std::ofstream{dir / "root/index.html"} << "<div id=\"root\"></div>";
+  std::ofstream{dir / "root/assets/app.js"} << "export {};";
+  std::ofstream{dir / "secret.txt"} << "secret";
+
+  const Response index = StaticFile(dir / "root", "/");
+  EXPECT_EQ(index.status, 200);
+  EXPECT_EQ(index.content_type, "text/html; charset=utf-8");
+  EXPECT_EQ(index.body, "<div id=\"root\"></div>");
+  const Response script = StaticFile(dir / "root", "/assets/app.js");
+  EXPECT_EQ(script.status, 200);
+  EXPECT_EQ(script.content_type, "text/javascript");
+  for (const std::string url : {"/../secret.txt", "/assets/../../secret.txt",
+                                "//etc/passwd", "/missing", "/assets"}) {
+    SCOPED_TRACE(url);
+    EXPECT_EQ(StaticFile(dir / "root", url).status, 404);
+  }
+  EXPECT_EQ(StaticFile(dir / "root", "/%2e%2e/secret.txt").status, 400);
+  EXPECT_EQ(StaticFile({}, "/").status, 404);
+  fs::remove_all(dir);
 }
 
 }  // namespace

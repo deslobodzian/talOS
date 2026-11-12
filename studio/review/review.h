@@ -2,7 +2,8 @@
 
 // The review API (studio/README.md "Reviewing a session"), as a function of
 // a request's path and query: no socket, so all of it is tested in process.
-// main.cc only carries requests to Review::Get and its answers back.
+// main.cc carries /review/* requests to Review::Get (after http.h's Host
+// check) and its answers back; every other path is a static file.
 //
 //   GET /review/sessions.json
 //       [{"id","start_wall_ns","end_wall_ns","class","files":[{"path","bytes"}]}]

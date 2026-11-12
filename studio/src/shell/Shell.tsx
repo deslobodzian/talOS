@@ -6,6 +6,7 @@
 import {useEffect, useMemo, useRef, useState} from 'react';
 
 import {useActions, useEvents, usePlayback, useRecorded} from '../data/hooks';
+import {detectReviewServer} from '../data/review';
 import {useStudio} from '../data/studio';
 import {PanelNavigationProvider} from '../layout/navigation';
 import {buildPresetPage, buildPresetRoot, defaultWorkspace, PRESETS, presetByName} from '../layout/presets';
@@ -92,6 +93,22 @@ export function Shell() {
   const importFileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => saveWorkspace(workspace), [workspace]);
+
+  // A Studio that studio_review served reviews that server's sessions: it
+  // opens straight into its picker, and offers no live connection.
+  const [reviewServer, setReviewServer] = useState<string|null>(null);
+  useEffect(() => {
+    if (typeof location === 'undefined') return;
+    let cancelled = false;
+    void detectReviewServer(location.origin, (u, init) => fetch(u, init)).then(server => {
+      if (cancelled || !server) return;
+      setReviewServer(server);
+      setReviewOpen(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const activePage = workspace.pages.find(p => p.id === workspace.activePage) ??
       workspace.pages[0] ?? null;
@@ -211,6 +228,7 @@ export function Shell() {
   // --- transport / workspace ------------------------------------------------
 
   const onConnect = () => {
+    if (reviewServer) return;  // a review server has no live stream
     setTransportError('');
     actions.connect(url);
   };
@@ -320,7 +338,8 @@ export function Shell() {
     <div className="app">
       <Header url={url} onUrl={setUrl} onConnect={onConnect} onDemo={onDemo}
               onImportClick={onImportClick} onExport={onExport}
-              onReset={onReset} onReview={() => setReviewOpen(true)}/>
+              onReset={onReset} onReview={() => setReviewOpen(true)}
+              review={reviewServer !== null}/>
       <StatusStrip/>
       <PageTabs pages={workspace.pages} activePageId={workspace.activePage}
                 renamingId={renamingPage} onSelect={setActivePage}
@@ -347,7 +366,8 @@ export function Shell() {
              }}/>
       {paletteOpen &&
        <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)}/>}
-      {reviewOpen && <ReviewPicker onClose={() => setReviewOpen(false)}/>}
+      {reviewOpen && <ReviewPicker onClose={() => setReviewOpen(false)}
+                                   server={reviewServer ?? undefined}/>}
       {shortcutsOpen &&
        <ShortcutsOverlay onClose={() => setShortcutsOpen(false)}/>}
     </div>

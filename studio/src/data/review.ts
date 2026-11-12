@@ -1,6 +1,7 @@
 // The review server's API (`studio_review`, studio/review, default
-// http://127.0.0.1:5805): parsers for its JSON documents and the decoder of
-// its binary series. Every parser is strict and throws a `ReviewError` naming
+// http://127.0.0.1:5805, or the page's own origin when it served Studio):
+// parsers for its JSON documents and the decoder of its binary series. The
+// shapes are pinned by studio/review/testdata/golden (tests/review_golden). Every parser is strict and throws a `ReviewError` naming
 // what is wrong, so a malformed payload becomes an error state in the
 // RecordedSource rather than a crash in a panel.
 //
@@ -234,4 +235,19 @@ export function errorMessage(e: unknown): string {
 
 export async function listSessions(server: string, fetchFn: FetchLike): Promise<ReviewSession[]> {
   return parseSessions(await getJson(fetchFn, reviewUrl(server, 'sessions.json')));
+}
+
+// `origin` when the page was served by a review server (studio_review serves
+// Studio itself), found by asking that origin for its session list; null for
+// any other server (the live bridge answers 404, a dev server its index
+// page), or when the origin is not http(s).
+export async function detectReviewServer(origin: string,
+                                         fetchFn: FetchLike): Promise<string|null> {
+  if (!/^https?:\/\//.test(origin)) return null;
+  try {
+    await listSessions(origin, fetchFn);
+    return origin;
+  } catch {
+    return null;
+  }
 }

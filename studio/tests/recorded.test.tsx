@@ -14,12 +14,15 @@ import {useChannelStale, useChassis, usePlayback} from '../src/data/hooks';
 import {bucketSeries, RecordedSource, type ReviewClock} from '../src/data/recorded';
 import {
   decodeSeries,
+  detectReviewServer,
   ReviewError,
   type FetchLike,
   type ReviewBounds
 } from '../src/data/review';
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {ChannelInfo} from '../src/data/types';
+import {Header} from '../src/shell/Header';
+import {ReviewPicker} from '../src/shell/ReviewPicker';
 
 const SERVER = 'http://review.test';
 const START = 1_000_000_000n;
@@ -128,9 +131,6 @@ test('series decode keeps empty buckets and a channel with no data as gaps', () 
                 ReviewError);
 });
 
-test('identical series requests share one fetch and then the cache', async () => {
-  const server = fakeServer(echoSnapshot);
-  const recorded = source(server);
 // The server's t_ns is each channel's own last sample's publication time
 // (studio/review/review.h): two channels of one bucket are drawn where each
 // was published, never one at the other's time.
@@ -146,6 +146,9 @@ test('each channel\'s point sits at its own sample time', () => {
   assert.deepEqual([...series.count!.b], [0, 1, 1]);
 });
 
+test('identical series requests share one fetch and then the cache', async () => {
+  const server = fakeServer(echoSnapshot);
+  const recorded = source(server);
   const a = recorded.fetchSeries(['x'], '0', '10', 100);
   const b = recorded.fetchSeries(['x'], '0', '10', 100);
   assert.equal(server.of('/series').length, 1);
@@ -306,4 +309,36 @@ test('an HTTP error or malformed payload is an error state, never a throw', asyn
   assert.match(plot.error, /truncated/);
   assert.equal(plot.series(['x'], {seconds: 1}, cursor).times.length, 0);
   assert.equal(truncated.of('/series').length, 1);
+});
+
+// A Studio served by studio_review reviews its own origin's sessions: found
+// by that origin answering a session list, which the live bridge (404) and a
+// dev server (its index page) do not. In that mode the picker has no address
+// field and the header offers no live connection.
+test('a Studio served by the review server reviews its own origin', async () => {
+  const answering = (response: () => Response): FetchLike => () =>
+      Promise.resolve(response());
+  const origin = 'http://127.0.0.1:5805';
+  assert.equal(await detectReviewServer(origin, answering(() => json([]))), origin);
+  assert.equal(await detectReviewServer(origin, answering(() => new Response('', {status: 404}))),
+               null);
+  assert.equal(await detectReviewServer(
+                   origin, answering(() => new Response('<!doctype html>'))), null);
+  assert.equal(await detectReviewServer('file://', answering(() => json([]))), null);
+
+  const studio = createStaticStudio();
+  const render = (node: React.ReactNode) =>
+      renderToStaticMarkup(<StudioProvider studio={studio}>{node}</StudioProvider>);
+  const noop = () => {};
+  const header = (review: boolean) => render(
+      <Header url="ws://x" onUrl={noop} onConnect={noop} onDemo={noop} onImportClick={noop}
+              onExport={noop} onReset={noop} onReview={noop} review={review}/>);
+  assert.match(header(false), /WebSocket URL/);
+  assert.doesNotMatch(header(true), /WebSocket URL|>Connect</);
+  const fetchNothing: FetchLike = () => new Promise(() => {});
+  assert.match(render(<ReviewPicker onClose={noop} fetchFn={fetchNothing}/>),
+               /Review server address/);
+  assert.doesNotMatch(
+      render(<ReviewPicker onClose={noop} fetchFn={fetchNothing} server={origin}/>),
+      /Review server address/);
 });

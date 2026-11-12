@@ -1,6 +1,8 @@
 // The session picker: lists the review server's sessions (studio_review,
 // default http://127.0.0.1:5805) and opens one as the Studio's source. The
 // server address is remembered per browser; every failure is shown here.
+// When studio_review served this Studio, `server` is its origin and the
+// picker has no address field.
 
 import {useCallback, useEffect, useState} from 'react';
 
@@ -33,9 +35,13 @@ function saveServer(server: string) {
   }
 }
 
-export function ReviewPicker({onClose, fetchFn}: {onClose: () => void; fetchFn?: FetchLike}) {
+export function ReviewPicker({onClose, fetchFn, server: fixed}: {
+  onClose: () => void;
+  fetchFn?: FetchLike;
+  server?: string;
+}) {
   const studio = useStudio();
-  const [server, setServer] = useState(loadServer);
+  const [server, setServer] = useState(() => fixed ?? loadServer());
   const [sessions, setSessions] = useState<ReviewSession[]|null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -46,7 +52,7 @@ export function ReviewPicker({onClose, fetchFn}: {onClose: () => void; fetchFn?:
     setError('');
     try {
       setSessions(await listSessions(address, fetcher));
-      saveServer(address);
+      if (!fixed) saveServer(address);
     } catch (e) {
       setSessions(null);
       setError(errorMessage(e));
@@ -90,14 +96,14 @@ export function ReviewPicker({onClose, fetchFn}: {onClose: () => void; fetchFn?:
     <div className="review-picker" role="dialog" aria-modal="true"
          aria-label="Open a recorded session">
       <h3>Open a recorded session</h3>
-      <form onSubmit={e => {
+      {!fixed && <form onSubmit={e => {
         e.preventDefault();
         void list(server);
       }}>
         <input aria-label="Review server address" value={server}
                onChange={e => setServer(e.target.value)}/>
         <button disabled={busy}>List sessions</button>
-      </form>
+      </form>}
       {error && <div className="alert-error">{error}</div>}
       {sessions && !sessions.length && <p className="review-empty">No sessions.</p>}
       {sessions && sessions.length > 0 && <table className="review-sessions">
