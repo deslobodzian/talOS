@@ -85,6 +85,7 @@ cc_test(
         "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "//talOS/schema:test_messages",
+        "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
     ],
 )

@@ -17,76 +17,128 @@ namespace talos::telemetry {
 
 namespace {
 
-void AddScalar(const reflection::Schema& schema, reflection::BaseType base,
-               std::int32_t type_index, std::string_view field_name,
-               std::string name, std::size_t offset,
-               std::vector<Channel>& channels) {
-  Channel channel;
-  channel.name = std::move(name);
-  channel.kind = KindOf(base);
-  channel.offset = offset;
-  channel.base = base;
-  if (base == reflection::BaseType::Bool) {
-    // A bool has no unit.
-  } else if (type_index >= 0) {
-    channel.labels = EnumLabels(schema, type_index);
-  } else {
-    channel.unit = std::string{schema::unit_for_field(field_name)};
-  }
-  channels.push_back(std::move(channel));
-}
+// One topic's flattening, bounded against a schema that is damaged or
+// crafted (a recorded log's, which nothing checked against this build).
+class Flattener {
+ public:
+  Flattener(const reflection::Schema& schema, std::string_view topic,
+            std::vector<Channel>& channels)
+      : schema_{schema},
+        topic_{topic},
+        channels_{channels},
+        open_(schema.objects()->size()) {}
 
-void FlattenStruct(const reflection::Schema& schema,
-                   const reflection::Object& object, std::string_view prefix,
-                   std::size_t base_offset, std::vector<Channel>& channels) {
-  std::vector<const reflection::Field*> fields(object.fields()->begin(),
-                                               object.fields()->end());
-  std::sort(fields.begin(), fields.end(),
-            [](const reflection::Field* a, const reflection::Field* b) {
-              return a->id() < b->id();
-            });
-
-  for (const auto* field : fields) {
-    const std::string field_name = field->name()->str();
-    const std::string channel_name = std::string{prefix} + "/" + field_name;
-    const auto& type = *field->type();
-    const std::size_t field_offset = base_offset + field->offset();
-
-    if (type.base_type() == reflection::BaseType::Obj) {
-      const auto* nested = schema.objects()->Get(type.index());
-      if (nested != nullptr) {
-        FlattenStruct(schema, *nested, channel_name, field_offset, channels);
-      }
-      continue;
+  // Flattens object `index` (reached through `field`) at `base_offset`.
+  void Struct(std::size_t index, std::string_view field,
+              std::string_view prefix, std::size_t base_offset,
+              std::size_t depth) {
+    if (depth > kMaxNestingDepth) {
+      Refuse(field, "nests structs more than " +
+                        std::to_string(kMaxNestingDepth) + " deep");
     }
+    if (open_[index]) Refuse(field, "contains its own struct");
+    if (++structs_ > kMaxTopicStructs) {
+      Refuse(field, "expands to more than " + std::to_string(kMaxTopicStructs) +
+                        " struct instances");
+    }
+    const reflection::Object& object =
+        *schema_.objects()->Get(static_cast<flatbuffers::uoffset_t>(index));
+    open_[index] = true;
+    std::vector<const reflection::Field*> fields(object.fields()->begin(),
+                                                 object.fields()->end());
+    std::sort(fields.begin(), fields.end(),
+              [](const reflection::Field* a, const reflection::Field* b) {
+                return a->id() < b->id();
+              });
 
-    if (type.base_type() == reflection::BaseType::Array) {
-      const std::size_t count = type.fixed_length();
-      const std::size_t element_bytes =
-          type.element() == reflection::BaseType::Obj
-              ? schema.objects()->Get(type.index())->bytesize()
-              : flatbuffers::GetTypeSize(type.element());
-      for (std::size_t i = 0; i < count; ++i) {
-        const std::string element_name = channel_name + "/" + std::to_string(i);
-        const std::size_t element_offset = field_offset + i * element_bytes;
-        if (type.element() == reflection::BaseType::Obj) {
-          const auto* nested = schema.objects()->Get(type.index());
-          if (nested != nullptr) {
-            FlattenStruct(schema, *nested, element_name, element_offset,
-                          channels);
+    for (const auto* field_def : fields) {
+      const std::string field_name = field_def->name()->str();
+      const std::string channel_name = std::string{prefix} + "/" + field_name;
+      const auto& type = *field_def->type();
+      const std::size_t field_offset = base_offset + field_def->offset();
+
+      if (type.base_type() == reflection::BaseType::Obj) {
+        Struct(ObjectIndex(type.index(), field_name), field_name, channel_name,
+               field_offset, depth + 1);
+        continue;
+      }
+
+      if (type.base_type() == reflection::BaseType::Array) {
+        const std::size_t count = type.fixed_length();
+        const bool nested = type.element() == reflection::BaseType::Obj;
+        const std::size_t element =
+            nested ? ObjectIndex(type.index(), field_name) : 0;
+        const std::size_t element_bytes =
+            nested ? static_cast<std::size_t>(
+                         schema_.objects()
+                             ->Get(static_cast<flatbuffers::uoffset_t>(element))
+                             ->bytesize())
+                   : flatbuffers::GetTypeSize(type.element());
+        for (std::size_t i = 0; i < count; ++i) {
+          const std::string element_name =
+              channel_name + "/" + std::to_string(i);
+          const std::size_t element_offset = field_offset + i * element_bytes;
+          if (nested) {
+            Struct(element, field_name, element_name, element_offset,
+                   depth + 1);
+          } else {
+            AddScalar(type.element(), type.index(), field_name, element_name,
+                      element_offset);
           }
-        } else {
-          AddScalar(schema, type.element(), type.index(), field_name,
-                    element_name, element_offset, channels);
         }
+        continue;
       }
-      continue;
-    }
 
-    AddScalar(schema, type.base_type(), type.index(), field_name, channel_name,
-              field_offset, channels);
+      AddScalar(type.base_type(), type.index(), field_name, channel_name,
+                field_offset);
+    }
+    open_[index] = false;
   }
-}
+
+ private:
+  [[noreturn]] void Refuse(std::string_view field, std::string_view why) const {
+    throw std::invalid_argument("telemetry: schema for topic '" +
+                                std::string{topic_} + "': field '" +
+                                std::string{field} + "' " + std::string{why});
+  }
+
+  // The index of object `index`, refusing one the schema does not hold.
+  std::size_t ObjectIndex(std::int32_t index, std::string_view field) const {
+    if (index < 0 ||
+        static_cast<std::size_t>(index) >= schema_.objects()->size()) {
+      Refuse(field, "names no object");
+    }
+    return static_cast<std::size_t>(index);
+  }
+
+  void AddScalar(reflection::BaseType base, std::int32_t type_index,
+                 std::string_view field_name, std::string name,
+                 std::size_t offset) {
+    if (channels_.size() >= kMaxTopicChannels) {
+      Refuse(field_name, "is past the topic's " +
+                             std::to_string(kMaxTopicChannels) + " channels");
+    }
+    Channel channel;
+    channel.name = std::move(name);
+    channel.kind = KindOf(base);
+    channel.offset = offset;
+    channel.base = base;
+    if (base == reflection::BaseType::Bool) {
+      // A bool has no unit.
+    } else if (type_index >= 0) {
+      channel.labels = EnumLabels(schema_, type_index);
+    } else {
+      channel.unit = std::string{schema::unit_for_field(field_name)};
+    }
+    channels_.push_back(std::move(channel));
+  }
+
+  const reflection::Schema& schema_;
+  std::string_view topic_;
+  std::vector<Channel>& channels_;
+  std::vector<bool> open_;  // by object index: being flattened now
+  std::size_t structs_{0};
+};
 
 Channel Unread(std::string name, ChannelKind kind, std::string unit = "",
                std::vector<std::string> labels = {}) {
@@ -143,7 +195,12 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
   std::string_view prefix = topic;
   if (prefix.starts_with('/')) prefix.remove_prefix(1);
   std::vector<Channel> channels;
-  FlattenStruct(*schema, *object, prefix, 0, channels);
+  const auto* objects = schema->objects();
+  std::size_t root = 0;
+  while (objects->Get(static_cast<flatbuffers::uoffset_t>(root)) != object) {
+    ++root;
+  }
+  Flattener{*schema, topic, channels}.Struct(root, schema_name, prefix, 0, 0);
   return channels;
 }
 

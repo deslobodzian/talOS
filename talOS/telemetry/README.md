@@ -123,7 +123,11 @@ Channels are discovered automatically from the graph descriptors. Rules 1 to
 4 are `//talOS/telemetry:channels` (`channels.h`), the one implementation of
 the channel model: `FlattenTopic(topic, schema_name, bfbs)` lists a topic's
 channels (name, kind, unit, labels, and the scalar's offset and type) from
-its schema, `ReadChannel` reads one channel's raw sample from a message's
+its schema, refusing a schema that names an object it does not hold, holds
+a struct that contains itself, nests structs more than 16 deep, or expands
+to more than 2048 channels or 4096 struct instances (`channels.h`; a
+recorded log's schema may be damaged or crafted), `ReadChannel` reads one
+channel's raw sample from a message's
 bytes (absent when the message ends before it), and `DriverStationChannels`
 and `ReadDriverStation` do the same for the Driver Station packet. The node
 builds its dictionary and reads every tick through it, so anything that
