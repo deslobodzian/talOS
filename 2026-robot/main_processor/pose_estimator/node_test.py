@@ -111,7 +111,7 @@ class Chassis:
     def publish(self, *, sample_time_ns=None, modules_valid=True,
                 yaw_valid=True, distance_m=None):
         fields = dict(
-            sample_time_ns=(round(self.sim.now * 1e9)
+            sample_time_ns=(self.sim.now_ns
                             if sample_time_ns is None else sample_time_ns),
             enabled=False, modules_valid=modules_valid, yaw_valid=yaw_valid,
             vx_mps=self.velocity[0], vy_mps=self.velocity[1],
@@ -203,7 +203,7 @@ class EstimatorTest(unittest.TestCase):
                             chassis.distances[0] += 100.0
                         else:
                             chassis.yaw += 2.0
-                        rejected_ns = round(self.sim.now * 1e9)
+                        rejected_ns = self.sim.now_ns
                         chassis.publish()
                         self.sim.step(DT)
                         self.assertPoseHeld(before)
@@ -671,7 +671,7 @@ class EstimatorTest(unittest.TestCase):
                 e = self.estimate()
                 self.assertTrue(e.valid)
                 self.assertEqual(e.sample_time_ns,
-                                 round((self.sim.now - DT) * 1e9))
+                                 self.sim.now_ns - round(DT * 1e9))
                 self.assertEqual((e.velocity_vx_mps, e.velocity_omega_radps),
                                  (1.0, 1.0))
                 self.assertEqual(self.counts(), (0, 0))
@@ -767,7 +767,7 @@ class EstimatorTest(unittest.TestCase):
                 self.hw.set_driver_station(enabled=False, teleop=True)
                 self.chassis = Chassis(self.sim)
                 self.sim.step(DT)
-                self.observe(time_ns=round(self.sim.now * 1e9))
+                self.observe(time_ns=self.sim.now_ns)
                 self.sim.step(DT)
                 e = self.estimate()
                 self.assertFalse(e.valid)
