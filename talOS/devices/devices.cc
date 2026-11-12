@@ -412,6 +412,13 @@ Duration RezeroAgeBound(const hardware::Config& config) {
       std::llround(kStatusPeriods * 1e6 / config.status_hz)};
 }
 
+Duration ReadinessAgeBound(const hardware::Config& config) {
+  // The RoboRIO's LATE threshold, rounded as it rounds it.
+  constexpr double kStatusPeriods = 4;
+  return std::chrono::microseconds{static_cast<std::int64_t>(
+      std::ceil(kStatusPeriods * 1e6 / config.status_hz))};
+}
+
 std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
                                        std::string_view name) {
   HardwareLink::Impl& impl = *link.impl_;

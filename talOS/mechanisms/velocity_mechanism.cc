@@ -13,7 +13,7 @@ VelocityMechanism::VelocityMechanism(Node& node, std::string_view name)
       label_{"VelocityMechanism '" + std::string{name} + "'"},
       motor_{node, name},
       velocity_age_bound_{
-          RezeroAgeBound(node.extension<HardwareLink>().config().hardware)},
+          ReadinessAgeBound(node.extension<HardwareLink>().config().hardware)},
       max_rps_{MotorConfigOf(node, name).max_velocity_rps} {
   const Params params{node, name};
   entry_rps_ = params.positive("at_speed_entry_rps", 2.0);
@@ -85,8 +85,8 @@ void VelocityMechanism::update() {
   readiness(spin ? request_rps_ : 0.0);
 }
 
-// The velocity's age at its State, judged as Motor::rezero judges a
-// position's (RezeroAgeBound); an unknown age is never recent.
+// The velocity's age at its State against ReadinessAgeBound; an unknown age
+// is never recent.
 bool VelocityMechanism::velocity_recent() const {
   const std::optional<Duration> age = motor_.velocity_age();
   return age && *age <= velocity_age_bound_;

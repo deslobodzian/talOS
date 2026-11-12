@@ -293,10 +293,12 @@ on the node. They do not reset hardware and work while disabled. Disconnected,
 stale, or non-finite feedback and non-finite inputs leave the offset unchanged.
 `Motor::rezero` also refuses a position sample older, at the State it
 arrived in (`Motor::position_age()`), than `RezeroAgeBound` (`devices.h`):
-two status periods of `[robot] status_hz`, 10 ms at 200 Hz. The same bound
-decides whether a velocity sample counts toward `VelocityMechanism`'s at
-speed (`Motor::velocity_age()`). Both ages are read from the State, so
-neither use waits for the bridge's clock mapping. Whatever a rezero pairs the position
+two status periods of `[robot] status_hz`, 10 ms at 200 Hz.
+`VelocityMechanism`'s at speed counts a velocity sample
+(`Motor::velocity_age()`) only within `ReadinessAgeBound`, four status
+periods, since readiness is judged every tick and must not flap on one late
+frame. Both ages are read from the State, so neither use waits for the
+bridge's clock mapping. Whatever a rezero pairs the position
 with (a switch, a hard stop, a constant) is as of that State, and feedback
 stays valid up to `command_timeout_us` old, so a mechanism moving at 1 rot/s
 on a 100 ms-old position would take a frame 0.1 rot off. A frame is under
