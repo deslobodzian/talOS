@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <streambuf>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -16,26 +17,41 @@
 namespace talos::launcher {
 
 // ---------------------------------------------------------------------------
-// Child output
+// The launcher's output: its own lines and its members'
 //
-// Every roster member writes its stdout and stderr into one pipe, which a
-// ChildOutput drains into the member's `<output_dir>/<name>.log`, every run
-// appended to the one file after a line naming the run and its pid, and,
-// except for the Studio bridge, echoes to the launcher's stdout.
+// No launcher thread waits on the launcher's stdout or stderr. They are a
+// terminal, a pipe or a socket that may be closed, full or never read (a
+// paused pager, an ssh session sshd has not yet found dead), and a write to
+// one can then block for good; the supervision loop that restarts crashed
+// nodes and stops the session must not be the thread that waits.
 //
-// A child's write blocks only while its pipe is full, so the pipe is drained
-// by a thread that never waits for a disk: it only moves what arrives into a
-// bounded buffer in memory. A second thread writes those buffers to the log
-// files, and a third the echo to stdout: a one-line write to a file on a
-// loaded disk can take hundreds of milliseconds (222 ms at p99 with eight
-// disk writers on the Mac mini), and so can stdout when it is a file or a
-// pipe read slowly. While a writer is behind, a member's buffer (or the
-// echo's) grows to kChildOutputBufferBytes; what arrives beyond it is
-// dropped, counted, and marked where it was lost. A write to stdout that
-// cannot succeed later (a pipe whose reader closed it: EPIPE, since the
-// launcher ignores SIGPIPE) ends the echo for the session; the logs go on.
+// LauncherOutput takes the launcher's stdout and stderr for a Launcher::Run.
+// std::cout, std::cerr and std::clog write into it rather than into
+// descriptors 1 and 2, and so does the echo of node output: a write appends
+// to a bounded buffer in memory, under a mutex no thread holds across I/O,
+// and returns. One thread writes those buffers to the real descriptors and
+// is the only one that may wait on them; once the session directory exists,
+// a second writes every launcher line (not the echo) to its
+// `<output_dir>/<session_id>/talos.log` as well, so a terminal that is gone,
+// slow or never read loses only what it would have shown.
 //
-// The child's end of the pipe stays blocking. A nonblocking one would turn a
+// ChildOutput drains every roster member's stdout and stderr, one pipe per
+// run, into the member's `<name>.log`, every run appended after a line naming
+// the run and its pid, and, except for the Studio bridge, echoes it to the
+// launcher's stdout through the LauncherOutput. Its reading thread never
+// waits for a disk: it only moves what arrives into a bounded buffer in
+// memory, and a second thread writes the logs. A one-line write to a file on
+// a loaded disk can take hundreds of milliseconds (222 ms at p99 with eight
+// disk writers on the Mac mini).
+//
+// Every buffer holds at most kChildOutputBufferBytes while its writer is
+// behind, besides the batch the writer has taken; what arrives beyond that
+// is dropped, counted, and marked where it was lost once the writer catches
+// up. A descriptor that fails for good (EPIPE: the launcher ignores SIGPIPE;
+// a closed or broken descriptor) is not written again in the session, and
+// one line on the other descriptor and in talos.log says so.
+//
+// A member's end of its pipe stays blocking. A nonblocking one would turn a
 // full pipe into EAGAIN inside the child: stdio loses the data and sets the
 // stream's error flag, iostreams set badbit, which silences std::cout or
 // std::cerr for the rest of the run, and Python raises BlockingIOError out of
@@ -44,25 +60,132 @@ namespace talos::launcher {
 // fills its pipe (64 KiB on macOS, kChildOutputPipeBytes on Linux).
 // ---------------------------------------------------------------------------
 
-// What one member's output, or the echo, may hold in memory while the writer
-// is behind.
+// What one buffer -- a member's output, the echo, each launcher descriptor,
+// talos.log -- may hold in memory while its writer is behind.
 inline constexpr std::size_t kChildOutputBufferBytes = std::size_t{1} << 20;
-// What one member's output log may hold in a session; later output is
-// dropped, counted, and the log says so.
+// What one member's output log, or talos.log, may hold in a session; later
+// output is dropped, counted, and the log says so.
 inline constexpr uint64_t kChildOutputLogMaxBytes = uint64_t{64} << 20;
+// The launcher's own lines in a session directory. `talos` is a reserved
+// owner, so no member's `<name>.log` takes this name; `launcher` is a legal
+// node name.
+inline constexpr std::string_view kLauncherOutputFile = "talos.log";
+// How long LauncherOutput::Stop waits for descriptors 1 and 2 to take what
+// is buffered for them before it drops the rest.
+inline constexpr std::chrono::milliseconds kLauncherOutputLinger{1000};
 
 // The log a member's stdout and stderr are drained into, all runs together.
 std::string NodeOutputPath(const std::string& output_dir,
                            std::string_view name);
 
+class LauncherOutput {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  // Takes std::cout, std::cerr and std::clog (and clears their error state)
+  // and starts the writer threads, which block every signal so that the
+  // launcher's handlers run on its own threads. Throws std::system_error
+  // when a pipe or thread cannot be created; then nothing is taken. One at a
+  // time per process.
+  LauncherOutput();
+  ~LauncherOutput();
+  LauncherOutput(const LauncherOutput&) = delete;
+  LauncherOutput& operator=(const LauncherOutput&) = delete;
+
+  // From here on every launcher line also goes to `path` (talos.log).
+  // Lines before it go to the descriptors only.
+  void Record(const std::string& path);
+
+  // Node output for descriptor 1 only (ChildOutput's echo). Never waits.
+  void Echo(std::string_view bytes);
+
+  // Waits up to `linger` for descriptors 1 and 2 to take what is buffered
+  // for them and drops the rest (counted in talos.log), writes everything
+  // left to talos.log, stops the threads and gives std::cout, std::cerr and
+  // std::clog back. A write already in progress to a terminal whose output
+  // is stopped (Ctrl-S) still holds it until it returns. Idempotent.
+  void Stop(std::chrono::milliseconds linger = kLauncherOutputLinger);
+
+ private:
+  // A streambuf that hands every byte written to it to Say. Unbuffered, so
+  // several threads may write through one (each call is atomic, as on a
+  // descriptor; their lines can interleave).
+  class Sink : public std::streambuf {
+   public:
+    Sink(LauncherOutput& owner, int fd) : owner_{owner}, fd_{fd} {}
+
+   protected:
+    int_type overflow(int_type c) override;
+    std::streamsize xsputn(const char* data, std::streamsize size) override;
+    int sync() override { return 0; }
+
+   private:
+    LauncherOutput& owner_;
+    const int fd_;
+  };
+
+  // One real descriptor: 1, or 2 unless it is the same file as 1, whose
+  // lines then share 1's queue and keep their order.
+  struct Descriptor {
+    int fd{-1};           // A close-on-exec copy; -1 when unusable.
+    std::size_t chunk{};  // Bytes per write (PIPE_BUF for a pipe or socket).
+    const char* name{""};
+    // Under mutex_:
+    std::string pending;
+    uint64_t dropped{0};  // Since the writer last took `pending`.
+    bool closed{false};
+  };
+
+  // Appends `size` bytes written to std::cout (fd 1) or std::cerr and
+  // std::clog (fd 2) to that descriptor's buffer and to talos.log's.
+  void Say(int fd, const char* data, std::size_t size);
+
+  // Appends to `to` up to the buffer bound; returns the bytes dropped.
+  static std::size_t Append(std::string& to, const char* data,
+                            std::size_t size);
+
+  // A full wake pipe already holds a wakeup.
+  void Wake();
+
+  // Writes the descriptors' buffers, waiting on poll() for each to take
+  // more; never longer than the stop's linger once stopping.
+  void DescriptorLoop();
+
+  // Writes talos.log's buffer until the descriptor loop has ended and
+  // nothing is left.
+  void FileLoop();
+
+  // Descriptor 2's lines go to `descriptors_[target_[1]]`.
+  Descriptor descriptors_[2];
+  std::size_t target_[2]{0, 1};
+  Sink out_{*this, 1};
+  Sink err_{*this, 2};
+  std::streambuf* previous_[3]{nullptr, nullptr, nullptr};
+  int wake_[2]{-1, -1};
+  std::mutex mutex_;
+  std::condition_variable file_wake_;
+  // Guarded by mutex_.
+  std::string file_path_;
+  std::string file_pending_;
+  uint64_t file_dropped_{0};
+  bool stopping_{false};
+  std::chrono::milliseconds linger_{0};
+  Clock::time_point give_up_{};
+  bool descriptors_done_{false};
+  bool stopped_{false};  // The owner's: Stop has run.
+  std::thread descriptor_writer_;
+  std::thread file_writer_;
+};
+
 class ChildOutput {
  public:
   using Clock = std::chrono::steady_clock;
 
-  // Starts the reader, writer and echo threads, which block every signal so
-  // that the launcher's handlers run on its own threads. Throws
+  // Starts the reader and writer threads, which block every signal so that
+  // the launcher's handlers run on its own threads. Echoed output goes to
+  // `echo` (none without one), which must outlive Stop. Throws
   // std::system_error when a pipe or thread cannot be created.
-  ChildOutput();
+  explicit ChildOutput(LauncherOutput* echo = nullptr);
   ~ChildOutput();
   ChildOutput(const ChildOutput&) = delete;
   ChildOutput& operator=(const ChildOutput&) = delete;
@@ -75,8 +198,7 @@ class ChildOutput {
 
   // Waits up to `linger` for every pipe to end -- its run has exited, but a
   // descendant that left the process group can hold it open -- writes out
-  // everything that arrived, and stops the threads. The echo still waits for
-  // a stdout that does not drain, as every launcher line does. Idempotent.
+  // everything that arrived, and stops the threads. Idempotent.
   void Stop(std::chrono::milliseconds linger = std::chrono::milliseconds{500});
 
   // Bytes of the output bound for `path` that were dropped so far: the
@@ -98,19 +220,9 @@ class ChildOutput {
     uint64_t dropped_total{0};
     int runs{0};
   };
-  struct LogFile {
-    int fd{-1};
-    uint64_t written{0};
-    bool capped{false};
-    bool reported{false};
-  };
 
   // A full wake pipe already holds a wakeup.
   void Wake();
-
-  // A line marking `count` lost bytes, starting a line of its own.
-  static std::string DropNote(const std::string& before, uint64_t count,
-                              std::string_view why);
 
   // Moves `size` bytes read from `stream` into its buffers, dropping what
   // they cannot hold.
@@ -120,39 +232,23 @@ class ChildOutput {
   // `linger_` has passed. Touches no file.
   void ReadLoop();
 
-  // Appends `bytes` to `path`'s log up to kChildOutputLogMaxBytes. Returns
-  // the bytes it could not write.
-  static uint64_t WriteLog(LogFile& file, const std::string& path,
-                           std::string bytes);
-
-  // Writes all of `bytes` to `fd`. Returns the bytes left unwritten, with
-  // errno set, after an error.
-  static std::size_t WriteAll(int fd, std::string_view bytes);
-
   // Takes what the reader buffered and writes it out, until the reader has
   // ended and nothing is left.
   void WriteLoop();
 
-  // Copies echoed output to the launcher's stdout, on its own thread: a
-  // stdout that is slow, or a pipe nobody reads, never holds up the logs.
-  void EchoLoop();
-
+  LauncherOutput* const echo_;
   int wake_[2]{-1, -1};
   mutable std::mutex mutex_;
   std::condition_variable arrived_;
   // Guarded by mutex_.
   std::vector<Stream> added_;
   std::map<std::string, Pending> pending_;
-  std::string echo_;
-  uint64_t echo_dropped_{0};
-  bool echo_closed_{false};  // A write to stdout failed for good (EchoLoop).
   bool dirty_{false};
   bool stopping_{false};
   bool reader_done_{false};
   std::chrono::milliseconds linger_{0};
   std::thread reader_;
   std::thread writer_;
-  std::thread echoer_;
 };
 
 // SpawnProcess with the child's stdout and stderr drained into `path` by

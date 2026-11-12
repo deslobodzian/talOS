@@ -12,7 +12,6 @@
 
 #include <cerrno>
 #include <csignal>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -225,8 +224,8 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
   c_args.reserve(args.size() + 1);
   for (auto& arg : args) c_args.push_back(arg.data());
   c_args.push_back(nullptr);
-  std::cout.flush();
-  std::fflush(nullptr);
+  // No stdio flush first: the child never flushes the buffers it copies (it
+  // execs or _exits), and a flush here could wait on the launcher's stdout.
   const pid_t parent = ::getpid();
   int lifetime[2];
   int errors[2];

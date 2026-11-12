@@ -69,7 +69,8 @@ uint64_t LogSessionId(const std::filesystem::path& path) {
 // (what --replay-inputs leaves). A directory named by a session id that
 // holds nothing, or only what a launch writes before it starts its nodes
 // -- graph.json, the declared graph, an interrupted atomic write's
-// temporary, an empty event log -- is an abandoned launch: --describe-only,
+// temporary, an empty event log, the launcher's own lines
+// (kLauncherOutputFile) -- is an abandoned launch: --describe-only,
 // a refused graph, or a launch that failed or died before its manifest.
 // Any other content (another session's log, a retention record of what
 // that launch removed, any other file or directory) makes it no session.
@@ -89,7 +90,8 @@ Retained Classify(const std::filesystem::directory_entry& entry,
   constexpr std::string_view kLaunchFiles[] = {
       "graph.json",        "declared_graph.json",
       "graph.json.tmp",    "declared_graph.json.tmp",
-      "manifest.json.tmp", "retention.txt.tmp"};
+      "manifest.json.tmp", "retention.txt.tmp",
+      kLauncherOutputFile};
   bool abandoned = true;
   for (fs::directory_iterator file{entry.path(), error};
        !error && file != fs::directory_iterator{}; file.increment(error)) {

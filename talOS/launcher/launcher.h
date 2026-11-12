@@ -84,10 +84,17 @@ class Launcher {
   // the duration passes or a signal arrives, and writes manifest.json.
   // Returns 0, or the last nonzero exit code of a node. With --replay-inputs
   // it runs only the --only node, on recorded topics (RunOnRecordedInputs).
-  // Sets the process's SIGPIPE disposition to ignored, for good.
+  // Sets the process's SIGPIPE disposition to ignored, for good. While it
+  // runs, std::cout, std::cerr and std::clog write into a LauncherOutput
+  // (child_output.h), never into descriptors 1 and 2 directly, and from the
+  // session directory's creation also into its talos.log; it returns once
+  // they have taken what was written, or kLauncherOutputLinger has passed.
   int Run();
 
  private:
+  // Run's body, with the launcher's output taken.
+  int RunSession();
+
   // Replaces manifest.json with the session's state and `procs`. Before the
   // first node starts, and for the final manifest, it is written here and in
   // place when this returns; only a `durable` one is synced (the roster
@@ -351,7 +358,10 @@ class Launcher {
   std::unique_ptr<ManifestWriter> manifest_writer_;  // PersistManifest
   // Set by Run from --max-restarts or the config, and the window.
   RestartLimits restart_limits_{};
-  // Drains every member's output for the session (Run); empty before it.
+  // The launcher's stdout and stderr while Run runs; empty otherwise.
+  std::optional<LauncherOutput> launcher_output_;
+  // Drains every member's output for the session (Run), echoing through
+  // launcher_output_; empty before it.
   std::optional<ChildOutput> output_;
   // Held by Run for the session, refreshed by Supervise; null without one.
   const SessionLock* session_lock_{nullptr};

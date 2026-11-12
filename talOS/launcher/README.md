@@ -272,39 +272,51 @@ launcher drains into `<output_dir>/<session_id>/<name>.log`: every run of the
 member appended to that one file after a line naming it, such as
 `[launcher] alpha run 1, pid 4242` for the run that writes
 `alpha.restart1.tlog`. Except for the Studio bridge, the output is also
-echoed to the launcher's stdout. A deployed robot therefore keeps its nodes'
-output beside their event logs, whatever happens to the launcher's own.
+echoed to the launcher's stdout. Every line the launcher prints itself, from
+the session directory's creation on, also goes to that directory's
+`talos.log` (a line printed before it exists, such as a refused config, goes
+to the terminal only). A deployed robot therefore keeps its nodes' output and
+the launcher's beside their event logs, whatever happens to the launcher's
+stdout and stderr.
 
-A launcher whose stdout or stderr reader closes (a `tee` or a log pipe
-ending) keeps supervising: it ignores SIGPIPE, ends the echo at its first
-write that fails that way, and keeps writing every member's log. Every
-process it spawns starts with every signal at its default disposition and
-none blocked, whatever the launcher inherited (`nohup`'s ignored SIGHUP,
-`&`'s ignored SIGINT and SIGQUIT, its own ignored SIGPIPE). A reader that stays
-open but stops reading is different: once the pipe or terminal is full, the
-launcher's own next line blocks its supervision loop (no restart, stall kill
-or stop) until the reader reads again.
+Neither a print nor the launcher waits for a disk or for the launcher's
+stdout or stderr: a one-line write to a file on a loaded disk can take
+hundreds of milliseconds, far past a node's `command_timeout_us`, and a
+terminal or pipe nobody reads (a paused pager, an ssh session sshd has not
+yet found dead) can take a write forever. One launcher thread only reads
+the members' pipes into memory; others write the logs, `talos.log`, and the
+launcher's stdout and stderr, and only that last one ever waits on them.
+The launcher's own lines (`std::cout`, `std::cerr`) go into memory as well,
+so supervision (restarts, stall kills, the stop) goes on whatever its
+stdout does. While a writer is behind, up to 2 MiB per member, 2 MiB for
+`talos.log` and 2 MiB for each of the launcher's stdout and stderr (one
+buffer when they are the same file, as with `2>&1` or a terminal) wait in
+memory: a 1 MiB batch the writer has taken and a refilled 1 MiB pending
+buffer. Beyond that output is dropped, and the log (or the stdout or
+stderr) says how many bytes where they were lost, as does a launcher line
+at the end of the session for a member's log. A stdout or stderr whose
+write fails for good (its reader closed it: EPIPE, as the launcher ignores
+SIGPIPE) is not written again; a line on the other one and in `talos.log`
+says so. At the end the launcher gives its stdout and stderr 1 s to take
+what is left, then drops it and says how much in `talos.log`. A member's
+log, and `talos.log`, keep at most 64 MiB per session, then say so and drop
+the rest. The child's end of the pipe stays blocking: a nonblocking one
+would make a full pipe an error inside the node (lost data and an error flag
+in stdio, a silenced `std::cout`/`std::cerr` in iostreams, `BlockingIOError`
+from Python's `print`). A node can still block if the launcher's reading
+thread is not scheduled while it fills its pipe (64 KiB on macOS, 256 KiB
+requested on Linux).
+
+Every process the launcher spawns starts with every signal at its default
+disposition and none blocked, whatever the launcher inherited (`nohup`'s
+ignored SIGHUP, `&`'s ignored SIGINT and SIGQUIT, its own ignored SIGPIPE).
 
 A terminal hangup (an interactive ssh session or a terminal window closing
 sends SIGHUP) stops the session in order, as SIGTERM does, unless the
 launcher started with SIGHUP ignored (`nohup`), which it then keeps
-ignoring. A session that must outlive its terminal runs under the boot
-service ([deployment](../../docs/DEPLOYMENT.md)) or `nohup`.
-
-A print never waits for a disk or for the launcher's stdout: a one-line write
-to a file on a loaded disk can take hundreds of milliseconds, far past a
-node's `command_timeout_us`. One launcher
-thread only reads the pipes into memory; others write the logs and the echo.
-While a writer is behind, up to 2 MiB per member (and 2 MiB of echo) waits in
-memory: a 1 MiB batch the writer has taken and a refilled 1 MiB pending buffer; beyond that output is dropped, and the log (or the echo) says how many
-bytes where they were lost, as does a launcher line at the end of the session.
-A member's log keeps at most 64 MiB per session, then says so and drops the
-rest. The child's end of the pipe stays blocking: a nonblocking one would make
-a full pipe an error inside the node (lost data and an error flag in stdio, a
-silenced `std::cout`/`std::cerr` in iostreams, `BlockingIOError` from Python's
-`print`). A node can still block if the launcher's reading thread is not
-scheduled while it fills its pipe (64 KiB on macOS, 256 KiB requested on
-Linux).
+ignoring. A closed pipe costs only the echo; a session that must outlive its
+terminal runs under the boot service ([deployment](../../docs/DEPLOYMENT.md))
+or `nohup`.
 
 stdout is a pipe, not a terminal, so C stdio and Python buffer it in blocks
 and a killed run loses what it had not flushed; write diagnostics to stderr.
@@ -652,7 +664,7 @@ header:
 |---|---|---|
 | `:session` | `session.h`, `session_lock.h`, `session_retention.h`, `file_digest.h` | manifest.json and run history, atomic writes, the session lock, what retention reads of a recorded session, the log budget split |
 | `:spawn` | `spawn.h` | `SpawnProcess` (process group, guardian, child reports), `ChildExitWakeup` |
-| `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output) |
+| `:child_output` | `child_output.h` | `ChildOutput`, the drain behind [node output](#node-output), and `LauncherOutput`, the launcher's own stdout, stderr and `talos.log` |
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and `tlog_to_wpilog`'s inputs name, each once |
@@ -785,8 +797,8 @@ written.
 
 A directory named
 by a session id that holds nothing, or only what a launch writes before it
-starts its nodes (`graph.json`, `declared_graph.json`, the `.tmp` of an
-interrupted write, and the empty `.tlog` a node leaves when it dies between
+starts its nodes (`graph.json`, `declared_graph.json`, `talos.log`, the
+`.tmp` of an interrupted write, and the empty `.tlog` a node leaves when it dies between
 its log writer creating the file and writing the header), is a launch that
 recorded nothing:
 `--describe-only`, a refused graph, or a launch that failed or died early. It

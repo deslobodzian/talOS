@@ -165,7 +165,8 @@ run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
 
 Each node's stdout and stderr, every run of it, land in
-`<prefix>/logs/<session-id>/<name>.log` ([node output](../talOS/launcher/README.md#node-output)).
+`<prefix>/logs/<session-id>/<name>.log`, and the launcher's own lines in
+`<prefix>/logs/<session-id>/talos.log` ([node output](../talOS/launcher/README.md#node-output)).
 
 For event-log byte budgets, retention, capped recordings, manifest-write
 recovery and what is synced to disk when, see [session segments and logs](../talOS/launcher/README.md#session-segments-and-logs).
@@ -173,14 +174,16 @@ recovery and what is synced to disk when, see [session segments and logs](../tal
 ### Boot service output
 
 The launcher's own output is the record of a launch that fails before it
-writes a session manifest (a bad config, a refused graph); its errors go to
-stderr. On Linux both streams go to the journal (`journalctl -u talos`). The
+creates its session directory (a bad config, a held session lock); from that
+directory's creation on, a refused graph included, its lines are also in
+`<session>/talos.log`. Its errors go to stderr. On Linux both streams go to the journal (`journalctl -u talos`). The
 macOS LaunchDaemon sends stderr to `/Library/Logs/talos/launchd.stderr.log`
 and stdout (progress lines, already in the manifest, and the uncapped echo
 of node output, already in each `<name>.log`) to `/dev/null`. Node output,
 including a node's `realtime scheduling incomplete` line, is in its
 `<session>/<name>.log`, not this file; the launcher's own warning for a
-bridge or control loop without its realtime grant is here, and the outcome is
+bridge or control loop without its realtime grant is here (and in
+`<session>/talos.log`), and the outcome is
 in the [session manifest](../talOS/launcher/README.md#session-manifest). launchd appends to it across
 launches without marking where one starts. newsyslog, which macOS runs
 hourly as root, renames it once it passes 1024 KiB and keeps four older
