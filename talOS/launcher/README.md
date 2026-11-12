@@ -929,9 +929,10 @@ session directory and the file, or the file twice) is merged once
 - `--since-ms ms`, `--until-ms ms`: inclusive event-time bounds in milliseconds
   relative to the earliest record in the entire input session, **before**
   filtering. Values must be finite numbers.
-- `--format text|jsonl|csv`: default `text`; `jsonl` emits one JSON object per
-  matching record; `csv` emits a header and RFC-4180 rows. Machine-readable
-  formats omit the human-readable preamble and summary.
+- `--format text|jsonl|csv|summary`: default `text`; `jsonl` emits one JSON
+  object per matching record; `csv` emits a header and RFC-4180 rows.
+  Machine-readable formats omit the human-readable preamble and summary.
+  `summary` prints one block per topic instead of the records (below).
 - `--config robot.toml`: the config whose device names label the hardware
   packets (below). Without it, `log_dump` reads the `config_path` of the
   `manifest.json` in a session directory it was given, when that file still
@@ -971,6 +972,31 @@ bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
   --node drivetrain,pose_estimator --topic '/drivetrain/*' \
   --since-ms 1000 --until-ms 5000 --format jsonl
 ```
+
+`--format summary` answers "did it move" without reading every record. Each
+matching topic (or timer) is one block, topics sorted by name and blocks
+separated by a blank line:
+
+```text
+topic /gamma/state continuity_test.Count
+  records gamma TIMER 3
+  first_ms 2.000
+  last_ms 22.000
+  latest {run_index: 4, sequence_count: 9}
+  range run_index 2 11
+  range sequence_count 9 9
+```
+
+`records` counts the matching records per process and kind (a topic read by
+two nodes is counted in each log). `first_ms` and `last_ms` are the earliest
+and latest publication times, on the same baseline as the other formats (a
+timer's event time). `latest` is the last merged record's decoded value
+(`hardware` too for a hardware packet), and each `range` line gives a
+numeric or bool field's smallest and largest value over the matching
+records, as decoded, in field order (`message.<field>` inside a target
+envelope, `<field>[i]` for an array element). The summary is folded in
+during the streaming pass, so its memory grows with the topics and their
+fields, not the records.
 
 Both export formats contain `process`, `dispatch_index`, `kind`, `source_id`,
 `topic`, `event_ms`, `now_ms`, `publish_ms`, `sequence`, `aux`,

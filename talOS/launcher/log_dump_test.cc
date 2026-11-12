@@ -9,6 +9,7 @@
 #include <fstream>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -43,8 +44,10 @@ class LogDumpTest : public testing::Test {
 
   void TearDown() override { std::filesystem::remove_all(directory_); }
 
+  // One record per time, each {7, 9} unless `values` gives them.
   void WriteLog(const std::string& process, const std::string& topic,
-                const std::vector<int>& times) {
+                const std::vector<int>& times,
+                const std::vector<continuity_test::Count>& values = {}) {
     using D = talos::Descriptor<continuity_test::Count>;
     talos::event::Registration source;
     source.id = 1;
@@ -69,7 +72,8 @@ class LogDumpTest : public testing::Test {
       ctx.now = ctx.event_time;
       ctx.publish_time = ctx.event_time - std::chrono::milliseconds{3};
       ctx.sequence = i + 1;
-      const continuity_test::Count value{7, 9};
+      const continuity_test::Count value =
+          values.empty() ? continuity_test::Count{7, 9} : values.at(i);
       writer.dispatch(ctx, std::as_bytes(std::span{&value, 1}));
     }
     writer.flush();
@@ -268,6 +272,45 @@ TEST_F(LogDumpTest, LogNamedTwiceIsReadOnce) {
   const std::string alpha = directory_ + "/alpha.tlog";
   const auto records = Run({"--format", "jsonl", alpha, alpha});
   EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 4) << records;
+}
+
+// Guards: the summary a student reads to see whether a mechanism moved. Per
+// topic it counts the records, keeps the latest value, and ranges each
+// numeric field over the session numerically (11 above 2, though the
+// latest is 4); --topic and --node select its blocks.
+// REQ-OPS-15
+TEST_F(LogDumpTest, SummaryGivesCountsLatestValueAndRangePerTopic) {
+  WriteLog("gamma", "/gamma/state", {5, 15, 25}, {{2, 9}, {11, 9}, {4, 9}});
+  const auto lines = [](const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream{text};
+    for (std::string line; std::getline(stream, line);) out.push_back(line);
+    return out;
+  };
+  const auto has = [](const std::vector<std::string>& block,
+                      const std::string& line) {
+    return std::find(block.begin(), block.end(), line) != block.end();
+  };
+
+  const auto gamma = lines(Run({"--format", "summary", "--topic", "/gamma/*"}));
+  EXPECT_EQ(std::count_if(gamma.begin(), gamma.end(),
+                          [](const std::string& line) {
+                            return line.starts_with("topic ");
+                          }),
+            1);
+  EXPECT_TRUE(has(gamma, "topic /gamma/state continuity_test.Count"));
+  EXPECT_TRUE(has(gamma, "  records gamma TIMER 3"));
+  EXPECT_TRUE(has(gamma, "  latest {run_index: 4, sequence_count: 9}"));
+  EXPECT_TRUE(has(gamma, "  range run_index 2 11"));
+  EXPECT_TRUE(has(gamma, "  range sequence_count 9 9"));
+  // Publication times: each record was published 3 ms before its event.
+  EXPECT_TRUE(has(gamma, "  first_ms 2.000"));
+  EXPECT_TRUE(has(gamma, "  last_ms 22.000"));
+
+  const auto alpha = lines(Run({"--format", "summary", "--node", "alpha"}));
+  EXPECT_TRUE(has(alpha, "topic /alpha/state continuity_test.Count"));
+  EXPECT_TRUE(has(alpha, "  records alpha TIMER 2"));
+  EXPECT_FALSE(has(alpha, "topic /gamma/state continuity_test.Count"));
 }
 
 TEST_F(LogDumpTest, RejectsInvalidOptions) {
