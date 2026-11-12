@@ -116,22 +116,25 @@ void WriteShooterRun(const std::string& path, int first, int last,
   LogWriterOptions options{8192, 1, false};
   options.max_bytes = max_bytes;
   LogWriter writer{path, "shooter", options, kSessionId};
-  writer.start({Source(kTick, SourceKind::TIMER, "update", 0, {}),
-                Source(kShot, SourceKind::SENDER, "/shooter/state",
-                       sizeof(review_test::Shot), ShotSchema()),
-                Source(kRequest, SourceKind::SENDER, "/hw/request/shooter",
-                       sizeof(talos::hardware::Packet), PacketSchema()),
-                Source(kStatus, SourceKind::SENDER, "/shooter/status",
-                       sizeof(review_test::Status), StatusSchema())},
-               MonotonicTime::from_nanos(kStartNs + first * 20 * kMs));
+  writer.start(
+      {Source(kTick, SourceKind::TIMER, "update", 0, {}),
+       Source(kShot, SourceKind::SENDER, "/shooter/state",
+              sizeof(review_test::Shot), ShotSchema()),
+       Source(kRequest, SourceKind::SENDER, "/hw/request/shooter",
+              sizeof(talos::hardware::Packet), PacketSchema()),
+       Source(kStatus, SourceKind::SENDER, "/shooter/status",
+              sizeof(review_test::Status), StatusSchema())},
+      MonotonicTime::from_nanos(kStartNs + std::int64_t{first} * 20 * kMs));
   std::uint64_t index = 0;
   for (int k = first; k <= last; ++k) {
     Context tick{};
     tick.kind = EventKind::TIMER;
     tick.source_id = kTick;
     tick.dispatch_index = ++index;
-    tick.event_time = MonotonicTime::from_nanos(kStartNs + k * 20 * kMs);
-    tick.now = MonotonicTime::from_nanos(kStartNs + k * 20 * kMs + kMs / 2);
+    tick.event_time =
+        MonotonicTime::from_nanos(kStartNs + std::int64_t{k} * 20 * kMs);
+    tick.now = MonotonicTime::from_nanos(kStartNs + std::int64_t{k} * 20 * kMs +
+                                         kMs / 2);
     tick.sequence = 1;
     writer.dispatch(tick, {});
     const review_test::Shot shot = ShotOf(k);
@@ -163,10 +166,12 @@ void WriteObserver(const std::string& path) {
   std::vector<Event> events;
   for (int k = 0; k <= 499; ++k) {
     if (k % 5 != 0 || (k > 299 && k < 350)) continue;
-    events.push_back({kStartNs + k * 20 * kMs + kMs * 3 / 2, kShot, k});
+    events.push_back(
+        {kStartNs + std::int64_t{k} * 20 * kMs + kMs * 3 / 2, kShot, k});
   }
   for (int k = 0; k <= 100; ++k) {
-    events.push_back({kStartNs + k * 100 * kMs + 2 * kMs, kDriverStation, k});
+    events.push_back(
+        {kStartNs + std::int64_t{k} * 100 * kMs + 2 * kMs, kDriverStation, k});
   }
   std::sort(events.begin(), events.end(), [](const Event& a, const Event& b) {
     return a.event_ns < b.event_ns;
@@ -190,14 +195,14 @@ void WriteObserver(const std::string& path) {
     message.sequence = static_cast<std::uint64_t>(e.k) + 1;
     if (e.source == kShot) {
       message.source_id = kShot;
-      message.publish_time =
-          MonotonicTime::from_nanos(kStartNs + e.k * 20 * kMs + kMs / 2);
+      message.publish_time = MonotonicTime::from_nanos(
+          kStartNs + std::int64_t{e.k} * 20 * kMs + kMs / 2);
       const review_test::Shot shot = ShotOf(e.k);
       writer.dispatch(message, Bytes(shot));
     } else {
       message.source_id = kDriverStation;
       message.publish_time =
-          MonotonicTime::from_nanos(kStartNs + e.k * 100 * kMs);
+          MonotonicTime::from_nanos(kStartNs + std::int64_t{e.k} * 100 * kMs);
       const talos::hardware::Packet packet = DriverStationOf(e.k);
       writer.dispatch(message, Bytes(packet));
     }
@@ -214,7 +219,8 @@ void DamagePacket(const std::string& path, int k) {
     talos::event::log::LogReader::Record record;
     while (reader.next(record)) {
       if (record.header.source_id == kDriverStation &&
-          record.header.publish_time_ns == kStartNs + k * 100 * kMs) {
+          record.header.publish_time_ns ==
+              kStartNs + std::int64_t{k} * 100 * kMs) {
         offset = record.offset;
         break;
       }
