@@ -66,6 +66,35 @@ void WriteChildReport(int errors, const ChildReport& report) {
   ::_exit(127);
 }
 
+// In a forked child: every catchable signal back to its default disposition,
+// then nothing blocked. An ignored disposition and the mask survive exec, and
+// the launcher may hold either: it ignores SIGPIPE itself, `nohup` ignores
+// SIGHUP, `&` from a non-interactive shell ignores SIGINT and SIGQUIT, and the
+// spawning thread may block signals. Dispositions go first, so a signal the
+// unblocking delivers meets its default. sigaction, sigemptyset and
+// sigprocmask are async-signal-safe; sigaction refuses (EINVAL) the numbers
+// a C library reserves for itself, which keep theirs.
+void DefaultSignals() {
+  struct sigaction action {};
+  action.sa_handler = SIG_DFL;
+  sigemptyset(&action.sa_mask);
+  for (int signal = 1; signal < NSIG; ++signal) {
+    if (signal == SIGKILL || signal == SIGSTOP) continue;
+    ::sigaction(signal, &action, nullptr);
+  }
+  sigset_t none;
+  sigemptyset(&none);
+  ::sigprocmask(SIG_SETMASK, &none, nullptr);
+}
+
+// In the forked guardian: ignores `signal`. Async-signal-safe.
+void IgnoreSignal(int signal) {
+  struct sigaction action {};
+  action.sa_handler = SIG_IGN;
+  sigemptyset(&action.sa_mask);
+  ::sigaction(signal, &action, nullptr);
+}
+
 // How SpawnProcess names a child's failed step.
 std::string ChildStepName(ChildStep step, const std::string& program) {
   switch (step) {
@@ -276,20 +305,17 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
 #endif
   // The launcher died first, so nothing reads a report.
   if (::getppid() != parent) ::_exit(127);
-  std::signal(SIGINT, SIG_DFL);
-  std::signal(SIGTERM, SIG_DFL);
-  // The launcher ignores SIGPIPE, and an ignored signal stays ignored across
-  // exec: a program expects the default.
-  std::signal(SIGPIPE, SIG_DFL);
+  DefaultSignals();
   const pid_t group = ::getpid();
   const pid_t guardian = ::fork();
   if (guardian < 0) ReportChildFailure(errors[1], ChildStep::kGuardian);
   if (guardian == 0) {
-    // The launcher waits for every copy of the error pipe's writer to close.
-    ::close(errors[1]);
     // Graceful group signals belong to the node; the guardian waits for EOF.
-    std::signal(SIGINT, SIG_IGN);
-    std::signal(SIGTERM, SIG_IGN);
+    // Ignored before the launcher can see this spawn finish and signal the
+    // group: it waits for every copy of the error pipe's writer to close.
+    IgnoreSignal(SIGINT);
+    IgnoreSignal(SIGTERM);
+    ::close(errors[1]);
     // Unlike the node it never execs, so any other descriptor of the
     // launcher's process, close-on-exec or not, would stay open for as long
     // as the node runs: another thread's registry lock would stay locked.

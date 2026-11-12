@@ -545,18 +545,28 @@ cc_test(
     ],
 )
 
-# A session whose stdout and stderr reader closes, and the SIGPIPE
-# disposition its children start with (REQ-OPS-33).
+# A session whose stdout and stderr reader closes, and the signal
+# dispositions and mask its children start with (REQ-OPS-33).
 cc_test(
     name = "closed_output_test",
     size = "small",
     srcs = ["closed_output_test.cc"],
+    data = [":signal_probe"],
+    env = {"TALOS_SIGNAL_PROBE": "$(rlocationpath :signal_probe)"},
     # Each spawn is two fork()s; see launcher_test.
     tags = ["no_macos_sanitizer"],
     deps = [
         ":launcher_lib",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
+)
+
+# Prints the signals it started with ignored or blocked.
+cc_binary(
+    name = "signal_probe",
+    testonly = True,
+    srcs = ["testdata/signal_probe.cc"],
 )
 
 # A publisher that kills itself (SIGKILL) on its first run and exits cleanly

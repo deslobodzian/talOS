@@ -277,8 +277,10 @@ output beside their event logs, whatever happens to the launcher's own.
 
 A launcher whose stdout or stderr reader closes (an ssh session or a `tee`
 ending) keeps supervising: it ignores SIGPIPE, ends the echo at its first
-write that fails that way, and keeps writing every member's log; every
-process it spawns starts with SIGPIPE at its default. A reader that stays
+write that fails that way, and keeps writing every member's log. Every
+process it spawns starts with every signal at its default disposition and
+none blocked, whatever the launcher inherited (`nohup`'s ignored SIGHUP,
+`&`'s ignored SIGINT and SIGQUIT, its own ignored SIGPIPE). A reader that stays
 open but stops reading is different: once the pipe or terminal is full, the
 launcher's own next line blocks its supervision loop (no restart, stall kill
 or stop) until the reader reads again.
