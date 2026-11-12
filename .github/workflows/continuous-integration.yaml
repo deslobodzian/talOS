@@ -518,12 +518,22 @@ jobs:
       working-directory: 2026-robot/controller_processor/rio
       run: ./gradlew installRoboRioToolchain
 
+    - name: Keep the Phoenix simulation's device files in memory
+      # Phoenix 6 desktop simulation rewrites each simulated device's flash
+      # file (ctre_sim/*.dat, about 1250 rewrites in the 2 s after a
+      # configure) while holding the lock the loop's Phoenix calls take, so
+      # the loop waits as long as the runner's disk does (370 ms in run
+      # 43023451199). The RoboRIO has no such files. The loop's own config
+      # save (talos_config.bin) stays on disk.
+      working-directory: 2026-robot/controller_processor/rio
+      run: mkdir -p /dev/shm/ctre_sim && ln -sfn /dev/shm/ctre_sim ctre_sim
+
     - name: Build and start the desktop simulation once
       # The test runs Gradle with --offline, so everything simulateNative
       # resolves (WPILib and Phoenix simulation natives) is fetched here.
-      # The robot, disabled, stops itself after two seconds; the first
-      # launch of the program and its Phoenix simulation happens here
-      # rather than in the test.
+      # The robot, disabled, stops itself after two seconds. No config is
+      # pushed, so no simulated device is created here; the first configure
+      # happens in the test.
       working-directory: 2026-robot/controller_processor/rio
       env:
         TALOS_SIM_DS: '0'
