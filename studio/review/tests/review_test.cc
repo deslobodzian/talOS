@@ -399,6 +399,65 @@ TEST(SeriesCacheTest, StaysUnderItsCapacityEvictingLeastRecentlyUsed) {
   EXPECT_LE(cache.bytes(), kCapacity);
 }
 
+// Guards one series request's share of the heap bound (README "Reviewing a
+// session"): a request past kMaxSeriesValues (channels x points; here one
+// channel named 14 times at 20,000 points) is refused naming the limit, and
+// one at it answers within kMaxSeriesRequestBytes. Without the cap, 256
+// channels at 20,000 points held ~400 MB however small --cache-mb was.
+// REQ-OPS-42
+TEST_F(ReviewTest, SeriesPastItsValueCeilingIsRefused) {
+  Review review{Library(), 1u << 20};
+  const auto request = [&review](std::size_t channels) {
+    std::string query = "start_ns=" + std::to_string(kStartNs) +
+                        "&end_ns=" + std::to_string(kStartNs + 10 * kSecond) +
+                        "&points=" + std::to_string(kMaxSeriesPoints) + "&c=";
+    for (std::size_t i = 0; i < channels; ++i) {
+      query += "shooter/state/position_m,";
+    }
+    return review.Get("/review/s1/series", query);
+  };
+  constexpr std::size_t kFits = kMaxSeriesValues / kMaxSeriesPoints;
+  const Response over = request(kFits + 1);
+  ASSERT_EQ(over.status, 400);
+  EXPECT_NE(over.body.find(std::to_string(kMaxSeriesValues)), std::string::npos)
+      << over.body;
+  const Response at = request(kFits);
+  ASSERT_EQ(at.status, 200) << at.body;
+  EXPECT_LE(SeriesRequestBytes(kFits, kMaxSeriesPoints),
+            kMaxSeriesRequestBytes);
+  EXPECT_EQ(at.body.size(), 8 + kFits * kMaxSeriesPoints * 36);
+}
+
+// Guards the bound on open sessions: opening one past kMaxOpenSessions
+// closes the least recently used, and a closed session reopens (its index
+// rebuilt) with the same answers. Without it every session ever opened
+// kept its index for the server's life.
+// REQ-OPS-42
+TEST_F(ReviewTest, OpenSessionsStayWithinTheirCap) {
+  const std::filesystem::path library = Directory() + "/many";
+  std::filesystem::create_directories(library);
+  for (std::size_t i = 0; i <= kMaxOpenSessions; ++i) {
+    std::filesystem::copy(Library() + "/s1",
+                          library / ("s" + std::to_string(i)),
+                          std::filesystem::copy_options::recursive);
+  }
+  Review review{library, 1u << 20};
+  const Response first = review.Get("/review/s0/bounds.json", "");
+  ASSERT_EQ(first.status, 200) << first.body;
+  for (std::size_t i = 1; i <= kMaxOpenSessions; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(
+        review.Get("/review/s" + std::to_string(i) + "/bounds.json", "").status,
+        200);
+    EXPECT_LE(review.open_sessions(), kMaxOpenSessions);
+  }
+  const Response again = review.Get("/review/s0/bounds.json", "");
+  EXPECT_EQ(again.status, 200);
+  EXPECT_EQ(again.body, first.body);
+  EXPECT_EQ(review.open_sessions(), kMaxOpenSessions);
+  std::filesystem::remove_all(library);
+}
+
 // Guards that a request names only a session directory inside the library:
 // a parent, a hidden or encoded name, and a symlink out of the library are
 // refused, never opened.
@@ -623,9 +682,9 @@ Listing List(const std::filesystem::path& root) {
 
 // Guards that review never writes into the library it reads: a library may
 // be a read-only copy, and classifying a session is the launcher's
-// retention's business. A non-simulation session (whose class is read from
-// its logs) is served by every endpoint and its files are unchanged, no
-// session_class added; then, with every mode bit made read-only, every
+// retention's business. A non-simulation session with no session_class
+// (so "unknown") is served by every endpoint and its files are unchanged,
+// no session_class added; then, with every mode bit made read-only, every
 // endpoint still answers.
 // REQ-OPS-41
 TEST_F(ReviewTest, LibraryIsNeverWritten) {
@@ -647,7 +706,7 @@ TEST_F(ReviewTest, LibraryIsNeverWritten) {
     const json sessions =
         json::parse(review.Get("/review/sessions.json", "").body);
     ASSERT_EQ(sessions.size(), 1u);
-    EXPECT_EQ(sessions[0]["class"], "other");
+    EXPECT_EQ(sessions[0]["class"], "unknown");
   };
   const Listing before = List(library);
   every_endpoint();
@@ -667,6 +726,55 @@ TEST_F(ReviewTest, LibraryIsNeverWritten) {
   every_endpoint();
   read_only(perms::owner_all, perms::owner_read | perms::owner_write);
   EXPECT_EQ(List(library), before);
+  std::filesystem::remove_all(library);
+}
+
+// Guards that listing sessions reads no event log (README "Reviewing a
+// session": no log file is read whole): a non-simulation session's class is
+// the launcher's session_class when current, else "unknown", even when its
+// logs would answer. Reading the logs (RecordedMatch) lists the fixture,
+// which has no FMS-attached packet, as "other" without a cache.
+// REQ-OPS-42
+TEST_F(ReviewTest, ListingClassifiesFromTheLauncherCacheOnly) {
+  const std::filesystem::path library = Directory() + "/classes";
+  testing::WriteFixtureSession((library / "s1").string());
+  std::string manifest = ReadFile(library / "s1/manifest.json");
+  const auto at = manifest.find("\"simulation\": true");
+  ASSERT_NE(at, std::string::npos);
+  manifest.replace(at, 18, "\"simulation\": false");
+  std::ofstream{library / "s1/manifest.json"} << manifest;
+  std::uintmax_t log_bytes = 0;
+  for (const auto& entry :
+       std::filesystem::directory_iterator{library / "s1"}) {
+    if (entry.path().extension() == ".tlog") log_bytes += entry.file_size();
+  }
+  const struct {
+    const char* cache;  // session_class's content, or null for none
+    const char* expected;
+  } cases[] = {
+      {nullptr, "unknown"},
+      {"match 0\n", "match"},
+      {"stale", "unknown"},
+      {"current", "other"},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.cache == nullptr ? "no cache" : c.cache);
+    const auto file = library / "s1/session_class";
+    if (c.cache == nullptr) {
+      std::filesystem::remove(file);
+    } else if (std::string_view{c.cache} == "stale") {
+      std::ofstream{file} << "other " << log_bytes + 1 << '\n';
+    } else if (std::string_view{c.cache} == "current") {
+      std::ofstream{file} << "other " << log_bytes << '\n';
+    } else {
+      std::ofstream{file} << c.cache;
+    }
+    Review review{library, 1u << 20};
+    const json sessions =
+        json::parse(review.Get("/review/sessions.json", "").body);
+    ASSERT_EQ(sessions.size(), 1u);
+    EXPECT_EQ(sessions[0]["class"], std::string{c.expected});
+  }
   std::filesystem::remove_all(library);
 }
 

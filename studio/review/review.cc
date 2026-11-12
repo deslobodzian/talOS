@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -77,25 +78,46 @@ void AppendLe(std::string& out, const void* data, std::size_t bytes) {
   out.append(static_cast<const char*>(data), bytes);
 }
 
-std::string_view ClassName(talos::launcher::MatchVerdict verdict) {
-  switch (verdict) {
-    case talos::launcher::MatchVerdict::kMatch:
-      return "match";
-    case talos::launcher::MatchVerdict::kUnknown:
-      return "unknown";
-    case talos::launcher::MatchVerdict::kOther:
-      break;
-  }
-  return "other";
-}
-
 struct SessionEntry {
   std::string id;
   std::int64_t start_wall_ns{0};
   std::int64_t end_wall_ns{0};
+  // It has a manifest that does not say the launch was a simulation.
+  bool classified{false};
   std::string_view verdict;
   std::vector<std::pair<std::string, std::uintmax_t>> files;
 };
+
+// The largest manifest.json the listing parses; a larger one (no launcher
+// writes one) lists the session without its times. The launcher's
+// session_class file is one short line.
+constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{4} << 20;
+constexpr std::size_t kMaxClassFileBytes = 256;
+
+// A session's class from what the launcher already decided, never from its
+// logs: a simulation, or a session without a manifest, is "other", as
+// retention classifies it; else the launcher's session_class
+// file when it is current (written by RecordedMatch: "match" for good,
+// "other" while the event logs hold the bytes it counted), else "unknown".
+std::string_view ClassOf(const fs::path& dir, const SessionEntry& entry) {
+  if (!entry.classified) return "other";
+  std::uintmax_t log_bytes = 0;
+  for (const auto& [name, bytes] : entry.files) {
+    if (name.ends_with(".tlog")) log_bytes += bytes;
+  }
+  std::ifstream stream{dir / std::string{talos::launcher::kSessionClassFile}};
+  std::string line(kMaxClassFileBytes, '\0');
+  stream.read(line.data(), static_cast<std::streamsize>(line.size()));
+  line.resize(static_cast<std::size_t>(stream.gcount()));
+  std::istringstream cached{line};
+  std::string verdict;
+  std::uintmax_t bytes = 0;
+  if (cached >> verdict >> bytes) {
+    if (verdict == "match") return "match";
+    if (verdict == "other" && bytes == log_bytes) return "other";
+  }
+  return "unknown";
+}
 
 // A library session: a directory holding a manifest or an event log.
 bool IsSession(const fs::path& dir) {
@@ -125,8 +147,17 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
   }
   if (!session) return std::nullopt;
   std::sort(entry.files.begin(), entry.files.end());
-  std::ifstream stream{dir / "manifest.json"};
-  if (stream) {
+  const auto manifest_file = std::find_if(
+      entry.files.begin(), entry.files.end(),
+      [](const auto& file) { return file.first == "manifest.json"; });
+  // A launch's manifest that does not say it was a simulation is
+  // classified, as retention classifies it (launcher::InspectSession).
+  entry.classified = manifest_file != entry.files.end();
+  std::ifstream stream;
+  if (entry.classified && manifest_file->second <= kMaxManifestBytes) {
+    stream.open(dir / "manifest.json");
+  }
+  if (stream.is_open()) {
     const auto manifest = nlohmann::json::parse(
         std::string{std::istreambuf_iterator<char>{stream}, {}}, nullptr,
         /*allow_exceptions=*/false);
@@ -139,6 +170,9 @@ std::optional<SessionEntry> ReadEntry(const fs::path& dir) {
           *field = it->get<std::int64_t>();
         }
       }
+      const auto simulation = manifest.find("simulation");
+      entry.classified = simulation == manifest.end() ||
+                         !simulation->is_boolean() || !simulation->get<bool>();
     }
   }
   return entry;
@@ -209,8 +243,10 @@ const Session* Review::Open(std::string_view id, Response& error) {
     error = Error(400, "invalid session id");
     return nullptr;
   }
+  ++requests_;
   if (const auto it = sessions_.find(id); it != sessions_.end()) {
-    return it->second.get();
+    it->second.used = requests_;
+    return it->second.session.get();
   }
   const fs::path dir = library_ / std::string{id};
   std::error_code ignored;
@@ -222,7 +258,14 @@ const Session* Review::Open(std::string_view id, Response& error) {
   try {
     auto session = Session::Open(dir);
     const Session* opened = session.get();
-    sessions_.emplace(std::string{id}, std::move(session));
+    if (sessions_.size() >= kMaxOpenSessions) {
+      sessions_.erase(std::min_element(sessions_.begin(), sessions_.end(),
+                                       [](const auto& a, const auto& b) {
+                                         return a.second.used < b.second.used;
+                                       }));
+    }
+    sessions_.emplace(std::string{id},
+                      OpenSession{std::move(session), requests_});
     return opened;
   } catch (const std::exception& e) {
     // A log of another format version, another session's, or none.
@@ -240,18 +283,7 @@ Response Review::Sessions() {
     if (!it->is_directory(type_error) || it->is_symlink(type_error)) continue;
     auto entry = ReadEntry(it->path());
     if (!entry) continue;
-    // Classified read-only (the library is not ours to write, and may be
-    // read-only), so remembered here until the session's files change size.
-    std::uintmax_t bytes = 0;
-    for (const auto& file : entry->files) bytes += file.second;
-    auto& known = classes_[entry->id];
-    if (known.first != bytes || known.second.empty()) {
-      known = {bytes,
-               ClassName(talos::launcher::InspectSession(
-                             it->path(), talos::launcher::ClassCache::kReadOnly)
-                             .verdict)};
-    }
-    entry->verdict = known.second;
+    entry->verdict = ClassOf(it->path(), *entry);
     entries.push_back(std::move(*entry));
   }
   std::sort(entries.begin(), entries.end(),
@@ -399,6 +431,11 @@ Response Review::Series(std::string_view id, const Session& session,
   if (names.empty() || names.size() > kMaxSeriesChannels) {
     return Error(400, "series needs 1.." + std::to_string(kMaxSeriesChannels) +
                           " channels (c=)");
+  }
+  if (names.size() * static_cast<std::size_t>(points) > kMaxSeriesValues) {
+    return Error(400, "series asks for at most " +
+                          std::to_string(kMaxSeriesValues) +
+                          " values (channels x points)");
   }
   std::vector<ChannelRef> refs;
   for (const std::string& name : names) {
