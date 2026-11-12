@@ -333,6 +333,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     cfg.CurrentLimits.SupplyCurrentLimit = units::ampere_t{m.supply_limit_a};
     cfg.CurrentLimits.StatorCurrentLimitEnable = true;
     cfg.CurrentLimits.StatorCurrentLimit = units::ampere_t{m.stator_limit_a};
+    // The gateway applies the config on every session start; no beep for it.
+    // The boot beep stays: it is how a power cycle is heard.
+    cfg.Audio.BeepOnConfig = false;
     cfg.Voltage.PeakForwardVoltage = units::volt_t{m.max_voltage};
     cfg.Voltage.PeakReverseVoltage = units::volt_t{-m.max_voltage};
     cfg.Feedback.RotorToSensorRatio = m.rotor_to_sensor_ratio;
