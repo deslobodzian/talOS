@@ -123,6 +123,7 @@ STUDIO_TESTS = {
     "manifest_test": "manifest.test.ts",
     "panels_test": "panels.test.tsx",
     "plot_test": "plot.test.tsx",
+    "recorded_test": "recorded.test.tsx",
     "robot_panel_test": "robot_panel.test.tsx",
     "robot_test": "robot.test.ts",
     "session_test": "session.test.tsx",
