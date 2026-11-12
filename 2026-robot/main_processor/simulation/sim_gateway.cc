@@ -238,6 +238,9 @@ int main(int argc, char** argv) {
       auto robot_config = talos::config::ParseRobotConfig(config_path);
       auto hw_config = robot_config.hardware;
       hw_config.commissioned = true;
+      // The wire carries no motor type: a config the bridge pushes later
+      // keeps each motor's type from this parse, matched by name.
+      physics_backend.SetLocalMotorTypes(hw_config);
       if (!gateway.Reconfigure(hw_config)) {
         throw std::runtime_error(
             "sim_gateway: Reconfigure failed for the robot config");

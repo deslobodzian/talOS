@@ -46,8 +46,8 @@ struct LocalMotorSetting {
 // winding model (sim_physics.h MotorModelFor).
 enum class MotorType : uint8_t { kKrakenX60 = 0, kKrakenX44, kFalcon500 };
 
-// A motor type only the main processor reads: like LocalMotorSetting, not on
-// the config wire and equal whatever its value.
+// A motor type the RoboRIO never reads: like LocalMotorSetting, not on the
+// config wire and equal whatever its value.
 struct LocalMotorType {
   MotorType value{MotorType::kKrakenX60};
   bool operator==(const LocalMotorType&) const { return true; }
@@ -86,9 +86,12 @@ struct MotorConfig {
   // positions in the sensor's frame, which survives a reset, from its first
   // state, and keeps its rezero across resets.
   LocalMotorSetting absolute_position_frame{};
-  // Main processor only, not part of ConfigurationId: the motor type, which
-  // sets the physics simulator's stall current and free speed. Kraken X60
-  // unless set; the robot config does not name it yet.
+  // [motors.*] motor_type = "kraken_x60" (the default), "kraken_x44" or
+  // "falcon_500": the physics simulator's stall current and free speed. Not
+  // sent to the controller and not part of ConfigurationId; the physics
+  // backend inside sim_gateway takes it from sim_gateway's own parse of the
+  // robot config, since a pushed config carries none
+  // (sim::PhysicsSimBackend::SetLocalMotorTypes).
   LocalMotorType motor_type{};
   bool operator==(const MotorConfig&) const = default;
 };

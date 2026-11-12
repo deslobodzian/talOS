@@ -269,8 +269,27 @@ class PhysicsSimBackend final : public Backend {
 
   const WorldState& truth() const { return truth_; }
 
+  // The motor types of the robot config sim_gateway parsed itself. A config
+  // the bridge pushes carries none (MotorConfig::motor_type is off the wire),
+  // so every later Configure gives each motor the type of the local motor
+  // with the same name (names are unique in a valid config); a motor the
+  // local config does not name keeps the type it was configured with, a
+  // Kraken X60 off the wire.
+  void SetLocalMotorTypes(const Config& local) {
+    local_motor_types_.clear();
+    for (const auto& m : local.motors) {
+      local_motor_types_[m.name] = m.motor_type.value;
+    }
+  }
+
   bool Configure(const Config& config) override {
     config_ = config;
+    for (auto& m : config_.motors) {
+      if (const auto it = local_motor_types_.find(m.name);
+          it != local_motor_types_.end()) {
+        m.motor_type.value = it->second;
+      }
+    }
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
     gyro_override_ = false;
@@ -1006,6 +1025,8 @@ class PhysicsSimBackend final : public Backend {
   std::unordered_map<uint16_t, double> analog_inputs_{};
   std::unordered_map<uint16_t, ManualEncoder> encoders_{};
   std::unordered_map<uint16_t, double> pwm_outputs_{};
+  // By motor name; SetLocalMotorTypes.
+  std::unordered_map<std::string, MotorType> local_motor_types_{};
   double supply_v_{12.0};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};
