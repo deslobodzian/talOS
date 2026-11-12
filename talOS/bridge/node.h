@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -28,6 +29,10 @@
 #include "talOS/rtms/wake.h"
 
 namespace talos::hardware {
+
+namespace bridge_test {
+class InProcessGateway;  // in_process_gateway.h, the bridge's own tests
+}  // namespace bridge_test
 
 // This node's identity, in one place: the registry row, the `--describe`
 // output and the launcher's config all have to agree on both strings, and a
@@ -238,6 +243,20 @@ class HardwareNode {
   void PublishIntrospection();
 
  private:
+  // The in-process gateway the bridge's component tests drive this node
+  // through instead of a socket: a testonly library private to talOS/bridge
+  // (in_process_gateway.h). It calls OpenTopics() and HandleGatewayFrame()
+  // and sets frame_sink_; nothing else can.
+  friend class bridge_test::InProcessGateway;
+
+  // Open() after its socket: the shared-memory topics, the packet log and
+  // the registry row.
+  void OpenTopics();
+  // One decoded datagram from the gateway (a State, a Driver Station packet
+  // or a config acknowledgement), received at `now_us`: what Tick()'s
+  // receive loop does with each frame of this protocol version it reads.
+  void HandleGatewayFrame(const protocol::DecodedFrame& frame, uint64_t now_us);
+
   // The sum of the per-topic counters: the registry's dispatch count.
   std::uint64_t DispatchCount() const;
   // Heartbeat and dispatch count alone, one registry sample; Pass() calls it
@@ -257,9 +276,10 @@ class HardwareNode {
 
   // Whether a subsystem request may merge: same configuration, boot, and
   // epoch as last observed (exact match), and an observation its MergeOwner
-  // admits against last_sample_time_us_ (MergeOwner::Admits: bounded age,
-  // never future, monotonic per subsystem). The gateway re-enforces the age
-  // bound, so it remains the safety backstop.
+  // admits against last_sample_time_us_ (MergeOwner::Admits: younger than
+  // command_timeout_us, never future, monotonic per subsystem). That age
+  // bound is the gateway's own, which re-enforces it, so it remains the
+  // safety backstop.
   bool HasRequestIdentity(const SubsystemTracker& tracker,
                           const Command& partial) const;
   // Whether every actuator a request addresses belongs to the subsystem that
@@ -316,6 +336,15 @@ class HardwareNode {
   bool simulation_;
 
   protocol::RuntimeUdpPeer peer_;
+  // Where SendToGateway() hands every frame instead of peer_, each send
+  // succeeding: set only by bridge_test::InProcessGateway, unset in
+  // production.
+  struct FrameSink {
+    void (*send)(void* context, protocol::FrameType type, uint64_t now_us,
+                 std::span<const uint8_t> payload){nullptr};
+    void* context{nullptr};
+  };
+  FrameSink frame_sink_{};
   // What every request subscriber's reader slot names while Run() waits.
   // Declared before subsystems_, so their slots are released first and no
   // publisher notifies a closed receiver.
