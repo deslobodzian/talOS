@@ -1088,5 +1088,50 @@ TEST(TelemetryJson, RejectsBytesThatAreNotV3Pages) {
   EXPECT_FALSE(state.has_frame);
 }
 
+// Clients that each take one send when the bucket holds a token, in the
+// order the bridge offered them.
+struct Grants {
+  int tokens = 0;
+  std::string order;
+  bool operator()(char client) {
+    if (tokens == 0) return false;
+    --tokens;
+    order.push_back(client);
+    return true;
+  }
+};
+
+// REQ-OPS-23
+TEST(ClientRotation, ADrainedClientWaitsForItsTurn) {
+  ClientRotation<char> rotation;
+  for (const char client : {'a', 'b', 'c'}) rotation.Add(client);
+  Grants grants;
+  for (int pass = 0; pass < 4; ++pass) {
+    grants.tokens = 1;
+    rotation.Pass(grants);
+  }
+  // `a` was just sent to, its output was partly buffered, and it drained
+  // with one send's budget in the bucket: `b` is owed that send.
+  grants.tokens = 1;
+  rotation.Drained('a', grants);
+  EXPECT_EQ(grants.order, "abcab");
+}
+
+// REQ-OPS-23
+TEST(ClientRotation, ADisconnectDoesNotSkipTheClientOwedTheTurn) {
+  ClientRotation<char> rotation;
+  for (const char client : {'a', 'b', 'c'}) rotation.Add(client);
+  Grants grants;
+  for (int pass = 0; pass < 2; ++pass) {
+    grants.tokens = 1;
+    rotation.Pass(grants);
+  }
+  // `c` is owed the next send when `b`, ahead of it, disconnects.
+  rotation.Remove('b');
+  grants.tokens = 1;
+  rotation.Pass(grants);
+  EXPECT_EQ(grants.order, "abc");
+}
+
 }  // namespace
 }  // namespace studio
