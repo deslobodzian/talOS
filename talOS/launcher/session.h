@@ -203,7 +203,7 @@ struct NodeProcessInfo {
   // whether a count of that run became nonzero: the one change worth a
   // manifest version of its own, since a count only grows within a run and
   // is normally 0. A later increase waits for the next version.
-  bool RecordDeliveryLoss(DeliveryCounts seen);
+  bool RecordDeliveryLoss(const DeliveryCounts& seen);
 
   // Records the start of a run (`pid` -1 for a spawn that failed).
   void BeginRun(pid_t run_pid);

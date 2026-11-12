@@ -1097,7 +1097,7 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   // increase rides the next version the launcher posts anyway (at the
   // latest the one the run's end posts), so a healthy session's counts add
   // no manifest version.
-  if (delivery && proc.RecordDeliveryLoss(std::move(*delivery))) changed = true;
+  if (delivery && proc.RecordDeliveryLoss(*delivery)) changed = true;
   if (live) {
     launch.endpoints_checked = true;
     if (CheckEndpoints(proc, launch, *live, live_complete)) changed = true;
