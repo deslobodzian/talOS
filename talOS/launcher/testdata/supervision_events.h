@@ -74,12 +74,13 @@ class SupervisionPasses {
   uint64_t started_{0};
 };
 
-// steady_clock plus however far the test has moved it ahead, and never past
-// where the test holds it: for LauncherOptions::supervision_clock, so that a
-// deadline the launcher measures on it (restart backoff, the Studio bridge's
-// retry interval, the session duration, the stop's SIGKILL) passes when the
-// test says, neither after a real wait nor, while held, before. Copies share
-// one state.
+// steady_clock plus however far the test has moved it ahead, or, while the
+// test holds it, exactly where the test holds it: for
+// LauncherOptions::supervision_clock, so that a deadline the launcher
+// measures on it (restart backoff, the Studio bridge's retry interval, the
+// session duration, the stop's SIGKILL) passes when the test says, neither
+// after a real wait nor, while held, before. It never reads less than it
+// has read. Copies share one state.
 class SteppedClock {
  public:
   SupervisionClock clock() const {
@@ -88,12 +89,40 @@ class SteppedClock {
   void Advance(std::chrono::nanoseconds by) {
     state_->ahead.fetch_add(by.count());
   }
-  // From now on the clock reads at most what it reads now plus `after`,
-  // until Release.
-  void Hold(std::chrono::nanoseconds after) {
-    state_->held.store((state_->Now() + after).time_since_epoch().count());
+  // Holds the clock where it reads now, which it returns.
+  SupervisionTime Freeze() {
+    const SupervisionTime now = state_->Now();
+    HoldAt(now);
+    return now;
   }
-  void Release() { state_->held.store(kFree); }
+  // The clock reads exactly `at`, no earlier than it has read, until
+  // HoldAt again or Release.
+  void HoldAt(SupervisionTime at) {
+    state_->held.store(at.time_since_epoch().count());
+  }
+  // The clock runs on from where it is held.
+  void Release() {
+    const int64_t held = state_->held.load();
+    if (held == kFree) return;
+    const int64_t real =
+        std::chrono::steady_clock::now().time_since_epoch().count();
+    state_->ahead.store(std::max(state_->ahead.load(), held - real));
+    state_->held.store(kFree);
+  }
+
+  // Releases the clock when it goes out of scope: a test that gives up
+  // waiting must not leave the launcher's own deadlines frozen, or its hang
+  // bound becomes a test-runner timeout with no message.
+  class ReleaseOnExit {
+   public:
+    explicit ReleaseOnExit(SteppedClock& clock) : clock_{clock} {}
+    ~ReleaseOnExit() { clock_.Release(); }
+    ReleaseOnExit(const ReleaseOnExit&) = delete;
+    ReleaseOnExit& operator=(const ReleaseOnExit&) = delete;
+
+   private:
+    SteppedClock& clock_;
+  };
 
  private:
   static constexpr int64_t kFree = INT64_MAX;
@@ -101,10 +130,10 @@ class SteppedClock {
     std::atomic<int64_t> ahead{0};
     std::atomic<int64_t> held{kFree};
     SupervisionTime Now() const {
-      const SupervisionTime moved = std::chrono::steady_clock::now() +
-                                    std::chrono::nanoseconds{ahead.load()};
-      const SupervisionTime cap{std::chrono::nanoseconds{held.load()}};
-      return std::min(moved, cap);
+      const int64_t at = held.load();
+      if (at != kFree) return SupervisionTime{std::chrono::nanoseconds{at}};
+      return std::chrono::steady_clock::now() +
+             std::chrono::nanoseconds{ahead.load()};
     }
   };
   std::shared_ptr<State> state_{std::make_shared<State>()};

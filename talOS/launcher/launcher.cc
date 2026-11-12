@@ -1268,7 +1268,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     if (!stop_sent &&
         (stop_requested_ != 0 || past_deadline || endpoints_refused_)) {
       stop_sent = true;
-      shutdown_deadline = now + std::chrono::seconds{2};
+      shutdown_deadline = now + kStopTimeout;
       std::cout << "[launcher] Stopping children...\n";
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];

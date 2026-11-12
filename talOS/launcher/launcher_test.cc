@@ -661,10 +661,11 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
 }
 
 // A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
-// at the stop's 2 s timeout, not before. The test holds the supervision
-// clock short of that timeout from before the stop until its peer has died
-// of the stop's SIGINT and a whole pass more has run, then moves it past
-// the timeout: alpha's run must end after that release.
+// at the stop timeout (kStopTimeout), neither before nor after. The test
+// freezes the supervision clock at the stop, holds it 100 ms short of the
+// timeout for two passes after its peer died of the stop's SIGINT (alpha
+// must outlive them), then at the timeout itself (alpha must be killed, and
+// the session end, within four passes).
 TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   const std::string tag = "ignore_interrupt";
   const std::string out_dir = TempPath(tag + "_out");
@@ -707,8 +708,18 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
     return manifest.substr(runs, manifest.find(']', runs) - runs);
   };
   testing::SupervisionPasses passes;
-  int64_t released_ns = 0;  // Wall time the clock was let past the timeout.
+  // When the clock had been held just short of the stop timeout for two
+  // passes: alpha's run must outlive it.
+  int64_t short_of_timeout_ns = 0;
+  bool at_timeout = false;  // The clock was then held at the timeout.
+  // Four passes ran with the clock at the timeout and the session still on:
+  // one may have read the clock before it moved, one kills alpha, one reaps
+  // it and ends the session, and a fourth means it was not killed.
+  bool late = false;
   std::jthread stopper{[&](const std::stop_token& stop) {
+    // Every exit, a give-up included, lets the launcher's own clock run on,
+    // so its duration ends the session and the test fails with a message.
+    const testing::SteppedClock::ReleaseOnExit release{clock};
     const auto wait = [&](const std::function<bool()>& done) {
       const auto give_up = std::chrono::steady_clock::now() + kHang;
       while (!stop.stop_requested() && !done() &&
@@ -716,19 +727,25 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
         std::this_thread::sleep_for(std::chrono::milliseconds{2});
       return !stop.stop_requested() && done();
     };
+    const auto passes_from_now = [&](uint64_t count) {
+      const uint64_t until = passes.Started() + count;
+      return wait([&] { return passes.Started() >= until; });
+    };
     if (!wait([&] { return std::filesystem::exists(trapped); })) return;
-    clock.Hold(std::chrono::seconds{1});
+    // The stop's pass reads exactly `stopped_at`.
+    const SupervisionTime stopped_at = clock.Freeze();
     ::kill(::getpid(), SIGTERM);
     if (!wait([&] {
           return runs_of(ReadFile(live), "beta").find("\"reason\": \"stop\"") !=
                  std::string::npos;
         }))
       return;
-    const uint64_t pass = passes.Started() + 2;
-    if (!wait([&] { return passes.Started() >= pass; })) return;
-    released_ns = WallClockNanos();
-    clock.Release();
-    clock.Advance(std::chrono::seconds{2});
+    clock.HoldAt(stopped_at + kStopTimeout - std::chrono::milliseconds{100});
+    if (!passes_from_now(2)) return;
+    short_of_timeout_ns = WallClockNanos();
+    clock.HoldAt(stopped_at + kStopTimeout);
+    at_timeout = true;
+    late = passes_from_now(4);
   }};
   const auto started = std::chrono::steady_clock::now();
   Launcher launcher{options};
@@ -737,7 +754,10 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   stopper.request_stop();
   stopper.join();
   EXPECT_LT(elapsed, std::chrono::seconds{10});
-  ASSERT_NE(released_ns, 0) << "the stop's SIGINT ended no peer";
+  ASSERT_TRUE(at_timeout)
+      << "the stop's SIGINT ended no peer, or the session ended first";
+  EXPECT_FALSE(late)
+      << "alpha was not killed once the clock reached the stop timeout";
   const auto run = runs_of(ReadFile(live), "alpha");
   EXPECT_NE(run.find("\"exit_signal\": 9, \"reason\": \"stop_timeout\""),
             std::string::npos)
@@ -745,7 +765,8 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   const std::string end_key = "\"end_wall_ns\": ";
   const auto end_at = run.find(end_key);
   ASSERT_NE(end_at, std::string::npos) << run;
-  EXPECT_GE(std::stoll(run.substr(end_at + end_key.size())), released_ns)
+  const int64_t ended_ns = std::stoll(run.substr(end_at + end_key.size()));
+  EXPECT_GE(ended_ns, short_of_timeout_ns)
       << "alpha was killed before the stop timeout: " << run;
   std::filesystem::remove(alpha);
   std::filesystem::remove(beta);
