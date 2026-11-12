@@ -18,6 +18,7 @@ cc_library(
         "session_lock.h",
         "session_retention.h",
     ],
+    visibility = ["//studio/review:__pkg__"],
     deps = [
         "//talOS/driver_station",
         "//talOS/events:events_core",
@@ -108,6 +109,7 @@ cc_library(
     name = "log_inputs",
     srcs = ["log_inputs.cc"],
     hdrs = ["log_inputs.h"],
+    visibility = ["//studio/review:__pkg__"],
     deps = ["//talOS/events:events_log"],
 )
 
@@ -117,6 +119,7 @@ cc_library(
     name = "log_merge",
     srcs = ["log_merge.cc"],
     hdrs = ["log_merge.h"],
+    visibility = ["//studio/review:__pkg__"],
     deps = [
         "//talOS/events:events_core",
         "//talOS/events:events_log",
@@ -205,6 +208,7 @@ cc_library(
     name = "hardware_record",
     srcs = ["hardware_record.cc"],
     hdrs = ["hardware_record.h"],
+    visibility = ["//studio/review:__pkg__"],
     deps = [
         "//talOS/driver_station",
         "//talOS/hardware",

@@ -156,6 +156,54 @@ feed, the [agent README](agent/README.md) for headless queries, and
 [DATA_FLOW](../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary) for the
 transport and frame budgets.
 
+## Reviewing a session
+
+`studio_review` serves recorded sessions, read straight from their `.tlog`
+event logs with no conversion step:
+
+```sh
+bazel run -c opt //studio/review:studio_review -- --library /tmp/talos_logs [--port 5805] [--cache-mb 256]
+```
+
+`--library` is a log root as the launcher writes it: one directory per
+session holding its `manifest.json` and event logs, rotated segments and
+restarts included ([session segments and logs](../talOS/launcher/README.md#session-segments-and-logs)).
+The server listens on 127.0.0.1 only (there is no flag to change that) and
+serves only `/review/*`: `sessions.json`, and per session `channels.json`,
+`bounds.json`, `snapshot?t_ns=` and `series?c=a,b&start_ns=&end_ns=&points=N`.
+Their shapes are in [`review/review.h`](review/review.h); anything else is
+404. A session id is one directory name of the library; a parent, hidden or
+symlinked one is refused.
+
+Values are what `log_dump --format jsonl` decodes from the same records,
+named as live telemetry names them (`talOS/telemetry:channels`): each
+talos_messages struct by field path, a target lane's envelope as
+`<lane>/mode_since_us`, `<lane>/active` and `<lane>/message/...`, the Driver
+Station packet as its live `hw/state/driver_station/*` channels, and the other
+hardware packets (`/hw/state`, `/hw/command`, `/hw/request/<node>`) by
+`log_dump`'s own decoder, a device by its logical id
+(`hw/request/shooter/motors/1/demand`). A topic is read from its writer's
+SEND records, else from the first reader's MESSAGE records. Every time is
+nanoseconds on the recording's monotonic clock (the merge's event time), and
+every value carries its publication time; `origin_wall_ns + t_ns` is the
+wall-clock time. A damaged log is read and warned about as `log_dump` reads
+it; a log of another format version is refused (422) naming the file and
+both versions.
+
+Opening a session streams it once, merged, and keeps per log file one
+24-byte checkpoint per second of event time that holds records (where that
+second starts, and which sources it holds). A series or snapshot seeks to
+the checkpoints it needs and reads those seconds only, one second either
+side of its range by event time: a message received or sent more than a
+second from its publication time is not found. No log file is read whole.
+Series buckets (min, max, last, count) are kept for repeated requests in an
+LRU of at most `--cache-mb`. So the heap is the index, plus that cache, plus
+one read window per open log (REQ-OPS-42). On a generated 203 MiB session
+(8 logs, 2.75 million records; `bazel run -c opt //studio/review:review_bench`,
+Linux x86-64, a loaded host) the index pass took 0.49 s and kept 66,240 B
+(2,760 log-file seconds), a series of 8 channels over the whole session
+0.46 s, and peak resident memory was 5.7 MiB.
+
 ## Tests
 
 Every `tests/*.test.ts*` file runs under `pnpm test`, and under Bazel through
