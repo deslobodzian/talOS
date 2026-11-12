@@ -1088,6 +1088,18 @@ TEST(TelemetryJson, RejectsBytesThatAreNotV3Pages) {
   EXPECT_FALSE(state.has_frame);
 }
 
+// REQ-OPS-23
+TEST(ClientSendBuffer, HoldsAQuarterSecondOfTheShareAboveAFloor) {
+  // max_clients = 1: the whole budget, so a 250 ms round trip still
+  // carries the client's share.
+  EXPECT_EQ(ClientSendBuffer::Bytes(160000), 40000);
+  EXPECT_EQ(ClientSendBuffer::Bytes(80000), 20000);
+  // At and below 65,536 B/s (max_clients >= 3) the floor holds.
+  EXPECT_EQ(ClientSendBuffer::Bytes(65536), 16 * 1024);
+  EXPECT_EQ(ClientSendBuffer::Bytes(40000), 16 * 1024);
+  EXPECT_EQ(ClientSendBuffer::Bytes(2500), 16 * 1024);
+}
+
 // Clients that each take one send when the bucket holds a token, in the
 // order the bridge offered them.
 struct Grants {

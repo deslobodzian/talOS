@@ -36,8 +36,8 @@ def connect(port, stalled=False):
 
 
 # Frames every reader receives before the probe ends. The non-reading client
-# takes its turns beside them until its send buffer (main.cc
-# kClientSendBufferBytes) is full, about 11 updates in; 20 leave at least
+# takes its turns beside them until its send buffer (16 KiB at four clients,
+# telemetry.h ClientSendBuffer) is full, about 11 updates in; 20 leave at least
 # nine in which the bridge holds it, before the wait for the next graph
 # refresh adds more.
 SERVED_FRAMES = 20

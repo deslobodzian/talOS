@@ -317,6 +317,30 @@ struct EgressBudget {
   }
 };
 
+// The kernel send buffer the bridge sets on each client (SO_SNDBUF). The
+// bridge holds a client only once a write leaves output buffered, which
+// happens only when this buffer is full; left to autotuning it grew to
+// 4 MiB on Linux, so a client that stopped reading kept its turns for about
+// 100 s of a 40,000 B/s share, all stale on arrival. Sized as what the
+// client's share sends in kSeconds, it holds at most that much of a stalled
+// client's output, and it limits a reading client below its share only
+// when its round trip exceeds kSeconds (macOS uses the value as given;
+// Linux reserves twice it, about the value in payload). Larger sends, such
+// as the 64,000 B burst of a joining client's dictionary and keyframe, take
+// several round trips: meanwhile the client is held (it skips passes, and
+// its telemetry resumes from the latest values), and it is disconnected
+// only past uWebSockets' 512 KiB maxBackpressure. kMinBytes keeps a client
+// on a small share from being held on every update: a dozen value pages.
+struct ClientSendBuffer {
+  static constexpr double kSeconds = 0.25;
+  static constexpr int kMinBytes = 16 * 1024;
+  static int Bytes(double share_bytes_per_second) {
+    return std::max(
+        kMinBytes,
+        static_cast<int>(std::ceil(share_bytes_per_second * kSeconds)));
+  }
+};
+
 // What one client has been sent, so its next update carries only what
 // changed. Pump is called whenever there may be something to send (each new
 // tick, each bridge pass); it never sends what the client already has.
