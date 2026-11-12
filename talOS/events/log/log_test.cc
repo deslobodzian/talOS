@@ -192,7 +192,7 @@ constexpr std::uint64_t kFixtureSession = 0x123456789ABCDEF0ULL;
 // on-disk order so callers can verify the reader against them.
 std::vector<ExpectedRecord> WriteFixtureWithOptions(
     const std::string& path, LogWriter::Options options) {
-  LogWriter writer{path, "talos_log_test", options, kFixtureSession};
+  LogWriter writer{path, "talos_log_test", std::move(options), kFixtureSession};
   const Manifest manifest = MakeManifest();
   const MonotonicTime start_time = MonotonicTime::from_nanos(42);
   writer.start(manifest, start_time);
@@ -1765,6 +1765,48 @@ TEST(LogBackgroundWriter, FullChunkWakesAWriterWaitingToWrite) {
     ASSERT_EQ(record.header.dispatch_index, ++read);
   }
   EXPECT_EQ(read, records);
+  ::unlink(path.c_str());
+}
+
+// An owner stopped by destruction alone (no flush()) keeps every record it
+// committed, even when the stop lands between the writer's read of the
+// hand-off count and its stop check: ~State hands the last chunk over and
+// then stops, so the writer must not take the stop for "nothing left".
+TEST(LogBackgroundWriter, StopAfterTheWritersHandOffCheckKeepsTheLastChunk) {
+  const auto path = TempPath("stop_after_check");
+  constexpr std::uint64_t kRecords = 5;
+  const std::vector<std::byte> payload(16, std::byte{0x5a});
+  std::atomic<bool> holding{false};
+  {
+    LogWriter::Options options{4096, 3, /*background=*/true};
+    // Never due: only the stop's hand-off can write these records.
+    options.write_interval = std::chrono::hours{24 * 365 * 100};
+    options.sync_interval = std::chrono::hours{1};
+    // Holds the writer past its hand-off check until the stop has begun.
+    options.before_stop_check = [&](const std::atomic<bool>& stopping) {
+      holding.store(true);
+      while (!stopping.load()) std::this_thread::yield();
+    };
+    LogWriter writer{path, "stop_after_check", options};
+    writer.start({}, {});
+    // The writer has found nothing handed over and waits at its stop check;
+    // records committed now are in the active chunk, which only the
+    // destructor hands over.
+    while (!holding.load()) std::this_thread::yield();
+    for (std::uint64_t i = 1; i <= kRecords; ++i) {
+      Context context{};
+      context.dispatch_index = i;
+      writer.dispatch(context, payload);
+    }
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  LogReader reader{path};
+  LogReader::Record record{};
+  std::uint64_t read = 0;
+  while (reader.next(record)) {
+    ASSERT_EQ(record.header.dispatch_index, ++read);
+  }
+  EXPECT_EQ(read, kRecords);
   ::unlink(path.c_str());
 }
 

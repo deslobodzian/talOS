@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -138,6 +139,12 @@ struct LogWriterOptions {
   // the writer writes it to the file (see LogWriter): what a process killed
   // by a signal can lose, plus the writer's scheduling delay.
   std::chrono::nanoseconds write_interval{std::chrono::milliseconds{10}};
+
+  // Tests only: the writer thread calls it, with its stop flag, each time it
+  // has found nothing handed over and nothing due, before it checks for a
+  // stop; a test holds it there to order a stop against that check. Empty
+  // otherwise.
+  std::function<void(const std::atomic<bool>& stopping)> before_stop_check;
 };
 
 // LogWriterOptions::window from a `--log-window-us` value (microseconds; 0
