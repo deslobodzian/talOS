@@ -52,6 +52,8 @@ def fast_slots(document):
               ("clients", "frames_forwarded", "invalid", "ws_drops", "refused", "egress_bytes")]
     for node in document["nodes"]:
         slots += [(node, key) for key in ("heartbeat_wall_ns", "dispatch_count", "alive")]
+        slots += [(node["delivery"], key) for key in
+                  ("wake_failures", "stalled_arms", "wake_fallbacks", "requests_skipped")]
         for source in node["sources"]:
             slots += [(source, key) for key in
                       ("events", "dropped", "sequence", "last_monotonic_ns",
