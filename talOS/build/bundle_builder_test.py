@@ -1,7 +1,8 @@
 """Tests bundle_builder.py's check of a bundle's nodes against its config,
 its config staging (relative layout and identity), its manifest's binary
 digests and stamped revision, its staging of runfiles
-and of C++ nodes' shared libraries in lib/ and its run.sh, and
+and of C++ nodes' shared libraries in lib/, its check of a bundled Studio
+against the config, and its run.sh, and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
 import json
@@ -11,6 +12,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 from python.runfiles import runfiles
@@ -35,11 +37,14 @@ def node(tmp, name, target=None):
 
 
 class BundleBuilderTest(unittest.TestCase):
-    def assemble(self, tmp, files, nodes, launches, robot=None, extra=()):
+    def assemble(self, tmp, files, nodes, launches, robot=None, extra=(),
+                 studio=None, effective=None):
         """Runs the builder on `files` ({short_path: text}; the first is the
         config) and the node specs `nodes`, for a config whose subsystems
         launch the labels `launches` and whose effective [robot] table is
-        `robot`, with `extra` arguments. Returns the finished process."""
+        `robot` (other effective tables: `effective`), with `extra`
+        arguments and the Studio spec `studio`. Returns the finished
+        process."""
         src = os.path.join(tmp, "src")
         entries = []
         for short_path, text in files.items():
@@ -53,11 +58,13 @@ class BundleBuilderTest(unittest.TestCase):
             json.dump({"bundle_name": "b", "launcher_path": launcher,
                        "config": entries[0], "config_files": entries[1:],
                        "nodes": list(nodes),
-                       "default_hardware_node": HARDWARE_NODE}, f)
+                       "default_hardware_node": HARDWARE_NODE,
+                       "studio": studio}, f)
         resolved = os.path.join(tmp, "resolved.json")
         with open(resolved, "w", encoding="utf-8") as f:
             json.dump({"nodes": list(launches),
-                       "effective": {"robot": robot or {}}}, f)
+                       "effective": {"robot": robot or {},
+                                     **(effective or {})}}, f)
         builder = runfiles.Create().Rlocation("_main/talOS/build/bundle_builder.py")
         return subprocess.run([sys.executable, builder, "--spec", spec,
                                "--resolved", resolved,
@@ -206,6 +213,44 @@ class BundleBuilderTest(unittest.TestCase):
                 else:
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertIn(problem, proc.stderr)
+
+    def test_studio_must_be_the_configs_bridge_and_a_built_site(self):
+        # A bundle whose bridge is not the one [studio] names would run
+        # another viewer, found by name; a site with no index page serves
+        # nothing.
+        for configured, index, problem in (
+                (None, True, None),
+                ("//viewer:bridge", True, None),
+                ("//other:bridge", True, "//other:bridge"),
+                (None, False, "index.html")):
+            with self.subTest(configured=configured, index=index), \
+                    tempfile.TemporaryDirectory() as tmp:
+                bridge = os.path.join(tmp, "src", "studio_bridge")
+                put(bridge, "")
+                webroot = os.path.join(tmp, "src", "dist")
+                os.makedirs(webroot)
+                if index:
+                    put(os.path.join(webroot, "index.html"), "<html>")
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", HARDWARE_NODE)], (),
+                    studio={"bridge_path": bridge,
+                            "bridge_label": "//viewer:bridge",
+                            "webroot_path": webroot},
+                    effective={"studio": {"bridge": configured}
+                               if configured else {}})
+                if problem is not None:
+                    self.assertNotEqual(proc.returncode, 0)
+                    self.assertIn(problem, proc.stderr)
+                    continue
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                out = os.path.join(tmp, "out")
+                with open(os.path.join(out, "bundle_manifest.toml"), "rb") as f:
+                    studio = tomllib.load(f)["studio"]
+                self.assertTrue(os.access(os.path.join(out, studio["bridge"]),
+                                          os.X_OK))
+                self.assertTrue(os.path.isfile(
+                    os.path.join(out, studio["webroot"], "index.html")))
 
     def test_runfiles_the_bundle_cannot_hold_fail(self):
         # A Python node imports from its runfiles only on the robot. A link

@@ -156,13 +156,15 @@ talos_graph_test(
     ],
 )
 
-# What runs on the main processor: every node binary and the config
-# (docs/DEPLOYMENT.md).
+# What runs on the main processor: every node binary, the config, and
+# Studio for `run.sh --start-studio-bridge` (docs/DEPLOYMENT.md).
 talos_bundle(
     name = "robot_bundle",
     config = "robot.toml",
     config_files = CONFIG_FILES,
     nodes = ["//talOS/bridge:hardware_node"] + NODES,
+    studio_bridge = "//studio/bridge:studio_bridge",
+    studio_webroot = "//studio:web_dist",
 )
 """
 

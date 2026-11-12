@@ -81,8 +81,9 @@ cc_binary(
 cc_binary(
     name = "studio_bridge",
     srcs = ["main.cc"],
-    # The simulation soak test launches the bridge as a chaos target.
-    visibility = ["//2026-robot/main_processor/simulation:__pkg__"],
+    # A robot's talos_bundle carries it (studio_bridge), and the simulation
+    # soak test launches it as a chaos target.
+    visibility = ["//visibility:public"],
     deps = [
         ":system",
         ":telemetry",

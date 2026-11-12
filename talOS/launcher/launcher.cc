@@ -402,6 +402,11 @@ int Launcher::RunSession() {
                      std::chrono::milliseconds{options_.restart_window_ms}};
 
   const auto node_specs = DiscoverNodes(robot_config, options_);
+  if (options_.start_studio_bridge && BundleWithoutStudio(options_)) {
+    std::cerr << "[launcher] this bundle carries no Studio (its talos_bundle "
+                 "sets no studio_bridge and studio_webroot); session runs "
+                 "without Studio\n";
+  }
   if (node_specs.empty()) {
     std::cerr << "launcher: no nodes declared in config\n";
     return 1;

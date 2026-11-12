@@ -21,7 +21,12 @@ node plus `NODES`, and `CONFIG_FILES`, from the generated [field manifest](../20
 (`bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot_field.toml`).
 The build fails unless `nodes` is exactly what the config launches: its
 subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
-`//talOS/bridge:hardware_node`. It writes
+`//talOS/bridge:hardware_node`. A robot viewed with Studio also sets
+`studio_bridge` (`//studio/bridge:studio_bridge`) and `studio_webroot`
+(`//studio:web_dist`, the built site), both or neither; the build fails when
+`studio_bridge` is not the config's `[studio] bridge` (when it sets one) or
+the site has no `index.html`. The 2026 robot, the bench rig and
+`tools/new_robot`'s scaffold set both, which add about 2.5 MB. It writes
 `bazel-bin/2026-robot/main_processor/robot_bundle/`:
 
 | Entry | What |
@@ -30,8 +35,9 @@ subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
+| `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | `robot_field.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
-| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty` |
+| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
 
 The launcher copies `config_sha256`, `git_revision` and `git_dirty` into every
 session manifest, and records each member's binary SHA-256 again when the
@@ -56,6 +62,13 @@ no source edits are needed when switching between
 simulation and the field bundle. The overlay does not
 change CAN ids or commissioning: hardware must still be checked and
 commissioned through the normal bring-up process.
+
+`./run.sh --start-studio-bridge` serves Studio from the bundle on
+`[studio] http_port` (5800): the launcher runs the bundle's bridge for
+`[studio] bridge` and serves the bundle's webroot unless `[studio] webroot`
+is an absolute path ([Studio bridge](../talOS/launcher/README.md#studio-bridge)).
+The boot service starts `run.sh` without it. From a bundle built without
+Studio, the flag starts nothing and the session runs without Studio.
 
 To bring up the bundle against a different controller address without editing
 the config, run `./run.sh --remote <ip>` (for example,

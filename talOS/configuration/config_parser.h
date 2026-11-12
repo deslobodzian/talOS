@@ -125,7 +125,9 @@ struct RobotConfig {
     std::string bridge{"//studio/bridge:studio_bridge"};
     uint16_t http_port{5800};
     uint16_t max_clients{4};
-    // Relative to the launcher's working directory.
+    // Relative to the launcher's working directory; a bundle that carries
+    // Studio serves its own webroot unless this is absolute
+    // (EffectiveStudioWebroot in talOS/launcher/roster.h).
     std::string webroot{"bazel-bin/studio/dist"};
     std::string topic{"/talos/telemetry"};
     std::string pose_topic;

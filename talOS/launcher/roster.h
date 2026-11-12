@@ -130,6 +130,11 @@ struct LauncherOptions {
   // git_revision, git_dirty), present when it was built with --stamp.
   std::string bundle_git_revision;
   bool bundle_git_dirty{false};
+  // The bundle's Studio (bundle_manifest.toml [studio], written when its
+  // talos_bundle sets studio_bridge and studio_webroot): whether it carries
+  // one, and the absolute path of its webroot.
+  bool bundle_has_studio{false};
+  std::string bundle_studio_webroot;
 
   // Target or node name -> binary path. Filled from the bundle manifest, or
   // directly by tests.
@@ -143,7 +148,9 @@ struct LauncherOptions {
 inline constexpr std::string_view kBundleManifest = "bundle_manifest.toml";
 
 // Reads `bundle_manifest.toml` (written by talOS/build/bundle_builder.py) from
-// options.bundle_dir, or from the working directory when that holds one.
+// options.bundle_dir, or from the working directory when that holds one. A
+// [studio] table registers the bundled Studio bridge under its labels and
+// kStudioBridgeName, and its webroot.
 bool LoadBundle(LauncherOptions& options, std::string& error);
 
 // ---------------------------------------------------------------------------
@@ -177,8 +184,15 @@ std::string ResolveBinary(
 NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
                       const LauncherOptions& options);
 
+// The roster: the hardware bridge, the subsystems, the sim gateway under
+// --sim-gateway, and the Studio bridge under --start-studio-bridge unless
+// BundleWithoutStudio(options).
 std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
                                     const LauncherOptions& options);
+
+// Launched from a bundle built without Studio (its talos_bundle sets no
+// studio_bridge and studio_webroot): there is no bridge to start or probe.
+bool BundleWithoutStudio(const LauncherOptions& options);
 
 // Effective endpoints for a launch: a CLI flag wins, otherwise the config.
 std::string EffectiveRemoteAddress(const config::RobotConfig& config,
@@ -192,5 +206,11 @@ uint16_t EffectiveLocalPort(const config::RobotConfig& config,
 
 uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,
                                  const LauncherOptions& options);
+
+// The directory the Studio bridge serves: `[studio] webroot` when it is an
+// absolute path or the bundle carries no Studio; otherwise the bundle's
+// webroot, since a relative webroot names a checkout's build output.
+std::string EffectiveStudioWebroot(const config::RobotConfig& config,
+                                   const LauncherOptions& options);
 
 }  // namespace talos::launcher

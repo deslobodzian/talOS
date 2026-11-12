@@ -5,7 +5,11 @@ into a fresh prefix), then --describe runs every node binary from there, so a
 C++ node that cannot load a shared library it links, a
 Python node that cannot import its wheels or start its interpreter, or an
 install that breaks the bundle's relative symlinks fails here. The bench
-rig's bundle, which link and stop qualification install, is checked too."""
+rig's bundle, which link and stop qualification install, is checked too.
+Each is described with --start-studio-bridge: a bundle that carries Studio
+must run its bridge from the install, found through the manifest's [studio]
+table, beside the index page of the webroot that table names; one that does
+not must describe without a bridge rather than fail on its absence."""
 
 import json
 import os
@@ -23,9 +27,10 @@ BUNDLES = (
 )
 
 
-def describe(bundle, prefix):
+def describe(bundle, prefix, *args):
     """Installs `bundle` under `prefix` with deploy.sh and runs the installed
-    run.sh --describe-only."""
+    run.sh --describe-only with `args`. Returns the process, the session's
+    graph and the installed bundle's directory."""
     r = runfiles.Create()
     deploy = r.Rlocation("_main/tools/deploy.sh")
     subprocess.run(["bash", deploy, "install", bundle, "--prefix", prefix],
@@ -33,17 +38,17 @@ def describe(bundle, prefix):
     where = os.path.join(prefix, "current")
     log_dir = os.path.join(prefix, "logs")
     env = dict(os.environ, TALOS_LOG_DIR=log_dir)
-    proc = subprocess.run(["./run.sh", "--describe-only"], cwd=where, env=env,
-                          capture_output=True, text=True, timeout=120)
+    proc = subprocess.run(["./run.sh", "--describe-only", *args], cwd=where,
+                          env=env, capture_output=True, text=True, timeout=120)
     sessions = sorted(
         (os.path.join(log_dir, name) for name in os.listdir(log_dir)
          if os.path.isdir(os.path.join(log_dir, name))),
         key=os.path.getmtime, reverse=True)
     graph = os.path.join(sessions[0], "graph.json") if sessions else ""
     if not os.path.isfile(graph):
-        return proc, None
+        return proc, None, where
     with open(graph, encoding="utf-8") as f:
-        return proc, json.load(f)
+        return proc, json.load(f), where
 
 
 class BundleTest(unittest.TestCase):
@@ -58,13 +63,23 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(src and os.path.isdir(src), src)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
-                proc, graph = describe(src, os.path.join(tmp, "prefix"))
+                # Asked for Studio, a bundle without it still describes.
+                studio = manifest.get("studio")
+                proc, graph, where = describe(
+                    src, os.path.join(tmp, "prefix"), "--start-studio-bridge")
                 out = proc.stdout + "\n" + proc.stderr
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIsNotNone(graph, out)
                 # The bundle holds exactly the nodes its config launches, so
-                # the graph lists each of them.
-                self.assertEqual(len(graph["nodes"]), len(manifest["nodes"]), out)
+                # the graph lists each of them, and its Studio bridge.
+                self.assertEqual(len(graph["nodes"]),
+                                 len(manifest["nodes"]) + bool(studio), out)
+                if studio:
+                    self.assertIn("studio_bridge",
+                                  [node.get("name") for node in graph["nodes"]],
+                                  out)
+                    self.assertTrue(os.path.isfile(os.path.join(
+                        where, studio["webroot"], "index.html")), studio)
                 for node in graph["nodes"]:
                     self.assertTrue(node.get("described"),
                                     f"{node.get('name')}: {node.get('describe_error')}\n{out}")
