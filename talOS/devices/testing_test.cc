@@ -503,6 +503,24 @@ TEST_F(SimHardwareTest, AMotorThatCannotDriveIsNeutralFromThatTick) {
   }
 }
 
+// The RoboRIO reports a CANcoder's absolute position with
+// AbsoluteSensorDiscontinuityPoint = 0.5, so in [-0.5, 0.5) rotations;
+// set_cancoder's position goes out wrapped the same way.
+TEST_F(SimHardwareTest, CancoderPositionWrapsAsTheRoboRioReportsIt) {
+  struct Case {
+    double set;
+    double reported;
+  };
+  for (const Case c : {Case{0.25, 0.25}, Case{0.75, -0.25}, Case{0.5, -0.5},
+                       Case{-0.5, -0.5}, Case{-0.75, 0.25}, Case{2.25, 0.25}}) {
+    SCOPED_TRACE(c.set);
+    hw.set_cancoder("mech", "angle", c.set, 1.0);
+    sim.step(5ms);
+    EXPECT_DOUBLE_EQ(Sensor("angle").position_rot, c.reported);
+    EXPECT_DOUBLE_EQ(Sensor("angle").velocity_rps, 1.0);
+  }
+}
+
 // REQ-SAFE-22, REQ-SAFE-18: as on the gateway (Gateway::Tick), the State
 // that finds every motor and CAN sensor invalid raises kHardwareFault and
 // starts a new epoch, every output goes neutral, including digital and PWM

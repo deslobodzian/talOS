@@ -420,7 +420,11 @@ TEST(SimBelievability, RemoteCancoderFeedbackKeepsTheEncoderDirection) {
       State s{};
       uint64_t now_us = 0;
       StepBackend(backend, s, now_us, 5000, 1000);
-      EXPECT_DOUBLE_EQ(s.motors[0].position_rot, s.sensors[0].position_rot);
+      // The CANcoder's absolute position, wrapped; the motor's continuous.
+      EXPECT_NEAR(
+          std::remainder(s.motors[0].position_rot - s.sensors[0].position_rot,
+                         1.0),
+          0.0, 1e-9);
       if (motor_inverted == sensor_inverted) {
         EXPECT_NEAR(s.motors[0].position_rot, 2.0, 0.01)
             << "motor_inverted=" << motor_inverted;
@@ -554,7 +558,10 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
 }
 
-// CANcoders mirror the linked mechanism through the boundary.
+// CANcoders mirror the linked mechanism through the boundary, reporting its
+// absolute position as the RoboRIO does (AbsoluteSensorDiscontinuityPoint =
+// 0.5): wrapped to [-0.5, 0.5) rotations, while the remote-CANcoder motor's
+// own position stays continuous.
 TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   Config c = SingleMotorConfig();
   c.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 20, "rio"});
@@ -570,8 +577,23 @@ TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   uint64_t now_us = 0;
   StepBackend(backend, s, now_us, 5000, 200);
   EXPECT_TRUE(s.sensors[0].valid);
-  EXPECT_NEAR(s.sensors[0].position_rot, s.motors[0].position_rot, 1e-9);
+  ASSERT_GT(s.motors[0].position_rot, 1.0);
+  EXPECT_GE(s.sensors[0].position_rot, -0.5);
+  EXPECT_LT(s.sensors[0].position_rot, 0.5);
+  EXPECT_NEAR(
+      std::remainder(s.sensors[0].position_rot - s.motors[0].position_rot, 1.0),
+      0.0, 1e-9);
   EXPECT_NEAR(s.sensors[0].velocity_rps, s.motors[0].velocity_rps, 1e-9);
+  // Backwards past -0.5 wraps the other way.
+  cmd[0] = Duty(1, -0.5);
+  ASSERT_TRUE(backend.Apply(cmd));
+  StepBackend(backend, s, now_us, 5000, 400);
+  ASSERT_LT(s.motors[0].position_rot, -1.0);
+  EXPECT_GE(s.sensors[0].position_rot, -0.5);
+  EXPECT_LT(s.sensors[0].position_rot, 0.5);
+  EXPECT_NEAR(
+      std::remainder(s.sensors[0].position_rot - s.motors[0].position_rot, 1.0),
+      0.0, 1e-9);
 }
 
 // Commanded neutral coasts/brakes per model; it never teleports to a

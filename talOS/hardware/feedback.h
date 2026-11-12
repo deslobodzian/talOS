@@ -6,6 +6,7 @@
 
 // Relative, as in the rest of the gateway: the RoboRIO's GradleRIO build
 // compiles the gateway with talOS/, not the repository root, on its path.
+#include <cmath>
 #include <cstddef>
 
 #include "messages.h"
@@ -28,6 +29,16 @@ inline void MarkInvalid(SensorSample& sample) {
   sample.valid = false;
   sample.position_rot = 0;
   sample.velocity_rps = 0;
+}
+
+// A CANcoder's absolute position as the RoboRIO reports it: Phoenix 6
+// GetAbsolutePosition with AbsoluteSensorDiscontinuityPoint = 0.5 (set for
+// every CANcoder by PhoenixBackend), so in [-0.5, 0.5) rotations. A remote
+// CANcoder motor's own position is continuous and is not wrapped.
+inline double CANcoderAbsoluteRot(double rot) {
+  double wrapped = rot - std::floor(rot + 0.5);
+  if (wrapped >= 0.5) wrapped -= 1.0;  // rounding at the discontinuity
+  return wrapped;
 }
 
 // Whether any motor or CAN sensor in `state` has a valid sample, or none is
