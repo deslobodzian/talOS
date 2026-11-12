@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/time.h"
@@ -43,6 +44,37 @@ struct LogDamage {
   bool clean() const noexcept { return spans == 0 && tail_bytes == 0; }
 };
 
+// The most bytes any record's payload may claim, whatever its manifest
+// declares. No talOS source carries a message near it: the largest logged
+// today is the 1436 B hardware::Packet (docs/DATA_FLOW.md), and RTMS keeps up
+// to 1024 slots of a topic in shared memory. It bounds what one crafted or
+// damaged record, whose header checksum its author can compute, makes a
+// reader allocate.
+inline constexpr std::uint64_t kMaxRecordPayloadBytes = std::uint64_t{1} << 20;
+
+namespace detail {
+// The most bytes each record may claim: a record carrying its topic's
+// message (a MESSAGE of a watcher or fetcher, a SEND of a sender) that
+// topic's declared message size; any other record (a timer's, an id the
+// manifest does not list) the larger of 64 KiB and the manifest's largest
+// message; never more than kMaxRecordPayloadBytes. A record claiming more is
+// damage (LogReader).
+class PayloadBounds {
+ public:
+  void add(const ManifestEntry& entry);
+  std::uint64_t operator()(const RecordHeader& header) const noexcept;
+
+ private:
+  static constexpr std::uint64_t kMinOtherBytes = std::uint64_t{64} << 10;
+  struct Topic {
+    EventKind carries;  // the record kind that carries its message
+    std::uint64_t bytes;
+  };
+  std::vector<std::optional<Topic>> topic_;  // by source id
+  std::uint64_t other_{kMinOtherBytes};
+};
+}  // namespace detail
+
 // One line naming what `damage` skipped, offsets included; empty if clean.
 std::string DescribeDamage(const LogDamage& damage);
 
@@ -58,11 +90,13 @@ std::string DescribeDamage(const LogDamage& damage);
 // validate and whose dispatch index and time can follow the last record it
 // returned (one from another log, in disk blocks a power loss exposed,
 // cannot), resumes there, and counts what it skipped in damage(). Bytes
-// with no intact record after them end the log (truncated()). A record found
-// by the scan may claim at most the larger of the manifest's largest message
-// and 64 KiB, so one false magic costs at most that much checksumming. A
-// caller that must not see a gap (exact replay) refuses a log whose
-// damage().spans is nonzero.
+// with no intact record after them end the log (truncated()). A record whose
+// payload_bytes exceeds what its source allows (detail::PayloadBounds: its
+// topic's declared message size, else the larger of the manifest's largest
+// message and 64 KiB, never more than kMaxRecordPayloadBytes) is damage too,
+// so one false magic costs at most that much checksumming and one crafted
+// header at most that much memory. A caller that must not see a gap (exact
+// replay) refuses a log whose damage().spans is nonzero.
 class LogReader {
  public:
   struct Record {
@@ -116,7 +150,7 @@ class LogReader {
   std::string process_name_;
   std::size_t records_offset_{0};
   std::size_t cursor_{0};
-  std::uint64_t scan_payload_bytes_{0};
+  detail::PayloadBounds bounds_;
   LogDamage damage_;
   std::optional<RecordHeader> last_;  // the last record next() returned
   std::size_t record_count_{0};

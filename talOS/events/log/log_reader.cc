@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -91,12 +90,6 @@ std::uint32_t record_header_crc(RecordHeader header) {
   return crc32(std::span<const std::byte>{
       reinterpret_cast<const std::byte*>(&header), sizeof(header)});
 }
-
-// The least payload a record found by a resynchronising scan may claim
-// (LogReader); the manifest's largest message raises it. It bounds the
-// checksumming one false magic can cost.
-constexpr std::uint64_t kMinScanPayloadBytes = 64u << 10;
-constexpr std::uint64_t kAnyPayload = std::numeric_limits<std::uint64_t>::max();
 
 // A log's bytes, read through view(): a whole file in memory (SpanSource) or
 // an open file through a fixed window (FileSource).
@@ -206,17 +199,17 @@ std::uint64_t find_magic(Source& source, std::uint64_t from) {
 }
 
 // Whether an intact record -- magic, lengths and checksum -- starts at
-// `offset` and ends within the file, claiming at most `max_payload` bytes.
+// `offset` and ends within the file, claiming no more than `bounds` allows.
 template <typename Source>
-bool intact_at(Source& source, std::uint64_t offset, std::uint64_t max_payload,
-               RecordHeader& header) {
+bool intact_at(Source& source, std::uint64_t offset,
+               const detail::PayloadBounds& bounds, RecordHeader& header) {
   const std::span<const std::byte> bytes =
       source.view(offset, sizeof(RecordHeader));
   if (bytes.size() < sizeof(RecordHeader)) return false;
   std::memcpy(&header, bytes.data(), sizeof(header));
   if (header.magic != RECORD_MAGIC ||
       header.stored_bytes > header.payload_bytes ||
-      header.payload_bytes > max_payload) {
+      header.payload_bytes > bounds(header)) {
     return false;
   }
   const std::uint64_t body = offset + sizeof(RecordHeader);
@@ -244,12 +237,12 @@ bool can_follow(const RecordHeader& record,
 // intact record is left.
 template <typename Source>
 std::optional<RecordHeader> locate(Source& source, std::uint64_t& cursor,
-                                   std::uint64_t scan_payload_bytes,
+                                   const detail::PayloadBounds& bounds,
                                    LogDamage& damage,
                                    std::optional<RecordHeader>& last) {
   if (cursor >= source.size()) return std::nullopt;
   RecordHeader header{};
-  if (intact_at(source, cursor, kAnyPayload, header)) {
+  if (intact_at(source, cursor, bounds, header)) {
     last = header;
     return header;
   }
@@ -258,8 +251,7 @@ std::optional<RecordHeader> locate(Source& source, std::uint64_t& cursor,
   const std::uint64_t start = cursor;
   for (std::uint64_t at = find_magic(source, start + 1); at < source.size();
        at = find_magic(source, at + 1)) {
-    if (intact_at(source, at, scan_payload_bytes, header) &&
-        can_follow(header, last)) {
+    if (intact_at(source, at, bounds, header) && can_follow(header, last)) {
       if (damage.spans == 0) damage.first_offset = start;
       ++damage.spans;
       damage.skipped_bytes += at - start;
@@ -401,6 +393,7 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
     std::memcpy(&entry,
                 data_.data() + manifest_offset + i * sizeof(ManifestEntry),
                 sizeof(entry));
+    bounds_.add(entry);
 
     const std::size_t schema_size = std::size_t{entry.schema_name_bytes} +
                                     std::size_t{entry.schema_bfbs_bytes};
@@ -423,13 +416,36 @@ LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
   session_id_ = header.session_id;
   process_name_ = read_name(header.process_name);
 
-  scan_payload_bytes_ = kMinScanPayloadBytes;
-  for (const Registration& reg : manifest_) {
-    scan_payload_bytes_ =
-        std::max<std::uint64_t>(scan_payload_bytes_, reg.message_bytes);
-  }
   records_offset_ = schema_offset + schema_bytes.size();
   cursor_ = records_offset_;
+}
+
+void detail::PayloadBounds::add(const ManifestEntry& entry) {
+  const std::uint64_t bytes =
+      std::min<std::uint64_t>(entry.message_bytes, kMaxRecordPayloadBytes);
+  other_ = std::max(other_, bytes);
+  const auto kind = static_cast<SourceKind>(entry.kind);
+  EventKind carries{};
+  if (kind == SourceKind::WATCHER || kind == SourceKind::FETCHER) {
+    carries = EventKind::MESSAGE;
+  } else if (kind == SourceKind::SENDER) {
+    carries = EventKind::SEND;
+  } else {
+    return;
+  }
+  if (topic_.size() <= entry.id) topic_.resize(std::size_t{entry.id} + 1);
+  topic_[entry.id] = Topic{carries, bytes};
+}
+
+std::uint64_t detail::PayloadBounds::operator()(
+    const RecordHeader& header) const noexcept {
+  if (header.source_id < topic_.size()) {
+    const std::optional<Topic>& topic = topic_[header.source_id];
+    if (topic && header.kind == static_cast<std::uint16_t>(topic->carries)) {
+      return topic->bytes;
+    }
+  }
+  return other_;
 }
 
 void LogReader::rewind() noexcept {
@@ -443,7 +459,7 @@ bool LogReader::next(Record& out) {
   SpanSource source{data_};
   std::uint64_t cursor = cursor_;
   const std::optional<RecordHeader> header =
-      locate(source, cursor, scan_payload_bytes_, damage_, last_);
+      locate(source, cursor, bounds_, damage_, last_);
   cursor_ = static_cast<std::size_t>(cursor);
   if (!header) return false;
 
@@ -479,7 +495,7 @@ struct WindowedLogReader::State {
   std::string process_name;
   std::uint64_t records_offset{0};  // where the first record would start
   std::uint64_t cursor{0};
-  std::uint64_t scan_payload_bytes{kMinScanPayloadBytes};
+  detail::PayloadBounds bounds;
   LogDamage damage;
   std::optional<RecordHeader> last;  // the last record next() returned
   std::vector<std::byte> payload;
@@ -521,8 +537,7 @@ WindowedLogReader::WindowedLogReader(std::string_view path)
         crc);
     schemas += std::uint64_t{entry.schema_name_bytes} + entry.schema_bfbs_bytes;
     if (!overrun && schemas > header.schema_bytes) overrun = i;
-    state.scan_payload_bytes =
-        std::max<std::uint64_t>(state.scan_payload_bytes, entry.message_bytes);
+    state.bounds.add(entry);
   }
   std::vector<std::byte> schema_block;
   if (!stream.fold(header.schema_bytes, crc, &schema_block)) {
@@ -593,8 +608,8 @@ bool WindowedLogReader::next(LogReader::Record& out) {
   // The constructor's last step makes the source; a reader always has one.
   if (!state.source.has_value()) return false;
   FileSource& source = *state.source;
-  const std::optional<RecordHeader> record = locate(
-      source, state.cursor, state.scan_payload_bytes, state.damage, state.last);
+  const std::optional<RecordHeader> record =
+      locate(source, state.cursor, state.bounds, state.damage, state.last);
   if (!record.has_value()) return false;
   out.offset = state.cursor;
   const std::uint64_t body = state.cursor + sizeof(RecordHeader);
@@ -620,7 +635,7 @@ void WindowedLogReader::seek(std::uint64_t offset) {
   // The fast path of locate(): a record next() would accept without a scan.
   RecordHeader header{};
   if (!state.source.has_value() || offset < state.records_offset ||
-      !intact_at(*state.source, offset, kAnyPayload, header)) {
+      !intact_at(*state.source, offset, state.bounds, header)) {
     throw std::invalid_argument(
         "LogReader: " + state.path + ": no intact record starts at byte " +
         std::to_string(offset) +
