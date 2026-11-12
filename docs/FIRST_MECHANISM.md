@@ -237,8 +237,9 @@ The launcher runs every node binary with `--describe`, which makes the node
 build itself, report the topics it reads and writes, and exit, then checks the
 whole graph against the naming rules
 ([launcher: two phases](../talOS/launcher/README.md#two-phases)). The build
-comes first because the launcher runs the built binaries; before it, you see
-`did not answer --describe (execv bazel-bin/...: No such file or directory)`.
+comes first because the launcher runs the built binaries; before it, one
+`error:` line names the nodes that are `not built` and ends with the
+`bazel build` command that builds them.
 A warning is fine; an `error:` line means the launcher would refuse to start.
 
 ### Run it in simulation

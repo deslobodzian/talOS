@@ -98,7 +98,7 @@ void PrintDeclaredGraph(const std::vector<NodeDescription>& described,
     if (node.answered) {
       std::cout << " (" << node.declared.sources.size() << " sources)\n";
     } else {
-      std::cout << " (not described)\n";
+      std::cout << (node.missing ? " (not built)\n" : " (not described)\n");
     }
   }
   for (const auto& diagnostic : diagnostics) {
@@ -514,7 +514,7 @@ int Launcher::RunSession() {
 
   if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
     std::cerr << "launcher: the declared graph has errors; refusing to "
-                 "start. Fix the names above, or pass --allow-graph-errors "
+                 "start. Fix the errors above, or pass --allow-graph-errors "
                  "to launch anyway.\n";
     return 1;
   }
