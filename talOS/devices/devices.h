@@ -101,18 +101,28 @@ bool robot_enabled(Node& node);
 // a direct device command would be.
 void RequireInUpdate(const Node& node, std::string_view what);
 
-// How old a motor sample may be at the State it arrived in (Motor::
-// position_age, velocity_age) to count as recent: two status periods of
-// [robot] status_hz (10 ms at 200 Hz). Motor::rezero takes a position only
-// within it, and talos::mechanisms::VelocityMechanism counts a tick toward
-// at_speed only on a velocity within it; neither needs the bridge's clock
-// mapping. It also bounds how far apart two samples a rezero combines may be
-// (PositionMechanism's CANcoder homing). A status frame is under one period
-// old when the RoboRIO reads it, so two devices' samples in one State are
-// under one period apart; the second period absorbs jitter. Any wider gap
-// is a late frame, and a mechanism moving at v would take a frame off by v
-// times the gap (0.1 rot at 1 rot/s and the 100 ms feedback bound).
+// How old a motor's position may be at the State it arrived in
+// (Motor::position_age) for Motor::rezero to take it, and how far apart two
+// samples a rezero combines may be (PositionMechanism's CANcoder homing):
+// two status periods of [robot] status_hz (10 ms at 200 Hz). A status frame
+// is under one period old when the RoboRIO reads it, so two devices' samples
+// in one State are under one period apart; the second period absorbs
+// jitter. Any wider gap is a late frame, and a mechanism moving at v would
+// take a frame off by v times the gap (0.1 rot at 1 rot/s and the 100 ms
+// feedback bound). A refused rezero only retries on a later tick, so the
+// bound can be tight.
 Duration RezeroAgeBound(const hardware::Config& config);
+
+// How old a motor's velocity may be at its State (Motor::velocity_age) for
+// talos::mechanisms::VelocityMechanism to count a tick toward at_speed: four
+// status periods (20 ms at 200 Hz), the age at which the RoboRIO itself
+// reports a signal LATE (PhoenixBackend.cpp). Wider than RezeroAgeBound
+// because readiness is judged every tick and must not flap: at two periods
+// one late or dropped frame would drop at_speed for several ticks and cut a
+// feed short. Still far below command_timeout_us, so a velocity frozen by a
+// CAN gap stops holding at_speed long before the gateway invalidates it.
+// Like Motor::rezero's use of RezeroAgeBound, it needs no clock mapping.
+Duration ReadinessAgeBound(const hardware::Config& config);
 
 // Hardware handles: cheap copyable values. Output setters (Motor's set_* and
 // stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the

@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -182,24 +183,34 @@ TEST_F(VelocityMechanismTest, ChangedGoalRestartsReadiness) {
 // A CAN gap freezes the flywheel's velocity: the gateway keeps reporting the
 // last value, in band, with a growing age, and keeps it valid until that age
 // reaches command_timeout_us (100 ms). at_speed must not ride on it: a
-// sample at most two status periods old at its State (RezeroAgeBound, 10 ms
-// at the default 200 Hz) keeps it, one 1 us older drops it on that tick,
-// while the goal still drives, and a fresh sample must then qualify again
-// for the full entry count.
+// sample at most four status periods old at its State (ReadinessAgeBound,
+// 20 ms at the default 200 Hz) keeps it, one 1 us older drops it on that
+// tick while the goal still drives, an unknown age (UINT32_MAX, which the
+// gateway also marks invalid) drops it, and a fresh sample must then qualify
+// again for the full entry count.
 // REQ-DEV-22
 TEST_F(VelocityMechanismTest, AtSpeedDropsOnAVelocitySampleOlderThanTheBound) {
-  SetVelocity(60.0);
-  Drive(60.0, 40ms);
-  ASSERT_TRUE(flywheel().at_speed());
-  hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, 10'000);
-  Drive(60.0, 10ms);
-  EXPECT_TRUE(flywheel().at_speed()) << "velocity age 10000 us, at the bound";
-  hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, 10'001);
-  Drive(60.0, 10ms);
-  EXPECT_FALSE(flywheel().at_speed()) << "velocity age 10001 us, past 10 ms";
-  EXPECT_EQ(flywheel().phase(), VelocityPhase::kSpinningUp);
-  EXPECT_EQ(Applied().mode, Mode::kVelocity);
-  EXPECT_DOUBLE_EQ(Applied().demand, 60.0);
+  EXPECT_FALSE(flywheel().at_speed()) << "no velocity sample yet";
+  struct Row {
+    std::uint32_t velocity_age_us;
+    bool at_speed;
+    bool driving;
+  };
+  for (const Row& row : {Row{20'000, true, true}, Row{20'001, false, true},
+                         Row{UINT32_MAX, false, false}}) {
+    SCOPED_TRACE(row.velocity_age_us);
+    SetVelocity(60.0);
+    Drive(60.0, 20ms);
+    ASSERT_TRUE(flywheel().at_speed());
+    hw.set_motor("shooter", "flywheel", 0.0, 60.0, 0, row.velocity_age_us);
+    Drive(60.0, 10ms);
+    EXPECT_EQ(flywheel().at_speed(), row.at_speed);
+    EXPECT_EQ(flywheel().driving(), row.driving);
+    if (row.driving) {
+      EXPECT_EQ(Applied().mode, Mode::kVelocity);
+      EXPECT_DOUBLE_EQ(Applied().demand, 60.0);
+    }
+  }
   SetVelocity(60.0);  // fresh again: the entry count starts over
   Drive(60.0, 10ms);
   EXPECT_FALSE(flywheel().at_speed());
@@ -208,9 +219,8 @@ TEST_F(VelocityMechanismTest, AtSpeedDropsOnAVelocitySampleOlderThanTheBound) {
 }
 
 // The velocity's age comes from the State, so at_speed does not wait for
-// the bridge's clock mapping (eight States after a gateway boot or bridge
-// start): three in-band ticks right after the first States reach it while
-// HardwareLink::sample_time() is still unknown.
+// the bridge's clock mapping: three in-band ticks right after the first
+// States reach it while HardwareLink::sample_time() is still unknown.
 // REQ-DEV-22
 TEST(VelocityMechanismMapping, AtSpeedBeforeTheClockMappingConverges) {
   auto sim = Sim::FromToml(kRobotToml);

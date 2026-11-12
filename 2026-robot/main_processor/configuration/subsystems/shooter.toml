@@ -17,7 +17,7 @@ at_speed_entry_tick_count = 3
 at_speed_exit_frac = 0.1
 # Readiness clears immediately on a target change > 0.001 rps (even if both
 # targets clamp equally), release/staleness, disable, motor disconnect, or
-# a velocity sample older than two status periods at its State.
+# a velocity sample older than four status periods at its State.
 
 [motors.flywheel]
 type = "TalonFX"

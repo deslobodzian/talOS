@@ -71,7 +71,7 @@ class VelocityMechanism {
   // error leaves it, the asked goal changes, or the goal stops. A tick
   // counts only on a recent velocity sample: Motor::velocity_age(), read
   // from its State and so known without the bridge's clock mapping, at most
-  // RezeroAgeBound (two status periods). Any other sample, an unknown age
+  // ReadinessAgeBound (four status periods). Any other sample, an unknown age
   // included, loses at_speed and restarts the entry count, so a velocity
   // frozen by a CAN gap, which the gateway keeps valid up to
   // command_timeout_us, does not hold it.
@@ -95,7 +95,7 @@ class VelocityMechanism {
   Node* node_;
   std::string label_;  // "VelocityMechanism '<name>'", for errors
   Motor motor_;
-  Duration velocity_age_bound_;  // RezeroAgeBound of [robot] status_hz
+  Duration velocity_age_bound_;  // ReadinessAgeBound of [robot] status_hz
 
   double max_rps_{0};
   double entry_rps_{0};
