@@ -91,8 +91,9 @@ class HttpTest : public testing::Test {
         rules_cc::cc::runfiles::Runfiles::CreateForTest(
             BAZEL_CURRENT_REPOSITORY, &error));
     ASSERT_NE(runfiles, nullptr) << error;
-    const std::string binary =
-        runfiles->Rlocation(std::getenv("TALOS_STUDIO_REVIEW"));
+    const char* server = std::getenv("TALOS_STUDIO_REVIEW");
+    if (server == nullptr) FAIL() << "TALOS_STUDIO_REVIEW is not set";
+    const std::string binary = runfiles->Rlocation(server);
     int out[2];
     ASSERT_EQ(pipe(out), 0);
     child_ = fork();
