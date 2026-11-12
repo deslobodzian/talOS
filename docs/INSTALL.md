@@ -46,7 +46,7 @@ Both take `--base <ref>` and `--all`. `tools/tidy.sh` runs CI's own selection
 script, and needs `compile_commands.json` (it runs
 `bazel run @hedron_compile_commands//:refresh_all` when missing, or with
 `--refresh`) and the generated headers from a prior `bazel build` of the
-touched packages. It exits 3 when bazel is unavailable to make the database.
+touched packages. It exits 3 when it cannot run: no bazel to make the database, or a host C++ standard library too new for clang 18 (Arch with GCC 16), where it says so.
 Homebrew buildifier and the distribution's buildifier may differ from 8.2.1;
 setup warns about this.
 
