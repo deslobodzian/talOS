@@ -61,8 +61,14 @@ class Arm:
         self.arm = PositionMechanism(node, "arm")
         self.target = talos.Target(node, PositionTarget)
         self.in_units = False
+        self.clear = False  # clear_fault() this tick, set by the test
+        self.fault_after_clear = None
 
     def update(self):
+        if self.clear:
+            self.clear = False
+            self.arm.clear_fault()
+            self.fault_after_clear = self.arm.fault
         t = self.target.get()
         if t is None:
             self.arm.stop()
@@ -151,6 +157,27 @@ class MechanismsTest(unittest.TestCase):
         self.assertEqual(arm.phase, PositionPhase.READY)
         self.assertFalse(arm.driving)
 
+    def test_clear_fault_reaches_the_properties_at_once(self):
+        # The arm's motor never moves (no ideal motors): a goal stalls.
+        sim = Sim.from_toml(ROBOT_TOML.replace(
+            "units_per_rot = 360.0",
+            "units_per_rot = 360.0\nstall_time_us = 50000"))
+        node = sim.add(Arm, "arm")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.01)
+        for _ in range(30):
+            sim.publish_target(PositionTarget, "arm", "teleop",
+                               position_rot=0.25, feedforward_v=0.0)
+            sim.step(0.005)
+        self.assertEqual((node.arm.phase, node.arm.fault),
+                         (PositionPhase.FAULTED, PositionFault.STALL))
+        node.clear = True
+        sim.step(0.005)
+        # Read in update() between clear_fault() and the mechanism's update().
+        self.assertEqual(node.fault_after_clear, PositionFault.NONE)
+
     def test_velocity_mechanism_requests_and_state(self):
         self.hold(VelocityTarget, "shooter", 0.03, velocity_rps=60.0,
                   feedforward_v=1.5)
@@ -203,6 +230,11 @@ class MechanismsTest(unittest.TestCase):
         with self.assertRaisesRegex(talos.TalosError, "unknown roller"):
             talos._abi.ok(talos._abi.lib.talos_roller_with_sensor_set_goal(
                 self.intake.roller._node, self.intake.roller._index, 9))
+        # An index the node never opened (the shooter has no position
+        # mechanism) is an error.
+        with self.assertRaisesRegex(talos.TalosError, "no mechanism 0"):
+            talos._abi.ok(talos._abi.lib.talos_position_mechanism_stop(
+                self.shooter.flywheel._node, 0))
         # A bad parameter fails the open, naming the key.
         sim = Sim.from_toml(ROBOT_TOML.replace("tolerance_rot = 0.01",
                                                "tolerance_rot = -1.0"))

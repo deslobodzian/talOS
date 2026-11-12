@@ -24,10 +24,14 @@ them in __init__; the C++ object lives as long as the node. Requests
 (set_goal, hold, stop, clear_fault) and update() are taken only inside the
 node's update() and raise TalosError, naming the mechanism, anywhere else;
 a request lasts that tick only. Call set_goal only with a live talos.Target.
-The C++ getters are properties here, as of the last update(); state() builds
-the control message the C++ state() returns.
+The C++ getters are properties here, and state() is the control message the
+C++ state() returns, all read from one snapshot that update() (and
+clear_fault()) takes in a single C call: as of the last update(), when the
+C++ values change, except that the C++ homed() also reads the motor's zero
+between updates, which the next update() sees.
 """
 
+import ctypes
 import enum
 
 from control.PositionState import PositionState
@@ -83,12 +87,17 @@ class RollerPhase(enum.IntEnum):
 
 
 class _Mechanism(_OnNode):
-    _PREFIX = None  # talos_<kind>_
-    _STATE = None   # its ctypes state struct
+    _PREFIX = None   # talos_<kind>_
+    _STATE = None    # its ctypes state struct
+    _MESSAGE = None  # the MessageType of its C++ state(), if it has one
 
     def __init__(self, node, name):
         super().__init__(node)
         self._index = _abi.index(self._call("open", _abi.encode(name)))
+        self._snapshot = self._STATE()
+        self._message = (None if self._MESSAGE is None else
+                         ctypes.create_string_buffer(self._MESSAGE.size))
+        self._refresh()
 
     def _call(self, method, *args):
         function = getattr(lib, self._PREFIX + method)
@@ -96,10 +105,13 @@ class _Mechanism(_OnNode):
             return function(self._node, *args)
         return _abi.ok(function(self._node, self._index, *args))
 
-    def _state(self):
-        out = self._STATE()
-        self._call("state", out)
-        return out
+    def _refresh(self):
+        """Reads every getter, and the state() message, into the snapshot."""
+        if self._message is None:
+            self._call("state", self._snapshot)
+        else:
+            self._call("state", self._snapshot, self._message,
+                       len(self._message))
 
     def stop(self):
         """This tick's request: drive nothing (neutral)."""
@@ -108,10 +120,11 @@ class _Mechanism(_OnNode):
     def update(self):
         """Applies this tick's request; once per update()."""
         self._call("update")
+        self._refresh()
 
     @property
     def driving(self):
-        return bool(self._state().driving)
+        return bool(self._snapshot.driving)
 
 
 class PositionMechanism(_Mechanism):
@@ -131,27 +144,23 @@ class PositionMechanism(_Mechanism):
 
     def clear_fault(self):
         self._call("clear_fault")
+        self._refresh()
 
-    phase = property(lambda self: PositionPhase(self._state().phase))
-    fault = property(lambda self: PositionFault(self._state().fault))
-    homed = property(lambda self: bool(self._state().homed))
-    at_goal = property(lambda self: bool(self._state().at_goal))
-    connected = property(lambda self: bool(self._state().connected))
-    position_rot = property(lambda self: self._state().position_rot)
-    position_units = property(lambda self: self._state().position_units)
-    velocity_rps = property(lambda self: self._state().velocity_rps)
-    goal_rot = property(lambda self: self._state().goal_rot)
-    gravity_v = property(lambda self: self._state().gravity_v)
-    tolerance_rot = property(lambda self: self._state().tolerance_rot)
+    phase = property(lambda self: PositionPhase(self._snapshot.phase))
+    fault = property(lambda self: PositionFault(self._snapshot.fault))
+    homed = property(lambda self: bool(self._snapshot.homed))
+    at_goal = property(lambda self: bool(self._snapshot.at_goal))
+    connected = property(lambda self: bool(self._snapshot.connected))
+    position_rot = property(lambda self: self._snapshot.position_rot)
+    position_units = property(lambda self: self._snapshot.position_units)
+    velocity_rps = property(lambda self: self._snapshot.velocity_rps)
+    goal_rot = property(lambda self: self._snapshot.goal_rot)
+    gravity_v = property(lambda self: self._snapshot.gravity_v)
+    tolerance_rot = property(lambda self: self._snapshot.tolerance_rot)
 
     def state(self):
-        """control.PositionState: position, velocity, goal_rot, enabled =
-        driving, at_goal, connected."""
-        s = self._state()
-        return self._MESSAGE.decode(self._MESSAGE.encode({
-            "position_rot": s.position_rot, "velocity_rps": s.velocity_rps,
-            "goal_rot": s.goal_rot, "enabled": bool(s.driving),
-            "at_goal": bool(s.at_goal), "connected": bool(s.connected)}))
+        """control.PositionState, as the C++ state() returns it."""
+        return self._MESSAGE.decode(self._message.raw)
 
 
 class VelocityMechanism(_Mechanism):
@@ -163,21 +172,16 @@ class VelocityMechanism(_Mechanism):
     def set_goal(self, velocity_rps, feedforward_v=0.0):
         self._call("set_goal", velocity_rps, feedforward_v)
 
-    phase = property(lambda self: VelocityPhase(self._state().phase))
-    at_speed = property(lambda self: bool(self._state().at_speed))
-    connected = property(lambda self: bool(self._state().connected))
-    velocity_rps = property(lambda self: self._state().velocity_rps)
-    goal_rps = property(lambda self: self._state().goal_rps)
-    commanded_rps = property(lambda self: self._state().commanded_rps)
+    phase = property(lambda self: VelocityPhase(self._snapshot.phase))
+    at_speed = property(lambda self: bool(self._snapshot.at_speed))
+    connected = property(lambda self: bool(self._snapshot.connected))
+    velocity_rps = property(lambda self: self._snapshot.velocity_rps)
+    goal_rps = property(lambda self: self._snapshot.goal_rps)
+    commanded_rps = property(lambda self: self._snapshot.commanded_rps)
 
     def state(self):
-        """control.VelocityState: velocity, requested = goal_rps, current,
-        enabled = driving, connected."""
-        s = self._state()
-        return self._MESSAGE.decode(self._MESSAGE.encode({
-            "velocity_rps": s.velocity_rps, "requested_rps": s.goal_rps,
-            "current_a": s.current_a, "enabled": bool(s.driving),
-            "connected": bool(s.connected)}))
+        """control.VelocityState, as the C++ state() returns it."""
+        return self._MESSAGE.decode(self._message.raw)
 
 
 class RollerWithSensor(_Mechanism):
@@ -189,8 +193,8 @@ class RollerWithSensor(_Mechanism):
         """This tick's request: a RollerCommand."""
         self._call("set_goal", int(RollerCommand(command)))
 
-    phase = property(lambda self: RollerPhase(self._state().phase))
-    has_piece = property(lambda self: bool(self._state().has_piece))
+    phase = property(lambda self: RollerPhase(self._snapshot.phase))
+    has_piece = property(lambda self: bool(self._snapshot.has_piece))
     sensor_connected = property(
-        lambda self: bool(self._state().sensor_connected))
-    output_v = property(lambda self: self._state().output_v)
+        lambda self: bool(self._snapshot.sensor_connected))
+    output_v = property(lambda self: self._snapshot.output_v)

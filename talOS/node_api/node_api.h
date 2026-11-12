@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 31u
+#define TALOS_NODE_ABI_VERSION 32u
 
 enum {
   TALOS_OK = 0,
@@ -388,7 +388,11 @@ int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming);
 // C++ method of the same name: requests (set_goal, hold, stop, clear_fault)
 // and update fail, naming the mechanism, outside the node's update(), and
 // the open fails, naming the key, on a missing or invalid parameter. *_state
-// fills what the getters return as of the last update().
+// fills what the getters return now (as of the last update(), when they
+// change) and, for position and velocity, `message`, unless it is NULL, with
+// the control message state() returns (control::PositionState,
+// control::VelocityState); a `message_size` other than that message's size
+// is an error.
 
 enum {  // talos::mechanisms::PositionPhase
   TALOS_POSITION_PHASE_UNHOMED = 0,
@@ -452,7 +456,8 @@ int32_t talos_position_mechanism_stop(TalosNode* node, int64_t index);
 int32_t talos_position_mechanism_update(TalosNode* node, int64_t index);
 int32_t talos_position_mechanism_clear_fault(TalosNode* node, int64_t index);
 int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
-                                       TalosPositionMechanismState* out);
+                                       TalosPositionMechanismState* out,
+                                       void* message, uint32_t message_size);
 
 // current_a is VelocityMechanism::state()'s (stator amps).
 typedef struct TalosVelocityMechanismState {
@@ -472,7 +477,8 @@ int32_t talos_velocity_mechanism_set_goal(TalosNode* node, int64_t index,
 int32_t talos_velocity_mechanism_stop(TalosNode* node, int64_t index);
 int32_t talos_velocity_mechanism_update(TalosNode* node, int64_t index);
 int32_t talos_velocity_mechanism_state(TalosNode* node, int64_t index,
-                                       TalosVelocityMechanismState* out);
+                                       TalosVelocityMechanismState* out,
+                                       void* message, uint32_t message_size);
 
 typedef struct TalosRollerWithSensorState {
   int32_t phase;  // TALOS_ROLLER_PHASE_*
