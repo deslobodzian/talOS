@@ -2470,11 +2470,13 @@ void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
   EXPECT_NE(g.snapshot().motors[1].voltage, 0.0);
 }
 
+// REQ-DEV-24
 TEST(SimBackend, RestoringChainIsInvalidAsOnTheRobot) {
   SimBackend backend;
   ExpectRestoringPairIsTotalLoss(backend);
 }
 
+// REQ-DEV-24
 TEST(PhysicsSimBackend, RestoringChainIsInvalidAsOnTheRobot) {
   sim::PhysicsSimBackend backend;
   ExpectRestoringPairIsTotalLoss(backend);
