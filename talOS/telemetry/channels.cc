@@ -10,6 +10,7 @@
 #include "flatbuffers/flatbuffers.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
 #include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
 #include "talOS/telemetry/wire.h"
@@ -17,6 +18,17 @@
 namespace talos::telemetry {
 
 namespace {
+
+namespace naming = introspect::naming;
+static_assert(static_cast<int>(naming::AlertLevel::kNone) ==
+                      Talos::Telemetry::AlertLevel_None &&
+                  static_cast<int>(naming::AlertLevel::kInfo) ==
+                      Talos::Telemetry::AlertLevel_Info &&
+                  static_cast<int>(naming::AlertLevel::kWarning) ==
+                      Talos::Telemetry::AlertLevel_Warning &&
+                  static_cast<int>(naming::AlertLevel::kError) ==
+                      Talos::Telemetry::AlertLevel_Error,
+              "naming::AlertLevel and telemetry.fbs AlertLevel must agree");
 
 // One topic's flattening, bounded against a schema that is damaged or
 // crafted (a recorded log's, which nothing checked against this build).
@@ -88,14 +100,14 @@ class Flattener {
                    depth + 1);
           } else {
             AddScalar(type.element(), type.index(), field_name, element_name,
-                      element_offset);
+                      element_offset, false);
           }
         }
         continue;
       }
 
       AddScalar(type.base_type(), type.index(), field_name, channel_name,
-                field_offset);
+                field_offset, true);
     }
     open_[index] = false;
   }
@@ -116,9 +128,11 @@ class Flattener {
     return static_cast<std::size_t>(index);
   }
 
+  // `whole_field`: the scalar is the field itself, not an array element,
+  // so a bool may be an alert.
   void AddScalar(reflection::BaseType base, std::int32_t type_index,
                  std::string_view field_name, std::string name,
-                 std::size_t offset) {
+                 std::size_t offset, bool whole_field) {
     if (options_.keep && !options_.keep(name)) return;
     ++kept_;
     if (channels_.size() >= options_.max_channels) {
@@ -135,6 +149,7 @@ class Flattener {
     channel.base = base;
     if (base == reflection::BaseType::Bool) {
       // A bool has no unit.
+      if (whole_field) channel.alert = AlertLevelOf(field_name);
     } else if (type_index >= 0) {
       channel.labels = EnumLabels(schema_, type_index);
     } else {
@@ -163,6 +178,12 @@ Channel Unread(std::string name, ChannelKind kind, std::string unit = "",
 }
 
 }  // namespace
+
+AlertLevel AlertLevelOf(std::string_view field) {
+  const auto alert = naming::ParseAlertField(field);
+  return alert ? static_cast<AlertLevel>(alert->level)
+               : Talos::Telemetry::AlertLevel_None;
+}
 
 std::vector<std::string> EnumLabels(const reflection::Schema& schema,
                                     std::int32_t enum_index) {
