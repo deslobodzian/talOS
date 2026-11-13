@@ -369,7 +369,9 @@ differs, then `./gradlew deploy -Pcompanion=<ipv4>`
 Deploy it from the same checkout as the main-processor bundle: each side
 rejects frames of another protocol version (currently 7; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
-when that happens; the RoboRIO reports it to the Driver Station
-(`companion/protocol_ok`, [RoboRIO](../talOS/hardware/README.md#roborio)).
+when that happens; the RoboRIO reports it in the Driver Station message log
+(a `talos companion link` error naming both versions,
+[RoboRIO](../talOS/hardware/README.md#roborio)), and the driver dashboard's
+status line shows the RoboRIO link lost.
 Robot bring-up checklist: [BRINGUP.md](BRINGUP.md); before each match:
 [PRE_MATCH.md](PRE_MATCH.md).
