@@ -13,7 +13,10 @@ library's, naming the source file that read it.
   python3 tools/check_host_includes.py [--allow PATH]... DIR_OR_FILE...
 
 Each argument is a `.d` file, or a directory searched for `*.d` files
-(`bazel info output_path` after a build). Paths outside the host prefixes
+(`bazel info output_path` after a build with
+--experimental_inmemory_dotd_files=false and
+--remote_download_regex='.*\\.d$': without them a compile that hit a cache
+leaves no `.d` file on disk). Paths outside the host prefixes
 (the compiler's own directories, a macOS SDK, Bazel's external/ and
 bazel-out/) are never reported. --allow adds a header path, or a directory
 ending in '/', to the allowlist.
@@ -149,7 +152,12 @@ def main(argv):
     args = parser.parse_args(argv)
     found, count = check(args.paths, args.allow)
     if count == 0:
-        print("check_host_includes: no .d files under " + " ".join(args.paths),
+        # Not a pass: nothing was checked.
+        print("check_host_includes: no .d files under "
+              + " ".join(args.paths) + ": the build compiled nothing, or "
+              "its compiles hit a cache and Bazel kept their .d files in "
+              "memory; build with --experimental_inmemory_dotd_files=false "
+              "'--remote_download_regex=.*\\.d$' (tools/prepush.sh does)",
               file=sys.stderr)
         return 2
     if found:

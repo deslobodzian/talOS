@@ -143,11 +143,25 @@ run_step read-only python3 "$tools/make_sources_read_only.py" || {
 }
 
 bazel_started=1
-if run_step build bazel build //... --noshow_progress "--disk_cache=$disk_cache"; then
+# A compile that hits the disk cache leaves no `.d` file on disk under
+# Bazel's defaults (it is kept in memory, and outputs that are not top-level
+# are not downloaded), so host-includes would not see what it read. These
+# write every compile's `.d` to the output path; the test step takes them
+# too, so it reuses the build's analysis.
+bazel_flags=(--noshow_progress "--disk_cache=$disk_cache"
+  --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$')
+# Before the build, every `.d` in the reused output base is deleted, so
+# host-includes reads only this build's: the build rewrites or downloads
+# each one it needs, and one of a target since deleted is gone.
+if run_step build sh -c \
+    'out="$(bazel info "$@" output_path)" &&
+     { [ ! -d "$out" ] || find "$out" -name "*.d" -type f -delete; } &&
+     bazel build //... "$@"' _ "${bazel_flags[@]}"; then
   run_step host-includes sh -c \
-    'python3 "$1" "$(bazel info output_path)"' _ "$tools/check_host_includes.py" || true
-  run_step test bazel test //... --noshow_progress --test_output=errors \
-    --nocache_test_results "--disk_cache=$disk_cache" || true
+    'python3 "$1" "$(shift; bazel info "$@" output_path)"' _ \
+    "$tools/check_host_includes.py" "${bazel_flags[@]}" || true
+  run_step test bazel test //... --test_output=errors --nocache_test_results \
+    "${bazel_flags[@]}" || true
 else
   skip host-includes "the build failed"
   skip test "the build failed"
