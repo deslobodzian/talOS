@@ -117,6 +117,8 @@ struct RobotConfig {
   int64_t log_max_bytes{int64_t{2} * 1024 * 1024 * 1024};
 
   // Refuse a described graph with no producer for an actuated subsystem's mode.
+  // `[robot] require_target_coverage`, default false; true whenever the
+  // config file sets `commissioned = true`, which refuses an explicit false.
   bool require_target_coverage{false};
 
   // Sim-session viewer. Studio's bridge is a host-side process, not a robot
@@ -1100,8 +1102,19 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
     hw.status_hz = Read(*robot, "status_hz", hw.status_hz);
     hw.commissioned = Read(*robot, "commissioned", hw.commissioned);
+    // A commissioned robot drives hardware, so a mode its policy lists with
+    // no producer would lose that mode on the field: it requires coverage,
+    // and refuses a config that turns it off.
+    if (hw.commissioned && robot->contains("require_target_coverage") &&
+        !Read(*robot, "require_target_coverage", true)) {
+      throw std::invalid_argument(
+          "[robot] commissioned = true requires target coverage, but "
+          "require_target_coverage = false; remove the key or set it to "
+          "true, and give each subsystem's modes a producer or empty them "
+          "in its [targets]");
+    }
     result.require_target_coverage =
-        Read(*robot, "require_target_coverage", result.require_target_coverage);
+        Read(*robot, "require_target_coverage", hw.commissioned);
     result.controller_address = detail::ReadNonEmpty(
         *robot, "controller_address", result.controller_address, "[robot]");
     if (!detail::IsIpv4Address(result.controller_address)) {
