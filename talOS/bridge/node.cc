@@ -461,12 +461,22 @@ void HardwareNode::Tick(uint64_t now_us) {
       ++tick_requests_;
       tracker.arm_stalled = false;
       tracker.requests_skipped += received->dropped;
+      // Heard from its first request, accepted, refused or undecodable
+      // alike: the topic is this subsystem's alone, written only by its
+      // node's devices-layer flush (talOS/NAMING.md "Topics"). Until one is
+      // accepted its silence counts from this one.
+      if (!tracker.heard) {
+        tracker.heard = true;
+        tracker.silence_from_us = now_us;
+        tracker.transition_since_accepted = false;
+      }
       Command partial{};
       if (Decode(received->message.bytes(), partial)) {
         // Trust gates, in this order: an obsolete request must never merge,
         // and a current one must still own every device it addresses. Either
         // rejection drops the whole request without proving liveness, so a
-        // stream of bad requests still times the subsystem out.
+        // stream of bad requests still times the subsystem out, in the merge
+        // and on /hw/status alike.
         if (!HasRequestIdentity(tracker, partial)) {
           ++identity_rejected_;
         } else if (!OwnsRequestDevices(tracker, partial)) {
@@ -514,7 +524,6 @@ void HardwareNode::Tick(uint64_t now_us) {
           full_cmd_.boot_id = partial.boot_id;
           full_cmd_.epoch = partial.epoch;
           tracker.merge.Accept(now_us, partial.observed_time_us);
-          tracker.heard = true;
           tracker.silence_from_us = now_us;
           tracker.transition_since_accepted = false;
           tracker.silent = false;
@@ -1238,8 +1247,9 @@ void HardwareNode::InvalidateRequests(uint64_t now_us) {
     tracker.merge.Reset();
     // The owner's requests in flight carry the old identity and are
     // refused, so its next accepted one comes up to a period later: its
-    // silence restarts here, once per accepted request, unless it was
-    // already silent (a transition must not hide that).
+    // silence restarts here, once per accepted request (or its first
+    // received one), unless it was already silent (a transition must not
+    // hide that).
     if (!tracker.transition_since_accepted && !OwnerSilent(tracker, now_us)) {
       tracker.silence_from_us = now_us;
       tracker.transition_since_accepted = true;

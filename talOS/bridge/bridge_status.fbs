@@ -19,18 +19,20 @@ enum GatewayProgram : ubyte {
 // dropped ones included. timed_out_mask has bit i set while the i-th
 // actuator-owning subsystem, in sorted name order, is silent: the link is
 // ready (a State accepted and the current gateway boot has acknowledged
-// this configuration), the bridge has accepted a request from that
-// subsystem since it started, and, for longer than its owner timeout
-// (ARCHITECTURE.md "The tick"), none of its requests has been accepted
-// since the latest of its last accepted request, the link becoming ready
-// (the session's start, or a gateway reboot's acknowledgement) and that
-// subsystem's last controller transition (boot, configuration, epoch,
-// enable or fault edge) at which it was not already silent, one transition
-// per accepted request or link-ready edge. So a controller transition, a
-// session's start (however late an owner's first request) or a gateway
-// reboot alone sets no bit, and a subsystem whose node never sends a
-// request never gets one (the launcher reports a member that does not
-// start or stalls). While the link is not ready the mask is 0 and
+// this configuration), the bridge has received a request from that
+// subsystem since it started (accepted or refused), and, for longer than its
+// owner timeout (ARCHITECTURE.md "The tick"), none of its requests has been
+// accepted since the latest of its last accepted request (its first
+// received request, until one is accepted), the link becoming ready (the
+// session's start, or a gateway reboot's acknowledgement) and that
+// subsystem's first controller transition (boot, configuration, epoch,
+// enable or fault edge) after either at which it was not already silent.
+// So a controller transition, a session's start (however late an owner's
+// first request) or a gateway reboot alone sets no bit, a subsystem whose
+// node never sends a request never gets one (the launcher reports a member
+// that does not start or stalls), and one whose every request is refused
+// gets it one owner timeout after its first. While the link is not ready
+// the mask is 0 and
 // alert_error_link_lost or alert_error_not_configured says why. Only the
 // first 32 fit. subsystem_count is the number of those subsystems. The
 // bridge's exit summary prints, per subsystem, its count of silent
@@ -59,7 +61,7 @@ enum GatewayProgram : ubyte {
 // - alert_warning_owner_timed_out: timed_out_mask is nonzero, so it raises
 //   neither at a controller transition, which times every owner out in the
 //   merge until its next request, nor at the session's start, nor for an
-//   owner the bridge has never accepted a request from. Clears on the
+//   owner the bridge has never received a request from. Clears on the
 //   silent subsystem's next accepted request, or when the link stops being
 //   ready.
 // - alert_warning_brownout: health_valid and brownout.
