@@ -37,6 +37,37 @@ cc_library(
     ],
 )
 
+# The driver dashboard's feed (/drive): the reserved egress budget, the
+# drive slots, the channel mask and the drive summary. Header-only, like
+# :telemetry.
+cc_library(
+    name = "drive",
+    hdrs = ["drive.h"],
+    deps = [
+        ":system",
+        ":telemetry",
+        "//talOS/introspection:registry",
+        "//talOS/telemetry:wire",
+        "@nlohmann_json//:json",
+    ],
+)
+
+cc_test(
+    name = "drive_test",
+    size = "small",
+    srcs = ["tests/drive_test.cc"],
+    deps = [
+        ":drive",
+        ":telemetry",
+        "//talOS/introspection:registry",
+        "//talOS/telemetry:frames",
+        "//talOS/telemetry:schema",
+        "//talOS/telemetry:wire",
+        "@flatbuffers",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_test(
     name = "telemetry_test",
     size = "small",
@@ -114,6 +145,7 @@ cc_binary(
     # soak test launches it as a chaos target.
     visibility = ["//visibility:public"],
     deps = [
+        ":drive",
         ":system",
         ":telemetry",
         "//talOS/configuration",
@@ -122,6 +154,7 @@ cc_binary(
         "//talOS/process",
         "//talOS/rtms",
         "//talOS/rtms:wake",
+        "//talOS/telemetry:dashboard_layout",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
         "@flatbuffers",

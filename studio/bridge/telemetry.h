@@ -280,8 +280,10 @@ inline bool IngestTelemetry(TelemetryState& state, std::string_view payload,
 }
 
 // The WebSocket egress token bucket: every send to a client is charged, with
-// conservative framing overhead, against a shared bucket and the client's own
-// (docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
+// conservative framing overhead, against the client's own bucket and, for a
+// programmer client, a shared one; kBytesPerSecond is the bridge's total,
+// of which drive clients' budgets are reserved first (BridgeEgress in
+// drive.h; docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
 struct EgressBudget {
   static constexpr double kBytesPerSecond = 160000;
   static constexpr double kBurstBytes =
@@ -344,11 +346,25 @@ struct ClientSendBuffer {
 // What one client has been sent, so its next update carries only what
 // changed. Pump is called whenever there may be something to send (each new
 // tick, each bridge pass); it never sends what the client already has.
+//
+// A driver dashboard client (DriveFeed) narrows it two ways (REQ-OPS-35): a
+// channel mask, so its updates carry only the channels the mask marks, and
+// LimitUpdates, so an update carrying a change goes at most once per
+// interval. A change held by that limit waits and coalesces like one the
+// budget defers; meanwhile the client's heartbeat restamps the tick it holds.
 class ClientFeed {
  public:
-  // With nothing changed, an empty update still goes out this often, so the
-  // client knows the stream is alive and how old its view is.
-  static constexpr std::int64_t kHeartbeatNs = 100'000'000;
+  // With nothing new to send, an empty update still goes out this often, so
+  // the client knows the stream is alive and how old its view is.
+  static constexpr std::int64_t kHeartbeatNs =
+      talos::telemetry_wire::kHeartbeatIntervalNs;
+
+  // Updates that carry a change (a keyframe, a value, an absence or the
+  // chassis) go at most once per `interval_ns`; 0, the default, sends each
+  // as soon as the budget affords it. Heartbeats are not limited by it.
+  void LimitUpdates(std::int64_t interval_ns) {
+    min_update_interval_ns_ = interval_ns;
+  }
 
   // `afford(framed_bytes)` says whether a batch of that many framed bytes may
   // be sent now, and spends nothing; `send(page)` sends one page, is charged
@@ -356,10 +372,13 @@ class ClientFeed {
   // when the budget affords all of it, so the client applies it as one tick.
   // The dictionary is within telemetry_wire::kMaxChannels (IngestTelemetry), so
   // the largest update, a keyframe of every channel, fits the burst and is
-  // affordable once the budget refills.
+  // affordable once the budget refills. `mask`, when given, is indexed like
+  // the dictionary, and only the channels it marks nonzero are ever sent
+  // (the dictionary is sent whole); a mask of another size sends no values
+  // at all.
   template <class Afford, class Send>
   void Pump(const TelemetryState& state, std::int64_t now_ns, Afford&& afford,
-            Send&& send) {
+            Send&& send, const std::vector<std::uint8_t>* mask = nullptr) {
     if (!state.has_dictionary) return;
     const std::size_t count = state.dictionary.size();
     if (!known_ || stream_id_ != state.stream_id ||
@@ -375,6 +394,7 @@ class ClientFeed {
       if (!afford(EgressBudget::framed(page.size())) || !send(page)) return;
       ++dictionary_pages_sent_;
     }
+    if (mask != nullptr && mask->size() != count) return;
     // The client holds this tick: nothing to send until the heartbeat is due.
     if (!state.has_frame || (has_values_ && sequence_id_ == state.sequence_id &&
                              now_ns - last_send_ns_ < kHeartbeatNs)) {
@@ -386,6 +406,7 @@ class ClientFeed {
     raw_.clear();
     absent_.clear();
     for (std::size_t i = 0; i < count; ++i) {
+      if (mask != nullptr && (*mask)[i] == 0) continue;
       if (state.present[i] != 0) {
         if (keyframe || present_[i] == 0 || values_[i] != state.values[i]) {
           channels_.push_back(static_cast<std::uint32_t>(i));
@@ -395,23 +416,36 @@ class ClientFeed {
         absent_.push_back(static_cast<std::uint32_t>(i));
       }
     }
-    if (!keyframe && channels_.empty() && absent_.empty() &&
-        chassis_ == state.chassis && now_ns - last_send_ns_ < kHeartbeatNs) {
-      return;
+    const bool changed = keyframe || !channels_.empty() || !absent_.empty() ||
+                         chassis_ != state.chassis;
+    const bool heartbeat_due = now_ns - last_send_ns_ >= kHeartbeatNs;
+    // A change inside the update interval waits; if the heartbeat is due
+    // meanwhile, it restamps the tick the client holds, which is the truth
+    // about the values it shows. A client whose view is unknown has no tick
+    // to restamp and waits for its keyframe.
+    const bool limited = changed && updated_ &&
+                         now_ns - last_update_ns_ < min_update_interval_ns_;
+    held_ = limited;
+    if (!changed && !heartbeat_due) return;
+    if (limited && (!heartbeat_due || keyframe)) return;
+    if (limited) {
+      channels_.clear();
+      raw_.clear();
+      absent_.clear();
     }
 
     pages_.clear();
     spans_.clear();
     std::size_t framed_total = 0;
+    const TelemetryPose& pose = limited ? chassis_ : state.chassis;
     const talos::telemetry::PageHeader header{
         .stream_id = state.stream_id,
-        .sequence_id = state.sequence_id,
-        .timestamp_ns = state.timestamp_ns,
+        .sequence_id = limited ? sequence_id_ : state.sequence_id,
+        .timestamp_ns = limited ? timestamp_ns_ : state.timestamp_ns,
         .dictionary_id = state.dictionary_id,
         .channel_count = static_cast<std::uint32_t>(count)};
-    const Talos::Telemetry::Pose chassis{
-        state.chassis.x,    state.chassis.y,     state.chassis.z,
-        state.chassis.roll, state.chassis.pitch, state.chassis.yaw};
+    const Talos::Telemetry::Pose chassis{pose.x,    pose.y,     pose.z,
+                                         pose.roll, pose.pitch, pose.yaw};
     const bool encoded = talos::telemetry::EncodeValuePages(
         builder_, header, chassis, keyframe, channels_, raw_, absent_,
         [&](std::span<const std::uint8_t> page,
@@ -435,25 +469,43 @@ class ClientFeed {
       }
       Apply(spans_[i], keyframe && i == 0);
     }
-    sequence_id_ = state.sequence_id;
-    chassis_ = state.chassis;
     last_send_ns_ = now_ns;
+    if (limited) return;
+    sequence_id_ = state.sequence_id;
+    timestamp_ns_ = state.timestamp_ns;
+    chassis_ = state.chassis;
+    if (changed) {
+      updated_ = true;
+      last_update_ns_ = now_ns;
+    }
   }
 
   // When an update is next due with nothing new published: the heartbeat,
-  // once the client holds a tick; kNeverNs before.
-  std::int64_t NextHeartbeatNs() const {
-    return has_values_ ? last_send_ns_ + kHeartbeatNs : kNeverNs;
+  // once the client holds a tick, and the end of the update interval while
+  // a change waits for it; kNeverNs before the client holds a tick.
+  std::int64_t NextDueNs() const {
+    if (!has_values_) return kNeverNs;
+    const std::int64_t heartbeat = last_send_ns_ + kHeartbeatNs;
+    return held_
+               ? std::min(heartbeat, last_update_ns_ + min_update_interval_ns_)
+               : heartbeat;
   }
 
-  // True when the client holds exactly the state's latest tick.
-  bool current(const TelemetryState& state) const {
+  // Whether the client holds a tick: from then on the heartbeat keeps it
+  // hearing from the stream.
+  bool holds_tick() const { return has_values_; }
+
+  // True when the client holds exactly the state's latest tick (of the
+  // channels `mask` marks, when given).
+  bool current(const TelemetryState& state,
+               const std::vector<std::uint8_t>* mask = nullptr) const {
     if (!known_ || !has_values_ || !state.has_frame ||
         stream_id_ != state.stream_id ||
         dictionary_id_ != state.dictionary_id || chassis_ != state.chassis) {
       return false;
     }
     for (std::size_t i = 0; i < state.present.size(); ++i) {
+      if (mask != nullptr && (i >= mask->size() || (*mask)[i] == 0)) continue;
       if (present_[i] != state.present[i] ||
           (present_[i] != 0 && values_[i] != state.values[i])) {
         return false;
@@ -493,10 +545,17 @@ class ClientFeed {
   std::size_t dictionary_pages_sent_{0};
   bool has_values_{false};
   std::uint64_t sequence_id_{0};
+  std::uint64_t timestamp_ns_{0};
   std::vector<std::uint64_t> values_;
   std::vector<std::uint8_t> present_;
   TelemetryPose chassis_{};
   std::int64_t last_send_ns_{0};
+  // The update interval (LimitUpdates): the last update that carried a
+  // change, and whether a change now waits for the interval to end.
+  std::int64_t min_update_interval_ns_{0};
+  bool updated_{false};
+  std::int64_t last_update_ns_{0};
+  bool held_{false};
 
   // Scratch, reused per update.
   std::vector<std::uint32_t> channels_;
@@ -571,7 +630,7 @@ struct ClientFeeds {
   // for budget are due when it refills, which the caller tracks.
   std::int64_t NextDueNs(const SystemGraphDocument& document) const {
     std::int64_t due =
-        std::min(graph.NextDueNs(document), telemetry.NextHeartbeatNs());
+        std::min(graph.NextDueNs(document), telemetry.NextDueNs());
     if (held_since_ns_ >= 0) due = std::min(due, held_sent_ns_ + kHoldNs);
     return due;
   }
@@ -668,9 +727,10 @@ struct WakeSchedule {
 
   // The next instant to run, after `now_ns`. `polling` (no wake channel, or
   // pages left unread) brings it back in kFallbackNs. `for_each_feeds(f)`
-  // calls f(const ClientFeeds&) for each client. An instant already past is
-  // left out: what it was due for was done this pass or waits for budget,
-  // which retry_ns covers.
+  // calls f with each client's feeds: a programmer client's ClientFeeds, or
+  // anything else with a NextDueNs() (a driver dashboard's DriveFeed). An
+  // instant already past is left out: what it was due for was done this pass
+  // or waits for budget, which retry_ns covers.
   template <class ForEachFeeds>
   std::int64_t NextWakeNs(std::int64_t now_ns, bool polling,
                           const SystemGraphDocument& document,
@@ -682,8 +742,13 @@ struct WakeSchedule {
     };
     consider(check_due_ns);
     consider(retry_ns);
-    for_each_feeds(
-        [&](const ClientFeeds& feeds) { consider(feeds.NextDueNs(document)); });
+    for_each_feeds([&](const auto& feeds) {
+      if constexpr (requires { feeds.NextDueNs(document); }) {
+        consider(feeds.NextDueNs(document));
+      } else {
+        consider(feeds.NextDueNs());
+      }
+    });
     return std::max(next, now_ns + 1);
   }
 };

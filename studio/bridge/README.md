@@ -29,7 +29,9 @@ a port).
 
 These named options are removed before positional parsing:
 
-- `--config PATH`: read `[studio] max_clients` from robot configuration.
+- `--config PATH`: read `[studio] max_clients` and `[studio] dashboard` (the
+  driver dashboard's layout; see [Driver dashboard feed](#driver-dashboard-feed))
+  from robot configuration, and the config's roster for the drive summary.
 - `--idle-timeout-s S`: a client's idle timeout, 8 to 960 s (default 16; see
   [WebSocket operating limits](#websocket-operating-limits)). Tests pass 8 to
   keep their runtime short.
@@ -52,6 +54,8 @@ The manual runtime command still takes its topic positionally.
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
 | `/manifest.json` | Current manifest file | 404 if absent or unreadable; 413 above 1 MiB (Studio's own manifest limit) |
 | `/telemetry` | WebSocket: binary telemetry and text system graphs | Excess clients receive 503 |
+| `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout |
+| `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade); 404 without the file (the page) |
 
 For example:
 
@@ -109,7 +113,7 @@ waits for budget it reserves half of the client's refill
 lies beyond the reserve, at most one update per 250 ms
 (`ClientFeeds::kHoldNs`), so however large a telemetry update the message goes
 within a bound ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary):
-2.0 s for a 40 KB whole graph at the default share). A deferred message
+2.0 s for a 40 KB whole graph at a 40,000 B/s share). A deferred message
 coalesces into the next; while the client has heard nothing for 750 ms it is
 sent
 `{"kind":"talos.system_graph.deferred","structure":...}`, so Studio, which
@@ -150,10 +154,13 @@ TALOS_UPDATE_GOLDEN=1 bazel run //studio/bridge:system_test -- \
 
 ## WebSocket operating limits
 
-Run one bridge per robot. Extra upgrades past `[studio] max_clients` receive
-HTTP **503 Studio client limit**, `Retry-After: 5`, and
-`Studio client limit reached`. The client limit and the egress byte budget are
-in [Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
+Run one bridge per robot. Extra `/telemetry` upgrades past
+`[studio] max_clients` receive HTTP **503 Studio client limit**,
+`Retry-After: 5`, and `Studio client limit reached`. Driver dashboard clients
+(`/drive`) are not counted against it and are never refused; they have their
+own slots and budget ([Driver dashboard feed](#driver-dashboard-feed)). The
+client limit and the egress byte budget are in
+[Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary).
 
 The bridge sends nothing to a client that already has buffered userspace
 output, and never queues old observations for it: its telemetry waits and
@@ -177,9 +184,9 @@ counts only sends the socket refused (graph messages and telemetry pages); a
 graph message or telemetry update the budget deferred is not a drop. The bridge's own
 telemetry source counts as `dropped` the pages the publisher overwrote before
 the bridge read them plus the ticks it discarded for a missing page. The
-shutdown summary prints the cumulative counters, including `lapped` and
+shutdown summary prints the cumulative counters, including `lapped`,
 `held` (passes in which a client was sent nothing because its output was
-still buffered).
+still buffered) and `evicted` (drive clients a newer one replaced).
 
 ### Load probe
 
@@ -200,6 +207,130 @@ sent nothing while every reader is sent at least four updates. The test
 fills that client's receive window with pongs to its pings, since macOS
 gives a loopback client a window of about 320 KiB however small a buffer it
 asks for.
+
+## Driver dashboard feed
+
+The driver dashboard (REQ-OPS-35, REQ-OPS-36) is enabled when `--config`
+names a config whose `[studio] dashboard` names a layout that parses
+([telemetry README](../../talOS/telemetry/README.md#dashboard-layout)). A
+layout that does not parse is logged (`driver dashboard disabled: ...`) and
+the bridge runs on without it. The code is [`drive.h`](drive.h).
+
+**Endpoints**, on the same port as Studio:
+
+- `GET /drive` without a WebSocket upgrade: `drive.html` from the web
+  directory (404 when it has none).
+- `GET /drive/layout.json`: the layout as `DashboardLayoutJson` writes it
+  (shape in the telemetry README's `/drive/layout.json`). 404 without a
+  layout.
+- `ws://<host>:<port>/drive`: the feed. The upgrade answers 404 without a
+  layout and is otherwise always accepted: never 503.
+
+**Slots.** At most the layout's `drive_clients` feed connections are held.
+They are not counted against `[studio] max_clients`, so programmer clients
+can neither refuse nor displace one. A new connection past `drive_clients`
+is accepted, and the oldest held one is closed with WebSocket close code
+**4000** and reason **`replaced by a newer driver dashboard`**, so a laptop
+that reconnects after a Wi-Fi drop always gets in, even while its dead
+connection waits for the idle timeout. A page that reconnects by itself
+after that close takes the slot back from the newer page in turn, so with
+more pages open than `drive_clients` they keep replacing each other. Feed
+clients have the same idle timeout and pings as `/telemetry`.
+
+**Budget.** Each feed client has its own token bucket of the layout's
+`budget_bytes_per_s` with the 64,000 B burst, charged for every message with
+its WebSocket framing, and is charged to nothing else.
+`drive_clients × budget_bytes_per_s` is reserved out of the bridge's
+160,000 B/s before programmer clients share the rest
+([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)),
+so a programmer client's traffic never defers a feed message. A message the
+client's bucket cannot afford waits (telemetry coalesces into the next
+update); telemetry construction holds the budget at or above the feed's worst
+case, so that happens only while the burst refills after the dictionary.
+
+**Messages.** The bridge only sends; what a client sends is ignored (at most
+1024 B a message). A message is binary or text by its WebSocket frame type.
+
+*Binary: telemetry pages.* Each binary message is one TLM3 page, exactly as
+on `/telemetry` and as Studio's `TelemetryDecoder` reads them: a 4-byte
+little-endian length, then a FlatBuffers `Talos.Telemetry.Frame` with file
+identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
+
+1. **Dictionary.** On connect, and whenever the producer's `stream_id` or
+   `dictionary_id` changes, every dictionary page, in order: the whole
+   dictionary, not only the masked channels, so a channel's index in a
+   value page is its index in this dictionary.
+2. **Updates.** Then value updates. An update is the value pages of one tick,
+   `page` 0 to `page_count - 1`, all with that tick's `sequence_id` and
+   `timestamp_ns`, sent back to back; apply it when its last page arrives.
+   The first update after a dictionary has `keyframe` true on page 0: start
+   from every channel absent. After it, an update carries in `channels` and
+   `values` each masked channel whose value or presence changed, and in
+   `absent` each masked channel that lost its sample; every page carries the
+   tick's chassis pose. An update leaves the client holding the masked
+   values of the tick it is stamped with.
+3. **The mask.** Channel `i` of the dictionary is in the client's mask when
+   its name is in `/drive/layout.json` `"channels"`, or when that document's
+   `"alerts"` is true and the channel's `alert` is not `None`
+   (`/channels.json` `"alert"` other than `"none"`). Only masked channels are
+   ever carried or named absent. Every other channel, and a layout channel
+   the dictionary lacks, is never sent: read it as absent, never as a value.
+4. **Rate.** Updates that carry a change (a value, an absence, the chassis, or
+   a keyframe) go at most `update_hz` a second, at least
+   `ceil(1e9 / update_hz)` ns apart; changes in between coalesce into the
+   next update.
+5. **Heartbeat.** When nothing has been sent for 100 ms
+   (`telemetry_wire::kHeartbeatIntervalNs`) and the client holds a tick, an
+   empty update goes: `keyframe` false, no `channels`, no `absent`, stamped
+   with the tick whose masked values the client holds. That is the newest
+   tick when no masked value changed since, and the older one while a
+   change waits for the update interval, so a `sequence_id` that keeps
+   advancing means the telemetry the client shows is current, and one that
+   stops means the telemetry is stale.
+
+*Text: JSON objects*, told apart by `"kind"`:
+
+- **`talos.drive.heartbeat`**: exactly `{"kind":"talos.drive.heartbeat"}`.
+  Sent only while the client holds no telemetry tick (no telemetry yet, or a
+  new dictionary before its keyframe), when nothing has been sent for
+  100 ms.
+- **`talos.drive.summary`**: what the `subsystems` widget needs that
+  channels cannot give (a dead node raises no alert). Sent on connect and
+  whenever it changes, at most once per 500 ms
+  (`telemetry_wire::kDriveSummaryIntervalNs`), whole, at most 4,096 bytes
+  (`kDriveSummaryMaxBytes`). It is rebuilt at each 250 ms graph refresh
+  while a feed client is held, from the config's roster, the live registry
+  and the launcher's manifest (`--manifest`, re-read each time):
+
+  ```json
+  {"kind":"talos.drive.summary","session":"42","supervised":true,
+   "nodes":[{"name":"hardware_node","alive":true,"critical":true,"restarts":0,
+             "quarantined":false,"drives":null},
+            {"name":"drivetrain","alive":true,"critical":true,"restarts":1,
+             "quarantined":false,"drives":"teleop"}],
+   "omitted":0}
+  ```
+
+  | Key | Type | Meaning |
+  |---|---|---|
+  | `session` | string | the launcher's session id (the manifest's `session_id`), else a live registry row's, else `""` |
+  | `supervised` | bool | the manifest was read; when false, `restarts` 0 and `quarantined` false mean unknown, not none |
+  | `nodes` | array | every node the config launches, in this order: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
+  | `nodes[].name` | string | the node name |
+  | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false) |
+  | `nodes[].critical` | bool | the subsystem's `critical` (default true; `hardware_node` true) |
+  | `nodes[].restarts` | number | the manifest's `restart_count` for the node |
+  | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
+  | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |
+  | `omitted` | number | nodes left off the end of `nodes` to keep the message within 4,096 bytes; normally 0 |
+
+So a feed client hears something at least every 100 ms while the bridge
+runs and its socket drains: 500 ms of silence means the dashboard-to-bridge
+link, a `sequence_id` that stops advancing means stale telemetry, and the
+RoboRIO link is its own alert channel (`hw/status/alert_error_link_lost`).
+`DriveFeed` in [`drive.h`](drive.h) is the feed, `//studio/bridge:drive_test`
+its unit tests, and `integration_test.py`'s
+`test_drive_feed_slots_and_layout` the slots, eviction and 404 over a socket.
 
 ## Publisher and serving constraints
 
@@ -244,7 +375,10 @@ the wake. A timer is then set to the earliest duty: the 250 ms graph refresh,
 the segment check (100 ms waiting, 1 s attached), and for each client its
 graph update (500 ms) or deferral notice (750 ms), its telemetry heartbeat
 (100 ms after its last update), the end of a telemetry hold (250 ms), and the
-instant the egress budget can afford a deferred send. Idle and attached, with
+instant the egress budget can afford a deferred send; for each drive client,
+its heartbeat (100 ms), the end of its update interval while a change waits
+for it, and the end of its 500 ms summary interval while a changed summary
+waits. Idle and attached, with
 no client, that is about six wakes a second: four refreshes, one segment check
 and uWebSockets' own one-second date timer. A pass that stops at its page
 budget, an arm that keeps finding pages (three tries), or a wake receiver that
