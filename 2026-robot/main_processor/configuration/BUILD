@@ -4,7 +4,7 @@ load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_field_manifest.bzl", FIELD_CONFIG_FILES = "CONFIG_FILES", FIELD_NODES = "NODES")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
-load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES")
+load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES", PHYSICS_NODES = "NODES")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -104,6 +104,18 @@ manifest_sync_test(
     config = "robot_field.toml",
     config_files = FIELD_CONFIG_FILES,
     manifest = "robot_field_manifest.bzl",
+)
+
+talos_graph_test(
+    name = "physics_sim_graph_test",
+    config = "robot_physics_sim.toml",
+    data = PHYSICS_CONFIG_FILES,
+    nodes = PHYSICS_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 manifest_sync_test(

@@ -16,9 +16,10 @@
 # Steps, in order: read-only, `bazel build //...`, host-includes, `bazel test
 # --nocache_test_results //...`, checkout-unchanged; then, when the commits
 # to push (<ref>@{upstream}..<ref>; every file when <ref> is not a branch
-# with an upstream) touch them: gradle (`phoenixTest buildRio -Pheadless --offline`, for
-# 2026-robot/controller_processor/ and talOS/, whose headers the RoboRIO
-# program's build.gradle exports) and studio-test and studio-build (`pnpm test`, `pnpm build`, for studio/).
+# with an upstream) touch them: gradle (`phoenixTest buildRio -Pheadless
+# --offline`, for 2026-robot/controller_processor/ and talOS/, whose headers
+# the RoboRIO program's build.gradle exports) and studio-test and
+# studio-build (`pnpm test`, `pnpm build`, for studio/).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`); logs stay in a
 # directory under ${TMPDIR:-/tmp}.
@@ -28,9 +29,15 @@
 # or failure (write bits restored first) unless --keep, and one run holds it
 # at a time. Bazel reads and writes the disk cache TALOS_BAZEL_DISK_CACHE
 # (default ~/.cache/talos-bazel-disk): build results may come from it, test
-# results may not. JAVA_HOME defaults to ~/wpilib/2026/jdk. Studio uses the
-# checkout's studio/node_modules when present, else `pnpm install
-# --frozen-lockfile --offline`.
+# results may not. Where this host allows an unprivileged user and network
+# namespace (the probe below), the test step sets TALOS_REQUIRE_NETNS=1 as
+# CI's Linux job does, so //talOS/protocol:udp_address_change_test fails
+# rather than skips; elsewhere it may skip, and the run says so. JAVA_HOME
+# defaults to ~/wpilib/2026/jdk. Studio trusts the checkout's installed
+# studio/node_modules when present, unless the commits to push change
+# studio/pnpm-lock.yaml: then, as when none is installed, it runs `pnpm
+# install --frozen-lockfile --offline` and reports studio SKIPPED if that
+# fails.
 #
 # Exit: 0 every step passed, 1 a step failed or was skipped unasked, 2 usage
 # or setup error.
@@ -178,8 +185,18 @@ if run_step build sh -c \
   run_step host-includes sh -c \
     'python3 "$1" "$(shift; bazel info "$@" output_path)"' _ \
     "$tools/check_host_includes.py" "${bazel_flags[@]}" || true
+  # The same probe as the test's: a user and network namespace that can
+  # create a tap device.
+  netns=()
+  if unshare --user --map-root-user --net ip tuntap add dev tap0 mode tap \
+      >/dev/null 2>&1; then
+    netns=(--test_env=TALOS_REQUIRE_NETNS=1)
+    report "test requires network namespaces (TALOS_REQUIRE_NETNS=1, as CI)"
+  else
+    report "test may skip udp_address_change_test: this host refuses an unprivileged network namespace (CI requires it)"
+  fi
   run_step test bazel test //... --test_output=errors --nocache_test_results \
-    "${bazel_flags[@]}" || true
+    ${netns[@]+"${netns[@]}"} "${bazel_flags[@]}" || true
 else
   skip host-includes "the build failed"
   skip test "the build failed"
@@ -208,12 +225,12 @@ elif ! touches studio/; then
   report "studio not needed (nothing under studio/ since $upstream)"
 else
   studio_ready=1
-  if [ -d "$repo/studio/node_modules" ]; then
+  if [ -d "$repo/studio/node_modules" ] && ! touches studio/pnpm-lock.yaml; then
     ln -s "$repo/studio/node_modules" "$wt/studio/node_modules"
   elif ! run_step studio-install sh -c \
       'cd studio && pnpm install --frozen-lockfile --offline'; then
     studio_ready=0
-    skip studio "no studio/node_modules in $repo and an offline pnpm install failed"
+    skip studio "no studio/node_modules in $repo installed from this pnpm-lock.yaml, and an offline pnpm install failed"
   fi
   if [ "$studio_ready" = 1 ]; then
     run_step studio-test sh -c 'cd studio && pnpm test' || true

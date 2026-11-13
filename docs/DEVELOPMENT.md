@@ -101,8 +101,16 @@ cached test result (build results come from the disk cache
 `~/.cache/talos-bazel-disk`), checks that they left the worktree unchanged,
 and runs the gradle and pnpm checks when the commits to push touch the
 RoboRIO program or anything under `talOS/` (its `build.gradle` takes
-headers from all of it) or `studio/`; every
-config's `--describe-only` runs as its `talos_graph_test`. It prints one
+headers from all of it) or `studio/`; every robot and example config's
+`--describe-only` runs as its `talos_graph_test` (the bundle test's
+fixture, `2026-robot/main_processor/bundle_testdata`, has only a
+`manifest_sync_test`). It differs from CI in two places, and says which
+applies: where the host refuses an unprivileged network namespace it
+leaves `TALOS_REQUIRE_NETNS=1` unset, so
+`//talOS/protocol:udp_address_change_test` may skip where CI fails it;
+and Studio's checks use the checkout's installed `studio/node_modules`
+(an offline `pnpm install` when there is none or the commits change
+`studio/pnpm-lock.yaml`, and studio SKIPPED if that fails). It prints one
 line per step and exits nonzero if any failed; the script's header lists
 its flags and steps.
 
