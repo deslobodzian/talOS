@@ -35,6 +35,17 @@ doubled or trailing `_`.
   `target/<source>`, resolved by its node. See
   [target lanes](../ARCHITECTURE.md#targets).
 
+- **alerts** (role `status`): a `bool` field of a node's own `status`
+  message named `alert_<level>_<name>`, where `<level>` is `error`,
+  `warning` or `info` and `<name>` is a lowercase letter, then lowercase
+  letters, digits and single underscores, is an alert, active while true.
+  The node reports the condition and does not latch it.
+  `naming::ParseAlertField` is the only reader of this grammar: the
+  telemetry dictionary carries each alert's level (`ChannelInfo.alert`), so
+  no viewer parses names. The graph lint refuses an `alert_` field that is
+  not a `bool` or not of these levels (nested structs included), and warns
+  on an alert outside a `status` topic.
+
 Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
 `_out`, `_pub`, `_sub`, `_tx`, `_rx`, `_topic`, `_send`, `_recv`).

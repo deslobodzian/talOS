@@ -19,6 +19,7 @@ genrule(
     srcs = ["//talOS/telemetry:telemetry.fbs"],
     outs = [
         "src/generated/talos/telemetry.ts",
+        "src/generated/talos/telemetry/alert-level.ts",
         "src/generated/talos/telemetry/channel-info.ts",
         "src/generated/talos/telemetry/channel-kind.ts",
         "src/generated/talos/telemetry/frame.ts",

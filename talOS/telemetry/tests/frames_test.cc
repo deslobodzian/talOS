@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "talOS/telemetry/telemetry_generated.h"
@@ -61,6 +63,45 @@ TEST(ValuePages, EveryMixAtThePageBoundariesFitsThePageCap) {
   // reached, not avoided.
   EXPECT_GE(largest,
             telemetry_wire::kMaxValueFrameBytes - 2 * detail::kPageSlackBytes);
+}
+
+// The dictionary pager fills a page by DictionaryEntryBytes, so a bound below
+// a real entry would build a page past its slot. Every field set (an alert
+// level, a unit, labels), at every name length's padding, stays within it.
+TEST(DictionaryPages, EntryBoundHoldsWithEveryFieldSet) {
+  flatbuffers::FlatBufferBuilder builder{4096};
+  DictionaryScratch scratch;
+  const PageHeader header{~0ull, ~0ull, ~0ull, ~0u, ~0u};
+  for (std::size_t name_bytes = 1; name_bytes <= 8; ++name_bytes) {
+    for (const std::size_t label_count : {0u, 1u, 3u}) {
+      for (const auto alert : {Talos::Telemetry::AlertLevel_None,
+                               Talos::Telemetry::AlertLevel_Error}) {
+        for (const std::size_t count : {1u, 20u}) {
+          std::vector<ChannelDef> entries;
+          std::size_t bound = detail::DictionaryPageOverhead();
+          for (std::size_t i = 0; i < count; ++i) {
+            ChannelDef channel;
+            channel.name = std::string(name_bytes, 'a') + std::to_string(i);
+            channel.unit = i % 2 == 0 ? "m/s" : "";
+            channel.labels.assign(label_count, std::string(name_bytes, 'l'));
+            channel.kind = Talos::Telemetry::ChannelKind_UInt;
+            channel.alert = alert;
+            bound += detail::DictionaryEntryBytes(channel);
+            entries.push_back(std::move(channel));
+          }
+          detail::FinishDictionaryPage(builder, scratch, header, 0xffff, 0xffff,
+                                       ~0u, entries);
+          EXPECT_LE(builder.GetSize(), bound)
+              << count << " entries, " << name_bytes << " B names, "
+              << label_count << " labels, alert " << static_cast<int>(alert);
+          const auto* frame = Talos::Telemetry::GetSizePrefixedFrame(
+              builder.GetBufferPointer());
+          ASSERT_EQ(frame->dictionary()->size(), entries.size());
+          EXPECT_EQ(frame->dictionary()->Get(0)->alert(), alert);
+        }
+      }
+    }
+  }
 }
 
 }  // namespace

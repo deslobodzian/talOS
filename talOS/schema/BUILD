@@ -143,6 +143,7 @@ talos_messages(
     srcs = ["testdata/shapes.fbs"],
     include_prefix = "schema_test",
     visibility = [
+        "//talOS/introspection:__pkg__",
         "//talOS/python:__pkg__",
         "//talOS/telemetry:__pkg__",
         "//talOS/teleop:__pkg__",

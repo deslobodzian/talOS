@@ -21,6 +21,7 @@
 
 namespace talos::telemetry {
 
+using Talos::Telemetry::AlertLevel;
 using Talos::Telemetry::ChannelKind;
 
 // One dictionary entry, in wire order.
@@ -29,10 +30,11 @@ struct ChannelDef {
   std::string unit;
   std::vector<std::string> labels;  // non-empty: enum channel
   ChannelKind kind{Talos::Telemetry::ChannelKind_Double};
+  AlertLevel alert{Talos::Telemetry::AlertLevel_None};  // a Bool alert
 };
 
-// FNV-1a 32 over names, units, kinds and labels in dictionary order, with
-// NUL separators between fields and 0xFF between channels.
+// FNV-1a 32 over names, units, kinds, alert levels and labels in dictionary
+// order, with NUL separators between fields and 0xFF between channels.
 inline std::uint32_t DictionaryId(std::span<const ChannelDef> dictionary) {
   std::uint32_t hash = 2166136261u;
   auto mix = [&hash](std::string_view text) {
@@ -51,6 +53,8 @@ inline std::uint32_t DictionaryId(std::span<const ChannelDef> dictionary) {
     mix(channel.unit);
     separator(0);
     separator(static_cast<std::uint8_t>(channel.kind));
+    separator(0);
+    separator(static_cast<std::uint8_t>(channel.alert));
     separator(0);
     for (const std::string& label : channel.labels) {
       mix(label);
@@ -161,8 +165,9 @@ inline std::size_t ValuePageOverhead() {
 }
 
 // Upper bound on one ChannelInfo's bytes in a dictionary page: its offset in
-// the vector, the table and its vtable, and each string with its length,
-// terminator and padding.
+// the vector, the table (three offsets, kind and alert) and its vtable, and
+// each string with its length, terminator and padding (frames_test holds a
+// page of entries with every field set under it).
 inline std::size_t DictionaryEntryBytes(const ChannelDef& channel) {
   std::size_t bytes = 48 + channel.name.size() + 8 + channel.unit.size() + 8;
   if (!channel.labels.empty()) bytes += 4 + 4 * channel.labels.size();
@@ -192,7 +197,7 @@ inline void FinishDictionaryPage(flatbuffers::FlatBufferBuilder& builder,
     const auto label_vector =
         channel.labels.empty() ? 0 : builder.CreateVector(labels);
     offsets.push_back(Talos::Telemetry::CreateChannelInfo(
-        builder, name, unit, label_vector, channel.kind));
+        builder, name, unit, label_vector, channel.kind, channel.alert));
   }
   const auto dictionary = builder.CreateVector(offsets);
   Talos::Telemetry::FrameBuilder frame{builder};

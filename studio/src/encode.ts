@@ -1,5 +1,6 @@
 import {Builder} from 'flatbuffers';
 
+import {AlertLevel} from './generated/talos/telemetry/alert-level';
 import {ChannelInfo} from './generated/talos/telemetry/channel-info';
 import {ChannelKind} from './generated/talos/telemetry/channel-kind';
 import {Frame} from './generated/talos/telemetry/frame';
@@ -9,10 +10,11 @@ import {Pose} from './generated/talos/telemetry/pose';
 // (talOS/telemetry/README.md). The robot and the bridge encode with
 // talOS/telemetry/frames.h; these pages decode the same way.
 
-export {ChannelKind};
+export {AlertLevel, ChannelKind};
 
 export type ChannelSpec = {
-  name: string; unit: string; labels?: string[]; kind?: ChannelKind
+  name: string; unit: string; labels?: string[]; kind?: ChannelKind;
+  alert?: AlertLevel
 };
 export type PageHeader = {
   streamId: bigint; sequenceId: bigint; timestampNs: bigint;
@@ -32,8 +34,9 @@ export function doubleFromRaw(raw: bigint): number {
   return scratch.getFloat64(0, true);
 }
 
-// The producer's dictionary id: FNV-1a 32 over names, units, kinds and
-// labels with the same separators (talOS/telemetry/frames.h, DictionaryId).
+// The producer's dictionary id: FNV-1a 32 over names, units, kinds, alert
+// levels and labels with the same separators (talOS/telemetry/frames.h,
+// DictionaryId).
 export function dictionaryId(channels: ChannelSpec[]): number {
   let hash = 2166136261;
   const byte = (b: number) => {
@@ -48,6 +51,8 @@ export function dictionaryId(channels: ChannelSpec[]): number {
     text(channel.unit);
     byte(0);
     byte(channel.kind ?? ChannelKind.Double);
+    byte(0);
+    byte(channel.alert ?? AlertLevel.None);
     byte(0);
     for (const label of channel.labels ?? []) {
       text(label);
@@ -90,7 +95,8 @@ export function encodeDictionaryPages(header: PageHeader,
               b, channel.labels.map(label => b.createString(label))) :
           0;
       return ChannelInfo.createChannelInfo(
-          b, name, unit, labels, channel.kind ?? ChannelKind.Double);
+          b, name, unit, labels, channel.kind ?? ChannelKind.Double,
+          channel.alert ?? AlertLevel.None);
     });
     const dictionary = Frame.createDictionaryVector(b, offsets);
     Frame.startFrame(b);

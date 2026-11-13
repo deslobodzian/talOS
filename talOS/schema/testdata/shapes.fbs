@@ -27,3 +27,21 @@ struct Arrays {
   inners:[Inner:2];
   channel_id:[ubyte:5];
 }
+
+// Alert fields (talOS/introspection/names.h, ParseAlertField), one of each
+// level beside a plain field and an index the telemetry labels test names.
+struct Alerts {
+  alert_error_link_lost:bool;
+  alert_warning_hot:bool;
+  alert_info_homed:bool;
+  routine_index:ubyte;
+  supply_v:double;
+}
+
+// For the graph lint: an alert that is not a bool, an `alert_` field of no
+// level, and well-formed alerts nested one struct down.
+struct BadAlerts {
+  alert_error_fault_count:uint;
+  alert_fatal_overheat:bool;
+  nested:Alerts;
+}
