@@ -561,12 +561,19 @@ node = "//talOS/telemetry:node"
   EXPECT_EQ(dict.at("hw/state/driver_station/match_time_s")->unit, "s");
   EXPECT_EQ(dict.at("hw/state/driver_station/alliance")->labels,
             (std::vector<std::string>{"unknown", "red", "blue"}));
+  ASSERT_TRUE(dict.contains("hw/state/driver_station/match_type"));
+  EXPECT_EQ(dict.at("hw/state/driver_station/match_type")->labels,
+            (std::vector<std::string>{"none", "practice", "qualification",
+                                      "elimination"}));
 
   driver_station::DriverStationData ds_data{};
   ds_data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
                       driver_station::kTeleop;
   ds_data.fms.alliance = driver_station::Alliance::kRed;
   ds_data.fms.match_time_s = 75.5f;
+  ds_data.fms.station = 3;
+  ds_data.fms.match_type = driver_station::MatchType::kQualification;
+  ds_data.fms.match_number = 412;
 
   hardware::Packet packet{};
   packet.size =
@@ -585,6 +592,9 @@ node = "//talOS/telemetry:node"
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/autonomous"), 0.0);
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/alliance"), 1.0);
   EXPECT_NEAR(channels.at("hw/state/driver_station/match_time_s"), 75.5, 1e-3);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/station"), 3.0);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/match_type"), 2.0);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/match_number"), 412.0);
 }
 
 // Each topic contributes one channel after excluding its offset field.
@@ -1163,17 +1173,26 @@ can_id = 1
 [subsystems.demo]
 node = "//demo:node"
 
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+
 [subsystems.telemetry]
 node = "//talOS/telemetry:node"
 stale_timeout_us = 50000
+
+[[subsystems.telemetry.labels]]
+channel = "shooter/status/routine_index"
+from = "autonomous.routines"
 )";
 
 // Observer matrix (docs/TESTING.md §7): the node observes every state and
 // status topic; an input's "validity" is its channels' presence.
 
-// REQ-OPS-37: each alert field's channel carries its level in the dictionary
-// (other fields none) and its value each tick, so a viewer lists it by level
-// without parsing its name.
+// REQ-OPS-37, REQ-OPS-38: each alert field's channel carries its level in
+// the dictionary (other fields none), a labelled integer channel carries
+// another subsystem's string array as its labels, and every value is carried
+// each tick, so a viewer names both without parsing a name or reading TOML.
 TEST(TelemetryMatrix, PublishesFromALiveInput) {
   Sim sim = Sim::FromToml(std::string{kAlertsConfig});
   auto& shooter = sim.add<AlertsNode>("shooter");
@@ -1198,6 +1217,9 @@ TEST(TelemetryMatrix, PublishesFromALiveInput) {
         << name;
   }
 
+  EXPECT_EQ(dict.at("shooter/status/routine_index")->labels,
+            (std::vector<std::string>{"preload", "none", "taxi"}));
+
   shooter.status_.send(schema_test::Alerts{true, false, true, 2, 12.5});
   sim.step(20ms);
   const auto raw =
@@ -1205,6 +1227,84 @@ TEST(TelemetryMatrix, PublishesFromALiveInput) {
   EXPECT_EQ(raw.at("shooter/status/alert_error_link_lost"), 1u);
   EXPECT_EQ(raw.at("shooter/status/alert_warning_hot"), 0u);
   EXPECT_EQ(raw.at("shooter/status/alert_info_homed"), 1u);
+  EXPECT_EQ(raw.at("shooter/status/routine_index"), 2u);
+}
+
+// REQ-OPS-38: a [[subsystem.labels]] entry that cannot label an integer
+// channel with a string array refuses construction, naming its key, rather
+// than leaving a routine shown as a bare number.
+TEST(TelemetryMatrix, BadParameterFailsConstruction) {
+  std::string many = "[";
+  for (std::size_t i = 0; i <= telemetry_wire::kMaxEnumLabels; ++i) {
+    many += (i == 0 ? "\"r" : ", \"r") + std::to_string(i) + "\"";
+  }
+  many += "]";
+  struct Case {
+    const char* what;
+    std::string labels;  // the [[subsystems.telemetry.labels]] body
+    const char* key;     // the key the error names
+  };
+  const auto entry = [](std::string_view channel, std::string_view from) {
+    return "channel = \"" + std::string{channel} + "\"\nfrom = \"" +
+           std::string{from} + "\"\n";
+  };
+  const std::string kIndex = "shooter/status/routine_index";
+  for (const auto& [what, labels, key] : std::vector<Case>{
+           {"unknown channel",
+            entry("shooter/status/nope", "autonomous.routines"),
+            "labels[0].channel"},
+           {"double channel",
+            entry("shooter/status/supply_v", "autonomous.routines"),
+            "labels[0].channel"},
+           {"bool channel",
+            entry("shooter/status/alert_warning_hot", "autonomous.routines"),
+            "labels[0].channel"},
+           {"missing subsystem", entry(kIndex, "ghost.routines"),
+            "labels[0].from"},
+           {"missing key", entry(kIndex, "autonomous.missing"),
+            "labels[0].from"},
+           {"number array", entry(kIndex, "autonomous.speeds"),
+            "labels[0].from"},
+           {"not an array", entry(kIndex, "autonomous.name_text"),
+            "labels[0].from"},
+           {"no key", entry(kIndex, "autonomous"), "labels[0].from"},
+           {"too many labels", entry(kIndex, "autonomous.many"),
+            "labels[0].from"},
+           {"missing from", "channel = \"" + kIndex + "\"\n", "labels[0].from"},
+           {"missing channel", "from = \"autonomous.routines\"\n",
+            "labels[0].channel"},
+       }) {
+    SCOPED_TRACE(what);
+    const std::string config = R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.shooter]
+node = "//shooter:node"
+[subsystems.shooter.motors.m]
+can_id = 1
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+speeds = [1.0, 2.0]
+name_text = "preload"
+many = )" + many + R"(
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+)" + labels;
+    Sim sim = Sim::FromToml(config);
+    sim.add<AlertsNode>("shooter");
+    try {
+      sim.add<Telemetry>("telemetry");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find(key),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
 }
 
 // REQ-OPS-37: an alert whose topic went stale is absent, neither a frozen
@@ -1300,7 +1400,7 @@ class LiveSources {
 
 // RULES.md 3: with every source changing each tick (alerts toggling among
 // them), the producer's reads, value pages and its dictionary resend (every
-// 100th tick, alert levels included) allocate nothing.
+// 100th tick, alert levels and configured labels included) allocate nothing.
 TEST(TelemetryMatrix, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
@@ -1316,12 +1416,22 @@ pose_topic = "/pose_estimator/state"
 node = "//demo:node"
 [subsystems.demo.motors.m]
 can_id = 1
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
 [subsystems.telemetry]
 node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+channel = "demo/status/alerts/routine_index"
+from = "autonomous.routines"
 )");
   sim.add<LiveSources>("demo");
   const auto& telemetry = sim.add<Telemetry>("telemetry");
   ASSERT_GE(MeasurePages(telemetry.dictionary()).value_pages, 2u);
+  ASSERT_EQ(DictionaryMap(telemetry)
+                .at("demo/status/alerts/routine_index")
+                ->labels.size(),
+            3u);
   // Warm up through the dictionary resend at sequence 100: the first send,
   // at sequence 0, omits the zero sequence field, so its pages are smaller.
   sim.step(1030ms);

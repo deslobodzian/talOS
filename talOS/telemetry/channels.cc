@@ -270,6 +270,7 @@ std::vector<Channel> EnvelopeChannels(std::string_view topic,
 
 std::vector<Channel> DriverStationChannels() {
   constexpr auto kBool = Talos::Telemetry::ChannelKind_Bool;
+  constexpr auto kUInt = Talos::Telemetry::ChannelKind_UInt;
   const std::string prefix = "hw/state/driver_station/";
   return {
       Unread(prefix + "connected", kBool),
@@ -279,10 +280,13 @@ std::vector<Channel> DriverStationChannels() {
       Unread(prefix + "test", kBool),
       Unread(prefix + "estop", kBool),
       Unread(prefix + "fms_attached", kBool),
-      Unread(prefix + "alliance", Talos::Telemetry::ChannelKind_UInt, "",
-             {"unknown", "red", "blue"}),
+      Unread(prefix + "alliance", kUInt, "", {"unknown", "red", "blue"}),
       Unread(prefix + "match_time_s", Talos::Telemetry::ChannelKind_Double,
              "s"),
+      Unread(prefix + "match_number", kUInt),
+      Unread(prefix + "match_type", kUInt, "",
+             {"none", "practice", "qualification", "elimination"}),
+      Unread(prefix + "station", kUInt),
   };
 }
 
@@ -316,6 +320,9 @@ bool ReadDriverStation(
       flag(driver_station::kFmsAttached),
       static_cast<std::uint8_t>(data.fms.alliance),
       RawFromDouble(data.fms.match_time_s),
+      data.fms.match_number,
+      static_cast<std::uint8_t>(data.fms.match_type),
+      data.fms.station,
   };
   return true;
 }

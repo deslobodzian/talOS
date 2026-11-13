@@ -69,7 +69,7 @@ inline constexpr std::int64_t kDriveSummaryIntervalNs = 500'000'000;
 // Slot geometry for the /talos/telemetry byte topic. One slot holds one
 // value page or one dictionary page; a dictionary takes as many pages as it
 // needs, each at most one slot, so one channel's entry (name, unit, labels)
-// must fit one slot. 64 slots hold at least 0.3 s of a two-page tick at
+// must fit one slot. 64 slots hold at least 0.2 s of a three-page tick at
 // 100 Hz, which a reader that falls further behind loses (the writer
 // overwrites; the reader is told how many it missed).
 inline constexpr std::size_t slot_bytes = 16384;

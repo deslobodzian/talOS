@@ -81,6 +81,7 @@ class Telemetry {
             "include", std::vector<std::string>{"*"})},
         exclude_globs_{node.param<std::vector<std::string>>(
             "exclude", std::vector<std::string>{})},
+        labels_{ReadLabels(node)},
         topic_{ResolveTopic(node)},
         pose_topic_{ResolvePoseTopic(node)},
         studio_{node.publish_bytes(topic_, telemetry_wire::slot_bytes,
@@ -93,6 +94,9 @@ class Telemetry {
     const introspect::DeclaredGraph* graph = NodeAccess::declared_graph(node);
     if (graph != nullptr) {
       BuildFromGraph(*graph);
+      // The first --describe probe has no graph, so no channels to label;
+      // ReadLabels has checked every `from` already.
+      ApplyLabels();
     }
 
     CheckChannelCap();
@@ -217,6 +221,15 @@ class Telemetry {
     Channel channel;
   };
 
+  // One [[subsystem.labels]] entry (keys labels[<i>].channel and
+  // labels[<i>].from): `channel` is named by `from`, another subsystem's
+  // string-array parameter, read at construction.
+  struct LabelSpec {
+    std::string key;  // "labels[<i>]", what an error names
+    std::string channel;
+    std::vector<std::string> labels;
+  };
+
   struct ObservedTopic {
     std::string name;
     std::size_t sub_index;
@@ -226,6 +239,85 @@ class Telemetry {
     // Each DriverStationChannels() channel's dictionary index, in order.
     std::array<std::size_t, kDriverStationChannelCount> ds_channels{};
   };
+
+  // Every [[subsystem.labels]] entry, its `from` read with param_of. Throws
+  // std::invalid_argument naming the key for a missing `channel` or `from`,
+  // a `from` that is not <subsystem>.<key>, a subsystem the config lacks, a
+  // missing key, a value that is not a non-empty array of strings, more
+  // than kMaxEnumLabels labels, or a label past the dictionary string limit.
+  static std::vector<LabelSpec> ReadLabels(Node& node) {
+    std::vector<LabelSpec> specs;
+    for (std::size_t i = 0;; ++i) {
+      const std::string key = "labels[" + std::to_string(i) + "]";
+      std::string channel = node.param<std::string>(key + ".channel", "");
+      const std::string from = node.param<std::string>(key + ".from", "");
+      if (channel.empty() && from.empty()) break;
+      const auto refuse = [&key](const std::string& field,
+                                 const std::string& why) {
+        throw std::invalid_argument("telemetry: " + key + "." + field + " " +
+                                    why + " (see talOS/telemetry/README.md)");
+      };
+      if (channel.empty()) refuse("channel", "is missing");
+      if (from.empty()) refuse("from", "is missing");
+      const std::size_t dot = from.find('.');
+      if (dot == 0 || dot == std::string::npos || dot + 1 == from.size()) {
+        refuse("from", "'" + from + "' is not <subsystem>.<key>");
+      }
+      std::vector<std::string> labels;
+      try {
+        labels = node.param_of<std::vector<std::string>>(from.substr(0, dot),
+                                                         from.substr(dot + 1));
+      } catch (const std::invalid_argument& error) {
+        refuse("from", "'" + from + "': " + error.what());
+      }
+      if (labels.empty()) refuse("from", "'" + from + "' holds no labels");
+      if (labels.size() > telemetry_wire::kMaxEnumLabels) {
+        refuse("from", "'" + from + "' holds " + std::to_string(labels.size()) +
+                           " labels, over the " +
+                           std::to_string(telemetry_wire::kMaxEnumLabels) +
+                           "-label limit");
+      }
+      for (const std::string& label : labels) {
+        if (label.size() > telemetry_wire::kMaxDictionaryStringBytes) {
+          refuse("from",
+                 "'" + from + "' holds a label of " +
+                     std::to_string(label.size()) + " bytes, over the " +
+                     std::to_string(telemetry_wire::kMaxDictionaryStringBytes) +
+                     "-byte dictionary string limit");
+        }
+      }
+      specs.push_back(LabelSpec{key, std::move(channel), std::move(labels)});
+    }
+    return specs;
+  }
+
+  // Attaches each LabelSpec's labels to its channel. Throws
+  // std::invalid_argument naming the key for a channel absent from the
+  // dictionary (excluded, or no state or status topic holds it), one that is
+  // not an integer, or one that already has labels (an enum, or an earlier
+  // entry).
+  void ApplyLabels() {
+    for (LabelSpec& spec : labels_) {
+      const auto refuse = [&spec](const std::string& why) {
+        throw std::invalid_argument("telemetry: " + spec.key + ".channel '" +
+                                    spec.channel + "' " + why +
+                                    " (see talOS/telemetry/README.md)");
+      };
+      const auto it = std::find_if(
+          dictionary_.begin(), dictionary_.end(),
+          [&spec](const ChannelDef& def) { return def.name == spec.channel; });
+      if (it == dictionary_.end()) {
+        refuse("is not a channel of this dictionary");
+      }
+      if (it->kind != Talos::Telemetry::ChannelKind_Int &&
+          it->kind != Talos::Telemetry::ChannelKind_UInt) {
+        refuse("is not an integer channel");
+      }
+      if (!it->labels.empty()) refuse("already has labels");
+      it->labels = std::move(spec.labels);
+    }
+    labels_.clear();
+  }
 
   static std::string ResolveTopic(Node& node) {
     using talos::detail::NodeAccess;
@@ -545,6 +637,7 @@ class Telemetry {
   Duration stale_after_;
   std::vector<std::string> include_globs_;
   std::vector<std::string> exclude_globs_;
+  std::vector<LabelSpec> labels_;  // until ApplyLabels
   std::string topic_;
   std::string pose_topic_;
   BytePublisher studio_;

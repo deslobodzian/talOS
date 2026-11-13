@@ -39,7 +39,10 @@ presses; a held POV at startup/reconnect is not a press. The configured order is
 node restart within the launcher session; a new session or corrupt selection
 file uses the default. Studio is read-only: `autonomous/state/routine_index`
 reports the selected index, or the latched one from the routine's arm until a
-new match (below); a selection made meanwhile applies from that match.
+new match (below); a selection made meanwhile applies from that match. The
+telemetry dictionary labels it with `routines` (`[[subsystem.labels]]` in
+`subsystems/telemetry.toml`), so viewers show the routine's name; keep
+`routines` an ordered string array whose index is `routine_index`.
 Enabled inputs never change it. Tune the list, default, POV binding and
 `routine.<name>` action parameters in `subsystems/autonomous.toml`.
 
