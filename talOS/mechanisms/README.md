@@ -249,6 +249,17 @@ Losing enable (`robot_enabled` false: a Driver Station disable, a stale
 link) cancels intaking and any timed run, back to `kIdle`, so a re-enable
 within `eject_us` does not resume it; a held piece stays `kHolding`.
 
+A piece sensor sample that is not `connected()` (an input not answering, a
+gateway configuring, a stale link) is no reading, whatever value it carries:
+`has_piece()` keeps its last valid value (false before the first), and a run
+of piece readings still inside `sensor_debounce_us` starts over, so only
+consecutive valid readings complete the debounce. While it lasts
+`sensor_connected()` is false and `kIntaking` is neutral (it stops on the
+sensor, and a piece may arrive meanwhile); `kHolding` keeps `hold_v` on the
+piece it last saw, and a timed `kEjecting` or `kFeeding` runs on, since
+neither needs the sensor to stop. An owner can publish `sensor_connected()`
+beside the phase.
+
 | Key | Unit | Default | Meaning |
 |---|---|---|---|
 | `sensor` | | required | the `[digital_inputs]` name |
@@ -281,8 +292,9 @@ paused without a goal, hold on an unhomed mechanism, stall and limit-switch
 homing on the physics simulator's motor and home switch,
 gravity for elevator and arm, turret wrap, at-goal and at-speed edges
 (including at speed lost on a velocity sample past `ReadinessAgeBound` or
-of unknown age, and reached before the clock mapping converges, REQ-DEV-22), spin-down, faults, the roller's phases, a disable cancelling a timed run,
-and a held eject running once while release-then-press runs again. Downward limit-switch homing and the
+of unknown age, and reached before the clock mapping converges, REQ-DEV-22), spin-down, faults, the roller's phases, an invalid piece-sensor sample
+(a held piece kept, intaking neutral, a debounce started over), a disable
+cancelling a timed run, and a held eject running once while release-then-press runs again. Downward limit-switch homing and the
 travel clamp are also tested through `examples/superstructure`'s elevator.
 The tests carry the tags of REQ-SAFE-36 (`PositionMechanism`), REQ-SAFE-37 (`VelocityMechanism`) and
 REQ-SAFE-38 (`RollerWithSensor`). `//talOS/python:mechanisms_test` proves

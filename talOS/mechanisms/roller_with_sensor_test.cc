@@ -1,12 +1,13 @@
 // RollerWithSensor on a simulated robot (component tier): a node drives it
 // from its teleop lane, as a robot node does, with SimHardware as the bridge.
 //
-// Node test matrix (docs/TESTING.md §7) for the library: 1, 2, 3, 9 and 12
-// below. n/a 4, 5, 6: released, never-sent and Driver-Station-lost lanes
-// reach the library exactly as a stale one does, as stop(). n/a 7: the
-// roller reads no motor feedback (the gateway neutralizes a motor whose
-// feedback is invalid, REQ-SAFE-22), and the sensor keeps its last latched
-// reading. n/a 8: a command is an enum, there is no number to be non-finite.
+// Node test matrix (docs/TESTING.md §7) for the library: 1, 2, 3, 7, 9 and
+// 12 below. n/a 4, 5, 6: released, never-sent and Driver-Station-lost lanes
+// reach the library exactly as a stale one does, as stop(). 7 is the piece
+// sensor (an invalid sample is no reading; intaking is neutral while it
+// lasts); the roller reads no motor feedback (the gateway neutralizes a
+// motor whose feedback is invalid, REQ-SAFE-22). n/a 8: a command is an
+// enum, there is no number to be non-finite.
 // n/a 10, 11: lane selection and generations are the owner's talos::Target.
 
 #include "talOS/mechanisms/roller_with_sensor.h"
@@ -234,6 +235,107 @@ TEST(RollerWithSensor, InvertedDebouncedSensorAndNoHoldVoltage) {
   EXPECT_EQ(indexer.roller().phase(), RollerPhase::kHolding);
   EXPECT_EQ(indexer.Applied().mode, Mode::kNeutral);
   EXPECT_FALSE(indexer.roller().driving());
+}
+
+// A held piece survives an invalid sensor sample that reads "no piece"
+// (SimHardware's invalid sample reads false): has_piece() keeps its last
+// valid value and the hold keeps hold_v; a valid empty reading drops it.
+// REQ-SAFE-38
+TEST(RollerWithSensor, InvalidSensorSampleKeepsAHeldPiece) {
+  Rig intake{"intake"};
+  intake.Sensor("beam", true);
+  intake.Start();
+  intake.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+
+  intake.hw.set_connected("intake", "beam", false);
+  intake.Drive(Command::INTAKE, 30ms);
+  EXPECT_FALSE(intake.roller().sensor_connected());
+  EXPECT_TRUE(intake.roller().has_piece());
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kHolding);
+  EXPECT_EQ(intake.Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(intake.Applied().demand, 1.0);
+
+  intake.Sensor("beam", false);  // valid and empty: the piece is gone
+  intake.hw.set_connected("intake", "beam", true);
+  intake.Drive(Command::IDLE, 20ms);
+  EXPECT_FALSE(intake.roller().has_piece());
+  EXPECT_EQ(intake.roller().phase(), RollerPhase::kIdle);
+
+  // A confirmed piece is not a debounce run: back valid with the piece still
+  // there, the indexer (20 ms debounce) keeps holding from the first reading.
+  Rig indexer{"indexer"};
+  indexer.Sensor("gate", false);  // a piece
+  indexer.Start();
+  indexer.Drive(Command::INTAKE, 40ms);
+  ASSERT_EQ(indexer.roller().phase(), RollerPhase::kHolding);
+  indexer.hw.set_connected("indexer", "gate", false);
+  indexer.Drive(Command::INTAKE, 10ms);
+  indexer.hw.set_connected("indexer", "gate", true);
+  for (int i = 0; i < 6; ++i) {
+    SCOPED_TRACE(i);
+    indexer.Drive(Command::INTAKE, 5ms);
+    EXPECT_TRUE(indexer.roller().has_piece());
+    EXPECT_EQ(indexer.roller().phase(), RollerPhase::kHolding);
+  }
+}
+
+// Matrix 7. Intaking toward a sensor it cannot read is neutral (still
+// kIntaking) whatever the invalid sample reads (here "piece": the indexer is
+// inverted); back valid with a piece, the roller intakes until the debounce
+// completes, counted from the first valid piece reading.
+// REQ-SAFE-38
+TEST(RollerWithSensor, DisconnectedFeedbackGoesNeutral) {
+  Rig indexer{"indexer"};
+  indexer.Sensor("gate", true);  // empty
+  indexer.Start();
+  indexer.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
+  ASSERT_DOUBLE_EQ(indexer.Applied().demand, 4.0);
+
+  indexer.hw.set_connected("indexer", "gate", false);
+  indexer.Drive(Command::INTAKE, 40ms);  // twice the debounce
+  EXPECT_FALSE(indexer.roller().sensor_connected());
+  EXPECT_FALSE(indexer.roller().has_piece());
+  EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
+  EXPECT_FALSE(indexer.roller().driving());
+  EXPECT_EQ(indexer.Applied().mode, Mode::kNeutral);
+
+  indexer.Sensor("gate", false);  // a piece, read validly
+  indexer.hw.set_connected("indexer", "gate", true);
+  indexer.Drive(Command::INTAKE, 15ms);  // inside the 20 ms debounce
+  EXPECT_FALSE(indexer.roller().has_piece());
+  EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
+  EXPECT_EQ(indexer.Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(indexer.Applied().demand, 4.0);
+  indexer.Drive(Command::INTAKE, 25ms);
+  EXPECT_TRUE(indexer.roller().has_piece());
+  EXPECT_EQ(indexer.roller().phase(), RollerPhase::kHolding);
+  EXPECT_EQ(indexer.Applied().mode, Mode::kNeutral);
+}
+
+// Valid piece readings interrupted by invalid samples never complete the
+// debounce: each invalid sample starts the run over, though the valid
+// readings add up to three times sensor_debounce_us.
+// REQ-SAFE-38
+TEST(RollerWithSensor, InvalidSensorSampleRestartsTheDebounce) {
+  Rig indexer{"indexer"};
+  indexer.Sensor("gate", true);  // empty
+  indexer.Start();
+  indexer.Drive(Command::INTAKE, 20ms);
+  ASSERT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
+
+  indexer.Sensor("gate", false);  // a piece
+  for (int i = 0; i < 6; ++i) {
+    SCOPED_TRACE(i);
+    indexer.hw.set_connected("indexer", "gate", true);
+    indexer.Drive(Command::INTAKE, 10ms);  // two valid readings
+    EXPECT_FALSE(indexer.roller().has_piece());
+    indexer.hw.set_connected("indexer", "gate", false);
+    indexer.Drive(Command::INTAKE, 5ms);  // one invalid
+    EXPECT_FALSE(indexer.roller().has_piece());
+  }
+  EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
 }
 
 // REQ-SAFE-02: a disabled robot drives nothing, while the state machine keeps

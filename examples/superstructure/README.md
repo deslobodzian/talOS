@@ -39,7 +39,9 @@ maps the block's phase to its own status enum.
   never sent) it behaves as asked for IDLE with the roller neutral; the state
   machine still tracks the beam break and finishes a timed eject. Losing
   enable cancels an eject or intake in progress (back to IDLE); a held piece
-  stays HOLDING.
+  stays HOLDING. While the beam break's sample is invalid, `has_piece` keeps
+  its last valid value and INTAKING leaves the roller neutral
+  ([RollerWithSensor](../../talOS/mechanisms/README.md#rollerwithsensor)).
 - **elevator**: motion magic to the goal height (clamped to
   `min_rot`..`max_rot`, 0..12, in the `[lift]` table) while it has a target. It reports STOWED at 0, MOVING,
   or AT_GOAL (within `tolerance_rot`), and echoes the goal that `at_goal`

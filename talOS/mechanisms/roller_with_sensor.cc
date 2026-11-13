@@ -54,8 +54,18 @@ void RollerWithSensor::update() {
   const bool newly_asked = live && command != last_command_;
   last_command_ = command;
 
+  // A sensor sample that is not connected() (an input not answering, a
+  // gateway configuring, a stale link) is no reading, whatever value it
+  // carries: has_piece() keeps its last valid value, and a run of piece
+  // readings still inside sensor_debounce_us starts over, so only
+  // consecutive valid readings complete the debounce. A confirmed piece is
+  // not a run in progress: it stays confirmed across the gap.
   sensor_connected_ = sensor_.connected();
-  has_piece_ = piece_debounce_.update(sensor_.get() != sensor_inverted_, now);
+  if (sensor_connected_) {
+    has_piece_ = piece_debounce_.update(sensor_.get() != sensor_inverted_, now);
+  } else if (!has_piece_) {
+    piece_debounce_.reset();
+  }
 
   const auto go = [&](RollerPhase next) {
     phase_ = next;
@@ -85,7 +95,11 @@ void RollerWithSensor::update() {
       }
       break;
     case RollerPhase::kIntaking:
-      volts = intake_v_;
+      // Intaking stops on the sensor, so it does not drive toward one it
+      // cannot read: a piece may arrive during the gap. A held piece keeps
+      // hold_v, and a timed eject or feed runs its clock, since neither
+      // needs the sensor to stop.
+      if (sensor_connected_) volts = intake_v_;
       if (has_piece_) {
         go(RollerPhase::kHolding);
       } else if (command == RollerCommand::kIdle) {
