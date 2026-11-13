@@ -476,14 +476,127 @@ TEST(Config, StatusRateBelowFourPerTimeoutIsRefused) {
     EXPECT_NE(message.find("command_timeout_us"), std::string::npos) << message;
   }
 }
-TEST(Config, FingerprintIncludesCalibrationAndGains) {
-  auto c = SwerveConfig(true);
-  const auto id = ConfigurationId(c);
-  c.sensors[0].offset_rot = 0.1;
-  EXPECT_NE(id, ConfigurationId(c));
-  c = SwerveConfig(true);
-  c.motors[0].slots[1].p = 1;
-  EXPECT_NE(id, ConfigurationId(c));
+// One device of every kind, every motor setting class (follower, remote
+// CANcoder, soft and switch limits, three gain slots) off its default, and
+// the main-processor-only motor settings, which never reach the wire, set.
+Config EveryDeviceKindConfig() {
+  Config c;
+  c.commissioned = true;
+  MotorConfig arm;
+  arm.id = 1;
+  arm.name = "arm";
+  arm.can_id = 1;
+  arm.inverted = true;
+  arm.brake = false;
+  arm.feedback = Feedback::kRemoteCANcoder;
+  arm.feedback_sensor_id = 10;
+  arm.rotor_to_sensor_ratio = 12.8;
+  arm.sensor_to_mechanism_ratio = 2;
+  arm.soft_limits = true;
+  arm.reverse_limit_rot = -0.25;
+  arm.forward_limit_rot = 0.25;
+  arm.forward_limit_switch = LimitSwitch::kNormallyClosed;
+  arm.reverse_limit_switch = LimitSwitch::kDisabled;
+  arm.jerk_rps3 = 400;
+  for (std::size_t slot = 0; slot < arm.slots.size(); ++slot) {
+    const double k = static_cast<double>(slot + 1);
+    arm.slots[slot] = {k, k / 2, k / 4, k / 8, k / 16, k / 32, k / 64};
+  }
+  arm.slots[1].gravity_type = GravityType::kArmCosine;
+  arm.absolute_position_frame.value = true;
+  arm.motor_type.value = MotorType::kFalcon500;
+  MotorConfig follower;
+  follower.id = 2;
+  follower.name = "arm_follower";
+  follower.can_id = 2;
+  follower.master_id = arm.id;
+  follower.oppose_master = true;
+  follower.motor_type.value = MotorType::kFalcon500;
+  MotorConfig roller;
+  roller.id = 3;
+  roller.name = "roller";
+  roller.can_id = 3;
+  roller.continuous_wrap = true;
+  roller.supply_limit_a = 30;
+  roller.stator_limit_a = 60;
+  roller.max_voltage = 10;
+  roller.max_velocity_rps = 90;
+  roller.cruise_velocity_rps = 30;
+  roller.acceleration_rps2 = 60;
+  roller.motor_type.value = MotorType::kKrakenX44;
+  c.motors = {arm, follower, roller};
+  c.sensors = {
+      {10, "arm_encoder", SensorKind::kCANcoder, 20, "rio", true, 0.125},
+      {11, "imu", SensorKind::kPigeon2, 30, "rio", false, -0.25}};
+  c.digital_inputs = {{20, "beam_break", 0}};
+  c.digital_outputs = {{21, "solenoid", 1}};
+  c.analog_inputs = {{22, "pressure", 2}};
+  c.encoders = {{23, "wheel", EncoderKind::kQuadrature, 2, 3, 2048, 0},
+                {24, "turret", EncoderKind::kDutyCycle, 4, -1, 2048, 0.25}};
+  c.pwm_outputs = {{25, "servo", 5}};
+  return c;
+}
+
+// The id the gateway computes for `config` pushed over the config wire: the
+// one its States carry and its Accept compares.
+uint64_t GatewayConfigId(const Config& config) {
+  ConfigAssembler assembler;
+  std::string error;
+  auto status = ConfigAssembler::Status::kIncomplete;
+  for (const auto& chunk : CreateConfigChunks(config)) {
+    status = assembler.AddChunk(chunk, error);
+  }
+  EXPECT_EQ(status, ConfigAssembler::Status::kComplete) << error;
+  SimBackend backend;
+  Gateway gateway{backend, 1};
+  EXPECT_TRUE(gateway.Reconfigure(assembler.config()));
+  return gateway.snapshot().config_id;
+}
+
+// The main processor (bridge, devices layer) computes the config id from the
+// config it parsed, the gateway from the config the wire delivered; one
+// function computes both, so they diverge only if it reads a setting the wire
+// does not carry (a main-processor-only one included) or the wire carries one
+// it does not read. The first: the gateway's id for a config pushed over the
+// wire equals the main processor's, commissioned or not. The second: every
+// single-bit change to the serialized config that still decodes to another
+// valid config changes the id, the commissioned bit among them.
+// REQ-CONTRACT-05, REQ-SAFE-20: both ends' id, over every wire setting
+TEST(ConfigWire, BothEndsComputeOneIdCoveringEveryWireSetting) {
+  const auto config = EveryDeviceKindConfig();
+  ASSERT_NO_THROW(Validate(config));
+  const uint64_t id = ConfigurationId(config);
+  EXPECT_EQ(GatewayConfigId(config), id);
+  auto uncommissioned = config;
+  uncommissioned.commissioned = false;
+  const uint64_t uncommissioned_id = ConfigurationId(uncommissioned);
+  EXPECT_NE(uncommissioned_id, id);
+  EXPECT_EQ(GatewayConfigId(uncommissioned), uncommissioned_id);
+
+  const auto bytes = SerializeConfig(config);
+  std::size_t changed_offsets = 0;
+  for (std::size_t offset = 0; offset < bytes.size(); ++offset) {
+    bool changed = false;
+    for (int bit = 0; bit < 8; ++bit) {
+      auto mutated = bytes;
+      mutated[offset] ^= static_cast<uint8_t>(1u << bit);
+      Config decoded;
+      if (!DeserializeConfig(mutated, decoded) || decoded == config) continue;
+      try {
+        Validate(decoded);
+      } catch (const std::invalid_argument&) {
+        continue;
+      }
+      changed = true;
+      EXPECT_NE(ConfigurationId(decoded), id)
+          << "byte " << offset << " bit " << bit << " of " << bytes.size();
+    }
+    changed_offsets += changed ? 1 : 0;
+  }
+  // Counts, text lengths and values at a bound decode to nothing valid when
+  // changed; every other byte must, or the sweep proves little.
+  EXPECT_GT(changed_offsets, bytes.size() * 3 / 4)
+      << changed_offsets << " of " << bytes.size() << " bytes";
 }
 // Consumers tell consecutive States from a gap by sequence + 1, so every
 // tick counts, across a reconfigure too.
@@ -499,7 +612,8 @@ TEST(Gateway, SequenceCountsEveryTick) {
   EXPECT_EQ(g.snapshot().sequence, 3u);
 }
 
-// REQ-SAFE-20: refused while disabled, uncommissioned or mismatched
+// REQ-SAFE-20, REQ-CONTRACT-05: refused while disabled, uncommissioned or
+// mismatched
 TEST(Gateway, RequiresEnableCommissioningAndMatchingManifest) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
