@@ -94,6 +94,9 @@ struct LauncherOptions {
   // Internal session seam: SessionLock::Acquire.
   std::function<std::optional<SessionLock>(std::string& error, bool* no_room)>
       acquire_session_lock{SessionLock::Acquire};
+  // Internal session seam: the flock(2) every SessionDirectoryLock of the
+  // launch (its own, retention's) is taken with; ::flock in production.
+  FlockFunction lock_session_directory{::flock};
   // Internal retention seam: creates the session directory and its parents,
   // setting the error when it cannot; std::filesystem::create_directories in
   // production.

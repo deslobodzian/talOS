@@ -228,7 +228,8 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     bool running = false;
     std::error_code removal;
     const std::optional<SessionDirectoryLock> lock =
-        SessionDirectoryLock::TakeIdle(dir, running, removal);
+        SessionDirectoryLock::TakeIdle(dir, running, removal,
+                                       options_.lock_session_directory);
     if (running) {
       say("retention passes over running session " + dir.string() +
           " (a launch holds its " + std::string{kSessionDirectoryLockFile} +
@@ -287,7 +288,8 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     }
     // A launch in any shared-memory namespace is writing it: neither counted
     // nor read.
-    if (SessionDirectoryLock::Held(entry->path())) {
+    if (SessionDirectoryLock::Held(entry->path(),
+                                   options_.lock_session_directory)) {
       say("retention passes over running session " + entry->path().string() +
           " (a launch holds its " + std::string{kSessionDirectoryLockFile} +
           ")");
@@ -323,7 +325,8 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   }
   // Held only by a retention removing it now.
   for (const auto& leftover : leftovers) {
-    if (SessionDirectoryLock::Held(leftover)) continue;
+    if (SessionDirectoryLock::Held(leftover, options_.lock_session_directory))
+      continue;
     std::error_code removal;
     fs::remove_all(leftover, removal);
     if (removal) report("cannot remove", leftover, removal);
@@ -427,8 +430,9 @@ bool Launcher::CreateSessionDirectory(const config::RobotConfig& config,
                                       const std::string& record) {
   const std::filesystem::path current{options_.output_dir};
   std::error_code error;
-  session_directory_ = SessionDirectoryLock::Create(
-      current, options_.create_session_directory, error);
+  session_directory_ =
+      SessionDirectoryLock::Create(current, options_.create_session_directory,
+                                   error, options_.lock_session_directory);
   if (!session_directory_) {
     std::cerr << "launcher: cannot create the session directory "
               << current.string() << " (" << error.message() << ")";
@@ -451,6 +455,13 @@ bool Launcher::CreateSessionDirectory(const config::RobotConfig& config,
     std::cerr << "; nothing was started\n";
     ReportUnwrittenRetention(record);
     return false;
+  }
+  if (!session_directory_->held()) {
+    std::cerr << "[launcher] WARNING: cannot lock " << current.string() << "/"
+              << kSessionDirectoryLockFile << " (" << error.message()
+              << "; its filesystem takes no advisory locks): retention in "
+                 "another shared-memory namespace may remove this session "
+                 "while it runs\n";
   }
   if (record.empty()) return true;
   const std::string path =

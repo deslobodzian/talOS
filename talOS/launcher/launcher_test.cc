@@ -2857,6 +2857,39 @@ TEST(LauncherSessions, ACrashLoopBesideARunningSessionLeavesOneDirectory) {
   std::filesystem::remove_all(root);
 }
 
+// A log root on a filesystem without advisory locks (NFS without a lock
+// daemon: ENOLCK; macOS msdos and exFAT volumes: ENOTSUP) cannot hold a
+// session directory's lock. The robot still starts: one warning, and the
+// session runs without it, protected as before launches locked their
+// directories (by the namespace's session lock only); retention removes
+// as it did then.
+// REQ-OPS-11
+TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
+  auto options = SessionFixture("no_locks");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_keep_sessions = 1\n");
+  std::ofstream{options.config_path} << configuration;
+  WriteSessionManifest(root + "/1", 1, 1001, 1101);
+  options.lock_session_directory = [](int, int) {
+    errno = ENOLCK;
+    return -1;
+  };
+  options.session_id = 2;
+  ::testing::internal::CaptureStderr();
+  const int result = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(result, 0) << stderr_text;
+  EXPECT_TRUE(std::filesystem::exists(root + "/2/manifest.json"));
+  EXPECT_FALSE(std::filesystem::exists(root + "/1"));
+  EXPECT_NE(stderr_text.find("WARNING: cannot lock " + root + "/2/"),
+            std::string::npos)
+      << stderr_text;
+  std::filesystem::remove_all(root);
+}
+
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);

@@ -172,6 +172,19 @@ class SessionLock {
 // directory holds while it runs (SessionDirectoryLock).
 inline constexpr std::string_view kSessionDirectoryLockFile = "session.lock";
 
+// flock(2), or what a test puts in its place
+// (LauncherOptions::lock_session_directory).
+using FlockFunction = std::function<int(int fd, int operation)>;
+
+// Whether a flock(2) failure with `code` says the file's filesystem takes no
+// advisory locks: NFS without a lock daemon (ENOLCK), filesystems without
+// flock such as macOS's msdos and exFAT (ENOTSUP, EOPNOTSUPP), and other
+// refusals of the call itself (EINVAL, ENOSYS).
+inline bool FlockUnsupported(int code) {
+  return code == ENOLCK || code == ENOTSUP || code == EOPNOTSUPP ||
+         code == EINVAL || code == ENOSYS;
+}
+
 // Whether a session directory's launch is still running, read from the
 // directory itself. SessionLock is per shared-memory namespace, and launches
 // in different namespaces (a simulation beside a deployed or bench session,
@@ -198,10 +211,15 @@ class SessionDirectoryLock {
   using CreateDirectory =
       std::function<void(const std::filesystem::path&, std::error_code&)>;
 
-  // Creates `dir` with `create` (nothing when it exists) and takes its lock,
-  // or returns nullopt with `error` set: create's error, the lock file's
-  // open error, or std::errc::device_or_resource_busy when another launch
-  // (one given the same --session-id) holds it. Retention removing `dir`
+  // Creates `dir` with `create` (nothing when it exists) and takes its lock
+  // with `lock`, or returns nullopt with `error` set: create's error, the
+  // lock file's open error, or std::errc::device_or_resource_busy when
+  // another launch (one given the same --session-id) holds it. On a
+  // filesystem that takes no advisory locks (FlockUnsupported) it returns
+  // one that holds none (held() false) with `error` set to flock's error:
+  // the directory is then protected only from launches in its own
+  // shared-memory namespace, as before launches locked it, and a launch
+  // runs rather than being refused for its log root. Retention removing `dir`
   // meanwhile holds the lock and moves `dir` away before removing it, so an
   // attempt that finds the lock held, or that locked a file the path no
   // longer names, creates `dir` again and retries: when this returns the
@@ -209,7 +227,7 @@ class SessionDirectoryLock {
   // remove it while the lock is held.
   static std::optional<SessionDirectoryLock> Create(
       const std::filesystem::path& dir, const CreateDirectory& create,
-      std::error_code& error) {
+      std::error_code& error, const FlockFunction& lock = ::flock) {
     const std::string path = (dir / kSessionDirectoryLockFile).string();
     constexpr int kAttempts = 100;
     for (int attempt = 0; attempt < kAttempts; ++attempt) {
@@ -223,7 +241,7 @@ class SessionDirectoryLock {
         if (errno == ENOENT) continue;
         return std::nullopt;
       }
-      if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
+      if (lock(fd, LOCK_EX | LOCK_NB) == 0) {
         if (introspect::LockFileIsCurrent(fd, path)) {
           return SessionDirectoryLock{fd, path};
         }
@@ -232,6 +250,10 @@ class SessionDirectoryLock {
       }
       const int code = errno;
       ::close(fd);
+      if (FlockUnsupported(code)) {
+        error = {code, std::generic_category()};
+        return SessionDirectoryLock{-1, path};
+      }
       if (code != EWOULDBLOCK && code != EINTR) {
         error = {code, std::generic_category()};
         return std::nullopt;
@@ -245,13 +267,14 @@ class SessionDirectoryLock {
 
   // Whether a launch (or a retention removing it) holds `dir`'s lock now.
   // False when `dir` holds no lock file: a launch holds one from before its
-  // directory holds anything. Creates nothing.
-  static bool Held(const std::filesystem::path& dir) {
+  // directory holds anything; and on a filesystem without advisory locks.
+  // Creates nothing.
+  static bool Held(const std::filesystem::path& dir,
+                   const FlockFunction& lock = ::flock) {
     const int fd = ::open((dir / kSessionDirectoryLockFile).c_str(),
                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return false;
-    const bool held =
-        ::flock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+    const bool held = lock(fd, LOCK_SH | LOCK_NB) != 0 && errno == EWOULDBLOCK;
     ::close(fd);
     return held;
   }
@@ -260,9 +283,12 @@ class SessionDirectoryLock {
   // absent (a session recorded before launches held one). Returns nullopt
   // with `held` set when a launch, or another retention, holds it or `dir`
   // has become another directory meanwhile; with `error` set when the lock
-  // file cannot be opened or `dir` is gone.
+  // file cannot be opened or `dir` is gone. On a filesystem without
+  // advisory locks (FlockUnsupported) it returns one that holds none, as
+  // no launch there can hold one either.
   static std::optional<SessionDirectoryLock> TakeIdle(
-      const std::filesystem::path& dir, bool& held, std::error_code& error) {
+      const std::filesystem::path& dir, bool& held, std::error_code& error,
+      const FlockFunction& lock = ::flock) {
     held = false;
     const std::string path = (dir / kSessionDirectoryLockFile).string();
     const int fd = introspect::OpenLockFile(path, O_RDONLY);
@@ -270,9 +296,10 @@ class SessionDirectoryLock {
       error = {errno, std::generic_category()};
       return std::nullopt;
     }
-    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    if (lock(fd, LOCK_EX | LOCK_NB) != 0) {
       const int code = errno;
       ::close(fd);
+      if (FlockUnsupported(code)) return SessionDirectoryLock{-1, path};
       held = code == EWOULDBLOCK;
       if (!held) error = {code, std::generic_category()};
       return std::nullopt;
@@ -293,6 +320,7 @@ class SessionDirectoryLock {
     kHeld,     // The path names the locked file.
     kRetaken,  // It did not; the file it names now is locked instead.
     kLost,     // It did not, and the file it names cannot be locked now.
+    kNone,     // No lock is held (a filesystem without advisory locks).
   };
 
   // Keeps the held lock file from looking unused, so a cleaner of old /tmp
@@ -312,6 +340,7 @@ class SessionDirectoryLock {
   // held) or a retention holds it and is moving the directory away, or has
   // (kLost). A later refresh tries again.
   Refreshed Refresh() {
+    if (fd_ < 0) return Refreshed::kNone;
     introspect::TouchLockFile(fd_);
     if (introspect::LockFileIsCurrent(fd_, path_)) return Refreshed::kHeld;
     const int fd = introspect::OpenLockFile(path_, O_RDONLY);
@@ -327,6 +356,10 @@ class SessionDirectoryLock {
   }
 
   const std::string& path() const { return path_; }
+
+  // False for one Create or TakeIdle returned on a filesystem without
+  // advisory locks.
+  bool held() const { return fd_ >= 0; }
 
   ~SessionDirectoryLock() {
     if (fd_ >= 0) ::close(fd_);
