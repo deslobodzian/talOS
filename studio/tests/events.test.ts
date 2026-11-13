@@ -387,3 +387,21 @@ test('motor fault set bits warn; clears resolve and unchanged masks are silent',
   assert.deepEqual(transition(1, 1), []);
   assert.deepEqual(transition(1, 2).map(e => e.severity), ['warn', 'info']);
 });
+
+// REQ-OPS-20: the bridge sets a timed_out_mask bit only while that subsystem's
+// requests are silent on a ready link, so a newly set bit is the warning and a
+// cleared bit is the recovery.
+test('timeout mask set bits warn naming the subsystem bit; clears are info', () => {
+  const detector = FRAME_DETECTORS.find(d => d.id === 'link-timeout-mask')!;
+  const transition = (a: number, b: number) => detector.detect(
+      frame(1, 1n, {'hw/status/timed_out_mask': a}),
+      frame(2, 2n, {'hw/status/timed_out_mask': b}));
+  const set = transition(0, 4);
+  assert.deepEqual(set.map(e => e.severity), ['warn']);
+  assert.match(set[0].detail ?? '', /bits: 2$/);
+  assert.deepEqual(transition(4, 0).map(e => e.severity), ['info']);
+  const warnings = [[0, 4], [4, 0], [0, 4]]
+      .flatMap(([a, b]) => transition(a, b))
+      .filter(e => e.severity === 'warn');
+  assert.equal(warnings.length, 2);
+});
