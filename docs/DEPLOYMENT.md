@@ -242,7 +242,7 @@ first on `PATH`, Bazel's and Python's environment variables unset (as
 `run.sh` does), and `PYTHONDONTWRITEBYTECODE=1`, so the read-only bundle
 stays as installed even under sudo. A `--describe` run opens no topic,
 socket or registry row, so the warm-up touches no hardware and no network
-and can run beside a running robot. On the Mac mini it takes about 4.5 s,
+and can run beside a running robot. On the Mac mini it takes about 5 s,
 and the first launch then describes in under a second. A member that exits
 nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still

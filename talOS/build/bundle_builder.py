@@ -99,33 +99,57 @@ def stage_link(name, dest, rf_rel, link, target, bundle_root):
                       f"{rf_rel} -> {link}, kept out of the bundle as a link.")
 
 
+def is_executable_file(path):
+    """A regular file (a directory's X bit means search) that may run."""
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
 def runtime_repositories(files, links):
     """The repositories of a Python node's runfiles that hold its
     interpreter: those a declared link (a venv's bin/python3) names an
-    executable in. `files` maps each staged runfile to its source; `links`
-    lists (runfile, link) pairs."""
+    executable file in. `files` maps each staged runfile to its source;
+    `links` lists (runfile, link) pairs."""
     repos = set()
     for rf_rel, link in links:
         target = link_target(rf_rel, link)
         repo = target.split(os.sep, 1)[0]
         if (repo not in ("_main", os.pardir) and target in files
-                and os.access(files[target], os.X_OK)):
+                and is_executable_file(files[target])):
             repos.add(repo)
     return repos
 
 
-def stage_runtime_file(name, src, rf_rel, dest, staged_runtimes):
+def unselected_runtimes(files, runtimes):
+    """The repositories of `files` that hold an interpreter, an executable
+    bin/python3, which no venv link selected (`runtimes`). Such a runtime
+    would be staged whole in the node's runfiles, beside the bundle's one
+    copy of it."""
+    return sorted({rf_rel.split(os.sep, 1)[0] for rf_rel, src in files.items()
+                   if rf_rel.split(os.sep, 1)[1:] == [os.path.join("bin", "python3")]
+                   and rf_rel.split(os.sep, 1)[0] not in runtimes
+                   and is_executable_file(src)})
+
+
+def stage_runtime_file(name, src, rf_rel, dest, staged_from):
     """Stages a runtime's file at `dest` in the bundle's one runtime
-    directory, once for every node that carries it. Exits when an earlier
-    node carried different bytes there: one directory cannot serve both."""
-    repo = rf_rel.split(os.sep, 1)[0]
-    first = staged_runtimes.setdefault(repo, name)
-    if os.path.exists(dest):
-        if not filecmp.cmp(src, dest, shallow=False):
-            sys.exit(f"bundle: nodes '{first}' and '{name}' carry different "
-                     f"Python runtimes named {repo} ({rf_rel} differs)")
+    directory, once for every node that carries it. `staged_from` maps each
+    staged destination to its (source, node). A later node's file from the
+    same source is the same file; one from another source must have the
+    same bytes, or the build exits: one directory cannot serve both."""
+    seen = staged_from.get(dest)
+    if seen is None:
+        safe_copy(src, dest)
+        staged_from[dest] = (src, name)
         return
-    safe_copy(src, dest)
+    first_src, first = seen
+    if src == first_src:
+        return
+    if not (os.path.isfile(src) and os.path.isfile(dest)):
+        return  # a tree artifact; filecmp compares only files
+    if not filecmp.cmp(src, dest, shallow=False):
+        repo = rf_rel.split(os.sep, 1)[0]
+        sys.exit(f"bundle: nodes '{first}' and '{name}' carry different "
+                 f"Python runtimes named {repo} ({rf_rel} differs)")
 
 
 def alias_interpreter_copies(interpreter):
@@ -299,8 +323,8 @@ def main():
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
     staged_libs = {}
-    # python/: each Python runtime repository, with the first node that
-    # carried it, and the interpreters venv links exec there.
+    # python/: each Python runtime file, with its source and the first node
+    # that carried it, and the interpreters venv links exec there.
     staged_runtimes = {}
     interpreters = set()
     bundle_root = out_dir + os.sep
@@ -339,6 +363,11 @@ def main():
                              f"missing: {rf_src}")
                 files[os.path.normpath(rf_rel)] = rf_src
             runtimes = runtime_repositories(files, links)
+            for repo in unselected_runtimes(files, runtimes):
+                sys.exit(f"bundle: node '{name}': its runfiles carry the "
+                         f"Python runtime {repo}, but no venv link selects "
+                         "it, so the bundle would hold it again in the "
+                         "node's runfiles")
 
             def staged_at(rf_rel):
                 if rf_rel.split(os.sep, 1)[0] in runtimes:

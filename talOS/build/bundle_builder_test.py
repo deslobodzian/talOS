@@ -28,6 +28,8 @@ def put(path, text):
 HARDWARE_NODE = "//talOS/bridge:hardware_node"
 # A Python runtime's repository as a node's runfiles name it.
 RUNTIME = "rules_python++python+python_3_11"
+# Where a bundle holds it (bundle_builder.RUNTIME_DIR).
+RUNTIME_DIR = "python"
 
 
 def node(tmp, name, target=None):
@@ -368,12 +370,12 @@ class BundleBuilderTest(unittest.TestCase):
         # Each Python node's runfiles carry the whole interpreter (rules_python
         # copies it under python, python3 and python3.11): a 52 MB file six
         # times over for two nodes, most of a 749 MB bundle copied to the
-        # robot on every deploy. The bundle holds it once, and every node's
-        # venv still runs it where it finds its library, built or restored.
+        # robot on every deploy. The bundle holds its bytes once, and each
+        # node's venv runs that file in the built tree.
         interpreter = ('#!/bin/sh\nhome="$(dirname "$(realpath "$0")")/.."\n'
                        'test -d "$home/lib/python3.11/encodings" || {\n'
                        '  echo "No module named encodings" >&2; exit 1; }\n'
-                       'echo "ran $*"\n')
+                       'echo "ran $0"\n')
         with tempfile.TemporaryDirectory() as tmp:
             nodes = self.python_nodes(tmp, {"a": interpreter, "b": interpreter})
             proc = self.assemble(
@@ -383,30 +385,44 @@ class BundleBuilderTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             built = os.path.join(tmp, "out")
             held = []
-            for parent, dirs, files in os.walk(built):
-                for name in dirs + files:
+            for parent, _, files in os.walk(built):
+                for name in files:
                     path = os.path.join(parent, name)
-                    self.assertFalse(os.path.islink(path), path)
-                    if os.path.isfile(path):
-                        with open(path, encoding="utf-8",
-                                  errors="replace") as f:
-                            if f.read() == interpreter:
-                                held.append(os.path.relpath(path, built))
-            self.assertEqual(len(held), 1, held)
-            restored = os.path.join(tmp, "restored")
-            shutil.copytree(built, restored, symlinks=False)
-            for tree in (built, restored):
-                for name in ("a", "b"):
-                    venv = os.path.join(
-                        tree, "bin", f"{name}.runfiles", "_main", name,
-                        "_node_bin.venv", "bin", "python3")
-                    with self.subTest(tree=os.path.basename(tree), node=name):
-                        run = subprocess.run([venv, "-c", "pass"],
-                                             capture_output=True, text=True,
-                                             timeout=60)
-                        self.assertEqual((run.returncode, run.stdout),
-                                         (0, "ran -c pass\n"), run.stderr)
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        if f.read() == interpreter:
+                            held.append(os.path.relpath(path, built))
+            self.assertEqual(held, [RUNTIME_DIR + "/" + RUNTIME + "/bin/python3"])
+            for name in ("a", "b"):
+                venv = os.path.join(built, "bin", f"{name}.runfiles", "_main",
+                                    name, "_node_bin.venv", "bin", "python3")
+                with self.subTest(node=name):
+                    run = subprocess.run([venv], capture_output=True,
+                                         text=True, timeout=60)
+                    self.assertEqual(run.returncode, 0, run.stderr)
+                    self.assertEqual(
+                        os.path.realpath(run.stdout.split(" ", 1)[1].strip()),
+                        os.path.realpath(os.path.join(built, held[0])))
 
+    # REQ-OPS-48
+    def test_a_runtime_no_venv_link_selects_fails(self):
+        # A runtime repository a venv link selects is staged once, in
+        # python/. One that no link selects (a venv built without its
+        # declared symlink) was staged whole inside the node's runfiles
+        # again: the build passed and the bundle grew by the runtime, 242 MB
+        # per node.
+        with tempfile.TemporaryDirectory() as tmp:
+            (py,) = self.python_nodes(tmp, {"a": "#!/bin/sh\n"})
+            py["runfiles"] = [rf for rf in py["runfiles"]
+                              if not rf["rf_rel"].startswith("_main/")]
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE), py], ["//a:node"])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("node 'a'", proc.stderr)
+            self.assertIn(RUNTIME, proc.stderr)
+            self.assertIn("no venv link", proc.stderr)
+
+    # REQ-OPS-48
     def test_two_different_runtimes_under_one_name_fail(self):
         # One runtime directory serves every node, so two nodes that carry
         # different interpreters under one repository name cannot share it.
