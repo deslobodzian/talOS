@@ -31,7 +31,8 @@ These named options are removed before positional parsing:
 
 - `--config PATH`: read `[studio] max_clients` and `[studio] dashboard` (the
   driver dashboard's layout; see [Driver dashboard feed](#driver-dashboard-feed))
-  from robot configuration, and the config's roster for the drive summary.
+  from robot configuration, and each subsystem's `critical` for the drive
+  summary (its roster too, when no `--manifest` is read).
 - `--idle-timeout-s S`: a client's idle timeout, 8 to 960 s (default 16; see
   [WebSocket operating limits](#websocket-operating-limits)). Tests pass 8 to
   keep their runtime short.
@@ -320,8 +321,8 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   whenever it changes, at most once per 500 ms
   (`telemetry_wire::kDriveSummaryIntervalNs`), whole, at most 4,096 bytes
   (`kDriveSummaryMaxBytes`). It is rebuilt at each 250 ms graph refresh
-  while a feed client is held, from the config's roster, the live registry
-  and the launcher's manifest (`--manifest`, re-read each time):
+  while a feed client is held, from the launcher's manifest (`--manifest`,
+  re-read each time), the live registry and the config:
 
   ```json
   {"kind":"talos.drive.summary","session":"42","supervised":true,
@@ -336,10 +337,10 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   |---|---|---|
   | `session` | string | the launcher's session id (the manifest's `session_id`), else a live registry row's, else `""` |
   | `supervised` | bool | the manifest was read; when false, `restarts` 0 and `quarantined` false mean unknown, not none |
-  | `nodes` | array | every node the config launches, in this order: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
+  | `nodes` | array | with a manifest, every member of its `nodes` in its order but the Studio bridge itself (`studio_bridge`), so `sim_gateway` too when the launcher supervises one; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
   | `nodes[].name` | string | the node name |
   | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false) |
-  | `nodes[].critical` | bool | the subsystem's `critical` (default true; `hardware_node` true) |
+  | `nodes[].critical` | bool | the config's `critical` for that subsystem (default true); true for a member the config does not list (`hardware_node`, `sim_gateway`) |
   | `nodes[].restarts` | number | the manifest's `restart_count` for the node |
   | `nodes[].quarantined` | bool | the manifest's `quarantined` for the node |
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |

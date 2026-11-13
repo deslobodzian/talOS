@@ -144,14 +144,15 @@ struct Bridge {
   studio::BridgeEgress egress;
   // The driver dashboard, when [studio] dashboard names a layout that
   // parses (studio/bridge/drive.h): /drive/layout.json, the drive clients'
-  // mask and slots, and the summary built from the launcher's roster, the
-  // registry and the manifest. Drive clients that took a newer one's slot
-  // are counted in evicted.
+  // mask and slots, and the summary built from the launcher's manifest,
+  // the registry and, for what the manifest does not say (`critical`, or
+  // the roster when there is no manifest), the config. Drive clients that
+  // took a newer one's slot are counted in evicted.
   std::optional<talos::telemetry::DashboardLayout> layout;
   std::string layout_json;
   studio::DriveMask drive_mask;
   studio::DriveSlots<Socket*> drive_clients;
-  std::vector<studio::DriveRosterEntry> roster;
+  std::vector<studio::DriveRosterEntry> config_roster;
   std::string manifest_path;
   std::vector<talos::introspect::NodeSnapshot> registry_nodes;
   std::string drive_summary;
@@ -343,12 +344,12 @@ struct Bridge {
     });
   }
 
-  // The drive summary from the roster, the latest registry rows and the
-  // manifest as it is now (studio::BuildDriveSummary). Built only while a
-  // drive client is connected, so the manifest is not read for nobody.
+  // The drive summary from the manifest as it is now, the latest registry
+  // rows and the config's roster (studio::BuildDriveSummary). Built only while
+  // a drive client is connected, so the manifest is not read for nobody.
   void refresh_drive_summary() {
     drive_summary = studio::DriveSummaryJson(studio::BuildDriveSummary(
-        roster, registry_nodes, ReadManifest(manifest_path)));
+        config_roster, registry_nodes, ReadManifest(manifest_path)));
   }
 
   // The decoded feed: latest dictionary and latest complete tick, backing
@@ -416,7 +417,7 @@ struct Bridge {
   // This process as the registry would have described it, had it a slot.
   talos::introspect::NodeSnapshot self() const {
     talos::introspect::NodeSnapshot node;
-    node.name = "studio_bridge";
+    node.name = studio::kStudioBridgeNodeName;
     node.target = "//studio/bridge:studio_bridge";
     node.pid = static_cast<std::uint64_t>(::getpid());
     node.start_wall_ns = started_wall_ns;
@@ -759,17 +760,18 @@ int main(int argc, char** argv) try {
         std::cerr << "driver dashboard disabled: " << e.what() << '\n';
       }
     }
-    // The nodes the launcher starts for this config (its roster): the
-    // hardware bridge, then each subsystem with a `node`, critical unless
-    // it says otherwise. The drive summary reports each of them.
-    bridge.roster.push_back(
+    // The nodes the config launches: the hardware bridge, then each
+    // subsystem with a `node`, critical unless it says otherwise. The drive
+    // summary lists them only when there is no manifest, whose roster is
+    // the launcher's own; otherwise it takes only `critical` from here.
+    bridge.config_roster.push_back(
         {std::string{talos::introspect::naming::kHardwareBridgeNode}, true});
     if (const auto* subsystems = robot.toml_data["subsystems"].as_table()) {
-      bridge.roster.reserve(subsystems->size() + 1);
+      bridge.config_roster.reserve(subsystems->size() + 1);
       for (auto&& [key, value] : *subsystems) {
         const auto* table = value.as_table();
         if (table == nullptr || !table->contains("node")) continue;
-        bridge.roster.push_back(
+        bridge.config_roster.push_back(
             {std::string{key.str()}, (*table)["critical"].value_or(true)});
       }
     }

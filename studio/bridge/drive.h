@@ -265,21 +265,31 @@ struct DriveSummary {
   std::vector<DriveSummaryNode> nodes;
 };
 
-// A node the session's config launches (the launcher's roster): its name and
-// whether the launcher treats it as critical.
+// The name the Studio bridge goes by in the registry (Bridge::self) and in
+// the launcher's manifest (its kStudioBridgeName), so the drive summary,
+// which reports the nodes the bridge watches, leaves it out.
+inline constexpr std::string_view kStudioBridgeNodeName = "studio_bridge";
+
+// A node the session's config launches: its name and whether the launcher
+// treats it as critical (the subsystem's `critical`, default true). Read
+// from the config only for what the launcher's manifest does not say.
 struct DriveRosterEntry {
   std::string name;
   bool critical{true};
 };
 
-// The drive summary of `roster`, in its order: `alive` and `drives` from
-// the live registry's rows of that name, `restarts`, `quarantined` and the
-// session from the launcher's manifest (`manifest_json`, empty when there
-// is none). A manifest that does not parse is treated as absent, so the
-// summary says `supervised: false` rather than zero restarts as a fact;
-// the session then comes from the registry.
+// The drive summary. Its nodes are the launcher's roster as its manifest
+// (`manifest_json`, empty when there is none) lists them, in that order:
+// every member it supervises (the sim gateway included) but the Studio
+// bridge, with `restarts` and `quarantined` from each entry and `critical`
+// from `config` by name (true for a member the config does not list, such
+// as the sim gateway). Without a manifest, or one listing no member yet,
+// they are `config`'s nodes in its order. `alive` and `drives` come from
+// the live registry's rows of that name. A manifest that does not parse is
+// treated as absent, so the summary says `supervised: false` rather than
+// zero restarts as a fact; the session then comes from the registry.
 inline DriveSummary BuildDriveSummary(
-    const std::vector<DriveRosterEntry>& roster,
+    const std::vector<DriveRosterEntry>& config,
     const std::vector<talos::introspect::NodeSnapshot>& registry,
     std::string_view manifest_json) {
   DriveSummary summary;
@@ -304,13 +314,45 @@ inline DriveSummary BuildDriveSummary(
       }
     }
   }
-  summary.nodes.reserve(roster.size());
-  for (const DriveRosterEntry& entry : roster) {
-    DriveSummaryNode node;
-    node.name = entry.name;
-    node.critical = entry.critical;
+  if (summary.supervised && manifest.contains("nodes") &&
+      manifest["nodes"].is_array()) {
+    const auto& members = manifest["nodes"];
+    summary.nodes.reserve(members.size());
+    for (const auto& row : members) {
+      if (!row.is_object() || !row.contains("name") ||
+          !row["name"].is_string()) {
+        continue;
+      }
+      DriveSummaryNode node;
+      node.name = row["name"].get<std::string>();
+      if (node.name == kStudioBridgeNodeName) continue;
+      const auto listed = std::find_if(config.begin(), config.end(),
+                                       [&node](const DriveRosterEntry& entry) {
+                                         return entry.name == node.name;
+                                       });
+      node.critical = listed == config.end() || listed->critical;
+      if (row.contains("restart_count") &&
+          row["restart_count"].is_number_unsigned()) {
+        node.restarts = row["restart_count"].get<std::uint64_t>();
+      }
+      if (row.contains("quarantined") && row["quarantined"].is_boolean()) {
+        node.quarantined = row["quarantined"].get<bool>();
+      }
+      summary.nodes.push_back(std::move(node));
+    }
+  }
+  if (summary.nodes.empty()) {
+    summary.nodes.reserve(config.size());
+    for (const DriveRosterEntry& entry : config) {
+      DriveSummaryNode node;
+      node.name = entry.name;
+      node.critical = entry.critical;
+      summary.nodes.push_back(std::move(node));
+    }
+  }
+  for (DriveSummaryNode& node : summary.nodes) {
     for (const auto& row : registry) {
-      if (row.name != entry.name || !row.alive) continue;
+      if (row.name != node.name || !row.alive) continue;
       node.alive = true;
       for (const auto& selection : row.selections) {
         if (auto source = selection.selected_source()) {
@@ -320,24 +362,6 @@ inline DriveSummary BuildDriveSummary(
       }
       break;
     }
-    if (summary.supervised && manifest.contains("nodes") &&
-        manifest["nodes"].is_array()) {
-      for (const auto& row : manifest["nodes"]) {
-        if (!row.is_object() || !row.contains("name") ||
-            !row["name"].is_string() || row["name"] != entry.name) {
-          continue;
-        }
-        if (row.contains("restart_count") &&
-            row["restart_count"].is_number_unsigned()) {
-          node.restarts = row["restart_count"].get<std::uint64_t>();
-        }
-        if (row.contains("quarantined") && row["quarantined"].is_boolean()) {
-          node.quarantined = row["quarantined"].get<bool>();
-        }
-        break;
-      }
-    }
-    summary.nodes.push_back(std::move(node));
   }
   return summary;
 }

@@ -353,12 +353,15 @@ TEST(DriveSummary, CapKeepsWholeNodesAndCountsTheRest) {
 
 // REQ-OPS-35
 // The summary says what the `subsystems` widget shows and channels cannot:
-// each node the config launches, alive from the registry (a dead node raises
-// no alert), its lane from its Target's selection, restarts and quarantine
-// from the launcher's manifest. Without a manifest it says so instead of
-// reporting zero restarts as a fact.
-TEST(DriveSummary, BuildsFromRosterRegistryAndManifest) {
-  const std::vector<DriveRosterEntry> roster{{"hardware_node", true},
+// each member the launcher supervises, in its manifest's order (the sim
+// gateway the config does not list included, the Studio bridge itself
+// left out), alive from the registry (a dead node raises no alert), its
+// lane from its Target's selection, restarts and quarantine from the
+// manifest, critical from the config by name. Without a manifest the
+// config's roster is listed and it says so instead of reporting zero
+// restarts as a fact.
+TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
+  const std::vector<DriveRosterEntry> config{{"hardware_node", true},
                                              {"drivetrain", true},
                                              {"intake", false},
                                              {"shooter", true}};
@@ -372,15 +375,25 @@ TEST(DriveSummary, BuildsFromRosterRegistryAndManifest) {
   registry[2].name = "intake";  // its row outlived it
   registry[2].alive = false;
   registry[2].selections.push_back({{"teleop"}, 1, 0});
+  // As the launcher writes it with the simulation's gateway and Studio.
   const std::string manifest =
       R"({"session_id": 42, "nodes": [)"
+      R"({"name": "hardware_node", "restart_count": 0, "quarantined": false},)"
       R"({"name": "drivetrain", "restart_count": 2, "quarantined": false},)"
-      R"({"name": "intake", "restart_count": 5, "quarantined": true}]})";
+      R"({"name": "intake", "restart_count": 5, "quarantined": true},)"
+      R"({"name": "shooter", "restart_count": 0, "quarantined": false},)"
+      R"({"name": "sim_gateway", "restart_count": 2, "quarantined": false},)"
+      R"({"name": "studio_bridge", "restart_count": 0, "quarantined": false}]})";
 
-  const DriveSummary summary = BuildDriveSummary(roster, registry, manifest);
+  const DriveSummary summary = BuildDriveSummary(config, registry, manifest);
   EXPECT_EQ(summary.session, "42");
   EXPECT_TRUE(summary.supervised);
-  ASSERT_EQ(summary.nodes.size(), 4u);
+  std::vector<std::string> names;
+  names.reserve(summary.nodes.size());
+  for (const auto& node : summary.nodes) names.push_back(node.name);
+  ASSERT_EQ(names,
+            (std::vector<std::string>{"hardware_node", "drivetrain", "intake",
+                                      "shooter", "sim_gateway"}));
   const auto& hardware = summary.nodes[0];
   EXPECT_TRUE(hardware.alive);
   EXPECT_FALSE(hardware.drives.has_value());
@@ -395,11 +408,17 @@ TEST(DriveSummary, BuildsFromRosterRegistryAndManifest) {
   EXPECT_EQ(intake.restarts, 5u);
   EXPECT_TRUE(intake.quarantined);
   EXPECT_FALSE(summary.nodes[3].alive) << "never registered";
+  const auto& gateway = summary.nodes[4];
+  EXPECT_EQ(gateway.restarts, 2u);
+  EXPECT_TRUE(gateway.critical) << "a member the config does not list";
 
   const DriveSummary unsupervised =
-      BuildDriveSummary(roster, registry, "{not json");
+      BuildDriveSummary(config, registry, "{not json");
   EXPECT_FALSE(unsupervised.supervised);
   EXPECT_EQ(unsupervised.session, "41");
+  ASSERT_EQ(unsupervised.nodes.size(), config.size());
+  EXPECT_EQ(unsupervised.nodes[2].name, "intake");
+  EXPECT_FALSE(unsupervised.nodes[2].critical);
   EXPECT_EQ(unsupervised.nodes[2].restarts, 0u);
 }
 
