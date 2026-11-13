@@ -6,14 +6,10 @@
 # name through telemetry's [[subsystem.labels]] on
 # autonomous/state/routine_index.
 #
-# The feed's worst case: 31 named channels (the match widget's 12 included)
-# at 20 Hz is 21,952 B/s of the 24,000 budget, which covers 39 channels, so
-# at most 8 alert channels fit the alerts widget before the budget must grow.
-#
-# Not yet here, because their channels do not exist yet: a "Commissioned"
-# check on hw/status/commissioned, and the /hw/status alerts
-# (alert_error_link_lost, ...), which the alerts widget lists without naming
-# them here.
+# The feed's worst case: 32 named channels (the match widget's 12 included)
+# plus the six /hw/status alerts the alerts widget carries, 38 channels at
+# 20 Hz, is 23,632 B/s of the 24,000 budget, which covers 39 channels: one
+# more alert channel fits before the budget must grow.
 
 [dashboard]
 title = "Drive"
@@ -99,6 +95,7 @@ title = "Pre-match"
 items = [
   { label = "Battery", channel = "hw/status/battery_v", at_least = 12.5 },
   { label = "Hardware configured", channel = "hw/status/configured", equals = true },
+  { label = "Commissioned", channel = "hw/status/commissioned", equals = true },
   { label = "Swerve modules", channel = "drivetrain/state/modules_valid", equals = true },
   { label = "Gyro", channel = "drivetrain/state/yaw_valid", equals = true },
   { label = "Localized", channel = "pose_estimator/state/localized", equals = true },
