@@ -592,6 +592,67 @@ TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// What a run loses while the session stops still reaches the final
+// manifest (TODO.md RT-7): the supervision pass stops reading rows for
+// liveness once the session is stopping, so the launcher reads each run's
+// row once more when it reaps the run. alpha and the bridge stubs show
+// zeros until they are stopped, then store their counts in one last sample
+// and release their rows as they exit, as a node's Reporter and the bridge
+// do; the bridge's skipped requests survive that release.
+// REQ-OPS-43
+TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
+  auto options = BaseOptions("stop_loss");
+  options.allow_graph_errors = true;  // The bridge stub's request watcher.
+  options.duration_s = kHangSeconds;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* stub = std::getenv("TALOS_DELIVERY_LOSS_NODE");
+  ASSERT_NE(stub, nullptr);
+  const std::string binary = runfiles->Rlocation(stub);
+  const auto member = [&](std::string_view name, std::string_view target,
+                          std::string_view run) {
+    return WriteStub("stop_loss_" + std::string{name},
+                     "exec " + binary + " " + std::string{name} + " " +
+                         std::string{target} + " " + std::string{run} +
+                         " \"$@\"\n",
+                     name);
+  };
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      member("hardware_node", "//talOS/bridge:hardware_node", "0,0,0,6,stop");
+  options.binary_overrides["//example/alpha:node"] =
+      member("alpha", "//example/alpha:node", "2,1,3,0,stop");
+  options.binary_overrides["//example/beta:node"] =
+      member("beta", "//example/beta:node", "0,0,0,0,run");
+  const uint64_t session = options.session_id;
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [session](const std::string&) {
+                  return Registered("alpha", session) &&
+                         Registered("hardware_node", session);
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty()) << "a stub never registered";
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+
+  const auto alpha = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha.size(), 1u) << manifest;
+  EXPECT_NE(alpha[0].find("\"reason\": \"stop\", \"wake_failures\": 2, "
+                          "\"stalled_arms\": 1, \"wake_fallbacks\": 3, "
+                          "\"requests_skipped\": 0}"),
+            std::string::npos)
+      << "the run's counts as it ended: " << alpha[0];
+  const auto bridge = ManifestEntry(manifest, "hardware_node");
+  EXPECT_NE(bridge.find("\"requests_skipped_by_subsystem\": {\"alpha\": 6}"),
+            std::string::npos)
+      << bridge;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 // session_report --strict on a finished session directory: its exit status
 // and its stderr, where it names each reason it rejects the session.
 struct StrictReport {

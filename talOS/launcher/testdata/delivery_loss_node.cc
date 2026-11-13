@@ -8,9 +8,11 @@
 // for restart 1 (`<log>.restart1.tlog`), and so on: wake_failures,
 // stalled_arms, wake_fallbacks, the requests skipped on a watcher of
 // `/hw/request/alpha`, then how the run ends, comma separated. `run` runs
-// until SIGINT or SIGTERM, then exits 0; `exit` exits 3 once the session's
-// manifest.json shows wake_failures at this run's (nonzero) count, as the
-// launcher posts it when a count first leaves 0.
+// until SIGINT or SIGTERM, then exits 0; `stop` does too, but its row shows
+// zeros until the stop, then the counts, in one last sample before it
+// releases the row; `exit` exits 3 once the session's manifest.json shows
+// wake_failures at this run's (nonzero) count, as the launcher posts it
+// when a count first leaves 0.
 
 #include <chrono>
 #include <csignal>
@@ -40,6 +42,7 @@ struct Run {
   std::uint64_t wake_fallbacks{0};
   std::uint64_t requests_skipped{0};
   bool exits{false};
+  bool late{false};  // The counts appear only once the run is stopped.
 };
 
 Run ParseRun(const std::string& spec) {
@@ -52,7 +55,8 @@ Run ParseRun(const std::string& spec) {
           .stalled_arms = std::stoull(fields[1]),
           .wake_fallbacks = std::stoull(fields[2]),
           .requests_skipped = std::stoull(fields[3]),
-          .exits = fields[4] == "exit"};
+          .exits = fields[4] == "exit",
+          .late = fields[4] == "stop"};
 }
 
 // Restart k's event log is `<name>.restart<k>.tlog`; the first run's has no
@@ -103,14 +107,20 @@ int main(int argc, char** argv) {
       "\"wake_failures\": " + std::to_string(run.wake_failures);
   const auto give_up =
       std::chrono::steady_clock::now() + std::chrono::seconds{10};
-  for (std::uint64_t dispatch = 1; stop == 0; ++dispatch) {
+  const Run none{};
+  const auto sample = [&row, &run](std::uint64_t dispatch, const Run& shown) {
     row.begin_sample();
     row.heartbeat();
     row.set_dispatch_count(dispatch);
-    row.set_wake_loss(run.wake_failures, run.stalled_arms, run.wake_fallbacks);
+    row.set_wake_loss(shown.wake_failures, shown.stalled_arms,
+                      shown.wake_fallbacks);
     if (run.requests_skipped != 0)
-      row.set_source(0, dispatch, run.requests_skipped, dispatch, 0, 0, 0);
+      row.set_source(0, dispatch, shown.requests_skipped, dispatch, 0, 0, 0);
     row.end_sample();
+  };
+  std::uint64_t dispatch = 1;
+  for (; stop == 0; ++dispatch) {
+    sample(dispatch, run.late ? none : run);
     if (run.exits) {
       std::ifstream in{manifest};
       const std::string text{std::istreambuf_iterator<char>{in}, {}};
@@ -119,5 +129,8 @@ int main(int argc, char** argv) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
   }
+  // As a node's Reporter takes its final sample after its loop ends; the
+  // row is released on return.
+  if (run.late) sample(dispatch, run);
   return 0;
 }

@@ -221,7 +221,10 @@ the count is stored with release ordering afterwards, so a reader that can see a
 count can see the records it describes.
 
 A registration releases its slot in its destructor, so a clean shutdown leaves
-no ghost row and a viewer sees the node disappear immediately. A node that is
+no ghost row and a viewer sees the node disappear immediately. The released
+slot keeps its last sample, sources and wake counters included, until the
+next claim clears it: the launcher reads a reaped run's final
+[wake loss](#wake-loss) there. A node that is
 killed leaves its slot ACTIVE until the next claim, or until the heartbeat goes
 stale; a crash-looping roster therefore cannot fill the registry.
 
