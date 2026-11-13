@@ -67,6 +67,16 @@ int main(int argc, char** argv) {
     }
 
     auto robot_config = talos::config::ParseRobotConfig(config_path);
+    // A simulation config (its gains, bindings and travel) never reaches a
+    // controller, whoever started this bridge (REQ-SAFE-40): refused before a
+    // socket opens. --describe opens nothing, so the launcher's
+    // --describe-only probe without --sim still answers.
+    if (robot_config.simulation_only && !simulation && !describe) {
+      throw std::invalid_argument(
+          config_path +
+          " sets [robot] simulation_only = true; hardware_node runs it only "
+          "with --sim");
+    }
     const std::string remote_ip =
         talos::config::ResolveControllerAddress(robot_config, remote_cli);
     const uint16_t remote_port =
