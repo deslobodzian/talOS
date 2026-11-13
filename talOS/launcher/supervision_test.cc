@@ -285,7 +285,11 @@ bool Running(const std::string& manifest) {
 // for at the loop's next deadline), so whatever that pass reads
 // of a running member the session has recorded. `seen` gets the manifest
 // `ready` held for: empty when the session ended first. Set
-// options.duration_s to kHangSeconds.
+// options.duration_s to kHangSeconds. `ready` must also wait until every
+// member still running handles the stop (a talos node or
+// delivery_loss_node once Registered, a shell stub once its trap is set):
+// one stopped before that dies of the launcher's SIGINT, and a member
+// ended by a signal makes the session's status nonzero.
 int RunSessionUntil(LauncherOptions& options,
                     const std::function<bool(const std::string&)>& ready,
                     std::string& seen) {
@@ -643,8 +647,11 @@ TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
   EXPECT_EQ(RunSessionUntil(
                 options,
                 [session](const std::string&) {
+                  // beta too: a stub stopped before it handles the stop
+                  // dies of the SIGINT (RunSessionUntil).
                   return Registered("alpha", session) &&
-                         Registered("hardware_node", session);
+                         Registered("hardware_node", session) &&
+                         Registered("beta", session);
                 },
                 seen),
             0);
@@ -793,13 +800,18 @@ TEST(Supervision, AWakeLostOnAByteTopicFailsTheStrictReport) {
   options.binary_overrides["//example/beta:node"] =
       lossless("beta", "//example/beta:node");
   options.binary_overrides["//example/alpha:node"] = runfiles->Rlocation(node);
+  const uint64_t session = options.session_id;
   std::string seen;
   EXPECT_EQ(RunSessionUntil(
                 options,
-                [](const std::string& live) {
+                [session](const std::string& live) {
+                  // The lossless stubs too: one stopped before it handles
+                  // the stop dies of the SIGINT (RunSessionUntil).
                   return ManifestEntry(live, "alpha")
-                             .find("\"wake_failures\": 1,\n") !=
-                         std::string::npos;
+                                 .find("\"wake_failures\": 1,\n") !=
+                             std::string::npos &&
+                         Registered("hardware_node", session) &&
+                         Registered("beta", session);
                 },
                 seen),
             0);
