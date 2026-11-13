@@ -1175,8 +1175,17 @@ RECORDED for a manifest without `launcher_log`; informational, since the
 output logs are not the measured record), an unfinished
 session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
-lateness, the bridge's request-to-command delay, and every scalar
-`/hw/status` field.
+lateness, the bridge's request-to-command delay, every scalar
+`/hw/status` field, and the alerts.
+The Alerts section lists each alert that was ever active, as
+`<topic>/<field path>` with its level, from the `alerts` of its status
+topic's records (above; the publisher's stream, else one reader's): its
+first activation (milliseconds from the start of the log), activation count,
+and longest and total active time. Times are publication times: an alert is
+active from the first record showing it true to the first showing it false,
+or, still active at the end, to its topic's last record, so they resolve to
+that topic's publication period. The section is informational: `--strict`
+does not judge alerts, at any level.
 The bridge has no timer (it sleeps until a datagram, a request or a duty is
 due), so it is measured instead by request to command: for each observation
 (`boot_id`, `observed_time_us`) a `/hw/command` carries, its first command's
