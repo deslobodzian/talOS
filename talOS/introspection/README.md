@@ -168,11 +168,14 @@ watchers whose failed arms stopped holding its loop awake; and
 on a poll tick instead. The `Reporter` copies
 `RealtimeEventLoop::wake_loss()` in each full sample, adding each
 `ExtraSource::wake_failures` (`NodeRegistration::set_wake_loss`); the
-hardware bridge, whose loop is its own, stores its publishers' failures and its `OpenWaits()` fallbacks, and
-no stalled arms. A wake to the bridge that is lost shows as the requests its
-latest-value read of `/hw/request/<node>` then passes over: each counts in
-`dropped` of that subsystem's request source in the bridge's row, which is
-not latest-only, so Studio calls the topic `lossy`.
+hardware bridge, whose loop is its own, stores its publishers' failures,
+its `OpenWaits()` fallbacks and, as stalled arms, the request topics whose
+failed arms its idle-pass guard (`HardwareNode::kMaxIdlePasses`) stopped
+holding it awake, each once until that topic arms or delivers again. A
+wake to the bridge that is lost shows as the requests its latest-value read
+of `/hw/request/<node>` then passes over: each counts in `dropped` of that
+subsystem's request source in the bridge's row, which is not latest-only,
+so Studio calls the topic `lossy`.
 `NodeSnapshot::delivery_loss()` (and `DeliveryLossOf(const NodeRecord&)`,
 for a reader that copies no snapshot, such as the launcher's supervision
 pass, which keeps them per run in the

@@ -62,6 +62,12 @@ struct SubsystemTracker {
   // node's wakes to the bridge fail or the bridge falls behind, and this
   // subsystem merges at a fraction of its rate (TODO.md RT-7).
   uint64_t requests_skipped{0};
+  // HardwareNode::Pass()'s idle-pass guard (kMaxIdlePasses): whether this
+  // topic's arm failed in the last pass, and whether the guard has counted
+  // it in Wakeups::stalled_arms since its arm last succeeded or a read last
+  // returned a request from it.
+  bool arm_failed{false};
+  bool arm_stalled{false};
 
   // Positions in the merged command of the actuators this subsystem owns,
   // resolved from `devices` by HardwareNode::IndexActuators so a timeout
@@ -173,6 +179,10 @@ class HardwareNode {
     uint64_t throttled{0};
     // OpenWaits() calls that fell back to polling. Stays 0.
     uint64_t wait_fallbacks{0};
+    // Request topics whose failed arms the kMaxIdlePasses guard stopped
+    // holding the loop awake, each counted once until a read returns a
+    // request from it again; the registry row's stalled_arms. Stays 0.
+    uint64_t stalled_arms{0};
   };
   const Wakeups& wakeups() const { return wakeups_; }
 

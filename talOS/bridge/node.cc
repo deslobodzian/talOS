@@ -294,16 +294,16 @@ void HardwareNode::PublishIntrospection() {
   }
 
   // The bridge's loop is its own, so its wake loss is too: the wake
-  // notifications its publishers failed to send, and the runs that could
-  // not wait on their inputs (OpenWaits). Its idle-pass guard
-  // (kMaxIdlePasses) is not counted, so stalled_arms stays 0.
+  // notifications its publishers failed to send, the request topics whose
+  // failed arms its idle-pass guard (kMaxIdlePasses) stopped holding it
+  // awake, and the runs that could not wait on their inputs (OpenWaits).
   std::uint64_t wake_failures = 0;
   for (auto* publisher : {state_pub_.get(), cmd_pub_.get(), ds_pub_.get()}) {
     if (publisher != nullptr)
       wake_failures += publisher->queue().wake_failures();
   }
   if (status_pub_) wake_failures += status_pub_->queue().wake_failures();
-  registration_->set_wake_loss(wake_failures, /*stalled_arms=*/0,
+  registration_->set_wake_loss(wake_failures, wakeups_.stalled_arms,
                                wakeups_.wait_fallbacks);
   registration_->end_sample();
 }
@@ -451,6 +451,7 @@ void HardwareNode::Tick(uint64_t now_us) {
     if (received) {
       ++tracker.requests;
       ++tick_requests_;
+      tracker.arm_stalled = false;
       tracker.requests_skipped += received->dropped;
       Command partial{};
       if (Decode(received->message.bytes(), partial)) {
@@ -913,13 +914,19 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
   // before it fails the arm (talOS/rtms README.md "Wake channel").
   bool input_waiting = tick_receive_capped_;
   for (auto& [name, tracker] : subsystems_) {
+    tracker.arm_failed = false;
     // One without a slot cannot be armed; each Tick's read retries the
     // claim, and the longest wait bounds the time to the next Tick.
     if (!tracker.subscriber || !tracker.subscriber->registered()) continue;
     const bool caught_up = seams_.arm_request != nullptr
                                ? seams_.arm_request(*tracker.subscriber)
                                : tracker.subscriber->arm_wake();
-    if (!caught_up) input_waiting = true;
+    if (caught_up) {
+      tracker.arm_stalled = false;
+    } else {
+      tracker.arm_failed = true;
+      input_waiting = true;
+    }
   }
 
   const uint64_t timed_us =
@@ -950,6 +957,15 @@ HardwareNode::Wait HardwareNode::Pass(uint64_t now_us) {
     if (idle_passes_ < kMaxIdlePasses) {
       ++idle_passes_;
       return {now_us, false};
+    }
+    // The guard: each topic whose failed arm it now stops holding the loop
+    // awake is a stalled arm, counted once until it arms or delivers again,
+    // as an event loop counts its watchers' (Activity::stalled_arms).
+    for (auto& [name, tracker] : subsystems_) {
+      if (tracker.arm_failed && !tracker.arm_stalled) {
+        tracker.arm_stalled = true;
+        ++wakeups_.stalled_arms;
+      }
     }
   }
   idle_passes_ = 0;
