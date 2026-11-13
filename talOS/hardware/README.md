@@ -74,7 +74,13 @@ refused.
 On the main processor only `--sim` bypasses commissioning, in memory, and the
 bridge and every node apply it under that same flag: the bit is part of the
 configuration ID they compare. `--sim` rejects non-loopback remotes; a loopback
-remote without it keeps the configured value.
+remote without it keeps the configured value. A config that sets
+`[robot] simulation_only = true`, which the launcher starts only with `--sim`
+([lightweight simulation gateway](../launcher/README.md#lightweight-simulation-gateway)),
+is refused the same way by `hardware_node` started by hand without `--sim`,
+before it opens a socket; its `--describe` still answers:
+
+    hardware_node error: /path/robot_sim.toml sets [robot] simulation_only = true; hardware_node runs it only with --sim
 
 Both endpoints compute a canonical configuration fingerprint. Changing a CAN
 address, offset, limit, or gain changes that ID; commands with a different ID

@@ -6,6 +6,7 @@
 // configuration and a command out, cross the socket on their way to and
 // from it.
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -20,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <set>
@@ -393,6 +395,106 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   EXPECT_TRUE(logged_command);
   EXPECT_TRUE(logged_neutral);
   EXPECT_TRUE(logged_state);
+}
+
+// TODO.md SIM-4: a config that declares itself for simulation only (here
+// through its own [robot] over an included deployable base, as a scaffolded
+// robot_sim.toml does) never reaches a controller from a hardware_node started
+// by hand without --sim: it exits non-zero naming the key, the config and the
+// flag, having sent nothing. Its --describe, which opens nothing, still
+// answers, so the launcher's --describe-only probe without --sim works.
+// REQ-SAFE-40
+TEST(HardwareNodeTest, ASimulationOnlyConfigRunsOnlyWithSim) {
+  const std::string base = ::testing::TempDir() + "simulation_only";
+  const std::string deployable_path = base + "_deployable.toml";
+  const std::string config_path = base + ".toml";
+  {
+    std::ofstream file(deployable_path);
+    file << kTrustToml;
+  }
+  {
+    std::ofstream file(config_path);
+    file << "include = \""
+         << std::filesystem::path(deployable_path).filename().string()
+         << "\"\n[robot]\nsimulation_only = true\n";
+  }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  ASSERT_TRUE(runfiles) << error;
+  const char* executable_path = std::getenv("HARDWARE_NODE");
+  ASSERT_NE(executable_path, nullptr);
+  const auto executable = runfiles->Rlocation(executable_path);
+  // Runs hardware_node with `args`, its stdout and stderr in `output_path`,
+  // and returns its exit status, or -1 if it did not exit.
+  const auto run = [&executable](const std::vector<std::string>& args,
+                                 const std::string& output_path) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 2);
+    argv.push_back(const_cast<char*>(executable.c_str()));
+    for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+    argv.push_back(nullptr);
+    const pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+      const int out =
+          open(output_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (out < 0 || dup2(out, STDOUT_FILENO) < 0 ||
+          dup2(out, STDERR_FILENO) < 0) {
+        _exit(126);
+      }
+      execv(executable.c_str(), argv.data());
+      _exit(127);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+  };
+  const auto read = [](const std::string& path) {
+    std::ifstream file(path);
+    return std::string{std::istreambuf_iterator<char>(file), {}};
+  };
+
+  // The controller's end: a bound loopback socket the bridge would send its
+  // probes and configuration to.
+  uint16_t gateway_port = 0;
+  uint16_t node_port = 0;
+  int gateway_reservation = ReservePort(gateway_port);
+  int node_reservation = ReservePort(node_port);
+  const bool reserved = gateway_reservation >= 0 && node_reservation >= 0;
+  Release(gateway_reservation);
+  Release(node_reservation);
+  ASSERT_TRUE(reserved);
+  protocol::RuntimeUdpPeer gateway;
+  ASSERT_EQ(gateway.Open("127.0.0.1", gateway_port, "127.0.0.1", node_port),
+            protocol::UdpStatus::kOk);
+
+  // --duration-s bounds a bridge that wrongly runs: it then exits 0 after
+  // sending to the gateway, instead of hanging the test.
+  const std::string run_output = base + "_run.txt";
+  EXPECT_EQ(run({"--config", config_path, "--remote", "127.0.0.1",
+                 "--remote-port", std::to_string(gateway_port), "--local-port",
+                 std::to_string(node_port), "--duration-s", "1"},
+                run_output),
+            1);
+  const std::string message = read(run_output);
+  EXPECT_NE(message.find(config_path + " sets [robot] simulation_only = true; "
+                                       "hardware_node runs it only with --sim"),
+            std::string::npos)
+      << message;
+  // Exact, not a wait: the bridge has exited, and a datagram it sent over
+  // loopback was queued on this socket before its send returned.
+  protocol::DecodedFrame frame;
+  EXPECT_EQ(gateway.TryReceive(&frame), protocol::UdpStatus::kWouldBlock)
+      << "the bridge sent a frame to the controller";
+
+  const std::string describe_output = base + "_describe.json";
+  EXPECT_EQ(run({"--config", config_path, "--describe"}, describe_output), 0)
+      << read(describe_output);
+  EXPECT_NE(read(describe_output).find("\"describe_version\""),
+            std::string::npos)
+      << read(describe_output);
 }
 
 // REQ-OPS-14: replaying a session into a node that did not watch /hw/state
