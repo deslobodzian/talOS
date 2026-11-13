@@ -12,7 +12,7 @@ import {test} from 'node:test';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {esc, listRowsFit, METRICS, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, type Surface} from '../src/drive/view';
+import {esc, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, type Surface} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -185,7 +185,7 @@ test('renders every widget of the 2026 layout in its cell', () => {
   // Battery 12.61 >= 12.5 passes; commissioned is false and fails.
   const checks = widgetHtml(html, 'Pre-match');
   assert.equal(checks.match(/tag-good">OK/g)?.length, 5, checks);
-  assert.match(checks, /tag-bad">FAIL<\/span><span class="name">Commissioned/);
+  assert.match(checks, /tag-bad">FAIL<\/span><span class="name"[^>]*>Commissioned/);
 });
 
 // REQ-OPS-39: a widget this page cannot draw is never a silent blank: a kind
@@ -449,9 +449,11 @@ test('the routine widget shows the label for the index, the number out of range'
   assert.match(widgetHtml(render(h), 'Auto routine'), /class="big routine">routine #7</);
 });
 
-// The subsystems widget: what the drive summary says, with unknown shown as
-// unknown and the cut-off list as "+N more".
-test('the subsystems widget lists the summary, unknown as unknown', () => {
+// REQ-OPS-49: the subsystems widget shows what the drive summary says, one
+// state word per row (the most severe: a quarantined node is not running, so
+// FAILING and not DOWN beside it, which left no width for the name), unknown
+// as unknown, and the cut-off list as "+N more".
+test('the subsystems widget lists the summary, one state word per row', () => {
   const node = (name: string, extra: object) => ({name, alive: true, critical: true, restarts: 0,
                                                   quarantined: false, drives: null, ...extra});
   const h = harness();
@@ -462,7 +464,9 @@ test('the subsystems widget lists the summary, unknown as unknown', () => {
       node('shooter', {alive: false, quarantined: true})]}));
   const html = widgetHtml(render(h), 'Subsystems');
   assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 2<\/span><span class="meta">drives teleop/);
-  assert.match(html, /shooter<\/span><span class="tag tag-bad">DOWN<\/span><span class="tag tag-bad">QUARANTINED/);
+  assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
+  for (const row of html.match(/<li>.*?<\/li>/g) ?? [])
+    assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
   assert.match(html, /\+3 more/);
   h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
     registry: false, omitted: 0, nodes: [node('shooter', {alive: false})]}));
@@ -664,6 +668,32 @@ test('the 2026 lists fit their cells at 1366x768', () => {
   const read = new Set([...css.matchAll(/var\(--drive-([a-z-]+)\)/g)].map(m => m[1]));
   assert.deepEqual([...read].sort(),
                    Object.keys(METRICS).map(k => k.replace(/_/g, '-')).sort());
+});
+
+// REQ-OPS-49: each row keeps its name readable beside its state. At 1366x768
+// the 2026 subsystems cell gives two columns; the worst-case row (each state
+// word, with both notes, restarts and drives) still shows the name's floor,
+// and enough of each 2026 node name to tell them apart (front_left_camera
+// from front_right_camera). A model: glyph widths are GLYPH_PX, not a
+// browser's; a browser screenshot verifies it.
+test('a 2026 subsystems row keeps a readable name beside its widest state word', () => {
+  const names = ['hardware_node', 'autonomous', 'drivetrain', 'intake', 'driver', 'pose_estimator',
+                 'shooter', 'telemetry', 'teleop', 'front_left_camera', 'front_right_camera',
+                 'rear_left_camera', 'rear_right_camera'];
+  // The shortest prefix length that tells every name apart.
+  let distinct = 1;
+  while (new Set(names.map(n => n.slice(0, distinct))).size < names.length) distinct++;
+  const subsystems = LAYOUT.widgets.find(w => w.kind === 'subsystems')!;
+  const column = listColumns(LAYOUT, subsystems.at, {width: 1366, height: 768}, METRICS.node_column);
+  for (const word of Object.values(NODE_STATE)) {
+    const shown = nameCharsShown(column.width, word, 2);
+    assert.ok(shown + 1 >= METRICS.name_min_ch,
+              `${word}: a ${column.width.toFixed(1)} px column leaves the name ${shown} characters, ` +
+              `under its floor of ${METRICS.name_min_ch} ch, so the word is squeezed`);
+    assert.ok(shown >= distinct,
+              `${word}: the name shows ${shown} characters, ${distinct} tell the 2026 nodes apart`);
+  }
+  assert.ok(METRICS.name_min_ch - 1 >= distinct, 'the name floor cannot tell the 2026 nodes apart');
 });
 
 // REQ-OPS-36: when the subsystems list is longer than its cell, the rows

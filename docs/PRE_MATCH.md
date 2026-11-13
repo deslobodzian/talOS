@@ -56,9 +56,12 @@ check below.
 - [ ] Field: the robot drawn at its starting position, with no `POSE NOT
   VALID` (odometry not integrating fresh input) or `NOT LOCALIZED` (the
   pose estimator has neither trusted its seed nor seen a field tag) tag.
-- [ ] Subsystems: every node `UP`, none `QUARANTINED`, and `restarts` not
-  rising between checks. `DOWN` in red is a critical node. `unknown`: the
-  bridge could not read the live registry, so the rows say nothing.
+- [ ] Subsystems: every node `UP`, none `FAILING`, and `restarts` not
+  rising between checks (hover a name whose row is too narrow to show them).
+  `DOWN`: not running; in red, a critical node. `FAILING`: the node failed
+  too often and the launcher paused its restarts (quarantined); it is not
+  running. `unknown`: the bridge could not read the live registry, so the
+  rows say nothing.
 - [ ] Pre-match: every item `OK` (bounds in the
   [layout](../2026-robot/main_processor/configuration/dashboard.toml)):
 

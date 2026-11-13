@@ -195,10 +195,9 @@ html, body {
   font-size: var(--drive-tag-font);
   line-height: 1;
   font-weight: 700;
-  padding: 1px 5px;
+  padding: 1px var(--drive-tag-pad-x);
   border-radius: 4px;
-  border: 1.5px solid currentColor;
-  margin-right: 4px;
+  border: var(--drive-tag-border) solid currentColor;
   white-space: nowrap;
 }
 .tag-good { color: var(--good); }
@@ -228,9 +227,12 @@ html, body {
 
 ul { list-style: none; margin: 0; padding: 0; }
 
-/* List rows: one fixed height, the state words never squeezed out (a long
- * name ellipsizes instead), in as many columns of at least --drive-*-column
- * as the cell's width holds. */
+/* List rows: one fixed height, in as many columns of at least
+ * --drive-*-column as the cell's width holds. A row too narrow for its
+ * content gives up width in this order: its notes (restarts, drives) to
+ * nothing, then its name down to --drive-name-min-ch (ellipsized; the full
+ * name is its tooltip), and only then its state word (ellipsized).
+ * nameCharsShown in view.ts models this. */
 .nodes, .checks {
   display: grid;
   column-gap: var(--drive-list-gap);
@@ -241,7 +243,7 @@ ul { list-style: none; margin: 0; padding: 0; }
 .alerts li, .nodes li, .checks li {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--drive-item-gap);
   height: var(--drive-row);
   font-size: var(--drive-row-font);
   line-height: 1.2;
@@ -251,12 +253,15 @@ ul { list-style: none; margin: 0; padding: 0; }
   min-width: 0;
 }
 .alerts li > *, .nodes li > *, .checks li > * { flex: none; }
-.alerts .name, .nodes .name, .checks .name, .nodes .meta {
-  flex: 0 1 auto;
+.alerts .name, .nodes .name, .checks .name,
+.alerts .meta, .nodes .meta, .nodes .tag, .checks .tag {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.alerts .meta, .nodes .meta { flex: 0 10000 auto; margin-left: 0; }
+.alerts .name, .nodes .name, .checks .name { flex: 0 100 auto; min-width: var(--drive-name-min-ch); }
+.nodes .tag, .checks .tag { flex: 0 1 auto; }
 .alerts .level { font-weight: 800; font-size: var(--drive-tag-font); margin-right: 4px; }
 .alert-error .level { color: var(--bad); }
 .alert-warning .level { color: var(--warn); }
