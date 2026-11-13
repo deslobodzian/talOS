@@ -12,8 +12,8 @@ import socket
 import subprocess
 import tempfile
 import unittest
-import uuid
 
+from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
 
 from tools import new_robot_test as harness
@@ -21,6 +21,33 @@ from tools import new_subsystem
 from tools import sync_manifest
 
 MECHANISMS = (("gripper", "velocity"), ("position_cpp", "position"))
+
+# talOS/introspection/registry.h kRegistryPath. The launcher creates the
+# registry and deliberately leaves it for later sessions, so the test
+# unlinks its own after the run.
+REGISTRY = "/talos_registry.6"
+
+# Bounds on a hang, not on the run (which lasts SIM_DURATION_S): together
+# they stay below Bazel's 60 s `short` timeout, so a hang fails with the
+# test's diagnostics instead of being killed by Bazel.
+LAUNCH_TIMEOUT_S = 40
+LOG_DUMP_TIMEOUT_S = 5
+
+
+def shm_name(topic, namespace):
+    """talos::ShmObjectName (talOS/memory/shared_memory_ptr.h)."""
+    mapped = "/" + topic.lstrip("/").replace("/", ".")
+    value = 0xCBF29CE484222325
+    for byte in namespace.encode() + b"\0" + mapped.encode():
+        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"/~{value:016x}"
+
+
+def unlink_registry(namespace):
+    try:
+        shm_unlink(shm_name(REGISTRY, namespace))
+    except FileNotFoundError:
+        pass
 
 
 def udp_ports():
@@ -58,7 +85,8 @@ def states(log_dump, session, mechanism):
     dumped = subprocess.run(
         [log_dump, "--format", "jsonl", "--node", mechanism, "--topic",
          f"/{mechanism}/state", session],
-        capture_output=True, text=True, timeout=60, check=True)
+        capture_output=True, text=True, timeout=LOG_DUMP_TIMEOUT_S,
+        check=True)
     rows = [json.loads(line) for line in dumped.stdout.splitlines()
             if line.startswith("{")]
     decoded = []
@@ -83,7 +111,14 @@ class ScaffoldSimTest(unittest.TestCase):
             subsystems, _ = sync_manifest.effective(work, config)
 
             gateway_port, bridge_port = udp_ports()
-            env["TALOS_SHM_NAMESPACE"] = f"scaffold-sim-{uuid.uuid4().hex}"
+            # Bazel's TEST_TMPDIR is the shared-memory namespace
+            # (ARCHITECTURE.md "Topics and messages") and holds the lock
+            # files, which Bazel removes with it; only the registry segment
+            # is left to unlink.
+            namespace = os.environ.get("TEST_TMPDIR") or tmp
+            env.pop("TALOS_SHM_NAMESPACE", None)
+            env["TEST_TMPDIR"] = namespace
+            self.addCleanup(unlink_registry, namespace)
             gateway_args = [
                 "--physics", "--port", str(gateway_port), "--remote-port",
                 str(bridge_port), "--mode-schedule",
@@ -99,8 +134,13 @@ class ScaffoldSimTest(unittest.TestCase):
                      "--output-dir", output, "--duration-s",
                      str(new_subsystem.SIM_DURATION_S)]
             # The timeout only bounds a hang; the run lasts SIM_DURATION_S.
-            run = subprocess.run(args, cwd=work, env=env, capture_output=True,
-                                 text=True, timeout=60)
+            try:
+                run = subprocess.run(args, cwd=work, env=env,
+                                     capture_output=True, text=True,
+                                     timeout=LAUNCH_TIMEOUT_S)
+            except subprocess.TimeoutExpired as hung:
+                self.fail(f"launcher still running after {hung.timeout:.0f} s:"
+                          f" {hung.stdout!r} {hung.stderr!r}")
             diagnostics = run.stdout + run.stderr
             self.assertEqual(run.returncode, 0, diagnostics)
             (session,) = os.listdir(output)
