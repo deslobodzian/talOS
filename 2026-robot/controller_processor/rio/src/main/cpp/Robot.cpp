@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <optional>
 #include <random>
+#include <span>
 #include <string_view>
 #include <thread>
 
@@ -277,9 +278,10 @@ void Robot::StartCompetition() {
   // after a failed save) and collects the outcome on later ticks, never
   // waiting (ConfigStore.h). Started here, before the loop raises itself
   // below, so it keeps the default scheduling.
+  const talos::rio::ConfigFile config_file{kConfigPath};
   talos::rio::ConfigPersister persister{
-      [](const talos::hardware::Config& config) {
-        return talos::rio::SaveConfigFile(kConfigPath, config);
+      [&config_file](std::span<const uint8_t> persisted) {
+        return config_file.Save(persisted);
       },
       restoring_id};
   persister.Start();
