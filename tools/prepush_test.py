@@ -190,6 +190,67 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertFalse(self.gradle_ran(), out)
 
+    # REQ-DEV-25
+    def test_optional_steps_follow_the_checked_refs_own_upstream(self):
+        # The current branch's upstream already holds the change; the
+        # branch checked, whose upstream does not, still runs gradle.
+        self.add_gradlew()
+        self.git("branch", "feature_pushed")
+        change = self.commit("talOS/hardware/x.h", "hardware")
+        self.git("branch", "feature", change)
+        self.git("branch", "--set-upstream-to=feature_pushed", "feature")
+        self.git("branch", "current_pushed", change)
+        self.git("branch", "--set-upstream-to=current_pushed")
+        status, out, _ = self.prepush("--ref", "feature", "--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+
+    # REQ-DEV-25
+    def test_a_relative_tmpdir_from_a_subdirectory(self):
+        # TMPDIR names self.tmpdir relative to the subdirectory run from,
+        # not to the repository's top level.
+        cwd = os.path.join(self.repo, "src")
+        status, out, calls = self.prepush(
+            cwd=cwd, TMPDIR=os.path.relpath(self.tmpdir, cwd))
+        self.assertEqual(status, 0, out)
+        build_cwd = [c for c, _, args in calls if args.startswith("build")]
+        self.assertEqual(len(build_cwd), 1, out)
+        self.assertTrue(build_cwd[0].startswith(self.tmpdir + os.sep),
+                        build_cwd[0])
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25
+    def test_refuses_to_run_from_inside_its_own_worktree(self):
+        wt = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}")
+        self.git("worktree", "add", "-q", "--detach", wt)
+        status, out, calls = self.prepush(cwd=wt)
+        self.assertEqual(status, 2, out)
+        self.assertEqual(calls, [], out)
+        self.assertTrue(os.path.isfile(os.path.join(wt, "src", "a.txt")), out)
+        self.assertFalse(os.path.exists(wt + ".lock"), out)
+
+    # REQ-DEV-25
+    def test_a_lock_without_a_pid_is_held(self):
+        # Another run between its mkdir and its pid write.
+        lock = os.path.join(self.tmpdir, f"talos-prepush-{os.getuid()}.lock")
+        os.makedirs(lock)
+        status, out, calls = self.prepush()
+        self.assertEqual(status, 2, out)
+        self.assertEqual(calls, [], out)
+        self.assertTrue(os.path.isdir(lock), out)
+
+    # REQ-DEV-25
+    def test_leaves_other_worktrees_registered(self):
+        # Another worktree whose directory is missing for now (an unmounted
+        # disk): `git worktree prune` would drop its registration.
+        other = os.path.join(self.tmp, "other")
+        self.git("worktree", "add", "-q", "--detach", other)
+        os.rename(other, other + ".away")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn(other, self.worktree_paths())
+        os.rename(other + ".away", other)
+
 
 if __name__ == "__main__":
     unittest.main()

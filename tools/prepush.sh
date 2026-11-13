@@ -15,8 +15,8 @@
 #
 # Steps, in order: read-only, `bazel build //...`, host-includes, `bazel test
 # --nocache_test_results //...`, checkout-unchanged; then, when the commits
-# to push (@{upstream}..<ref>, or every file if the branch has no upstream)
-# touch them: gradle (`phoenixTest buildRio -Pheadless --offline`, for
+# to push (<ref>@{upstream}..<ref>; every file when <ref> is not a branch
+# with an upstream) touch them: gradle (`phoenixTest buildRio -Pheadless --offline`, for
 # 2026-robot/controller_processor/ and talOS/, whose headers the RoboRIO
 # program's build.gradle exports) and studio-test and studio-build (`pnpm test`, `pnpm build`, for studio/).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
@@ -59,14 +59,22 @@ repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git checkou
 commit="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" ||
   die "not a commit: $ref"
 disk_cache="${TALOS_BAZEL_DISK_CACHE:-$HOME/.cache/talos-bazel-disk}"
-tmp="${TMPDIR:-/tmp}"
-tmp="${tmp%/}"
+# Absolute and physical: git -C "$repo" and `cd` would resolve a relative
+# TMPDIR against different directories.
+tmp="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" ||
+  die "TMPDIR is not a directory: ${TMPDIR:-/tmp}"
 wt="$tmp/talos-prepush-$(id -u)"
 lock="$wt.lock"
 start=$SECONDS
+[ "$(cd "$repo" && pwd -P)" != "$wt" ] ||
+  die "run from the checkout, not from prepush's own worktree $wt"
 
 # One run at a time owns the worktree path.
+# The pid file appears whole (written beside it, then renamed), so a lock
+# without one is being taken, or its run was killed while taking it.
 if ! mkdir "$lock" 2>/dev/null; then
+  [ -f "$lock/pid" ] ||
+    die "$lock has no pid yet: another prepush is starting (if none is, rmdir $lock)"
   holder="$(cat "$lock/pid" 2>/dev/null || true)"
   if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
     die "another prepush (pid $holder) is using $wt"
@@ -74,14 +82,21 @@ if ! mkdir "$lock" 2>/dev/null; then
   rm -rf "$lock"
   mkdir "$lock" 2>/dev/null || die "cannot take $lock"
 fi
-echo $$ > "$lock/pid"
+{ echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
+  die "cannot write $lock/pid"
 
 bazel_started=0
 remove_worktree() {
-  [ -e "$wt" ] || return 0
-  chmod -R u+w "$wt" 2>/dev/null
-  git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
-  git -C "$repo" worktree prune
+  if [ -e "$wt" ]; then
+    chmod -R u+w "$wt" 2>/dev/null
+    git -C "$repo" worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  fi
+  # Still registered with its directory gone (deleted by hand, or by the
+  # rm above): only `git worktree prune` drops that, and it prunes every
+  # worktree whose directory is missing, so it runs only in this case.
+  if git -C "$repo" worktree list --porcelain | grep -qxF "worktree $wt"; then
+    git -C "$repo" worktree prune
+  fi
 }
 cleanup() {
   if [ "$keep" = 1 ]; then
@@ -129,7 +144,10 @@ skip() {  # skip NAME REASON: a step that should have run and did not.
 }
 
 # Which optional steps the commits to push need.
-upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+# The range is from the checked branch's upstream (--ref's own when it
+# names a branch); for any other commit there is none, and every optional
+# step runs.
+upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name "$ref@{upstream}" 2>/dev/null || true)"
 touches() {  # touches PATH...: the pushed range changes something under PATH.
   [ -z "$upstream" ] && return 0
   local changed
