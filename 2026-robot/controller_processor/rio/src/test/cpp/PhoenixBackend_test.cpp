@@ -471,6 +471,49 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
 }
 
+// A configuration with no motor, or no device at all, is valid: the backend
+// configures it, its Read has no device signal to refresh and still reports
+// a healthy read with power health, and a digital output alone drives, reads
+// back and goes de-energized on Neutral.
+// REQ-CONTRACT-35
+TEST(PhoenixBackendNoMotor, EmptyAndDigitalOutputOnlyConfigsConfigureAndRead) {
+  EnsureHal();
+  {
+    const hw::Config empty;
+    PhoenixBackend backend(true);
+    ASSERT_TRUE(backend.Configure(empty));
+    ASSERT_TRUE(AwaitReady(backend, empty));
+    EXPECT_TRUE(backend.UnavailableDevices().empty());
+    hw::State s;
+    EXPECT_TRUE(backend.Read(s));
+    EXPECT_TRUE(s.health.valid);
+    EXPECT_TRUE(backend.Apply({}));
+    backend.Neutral();
+    EXPECT_TRUE(backend.Read(s));
+  }
+
+  hw::Config outputs;
+  hw::DigitalOutputConfig d;
+  d.id = 20;
+  d.name = "solenoid";
+  d.dio = 6;
+  outputs.digital_outputs.push_back(d);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(outputs));
+  ASSERT_TRUE(AwaitReady(backend, outputs));
+  const std::array<hw::DigitalOutputRequest, 1> on{
+      hw::DigitalOutputRequest{20, true}};
+  ASSERT_TRUE(backend.ApplyOutputs(on, {}));
+  hw::State s;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.digital_outputs[0].valid);
+  EXPECT_TRUE(s.digital_outputs[0].value);
+  backend.Neutral();
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.digital_outputs[0].valid);
+  EXPECT_FALSE(s.digital_outputs[0].value);
+}
+
 TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
   EnsureHal();
   PhoenixBackend backend(true);
