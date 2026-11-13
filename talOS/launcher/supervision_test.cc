@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -224,6 +225,18 @@ LauncherOptions ConstructionOptions(std::string_view tag, int delay_ms) {
       WriteStub(std::string{tag} + "_beta", "exit 0\n");
   return options;
 }
+
+// The drift fixture's /alpha/event is no session topic (no probe declares
+// it), so its node creates the segment and, killed for the mismatch, never
+// unlinks it: unlinked after the last test, in this test's namespace only.
+class DriftTopicCleanup : public ::testing::Environment {
+ public:
+  void TearDown() override {
+    ::shm_unlink(ShmObjectName("/alpha/event").c_str());
+  }
+};
+[[maybe_unused]] ::testing::Environment* const kDriftTopicCleanup =
+    ::testing::AddGlobalTestEnvironment(new DriftTopicCleanup);
 
 // alpha is the endpoint drift fixture (testdata/endpoint_drift_node.cc),
 // which publishes /alpha/event only live, and only with `drift` set.

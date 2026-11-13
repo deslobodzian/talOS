@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1055,8 +1056,14 @@ TEST(LauncherTest, MaxRestartsComesFromFlagThenConfigThenDefault) {
 // is, so a script that prints it is a complete node for this purpose -- and the
 // graph under test stays in the test instead of in some other package's source,
 // where it would drift.
+//
+// Stubs live in a directory of their own, so no TempPath a test means to be
+// missing (a never-built binary) or to hold output can name one.
 std::string WriteStubNode(std::string_view name, std::string_view script) {
-  const std::string path = TempPath(name);
+  const std::string dir = ::testing::TempDir() + "/talos_launcher_stubs_" +
+                          std::to_string(::getpid());
+  std::filesystem::create_directories(dir);
+  const std::string path = dir + "/" + std::string{name};
   {
     std::ofstream out{path};
     out << script;
@@ -2822,6 +2829,8 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   ::kill(child, SIGKILL);
   int status = 0;
   ::waitpid(child, &status, 0);
+  // The killed launcher never unlinked its session's one topic segment.
+  ::shm_unlink(ShmObjectName("/alpha/state").c_str());
   const std::string manifest = ReadFile(path);
   ASSERT_FALSE(manifest.empty());
   const std::string parse =
