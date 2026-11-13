@@ -73,7 +73,8 @@ commissioned through the normal bring-up process.
 A bundle that carries Studio serves it whenever `run.sh` runs, by hand or
 from the boot service: `run.sh` passes the launcher `--start-studio-bridge`,
 which runs the bundle's bridge for `[studio] bridge` on `[studio] http_port`
-(5800; Studio at `/`, the driver dashboard at `/drive`) and serves the
+(5800; Studio at `/`, the [driver dashboard](../studio/README.md#driver-dashboard)
+at `/drive`, for a browser on the Driver Station laptop) and serves the
 bundle's webroot unless `[studio] webroot` is an absolute path
 ([Studio bridge](../talOS/launcher/README.md#studio-bridge)).
 `./run.sh --no-studio` runs the session without it. From a bundle built

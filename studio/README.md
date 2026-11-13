@@ -78,6 +78,49 @@ guarantees for a short activation, is in
 [`src/data/alerts.ts`](src/data/alerts.ts). The demo cycles through numbered
 matches with one alert of each level.
 
+## Driver dashboard
+
+The page the drive team watches during a match: `drive.html`, served by the
+bridge at `/drive` (REQ-OPS-34). It draws the layout `[studio] dashboard` names
+(`/drive/layout.json`, widget kinds in the
+[telemetry README](../talOS/telemetry/README.md#dashboard-layout)) from the
+`/drive` feed ([bridge README](bridge/README.md#driver-dashboard-feed)). It is
+plain TypeScript with no React, a second entry of the same Vite build
+([`vite.config.mjs`](vite.config.mjs)), so it loads about 45 kB
+(`assets/drive-*.js`, `assets/drive-*.css` and the chunk it shares with
+Studio: the telemetry decoder and the alert model) and makes no request beyond
+the bridge. Light and dark follow the browser's colour scheme.
+
+- [`src/drive/feed.ts`](src/drive/feed.ts) (`DriveModel`) holds the one socket,
+  decodes the feed with Studio's `TelemetryDecoder`, latches alerts with
+  `AlertTracker`, and names the failed link. It has no timers or DOM: the page
+  calls `tick(now)` every 100 ms.
+- [`src/drive/view.ts`](src/drive/view.ts) renders the layout as HTML text;
+  [`src/drive/main.ts`](src/drive/main.ts) loads the layout and swaps the text
+  in.
+
+What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
+
+- Every value is current only while a new telemetry tick (a `sequence_id`
+  that advanced) arrived within 300 ms; otherwise its widget is dimmed, struck
+  through and tagged STALE, at most 400 ms after the last tick. A channel never
+  received reads "no data", never zero.
+- One status line names the failed link, upstream first: the dashboard to
+  bridge link (no socket, or nothing heard for 500 ms), telemetry (messages
+  but no new tick; or none 1.5 s after connecting, the time a refilling bucket
+  may take to send the dictionary, which until then reads as connecting), then
+  the RoboRIO link (`hw/status/alert_error_link_lost`).
+- On a close or error it reconnects every 1 s, one socket at a time; a connect
+  that has not opened in 2 s, or a socket silent for 2 s, counts as an error.
+  After close 4000 it shows that another dashboard replaced it and reconnects
+  only when Reconnect is pressed.
+- Alerts: active ones error first, each with its level as a word, and every
+  alert raised this match with its count. The routine widget names the routine
+  from the channel's labels, or `routine #N` out of range. Subsystems lists
+  the drive summary's nodes; `unknown` when the registry could not be read.
+- A widget kind it does not draw is an "Unsupported widget" cell. A message
+  that does not decode is counted on the status line and ignored.
+
 ## Add a panel
 
 1. Write `src/panels/<id>/index.tsx`, exporting a
