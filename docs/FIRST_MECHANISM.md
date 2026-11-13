@@ -54,7 +54,10 @@ Next:
 
 Run it through `bazel run`; `python3 tools/new_robot.py` alone fails with
 `No module named 'tools'`. `--dry-run` prints every file without writing.
-`new_robot` always writes the robot with its first mechanism.
+`new_robot` writes the robot with its first mechanism; with
+`--no-mechanism` in place of `--mechanism` and `--lang` it writes one with
+no device (the hardware bridge, `teleop` and `telemetry`), whose
+mechanisms `new_subsystem` adds later.
 `my_robot/README.md` says what each file is; the ones that
 matter now:
 
