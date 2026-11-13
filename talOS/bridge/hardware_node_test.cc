@@ -1064,22 +1064,58 @@ bool NeverCaughtUp(ipc::Subscriber<Packet>& /*subscriber*/) { return false; }
 
 // An arm that keeps reporting unread data no read returns (a read the
 // writer keeps tearing) holds the loop awake for kMaxIdlePasses passes, then
-// the loop waits for its next duty anyway: it cannot spin.
-// REQ-RT-20
+// the loop waits for its next duty anyway: it cannot spin. Each request
+// topic whose failed arm the guard stops holding the loop awake counts once
+// in stalled_arms, which reaches the bridge's registry row (TODO.md RT-7),
+// until a read returns a request from that topic.
+// REQ-RT-20, REQ-OPS-43
 TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
   ASSERT_TRUE(link.Open(cfg));
   HardwareNode& node = link.node.value();
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
   node.set_seams({.arm_request = &NeverCaughtUp});
-  constexpr uint64_t kStartUs = 1'000'000;
-  for (uint64_t i = 0; i < HardwareNode::kMaxIdlePasses; ++i) {
-    EXPECT_EQ(node.Pass(kStartUs + i).until_us, kStartUs + i) << i;
+  uint64_t now_us = 1'000'000;
+  // kMaxIdlePasses immediate passes, then one that waits (the guard) until
+  // the time it returns, where the next pass runs.
+  const auto stall = [&node, &now_us] {
+    for (uint64_t i = 0; i < HardwareNode::kMaxIdlePasses; ++i, ++now_us) {
+      EXPECT_EQ(node.Pass(now_us).until_us, now_us) << i;
+    }
+    const HardwareNode::Wait wait = node.Pass(now_us);
+    EXPECT_FALSE(wait.ignore_input);
+    EXPECT_GT(wait.until_us, now_us);
+    const uint64_t waited_us = wait.until_us - now_us;
+    now_us = wait.until_us;
+    return waited_us;
+  };
+  EXPECT_EQ(stall(), 10'000u);  // the longest wait
+  // Both subsystems' arms (drivetrain, intake) stalled.
+  EXPECT_EQ(node.wakeups().stalled_arms, 2u);
+  stall();
+  EXPECT_EQ(node.wakeups().stalled_arms, 2u) << "once per stall, not per pass";
+
+  ipc::Publisher<Packet> intake{RequestTopic("intake")};
+  Command request{};
+  request.config_id = NodeConfigId(cfg);
+  PublishCommand(intake, request);
+  EXPECT_EQ(node.Pass(now_us).until_us, now_us) << "read the request";
+  ++now_us;
+  stall();
+  EXPECT_EQ(node.wakeups().stalled_arms, 3u) << "intake stalled again";
+
+  node.PublishIntrospection();
+  std::optional<introspect::NodeSnapshot> bridge;
+  for (auto& row : reader->nodes()) {
+    if (row.name == kNodeName &&
+        row.pid == static_cast<std::uint64_t>(getpid()) &&
+        (!bridge || row.generation > bridge->generation))
+      bridge = std::move(row);
   }
-  const uint64_t now_us = kStartUs + HardwareNode::kMaxIdlePasses;
-  const HardwareNode::Wait wait = node.Pass(now_us);
-  EXPECT_FALSE(wait.ignore_input);
-  EXPECT_EQ(wait.until_us, now_us + 10'000);  // the longest wait
+  ASSERT_TRUE(bridge.has_value());
+  EXPECT_EQ(bridge->delivery_loss().stalled_arms, 3u);
 }
 
 // The send time of the next clock probe the gateway receives, skipping other
