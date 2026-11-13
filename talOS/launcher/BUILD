@@ -460,6 +460,7 @@ cc_library(
     srcs = ["testdata/registry_cleanup.cc"],
     deps = [
         "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
         "@googletest//:gtest",
     ],
     alwayslink = True,
@@ -682,6 +683,7 @@ cc_test(
         ":first_exec",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
