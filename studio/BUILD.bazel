@@ -42,9 +42,11 @@ js_library(
         "agent/*.mjs",
         "tests/*.mjs",
     ]) + [
+        "drive.html",
         "index.html",
         "package.json",
         "tsconfig.json",
+        "vite.config.mjs",
         ":telemetry_ts",
     ],
     deps = [":node_modules"],
@@ -66,6 +68,9 @@ tsc_bin.tsc_test(
     data = [":sources"],
 )
 
+# The webroot a bundle carries (talos_bundle studio_webroot): index.html
+# (Studio, at /), drive.html (the driver dashboard, at /drive) and their
+# assets/<name>-<hash>.<ext>, both pages from vite.config.mjs's inputs.
 js_run_binary(
     name = "web_dist",
     srcs = [":sources"],
@@ -113,6 +118,7 @@ STUDIO_TESTS = {
     "core_test": "core.test.ts",
     "declared_test": "declared.test.ts",
     "discovery_test": "discovery.test.ts",
+    "drive_test": "drive.test.ts",
     "events_panel_test": "events_panel.test.tsx",
     "events_test": "events.test.ts",
     "field_test": "field.test.tsx",
