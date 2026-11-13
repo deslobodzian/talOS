@@ -93,29 +93,34 @@ TEST(SocketRetry, AttemptsAtMostOncePerPeriod) {
             SocketRetry::Event::kNone);
 }
 
-// A send error the network clears by itself keeps the socket: a full
-// interface queue (ENOBUFS), the companion's port closed (ECONNREFUSED), no
-// interface or route yet (ENETDOWN, ENETUNREACH, EHOSTUNREACH), a full socket
-// buffer (EAGAIN). A new socket would fail them the same way, so the loop
-// goes on sending on this one and opens nothing.
+// Which send errors lose the socket. One the network clears by itself keeps
+// it, and the loop goes on sending on it: a full interface queue (ENOBUFS),
+// the companion's port closed (ECONNREFUSED), no interface yet (ENETDOWN),
+// an ICMP host unreachable (EHOSTUNREACH), a full socket buffer (EAGAIN).
+// One that every later send on the same socket repeats loses it, and the next
+// due attempt replaces it: ENETUNREACH is what Linux, the RoboRIO's OS,
+// returns once the socket's source address has left the host (a new DHCP
+// lease), even after a new address appears.
 // REQ-RT-22
-TEST(SocketRetry, ATransientSendErrorKeepsTheSocket) {
-  SocketRetry retry;
-  ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
-            SocketRetry::Event::kOpened);
+TEST(SocketRetry, OnlyASendErrorTheSocketKeepsRepeatingLosesIt) {
+  struct Row {
+    int error;
+    bool lost;
+  };
   uint64_t now = kStartUs;
-  for (const int error :
-       {ENOBUFS, ECONNREFUSED, ENETDOWN, ENETUNREACH, EHOSTUNREACH, EAGAIN}) {
-    SCOPED_TRACE(std::strerror(error));
+  for (const Row row :
+       {Row{ENOBUFS, false}, Row{ECONNREFUSED, false}, Row{ENETDOWN, false},
+        Row{EHOSTUNREACH, false}, Row{EAGAIN, false}, Row{ENETUNREACH, true}}) {
+    SCOPED_TRACE(std::strerror(row.error));
+    SocketRetry retry;
+    ASSERT_EQ(retry.Poll(now, [] { return true; }),
+              SocketRetry::Event::kOpened);
     now += SocketRetry::kPeriodUs;
-    EXPECT_FALSE(retry.SendFailed(now, error));
-    EXPECT_TRUE(retry.open());
-    EXPECT_EQ(retry.Poll(now + kLoopPeriodUs,
-                         [] {
-                           ADD_FAILURE() << "a socket was opened";
-                           return true;
-                         }),
-              SocketRetry::Event::kNone);
+    EXPECT_EQ(retry.SendFailed(now, row.error), row.lost);
+    EXPECT_EQ(retry.open(), !row.lost);
+    EXPECT_EQ(
+        retry.Poll(now + kLoopPeriodUs, [] { return true; }),
+        row.lost ? SocketRetry::Event::kReplaced : SocketRetry::Event::kNone);
   }
 }
 

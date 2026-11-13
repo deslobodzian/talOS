@@ -16,16 +16,18 @@
 // nothing it would notice, and State goes out within one period of the route
 // appearing.
 //
-// A send that fails with an error the socket never recovers from
-// (protocol::SendErrorNeedsNewSocket: EPIPE, ENOTCONN, EDESTADDRREQ,
-// EADDRNOTAVAIL, EBADF) loses the socket: the loop ticks the gateway disabled
-// again, sends nothing, and the next attempt opens a new socket on the same
-// ports (Endpoint::Reopen, keeping the frame sequence), on the same cadence:
-// at once if no attempt was made in the last kPeriodUs, otherwise kPeriodUs
-// after the last, so a condition that also breaks every new socket costs at
-// most ten sockets a second. Any other send error (ENOBUFS, ECONNREFUSED,
-// ENETUNREACH, ...) clears on the same socket and keeps it; EAGAIN is not
-// an error here (kWouldBlock).
+// A send that fails with an error the socket may never recover from
+// (protocol::SendErrorNeedsNewSocket: a socket shut down, or its source
+// address gone from the host, which Linux reports as ENETUNREACH) loses the
+// socket: the loop ticks the gateway disabled again, sends nothing, and the
+// next attempt opens a new socket on the same ports (Endpoint::Reopen,
+// keeping the frame sequence), on the same cadence: at once if no attempt
+// was made in the last kPeriodUs, otherwise kPeriodUs after the last, so a
+// condition that also breaks every new socket costs at most ten sockets a
+// second, and a network with no route at all costs one failed open per
+// kPeriodUs, as at boot. Any other send error (ENOBUFS, ECONNREFUSED, ...)
+// clears on the same socket and keeps it; EAGAIN is not an error here
+// (kWouldBlock).
 namespace talos::rio {
 
 class SocketRetry {

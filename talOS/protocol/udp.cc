@@ -402,24 +402,36 @@ UdpStatus RuntimeUdpPeer::ConfigureSocket(const UdpSocketOptions& options) {
 }
 
 // Shut down for writing, or marked defunct by macOS (EPIPE; seen after sleep
-// and wake); no longer connected (ENOTCONN, EDESTADDRREQ); its source address
-// removed from the host (EADDRNOTAVAIL; a new socket's connect picks a
-// current one); or no socket at all (EBADF). Every other error is the
-// network's, and the same socket sends again once it clears: ECONNREFUSED (an
-// ICMP port unreachable from an earlier datagram, reported once: the peer
-// program is not running yet), ENETDOWN, ENETUNREACH, EHOSTUNREACH (no
-// interface or route; a connected socket looks the route up again on each
-// send) and ENOBUFS (a full interface queue). A new socket would fail those
-// the same way, so reopening for them would only churn sockets. EAGAIN never
-// gets here: Send() returns it as kWouldBlock.
+// and wake); no longer connected (ENOTCONN, EDESTADDRREQ); no socket at all
+// (EBADF); or its source address gone from the host. connect() fixed that
+// source, and every later send on the socket uses it, so the socket stays
+// broken even once the host has a new address on the same network; a new
+// socket's connect picks the current one. Linux reports a gone source as
+// ENETUNREACH (its route lookup for a source that is not local fails so),
+// macOS as EADDRNOTAVAIL.
+//
+// ENETUNREACH is also Linux's and macOS's error for no route to the peer at
+// all (the interface down, no address yet), which a new socket does not
+// cure: its connect() fails ENETUNREACH the same way, and the caller sits
+// without a socket, retrying the open on its cadence, as at boot until the
+// network comes up. Nothing could be sent meanwhile either way, so the only
+// cost is that failed open (a few non-blocking calls) per retry.
+//
+// Every other error is the network's, and the same socket sends again once
+// it clears: ECONNREFUSED (an ICMP port unreachable from an earlier
+// datagram, reported once: the peer program is not running yet), ENETDOWN,
+// EHOSTUNREACH (an ICMP host unreachable, or the peer not answering ARP) and
+// ENOBUFS (a full interface queue). A new socket would fail those the same
+// way, so reopening for them would only churn sockets. EAGAIN never gets
+// here: Send() returns it as kWouldBlock.
 bool SendErrorNeedsNewSocket(int error) {
 #if defined(_WIN32)
   return error == WSAESHUTDOWN || error == WSAENOTCONN ||
          error == WSAEDESTADDRREQ || error == WSAEADDRNOTAVAIL ||
-         error == WSAENOTSOCK;
+         error == WSAENETUNREACH || error == WSAENOTSOCK;
 #else
   return error == EPIPE || error == ENOTCONN || error == EDESTADDRREQ ||
-         error == EADDRNOTAVAIL || error == EBADF;
+         error == EADDRNOTAVAIL || error == ENETUNREACH || error == EBADF;
 #endif
 }
 

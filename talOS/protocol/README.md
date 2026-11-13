@@ -45,6 +45,17 @@ decoding. Clock probes do not authorize actuation and work while disabled.
   on the same addresses and ports, keeping the send sequence and stats.
   `SendErrorNeedsNewSocket(errno)` tells an error only a new socket clears
   from one the network clears on the same socket; both ends decide with it.
+  A new socket is needed for `EPIPE` (shut down, or a socket macOS marked
+  defunct around sleep and wake), `ENOTCONN`, `EDESTADDRREQ`, `EBADF`, and a
+  source address that left the host: `connect()` fixed the source, so after
+  an address change (a new DHCP lease, a link that re-addresses) every send
+  on the old socket fails, on Linux with `ENETUNREACH` and on macOS with
+  `EADDRNOTAVAIL`, while a new socket sends from the new address
+  (`udp_address_change_test`). `ENETUNREACH` also means no route at all; a new
+  socket's `connect()` then fails the same way, and the caller retries the
+  open on its cadence, as at boot. The socket is kept for `ECONNREFUSED`,
+  `ENETDOWN`, `EHOSTUNREACH` and `ENOBUFS`, which clear on it (Windows: the
+  `WSAE` equivalents).
   The bridge's use of it is in the
   [data-flow reference](../../docs/DATA_FLOW.md#link-rates-and-endpoints), the
   RoboRIO program's in [talOS/hardware](../hardware/README.md#roborio).

@@ -187,16 +187,18 @@ class HardwareNode {
   const Wakeups& wakeups() const { return wakeups_; }
 
   // The UDP socket to the gateway. A send that fails with an error the
-  // socket never recovers from (protocol::SendErrorNeedsNewSocket: EPIPE,
-  // ENOTCONN, EDESTADDRREQ, EADDRNOTAVAIL, EBADF) closes it; Tick() then
-  // opens a new one on the same ports (RuntimeUdpPeer::Reopen): the first
-  // attempt on the next Tick (NextDutyUs: kRetryUs later at the latest),
-  // then at most once per kReopenRetryUs.
+  // socket may never recover from (protocol::SendErrorNeedsNewSocket: a
+  // socket shut down or defunct, or its source address gone from the host)
+  // closes it; Tick() then opens a new one on the same ports
+  // (RuntimeUdpPeer::Reopen): the first attempt on the next Tick
+  // (NextDutyUs: kRetryUs later at the latest), then at most once per
+  // kReopenRetryUs, which is also the cadence while the network has no
+  // route to the gateway and each attempt fails.
   // While it is closed nothing is sent or received, so the gateway times
   // the command out and /hw/status's state_age_us grows, as for any lost
   // link. Any other send error (ECONNREFUSED while the gateway is down,
-  // ENETDOWN, ENETUNREACH, EHOSTUNREACH, ENOBUFS) keeps the socket: it
-  // clears by itself, and the failed duty is retried kRetryUs later.
+  // ENOBUFS, ...) keeps the socket: it clears by itself, and the failed duty
+  // is retried kRetryUs later.
   // stderr gets one line when an outage starts, with its errno, and one when
   // a send succeeds again. Read only while Run() is not running.
   struct SocketCounters {
