@@ -41,9 +41,10 @@ constexpr std::array<std::string_view, 4> kReservedKinds{"camera", "mechanism",
 // DriverStationChannels names them), and the /hw/status fields a `power`
 // widget reads. A rename there leaves the telemetry node's dictionary check
 // refusing the layout, never a widget silently empty.
-constexpr std::array<std::string_view, 9> kMatchRoles{
-    "connected", "enabled",      "autonomous", "teleop",      "test",
-    "estop",     "fms_attached", "alliance",   "match_time_s"};
+constexpr std::array<std::string_view, 12> kMatchRoles{
+    "connected",    "enabled",      "autonomous",   "teleop",
+    "test",         "estop",        "fms_attached", "alliance",
+    "match_time_s", "match_number", "match_type",   "station"};
 constexpr std::string_view kDriverStationPrefix = "hw/state/driver_station/";
 constexpr std::array<std::string_view, 3> kPowerRoles{"battery_v", "brownout",
                                                       "health_valid"};
