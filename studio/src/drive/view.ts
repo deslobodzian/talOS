@@ -7,8 +7,8 @@
 import {channelDisplay, type Snapshot} from '../core';
 import {alertLevelName, type ActiveAlert, type LatchedAlert} from '../data/alerts';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../panels/field/geometry';
-import type {DriveModel, Link, SummaryNode} from './feed';
-import type {CheckItem, Layout, Widget} from './layout';
+import type {DriveModel, DriveSummary, Link, SummaryNode} from './feed';
+import type {Cell, CheckItem, Layout, Widget} from './layout';
 
 export function esc(text: string): string {
   return text.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
@@ -150,17 +150,32 @@ function alertsWidget(model: DriveModel): string {
                              '<p class="none">none</p>');
 }
 
+// The rows that matter come first, so a list that overflows its cell (the
+// body then scrolls) hides the least: a node down or quarantined (critical
+// ones first), a named node the summary lacks, one driving from a target
+// lane, a critical one, then the rest; summary order within each.
+function nodeRank(n: SummaryNode|string, summary: DriveSummary): number {
+  if (typeof n === 'string') return 2;
+  const failed = (summary.registry && !n.alive) || (summary.supervised && n.quarantined);
+  if (failed) return n.critical ? 0 : 1;
+  if (summary.registry && n.drives !== null) return 3;
+  return n.critical ? 4 : 5;
+}
+
 function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): string {
   const summary = model.summary;
   if (!summary) return `<p class="none">${ABSENT}</p>`;
-  // A filter shows every node it names, in its order: one the summary does
-  // not list (cut off by `omitted`, or not in the session) is unknown.
-  const nodes: (SummaryNode|string)[] = w.nodes.length ?
+  // A filter shows every node it names: one the summary does not list (cut
+  // off by `omitted`, or not in the session) is unknown.
+  const named: (SummaryNode|string)[] = w.nodes.length ?
       w.nodes.map(name => summary.nodes.find(n => n.name === name) ?? name) :
       summary.nodes;
+  const nodes = named.map((n, i) => ({n, i, rank: nodeRank(n, summary)}))
+                    .sort((a, b) => a.rank - b.rank || a.i - b.i)
+                    .map(e => e.n);
   const rows = nodes.map(n => {
     if (typeof n === 'string')
-      return `<li><span class="name">${esc(n)}</span>${tag('unknown', 'neutral')}` +
+      return `<li><span class="name" title="${esc(n)}">${esc(n)}</span>${tag('unknown', 'neutral')}` +
           '<span class="meta">not in the summary</span></li>';
     const alive = !summary.registry ? tag('unknown', 'neutral') :
         n.alive ? tag('UP', 'good') : tag('DOWN', n.critical ? 'bad' : 'warn');
@@ -169,7 +184,7 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
     const quarantined = summary.supervised && n.quarantined ? tag('QUARANTINED', 'bad') : '';
     const drives = !summary.registry ? '' : n.drives !== null ?
         `<span class="meta">drives ${esc(n.drives)}</span>` : '';
-    return `<li><span class="name">${esc(n.name)}</span>${alive}${quarantined}${restarts}${drives}</li>`;
+    return `<li><span class="name" title="${esc(n.name)}">${esc(n.name)}</span>${alive}${quarantined}${restarts}${drives}</li>`;
   });
   if (summary.omitted > 0 && !w.nodes.length)
     rows.push(`<li class="more">+${summary.omitted} more</li>`);
@@ -388,10 +403,58 @@ export class Painter {
   }
 }
 
+// The page's box sizes in px, written onto the page as custom properties
+// (pageStyle) that drive.css reads with var() and states nowhere else, so
+// listRowsFit below computes with the numbers the browser lays out with.
+export const METRICS = {
+  page_pad: 6,        // around the page
+  gap: 6,             // between the top bar and the grid, and between cells
+  top: 40,            // the title and status bar
+  cell_border: 1,
+  cell_pad_y: 4,
+  cell_pad_x: 8,
+  header: 22,         // a widget's heading line
+  row: 22,            // one list row (subsystems, checks, alerts)
+  row_font: 14,
+  tag_font: 12,
+  min_font: 12,       // no text is smaller
+  list_gap: 8,        // between list columns
+  node_column: 150,   // the narrowest subsystems column: a name and a state word
+  check_column: 220   // the narrowest checks column: a verdict and a label
+} as const;
+
+export function pageStyle(): string {
+  return Object.entries(METRICS)
+      .map(([name, px]) => `--drive-${name.replace(/_/g, '-')}:${px}px`)
+      .join(';');
+}
+
+// How many list rows fit, without scrolling, in the body of a widget at
+// `at` of `layout`'s grid on a `page` of that many px: the rows of one
+// column times the columns of at least `column` px that fit its width (CSS
+// grid `repeat(auto-fill, minmax(column, 1fr))`). Computed from METRICS and
+// the stylesheet's box model, not measured.
+export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
+                            page: {width: number; height: number}, column: number): number {
+  const m = METRICS;
+  const gridW = page.width - 2 * m.page_pad;
+  const gridH = page.height - 2 * m.page_pad - m.top - m.gap;
+  const trackW = (gridW - (layout.columns - 1) * m.gap) / layout.columns;
+  const trackH = (gridH - (layout.rows - 1) * m.gap) / layout.rows;
+  const cellW = at.width * trackW + (at.width - 1) * m.gap;
+  const cellH = at.height * trackH + (at.height - 1) * m.gap;
+  const bodyW = cellW - 2 * m.cell_border - 2 * m.cell_pad_x;
+  const bodyH = cellH - 2 * m.cell_border - 2 * m.cell_pad_y - m.header;
+  const columns = Math.max(1, Math.floor((bodyW + m.list_gap) / (column + m.list_gap)));
+  return Math.floor(bodyH / m.row) * columns;
+}
+
 // The whole page body; the page itself updates the status line and the grid
 // apart, so a button in the status line survives grid updates.
 export function renderDashboard(layout: Layout, model: DriveModel, now: number): string {
-  return `<header class="top"><h1>${esc(layout.title)}</h1>` +
+  return `<div class="page" style="${pageStyle()}">` +
+      `<header class="top"><h1>${esc(layout.title)}</h1>` +
       `<div class="status-slot">${renderStatus(model, now, layout.skipped)}</div></header>` +
-      `<main class="grid" style="${gridStyle(layout)}">${renderWidgets(layout, model, now)}</main>`;
+      `<main class="grid" style="${gridStyle(layout)}">${renderWidgets(layout, model, now)}</main>` +
+      '</div>';
 }
