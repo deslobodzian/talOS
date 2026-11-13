@@ -7,7 +7,7 @@
 import {channelDisplay, type Snapshot} from '../core';
 import {alertLevelName, type ActiveAlert, type LatchedAlert} from '../data/alerts';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../panels/field/geometry';
-import type {DriveModel, DriveSummary, Link, SummaryNode} from './feed';
+import {type DriveModel, type DriveSummary, type Link, STALE_MS, type SummaryNode} from './feed';
 import type {Cell, CheckItem, Layout, Widget} from './layout';
 
 export function esc(text: string): string {
@@ -444,6 +444,55 @@ export class Painter<E> {
       if (top > 0) this.surface.setScrollTop(element, top);
     });
     this.surface.errored(false);
+  }
+}
+
+// The page's clocks and timers; a test passes fakes.
+export interface Timers {
+  now(): number;   // monotonic ms (performance.now)
+  wall(): number;  // wall-clock ms (Date.now)
+  setTimeout(fn: () => void, ms: number): number;
+  clearTimeout(handle: number): void;
+}
+
+// How late after a freshness deadline the deadline's draw is asked for:
+// `fresh` holds through the deadline itself, so the draw comes 1 ms after.
+export const STALE_DRAW_LAG_MS = 1;
+
+// When the page draws. Besides the periodic render (RENDER_MS), the page's
+// return to view and a user action, each draw arms a timer for the model's
+// next freshness deadline (a value going stale STALE_MS after its last new
+// tick, or the link going silent), so stale is drawn STALE_DRAW_LAG_MS after
+// the deadline (plus the browser's timer lateness), not up to RENDER_MS
+// later. A periodic draw follows every new tick within RENDER_MS, before its
+// deadline, and re-arms the timer for it.
+//
+// performance.now() may not advance while the laptop sleeps, so a value
+// last updated before the sleep would read current after it: when the wall
+// clock moved more than STALE_MS further than the monotonic one between two
+// draws, the model reads stale until a new tick (DriveModel.suspend).
+export class DrawSchedule {
+  private armed: {at: number; handle: number}|null = null;
+  private last: {now: number; wall: number}|null = null;
+
+  constructor(private readonly model: DriveModel, private readonly draw: (now: number) => void,
+              private readonly timers: Timers) {}
+
+  frame() {
+    const now = this.timers.now(), wall = this.timers.wall();
+    if (this.last && (wall - this.last.wall) - (now - this.last.now) > STALE_MS) this.model.suspend();
+    this.last = {now, wall};
+    this.draw(now);
+    const at = this.model.nextChangeAt(now);
+    if (this.armed?.at === at) return;
+    if (this.armed) this.timers.clearTimeout(this.armed.handle);
+    this.armed = null;
+    if (at === null) return;
+    const handle = this.timers.setTimeout(() => {
+      this.armed = null;
+      this.frame();
+    }, at - now + STALE_DRAW_LAG_MS);
+    this.armed = {at, handle};
   }
 }
 

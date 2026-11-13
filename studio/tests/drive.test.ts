@@ -12,7 +12,7 @@ import {test} from 'node:test';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {esc, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, type Surface} from '../src/drive/view';
+import {DrawSchedule, esc, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -230,24 +230,85 @@ test('values go stale within 500 ms of the last new tick, whatever else arrives'
   assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'));
 });
 
-// REQ-OPS-36: the page draws every RENDER_MS at a phase unrelated to the
-// ticks, while the bridge restamps the last tick every 100 ms. Whatever the
-// phase, the first draw that shows the value stale comes within 500 ms of
-// the last new tick.
-test('the page draws a stopped value stale within 500 ms at any draw phase', () => {
-  for (let phase = 0; phase < RENDER_MS; phase += 10) {
-    const h = harness();
-    h.connect(0);  // the last new tick, at 0
-    let shownStale = Infinity;
-    for (let t = 1; t <= 1000 && shownStale === Infinity; t++) {
-      h.at(t);
-      if (t % 100 === 0) h.socket().send(...update(1, {}, false));
-      if (t % RENDER_MS === phase && widgetHtml(render(h), 'Flywheel').includes('STALE'))
-        shownStale = t;
+// Timers on a test clock: `run(t)` fires, in order, every timeout due by t.
+function fakeTimers(clock: {now: number; wall: number}) {
+  let pending: {at: number; fn: () => void; handle: number}[] = [];
+  let next = 0;
+  const timers: Timers = {
+    now: () => clock.now,
+    wall: () => clock.wall,
+    setTimeout: (fn, ms) => {
+      pending.push({at: clock.now + ms, fn, handle: ++next});
+      return next;
+    },
+    clearTimeout: handle => {
+      pending = pending.filter(p => p.handle !== handle);
     }
-    assert.ok(shownStale <= 500,
-              `draw phase ${phase} ms: first stale draw at ${shownStale} ms, bound 500 ms (REQ-OPS-36)`);
+  };
+  const run = (t: number) => {
+    for (;;) {
+      const due = pending.filter(p => p.at <= t).sort((a, b) => a.at - b.at)[0];
+      if (!due) return;
+      pending = pending.filter(p => p !== due);
+      clock.now = due.at;
+      due.fn();
+    }
+  };
+  return {timers, run};
+}
+
+// REQ-OPS-36: a value is shown stale within 500 ms of its last update. The
+// bridge may deliver the producer's last tick up to its 100 ms heartbeat
+// after the tick, so the page's own share must be STALE_MS and not STALE_MS
+// plus a render period. The page draws every RENDER_MS at a phase unrelated
+// to the ticks while the bridge restamps the last tick every 100 ms;
+// whatever the phase, the first stale draw comes STALE_MS (+ STALE_DRAW_LAG_MS)
+// after the last new tick's receipt.
+test('the page draws a stopped value stale at its deadline at any draw phase', () => {
+  for (let phase = 0; phase < RENDER_MS; phase += 7) {
+    const h = harness();
+    const clock = {now: 0, wall: 1e12};
+    h.model.clock = () => clock.now;
+    const {timers, run} = fakeTimers(clock);
+    let shownStale = Infinity;
+    const schedule = new DrawSchedule(h.model, now => {
+      h.model.tick(now);
+      h.clock.now = now;
+      if (shownStale === Infinity && widgetHtml(render(h), 'Flywheel').includes('STALE'))
+        shownStale = now;
+    }, timers);
+    h.connect(0);  // the last new tick, received at 0
+    schedule.frame();
+    for (let t = 1; t <= 1000 && shownStale === Infinity; t++) {
+      run(t);
+      clock.now = clock.wall = t;
+      clock.wall += 1e12;
+      if (t % 100 === 0) h.socket().send(...update(1, {}, false));
+      if (t % RENDER_MS === phase) schedule.frame();
+    }
+    assert.ok(shownStale >= STALE_MS && shownStale <= STALE_MS + STALE_DRAW_LAG_MS,
+              `draw phase ${phase} ms: first stale draw at ${shownStale} ms, deadline ` +
+              `${STALE_MS} ms + ${STALE_DRAW_LAG_MS} ms (REQ-OPS-36: 500 ms with the bridge's 100 ms heartbeat)`);
   }
+});
+
+// REQ-OPS-36: performance.now() may stand still while the laptop sleeps. A
+// draw that finds the wall clock moved more than STALE_MS beyond it shows the
+// values stale until a new tick arrives.
+test('a draw after the page clock stood still across a sleep shows values stale', () => {
+  const h = harness();
+  const clock = {now: 0, wall: 0};
+  const {timers} = fakeTimers(clock);
+  const stale = () => widgetHtml(render(h), 'Flywheel').includes('STALE');
+  const schedule = new DrawSchedule(h.model, now => h.model.tick(now), timers);
+  h.connect(0);
+  schedule.frame();
+  assert.ok(!stale());
+  clock.wall = 60_000;  // a minute asleep; the monotonic clock still reads 0
+  schedule.frame();
+  assert.ok(stale(), 'values read current after the page clock missed a sleep');
+  h.socket().send(...update(2, {}, false));
+  assert.ok(!stale(), 'a new tick after the sleep does not make the values current');
 });
 
 // REQ-OPS-36: on connect the bridge sends a keyframe of the newest tick it

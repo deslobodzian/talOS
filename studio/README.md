@@ -104,8 +104,17 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 
 - Every value is current only while a new telemetry tick (a `sequence_id`
   that advanced) arrived on the current connection within 300 ms; otherwise
-  its widget is dimmed, struck through and tagged STALE, at most 400 ms after
-  the last tick. A channel never received reads "no data", never zero.
+  its widget is dimmed, struck through and tagged STALE. The page draws at
+  that deadline itself (a timer re-armed at every draw, 1 ms after it, plus
+  the browser's timer lateness), not only every 100 ms. Against REQ-OPS-36's
+  500 ms from the producer's last tick: the bridge delivers that tick up to
+  its 100 ms heartbeat late, then 300 ms, plus the network's delay. The page
+  also draws at once when its tab returns to view (a background tab's timers
+  run at most once a second), and when the wall clock moved more than 300 ms
+  further than the page's monotonic clock between two draws (a laptop that
+  slept) it shows every value stale, status TELEMETRY `the page missed
+  time`, until a new tick. A channel never received reads "no data", never
+  zero.
 - The first tick a connection brings never counts: it is the bridge's
   connect-time keyframe, which repeats the newest tick the bridge holds,
   however old. So a reload or a reconnect shows the keyframe's values tagged
