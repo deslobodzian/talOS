@@ -22,6 +22,7 @@
 //                        request counts as kIdle), so a held command runs
 //                        once and press, release, press runs twice
 //   kIntaking  intake_v  piece -> kHolding; kIdle -> kIdle; kEject, kFeed
+//              (neutral while the sensor is invalid)
 //   kHolding   hold_v    kEject, kFeed; piece gone -> kIdle
 //   kEjecting  eject_v   after eject_us -> kIdle
 //   kFeeding   feed_v    after feed_us -> kIdle
@@ -36,9 +37,14 @@
 // the state machine runs as if asked for kIdle: it still tracks the sensor
 // and finishes a timed run, without driving. Losing enable (robot_enabled
 // false: a Driver Station disable, a stale link) also cancels intaking and
-// any timed run, back to kIdle; a held piece stays kHolding. The roller
-// reads no motor feedback: a motor whose feedback is invalid is
-// neutralized by the gateway, not here.
+// any timed run, back to kIdle; a held piece stays kHolding. A piece sensor
+// sample that is not connected() (an input not answering, a gateway
+// configuring, a stale link) is no reading: has_piece() keeps its last valid
+// value, a debounce in progress starts over, and intaking is neutral until
+// the sensor reads again, since a piece may arrive meanwhile; a held piece
+// keeps hold_v and a timed eject or feed runs on. The roller reads no motor
+// feedback: a motor whose feedback is invalid is neutralized by the gateway,
+// not here.
 
 #include <cstdint>
 #include <optional>
@@ -55,7 +61,8 @@ enum class RollerCommand : std::uint8_t { kIdle, kIntake, kEject, kFeed };
 
 enum class RollerPhase : std::uint8_t {
   kIdle,      // neutral
-  kIntaking,  // intake_v until the sensor sees a piece
+  kIntaking,  // intake_v until the sensor sees a piece (neutral while it
+              // cannot be read)
   kHolding,   // hold_v (neutral without one) while the piece stays
   kEjecting,  // eject_v for eject_us
   kFeeding,   // feed_v for feed_us
@@ -76,10 +83,11 @@ class RollerWithSensor {
   void update();
 
   RollerPhase phase() const { return phase_; }
-  // The sensor (after sensor_inverted and sensor_debounce_us), as last
-  // latched: the devices layer keeps the last reading while the link is
-  // stale.
+  // The sensor (after sensor_inverted and sensor_debounce_us) at its last
+  // valid sample; false until the first.
   bool has_piece() const { return has_piece_; }
+  // This tick's sensor sample was valid. While false, has_piece() is the
+  // last valid reading and intaking does not drive.
   bool sensor_connected() const { return sensor_connected_; }
   bool driving() const { return driving_; }
   // The voltage sent this tick (0 when not driving).
