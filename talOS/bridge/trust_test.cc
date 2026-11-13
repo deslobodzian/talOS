@@ -8,14 +8,18 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/bridge/in_process_gateway.h"
 #include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
@@ -23,6 +27,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/config_wire.h"
+#include "talOS/hardware/gate.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/ipc/subscriber.h"
@@ -799,6 +804,222 @@ TEST(HardwareNodeTrustTest,
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kDutyCycle);
   EXPECT_TRUE(node.current_command().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.5);
+}
+
+// The 2026 robot's mix of owner periods: one 5 ms and one 20 ms actuator
+// owner.
+constexpr std::string_view kMixedPeriodsToml = R"(
+[robot]
+name = "rate_robot"
+period_us = 5000
+
+[subsystems.drivetrain]
+period_us = 5000
+
+[subsystems.drivetrain.motors.drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.intake]
+period_us = 20000
+
+[subsystems.intake.motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+)";
+
+// Ticks `node` as Run() does while no input arrives before `until_us`: at
+// each duty NextDutyUs() names before it. `now_us` ends at the last one.
+void TickDutiesBefore(HardwareNode& node, uint64_t& now_us, uint64_t until_us) {
+  for (uint64_t due_us = node.NextDutyUs(now_us); due_us < until_us;
+       due_us = node.NextDutyUs(now_us)) {
+    now_us = due_us;
+    node.Tick(now_us);
+  }
+}
+
+// A disabled robot: every State says the gateway cannot take a command, so
+// each owner flushes neutral requests (NeutralCommand, as the devices layer
+// does), stamped with the latest State each one observed. Between
+// transitions only the merged observation changes. The bridge sends one
+// command per heartbeat (plus the first at once), whatever the owners'
+// phases against the State cadence. Sending every change of the
+// observation made the rate follow the phases: 51 commands a second when
+// both owners observed the same State, 101 when a State landed between the
+// drivetrain's tick and the intake's.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NotReadyCommandRateIsOnePerHeartbeat) {
+  auto cfg = config::ParseRobotConfigString(kMixedPeriodsToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const std::vector<uint16_t>& drive = cfg.subsystems.at("drivetrain").motors;
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  constexpr uint64_t kStartUs = 1'000'000;
+  // The gateway clock runs this far behind the bridge's.
+  constexpr uint64_t kBehindUs = 900'000;
+  constexpr uint64_t kStatePeriodUs = 5'000;
+  constexpr uint64_t kWindowUs = 1'000'000;
+  // Phases are offset from the States' instants by 500 us, so an owner's
+  // tick never coincides with a State's receipt.
+  for (uint64_t drive_phase_us = 500; drive_phase_us < 5'000;
+       drive_phase_us += 1'000) {
+    for (uint64_t intake_phase_us = 500; intake_phase_us < 20'000;
+         intake_phase_us += 1'000) {
+      SCOPED_TRACE(::testing::Message()
+                   << "drivetrain phase " << drive_phase_us
+                   << " us, intake phase " << intake_phase_us << " us");
+      Bridge bridge{cfg};
+      HardwareNode& node = bridge.node;
+      ASSERT_EQ(node.heartbeat_us(), 20'000u);
+      ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+      ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+      State state = TrustState(config_id, 11, 1, 0);
+      state.flags = kConfigured;  // disabled
+      uint64_t now_us = kStartUs;
+      uint64_t next_state_us = kStartUs;
+      uint64_t next_drive_us = kStartUs + drive_phase_us;
+      uint64_t next_intake_us = kStartUs + intake_phase_us;
+      const uint64_t end_us = kStartUs + 20'000 + kWindowUs;
+      for (;;) {
+        const uint64_t event_us =
+            std::min({next_state_us, next_drive_us, next_intake_us});
+        if (event_us > end_us) break;
+        TickDutiesBefore(node, now_us, event_us);
+        now_us = event_us;
+        if (event_us == next_state_us) {
+          state.sample_time_us = now_us - kBehindUs;
+          ASSERT_TRUE(bridge.gateway.Deliver(state, now_us));
+          next_state_us += kStatePeriodUs;
+        }
+        bool published = false;
+        if (event_us == next_drive_us) {
+          PublishCommand(drive_pub, NeutralCommand(state, drive));
+          next_drive_us += 5'000;
+          published = true;
+        }
+        if (event_us == next_intake_us) {
+          PublishCommand(intake_pub, NeutralCommand(state, roller));
+          next_intake_us += 20'000;
+          published = true;
+        }
+        if (published) node.Tick(now_us);
+      }
+      ASSERT_EQ(node.identity_rejected(), 0u);
+
+      std::vector<uint64_t> sent_us;
+      for (const auto& frame : bridge.gateway.TakeSent()) {
+        if (frame.type == protocol::FrameType::kHardwareCommand) {
+          sent_us.push_back(frame.sent_us);
+        }
+      }
+      ASSERT_FALSE(sent_us.empty());
+      const uint64_t first_us = sent_us.front();
+      const auto in_window = std::count_if(
+          sent_us.begin(), sent_us.end(),
+          [first_us](uint64_t us) { return us <= first_us + kWindowUs; });
+      const auto expected =
+          static_cast<std::ptrdiff_t>(1 + (kWindowUs / node.heartbeat_us()));
+      EXPECT_GE(in_window, expected - 1) << "in the second from " << first_us;
+      EXPECT_LE(in_window, expected + 1) << "in the second from " << first_us;
+    }
+  }
+}
+
+// NextDutyUsIsWhenTickNextHasWork (hardware_node_test.cc) on a disabled
+// robot: a request that changes only the merged observation does not send,
+// and NextDutyUs() names the heartbeat that carries it rather than now.
+// Ticking just before each duty does nothing, and each duty it names has
+// work (a frame to the gateway or a /hw/status), so the loop neither sends
+// early nor wakes every millisecond for a send Tick will not make.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Subscriber<bridge::BridgeStatus> statuses{
+      bridge::topics::kStatus,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  constexpr uint64_t kStartUs = 1'000'000;
+  constexpr uint64_t kRequestUs = kStartUs + 7'000;
+  const uint64_t heartbeat_us = node.heartbeat_us();
+  ASSERT_EQ(heartbeat_us, 20'000u);
+
+  State state = TrustState(NodeConfigId(cfg), 11, 1, 1000);
+  state.flags = kConfigured;  // disabled
+  ASSERT_TRUE(gateway.Deliver(state, kStartUs));
+  PublishCommand(pub, NeutralCommand(state, roller));
+  node.Tick(kRequestUs);
+  ASSERT_EQ(node.commands_sent(), 1u);
+  state.sample_time_us = 2000;
+  ASSERT_TRUE(gateway.Deliver(state, kStartUs + 8'000));
+  PublishCommand(pub, NeutralCommand(state, roller));
+  uint64_t now_us = kStartUs + 9'000;
+  node.Tick(now_us);
+  EXPECT_EQ(node.commands_sent(), 1u) << "an observation alone sent at once";
+  gateway.TakeSent();
+  while (statuses.read()) {
+  }
+
+  // Every duty before the intake's owner timeout (at kStartUs + 59'001,
+  // whose Tick changes only the bridge's own merge).
+  std::vector<SentCommand> commands;
+  for (uint64_t due_us = node.NextDutyUs(now_us); due_us < kStartUs + 50'000;
+       due_us = node.NextDutyUs(now_us)) {
+    ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
+    if (due_us - 1 > now_us) {
+      node.Tick(due_us - 1);
+      EXPECT_TRUE(gateway.TakeSent().empty()) << "early, at " << due_us - 1;
+      EXPECT_FALSE(statuses.read()) << "early, at " << due_us - 1;
+    }
+    now_us = due_us;
+    node.Tick(now_us);
+    const auto frames = gateway.TakeSent();
+    const bool status = statuses.read().has_value();
+    EXPECT_TRUE(!frames.empty() || status) << "no work at " << now_us;
+    for (const auto& command : Commands(frames)) {
+      commands.push_back({now_us, command});
+    }
+  }
+
+  ASSERT_EQ(commands.size(), 2u);
+  for (std::size_t i = 0; i < commands.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(commands[i].sent_us, kRequestUs + ((i + 1) * heartbeat_us));
+    EXPECT_EQ(commands[i].command.observed_time_us, 2000u);
+  }
+}
+
+// While the gateway can take a command, a request that changes only the
+// merged observation sends at once: the gateway ages every output from that
+// observation, and holding it for a heartbeat would spend up to 20 ms of the
+// silent-owner tolerance ARCHITECTURE.md "The tick" states.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, ReadyObservationChangeSendsAtOnce) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+  const uint64_t config_id = NodeConfigId(cfg);
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 1000), 1'000'000));
+  PublishCommand(pub, IntakeRequest(cfg, 4.0));
+  node.Tick(1'001'000);
+  ASSERT_EQ(node.commands_sent(), 1u);
+  gateway.TakeSent();
+
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 2000), 1'002'000));
+  Command request = IntakeRequest(cfg, 4.0);
+  request.observed_time_us = 2000;
+  PublishCommand(pub, request);
+  node.Tick(1'003'000);
+  EXPECT_EQ(node.commands_sent(), 2u);
+  const auto commands = Commands(gateway.TakeSent());
+  ASSERT_EQ(commands.size(), 1u);
+  EXPECT_EQ(commands[0].observed_time_us, 2000u);
 }
 
 // The alerts `status` raises, by name, in field order.
