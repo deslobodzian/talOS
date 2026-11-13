@@ -1351,31 +1351,43 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   }
 }
 
+// A robot brought up before its first mechanism has no device at all, and
+// one with only a solenoid has no motor: both cross the wire like any other.
 TEST(ConfigWire, ChunksAndAssemblesConfigLosslessly) {
-  auto cfg = SwerveConfig(false);
-  cfg.motors[1].master_id = cfg.motors[0].id;
-  cfg.motors[1].oppose_master = true;
-  cfg.motors[1].slots[2].gravity_type = GravityType::kArmCosine;
-  for (auto& sensor : cfg.sensors) {
+  auto swerve = SwerveConfig(false);
+  swerve.motors[1].master_id = swerve.motors[0].id;
+  swerve.motors[1].oppose_master = true;
+  swerve.motors[1].slots[2].gravity_type = GravityType::kArmCosine;
+  for (auto& sensor : swerve.sensors) {
     if (sensor.kind != SensorKind::kPigeon2) continue;
     sensor.offset_rot = 0.125;
     sensor.inverted = true;
   }
-  auto chunks = CreateConfigChunks(cfg);
-  EXPECT_GT(chunks.size(), 0u);
-  for (const auto& ch : chunks) {
-    EXPECT_LE(ch.size(), protocol::kMaxPayloadSize);
-  }
+  Config solenoid_only;
+  solenoid_only.digital_outputs.push_back({40, "solenoid", 1});
+  const std::pair<const char*, Config> rows[] = {
+      {"swerve", swerve},
+      {"no device", Config{}},
+      {"a digital output and no motor", solenoid_only},
+  };
+  for (const auto& [label, cfg] : rows) {
+    SCOPED_TRACE(label);
+    auto chunks = CreateConfigChunks(cfg);
+    EXPECT_GT(chunks.size(), 0u);
+    for (const auto& ch : chunks) {
+      EXPECT_LE(ch.size(), protocol::kMaxPayloadSize);
+    }
 
-  ConfigAssembler assembler;
-  std::string err;
-  ConfigAssembler::Status status = ConfigAssembler::Status::kIncomplete;
-  for (const auto& ch : chunks) {
-    status = assembler.AddChunk(ch, err);
+    ConfigAssembler assembler;
+    std::string err;
+    ConfigAssembler::Status status = ConfigAssembler::Status::kIncomplete;
+    for (const auto& ch : chunks) {
+      status = assembler.AddChunk(ch, err);
+    }
+    EXPECT_EQ(status, ConfigAssembler::Status::kComplete) << err;
+    EXPECT_EQ(assembler.config(), cfg);
+    EXPECT_EQ(assembler.config_id(), ConfigurationId(cfg));
   }
-  EXPECT_EQ(status, ConfigAssembler::Status::kComplete);
-  EXPECT_EQ(assembler.config(), cfg);
-  EXPECT_EQ(assembler.config_id(), ConfigurationId(cfg));
 }
 
 TEST(ConfigWire, FullyCappedSerializationMatchesAssemblyLimit) {
@@ -1605,6 +1617,50 @@ TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   EXPECT_TRUE(g.snapshot().flags & kConfigured);
   EXPECT_TRUE(g.snapshot().flags & kEnabled);
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+}
+
+// A robot is brought up (link, Driver Station, telemetry) before its first
+// mechanism: a config with no device, or with a digital output and no motor,
+// configures on either simulated backend, publishes States, enables, and
+// raises no fault, since with no motor or CAN sensor there is no feedback to
+// lose (AnyFeedbackValid). A command for the digital output applies it.
+// REQ-CONTRACT-35
+TEST(Gateway, ARobotWithNoMotorConfiguresAndEnables) {
+  Config solenoid_only;
+  solenoid_only.commissioned = true;
+  solenoid_only.digital_outputs.push_back({40, "solenoid", 1});
+  Config empty;
+  empty.commissioned = true;
+  for (const auto& [label, config] :
+       {std::pair<const char*, Config>{"no device", empty},
+        std::pair<const char*, Config>{"a digital output", solenoid_only}}) {
+    for (const bool physics : {false, true}) {
+      SCOPED_TRACE(std::string{label} + (physics ? ", physics" : ", ideal"));
+      SimBackend ideal;
+      sim::PhysicsSimBackend physical;
+      Backend& backend = physics ? static_cast<Backend&>(physical) : ideal;
+      Gateway g{backend, 1};
+      g.Tick(1000, false);
+      ASSERT_TRUE(g.Reconfigure(config));
+      g.Tick(2000, true);
+      const auto s = g.snapshot();
+      EXPECT_EQ(s.config_id, ConfigurationId(config));
+      EXPECT_EQ(s.motor_count, 0u);
+      EXPECT_EQ(s.flags & (kConfigured | kEnabled | kHardwareFault),
+                kConfigured | kEnabled);
+      Command c = Request(g);
+      c.digital_output_count = config.digital_outputs.size();
+      if (c.digital_output_count > 0) c.digital_outputs[0] = {40, true};
+      EXPECT_TRUE(g.Accept(c, 1, 2000));
+      g.Tick(3000, true);
+      const auto after = g.snapshot();
+      EXPECT_EQ(after.flags & (kCommandActive | kHardwareFault),
+                kCommandActive);
+      if (config.digital_outputs.empty()) continue;
+      ASSERT_TRUE(after.digital_outputs[0].valid);
+      EXPECT_TRUE(after.digital_outputs[0].value);
+    }
+  }
 }
 
 // While a configure runs, or after one fails, the gateway reads no device, so

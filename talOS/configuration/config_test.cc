@@ -202,9 +202,9 @@ can_id = 2
 feedback = "RemoteCANcoder"
 feedback_sensor = "imu"
 )");
-  EXPECT_THROW(
-      ParseRobotConfigString("[subsystems.test.sensors.s]\ncan_id = 1\n"),
-      std::invalid_argument);  // No motors.
+  // A robot with no motor is valid (REQ-CONTRACT-35).
+  EXPECT_NO_THROW(
+      ParseRobotConfigString("[subsystems.test.sensors.s]\ncan_id = 1\n"));
 }
 
 // Every node's Driver Station view expires at command_timeout_us, and a packet
