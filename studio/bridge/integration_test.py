@@ -591,6 +591,86 @@ class BridgeIntegration(unittest.TestCase):
                 for process in processes:
                     self.assertEqual(process.returncode, 0)
 
+    # REQ-OPS-34
+    def test_cache_headers(self):
+        """Hashed assets are cached for good; pages and live JSON are not.
+
+        A browser that cached index.html or drive.html would keep loading
+        the asset names of an old build after a deploy; a hashed asset
+        never changes under its name, so it is cached for a year. A file
+        that is not hashed (a favicon, an unhashed file under assets/) is
+        revalidated like the pages, and the JSON the bridge generates is
+        never stored.
+        """
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        binaries = workspace / "studio/bridge"
+        topic = f"/test/telemetry/c{os.getpid()}"
+        processes = []
+        with tempfile.TemporaryDirectory() as webroot, \
+                tempfile.TemporaryDirectory() as configs:
+            Path(webroot, "index.html").write_text("studio")
+            Path(webroot, "drive.html").write_text("drive")
+            Path(webroot, "favicon.svg").write_text("<svg/>")
+            Path(webroot, "assets").mkdir()
+            # Vite's default name, `<name>-<8-character hash>.<ext>`; the
+            # hash's alphabet includes '-' (a deployed bundle's real name).
+            Path(webroot, "assets", "index-3-nMjUae.js").write_text("hashed")
+            Path(webroot, "assets", "logo.svg").write_text("<svg/>")
+            Path(configs, "robot.toml").write_text(
+                "[robot]\nperiod_us = 5000\n\n"
+                "[studio]\ndashboard = \"dashboard.toml\"\n\n"
+                "[subsystems.alpha]\nnode = \"//test:alpha\"\n")
+            Path(configs, "dashboard.toml").write_text(
+                "[dashboard]\ntitle = \"Pit\"\n\n"
+                "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+                "channel = \"drive/velocity\"\n")
+            try:
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
+                bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic, "0", webroot,
+                                           "--config", str(Path(configs, "robot.toml"))],
+                                          stdout=subprocess.PIPE, text=True)
+                processes.append(bridge)
+                port = bound_port(bridge)
+
+                def cache_control(path):
+                    # The live JSON answers 503 until the mock's dictionary
+                    # and first tick arrive.
+                    deadline = time.monotonic() + 10
+                    while True:
+                        try:
+                            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
+                                                        timeout=3) as response:
+                                return response.headers.get("Cache-Control")
+                        except urllib.error.HTTPError as error:
+                            if error.code != 503 or time.monotonic() > deadline:
+                                raise
+                            time.sleep(0.02)
+
+                immutable = "public, max-age=31536000, immutable"
+                expected = {
+                    "/": "no-cache",
+                    "/index.html": "no-cache",
+                    "/drive": "no-cache",
+                    "/drive.html": "no-cache",
+                    "/favicon.svg": "no-cache",
+                    "/assets/logo.svg": "no-cache",
+                    "/assets/index-3-nMjUae.js": immutable,
+                    "/channels.json": "no-store",
+                    "/telemetry.json": "no-store",
+                    "/system.json": "no-store",
+                    "/drive/layout.json": "no-store",
+                }
+                for path, header in expected.items():
+                    with self.subTest(path=path):
+                        self.assertEqual(cache_control(path), header)
+            finally:
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
     # REQ-RT-21
     def test_sleeps_until_a_publication_or_a_deadline(self):
         """An idle bridge wakes only for its deadlines; a publication wakes it.
