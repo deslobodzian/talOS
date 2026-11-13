@@ -15,8 +15,13 @@ namespace talos::hardware {
 namespace {
 
 constexpr uint16_t kMotorId = 7;
+constexpr uint16_t kOtherMotorId = 8;
 constexpr uint64_t kBootId = 0xB0071DULL;
 
+// The roller and a motor its reset leaves alone, whose valid feedback keeps
+// the roller's restore from being total feedback loss: with the roller alone,
+// the State read while it restores would fault and end every command
+// (SimBackend.RestoringChainIsInvalidAsOnTheRobot).
 Config RollerConfig() {
   Config c;
   c.commissioned = true;
@@ -25,6 +30,10 @@ Config RollerConfig() {
   m.name = "roller";
   m.can_id = 5;
   m.bus = "rio";
+  c.motors.push_back(m);
+  m.id = kOtherMotorId;
+  m.name = "feeder";
+  m.can_id = 6;
   c.motors.push_back(m);
   return c;
 }
@@ -35,8 +44,9 @@ Command FreshCommand(const Gateway& gw, double demand, uint64_t now) {
   c.boot_id = kBootId;
   c.epoch = gw.snapshot().epoch;
   c.observed_time_us = now;
-  c.count = 1;
+  c.count = 2;
   c.motors[0] = MotorRequest{kMotorId, Mode::kVelocity, 0, demand, 0.0};
+  c.motors[1] = MotorRequest{kOtherMotorId};
   return c;
 }
 
@@ -132,15 +142,16 @@ TEST(GatewayScenario, RestoreRetriesTwiceThenResumesWhileEnabled) {
   EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 0);
   gw.Tick(754000, true);
   EXPECT_EQ(backend.restore_attempts, 3);
-  gw.Tick(755000, true);
+  gw.Tick(755000, true);  // Read while restoring, then restored.
+  gw.Tick(756000, true);
   EXPECT_TRUE(gw.configured());
   EXPECT_FALSE(gw.snapshot().flags & kHardwareFault);
   EXPECT_EQ(gw.restore_attempt_count(), 3u);
   EXPECT_EQ(gw.snapshot().counters.device_reset_count, 1u);
   EXPECT_TRUE(gw.snapshot().motors[0].valid);
-  EXPECT_FALSE(gw.Accept(stale, 4, 755000));
-  ASSERT_TRUE(AcceptVel(gw, 10, 755000, 5));
-  gw.Tick(756000, true);
+  EXPECT_FALSE(gw.Accept(stale, 4, 756000));
+  ASSERT_TRUE(AcceptVel(gw, 10, 756000, 5));
+  gw.Tick(757000, true);
   EXPECT_DOUBLE_EQ(gw.snapshot().motors[0].velocity_rps, 10);
 }
 

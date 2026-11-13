@@ -16,6 +16,7 @@ class SimBackend final : public Backend {
   bool Configure(const Config& config) override {
     config_ = config;
     pending_resets_.clear();
+    restoring_.fill(false);
     return true;
   }
   bool Read(State& state) override {
@@ -76,6 +77,7 @@ class SimBackend final : public Backend {
       samples_[i].supply_current_a = std::abs(samples_[i].voltage) / 12.0 *
                                      config_.motors[i].supply_limit_a;
       state.motors[i] = samples_[i];
+      if (restoring_[i]) MarkInvalid(state.motors[i]);
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
       state.sensors[i] = {config_.sensors[i].id, true, 0, 0};
@@ -116,7 +118,7 @@ class SimBackend final : public Backend {
       const auto id = config_.pwm_outputs[i].id;
       state.pwm_outputs[i] = {id, true, pwm_outputs_[id]};
     }
-    return true;
+    return AnyFeedbackValid(state);
   }
   bool Apply(std::span<const MotorRequest> commands) override {
     std::copy(commands.begin(), commands.end(), commands_.begin());
@@ -151,7 +153,9 @@ class SimBackend final : public Backend {
   // device as reset; the gateway restores configuration and drops obsolete
   // demand. Restore clears latched commands without zeroing mechanism
   // positions (documented ideal-fake limit: positions re-acquire from the
-  // next command, they are not re-measured from hardware).
+  // next command, they are not re-measured from hardware). The restored
+  // chain reads invalid until the next PollRestore (RestoredWith), as on the
+  // robot.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
@@ -159,11 +163,16 @@ class SimBackend final : public Backend {
     return !reset_ids.empty();
   }
   void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
-    for (std::size_t i = 0; i < config_.motors.size(); ++i)
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       if (std::find(ids.begin(), ids.end(), config_.motors[i].id) != ids.end())
         commands_[i] = MotorRequest{};
+      if (RestoredWith(config_.motors, i, ids)) restoring_[i] = true;
+    }
   }
-  RestoreStatus PollRestore() override { return RestoreStatus::kDone; }
+  RestoreStatus PollRestore() override {
+    restoring_.fill(false);
+    return RestoreStatus::kDone;
+  }
   // Position demands teleport, so a step says nothing about a reset.
   bool PositionsArePhysical() const override { return false; }
   void SetPowerHealth(double battery_v, bool brownout) {
@@ -197,6 +206,7 @@ class SimBackend final : public Backend {
   std::vector<uint16_t> pending_resets_;
   std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<MotorSample, kMaxMotors> samples_{};
+  std::array<bool, kMaxMotors> restoring_{};
   std::unordered_map<uint16_t, bool> digital_inputs_{};
   std::unordered_map<uint16_t, bool> digital_outputs_{};
   std::unordered_map<uint16_t, double> analog_inputs_{};

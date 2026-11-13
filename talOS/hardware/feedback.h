@@ -1,13 +1,17 @@
 #pragma once
 
 // The gateway's rules for an invalid feedback sample and for total feedback
-// loss. The gateway and testing::SimHardware both call these, so a node test
-// sees what the robot reports for the same condition.
+// loss. The gateway, testing::SimHardware and the simulated backends call
+// these, so a node test and a simulated gateway see what the robot reports
+// for the same condition.
 
 // Relative, as in the rest of the gateway: the RoboRIO's GradleRIO build
 // compiles the gateway with talOS/, not the repository root, on its path.
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <span>
 
 #include "messages.h"
 
@@ -54,6 +58,30 @@ inline bool AnyFeedbackValid(const State& state) {
     if (state.sensors[i].valid) return true;
   }
   return false;
+}
+
+// Whether a restore of `ids` (Backend::BeginRestoreAfterReset) reapplies
+// motor `i`, as PhoenixBackend widens it: a listed motor, a motor fed by a
+// listed remote CANcoder, and a follower of either. PhoenixBackend::Read
+// reports each such motor invalid from that call until PollRestore completes
+// its restore (a failed device stays invalid until a later one does), so the
+// total-loss judgment above sees it; SimBackend and PhysicsSimBackend do the
+// same. A CANcoder's own sample stays valid while it restores.
+inline bool RestoredWith(std::span<const MotorConfig> motors, std::size_t i,
+                         std::span<const uint16_t> ids) {
+  const auto listed = [ids](uint16_t id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+  const auto reapplied = [&listed](const MotorConfig& m) {
+    return listed(m.id) || (m.feedback == Feedback::kRemoteCANcoder &&
+                            listed(m.feedback_sensor_id));
+  };
+  if (reapplied(motors[i])) return true;
+  // Config refuses follower chains, so a master is never a follower.
+  return motors[i].master_id != 0 &&
+         std::any_of(motors.begin(), motors.end(), [&](const MotorConfig& m) {
+           return m.id == motors[i].master_id && reapplied(m);
+         });
 }
 
 }  // namespace talos::hardware

@@ -2221,7 +2221,8 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   ASSERT_FALSE(gateway.snapshot().motors[0].valid);
   EXPECT_EQ(gateway.snapshot().epoch, epoch);
   EXPECT_TRUE(gateway.Accept(stale, 200000, 106000));
-  gateway.Tick(111000, true);
+  gateway.Tick(111000, true);  // Read while restoring, then restored.
+  gateway.Tick(116000, true);
   // Restored where the reset tick left it, past `before` rather than
   // restarted at zero, and the stale demand drives nothing.
   const auto restored = gateway.snapshot().motors[0];
@@ -2229,6 +2230,73 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   EXPECT_GT(restored.position_rot, before);
   EXPECT_DOUBLE_EQ(restored.velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(restored.voltage, 0.0);
+}
+
+// A config of one master and its follower, driving, whose master resets. On
+// the robot PhoenixBackend::Read reports both invalid from the tick after the
+// restore begins until PollRestore completes it, so that State has no valid
+// feedback: total loss, which faults, ends the command in force and starts a
+// new epoch. The next State is healthy again, and only a command of the new
+// epoch drives the pair. A simulated backend must fault the same way.
+template <typename SimulatedBackend>
+void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
+  Config config;
+  config.commissioned = true;
+  MotorConfig master;
+  master.id = 1;
+  master.name = "shooter";
+  master.can_id = 1;
+  MotorConfig follower = master;
+  follower.id = 2;
+  follower.name = "shooter_follower";
+  follower.can_id = 2;
+  follower.master_id = master.id;
+  config.motors = {master, follower};
+  Gateway g{config, backend, 1};
+  const auto drive = [&g](uint64_t sequence, uint64_t now) {
+    auto command = Request(g);
+    for (std::size_t i = 0; i < command.count; ++i) {
+      command.motors[i] = {command.motors[i].id, Mode::kVoltage, 0, 2};
+    }
+    return g.Accept(command, sequence, now);
+  };
+  g.Tick(1000, true);
+  ASSERT_TRUE(drive(1, 1000));
+  const auto epoch = g.snapshot().epoch;
+  backend.SimulateDeviceReset(master.id);
+  g.Tick(2000, true);  // Reset found: the pair neutral, the restore begun.
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  const auto before_loss = Request(g);
+
+  g.Tick(3000, true);  // Read while the pair restores.
+  auto s = g.snapshot();
+  EXPECT_FALSE(s.motors[0].valid);
+  EXPECT_FALSE(s.motors[1].valid);
+  EXPECT_TRUE(s.flags & kHardwareFault);
+  EXPECT_FALSE(s.flags & kCommandActive);
+  EXPECT_EQ(s.epoch, epoch + 1);
+  EXPECT_FALSE(g.Accept(before_loss, 2, 3000));
+
+  g.Tick(4000, true);  // Restored.
+  s = g.snapshot();
+  EXPECT_TRUE(s.motors[0].valid);
+  EXPECT_TRUE(s.motors[1].valid);
+  EXPECT_FALSE(s.flags & kHardwareFault);
+  EXPECT_FALSE(g.Accept(before_loss, 3, 4000));
+  ASSERT_TRUE(drive(4, 4000));
+  g.Tick(5000, true);
+  EXPECT_NE(g.snapshot().motors[0].voltage, 0.0);
+  EXPECT_NE(g.snapshot().motors[1].voltage, 0.0);
+}
+
+TEST(SimBackend, RestoringChainIsInvalidAsOnTheRobot) {
+  SimBackend backend;
+  ExpectRestoringPairIsTotalLoss(backend);
+}
+
+TEST(PhysicsSimBackend, RestoringChainIsInvalidAsOnTheRobot) {
+  sim::PhysicsSimBackend backend;
+  ExpectRestoringPairIsTotalLoss(backend);
 }
 
 // A TalonFX reset restarts its rotor position at zero, and the restarted

@@ -648,6 +648,7 @@ or without a live command. On the real backend, neutral disables PWM pulses
 | Supply voltage | Ignored | Scales free speed (`SetSupplyVoltage`) |
 | Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid, its age growing), per-device disconnect, controller restart |
+| Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it, so a config of only that chain is total feedback loss for that State; completes at the next poll | The same; `SetRestoreFails` fails restores, and the chain stays invalid until one succeeds |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
 ideal backend by default and the physics backend with `--physics` (see
