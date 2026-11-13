@@ -8,11 +8,11 @@
 #include <initializer_list>
 #include <set>
 #include <sstream>
-#include <toml++/toml.hpp>
 #include <utility>
 
 #include "talOS/introspection/names.h"
 #include "talOS/telemetry/wire.h"
+#include "toml.hpp"
 
 namespace talos::telemetry {
 namespace {
