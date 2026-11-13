@@ -22,7 +22,8 @@ const OWNER_TIMED_OUT = 'hw/status/alert_warning_owner_timed_out';
 const ROUTINES = ['preload', 'none', 'shoot_only', 'taxi'];
 
 // The 2026 dictionary as far as the feed carries it: every layout channel
-// plus the /hw/status alert channels the alerts widget adds.
+// (the link-lost alert among them: the bridge always lists it) plus the
+// /hw/status alert channels the alerts widget adds.
 const LABELS: Record<string, string[]> = {
   'hw/state/driver_station/alliance': ['unknown', 'red', 'blue'],
   'hw/state/driver_station/match_type': ['none', 'practice', 'qualification', 'elimination'],
@@ -39,7 +40,7 @@ const DOUBLE = new Set(['hw/state/driver_station/match_time_s', 'hw/status/batte
 const unitOf = (name: string) => name.endsWith('_rps') ? 'rps' : name.endsWith('_v') ? 'V' :
     name.endsWith('_s') ? 's' : name.endsWith('_m') ? 'm' : name.endsWith('_rad') ? 'rad' : '';
 const CHANNELS: ChannelSpec[] = [
-  ...LAYOUT.channels.map(name => ({
+  ...LAYOUT.channels.filter(name => name !== LINK_LOST).map(name => ({
     name, unit: unitOf(name), labels: LABELS[name],
     kind: DOUBLE.has(name) ? ChannelKind.Double : UINT.has(name) ? ChannelKind.UInt :
                              ChannelKind.Bool
@@ -355,7 +356,7 @@ test('the status line names the failed link', () => {
       h.socket().send(...update(2, {[LINK_LOST]: 1}, false));
     }},
     {name: 'RoboRIO link lost, named by a layout without an alerts widget', link: 'roborio',
-     carried: {channels: [...LAYOUT.channels, LINK_LOST], alerts: false}, arrange: h => {
+     carried: {channels: LAYOUT.channels, alerts: false}, arrange: h => {
       h.connect(0);
       h.at(50);
       h.socket().send(...update(2, {[LINK_LOST]: 1}, false));
@@ -366,7 +367,8 @@ test('the status line names the failed link', () => {
     // The feed never carries the channel for this layout, so its absence
     // says nothing about the RoboRIO link.
     {name: 'layout without an alerts widget', link: 'ok',
-     carried: {channels: LAYOUT.channels, alerts: false}, arrange: h => {
+     carried: {channels: LAYOUT.channels.filter(n => n !== LINK_LOST), alerts: false},
+     arrange: h => {
       h.connect(0, WITHOUT_HW_STATUS_ALERTS);
     }},
   ];
