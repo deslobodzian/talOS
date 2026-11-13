@@ -1,4 +1,4 @@
-import {ChannelKind, type ChannelSpec, concatPages, encodeDictionaryPages, encodeValuePages, type PageHeader, rawFromDouble} from './encode';
+import {AlertLevel, ChannelKind, type ChannelSpec, concatPages, encodeDictionaryPages, encodeValuePages, type PageHeader, rawFromDouble} from './encode';
 import {
   type DeclaredGraph,
   type DeclaredNode,
@@ -28,7 +28,41 @@ const DEMO_CHANNELS: ChannelSpec[] = [
   {name: 'sim/state/pose/x_m', unit: 'm'},
   {name: 'sim/state/pose/y_m', unit: 'm'},
   {name: 'sim/state/pose/yaw_rad', unit: 'rad'},
+  // A Driver Station cycling through numbered qualification matches
+  // (demoMatch), and one alert of each level, so the alert views show an
+  // active list, a latch and its reset at the next match without a robot.
+  {name: 'hw/state/driver_station/enabled', unit: '', kind: ChannelKind.Bool},
+  {name: 'hw/state/driver_station/autonomous', unit: '', kind: ChannelKind.Bool},
+  {name: 'hw/state/driver_station/teleop', unit: '', kind: ChannelKind.Bool},
+  {name: 'hw/state/driver_station/match_number', unit: '', kind: ChannelKind.UInt},
+  {name: 'hw/state/driver_station/match_type', unit: '', kind: ChannelKind.UInt,
+   labels: ['none', 'practice', 'qualification', 'elimination']},
+  {name: 'hw/state/driver_station/station', unit: '', kind: ChannelKind.UInt},
+  {name: 'hw/status/alert_error_link_lost', unit: '', kind: ChannelKind.Bool,
+   alert: AlertLevel.Error},
+  {name: 'drivetrain/status/alert_warning_module_offset', unit: '',
+   kind: ChannelKind.Bool, alert: AlertLevel.Warning},
+  {name: 'autonomous/status/alert_info_routine_not_selected', unit: '',
+   kind: ChannelKind.Bool, alert: AlertLevel.Info},
 ];
+
+// One demo match every 60 s at 50 Hz: 5 s disabled, 15 s autonomous, 1 s
+// disabled, 35 s teleop, 4 s disabled. The info alert holds before
+// autonomous, the warning is raised twice (autonomous and teleop) and the
+// error once for 200 ms in teleop.
+const DEMO_MATCH_FRAMES = 3000n;
+function demoMatch(sequence: bigint): bigint[] {
+  const i = Number(sequence % DEMO_MATCH_FRAMES);
+  const auto = i >= 250 && i < 1000, teleop = i >= 1050 && i < 2800;
+  const flag = (on: boolean) => on ? 1n : 0n;
+  return [
+    flag(auto || teleop), flag(auto), flag(teleop),
+    1n + sequence / DEMO_MATCH_FRAMES % 99n, 2n, 1n,
+    flag(i >= 1500 && i < 1510),
+    flag((i >= 400 && i < 450) || (i >= 1800 && i < 1850)),
+    flag(i < 250)
+  ];
+}
 
 // One demo tick as the bridge would send it to a client that has just
 // joined: the dictionary pages (on the first tick of each hundred) followed
@@ -55,7 +89,8 @@ export function demoPacket(sequence: bigint): Uint8Array {
     // The shared decoder turns this into the derived/ pose-error series,
     // exactly as it does for live telemetry and imported recordings.
     ...[x - .12 - .03 * Math.sin(t * .2), y + .08, yaw - .025].map(
-        (value, i): [number, bigint] => [8 + i, rawFromDouble(value)])
+        (value, i): [number, bigint] => [8 + i, rawFromDouble(value)]),
+    ...demoMatch(sequence).map((raw, i): [number, bigint] => [11 + i, raw])
   ];
   const pages = sequence % 100n === 0n ?
       encodeDictionaryPages(header, DEMO_CHANNELS) : [];

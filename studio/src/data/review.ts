@@ -8,6 +8,7 @@
 // 64-bit nanosecond values follow the bridge's convention: a decimal string
 // (data/types.ts), with an integer JSON number also accepted.
 
+import {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import type {ChannelInfo} from './types';
 
 export const DEFAULT_REVIEW_URL = 'http://127.0.0.1:5805';
@@ -105,8 +106,15 @@ export function parseSessions(raw: unknown): ReviewSession[] {
   });
 }
 
-// The bridge's /channels.json shape; the review server adds "alert", which no
-// panel reads yet.
+// An alert level as JSON names it, as "kind" names a kind: "info",
+// "warning" or "error"; "none" or no field is no alert.
+const ALERT_LEVELS: Record<string, AlertLevel> = {
+  none: AlertLevel.None, info: AlertLevel.Info, warning: AlertLevel.Warning,
+  error: AlertLevel.Error
+};
+
+// The bridge's /channels.json shape, plus the optional "alert" level the
+// review server adds.
 export function parseChannels(raw: unknown): ChannelInfo[] {
   const source = record(raw, 'channels.json');
   const channels = source.channels;
@@ -117,10 +125,14 @@ export function parseChannels(raw: unknown): ChannelInfo[] {
     const labels = c.labels ?? [];
     if (!Array.isArray(labels) || labels.some(l => typeof l !== 'string'))
       fail(`${where}.labels must be an array of strings`);
+    const alertName = c.alert ?? 'none';
+    const alert = typeof alertName === 'string' && Object.hasOwn(ALERT_LEVELS, alertName) ?
+        ALERT_LEVELS[alertName] : fail(`${where}.alert must be none, info, warning or error`);
     return {
       name: str(c, 'name', where),
       unit: str(c, 'unit', where),
-      labels: labels as string[]
+      labels: labels as string[],
+      ...(alert !== AlertLevel.None ? {alert} : {})
     };
   });
 }

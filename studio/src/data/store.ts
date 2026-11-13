@@ -29,6 +29,8 @@ import type {
   SeriesWindow
 } from './types';
 import {EventEngine} from './events';
+import {type AlertLatch, AlertTracker} from './alerts';
+import type {AlertLevel} from '../generated/talos/telemetry/alert-level';
 
 // The worker's Timeline capacity (core.ts Timeline defaults to 30000); the
 // cache never holds more frames than the timeline it mirrors.
@@ -89,6 +91,7 @@ export class TelemetryStore {
   private readonly dictionaries = new Map<string, {
     infos: Map<string, ChannelInfo>;
     kinds: Readonly<Record<string, ChannelKind>>|undefined;
+    alerts: Readonly<Record<string, AlertLevel>>|undefined;
     frames: number;
   }>();
   private readonly channelReferences = new Map<string, number>();
@@ -100,6 +103,9 @@ export class TelemetryStore {
   private origin: bigint|null = null;
 
   private readonly eventEngine: EventEngine;
+  // Fed every frame in order, so its latch spans more than the retained
+  // history; replaced with the history (a reset).
+  private readonly alertTracker = new AlertTracker();
   private bands: ModeBand[] = [];
   private bandMode: DriverStationMode|null = null;
 
@@ -276,6 +282,12 @@ export class TelemetryStore {
     return this.bands;
   }
 
+  // Every alert raised since the current match began, as of the newest frame
+  // (data/alerts.ts), whatever the cursor.
+  alertLatch(): AlertLatch {
+    return this.alertTracker.latch();
+  }
+
   // --- internals ------------------------------------------------------------
 
   private phys(index: number): number {
@@ -336,7 +348,8 @@ export class TelemetryStore {
       channels,
       ...(dictionary.kinds ? {exact, kinds: dictionary.kinds} : {}),
       units,
-      labels
+      labels,
+      ...(dictionary.alerts ? {alerts: dictionary.alerts} : {})
     };
   }
 
@@ -354,14 +367,18 @@ export class TelemetryStore {
     const key = dictionaryKey(frame);
     let dictionary = this.dictionaries.get(key);
     if (!dictionary) {
-      dictionary = {infos: new Map(), kinds: frame.kinds, frames: 0};
+      dictionary = {infos: new Map(), kinds: frame.kinds, alerts: frame.alerts,
+                    frames: 0};
       this.dictionaries.set(key, dictionary);
     }
     dictionary.frames++;
     // Units declare channels even when their current reading is absent.
     for (const name of new Set([...Object.keys(frame.units), ...Object.keys(frame.channels)])) {
       if (dictionary.infos.has(name)) continue;
-      const info = {name, unit: frame.units[name] ?? '', labels: frame.labels[name] ?? []};
+      const alert = frame.alerts?.[name];
+      const info: ChannelInfo = {name, unit: frame.units[name] ?? '',
+                                 labels: frame.labels[name] ?? [],
+                                 ...(alert ? {alert} : {})};
       dictionary.infos.set(name, info);
       this.channelReferences.set(name, (this.channelReferences.get(name) ?? 0) + 1);
       this.infos.set(name, info);
@@ -416,6 +433,7 @@ export class TelemetryStore {
     }
 
     this.eventEngine.pushFrame(frame);
+    this.alertTracker.push(frame);
     this.updateBands(frame, this.streamStarts[slot] === 1);
   }
 
@@ -453,6 +471,7 @@ export class TelemetryStore {
     this.bands = [];
     this.bandMode = null;
     this.eventEngine.clear();
+    this.alertTracker.reset();
   }
 
   private trimHistory() {

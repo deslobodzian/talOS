@@ -12,6 +12,7 @@
 // Plot axes use float seconds relative to an explicit origin.
 
 import type {Mode, Snapshot} from '../core';
+import type {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import type {DeclaredGraph, SystemGraph} from '../system';
 
 export type {Mode, Snapshot};
@@ -54,8 +55,12 @@ export type SystemState = {
   declaredError: string;
 };
 
-// One telemetry channel as the current dictionary declares it.
-export type ChannelInfo = {name: string; unit: string; labels: string[]};
+// One telemetry channel as the current dictionary declares it. `alert` is the
+// level of an alert channel (a status `bool` named alert_<level>_<name>, active
+// while true; the producer sets it, Studio never parses the name); absent on
+// every other channel, which is AlertLevel.None.
+export type ChannelInfo =
+    {name: string; unit: string; labels: string[]; alert?: AlertLevel};
 
 // Columnar history for plotting. `times` are seconds since `t0_ns`, strictly
 // ascending; each value array is index-aligned with `times` and holds NaN

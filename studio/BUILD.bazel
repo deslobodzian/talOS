@@ -108,6 +108,7 @@ js_binary(
 # the C++ launcher really produced, so a change to its envelope fails here.
 STUDIO_TESTS = {
     "agent_test": "agent.test.ts",
+    "alerts_test": "alerts.test.ts",
     "commands_test": "commands.test.ts",
     "core_test": "core.test.ts",
     "declared_test": "declared.test.ts",

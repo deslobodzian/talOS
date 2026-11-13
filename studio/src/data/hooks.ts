@@ -10,6 +10,7 @@
 import {useMemo, useSyncExternalStore} from 'react';
 
 import type {Pose, Snapshot} from '../core';
+import type {AlertLatch} from './alerts';
 import type {RecordedSource} from './recorded';
 import type {DataSource, SourceKind} from './source';
 import {useStudio} from './studio';
@@ -129,6 +130,15 @@ export function useModeBands(): ModeBand[] {
   const studio = useStudio();
   return useSyncExternalStore(
       studio.subscribe, () => studio.source.modeBands(), () => studio.source.modeBands());
+}
+
+// Every alert raised since the current match began (data/alerts.ts); null for
+// a source that cannot know it.
+export function useAlertLatch(): AlertLatch|null {
+  const studio = useStudio();
+  return useSyncExternalStore(
+      studio.subscribe, () => studio.source.alertLatch(),
+      () => studio.source.alertLatch());
 }
 
 export function useManifest(): {manifest: SessionManifest|null; error: string} {

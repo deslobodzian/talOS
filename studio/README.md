@@ -64,6 +64,20 @@ way are ignored until another stream appears. A new stream whose timestamps
 start behind the history (a simulated or replayed clock) also replaces it.
 With no graph naming the session (no registry), a restart always continues it.
 
+### Alerts
+
+An alert channel is one the telemetry dictionary marks with a level
+(`ChannelInfo.alert`). The Robot panel's Alerts card lists the alerts active
+at the cursor by level, then name, each tagged with its level as a word and a
+glyph, and below them every alert raised since the current match began, with
+when it was first raised and how many times. A channel with no reading is
+neither active nor clear. The store feeds every frame to the latch, so it
+spans more than the retained history and holds as of the newest frame; a new
+connection, demo or import clears it. When a match begins, and what the model
+guarantees for a short activation, is in
+[`src/data/alerts.ts`](src/data/alerts.ts). The demo cycles through numbered
+matches with one alert of each level.
+
 ## Add a panel
 
 1. Write `src/panels/<id>/index.tsx`, exporting a
@@ -138,7 +152,7 @@ shown in the footer with **Retry**; panels keep what they last showed.
 |---|---|
 | Plot | Each channel decimated to the plot's pixel width rounded up to 256, 512, 1024, 2048 or 4096 buckets (so a plot wider than 4096 px gets fewer buckets than pixels), so resizing a plot requests again only where it crosses one, and fetched in as many requests as the server's limit on channels × buckets (its `bounds.json`) needs: the line is each bucket's last sample, at that sample's own publication time, and a bucket of more than one sample also draws its min-to-max range. The window ends at the playhead; "All history" is the session from its start to the playhead. |
 | Field | The pose estimator's pose at the playhead (no pose while its `valid` is false), the trail and camera observations over the window. |
-| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings); the system graph, events and node selections are live-only and show as absent. |
+| Robot | Every reading at the playhead, stale as live when its sample is a second or more older than the snapshot it came from (the snapshot's own time, as live measures against its frame's: a snapshot still trailing a playing playhead does not age its readings), and the alerts active there; the system graph, events, node selections and the alert latch are live-only and show as absent. |
 | Every other panel | "Not available for recorded sessions yet." |
 
 Values carry the channel names live telemetry uses. The chassis pose differs:
