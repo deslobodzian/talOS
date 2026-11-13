@@ -3,7 +3,8 @@
 # Run RULES.md 11's pre-push checks on a clean worktree of the commits to
 # push, under CI's conditions: tracked files read-only (CI's own step,
 # tools/make_sources_read_only.py), nothing untracked or uncommitted from the
-# checkout, and every test result fresh. docs/DEVELOPMENT.md §5 rung 3.
+# checkout, every test result fresh, and no header read from the host's
+# include tree (tools/check_host_includes.py). docs/DEVELOPMENT.md §5 rung 3.
 #
 #   tools/prepush.sh [--ref <commit>] [--keep] [--skip-gradle] [--skip-studio]
 #
@@ -12,7 +13,7 @@
 #   --skip-gradle  do not run the RoboRIO program's gradle checks
 #   --skip-studio  do not run Studio's pnpm checks
 #
-# Steps, in order: read-only, `bazel build //...`, `bazel test
+# Steps, in order: read-only, `bazel build //...`, host-includes, `bazel test
 # --nocache_test_results //...`, checkout-unchanged; then, when the commits
 # to push (@{upstream}..<ref>, or every file if the branch has no upstream)
 # touch them: gradle (`phoenixTest buildRio -Pheadless --offline`, for
@@ -143,9 +144,12 @@ run_step read-only python3 "$tools/make_sources_read_only.py" || {
 
 bazel_started=1
 if run_step build bazel build //... --noshow_progress "--disk_cache=$disk_cache"; then
+  run_step host-includes sh -c \
+    'python3 "$1" "$(bazel info output_path)"' _ "$tools/check_host_includes.py" || true
   run_step test bazel test //... --noshow_progress --test_output=errors \
     --nocache_test_results "--disk_cache=$disk_cache" || true
 else
+  skip host-includes "the build failed"
   skip test "the build failed"
 fi
 run_step checkout-unchanged sh -c \

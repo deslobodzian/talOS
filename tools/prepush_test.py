@@ -17,6 +17,8 @@ import unittest
 
 from python.runfiles import runfiles
 
+DEPFILE = "x.o: x.cc /usr/include/stdio.h\n"
+
 
 def put(path, text, mode=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -37,6 +39,8 @@ class PrepushTest(unittest.TestCase):
         self.tmpdir = os.path.join(self.tmp, "tmp")
         os.makedirs(self.tmpdir)
         self.log = os.path.join(self.tmp, "bazel_calls")
+        self.out_path = os.path.join(self.tmp, "bazel-out")
+        put(os.path.join(self.out_path, "x.d"), DEPFILE)
 
         # Each call records its working directory, its arguments, and
         # whether the tracked file is writable there; STUB_FAIL fails that
@@ -46,6 +50,7 @@ class PrepushTest(unittest.TestCase):
             "#!/bin/sh\n"
             'if [ -w src/a.txt ]; then mode=writable; else mode=read-only; fi\n'
             f'echo "$PWD|$mode|$*" >> {shlex.quote(self.log)}\n'
+            f'[ "$1" = info ] && echo {shlex.quote(self.out_path)}\n'
             '[ "$1" = "${STUB_FAIL:-}" ] && { echo "stub: $1 failed"; exit 1; }\n'
             "exit 0\n",
             0o755)
@@ -104,13 +109,18 @@ class PrepushTest(unittest.TestCase):
             self.assertEqual(mode, "read-only", f"{step} ran on writable sources")
             self.assertIn("//...", args.split())
         self.assertIn("--nocache_test_results", steps["test"][2].split())
+        self.assertIn("prepush: host-includes ok", out)
         self.assertIn("prepush: test ok", out)
         self.assert_cleaned_up()
 
     # REQ-DEV-25
     def test_a_failing_step_fails_the_run_naming_it(self):
+        put(os.path.join(self.out_path, "y.d"),
+            "y.o: y.cc /usr/include/toml++/toml.hpp\n")
         status, out, _ = self.prepush(STUB_FAIL="test")
         self.assertNotEqual(status, 0, out)
+        self.assertIn("prepush: host-includes FAILED", out)
+        self.assertIn("y.cc: /usr/include/toml++/toml.hpp", out)
         self.assertIn("prepush: test FAILED", out)
         self.assertIn("prepush: build ok", out)
         self.assert_cleaned_up()
