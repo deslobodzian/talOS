@@ -176,6 +176,7 @@ Automated checks that keep the architecture honest.
 | `tools/check_links.py` (CI lint job) | every relative markdown link and `#anchor` resolves |
 | `tools/trace.py --check` (CI lint job) | every `REQ-` tag names a catalogue requirement; every SAFE, CONTRACT and P0 requirement has a tagged test or cites a bench section or open TODO.md item; quarantines are dated and unexpired; every Bazel package is in the package scope table; its waiver list only shrinks |
 | `check_runfiles_collisions.py`, read-only sources and "checkout unchanged" in CI | the build never writes the source tree |
+| `tools/prepush.sh` (read-only sources, uncached tests, `check_host_includes.py`) | a push meets CI's conditions before CI runs: no test writes a source file or its mode-preserving copy, no compile reads a host package header (REQ-DEV-25) |
 | `clang-format-18`, `clang-tidy-18`, `buildifier` on changed files | style and bug-prone patterns |
 | `input_replay_test`, `replay_inputs_test`, the `*Binary` replay cases | a node is a function of its inputs and their times |
 
