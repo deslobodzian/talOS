@@ -331,8 +331,10 @@ the final manifest. systemd SIGKILLs whatever remains once the launcher
 exits, or at `TimeoutStopSec=90`: 90 s against the launcher's 2 s, so the
 launcher's own escalation and its final write always come first. systemd's
 default, `KillMode=control-group`, would SIGTERM every member as well, and
-a member still starting, not yet handling a stop, would die of a signal the
-launcher did not send, ending the session 255 and the unit failed. launchd
+a member that does not hold a stop while starting (`hardware_node`, the
+simulated gateway, the Studio bridge: none declares `holds_stop`; a
+framework node holds it) would die of a signal the launcher did not send,
+ending the session 255 and the unit failed. launchd
 needs no such setting: stopping the job (`launchctl bootout`) sends SIGTERM
 to the launcher's process alone, SIGKILL after its `ExitTimeOut` (not set
 in the plist, so launchd's system-defined default; `man launchd.plist`),
