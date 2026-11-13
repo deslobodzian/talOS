@@ -2,7 +2,7 @@
 // panel-type switcher), the split/maximize/close actions, and the panel's
 // body. The switcher lists panels grouped by category with descriptions.
 
-import {useState} from 'react';
+import {useEffect, useState} from 'react';
 
 import {panelsByCategory} from '../panels/registry';
 import type {PanelCategory} from '../panels/types';
@@ -22,6 +22,15 @@ export function PanelChrome({panelId, title, category, subtitle, onSwitch, onSpl
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open]);
 
   return <section className="panel-shell" onPointerDownCapture={onInteract}
                   onFocusCapture={onInteract}>

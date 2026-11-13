@@ -12,6 +12,9 @@
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <limits>
+#include <string>
+
+#include "hardware/gate.h"
 
 namespace ph = ctre::phoenix6;
 namespace hw = talos::hardware;
@@ -31,15 +34,106 @@ void SetGains(Slot& slot, const hw::Gains& gains) {
                          ? ph::signals::GravityTypeValue::Arm_Cosine
                          : ph::signals::GravityTypeValue::Elevator_Static;
 }
-bool Fresh(const ph::BaseStatusSignal& signal) {
+// Diagnostics only (effort, fault field, temperature). Motion feedback is not
+// held to an age here: Read reports its ages and the gateway judges them
+// (Backend::Read, FeedbackFresh).
+bool Fresh(const ph::BaseStatusSignal& signal,
+           units::second_t max_age = 50_ms) {
   return signal.GetStatus().IsOK() &&
-         signal.GetTimestamp().GetLatency() < 50_ms;
+         signal.GetTimestamp().GetLatency() < max_age;
 }
+// One clock_gettime(CLOCK_MONOTONIC) per phase boundary of the tick.
+uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+// Adds the time from construction to destruction to `phase`, for a call
+// with several returns.
+class PhaseTimer {
+ public:
+  PhaseTimer(talos::rio::RioLog& log, talos::rio::TickPhase phase)
+      : log_{log}, phase_{phase}, start_ns_{NowNs()} {}
+  ~PhaseTimer() { log_.AddPhase(phase_, NowNs() - start_ns_); }
+  PhaseTimer(const PhaseTimer&) = delete;
+  PhaseTimer& operator=(const PhaseTimer&) = delete;
+
+ private:
+  talos::rio::RioLog& log_;
+  talos::rio::TickPhase phase_;
+  uint64_t start_ns_;
+};
 uint32_t Age(const ph::BaseStatusSignal& signal) {
   const double age = signal.GetTimestamp().GetLatency().value() * 1e6;
   if (!std::isfinite(age) || age >= std::numeric_limits<uint32_t>::max())
     return std::numeric_limits<uint32_t>::max();
   return static_cast<uint32_t>(std::max(0.0, std::ceil(age)));
+}
+// Apply's follower check, between the gateway's judgements: the master's or
+// the follower's own (or remote) feedback, by the gateway's rule.
+template <typename Position, typename Velocity>
+bool ValidMotionFeedback(const Position& position, const Velocity& velocity,
+                         uint64_t command_timeout_us) {
+  return position.GetStatus().IsOK() && velocity.GetStatus().IsOK() &&
+         hw::FeedbackFresh(Age(position), command_timeout_us) &&
+         hw::FeedbackFresh(Age(velocity), command_timeout_us) &&
+         std::isfinite(position.GetValue().value()) &&
+         std::isfinite(velocity.GetValue().value());
+}
+
+// Posts a feedback validity change: the loop thread only copies it.
+void LogFeedbackChange(talos::rio::RioLog& log, talos::rio::LogKind kind,
+                       std::size_t index, const std::string& name, uint16_t id,
+                       const std::string& bus, int can_id, bool valid,
+                       const ph::BaseStatusSignal& p,
+                       const ph::BaseStatusSignal& v) {
+  talos::rio::LogEvent event;
+  event.kind = kind;
+  event.index = static_cast<uint16_t>(index);
+  event.id = id;
+  event.can_id = can_id;
+  event.flag = valid;
+  event.status = p.GetStatus().GetName();
+  event.status2 = v.GetStatus().GetName();
+  event.age_us = Age(p);
+  event.age2_us = Age(v);
+  event.SetName(name);
+  event.SetBus(bus);
+  log.Post(event);
+}
+
+// Posts LATE when the older of a device's position and velocity samples
+// reaches `late_us` (four status periods), and ON TIME, with the oldest age of
+// that spell, once both are younger again: a CAN silence shorter than the
+// gateway's bound changes no validity, so this line is what shows it.
+// Loop thread: a copy into the queue, never a write.
+void NoteLateness(talos::rio::RioLog& log, talos::rio::LogKind kind,
+                  std::size_t index, const std::string& name, uint16_t id,
+                  const std::string& bus, int can_id, uint32_t late_us,
+                  const ph::BaseStatusSignal& p, const ph::BaseStatusSignal& v,
+                  bool& late, uint32_t& peak_age_us) {
+  const uint32_t age_us = std::max(Age(p), Age(v));
+  const bool now_late = age_us >= late_us;
+  if (now_late) peak_age_us = std::max(peak_age_us, age_us);
+  if (now_late == late) return;
+  talos::rio::LogEvent event;
+  event.kind = kind;
+  event.index = static_cast<uint16_t>(index);
+  event.id = id;
+  event.can_id = can_id;
+  event.flag = now_late;
+  event.value = peak_age_us;
+  event.previous = late_us;
+  event.status = p.GetStatus().GetName();
+  event.status2 = v.GetStatus().GetName();
+  event.age_us = Age(p);
+  event.age2_us = Age(v);
+  event.SetName(name);
+  event.SetBus(bus);
+  log.Post(event);
+  late = now_late;
+  if (!now_late) peak_age_us = 0;
 }
 
 // A config apply or a signal-rate change can miss its reply window while a
@@ -54,26 +148,80 @@ ctre::phoenix::StatusCode Retry(Call call) {
   }
   return status;
 }
+
+// Desktop-sim neutral decay time constants (rotor velocity, first order).
+// Neutral removes drive but keeps momentum: brake shorts the windings and
+// stops the rotor quickly, coast lets the load roll on. Matches the unpowered
+// branch of talos::hardware::sim::StepAxis (talOS/hardware/sim_physics.h), so
+// disable-time behaviour agrees between the two simulators.
+constexpr double kSimNeutralBrakeTauS = 0.05;
+constexpr double kSimNeutralCoastTauS = 1.0;
+// Friction holds a nearly-stopped unpowered rotor instead of creeping forever
+// (same standstill snap as StepAxis).
+constexpr double kSimNeutralStandstillRps = 0.01;
+// RioLog kMessage index of the configure-failure line (its rate-limit key).
+constexpr uint16_t kConfigureFailedMessage = 0;
 }  // namespace
 
-PhoenixBackend::PhoenixBackend(bool is_simulation)
-    : is_simulation_{is_simulation} {}
+PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
+    : owned_log_{log ? nullptr : std::make_unique<talos::rio::RioLog>()},
+      log_{log ? log : owned_log_.get()},
+      is_simulation_{is_simulation} {
+  if (owned_log_) owned_log_->Start();
+}
 
 std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
   return last_error_;
 }
 
+void PhoenixBackend::BeginConfigure(const hw::Config& config) {
+  configure_ = std::async(std::launch::async,
+                          [this, config] { return Configure(config); });
+}
+
+PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
+  if (!configure_.valid()) return ConfigureStatus::kFailed;
+  if (configure_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
+    return ConfigureStatus::kPending;
+  return configure_.get() ? ConfigureStatus::kDone : ConfigureStatus::kFailed;
+}
+
 bool PhoenixBackend::Configure(const hw::Config& c) {
+  const std::lock_guard devices_lock{devices_mutex_};
   hw::Validate(c);
   restore_operations_.clear();
+  unavailable_.clear();
+  signal_ids_.clear();
   last_error_.reset();
+  last_fault_flags_.fill(0);
+  last_motor_valid_.fill(true);
+  last_sensor_valid_.fill(true);
+  motor_late_.fill(false);
+  motor_peak_age_us_.fill(0);
+  sensor_late_.fill(false);
+  sensor_peak_age_us_.fill(0);
+  last_motor_fault_mask_ = 0;
+  neutral_send_failing_.fill(false);
+  apply_failing_.fill(false);
+  apply_failed_.clear();
+  apply_failed_.reserve(c.motors.size());
+  last_brownout_ = false;
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
   const auto note_failure = [this](const std::string& name,
                                    const std::string& bus, int can_id,
                                    const std::string& operation,
                                    const ctre::phoenix::StatusCode& code) {
-    if (code.IsOK() || last_error_.has_value()) return code.IsOK();
+    if (code.IsOK()) return true;
+    uint16_t id = 0;
+    for (const auto& m : config_.motors)
+      if (m.name == name) id = m.id;
+    for (const auto& s : config_.sensors)
+      if (s.name == name) id = s.id;
+    if (id != 0 && std::find(unavailable_.begin(), unavailable_.end(), id) ==
+                       unavailable_.end())
+      unavailable_.push_back(id);
+    if (last_error_.has_value()) return false;
     hw::ConfigError err;
     err.device_name = name;
     err.bus = bus;
@@ -97,7 +245,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   sim_rotor_velocity_.fill(0.0);
   sim_rotor_position_.fill(0.0);
   motor_to_sensor_map_.fill(-1);
-  last_commands_.fill(hw::MotorRequest{});
+  sim_neutral_.fill(true);
   sim_yaw_deg_ = 0.0;
   last_sim_time_ = std::nullopt;
 
@@ -144,9 +292,11 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_cancoder_config",
           Retry([&] { return device.encoder->GetConfigurator().Apply(cfg); }));
-      restore_operations_.push_back([ptr = device.encoder.get(), cfg] {
-        return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
-      });
+      restore_operations_.push_back(
+          {s.id, [ptr = device.encoder.get(), cfg] {
+             return Retry([&] { return ptr->GetConfigurator().Apply(cfg); })
+                 .IsOK();
+           }});
       signals_.push_back(&device.encoder->GetAbsolutePosition(false));
       signals_.push_back(&device.encoder->GetVelocity(false));
     } else {
@@ -157,12 +307,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
       ok &= note_failure(
           s.name, s.bus, s.can_id, "apply_pigeon2_config",
           Retry([&] { return device.imu->GetConfigurator().Apply(cfg); }));
-      restore_operations_.push_back([ptr = device.imu.get(), cfg] {
-        return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
-      });
+      restore_operations_.push_back(
+          {s.id, [ptr = device.imu.get(), cfg] {
+             return Retry([&] { return ptr->GetConfigurator().Apply(cfg); })
+                 .IsOK();
+           }});
       signals_.push_back(&device.imu->GetYaw(false));
       signals_.push_back(&device.imu->GetAngularVelocityZWorld(false));
     }
+    signal_ids_.push_back(s.id);
+    signal_ids_.push_back(s.id);
     sensors_.push_back(std::move(device));
   }
   for (const auto& m : c.motors) {
@@ -179,6 +333,9 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     cfg.CurrentLimits.SupplyCurrentLimit = units::ampere_t{m.supply_limit_a};
     cfg.CurrentLimits.StatorCurrentLimitEnable = true;
     cfg.CurrentLimits.StatorCurrentLimit = units::ampere_t{m.stator_limit_a};
+    // The gateway applies the config on every session start; no beep for it.
+    // The boot beep stays: it is how a power cycle is heard.
+    cfg.Audio.BeepOnConfig = false;
     cfg.Voltage.PeakForwardVoltage = units::volt_t{m.max_voltage};
     cfg.Voltage.PeakReverseVoltage = units::volt_t{-m.max_voltage};
     cfg.Feedback.RotorToSensorRatio = m.rotor_to_sensor_ratio;
@@ -197,6 +354,25 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
         units::turn_t{m.forward_limit_rot};
     cfg.SoftwareLimitSwitch.ReverseSoftLimitThreshold =
         units::turn_t{m.reverse_limit_rot};
+    // Switches on the TalonFX's own limit pins; the defaults (enabled,
+    // normally open) are Phoenix's, so an unconfigured motor is unchanged.
+    auto& limits = cfg.HardwareLimitSwitch;
+    limits.ForwardLimitSource =
+        ph::signals::ForwardLimitSourceValue::LimitSwitchPin;
+    limits.ForwardLimitEnable =
+        m.forward_limit_switch != hw::LimitSwitch::kDisabled;
+    limits.ForwardLimitType =
+        m.forward_limit_switch == hw::LimitSwitch::kNormallyClosed
+            ? ph::signals::ForwardLimitTypeValue::NormallyClosed
+            : ph::signals::ForwardLimitTypeValue::NormallyOpen;
+    limits.ReverseLimitSource =
+        ph::signals::ReverseLimitSourceValue::LimitSwitchPin;
+    limits.ReverseLimitEnable =
+        m.reverse_limit_switch != hw::LimitSwitch::kDisabled;
+    limits.ReverseLimitType =
+        m.reverse_limit_switch == hw::LimitSwitch::kNormallyClosed
+            ? ph::signals::ReverseLimitTypeValue::NormallyClosed
+            : ph::signals::ReverseLimitTypeValue::NormallyOpen;
     cfg.MotionMagic.MotionMagicCruiseVelocity =
         units::turns_per_second_t{m.cruise_velocity_rps};
     cfg.MotionMagic.MotionMagicAcceleration =
@@ -209,14 +385,19 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     ok &= note_failure(
         m.name, m.bus, m.can_id, "apply_talonfx_config",
         Retry([&] { return motor->GetConfigurator().Apply(cfg); }));
-    restore_operations_.push_back([ptr = motor.get(), cfg] {
-      return Retry([&] { return ptr->GetConfigurator().Apply(cfg); }).IsOK();
-    });
+    restore_operations_.push_back(
+        {m.id, [ptr = motor.get(), cfg] {
+           return Retry([&] { return ptr->GetConfigurator().Apply(cfg); })
+               .IsOK();
+         }});
     signals_.push_back(&motor->GetPosition(false));
     signals_.push_back(&motor->GetVelocity(false));
     signals_.push_back(&motor->GetMotorVoltage(false));
     signals_.push_back(&motor->GetStatorCurrent(false));
     signals_.push_back(&motor->GetFaultField(false));
+    signals_.push_back(&motor->GetDeviceTemp(false));
+    signals_.push_back(&motor->GetSupplyCurrent(false));
+    for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
     motors_.push_back(std::move(motor));
   }
 
@@ -254,69 +435,153 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     }
   }
 
-  for (auto* signal : signals_) {
-    const auto code = Retry([&] {
-      return signal->SetUpdateFrequency(units::hertz_t{c.status_hz});
-    });
-    ok &= note_failure("signal_rates", "", -1, "set_signal_frequency", code);
-    restore_operations_.push_back([signal, hz = c.status_hz] {
+  for (std::size_t i = 0; i < signals_.size(); ++i) {
+    auto* signal = signals_[i];
+    const uint16_t id = signal_ids_[i];
+    double hz = c.status_hz;
+    std::string name, bus;
+    int can_id = -1;
+    for (const auto& m : c.motors) {
+      if (m.id != id) continue;
+      name = m.name;
+      bus = m.bus;
+      can_id = m.can_id;
+      // Diagnostics request lower rates, but Phoenix applies the highest
+      // requested rate to every signal sharing a status frame. In SDK 26.3,
+      // StatorCurrent, SupplyCurrent and DeviceTemp are SupplyAndTemp SPNs.
+      auto& motor = *motors_[&m - c.motors.data()];
+      if (signal == &motor.GetMotorVoltage(false) ||
+          signal == &motor.GetStatorCurrent(false) ||
+          signal == &motor.GetSupplyCurrent(false) ||
+          signal == &motor.GetFaultField(false))
+        hz = std::min(hz, 50.0);
+      if (signal == &motor.GetDeviceTemp(false)) hz = std::min(hz, 4.0);
+    }
+    for (const auto& s : c.sensors) {
+      if (s.id != id) continue;
+      name = s.name;
+      bus = s.bus;
+      can_id = s.can_id;
+    }
+    const auto operation = [signal, hz] {
       return Retry(
-                 [&] { return signal->SetUpdateFrequency(units::hertz_t{hz}); })
-          .IsOK();
-    });
-  }
-  for (auto& motor : motors_) {
-    const auto code = Retry([&] { return motor->OptimizeBusUtilization(); });
-    ok &=
-        note_failure("signal_rates", "", -1, "optimize_bus_utilization", code);
-    restore_operations_.push_back([ptr = motor.get()] {
-      return Retry([&] { return ptr->OptimizeBusUtilization(); }).IsOK();
-    });
-  }
-  for (auto& sensor : sensors_) {
-    const auto code = Retry([&] {
-      return sensor.encoder ? sensor.encoder->OptimizeBusUtilization()
-                            : sensor.imu->OptimizeBusUtilization();
-    });
-    ok &=
-        note_failure("signal_rates", "", -1, "optimize_bus_utilization", code);
+          [&] { return signal->SetUpdateFrequency(units::hertz_t{hz}); });
+    };
+    ok &= note_failure(name, bus, can_id, "set_signal_frequency", operation());
     restore_operations_.push_back(
-        [encoder = sensor.encoder.get(), imu = sensor.imu.get()] {
-          return Retry([&] {
-                   return encoder ? encoder->OptimizeBusUtilization()
-                                  : imu->OptimizeBusUtilization();
-                 })
-              .IsOK();
-        });
+        {id, [operation] { return operation().IsOK(); }});
   }
-  return ok;
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    const auto& m = c.motors[i];
+    const auto operation = [ptr = motors_[i].get()] {
+      return Retry([&] { return ptr->OptimizeBusUtilization(); });
+    };
+    ok &= note_failure(m.name, m.bus, m.can_id, "optimize_bus_utilization",
+                       operation());
+    restore_operations_.push_back(
+        {m.id, [operation] { return operation().IsOK(); }});
+  }
+  for (std::size_t i = 0; i < sensors_.size(); ++i) {
+    const auto& s = c.sensors[i];
+    const auto operation = [encoder = sensors_[i].encoder.get(),
+                            imu = sensors_[i].imu.get()] {
+      return Retry([&] {
+        return encoder ? encoder->OptimizeBusUtilization()
+                       : imu->OptimizeBusUtilization();
+      });
+    };
+    ok &= note_failure(s.name, s.bus, s.can_id, "optimize_bus_utilization",
+                       operation());
+    restore_operations_.push_back(
+        {s.id, [operation] { return operation().IsOK(); }});
+  }
+  if (!ok && last_error_) {
+    const auto& error = *last_error_;
+    // Configure runs on the configure worker; it still posts, so its line
+    // stays ordered with the loop thread's.
+    talos::rio::LogEvent event;
+    event.index = kConfigureFailedMessage;
+    event.SetText("[phoenix] " + hw::FormatConfigError(error));
+    log_->Post(event);
+  }
+  // Structural validity succeeded; unavailable devices are isolated and
+  // retried.
+  return true;
 }
 
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
+  const PhaseTimer timer{*log_, talos::rio::TickPhase::kDevices};
   // HasResetOccurred reports (and clears) one device's reset latch.
   reset_ids.clear();
   for (std::size_t i = 0; i < motors_.size() && i < config_.motors.size();
        ++i) {
-    if (motors_[i]->HasResetOccurred())
-      reset_ids.push_back(config_.motors[i].id);
+    if (motors_[i]->HasResetOccurred()) {
+      const auto& motor = config_.motors[i];
+      reset_ids.push_back(motor.id);
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kDeviceReset;
+      event.index = static_cast<uint16_t>(i);
+      event.id = motor.id;
+      event.can_id = motor.can_id;
+      event.SetName(motor.name);
+      event.SetBus(motor.bus);
+      log_->Post(event);
+    }
   }
   for (std::size_t i = 0; i < sensors_.size() && i < config_.sensors.size();
        ++i) {
     const bool reset = sensors_[i].encoder
                            ? sensors_[i].encoder->HasResetOccurred()
                            : sensors_[i].imu->HasResetOccurred();
-    if (reset) reset_ids.push_back(config_.sensors[i].id);
+    if (reset) {
+      const auto& sensor = config_.sensors[i];
+      reset_ids.push_back(sensor.id);
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kDeviceReset;
+      // Sensor slots follow the motor slots in the rate-limit key.
+      event.index = static_cast<uint16_t>(hw::kMaxMotors + i);
+      event.flag = true;
+      event.id = sensor.id;
+      event.can_id = sensor.can_id;
+      event.SetName(sensor.name);
+      event.SetBus(sensor.bus);
+      log_->Post(event);
+    }
   }
   return !reset_ids.empty();
 }
 
-void PhoenixBackend::BeginRestoreAfterReset() {
-  // Only immutable device configurations cross onto the worker. Device objects
-  // remain stable, so cached status reads and one-shot Neutral keep running.
-  restore_ = std::async(std::launch::async, [this] {
-    bool ok = true;
-    for (const auto& operation : restore_operations_) ok &= operation();
-    return ok;
+void PhoenixBackend::BeginRestoreAfterReset(std::span<const uint16_t> ids) {
+  restoring_ids_.assign(ids.begin(), ids.end());
+  // Re-apply the affected control chain, never unrelated device settings.
+  for (std::size_t pass = 0; pass < config_.motors.size(); ++pass) {
+    for (const auto& motor : config_.motors) {
+      const auto contains = [&](uint16_t id) {
+        return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+               restoring_ids_.end();
+      };
+      if (!contains(motor.id) &&
+          ((motor.master_id != 0 && contains(motor.master_id)) ||
+           (motor.feedback == hw::Feedback::kRemoteCANcoder &&
+            contains(motor.feedback_sensor_id))))
+        restoring_ids_.push_back(motor.id);
+    }
+  }
+  for (auto id : restoring_ids_) {
+    if (std::find(unavailable_.begin(), unavailable_.end(), id) ==
+        unavailable_.end())
+      unavailable_.push_back(id);
+  }
+  restore_ = std::async(std::launch::async, [this, ids = restoring_ids_] {
+    std::vector<uint16_t> failures;
+    for (const auto& operation : restore_operations_) {
+      if (std::find(ids.begin(), ids.end(), operation.id) == ids.end())
+        continue;
+      if (!operation.apply() && std::find(failures.begin(), failures.end(),
+                                          operation.id) == failures.end())
+        failures.push_back(operation.id);
+    }
+    return failures;
   });
 }
 
@@ -324,13 +589,23 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
   if (!restore_.valid()) return RestoreStatus::kDone;
   if (restore_.wait_for(std::chrono::seconds{0}) != std::future_status::ready)
     return RestoreStatus::kPending;
-  return restore_.get() ? RestoreStatus::kDone : RestoreStatus::kFailed;
+  const auto failures = restore_.get();
+  std::erase_if(unavailable_, [this, &failures](uint16_t id) {
+    return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+               restoring_ids_.end() &&
+           std::find(failures.begin(), failures.end(), id) == failures.end();
+  });
+  return RestoreStatus::kDone;
 }
 
 bool PhoenixBackend::Read(hw::State& s) {
+  using talos::rio::TickPhase;
+  const uint64_t read_start_ns = NowNs();
   s.health = {true, frc::RobotController::GetBatteryVoltage().value(),
               frc::RobotController::IsBrownedOut(),
               frc::RobotController::GetCANStatus().percentBusUtilization};
+  uint64_t refresh_start_ns = NowNs();
+  log_->AddPhase(TickPhase::kHealth, refresh_start_ns - read_start_ns);
   if (is_simulation_) {
     const auto now = std::chrono::steady_clock::now();
     double dt =
@@ -340,10 +615,18 @@ bool PhoenixBackend::Read(hw::State& s) {
     if (dt <= 0.0 || dt > 0.05) dt = 0.005;
     last_sim_time_ = now;
     UpdateSimulation(dt);
+    const uint64_t simulated_ns = NowNs();
+    log_->AddPhase(TickPhase::kOther, simulated_ns - refresh_start_ns);
+    refresh_start_ns = simulated_ns;
   }
   ph::BaseStatusSignal::RefreshAll(
       false, std::span<ph::BaseStatusSignal* const>{signals_});
+  const uint64_t devices_start_ns = NowNs();
+  log_->AddPhase(TickPhase::kRefresh, devices_start_ns - refresh_start_ns);
   bool healthy = motors_.empty() && sensors_.empty();
+  // Four status periods: the LATE line's threshold (NoteLateness).
+  const auto late_us =
+      static_cast<uint32_t>(std::ceil(4'000'000.0 / config_.status_hz));
   for (std::size_t i = 0; i < motors_.size(); ++i) {
     auto& motor = *motors_[i];
     auto& out = s.motors[i];
@@ -351,11 +634,20 @@ bool PhoenixBackend::Read(hw::State& s) {
     auto& v = motor.GetVelocity(false);
     auto& volts = motor.GetMotorVoltage(false);
     auto& amps = motor.GetStatorCurrent(false);
+    auto& temperature = motor.GetDeviceTemp(false);
+    auto& supply = motor.GetSupplyCurrent(false);
     out.position_rot = p.GetValue().value();
     out.velocity_rps = v.GetValue().value();
     out.position_age_us = Age(p);
     out.velocity_age_us = Age(v);
-    out.fault_flags = motor.GetFaultField(false).GetValue();
+    // FaultField is its own 50 Hz signal, separate from the motion feedback
+    // that sets `valid`. A stale FaultField reports no asserted limit and no
+    // active current limiter (kMotorNotFaultFlags), so neither a limit getter
+    // nor a display shows an old state, but keeps its last fault bits: losing
+    // the signal must not un-fault a faulted motor.
+    auto& faults = motor.GetFaultField(false);
+    out.fault_flags = faults.GetValue();
+    if (!Fresh(faults)) out.fault_flags &= ~hw::kMotorNotFaultFlags;
     // Stale current/voltage is telemetry-only degradation. The
     // effort fields zero but the sample stays valid and the backend stays
     // healthy; lost motion feedback isolates only the affected motor.
@@ -375,45 +667,119 @@ bool PhoenixBackend::Read(hw::State& s) {
       }
     }
     out.stator_current_a = effort_ok ? amps.GetValue().value() : 0.0;
-    out.valid = Fresh(p) && Fresh(v) && std::isfinite(out.position_rot) &&
-                std::isfinite(out.velocity_rps);
+    // Temperature can legitimately be 250 ms old at its requested 4 Hz.
+    // Neither health signal participates in motion-feedback validity.
+    out.temperature_c = Fresh(temperature, 500_ms) &&
+                                std::isfinite(temperature.GetValue().value())
+                            ? temperature.GetValue().value()
+                            : 0.0;
+    out.supply_current_a =
+        Fresh(supply) && std::isfinite(supply.GetValue().value())
+            ? supply.GetValue().value()
+            : 0.0;
+    if (is_simulation_) {
+      // Phoenix models supply current from rotor physics, but provides no
+      // temperature input. Report ambient, not a fictitious thermal model.
+      out.temperature_c = 25.0;
+    }
+    if (out.fault_flags != last_fault_flags_[i]) {
+      // Current-limit bits toggle at the fault-field rate under hard
+      // acceleration: post only, and let the logger coalesce them.
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kMotorFault;
+      event.index = static_cast<uint16_t>(i);
+      event.id = motor_config.id;
+      event.can_id = motor_config.can_id;
+      event.value = out.fault_flags;
+      event.previous = last_fault_flags_[i];
+      event.a = out.position_rot;
+      event.b = out.velocity_rps;
+      event.c = out.voltage;
+      event.d = out.stator_current_a;
+      event.limit1 = motor_config.supply_limit_a;
+      event.limit2 = motor_config.stator_limit_a;
+      event.SetName(motor_config.name);
+      event.SetBus(motor_config.bus);
+      log_->Post(event);
+      last_fault_flags_[i] = out.fault_flags;
+    }
+    // Status, value and isolation only: the gateway judges the ages.
+    out.valid =
+        p.GetStatus().IsOK() && v.GetStatus().IsOK() &&
+        std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps) &&
+        std::find(unavailable_.begin(), unavailable_.end(), motor_config.id) ==
+            unavailable_.end();
+    if (out.valid != last_motor_valid_[i]) {
+      LogFeedbackChange(*log_, talos::rio::LogKind::kMotorFeedback, i,
+                        motor_config.name, motor_config.id, motor_config.bus,
+                        motor_config.can_id, out.valid, p, v);
+      last_motor_valid_[i] = out.valid;
+    }
+    NoteLateness(*log_, talos::rio::LogKind::kMotorFeedbackLate, i,
+                 motor_config.name, motor_config.id, motor_config.bus,
+                 motor_config.can_id, late_us, p, v, motor_late_[i],
+                 motor_peak_age_us_[i]);
     healthy |= out.valid;
+    // An invalid sample carries zero in every measured field
+    // (talOS/hardware/README.md, fault scope).
     if (!out.valid) {
       out.position_rot = 0;
       out.velocity_rps = 0;
       out.voltage = 0;
       out.stator_current_a = 0;
+      out.supply_current_a = 0;
     }
   }
   for (std::size_t i = 0; i < sensors_.size(); ++i) {
     auto& device = sensors_[i];
     auto& out = s.sensors[i];
+    const ph::BaseStatusSignal* position_signal;
+    const ph::BaseStatusSignal* velocity_signal;
     if (device.encoder) {
       auto& p = device.encoder->GetAbsolutePosition(false);
       auto& v = device.encoder->GetVelocity(false);
+      position_signal = &p;
+      velocity_signal = &v;
       out.position_rot = p.GetValue().value();
       out.velocity_rps = v.GetValue().value();
-      out.valid = Fresh(p) && Fresh(v);
+      out.valid = p.GetStatus().IsOK() && v.GetStatus().IsOK();
       out.position_age_us = Age(p);
       out.velocity_age_us = Age(v);
     } else {
       auto& p = device.imu->GetYaw(false);
       auto& v = device.imu->GetAngularVelocityZWorld(false);
+      position_signal = &p;
+      velocity_signal = &v;
       const double sign = config_.sensors[i].inverted ? -1.0 : 1.0;
       out.position_rot = sign * p.GetValue().value() / 360.0;
       out.velocity_rps = sign * v.GetValue().value() / 360.0;
-      out.valid = Fresh(p) && Fresh(v);
+      out.valid = p.GetStatus().IsOK() && v.GetStatus().IsOK();
       out.position_age_us = Age(p);
       out.velocity_age_us = Age(v);
     }
+    // Status and value only: the gateway judges the ages.
     out.valid &=
         std::isfinite(out.position_rot) && std::isfinite(out.velocity_rps);
+    const auto& sensor = config_.sensors[i];
+    if (out.valid != last_sensor_valid_[i]) {
+      LogFeedbackChange(*log_, talos::rio::LogKind::kSensorFeedback, i,
+                        sensor.name, sensor.id, sensor.bus, sensor.can_id,
+                        out.valid, *position_signal, *velocity_signal);
+      last_sensor_valid_[i] = out.valid;
+    }
+    NoteLateness(*log_, talos::rio::LogKind::kSensorFeedbackLate, i,
+                 sensor.name, sensor.id, sensor.bus, sensor.can_id, late_us,
+                 *position_signal, *velocity_signal, sensor_late_[i],
+                 sensor_peak_age_us_[i]);
     healthy |= out.valid;
     if (!out.valid) {
       out.position_rot = 0;
       out.velocity_rps = 0;
     }
   }
+  const uint64_t devices_end_ns = NowNs();
+  log_->AddPhase(TickPhase::kDevices, devices_end_ns - devices_start_ns);
+  log_->SetTickDevices(motors_.size(), sensors_.size());
   for (std::size_t i = 0; i < digital_inputs_.size(); ++i) {
     auto& out = s.digital_inputs[i];
     out.value = digital_inputs_[i]->Get();
@@ -434,20 +800,27 @@ bool PhoenixBackend::Read(hw::State& s) {
     auto& out = s.encoders[i];
     auto& dev = rio_encoders_[i];
     if (dev.duty_cycle) {
+      const bool connected = dev.duty_cycle->IsConnected();
       const double pos = dev.duty_cycle->Get() - dev.config.offset_rot;
       double vel = 0.0;
-      const auto now = std::chrono::steady_clock::now();
-      if (dev.last_time && now > *dev.last_time) {
-        const double dt =
-            std::chrono::duration<double>(now - *dev.last_time).count();
-        if (dt > 0.0) vel = (pos - dev.last_position_rot) / dt;
+      if (connected) {
+        const auto now = std::chrono::steady_clock::now();
+        if (dev.last_time && now > *dev.last_time) {
+          const double dt =
+              std::chrono::duration<double>(now - *dev.last_time).count();
+          const double delta_rot =
+              std::remainder(pos - dev.last_position_rot, 1.0);
+          if (dt > 0.0) vel = delta_rot / dt;
+        }
+        dev.last_position_rot = pos;
+        dev.last_time = now;
+      } else {
+        dev.last_time.reset();
+        dev.last_position_rot = 0.0;
       }
-      dev.last_position_rot = pos;
-      dev.last_time = now;
       out.position_rot = pos;
       out.velocity_rps = vel;
-      out.valid = dev.duty_cycle->IsConnected() && std::isfinite(pos) &&
-                  std::isfinite(vel);
+      out.valid = connected && std::isfinite(pos) && std::isfinite(vel);
       out.age_us = 0;
     } else {
       const double pos = dev.quadrature->GetDistance() - dev.config.offset_rot;
@@ -470,21 +843,70 @@ bool PhoenixBackend::Read(hw::State& s) {
     out.output = pwm_outputs_[i]->GetSpeed();
     out.valid = true;
   }
+  uint32_t motor_fault_mask = 0;
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    if (hw::MotorFaulted(s.motors[i].fault_flags))
+      motor_fault_mask |= uint32_t{1} << i;
+  }
+  if (motor_fault_mask != last_motor_fault_mask_) {
+    talos::rio::LogEvent event;
+    event.kind = talos::rio::LogKind::kMotorFaultMask;
+    event.value = motor_fault_mask;
+    event.previous = last_motor_fault_mask_;
+    log_->Post(event);
+    last_motor_fault_mask_ = motor_fault_mask;
+  }
+  if (s.health.brownout != last_brownout_) {
+    talos::rio::LogEvent event;
+    event.kind = talos::rio::LogKind::kBrownout;
+    event.flag = s.health.brownout;
+    event.a = s.health.battery_v;
+    log_->Post(event);
+    last_brownout_ = s.health.brownout;
+  }
+  log_->AddPhase(TickPhase::kOther, NowNs() - devices_end_ns);
   return healthy;
 }
 bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
+  const PhaseTimer timer{*log_, talos::rio::TickPhase::kControl};
+  apply_failed_.clear();
   if (commands.size() != motors_.size()) return false;
-  if (is_simulation_) {
-    for (std::size_t i = 0; i < commands.size() && i < last_commands_.size();
-         ++i) {
-      last_commands_[i] = commands[i];
+  // A failed send is local to its motor: try neutral on that motor only, keep
+  // applying the rest, and report it so Gateway quarantines its chain. Log
+  // only ok<->failing transitions; an isolated motor is retried per command.
+  const auto note_send = [&](std::size_t i,
+                             const ctre::phoenix::StatusCode& status) {
+    const bool failed = !status.IsOK();
+    const auto& config = config_.motors[i];
+    if (failed != apply_failing_[i]) {
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kApplyControl;
+      event.index = static_cast<uint16_t>(i);
+      event.can_id = config.can_id;
+      event.flag = failed;
+      event.status = status.GetName();
+      event.SetName(config.name);
+      log_->Post(event);
     }
-  }
+    apply_failing_[i] = failed;
+    if (!failed) return;
+    motors_[i]->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+    sim_neutral_[i] = true;
+    apply_failed_.push_back(config.id);
+  };
   for (std::size_t i = 0; i < commands.size(); ++i) {
     const auto& r = commands[i];
     auto& m = *motors_[i];
     ctre::phoenix::StatusCode result;
     const auto& config = config_.motors[i];
+    if (std::find(unavailable_.begin(), unavailable_.end(), config.id) !=
+        unavailable_.end()) {
+      // A missing device cannot acknowledge NeutralOut. Keep trying neutral,
+      // but do not turn its transport failure into a whole-robot Apply failure.
+      m.SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+      sim_neutral_[i] = true;
+      continue;
+    }
     if (config.master_id != 0) {
       const auto master =
           std::find_if(config_.motors.begin(), config_.motors.end(),
@@ -496,22 +918,38 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
           static_cast<std::size_t>(master - config_.motors.begin());
       auto& position = motors_[master_index]->GetPosition(false);
       auto& velocity = motors_[master_index]->GetVelocity(false);
-      if (commands[master_index].mode == hw::Mode::kNeutral ||
-          !Fresh(position) || !Fresh(velocity) ||
-          !std::isfinite(position.GetValue().value()) ||
-          !std::isfinite(velocity.GetValue().value())) {
+      const uint64_t bound = config_.command_timeout_us;
+      bool feedback_valid = ValidMotionFeedback(m.GetPosition(false),
+                                                m.GetVelocity(false), bound);
+      if (config.feedback == hw::Feedback::kRemoteCANcoder) {
+        bool sensor_valid = false;
+        for (std::size_t j = 0; j < config_.sensors.size(); ++j) {
+          if (config_.sensors[j].id == config.feedback_sensor_id &&
+              sensors_[j].encoder) {
+            sensor_valid = ValidMotionFeedback(
+                sensors_[j].encoder->GetAbsolutePosition(false),
+                sensors_[j].encoder->GetVelocity(false), bound);
+            break;
+          }
+        }
+        feedback_valid &= sensor_valid;
+      }
+      const bool neutral = r.mode == hw::Mode::kNeutral ||
+                           commands[master_index].mode == hw::Mode::kNeutral ||
+                           !ValidMotionFeedback(position, velocity, bound) ||
+                           !feedback_valid;
+      sim_neutral_[i] = neutral;
+      if (neutral) {
         result = m.SetControl(ph::controls::NeutralOut{});
       } else {
         result = m.SetControl(
             ph::controls::Follower{master->can_id, config.oppose_master}
                 .WithUpdateFreqHz(0_Hz));
       }
-      if (!result.IsOK()) {
-        Neutral();
-        return false;
-      }
+      note_send(i, result);
       continue;
     }
+    sim_neutral_[i] = r.mode == hw::Mode::kNeutral;
     switch (r.mode) {
       case hw::Mode::kNeutral:
         result = m.SetControl(ph::controls::NeutralOut{});
@@ -553,16 +991,14 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
       default:
         return false;
     }
-    if (!result.IsOK()) {
-      Neutral();
-      return false;
-    }
+    note_send(i, result);
   }
   return true;
 }
 bool PhoenixBackend::ApplyOutputs(
     std::span<const hw::DigitalOutputRequest> digital_outputs,
     std::span<const hw::PwmRequest> pwm_outputs) {
+  const PhaseTimer timer{*log_, talos::rio::TickPhase::kOther};
   for (std::size_t i = 0;
        i < digital_outputs.size() && i < digital_outputs_.size(); ++i) {
     digital_outputs_[i]->Set(digital_outputs[i].value);
@@ -574,18 +1010,55 @@ bool PhoenixBackend::ApplyOutputs(
   return true;
 }
 void PhoenixBackend::Neutral() {
-  for (auto& motor : motors_)
-    motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+  // Gateway refreshes neutral every tick without an active command, so a
+  // failed send here is retried on the next tick. Count every failure and log
+  // only each motor's ok<->failing transition to avoid a 200 Hz log flood.
+  const uint64_t control_start_ns = NowNs();
+  for (std::size_t i = 0; i < motors_.size(); ++i) {
+    const auto status = motors_[i]->SetControl(
+        ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz));
+    const bool failed = !status.IsOK();
+    if (failed) ++neutral_send_failure_count_;
+    if (failed != neutral_send_failing_[i] && i < config_.motors.size()) {
+      const auto& motor = config_.motors[i];
+      talos::rio::LogEvent event;
+      event.kind = talos::rio::LogKind::kNeutralSend;
+      event.index = static_cast<uint16_t>(i);
+      event.can_id = motor.can_id;
+      event.flag = failed;
+      event.status = status.GetName();
+      event.SetName(motor.name);
+      log_->Post(event);
+    }
+    neutral_send_failing_[i] = failed;
+  }
+  const uint64_t control_end_ns = NowNs();
+  log_->AddPhase(talos::rio::TickPhase::kControl,
+                 control_end_ns - control_start_ns);
   for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
   // Support matrix: DIO outputs de-energize on every safe-state transition.
   for (auto& dio : digital_outputs_) dio->Set(false);
-  if (is_simulation_) {
-    for (auto& cmd : last_commands_) cmd = hw::MotorRequest{};
-    for (std::size_t i = 0; i < motors_.size(); ++i) {
-      sim_rotor_velocity_[i] = 0.0;
-      motors_[i]->GetSimState().SetRotorVelocity(0_tps);
-    }
+  // Sim: neutral keeps rotor momentum; UpdateSimulation decays it per brake.
+  if (is_simulation_) sim_neutral_.fill(true);
+  log_->AddPhase(talos::rio::TickPhase::kOther, NowNs() - control_end_ns);
+}
+
+bool PhoenixBackend::WatchdogNeutral() {
+  const std::unique_lock devices_lock{devices_mutex_, std::try_to_lock};
+  if (!devices_lock.owns_lock()) return false;
+  // Phoenix 6 serializes SetControl per device (ParentDevice's control lock)
+  // and the HAL DIO and PWM writes are safe from any thread, so this may run
+  // beside the loop thread's own sends; the last one sent wins. PWM and DIO
+  // first: a motor whose control lock the stalled loop holds would hold them
+  // back too.
+  for (auto& pwm : pwm_outputs_) pwm->SetDisabled();
+  for (auto& dio : digital_outputs_) dio->Set(false);
+  bool sent = true;
+  for (auto& motor : motors_) {
+    sent &= motor->SetControl(ph::controls::NeutralOut{}.WithUpdateFreqHz(0_Hz))
+                .IsOK();
   }
+  return sent;
 }
 
 void PhoenixBackend::UpdateSimulation(double dt) {
@@ -599,12 +1072,24 @@ void PhoenixBackend::UpdateSimulation(double dt) {
     // Voltage is the only driver (Kraken X60 free speed: 100 rps at 12 V).
     // A closed-loop request with missing gains produces ~0 V, so the rotor
     // coasts to a stop here instead of jumping to the requested demand. Never
-    // consult last_commands_ for physics: that shortcut hides bad tuning.
-    const double volts = sim.GetMotorVoltage().value();
-    const double target_rotor_rps = (volts / 12.0) * 100.0;
-    const double alpha = std::min(1.0, dt / 0.01);
+    // consult the request demand for physics: that shortcut hides bad tuning.
+    // Neutral is unpowered: velocity decays per the brake config and the
+    // position keeps integrating while the rotor rolls on.
+    double target_rotor_rps = 0.0;
+    double tau = 0.01;
+    if (sim_neutral_[i]) {
+      tau = m_cfg.brake ? kSimNeutralBrakeTauS : kSimNeutralCoastTauS;
+    } else {
+      const double volts = sim.GetMotorVoltage().value();
+      target_rotor_rps = (volts / 12.0) * 100.0;
+    }
+    const double alpha = std::min(1.0, dt / tau);
     sim_rotor_velocity_[i] +=
         (target_rotor_rps - sim_rotor_velocity_[i]) * alpha;
+    if (sim_neutral_[i] &&
+        std::abs(sim_rotor_velocity_[i]) < kSimNeutralStandstillRps) {
+      sim_rotor_velocity_[i] = 0.0;
+    }
 
     sim_rotor_position_[i] += sim_rotor_velocity_[i] * dt;
     sim.SetRotorVelocity(units::turns_per_second_t{sim_rotor_velocity_[i]});

@@ -4,16 +4,22 @@ namespace autonomous;
 // every update (enabled or not; reporting is not actuation-gated). Values
 // mirror the node's private StateMachine<Phase> and are append-only, never
 // renumbered: they are wire values.
+// INHIBITED is the safe process-start state: only observing a fresh disabled
+// or non-autonomous mode arms a later enabled-autonomous transition.
 enum Phase : ubyte {
   IDLE,
   SPINUP,
   FEED,
   DRIVE,
   HOLD,
+  ABORTED,
+  INHIBITED,
 }
 
 // Studio view: the phase enum is forwarded by talOS/telemetry as the
 // `autonomous/state/phase` enum channel, whose labels are the names above.
 struct AutonomousState {
   phase:Phase;
+  // Index in autonomous.toml's routines: selected while disabled, latched in auto.
+  routine_index:ubyte;
 }

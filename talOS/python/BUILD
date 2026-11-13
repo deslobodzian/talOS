@@ -42,6 +42,37 @@ py_library(
     deps = [":talos"],
 )
 
+# `talos.mechanisms`: the talOS/mechanisms classes, through libtalos_node.
+py_library(
+    name = "mechanisms",
+    srcs = ["talos/mechanisms.py"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":talos",
+        "//talOS/msgs:control_py",
+    ],
+)
+
+# talos.mechanisms reaches the C++ classes: marshalling, stale and disabled
+# paths; behaviour is //talOS/mechanisms' tests.
+py_test(
+    name = "mechanisms_test",
+    size = "small",
+    srcs = ["mechanisms_test.py"],
+    legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":mechanisms",
+        ":testing",
+        "//talOS/msgs:control_py",
+    ],
+)
+
 talos_messages(
     name = "test_messages",
     srcs = ["testdata/talos_test_message.fbs"],
@@ -52,10 +83,20 @@ py_test(
     name = "talos_test",
     size = "small",
     srcs = ["talos_test.py"],
+    # node_api.cc's static_asserts are the struct layouts the ctypes mirror
+    # is checked against.
+    data = ["//talOS/node_api:node_api.cc"],
+    env = {"TALOS_ABI_SOURCE": "$(rlocationpath //talOS/node_api:node_api.cc)"},
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":test_messages_py",
         ":testing",
+        "@rules_python//python/runfiles",
     ],
 )
 
@@ -65,12 +106,17 @@ py_test(
     srcs = ["api_parity_test.py"],
     data = [
         "talos/_abi.py",
+        "talos/devices.py",
         "//talOS/node_api:node_api.h",
     ],
     env = {
+        "TALOS_ABI_DEVICES": "$(rlocationpath talos/devices.py)",
         "TALOS_ABI_HEADER": "$(rlocationpath //talOS/node_api:node_api.h)",
         "TALOS_ABI_PYTHON": "$(rlocationpath talos/_abi.py)",
     },
+    # A generated empty talos/__init__.py here would collide with the tracked
+    # one in every other test's runfiles (see tools/check_runfiles_collisions.py).
+    legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
 )
 
@@ -93,6 +139,11 @@ py_test(
     data = [":messages_golden"],
     env = {"TALOS_MESSAGES_GOLDEN": "$(rlocationpath :messages_golden)"},
     legacy_create_init = False,
+    # Imports talos, loading instrumented ctypes libraries in a Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":talos",
         ":test_messages_py",

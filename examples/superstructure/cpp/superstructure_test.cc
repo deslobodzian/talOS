@@ -8,17 +8,21 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "examples/superstructure/cpp/elevator.h"
 #include "examples/superstructure/cpp/intake.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/devices/testing.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
 
 namespace demo {
@@ -26,6 +30,8 @@ namespace {
 
 using namespace std::chrono_literals;
 using talos::hardware::Mode;
+using talos::testing::AllocationProbe;
+using talos::testing::DriverStationGeneration;
 using talos::testing::DsPacket;
 using talos::testing::LatestTarget;
 using talos::testing::PublishTarget;
@@ -51,6 +57,13 @@ constexpr double kIntakeVolts = 8.0;
 constexpr double kHoldVolts = 1.0;
 constexpr double kEjectVolts = -10.0;
 constexpr double kHighRot = 10.0;
+constexpr double kMaxHeightRot = 12.0;
+constexpr double kHomingVolts = -3.0;
+constexpr auto kHomingTimeout = 6000ms;
+constexpr auto kHomingStall = 500ms;
+// The switch zeroes the lift once it has read closed for home_samples (3)
+// elevator periods.
+constexpr auto kHomeTime = 30ms;
 
 // Enables the robot and puts the Driver Station in enabled teleop: a Target
 // drives only with both. The 10 ms step lets the mode begin before the first
@@ -61,8 +74,22 @@ void EnableTeleop(Sim& sim, SimHardware& hw) {
   sim.step(10ms);
 }
 
+// The elevator's bottom switch closed: the lift starts at the bottom, so it
+// zeroes there (Motor::rezero) without moving. The switch is normally open to
+// ground behind a pull-up: closed reads false.
+void LiftAtBottom(SimHardware& hw, bool down = true) {
+  hw.set_digital_input("elevator", "bottom_limit", !down);
+}
+
 class SuperstructureTest : public ::testing::Test {
  protected:
+  // The lift zeroes on its switch, then leaves it as it rises.
+  SuperstructureTest() {
+    LiftAtBottom(hw);
+    sim.step(kHomeTime);
+    LiftAtBottom(hw, false);
+  }
+
   // Holds a driver command the way a driver node would: its teleop lane
   // republished every 20 ms.
   void Hold(SuperstructureCommand command, std::chrono::milliseconds duration) {
@@ -275,6 +302,16 @@ class SuperstructureAlone : public ::testing::Test {
     EXPECT_TRUE(lane.has_value() && lane->active == 1);
     return lane.has_value() ? lane->message.height_rot() : -1.0;
   }
+  void ExpectLanesReleased() const {
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    const auto elevator =
+        LatestTarget<ElevatorGoal>(sim, "elevator", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    ASSERT_TRUE(elevator.has_value());
+    EXPECT_EQ(intake->active, 0);
+    EXPECT_EQ(elevator->active, 0);
+  }
 
   const IntakeStatus kHolding{IntakeState::HOLDING, true};
   const ElevatorStatus kDown{ElevatorState::STOWED, 0.0, 0.0, true};
@@ -286,53 +323,159 @@ class SuperstructureAlone : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(SuperstructureAlone, StaleStatusHoldsTheStateAndDoesNotAdvance) {
-  for (int i = 0; i < 5; ++i) {
-    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
-  }
-  ASSERT_EQ(State(), SuperstructureState::HOLDING);
-
-  // The intake goes quiet for longer than command_timeout_us (100 ms).
-  for (int i = 0; i < 6; ++i) {
-    Tick(SuperstructureCommand::INTAKE, std::nullopt, kDown);
-  }
-  // Its last word was "holding a piece", but it is stale: SCORE_HIGH must not
-  // raise, and HOLDING's goals (elevator down, intake idle) keep going out.
-  for (int i = 0; i < 10; ++i) {
-    Tick(SuperstructureCommand::SCORE_HIGH, std::nullopt, kDown);
-  }
-  EXPECT_EQ(State(), SuperstructureState::HOLDING);
-  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
-  const auto intake_lane =
-      LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
-  if (!intake_lane.has_value()) {
-    FAIL() << "no intake lane";
-  }
-  EXPECT_EQ(intake_lane->active, 1);
-  EXPECT_EQ(intake_lane->message.command(), IntakeCommand::IDLE);
-
-  // It reports again: RAISING.
-  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+TEST_F(SuperstructureAlone, StowWinsWhenRaisingArrivesAtScoringHeight) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
   Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
   ASSERT_EQ(State(), SuperstructureState::RAISING);
-  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
+  Tick(SuperstructureCommand::STOW, kHolding, kUp);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  ASSERT_TRUE(intake.has_value());
+  EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+}
 
-  // Now the elevator goes quiet past the timeout, and the driver lets go
-  // (STOW). Without a fresh elevator state it stays RAISING and keeps asking
-  // for the height rather than acting on old data.
+TEST_F(SuperstructureAlone, ScoringStowsOnExplicitCommandOrTargetRelease) {
+  for (bool release : {false, true}) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    if (release) {
+      ReleaseTarget<SuperstructureGoal>(sim, "superstructure", "teleop");
+      sim.publish(topics::kIntakeStatus, kHolding);
+      sim.publish(topics::kElevatorStatus, kUp);
+      sim.step(20ms);
+    } else {
+      Tick(SuperstructureCommand::STOW, kHolding, kUp);
+    }
+    EXPECT_EQ(State(), SuperstructureState::HOLDING);
+    EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+    const auto intake =
+        LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+    ASSERT_TRUE(intake.has_value());
+    EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+  }
+}
+
+TEST_F(SuperstructureAlone, StaleIntakeReleasesLanesUntilObservationsReturn) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::HOLDING);
   for (int i = 0; i < 6; ++i) {
-    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, std::nullopt);
+    Tick(SuperstructureCommand::SCORE_HIGH, std::nullopt, kDown);
   }
-  for (int i = 0; i < 10; ++i) {
-    Tick(SuperstructureCommand::STOW, kHolding, std::nullopt);
-  }
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  ExpectLanesReleased();
+
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  EXPECT_EQ(State(), SuperstructureState::HOLDING);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
   EXPECT_EQ(State(), SuperstructureState::RAISING);
   EXPECT_DOUBLE_EQ(ElevatorGoalRot(), kHighRot);
+}
 
-  // A fresh at_goal for the high goal: SCORING.
-  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
-  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
-  EXPECT_EQ(State(), SuperstructureState::SCORING);
+TEST_F(SuperstructureAlone, StaleStatusWhileRaisingStowsImmediately) {
+  for (bool stale_intake : {false, true}) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    ASSERT_EQ(State(), SuperstructureState::RAISING);
+    for (int i = 0; i < 4; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH,
+           stale_intake ? std::nullopt : std::optional{kHolding},
+           stale_intake ? std::optional{kDown} : std::nullopt);
+    }
+    ASSERT_EQ(State(), SuperstructureState::RAISING);
+
+    // STOW coincides with the first tick that sees the status as stale.
+    Tick(SuperstructureCommand::STOW,
+         stale_intake ? std::nullopt : std::optional{kHolding},
+         stale_intake ? std::optional{kDown} : std::nullopt);
+    EXPECT_EQ(State(), stale_intake ? SuperstructureState::STOWED
+                                    : SuperstructureState::HOLDING);
+    ExpectLanesReleased();
+
+    // Cancellation persists when the elevator reports its old high goal.
+    Tick(SuperstructureCommand::STOW, kHolding, kUp);
+    EXPECT_EQ(State(), SuperstructureState::HOLDING);
+    EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  }
+}
+
+TEST_F(SuperstructureAlone, PieceLostWhileRaisingDoesNotStartEject) {
+  Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+  Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+  ASSERT_EQ(State(), SuperstructureState::RAISING);
+  Tick(SuperstructureCommand::SCORE_HIGH,
+       IntakeStatus{IntakeState::IDLE, false}, kUp);
+  EXPECT_EQ(State(), SuperstructureState::STOWED);
+  EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+  const auto intake = LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+  ASSERT_TRUE(intake.has_value());
+  EXPECT_EQ(intake->active, 1);
+  EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+}
+
+TEST_F(SuperstructureAlone, StaleScoringReleasesEjectAndDoesNotReplayIt) {
+  const IntakeStatus empty{IntakeState::IDLE, false};
+  for (bool stale_intake : {false, true}) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    for (int i = 0; i < 6; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH,
+           stale_intake ? std::nullopt : std::optional{kHolding},
+           stale_intake ? std::optional{kUp} : std::nullopt);
+    }
+    EXPECT_NE(State(), SuperstructureState::SCORING);
+    ExpectLanesReleased();
+
+    // The piece left while a dependency was silent. A held SCORE_HIGH must
+    // not replay EJECT or the high goal when current observations return.
+    for (int i = 0; i < 3; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH, empty, kUp);
+      EXPECT_EQ(State(), SuperstructureState::STOWED);
+      EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+      const auto intake =
+          LatestTarget<IntakeGoal>(sim, "intake", "superstructure");
+      ASSERT_TRUE(intake.has_value());
+      EXPECT_EQ(intake->active, 1);
+      EXPECT_EQ(intake->message.command(), IntakeCommand::IDLE);
+    }
+  }
+}
+
+TEST_F(SuperstructureAlone, GoalLossAndDisableCancelWithStaleStatuses) {
+  for (int cancellation = 0; cancellation < 3; ++cancellation) {
+    Tick(SuperstructureCommand::INTAKE, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kDown);
+    Tick(SuperstructureCommand::SCORE_HIGH, kHolding, kUp);
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    for (int i = 0; i < 4; ++i) {
+      Tick(SuperstructureCommand::SCORE_HIGH, std::nullopt, std::nullopt);
+    }
+    ASSERT_EQ(State(), SuperstructureState::SCORING);
+    if (cancellation == 0)
+      ReleaseTarget<SuperstructureGoal>(sim, "superstructure", "teleop");
+    else if (cancellation == 1)
+      hw.enable(false);
+    sim.step(cancellation == 2 ? 120ms : 20ms);  // Released, disabled, expired.
+    EXPECT_EQ(State(), SuperstructureState::STOWED);
+    ExpectLanesReleased();
+
+    // Fresh mechanism states cannot revive a cancelled score.
+    sim.publish(topics::kIntakeStatus, kHolding);
+    sim.publish(topics::kElevatorStatus, kUp);
+    sim.step(20ms);
+    EXPECT_EQ(State(), SuperstructureState::HOLDING);
+    EXPECT_DOUBLE_EQ(ElevatorGoalRot(), 0.0);
+    if (cancellation == 1) {
+      hw.enable();
+      sim.step(
+          20ms);  // Refresh hardware without shifting the 20 ms test phase.
+    }
+  }
 }
 
 TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {
@@ -346,12 +489,16 @@ TEST_F(SuperstructureAlone, AtGoalForAnEarlierHeightDoesNotCount) {
   EXPECT_EQ(State(), SuperstructureState::RAISING);
 }
 
-// The elevator on its own, driven through its superstructure lane by hand.
+// The elevator on its own, driven through its superstructure lane by hand,
+// homed at the bottom.
 class ElevatorAlone : public ::testing::Test {
  protected:
   void SetUp() override {
     EnableTeleop(sim, hw);
     hw.ideal_motors();
+    LiftAtBottom(hw);
+    sim.step(kHomeTime);
+    LiftAtBottom(hw, false);
   }
 
   // The superstructure's lane, republished every 10 ms.
@@ -365,14 +512,52 @@ class ElevatorAlone : public ::testing::Test {
   talos::hardware::MotorRequest Lift() const {
     return hw.motor_request("elevator", "lift");
   }
+  // Drive(), checking the lift output the hardware applies after every
+  // gateway tick: true if any was a motion-magic goal. (A request the node
+  // built from a State before a reset is in the old frame; the gateway
+  // applies it neutral.)
+  bool DriveSawMotionMagic(double height_rot,
+                           std::chrono::milliseconds duration) {
+    bool seen = false;
+    for (auto t = 0ms; t < duration; t += 10ms) {
+      PublishTarget(sim, "elevator", "superstructure",
+                    ElevatorGoal{height_rot});
+      for (int i = 0; i < 2; ++i) {
+        sim.step(5ms);
+        seen |= hw.applied_motor("elevator", "lift").mode == Mode::kMotionMagic;
+      }
+    }
+    return seen;
+  }
+  // The carriage reaches its bottom stop, at `raw_rot` in the motor's frame.
+  // Long enough on the closed switch to zero, then the lift rises off it.
+  void ReachBottom(double raw_rot) {
+    hw.set_motor("elevator", "lift", raw_rot, 0.0);
+    LiftAtBottom(hw);
+    sim.step(kHomeTime);
+    LiftAtBottom(hw, false);
+  }
+  void ExpectHoming() const {
+    EXPECT_EQ(Lift().mode, Mode::kVoltage);
+    EXPECT_DOUBLE_EQ(Lift().demand, kHomingVolts);
+    EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+    EXPECT_DOUBLE_EQ(Status().goal_rot(), 0.0);
+    EXPECT_FALSE(Status().at_goal());
+  }
   ElevatorStatus Status() const {
     const auto status = sim.latest<ElevatorStatus>(topics::kElevatorStatus);
     EXPECT_TRUE(status.has_value());
     return status.value_or(ElevatorStatus{});
   }
-  // Neutral, and the status says it is driving nothing.
+  // What the gateway applies, after its enable and expiry gates.
+  talos::hardware::MotorRequest Applied() const {
+    return hw.applied_motor("elevator", "lift");
+  }
+  // Neutral, requested and applied, and the status says it is driving
+  // nothing.
   void ExpectNeutral() const {
     EXPECT_EQ(Lift().mode, Mode::kNeutral);
+    EXPECT_EQ(Applied().mode, Mode::kNeutral);
     EXPECT_DOUBLE_EQ(Status().goal_rot(), 0.0);
     EXPECT_FALSE(Status().at_goal());
   }
@@ -382,133 +567,473 @@ class ElevatorAlone : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(ElevatorAlone, DrivesToTheLaneGoal) {
+// The node test matrix (docs/TESTING.md §7) for the elevator, the package's
+// homed actuator: cases 1 to 8, 10 to 12 here, 9 in ElevatorConfig below.
+// The intake's Target cases are in IntakeAlone.
+
+// REQ-SAFE-07
+TEST_F(ElevatorAlone, DrivesAtALiveLane) {
   Drive(kHighRot, 50ms);
-  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
-  EXPECT_DOUBLE_EQ(Lift().demand, kHighRot);
+  EXPECT_EQ(Applied().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Applied().demand, kHighRot);
   EXPECT_EQ(Status().state(), ElevatorState::AT_GOAL);
   EXPECT_TRUE(Status().at_goal());
   EXPECT_DOUBLE_EQ(Status().goal_rot(), kHighRot);
 }
 
-TEST_F(ElevatorAlone, NeutralWhenTheLaneGoesStale) {
+// REQ-SAFE-02
+TEST_F(ElevatorAlone, DisabledRobotGoesNeutral) {
   Drive(kHighRot, 50ms);
-  ASSERT_EQ(Lift().mode, Mode::kMotionMagic);
-  // Nothing more: it does not hold the old goal past command_timeout_us.
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
+  hw.enable(false);
+  Drive(kHighRot, 100ms);
+  ExpectNeutral();  // and the status is still published
+}
+
+// REQ-SAFE-07
+TEST_F(ElevatorAlone, StaleLaneGoesNeutral) {
+  Drive(kHighRot, 50ms);
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
+  // Nothing more: it does not hold the old goal past command_timeout_us
+  // (100 ms) plus one elevator period.
   sim.step(110ms);
   ExpectNeutral();
   // Up at kHighRot with nothing driving it: MOVING, not AT_GOAL.
   EXPECT_EQ(Status().state(), ElevatorState::MOVING);
 }
 
-TEST_F(ElevatorAlone, NeutralWhenTheLaneIsReleased) {
+// REQ-SAFE-07
+TEST_F(ElevatorAlone, ReleasedLaneGoesNeutral) {
   Drive(kHighRot, 50ms);
-  ASSERT_EQ(Lift().mode, Mode::kMotionMagic);
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
   ReleaseTarget<ElevatorGoal>(sim, "elevator", "superstructure");
   sim.step(20ms);
   ExpectNeutral();
 }
 
-TEST_F(ElevatorAlone, NeutralWhenTheTargetWasNeverSent) {
+// REQ-SAFE-07
+TEST_F(ElevatorAlone, NeverSentGoesNeutral) {
   sim.step(100ms);
   ExpectNeutral();
-  EXPECT_EQ(Status().state(), ElevatorState::STOWED);  // at 0
+  EXPECT_EQ(Status().state(), ElevatorState::STOWED);
 }
 
-TEST_F(ElevatorAlone, NeutralWhenDisabled) {
-  hw.enable(false);
-  Drive(kHighRot, 100ms);
-  ExpectNeutral();
-}
-
-TEST_F(ElevatorAlone, NeutralOnDriverStationLoss) {
+// REQ-SAFE-07
+TEST_F(ElevatorAlone, DriverStationLossGoesNeutral) {
   Drive(kHighRot, 50ms);
-  ASSERT_EQ(Lift().mode, Mode::kMotionMagic);
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
   hw.stop_driver_station();
   Drive(kHighRot, 150ms);  // the lane stays fresh; the DS does not
   ExpectNeutral();
 }
 
-TEST_F(ElevatorAlone, NeutralWithTheLiftDisconnected) {
+// REQ-CONTRACT-25
+TEST_F(ElevatorAlone, DisconnectedFeedbackGoesNeutral) {
+  Drive(kHighRot, 50ms);
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
   hw.set_connected("elevator", "lift", false);
   Drive(kHighRot, 50ms);
+  // The intake's roller stays connected, so the robot stays enabled: the
+  // elevator's own feedback gate is what stops it.
+  ASSERT_TRUE(talos::robot_enabled(sim.node("elevator")));
   ExpectNeutral();
   EXPECT_EQ(Status().state(), ElevatorState::MOVING);
 }
 
-TEST_F(ElevatorAlone, NeutralOnANonFiniteGoal) {
+// REQ-SAFE-04
+TEST_F(ElevatorAlone, NonFiniteDemandGoesNeutral) {
+  Drive(kHighRot, 50ms);
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
   Drive(std::numeric_limits<double>::quiet_NaN(), 50ms);
   ExpectNeutral();
+  EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);  // never NaN
 }
 
-TEST(IntakeAlone, EjectDurationUsesMicroseconds) {
-  Sim sim{RobotConfig()};
-  sim.add<demo::Intake>("intake");
-  SimHardware hw{sim};
-  EnableTeleop(sim, hw);
-  const auto drive = [&](IntakeCommand command, int ticks) {
+// REQ-SAFE-07: elevator.toml's [targets] replaces [robot.targets]: only the
+// superstructure's lane drives it, in teleop and autonomous alike. The
+// robot-wide sources' lanes, live in either mode, are ignored.
+TEST_F(ElevatorAlone, OtherModesLaneIsIgnored) {
+  for (const std::uint32_t mode : {ds::kTeleop, ds::kAutonomous}) {
+    SCOPED_TRACE(mode == ds::kTeleop ? "teleop" : "autonomous");
+    hw.set_driver_station(DsPacket(ds::kEnabled | mode));
+    sim.step(20ms);
+    for (auto t = 0ms; t < 50ms; t += 10ms) {
+      PublishTarget(sim, "elevator", "teleop", ElevatorGoal{kHighRot});
+      PublishTarget(sim, "elevator", "auto", ElevatorGoal{kHighRot});
+      sim.step(10ms);
+    }
+    ExpectNeutral();
+    ReleaseTarget<ElevatorGoal>(sim, "elevator", "teleop");
+    ReleaseTarget<ElevatorGoal>(sim, "elevator", "auto");
+  }
+  // The superstructure's lane drives in autonomous too.
+  Drive(kHighRot, 50ms);
+  EXPECT_EQ(Applied().mode, Mode::kMotionMagic);
+}
+
+// REQ-SAFE-09
+TEST_F(ElevatorAlone, EarlierGenerationTargetIsIgnored) {
+  Drive(kHighRot, 50ms);
+  ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
+  const std::uint64_t before = DriverStationGeneration(sim);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  // Re-enabled. SimHardware publishes the packet at its next 20 ms hook,
+  // after the elevator's tick at that instant, so the packet waits for the
+  // elevator's next drain; a goal the superstructure queued under the
+  // earlier enable, published before that drain, arrives in the same one.
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(20ms);
+  ASSERT_NE(DriverStationGeneration(sim), before);
+  PublishTarget(sim, "elevator", "superstructure", ElevatorGoal{kHighRot},
+                before);
+  sim.step(20ms);
+  ExpectNeutral();
+  // The same goal stamped with the current generation drives at once.
+  Drive(kHighRot, 20ms);
+  EXPECT_EQ(Applied().mode, Mode::kMotionMagic);
+}
+
+// REQ-RT-06: the steady-state tick (goal read, mechanism update, request,
+// flush, status publish) allocates nothing. The goal stays fresh through
+// the window (60 ms < command_timeout_us).
+TEST_F(ElevatorAlone, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Drive(kHighRot, 50ms);
+  PublishTarget(sim, "elevator", "superstructure", ElevatorGoal{kHighRot});
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Applied().mode, Mode::kMotionMagic);
+}
+
+// REQ-SAFE-36
+TEST_F(ElevatorAlone, ClampsGoalsToTheTravel) {
+  Drive(kMaxHeightRot + 8.0, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, kMaxHeightRot);
+  EXPECT_DOUBLE_EQ(Status().goal_rot(), kMaxHeightRot);
+  Drive(-3.0, 30ms);
+  EXPECT_DOUBLE_EQ(Lift().demand, 0.0);
+  EXPECT_DOUBLE_EQ(Status().goal_rot(), 0.0);
+}
+
+// A switch stuck closed zeroed the lift at the bottom; the first move up
+// shows it still closed well above 0, and the elevator stops.
+// REQ-SAFE-36
+TEST_F(ElevatorAlone, AStuckSwitchStopsTheFirstMoveUp) {
+  LiftAtBottom(hw);
+  Drive(kHighRot, 30ms);  // ideal motors: up at once
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+  EXPECT_FALSE(Status().at_goal());
+  Drive(kHighRot, 100ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+}
+
+// Powered on away from the bottom, switch open: no zero yet. The lift moves
+// when pushed (velocity -1 rps), so homing does not count as stalled.
+class ElevatorHoming : public ElevatorAlone {
+ protected:
+  void SetUp() override {
+    LiftAtBottom(hw, false);
+    hw.set_motor("elevator", "lift", 0.0, -1.0);  // the power-on count
+    EnableTeleop(sim, hw);
+    hw.ideal_motors();
+  }
+  // The operator disables and re-enables at the Driver Station.
+  void DisableAndEnable() {
+    hw.set_driver_station(DsPacket(ds::kTeleop));
+    sim.step(20ms);
+    hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+    sim.step(10ms);
+  }
+};
+
+// REQ-SAFE-36
+TEST_F(ElevatorHoming, HomesOnALiveTargetThenReachesTheGoal) {
+  // Unhomed: a goal drives the lift down, never to a motion-magic goal in
+  // the power-on frame.
+  EXPECT_FALSE(DriveSawMotionMagic(kHighRot, 100ms));
+  ExpectHoming();
+
+  // The switch closes 4 rotations below where the TalonFX powered on: that
+  // is height 0, and the goal goes out in the homed frame.
+  ReachBottom(-4.0);
+  Drive(kHighRot, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, kHighRot - 4.0);
+  EXPECT_EQ(Status().state(), ElevatorState::AT_GOAL);
+  EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);
+  EXPECT_TRUE(Status().at_goal());
+}
+
+// A one-tick closed reading mid-travel (EMI on the switch wire) is not the
+// bottom: homing keeps driving down and the lift stays unzeroed, so the next
+// goal does not go out in a frame zeroed partway up.
+// REQ-SAFE-36
+TEST_F(ElevatorHoming, OneClosedSampleMidTravelDoesNotZero) {
+  Drive(kHighRot, 50ms);
+  hw.set_motor("elevator", "lift", -2.0, -1.0);  // partway down
+  LiftAtBottom(hw);
+  Drive(kHighRot, 10ms);  // one elevator period
+  LiftAtBottom(hw, false);
+  EXPECT_FALSE(DriveSawMotionMagic(kHighRot, 100ms));
+  ExpectHoming();
+
+  ReachBottom(-4.0);  // home_samples consecutive closed readings
+  Drive(kHighRot, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, kHighRot - 4.0);
+}
+
+// REQ-SAFE-36
+TEST_F(ElevatorAlone, AResetAtHeightRehomesBeforeAnyGoal) {
+  Drive(kHighRot, 50ms);
+  ASSERT_EQ(Status().state(), ElevatorState::AT_GOAL);
+  ASSERT_DOUBLE_EQ(Lift().demand, kHighRot);
+
+  // The TalonFX resets at height: its count restarts at 0 up there. A goal
+  // of kHighRot in that frame would drive the carriage 10 rotations past
+  // where it is; homing goes down to the switch first.
+  hw.reset_device("elevator", "lift");
+  hw.set_motor("elevator", "lift", 0.0, -1.0);
+  EXPECT_FALSE(DriveSawMotionMagic(kHighRot, 100ms));
+  ExpectHoming();
+
+  ReachBottom(-kHighRot);
+  Drive(kHighRot, 30ms);
+  EXPECT_EQ(Lift().mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(Lift().demand, 0.0);  // kHighRot above the switch
+  EXPECT_EQ(Status().state(), ElevatorState::AT_GOAL);
+  EXPECT_DOUBLE_EQ(Status().height_rot(), kHighRot);
+}
+
+// REQ-SAFE-36
+TEST_F(ElevatorHoming, NoHomingMotionWithoutALiveFiniteTarget) {
+  sim.step(100ms);  // never sent
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+
+  Drive(std::numeric_limits<double>::quiet_NaN(), 50ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+
+  hw.enable(false);
+  Drive(kHighRot, 100ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+
+  hw.enable();
+  Drive(kHighRot, 50ms);
+  ExpectHoming();
+  sim.step(110ms);  // the lane goes stale
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+
+  Drive(kHighRot, 50ms);
+  ExpectHoming();
+  ReleaseTarget<ElevatorGoal>(sim, "elevator", "superstructure");
+  sim.step(20ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING);
+}
+
+// REQ-SAFE-36
+TEST_F(ElevatorHoming, TimeoutStopsHomingUntilTheDriverStationDisables) {
+  Drive(kHighRot, kHomingTimeout - 100ms);
+  ExpectHoming();
+  Drive(kHighRot, 200ms);  // the switch never closes
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+  EXPECT_FALSE(Status().at_goal());
+
+  // Neither a live target nor a stale-link glitch (robot_enabled false for
+  // 150 ms) restarts it; a Driver Station disable does.
+  Drive(kHighRot, 500ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  hw.lose_states(30);
+  Drive(kHighRot, 150ms);
+  Drive(kHighRot, 100ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+  DisableAndEnable();
+  Drive(kHighRot, 30ms);
+  ExpectHoming();
+}
+
+// REQ-SAFE-36
+TEST_F(ElevatorHoming, AStalledLiftStopsHoming) {
+  hw.set_motor("elevator", "lift", 0.0, 0.0);  // pushed, but not moving
+  Drive(kHighRot, kHomingStall - 100ms);
+  ExpectHoming();
+  Drive(kHighRot, 200ms);
+  EXPECT_EQ(Lift().mode, Mode::kNeutral);
+  EXPECT_EQ(Status().state(), ElevatorState::HOMING_FAILED);
+}
+
+// config/subsystems/elevator.toml's elevator, as a single-file config with
+// one [lift] key replaced.
+std::string ElevatorConfig(const std::string& key, const std::string& value) {
+  std::vector<std::pair<std::string, std::string>> params{
+      {"tolerance_rot", "0.1"},
+      {"min_rot", "0.0"},
+      {"max_rot", "12.0"},
+      {"homing", "\"limit_switch\""},
+      {"limit_switch", "\"bottom_limit\""},
+      {"homing_v", "-3.0"},
+      {"homing_timeout_us", "6000000"},
+      {"homing_stall_rps", "0.2"},
+      {"homing_stall_us", "500000"},
+      {"home_margin_rot", "0.5"},
+      {"home_samples", "3"}};
+  std::string toml =
+      "[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n\n"
+      "[subsystems.elevator]\nperiod_us = 10000\n\n"
+      "[subsystems.elevator.lift]\n";
+  for (const auto& [k, v] : params)
+    toml += k + " = " + (k == key ? value : v) + "\n";
+  return toml + R"(
+[subsystems.elevator.motors.lift]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+position_frame = "rezero"
+
+[subsystems.elevator.digital_inputs.bottom_limit]
+dio = 1
+)";
+}
+
+// REQ-SAFE-36, REQ-CONTRACT-18: an unsafe homing parameter refuses
+// construction, naming its key.
+TEST(ElevatorConfig, BadParameterFailsConstruction) {
+  {
+    auto sim = Sim::FromToml(ElevatorConfig("", ""));
+    EXPECT_NO_THROW(sim.add<demo::Elevator>("elevator"));
+  }
+  const std::vector<std::pair<std::string, std::string>> bad{
+      {"homing_v", "0.0"},        {"homing_v", "2.0"},
+      {"max_rot", "0.0"},         {"max_rot", "nan"},
+      {"homing_timeout_us", "0"}, {"homing_stall_rps", "0.0"},
+      {"homing_stall_us", "0"},   {"home_margin_rot", "-0.5"},
+      {"home_samples", "0"}};
+  for (const auto& [key, value] : bad) {
+    SCOPED_TRACE(key + " = " + value);
+    auto sim = Sim::FromToml(ElevatorConfig(key, value));
+    try {
+      sim.add<demo::Elevator>("elevator");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(key), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
+// The intake on its own, driven through its superstructure lane by hand.
+class IntakeAlone : public ::testing::Test {
+ protected:
+  void SetUp() override { EnableTeleop(sim, hw); }
+
+  // The superstructure's lane, republished every intake period (20 ms).
+  void Drive(IntakeCommand command, int ticks) {
     for (int i = 0; i < ticks; ++i) {
       PublishTarget(sim, "intake", "superstructure", IntakeGoal{command});
       sim.step(20ms);
     }
-  };
-  drive(IntakeCommand::INTAKE, 2);
-  drive(IntakeCommand::EJECT, 1);
-  const auto initial_status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
-  if (!initial_status.has_value()) {
-    FAIL() << "Expected initial intake status";
   }
-  const auto& initial = *initial_status;
-  ASSERT_EQ(initial.state(), IntakeState::EJECTING);
+  talos::hardware::MotorRequest Roller() const {
+    return hw.motor_request("intake", "roller");
+  }
+  // What the gateway applies, after its enable and expiry gates.
+  talos::hardware::MotorRequest Applied() const {
+    return hw.applied_motor("intake", "roller");
+  }
+  IntakeStatus Status() const {
+    const auto status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
+    EXPECT_TRUE(status.has_value());
+    return status.value_or(IntakeStatus{});
+  }
+  void ExpectNeutral() const {
+    EXPECT_EQ(Roller().mode, Mode::kNeutral);
+    EXPECT_EQ(Applied().mode, Mode::kNeutral);
+  }
 
-  // eject_us = 500000 is 500 ms, not 500 seconds or half a millisecond.
-  drive(IntakeCommand::EJECT, 23);
-  const auto ejecting_status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
-  if (!ejecting_status.has_value()) {
-    FAIL() << "Expected intake status during ejection";
-  }
-  const auto& ejecting = *ejecting_status;
-  EXPECT_EQ(ejecting.state(), IntakeState::EJECTING);
-  EXPECT_DOUBLE_EQ(hw.motor_request("intake", "roller").demand, kEjectVolts);
-  drive(IntakeCommand::EJECT, 3);
-  const auto final_status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
-  if (!final_status.has_value()) {
-    FAIL() << "Expected final intake status";
-  }
-  const auto& final = *final_status;
-  EXPECT_EQ(final.state(), IntakeState::IDLE);
-  EXPECT_EQ(hw.motor_request("intake", "roller").mode, Mode::kNeutral);
+  Sim sim{RobotConfig()};
+  demo::Intake& intake = sim.add<demo::Intake>("intake");
+  SimHardware hw{sim};
+};
+
+// The intake's matrix cases that prove it uses its Target; the rest of the
+// matrix runs on the elevator above, and the roller's own gates in
+// //talOS/mechanisms:roller_with_sensor_test.
+// REQ-SAFE-07
+TEST_F(IntakeAlone, DrivesAtALiveLane) {
+  Drive(IntakeCommand::INTAKE, 3);
+  EXPECT_EQ(Applied().mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(Applied().demand, kIntakeVolts);
+  EXPECT_EQ(Status().state(), IntakeState::INTAKING);
 }
 
-// The intake with no target: the state machine carries on, the roller is
-// neutral.
-TEST(IntakeAlone, NeutralWhenTheLaneGoesStale) {
-  Sim sim{RobotConfig()};
-  sim.add<demo::Intake>("intake");
-  SimHardware hw{sim};
-  EnableTeleop(sim, hw);
-  for (int i = 0; i < 5; ++i) {
-    PublishTarget(sim, "intake", "superstructure",
-                  IntakeGoal{IntakeCommand::INTAKE});
-    sim.step(20ms);
-  }
+// REQ-SAFE-02
+TEST_F(IntakeAlone, DisabledRobotGoesNeutral) {
+  Drive(IntakeCommand::INTAKE, 3);
+  ASSERT_EQ(Applied().mode, Mode::kVoltage);
+  hw.enable(false);
+  Drive(IntakeCommand::INTAKE, 3);
+  ExpectNeutral();
+  EXPECT_EQ(Status().state(), IntakeState::IDLE);  // still published
+}
+
+// REQ-SAFE-07: the state machine carries on, the roller is neutral.
+TEST_F(IntakeAlone, StaleLaneGoesNeutral) {
+  Drive(IntakeCommand::INTAKE, 5);
   hw.set_digital_input("intake", "beam_break", true);
-  for (int i = 0; i < 5; ++i) {
-    PublishTarget(sim, "intake", "superstructure",
-                  IntakeGoal{IntakeCommand::INTAKE});
-    sim.step(20ms);
-  }
-  ASSERT_EQ(hw.motor_request("intake", "roller").mode, Mode::kVoltage);
-  ASSERT_DOUBLE_EQ(hw.motor_request("intake", "roller").demand, kHoldVolts);
+  Drive(IntakeCommand::INTAKE, 5);
+  ASSERT_EQ(Roller().mode, Mode::kVoltage);
+  ASSERT_DOUBLE_EQ(Roller().demand, kHoldVolts);
 
   sim.step(140ms);  // past command_timeout_us (100 ms)
-  EXPECT_EQ(hw.motor_request("intake", "roller").mode, Mode::kNeutral);
-  const auto status = sim.latest<IntakeStatus>(topics::kIntakeStatus);
-  if (!status.has_value()) {
-    FAIL() << "no intake status";
-  }
-  EXPECT_EQ(status->state(), IntakeState::HOLDING);
-  EXPECT_TRUE(status->has_piece());
+  ExpectNeutral();
+  EXPECT_EQ(Status().state(), IntakeState::HOLDING);
+  EXPECT_TRUE(Status().has_piece());
+}
+
+// REQ-SAFE-09
+TEST_F(IntakeAlone, EarlierGenerationTargetIsIgnored) {
+  Drive(IntakeCommand::INTAKE, 3);
+  ASSERT_EQ(Applied().mode, Mode::kVoltage);
+  const std::uint64_t before = DriverStationGeneration(sim);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  // Re-enabled; the earlier enable's goal lands in the same drain as the
+  // re-enabling packet (see ElevatorAlone's case).
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(20ms);
+  ASSERT_NE(DriverStationGeneration(sim), before);
+  PublishTarget(sim, "intake", "superstructure",
+                IntakeGoal{IntakeCommand::INTAKE}, before);
+  sim.step(20ms);
+  ExpectNeutral();
+  // The same goal stamped with the current generation drives.
+  Drive(IntakeCommand::INTAKE, 2);
+  EXPECT_EQ(Applied().mode, Mode::kVoltage);
+}
+
+TEST_F(IntakeAlone, EjectDurationUsesMicroseconds) {
+  Drive(IntakeCommand::INTAKE, 2);
+  Drive(IntakeCommand::EJECT, 1);
+  ASSERT_EQ(Status().state(), IntakeState::EJECTING);
+
+  // eject_us = 500000 is 500 ms, not 500 seconds or half a millisecond.
+  Drive(IntakeCommand::EJECT, 23);
+  EXPECT_EQ(Status().state(), IntakeState::EJECTING);
+  EXPECT_DOUBLE_EQ(Roller().demand, kEjectVolts);
+  Drive(IntakeCommand::EJECT, 3);
+  EXPECT_EQ(Status().state(), IntakeState::IDLE);
+  EXPECT_EQ(Roller().mode, Mode::kNeutral);
 }
 
 }  // namespace

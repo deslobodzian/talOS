@@ -2,20 +2,28 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "alert_test/alert_message_descriptor.h"
+#include "alert_test/alert_message_generated.h"
 #include "continuity_test/continuity_message_descriptor.h"
 #include "continuity_test/continuity_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/hardware/messages.h"
+#include "talOS/hardware/packet.h"
 
 namespace {
 
@@ -29,16 +37,19 @@ class LogDumpTest : public testing::Test {
         rules_cc::cc::runfiles::Runfiles::CreateForTest(
             BAZEL_CURRENT_REPOSITORY, &error));
     ASSERT_NE(runfiles, nullptr) << error;
-    ASSERT_NE(std::getenv("TALOS_LOG_DUMP"), nullptr);
-    binary_ = runfiles->Rlocation(std::getenv("TALOS_LOG_DUMP"));
+    const char* log_dump = std::getenv("TALOS_LOG_DUMP");
+    ASSERT_NE(log_dump, nullptr);
+    binary_ = runfiles->Rlocation(log_dump);
     WriteLog("alpha", "/alpha/state", {0, 20});
     WriteLog("beta", "/beta/quote,\"\n", {10, 30});
   }
 
   void TearDown() override { std::filesystem::remove_all(directory_); }
 
+  // One record per time, each {7, 9} unless `values` gives them.
   void WriteLog(const std::string& process, const std::string& topic,
-                const std::vector<int>& times) {
+                const std::vector<int>& times,
+                const std::vector<continuity_test::Count>& values = {}) {
     using D = talos::Descriptor<continuity_test::Count>;
     talos::event::Registration source;
     source.id = 1;
@@ -61,8 +72,10 @@ class LogDumpTest : public testing::Test {
       ctx.event_time = talos::event::MonotonicTime::from_nanos(
           1'000'000'000 + times[i] * 1'000'000);
       ctx.now = ctx.event_time;
+      ctx.publish_time = ctx.event_time - std::chrono::milliseconds{3};
       ctx.sequence = i + 1;
-      const continuity_test::Count value{7, 9};
+      const continuity_test::Count value =
+          values.empty() ? continuity_test::Count{7, 9} : values.at(i);
       writer.dispatch(ctx, std::as_bytes(std::span{&value, 1}));
     }
     writer.flush();
@@ -99,41 +112,33 @@ class LogDumpTest : public testing::Test {
   std::string binary_;
 };
 
-TEST_F(LogDumpTest, DefaultTextAndNodeFilters) {
-  const auto text = Run({});
-  EXPECT_NE(text.find("merged log dump: 2 files, 4 total records"),
-            std::string::npos);
-  EXPECT_NE(text.find("summary: 4 records across 2 processes"),
-            std::string::npos);
-  EXPECT_NE(text.find("continuity_test.Count"), std::string::npos);
-  const auto alpha = Run({"--node", "alpha"});
-  EXPECT_NE(alpha.find("summary: 2 records across 1 processes"),
-            std::string::npos);
-  EXPECT_EQ(alpha.find("[beta"), std::string::npos);
-  EXPECT_NE(Run({"--node", "alpha,beta"}).find("summary: 4 records"),
-            std::string::npos);
-  EXPECT_NE(
-      Run({"--node", "alpha", "--node", "beta"}).find("summary: 4 records"),
-      std::string::npos);
+TEST_F(LogDumpTest, NodeFiltersSelectOnlyRequestedProcesses) {
+  for (const auto& selection : std::vector<std::vector<std::string>>{
+           {"--node", "alpha,beta"}, {"--node", "alpha", "--node", "beta"}}) {
+    auto args = selection;
+    args.insert(args.end(), {"--format", "jsonl"});
+    const auto records = Run(args);
+    EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 4);
+  }
+  const auto records = Run({"--format", "jsonl", "--node", "alpha"});
+  EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 2);
+  EXPECT_EQ(records.find("\"process\":\"beta\""), std::string::npos);
+  EXPECT_NE(records.find("\"process\":\"alpha\""), std::string::npos);
 }
 
-TEST_F(LogDumpTest, TopicFiltersAndStableInclusiveWindow) {
-  EXPECT_NE(Run({"--topic", "/alpha/state"}).find("summary: 2 records"),
-            std::string::npos);
-  EXPECT_NE(Run({"--topic", "/beta/*"}).find("summary: 2 records"),
-            std::string::npos);
-  EXPECT_NE(Run({"--topic", "/alpha/state,/beta/*"}).find("summary: 4 records"),
-            std::string::npos);
-  EXPECT_NE(Run({"--topic", "/alpha/state", "--topic", "/beta/*"})
-                .find("summary: 4 records"),
-            std::string::npos);
-  const auto window =
-      Run({"--node", "beta", "--since-ms", "10", "--until-ms", "10"});
-  EXPECT_NE(window.find("summary: 1 records"), std::string::npos);
-  EXPECT_NE(window.find("10.000ms"), std::string::npos);
-  EXPECT_NE(
-      Run({"--since-ms", "20", "--until-ms", "30"}).find("summary: 2 records"),
-      std::string::npos);
+TEST_F(LogDumpTest, TopicFiltersAndInclusiveWindow) {
+  for (const std::string topic : {"/alpha/state", "/beta/*"}) {
+    const auto records = Run({"--format", "jsonl", "--topic", topic});
+    EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 2);
+    EXPECT_EQ(records.find(topic == "/alpha/state" ? "\"process\":\"beta\""
+                                                   : "\"process\":\"alpha\""),
+              std::string::npos);
+  }
+  const auto records =
+      Run({"--format", "jsonl", "--since-ms", "10", "--until-ms", "20"});
+  EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 2);
+  EXPECT_NE(records.find("\"event_ms\":10,"), std::string::npos);
+  EXPECT_NE(records.find("\"event_ms\":20,"), std::string::npos);
 }
 
 TEST_F(LogDumpTest, MachineReadableFormatsEscapeAndDecode) {
@@ -145,24 +150,223 @@ TEST_F(LogDumpTest, MachineReadableFormatsEscapeAndDecode) {
       std::string::npos);
   EXPECT_NE(json.find("\"topic\":\"/beta/quote,\\\"\\u000a\""),
             std::string::npos);
-  EXPECT_NE(json.find("\"event_ms\":10,\"now_ms\":10,\"sequence\":1,\"aux\":0,"
-                      "\"payload_bytes\":8"),
+  EXPECT_NE(json.find("\"event_ms\":10,\"now_ms\":10,\"publish_ms\":7,"
+                      "\"sequence\":1,\"aux\":0,\"payload_bytes\":8"),
             std::string::npos);
-  EXPECT_NE(json.find("\"schema\":\"continuity_test.Count\",\"decoded\":\"{run_"
-                      "index: 7, sequence_count: 9}\""),
+  EXPECT_NE(json.find("\"schema\":\"continuity_test.Count\","
+                      "\"payload_hex\":\"0700000009000000\","
+                      "\"decoded\":\"{run_index: 7, sequence_count: 9}\""),
             std::string::npos);
   EXPECT_EQ(json.find("summary"), std::string::npos);
   const auto csv =
       Run({"--format", "csv", "--node", "beta", "--until-ms", "10"});
   EXPECT_TRUE(
       csv.starts_with("process,dispatch_index,kind,source_id,topic,event_ms,"
-                      "now_ms,sequence,aux,payload_bytes,schema,decoded\r\n"));
+                      "now_ms,publish_ms,sequence,aux,payload_bytes,schema,"
+                      "decoded,hardware\r\n"));
   EXPECT_NE(csv.find("beta,1,TIMER,1,\"/beta/"
-                     "quote,\"\"\n\",10,10,1,0,8,continuity_test.Count,"),
+                     "quote,\"\"\n\",10,10,7,1,0,8,continuity_test.Count,"),
             std::string::npos);
-  EXPECT_NE(csv.find("\"{run_index: 7, sequence_count: 9}\"\r\n"),
+  EXPECT_NE(csv.find("\"{run_index: 7, sequence_count: 9}\",\r\n"),
             std::string::npos);
   EXPECT_EQ(csv.find("summary"), std::string::npos);
+}
+
+TEST_F(LogDumpTest, JsonExportsCompletePayloadBeyondDisplayHexLimit) {
+  talos::event::Registration source;
+  source.id = 1;
+  source.kind = talos::event::SourceKind::SENDER;
+  source.name = "/raw";
+  source.message_bytes = 96;
+  talos::event::log::LogWriter writer{
+      directory_ + "/raw.tlog", "raw",
+      talos::event::log::LogWriterOptions{4096, 1, false}, 42};
+  writer.start({source},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  std::vector<std::byte> payload(96, std::byte{0xab});
+  payload.back() = std::byte{0};  // Preserve trailing zeros too.
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.source_id = 1;
+  ctx.dispatch_index = 1;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  writer.dispatch(ctx, payload);
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+  std::string expected{"\"payload_hex\":\""};
+  for (int i = 0; i < 95; ++i) expected += "ab";
+  expected += "00\"";
+  EXPECT_NE(Run({"--format", "jsonl", "--node", "raw"}).find(expected),
+            std::string::npos);
+}
+
+// A recorded request reads by device name from the config the session's
+// manifest names, with no flag; the bytes stay in payload_hex. A relative
+// config_path (as manifests written before the launcher recorded it absolute
+// hold) is relative to where `bazel run` was run, not to log_dump's runfiles
+// directory.
+TEST_F(LogDumpTest, HardwarePacketsDecodeWithTheSessionConfig) {
+  constexpr std::string_view kToml = R"(
+[robot]
+period_us = 5000
+
+[subsystems.shooter]
+period_us = 10000
+
+[subsystems.shooter.motors.flywheel]
+type = "TalonFX"
+can_id = 2
+)";
+  std::filesystem::create_directories(directory_ + "/configuration");
+  std::ofstream{directory_ + "/configuration/robot.toml"} << kToml;
+  std::ofstream{directory_ + "/manifest.json"}
+      << "{\n  \"session_id\": 42,\n  \"config_path\": "
+         "\"configuration/robot.toml\",\n  \"nodes\": []\n}\n";
+  ASSERT_EQ(setenv("BUILD_WORKING_DIRECTORY", directory_.c_str(), 1), 0);
+  const auto config = talos::config::ParseRobotConfigString(kToml).hardware;
+
+  using D = talos::Descriptor<talos::hardware::Packet>;
+  talos::event::Registration source;
+  source.id = 1;
+  source.kind = talos::event::SourceKind::SENDER;
+  source.name = talos::hardware::RequestTopic("shooter");
+  source.message_bytes = sizeof(talos::hardware::Packet);
+  source.schema = {std::string{D::kName}, D::kHash, {}};
+  talos::event::log::LogWriter writer{
+      directory_ + "/shooter.tlog", "shooter",
+      talos::event::log::LogWriterOptions{8192, 1, false}, 42};
+  writer.start({source},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  talos::hardware::Command command;
+  command.config_id = talos::hardware::ConfigurationId(config);
+  command.count = 1;
+  command.motors[0] = {config.motors.at(0).id, talos::hardware::Mode::kVoltage,
+                       0, 6.0, 0.0};
+  talos::hardware::Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(talos::hardware::Encode(command, packet.data));
+  talos::event::Context ctx{};
+  ctx.kind = talos::event::EventKind::SEND;
+  ctx.source_id = 1;
+  ctx.dispatch_index = 1;
+  ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+  ctx.now = ctx.event_time;
+  writer.dispatch(ctx, std::as_bytes(std::span{&packet, 1}));
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto json = Run({"--format", "jsonl", "--node", "shooter"});
+  unsetenv("BUILD_WORKING_DIRECTORY");
+  EXPECT_NE(json.find("\"payload_hex\":\""), std::string::npos) << json;
+  EXPECT_NE(json.find("\"hardware\":{\"type\":\"command\""), std::string::npos)
+      << json;
+  EXPECT_NE(json.find("\"name\":\"flywheel\",\"mode\":\"voltage\",\"slot\":0,"
+                      "\"demand\":6,"),
+            std::string::npos)
+      << json;
+}
+
+// Guards: a log named more than once (as itself, twice, and through its
+// session directory) is merged once, so each record prints once.
+// REQ-OPS-15
+TEST_F(LogDumpTest, LogNamedTwiceIsReadOnce) {
+  const std::string alpha = directory_ + "/alpha.tlog";
+  const auto records = Run({"--format", "jsonl", alpha, alpha});
+  EXPECT_EQ(std::count(records.begin(), records.end(), '\n'), 4) << records;
+}
+
+// Guards: the summary a student reads to see whether a mechanism moved. Per
+// topic it counts the records, keeps the latest value, and ranges each
+// numeric field over the session numerically (11 above 2, though the
+// latest is 4); --topic and --node select its blocks.
+// REQ-OPS-15
+TEST_F(LogDumpTest, SummaryGivesCountsLatestValueAndRangePerTopic) {
+  WriteLog("gamma", "/gamma/state", {5, 15, 25}, {{2, 9}, {11, 9}, {4, 9}});
+  const auto lines = [](const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream{text};
+    for (std::string line; std::getline(stream, line);) out.push_back(line);
+    return out;
+  };
+  const auto has = [](const std::vector<std::string>& block,
+                      const std::string& line) {
+    return std::find(block.begin(), block.end(), line) != block.end();
+  };
+
+  const auto gamma = lines(Run({"--format", "summary", "--topic", "/gamma/*"}));
+  EXPECT_EQ(std::count_if(gamma.begin(), gamma.end(),
+                          [](const std::string& line) {
+                            return line.starts_with("topic ");
+                          }),
+            1);
+  EXPECT_TRUE(has(gamma, "topic /gamma/state continuity_test.Count"));
+  EXPECT_TRUE(has(gamma, "  records gamma TIMER 3"));
+  EXPECT_TRUE(has(gamma, "  latest {run_index: 4, sequence_count: 9}"));
+  EXPECT_TRUE(has(gamma, "  range run_index 2 11"));
+  EXPECT_TRUE(has(gamma, "  range sequence_count 9 9"));
+  // Publication times: each record was published 3 ms before its event.
+  EXPECT_TRUE(has(gamma, "  first_ms 2.000"));
+  EXPECT_TRUE(has(gamma, "  last_ms 22.000"));
+
+  const auto alpha = lines(Run({"--format", "summary", "--node", "alpha"}));
+  EXPECT_TRUE(has(alpha, "topic /alpha/state continuity_test.Count"));
+  EXPECT_TRUE(has(alpha, "  records alpha TIMER 2"));
+  EXPECT_FALSE(has(alpha, "topic /gamma/state continuity_test.Count"));
+}
+
+// Guards: each record of a node's `status` topic carries every alert field's
+// level and state, nested ones by path, so a session read offline shows when
+// each alert was raised; an `alert_` field that names no level, the same
+// message on a topic of another role, and a record with no alert field get
+// none.
+// REQ-OPS-37
+TEST_F(LogDumpTest, StatusRecordsCarryTheirAlerts) {
+  using D = talos::Descriptor<alert_test::Status>;
+  talos::event::log::LogWriter writer{
+      directory_ + "/watchdog.tlog", "watchdog",
+      talos::event::log::LogWriterOptions{4096, 1, false}, 42};
+  std::vector<talos::event::Registration> sources;
+  for (const std::uint16_t id : {1, 2}) {
+    talos::event::Registration source;
+    source.id = id;
+    source.kind = talos::event::SourceKind::SENDER;
+    source.name = id == 1 ? "/watchdog/status" : "/watchdog/state";
+    source.message_bytes = sizeof(alert_test::Status);
+    source.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+    sources.push_back(source);
+  }
+  writer.start(sources, talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  const alert_test::Status status{true, true, alert_test::Health{false}, 12.5F};
+  for (const std::uint16_t id : {1, 2}) {
+    talos::event::Context ctx{};
+    ctx.kind = talos::event::EventKind::SEND;
+    ctx.source_id = id;
+    ctx.dispatch_index = id;
+    ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+    ctx.now = ctx.event_time;
+    ctx.publish_time = ctx.event_time;
+    writer.send(ctx, id, std::as_bytes(std::span{&status, 1}), 0, id);
+  }
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto status_json =
+      Run({"--format", "jsonl", "--topic", "/watchdog/status"});
+  EXPECT_NE(status_json.find(
+                ",\"alerts\":[{\"name\":\"alert_error_link_lost\",\"level\":"
+                "\"error\",\"active\":true},{\"name\":\"health.alert_warning_"
+                "hot\",\"level\":\"warning\",\"active\":false}]}"),
+            std::string::npos)
+      << status_json;
+  for (const std::string topic : {"/watchdog/state", "/alpha/state"}) {
+    const auto json = Run({"--format", "jsonl", "--topic", topic});
+    EXPECT_NE(json.find("\"topic\":\"" + topic + "\""), std::string::npos)
+        << json;
+    EXPECT_EQ(json.find("\"alerts\""), std::string::npos) << json;
+  }
 }
 
 TEST_F(LogDumpTest, RejectsInvalidOptions) {
@@ -173,9 +377,7 @@ TEST_F(LogDumpTest, RejectsInvalidOptions) {
                                              {"--until-ms", "inf"},
                                              {"--since-ms", "bad"},
                                              {"--until-ms", "10oops"}}) {
-    const auto output = Run(args, false);
-    EXPECT_NE(output.find("log_dump:"), std::string::npos);
-    EXPECT_NE(output.find("usage:"), std::string::npos);
+    Run(args, false);
   }
 }
 

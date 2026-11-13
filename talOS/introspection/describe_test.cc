@@ -2,15 +2,24 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
+#include <span>
 #include <string>
+#include <string_view>
+#include <vector>
 
+#include "talOS/events/callback.h"
+#include "talOS/events/context.h"
 #include "talOS/events/manifest.h"
+#include "talOS/events/simulated_event_loop.h"
 #include "talOS/introspection/names.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::introspect {
 namespace {
 
 constexpr std::uint32_t kSlots = 1024;
+
 event::Manifest sample_manifest() {
   event::Manifest manifest;
   manifest.push_back({.id = 0,
@@ -47,6 +56,8 @@ void ExpectSameDescription(const Description& written,
   EXPECT_EQ(read.name, written.name);
   EXPECT_EQ(read.target, written.target);
   EXPECT_EQ(read.reads_graph, written.reads_graph);
+  EXPECT_EQ(read.holds_stop, written.holds_stop);
+  EXPECT_EQ(read.params, written.params);
   ASSERT_EQ(read.sources.size(), written.sources.size());
   for (std::size_t i = 0; i < written.sources.size(); ++i) {
     const auto& a = written.sources[i];
@@ -54,8 +65,6 @@ void ExpectSameDescription(const Description& written,
     EXPECT_EQ(b.kind, a.kind) << "source " << i;
     EXPECT_EQ(b.name, a.name) << "source " << i;
     EXPECT_EQ(b.message_bytes, a.message_bytes) << "source " << i;
-    EXPECT_EQ(b.external(), a.external()) << "source " << i;
-    EXPECT_EQ(b.optional(), a.optional()) << "source " << i;
     EXPECT_EQ(b.flags, a.flags) << "source " << i;
     EXPECT_EQ(b.schema, a.schema) << "source " << i;
     EXPECT_EQ(b.schema_hash, a.schema_hash) << "source " << i;
@@ -65,106 +74,60 @@ void ExpectSameDescription(const Description& written,
   }
 }
 
-TEST(Describe, RoundTripsEverySourceKind) {
-  const Description written = DescribeManifest(
-      "drivetrain", "//2026-robot/main_processor/drivetrain:node",
-      sample_manifest(), kSlots);
-  ASSERT_EQ(written.sources.size(), 4u);
-  EXPECT_TRUE(written.sources[0].schema.empty());  // a timer has none
-  EXPECT_EQ(written.sources[1].schema, "drivetrain.ChassisTarget");
-  EXPECT_EQ(written.sources[2].alignment, 4u);
-  EXPECT_EQ(written.sources[3].slots, kSlots);
-
-  Description read;
-  std::string error;
-  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
-      << error;
-  EXPECT_TRUE(error.empty());
-  ExpectSameDescription(written, read);
-  // The full 64 bits survive: JSON carries the hash as a string.
-  EXPECT_EQ(read.sources[1].schema_hash, 0xfedcba9876543210ULL);
-}
-
-TEST(Describe, RejectsATopicWithoutASchema) {
-  event::Manifest manifest = sample_manifest();
-  manifest[3].schema = {};
-  Description read;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(
-      DescribeToJson(DescribeManifest("d", "//d:d", manifest, kSlots)), read,
-      error));
-  EXPECT_NE(error.find("/hw/request/drivetrain"), std::string::npos) << error;
-  EXPECT_NE(error.find("schema"), std::string::npos) << error;
-}
-
-TEST(Describe, RoundTripsEndpointFlags) {
-  // Both flags on one topic, one flag on another, none on the rest: the reader
-  // looks each up by key, so a missing key must not shift the answer onto the
-  // next source.
-  const Description written = DescribeManifest(
-      "driver", "//2026-robot/main_processor/driver:node", sample_manifest(),
-      kSlots,
-      {{"/hw/request/drivetrain",
-        naming::kSourceFlagExternal | naming::kSourceFlagOptional},
-       {"/drivetrain/target", naming::kSourceFlagOptional}});
-
-  ASSERT_EQ(written.sources.size(), 4u);
-  EXPECT_TRUE(written.sources[1].optional());
-  EXPECT_FALSE(written.sources[1].external());
-  EXPECT_TRUE(written.sources[3].external());
-  EXPECT_TRUE(written.sources[3].optional());
-
-  Description read;
-  std::string error;
-  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
-      << error;
-  ExpectSameDescription(written, read);
-}
-
-// The schema bytes cross as base64, every byte value and every padding
-// length included, so a graph-reading node gets the bfbs the publisher has.
-TEST(Describe, RoundTripsSchemaBytesObserversAndGraphReaders) {
+// Every source kind, endpoint flags looked up by key (a missing key must not
+// shift onto the next source), schema bytes at every base64 padding length,
+// the full 64-bit hash, names that need escaping, and parameter keys holding
+// the brackets, braces and field names a scanning reader would stop at.
+TEST(Describe, RoundTripsEveryField) {
   event::Manifest manifest = sample_manifest();
   std::string bytes;
   for (int i = 0; i < 256; ++i) bytes += static_cast<char>(i);
   manifest[1].schema.bfbs = bytes;               // 256 bytes: two '='
   manifest[2].schema.bfbs = bytes.substr(0, 5);  // one '='
   manifest[3].schema.bfbs = bytes.substr(7, 3);  // none
-  Description written =
-      DescribeManifest("telemetry", "//talOS/telemetry:node", manifest, kSlots,
-                       {{"/drivetrain/target", naming::kSourceFlagObserver}});
+  manifest.push_back({.id = 4,
+                      .kind = event::SourceKind::SENDER,
+                      .name = R"(/odd/state/"quoted\path)",
+                      .message_bytes = 8,
+                      .schema = {R"(odd."quoted)", 2}});
+  Description written = DescribeManifest(
+      R"(od"d)", R"(//example/od\d:node)", manifest, kSlots,
+      {{"/hw/request/drivetrain", naming::kSourceFlagExternal |
+                                      naming::kSourceFlagOptional |
+                                      naming::kSourceFlagHardwareRequest},
+       {"/drivetrain/target", naming::kSourceFlagOptional},
+       {"/driver_station/state", naming::kSourceFlagObserver}});
   written.reads_graph = true;
-  ASSERT_TRUE(written.sources[1].observer());
-  EXPECT_EQ(written.sources[1].bfbs, bytes);
+  written.holds_stop = true;
+  written.params = {{"drivetrain", "geometry.modules[0].x_m"},
+                    {R"(od"d)", "sources"},
+                    {"describe_version", R"(odd]}{["key)"}};
+  ASSERT_EQ(written.sources.size(), 5u);
+  ASSERT_EQ(written.sources[3].flags, naming::kSourceFlagExternal |
+                                          naming::kSourceFlagOptional |
+                                          naming::kSourceFlagHardwareRequest);
+  ASSERT_EQ(written.sources[3].slots, kSlots);
+  ASSERT_EQ(written.sources[1].bfbs, bytes);
 
   Description read;
   std::string error;
   ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
       << error;
   ExpectSameDescription(written, read);
-  EXPECT_TRUE(read.sources[1].observer());
-  EXPECT_FALSE(read.sources[2].observer());
-}
-
-TEST(Describe, RejectsMalformedSchemaBytes) {
-  std::string json =
-      DescribeToJson(DescribeManifest("d", "//d:d", sample_manifest(), kSlots));
-  const std::size_t at = json.find("\"bfbs\": \"\"");
-  ASSERT_NE(at, std::string::npos);
-  json.replace(at, 10, "\"bfbs\": \"abc\"");
-  Description read;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(json, read, error));
-  EXPECT_NE(error.find("bfbs"), std::string::npos) << error;
+  EXPECT_EQ(read.sources[1].schema_hash, 0xfedcba9876543210ULL);
 }
 
 TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
   event::Manifest manifest = sample_manifest();
   manifest[1].schema.bfbs = std::string{"\x00\x01{}[]\"", 7};
-  const DeclaredGraph written{
+  DeclaredGraph written{
       DescribeManifest("drivetrain", "//d:drivetrain", manifest, kSlots),
       DescribeManifest("empty", "//e:empty", event::Manifest{}, kSlots),
       DescribeManifest("shooter", "//s:shooter", sample_manifest(), kSlots)};
+  // Reported, reported as none, and not reported (nullopt) stay distinct.
+  written[0].params =
+      std::vector<ParamRead>{ParamRead{"describe_version", "describe_version"}};
+  written[1].params.emplace();
   DeclaredGraph read;
   std::string error;
   ASSERT_TRUE(
@@ -181,35 +144,6 @@ TEST(Describe, DeclaredGraphRoundTripsEveryNode) {
   EXPECT_FALSE(DescribeReader::ParseGraph("not json", read, error));
 }
 
-TEST(Describe, RoundTripsANodeThatRegisteredNothing) {
-  const Description written = DescribeManifest("empty", "//example/empty:node",
-                                               event::Manifest{}, kSlots);
-
-  Description read;
-  std::string error;
-  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
-      << error;
-  EXPECT_TRUE(read.sources.empty());
-  ExpectSameDescription(written, read);
-}
-
-TEST(Describe, RoundTripsNamesThatNeedEscaping) {
-  event::Manifest manifest;
-  manifest.push_back({.id = 0,
-                      .kind = event::SourceKind::SENDER,
-                      .name = R"(/odd/state/"quoted\path)",
-                      .message_bytes = 8,
-                      .schema = {R"(odd."quoted)", 2}});
-  const Description written =
-      DescribeManifest(R"(od"d)", R"(//example/od\d:node)", manifest, kSlots);
-
-  Description read;
-  std::string error;
-  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
-      << error;
-  ExpectSameDescription(written, read);
-}
-
 TEST(Describe, WritesTheKindNamesTheRegistryUses) {
   // Not a formatting preference: the registry and the log print kinds with
   // event::to_string, and a viewer joining declared to running matches on them.
@@ -220,79 +154,6 @@ TEST(Describe, WritesTheKindNamesTheRegistryUses) {
   EXPECT_NE(json.find("\"kind\": \"FETCHER\""), std::string::npos);
   EXPECT_NE(json.find("\"kind\": \"SENDER\""), std::string::npos);
   EXPECT_NE(json.find("\"describe_version\": 1"), std::string::npos);
-}
-
-// Everything below is a launcher failure path. The launcher's input is a child
-// process's stdout, which may be anything at all, and the answer must be a
-// false with a message a person can act on -- never a throw, and never a true
-// with an empty graph, which would read as "this node has no topics" and pass
-// the lint.
-
-TEST(Describe, RejectsAUsageMessage) {
-  Description out;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(
-      "usage: node [--sim] [--duration-s N] [--log PATH]\n", out, error));
-  EXPECT_NE(error.find("did not answer --describe"), std::string::npos);
-  EXPECT_TRUE(out.sources.empty());
-}
-
-TEST(Describe, RejectsAStackTrace) {
-  Description out;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(
-      "libc++abi: terminating due to uncaught exception of type "
-      "std::runtime_error: topic '/hw/state' used with two different message "
-      "sizes\n0   node   0x0000000102d3c1f8 main + 132\n",
-      out, error));
-  EXPECT_FALSE(error.empty());
-}
-
-TEST(Describe, RejectsEmptyOutput) {
-  Description out;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse("", out, error));
-  EXPECT_FALSE(error.empty());
-}
-
-TEST(Describe, RejectsAVersionItCannotRead) {
-  std::string json = DescribeToJson(
-      DescribeManifest("odometry", "//x:odometry", sample_manifest(), kSlots));
-  const std::size_t at = json.find("\"describe_version\": 1");
-  ASSERT_NE(at, std::string::npos);
-  json.replace(at, 21, "\"describe_version\": 2");
-
-  Description out;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(json, out, error));
-  EXPECT_NE(error.find("describe_version 2"), std::string::npos);
-  EXPECT_TRUE(out.sources.empty());
-}
-
-TEST(Describe, RejectsAnUnterminatedSourcesArray) {
-  // A node killed mid-print: the JSON starts out well-formed, so a reader that
-  // only checked the prefix would report a truncated graph as a complete one.
-  std::string json = DescribeToJson(
-      DescribeManifest("odometry", "//x:odometry", sample_manifest(), kSlots));
-  json.resize(json.find("\"/driver_station/state\""));
-
-  Description out;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(json, out, error));
-  EXPECT_NE(error.find("not terminated"), std::string::npos);
-}
-
-TEST(Describe, RejectsAnUnknownSourceKind) {
-  std::string json = DescribeToJson(
-      DescribeManifest("odometry", "//x:odometry", sample_manifest(), kSlots));
-  const std::size_t at = json.find("\"WATCHER\"");
-  ASSERT_NE(at, std::string::npos);
-  json.replace(at, 9, "\"LISTENER\"");
-
-  Description out;
-  std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(json, out, error));
-  EXPECT_NE(error.find("LISTENER"), std::string::npos);
 }
 
 TEST(Describe, ReadsThroughOutputPrintedAheadOfTheJson) {
@@ -312,12 +173,83 @@ TEST(Describe, ReadsThroughOutputPrintedAheadOfTheJson) {
   ExpectSameDescription(written, read);
 }
 
-TEST(Describe, RejectsOutputWithNoNodeIdentity) {
-  Description out;
+// The launcher's input is a child process's stdout, which may be anything at
+// all, and the answer must be a false with a message -- never a throw, and
+// never a true with a partial or empty graph, which would read as "this node
+// has these topics" and pass the lint.
+TEST(Describe, RejectsOutputThatIsNotACompleteDescription) {
+  const std::string valid =
+      DescribeToJson(DescribeManifest("d", "//d:d", sample_manifest(), kSlots));
+  const auto replaced = [&valid](std::string_view from, std::string_view to) {
+    std::string json = valid;
+    const std::size_t at = json.find(from);
+    EXPECT_NE(at, std::string::npos) << from;
+    if (at != std::string::npos) json.replace(at, from.size(), to);
+    return json;
+  };
+  event::Manifest unschematized = sample_manifest();
+  unschematized[3].schema = {};
+  struct Case {
+    const char* what;
+    std::string output;
+  };
+  for (const auto& [what, output] : std::vector<Case>{
+           {"usage message",
+            "usage: node [--sim] [--duration-s N] [--log PATH]\n"},
+           {"stack trace",
+            "libc++abi: terminating due to uncaught exception of type "
+            "std::runtime_error: topic '/hw/state' used with two different "
+            "message sizes\n0   node   0x0000000102d3c1f8 main + 132\n"},
+           {"empty", ""},
+           {"no node identity",
+            "{\n  \"describe_version\": 1,\n  \"sources\": []\n}\n"},
+           {"unreadable version",
+            replaced("\"describe_version\": 1", "\"describe_version\": 2")},
+           // A node killed mid-print starts out well-formed.
+           {"unterminated sources",
+            valid.substr(0, valid.find("\"/driver_station/state\""))},
+           {"unknown source kind", replaced("\"WATCHER\"", "\"LISTENER\"")},
+           {"malformed schema bytes",
+            replaced("\"bfbs\": \"\"", "\"bfbs\": \"abc\"")},
+           {"topic without a schema",
+            DescribeToJson(
+                DescribeManifest("d", "//d:d", unschematized, kSlots))},
+       }) {
+    Description out;
+    std::string error;
+    EXPECT_FALSE(DescribeReader::Parse(output, out, error)) << what;
+    EXPECT_FALSE(error.empty()) << what;
+  }
+}
+
+// REQ-OPS-32: the launcher sizes a member's log share from its describe, and
+// a latest-only watcher logs at most one message per drain where a sequence
+// watcher logs every message. --describe must therefore say which is which,
+// as the loop decided it (an empty callback, or latest_only asked for).
+TEST(Describe, MarksExactlyTheLoopsLatestOnlyWatchers) {
+  event::SimulationEnvironment environment;
+  event::SimulatedEventLoop<> loop{environment};
+  const schema::Identity schema{"test.Count", 7};
+  const event::Thunk callback{
+      nullptr, [](void*, const event::Context&, std::span<const std::byte>) {}};
+  const auto sequence =
+      loop.register_watcher("/a/state", 8, 8, schema, callback);
+  const auto empty = loop.register_watcher("/b/state", 8, 8, schema, {});
+  const auto asked =
+      loop.register_watcher("/c/state", 8, 8, schema, callback, true);
+  const auto sender = loop.register_sender("/d/state", 8, 8, schema);
+
+  const Description written = DescribeManifest(
+      "n", "//n:n", loop.manifest(), kSlots, {}, LoopSourceFlags(loop));
+  Description read;
   std::string error;
-  EXPECT_FALSE(DescribeReader::Parse(
-      "{\n  \"describe_version\": 1,\n  \"sources\": []\n}\n", out, error));
-  EXPECT_NE(error.find("name"), std::string::npos);
+  ASSERT_TRUE(DescribeReader::Parse(DescribeToJson(written), read, error))
+      << error;
+  ASSERT_EQ(read.sources.size(), 4u);
+  EXPECT_EQ(read.sources[sequence].flags & naming::kSourceFlagLatestOnly, 0u);
+  EXPECT_EQ(read.sources[empty].flags, naming::kSourceFlagLatestOnly);
+  EXPECT_EQ(read.sources[asked].flags, naming::kSourceFlagLatestOnly);
+  EXPECT_EQ(read.sources[sender].flags, 0u);
 }
 
 }  // namespace

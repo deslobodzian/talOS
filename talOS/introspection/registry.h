@@ -11,11 +11,14 @@
  * This is where every node says so. One shared-memory segment holds a fixed
  * array of slots; a node claims one at startup, writes its event-loop manifest
  * into it -- every timer, watcher, fetcher and sender, by name and message size
- * -- and then keeps a heartbeat, a set of counters and the lane each of its
- * Targets selected current while it runs. Studio and any agent map the segment
- * read-only and get the whole system: which processes exist, which topics each
- * one publishes and subscribes to, how much traffic has actually moved, and who
- * drives each subsystem.
+ * -- and then, while it runs, keeps current a heartbeat, a set of counters,
+ * the lane each of its Targets selected, whether its event log stopped
+ * early, the realtime scheduling its loop got, and what its wake channel
+ * lost. Studio and any agent map
+ * the segment read-only and get the whole system: which processes exist,
+ * which topics each one publishes and subscribes to, how much traffic has
+ * actually moved, who drives each subsystem, which recordings are incomplete
+ * and which loops run without their realtime grant.
  *
  * The layout is frozen and the version is part of the segment name, so a node
  * from an older build cannot be misread by a newer reader: it lands in a
@@ -33,21 +36,28 @@
  * on, so a writer that dies mid-sample cannot wedge a viewer. The residual
  * staleness is bounded by one refresh period, which no consumer branches on:
  * liveness reads the heartbeat alone against a 5 s timeout, and health
- * aggregates cumulative gauges.
+ * aggregates cumulative gauges. An event-loop node's dispatch count is the
+ * exception: its loop thread stores it at every dispatch, outside the sample,
+ * because the launcher's stall check reads it as the loop's own progress
+ * and must not depend on when the reporting thread gets scheduled.
  */
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <new>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -55,8 +65,11 @@
 #include <vector>
 
 #include "talOS/events/manifest.h"
+#include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/names.h"
 #include "talOS/memory/shared_memory_ptr.h"
+#include "talOS/process/realtime_outcome.h"
+#include "talOS/rtms/process_liveness.h"
 
 namespace talos::introspect {
 
@@ -85,8 +98,39 @@ namespace talos::introspect {
 // reserved word was left to reuse, and a table of source names per Target does
 // not fit in one anyway. A version-1 viewer therefore sees an empty registry
 // rather than misreading the new records, until it is rebuilt.
-inline constexpr std::uint32_t kRegistryVersion = 2;
-inline constexpr const char* kRegistryPath = "/talos_registry.2";
+// Version 3 changes the heartbeat epoch from wall time to the host monotonic
+// clock. Mixing epochs would make healthy nodes appear stale.
+// Version 4 adds NodeRecord::pid_start, so a row whose claimant died is
+// freed at once and a reused pid does not keep a dead claimant's row.
+// Version 5 narrows the pid to 22 bits of the process word and records the
+// claimant's pid namespace above its start (process_liveness.h): a version-4
+// reader would misread the start and free live rows.
+// Version 6 adds the wake counters at NodeRecord's end (wake_failures,
+// stalled_arms, wake_fallbacks). They sit in what was tail padding, so
+// sizeof(NodeRecord) stays 11136 B, but no earlier writer zeroes that
+// padding on a claim: a slot one build wrote and an older build reclaimed
+// would show the first node's counts against the second.
+//
+// The event log flags (kFlagRecorderFailed, kFlagLogCapped) did not bump it:
+// they are bits of `flags` that every earlier writer left clear, which reads
+// as "no stopped log seen" -- all an earlier build could have said -- and
+// every earlier reader tests only the bits it knows.
+//
+// Nor did naming::kSourceFlagLatestOnly: a bit of SourceRecord::flags that
+// every earlier writer left clear, which reads as "every drop is a loss" --
+// what an earlier reader assumed of every source.
+//
+// Nor did the realtime outcome (kFlagRealtimeMask): bits of `flags` that
+// every earlier writer left clear, which reads as "not reported" -- all an
+// earlier build could have said -- and every earlier reader ignores.
+//
+// Nor did counting a timer's missed periods in SourceRecord::dropped: a
+// timer's `dropped` was always 0, which still reads as "no overrun".
+inline constexpr std::uint32_t kRegistryVersion = 6;
+inline constexpr const char* kRegistryPath = "/talos_registry.6";
+// The segment's mode, whatever the creator's umask: every node registers,
+// whichever user runs it, and the registry provides no authentication.
+inline constexpr mode_t kRegistryMode = 0666;
 
 inline constexpr std::size_t kMaxNodes = 32;
 inline constexpr std::size_t kMaxSourcesPerNode = 64;
@@ -115,6 +159,54 @@ enum class SlotState : std::uint64_t {
 // Bit flags describing how a node is running.
 inline constexpr std::uint32_t kFlagSimulation = 1u << 0;
 inline constexpr std::uint32_t kFlagReplay = 1u << 1;
+// Lifecycle flag: identity is visible, but construction/topology is incomplete.
+// SlotState::ACTIVE means the slot is owned, not that the node is dispatching.
+inline constexpr std::uint32_t kFlagConstructing = 1u << 2;
+inline constexpr std::chrono::seconds kConstructionTimeout{30};
+
+// Event log flags: the node's event log stopped early, so the rest of its run
+// is not recorded. kFlagRecorderFailed mirrors LogWriter::failed() -- a disk
+// error, or capture abandoned because the writer fell behind or a record did
+// not fit -- and kFlagLogCapped mirrors capped(), the log reaching its byte
+// budget. Set while the node runs (NodeRegistration::set_recording) and never
+// cleared, because capture never resumes; a new claim starts without them.
+inline constexpr std::uint32_t kFlagRecorderFailed = 1u << 3;
+inline constexpr std::uint32_t kFlagLogCapped = 1u << 4;
+
+// The loop's realtime scheduling (process::ConfigureRealtime's outcome), as
+// bits 5 to 12 of `flags`: the tier plus one in the low two (0: not reported
+// yet, or a writer that predates them), whether the steps were requested,
+// then the process::kStep* bits the OS refused. Written once per claim
+// (NodeRegistration::set_realtime), after the node has asked; RealtimeOf
+// decodes it.
+inline constexpr std::uint32_t kFlagRealtimeShift = 5;
+inline constexpr std::uint32_t kFlagRealtimeMask = 0xFFu << kFlagRealtimeShift;
+
+inline constexpr std::uint32_t RealtimeFlags(
+    const process::RealtimeOutcome& outcome) {
+  const std::uint32_t tier = static_cast<std::uint32_t>(outcome.tier) + 1u;
+  const std::uint32_t requested = outcome.requested ? 1u : 0u;
+  const auto refused =
+      static_cast<std::uint32_t>(outcome.refused & process::kAllSteps);
+  return (tier | requested << 2 | refused << 3) << kFlagRealtimeShift;
+}
+
+// The outcome a row's `flags` carry, or nullopt while none is reported.
+inline constexpr std::optional<process::RealtimeOutcome> RealtimeOf(
+    std::uint32_t flags) {
+  const std::uint32_t bits = (flags & kFlagRealtimeMask) >> kFlagRealtimeShift;
+  if ((bits & 3u) == 0) return std::nullopt;
+  return process::RealtimeOutcome{
+      .tier = static_cast<process::LoopTier>((bits & 3u) - 1u),
+      .requested = (bits & 4u) != 0,
+      .refused = static_cast<std::uint8_t>(bits >> 3)};
+}
+
+static_assert(process::kAllSteps < (1u << 5),
+              "the refused steps must fit the five bits kFlagRealtimeMask "
+              "leaves them");
+static_assert(static_cast<std::uint32_t>(process::LoopTier::kBridge) + 1u < 4u,
+              "the tier plus one must fit two bits");
 
 // One event source, as the owning node registered it. The descriptive fields
 // are written once, before the slot goes ACTIVE; the counters keep moving.
@@ -126,7 +218,8 @@ struct SourceRecord {
 
   // naming::kSourceFlagExternal, naming::kSourceFlagOptional: how this end's
   // far end is expected to behave, so a graph tool can tell a designed dead
-  // end from a fault. Written once with the descriptive fields, never after.
+  // end from a fault. naming::kSourceFlagLatestOnly: `dropped` below includes
+  // skips by design. Written once with the descriptive fields, never after.
   //
   // This field was `reserved`. See kRegistryVersion for why reusing it needed
   // no version bump.
@@ -140,8 +233,10 @@ struct SourceRecord {
   // its job.
   std::atomic<std::uint64_t> events;
 
-  // Messages the transport lapped before this source could read them, or
-  // publishes the transport refused.
+  // Messages the transport lapped before this source could read them, messages
+  // a latest-only watcher (kSourceFlagLatestOnly) skipped by design, publishes
+  // the transport refused, or reads it failed; for a timer, the periods it
+  // missed because the loop overran (SourceCounters).
   std::atomic<std::uint64_t> dropped;
 
   // Transport sequence last observed, which is what makes a subscriber's lag
@@ -179,23 +274,28 @@ struct alignas(64) NodeRecord {
   // underneath it.
   std::atomic<std::uint64_t> generation;
 
-  // Wall clock, because the reader is a different process and the monotonic
-  // clocks need not agree.
-  std::atomic<std::int64_t> heartbeat_wall_ns;
+  // Host monotonic time is shared by processes and cannot jump with NTP.
+  std::atomic<std::int64_t> heartbeat_monotonic_ns;
 
   // Published after the source records are written, so a reader never walks
   // entries that are still being filled in.
   std::atomic<std::uint32_t> source_count;
   std::atomic<std::uint32_t> flags;
 
+  // The node's progress, which the launcher's stall check reads. An
+  // event-loop node's loop thread stores it at every dispatch
+  // (event::EventLoopBase::set_dispatch_observer), outside the sample
+  // sequence; a node with its own loop (the hardware bridge) stores it in its
+  // samples.
   std::atomic<std::uint64_t> dispatch_count;
 
   // How many sources the node registered, which exceeds source_count when it
   // registered more than this segment can hold.
   std::atomic<std::uint32_t> declared_source_count;
 
-  // Seqlock for one refresh: the writer brackets the heartbeat, dispatch,
-  // per-source counter and selection stores with begin_sample/end_sample (odd
+  // Seqlock for one refresh: the writer brackets the heartbeat, (for a node
+  // without an event loop) dispatch, per-source counter and selection stores
+  // with begin_sample/end_sample (odd
   // while a sample is landing, even when the slot is stable), and the reader
   // retries a copy taken across a change. This reuses the word `reserved`
   // held, so it moved no field; see kRegistryVersion for why that reuse is
@@ -205,6 +305,9 @@ struct alignas(64) NodeRecord {
 
   std::int64_t start_wall_ns;
   std::uint64_t pid;
+  // The claimant's process word above kProcessPidBits: its start time and
+  // pid namespace (talOS/rtms/process_liveness.h); 0 compares the pid alone.
+  std::uint64_t pid_start;
   std::uint64_t session_id;
   char name[kMaxNameBytes];
   char target[kMaxTargetBytes];
@@ -216,11 +319,23 @@ struct alignas(64) NodeRecord {
   std::atomic<std::uint32_t> selection_count;
   std::atomic<std::uint32_t> declared_selection_count;
   SelectionRecord selections[kMaxSelectionsPerNode];
+
+  // What the node's wake channel lost, cumulative since the claim, written in
+  // each sample (NodeRegistration::set_wake_loss; TODO.md RT-7). Each should
+  // stay 0. wake_failures: notifications its writers failed to send for a
+  // reason other than a gone receiver (RTMSQueue::wake_failures(): no
+  // descriptor left, say), each leaving a reader asleep until its backstop.
+  // stalled_arms: prompt watchers whose failed arms stopped holding its loop
+  // awake. wake_fallbacks: runs that could not build their wake receiver and
+  // drain on a poll tick instead (the bridge: OpenWaits() fallbacks).
+  std::atomic<std::uint64_t> wake_failures;
+  std::atomic<std::uint64_t> stalled_arms;
+  std::atomic<std::uint64_t> wake_fallbacks;
 };
 
 struct RegistryHeader {
-  // 0 in a fresh segment. The first writer CASes it to kInitializing, fills in
-  // the rest, then stores kMagic; everyone else waits for kMagic.
+  // Initialization is serialized by RegistryLock. kMagic is committed last;
+  // an opener holding the lock can restart any uncommitted initialization.
   std::atomic<std::uint64_t> magic;
   std::uint32_t version;
   std::uint32_t node_capacity;
@@ -242,11 +357,10 @@ static_assert(std::atomic<std::uint32_t>::is_always_lock_free);
 static_assert(std::atomic<std::int32_t>::is_always_lock_free);
 static_assert(std::is_standard_layout_v<RegistryHeader>);
 
-// The claim that let kRegistryVersion stay at 1 when endpoint attributes
-// arrived: `flags` occupies the word `reserved` held, immediately after
-// `alignment`, so no field after it moved. A future edit that inserts something
-// here instead of reusing a reserved word has changed the layout and must bump
-// the version.
+// Why endpoint attributes needed no kRegistryVersion bump: `flags` occupies
+// the word `reserved` held, immediately after `alignment`, so no field after it
+// moved. A future edit that inserts something here instead of reusing a
+// reserved word has changed the layout and must bump the version.
 static_assert(std::is_standard_layout_v<SourceRecord>);
 static_assert(offsetof(SourceRecord, flags) ==
               offsetof(SourceRecord, alignment) + sizeof(std::uint32_t));
@@ -259,9 +373,21 @@ static_assert(offsetof(NodeRecord, sample_seq) ==
 static_assert(offsetof(NodeRecord, start_wall_ns) ==
               offsetof(NodeRecord, sample_seq) + sizeof(std::uint32_t));
 
+// The segment's layout, as docs/DATA_FLOW.md states it: a change to either
+// size is a change of layout, which bumps kRegistryVersion and that table.
+static_assert(alignof(NodeRecord) == 64);
+static_assert(sizeof(NodeRecord) == 11136);
+static_assert(sizeof(RegistryHeader) == 356416);
+
 inline std::int64_t wall_now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
              std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+inline std::int64_t monotonic_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
 
@@ -278,58 +404,123 @@ inline std::string read_name(const char* value, std::size_t capacity) {
   return std::string{value, n};
 }
 
+// Optional startup-only fault-injection seams. Production callers leave these
+// null; tests stop a child while it owns the lock, before either commit.
+struct RegistryTestHooks {
+  void (*initializing)(RegistryHeader*){nullptr};
+  void (*claiming)(NodeRecord*){nullptr};
+};
+
+// Serializes the writers: segment creation, sizing and initialization
+// (RegistryMapping) and slot claims (NodeRegistration); a reader never takes
+// it. Use a regular file (LockFilePath): Darwin's shm descriptors are not
+// vnodes, so flock on them fails with ENOTSUP. Each acquisition opens a
+// separate file description, which also serializes threads in one process.
+// close (including process death) releases the lock. Nothing in talos
+// unlinks this file; if something else does, an acquirer that wins the old
+// inode finds it no longer current and starts over.
+class RegistryLock {
+ public:
+  explicit RegistryLock(const std::string& mapped_path)
+      : RegistryLock(mapped_path, std::nullopt) {}
+
+  // Waits at most `wait` when it is set, then throws: a holder that keeps
+  // the lock that long is stuck (stopped mid-registration), not registering.
+  RegistryLock(const std::string& mapped_path,
+               std::optional<std::chrono::milliseconds> wait) {
+    // Namespace selection is entirely ShmObjectName's job: the lock file is
+    // named after its mapped result.
+    const std::string file_path = LockFilePath(mapped_path);
+    const auto waited = wait.value_or(std::chrono::milliseconds::zero());
+    const auto deadline = std::chrono::steady_clock::now() + waited;
+    const int operation = wait ? (LOCK_EX | LOCK_NB) : LOCK_EX;
+    // A lock on a file unlinked meanwhile (a /tmp cleaner) excludes nobody
+    // who opens the path anew, so it is taken again on the file the path
+    // names (LockFileIsCurrent).
+    for (;;) {
+      // flock does not require write access, so the file is opened
+      // read-only: any process that may read it can lock it, whichever user
+      // created it.
+      fd_ = OpenLockFile(file_path, O_RDONLY);
+      if (fd_ < 0) {
+        throw std::runtime_error("registry lock open failed for " + file_path +
+                                 ": " + std::strerror(errno));
+      }
+      while (::flock(fd_, operation) < 0) {
+        const int error = errno;
+        if (error == EINTR) continue;
+        if (error == EWOULDBLOCK &&
+            std::chrono::steady_clock::now() < deadline) {
+          ::usleep(1000);
+          continue;
+        }
+        ::close(fd_);
+        if (error == EWOULDBLOCK) {
+          throw std::runtime_error("registry lock " + file_path +
+                                   " has been held for " +
+                                   std::to_string(waited.count()) +
+                                   " ms by another process, likely one "
+                                   "stopped while it registered a node");
+        }
+        throw std::runtime_error("registry lock failed for " + file_path +
+                                 ": " + std::strerror(error));
+      }
+      if (LockFileIsCurrent(fd_, file_path)) return;
+      ::close(fd_);
+    }
+  }
+
+  ~RegistryLock() { ::close(fd_); }
+  RegistryLock(const RegistryLock&) = delete;
+  RegistryLock& operator=(const RegistryLock&) = delete;
+
+ private:
+  int fd_{-1};
+};
+
+// Gives a segment this process's user owns kRegistryMode whatever umask
+// created it, so a node or tool running as another user can open it too.
+// Best effort: on macOS shm_open applies no umask and fchmod refuses shm
+// descriptors, and a mode this cannot fix is reported by whoever it stops
+// (PrepareRegistry).
+inline void ShareRegistrySegment(int fd, const struct stat& status) {
+  if (status.st_uid == ::geteuid() &&
+      (status.st_mode & 07777) != kRegistryMode) {
+    static_cast<void>(::fchmod(fd, kRegistryMode));
+  }
+}
+
 // Maps the registry segment, creating it if this is the first process to ask.
 //
 // Deliberately not SharedMemoryPtr: that unlinks on destruction, which is right
 // for a topic owned by one publisher and wrong here. The registry outlives any
 // single node, so nothing unlinks it -- a stale segment is harmless because
-// slots are reclaimed by heartbeat and the version is in the name.
+// slots are reclaimed by heartbeat or claimant death and the version is in the
+// name.
 class RegistryMapping {
  public:
   explicit RegistryMapping(std::string_view path = kRegistryPath,
-                           bool read_only = false)
+                           bool read_only = false,
+                           const RegistryTestHooks* test_hooks = nullptr)
       : path_{ShmObjectName(path)} {
-    const std::size_t size = sizeof(RegistryHeader);
-    const int flags = read_only ? O_RDONLY : (O_CREAT | O_RDWR);
+    // Only a writer creates, sizes or initializes the segment, so only a
+    // writer takes RegistryLock. A reader validates the commit instead: kMagic
+    // is release-stored after every header field and never reset once stored,
+    // so a segment a writer is still creating or initializing opens as absent,
+    // too small or uncommitted, for the reader to retry. No lock holder -- a
+    // node stopped mid-registration, or a descriptor a fork inherited -- can
+    // therefore block a reader, such as the launcher's supervision loop.
+    std::optional<RegistryLock> lock;
+    if (!read_only) lock.emplace(path_);
+    map(read_only, test_hooks);
+  }
 
-    int fd = ::shm_open(path_.c_str(), flags, 0666);
-    if (fd < 0) {
-      throw std::runtime_error("registry shm_open failed for " + path_ + ": " +
-                               std::strerror(errno));
-    }
-
-    struct stat status {};
-    if (::fstat(fd, &status) < 0) {
-      ::close(fd);
-      throw std::runtime_error("registry fstat failed for " + path_);
-    }
-
-    if (!read_only && static_cast<std::size_t>(status.st_size) < size &&
-        ::ftruncate(fd, static_cast<off_t>(size)) < 0) {
-      ::close(fd);
-      throw std::runtime_error("registry ftruncate failed for " + path_);
-    }
-
-    if (read_only && static_cast<std::size_t>(status.st_size) < size) {
-      ::close(fd);
-      throw std::runtime_error("registry segment " + path_ + " is too small");
-    }
-
-    void* address =
-        ::mmap(nullptr, size, read_only ? PROT_READ : (PROT_READ | PROT_WRITE),
-               MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (address == MAP_FAILED) {
-      throw std::runtime_error("registry mmap failed for " + path_);
-    }
-
-    header_ = static_cast<RegistryHeader*>(address);
-
-    if (read_only) {
-      await_initialized();
-    } else {
-      initialize();
-    }
+  // A writer's mapping for a caller that already holds `held`, this path's
+  // RegistryLock (PrepareRegistry); taking it again would wait on itself.
+  RegistryMapping(std::string_view path, const RegistryLock& held)
+      : path_{ShmObjectName(path)} {
+    static_cast<void>(held);
+    map(false, nullptr);
   }
 
   ~RegistryMapping() {
@@ -366,49 +557,177 @@ class RegistryMapping {
   }
 
  private:
-  void initialize() {
-    std::uint64_t expected = 0;
-    if (header_->magic.compare_exchange_strong(expected, kInitializing,
-                                               std::memory_order_acq_rel)) {
-      // A fresh segment is zero-filled, so only the descriptive fields need
-      // writing. Re-initializing an existing segment would blow away live
-      // nodes, which is exactly what the CAS prevents.
+  void map(bool read_only, const RegistryTestHooks* test_hooks) {
+    const std::size_t size = sizeof(RegistryHeader);
+    const int flags = read_only ? O_RDONLY : (O_CREAT | O_RDWR);
+
+    int fd = ::shm_open(path_.c_str(), flags, kRegistryMode);
+    if (fd < 0) {
+      throw std::runtime_error("registry shm_open failed for " + path_ + ": " +
+                               std::strerror(errno));
+    }
+
+    struct stat status {};
+    if (::fstat(fd, &status) < 0) {
+      ::close(fd);
+      throw std::runtime_error("registry fstat failed for " + path_);
+    }
+    if (!read_only) ShareRegistrySegment(fd, status);
+
+    if (!read_only && static_cast<std::size_t>(status.st_size) < size &&
+        ::ftruncate(fd, static_cast<off_t>(size)) < 0) {
+      ::close(fd);
+      throw std::runtime_error("registry ftruncate failed for " + path_);
+    }
+
+    if (read_only && static_cast<std::size_t>(status.st_size) < size) {
+      ::close(fd);
+      throw std::runtime_error("registry segment " + path_ + " is too small");
+    }
+
+    void* address =
+        ::mmap(nullptr, size, read_only ? PROT_READ : (PROT_READ | PROT_WRITE),
+               MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (address == MAP_FAILED) {
+      throw std::runtime_error("registry mmap failed for " + path_);
+    }
+
+    header_ = static_cast<RegistryHeader*>(address);
+
+    try {
+      if (read_only) {
+        validate_initialized();
+      } else {
+        initialize(test_hooks);
+      }
+    } catch (...) {
+      ::munmap(header_, size);
+      header_ = nullptr;
+      throw;
+    }
+  }
+
+  void initialize(const RegistryTestHooks* test_hooks) {
+    if (header_->magic.load(std::memory_order_acquire) != kMagic) {
+      // No committed registry exists, and the file lock excludes any live
+      // initializer. Reset all residue, even if its owner died mid-reset.
+      ::new (header_) RegistryHeader{};
+      header_->magic.store(kInitializing, std::memory_order_relaxed);
       header_->version = kRegistryVersion;
+      if (test_hooks != nullptr && test_hooks->initializing != nullptr) {
+        test_hooks->initializing(header_);
+      }
       header_->node_capacity = static_cast<std::uint32_t>(kMaxNodes);
       header_->source_capacity = static_cast<std::uint32_t>(kMaxSourcesPerNode);
       header_->node_record_bytes = sizeof(NodeRecord);
       header_->source_record_bytes = sizeof(SourceRecord);
       header_->magic.store(kMagic, std::memory_order_release);
-      return;
     }
-    await_initialized();
+    validate_initialized();
   }
 
-  void await_initialized() const {
-    // The winner of the CAS above publishes kMagic microseconds later. Bounded
-    // so a segment left in kInitializing by a process that died mid-setup is
-    // reported instead of hanging a node forever.
-    for (int attempt = 0; attempt < 200; ++attempt) {
-      if (header_->magic.load(std::memory_order_acquire) == kMagic) {
-        if (header_->version != kRegistryVersion ||
-            header_->node_record_bytes != sizeof(NodeRecord) ||
-            header_->source_record_bytes != sizeof(SourceRecord)) {
-          throw std::runtime_error(
-              "registry " + path_ +
-              " was created by a process with a different record layout");
-        }
-        return;
-      }
-      ::usleep(250);
+  void validate_initialized() const {
+    if (header_->magic.load(std::memory_order_acquire) != kMagic) {
+      throw std::runtime_error("registry " + path_ +
+                               " has not been initialized by a writer");
     }
-    throw std::runtime_error("registry " + path_ +
-                             " was never initialized; remove it with "
-                             "shm_unlink and restart the nodes");
+    if (header_->version != kRegistryVersion ||
+        header_->node_record_bytes != sizeof(NodeRecord) ||
+        header_->source_record_bytes != sizeof(SourceRecord)) {
+      throw std::runtime_error(
+          "registry " + path_ +
+          " was created by a process with a different record layout");
+    }
   }
 
   std::string path_;
   RegistryHeader* header_{nullptr};
 };
+
+// How long PrepareRegistry waits for the writer lock. A writer holds it for
+// microseconds; one that holds it this long is stuck.
+inline constexpr std::chrono::milliseconds kRegistryLockWait{5000};
+
+// Makes sure every node the launcher starts can register: called once before
+// the launcher spawns any. A node that cannot open the registry runs without a
+// row (Reporter), and the launcher kills a node that has no row once its
+// startup grace ends, so an unusable registry would restart the whole roster
+// forever. This opens the segment read-write -- creating and initializing it
+// when absent or uncommitted -- gives it and its writer lock file the modes
+// every user's nodes and tools need (kRegistryMode, kLockFileMode), and opens
+// that lock file as every writer must. Nodes run as the launcher's user, so
+// what it can open they can. The lock is waited for only when the segment must
+// be created or initialized, and at most `lock_wait`. Throws
+// std::runtime_error naming the segment or file and what to do about it.
+inline void PrepareRegistry(
+    std::string_view path = kRegistryPath,
+    std::chrono::milliseconds lock_wait = kRegistryLockWait) {
+  const std::string mapped = ShmObjectName(path);
+  const std::string lock_path = LockFilePath(mapped);
+  const auto refuse = [&mapped](std::string_view what, const std::string& name,
+                                int error, const std::string& owner) {
+    std::string message = "the node registry's " + std::string{what} + " " +
+                          name + " cannot be opened by uid " +
+                          std::to_string(::geteuid()) + ": " +
+                          std::strerror(error);
+    if (!owner.empty()) message += " (" + owner + ")";
+    message +=
+        "; its nodes could not register and would be killed. Remove it as its "
+        "owner or root";
+    if (what == "segment") {
+#if defined(__linux__)
+      message += " (rm /dev/shm" + mapped + ")";
+#else
+      message += " (shm_unlink " + mapped + ", or reboot)";
+#endif
+    }
+    return std::runtime_error(message);
+  };
+
+  // Every writer locks this file first, so one the nodes cannot open is a
+  // registry they cannot write.
+  const int lock_fd = OpenLockFile(lock_path, O_RDONLY);
+  if (lock_fd < 0) {
+    const int error = errno;
+    std::string owner;
+    struct stat status {};
+    if (::stat(lock_path.c_str(), &status) == 0) owner = DescribeOwner(status);
+    throw refuse("lock file", lock_path, error, owner);
+  }
+  ::close(lock_fd);
+
+  std::optional<RegistryLock> lock;
+  int fd = ::shm_open(mapped.c_str(), O_RDWR, 0);
+  if (fd < 0 && errno == ENOENT) {
+    lock.emplace(mapped, lock_wait);
+    fd = ::shm_open(mapped.c_str(), O_RDWR | O_CREAT, kRegistryMode);
+  }
+  if (fd < 0) {
+    const int error = errno;
+    std::string owner;
+    const int peek = ::shm_open(mapped.c_str(), O_RDONLY, 0);
+    if (peek >= 0) {
+      struct stat status {};
+      if (::fstat(peek, &status) == 0) owner = DescribeOwner(status);
+      ::close(peek);
+    }
+    throw refuse("segment", mapped, error, owner);
+  }
+  struct stat status {};
+  if (::fstat(fd, &status) == 0) ShareRegistrySegment(fd, status);
+  ::close(fd);
+
+  // A committed segment of this layout is ready; reading it takes no lock.
+  try {
+    const RegistryMapping ready{path, /*read_only=*/true};
+    return;
+  } catch (const std::runtime_error&) {  // NOLINT(bugprone-empty-catch)
+    // Too small, uncommitted or another layout: a writer settles which.
+  }
+  if (!lock) lock.emplace(mapped, lock_wait);
+  const RegistryMapping initialized{path, *lock};
+}
 
 // One node's claim on a registry slot. Owns the slot for its lifetime and
 // frees it on destruction, so a clean shutdown leaves no ghost rows.
@@ -421,15 +740,19 @@ class NodeRegistration {
     std::uint32_t flags{0};
   };
 
-  NodeRegistration(Identity identity, std::string_view path = kRegistryPath)
-      : mapping_{path}, identity_{std::move(identity)} {
-    record_ = claim(mapping_.header(), identity_);
+  explicit NodeRegistration(Identity identity,
+                            std::string_view path = kRegistryPath,
+                            const RegistryTestHooks* test_hooks = nullptr)
+      : mapping_{path, false, test_hooks}, identity_{std::move(identity)} {
+    const RegistryLock lock{mapping_.path()};
+    record_ = claim(mapping_.header(), identity_, test_hooks);
     if (record_ == nullptr) {
       throw std::runtime_error(
           "registry is full: " + std::to_string(kMaxNodes) +
           " nodes are already registered");
     }
     generation_ = record_->generation.load(std::memory_order_acquire);
+    pid_ = record_->pid;
   }
 
   ~NodeRegistration() { release(); }
@@ -441,10 +764,14 @@ class NodeRegistration {
   // the event loop has closed registration: the manifest is fixed from then on,
   // so it can be read from another thread without synchronization.
   void publish(const event::Manifest& manifest) {
-    write_sources(manifest, [](std::string_view) { return std::uint32_t{0}; });
+    write_sources(manifest, [](std::size_t, std::string_view) {
+      return std::uint32_t{0};
+    });
   }
 
-  // The same, plus endpoint attributes keyed by topic name.
+  // The same, plus endpoint attributes keyed by topic name, and flags the loop
+  // holds per source (naming::kSourceFlagLatestOnly) indexed like the
+  // manifest; `source_flags` may be shorter than it, and the rest get none.
   //
   // The attributes cannot come from the manifest, because the loop does not
   // know them: `/hw/command` looks like any other sender to it. They come from
@@ -462,9 +789,12 @@ class NodeRegistration {
   // elements have `.topic` and `.flags` fits, which is exactly
   // `introspect::EndpointAttribute` -- what the Reporter passes.
   template <typename Attributes>
-  void publish(const event::Manifest& manifest, const Attributes& attributes) {
-    write_sources(manifest, [&attributes](std::string_view name) {
-      std::uint32_t flags = 0;
+  void publish(const event::Manifest& manifest, const Attributes& attributes,
+               std::span<const std::uint32_t> source_flags = {}) {
+    write_sources(manifest, [&attributes, source_flags](std::size_t index,
+                                                        std::string_view name) {
+      std::uint32_t flags =
+          index < source_flags.size() ? source_flags[index] : 0u;
       for (const auto& attribute : attributes) {
         if (attribute.topic == name) {
           flags |= attribute.flags;
@@ -482,6 +812,7 @@ class NodeRegistration {
   // and naming it here would make this header reach for reporter.h.
   template <typename Selections>
   void publish_selections(const Selections& selections) {
+    if (!owns_slot()) return;
     std::uint32_t total = 0;
     for (const auto& selection : selections) {
       if (total < kMaxSelectionsPerNode) {
@@ -516,22 +847,31 @@ class NodeRegistration {
   // per-source counter stores so a reader sees the whole sample or retries:
   // begin_sample, the stores, then end_sample. Adjacent samples must not
   // overlap; the reporting thread is the only writer, so plain bracketing is
-  // enough, with no RAII and no nesting.
+  // enough, with no RAII and no nesting. An event-loop node's loop thread
+  // stores the dispatch count itself, unbracketed (NodeRecord).
   void begin_sample() {
+    if (!owns_slot()) return;
     record_->sample_seq.fetch_add(1, std::memory_order_relaxed);
   }
 
   void end_sample() {
+    if (!owns_slot()) return;
     // Release: every counter store above must be visible to a reader that
     // observes the closing even sequence.
     record_->sample_seq.fetch_add(1, std::memory_order_release);
   }
 
   void heartbeat() {
-    record_->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+    if (!owns_slot()) return;
+    record_->heartbeat_monotonic_ns.store(monotonic_now_ns(),
+                                          std::memory_order_relaxed);
   }
 
+  // Also called from an event loop's thread at every dispatch (the
+  // Reporter's DispatchObserver): one relaxed store, guarded like every
+  // other write against a slot that is no longer this registration's.
   void set_dispatch_count(std::uint64_t count) {
+    if (!owns_slot()) return;
     record_->dispatch_count.store(count, std::memory_order_relaxed);
   }
 
@@ -541,6 +881,7 @@ class NodeRegistration {
                   std::uint64_t dropped, std::uint64_t sequence,
                   std::int64_t last_monotonic_ns, std::int64_t last_latency_ns,
                   std::int64_t max_latency_ns) {
+    if (!owns_slot()) return;
     if (index >= record_->source_count.load(std::memory_order_relaxed)) {
       return;
     }
@@ -557,11 +898,46 @@ class NodeRegistration {
   // Which lane Target `index` selected last: an index into its sources, or
   // -1 for none. Called from the reporting thread inside a sample.
   void set_selected(std::uint32_t index, std::int32_t selected) {
+    if (!owns_slot()) return;
     if (index >= record_->selection_count.load(std::memory_order_relaxed)) {
       return;
     }
     record_->selections[index].selected.store(selected,
                                               std::memory_order_relaxed);
+  }
+
+  // Copies the node's wake counters into the row (NodeRecord::wake_failures
+  // and after). Called from the reporting thread inside a sample.
+  void set_wake_loss(std::uint64_t wake_failures, std::uint64_t stalled_arms,
+                     std::uint64_t wake_fallbacks) {
+    if (!owns_slot()) return;
+    record_->wake_failures.store(wake_failures, std::memory_order_relaxed);
+    record_->stalled_arms.store(stalled_arms, std::memory_order_relaxed);
+    record_->wake_fallbacks.store(wake_fallbacks, std::memory_order_relaxed);
+  }
+
+  // Sets kFlagRecorderFailed / kFlagLogCapped for an event log that failed or
+  // reached its cap; neither is ever cleared. Called inside a sample.
+  void set_recording(bool failed, bool capped) {
+    if (!owns_slot()) return;
+    const std::uint32_t flags =
+        (failed ? kFlagRecorderFailed : 0u) | (capped ? kFlagLogCapped : 0u);
+    if (flags != 0) record_->flags.fetch_or(flags, std::memory_order_relaxed);
+  }
+
+  // Publishes the loop's realtime outcome (kFlagRealtimeMask). Call once,
+  // from the thread that asked, right after process::ConfigureRealtime, or
+  // with requested false when the node did not ask. The bits are clear
+  // until then: a claim starts without them.
+  void set_realtime(const process::RealtimeOutcome& outcome) {
+    if (!owns_slot()) return;
+    record_->flags.fetch_or(RealtimeFlags(outcome), std::memory_order_release);
+  }
+
+  void activate() {
+    if (owns_slot()) {
+      record_->flags.fetch_and(~kFlagConstructing, std::memory_order_release);
+    }
   }
 
   const std::string& name() const { return identity_.name; }
@@ -570,8 +946,17 @@ class NodeRegistration {
   }
 
  private:
+  bool owns_slot() const noexcept {
+    return record_ != nullptr &&
+           record_->generation.load(std::memory_order_relaxed) == generation_ &&
+           record_->state.load(std::memory_order_relaxed) ==
+               static_cast<std::uint64_t>(SlotState::ACTIVE) &&
+           record_->pid == pid_;
+  }
+
   template <typename FlagsFor>
   void write_sources(const event::Manifest& manifest, FlagsFor flags_for) {
+    if (!owns_slot()) return;
     check_names(manifest);
 
     const std::uint32_t total = static_cast<std::uint32_t>(manifest.size());
@@ -587,7 +972,7 @@ class NodeRegistration {
       source.kind = static_cast<std::uint16_t>(registration.kind);
       source.message_bytes = registration.message_bytes;
       source.alignment = registration.alignment;
-      source.flags = flags_for(registration.name);
+      source.flags = flags_for(i, registration.name);
       source.period_ns = registration.period_ns;
       copy_name(source.name, kMaxNameBytes, registration.name);
       source.events.store(0, std::memory_order_relaxed);
@@ -643,10 +1028,11 @@ class NodeRegistration {
     if (record_ != nullptr) {
       // Only free what is still ours: the slot may have been swept and
       // reclaimed after this owner went quiet (see sweep_stale), and freeing
-      // it then would yank the new owner's row out from under it.
-      if (record_->generation.load(std::memory_order_acquire) == generation_) {
-        record_->source_count.store(0, std::memory_order_relaxed);
-        record_->selection_count.store(0, std::memory_order_relaxed);
+      // it then would yank the new owner's row out from under it. The row
+      // keeps its last sample, sources included, until the next claim clears
+      // it: the launcher reads a reaped run's final delivery loss there
+      // (DeliveryLossOf; TODO.md RT-7).
+      if (owns_slot()) {
         record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
                              std::memory_order_release);
       }
@@ -654,51 +1040,68 @@ class NodeRegistration {
     }
   }
 
-  // Frees every slot whose owner stopped heartbeating long enough ago to be
-  // considered gone, so crash residue from an earlier session never lingers
-  // as a permanent "stopped heartbeating" row in the viewer. Runs on every
-  // claim -- a fresh session starts one claim per node, which sweeps the
-  // previous session's ghosts -- and only touches slots the liveness check
-  // already treats as dead.
+  // Frees every slot whose owner is gone: its process no longer runs
+  // (process_liveness.h: no process with its pid, a zombie, or a pid reused
+  // by a process that started later; never decided for an owner in another
+  // pid namespace), or it stopped heartbeating long enough ago to be
+  // considered gone. So crash residue from an earlier session never
+  // lingers as a permanent "stopped heartbeating" row in the viewer, and
+  // SIGKILLed nodes -- a crash-looping roster leaves one row per run -- never
+  // fill the registry for the restarts that follow. Runs on every claim -- a
+  // fresh session starts one claim per node, which sweeps the previous
+  // session's ghosts -- and only touches slots whose owner is gone.
   static void sweep_stale(RegistryHeader* header) {
-    const std::int64_t now = wall_now_ns();
+    const std::int64_t now = monotonic_now_ns();
     const std::int64_t timeout =
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
     for (std::size_t i = 0; i < kMaxNodes; ++i) {
       NodeRecord& record = header->nodes[i];
+      // A live claimant/sweeper holds RegistryLock until its state commit.
+      // Under that lock any remaining CLAIMING row is abandoned, even if
+      // death preceded its first pid or heartbeat store. Reclaim immediately.
+      if (record.state.load(std::memory_order_acquire) ==
+          static_cast<std::uint64_t>(SlotState::CLAIMING)) {
+        record.state.store(static_cast<std::uint64_t>(SlotState::FREE),
+                           std::memory_order_release);
+        continue;
+      }
       if (record.state.load(std::memory_order_acquire) !=
           static_cast<std::uint64_t>(SlotState::ACTIVE)) {
         continue;
       }
-      if (now - record.heartbeat_wall_ns.load(std::memory_order_relaxed) <
-          timeout) {
+      // The claimant's identity is written under this lock before ACTIVE
+      // and never after, so it is stable while the row is ACTIVE.
+      const std::uint64_t claimant =
+          (record.pid_start << kProcessPidBits) | record.pid;
+      const auto& beat = record.heartbeat_monotonic_ns;
+      if (now - beat.load(std::memory_order_relaxed) < timeout &&
+          talos::ProcessWordAlive(claimant)) {
         continue;
       }
       // Take the slot before deciding, so two nodes starting at once cannot
       // free the same row twice; hand it back when the owner heartbeated
-      // while we were deciding.
+      // while we were deciding and still runs.
       std::uint64_t expected = static_cast<std::uint64_t>(SlotState::ACTIVE);
       if (!record.state.compare_exchange_strong(
               expected, static_cast<std::uint64_t>(SlotState::CLAIMING),
               std::memory_order_acq_rel)) {
         continue;
       }
-      const bool still_stale =
-          now - record.heartbeat_wall_ns.load(std::memory_order_relaxed) >=
-          timeout;
-      record.state.store(still_stale
-                             ? static_cast<std::uint64_t>(SlotState::FREE)
-                             : static_cast<std::uint64_t>(SlotState::ACTIVE),
+      const bool gone = now - beat.load(std::memory_order_relaxed) >= timeout ||
+                        !talos::ProcessWordAlive(claimant);
+      record.state.store(gone ? static_cast<std::uint64_t>(SlotState::FREE)
+                              : static_cast<std::uint64_t>(SlotState::ACTIVE),
                          std::memory_order_release);
     }
   }
 
   // Takes a free slot, or -- only when none is free -- one whose owner stopped
-  // heartbeating long enough ago to be considered gone. Stale rows are swept
-  // first (see sweep_stale), so the fallback below only fires for a slot that
-  // went quiet between the sweep and the claim.
-  static NodeRecord* claim(RegistryHeader* header, const Identity& identity) {
+  // heartbeating long enough ago to be considered gone. Rows of gone owners
+  // are swept first (see sweep_stale), so the fallback below only fires for a
+  // slot that went quiet between the sweep and the claim.
+  static NodeRecord* claim(RegistryHeader* header, const Identity& identity,
+                           const RegistryTestHooks* test_hooks) {
     sweep_stale(header);
     NodeRecord* record = claim_where(header, SlotState::FREE, false);
     if (record == nullptr) {
@@ -707,8 +1110,13 @@ class NodeRegistration {
     if (record == nullptr) {
       return nullptr;
     }
+    if (test_hooks != nullptr && test_hooks->claiming != nullptr) {
+      test_hooks->claiming(record);
+    }
 
-    record->pid = static_cast<std::uint64_t>(::getpid());
+    const std::uint64_t process = talos::OwnProcessWord();
+    record->pid = process & kProcessPidMask;
+    record->pid_start = process >> kProcessPidBits;
     record->session_id = identity.session_id;
     record->start_wall_ns = wall_now_ns();
     copy_name(record->name, kMaxNameBytes, identity.name);
@@ -719,10 +1127,14 @@ class NodeRegistration {
     record->selection_count.store(0, std::memory_order_relaxed);
     record->declared_selection_count.store(0, std::memory_order_relaxed);
     record->dispatch_count.store(0, std::memory_order_relaxed);
+    record->wake_failures.store(0, std::memory_order_relaxed);
+    record->stalled_arms.store(0, std::memory_order_relaxed);
+    record->wake_fallbacks.store(0, std::memory_order_relaxed);
     // A recycled slot may hold an odd sequence from a writer that died
     // mid-sample; a fresh claim is quiescent by definition.
     record->sample_seq.store(0, std::memory_order_relaxed);
-    record->heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+    record->heartbeat_monotonic_ns.store(monotonic_now_ns(),
+                                         std::memory_order_relaxed);
 
     // A reader that saw the previous occupant must observe a different
     // generation, so bump it before the slot goes live.
@@ -734,7 +1146,7 @@ class NodeRegistration {
 
   static NodeRecord* claim_where(RegistryHeader* header, SlotState from,
                                  bool require_stale) {
-    const std::int64_t now = wall_now_ns();
+    const std::int64_t now = monotonic_now_ns();
     const std::int64_t timeout =
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
@@ -743,7 +1155,7 @@ class NodeRegistration {
       NodeRecord& record = header->nodes[i];
       if (require_stale) {
         const std::int64_t beat =
-            record.heartbeat_wall_ns.load(std::memory_order_relaxed);
+            record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
         if (now - beat < timeout) {
           continue;
         }
@@ -764,6 +1176,7 @@ class NodeRegistration {
   // Generation of record_ when claimed. Guards release() against freeing a
   // slot that was swept and reclaimed after this owner went quiet.
   std::uint64_t generation_{0};
+  std::uint64_t pid_{0};
   bool names_checked_{false};
 };
 
@@ -789,6 +1202,9 @@ struct SourceSnapshot {
   bool external() const { return (flags & naming::kSourceFlagExternal) != 0; }
   bool optional() const { return (flags & naming::kSourceFlagOptional) != 0; }
   bool observer() const { return (flags & naming::kSourceFlagObserver) != 0; }
+  bool latest_only() const {
+    return (flags & naming::kSourceFlagLatestOnly) != 0;
+  }
 };
 
 // One Target of a node: the lanes its policy names and the one it selected
@@ -809,6 +1225,54 @@ struct SelectionSnapshot {
   }
 };
 
+// What a row says its node lost of what it should have delivered or been
+// woken for, all cumulative since the claim and all normally 0 (TODO.md
+// RT-7): the row's wake counters (NodeRecord::wake_failures and after), and
+// requests_skipped, the requests the hardware bridge's latest-value reads of
+// `/hw/request/<node>` passed over (its per-subsystem source rows' `dropped`,
+// summed; 0 for every other node).
+struct DeliveryLoss {
+  std::uint64_t wake_failures{0};
+  std::uint64_t stalled_arms{0};
+  std::uint64_t wake_fallbacks{0};
+  std::uint64_t requests_skipped{0};
+
+  bool any() const {
+    return (wake_failures | stalled_arms | wake_fallbacks | requests_skipped) !=
+           0;
+  }
+};
+
+// A reader of a hardware request topic: the bridge's per-subsystem source,
+// whose `dropped` counts the requests its reads skipped.
+inline bool IsRequestRead(event::SourceKind kind, std::string_view name) {
+  return (kind == event::SourceKind::FETCHER ||
+          kind == event::SourceKind::WATCHER) &&
+         naming::IsHardwareRequest(name);
+}
+
+// The same, read straight from a row by a reader that copies no snapshot
+// (the launcher's supervision pass). Relaxed loads: each counter only grows,
+// and a value one sample old is as good as the next.
+inline DeliveryLoss DeliveryLossOf(const NodeRecord& record) {
+  DeliveryLoss loss{
+      .wake_failures = record.wake_failures.load(std::memory_order_relaxed),
+      .stalled_arms = record.stalled_arms.load(std::memory_order_relaxed),
+      .wake_fallbacks = record.wake_fallbacks.load(std::memory_order_relaxed)};
+  const std::uint32_t count =
+      record.source_count.load(std::memory_order_acquire);
+  for (std::uint32_t s = 0; s < count && s < kMaxSourcesPerNode; ++s) {
+    const SourceRecord& source = record.sources[s];
+    if (IsRequestRead(
+            static_cast<event::SourceKind>(source.kind),
+            std::string_view{source.name,
+                             ::strnlen(source.name, kMaxNameBytes)})) {
+      loss.requests_skipped += source.dropped.load(std::memory_order_relaxed);
+    }
+  }
+  return loss;
+}
+
 struct NodeSnapshot {
   std::size_t slot{0};
   std::string name;
@@ -818,13 +1282,33 @@ struct NodeSnapshot {
   std::uint64_t generation{0};
   std::uint64_t dispatch_count{0};
   std::int64_t start_wall_ns{0};
-  std::int64_t heartbeat_wall_ns{0};
+  std::int64_t heartbeat_monotonic_ns{0};
   std::uint32_t flags{0};
   std::uint32_t declared_source_count{0};
   bool alive{false};
+  // The loop's realtime outcome, once the node reported it.
+  std::optional<process::RealtimeOutcome> realtime() const {
+    return RealtimeOf(flags);
+  }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
   std::vector<SelectionSnapshot> selections;
+  // NodeRecord's wake counters.
+  std::uint64_t wake_failures{0};
+  std::uint64_t stalled_arms{0};
+  std::uint64_t wake_fallbacks{0};
+
+  DeliveryLoss delivery_loss() const {
+    DeliveryLoss loss{.wake_failures = wake_failures,
+                      .stalled_arms = stalled_arms,
+                      .wake_fallbacks = wake_fallbacks};
+    for (const SourceSnapshot& source : sources) {
+      if (IsRequestRead(source.kind, source.name)) {
+        loss.requests_skipped += source.dropped;
+      }
+    }
+    return loss;
+  }
 };
 
 // Read-only view of the registry. Safe to poll at any rate: it takes no locks
@@ -853,10 +1337,42 @@ class RegistryReader {
     return mapping_.header()->source_capacity;
   }
 
+  // The rows a claim cannot take: ACTIVE rows whose owner still runs and
+  // heartbeated within kLivenessTimeout, constructing or not -- what
+  // NodeRegistration's sweep keeps. kMaxNodes minus their count is how many
+  // nodes can register now. Owner liveness is the sweep's own test, so a
+  // reader takes no lock here either.
+  std::vector<NodeSnapshot> held_rows() const {
+    std::vector<NodeSnapshot> out;
+    const RegistryHeader* header = mapping_.header();
+    const std::int64_t now = monotonic_now_ns();
+    const std::int64_t timeout =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+            .count();
+    for (std::size_t i = 0; i < kMaxNodes; ++i) {
+      const NodeRecord& record = header->nodes[i];
+      if (record.state.load(std::memory_order_acquire) !=
+          static_cast<std::uint64_t>(SlotState::ACTIVE)) {
+        continue;
+      }
+      const std::uint64_t claimant =
+          (record.pid_start << kProcessPidBits) | record.pid;
+      if (now - record.heartbeat_monotonic_ns.load(std::memory_order_relaxed) >=
+              timeout ||
+          !talos::ProcessWordAlive(claimant)) {
+        continue;
+      }
+      NodeSnapshot node = copy(record, i);
+      node.alive = (node.flags & kFlagConstructing) == 0;
+      out.push_back(std::move(node));
+    }
+    return out;
+  }
+
   std::vector<NodeSnapshot> nodes() const {
     std::vector<NodeSnapshot> out;
     const RegistryHeader* header = mapping_.header();
-    const std::int64_t now = wall_now_ns();
+    const std::int64_t now = monotonic_now_ns();
     const std::int64_t timeout =
         std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
             .count();
@@ -873,14 +1389,17 @@ class RegistryReader {
       for (int attempt = 0; attempt < 2; ++attempt) {
         const std::uint64_t generation =
             record.generation.load(std::memory_order_acquire);
-        NodeSnapshot node = copy_stable(record, i);
-        if (record.generation.load(std::memory_order_acquire) != generation &&
-            attempt == 0) {
+        auto node = copy_stable(record, i);
+        if (!node ||
+            record.state.load(std::memory_order_acquire) !=
+                static_cast<std::uint64_t>(SlotState::ACTIVE) ||
+            record.generation.load(std::memory_order_acquire) != generation) {
           continue;
         }
-        node.generation = generation;
-        node.alive = now - node.heartbeat_wall_ns < timeout;
-        out.push_back(std::move(node));
+        node->generation = generation;
+        node->alive = now - node->heartbeat_monotonic_ns < timeout &&
+                      (node->flags & kFlagConstructing) == 0;
+        out.push_back(std::move(*node));
         break;
       }
     }
@@ -894,19 +1413,26 @@ class RegistryReader {
   // refresh that never quiesces -- degrades to one plain copy instead of a
   // wedged viewer. That fallback is exactly what a reader without the guard
   // takes every time, so it is no worse than the status quo ante.
-  static NodeSnapshot copy_stable(const NodeRecord& record, std::size_t slot) {
-    for (int attempt = 0; attempt < 3; ++attempt) {
+  static std::optional<NodeSnapshot> copy_stable(const NodeRecord& record,
+                                                 std::size_t slot) {
+    const auto generation = record.generation.load(std::memory_order_acquire);
+    for (int attempt = 0; attempt < 4; ++attempt) {
       const std::uint32_t before =
           record.sample_seq.load(std::memory_order_acquire);
-      if ((before & 1u) != 0u) {
-        continue;
-      }
+      // Retain the bounded plain-copy fallback for a stalled sample writer.
+      if ((before & 1u) != 0u && attempt < 3) continue;
       NodeSnapshot node = copy(record, slot);
-      if (record.sample_seq.load(std::memory_order_acquire) == before) {
+      if (record.state.load(std::memory_order_acquire) !=
+              static_cast<std::uint64_t>(SlotState::ACTIVE) ||
+          record.generation.load(std::memory_order_acquire) != generation) {
+        return std::nullopt;
+      }
+      if (attempt == 3 ||
+          record.sample_seq.load(std::memory_order_acquire) == before) {
         return node;
       }
     }
-    return copy(record, slot);
+    return std::nullopt;
   }
 
   static NodeSnapshot copy(const NodeRecord& record, std::size_t slot) {
@@ -917,12 +1443,15 @@ class RegistryReader {
     node.pid = record.pid;
     node.session_id = record.session_id;
     node.start_wall_ns = record.start_wall_ns;
-    node.heartbeat_wall_ns =
-        record.heartbeat_wall_ns.load(std::memory_order_relaxed);
+    node.heartbeat_monotonic_ns =
+        record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
     node.flags = record.flags.load(std::memory_order_relaxed);
     node.dispatch_count = record.dispatch_count.load(std::memory_order_relaxed);
     node.declared_source_count =
         record.declared_source_count.load(std::memory_order_relaxed);
+    node.wake_failures = record.wake_failures.load(std::memory_order_relaxed);
+    node.stalled_arms = record.stalled_arms.load(std::memory_order_relaxed);
+    node.wake_fallbacks = record.wake_fallbacks.load(std::memory_order_relaxed);
 
     // Acquire pairs with publish(): a visible count means the records it
     // describes are visible too.

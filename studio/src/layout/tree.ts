@@ -66,9 +66,9 @@ export function normalizeSizes(sizes: number[],
 
   if (n * min >= 1) return sizes.map(() => 1 / n);
   const raw = sizes.map(s => (Number.isFinite(s) && s > 0 ? s : 1));
-  // Scale first to avoid overflowing the sum of finite weights.
-  const scale = Math.max(...raw);
-  const weights = raw.map(s => s / scale);
+  const rawSum = raw.reduce((sum, s) => sum + s, 0);
+  const scale = Number.isFinite(rawSum) ? 1 : Math.max(...raw);
+  const weights = scale === 1 ? raw : raw.map(s => s / scale);
   const result = new Array<number>(n).fill(0);
   let remaining = 1;
   let active = weights.map((_, i) => i);
@@ -277,13 +277,16 @@ const isString = (v: unknown): v is string => typeof v === 'string' && !!v;
 const isObject = (v: unknown): v is Record<string, unknown> =>
     !!v && typeof v === 'object' && !Array.isArray(v);
 
-function parseNode(value: unknown): LayoutNode|null {
+function parseNode(value: unknown, seenInstanceIds: Set<string>): LayoutNode|null {
   if (!isObject(value)) return null;
   if (value.type === 'panel') {
     if (!isString(value.instanceId) || !isString(value.panelId)) return null;
+    let instanceId = value.instanceId;
+    while (seenInstanceIds.has(instanceId)) instanceId = newInstanceId();
+    seenInstanceIds.add(instanceId);
     return {
       type: 'panel',
-      instanceId: value.instanceId,
+      instanceId,
       panelId: value.panelId,
       config: value.config
     };
@@ -293,7 +296,7 @@ function parseNode(value: unknown): LayoutNode|null {
     if (!Array.isArray(value.children) || value.children.length < 1) return null;
     const children: LayoutNode[] = [];
     for (const child of value.children) {
-      const parsed = parseNode(child);
+      const parsed = parseNode(child, seenInstanceIds);
       // One malformed branch is dropped, not the whole split: a stray bad leaf
       // should not blank a page that is otherwise readable.
       if (parsed) children.push(parsed);
@@ -327,10 +330,11 @@ export function parseWorkspace(raw: unknown): Workspace {
 
   const pages: Page[] = [];
   const seenIds = new Set<string>();
+  const seenInstanceIds = new Set<string>();
   for (const entry of raw.pages) {
     if (!isObject(entry) || !isString(entry.id) || seenIds.has(entry.id))
       continue;
-    const root = parseNode(entry.root);
+    const root = parseNode(entry.root, seenInstanceIds);
     if (!root) continue;
     seenIds.add(entry.id);
     pages.push({

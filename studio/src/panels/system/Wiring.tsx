@@ -2,6 +2,7 @@
 // far end of each. The question this answers is the one a topic table cannot:
 // not "what topics exist" but "who is this process actually talking to".
 
+import {nodeLiveness} from '../../data/freshness';
 import {drivenBy, isSubscriber, rateKey, type SystemGraph, type SystemNode, type SystemSource} from '../../system';
 import {hertz, integer} from '../../ui/formatters';
 import {EmptyState, StatusDot} from '../../ui/primitives';
@@ -14,8 +15,10 @@ const KIND_LABEL = {
 } as const;
 
 export function Wiring(
-    {graph, node, rates}:
-        {graph: SystemGraph; node: SystemNode; rates: Record<string, number>}) {
+    {graph, node, stale, rates}: {
+      graph: SystemGraph; node: SystemNode; stale: boolean;
+      rates: Record<string, number>;
+    }) {
   const peersOf = (topic: string, want: 'publishers'|'subscribers') =>
       graph.topics.find(t => t.name === topic)?.[want].filter(
           n => n !== node.name) ??
@@ -62,7 +65,7 @@ export function Wiring(
                          <EmptyState>Reads nothing.</EmptyState>}
     </section>
     <div className="wiring-node">
-      <StatusDot active={node.alive}/>
+      <StatusDot active={nodeLiveness(node, {stale}) === 'live'}/>
       <b>{node.name}</b>
       <small>{node.sources.filter(s => s.kind === 'TIMER').length} timers</small>
       {driver !== null &&

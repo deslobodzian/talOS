@@ -1,8 +1,7 @@
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_test")
-load("//talOS/build:contract.bzl", "talos_cc_node")
+load("//talOS/build:contract.bzl", "talos_cc_node", "talos_cc_shared_node")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -23,6 +22,7 @@ cc_library(
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/node",
+        "//talOS/schema:field_path",
         "//talOS/schema:identity",
         "//talOS/schema:schema_hash",
         "@flatbuffers//:runtime_cc",
@@ -36,10 +36,9 @@ talos_cc_node(
     deps = [":teleop"],
 )
 
-cc_binary(
+talos_cc_shared_node(
     name = "libteleop.so",
     srcs = ["teleop_abi.cc"],
-    linkshared = True,
     deps = [":teleop"],
 )
 
@@ -49,6 +48,11 @@ py_test(
     srcs = ["teleop_test.py"],
     legacy_create_init = False,
     main = "teleop_test.py",
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         "//talOS/msgs:control_py",
         "//talOS/python:teleop",
@@ -68,7 +72,9 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/msgs:control",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
+        "//talOS/schema:field_path",
         "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
     ],

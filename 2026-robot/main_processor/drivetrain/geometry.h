@@ -135,6 +135,7 @@ inline SwerveGeometry BuildSwerveGeometry(
     module.steer = detail::RequiredString(*entry, "steer", where);
     const std::string encoder =
         detail::RequiredString(*entry, "encoder", where);
+    module.encoder = encoder;
 
     const auto& drive = SubsystemMotor(config, subsystem, module.drive);
     const auto& steer = SubsystemMotor(config, subsystem, module.steer);
@@ -146,12 +147,32 @@ inline SwerveGeometry BuildSwerveGeometry(
     if (!steer.continuous_wrap)
       throw std::invalid_argument(where +
                                   ": steer motor needs continuous_wrap = true");
-    // The steer motor closes its position loop on the module's own encoder.
-    if (steer.feedback == talos::hardware::Feedback::kRemoteCANcoder &&
-        steer.feedback_sensor_id != cancoder.id)
+    // The steer motor closes its position loop on the module's own encoder,
+    // so its position is the absolute azimuth. Rotor feedback would make
+    // every steer angle relative to wherever the rotor booted.
+    if (steer.feedback != talos::hardware::Feedback::kRemoteCANcoder)
       throw std::invalid_argument(
-          where +
-          ": steer motor's feedback sensor is not this module's encoder");
+          where + ": steer motor '" + module.steer +
+          "' needs feedback = \"RemoteCANcoder\" with feedback_sensor = \"" +
+          encoder + "\"");
+    if (steer.feedback_sensor_id != cancoder.id)
+      throw std::invalid_argument(
+          where + ": steer motor '" + module.steer +
+          "' feedback sensor is not this module's encoder '" + encoder + "'");
+    // That azimuth survives a reset; without saying so, the devices layer
+    // would hold every steer position neutral until a rezero, which the
+    // drivetrain never does. It survives only at one encoder rotation per
+    // module rotation: a reset encoder rereads its angle within one
+    // rotation, which at any other ratio is a different module angle (at 2,
+    // a reset at 0.7 rereads -0.3, the module half a turn off).
+    if (!steer.absolute_position_frame.value)
+      throw std::invalid_argument(where + ": steer motor '" + module.steer +
+                                  "' needs position_frame = \"absolute\"");
+    if (steer.sensor_to_mechanism_ratio != 1.0)
+      throw std::invalid_argument(
+          where + ": steer motor '" + module.steer +
+          "' needs sensor_to_mechanism_ratio = 1 (one encoder rotation per "
+          "module rotation)");
   }
   return out;
 }
@@ -166,10 +187,30 @@ inline SwerveGeometry BuildSwerveGeometry(
   return BuildSwerveGeometry(config, subsystem, *geometry);
 }
 
-// The geometry of the subsystem `node` runs as, from its config.
+// Declares to `node`'s --describe every [geometry] key BuildSwerveGeometry
+// reads, by reading it with Node::param (the launcher refuses a subsystem
+// key no node reads). Called only after BuildSwerveGeometry accepted the
+// table, so every present key already has the type read here, and the one
+// parser stays BuildSwerveGeometry's. A key it reads but this does not
+// declare fails the launch, not silently.
+inline void DeclareSwerveGeometry(const talos::Node& node) {
+  node.param<double>("geometry.wheel_radius_m");
+  for (std::size_t i = 0; i < kModuleCount; ++i) {
+    const std::string entry = "geometry.modules[" + std::to_string(i) + "].";
+    for (const char* key : {"name", "drive", "steer", "encoder"})
+      node.param<std::string>(entry + key);
+    for (const char* key : {"x_m", "y_m"}) node.param<double>(entry + key);
+    node.param<double>(entry + "wheel_radius_m", 0.0);
+  }
+}
+
+// The geometry of the subsystem `node` runs as, from its config, with its
+// keys declared (DeclareSwerveGeometry).
 inline SwerveGeometry LoadSwerveGeometry(talos::Node& node) {
-  return BuildSwerveGeometry(node.extension<talos::HardwareLink>().config(),
-                             node.name());
+  SwerveGeometry geometry = BuildSwerveGeometry(
+      node.extension<talos::HardwareLink>().config(), node.name());
+  DeclareSwerveGeometry(node);
+  return geometry;
 }
 
 }  // namespace drivetrain

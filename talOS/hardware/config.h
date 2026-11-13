@@ -17,11 +17,40 @@ inline constexpr std::size_t kMaxPwmOutputs = 4;
 enum class SensorKind : uint8_t { kCANcoder = 1, kPigeon2 = 2 };
 enum class Feedback : uint8_t { kRotor = 0, kRemoteCANcoder = 1 };
 enum class GravityType : uint8_t { kElevatorStatic = 0, kArmCosine = 1 };
+// A switch wired to the TalonFX's own forward or reverse limit input. While it
+// is asserted (a normally open switch closed, a normally closed one open) the
+// TalonFX itself holds output toward that direction neutral, in every control
+// mode and whatever the position frame; output away from it still drives.
+// kNormallyOpen, enabled, is Phoenix's default for both inputs.
+enum class LimitSwitch : uint8_t {
+  kNormallyOpen = 0,
+  kNormallyClosed = 1,
+  kDisabled = 2
+};
 
 struct Gains {
   double p{}, i{}, d{}, s{}, v{}, a{}, g{};
   GravityType gravity_type{GravityType::kElevatorStatic};
   bool operator==(const Gains&) const = default;
+};
+
+// A motor setting only the main processor reads. It is not on the config
+// wire, so it compares equal whatever its value: Decode(Encode(c)) == c still
+// holds, and the gateway's same-config shortcut (Reconfigure) is unaffected.
+struct LocalMotorSetting {
+  bool value{false};
+  bool operator==(const LocalMotorSetting&) const { return true; }
+};
+
+// The motor a TalonFX drives. Only the physics simulator reads it, for its
+// winding model (sim_physics.h MotorModelFor).
+enum class MotorType : uint8_t { kKrakenX60 = 0, kKrakenX44, kFalcon500 };
+
+// A motor type the RoboRIO never reads: like LocalMotorSetting, not on the
+// config wire and equal whatever its value.
+struct LocalMotorType {
+  MotorType value{MotorType::kKrakenX60};
+  bool operator==(const LocalMotorType&) const { return true; }
 };
 
 struct MotorConfig {
@@ -41,11 +70,29 @@ struct MotorConfig {
   bool continuous_wrap{false};
   bool soft_limits{false};
   double reverse_limit_rot{-1}, forward_limit_rot{1};
+  LimitSwitch forward_limit_switch{LimitSwitch::kNormallyOpen};
+  LimitSwitch reverse_limit_switch{LimitSwitch::kNormallyOpen};
   double max_velocity_rps{100};
   double cruise_velocity_rps{20}, acceleration_rps2{40}, jerk_rps3{0};
   std::array<Gains, 3> slots{};
   uint16_t master_id{0};  // Zero denotes an independent motor.
   bool oppose_master{false};
+  // Main processor only (talOS/devices), not sent to the controller and not
+  // part of ConfigurationId: [motors.*] position_frame = "absolute" (true)
+  // or "rezero" (false, the default). A rezero-frame motor's position and
+  // motion-magic demands go out neutral until the owning node's
+  // Motor::rezero holds, and again once a device reset or gateway boot drops
+  // it. An absolute-frame motor (remote CANcoder feedback only) commands
+  // positions in the sensor's frame, which survives a reset, from its first
+  // state, and keeps its rezero across resets.
+  LocalMotorSetting absolute_position_frame{};
+  // [motors.*] motor_type = "kraken_x60" (the default), "kraken_x44" or
+  // "falcon_500": the physics simulator's stall current and free speed. Not
+  // sent to the controller and not part of ConfigurationId; the physics
+  // backend inside sim_gateway takes it from sim_gateway's own parse of the
+  // robot config, since a pushed config carries none
+  // (sim::PhysicsSimBackend::SetLocalMotorTypes).
+  LocalMotorType motor_type{};
   bool operator==(const MotorConfig&) const = default;
 };
 
@@ -61,10 +108,29 @@ struct SensorConfig {
   bool operator==(const SensorConfig&) const = default;
 };
 
+// A simulated home switch on a digital input: the physics simulator reads it
+// closed while `motor`'s reported position (mechanism rotations, hardware
+// frame) is at or below `closed_at_rot` (at or above when `closed_above`),
+// and reads `closed_reads` while closed. Like LocalMotorType, not on the
+// config wire and equal whatever its value.
+struct LocalHomeSwitch {
+  std::string motor;  // Empty: no simulated switch.
+  double closed_at_rot{};
+  bool closed_above{false};
+  bool closed_reads{false};
+  bool operator==(const LocalHomeSwitch&) const { return true; }
+};
+
 struct DigitalInputConfig {
   uint16_t id{};
   std::string name;
   int dio{};
+  // [digital_inputs.*] sim_motor, sim_closed_at_rot, sim_closed_above and
+  // sim_closed_reads. Not sent to the controller and not part of
+  // ConfigurationId; sim_gateway --physics hands them to the physics backend
+  // from its own parse of the robot config
+  // (sim::PhysicsSimBackend::SetHomeSwitches).
+  LocalHomeSwitch sim_home_switch{};
   bool operator==(const DigitalInputConfig&) const = default;
 };
 
@@ -111,6 +177,13 @@ struct Devices {
   std::vector<uint16_t> analog_inputs;
   std::vector<uint16_t> encoders;
   std::vector<uint16_t> pwm_outputs;
+  // Whether this subsystem drives an output (motor, digital output or PWM
+  // output): the bridge merges and times out its requests, the configuration
+  // bounds its period_us, and the launcher treats it as an actuator owner. A
+  // new output kind joins here first.
+  bool owns_actuators() const {
+    return !motors.empty() || !digital_outputs.empty() || !pwm_outputs.empty();
+  }
   bool operator==(const Devices&) const = default;
 };
 

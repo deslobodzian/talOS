@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_cc//cc:objc_library.bzl", "objc_library")
@@ -53,7 +54,11 @@ cc_library(
         "//talOS/vision:frame",
     ] + select({
         "@platforms//os:macos": [":avfoundation"],
-        "@platforms//os:linux": ["//talOS/events:events_os"],
+        "@platforms//os:linux": [
+            "//talOS/events:events_os",
+            "@opencv//:core",
+            "@opencv//:imgcodecs",
+        ],
         "//conditions:default": [],
     }),
 )
@@ -64,5 +69,23 @@ cc_test(
     deps = [
         ":capture",
         "@googletest//:gtest_main",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+        "@opencv//:imgproc",
+    ],
+)
+
+# Bring-up tool: measures what one live camera delivers (docs/BRINGUP.md).
+cc_binary(
+    name = "capture_check",
+    srcs = ["capture_check.cc"],
+    deps = [
+        ":capture",
+        "//talOS/events:events_os",
+        "//talOS/vision:compute_backend",
+        "//talOS/vision:frame_mailbox",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+        "@opencv//:imgproc",
     ],
 )

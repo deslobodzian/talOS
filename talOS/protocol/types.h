@@ -4,7 +4,9 @@
 
 namespace talos::protocol {
 
-constexpr uint16_t kProtocolVersion = 2;
+constexpr uint16_t kProtocolVersion = 7;
+static_assert(kProtocolVersion == 7,
+              "Update docs/DATA_FLOW.md and docs/DEPLOYMENT.md");
 constexpr uint64_t kFrameMagic = 0x4F4952534F4C4154ull;  // "TALOSRIO" LE
 
 enum class FrameType : uint16_t {
@@ -13,13 +15,14 @@ enum class FrameType : uint16_t {
   kHardwareConfig = 22,
   kHardwareConfigAck = 23,
   kDriverStation = 24,
+  // Empty probe; header monotonic_time_us is echoed by a later State.
+  kClockProbe = 25,
 };
 
+// No header flag has defined semantics yet: every sender writes kFlagNone.
+// ConfigAck is a frame type and config chunking is payload-level.
 enum FrameFlags : uint16_t {
   kFlagNone = 0,
-  kFlagAckRequested = 1u << 0,
-  kFlagAck = 1u << 1,
-  kFlagFragment = 1u << 2,
 };
 
 }  // namespace talos::protocol

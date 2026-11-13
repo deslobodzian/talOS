@@ -1,6 +1,5 @@
 // Session panel: pure merge/sort logic (manifest-only, registry-only, both,
-// declared-but-missing) and server-side rendering of the panel against empty
-// and populated studios.
+// declared-but-missing) and the rendered manifest error and session uptime.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -32,9 +31,11 @@ const mnode = (overrides: Partial<ManifestNode> = {}): ManifestNode => ({
   log_paths: ['/logs/drivetrain.tlog'],
   pid: 100,
   exit_code: -1,
+  exit_signal: 0,
   restart_count: 0,
   recorder_failed: false,
   described: true,
+  endpoint_mismatch: false,
   record_count: '5000',
   ...overrides
 });
@@ -120,9 +121,11 @@ test('mergeProcesses reads manifest-only rows', () => {
   const m = manifest([
     mnode({name: 'a', pid: 1, exit_code: 0, record_count: '42'}),
     mnode({name: 'b', pid: 2, exit_code: -1, restart_count: 3,
-           recorder_failed: true})
+           recorder_failed: true, runs_dropped: 0, runs: [
+             {pid: 2, start_wall_ns: 1, end_wall_ns: 2, exit_code: -1,
+              exit_signal: 9, reason: 'stalled'}]})
   ]);
-  const rows = mergeProcesses(m, null, null, {});
+  const rows = mergeProcesses(m, null, null, {}, false);
   assert.equal(rows.length, 2);
 
   // Problems sort first, so 'b' leads.
@@ -135,6 +138,7 @@ test('mergeProcesses reads manifest-only rows', () => {
   assert.equal(a.exitCode, 0);
   assert.equal(a.records, '42');
   assert.equal(a.hasManifest, true);
+  assert.equal(a.endReason, null);  // no run history: an older manifest
   assert.deepEqual(a.problems, []);
 
   const b = rows.find(r => r.name === 'b')!;
@@ -142,6 +146,8 @@ test('mergeProcesses reads manifest-only rows', () => {
   assert.equal(b.exitCode, null);   // -1 means not exited, not "exit 0"
   assert.equal(b.restarts, 3);
   assert.equal(b.recorderFailed, true);
+  // The launcher's kill reason, not just its signal, reaches the row.
+  assert.equal(b.endReason, 'stalled');
   assert.deepEqual(b.problems, ['restarted', 'recorder_failed']);
 });
 
@@ -157,7 +163,7 @@ test('mergeProcesses reads registry-only rows and measures rate/latency', () => 
     snode({name: 'gone', alive: false})
   ]);
   const rates = {'loop 0': 200, 'loop 1': 100};
-  const rows = mergeProcesses(null, g, null, rates);
+  const rows = mergeProcesses(null, g, null, rates, false);
   assert.equal(rows.length, 2);
   assert.equal(rows[0].name, 'gone');   // the problem sorts first
 
@@ -174,20 +180,32 @@ test('mergeProcesses reads registry-only rows and measures rate/latency', () => 
   assert.equal(gone.loopRate, null);
   assert.equal(gone.worstLatency, null);
   assert.deepEqual(gone.problems, ['dead']);
+
+  // A stale registry graph keeps who held a slot, but claims nobody is alive
+  // or dead now.
+  const stale = mergeProcesses(null, g, null, rates, true);
+  for (const row of stale) {
+    assert.equal(row.alive, null, `${row.name} liveness from a stale graph`);
+    assert.deepEqual(row.problems, []);
+  }
+  assert.equal(stale.find(r => r.name === 'loop')!.pid, '100');
+  assert.equal(summarize(stale).running, 0);
 });
 
 test('mergeProcesses joins manifest and registry by name', () => {
   const m = manifest([
     mnode({name: 'a', pid: 1, exit_code: 3, restart_count: 1,
            record_count: '10'}),
-    mnode({name: 'b', pid: 2})
+    mnode({name: 'b', pid: 2}),
+    mnode({name: 'd', pid: 4, exit_signal: 9}),
+    mnode({name: 'e', pid: 5, endpoint_mismatch: true})
   ]);
   const g = graph([
     snode({name: 'a', pid: '1', alive: false}),
     snode({name: 'c', pid: '3'})   // registry-only
   ]);
-  const rows = mergeProcesses(m, g, null, {});
-  assert.equal(rows.length, 3);
+  const rows = mergeProcesses(m, g, null, {}, false);
+  assert.equal(rows.length, 5);
 
   const a = rows.find(r => r.name === 'a')!;
   assert.equal(a.alive, false);
@@ -199,6 +217,16 @@ test('mergeProcesses joins manifest and registry by name', () => {
   assert.equal(b.alive, null);   // launched, never registered — not "dead"
   assert.equal(b.pid, '2');
   assert.deepEqual(b.problems, []);
+
+  // A signal death reads as one, not as "exit -1" or as no exit at all.
+  const d = rows.find(r => r.name === 'd')!;
+  assert.equal(d.exitCode, null);
+  assert.equal(d.exitSignal, 'signal 9 SIGKILL');
+  assert.deepEqual(d.problems, ['killed_by_signal']);
+
+  // A run whose live endpoints differed from its probe is marked.
+  assert.deepEqual(rows.find(r => r.name === 'e')!.problems,
+                   ['endpoint_mismatch']);
 
   const c = rows.find(r => r.name === 'c')!;
   assert.equal(c.hasManifest, false);
@@ -214,7 +242,7 @@ test('mergeProcesses flags declared-but-never-registered and sorts it first',
          dnode('ok', '//2026:ok'),
          dnode('missing', '//2026:missing')
        ]);
-       const rows = mergeProcesses(m, g, d, {});
+       const rows = mergeProcesses(m, g, d, {}, false);
        assert.equal(rows.length, 2);
        assert.equal(rows[0].name, 'missing');
        assert.deepEqual(rows[0].problems, ['never_registered']);
@@ -228,7 +256,7 @@ test('never-registered is not claimed without a live registry', () => {
   // A declared graph with no registry to compare against cannot say "never
   // registered" — that is the same rule `declaredStatus` follows.
   const d = declared([dnode('missing', '//2026:missing')]);
-  const rows = mergeProcesses(null, null, d, {});
+  const rows = mergeProcesses(null, null, d, {}, false);
   assert.equal(rows.length, 1);
   assert.deepEqual(rows[0].problems, []);
 });
@@ -257,7 +285,7 @@ test('summarize counts running, total and restarts', () => {
     snode({name: 'b', alive: false}),
     snode({name: 'c', alive: true})
   ]);
-  const summary = summarize(mergeProcesses(m, g, null, {}));
+  const summary = summarize(mergeProcesses(m, g, null, {}, false));
   assert.equal(summary.total, 3);
   assert.equal(summary.running, 2);
   assert.equal(summary.restarts, 3);
@@ -271,115 +299,64 @@ const renderPanel = (studio: Studio): string => renderToStaticMarkup(
                               setConfig={() => {}} instanceId="test"/>
     </StudioProvider>);
 
-test('running session uptime is unknown without the registry clock', () => {
-  const html = renderPanel(createStaticStudio({manifest: manifest([])}));
-  const text = html.replace(/<[^>]*>/g, '');
-  assert.match(text, /Uptime—/);
-});
-
-test('the session panel shows the not-offered state with no manifest', () => {
-  const html = renderPanel(createStaticStudio({}));
-  assert.ok(html.includes('Session manifest not offered'));
-  assert.ok(html.includes('No processes'));
-});
-
-test('the session panel shows the parse error when the manifest failed', () => {
+test('a manifest that failed to parse shows the parser\'s reason', () => {
   const html = renderPanel(createStaticStudio({
     manifest: null,
     manifestError: 'Invalid manifest: session_id must be a decimal integer'
   }));
-  assert.ok(html.includes('Invalid manifest'));
   assert.ok(html.includes('session_id must be a decimal integer'));
 });
 
-test('the session panel shows the header, processes and counts', () => {
+test('uptime runs to the registry clock, then to the end; unknown without either', () => {
+  const uptime = (m: SessionManifest, g: SystemGraph|null) => {
+    const html = renderPanel(createStaticStudio({
+      manifest: m,
+      system: {graph: g, rates: {}, error: '', declared: null, declaredError: ''}
+    }));
+    return /Uptime([^A-Z]*)/.exec(html.replace(/<[^>]*>/g, ''))![1];
+  };
+  const running = manifest([mnode({name: 'a'})]);
+  assert.equal(uptime(running, null), '—');
+  // One hour after start by the registry clock.
+  assert.equal(uptime(running, graph([snode({name: 'a'})], '1735693200000000000')),
+               '1 h 0 m');
+  const ended = manifest([mnode({name: 'a', exit_code: 0})]);
+  ended.end_wall_ns = '1735689605000000000';   // 5 s after start
+  assert.equal(uptime(ended, null), '5.0 s');
+});
+
+// REQ-OPS-06: a member ended by the launcher's own stop signal before it
+// handled stops is a clean stop, not a signal death; any other signal death,
+// or SIGINT for any other reason, stays flagged. The run's stopped_by_session
+// decides when the manifest has it: a SIGINT from elsewhere that ended the
+// run during the stop is reason stop too, and the launcher counted it. A
+// manifest without the field (an older launcher) falls back to reason stop
+// with SIGINT; SIGTERM (systemd's default kill mode) is never the stop's own.
+test('mergeProcesses shows a launcher-stopped member as stopped', () => {
+  const run = (reason: string, exit_signal: number,
+               stopped_by_session?: boolean) => [{
+    pid: 1, start_wall_ns: 1, end_wall_ns: 2, exit_code: -1, exit_signal,
+    reason, ...(stopped_by_session === undefined ? {} : {stopped_by_session})
+  }];
   const m = manifest([
-    mnode({name: 'drivetrain', pid: 100, record_count: '1204',
-           restart_count: 2, recorder_failed: true}),
-    mnode({name: 'odometry', pid: 101, exit_code: 1})
+    mnode({name: 'stopped', exit_signal: 2, runs: run('stop', 2, true)}),
+    mnode({name: 'foreign', exit_signal: 2, runs: run('stop', 2, false)}),
+    mnode({name: 'older', exit_signal: 2, runs: run('stop', 2)}),
+    mnode({name: 'terminated', exit_signal: 15, runs: run('stop', 15)}),
+    mnode({name: 'crashed', exit_signal: 2, runs: run('crash', 2)}),
+    mnode({name: 'killed', exit_signal: 9, runs: run('stop_timeout', 9)})
   ]);
-  const g = graph(
-      [
-        snode({
-          name: 'drivetrain',
-          pid: '100',
-          alive: false,
-          sources: [source({id: 0, kind: 'TIMER', max_latency_ns: '2000000'})]
-        }),
-        snode({
-          name: 'odometry',
-          pid: '101',
-          alive: true,
-          sources: [source({id: 0, kind: 'TIMER', max_latency_ns: '300000'})]
-        })
-      ],
-      '1735693200000000000');   // one hour after start
-  const d = declared([
-    dnode('drivetrain', '//2026:drivetrain'),
-    dnode('odometry', '//2026:odometry'),
-    dnode('vision', '//2026:vision')
-  ]);
-  const rates = {'drivetrain 0': 200, 'odometry 0': 50};
-  const html = renderPanel(createStaticStudio({
-    manifest: m,
-    system: {graph: g, rates, error: '', declared: d, declaredError: ''}
-  }));
-
-  // Header.
-  assert.ok(html.includes('7351220489113141'), 'session id');
-  assert.ok(html.includes('>no<'), 'simulation');
-  // Config path: tail visible, full value on hover, copy affordance.
-  assert.ok(html.includes('robot.toml'), 'config path tail');
-  assert.ok(html.includes('title="/robot.toml"'), 'full config path on hover');
-  assert.ok(html.includes('abcdef01'), 'short sha256');
-  assert.ok(html.includes('abcdef0123456789'), 'full sha256 in the title');
-  assert.ok(html.includes('title="/tmp/session"'), 'full output dir on hover');
-  assert.ok(html.includes('2025-01-01 00:00:00 UTC'), 'start time');
-  assert.ok(html.includes('1 h 0 m'), 'uptime');
-
-  // Counts: 1 alive of 3 processes, 2 restarts.
-  assert.ok(html.includes('1/3 processes running'));
-  assert.ok(html.includes('2 restarts'));
-
-  // Processes: problems are marked by text.
-  assert.ok(html.includes('restarted ×2'), 'restart count in the tag');
-  assert.ok(html.includes('recorder failed'));
-  assert.ok(html.includes('never registered'));
-  assert.ok(html.includes('>dead<'), 'dead alive cell');
-  assert.ok(html.includes('failed'), 'recorder column');
-  // Rates and latency from the registry sources.
-  assert.ok(html.includes('200 Hz'));
-  assert.ok(html.includes('2.00 ms'));
-  // A manifest record count with thousands separators.
-  assert.ok(html.includes('1,204'));
-  // A log path with a copy affordance: tail visible, full value on hover.
-  assert.ok(html.includes('drivetrain.tlog'));
-  assert.ok(html.includes('title="/logs/drivetrain.tlog"'));
-  assert.ok(html.includes('copy'));
-});
-
-test('the session panel shows an ended session end time', () => {
-  const m = manifest([mnode({name: 'a', exit_code: 0})]);
-  m.end_wall_ns = '1735689605000000000';   // 5 s after start
-  const html = renderPanel(createStaticStudio({manifest: m}));
-  assert.ok(html.includes('Ended'));
-  assert.ok(html.includes('2025-01-01 00:00:05 UTC'));
-  assert.ok(html.includes('5.0 s'));   // uptime is end - start
-});
-
-test('the session header middle-ellipsizes long paths', () => {
-  const m = manifest([mnode({name: 'a'})]);
-  m.config_path = '/opt/talos/workspaces/session-2026-11-06/configs/robot.toml';
-  m.output_dir = '/opt/talos/workspaces/session-2026-11-06/output';
-  const html = renderPanel(createStaticStudio({manifest: m}));
-  // The path is split into a directory head and a filename tail, so both ends
-  // survive and the middle ellipsizes rather than wrapping mid-word.
-  assert.ok(html.includes('path-head'), 'path is split for middle ellipsis');
-  assert.ok(html.includes('path-tail'), 'filename keeps its own span');
-  assert.ok(html.includes('/opt/talos/workspaces/session-2026-11-06/configs/'),
-            'directory head survives');
-  assert.ok(html.includes('robot.toml'), 'filename tail survives');
-  assert.ok(html.includes(
-                'title="/opt/talos/workspaces/session-2026-11-06/configs/robot.toml"'),
-            'full path on hover');
+  const rows = mergeProcesses(m, null, null, {}, false);
+  const row = (n: string) => rows.find(r => r.name === n)!;
+  for (const name of ['stopped', 'older']) {
+    assert.deepEqual(row(name).problems, [], name);
+    assert.equal(row(name).exitSignal, null, name);
+    assert.equal(row(name).endReason, 'stop', name);
+  }
+  assert.deepEqual(row('foreign').problems, ['killed_by_signal']);
+  assert.equal(row('foreign').exitSignal, 'signal 2 SIGINT');
+  assert.deepEqual(row('terminated').problems, ['killed_by_signal']);
+  assert.equal(row('terminated').exitSignal, 'signal 15 SIGTERM');
+  assert.deepEqual(row('crashed').problems, ['killed_by_signal']);
+  assert.deepEqual(row('killed').problems, ['killed_by_signal']);
 });

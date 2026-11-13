@@ -4,11 +4,15 @@
     self.beam = talos.DigitalInput(node, "beam")  # [digital_inputs.beam]
     self.ds = talos.DriverStation(node)          # what the bridge forwards
 
-Take handles in __init__. Commands apply to the next flush after update();
-motors not commanded by then are neutral. Motors, digital outputs and PWM
-outputs are neutral while talos.robot_enabled(node) is false. Motor demands
-clamp to configured limits; non-finite input neutralizes the motor. Feedback
-is in mechanism units and reads 0 (connected False) until the first state.
+Take handles in __init__. Output commands (Motor.set_* and stop(),
+DigitalOutput.set, PwmOutput.set) are taken only inside update() and apply
+to the flush right after it; outputs that update() did not set are neutral.
+From __init__, an every() timer or a callback they raise TalosError naming
+the device, since such a command would reach the hardware for at most one
+tick. Motors, digital outputs and PWM outputs are neutral while
+talos.robot_enabled(node) is false. Motor demands clamp to configured
+limits; non-finite input neutralizes the motor. Feedback is in mechanism
+units and reads 0 (connected False) until the first state.
 """
 
 import ctypes
@@ -17,18 +21,18 @@ import math
 from datetime import timedelta
 
 from talos import _abi
-from talos._abi import lib
+from talos._abi import TalosError, lib
 from talos._messages import message_type
 
 
 class Mode(enum.IntEnum):
     """A motor request's control mode (talos::hardware::Mode)."""
-    NEUTRAL = 0
-    DUTY_CYCLE = 1
-    VOLTAGE = 2
-    VELOCITY = 3
-    POSITION = 4
-    MOTION_MAGIC = 5
+    NEUTRAL = _abi.MODE_NEUTRAL
+    DUTY_CYCLE = _abi.MODE_DUTY_CYCLE
+    VOLTAGE = _abi.MODE_VOLTAGE
+    VELOCITY = _abi.MODE_VELOCITY
+    POSITION = _abi.MODE_POSITION
+    MOTION_MAGIC = _abi.MODE_MOTION_MAGIC
 
 
 def robot_enabled(node):
@@ -41,48 +45,61 @@ def hardware_sample_time_ns(node):
     int of nanoseconds on the node clock (the one node.now reads in
     seconds), or None: before any state, while it is stale, and until the
     bridge's clock mapping has converged (HardwareLink::sample_time).
-    Later than the true sample time by the link's smallest latency, so
-    node.now - t / 1e9 never exceeds the sample's true age."""
+    Absolute mapping error is bounded by /hw/status clock_offset_uncertainty_us
+    under the documented relative oscillator drift assumption."""
     sampled = ctypes.c_int64()
     found = _abi.ok(lib.talos_hardware_sample_time(node._handle,
                                                    ctypes.byref(sampled)))
     return sampled.value if found else None
 
 
-class HardwareLink:
-    """This node's accepted hardware state; ages are seconds since receipt."""
+class _OnNode:
+    """A wrapper over one native node's endpoint or device. It holds the
+    talos.Node (`_owner`), which holds the node's owner (a talos.testing.Sim),
+    so the native node lives as long as any wrapper that can reach it. Its
+    handle reads raise TalosError once the node has been torn down."""
 
     def __init__(self, node):
-        self._node = node
+        self._owner = node
+
+    @property
+    def _node(self):
+        return self._owner._handle
+
+
+class HardwareLink(_OnNode):
+    """Accepted hardware state; ages are seconds since publication."""
+
+    def __init__(self, node):
+        super().__init__(node)
         # Attach the C++ extension during construction, before the loop starts.
-        _abi.ok(lib.talos_hardware_fresh(node._handle, -1))
+        _abi.ok(lib.talos_hardware_fresh(self._node, -1))
 
     def fresh(self, max_age=None) -> bool:
         """Whether state is younger than max_age (default command timeout)."""
         if isinstance(max_age, timedelta):
             max_age = max_age.total_seconds()
         ns = -1 if max_age is None else round(max_age * 1e9)
-        return bool(_abi.ok(lib.talos_hardware_fresh(self._node._handle, ns)))
+        return bool(_abi.ok(lib.talos_hardware_fresh(self._node, ns)))
 
     @property
     def age(self) -> float:
-        """Seconds since the last accepted state; infinity before the first."""
+        """Seconds since the accepted state was published; inf before any."""
         ns = ctypes.c_int64()
-        found = _abi.ok(lib.talos_hardware_age(
-            self._node._handle, ctypes.byref(ns)))
+        found = _abi.ok(lib.talos_hardware_age(self._node, ctypes.byref(ns)))
         return ns.value / 1e9 if found else math.inf
 
     @property
     def sample_time(self):
         """Gateway sample time as integer node-clock nanoseconds, or None."""
-        return hardware_sample_time_ns(self._node)
+        return hardware_sample_time_ns(self._owner)
 
 
-class _Device:
+class _Device(_OnNode):
     _KIND = None
 
     def __init__(self, node, name):
-        self._node = node._handle
+        super().__init__(node)
         self._index = _abi.index(
             lib.talos_device(self._node, self._KIND, _abi.encode(name)))
 
@@ -103,14 +120,67 @@ class _Input(_Device):
 class Motor(_Input):
     _KIND = _abi.DEVICE_MOTOR
     _SAMPLE = lib.talos_motor_sample
+    _TIME = lib.talos_motor_time
+
+    def _time(self, velocity):
+        sampled = ctypes.c_int64()
+        found = _abi.ok(self._TIME(
+            self._node, self._index, velocity, ctypes.byref(sampled)))
+        return sampled.value if found else None
+
+    @property
+    def position_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(False)
+
+    @property
+    def velocity_time(self):
+        """Acquisition time, integer node-clock ns, or None if unavailable."""
+        return self._time(True)
+
+    def _age(self, velocity):
+        age = ctypes.c_int64()
+        found = _abi.ok(lib.talos_motor_age(
+            self._node, self._index, velocity, ctypes.byref(age)))
+        return age.value if found else None
+
+    @property
+    def position_age(self):
+        """The position sample's age at the State it arrived in, integer ns
+        (Motor::position_age): read from the State, so known without the
+        clock mapping position_time needs. None unless connected, or when
+        the age is unknown."""
+        return self._age(False)
+
+    @property
+    def velocity_age(self):
+        """The velocity sample's age at its State, integer ns, or None, as
+        position_age."""
+        return self._age(True)
 
     def rezero(self, position_rot=0):
         """Set the node-shared software position on connected finite feedback.
 
         Position goals use this frame; soft limits remain hardware coordinates.
-        Disconnected/non-finite feedback or input leaves the offset unchanged.
+        Disconnected/non-finite feedback or input, or a position sample older
+        than two status periods at its State (C++ RezeroAgeBound), leaves the
+        offset unchanged: zeroed stays as it was, so retry on a later tick.
         """
         _abi.ok(lib.talos_motor_rezero(self._node, self._index, position_rot))
+
+    @property
+    def zeroed(self):
+        """Whether a rezero holds: False until one takes (a restarted node
+        starts unzeroed), and again once one is dropped: on a gateway boot
+        change, a reset that masks this motor in the next gateway State, or
+        any device reset across a sequence gap. A disconnect keeps it, and so
+        does every reset of a motor whose config sets
+        position_frame = "absolute". A dropped zero keeps its offset
+        (dropping does not move position). set_position and set_motion_magic
+        go out neutral while no rezero holds, unless position_frame =
+        "absolute" (a remote CANcoder's frame, usable from the first
+        state)."""
+        return bool(_abi.ok(lib.talos_motor_zeroed(self._node, self._index)))
 
     @property
     def clamped_count(self):
@@ -154,6 +224,30 @@ class Motor(_Input):
     def current(self):  # stator amps
         return self._sample().current
 
+    @property
+    def temperature_c(self):
+        """Motor controller temperature in Celsius."""
+        return self._sample().temperature_c
+
+    @property
+    def supply_current_a(self):
+        """Supply current in amps, distinct from current (stator amps)."""
+        return self._sample().supply_current_a
+
+    @property
+    def forward_limit(self):
+        """Whether the TalonFX's forward hardware limit switch is asserted
+        (Motor::forward_limit): False unless connected; otherwise read from a
+        FaultField signal under 50 ms old (cleared once it is staler)."""
+        return bool(self._sample().forward_limit)
+
+    @property
+    def reverse_limit(self):
+        """Whether the TalonFX's reverse hardware limit switch is asserted
+        (Motor::reverse_limit): False unless connected; otherwise read from a
+        FaultField signal under 50 ms old (cleared once it is staler)."""
+        return bool(self._sample().reverse_limit)
+
     def _set(self, mode, demand, ff_volts=0.0, slot=0):
         _abi.ok(lib.talos_motor_set(self._node, self._index, mode, demand,
                                     ff_volts, slot))
@@ -162,6 +256,10 @@ class Motor(_Input):
 class CANcoder(_Input):
     _KIND = _abi.DEVICE_CANCODER
     _SAMPLE = lib.talos_sensor_sample
+    _TIME = lib.talos_sensor_time
+    _time = Motor._time
+    position_time = Motor.position_time
+    velocity_time = Motor.velocity_time
 
     @property
     def position(self):  # rotations
@@ -176,10 +274,20 @@ class Gyro(_Input):
     """A Pigeon2. Rotations and rotations/s, CCW+."""
     _KIND = _abi.DEVICE_GYRO
     _SAMPLE = lib.talos_sensor_sample
+    _TIME = lib.talos_sensor_time
+    _time = Motor._time
+    yaw_time = Motor.position_time
+    yaw_rate_time = Motor.velocity_time
 
     def rezero(self, yaw_rot=0):
         """Set node-shared software yaw on connected finite feedback/input."""
         _abi.ok(lib.talos_gyro_rezero(self._node, self._index, yaw_rot))
+
+    @property
+    def zeroed(self):
+        """Whether a rezero holds; dropped like Motor.zeroed, keeping its
+        offset, so dropping does not move yaw."""
+        return bool(_abi.ok(lib.talos_gyro_zeroed(self._node, self._index)))
 
     @property
     def yaw(self):
@@ -284,7 +392,7 @@ class Joystick:
         return self._data.povs[index] if 0 <= index < _abi.DS_MAX_POVS else -1
 
 
-class DriverStation:
+class DriverStation(_OnNode):
     """The Driver Station packet the bridge forwards, decoded and latched.
 
         self.ds = talos.DriverStation(node)
@@ -298,7 +406,7 @@ class DriverStation:
     """
 
     def __init__(self, node, on_packet=None):
-        self._node = node._handle
+        super().__init__(node)
         callback = _abi.CALLBACK()
         if on_packet is not None:
             callback = node._keep(_abi.CALLBACK(
@@ -328,14 +436,14 @@ class DriverStation:
         return Joystick(self._read().joysticks[port])
 
 
-class Target:
+class Target(_OnNode):
     """The lanes of this node's target policy, resolved (talos::Target in
     talOS/devices/target.h). Take it in __init__:
 
         self.target = talos.Target(node, PositionTarget)
         ...
         t = self.target.get()   # None: disabled, stale or no live lane
-        if t is not None:
+        if t is not None:       # motor needs a position frame (below)
             self.motor.set_motion_magic(t.position_rot)
 
     get() returns the message of the first lane, in the current Driver
@@ -343,10 +451,14 @@ class Target:
     [targets]), that is active, fresh and stamped with the current mode
     generation, while robot_enabled(node); otherwise None. `source` names
     that lane, or "".
+
+    Motion magic needs a position frame: position_frame = "absolute" on a
+    remote CANcoder, or a rezero first (docs/NODE_DEVELOPMENT_GUIDE.md,
+    "Rezero and position frames"); until then it goes out neutral.
     """
 
     def __init__(self, node, msg):
-        self._node = node._handle
+        super().__init__(node)
         self._type = message_type(msg)
         self._index = _abi.index(lib.talos_target_open(
             self._node, self._type.size, self._type.alignment,
@@ -370,29 +482,79 @@ class Target:
             lambda name: name is None).decode()
 
 
-class TargetLane:
+class OperatorArming(_OnNode):
+    """Whether an operator-input producer may publish active targets
+    (talos::OperatorArming): armed by a reading that found every input it
+    maps at rest, and only for the Driver Station view it was armed under.
+
+        self.arming = talos.OperatorArming(node)
+        self.climb = talos.TargetLane(node, ClimbTarget, "climber",
+                                      "operator", arming=self.arming)
+        ...
+        held = self.ds.joystick(1).button(3)
+        if self.arming.evaluate(neutral=not held) and held:
+            self.climb.send(...)
+        else:
+            self.climb.release()
+
+    evaluate() is True when this reading may publish: armed by an earlier
+    one, and not disarmed since. Otherwise it is False, and a neutral
+    reading under a Driver Station mode arms it at once. It disarms at
+    startup; when the Driver Station shows no mode, a new mode generation or
+    a new gateway boot (so after any disable or mode switch, sampled or
+    not); after the link recovers from a stale spell; when readings stop
+    for command_timeout_us; and on disarm(). Evaluate on every reading.
+    """
+
+    def __init__(self, node):
+        super().__init__(node)
+        self._index = _abi.index(lib.talos_operator_arming_open(self._node))
+
+    def evaluate(self, neutral) -> bool:
+        return bool(_abi.ok(lib.talos_operator_arming_evaluate(
+            self._node, self._index, 1 if neutral else 0)))
+
+    @property
+    def armed(self) -> bool:
+        """Armed now, without evaluating: what an armed lane's send()
+        checks."""
+        return bool(_abi.ok(lib.talos_operator_arming_armed(
+            self._node, self._index)))
+
+    def disarm(self):
+        _abi.ok(lib.talos_operator_arming_disarm(self._node, self._index))
+
+
+class TargetLane(_OnNode):
     """One producer's lane, /<subsystem>/target/<source> (talos::TargetLane):
 
         self.lane = talos.TargetLane(node, PositionTarget, "wrist", "auto")
-        self.lane.send(position_rot=0.25)   # republish every period
+        self.lane.send(position_rot=0.25, feedforward_v=0.0)  # every period
         self.lane.release()                 # nothing to say
 
     send() stamps the mode generation this node's Driver Station shows (0,
     which no consumer accepts, while it shows no mode), so a target from an
-    earlier enable or mode never drives this one.
+    earlier enable or mode never drives this one. A lane of operator input
+    takes arming=OperatorArming(node): while that is not armed, send()
+    publishes a release and returns False.
     """
 
-    def __init__(self, node, msg, subsystem, source):
-        self._node = node._handle
+    def __init__(self, node, msg, subsystem, source, arming=None):
+        super().__init__(node)
         self._type = message_type(msg)
+        if arming is not None and arming._owner is not node:
+            raise TalosError(f"{subsystem}/target/{source}: the lane's "
+                             "OperatorArming belongs to another node")
         self._index = _abi.index(lib.talos_target_lane_open(
             self._node, _abi.encode(subsystem), _abi.encode(source),
-            self._type.size, self._type.alignment, _abi.schema_of(self._type)))
+            self._type.size, self._type.alignment, _abi.schema_of(self._type),
+            -1 if arming is None else arming._index))
 
     def send(self, message=None, **fields):
         """send(field=value, ...) with the .fbs field names, or send(message)
-        to forward a received one."""
-        data = message._bytes if message is not None else (
+        to forward a received one. False when the transport dropped it or the
+        lane's arming held it to a release."""
+        data = self._type.forward(message) if message is not None else (
             self._type.encode(fields))
         return bool(_abi.ok(lib.talos_target_lane_send(
             self._node, self._index, data, len(data))))

@@ -24,6 +24,7 @@
 #include "talOS/devices/target.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
 #include "talOS/ipc/subscriber.h"
 #include "talOS/process/process.h"
 
@@ -271,7 +272,8 @@ int main(int argc, char** argv) {
     using Packet = talos::hardware::Packet;
     ipc::Subscriber<Packet> states{talos::hardware::kStateTopic, latest};
     ipc::Subscriber<Packet> commands{talos::hardware::kCommandTopic, latest};
-    const std::string lane_topic = "/drivetrain/target/" + source;
+    const std::string lane_topic =
+        talos::introspect::naming::TargetLaneTopic("drivetrain", source);
     ipc::Subscriber<talos::TargetEnvelope<drivetrain::ChassisTarget>> targets{
         lane_topic, latest};
 

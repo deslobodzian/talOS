@@ -9,14 +9,10 @@ rates, exact payload/slot sizes, config chunking, and the current robot budget.
 
 ## Frames
 
-All traffic is UDP: the gateway listens on port 5802 and the companion on
-5803. Every datagram is one frame: a fixed 40 byte header
-(`kFrameHeaderSize`) followed by an optional payload of up to
-`kMaxPayloadSize` bytes, which is 1432: a 1472-byte frame fits inside the 1472
-bytes a 1500-byte Ethernet MTU leaves after the IPv4 and UDP headers, and
-`frame.h` has a static assertion to that effect. Multi-byte header fields are
-encoded little-endian explicitly by `EncodeFrame`; the C++ struct layout is not
-the wire layout.
+Each UDP datagram contains one frame. `EncodeFrame` explicitly encodes
+multi-byte header fields little-endian; native C++ layout is not the wire
+layout. Ports, protocol version, header and payload sizes are recorded in the
+[data-flow reference](../../docs/DATA_FLOW.md#udp-frame-and-payload-sizes).
 
 | `FrameType` | Value | Direction | Payload |
 |---|---|---|---|
@@ -25,23 +21,54 @@ the wire layout.
 | `kHardwareConfig` | 22 | companion → gateway | one chunk of the serialized `hardware::Config` (`config_wire.h`) |
 | `kHardwareConfigAck` | 23 | gateway → companion | `ConfigAckPayload` |
 | `kDriverStation` | 24 | gateway → companion | Driver Station snapshot (`talOS/driver_station`) |
+| `kClockProbe` | 25 | companion → gateway | empty; header send time echoed in a subsequent State |
 
 Payload codecs live with the payload owners; this package only frames bytes.
+The frame decoder rejects incompatible protocol versions before payload
+decoding. Clock probes do not authorize actuation and work while disabled.
 
 ## Low-Latency UDP API
 
 `RuntimeUdpPeer` is the hot-path socket wrapper for both sides:
 
 - connected UDP, so the kernel filters packets from unexpected peers;
-- non-blocking by default for control-loop polling;
+- non-blocking by default: a loop waits for a datagram on `NativeFd()`
+  (POSIX) with its poller, then drains with `TryReceive()`;
 - fixed TX/RX packet buffers, no allocation per send or receive;
 - explicit sequence numbers and sequence-gap counters;
 - version/header validation before payload interpretation;
-- DSCP EF (`0xB8`) requested through `IP_TOS` where the OS honors it.
+- DSCP EF (`0xB8`) requested through `IP_TOS` where the OS honors it;
+- a send never raises `SIGPIPE` (`MSG_NOSIGNAL` on every send where the SDK
+  defines it, Linux and current macOS SDKs, and `SO_NOSIGPIPE` on the socket
+  on macOS, which alone covers an SDK without `MSG_NOSIGNAL`): a socket that can no longer send fails it with `kSocketError` and
+  the errno in `stats().last_send_error`, and `Reopen()` replaces the socket
+  on the same addresses and ports, keeping the send sequence and stats.
+  `SendErrorNeedsNewSocket(errno)` tells an error only a new socket clears
+  from one the network clears on the same socket; both ends decide with it.
+  A new socket is needed for `EPIPE` (shut down, or a socket macOS marked
+  defunct around sleep and wake), `ENOTCONN`, `EDESTADDRREQ`, `EBADF`, and a
+  source address that left the host: `connect()` fixed the source, so after
+  an address change (a new DHCP lease, a link that re-addresses) every send
+  on the old socket fails, on Linux with `ENETUNREACH` and on macOS with
+  `EADDRNOTAVAIL`, while a new socket sends from the new address
+  (`udp_address_change_test`). `ENETUNREACH` also means no route at all; a new
+  socket's `connect()` then fails the same way, and the caller retries the
+  open on its cadence, as at boot. The socket is kept for `ECONNREFUSED`,
+  `ENETDOWN`, `EHOSTUNREACH` and `ENOBUFS`, which clear on it (Windows: the
+  `WSAE` equivalents).
+  The bridge's use of it is in the
+  [data-flow reference](../../docs/DATA_FLOW.md#link-rates-and-endpoints), the
+  RoboRIO program's in [talOS/hardware](../hardware/README.md#roborio).
 
 Use `MutablePayloadBuffer()` plus `SendBufferedFrame()` to build the payload
 directly inside the outgoing datagram buffer, avoiding an extra copy.
 `SendFrame()` copies from a caller buffer.
+
+Loopback tests expecting a sent frame use the test-only
+`udp_test_helpers.h` `testing::ReceiveFrame()` delivery barrier. It bounds
+wall-clock waiting without advancing simulated time or resending, and returns
+socket/decode errors immediately. Negative receive assertions still use
+`TryReceive()` directly.
 
 ## Safety Boundary
 

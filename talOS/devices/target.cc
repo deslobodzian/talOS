@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -27,22 +28,38 @@ struct TargetState {
   std::vector<std::int32_t> test;
   DriverStation ds;
   std::size_t selection = 0;  // NodeAccess::add_selection: who drives
+  // NodeAccess::next_update of the update() that last logged a READ (0:
+  // none; inside update() it is at least 1).
+  std::uint64_t read_update = 0;
 };
 
 struct LaneState {
   std::size_t publisher = 0;
   std::size_t bytes = 0;
   std::size_t alignment = 0;
-  DriverStation ds;                 // whose generation send() stamps
-  std::vector<std::byte> envelope;  // reused for every send
+  DriverStation ds;                   // whose generation send() stamps
+  std::vector<std::byte> envelope;    // reused for every send
+  std::optional<std::size_t> arming;  // holds send() to a release
 };
 
-// This node's targets and lanes, attached as a Node extension. Deques keep
-// each entry where it is as more are opened.
+// One OperatorArming: armed by a neutral evaluation, and only for the
+// Driver Station view it was armed under.
+struct ArmingState {
+  DriverStation ds;
+  bool armed = false;
+  std::uint64_t boot_id = 0;
+  std::uint64_t generation = 0;
+  std::uint64_t recoveries = 0;
+  std::optional<Time> last_evaluation;
+};
+
+// This node's targets, lanes and armings, attached as a Node extension.
+// Deques keep each entry where it is as more are opened.
 struct Targets {
   explicit Targets(Node&) {}
   std::deque<TargetState> targets;
   std::deque<LaneState> lanes;
+  std::deque<ArmingState> armings;
 };
 
 TargetState& TargetAt(Node& node, std::size_t index) {
@@ -62,6 +79,31 @@ LaneState& LaneAt(Node& node, std::size_t index) {
                             std::to_string(index));
   }
   return lanes[index];
+}
+
+ArmingState& ArmingAt(Node& node, std::size_t index) {
+  auto& armings = node.extension<Targets>().armings;
+  if (index >= armings.size()) {
+    throw std::out_of_range(std::string{node.name()} +
+                            ": no operator arming at index " +
+                            std::to_string(index));
+  }
+  return armings[index];
+}
+
+// Armed, and nothing has happened since that the arming evaluation did not
+// see: an evaluation within command_timeout_us, and the same Driver Station
+// mode generation and gateway boot, with no stale spell of the link between.
+bool Armed(Node& node, const ArmingState& state) {
+  if (!state.armed || !state.last_evaluation) return false;
+  if (node.now() - *state.last_evaluation >=
+      NodeAccess::freshness_timeout(node)) {
+    return false;
+  }
+  const std::uint64_t generation = DriverStationAccess::generation(state.ds);
+  return generation != 0 && generation == state.generation &&
+         state.ds.data().boot_id == state.boot_id &&
+         DriverStationAccess::recoveries(state.ds) == state.recoveries;
 }
 
 // Hands whatever target_get decided -- on every path out of it -- to the
@@ -158,7 +200,7 @@ std::size_t TargetAccess::open_target(Node& node, std::size_t bytes,
 const void* TargetAccess::target_get(Node& node, std::size_t target,
                                      std::int32_t& source) {
   source = -1;
-  const TargetState& state = TargetAt(node, target);
+  TargetState& state = TargetAt(node, target);
   const ReportSelection report{node, state.selection, source};
   if (!robot_enabled(node)) return nullptr;
   const std::vector<std::int32_t>* lanes = nullptr;
@@ -194,6 +236,16 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
       continue;
     }
     source = lane;
+    // A selection inside update() is what that tick acts on, through its
+    // outputs or a command topic: the dispatch log records which message it
+    // was (an EventKind::READ record), which is how a session's tick-time
+    // target age is measured. Only the first selecting get() or source() of
+    // each update() logs one, so a tick is one READ however often it asks.
+    if (NodeAccess::in_update(node) &&
+        state.read_update != NodeAccess::next_update(node)) {
+      state.read_update = NodeAccess::next_update(node);
+      NodeAccess::record_read(node, subscription);
+    }
     return envelope + kTargetEnvelopeHeaderBytes;
   }
   return nullptr;
@@ -211,17 +263,15 @@ std::size_t TargetAccess::target_bytes(Node& node, std::size_t target) {
 std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
                                     std::string_view source, std::size_t bytes,
                                     std::size_t alignment,
-                                    const schema::Identity& message) {
+                                    const schema::Identity& message,
+                                    std::optional<std::size_t> arming) {
   const std::size_t envelope = TargetEnvelopeBytes(bytes, alignment);
-  for (const auto& [segment, what] :
-       {std::pair{subsystem, "target lane subsystem"},
-        std::pair{source, "target lane source"}}) {
-    if (auto problem = introspect::naming::CheckSegmentName(segment, what)) {
-      throw std::invalid_argument(std::string{node.name()} + ": " + *problem);
-    }
+  if (arming) ArmingAt(node, *arming);  // throws unless this node has it
+  if (auto problem = introspect::naming::CheckTargetLane(subsystem, source)) {
+    throw std::invalid_argument(std::string{node.name()} + ": " + *problem);
   }
   const std::string topic =
-      "/" + std::string{subsystem} + "/target/" + std::string{source};
+      introspect::naming::TargetLaneTopic(subsystem, source);
   auto& lanes = node.extension<Targets>().lanes;
   lanes.push_back(LaneState{
       .publisher = NodeAccess::add_publisher(
@@ -232,12 +282,14 @@ std::size_t TargetAccess::open_lane(Node& node, std::string_view subsystem,
       // before its timer and send() stamps the packet it saw last.
       .ds = DriverStation{node},
       .envelope = std::vector<std::byte>(envelope),
+      .arming = arming,
   });
   return lanes.size() - 1;
 }
 
 bool TargetAccess::lane_send(Node& node, std::size_t lane, const void* message,
                              std::size_t bytes) {
+  NodeAccess::require_loop_thread(node, "TargetLane::send");
   LaneState& state = LaneAt(node, lane);
   if (message == nullptr || bytes != state.bytes) {
     throw std::invalid_argument(
@@ -246,18 +298,58 @@ bool TargetAccess::lane_send(Node& node, std::size_t lane, const void* message,
         (message == nullptr ? std::string{"no message"}
                             : std::to_string(bytes) + " bytes"));
   }
-  EncodeTargetEnvelope(DriverStationAccess::generation(state.ds), true, message,
-                       state.bytes, state.alignment, state.envelope);
-  return NodeAccess::publisher_send(
-      node, state.publisher, state.envelope.data(), state.envelope.size());
+  // Not armed: the operator's inputs have not been neutral since whatever
+  // last disarmed it, so the lane says nothing rather than what they say.
+  const bool active =
+      !state.arming || Armed(node, ArmingAt(node, *state.arming));
+  EncodeTargetEnvelope(DriverStationAccess::generation(state.ds), active,
+                       active ? message : nullptr, state.bytes, state.alignment,
+                       state.envelope);
+  return NodeAccess::publisher_send(node, state.publisher,
+                                    state.envelope.data(),
+                                    state.envelope.size()) &&
+         active;
 }
 
 bool TargetAccess::lane_release(Node& node, std::size_t lane) {
+  NodeAccess::require_loop_thread(node, "TargetLane::release");
   LaneState& state = LaneAt(node, lane);
   EncodeTargetEnvelope(DriverStationAccess::generation(state.ds), false,
                        nullptr, state.bytes, state.alignment, state.envelope);
   return NodeAccess::publisher_send(
       node, state.publisher, state.envelope.data(), state.envelope.size());
+}
+
+std::size_t TargetAccess::open_arming(Node& node) {
+  auto& armings = node.extension<Targets>().armings;
+  armings.push_back(ArmingState{.ds = DriverStation{node}});
+  return armings.size() - 1;
+}
+
+bool TargetAccess::arming_evaluate(Node& node, std::size_t arming,
+                                   bool neutral) {
+  NodeAccess::require_loop_thread(node, "OperatorArming::evaluate");
+  ArmingState& state = ArmingAt(node, arming);
+  const bool armed = Armed(node, state);
+  state.last_evaluation = node.now();
+  if (armed) return true;
+  // Arms for the evaluations after this one, under the view seen now.
+  const std::uint64_t generation = DriverStationAccess::generation(state.ds);
+  state.armed = neutral && generation != 0;
+  state.generation = generation;
+  state.boot_id = state.ds.data().boot_id;
+  state.recoveries = DriverStationAccess::recoveries(state.ds);
+  return false;
+}
+
+bool TargetAccess::arming_armed(Node& node, std::size_t arming) {
+  NodeAccess::require_loop_thread(node, "OperatorArming::armed");
+  return Armed(node, ArmingAt(node, arming));
+}
+
+void TargetAccess::arming_disarm(Node& node, std::size_t arming) {
+  NodeAccess::require_loop_thread(node, "OperatorArming::disarm");
+  ArmingAt(node, arming).armed = false;
 }
 
 }  // namespace talos::detail

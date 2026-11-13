@@ -14,6 +14,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -21,6 +22,7 @@
 
 #include "talOS/events/manifest.h"
 #include "talOS/hardware/config.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/rtms/rtms.h"
 
 namespace talos::introspect::naming {
@@ -79,6 +81,27 @@ inline constexpr std::string_view kDirectionSuffixes[] = {
 inline constexpr std::uint32_t kSourceFlagExternal = 1u << 0;
 inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
 inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
+// Not about the far end: a watcher that delivers only the newest message
+// (event::EventLoopBase::latest_only), whose dropped count therefore includes
+// the messages it skipped by design, and whose log records at most one
+// message per drain. Set from the loop (introspect::LoopSourceFlags) by the
+// Reporter and by `--describe` (`"latest_only": true`), never declared by a
+// node.
+inline constexpr std::uint32_t kSourceFlagLatestOnly = 1u << 3;
+// Not about the far end either: the publisher the devices layer's flush writes
+// its node's hardware request on (detail::NodeAccess::add_hardware_request),
+// set by the node from that registration, never declared by node code. The
+// graph lint refuses a `/hw/request` writer without it (RULES.md 2). A bit of
+// the existing flags word: an older registry reader ignores it, and an older
+// `--describe`, which never wrote it, reads as "not the flush".
+inline constexpr std::uint32_t kSourceFlagHardwareRequest = 1u << 4;
+
+// The hardware bridge's roster name: the launcher lists the bridge under it
+// (launcher kHardwareNodeName), whatever binary `[robot] hardware_node` names,
+// and the stock bridge describes itself by it (talOS/bridge kNodeName; both
+// are held to this one). The graph lint knows the bridge by its roster slot
+// (NodeShape::hardware_bridge), not by the name a binary describes.
+inline constexpr std::string_view kHardwareBridgeNode = "hardware_node";
 
 inline bool IsSender(event::SourceKind kind) {
   return kind == event::SourceKind::SENDER;
@@ -193,6 +216,68 @@ inline std::optional<std::string> CheckTopicName(std::string_view topic) {
   return std::nullopt;
 }
 
+// Alerts: a bool field of a node's own `status` message named
+// `alert_<level>_<name>` is an alert, active while true (NAMING.md, the
+// `status` role). ParseAlertField is the only reader of that grammar: the
+// graph lint checks fields with it, the telemetry dictionary tags channels
+// with its level, and every viewer reads the level from there.
+inline constexpr std::string_view kAlertPrefix = "alert_";
+
+// Ordered by severity; the values are telemetry.fbs's AlertLevel.
+enum class AlertLevel : std::uint8_t { kNone, kInfo, kWarning, kError };
+
+struct AlertField {
+  AlertLevel level{AlertLevel::kNone};
+  std::string_view name;  // the `<name>` part, a view into the field name
+};
+
+// `field` (a field name, not a path) as an alert: `alert_error_<name>`,
+// `alert_warning_<name>` or `alert_info_<name>`, where `<name>` is a
+// lowercase letter, then lowercase letters, digits and single underscores,
+// not ending in one. Anything else, including an `alert_` field of another
+// level or with no name, is nullopt.
+inline std::optional<AlertField> ParseAlertField(std::string_view field) {
+  if (!field.starts_with(kAlertPrefix)) return std::nullopt;
+  field.remove_prefix(kAlertPrefix.size());
+  struct Spelling {
+    std::string_view word;
+    AlertLevel level;
+  };
+  static constexpr Spelling kLevels[] = {{"error_", AlertLevel::kError},
+                                         {"warning_", AlertLevel::kWarning},
+                                         {"info_", AlertLevel::kInfo}};
+  for (const auto& [word, level] : kLevels) {
+    if (!field.starts_with(word)) continue;
+    const std::string_view name = field.substr(word.size());
+    if (name.empty() || name.front() < 'a' || name.front() > 'z' ||
+        name.back() == '_' || name.find("__") != std::string_view::npos) {
+      return std::nullopt;
+    }
+    for (const char c : name) {
+      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+        return std::nullopt;
+    }
+    return AlertField{level, name};
+  }
+  return std::nullopt;
+}
+
+namespace detail {
+// One field of a message whose name starts with kAlertPrefix.
+struct AlertPrefixedField {
+  std::string path;     // field names from the root struct, joined by '.'
+  std::string name;     // the field's own name
+  bool is_bool{false};  // a bool scalar (not an array, not a struct)
+};
+
+// Every field whose name starts with kAlertPrefix in struct `root` of
+// `bfbs` (a reflection.Schema), nested structs and arrays of structs
+// included, each struct type visited once. Empty when `bfbs` does not
+// verify or does not hold `root`. In names.cc: it reads reflection.
+std::vector<AlertPrefixedField> AlertPrefixedFields(std::string_view bfbs,
+                                                    std::string_view root);
+}  // namespace detail
+
 // The node name must match the target's package leaf
 // (`//2026-robot/main_processor/odometry:node`), its repository when at the
 // repository root (`@wrist//:node`), or its rule name
@@ -270,6 +355,10 @@ struct NodeShape {
   std::string name;
   std::string target;
   std::vector<SourceShape> sources;
+  // The roster's hardware bridge (the launcher marks the node in the
+  // kHardwareBridgeNode slot, whatever its binary calls itself): the one node
+  // that writes the `hw` namespace, except each node's own request.
+  bool hardware_bridge{false};
 };
 
 enum class Severity { WARNING, ERROR };
@@ -326,24 +415,118 @@ inline std::vector<Diagnostic> CheckHardwareConfig(
 using TargetSources =
     std::map<std::string, std::vector<std::string>, std::less<>>;
 
-// A target lane is `/<sub>/target/<source>`.
+// Per-mode policy sources, kept separate from the union used for lane naming.
+using TargetModeSources =
+    std::map<std::string,
+             std::map<std::string, std::vector<std::string>, std::less<>>,
+             std::less<>>;
+
+// A target lane is `/<subsystem>/target/<source>`: a valid topic name of
+// exactly three segments whose role is `target`. C++ recognises a lane only
+// through IsTargetLane, and producers and test helpers build one only through
+// TargetLaneTopic; a consumer (talos::Target) subscribes to the relative
+// `target/<source>`, which its node resolves (and may remap). session_report.py
+// and contract.bzl mirror the grammar.
 inline bool IsTargetLane(std::string_view topic) {
+  if (CheckTopicName(topic)) return false;
   const auto segments = detail::Segments(topic);
   return segments.size() == 3 && segments[1] == "target";
 }
+
+namespace detail {
+// Unchecked: LintGraph names a policy lane even when it would be malformed.
+inline std::string JoinTargetLane(std::string_view subsystem,
+                                  std::string_view source) {
+  return "/" + std::string{subsystem} + "/target/" + std::string{source};
+}
+}  // namespace detail
+
+// Whether `topic` is in the hardware request namespace: `/hw/request` or any
+// topic below it, well formed or not. Only a node's devices-layer flush
+// writes there (detail::NodeAccess::add_hardware_request); the generic
+// publishers refuse every such topic, however it was spelled or remapped.
+inline bool IsHardwareRequest(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() >= 2 && segments[0] == "hw" &&
+         segments[1] == "request";
+}
+
+// The hardware request of node `node`: hardware::RequestTopic, the one
+// spelling the bridge also reads.
+inline std::string HardwareRequestTopic(std::string_view node) {
+  return hardware::RequestTopic(node);
+}
+static_assert(std::string_view{hardware::kRequestTopicPrefix} == "/hw/request/",
+              "IsHardwareRequest recognises the prefix the bridge reads");
+
+// Why `/<subsystem>/target/<source>` is not a target lane, or nullopt.
+inline std::optional<std::string> CheckTargetLane(std::string_view subsystem,
+                                                  std::string_view source) {
+  if (auto problem = CheckSegmentName(subsystem, "target lane subsystem"))
+    return problem;
+  if (auto problem = CheckSegmentName(source, "target lane source"))
+    return problem;
+  return CheckTopicName(detail::JoinTargetLane(subsystem, source));
+}
+
+// The lane `/<subsystem>/target/<source>`; std::invalid_argument with
+// CheckTargetLane's reason when the parts do not make one.
+inline std::string TargetLaneTopic(std::string_view subsystem,
+                                   std::string_view source) {
+  if (auto problem = CheckTargetLane(subsystem, source))
+    throw std::invalid_argument(*problem);
+  return detail::JoinTargetLane(subsystem, source);
+}
+
+namespace detail {
+// Why `node` may not write `source`, a topic of the `hw` namespace, or
+// nullopt (RULES.md 2). The bridge (NodeShape::hardware_bridge) writes the
+// namespace, except the requests:
+// `/hw/request/<node>` is written only by <node>'s devices-layer flush, which
+// gates every output on robot_enabled and update() and applies the motor
+// limits and position frames before it sends; a plain publisher would skip
+// all of that.
+inline std::optional<std::string> HardwareWriterProblem(
+    const NodeShape& node, const SourceShape& source) {
+  const std::string writer = "is written by '" + node.name + "'";
+  if (!IsHardwareRequest(source.name)) {
+    if (node.hardware_bridge) return std::nullopt;
+    return writer + "; the hw namespace is written only by the hardware " +
+           "bridge (the roster's '" + std::string{kHardwareBridgeNode} +
+           "'), except each node's own " + HardwareRequestTopic("<node>");
+  }
+  if (source.name != HardwareRequestTopic(node.name))
+    return writer + ", but the only hardware request a node writes is its " +
+           "own, " + HardwareRequestTopic(node.name);
+  if ((source.flags & kSourceFlagHardwareRequest) == 0)
+    return writer + " outside its devices layer; a hardware request " +
+           "leaves only through the devices-layer flush after update(), " +
+           "which gates it on robot_enabled and applies the motor limits " +
+           "(command the node's devices instead of publishing a request), " +
+           "or the binary predates the hardware_request attribute; rebuild " +
+           "it";
+  return std::nullopt;
+}
+}  // namespace detail
 
 // Everything checkable about a whole graph, errors first.
 //
 // Errors cannot be correct in any configuration (two writers, a reader with no
 // writer, two schemas or message sizes or ring layouts on one topic, a
-// malformed name, a lane its subsystem never
-// reads). Warnings are normal during development or in a partial launch (an
-// unread topic, an owner not in this session, a policy lane nobody writes yet).
-// Timers are skipped: their names are labels, not topics. `target_sources`
-// comes from the config; a subsystem missing from it is not lane-checked.
+// malformed name, a lane its subsystem never reads, an `hw` topic written by
+// anything but the roster's bridge or, for `/hw/request/<node>`, <node>'s
+// devices-layer flush, an `alert_` field that is not a bool or not
+// ParseAlertField's grammar). Warnings are normal during development or in a
+// partial launch (an unread topic, an owner not in this session, a policy
+// lane nobody writes yet, an alert outside a `status` topic). Required coverage
+// additionally rejects a target-consuming subsystem with no producer for a
+// nonempty mode policy. Timers are skipped: their names are labels, not topics.
+// A subsystem absent from target_sources is not lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
-    const TargetSources& target_sources = {}) {
+    const TargetSources& target_sources = {},
+    const TargetModeSources& target_mode_sources = {},
+    bool require_target_coverage = false) {
   std::vector<Diagnostic> out;
   const auto add = [&out](Severity severity, std::string subject,
                           std::string message) {
@@ -412,6 +595,35 @@ inline std::vector<Diagnostic> LintGraph(
         const auto segments = detail::Segments(source.name);
         const std::string owner{segments[0]};
         const std::string role{segments[1]};
+        if (owner == "hw") {
+          if (auto problem = detail::HardwareWriterProblem(node, source))
+            add(Severity::ERROR, source.name, *problem);
+        }
+        // Alert fields, from the writer's schema (a shape without one, a
+        // registry snapshot, has no fields to check).
+        if (!source.bfbs.empty()) {
+          for (const auto& field :
+               detail::AlertPrefixedFields(source.bfbs, source.schema)) {
+            const auto alert = ParseAlertField(field.name);
+            if (!alert) {
+              add(Severity::ERROR, source.name,
+                  "field '" + field.path + "' (written by " + node.name +
+                      ") starts with 'alert_' but is not "
+                      "alert_<error|warning|info>_<name>");
+            } else if (!field.is_bool) {
+              add(Severity::ERROR, source.name,
+                  "alert field '" + field.path + "' (written by " + node.name +
+                      ") is not a bool; an alert is active "
+                      "while true");
+            } else if (role != "status") {
+              add(Severity::WARNING, source.name,
+                  "alert field '" + field.path + "' (written by " + node.name +
+                      ") is in a '" + role +
+                      "' topic; an alert belongs to its node's 'status' "
+                      "topic, the health it reports");
+            }
+          }
+        }
         if (!detail::OneOf(kReservedOwners, owner)) {
           if (detail::OneOf(kOwnerPublishedRoles, role) && owner != node.name)
             add(Severity::ERROR, source.name,
@@ -537,6 +749,41 @@ inline std::vector<Diagnostic> LintGraph(
     if (topic.readers.empty() && !topic.exempt)
       add(Severity::WARNING, topic.name,
           "is published but nothing subscribes to it");
+  }
+
+  if (require_target_coverage) {
+    for (const auto& node : nodes) {
+      const bool consumes_targets =
+          std::any_of(node.sources.begin(), node.sources.end(),
+                      [&node](const SourceShape& source) {
+                        return IsReader(source.kind) && !source.observer() &&
+                               IsTargetLane(source.name) &&
+                               detail::Segments(source.name)[0] == node.name;
+                      });
+      if (!consumes_targets) continue;
+      const auto policy = target_mode_sources.find(node.name);
+      if (policy == target_mode_sources.end()) continue;
+      for (const auto& [mode, sources] : policy->second) {
+        if (sources.empty()) continue;
+        bool has_writer = false;
+        std::vector<std::string> lanes;
+        for (const auto& source : sources) {
+          lanes.push_back(detail::JoinTargetLane(node.name, source));
+          const auto topic = std::find_if(topics.begin(), topics.end(),
+                                          [&lanes](const TopicFacts& facts) {
+                                            return facts.name == lanes.back();
+                                          });
+          has_writer =
+              has_writer || (topic != topics.end() && !topic->writers.empty());
+        }
+        if (!has_writer) {
+          add(Severity::ERROR, node.name,
+              "target coverage required for mode '" + mode +
+                  "', but none of its policy lanes has a writer: " +
+                  join(lanes));
+        }
+      }
+    }
   }
 
   std::stable_partition(out.begin(), out.end(), [](const Diagnostic& d) {

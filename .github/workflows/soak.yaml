@@ -1,0 +1,97 @@
+# Minutes of the full simulated graph under SIGKILL/SIGSTOP chaos
+# (2026-robot/main_processor/simulation/README.md). Called by
+# continuous-integration.yaml (Linux, every push) and nightly.yaml (macOS).
+# The target is `manual`, so `bazel test //...` never runs it.
+name: Soak
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: Runner label.
+        required: true
+        type: string
+      seed:
+        description: Fault-order seed (TALOS_SOAK_SEED).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  soak:
+    name: Soak (${{ inputs.os }}, seed ${{ inputs.seed }})
+    runs-on: ${{ inputs.os }}
+    timeout-minutes: 60
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        # The plain-configuration cache of this OS, which only the main
+        # build job of a push to main saves.
+        disk-cache: plain
+        repository-cache: true
+        cache-save: false
+
+    # Built first, so the host recording below covers only the test.
+    - name: Build
+      run: >-
+        bazel build //2026-robot/main_processor/simulation:soak_test
+        --noshow_progress
+
+    - name: Soak
+      env:
+        SOAK_SEED: ${{ inputs.seed }}
+      # Records the host once a second for the test's duration into host/
+      # beside the test's logs, which a failure keeps: paging (vm_stat,
+      # vmstat), the busiest processes (top) and, on macOS, the busiest
+      # threads with their priority and policy (ps -M: T timeshare, R
+      # realtime), which macOS top cannot show. A stall of the whole
+      # host shows there and in no log of the test's own. The test's `long`
+      # timeout bounds the recording to 15 minutes, a few MB.
+      run: |
+        logs=bazel-testlogs/2026-robot/main_processor/simulation/soak_test
+        host="$RUNNER_TEMP/soak-host"
+        mkdir -p "$host"
+        # Job control puts each recorder pipeline in its own process group.
+        set -m
+        finish() {
+          for job in $(jobs -p); do kill -- "-$job" 2>/dev/null || true; done
+          mkdir -p "$logs"
+          cp -R "$host" "$logs/host" || true
+        }
+        trap finish EXIT
+        if [ "$RUNNER_OS" = macOS ]; then
+          vm_stat 1 2>&1 | perl -MPOSIX -ne \
+            '$| = 1; print strftime("%H:%M:%S ", localtime), $_' \
+            > "$host/vm_stat.log" &
+          top -l 0 -s 1 -o cpu -n 30 -stats pid,command,cpu,state,threads \
+            > "$host/top.log" 2>&1 &
+          while sleep 1; do
+            date +%T
+            # A thread's row omits USER and TT, so %CPU is its second field.
+            ps -A -M | awk 'NR > 1 { print (($1 ~ /^[0-9]+$/) ? $2 : $4) "\t" $0 }' \
+              | sort -rn | head -60 | cut -c1-160
+          done > "$host/threads.log" 2>&1 &
+        else
+          vmstat -t 1 > "$host/vmstat.log" 2>&1 &
+          top -b -d 1 -w 200 -o %CPU 2>&1 \
+            | awk '/^top -/ { n = 0 } n++ < 47' > "$host/top.log" &
+        fi
+        bazel test //2026-robot/main_processor/simulation:soak_test \
+          --noshow_progress --test_output=all \
+          --test_env=TALOS_SOAK_SECONDS=180 \
+          --test_env=TALOS_SOAK_SEED="$SOAK_SEED"
+
+    - name: Keep the failed session
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: soak-${{ inputs.os }}-seed-${{ inputs.seed }}
+        path: bazel-testlogs/2026-robot/main_processor/simulation/soak_test/
+        if-no-files-found: ignore

@@ -3,12 +3,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -26,11 +28,14 @@
 #include "geometry/geometry_generated.h"
 #include "sim/topics.h"
 #include "talOS/node/node.h"
+#include "talOS/process/process.h"
 #include "talOS/vision/capture/avfoundation_source.h"
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "talOS/vision/field_sim/tag_patterns.h"
 #include "talOS/vision/field_sim/tag_rasterizer.h"
+#include "talOS/vision/frame_mailbox.h"
 #include "talOS/vision/pipeline.h"
+#include "talOS/vision/playback/recorded_source.h"
 #include "talOS/vision/recording/recorder.h"
 #include "talOS/vision/recording/recording.h"
 #include "vision/data/field_layout_2026.h"
@@ -38,19 +43,27 @@
 
 namespace vision {
 
-// One calibrated camera, one observation topic and one bounded live worker.
-// Construction only registers/configures: describing never opens hardware.
+// One calibrated camera, one observation topic and one bounded worker: live
+// capture, or the simulated raster render/detect chain. Construction only
+// registers/configures: describing never opens hardware.
 class Vision {
  public:
-  explicit Vision(talos::Node& node)
+  using SourceFactory =
+      std::function<std::unique_ptr<talos::vision::CameraSource>(
+          const talos::vision::CameraSourceConfig&)>;
+  // `backend`, when set, replaces the configured detector backend (tests).
+  explicit Vision(talos::Node& node, SourceFactory factory = {},
+                  std::shared_ptr<talos::vision::ComputeBackend> backend = {})
       : node_(node),
-        simulated_(node.simulation()),
+        simulated_(node.simulation() && !factory),
         rasterize_(node.param("rasterize", true)),
         tag_size_(node.param("tag_size_m", 0.1651)),
         camera_id_(node.param<int>("camera.id")),
         device_(node.param<std::string>("camera.device", "")),
         state_(node.publish<geometry::PoseObservation>("state")),
         status_(node.publish<VisionStatus>("status")) {
+    source_factory_ = factory ? std::move(factory)
+                              : talos::vision::playback::CreateCameraSource;
     if (simulated_) {
       truth_.emplace(node.subscribe<geometry::OdometrySample>(
           sim::topics::kState, {.optional = true}));
@@ -68,6 +81,8 @@ class Vision {
       throw std::runtime_error("vision layout: " + error);
     }
     LoadCamera();
+    // Each layout tag in view once: the direct-projection sim's most.
+    solver_.Reserve(layout_.layout.size());
     if (simulated_ && sim_timestamp_lag_ns_ > 0) {
       // Reserve the capture-rate lag window plus boundary/scheduling margin.
       // The node/status tick may be much slower or faster than camera frames.
@@ -75,11 +90,9 @@ class Vision {
       const auto frames =
           std::ceil(static_cast<long double>(sim_timestamp_lag_ns_) *
                     capture_config_.fps / 1.0e9L);
-      if (frames > sim_pending_.max_size() - kMargin) {
-        throw std::invalid_argument(
-            std::string(node_.name()) +
-            ": camera.fps requires too many delayed frames");
-      }
+      RequireQueueSize(frames + kMargin, "camera.sim_timestamp_lag_us",
+                       static_cast<long double>(sim_timestamp_lag_ns_) / 1000,
+                       "delayed observations");
       sim_pending_.resize(static_cast<std::size_t>(frames) + kMargin);
     }
     solver_options_.pixel_std_px =
@@ -112,8 +125,13 @@ class Vision {
     config.mounting = camera_.mounting;
     config.layout = layout_.layout;
     config.validation_options = validation_options_;
+    // Never hold construction hostage to Metal's shared compiler-cache lock
+    // (INC-7): "auto" detects on the CPU until Metal is ready.
+    config.deferred_gpu_init = true;
+    config.log_name = std::string{node.name()};
     try {
-      pipeline_ = std::make_unique<talos::vision::AprilTagPipeline>(config);
+      pipeline_ = std::make_unique<talos::vision::AprilTagPipeline>(
+          config, std::move(backend));
     } catch (const std::invalid_argument& error) {
       throw std::invalid_argument(std::string(node.name()) + ": " +
                                   error.what());
@@ -145,8 +163,10 @@ class Vision {
         recorder_options.rejected_hz = recording_rejected_hz_;
         recorder_options.max_bytes = recording_max_bytes_;
         recorder_options.context.camera = std::string{node.name()};
-        recorder_options.context.width = camera_.intrinsics.image_width;
-        recorder_options.context.height = camera_.intrinsics.image_height;
+        recorder_options.context.width =
+            static_cast<int>(camera_.intrinsics.image_width);
+        recorder_options.context.height =
+            static_cast<int>(camera_.intrinsics.image_height);
         recorder_options.context.intrinsics = camera_.intrinsics;
         recorder_options.context.mounting = extrinsics_;
         recorder_options.context.detector = {
@@ -176,8 +196,46 @@ class Vision {
     }
     sim_tags_.reserve(256);
     detections_.reserve(256);
+    {
+      // The worker finishes at most one result per frame period (it takes one
+      // frame or request at a time, and they come no faster than camera.fps),
+      // and every update() takes all of them. Between two collections a
+      // period_us apart: ceil(period_us * fps) results, plus the one in
+      // progress at the earlier collection. A late tick, or a collection
+      // whose try_lock met the worker storing, doubles the window:
+      // ceil(2 * period_us * fps) + 1, plus one slot for a live disconnect
+      // marker. 10 ms ticks at 60 fps: 4. This is the bound for a camera
+      // delivering at camera.fps whose frames are all captured inside the
+      // window; a live window can also finish the frame in progress and the
+      // one waiting in the mailbox from before it, and a camera faster than
+      // camera.fps finishes more. Past the capacity the oldest result is
+      // evicted and counted dropped (PushFinished), never lost silently.
+      constexpr std::size_t kMargin = 2;
+      const auto period_s =
+          std::chrono::duration<long double>{node.period()}.count();
+      const auto frames = std::ceil(2.0L * period_s * capture_config_.fps);
+      RequireQueueSize(frames + kMargin, "period_us", period_s * 1.0e6L,
+                       "queued results");
+      finished_.resize(static_cast<std::size_t>(frames) + kMargin);
+      collected_.resize(finished_.size());
+    }
     if (CanCapture(simulated_, device_)) {
-      worker_ = std::thread([this] { Work(); });
+      // No up-front mailbox reservation: the pixel format (V4L2 at most
+      // 2 B/px, AVFoundation BGRA) is negotiated only when the worker opens
+      // the source, and frames may arrive before Start() returns. Each slot
+      // instead grows to the negotiated frame size the first time it is
+      // filled (three allocations), then capture copies without allocating.
+      worker_ = std::thread([this] {
+        // Capture, detection and the threads they start run below every
+        // node loop (talOS/process ConfigureBackgroundThread).
+        talos::process::ConfigureBackgroundThread();
+        Work();
+      });
+    } else if (simulated_ && rasterize_) {
+      worker_ = std::thread([this] {
+        talos::process::ConfigureBackgroundThread();
+        SimWork();
+      });
     }
   }
 
@@ -189,6 +247,14 @@ class Vision {
     wake_.notify_one();
     if (worker_.joinable()) worker_.join();
   }
+
+  // Bounds every per-camera frame queue, sized from camera.fps at
+  // construction: 240 fps (four times the configured 60) across
+  // the longest accepted sim lag (just under 1 s), or doubled across a
+  // 500 ms tick, needs at most 242 slots. A larger product is a typo
+  // (fps = 1e9 would fill gigabytes before the node failed), so it is
+  // refused at construction, before anything is allocated.
+  static constexpr std::size_t kMaxQueuedFrames = 256;
 
   static bool CanCapture(bool simulated, std::string_view device) {
     return !simulated && !device.empty();
@@ -208,6 +274,32 @@ class Vision {
 
   const talos::vision::CameraSourceConfig& capture_config() const {
     return capture_config_;
+  }
+
+  // Tests: blocks, in wall time, until the raster sim worker holds no request
+  // and has stored the result of the one it took, so the next update()
+  // collects it without simulated time passing meanwhile. False if `timeout`
+  // passes first; true at once for a node without a raster sim worker.
+  bool WaitForSimWorker(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return sim_idle_.wait_for(lock, timeout,
+                              [this] { return !sim_request_ && !sim_busy_; });
+  }
+
+  // Tests: blocks, in wall time, until the live capture worker has serviced
+  // the latest update() instant and every frame delivered to it and is waiting
+  // for more, so the next update() collects what it produced without
+  // simulated time passing meanwhile. False if `timeout` passes first; true at
+  // once for a node without a live capture worker.
+  bool WaitForLiveWorker(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return live_idle_.wait_for(lock, timeout, [this] {
+      return stopping_.load(std::memory_order_acquire) ||
+             (!live_busy_ &&
+              live_serviced_ns_ ==
+                  worker_now_ns_.load(std::memory_order_acquire) &&
+              !mailbox_.HasReady());
+    });
   }
 
   bool AcceptEstimate(const talos::vision::RobotPoseEstimate& estimate) const {
@@ -246,37 +338,39 @@ class Vision {
   void update() {
     const auto now = node_.now();
     const auto now_ns = static_cast<std::uint64_t>(now.nanos());
+    // An invalid observation that stands for no capture (no truth, no
+    // camera); captures publish as they are admitted, oldest first.
     std::optional<Completed> completed;
-    if (simulated_) {
+    // truth_ exists exactly when simulated_.
+    if (truth_.has_value()) {
       if (truth_->fresh()) {
         truth_outage_ = false;
-        // Deliver ready frames before rendering or admitting a new capture.
+        // Deliver ready frames before admitting a new capture.
         DrainSimPending(now_ns);
+        if (rasterize_) CollectSimResults(now_ns);
         const auto& truth = truth_->value();
-        const auto stamp = truth.sample_time_ns();
-        if (SimCaptureDue(stamp)) {
-          auto capture = Simulate(truth);
-          ++captured_;
-          RecordProcessed(capture.capture_ns);
-          if (sim_pending_.empty()) {
-            completed = capture;
+        if (SimCaptureDue(truth.sample_time_ns())) {
+          if (rasterize_) {
+            // Rendering and detection run on the worker, never this loop.
+            PostSimRequest(truth);
           } else {
-            if (sim_pending_count_ == sim_pending_.size()) {
-              sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
-              --sim_pending_count_;
-              ++dropped_;
-            }
-            sim_pending_[(sim_pending_head_ + sim_pending_count_) %
-                         sim_pending_.size()] = capture;
-            ++sim_pending_count_;
+            // Bounded, O(visible tags): stays inline and deterministic.
+            AdmitSimCapture(Simulate(truth, captured_), now_ns);
           }
+          ++captured_;
         }
         DrainSimPending(now_ns);
       } else {
+        // Delayed observations of the retired truth are never delivered.
+        processed_ -= sim_pending_count_;
+        dropped_ += sim_pending_count_;
         sim_pending_count_ = 0;
         completed = Completed{
             truth_->has_value() ? truth_->value().sample_time_ns() : 0};
         if (!truth_outage_) {
+          // Stale truth clears pending observations, including the ones the
+          // worker still holds: their results come back from an older epoch.
+          ++sim_epoch_;
           std::fprintf(
               stderr,
               "%.*s: no fresh /sim/state; simulated cameras need "
@@ -290,24 +384,39 @@ class Vision {
     } else {
       worker_now_ns_.store(now.nanos(), std::memory_order_release);
       wake_.notify_one();
-      std::unique_lock lock(mutex_, std::try_to_lock);
-      if (lock.owns_lock()) {
-        completed = std::move(completed_);
-        completed_.reset();
-        captured_ = received_;
-        processed_ = worker_processed_;
-        dropped_ = worker_dropped_;
-        rejected_range_ = worker_rejected_range_;
-        frame_period_us_ = worker_period_us_;
+      std::size_t collected = 0;
+      {
+        // Never waits for the worker: what it is still storing is taken on a
+        // later tick.
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (lock.owns_lock()) {
+          collected = TakeFinished();
+          captured_ = received_;
+          dropped_ = mailbox_.dropped();
+        }
+      }
+      for (std::size_t i = 0; i < collected; ++i) {
+        const auto& result = collected_[i];
+        if (result.frame) {
+          RecordProcessed(result.completed.capture_ns);
+          rejected_range_ += result.completed.rejected_range;
+        }
+        PublishObservation(result.completed, now_ns);
       }
     }
     if (completed) PublishObservation(*completed, now_ns);
     const bool healthy =
         healthy_ && (simulated_ || connected_.load(std::memory_order_acquire));
-    status_.send(VisionStatus{captured_, processed_, dropped_, frame_period_us_,
-                              last_latency_us_, rejected_range_, visible_,
-                              healthy});
+    status_.send(VisionStatus{
+        captured_, processed_, dropped_, frame_period_us_, last_latency_us_,
+        rejected_range_, visible_, healthy, reconnects_.load(), stalls_.load(),
+        control_failures_.load(), controls_applied_.load()});
   }
+
+  static_assert(sizeof(VisionStatus) == 88);
+  // Shared-memory slot contract for /<camera>/state: docs/DATA_FLOW.md.
+  static_assert(sizeof(geometry::PoseObservation) == 64,
+                "PoseObservation size changed; update docs/DATA_FLOW.md");
 
  private:
   struct Completed {
@@ -319,20 +428,52 @@ class Vision {
     std::uint32_t visible = 0;
     std::uint32_t rejected_range = 0;
     bool success = false;
+    talos::vision::TimestampKind timestamp_kind =
+        talos::vision::TimestampKind::kExposure;
   };
   static_assert(std::is_trivially_copyable_v<Completed>);
+
+  // One due raster capture: the truth sample it renders, the outage epoch it
+  // was posted in, and its frame sequence number.
+  struct SimRequest {
+    geometry::OdometrySample truth;
+    std::uint64_t epoch = 0;
+    std::uint64_t sequence = 0;
+  };
+  // A result on its way from the worker to update(). `frame` is false only
+  // for the live worker's disconnect marker, an invalid observation that is
+  // no capture; `epoch` is the raster sim's outage epoch of its request.
+  struct Finished {
+    Completed completed;
+    std::uint64_t epoch = 0;
+    bool frame = true;
+  };
 
   // What the recorder needs per frame beyond the detections already produced:
   // the gray frame (nullptr when there is none, e.g. the non-raster sim path)
   // and, under --sim, the /sim/state pose the frame was rendered from.
   struct RecordingFeed {
+    RecordingFeed() : gray{nullptr} {}
+    RecordingFeed(const talos::vision::Frame* g,
+                  std::optional<talos::vision::recording::TruthRecord> t)
+        : gray{g}, truth{t} {}
     const talos::vision::Frame* gray;
     std::optional<talos::vision::recording::TruthRecord> truth;
-    RecordingFeed(
-        const talos::vision::Frame* g = nullptr,
-        std::optional<talos::vision::recording::TruthRecord> t = std::nullopt)
-        : gray{g}, truth{std::move(t)} {}
   };
+
+  // Refuses a queue of `slots` (from camera.fps and `key` = `value`) larger
+  // than kMaxQueuedFrames.
+  void RequireQueueSize(long double slots, const char* key, long double value,
+                        const char* what) const {
+    if (slots <= static_cast<long double>(kMaxQueuedFrames)) return;
+    char message[256];
+    std::snprintf(message, sizeof(message),
+                  ": camera.fps = %.6Lg with %s = %.6Lg needs %.6Lg %s; at "
+                  "most %zu",
+                  static_cast<long double>(capture_config_.fps), key, value,
+                  slots, what, kMaxQueuedFrames);
+    throw std::invalid_argument(std::string(node_.name()) + message);
+  }
 
   bool SimCaptureDue(std::uint64_t stamp) {
     if (!first_sim_capture_ns_) {
@@ -411,6 +552,12 @@ class Vision {
     };
     latency_offset_ns_ = duration_ns("latency_offset_us");
     sim_timestamp_lag_ns_ = duration_ns("sim_timestamp_lag_us");
+    readout_ns_ = duration_ns("readout_us");
+    const auto timeout_us = number("frame_timeout_us", 500000);
+    require(
+        std::isfinite(timeout_us) && timeout_us > 0 && timeout_us <= 10000000,
+        "camera.frame_timeout_us");
+    frame_timeout_ns_ = static_cast<std::int64_t>(timeout_us * 1000);
     require(camera_id_ >= 0 && camera_id_ <= 31, "camera.id");
     require(width >= 160 && width <= 4096, "camera.width");
     require(height >= 120 && height <= 2160, "camera.height");
@@ -420,24 +567,54 @@ class Vision {
     require(std::isfinite(solver_options_.mount_translation_std_m) &&
                 solver_options_.mount_translation_std_m >= 0,
             "camera.mount_translation_std_m");
-    if (!intr.IsValid() || !std::isfinite(camera_.max_range_m) ||
-        !(camera_.max_range_m > 0) || !std::isfinite(camera_.min_tag_px) ||
-        !(camera_.min_tag_px >= 0) || !(camera_.facing_min >= 0) ||
-        !(camera_.facing_min <= 1) || !std::isfinite(camera_.pixel_noise_std) ||
-        !(camera_.pixel_noise_std >= 0) ||
-        !std::isfinite(camera_.sensor_noise_std_gray) ||
-        !(camera_.sensor_noise_std_gray >= 0) ||
-        !std::isfinite(camera_.exposure_gain_std) ||
-        !(camera_.exposure_gain_std >= 0) ||
-        !std::isfinite(camera_.exposure_ms) || !(camera_.exposure_ms >= 0) ||
-        seed < 0 || !camera_.mounting.T_robot_camera.matrix().allFinite()) {
-      throw std::runtime_error("invalid vision camera: " +
-                               std::string(node_.name()));
+    // Each key on its own, so the error names it (the ranges are those
+    // CameraIntrinsics::IsValid and the simulation paths rely on).
+    require(intr.fx > 0, "camera.fx");
+    require(intr.fy > 0, "camera.fy");
+    require(intr.cx > 0, "camera.cx");
+    require(intr.cy > 0, "camera.cy");
+    for (const auto& [key, value] : {
+             std::pair{"camera.x_m", extrinsics_.x_m},
+             std::pair{"camera.y_m", extrinsics_.y_m},
+             std::pair{"camera.z_m", extrinsics_.z_m},
+             std::pair{"camera.roll_rad", extrinsics_.roll_rad},
+             std::pair{"camera.pitch_rad", extrinsics_.pitch_rad},
+             std::pair{"camera.yaw_rad", extrinsics_.yaw_rad},
+         }) {
+      require(std::isfinite(value), key);
     }
+    require(std::isfinite(camera_.max_range_m) && camera_.max_range_m > 0,
+            "camera.max_range_m");
+    require(std::isfinite(camera_.min_tag_px) && camera_.min_tag_px >= 0,
+            "camera.min_tag_px");
+    require(camera_.facing_min >= 0 && camera_.facing_min <= 1,
+            "camera.facing_min");
+    require(
+        std::isfinite(camera_.pixel_noise_std) && camera_.pixel_noise_std >= 0,
+        "camera.pixel_noise_std");
+    require(std::isfinite(camera_.sensor_noise_std_gray) &&
+                camera_.sensor_noise_std_gray >= 0,
+            "camera.sensor_noise_std_gray");
+    require(std::isfinite(camera_.exposure_gain_std) &&
+                camera_.exposure_gain_std >= 0,
+            "camera.exposure_gain_std");
+    require(std::isfinite(camera_.exposure_ms) && camera_.exposure_ms >= 0 &&
+                camera_.exposure_ms < 214748364,
+            "camera.exposure_ms");
+    require(seed >= 0, "camera.rng_seed");
     capture_config_.camera_id = camera_id_;
     capture_config_.device_path = device_;
     capture_config_.width = width;
     capture_config_.height = height;
+    capture_config_.exposure_ms = camera_.exposure_ms;
+    capture_config_.gain = number("gain", 0);
+    require(std::isfinite(capture_config_.gain) && capture_config_.gain >= 0 &&
+                capture_config_.gain < 2147483647,
+            "camera.gain");
+    capture_config_.auto_exposure =
+        node_.param("camera.auto_exposure", camera_.exposure_ms == 0);
+    capture_config_.auto_gain =
+        node_.param("camera.auto_gain", capture_config_.gain == 0);
     capture_config_.fps = node_.param<double>("camera.fps", 60.0);
     if (!std::isfinite(capture_config_.fps) || capture_config_.fps <= 0) {
       throw std::invalid_argument(std::string(node_.name()) +
@@ -479,9 +656,9 @@ class Vision {
     }
     result.rejected_range = FilterDetections(detections, camera_.max_range_m);
     result.visible = static_cast<std::uint32_t>(detections.size());
-    const auto estimate = talos::vision::SolveMultiTagRobotPose(
-        detections, camera_id_, camera_.mounting, layout_.layout,
-        camera_.intrinsics, validation_options_, solver_options_);
+    const auto estimate =
+        solver_.Solve(detections, camera_id_, camera_.mounting, layout_.layout,
+                      camera_.intrinsics, validation_options_, solver_options_);
     result.observation = MakeObservation(estimate, capture_ns, success);
     if (record) {
       // The ambiguity gate applies only to single-tag observations; mark that
@@ -535,7 +712,8 @@ class Vision {
     recording_frame_.observation.x_std_m = observation.x_std_m();
     recording_frame_.observation.y_std_m = observation.y_std_m();
     recording_frame_.observation.yaw_std_rad = observation.yaw_std_rad();
-    recording_frame_.observation.tag_count = observation.tag_count();
+    recording_frame_.observation.tag_count =
+        static_cast<int>(observation.tag_count());
     recording_frame_.truth = truth;
     recording_frame_.reason =
         std::string{talos::vision::recording::FrameReason(recording_frame_)};
@@ -546,11 +724,16 @@ class Vision {
                     const std::optional<talos::vision::recording::TruthRecord>&
                         truth = std::nullopt) {
     auto result = pipeline_->ProcessFrame(frame);
-    return Localize(result.detections, frame.capture_timestamp_ns(),
-                    result.success, RecordingFeed{&frame, truth});
+    auto completed = Localize(result.detections, frame.capture_timestamp_ns(),
+                              result.success, RecordingFeed{&frame, truth});
+    completed.timestamp_kind = frame.timestamp_kind();
+    return completed;
   }
 
-  Completed Simulate(const geometry::OdometrySample& truth) {
+  // Raster: the worker's alone (pipeline_, rng_, pixels_, render_scratch_,
+  // recorder_). Direct projection: the loop's alone.
+  Completed Simulate(const geometry::OdometrySample& truth,
+                     std::uint64_t sequence) {
     namespace fs = talos::vision::field_sim;
     const auto& pose = truth.pose();
     const auto field_pose =
@@ -567,7 +750,7 @@ class Vision {
           velocity.omega_radps(), &rng_, &render_scratch_);
       const auto& intr = camera_.intrinsics;
       const talos::vision::Frame frame(
-          camera_id_, 1, captured_, capture_time, intr.image_width,
+          camera_id_, 1, sequence, capture_time, intr.image_width,
           intr.image_height, intr.image_width,
           talos::vision::PixelFormat::kGray8,
           std::shared_ptr<const std::vector<std::uint8_t>>(pixels_));
@@ -583,24 +766,143 @@ class Vision {
         detection.tag_id = tag.tag_id;
         detection.T_camera_tag = tag.T_camera_tag;
         detection.ambiguity = tag.ambiguity;
-        for (int c = 0; c < 4; ++c) {
-          detection.corners[2 * c] = tag.corners[c].x();
-          detection.corners[2 * c + 1] = tag.corners[c].y();
+        for (std::size_t c = 0; c < 4; ++c) {
+          detection.corners[2 * c] = static_cast<float>(tag.corners[c].x());
+          detection.corners[2 * c + 1] = static_cast<float>(tag.corners[c].y());
         }
         detections_.push_back(detection);
       }
       result = Localize(detections_, truth.sample_time_ns(), true);
     }
-    rejected_range_ += result.rejected_range;
     return result;
   }
 
+  // Counts a processed capture and queues it behind the timestamp lag, or
+  // publishes it now when there is none. A capture the full lag queue evicts
+  // moves from processed to dropped.
+  void AdmitSimCapture(const Completed& capture, std::uint64_t now_ns) {
+    RecordProcessed(capture.capture_ns);
+    rejected_range_ += capture.rejected_range;
+    if (sim_pending_.empty()) {
+      PublishObservation(capture, now_ns);
+      return;
+    }
+    if (sim_pending_count_ == sim_pending_.size()) {
+      sim_pending_head_ = (sim_pending_head_ + 1) % sim_pending_.size();
+      --sim_pending_count_;
+      --processed_;
+      ++dropped_;
+    }
+    sim_pending_[(sim_pending_head_ + sim_pending_count_) %
+                 sim_pending_.size()] = capture;
+    ++sim_pending_count_;
+  }
+
+  // Loop side of the raster worker. A request the worker has not taken when
+  // the next capture is due is replaced and counted, like a live frame.
+  void PostSimRequest(const geometry::OdometrySample& truth) {
+    {
+      std::lock_guard lock(mutex_);
+      if (sim_request_) ++dropped_;
+      sim_request_ = SimRequest{truth, sim_epoch_, captured_};
+    }
+    wake_.notify_one();
+  }
+
+  // Worker side, under mutex_. A full queue means update() fell behind: the
+  // oldest result is dropped and counted, and the newest kept.
+  void PushFinished(const Finished& result) {
+    if (finished_count_ == finished_.size()) {
+      if (finished_[finished_head_].frame) {
+        if (simulated_) {
+          ++finished_overflow_;
+        } else {
+          mailbox_.CountDropped(1);
+        }
+      }
+      finished_head_ = (finished_head_ + 1) % finished_.size();
+      --finished_count_;
+    }
+    finished_[(finished_head_ + finished_count_) % finished_.size()] = result;
+    ++finished_count_;
+  }
+
+  // Loop side, under mutex_: moves every queued result into collected_,
+  // oldest first, and returns how many (at most the queue's capacity).
+  std::size_t TakeFinished() {
+    const auto count = finished_count_;
+    for (std::size_t i = 0; i < count; ++i) {
+      collected_[i] = finished_[(finished_head_ + i) % finished_.size()];
+    }
+    finished_head_ = (finished_head_ + count) % finished_.size();
+    finished_count_ = 0;
+    return count;
+  }
+
+  // Never waits for the worker: a result it is still storing is taken on a
+  // later tick. Admits every queued result in capture order. One from before
+  // the latest truth outage, or whose truth stamp is older than
+  // frame_timeout_us on the node clock (a worker that fell that far behind),
+  // is discarded and counted as dropped.
+  void CollectSimResults(std::uint64_t now_ns) {
+    std::size_t collected = 0;
+    {
+      std::unique_lock lock(mutex_, std::try_to_lock);
+      if (!lock.owns_lock()) return;
+      collected = TakeFinished();
+      dropped_ += std::exchange(finished_overflow_, 0);
+    }
+    for (std::size_t i = 0; i < collected; ++i) {
+      const auto& result = collected_[i];
+      const auto capture_ns = result.completed.capture_ns;
+      if (result.epoch != sim_epoch_ ||
+          (capture_ns <= now_ns &&
+           now_ns - capture_ns >
+               static_cast<std::uint64_t>(frame_timeout_ns_))) {
+        ++dropped_;
+        continue;
+      }
+      AdmitSimCapture(result.completed, now_ns);
+    }
+  }
+
+  // Renders, detects, solves and records one requested capture at a time.
+  void SimWork() {
+    while (true) {
+      std::optional<SimRequest> request;
+      {
+        std::unique_lock lock(mutex_);
+        wake_.wait(lock, [this] {
+          return stopping_.load(std::memory_order_acquire) ||
+                 sim_request_.has_value();
+        });
+        if (stopping_.load(std::memory_order_acquire)) break;
+        request = std::exchange(sim_request_, std::nullopt);
+        sim_busy_ = request.has_value();
+      }
+      if (!request) continue;
+      Completed result;
+      try {
+        result = Simulate(request->truth, request->sequence);
+      } catch (const std::exception&) {
+        result = Completed{request->truth.sample_time_ns()};
+      }
+      {
+        std::lock_guard lock(mutex_);
+        PushFinished(Finished{result, request->epoch, true});
+        sim_busy_ = false;
+      }
+      sim_idle_.notify_all();
+    }
+  }
+
   void RecordProcessed(std::uint64_t capture_ns) {
-    if (processed_ == 0) first_capture_ns_ = capture_ns;
+    if (period_samples_ == 0) first_capture_ns_ = capture_ns;
+    ++period_samples_;
     ++processed_;
     frame_period_us_ =
-        processed_ > 1 && capture_ns >= first_capture_ns_
-            ? (capture_ns - first_capture_ns_) / (processed_ - 1) / 1000
+        period_samples_ > 1 && capture_ns >= first_capture_ns_
+            ? (capture_ns - first_capture_ns_) / (period_samples_ - 1) / 1000
             : 0;
   }
 
@@ -640,99 +942,223 @@ class Vision {
 
   void PublishObservation(const Completed& completed, std::uint64_t now_ns) {
     const auto stamp =
-        CorrectCaptureTimestamp(completed.capture_ns, latency_offset_ns_,
-                                simulated_ ? sim_timestamp_lag_ns_ : 0);
+        simulated_
+            ? CorrectCaptureTimestamp(completed.capture_ns, latency_offset_ns_,
+                                      sim_timestamp_lag_ns_)
+            : talos::vision::CaptureMidpoint(
+                  completed.capture_ns, completed.timestamp_kind,
+                  controls_applied_.load() && !capture_config_.auto_exposure
+                      ? static_cast<std::uint64_t>(capture_config_.exposure_ms *
+                                                   1e6)
+                      : 0,
+                  readout_ns_, latency_offset_ns_);
     const bool timestamp_valid = stamp && *stamp <= now_ns;
+    const std::uint64_t age_ns = timestamp_valid ? now_ns - *stamp : 0;
+    // A live stamp older than the frame timeout describes an instant the
+    // camera would already count as silent: publish it invalid, still
+    // reporting its age as latency, with one diagnostic per transition.
+    // Only a valid stamp has an age, so an invalid one (future, underflow)
+    // neither ends nor starts a stale run.
+    const bool stale =
+        !simulated_ && age_ns > static_cast<std::uint64_t>(frame_timeout_ns_);
+    if (timestamp_valid && stale != stale_stamps_) {
+      stale_stamps_ = stale;
+      if (stale) {
+        std::fprintf(stderr,
+                     "%.*s: capture stamp %.3f s old exceeds "
+                     "camera.frame_timeout_us = %lld; observations invalid\n",
+                     static_cast<int>(node_.name().size()), node_.name().data(),
+                     static_cast<double>(age_ns) / 1e9,
+                     static_cast<long long>(frame_timeout_ns_ / 1000));
+      } else {
+        std::fprintf(stderr,
+                     "%.*s: capture stamps within camera.frame_timeout_us "
+                     "again\n",
+                     static_cast<int>(node_.name().size()),
+                     node_.name().data());
+      }
+    }
     const auto& observation = completed.observation;
-    last_latency_us_ = timestamp_valid ? (now_ns - *stamp) / 1000 : 0;
+    last_latency_us_ = age_ns / 1000;
     visible_ = completed.visible;
     healthy_ = completed.success;
     state_.send(geometry::PoseObservation{
         stamp.value_or(0), observation.pose(), observation.x_std_m(),
         observation.y_std_m(), observation.yaw_std_rad(),
-        observation.tag_count(), observation.valid() && timestamp_valid});
+        observation.tag_count(),
+        observation.valid() && timestamp_valid && !stale});
+  }
+
+  // Logs a connection state once per change, with the reason for it; repeats
+  // of the current state (every failed retry, say) stay silent. Called by the
+  // worker and by a source's capture thread.
+  void ReportConnection(talos::vision::ConnectionState state,
+                        std::string_view reason) {
+    std::lock_guard lock(connection_mutex_);
+    if (logged_connection_ == state) return;
+    logged_connection_ = state;
+    const auto name = talos::vision::ConnectionStateToString(state);
+    std::fprintf(stderr, "%.*s: camera %.*s%s%.*s\n",
+                 static_cast<int>(node_.name().size()), node_.name().data(),
+                 static_cast<int>(name.size()), name.data(),
+                 reason.empty() ? "" : ": ", static_cast<int>(reason.size()),
+                 reason.data());
+  }
+
+  // Folds the current source's own losses (errored driver buffers) into the
+  // one drop count.
+  void CollectSourceDrops() {
+    if (!source_) return;
+    const auto dropped = source_->dropped_frames();
+    if (dropped > source_drops_seen_) {
+      mailbox_.CountDropped(dropped - source_drops_seen_);
+      source_drops_seen_ = dropped;
+    }
   }
 
   // Only the worker owns camera lifecycle calls. Retry timing comes from the
   // node clock supplied by update(), never a wall-clock timer.
   bool OpenCamera() {
     if (!CanCapture(simulated_, device_)) return false;
-    source_ = talos::vision::CreatePlatformCameraSource(capture_config_);
-    if (!source_) return false;
+    source_ = source_factory_(capture_config_);
+    source_drops_seen_ = 0;
+    if (!source_) {
+      ReportConnection(talos::vision::ConnectionState::kError,
+                       "no capture source on this platform");
+      return false;
+    }
+    source_->SetConnectionCallback(
+        [this](talos::vision::ConnectionState state, std::string_view reason) {
+          source_reports_.fetch_add(1, std::memory_order_relaxed);
+          ReportConnection(state, reason);
+        });
     source_->SetFrameCallback([this](const talos::vision::Frame& frame) {
+      if (stopping_.load(std::memory_order_acquire)) return;
+      // Copy out of the source's buffer. A frame the worker has not taken
+      // yet is replaced and counted: the worker always gets the newest one.
+      mailbox_.Publish(frame);
       {
         std::lock_guard lock(mutex_);
-        if (stopping_.load(std::memory_order_acquire)) return;
         ++received_;
-        if (pending_) ++worker_dropped_;
-        pending_ = frame;
+        last_received_ns_.store(worker_now_ns_.load(std::memory_order_acquire),
+                                std::memory_order_release);
+        awaiting_first_frame_.store(false, std::memory_order_release);
       }
       wake_.notify_one();
     });
-    return source_->Start() && source_->IsRunning() && source_->IsConnected();
+    const auto reports = source_reports_.load(std::memory_order_relaxed);
+    const bool opened =
+        source_->Start() && source_->IsRunning() && source_->IsConnected();
+    controls_applied_.store(opened && source_->controls_applied());
+    if (opened && !source_->controls_applied()) ++control_failures_;
+    if (opened) {
+      ReportConnection(talos::vision::ConnectionState::kConnected, "");
+    } else if (source_reports_.load(std::memory_order_relaxed) == reports) {
+      // The source gave no reason of its own.
+      ReportConnection(talos::vision::ConnectionState::kError,
+                       "capture did not start");
+    }
+    return opened;
   }
+
+  static constexpr std::int64_t kFirstRetryNs = 100000000;
+  // Bounded so a camera plugged back in mid-match resumes within about 1 s.
+  static constexpr std::int64_t kMaxRetryNs = 1000000000;
+  // An open's silence deadline until its first frame, when longer than
+  // frame_timeout_us: a UVC camera's first frame arrives 0.6-1.8 s after it
+  // starts streaming (Arducam OV9281 on Linux, measured).
+  static constexpr std::int64_t kFirstFrameTimeoutNs = 3000000000;
 
   void Work() {
     std::int64_t serviced_ns = -1;
     std::int64_t retry_at_ns = 0;
-    std::int64_t retry_delay_ns = 1000000000;
+    std::int64_t retry_delay_ns = kFirstRetryNs;
+    bool opened_once = false;
     while (!stopping_.load(std::memory_order_acquire)) {
-      std::optional<talos::vision::Frame> frame;
       {
         std::unique_lock lock(mutex_);
+        live_busy_ = false;
+        live_serviced_ns_ = serviced_ns;
+        live_idle_.notify_all();
         wake_.wait(lock, [this, serviced_ns] {
-          return stopping_.load(std::memory_order_acquire) || pending_ ||
+          return stopping_.load(std::memory_order_acquire) ||
+                 mailbox_.HasReady() ||
                  worker_now_ns_.load(std::memory_order_acquire) != serviced_ns;
         });
         if (stopping_.load(std::memory_order_acquire)) break;
+        live_busy_ = true;
         serviced_ns = worker_now_ns_.load(std::memory_order_acquire);
         if (serviced_ns < 0) continue;
-        frame = std::move(pending_);
-        pending_.reset();
+      }
+      // Valid until the next TakeNewest(); only this thread takes.
+      const talos::vision::Frame* frame = mailbox_.TakeNewest();
+      CollectSourceDrops();
+      const auto last_received =
+          last_received_ns_.load(std::memory_order_acquire);
+      const std::int64_t silence_limit_ns =
+          awaiting_first_frame_.load(std::memory_order_acquire)
+              ? std::max(frame_timeout_ns_, kFirstFrameTimeoutNs)
+              : frame_timeout_ns_;
+      const bool stalled = source_ && connected_.load() &&
+                           serviced_ns >= last_received &&
+                           serviced_ns - last_received >= silence_limit_ns;
+      if (stalled) {
+        ++stalls_;
+        ReportConnection(talos::vision::ConnectionState::kDisconnected,
+                         "no frame within camera.frame_timeout_us");
+        source_->Stop();
       }
       if (!source_ || !source_->IsRunning() || !source_->IsConnected()) {
         const bool was_connected =
             connected_.exchange(false, std::memory_order_acq_rel);
         if (source_) {
+          ReportConnection(talos::vision::ConnectionState::kDisconnected,
+                           "capture stopped");
           source_->Stop();
+          CollectSourceDrops();
           source_.reset();
         }
         // Frames from the retired capture session cannot survive a reconnect.
-        {
+        mailbox_.DiscardReady();
+        if (frame != nullptr) {
+          mailbox_.CountDropped(1);
+          frame = nullptr;
+        }
+        if (was_connected) {
           std::lock_guard lock(mutex_);
-          if (pending_) {
-            ++worker_dropped_;
-            pending_.reset();
-          }
-          if (frame) {
-            ++worker_dropped_;
-            frame.reset();
-          }
-          if (was_connected) {
-            completed_ = Completed{static_cast<std::uint64_t>(serviced_ns)};
-          }
+          PushFinished(Finished{
+              Completed{static_cast<std::uint64_t>(serviced_ns)}, 0, false});
         }
         if (serviced_ns < retry_at_ns) continue;
         bool opened = false;
         try {
           opened = OpenCamera();
-        } catch (const std::exception&) {
+        } catch (const std::exception& error) {
+          ReportConnection(talos::vision::ConnectionState::kError,
+                           error.what());
           opened = false;
         }
         connected_.store(opened, std::memory_order_release);
+        if (opened) {
+          if (opened_once) ++reconnects_;
+          opened_once = true;
+          awaiting_first_frame_.store(true, std::memory_order_release);
+          last_received_ns_.store(serviced_ns, std::memory_order_release);
+        }
         retry_at_ns = serviced_ns + retry_delay_ns;
-        retry_delay_ns = std::min<std::int64_t>(retry_delay_ns * 2, 8000000000);
+        retry_delay_ns = std::min(retry_delay_ns * 2, kMaxRetryNs);
         if (!opened) {
           if (source_) {
             source_->Stop();
             source_.reset();
           }
           std::lock_guard lock(mutex_);
-          completed_ = Completed{static_cast<std::uint64_t>(serviced_ns)};
+          PushFinished(Finished{
+              Completed{static_cast<std::uint64_t>(serviced_ns)}, 0, false});
         }
         continue;
       }
-      if (!frame) continue;
+      if (frame == nullptr) continue;
       Completed result;
       try {
         result = Process(*frame);
@@ -740,22 +1166,11 @@ class Vision {
         result = Completed{
             static_cast<std::uint64_t>(frame->capture_timestamp_ns())};
       }
-      retry_delay_ns = 1000000000;
+      retry_delay_ns = kFirstRetryNs;
       retry_at_ns = serviced_ns + retry_delay_ns;
       {
         std::lock_guard lock(mutex_);
-        if (completed_) ++worker_dropped_;
-        if (worker_processed_ == 0)
-          worker_first_capture_ns_ = result.capture_ns;
-        ++worker_processed_;
-        worker_period_us_ =
-            worker_processed_ > 1 &&
-                    result.capture_ns >= worker_first_capture_ns_
-                ? (result.capture_ns - worker_first_capture_ns_) /
-                      (worker_processed_ - 1) / 1000
-                : 0;
-        worker_rejected_range_ += result.rejected_range;
-        completed_ = std::move(result);
+        PushFinished(Finished{result, 0, true});
       }
     }
     connected_.store(false, std::memory_order_release);
@@ -763,6 +1178,7 @@ class Vision {
       source_->Stop();
       source_.reset();
     }
+    live_idle_.notify_all();
   }
 
   talos::Node& node_;
@@ -786,6 +1202,9 @@ class Vision {
   talos::vision::CameraSourceConfig capture_config_;
   talos::vision::PoseValidationOptions validation_options_;
   talos::vision::PoseSolverOptions solver_options_;
+  // Localize()'s scratch, so a capture's solve does not allocate; used only
+  // by the one thread that localizes (the loop or the worker, see Simulate).
+  talos::vision::MultiTagPoseSolver solver_;
   std::mt19937_64 rng_;
   std::map<int, talos::vision::field_sim::TagPattern> patterns_;
   std::shared_ptr<std::vector<std::uint8_t>> pixels_;
@@ -801,21 +1220,52 @@ class Vision {
   double recording_sample_hz_ = 1.0, recording_rejected_hz_ = 1.0;
   std::uint64_t recording_max_bytes_ = 268435456;
   std::unique_ptr<talos::vision::CameraSource> source_;
+  SourceFactory source_factory_;
+  std::uint64_t readout_ns_ = 0;
+  std::int64_t frame_timeout_ns_ = 500000000;
+  std::atomic<std::int64_t> last_received_ns_{0};
+  // Set at each successful open, cleared by its first frame.
+  std::atomic<bool> awaiting_first_frame_{true};
+  std::atomic<std::uint64_t> reconnects_{0}, stalls_{0}, control_failures_{0};
+  std::atomic<bool> controls_applied_{true};
   std::thread worker_;
   std::mutex mutex_;
   std::condition_variable wake_;
-  std::optional<talos::vision::Frame> pending_;
-  std::optional<Completed> completed_;
-  bool healthy_ = false;
+  // Capture-to-worker handoff, and the camera's one drop count.
+  talos::vision::FrameMailbox mailbox_;
+  std::uint64_t source_drops_seen_ = 0;  // Worker only.
+  std::atomic<std::uint64_t> source_reports_{0};
+  std::mutex connection_mutex_;
+  std::optional<talos::vision::ConnectionState> logged_connection_;
+  // Worker-to-loop results, a fixed-capacity FIFO guarded by mutex_, and the
+  // loop's copy of what it took from it.
+  std::vector<Finished> finished_;
+  std::size_t finished_head_ = 0, finished_count_ = 0;
+  std::vector<Finished> collected_;
+  bool healthy_ = false, stale_stamps_ = false;
   std::atomic<bool> stopping_{false}, connected_{false};
   std::atomic<std::int64_t> worker_now_ns_{-1};
-  std::uint64_t received_ = 0, worker_processed_ = 0, worker_dropped_ = 0;
-  std::uint64_t worker_first_capture_ns_ = 0, worker_period_us_ = 0,
-                worker_rejected_range_ = 0;
+  // Live worker progress for WaitForLiveWorker, guarded by mutex_: the
+  // update() instant it last serviced, and whether it is servicing one now.
+  std::int64_t live_serviced_ns_ = -1;
+  bool live_busy_ = false;
+  std::condition_variable live_idle_;  // Notified when the worker goes idle.
+  // Raster sim handoff, guarded by mutex_. sim_epoch_ is the loop's alone.
+  std::optional<SimRequest> sim_request_;
+  bool sim_busy_ = false;  // The worker is simulating a request it took.
+  std::condition_variable sim_idle_;  // Notified when sim_busy_ clears.
+  // Raster sim results the full queue evicted, not yet in dropped_.
+  std::uint64_t finished_overflow_ = 0;
+  std::uint64_t sim_epoch_ = 0;
+  std::uint64_t received_ = 0;  // Live frames delivered; guarded by mutex_.
+  // The loop's. Once nothing is in flight (a request, the worker, the result
+  // queue, the mailbox), processed + dropped == captured + the deadlines lost
+  // before capture (sim: skipped by a slow tick; live: driver buffers the
+  // source dropped). Observations waiting out a sim lag count as processed.
   std::uint64_t captured_ = 0, processed_ = 0, dropped_ = 0,
                 rejected_range_ = 0;
-  std::uint64_t first_capture_ns_ = 0, frame_period_us_ = 0,
-                last_latency_us_ = 0;
+  std::uint64_t first_capture_ns_ = 0, period_samples_ = 0,
+                frame_period_us_ = 0, last_latency_us_ = 0;
   std::uint32_t visible_ = 0;
 };
 

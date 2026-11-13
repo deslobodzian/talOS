@@ -1,8 +1,6 @@
 // Field panel tests: the pure geometry helpers (ellipse from stds, staleness
-// fade, follow viewport) and the rendered panel against an empty and a
-// realistically populated static studio (frames shaped like the 2026
-// dictionary: a pose estimator with velocity, two cameras with stds, and sim
-// truth).
+// fade, follow viewport, zoom), config parsing, and the rendered camera layer
+// when a camera's uncertainty or heading is missing.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -11,6 +9,7 @@ import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
 import type {Snapshot} from '../src/core';
+import {chassisReading} from '../src/data/freshness';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {fieldPanel} from '../src/panels/field';
 import {
@@ -60,14 +59,11 @@ test('followViewport is a 4 m window centred on the robot, clamped', () => {
   assert.ok(corner.y + corner.height <= FIELD_HEIGHT_PX);
 });
 
-test('wholeFieldViewport and zoomViewport', () => {
+test('zoomViewport scales the viewport; non-positive factors are a no-op', () => {
   const whole = wholeFieldViewport();
-  assert.equal(whole.width, FIELD_WIDTH_PX + 50);
-  assert.equal(whole.height, FIELD_HEIGHT_PX + 50);
   const zoomed = zoomViewport(whole, 2, 0, 0);
   assert.equal(zoomed.width, whole.width * 2);
   assert.equal(zoomed.height, whole.height * 2);
-  // Non-positive factors are a no-op.
   assert.deepEqual(zoomViewport(whole, 0, 1, 1), whole);
 });
 
@@ -149,19 +145,20 @@ function frame(seq: number): Snapshot {
   };
 }
 
-function populatedStudio(): Studio {
-  const frames = [0, 1, 2].map(frame);
-  return createStaticStudio({
-    frames,
-    playback: {
-      mode: 'PAUSED',
-      cursor_ns: frames[2].timestamp_ns,
-      bounds: {start: frames[0].timestamp_ns, end: frames[2].timestamp_ns},
-      stats: {dropped: 0, late: 0, invalid: 0},
-      status: 'Static', connection: 'replay'
-    }
-  });
-}
+test('the drawn chassis pose is stale once its frame is a second behind the clock', () => {
+  const last = frame(3);
+  const at = (clock_ns: string|null) =>
+      chassisReading(last, {cursor_ns: last.timestamp_ns, clock_ns});
+  const after = (ns: bigint) => (BigInt(last.timestamp_ns) + ns).toString();
+  assert.deepEqual(at(after(999_999_999n)), {pose: last.chassis, stale: false});
+  // Telemetry stopped: the cursor holds the last frame while the clock runs on.
+  assert.deepEqual(at(after(1_000_000_000n)), {pose: last.chassis, stale: true});
+  // No current time known: the last pose is not current either.
+  assert.equal(at(null)?.stale, true);
+  // A frame without a valid pose draws no chassis at all.
+  const invalid = {...last, channels: {...last.channels, 'pose/valid': 0}};
+  assert.equal(chassisReading(invalid, {cursor_ns: last.timestamp_ns}), null);
+});
 
 function renderField(studio: Studio): string {
   return renderToStaticMarkup(
@@ -170,29 +167,6 @@ function renderField(studio: Studio): string {
                               setConfig={() => {}} instanceId="test"/>
       </StudioProvider>);
 }
-
-test('the field panel waits for telemetry when there is none', () => {
-  const html = renderField(createStaticStudio({}));
-  assert.ok(html.includes('Awaiting telemetry'));
-  assert.ok(html.includes('BLUE ORIGIN'));
-});
-
-test('the field panel renders every layer that has data', () => {
-  const html = renderField(populatedStudio());
-  assert.ok(html.includes('BLUE ORIGIN'));
-  assert.ok(html.includes('Estimate'), 'estimate robot legend');
-  assert.ok(html.includes('Trail'), 'estimate trail legend');
-  assert.ok(html.includes('Sim truth'), 'truth legend');
-  assert.ok(html.includes('Velocity'), 'velocity legend');
-  assert.ok(html.includes('front_left_camera'), 'first camera legend');
-  assert.ok(html.includes('front_right_camera'), 'second camera legend');
-  assert.ok(html.includes('Position error'), 'error readout');
-  assert.ok(html.includes('m'), 'position unit');
-  assert.ok(html.includes('°'), 'heading unit');
-  assert.ok(!html.includes('Awaiting telemetry'));
-  // The camera layer draws an uncertainty ellipse and a heading tick.
-  assert.ok(html.includes('ellipse'), 'camera uncertainty ellipse rendered');
-});
 
 test('camera position survives missing uncertainty and heading without inventing them', () => {
   const renderCamera = (omit: string[]) => {

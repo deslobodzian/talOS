@@ -3,7 +3,7 @@
 // launcher's --describe probe runs too -- publishes kMessages counts and dies
 // by SIGKILL, which the launcher restarts; the restart publishes kMessages
 // more and stops itself with SIGTERM, a clean exit the launcher does not
-// restart.
+// restart because the test's config marks this node non-critical.
 
 #include <csignal>
 #include <cstdint>

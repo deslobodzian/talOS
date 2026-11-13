@@ -38,6 +38,22 @@ use_repo(python, "python_3_11")
 # For configuration
 bazel_dep(name = "tomlplusplus", version = "3.4.0")
 
+# toml++ 3.4.0 has two parser UBs the patch removes: a table header whose
+# first character cannot start a key (`[#motors]`) asserts, or is UB under
+# NDEBUG; and any non-ASCII character in buckets its whitespace classifier
+# leaves unfiltered (U+00B1 '±' in our own vision.toml comments) reaches
+# TOML_UNREACHABLE. Regressions: //talOS/configuration:config_fuzz_test.
+single_version_override(
+    module_name = "tomlplusplus",
+    patch_strip = 1,
+    patches = ["//third_party:tomlplusplus_parser_ub.patch"],
+    version = "3.4.0",
+)
+
+# Choreo .traj (JSON) trajectories, read by //talOS/trajectory at load time.
+# 3.11.3 is the version the module graph already resolves transitively.
+bazel_dep(name = "nlohmann_json", version = "3.11.3")
+
 # Hedron's Compile Commands Extractor for Bazel
 # https://github.com/hedronvision/bazel-compile-commands-extractor
 bazel_dep(name = "hedron_compile_commands", dev_dependency = True)
@@ -97,6 +113,11 @@ pip.parse(
 use_repo(pip, "pypi")
 
 bazel_dep(name = "opencv", version = "4.12.0")
+single_version_override(
+    module_name = "opencv",
+    patch_strip = 1,
+    patches = ["//third_party:opencv_thread_pool_atomic.patch"],
+)
 
 vision_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
@@ -112,7 +133,11 @@ vision_http_archive(
     name = "apriltag",
     build_file = "//third_party:apriltag.BUILD.bazel",
     patch_args = ["-p1"],
-    patches = ["//third_party:apriltag_pose_ambiguity.patch"],
+    patches = [
+        "//third_party:apriltag_pose_ambiguity.patch",
+        "//third_party:apriltag_unionfind_atomic.patch",
+        "//third_party:apriltag_pjpeg_bounds.patch",
+    ],
     sha256 = "3749f48220db78c29c375a373861f4e1f4138e5dbae3c298584e96cfcc556515",
     strip_prefix = "apriltag-3.4.5",
     urls = ["https://github.com/AprilRobotics/apriltag/archive/v3.4.5.tar.gz"],

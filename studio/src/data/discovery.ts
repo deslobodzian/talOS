@@ -96,3 +96,35 @@ export function discoverSubsystems(channels: ChannelInfo[], graph: SystemGraph|n
   }
   return out.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
 }
+
+export type EstimateChannels = {
+  x: string; y: string; yaw: string; vx: string|null; vy: string|null;
+};
+
+// The estimate pose (and, when present, velocity) channels. The estimator
+// publishes the estimated pose; discover it by its accepted-observation
+// counter rather than by name. Falls back to the old `/pose/x_m` suffix rule
+// for recordings whose estimator predates that shape (the demo).
+export function discoverEstimate(dictionary: ChannelInfo[]): EstimateChannels|null {
+  const names = new Set(dictionary.map(c => c.name));
+  for (const est of discoverEstimators(dictionary)) {
+    const x = `${est.name}/state/pose/x_m`;
+    if (!names.has(x)) continue;
+    const vx = `${est.name}/state/velocity/vx_mps`;
+    const vy = `${est.name}/state/velocity/vy_mps`;
+    return {
+      x,
+      y: `${est.name}/state/pose/y_m`,
+      yaw: `${est.name}/state/pose/yaw_rad`,
+      vx: names.has(vx) ? vx : null,
+      vy: names.has(vy) ? vy : null
+    };
+  }
+  const x = dictionary.find(c => c.name.endsWith('/pose/x_m'));
+  if (!x) return null;
+  const prefix = x.name.slice(0, -'pose/x_m'.length);
+  return {
+    x: x.name, y: prefix + 'pose/y_m', yaw: prefix + 'pose/yaw_rad',
+    vx: null, vy: null
+  };
+}

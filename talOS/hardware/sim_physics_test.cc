@@ -1,7 +1,7 @@
-// Simulation believability track (items 13-19): the ideal SimBackend stays
-// the fast logic fake, while PhysicsSimBackend (sim_physics.h) earns trust
-// for PID tuning, gearing, direction, and limits. All tests step an explicit
-// sim clock; no wall-clock, no sockets, no live sim.
+// The ideal SimBackend stays the fast logic fake, while PhysicsSimBackend
+// (sim_physics.h) earns trust for PID tuning, gearing, direction, and limits.
+// All tests step an explicit sim clock; no wall-clock, no sockets, no live
+// sim.
 #include "sim_physics.h"
 
 #include <gtest/gtest.h>
@@ -10,7 +10,9 @@
 #include <cmath>
 #include <memory>
 #include <tuple>
+#include <utility>
 
+#include "config_wire.h"
 #include "gateway.h"
 #include "sim_backend.h"
 
@@ -52,6 +54,29 @@ void StepBackend(Backend& backend, State& s, uint64_t& now_us, uint64_t step_us,
     now_us += step_us;
     s.sample_time_us = now_us;
     backend.Read(s);
+  }
+}
+
+TEST(SimMotorDiagnostics, AmbientAndEffortPlaceholdersAcrossNeutral) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].supply_limit_a = 40.0;
+  SimBackend ideal;
+  PhysicsSimBackend physics;
+  for (Backend* backend :
+       {static_cast<Backend*>(&ideal), static_cast<Backend*>(&physics)}) {
+    ASSERT_TRUE(backend->Configure(cfg));
+    std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 6.0, 0.0}}};
+    ASSERT_TRUE(backend->Apply(command));
+    State state;
+    state.motor_count = 1;
+    uint64_t now_us = 0;
+    StepBackend(*backend, state, now_us, 5000, 2);
+    EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
+    EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 20.0);
+    backend->Neutral();
+    StepBackend(*backend, state, now_us, 5000, 1);
+    EXPECT_DOUBLE_EQ(state.motors[0].temperature_c, 25.0);
+    EXPECT_DOUBLE_EQ(state.motors[0].supply_current_a, 0.0);
   }
 }
 
@@ -196,6 +221,31 @@ TEST(SimFollowers, IdealMirrorsPositionVelocityAndNeutralInEitherOrder) {
   }
 }
 
+// The RoboRIO reports a CANcoder's absolute position in [-0.5, 0.5)
+// rotations (CANcoderAbsoluteRot); the ideal backend's CANcoder, which
+// mirrors its motor's position, wraps the same way, so an absolute-homing
+// node under sim_gateway sees the reading the robot gives.
+// REQ-DEV-05
+TEST(SimBackend, CancoderReadsItsAbsolutePositionWrapped) {
+  auto cfg = SingleMotorConfig();
+  cfg.sensors.push_back({2, "angle", SensorKind::kCANcoder, 2, "rio"});
+  cfg.motors[0].feedback = Feedback::kRemoteCANcoder;
+  cfg.motors[0].feedback_sensor_id = 2;
+  SimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  for (const auto& [demand, reported] :
+       {std::pair{0.25, 0.25}, std::pair{0.75, -0.25}, std::pair{0.5, -0.5},
+        std::pair{-0.75, 0.25}, std::pair{2.25, 0.25}}) {
+    SCOPED_TRACE(demand);
+    std::array<MotorRequest, 1> command{{{1, Mode::kPosition, 0, demand, 0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    State s{};
+    ASSERT_TRUE(backend.Read(s));
+    EXPECT_DOUBLE_EQ(s.motors[0].position_rot, demand);  // continuous
+    EXPECT_DOUBLE_EQ(s.sensors[0].position_rot, reported);
+  }
+}
+
 template <typename Sim>
 void CheckPowerHealth() {
   Sim backend;
@@ -214,55 +264,114 @@ void CheckPowerHealth() {
   EXPECT_DOUBLE_EQ(gateway.snapshot().health.battery_v, 6.5);
 }
 
-TEST(SimHealth, IdealReportsPowerWhileDisabledAndStale) {
+TEST(SimHealth, PowerVisibleWhileDisabledAndStale) {
   CheckPowerHealth<SimBackend>();
-}
-TEST(SimHealth, PhysicsReportsPowerWhileDisabledAndStale) {
   CheckPowerHealth<PhysicsSimBackend>();
 }
 
-// The ideal backend is for fast logic tests: demands apply instantly,
-// even with zero gains. The physics backend must NOT behave this way.
-TEST(SimBelievability, IdealTeleportsWhilePhysicsRamps) {
-  State s{};
-  // Ideal: one tick at demand.
-  {
-    SimBackend ideal;
-    Gateway g{SingleMotorConfig(), ideal, 1};
-    g.Tick(1000, true);
-    Command c{};
-    const State snap = g.snapshot();
-    c.config_id = snap.config_id;
-    c.boot_id = snap.boot_id;
-    c.epoch = snap.epoch;
-    c.observed_time_us = snap.sample_time_us;
-    c.count = 1;
-    c.motors[0] = {1, Mode::kVelocity, 0, 10.0, 0};
-    ASSERT_TRUE(g.Accept(c, 1, 1000));
-    g.Tick(6000, true);
-    EXPECT_DOUBLE_EQ(g.snapshot().motors[0].velocity_rps, 10.0);
-  }
-  // Physics: one 5 ms step only starts the ramp; it converges, not snaps.
-  {
-    PhysicsSimBackend physics;
-    ASSERT_TRUE(physics.Configure(SingleMotorConfig()));
-    std::array<MotorRequest, kMaxMotors> cmd{};
-    cmd[0] = Duty(1, 0.5);
-    ASSERT_TRUE(physics.Apply(cmd));
+// Stator current is the winding model, (applied volts - back-EMF) / R with
+// R = 12 V / the motor type's stall current, clamped to stator_limit_a: a
+// stalled rotor draws stall_current / 12 per volt (a 1 V homing push into a
+// stop reads loaded), one at its free speed for the applied volts draws
+// none, and 12 V at half the 12 V free speed draws half the stall current.
+TEST(SimMotorDiagnostics, StatorCurrentIsTheWindingModel) {
+  struct Case {
+    MotorType type;
+    double stall_a;
+  };
+  for (const Case c :
+       {Case{MotorType::kKrakenX60, 366.0}, Case{MotorType::kKrakenX44, 275.0},
+        Case{MotorType::kFalcon500, 257.0}}) {
+    SCOPED_TRACE(c.stall_a);
+    auto cfg = SingleMotorConfig();
+    cfg.motors[0].stator_limit_a = 1000.0;  // above stall: unclamped
+    cfg.motors[0].motor_type.value = c.type;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 1.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    State s{};
+    s.motor_count = 1;
     uint64_t now_us = 0;
-    // Two Reads: the first establishes the timestamp (dt = 0), the second
-    // advances one effective 5 ms step.
-    StepBackend(physics, s, now_us, 5000, 2);
-    EXPECT_GT(s.motors[0].velocity_rps, 0.0);
-    EXPECT_LT(s.motors[0].velocity_rps, 50.0);   // Far from the ~50 rps target.
-    StepBackend(physics, s, now_us, 5000, 400);  // 2 s more.
-    EXPECT_GT(s.motors[0].velocity_rps, 40.0);
-    EXPECT_GT(s.motors[0].position_rot, 0.0);
+    StepBackend(backend, s, now_us, 5000, 1);  // the first Read: at rest
+    EXPECT_NEAR(s.motors[0].stator_current_a, c.stall_a / 12.0, 1e-9);
+    command[0].demand = 6.0;
+    ASSERT_TRUE(backend.Apply(command));
+    StepBackend(backend, s, now_us, 5000, 400);  // 2 s: free speed for 6 V
+    EXPECT_NEAR(s.motors[0].stator_current_a, 0.0, 0.01 * c.stall_a);
+    command[0].demand = 12.0;
+    ASSERT_TRUE(backend.Apply(command));
+    StepBackend(backend, s, now_us, 1, 1);  // 1 us later: still that speed
+    EXPECT_NEAR(s.motors[0].stator_current_a, c.stall_a / 2.0,
+                0.01 * c.stall_a);
   }
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].stator_limit_a = 80.0;
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 12.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 1);
+  EXPECT_DOUBLE_EQ(s.motors[0].stator_current_a, 80.0);
 }
 
-// Voltage drives the mechanism; position integrates velocity.
-TEST(SimBelievability, VoltageDrivesMechanismAndPositionIntegrates) {
+// A motor driven into its soft limit is held there with its rotor stopped,
+// so it reads the stall current of its applied volts, as a mechanism pushed
+// into a stop does: stall homing (PositionMechanism) relies on it. The
+// current is taken after the limit stops the rotor, not before.
+// REQ-DEV-10
+TEST(SimMotorDiagnostics, MotorHeldAtASoftLimitReadsStalled) {
+  auto cfg = SingleMotorConfig();
+  cfg.motors[0].soft_limits = true;
+  cfg.motors[0].reverse_limit_rot = -1.0;
+  cfg.motors[0].forward_limit_rot = 1.0;
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(cfg));
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 1.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 400);  // 2 s at ~8 rps: at the limit
+  ASSERT_DOUBLE_EQ(s.motors[0].position_rot, 1.0);
+  EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+  EXPECT_NEAR(s.motors[0].stator_current_a, 366.0 / 12.0, 1e-9);  // X60
+}
+
+// The wire config carries no motor type, so a config the bridge pushes to
+// sim_gateway that differs from the one it holds reconfigures the physics
+// backend with every motor a Kraken X60. Each motor keeps the type of the
+// motor of the same name in sim_gateway's own parse: after such a push, a
+// Kraken X44 still stalls at the X44's current.
+// REQ-DEV-10
+TEST(SimMotorDiagnostics, PushedConfigKeepsTheLocalMotorType) {
+  auto local = SingleMotorConfig();  // 80 A stator limit: 1 V stays under it
+  local.motors[0].motor_type.value = MotorType::kKrakenX44;
+  PhysicsSimBackend backend;
+  backend.SetLocalMotorTypes(local);  // as sim_gateway does from its parse
+  Gateway gateway{backend, 1};
+  ASSERT_TRUE(gateway.Reconfigure(local));
+  auto pushed = local;
+  pushed.motors[0].max_voltage = 11.0;  // differs: Configure runs again
+  Config wire;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(pushed), wire));
+  ASSERT_EQ(wire.motors[0].motor_type.value, MotorType::kKrakenX60);
+  ASSERT_TRUE(gateway.Reconfigure(wire));
+  std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, 1.0, 0.0}}};
+  ASSERT_TRUE(backend.Apply(command));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  StepBackend(backend, s, now_us, 5000, 1);  // the first Read: at rest
+  EXPECT_NEAR(s.motors[0].stator_current_a, 275.0 / 12.0, 1e-9);
+}
+
+// Voltage ramps the mechanism rather than snapping it to demand; position
+// integrates velocity.
+TEST(SimBelievability, VoltageRampsMechanismAndPositionIntegrates) {
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
   std::array<MotorRequest, kMaxMotors> cmd{};
@@ -270,7 +379,12 @@ TEST(SimBelievability, VoltageDrivesMechanismAndPositionIntegrates) {
   ASSERT_TRUE(backend.Apply(cmd));
   State s{};
   uint64_t now_us = 0;
-  StepBackend(backend, s, now_us, 5000, 200);  // 1 s at ~6 V.
+  // Two Reads: the first establishes the timestamp (dt = 0), the second
+  // advances one 5 ms step, which only starts the ramp.
+  StepBackend(backend, s, now_us, 5000, 2);
+  EXPECT_GT(s.motors[0].velocity_rps, 0.0);
+  EXPECT_LT(s.motors[0].velocity_rps, 50.0);   // Far from the ~50 rps target.
+  StepBackend(backend, s, now_us, 5000, 198);  // 1 s at ~6 V.
   const double pos_1s = s.motors[0].position_rot;
   const double vel_1s = s.motors[0].velocity_rps;
   EXPECT_GT(vel_1s, 5.0);
@@ -315,9 +429,9 @@ TEST(SimBelievability, TunedVelocityLoopTracksDemand) {
   EXPECT_LE(s.motors[0].velocity_rps, 10.0);
 }
 
-// (14/15) Gearing divides rotor speed into mechanism speed; inversion flips
-// direction; soft limits clamp and stop the axis.
-TEST(SimBelievability, GearingDirectionAndLimits) {
+// Gearing divides rotor speed into mechanism speed; soft limits clamp and
+// stop the axis.
+TEST(SimBelievability, GearingAndLimits) {
   // Gearing: identical volts, gear 2 must run half mechanism speed of gear 1.
   {
     PhysicsSimBackend geared, direct;
@@ -342,28 +456,6 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
     EXPECT_NEAR(sg.motors[0].velocity_rps * 2.0, sd.motors[0].velocity_rps,
                 std::abs(sd.motors[0].velocity_rps) * 0.05 + 1e-6);
   }
-  // Direction: inverted spins the mechanism the opposite way.
-  {
-    PhysicsSimBackend fwd, rev;
-    Config c = SingleMotorConfig(), ci = SingleMotorConfig();
-    ci.motors[0].inverted = true;
-    ASSERT_TRUE(fwd.Configure(c));
-    ASSERT_TRUE(rev.Configure(ci));
-    std::array<MotorRequest, kMaxMotors> cmd{};
-    cmd[0] = Duty(1, 0.5);
-    ASSERT_TRUE(fwd.Apply(cmd));
-    ASSERT_TRUE(rev.Apply(cmd));
-    State sf{}, sr{};
-    uint64_t now_us = 0;
-    for (int i = 0; i < 100; ++i) {
-      now_us += 5000;
-      sf.sample_time_us = now_us;
-      sr.sample_time_us = now_us;
-      fwd.Read(sf);
-      rev.Read(sr);
-    }
-    EXPECT_NEAR(sr.motors[0].velocity_rps, -sf.motors[0].velocity_rps, 1e-6);
-  }
   // Limits: the axis clamps at the forward soft limit and stops.
   {
     Config c = SingleMotorConfig();
@@ -383,21 +475,217 @@ TEST(SimBelievability, GearingDirectionAndLimits) {
   }
 }
 
-// Pigeon yaw comes from simulated chassis motion through the boundary.
-TEST(SimBelievability, PigeonYawFollowsChassisMotion) {
+// Phoenix 6's MotorOutput.Inverted flips the rotor sensor with the output, so
+// a TalonFX reports position and velocity in its configured positive
+// direction: inverted or not, a closed loop converges.
+TEST(SimBelievability, InvertedMotorReportsItsConfiguredDirection) {
+  for (const bool inverted : {false, true}) {
+    for (const auto mode : {Mode::kPosition, Mode::kMotionMagic}) {
+      Config c = SingleMotorConfig();
+      c.motors[0].inverted = inverted;
+      c.motors[0].cruise_velocity_rps = 2.0;
+      c.motors[0].acceleration_rps2 = 4.0;
+      c.motors[0].slots[0].p = 1.0;
+      c.motors[0].slots[0].d = 0.05;
+      c.motors[0].slots[0].v = 0.12;
+      PhysicsSimBackend backend;
+      ASSERT_TRUE(backend.Configure(c));
+      std::array<MotorRequest, 1> cmd{{{1, mode, 0, 2.0, 0.0}}};
+      ASSERT_TRUE(backend.Apply(cmd));
+      State s{};
+      uint64_t now_us = 0;
+      StepBackend(backend, s, now_us, 5000, 1000);
+      EXPECT_NEAR(s.motors[0].position_rot, 2.0, 0.01)
+          << "inverted=" << inverted << " mode=" << static_cast<int>(mode);
+      EXPECT_NEAR(s.motors[0].velocity_rps, 0.0, 0.01);
+    }
+  }
+}
+
+// A remote CANcoder keeps its own direction, and a TalonFX fed back from it
+// reports and closes its loops on that reading. A loop whose motor and
+// CANcoder directions agree converges; a mismatch is positive feedback and
+// runs away, as it would on a robot.
+TEST(SimBelievability, RemoteCancoderFeedbackKeepsTheEncoderDirection) {
+  for (const bool motor_inverted : {false, true}) {
+    for (const bool sensor_inverted : {false, true}) {
+      Config c = SingleMotorConfig();
+      c.motors[0].inverted = motor_inverted;
+      SensorConfig encoder{2, "encoder", SensorKind::kCANcoder, 20, "rio"};
+      encoder.inverted = sensor_inverted;
+      c.sensors.push_back(encoder);
+      c.motors[0].feedback = Feedback::kRemoteCANcoder;
+      c.motors[0].feedback_sensor_id = 2;
+      c.motors[0].slots[0].p = 1.0;
+      c.motors[0].slots[0].d = 0.05;
+      PhysicsSimBackend backend;
+      ASSERT_TRUE(backend.Configure(c));
+      std::array<MotorRequest, 1> cmd{{{1, Mode::kPosition, 0, 2.0, 0.0}}};
+      ASSERT_TRUE(backend.Apply(cmd));
+      State s{};
+      uint64_t now_us = 0;
+      StepBackend(backend, s, now_us, 5000, 1000);
+      // The CANcoder's absolute position, wrapped; the motor's continuous.
+      EXPECT_NEAR(
+          std::remainder(s.motors[0].position_rot - s.sensors[0].position_rot,
+                         1.0),
+          0.0, 1e-9);
+      if (motor_inverted == sensor_inverted) {
+        EXPECT_NEAR(s.motors[0].position_rot, 2.0, 0.01)
+            << "motor_inverted=" << motor_inverted;
+      } else {
+        EXPECT_LT(s.motors[0].position_rot, -100.0)
+            << "motor_inverted=" << motor_inverted;
+      }
+    }
+  }
+}
+
+// Under Phoenix 6's Follower request a follower drives in its master's
+// configured direction, reversed when opposed; its own Inverted does not
+// apply. CANcoders on each rotor show the physical direction.
+TEST(SimFollowers, FollowerTakesItsMasterDirectionNotItsOwnInverted) {
+  for (const bool master_inverted : {false, true}) {
+    for (const bool follower_inverted : {false, true}) {
+      for (const bool oppose : {false, true}) {
+        Config c = SingleMotorConfig();
+        c.motors[0].inverted = master_inverted;
+        auto follower = TestMotor(2, "follower", 2);
+        follower.master_id = 1;
+        follower.oppose_master = oppose;
+        follower.inverted = follower_inverted;
+        c.motors.push_back(follower);
+        for (std::size_t i = 0; i < 2; ++i) {
+          const auto id = static_cast<uint16_t>(10 + i);
+          c.sensors.push_back(
+              {id, i == 0 ? "master_encoder" : "follower_encoder",
+               SensorKind::kCANcoder, static_cast<int>(20 + i), "rio"});
+          c.motors[i].feedback = Feedback::kRemoteCANcoder;
+          c.motors[i].feedback_sensor_id = id;
+        }
+        PhysicsSimBackend backend;
+        ASSERT_TRUE(backend.Configure(c));
+        std::array<MotorRequest, kMaxMotors> cmd{};
+        cmd[0] = Duty(1, 0.5);
+        cmd[1] = Duty(2, 0.0);  // A follower runs only while not neutral.
+        ASSERT_TRUE(backend.Apply(cmd));
+        State s{};
+        uint64_t now_us = 0;
+        StepBackend(backend, s, now_us, 5000, 100);
+        const double master_rps = s.sensors[0].velocity_rps;
+        EXPECT_GT(master_rps * (master_inverted ? -1.0 : 1.0), 10.0);
+        EXPECT_NEAR(s.sensors[1].velocity_rps,
+                    master_rps * (oppose ? -1.0 : 1.0), 1e-9)
+            << "master_inverted=" << master_inverted
+            << " follower_inverted=" << follower_inverted
+            << " oppose=" << oppose;
+      }
+    }
+  }
+}
+
+// A pressed switch on the TalonFX's forward input holds forward output
+// neutral in every mode (here duty cycle, which soft limits in the gateway do
+// not check) while reverse output still drives off it; a disabled input does
+// nothing. Forward is the configured positive direction, inverted or not.
+// The asserted switch is reported as the FaultField's ForwardHardLimit bit.
+TEST(SimLimitSwitches, PressedForwardSwitchStopsOnlyForwardOutput) {
+  for (const bool disabled : {false, true}) {
+    Config c = SingleMotorConfig();
+    c.motors[0].inverted = true;
+    if (disabled) c.motors[0].forward_limit_switch = LimitSwitch::kDisabled;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(c));
+    backend.SetForwardLimitPressed(1, true);
+    std::array<MotorRequest, 1> cmd{Duty(1, 0.5)};
+    ASSERT_TRUE(backend.Apply(cmd));
+    State s{};
+    uint64_t now_us = 0;
+    StepBackend(backend, s, now_us, 5000, 100);
+    if (disabled) {
+      EXPECT_GT(backend.applied_voltage(0), 5.0);
+      EXPECT_GT(std::abs(s.motors[0].velocity_rps), 10.0);
+      EXPECT_EQ(s.motors[0].fault_flags, 0u);
+      continue;
+    }
+    EXPECT_DOUBLE_EQ(backend.applied_voltage(0), 0.0);
+    EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 0.0);
+    EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+    EXPECT_FALSE(MotorFaulted(s.motors[0].fault_flags));
+    cmd[0] = Duty(1, -0.5);
+    ASSERT_TRUE(backend.Apply(cmd));
+    StepBackend(backend, s, now_us, 5000, 100);
+    EXPECT_LT(backend.applied_voltage(0), -5.0);
+    EXPECT_GT(std::abs(s.motors[0].velocity_rps), 10.0);
+    backend.SetForwardLimitPressed(1, false);
+    StepBackend(backend, s, now_us, 5000, 1);
+    EXPECT_EQ(s.motors[0].fault_flags, 0u);
+  }
+}
+
+// A home switch reads closed exactly while the motor's reported position is
+// at its point or beyond it, with no hysteresis either way: "bottom"
+// (normally open, closed at or below -0.3) and "top" (closed reads true,
+// closed at or above 0.25) as the mechanism sweeps down into its -0.3 soft
+// limit and back up. At the limit the position is exactly -0.3: "bottom" is
+// closed there, and "below" (closed one ulp further down) is open. The
+// binding survives a reconfigure, as a config the bridge pushes to
+// sim_gateway.
+// REQ-DEV-10
+TEST(SimLimitSwitches, HomeSwitchClosesAtItsPositionExactly) {
   Config c = SingleMotorConfig();
-  c.sensors.push_back({9, "imu", SensorKind::kPigeon2, 30, "rio"});
+  c.motors[0].soft_limits = true;
+  c.motors[0].reverse_limit_rot = -0.3;
+  c.motors[0].forward_limit_rot = 0.3;
+  for (const auto& [id, name] : {std::pair<uint16_t, const char*>{1, "bottom"},
+                                 {2, "top"},
+                                 {3, "below"}}) {
+    c.digital_inputs.push_back({.id = id, .name = name, .dio = id});
+  }
+  const double below = std::nextafter(-0.3, -1.0);
   PhysicsSimBackend backend;
+  backend.SetHomeSwitches(
+      {{.input = "bottom", .motor = "roller", .closed_at_rot = -0.3},
+       {.input = "top",
+        .motor = "roller",
+        .closed_at_rot = 0.25,
+        .closed_above = true,
+        .closed_reads = true},
+       {.input = "below", .motor = "roller", .closed_at_rot = below}});
   ASSERT_TRUE(backend.Configure(c));
-  backend.SetChassisYawRate(0.25);  // Quarter turn per second, CCW+.
   State s{};
+  s.motor_count = 1;
   uint64_t now_us = 0;
-  // 201 Reads: the first establishes the timestamp, the next 200 step 1 s.
-  StepBackend(backend, s, now_us, 5000, 201);  // 1 s.
-  ASSERT_EQ(s.sensors[0].id, 9u);
-  EXPECT_TRUE(s.sensors[0].valid);
-  EXPECT_NEAR(s.sensors[0].position_rot, 0.25, 1e-9);
-  EXPECT_NEAR(s.sensors[0].velocity_rps, 0.25, 1e-9);
+  int bottom_closed = 0;
+  int top_closed = 0;
+  const auto sweep = [&](double volts) {
+    std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, volts, 0.0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    for (int i = 0; i < 100; ++i) {  // 0.5 s at about 8 rps: limit to limit
+      StepBackend(backend, s, now_us, 5000, 1);
+      const double p = s.motors[0].position_rot;
+      EXPECT_EQ(s.digital_inputs[0].value, !(p <= -0.3)) << p;
+      EXPECT_EQ(s.digital_inputs[1].value, p >= 0.25) << p;
+      EXPECT_EQ(s.digital_inputs[2].value, !(p <= below)) << p;
+      bottom_closed += p <= -0.3 ? 1 : 0;
+      top_closed += p >= 0.25 ? 1 : 0;
+    }
+  };
+  sweep(-1.0);
+  ASSERT_EQ(s.motors[0].position_rot, -0.3);
+  EXPECT_FALSE(s.digital_inputs[0].value);  // closed at its point
+  EXPECT_TRUE(s.digital_inputs[2].value);   // open an ulp short of its point
+  sweep(1.0);
+  EXPECT_EQ(s.motors[0].position_rot, 0.3);
+  EXPECT_GT(bottom_closed, 0);
+  EXPECT_GT(top_closed, 0);
+
+  // Reconfigured, the axis restarts at 0, between the switches: open.
+  c.motors[0].max_voltage = 11.0;
+  ASSERT_TRUE(backend.Configure(c));
+  StepBackend(backend, s, now_us, 5000, 1);
+  EXPECT_TRUE(s.digital_inputs[0].value);
+  EXPECT_FALSE(s.digital_inputs[1].value);
 }
 
 TEST(SimBelievability, PigeonMountOffsetPrecedesInversion) {
@@ -430,8 +718,10 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   const double position = state.motors[0].position_rot;
   ASSERT_GT(position, 0.0);
   ASSERT_GT(state.motors[0].velocity_rps, 0.0);
-  backend.BeginRestoreAfterReset();
-  ASSERT_TRUE(backend.Read(state));  // Same timestamp: inspect reset directly.
+  const std::array<uint16_t, 1> reset_ids{1};
+  backend.BeginRestoreAfterReset(reset_ids);
+  ASSERT_EQ(backend.PollRestore(), Backend::RestoreStatus::kDone);
+  ASSERT_TRUE(backend.Read(state));
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(state.motors[0].velocity_rps, 0.0);
   EXPECT_DOUBLE_EQ(state.motors[0].voltage, 0.0);
@@ -439,7 +729,10 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
 }
 
-// CANcoders mirror the linked mechanism through the boundary.
+// CANcoders mirror the linked mechanism through the boundary, reporting its
+// absolute position as the RoboRIO does (AbsoluteSensorDiscontinuityPoint =
+// 0.5): wrapped to [-0.5, 0.5) rotations, while the remote-CANcoder motor's
+// own position stays continuous.
 TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   Config c = SingleMotorConfig();
   c.sensors.push_back({2, "encoder", SensorKind::kCANcoder, 20, "rio"});
@@ -455,8 +748,23 @@ TEST(SimBelievability, CancoderMirrorsLinkedMechanism) {
   uint64_t now_us = 0;
   StepBackend(backend, s, now_us, 5000, 200);
   EXPECT_TRUE(s.sensors[0].valid);
-  EXPECT_NEAR(s.sensors[0].position_rot, s.motors[0].position_rot, 1e-9);
+  ASSERT_GT(s.motors[0].position_rot, 1.0);
+  EXPECT_GE(s.sensors[0].position_rot, -0.5);
+  EXPECT_LT(s.sensors[0].position_rot, 0.5);
+  EXPECT_NEAR(
+      std::remainder(s.sensors[0].position_rot - s.motors[0].position_rot, 1.0),
+      0.0, 1e-9);
   EXPECT_NEAR(s.sensors[0].velocity_rps, s.motors[0].velocity_rps, 1e-9);
+  // Backwards past -0.5 wraps the other way.
+  cmd[0] = Duty(1, -0.5);
+  ASSERT_TRUE(backend.Apply(cmd));
+  StepBackend(backend, s, now_us, 5000, 400);
+  ASSERT_LT(s.motors[0].position_rot, -1.0);
+  EXPECT_GE(s.sensors[0].position_rot, -0.5);
+  EXPECT_LT(s.sensors[0].position_rot, 0.5);
+  EXPECT_NEAR(
+      std::remainder(s.sensors[0].position_rot - s.motors[0].position_rot, 1.0),
+      0.0, 1e-9);
 }
 
 // Commanded neutral coasts/brakes per model; it never teleports to a
@@ -550,23 +858,6 @@ TEST(SimBelievability, GatewayDisableDecaysRatherThanSnaps) {
   EXPECT_DOUBLE_EQ(g.snapshot().motors[0].velocity_rps, 0.0);
 }
 
-// Controlled inputs: beam breaks read back through the boundary.
-TEST(SimBelievability, BeamBreakInputReadsBack) {
-  Config c = SingleMotorConfig();
-  c.digital_inputs.push_back({3, "beam_break", 0});
-  PhysicsSimBackend backend;
-  ASSERT_TRUE(backend.Configure(c));
-  backend.SetDigitalInput(3, true);
-  State s{};
-  s.sample_time_us = 5000;
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_TRUE(s.digital_inputs[0].value);
-  backend.SetDigitalInput(3, false);
-  s.sample_time_us = 10000;
-  ASSERT_TRUE(backend.Read(s));
-  EXPECT_FALSE(s.digital_inputs[0].value);
-}
-
 // Frozen feedback holds stale samples while physics keeps moving.
 TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   PhysicsSimBackend backend;
@@ -582,6 +873,9 @@ TEST(SimBelievability, FrozenFeedbackHoldsStaleSamples) {
   StepBackend(backend, s, now_us, 5000, 100);
   EXPECT_DOUBLE_EQ(s.motors[0].position_rot, held_pos);
   EXPECT_TRUE(s.motors[0].valid);  // Frozen is stale, not disconnected.
+  // Its age says so, so the gateway's reset check widens its bound by the
+  // freeze instead of reading the unfreeze as a reset.
+  EXPECT_EQ(s.motors[0].position_age_us, 500000u);
   backend.UnfreezeFeedback(1);
   StepBackend(backend, s, now_us, 5000, 100);
   EXPECT_GT(s.motors[0].position_rot, held_pos);
@@ -651,6 +945,8 @@ TEST(SimBelievability, MotionMagicProfilesCruiseAndSettlesInBothDirections) {
   }
 }
 
+// Conventional module names infer swerve geometry, so wheel motion alone
+// rotates the chassis that the Pigeon reports.
 TEST(SimBelievability, SwerveRotationDrivesPigeonAndExplicitOverrideWins) {
   Config config;
   const std::array<const char*, 4> names{"front_left", "front_right",
@@ -687,15 +983,13 @@ TEST(SimBelievability, SwerveRotationDrivesPigeonAndExplicitOverrideWins) {
   EXPECT_DOUBLE_EQ(state.sensors[0].velocity_rps, -0.25);
 }
 
-// Supply-voltage change scales the available speed; restart zeroes
-// motion but keeps the configuration.
+// Supply-voltage change scales speed; restart clears motion safely.
 TEST(SimBelievability, SupplyVoltageScalesSpeedAndRestartZeroesMotion) {
   PhysicsSimBackend low, high;
   Config c = SingleMotorConfig();
   ASSERT_TRUE(low.Configure(c));
   ASSERT_TRUE(high.Configure(c));
   low.SetSupplyVoltage(6.0);
-  EXPECT_DOUBLE_EQ(low.supply_voltage(), 6.0);
   std::array<MotorRequest, kMaxMotors> cmd{};
   cmd[0] = Duty(1, 1.0);  // Full duty: 6 V vs 12 V rails.
   ASSERT_TRUE(low.Apply(cmd));
@@ -711,7 +1005,6 @@ TEST(SimBelievability, SupplyVoltageScalesSpeedAndRestartZeroesMotion) {
   }
   EXPECT_NEAR(sl.motors[0].velocity_rps, sh.motors[0].velocity_rps / 2.0,
               std::abs(sh.motors[0].velocity_rps) * 0.1 + 1e-6);
-  // Restart zeroes motion state; the config (and output safe state) survives.
   high.RestartController();
   sh.sample_time_us = now_us + 5000;
   ASSERT_TRUE(high.Read(sh));

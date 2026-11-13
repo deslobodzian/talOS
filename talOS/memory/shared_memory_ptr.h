@@ -17,6 +17,8 @@
 #include <string_view>
 #include <utility>
 
+#include "talOS/memory/residency.h"
+
 // The name a topic gets in the operating system's shared-memory namespace.
 //
 // POSIX defines the portable form of an shm name as an initial slash followed
@@ -36,9 +38,9 @@
 // character in /dev/shm, and the mapping preserves length so the 30-character
 // cap keeps meaning the same thing on both sides.
 //
-// Public because anything that opens a segment directly -- RTMS's stale-segment
-// reclaim, a test, a tool listing /dev/shm -- needs this name and not the
-// topic.
+// Public because anything that opens a segment directly -- RTMS's unlink of a
+// closing segment, a test, a tool listing /dev/shm -- needs this name and not
+// the topic.
 inline std::string ShmObjectName(std::string_view topic, std::string_view ns) {
   if (topic.starts_with("/~")) return std::string{topic};
   std::string_view stripped = topic;
@@ -148,24 +150,25 @@ class SharedMemoryPtr {
     return static_cast<off_t>(size);
   }
 
-  void create_or_attach_shm_map(int& shm_fd, SharedMemoryMode& shm_mode,
-                                const char* name, int oflag, mode_t mode) {
-    shm_fd = shm_open(name, oflag, mode);
-    if (shm_fd == -1) {
-      if (errno == EEXIST) {
-        shm_mode = SharedMemoryMode::ATTACH;
-        create_or_attach_shm_map(shm_fd, shm_mode, name, O_RDWR, mode);
-      }
+  // Opens the name, creating it when absent; mode_ says which. A name found
+  // by the exclusive create (EEXIST) can be gone by the attach (ENOENT),
+  // unlinked by its last holder in between, and is then free to create, so
+  // the create is retried. -1 with errno set when neither succeeds.
+  int create_or_attach() {
+    for (int attempt = 0; attempt < kAttachAttempts; ++attempt) {
+      mode_ = SharedMemoryMode::CREATE;
+      int shm_fd = shm_open(shm_name_.c_str(), O_CREAT | O_RDWR | O_EXCL, 0666);
+      if (shm_fd != -1 || errno != EEXIST) return shm_fd;
+      mode_ = SharedMemoryMode::ATTACH;
+      shm_fd = shm_open(shm_name_.c_str(), O_RDWR, 0666);
+      if (shm_fd != -1 || errno != ENOENT) return shm_fd;
     }
+    return -1;
   }
 
   int map_ptr() {
-    int shm_fd = -1;
-    int oflag = -1;
     const off_t file_size = to_off_t(size_);
-
-    oflag = O_CREAT | O_RDWR | O_EXCL;
-    create_or_attach_shm_map(shm_fd, mode_, shm_name_.c_str(), oflag, 0666);
+    const int shm_fd = create_or_attach();
 
     switch (mode_) {
       case SharedMemoryMode::CREATE:
@@ -180,18 +183,12 @@ class SharedMemoryPtr {
           std::fprintf(stderr, "ftruncate: fd=%d size=%zu errno=%d (%s)\n",
                        shm_fd, size_, err, std::strerror(err));
           close(shm_fd);
+          shm_unlink(shm_name_.c_str());
           return -1;
         }
 
         break;
       case SharedMemoryMode::ATTACH: {
-        // create_or_attach_shm_map already opened the object on the
-        // EEXIST path; only open again if it did not.
-        if (shm_fd == -1) {
-          oflag = O_RDWR;
-          shm_fd = shm_open(shm_name_.c_str(), oflag, 0666);
-        }
-
         if (shm_fd == -1) {
           std::perror(std::format("shm_open failed on attach for {}", shm_name_)
                           .c_str());
@@ -250,15 +247,25 @@ class SharedMemoryPtr {
     // Says we can close mmap after mapping.
     if (close(shm_fd) == -1) {
       std::perror("failed to close shm_fd");
+      munmap(shm_addr, size_);
       return -1;
     }
 
+    // Registered so a realtime loop keeps it resident (residency.h): made
+    // resident here when the process already asked, or when it asks later.
+    try {
+      talos::memory::TrackMapping(shm_addr, size_);
+    } catch (...) {
+      munmap(shm_addr, size_);
+      throw;
+    }
     ptr_ = shm_addr;
     return 0;
   }
 
   void reset() noexcept {
     if (ptr_ != nullptr) {
+      talos::memory::UntrackMapping(ptr_);
       if (munmap(ptr_, size_) == -1) {
         std::perror("munmap failed");
       }

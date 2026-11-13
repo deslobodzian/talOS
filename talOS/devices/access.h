@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -56,10 +57,29 @@ struct HardwareAccess {
                            double position_rot);
   static void gyro_rezero(HardwareLink& link, std::size_t index,
                           double yaw_rot);
+  // Whether a rezero holds: set by one that took, cleared as Motor::zeroed
+  // describes (boot change, a reset masking the device in the next State,
+  // any reset across a sequence gap).
+  static bool motor_zeroed(const HardwareLink& link, std::size_t index);
+  static bool gyro_zeroed(const HardwareLink& link, std::size_t index);
+  static std::optional<event::MonotonicTime> motor_time(
+      const HardwareLink& link, std::size_t index, bool velocity);
+  static std::optional<event::MonotonicTime> sensor_time(
+      const HardwareLink& link, std::size_t index, bool velocity);
+  // Motor::position_age / velocity_age.
+  static std::optional<event::Duration> motor_age(const HardwareLink& link,
+                                                  std::size_t index,
+                                                  bool velocity);
   // The latched sample for a device; all zeros (valid == false) until an
-  // accepted hardware state carries it.
+  // accepted hardware state carries it. A motor's, CAN sensor's or encoder's
+  // invalid sample carries the last valid position instead of its own
+  // (devices.h); a motor's and CAN sensor's position is in the rezero frame.
   static hardware::MotorSample motor_sample(const HardwareLink& link,
                                             std::size_t index);
+  // Motor::forward_limit / reverse_limit: the sample's hardware-limit fault
+  // bit, false unless the sample is valid and the hardware state fresh.
+  static bool motor_hard_limit(const HardwareLink& link, std::size_t index,
+                               bool forward);
   static hardware::SensorSample sensor_sample(const HardwareLink& link,
                                               std::size_t index);
   static hardware::DigitalInputSample digital_input_sample(
@@ -86,6 +106,10 @@ struct DriverStationAccess {
   // The current mode generation: the latest packet's mode_since_us while
   // mode() is not none, else 0.
   static std::uint64_t generation(const DriverStation& ds);
+  // How many accepted packets arrived [robot] command_timeout_us or more
+  // after the one before (by publication time): each is a recovery from a
+  // stale link, whether or not anything sampled it while stale.
+  static std::uint64_t recoveries(const DriverStation& ds);
 };
 
 // Target and TargetLane (target.h) over message bytes, so the C ABI drives
@@ -108,13 +132,25 @@ struct TargetAccess {
   static std::size_t target_bytes(Node& node, std::size_t target);
 
   // Subscribes to the Driver Station, whose generation lane_send stamps.
+  // With `arming` (an index from open_arming on this node), lane_send
+  // publishes a release instead while that arming is not armed.
   static std::size_t open_lane(Node& node, std::string_view subsystem,
                                std::string_view source, std::size_t bytes,
                                std::size_t alignment,
-                               const schema::Identity& message);
+                               const schema::Identity& message,
+                               std::optional<std::size_t> arming = {});
+  // Whether the envelope went out active: false when the transport dropped
+  // it or the lane's arming held it to a release.
   static bool lane_send(Node& node, std::size_t lane, const void* message,
                         std::size_t bytes);
   static bool lane_release(Node& node, std::size_t lane);
+
+  // OperatorArming (target.h): subscribes to the Driver Station.
+  static std::size_t open_arming(Node& node);
+  // OperatorArming::evaluate, armed and disarm.
+  static bool arming_evaluate(Node& node, std::size_t arming, bool neutral);
+  static bool arming_armed(Node& node, std::size_t arming);
+  static void arming_disarm(Node& node, std::size_t arming);
 };
 
 // sizeof(TargetEnvelope<M>) for a message of `bytes` and `alignment`: the

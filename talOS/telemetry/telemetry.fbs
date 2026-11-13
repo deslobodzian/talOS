@@ -2,26 +2,55 @@ namespace Talos.Telemetry;
 
 struct Pose { x:double; y:double; z:double; roll:double; pitch:double; yaw:double; }
 
-// One dictionary entry: values[i] in every Frame is this channel's sample.
-// unit is "" for unitless channels. labels, when non-empty, names the
-// integral values of an enum channel (labels[value]); an empty labels list
-// means the channel is a plain number.
-table ChannelInfo { name:string (required); unit:string; labels:[string]; }
+// How a channel's 64-bit sample reads: an IEEE-754 double, a two's-complement
+// signed integer, an unsigned integer, or a boolean (0 or 1). Integers travel
+// exactly; nothing is converted to a double on the wire.
+enum ChannelKind : ubyte { Double = 0, Int = 1, UInt = 2, Bool = 3 }
 
-// One telemetry sample. values aligns index-for-index with the dictionary
-// named by dictionary_id; NaN means the source was absent or stale this
-// tick. dictionary is present only on dictionary frames (the first frame
-// of a stream and every 100th after it); value-only frames carry no
-// dictionary and stay under talos::telemetry_wire::kMaxValueFrameBytes.
+// A Bool channel that is an alert, by level (talOS/NAMING.md, the `status`
+// role; naming::ParseAlertField); None for every other channel.
+enum AlertLevel : ubyte { None = 0, Info = 1, Warning = 2, Error = 3 }
+
+// One dictionary entry. unit is "" for unitless channels. labels, when
+// non-empty, names the values of an integer enum channel (labels[value]); an
+// empty labels list means the channel is a plain number. alert, when not
+// None, makes a Bool channel an alert of that level, active while 1.
+table ChannelInfo {
+  name:string (required);
+  unit:string;
+  labels:[string];
+  kind:ChannelKind;
+  alert:AlertLevel;
+}
+
+// One page of a telemetry tick. A tick is one or more value pages sharing
+// sequence_id; page counts from 0 to page_count - 1 within the tick, and a
+// reader applies the tick when its last page arrives. Dictionary pages are
+// separate frames (dictionary present, no values) with their own page count.
+//
+// values[i] is the raw 64-bit sample of channel channels[i], read per the
+// channel's kind. On a keyframe every channel not carried is absent (no
+// sample this tick); otherwise only the carried and `absent` channels change.
+// Producer ticks are keyframes; the Studio bridge sends each client keyframes
+// and change-only updates (talOS/telemetry/README.md).
 table Frame {
   stream_id:ulong;
   sequence_id:ulong;
   timestamp_ns:ulong;
   dictionary_id:uint;
   chassis:Pose;
-  values:[double];
+  page:ushort;
+  page_count:ushort;
+  // Dictionary size: every channel index is below it.
+  channel_count:uint;
+  keyframe:bool;
+  channels:[uint];
+  values:[ulong];
+  absent:[uint];
+  // Dictionary page: dictionary[i] describes channel first_channel + i.
+  first_channel:uint;
   dictionary:[ChannelInfo];
 }
 
 root_type Frame;
-file_identifier "TLM2";
+file_identifier "TLM3";

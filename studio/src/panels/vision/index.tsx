@@ -113,8 +113,7 @@ function VisionPanel() {
 
   // The chart reference is the estimator pose, or sim ground truth when it is
   // present (the disagreement column always compares against the estimator).
-  const simPresent = useMemo(
-      () => dictionary.some(c => c.name === 'sim/state/pose/x_m'), [dictionary]);
+  const simPresent = Number.isFinite(snapshot?.channels['sim/state/pose/x_m']);
   const refOwner = simPresent ? 'sim' : estimator?.name ?? null;
   const refX = refOwner ? channel(refOwner, 'state/pose/x_m') : null;
   const refY = refOwner ? channel(refOwner, 'state/pose/y_m') : null;
@@ -148,13 +147,14 @@ function VisionPanel() {
           col(state('sample_time_ns'))(rate5), col(state('valid'))(rate5));
       const dropped = counterDelta(col(status('frames_dropped_count'))(drop10));
 
-      // Disagreement: the camera's latest valid pose vs the estimator pose at
-      // the cursor.
+      // Disagreement: the camera's latest valid pose, if it is still current,
+      // vs the estimator pose at the cursor.
       let disagreement: number|null = null;
       const estX = estimator ? read(channel(estimator.name, 'state/pose/x_m')) : null;
       const estY = estimator ? read(channel(estimator.name, 'state/pose/y_m')) : null;
       if (estX !== null && estY !== null) {
         const cam: Planar|null = latestValidPose(
+            detail30.times,
             col(state('pose/x_m'))(detail30),
             col(state('pose/y_m'))(detail30),
             col(state('valid'))(detail30));

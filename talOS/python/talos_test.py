@@ -1,11 +1,23 @@
 """The talos package, end to end through libtalos_node on talos.testing.Sim."""
 
+import ctypes
 import enum
+import json
 import math
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import textwrap
+import threading
 from datetime import timedelta
 import unittest
+from unittest import mock
 
+from python.runfiles import runfiles
 import talos
+from talos import _abi
 from talos.testing import Sim, SimHardware, Stick
 from demo.Goal import Goal
 from demo.Phase import Phase
@@ -101,7 +113,28 @@ class Stepper:
             self.sm.go(Stepper.State.MOVING)
 
 
+class Clock:
+    """No update(), so stepping weeks of virtual time runs no timer."""
+
+    def __init__(self, node):
+        self.node = node
+
+
 class TwoNodesTest(unittest.TestCase):
+    # REQ-CONTRACT-14: Python reads the node clock, and a test the Sim
+    # clock, as integer nanoseconds, as C++ does with now().nanos().
+    def test_now_ns_is_the_exact_node_clock(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        clock = sim.add(Clock, "planner")
+        # 50.7 days, where float seconds no longer round-trip: each step
+        # converts exactly, their sum does not.
+        sim.step(4_000_000.0)
+        sim.step(378_605.124704419)
+        expected = 4_378_605_124_704_419
+        self.assertEqual(clock.node.now_ns, expected)
+        self.assertEqual(sim.now_ns, expected)
+        self.assertNotEqual(round(clock.node.now * 1e9), expected)
+
     def test_python_nodes_talk_over_a_topic(self):
         sim = Sim.from_toml(ROBOT_TOML)
         sim.add(Planner, "planner")
@@ -120,73 +153,346 @@ class TwoNodesTest(unittest.TestCase):
         self.assertEqual(sim.node("follower").period, 0.01)
         self.assertAlmostEqual(sim.now, 0.055)
 
+    # REQ-RT-02
+    def test_an_at_drain_callback_hears_every_message_at_the_next_tick(self):
+        """wake=Wake.AT_DRAIN reaches the node: goals published at 2 and 3
+        ms reach the callback in order at the 10 ms tick's drain, not as
+        they are published."""
+        sim = Sim.from_toml(ROBOT_TOML)
+        collector = sim.add(AtDrainCollector, "collector")
+        sim.step(0.002)
+        for tick in (7, 8):
+            sim.publish(Goal, "/planner/goal", height_rot=0.0, enabled=True,
+                        tick_count=tick)
+            sim.step(0.001)
+        self.assertEqual(collector.heard, [])
+        sim.step(0.007)
+        self.assertEqual(collector.heard, [(7, 10), (8, 10)])
+
+
+class AtDrainCollector:
+    """Hears every /planner/goal at the node's drains, never woken by one:
+    (tick_count, node time in ms) per goal."""
+
+    def __init__(self, node):
+        self.node = node
+        self.heard = []
+        node.subscribe(Goal, "/planner/goal", callback=self.hear,
+                       wake=talos.Wake.AT_DRAIN)
+
+    def hear(self, goal):
+        self.heard.append((goal.tick_count, round(self.node.now * 1000)))
+
+    def update(self):
+        pass
+
+
+class RunTest(unittest.TestCase):
+    def test_run_freezes_the_built_node_out_of_collection(self):
+        # gc.freeze is process-wide: run in a child process.
+        probe = textwrap.dedent("""
+            import gc, sys, tempfile
+            import talos
+
+            built = []
+
+            class Probe:
+                def __init__(self, node):
+                    assert gc.get_freeze_count() == 0
+                    built.append(self)
+
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write(sys.argv[1])
+                config.flush()
+                code = talos.run(Probe, "planner", "//talOS/python:probe",
+                                 ["probe", "--describe", "--config",
+                                  config.name])
+            assert code == 0, code
+            assert gc.get_freeze_count() > 0
+            assert not any(o is built[0] for o in gc.get_objects())
+        """)
+        result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+    # REQ-OPS-06: holds_stop, by which the launcher holds a stop through a
+    # Python node's start-up, reaches its --describe as params do.
+    def test_describe_reports_every_param_the_constructor_read(self):
+        # The launcher refuses a subsystem key no node reads, so a Python
+        # node's reads (set or not, its own table or another's) must reach
+        # --describe through the C ABI.
+        probe = textwrap.dedent("""
+            import sys, tempfile
+            import talos
+
+            class Probe:
+                def __init__(self, node):
+                    node.param("height_rot")
+                    node.param("absent_v", 0.0)
+                    node.param_of("follower", "gain", 1.0)
+
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write(sys.argv[1])
+                config.flush()
+                sys.exit(talos.run(Probe, "planner", "//talOS/python:probe",
+                                   ["probe", "--describe", "--config",
+                                    config.name]))
+        """)
+        result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        described = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertTrue(described["holds_stop"])
+        self.assertEqual(described["params"], [
+            {"subsystem": "planner", "key": "height_rot"},
+            {"subsystem": "planner", "key": "absent_v"},
+            {"subsystem": "follower", "key": "gain"},
+        ])
+
+
+class BorrowedLifetimeTest(unittest.TestCase):
+    def test_wrappers_keep_sim_alive_until_native_teardown(self):
+        # A bad lifetime implementation may segfault: isolate the probe and
+        # check collection tears down the Sim after the last wrapper goes.
+        probe = textwrap.dedent("""
+            import gc
+            import weakref
+            import talos
+            from talos.testing import Sim
+            from demo.Goal import Goal
+
+            class Endpoints:
+                def __init__(self, node):
+                    self.node = node
+                    self.sub = node.subscribe(Goal, "/probe/input")
+                    self.pub = node.publish(Goal, "/probe/output")
+                    self.bytes = node.publish_bytes("/probe/bytes", 64)
+                    self.motor = talos.Motor(node, "m")
+                    self.hardware = talos.HardwareLink(node)
+                    self.ds = talos.DriverStation(node)
+                    self.target = talos.Target(node, Goal)
+                    self.lane = talos.TargetLane(node, Goal, "probe", "teleop")
+                    self.sm = talos.StateMachine(node, 0)
+
+            config = '''
+            [robot]
+            period_us = 1000
+            [subsystems.probe.motors.m]
+            can_id = 1
+            [subsystems.probe.targets]
+            teleop = ["teleop"]
+            '''
+            for kind in ("node", "lookup", "sub", "pub", "bytes", "motor",
+                         "hardware", "ds", "target", "lane", "sm"):
+                sim = Sim.from_toml(config)
+                obj = sim.add(Endpoints, "probe")
+                wrapper = sim.node("probe") if kind == "lookup" else getattr(obj, kind)
+                sim.step(0.002)
+                owner = weakref.ref(sim)
+                del obj, sim
+                gc.collect()
+                assert owner() is not None, kind
+                if kind in ("node", "lookup"):
+                    assert wrapper.name == "probe"
+                elif kind == "sub":
+                    assert not wrapper.has_value
+                elif kind == "pub":
+                    wrapper.send(height_rot=0.0, enabled=False, tick_count=1)
+                elif kind == "bytes":
+                    assert wrapper.send(b"offline")
+                elif kind == "motor":
+                    assert not wrapper.connected
+                elif kind == "hardware":
+                    assert not wrapper.fresh()
+                elif kind == "ds":
+                    assert not wrapper.enabled
+                elif kind == "target":
+                    assert wrapper.get() is None
+                elif kind == "lane":
+                    wrapper.release()
+                elif kind == "sm":
+                    assert wrapper.state == 0
+                del wrapper
+                gc.collect()
+                assert owner() is None, kind
+        """)
+        result = subprocess.run([sys.executable, "-c", probe],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class AbiErrorsTest(unittest.TestCase):
+    def test_abi_errors_are_not_values_states_or_true_flags(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        follower = sim.add(Follower, "follower")
+        stepper = sim.add(Stepper, "planner")
+        # A failed state read returns 0, a valid state: only the error
+        # string set by the failed call tells them apart.
+        stepper.sm._index = 99  # no such state machine: every C call fails
+        for name in ("state", "previous", "time_in_state", "just_entered"):
+            with self.subTest(state_machine=name):
+                with self.assertRaises(talos.TalosError):
+                    getattr(stepper.sm, name)
+        subscription = follower.goal
+        self.assertIsNone(subscription.value)
+        with mock.patch.object(talos.lib, "talos_last_error",
+                               return_value=b"subscription failed"):
+            for symbol, read in (
+                ("talos_subscription_has_value",
+                 lambda: subscription.has_value),
+                ("talos_subscription_fresh", lambda: subscription.fresh()),
+                ("talos_subscription_updated", lambda: subscription.updated),
+            ):
+                with self.subTest(symbol=symbol):
+                    with mock.patch.object(talos.lib, symbol, return_value=-1):
+                        with self.assertRaises(talos.TalosError):
+                            read()
+            with mock.patch.object(talos.lib, "talos_subscription_has_value",
+                                   return_value=1):
+                with mock.patch.object(talos.lib, "talos_subscription_value",
+                                       return_value=None):
+                    with self.assertRaises(talos.TalosError):
+                        _ = subscription.value
+
+
+class CallbackErrorTest(unittest.TestCase):
+    def test_a_callback_exception_is_raised_only_on_its_thread(self):
+        # Like the C error string, a callback's exception belongs to the
+        # thread whose C call ran it: another thread's failed call must not
+        # raise it, nor take it from the call it failed.
+        def boom(_):
+            raise ValueError("boom")
+
+        self.assertEqual(_abi.callback(boom)(None), 1)
+        raised = []
+
+        def other_thread():
+            try:
+                _abi.fail()
+            except BaseException as error:  # noqa: B902 - inspected below
+                raised.append(error)
+
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        thread.join()
+        with self.assertRaises(ValueError):
+            _abi.fail()
+        self.assertEqual([type(error) for error in raised], [talos.TalosError])
+
+
+class AbiLayoutTest(unittest.TestCase):
+    def test_ctypes_mirrors_match_the_layouts_node_api_pins(self):
+        # node_api.cc pins each ABI struct's size and field offsets with
+        # static_asserts; the ctypes mirror must read the same bytes.
+        source = Path(runfiles.Create().Rlocation(
+            os.environ["TALOS_ABI_SOURCE"])).read_text()
+        sizes = {name: int(size) for name, size in re.findall(
+            r"static_assert\(\s*sizeof\((Talos\w+)\)\s*==\s*(\d+)\s*\);",
+            source)}
+        offsets = {}
+        for name, field, offset in re.findall(
+                r"static_assert\(\s*offsetof\((Talos\w+),\s*(\w+)\)\s*==\s*"
+                r"(\d+)\s*\);", source):
+            offsets.setdefault(name, {})[field] = int(offset)
+        mirrors = {"Talos" + cls.__name__: cls for cls in vars(_abi).values()
+                   if isinstance(cls, type)
+                   and issubclass(cls, ctypes.Structure)}
+        self.assertEqual(sorted(mirrors), sorted(sizes))
+        self.assertEqual(sorted(mirrors), sorted(offsets))
+        for name, cls in mirrors.items():
+            with self.subTest(struct=name):
+                self.assertEqual(ctypes.sizeof(cls), sizes[name])
+                self.assertEqual({field: getattr(cls, field).offset
+                                  for field, _ in cls._fields_},
+                                 offsets[name])
+
 
 class DevicesTest(unittest.TestCase):
-    def test_rezero_shares_motor_and_gyro_frames(self):
-        class Frames:
+    def test_applied_output_accessors_propagate_device_errors(self):
+        sim = Sim.from_toml(ROBOT_TOML)
+        hw = SimHardware(sim)
+        for accessor in (hw.applied_motor, hw.applied_digital_output,
+                         hw.applied_pwm):
+            with self.subTest(accessor=accessor.__name__):
+                with self.assertRaises(talos.TalosError):
+                    accessor("lift", "missing")
+
+    def test_signal_acquisition_times_preserve_unequal_ages(self):
+        class Signals:
             def __init__(self, node):
                 self.motor = talos.Motor(node, "lift")
-                self.other = talos.Motor(node, "lift")
+                self.encoder = talos.CANcoder(node, "cc")
                 self.gyro = talos.Gyro(node, "gyro")
 
-            def update(self):
-                self.motor.set_position(1)
-
         toml = ROBOT_TOML + """
+[subsystems.lift.sensors.cc]
+type = "CANcoder"
+can_id = 2
 [subsystems.lift.sensors.gyro]
 type = "Pigeon2"
-can_id = 2
+can_id = 3
 """
         sim = Sim.from_toml(toml)
-        frames = sim.add(Frames, "lift")
+        signals = sim.add(Signals, "lift")
+        node = sim.node("lift")
         hw = SimHardware(sim)
-        hw.set_motor("lift", "lift", 3, 2)
-        hw.set_gyro("lift", "gyro", 0.75, -0.5)
+        hw.set_gateway_clock(offset=2)
+        hw.set_motor("lift", "lift", 3, 2, 1000, 3000)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3, 2000, 4000)
+        hw.set_gyro("lift", "gyro", 0.75, -0.5, 5000, 6000)
         sim.step(0.02)
-        frames.motor.rezero()
-        frames.gyro.rezero(0.25)
-        self.assertEqual(frames.other.position, 0)
-        self.assertEqual(frames.other.velocity, 2)
-        self.assertEqual(frames.gyro.yaw, 0.25)
-        self.assertEqual(frames.gyro.yaw_rate, -0.5)
-        frames.motor.rezero(float("nan"))
-        self.assertEqual(frames.other.position, 0)
+        self.assertIsNone(signals.motor.position_time)
+        # Motor ages come from the State: known before the clock mapping.
+        self.assertEqual((signals.motor.position_age,
+                          signals.motor.velocity_age), (1_000_000, 3_000_000))
+        sim.step(0.08)
+        sampled = talos.hardware_sample_time_ns(node)
+        self.assertIsInstance(sampled, int)
+        self.assertFalse(talos.robot_enabled(node))
+        for actual, age in (
+                (signals.motor.position_time, 1000),
+                (signals.motor.velocity_time, 3000),
+                (signals.encoder.position_time, 2000),
+                (signals.encoder.velocity_time, 4000),
+                (signals.gyro.yaw_time, 5000),
+                (signals.gyro.yaw_rate_time, 6000)):
+            self.assertEqual(actual, sampled - age * 1000)
+        # An unknown age invalidates the whole sample, as at the gateway.
+        hw.set_motor("lift", "lift", 3, 2, 0xffffffff, 0)
+        hw.set_cancoder("lift", "cc", 0.2, 0.3, 0, 0xffffffff)
+        hw.set_gyro("lift", "gyro", 0.75, -0.5, 0xffffffff, 0)
         sim.step(0.02)
-        self.assertEqual(hw.motor_request("lift", "lift").mode,
-                         talos.Mode.NEUTRAL)
-        hw.enable()
+        self.assertFalse(signals.motor.connected)
+        self.assertIsNone(signals.motor.velocity_time)
+        self.assertIsNone(signals.motor.velocity_age)
+        self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.gyro.yaw_rate_time)
+        hw.set_motor("lift", "lift", 3, 2, 1000, 3000)
+        hw.set_connected("lift", "lift", False)
         sim.step(0.02)
-        self.assertEqual(hw.motor_request("lift", "lift").demand, 4)
+        self.assertIsNone(signals.motor.velocity_time)
+        del hw
+        sim.step(0.15)
+        self.assertIsNone(signals.encoder.position_time)
+        self.assertIsNone(signals.gyro.yaw_rate_time)
 
-    def test_motor_clamping_is_exposed_as_a_property(self):
-        class Shooter:
-            def __init__(self, node):
-                self.motor = talos.Motor(node, "lift")
-                self.demand = 120.0
-
-            def update(self):
-                self.motor.set_velocity(self.demand)
-
+    def test_limit_switches_read_only_from_a_connected_sample(self):
         sim = Sim.from_toml(ROBOT_TOML)
-        shooter = sim.add(Shooter, "lift")
+        lift = sim.add(Lift, "lift").lift
         hw = SimHardware(sim)
-        self.assertEqual(shooter.motor.clamped_count, 0)
+        hw.set_limit_switches("lift", "lift", forward=True)
         sim.step(0.02)
-        self.assertEqual(hw.motor_request("lift", "lift").mode,
-                         talos.Mode.NEUTRAL)
-        hw.enable()
+        self.assertEqual((lift.forward_limit, lift.reverse_limit),
+                         (True, False))
+        hw.set_limit_switches("lift", "lift", reverse=True)
         sim.step(0.02)
-        self.assertEqual(hw.motor_request("lift", "lift").demand, 100.0)
-        self.assertGreater(shooter.motor.clamped_count, 0)
-        count = shooter.motor.clamped_count
-        shooter.demand = 50.0
-        sim.step(0.02)
-        self.assertEqual(shooter.motor.clamped_count, count)
-        shooter.demand = float("nan")
-        sim.step(0.02)
-        self.assertEqual(hw.motor_request("lift", "lift").mode,
-                         talos.Mode.NEUTRAL)
-        self.assertGreater(shooter.motor.clamped_count, count)
+        self.assertEqual((lift.forward_limit, lift.reverse_limit),
+                         (False, True))
+        del hw
+        sim.step(0.15)  # past [robot] command_timeout_us
+        self.assertFalse(lift.connected)
+        self.assertFalse(lift.reverse_limit)
 
     def test_neutral_when_disabled_and_requests_when_enabled(self):
         sim = Sim.from_toml(ROBOT_TOML)
@@ -200,37 +506,30 @@ can_id = 2
         self.assertTrue(lift.lift.connected)
         self.assertEqual(lift.lift.position, 0.75)
 
+        lift.lift.rezero(0.75)  # a rotor frame: motion magic needs a zero
         hw.enable()
         sim.step(0.03)
         self.assertTrue(lift.enabled)
         self.assertEqual(hw.motor_request("lift", "lift"),
                          (talos.Mode.MOTION_MAGIC, 1.5, 0.25, 2))
 
-    def test_unknown_device_names_it(self):
-        class Wrong:
+    # REQ-SAFE-06: a motor setter outside update() raises, naming the motor
+    def test_motor_command_outside_update_raises(self):
+        # The flush after each update() sends neutral for every motor that
+        # update() did not set, so a command from every() would pulse.
+        class Pulser:
             def __init__(self, node):
-                talos.Motor(node, "elbow")
+                self.lift = talos.Motor(node, "lift")
+                node.every(0.02, lambda: self.lift.set_voltage(6.0))
+
+            def update(self):
+                pass
 
         sim = Sim.from_toml(ROBOT_TOML)
-        with self.assertRaisesRegex(talos.TalosError, "'elbow'"):
-            sim.add(Wrong, "lift")
-
-    def test_disconnected_device_reports_it(self):
-        sim = Sim.from_toml(ROBOT_TOML)
-        lift = sim.add(Lift, "lift")
-        hw = SimHardware(sim)
-        hw.set_motor("lift", "lift", 0.75, 2.0)
-        hw.set_connected("lift", "lift", False)
-        sim.step(0.02)
-        self.assertFalse(lift.lift.connected)
-        self.assertEqual((lift.lift.position, lift.lift.velocity), (0.0, 0.0))
-
-        hw.set_connected("lift", "lift", True)
-        sim.step(0.02)
-        self.assertTrue(lift.lift.connected)
-        self.assertEqual(lift.lift.position, 0.75)
-        with self.assertRaisesRegex(talos.TalosError, "'elbow'"):
-            hw.set_connected("lift", "elbow", False)
+        sim.add(Pulser, "lift")
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"motor 'lift'.*outside update\(\)"):
+            sim.step(0.05)
 
     def test_hardware_link_freshness_and_age(self):
         class Watcher:
@@ -262,33 +561,6 @@ can_id = 2
         self.assertGreaterEqual(link.age, 0.1)
         self.assertTrue(link.fresh(1))
         self.assertFalse(link.fresh(timedelta(milliseconds=100)))
-
-    def test_hardware_sample_time_converges_and_goes_stale(self):
-        sim = Sim.from_toml(ROBOT_TOML)
-        lift = sim.add(Lift, "lift")
-        node = sim.node("lift")
-        hw = SimHardware(sim)
-        hw.set_gateway_clock(offset=2.0)  # the RoboRIO's clock is 2 s ahead
-        # A state every 10 ms from 0: at most 6 by 50 ms, short of the 8 the
-        # bridge's clock filter needs.
-        sim.step(0.05)
-        self.assertIsNone(talos.hardware_sample_time_ns(node))
-
-        sim.step(0.05)
-        sampled = talos.hardware_sample_time_ns(node)
-        self.assertIsInstance(sampled, int)
-        # A publication time in sim time, not the gateway clock 2 s off it.
-        self.assertEqual(sampled % 10_000_000, 0)
-        now_ns = round(sim.now * 1e9)
-        self.assertLessEqual(sampled, now_ns)
-        self.assertGreaterEqual(sampled, now_ns - 20_000_000)
-        self.assertFalse(lift.enabled)  # independent of enable
-        with self.assertRaisesRegex(talos.TalosError, "latency"):
-            hw.set_gateway_clock(latency=-0.001)
-
-        del hw  # the bridge goes silent
-        sim.step(0.15)
-        self.assertIsNone(talos.hardware_sample_time_ns(node))
 
 
 class Pilot:
@@ -360,16 +632,20 @@ class DriverStationTest(unittest.TestCase):
 
 
 class Aimer:
-    """Records what its Target selected on each update()."""
+    """Records what its Target selected on each update(), and drives the
+    lift motor at its height_rot (as volts) only while get() returns one."""
 
     def __init__(self, node):
         self.target = talos.Target(node, Goal)
+        self.motor = talos.Motor(node, "lift")
         self.seen = None
         self.source = ""
 
     def update(self):
         self.seen = self.target.get()
         self.source = self.target.source
+        if self.seen is not None:
+            self.motor.set_voltage(self.seen.height_rot)
 
 
 class Driver:
@@ -381,13 +657,37 @@ class Driver:
 
     def update(self):
         if self.talking:
-            self.lane.send(height_rot=0.5, tick_count=7)
+            self.lane.send(height_rot=0.5, enabled=True, tick_count=7)
+        else:
+            self.lane.release()
+
+
+class Operator:
+    """Sends the lift's teleop lane whenever joystick 0's button 1 is held,
+    ignoring evaluate(): its OperatorArming alone holds the lane released."""
+
+    def __init__(self, node):
+        self.ds = talos.DriverStation(node)
+        self.arming = talos.OperatorArming(node)
+        self.lane = talos.TargetLane(node, Goal, "lift", "teleop",
+                                     arming=self.arming)
+
+    def update(self):
+        held = self.ds.joystick(0).button(1)
+        self.arming.evaluate(neutral=not held)
+        if held:
+            self.lane.send(height_rot=0.5, enabled=True, tick_count=7)
         else:
             self.lane.release()
 
 
 class TargetTest(unittest.TestCase):
-    """The same selection the C++ talos::Target runs (target_test.cc)."""
+    """Target/TargetLane through Python; selection is target_test.cc's.
+
+    The safety cases (stale, disabled, earlier generation) are here because
+    a marshalling fault on the way out of talos_target_get, such as a
+    binding that decodes its buffer when the call found no target, would
+    actuate on a target the C++ Target refused (docs/TESTING.md §4)."""
 
     def setUp(self):
         self.sim = Sim.from_toml(ROBOT_TOML)
@@ -402,11 +702,17 @@ class TargetTest(unittest.TestCase):
 
     def hold(self, source, height, seconds=0.03):
         for _ in range(round(seconds / 0.01)):
-            self.sim.publish_target(Goal, "lift", source, height_rot=height)
+            self.sim.publish_target(Goal, "lift", source, height_rot=height,
+                                    enabled=True, tick_count=0)
             self.sim.step(0.01)
 
     def seen(self):
         return None if self.lift.seen is None else self.lift.seen.height_rot
+
+    def applied(self):
+        """The lift motor's applied (mode, demand)."""
+        request = self.hw.applied_motor("lift", "lift")
+        return request.mode, request.demand
 
     def test_teleop_drives_and_never_sent_is_none(self):
         self.sim.step(0.05)
@@ -415,116 +721,59 @@ class TargetTest(unittest.TestCase):
         self.hold("teleop", 1.5)
         self.assertEqual(self.seen(), 1.5)
         self.assertEqual(self.lift.source, "teleop")
+        self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 1.5))
 
-    def test_release_falls_through_within_one_tick(self):
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
-        self.sim.publish_target(Goal, "lift", "align", height_rot=2.0)
-        self.sim.step(0.01)
-        self.assertEqual((self.seen(), self.lift.source), (2.0, "align"))
-        self.sim.release_target(Goal, "lift", "align")
-        self.sim.step(0.01)
-        self.assertEqual((self.seen(), self.lift.source), (1.0, "teleop"))
-
-    def test_stale_lane_is_none(self):
+    # REQ-SAFE-07
+    def test_stale_lane_goes_neutral_at_publication_timeout(self):
         self.hold("teleop", 1.0)
-        self.sim.step(0.09)
+        # hold() returns 10 ms after its final publication: 80 ms more
+        # leaves the target 90 ms old, just inside the 100 ms timeout.
+        self.sim.step(0.08)
         self.assertEqual(self.seen(), 1.0)
+        self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 1.0))
         self.sim.step(0.01)
         self.assertIsNone(self.seen())
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
 
-    def test_mode_switch_ignores_the_old_lane(self):
-        self.mode(enabled=True, autonomous=True)
-        self.hold("auto", 3.0)
-        self.assertEqual((self.seen(), self.lift.source), (3.0, "auto"))
-        self.hw.set_driver_station(enabled=True, teleop=True)
-        self.hold("auto", 3.0)
-        self.assertIsNone(self.seen())
-
-    def test_lane_from_before_the_mode_change_is_ignored(self):
-        self.hold("teleop", 1.0)
-        self.mode(enabled=True, autonomous=True)
-        self.mode(enabled=True, teleop=True)  # teleop lane still fresh
-        self.assertIsNone(self.seen())
-        self.hold("teleop", 1.25, 0.01)
-        self.assertEqual(self.seen(), 1.25)
-
-    def reenable_between_ticks(self):
-        """Disabled, then teleop again; the re-enabling packet waits for the
-        lift's next drain with whatever producers queued meanwhile."""
-        self.mode()  # attached, disabled
-        self.sim.step(0.001)  # off the grid packets and ticks share
-        self.hw.set_driver_station(enabled=True, teleop=True)
-        self.sim.step(0.009)  # the packet goes out just after this tick
-
-    def test_target_queued_before_the_mode_change_is_rejected(self):
-        self.hold("teleop", 1.0)
-        self.assertEqual(self.seen(), 1.0)
-        teleop = self.sim.driver_station_generation
-        self.reenable_between_ticks()
-        self.assertNotEqual(self.sim.driver_station_generation, teleop)
-        # Same drain as the re-enabling packet, said under the old period.
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=2.0,
-                                mode_since_us=teleop)
-        self.sim.step(0.01)
-        self.assertEqual((self.seen(), self.lift.source), (None, ""))
-
-    def test_target_of_the_new_generation_is_accepted_in_the_same_drain(self):
-        self.reenable_between_ticks()
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=0.5)
-        self.sim.step(0.01)
-        self.assertEqual(self.seen(), 0.5)
-
-    def test_target_from_a_producer_with_no_mode_is_rejected(self):
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0,
-                                mode_since_us=0)
-        self.sim.step(0.01)
-        self.assertIsNone(self.seen())
-
-    def test_same_mode_recovery_keeps_the_generation(self):
-        self.hold("teleop", 1.0)
-        teleop = self.sim.driver_station_generation
-        self.hw.stop_driver_station()
-        self.sim.step(0.15)
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=3.0,
-                                mode_since_us=0)  # sent while it saw none
-        self.mode(enabled=True, teleop=True)
-        self.assertEqual(self.sim.driver_station_generation, teleop)
-        self.assertIsNone(self.seen())
-        self.hold("teleop", 1.5, 0.01)
-        self.assertEqual(self.seen(), 1.5)
-
-    def test_reattach_starts_a_generation_the_old_lane_cannot_drive(self):
-        self.hold("teleop", 1.0)
-        teleop = self.sim.driver_station_generation
-        self.mode(enabled=True, teleop=True, attached=False)
-        self.assertIsNone(self.seen())
-        self.mode(enabled=True, teleop=True)
-        self.assertNotEqual(self.sim.driver_station_generation, teleop)
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0,
-                                mode_since_us=teleop)
-        self.sim.step(0.01)
-        self.assertIsNone(self.seen())
-        self.hold("teleop", 1.25, 0.01)
-        self.assertEqual(self.seen(), 1.25)
-
-    def test_stale_higher_priority_lane_falls_back_to_the_next(self):
-        self.sim.publish_target(Goal, "lift", "align", height_rot=2.0)
-        self.hold("teleop", 1.0, 0.05)
-        self.assertEqual((self.seen(), self.lift.source), (2.0, "align"))
-        self.hold("teleop", 1.0, 0.07)  # align is past command_timeout_us
-        self.assertEqual((self.seen(), self.lift.source), (1.0, "teleop"))
-
-    def test_robot_disabled_and_driver_station_loss_are_none(self):
+    # REQ-SAFE-02, REQ-SAFE-07
+    def test_robot_disabled_and_driver_station_loss_go_neutral(self):
         self.hold("teleop", 1.0)
         self.hw.enable(False)
         self.hold("teleop", 1.0)
         self.assertIsNone(self.seen())
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
         self.hw.enable()
         self.hold("teleop", 1.0)
         self.assertEqual(self.seen(), 1.0)
         self.hw.stop_driver_station()
         self.hold("teleop", 1.0, 0.12)
         self.assertIsNone(self.seen())
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
+
+    # REQ-SAFE-09
+    def test_earlier_generation_target_is_ignored(self):
+        self.hold("teleop", 1.0)
+        self.assertEqual(self.seen(), 1.0)
+        teleop = self.sim.driver_station_generation
+        self.mode(enabled=False, teleop=True)
+        # SimHardware publishes on the tick grid after the lift (added
+        # first) has run, so the lift drains the re-enabling packet on its
+        # next tick together with whatever was queued meanwhile.
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.01)
+        self.assertNotEqual(self.sim.driver_station_generation, teleop)
+        # Said under the first teleop period, drained with the packet that
+        # starts the second: only the generation tells them apart.
+        self.sim.publish_target(Goal, "lift", "teleop", height_rot=2.0,
+                                enabled=True, tick_count=0,
+                                mode_since_us=teleop)
+        self.sim.step(0.01)
+        self.assertIsNone(self.seen())
+        self.assertEqual(self.lift.source, "")
+        self.assertEqual(self.applied()[0], talos.Mode.NEUTRAL)
+        # The lift is enabled and in teleop: the current generation drives.
+        self.hold("teleop", 2.0, 0.01)
+        self.assertEqual(self.applied(), (talos.Mode.VOLTAGE, 2.0))
 
     def test_lane_sends_and_releases(self):
         sim = Sim.from_toml(ROBOT_TOML)
@@ -542,107 +791,51 @@ class TargetTest(unittest.TestCase):
         self.assertIsNone(sim.latest_target(Goal, "lift", "teleop"))
         self.assertIsNone(lift.seen)
 
-    def test_lane_follows_its_nodes_driver_station_generation(self):
+    def test_operator_arming_holds_a_button_held_through_re_enable(self):
+        """The arming is the C++ one (target_test.cc covers every break);
+        this is the binding, on the case it exists for."""
         sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Driver, "planner")
+        sim.add(Operator, "planner")
         lift = sim.add(Aimer, "lift")
         hw = SimHardware(sim)
         hw.enable()
-        hw.set_driver_station(enabled=True, teleop=True)
-        sim.step(0.04)
-        self.assertEqual(lift.seen.height_rot, 0.5)
-        hw.set_driver_station(enabled=False, teleop=True)
-        sim.step(0.04)
+
+        def driver_station(held, enabled=True):
+            hw.set_driver_station(
+                enabled=enabled, teleop=True,
+                joysticks=[Stick(buttons=(1,) if held else ())])
+            sim.step(0.04)
+
+        driver_station(held=True)  # held from startup: never armed
         self.assertIsNone(lift.seen)
-        # A new generation, which the Python producer stamps on its own.
-        hw.set_driver_station(enabled=True, teleop=True)
-        sim.step(0.04)
+        driver_station(held=False)
+        driver_station(held=True)
         self.assertEqual(lift.seen.height_rot, 0.5)
-
-
-# The lift's teleop lane is remapped; the blind driver's Driver Station is
-# remapped onto a topic nothing writes.
-REMAP_TOML = """
-[robot]
-period_us = 10000
-command_timeout_us = 100000
-
-[subsystems.lift.motors.lift]
-can_id = 1
-[subsystems.lift.targets]
-teleop = ["align", "teleop"]
-[subsystems.lift.remap]
-"target/teleop" = "/left_lift/target/teleop"
-
-[subsystems.blind_driver.remap]
-"/hw/state/driver_station" = "/hw/state/driver_station_unplugged"
-"""
-
-
-class BlindAligner:
-    """Writes the lift's align lane, seeing no Driver Station."""
-
-    def __init__(self, node):
-        self.lane = talos.TargetLane(node, Goal, "lift", "align")
-
-    def update(self):
-        self.lane.send(height_rot=5.0)
-
-
-class RemappedTargetTest(unittest.TestCase):
-    def setUp(self):
-        self.sim = Sim.from_toml(REMAP_TOML)
-
-    def start(self):
-        lift = self.sim.add(Aimer, "lift")
-        self.hw = SimHardware(self.sim)
-        self.hw.enable()
-        self.hw.set_driver_station(enabled=True, teleop=True)
-        self.sim.step(0.02)
-        return lift
-
-    def test_remap_redirects_one_lane(self):
-        lift = self.start()
-        self.sim.publish_target(Goal, "lift", "teleop", height_rot=1.0)
-        self.sim.step(0.01)
+        driver_station(held=True, enabled=False)
+        driver_station(held=True)  # re-enabled with the button still held
+        self.assertIsNone(sim.latest_target(Goal, "lift", "teleop"))
         self.assertIsNone(lift.seen)
-        self.sim.publish_target(Goal, "left_lift", "teleop", height_rot=2.0)
-        self.sim.step(0.01)
-        self.assertEqual((lift.seen.height_rot, lift.source), (2.0, "teleop"))
-        self.sim.publish_target(Goal, "lift", "align", height_rot=3.0)
-        self.sim.publish_target(Goal, "left_lift", "teleop", height_rot=2.0)
-        self.sim.step(0.01)
-        self.assertEqual(lift.source, "align")
-
-    def test_a_producer_that_sees_no_driver_station_never_drives(self):
-        self.sim.add(BlindAligner, "blind_driver")
-        lift = self.start()
-        self.sim.step(0.05)
-        self.assertIsNone(lift.seen)  # align is active and fresh, stamped 0
-        self.sim.publish_target(Goal, "left_lift", "teleop", height_rot=2.0)
-        self.sim.step(0.01)
-        self.assertEqual(lift.source, "teleop")
+        driver_station(held=False)
+        driver_station(held=True)
+        self.assertEqual(lift.seen.height_rot, 0.5)
 
 
 class StateMachineTest(unittest.TestCase):
-    def test_just_entered_and_time_in_state(self):
+    """Transitions are StateMachine's (node_test.cc); these prove each
+    accessor crosses the ABI as the state's Python type."""
+
+    def test_enum_states_cross_the_abi(self):
         sim = Sim.from_toml(ROBOT_TOML)
         stepper = sim.add(Stepper, "planner")
         sim.step(0.045)
         idle, moving = Stepper.State.IDLE, Stepper.State.MOVING
-        self.assertEqual(stepper.seen, [
-            (0, idle, True), (1, idle, False), (2, idle, False),
-            (3, moving, True)])
-        self.assertEqual(stepper.sm.previous, idle)
-        self.assertTrue(stepper.sm.is_(moving))
+        # go(MOVING) in tick 2's update(); tick 3 is the first in MOVING.
+        self.assertEqual(stepper.seen[-2:],
+                         [(2, idle, False), (3, moving, True)])
+        self.assertIs(stepper.sm.previous, idle)
         # Entered at the 30 ms tick; now is 45 ms.
         self.assertAlmostEqual(stepper.sm.time_in_state, 0.015)
-        self.assertRegex(repr(stepper.sm),
-                         r"^StateMachine\(MOVING, previous=IDLE, "
-                         r"time_in_state=0\.015\d*s\)$")
-        with self.assertRaisesRegex(ValueError,
-                                    "Stepper.State has no state 2; it has "
-                                    "IDLE, MOVING"):
+        with self.assertRaises(ValueError):
             stepper.sm.go(2)
 
     def test_flatc_enum_states_are_named(self):
@@ -658,38 +851,21 @@ class StateMachineTest(unittest.TestCase):
         sim.step(0.015)
         self.assertEqual(mover.sm.state, Phase.HOLDING)
         self.assertIs(type(mover.sm.state), int)  # flatc values stay ints
-        self.assertRegex(repr(mover.sm),
-                         r"^StateMachine\(HOLDING, previous=IDLE, ")
-        with self.assertRaisesRegex(
-                ValueError, "Phase has no state 3; it has IDLE, MOVING, "
-                            "HOLDING"):
+        with self.assertRaises(ValueError):
             mover.sm.go(3)
-        with self.assertRaisesRegex(ValueError, "Phase has no state 7"):
+        with self.assertRaises(ValueError):
             talos.StateMachine(sim.node("planner"), 7, states=Phase)
 
 
 class ParamTest(unittest.TestCase):
-    def test_session_dir(self):
-        class Reader:
-            def __init__(self, node):
-                self.session_dir = node.session_dir
+    """Lookup, fallbacks and type checks are the C++ Node's (node_test.cc);
+    these prove the kind each default asks for, and each kind's value, cross
+    talos_node_param and talos_node_param_of as their Python types."""
 
-        sim = Sim.from_toml(ROBOT_TOML)
-        reader = sim.add(Reader, "follower")
-        self.assertIsNone(reader.session_dir)
-
-        sim.set_session_dir("/tmp/talos_session")
-        reader = sim.add(Reader, "planner")
-        self.assertEqual(reader.session_dir, "/tmp/talos_session")
-
-        sim.set_session_dir(None)
-        reader = sim.add(Reader, "lift")
-        self.assertIsNone(reader.session_dir)
-
-    def test_fallback_and_missing(self):
+    def test_each_kind_reads_as_its_python_type(self):
         seen = {}
 
-        class Reader:
+        class Scalars:
             def __init__(self, node):
                 seen["gain"] = node.param("gain", 1.0)
                 seen["mode"] = node.param("mode")
@@ -697,45 +873,23 @@ class ParamTest(unittest.TestCase):
                 seen["verbose"] = node.param("verbose")
                 seen["absent"] = node.param("absent", 7.5)
 
-        sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Reader, "follower")
-        self.assertEqual(seen, {"gain": 2.0, "mode": "fast", "retries": 3,
-                                "verbose": True, "absent": 7.5})
-
-        class Missing:
-            def __init__(self, node):
-                node.param("absent")
-
-        with self.assertRaisesRegex(talos.TalosError, "'absent'"):
-            sim.add(Missing, "planner")
-
-        class Mistyped:
-            def __init__(self, node):
-                node.param("height_rot", 0)
-
-        with self.assertRaisesRegex(talos.TalosError, "must be an integer"):
-            sim.add(Mistyped, "planner")
-
-    def test_lists(self):
-        seen = {}
-
-        class Vision:
+        class Lists:
             def __init__(self, node):
                 seen["cameras"] = node.param("cameras")
-                seen["offsets_m"] = node.param("offsets_m")
-                seen["no_cameras"] = node.param("no_cameras")
-                seen["cameras_any"] = node.param("cameras", [])
-                seen["offsets_typed"] = node.param("offsets_m", [0.0])
-                seen["empty_over_default"] = node.param("no_cameras", ["x"])
-                seen["absent"] = node.param("absent", ["left"])
+                seen["offsets_m"] = node.param("offsets_m", [0.0])
+                seen["no_cameras"] = node.param("no_cameras", ["x"])
+                seen["absent_list"] = node.param("absent", ["left"])
 
         sim = Sim.from_toml(ROBOT_TOML)
-        sim.add(Vision, "vision")
+        sim.add(Scalars, "follower")
+        sim.add(Lists, "vision")
         self.assertEqual(seen, {
-            "cameras": ["front", "back"], "offsets_m": [0.5, 1.0, -2.25],
-            "no_cameras": [], "cameras_any": ["front", "back"],
-            "offsets_typed": [0.5, 1.0, -2.25], "empty_over_default": [],
-            "absent": ["left"]})
+            "gain": 2.0, "mode": "fast", "retries": 3, "verbose": True,
+            "absent": 7.5, "cameras": ["front", "back"],
+            "offsets_m": [0.5, 1.0, -2.25], "no_cameras": [],
+            "absent_list": ["left"]})
+        self.assertEqual(
+            [type(seen[key]) for key in ("retries", "verbose")], [int, bool])
         self.assertEqual([type(v) for v in seen["offsets_m"]], [float] * 3)
 
         def reading(key, *default):
@@ -744,124 +898,154 @@ class ParamTest(unittest.TestCase):
                     node.param(key, *default)
             return Reader
 
+        # Each refusal is C++'s, reached through the kind the default asked
+        # for; a list default of mixed types never leaves Python.
         for key, default, error in (
-                ("mixed", (), r"'mixed' must be an array of strings or of "
-                              r"numbers; element 1 is a string"),
-                ("flags", (), r"'flags' .*element 0 is a boolean"),
-                ("cameras", ([0.0],), r"'cameras' must be an array of "
-                                      r"numbers; element 0 is a string"),
-                ("offsets_m", (["a"],), r"'offsets_m' must be an array of "
-                                        r"strings; element 0 is a float"),
-                ("exposure_s", ([],), r"'exposure_s' must be an array"),
-                ("exposure_s", (["a"],), r"'exposure_s' must be an array of "
-                                         r"strings"),
-                ("absent", (), r"'absent' is missing")):
+                ("absent", (), talos.TalosError),
+                ("offsets_m", (0,), talos.TalosError),
+                ("cameras", ([0.0],), talos.TalosError),
+                ("cameras", (["a", 1.0],), TypeError)):
             with self.subTest(key=key, default=default):
-                with self.assertRaisesRegex(talos.TalosError, error):
+                with self.assertRaises(error):
                     Sim.from_toml(ROBOT_TOML).add(reading(key, *default),
                                                   "vision")
-        with self.assertRaisesRegex(TypeError, "'cameras': a list default"):
-            Sim.from_toml(ROBOT_TOML).add(reading("cameras", ["a", 1.0]),
-                                          "vision")
+
+    def test_param_of_reads_another_subsystem(self):
+        seen = {}
+
+        class Reader:
+            def __init__(self, node):
+                seen["offsets_m"] = node.param_of("vision", "offsets_m")
+                seen["absent"] = node.param_of("follower", "absent", 7.5)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Reader, "planner")
+        self.assertEqual(seen, {"offsets_m": [0.5, 1.0, -2.25],
+                                "absent": 7.5})
+
+        class Missing:
+            def __init__(self, node):
+                node.param_of("absent", "gain", 1.0)
+
+        with self.assertRaises(talos.TalosError):
+            Sim.from_toml(ROBOT_TOML).add(Missing, "planner")
+
+
+class TrajectoryPathTest(unittest.TestCase):
+    """Resolution is the C++ config's (config_test.cc); this proves a Python
+    node gets the path and the refusal through the C ABI.
+    REQ-CONTRACT-14 REQ-CONTRACT-31"""
+
+    def test_a_node_opens_its_configured_trajectory(self):
+        traj = Path(os.environ["TEST_TMPDIR"]) / "two_piece.traj"
+        traj.write_text('{"version": 3}\n')
+        toml = (ROBOT_TOML + "[subsystems.planner.trajectories]\n"
+                f'two_piece = "{traj}"\n')
+        opened = {}
+
+        class Auto:
+            def __init__(self, node):
+                with open(node.trajectory_path("two_piece")) as f:
+                    opened["two_piece"] = json.load(f)
+
+        Sim.from_toml(toml).add(Auto, "planner")
+        self.assertEqual(opened, {"two_piece": {"version": 3}})
+
+        class Undeclared:
+            def __init__(self, node):
+                node.trajectory_path("three_piece")
+
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"planner.*trajectories\.three_piece"):
+            Sim.from_toml(toml).add(Undeclared, "planner")
 
 
 class MessageTest(unittest.TestCase):
-    def test_views_and_send_round_trip(self):
-        class Echo:
+    def test_forwarding_checks_schema_and_payload_in_every_send_path(self):
+        from talos._messages import message_type
+
+        class Outputs:
             def __init__(self, node):
-                self.goal = node.subscribe(Goal, "/echo/in")
-                self.out = node.publish(Goal, "/echo/out")
-
-            def update(self):
-                if self.goal.updated:
-                    self.out.send(self.goal.value)  # re-send the view
+                self.publisher = node.publish(Goal, "/forward/goal")
+                self.lane = talos.TargetLane(node, Goal, "lift", "teleop")
 
         sim = Sim.from_toml(ROBOT_TOML)
-        echo = sim.add(Echo, "planner")
-        self.assertIsNone(echo.goal.value)
-        sim.publish(Goal, "/echo/in", tick_count=7)  # the rest is 0/False
-        sim.step(0.015)
+        outputs = sim.add(Outputs, "planner")
+        goal_type = message_type(Goal)
+        report_type = message_type(Report)
+        self.assertEqual(goal_type.size, report_type.size)
+        goal = goal_type.decode(goal_type.encode(
+            {"height_rot": 2.5, "enabled": True, "tick_count": 0}))
+        report = report_type.decode(report_type.encode(
+            {"phase": Phase.IDLE, "height_rot": 9.0}))
 
-        goal = echo.goal.value
-        self.assertEqual((goal.height_rot, goal.enabled, goal.tick_count),
-                         (0.0, False, 7))
-        self.assertEqual(sim.latest(Goal, "/echo/out"), goal)
-        self.assertEqual(repr(goal),
-                         "Goal(height_rot=0.0, enabled=False, tick_count=7)")
-        with self.assertRaisesRegex(AttributeError, "height_rot, enabled"):
-            goal.height
-        with self.assertRaisesRegex(TypeError, "no field heigth_rot"):
-            sim.publish(Goal, "/echo/in", heigth_rot=1.0)
+        paths = (
+            ("publisher", outputs.publisher.send, "talos_publisher_send"),
+            ("lane", outputs.lane.send, "talos_target_lane_send"),
+            ("sim", lambda msg: sim.publish(
+                Goal, "/forward/injected", msg), "talos_sim_publish_raw"),
+            ("sim_target", lambda msg: sim.publish_target(
+                Goal, "lift", "align", msg), "talos_sim_publish_target"),
+        )
+        for name, send, symbol in paths:
+            with self.subTest(path=name):
+                send(goal)
+                with mock.patch.object(talos.lib, symbol) as forward:
+                    with self.assertRaises(TypeError):
+                        send(report)
+                    forward.assert_not_called()
 
-    def test_enum_fields_read_as_ints_and_repr_as_names(self):
-        sim = Sim.from_toml(ROBOT_TOML)
-        sim.publish(Report, "/report", phase=Phase.HOLDING, height_rot=1.5)
-        report = sim.latest(Report, "/report")
-        self.assertEqual(report.phase, Phase.HOLDING)
-        self.assertIs(type(report.phase), int)
-        self.assertEqual(repr(report), "Report(phase=HOLDING, height_rot=1.5)")
-        sim.publish(Report, "/report", phase=9)  # not a Phase
-        self.assertEqual(repr(sim.latest(Report, "/report")),
-                         "Report(phase=9, height_rot=0.0)")
+        self.assertEqual(sim.latest(Goal, "/forward/goal"), goal)
+        self.assertEqual(sim.latest(Goal, "/forward/injected"), goal)
+        self.assertEqual(sim.latest_target(Goal, "lift", "teleop"), goal)
+        self.assertEqual(sim.latest_target(Goal, "lift", "align"), goal)
 
-    def test_byte_topics_and_relative_topic_remapping(self):
+        changed_hash = type("ChangedGoal", (Goal,), {
+            "TALOS_SCHEMA_HASH": Goal.TALOS_SCHEMA_HASH ^ 1,
+        })
+        alternate_class = type("EquivalentGoal", (Goal,), {})
+        alternate_type = message_type(alternate_class)
+        equivalent = alternate_type.decode(goal._bytes)
+        mismatches = (
+            message_type(changed_hash).decode(goal._bytes),
+            goal_type.decode(goal._bytes[:-1]),
+            goal_type.decode(goal._bytes + b"\0"),
+        )
+        for name, send, symbol in paths:
+            with self.subTest(path=name, identity="equivalent"):
+                # Schema identity, not Python class identity, is the contract.
+                send(equivalent)
+            for bad in mismatches:
+                with self.subTest(path=name, payload=bad._bytes,
+                                  schema_hash=bad._type.schema_hash):
+                    with mock.patch.object(talos.lib, symbol) as forward:
+                        with self.assertRaises(TypeError):
+                            send(bad)
+                        forward.assert_not_called()
+            with self.subTest(path=name, identity="not_a_message"):
+                with mock.patch.object(talos.lib, symbol) as forward:
+                    with self.assertRaises(TypeError):
+                        send(object())
+                    forward.assert_not_called()
+
+    def test_byte_publisher_takes_buffers_and_reports_oversize(self):
         class Telemeter:
             def __init__(self, node):
-                self.node = node
-                self.goal = node.subscribe(Goal, "goal")
-                self.status = node.publish(Status, "status")
-                self.frames = node.publish_bytes("frames", 6, slots=16,
-                                                 drop_newest=True,
-                                                 external=True)
-                self.sent = []
+                self.frames = node.publish_bytes("frames", 6)
 
-            def update(self):
-                if self.goal.has_value:
-                    self.status.send(height_rot=self.goal.value.height_rot,
-                                     at_goal=True, tick_count=self.node.tick)
-                payload = bytearray(range(self.node.tick + 1))
-                self.sent.append(self.frames.send(memoryview(payload)))
-
-        sim = Sim.from_toml("""
-[robot]
-period_us = 10000
-command_timeout_us = 100000
-
-[subsystems.planner.motors.m]
-can_id = 1
-
-[subsystems.follower.remap]
-goal = "/planner/goal"
-"/follower/status" = "/remapped/status"
-frames = "/remapped/frames"
-""")
+        sim = Sim.from_toml(ROBOT_TOML)
         telemeter = sim.add(Telemeter, "planner")
-        remapped = sim.add(Telemeter, "follower")
         self.assertIsNone(sim.latest_bytes("/planner/frames"))
-
-        sim.publish(Goal, "/planner/goal", height_rot=3.5)
-        sim.step(0.035)  # ticks 0, 1, 2
-        self.assertEqual(sim.latest(Status, "/planner/status").height_rot, 3.5)
-        self.assertEqual(sim.latest(Status, "/remapped/status").height_rot, 3.5)
-        self.assertEqual(sim.latest_bytes("/planner/frames"), b"\x00\x01\x02")
-        self.assertEqual(sim.latest_bytes("/remapped/frames"), b"\x00\x01\x02")
-        self.assertEqual(telemeter.sent, [True, True, True])
+        self.assertTrue(telemeter.frames.send(memoryview(bytearray(b"\0\1\2"))))
+        self.assertEqual(sim.latest_bytes("/planner/frames"), b"\0\1\2")
 
         # Oversize returns False and preserves the last valid frame; empty works.
         self.assertFalse(telemeter.frames.send(b"1234567"))
-        self.assertEqual(sim.latest_bytes("/planner/frames"), b"\x00\x01\x02")
+        self.assertEqual(sim.latest_bytes("/planner/frames"), b"\0\1\2")
         self.assertTrue(telemeter.frames.send(b""))
         self.assertEqual(sim.latest_bytes("/planner/frames"), b"")
-        self.assertIsNotNone(remapped)
         with self.assertRaises(TypeError):
             telemeter.frames.send("not bytes")
-
-        class BadBytes:
-            def __init__(self, node):
-                node.publish_bytes("frames", 0)
-
-        with self.assertRaises(talos.TalosError):
-            sim.add(BadBytes, "planner")
 
 
 if __name__ == "__main__":

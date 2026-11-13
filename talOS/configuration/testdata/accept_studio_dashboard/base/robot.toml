@@ -1,0 +1,6 @@
+[studio]
+dashboard = "layouts/dashboard.toml"
+
+[[subsystems]]
+name = "a"
+path = "a.toml"

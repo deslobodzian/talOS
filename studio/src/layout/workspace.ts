@@ -48,14 +48,14 @@ export function saveWorkspace(workspace: Workspace): void {
   }
 }
 
-// Import/export are the serialize/parse pair made explicit: a JSON file is
-// just a saved workspace, and importing one is just reading it back with the
-// same validation localStorage uses.
+// Import/export use the same validation as persistence, but an invalid import
+// is rejected instead of replacing the user's current workspace with defaults.
 export function exportWorkspace(workspace: Workspace): string {
   return serialize(workspace);
 }
 
 export function importWorkspace(text: string): Workspace {
   const parsed = parseWorkspace(JSON.parse(text));
-  return parsed.pages.length ? parsed : defaultWorkspace();
+  if (!parsed.pages.length) throw new Error('Invalid workspace document');
+  return parsed;
 }

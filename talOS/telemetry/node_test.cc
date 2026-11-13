@@ -1,21 +1,30 @@
 #include "talOS/telemetry/node.h"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "geometry/geometry_generated.h"
 #include "schema_test/shapes_generated.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
+#include "talOS/rtms/rtms.h"
+#include "talOS/schema/identity.h"
 #include "talOS/telemetry/wire.h"
 
 namespace talos::telemetry {
@@ -84,15 +93,44 @@ FrameHolder LatestFrame(const Sim& sim, std::string_view topic) {
   return FrameHolder{std::move(*bytes)};
 }
 
+std::map<std::string, const ChannelDef*> DictionaryMap(
+    const Telemetry& telemetry) {
+  std::map<std::string, const ChannelDef*> out;
+  for (const auto& def : telemetry.dictionary()) {
+    out[def.name] = &def;
+  }
+  return out;
+}
+
+// The raw samples one value page carries, by channel name. A keyframe page
+// carries every present channel of a single-page tick; absent ones are missing.
+std::map<std::string, std::uint64_t> DecodeRaw(const Telemetry& telemetry,
+                                               const Frame* frame) {
+  std::map<std::string, std::uint64_t> out;
+  if (!frame || !frame->channels() || !frame->values()) return out;
+  const auto& dict = telemetry.dictionary();
+  for (std::size_t i = 0; i < frame->channels()->size(); ++i) {
+    out[dict.at(frame->channels()->Get(i)).name] = frame->values()->Get(i);
+  }
+  return out;
+}
+
+// The same samples as numbers, read per channel kind.
 std::map<std::string, double> DecodeChannels(const Telemetry& telemetry,
                                              const Frame* frame) {
   std::map<std::string, double> out;
-  if (!frame || !frame->values()) return out;
-  const auto& dict = telemetry.dictionary();
-  for (std::size_t i = 0; i < dict.size(); ++i) {
-    const double val = frame->values()->Get(i);
-    if (!std::isnan(val)) {
-      out[dict[i].name] = val;
+  const auto by_name = DictionaryMap(telemetry);
+  for (const auto& [name, raw] : DecodeRaw(telemetry, frame)) {
+    switch (by_name.at(name)->kind) {
+      case Talos::Telemetry::ChannelKind_Int:
+        out[name] = static_cast<double>(static_cast<std::int64_t>(raw));
+        break;
+      case Talos::Telemetry::ChannelKind_UInt:
+      case Talos::Telemetry::ChannelKind_Bool:
+        out[name] = static_cast<double>(raw);
+        break;
+      default:
+        out[name] = DoubleFromRaw(raw);
     }
   }
   return out;
@@ -101,15 +139,6 @@ std::map<std::string, double> DecodeChannels(const Telemetry& telemetry,
 std::map<std::string, double> DecodeChannels(const Telemetry& telemetry,
                                              const FrameHolder& holder) {
   return DecodeChannels(telemetry, holder.get());
-}
-
-std::map<std::string, const ChannelDef*> DictionaryMap(
-    const Telemetry& telemetry) {
-  std::map<std::string, const ChannelDef*> out;
-  for (const auto& def : telemetry.dictionary()) {
-    out[def.name] = &def;
-  }
-  return out;
 }
 
 TEST(TelemetryTest, SchemaLessStateIsSilentlyExcluded) {
@@ -139,7 +168,10 @@ node = "//talOS/telemetry:node"
   ::testing::internal::CaptureStderr();
   auto& telemetry = sim.add<Telemetry>("telemetry");
   const std::string stderr_output = ::testing::internal::GetCapturedStderr();
-  EXPECT_TRUE(stderr_output.empty()) << stderr_output;
+  // Only the budget report; nothing about the excluded schema-less topic.
+  EXPECT_EQ(stderr_output.find("hw/state"), std::string::npos) << stderr_output;
+  EXPECT_NE(stderr_output.find("value page(s) per tick"), std::string::npos)
+      << stderr_output;
 
   const auto dict = DictionaryMap(telemetry);
   EXPECT_TRUE(dict.contains("demo/state/position_m"));
@@ -183,14 +215,7 @@ node = "//talOS/telemetry:node"
 )";
   Sim sim = Sim::FromToml(kConfig);
   sim.add<HardwareNode>("hw");
-  try {
-    sim.add<Telemetry>("telemetry");
-    FAIL() << "expected exception for schema-less pose_topic";
-  } catch (const std::invalid_argument& err) {
-    EXPECT_NE(
-        std::string{err.what()}.find("pose topic '/hw/state' has no schema"),
-        std::string::npos);
-  }
+  EXPECT_THROW(sim.add<Telemetry>("telemetry"), std::invalid_argument);
 }
 
 TEST(TelemetryTest, FlatteningAndUnits) {
@@ -316,7 +341,7 @@ exclude = ["*state*"]
   EXPECT_FALSE(dict.contains("demo/state/position_m"));
 }
 
-TEST(TelemetryTest, ChannelExcludePreservesOtherChannelsAndShrinksBudget) {
+TEST(TelemetryTest, ChannelExcludePreservesOtherChannels) {
   const std::string config = R"(
 [robot]
 period_us = 10000
@@ -338,8 +363,6 @@ node = "//talOS/telemetry:node"
   const auto& original = baseline.add<Telemetry>("telemetry");
   auto expected = DictionaryMap(original);
   ASSERT_EQ(expected.erase("demo/state/sample_count"), 1u);
-  const auto original_bytes =
-      MeasureValueFrameBytes(original.dictionary().size());
 
   for (const std::string pattern :
        {"demo/state/sample_count", "/demo/state/sample_count"}) {
@@ -356,8 +379,6 @@ node = "//talOS/telemetry:node"
       EXPECT_TRUE(actual.contains(name)) << name;
     }
     EXPECT_FALSE(actual.contains("demo/state/sample_count"));
-    EXPECT_EQ(MeasureValueFrameBytes(telemetry.dictionary().size()),
-              original_bytes - sizeof(double));
 
     shapes.mixed_.send(schema_test::Mixed{true,
                                           4.5,
@@ -381,7 +402,9 @@ node = "//talOS/telemetry:node"
   }
 }
 
-TEST(TelemetryTest, NaNOnStale) {
+// Absent means only that the topic was not published (or went stale); a NaN
+// or infinite reading is a reading, and travels with its bits.
+TEST(TelemetryTest, StaleIsAbsentWhileNaNAndInfinityAreReadings) {
   const std::string kConfig = R"(
 [robot]
 period_us = 10000
@@ -405,18 +428,22 @@ stale_timeout_us = 50000
   auto& telemetry = sim.add<Telemetry>("telemetry");
 
   schema_test::Mixed mixed{true,
-                           4.5,
+                           std::numeric_limits<double>::quiet_NaN(),
                            schema_test::Level::TOP,
                            1234,
                            {schema_test::Mode::HIGH, 1.25f},
-                           0.8f};
+                           -std::numeric_limits<float>::infinity()};
   shapes.mixed_.send(mixed);
 
   sim.step(20ms);
   const auto frame1 = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame1, nullptr);
   auto channels1 = DecodeChannels(telemetry, frame1);
-  EXPECT_TRUE(channels1.contains("demo/state/position_m"));
+  ASSERT_TRUE(channels1.contains("demo/state/position_m"));
+  EXPECT_TRUE(std::isnan(channels1.at("demo/state/position_m")));
+  ASSERT_TRUE(channels1.contains("demo/state/speed_frac"));
+  EXPECT_EQ(channels1.at("demo/state/speed_frac"),
+            -std::numeric_limits<double>::infinity());
 
   // Advance time past stale_timeout_us without new publications
   sim.step(100ms);
@@ -428,7 +455,7 @@ stale_timeout_us = 50000
   const auto frame2 = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame2, nullptr);
   auto channels2 = DecodeChannels(telemetry, frame2);
-  // demo/state was stale, so its channels are NaN (DecodeChannels drops NaNs)
+  // demo/state went stale, so its channels are absent: not carried.
   EXPECT_FALSE(channels2.contains("demo/state/position_m"));
   EXPECT_TRUE(channels2.contains("demo/status/samples_m/0"));
 }
@@ -464,6 +491,7 @@ node = "//talOS/telemetry:node"
       ::geometry::Pose2d{3.25, 1.5, 0.75},
       ::geometry::Twist2d{0.0, 0.0, 0.0},
       true,
+      true,
       0,
       0,
   };
@@ -487,6 +515,7 @@ node = "//talOS/telemetry:node"
       ::geometry::Pose2d{3.25, 1.5, 0.75},
       ::geometry::Twist2d{0.0, 0.0, 0.0},
       false,
+      true,
       0,
       0,
   };
@@ -534,12 +563,19 @@ node = "//talOS/telemetry:node"
   EXPECT_EQ(dict.at("hw/state/driver_station/match_time_s")->unit, "s");
   EXPECT_EQ(dict.at("hw/state/driver_station/alliance")->labels,
             (std::vector<std::string>{"unknown", "red", "blue"}));
+  ASSERT_TRUE(dict.contains("hw/state/driver_station/match_type"));
+  EXPECT_EQ(dict.at("hw/state/driver_station/match_type")->labels,
+            (std::vector<std::string>{"none", "practice", "qualification",
+                                      "elimination"}));
 
   driver_station::DriverStationData ds_data{};
   ds_data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
                       driver_station::kTeleop;
   ds_data.fms.alliance = driver_station::Alliance::kRed;
   ds_data.fms.match_time_s = 75.5f;
+  ds_data.fms.station = 3;
+  ds_data.fms.match_type = driver_station::MatchType::kQualification;
+  ds_data.fms.match_number = 412;
 
   hardware::Packet packet{};
   packet.size =
@@ -558,60 +594,304 @@ node = "//talOS/telemetry:node"
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/autonomous"), 0.0);
   EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/alliance"), 1.0);
   EXPECT_NEAR(channels.at("hw/state/driver_station/match_time_s"), 75.5, 1e-3);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/station"), 3.0);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/match_type"), 2.0);
+  EXPECT_DOUBLE_EQ(channels.at("hw/state/driver_station/match_number"), 412.0);
 }
 
-// Node with 150 channels to exceed 1200-byte frame budget.
-class GiantNode {
+// Each topic contributes one channel after excluding its offset field.
+class BoundaryChannelsNode {
  public:
-  explicit GiantNode(talos::Node& node)
-      : a_{node.publish<schema_test::Arrays>("/giant/state/a")},
-        b_{node.publish<schema_test::Arrays>("/giant/state/b")},
-        c_{node.publish<schema_test::Arrays>("/giant/state/c")},
-        d_{node.publish<schema_test::Arrays>("/giant/state/d")},
-        e_{node.publish<schema_test::Arrays>("/giant/state/e")},
-        f_{node.publish<schema_test::Arrays>("/giant/state/f")},
-        g_{node.publish<schema_test::Arrays>("/giant/state/g")},
-        h_{node.publish<schema_test::Arrays>("/giant/state/h")},
-        i_{node.publish<schema_test::Arrays>("/giant/state/i")},
-        j_{node.publish<schema_test::Arrays>("/giant/state/j")},
-        k_{node.publish<schema_test::Arrays>("/giant/state/k")},
-        l_{node.publish<schema_test::Arrays>("/giant/state/l")} {}
+  explicit BoundaryChannelsNode(talos::Node& node) {
+    const auto count = node.param<std::int64_t>("channel_count", 0);
+    for (std::int64_t i = 0; i < count; ++i) {
+      publishers_.push_back(node.publish<schema_test::Inner>(
+          "/budget/state/" + std::to_string(i)));
+    }
+  }
 
-  talos::Publisher<schema_test::Arrays> a_, b_, c_, d_, e_, f_, g_, h_, i_, j_,
-      k_, l_;
+  void send() {
+    for (auto& publisher : publishers_) {
+      publisher.send(schema_test::Inner{schema_test::Mode::LOW, 1.0f});
+    }
+  }
+
+ private:
+  std::vector<talos::Publisher<schema_test::Inner>> publishers_;
 };
 
-TEST(TelemetryTest, BudgetCheckFailureMessage) {
-  const std::string kConfig = R"(
+// A tick past one page's worth of channels publishes as several pages of one
+// sequence, each within the page cap. (The Studio bridge's telemetry_test
+// reassembles such pages channel by channel.)
+TEST(TelemetryTest, ValuesPastOnePagePublishInPages) {
+  Sim sim = Sim::FromToml(R"(
 [robot]
 period_us = 10000
-
 [studio]
 topic = "/talos/telemetry"
-
-[subsystems.giant]
-node = "//giant:node"
-
-[subsystems.giant.motors.m]
+[subsystems.budget]
+node = "//budget:node"
+channel_count = 300
+[subsystems.budget.motors.m]
 can_id = 1
-
 [subsystems.telemetry]
 node = "//talOS/telemetry:node"
-)";
+exclude = ["budget/state/*/offset_m"]
+)");
+  auto& source = sim.add<BoundaryChannelsNode>("budget");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  ASSERT_EQ(telemetry.dictionary().size(), 301u);
+  const PageBudget budget = MeasurePages(telemetry.dictionary());
+  ASSERT_GE(budget.value_pages, 3u);
+  EXPECT_LE(budget.largest_value_page, telemetry_wire::kMaxValueFrameBytes);
 
-  Sim sim = Sim::FromToml(kConfig);
-  sim.add<GiantNode>("giant");
+  source.send();
+  sim.step(20ms);
+  const auto last = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(last, nullptr);
+  ASSERT_EQ(last->dictionary(), nullptr);
+  EXPECT_TRUE(last->keyframe());
+  EXPECT_EQ(last->channel_count(), 301u);
+  EXPECT_EQ(last->page_count(), budget.value_pages);
+  EXPECT_EQ(last->page(), last->page_count() - 1);
+  EXPECT_LE(last.bytes.size(), telemetry_wire::kMaxValueFrameBytes);
+}
 
+// The channel cap is exact: a dictionary of kMaxChannels constructs, one more
+// is refused naming the largest source (a keyframe of it could not fit the
+// Studio bridge's burst, so no client could ever be sent one whole).
+// REQ-CONTRACT-28
+TEST(TelemetryTest, ChannelCapAdmitsExactlyMaxChannels) {
+  const auto config = [](std::string_view exclude) {
+    return std::string{R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.budget]
+node = "//budget:node"
+channel_count = )"} +
+           std::to_string(telemetry_wire::kMaxChannels / 2) + R"(
+[subsystems.budget.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+exclude = [)" +
+           std::string{exclude} + "]\n";
+  };
+  // Two channels per topic plus pose/valid, less one excluded.
+  Sim at_cap = Sim::FromToml(config(R"("budget/state/0/offset_m")"));
+  at_cap.add<BoundaryChannelsNode>("budget");
+  EXPECT_EQ(at_cap.add<Telemetry>("telemetry").dictionary().size(),
+            telemetry_wire::kMaxChannels);
+
+  Sim over = Sim::FromToml(config(""));
+  over.add<BoundaryChannelsNode>("budget");
   try {
-    sim.add<Telemetry>("telemetry");
-    FAIL() << "expected frame size budget failure";
-  } catch (const std::runtime_error& err) {
-    const std::string msg = err.what();
-    EXPECT_NE(msg.find("worst-case value frame is"), std::string::npos);
-    EXPECT_NE(msg.find("over the 1200-byte budget"), std::string::npos);
-    EXPECT_NE(msg.find("Largest sources:"), std::string::npos);
-    EXPECT_NE(msg.find("/giant/state/a"), std::string::npos);
+    over.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "a dictionary past the channel cap constructed";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string_view{error.what()}.find("2049 channels"),
+              std::string_view::npos)
+        << error.what();
+    EXPECT_NE(std::string_view{error.what()}.find("budget/state"),
+              std::string_view::npos)
+        << error.what();
   }
+}
+
+// `/budget/state` as a struct of `field_count` doubles, each named
+// `name_bytes` long; the schema is built by hand so a test sets any length.
+class LongNamesNode {
+ public:
+  explicit LongNamesNode(talos::Node& node) {
+    const auto count =
+        static_cast<std::size_t>(node.param<std::int64_t>("field_count", 1));
+    const auto name_bytes =
+        static_cast<std::size_t>(node.param<std::int64_t>("name_bytes", 1));
+    flatbuffers::FlatBufferBuilder builder;
+    std::vector<flatbuffers::Offset<reflection::Field>> fields;
+    for (std::size_t i = 0; i < count; ++i) {
+      std::string name = std::to_string(i);
+      name.resize(name_bytes, 'x');
+      const auto field_name = builder.CreateString(name);
+      reflection::TypeBuilder type_builder{builder};
+      type_builder.add_base_type(reflection::BaseType::Double);
+      type_builder.add_index(-1);
+      const auto type = type_builder.Finish();
+      reflection::FieldBuilder field_builder{builder};
+      field_builder.add_name(field_name);
+      field_builder.add_type(type);
+      field_builder.add_id(static_cast<std::uint16_t>(i));
+      field_builder.add_offset(static_cast<std::uint16_t>(i * sizeof(double)));
+      fields.push_back(field_builder.Finish());
+    }
+    const auto object_name = builder.CreateString("budget.State");
+    const auto field_vector = builder.CreateVector(fields);
+    reflection::ObjectBuilder object_builder{builder};
+    object_builder.add_name(object_name);
+    object_builder.add_fields(field_vector);
+    object_builder.add_is_struct(true);
+    object_builder.add_minalign(8);
+    object_builder.add_bytesize(
+        static_cast<std::int32_t>(count * sizeof(double)));
+    const auto object = object_builder.Finish();
+    const auto objects = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Object>>{object});
+    const auto enums = builder.CreateVector(
+        std::vector<flatbuffers::Offset<reflection::Enum>>{});
+    reflection::SchemaBuilder schema_builder{builder};
+    schema_builder.add_objects(objects);
+    schema_builder.add_enums(enums);
+    reflection::FinishSchemaBuffer(builder, schema_builder.Finish());
+    schema_.assign(reinterpret_cast<const char*>(builder.GetBufferPointer()),
+                   builder.GetSize());
+    talos::detail::NodeAccess::add_publisher(
+        node, "/budget/state", count * sizeof(double), 8,
+        talos::schema::Identity{"budget.State", 12345, schema_});
+  }
+
+ private:
+  std::string schema_;
+};
+
+// LongNamesNode's channels are this prefix plus the field name, so this is
+// the longest field name whose channel Studio still decodes.
+constexpr std::string_view kLongNamesPrefix = "budget/state/";
+constexpr std::size_t kLongestFieldName =
+    telemetry_wire::kMaxDictionaryStringBytes - kLongNamesPrefix.size();
+
+// The channel LongNamesNode's first field produces.
+std::string LongChannelName(std::size_t name_bytes) {
+  std::string field = "0";
+  field.resize(name_bytes, 'x');
+  return std::string{kLongNamesPrefix} + field;
+}
+
+std::string LongNamesConfig(std::size_t field_count, std::size_t name_bytes,
+                            std::string_view telemetry_keys = "") {
+  return R"(
+[robot]
+period_us = 10000
+[subsystems.budget]
+node = "//budget:node"
+field_count = )" +
+         std::to_string(field_count) +
+         "\nname_bytes = " + std::to_string(name_bytes) + R"(
+[subsystems.budget.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)" + std::string{telemetry_keys};
+}
+
+// A node may declare a message of more scalars than a dictionary holds; the
+// config's exclude brings it within the cap, as for any large source. Here
+// /budget/state has 2100 doubles (fields "0xxx" to "2099") and excluding
+// the names starting with 1
+// leaves 989: telemetry constructs and serves exactly those. Counting the
+// excluded channels against the topic cap refused the whole node.
+// REQ-CONTRACT-28
+TEST(TelemetryTest, ExcludedChannelsDoNotCountAgainstATopicsCap) {
+  Sim sim = Sim::FromToml(
+      LongNamesConfig(2100, 4, R"(exclude = ["budget/state/1*"])"));
+  sim.add<LongNamesNode>("budget");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  std::size_t served = 0;
+  for (const ChannelDef& channel : telemetry.dictionary()) {
+    if (!channel.name.starts_with(kLongNamesPrefix)) continue;
+    ++served;
+    EXPECT_NE(channel.name[kLongNamesPrefix.size()], '1') << channel.name;
+  }
+  EXPECT_EQ(served, 2100u - 1111u);
+
+  // Excluding nothing keeps all 2100: the refusal names that many, not the
+  // cap plus one, so the author knows how much to exclude.
+  Sim over = Sim::FromToml(LongNamesConfig(2100, 4));
+  over.add<LongNamesNode>("budget");
+  try {
+    over.add<Telemetry>("telemetry");
+    ADD_FAILURE() << "a dictionary past the channel cap constructed";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string_view{error.what()}.find("budget/state (2100)"),
+              std::string_view::npos)
+        << error.what();
+  }
+}
+
+TEST(TelemetryTest, DictionaryPastOneSlotPagesAndOneChannelMustFitAPage) {
+  // 64 channels of the longest name Studio decodes: more dictionary than one
+  // slot holds, so it takes several pages.
+  Sim sim = Sim::FromToml(LongNamesConfig(64, kLongestFieldName));
+  sim.add<LongNamesNode>("budget");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  EXPECT_GE(MeasurePages(telemetry.dictionary()).dictionary_pages, 2u);
+
+  // One channel whose entry alone outgrows a page cannot be paged; the
+  // refusal names it.
+  const std::vector<ChannelDef> oversized{
+      {"status/huge", "",
+       std::vector<std::string>(1024, std::string(256, 'x'))}};
+  try {
+    MeasurePages(oversized);
+    ADD_FAILURE() << "a channel larger than a dictionary page was accepted";
+  } catch (const std::runtime_error& error) {
+    EXPECT_NE(std::string{error.what()}.find("'status/huge'"),
+              std::string::npos)
+        << error.what();
+  }
+}
+
+// Owns a topic whose channels fall under Studio's derived/ prefix.
+class DerivedOwnerNode {
+ public:
+  explicit DerivedOwnerNode(talos::Node& node)
+      : state_{node.publish<schema_test::Inner>("/derived/state")} {}
+
+  talos::Publisher<schema_test::Inner> state_;
+};
+
+// Studio refuses a whole dictionary over one channel it cannot decode, which
+// blanks the stream; construction refuses that channel instead, by name.
+TEST(TelemetryTest, ChannelStudioCannotDecodeIsRefusedByName) {
+  const auto refusal = [](Sim& sim) -> std::string {
+    try {
+      sim.add<Telemetry>("telemetry");
+    } catch (const std::invalid_argument& error) {
+      return error.what();
+    }
+    return "";
+  };
+  Sim at_limit = Sim::FromToml(LongNamesConfig(1, kLongestFieldName));
+  at_limit.add<LongNamesNode>("budget");
+  EXPECT_EQ(refusal(at_limit), "");
+
+  const std::string over_limit = LongChannelName(kLongestFieldName + 1);
+  Sim over = Sim::FromToml(LongNamesConfig(1, kLongestFieldName + 1));
+  over.add<LongNamesNode>("budget");
+  const std::string message = refusal(over);
+  EXPECT_NE(message.find("'" + over_limit + "'"), std::string::npos) << message;
+
+  // The remedy the refusal points at: excluding the channel.
+  Sim excluded = Sim::FromToml(LongNamesConfig(
+      1, kLongestFieldName + 1, "exclude = [\"" + over_limit + "\"]\n"));
+  excluded.add<LongNamesNode>("budget");
+  EXPECT_EQ(refusal(excluded), "");
+
+  Sim derived = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[subsystems.derived]
+node = "//derived:node"
+[subsystems.derived.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+  derived.add<DerivedOwnerNode>("derived");
+  const std::string reserved = refusal(derived);
+  EXPECT_NE(reserved.find("'derived/state/mode'"), std::string::npos)
+      << reserved;
 }
 
 TEST(TelemetryTest, PoseTopicMissingErrors) {
@@ -630,12 +910,7 @@ can_id = 1
 node = "//talOS/telemetry:node"
 )";
   Sim sim1 = Sim::FromToml(kAbsentConfig);
-  try {
-    sim1.add<Telemetry>("telemetry");
-    FAIL() << "expected exception for absent pose_topic";
-  } catch (const std::invalid_argument& err) {
-    EXPECT_NE(std::string{err.what()}.find("/absent/state"), std::string::npos);
-  }
+  EXPECT_THROW(sim1.add<Telemetry>("telemetry"), std::invalid_argument);
 
   const std::string kNoPoseFieldConfig = R"(
 [robot]
@@ -656,12 +931,7 @@ node = "//talOS/telemetry:node"
 )";
   Sim sim2 = Sim::FromToml(kNoPoseFieldConfig);
   sim2.add<ShapesNode>("demo");
-  try {
-    sim2.add<Telemetry>("telemetry");
-    FAIL() << "expected exception for topic lacking geometry.Pose2d field";
-  } catch (const std::invalid_argument& err) {
-    EXPECT_NE(std::string{err.what()}.find("/demo/state"), std::string::npos);
-  }
+  EXPECT_THROW(sim2.add<Telemetry>("telemetry"), std::invalid_argument);
 }
 
 class BadBfbsNode {
@@ -704,12 +974,7 @@ node = "//talOS/telemetry:node"
 )";
   Sim sim1 = Sim::FromToml(kBadBfbsConfig);
   sim1.add<BadBfbsNode>("bad");
-  try {
-    sim1.add<Telemetry>("telemetry");
-    FAIL() << "expected bad schema buffer exception";
-  } catch (const std::invalid_argument& err) {
-    EXPECT_NE(std::string{err.what()}.find("/bad/state"), std::string::npos);
-  }
+  EXPECT_THROW(sim1.add<Telemetry>("telemetry"), std::invalid_argument);
 
   const std::string kMissingObjConfig = R"(
 [robot]
@@ -729,13 +994,7 @@ node = "//talOS/telemetry:node"
 )";
   Sim sim2 = Sim::FromToml(kMissingObjConfig);
   sim2.add<MissingObjectNode>("missing");
-  try {
-    sim2.add<Telemetry>("telemetry");
-    FAIL() << "expected missing root object exception";
-  } catch (const std::invalid_argument& err) {
-    EXPECT_NE(std::string{err.what()}.find("/missing_obj/state"),
-              std::string::npos);
-  }
+  EXPECT_THROW(sim2.add<Telemetry>("telemetry"), std::invalid_argument);
 }
 
 TEST(TelemetryTest, EnumLabelsExtraction) {
@@ -768,7 +1027,41 @@ node = "//talOS/telemetry:node"
   EXPECT_EQ(mode_labels[4], "HIGH");
 }
 
-TEST(TelemetryTest, StalePoseBecomesZeroAndNaN) {
+// Integer fields travel as their exact value, not through a double: 2^53 + 1
+// has no double representation.
+TEST(TelemetryTest, IntegerAbove2To53TravelsExactly) {
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.pose_estimator]
+node = "//estimator:node"
+[subsystems.pose_estimator.motors.m]
+can_id = 1
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+  auto& estimator = sim.add<EstimatorNode>("pose_estimator");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  const auto dict = DictionaryMap(telemetry);
+  ASSERT_EQ(dict.at("pose_estimator/state/sample_time_ns")->kind,
+            Talos::Telemetry::ChannelKind_UInt);
+  ASSERT_EQ(dict.at("pose_estimator/state/valid")->kind,
+            Talos::Telemetry::ChannelKind_Bool);
+
+  constexpr std::uint64_t kExact = (std::uint64_t{1} << 53) + 1;
+  ASSERT_NE(static_cast<std::uint64_t>(static_cast<double>(kExact)), kExact);
+  estimator.pose_.send(::geometry::PoseEstimate{
+      kExact, ::geometry::Pose2d{1.0, 2.0, 0.5},
+      ::geometry::Twist2d{0.0, 0.0, 0.0}, true, true, 0, 0});
+  sim.step(20ms);
+  const auto raw =
+      DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
+  EXPECT_EQ(raw.at("pose_estimator/state/sample_time_ns"), kExact);
+}
+
+TEST(TelemetryTest, AllSourcesStaleEmitsOneClearingFrameThenResumes) {
   const std::string kConfig = R"(
 [robot]
 period_us = 10000
@@ -802,20 +1095,42 @@ stale_timeout_us = 50000
       ::geometry::Pose2d{2.0, 3.0, 1.0},
       ::geometry::Twist2d{0.0, 0.0, 0.0},
       true,
+      true,
       0,
       0,
   };
   estimator.pose_.send(estimate);
-  sim.step(20ms);
+  sim.step(40ms);
 
   auto frame = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame, nullptr);
   EXPECT_DOUBLE_EQ(frame->chassis()->x(), 2.0);
   auto channels = DecodeChannels(telemetry, frame);
   EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 1.0);
+  const auto fresh_sequence = frame->sequence_id();
 
-  // Advance time past stale_timeout_us (100ms) without sending new pose
+  // Advance time past stale_timeout_us (50ms) without sending new pose
   sim.step(100ms);
+  // The last fresh source becoming stale emits one clearing frame, even when
+  // there is no other source left to trigger normal publication.
+  frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  const auto stale_sequence = frame->sequence_id();
+  EXPECT_EQ(stale_sequence, fresh_sequence + 1);
+  EXPECT_DOUBLE_EQ(frame->chassis()->x(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->y(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->z(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->roll(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->pitch(), 0.0);
+  EXPECT_DOUBLE_EQ(frame->chassis()->yaw(), 0.0);
+  // Every other channel is absent: a keyframe carries only pose/valid.
+  const auto cleared = DecodeChannels(telemetry, frame);
+  ASSERT_EQ(cleared.size(), 1u);
+  EXPECT_DOUBLE_EQ(cleared.at("pose/valid"), 0.0);
+  sim.step(100ms);
+  frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  EXPECT_EQ(frame->sequence_id(), stale_sequence);
 
   // Publish arrays on demo node so telemetry produces a new frame while pose is
   // stale
@@ -825,13 +1140,536 @@ stale_timeout_us = 50000
 
   frame = LatestFrame(sim, "/talos/telemetry");
   ASSERT_NE(frame, nullptr);
+  EXPECT_GT(frame->sequence_id(), stale_sequence);
   EXPECT_DOUBLE_EQ(frame->chassis()->x(), 0.0);
   EXPECT_DOUBLE_EQ(frame->chassis()->y(), 0.0);
   EXPECT_DOUBLE_EQ(frame->chassis()->yaw(), 0.0);
   channels = DecodeChannels(telemetry, frame);
   EXPECT_DOUBLE_EQ(channels.at("pose/valid"), 0.0);
-  // Pose estimator channels are NaN when stale
+  // Pose estimator channels are absent (not carried) when stale
   EXPECT_FALSE(channels.contains("pose_estimator/state/twist/vx_mps"));
+}
+
+// Test node whose status carries an alert of each level (schema_test.Alerts).
+class AlertsNode {
+ public:
+  explicit AlertsNode(talos::Node& node)
+      : status_{node.publish<schema_test::Alerts>("/shooter/status")} {}
+
+  talos::Publisher<schema_test::Alerts> status_;
+};
+
+constexpr std::string_view kAlertsConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.shooter]
+node = "//shooter:node"
+
+[subsystems.shooter.motors.m]
+can_id = 1
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+stale_timeout_us = 50000
+
+[[subsystems.telemetry.labels]]
+channel = "shooter/status/routine_index"
+from = "autonomous.routines"
+)";
+
+// Observer matrix (docs/TESTING.md §7): the node observes every state and
+// status topic; an input's "validity" is its channels' presence.
+
+// REQ-OPS-37, REQ-OPS-38: each alert field's channel carries its level in
+// the dictionary (other fields none), a labelled integer channel carries
+// another subsystem's string array as its labels, and every value is carried
+// each tick, so a viewer names both without parsing a name or reading TOML.
+TEST(TelemetryMatrix, PublishesFromALiveInput) {
+  Sim sim = Sim::FromToml(std::string{kAlertsConfig});
+  auto& shooter = sim.add<AlertsNode>("shooter");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  const auto dict = DictionaryMap(telemetry);
+  using Talos::Telemetry::AlertLevel;
+  for (const auto& [name, level] :
+       std::initializer_list<std::pair<std::string_view, AlertLevel>>{
+           {"shooter/status/alert_error_link_lost",
+            Talos::Telemetry::AlertLevel_Error},
+           {"shooter/status/alert_warning_hot",
+            Talos::Telemetry::AlertLevel_Warning},
+           {"shooter/status/alert_info_homed",
+            Talos::Telemetry::AlertLevel_Info},
+           {"shooter/status/routine_index", Talos::Telemetry::AlertLevel_None},
+           {"shooter/status/supply_v", Talos::Telemetry::AlertLevel_None},
+       }) {
+    ASSERT_TRUE(dict.contains(std::string{name})) << name;
+    EXPECT_EQ(static_cast<int>(dict.at(std::string{name})->alert),
+              static_cast<int>(level))
+        << name;
+  }
+
+  EXPECT_EQ(dict.at("shooter/status/routine_index")->labels,
+            (std::vector<std::string>{"preload", "none", "taxi"}));
+
+  shooter.status_.send(schema_test::Alerts{true, false, true, 2, 12.5});
+  sim.step(20ms);
+  const auto raw =
+      DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
+  EXPECT_EQ(raw.at("shooter/status/alert_error_link_lost"), 1u);
+  EXPECT_EQ(raw.at("shooter/status/alert_warning_hot"), 0u);
+  EXPECT_EQ(raw.at("shooter/status/alert_info_homed"), 1u);
+  EXPECT_EQ(raw.at("shooter/status/routine_index"), 2u);
+}
+
+// Test node publishing the alert-shaped schema on its `state` topic.
+class StateAlertsNode {
+ public:
+  explicit StateAlertsNode(talos::Node& node)
+      : state_{node.publish<schema_test::Alerts>("/arm/state")} {}
+
+  talos::Publisher<schema_test::Alerts> state_;
+};
+
+// REQ-OPS-37, REQ-CONTRACT-33: an alert is a `status` topic's field, as
+// session_report reads it; an alert-shaped bool on another role is a plain
+// bool, so the dashboard's alert feed (and its budget count) and the
+// post-match report agree on which channels are alerts.
+TEST(TelemetryMatrix, TagsAlertsOnlyOnStatusTopics) {
+  std::string config{kAlertsConfig};
+  config += R"(
+[subsystems.arm]
+node = "//arm:node"
+)";
+  Sim sim = Sim::FromToml(config);
+  sim.add<AlertsNode>("shooter");
+  sim.add<StateAlertsNode>("arm");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  const auto dict = DictionaryMap(telemetry);
+  ASSERT_TRUE(dict.contains("arm/state/alert_warning_hot"));
+  EXPECT_EQ(static_cast<int>(dict.at("arm/state/alert_warning_hot")->alert),
+            static_cast<int>(Talos::Telemetry::AlertLevel_None));
+  EXPECT_EQ(
+      static_cast<int>(dict.at("shooter/status/alert_warning_hot")->alert),
+      static_cast<int>(Talos::Telemetry::AlertLevel_Warning));
+  // What the `alerts` widget adds to the feed mask and its budget.
+  std::size_t alerts = 0;
+  for (const auto& [name, info] : dict) {
+    if (info->alert != Talos::Telemetry::AlertLevel_None) ++alerts;
+  }
+  EXPECT_EQ(alerts, 3u);
+}
+
+// The channels a dashboard layout names, each from one of its key shapes.
+struct LayoutChannels {
+  std::string routine = "shooter/status/routine_index";
+  std::string phase = "shooter/status/supply_v";  // optional key
+  std::string pose = "pose_estimator/state/pose";
+  std::string series = "pose_estimator/state/localized";  // channels[1]
+  std::string item = "shooter/status/alert_error_link_lost";
+};
+
+std::string DashboardLayoutText(const LayoutChannels& c) {
+  return R"([[widgets]]
+kind = "match"
+at = [0, 0, 4, 2]
+[[widgets]]
+kind = "routine"
+at = [4, 0, 3, 2]
+channel = ")" +
+         c.routine + R"("
+phase = ")" +
+         c.phase +
+         R"("
+[[widgets]]
+kind = "field"
+at = [7, 0, 5, 4]
+pose = ")" +
+         c.pose +
+         R"("
+valid = "pose_estimator/state/valid"
+[[widgets]]
+kind = "graph"
+at = [0, 2, 4, 2]
+channels = ["shooter/status/supply_v", ")" +
+         c.series + R"("]
+[[widgets]]
+kind = "checks"
+at = [0, 4, 4, 2]
+items = [{ label = "Link", channel = ")" +
+         c.item + R"(", equals = false }]
+[[widgets]]
+kind = "alerts"
+at = [4, 2, 3, 2]
+)";
+}
+
+// REQ-OPS-38: a [[subsystem.labels]] entry that cannot label an integer
+// channel with a string array refuses construction, naming its key, rather
+// than leaving a routine shown as a bare number.
+// REQ-OPS-39, REQ-OPS-35: so does a dashboard layout ([studio] dashboard)
+// the drive feed could not fill, naming the file and the key: a channel
+// absent from this dictionary, whichever key named it (optional keys
+// too), and a feed over its budget once the dictionary's alert channels,
+// which an `alerts` widget adds, are counted.
+TEST(TelemetryMatrix, BadParameterFailsConstruction) {
+  std::string many = "[";
+  for (std::size_t i = 0; i <= telemetry_wire::kMaxEnumLabels; ++i) {
+    many += (i == 0 ? "\"r" : ", \"r") + std::to_string(i) + "\"";
+  }
+  many += "]";
+  struct Case {
+    const char* what;
+    std::string labels;  // the [[subsystems.telemetry.labels]] body
+    const char* key;     // the key the error names
+  };
+  const auto entry = [](std::string_view channel, std::string_view from) {
+    return "channel = \"" + std::string{channel} + "\"\nfrom = \"" +
+           std::string{from} + "\"\n";
+  };
+  const std::string kIndex = "shooter/status/routine_index";
+  for (const auto& [what, labels, key] : std::vector<Case>{
+           {"unknown channel",
+            entry("shooter/status/nope", "autonomous.routines"),
+            "labels[0].channel"},
+           {"double channel",
+            entry("shooter/status/supply_v", "autonomous.routines"),
+            "labels[0].channel"},
+           {"bool channel",
+            entry("shooter/status/alert_warning_hot", "autonomous.routines"),
+            "labels[0].channel"},
+           {"missing subsystem", entry(kIndex, "ghost.routines"),
+            "labels[0].from"},
+           {"missing key", entry(kIndex, "autonomous.missing"),
+            "labels[0].from"},
+           {"number array", entry(kIndex, "autonomous.speeds"),
+            "labels[0].from"},
+           {"not an array", entry(kIndex, "autonomous.name_text"),
+            "labels[0].from"},
+           {"no key", entry(kIndex, "autonomous"), "labels[0].from"},
+           {"too many labels", entry(kIndex, "autonomous.many"),
+            "labels[0].from"},
+           {"missing from", "channel = \"" + kIndex + "\"\n", "labels[0].from"},
+           {"missing channel", "from = \"autonomous.routines\"\n",
+            "labels[0].channel"},
+       }) {
+    SCOPED_TRACE(what);
+    const std::string config = R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+[subsystems.shooter]
+node = "//shooter:node"
+[subsystems.shooter.motors.m]
+can_id = 1
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+speeds = [1.0, 2.0]
+name_text = "preload"
+many = )" + many + R"(
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+)" + labels;
+    Sim sim = Sim::FromToml(config);
+    sim.add<AlertsNode>("shooter");
+    try {
+      sim.add<Telemetry>("telemetry");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string_view{error.what()}.find(key),
+                std::string_view::npos)
+          << error.what();
+    }
+  }
+
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::string file = std::string{tmp} + "/dashboard.toml";
+  // Writes `layout` to `file` and constructs every node of a config that
+  // names it, with `telemetry` added to [subsystems.telemetry].
+  const auto construct = [&file](const std::string& layout,
+                                 const std::string& telemetry) {
+    std::ofstream(file) << layout;
+    Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+dashboard = ")" + file + R"("
+[subsystems.shooter]
+node = "//shooter:node"
+[subsystems.shooter.motors.m]
+can_id = 1
+[subsystems.hw]
+node = "//hw:node"
+[subsystems.pose_estimator]
+node = "//pose_estimator:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)" + telemetry);
+    sim.add<AlertsNode>("shooter");
+    sim.add<HardwareNode>("hw");
+    sim.add<EstimatorNode>("pose_estimator");
+    sim.add<Telemetry>("telemetry");
+  };
+  // Every key shape naming a channel the dictionary holds constructs.
+  EXPECT_NO_THROW(construct(DashboardLayoutText({}), ""));
+
+  struct LayoutCase {
+    const char* what;
+    std::string layout;
+    std::string telemetry;  // keys of [subsystems.telemetry]
+    const char* key;        // the key the error names
+  };
+  const auto with = [](auto change) {
+    LayoutChannels channels;
+    change(channels);
+    return DashboardLayoutText(channels);
+  };
+  // One number channel at 10 Hz fits 12,532 B/s exactly (dashboard_layout
+  // test); the three alert channels an `alerts` widget adds do not.
+  const std::string over_budget = R"([dashboard]
+update_hz = 10
+budget_bytes_per_s = 12532
+[[widgets]]
+kind = "number"
+at = [0, 0, 1, 1]
+channel = "shooter/status/supply_v"
+[[widgets]]
+kind = "alerts"
+at = [1, 0, 1, 1]
+)";
+  for (const auto& [what, layout, telemetry, key] : std::vector<LayoutCase>{
+           {"absent channel",
+            with([](auto& c) { c.routine = "shooter/status/nope"; }), "",
+            "widgets[1].channel"},
+           {"absent optional channel",
+            with([](auto& c) { c.phase = "autonomous/state/phase"; }), "",
+            "widgets[1].phase"},
+           {"absent pose fields",
+            with([](auto& c) { c.pose = "pose_estimator/state/nope"; }), "",
+            "widgets[2].pose"},
+           {"absent graph series",
+            with([](auto& c) { c.series = "shooter/status/nope"; }), "",
+            "widgets[3].channels[1]"},
+           {"absent check channel",
+            with([](auto& c) { c.item = "shooter/status/nope"; }), "",
+            "widgets[4].items[0].channel"},
+           {"excluded fixed channel", DashboardLayoutText({}),
+            "exclude = [\"hw/state/driver_station/alliance\"]\n",
+            "widgets[0].kind"},
+           {"over budget with alert channels", over_budget, "",
+            "[dashboard].budget_bytes_per_s"},
+       }) {
+    SCOPED_TRACE(what);
+    try {
+      construct(layout, telemetry);
+      ADD_FAILURE() << "constructed";
+    } catch (const DashboardLayoutError& error) {
+      const std::string_view message = error.what();
+      EXPECT_NE(message.find(file), std::string_view::npos) << message;
+      EXPECT_NE(message.find(key), std::string_view::npos) << message;
+    }
+  }
+}
+
+// REQ-OPS-37: an alert whose topic went stale is absent, neither a frozen
+// "active" nor a "clear", while the node keeps publishing its other inputs.
+TEST(TelemetryMatrix, StaleInputClearsValidity) {
+  Sim sim = Sim::FromToml(std::string{kAlertsConfig});
+  auto& shooter = sim.add<AlertsNode>("shooter");
+  auto& shapes = sim.add<ShapesNode>("demo");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  shooter.status_.send(schema_test::Alerts{true, true, false, 0, 12.0});
+  shapes.arrays_.send(schema_test::Arrays{});
+  sim.step(20ms);
+  auto raw = DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
+  ASSERT_EQ(raw.at("shooter/status/alert_error_link_lost"), 1u);
+  ASSERT_EQ(raw.at("shooter/status/alert_info_homed"), 0u);
+
+  // Past stale_timeout_us (50 ms) with the demo topic still fresh.
+  for (int i = 0; i < 8; ++i) {
+    shapes.arrays_.send(schema_test::Arrays{});
+    sim.step(10ms);
+  }
+  const auto frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  ASSERT_TRUE(frame->keyframe());
+  raw = DecodeRaw(telemetry, frame.get());
+  EXPECT_TRUE(raw.contains("demo/status/samples_m/0"));
+  for (const auto* name : {"shooter/status/alert_error_link_lost",
+                           "shooter/status/alert_warning_hot",
+                           "shooter/status/alert_info_homed"}) {
+    EXPECT_FALSE(raw.contains(name)) << name;
+  }
+}
+
+// Sources whose every topic changes on each of their ticks: nested structs,
+// arrays and enums, a pose, a Driver Station packet, and enough topics that
+// one telemetry tick takes several value pages.
+class LiveSources {
+ public:
+  static constexpr int kPagingTopics = 300;
+
+  explicit LiveSources(talos::Node& node)
+      : node_{node},
+        mixed_{node.publish<schema_test::Mixed>("/demo/state")},
+        arrays_{node.publish<schema_test::Arrays>("/demo/status")},
+        alerts_{node.publish<schema_test::Alerts>("/demo/status/alerts")},
+        pose_{node.publish<::geometry::PoseEstimate>("/pose_estimator/state")},
+        driver_station_{
+            node.publish<hardware::Packet>("/hw/state/driver_station")} {
+    for (int i = 0; i < kPagingTopics; ++i) {
+      paging_.push_back(
+          node.publish<schema_test::Inner>("/demo/state/" + std::to_string(i)));
+    }
+  }
+
+  void update() {
+    const auto tick = static_cast<double>(node_.tick());
+    mixed_.send(schema_test::Mixed{
+        node_.tick() % 2 == 0, tick, schema_test::Level::TOP,
+        static_cast<std::uint32_t>(node_.tick()),
+        schema_test::Inner{schema_test::Mode::HIGH, static_cast<float>(tick)},
+        0.5f});
+    arrays_.send(schema_test::Arrays{});
+    const bool odd = node_.tick() % 2 != 0;
+    alerts_.send(schema_test::Alerts{
+        odd, !odd, odd, static_cast<std::uint8_t>(node_.tick()), tick});
+    pose_.send(::geometry::PoseEstimate{0, ::geometry::Pose2d{tick, 1.0, 0.5},
+                                        ::geometry::Twist2d{0.0, 0.0, 0.0},
+                                        true, true, 0, 0});
+    driver_station::DriverStationData data{};
+    data.fms.flags = driver_station::kDsAttached | driver_station::kEnabled |
+                     driver_station::kTeleop;
+    data.fms.match_time_s = static_cast<float>(tick);
+    hardware::Packet packet{};
+    packet.size =
+        static_cast<std::uint32_t>(driver_station::Encode(data, packet.data));
+    driver_station_.send(packet);
+    for (auto& publisher : paging_) {
+      publisher.send(
+          schema_test::Inner{schema_test::Mode::LOW, static_cast<float>(tick)});
+    }
+  }
+
+ private:
+  talos::Node& node_;
+  talos::Publisher<schema_test::Mixed> mixed_;
+  talos::Publisher<schema_test::Arrays> arrays_;
+  talos::Publisher<schema_test::Alerts> alerts_;
+  talos::Publisher<::geometry::PoseEstimate> pose_;
+  talos::Publisher<hardware::Packet> driver_station_;
+  std::vector<talos::Publisher<schema_test::Inner>> paging_;
+};
+
+// RULES.md 3: with every source changing each tick (alerts toggling among
+// them), the producer's reads, value pages and its dictionary resend (every
+// 100th tick, alert levels and configured labels included) allocate nothing.
+TEST(TelemetryMatrix, UpdateDoesNotAllocate) {
+  if (const auto why = talos::testing::AllocationProbe::Unsupported();
+      !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+pose_topic = "/pose_estimator/state"
+[subsystems.demo]
+node = "//demo:node"
+[subsystems.demo.motors.m]
+can_id = 1
+[subsystems.autonomous]
+node = "//autonomous:node"
+routines = ["preload", "none", "taxi"]
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+[[subsystems.telemetry.labels]]
+channel = "demo/status/alerts/routine_index"
+from = "autonomous.routines"
+)");
+  sim.add<LiveSources>("demo");
+  const auto& telemetry = sim.add<Telemetry>("telemetry");
+  ASSERT_GE(MeasurePages(telemetry.dictionary()).value_pages, 2u);
+  ASSERT_EQ(DictionaryMap(telemetry)
+                .at("demo/status/alerts/routine_index")
+                ->labels.size(),
+            3u);
+  // Warm up through the dictionary resend at sequence 100: the first send,
+  // at sequence 0, omits the zero sequence field, so its pages are smaller.
+  sim.step(1030ms);
+  const auto before = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(before, nullptr);
+  const std::uint64_t first_sequence = before->sequence_id();
+
+  talos::testing::AllocationProbe probe;
+  probe.start();
+  // Past the next dictionary resend, at sequence 200.
+  sim.step(1100ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+
+  const auto after = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(after, nullptr);
+  EXPECT_GE(after->sequence_id(), first_sequence + 105);
+  EXPECT_GE(after->page_count(), 2u);
+}
+
+// The viewer stream outlives its viewers: a reader that registered and then
+// stopped reading (a stalled Studio bridge) is lapped, not obeyed. Under
+// drop_newest the writer refused every frame past the ring, for every reader.
+// testing::Sim keeps byte topics in memory without a ring, so the topic is
+// exercised on RTMS directly, as Node::publish_bytes opens it without
+// drop_newest.
+TEST(TelemetryTopic, AStoppedReaderDoesNotStopPublication) {
+  ASSERT_FALSE(kTopicOptions.drop_newest);
+  const std::string topic = "/test/telemetry/p" + std::to_string(::getpid());
+  RTMSQueue writer{topic,
+                   telemetry_wire::slot_bytes,
+                   kMessageAlignment,
+                   schema::Bytes(),
+                   kTopicOptions.slots,
+                   {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                    .read_mode = ReadMode::SEQUENCE,
+                    .publisher = true}};
+  RTMSQueue stalled{topic,
+                    telemetry_wire::slot_bytes,
+                    kMessageAlignment,
+                    schema::Bytes(),
+                    telemetry_wire::slot_count,
+                    {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                     .read_mode = ReadMode::SEQUENCE}};
+  const auto reader = stalled.register_reader();
+  ASSERT_TRUE(reader.has_value());
+
+  const std::uint64_t frames = 3 * telemetry_wire::slot_count;
+  std::vector<std::byte> frame(64, std::byte{1});
+  for (std::uint64_t i = 0; i < frames; ++i) {
+    EXPECT_EQ(writer.write(frame).result, WriteResult::SUCCESS) << i;
+  }
+
+  // Resuming, the reader gets the oldest intact frame and the count it missed.
+  std::vector<std::byte> slot(telemetry_wire::slot_bytes);
+  MessageInfo info{};
+  ASSERT_EQ(stalled.read_next(*reader, slot, info), ReadResult::OK);
+  EXPECT_EQ(info.dropped, frames - (telemetry_wire::slot_count - 1));
+  stalled.release_reader(*reader);
 }
 
 }  // namespace

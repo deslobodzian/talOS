@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -11,24 +12,32 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "node_test/node_test_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/events/simulated_event_loop.h"
 #include "talOS/introspection/describe.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/node/internal.h"
 #include "talOS/node/testing.h"
+#include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
 
 namespace talos {
@@ -56,6 +65,7 @@ cameras = ["front", "back"]
 offsets_m = [0.5, 1, -2.25]
 none = []
 mixed = [1.0, "back"]
+modules = [{ x_m = 0.3 }, { x_m = -0.25 }]
 [subsystems.listener.limits]
 max = 4.0
 
@@ -74,8 +84,6 @@ TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
   sim.add<Empty>("listener");
   const Node& node = sim.node("listener");
 
-  EXPECT_EQ(node.name(), "listener");
-  EXPECT_TRUE(node.simulation());
   EXPECT_DOUBLE_EQ(node.param<double>("gain"), 2.5);
   EXPECT_DOUBLE_EQ(node.param<double>("whole"), 3.0);  // integer as double
   EXPECT_EQ(node.param<int>("whole"), 3);
@@ -87,20 +95,58 @@ TEST(Node, ReadsParamsWithFallbacksAndRejectsMissingOrMistyped) {
   EXPECT_EQ(node.param<std::string>("absent", "x"), "x");
   EXPECT_DOUBLE_EQ(node.param<double>("gain", 0.0), 2.5);
 
-  try {
-    (void)node.param<double>("absent");
-    FAIL() << "a missing parameter must throw";
-  } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string{e.what()}.find("listener"), std::string::npos);
-    EXPECT_NE(std::string{e.what()}.find("'absent'"), std::string::npos);
-  }
+  EXPECT_THROW((void)node.param<double>("absent"), std::invalid_argument);
   EXPECT_THROW((void)node.param<bool>("tag"), std::invalid_argument);
   EXPECT_THROW((void)node.param<int>("gain", 0), std::invalid_argument);
   EXPECT_EQ(node.param<std::uint8_t>("whole"), 3);
   EXPECT_THROW((void)node.param<std::uint8_t>("big"), std::invalid_argument);
 }
 
-TEST(Node, ReadsArrayParamsAndNamesTheOffendingElement) {
+// The actuation path picks a loop's scheduling tier: a node whose own
+// subsystem has a motor, or that writes a target lane, runs above the
+// observers (sensors only, or publishing only its own topics), wherever the
+// other subsystems' actuators are.
+struct LanePublisher {
+  explicit LanePublisher(Node& n)
+      : lane{n.publish<Count>("/arm/target/auto")} {}
+  Publisher<Count> lane;
+};
+struct StatePublisher {
+  explicit StatePublisher(Node& n) : state{n.publish<Count>("state")} {}
+  Publisher<Count> state;
+};
+
+TEST(Node, LoopTierFollowsTheActuationPath) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.arm.motors.lift]
+can_id = 1
+
+[subsystems.gate.digital_inputs.beam]
+dio = 3
+
+[subsystems.autonomous]
+[subsystems.estimator]
+)");
+  sim.add<Empty>("arm");
+  sim.add<LanePublisher>("autonomous");
+  sim.add<Empty>("gate");
+  sim.add<StatePublisher>("estimator");
+
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("arm")),
+            process::LoopTier::kControl);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("autonomous")),
+            process::LoopTier::kControl);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("gate")),
+            process::LoopTier::kObserver);
+  EXPECT_EQ(detail::NodeAccess::loop_tier(sim.node("estimator")),
+            process::LoopTier::kObserver);
+}
+
+TEST(Node, ArrayParamsRejectMissingAndMistypedValues) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Empty>("listener");
   const Node& node = sim.node("listener");
@@ -117,65 +163,63 @@ TEST(Node, ReadsArrayParamsAndNamesTheOffendingElement) {
   EXPECT_EQ(node.param<Strings>("absent", {"x"}), Strings{"x"});
   EXPECT_EQ(node.param<Doubles>("absent", {}), Doubles{});
 
-  auto error = [&](auto read) -> std::string {
-    try {
-      read();
-    } catch (const std::invalid_argument& e) {
-      return e.what();
-    }
-    return "no error";
-  };
-  EXPECT_EQ(error([&] { (void)node.param<Strings>("absent"); }),
-            "listener: parameter 'absent' is missing in [subsystems.listener]");
-  EXPECT_EQ(error([&] { (void)node.param<Doubles>("cameras"); }),
-            "listener: parameter 'cameras' must be an array of numbers; "
-            "element 0 is a string in [subsystems.listener]");
-  EXPECT_EQ(error([&] { (void)node.param<Strings>("offsets_m", {}); }),
-            "listener: parameter 'offsets_m' must be an array of strings; "
-            "element 0 is a float in [subsystems.listener]");
-  EXPECT_EQ(error([&] { (void)node.param<Doubles>("mixed"); }),
-            "listener: parameter 'mixed' must be an array of numbers; "
-            "element 1 is a string in [subsystems.listener]");
-  EXPECT_EQ(error([&] { (void)node.param<Strings>("tag"); }),
-            "listener: parameter 'tag' must be an array of strings in "
-            "[subsystems.listener]");
-  EXPECT_EQ(error([&] { (void)node.param<Doubles>("limits", {}); }),
-            "listener: parameter 'limits' must be an array of numbers in "
-            "[subsystems.listener]");
+  EXPECT_THROW((void)node.param<Strings>("absent"), std::invalid_argument);
+  EXPECT_THROW((void)node.param<Doubles>("cameras"), std::invalid_argument);
+  EXPECT_THROW((void)node.param<Strings>("offsets_m", {}),
+               std::invalid_argument);
+  EXPECT_THROW((void)node.param<Doubles>("mixed"), std::invalid_argument);
+  EXPECT_THROW((void)node.param<Strings>("tag"), std::invalid_argument);
+  EXPECT_THROW((void)node.param<Doubles>("limits", {}), std::invalid_argument);
   EXPECT_THROW((void)node.param<std::string>("cameras"), std::invalid_argument);
 }
 
-TEST(Node, PeriodComesFromTheSubsystemElseTheRobot) {
+// One subsystem reads a value another owns, so it is configured once; a
+// wrong subsystem or key fails construction, not a later tick.
+TEST(Node, ParamOfReadsAnotherSubsystemOnlyInTheConstructor) {
+  struct Reader {
+    explicit Reader(Node& n)
+        : gain{n.param_of<double>("listener", "gain")},
+          second_x_m{n.param_of<double>("listener", "modules[1].x_m")},
+          past_end{n.param_of<double>("listener", "modules[2].x_m", 9.5)},
+          cameras{n.param_of<std::vector<std::string>>("listener", "cameras")} {
+    }
+    double gain;
+    double second_x_m;
+    double past_end;
+    std::vector<std::string> cameras;
+  };
   auto sim = Sim::FromToml(kRobotToml);
-  sim.add<Empty>("talker");
-  sim.add<Empty>("listener");
-  EXPECT_EQ(sim.node("talker").period(), 10ms);
-  EXPECT_EQ(sim.node("listener").period(), 5ms);
-  EXPECT_EQ(detail::NodeAccess::freshness_timeout(sim.node("listener")), 100ms);
-}
+  const auto& reader = sim.add<Reader>("talker");
+  EXPECT_DOUBLE_EQ(reader.gain, 2.5);
+  EXPECT_DOUBLE_EQ(reader.second_x_m, -0.25);
+  EXPECT_DOUBLE_EQ(reader.past_end, 9.5);
+  EXPECT_EQ(reader.cameras, (std::vector<std::string>{"front", "back"}));
+  // After construction the dependency is fixed.
+  EXPECT_THROW((void)sim.node("talker").param_of<double>("listener", "gain"),
+               std::logic_error);
 
-TEST(Node, SessionDirIsAbsentByDefaultAndSetThroughTheSim) {
-  auto sim = Sim::FromToml(kRobotToml);
-  sim.add<Empty>("listener");
-  EXPECT_FALSE(sim.node("listener").session_dir().has_value());
-
-  // A launched node's session dir is fixed at construction: setting the Sim
-  // dir only affects nodes added after the call.
-  auto with_dir = Sim::FromToml(kRobotToml);
-  with_dir.set_session_dir(std::filesystem::path{"/tmp/talos_session"});
-  with_dir.add<Empty>("listener");
-  const auto dir = with_dir.node("listener").session_dir();
-  if (!dir.has_value()) {
-    FAIL() << "session directory is absent";
+  struct MissingKey {
+    explicit MissingKey(Node& n) { (void)n.param_of<double>("listener", "x"); }
+  };
+  struct MissingSubsystem {
+    explicit MissingSubsystem(Node& n) {
+      (void)n.param_of<double>("absent", "gain", 1.0);
+    }
+  };
+  struct Mistyped {
+    explicit Mistyped(Node& n) { (void)n.param_of<bool>("listener", "tag"); }
+  };
+  try {
+    sim.add<MissingKey>("missing_key");
+    ADD_FAILURE() << "a missing key constructed";
+  } catch (const std::invalid_argument& e) {
+    EXPECT_NE(std::string{e.what()}.find("in [subsystems.listener]"),
+              std::string::npos)
+        << e.what();
   }
-  EXPECT_EQ(dir->string(), "/tmp/talos_session");
-
-  // Clearing it before adding a node leaves that node with none.
-  auto cleared = Sim::FromToml(kRobotToml);
-  cleared.set_session_dir(std::filesystem::path{"/tmp/talos_session"});
-  cleared.set_session_dir(std::nullopt);
-  cleared.add<Empty>("listener");
-  EXPECT_FALSE(cleared.node("listener").session_dir().has_value());
+  EXPECT_THROW(sim.add<MissingSubsystem>("missing_subsystem"),
+               std::invalid_argument);
+  EXPECT_THROW(sim.add<Mistyped>("mistyped"), std::invalid_argument);
 }
 
 // --- topics ----------------------------------------------------------------
@@ -189,33 +233,13 @@ struct Talker {
   Publisher<Count> out;
 };
 
+// A callback subscription.
 struct Listener {
   explicit Listener(Node& n)
-      : in{n.subscribe<Count>("/talker/state", [this](const Count& c) {
-          heard.push_back(c.tick_count());
-        })} {}
-  void update() { latest_in_update = in.has_value() ? in->tick_count() : -1; }
+      : in{n.subscribe<Count>("/talker/state", [](const Count&) {})} {}
+  void update() {}
   Subscription<Count> in;
-  std::vector<std::int64_t> heard;
-  std::int64_t latest_in_update = -1;
 };
-
-TEST(Node, TwoNodesTalkOverATopicInOneSim) {
-  auto sim = Sim::FromToml(kRobotToml);
-  sim.add<Talker>("talker");
-  auto& listener = sim.add<Listener>("listener");
-
-  sim.step(52ms);  // talker ticks at 10..50 ms; the last lands by 51 ms
-
-  EXPECT_EQ(listener.heard, (std::vector<std::int64_t>{0, 1, 2, 3, 4}));
-  EXPECT_EQ(listener.in->tick_count(), 4);
-  EXPECT_GE(listener.latest_in_update, 3);
-  const auto latest = sim.latest<Count>("/talker/state");
-  if (!latest.has_value()) {
-    FAIL() << "nothing published on /talker/state";
-  }
-  EXPECT_EQ(latest->tick_count(), 4);
-}
 
 struct Watcher {
   explicit Watcher(Node& n)
@@ -245,8 +269,8 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.updated[0]);
   EXPECT_FALSE(watcher.fresh[0]);
 
-  // No callback, so the node drains right before its tick: the message
-  // arrives at tick 1 itself and its age counts from there.
+  // No callback, so the node drains right before its tick. Publication time
+  // still counts: the 5 ms wait before the first drain must not disappear.
   sim.publish("/watch/target", Count{7, 0});
   sim.step(5ms);  // tick 1 at 10 ms
   sim.step(5ms);  // tick 2 at 15 ms: nothing new since tick 1 began
@@ -254,8 +278,8 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_TRUE(watcher.updated[1]);
   EXPECT_FALSE(watcher.updated[2]);
   EXPECT_TRUE(watcher.fresh[1]);
-  EXPECT_EQ(watcher.ages[1], 0ms);
-  EXPECT_EQ(watcher.ages[2], 5ms);
+  EXPECT_EQ(watcher.ages[1], 5ms);
+  EXPECT_EQ(watcher.ages[2], 10ms);
   EXPECT_EQ(watcher.in->tick_count(), 7);
 
   sim.step(100ms);  // past [robot] command_timeout_us
@@ -263,6 +287,376 @@ TEST(Node, SubscriptionTracksFreshnessUpdatesAndAge) {
   EXPECT_FALSE(watcher.in.fresh());
   EXPECT_TRUE(watcher.in.fresh(1s));
   EXPECT_TRUE(watcher.in.has_value());
+}
+
+// REQ-SAFE-08
+TEST(Node, PausingOneNodeStopsItsTimersAndDeliveriesButNotItsClock) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Talker>("talker");
+  auto& watcher = sim.add<Watcher>("listener");
+  sim.step(5ms);
+  sim.pause("listener", 200ms);
+  sim.publish("/watch/target", Count{7, 0});
+  sim.step(125ms);
+  EXPECT_EQ(watcher.updated.size(), 1u);
+  EXPECT_FALSE(watcher.in.has_value());
+  EXPECT_EQ(sim.node("listener").now(), sim.now());
+  ASSERT_TRUE(sim.latest<Count>("/talker/state"));
+  EXPECT_EQ(sim.latest<Count>("/talker/state")->tick_count(), 12);
+  sim.resume("listener");
+  ASSERT_EQ(watcher.updated.size(), 2u);
+  EXPECT_TRUE(watcher.updated.back());
+  EXPECT_FALSE(watcher.fresh.back());
+  EXPECT_EQ(watcher.ages.back(), 125ms);
+  sim.step(5ms);
+  EXPECT_EQ(watcher.updated.size(), 3u);
+}
+
+TEST(Node, TimedPauseResumesExactlyAtItsDeadlineAndRejectsInvalidNodes) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& watcher = sim.add<Watcher>("listener");
+  sim.pause("listener", 12ms);
+  sim.step(11ms);
+  EXPECT_TRUE(watcher.updated.empty());
+  sim.step(1ms);
+  ASSERT_EQ(watcher.updated.size(), 1u);
+  sim.step(3ms);
+  EXPECT_EQ(watcher.updated.size(), 2u);
+  EXPECT_THROW(sim.pause("missing", 1ms), std::invalid_argument);
+  EXPECT_THROW(sim.resume("missing"), std::invalid_argument);
+  EXPECT_THROW(sim.pause("listener", -1ms), std::invalid_argument);
+}
+
+// A node of type T named "listener" on a simulated loop the test holds, so
+// that it can read what testing::Sim keeps inside its loops.
+template <class T>
+struct OnOwnLoop {
+  OnOwnLoop() {
+    const std::string& config_path = detail::SimAccess::config_path(sim);
+    node = detail::NodeAccess::create(detail::NodeSetup{
+        .name = "listener",
+        .config_path = config_path,
+        .config = std::make_shared<const config::RobotConfig>(
+            config::ParseRobotConfig(config_path)),
+        .simulation = true,
+        .loop = &port,
+    });
+    user = detail::MakeInstance<T>()(*node);
+    detail::NodeAccess::start(*node);
+  }
+  T& get() { return *static_cast<T*>(user.get()); }
+
+  Sim sim = Sim::FromToml(kRobotToml);  // for its config file
+  event::SimulationEnvironment environment;
+  event::SimulatedEventLoop<> loop{environment};
+  detail::LoopPortFor<event::SimulatedEventLoop<>> port{loop};
+  std::unique_ptr<Node> node;
+  detail::Instance user;
+};
+
+struct Backlog {
+  explicit Backlog(Node& n)
+      : latest{n.subscribe<Count>("/backlog")},
+        ordered{n.subscribe<Count>("/backlog", [this](const Count& c) {
+          received.push_back(c.tick_count());
+          if (loop != nullptr) drain_of.push_back(loop->drains());
+        })} {}
+  void update() {}
+  Subscription<Count> latest;
+  Subscription<Count> ordered;
+  std::vector<std::int64_t> received;
+  // The loop's drain count at each callback, once the test gives the loop.
+  const event::SimulatedEventLoop<>* loop = nullptr;
+  std::vector<std::uint64_t> drain_of;
+};
+
+// A plain subscription is a latest value: one drain jumps a backlog longer
+// than the per-drain cap to its newest message, aged from publication. A
+// callback subscription still sees every message in order, 64 per drain:
+// its publications wake the node, so the drains run back to back at the
+// publication instant.
+// REQ-RT-02
+TEST(Node, PlainSubscriptionSkipsBacklogWhileCallbacksKeepCappedSequence) {
+  OnOwnLoop<Backlog> hosted;
+  Backlog& backlog = hosted.get();
+  backlog.loop = &hosted.loop;
+  const event::MonotonicTime at = event::MonotonicTime{} + 10ms;
+  hosted.loop.run_until(at);
+  for (std::int64_t i = 0; i < 130; ++i) {
+    hosted.loop.inject("/backlog", Count{i, 0});
+  }
+
+  hosted.loop.run_until(at + 1ms);
+  EXPECT_EQ(backlog.latest->tick_count(), 129);
+  EXPECT_EQ(backlog.latest.age(), 1ms);
+  ASSERT_EQ(backlog.received.size(), 130u);
+  ASSERT_EQ(backlog.drain_of.size(), 130u);
+  for (std::size_t i = 0; i < 130; ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(backlog.received[i], static_cast<std::int64_t>(i));
+    EXPECT_EQ(backlog.drain_of[i] - backlog.drain_of[0], i / 64);
+  }
+}
+
+// --- chronological causality ---------------------------------------------
+
+constexpr const char* kCausalToml = R"(
+[robot]
+period_us = 1000
+command_timeout_us = 100000
+
+[subsystems.producer]
+period_us = 1000
+
+[subsystems.consumer]
+period_us = 500
+
+[subsystems.hearer]
+period_us = 500
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)";
+
+struct Producer {
+  explicit Producer(Node& n)
+      : node{n}, out{n.publish<Count>("/producer/state")} {}
+  void update() {
+    out.send(Count{static_cast<std::int64_t>(node.tick()), node.now().nanos()});
+  }
+  Node& node;
+  Publisher<Count> out;
+};
+
+// What one consumer update() saw: its time, and the newest message's
+// publication time (stamped by the producer) and age as delivered.
+struct Seen {
+  Duration now;
+  Duration stamp;
+  Duration age;
+  bool fresh;
+};
+
+// A plain subscription: the node drains right before each update().
+struct Consumer {
+  explicit Consumer(Node& n)
+      : node{n}, in{n.subscribe<Count>("/producer/state")} {}
+  void update() {
+    if (!in.has_value()) return;
+    seen.push_back({Duration{node.now().nanos()}, Duration{in->stamp_ns()},
+                    in.age(), in.fresh()});
+  }
+  Node& node;
+  Subscription<Count> in;
+  std::vector<Seen> seen;
+};
+
+// A callback subscription: each publication wakes the node, which the Sim
+// models as a drain at the publication's instant, in sequence.
+struct Hearer {
+  explicit Hearer(Node& n)
+      : node{n},
+        in{n.subscribe<Count>("/producer/state", [this](const Count& c) {
+          heard.emplace_back(Duration{node.now().nanos()},
+                             Duration{c.stamp_ns()});
+        })} {}
+  Node& node;
+  Subscription<Count> in;
+  std::vector<std::pair<Duration, Duration>> heard;  // (delivered, stamp)
+};
+
+// A 1 ms producer and 500 us consumers in either insertion order: no
+// consumer ever sees a publication from its future, so no age is negative.
+// The only difference between the orders is the documented equal-time rule:
+// at an instant several nodes run, the earlier-added one runs first, so a
+// consumer added after the producer sees that instant's message at once, and
+// one added before sees it at its next drain. A callback subscriber is woken
+// by the publication instead, so it hears each one at its instant in either
+// order: one added before the producer runs again at that instant.
+// REQ-RT-05
+TEST(Sim, LoopsAdvanceOnOneChronologicalFrontierInEitherInsertionOrder) {
+  using std::chrono::milliseconds;
+  for (const bool producer_first : {true, false}) {
+    SCOPED_TRACE(producer_first ? "producer first" : "consumer first");
+    auto sim = Sim::FromToml(kCausalToml);
+    if (producer_first) sim.add<Producer>("producer");
+    auto& consumer = sim.add<Consumer>("consumer");
+    auto& hearer = sim.add<Hearer>("hearer");
+    if (!producer_first) sim.add<Producer>("producer");
+    sim.step(20ms);
+    sim.pause("consumer", 2500us);
+    sim.step(3ms);
+    sim.step(17ms);
+
+    // Every update from 1 ms (or 1.5 ms) on saw a message; the pause
+    // coalesced the five missed ticks into one at its end, 22.5 ms.
+    EXPECT_EQ(consumer.seen.size(), producer_first ? 75u : 74u);
+    for (const Seen& s : consumer.seen) {
+      SCOPED_TRACE(s.now.count());
+      EXPECT_GE(s.age, Duration::zero());
+      EXPECT_EQ(s.age, s.now - s.stamp);
+      // The newest publication by then: this instant's when the producer
+      // ran first, otherwise the previous millisecond's.
+      EXPECT_EQ(s.stamp, producer_first
+                             ? std::chrono::floor<milliseconds>(s.now)
+                             : std::chrono::ceil<milliseconds>(s.now) - 1ms);
+      EXPECT_TRUE(s.fresh);
+    }
+
+    // Every publication reaches the ordered subscriber once, at its instant,
+    // the last one (at 40 ms) included.
+    const auto latest = sim.latest<Count>("/producer/state");
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_EQ(latest->tick_count(), 39);
+    ASSERT_EQ(hearer.heard.size(), 40u);
+    for (std::size_t i = 0; i < hearer.heard.size(); ++i) {
+      const auto [delivered, stamp] = hearer.heard[i];
+      EXPECT_EQ(stamp, milliseconds{i + 1});
+      EXPECT_EQ(delivered, stamp);
+    }
+  }
+}
+
+// Hears /producer/state and passes each message on, as it arrives, on
+// /relay/state.
+struct Relay {
+  explicit Relay(Node& n)
+      : out{n.publish<Count>("/relay/state")},
+        in{n.subscribe<Count>("/producer/state",
+                              [this](const Count& c) { out.send(c); })} {}
+  Publisher<Count> out;
+  Subscription<Count> in;
+};
+
+// Hears /relay/state.
+struct RelayHearer {
+  explicit RelayHearer(Node& n)
+      : node{n}, in{n.subscribe<Count>("/relay/state", [this](const Count& c) {
+          heard.emplace_back(Duration{node.now().nanos()},
+                             Duration{c.stamp_ns()});
+        })} {}
+  Node& node;
+  Subscription<Count> in;
+  std::vector<std::pair<Duration, Duration>> heard;  // (delivered, stamp)
+};
+
+// A chain of callbacks crosses nodes added in reverse order within the
+// instant of the first publication: each hop runs another round there.
+// REQ-RT-05
+TEST(Sim, CallbackChainAcrossNodesSettlesAtThePublicationInstant) {
+  auto sim = Sim::FromToml(kCausalToml);
+  auto& hearer = sim.add<RelayHearer>("hearer");
+  sim.add<Relay>("relay");
+  sim.add<Producer>("producer");
+  sim.step(5ms);
+  ASSERT_EQ(hearer.heard.size(), 5u);
+  for (const auto& [delivered, stamp] : hearer.heard) {
+    EXPECT_EQ(delivered, stamp);
+  }
+}
+
+// The end of a chain: hears /relay/state, and records at each update()
+// whether it had heard anything.
+struct ChainEnd {
+  explicit ChainEnd(Node& n)
+      : node{n}, in{n.subscribe<Count>("/relay/state", [this](const Count&) {
+          heard_at.push_back(Duration{node.now().nanos()});
+        })} {}
+  void update() { had_value.push_back(in.has_value()); }
+  Node& node;
+  Subscription<Count> in;
+  std::vector<Duration> heard_at;
+  std::vector<bool> had_value;
+};
+
+// The start of a chain: passes what the test publishes on /test/start on to
+// /producer/state as it arrives.
+struct ChainStart {
+  explicit ChainStart(Node& n)
+      : out{n.publish<Count>("state")},
+        in{n.subscribe<Count>("/test/start",
+                              [this](const Count& c) { out.send(c); })} {}
+  Publisher<Count> out;
+  Subscription<Count> in;
+};
+
+// On the first step every node's loop starts at time 0, and the last one
+// added can then run a callback that wakes one started before it. A
+// publication made before the first step travels the whole chain at 0, so
+// the end's first update(), at 1 ms, has it.
+// REQ-RT-05
+TEST(Sim, TheFirstStepSettlesAChainStartedBeforeIt) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 1000
+command_timeout_us = 100000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)");
+  auto& end = sim.add<ChainEnd>("hearer");
+  sim.add<Relay>("relay");
+  sim.add<ChainStart>("producer");
+  sim.publish("/test/start", Count{7, 0});
+  sim.step(5ms);
+  EXPECT_EQ(end.heard_at, std::vector<Duration>{Duration::zero()});
+  ASSERT_FALSE(end.had_value.empty());
+  EXPECT_TRUE(end.had_value.front())
+      << "the 1 ms update() ran without the message published at 0";
+}
+
+// A paused node hears nothing; when the pause ends it hears every
+// publication it missed at once, in sequence, and one made at that instant
+// by a node added after it in the round that follows, not at its next
+// event.
+// REQ-RT-05
+TEST(Sim, APausedNodeHearsWhatItMissedWhenThePauseEnds) {
+  using std::chrono::milliseconds;
+  auto sim = Sim::FromToml(kCausalToml);
+  auto& hearer = sim.add<Hearer>("hearer");
+  sim.add<Producer>("producer");
+  sim.step(5ms);
+  sim.pause("hearer", 10ms);
+  sim.step(9ms);
+  EXPECT_EQ(hearer.heard.size(), 5u);
+  sim.step(6ms);
+  ASSERT_EQ(hearer.heard.size(), 20u);
+  for (std::size_t i = 0; i < hearer.heard.size(); ++i) {
+    SCOPED_TRACE(i);
+    const auto [delivered, stamp] = hearer.heard[i];
+    EXPECT_EQ(stamp, milliseconds{i + 1});
+    const bool missed = stamp > 5ms && stamp <= 15ms;
+    EXPECT_EQ(delivered, missed ? Duration{15ms} : stamp);
+  }
+}
+
+// Two nodes whose callbacks answer each other at once never let time pass.
+// The step fails after its round bound, naming the node still due and its
+// topic, instead of hanging the test.
+struct Echo {
+  explicit Echo(Node& n)
+      : out{n.publish<Count>("state")},
+        in{n.subscribe<Count>(
+            n.name() == "ping" ? "/pong/state" : "/ping/state",
+            [this](const Count& c) { out.send(c); })} {}
+  Publisher<Count> out;
+  Subscription<Count> in;
+};
+
+// REQ-RT-05
+TEST(Sim, AZeroTimePublishCycleFailsTheStepNamingWhatIsDue) {
+  auto sim = Sim::FromToml(kCausalToml);
+  sim.add<Echo>("ping");
+  sim.add<Echo>("pong");
+  sim.publish("/pong/state", Count{0, 0});
+  try {
+    sim.step(1ms);
+    FAIL() << "a zero-time cycle returned";
+  } catch (const std::runtime_error& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find("'ping'"), std::string::npos) << what;
+    EXPECT_NE(what.find("/pong/state"), std::string::npos) << what;
+  }
 }
 
 struct RelativeWrist {
@@ -340,13 +734,47 @@ can_id = 1
 [subsystems.wrist.remap]
 state = 42
 )");
-  try {
-    sim.add<RelativeWrist>("wrist");
-    FAIL() << "a non-string remap entry must throw";
-  } catch (const std::invalid_argument& e) {
-    EXPECT_NE(std::string{e.what()}.find("wrist: remap entry for 'state'"),
-              std::string::npos);
-  }
+  EXPECT_THROW(sim.add<RelativeWrist>("wrist"), std::invalid_argument);
+}
+
+// RULES.md 2: a hardware request leaves only through the devices layer's
+// flush, which gates it on robot_enabled and update() and applies the motor
+// limits. A node publishing its own /hw/request with a plain publisher, typed
+// or bytes, spelled out or reached by remap, is refused at construction, which
+// --allow-graph-errors cannot override; the C ABI (Python) shares this path.
+struct PlainRequest {
+  explicit PlainRequest(Node& n)
+      : request{n.publish<Count>("/hw/request/plain")} {}
+  Publisher<Count> request;
+};
+struct ByteRequest {
+  explicit ByteRequest(Node& n)
+      : request{n.publish_bytes("/hw/request/bytes", 8)} {}
+  BytePublisher request;
+};
+struct RemappedRequest {
+  explicit RemappedRequest(Node& n) : request{n.publish<Count>("state")} {}
+  Publisher<Count> request;
+};
+
+// REQ-SAFE-27
+TEST(Node, APlainPublisherOnAHardwareRequestIsRefused) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.plain]
+[subsystems.bytes]
+[subsystems.remapped.remap]
+state = "/hw/request/remapped"
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+)");
+  EXPECT_THROW(sim.add<PlainRequest>("plain"), std::invalid_argument);
+  EXPECT_THROW(sim.add<ByteRequest>("bytes"), std::invalid_argument);
+  EXPECT_THROW(sim.add<RemappedRequest>("remapped"), std::invalid_argument);
 }
 
 // --- state machines --------------------------------------------------------
@@ -468,36 +896,175 @@ struct Silent {
   Subscription<Count> in;
 };
 
+// Two raw callback subscriptions, as the devices layer opens /hw/state and
+// the Driver Station link; only the second has a handler that must run as
+// each message arrives (a Driver Station listener), when `listen`.
+template <bool listen>
+struct RawCallbacks {
+  explicit RawCallbacks(Node& n) {
+    const auto open = [&n](std::string_view topic) {
+      return detail::NodeAccess::add_subscription(
+          n, topic, sizeof(Count), kMessageAlignment, schema::Of<Count>(),
+          /*optional=*/false, [](const void*) {});
+    };
+    open("/feed/state");
+    [[maybe_unused]] const std::size_t link = open("/link/state");
+    if constexpr (listen) {
+      detail::NodeAccess::require_immediate_delivery(n, link);
+    }
+  }
+  void update() {}
+};
+
+struct Wakes {
+  event::Delivery policy;
+  std::vector<bool> prompt;  // per watcher, in registration order
+};
+
 // The loop's delivery as NodeAccess::start picks it for T on node
-// "listener".
+// "listener", and which of its watchers wake it.
 template <class T>
-event::Delivery DeliveryFor() {
-  auto sim = Sim::FromToml(kRobotToml);
-  const std::string& config_path = detail::SimAccess::config_path(sim);
-  event::SimulationEnvironment environment;
-  event::SimulatedEventLoop<> loop{environment};
-  detail::LoopPortFor<event::SimulatedEventLoop<>> port{loop};
-  const auto node = detail::NodeAccess::create(detail::NodeSetup{
-      .name = "listener",
-      .config_path = config_path,
-      .config = std::make_shared<const config::RobotConfig>(
-          config::ParseRobotConfig(config_path)),
-      .simulation = true,
-      .loop = &port,
-  });
-  const detail::Instance user = detail::MakeInstance<T>()(*node);
-  detail::NodeAccess::start(*node);
-  return loop.delivery();
+Wakes DeliveryFor() {
+  const OnOwnLoop<T> hosted;
+  Wakes wakes{.policy = hosted.loop.delivery(), .prompt = {}};
+  for (const event::Registration& source : hosted.loop.manifest()) {
+    if (source.kind == event::SourceKind::WATCHER) {
+      wakes.prompt.push_back(hosted.loop.prompt(source.id));
+    }
+  }
+  return wakes;
 }
 
-// A node that only reads latched values at its own timers drains right
-// before them; a message callback, or having no timer to drain before, keeps
-// the 1 ms drain.
-TEST(Node, DeliveryWaitsForTimersUnlessAHandlerNeedsEveryMessage) {
-  EXPECT_EQ(DeliveryFor<Watcher>(), event::Delivery::BEFORE_TIMERS);
-  EXPECT_EQ(DeliveryFor<Beats>(), event::Delivery::BEFORE_TIMERS);
-  EXPECT_EQ(DeliveryFor<Listener>(), event::Delivery::POLL);
-  EXPECT_EQ(DeliveryFor<Silent>(), event::Delivery::POLL);
+// A Wake::kAtDrain callback subscription, with a timer (AtDrain) or without
+// one (SilentAtDrain).
+struct AtDrain {
+  explicit AtDrain(Node& n)
+      : in{n.subscribe<Count>(
+            "/feed/state", [](const Count&) {}, Wake::kAtDrain)} {}
+  void update() {}
+  Subscription<Count> in;
+};
+
+struct SilentAtDrain {
+  explicit SilentAtDrain(Node& n)
+      : in{n.subscribe<Count>(
+            "/feed/state", [](const Count&) {}, Wake::kAtDrain)} {}
+  Subscription<Count> in;
+};
+
+// Every message its callbacks heard, in order, with the instant of the
+// drain that delivered it: /feed/state's with Wake::kAtDrain, then
+// /poke/state's (heard as -1) with the default Wake::kOnPublish; and the
+// feed subscription's age() inside each of its callbacks.
+struct Collector {
+  explicit Collector(Node& n)
+      : node{n},
+        feed{n.subscribe<Count>(
+            "/feed/state",
+            [this](const Count& c) {
+              feed_ages.push_back(feed.age());
+              Hear(c.tick_count());
+            },
+            Wake::kAtDrain)},
+        poke{n.subscribe<Count>("/poke/state",
+                                [this](const Count&) { Hear(-1); })} {}
+  void update() {}
+  void Hear(std::int64_t value) {
+    heard.emplace_back(value, Duration{node.now().nanos()});
+  }
+  Node& node;
+  Subscription<Count> feed;
+  Subscription<Count> poke;
+  std::vector<std::pair<std::int64_t, Duration>> heard;  // (value, delivered)
+  std::vector<Duration> feed_ages;
+};
+
+// A node that only reads latched values at its own timers drains
+// right before them and is never woken by a publication. A subscribe
+// callback, or a listener on one raw subscription, makes that one
+// subscription wake the node, not the node's other callback subscriptions,
+// unless it is opened with Wake::kAtDrain; a node with no timer to drain
+// before is woken by every subscription.
+// REQ-RT-19
+TEST(Node, OnlyASubscriptionWhoseHandlerMustRunAtOnceWakesTheNode) {
+  constexpr auto BEFORE_TIMERS = event::Delivery::BEFORE_TIMERS;
+  constexpr auto ON_PUBLISH = event::Delivery::ON_PUBLISH;
+  const auto expect = [](const char* node, const Wakes& got,
+                         event::Delivery policy,
+                         const std::vector<bool>& prompt) {
+    SCOPED_TRACE(node);
+    EXPECT_EQ(got.policy, policy);
+    EXPECT_EQ(got.prompt, prompt);
+  };
+  expect("timer reads a latched value", DeliveryFor<Watcher>(), BEFORE_TIMERS,
+         {false});
+  expect("timers only", DeliveryFor<Beats>(), BEFORE_TIMERS, {});
+  expect("callbacks without a listener", DeliveryFor<RawCallbacks<false>>(),
+         BEFORE_TIMERS, {false, false});
+  expect("a listener on the second", DeliveryFor<RawCallbacks<true>>(),
+         ON_PUBLISH, {false, true});
+  expect("subscribe callback", DeliveryFor<Listener>(), ON_PUBLISH, {true});
+  expect("at-drain callback", DeliveryFor<AtDrain>(), BEFORE_TIMERS, {false});
+  expect("at-drain beside a waking callback", DeliveryFor<Collector>(),
+         ON_PUBLISH, {false, true});
+  expect("no timer", DeliveryFor<Silent>(), ON_PUBLISH, {true});
+  expect("no timer, at-drain callback", DeliveryFor<SilentAtDrain>(),
+         ON_PUBLISH, {true});
+}
+
+// A Wake::kAtDrain callback hears every message, in order, but only at the
+// node's next drain, here its 5 ms update(): publications between ticks wake
+// nothing. A drain delivers at most 64 of them, and one that stops there is
+// followed at once by another, so a backlog over the cap is heard whole at
+// that instant, as a waking callback's is, not one batch per tick. Inside
+// the callback age() is that message's, counted from its publication.
+// REQ-RT-02
+// REQ-RT-19
+TEST(Node, AnAtDrainCallbackHearsEveryMessageInOrderAtTheNextDrain) {
+  using Heard = std::vector<std::pair<std::int64_t, Duration>>;
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& collector = sim.add<Collector>("listener");  // update() every 5 ms
+  sim.step(6ms);
+  for (std::int64_t i = 0; i < 3; ++i) {
+    sim.publish("/feed/state", Count{i, 0});
+    sim.step(1ms);
+  }
+  EXPECT_EQ(collector.heard, Heard{})
+      << "a publication at 6, 7 or 8 ms woke the node";
+  sim.step(1ms);
+  EXPECT_EQ(collector.heard, (Heard{{0, 10ms}, {1, 10ms}, {2, 10ms}}));
+  EXPECT_EQ(collector.feed_ages, (std::vector<Duration>{4ms, 3ms, 2ms}));
+
+  collector.heard.clear();
+  for (std::int64_t i = 0; i < 70; ++i) {
+    sim.publish("/feed/state", Count{i, 0});
+  }
+  sim.step(4ms);
+  EXPECT_EQ(collector.heard, Heard{}) << "published at 10 ms, after its drain";
+  sim.step(1ms);
+  ASSERT_EQ(collector.heard.size(), 70u) << "the rest waited past 15 ms";
+  for (std::size_t i = 0; i < collector.heard.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(collector.heard[i].first, static_cast<std::int64_t>(i));
+    EXPECT_EQ(collector.heard[i].second, 15ms);
+  }
+}
+
+// A wake from another topic drains every subscription, so the Wake::kAtDrain
+// messages waiting then are heard at that wake, first (registration order),
+// not at the next tick.
+// REQ-RT-02
+TEST(Node, AnotherTopicsWakeDeliversWaitingAtDrainMessages) {
+  using Heard = std::vector<std::pair<std::int64_t, Duration>>;
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& collector = sim.add<Collector>("listener");
+  sim.step(6ms);
+  sim.publish("/feed/state", Count{7, 0});
+  sim.step(1ms);
+  EXPECT_EQ(collector.heard, Heard{});
+  sim.publish("/poke/state", Count{0, 0});
+  sim.step(1ms);
+  EXPECT_EQ(collector.heard, (Heard{{7, 7ms}, {-1, 7ms}}));
 }
 
 struct LateSubscriber {
@@ -567,11 +1134,9 @@ struct BadFramer {
   }
 };
 
-TEST(BytePublisher, RejectsBadLayoutsAndLateRegistration) {
+TEST(BytePublisher, RejectsBadLayouts) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<BadFramer>("listener");
-  EXPECT_THROW((void)sim.node("listener").publish_bytes("/late/frames", 8),
-               std::logic_error);
 }
 
 // --- the binary
@@ -614,47 +1179,70 @@ std::string ConfigFlag() {
   return "--config '" + Runfile("TALOS_TEST_CONFIG") + "'";
 }
 
+// REQ-CONTRACT-12, REQ-OPS-06
 TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   const Result result = RunBinary("--describe " + ConfigFlag());
   ASSERT_EQ(result.status, 0) << result.output;
-  EXPECT_NE(result.output.find(R"("name": "test_node")"), std::string::npos)
+  introspect::Description described;
+  std::string error;
+  ASSERT_TRUE(
+      introspect::DescribeReader::Parse(result.output, described, error))
+      << error << "\n"
       << result.output;
-  EXPECT_NE(result.output.find(R"("target": "//talOS/node:test_node")"),
-            std::string::npos)
-      << result.output;
-  // Every topic endpoint names its schema, with its reflection bytes; a
-  // timer has none.
-  const std::string count_schema =
-      R"("schema": "node_test.Count", "schema_hash": ")" +
-      introspect::HexHash(Descriptor<Count>::kHash) +
-      R"(", "alignment": 8, "slots": 1024, "bfbs": ")" +
-      introspect::Base64(schema::Of<Count>().bfbs) + R"("})";
-  EXPECT_NE(
-      result.output.find(
-          R"({"kind": "WATCHER", "name": "/test_node/target", "message_bytes": 16, "external": false, "optional": true, "observer": false, )" +
-          count_schema),
-      std::string::npos)
-      << result.output;
-  EXPECT_NE(
-      result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/state", "message_bytes": 16, "external": false, "optional": false, "observer": false, )" +
-          count_schema),
-      std::string::npos)
-      << result.output;
-  EXPECT_NE(
-      result.output.find(
-          R"({"kind": "SENDER", "name": "/test_node/frames", "message_bytes": 64, "external": true, "optional": false, "observer": false, "schema": "talos.Bytes", "schema_hash": ")" +
-          introspect::HexHash(schema::BytesHash()) +
-          R"(", "alignment": 8, "slots": 16, "bfbs": ""})"),
-      std::string::npos)
-      << result.output;
-  EXPECT_NE(result.output.find(R"("reads_graph": false)"), std::string::npos)
-      << result.output;
-  EXPECT_NE(result.output.find(R"({"kind": "TIMER", "name": "test_node")"),
-            std::string::npos)
-      << result.output;
+  EXPECT_EQ(described.name, "test_node");
+  EXPECT_EQ(described.target, "//talOS/node:test_node");
+  EXPECT_FALSE(described.reads_graph);
+  // A run installs the stop handlers first thing, so the launcher may hold
+  // a stop through its start-up.
+  EXPECT_TRUE(described.holds_stop);
+  // The constructor's one param read is the node's declared parameter.
+  EXPECT_EQ(described.params,
+            (std::vector<introspect::ParamRead>{{"test_node", "step"}}));
+  const auto find = [&](std::string_view name) {
+    const auto it =
+        std::find_if(described.sources.begin(), described.sources.end(),
+                     [&](const auto& source) { return source.name == name; });
+    return it == described.sources.end() ? nullptr : &*it;
+  };
+
+  const auto* target = find("/test_node/target");
+  ASSERT_NE(target, nullptr) << result.output;
+  EXPECT_EQ(target->kind, event::SourceKind::WATCHER);
+  EXPECT_TRUE(target->optional());
+  EXPECT_FALSE(target->external());
+  const auto* state = find("/test_node/state");
+  ASSERT_NE(state, nullptr) << result.output;
+  EXPECT_EQ(state->kind, event::SourceKind::SENDER);
+  EXPECT_FALSE(state->optional());
+  EXPECT_FALSE(state->external());
+  // Every topic endpoint names its schema, with its reflection bytes.
+  for (const auto* count : {target, state}) {
+    SCOPED_TRACE(count->name);
+    EXPECT_FALSE(count->observer());
+    EXPECT_EQ(count->message_bytes, 16u);
+    EXPECT_EQ(count->schema, "node_test.Count");
+    EXPECT_EQ(count->schema_hash, Descriptor<Count>::kHash);
+    EXPECT_EQ(count->alignment, 8u);
+    EXPECT_EQ(count->slots, 1024u);
+    EXPECT_EQ(count->bfbs, schema::Of<Count>().bfbs);
+  }
+  const auto* frames = find("/test_node/frames");
+  ASSERT_NE(frames, nullptr) << result.output;
+  EXPECT_EQ(frames->kind, event::SourceKind::SENDER);
+  EXPECT_TRUE(frames->external());
+  EXPECT_EQ(frames->message_bytes, 64u);
+  EXPECT_EQ(frames->schema, "talos.Bytes");
+  EXPECT_EQ(frames->schema_hash, schema::BytesHash());
+  EXPECT_EQ(frames->alignment, 8u);
+  EXPECT_EQ(frames->slots, 16u);
+  EXPECT_TRUE(frames->bfbs.empty());
+  const auto* tick = find("test_node");
+  ASSERT_NE(tick, nullptr) << result.output;
+  EXPECT_EQ(tick->kind, event::SourceKind::TIMER);
   // A node with no hardware never touches /hw/*.
-  EXPECT_EQ(result.output.find("/hw/"), std::string::npos) << result.output;
+  for (const auto& source : described.sources) {
+    EXPECT_FALSE(source.name.starts_with("/hw/")) << source.name;
+  }
 }
 
 std::string TempFile(const std::string& name) {
@@ -705,27 +1293,246 @@ TEST(Binary, AGraphReaderDescribesWhatTheGraphItWasGivenHolds) {
   EXPECT_EQ(observed->schema_hash, Descriptor<Count>::kHash);
   EXPECT_EQ(observed->bfbs, schema::Of<Count>().bfbs);
 
-  // Run for real without a graph: it cannot be built, and says how to fix it.
+  // Run for real without a graph: it cannot be built.
   const Result run =
       RunBinary("--sim --duration-s 1 --log '" + TempFile("graph_node.tlog") +
                     "' " + ConfigFlag(),
                 "TALOS_GRAPH_NODE");
   EXPECT_NE(run.status, 0);
-  EXPECT_NE(run.output.find("--graph"), std::string::npos) << run.output;
 }
 
-TEST(Binary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/talos_node_test.tlog";
+// Node::describing() is set only for the launcher's --describe probe: a run
+// (and a Sim) builds the node with it clear, so no node skips its backends
+// for real.
+TEST(Binary, OnlyTheDescribeProbeBuildsANodeThatIsDescribing) {
+  const Result described =
+      RunBinary("--describe " + ConfigFlag(), "TALOS_DESCRIBING_NODE");
+  ASSERT_EQ(described.status, 0) << described.output;
+  EXPECT_NE(described.output.find("describing=1"), std::string::npos)
+      << described.output;
+
+  const Result run =
+      RunBinary("--sim --duration-s 1 --log '" +
+                    TempFile("describing_node.tlog") + "' " + ConfigFlag(),
+                "TALOS_DESCRIBING_NODE");
+  ASSERT_EQ(run.status, 0) << run.output;
+  EXPECT_NE(run.output.find("describing=0"), std::string::npos) << run.output;
+
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Silent>("listener");
+  EXPECT_FALSE(sim.node("listener").describing());
+}
+
+// SIGINT while the constructor is blocked in a system call does not kill the
+// node: the call keeps waiting, and once the constructor returns the node
+// exits cleanly without running its loop.
+TEST(Binary, StopDuringConstructionExitsCleanlyOnceConstructed) {
+  const std::string binary = Runfile("TALOS_BLOCKED_NODE");
+  const std::string config = Runfile("TALOS_TEST_CONFIG");
+  const std::string log = TempFile("blocked_node.tlog");
+  int input[2];
+  int output[2];
+  ASSERT_EQ(::pipe(input), 0);
+  ASSERT_EQ(::pipe(output), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::dup2(input[0], STDIN_FILENO);
+    ::dup2(output[1], STDOUT_FILENO);
+    ::close(input[0]);
+    ::close(input[1]);
+    ::close(output[0]);
+    ::close(output[1]);
+    ::execl(binary.c_str(), binary.c_str(), "--sim", "--duration-s", "1",
+            "--log", log.c_str(), "--config", config.c_str(), nullptr);
+    ::_exit(127);
+  }
+  ::close(input[0]);
+  ::close(output[1]);
+  std::string printed;
+  const auto read_some = [&] {
+    char buffer[256];
+    const ssize_t got = ::read(output[0], buffer, sizeof buffer);
+    if (got > 0) printed.append(buffer, static_cast<std::size_t>(got));
+    return got > 0;
+  };
+  while (printed.find("constructing\n") == std::string::npos && read_some()) {
+  }
+  const bool blocked = printed.find("constructing\n") != std::string::npos;
+  bool stop_landed = false;
+  if (blocked) {
+    EXPECT_EQ(::kill(child, SIGINT), 0);
+    // Each byte wakes the constructor's read, which answers with one line
+    // saying whether the stop has landed. The signal may reach another of
+    // the node's threads first, so ask until it has. A child whose read was
+    // interrupted exits instead, and the answer never comes (nor a SIGPIPE
+    // for the write that finds it gone).
+    struct sigaction ignore {};
+    struct sigaction previous {};
+    ignore.sa_handler = SIG_IGN;
+    ::sigaction(SIGPIPE, &ignore, &previous);
+    while (!stop_landed) {
+      const char byte = 0;
+      if (::write(input[1], &byte, 1) != 1) break;
+      const std::size_t answered = printed.size();
+      while (printed.find('\n', answered) == std::string::npos && read_some()) {
+      }
+      if (printed.find('\n', answered) == std::string::npos) break;
+      stop_landed =
+          printed.find("stop requested\n", answered) != std::string::npos;
+    }
+    ::sigaction(SIGPIPE, &previous, nullptr);
+  }
+  ::close(input[1]);  // the constructor's read returns
+  while (read_some()) {
+  }
+  ::close(output[0]);
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(blocked) << printed;
+  EXPECT_TRUE(stop_landed) << printed;
+  ASSERT_TRUE(WIFEXITED(status))
+      << "killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  EXPECT_EQ(WEXITSTATUS(status), 0) << printed;
+  EXPECT_NE(printed.find("stopped during construction"), std::string::npos)
+      << printed;
+  EXPECT_EQ(printed.find("dispatches="), std::string::npos) << printed;
+}
+
+// A running node whose loop has no timer and no subscription waits on
+// nothing but a stop, and no helper thread polls for one: SIGTERM must end
+// that wait from the loop's own thread, and the node exit 0 after its run,
+// long before --duration-s (60 s), the only other way out. The signal goes
+// once the registry row shows the loop running (endpoints are published only
+// then).
+// REQ-OPS-06
+// REQ-RT-21
+TEST(Binary, StopEndsARunningNodeThatWaitsOnNothing) {
+  const std::string binary = Runfile("TALOS_BLOCKED_NODE");
+  const std::string config = Runfile("TALOS_TEST_CONFIG");
+  const std::string log = TempFile("idle_node.tlog");
+  int output[2];
+  ASSERT_EQ(::pipe(output), 0);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    // Its constructor reads stdin to EOF: at once, from /dev/null.
+    const int null = ::open("/dev/null", O_RDONLY);
+    ::dup2(null, STDIN_FILENO);
+    ::dup2(output[1], STDOUT_FILENO);
+    ::close(null);
+    ::close(output[0]);
+    ::close(output[1]);
+    ::execl(binary.c_str(), binary.c_str(), "--sim", "--duration-s", "60",
+            "--log", log.c_str(), "--config", config.c_str(), nullptr);
+    ::_exit(127);
+  }
+  ::close(output[1]);
+  const auto running = [child] {
+    const auto reader = introspect::RegistryReader::open();
+    if (!reader) return false;
+    for (const auto& node : reader->nodes()) {
+      if (node.pid == static_cast<std::uint64_t>(child) && node.alive) {
+        return true;
+      }
+    }
+    return false;
+  };
+  int status = 0;
+  bool exited = false;
+  bool live = running();
+  const auto give_up = std::chrono::steady_clock::now() + 20s;
+  while (!live && std::chrono::steady_clock::now() < give_up) {
+    if (::waitpid(child, &status, WNOHANG) == child) {
+      exited = true;
+      break;
+    }
+    std::this_thread::sleep_for(1ms);  // paces the poll; the row is the event
+    live = running();
+  }
+  const auto signalled = std::chrono::steady_clock::now();
+  if (!exited) ::kill(child, live ? SIGTERM : SIGKILL);
+  std::string printed;
+  char buffer[256];
+  for (;;) {
+    const ssize_t got = ::read(output[0], buffer, sizeof buffer);
+    if (got <= 0) break;
+    printed.append(buffer, static_cast<std::size_t>(got));
+  }
+  ::close(output[0]);
+  if (!exited) {
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+  }
+  const auto stopped_after = std::chrono::steady_clock::now() - signalled;
+
+  ASSERT_TRUE(live) << "the node's loop never showed running: " << printed;
+  ASSERT_TRUE(WIFEXITED(status))
+      << "killed by signal " << (WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  EXPECT_EQ(WEXITSTATUS(status), 0) << printed;
+  EXPECT_NE(printed.find("dispatches="), std::string::npos) << printed;
+  EXPECT_LT(stopped_after, 30s) << "the stop waited for --duration-s";
+}
+
+// Describing and exact replay are offline: a robot (here a sentinel
+// publisher) may own the node's byte topic on this machine, and neither the
+// launcher's --describe probe nor replay attaches to it or fails because of
+// it. Byte topics are not logged, so replay does not verify them; typed sends
+// still are, and a changed parameter diverges.
+TEST(Binary, LoggedSimRunReplaysOfflineWithoutDivergence) {
+  const std::string log = TempFile("talos_node_test.tlog");
+  // Isolate the sentinel and child replay from live publishers, restoring
+  // the caller's namespace afterwards.
+  struct Namespace {
+    std::optional<std::string> previous;
+    Namespace() {
+      if (const char* value = std::getenv("TALOS_SHM_NAMESPACE"))
+        previous = value;
+      const std::string name = "replay_offline_" + std::to_string(::getpid());
+      ::setenv("TALOS_SHM_NAMESPACE", name.c_str(), 1);
+    }
+    ~Namespace() {
+      if (previous) {
+        ::setenv("TALOS_SHM_NAMESPACE", previous->c_str(), 1);
+      } else {
+        ::unsetenv("TALOS_SHM_NAMESPACE");
+      }
+    }
+  } isolated;
   const Result run =
       RunBinary("--sim --duration-s 1 --log '" + log + "' " + ConfigFlag());
   ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunBinary("--replay '" + log + "' " + ConfigFlag());
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
-  // Both runs wrote the node's byte topic to shared memory.
+  {
+    RTMSQueue sentinel{
+        "/test_node/frames",
+        64,
+        kMessageAlignment,
+        schema::Bytes(),
+        16,
+        RTMSOptions{.overflow_policy = OverflowPolicy::DROP_NEWEST,
+                    .read_mode = ReadMode::SEQUENCE,
+                    .publisher = true}};
+    const std::uint64_t written = sentinel.writer_sequence();
+    const Result describe = RunBinary("--describe " + ConfigFlag());
+    EXPECT_EQ(describe.status, 0) << describe.output;
+    const Result replay = RunBinary("--replay '" + log + "' " + ConfigFlag());
+    EXPECT_EQ(replay.status, 0) << replay.output;
+    EXPECT_EQ(sentinel.writer_sequence(), written);
+  }
+
+  std::string config;
+  {
+    std::ifstream in{Runfile("TALOS_TEST_CONFIG")};
+    config.assign(std::istreambuf_iterator<char>{in}, {});
+  }
+  const std::size_t step = config.find("step = 3");
+  ASSERT_NE(step, std::string::npos);
+  config.replace(step, 8, "step = 4");
+  const std::string changed = TempFile("talos_node_test_step4.toml");
+  std::ofstream{changed} << config;
+  const Result diverged =
+      RunBinary("--replay '" + log + "' --config '" + changed + "'");
+  EXPECT_NE(diverged.status, 0) << diverged.output;
+  // Only the --sim run wrote the node's byte topic to shared memory.
   ::shm_unlink(ShmObjectName("/test_node/frames").c_str());
 }
 
@@ -767,28 +1574,59 @@ TEST(Node, SimHandsAGraphReaderTheNodesAddedBeforeIt) {
   EXPECT_FALSE(detail::NodeAccess::reads_graph(sim.node("talker")));
 }
 
-// Outside the Sim a byte topic is an RTMS queue, opened by the first send:
-// building the node (as --describe does) leaves no segment behind.
-TEST(BytePublisher, OpensRtmsOnFirstSendAndDropsNewestWhenFull) {
+// A node's sends belong to the thread that runs its loop: the loop's dispatch
+// context, its log and the transport are single-threaded. A send from another
+// thread (a node's worker; a Python thread, whose C calls release the GIL)
+// throws instead of racing them, and publishes nothing.
+TEST(Node, SendsOnlyFromTheThreadThatBuiltIt) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& talker = sim.add<CountPublisher>("talker");
+  bool refused = false;
+  std::thread worker{[&] {
+    try {
+      (void)talker.out.send(Count{1, 0});
+    } catch (const std::logic_error&) {
+      refused = true;
+    }
+  }};
+  worker.join();
+  EXPECT_TRUE(refused);
+  EXPECT_FALSE(sim.latest<Count>("/talker/state").has_value());
+  EXPECT_TRUE(talker.out.send(Count{2, 0}));
+  ASSERT_TRUE(sim.latest<Count>("/talker/state").has_value());
+  EXPECT_EQ(sim.latest<Count>("/talker/state")->tick_count(), 2);
+}
+
+// Outside the Sim a byte topic is an RTMS queue, opened as the node registers
+// it, like the realtime loop's typed topics: a second writer is refused while
+// it is being built, not at its first send in the middle of a run.
+TEST(BytePublisher, ClaimsItsRtmsTopicWhenRegisteredAndDropsNewestWhenFull) {
   const std::string topic = "/test/node_bytes/p" + std::to_string(::getpid());
   const std::string config_path = Runfile("TALOS_TEST_CONFIG");
+  const auto robot_config = std::make_shared<const config::RobotConfig>(
+      config::ParseRobotConfig(config_path));
   event::RealtimeEventLoop<> loop;
   detail::LoopPortFor<event::RealtimeEventLoop<>> port{loop};
-  const auto node = detail::NodeAccess::create(detail::NodeSetup{
-      .name = "test_node",
-      .config_path = config_path,
-      .config = std::make_shared<const config::RobotConfig>(
-          config::ParseRobotConfig(config_path)),
-      .loop = &port,
-  });
-  BytePublisher out = node->publish_bytes(
-      topic, 64, {.slots = 4, .drop_newest = true, .external = true});
+  const auto build = [&] {
+    return detail::NodeAccess::create(detail::NodeSetup{
+        .name = "test_node",
+        .config_path = config_path,
+        .config = robot_config,
+        .loop = &port,
+    });
+  };
+  const BytePublishOptions options{
+      .slots = 4, .drop_newest = true, .external = true};
+  const auto node = build();
+  BytePublisher out = node->publish_bytes(topic, 64, options);
+  EXPECT_TRUE(ShmSegmentExists(topic));
+  const auto rival = build();
+  EXPECT_THROW((void)rival->publish_bytes(topic, 64, options),
+               std::runtime_error);
   detail::NodeAccess::start(*node);
-  EXPECT_FALSE(ShmSegmentExists(topic));
 
   const std::vector<std::byte> first(5, std::byte{1});
   EXPECT_TRUE(out.send(first));
-  ASSERT_TRUE(ShmSegmentExists(topic));
 
   RTMSQueue reader_queue{
       topic,

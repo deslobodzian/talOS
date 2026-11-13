@@ -13,29 +13,87 @@ namespace talos::telemetry_wire {
 // full protocol and the size/rate budget.
 //
 // RTMS slots hold a size-prefixed FlatBuffer (4-byte little-endian size,
-// then the Frame buffer whose file identifier is "TLM2") at offset 0; the
+// then the Frame buffer whose file identifier is "TLM3") at offset 0; the
 // rest of the slot is unused padding. payload() returns the prefix plus
-// buffer -- exactly what the bridge forwards on the WebSocket -- or an
-// empty view when the slot does not hold a well-formed v2 frame header.
+// buffer -- the frame as the Studio bridge decodes it -- or an empty view
+// when the slot does not hold a well-formed v3 frame header.
 
-// A value-only frame (no dictionary) including its 4-byte prefix. 1200 B
-// fits one 1500-byte-MTU Ethernet frame with IP/TCP/WebSocket overhead,
-// and at the 100 Hz telemetry rate it is 1200 * 8 * 100 = 0.96 Mbit/s per
-// client, under 25% of the 4 Mbit/s FRC radio floor (rule R704 budget).
+// A value page (no dictionary) including its 4-byte prefix. A tick's values
+// take as many pages as they need; each page, from the producer and from the
+// Studio bridge to a client, fits one 1500-byte-MTU Ethernet frame with
+// IP/TCP/WebSocket overhead. The bridge's egress budget, not this cap, bounds
+// the radio rate (docs/DATA_FLOW.md).
 inline constexpr std::size_t kMaxValueFrameBytes = 1200;
 static_assert(kMaxValueFrameBytes == 1200,
-              "telemetry value frame limit changed; update docs/DATA_FLOW.md");
+              "telemetry value page limit changed; update docs/DATA_FLOW.md");
 
-// Slot geometry for the /talos/telemetry byte topic. A dictionary frame
-// (names, units, labels) is larger than a value frame but still bounded
-// by one slot; 64 slots at 100 Hz absorb over half a second of bridge
-// lag before DROP_NEWEST starts shedding frames.
+// Per carried sample: a uint32 channel index and a uint64 raw value. An
+// absent channel costs less (its uint32 index alone).
+inline constexpr std::size_t kSampleBytes = 12;
+// Upper bound on a value page's bytes besides its samples and absent
+// channels: header scalars, chassis, vtable, vector lengths and alignment
+// (frames.h measures the real overhead; its test holds it under this).
+inline constexpr std::size_t kValuePageOverheadBound = 200;
+
+// The Studio bridge's per-client egress burst (studio/bridge EgressBudget)
+// and the WebSocket header it charges per message: the bridge sends a client
+// an update only when it can afford all of it at once, so an update larger
+// than the burst could never be sent.
+inline constexpr std::size_t kClientBurstBytes = 64000;
+inline constexpr std::size_t kMaxWebSocketHeaderBytes = 10;
+
+// The most channels a dictionary may hold: sized so that the largest update,
+// a keyframe carrying every channel, fits the bridge's burst with all its
+// page and WebSocket framing. The producer refuses a larger dictionary at
+// construction, naming its largest sources.
+inline constexpr std::size_t kMaxChannels = 2048;
+inline constexpr std::size_t kMinSamplesPerPage =
+    (kMaxValueFrameBytes - kValuePageOverheadBound) / kSampleBytes;
+inline constexpr std::size_t kMaxUpdateBytes =
+    (kMaxChannels + kMinSamplesPerPage - 1) / kMinSamplesPerPage *
+    (kMaxValueFrameBytes + kMaxWebSocketHeaderBytes);
+static_assert(kMaxUpdateBytes <= kClientBurstBytes,
+              "a keyframe of kMaxChannels must fit the Studio bridge's "
+              "egress burst; update docs/DATA_FLOW.md with either");
+
+// The driver dashboard feed's rates, which a dashboard layout's worst case
+// (talOS/telemetry:dashboard_layout) counts: with nothing new to send, a
+// client gets an empty update every kHeartbeatIntervalNs (the Studio
+// bridge's heartbeat, studio/bridge ClientFeed), and the drive summary text
+// message (REQ-OPS-35) is at most kDriveSummaryMaxBytes, at most once per
+// kDriveSummaryIntervalNs.
+inline constexpr std::int64_t kHeartbeatIntervalNs = 100'000'000;
+inline constexpr std::size_t kDriveSummaryMaxBytes = 4096;
+inline constexpr std::int64_t kDriveSummaryIntervalNs = 500'000'000;
+
+// Slot geometry for the /talos/telemetry byte topic. One slot holds one
+// value page or one dictionary page; a dictionary takes as many pages as it
+// needs, each at most one slot, so one channel's entry (name, unit, labels)
+// must fit one slot. 64 slots hold at least 0.2 s of a three-page tick at
+// 100 Hz, which a reader that falls further behind loses (the writer
+// overwrites; the reader is told how many it missed).
 inline constexpr std::size_t slot_bytes = 16384;
 inline constexpr std::size_t slot_count = 64;
+inline constexpr std::size_t kMaxDictionaryPageBytes = slot_bytes;
+// A page, prefix included, is what one slot holds (payload() checks it).
+static_assert(kMaxDictionaryPageBytes <= slot_bytes &&
+                  kMaxValueFrameBytes <= slot_bytes,
+              "a telemetry page must fit one /talos/telemetry slot");
+
+// Dictionary limits: each channel name, unit and enum label is at most
+// kMaxDictionaryStringBytes, and an enum channel carries at most
+// kMaxEnumLabels labels. Studio's decoder (studio/src/core.ts) accepts
+// exactly these, and the producer (node.h) never emits past them: one
+// channel past them would blank the whole stream.
+inline constexpr std::size_t kMaxDictionaryStringBytes = 256;
+inline constexpr std::size_t kMaxEnumLabels = 1024;
+static_assert(kMaxDictionaryStringBytes == 256 && kMaxEnumLabels == 1024,
+              "telemetry dictionary limits changed; update docs/DATA_FLOW.md "
+              "and studio/src/core.ts");
 
 // Validates the slot header: a 4-byte little-endian FlatBuffers size
-// prefix, a minimum FlatBuffer size (root offset + "TLM2" identifier),
-// a size that fits the slot, and the TLM2 identifier itself. Full
+// prefix, a minimum FlatBuffer size (root offset + "TLM3" identifier),
+// a size that fits the slot, and the TLM3 identifier itself. Full
 // FlatBuffers verification is the consumer's job (the bridge does it
 // when decoding for /telemetry.json); this stays cheap enough to run
 // per frame on the forwarding path.
@@ -51,7 +109,7 @@ inline std::string_view payload(std::span<const std::byte> slot) {
   // The file identifier sits right after the root-table offset:
   // slot bytes [8, 12) are buffer bytes [4, 8).
   if (slot[8] != std::byte{'T'} || slot[9] != std::byte{'L'} ||
-      slot[10] != std::byte{'M'} || slot[11] != std::byte{'2'}) {
+      slot[10] != std::byte{'M'} || slot[11] != std::byte{'3'}) {
     return {};
   }
   return {reinterpret_cast<const char*>(slot.data()), n + 4};

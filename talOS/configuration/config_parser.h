@@ -14,12 +14,23 @@
 // encoders (type "QuadratureEncoder" or "DutyCycleEncoder"), pwm_outputs.
 // Logical ids are assigned 1..N sorted by (subsystem, device name). Ranges,
 // uniqueness, and exclusive ownership are enforced by hardware::Validate; the
-// parser only checks what Validate cannot see (types, names, references).
+// parser only checks what Validate cannot see (types, names, references, and
+// each actuator owner's period_us against command_timeout_us).
+//
+// A subsystem's [trajectories] table names data files (name = "path",
+// relative to the file that sets it); config load requires each to exist,
+// and the build lists each in the config's CONFIG_FILES (resolve.cc). So
+// does [studio] dashboard, the driver dashboard's layout file.
+
+#include <arpa/inet.h>
 
 #include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <sstream>
@@ -90,22 +101,51 @@ struct RobotConfig {
   // lives as seen from this companion. Loopback by default, so simulation and
   // loopback tests work with no extra configuration. Set to the RIO address
   // (e.g. "10.56.87.2") for a real robot, either here or via --remote.
+  // An IPv4 literal: the bridge's socket (talOS/protocol/udp.h) takes one
+  // and never resolves a hostname, so config load refuses anything else.
   std::string controller_address{"127.0.0.1"};
   uint16_t controller_port{5802};
   uint16_t local_port{5803};
 
+  // Launcher log retention: sessions kept under the log root (the new one
+  // included; the newest matches and unclassifiable sessions may exceed it)
+  // and the byte budget: half for the new session's event logs, half for
+  // older sessions but those matches, and the space kept free on the root's
+  // filesystem, which alone removes them.
+  // Both positive integers. See talOS/launcher/README.md.
+  int64_t log_keep_sessions{50};
+  int64_t log_max_bytes{int64_t{2} * 1024 * 1024 * 1024};
+
+  // Refuse a described graph with no producer for an actuated subsystem's mode.
+  // `[robot] require_target_coverage`, default false; true whenever the
+  // config file sets `commissioned = true`, which refuses an explicit false.
+  bool require_target_coverage{false};
+
+  // `[robot] simulation_only`, default false: the config (simulation gains,
+  // bindings, wide travel) must never drive real hardware, so the launcher
+  // refuses it without --sim. Once a file sets it true, a file including
+  // that one cannot set it back to false (ResolveRobotConfig refuses).
+  bool simulation_only{false};
+
   // Sim-session viewer. Studio's bridge is a host-side process, not a robot
   // node, so it is not a subsystem; this table carries what the launcher
-  // needs to start and supervise it in sim sessions. The watched topic is
-  // read from [subsystems.telemetry] topic, the same key the telemetry node
-  // reads, so the two ends cannot drift apart.
+  // needs to start and supervise it in sim sessions. `topic` is the topic it
+  // watches, the telemetry node's byte topic (/talos/telemetry).
   struct StudioConfig {
     std::string bridge{"//studio/bridge:studio_bridge"};
     uint16_t http_port{5800};
-    // Relative to the launcher's working directory.
+    uint16_t max_clients{4};
+    // Relative to the launcher's working directory; a bundle that carries
+    // Studio serves its own webroot unless this is absolute
+    // (EffectiveStudioWebroot in talOS/launcher/roster.h).
     std::string webroot{"bazel-bin/studio/dist"};
     std::string topic{"/talos/telemetry"};
     std::string pose_topic;
+    // The driver dashboard's layout file (talOS/telemetry:dashboard_layout),
+    // resolved against the file that set `dashboard` (in a config parsed
+    // from a string, the working directory); empty when unset. Config load
+    // refused a file that does not exist.
+    std::string dashboard;
   };
   StudioConfig studio;
 
@@ -138,7 +178,55 @@ struct RobotConfig {
   }
   // Subsystem teleop bindings, preserving list order.
   std::map<std::string, std::vector<TeleopBinding>> teleop;
+  std::map<std::string, std::vector<std::pair<std::string, TeleopValue>>>
+      teleop_defaults;
+
+  // Each subsystem's [trajectories]: name -> file, resolved against the file
+  // that set it (in a config parsed from a string, the working directory).
+  // Config load refused a file that does not exist.
+  std::map<std::string, std::map<std::string, std::string, std::less<>>,
+           std::less<>>
+      trajectories;
+
+  // The absolute path of `subsystem`'s [trajectories] entry `name`; throws
+  // std::invalid_argument naming the subsystem and `trajectories.<name>` when
+  // the config does not declare it.
+  std::filesystem::path TrajectoryPath(std::string_view subsystem,
+                                       std::string_view name) const {
+    const auto sub = trajectories.find(subsystem);
+    if (sub != trajectories.end()) {
+      if (const auto it = sub->second.find(name); it != sub->second.end()) {
+        return std::filesystem::absolute(it->second).lexically_normal();
+      }
+    }
+    std::string declared;
+    if (sub != trajectories.end()) {
+      for (const auto& [known, path] : sub->second) {
+        declared += (declared.empty() ? "" : ", ") + known;
+      }
+    }
+    throw std::invalid_argument(
+        "[subsystems." + std::string(subsystem) +
+        "] declares no 'trajectories." + std::string(name) +
+        "' (declared: " + (declared.empty() ? "none" : declared) + ")");
+  }
 };
+
+// The keys of a [subsystems.<name>] table the framework reads: config load,
+// the launcher, talOS/node (period_us, remap) and the devices layer. Every
+// other key is a parameter of some node (Node::param, param_of), which the
+// launcher checks against the keys the nodes' --describe probes report.
+inline constexpr std::string_view kFrameworkSubsystemKeys[] = {
+    "node",        "critical",       "period_us",       "remap",
+    "targets",     "teleop",         "motors",          "sensors",
+    "encoders",    "digital_inputs", "digital_outputs", "analog_inputs",
+    "pwm_outputs", "trajectories",
+};
+
+constexpr bool IsFrameworkSubsystemKey(std::string_view key) {
+  return std::ranges::find(kFrameworkSubsystemKeys, key) !=
+         std::end(kFrameworkSubsystemKeys);
+}
 
 namespace detail {
 
@@ -150,7 +238,7 @@ T Read(const toml::table& tbl, std::string_view key, T def) {
   if (!node) return def;
   const std::string field = "field '" + std::string(key) + "'";
   if constexpr (std::is_same_v<T, bool>) {
-    if (auto v = node.value<bool>()) return *v;
+    if (auto v = node.value_exact<bool>()) return *v;
     throw std::invalid_argument(field + " must be a boolean");
   } else if constexpr (std::is_integral_v<T>) {
     if (auto v = node.value<int64_t>(); v && std::in_range<T>(*v)) {
@@ -178,10 +266,25 @@ T ReadRequired(const toml::table& tbl, const char* key,
 
 inline std::string ReadNonEmpty(const toml::table& tbl, const char* key,
                                 std::string def, const char* table_name) {
-  std::string v = Read<std::string>(tbl, key, def);
+  std::string v = Read<std::string>(tbl, key, std::move(def));
   if (v.empty()) {
     throw std::invalid_argument(std::string(table_name) + " field '" + key +
                                 "' must be a non-empty string");
+  }
+  return v;
+}
+
+inline bool IsIpv4Address(const std::string& address) {
+  in_addr parsed{};
+  return inet_pton(AF_INET, address.c_str(), &parsed) == 1;
+}
+
+inline int64_t ReadPositive(const toml::table& tbl, const char* key,
+                            int64_t def, const char* table_name) {
+  const int64_t v = Read(tbl, key, def);
+  if (v < 1) {
+    throw std::invalid_argument(std::string(table_name) + " field '" + key +
+                                "' must be a positive integer");
   }
   return v;
 }
@@ -206,6 +309,196 @@ inline void CheckTopLevelKeys(const toml::table& tbl) {
     }
   }
 }
+
+// A subsystem table also carries its node's own parameters (Node::param), so
+// a key the framework does not know cannot be refused here (the launcher
+// refuses one no node's --describe reports reading). A framework section
+// spelled in the singular can: `[subsystems.arm.target]` would otherwise
+// leave arm on the default target policy, and `[subsystems.arm.motor.x]`
+// would leave the motor unconfigured, both silently. `where` names the table
+// or the file holding it.
+inline void CheckSubsystemKeys(const toml::table& tbl,
+                               const std::string& where) {
+  static constexpr std::pair<std::string_view, std::string_view> kSections[] = {
+      {"target", "targets"},
+      {"motor", "motors"},
+      {"sensor", "sensors"},
+      {"encoder", "encoders"},
+      {"digital_input", "digital_inputs"},
+      {"digital_output", "digital_outputs"},
+      {"analog_input", "analog_inputs"},
+      {"pwm_output", "pwm_outputs"},
+      {"trajectory", "trajectories"},
+  };
+  static_assert(std::ranges::all_of(kSections, [](const auto& section) {
+    return IsFrameworkSubsystemKey(section.second);
+  }));
+  for (auto&& [k, v] : tbl) {
+    for (const auto& [wrong, right] : kSections) {
+      if (k.str() == wrong) {
+        throw std::invalid_argument(where + ": unknown key '" +
+                                    std::string(wrong) + "'; did you mean '" +
+                                    std::string(right) + "'?");
+      }
+    }
+  }
+}
+
+// A subsystem file (or its defaults file) before merging, so the error names
+// the file that holds the key: its top level and its [subsystem] header both
+// land in the subsystem's table.
+inline void CheckSubsystemFileKeys(const toml::table& file,
+                                   const std::string& path) {
+  CheckSubsystemKeys(file, path);
+  if (const auto* header = file["subsystem"].as_table()) {
+    CheckSubsystemKeys(*header, path + " [subsystem]");
+  }
+}
+
+// The entries of `holder`'s [trajectories] table as (name, path), refusing a
+// non-table section, a name that is not a topic segment (talOS/NAMING.md) and
+// a value that is not a non-empty string. `where` names the file or table.
+inline std::vector<std::pair<std::string, std::string>> ReadTrajectories(
+    const toml::table& holder, const std::string& where) {
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!holder.contains("trajectories")) return out;
+  const auto* section = holder["trajectories"].as_table();
+  if (section == nullptr) {
+    throw std::invalid_argument(
+        where + ": 'trajectories' must be a table of name = \"path\"");
+  }
+  for (auto&& [key, value] : *section) {
+    const std::string name(key.str());
+    const std::string field = where + ": trajectories." + name;
+    if (auto problem =
+            introspect::naming::CheckSegmentName(name, "trajectory name")) {
+      throw std::invalid_argument(field + ": " + *problem);
+    }
+    const auto path = value.value_exact<std::string>();
+    if (!path || path->empty()) {
+      throw std::invalid_argument(field + " must be a non-empty string path");
+    }
+    out.emplace_back(name, *path);
+  }
+  return out;
+}
+
+// A [trajectories] file must exist; the error names where it was set, the
+// key and the path as resolved.
+inline void RequireTrajectoryFile(const std::string& where,
+                                  const std::string& name,
+                                  const std::string& path) {
+  if (!std::filesystem::is_regular_file(path)) {
+    throw std::invalid_argument(where + ": trajectories." + name +
+                                ": no such file '" + path + "'");
+  }
+}
+
+// Where each [trajectories] entry (by name) was set, for the errors of the
+// check that runs once files are merged.
+using TrajectorySources = std::map<std::string, std::string>;
+
+// Rewrites `holder`'s [trajectories] paths relative to `file`'s directory,
+// validating each entry, and records into `sources` where each was set
+// (`where`). Existence is checked later, on the merged result, so an entry a
+// later file overrides is never required or listed.
+inline void RebaseTrajectories(toml::table& holder, const std::string& file,
+                               const std::string& where,
+                               TrajectorySources& sources) {
+  namespace fs = std::filesystem;
+  const fs::path base = fs::path(file).parent_path();
+  for (auto& [name, path] : ReadTrajectories(holder, where)) {
+    const fs::path rel{path};
+    const std::string resolved =
+        (rel.is_absolute() || base.empty() ? rel : base / rel)
+            .lexically_normal()
+            .string();
+    holder["trajectories"].as_table()->insert_or_assign(name, resolved);
+    sources.insert_or_assign(name, where);
+  }
+}
+
+// The effective entries of `holder`'s [trajectories] (already rebased):
+// `data` sees each path with its label (where it was set and
+// trajectories.<name>), so a build tool can list it (resolve.cc) before its
+// absence is an error; then the file must exist.
+template <typename DataFile>
+void RequireTrajectories(const toml::table& holder,
+                         const TrajectorySources& sources,
+                         const std::string& fallback, DataFile& data) {
+  for (const auto& [name, path] : ReadTrajectories(holder, fallback)) {
+    const auto source = sources.find(name);
+    const std::string& where =
+        source == sources.end() ? fallback : source->second;
+    data(path, where + ": trajectories." + name);
+    RequireTrajectoryFile(where, name, path);
+  }
+}
+
+// [studio] dashboard names a file relative to the file that sets it:
+// rewrites the path in `document` (read from `file`) against `file`'s
+// directory and returns `file`, or "" when `document` does not set it.
+inline std::string RebaseStudioDashboard(toml::table& document,
+                                         const std::string& file) {
+  auto* studio = document["studio"].as_table();
+  if (studio == nullptr || !studio->contains("dashboard")) return {};
+  const auto value = (*studio)["dashboard"].value_exact<std::string>();
+  if (!value || value->empty()) {
+    throw std::invalid_argument(
+        file + ": [studio] dashboard must be a non-empty string path");
+  }
+  const std::filesystem::path base = std::filesystem::path(file).parent_path();
+  const std::filesystem::path rel{*value};
+  studio->insert_or_assign(
+      "dashboard", (rel.is_absolute() || base.empty() ? rel : base / rel)
+                       .lexically_normal()
+                       .string());
+  return file;
+}
+
+// The dashboard layout file must exist; the error names where it was set,
+// the key and the path as resolved.
+inline void RequireStudioDashboard(const std::string& where,
+                                   const std::string& path) {
+  if (!std::filesystem::is_regular_file(path)) {
+    throw std::invalid_argument(where + ": [studio] dashboard: no such file '" +
+                                path + "'");
+  }
+}
+
+// [trajectories] belongs at a subsystem file's top level. Under its
+// [subsystem] header it would be merged into the subsystem's table and then
+// replaced by a top-level [trajectories], so it is refused, not dropped.
+inline void RefuseHeaderTrajectories(const toml::table& document,
+                                     const std::string& file) {
+  if (const auto* header = document["subsystem"].as_table();
+      header != nullptr && header->contains("trajectories")) {
+    throw std::invalid_argument(
+        file +
+        ": [subsystem.trajectories] is not read; put the entries in a "
+        "top-level [trajectories] table");
+  }
+}
+
+// The [subsystems.<name>] tables of one robot file: rebased, with where each
+// entry was set recorded per subsystem (a later call overrides).
+inline void RebaseSubsystemTablesTrajectories(
+    toml::table& document, const std::string& file,
+    std::map<std::string, TrajectorySources>& sources) {
+  if (auto* subs = document["subsystems"].as_table()) {
+    for (auto&& [name, value] : *subs) {
+      if (auto* sub = value.as_table()) {
+        const std::string subsystem{name.str()};
+        RebaseTrajectories(*sub, file, file + " [subsystems." + subsystem + "]",
+                           sources[subsystem]);
+      }
+    }
+  }
+}
+
+// The default DataFile: config load needs only each file's existence.
+inline void IgnoreDataFile(const std::string& /*path*/,
+                           const std::string& /*label*/) {}
 
 inline void MergeTables(toml::table& base, const toml::table& over) {
   for (auto&& [k, v] : over) {
@@ -238,7 +531,61 @@ inline bool IsCANcoder(const RawDevice& d) {
   return s && s->kind == hardware::SensorKind::kCANcoder;
 }
 
+// A switch on the TalonFX's own limit input; absent keeps Phoenix's default,
+// an enabled normally open switch.
+inline hardware::LimitSwitch ReadLimitSwitch(const toml::table& t,
+                                             const char* key,
+                                             const std::string& name) {
+  const auto value = Read<std::string>(t, key, "NormallyOpen");
+  if (value == "NormallyOpen") return hardware::LimitSwitch::kNormallyOpen;
+  if (value == "NormallyClosed") return hardware::LimitSwitch::kNormallyClosed;
+  if (value == "Disabled") return hardware::LimitSwitch::kDisabled;
+  throw std::invalid_argument(std::string(key) + " for " + name +
+                              " must be \"NormallyOpen\", \"NormallyClosed\" "
+                              "or \"Disabled\", not \"" +
+                              value + "\"");
+}
+
+// The motor the TalonFX drives (MotorConfig::motor_type); absent is a Kraken
+// X60.
+inline hardware::MotorType ReadMotorType(const toml::table& t,
+                                         const std::string& name) {
+  const auto value = Read<std::string>(t, "motor_type", "kraken_x60");
+  if (value == "kraken_x60") return hardware::MotorType::kKrakenX60;
+  if (value == "kraken_x44") return hardware::MotorType::kKrakenX44;
+  if (value == "falcon_500") return hardware::MotorType::kFalcon500;
+  std::string message = "motor_type for " + name +
+                        " must be \"kraken_x60\", \"kraken_x44\" or "
+                        "\"falcon_500\", not \"" +
+                        value + "\"";
+  // The key keeps its source through table copies; a value node does not.
+  for (auto&& [key, node] : t) {
+    if (key.str() == "motor_type" && key.source().path) {
+      message += " in " + *key.source().path;
+    }
+  }
+  throw std::invalid_argument(message);
+}
+
 inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
+  for (auto&& [key, value] : t) {
+    const auto k = key.str();
+    if (k != "type" && k != "bus" && k != "can_id" && k != "inverted" &&
+        k != "brake" && k != "supply_limit_a" && k != "stator_limit_a" &&
+        k != "max_voltage" && k != "rotor_to_sensor_ratio" &&
+        k != "sensor_to_mechanism_ratio" && k != "continuous_wrap" &&
+        k != "soft_limits" && k != "reverse_limit_rot" &&
+        k != "forward_limit_rot" && k != "max_velocity_rps" &&
+        k != "cruise_velocity_rps" && k != "acceleration_rps2" &&
+        k != "jerk_rps3" && k != "follow" && k != "oppose_master" &&
+        k != "feedback" && k != "feedback_sensor" && k != "slot0" &&
+        k != "slot1" && k != "slot2" && k != "position_frame" &&
+        k != "forward_limit_switch" && k != "reverse_limit_switch" &&
+        k != "motor_type") {
+      throw std::invalid_argument("unknown motor key '" + std::string(k) +
+                                  "' for " + name);
+    }
+  }
   if (Read<std::string>(t, "type", "TalonFX") != "TalonFX") {
     throw std::invalid_argument("unknown motor type for " + name);
   }
@@ -258,13 +605,28 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   m.soft_limits = Read(t, "soft_limits", m.soft_limits);
   m.reverse_limit_rot = Read(t, "reverse_limit_rot", m.reverse_limit_rot);
   m.forward_limit_rot = Read(t, "forward_limit_rot", m.forward_limit_rot);
+  m.forward_limit_switch = ReadLimitSwitch(t, "forward_limit_switch", name);
+  m.reverse_limit_switch = ReadLimitSwitch(t, "reverse_limit_switch", name);
   m.max_velocity_rps = Read(t, "max_velocity_rps", m.max_velocity_rps);
   m.cruise_velocity_rps =
       Read(t, "cruise_velocity_rps", std::min(20.0, m.max_velocity_rps));
   m.acceleration_rps2 = Read(t, "acceleration_rps2", m.acceleration_rps2);
   m.jerk_rps3 = Read(t, "jerk_rps3", m.jerk_rps3);
+  m.motor_type.value = ReadMotorType(t, name);
   for (int s = 0; s < 3; ++s) {
+    const auto slot_name = "slot" + std::to_string(s);
+    if (t.contains(slot_name) && !t[slot_name].is_table()) {
+      throw std::invalid_argument(slot_name + " must be a table for " + name);
+    }
     if (auto* slot = t["slot" + std::to_string(s)].as_table()) {
+      for (auto&& [key, value] : *slot) {
+        const auto k = key.str();
+        if (k != "p" && k != "i" && k != "d" && k != "s" && k != "v" &&
+            k != "a" && k != "g" && k != "gravity_type") {
+          throw std::invalid_argument("unknown motor slot key '" +
+                                      std::string(k) + "' for " + name);
+        }
+      }
       auto& g = m.slots[s];
       g.p = Read(*slot, "p", g.p);
       g.i = Read(*slot, "i", g.i);
@@ -309,11 +671,89 @@ inline RawDevice ParseMotor(const toml::table& t, const std::string& name) {
   } else {
     throw std::invalid_argument("unknown feedback source: " + feedback);
   }
+  // A TalonFX reset restarts its rotor position, so only a remote CANcoder's
+  // frame can be absolute (see MotorConfig::absolute_position_frame).
+  const auto frame = Read<std::string>(t, "position_frame", "rezero");
+  if (frame == "absolute") {
+    if (m.feedback != hardware::Feedback::kRemoteCANcoder) {
+      throw std::invalid_argument(
+          "position_frame = \"absolute\" requires feedback = "
+          "\"RemoteCANcoder\" for " +
+          name + ": a TalonFX reset restarts its rotor position");
+    }
+    m.absolute_position_frame.value = true;
+  } else if (frame != "rezero") {
+    throw std::invalid_argument("position_frame for " + name +
+                                " must be \"rezero\" or \"absolute\", not \"" +
+                                frame + "\"");
+  }
+  // The TalonFX enforces its soft limits on its own position, in every
+  // control mode, from thresholds applied once at configuration. A reset
+  // restarts a rezero frame wherever the mechanism is, so those thresholds
+  // would then sit elsewhere in the travel (limits [0, 50] after a reset at
+  // 30 allow 30 more past the top), and no rezero can move them.
+  if (m.soft_limits && !m.absolute_position_frame.value) {
+    throw std::invalid_argument(
+        "soft_limits = true for " + name +
+        " is refused in a \"rezero\" position frame: a device reset restarts "
+        "it, moving the soft limits along the travel. Set soft_limits = "
+        "false, or use a remote CANcoder's absolute position frame "
+        "(feedback = \"RemoteCANcoder\", position_frame = \"absolute\")");
+  }
   raw.config = std::move(m);
   return raw;
 }
 
+inline void CheckDeviceKeys(const toml::table& t, const std::string& name,
+                            std::string_view kind,
+                            std::initializer_list<std::string_view> allowed) {
+  for (auto&& [key, value] : t) {
+    if (std::find(allowed.begin(), allowed.end(), key.str()) == allowed.end()) {
+      std::string message = "unknown " + std::string(kind) + " key '" +
+                            std::string(key.str()) + "' for " + name;
+      if (key.source().path) {
+        message += " in " + *key.source().path;
+      }
+      throw std::invalid_argument(message);
+    }
+  }
+}
+
+// A digital input, with its simulated home switch (DigitalInputConfig::
+// sim_home_switch): the sim_closed_* keys need sim_motor, which needs a
+// finite sim_closed_at_rot. Whether sim_motor names a motor of the same
+// subsystem is checked once every device is parsed.
+inline RawDevice ParseDigitalInput(const toml::table& t,
+                                   const std::string& name) {
+  CheckDeviceKeys(t, name, "digital input",
+                  {"dio", "sim_motor", "sim_closed_at_rot", "sim_closed_above",
+                   "sim_closed_reads"});
+  hardware::DigitalInputConfig input{.dio = ReadRequired<int>(t, "dio", name)};
+  auto& sim = input.sim_home_switch;
+  if (!t.contains("sim_motor")) {
+    for (const char* key :
+         {"sim_closed_at_rot", "sim_closed_above", "sim_closed_reads"}) {
+      if (t.contains(key)) {
+        throw std::invalid_argument(std::string(key) + " for digital input " +
+                                    name + " needs sim_motor");
+      }
+    }
+    return RawDevice{.config = std::move(input)};
+  }
+  sim.motor = ReadNonEmpty(t, "sim_motor", "", "digital input");
+  sim.closed_at_rot = ReadRequired<double>(t, "sim_closed_at_rot", name);
+  if (!std::isfinite(sim.closed_at_rot)) {
+    throw std::invalid_argument("sim_closed_at_rot for digital input " + name +
+                                " must be finite");
+  }
+  sim.closed_above = Read(t, "sim_closed_above", sim.closed_above);
+  sim.closed_reads = Read(t, "sim_closed_reads", sim.closed_reads);
+  return RawDevice{.config = std::move(input)};
+}
+
 inline RawDevice ParseSensor(const toml::table& t, const std::string& name) {
+  CheckDeviceKeys(t, name, "sensor",
+                  {"type", "bus", "can_id", "inverted", "offset_rot"});
   hardware::SensorConfig s;
   const std::string type = Read<std::string>(t, "type", "CANcoder");
   if (type == "CANcoder") {
@@ -335,11 +775,14 @@ inline RawDevice ParseEncoder(const toml::table& t, const std::string& name) {
   hardware::EncoderConfig e;
   const std::string type = Read<std::string>(t, "type", "QuadratureEncoder");
   if (type == "QuadratureEncoder") {
+    CheckDeviceKeys(t, name, "encoder",
+                    {"type", "dio_a", "dio_b", "counts_per_rev"});
     e.kind = hardware::EncoderKind::kQuadrature;
     e.dio_a = ReadRequired<int>(t, "dio_a", name);
     e.dio_b = ReadRequired<int>(t, "dio_b", name);
     e.counts_per_rev = Read(t, "counts_per_rev", e.counts_per_rev);
   } else if (type == "DutyCycleEncoder") {
+    CheckDeviceKeys(t, name, "encoder", {"type", "dio", "offset_rot"});
     e.kind = hardware::EncoderKind::kDutyCycle;
     e.dio_a = ReadRequired<int>(t, "dio", name);
     e.offset_rot = Read(t, "offset_rot", e.offset_rot);
@@ -392,6 +835,29 @@ inline void ApplyTargetPolicy(const toml::table& tbl, TargetPolicy& policy,
   }
 }
 
+inline std::vector<std::pair<std::string, TeleopValue>> ParseTeleopAssignments(
+    const toml::table& table, const std::string& where) {
+  std::vector<std::pair<std::string, TeleopValue>> assignments;
+  std::vector<std::string> keys;
+  for (auto&& [key, value] : table) keys.emplace_back(key.str());
+  std::sort(keys.begin(), keys.end());
+  for (const auto& key : keys) {
+    const auto& value = table[key];
+    if (const auto* flag = value.as_boolean()) {
+      assignments.emplace_back(key, flag->get());
+    } else if (const auto* integer = value.as_integer()) {
+      assignments.emplace_back(key, integer->get());
+    } else if (const auto* real = value.as_floating_point()) {
+      assignments.emplace_back(key, real->get());
+    } else if (const auto* text = value.as_string()) {
+      assignments.emplace_back(key, text->get());
+    } else {
+      throw std::invalid_argument(where + "." + key + " must be a scalar");
+    }
+  }
+  return assignments;
+}
+
 inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
                                               const std::string& sub_name) {
   std::vector<TeleopBinding> result;
@@ -403,7 +869,7 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
                                 ".teleop] must be a table");
   }
   for (auto&& [k, v] : *teleop_tbl) {
-    if (k.str() != "bindings") {
+    if (k.str() != "bindings" && k.str() != "defaults") {
       throw std::invalid_argument("[subsystems." + sub_name +
                                   ".teleop] unknown key '" +
                                   std::string(k.str()) + "'");
@@ -514,28 +980,7 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
         throw std::invalid_argument(entry_where + "." + action +
                                     " must be a non-empty table");
       }
-      std::vector<std::string> wh_keys;
-      for (auto&& [fk, fv] : *wh) wh_keys.emplace_back(fk.str());
-      std::sort(wh_keys.begin(), wh_keys.end());
-      for (const auto& fk : wh_keys) {
-        const auto& fv = (*wh)[fk];
-        if (fv.is_table() || fv.is_array()) {
-          throw std::invalid_argument(entry_where + "." + action + "." + fk +
-                                      " must be a scalar");
-        }
-        if (fv.is_boolean()) {
-          assignments.emplace_back(fk, *fv.value<bool>());
-        } else if (fv.is_integer()) {
-          assignments.emplace_back(fk, *fv.value<int64_t>());
-        } else if (fv.is_floating_point()) {
-          assignments.emplace_back(fk, *fv.value<double>());
-        } else if (fv.is_string()) {
-          assignments.emplace_back(fk, *fv.value<std::string>());
-        } else {
-          throw std::invalid_argument(entry_where + "." + action + "." + fk +
-                                      " must be a scalar");
-        }
-      }
+      assignments = ParseTeleopAssignments(*wh, entry_where + "." + action);
     }
     if (has_axis) {
       if (entry->contains("while_held") || entry->contains("on_toggle")) {
@@ -600,12 +1045,34 @@ inline std::vector<TeleopBinding> ParseTeleop(const toml::table& sub_tbl,
 
 }  // namespace detail
 
+// A port flag's value: a decimal integer in [1, 65535], else
+// std::invalid_argument naming `flag` (std::stoi would accept "5802x" and a
+// uint16_t cast would wrap 70000 to 4464).
+inline uint16_t ParsePortFlag(std::string_view flag, std::string_view value) {
+  int port = 0;
+  const auto* end = value.data() + value.size();
+  const auto [ptr, ec] = std::from_chars(value.data(), end, port);
+  if (value.empty() || ec != std::errc{} || ptr != end || port < 1 ||
+      port > 65535) {
+    throw std::invalid_argument(std::string(flag) +
+                                " must be a port in [1, 65535], not '" +
+                                std::string(value) + "'");
+  }
+  return static_cast<uint16_t>(port);
+}
+
 // Effective controller endpoint: an explicit CLI value wins, otherwise the
-// deployment configuration. A zero CLI port means "not given".
+// deployment configuration. A zero CLI port means "not given". A CLI address
+// that is not an IPv4 literal throws std::invalid_argument, as config load
+// does for controller_address.
 inline std::string ResolveControllerAddress(const RobotConfig& config,
                                             const std::string& cli_override) {
-  if (!cli_override.empty()) return cli_override;
-  return config.controller_address;
+  if (cli_override.empty()) return config.controller_address;
+  if (!detail::IsIpv4Address(cli_override)) {
+    throw std::invalid_argument("--remote must be an IPv4 address, not '" +
+                                cli_override + "'");
+  }
+  return cli_override;
 }
 
 inline uint16_t ResolveControllerPort(const RobotConfig& config,
@@ -621,8 +1088,10 @@ inline uint16_t ResolveLocalPort(const RobotConfig& config,
 }
 
 // Parses the canonical single-file view. toml_data keeps the table, which is
-// what GetSubsystemTable answers from.
-inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
+// what GetSubsystemTable answers from. Build-time resolution can parse an
+// incomplete hardware inventory; only runtime requires a deployable inventory.
+inline RobotConfig ParseRobotConfigTable(toml::table tbl,
+                                         bool validate_hardware = true) {
   using detail::Read;
   using detail::ReadRequired;
   detail::CheckTopLevelKeys(tbl);
@@ -630,18 +1099,46 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   result.toml_data = tbl;
   auto& hw = result.hardware;
 
+  if (tbl.contains("robot") && !tbl["robot"].is_table()) {
+    throw std::invalid_argument("[robot] must be a table");
+  }
   if (auto* robot = tbl["robot"].as_table()) {
     hw.period_us = Read(*robot, "period_us", hw.period_us);
     hw.command_timeout_us =
         Read(*robot, "command_timeout_us", hw.command_timeout_us);
     hw.status_hz = Read(*robot, "status_hz", hw.status_hz);
     hw.commissioned = Read(*robot, "commissioned", hw.commissioned);
+    // A commissioned robot drives hardware, so a mode its policy lists with
+    // no producer would lose that mode on the field: it requires coverage,
+    // and refuses a config that turns it off.
+    if (hw.commissioned && robot->contains("require_target_coverage") &&
+        !Read(*robot, "require_target_coverage", true)) {
+      throw std::invalid_argument(
+          "[robot] commissioned = true requires target coverage, but "
+          "require_target_coverage = false; remove the key or set it to "
+          "true, and give each subsystem's modes a producer or empty them "
+          "in its [targets]");
+    }
+    result.require_target_coverage =
+        Read(*robot, "require_target_coverage", hw.commissioned);
+    result.simulation_only =
+        Read(*robot, "simulation_only", result.simulation_only);
     result.controller_address = detail::ReadNonEmpty(
         *robot, "controller_address", result.controller_address, "[robot]");
+    if (!detail::IsIpv4Address(result.controller_address)) {
+      throw std::invalid_argument(
+          "[robot] field 'controller_address' must be an IPv4 address such "
+          "as \"10.56.87.2\", not '" +
+          result.controller_address + "': the bridge resolves no hostname");
+    }
     result.controller_port = detail::ReadPort(
         *robot, "controller_port", result.controller_port, "[robot]");
     result.local_port =
         detail::ReadPort(*robot, "local_port", result.local_port, "[robot]");
+    result.log_keep_sessions = detail::ReadPositive(
+        *robot, "log_keep_sessions", result.log_keep_sessions, "[robot]");
+    result.log_max_bytes = detail::ReadPositive(
+        *robot, "log_max_bytes", result.log_max_bytes, "[robot]");
     if (robot->contains("targets")) {
       const auto* targets = (*robot)["targets"].as_table();
       if (targets == nullptr) {
@@ -659,7 +1156,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     for (auto&& [k, v] : *studio) {
       if (k.str() != "bridge" && k.str() != "webroot" &&
           k.str() != "http_port" && k.str() != "topic" &&
-          k.str() != "pose_topic") {
+          k.str() != "pose_topic" && k.str() != "max_clients" &&
+          k.str() != "dashboard") {
         throw std::invalid_argument("[studio] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -669,12 +1167,24 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     s.webroot = detail::ReadNonEmpty(*studio, "webroot", s.webroot, "[studio]");
     s.http_port =
         detail::ReadPort(*studio, "http_port", s.http_port, "[studio]");
+    if (studio->contains("max_clients")) {
+      const auto clients = (*studio)["max_clients"].value<int64_t>();
+      if (!clients || *clients < 1 || *clients > 64) {
+        throw std::invalid_argument(
+            "[studio] field 'max_clients' must be an integer in [1, 64]");
+      }
+      s.max_clients = static_cast<uint16_t>(*clients);
+    }
     if (studio->contains("topic")) {
       s.topic = detail::ReadNonEmpty(*studio, "topic", "", "[studio]");
     }
     if (studio->contains("pose_topic")) {
       s.pose_topic =
           detail::ReadNonEmpty(*studio, "pose_topic", "", "[studio]");
+    }
+    if (studio->contains("dashboard")) {
+      s.dashboard = detail::ReadNonEmpty(*studio, "dashboard", "", "[studio]");
+      detail::RequireStudioDashboard("config", s.dashboard);
     }
   }
 
@@ -687,14 +1197,20 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
   for (auto&& [sub_key, sub_val] : *subsystems_tbl) {
     const std::string sub_name(sub_key.str());
     auto* sub_tbl = sub_val.as_table();
-    if (!sub_tbl) continue;
+    if (!sub_tbl) {
+      throw std::invalid_argument("[subsystems." + sub_name +
+                                  "] must be a table");
+    }
     result.subsystems[sub_name].subsystem = sub_name;
+    detail::CheckSubsystemKeys(*sub_tbl, "[subsystems." + sub_name + "]");
     // The launcher starts a subsystem's `node`; a malformed one must not
     // silently leave the subsystem without a process.
     if (sub_tbl->contains("node")) {
       detail::ReadNonEmpty(*sub_tbl, "node", "",
                            ("[subsystems." + sub_name + "]").c_str());
     }
+    // Fail closed: unknown nodes are required for safe robot operation.
+    detail::Read<bool>(*sub_tbl, "critical", true);
     TargetPolicy& policy = result.subsystem_targets[sub_name] = result.targets;
     if (sub_tbl->contains("targets")) {
       const auto* targets = (*sub_tbl)["targets"].as_table();
@@ -704,13 +1220,36 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
       }
       detail::ApplyTargetPolicy(*targets, policy, where);
     }
+    {
+      const std::string where = "[subsystems." + sub_name + "]";
+      for (auto& [name, path] : detail::ReadTrajectories(*sub_tbl, where)) {
+        detail::RequireTrajectoryFile(where, name, path);
+        result.trajectories[sub_name].insert_or_assign(name, std::move(path));
+      }
+    }
     auto bindings = detail::ParseTeleop(*sub_tbl, sub_name);
     if (!bindings.empty()) {
       result.teleop[sub_name] = std::move(bindings);
     }
+    if (const auto* teleop = (*sub_tbl)["teleop"].as_table();
+        teleop != nullptr && teleop->contains("defaults")) {
+      const auto* defaults = (*teleop)["defaults"].as_table();
+      const std::string where = "[subsystems." + sub_name + "] teleop.defaults";
+      if (defaults == nullptr) {
+        throw std::invalid_argument(where + " must be a table");
+      }
+      result.teleop_defaults[sub_name] =
+          detail::ParseTeleopAssignments(*defaults, where);
+    }
     auto each = [&](const char* section, auto parse) {
       auto* devices = (*sub_tbl)[section].as_table();
-      if (!devices) return;
+      if (!devices) {
+        if (sub_tbl->contains(section)) {
+          throw std::invalid_argument(std::string(section) +
+                                      " must be a table");
+        }
+        return;
+      }
       for (auto&& [dev_key, dev_val] : *devices) {
         const std::string name(dev_key.str());
         auto* dev_tbl = dev_val.as_table();
@@ -718,29 +1257,35 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
           throw std::invalid_argument(std::string(section) + " entry '" + name +
                                       "' must be a table");
         }
-        detail::RawDevice raw = parse(*dev_tbl, name);
-        raw.subsystem = sub_name;
-        raw.name = name;
-        raw_devices.push_back(std::move(raw));
+        try {
+          detail::RawDevice raw = parse(*dev_tbl, name);
+          raw.subsystem = sub_name;
+          raw.name = name;
+          raw_devices.push_back(std::move(raw));
+        } catch (const std::invalid_argument& error) {
+          throw std::invalid_argument("[subsystems." + sub_name + "]." +
+                                      section + "." + name + ": " +
+                                      error.what());
+        }
       }
     };
     each("motors", detail::ParseMotor);
     each("sensors", detail::ParseSensor);
     each("encoders", detail::ParseEncoder);
-    each("digital_inputs", [](const toml::table& t, const std::string& n) {
-      return detail::RawDevice{.config = hardware::DigitalInputConfig{
-                                   .dio = ReadRequired<int>(t, "dio", n)}};
-    });
+    each("digital_inputs", detail::ParseDigitalInput);
     each("digital_outputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "digital output", {"dio"});
       return detail::RawDevice{.config = hardware::DigitalOutputConfig{
                                    .dio = ReadRequired<int>(t, "dio", n)}};
     });
     each("analog_inputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "analog input", {"channel"});
       return detail::RawDevice{
           .config = hardware::AnalogInputConfig{
               .channel = ReadRequired<int>(t, "channel", n)}};
     });
     each("pwm_outputs", [](const toml::table& t, const std::string& n) {
+      detail::CheckDeviceKeys(t, n, "PWM output", {"channel"});
       return detail::RawDevice{
           .config = hardware::PwmConfig{
               .channel = ReadRequired<int>(t, "channel", n)}};
@@ -804,6 +1349,21 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
     }
     require_same_subsystem(*master, dev.subsystem, dev.name);
     motor->master_id = std::get<hardware::MotorConfig>(master->config).id;
+  }
+
+  // A simulated home switch's motor is a motor of the input's subsystem.
+  for (const auto& dev : raw_devices) {
+    const auto* input = std::get_if<hardware::DigitalInputConfig>(&dev.config);
+    if (input == nullptr || input->sim_home_switch.motor.empty()) continue;
+    const std::string& motor = input->sim_home_switch.motor;
+    const auto* found = find(motor);
+    if (found == nullptr || found->subsystem != dev.subsystem ||
+        !std::holds_alternative<hardware::MotorConfig>(found->config)) {
+      throw std::invalid_argument(
+          "[subsystems." + dev.subsystem + "].digital_inputs." + dev.name +
+          ": sim_motor '" + motor + "' names no motor of subsystem '" +
+          dev.subsystem + "'");
+    }
   }
 
   // Swerve geometry module references must name this subsystem's devices.
@@ -871,7 +1431,29 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl) {
         dev.config);
   }
 
-  hardware::Validate(hw);
+  if (validate_hardware) {
+    hardware::Validate(hw);
+    // The bridge holds an actuator owner's last request for
+    // max(2 x period_us, command_timeout_us / 2), and the merged command
+    // carries the oldest observation it holds, which the gateway refuses once
+    // that is command_timeout_us old. At period_us <= command_timeout_us / 4
+    // the owner timeout is half the timeout, so a silent owner leaves the
+    // merge while its last observation can still be younger than the
+    // gateway's limit; a slower owner would hold it longer and expire every
+    // owner's command with its own.
+    for (const auto& [name, owned] : result.subsystems) {
+      if (!owned.owns_actuators()) continue;
+      const auto period_us = Read(*result.GetSubsystemTable(name), "period_us",
+                                  int64_t{hw.period_us});
+      if (period_us > int64_t{hw.command_timeout_us / 4}) {
+        throw std::invalid_argument(
+            "[subsystems." + name + "] owns actuators, so its period_us (" +
+            std::to_string(period_us) +
+            ") must be at most a quarter of [robot] command_timeout_us (" +
+            std::to_string(hw.command_timeout_us) + ")");
+      }
+    }
+  }
   return result;
 }
 
@@ -894,7 +1476,7 @@ inline toml::table ParseTomlFile(const std::string& path) {
   std::stringstream ss;
   ss << f.rdbuf();
   try {
-    return toml::parse(ss.str());
+    return toml::parse(ss.str(), path);
   } catch (const toml::parse_error& err) {
     throw std::invalid_argument("TOML parse error in " + path + ": " +
                                 err.what());
@@ -964,9 +1546,13 @@ inline void MergeManifests(toml::array& base_arr, const toml::array& child_arr,
   }
 }
 
+template <typename Reader = decltype(&ParseTomlFile),
+          typename DataFile = decltype(&IgnoreDataFile)>
 inline toml::table ExpandManifest(const toml::array& manifest,
                                   const std::string& path,
-                                  bool paths_normalized = false) {
+                                  bool paths_normalized = false,
+                                  Reader read = ParseTomlFile,
+                                  DataFile data = IgnoreDataFile) {
   namespace fs = std::filesystem;
   const fs::path base = fs::path(path).parent_path();
   auto resolve_entry_path = [&](std::string_view p) {
@@ -1007,7 +1593,11 @@ inline toml::table ExpandManifest(const toml::array& manifest,
           ReadNonEmpty(*entry, "defaults", "", "[[subsystems]] entry"));
     }
     const std::string file = resolve_entry_path(*rel_view);
-    toml::table sub_file = ParseTomlFile(file);
+    toml::table sub_file = read(file);
+    CheckSubsystemFileKeys(sub_file, file);
+    RefuseHeaderTrajectories(sub_file, file);
+    TrajectorySources sources;
+    RebaseTrajectories(sub_file, file, file, sources);
 
     auto* header = sub_file["subsystem"].as_table();
     if (!header || (*header)["name"].value<std::string_view>() != name) {
@@ -1032,11 +1622,24 @@ inline toml::table ExpandManifest(const toml::array& manifest,
       defaults_file = *entry_defaults;
     }
     if (defaults_file) {
-      toml::table merged = ParseTomlFile(*defaults_file);
+      toml::table merged = read(*defaults_file);
+      CheckSubsystemFileKeys(merged, *defaults_file);
+      RefuseHeaderTrajectories(merged, *defaults_file);
+      TrajectorySources defaults_sources;
+      RebaseTrajectories(merged, *defaults_file, *defaults_file,
+                         defaults_sources);
+      // The subsystem file's entries override its defaults' entries.
+      for (auto& [entry, where] : sources) {
+        defaults_sources.insert_or_assign(entry, where);
+      }
+      sources = std::move(defaults_sources);
       MergeTables(merged, sub_file);
       sub_file = std::move(merged);
       header = sub_file["subsystem"].as_table();
     }
+    // Only the effective entries, after the defaults merge, are listed and
+    // required.
+    RequireTrajectories(sub_file, sources, file, data);
     toml::table view;
     for (auto&& [k, v] : *header) {
       if (k.str() != "name" && k.str() != "defaults") {
@@ -1055,10 +1658,28 @@ inline toml::table ExpandManifest(const toml::array& manifest,
 
 }  // namespace detail
 
-inline RobotConfig ParseRobotConfig(const std::string& path) {
+// Resolve once for runtime and build tools. Readers may track dependencies or
+// supply pending file contents without changing include/manifest semantics.
+// `data(path, label)` sees every non-TOML file the config names (the
+// effective [trajectories] entries and [studio] dashboard), resolved against
+// the file that names it, with a label naming that file and the key, before
+// config load requires it to exist.
+template <typename Reader = decltype(&detail::ParseTomlFile),
+          typename DataFile = decltype(&detail::IgnoreDataFile)>
+inline toml::table ResolveRobotConfig(const std::string& path,
+                                      Reader read = detail::ParseTomlFile,
+                                      DataFile data = detail::IgnoreDataFile) {
   namespace fs = std::filesystem;
-  toml::table tbl = detail::ParseTomlFile(path);
+  toml::table tbl = read(path);
   detail::CheckTopLevelKeys(tbl);
+  // [subsystems.<name>.trajectories] in this file and its include: rebased
+  // now, required once the include is merged, so an entry this file
+  // overrides is never required.
+  std::map<std::string, detail::TrajectorySources> table_sources;
+  detail::RebaseSubsystemTablesTrajectories(tbl, path, table_sources);
+  // Where the effective [studio] dashboard was set: this file's wins over
+  // its include's.
+  std::string dashboard_source = detail::RebaseStudioDashboard(tbl, path);
   if (auto* manifest = tbl["subsystems"].as_array()) {
     detail::NormalizeManifestPaths(*manifest, path);
   }
@@ -1071,11 +1692,34 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
         (inc_rel.is_absolute() || base_dir.empty() ? inc_rel
                                                    : base_dir / inc_rel)
             .string();
-    toml::table base = detail::ParseTomlFile(inc_file);
+    toml::table base = read(inc_file);
     detail::CheckTopLevelKeys(base);
+    const std::string base_dashboard =
+        detail::RebaseStudioDashboard(base, inc_file);
+    if (dashboard_source.empty()) dashboard_source = base_dashboard;
+    std::map<std::string, detail::TrajectorySources> base_sources;
+    detail::RebaseSubsystemTablesTrajectories(base, inc_file, base_sources);
+    for (auto& [subsystem, entries] : table_sources) {
+      for (auto& [entry, where] : entries) {
+        base_sources[subsystem].insert_or_assign(entry, where);
+      }
+    }
+    table_sources = std::move(base_sources);
     if (base.contains("include")) {
       throw std::invalid_argument("nested 'include' is not supported in " +
                                   inc_file);
+    }
+    // A simulation-only config stays one in every config that includes it:
+    // an override back to false would make simulation settings drivable.
+    if (base["robot"]["simulation_only"].value_exact<bool>().value_or(false) &&
+        !tbl["robot"]["simulation_only"].value_exact<bool>().value_or(true)) {
+      throw std::invalid_argument(
+          path +
+          " sets [robot] simulation_only = false, but the file it "
+          "includes, " +
+          inc_file +
+          ", sets it true; a simulation-only config cannot be included as "
+          "a deployable one");
     }
     if (auto* base_manifest = base["subsystems"].as_array()) {
       detail::NormalizeManifestPaths(*base_manifest, inc_file);
@@ -1087,19 +1731,71 @@ inline RobotConfig ParseRobotConfig(const std::string& path) {
         tbl.erase("subsystems");
       } else if (tbl.contains("subsystems")) {
         base.insert_or_assign(
-            "subsystems", detail::ExpandManifest(*base_subs, inc_file,
-                                                 /*paths_normalized=*/true));
+            "subsystems",
+            detail::ExpandManifest(*base_subs, inc_file,
+                                   /*paths_normalized=*/true, read, data));
       }
     }
     detail::MergeTables(base, tbl);
     tbl = std::move(base);
   }
+  if (!dashboard_source.empty()) {
+    const std::string dashboard =
+        tbl["studio"]["dashboard"].value_or(std::string{});
+    data(dashboard, dashboard_source + ": [studio] dashboard");
+    detail::RequireStudioDashboard(dashboard_source, dashboard);
+  }
+  if (auto* subs = tbl["subsystems"].as_table()) {
+    for (const auto& [subsystem, entries] : table_sources) {
+      if (const auto* sub = (*subs)[subsystem].as_table()) {
+        detail::RequireTrajectories(
+            *sub, entries, path + " [subsystems." + subsystem + "]", data);
+      }
+    }
+  }
   if (auto* manifest = tbl["subsystems"].as_array()) {
     tbl.insert_or_assign(
         "subsystems",
-        detail::ExpandManifest(*manifest, path, /*paths_normalized=*/true));
+        detail::ExpandManifest(*manifest, path,
+                               /*paths_normalized=*/true, read, data));
   }
-  return ParseRobotConfigTable(std::move(tbl));
+  return tbl;
+}
+
+inline RobotConfig ParseRobotConfig(const std::string& path) {
+  return ParseRobotConfigTable(ResolveRobotConfig(path));
+}
+
+// The files of the config at `path` (itself, its include, subsystem and
+// defaults files) that set `key` (a dotted path, "camera.fps") of
+// `subsystem`'s table, for a diagnostic to name: a [subsystems.<subsystem>]
+// table, or a subsystem file whose [subsystem] names it, or a defaults file
+// (whose [subsystem] names none). Empty when the config no longer resolves.
+inline std::vector<std::string> SubsystemKeyFiles(const std::string& path,
+                                                  std::string_view subsystem,
+                                                  std::string_view key) {
+  std::vector<std::string> out;
+  const auto read = [&](const std::string& file) {
+    toml::table document = detail::ParseTomlFile(file);
+    bool sets = false;
+    if (const auto* tables = document["subsystems"].as_table()) {
+      if (const auto* table = (*tables)[subsystem].as_table()) {
+        sets = static_cast<bool>(table->at_path(key));
+      }
+    } else if (const auto* header = document["subsystem"].as_table()) {
+      const auto name = (*header)["name"].value<std::string_view>();
+      sets = (!name || *name == subsystem) &&
+             (document.at_path(key) || header->at_path(key));
+    }
+    if (sets && std::ranges::find(out, file) == out.end()) out.push_back(file);
+    return document;
+  };
+  try {
+    ResolveRobotConfig(path, read);
+  } catch (const std::exception&) {
+    return {};
+  }
+  return out;
 }
 
 }  // namespace talos::config

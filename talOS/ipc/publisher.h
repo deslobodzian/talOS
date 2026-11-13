@@ -2,7 +2,9 @@
 
 #include <flatbuffers/flatbuffers.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <span>
 #include <string>
 
 #include "concepts.h"
@@ -21,6 +23,12 @@ class RawPublisher {
   }
   WriteStatus write(std::span<const std::byte> message) {
     return queue_.write(message);
+  }
+  // Stamped `publish_time_ns` (the event Poller's clock), so a writer that
+  // logs its publication can record the stamp readers see.
+  WriteStatus write(std::span<const std::byte> message,
+                    std::int64_t publish_time_ns) {
+    return queue_.write(message, publish_time_ns);
   }
 
   RTMSQueue& queue() { return queue_; }
@@ -57,6 +65,13 @@ class Publisher {
     return publisher_.write(
         std::as_bytes(std::span<const Message, 1>{&message, 1}));
   }
+  WriteStatus write(const Message& message, std::int64_t publish_time_ns) {
+    return publisher_.write(
+        std::as_bytes(std::span<const Message, 1>{&message, 1}),
+        publish_time_ns);
+  }
+
+  RTMSQueue& queue() { return publisher_.queue(); }
 
  private:
   RawPublisher publisher_;

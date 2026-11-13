@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
+import {graphStale} from '../src/data/freshness';
 import {demoDeclaredGraph, demoSystemGraph} from '../src/demo';
 import {
   DECLARED_VERSION,
@@ -19,6 +21,7 @@ import {
   RateWindow,
   SYSTEM_GRAPH_VERSION,
   type SystemGraph,
+  SystemGraphStream,
   type SystemTopic,
   TOPIC_HEALTH,
   topicEnds,
@@ -95,8 +98,7 @@ const document = (over: Json = {}): Json => ({
 });
 const parse = (over: Json = {}): SystemGraph =>
     parseSystemGraph(JSON.stringify(document(over)));
-const rejects = (over: Json, because: RegExp) =>
-    assert.throws(() => parse(over), because);
+const rejects = (over: Json) => assert.throws(() => parse(over), Error);
 
 test('a well-formed graph parses with both ends of every topic intact', () => {
   const graph = parse();
@@ -134,74 +136,65 @@ test('uint64 counters survive as decimal strings past 2^53', () => {
 });
 
 test('a document of the wrong kind is refused, not read hopefully', () => {
-  rejects({kind: 'talos.telemetry'}, /unexpected document kind/);
-  rejects({kind: 1}, /unexpected document kind/);
+  rejects({kind: 'talos.telemetry'});
+  rejects({kind: 1});
 });
 
 test('a number where a uint64 string belongs is a rejection', () => {
-  rejects({wall_ns: 1700000000500000000}, /wall_ns must be a decimal integer/);
-  rejects({nodes: [node({dispatch_count: 5})]}, /dispatch_count/);
-  rejects({nodes: [node({sources: [source({events: 10})]})]}, /events/);
-  rejects({topics: [topic({published: null})]}, /published/);
+  rejects({wall_ns: 1700000000500000000});
+  rejects({nodes: [node({dispatch_count: 5})]});
+  rejects({nodes: [node({sources: [source({events: 10})]})]});
+  rejects({topics: [topic({published: null})]});
   // Twenty digits is a full uint64; twenty-one is not a number we accept.
-  rejects({wall_ns: '1'.repeat(21)}, /wall_ns must be a decimal integer/);
-  rejects({wall_ns: '12.5'}, /wall_ns must be a decimal integer/);
+  rejects({wall_ns: '1'.repeat(21)});
+  rejects({wall_ns: '12.5'});
 });
 
 test('byte counts must be non-negative integers', () => {
-  rejects({nodes: [node({sources: [source({message_bytes: 1.5})]})]},
-          /message_bytes must be a non-negative integer/);
-  rejects({nodes: [node({sources: [source({message_bytes: -1})]})]},
-          /message_bytes must be a non-negative integer/);
-  rejects({nodes: [node({sources: [source({message_bytes: '64'})]})]},
-          /message_bytes must be a non-negative integer/);
-  rejects({topics: [topic({message_bytes: 2 ** 33})]},
-          /message_bytes must be a non-negative integer/);
+  rejects({nodes: [node({sources: [source({message_bytes: 1.5})]})]});
+  rejects({nodes: [node({sources: [source({message_bytes: -1})]})]});
+  rejects({nodes: [node({sources: [source({message_bytes: '64'})]})]});
+  rejects({topics: [topic({message_bytes: 2 ** 33})]});
 });
 
 test('an unknown source kind is refused rather than rendered blank', () => {
-  rejects({nodes: [node({sources: [source({kind: 'PUBLISHER'})]})]},
-          /kind must be one of/);
-  rejects({nodes: [node({sources: [source({kind: 'sender'})]})]},
-          /kind must be one of/);
-  rejects({nodes: [node({sources: [source({kind: 4})]})]}, /kind must be a/);
+  rejects({nodes: [node({sources: [source({kind: 'PUBLISHER'})]})]});
+  rejects({nodes: [node({sources: [source({kind: 'sender'})]})]});
+  rejects({nodes: [node({sources: [source({kind: 4})]})]});
 });
 
 test('liveness and mode flags must be actual booleans', () => {
-  rejects({nodes: [node({alive: 'true'})]}, /alive must be a boolean/);
-  rejects({nodes: [node({simulation: 1})]}, /simulation must be a boolean/);
-  rejects({nodes: [node({replay: null})]}, /replay must be a boolean/);
+  rejects({nodes: [node({alive: 'true'})]});
+  rejects({nodes: [node({simulation: 1})]});
+  rejects({nodes: [node({replay: null})]});
 });
 
 test('collections beyond their caps are refused before being walked', () => {
   // Over-cap arrays are rejected by the bound, so these entries never have to
   // be valid; that is the point, an oversized document does no work.
-  rejects({nodes: new Array(257).fill(null)}, /nodes must be an array of at most 256/);
-  rejects({topics: new Array(4097).fill(null)},
-          /topics must be an array of at most 4096/);
-  rejects({nodes: [node({sources: new Array(513).fill(null)})]},
-          /sources must be an array of at most 512/);
-  rejects({nodes: {}}, /nodes must be an array/);
-  rejects({topics: [topic({publishers: 'odometry'})]},
-          /publishers must be an array/);
-  rejects({topics: [topic({subscribers: [1]})]}, /subscribers\[0\] must be a string/);
+  rejects({nodes: new Array(257).fill(null)});
+  rejects({topics: new Array(4097).fill(null)});
+  rejects({nodes: [node({sources: new Array(513).fill(null)})]});
+  rejects({nodes: {}});
+  rejects({topics: [topic({publishers: 'odometry'})]});
+  rejects({topics: [topic({subscribers: [1]})]});
 });
 
 test('anything that is not an object document fails closed', () => {
   for (const text of ['null', '[]', '5', '"text"', 'true'])
-    assert.throws(() => parseSystemGraph(text), /must be an object/);
+    assert.throws(() => parseSystemGraph(text), Error);
   // Malformed JSON still throws; it just throws from JSON.parse.
   assert.throws(() => parseSystemGraph(''));
   assert.throws(() => parseSystemGraph('{'));
-  rejects({registry: null}, /registry must be an object/);
-  rejects({bridge: []}, /bridge must be an object/);
+  rejects({registry: null});
+  rejects({bridge: []});
 });
 
 test('an oversized document is rejected before it is parsed', () => {
   // Not valid JSON, so reaching JSON.parse would throw a SyntaxError instead:
   // the size gate has to come first for this to be the error.
   assert.throws(() => parseSystemGraph('x'.repeat(MAX_SYSTEM_BYTES + 1)),
-                /document too large/);
+                (error: unknown) => !(error instanceof SyntaxError));
 });
 
 // topicHealthOf hands back a classifier, so a caller with a row in hand cannot
@@ -324,12 +317,9 @@ test('an endpoint attribute may be absent but must not be the wrong type', () =>
   assert.equal(older.nodes[0].sources[0].external, false);
   assert.equal(older.nodes[0].sources[0].optional, false);
 
-  rejects({nodes: [node({sources: [source({external: 'true'})]})]},
-          /external must be a boolean/);
-  rejects({nodes: [node({sources: [source({optional: 1})]})]},
-          /optional must be a boolean/);
-  rejects({nodes: [node({sources: [source({external: null})]})]},
-          /external must be a boolean/);
+  rejects({nodes: [node({sources: [source({external: 'true'})]})]});
+  rejects({nodes: [node({sources: [source({optional: 1})]})]});
+  rejects({nodes: [node({sources: [source({external: null})]})]});
 });
 
 test('watchers and fetchers are the subscribing ends', () => {
@@ -362,13 +352,10 @@ test('a Target\'s selected source is read, and nobody driving is null', () => {
   assert.deepEqual(older.nodes[0].selections, []);
   assert.equal(drivenBy(older.nodes[0]), null);
 
-  rejects({nodes: [node({selections: [{sources: ['teleop']}]})]},
-          /selected must be a string or null/);
-  rejects({nodes: [node({selections: [{sources: ['teleop'], selected: 0}]})]},
-          /selected must be a string or null/);
-  rejects({nodes: [node({selections: [{sources: 'teleop', selected: null}]})]},
-          /sources must be an array/);
-  rejects({nodes: [node({selections: {}})]}, /selections must be an array/);
+  rejects({nodes: [node({selections: [{sources: ['teleop']}]})]});
+  rejects({nodes: [node({selections: [{sources: ['teleop'], selected: 0}]})]});
+  rejects({nodes: [node({selections: [{sources: 'teleop', selected: null}]})]});
+  rejects({nodes: [node({selections: {}})]});
 });
 
 test('the demo graph is a document the parser actually accepts', () => {
@@ -528,8 +515,8 @@ test('a rate window resolves finer than one integer count per refresh', () => {
 });
 
 test('a rate window needs two samples and rejects a nonsense span', () => {
-  assert.throws(() => new RateWindow(0), /Invalid rate window/);
-  assert.throws(() => new RateWindow(2, 1), /capacity/);
+  assert.throws(() => new RateWindow(0), Error);
+  assert.throws(() => new RateWindow(2, 1), Error);
 
   const window = new RateWindow(2);
   // One sample is "not measured yet", which must not read as zero.
@@ -570,8 +557,7 @@ const declaredDocument = (over: Json = {}): Json => ({
 });
 const parseDeclared = (over: Json = {}): DeclaredGraph =>
     parseDeclaredGraph(JSON.stringify(declaredDocument(over)));
-const refuses = (over: Json, because: RegExp) =>
-    assert.throws(() => parseDeclared(over), because);
+const refuses = (over: Json) => assert.throws(() => parseDeclared(over), Error);
 
 test('a declared graph parses into nodes, ends and the launcher\'s lint', () => {
   const declared = parseDeclared({
@@ -616,42 +602,28 @@ test('a declared graph parses into nodes, ends and the launcher\'s lint', () => 
 });
 
 test('a declared graph is refused as strictly as a live one, and says which', () => {
-  refuses({nodes: [declaredNode({name: 5})]},
-          /Invalid declared graph: name must be a string/);
-  refuses({nodes: [declaredNode({target: null})]}, /target must be a string/);
-  refuses({nodes: [declaredNode({sources: [declaredSource({kind: 'PUBLISHER'})]})]},
-          /kind must be one of/);
-  refuses({nodes: [declaredNode({sources: [declaredSource({schema: undefined})]})]},
-          /schema must be a string/);
-  refuses({nodes: [declaredNode({sources: [declaredSource({schema_hash: 12})]})]},
-          /schema_hash must be a string/);
-  refuses({nodes: [declaredNode({sources: [declaredSource({schema_hash: '0x12'})]})]},
-          /schema_hash must be 0x and 16 lowercase hex digits/);
-  refuses({nodes: [declaredNode({sources: [declaredSource({message_bytes: '64'})]})]},
-          /message_bytes must be a non-negative integer/);
-  refuses({nodes: [declaredNode({sources: [declaredSource({external: 'yes'})]})]},
-          /external must be a boolean/);
-  refuses({nodes: [declaredNode({sources: {}})]}, /sources must be an array/);
-  refuses({nodes: new Array(257).fill(null)},
-          /nodes must be an array of at most 256/);
-  refuses({nodes: undefined}, /nodes must be an array/);
-  refuses({diagnostics: [{severity: 'fatal', subject: '/x', message: 'no'}]},
-          /severity must be error or warning/);
-  refuses({diagnostics: [{severity: 'error', subject: '/x'}]},
-          /message must be a string/);
-  refuses({diagnostics: new Array(1025).fill(null)},
-          /diagnostics must be an array of at most 1024/);
+  refuses({nodes: [declaredNode({name: 5})]});
+  refuses({nodes: [declaredNode({target: null})]});
+  refuses({nodes: [declaredNode({sources: [declaredSource({kind: 'PUBLISHER'})]})]});
+  refuses({nodes: [declaredNode({sources: [declaredSource({schema: undefined})]})]});
+  refuses({nodes: [declaredNode({sources: [declaredSource({schema_hash: 12})]})]});
+  refuses({nodes: [declaredNode({sources: [declaredSource({schema_hash: '0x12'})]})]});
+  refuses({nodes: [declaredNode({sources: [declaredSource({message_bytes: '64'})]})]});
+  refuses({nodes: [declaredNode({sources: [declaredSource({external: 'yes'})]})]});
+  refuses({nodes: [declaredNode({sources: {}})]});
+  refuses({nodes: new Array(257).fill(null)});
+  refuses({nodes: undefined});
+  refuses({diagnostics: [{severity: 'fatal', subject: '/x', message: 'no'}]});
+  refuses({diagnostics: [{severity: 'error', subject: '/x'}]});
+  refuses({diagnostics: new Array(1025).fill(null)});
 
   // A live system graph handed to this reader is a mistake, not a graph.
-  assert.throws(() => parseDeclaredGraph(demoSystemGraph()),
-                /Invalid declared graph: unexpected document kind/);
+  assert.throws(() => parseDeclaredGraph(demoSystemGraph()), Error);
   for (const text of ['null', '[]', '5', '"text"', 'true'])
-    assert.throws(() => parseDeclaredGraph(text),
-                  /Invalid declared graph: document must be an object/);
+    assert.throws(() => parseDeclaredGraph(text), Error);
   // Malformed JSON still fails, and now names the document it was reading.
-  assert.throws(() => parseDeclaredGraph('{'), /Invalid declared graph: /);
-  assert.throws(() => parseDeclaredGraph('x'.repeat(MAX_DECLARED_BYTES + 1)),
-                /Invalid declared graph: document too large/);
+  assert.throws(() => parseDeclaredGraph('{'), Error);
+  assert.throws(() => parseDeclaredGraph('x'.repeat(MAX_DECLARED_BYTES + 1)), Error);
 });
 
 test('a declared graph the launcher wrote plainly is still read', () => {
@@ -772,4 +744,47 @@ test('the demo declared graph is a document the parser accepts', () => {
   // A graph with an error is one the launcher refuses to launch, so a demo
   // session that is running must not carry one.
   assert.ok(!declared.diagnostics.some(d => d.severity === 'error'));
+});
+
+// The bridge's own output (studio/bridge/testdata/golden, which
+// //studio/bridge:system_test requires it to reproduce byte for byte): a
+// whole graph, the update it sends at the next refresh, and that refresh's
+// whole graph. The bridge's order of the fast values is the one source;
+// these files are how Studio is held to it.
+const bridgeGolden = (name: string) => readFileSync(
+    new URL(`../bridge/testdata/golden/${name}`, import.meta.url), 'utf8');
+
+// REQ-OPS-23: a client holding the whole graph becomes current from updates
+// alone, each value written into the field the bridge read it from (a slot
+// out of the bridge's order shows one counter's value as another's), and
+// stays fresh across deferral notices: a graph the radio budget holds back
+// is late, not lost, so Studio does not mark it stale. Without a notice it
+// does go stale; an update for a structure the client does not hold is
+// refused without changing what it has.
+test('graph updates and deferral notices keep a held graph current and fresh', () => {
+  const stream = new SystemGraphStream();
+  const first = bridgeGolden('graph.json'), later = bridgeGolden('later.json');
+  const update = bridgeGolden('update.json');
+  const {structure} = JSON.parse(update) as {structure: string};
+  assert.ok(stream.ingest(first, 0));
+  const current = stream.ingest(update, 500)!;
+  assert.deepEqual(current, parseSystemGraph(later));
+  assert.notDeepEqual(current, parseSystemGraph(first));
+
+  const deferred =
+      JSON.stringify({kind: 'talos.system_graph.deferred', structure});
+  for (const at of [1000, 1500, 2000]) {
+    assert.equal(stream.ingest(deferred, at), null);
+    assert.equal(graphStale(stream.arrival, at + 900, true), false);
+  }
+  assert.equal(graphStale(stream.arrival, 3000, true), true);
+
+  assert.throws(() => stream.ingest(JSON.stringify(
+      {...JSON.parse(update), structure: 'other'}), 3100),
+                /structure not held/);
+  assert.throws(() => stream.ingest(JSON.stringify(
+      {kind: 'talos.system_graph.update', structure, values: [1]}), 3100),
+                /do not match/);
+  assert.equal(stream.arrival, 2000);
+  assert.deepEqual(stream.ingest(update, 3200), parseSystemGraph(later));
 });

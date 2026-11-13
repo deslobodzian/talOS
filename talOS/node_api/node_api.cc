@@ -70,6 +70,33 @@ hardware::Mode MotorMode(std::int32_t mode) {
   return static_cast<hardware::Mode>(mode);
 }
 
+// DeviceKindOf and MotorMode cast the ABI value straight to the C++ enum, so
+// every enumerator must match; Python takes these values from _abi.py, which
+// api_parity_test compares with node_api.h.
+constexpr bool SameKind(std::int32_t abi, detail::DeviceKind kind) {
+  return abi == static_cast<std::int32_t>(kind);
+}
+static_assert(
+    SameKind(TALOS_DEVICE_MOTOR, detail::DeviceKind::kMotor) &&
+    SameKind(TALOS_DEVICE_CANCODER, detail::DeviceKind::kCANcoder) &&
+    SameKind(TALOS_DEVICE_GYRO, detail::DeviceKind::kGyro) &&
+    SameKind(TALOS_DEVICE_DIGITAL_INPUT, detail::DeviceKind::kDigitalInput) &&
+    SameKind(TALOS_DEVICE_DIGITAL_OUTPUT, detail::DeviceKind::kDigitalOutput) &&
+    SameKind(TALOS_DEVICE_ANALOG_INPUT, detail::DeviceKind::kAnalogInput) &&
+    SameKind(TALOS_DEVICE_ENCODER, detail::DeviceKind::kEncoder) &&
+    SameKind(TALOS_DEVICE_PWM, detail::DeviceKind::kPwm));
+constexpr bool SameMode(std::int32_t abi, hardware::Mode mode) {
+  return abi == static_cast<std::int32_t>(mode);
+}
+static_assert(SameMode(TALOS_MODE_NEUTRAL, hardware::Mode::kNeutral) &&
+              SameMode(TALOS_MODE_DUTY_CYCLE, hardware::Mode::kDutyCycle) &&
+              SameMode(TALOS_MODE_VOLTAGE, hardware::Mode::kVoltage) &&
+              SameMode(TALOS_MODE_VELOCITY, hardware::Mode::kVelocity) &&
+              SameMode(TALOS_MODE_POSITION, hardware::Mode::kPosition) &&
+              SameMode(TALOS_MODE_MOTION_MAGIC, hardware::Mode::kMotionMagic));
+static_assert(TALOS_WAKE_ON_PUBLISH == static_cast<int>(Wake::kOnPublish) &&
+              TALOS_WAKE_AT_DRAIN == static_cast<int>(Wake::kAtDrain));
+
 TalosSample* Out(TalosSample* out) {
   if (out == nullptr) throw std::invalid_argument("null TalosSample");
   *out = TalosSample{};
@@ -90,6 +117,96 @@ static_assert(SameFlag(TALOS_DS_ATTACHED, driver_station::kDsAttached) &&
               SameFlag(TALOS_DS_TELEOP, driver_station::kTeleop) &&
               SameFlag(TALOS_DS_TEST, driver_station::kTest) &&
               SameFlag(TALOS_DS_ESTOP, driver_station::kEStop));
+
+// Every struct this ABI passes, field by field, as talOS/python/talos/_abi.py
+// mirrors it with ctypes: talos_test.py reads these lines and checks the
+// mirror against them. A layout change changes the ABI, so these numbers, the
+// mirror and TALOS_NODE_ABI_VERSION change together.
+static_assert(sizeof(TalosSchema) == 32);
+static_assert(offsetof(TalosSchema, name) == 0);
+static_assert(offsetof(TalosSchema, hash) == 8);
+static_assert(offsetof(TalosSchema, bfbs) == 16);
+static_assert(offsetof(TalosSchema, bfbs_size) == 24);
+static_assert(sizeof(TalosParam) == 56);
+static_assert(offsetof(TalosParam, kind) == 0);
+static_assert(offsetof(TalosParam, boolean) == 4);
+static_assert(offsetof(TalosParam, integer) == 8);
+static_assert(offsetof(TalosParam, number) == 16);
+static_assert(offsetof(TalosParam, string) == 24);
+static_assert(offsetof(TalosParam, count) == 32);
+static_assert(offsetof(TalosParam, numbers) == 40);
+static_assert(offsetof(TalosParam, strings) == 48);
+static_assert(sizeof(TalosSample) == 64);
+static_assert(offsetof(TalosSample, valid) == 0);
+static_assert(offsetof(TalosSample, value) == 4);
+static_assert(offsetof(TalosSample, position) == 8);
+static_assert(offsetof(TalosSample, velocity) == 16);
+static_assert(offsetof(TalosSample, voltage) == 24);
+static_assert(offsetof(TalosSample, current) == 32);
+static_assert(offsetof(TalosSample, temperature_c) == 40);
+static_assert(offsetof(TalosSample, supply_current_a) == 48);
+static_assert(offsetof(TalosSample, forward_limit) == 56);
+static_assert(offsetof(TalosSample, reverse_limit) == 60);
+static_assert(sizeof(TalosJoystick) == 116);
+static_assert(offsetof(TalosJoystick, connected) == 0);
+static_assert(offsetof(TalosJoystick, axis_count) == 4);
+static_assert(offsetof(TalosJoystick, button_count) == 8);
+static_assert(offsetof(TalosJoystick, pov_count) == 12);
+static_assert(offsetof(TalosJoystick, buttons) == 16);
+static_assert(offsetof(TalosJoystick, axes) == 20);
+static_assert(offsetof(TalosJoystick, povs) == 68);
+static_assert(offsetof(TalosJoystick, name) == 84);
+static_assert(sizeof(TalosDriverStation) == 744);
+static_assert(offsetof(TalosDriverStation, connected) == 0);
+static_assert(offsetof(TalosDriverStation, enabled) == 4);
+static_assert(offsetof(TalosDriverStation, autonomous) == 8);
+static_assert(offsetof(TalosDriverStation, teleop) == 12);
+static_assert(offsetof(TalosDriverStation, test) == 16);
+static_assert(offsetof(TalosDriverStation, estop) == 20);
+static_assert(offsetof(TalosDriverStation, fms_attached) == 24);
+static_assert(offsetof(TalosDriverStation, alliance) == 28);
+static_assert(offsetof(TalosDriverStation, station) == 32);
+static_assert(offsetof(TalosDriverStation, match_time_s) == 40);
+static_assert(offsetof(TalosDriverStation, joysticks) == 48);
+static_assert(sizeof(TalosDriverStationPacket) == 712);
+static_assert(offsetof(TalosDriverStationPacket, flags) == 0);
+static_assert(offsetof(TalosDriverStationPacket, alliance) == 4);
+static_assert(offsetof(TalosDriverStationPacket, station) == 8);
+static_assert(offsetof(TalosDriverStationPacket, match_time_s) == 12);
+static_assert(offsetof(TalosDriverStationPacket, joysticks) == 16);
+static_assert(sizeof(TalosMotorRequest) == 24);
+static_assert(offsetof(TalosMotorRequest, mode) == 0);
+static_assert(offsetof(TalosMotorRequest, slot) == 4);
+static_assert(offsetof(TalosMotorRequest, demand) == 8);
+static_assert(offsetof(TalosMotorRequest, ff_volts) == 16);
+static_assert(sizeof(TalosPositionMechanismState) == 72);
+static_assert(offsetof(TalosPositionMechanismState, phase) == 0);
+static_assert(offsetof(TalosPositionMechanismState, fault) == 4);
+static_assert(offsetof(TalosPositionMechanismState, homed) == 8);
+static_assert(offsetof(TalosPositionMechanismState, at_goal) == 12);
+static_assert(offsetof(TalosPositionMechanismState, driving) == 16);
+static_assert(offsetof(TalosPositionMechanismState, connected) == 20);
+static_assert(offsetof(TalosPositionMechanismState, position_rot) == 24);
+static_assert(offsetof(TalosPositionMechanismState, position_units) == 32);
+static_assert(offsetof(TalosPositionMechanismState, velocity_rps) == 40);
+static_assert(offsetof(TalosPositionMechanismState, goal_rot) == 48);
+static_assert(offsetof(TalosPositionMechanismState, gravity_v) == 56);
+static_assert(offsetof(TalosPositionMechanismState, tolerance_rot) == 64);
+static_assert(sizeof(TalosVelocityMechanismState) == 48);
+static_assert(offsetof(TalosVelocityMechanismState, phase) == 0);
+static_assert(offsetof(TalosVelocityMechanismState, at_speed) == 4);
+static_assert(offsetof(TalosVelocityMechanismState, driving) == 8);
+static_assert(offsetof(TalosVelocityMechanismState, connected) == 12);
+static_assert(offsetof(TalosVelocityMechanismState, velocity_rps) == 16);
+static_assert(offsetof(TalosVelocityMechanismState, goal_rps) == 24);
+static_assert(offsetof(TalosVelocityMechanismState, commanded_rps) == 32);
+static_assert(offsetof(TalosVelocityMechanismState, current_a) == 40);
+static_assert(sizeof(TalosRollerWithSensorState) == 24);
+static_assert(offsetof(TalosRollerWithSensorState, phase) == 0);
+static_assert(offsetof(TalosRollerWithSensorState, has_piece) == 4);
+static_assert(offsetof(TalosRollerWithSensorState, sensor_connected) == 8);
+static_assert(offsetof(TalosRollerWithSensorState, driving) == 12);
+static_assert(offsetof(TalosRollerWithSensorState, output_v) == 16);
 
 TalosJoystick JoystickOf(const Joystick& joystick) {
   TalosJoystick out{};
@@ -148,31 +265,32 @@ void Fill(TalosParam& out, detail::ParamValue value) {
 
 std::optional<detail::ParamValue> FindParam(const Node& node,
                                             std::string_view key,
-                                            std::int32_t kind) {
+                                            std::int32_t kind,
+                                            NodeAccess::ParamTable subsystem) {
   auto wrap = [](auto found) -> std::optional<detail::ParamValue> {
     if (!found) return std::nullopt;
     return detail::ParamValue{*std::move(found)};
   };
   switch (kind) {
     case TALOS_PARAM_ANY:
-      return NodeAccess::find_param(node, key);
+      return NodeAccess::find_param(node, key, subsystem);
     case TALOS_PARAM_BOOL:
-      return wrap(NodeAccess::find_bool(node, key));
+      return wrap(NodeAccess::find_bool(node, key, subsystem));
     case TALOS_PARAM_INT:
-      return wrap(NodeAccess::find_int(node, key));
+      return wrap(NodeAccess::find_int(node, key, subsystem));
     case TALOS_PARAM_DOUBLE:
-      return wrap(NodeAccess::find_double(node, key));
+      return wrap(NodeAccess::find_double(node, key, subsystem));
     case TALOS_PARAM_STRING:
-      return wrap(NodeAccess::find_string(node, key));
+      return wrap(NodeAccess::find_string(node, key, subsystem));
     case TALOS_PARAM_STRING_LIST:
-      return wrap(NodeAccess::find_string_list(node, key));
+      return wrap(NodeAccess::find_string_list(node, key, subsystem));
     case TALOS_PARAM_DOUBLE_LIST:
-      return wrap(NodeAccess::find_double_list(node, key));
+      return wrap(NodeAccess::find_double_list(node, key, subsystem));
     case TALOS_PARAM_LIST: {
-      auto value = NodeAccess::find_param(node, key);
+      auto value = NodeAccess::find_param(node, key, subsystem);
       if (value && !std::holds_alternative<std::vector<std::string>>(*value) &&
           !std::holds_alternative<std::vector<double>>(*value)) {
-        NodeAccess::param_error(node, key, "must be an array");
+        NodeAccess::param_error(node, key, "must be an array", subsystem);
       }
       return value;
     }
@@ -222,6 +340,11 @@ int32_t talos_node_simulation(const TalosNode* node) {
                         [&] { return AsNode(node).simulation() ? 1 : 0; });
 }
 
+int32_t talos_node_describing(const TalosNode* node) {
+  return Guard<int32_t>(TALOS_ERR,
+                        [&] { return AsNode(node).describing() ? 1 : 0; });
+}
+
 int64_t talos_node_now_ns(const TalosNode* node) {
   return Guard<int64_t>(0, [&] { return AsNode(node).now().nanos(); });
 }
@@ -253,20 +376,53 @@ const char* talos_node_session_dir(const TalosNode* node) {
   });
 }
 
+int32_t talos_node_trajectory_path(const TalosNode* node, const char* name,
+                                   char* out, uint32_t out_size) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out == nullptr) throw std::invalid_argument("out is NULL");
+    const std::string path =
+        AsNode(node).trajectory_path(NonNull(name, "name")).string();
+    if (path.size() >= out_size) {
+      throw std::invalid_argument(
+          "trajectory path needs " + std::to_string(path.size() + 1) +
+          " bytes, out_size is " + std::to_string(out_size));
+    }
+    std::memcpy(out, path.c_str(), path.size() + 1);
+    return TALOS_OK;
+  });
+}
+
+// talos_node_param and talos_node_param_of: `key` of this node's table, or
+// of `subsystem`'s.
+static int32_t ReadParam(const TalosNode* node,
+                         NodeAccess::ParamTable subsystem, const char* key,
+                         int32_t kind, int32_t required, TalosParam* out) {
+  const talos::Node& n = AsNode(node);
+  const std::string_view k = NonNull(key, "key");
+  if (out == nullptr) throw std::invalid_argument("null TalosParam");
+  *out = TalosParam{};
+  auto value = FindParam(n, k, kind, subsystem);
+  if (!value) {
+    if (required != 0) NodeAccess::param_error(n, k, "is missing", subsystem);
+    return 0;
+  }
+  Fill(*out, *std::move(value));
+  return 1;
+}
+
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
                          int32_t required, TalosParam* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    const talos::Node& n = AsNode(node);
-    const std::string_view k = NonNull(key, "key");
-    if (out == nullptr) throw std::invalid_argument("null TalosParam");
-    *out = TalosParam{};
-    auto value = FindParam(n, k, kind);
-    if (!value) {
-      if (required != 0) NodeAccess::param_error(n, k, "is missing");
-      return 0;
-    }
-    Fill(*out, *std::move(value));
-    return 1;
+    return ReadParam(node, std::nullopt, key, kind, required, out);
+  });
+}
+
+int32_t talos_node_param_of(const TalosNode* node, const char* subsystem,
+                            const char* key, int32_t kind, int32_t required,
+                            TalosParam* out) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return ReadParam(node, NonNull(subsystem, "subsystem"), key, kind, required,
+                     out);
   });
 }
 
@@ -285,10 +441,15 @@ static talos::schema::Identity Schema(const TalosSchema* schema) {
 
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, const TalosSchema* schema,
-                             int32_t optional, TalosMessageCallback on_message,
-                             void* user) {
+                             int32_t optional, int32_t wake,
+                             TalosMessageCallback on_message, void* user) {
   return Guard<int64_t>(-1, [&] {
     talos::Node& n = AsNode(node);
+    if (wake != TALOS_WAKE_ON_PUBLISH && wake != TALOS_WAKE_AT_DRAIN) {
+      throw std::invalid_argument(
+          "wake must be TALOS_WAKE_ON_PUBLISH or TALOS_WAKE_AT_DRAIN, got " +
+          std::to_string(wake));
+    }
     talos::detail::MessageCallback callback;
     if (on_message != nullptr) {
       callback = [on_message, user, message_bytes](const void* data) {
@@ -298,7 +459,11 @@ int64_t talos_node_subscribe(TalosNode* node, const char* topic,
     const std::size_t index = NodeAccess::add_subscription(
         n, NonNull(topic, "topic"), message_bytes, talos::kMessageAlignment,
         Schema(schema), optional != 0, std::move(callback));
-    if (on_message != nullptr) NodeAccess::require_immediate_delivery(n);
+    // talos::Node::subscribe's rule: a callback wakes the node unless it is
+    // opened to wait for the next drain.
+    if (on_message != nullptr && wake == TALOS_WAKE_ON_PUBLISH) {
+      NodeAccess::require_immediate_delivery(n, index);
+    }
     return static_cast<int64_t>(index);
   });
 }
@@ -511,6 +676,20 @@ int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot) {
   });
 }
 
+int32_t talos_motor_zeroed(TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return static_cast<int32_t>(
+        HardwareAccess::motor_zeroed(Link(node), Index(index)));
+  });
+}
+
+int32_t talos_gyro_zeroed(TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return static_cast<int32_t>(
+        HardwareAccess::gyro_zeroed(Link(node), Index(index)));
+  });
+}
+
 int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
@@ -538,12 +717,18 @@ int32_t talos_pwm_set(TalosNode* node, int64_t index, double output) {
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);
-    const auto s = HardwareAccess::motor_sample(Link(node), Index(index));
+    const auto& link = Link(node);
+    const auto i = Index(index);
+    const auto s = HardwareAccess::motor_sample(link, i);
     o.valid = s.valid;
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
     o.voltage = s.voltage;
     o.current = s.stator_current_a;
+    o.temperature_c = s.temperature_c;
+    o.supply_current_a = s.supply_current_a;
+    o.forward_limit = HardwareAccess::motor_hard_limit(link, i, true);
+    o.reverse_limit = HardwareAccess::motor_hard_limit(link, i, false);
     return TALOS_OK;
   });
 }
@@ -556,6 +741,42 @@ int32_t talos_sensor_sample(TalosNode* node, int64_t index, TalosSample* out) {
     o.position = s.position_rot;
     o.velocity = s.velocity_rps;
     return TALOS_OK;
+  });
+}
+
+int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
+                         int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const auto time =
+        HardwareAccess::motor_time(Link(node), Index(index), velocity != 0);
+    if (!time) return 0;
+    *out_ns = time->nanos();
+    return 1;
+  });
+}
+
+int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
+                          int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const auto time =
+        HardwareAccess::sensor_time(Link(node), Index(index), velocity != 0);
+    if (!time) return 0;
+    *out_ns = time->nanos();
+    return 1;
+  });
+}
+
+int32_t talos_motor_age(TalosNode* node, int64_t index, int32_t velocity,
+                        int64_t* out_ns) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    if (out_ns == nullptr) throw std::invalid_argument("null out_ns");
+    const auto age =
+        HardwareAccess::motor_age(Link(node), Index(index), velocity != 0);
+    if (!age) return 0;
+    *out_ns = age->count();
+    return 1;
   });
 }
 
@@ -674,11 +895,13 @@ const char* talos_target_source_name(TalosNode* node, int64_t target,
 
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
-                               uint32_t alignment, const TalosSchema* schema) {
+                               uint32_t alignment, const TalosSchema* schema,
+                               int64_t arming) {
   return Guard<int64_t>(-1, [&] {
     return static_cast<int64_t>(TargetAccess::open_lane(
         AsNode(node), NonNull(subsystem, "subsystem"),
-        NonNull(source, "source"), message_bytes, alignment, Schema(schema)));
+        NonNull(source, "source"), message_bytes, alignment, Schema(schema),
+        arming < 0 ? std::nullopt : std::optional{Index(arming)}));
   });
 }
 
@@ -694,6 +917,35 @@ int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     return TargetAccess::lane_release(AsNode(node), Index(lane)) ? 1 : 0;
+  });
+}
+
+int64_t talos_operator_arming_open(TalosNode* node) {
+  return Guard<int64_t>(-1, [&] {
+    return static_cast<int64_t>(TargetAccess::open_arming(AsNode(node)));
+  });
+}
+
+int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
+                                       int32_t neutral) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return TargetAccess::arming_evaluate(AsNode(node), Index(arming),
+                                         neutral != 0)
+               ? 1
+               : 0;
+  });
+}
+
+int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    return TargetAccess::arming_armed(AsNode(node), Index(arming)) ? 1 : 0;
+  });
+}
+
+int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    TargetAccess::arming_disarm(AsNode(node), Index(arming));
+    return TALOS_OK;
   });
 }
 

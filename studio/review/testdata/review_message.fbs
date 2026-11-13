@@ -1,0 +1,16 @@
+// The schema'd topic of //studio/review:review_test's fixture session.
+namespace review_test;
+
+enum Mode : ubyte { IDLE, SPINNING, FIRING }
+
+struct Shot {
+  position_m:double;
+  shot_count:uint;
+  mode:Mode;
+  ready:bool;
+  shot_id:ulong;
+}
+
+struct Status {
+  boot_id:ulong;
+}

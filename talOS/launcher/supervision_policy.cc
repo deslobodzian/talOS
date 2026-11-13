@@ -1,0 +1,143 @@
+#include "talOS/launcher/supervision_policy.h"
+
+#include <algorithm>
+
+#include "talOS/launcher/session.h"
+
+namespace talos::launcher {
+
+std::chrono::milliseconds RestartBackoff(int restart, bool clean_exit,
+                                         bool critical) {
+  if (restart == 1 && critical && !clean_exit) {
+    return std::chrono::milliseconds{0};
+  }
+  std::chrono::milliseconds backoff = kRestartInitialBackoff;
+  for (int i = 1; i < restart && backoff < kRestartMaxBackoff; ++i) {
+    backoff *= 2;
+  }
+  return std::min(backoff, kRestartMaxBackoff);
+}
+
+bool ShouldRestartNode(bool clean_exit, bool critical, int max_restarts,
+                       bool stopping) {
+  if (stopping || max_restarts <= 0) return false;
+  return !clean_exit || critical;
+}
+
+std::chrono::nanoseconds HeartbeatTimeout(int64_t period_us,
+                                          int heartbeat_periods) {
+  return std::chrono::microseconds{
+      std::max<int64_t>(std::chrono::microseconds{kMinHeartbeatTimeout}.count(),
+                        period_us * heartbeat_periods)};
+}
+
+std::chrono::milliseconds RestartSchedule::Schedule(
+    SupervisionTime now, const RestartLimits& limits) {
+  while (!starts_.empty() && now - starts_.front() >= limits.window) {
+    starts_.pop_front();
+  }
+  const int recent = static_cast<int>(starts_.size());
+  quarantined_ = !critical_ && recent > 0 && recent >= limits.max_restarts;
+  pending_ = true;
+  at_ = (quarantined_ ? starts_.front() + limits.window : now) +
+        RestartBackoff(recent + 1, last_exit_clean_, critical_);
+  return std::chrono::duration_cast<std::chrono::milliseconds>(at_ - now);
+}
+
+void RestartSchedule::Started(SupervisionTime now) {
+  starts_.push_back(now);
+  pending_ = false;
+  quarantined_ = false;
+}
+
+void RestartSchedule::Cancel() {
+  pending_ = false;
+  quarantined_ = false;
+}
+
+std::chrono::nanoseconds LivenessLookInterval(const LivenessLimits& limits) {
+  return limits.heartbeat_timeout / kLivenessLooksPerTimeout;
+}
+
+void RunLiveness::Begin(SupervisionTime spawned) {
+  started_at_ = spawned;
+  progress_changed_at_ = spawned;
+  heartbeat_changed_at_ = spawned;
+  looked_at_ = spawned;
+  constructed_ = false;
+  last_heartbeat_ = 0;
+  last_dispatch_ = 0;
+}
+
+SupervisionTime RunLiveness::NextLook(const LivenessLimits& limits) const {
+  SupervisionTime next = looked_at_ + LivenessLookInterval(limits);
+  const auto consider = [&](SupervisionTime deadline) {
+    if (deadline > looked_at_) next = std::min(next, deadline);
+  };
+  consider(std::max(started_at_ + limits.startup_grace,
+                    progress_changed_at_ + limits.heartbeat_timeout));
+  if (!constructed_) consider(started_at_ + limits.construction_timeout);
+  return next;
+}
+
+void RunLiveness::Looked(const RowObservation& row, SupervisionTime judged_at) {
+  looked_at_ = judged_at;
+  if (row.found && !row.constructing) constructed_ = true;
+}
+
+LivenessCheck RunLiveness::Watch(
+    const SupervisionClock& clock,
+    const std::function<RowObservation()>& read_row,
+    const LivenessLimits& limits) {
+  // A row that shows progress shows it no later than `after`, and one that
+  // shows none showed none since at least `before`: a launcher stalled
+  // before or after the read can only shorten the stall it measures.
+  const SupervisionTime before = clock();
+  const RowObservation row = read_row();
+  const SupervisionTime after = clock();
+  Record(row, after);
+  Looked(row, before);
+  return {Verdict(row, before, limits), before};
+}
+
+std::string_view RunLiveness::Judge(const RowObservation& row,
+                                    SupervisionTime now,
+                                    const LivenessLimits& limits) {
+  Record(row, now);
+  Looked(row, now);
+  return Verdict(row, now, limits);
+}
+
+void RunLiveness::Record(const RowObservation& row, SupervisionTime read_at) {
+  if (!row.found) return;
+  // Progress is the loop's dispatch count, which an event-loop node's loop
+  // thread stores itself (introspect::Reporter), so a starved reporting
+  // thread cannot make a running loop look stalled. Its heartbeat, which
+  // that thread writes, counts only while it constructs and has no loop
+  // yet.
+  const bool beat_moved = row.heartbeat != last_heartbeat_;
+  const bool dispatch_moved = row.dispatch != last_dispatch_;
+  if (beat_moved) {
+    heartbeat_changed_at_ = read_at;
+    last_heartbeat_ = row.heartbeat;
+  }
+  if (dispatch_moved) last_dispatch_ = row.dispatch;
+  if (dispatch_moved || (row.constructing && beat_moved))
+    progress_changed_at_ = read_at;
+}
+
+std::string_view RunLiveness::Verdict(const RowObservation& row,
+                                      SupervisionTime now,
+                                      const LivenessLimits& limits) const {
+  const bool grace_over = now - started_at_ >= limits.startup_grace;
+  // Registration is part of startup, not an opt-in to supervision:
+  // until a row arrives, the spawn time is the last progress time.
+  const bool construction_expired =
+      row.constructing && now - started_at_ >= limits.construction_timeout;
+  if (construction_expired) return kRunConstructionDeadline;
+  if (grace_over && now - progress_changed_at_ >= limits.heartbeat_timeout)
+    return row.found ? kRunStalled : kRunHeartbeatMissing;
+  return {};
+}
+
+}  // namespace talos::launcher

@@ -34,6 +34,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -44,6 +45,15 @@
 namespace talos::introspect {
 
 inline constexpr int kDescribeVersion = 1;
+
+// One parameter a node read while it was built (Node::param, or param_of
+// for another subsystem's table): `key` as the node named it
+// ("geometry.modules[0].x_m") in `subsystem`'s table.
+struct ParamRead {
+  std::string subsystem;
+  std::string key;
+  bool operator==(const ParamRead&) const = default;
+};
 
 // A node as `--describe` reports it: identity, plus every end it will hold.
 struct Description {
@@ -59,6 +69,21 @@ struct Description {
   // declared_graph): its topics depend on the other nodes', so the launcher
   // describes it again with the graph in hand (see DeclaredGraph below).
   bool reads_graph = false;
+
+  // The binary may be started with process::kHeldStopSignals blocked: its
+  // run calls process::InstallStopHandlers, which unblocks them, before
+  // anything that can wait. A stop sent before then stays pending instead of
+  // meeting the runtime's own handling (CPython's KeyboardInterrupt) or its
+  // default action, and is taken once the handlers are in. False for a
+  // binary that does not say so.
+  bool holds_stop = false;
+
+  // Every parameter key the node's constructor read, in first-read order:
+  // what the node declares it reads, so the launcher can refuse a subsystem
+  // key no node reads. nullopt when the describe did not report them (a
+  // hand-written describe, or one from a binary built before the field), which
+  // the launcher cannot judge.
+  std::optional<std::vector<ParamRead>> params;
 };
 
 // The declared graph a framework node reads (telemetry observes every state
@@ -160,6 +185,22 @@ inline std::string DescribeToJson(const Description& description) {
   AppendJsonString(out, description.target);
   out += ",\n  \"reads_graph\": ";
   out += description.reads_graph ? "true" : "false";
+  out += ",\n  \"holds_stop\": ";
+  out += description.holds_stop ? "true" : "false";
+  // Before the sources, whose reader looks only past them.
+  if (description.params) {
+    out += ",\n  \"params\": [";
+    for (std::size_t i = 0; i < description.params->size(); ++i) {
+      const ParamRead& read = (*description.params)[i];
+      out += i ? ",\n    {" : "\n    {";
+      out += "\"subsystem\": ";
+      AppendJsonString(out, read.subsystem);
+      out += ", \"key\": ";
+      AppendJsonString(out, read.key);
+      out += "}";
+    }
+    out += description.params->empty() ? "]" : "\n  ]";
+  }
   out += ",\n  \"sources\": [";
   for (std::size_t i = 0; i < description.sources.size(); ++i) {
     const auto& source = description.sources[i];
@@ -175,6 +216,12 @@ inline std::string DescribeToJson(const Description& description) {
     out += source.optional() ? "true" : "false";
     out += ", \"observer\": ";
     out += source.observer() ? "true" : "false";
+    // Only on the devices layer's request publisher; absent means false.
+    if ((source.flags & naming::kSourceFlagHardwareRequest) != 0)
+      out += ", \"hardware_request\": true";
+    // Only on a latest-only watcher; absent means a sequence watcher.
+    if ((source.flags & naming::kSourceFlagLatestOnly) != 0)
+      out += ", \"latest_only\": true";
     if (source.kind != event::SourceKind::TIMER) {
       // The hash as a hex string: a JSON number is a double.
       out += ", \"schema\": ";
@@ -206,21 +253,42 @@ inline std::string DeclaredGraphToJson(const DeclaredGraph& graph) {
 // Builds a description from a loop's manifest, whose topics are rings of
 // `slots` slots. Endpoint attributes are not something the loop knows --
 // `/hw/command` looks like any other sender to it -- so the node supplies
-// them by topic name.
+// them by topic name. `source_flags`, indexed by registration id, carries
+// what only the loop knows (LoopSourceFlags); shorter than the manifest
+// means none for the rest.
 struct EndpointAttribute {
   std::string_view topic;
   std::uint32_t flags{0};
 };
 
+// What only `loop` knows about its own sources, indexed by source id:
+// naming::kSourceFlagLatestOnly on each watcher that delivers only the newest
+// message (event::EventLoopBase::latest_only). The Reporter publishes it to
+// the registry and `--describe` writes it, so the launcher can tell a watcher
+// that logs at most one message per drain from one that logs every message.
+template <class Loop>
+std::vector<std::uint32_t> LoopSourceFlags(const Loop& loop) {
+  std::vector<std::uint32_t> flags(loop.manifest().size(), 0u);
+  for (std::size_t id = 0; id < flags.size(); ++id) {
+    if (loop.latest_only(static_cast<std::uint16_t>(id))) {
+      flags[id] = naming::kSourceFlagLatestOnly;
+    }
+  }
+  return flags;
+}
+
 inline Description DescribeManifest(
     std::string name, std::string target, const event::Manifest& manifest,
-    std::uint32_t slots,
-    const std::vector<EndpointAttribute>& attributes = {}) {
+    std::uint32_t slots, const std::vector<EndpointAttribute>& attributes = {},
+    const std::vector<std::uint32_t>& source_flags = {}) {
   Description description{std::move(name), std::move(target), {}};
   for (const auto& registration : manifest) {
     std::uint32_t flags = 0;
     for (const auto& attribute : attributes) {
       if (attribute.topic == registration.name) flags |= attribute.flags;
+    }
+    if (registration.id < source_flags.size()) {
+      flags |= source_flags[registration.id];
     }
     naming::SourceShape source{registration.kind, registration.name,
                                registration.message_bytes, flags};
@@ -281,6 +349,14 @@ class DescribeReader {
       std::size_t flag = 0;
       out.reads_graph =
           Field(header, "reads_graph", flag) && Boolean(header, flag);
+      flag = 0;
+      out.holds_stop =
+          Field(header, "holds_stop", flag) && Boolean(header, flag);
+      std::size_t params = 0;
+      if (Field(header, "params", params) &&
+          !Params(header, params, out.params.emplace(), error)) {
+        return false;
+      }
     }
 
     // Each source is parsed inside its own object.
@@ -346,6 +422,13 @@ class DescribeReader {
       attribute = 0;
       if (Field(entry, "observer", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagObserver;
+      attribute = 0;
+      if (Field(entry, "hardware_request", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagHardwareRequest;
+      attribute = 0;
+      if (Field(entry, "latest_only", attribute) && Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagLatestOnly;
 
       // Every topic end names its schema and ring layout: the launcher
       // creates the segment from them.
@@ -396,10 +479,20 @@ class DescribeReader {
   static bool ParseGraph(std::string_view text, DeclaredGraph& out,
                          std::string& error) {
     out.clear();
-    constexpr std::string_view kStart = "\"describe_version\"";
-    std::size_t begin = text.find(kStart);
+    static constexpr std::string_view kStart = "\"describe_version\"";
+    // The key, not a string value that happens to spell it.
+    const auto start = [text](std::size_t from) {
+      for (std::size_t found = text.find(kStart, from);
+           found != std::string_view::npos;
+           found = text.find(kStart, found + kStart.size())) {
+        std::size_t cursor = found + kStart.size();
+        if (Expect(text, cursor, ':')) return found;
+      }
+      return std::string_view::npos;
+    };
+    std::size_t begin = start(0);
     while (begin != std::string_view::npos) {
-      const std::size_t next = text.find(kStart, begin + kStart.size());
+      const std::size_t next = start(begin + kStart.size());
       const std::string_view document = text.substr(
           begin, next == std::string_view::npos ? next : next - begin);
       Description description;
@@ -435,23 +528,73 @@ class DescribeReader {
   }
 
  private:
-  // Advances `at` past `"key":` and any following whitespace.
+  static void SkipSpace(std::string_view text, std::size_t& at) {
+    while (at < text.size() &&
+           (std::isspace(static_cast<unsigned char>(text[at])) != 0))
+      ++at;
+  }
+
+  // Consumes `c` (after any whitespace); false when the next character is
+  // anything else.
+  static bool Expect(std::string_view text, std::size_t& at, char c) {
+    SkipSpace(text, at);
+    if (at >= text.size() || text[at] != c) return false;
+    ++at;
+    return true;
+  }
+
+  // The params array at `at`, read token by token in the order
+  // DescribeToJson writes: a key may hold any character, brackets and braces
+  // included, so finding the next ']' would cut one short.
+  static bool Params(std::string_view text, std::size_t at,
+                     std::vector<ParamRead>& out, std::string& error) {
+    error = "malformed params";
+    if (!Expect(text, at, '[')) return false;
+    if (Expect(text, at, ']')) return true;
+    for (;;) {
+      ParamRead read;
+      std::string label;
+      if (!Expect(text, at, '{')) return false;
+      SkipSpace(text, at);
+      if (!String(text, at, label) || label != "subsystem" ||
+          !Expect(text, at, ':')) {
+        return false;
+      }
+      SkipSpace(text, at);
+      if (!String(text, at, read.subsystem) || !Expect(text, at, ',')) {
+        return false;
+      }
+      SkipSpace(text, at);
+      if (!String(text, at, label) || label != "key" ||
+          !Expect(text, at, ':')) {
+        return false;
+      }
+      SkipSpace(text, at);
+      if (!String(text, at, read.key) || !Expect(text, at, '}')) return false;
+      out.push_back(std::move(read));
+      if (Expect(text, at, ']')) break;
+      if (!Expect(text, at, ',')) return false;
+    }
+    error.clear();
+    return true;
+  }
+
+  // Advances `at` past `"key":` and any following whitespace. An occurrence
+  // not followed by ':' is a string value (a parameter named "sources"), not
+  // the key, so the search goes on past it.
   static bool Field(std::string_view text, std::string_view key,
                     std::size_t& at) {
     const std::string needle = "\"" + std::string{key} + "\"";
-    const std::size_t found = text.find(needle, at);
-    if (found == std::string_view::npos) return false;
-    std::size_t cursor = found + needle.size();
-    while (cursor < text.size() &&
-           (std::isspace(static_cast<unsigned char>(text[cursor])) != 0))
-      ++cursor;
-    if (cursor >= text.size() || text[cursor] != ':') return false;
-    ++cursor;
-    while (cursor < text.size() &&
-           (std::isspace(static_cast<unsigned char>(text[cursor])) != 0))
-      ++cursor;
-    at = cursor;
-    return true;
+    for (std::size_t found = text.find(needle, at);
+         found != std::string_view::npos;
+         found = text.find(needle, found + needle.size())) {
+      std::size_t cursor = found + needle.size();
+      if (!Expect(text, cursor, ':')) continue;
+      SkipSpace(text, cursor);
+      at = cursor;
+      return true;
+    }
+    return false;
   }
 
   static bool String(std::string_view text, std::size_t& at, std::string& out) {

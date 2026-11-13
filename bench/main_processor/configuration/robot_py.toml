@@ -1,0 +1,8 @@
+# The bench robot launching the Python motor node (motor/motor.py) in place
+# of the C++ one. Same robot and subsystem files as robot.toml; only the
+# motor's `node =` differs. On hardware, add `--remote <roborio-ipv4>`.
+include = "robot.toml"
+
+[[subsystems]]
+name = "motor"
+node = "//bench/main_processor/motor:node_py"

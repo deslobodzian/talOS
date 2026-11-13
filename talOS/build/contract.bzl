@@ -1,10 +1,13 @@
 """Talos contract build rules and macros for FlatBuffers and multi-language messages."""
 
+load("@aspect_bazel_lib//lib:stamping.bzl", "STAMP_ATTRS", "maybe_stamp")
 load("@flatbuffers//:build_defs.bzl", "DEFAULT_INCLUDE_PATHS", "flatbuffer_cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_shared_library.bzl", "cc_shared_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("@rules_python//python:py_info.bzl", "PyInfo")
+load("//tools:sync_manifest.bzl", "manifest_freshness_stamp")
 
 _TalosMessagesInfo = provider(
     doc = "The schema include tree of a talos_messages target.",
@@ -225,12 +228,98 @@ _flatc_py_tree = rule(
     },
 )
 
+# The topic grammar of talOS/NAMING.md, mirroring naming::CheckTopicName in
+# talOS/introspection/names.h (the authority). //talOS/build:topic_grammar_test
+# checks that the two agree on a set of names and that these tables hold
+# exactly names.h's roles, abbreviations and direction suffixes.
+_MAX_TOPIC_BYTES = 31
+_MAX_SEGMENT_BYTES = 24
+TALOS_TOPIC_ROLES = ["state", "status", "event", "telemetry", "target", "request", "command"]
+TALOS_TOPIC_ABBREVIATIONS = {
+    "acc": "acceleration",
+    "cfg": "config",
+    "cmd": "command",
+    "cnt": "count",
+    "drive": "drivetrain",
+    "ds": "driver_station",
+    "dt": "drivetrain",
+    "idx": "index",
+    "msg": "message",
+    "odom": "odometry",
+    "pkt": "packet",
+    "pos": "position",
+    "req": "request",
+    "st": "state",
+    "stat": "status",
+    "tgt": "target",
+    "tlm": "telemetry",
+    "vel": "velocity",
+}
+TALOS_TOPIC_DIRECTION_SUFFIXES = ["_in", "_out", "_pub", "_sub", "_tx", "_rx", "_topic", "_send", "_recv"]
+_LOWERCASE = "abcdefghijklmnopqrstuvwxyz"
+_SEGMENT_CHARACTERS = _LOWERCASE + "0123456789_"
+_SEGMENT_KINDS = ["owner", "role", "qualifier", "qualifier"]
+
+def _segment_problem(segment, what):
+    quoted = "%s '%s'" % (what, segment)
+    if not segment:
+        return what + " is empty"
+    if len(segment) > _MAX_SEGMENT_BYTES:
+        return "%s is %d characters; the limit is %d" % (quoted, len(segment), _MAX_SEGMENT_BYTES)
+    if segment[0] not in _LOWERCASE.elems():
+        return quoted + " must start with a lowercase letter"
+    for c in segment.elems():
+        if c not in _SEGMENT_CHARACTERS.elems():
+            return quoted + " contains '%s'; segments are lowercase letters, digits and underscores" % c
+    if "__" in segment:
+        return quoted + " has a doubled underscore"
+    if segment.endswith("_"):
+        return quoted + " ends with an underscore"
+    if segment in TALOS_TOPIC_ABBREVIATIONS:
+        return quoted + " is an abbreviation; use '%s'" % TALOS_TOPIC_ABBREVIATIONS[segment]
+    for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES:
+        if len(segment) > len(suffix) and segment.endswith(suffix):
+            return quoted + " encodes direction in '%s'; direction belongs to the endpoint, not the name" % suffix
+    return None
+
+def talos_topic_problem(topic):
+    """Why `topic` breaks the naming grammar (talOS/NAMING.md), or None.
+
+    Args:
+      topic: a topic name such as "/drivetrain/target/teleop".
+
+    Returns:
+      A message naming the broken rule, or None for a valid name.
+    """
+    quoted = "topic '%s'" % topic
+    if not topic:
+        return "topic name is empty"
+    if not topic.startswith("/"):
+        return quoted + " must start with '/'"
+    if len(topic) > _MAX_TOPIC_BYTES:
+        return "%s is %d characters; the limit is %d" % (quoted, len(topic), _MAX_TOPIC_BYTES)
+    if topic.endswith("/"):
+        return quoted + " ends with '/'"
+    if "//" in topic:
+        return quoted + " has an empty segment"
+    segments = topic[1:].split("/")
+    if len(segments) < 2 or len(segments) > 4:
+        return quoted + " has %d segments; the form is /owner/role[/qualifier[/qualifier]]" % len(segments)
+    for i, segment in enumerate(segments):
+        problem = _segment_problem(segment, _SEGMENT_KINDS[i])
+        if problem:
+            return quoted + ": " + problem
+    if segments[1] not in TALOS_TOPIC_ROLES:
+        return quoted + ": role '%s' is not one of %s" % (segments[1], ", ".join(TALOS_TOPIC_ROLES))
+    return None
+
 def _check_topics(topics):
     for key, topic in topics.items():
         if not key or not key[0].isalpha() or not key.replace("_", "a").isalnum() or key.lower() != key:
             fail("talos_messages: topic key %r must be a lower_snake_case name" % key)
-        if not topic.startswith("/") or not topic.replace("/", "a").replace("_", "a").replace("-", "a").replace(".", "a").isalnum():
-            fail("talos_messages: topic %r must be /-separated [A-Za-z0-9_.-] segments" % topic)
+        problem = talos_topic_problem(topic)
+        if problem:
+            fail("talos_messages: %s (talOS/NAMING.md)" % problem)
 
 def _heredoc_genrule(name, out, content):
     native.genrule(
@@ -552,6 +641,67 @@ def talos_cc_node(
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
+def talos_cc_shared_node(
+        name,
+        srcs,
+        deps = [],
+        visibility = None,
+        testonly = None,
+        tags = None,
+        **kwargs):
+    """A shared library of C++ nodes for talos.cpp_node.
+
+    The sources export node classes with TALOS_EXPORT_NODE(name, Class). The
+    library links the talOS framework dynamically, from
+    //talOS/node_api:libtalos_node.so: Python loads that library first, so the
+    hosted classes run on the process's one copy of Node, the devices layer
+    and their statics and extension types. A library that linked its own
+    copy would run that copy against libtalos_node's Node. Anything else in
+    `deps` is linked into the library.
+
+    On Linux the library carries its file name as its soname and links with
+    -z defs, so a symbol neither it nor libtalos_node.so defines fails the
+    link instead of the load (macOS's linker refuses one already).
+
+    Args:
+      name: the library's file name, e.g. "libmechanisms.so"; talos.cpp_node
+        takes "<package>/<name>".
+      srcs: C++ sources using TALOS_EXPORT_NODE.
+      deps: libraries the sources use (the node classes, messages, ...).
+      visibility: of the shared library.
+      testonly: of both rules.
+      tags: of both rules.
+      **kwargs: passed to the cc_library that compiles `srcs` (copts,
+        defines, hdrs, ...).
+    """
+    objects = name.removesuffix(".so") + "_exports"
+    cc_library(
+        name = objects,
+        srcs = srcs,
+        deps = deps + [Label("//talOS/node")],
+        # The talos_cpp_node_<name> entry points are referenced by nothing
+        # but dlsym.
+        alwayslink = True,
+        testonly = testonly,
+        tags = tags,
+        visibility = ["//visibility:private"],
+        **kwargs
+    )
+    cc_shared_library(
+        name = name,
+        shared_lib_name = name,
+        dynamic_deps = [Label("//talOS/node_api:libtalos_node.so")],
+        features = ["set_soname"],
+        user_link_flags = select({
+            Label("@platforms//os:linux"): ["-Wl,-z,defs"],
+            "//conditions:default": [],
+        }),
+        testonly = testonly,
+        tags = tags,
+        visibility = visibility,
+        deps = [":" + objects],
+    )
+
 def talos_py_node(
         name,
         node_name,
@@ -617,6 +767,49 @@ def talos_py_node(
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
+# The bridge the launcher starts unless the config's [robot] hardware_node
+# names another.
+_HARDWARE_NODE = Label("//talOS/bridge:hardware_node")
+
+def _bundle_label(label):
+    """`label` as a bundle manifest spells it.
+
+    That is //pkg:name in the main repository, @@repo//pkg:name in any other.
+    """
+    raw = str(label)
+    if raw.startswith("@@//"):
+        return raw[2:]
+    if raw.startswith("@//"):
+        return raw[1:]
+    return raw
+
+def _resolve_config(ctx, manifest_stamp):
+    """Runs the configuration resolver on ctx's config; returns its JSON.
+
+    The JSON names every subsystem's node and holds the effective config, so
+    the bundle builder can compare `nodes` with what the config launches. The
+    manifest check's stamp is an input: a stale manifest reports itself, with
+    the regenerate command, before the resolver meets a file it was not given.
+    """
+    resolved = ctx.actions.declare_file(ctx.label.name + "_resolved.json")
+
+    # As in the manifest check, the resolver reads the config's files by
+    # their paths from the root of the config's repository.
+    workspace_root = ctx.attr.config.label.workspace_root
+    config_path = ctx.file.config.path
+    if workspace_root:
+        config_path = config_path.removeprefix(workspace_root + "/")
+    ctx.actions.run_shell(
+        inputs = depset([ctx.file.config, manifest_stamp] + ctx.files.config_files),
+        tools = [ctx.attr._resolve[DefaultInfo].files_to_run],
+        outputs = [resolved],
+        command = 'root="$PWD"; cd "$root/$4" && "$root/$1" "$2" > "$root/$3"',
+        arguments = [ctx.executable._resolve.path, config_path, resolved.path, workspace_root],
+        mnemonic = "TalosResolveConfig",
+        progress_message = "Resolving the config of %{label}",
+    )
+    return resolved
+
 def _talos_bundle_impl(ctx):
     bundle_dir = ctx.actions.declare_directory(ctx.label.name)
     run_script = ctx.actions.declare_file(ctx.label.name + ".sh")
@@ -624,7 +817,15 @@ def _talos_bundle_impl(ctx):
     launcher_exec = ctx.executable.launcher
     launcher_runfiles = ctx.attr.launcher[DefaultInfo].default_runfiles.files
 
-    direct_inputs = [launcher_exec, ctx.file.config]
+    manifest_stamp = manifest_freshness_stamp(
+        ctx,
+        ctx.file.config,
+        ctx.file.manifest,
+        ctx.files.config_files,
+        ctx.attr._manifest_sync[DefaultInfo].files_to_run,
+    )
+    resolved = _resolve_config(ctx, manifest_stamp)
+    direct_inputs = [launcher_exec, ctx.file.config, manifest_stamp, resolved]
     direct_inputs.extend(ctx.files.config_files)
     transitive_inputs = [launcher_runfiles]
 
@@ -641,13 +842,7 @@ def _talos_bundle_impl(ctx):
             default_info = node[DefaultInfo]
             n_exec = default_info.files_to_run.executable
             n_rf = default_info.default_runfiles
-            raw_target = str(node.label)
-            if raw_target.startswith("@@//"):
-                n_target = raw_target[2:]
-            elif raw_target.startswith("@//"):
-                n_target = raw_target[1:]
-            else:
-                n_target = raw_target
+            n_target = _bundle_label(node.label)
             if node.label.name == "node":
                 n_name = node.label.package.split("/")[-1]
             else:
@@ -676,17 +871,10 @@ def _talos_bundle_impl(ctx):
                 for f in n_rf.files.to_list():
                     if f.extension in ("dylib", "so") or ".so." in f.basename:
                         lib_list.append({"src_path": f.path, "name": f.basename})
-        raw_label = str(node.label)
-        clean_label = raw_label
-        if clean_label.startswith("@@//"):
-            clean_label = clean_label[2:]
-        elif clean_label.startswith("@//"):
-            clean_label = clean_label[1:]
-
         nodes_spec.append({
             "name": n_name,
             "target": n_target,
-            "label": clean_label,
+            "label": _bundle_label(node.label),
             "language": n_lang,
             "src_path": n_exec.path,
             "runfiles": rf_list,
@@ -700,13 +888,29 @@ def _talos_bundle_impl(ctx):
         for f in ctx.files.config_files
     ]
 
+    # Studio: the bridge binary and the built webroot, both or neither. The
+    # robot's BUILD names them; talOS names no studio/ label.
+    studio_spec = None
+    if bool(ctx.attr.studio_bridge) != bool(ctx.attr.studio_webroot):
+        fail("talos_bundle: set studio_bridge and studio_webroot together, or neither")
+    if ctx.attr.studio_bridge:
+        bridge_exec = ctx.executable.studio_bridge
+        webroot = ctx.file.studio_webroot
+        direct_inputs.extend([bridge_exec, webroot])
+        studio_spec = {
+            "bridge_path": bridge_exec.path,
+            "bridge_label": _bundle_label(ctx.attr.studio_bridge.label),
+            "webroot_path": webroot.path,
+        }
+
     spec = {
-        "bundle_name": ctx.label.name,
         "bundle_version": 1,
         "launcher_path": launcher_exec.path,
         "config": {"src_path": ctx.file.config.path, "short_path": ctx.file.config.short_path},
         "config_files": config_files_spec,
         "nodes": nodes_spec,
+        "default_hardware_node": _bundle_label(_HARDWARE_NODE),
+        "studio": studio_spec,
     }
 
     spec_file = ctx.actions.declare_file(ctx.label.name + "_spec.json")
@@ -715,18 +919,29 @@ def _talos_bundle_impl(ctx):
         content = json.encode(spec),
     )
 
-    builder_tool = ctx.file._builder
-    direct_inputs.extend([spec_file, builder_tool])
+    direct_inputs.append(spec_file)
+    arguments = [
+        "--spec",
+        spec_file.path,
+        "--resolved",
+        resolved.path,
+        "--out",
+        bundle_dir.path,
+    ]
 
-    ctx.actions.run_shell(
+    # The source revision only under --stamp (--config=release): the status
+    # file changes with every commit, so an unstamped bundle never reads it
+    # and stays cached.
+    stamp = maybe_stamp(ctx)
+    if stamp:
+        direct_inputs.append(stamp.stable_status_file)
+        arguments += ["--stable-status", stamp.stable_status_file.path]
+
+    ctx.actions.run(
+        executable = ctx.attr._builder[DefaultInfo].files_to_run,
         outputs = [bundle_dir],
         inputs = depset(direct = direct_inputs, transitive = transitive_inputs),
-        command = 'python3 "$1" --spec "$2" --out "$3"',
-        arguments = [
-            builder_tool.path,
-            spec_file.path,
-            bundle_dir.path,
-        ],
+        arguments = arguments,
         mnemonic = "TalosBundle",
         progress_message = "Assembling Talos bundle %s" % ctx.label.name,
     )
@@ -792,18 +1007,25 @@ exec "${{BUNDLE_DIR}}/run.sh" "$@"
         ),
     ]
 
-talos_bundle = rule(
+_talos_bundle = rule(
     implementation = _talos_bundle_impl,
     executable = True,
-    attrs = {
+    attrs = dict({
         "nodes": attr.label_list(
             mandatory = True,
-            doc = "List of node labels providing TalosNodeInfo or DefaultInfo",
+            doc = "Every node the config launches, each providing TalosNodeInfo or DefaultInfo: " +
+                  "the hardware node ([robot] hardware_node, default //talOS/bridge:hardware_node) " +
+                  "and the NODES of its generated manifest. The build fails on any other set.",
         ),
         "config": attr.label(
             mandatory = True,
             allow_single_file = True,
             doc = "The robot.toml config file",
+        ),
+        "manifest": attr.label(
+            mandatory = True,
+            allow_single_file = [".bzl"],
+            doc = "The generated <stem>_manifest.bzl beside config",
         ),
         "config_files": attr.label_list(
             allow_files = True,
@@ -816,12 +1038,60 @@ talos_bundle = rule(
             cfg = "target",
             doc = "The launcher binary",
         ),
-        "_builder": attr.label(
-            default = Label("//talOS/build:bundle_builder.py"),
-            allow_single_file = True,
+        "studio_bridge": attr.label(
+            executable = True,
+            cfg = "target",
+            doc = "The Studio bridge binary (the robot's [studio] bridge) that " +
+                  "--start-studio-bridge starts from the bundle. Set with studio_webroot.",
         ),
-    },
+        "studio_webroot": attr.label(
+            allow_single_file = True,
+            doc = "The built Studio site, one directory holding index.html, that " +
+                  "the bundled bridge serves. Set with studio_bridge.",
+        ),
+        "_builder": attr.label(
+            default = Label("//talOS/build:bundle_builder"),
+            executable = True,
+            cfg = "exec",
+        ),
+        "_resolve": attr.label(
+            default = Label("//talOS/configuration:resolve"),
+            executable = True,
+            cfg = "exec",
+        ),
+        "_manifest_sync": attr.label(
+            default = Label("//tools:sync_manifest"),
+            executable = True,
+            cfg = "exec",
+        ),
+    }, **STAMP_ATTRS),
 )
+
+def talos_bundle(name, config, **kwargs):
+    """Assembles a deployable bundle of exactly the nodes `config` launches.
+
+    The build fails when the config's generated manifest is stale, or when
+    `nodes` is not the hardware node ([robot] hardware_node, default
+    //talOS/bridge:hardware_node) plus the manifest's NODES.
+
+    bundle_manifest.toml records each node binary's SHA-256 and, in a --stamp
+    build (--config=release), the source revision and dirty flag that
+    tools/workspace_status.sh reports.
+
+    Args:
+      name: bundle target name.
+      config: robot TOML label; its generated manifest must live beside it.
+      **kwargs: passed to the bundle rule: nodes, the hardware node plus the
+        manifest's NODES; config_files, its CONFIG_FILES; and, for a robot
+        viewed with Studio, studio_bridge and studio_webroot (the bridge
+        binary and the built site), which put Studio in the bundle; its
+        run.sh then starts the bridge unless given --no-studio.
+    """
+    config_label = native.package_relative_label(config)
+    manifest = config_label.same_package_label(
+        config_label.name.removesuffix(".toml") + "_manifest.bzl",
+    )
+    _talos_bundle(name = name, config = config, manifest = manifest, **kwargs)
 
 def talos_graph_test(
         name,
@@ -831,6 +1101,9 @@ def talos_graph_test(
         **kwargs):
     """Probes every node in `config` with `launcher --describe-only` and lints the graph.
 
+    The graph must list the hardware node and one node per entry of `nodes`,
+    each of them described.
+
     Args:
       name: test target name.
       config: the robot.toml file or label.
@@ -838,6 +1111,14 @@ def talos_graph_test(
       data: every file `config` reads besides itself: the manifest's CONFIG_FILES.
       **kwargs: passed to py_test.
     """
+
+    # The roster is the hardware node and one node per NODES entry: a binary
+    # registers under one name and the launcher refuses two nodes of one name,
+    # so no two subsystems of a passing graph share an entry.
+    expected_nodes = len({
+        native.package_relative_label(item): True
+        for item in ["//talOS/bridge:hardware_node"] + list(nodes)
+    })
     config_label = native.package_relative_label(config)
     config_rel = (config_label.package + "/" + config_label.name) if config_label.package else config_label.name
     runner_py = name + "_graph_test.py"
@@ -889,7 +1170,9 @@ def talos_graph_test(
         "            self.assertEqual(len(sessions), 1, sessions)\n" +
         "            with open(os.path.join(sessions[0], \"graph.json\"), \"r\") as f:\n" +
         "                graph = json.load(f)\n" +
-        "            for node in graph.get(\"nodes\", []):\n" +
+        "            nodes = graph[\"nodes\"]\n" +
+        "            self.assertEqual(len(nodes), %d, [n.get(\"name\") for n in nodes])\n" % expected_nodes +
+        "            for node in nodes:\n" +
         "                self.assertTrue(\n" +
         "                    node.get(\"described\"),\n" +
         "                    f\"node {node.get('name')} ({node.get('target')}) failed --describe: {node.get('describe_error')}\",\n" +

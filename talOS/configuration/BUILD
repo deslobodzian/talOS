@@ -1,5 +1,13 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+# //tools:new_subsystem_test compares new_subsystem's copy of the subsystem
+# file keys with the header's.
+exports_files(
+    ["config_parser.h"],
+    visibility = ["//tools:__pkg__"],
+)
 
 cc_library(
     name = "configuration",
@@ -11,6 +19,13 @@ cc_library(
         "//talOS/introspection:names",
         "@tomlplusplus//:toml++",
     ],
+)
+
+cc_binary(
+    name = "resolve",
+    srcs = ["resolve.cc"],
+    visibility = ["//visibility:public"],
+    deps = [":configuration"],
 )
 
 # Config trees with the expected parse decision, nodes and read files. The
@@ -30,6 +45,17 @@ cc_test(
         ":configuration",
         "//talOS/hardware:config",
         "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "config_fuzz_test",
+    size = "small",
+    srcs = ["config_fuzz_test.cc"],
+    deps = [
+        ":configuration",
+        "//talOS/protocol:fuzz_corpus",
         "@googletest//:gtest_main",
     ],
 )

@@ -6,6 +6,7 @@
 import {useMemo} from 'react';
 
 import {usePlayback, useSnapshot, useSystem} from '../../data/hooks';
+import {liveNodeCount} from '../../data/freshness';
 import {usePanelNavigation} from '../../layout/navigation';
 import {
   declaredStatus,
@@ -14,6 +15,7 @@ import {
 } from '../../system';
 import {duration, integer, staleness} from '../../ui/formatters';
 import {EmptyState, Stat, StatList} from '../../ui/primitives';
+import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
 import './health.css';
 
@@ -31,6 +33,7 @@ function HealthPanel() {
   const navigation = usePanelNavigation();
 
   const graph = system.graph;
+  const graphStale = system.stale;
   const declared = system.declared;
   const status = useMemo(
       () => declared ? declaredStatus(declared, graph) : null, [declared, graph]);
@@ -62,14 +65,23 @@ function HealthPanel() {
 
     if (graph) {
       const health = topicHealthOf(graph);
-      for (const node of graph.nodes)
-        if (!node.alive)
-          out.push({
-            severity: 'warn',
-            text: `${node.name} stopped heartbeating ${
-                duration(staleness(graph, node))} ago`,
-            panel: 'system'
-          });
+      // A stale graph's liveness is last-known, not current: one honest
+      // "unknown" rather than a per-node claim either way.
+      if (graphStale)
+        out.push({
+          severity: 'warn',
+          text: 'the system graph is stale: which nodes are alive is unknown',
+          panel: 'system'
+        });
+      else
+        for (const node of graph.nodes)
+          if (!node.alive)
+            out.push({
+              severity: 'warn',
+              text: `${node.name} stopped heartbeating ${
+                  duration(staleness(graph, node))} ago`,
+              panel: 'system'
+            });
       for (const topic of graph.topics) {
         const state = health(topic);
         if (state === 'orphaned' && !linted.has(topic.name))
@@ -82,7 +94,7 @@ function HealthPanel() {
         if (topic.dropped !== '0')
           out.push({
             severity: 'warn',
-            text: `${topic.name} lapped ${integer(topic.dropped)} messages`,
+            text: `${topic.name} lost ${integer(topic.dropped)} messages`,
             panel: 'timing'
           });
         if (state === 'unread' && !linted.has(topic.name))
@@ -96,7 +108,7 @@ function HealthPanel() {
         out.push({
           severity: 'note',
           text: `bridge dropped ${
-              integer(graph.bridge.ws_drops)} frames to slow clients`,
+              integer(graph.bridge.ws_drops)} messages to slow clients`,
           panel: 'system'
         });
       if (!endpointAttributesKnown(graph))
@@ -110,7 +122,7 @@ function HealthPanel() {
         });
     }
     return out;
-  }, [graph, declared, status]);
+  }, [graph, graphStale, declared, status]);
 
   const s = snapshot;
   const channels = Object.keys(s?.channels ?? {}).length;
@@ -123,9 +135,9 @@ function HealthPanel() {
         <Stat label="Mode">{playback.mode.replaceAll('_', ' ')}</Stat>
         <Stat label="Connection">{playback.connection}</Stat>
         <Stat label="Sequence">{s?.sequence_id ?? '—'}</Stat>
-        <Stat label="Dropped / late" tone={
-          playback.stats.dropped || playback.stats.late ? 'warn' : undefined}>
-          {playback.stats.dropped} / {playback.stats.late}
+        <Stat label="Skipped / late" tone={
+          playback.stats.late ? 'warn' : undefined}>
+          {playback.stats.skipped} / {playback.stats.late}
         </Stat>
         <Stat label="Invalid" tone={playback.stats.invalid ? 'warn' : undefined}>
           {playback.stats.invalid}
@@ -136,13 +148,16 @@ function HealthPanel() {
 
     <section className="panel">
       <div className="panel-heading"><h2>System</h2><span>REGISTRY</span></div>
+      {graph && <GraphFreshnessNotice/>}
       {graph ? <StatList>
-        <Stat label="Nodes live">
-          {graph.nodes.filter(n => n.alive).length} of {graph.nodes.length}
+        <Stat label="Nodes live" tone={graphStale ? 'warn' : undefined}>
+          {liveNodeCount(system) ?? 'unknown'} of {graph.nodes.length}
+          {graphStale && ' (stale graph)'}
         </Stat>
         {declared && <Stat label="Declared">
           {declared.nodes.length} nodes, {
-              status ? `${status.registered} live` : 'no registry yet'}
+              status ? `${status.registered} ${graphStale ? 'registered (stale graph)' : 'live'}` :
+                       'no registry yet'}
         </Stat>}
         {!!status?.missing.length && <Stat label="Never appeared" tone="warn">
           {status.missing.map(n => n.name).join(', ')}

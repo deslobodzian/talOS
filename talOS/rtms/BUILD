@@ -1,4 +1,5 @@
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -7,14 +8,55 @@ flatbuffer_cc_library(
     srcs = ["test_message.fbs"],
 )
 
+# Whether a process recorded in shared memory (pid, start time and pid
+# namespace) still runs: RTMS claims and the live registry's rows share this
+# one check.
+cc_library(
+    name = "process_liveness",
+    srcs = ["process_liveness.cc"],
+    hdrs = ["process_liveness.h"],
+    visibility = ["//visibility:public"],
+)
+
+# The cross-process wake channel a publisher uses to wake a reader asleep on
+# its topic (README.md "Wake channel").
+cc_library(
+    name = "wake",
+    srcs = ["wake.cc"],
+    hdrs = ["wake.h"],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "rtms",
     srcs = ["rtms.cc"],
     hdrs = ["rtms.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":process_liveness",
+        ":wake",
         "//talOS/memory:shared_memory",
         "//talOS/schema:identity",
+    ],
+)
+
+cc_test(
+    name = "process_liveness_test",
+    size = "small",
+    srcs = ["process_liveness_test.cc"],
+    deps = [
+        ":process_liveness",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "wake_test",
+    size = "small",
+    srcs = ["wake_test.cc"],
+    deps = [
+        ":wake",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -34,12 +76,27 @@ cc_test(
         for v in _VARIANTS
     },
     deps = [
+        ":process_liveness",
         ":rtms",
         ":test_message_fbs",
+        ":wake",
         "//talOS/schema:schema_hash",
         "@flatbuffers",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
+    ],
+)
+
+# What a publication costs its writer with 0, 1, 8 and 32 reader processes
+# asleep on the topic (README.md "Publish cost"). Run by hand:
+# bazel run -c opt //talOS/rtms:wake_fanout_bench
+cc_binary(
+    name = "wake_fanout_bench",
+    srcs = ["wake_fanout_bench.cc"],
+    deps = [
+        ":rtms",
+        ":wake",
+        "//talOS/schema:identity",
     ],
 )

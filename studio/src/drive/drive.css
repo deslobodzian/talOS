@@ -1,0 +1,282 @@
+/* The driver dashboard (drive.html). Sized for a 1366x768 Driver Station
+ * screen read at arm's length: the grid fills the viewport and values are
+ * large. System fonts only: the page makes no request beyond the bridge.
+ * Every state is a word as well as a colour; STALE also dims and strikes
+ * the values through.
+ *
+ * The box sizes a list's fit depends on (page padding, gaps, the top bar,
+ * a cell's border and padding, its heading, a list row, list columns and
+ * fonts) are the --drive-* custom properties that view.ts's METRICS writes
+ * on .page; they are stated only there, so listRowsFit computes with what
+ * this sheet lays out. No text is smaller than --drive-min-font. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f3f5f8;
+  --surface: #ffffff;
+  --border: #c9d1db;
+  --text: #0e1621;
+  --muted: #4d5b6b;
+  --good: #11743f;
+  --bad: #b3122e;
+  --warn: #8a5a00;
+  --info: #1f5fa8;
+  --red-alliance: #c0182f;
+  --blue-alliance: #1747a6;
+  --carpet: #dfe5ec;
+  --robot: #0e1621;
+  --series-0: #0b6bcb;
+  --series-1: #b3122e;
+  --series-2: #11743f;
+  --series-3: #8a5a00;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b121c;
+    --surface: #131e2b;
+    --border: #2b3a4b;
+    --text: #e6edf5;
+    --muted: #9db0c3;
+    --good: #5ee0a0;
+    --bad: #ff7d8f;
+    --warn: #ffc65c;
+    --info: #9dc2f5;
+    --red-alliance: #ff7d8f;
+    --blue-alliance: #8fb4ff;
+    --carpet: #1c2a3a;
+    --robot: #e6edf5;
+    --series-0: #6fb8ff;
+    --series-1: #ff7d8f;
+    --series-2: #5ee0a0;
+    --series-3: #ffc65c;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.25 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+#drive { height: 100vh; }
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: var(--drive-page-pad);
+  gap: var(--drive-gap);
+}
+
+.loading { font-size: 22px; margin: 24px; }
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: none;
+  height: var(--drive-top);
+}
+
+.top h1 { font-size: 22px; margin: 0; white-space: nowrap; }
+
+.status-slot { flex: 1; min-width: 0; }
+
+.status {
+  font-size: 20px;
+  padding: 4px 12px;
+  border: 2px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.status b { margin-right: 6px; }
+.status.link-ok b { color: var(--good); }
+.status.link-connecting b { color: var(--info); }
+.status.link-bridge, .status.link-telemetry, .status.link-hardware, .status.link-roborio,
+.status.link-replaced, .status.link-error {
+  border-color: var(--bad);
+}
+.status.link-bridge b, .status.link-telemetry b, .status.link-hardware b,
+.status.link-roborio b, .status.link-replaced b, .status.link-error b { color: var(--bad); }
+.status .meta.bad { color: var(--bad); }
+
+.status button {
+  font: inherit;
+  font-weight: 700;
+  padding: 2px 14px;
+  margin-left: 8px;
+  border-radius: 6px;
+  border: 2px solid var(--text);
+  background: var(--text);
+  color: var(--bg);
+  cursor: pointer;
+}
+
+.meta { color: var(--muted); font-size: max(var(--drive-min-font), 0.8em); margin-left: 6px; }
+
+.grid {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  gap: var(--drive-gap);
+}
+
+.w {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface);
+  border: var(--drive-cell-border) solid var(--border);
+  border-radius: 6px;
+  padding: var(--drive-cell-pad-y) var(--drive-cell-pad-x);
+}
+
+.w > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: var(--drive-header);
+  overflow: hidden;
+}
+
+.w h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.w h3 { margin: 4px 0 2px; font-size: 14px; color: var(--muted); font-weight: 600; }
+
+.body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+/* A list that cannot fit scrolls, never hides a row; its rows that matter
+ * come first (view.ts). */
+.w-subsystems .body, .w-checks .body, .w-alerts .body { overflow-y: auto; display: block; }
+
+.big { font-size: 34px; font-weight: 700; line-height: 1.1; }
+.small { font-size: 16px; }
+.row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.unit { font-size: max(var(--drive-min-font), 0.55em); color: var(--muted); font-weight: 600; }
+.absent { color: var(--muted); font-style: italic; font-weight: 400; font-size: 20px; }
+.none { color: var(--muted); margin: 0; }
+
+.good { color: var(--good); }
+.bad { color: var(--bad); }
+
+.tag {
+  display: inline-block;
+  flex: none;
+  font-size: var(--drive-tag-font);
+  line-height: 1;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1.5px solid currentColor;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.tag-good { color: var(--good); }
+.tag-bad { color: var(--bad); }
+.tag-warn { color: var(--warn); }
+.tag-neutral, .tag-stale { color: var(--muted); }
+.tag-stale { border-style: dashed; }
+
+/* Stale: dimmed, struck through, and the STALE tag in the header. */
+.w.stale .body { opacity: 0.45; }
+.w.stale .big, .w.stale .legend b, .w.stale .checks .name, .w.stale .nodes .name {
+  text-decoration: line-through;
+}
+/* A drawing error: the grid keeps its last draw, which no longer updates,
+ * so every widget reads stale and the status line says DRAWING ERROR. */
+.grid.errored .w .body { opacity: 0.45; }
+.grid.errored .w .big, .grid.errored .w .legend b, .grid.errored .w .checks .name,
+.grid.errored .w .nodes .name { text-decoration: line-through; }
+.grid.errored .w { border: 2px dashed var(--bad); }
+
+.mode-good { color: var(--good); }
+.mode-bad { color: var(--bad); }
+.clock { font-variant-numeric: tabular-nums; }
+.alliance { font-size: 24px; font-weight: 700; }
+.alliance-red { color: var(--red-alliance); }
+.alliance-blue { color: var(--blue-alliance); }
+
+ul { list-style: none; margin: 0; padding: 0; }
+
+/* List rows: one fixed height, the state words never squeezed out (a long
+ * name ellipsizes instead), in as many columns of at least --drive-*-column
+ * as the cell's width holds. */
+.nodes, .checks {
+  display: grid;
+  column-gap: var(--drive-list-gap);
+  align-content: start;
+}
+.nodes { grid-template-columns: repeat(auto-fill, minmax(var(--drive-node-column), 1fr)); }
+.checks { grid-template-columns: repeat(auto-fill, minmax(var(--drive-check-column), 1fr)); }
+.alerts li, .nodes li, .checks li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--drive-row);
+  font-size: var(--drive-row-font);
+  line-height: 1.2;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+}
+.alerts li > *, .nodes li > *, .checks li > * { flex: none; }
+.alerts .name, .nodes .name, .checks .name, .nodes .meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.alerts .level { font-weight: 800; font-size: var(--drive-tag-font); margin-right: 4px; }
+.alert-error .level { color: var(--bad); }
+.alert-warning .level { color: var(--warn); }
+.alert-info .level { color: var(--info); }
+.nodes .name, .checks .name { font-weight: 600; }
+.nodes .more { color: var(--muted); }
+
+.field { flex: 1; min-height: 0; width: 100%; }
+.field .carpet { fill: var(--carpet); }
+.field .mid { stroke: var(--muted); stroke-width: 0.04; stroke-dasharray: 0.2 0.2; }
+.field .robot { fill: none; stroke: var(--robot); stroke-width: 0.1; }
+.field .heading { stroke: var(--robot); stroke-width: 0.12; }
+.field .trail { fill: none; stroke: var(--series-0); stroke-width: 0.08; }
+
+.graph { flex: 1; min-height: 0; width: 100%; border-left: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.graph polyline, .key line { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+.key { width: 22px; height: 8px; margin-right: 4px; }
+.axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; }
+.legend li { font-size: 16px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.series-0 polyline, polyline.series-0, .series-0 line { stroke: var(--series-0); }
+.series-1 polyline, polyline.series-1, .series-1 line { stroke: var(--series-1); }
+.series-2 polyline, polyline.series-2, .series-2 line { stroke: var(--series-2); }
+.series-3 polyline, polyline.series-3, .series-3 line { stroke: var(--series-3); }
+
+.unsupported {
+  color: var(--bad);
+  font-size: 16px;
+  border: 2px dashed var(--bad);
+  padding: 6px;
+  margin: 4px 0 0;
+}

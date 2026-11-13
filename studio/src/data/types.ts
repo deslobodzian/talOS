@@ -12,13 +12,18 @@
 // Plot axes use float seconds relative to an explicit origin.
 
 import type {Mode, Snapshot} from '../core';
+import type {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import type {DeclaredGraph, SystemGraph} from '../system';
 
 export type {Mode, Snapshot};
 
 export type Bounds = {start: string; end: string};
 
-export type StreamStats = {dropped: number; late: number; invalid: number};
+// skipped: producer ticks the live view never showed, because nothing
+// changed or the bridge's egress budget coalesced them into a later update
+// (each node's event log keeps every tick). late: updates that arrived out of
+// order.
+export type StreamStats = {skipped: number; late: number; invalid: number};
 
 export type Connection = 'idle'|'connecting'|'live'|'demo'|'replay'|'error';
 
@@ -26,6 +31,8 @@ export type Connection = 'idle'|'connecting'|'live'|'demo'|'replay'|'error';
 export type PlaybackState = {
   mode: Mode;
   cursor_ns: string|null;  // null until the first frame
+  clock_ns?: string|null;  // session time, advancing through a live data gap
+  updates?: {dropped: number; coalesced: number};
   bounds: Bounds|null;     // retained history; null until the first frame
   stats: StreamStats;
   status: string;          // human-readable connection/import status
@@ -35,7 +42,12 @@ export type PlaybackState = {
 // What the worker knows about the shape of the system, as opposed to what it
 // measured. Arrives at a few hertz, separately from frames.
 export type SystemState = {
+  // The last good graph. Kept when it goes stale, so the last-known evidence
+  // stays inspectable; read liveness through data/freshness.ts.
   graph: SystemGraph|null;
+  // The graph is not current: none has arrived, the newest is older than
+  // GRAPH_STALE_AFTER_MS, the socket is down, or the worker failed.
+  stale: boolean;
   rates: Record<string, number>;
   error: string;
   // Null is the ordinary case ("not offered"), not an error.
@@ -43,16 +55,33 @@ export type SystemState = {
   declaredError: string;
 };
 
-// One telemetry channel as the current dictionary declares it.
-export type ChannelInfo = {name: string; unit: string; labels: string[]};
+// One telemetry channel as the current dictionary declares it. `alert` is the
+// level of an alert channel (a status `bool` named alert_<level>_<name>, active
+// while true; the producer sets it, Studio never parses the name); absent on
+// every other channel, which is AlertLevel.None.
+export type ChannelInfo =
+    {name: string; unit: string; labels: string[]; alert?: AlertLevel};
 
 // Columnar history for plotting. `times` are seconds since `t0_ns`, strictly
 // ascending; each value array is index-aligned with `times` and holds NaN
-// where the channel had no reading (absent, stale, or not yet declared).
+// where the channel had no reading (absent, stale, or not yet declared). A
+// NaN or infinite reading is itself; plots draw every non-finite value as a
+// gap, and the store's presence (channelSample) tells the two apart. Between
+// the frames of two streams (a producer restart) the series holds one extra
+// sample, NaN for every channel, so plots break there rather than draw the
+// restart as continuous operation.
+//
+// A recorded source's series is decimated: each row is one bucket of samples,
+// `values` its last sample, and `min`, `max` and `count` its envelope (NaN and
+// 0 for an empty bucket). The live store's rows are single samples and carry
+// no envelope.
 export type Series = {
   t0_ns: string;
   times: Float64Array;
   values: Record<string, Float64Array>;
+  min?: Record<string, Float64Array>;
+  max?: Record<string, Float64Array>;
+  count?: Record<string, Uint32Array>;
 };
 
 // How much history a series covers, ending at the playback cursor.

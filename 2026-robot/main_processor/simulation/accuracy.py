@@ -1,6 +1,7 @@
 """Run a physical robot session and score fused/replayed poses via log_dump."""
 
 from bisect import bisect_left, bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
 import math
@@ -16,6 +17,8 @@ import tomllib
 import uuid
 
 from python.runfiles import runfiles
+
+import autonomous_progress
 
 
 CONFIG = "2026-robot/main_processor/configuration/robot_physics_sim.toml"
@@ -43,8 +46,11 @@ MOUNT_ERROR_PRESET = {
 }
 # At the routine's 2 m/s limit, 40 ms is 8 cm: above the 2 cm xy floor.
 TIMESTAMP_LAG_US = 40_000
-RUNS = ("odometry-only", "fused", "fused-lag-uncorrected",
+# Report row order; each row is scored once per backend that produced it.
+RUNS = ("odometry-only", "fused", "fused-live", "fused-lag-uncorrected",
         "fused-lag-corrected")
+# Every pose_estimator `backend`; each replays the same recorded sessions.
+BACKENDS = ("kalman", "factor_graph")
 
 
 @dataclass(frozen=True)
@@ -276,12 +282,40 @@ def camera_timing(records):
         for name, (_, message) in latest.items()}
 
 
+def camera_health_issues(timings):
+    """Require >=40 of the requested 60 fps and >=95% processing per camera.
+
+    The deadline counters cover the whole session, unlike estimator accepts,
+    which also depend on visibility and innovation gating. This prerequisite
+    is independent of whether fusion happened to beat odometry.
+
+    Each scheduled deadline ends processed or dropped exactly once, whether
+    it was skipped before capture or its result was lost after it, so
+    processed + dropped counts every deadline once (less the few still in
+    flight at the final status). captured + dropped would count a capture
+    dropped after its capture twice.
+    """
+    issues = []
+    for camera in CAMERAS:
+        timing = timings[camera]
+        scheduled = timing.processed + timing.dropped
+        if (not scheduled or timing.captured * 3 < scheduled * 2
+                or not 0 < timing.frame_period_us <= 25_000
+                or not timing.captured
+                or timing.processed * 20 < timing.captured * 19):
+            issues.append(
+                f"{camera}: period={timing.frame_period_us} us, "
+                f"captured={timing.captured}/{scheduled} deadlines, "
+                f"processed={timing.processed}/{timing.captured}")
+    return issues
+
+
 def timing_markdown(results):
     lines = [
         "| Run | Camera | frame_period_us | Dropped | Captured | Processed |",
         "|---|---|---:|---:|---:|---:|",
     ]
-    for name in RUNS[1:]:
+    for name in ("fused-live", "fused-lag-uncorrected", "fused-lag-corrected"):
         for camera in CAMERAS:
             timing = results[name][camera]
             lines.append(
@@ -290,15 +324,21 @@ def timing_markdown(results):
     return "\n".join(lines)
 
 
+def rows(results):
+    """(run, backend) rows in RUNS order, with a run's backends adjacent."""
+    return [(run, backend) for run in RUNS for backend in BACKENDS
+            if (run, backend) in results["metrics"]]
+
+
 def markdown(results):
     lines = [
-        "| Run | Samples | Position RMS (m) | Position max (m) | Heading RMS (deg) | Heading max (deg) | Final position (m) | Final heading (deg) | Accepted | Rejected |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Backend | Samples | Position RMS (m) | Position max (m) | Heading RMS (deg) | Heading max (deg) | Final position (m) | Final heading (deg) | Accepted | Rejected |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for name in RUNS:
-        m = results[name]
+    for run, backend in rows(results):
+        m = results["metrics"][(run, backend)]
         lines.append(
-            f"| {name} | {m.samples} | {m.position_rms_m:.4f} | "
+            f"| {run} | {backend} | {m.samples} | {m.position_rms_m:.4f} | "
             f"{m.position_max_m:.4f} | {m.heading_rms_deg:.3f} | "
             f"{m.heading_max_deg:.3f} | {m.final_position_m:.4f} | "
             f"{m.final_heading_deg:.3f} | {m.accepted} | {m.rejected} |")
@@ -306,6 +346,11 @@ def markdown(results):
         lines.extend(["", camera_markdown(results["cameras"])])
     if "timing" in results:
         lines.extend(["", timing_markdown(results["timing"])])
+        issues = camera_health_issues(results["timing"]["fused-live"])
+        health = ("Fusion improvement NOT EVALUATED: INSUFFICIENT camera "
+                  "throughput: " + "; ".join(issues)) if issues else (
+                      "Camera throughput sufficient; fusion improvement required.")
+        lines.extend(["", health])
     if "runtime_s" in results:
         lines.extend(["", f"Total runtime: {results['runtime_s']:.1f} s"])
     return "\n".join(lines)
@@ -316,14 +361,15 @@ def summary_markdown(scenarios):
     if not scenarios:
         raise ValueError("at least one scenario is required for a summary")
     lines = [
-        "| Run | Position RMS mean (m) | min (m) | max (m) | Heading RMS mean (deg) | min (deg) | max (deg) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Run | Backend | Position RMS mean (m) | min (m) | max (m) | Heading RMS mean (deg) | min (deg) | max (deg) |",
+        "|---|---|---:|---:|---:|---:|---:|---:|",
     ]
-    for name in RUNS:
-        cells = [name]
+    for row in rows(scenarios[0]):
+        cells = list(row)
         for field, precision in (("position_rms_m", 4),
                                  ("heading_rms_deg", 3)):
-            values = [getattr(result[name], field) for result in scenarios]
+            values = [getattr(result["metrics"][row], field)
+                      for result in scenarios]
             cells.extend(f"{value:.{precision}f}" for value in
                          (sum(values) / len(values), min(values), max(values)))
         lines.append("| " + " | ".join(cells) + " |")
@@ -356,15 +402,49 @@ def run_launcher(binary, args, cwd, env, diagnostic, timeout):
                 raise RuntimeError(f"launcher failed ({proc.returncode}):\n{log.read()}")
 
 
-def session_directory(root):
+def tail(path, lines):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as error:
+        return f"<unreadable: {error}>"
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def log_damage(dumper, node, env):
+    """What log_dump says is damaged in a node's logs; the launcher marks a
+    damaged log recorder_failed at shutdown without printing why."""
+    logs = [path for path in node.get("log_paths", []) if Path(path).exists()]
+    if not logs:
+        return "<no log files>"
+    try:
+        proc = subprocess.run([str(dumper), "--format", "jsonl", *logs], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"<log_dump failed: {error}>"
+    return proc.stderr.strip() or f"<log_dump exit {proc.returncode}, no warnings>"
+
+
+def session_directory(root, diagnostic, dumper, env):
     manifests = list(root.glob("*/manifest.json"))
     if len(manifests) != 1:
-        raise RuntimeError(f"expected one session under {root}, got {len(manifests)}")
+        raise RuntimeError(f"expected one session under {root}, got {len(manifests)}\n"
+                           f"launcher output tail:\n{tail(diagnostic, 80)}")
+    session = manifests[0].parent
     manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    output = Path(manifest.get("output_dir", session))
     for node in manifest["nodes"]:
         if node["exit_code"] != 0 or node["recorder_failed"] or node["restart_count"]:
-            raise RuntimeError(f"unclean session node: {node}")
-    return manifests[0].parent
+            # The entry alone does not say why (a failed spawn, a log the node
+            # could not create, or damage found at shutdown), so carry what
+            # does: the node's output, log_dump's damage report, and the
+            # launcher's output.
+            raise RuntimeError(
+                f"unclean session node: {node}\n"
+                f"{node['name']} output tail:\n{tail(output / (node['name'] + '.log'), 40)}\n"
+                f"{node['name']} log damage:\n{log_damage(dumper, node, env)}\n"
+                f"launcher output tail:\n{tail(diagnostic, 80)}")
+    return session
 
 
 def dump_records(binary, cameras, drivetrain, estimator, env):
@@ -405,13 +485,39 @@ def overlay_config(physics_config, subsystem_overrides):
     return f"include = {json.dumps(str(base))}\n\n" + "\n".join(tables(overrides)) + "\n"
 
 
-def replay_config(physics_config):
-    # The replay has no camera consumers and receives no mounting-error overlay.
-    return overlay_config(physics_config, {"pose_estimator": {"cameras": []}})
+def configured_backend(physics_config):
+    """The backend a live session runs: the physics overlay's, else the one in
+    the pose_estimator subsystem file that the included robot config names."""
+    overrides = tomllib.loads(physics_config.read_text(encoding="utf-8"))
+    backend = overrides.get("subsystems", {}).get(
+        "pose_estimator", {}).get("backend")
+    if backend is not None:
+        return backend
+    base = physics_config.parent / overrides["include"]
+    for entry in tomllib.loads(base.read_text(encoding="utf-8")).get(
+            "subsystems", []):
+        if entry.get("name") == "pose_estimator":
+            subsystem = base.parent / entry["path"]
+            return tomllib.loads(subsystem.read_text(
+                encoding="utf-8"))["subsystem"]["backend"]
+    raise ValueError(f"no pose_estimator subsystem in {base}")
+
+
+def replay_config(physics_config, backend):
+    """Odometry-only replay: the fused replays' estimator, cameras and all,
+    with each camera topic remapped to one no session records, so no
+    observation arrives, and the pair differ only in observations, not in
+    the estimator's subscriptions. No mounting-error overlay; nothing reads
+    a camera's mount."""
+    return overlay_config(physics_config, {"pose_estimator": {
+        "backend": backend,
+        "remap": {f"/{camera}/state": f"/{camera}/state/none"
+                  for camera in CAMERAS}}})
 
 
 def scenario_config(physics_config, min_yaw_std_rad=None,
-                    timestamp_lag_us=0, latency_offset_us=0):
+                    timestamp_lag_us=0, latency_offset_us=0, backend=None):
+    """Live camera overlays; `backend` also selects the estimator (replays)."""
     overrides = {
         name: {"camera": dict(error, sim_timestamp_lag_us=timestamp_lag_us,
                                latency_offset_us=latency_offset_us)}
@@ -419,12 +525,15 @@ def scenario_config(physics_config, min_yaw_std_rad=None,
     if min_yaw_std_rad is not None:
         for values in overrides.values():
             values["min_yaw_std_rad"] = min_yaw_std_rad
+    if backend is not None:
+        overrides["pose_estimator"] = {"backend": backend}
     return overlay_config(physics_config, overrides)
 
 
 def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
-                 lag_duration_s=None):
-    """Score baseline/replay and two lag sessions, retaining logs in output_dir."""
+                 lag_duration_s=None, backends=BACKENDS):
+    """Score each backend's input replays of three live sessions, plus the
+    configured backend's live estimate of the baseline session."""
     started = time.monotonic()
     if lag_duration_s is None:
         lag_duration_s = duration_s
@@ -435,6 +544,8 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
     if min_yaw_std_rad is not None and (
             not math.isfinite(min_yaw_std_rad) or min_yaw_std_rad < 0):
         raise ValueError("yaw std floor must be finite and nonnegative")
+    if not backends or any(backend not in BACKENDS for backend in backends):
+        raise ValueError(f"backends must be a nonempty subset of {BACKENDS}")
     files = runfiles.Create()
     config = Path(files.Rlocation("_main/" + CONFIG))
     launcher = Path(files.Rlocation("_main/talOS/launcher/launcher"))
@@ -448,7 +559,9 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                TALOS_SHM_NAMESPACE=f"accuracy-{uuid.uuid4().hex}")
     # Preserve the runfiles binary layout instead of using the source workspace.
     env.pop("BUILD_WORKSPACE_DIRECTORY", None)
-    results = {"timing": {}}
+    live_backend = configured_backend(config)
+    results = {"metrics": {}, "timing": {}}
+    replays = []  # (run, backend, session, estimator config)
     with tempfile.TemporaryDirectory(prefix="accuracy-launcher-") as temporary:
         cwd = Path(temporary)
         (cwd / "bazel-bin").symlink_to(root, target_is_directory=True)
@@ -476,31 +589,63 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                     "--duration-s", str(seconds + 1)]
             for arg in gateway_args:
                 args.extend(["--sim-gateway-arg", arg])
-            run_launcher(launcher, args, cwd, env, destination / f"{name}.txt",
-                         seconds + 90)
-            session = session_directory(destination / name)
+            try:
+                run_launcher(launcher, args, cwd, env,
+                             destination / f"{name}.txt", seconds + 90)
+            finally:
+                autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
+            session = session_directory(destination / name,
+                                        destination / f"{name}.txt", dumper, env)
             cameras = [session / f"{camera}.tlog" for camera in CAMERAS]
             drivetrain = session / "drivetrain.tlog"
             records = dump_records(dumper, cameras, drivetrain,
                                    session / "pose_estimator.tlog", env)
-            results[name] = score(records)
-            results["timing"][name] = camera_timing(records)
-            if name != "fused":
-                continue
-            results["cameras"] = score_cameras(records)
-            derived = destination / "odometry_only.toml"
-            derived.write_text(replay_config(config), encoding="utf-8")
+            live_name = "fused-live" if name == "fused" else name
+            results["timing"][live_name] = camera_timing(records)
+            replays.extend(
+                (name, backend, session, scenario_config(
+                    config, min_yaw_std_rad, lag_us, offset_us, backend))
+                for backend in backends)
+            if name == "fused":
+                results["metrics"][("fused-live", live_backend)] = score(records)
+                results["cameras"] = score_cameras(records)
+                replays.extend(
+                    ("odometry-only", backend, session,
+                     replay_config(config, backend))
+                    for backend in backends)
+
+        # Every backend and odometry-only run on the same virtual-clock
+        # schedule and inputs. Comparing live fusion with offline odometry
+        # also compares host scheduling: live polling can skip different
+        # drivetrain samples and deliver cameras at different
+        # odometry-buffer positions. Nothing in a replay depends on host
+        # timing, so they run at once, after the live sessions (whose camera
+        # throughput they would otherwise share the CPU with), each in its
+        # own shared-memory namespace: the launcher refuses a second launch
+        # in a namespace that one holds.
+        def replay(run, backend, session, text):
+            label = f"{run}-{backend}-replay"
+            replay_config_path = destination / f"{label}.toml"
+            replay_config_path.write_text(text, encoding="utf-8")
+            replay_env = dict(env, TALOS_SHM_NAMESPACE=f"accuracy-{uuid.uuid4().hex}")
             run_launcher(
                 launcher,
-                ["--config", str(derived), "--replay-inputs", str(session),
+                ["--config", str(replay_config_path),
+                 "--replay-inputs", str(session),
                  "--only", "pose_estimator", "--session-id", session.name,
-                 "--output-dir", str(destination / "odometry-only")],
-                cwd, env, destination / "odometry-only.txt", 90)
-            # Input replay writes the node log, not a live-session manifest.
-            odometry = destination / "odometry-only" / session.name
-            records = dump_records(dumper, cameras, drivetrain,
-                                   odometry / "pose_estimator.tlog", env)
-            results["odometry-only"] = score(records)
+                 "--output-dir", str(destination / label)],
+                cwd, replay_env, destination / f"{label}.txt", 90)
+            # Input replay writes a node log, not a session manifest.
+            replayed = dump_records(
+                dumper, [session / f"{camera}.tlog" for camera in CAMERAS],
+                session / "drivetrain.tlog",
+                destination / label / session.name / "pose_estimator.tlog",
+                replay_env)
+            return (run, backend), score(replayed)
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as pool:
+            for key, metrics in pool.map(lambda args: replay(*args), replays):
+                results["metrics"][key] = metrics
     results["runtime_s"] = time.monotonic() - started
     (destination / "report.md").write_text(markdown(results) + "\n", encoding="utf-8")
     return results, destination

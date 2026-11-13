@@ -1,0 +1,81 @@
+# Checks that hosted macOS cannot run on every push without failing on the
+# runner rather than the code: the sanitizer legs (fork costs about 30 ms
+# under ASan and 375 ms under TSan there) and the full-graph soak (the graph
+# needs about 2.5 of the runner's 3 shared vCPUs). Nightly on main, and on
+# demand for any branch (Actions > Nightly > Run workflow). A failure here
+# does not block a merge; it is a TODO.md entry.
+name: Nightly
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  macos-sanitizers:
+    name: Bazel (${{ matrix.sanitizer }}, macOS)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: ${{ matrix.sanitizer }}
+        repository-cache: true
+        # The only users of the macOS sanitizer caches; a dispatched run on
+        # another branch restores them without saving.
+        cache-save: ${{ github.ref == 'refs/heads/main' }}
+    - name: Test instrumented suite and bounded decoder corpora
+      id: test
+      run: |
+        set -o pipefail
+        bazel test --config=${{ matrix.sanitizer }} \
+          --test_tag_filters=-no_${{ matrix.sanitizer }},-no_macos_sanitizer \
+          --test_output=errors //... 2>&1 \
+          | tee "$RUNNER_TEMP/bazel-test.log"
+    - name: Collect the failed tests' logs and outputs
+      # As in continuous-integration.yaml: each failed test's
+      # bazel-testlogs directory, named in Bazel's summary.
+      if: ${{ failure() && steps.test.outcome == 'failure' }}
+      run: |
+        out="$RUNNER_TEMP/failed-tests"
+        mkdir -p "$out"
+        cp "$RUNNER_TEMP/bazel-test.log" "$out/" || true
+        grep -oE '^//[^ ]+ +(FAILED|TIMEOUT|INCOMPLETE|NO STATUS)' \
+            "$RUNNER_TEMP/bazel-test.log" | awk '{ print $1 }' | sort -u \
+          | while read -r label; do
+              rel="${label#//}"
+              rel="${rel/://}"
+              echo "$label -> $rel"
+              if [ -d "bazel-testlogs/$rel" ]; then
+                mkdir -p "$out/$rel"
+                cp -R "bazel-testlogs/$rel/." "$out/$rel/"
+              fi
+            done
+    - name: Keep the failed tests' logs and outputs
+      if: ${{ failure() && steps.test.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: testlogs-macos-${{ matrix.sanitizer }}
+        path: ${{ runner.temp }}/failed-tests/
+        if-no-files-found: ignore
+
+  macos-soak:
+    # Seed 1, the order main's per-push Linux soak runs.
+    uses: ./.github/workflows/soak.yaml
+    with:
+      os: macos-latest
+      seed: '1'

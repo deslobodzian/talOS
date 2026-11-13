@@ -113,6 +113,40 @@
   margin-bottom: 6px;
 }
 
+.routine-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.routine-hint {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* --- Alerts --------------------------------------------------------------- */
+
+.alerts-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.alerts-latched {
+  border-top: 1px solid var(--border-soft);
+  padding-top: 8px;
+}
+.alerts-latched h3 {
+  margin: 0 0 6px;
+  font-size: 8px;
+  font-weight: 500;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+}
+
 /* --- Power ---------------------------------------------------------------- */
 
 .battery-row {

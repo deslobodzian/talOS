@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +15,6 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <thread>
 #include <utility>
@@ -47,11 +47,15 @@ struct Node::Impl {
     std::unique_ptr<std::byte[]> data;  // operator new[]: aligned for M
     bool optional;
     bool observer = false;
+    // Its publications wake the node (require_immediate_delivery).
+    bool prompt = false;
     detail::MessageCallback on_message;
+    std::uint16_t watcher = 0;  // the loop's source id
     bool has_value = false;
-    Time received{};
-    bool pending = false;  // arrived since the last update() began
-    bool updated = false;  // what update() sees: pending at its start
+    Time published{};
+    std::uint64_t sequence = 0;  // RTMS sequence of the latched message
+    bool pending = false;        // arrived since the last update() began
+    bool updated = false;        // what update() sees: pending at its start
   };
   struct PublisherSlot {
     std::uint16_t id;
@@ -87,10 +91,15 @@ struct Node::Impl {
   std::string config_path;
   std::shared_ptr<const config::RobotConfig> config;
   bool simulation = false;
+  bool describing = false;
   detail::LoopPort* loop = nullptr;
   detail::GraphSource graph;
   std::optional<std::filesystem::path> session_dir;
   bool reads_graph = false;
+  // A publisher on a target lane (`/<sub>/target/<source>`) is registered.
+  bool writes_target_lane = false;
+  // The topic add_hardware_request registered, or empty.
+  std::string hardware_request;
   Duration period{};
   Duration timeout{};
 
@@ -105,9 +114,12 @@ struct Node::Impl {
   std::function<void()> update;
   std::vector<std::function<void()>> after_update;
   bool started = false;
-  bool immediate_delivery = false;
   bool in_update = false;
   std::uint64_t ticks = 0;
+  // The thread that built the node, which also runs its loop: talos::Run,
+  // testing::Sim and the C ABI do both on one thread. require_loop_thread
+  // accepts sends, and the devices layer's commands, from it alone.
+  std::thread::id loop_thread = std::this_thread::get_id();
 
   const SubscriptionSlot& SubscriptionAt(std::size_t index) const {
     if (index >= subscriptions.size()) {
@@ -156,9 +168,41 @@ struct Node::Impl {
   }
 
   const toml::table* Table() const { return config->GetSubsystemTable(name); }
-  toml::node_view<const toml::node> Param(std::string_view key) const {
-    const toml::table* table = Table();
-    if (table == nullptr) return {};
+
+  // Every key the constructor read, present or not: what --describe reports
+  // the node reads (introspect::Description::params). Reads after the loop
+  // starts are not recorded, so update() allocates nothing for them.
+  mutable std::vector<introspect::ParamRead> params_read;
+
+  void RecordParam(std::string_view subsystem, std::string_view key) const {
+    if (started) return;
+    introspect::ParamRead read{std::string{subsystem}, std::string{key}};
+    if (std::find(params_read.begin(), params_read.end(), read) ==
+        params_read.end()) {
+      params_read.push_back(std::move(read));
+    }
+  }
+
+  // `key` in this node's table, or in `subsystem`'s (param_of: read once,
+  // in the constructor, from a subsystem the config must have).
+  toml::node_view<const toml::node> Param(
+      std::string_view key, std::optional<std::string_view> subsystem) const {
+    if (!subsystem) {
+      RecordParam(name, key);
+      const toml::table* table = Table();
+      if (table == nullptr) return {};
+      return table->at_path(key);
+    }
+    CheckOpen("param_of");
+    const toml::table* table =
+        config->GetSubsystemTable(std::string{*subsystem});
+    if (table == nullptr) {
+      throw std::invalid_argument(name + ": param_of('" +
+                                  std::string{*subsystem} + "', '" +
+                                  std::string{key} + "'): no [subsystems." +
+                                  std::string{*subsystem} + "] in the config");
+    }
+    RecordParam(*subsystem, key);
     return table->at_path(key);
   }
 
@@ -198,7 +242,8 @@ struct Node::Impl {
     std::memcpy(slot->data.get(), payload.data(), copied);
     std::memset(slot->data.get() + copied, 0, slot->bytes - copied);
     slot->has_value = true;
-    slot->received = context.now;
+    slot->published = context.publish_time;
+    slot->sequence = context.sequence;
     slot->pending = true;
     if (slot->on_message) slot->on_message(slot->data.get());
   }
@@ -237,6 +282,7 @@ Node::Node(detail::NodeSetup setup) : impl_{std::make_unique<Impl>()} {
   impl.config_path = std::move(setup.config_path);
   impl.config = std::move(setup.config);
   impl.simulation = setup.simulation;
+  impl.describing = setup.describing;
   impl.loop = setup.loop;
   impl.graph = std::move(setup.graph);
   impl.session_dir = std::move(setup.session_dir);
@@ -267,6 +313,7 @@ Node::~Node() {
 
 std::string_view Node::name() const { return impl_->name; }
 bool Node::simulation() const { return impl_->simulation; }
+bool Node::describing() const { return impl_->describing; }
 Time Node::now() const { return impl_->loop->now(); }
 std::uint64_t Node::tick() const { return impl_->ticks; }
 Duration Node::period() const { return impl_->period; }
@@ -274,6 +321,14 @@ const std::string& Node::config_path() const { return impl_->config_path; }
 
 std::optional<std::filesystem::path> Node::session_dir() const {
   return impl_->session_dir;
+}
+
+std::filesystem::path Node::trajectory_path(std::string_view name) const {
+  try {
+    return impl_->config->TrajectoryPath(impl_->name, name);
+  } catch (const std::invalid_argument& error) {
+    throw std::invalid_argument(impl_->name + ": " + error.what());
+  }
 }
 
 void Node::after_update(std::function<void()> fn) {
@@ -322,26 +377,44 @@ void NodeAccess::start(Node& node) {
   Node::Impl& impl = *node.impl_;
   if (impl.started) throw std::logic_error(impl.name + ": started twice");
   impl.started = true;
-  // Draining before timers needs a timer: a node with none (it only lets
-  // its extensions latch values for someone else to read) keeps the tick.
+  // Draining before timers needs a timer: in a node with none (it only lets
+  // its extensions latch values for someone else to read) nothing else would
+  // ever drain, so every subscription wakes it.
   const bool has_tick = impl.update || !impl.after_update.empty();
   const bool timed = has_tick || !impl.timers.empty();
-  impl.loop->set_delivery(impl.immediate_delivery || !timed
-                              ? event::Delivery::POLL
-                              : event::Delivery::BEFORE_TIMERS);
+  bool prompt = false;
+  for (const auto& slot : impl.subscriptions) {
+    if (slot->prompt || !timed) {
+      impl.loop->set_prompt(slot->watcher);
+      prompt = true;
+    }
+  }
+  impl.loop->set_delivery(prompt || !timed ? event::Delivery::ON_PUBLISH
+                                           : event::Delivery::BEFORE_TIMERS);
   if (!has_tick) return;
   const std::uint16_t id = impl.loop->register_timer(
       impl.name, event::Thunk{&impl, &Node::Impl::OnTick});
   impl.loop->arm_timer(id, node.now() + impl.period, impl.period);
 }
 
-void NodeAccess::require_immediate_delivery(Node& node) {
-  node.impl_->CheckOpen("subscribe with a callback");
-  node.impl_->immediate_delivery = true;
+void NodeAccess::require_loop_thread(const Node& node, std::string_view what) {
+  const Node::Impl& impl = *node.impl_;
+  if (std::this_thread::get_id() == impl.loop_thread) return;
+  throw std::logic_error(impl.name + ": " + std::string{what} +
+                         " must run on the node's loop thread");
 }
 
-bool NodeAccess::immediate_delivery(const Node& node) {
-  return node.impl_->immediate_delivery;
+bool NodeAccess::in_update(const Node& node) { return node.impl_->in_update; }
+
+void NodeAccess::require_immediate_delivery(Node& node,
+                                            std::size_t subscription) {
+  Node::Impl& impl = *node.impl_;
+  impl.CheckOpen("subscribe with a callback");
+  if (subscription >= impl.subscriptions.size()) {
+    throw std::out_of_range(impl.name + ": no subscription at index " +
+                            std::to_string(subscription));
+  }
+  impl.subscriptions[subscription]->prompt = true;
 }
 
 std::uint64_t NodeAccess::next_update(const Node& node) {
@@ -379,8 +452,22 @@ bool NodeAccess::reads_graph(const Node& node) {
   return node.impl_->reads_graph;
 }
 
+const std::vector<introspect::ParamRead>& NodeAccess::params_read(
+    const Node& node) {
+  return node.impl_->params_read;
+}
+
 const config::RobotConfig& NodeAccess::robot_config(const Node& node) {
   return *node.impl_->config;
+}
+
+process::LoopTier NodeAccess::loop_tier(const Node& node) {
+  const Node::Impl& impl = *node.impl_;
+  const hardware::Devices* devices = impl.config->GetDevices(impl.name);
+  const bool owns_actuators = devices != nullptr && devices->owns_actuators();
+  return owns_actuators || impl.writes_target_lane
+             ? process::LoopTier::kControl
+             : process::LoopTier::kObserver;
 }
 
 std::optional<std::filesystem::path> NodeAccess::session_dir(const Node& node) {
@@ -446,37 +533,41 @@ void NodeAccess::add_extension(Node& node, std::type_index type,
 // --- params ------------------------------------------------------------------
 
 std::optional<bool> NodeAccess::find_bool(const Node& node,
-                                          std::string_view key) {
-  const auto value = node.impl_->Param(key);
+                                          std::string_view key,
+                                          ParamTable subsystem) {
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   if (auto b = value.value_exact<bool>()) return b;
-  param_error(node, key, "must be a boolean");
+  param_error(node, key, "must be a boolean", subsystem);
 }
 
 std::optional<std::int64_t> NodeAccess::find_int(const Node& node,
-                                                 std::string_view key) {
-  const auto value = node.impl_->Param(key);
+                                                 std::string_view key,
+                                                 ParamTable subsystem) {
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   if (auto i = value.value_exact<std::int64_t>()) return i;
-  param_error(node, key, "must be an integer");
+  param_error(node, key, "must be an integer", subsystem);
 }
 
 std::optional<double> NodeAccess::find_double(const Node& node,
-                                              std::string_view key) {
-  const auto value = node.impl_->Param(key);
+                                              std::string_view key,
+                                              ParamTable subsystem) {
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   if (value.is_floating_point() || value.is_integer()) {
     if (auto d = value.value<double>()) return d;
   }
-  param_error(node, key, "must be a number");
+  param_error(node, key, "must be a number", subsystem);
 }
 
 std::optional<std::string> NodeAccess::find_string(const Node& node,
-                                                   std::string_view key) {
-  const auto value = node.impl_->Param(key);
+                                                   std::string_view key,
+                                                   ParamTable subsystem) {
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   if (auto s = value.value_exact<std::string>()) return s;
-  param_error(node, key, "must be a string");
+  param_error(node, key, "must be a string", subsystem);
 }
 
 namespace {
@@ -501,28 +592,32 @@ std::string_view TypeName(const toml::node& value) {
 }
 
 [[noreturn]] void ElementError(const Node& node, std::string_view key,
+                               NodeAccess::ParamTable subsystem,
                                std::string_view expected, std::size_t index,
                                const toml::node& element) {
   NodeAccess::param_error(node, key,
                           std::string{expected} + "; element " +
                               std::to_string(index) + " is " +
-                              std::string{TypeName(element)});
+                              std::string{TypeName(element)},
+                          subsystem);
 }
 
 std::vector<std::string> StringList(const Node& node, std::string_view key,
+                                    NodeAccess::ParamTable subsystem,
                                     const toml::array& array,
                                     std::string_view expected) {
   std::vector<std::string> out;
   out.reserve(array.size());
   for (std::size_t i = 0; i < array.size(); ++i) {
     const toml::value<std::string>* s = array[i].as_string();
-    if (s == nullptr) ElementError(node, key, expected, i, array[i]);
+    if (s == nullptr) ElementError(node, key, subsystem, expected, i, array[i]);
     out.push_back(s->get());
   }
   return out;
 }
 
 std::vector<double> DoubleList(const Node& node, std::string_view key,
+                               NodeAccess::ParamTable subsystem,
                                const toml::array& array,
                                std::string_view expected) {
   std::vector<double> out;
@@ -533,7 +628,7 @@ std::vector<double> DoubleList(const Node& node, std::string_view key,
     if (element.is_floating_point() || element.is_integer()) {
       d = element.value<double>();
     }
-    if (!d) ElementError(node, key, expected, i, element);
+    if (!d) ElementError(node, key, subsystem, expected, i, element);
     out.push_back(*d);
   }
   return out;
@@ -542,28 +637,29 @@ std::vector<double> DoubleList(const Node& node, std::string_view key,
 }  // namespace
 
 std::optional<std::vector<std::string>> NodeAccess::find_string_list(
-    const Node& node, std::string_view key) {
+    const Node& node, std::string_view key, ParamTable subsystem) {
   constexpr std::string_view kExpected = "must be an array of strings";
-  const auto value = node.impl_->Param(key);
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   const toml::array* array = value.as_array();
-  if (array == nullptr) param_error(node, key, kExpected);
-  return StringList(node, key, *array, kExpected);
+  if (array == nullptr) param_error(node, key, kExpected, subsystem);
+  return StringList(node, key, subsystem, *array, kExpected);
 }
 
 std::optional<std::vector<double>> NodeAccess::find_double_list(
-    const Node& node, std::string_view key) {
+    const Node& node, std::string_view key, ParamTable subsystem) {
   constexpr std::string_view kExpected = "must be an array of numbers";
-  const auto value = node.impl_->Param(key);
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   const toml::array* array = value.as_array();
-  if (array == nullptr) param_error(node, key, kExpected);
-  return DoubleList(node, key, *array, kExpected);
+  if (array == nullptr) param_error(node, key, kExpected, subsystem);
+  return DoubleList(node, key, subsystem, *array, kExpected);
 }
 
 std::optional<ParamValue> NodeAccess::find_param(const Node& node,
-                                                 std::string_view key) {
-  const auto value = node.impl_->Param(key);
+                                                 std::string_view key,
+                                                 ParamTable subsystem) {
+  const auto value = node.impl_->Param(key, subsystem);
   if (!value) return std::nullopt;
   if (auto b = value.value_exact<bool>()) return ParamValue{*b};
   if (auto i = value.value_exact<std::int64_t>()) return ParamValue{*i};
@@ -577,19 +673,21 @@ std::optional<ParamValue> NodeAccess::find_param(const Node& node,
     constexpr std::string_view kExpected =
         "must be an array of strings or of numbers";
     if (!array->empty() && array->front().is_string()) {
-      return ParamValue{StringList(node, key, *array, kExpected)};
+      return ParamValue{StringList(node, key, subsystem, *array, kExpected)};
     }
-    return ParamValue{DoubleList(node, key, *array, kExpected)};
+    return ParamValue{DoubleList(node, key, subsystem, *array, kExpected)};
   }
-  param_error(node, key, "must be a boolean, number, string or array");
+  param_error(node, key, "must be a boolean, number, string or array",
+              subsystem);
 }
 
 void NodeAccess::param_error(const Node& node, std::string_view key,
-                             std::string_view problem) {
+                             std::string_view problem, ParamTable subsystem) {
   const std::string& name = node.impl_->name;
+  const std::string table{subsystem.value_or(name)};
   throw std::invalid_argument(name + ": parameter '" + std::string{key} + "' " +
-                              std::string{problem} + " in [subsystems." + name +
-                              "]");
+                              std::string{problem} + " in [subsystems." +
+                              table + "]");
 }
 
 // --- topics ------------------------------------------------------------------
@@ -603,6 +701,21 @@ void CheckLayout(const std::string& node, std::string_view topic,
       (alignment & (alignment - 1)) != 0) {
     throw std::invalid_argument(node + ": bad message layout for '" +
                                 std::string{topic} + "'");
+  }
+}
+
+// RULES.md 2: a hardware request leaves only through the devices layer's flush
+// after update() (add_hardware_request), which gates it on robot_enabled and
+// update() and applies the motor limits and position frames. A plain
+// publisher there would skip all of that, so none is opened, however the
+// topic was spelled or remapped, whatever --allow-graph-errors says.
+void RefuseHardwareRequest(const std::string& node, std::string_view topic) {
+  if (introspect::naming::IsHardwareRequest(topic)) {
+    throw std::invalid_argument(
+        node + ": cannot publish '" + std::string{topic} +
+        "': hardware requests are sent only by the devices layer's flush "
+        "after update(); command the node's devices (Motor, DigitalOutput, "
+        "PwmOutput) instead");
   }
 }
 
@@ -623,9 +736,10 @@ std::size_t NodeAccess::add_subscription(Node& node, std::string_view topic,
   slot->data = std::make_unique<std::byte[]>(bytes);
   slot->optional = optional;
   slot->on_message = std::move(on_message);
-  impl.loop->register_watcher(slot->topic, static_cast<std::uint32_t>(bytes),
-                              static_cast<std::uint32_t>(alignment), schema,
-                              event::Thunk{slot.get(), &Node::Impl::OnMessage});
+  slot->watcher = impl.loop->register_watcher(
+      slot->topic, static_cast<std::uint32_t>(bytes),
+      static_cast<std::uint32_t>(alignment), schema,
+      event::Thunk{slot.get(), &Node::Impl::OnMessage}, !slot->on_message);
   impl.subscriptions.push_back(std::move(slot));
   return impl.subscriptions.size() - 1;
 }
@@ -642,7 +756,14 @@ bool NodeAccess::subscription_has_value(const Node& node, std::size_t index) {
 Duration NodeAccess::subscription_age(const Node& node, std::size_t index) {
   const auto& slot = node.impl_->SubscriptionAt(index);
   if (!slot.has_value) return Duration::max();
-  return node.now() - slot.received;
+  return node.now() - slot.published;
+}
+
+void NodeAccess::record_read(Node& node, std::size_t index) {
+  const auto& slot = node.impl_->SubscriptionAt(index);
+  if (!slot.has_value) return;
+  node.impl_->loop->record_read(slot.watcher, node.now(), slot.published,
+                                slot.sequence);
 }
 
 bool NodeAccess::subscription_fresh(const Node& node, std::size_t index,
@@ -669,16 +790,43 @@ std::size_t NodeAccess::add_publisher(Node& node, std::string_view topic,
                                       const schema::Identity& schema) {
   Node::Impl& impl = *node.impl_;
   const std::string resolved = impl.ResolveTopic(topic);
+  RefuseHardwareRequest(impl.name, resolved);
   CheckLayout(impl.name, resolved, bytes, alignment);
   const std::uint16_t id =
       impl.loop->register_sender(resolved, static_cast<std::uint32_t>(bytes),
                                  static_cast<std::uint32_t>(alignment), schema);
   impl.publishers.push_back({id, bytes});
+  if (introspect::naming::IsTargetLane(resolved)) {
+    impl.writes_target_lane = true;
+  }
   return impl.publishers.size() - 1;
+}
+
+std::size_t NodeAccess::add_hardware_request(Node& node, std::size_t bytes,
+                                             std::size_t alignment,
+                                             const schema::Identity& schema) {
+  Node::Impl& impl = *node.impl_;
+  if (!impl.hardware_request.empty()) {
+    throw std::logic_error(impl.name + ": hardware request '" +
+                           impl.hardware_request + "' is already registered");
+  }
+  std::string topic = introspect::naming::HardwareRequestTopic(impl.name);
+  CheckLayout(impl.name, topic, bytes, alignment);
+  const std::uint16_t id =
+      impl.loop->register_sender(topic, static_cast<std::uint32_t>(bytes),
+                                 static_cast<std::uint32_t>(alignment), schema);
+  impl.publishers.push_back({id, bytes});
+  impl.hardware_request = std::move(topic);
+  return impl.publishers.size() - 1;
+}
+
+std::string_view NodeAccess::hardware_request(const Node& node) {
+  return node.impl_->hardware_request;
 }
 
 bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
                                 std::size_t bytes) {
+  require_loop_thread(node, "Publisher::send");
   Node::Impl& impl = *node.impl_;
   if (index >= impl.publishers.size()) {
     throw std::out_of_range(impl.name + ": no publisher at index " +
@@ -699,35 +847,35 @@ bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
 
 namespace {
 
-// A byte topic on RTMS (schema talos.Bytes). This node is its only producer
-// and owns its layout, so it reclaims a stale segment no live process holds.
+// A byte topic on RTMS (schema talos.Bytes), opened, and its writer claimed,
+// as the node registers it, the way the realtime loop opens its typed topics:
+// a topic another live process writes fails the node's construction, not a
+// send in the middle of a run.
 class SharedByteTopic final : public ByteTopic {
  public:
   SharedByteTopic(std::string_view topic, std::size_t max_bytes,
                   std::size_t slots, bool drop_newest)
-      : topic_{topic},
-        max_bytes_{max_bytes},
-        slots_{slots},
-        policy_{drop_newest ? OverflowPolicy::DROP_NEWEST
-                            : OverflowPolicy::OVERWRITE_OLDEST} {}
+      : queue_{topic,
+               max_bytes,
+               kMessageAlignment,
+               schema::Bytes(),
+               slots,
+               RTMSOptions{.overflow_policy =
+                               drop_newest ? OverflowPolicy::DROP_NEWEST
+                                           : OverflowPolicy::OVERWRITE_OLDEST,
+                           .read_mode = ReadMode::SEQUENCE,
+                           .publisher = true}} {}
 
   bool write(std::span<const std::byte> message) override {
-    if (!queue_) {
-      queue_.emplace(topic_, max_bytes_, kMessageAlignment, schema::Bytes(),
-                     slots_,
-                     RTMSOptions{.overflow_policy = policy_,
-                                 .read_mode = ReadMode::SEQUENCE,
-                                 .publisher = true});
-    }
-    return queue_->write(message) == WriteResult::SUCCESS;
+    return queue_.write(message) == WriteResult::SUCCESS;
+  }
+
+  std::uint64_t wake_failures() const override {
+    return queue_.wake_failures();
   }
 
  private:
-  std::string topic_;
-  std::size_t max_bytes_;
-  std::size_t slots_;
-  OverflowPolicy policy_;
-  std::optional<RTMSQueue> queue_;
+  RTMSQueue queue_;
 };
 
 }  // namespace
@@ -745,6 +893,7 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
   Node::Impl& impl = *node.impl_;
   impl.CheckOpen("publish_bytes");
   std::string resolved = impl.ResolveTopic(topic);
+  RefuseHardwareRequest(impl.name, resolved);
   CheckLayout(impl.name, resolved, max_bytes, kMessageAlignment);
   if (!is_pow_2(options.slots) || options.slots > MAX_SLOTS) {
     throw std::invalid_argument(impl.name + ": byte topic '" + resolved +
@@ -763,6 +912,7 @@ std::size_t NodeAccess::add_byte_publisher(Node& node, std::string_view topic,
 
 bool NodeAccess::byte_publisher_send(Node& node, std::size_t index,
                                      std::span<const std::byte> message) {
+  require_loop_thread(node, "BytePublisher::send");
   Node::Impl::BytePublisherSlot& slot = node.impl_->ByteAt(index);
   if (message.size() > slot.max_bytes || !slot.sink->write(message)) {
     slot.dropped.fetch_add(1, std::memory_order_relaxed);
@@ -790,6 +940,11 @@ std::uint64_t NodeAccess::byte_topic_published(const Node& node,
 std::uint64_t NodeAccess::byte_topic_dropped(const Node& node,
                                              std::size_t index) {
   return node.impl_->ByteAt(index).dropped.load(std::memory_order_relaxed);
+}
+
+std::uint64_t NodeAccess::byte_topic_wake_failures(const Node& node,
+                                                   std::size_t index) {
+  return node.impl_->ByteAt(index).sink->wake_failures();
 }
 
 std::size_t NodeAccess::add_selection(Node& node,
@@ -841,6 +996,9 @@ struct Flags {
   std::string graph_path;
   int duration_s = 0;
   std::uint64_t session_id = 0;
+  std::uint64_t log_max_bytes = 0;  // --log-max-bytes; 0 is unbounded
+  // --log-window-us: LogWriterOptions::window; 0 ends segments on bytes only.
+  std::chrono::nanoseconds log_window{0};
   bool simulation = false;
   bool describe = false;
   bool log_set = false;  // --log was passed (vs. the /tmp default)
@@ -858,6 +1016,10 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else if (arg == "--log" && i + 1 < argc) {
       flags.log_path = argv[++i];
       flags.log_set = true;
+    } else if (arg == "--log-max-bytes" && i + 1 < argc) {
+      flags.log_max_bytes = std::stoull(argv[++i]);
+    } else if (arg == "--log-window-us" && i + 1 < argc) {
+      flags.log_window = event::log::ParseLogWindowUs(argv[++i]);
     } else if (arg == "--session-id" && i + 1 < argc) {
       flags.session_id = std::stoull(argv[++i]);
     } else if (arg == "--config" && i + 1 < argc) {
@@ -873,8 +1035,9 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
     } else {
       throw std::invalid_argument(
           "usage: node [--sim] [--describe] [--duration-s N] [--log PATH] "
-          "[--session-id ID] [--config PATH] [--graph PATH] [--replay PATH] "
-          "[--replay-inputs SESSION_DIR]");
+          "[--log-max-bytes N] [--log-window-us N] [--session-id ID] "
+          "[--config PATH] "
+          "[--graph PATH] [--replay PATH] [--replay-inputs SESSION_DIR]");
     }
   }
   if (!flags.replay_path.empty() && !flags.replay_inputs.empty()) {
@@ -891,10 +1054,24 @@ Flags ParseFlags(int argc, char** argv, const char* node_name) {
 }
 
 // The declared graph from --graph, read on first use. Without the flag:
-// none yet under --describe (the launcher's first pass), and an error
-// otherwise, since a node that reads the graph cannot be built without one.
+// under --replay-inputs, the one the replayed session was launched with
+// (<session dir>/declared_graph.json, which the launcher writes into a
+// session that runs a graph reader); none yet under --describe (the
+// launcher's first pass); and an error otherwise, since a node that reads the
+// graph cannot be built without one.
 GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
-  if (flags.graph_path.empty()) {
+  std::string path = flags.graph_path;
+  std::string unreadable = "cannot read --graph " + path;
+  if (path.empty() && !flags.replay_inputs.empty()) {
+    path = (std::filesystem::path{flags.replay_inputs} / "declared_graph.json")
+               .string();
+    unreadable = std::string{node_name} +
+                 " reads the declared graph, and the replayed session has "
+                 "none: cannot read " +
+                 path +
+                 " (a session without a graph reader has none); pass --graph";
+  }
+  if (path.empty()) {
     if (flags.describe) return [] { return nullptr; };
     return [name = std::string{node_name}]() -> const DeclaredGraph* {
       throw std::runtime_error(
@@ -904,10 +1081,11 @@ GraphSource GraphFromFlags(const Flags& flags, std::string_view node_name) {
     };
   }
   auto graph = std::make_shared<std::optional<DeclaredGraph>>();
-  return [graph, path = flags.graph_path]() -> const DeclaredGraph* {
+  return [graph, path = std::move(path),
+          unreadable = std::move(unreadable)]() -> const DeclaredGraph* {
     if (!graph->has_value()) {
       std::ifstream file{path};
-      if (!file) throw std::runtime_error("cannot read --graph " + path);
+      if (!file) throw std::runtime_error(unreadable);
       const std::string text{std::istreambuf_iterator<char>{file}, {}};
       DeclaredGraph parsed;
       std::string error;
@@ -934,8 +1112,14 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
             const Flags& flags, const InstanceFactory& make) {
   Hosted hosted;
   hosted.port = std::move(port);
+  // An offline run has no session, even with --log (--replay-inputs always
+  // has one): state a node keeps per session or across restarts (the 2026
+  // autonomous node's selection and progress) must not be read or written by
+  // a replay or a probe.
+  const bool offline = flags.describe || !flags.replay_path.empty() ||
+                       !flags.replay_inputs.empty();
   std::optional<std::filesystem::path> session_dir;
-  if (flags.log_set) {
+  if (flags.log_set && !offline) {
     session_dir.emplace(std::filesystem::path{flags.log_path}.parent_path());
   }
   NodeSetup setup;
@@ -944,6 +1128,7 @@ Hosted Host(std::unique_ptr<LoopPort> port, const char* node_name,
   setup.config = std::make_shared<const config::RobotConfig>(
       config::ParseRobotConfig(flags.config_path));
   setup.simulation = flags.simulation;
+  setup.describing = flags.describe;
   setup.loop = hosted.port.get();
   setup.graph = GraphFromFlags(flags, node_name);
   setup.session_dir = std::move(session_dir);
@@ -960,18 +1145,20 @@ Hosted Host(Loop& loop, const char* node_name, const Flags& flags,
               make);
 }
 
-// A byte topic that goes nowhere. The loop never logged byte topics, and a
-// node replayed offline must not write into the shared memory of a robot
-// that may be running on this machine.
+// A byte topic that goes nowhere, for runs that must leave a robot that may
+// be running on this machine alone: --describe (the launcher's probe) must
+// not claim its writers, and a node replayed offline must not attach to or
+// write into its shared memory. The loop never logged byte topics, so replay
+// cannot verify them anyway.
 class DiscardedByteTopic final : public ByteTopic {
  public:
   bool write(std::span<const std::byte>) override { return true; }
 };
 
-// The loop port under --replay-inputs: the simulated loop, with byte topics
-// discarded.
+// The loop port under --describe, --replay and --replay-inputs: the loop,
+// with byte topics discarded.
 template <class Loop>
-class InputReplayPort final : public LoopPortFor<Loop> {
+class OfflinePort final : public LoopPortFor<Loop> {
  public:
   using LoopPortFor<Loop>::LoopPortFor;
   std::unique_ptr<ByteTopic> open_byte_topic(
@@ -980,23 +1167,27 @@ class InputReplayPort final : public LoopPortFor<Loop> {
   }
 };
 
-// --replay-inputs: this node, on a simulated loop starting at the recorded
-// session's origin, fed every message the session logged on a topic it
-// watches at its recorded time (talOS/events/input_replay.h). What it sends
-// is logged to --log. A topic recorded with another schema fails before
-// anything runs; topics nobody recorded are listed.
+// --replay-inputs: this node, on a simulated loop on the recorded clock, fed
+// every message the session logged on a topic it watches at its recorded
+// time (talOS/events/input_replay.h). A node the session logged runs on its
+// own recorded timeline (origin and run start, so its timers fire at the
+// recorded deadlines) and is handed what it received live, at the drains it
+// received it in. What it sends is logged to --log. A topic recorded with
+// another schema fails before anything runs; topics nobody recorded are
+// listed.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
-  const event::RecordedSession session{flags.replay_inputs};
+  const event::RecordedSession session{flags.replay_inputs, node_name};
   event::SimulationEnvironment environment;
   Loop loop{
       environment,
       event::log::LogWriter{flags.log_path, node_name,
                             event::log::LogWriterOptions{}, flags.session_id},
-      Loop::Options{.start = session.start()}};
-  const Hosted hosted = Host(std::make_unique<InputReplayPort<Loop>>(loop),
-                             node_name, flags, make);
+      Loop::Options{.start = session.loop_start(),
+                    .run_start = session.run_start()}};
+  const Hosted hosted =
+      Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =
       event::ReplayInputs(loop, environment, session);
 
@@ -1022,8 +1213,8 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   return 0;
 }
 
-// Endpoint attributes of the loop's sources: the optional subscriptions and
-// the observers.
+// Endpoint attributes of the loop's sources: the optional subscriptions, the
+// observers and the devices layer's hardware request.
 std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   std::vector<introspect::EndpointAttribute> attributes;
   for (const std::string_view topic : NodeAccess::optional_topics(node)) {
@@ -1031,6 +1222,11 @@ std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   }
   for (const std::string_view topic : NodeAccess::observer_topics(node)) {
     attributes.push_back({topic, introspect::naming::kSourceFlagObserver});
+  }
+  if (const std::string_view topic = NodeAccess::hardware_request(node);
+      !topic.empty()) {
+    attributes.push_back(
+        {topic, introspect::naming::kSourceFlagHardwareRequest});
   }
   return attributes;
 }
@@ -1040,7 +1236,8 @@ std::uint32_t ByteTopicFlags(const NodeAccess::ByteTopicShape& topic) {
 }
 
 // Byte topics bypass the loop, so its manifest misses them; they are
-// declared to the registry here, with their own counters.
+// declared to the registry here, with their own counters, wake failures
+// included (the loop's wake_loss() sums only its own senders).
 std::vector<introspect::Reporter::ExtraSource> ByteTopicSources(
     const Node& node) {
   std::vector<introspect::Reporter::ExtraSource> sources;
@@ -1057,6 +1254,10 @@ std::vector<introspect::Reporter::ExtraSource> ByteTopicSources(
                    i] { return NodeAccess::byte_topic_published(node, i); },
         .dropped = [&node,
                     i] { return NodeAccess::byte_topic_dropped(node, i); },
+        .wake_failures =
+            [&node, i] {
+              return NodeAccess::byte_topic_wake_failures(node, i);
+            },
     });
   }
   return sources;
@@ -1079,12 +1280,13 @@ std::vector<introspect::Reporter::Selection> Selections(const Node& node) {
 
 }  // namespace
 
-introspect::Description DescribeNode(const Node& node, std::string_view target,
-                                     const event::Manifest& manifest) {
+introspect::Description DescribeNode(
+    const Node& node, std::string_view target, const event::Manifest& manifest,
+    const std::vector<std::uint32_t>& source_flags) {
   auto description = introspect::DescribeManifest(
       std::string{node.name()}, std::string{target}, manifest,
       static_cast<std::uint32_t>(event::RealtimeEventLoop<>::Options{}.slots),
-      Endpoints(node));
+      Endpoints(node), source_flags);
   const schema::Identity bytes = schema::Bytes();
   for (const auto& topic : NodeAccess::byte_topics(node)) {
     introspect::naming::SourceShape source{
@@ -1097,6 +1299,7 @@ introspect::Description DescribeNode(const Node& node, std::string_view target,
     description.sources.push_back(std::move(source));
   }
   description.reads_graph = NodeAccess::reads_graph(node);
+  description.params = NodeAccess::params_read(node);
   return description;
 }
 
@@ -1105,24 +1308,36 @@ int RunMain(int argc, char** argv, const char* node_name,
   try {
     const Flags flags = ParseFlags(argc, argv, node_name);
     // --describe builds the node for real and prints what its constructor
-    // registered. The loop is the only difference: a simulated loop's
-    // channels live in this process, so no shared memory, no hardware and no
-    // network is touched, and the launcher can ask what a node is without
-    // starting a robot.
+    // registered. The loop and Node::describing() are the only differences:
+    // a simulated loop's channels live in this process and its byte topics
+    // are discarded, so no shared memory, no hardware and no network is
+    // touched, and the launcher can ask what a node is without starting a
+    // robot, or while one runs. The loop never runs, so no update() or
+    // callback sees a node built without its backends.
     if (flags.describe) {
       event::SimulationEnvironment environment;
       event::SimulatedEventLoop<> loop{environment};
-      const Hosted hosted = Host(loop, node_name, flags, make);
-      std::printf("%s",
-                  introspect::DescribeToJson(
-                      DescribeNode(*hosted.node, node_target, loop.manifest()))
-                      .c_str());
+      const Hosted hosted =
+          Host(std::make_unique<OfflinePort<event::SimulatedEventLoop<>>>(loop),
+               node_name, flags, make);
+      introspect::Description description =
+          DescribeNode(*hosted.node, node_target, loop.manifest(),
+                       introspect::LoopSourceFlags(loop));
+      // A run installs the stop handlers below, right after its flags parse
+      // and before anything that can wait, and they unblock what a launcher
+      // holds: a stop sent while this binary (or the Python interpreter
+      // hosting it) was starting is held until then, then taken as one
+      // during construction.
+      description.holds_stop = true;
+      std::printf("%s", introspect::DescribeToJson(description).c_str());
       return 0;
     }
     if (!flags.replay_path.empty()) {
       event::log::LogReader reader{flags.replay_path};
       event::ReplayEventLoop<> loop{reader};
-      const Hosted hosted = Host(loop, node_name, flags, make);
+      const Hosted hosted =
+          Host(std::make_unique<OfflinePort<event::ReplayEventLoop<>>>(loop),
+               node_name, flags, make);
       loop.run();
       std::printf("replay: diverged=%d clean_exit=%d\n", loop.diverged(),
                   loop.reached_exit());
@@ -1131,48 +1346,80 @@ int RunMain(int argc, char** argv, const char* node_name,
     if (!flags.replay_inputs.empty()) {
       return RunOnRecordedInputs(node_name, flags, make);
     }
-    event::RealtimeEventLoop<event::log::LogWriter> loop{event::log::LogWriter{
-        flags.log_path, node_name, event::log::LogWriterOptions{},
-        flags.session_id}};
-    const Hosted hosted = Host(loop, node_name, flags, make);
+    // Before anything slow: a stop (SIGINT/SIGTERM) during construction is
+    // recorded instead of killing the process, and honoured once the
+    // constructor returns. A constructor blocked in a restartable system call
+    // stays blocked (the handlers restart it); the launcher's SIGKILL after its
+    // grace bounds that.
     process::InstallStopHandlers();
-    // Publishes this node's topics and activity into the live registry, so
-    // Studio and any agent can see what is running without being told.
-    // Declared after the loop and the node: reverse destruction order joins
-    // its thread before the counters it samples are destroyed.
-    introspect::Reporter reporter{loop,
-                                  {.name = node_name,
+    const int stop_fd = process::StopFd();
+    if (stop_fd < 0) {
+      throw std::runtime_error(
+          std::string{node_name} +
+          ": cannot create the stop pipe: " + std::strerror(errno));
+    }
+    // The launcher bounds each node's share of the session's log budget; at
+    // the cap the log drops its oldest segments to keep the newest records
+    // (LogWriterOptions::max_bytes) and `<log>.capped` marks it incomplete.
+    // It also passes the session's log window, so every capped member keeps
+    // about the same record time (LogWriterOptions::window).
+    event::log::LogWriterOptions log_options;
+    log_options.max_bytes = flags.log_max_bytes;
+    log_options.window = flags.log_window;
+    // The loop reads the stop flag between dispatches, so a stop takes effect
+    // after the current dispatch even when overdue timers never let it wait
+    // (an update() that overruns its period).
+    event::RealtimeEventLoop<event::log::LogWriter>::Options loop_options;
+    loop_options.stop = &process::stop_requested;
+    event::RealtimeEventLoop<event::log::LogWriter> loop{
+        event::log::LogWriter{flags.log_path, node_name, log_options,
+                              flags.session_id},
+        loop_options};
+    // Keep the hosted node alive until the reporting thread has joined, while
+    // publishing identity before any user constructor or backend
+    // initialization.
+    std::optional<Hosted> hosted;
+    introspect::Reporter reporter{{.name = node_name,
                                    .target = node_target,
                                    .session_id = flags.session_id,
-                                   .simulation = flags.simulation,
-                                   .extra = ByteTopicSources(*hosted.node),
-                                   .endpoints = Endpoints(*hosted.node),
-                                   .selections = Selections(*hosted.node)}};
-
-    std::jthread stopper{[&](const std::stop_token& stop) {
-      while (!stop.stop_requested()) {
-        if (process::stop_requested.load() && loop.running()) {
-          loop.exit();
-          return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds{20});
-      }
-    }};
-    // Last, from this thread: the reporter and the stopper above are
-    // bookkeeping and must not inherit the loop's realtime policy.
-    if (!flags.simulation) {
-      process::ConfigureRealtime(
-          {.period = hosted.node->period(), .priority = 50});
+                                   .simulation = flags.simulation}};
+    hosted.emplace(Host(loop, node_name, flags, make));
+    if (process::stop_requested.load()) {
+      // Stopped while constructing: a clean stop, without running the loop.
+      std::printf("%s: stopped during construction\n", node_name);
+      return 0;
     }
+    // A stop from here on also makes the stop pipe readable, which ends the
+    // loop's wait wherever it waits, and the loop exits from its own thread:
+    // no thread polls for a stop, so an idle node is woken only by its own
+    // timers and publications. A stop that lands before the run starts is
+    // seen by the run's first flag check.
+    loop.watch_fd(stop_fd, [&loop] {
+      if (process::ConsumeStopWake()) loop.exit();
+    });
+    reporter.start(loop, ByteTopicSources(*hosted->node),
+                   Endpoints(*hosted->node), Selections(*hosted->node));
+
+    // Last, from this thread: the reporter is bookkeeping and must not
+    // inherit the loop's realtime policy. The row carries the outcome, where
+    // the launcher and session_report look for a loop that runs without its
+    // grant.
+    process::RealtimeOutcome realtime{.tier =
+                                          NodeAccess::loop_tier(*hosted->node)};
+    if (process::RealtimeRequested(flags.simulation)) {
+      realtime = process::ConfigureRealtime(
+          {.period = hosted->node->period(), .tier = realtime.tier});
+    }
+    reporter.set_realtime(realtime);
     if (flags.duration_s) {
       loop.run_for(std::chrono::seconds{flags.duration_s});
     } else {
       loop.run();
     }
-    stopper.request_stop();
-    std::printf("%s: dispatches=%llu recording_failed=%d\n", node_name,
+    std::printf("%s: dispatches=%llu recording_failed=%d recording_capped=%d\n",
+                node_name,
                 static_cast<unsigned long long>(loop.dispatch_count()),
-                loop.recorder().failed());
+                loop.recorder().failed(), loop.recorder().capped());
     if (loop.recorder().failed()) {
       std::fprintf(stderr, "%s\n", loop.recorder().error().c_str());
       return 1;

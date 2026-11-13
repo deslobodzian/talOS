@@ -5,26 +5,29 @@
 // A contiguous span (seconds since the series origin) where a 0/1 flag read 1.
 export type Band = {start: number; end: number};
 
-// Rate of a cumulative counter over the samples given, in units per second.
+// Rate of a cumulative counter over the samples given, in units per second:
+// the sum of the nonnegative steps between consecutive finite readings over
+// the time from the first reading to the last. A reset (a step down, the
+// bridge restarted) adds nothing, so it reads neither as a negative rate nor
+// as a jump; increments hidden by the reset are unknown and excluded.
 //
-// Null when there are fewer than two readings, when the time span is zero, or
-// when the counter wrapped (the later value is lower than the earlier one):
-// "not measured" and "the bridge restarted" are different statements from a
-// real rate. A flat counter yields 0, which is the honest "not moving".
+// Null when there are fewer than two readings or the time span is zero: "not
+// measured" is a different statement from a real rate. A flat counter yields
+// 0, which is the honest "not moving".
 export function counterRate(
     times: ArrayLike<number>, values: ArrayLike<number>): number|null {
   let first = -1;
   let last = -1;
+  let dv = 0;
   for (let i = 0; i < values.length; i++) {
-    if (Number.isFinite(values[i])) {
-      if (first < 0) first = i;
-      last = i;
-    }
+    if (!Number.isFinite(values[i])) continue;
+    if (first < 0) first = i;
+    else if (values[i] > values[last]) dv += values[i] - values[last];
+    last = i;
   }
   if (first < 0 || last <= first) return null;
   const dt = times[last] - times[first];
-  const dv = values[last] - values[first];
-  if (!(dt > 0) || dv < 0) return null;
+  if (!(dt > 0)) return null;
   return dv / dt;
 }
 
@@ -34,13 +37,13 @@ export type BitHistory = {
   set: boolean|null;   // null when there was no finite reading
   lastSetAt: number|null;  // seconds since origin of the last 0→1 edge (null
                            // if the bit never rose within the view)
-  setCount: number;     // 0→1 edges in the view
+  setCount: number;     // active at the start, plus 0→1 edges in the view
 };
 
 // The history of each low bit of a bitmask channel. `bits` is how many low
 // bits to report (e.g. subsystem_count, motor count), clamped to 32. NaN
 // samples are skipped, so a gap neither clears nor sets a bit; a bit already
-// set at the first sample is "set" with no edge in the view.
+// set at the first sample is retained as an initial occurrence, not an edge.
 export function bitHistory(
     times: ArrayLike<number>, mask: ArrayLike<number>,
     bits = 32): BitHistory[] {
@@ -57,8 +60,8 @@ export function bitHistory(
       if (!Number.isFinite(v)) continue;
       const on = (v & bit) !== 0;
       if (!seen) {
-        // The first reading is a state, not an edge: a bit already set at the
-        // start of the view has no observable rise inside it.
+        // Retain a fault active before the view even if it later clears.
+        if (on) setCount = 1;
         prev = on;
         seen = true;
         continue;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -14,6 +15,7 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
+#include "talOS/bridge/boot_history.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
@@ -160,11 +162,17 @@ struct HardwareLink::Impl {
   struct Device {
     Kind kind;
     std::uint16_t id;
-    bool set = false;  // commanded since the last flush
+    std::string name;  // the config key the first handle named
+    bool set = false;  // commanded in the current update()
     hardware::MotorRequest motor{};
     const hardware::MotorConfig* motor_config = nullptr;
     std::uint64_t clamped_count = 0;
-    double position_offset = 0;
+    double position_offset = 0;  // Motor/Gyro software zero
+    bool zeroed = false;         // position_offset was set by rezero
+    // The position (yaw) of the last accepted State whose sample was valid,
+    // in the hardware frame; 0 before one. A position read returns it while
+    // the latched sample is invalid (HeldPosition).
+    double held_position = 0;
     bool digital = false;
     double pwm = 0;
     // Where this device's sample was in the state arrays last time it was
@@ -185,7 +193,8 @@ struct HardwareLink::Impl {
 
   hardware::State state{};
   bool have_state = false;
-  Time state_received{};
+  Time state_published{};
+  std::size_t state_subscription = 0;
   // The bridge's gateway-to-node clock mapping. The state is the gateway's
   // canonical wire bytes, which the bridge relays untouched (its
   // sample_time_us is what every request echoes, on the gateway clock), so
@@ -198,14 +207,14 @@ struct HardwareLink::Impl {
   explicit Impl(Node& n) : node{n} {}
 
   bool Fresh() const {
-    return have_state && node.now() - state_received < timeout;
+    return have_state && node.now() - state_published < timeout;
   }
   Duration Age() const {
-    return have_state ? node.now() - state_received : Duration::max();
+    return have_state ? node.now() - state_published : Duration::max();
   }
   bool Enabled() const { return Fresh() && hardware::GatewayReady(state); }
   std::optional<Time> SampleTime() const {
-    if (!Fresh() || !bridge_status.has_value()) return std::nullopt;
+    if (!Fresh() || !bridge_status.fresh(timeout)) return std::nullopt;
     const ::bridge::BridgeStatus& clock = bridge_status.value();
     if (!clock.clock_offset_valid() || clock.clock_boot_id() != state.boot_id) {
       return std::nullopt;
@@ -226,6 +235,24 @@ struct HardwareLink::Impl {
   const Device& At(std::size_t index, Kind kind) const {
     return const_cast<Impl*>(this)->At(index, kind);
   }
+  // The device an output setter commands. Outputs are taken only on the
+  // loop thread, inside update(): Flush() runs after each update() and sends
+  // neutral for every output that update() did not set, so a command from
+  // the constructor, every() or a message callback would reach the hardware
+  // for at most one tick (from a timer slower than the tick, a pulse).
+  Device& Output(std::size_t index, Kind kind, std::string_view setter) {
+    detail::NodeAccess::require_loop_thread(node, setter);
+    Device& device = At(index, kind);
+    if (!detail::NodeAccess::in_update(node)) {
+      throw std::logic_error(
+          std::string{node.name()} + ": " + std::string{setter} + " on " +
+          KindLabel(kind) + " '" + device.name +
+          "' called outside update(); set outputs in update(), since the "
+          "flush after each update() sends neutral for every output it did "
+          "not set");
+    }
+    return device;
+  }
   const Device& SensorAt(std::size_t index) const {
     if (index < devices.size() && (devices[index].kind == Kind::kGyro ||
                                    devices[index].kind == Kind::kCANcoder)) {
@@ -244,9 +271,89 @@ struct HardwareLink::Impl {
     hardware::State next{};
     if (!hardware::Decode(packet.bytes(), next)) return;
     if (!hardware::AcceptState(have_state, state, config_id, next)) return;
+    if (have_state) ForgetZeros(next);
     state = next;
     have_state = true;
-    state_received = node.now();
+    HoldPositions();
+    state_published = node.now() - detail::NodeAccess::subscription_age(
+                                       node, state_subscription);
+  }
+
+  // A software zero holds only in the hardware frame it was taken in, and a
+  // gateway boot change or a device reset may have restarted that frame.
+  // ForgetZeros runs on each accepted state, with `state` still the one
+  // before it:
+  //   - a boot id change drops every zero (a new boot may come with
+  //     power-cycled devices);
+  //   - a device_reset_count change with next.sequence == state.sequence + 1
+  //     (the gateway tick right after the one seen last) drops the zeros of
+  //     this node's devices that `next` masks: the gateway counts a reset
+  //     and masks the device, with its followers and remote-sensor
+  //     consumers, in the same State;
+  //   - any other device_reset_count change drops every zero: the masking
+  //     State may have been lost (a link outage, a bridge restart, dropped
+  //     datagrams, a tick with no socket) and the device restored since.
+  // A motor whose config sets position_frame = "absolute" keeps its zero:
+  // its remote CANcoder's frame survives a reset. A dropped zero keeps its
+  // offset, so dropping does not move position() or yaw(); it reads zeroed()
+  // false and holds the motor's position goals neutral until the node
+  // rezeroes.
+  void ForgetZeros(const hardware::State& next) {
+    const bool reboot = next.boot_id != state.boot_id;
+    if (!reboot &&
+        next.counters.device_reset_count == state.counters.device_reset_count) {
+      return;
+    }
+    const bool consecutive = !reboot && next.sequence == state.sequence + 1;
+    for (Device& device : devices) {
+      if (!device.zeroed || AbsoluteFrame(device)) continue;
+      if (consecutive && Valid(next, device)) continue;
+      device.zeroed = false;
+    }
+  }
+
+  // Records each position-reading device's position from the new state
+  // while its sample there is valid. A loop over this node's handles, with
+  // no allocation.
+  void HoldPositions() {
+    for (Device& device : devices) {
+      switch (device.kind) {
+        case Kind::kMotor:
+          Hold(device, state.motors, state.motor_count);
+          break;
+        case Kind::kCANcoder:
+        case Kind::kGyro:
+          Hold(device, state.sensors, state.sensor_count);
+          break;
+        case Kind::kEncoder:
+          Hold(device, state.encoders, state.encoder_count);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  template <class Sample, std::size_t N>
+  static void Hold(Device& device, const std::array<Sample, N>& samples,
+                   std::size_t count) {
+    const Sample sample =
+        FindSample(samples, count, device.id, device.sample_index);
+    if (sample.valid) device.held_position = sample.position_rot;
+  }
+
+  static bool AbsoluteFrame(const Device& device) {
+    return device.motor_config != nullptr &&
+           device.motor_config->absolute_position_frame.value;
+  }
+
+  static bool Valid(const hardware::State& in, Device& device) {
+    return device.kind == Kind::kMotor
+               ? FindSample(in.motors, in.motor_count, device.id,
+                            device.sample_index)
+                     .valid
+               : FindSample(in.sensors, in.sensor_count, device.id,
+                            device.sample_index)
+                     .valid;
   }
 
   void Flush() {
@@ -283,14 +390,16 @@ struct HardwareLink::Impl {
 
 HardwareLink::HardwareLink(Node& node) : impl_{std::make_unique<Impl>(node)} {
   Impl& impl = *impl_;
-  impl.config = config::ParseRobotConfig(node.config_path());
+  // A copy of the config the node already parsed, not a second parse: the
+  // commissioned bit below must not leak into the node's own view.
+  impl.config = detail::NodeAccess::robot_config(node);
   // The bridge treats the config as commissioned under --sim, and the
   // commissioned bit is part of the config id both ends compare.
   if (node.simulation()) impl.config.hardware.commissioned = true;
   impl.config_id = hardware::ConfigurationId(impl.config.hardware);
   impl.timeout =
       std::chrono::microseconds{impl.config.hardware.command_timeout_us};
-  detail::NodeAccess::add_subscription(
+  impl.state_subscription = detail::NodeAccess::add_subscription(
       node, hardware::kStateTopic, sizeof(Packet), alignof(Packet),
       schema::Of<Packet>(), /*optional=*/false,
       [&impl](const void* data) { impl.OnState(data); });
@@ -322,6 +431,28 @@ bool robot_enabled(Node& node) {
   return node.extension<HardwareLink>().enabled();
 }
 
+void RequireInUpdate(const Node& node, std::string_view what) {
+  detail::NodeAccess::require_loop_thread(node, what);
+  if (!detail::NodeAccess::in_update(node)) {
+    throw std::logic_error(std::string{node.name()} + ": " + std::string{what} +
+                           " called outside update(); make requests in "
+                           "update(), where they apply to this tick");
+  }
+}
+
+Duration RezeroAgeBound(const hardware::Config& config) {
+  constexpr double kStatusPeriods = 2;
+  return std::chrono::microseconds{
+      std::llround(kStatusPeriods * 1e6 / config.status_hz)};
+}
+
+Duration ReadinessAgeBound(const hardware::Config& config) {
+  // The RoboRIO's LATE threshold, rounded as it rounds it.
+  constexpr double kStatusPeriods = 4;
+  return std::chrono::microseconds{static_cast<std::int64_t>(
+      std::ceil(kStatusPeriods * 1e6 / config.status_hz))};
+}
+
 std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
                                        std::string_view name) {
   HardwareLink::Impl& impl = *link.impl_;
@@ -337,9 +468,10 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
   // Input-only nodes publish no request: the bridge reads one only from
   // subsystems that own actuators, and an unread topic is a graph error.
   if (IsOutput(kind) && !impl.has_outputs) {
-    impl.request = detail::NodeAccess::add_publisher(
-        impl.node, hardware::RequestTopic(impl.node.name()), sizeof(Packet),
-        alignof(Packet), schema::Of<Packet>());
+    // hardware::RequestTopic(name), through the one registration the node
+    // layer lets write it (RULES.md 2).
+    impl.request = detail::NodeAccess::add_hardware_request(
+        impl.node, sizeof(Packet), alignof(Packet), schema::Of<Packet>());
     impl.node.after_update([&impl] { impl.Flush(); });
     impl.has_outputs = true;
   }
@@ -347,7 +479,7 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
     impl.motor_ids.push_back(id);
     impl.motor_devices.push_back(impl.devices.size());
   }
-  impl.devices.push_back({.kind = kind, .id = id});
+  impl.devices.push_back({.kind = kind, .id = id, .name = std::string{name}});
   if (kind == Kind::kMotor) {
     for (const auto& motor : impl.config.hardware.motors) {
       if (motor.id == id) {
@@ -362,7 +494,8 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
 void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                hardware::Mode mode, double demand,
                                double ff_volts, int slot) {
-  HardwareLink::Impl::Device& device = link.impl_->At(index, Kind::kMotor);
+  HardwareLink::Impl::Device& device =
+      link.impl_->Output(index, Kind::kMotor, "Motor command");
   if (slot < 0 || slot > 2) {
     throw std::invalid_argument(std::string{link.impl_->node.name()} +
                                 ": motor slot " + std::to_string(slot) +
@@ -371,6 +504,16 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
   const auto& config = *device.motor_config;
   if (mode == hardware::Mode::kPosition ||
       mode == hardware::Mode::kMotionMagic) {
+    // A position needs a frame that no reset has restarted since it was
+    // taken: a rezero that still holds, or a remote CANcoder's absolute frame
+    // ([motors.*] position_frame = "absolute"). The rotor position a TalonFX
+    // powers on or resets with is no frame: neutral until the node rezeroes.
+    // Other modes need no frame.
+    if (!device.zeroed && !config.absolute_position_frame.value) {
+      device.motor = {.id = device.id};
+      device.set = true;
+      return;
+    }
     demand += device.position_offset;
   }
   const double requested_demand = demand;
@@ -425,19 +568,32 @@ std::uint64_t HardwareAccess::motor_clamped_count(const HardwareLink& link,
 
 void HardwareAccess::motor_rezero(HardwareLink& link, std::size_t index,
                                   double position_rot) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node, "Motor::rezero");
   auto& device = link.impl_->At(index, Kind::kMotor);
   const auto& impl = *link.impl_;
   const auto sample = FindSample(impl.state.motors, impl.state.motor_count,
                                  device.id, device.sample_index);
   const double offset = sample.position_rot - position_rot;
-  if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
+  // What a rezero pairs the position with (a switch, a stop, a constant, a
+  // CANcoder its caller checked) is as of the State, so the position must
+  // be too (RezeroAgeBound); an unknown age, or a disconnected sample, never
+  // is.
+  const std::optional<Duration> age = motor_age(link, index, false);
+  const bool recent = age && *age <= RezeroAgeBound(impl.config.hardware);
+  if (recent && std::isfinite(sample.position_rot) &&
       std::isfinite(position_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
+    device.zeroed = true;
   }
+}
+
+bool HardwareAccess::motor_zeroed(const HardwareLink& link, std::size_t index) {
+  return link.impl_->At(index, Kind::kMotor).zeroed;
 }
 
 void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
                                  double yaw_rot) {
+  detail::NodeAccess::require_loop_thread(link.impl_->node, "Gyro::rezero");
   auto& device = link.impl_->At(index, Kind::kGyro);
   const auto& impl = *link.impl_;
   const auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
@@ -446,7 +602,12 @@ void HardwareAccess::gyro_rezero(HardwareLink& link, std::size_t index,
   if (impl.Fresh() && sample.valid && std::isfinite(sample.position_rot) &&
       std::isfinite(yaw_rot) && std::isfinite(offset)) {
     device.position_offset = offset;
+    device.zeroed = true;
   }
+}
+
+bool HardwareAccess::gyro_zeroed(const HardwareLink& link, std::size_t index) {
+  return link.impl_->At(index, Kind::kGyro).zeroed;
 }
 
 hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
@@ -455,9 +616,18 @@ hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
   const auto& device = impl.At(index, Kind::kMotor);
   auto sample = FindSample(impl.state.motors, impl.state.motor_count, device.id,
                            device.sample_index);
+  if (!sample.valid) sample.position_rot = device.held_position;
   if (!impl.Fresh()) sample.valid = false;
   sample.position_rot -= device.position_offset;
   return sample;
+}
+
+bool HardwareAccess::motor_hard_limit(const HardwareLink& link,
+                                      std::size_t index, bool forward) {
+  const auto sample = motor_sample(link, index);
+  const std::uint32_t flag = forward ? hardware::kMotorForwardHardLimitFlag
+                                     : hardware::kMotorReverseHardLimitFlag;
+  return sample.valid && (sample.fault_flags & flag) != 0;
 }
 
 hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
@@ -466,9 +636,43 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
   const auto& device = impl.SensorAt(index);
   auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
                            device.id, device.sample_index);
+  if (!sample.valid) sample.position_rot = device.held_position;
   if (!impl.Fresh()) sample.valid = false;
   sample.position_rot -= device.position_offset;
   return sample;
+}
+
+namespace {
+template <class Sample>
+std::optional<Time> AcquisitionTime(const HardwareLink& link,
+                                    const Sample& sample, bool velocity) {
+  const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
+  if (!sample.valid || age == UINT32_MAX) return std::nullopt;
+  const auto time = link.sample_time();
+  if (!time) return std::nullopt;
+  return *time - std::chrono::microseconds{age};
+}
+}  // namespace
+
+std::optional<Time> HardwareAccess::motor_time(const HardwareLink& link,
+                                               std::size_t index,
+                                               bool velocity) {
+  return AcquisitionTime(link, motor_sample(link, index), velocity);
+}
+
+std::optional<Time> HardwareAccess::sensor_time(const HardwareLink& link,
+                                                std::size_t index,
+                                                bool velocity) {
+  return AcquisitionTime(link, sensor_sample(link, index), velocity);
+}
+
+std::optional<Duration> HardwareAccess::motor_age(const HardwareLink& link,
+                                                  std::size_t index,
+                                                  bool velocity) {
+  const auto sample = motor_sample(link, index);
+  const auto age = velocity ? sample.velocity_age_us : sample.position_age_us;
+  if (!sample.valid || age == UINT32_MAX) return std::nullopt;
+  return std::chrono::microseconds{age};
 }
 
 hardware::DigitalInputSample HardwareAccess::digital_input_sample(
@@ -499,21 +703,23 @@ hardware::EncoderSample HardwareAccess::encoder_sample(const HardwareLink& link,
   const auto& device = impl.At(index, Kind::kEncoder);
   auto sample = FindSample(impl.state.encoders, impl.state.encoder_count,
                            device.id, device.sample_index);
+  if (!sample.valid) sample.position_rot = device.held_position;
   if (!impl.Fresh()) sample.valid = false;
   return sample;
 }
 
 void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
                                         bool value) {
-  auto& device = link.impl_->At(index, Kind::kDigitalOutput);
+  auto& device =
+      link.impl_->Output(index, Kind::kDigitalOutput, "DigitalOutput::set");
   device.digital = value;
   device.set = true;
 }
 
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
-  auto& device = link.impl_->At(index, Kind::kPwm);
-  device.pwm = std::isfinite(output) ? output : 0.0;
+  auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::set");
+  device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
   device.set = true;
 }
 
@@ -557,6 +763,9 @@ std::uint64_t Motor::clamped_count() const {
 void Motor::rezero(double position_rot) {
   HardwareAccess::motor_rezero(*link_, index_, position_rot);
 }
+bool Motor::zeroed() const {
+  return HardwareAccess::motor_zeroed(*link_, index_);
+}
 double Motor::position() const {
   return HardwareAccess::motor_sample(*link_, index_).position_rot;
 }
@@ -569,8 +778,32 @@ double Motor::voltage() const {
 double Motor::current() const {
   return HardwareAccess::motor_sample(*link_, index_).stator_current_a;
 }
+double Motor::temperature_c() const {
+  return HardwareAccess::motor_sample(*link_, index_).temperature_c;
+}
+double Motor::supply_current_a() const {
+  return HardwareAccess::motor_sample(*link_, index_).supply_current_a;
+}
 bool Motor::connected() const {
   return HardwareAccess::motor_sample(*link_, index_).valid;
+}
+bool Motor::forward_limit() const {
+  return HardwareAccess::motor_hard_limit(*link_, index_, true);
+}
+bool Motor::reverse_limit() const {
+  return HardwareAccess::motor_hard_limit(*link_, index_, false);
+}
+std::optional<Time> Motor::position_time() const {
+  return HardwareAccess::motor_time(*link_, index_, false);
+}
+std::optional<Time> Motor::velocity_time() const {
+  return HardwareAccess::motor_time(*link_, index_, true);
+}
+std::optional<Duration> Motor::position_age() const {
+  return HardwareAccess::motor_age(*link_, index_, false);
+}
+std::optional<Duration> Motor::velocity_age() const {
+  return HardwareAccess::motor_age(*link_, index_, true);
 }
 
 CANcoder::CANcoder(Node& node, std::string_view name)
@@ -585,12 +818,21 @@ double CANcoder::velocity() const {
 bool CANcoder::connected() const {
   return HardwareAccess::sensor_sample(*link_, index_).valid;
 }
+std::optional<Time> CANcoder::position_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, false);
+}
+std::optional<Time> CANcoder::velocity_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, true);
+}
 
 Gyro::Gyro(Node& node, std::string_view name)
     : link_{LinkOf(node)},
       index_{HardwareAccess::add_device(*link_, Kind::kGyro, name)} {}
 void Gyro::rezero(double yaw_rot) {
   HardwareAccess::gyro_rezero(*link_, index_, yaw_rot);
+}
+bool Gyro::zeroed() const {
+  return HardwareAccess::gyro_zeroed(*link_, index_);
 }
 double Gyro::yaw() const {
   return HardwareAccess::sensor_sample(*link_, index_).position_rot;
@@ -600,6 +842,12 @@ double Gyro::yaw_rate() const {
 }
 bool Gyro::connected() const {
   return HardwareAccess::sensor_sample(*link_, index_).valid;
+}
+std::optional<Time> Gyro::yaw_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, false);
+}
+std::optional<Time> Gyro::yaw_rate_time() const {
+  return HardwareAccess::sensor_time(*link_, index_, true);
 }
 
 DigitalInput::DigitalInput(Node& node, std::string_view name)
@@ -660,21 +908,22 @@ namespace detail {
 class DriverStationLink {
  public:
   explicit DriverStationLink(Node& node) : node_{node} {
-    NodeAccess::add_subscription(node, hardware::kDriverStationTopic,
-                                 sizeof(Packet), alignof(Packet),
-                                 schema::Of<Packet>(), /*optional=*/false,
-                                 [this](const void* data) { OnPacket(data); });
+    subscription_ = NodeAccess::add_subscription(
+        node, hardware::kDriverStationTopic, sizeof(Packet), alignof(Packet),
+        schema::Of<Packet>(), /*optional=*/false,
+        [this](const void* data) { OnPacket(data); });
   }
 
-  // A listener runs as each packet arrives, so its node drains every tick.
+  // A listener runs as each packet arrives, so the packet's publications
+  // wake the node; without one the link is drained before the node's timers.
   void Listen(std::function<void()> on_packet) {
-    NodeAccess::require_immediate_delivery(node_);
+    NodeAccess::require_immediate_delivery(node_, subscription_);
     listeners_.push_back(std::move(on_packet));
   }
 
   bool Connected() const {
     return have_ && (data_.fms.flags & driver_station::kDsAttached) != 0 &&
-           node_.now() - received_ < NodeAccess::freshness_timeout(node_);
+           node_.now() - published_ < NodeAccess::freshness_timeout(node_);
   }
   const driver_station::DriverStationData& data() const { return data_; }
 
@@ -685,23 +934,47 @@ class DriverStationLink {
   std::uint64_t Generation() const {
     return Mode() != DsMode::kNone ? data_.mode_since_us : 0;
   }
+  std::uint64_t Recoveries() const { return recoveries_; }
 
  private:
+  // Sample and mode times run on the sampling gateway's boot clock, so they
+  // order packets only within one boot. A boot never seen is a reboot (its
+  // clock restarted low): take it and start the ordering over. A boot left
+  // recently is a packet delayed across that reboot: never go back to it.
   void OnPacket(const void* data) {
     Packet packet{};
     std::memcpy(&packet, data, sizeof packet);
     driver_station::DriverStationData next{};
     if (!driver_station::Decode(packet.bytes(), next)) return;
+    if (boots_.retired(next.boot_id)) return;
+    if (!boots_.current(next.boot_id)) {
+      boots_.Enter(next.boot_id);
+    } else if (next.sample_time_us > 0 && data_.sample_time_us > 0 &&
+               (next.sample_time_us < data_.sample_time_us ||
+                (next.mode_since_us != 0 &&
+                 next.mode_since_us < data_.mode_since_us))) {
+      return;
+    }
+    const Time published =
+        node_.now() - NodeAccess::subscription_age(node_, subscription_);
+    // The link was stale in between, whether or not anyone sampled it then.
+    if (have_ &&
+        published - published_ >= NodeAccess::freshness_timeout(node_)) {
+      ++recoveries_;
+    }
     data_ = next;
     have_ = true;
-    received_ = node_.now();
+    published_ = published;
     for (const auto& listener : listeners_) listener();
   }
 
   Node& node_;
   driver_station::DriverStationData data_{};
   bool have_ = false;
-  Time received_{};
+  hardware::BootHistory boots_;
+  Time published_{};
+  std::uint64_t recoveries_ = 0;
+  std::size_t subscription_ = 0;
   std::vector<std::function<void()>> listeners_;
 };
 
@@ -723,6 +996,9 @@ DsMode DriverStationAccess::mode(const DriverStation& ds) {
 }
 std::uint64_t DriverStationAccess::generation(const DriverStation& ds) {
   return ds.link_->Generation();
+}
+std::uint64_t DriverStationAccess::recoveries(const DriverStation& ds) {
+  return ds.link_->Recoveries();
 }
 
 }  // namespace detail

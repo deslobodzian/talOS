@@ -1,25 +1,83 @@
 namespace bridge;
 
+// The program running the gateway, as its State reports it
+// (hardware::GatewayProgram; the values match, and a new one comes with a
+// protocol version bump, since an older decoder rejects it).
+enum GatewayProgram : ubyte {
+  UNKNOWN,
+  ROBORIO,
+  ROBORIO_SIMULATION,
+  SIM_GATEWAY,
+}
+
 // The hardware bridge's health, published by hardware_node on /hw/status every
 // 20 ms. The counters are cumulative since the bridge started.
 //
-// state_age_us is the bridge's monotonic now minus the moment it received the
+// state_age_us is the bridge's monotonic now minus the moment it accepted the
 // last /hw/state frame from the RoboRIO (bridge clock on both sides), and 0
-// before the first frame. timed_out_mask has bit i set when the i-th
-// actuator-owning subsystem, in sorted name order, has timed out; only the
-// first 32 fit. subsystem_count is the number of those subsystems.
-// configured is whether the RoboRIO acknowledged this bridge's configuration.
+// before the first frame. states_received_count counts every decoded frame,
+// dropped ones included. timed_out_mask has bit i set while the i-th
+// actuator-owning subsystem, in sorted name order, is silent: the link is
+// ready (a State accepted and the current gateway boot has acknowledged
+// this configuration), the bridge has received a request from that
+// subsystem since it started (accepted or refused), and, for longer than its
+// owner timeout (ARCHITECTURE.md "The tick"), none of its requests has been
+// accepted since the latest of its last accepted request (its first
+// received request, until one is accepted), the link becoming ready (the
+// session's start, or a gateway reboot's acknowledgement) and that
+// subsystem's first controller transition (boot, configuration, epoch,
+// enable or fault edge) after either at which it was not already silent.
+// So a controller transition, a session's start (however late an owner's
+// first request) or a gateway reboot alone sets no bit, a subsystem whose
+// node never sends a request never gets one (the launcher reports a member
+// that does not start or stalls), and one whose every request is refused
+// gets it one owner timeout after its first. While the link is not ready
+// the mask is 0 and
+// alert_error_link_lost or alert_error_not_configured says why. Only the
+// first 32 fit. subsystem_count is the number of those subsystems. The
+// bridge's exit summary prints, per subsystem, its count of silent
+// episodes (timeouts=) and whether it was silent at the bridge's last pass
+// (timed_out=).
+// configured is whether the current gateway boot acknowledged this bridge's
+// configuration: a State from a new boot, or naming another configuration,
+// clears it until the next acknowledgement. An uncommissioned config is
+// acknowledged, so this can be true while the State's kConfigured flag, which
+// also requires commissioned, is false. Display only; actuation is gated on the
+// State's flags (robot_enabled).
 //
-// The clock_* fields map the gateway's State.sample_time_us into the node
-// clock (talOS/bridge/clock_offset.h): the node-clock time of a sample of
-// gateway boot clock_boot_id is sample_time_us + clock_offset_us, later than
-// the truth by the smallest transport latency in the window (an upper-bounded
-// latency estimate, not clock synchronisation). clock_offset_valid is whether
-// the window holds enough samples of that boot; clock_offset_spread_us is the
-// largest minus the smallest one-way delay in it; clock_window_count is how
-// many samples it holds. clock_resets_count counts restarts for a new gateway
-// boot and clock_ignored_count duplicate or reordered samples left out.
-// talos::HardwareLink::sample_time() applies the mapping.
+// commissioned is the configuration this bridge pushes: the config's
+// `commissioned`, which --sim forces true.
+//
+// The alert_<level>_<name> fields are alerts (talOS/NAMING.md "Topics"):
+// each is true while its condition holds in the status published, and false
+// as soon as it no longer does; nothing latches. Each is derived from what
+// the bridge already tracks:
+// - alert_error_link_lost: no State accepted yet, or state_age_us above
+//   [robot] command_timeout_us. Clears on the next accepted State.
+// - alert_error_not_configured: configured is false. Clears on the current
+//   boot's acknowledgement.
+// - alert_error_uncommissioned: commissioned is false. Never in simulation.
+// - alert_error_motor_fault: motor_fault_mask is nonzero.
+// - alert_warning_owner_timed_out: timed_out_mask is nonzero, so it raises
+//   neither at a controller transition, which times every owner out in the
+//   merge until its next request, nor at the session's start, nor for an
+//   owner the bridge has never received a request from. Clears on the
+//   silent subsystem's next accepted request, or when the link stops being
+//   ready.
+// - alert_warning_brownout: health_valid and brownout.
+// motor_fault and brownout describe the last accepted State, as the fields
+// they read do: while link_lost holds they are that State's.
+//
+// clock_offset_us maps gateway sample time to node time. Valid only after
+// eight ordered States and a causal two-way probe exchange of this boot.
+// clock_offset_uncertainty_us bounds absolute mapping error assuming
+// nonnegative transport delay and <=1000 ppm relative oscillator drift.
+// clock_min_round_trip_us includes gateway residence and bridge scheduling.
+// Exchanges expire after one second; spread remains a one-way variability
+// diagnostic, never an accuracy bound. No fusion accuracy threshold is
+// specified, so uncertainty is reported rather than arbitrarily gated.
+// Resets count new boots; ignored counts reordered/retired States dropped whole.
+// HardwareLink::sample_time() applies this mapping.
 struct BridgeStatus {
   states_received_count:uint64;
   commands_sent_count:uint64;
@@ -30,6 +88,15 @@ struct BridgeStatus {
   timed_out_mask:uint32;
   subsystem_count:uint32;
   configured:bool;
+  // These seven fill the padding after configured: the struct stays 192 B
+  // and every later field keeps its offset.
+  commissioned:bool;
+  alert_error_link_lost:bool;
+  alert_error_not_configured:bool;
+  alert_error_uncommissioned:bool;
+  alert_error_motor_fault:bool;
+  alert_warning_owner_timed_out:bool;
+  alert_warning_brownout:bool;
   clock_boot_id:uint64;
   clock_offset_us:int64;
   clock_offset_spread_us:uint64;
@@ -41,9 +108,30 @@ struct BridgeStatus {
   battery_v:double;
   brownout:bool;
   can_utilization_frac:double;
+  // Bit i (configured motor order): invalid feedback or controller fault flags
+  // other than an asserted soft or hard limit or an active current limit
+  // (hardware::MotorFaulted).
   motor_fault_mask:uint32;
+  // Bit i (configured motor order): a valid sample reports the TalonFX's
+  // forward (reverse) hardware limit switch asserted
+  // (hardware::kMotorForwardHardLimitFlag, kMotorReverseHardLimitFlag), so it
+  // holds output that way neutral. Normal at the end of travel; a bit that
+  // stays set away from it is a normally closed switch with a cut wire.
+  motor_forward_limit_mask:uint32;
+  motor_reverse_limit_mask:uint32;
   gateway_rejected_command_count:uint32;
   gateway_neutralized_motor_count:uint32;
   gateway_apply_failure_count:uint32;
   gateway_device_reset_count:uint32;
+  // The gateway build of the last accepted State (hardware::GatewayBuild),
+  // UNKNOWN and 0 before the first: the program, whether it was built with
+  // uncommitted changes, and the first 16 hex digits of its git commit read
+  // as one number (0 when unknown; print it with %016llx).
+  gateway_program:GatewayProgram;
+  gateway_build_dirty:bool;
+  gateway_build_id:uint64;
+  // Causal two-way bound, including residence time, quantization and 1000 ppm
+  // relative oscillator drift. Local logs only (excluded from robot radio).
+  clock_offset_uncertainty_us:uint64;
+  clock_min_round_trip_us:uint64;
 }

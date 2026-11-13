@@ -18,7 +18,8 @@ import {rateKey, type DeclaredGraph, type SystemGraph, type SystemNode} from '..
 // A problem worth the top of the list and a visible mark, in the order a
 // person cares about them.
 export type ProcessProblem =
-    'dead'|'restarted'|'recorder_failed'|'nonzero_exit'|'never_registered';
+    'dead'|'restarted'|'recorder_failed'|'nonzero_exit'|'killed_by_signal'|
+    'endpoint_mismatch'|'never_registered';
 
 export type ProcessRow = {
   name: string;
@@ -28,7 +29,8 @@ export type ProcessRow = {
   pid: string|null;
   // Null is "the registry has nothing to say", not "not alive": a node that
   // never claimed a slot is absent from the registry, and answering "dead"
-  // for it would be inventing one.
+  // for it would be inventing one. A stale registry graph says nothing
+  // current either, so it is null then too.
   alive: boolean|null;
   // Whether a manifest node named this process (so the recorder/exit columns
   // can tell "no" from "the manifest did not say").
@@ -37,6 +39,13 @@ export type ProcessRow = {
   // The manifest's exit_code when it is non-negative (the process exited),
   // else null. A null never reads as zero: "exited cleanly" is exit 0.
   exitCode: number|null;
+  // The signal that ended the last run, as the launcher reports it
+  // ("signal 9 SIGKILL"), else null.
+  exitSignal: string|null;
+  // Why the launcher ended the last run ('stalled', 'stop', ...; launcher
+  // README "Session manifest"), when it ended and was not a plain exit.
+  // Null for a manifest from before runs were recorded.
+  endReason: string|null;
   recorderFailed: boolean;
   records: string|null;
   loopRate: number|null;
@@ -44,6 +53,23 @@ export type ProcessRow = {
   logPath: string|null;
   problems: ProcessProblem[];
 };
+
+// Signal numbers that Linux and macOS share; any other is shown by number
+// only, since the viewer cannot tell which host's numbering the launcher used.
+const SIGNAL_NAMES: Record<number, string> = {
+  1: 'SIGHUP', 2: 'SIGINT', 3: 'SIGQUIT', 4: 'SIGILL', 5: 'SIGTRAP',
+  6: 'SIGABRT', 8: 'SIGFPE', 9: 'SIGKILL', 11: 'SIGSEGV', 13: 'SIGPIPE',
+  14: 'SIGALRM', 15: 'SIGTERM'
+};
+
+// The signal the launcher sends to stop a session's members.
+const SIGINT = 2;
+
+// The launcher's own spelling (SignalText in talOS/launcher/spawn.h).
+export function signalText(signal: number): string {
+  const name = SIGNAL_NAMES[signal];
+  return name ? `signal ${signal} ${name}` : `signal ${signal}`;
+}
 
 export type ProcessSummary = {
   running: number;
@@ -75,10 +101,12 @@ export function worstLatency(node: SystemNode): number|null {
   return latencies.length ? Math.max(...latencies) : null;
 }
 
+// `graphStale`: the registry graph is last-known (data/freshness.ts), so it
+// says who held a slot but not who is alive now.
 export function mergeProcesses(
     manifest: SessionManifest|null, graph: SystemGraph|null,
     declared: DeclaredGraph|null,
-    rates: Record<string, number>): ProcessRow[] {
+    rates: Record<string, number>, graphStale: boolean): ProcessRow[] {
   interface Parts {
     manifest?: ManifestNode;
     registry?: SystemNode;
@@ -105,10 +133,21 @@ export function mergeProcesses(
   const rows: ProcessRow[] = [];
   for (const [name, {manifest: m, registry: r, declared: d}] of byName) {
     const problems: ProcessProblem[] = [];
-    if (r && !r.alive) problems.push('dead');
+    if (r && !graphStale && !r.alive) problems.push('dead');
     if (m && m.restart_count > 0) problems.push('restarted');
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
+    const lastRun = m?.runs?.at(-1);
+    // The launcher's own stop signal ending a member before it handled stops
+    // is a clean stop (launcher README "Session manifest"): the run's
+    // stopped_by_session says so, or, in a manifest written before the
+    // launcher recorded it, reason stop with SIGINT.
+    const stoppedBySession = lastRun?.stopped_by_session ??
+        (lastRun?.reason === 'stop' && m?.exit_signal === SIGINT);
+    if (m && m.exit_signal > 0 && !stoppedBySession) {
+      problems.push('killed_by_signal');
+    }
+    if (m && m.endpoint_mismatch) problems.push('endpoint_mismatch');
     // Declared but never registered is only a claim when there is a registry
     // to compare against; with no live graph it cannot be made (the same rule
     // `declaredStatus` follows).
@@ -118,10 +157,13 @@ export function mergeProcesses(
       name,
       target: m?.target ?? r?.target ?? d?.target ?? '',
       pid: r ? r.pid : (m ? String(m.pid) : null),
-      alive: r ? r.alive : null,
+      alive: r && !graphStale ? r.alive : null,
       hasManifest: m !== undefined,
       restarts: m?.restart_count ?? 0,
       exitCode: m && m.exit_code >= 0 ? m.exit_code : null,
+      exitSignal: m && m.exit_signal > 0 && !stoppedBySession ? signalText(m.exit_signal) : null,
+      endReason: lastRun && lastRun.reason !== 'running' &&
+              lastRun.reason !== 'exit' ? lastRun.reason : null,
       recorderFailed: m?.recorder_failed ?? false,
       records: m ? m.record_count : null,
       loopRate: r ? loopRate(r, rates) : null,

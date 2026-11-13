@@ -21,10 +21,22 @@
 // slot; the volts then drive the rotor, whose position/velocity are written
 // back as mechanism units (rotor / gear ratio), per CTRE sim guidance that
 // sim state is fed from the device's voltage output, not from the demand.
+// Rotor state is physical (counterclockwise positive, the sim's mounting). A
+// TalonFX's `inverted` flips its output and its own position and velocity
+// together, as Phoenix 6's MotorOutput.Inverted does, so its closed loops run
+// in the configured positive direction; CANcoders and the chassis see the
+// physical rotor. A follower ignores its own `inverted`, as under Phoenix 6's
+// Follower request: it drives in its master's configured direction, reversed
+// by `oppose_master`, and reports in its master's frame, as PhoenixBackend
+// reports it. A motor whose feedback is a remote CANcoder reports, and closes
+// its loops on, that CANcoder's reading in the CANcoder's own direction, so a
+// motor/CANcoder direction mismatch runs away here as on a robot.
 //
 // Sensors cross the hardware boundary. CANcoder samples mirror the linked
-// mechanism. Swerve ground motion determines the true field pose; the Pigeon
-// reports true yaw plus optional drift, unless explicitly overridden.
+// mechanism, the position wrapped to [-0.5, 0.5) rotations as the RoboRIO
+// reports it (CANcoderAbsoluteRot). Swerve ground motion determines the true
+// field pose; the Pigeon reports true yaw plus optional drift, unless
+// explicitly overridden.
 //
 // Stopping is consistent. Commanded neutral (Mode::kNeutral, and
 // Neutral() on disable/timeout/failure) removes drive and lets the rotor
@@ -32,9 +44,13 @@
 // zero-velocity demand is instead an active standstill hold (when gains are
 // tuned); with zero gains it honestly cannot hold and coasts.
 //
-// Controlled inputs/faults. Beam breaks and limit-switch inputs via
-// SetDigitalInput, soft limits from MotorConfig enforced in physics, frozen
-// feedback, per-device disconnect, supply-voltage change, controller restart.
+// Controlled inputs/faults. Beam breaks and RoboRIO limit-switch inputs via
+// SetDigitalInput, a home switch a motor's position closes via
+// SetHomeSwitches, switches on a TalonFX's own limit inputs via
+// Set{Forward,Reverse}LimitPressed (enforced per MotorConfig's
+// forward_limit_switch and reverse_limit_switch), soft limits from
+// MotorConfig enforced in physics, frozen feedback, per-device disconnect,
+// supply-voltage change, controller restart.
 //
 // Explicit sim clock, deterministic stepping. Read() derives dt from
 // state.sample_time_us deltas, so Gateway ticks with explicit timestamps are
@@ -47,32 +63,30 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include "feedback.h"
 #include "gateway.h"
 
 namespace talos::hardware::sim {
-
-// One reusable motor/mechanism model.
-enum class MotorType : uint8_t {
-  kKrakenX60 = 0,
-  kKrakenX44,
-  kFalcon500,
-  kGeneric
-};
 
 // Load reflected onto the rotor shaft. Roller/flywheel first; arm/elevator
 // gravity loads are future work.
 enum class LoadKind : uint8_t { kRoller = 0, kFlywheel };
 
+// One reusable motor/mechanism model.
 struct MotorModel {
-  MotorType type{MotorType::kKrakenX60};
   // Rotor free speed at 12 V. Kraken X60 default; matches the PhoenixBackend
   // desktop model so both sims agree on unloaded speed.
   double free_speed_rps_at_12v{100.0};
+  // Stall current at 12 V, which sets the winding resistance,
+  // R = 12 V / stall current.
+  double stall_current_a_at_12v{366.0};
   // First-order lag at nominal_inertia_kg_m2.
   double time_constant_s{0.02};
   double nominal_inertia_kg_m2{0.002};
@@ -82,6 +96,30 @@ struct MotorModel {
   // below this. Kept at 0 by default so small signals stay observable.
   double static_friction_v{0.0};
 };
+
+// The published 12 V free speed and stall current of each motor type
+// (manufacturer data, as tabulated by ReCalc, reca.lc): Kraken X60 6000 rpm
+// and 366 A, Kraken X44 7530 rpm and 275 A, Falcon 500 6380 rpm and 257 A.
+// Free current (1.5-2 A) is neglected: back-EMF at free speed is taken as
+// the full 12 V.
+inline MotorModel MotorModelFor(MotorType type) {
+  MotorModel model;
+  switch (type) {
+    case MotorType::kKrakenX60:
+      model.free_speed_rps_at_12v = 6000.0 / 60.0;
+      model.stall_current_a_at_12v = 366.0;
+      break;
+    case MotorType::kKrakenX44:
+      model.free_speed_rps_at_12v = 7530.0 / 60.0;
+      model.stall_current_a_at_12v = 275.0;
+      break;
+    case MotorType::kFalcon500:
+      model.free_speed_rps_at_12v = 6380.0 / 60.0;
+      model.stall_current_a_at_12v = 257.0;
+      break;
+  }
+  return model;
+}
 
 struct MechanismModel {
   // Rotor revolutions per mechanism revolution, normally
@@ -226,6 +264,24 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
   return false;
 }
 
+// A home switch the mechanism closes: the RoboRIO digital input named
+// `input` is closed while the motor named `motor` is at `closed_at_rot` or
+// beyond it, below it (`closed_above` false) or above it (true). The
+// position is the one the motor reports, in mechanism rotations of its own
+// hardware frame (before any node's rezero), taken from the physical axis
+// whether or not the motor's feedback is valid. The boundary is exact and
+// has no hysteresis. A closed switch reads `closed_reads` (false: normally
+// open to ground behind the RoboRIO's pull-up, as PositionMechanism's
+// limit_switch_closed_reads defaults), an open one the opposite. The switch
+// only reports: it stops nothing.
+struct HomeSwitch {
+  std::string input;
+  std::string motor;
+  double closed_at_rot{};
+  bool closed_above{false};
+  bool closed_reads{false};
+};
+
 // Physics-backed Backend. See the header comment for the item-by-item map.
 class PhysicsSimBackend final : public Backend {
  public:
@@ -233,8 +289,38 @@ class PhysicsSimBackend final : public Backend {
 
   const WorldState& truth() const { return truth_; }
 
+  // The motor types of the robot config sim_gateway parsed itself. A config
+  // the bridge pushes carries none (MotorConfig::motor_type is off the wire),
+  // so every later Configure gives each motor the type of the local motor
+  // with the same name (names are unique in a valid config); a motor the
+  // local config does not name keeps the type it was configured with, a
+  // Kraken X60 off the wire.
+  void SetLocalMotorTypes(const Config& local) {
+    local_motor_types_.clear();
+    for (const auto& m : local.motors) {
+      local_motor_types_[m.name] = m.motor_type.value;
+    }
+  }
+
+  // The home switches (HomeSwitch), replacing any set before. They survive
+  // every later Configure, a config the bridge pushes included, matched by
+  // the input's and the motor's names; a switch whose input or motor the
+  // config does not name is inactive, and that input reads as
+  // SetDigitalInput left it. A bound input ignores SetDigitalInput.
+  void SetHomeSwitches(std::vector<HomeSwitch> switches) {
+    home_switches_ = std::move(switches);
+    BindHomeSwitches();
+  }
+
   bool Configure(const Config& config) override {
     config_ = config;
+    for (auto& m : config_.motors) {
+      if (const auto it = local_motor_types_.find(m.name);
+          it != local_motor_types_.end()) {
+        m.motor_type.value = it->second;
+      }
+    }
+    BindHomeSwitches();
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
     gyro_override_ = false;
@@ -244,9 +330,12 @@ class PhysicsSimBackend final : public Backend {
     powered_.fill(false);
     frozen_.fill(false);
     held_.fill(MotorSample{});
+    held_at_us_.fill(0);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
     motor_to_sensor_.fill(-1);
+    forward_pressed_.fill(false);
+    reverse_pressed_.fill(false);
     previous_time_.reset();
     digital_inputs_.clear();
     digital_outputs_.clear();
@@ -254,6 +343,7 @@ class PhysicsSimBackend final : public Backend {
     encoders_.clear();
     pwm_outputs_.clear();
     pending_resets_.clear();
+    restoring_.fill(false);
     supply_v_ = 12.0;
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
@@ -301,24 +391,47 @@ class PhysicsSimBackend final : public Backend {
         out.velocity_rps = 0;
         out.voltage = 0;
         out.stator_current_a = 0;
+        out.temperature_c = 0;
+        out.supply_current_a = 0;
+        out.fault_flags = 0;
+        continue;
+      }
+      if (restoring_[i]) {
+        MarkInvalid(out);
+        out.temperature_c = 25.0;
+        out.fault_flags = 0;
         continue;
       }
       healthy = true;
       if (frozen_[i]) {
+        // Stale, as a Phoenix signal that stops updating: its age grows.
         out = held_[i];
+        const uint64_t age_us =
+            std::min<uint64_t>(state.sample_time_us - held_at_us_[i],
+                               std::numeric_limits<uint32_t>::max() - 1);
+        out.position_age_us = static_cast<uint32_t>(age_us);
+        out.velocity_age_us = static_cast<uint32_t>(age_us);
         continue;
       }
       const double gear = Gear(i);
-      const double mech_pos = axes_[i].rotor_position_rot / gear;
-      const double mech_vel = axes_[i].rotor_velocity_rps / gear;
+      const double mech_pos =
+          axes_[i].rotor_position_rot * FeedbackDirection(i) / gear;
+      const double mech_vel =
+          axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
       out.valid = true;
       out.position_rot = mech_pos;
       out.velocity_rps = mech_vel;
       out.voltage = powered_[i] ? applied_volts_[i] : 0.0;
-      // Placeholder current proportional to effort; not a winding model.
-      out.stator_current_a = std::abs(out.voltage) / 12.0 * m.stator_limit_a;
+      // Placeholder supply current proportional to effort and constant
+      // ambient temperature; not electrical or thermal models.
+      out.supply_current_a = std::abs(out.voltage) / 12.0 * m.supply_limit_a;
+      out.temperature_c = 25.0;
+      out.fault_flags = HardLimitFlags(i);
       EnforceSoftLimits(m, out, i);
+      // After the limit stops the rotor: a motor held at it is stalled.
+      out.stator_current_a = StatorCurrent(i, m);
       held_[i] = out;
+      held_at_us_[i] = state.sample_time_us;
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
       const auto& s = config_.sensors[i];
@@ -358,6 +471,7 @@ class PhysicsSimBackend final : public Backend {
           out.position_rot = -out.position_rot;
           out.velocity_rps = -out.velocity_rps;
         }
+        out.position_rot = CANcoderAbsoluteRot(out.position_rot);
       }
     }
     for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
@@ -365,6 +479,15 @@ class PhysicsSimBackend final : public Backend {
       const auto it = digital_inputs_.find(id);
       state.digital_inputs[i] = {
           id, true, it != digital_inputs_.end() ? it->second : false};
+    }
+    // After the motors, so a soft limit has already stopped each axis.
+    for (const BoundHomeSwitch& s : bound_home_switches_) {
+      const double position_rot = axes_[s.motor].rotor_position_rot *
+                                  FeedbackDirection(s.motor) / Gear(s.motor);
+      const bool closed = s.closed_above ? position_rot >= s.closed_at_rot
+                                         : position_rot <= s.closed_at_rot;
+      state.digital_inputs[s.input].value =
+          closed ? s.closed_reads : !s.closed_reads;
     }
     for (std::size_t i = 0; i < config_.digital_outputs.size(); ++i) {
       const auto id = config_.digital_outputs[i].id;
@@ -398,6 +521,7 @@ class PhysicsSimBackend final : public Backend {
     std::copy(commands.begin(), commands.end(), commands_.begin());
     return true;
   }
+  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
 
   bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
                     std::span<const PwmRequest> pwm_outputs) override {
@@ -426,40 +550,64 @@ class PhysicsSimBackend final : public Backend {
 
   // Controlled inputs/faults.
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
+  // The mechanism pressing the switch on a motor's forward or reverse TalonFX
+  // limit input. It models a correctly wired switch: an enabled one of either
+  // type is asserted while pressed, and the motor's output toward it goes
+  // neutral as on the TalonFX. A follower takes its master's output; its own
+  // switches are not modelled. While such a switch is asserted the motor
+  // reports its ForwardHardLimit or ReverseHardLimit fault bit
+  // (kMotorForwardHardLimitFlag, kMotorReverseHardLimitFlag), as PhoenixBackend
+  // reports the TalonFX's FaultField.
+  void SetForwardLimitPressed(uint16_t motor_id, bool pressed) {
+    if (const int i = MotorIndex(motor_id); i >= 0)
+      forward_pressed_[i] = pressed;
+  }
+  void SetReverseLimitPressed(uint16_t motor_id, bool pressed) {
+    if (const int i = MotorIndex(motor_id); i >= 0)
+      reverse_pressed_[i] = pressed;
+  }
   void SetAnalogInput(uint16_t id, double voltage) {
     analog_inputs_[id] = voltage;
   }
   void SetEncoder(uint16_t id, double position_rot, double velocity_rps) {
     encoders_[id] = {position_rot, velocity_rps};
   }
-  // Fault injection for reset handling. The next gateway Tick
-  // reports these logical IDs as reset; BeginRestoreAfterReset re-applies the
-  // motor-to-sensor mapping while preserving physical rotor positions. Only
-  // velocities and outputs reset; the gateway drops obsolete demand separately
-  // via Neutral/epoch bump.
+  // Restore only reset motors, preserving positions and unrelated motion.
+  // The gateway neutralizes dependent motors before starting restoration.
+  // The restored chain reads invalid until a PollRestore that succeeds
+  // (RestoredWith), as on the robot.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
     pending_resets_.clear();
     return !reset_ids.empty();
   }
-  void BeginRestoreAfterReset() override {
-    for (auto& axis : axes_) axis.rotor_velocity_rps = 0.0;
-    profiles_.fill(Profile{});
-    commands_.fill(MotorRequest{});
-    applied_volts_.fill(0.0);
-    powered_.fill(false);
-    frozen_.fill(false);
-    motor_connected_.fill(true);
-    sensor_connected_.fill(true);
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-      held_[i] = MotorSample{};
-      held_[i].id = config_.motors[i].id;
-      held_[i].valid = true;
+      if (RestoredWith(config_.motors, i, ids)) restoring_[i] = true;
+    }
+    for (auto id : ids) {
+      const int i = MotorIndex(id);
+      if (i >= 0) {
+        axes_[i].rotor_velocity_rps = 0.0;
+        profiles_[i] = Profile{};
+        commands_[i] = MotorRequest{};
+        applied_volts_[i] = 0.0;
+        powered_[i] = false;
+        frozen_[i] = false;
+        motor_connected_[i] = true;
+        held_[i] = MotorSample{};
+        held_[i].id = id;
+        held_[i].valid = true;
+      }
+      for (std::size_t j = 0; j < config_.sensors.size(); ++j)
+        if (config_.sensors[j].id == id) sensor_connected_[j] = true;
     }
   }
   RestoreStatus PollRestore() override {
-    return restore_fails_ ? RestoreStatus::kFailed : RestoreStatus::kDone;
+    if (restore_fails_) return RestoreStatus::kFailed;
+    restoring_.fill(false);
+    return RestoreStatus::kDone;
   }
   void SetRestoreFails(bool fails) { restore_fails_ = fails; }
   void FreezeFeedback(uint16_t motor_id) {
@@ -497,6 +645,7 @@ class PhysicsSimBackend final : public Backend {
     applied_volts_.fill(0.0);
     powered_.fill(false);
     frozen_.fill(false);
+    restoring_.fill(false);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
     yaw_rot_ = 0.0;
@@ -632,6 +781,39 @@ class PhysicsSimBackend final : public Backend {
     double velocity_rps{};
   };
 
+  // Phoenix 6 output direction of motor i in the physical rotor frame. A
+  // follower's own Inverted does not apply: the Follower request takes the
+  // master's configured direction, reversed when opposed.
+  double OutputDirection(std::size_t i) const {
+    double sign = 1.0;
+    for (std::size_t hop = 0; hop <= config_.motors.size(); ++hop) {
+      const auto& m = config_.motors[i];
+      const int master = m.master_id != 0 ? MotorIndex(m.master_id) : -1;
+      if (master < 0) return m.inverted ? -sign : sign;
+      if (m.oppose_master) sign = -sign;
+      i = static_cast<std::size_t>(master);
+    }
+    return sign;  // A follower cycle is never powered.
+  }
+
+  // The frame motor i's voltage and rotor feedback are reported in, in the
+  // physical rotor frame: its configured direction, or for a follower its
+  // master's, matching PhoenixBackend, which undoes the opposition Phoenix
+  // applies to an opposed follower's signals.
+  double Direction(std::size_t i) const {
+    const auto& m = config_.motors[i];
+    return m.master_id != 0 && m.oppose_master ? -OutputDirection(i)
+                                               : OutputDirection(i);
+  }
+
+  // The direction of motor i's position and velocity feedback in the physical
+  // rotor frame: a remote CANcoder's own direction, else Direction(i).
+  double FeedbackDirection(std::size_t i) const {
+    const int sensor = motor_to_sensor_[i];
+    if (sensor < 0) return Direction(i);
+    return config_.sensors[sensor].inverted ? -1.0 : 1.0;
+  }
+
   double Gear(std::size_t i) const {
     const double gear = config_.motors[i].rotor_to_sensor_ratio *
                         config_.motors[i].sensor_to_mechanism_ratio;
@@ -645,6 +827,26 @@ class PhysicsSimBackend final : public Backend {
     return -1;
   }
 
+  // Resolves home_switches_ by name against config_.
+  void BindHomeSwitches() {
+    bound_home_switches_.clear();
+    bound_home_switches_.reserve(home_switches_.size());
+    for (const HomeSwitch& s : home_switches_) {
+      std::optional<std::size_t> input;
+      std::optional<std::size_t> motor;
+      for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
+        if (config_.digital_inputs[i].name == s.input) input = i;
+      }
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (config_.motors[i].name == s.motor) motor = i;
+      }
+      if (input && motor) {
+        bound_home_switches_.push_back(
+            {*input, *motor, s.closed_at_rot, s.closed_above, s.closed_reads});
+      }
+    }
+  }
+
   void EnforceSoftLimits(const MotorConfig& m, MotorSample& out,
                          std::size_t i) {
     if (!m.soft_limits) return;
@@ -653,7 +855,7 @@ class PhysicsSimBackend final : public Backend {
     const double gear = Gear(i);
     if (out.position_rot < lo || out.position_rot > hi) {
       const double clamped = std::clamp(out.position_rot, lo, hi);
-      axes_[i].rotor_position_rot = clamped * gear;
+      axes_[i].rotor_position_rot = clamped * FeedbackDirection(i) * gear;
       out.position_rot = clamped;
       if ((out.position_rot <= lo && out.velocity_rps < 0) ||
           (out.position_rot >= hi && out.velocity_rps > 0)) {
@@ -661,6 +863,47 @@ class PhysicsSimBackend final : public Backend {
         out.velocity_rps = 0.0;
       }
     }
+  }
+
+  // Output toward an asserted, enabled limit switch is held neutral; volts
+  // are in the motor's configured positive (forward) direction.
+  bool LimitSwitchBlocks(std::size_t i, double volts) const {
+    const auto& m = config_.motors[i];
+    return (volts > 0.0 && forward_pressed_[i] &&
+            m.forward_limit_switch != LimitSwitch::kDisabled) ||
+           (volts < 0.0 && reverse_pressed_[i] &&
+            m.reverse_limit_switch != LimitSwitch::kDisabled);
+  }
+
+  // The FaultField bits of motor i's asserted, enabled limit switches; a
+  // follower's own switches are not modelled.
+  uint32_t HardLimitFlags(std::size_t i) const {
+    const auto& m = config_.motors[i];
+    if (m.master_id != 0) return 0;
+    uint32_t flags = 0;
+    if (forward_pressed_[i] && m.forward_limit_switch != LimitSwitch::kDisabled)
+      flags |= kMotorForwardHardLimitFlag;
+    if (reverse_pressed_[i] && m.reverse_limit_switch != LimitSwitch::kDisabled)
+      flags |= kMotorReverseHardLimitFlag;
+    return flags;
+  }
+
+  // Stator current from the winding model: the applied volts less the
+  // back-EMF of the rotor's speed (12 V at the motor type's 12 V free speed),
+  // over the winding resistance (12 V over its stall current), clamped to
+  // stator_limit_a as the TalonFX's limiter reports it. It peaks at stall and
+  // falls toward 0 at free speed, so a mechanism pushed against a stop reads
+  // loaded (a 1 V push on a Kraken X60 draws about 30 A) and one spinning
+  // freely does not. 0 while unpowered (no braking current is modelled).
+  // The limit is not fed back into the rotor dynamics.
+  double StatorCurrent(std::size_t i, const MotorConfig& m) const {
+    if (!powered_[i]) return 0.0;
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double back_emf_v =
+        12.0 * axes_[i].rotor_velocity_rps / motor.free_speed_rps_at_12v;
+    const double net_v = Direction(i) * applied_volts_[i] - back_emf_v;
+    const double resistance_ohm = 12.0 / motor.stall_current_a_at_12v;
+    return std::min(m.stator_limit_a, std::abs(net_v) / resistance_ohm);
   }
 
   bool FeedbackValid(std::size_t i) const {
@@ -686,8 +929,10 @@ class PhysicsSimBackend final : public Backend {
       mech.load = LoadKind::kRoller;
       double volts = 0.0;
       const double gear = mech.gear_ratio;
-      const double mech_pos = axes_[i].rotor_position_rot / gear;
-      const double mech_vel = axes_[i].rotor_velocity_rps / gear;
+      const double mech_pos =
+          axes_[i].rotor_position_rot * FeedbackDirection(i) / gear;
+      const double mech_vel =
+          axes_[i].rotor_velocity_rps * FeedbackDirection(i) / gear;
       auto& profile = profiles_[i];
       const auto& req = commands_[i];
       bool want_power;
@@ -712,6 +957,7 @@ class PhysicsSimBackend final : public Backend {
         want_power = FeedbackValid(i) &&
                      DriveVoltage(req, m, mech_pos, mech_vel, supply_v_, volts);
       }
+      want_power = want_power && !LimitSwitchBlocks(i, volts);
       applied_volts_[i] = want_power ? volts : 0.0;
       powered_[i] = want_power;
     }
@@ -726,7 +972,8 @@ class PhysicsSimBackend final : public Backend {
         if (master < 0 || !resolved[master]) continue;
         resolved[i] = true;
         progress = true;
-        powered_[i] = FeedbackValid(i) && powered_[master];
+        powered_[i] = commands_[i].mode != Mode::kNeutral && FeedbackValid(i) &&
+                      powered_[master];
         applied_volts_[i] = powered_[i] ? applied_volts_[master] *
                                               (m.oppose_master ? -1.0 : 1.0)
                                         : 0.0;
@@ -735,12 +982,14 @@ class PhysicsSimBackend final : public Backend {
     }
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
       const auto& m = config_.motors[i];
-      MotorModel motor;
+      const MotorModel motor = MotorModelFor(m.motor_type.value);
       MechanismModel mech;
       mech.gear_ratio = Gear(i);
       mech.brake = m.brake;
       const double volts = applied_volts_[i];
-      const double rotor_volts = m.inverted ? -volts : volts;
+      // A follower's applied volts are its master's, reversed if opposed, so
+      // this is OutputDirection(i) times the master's volts.
+      const double rotor_volts = Direction(i) * volts;
       axes_[i] = StepAxis(motor, mech, axes_[i], rotor_volts, powered_[i],
                           supply_v_, dt_s);
     }
@@ -839,7 +1088,10 @@ class PhysicsSimBackend final : public Backend {
   std::array<bool, kMaxMotors> powered_{};
   std::array<bool, kMaxMotors> frozen_{};
   std::array<MotorSample, kMaxMotors> held_{};
+  std::array<uint64_t, kMaxMotors> held_at_us_{};
   std::array<bool, kMaxMotors> motor_connected_{};
+  std::array<bool, kMaxMotors> forward_pressed_{};
+  std::array<bool, kMaxMotors> reverse_pressed_{};
   std::array<bool, kMaxSensors> sensor_connected_{};
   // Filled with -1 by Configure; valid only after Configure.
   std::array<int, kMaxMotors> motor_to_sensor_;
@@ -848,11 +1100,24 @@ class PhysicsSimBackend final : public Backend {
   std::unordered_map<uint16_t, double> analog_inputs_{};
   std::unordered_map<uint16_t, ManualEncoder> encoders_{};
   std::unordered_map<uint16_t, double> pwm_outputs_{};
+  // By motor name; SetLocalMotorTypes.
+  std::unordered_map<std::string, MotorType> local_motor_types_{};
+  // SetHomeSwitches, and those of them config_ names, by index.
+  struct BoundHomeSwitch {
+    std::size_t input;
+    std::size_t motor;
+    double closed_at_rot;
+    bool closed_above;
+    bool closed_reads;
+  };
+  std::vector<HomeSwitch> home_switches_;
+  std::vector<BoundHomeSwitch> bound_home_switches_;
   double supply_v_{12.0};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};
   std::vector<uint16_t> pending_resets_;
   bool restore_fails_{false};
+  std::array<bool, kMaxMotors> restoring_{};
 };
 
 }  // namespace talos::hardware::sim

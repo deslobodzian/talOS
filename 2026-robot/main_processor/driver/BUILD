@@ -11,6 +11,7 @@ cc_library(
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
         "//talOS/devices",
+        "//talOS/driver_station",
         "//talOS/node",
         "//talOS/teleop:deadband",
     ],
@@ -41,6 +42,9 @@ cc_test(
         "//2026-robot/main_processor/drivetrain",
         "//talOS/configuration",
         "//talOS/devices:testing",
+        "//talOS/driver_station",
+        "//talOS/hardware",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

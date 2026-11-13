@@ -8,7 +8,15 @@
  * on would refuse to replay against a build with it off, and every node's
  * source ids would shift. Observability must not change the program being
  * observed. So this runs on its own thread and reads only the loop's atomics
- * plus its manifest, which is immutable once the run has started.
+ * -- its counters, its wake loss and its recorder's capture state -- plus its
+ * manifest and which watchers are latest-only, both immutable once the run
+ * has started.
+ *
+ * The one exception is the row's dispatch count, the launcher's evidence that
+ * the node is not stalled. The loop thread stores it at every dispatch
+ * (event::DispatchObserver): this thread runs below every realtime loop, and
+ * a host busy with them can starve it for longer than the launcher's stall
+ * timeout while the loop itself keeps time.
  *
  * Construct it after the loop, so that reverse destruction order joins this
  * thread before the loop's counters go away:
@@ -25,8 +33,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <stop_token>
 #include <string>
@@ -34,11 +45,29 @@
 #include <utility>
 #include <vector>
 
+#include "talOS/events/dispatch_observer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 
 namespace talos::introspect {
+
+// How often a running node's reporter refreshes its row: the heartbeat, the
+// source counters, the selections and the event log flags. Once a loop
+// runs, the one deadline the heartbeat must meet is liveness: a viewer's
+// `alive`, and the next claim freeing a row whose heartbeat is
+// kLivenessTimeout old. The launcher's stall check reads the dispatch count,
+// which the loop thread stores itself, and counts the heartbeat as progress
+// only while a node constructs, when the reporter beats on a cadence of its
+// own (Reporter's constructor). So the refresh owes the heartbeat only a wide
+// margin under kLivenessTimeout, for a reporting thread starved below the
+// realtime loops: 20 refreshes per timeout. Each refresh is the reporting
+// thread's only wake while the loop runs; nothing else it writes has a
+// deadline (Studio's view and the launcher's recording and realtime notes
+// read it as it comes).
+inline constexpr std::chrono::milliseconds kRefreshPeriod{250};
+static_assert(kRefreshPeriod * 20 <= kLivenessTimeout,
+              "a starved reporter must not lose its row");
 
 class Reporter {
  public:
@@ -67,6 +96,11 @@ class Reporter {
     // that takes a lock the loop might hold.
     std::function<std::uint64_t()> events;
     std::function<std::uint64_t()> dropped;
+    // Wake notifications this topic's writer could not send for a reason
+    // other than a gone receiver (RTMSQueue::wake_failures()), added to the
+    // loop's in the row's wake_failures: the loop counts only its own
+    // senders. Same threading rule; empty for none.
+    std::function<std::uint64_t()> wake_failures;
   };
 
   // One of the node's Targets (talOS/devices/target.h): who drives the
@@ -105,23 +139,81 @@ class Reporter {
     // The node's Targets, in the order it opened them.
     std::vector<Selection> selections;
 
-    // How often the slot is refreshed. Four times a second is well inside the
-    // liveness timeout and far below any rate a human or an agent polls at.
-    std::chrono::milliseconds period{250};
+    // Full refresh cadence: heartbeat, source counters and selections. The
+    // dispatch count the launcher supervises is the loop thread's own.
+    std::chrono::milliseconds period{kRefreshPeriod};
 
     std::string registry_path{kRegistryPath};
   };
 
+  explicit Reporter(Options options) : options_{std::move(options)} {
+    try {
+      registration_.emplace(
+          NodeRegistration::Identity{
+              .name = options_.name,
+              .target = options_.target,
+              .session_id = options_.session_id,
+              .flags = static_cast<std::uint32_t>(
+                  kFlagConstructing |
+                  (options_.simulation ? kFlagSimulation : 0u) |
+                  (options_.replay ? kFlagReplay : 0u))},
+          options_.registry_path);
+    } catch (const std::exception& e) {
+      error_ = e.what();
+      std::fprintf(stderr, "%s: node registry unavailable: %s\n",
+                   options_.name.c_str(), e.what());
+    }
+    // The construction heartbeat: while a node constructs, the launcher's
+    // stall check reads it as progress, against a timeout of at least
+    // 500 ms. Its 10 ms cadence lasts only as long as construction, which
+    // the launcher bounds (kConstructionTimeout); start() ends it.
+    thread_ = std::jthread{[this](const std::stop_token& stop) {
+      while (!stop.stop_requested()) {
+        if (registration_) registration_->heartbeat();
+        pause(stop, std::chrono::milliseconds{10});
+      }
+    }};
+  }
+
   template <typename Loop>
-  Reporter(Loop& loop, Options options) : options_{std::move(options)} {
-    // Captured by pointer rather than reference so the lambda stays copyable
-    // and the intent -- this thread outlives no part of the loop -- stays
-    // visible at the call site.
-    thread_ =
-        std::jthread{[this, &loop](std::stop_token stop) { run(loop, stop); }};
+  Reporter(Loop& loop, Options options) : Reporter(std::move(options)) {
+    start(loop);
+  }
+
+  // Call after construction, before running the loop. The owner must keep the
+  // loop and every sampled node alive until this Reporter has been destroyed,
+  // and destroy it only while the loop is not running: from then on the loop
+  // stores its dispatch count in this Reporter's row.
+  template <typename Loop>
+  void start(Loop& loop, std::vector<ExtraSource> extra,
+             std::vector<EndpointAttribute> endpoints,
+             std::vector<Selection> selections) {
+    stop();
+    options_.extra = std::move(extra);
+    options_.endpoints = std::move(endpoints);
+    options_.selections = std::move(selections);
+    start(loop);
+  }
+
+  template <typename Loop>
+  void start(Loop& loop) {
+    stop();
+    detach();
+    if (registration_) {
+      progress_.registration = &*registration_;
+      loop.set_dispatch_observer(&progress_);
+      detach_ = [&loop] { loop.set_dispatch_observer(nullptr); };
+    }
+    thread_ = std::jthread{
+        [this, &loop](const std::stop_token& stop) { run(loop, stop); }};
   }
 
   ~Reporter() {
+    stop();
+    detach();
+  }
+
+  void stop() {
     thread_.request_stop();
     if (thread_.joinable()) {
       thread_.join();
@@ -131,43 +223,44 @@ class Reporter {
   Reporter(const Reporter&) = delete;
   Reporter& operator=(const Reporter&) = delete;
 
+  // Publishes the loop's realtime outcome in the row
+  // (NodeRegistration::set_realtime): call once, from the loop thread, right
+  // after process::ConfigureRealtime, or with requested false when the node
+  // did not ask. Safe while the reporting thread runs.
+  void set_realtime(const process::RealtimeOutcome& outcome) {
+    if (registration_) registration_->set_realtime(outcome);
+  }
+
   // True once the slot has been claimed and the topology written. Tests wait
   // on this rather than sleeping.
   bool published() const { return published_.load(std::memory_order_acquire); }
+
+  // How many times the reporting thread has woken from its waits, for
+  // measuring what reporting costs a node: once per `period` while its loop
+  // runs.
+  std::uint64_t wakeups() const {
+    return wakeups_.load(std::memory_order_relaxed);
+  }
 
   const std::string& error() const { return error_; }
 
  private:
   template <typename Loop>
-  void run(Loop& loop, std::stop_token stop) {
+  void run(Loop& loop, const std::stop_token& stop) {
     // The loop publishes its counters array before it stores running(), and
     // that store synchronizes with this load, so a visible `true` means the
-    // manifest is frozen and the counters exist.
+    // manifest is frozen and the counters exist. The 2 ms polls last only
+    // from start() to the run, a few calls in talos::Run.
     while (!stop.stop_requested() && !loop.running()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+      pause(stop, std::chrono::milliseconds{2});
+      if (registration_) registration_->heartbeat();
     }
     if (stop.stop_requested()) {
       return;
     }
 
-    std::optional<NodeRegistration> registration;
-    try {
-      registration.emplace(
-          NodeRegistration::Identity{
-              .name = options_.name,
-              .target = options_.target,
-              .session_id = options_.session_id,
-              .flags = static_cast<std::uint32_t>(
-                  (options_.simulation ? kFlagSimulation : 0u) |
-                  (options_.replay ? kFlagReplay : 0u)),
-          },
-          options_.registry_path);
-    } catch (const std::exception& e) {
-      error_ = e.what();
-      std::fprintf(stderr, "%s: node registry unavailable: %s\n",
-                   options_.name.c_str(), e.what());
-      return;
-    }
+    if (!registration_) return;
+    NodeRegistration& registration = *registration_;
 
     // The loop's own sources first, keeping their ids, then anything the node
     // owns outside the loop.
@@ -192,35 +285,43 @@ class Reporter {
       }
     }
 
-    registration->publish(manifest, endpoints);
-    registration->publish_selections(options_.selections);
+    // What only the loop knows about its own sources, by id: which watchers
+    // skip to the newest message, so a viewer does not read their skips as
+    // loss.
+    registration.publish(manifest, endpoints, LoopSourceFlags(loop));
+    registration.publish_selections(options_.selections);
+    registration.activate();
     published_.store(true, std::memory_order_release);
 
+    // One wait per refresh. The end of the loop is not polled for: the row
+    // stays until this Reporter goes, which talos::Run does right after its
+    // loop returns, and stop() wakes the wait at once.
     while (!stop.stop_requested() && loop.running()) {
-      sample(loop, *registration);
-      // Short sleeps rather than one long one, so shutdown is prompt: a node
-      // that has exited should leave the viewer immediately, not a quarter
-      // second later.
-      const auto deadline = std::chrono::steady_clock::now() + options_.period;
-      while (!stop.stop_requested() && loop.running() &&
-             std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds{10});
-      }
+      sample(loop, registration);
+      pause(stop, options_.period);
     }
 
     // A final sample so the last cycle's counts are not lost when a node exits
     // between refreshes.
-    sample(loop, *registration);
+    sample(loop, registration);
   }
 
   template <typename Loop>
   void sample(Loop& loop, NodeRegistration& registration) {
-    // One sample: the heartbeat, the dispatch count and every source move
-    // together behind sample_seq, so a reader never pairs a fresh heartbeat
-    // with the previous refresh's counts.
+    // One full sample. The dispatch count is the loop thread's to store
+    // (ProgressObserver).
     registration.begin_sample();
     registration.heartbeat();
-    registration.set_dispatch_count(loop.dispatch_count());
+    // Whether the event log stopped early, from a recorder that can say
+    // (event::log::LogWriter, whose answers are lock-free loads); an
+    // unlogged loop's NullRecorder cannot.
+    if constexpr (requires {
+                    loop.recorder().failed();
+                    loop.recorder().capped();
+                  }) {
+      registration.set_recording(loop.recorder().failed(),
+                                 loop.recorder().capped());
+    }
 
     const event::SourceCounters* counters = loop.source_counters();
     const std::size_t count = loop.source_counter_count();
@@ -246,6 +347,19 @@ class Reporter {
                               /*max_latency_ns=*/0);
     }
 
+    // What the loop's wake channel lost (RealtimeEventLoop::wake_loss), and
+    // the notifications the node's own topics' writers failed to send; a
+    // simulated or replayed loop has no wake channel to lose.
+    if constexpr (requires { loop.wake_loss(); }) {
+      const auto loss = loop.wake_loss();
+      std::uint64_t wake_failures = loss.wake_failures;
+      for (const ExtraSource& extra : options_.extra) {
+        if (extra.wake_failures) wake_failures += extra.wake_failures();
+      }
+      registration.set_wake_loss(wake_failures, loss.stalled_arms,
+                                 loss.wake_fallbacks);
+    }
+
     for (std::size_t i = 0; i < options_.selections.size(); ++i) {
       const Selection& selection = options_.selections[i];
       registration.set_selected(static_cast<std::uint32_t>(i),
@@ -254,10 +368,38 @@ class Reporter {
     registration.end_sample();
   }
 
+  // Stores the loop's dispatch count in the row from the loop thread.
+  struct ProgressObserver final : event::DispatchObserver {
+    NodeRegistration* registration{nullptr};
+    void on_dispatch_count(std::uint64_t count) noexcept override {
+      registration->set_dispatch_count(count);
+    }
+  };
+
+  // Detaches ProgressObserver from the loop start() gave it, if any.
+  void detach() {
+    if (detach_) std::exchange(detach_, nullptr)();
+  }
+
+  // Waits `period`, returning as soon as a stop is requested, so stop() --
+  // and with it start(), which ends the construction heartbeat -- joins
+  // without sitting out the rest of a sleep. Only the reporting thread waits.
+  void pause(const std::stop_token& stop, std::chrono::milliseconds period) {
+    std::unique_lock lock{pause_mutex_};
+    pause_.wait_for(lock, stop, period, [] { return false; });
+    wakeups_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   Options options_;
   std::size_t loop_sources_{0};
   std::atomic<bool> published_{false};
+  std::atomic<std::uint64_t> wakeups_{0};
   std::string error_;
+  std::optional<NodeRegistration> registration_;
+  ProgressObserver progress_;
+  std::function<void()> detach_;
+  std::mutex pause_mutex_;
+  std::condition_variable_any pause_;
   std::jthread thread_;
 };
 

@@ -38,8 +38,13 @@ slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 [digital_inputs.intake_beam]
 dio = 1
 
-# Held button asks for 30 wheel rps (below the 100 rps motor limit).
-# Positive asks stop at the beam; negative asks eject at their asked speed.
+# Button 2 collects at 30 rps and stops at the beam. Button 3 feeds at -20 rps
+# past the beam only while the shooter is ready (hold button 1 to spin it up).
+# First live binding wins: button 2 takes precedence if 2 and 3 are both held.
 [[teleop.bindings]]
 button = 2
 while_held = { roller_velocity_rps = 30.0 }
+
+[[teleop.bindings]]
+button = 3
+while_held = { roller_velocity_rps = -20.0 }

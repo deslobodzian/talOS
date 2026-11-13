@@ -1,0 +1,730 @@
+// The launcher's stdout and stderr closed or never read, and its terminal
+// hanging up: the session runs on (or, on the hangup, stops in order), and
+// what it spawns starts with default signal dispositions and an empty mask
+// whatever the launcher's are.
+//
+// Every wait here is on an event -- a pipe's data or its end -- bounded by
+// kHangMs, which only bounds a hang (docs/TESTING.md §6.3).
+
+#include <fcntl.h>
+#include <gtest/gtest.h>
+#include <poll.h>
+#ifdef __APPLE__
+#include <util.h>
+#else
+#include <pty.h>
+#endif
+#include <pthread.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <iterator>
+#include <memory>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <string_view>
+
+#include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/launcher/launcher.h"
+#include "talOS/launcher/testdata/first_exec.h"
+
+namespace talos::launcher {
+namespace {
+
+// How long a wait for one event may see nothing before the test gives up.
+constexpr int kHangMs = 20000;
+
+// The descriptor a forked launcher's members find the test's event pipe on.
+// They inherit it across exec; their guardians close it.
+constexpr int kEventFd = 9;
+
+std::string TempPath(std::string_view name) {
+  return ::testing::TempDir() + "/talos_closed_output_" +
+         std::to_string(::getpid()) + "_" + std::string{name};
+}
+
+constexpr std::string_view kFixtureToml = R"(
+[robot]
+name = "closed_output_fixture"
+period_us = 5000
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+period_us = 5000
+
+[subsystems.alpha.motors.m1]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+)";
+
+// A shell stub for `node` that answers --describe, then runs `body`.
+std::string WriteStub(std::string_view tag, std::string_view body,
+                      std::string_view node) {
+  const std::string path = TempPath(tag) + ".sh";
+  introspect::Description description;
+  description.name = std::string{node};
+  description.target = node == "hardware_node"
+                           ? "//talOS/bridge:hardware_node"
+                           : "//example/" + std::string{node} + ":node";
+  std::ostringstream out;
+  out << "#!/bin/sh\n"
+      << "for arg in \"$@\"; do\n"
+      << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+      << "    cat <<'TALOS_DESCRIBE'\n"
+      << introspect::DescribeToJson(description) << "TALOS_DESCRIBE\n"
+      << "    exit 0\n"
+      << "  fi\n"
+      << "done\n"
+      << body;
+  return talos::launcher::testing::WriteWarmStub(path, out.str());
+}
+
+std::string ReadFile(const std::string& path) {
+  std::ifstream in{path};
+  return std::string((std::istreambuf_iterator<char>(in)),
+                     std::istreambuf_iterator<char>());
+}
+
+// A session of the fixture: a hardware stub that runs until stopped, and
+// alpha, which prints "tick" every 20 ms. Once its stop trap is set, the
+// hardware stub writes "hardware ready" to kEventFd, and each alpha run
+// "alpha <run>"; run 1 also writes "alpha 1 ticked" once it has printed
+// twenty ticks. Once `crash` exists, run 0 exits 1. A stop signalled before
+// both are ready could end a stub by the signal rather than its trap. Each
+// alpha run starts with a 16 KiB line, more than a terminal holds.
+struct Fixture {
+  LauncherOptions options;
+  std::string crash;
+  std::string crashed;
+  std::string session_dir;
+
+  explicit Fixture(std::string_view tag) {
+    options.session_id = GenerateSessionId();
+    options.output_dir = TempPath(std::string{tag} + "_session");
+    options.describe_timeout_ms = 4000;
+    // The stubs never take a registry row; nothing here waits for one.
+    options.heartbeat_startup_grace_ms = 60000;
+    options.config_path = TempPath(std::string{tag} + "_fixture") + ".toml";
+    std::ofstream{options.config_path} << kFixtureToml;
+    crash = TempPath(std::string{tag} + "_crash");
+    crashed = TempPath(std::string{tag} + "_crashed");
+    ::remove(crash.c_str());
+    ::remove(crashed.c_str());
+    const std::string events = std::to_string(kEventFd);
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStub(std::string{tag} + "_hardware",
+                  "trap 'exit 0' INT TERM\necho 'hardware ready' >&" + events +
+                      "\nwhile :; do sleep 0.05; done\n",
+                  "hardware_node");
+    std::string alpha = "trap 'exit 0' INT TERM\nrun=0\n";
+    alpha += "[ -e " + crashed + " ] && run=1\n";
+    alpha += "head -c 16384 /dev/zero | tr '\\0' x\necho\n";
+    alpha += "echo \"alpha $run\" >&" + events + "\nticks=0\nwhile :; do\n";
+    alpha += "  echo tick\n  ticks=$((ticks + 1))\n";
+    alpha += "  if [ $run = 1 ] && [ $ticks = 20 ]; then\n";
+    alpha += "    echo 'alpha 1 ticked' >&" + events + "\n  fi\n";
+    alpha += "  if [ $run = 0 ] && [ -e " + crash + " ]; then\n";
+    alpha += "    : > " + crashed + "\n    exit 1\n  fi\n";
+    alpha += "  sleep 0.02\ndone\n";
+    options.binary_overrides["//example/alpha:node"] =
+        WriteStub(std::string{tag} + "_alpha", alpha, "alpha");
+    session_dir = options.output_dir + "/" + std::to_string(options.session_id);
+  }
+  ~Fixture() {
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(crash.c_str());
+    ::remove(crashed.c_str());
+  }
+  Fixture(const Fixture&) = delete;
+  Fixture& operator=(const Fixture&) = delete;
+};
+
+// A launcher forked from the test, its stdout and stderr both `output`.
+struct Forked {
+  pid_t pid{-1};
+  int events{-1};  // The read end of its kEventFd; ends once all have exited.
+};
+
+// `reader`, when not -1, is the test's end of an `output` pipe: closed in
+// the launcher, so that the test's close leaves the pipe without a reader.
+// With `ignore_hangup` the launcher starts with SIGHUP ignored, as `nohup`
+// starts it.
+Forked ForkLauncher(const LauncherOptions& options, int output, int reader = -1,
+                    bool ignore_hangup = false) {
+  int events[2];
+  if (::pipe(events) != 0) return {};
+  // Nothing the test buffered may reach the launcher's output twice.
+  std::fflush(nullptr);
+  const pid_t pid = ::fork();
+  if (pid < 0) return {};
+  if (pid == 0) {
+    if (reader >= 0) ::close(reader);
+    ::close(events[0]);
+    if (::dup2(output, STDOUT_FILENO) < 0 ||
+        ::dup2(output, STDERR_FILENO) < 0 || ::dup2(events[1], kEventFd) < 0)
+      ::_exit(100);
+    ::close(output);
+    ::close(events[1]);
+    // Started as a shell starts it, whatever this test inherited (a harness
+    // may ignore SIGPIPE).
+    std::signal(SIGPIPE, SIG_DFL);
+    std::signal(SIGHUP, ignore_hangup ? SIG_IGN : SIG_DFL);
+    const int code = Launcher{options}.Run();
+    // As main's return would.
+    std::cout.flush();
+    std::fflush(nullptr);
+    ::_exit(code);
+  }
+  ::close(events[1]);
+  return {pid, events[0]};
+}
+
+// Reads `fd` into `seen` until `want` appears in it. False when `fd` ends,
+// or stays silent for kHangMs, first.
+bool AwaitText(int fd, std::string& seen, std::string_view want) {
+  while (seen.find(want) == std::string::npos) {
+    ::pollfd ready{fd, POLLIN, 0};
+    const int polled = ::poll(&ready, 1, kHangMs);
+    if (polled < 0 && errno == EINTR) continue;
+    if (polled <= 0) return false;
+    char buffer[4096];
+    const ssize_t got = ::read(fd, buffer, sizeof buffer);
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0) return false;
+    seen.append(buffer, static_cast<std::size_t>(got));
+  }
+  return true;
+}
+
+// Reads `fd` until it ends. False when it stays silent for kHangMs first.
+bool AwaitEnd(int fd, std::string& seen) {
+  for (;;) {
+    ::pollfd ready{fd, POLLIN, 0};
+    const int polled = ::poll(&ready, 1, kHangMs);
+    if (polled < 0 && errno == EINTR) continue;
+    if (polled <= 0) return false;
+    char buffer[4096];
+    const ssize_t got = ::read(fd, buffer, sizeof buffer);
+    if (got < 0 && errno == EINTR) continue;
+    if (got <= 0) return true;
+    seen.append(buffer, static_cast<std::size_t>(got));
+  }
+}
+
+// Reaps `pid`, which has exited or is about to (its event pipe ended).
+int Reap(pid_t pid) {
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  return status;
+}
+
+// Whether the session's manifest was finalized: its end_wall_ns is set.
+bool Finalized(const std::string& manifest) {
+  return manifest.find("\n  \"end_wall_ns\": 0,") == std::string::npos;
+}
+
+// The runs a manifest records as ended by the session's stop.
+std::size_t StoppedRuns(const std::string& manifest) {
+  std::size_t stopped = 0;
+  for (std::size_t at = manifest.find("\"reason\": \"stop\"");
+       at != std::string::npos;
+       at = manifest.find("\"reason\": \"stop\"", at + 1))
+    ++stopped;
+  return stopped;
+}
+
+// Whether `text` has a line holding both `first` and `second`.
+bool HasLine(const std::string& text, std::string_view first,
+             std::string_view second) {
+  std::size_t start = 0;
+  while (start < text.size()) {
+    std::size_t end = text.find('\n', start);
+    if (end == std::string::npos) end = text.size();
+    const std::string_view line{text.data() + start, end - start};
+    if (line.find(first) != std::string_view::npos &&
+        line.find(second) != std::string_view::npos)
+      return true;
+    start = end + 1;
+  }
+  return false;
+}
+
+// Fills `writer`'s pipe (or terminal) until a write would block, leaving it
+// blocking.
+void FillPipe(int writer) {
+  const int flags = ::fcntl(writer, F_GETFL);
+  ::fcntl(writer, F_SETFL, flags | O_NONBLOCK);
+  const std::string filler(4096, 'f');
+  while (::write(writer, filler.data(), filler.size()) > 0) {
+  }
+  ::fcntl(writer, F_SETFL, flags);
+}
+
+// REQ-OPS-33
+// A session whose launcher stdout and stderr are one pipe (`launcher 2>&1 |
+// tee`) that is not read. Row "closed": once alpha's output has been echoed
+// through it, the test closes the pipe's only reader, so every later write
+// fails with EPIPE; a launcher that dies of SIGPIPE ends the session. Row
+// "full": the pipe is full before the launcher starts and nobody ever reads
+// it (a paused pager, an ssh session sshd has not noticed is gone), so every
+// write to it blocks; a launcher that writes its own lines there from its
+// supervision thread stops supervising. In both, alpha's first run exits 1
+// once it has started: alpha must be restarted, its second run's output
+// must reach alpha.log, SIGTERM must still stop the session in order
+// (status 0, manifest finalized, the hardware stub's and alpha's last runs
+// "stop"), and the session's talos.log must hold the launcher's line about
+// alpha's exit. Row "terminal": stdout and stderr are a pseudo-terminal
+// nobody reads (an interactive ssh session whose client's network dropped),
+// full but for a few bytes: poll() calls it writable, and a blocking write
+// of more than that room never returns. The stop must still end the
+// launcher within the descriptors' linger.
+TEST(ClosedOutput, SessionOutlivesAnUnreadStdout) {
+  enum class Output { kClosed, kFull, kTerminal };
+  struct Row {
+    const char* name;
+    Output output;
+  };
+  for (const Row row :
+       {Row{"closed", Output::kClosed}, Row{"full", Output::kFull},
+        Row{"terminal", Output::kTerminal}}) {
+    SCOPED_TRACE(row.name);
+    Fixture fixture{row.name};
+    const std::string alpha_log = NodeOutputPath(fixture.session_dir, "alpha");
+    // output[0] the test's end, output[1] the launcher's.
+    int output[2];
+    if (row.output == Output::kTerminal) {
+      ASSERT_EQ(::openpty(&output[0], &output[1], nullptr, nullptr, nullptr),
+                0);
+      FillPipe(output[1]);
+      // One read, once: some room, so that poll() calls the terminal
+      // writable, but less than the launcher's output will need.
+      char taken[4096];
+      ASSERT_GT(::read(output[0], taken, sizeof taken), 0);
+    } else {
+      ASSERT_EQ(::pipe(output), 0);
+      if (row.output == Output::kFull) FillPipe(output[1]);
+    }
+    const Forked launcher = ForkLauncher(fixture.options, output[1], output[0]);
+    ::close(output[1]);
+    ASSERT_GT(launcher.pid, 0);
+
+    std::string seen;
+    std::string events;
+    bool started = false;
+    if (row.output != Output::kClosed) {
+      started = AwaitText(launcher.events, events, "alpha 0") &&
+                AwaitText(launcher.events, events, "hardware ready");
+    } else {
+      // Read the launcher's output until alpha's echo shows up in it.
+      started = AwaitText(output[0], seen, "tick");
+      ::close(output[0]);
+    }
+    std::ofstream{fixture.crash}.close();
+    // Each wait that fails costs kHangMs: the later ones are skipped.
+    const bool restarted =
+        started && AwaitText(launcher.events, events, "alpha 1 ticked");
+    int status = 0;
+    const bool alive = ::waitpid(launcher.pid, &status, WNOHANG) == 0;
+    if (alive) ::kill(launcher.pid, SIGTERM);
+    const bool ended = AwaitEnd(launcher.events, events);
+    ::close(launcher.events);
+    if (!ended) ::kill(launcher.pid, SIGKILL);
+    if (alive) status = Reap(launcher.pid);
+    if (row.output != Output::kClosed) ::close(output[0]);
+
+    ASSERT_TRUE(started) << (row.output != Output::kClosed
+                                 ? "alpha never started; events: "
+                                 : "alpha's output never reached the "
+                                   "launcher's stdout: ")
+                         << (row.output != Output::kClosed ? events : seen);
+    EXPECT_TRUE(alive) << "the launcher ended: " << ExitReason(status);
+    EXPECT_TRUE(restarted) << "alpha's second run never printed twenty "
+                              "lines; events: "
+                           << events;
+    EXPECT_TRUE(ended) << "the launcher did not exit after SIGTERM";
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "the stop ended with " << ExitReason(status);
+    const std::string manifest =
+        ReadFile(fixture.session_dir + "/manifest.json");
+    EXPECT_TRUE(Finalized(manifest)) << manifest;
+    EXPECT_EQ(StoppedRuns(manifest), 2u) << manifest;
+    const std::string log = ReadFile(alpha_log);
+    const std::size_t second_run = log.find("[launcher] alpha run 1,");
+    ASSERT_NE(second_run, std::string::npos) << alpha_log << ":\n" << log;
+    std::size_t ticks = 0;
+    for (std::size_t at = log.find("tick", second_run); at != std::string::npos;
+         at = log.find("tick", at + 1))
+      ++ticks;
+    EXPECT_GE(ticks, 20u) << alpha_log << ":\n" << log;
+    const std::string launcher_log =
+        ReadFile(fixture.session_dir + "/" + std::string{kLauncherOutputFile});
+    EXPECT_TRUE(HasLine(launcher_log, "alpha", "exit code 1")) << "talos.log:\n"
+                                                               << launcher_log;
+  }
+}
+
+// REQ-OPS-33
+// A terminal hangup (an interactive ssh session or a terminal window
+// closing) sends the launcher SIGHUP. Row "hangup": a launcher started with
+// SIGHUP at its default stops the session in order on it, as on SIGTERM:
+// members stopped (each run's reason "stop"), the manifest finalized (its
+// end_wall_ns set), exit status 0. Killed by the default action instead,
+// it ends with signal 1, its guardians kill the members and the manifest
+// is never finalized. Row "nohup": a launcher started with SIGHUP ignored
+// keeps supervising after one: alpha's crash after it is restarted, and
+// SIGTERM then stops the session.
+TEST(ClosedOutput, HangupStopsTheSessionUnlessIgnoredAtStart) {
+  struct Row {
+    const char* name;
+    bool ignored;
+  };
+  for (const Row row : {Row{"hangup", false}, Row{"nohup", true}}) {
+    SCOPED_TRACE(row.name);
+    Fixture fixture{row.name};
+    const std::string output_path = TempPath(std::string{row.name} + ".out");
+    const int output = ::open(output_path.c_str(),
+                              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    ASSERT_GE(output, 0);
+    const Forked launcher =
+        ForkLauncher(fixture.options, output, -1, row.ignored);
+    ::close(output);
+    ASSERT_GT(launcher.pid, 0);
+    std::string events;
+    // The members start after the launcher has installed its handlers.
+    const bool started = AwaitText(launcher.events, events, "alpha 0") &&
+                         AwaitText(launcher.events, events, "hardware ready");
+    ::kill(launcher.pid, SIGHUP);
+    bool restarted = false;
+    if (row.ignored) {
+      std::ofstream{fixture.crash}.close();
+      restarted = AwaitText(launcher.events, events, "alpha 1");
+      ::kill(launcher.pid, SIGTERM);
+    }
+    const bool ended = AwaitEnd(launcher.events, events);
+    ::close(launcher.events);
+    const int status = Reap(launcher.pid);
+    const std::string manifest =
+        ReadFile(fixture.session_dir + "/manifest.json");
+    ::remove(output_path.c_str());
+
+    ASSERT_TRUE(started) << "alpha never started; events: " << events;
+    if (row.ignored) {
+      EXPECT_TRUE(restarted)
+          << "no restart after an ignored SIGHUP; events: " << events;
+    }
+    EXPECT_TRUE(ended) << "the session did not end";
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "the launcher ended with " << ExitReason(status);
+    EXPECT_TRUE(Finalized(manifest)) << "the manifest was not finalized:\n"
+                                     << manifest;
+    // The hardware stub's run and alpha's last.
+    EXPECT_EQ(StoppedRuns(manifest), 2u) << manifest;
+  }
+}
+
+// REQ-OPS-33
+// A roster member's name is its output and event log file names. One named
+// `talos` would drain its output into talos.log, the launcher's own, and so
+// would `Talos` on a case-insensitive file system (macOS's default APFS).
+// The graph lint refuses both (a reserved owner; a segment of lowercase
+// letters), but --allow-graph-errors overrides the lint; the launch must
+// still be refused, before any session directory or member exists. Row
+// "gamma", the same roster under a legal name, launches and runs its member.
+TEST(ClosedOutput, MisnamedMemberIsRefusedEvenAllowingGraphErrors) {
+  struct Row {
+    const char* name;
+    bool refused;
+  };
+  for (const Row row :
+       {Row{"talos", true}, Row{"Talos", true}, Row{"gamma", false}}) {
+    SCOPED_TRACE(row.name);
+    const std::string name{row.name};
+    LauncherOptions options;
+    options.session_id = GenerateSessionId();
+    options.output_dir = TempPath(name + "_member_session");
+    options.allow_graph_errors = true;
+    options.simulation = true;  // The flag requires --sim.
+    options.config_path = TempPath(name + "_member") + ".toml";
+    std::ofstream{options.config_path}
+        << "[robot]\nname = \"member_fixture\"\nperiod_us = 5000\n\n"
+        << "[subsystems." << name << "]\nnode = \"//example/" << name
+        << ":node\"\nperiod_us = 5000\n\n[subsystems." << name
+        << ".motors.m1]\ntype = \"TalonFX\"\nbus = \"rio\"\ncan_id = 1\n";
+    const std::string ran = TempPath(name + "_member_ran");
+    ::remove(ran.c_str());
+    options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStub(name + "_member_hardware", "exit 0\n", "hardware_node");
+    options.binary_overrides["//example/" + name + ":node"] =
+        WriteStub(name + "_member", ": > " + ran + "\nexit 0\n", name);
+    const int status = Launcher{options}.Run();
+    const bool started = std::filesystem::exists(ran);
+    const bool session = std::filesystem::exists(
+        options.output_dir + "/" + std::to_string(options.session_id));
+    std::filesystem::remove_all(options.output_dir);
+    ::remove(ran.c_str());
+    EXPECT_EQ(status, row.refused ? 1 : 0);
+    EXPECT_EQ(started, !row.refused);
+    EXPECT_EQ(session, !row.refused);
+  }
+}
+
+// REQ-OPS-33
+// Output the launcher's stdout drops mid-session, because its reader fell
+// behind, is noted in talos.log as well as in the stream: the stream's note
+// may never be read, and talos.log is what session_report reads. A forked
+// launcher-to-be echoes 2 MiB, twice what its stdout's buffer holds, into a
+// pipe the test does not read yet; the test then reads until the stream's
+// note of the drop arrives, and only then lets it stop. talos.log must note
+// the same count, in the line session_report parses.
+TEST(ClosedOutput, StdoutDropsMidSessionAreNotedInTalosLog) {
+  const std::string log = TempPath("dropped_stdout.log");
+  ::remove(log.c_str());
+  int output[2];
+  int echoed[2];
+  int stop[2];
+  ASSERT_EQ(::pipe(output), 0);
+  ASSERT_EQ(::pipe(echoed), 0);
+  ASSERT_EQ(::pipe(stop), 0);
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(output[0]);
+    ::close(echoed[0]);
+    ::close(stop[1]);
+    const int null = ::open("/dev/null", O_WRONLY);
+    if (null < 0 || ::dup2(output[1], STDOUT_FILENO) < 0 ||
+        ::dup2(null, STDERR_FILENO) < 0)
+      ::_exit(100);
+    ::close(output[1]);
+    {
+      LauncherOutput launcher;
+      launcher.Record(log);
+      launcher.Echo(std::string(std::size_t{2} << 20, 'e'));
+      // Waits for the test to close its end.
+      char go = 0;
+      if (::write(echoed[1], "e", 1) != 1 || ::read(stop[0], &go, 1) != 0)
+        ::_exit(101);
+      launcher.Stop(std::chrono::milliseconds{kHangMs});
+    }
+    ::_exit(0);
+  }
+  ::close(output[1]);
+  ::close(echoed[1]);
+  ::close(stop[0]);
+  std::string ready;
+  const bool echoed_all = AwaitText(echoed[0], ready, "e");
+  std::string seen;
+  const bool noted = echoed_all && AwaitText(output[0], seen, " here: ");
+  ::close(stop[1]);  // Lets the child stop.
+  AwaitEnd(output[0], seen);
+  ::close(output[0]);
+  ::close(echoed[0]);
+  const int status = Reap(child);
+  const std::string talos_log = ReadFile(log);
+  ::remove(log.c_str());
+
+  ASSERT_TRUE(noted) << "the stream never noted a drop";
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  const std::regex stream_note{
+      R"(\[launcher\] (\d+) bytes of output dropped here: )"};
+  std::smatch in_stream;
+  ASSERT_TRUE(std::regex_search(seen, in_stream, stream_note));
+  // session_report.py's pattern for a drop on the launcher's own stdout.
+  const std::regex log_note{
+      R"((^|\n)\[launcher\] (\d+) bytes for the launcher's stdout were not written)"};
+  std::smatch in_log;
+  ASSERT_TRUE(std::regex_search(talos_log, in_log, log_note)) << "talos.log:\n"
+                                                              << talos_log;
+  EXPECT_EQ(in_log[2].str(), in_stream[1].str()) << talos_log;
+}
+
+// REQ-OPS-33
+// talos.log is read by line (session_report, a person grepping for a
+// member's exit), so the launcher's note about one of its streams never
+// lands inside another line. A forked launcher-to-be prints the first piece
+// of a line ("[launcher] alpha") to a stdout whose reader is gone, waits
+// until the stream's failure has been noted (on stderr, which the test
+// reads), then prints the rest. talos.log must hold the whole line, then
+// the note on a line of its own.
+TEST(ClosedOutput, StreamNoteWaitsForTheLineInProgress) {
+  const std::string log = TempPath("note_line.log");
+  ::remove(log.c_str());
+  int errors[2];
+  int resume[2];
+  ASSERT_EQ(::pipe(errors), 0);
+  ASSERT_EQ(::pipe(resume), 0);
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0);
+  if (child == 0) {
+    ::close(errors[0]);
+    ::close(resume[1]);
+    int closed[2];
+    if (::pipe(closed) != 0) ::_exit(100);
+    ::close(closed[0]);             // Every write to stdout fails with EPIPE.
+    std::signal(SIGPIPE, SIG_IGN);  // As Launcher::Run sets it.
+    if (::dup2(closed[1], STDOUT_FILENO) < 0 ||
+        ::dup2(errors[1], STDERR_FILENO) < 0)
+      ::_exit(101);
+    ::close(closed[1]);
+    ::close(errors[1]);
+    {
+      LauncherOutput launcher;
+      launcher.Record(log);
+      std::cout << "[launcher] alpha";
+      // Until the test has seen the failure noted and closes its end.
+      char go = 0;
+      if (::read(resume[0], &go, 1) != 0) ::_exit(102);
+      std::cout << " exited (exit code 1)\n";
+      launcher.Stop(std::chrono::milliseconds{kHangMs});
+    }
+    ::_exit(0);
+  }
+  ::close(errors[1]);
+  ::close(resume[0]);
+  std::string seen;
+  const bool noted = AwaitText(errors[0], seen, "no longer writes to it");
+  ::close(resume[1]);
+  AwaitEnd(errors[0], seen);
+  ::close(errors[0]);
+  const int status = Reap(child);
+  const std::string talos_log = ReadFile(log);
+  ::remove(log.c_str());
+
+  ASSERT_TRUE(noted) << "the stream's failure was never noted: " << seen;
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  const std::string line = "[launcher] alpha exited (exit code 1)\n";
+  const std::size_t whole = talos_log.find(line);
+  ASSERT_NE(whole, std::string::npos) << "talos.log:\n" << talos_log;
+  const std::size_t note = talos_log.find("[launcher] stdout: ");
+  ASSERT_NE(note, std::string::npos) << "talos.log:\n" << talos_log;
+  EXPECT_EQ(note, whole + line.size()) << "talos.log:\n" << talos_log;
+}
+
+std::string Runfile(const char* env) {
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  const char* location = std::getenv(env);
+  if (!runfiles || location == nullptr) return {};
+  return runfiles->Rlocation(location);
+}
+
+// REQ-OPS-33
+// Ignored signals stay ignored across exec, and the signal mask passes
+// through it. Each row is a way a launcher comes to hold a disposition or
+// mask its programs must not get: it ignores SIGPIPE itself; `nohup` ignores
+// SIGHUP; `&` from a non-interactive shell ignores SIGINT and SIGQUIT (a
+// node that ignores SIGINT no longer stops when the session does); and a
+// caller's blocked signals. With all of them set on the spawning thread, a
+// spawned program must report no signal ignored and none blocked.
+TEST(ClosedOutput, SpawnedChildStartsWithDefaultSignals) {
+  const std::string probe = Runfile("TALOS_SIGNAL_PROBE");
+  ASSERT_FALSE(probe.empty()) << "TALOS_SIGNAL_PROBE";
+  struct Row {
+    const char* why;
+    int signal;
+    bool block;  // Else ignore.
+  };
+  const Row rows[] = {
+      {"the launcher ignores SIGPIPE", SIGPIPE, false},
+      {"nohup", SIGHUP, false},
+      {"& from a non-interactive shell", SIGINT, false},
+      {"& from a non-interactive shell", SIGQUIT, false},
+      {"a caller's blocked signal", SIGUSR1, true},
+      {"a caller's blocked signal", SIGTERM, true},
+  };
+  struct sigaction ignore {};
+  ignore.sa_handler = SIG_IGN;
+  sigemptyset(&ignore.sa_mask);
+  struct sigaction previous[NSIG]{};
+  sigset_t blocked;
+  sigset_t mask;
+  sigemptyset(&blocked);
+  std::string set;
+  for (const Row& row : rows) {
+    set += std::string{"\n  "} + row.why + ": " +
+           (row.block ? "blocks " : "ignores ") + SignalText(row.signal);
+    if (row.block) {
+      sigaddset(&blocked, row.signal);
+    } else {
+      ASSERT_EQ(::sigaction(row.signal, &ignore, &previous[row.signal]), 0);
+    }
+  }
+  ASSERT_EQ(::pthread_sigmask(SIG_BLOCK, &blocked, &mask), 0);
+  std::string error;
+  int reader = -1;
+  const pid_t child =
+      SpawnProcess({probe}, error, SpawnOutput::kStdoutPipe, &reader);
+  ::pthread_sigmask(SIG_SETMASK, &mask, nullptr);
+  for (const Row& row : rows) {
+    if (!row.block) ::sigaction(row.signal, &previous[row.signal], nullptr);
+  }
+  ASSERT_GT(child, 0) << error;
+  std::string report;
+  ASSERT_TRUE(AwaitEnd(reader, report)) << report;
+  ::close(reader);
+  const int status = Reap(child);
+  FinishProcessGroup(child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  EXPECT_EQ(report, "ignored:\nblocked:\n")
+      << "spawned from a thread set up so:" << set;
+}
+
+// REQ-OPS-06
+// A member whose --describe says holds_stop is spawned with exactly the stop
+// signals blocked (SIGINT, SIGTERM, SIGHUP), so a stop sent while its runtime
+// starts stays pending; nothing else is, even signals the spawning thread
+// blocks itself (SIGCHLD, SIGPIPE), or the node would never see a child exit
+// or a broken pipe.
+TEST(ClosedOutput, HeldStopSpawnBlocksExactlyTheStopSignals) {
+  const std::string probe = Runfile("TALOS_SIGNAL_PROBE");
+  ASSERT_FALSE(probe.empty()) << "TALOS_SIGNAL_PROBE";
+  sigset_t blocked;
+  sigset_t mask;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGCHLD);
+  sigaddset(&blocked, SIGPIPE);
+  ASSERT_EQ(::pthread_sigmask(SIG_BLOCK, &blocked, &mask), 0);
+  std::string error;
+  int reader = -1;
+  const pid_t child =
+      SpawnProcess({probe}, error, SpawnOutput::kStdoutPipe, &reader, nullptr,
+                   /*hold_stop=*/true);
+  ::pthread_sigmask(SIG_SETMASK, &mask, nullptr);
+  ASSERT_GT(child, 0) << error;
+  std::string report;
+  ASSERT_TRUE(AwaitEnd(reader, report)) << report;
+  ::close(reader);
+  const int status = Reap(child);
+  FinishProcessGroup(child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  int held[] = {SIGINT, SIGTERM, SIGHUP};
+  std::sort(std::begin(held), std::end(held));
+  std::string expected = "ignored:\nblocked:";
+  for (const int signal : held) expected += " " + std::to_string(signal);
+  expected += "\n";
+  EXPECT_EQ(report, expected);
+}
+
+}  // namespace
+}  // namespace talos::launcher

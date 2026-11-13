@@ -5,7 +5,9 @@
         [--standalone DIR] [--dry-run]
 
 Writes <robot>/main_processor/<name>/ (messages, node, Sim test, testdata),
-modelled on that robot's shooter (C++) and intake (Python) packages, or for
+modelled on that robot's shooter (C++) and intake (Python) packages (a
+--type position node wraps talos::mechanisms::PositionMechanism, in Python
+talos.mechanisms.PositionMechanism), or for
 --type estimator a hardware-free node publishing geometry.PoseEstimate from
 the PoseObservations of its `cameras`, then adds
 configuration/subsystems/<name>.toml and its [[subsystems]] entry in
@@ -17,6 +19,11 @@ subsystem inherited through `include`, `defaults` or a custom `path` counts.
 Everything is checked before anything is written, so a refused run leaves the
 tree untouched. --standalone writes the package as its own Bzlmod repository
 in DIR instead, building against this checkout.
+
+Run it with `bazel run` (`bazel run //tools:new_subsystem -- --help` lists the
+options): it imports //tools:sync_manifest, which finds the configuration
+resolver in Bazel runfiles, so `python3 tools/new_subsystem.py` fails with
+`No module named 'tools'`.
 """
 
 import argparse
@@ -24,13 +31,15 @@ import difflib
 import keyword
 import os
 import sys
+import textwrap
 import tomllib
 
 from tools import sync_manifest
 
-# Mirrors talOS/introspection/names.h (CheckSegment, CheckNodeName); keep them
-# in sync. The launcher re-checks at --describe-only, so drift only costs an
-# earlier error message.
+# Mirrors talOS/introspection/names.h (CheckSegment, CheckNodeName): no tool
+# runs those checks on a bare name before its package exists.
+# new_subsystem_test parses the header and fails when the two differ; the
+# launcher re-checks every name at --describe-only.
 MAX_SEGMENT_BYTES = 24
 MAX_TOPIC_BYTES = 31
 RESERVED_OWNERS = {"hw", "talos", "sim", "replay", "test"}
@@ -73,6 +82,19 @@ PACKAGE_TARGETS = {"messages", "node", "node_bin", "node_test"}
 LONGEST_LANE = "teleop"
 PERIOD_US = 20000
 MAX_CAN_ID = 62  # 63 is the CAN broadcast id
+MAX_DIO = 31  # talOS/hardware/config.cc: DIO channels 0..31
+# Keys of a subsystem file that the framework reads or refuses
+# (talOS/configuration/config_parser.h: kFrameworkSubsystemKeys and
+# CheckSubsystemKeys' singular spellings), and its [subsystem] header. A
+# position mechanism's parameter table is [<name>], so <name> cannot be one.
+# new_subsystem_test parses the header and fails when the two differ.
+SUBSYSTEM_FILE_KEYS = {
+    "subsystem", "node", "critical", "period_us", "remap", "targets", "teleop",
+    "motors", "sensors", "encoders", "digital_inputs", "digital_outputs",
+    "analog_inputs", "pwm_outputs", "trajectories", "target", "motor",
+    "sensor", "encoder", "digital_input", "digital_output", "analog_input",
+    "pwm_output", "trajectory",
+}
 
 
 class Refused(Exception):
@@ -115,6 +137,17 @@ def check_name(name):
                 "it becomes a namespace and a Python package")
     if name in PACKAGE_TARGETS:
         return f"{quoted} collides with a target the package BUILD declares"
+    return None
+
+
+def check_kind(name, lang, kind):
+    """Why `name` cannot name a subsystem of this language and kind, or
+    None. Both languages' position nodes take the same [<name>] table."""
+    del lang
+    if kind == "position" and name in SUBSYSTEM_FILE_KEYS:
+        return (f"node name '{name}' would name the position mechanism's "
+                f"parameter table [{name}], which the subsystem file "
+                "reserves")
     return None
 
 
@@ -177,12 +210,21 @@ struct @PASCAL@Target {
   position_rot:double;
 }
 
-// What the @NAME@ is doing, published every tick.
+// Whether positions count from the home switch yet: HOMING until the switch
+// zeroes the motor (it drives toward the switch only with a live target);
+// FAILED once homing timed out or stalled, or the switch read closed well
+// away from the zero (neutral until the Driver Station reports disabled).
+enum @PASCAL@Homing : ubyte { HOMING, HOMED, FAILED }
+
+// What the @NAME@ is doing, published every tick. enabled: it drove the motor
+// this tick (homing or Motion Magic). position_rot counts from the home
+// switch once HOMED; before that it is the motor's unhomed position.
 struct @PASCAL@State {
   enabled:bool;
   position_rot:double;
   connected:bool;
   at_goal:bool;
+  homing:@PASCAL@Homing;
 }
 """
 
@@ -240,6 +282,7 @@ cc_test(
     deps = [
         ":@NAME@",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
@@ -295,43 +338,60 @@ class @PASCAL@ {
 CC_POSITION_HEADER = """\
 #pragma once
 
-#include <cmath>
-
 @INCLUDES@
 
 namespace @NAME@ {
 
-// Drives the motor to the position its target asks for with Motion Magic
-// and reports what it did on /@NAME@/state. Producers write lanes
-// /@NAME@/target/<source> with talos::TargetLane; the policy comes from
-// [robot.targets] or the subsystem's [targets].
+// Drives the mechanism to the position its target asks for and reports
+// what it did on /@NAME@/state. Producers write lanes
+// /@NAME@/target/<source> with talos::TargetLane; the
+// policy comes from [robot.targets] or the subsystem's [targets].
+//
+// The control is a talos::mechanisms::PositionMechanism, configured by the
+// subsystem file: the motor [motors.@NAME@] and the
+// parameter table [@NAME@] (keys and units in
+// talOS/mechanisms/README.md). It runs Motion Magic to the goal, clamped to
+// min_rot..max_rot, and homes on the switch @NAME@_home:
+// positions count from that switch, not from where the motor powered on.
+// Until the switch has zeroed the motor, and again after a motor reset or a
+// RoboRIO reboot drops that zero, a live goal drives toward the switch at
+// homing_v instead. A homing timeout, a homing push that does not move, or
+// the switch reading closed well into the travel (stuck) latches FAILED,
+// neutral, until the Driver Station reports disabled.
 class @PASCAL@ {
  public:
   using Target = @PASCAL@Target;
   using State = @PASCAL@State;
+  using Homing = @PASCAL@Homing;
 
   explicit @PASCAL@(talos::Node& node)
-      : motor_{node, "@NAME@_motor"},
-        tolerance_rot_{node.param<double>("tolerance_rot", 0.05)},
+      : mechanism_{node, "@NAME@"},
         target_{node},
         state_{node.publish<State>(topics::kState)} {}
 
   void update() {
-    const Target* t = target_.get();  // null: disabled, stale or released
-    const bool drive =
-        t != nullptr && motor_.connected() && std::isfinite(t->position_rot());
-    const double pos = motor_.position();
-    bool at_goal = false;
-    if (drive) {
-      motor_.set_motion_magic(t->position_rot());
-      at_goal = std::abs(pos - t->position_rot()) <= tolerance_rot_;
+    // The mechanism drives only on this tick's request. Without a live
+    // target (disabled, stale, released, another mode's lane) stop(): the
+    // motor goes neutral rather than holding an old goal.
+    if (const Target* t = target_.get()) {
+      mechanism_.set_goal(t->position_rot());  // homes first; NaN: neutral
+    } else {
+      mechanism_.stop();
     }
-    state_.send(State{drive, pos, motor_.connected(), at_goal});
+    mechanism_.update();
+    state_.send(State{mechanism_.driving(), mechanism_.position_rot(),
+                      mechanism_.connected(), mechanism_.at_goal(),
+                      HomingState()});
   }
 
  private:
-  talos::Motor motor_;
-  double tolerance_rot_;
+  Homing HomingState() const {
+    using Phase = talos::mechanisms::PositionPhase;
+    if (mechanism_.phase() == Phase::kFaulted) return Homing::FAILED;
+    return mechanism_.homed() ? Homing::HOMED : Homing::HOMING;
+  }
+
+  talos::mechanisms::PositionMechanism mechanism_;
   talos::Target<Target> target_;
   talos::Publisher<State> state_;
 };
@@ -351,6 +411,7 @@ CC_TEST = """\
 #include <sys/wait.h>
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
@@ -365,6 +426,8 @@ namespace {
 
 using namespace std::chrono_literals;
 using talos::hardware::Mode;
+using talos::testing::AllocationProbe;
+using talos::testing::DriverStationGeneration;
 using talos::testing::DsPacket;
 using talos::testing::PublishTarget;
 using talos::testing::ReleaseTarget;
@@ -385,6 +448,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// The node test matrix, docs/TESTING.md §7: the case names are the matrix's,
+// which //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
  protected:
   using Target = @PASCAL@::Target;
@@ -396,15 +461,21 @@ class @PASCAL@Test : public ::testing::Test {
     hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
     sim.step(10ms);  // the mode is current before any lane arrives
   }
-  // Holds the teleop lane the way a producer does: republished every 20 ms.
-  void Hold(double demand, std::chrono::milliseconds duration) {
+  // Holds a lane the way a producer does: republished every 20 ms.
+  void Hold(double demand, std::chrono::milliseconds duration,
+            const char* source = "teleop") {
     for (auto t = 0ms; t < duration; t += 20ms) {
-      PublishTarget(sim, "@NAME@", "teleop", Target{demand});
+      PublishTarget(sim, "@NAME@", source, Target{demand});
       sim.step(20ms);
     }
   }
+  // What the node asked for (the flush sends neutral for an unset motor).
   Mode Request() const {
     return hw.motor_request("@NAME@", "@NAME@_motor").mode;
+  }
+  // What the gateway applies, after its enable and expiry gates.
+  Mode Applied() const {
+    return hw.applied_motor("@NAME@", "@NAME@_motor").mode;
   }
   State Latest() const {
     const auto state = sim.latest<State>(topics::kState);
@@ -417,12 +488,13 @@ class @PASCAL@Test : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(@PASCAL@Test, DrivesTheMotorAtALiveLane) {
+// REQ-SAFE-07
+TEST_F(@PASCAL@Test, DrivesAtALiveLane) {
   hw.ideal_motors();
   Teleop();
   Hold(30.0, 60ms);
 
-  const auto request = hw.motor_request("@NAME@", "@NAME@_motor");
+  const auto request = hw.applied_motor("@NAME@", "@NAME@_motor");
   EXPECT_EQ(request.mode, Mode::kVelocity);
   EXPECT_DOUBLE_EQ(request.demand, 30.0);
   const State state = Latest();
@@ -431,15 +503,18 @@ TEST_F(@PASCAL@Test, DrivesTheMotorAtALiveLane) {
   EXPECT_TRUE(state.connected());
 }
 
+// REQ-SAFE-02
 TEST_F(@PASCAL@Test, DisabledRobotGoesNeutral) {
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
   hw.enable(false);
   sim.step(10ms);
   Hold(30.0, 60ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
-  EXPECT_FALSE(Latest().enabled());
+  EXPECT_EQ(Applied(), Mode::kNeutral);
+  EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -447,9 +522,11 @@ TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
 
   sim.step(150ms);  // past command_timeout_us: the lane is stale
   EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Applied(), Mode::kNeutral);
   EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -460,6 +537,7 @@ TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
   EXPECT_EQ(Request(), Mode::kNeutral);
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
@@ -467,6 +545,7 @@ TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
+// REQ-SAFE-07
 TEST_F(@PASCAL@Test, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -477,11 +556,89 @@ TEST_F(@PASCAL@Test, DriverStationLossGoesNeutral) {
   EXPECT_EQ(Request(), Mode::kNeutral);
 }
 
+// REQ-CONTRACT-25
+TEST_F(@PASCAL@Test, DisconnectedFeedbackGoesNeutral) {
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Request(), Mode::kVelocity);
+
+  hw.set_connected("@NAME@", "@NAME@_motor", false);
+  Hold(30.0, 40ms);
+  // The neighbor's motor keeps the robot enabled (testdata/robot.toml), so
+  // the node's own feedback gate is what stops it.
+  ASSERT_TRUE(talos::robot_enabled(sim.node("@NAME@")));
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  const State state = Latest();
+  EXPECT_FALSE(state.connected());
+  EXPECT_FALSE(state.enabled());
+}
+
+// REQ-SAFE-04
 TEST_F(@PASCAL@Test, NonFiniteDemandGoesNeutral) {
   Teleop();
   Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
   EXPECT_EQ(Request(), Mode::kNeutral);
   EXPECT_FALSE(Latest().enabled());
+}
+
+// matrix: n/a 9 (the @NAME@ reads no parameters)
+
+// REQ-SAFE-07
+TEST_F(@PASCAL@Test, OtherModesLaneIsIgnored) {
+  Teleop();
+  Hold(30.0, 40ms, "auto");  // autonomous's lane, live, in teleop
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  ReleaseTarget<Target>(sim, "@NAME@", "auto");
+
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kAutonomous));
+  sim.step(10ms);
+  Hold(30.0, 40ms);  // teleop's lane, live, in autonomous
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  Hold(20.0, 40ms, "auto");
+  const auto request = hw.motor_request("@NAME@", "@NAME@_motor");
+  EXPECT_EQ(request.mode, Mode::kVelocity);
+  EXPECT_DOUBLE_EQ(request.demand, 20.0);
+}
+
+// REQ-SAFE-09
+TEST_F(@PASCAL@Test, EarlierGenerationTargetIsIgnored) {
+  Teleop();
+  Hold(30.0, 40ms);
+  ASSERT_EQ(Request(), Mode::kVelocity);
+  const std::uint64_t before = DriverStationGeneration(sim);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  // Re-enabled. SimHardware publishes the packet at its next 20 ms hook,
+  // which the Sim runs after the node's tick at that instant, so the packet
+  // waits for the node's next drain; a target its producer queued under the
+  // earlier enable, published before that drain, arrives in the same one.
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(20ms);
+  ASSERT_NE(DriverStationGeneration(sim), before);
+  PublishTarget(sim, "@NAME@", "teleop", Target{30.0}, before);
+  sim.step(20ms);
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  // The same target stamped with the current generation drives at once.
+  PublishTarget(sim, "@NAME@", "teleop", Target{30.0});
+  sim.step(20ms);
+  EXPECT_EQ(Request(), Mode::kVelocity);
+}
+
+// REQ-RT-06: the steady-state tick (target read, request, flush, state
+// publish) allocates nothing. The target is published before the window and
+// stays fresh through it (60 ms < command_timeout_us).
+TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  Teleop();
+  Hold(30.0, 40ms);
+  PublishTarget(sim, "@NAME@", "teleop", Target{30.0});
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Request(), Mode::kVelocity);
 }
 
 struct Result {
@@ -521,8 +678,87 @@ TEST(@PASCAL@Binary, LoggedSimRunReplaysWithoutDivergence) {
 }  // namespace @NAME@
 """
 
+# Inserted into CC_TEST for a position mechanism: its fixture starts on the
+# home switch, and the homing tests start off it.
+CC_POSITION_FIXTURE = """\
+  SimHardware hw{sim};
+
+  // Starts on its home switch, so the motor zeroes without moving.
+  @PASCAL@Test() { SetHome(true); }
+  // Normally open to ground behind the input's pull-up: closed reads false.
+  void SetHome(bool closed) {
+    hw.set_digital_input("@NAME@", "@NAME@_home", !closed);
+  }
+  // Powered on off the switch, unzeroed, and moving when pushed.
+  void StartOffHome() {
+    SetHome(false);
+    hw.set_motor("@NAME@", "@NAME@", 0.0, -1.0);
+  }
+};
+"""
+
+# Replaces CC_TEST's case 9 for a position mechanism.
+CC_POSITION_PARAMETERS = """\
+// matrix: n/a 9 (PositionMechanism's parameters, tested in talOS/mechanisms)
+"""
+
+# The node's own logic over the mechanism: the config homes it, and the
+# mechanism's phase reaches /@NAME@/state. The homing rules themselves are
+# talOS/mechanisms' and tested there.
+CC_POSITION_TESTS = """\
+// Homing. The values are testdata/@NAME@.toml's.
+constexpr double kHomingVolts = -1.0;
+constexpr double kMaxRot = 100.0;
+
+// REQ-SAFE-36
+TEST_F(@PASCAL@Test, HomesBeforeTheFirstGoal) {
+  StartOffHome();
+  hw.ideal_motors();
+  Teleop();
+  Hold(30.0, 60ms);  // toward the switch, not to 30 in the power-on frame
+  auto request = hw.motor_request("@NAME@", "@NAME@");
+  EXPECT_EQ(request.mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(request.demand, kHomingVolts);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::HOMING);
+
+  // The switch closes 0.5 rotations below where the motor powered on: that
+  // is position 0, and targets go out in that frame, clamped to the travel.
+  hw.set_motor("@NAME@", "@NAME@", -0.5, 0.0);
+  // It zeroes after home_samples (3) consecutive closed readings.
+  SetHome(true);
+  Hold(30.0, 60ms);
+  SetHome(false);  // the motor leaves the switch
+  Hold(30.0, 20ms);
+  request = hw.motor_request("@NAME@", "@NAME@");
+  EXPECT_EQ(request.mode, Mode::kMotionMagic);
+  EXPECT_DOUBLE_EQ(request.demand, 30.0 - 0.5);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::HOMED);
+  Hold(1000.0, 40ms);
+  request = hw.motor_request("@NAME@", "@NAME@");
+  EXPECT_DOUBLE_EQ(request.demand, kMaxRot - 0.5);
+  Hold(-5.0, 40ms);
+  request = hw.motor_request("@NAME@", "@NAME@");
+  EXPECT_DOUBLE_EQ(request.demand, -0.5);  // position 0
+}
+
+// REQ-SAFE-36
+TEST_F(@PASCAL@Test, HomingThatDoesNotMoveFails) {
+  SetHome(false);  // velocity stays 0
+  Teleop();
+  Hold(30.0, 100ms);
+  ASSERT_EQ(Request(), Mode::kVoltage);
+  Hold(30.0, 200ms);  // past homing_stall_us (200 ms)
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
+}
+
+"""
+
 CC_TESTDATA_ROBOT = """\
 # Local @NAME@ fixture. Device IDs are assigned by the normal parser.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "@NAME@_test"
 period_us = @PERIOD@
@@ -533,6 +769,22 @@ commissioned = false
 [[subsystems]]
 name = "@NAME@"
 path = "@NAME@.toml"
+
+[[subsystems]]
+name = "@NEIGHBOR@"
+path = "@NEIGHBOR@.toml"
+"""
+
+# Another subsystem's motor, which a test never disconnects.
+CC_TESTDATA_NEIGHBOR = """\
+[subsystem]
+name = "@NEIGHBOR@"
+period_us = @PERIOD@
+
+[motors.wheel]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
 """
 
 CC_TESTDATA_SUBSYSTEM = """\
@@ -545,6 +797,34 @@ type = "TalonFX"
 bus = "rio"
 can_id = 1
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+"""
+
+CC_POSITION_TESTDATA_SUBSYSTEM = """\
+[subsystem]
+name = "@NAME@"
+period_us = @PERIOD@
+
+[@NAME@]
+tolerance_rot = 0.05
+min_rot = 0.0
+max_rot = 100.0
+homing = "limit_switch"
+limit_switch = "@NAME@_home"
+homing_v = -1.0
+homing_timeout_us = 500000
+homing_stall_rps = 0.1
+homing_stall_us = 200000
+home_margin_rot = 0.5
+
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+position_frame = "rezero"
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[digital_inputs.@NAME@_home]
+dio = 0
 """
 
 PY_BUILD = """\
@@ -567,6 +847,11 @@ py_test(
     data = @DATA@,
     env = {"NODE_BINARY": "$(rlocationpath :node)"},
     legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
     deps = [
         ":messages_py",
         "//talOS/python:testing",
@@ -615,42 +900,63 @@ class @PASCAL@:
 '''
 
 PY_POSITION_NODE = '''\
-"""@PASCAL@: one motor driven to the position its target asks for.
+"""@PASCAL@: drives the mechanism to the position its target asks for.
 
-Producers write lanes /@NAME@/target/<source> with talos.TargetLane; the
-policy comes from [robot.targets] or the subsystem's [targets].
+Reports what it did on /@NAME@/state. Producers write lanes
+/@NAME@/target/<source> with talos.TargetLane; the policy comes from
+[robot.targets] or the subsystem's [targets].
+
+The control is a talos.mechanisms.PositionMechanism (the C++
+talos::mechanisms::PositionMechanism), configured by the subsystem file: the
+motor [motors.@NAME@] and the parameter table [@NAME@] (keys and units in
+talOS/mechanisms/README.md). It runs Motion Magic to the goal, clamped to
+min_rot..max_rot, and homes on the switch @NAME@_home: positions count from
+that switch, not from where the motor powered on. Until the switch has
+zeroed the motor, and again after a motor reset or a RoboRIO reboot drops
+that zero, a live goal drives toward the switch at homing_v instead. A
+homing timeout, a homing push that does not move, or the switch reading
+closed well into the travel (stuck) latches FAILED, neutral, until the
+Driver Station reports disabled.
 """
 
-import math
-
 import talos
-from @NAME@ import topics
-from @NAME@.@PASCAL@State import @PASCAL@State
-from @NAME@.@PASCAL@Target import @PASCAL@Target
+@FROM_IMPORTS@
 
 
 class @PASCAL@:
     def __init__(self, node):
-        self.motor = talos.Motor(node, "@NAME@_motor")
-        self.tolerance_rot = node.param("tolerance_rot", 0.05)
+        self.mechanism = PositionMechanism(node, "@NAME@")
         self.target = talos.Target(node, @PASCAL@Target)
         self.state = node.publish(@PASCAL@State, topics.STATE)
 
     def update(self):
-        t = self.target.get()  # None: disabled, stale or released
-        drive = (t is not None and self.motor.connected
-                 and math.isfinite(t.position_rot))
-        pos = self.motor.position
-        at_goal = False
-        if drive:
-            self.motor.set_motion_magic(t.position_rot)
-            at_goal = abs(pos - t.position_rot) <= self.tolerance_rot
-        self.state.send(enabled=drive, position_rot=pos,
-                        connected=self.motor.connected, at_goal=at_goal)
+        # The mechanism drives only on this tick's request. Without a live
+        # target (disabled, stale, released, another mode's lane) stop(): the
+        # motor goes neutral rather than holding an old goal.
+        t = self.target.get()
+        if t is not None:
+            self.mechanism.set_goal(t.position_rot)  # homes first
+        else:
+            self.mechanism.stop()
+        self.mechanism.update()
+        m = self.mechanism
+        if m.phase == PositionPhase.FAULTED:
+            homing = @PASCAL@Homing.FAILED
+        elif m.homed:
+            homing = @PASCAL@Homing.HOMED
+        else:
+            homing = @PASCAL@Homing.HOMING
+        self.state.send(enabled=m.driving, position_rot=m.position_rot,
+                        connected=m.connected, at_goal=m.at_goal,
+                        homing=homing)
 '''
 
 PY_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary."""
+"""Node tests: the class on talos.testing.Sim, and the binary.
+
+@PASCAL@Test is the node test matrix, docs/TESTING.md §7: the case names are
+the matrix's, which //tools:check_node_matrix looks for.
+"""
 
 import os
 import subprocess
@@ -679,23 +985,36 @@ class @PASCAL@Test(unittest.TestCase):
         self.hw.set_driver_station(enabled=True, teleop=True)
         self.sim.step(0.01)
 
-    def hold(self, demand, seconds):
-        """Republishes the teleop lane every 20 ms, as a producer does."""
+    def send(self, demand, source="teleop", mode_since_us=None):
+        """One target on a lane, stamped like a producer that has drained
+        the newest Driver Station packet, or with `mode_since_us`."""
+        self.sim.publish_target(@PASCAL@Target, "@NAME@", source,
+                                mode_since_us=mode_since_us,
+                                velocity_rps=demand)
+
+    def hold(self, demand, seconds, source="teleop"):
+        """Republishes a lane every 20 ms, as a producer does."""
         for _ in range(round(seconds / 0.02)):
-            self.sim.publish_target(@PASCAL@Target, "@NAME@", "teleop",
-                                    velocity_rps=demand)
+            self.send(demand, source)
             self.sim.step(0.02)
 
     def mode(self):
+        """What the node asked for (the flush sends neutral for an unset
+        motor)."""
         return self.hw.motor_request("@NAME@", "@NAME@_motor").mode
+
+    def applied(self):
+        """What the gateway applies, after its enable and expiry gates."""
+        return self.hw.applied_motor("@NAME@", "@NAME@_motor").mode
 
     def state(self):
         return self.sim.latest(@PASCAL@State, topics.STATE)
 
-    def test_live_lane_drives_the_motor(self):
+    # REQ-SAFE-07
+    def test_drives_at_a_live_lane(self):
         self.teleop()
         self.hold(30.0, 0.06)
-        request = self.hw.motor_request("@NAME@", "@NAME@_motor")
+        request = self.hw.applied_motor("@NAME@", "@NAME@_motor")
         self.assertEqual(request.mode, talos.Mode.VELOCITY)
         self.assertEqual(request.demand, 30.0)
         state = self.state()
@@ -703,21 +1022,26 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertEqual(state.velocity_rps, 12.5)
         self.assertTrue(state.connected)
 
-    def test_disabled_robot_sends_neutral(self):
+    # REQ-SAFE-02
+    def test_disabled_robot_goes_neutral(self):
         self.teleop(enabled=False)
         self.hold(30.0, 0.06)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
-        self.assertFalse(self.state().enabled)
+        self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
+        self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    def test_stale_lane_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_stale_lane_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
         self.sim.step(0.15)  # past command_timeout_us
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    def test_released_lane_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_released_lane_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
@@ -725,13 +1049,15 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim.step(0.04)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
 
-    def test_never_sent_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_never_sent_goes_neutral(self):
         self.teleop()
         self.sim.step(0.06)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
 
-    def test_driver_station_loss_sends_neutral(self):
+    # REQ-SAFE-07
+    def test_driver_station_loss_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
@@ -739,11 +1065,70 @@ class @PASCAL@Test(unittest.TestCase):
         self.hold(30.0, 0.16)  # past command_timeout_us: the DS is stale
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
 
-    def test_non_finite_demand_sends_neutral(self):
+    # REQ-CONTRACT-25
+    def test_disconnected_feedback_goes_neutral(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        self.hw.set_connected("@NAME@", "@NAME@_motor", False)
+        self.hold(30.0, 0.04)
+        # The neighbor's motor keeps the robot enabled (testdata/robot.toml),
+        # so the node's own feedback gate is what stops it.
+        self.assertTrue(talos.robot_enabled(self.sim.node("@NAME@")))
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        state = self.state()
+        self.assertFalse(state.connected)
+        self.assertFalse(state.enabled)
+
+    # REQ-SAFE-04
+    def test_non_finite_demand_goes_neutral(self):
         self.teleop()
         self.hold(float("nan"), 0.04)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
+
+    # matrix: n/a 9 (the @NAME@ reads no parameters)
+
+    # REQ-SAFE-07
+    def test_other_modes_lane_is_ignored(self):
+        self.teleop()
+        self.hold(30.0, 0.04, source="auto")  # autonomous's lane, in teleop
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.sim.release_target(@PASCAL@Target, "@NAME@", "auto")
+        self.hw.set_driver_station(enabled=True, autonomous=True)
+        self.sim.step(0.02)
+        self.hold(30.0, 0.04)  # teleop's lane, live, in autonomous
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.hold(20.0, 0.04, source="auto")
+        request = self.hw.motor_request("@NAME@", "@NAME@_motor")
+        self.assertEqual(request.mode, talos.Mode.VELOCITY)
+        self.assertEqual(request.demand, 20.0)
+
+    # REQ-SAFE-09
+    def test_earlier_generation_target_is_ignored(self):
+        self.teleop()
+        self.hold(30.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+        before = self.sim.driver_station_generation
+        self.hw.set_driver_station(teleop=True)  # disabled
+        self.sim.step(0.04)
+        # Re-enabled. SimHardware publishes the packet at its next 20 ms hook,
+        # which the Sim runs after the node's tick at that instant, so the
+        # packet waits for the node's next drain; a target its producer
+        # queued under the earlier enable, published before that drain,
+        # arrives in the same one.
+        self.hw.set_driver_station(enabled=True, teleop=True)
+        self.sim.step(0.02)
+        self.assertNotEqual(self.sim.driver_station_generation, before)
+        self.send(30.0, mode_since_us=before)
+        self.sim.step(0.02)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        # The same target stamped with the current generation drives at once.
+        self.send(30.0)
+        self.sim.step(0.02)
+        self.assertEqual(self.mode(), talos.Mode.VELOCITY)
+
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
 class BinaryTest(unittest.TestCase):
@@ -770,8 +1155,107 @@ if __name__ == "__main__":
     unittest.main()
 '''
 
+# Replaces PY_TEST's case 9 for a position mechanism.
+PY_POSITION_PARAMETERS = '''\
+    # matrix: n/a 9 (PositionMechanism parameters, tested in talOS/mechanisms)
+'''
+
+# Inserted into PY_TEST for a position mechanism before BinaryTest: the
+# node's own logic over the mechanism (the config homes it, and the
+# mechanism's phase reaches /@NAME@/state). The homing rules themselves are
+# talOS/mechanisms' and tested there.
+PY_POSITION_TESTS = '''
+    # Homing. The values are testdata/robot.toml's (homing_v = -1.0,
+    # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor
+    # at rest.
+
+    def set_home(self, closed):
+        """Normally open to ground behind the input's pull-up: closed reads
+        False."""
+        self.hw.set_digital_input("@NAME@", "@NAME@_home", not closed)
+
+    # REQ-SAFE-36
+    def test_homes_before_the_first_goal(self):
+        self.set_home(False)
+        self.hw.ideal_motors()
+        self.teleop()
+        self.hold(30.0, 0.06)  # toward the switch, not to 30 unhomed
+        request = self.hw.motor_request("@NAME@", "@NAME@")
+        self.assertEqual(request[:2], (talos.Mode.VOLTAGE, -1.0))
+        self.assertEqual(self.state().homing, @PASCAL@Homing.HOMING)
+
+        # The switch closes 0.5 rotations below the power-on position: that
+        # is 0, and targets go out in that frame, clamped to the travel.
+        self.hw.set_motor("@NAME@", "@NAME@", -0.5, 0.0)
+        self.set_home(True)
+        self.hold(30.0, 0.06)  # home_samples (3) consecutive closed readings
+        self.set_home(False)  # the motor leaves the switch
+        self.hold(30.0, 0.02)
+        request = self.hw.motor_request("@NAME@", "@NAME@")
+        self.assertEqual(request[:2], (talos.Mode.MOTION_MAGIC, 29.5))
+        self.assertEqual(self.state().homing, @PASCAL@Homing.HOMED)
+        self.hold(1000.0, 0.04)
+        self.assertEqual(
+            self.hw.motor_request("@NAME@", "@NAME@").demand, 99.5)
+        self.hold(-5.0, 0.04)  # position 0
+        self.assertEqual(
+            self.hw.motor_request("@NAME@", "@NAME@").demand, -0.5)
+
+    # REQ-SAFE-36
+    def test_homing_that_does_not_move_fails(self):
+        self.set_home(False)
+        self.hw.set_motor("@NAME@", "@NAME@", 0.0, 0.0)
+        self.teleop()
+        self.hold(30.0, 0.1)
+        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
+        self.hold(30.0, 0.2)  # past homing_stall_us
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+'''
+
+PY_POSITION_TESTDATA_ROBOT = """\
+# @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
+[robot]
+name = "@NAME@_test"
+period_us = @PERIOD@
+command_timeout_us = 100000
+
+[subsystems.@NAME@.@NAME@]
+tolerance_rot = 0.05
+min_rot = 0.0
+max_rot = 100.0
+homing = "limit_switch"
+limit_switch = "@NAME@_home"
+homing_v = -1.0
+homing_timeout_us = 500000
+homing_stall_rps = 0.1
+homing_stall_us = 200000
+home_margin_rot = 0.5
+
+[subsystems.@NAME@.motors.@NAME@]
+type = "TalonFX"
+bus = "test"
+can_id = 1
+position_frame = "rezero"
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[subsystems.@NAME@.digital_inputs.@NAME@_home]
+dio = 0
+
+[subsystems.@NEIGHBOR@.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2
+"""
+
 PY_TESTDATA_ROBOT = """\
-# @PASCAL@ test robot: one subsystem, one motor.
+# @PASCAL@ test robot: one motor, and a neighbor.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "@NAME@_test"
 period_us = @PERIOD@
@@ -782,6 +1266,11 @@ type = "TalonFX"
 bus = "test"
 can_id = 1
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[subsystems.@NEIGHBOR@.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2
 """
 
 SUBSYSTEM_TOML = """\
@@ -796,7 +1285,9 @@ period_us = @PERIOD@
 
 # Zero-code robot wiring: uncomment to have the teleop node write a
 # Driver Station button on the /@NAME@/target/teleop lane, without editing any
-# C++ or Python files in other packages.
+# C++ or Python files in other packages. Only once slot0 is tuned on the
+# mechanism: every config of this robot reads this file. A simulation-only
+# binding goes in the simulation-only config new_subsystem's `Next:` names.
 # [[teleop.bindings]]
 # button = 3
 # while_held = { velocity_rps = 20.0 }
@@ -831,6 +1322,118 @@ max_velocity_rps = 100.0
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 """
 
+POSITION_SUBSYSTEM_TOML = """\
+# @PASCAL@ subsystem, generated by //tools:new_subsystem. Parsed via the
+# [[subsystems]] manifest in @ROBOT@/main_processor/configuration/robot.toml
+# and merged with the other subsystem files into one canonical view before
+# validation.
+[subsystem]
+name = "@NAME@"
+node = "//@PACKAGE@:node"
+period_us = @PERIOD@
+
+# The @NAME@'s talos::mechanisms::PositionMechanism parameters (keys and
+# units: talOS/mechanisms/README.md).
+[@NAME@]
+# /@NAME@/state reports at_goal while the motor is within this of its target.
+tolerance_rot = 0.05
+# Travel, in rotations from the home switch: targets clamp to
+# min_rot..max_rot. PLACEHOLDER: this confines every target to within 0.001
+# rotations of the switch until a human measures the travel. Nothing stops
+# the mechanism past the top but this clamp; see "Overtravel" below.
+min_rot = 0.0
+max_rot = 0.001
+# Homing drives at homing_v volts (negative: toward the switch at min_rot)
+# while unzeroed and a target is live. It gives up, neutral, after
+# homing_timeout_us, or once the motor has moved slower than homing_stall_rps
+# for homing_stall_us. PLACEHOLDER: check the direction (`inverted`) before
+# the first enable, then set a timeout a little longer than the slowest
+# full-travel move at that voltage.
+homing = "limit_switch"
+limit_switch = "@NAME@_home"
+homing_v = -0.5
+homing_timeout_us = 3000000
+homing_stall_rps = 0.05
+homing_stall_us = 500000
+# The switch reading closed with the zeroed motor more than this from it is a
+# stuck or miswired switch: the @NAME@ stops, neutral.
+home_margin_rot = 0.5
+# The switch zeroes the motor only after reading closed on this many
+# consecutive ticks, so one glitched sample mid-travel does not.
+home_samples = 3
+
+# Zero-code robot wiring: uncomment to have the teleop node write a
+# Driver Station button on the /@NAME@/target/teleop lane, without editing any
+# C++ or Python files in other packages. Only once slot0 is tuned on the
+# mechanism: every config of this robot reads this file. A simulation-only
+# binding goes in the simulation-only config new_subsystem's `Next:` names.
+# [[teleop.bindings]]
+# button = 3
+# while_held = { position_rot = 0.0 }
+
+# Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
+# mode, highest priority first. Without this table [robot.targets] applies
+# (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
+# [targets]
+# teleop = ["teleop"]
+# autonomous = ["auto"]
+
+# Device names are robot-wide, so the motor is named after the subsystem.
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+# PLACEHOLDER: the lowest id the robot config does not use yet, not the
+# motor's.
+# Replace it with the physical CAN id before the robot drives this motor.
+can_id = @CAN_ID@
+# Flip `inverted` if a positive position moves the mechanism the wrong way;
+# `brake` resists motion while no target drives it, coast lets it move freely.
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+# homing_v may be at most half of this.
+max_voltage = 12.0
+# Sensor rotations per mechanism rotation: positions, the profile and the
+# travel above are in mechanism rotations.
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+# The Motion Magic profile every move follows (cruise at most
+# max_velocity_rps); raise it once the mechanism is tuned.
+cruise_velocity_rps = 1.0
+acceleration_rps2 = 2.0
+# Positions count from the home switch, not from where the motor powered on:
+# Motion Magic goals go out neutral until the switch zeroes the motor and it
+# has come to rest, and again after a motor reset or RoboRIO reboot drops that zero. Only a remote
+# CANcoder's frame may be "absolute" (usable unzeroed, surviving a reset).
+position_frame = "rezero"
+# No hardware soft limits: the TalonFX applies them to its power-on position
+# in every control mode, so after a reset partway along the travel they sit
+# in the wrong place and can stop homing; config load refuses them unless
+# position_frame = "absolute". max_rot bounds targets.
+# Overtravel: that clamp is the only top-of-travel protection in software. At
+# the robot, wire a forward limit switch to the TalonFX's own limit input,
+# which stops forward output in every control mode whatever the frame, and
+# set forward_limit_switch = "NormallyOpen" (Phoenix's default) or
+# "NormallyClosed" to match it. talOS cannot move soft-limit thresholds after
+# a rezero.
+soft_limits = false
+# Position gains (slot 0). ALL ZERO means UNTUNED: the motor will not follow
+# its target. Tune g to hold the mechanism against gravity (add
+# gravity_type = "Arm" for a pivot), s to break static friction, v and a
+# until it tracks the profile, then p until it settles within tolerance_rot.
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+# The home switch at the reverse end of travel (position 0): normally open,
+# between the DIO signal pin and ground, so the input's pull-up reads true off
+# the switch and false on it. A cut or unplugged wire reads "not home": homing
+# then times out or stalls instead of zeroing mid-travel. PLACEHOLDER: the
+# lowest DIO channel the robot config does not use yet, not the switch's.
+# Replace it with the physical channel.
+[digital_inputs.@NAME@_home]
+dio = @DIO@
+"""
+
 MANIFEST_ENTRY = """\
 
 [[subsystems]]
@@ -839,7 +1442,10 @@ path = "subsystems/@NAME@.toml"
 """
 
 STANDALONE_MODULE = """\
-module(name = "@NAME@", version = "0.1.0")
+module(
+    name = "@NAME@",
+    version = "0.1.0",
+)
 
 bazel_dep(name = "talos", version = "0.1.0")
 @EXTRA_DEPS@"""
@@ -866,6 +1472,53 @@ max_velocity_rps = 100.0
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 """
 
+STANDALONE_POSITION_DEFAULTS_TOML = """\
+# @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
+# The robot's own subsystem file starts as a copy of this one, with the
+# motor's physical can_id and the home switch's dio added; inversions, the
+# measured travel (max_rot), the homing voltage and tuned slot0 gains go
+# there. Until then the travel confines every target to within 0.001
+# rotations of the home switch. The motor requires a zero from the home switch
+# (normally open, to ground) and has no hardware soft limits; see the node's
+# header comment and talOS/mechanisms/README.md for the [@NAME@] keys.
+[subsystem]
+name = "@NAME@"
+node = "@@NAME@//:node"
+period_us = @PERIOD@
+
+[@NAME@]
+tolerance_rot = 0.05
+min_rot = 0.0
+max_rot = 0.001
+homing = "limit_switch"
+limit_switch = "@NAME@_home"
+homing_v = -0.5
+homing_timeout_us = 3000000
+homing_stall_rps = 0.05
+homing_stall_us = 500000
+home_margin_rot = 0.5
+home_samples = 3
+
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 1.0
+acceleration_rps2 = 2.0
+position_frame = "rezero"
+soft_limits = false
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+# The home switch, normally open to ground; the robot's file adds its dio.
+[digital_inputs.@NAME@_home]
+"""
+
 # ---------------------------------------------------- estimator archetype
 
 ESTIMATOR_MESSAGES_BUILD = """\
@@ -887,20 +1540,28 @@ talos_messages(
 ESTIMATOR_DOC = """\
 Reads geometry.PoseObservation from each camera node listed in `cameras`
 (/<camera>/state) and publishes geometry.PoseEstimate on its own state
-topic every tick. As generated it follows the newest usable observation
-(the most certain one when several arrive in one tick) and is valid while
-one arrived within observation_timeout_us; fuse odometry here (see
-2026-robot/main_processor/pose_estimator, which runs wpimath's
+topic every tick. Each camera is read through a callback subscription,
+which delivers every observation in sequence (a latest-value read would lose
+all but the newest per tick); the callback queues at most 64 per camera (the
+oldest is dropped and counted as rejected) and update() checks every queued
+one. Only update() reads the queues, so the callback waits for the drain
+before it (at-drain) instead of waking the node for every frame. As
+generated it follows the most certain usable observation of the tick and is
+valid while one arrived within observation_timeout_us; fuse odometry here
+(see 2026-robot/main_processor/pose_estimator, which runs wpimath's
 SwerveDrive4PoseEstimator or a GTSAM smoother). It drives nothing, so it
 runs whether the robot is enabled or not."""
 
 CC_ESTIMATOR_HEADER = """\
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -914,46 +1575,88 @@ class @PASCAL@ {
  public:
   using State = geometry::PoseEstimate;
   using Observation = geometry::PoseObservation;
+  // Observations queued per camera between two update()s: the framework's
+  // per-topic, per-drain delivery cap, over a second of a 60 fps camera.
+  static constexpr std::size_t kMaxPendingObservations = 64;
+
+  // The camera callbacks capture `this`: the node stays where it was built.
+  @PASCAL@(const @PASCAL@&) = delete;
+  @PASCAL@& operator=(const @PASCAL@&) = delete;
+  @PASCAL@(@PASCAL@&&) = delete;
+  @PASCAL@& operator=(@PASCAL@&&) = delete;
 
   explicit @PASCAL@(talos::Node& node)
       : node_{node},
         timeout_{std::chrono::microseconds{
             node.param<std::int64_t>("observation_timeout_us", 500'000)}},
         state_{node.publish<State>(topics::kState)} {
-    for (const std::string& camera :
-         node.param<std::vector<std::string>>("cameras")) {
-      cameras_.push_back(node.subscribe<Observation>("/" + camera + "/state",
-                                                     {.optional = true}));
+    if (timeout_ <= talos::Duration::zero()) {
+      throw std::invalid_argument(
+          "@NAME@: observation_timeout_us must be positive");
+    }
+    const auto names = node.param<std::vector<std::string>>("cameras");
+    pending_.resize(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      // The callback sees every observation in sequence. Only update() reads
+      // the queue, so kAtDrain delivers them at the drain before update()
+      // instead of waking the node for each camera frame.
+      cameras_.push_back(node.subscribe<Observation>(
+          "/" + names[i] + "/state",
+          [this, i](const Observation& o) { pending_[i].Push(o, rejected_); },
+          talos::Wake::kAtDrain, {.optional = true}));
     }
   }
 
   void update() {
-    const Observation* best = nullptr;
-    for (const auto& camera : cameras_) {
-      if (!camera.updated()) continue;  // each observation counts once
-      const Observation& o = camera.value();
-      if (!Usable(o)) {
-        ++rejected_;
-        continue;
+    std::optional<Observation> best;
+    for (Pending& queue : pending_) {
+      for (std::size_t k = 0; k < queue.count; ++k) {  // each counts once
+        const Observation& o = queue.At(k);
+        if (!Usable(o)) {
+          ++rejected_;
+          continue;
+        }
+        ++accepted_;
+        if (!best.has_value() ||
+            o.x_std_m() + o.y_std_m() < best->x_std_m() + best->y_std_m()) {
+          best = o;
+        }
       }
-      ++accepted_;
-      if (best == nullptr ||
-          o.x_std_m() + o.y_std_m() < best->x_std_m() + best->y_std_m()) {
-        best = &o;
-      }
+      queue.count = 0;
     }
-    if (best != nullptr) {
+    if (best.has_value()) {
       pose_ = best->pose();
       sample_time_ns_ = best->sample_time_ns();
       last_accepted_ = node_.now();
     }
     const bool valid =
         last_accepted_.has_value() && node_.now() - *last_accepted_ <= timeout_;
-    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid,
+    state_.send(State{sample_time_ns_, pose_, geometry::Twist2d{}, valid, false,
                       accepted_, rejected_});
   }
 
  private:
+  // A fixed ring of the newest observations, oldest first: no allocation
+  // after construction.
+  struct Pending {
+    std::array<Observation, kMaxPendingObservations> slots{};
+    std::size_t head = 0;  // index of the oldest
+    std::size_t count = 0;
+
+    const Observation& At(std::size_t k) const {
+      return slots[(head + k) % kMaxPendingObservations];
+    }
+    void Push(const Observation& o, std::uint32_t& rejected) {
+      if (count == kMaxPendingObservations) {  // drop the oldest
+        head = (head + 1) % kMaxPendingObservations;
+        --count;
+        ++rejected;
+      }
+      slots[(head + count) % kMaxPendingObservations] = o;
+      ++count;
+    }
+  };
+
   static bool Usable(const Observation& o) {
     for (const double v : {o.pose().x_m(), o.pose().y_m(), o.pose().yaw_rad(),
                            o.x_std_m(), o.y_std_m(), o.yaw_std_rad()}) {
@@ -966,6 +1669,7 @@ class @PASCAL@ {
   talos::Node& node_;
   talos::Duration timeout_;
   std::vector<talos::Subscription<Observation>> cameras_;
+  std::vector<Pending> pending_;  // per camera, in sequence
   talos::Publisher<State> state_;
   geometry::Pose2d pose_{};  // held while no usable observation arrives
   std::uint64_t sample_time_ns_{0};
@@ -996,6 +1700,7 @@ namespace @NAME@ {
 namespace {
 
 using namespace std::chrono_literals;
+using talos::testing::AllocationProbe;
 using talos::testing::Sim;
 using talos::testing::SimHardware;
 
@@ -1012,6 +1717,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
+// The node test matrix for an observer, docs/TESTING.md §7: the case names
+// are the matrix's, which //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
  protected:
   using State = @PASCAL@::State;
@@ -1036,7 +1743,7 @@ class @PASCAL@Test : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(@PASCAL@Test, FollowsAUsableObservation) {
+TEST_F(@PASCAL@Test, PublishesFromALiveInput) {
   sim.step(20ms);
   Observe("front_camera", 1.0, 2.0);
   sim.step(40ms);
@@ -1056,7 +1763,8 @@ TEST_F(@PASCAL@Test, EstimatesWhileTheRobotIsDisabled) {
   EXPECT_DOUBLE_EQ(Latest().pose().x_m(), 3.0);
 }
 
-TEST_F(@PASCAL@Test, StaleInputIsInvalidAndHoldsThePose) {
+// REQ-CONTRACT-25
+TEST_F(@PASCAL@Test, StaleInputClearsValidity) {
   sim.step(20ms);
   Observe("front_camera", 1.0, 2.0);
   sim.step(40ms);
@@ -1086,6 +1794,61 @@ TEST_F(@PASCAL@Test, ReadsOnlyTheListedCameras) {
   sim.step(40ms);
   EXPECT_FALSE(Latest().valid());
   EXPECT_EQ(Latest().observation_accepted_count(), 0u);
+}
+
+TEST_F(@PASCAL@Test, CountsEveryObservationBetweenTicks) {
+  sim.step(20ms);
+  Observe("front_camera", 1.0, 2.0);
+  Observe("front_camera", 1.0, 2.0, /*valid=*/false);
+  Observe("front_camera", 1.5, 2.0);
+  sim.step(40ms);
+  const State state = Latest();
+  EXPECT_EQ(state.observation_accepted_count(), 2u);
+  EXPECT_EQ(state.observation_rejected_count(), 1u);
+}
+
+// REQ-CONTRACT-18
+TEST(@PASCAL@Parameters, BadParameterFailsConstruction) {
+  const struct {
+    const char* key;
+    const char* settings;  // [subsystems.@NAME@]
+  } rows[] = {
+      {"cameras", "observation_timeout_us = 500000"},
+      {"cameras", "cameras = 3"},
+      {"observation_timeout_us",
+       "cameras = ['front_camera']\\nobservation_timeout_us = 0"},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.settings);
+    Sim sim = Sim::FromToml(
+        std::string{"[robot]\\nperiod_us = 20000\\ncommand_timeout_us = 100000\\n"
+                    "[subsystems.@NAME@]\\n"} +
+        row.settings +
+        "\\n[subsystems.chassis.motors.chassis_motor]\\n"
+        "type = 'TalonFX'\\ncan_id = 1\\n");
+    try {
+      sim.add<@PASCAL@>("@NAME@");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
+// REQ-RT-06: a tick that drains a queued observation, picks it and publishes
+// the estimate allocates nothing.
+TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
+  if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
+    GTEST_SKIP() << why;
+  }
+  sim.step(40ms);
+  Observe("front_camera", 1.0, 2.0);
+  AllocationProbe probe;
+  probe.start();
+  sim.step(60ms);
+  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  EXPECT_EQ(Latest().observation_accepted_count(), 1u);
 }
 
 struct Result {
@@ -1131,8 +1894,10 @@ PY_ESTIMATOR_NODE = '''\
 @DOC@
 """
 
+import collections
 import math
 
+import talos
 from @NAME@ import topics
 from geometry.PoseEstimate import PoseEstimate
 from geometry.PoseObservation import PoseObservation
@@ -1146,6 +1911,11 @@ def usable(o):
             and min(o.x_std_m, o.y_std_m, o.yaw_std_rad) > 0)
 
 
+# Observations queued per camera between two update()s: the framework's
+# per-topic, per-drain delivery cap, over a second of a 60 fps camera.
+MAX_PENDING_OBSERVATIONS = 64
+
+
 class @PASCAL@:
     def __init__(self, node):
         self.node = node
@@ -1154,29 +1924,42 @@ class @PASCAL@:
                 or not all(isinstance(c, str) and c for c in cameras)):
             raise ValueError(f"@NAME@: cameras must list camera node names, "
                              f"got {cameras!r}")
-        self.cameras = [
-            node.subscribe(PoseObservation, f"/{camera}/state", optional=True)
-            for camera in cameras]
+        # The callback sees every observation in sequence. Only update()
+        # reads the queues, so AT_DRAIN delivers them at the drain before
+        # update() instead of waking the node for each camera frame.
+        self.pending = [collections.deque() for _ in cameras]
+        for camera, queue in zip(cameras, self.pending):
+            node.subscribe(PoseObservation, f"/{camera}/state",
+                           callback=lambda o, q=queue: self.queue(q, o),
+                           wake=talos.Wake.AT_DRAIN, optional=True)
         self.timeout_s = node.param("observation_timeout_us", 500_000) / 1e6
+        if not self.timeout_s > 0:
+            raise ValueError(
+                "@NAME@: observation_timeout_us must be positive")
         self.state = node.publish(PoseEstimate, topics.STATE)
         self.pose = (0.0, 0.0, 0.0)  # held while no usable observation arrives
         self.sample_time_ns = 0
         self.last_accepted_s = None
         self.accepted = self.rejected = 0
 
+    def queue(self, pending, observation):
+        if len(pending) >= MAX_PENDING_OBSERVATIONS:
+            pending.popleft()
+            self.rejected += 1
+        pending.append(observation)
+
     def update(self):
         best = None
-        for camera in self.cameras:
-            if not camera.updated:  # each observation counts once
-                continue
-            o = camera.value
-            if not usable(o):
-                self.rejected += 1
-                continue
-            self.accepted += 1
-            if best is None or (o.x_std_m + o.y_std_m
-                                < best.x_std_m + best.y_std_m):
-                best = o
+        for pending in self.pending:
+            for o in pending:  # each observation counts once
+                if not usable(o):
+                    self.rejected += 1
+                    continue
+                self.accepted += 1
+                if best is None or (o.x_std_m + o.y_std_m
+                                    < best.x_std_m + best.y_std_m):
+                    best = o
+            pending.clear()
         if best is not None:
             self.pose = (best.pose_x_m, best.pose_y_m, best.pose_yaw_rad)
             self.sample_time_ns = best.sample_time_ns
@@ -1185,13 +1968,20 @@ class @PASCAL@:
                  and self.node.now - self.last_accepted_s <= self.timeout_s)
         x, y, yaw = self.pose
         self.state.send(sample_time_ns=self.sample_time_ns, pose_x_m=x,
-                        pose_y_m=y, pose_yaw_rad=yaw, valid=valid,
+                        pose_y_m=y, pose_yaw_rad=yaw, velocity_vx_mps=0.0,
+                        velocity_vy_mps=0.0, velocity_omega_radps=0.0,
+                        valid=valid, localized=False,
                         observation_accepted_count=self.accepted,
                         observation_rejected_count=self.rejected)
 '''
 
 PY_ESTIMATOR_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary."""
+"""Node tests: the class on talos.testing.Sim, and the binary.
+
+@PASCAL@Test is the node test matrix for an observer, docs/TESTING.md
+§7: the case names are the matrix's, which //tools:check_node_matrix looks
+for.
+"""
 
 import math
 import os
@@ -1217,14 +2007,14 @@ class @PASCAL@Test(unittest.TestCase):
         """A camera's observation of (x, y), taken now."""
         self.sim.publish(
             PoseObservation, f"/{camera}/state",
-            sample_time_ns=round(self.sim.now * 1e9), pose_x_m=x, pose_y_m=y,
+            sample_time_ns=self.sim.now_ns, pose_x_m=x, pose_y_m=y,
             pose_yaw_rad=0.5, x_std_m=std_m, y_std_m=std_m, yaw_std_rad=0.05,
             tag_count=2, valid=valid)
 
     def state(self):
         return self.sim.latest(PoseEstimate, topics.STATE)
 
-    def test_follows_a_usable_observation(self):
+    def test_publishes_from_a_live_input(self):
         self.sim.step(0.02)
         self.observe("front_camera", 1.0, 2.0)
         self.sim.step(0.04)
@@ -1241,7 +2031,8 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertTrue(self.state().valid)
         self.assertEqual(self.state().pose_x_m, 3.0)
 
-    def test_stale_input_is_invalid_and_holds_the_pose(self):
+    # REQ-CONTRACT-25
+    def test_stale_input_clears_validity(self):
         self.sim.step(0.02)
         self.observe("front_camera", 1.0, 2.0)
         self.sim.step(0.04)
@@ -1267,6 +2058,36 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim.step(0.04)
         self.assertFalse(self.state().valid)
         self.assertEqual(self.state().observation_accepted_count, 0)
+
+    def test_counts_every_observation_between_ticks(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0)
+        self.observe("front_camera", 1.0, 2.0, valid=False)
+        self.observe("front_camera", 1.5, 2.0)
+        self.sim.step(0.04)
+        state = self.state()
+        self.assertEqual((state.observation_accepted_count,
+                          state.observation_rejected_count), (2, 1))
+
+    # REQ-CONTRACT-18
+    def test_bad_parameter_fails_construction(self):
+        for key, settings in (
+                ("cameras", "observation_timeout_us = 500000"),
+                ("cameras", "cameras = 3"),
+                ("observation_timeout_us",
+                 'cameras = ["front_camera"]\\nobservation_timeout_us = 0')):
+            with self.subTest(settings=settings):
+                sim = Sim.from_toml(
+                    "[robot]\\nperiod_us = 20000\\n"
+                    "command_timeout_us = 100000\\n"
+                    f"[subsystems.@NAME@]\\n{settings}\\n"
+                    "[subsystems.chassis.motors.chassis_motor]\\n"
+                    'type = "TalonFX"\\ncan_id = 1\\n')
+                with self.assertRaisesRegex((ValueError, talos.TalosError),
+                                            key):
+                    sim.add(node_py.@PASCAL@, "@NAME@")
+
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
 class BinaryTest(unittest.TestCase):
@@ -1351,6 +2172,7 @@ def estimator_files(name, lang):
                          "talOS/node/node.h"]
         test_includes = ["rules_cc/cc/runfiles/runfiles.h",
                          f"{name}/{name}.h", "talOS/devices/testing.h",
+                         "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(["testdata/robot.toml", ":node"],
@@ -1412,15 +2234,23 @@ def package_files(name, lang, standalone=False, kind="velocity"):
         )
         files["MODULE.bazel"] = fill(
             STANDALONE_MODULE, EXTRA_DEPS=extra_deps, **values)
-        files["defaults.toml"] = fill(
-            STANDALONE_ESTIMATOR_DEFAULTS_TOML if kind == "estimator"
-            else STANDALONE_DEFAULTS_TOML, **values)
+        files["defaults.toml"] = fill({
+            "velocity": STANDALONE_DEFAULTS_TOML,
+            "position": STANDALONE_POSITION_DEFAULTS_TOML,
+            "estimator": STANDALONE_ESTIMATOR_DEFAULTS_TOML,
+        }[kind], **values)
     return files
+
+
+def neighbor_of(name):
+    """The test robot's other subsystem: any name but the package's."""
+    return "bystander" if name == "neighbor" else "neighbor"
 
 
 def mechanism_files(name, lang, kind):
     """{relative path: content} of a one-motor velocity/position package."""
-    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
+    values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US,
+                  NEIGHBOR=neighbor_of(name))
     messages = fill(MESSAGES_BUILD, **values)
     fbs_template = POSITION_FBS if kind == "position" else FBS
     files = {f"{name}_message.fbs": fill(fbs_template, **values)}
@@ -1429,17 +2259,51 @@ def mechanism_files(name, lang, kind):
                          f"{name}/{name}_message_generated.h",
                          "talOS/devices/devices.h", "talOS/node/node.h"]
         test_includes = ["rules_cc/cc/runfiles/runfiles.h",
-                         f"{name}/{name}.h", "talOS/devices/testing.h",
+                         f"{name}/{name}.h", "talOS/devices/devices.h",
+                         "talOS/devices/testing.h",
+                         "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
-        data = ["testdata/robot.toml", f"testdata/{name}.toml", ":node"]
+        neighbor = values["NEIGHBOR"]
+        data = ["testdata/robot.toml", f"testdata/{name}.toml",
+                f"testdata/{neighbor}.toml", ":node"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
         cc_test = fill(CC_TEST, INCLUDES=includes(test_includes), **values)
+        testdata_subsystem = CC_TESTDATA_SUBSYSTEM
         if kind == "position":
-            cc_test = (cc_test
-                       .replace("Mode::kVelocity", "Mode::kMotionMagic")
-                       .replace("velocity_rps()", "position_rot()"))
+            # A thin node over talos::mechanisms::PositionMechanism, whose
+            # name is both its motor and its parameter table.
+            node_includes.append("talOS/mechanisms/position_mechanism.h")
+            build = edited(build, [
+                ('        "//talOS/devices",\n        "//talOS/node",\n',
+                 '        "//talOS/devices",\n        "//talOS/mechanisms",\n'
+                 '        "//talOS/node",\n'),
+            ])
+            cc_test = edited(cc_test, [
+                (f'"{name}_motor"', f'"{name}"'),
+                ("Mode::kVelocity", "Mode::kMotionMagic"),
+                ("velocity_rps()", "position_rot()"),
+                ("  SimHardware hw{sim};\n};\n",
+                 fill(CC_POSITION_FIXTURE, **values)),
+                # A motor on its home switch zeroes after home_samples ticks.
+                ("    sim.step(10ms);  // the mode is current before any lane "
+                 "arrives\n",
+                 "    // The mode is current before any lane arrives, and a "
+                 "motor on its home\n"
+                 "    // switch has zeroed (home_samples ticks).\n"
+                 "    sim.step(60ms);\n"),
+                # Moving off a switch that still reads closed is a fault.
+                ("  Teleop();\n  Hold(30.0, 60ms);\n",
+                 "  Teleop();\n"
+                 "  SetHome(false);  // zeroed on the switch, it leaves it\n"
+                 "  Hold(30.0, 60ms);\n"),
+                (f"// matrix: n/a 9 (the {name} reads no parameters)\n",
+                 fill(CC_POSITION_PARAMETERS, **values)),
+                ("struct Result {",
+                 fill(CC_POSITION_TESTS, **values) + "struct Result {"),
+            ])
+            testdata_subsystem = CC_POSITION_TESTDATA_SUBSYSTEM
         files.update({
             "BUILD": build,
             f"{name}.h": fill(hdr_template, INCLUDES=includes(node_includes),
@@ -1447,7 +2311,8 @@ def mechanism_files(name, lang, kind):
             f"{name}.cc": fill(CC_SOURCE, **values),
             "node_test.cc": cc_test,
             "testdata/robot.toml": fill(CC_TESTDATA_ROBOT, **values),
-            f"testdata/{name}.toml": fill(CC_TESTDATA_SUBSYSTEM, **values),
+            f"testdata/{name}.toml": fill(testdata_subsystem, **values),
+            f"testdata/{neighbor}.toml": fill(CC_TESTDATA_NEIGHBOR, **values),
         })
     else:
         data = [f"{name}.py", "testdata/robot.toml", ":node"]
@@ -1460,25 +2325,74 @@ def mechanism_files(name, lang, kind):
             "python.runfiles": "runfiles",
             "talos.testing": "Sim, SimHardware",
         }
+        if kind == "position":
+            imports[f"{name}.{pascal_name}Homing"] = f"{pascal_name}Homing"
         from_imports = "\n".join(
             f"from {module} import {imports[module]}"
             for module in sorted(imports, key=str.lower))
         build = fill(PY_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
-        node_template = PY_POSITION_NODE if kind == "position" else PY_NODE
+        node = fill(PY_NODE, **values)
         py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
+        testdata_robot = PY_TESTDATA_ROBOT
         if kind == "position":
-            py_test = (py_test
-                       .replace("velocity_rps=demand", "position_rot=demand")
-                       .replace("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC")
-                       .replace("state.velocity_rps, 12.5", "state.position_rot, 0.0"))
+            # A thin node over talos.mechanisms.PositionMechanism, whose name
+            # is both its motor and its parameter table.
+            node_imports = {
+                name: "topics",
+                f"{name}.{pascal_name}Homing": f"{pascal_name}Homing",
+                f"{name}.{pascal_name}State": f"{pascal_name}State",
+                f"{name}.{pascal_name}Target": f"{pascal_name}Target",
+                "talos.mechanisms": "PositionMechanism, PositionPhase",
+            }
+            node = fill(PY_POSITION_NODE, FROM_IMPORTS="\n".join(
+                f"from {module} import {node_imports[module]}"
+                for module in sorted(node_imports, key=str.lower)), **values)
+            build = edited(build, [
+                ('    deps = [":messages_py"],\n',
+                 '    deps = [\n        ":messages_py",\n'
+                 '        "//talOS/python:mechanisms",\n    ],\n'),
+                ('        ":messages_py",\n        "//talOS/python:testing",\n',
+                 '        ":messages_py",\n        "//talOS/python:mechanisms",\n'
+                 '        "//talOS/python:testing",\n'),
+            ])
+            py_test = edited(py_test, [
+                (f'"{name}_motor"', f'"{name}"'),
+                ("velocity_rps=demand", "position_rot=demand"),
+                (f"    # matrix: n/a 9 (the {name} reads no parameters)\n",
+                 fill(PY_POSITION_PARAMETERS, **values)),
+                # A motor on its home switch zeroes after home_samples ticks.
+                ("        self.sim.step(0.01)\n",
+                 "        self.sim.step(0.06)  # home_samples ticks on a switch\n"),
+                ("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC"),
+                ("state.velocity_rps, 12.5", "state.position_rot, 0.0"),
+                ('0.0, 12.5)\n',
+                 '0.0, 0.0)\n'
+                 '        # Starts at rest on its home switch (closed reads\n'
+                 '        # False, see set_home): zeroed without moving.\n'
+                 f'        self.hw.set_digital_input("{name}", '
+                 f'"{name}_home", False)\n'),
+                ("\n\nclass BinaryTest",
+                 fill(PY_POSITION_TESTS, **values) + "\n\nclass BinaryTest"),
+            ])
+            testdata_robot = PY_POSITION_TESTDATA_ROBOT
         files.update({
             "BUILD": build,
-            f"{name}.py": fill(node_template, **values),
+            f"{name}.py": node,
             "node_test.py": py_test,
-            "testdata/robot.toml": fill(PY_TESTDATA_ROBOT, **values),
+            "testdata/robot.toml": fill(testdata_robot, **values),
         })
     return files
+
+
+def edited(text, replacements):
+    """`text` with each (old, new) replaced; every `old` must occur, so a
+    template change cannot silently drop a position-only edit."""
+    for old, new in replacements:
+        if old not in text:
+            raise AssertionError(f"template anchor not found: {old!r}")
+        text = text.replace(old, new)
+    return text
 
 
 def includes(paths):
@@ -1506,10 +2420,30 @@ def used_can_ids(subsystems):
     return ids
 
 
+def used_dio_channels(subsystems):
+    """Every DIO channel (dio, dio_a, dio_b) in the effective [subsystems]
+    view."""
+    channels = set()
+
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key in ("dio", "dio_a", "dio_b") and isinstance(item, int):
+                    channels.add(item)
+                else:
+                    walk(item)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+
+    walk(subsystems)
+    return channels
+
+
 def plan(root, robot, name, lang, kind="velocity"):
     """([(path, old content or None, new content)], placeholder CAN id, or
     None for an estimator, which owns no devices)."""
-    if problem := check_name(name):
+    if problem := check_name(name) or check_kind(name, lang, kind):
         raise Refused(problem)
     processor = os.path.join(root, robot, "main_processor")
     configuration = os.path.join(processor, "configuration")
@@ -1538,14 +2472,23 @@ def plan(root, robot, name, lang, kind="velocity"):
         if can_id is None:
             raise Refused(f"every CAN id 1..{MAX_CAN_ID} is taken in "
                           f"{rel(root, configuration)}")
+    dio = None
+    if kind == "position":
+        used = used_dio_channels(subsystems)
+        dio = next((i for i in range(MAX_DIO + 1) if i not in used), None)
+        if dio is None:
+            raise Refused(f"every DIO channel 0..{MAX_DIO} is taken in "
+                          f"{rel(root, configuration)}")
 
     writes = [(os.path.join(package, path), None, content)
               for path, content in package_files(name, lang, kind=kind).items()]
     subsystem = fill(
-        ESTIMATOR_SUBSYSTEM_TOML if kind == "estimator" else SUBSYSTEM_TOML,
+        {"velocity": SUBSYSTEM_TOML,
+         "position": POSITION_SUBSYSTEM_TOML,
+         "estimator": ESTIMATOR_SUBSYSTEM_TOML}[kind],
         NAME=name, PASCAL=pascal(name), ROBOT=robot,
         PACKAGE=f"{robot}/main_processor/{name}", PERIOD=PERIOD_US,
-        CAN_ID=can_id)
+        CAN_ID=can_id, DIO=dio)
     writes.append((subsystem_toml, None, subsystem))
 
     old = read(robot_toml)
@@ -1591,7 +2534,7 @@ def robot_configs(root, robot):
 def plan_standalone(target_dir, name, lang, talos_root, kind="velocity"):
     """[(path, None, content)] for a standalone Bzlmod subsystem repository
     that builds against the talOS checkout at `talos_root` as it stands."""
-    if problem := check_name(name):
+    if problem := check_name(name) or check_kind(name, lang, kind):
         raise Refused(problem)
     if os.path.exists(target_dir) and os.listdir(target_dir):
         raise Refused(f"{target_dir} already exists and is not empty")
@@ -1603,7 +2546,10 @@ def plan_standalone(target_dir, name, lang, talos_root, kind="velocity"):
     files["MODULE.bazel"] += (
         "\n# The talOS checkout this repository was generated from. Replace it\n"
         "# with a registry version once talos is published to one.\n"
-        f'local_path_override(module_name = "talos", path = "{talos_path}")\n')
+        "local_path_override(\n"
+        '    module_name = "talos",\n'
+        f'    path = "{talos_path}",\n'
+        ")\n")
     # talOS's C++23 flags and Bazel version are per workspace, not carried by
     # the module, so the new workspace takes the checkout's own.
     for config in (".bazelrc", ".bazelversion"):
@@ -1638,29 +2584,166 @@ def show(root, writes):
                 f"a/{name}", f"b/{name}")))
 
 
-def next_steps(robot, name, can_id):
+# What ./sim.sh drives a scaffold with: teleop after a second disabled, and
+# joystick 0's button 3 (bit 2) pressed from second 3 to second 6, after a
+# neutral sample that arms the teleop lane (talos::OperatorArming).
+SIM_DURATION_S = 8
+MODE_SCHEDULE = "disabled:1,teleop:10"
+JOYSTICK_SCHEDULE = ("0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|"
+                     "6:axes=0;buttons=0;pov=-1")
+SIM_RUN = (f"--sim-gateway --no-studio --duration-s {SIM_DURATION_S} "
+           f"--mode-schedule '{MODE_SCHEDULE}' \\\n      "
+           f"--joystick-schedule '{JOYSTICK_SCHEDULE}'")
+
+
+# The robot's simulation-only configs, in the order next_steps looks for
+# one: `include = "robot.toml"` plus each mechanism's simulation block.
+# new_robot writes robot_sim.toml with its manifest; 2026-robot's is
+# robot_physics_sim.toml.
+SIM_CONFIGS = ("robot_sim.toml", "robot_physics_sim.toml")
+
+SIM_CONFIG_HEADER = """\
+# Simulation only: ./sim.sh --config @CONFIG@ --sim-gateway
+# robot.toml never reads this file, so nothing here reaches the robot.
+include = "robot.toml"
+
+[robot]
+# The launcher and hardware_node refuse this config without --sim.
+simulation_only = true
+"""
+
+
+def sim_config(root, robot):
+    """(workspace-relative simulation config of `robot`, whether it exists):
+    the first of SIM_CONFIGS that does, else robot_sim.toml to create."""
+    configuration = f"{robot}/main_processor/configuration"
+    for name in SIM_CONFIGS:
+        if os.path.isfile(os.path.join(root, configuration, name)):
+            return f"{configuration}/{name}", True
+    return f"{configuration}/{SIM_CONFIGS[0]}", False
+
+
+def simulation_block(name, kind):
+    """The TOML a student appends to the robot's simulation config so that
+    `name` moves under `./sim.sh --sim-gateway` with button 3 held.
+
+    The values go there, not in the subsystem file, because the robot's own
+    configs never read the simulation config: a live button binding, gains
+    nobody tuned and an unmeasured travel cannot reach a real robot,
+    commissioned or not. The scaffold leaves the subsystem file with its
+    binding commented and every gain zero. next_steps prints the block;
+    new_robot_test and scaffold_sim_test append it as printed.
+    """
+    lane = f"/{name}/target/teleop"
+    sub = f"subsystems.{name}"
+    if kind == "position":
+        motor, demand = name, "position_rot = 1.0"
+        measure = " and\n# measure its travel"
+    else:
+        motor, demand, measure = f"{name}_motor", "velocity_rps = 20.0", ""
+    block = f"""\
+# {name}: simulation values only. robot.toml never reads this file; before
+# a real robot drives the {name}, tune slot0 on the mechanism{measure}.
+# Holding joystick button 3 writes {demand} on {lane}.
+[[{sub}.teleop.bindings]]
+button = 3
+while_held = {{ {demand} }}
+# Until an autonomous node writes /{name}/target/auto, the binding is the
+# {name}'s only producer; a policy that lists "auto" with
+# require_target_coverage = true refuses the graph without this.
+[{sub}.targets]
+autonomous = []
+"""
+    zero = "p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0"
+    if kind == "position":
+        gains = (zero.replace("p = 0.0", "p = 1.0")
+                 .replace("d = 0.0", "d = 0.05").replace("v = 0.0", "v = 0.12"))
+        return block + f"""\
+# The simulated travel.
+[{sub}.{name}]
+max_rot = 2.0
+# The simulated home switch: it reads closed while the motor, which starts
+# at 0, is at or below -0.1 rotations, where homing_v drives it.
+[{sub}.digital_inputs.{name}_home]
+sim_motor = "{motor}"
+sim_closed_at_rot = -0.1
+# The simulated motor's gains, not the mechanism's.
+[{sub}.motors.{motor}]
+slot0 = {{ {gains} }}
+"""
+    return block + f"""\
+# The simulated motor's feedforward (volts per rps), not the mechanism's:
+# with every gain zero the physics simulation stalls the motor.
+[{sub}.motors.{motor}]
+slot0 = {{ {zero.replace("v = 0.0", "v = 0.12")} }}
+"""
+
+
+def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
+               golden_test=False, sim=None):
+    """What to do after scaffolding `name` into `robot`. `golden_test`: the
+    robot pins its hardware config in configuration/config_golden_test.cc
+    (2026-robot does; a new_robot robot does not). `sim`: sim_config's
+    (path, exists) for the robot; default, a robot_sim.toml that exists."""
+    del lang  # both languages' nodes read the same keys
     package = f"//{robot}/main_processor/{name}"
     configuration = f"{robot}/main_processor/configuration"
-    common = f"""\
+    subsystem = f"{configuration}/subsystems/{name}.toml"
+    sim_path, sim_exists = sim or (f"{configuration}/{SIM_CONFIGS[0]}", True)
+    build = (f"  bazel build //talOS/launcher //talOS/bridge:hardware_node "
+             f"//{robot}/main_processor/...")
+    if can_id is None:  # an estimator
+        return f"""\
 Next:
   bazel test {package}:all
-  bazel build //talOS/launcher //talOS/bridge:hardware_node //{robot}/main_processor/...
+{build}
   bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only
-  {configuration}/subsystems/{name}.toml"""
-    if can_id is None:  # an estimator
-        return common + f"""
+  {subsystem}
     List the camera nodes in `cameras`; point telemetry at the pose with
     [studio] pose_topic = "/{name}/state"."""
-    return common + f"""
-    can_id = {can_id} is a placeholder: replace it with the motor's physical id.
-    The gains are zero (untuned): tune slot0 there.
+    lines = simulation_block(name, kind)
+    if sim_exists:
+        step, manifest = "append these lines to", ""
+    else:
+        step = "create"
+        lines = fill(SIM_CONFIG_HEADER, CONFIG=sim_path) + lines
+        manifest = (
+            "\n  and generate its manifest, which ./sim.sh checks:\n"
+            f"  bazel run //tools:sync_manifest -- {sim_path}")
+    lines = textwrap.indent(lines, "    ").rstrip("\n")
+    travel = """
+    The home switch's dio is a placeholder too: replace it with its physical
+    channel. Set max_rot to the measured travel. Wire the switch normally
+    open to ground; check that homing_v (-0.5 V) moves toward it, and set
+    homing_timeout_us.
+    Only the node's clamp stops the mechanism past the top: wire a forward
+    limit switch to the TalonFX's limit input and set
+    forward_limit_switch.""" if kind == "position" else ""
+    golden = f"""
   {configuration}/config_golden_test.cc
-    pins the hardware config: update it once a human has checked the CAN id."""
+    pins the hardware config: update it once a human has checked the CAN id.""" \
+        if golden_test else ""
+    return f"""\
+Next:
+  bazel test {package}:all
+  To see it move in simulation, {step} {sim_path},
+  the simulation-only config; {subsystem}
+  keeps its binding commented and its gains zero:
+{lines}{manifest}
+  Then check the graph and run it (button 3 held from second 3 to 6):
+{build}
+  bazel run //talOS/launcher -- --config $PWD/{sim_path} --describe-only
+  ./sim.sh --config {sim_path} {SIM_RUN}
+  Before a real robot drives the motor, in {subsystem}:
+    can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
+    Tune slot0 on the mechanism before uncommenting its teleop binding.{golden}"""
 
 
 def standalone_next_steps(target_dir, name, kind="velocity"):
-    edit = ("list its camera nodes in `cameras`" if kind == "estimator"
-            else "add the motor's physical can_id")
+    edit = {"velocity": "add the motor's physical can_id",
+            "position": "add the motor's physical can_id and the home "
+                        "switch's dio, set its travel and homing_v",
+            "estimator": "list its camera nodes in `cameras`"}[kind]
     return f"""\
 Next (standalone subsystem repo at {target_dir}):
   1. Run its tests (MODULE.bazel overrides @talos with this checkout):
@@ -1733,7 +2816,11 @@ def main(argv):
         print(standalone_next_steps(shown(root, target_dir), args.name,
                                     args.kind))
     else:
-        print(next_steps(args.robot, args.name, can_id))
+        golden_test = os.path.isfile(os.path.join(
+            root, args.robot, "main_processor", "configuration",
+            "config_golden_test.cc"))
+        print(next_steps(args.robot, args.name, can_id, args.kind, args.lang,
+                         golden_test, sim_config(root, args.robot)))
     return 0
 
 

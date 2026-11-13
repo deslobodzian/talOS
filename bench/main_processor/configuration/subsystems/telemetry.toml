@@ -1,0 +1,5 @@
+[subsystem]
+name = "telemetry"
+node = "//talOS/telemetry:node"
+critical = false
+period_us = 10000

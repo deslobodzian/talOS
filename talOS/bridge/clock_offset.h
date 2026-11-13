@@ -1,8 +1,17 @@
 #pragma once
 
-// The gateway's sample clock mapped into the bridge's clock, which is the
-// clock every node runs on (talos::event::Poller::now(), the clock
-// Node::now() reads).
+// Gateway-to-node clock mapping. Production uses bounded_offset_us() from a
+// causal two-way exchange; offset_us()/spread_us() are the one-way diagnostic
+// below and MUST NOT be treated as an accuracy bound.
+// The estimator keeps every exchange of the current boot from the last
+// second (up to kExchangeSlots) and, at each State, uses the minimum-RTT one
+// that is still at most one second old. A kept exchange therefore expires
+// only while a younger one is held, and accuracy_valid() stays true as long
+// as exchanges keep arriving less than a second apart. Its error bound
+// assumes nonnegative delay and <=1000 ppm relative oscillator drift. No
+// fusion accuracy threshold has been specified.
+//
+// One-way diagnostic (not the production mapping):
 //
 // Each gateway state the bridge receives gives one one-way delay
 //
@@ -10,8 +19,8 @@
 //     = true offset between the clocks + that sample's latency,
 //
 // where the latency (>= 0) is how long the sample took from the gateway's
-// sampler to the bridge's receive: gateway processing, UDP, and up to one
-// bridge tick. The estimate is the minimum d over the window, so
+// sampler to the bridge's receive: gateway processing, UDP, and the bridge
+// waking for it. The estimate is the minimum d over the window, so
 //
 //   node time of gateway time t  =  t + offset_us()
 //
@@ -34,9 +43,12 @@
 // the estimate lags by at most window duration x drift rate (about 100 us at
 // 100 ppm).
 //
-// A new gateway boot (boot_id changes) restarts the window: the gateway clock
-// restarts with the boot. A sample whose sample_time_us is not after the last
-// one accepted in this boot (a duplicate or a reordered frame) is ignored.
+// A new gateway boot (a boot_id not seen before) restarts the window: the
+// gateway clock restarts with the boot. A sample whose sample_time_us is not
+// after the last one accepted in this boot (a duplicate or a reordered frame)
+// is ignored, and so is one from a boot the gateway has since left
+// (BootHistory: a datagram delayed across a reboot). Observe() is the
+// bridge's State ordering gate: a State it ignores is dropped whole.
 // The estimate is valid -- converged() -- once the window holds
 // kConvergedSamples samples of the current boot (40 ms at 5 ms).
 
@@ -44,22 +56,40 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "talOS/bridge/boot_history.h"
+
 namespace talos::hardware {
 
 class ClockOffsetEstimator {
  public:
   static constexpr std::size_t kWindowSamples = 200;
   static constexpr std::size_t kConvergedSamples = 8;
+  // A second of exchanges at the bridge's 50 Hz probe rate, with margin. A
+  // faster caller overwrites the oldest; any exchange kept is still causal.
+  static constexpr std::size_t kExchangeSlots = 64;
+  static constexpr std::uint64_t kExchangeLifetimeUs = 1'000'000;
 
   // One received gateway state: its boot, its gateway-clock sample time and
   // the bridge-clock time it was received. Returns whether it entered the
-  // window (false: a duplicate or reordered sample, ignored).
+  // window (false: a duplicate, reordered or retired-boot sample, ignored).
   bool Observe(std::uint64_t boot_id, std::uint64_t sample_time_us,
                std::uint64_t receipt_us);
 
+  // Causal two-way interval: probe sent at bridge t1, later gateway sample
+  // t2, bridge time t4 sampled AFTER receiving that State. No symmetry
+  // assumption: offset lies in [t1 - t2, t4 - t2]. Residence time is retained
+  // in RTT, making this looser but safer than subtracting guessed processing.
+  // Ignored for another boot, t1 == 0, t4 < t1, or a round trip over 1 s.
+  void ObserveExchange(std::uint64_t boot_id, std::uint64_t t1,
+                       std::uint64_t t2, std::uint64_t t4);
+  bool accuracy_valid() const { return exchange_valid_; }
+  std::int64_t bounded_offset_us() const { return bounded_offset_us_; }
+  std::uint64_t uncertainty_us() const { return uncertainty_us_; }
+  std::uint64_t round_trip_us() const { return round_trip_us_; }
+
   bool converged() const { return count_ >= kConvergedSamples; }
   // The gateway boot the window holds samples of; 0 before the first.
-  std::uint64_t boot_id() const { return boot_id_; }
+  std::uint64_t boot_id() const { return boots_.id(); }
   // Minimum one-way delay over the window (bridge clock minus gateway clock);
   // 0 while the window is empty. Meaningful once converged().
   std::int64_t offset_us() const { return offset_us_; }
@@ -68,19 +98,38 @@ class ClockOffsetEstimator {
   std::size_t window_count() const { return count_; }
   // Restarts for a new gateway boot after the first.
   std::uint64_t resets_count() const { return resets_; }
-  // Samples ignored as duplicates or reordered.
+  // Samples ignored as duplicates, reordered or from a retired boot.
   std::uint64_t ignored_count() const { return ignored_; }
 
  private:
+  struct Exchange {
+    std::int64_t offset_us;       // midpoint of [t1 - t2, t4 - t2]
+    std::uint64_t round_trip_us;  // t4 - t1
+    std::uint64_t sample_us;      // t2, gateway clock
+    std::uint64_t receipt_us;     // t4, bridge clock
+  };
+
+  // Picks the minimum-RTT kept exchange at most kExchangeLifetimeUs old at
+  // (bridge receipt_us, gateway sample_time_us), and sets accuracy_valid()
+  // and the bound from it.
+  void SelectExchange(std::uint64_t receipt_us, std::uint64_t sample_time_us);
+
   std::array<std::int64_t, kWindowSamples> delays_us_{};  // ring buffer
   std::size_t next_{0};   // where the next delay goes
   std::size_t count_{0};  // delays held, at most kWindowSamples
-  std::uint64_t boot_id_{0};
+  BootHistory boots_;
   std::uint64_t last_sample_time_us_{0};
   std::int64_t offset_us_{0};
   std::uint64_t spread_us_{0};
   std::uint64_t resets_{0};
   std::uint64_t ignored_{0};
+  bool exchange_valid_{false};
+  std::int64_t bounded_offset_us_{};
+  std::uint64_t uncertainty_us_{};
+  std::uint64_t round_trip_us_{};
+  std::array<Exchange, kExchangeSlots> exchanges_{};  // ring buffer
+  std::size_t next_exchange_{0};
+  std::size_t exchange_count_{0};
 };
 
 }  // namespace talos::hardware

@@ -52,7 +52,8 @@ inline std::string RequestTopic(std::string_view subsystem) {
 }  // namespace talos::hardware
 
 // The packet topics' schema identity (talOS/schema/identity.h): a framework
-// layout with no FlatBuffers schema, so log_dump shows its bytes.
+// layout with no FlatBuffers schema. log_dump decodes these topics with the
+// wire codecs instead (talOS/launcher/hardware_record.h).
 template <>
 struct talos::Descriptor<talos::hardware::Packet> {
   static constexpr std::string_view kName = schema::kPacketName;

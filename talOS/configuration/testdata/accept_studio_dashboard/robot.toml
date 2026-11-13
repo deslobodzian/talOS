@@ -1,0 +1,4 @@
+include = "base/robot.toml"
+
+[studio]
+http_port = 5800

@@ -3,11 +3,17 @@
 [subsystem]
 name = "telemetry"
 node = "//talOS/telemetry:node"
+# Observation-only: the robot may run without this node.
+critical = false
 period_us = 10000
-# Leave room below the 1200-byte value-frame cap by dropping cumulative
-# camera counters; retain health, timing, drops and visible-tag diagnostics.
-exclude = [
-    "*_camera/status/frames_captured_count",
-    "*_camera/status/frames_processed_count",
-    "*_camera/status/range_rejected_count",
-]
+# Every state and status channel is published: a tick takes as many pages as
+# it needs, integers travel exactly, and the Studio bridge sends each viewer
+# only the channels that changed, within its radio budget
+# (talOS/telemetry/README.md). Add `exclude` globs only to hide a channel
+# from viewers, not to fit a budget.
+
+# The autonomous routine by name: routine_index is an index into
+# autonomous's `routines`, which stays an ordered string array.
+[[subsystem.labels]]
+channel = "autonomous/state/routine_index"
+from = "autonomous.routines"

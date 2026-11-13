@@ -9,7 +9,11 @@ import {useState} from 'react';
 import {usePlayback} from '../data/hooks';
 import {StatusDot} from '../ui/primitives';
 
-export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, onReset}: {
+// `review`: studio_review served this Studio, which only reviews recorded
+// sessions, so there is no live connection to offer.
+export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, onReset, onReview,
+                        review = false}: {
+  review?: boolean;
   url: string;
   onUrl: (url: string) => void;
   onConnect: () => void;
@@ -17,6 +21,7 @@ export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, 
   onImportClick: () => void;
   onExport: () => void;
   onReset: () => void;
+  onReview: () => void;
 }) {
   const playback = usePlayback();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -33,10 +38,13 @@ export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, 
       <StatusDot active={playback.connection === 'live' ||
                          playback.connection === 'demo'}/>
       <span>{playback.status}</span>
-      <input aria-label="WebSocket URL" value={url}
-             onChange={e => onUrl(e.target.value)}/>
-      <button className="primary" onClick={onConnect}>Connect</button>
+      {!review && <>
+        <input aria-label="WebSocket URL" value={url}
+               onChange={e => onUrl(e.target.value)}/>
+        <button className="primary" onClick={onConnect}>Connect</button>
+      </>}
       <button onClick={onDemo}>Demo data</button>
+      <button onClick={onReview}>Open recording…</button>
     </div>
     <div className="workspace-menu">
       <button onClick={() => setMenuOpen(o => !o)} aria-haspopup="menu"

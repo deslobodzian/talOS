@@ -1,14 +1,15 @@
 // The Session panel: what launched, from which config, and how every process
 // has fared. Three views over two documents plus the live registry:
 //
-//   Session   — the launcher's manifest: session id, simulation, config path +
-//               its hash, output dir, start time and uptime (end time when the
-//               session ended).
+//   Session   — the launcher's manifest: session id, source revision,
+//               simulation, config path + its hash, output dir, start time and
+//               uptime (end time when the session ended).
 //   Processes — one row per process, merging the manifest nodes, the live
 //               registry and the declared graph by name, so a process that
 //               crashed before claiming a slot still shows up (declared, never
 //               registered) and a process started outside the launcher is not
-//               lost (registry only).
+//               lost (registry only). The exit column adds why the launcher
+//               ended the last run (stalled, stop, ...) when it says.
 //   Counts    — running / total processes and total restarts.
 //
 // The manifest is served by the bridge at /manifest.json only when it was
@@ -23,6 +24,7 @@ import type {SessionManifest} from '../../data/manifest';
 import type {SystemGraph} from '../../system';
 import {duration, hertz, integer} from '../../ui/formatters';
 import {EmptyState, StatusDot} from '../../ui/primitives';
+import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
 import {mergeProcesses, summarize, type ProcessProblem} from './logic';
 import './session.css';
@@ -63,6 +65,8 @@ const PROBLEM_META: Record<ProcessProblem, {label: string; cls: string}> = {
   restarted: {label: 'restarted', cls: 'restarted'},
   recorder_failed: {label: 'recorder failed', cls: 'recorder'},
   nonzero_exit: {label: 'nonzero exit', cls: 'exit'},
+  killed_by_signal: {label: 'killed by signal', cls: 'exit'},
+  endpoint_mismatch: {label: 'endpoint mismatch', cls: 'missing'},
   never_registered: {label: 'never registered', cls: 'missing'}
 };
 
@@ -120,6 +124,9 @@ function SessionHeader(
   const upNs = ended ? Number(end - start) :
       graph ? Math.max(0, Number(BigInt(graph.wall_ns) - start)) : null;
   const shortSha = manifest.config_sha256.slice(0, 8);
+  const revision = manifest.git_revision ?
+      manifest.git_revision.slice(0, 12) + (manifest.git_dirty ? ' (dirty)' : '') :
+      '—';
 
   return <div className="session-fields">
     <Field label="Config" wide>
@@ -132,6 +139,9 @@ function SessionHeader(
                  copied={copied === manifest.output_dir} onCopy={onCopy}/>
     </Field>
     <Field label="Session">{manifest.session_id}</Field>
+    <Field label="Revision">
+      <code className="sha" title={manifest.git_revision}>{revision}</code>
+    </Field>
     <Field label="Simulation">{manifest.simulation ? 'yes' : 'no'}</Field>
     <Field label="Started">{wallClock(manifest.start_wall_ns)}</Field>
     {ended && <Field label="Ended">{wallClock(manifest.end_wall_ns)}</Field>}
@@ -146,14 +156,14 @@ function SessionPanel() {
 
   const rows = useMemo(
       () => mergeProcesses(manifest, system.graph, system.declared,
-                           system.rates),
-      [manifest, system.graph, system.declared, system.rates]);
+                           system.rates, system.stale),
+      [manifest, system.graph, system.declared, system.rates, system.stale]);
   const summary = useMemo(() => summarize(rows), [rows]);
 
   const copyPath = (path: string) => {
-    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText)
-      navigator.clipboard.writeText(path).catch(() => {});
-    setCopied(path);
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(path).then(() => setCopied(path)).catch(() => {});
+    }
   };
 
   return <div className="session">
@@ -175,8 +185,9 @@ function SessionPanel() {
       <div className="card-heading">
         <h2>Processes</h2><span>MANIFEST ∪ REGISTRY ∪ DECLARED</span>
       </div>
+      <GraphFreshnessNotice/>
       <div className="system-counts session-counts">
-        <span>{summary.running}/{summary.total} processes running</span>
+        <span>{system.graph && system.stale ? '?' : summary.running}/{summary.total} processes running</span>
         <span>{summary.restarts} restart{summary.restarts === 1 ? '' : 's'}</span>
       </div>
       {rows.length === 0 ?
@@ -226,8 +237,12 @@ function SessionPanel() {
                   <td className={'right' +
                       (row.restarts > 0 ? ' warn' : '')}>{row.restarts}</td>
                   <td className={'right' +
-                      (row.exitCode !== null && row.exitCode > 0 ? ' warn' : '')}>
-                    {row.exitCode === null ? '—' : row.exitCode}
+                      ((row.exitCode !== null && row.exitCode > 0) ||
+                       row.exitSignal !== null ? ' warn' : '')}>
+                    {row.exitSignal ?? (row.exitCode === null ? '—' : row.exitCode)}
+                    {row.endReason &&
+                     <span>{' · '}{
+                         row.endReason.replaceAll('_', ' ')}</span>}
                   </td>
                   <td className={row.recorderFailed ? 'text-warn' : ''}>
                     {!row.hasManifest ? '—' :

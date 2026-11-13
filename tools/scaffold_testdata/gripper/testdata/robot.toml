@@ -1,4 +1,7 @@
 # Local gripper fixture. Device IDs are assigned by the normal parser.
+# The neighbor subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
 [robot]
 name = "gripper_test"
 period_us = 20000
@@ -9,3 +12,7 @@ commissioned = false
 [[subsystems]]
 name = "gripper"
 path = "gripper.toml"
+
+[[subsystems]]
+name = "neighbor"
+path = "neighbor.toml"

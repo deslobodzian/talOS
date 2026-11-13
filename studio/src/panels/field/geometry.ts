@@ -4,8 +4,10 @@
 // +X pointing right (away from the blue wall) and +Y pointing up; SVG y grows
 // downward, so `toPy` flips.
 
-export const FIELD_WIDTH_M = 16.54;
-export const FIELD_HEIGHT_M = 8.21;
+// The 2026 field: field-dimensions of the robot's tag layout,
+// 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json.
+export const FIELD_WIDTH_M = 16.541;
+export const FIELD_HEIGHT_M = 8.069;
 export const PX_PER_M = 50;
 
 // Field extent in SVG user units.

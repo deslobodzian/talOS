@@ -2,38 +2,34 @@
 """Assembles a relocatable Talos bundle directory."""
 
 import argparse
+import filecmp
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
 
 
 def make_executable(path):
-    try:
-        mode = os.stat(path).st_mode
-        os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    except Exception:
-        pass
+    mode = os.stat(path).st_mode
+    os.chmod(path, mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
 def make_writable(path):
-    try:
-        if os.path.isdir(path) and not os.path.islink(path):
-            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
-            for root, dirs, files in os.walk(path):
-                for d in dirs:
-                    p = os.path.join(root, d)
+    if os.path.isdir(path) and not os.path.islink(path):
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+        for root, dirs, files in os.walk(path):
+            for d in dirs:
+                p = os.path.join(root, d)
+                os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
+            for f in files:
+                p = os.path.join(root, f)
+                if not os.path.islink(p):
                     os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
-                for f in files:
-                    p = os.path.join(root, f)
-                    if not os.path.islink(p):
-                        os.chmod(p, os.stat(p).st_mode | stat.S_IWUSR)
-        elif os.path.exists(path) and not os.path.islink(path):
-            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
-    except Exception:
-        pass
+    elif os.path.exists(path) and not os.path.islink(path):
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
 
 
 def safe_copy(src, dest):
@@ -55,26 +51,221 @@ def safe_copy(src, dest):
     make_writable(dest)
 
 
-def safe_symlink(target, link_path):
-    parent = os.path.dirname(link_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    if os.path.islink(link_path) or os.path.exists(link_path):
-        if os.path.isdir(link_path) and not os.path.islink(link_path):
-            shutil.rmtree(link_path)
-        else:
-            os.remove(link_path)
-    os.symlink(target, link_path)
+# Where a bundle holds the Python runtimes its nodes share, by repository.
+RUNTIME_DIR = "python"
+
+
+def write_exec_script(dest, target, note):
+    """Writes `dest` as a script that execs `target` (a path in the bundle)
+    by its path relative to `dest`, so the bundle runs wherever it is
+    installed. The exec keeps the pid, and the target runs as its own file:
+    an interpreter finds its library from where it is."""
+    rel = os.path.relpath(target, os.path.dirname(dest))
+    if os.path.lexists(dest):
+        make_writable(dest)
+        os.remove(dest)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n"
+                f"# {note}\n"
+                f'exec "$(dirname "$0")"/{shlex.quote(rel)} "$@"\n')
+    make_executable(dest)
+
+
+def link_target(rf_rel, link):
+    """The runfile a link at `rf_rel` to `link` (relative to the link's
+    directory in the runfiles tree) names, as a runfiles-relative path."""
+    return os.path.normpath(os.path.join(os.path.dirname(rf_rel), link))
+
+
+def stage_link(name, dest, rf_rel, link, target, bundle_root):
+    """Stages the runfile `rf_rel` at `dest`, a link Bazel declared to `link`
+    whose target the bundle holds at `target`, without a symlink.
+
+    Bazel may restore a tree artifact from its cache with every symlink in
+    it replaced by a copy of its target, so the bundle holds none and runs
+    the same either way. An executable is staged as a script that execs its
+    target where the bundle holds it: an interpreter finds its library from
+    its own location, so a copy of it elsewhere would not run (a py_binary
+    venv's bin/python3; the node's stage-2 bootstrap then adds the venv's
+    site-packages itself). Any other file is staged as a copy."""
+    if not (target.startswith(bundle_root) and os.path.isfile(target)):
+        sys.exit(f"bundle: node '{name}': runfile {rf_rel} links to {link}, "
+                 "which the bundle does not hold")
+    if not os.access(target, os.X_OK):
+        safe_copy(target, dest)
+        return
+    write_exec_script(dest, target,
+                      f"{rf_rel} -> {link}, kept out of the bundle as a link.")
+
+
+def is_executable_file(path):
+    """A regular file (a directory's X bit means search) that may run."""
+    return os.path.isfile(path) and os.access(path, os.X_OK)
+
+
+def runtime_repositories(files, links):
+    """The repositories of a Python node's runfiles that hold its
+    interpreter: those a declared link (a venv's bin/python3) names an
+    executable file in. `files` maps each staged runfile to its source;
+    `links` lists (runfile, link) pairs."""
+    repos = set()
+    for rf_rel, link in links:
+        target = link_target(rf_rel, link)
+        repo = target.split(os.sep, 1)[0]
+        if (repo not in ("_main", os.pardir) and target in files
+                and is_executable_file(files[target])):
+            repos.add(repo)
+    return repos
+
+
+def unselected_runtimes(files, runtimes):
+    """The repositories of `files` that hold an interpreter, an executable
+    bin/python3, which no venv link selected (`runtimes`). Such a runtime
+    would be staged whole in the node's runfiles, beside the bundle's one
+    copy of it."""
+    return sorted({rf_rel.split(os.sep, 1)[0] for rf_rel, src in files.items()
+                   if rf_rel.split(os.sep, 1)[1:] == [os.path.join("bin", "python3")]
+                   and rf_rel.split(os.sep, 1)[0] not in runtimes
+                   and is_executable_file(src)})
+
+
+def stage_runtime_file(name, src, rf_rel, dest, staged_from):
+    """Stages a runtime's file at `dest` in the bundle's one runtime
+    directory, once for every node that carries it. `staged_from` maps each
+    staged destination to its (source, node). A later node's file from the
+    same source is the same file; one from another source must have the
+    same bytes, or the build exits: one directory cannot serve both."""
+    seen = staged_from.get(dest)
+    if seen is None:
+        safe_copy(src, dest)
+        staged_from[dest] = (src, name)
+        return
+    first_src, first = seen
+    if src == first_src:
+        return
+    if not (os.path.isfile(src) and os.path.isfile(dest)):
+        return  # a tree artifact; filecmp compares only files
+    if not filecmp.cmp(src, dest, shallow=False):
+        repo = rf_rel.split(os.sep, 1)[0]
+        sys.exit(f"bundle: nodes '{first}' and '{name}' carry different "
+                 f"Python runtimes named {repo} ({rf_rel} differs)")
+
+
+def alias_interpreter_copies(interpreter):
+    """Restages every other executable file of `interpreter`'s directory
+    with its exact bytes (rules_python's runfiles copy it as python,
+    python3 and python3.11) as a script that execs it, so the bundle holds
+    the interpreter once."""
+    size = os.path.getsize(interpreter)
+    bin_dir = os.path.dirname(interpreter)
+    for entry in sorted(os.listdir(bin_dir)):
+        path = os.path.join(bin_dir, entry)
+        if (path != interpreter and os.path.isfile(path)
+                and os.access(path, os.X_OK)
+                and os.path.getsize(path) == size
+                and filecmp.cmp(path, interpreter, shallow=False)):
+            write_exec_script(path, interpreter,
+                              f"{entry}: the interpreter, held once as "
+                              f"{os.path.basename(interpreter)}.")
+
+
+def node_targets(node):
+    """Every label the robot config may name `node` by."""
+    targets = []
+    for label in (node["target"], node.get("label")):
+        if not label:
+            continue
+        targets.append(label)
+        if label.startswith("@"):
+            repo, package = label.lstrip("@").split("//", 1)
+            # The config uses an apparent module name; node metadata uses
+            # Bazel's canonical repository name. Preserve both spellings.
+            targets.append("@" + repo.split("+", 1)[0] + "//" + package)
+    return list(dict.fromkeys(targets))
+
+
+def check_nodes(spec, resolved):
+    """Exits unless the bundle's nodes are exactly the ones its config
+    launches. `resolved` is the configuration resolver's JSON for the config:
+    `nodes` holds every subsystem's node (the generated manifest's NODES), and
+    the effective [robot] table's `hardware_node` names the bridge, the
+    launcher's default `spec["default_hardware_node"]` when it is unset. The
+    launcher finds a node's binary by label and, failing that, by the node's
+    name, so a node missing here either stops the robot at boot or silently
+    runs another binary of that name: the default bridge in place of a
+    [robot] hardware_node, say."""
+    hardware = resolved["effective"].get("robot", {}).get("hardware_node")
+    if not isinstance(hardware, str):  # as the launcher reads it
+        hardware = spec["default_hardware_node"]
+    launched = set(resolved["nodes"]) | {hardware}
+    bundled = [(node.get("label") or node["target"], node_targets(node))
+               for node in spec["nodes"]]
+    missing = sorted(label for label in launched
+                     if not any(label in targets for _, targets in bundled))
+    extra = sorted(label for label, targets in bundled
+                   if launched.isdisjoint(targets))
+    if missing or extra:
+        sys.exit("\n".join(
+            [f"bundle: nodes must be what {spec['config']['short_path']} "
+             f"launches: its generated manifest's NODES and its hardware node "
+             f"{hardware}"] +
+            [f"  launched but not in nodes: {label}" for label in missing] +
+            [f"  in nodes but not launched: {label}" for label in extra]))
+
+
+def check_studio(spec, resolved):
+    """Exits when the bundle carries a Studio bridge other than the one its
+    config's `[studio] bridge` names, or a webroot with no index.html. Unset,
+    the launcher's default label is used and falls back to the bundled bridge
+    by name."""
+    studio = spec.get("studio")
+    if not studio:
+        return
+    configured = resolved["effective"].get("studio", {}).get("bridge")
+    targets = node_targets({"target": studio["bridge_label"]})
+    if isinstance(configured, str) and configured not in targets:
+        sys.exit(f"bundle: studio_bridge {studio['bridge_label']} is not the "
+                 f"[studio] bridge {configured} that "
+                 f"{spec['config']['short_path']} names")
+    if not os.path.isfile(os.path.join(studio["webroot_path"], "index.html")):
+        sys.exit(f"bundle: studio_webroot {studio['webroot_path']} holds no "
+                 "index.html")
+
+
+def source_revision(path):
+    """The bundle_manifest.toml lines naming the source revision, from a --stamp
+    build's stable status file (tools/workspace_status.sh); none when it has
+    no STABLE_GIT_COMMIT (no git checkout, or no --workspace_status_command)."""
+    status = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            key, _, value = line.rstrip("\n").partition(" ")
+            status[key] = value
+    revision = status.get("STABLE_GIT_COMMIT", "")
+    if not revision:
+        return []
+    dirty = status.get("STABLE_GIT_DIRTY", "0") != "0"
+    return [f"git_revision = {json.dumps(revision)}",
+            f"git_dirty = {'true' if dirty else 'false'}"]
 
 
 def main():
     parser = argparse.ArgumentParser(description="Assemble a Talos robot bundle.")
     parser.add_argument("--spec", required=True, help="Path to JSON specification")
+    parser.add_argument("--resolved", required=True,
+                        help="The configuration resolver's JSON for the config")
     parser.add_argument("--out", required=True, help="Output bundle directory")
+    parser.add_argument("--stable-status",
+                        help="Bazel's stable status file, in a --stamp build")
     args = parser.parse_args()
 
     with open(args.spec, "r") as f:
         spec = json.load(f)
+    with open(args.resolved, "r") as f:
+        resolved = json.load(f)
+    check_nodes(spec, resolved)
+    check_studio(spec, resolved)
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
@@ -89,11 +280,6 @@ def main():
     launcher_dest = os.path.join(out_dir, "launcher")
     safe_copy(launcher_src, launcher_dest)
     make_executable(launcher_dest)
-    bundle_name = spec.get("bundle_name", "")
-    if bundle_name:
-        named_launcher_dir = os.path.join(out_dir, bundle_name)
-        os.makedirs(named_launcher_dir, exist_ok=True)
-        safe_symlink("../launcher", os.path.join(named_launcher_dir, "launcher"))
 
     # 2. Config. Every file keeps its path relative to the others under
     # config/, rooted at their deepest common directory, so the config's
@@ -137,9 +323,13 @@ def main():
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
     staged_libs = {}
+    # python/: each Python runtime file, with its source and the first node
+    # that carried it, and the interpreters venv links exec there.
+    staged_runtimes = {}
+    interpreters = set()
+    bundle_root = out_dir + os.sep
     for node in spec.get("nodes", []):
         name = node["name"]
-        target = node["target"]
         lang = node["language"]
         src_path = node["src_path"]
         bin_rel = f"bin/{name}"
@@ -147,50 +337,59 @@ def main():
         safe_copy(src_path, bin_dest)
         make_executable(bin_dest)
 
-        # Runfiles
+        # Runfiles. Each is an input of this action, so one that does not
+        # exist is a symlink Bazel declared unresolved, such as a py_binary
+        # venv's bin/python3. Its target is relative to the runfiles tree, so
+        # it is staged after the files (stage_link), and must name one of
+        # them. The repository holding the interpreter such a link names is
+        # staged once for every node, under python/ (the interpreter and its
+        # library are most of a bundle's bytes); the link's script execs it
+        # there, and the interpreter finds its library beside it as before.
         rf_entries = node.get("runfiles", [])
         if rf_entries:
             rf_dir = os.path.join(bin_dir, f"{name}.runfiles")
             os.makedirs(rf_dir, exist_ok=True)
             repo_mapping_src = None
-            python_bin_path = None
-
+            files = {}
+            links = []
             for rf in rf_entries:
                 rf_src = rf["src_path"]
                 rf_rel = rf["rf_rel"]
-                dest = os.path.join(rf_dir, rf_rel)
-                parent = os.path.dirname(dest)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-
-                if rf_rel.endswith("bin/python3") and ".venv" in rf_rel:
-                    # Defer venv python3 until target hermetic python binary is copied
+                if os.path.islink(rf_src) and not os.path.exists(rf_src):
+                    links.append((rf_rel, os.readlink(rf_src)))
                     continue
+                if not os.path.exists(rf_src):
+                    sys.exit(f"bundle: node '{name}': runfile {rf_rel} is "
+                             f"missing: {rf_src}")
+                files[os.path.normpath(rf_rel)] = rf_src
+            runtimes = runtime_repositories(files, links)
+            for repo in unselected_runtimes(files, runtimes):
+                sys.exit(f"bundle: node '{name}': its runfiles carry the "
+                         f"Python runtime {repo}, but no venv link selects "
+                         "it, so the bundle would hold it again in the "
+                         "node's runfiles")
 
-                if os.path.exists(rf_src):
-                    safe_copy(rf_src, dest)
+            def staged_at(rf_rel):
+                if rf_rel.split(os.sep, 1)[0] in runtimes:
+                    return os.path.join(out_dir, RUNTIME_DIR, rf_rel)
+                return os.path.join(rf_dir, rf_rel)
 
-                if rf_rel.endswith("bin/python3") and "rules_python" in rf_rel and ".venv" not in rf_rel:
-                    python_bin_path = dest
+            for rf_rel, rf_src in files.items():
+                if rf_rel.split(os.sep, 1)[0] in runtimes:
+                    stage_runtime_file(name, rf_src, rf_rel, staged_at(rf_rel),
+                                       staged_runtimes)
+                    continue
+                safe_copy(rf_src, os.path.join(rf_dir, rf_rel))
                 if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
                     repo_mapping_src = rf_src
+            for rf_rel, link in links:
+                target = link_target(rf_rel, link)
+                stage_link(name, os.path.join(rf_dir, rf_rel), rf_rel, link,
+                           staged_at(target), bundle_root)
+                if target.split(os.sep, 1)[0] in runtimes:
+                    interpreters.add(staged_at(target))
 
-            # Link any venv python3 to the bundled hermetic python3
-            for rf in rf_entries:
-                rf_rel = rf["rf_rel"]
-                if rf_rel.endswith("bin/python3") and ".venv" in rf_rel:
-                    dest = os.path.join(rf_dir, rf_rel)
-                    parent = os.path.dirname(dest)
-                    if parent:
-                        os.makedirs(parent, exist_ok=True)
-                    if python_bin_path and os.path.exists(python_bin_path):
-                        rel_py = os.path.relpath(python_bin_path, os.path.dirname(dest))
-                        if os.path.islink(dest) or os.path.exists(dest):
-                            os.remove(dest)
-                        os.symlink(rel_py, dest)
-                        make_executable(dest)
-
-            if repo_mapping_src and os.path.exists(repo_mapping_src):
+            if repo_mapping_src:
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
                 safe_copy(repo_mapping_src, os.path.join(bin_dir, f"{name}.repo_mapping"))
         for lib in node.get("shared_libs", []):
@@ -204,31 +403,53 @@ def main():
             elif seen[0] != digest:
                 sys.exit(f"bundle: nodes '{seen[1]}' and '{name}' link different "
                          f"shared libraries named {lib['name']}")
-        # Every label the robot config may name this node by.
-        targets = []
-        for label in (target, node.get("label")):
-            if not label:
-                continue
-            targets.append(label)
-            if label.startswith("@"):
-                repo, package = label.lstrip("@").split("//", 1)
-                # The config uses an apparent module name; node metadata uses
-                # Bazel's canonical repository name. Preserve both spellings.
-                targets.append("@" + repo.split("+", 1)[0] + "//" + package)
+        with open(bin_dest, "rb") as f:
+            binary_sha256 = hashlib.sha256(f.read()).hexdigest()
         manifest_nodes.append({
             "name": name,
-            "targets": list(dict.fromkeys(targets)),
+            "targets": node_targets(node),
             "binary": bin_rel,
+            "binary_sha256": binary_sha256,
             "language": lang,
         })
 
-    # 5. bundle_manifest.toml, read by the launcher's LoadBundle. A JSON string
+    for interpreter in sorted(interpreters):
+        alias_interpreter_copies(interpreter)
+
+    # 5. Studio: the bridge binary and the built site it serves, which the
+    # launcher's LoadBundle registers for --start-studio-bridge.
+    studio_lines = []
+    studio = spec.get("studio")
+    if studio:
+        bridge_rel = "studio/studio_bridge"
+        bridge_dest = os.path.join(out_dir, bridge_rel)
+        safe_copy(studio["bridge_path"], bridge_dest)
+        make_executable(bridge_dest)
+        with open(bridge_dest, "rb") as f:
+            bridge_sha256 = hashlib.sha256(f.read()).hexdigest()
+        webroot_rel = "studio/webroot"
+        safe_copy(studio["webroot_path"], os.path.join(out_dir, webroot_rel))
+        studio_lines = [
+            "",
+            "[studio]",
+            f"bridge = {json.dumps(bridge_rel)}",
+            f"bridge_sha256 = {json.dumps(bridge_sha256)}",
+            "targets = [" + ", ".join(
+                json.dumps(t) for t in
+                node_targets({"target": studio["bridge_label"]})) + "]",
+            f"webroot = {json.dumps(webroot_rel)}",
+        ]
+
+    # 6. bundle_manifest.toml, read by the launcher's LoadBundle. A JSON string
     # literal (ASCII, \uXXXX escapes) is also a valid TOML basic string.
     lines = [
         "bundle_version = 1",
         f"config_path = {json.dumps(config_rel)}",
         f"config_sha256 = {json.dumps(config_sha256)}",
     ]
+    if args.stable_status:
+        lines += source_revision(args.stable_status)
+    lines += studio_lines
     for entry in manifest_nodes:
         lines += [
             "",
@@ -236,17 +457,24 @@ def main():
             f"name = {json.dumps(entry['name'])}",
             f"targets = [{', '.join(json.dumps(t) for t in entry['targets'])}]",
             f"binary = {json.dumps(entry['binary'])}",
+            f"binary_sha256 = {json.dumps(entry['binary_sha256'])}",
             f"language = {json.dumps(entry['language'])}",
         ]
     with open(os.path.join(out_dir, "bundle_manifest.toml"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
-    # 6. run.sh
+    # 7. run.sh. A bundle that carries Studio starts its bridge by default,
+    # so a booted robot (deploy.sh enable-boot runs run.sh bare) and a run
+    # by hand serve the same Studio; --no-studio, which run.sh consumes,
+    # declines it. A bridge that cannot run is one warning (REQ-OPS-30).
+    start_studio = "true" if studio else "false"
     run_sh_path = os.path.join(out_dir, "run.sh")
     with open(run_sh_path, "w") as f:
         f.write(f"""#!/usr/bin/env bash
 set -e
-SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd)"
+# Physical (pwd -P): started as <prefix>/current/run.sh, the launcher and
+# every node it restarts stay in this bundle when deploy.sh moves `current`.
+SCRIPT_DIR="$(cd "$(dirname "${{BASH_SOURCE[0]}}")" && pwd -P)"
 export PATH="${{SCRIPT_DIR}}/bin:${{PATH}}"
 
 unset BUILD_WORKSPACE_DIRECTORY
@@ -255,11 +483,15 @@ cd "${{SCRIPT_DIR}}"
 
 has_config=false
 has_output_dir=false
+start_studio={start_studio}
+args=()
 for arg in "$@"; do
   case "$arg" in
+    --no-studio) start_studio=false; continue ;;
     --config|--config=*) has_config=true ;;
     --output-dir|--output-dir=*) has_output_dir=true ;;
   esac
+  args+=("$arg")
 done
 
 extra_args=()
@@ -269,8 +501,11 @@ fi
 if [[ "$has_output_dir" == "false" && -n "${{TALOS_LOG_DIR:-}}" ]]; then
   extra_args+=(--output-dir "${{TALOS_LOG_DIR}}")
 fi
+if [[ "$start_studio" == "true" ]]; then
+  extra_args+=(--start-studio-bridge)
+fi
 
-exec "./launcher" --bundle "${{SCRIPT_DIR}}" ${{extra_args[@]+"${{extra_args[@]}}"}} "$@"
+exec "./launcher" --bundle "${{SCRIPT_DIR}}" ${{extra_args[@]+"${{extra_args[@]}}"}} ${{args[@]+"${{args[@]}}"}}
 """)
     make_executable(run_sh_path)
 

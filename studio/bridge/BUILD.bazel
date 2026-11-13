@@ -1,3 +1,4 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -21,17 +22,49 @@ cc_library(
     ],
 )
 
-# The telemetry JSON views: the latest v2 frame and its dictionary as
-# self-describing documents. Header-only, like :system, so both can be
-# tested without a socket.
+# The telemetry feed's bridge side: page assembly, per-client change-only
+# updates under the egress budget, and the JSON views. Header-only, like
+# :system, so all of it can be tested without a socket.
 cc_library(
     name = "telemetry",
     hdrs = ["telemetry.h"],
     visibility = ["//visibility:public"],
     deps = [
         ":system",
+        "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "@flatbuffers",
+    ],
+)
+
+# The driver dashboard's feed (/drive): the reserved egress budget, the
+# drive slots, the channel mask and the drive summary. Header-only, like
+# :telemetry.
+cc_library(
+    name = "drive",
+    hdrs = ["drive.h"],
+    deps = [
+        ":system",
+        ":telemetry",
+        "//talOS/introspection:registry",
+        "//talOS/telemetry:wire",
+        "@nlohmann_json//:json",
+    ],
+)
+
+cc_test(
+    name = "drive_test",
+    size = "small",
+    srcs = ["tests/drive_test.cc"],
+    deps = [
+        ":drive",
+        ":telemetry",
+        "//talOS/introspection:registry",
+        "//talOS/telemetry:frames",
+        "//talOS/telemetry:schema",
+        "//talOS/telemetry:wire",
+        "@flatbuffers",
+        "@googletest//:gtest_main",
     ],
 )
 
@@ -40,17 +73,33 @@ cc_test(
     size = "small",
     srcs = ["tests/telemetry_test.cc"],
     deps = [
+        ":system",
         ":telemetry",
+        "//talOS/introspection:registry",
+        "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "@flatbuffers",
         "@googletest//:gtest_main",
     ],
 )
 
+# The system graph's golden files: a graph, the update the bridge sends at
+# the next refresh, and that refresh's graph. :system_test requires the
+# bridge to reproduce them byte for byte; //studio:system_test and
+# :fast_slots_test apply the update in Studio's and the Python harness's
+# fast-value order (README.md, "HTTP and WebSocket views").
+js_library(
+    name = "golden",
+    srcs = glob(["testdata/golden/*"]),
+    visibility = ["//studio:__pkg__"],
+)
+
 cc_test(
     name = "system_test",
     size = "small",
     srcs = ["tests/system_test.cc"],
+    data = glob(["testdata/golden/*"]),
+    env = {"TALOS_GOLDEN_GRAPH": "$(rlocationpath testdata/golden/graph.json)"},
     deps = [
         ":system",
         # The `/hw/*` topic names, so a test that asserts on them cannot drift
@@ -59,7 +108,22 @@ cc_test(
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
+)
+
+# Hermetic: it imports only integration_test.py's fast_slots. Not
+# precompiled, since the `local` tests that also list integration_test.py
+# compile it under other execution requirements (two actions, one output).
+py_test(
+    name = "fast_slots_test",
+    size = "small",
+    srcs = [
+        "fast_slots_test.py",
+        "integration_test.py",
+    ],
+    data = glob(["testdata/golden/*"]),
+    precompile = "disabled",
 )
 
 cc_binary(
@@ -67,6 +131,7 @@ cc_binary(
     srcs = ["mock.cc"],
     deps = [
         "//talOS/rtms",
+        "//talOS/telemetry:frames",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
         "@flatbuffers",
@@ -76,17 +141,27 @@ cc_binary(
 cc_binary(
     name = "studio_bridge",
     srcs = ["main.cc"],
+    # A robot's talos_bundle carries it (studio_bridge), and the simulation
+    # soak test launches it as a chaos target.
+    visibility = ["//visibility:public"],
     deps = [
+        ":drive",
         ":system",
         ":telemetry",
         "//talOS/configuration",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
+        "//talOS/process",
         "//talOS/rtms",
+        "//talOS/rtms:wake",
+        "//talOS/telemetry:dashboard_layout",
         "//talOS/telemetry:schema",
         "//talOS/telemetry:wire",
         "@flatbuffers",
         "@studio_uws//:uws",
+        # internal/internal.h: the callback poll that puts the wake channel's
+        # descriptor in the loop (main.cc WatchReadable).
+        "@studio_usockets//:usockets",
     ],
 )
 
@@ -97,7 +172,44 @@ py_test(
         ":studio_bridge",
         ":studio_mock",
     ],
-    tags = ["local"],
+    tags = [
+        "integration",
+        "local",
+    ],
+)
+
+py_test(
+    name = "bandwidth_test",
+    size = "medium",
+    srcs = [
+        "bandwidth_test.py",
+        "integration_test.py",
+    ],
+    data = [
+        ":studio_bridge",
+        ":studio_mock",
+    ],
+    main = "bandwidth_test.py",
+    tags = [
+        "integration",
+        "local",
+    ],
+)
+
+# Runs the bridge at its smallest idle timeout (8 s), so it takes about 9 s.
+py_test(
+    name = "client_timeout_test",
+    size = "medium",
+    srcs = [
+        "client_timeout_test.py",
+        "integration_test.py",
+    ],
+    data = [":studio_bridge"],
+    main = "client_timeout_test.py",
+    tags = [
+        "integration",
+        "local",
+    ],
 )
 
 # --describe answers with no ports, shm, or robot, so this stays hermetic.

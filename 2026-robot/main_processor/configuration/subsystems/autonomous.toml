@@ -1,22 +1,62 @@
-# Preload shot, then a field waypoint; Red rotates about the field centre.
+# Disabled-only joystick 0 POV selection; Studio remains read-only.
 [subsystem]
 name = "autonomous"
 node = "//2026-robot/main_processor/autonomous:node"
 period_us = 20000
-shooter_velocity_rps = 60.0
-intake_velocity_rps = 30.0
-# Negative roller demand feeds a held piece past the intake beam interlock.
-feed_velocity_rps = -20.0
-target_x_m = 6.0
-target_y_m = 4.0
-target_yaw_rad = 0.0
+routines = ["preload", "none", "shoot_only", "taxi"]
+default_routine = "preload"
+selection_port_index = 0
+selection_pov_index = 0
+# Joystick port 0..5, POV 0..3. Eighth-turn directions clockwise from up,
+# 0..7 and different: right = 2, left = 6. A key out of range, or any
+# non-finite or (durations, limits, tolerances, gains) non-positive value
+# below, fails construction naming the key.
+selection_next_direction_index = 2
+selection_previous_direction_index = 6
+# Feedback at these tolerances must exceed the drivetrain's wheel hold speed
+# (drivetrain/swerve.h), or a residual error stalls a drive phase
+# (config_golden_test checks it).
 position_tolerance_m = 0.10
 yaw_tolerance_rad = 0.05
 max_linear_mps = 2.0
 max_angular_radps = 3.0
-feed_duration_us = 500000
-field_length_m = 16.54
-field_width_m = 8.21
+# Common controller limits; each routine below owns its action parameters.
+# Field size: field-dimensions of the tag layout
+# 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+# (config_golden_test checks they match).
+field_length_m = 16.541
+field_width_m = 8.069
 # Feedback velocity per metre/radian of pose error.
 xy_feedback_per_m_mps = 1.0
 yaw_feedback_per_rad_radps = 1.0
+# The game's autonomous period. A re-enable in autonomous this long after the
+# routine armed belongs to another match and starts it over; sooner, in the
+# same match, it resumes (2026-robot/README.md).
+autonomous_period_us = 20000000
+
+[subsystem.routine.preload]
+shooter_velocity_rps = 60.0
+intake_velocity_rps = 30.0
+# Negative feeds past the intake beam interlock.
+feed_velocity_rps = -20.0
+feed_duration_us = 500000
+spinup_timeout_s = 2.0
+drive_timeout_s = 10.0
+target_x_m = 6.0
+target_y_m = 4.0
+target_yaw_rad = 0.0
+
+[subsystem.routine.none]
+# HOLD only: all lanes released throughout autonomous.
+
+[subsystem.routine.shoot_only]
+shooter_velocity_rps = 60.0
+feed_velocity_rps = -20.0
+feed_duration_us = 500000
+spinup_timeout_s = 2.0
+
+[subsystem.routine.taxi]
+target_x_m = 6.0
+target_y_m = 4.0
+target_yaw_rad = 0.0
+drive_timeout_s = 10.0

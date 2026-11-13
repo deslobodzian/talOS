@@ -1,15 +1,13 @@
 """The whole example robot in one simulated process: the intake, elevator and
 superstructure nodes talking over their real topics and target lanes, with
 SimHardware in place of the bridge and the Driver Station, all configured by
-config/robot_py.toml and config/subsystems/. The same scenarios as
-cpp/superstructure_test.cc."""
+config/robot_py.toml and config/subsystems/. Detailed mechanism behavior is
+covered once in cpp/superstructure_test.cc; these exercise the Python host."""
 
-import math
 import os
 import unittest
 
 import talos
-from demo.ElevatorGoal import ElevatorGoal
 from demo.ElevatorState import ElevatorState
 from demo.ElevatorStatus import ElevatorStatus
 from demo.IntakeCommand import IntakeCommand
@@ -56,6 +54,12 @@ class SuperstructureTest(unittest.TestCase):
         self.sim.add(elevator.Elevator, "elevator")
         self.sim.add(superstructure.Superstructure, "superstructure")
         self.hw = SimHardware(self.sim)
+        # The lift starts on its bottom switch, so it zeroes without moving,
+        # then leaves it as it rises. The switch is normally open to ground
+        # behind a pull-up: closed reads False.
+        self.hw.set_digital_input("elevator", "bottom_limit", False)
+        self.sim.step(0.03)  # home_samples (3) elevator periods
+        self.hw.set_digital_input("elevator", "bottom_limit", True)
 
     def hold(self, command, seconds):
         """Holds a driver command the way a driver node would: its teleop
@@ -215,194 +219,6 @@ class SuperstructureTest(unittest.TestCase):
         self.sim.step(0.16)  # past command_timeout_us (100 ms)
         self.assertEqual(self.superstructure_state(), SuperstructureState.STOWED)
         self.assertEqual(self.roller().mode, NEUTRAL)
-
-
-HOLDING = dict(state=IntakeState.HOLDING, has_piece=True)
-DOWN = dict(state=ElevatorState.STOWED, height_rot=0.0, goal_rot=0.0,
-            at_goal=True)
-UP = dict(state=ElevatorState.AT_GOAL, height_rot=HIGH_ROT, goal_rot=HIGH_ROT,
-          at_goal=True)
-
-
-class SuperstructureAloneTest(unittest.TestCase):
-    """The superstructure on its own, with the mechanism states published by
-    hand so either one can go quiet."""
-
-    def setUp(self):
-        self.sim = Sim(CONFIG)
-        self.sim.add(superstructure.Superstructure, "superstructure")
-        self.hw = SimHardware(self.sim)
-        enable_teleop(self.sim, self.hw)
-
-    def tick(self, command, intake_status, elevator_status, times=1):
-        """`times` 20 ms periods: the driver's command, plus whichever
-        mechanism states are still being reported (None: gone quiet)."""
-        for _ in range(times):
-            self.sim.publish_target(SuperstructureGoal, "superstructure",
-                                    "teleop", command=command)
-            if intake_status is not None:
-                self.sim.publish(IntakeStatus, "/intake/state", **intake_status)
-            if elevator_status is not None:
-                self.sim.publish(ElevatorStatus, "/elevator/state",
-                                 **elevator_status)
-            self.sim.step(0.02)
-
-    def state(self):
-        return self.sim.latest(SuperstructureStatus,
-                               "/superstructure/state").state
-
-    def elevator_goal_rot(self):
-        return self.sim.latest_target(ElevatorGoal, "elevator",
-                                      "superstructure").height_rot
-
-    def test_stale_status_holds_the_state_and_does_not_advance(self):
-        self.tick(Command.INTAKE, HOLDING, DOWN, times=5)
-        self.assertEqual(self.state(), SuperstructureState.HOLDING)
-
-        # The intake goes quiet for longer than command_timeout_us (100 ms).
-        # Its last word was "holding a piece", but it is stale: SCORE_HIGH
-        # must not raise, and HOLDING's goals keep going out.
-        self.tick(Command.INTAKE, None, DOWN, times=6)
-        self.tick(Command.SCORE_HIGH, None, DOWN, times=10)
-        self.assertEqual(self.state(), SuperstructureState.HOLDING)
-        self.assertEqual(self.elevator_goal_rot(), 0.0)
-        self.assertEqual(
-            self.sim.latest_target(IntakeGoal, "intake",
-                                   "superstructure").command,
-            IntakeCommand.IDLE)
-
-        # It reports again: RAISING.
-        self.tick(Command.SCORE_HIGH, HOLDING, DOWN, times=2)
-        self.assertEqual(self.state(), SuperstructureState.RAISING)
-        self.assertEqual(self.elevator_goal_rot(), HIGH_ROT)
-
-        # Now the elevator goes quiet past the timeout, and the driver lets go
-        # (STOW). Without a fresh elevator state it stays RAISING and keeps
-        # asking for the height rather than acting on old data.
-        self.tick(Command.SCORE_HIGH, HOLDING, None, times=6)
-        self.tick(Command.STOW, HOLDING, None, times=10)
-        self.assertEqual(self.state(), SuperstructureState.RAISING)
-        self.assertEqual(self.elevator_goal_rot(), HIGH_ROT)
-
-        # A fresh at_goal for the high goal: SCORING.
-        self.tick(Command.SCORE_HIGH, HOLDING, UP, times=2)
-        self.assertEqual(self.state(), SuperstructureState.SCORING)
-
-    def test_at_goal_for_an_earlier_height_does_not_count(self):
-        self.tick(Command.INTAKE, HOLDING, DOWN, times=5)
-        # The elevator is at_goal, but for 0: RAISING waits for its own height.
-        self.tick(Command.SCORE_HIGH, HOLDING, DOWN, times=10)
-        self.assertEqual(self.state(), SuperstructureState.RAISING)
-
-
-class ElevatorAloneTest(unittest.TestCase):
-    """The elevator on its own, driven through its superstructure lane by
-    hand."""
-
-    def setUp(self):
-        self.sim = Sim(CONFIG)
-        self.sim.add(elevator.Elevator, "elevator")
-        self.hw = SimHardware(self.sim)
-        enable_teleop(self.sim, self.hw)
-        self.hw.ideal_motors()
-
-    def drive(self, height_rot, seconds):
-        """The superstructure's lane, republished every 10 ms."""
-        for _ in range(round(seconds / 0.01)):
-            self.sim.publish_target(ElevatorGoal, "elevator", "superstructure",
-                                    height_rot=height_rot)
-            self.sim.step(0.01)
-
-    def lift(self):
-        return self.hw.motor_request("elevator", "lift")
-
-    def status(self):
-        return self.sim.latest(ElevatorStatus, "/elevator/state")
-
-    def assert_neutral(self):
-        """Neutral, and the status says it is driving nothing."""
-        self.assertEqual(self.lift().mode, NEUTRAL)
-        self.assertEqual(self.status().goal_rot, 0.0)
-        self.assertFalse(self.status().at_goal)
-
-    def test_drives_to_the_lane_goal(self):
-        self.drive(HIGH_ROT, 0.05)
-        self.assertEqual(self.lift()[:2], (MOTION_MAGIC, HIGH_ROT))
-        self.assertEqual(self.status().state, ElevatorState.AT_GOAL)
-        self.assertTrue(self.status().at_goal)
-        self.assertEqual(self.status().goal_rot, HIGH_ROT)
-
-    def test_neutral_when_the_lane_goes_stale(self):
-        self.drive(HIGH_ROT, 0.05)
-        self.assertEqual(self.lift().mode, MOTION_MAGIC)
-        # Nothing more: it does not hold the old goal past command_timeout_us.
-        self.sim.step(0.11)
-        self.assert_neutral()
-        # Up at HIGH_ROT with nothing driving it: MOVING, not AT_GOAL.
-        self.assertEqual(self.status().state, ElevatorState.MOVING)
-
-    def test_neutral_when_the_lane_is_released(self):
-        self.drive(HIGH_ROT, 0.05)
-        self.assertEqual(self.lift().mode, MOTION_MAGIC)
-        self.sim.release_target(ElevatorGoal, "elevator", "superstructure")
-        self.sim.step(0.02)
-        self.assert_neutral()
-
-    def test_neutral_when_the_target_was_never_sent(self):
-        self.sim.step(0.1)
-        self.assert_neutral()
-        self.assertEqual(self.status().state, ElevatorState.STOWED)  # at 0
-
-    def test_neutral_when_disabled(self):
-        self.hw.enable(False)
-        self.drive(HIGH_ROT, 0.1)
-        self.assert_neutral()
-
-    def test_neutral_on_driver_station_loss(self):
-        self.drive(HIGH_ROT, 0.05)
-        self.assertEqual(self.lift().mode, MOTION_MAGIC)
-        self.hw.stop_driver_station()
-        self.drive(HIGH_ROT, 0.15)  # the lane stays fresh; the DS does not
-        self.assert_neutral()
-
-    def test_neutral_with_the_lift_disconnected(self):
-        self.hw.set_connected("elevator", "lift", False)
-        self.drive(HIGH_ROT, 0.05)
-        self.assert_neutral()
-        self.assertEqual(self.status().state, ElevatorState.MOVING)
-
-    def test_neutral_on_a_non_finite_goal(self):
-        self.drive(math.nan, 0.05)
-        self.assert_neutral()
-
-
-class IntakeAloneTest(unittest.TestCase):
-    """The intake with no target: the state machine carries on, the roller
-    is neutral."""
-
-    def test_neutral_when_the_lane_goes_stale(self):
-        sim = Sim(CONFIG)
-        sim.add(intake.Intake, "intake")
-        hw = SimHardware(sim)
-        enable_teleop(sim, hw)
-
-        def intake_for(periods):
-            for _ in range(periods):
-                sim.publish_target(IntakeGoal, "intake", "superstructure",
-                                   command=IntakeCommand.INTAKE)
-                sim.step(0.02)
-
-        intake_for(5)
-        hw.set_digital_input("intake", "beam_break", True)
-        intake_for(5)
-        self.assertEqual(hw.motor_request("intake", "roller")[:2],
-                         (VOLTAGE, HOLD_VOLTS))
-
-        sim.step(0.14)  # past command_timeout_us (100 ms)
-        self.assertEqual(hw.motor_request("intake", "roller").mode, NEUTRAL)
-        status = sim.latest(IntakeStatus, "/intake/state")
-        self.assertEqual(status.state, IntakeState.HOLDING)
-        self.assertTrue(status.has_piece)
 
 
 if __name__ == "__main__":

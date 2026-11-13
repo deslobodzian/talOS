@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 19u
+#define TALOS_NODE_ABI_VERSION 32u
 
 enum {
   TALOS_OK = 0,
@@ -56,7 +56,10 @@ typedef struct TalosSchema {
 } TalosSchema;
 
 uint32_t talos_abi_version(void);
-// Last error on this thread; valid until the next call. Never NULL.
+// Last error on this thread: set by the call that failed, empty after one
+// that succeeded, so it tells a failure from a failure value that is also a
+// valid result (talos_state_machine_state's 0). Valid until the next call.
+// Never NULL.
 const char* talos_last_error(void);
 
 // --- running a node ------------------------------------------------------
@@ -71,6 +74,8 @@ int32_t talos_run(int32_t argc, char** argv, const char* node_name,
 
 const char* talos_node_name(const TalosNode* node);
 int32_t talos_node_simulation(const TalosNode* node);
+// 1 while the node is built to answer --describe (Node::describing()).
+int32_t talos_node_describing(const TalosNode* node);
 int64_t talos_node_now_ns(const TalosNode* node);
 uint64_t talos_node_tick(const TalosNode* node);
 // The update() index state machines stamp a transition with.
@@ -78,9 +83,17 @@ uint64_t talos_node_next_update(const TalosNode* node);
 int64_t talos_node_period_ns(const TalosNode* node);
 const char* talos_node_config_path(const TalosNode* node);
 // The session output directory (the parent of --log), or NULL when there is
-// none (no --log: tests, --describe, --replay). The pointer is valid until
-// the next talos_node_session_dir call on this thread.
+// none: without --log (tests), and under --describe, --replay and
+// --replay-inputs with or without it. The pointer is valid until the next
+// talos_node_session_dir call on this thread.
 const char* talos_node_session_dir(const TalosNode* node);
+// Copies this subsystem's [trajectories] entry `name`, as an absolute path
+// (talos::Node::trajectory_path), NUL-terminated into `out`. TALOS_ERR, with
+// `out` untouched, when the config does not declare `name` (the error names
+// the node, subsystem and key) or when the path and its NUL do not fit in
+// `out_size` bytes (the error gives the size needed); never truncates.
+int32_t talos_node_trajectory_path(const TalosNode* node, const char* name,
+                                   char* out, uint32_t out_size);
 
 // Parameter kinds. ANY takes the key's own type; LIST takes an array of
 // either element kind (an empty array reports DOUBLE_LIST).
@@ -111,13 +124,30 @@ typedef struct TalosParam {
 // offending element's index and type).
 int32_t talos_node_param(const TalosNode* node, const char* key, int32_t kind,
                          int32_t required, TalosParam* out);
+// talos_node_param on another subsystem's table (talos::Node::param_of):
+// only while the factory runs; a subsystem the config lacks is TALOS_ERR
+// whether or not the key is `required`.
+int32_t talos_node_param_of(const TalosNode* node, const char* subsystem,
+                            const char* key, int32_t kind, int32_t required,
+                            TalosParam* out);
 
 // Registration: call while the factory runs. Indexes are >= 0; -1 is an
 // error. `schema` names the message type; the topic refuses another.
+// No on_message: each drain keeps only the newest message, counting skipped
+// messages as dropped. With on_message: sequence delivery, capped at 64
+// messages per topic per drain, and `wake` (talos::Wake) says when:
+// TALOS_WAKE_ON_PUBLISH makes each publication wake the node to run it;
+// TALOS_WAKE_AT_DRAIN wakes nothing and delivers at the node's next drain.
+// `wake` is ignored without on_message; another value is an error. Both
+// kinds measure freshness from publication.
+enum {  // talos::Wake
+  TALOS_WAKE_ON_PUBLISH = 0,
+  TALOS_WAKE_AT_DRAIN = 1,
+};
 int64_t talos_node_subscribe(TalosNode* node, const char* topic,
                              uint32_t message_bytes, const TalosSchema* schema,
-                             int32_t optional, TalosMessageCallback on_message,
-                             void* user);
+                             int32_t optional, int32_t wake,
+                             TalosMessageCallback on_message, void* user);
 int64_t talos_node_publish(TalosNode* node, const char* topic,
                            uint32_t message_bytes, const TalosSchema* schema);
 int64_t talos_node_publish_bytes(TalosNode* node, const char* topic,
@@ -131,6 +161,8 @@ int32_t talos_node_set_update(TalosNode* node, TalosCallback fn, void* user);
 // Subscription `index`: the latest message (zeros until the first), ...
 const void* talos_subscription_value(const TalosNode* node, int64_t index);
 int32_t talos_subscription_has_value(const TalosNode* node, int64_t index);
+// Consumer now minus writer publication time, in ns; INT64_MAX before the
+// first.
 int64_t talos_subscription_age_ns(const TalosNode* node, int64_t index);
 // max_age_ns < 0: [robot] command_timeout_us.
 int32_t talos_subscription_fresh(const TalosNode* node, int64_t index,
@@ -190,17 +222,28 @@ int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns);
 // accepted hardware state, 0 when none has arrived, TALOS_ERR on error.
 int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns);
 
-// One motor command for the next flush (Motor::set_* / stop).
+// One motor command for the flush after this update() (Motor::set_* /
+// stop). Like talos_digital_output_set and talos_pwm_set, it fails (naming
+// the device) outside the node's update() callback: the flush sends neutral
+// for every output that update() did not set.
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot);
 // Monotonic per-device count of adjusted/neutralized motor setter calls.
 int32_t talos_motor_clamped_count(TalosNode* node, int64_t index,
                                   uint64_t* out);
-// Node-shared software offsets; ignored for disconnected/non-finite samples
-// or non-finite inputs. Motor goals translate to hardware coordinates before
+// Node-shared software offsets; ignored for disconnected/non-finite samples,
+// a motor position older than RezeroAgeBound (devices.h), or non-finite
+// inputs. Motor goals translate to hardware coordinates before
 // applying configured soft limits, which remain in the hardware frame.
 int32_t talos_motor_rezero(TalosNode* node, int64_t index, double position_rot);
 int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot);
+// Motor::zeroed / Gyro::zeroed: 1 while a rezero holds, 0 before one takes
+// and after one was dropped (a gateway boot change, a reset masking this
+// device in the next gateway State, or any reset across a sequence gap),
+// TALOS_ERR on error. A dropped motor zero holds position and motion-magic
+// demands neutral until talos_motor_rezero.
+int32_t talos_motor_zeroed(TalosNode* node, int64_t index);
+int32_t talos_gyro_zeroed(TalosNode* node, int64_t index);
 int32_t talos_digital_output_set(TalosNode* node, int64_t index, int32_t value);
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output);
 
@@ -213,10 +256,30 @@ typedef struct TalosSample {
   double velocity;  // rotations/s (gyro: yaw rate)
   double voltage;   // applied volts (motor), input volts (analog input)
   double current;   // stator amps (motor)
+
+  double temperature_c;     // controller temperature, Celsius (motor)
+  double supply_current_a;  // supply amps (motor), distinct from stator amps
+  // Motor::forward_limit / reverse_limit: 1 while that TalonFX hardware limit
+  // switch is asserted; 0 unless the sample is valid and the state fresh.
+  int32_t forward_limit;
+  int32_t reverse_limit;
 } TalosSample;
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out);
 int32_t talos_sensor_sample(TalosNode* node, int64_t index,
                             TalosSample* out);  // CANcoder, gyro
+// Per-signal node-clock acquisition time: velocity selects rate rather than
+// position/yaw. Returns 1 with *out_ns, 0 if unavailable (including unknown
+// UINT32_MAX age), TALOS_ERR on error. Independent of robot enable.
+int32_t talos_motor_time(TalosNode* node, int64_t index, int32_t velocity,
+                         int64_t* out_ns);
+int32_t talos_sensor_time(TalosNode* node, int64_t index, int32_t velocity,
+                          int64_t* out_ns);
+// Motor::position_age / velocity_age (velocity selects the rate): the
+// signal's age (ns) at the State it arrived in, read from that State, so
+// without the clock mapping. Returns 1 with *out_ns, 0 unless the motor is
+// connected or when the age is unknown, TALOS_ERR on error.
+int32_t talos_motor_age(TalosNode* node, int64_t index, int32_t velocity,
+                        int64_t* out_ns);
 int32_t talos_digital_input_sample(TalosNode* node, int64_t index,
                                    TalosSample* out);
 int32_t talos_analog_input_sample(TalosNode* node, int64_t index,
@@ -275,7 +338,7 @@ int32_t talos_driver_station(TalosNode* node, TalosCallback on_packet,
 // Fills `out` from the node's DriverStation, taken by talos_driver_station.
 int32_t talos_driver_station_read(TalosNode* node, TalosDriverStation* out);
 
-// --- target lanes (talos::Target, talos::TargetLane) ----------------------
+// --- target lanes (talos::Target, talos::TargetLane, OperatorArming) ------
 
 // Opens this node's Target for a message of `message_bytes` aligned to
 // `alignment` (the struct's minimum alignment, a power of two <= 8) and of
@@ -293,15 +356,145 @@ int32_t talos_target_get(TalosNode* node, int64_t target, void* out,
 const char* talos_target_source_name(TalosNode* node, int64_t target,
                                      int32_t source_index);
 // Opens the lane /<subsystem>/target/<source>. Call while the factory runs.
+// `arming`: an index from talos_operator_arming_open on this node, whose
+// lane sends go out as releases while it is not armed; negative for none.
 int64_t talos_target_lane_open(TalosNode* node, const char* subsystem,
                                const char* source, uint32_t message_bytes,
-                               uint32_t alignment, const TalosSchema* schema);
+                               uint32_t alignment, const TalosSchema* schema,
+                               int64_t arming);
 // TargetLane::send (active = 1, stamped with this node's Driver Station mode
 // generation) and release (active = 0). Return 1 sent, 0 dropped by the
-// transport, TALOS_ERR.
+// transport (or, for send, held to a release by the lane's arming),
+// TALOS_ERR.
 int32_t talos_target_lane_send(TalosNode* node, int64_t lane,
                                const void* message, uint32_t size);
 int32_t talos_target_lane_release(TalosNode* node, int64_t lane);
+// talos::OperatorArming: opens one (call while the factory runs) and returns
+// its index. evaluate returns 1 when the producer may publish active targets
+// on this reading of its inputs (`neutral` nonzero: every input at rest), 0
+// otherwise; armed returns 1 or 0 without evaluating. All return TALOS_ERR on
+// error.
+int64_t talos_operator_arming_open(TalosNode* node);
+int32_t talos_operator_arming_evaluate(TalosNode* node, int64_t arming,
+                                       int32_t neutral);
+int32_t talos_operator_arming_armed(TalosNode* node, int64_t arming);
+int32_t talos_operator_arming_disarm(TalosNode* node, int64_t arming);
+
+// --- mechanisms (talOS/mechanisms) -----------------------------------------
+//
+// PositionMechanism, VelocityMechanism and RollerWithSensor, each opened by
+// name on a node (call while the factory runs; the mechanism lives as long
+// as the node) and addressed by the index the open returns. Each call is the
+// C++ method of the same name: requests (set_goal, hold, stop, clear_fault)
+// and update fail, naming the mechanism, outside the node's update(), and
+// the open fails, naming the key, on a missing or invalid parameter. *_state
+// fills what the getters return now (as of the last update(), when they
+// change) and, for position and velocity, `message`, unless it is NULL, with
+// the control message state() returns (control::PositionState,
+// control::VelocityState); a `message_size` other than that message's size
+// is an error.
+
+enum {  // talos::mechanisms::PositionPhase
+  TALOS_POSITION_PHASE_UNHOMED = 0,
+  TALOS_POSITION_PHASE_HOMING = 1,
+  TALOS_POSITION_PHASE_READY = 2,
+  TALOS_POSITION_PHASE_MOVING = 3,
+  TALOS_POSITION_PHASE_AT_GOAL = 4,
+  TALOS_POSITION_PHASE_FAULTED = 5,
+};
+enum {  // talos::mechanisms::PositionFault
+  TALOS_POSITION_FAULT_NONE = 0,
+  TALOS_POSITION_FAULT_HOMING_TIMEOUT = 1,
+  TALOS_POSITION_FAULT_HOMING_STALL = 2,
+  TALOS_POSITION_FAULT_SWITCH_STUCK = 3,
+  TALOS_POSITION_FAULT_STALL = 4,
+  TALOS_POSITION_FAULT_MOVE_TIMEOUT = 5,
+};
+enum {  // talos::mechanisms::VelocityPhase
+  TALOS_VELOCITY_PHASE_STOPPED = 0,
+  TALOS_VELOCITY_PHASE_SPINNING_UP = 1,
+  TALOS_VELOCITY_PHASE_AT_SPEED = 2,
+};
+enum {  // talos::mechanisms::RollerCommand
+  TALOS_ROLLER_COMMAND_IDLE = 0,
+  TALOS_ROLLER_COMMAND_INTAKE = 1,
+  TALOS_ROLLER_COMMAND_EJECT = 2,
+  TALOS_ROLLER_COMMAND_FEED = 3,
+};
+enum {  // talos::mechanisms::RollerPhase
+  TALOS_ROLLER_PHASE_IDLE = 0,
+  TALOS_ROLLER_PHASE_INTAKING = 1,
+  TALOS_ROLLER_PHASE_HOLDING = 2,
+  TALOS_ROLLER_PHASE_EJECTING = 3,
+  TALOS_ROLLER_PHASE_FEEDING = 4,
+};
+
+typedef struct TalosPositionMechanismState {
+  int32_t phase;  // TALOS_POSITION_PHASE_*
+  int32_t fault;  // TALOS_POSITION_FAULT_*
+  int32_t homed;
+  int32_t at_goal;
+  int32_t driving;
+  int32_t connected;
+  double position_rot;
+  double position_units;
+  double velocity_rps;
+  double goal_rot;
+  double gravity_v;
+  double tolerance_rot;
+} TalosPositionMechanismState;
+int64_t talos_position_mechanism_open(TalosNode* node, const char* name);
+int32_t talos_position_mechanism_set_goal(TalosNode* node, int64_t index,
+                                          double position_rot,
+                                          double feedforward_v);
+int32_t talos_position_mechanism_set_goal_units(TalosNode* node, int64_t index,
+                                                double position_units,
+                                                double feedforward_v);
+int32_t talos_position_mechanism_hold(TalosNode* node, int64_t index,
+                                      double feedforward_v);
+int32_t talos_position_mechanism_stop(TalosNode* node, int64_t index);
+int32_t talos_position_mechanism_update(TalosNode* node, int64_t index);
+int32_t talos_position_mechanism_clear_fault(TalosNode* node, int64_t index);
+int32_t talos_position_mechanism_state(TalosNode* node, int64_t index,
+                                       TalosPositionMechanismState* out,
+                                       void* message, uint32_t message_size);
+
+// current_a is VelocityMechanism::state()'s (stator amps).
+typedef struct TalosVelocityMechanismState {
+  int32_t phase;  // TALOS_VELOCITY_PHASE_*
+  int32_t at_speed;
+  int32_t driving;
+  int32_t connected;
+  double velocity_rps;
+  double goal_rps;
+  double commanded_rps;
+  double current_a;
+} TalosVelocityMechanismState;
+int64_t talos_velocity_mechanism_open(TalosNode* node, const char* name);
+int32_t talos_velocity_mechanism_set_goal(TalosNode* node, int64_t index,
+                                          double velocity_rps,
+                                          double feedforward_v);
+int32_t talos_velocity_mechanism_stop(TalosNode* node, int64_t index);
+int32_t talos_velocity_mechanism_update(TalosNode* node, int64_t index);
+int32_t talos_velocity_mechanism_state(TalosNode* node, int64_t index,
+                                       TalosVelocityMechanismState* out,
+                                       void* message, uint32_t message_size);
+
+typedef struct TalosRollerWithSensorState {
+  int32_t phase;  // TALOS_ROLLER_PHASE_*
+  int32_t has_piece;
+  int32_t sensor_connected;
+  int32_t driving;
+  double output_v;
+} TalosRollerWithSensorState;
+int64_t talos_roller_with_sensor_open(TalosNode* node, const char* name);
+// `command` is a TALOS_ROLLER_COMMAND_*; another value is an error.
+int32_t talos_roller_with_sensor_set_goal(TalosNode* node, int64_t index,
+                                          int32_t command);
+int32_t talos_roller_with_sensor_stop(TalosNode* node, int64_t index);
+int32_t talos_roller_with_sensor_update(TalosNode* node, int64_t index);
+int32_t talos_roller_with_sensor_state(TalosNode* node, int64_t index,
+                                       TalosRollerWithSensorState* out);
 
 // --- test harness (libtalos_node_testing.so only) ------------------------
 
@@ -317,6 +510,10 @@ TalosNode* talos_sim_add(TalosSim* sim, const char* node_name,
                          TalosFactory factory, void* user);
 TalosNode* talos_sim_node(TalosSim* sim, const char* node_name);
 int32_t talos_sim_step(TalosSim* sim, int64_t duration_ns);
+// Pauses only this node for duration_ns; resume ends a pause early.
+int32_t talos_sim_pause(TalosSim* sim, const char* node_name,
+                        int64_t duration_ns);
+int32_t talos_sim_resume(TalosSim* sim, const char* node_name);
 int64_t talos_sim_now_ns(const TalosSim* sim);
 int32_t talos_sim_publish_raw(TalosSim* sim, const char* topic,
                               const void* data, uint32_t size);
@@ -352,9 +549,16 @@ void talos_sim_hardware_destroy(TalosSimHardware* hw);
 int32_t talos_sim_hardware_enable(TalosSimHardware* hw, int32_t on);
 int32_t talos_sim_hardware_ideal_motors(TalosSimHardware* hw, int32_t on);
 // Feedback for (node, device), by the names the node uses.
-int32_t talos_sim_hardware_set_motor(TalosSimHardware* hw, const char* node,
-                                     const char* device, double position,
-                                     double velocity);
+int32_t talos_sim_hardware_set_motor(
+    TalosSimHardware* hw, const char* node, const char* device, double position,
+    double velocity, uint32_t position_age_us, uint32_t velocity_age_us,
+    double temperature_c, double supply_current_a, double stator_current_a);
+// SimHardware::set_limit_switches: the motor's forward and reverse TalonFX
+// limit switches, asserted (nonzero) or not, from the next state on.
+int32_t talos_sim_hardware_set_limit_switches(TalosSimHardware* hw,
+                                              const char* node,
+                                              const char* device,
+                                              int32_t forward, int32_t reverse);
 int32_t talos_sim_hardware_set_digital_input(TalosSimHardware* hw,
                                              const char* node,
                                              const char* device, int32_t value);
@@ -366,10 +570,13 @@ int32_t talos_sim_hardware_set_encoder(TalosSimHardware* hw, const char* node,
                                        double velocity);
 int32_t talos_sim_hardware_set_cancoder(TalosSimHardware* hw, const char* node,
                                         const char* device, double position,
-                                        double velocity);
+                                        double velocity,
+                                        uint32_t position_age_us,
+                                        uint32_t velocity_age_us);
 int32_t talos_sim_hardware_set_gyro(TalosSimHardware* hw, const char* node,
                                     const char* device, double yaw,
-                                    double yaw_rate);
+                                    double yaw_rate, uint32_t yaw_age_us,
+                                    uint32_t yaw_rate_age_us);
 // SimHardware::set_gateway_clock: the gateway clock reads sim time +
 // gateway_offset_ns, and each state is sampled latency_ns before it goes out.
 int32_t talos_sim_hardware_set_gateway_clock(TalosSimHardware* hw,
@@ -379,6 +586,15 @@ int32_t talos_sim_hardware_set_gateway_clock(TalosSimHardware* hw,
 // (SimHardware::set_connected).
 int32_t talos_sim_hardware_set_connected(TalosSimHardware* hw, const char* node,
                                          const char* device, int32_t connected);
+// SimHardware::reset_device: the next state counts a reset of the motor or
+// sensor of `node` named `device`, and it and the state after mask it with
+// what the gateway masks along with it.
+int32_t talos_sim_hardware_reset_device(TalosSimHardware* hw, const char* node,
+                                        const char* device);
+// SimHardware::lose_states: the next `count` gateway ticks publish nothing.
+int32_t talos_sim_hardware_lose_states(TalosSimHardware* hw, int32_t count);
+// SimHardware::reboot: a new gateway boot id from the next state on.
+int32_t talos_sim_hardware_reboot(TalosSimHardware* hw);
 // The Driver Station packet to forward from now on
 // (SimHardware::set_driver_station); the rest of the packet is zero. NULL
 // stops forwarding: the Driver Station goes silent
@@ -392,7 +608,8 @@ typedef struct TalosDriverStationPacket {
 } TalosDriverStationPacket;
 int32_t talos_sim_hardware_set_driver_station(
     TalosSimHardware* hw, const TalosDriverStationPacket* packet);
-// The last request flushed by `node` for `device`.
+// Raw requests: last value explicitly requested, unchanged by expiry,
+// omission from a later request, or disable.
 typedef struct TalosMotorRequest {
   int32_t mode;  // TALOS_MODE_*
   int32_t slot;
@@ -407,6 +624,17 @@ int32_t talos_sim_hardware_digital_output(const TalosSimHardware* hw,
                                           const char* node, const char* device);
 int32_t talos_sim_hardware_pwm(const TalosSimHardware* hw, const char* node,
                                const char* device, double* out);
+// Applied outputs after per-node timeout, omission, and the enabled gate.
+// Motor/PWM return TALOS_OK or TALOS_ERR; digital returns 0/1 or TALOS_ERR.
+int32_t talos_sim_hardware_applied_motor(const TalosSimHardware* hw,
+                                         const char* node, const char* device,
+                                         TalosMotorRequest* out);
+int32_t talos_sim_hardware_applied_digital_output(const TalosSimHardware* hw,
+                                                  const char* node,
+                                                  const char* device);
+int32_t talos_sim_hardware_applied_pwm(const TalosSimHardware* hw,
+                                       const char* node, const char* device,
+                                       double* out);
 
 #ifdef __cplusplus
 }  // extern "C"

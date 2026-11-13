@@ -4,7 +4,10 @@
 #include <cmath>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+
+#include "../driver_station/driver_station.h"
 
 namespace talos::hardware {
 namespace {
@@ -29,20 +32,45 @@ struct Hash {
 }  // namespace
 
 void Validate(const Config& c) {
-  Require(!c.motors.empty() && c.motors.size() <= kMaxMotors &&
-              c.sensors.size() <= kMaxSensors &&
+  // No device at all is a robot brought up before its first mechanism.
+  Require(c.motors.size() <= kMaxMotors && c.sensors.size() <= kMaxSensors &&
               c.digital_inputs.size() <= kMaxDigitalInputs &&
               c.digital_outputs.size() <= kMaxDigitalOutputs &&
               c.analog_inputs.size() <= kMaxAnalogInputs &&
               c.encoders.size() <= kMaxEncoders &&
               c.pwm_outputs.size() <= kMaxPwmOutputs,
           "invalid hardware device count");
-  Require(c.period_us >= 1000 && c.period_us <= 20000 &&
-              c.command_timeout_us >= 2 * c.period_us &&
-              c.command_timeout_us <= 500000,
-          "invalid gateway period or command timeout");
+  Require(c.period_us >= 1000 && c.period_us <= 20000,
+          "invalid gateway period");
+  // Every node's Driver Station view expires at command_timeout_us. The
+  // gateway sends a Driver Station packet on its first tick at least
+  // kSamplePeriodUs after the previous one, so packets can be
+  // kSamplePeriodUs + period_us apart; two such gaps leave a whole gap of
+  // margin, where a shorter timeout can drop the mode between packets and
+  // every Target with it. That also covers two gateway periods.
+  const uint64_t min_timeout_us =
+      2 * (driver_station::kSamplePeriodUs + c.period_us);
+  if (c.command_timeout_us < min_timeout_us || c.command_timeout_us > 500000) {
+    throw std::invalid_argument(
+        "command_timeout_us " + std::to_string(c.command_timeout_us) +
+        " is outside [" + std::to_string(min_timeout_us) +
+        ", 500000]: it must span two Driver Station packet gaps of up to " +
+        std::to_string(driver_station::kSamplePeriodUs) +
+        " us + period_us each");
+  }
   Require(Positive(c.status_hz) && c.status_hz <= 1000,
           "invalid status frequency");
+  // The gateway counts motion feedback command_timeout_us old as invalid
+  // (FeedbackFresh, gate.h). Four status periods inside it, the factor an
+  // actuator owner's period has too, keep a slow rate from reading as a
+  // dropout at every frame.
+  if (c.status_hz * static_cast<double>(c.command_timeout_us) < 4'000'000) {
+    throw std::invalid_argument(
+        "status_hz " + std::to_string(c.status_hz) +
+        " gives fewer than four status periods per command_timeout_us " +
+        std::to_string(c.command_timeout_us) +
+        ": it must be at least 4000000 / command_timeout_us");
+  }
   std::set<uint16_t> ids;
   std::set<std::string> names;
   std::set<std::pair<std::string, int>> addresses;
@@ -100,6 +128,9 @@ void Validate(const Config& c) {
                 std::isfinite(m.forward_limit_rot) &&
                 m.reverse_limit_rot < m.forward_limit_rot,
             "invalid soft limits");
+    Require(m.forward_limit_switch <= LimitSwitch::kDisabled &&
+                m.reverse_limit_switch <= LimitSwitch::kDisabled,
+            "unknown limit switch type");
     for (const auto& g : m.slots) {
       for (double x : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) {
         Require(std::isfinite(x) && x >= 0, "invalid gain");
@@ -197,6 +228,8 @@ uint64_t ConfigurationId(const Config& c) {
     h.Add(m.soft_limits);
     h.Number(m.reverse_limit_rot);
     h.Number(m.forward_limit_rot);
+    h.Add(static_cast<uint8_t>(m.forward_limit_switch));
+    h.Add(static_cast<uint8_t>(m.reverse_limit_switch));
     h.Number(m.max_velocity_rps);
     h.Number(m.cruise_velocity_rps);
     h.Number(m.acceleration_rps2);

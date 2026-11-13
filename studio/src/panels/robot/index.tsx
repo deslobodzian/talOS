@@ -1,15 +1,17 @@
 // The robot panel: the at-a-glance answer to "what is the robot doing right
-// now". A dense grid of cards over Driver Station, routine phase, power, link,
-// pose, the discovered subsystems and cameras, and the recent event feed. It
-// reads only through the data hooks and discovers owners/channels by shape, so
-// it stays robot-agnostic: no 2026 node names are hard-coded here.
+// now". A dense grid of cards over Driver Station, routine and phase, power,
+// link, pose, alerts, the discovered subsystems and cameras, and the recent
+// event feed. It reads only through the data hooks and discovers
+// owners/channels by shape, so it stays robot-agnostic: no 2026 node names are hard-coded here.
 
 import {useMemo} from 'react';
 import type {ReactNode} from 'react';
 
-import {poseError, simTruthPose} from '../../core';
+import {channelDisplay, poseError, simTruthPose} from '../../core';
+import {activeAlerts} from '../../data/alerts';
 import {
   useActions,
+  useAlertLatch,
   useDictionary,
   useEvents,
   useRobotStatus,
@@ -27,9 +29,11 @@ import {
 } from '../../data/discovery';
 import {channelLeaf} from '../../ui/channel';
 import {duration, number} from '../../ui/formatters';
-import {EmptyState, Stat, StatList} from '../../ui/primitives';
+import {EmptyState, StatList} from '../../ui/primitives';
 import {Sparkline} from '../../ui/Sparkline';
+import {ActiveAlertList, LatchedAlertList, latchSpan} from '../../ui/AlertList';
 import type {PanelDefinition} from '../types';
+import {ChannelReading, ChannelStat as Stat, FreshnessNotice} from '../../ui/FreshnessNotice';
 import './robot.css';
 
 export type RobotConfig = Record<string, never>;
@@ -53,9 +57,9 @@ export function maskBits(value: number|null|undefined): string|null {
   return bits.length ? bits.join(', ') : 'none';
 }
 
-// The last finite value of a series column, and the change of that value over
-// the trailing `windowSeconds` of the series. Both are null when the column
-// has no reading in range: "not measured" is never "zero".
+// The last finite counter value and accumulated increments over the trailing
+// `windowSeconds`. A decrease starts a new counter from zero. Both are null
+// when the column has no reading: "not measured" is never "zero".
 export function windowDelta(
     series: Series, name: string, windowSeconds: number):
     {current: number|null; delta: number|null} {
@@ -74,7 +78,14 @@ export function windowDelta(
     prior = i;
     if (series.times[i] <= bound) break;
   }
-  const delta = prior === last ? 0 : current - values[prior];
+  let delta = 0;
+  let prev = values[prior];
+  for (let i = prior + 1; i <= last; i++) {
+    const v = values[i];
+    if (!Number.isFinite(v)) continue;
+    delta += v >= prev ? v - prev : Math.max(0, v);
+    prev = v;
+  }
   return {current, delta};
 }
 
@@ -103,23 +114,20 @@ export function phaseFromSeries(
   const currentValue = values[end];
   const current = label(currentValue);
 
-  // Walk back to the first sample whose label differs from the current one.
+  // Walk back through finite samples of the current phase, stopping at a change.
   let previous: string|null = null;
-  let boundary = end;
+  let earliestFinite = end;
   for (let i = end - 1; i >= 0; i--) {
     if (!Number.isFinite(values[i])) continue;
     if (label(values[i]) !== current) {
       previous = label(values[i]);
-      boundary = i;
       break;
     }
+    earliestFinite = i;
   }
 
-  // The phase has held since the first sample of the current label (the
-  // sample after the boundary, or the first retained sample when there is no
-  // previous label in range).
-  const startIndex = boundary === end ? 0 : boundary + 1;
-  return {current, previous, seconds: series.times[end] - series.times[startIndex]};
+  // Gaps before the first finite reading of this run are not phase time.
+  return {current, previous, seconds: series.times[end] - series.times[earliestFinite]};
 }
 
 const MODE_LABEL: Record<DriverStationMode, string> = {
@@ -165,7 +173,7 @@ function Card({title, eyebrow, children}: {
 
 function ModeBadge({mode}: {mode: DriverStationMode|null}) {
   return <em className={'mode-badge' + (mode ? ' ' + mode : ' unknown')}>
-    {mode ? MODE_LABEL[mode] : '—'}
+    <ChannelReading channel="hw/state/driver_station/enabled">{mode ? MODE_LABEL[mode] : '—'}</ChannelReading>
   </em>;
 }
 
@@ -190,7 +198,7 @@ function SubsystemTile({subsystem, channels, labels}: {
     <b className="tile-name">{subsystem.name}</b>
     <span className={'tile-enabled' + (enabled === true ? ' on' :
                  enabled === false ? ' off' : '')}>
-      {enabled === null ? '—' : enabled ? 'enabled' : 'disabled'}
+      {enabledName ? <ChannelReading channel={enabledName}>{enabled === null ? '—' : enabled ? 'enabled' : 'disabled'}</ChannelReading> : '—'}
     </span>
     <span className="tile-source">← {selected}</span>
     {enumBadge && <span className="tile-enum">{enumBadge.leaf}: {enumBadge.label}</span>}
@@ -211,7 +219,7 @@ function CameraTile({camera, channels}: {
   return <div className="camera-tile">
     <b className="tile-name">{camera.name}</b>
     <span className={'tile-health' + (healthy === false ? ' bad' : healthy === true ? ' good' : '')}>
-      {healthy === null ? '—' : healthy ? 'healthy' : 'unhealthy'}
+      {healthyName ? <ChannelReading channel={healthyName}>{healthy === null ? '—' : healthy ? 'healthy' : 'unhealthy'}</ChannelReading> : '—'}
     </span>
     <span className="tile-metric">{fps === null ? '—' : `${fps.toFixed(0)} fps`}</span>
     <span className="tile-metric">{tags === undefined ? '—' : `${tags} tags`}</span>
@@ -227,6 +235,7 @@ function RobotPanel() {
   const status = useRobotStatus();
   const events = useEvents();
   const actions = useActions();
+  const latch = useAlertLatch();
 
   const graph = system.graph;
   const channels = snapshot?.channels ?? {};
@@ -242,6 +251,17 @@ function RobotPanel() {
   const phaseChannel = useMemo(() => dictionary.find(
       c => /^[^/]+\/state\/phase$/.test(c.name) && c.labels.length > 0) ?? null,
       [dictionary]);
+  // The selected routine: <owner>/state/routine_index, the phase owner's when
+  // it has one. Its labels are the routine names telemetry attaches
+  // ([[subsystem.labels]]); without them, or out of their range, the index.
+  const routineChannel = useMemo(() => {
+    const routines = dictionary.filter(c => /^[^/]+\/state\/routine_index$/.test(c.name));
+    const owner = phaseChannel?.name.slice(0, phaseChannel.name.indexOf('/'));
+    return routines.find(c => c.name === `${owner}/state/routine_index`) ??
+        routines[0] ?? null;
+  }, [dictionary, phaseChannel]);
+  const routine = routineChannel && snapshot ?
+      channelDisplay(snapshot, routineChannel.name) : '';
 
   // Gateway counters (any hw/status/gateway_*_count), discovered rather than
   // hard-coded so every counter the hardware reports is shown.
@@ -296,8 +316,12 @@ function RobotPanel() {
       null;
 
   const recent = useMemo(() => events.slice(-8), [events]);
+  const alerts = useMemo(() => activeAlerts(snapshot), [snapshot]);
+  const hasAlertChannels = useMemo(
+      () => dictionary.some(c => c.alert), [dictionary]);
 
   return <div className="robot-panel">
+    <FreshnessNotice/>
     <div className="robot-grid">
       <Card title="Driver Station" eyebrow="DS">
         {status.ds.mode === null ?
@@ -305,28 +329,34 @@ function RobotPanel() {
              <div className="ds-card">
                <ModeBadge mode={status.ds.mode}/>
                <StatList>
-                 <Stat label="Enabled" tone={status.ds.enabled ? 'ok' : 'warn'}>
+                 <Stat label="Enabled" channel="hw/state/driver_station/enabled" tone={status.ds.enabled ? 'ok' : 'warn'}>
                    {status.ds.enabled === null ? '—' : status.ds.enabled ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="Match time">{matchTime(status.ds.matchTime_s)}</Stat>
-                 <Stat label="Alliance">{status.ds.alliance ?? '—'}</Stat>
-                 <Stat label="FMS">{status.ds.fms === null ? '—' : status.ds.fms ? 'attached' : 'not attached'}</Stat>
+                 <Stat label="Match time" channel="hw/state/driver_station/match_time_s">{matchTime(status.ds.matchTime_s)}</Stat>
+                 <Stat label="Alliance" channel="hw/state/driver_station/alliance">{status.ds.alliance ?? '—'}</Stat>
+                 <Stat label="FMS" channel="hw/state/driver_station/fms_attached">{status.ds.fms === null ? '—' : status.ds.fms ? 'attached' : 'not attached'}</Stat>
                </StatList>
              </div>}
       </Card>
 
       <Card title="Routine" eyebrow="PHASE">
-        {!phaseChannel ?
-             <EmptyState>no phase channel discovered</EmptyState> :
+        {!phaseChannel && !routineChannel ?
+             <EmptyState>no routine or phase channel discovered</EmptyState> :
              <div className="routine-card">
-               <div className="phase-current">{phase.current ?? '—'}</div>
-               <StatList>
-                 <Stat label="In phase">{phase.seconds == null || !Number.isFinite(phase.seconds) ? '—' :
-                     phase.seconds < 60 ? `${phase.seconds.toFixed(1)} s` :
-                     phase.seconds < 3600 ? `${(phase.seconds / 60).toFixed(1)} min` :
-                     `${(phase.seconds / 3600).toFixed(1)} h`}</Stat>
-                 <Stat label="Previous">{phase.previous ?? '—'}</Stat>
-               </StatList>
+               {routineChannel && <div className="routine-name">
+                 <ChannelReading channel={routineChannel.name}>{routine || '—'}</ChannelReading>
+                 <span className="routine-hint">selected while disabled, latched at autonomous start</span>
+               </div>}
+               {phaseChannel && <>
+                 <div className="phase-current"><ChannelReading channel={phaseChannel.name}>{phase.current ?? '—'}</ChannelReading></div>
+                 <StatList>
+                   <Stat label="In phase" channel={phaseChannel.name}>{phase.seconds == null || !Number.isFinite(phase.seconds) ? '—' :
+                       phase.seconds < 60 ? `${phase.seconds.toFixed(1)} s` :
+                       phase.seconds < 3600 ? `${(phase.seconds / 60).toFixed(1)} min` :
+                       `${(phase.seconds / 3600).toFixed(1)} h`}</Stat>
+                   <Stat label="Previous">{phase.previous ?? '—'}</Stat>
+                 </StatList>
+               </>}
              </div>}
       </Card>
 
@@ -336,16 +366,16 @@ function RobotPanel() {
              <div className="power-card">
                <div className="battery-row">
                  <span className="battery-v">
-                   {status.power.battery_v === null ? '—' :
-                       `${number(status.power.battery_v, 2)} V`}
+                   <ChannelReading channel="hw/status/battery_v">{status.power.battery_v === null ? '—' :
+                       `${number(status.power.battery_v, 2)} V`}</ChannelReading>
                  </span>
                  <Sparkline values={batterySeries.values['hw/status/battery_v'] ?? []}/>
                </div>
                <StatList>
-                 <Stat label="Brownout" tone={status.power.brownout ? 'warn' : undefined}>
+                 <Stat label="Brownout" channel="hw/status/brownout" tone={status.power.brownout ? 'warn' : undefined}>
                    {status.power.brownout === null ? '—' : status.power.brownout ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="CAN util">{status.power.can_frac == null ? '—' :
+                 <Stat label="CAN util" channel="hw/status/can_utilization_frac">{status.power.can_frac == null ? '—' :
                      `${number(status.power.can_frac * 100, 1)} %`}</Stat>
                </StatList>
              </div>}
@@ -355,19 +385,19 @@ function RobotPanel() {
         {status.link.stateAge_us === null && status.link.faultMask === null ?
              <EmptyState>no link data</EmptyState> :
              <StatList>
-               <Stat label="State age" tone={
+               <Stat label="State age" channel="hw/status/state_age_us" tone={
                    status.link.stateAge_us !== null && status.link.stateAge_us > 200000 ?
                        'warn' : undefined}>
                  {status.link.stateAge_us === null ? '—' :
                      duration(status.link.stateAge_us * 1e3)}
                </Stat>
-               <Stat label="Configured" tone={status.link.configured === false ? 'warn' : undefined}>
+               <Stat label="Configured" channel="hw/status/configured" tone={status.link.configured === false ? 'warn' : undefined}>
                  {status.link.configured === null ? '—' : status.link.configured ? 'yes' : 'no'}
                </Stat>
-               <Stat label="Motor faults" tone={status.link.faultMask ? 'warn' : undefined}>
+               <Stat label="Motor faults" channel="hw/status/motor_fault_mask" tone={status.link.faultMask ? 'warn' : undefined}>
                  {maskBits(status.link.faultMask) ?? '—'}
                </Stat>
-               <Stat label="Timed out" tone={status.link.timedOutMask ? 'warn' : undefined}>
+               <Stat label="Timed out" channel="hw/status/timed_out_mask" tone={status.link.timedOutMask ? 'warn' : undefined}>
                  {maskBits(status.link.timedOutMask) ?? '—'}
                </Stat>
              </StatList>}
@@ -386,19 +416,19 @@ function RobotPanel() {
              <EmptyState>no estimator discovered</EmptyState> :
              <div className="pose-card">
                <StatList>
-                 <Stat label="X">{poseX === undefined ? '—' : number(poseX, 3) + ' m'}</Stat>
-                 <Stat label="Y">{poseY === undefined ? '—' : number(poseY, 3) + ' m'}</Stat>
-                 <Stat label="Heading">{poseYaw === undefined || !Number.isFinite(poseYaw) ? '—' :
+                 <Stat label="X" channel={`${posePrefix}/x_m`}>{poseX === undefined ? '—' : number(poseX, 3) + ' m'}</Stat>
+                 <Stat label="Y" channel={`${posePrefix}/y_m`}>{poseY === undefined ? '—' : number(poseY, 3) + ' m'}</Stat>
+                 <Stat label="Heading" channel={`${posePrefix}/yaw_rad`}>{poseYaw === undefined || !Number.isFinite(poseYaw) ? '—' :
                      `${number(poseYaw * 180 / Math.PI, 1)}°`}</Stat>
-                 <Stat label="Valid" tone={
+                 <Stat label="Valid" channel={`${estimator.name}/state/valid`} tone={
                      status.estimator !== null && status.estimator.valid === false ? 'warn' : undefined}>
                    {status.estimator === null || status.estimator.valid === null ? '—' :
                        status.estimator.valid ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="Accepted (10 s)" tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
+                 <Stat label="Accepted (10 s)" channel={estimatorAccepted ?? undefined} tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
                    {accepted.delta === null ? '—' : accepted.delta}
                  </Stat>
-                 <Stat label="Rejected (10 s)" tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
+                 <Stat label="Rejected (10 s)" channel={estimatorRejected ?? undefined} tone={rejected.delta !== null && rejected.delta > 0 ? 'warn' : undefined}>
                    {rejected.delta === null ? '—' : rejected.delta}
                  </Stat>
                  <Stat label="Acceptance">{acceptancePct === null ? '—' : `${number(acceptancePct, 1)} %`}</Stat>
@@ -409,6 +439,19 @@ function RobotPanel() {
                       {number(poseErrorValue.heading_deg, 1)}°
                     </div> :
                     <div className="pose-error muted">no sim truth</div>}
+             </div>}
+      </Card>
+
+      <Card title="Alerts" eyebrow={`${alerts.length} ACTIVE`}>
+        {!hasAlertChannels ?
+             <EmptyState>no alert channels in the dictionary</EmptyState> :
+             <div className="alerts-card">
+               <ActiveAlertList alerts={alerts} latch={latch}
+                                now_ns={snapshot?.timestamp_ns ?? null}/>
+               <div className="alerts-latched">
+                 <h3>Raised · {latchSpan(latch)}</h3>
+                 <LatchedAlertList latch={latch} now_ns={snapshot?.timestamp_ns ?? null}/>
+               </div>
              </div>}
       </Card>
 
@@ -452,8 +495,9 @@ export const robotPanel: PanelDefinition<RobotConfig> = {
   id: 'robot',
   title: 'Robot',
   category: 'Robot',
-  description: 'At a glance: Driver Station, routine, power, link, pose, subsystems, cameras and events.',
+  description: 'At a glance: Driver Station, routine, power, link, pose, alerts, subsystems, cameras and events.',
   defaultConfig,
   parseConfig,
-  component: RobotPanel
+  component: RobotPanel,
+  recorded: true
 };

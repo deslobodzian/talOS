@@ -17,7 +17,7 @@ enum class Mode : uint8_t {
   kMotionMagic
 };
 enum StateFlags : uint32_t {
-  kConfigured = 1,
+  kConfigured = 1,  // a config applied and commissioned
   kEnabled = 2,
   kCommandActive = 4,
   kHardwareFault = 8
@@ -56,8 +56,38 @@ struct MotorSample {
   double position_rot{}, velocity_rps{}, voltage{}, stator_current_a{};
   uint32_t position_age_us{}, velocity_age_us{};
   uint32_t fault_flags{};
+  double temperature_c{}, supply_current_a{};
   bool operator==(const MotorSample&) const = default;
 };
+// `fault_flags` is the Phoenix 6 TalonFX FaultField. Bits 14-17 (forward and
+// reverse soft limit, forward and reverse hard limit) say a limit is asserted:
+// a homed mechanism resting on its limit switch, or a motor held at a soft
+// limit, is operating normally, so these bits are not a fault.
+inline constexpr uint32_t kMotorLimitAssertedFlags = uint32_t{0xF} << 14;
+// ForwardHardLimit and ReverseHardLimit: an enabled switch on the TalonFX's
+// own forward or reverse limit input is asserted, and the TalonFX holds output
+// toward it neutral (Motor::forward_limit, reverse_limit).
+inline constexpr uint32_t kMotorForwardHardLimitFlag = uint32_t{1} << 16;
+inline constexpr uint32_t kMotorReverseHardLimitFlag = uint32_t{1} << 17;
+// Bits 8-9 (SupplyCurrLimit, StatorCurrLimit) say the TalonFX's configured
+// supply or stator current limiter is holding current at its limit, as it does
+// for a few milliseconds on any hard acceleration from rest: the limiter
+// working as configured, not a failure.
+inline constexpr uint32_t kMotorCurrentLimitFlags = uint32_t{0x3} << 8;
+// The FaultField bits that report a limit or limiter acting as configured and
+// so are not a motor fault: the asserted soft and hard limits and the active
+// current limits. They stay in `fault_flags` for display; MotorFaulted, and so
+// `/hw/status` `motor_fault_mask`, the hardware log's `faulted` and the
+// RoboRIO's faulted-motor console line, ignore them. Every other bit,
+// including StaticBrakeDisabled (bit 6, a protective release the
+// configuration did not ask for), is a fault.
+inline constexpr uint32_t kMotorNotFaultFlags =
+    kMotorLimitAssertedFlags | kMotorCurrentLimitFlags;
+// Whether the controller reports a fault other than a limit or limiter acting
+// as configured (kMotorNotFaultFlags).
+inline constexpr bool MotorFaulted(uint32_t fault_flags) {
+  return (fault_flags & ~kMotorNotFaultFlags) != 0;
+}
 struct SensorSample {
   uint16_t id{};
   bool valid{};
@@ -112,9 +142,54 @@ struct GatewayCounters {
   uint32_t device_reset_count{};
   bool operator==(const GatewayCounters&) const = default;
 };
+// The program running the gateway. Wire values, never renumbered. Decode
+// rejects a value above kLastGatewayProgram, so adding one is an incompatible
+// State change: bump protocol::kProtocolVersion with it.
+enum class GatewayProgram : uint8_t {
+  kUnknown = 0,            // a gateway that does not say (tests, SimHardware)
+  kRoboRio = 1,            // the RoboRIO program on a RoboRIO
+  kRoboRioSimulation = 2,  // the RoboRIO program under WPILib simulation
+  kSimGateway = 3,         // //2026-robot/main_processor/simulation:sim_gateway
+};
+inline constexpr GatewayProgram kLastGatewayProgram =
+    GatewayProgram::kSimGateway;
+// Its name in logs and records: unknown, roborio, roborio_simulation,
+// sim_gateway.
+inline constexpr const char* GatewayProgramName(GatewayProgram program) {
+  switch (program) {
+    case GatewayProgram::kUnknown:
+      break;
+    case GatewayProgram::kRoboRio:
+      return "roborio";
+    case GatewayProgram::kRoboRioSimulation:
+      return "roborio_simulation";
+    case GatewayProgram::kSimGateway:
+      return "sim_gateway";
+  }
+  return "unknown";
+}
+// Which build of which program sends the State, so a session record shows
+// the build that drove the hardware (Gateway::SetBuild).
+struct GatewayBuild {
+  // The first 16 hex digits of the git commit the program was built from,
+  // read as one hex number (print it with %016llx); 0 when unknown: built
+  // outside a git checkout, or a program that does not embed its revision
+  // (sim_gateway, whose checkout is the main processor's).
+  uint64_t revision{};
+  GatewayProgram program{GatewayProgram::kUnknown};
+  // Built with uncommitted changes, untracked files included.
+  bool dirty{};
+  bool operator==(const GatewayBuild&) const = default;
+};
 struct State {
   uint64_t config_id{}, boot_id{}, epoch{}, sample_time_us{},
       last_command_sequence{};
+  uint64_t clock_probe_time_us{};
+  // Gateway::Tick count within this boot, incremented at the top of every
+  // tick, so a consumer can tell consecutive States from a gap (a lost
+  // datagram, a tick with no socket, a reconfigure's extra tick).
+  uint64_t sequence{};
+  GatewayBuild build{};
   uint32_t flags{};
   uint16_t motor_count{}, sensor_count{};
   uint16_t digital_input_count{}, digital_output_count{};
@@ -142,10 +217,14 @@ inline constexpr std::size_t kMaxCommandSize =
     kMaxPwmOutputs * kPwmRequestSize;
 
 inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
-inline constexpr std::size_t kGatewayCountersSize = 4 * 4;
+inline constexpr std::size_t kGatewayCountersSize = std::size_t{4} * 4;
+// Revision u64, program u8, dirty u8.
+inline constexpr std::size_t kGatewayBuildSize = 8 + 1 + 1;
 inline constexpr std::size_t kStateBaseSize =
-    5 * 8 + 4 + 7 * 2 + kHealthSampleSize + kGatewayCountersSize;
-inline constexpr std::size_t kMotorSampleSize = 2 + 1 + 4 * 8 + 3 * 4;
+    std::size_t{7} * 8 + kGatewayBuildSize + 4 + std::size_t{7} * 2 +
+    kHealthSampleSize + kGatewayCountersSize;
+// Current and temperature use signed tenths (saturating int16) on the wire.
+inline constexpr std::size_t kMotorSampleSize = 2 + 1 + 3 * 8 + 3 * 2 + 3 * 4;
 inline constexpr std::size_t kSensorSampleSize = 2 + 1 + 2 * 8 + 2 * 4;
 inline constexpr std::size_t kDigitalInputSampleSize = 2 + 1 + 1;
 inline constexpr std::size_t kDigitalOutputSampleSize = 2 + 1 + 1;
@@ -161,7 +240,9 @@ inline constexpr std::size_t kMaxStateSize =
     kMaxEncoders * kEncoderSampleSize + kMaxPwmOutputs * kPwmSampleSize;
 
 static_assert(kMaxCommandSize == 410, "Update docs/DATA_FLOW.md");
-static_assert(kMaxStateSize == 1412, "Update docs/DATA_FLOW.md");
+static_assert(kStateBaseSize - kHealthSampleSize - kGatewayCountersSize == 84,
+              "Update docs/DATA_FLOW.md");
+static_assert(kMaxStateSize == 1406, "Update docs/DATA_FLOW.md");
 
 // Explicit little-endian codecs: no padding, native bool layout, or alignment
 // assumptions cross the RoboRIO/companion boundary.

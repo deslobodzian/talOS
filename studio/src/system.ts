@@ -60,6 +60,18 @@ export type SystemSource = {
 // does: robot disabled, Driver Station stale, or no live lane in the mode.
 export type SystemSelection = {sources: string[]; selected: string|null};
 
+// What a node lost of what it should have been woken for or delivered, from
+// its registry row (talOS/introspection README "Wake loss"), each cumulative
+// since the node started and normally 0: wake notifications its writers could
+// not send, prompt watchers whose stalled arms stopped holding its loop
+// awake, runs that fell back to polling, and (the hardware bridge) requests
+// its latest-value reads passed over.
+export const DELIVERY_COUNTERS = [
+  'wake_failures', 'stalled_arms', 'wake_fallbacks', 'requests_skipped'
+] as const;
+export type DeliveryCounter = typeof DELIVERY_COUNTERS[number];
+export type DeliveryLoss = Record<DeliveryCounter, string>;
+
 export type SystemNode = {
   name: string; target: string; slot: number; pid: string; session_id: string;
   generation: string;
@@ -74,7 +86,16 @@ export type SystemNode = {
   // The node's Targets, in the order it opened them. Empty for a node that
   // drives nothing, and for a bridge that predates the field.
   selections: SystemSelection[];
+  // Null (or absent) from a bridge that predates the counters: not
+  // reported, not zero.
+  delivery?: DeliveryLoss|null;
 };
+
+// The node's nonzero delivery counters, in DELIVERY_COUNTERS order; empty
+// when it lost nothing or did not report.
+export const deliveryLoss = (node: SystemNode): [DeliveryCounter, string][] =>
+    DELIVERY_COUNTERS.filter(key => (node.delivery?.[key] ?? '0') !== '0')
+        .map(key => [key, node.delivery![key]]);
 
 export type SystemTopic = {
   name: string; message_bytes: number; publishers: string[];
@@ -97,6 +118,21 @@ export type SystemGraph = {
   nodes: SystemNode[];
   topics: SystemTopic[];
 };
+
+// The launcher session of the live process publishing the bridge's telemetry
+// topic, from its registry row; null when the graph names none (no registry,
+// or the producer is between processes) or its live rows disagree. This is how
+// a viewer tells a producer restart within one session (the same session id)
+// from a new launcher session behind the same bridge: the manifest the bridge
+// serves is the file it was started with, so it cannot say.
+export function telemetrySession(graph: SystemGraph): string|null {
+  const publishers =
+      graph.topics.find(topic => topic.name === graph.bridge.topic)?.publishers ?? [];
+  const sessions = new Set(graph.nodes.filter(node => node.alive &&
+                                              publishers.includes(node.name))
+                               .map(node => node.session_id));
+  return sessions.size === 1 ? [...sessions][0] : null;
+}
 
 // Caps chosen well above anything the registry can hold (32 nodes, 64 sources
 // each) so a legitimate document never trips them, and far below anything that
@@ -240,6 +276,16 @@ function selections(node: Record<string, unknown>,
       .map((entry, i) => parseSelection(entry, `${where}.selections[${i}]`));
 }
 
+// Absent is read as not reported rather than refused, the rule `flag`
+// follows: a bridge built before the counters sends no `delivery`.
+function delivery(node: Record<string, unknown>): DeliveryLoss|null {
+  if (node.delivery === undefined) return null;
+  const counters = record(node.delivery, 'delivery');
+  return Object.fromEntries(
+             DELIVERY_COUNTERS.map(key => [key, u64(counters, key)])) as
+      DeliveryLoss;
+}
+
 function parseNode(value: unknown, where: string): SystemNode {
   const node = record(value, where);
   return {
@@ -259,7 +305,8 @@ function parseNode(value: unknown, where: string): SystemNode {
     sources:
         list(node, 'sources', MAX_SOURCES)
             .map((entry, i) => parseSource(entry, `${where}.sources[${i}]`)),
-    selections: selections(node, where)
+    selections: selections(node, where),
+    delivery: delivery(node)
   };
 }
 
@@ -280,7 +327,11 @@ function parseTopic(value: unknown, where: string): SystemTopic {
 export function parseSystemGraph(text: string): SystemGraph {
   return parsing('system graph', () => {
     if (text.length > MAX_SYSTEM_BYTES) fail('document too large');
-    const root = record(JSON.parse(text), 'document');
+    return graphOf(record(JSON.parse(text), 'document'));
+  });
+}
+
+function graphOf(root: Record<string, unknown>): SystemGraph {
     if (root.kind !== 'talos.system_graph') fail('unexpected document kind');
 
     const registry = record(root.registry, 'registry');
@@ -307,7 +358,105 @@ export function parseSystemGraph(text: string): SystemGraph {
       topics: list(root, 'topics', MAX_TOPICS)
                   .map((entry, i) => parseTopic(entry, `topics[${i}]`))
     };
+}
+
+// --- the live graph stream ---------------------------------------------------
+//
+// The bridge sends a client the whole graph on connect and when its structure
+// changes (a node starts, stops or restarts), and otherwise only its fast
+// values -- wall time, counters, heartbeats, liveness, selected sources, topic
+// verdicts -- as `talos.system_graph.update`, at most twice a second, for the
+// structure the client holds (studio/bridge/system.h, BuildSystemGraph). When
+// the radio budget defers an update it sends `talos.system_graph.deferred`
+// instead, so a graph that is late, not lost, is not marked stale.
+
+// The fast fields, in the order the bridge appends their values (its
+// BuildSystemGraph is the one source of that order). //studio:system_test
+// holds this walk to the bridge's golden files (studio/bridge/testdata/golden).
+function fastSlots(root: Record<string, unknown>): [Record<string, unknown>, string][] {
+  const slots: [Record<string, unknown>, string][] = [[root, 'wall_ns']];
+  const bridge = record(root.bridge, 'bridge');
+  for (const key of ['clients', 'frames_forwarded', 'invalid', 'ws_drops',
+                     'refused', 'egress_bytes'])
+    slots.push([bridge, key]);
+  list(root, 'nodes', MAX_NODES).forEach((entry, i) => {
+    const node = record(entry, `nodes[${i}]`);
+    for (const key of ['heartbeat_wall_ns', 'dispatch_count', 'alive'])
+      slots.push([node, key]);
+    if (node.delivery !== undefined) {
+      const counters = record(node.delivery, `nodes[${i}].delivery`);
+      for (const key of DELIVERY_COUNTERS) slots.push([counters, key]);
+    }
+    list(node, 'sources', MAX_SOURCES).forEach((source, j) => {
+      const fields = record(source, `nodes[${i}].sources[${j}]`);
+      for (const key of ['events', 'dropped', 'sequence', 'last_monotonic_ns',
+                         'last_latency_ns', 'max_latency_ns'])
+        slots.push([fields, key]);
+    });
+    list(node, 'selections', MAX_SOURCES).forEach((selection, j) =>
+        slots.push([record(selection, `nodes[${i}].selections[${j}]`), 'selected']));
   });
+  list(root, 'topics', MAX_TOPICS).forEach((entry, i) => {
+    const topic = record(entry, `topics[${i}]`);
+    for (const key of ['published', 'received', 'dropped', 'health'])
+      slots.push([topic, key]);
+  });
+  return slots;
+}
+
+const jsonType = (value: unknown) =>
+    value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+
+export class SystemGraphStream {
+  // The document as last applied, so the next update can be written over it.
+  private document: Record<string, unknown>|null = null;
+  // performance.now() when the bridge last spoke about the graph: a graph,
+  // an update or a deferral notice.
+  arrival: number|null = null;
+
+  // The graph a message makes current, or null for a deferral notice (the
+  // graph held is still the latest the budget let through). Throws, changing
+  // nothing, on a malformed message or one for a structure not held.
+  ingest(text: string, now: number): SystemGraph|null {
+    const result = parsing('system graph', () => {
+      if (text.length > MAX_SYSTEM_BYTES) fail('document too large');
+      const root = record(JSON.parse(text), 'document');
+      if (root.kind === 'talos.system_graph') {
+        return {document: root, graph: graphOf(root)};
+      }
+      const held = this.document;
+      if (!held || root.structure !== held.structure)
+        fail('update for a graph structure not held');
+      if (root.kind === 'talos.system_graph.deferred') return null;
+      if (root.kind !== 'talos.system_graph.update')
+        fail('unexpected document kind');
+      const values = root.values;
+      if (!Array.isArray(values)) fail('update without values');
+      const document = structuredClone(held!);
+      const slots = fastSlots(document);
+      if (slots.length !== (values as unknown[]).length)
+        fail('update values do not match the graph');
+      slots.forEach(([owner, key], i) => {
+        const value = (values as unknown[])[i];
+        // A selected source may come or go (null); nothing else changes type.
+        if (jsonType(value) !== jsonType(owner[key]) &&
+            !(key === 'selected' &&
+              ['null', 'string'].includes(jsonType(value))))
+          fail(`update value ${i} has the wrong type`);
+        owner[key] = value;
+      });
+      return {document, graph: graphOf(document)};
+    });
+    this.arrival = now;
+    if (!result) return null;
+    this.document = result.document;
+    return result.graph;
+  }
+
+  reset() {
+    this.document = null;
+    this.arrival = null;
+  }
 }
 
 // --- the declared graph ----------------------------------------------------
@@ -600,7 +749,7 @@ export const rateKey = (node: string, sourceId: number) => `${node} ${sourceId}`
 // graph's `wall_ns`. Those are two different clocks readings and using the
 // wrong one was the whole artifact: a node refreshes its registry slot on its
 // own timer (Reporter::Options::period, 250 ms) and the bridge rebuilds the
-// graph on another (kSystemRefreshTicks, also 250 ms), free-running with no
+// graph on another (kSystemRefreshNs, also 250 ms), free-running with no
 // phase relationship between them. So the counter the bridge reads was written
 // at some point up to a full reporter period before the graph was stamped, and
 // by a varying amount each time -- which showed up as a 200 Hz loop reported

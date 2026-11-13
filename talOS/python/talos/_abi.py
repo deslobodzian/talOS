@@ -6,8 +6,9 @@ raise, with the C++ message, or with the Python exception a callback raised.
 
 import ctypes
 import os
+import threading
 
-_EXPECTED_ABI_VERSION = 19
+_EXPECTED_ABI_VERSION = 32
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -19,14 +20,70 @@ CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p)
 MESSAGE_CALLBACK = ctypes.CFUNCTYPE(c_int32, c_void_p, c_uint32, c_void_p)
 FACTORY = ctypes.CFUNCTYPE(c_int32, c_void_p, c_void_p)
 
-(PARAM_ANY, PARAM_BOOL, PARAM_INT, PARAM_DOUBLE, PARAM_STRING,
- PARAM_STRING_LIST, PARAM_DOUBLE_LIST, PARAM_LIST) = range(8)
-(DEVICE_MOTOR, DEVICE_CANCODER, DEVICE_GYRO, DEVICE_DIGITAL_INPUT,
- DEVICE_DIGITAL_OUTPUT, DEVICE_ANALOG_INPUT, DEVICE_ENCODER,
- DEVICE_PWM) = range(8)
-DS_MAX_JOYSTICKS, DS_MAX_AXES, DS_MAX_POVS, DS_NAME_LENGTH = 6, 12, 4, 32
-(DS_ATTACHED, DS_FMS_ATTACHED, DS_ENABLED, DS_AUTONOMOUS, DS_TELEOP, DS_TEST,
- DS_ESTOP) = (1 << bit for bit in range(7))
+# The C ABI's enum and #define constants, without the TALOS_ prefix. The one
+# Python copy: api_parity_test compares each with node_api.h, and node_api.cc
+# static_asserts the header against the C++ enums.
+OK = 0
+ERR = -1
+PARAM_ANY = 0
+PARAM_BOOL = 1
+PARAM_INT = 2
+PARAM_DOUBLE = 3
+PARAM_STRING = 4
+PARAM_STRING_LIST = 5
+PARAM_DOUBLE_LIST = 6
+PARAM_LIST = 7
+WAKE_ON_PUBLISH = 0
+WAKE_AT_DRAIN = 1
+DEVICE_MOTOR = 0
+DEVICE_CANCODER = 1
+DEVICE_GYRO = 2
+DEVICE_DIGITAL_INPUT = 3
+DEVICE_DIGITAL_OUTPUT = 4
+DEVICE_ANALOG_INPUT = 5
+DEVICE_ENCODER = 6
+DEVICE_PWM = 7
+MODE_NEUTRAL = 0
+MODE_DUTY_CYCLE = 1
+MODE_VOLTAGE = 2
+MODE_VELOCITY = 3
+MODE_POSITION = 4
+MODE_MOTION_MAGIC = 5
+DS_MAX_JOYSTICKS = 6
+DS_MAX_AXES = 12
+DS_MAX_POVS = 4
+DS_NAME_LENGTH = 32
+DS_ATTACHED = 1 << 0
+DS_FMS_ATTACHED = 1 << 1
+DS_ENABLED = 1 << 2
+DS_AUTONOMOUS = 1 << 3
+DS_TELEOP = 1 << 4
+DS_TEST = 1 << 5
+DS_ESTOP = 1 << 6
+POSITION_PHASE_UNHOMED = 0
+POSITION_PHASE_HOMING = 1
+POSITION_PHASE_READY = 2
+POSITION_PHASE_MOVING = 3
+POSITION_PHASE_AT_GOAL = 4
+POSITION_PHASE_FAULTED = 5
+POSITION_FAULT_NONE = 0
+POSITION_FAULT_HOMING_TIMEOUT = 1
+POSITION_FAULT_HOMING_STALL = 2
+POSITION_FAULT_SWITCH_STUCK = 3
+POSITION_FAULT_STALL = 4
+POSITION_FAULT_MOVE_TIMEOUT = 5
+VELOCITY_PHASE_STOPPED = 0
+VELOCITY_PHASE_SPINNING_UP = 1
+VELOCITY_PHASE_AT_SPEED = 2
+ROLLER_COMMAND_IDLE = 0
+ROLLER_COMMAND_INTAKE = 1
+ROLLER_COMMAND_EJECT = 2
+ROLLER_COMMAND_FEED = 3
+ROLLER_PHASE_IDLE = 0
+ROLLER_PHASE_INTAKING = 1
+ROLLER_PHASE_HOLDING = 2
+ROLLER_PHASE_EJECTING = 3
+ROLLER_PHASE_FEEDING = 4
 
 
 class TalosError(RuntimeError):
@@ -43,7 +100,9 @@ class Param(ctypes.Structure):
 class Sample(ctypes.Structure):
     _fields_ = [("valid", c_int32), ("value", c_int32), ("position", c_double),
                 ("velocity", c_double), ("voltage", c_double),
-                ("current", c_double)]
+                ("current", c_double), ("temperature_c", c_double),
+                ("supply_current_a", c_double), ("forward_limit", c_int32),
+                ("reverse_limit", c_int32)]
 
 
 class MotorRequest(ctypes.Structure):
@@ -74,6 +133,28 @@ class DriverStationPacket(ctypes.Structure):
                 ("joysticks", Joystick * DS_MAX_JOYSTICKS)]
 
 
+class PositionMechanismState(ctypes.Structure):
+    _fields_ = [("phase", c_int32), ("fault", c_int32), ("homed", c_int32),
+                ("at_goal", c_int32), ("driving", c_int32),
+                ("connected", c_int32), ("position_rot", c_double),
+                ("position_units", c_double), ("velocity_rps", c_double),
+                ("goal_rot", c_double), ("gravity_v", c_double),
+                ("tolerance_rot", c_double)]
+
+
+class VelocityMechanismState(ctypes.Structure):
+    _fields_ = [("phase", c_int32), ("at_speed", c_int32),
+                ("driving", c_int32), ("connected", c_int32),
+                ("velocity_rps", c_double), ("goal_rps", c_double),
+                ("commanded_rps", c_double), ("current_a", c_double)]
+
+
+class RollerWithSensorState(ctypes.Structure):
+    _fields_ = [("phase", c_int32), ("has_piece", c_int32),
+                ("sensor_connected", c_int32), ("driving", c_int32),
+                ("output_v", c_double)]
+
+
 class Schema(ctypes.Structure):
     """TalosSchema: a message class's TALOS_SCHEMA_NAME/HASH/BFBS."""
     _fields_ = [("name", c_char_p), ("hash", c_uint64), ("bfbs", c_char_p),
@@ -94,17 +175,22 @@ _SIGNATURES = {
                             FACTORY, c_void_p]),
     "talos_node_name": (c_char_p, [c_void_p]),
     "talos_node_simulation": (c_int32, [c_void_p]),
+    "talos_node_describing": (c_int32, [c_void_p]),
     "talos_node_now_ns": (c_int64, [c_void_p]),
     "talos_node_tick": (c_uint64, [c_void_p]),
     "talos_node_next_update": (c_uint64, [c_void_p]),
     "talos_node_period_ns": (c_int64, [c_void_p]),
     "talos_node_config_path": (c_char_p, [c_void_p]),
     "talos_node_session_dir": (c_char_p, [c_void_p]),
+    "talos_node_trajectory_path": (c_int32, [c_void_p, c_char_p, c_char_p,
+                                             c_uint32]),
     "talos_node_param": (c_int32, [c_void_p, c_char_p, c_int32, c_int32,
                                    _P(Param)]),
+    "talos_node_param_of": (c_int32, [c_void_p, c_char_p, c_char_p, c_int32,
+                                      c_int32, _P(Param)]),
     "talos_node_subscribe": (c_int64, [c_void_p, c_char_p, c_uint32,
-                                       _P(Schema), c_int32, MESSAGE_CALLBACK,
-                                       c_void_p]),
+                                       _P(Schema), c_int32, c_int32,
+                                       MESSAGE_CALLBACK, c_void_p]),
     "talos_node_publish": (c_int64, [c_void_p, c_char_p, c_uint32,
                                      _P(Schema)]),
     "talos_node_publish_bytes": (c_int64, [c_void_p, c_char_p, c_uint32,
@@ -135,10 +221,15 @@ _SIGNATURES = {
     "talos_motor_clamped_count": (c_int32, [c_void_p, c_int64, _P(c_uint64)]),
     "talos_motor_rezero": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_gyro_rezero": (c_int32, [c_void_p, c_int64, c_double]),
+    "talos_motor_zeroed": (c_int32, [c_void_p, c_int64]),
+    "talos_gyro_zeroed": (c_int32, [c_void_p, c_int64]),
     "talos_digital_output_set": (c_int32, [c_void_p, c_int64, c_int32]),
     "talos_pwm_set": (c_int32, [c_void_p, c_int64, c_double]),
     "talos_motor_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_sensor_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
+    "talos_motor_time": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
+    "talos_sensor_time": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
+    "talos_motor_age": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),
     "talos_digital_input_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_analog_input_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_encoder_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
@@ -150,10 +241,41 @@ _SIGNATURES = {
                                    _P(c_int32)]),
     "talos_target_source_name": (c_char_p, [c_void_p, c_int64, c_int32]),
     "talos_target_lane_open": (c_int64, [c_void_p, c_char_p, c_char_p,
-                                         c_uint32, c_uint32, _P(Schema)]),
+                                         c_uint32, c_uint32, _P(Schema),
+                                         c_int64]),
     "talos_target_lane_send": (c_int32, [c_void_p, c_int64, c_char_p,
                                          c_uint32]),
     "talos_target_lane_release": (c_int32, [c_void_p, c_int64]),
+    "talos_operator_arming_open": (c_int64, [c_void_p]),
+    "talos_operator_arming_evaluate": (c_int32, [c_void_p, c_int64, c_int32]),
+    "talos_operator_arming_armed": (c_int32, [c_void_p, c_int64]),
+    "talos_operator_arming_disarm": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_open": (c_int64, [c_void_p, c_char_p]),
+    "talos_position_mechanism_set_goal": (c_int32, [c_void_p, c_int64,
+                                                    c_double, c_double]),
+    "talos_position_mechanism_set_goal_units": (c_int32, [c_void_p, c_int64,
+                                                          c_double,
+                                                          c_double]),
+    "talos_position_mechanism_hold": (c_int32, [c_void_p, c_int64, c_double]),
+    "talos_position_mechanism_stop": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_update": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_clear_fault": (c_int32, [c_void_p, c_int64]),
+    "talos_position_mechanism_state": (c_int32, [
+        c_void_p, c_int64, _P(PositionMechanismState), c_void_p, c_uint32]),
+    "talos_velocity_mechanism_open": (c_int64, [c_void_p, c_char_p]),
+    "talos_velocity_mechanism_set_goal": (c_int32, [c_void_p, c_int64,
+                                                    c_double, c_double]),
+    "talos_velocity_mechanism_stop": (c_int32, [c_void_p, c_int64]),
+    "talos_velocity_mechanism_update": (c_int32, [c_void_p, c_int64]),
+    "talos_velocity_mechanism_state": (c_int32, [
+        c_void_p, c_int64, _P(VelocityMechanismState), c_void_p, c_uint32]),
+    "talos_roller_with_sensor_open": (c_int64, [c_void_p, c_char_p]),
+    "talos_roller_with_sensor_set_goal": (c_int32, [c_void_p, c_int64,
+                                                    c_int32]),
+    "talos_roller_with_sensor_stop": (c_int32, [c_void_p, c_int64]),
+    "talos_roller_with_sensor_update": (c_int32, [c_void_p, c_int64]),
+    "talos_roller_with_sensor_state": (c_int32, [
+        c_void_p, c_int64, _P(RollerWithSensorState)]),
 }
 _TESTING_SIGNATURES = {
     "talos_sim_create": (c_void_p, [c_char_p]),
@@ -163,6 +285,8 @@ _TESTING_SIGNATURES = {
     "talos_sim_add": (c_void_p, [c_void_p, c_char_p, FACTORY, c_void_p]),
     "talos_sim_node": (c_void_p, [c_void_p, c_char_p]),
     "talos_sim_step": (c_int32, [c_void_p, c_int64]),
+    "talos_sim_pause": (c_int32, [c_void_p, c_char_p, c_int64]),
+    "talos_sim_resume": (c_int32, [c_void_p, c_char_p]),
     "talos_sim_now_ns": (c_int64, [c_void_p]),
     "talos_sim_publish_raw": (c_int32, [c_void_p, c_char_p, c_char_p,
                                         c_uint32]),
@@ -182,7 +306,13 @@ _TESTING_SIGNATURES = {
     "talos_sim_hardware_enable": (c_int32, [c_void_p, c_int32]),
     "talos_sim_hardware_ideal_motors": (c_int32, [c_void_p, c_int32]),
     "talos_sim_hardware_set_motor": (c_int32, [c_void_p, c_char_p, c_char_p,
-                                               c_double, c_double]),
+                                               c_double, c_double,
+                                               c_uint32, c_uint32,
+                                               c_double, c_double,
+                                               c_double]),
+    "talos_sim_hardware_set_limit_switches": (c_int32, [c_void_p, c_char_p,
+                                                        c_char_p, c_int32,
+                                                        c_int32]),
     "talos_sim_hardware_set_digital_input": (c_int32, [c_void_p, c_char_p,
                                                        c_char_p, c_int32]),
     "talos_sim_hardware_set_analog_input": (c_int32, [c_void_p, c_char_p,
@@ -191,13 +321,18 @@ _TESTING_SIGNATURES = {
                                                  c_double, c_double]),
     "talos_sim_hardware_set_cancoder": (c_int32, [c_void_p, c_char_p,
                                                   c_char_p, c_double,
-                                                  c_double]),
+                                                  c_double, c_uint32, c_uint32]),
     "talos_sim_hardware_set_gyro": (c_int32, [c_void_p, c_char_p, c_char_p,
-                                              c_double, c_double]),
+                                              c_double, c_double,
+                                              c_uint32, c_uint32]),
     "talos_sim_hardware_set_gateway_clock": (c_int32, [c_void_p, c_int64,
                                                        c_int64]),
     "talos_sim_hardware_set_connected": (c_int32, [c_void_p, c_char_p,
                                                    c_char_p, c_int32]),
+    "talos_sim_hardware_reset_device": (c_int32, [c_void_p, c_char_p,
+                                                  c_char_p]),
+    "talos_sim_hardware_lose_states": (c_int32, [c_void_p, c_int32]),
+    "talos_sim_hardware_reboot": (c_int32, [c_void_p]),
     "talos_sim_hardware_set_driver_station": (
         c_int32, [c_void_p, _P(DriverStationPacket)]),
     "talos_sim_hardware_motor_request": (c_int32, [c_void_p, c_char_p,
@@ -207,6 +342,13 @@ _TESTING_SIGNATURES = {
                                                     c_char_p]),
     "talos_sim_hardware_pwm": (c_int32, [c_void_p, c_char_p, c_char_p,
                                          _P(c_double)]),
+    "talos_sim_hardware_applied_motor": (c_int32, [c_void_p, c_char_p,
+                                                   c_char_p,
+                                                   _P(MotorRequest)]),
+    "talos_sim_hardware_applied_digital_output": (
+        c_int32, [c_void_p, c_char_p, c_char_p]),
+    "talos_sim_hardware_applied_pwm": (c_int32, [c_void_p, c_char_p, c_char_p,
+                                                 _P(c_double)]),
 }
 
 
@@ -243,28 +385,34 @@ def _load():
 
 lib = _load()
 
-# The first exception a Python callback raised during the current C call.
-_pending = None
+# The first exception a Python callback raised during the current C call, per
+# thread like talos_last_error(): a callback runs on the thread whose C call
+# ran it, and a failure there is raised by that call, never by another
+# thread's.
+_local = threading.local()
 
 
 def callback(fn):
     """fn as a C callback body: an exception is kept and reported as 1."""
     def body(*args):
-        global _pending
         try:
             fn(*args)
             return 0
         except BaseException as error:  # noqa: B902 - re-raised by fail()
-            if _pending is None:
-                _pending = error
+            if pending() is None:
+                _local.pending = error
             return 1
     return body
 
 
+def pending():
+    """The exception a callback raised during this thread's C call, or None."""
+    return getattr(_local, "pending", None)
+
+
 def fail():
-    """Raise what made the last C call fail."""
-    global _pending
-    error, _pending = _pending, None
+    """Raise what made this thread's last C call fail."""
+    error, _local.pending = pending(), None
     if error is not None:
         raise error
     raise TalosError(lib.talos_last_error().decode())
@@ -283,6 +431,13 @@ def ok(status):
 
 def index(result):
     return check(result, lambda r: r < 0)
+
+
+def value(result, failure):
+    """For returns whose failure value is also a valid result (0 from
+    talos_state_machine_state): the call failed only when it also left a
+    talos_last_error(), which a call that succeeds clears."""
+    return check(result, lambda r: r == failure and lib.talos_last_error())
 
 
 def handle(pointer):

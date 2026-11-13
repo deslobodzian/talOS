@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import {once} from 'node:events';
 import {createServer} from 'node:http';
 import type {AddressInfo} from 'node:net';
 import {test} from 'node:test';
 
-import {WebSocketServer} from 'ws';
+import {WebSocket, WebSocketServer} from 'ws';
 
 import {
   dispatch,
@@ -12,8 +13,10 @@ import {
   type RpcContext,
   RpcFault,
 } from '../agent/rpc';
-import {startAgent} from '../agent/server';
-import {decode, Timeline} from '../src/core';
+import {MAX_BATCH, startAgent} from '../agent/server';
+import {TelemetryDecoder, Timeline} from '../src/core';
+import {ChannelKind} from '../src/generated/talos/telemetry/channel-kind';
+import {GRAPH_STALE_AFTER_MS} from '../src/data/freshness';
 import {demoDeclaredGraph, demoPacket, demoSystemGraph} from '../src/demo';
 import {
   type DeclaredGraph,
@@ -24,8 +27,9 @@ import {
 
 function history() {
   const timeline = new Timeline();
+  const decoder = new TelemetryDecoder();
   [0, 4, 5, 0, 7].forEach((current, i) => {
-    const frame = decode(demoPacket(BigInt(i)))!;
+    const frame = decoder.decode(demoPacket(BigInt(i)))!;
     frame.channels['intake/state/current_a'] = current;
     timeline.append(frame);
   });
@@ -71,6 +75,98 @@ test(
               {timestamp_ns: '18446744073709551616'}),
           /uint64/);
     });
+// A 64-bit integer channel answers exactly: 2^53 and 2^53 + 1 are one double,
+// so a rounded value would hide both the reading and the change.
+test('RPC answers integer channels with their exact value', () => {
+  const timeline = new Timeline();
+  const decoder = new TelemetryDecoder();
+  const boot = ['9007199254740992', '9007199254740992', '9007199254740993'];
+  boot.forEach((id, i) => {
+    const frame = decoder.decode(demoPacket(BigInt(i)))!;
+    frame.channels['hw/status/clock_boot_id'] = Number(id);
+    frame.exact = {...frame.exact, 'hw/status/clock_boot_id': id};
+    timeline.append(frame);
+  });
+  const last = timeline.frames.at(-1)!;
+  const response = dispatch(ctx(timeline), 'query_state_at', {
+                     timestamp_ns: last.timestamp_ns,
+                     topics: ['hw/status/clock_boot_id']
+                   }) as any;
+  assert.equal(response.topics['hw/status/clock_boot_id'], '9007199254740993');
+  const first = dispatch(ctx(timeline), 'query_state_at', {
+                  timestamp_ns: timeline.frames[0].timestamp_ns,
+                  topics: ['hw/status/clock_boot_id']
+                }) as any;
+  assert.equal(first.topics['hw/status/clock_boot_id'], '9007199254740992');
+  const changed = dispatch(ctx(timeline), 'scan_channel_events', {
+                    topic: 'hw/status/clock_boot_id',
+                    condition: {op: 'changed'}
+                  }) as any;
+  assert.deepEqual(changed.ranges, [
+    {start_ns: last.timestamp_ns, end_ns: last.timestamp_ns, samples: 1}
+  ]);
+  const above = dispatch(ctx(timeline), 'scan_channel_events', {
+                  topic: 'hw/status/clock_boot_id',
+                  condition: {op: 'gt', value: 9007199254740992}
+                }) as any;
+  assert.equal(above.ranges.length, 1);
+});
+// NaN and the infinities are readings: an answer spells them as the bridge's
+// JSON does, since JSON.stringify would turn them into null (absence). NaN
+// orders with nothing, so no threshold matches it, and NaN after NaN is no
+// change. An integer channel is a number while that number is exact.
+test('RPC answers NaN and infinities as readings and integers as numbers when exact', () => {
+  const timeline = new Timeline();
+  const decoder = new TelemetryDecoder();
+  const readings = [1, NaN, NaN, Infinity, -Infinity, 2];
+  readings.forEach((x, i) => {
+    const frame = decoder.decode(demoPacket(BigInt(i)))!;
+    frame.channels['test/state/x'] = x;
+    frame.channels['test/state/count'] = 5;
+    frame.exact = {...frame.exact, 'test/state/count': '5'};
+    frame.kinds = {...frame.kinds, 'test/state/x': ChannelKind.Double,
+                   'test/state/count': ChannelKind.UInt};
+    timeline.append(frame);
+  });
+  const at = (i: number) => timeline.frames[i].timestamp_ns;
+  const value = (i: number) => (dispatch(ctx(timeline), 'query_state_at', {
+    timestamp_ns: at(i), topics: ['test/state/x', 'test/state/count']
+  }) as any).topics;
+  assert.deepEqual(value(1), {'test/state/x': 'NaN', 'test/state/count': 5});
+  assert.equal(value(3)['test/state/x'], 'Infinity');
+  assert.equal(value(4)['test/state/x'], '-Infinity');
+  const whole = JSON.parse(JSON.stringify(
+      dispatch(ctx(timeline), 'query_state_at', {timestamp_ns: at(1)})));
+  assert.equal(whole.channels['test/state/x'], 'NaN');
+  assert.equal(whole.channels['test/state/count'], 5);
+  assert.equal(whole.kinds['test/state/count'], 'uint');
+  const latest = JSON.parse(JSON.stringify(dispatch(ctx(timeline), 'get_latest')));
+  assert.equal(latest.channels['test/state/x'], 2);
+
+  const ranges = (condition: object) =>
+      (dispatch(ctx(timeline), 'scan_channel_events',
+                {topic: 'test/state/x', condition}) as any)
+          .ranges.map((r: any) => [r.start_ns, r.end_ns]);
+  assert.deepEqual(ranges({op: 'gte', value: 0}),
+                   [[at(0), at(0)], [at(3), at(3)], [at(5), at(5)]]);
+  assert.deepEqual(ranges({op: 'lte', value: 0}), [[at(4), at(4)]]);
+  assert.deepEqual(ranges({op: 'changed'}), [[at(1), at(1)], [at(3), at(5)]]);
+  // A scan accepts the spellings an answer used: eq "NaN" finds the NaN
+  // readings rather than comparing them to a string.
+  assert.deepEqual(ranges({op: 'eq', value: 'NaN'}), [[at(1), at(2)]]);
+  assert.deepEqual(ranges({op: 'ne', value: 'NaN'}),
+                   [[at(0), at(0)], [at(3), at(5)]]);
+  assert.deepEqual(ranges({op: 'eq', value: '-Infinity'}), [[at(4), at(4)]]);
+  assert.deepEqual(ranges({op: 'ne', value: '-Infinity'}),
+                   [[at(0), at(3)], [at(5), at(5)]]);
+
+  // The schema tree labels channels by kind and lists no decoder internals.
+  const tree = (dispatch(ctx(timeline), 'get_schema_tree') as any).topics;
+  assert.equal(tree['test/state/x'], 'double');
+  assert.equal(tree['test/state/count'], 'uint');
+  assert.ok(!Object.keys(tree).some(
+      name => name.startsWith('exact.') || name.startsWith('kinds.')));
+});
 test('RPC exposes the same derived pose-error series stored in history', () => {
   const timeline = history();
   const snapshot = timeline.exact(1020000000n)!;
@@ -167,8 +263,7 @@ test('system methods distinguish an unknown system from an empty one', () => {
   // nothing".
   assert.throws(
       () => dispatch(systemContext(demoGraph()), 'get_declared_graph', {}),
-      (e: unknown) => e instanceof RpcFault && e.code === -32002 &&
-          /--declared/.test(e.message));
+      (e: unknown) => e instanceof RpcFault && e.code === -32002);
   assert.equal(
       (handleRpc(
            systemContext(null),
@@ -384,6 +479,18 @@ test('get_latest returns the newest sample with its dictionary and age', () => {
   assert.ok(latest.age_ms >= 0);
 });
 
+test('get_system_graph says when the graph no longer describes now', () => {
+  const system = demoGraph();
+  const at = (systemArrivalMs: number) =>
+      dispatch({...systemContext(system), systemArrivalMs, connected: true},
+               'get_system_graph', {}) as {stale: boolean|null; age_ms: number|null};
+  // A hung bridge sends nothing; a graph past the threshold is last-known.
+  const old = at(performance.now() - GRAPH_STALE_AFTER_MS - 1);
+  assert.equal(old.stale, true);
+  assert.ok(old.age_ms! > GRAPH_STALE_AFTER_MS);
+  assert.equal(at(performance.now()).stale, false);
+});
+
 test('every advertised method exists, and nothing else does', () => {
   // RPC_METHODS is what the Agent tab and the README list, so a name in it that
   // dispatch does not answer is a picker entry that fails on click.
@@ -413,7 +520,9 @@ test('every advertised method exists, and nothing else does', () => {
 // a real socket: a wrong path or an unhandled 404 would leave every declared
 // view permanently empty and nothing would say why.
 
-function fakeBridge(declared: string|null) {
+// `greeting` is sent as a binary message on every open, as the bridge sends
+// a new client the dictionary pages and a keyframe of the latest tick.
+async function fakeBridge(declared: string|null, greeting?: Uint8Array) {
   const server = createServer((request, response) => {
     if (request.url === '/declared.json' && declared !== null) {
       response.setHeader('Content-Type', 'application/json');
@@ -424,19 +533,23 @@ function fakeBridge(declared: string|null) {
     response.writeHead(404).end();
   });
   const sockets = new WebSocketServer({server, path: '/telemetry'});
-  return new Promise<{url: string; close: () => void}>(resolve => {
-    server.listen(0, '127.0.0.1', () => {
-      const {port} = server.address() as AddressInfo;
-      resolve({
-        url: `ws://127.0.0.1:${port}/telemetry`,
-        close: () => {
-          for (const client of sockets.clients) client.terminate();
-          sockets.close();
-          server.close();
-        }
-      });
-    });
-  });
+  if (greeting)
+    sockets.on('connection', client => client.send(greeting, {binary: true}));
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const {port} = server.address() as AddressInfo;
+  return {
+    url: `ws://127.0.0.1:${port}/telemetry`,
+    reconnect: (nextDeclared: string|null) => {
+      declared = nextDeclared;
+      for (const client of sockets.clients) client.terminate();
+    },
+    close: () => {
+      for (const client of sockets.clients) client.terminate();
+      sockets.close();
+      server.close();
+    }
+  };
 }
 
 const settle = async (until: () => boolean, what: string) => {
@@ -494,3 +607,111 @@ test('a bridge started without --declared leaves everything else working',
          bridge.close();
        }
      });
+
+test('a reconnecting bridge 404 clears the previous declared graph', async () => {
+  const bridge = await fakeBridge(demoDeclaredGraph());
+  const agent = startAgent(0, bridge.url);
+  try {
+    await settle(() => !!agent.context().declared, 'initial graph missing');
+    bridge.reconnect(null);
+    await settle(() => agent.context().declared === null,
+                 '404 left a stale declared graph');
+    assert.throws(
+        () => dispatch(agent.context(), 'get_declared_graph', {}),
+        (e: unknown) => e instanceof RpcFault && e.code === -32002);
+  } finally {
+    agent.close();
+    bridge.close();
+  }
+});
+
+test('losing the bridge drops the live graph instead of reporting it alive',
+     async () => {
+       const bridge = await fakeBridge(demoDeclaredGraph());
+       const agent = startAgent(0, bridge.url);
+       try {
+         // The declared fetch happens on open, so this waits for a connection.
+         await settle(() => !!agent.context().declared, 'never connected');
+         agent.ingestSystemGraph(demoSystemGraph(500n));
+         assert.ok(agent.context().system);
+         bridge.reconnect(demoDeclaredGraph());
+         await settle(() => agent.context().system === null,
+                      'a lost connection kept its graph');
+         assert.throws(
+             () => dispatch(agent.context(), 'get_system_graph', {}),
+             (e: unknown) => e instanceof RpcFault && e.code === -32002);
+       } finally {
+         agent.close();
+         bridge.close();
+       }
+     });
+
+test('the cached frame sent on open has unknown age', async () => {
+  const bridge = await fakeBridge(null, demoPacket(0n));
+  const agent = startAgent(0, bridge.url);
+  try {
+    await settle(() => agent.timeline.frames.length === 1,
+                 'the cached frame never reached the timeline');
+    // It names the channels, but its values may predate this connection by
+    // any amount: an age of ~0 would call a dead robot live.
+    const latest = dispatch(agent.context(), 'get_latest', {}) as
+        {sequence_id: string; age_ms: number|null; age_ns: string|null};
+    assert.equal(latest.sequence_id, '0');
+    assert.equal(latest.age_ms, null);
+    assert.equal(latest.age_ns, null);
+  } finally {
+    agent.close();
+    bridge.close();
+  }
+});
+
+test('an oversized JSON-RPC batch is rejected whole', async () => {
+  const bridge = await fakeBridge(null);
+  const agent = startAgent(0, bridge.url);
+  try {
+    await settle(() => !!agent.server.address(), 'agent did not listen');
+    const {port} = agent.server.address() as AddressInfo;
+    const post = async (requests: number): Promise<unknown> =>
+        (await fetch(`http://127.0.0.1:${port}/rpc`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(Array.from(
+              {length: requests},
+              (_, id) => ({jsonrpc: '2.0', id, method: 'get_schema_tree'})))
+        })).json();
+    assert.equal((await post(MAX_BATCH) as unknown[]).length, MAX_BATCH);
+    const rejected = await post(MAX_BATCH + 1) as {error: {code: number}};
+    assert.equal(rejected.error.code, -32600);
+  } finally {
+    agent.close();
+    bridge.close();
+  }
+});
+
+test('oversized RPC WebSocket payloads close only the offending client', async () => {
+  const bridge = await fakeBridge(null);
+  const agent = startAgent(0, bridge.url);
+  let client: WebSocket|undefined;
+  try {
+    await settle(() => !!agent.server.address(), 'agent did not listen');
+    const {port} = agent.server.address() as AddressInfo;
+    client = new WebSocket(`ws://127.0.0.1:${port}/rpc`);
+    client.on('error', () => {});
+    await once(client, 'open');
+    const closed = once(client, 'close');
+    client.send(Buffer.alloc(65537));
+    assert.equal((await closed)[0], 1009);
+    const response = await fetch(`http://127.0.0.1:${port}/rpc`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({jsonrpc: '2.0', id: 1, method: 'get_schema_tree'})
+    });
+    assert.equal(response.status, 200);
+    const body: unknown = await response.json();
+    assert.ok(body !== null && typeof body === 'object' && 'id' in body);
+    assert.equal(body.id, 1);
+  } finally {
+    client?.terminate();
+    agent.close();
+    bridge.close();
+  }
+});

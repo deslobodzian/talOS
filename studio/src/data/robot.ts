@@ -6,6 +6,7 @@
 import type {Snapshot} from '../core';
 import type {ChannelInfo, DriverStationMode, SystemState} from './types';
 import {discoverEstimators} from './discovery';
+import {liveNodeCount} from './freshness';
 
 export type RobotStatus = {
   ds: {
@@ -27,15 +28,21 @@ export type RobotStatus = {
     faultMask: number|null;
     timedOutMask: number|null;
   };
-  estimator: {valid: boolean|null; accepted: number|null; rejected: number|null}|null;
-  nodes: {alive: number; total: number}|null;
+  // `channel` names the validity channel, so the reading can be aged.
+  estimator: {valid: boolean|null; accepted: number|null; rejected: number|null;
+              channel: string}|null;
+  // `alive` is null when the graph is stale: `total` is last-known, the live
+  // count is not knowable.
+  nodes: {alive: number|null; total: number}|null;
 };
 
 const DS = 'hw/state/driver_station/';
 
 // Precedence: e-stop outranks a lost link, which outranks a disabled robot,
 // which outranks the chosen mode. Null when the DS channels are absent from
-// the snapshot (which is a different statement from "disconnected").
+// the snapshot (which is a different statement from "disconnected"), and when
+// `enabled` is: a mode flag names the selected mode, not that the robot is
+// enabled in it.
 export function driverStationMode(snapshot: Snapshot|null): DriverStationMode|null {
   if (!snapshot) return null;
   const ch = snapshot.channels;
@@ -48,6 +55,7 @@ export function driverStationMode(snapshot: Snapshot|null): DriverStationMode|nu
     return null;
   if (estop === 1) return 'estop';
   if (connected === 0) return 'disconnected';
+  if (enabled === undefined) return null;
   if (enabled === 0) return 'disabled';
   if (autonomous === 1) return 'autonomous';
   if (teleop === 1) return 'teleop';
@@ -97,14 +105,13 @@ export function robotStatus(snapshot: Snapshot|null, system: SystemState): Robot
     estimator = {
       valid: flag(`${owner}/state/valid`),
       accepted: num(`${owner}/state/observation_accepted_count`),
-      rejected: num(`${owner}/state/observation_rejected_count`)
+      rejected: num(`${owner}/state/observation_rejected_count`),
+      channel: `${owner}/state/valid`
     };
   }
 
   const graph = system.graph;
-  const nodes = graph ?
-      {alive: graph.nodes.filter(n => n.alive).length, total: graph.nodes.length} :
-      null;
+  const nodes = graph ? {alive: liveNodeCount(system), total: graph.nodes.length} : null;
 
   return {
     ds: {

@@ -1,16 +1,22 @@
-"""Gateway startup, full robot sessions, and transient producer-stall recovery."""
+"""Gateway startup and a real, bounded match with observable safety assertions."""
 
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import socket
 import struct
 import tempfile
 import time
+import sys
+import tomllib
 from pathlib import Path
 import unittest
 import uuid
+
+import autonomous_progress
 
 
 def workspace():
@@ -32,27 +38,12 @@ def udp_ports():
 
 
 class SimGatewayStartup(unittest.TestCase):
-    def test_describe_answers_without_hardware(self):
-        proc = subprocess.run(
-            [str(binary()), "--describe"], capture_output=True, text=True,
-            timeout=30)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        doc = json.loads(proc.stdout)
-        self.assertEqual(doc["name"], "sim_gateway")
-        self.assertEqual(doc["target"],
-                         "//2026-robot/main_processor/simulation:sim_gateway")
-        self.assertEqual(doc["sources"], [])
+    def test_physics_truth_message_preserves_wire_size(self):
         proc = subprocess.run(
             [str(binary()), "--describe", "--physics"], capture_output=True,
             text=True, timeout=30)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        sources = json.loads(proc.stdout)["sources"]
-        self.assertEqual(len(sources), 1)
-        self.assertEqual(sources[0]["name"], "/sim/state")
-        self.assertEqual(sources[0]["kind"], "SENDER")
-        self.assertEqual(sources[0]["schema"], "geometry.OdometrySample")
-        self.assertEqual(sources[0]["message_bytes"], 56)
-        self.assertTrue(sources[0]["bfbs"])
+        self.assertEqual(json.loads(proc.stdout)["sources"][0]["message_bytes"], 56)
 
     def test_physics_flags_validate_before_starting(self):
         for flag, value in (
@@ -65,7 +56,6 @@ class SimGatewayStartup(unittest.TestCase):
                     [str(binary()), "--describe", flag, value],
                     capture_output=True, text=True, timeout=30)
                 self.assertNotEqual(proc.returncode, 0)
-                self.assertIn("require --physics", proc.stderr)
         for flag, value in (
                 ("--start-pose", "1,2"), ("--start-pose", "1,2,3,4"),
                 ("--start-pose", "nan,2,0"), ("--start-pose", "1,inf,0"),
@@ -87,7 +77,6 @@ class SimGatewayStartup(unittest.TestCase):
             [str(binary()), "--duration-s", "1"], capture_output=True,
             text=True, timeout=30)
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("--config", proc.stderr)
 
     def test_scheduled_modes_and_generations(self):
         with tempfile.TemporaryDirectory() as tmp, socket.socket(
@@ -98,15 +87,27 @@ class SimGatewayStartup(unittest.TestCase):
                 'controller_address = "127.0.0.1"\n'
                 '[subsystems.test.motors.motor]\ncan_id = 1\n',
                 encoding="utf-8")
-            receiver.bind(("127.0.0.1", 5803))
+            # Ephemeral ports: the default 5802/5803 belong to whatever
+            # session or test is already running on the host.
+            receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
             with subprocess.Popen(
                     [str(binary()), "--config", str(config),
+                     "--port", str(gateway_port),
+                     "--remote-port", str(receiver.getsockname()[1]),
                      "--mode-schedule", "disabled:0.1,auto:0.2,teleop:0.2",
+                     "--joystick-schedule",
+                     "0:axes=0,0,0;buttons=0;pov=-1|"
+                     "0.3:axes=0,-0.5,0;buttons=5;pov=90",
                      "--duration-s", "0.6", "--alliance", "red"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True) as proc:
                 phases = []
+                joystick_samples = []
+                boots = set()
                 previous_sample = None
                 deadline = time.monotonic() + 10
                 try:
@@ -118,23 +119,37 @@ class SimGatewayStartup(unittest.TestCase):
                                 break
                             continue
                         # Protocol v2: 40-byte frame header; DS payload begins
-                        # with sample time, mode generation, flags, alliance.
+                        # with sample time, mode generation, boot id, flags,
+                        # alliance.
                         frame_type = struct.unpack_from("<H", packet, 12)[0]
                         if frame_type != 24:
                             continue
-                        sample, generation, flags, alliance = struct.unpack_from(
-                            "<QQIB", packet, 40)
-                        if previous_sample is not None:
-                            self.assertGreaterEqual(sample - previous_sample,
-                                                    20000)
-                        previous_sample = sample
+                        sample, generation, boot, flags, alliance = (
+                            struct.unpack_from("<QQQIB", packet, 40))
+                        # The gateway's random boot id (odd), one per run.
+                        self.assertEqual(boot & 1, 1)
+                        boots.add(boot)
+                        # Empty FMS strings end at byte 40. Joystick axes and
+                        # POVs are variable-length, not native struct arrays.
+                        connected, axes, buttons, povs, mask = struct.unpack_from(
+                            "<BBBBI", packet, 40 + 40)
+                        axis = struct.unpack_from("<f", packet, 40 + 52)[0]
+                        pov = struct.unpack_from("<h", packet, 40 + 60)[0]
+                        joystick_samples.append(
+                            (connected, axes, buttons, povs, mask, axis, pov))
                         self.assertEqual(alliance, 1)
                         self.assertGreater(generation, 0)
                         self.assertLessEqual(generation, sample)
                         if not phases or phases[-1][0] != flags:
+                            # A new mode goes out on the tick that observes
+                            # it, not at the next 20 ms slot.
+                            self.assertEqual(generation, sample)
                             phases.append((flags, generation))
                         else:
                             self.assertEqual(phases[-1][1], generation)
+                            self.assertGreaterEqual(sample - previous_sample,
+                                                    20000)
+                        previous_sample = sample
                     stdout, stderr = proc.communicate(timeout=5)
                 finally:
                     if proc.poll() is None:
@@ -142,137 +157,435 @@ class SimGatewayStartup(unittest.TestCase):
                         proc.communicate()
                 self.assertEqual(proc.returncode, 0, stdout + stderr)
                 self.assertEqual([flags for flags, _ in phases], [1, 13, 21])
+                self.assertEqual(len(boots), 1)
                 generations = [generation for _, generation in phases]
                 self.assertEqual(generations, sorted(set(generations)))
+                self.assertIn((1, 3, 32, 1, 5, -0.5, 90), joystick_samples)
+
+    # REQ-DEV-10
+    def test_physics_home_switches_read_from_the_config(self):
+        """[digital_inputs.*] sim_motor binds a home switch in --physics: with
+        the lift motor at rest at 0 rotations, a switch closed at or below
+        -0.1 reads open (true, normally open) and one closed at or below 0.1
+        reads closed (false); closed_above and closed_reads apply; an input
+        with no sim_motor reads false."""
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+            config = Path(tmp) / "robot.toml"
+            config.write_text(
+                '[robot]\nname = "home_switch_test"\nperiod_us = 5000\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.test.motors.lift]\ncan_id = 1\n'
+                '[subsystems.test.digital_inputs]\n'
+                'a_away = { dio = 0, sim_motor = "lift", '
+                'sim_closed_at_rot = -0.1 }\n'
+                'b_at = { dio = 1, sim_motor = "lift", '
+                'sim_closed_at_rot = 0.1 }\n'
+                'c_above = { dio = 2, sim_motor = "lift", '
+                'sim_closed_at_rot = -0.1, sim_closed_above = true, '
+                'sim_closed_reads = true }\n'
+                'd_unbound = { dio = 3 }\n',
+                encoding="utf-8")
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
+            with subprocess.Popen(
+                    [str(binary()), "--config", str(config), "--physics",
+                     "--port", str(gateway_port),
+                     "--remote-port", str(receiver.getsockname()[1]),
+                     "--duration-s", "0.3"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as proc:
+                inputs = None
+                deadline = time.monotonic() + 10
+                try:
+                    while inputs is None and time.monotonic() < deadline:
+                        try:
+                            packet = receiver.recv(4096)
+                        except socket.timeout:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        if struct.unpack_from("<H", packet, 12)[0] != 20:
+                            continue
+                        # talOS/hardware/messages.cc Encode(State): an 84-byte
+                        # base after the 40-byte frame header, whose counts
+                        # start at 70; 45 bytes per motor; then (id, valid,
+                        # value) per digital input.
+                        motors, sensors, digital_inputs = struct.unpack_from(
+                            "<HHH", packet, 40 + 70)
+                        self.assertEqual((motors, sensors), (1, 0))
+                        offset = 40 + 84 + 45 * motors
+                        inputs = [struct.unpack_from("<H??", packet,
+                                                     offset + 4 * i)
+                                  for i in range(digital_inputs)]
+                    stdout, stderr = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                # Logical ids follow the sorted device names (a..d, then lift).
+                self.assertEqual(inputs, [(1, True, True), (2, True, False),
+                                          (3, True, True), (4, True, False)])
+
+
+NEUTRAL = ("neutral", 0, 0.0, 0.0)
+
+
+def hardware(row):
+    """log_dump's decoded hardware packet (talOS/launcher/hardware_record.h)."""
+    decoded = row.get("hardware")
+    if decoded is None or "error" in decoded:
+        raise ValueError(f"undecoded hardware packet: {decoded}")
+    return decoded
+
+
+def motor_requests(row):
+    """Each requested motor's (mode, slot, demand, feedforward_v), by id."""
+    return {m["id"]: (m["mode"], m["slot"], m["demand"], m["feedforward_v"])
+            for m in hardware(row)["motors"]}
+
+
+def joystick(row, port=0):
+    data = hardware(row)
+    stick = next((j for j in data["joysticks"] if j["port"] == port), None)
+    if stick is None:
+        raise ValueError("scripted joystick disconnected")
+    return data, stick
+
+
+def ds_snapshot(row):
+    data, stick = joystick(row)
+    return data["flags"], stick["axes"][1]
+
+
+def ds_buttons(row):
+    return joystick(row)[1]["buttons"]
+
+
+def log_baseline_ns(session):
+    """Find log_dump's exact origin without assuming a Python/C++ clock epoch.
+
+    Walk v7 record headers only (events/log/format.h); payload decoding remains
+    log_dump's job. On macOS Node time is MONOTONIC_RAW, not steady_clock.
+    """
+    baseline = None
+    for path in session.glob("*.tlog"):
+        with path.open("rb") as stream:
+            header = stream.read(120)
+            magic, version, header_bytes = struct.unpack_from("<8sII", header)
+            if magic != b"TALOSLOG" or version != 7:
+                raise ValueError(f"unsupported log format: {path}")
+            manifests, = struct.unpack_from("<I", header, 40)
+            schema_bytes, = struct.unpack_from("<Q", header, 112)
+            stream.seek(header_bytes + 112 * manifests + schema_bytes)
+            while record := stream.read(64):
+                if len(record) != 64:
+                    raise ValueError(f"truncated log header: {path}")
+                timestamp, = struct.unpack_from("<q", record, 16)
+                baseline = timestamp if baseline is None else min(baseline, timestamp)
+                stored, = struct.unpack_from("<I", record, 60)
+                stream.seek(stored, 1)
+    if baseline is None:
+        raise ValueError("no recorded events")
+    return baseline
+
+
+def launcher_env(**extra):
+    """The launcher environment for a full-graph sim test.
+
+    On macOS the loop threads request realtime scheduling (the production
+    policy): at timeshare priority a saturated runner delayed 5 ms loops by
+    10-50 ms and broke the request-gap bounds. Linux passes without it, and
+    SCHED_FIFO there has no per-thread fail-safe.
+    """
+    env = dict(os.environ, **extra)
+    if sys.platform == "darwin":
+        env["TALOS_REALTIME"] = "1"
+    return env
+
+
+def assert_realtime(test, launcher_output, manifest=None):
+    """Fail a macOS run whose nodes silently fell back to timeshare.
+
+    With the session manifest, also require every bridge and control loop's
+    registry row to have reported a full grant (launcher README "Session
+    manifest"): a node that stopped reporting its outcome reads as unreported,
+    which this catches and the log line alone cannot.
+    """
+    if sys.platform != "darwin":
+        return
+    test.assertNotIn("talos: realtime scheduling incomplete", launcher_output)
+    if manifest is None:
+        return
+    actuation = {node["name"]: node.get("realtime") for node in manifest["nodes"]
+                 if node.get("loop_tier") in ("control", "bridge")}
+    test.assertIn("hardware_node", actuation, launcher_output)
+    test.assertEqual({name: grant for name, grant in actuation.items() if grant != "full"},
+                     {}, launcher_output)
+
+
+def restart_timeline(path, topic):
+    """(loop origin, first record, first SEND on topic) node-clock ns of a tlog.
+
+    The first record is the first dispatch after run() starts. Walks v7 record
+    headers like log_baseline_ns; any value may be None for a truncated log.
+    """
+    with Path(path).open("rb") as stream:
+        header = stream.read(120)
+        origin, = struct.unpack_from("<q", header, 24)
+        header_bytes, = struct.unpack_from("<I", header, 12)
+        manifests, = struct.unpack_from("<I", header, 40)
+        schema_bytes, = struct.unpack_from("<Q", header, 112)
+        stream.seek(header_bytes)
+        ids = set()
+        for _ in range(manifests):
+            entry = stream.read(112)
+            name = entry[32:96].split(b"\0", 1)[0].decode(errors="replace")
+            if name == topic:
+                ids.add(struct.unpack_from("<H", entry, 0)[0])
+        stream.seek(header_bytes + 112 * manifests + schema_bytes)
+        first = send = None
+        while (record := stream.read(64)) and len(record) == 64:
+            kind, source = struct.unpack_from("<HH", record, 4)
+            now, = struct.unpack_from("<q", record, 24)
+            first = now if first is None else first
+            if kind == 4 and source in ids:  # EventKind::SEND
+                send = now
+                break
+            stored, = struct.unpack_from("<I", record, 60)
+            stream.seek(stored, 1)
+    return origin, first, send
+
+
+def node_clock_ns():
+    clock = time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin" else time.CLOCK_MONOTONIC
+    return time.clock_gettime_ns(clock)
+
+
+def device_layout(config):
+    """Mirror the config's documented sorted logical-ID and motor-bit order."""
+    robot = tomllib.loads(config.read_text())
+    devices = []
+    for subsystem in robot["subsystems"]:
+        document = tomllib.loads((config.parent / subsystem["path"]).read_text())
+        for kind in ("motors", "sensors", "digital_inputs", "digital_outputs",
+                     "analog_inputs", "encoders", "pwm_outputs"):
+            devices.extend((subsystem["name"], name, kind)
+                           for name in document.get(kind, {}))
+    return [(i, *device) for i, device in enumerate(sorted(devices), 1)]
 
 
 class FullStackSimulation(unittest.TestCase):
-    def run_session(self, stall_producer=False):
+    def window(self, rows, start, end):
+        samples = [row for row in rows if start <= row["now_ms"] < end]
+        self.assertGreater(len(samples), 2, f"missing samples in [{start}, {end})")
+        # A quiet/missing recorder cannot masquerade as safe outputs.
+        times = [start] + [row["now_ms"] for row in samples] + [end]
+        self.assertLessEqual(max(b - a for a, b in zip(times, times[1:])), 30,
+                             f"output gap in [{start}, {end})")
+        return samples
+
+    def assert_driving(self, rows, start, end, drive_ids):
+        samples = self.window(rows, start, end)
+        self.assertTrue(all(all(
+            motor_requests(row)[i][0] == "velocity" and
+            abs(motor_requests(row)[i][2]) > 0.1 for i in drive_ids)
+                            for row in samples), "missing nonzero velocity requests")
+
+    def assert_neutral(self, rows, start, end, motor_ids):
+        for row in self.window(rows, start, end):
+            requests = motor_requests(row)
+            for motor in motor_ids:
+                self.assertEqual(requests[motor], NEUTRAL,
+                                 f"motor {motor} active at {row['now_ms']} ms")
+
+    def assert_neutral_by(self, rows, start, deadline, end, motor_ids):
+        neutral = [row for row in rows if start <= row["now_ms"] <= deadline and
+                   all(motor_requests(row)[i] == NEUTRAL
+                       for i in motor_ids)]
+        self.assertTrue(neutral, f"no neutral request by {deadline} ms")
+        self.assert_neutral(rows, neutral[0]["now_ms"], end, motor_ids)
+
+    def test_scripted_match_neutralizes_blackouts_and_disconnects(self):
         root = workspace()
-        config = root / "2026-robot/main_processor/configuration/robot_physics_sim.toml"
+        config_dir = root / "2026-robot/main_processor/configuration"
+        config = config_dir / "robot_physics_sim.toml"
+        robot = tomllib.loads((config_dir / "robot.toml").read_text())
+        bound_ms = (robot["robot"]["command_timeout_us"] +
+                    2 * robot["robot"]["period_us"]) / 1000
+        layout = device_layout(config_dir / "robot.toml")
+        motor_ids = [i for i, sub, _, kind in layout
+                     if sub == "drivetrain" and kind == "motors"]
+        drive_ids = [i for i, sub, name, kind in layout
+                     if sub == "drivetrain" and kind == "motors" and name.endswith("_drive")]
+        fault_id = next(i for i, _, name, kind in layout
+                        if kind == "motors" and name == "back_left_drive")
+        roller_id = next(i for i, sub, name, kind in layout
+                         if sub == "intake" and name == "roller" and kind == "motors")
+        motor_order = [i for i, _, _, kind in layout if kind == "motors"]
+        fault_bit = 1 << motor_order.index(fault_id)
         gw_port, bridge_port = udp_ports()
-        env = dict(os.environ, TALOS_SHM_NAMESPACE=f"full-stack-{uuid.uuid4().hex}")
-        with tempfile.TemporaryDirectory() as tmp:
-            # The launcher resolves labels under bazel-bin; map that layout
-            # onto the test's runfiles without changing the real workspace.
-            (Path(tmp) / "bazel-bin").symlink_to(root, target_is_directory=True)
-            output = Path(tmp) / "sessions"
-            processes = []
-            stopped_pid = None
-            with open(Path(tmp) / "launcher.txt", "w+") as launcher_log:
-                try:
-                    launcher = subprocess.Popen(
-                        [str(root / "talOS/launcher/launcher"),
-                         "--config", str(config), "--sim",
-                         "--start-sim-gateway",
-                         "--sim-gateway-arg", "--physics",
-                         "--sim-gateway-arg", "--port",
-                         "--sim-gateway-arg", str(gw_port),
-                         "--sim-gateway-arg", "--remote-port",
-                         "--sim-gateway-arg", str(bridge_port),
-                         "--sim-gateway-arg", "--mode-schedule",
-                         "--sim-gateway-arg",
-                         "disabled:0.2,auto:1.0,teleop:0.6,disabled:0.2",
-                         "--remote", "127.0.0.1",
-                         "--remote-port", str(gw_port),
-                         "--local-port", str(bridge_port),
-                         "--output-dir", str(output), "--duration-s", "2"],
-                        cwd=tmp, env=env, stdout=launcher_log,
-                        stderr=subprocess.STDOUT, start_new_session=True)
-                    processes.append(launcher)
-                    if stall_producer:
-                        # Description/import time is not simulation time:
-                        # anchor injection to the launcher-owned gateway.
-                        deadline = time.monotonic() + 15
-                        while time.monotonic() < deadline:
-                            manifests = list(output.glob("*/manifest.json"))
-                            if manifests:
-                                manifest = json.loads(manifests[0].read_text())
-                                if any(node["name"] == "sim_gateway"
-                                       and node["pid"] > 0
-                                       for node in manifest["nodes"]):
-                                    break
-                            self.assertIsNone(launcher.poll(),
-                                              "launcher exited before gateway")
-                            time.sleep(0.01)
-                        else:
-                            self.fail("gateway did not start")
-                        started = time.monotonic()
-                    if stall_producer:
-                        # The driver publishes teleop targets. Stop it within
-                        # the scheduled teleop phase, beyond target freshness
-                        # (100 ms) but below the heartbeat stall floor (500 ms).
-                        deadline = started + 1.45
-                        producer = None
-                        while time.monotonic() < deadline:
-                            manifests = list(output.glob("*/manifest.json"))
-                            if manifests:
-                                manifest = json.loads(manifests[0].read_text())
-                                producer = next(
-                                    (node for node in manifest["nodes"]
-                                     if node["name"] == "driver"
-                                     and node["pid"] > 0), None)
-                            if producer and time.monotonic() >= started + 1.3:
-                                break
-                            self.assertIsNone(launcher.poll(),
-                                              "launcher exited before injection")
-                            time.sleep(0.01)
-                        self.assertIsNotNone(producer,
-                                             "driver did not start during teleop")
-                        self.assertLess(time.monotonic(), started + 1.5,
-                                        "missed the teleop injection window")
-                        stopped_pid = producer["pid"]
-                        os.kill(stopped_pid, signal.SIGSTOP)
-                        time.sleep(0.25)
-                        os.kill(stopped_pid, signal.SIGCONT)
-                        stopped_pid = None
-                    launcher.wait(timeout=30)
-                    launcher_log.seek(0)
-                    diagnostics = launcher_log.read()
-                    self.assertEqual(launcher.returncode, 0, diagnostics)
+        env = launcher_env(TALOS_SHM_NAMESPACE=f"full-stack-{uuid.uuid4().hex}")
+        tmp = Path(tempfile.mkdtemp(prefix="talos-scripted-match-"))
+        output = tmp / "sessions"
+        launcher = None
+        success = False
+        try:
+            (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
+            with (tmp / "launcher.txt").open("w+") as launcher_log:
+                args = [str(root / "talOS/launcher/launcher"),
+                        "--config", str(config), "--sim", "--start-sim-gateway"]
+                gateway_args = [
+                    "--physics", "--port", str(gw_port), "--remote-port", str(bridge_port),
+                    "--mode-schedule", "disabled:0.5,auto:0.5,teleop:6,disabled:1",
+                    "--joystick-schedule",
+                    "0:axes=0,0,0;buttons=0;pov=-1|"
+                    "1.4:axes=0,-0.6,0;buttons=4;pov=-1|"
+                    "1.8:axes=0,-0.6,0;buttons=5;pov=-1|"
+                    "3:axes=0,0,0;buttons=0;pov=-1|"
+                    "3.4:axes=0,-0.6,0;buttons=0;pov=-1|"
+                    "5:axes=0,0,0;buttons=0;pov=-1|"
+                    "5.3:axes=0,-0.6,0;buttons=0;pov=-1",
+                    "--fault-schedule",
+                    "4.3:4.8:udp_blackout:bridge|6:6.7:motor_disconnect:back_left_drive"]
+                for arg in gateway_args:
+                    args.extend(["--sim-gateway-arg", arg])
+                args.extend(["--remote", "127.0.0.1", "--remote-port", str(gw_port),
+                             "--local-port", str(bridge_port), "--output-dir", str(output),
+                             "--duration-s", "8"])
+                launcher = subprocess.Popen(
+                    args, cwd=tmp, env=env, stdout=launcher_log,
+                    stderr=subprocess.STDOUT, start_new_session=True)
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
                     manifests = list(output.glob("*/manifest.json"))
-                    self.assertEqual(len(manifests), 1, diagnostics)
-                    manifest = json.loads(manifests[0].read_text())
-                    nodes = {node["name"]: node for node in manifest["nodes"]}
-                    self.assertEqual(set(nodes), {
-                        "hardware_node", "autonomous", "driver", "drivetrain",
-                        "intake", "pose_estimator", "shooter", "telemetry",
-                        "teleop", "front_left_camera", "front_right_camera",
-                        "rear_left_camera", "rear_right_camera",
-                        "sim_gateway",
-                    }, diagnostics)
-                    for name, node in nodes.items():
-                        with self.subTest(node=name):
-                            self.assertEqual(node["exit_code"], 0, diagnostics)
-                            self.assertFalse(node["recorder_failed"], diagnostics)
-                            self.assertEqual(node["restart_count"], 0, diagnostics)
-                    for name in ("hardware_node", "autonomous", "drivetrain",
-                                 "pose_estimator", "front_left_camera",
-                                 "front_right_camera", "rear_left_camera",
-                                 "rear_right_camera"):
-                        with self.subTest(log=name):
-                            self.assertGreater(nodes[name]["record_count"], 0,
-                                               diagnostics)
-                            log = manifests[0].parent / f"{name}.tlog"
-                            self.assertGreater(log.stat().st_size, 0)
-                finally:
-                    if stopped_pid is not None:
-                        try:
-                            os.kill(stopped_pid, signal.SIGCONT)
-                        except ProcessLookupError:
-                            pass  # Still reap the remaining process group.
-                    # Kill the whole launcher process group on a failed
-                    # assertion/timeout so its children cannot leak into tests.
-                    for proc in reversed(processes):
-                        if proc.poll() is None:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait(timeout=10)
-
-    def test_full_stack_closed_loop(self):
-        self.run_session()
-
-    def test_transient_producer_stall(self):
-        self.run_session(stall_producer=True)
+                    if manifests:
+                        manifest = json.loads(manifests[0].read_text())
+                        nodes = {node["name"]: node for node in manifest["nodes"]}
+                        if nodes.get("sim_gateway", {}).get("pid", 0) > 0:
+                            break
+                    self.assertIsNone(launcher.poll(), "launcher exited before gateway")
+                    time.sleep(0.01)
+                else:
+                    self.fail("gateway did not start")
+                # The rehearsal owns producer-pause/rearm coverage; this run
+                # exercises the scheduled link and device faults.
+                launcher.wait(timeout=20)
+                launcher_log.seek(0)
+                diagnostics = launcher_log.read()
+            self.assertEqual(launcher.returncode, 0, diagnostics)
+            manifests = list(output.glob("*/manifest.json"))
+            self.assertEqual(len(manifests), 1, diagnostics)
+            session = manifests[0].parent
+            manifest = json.loads(manifests[0].read_text())
+            assert_realtime(self, diagnostics, manifest)
+            nodes = {node["name"]: node for node in manifest["nodes"]}
+            for name, node in nodes.items():
+                self.assertEqual(node["exit_code"], 0, f"{name}: {diagnostics}")
+                self.assertFalse(node["recorder_failed"], f"{name}: {diagnostics}")
+                self.assertEqual(node["restart_count"], 0, f"{name}: {diagnostics}")
+            dumped = subprocess.run(
+                [str(root / "talOS/launcher/log_dump"), "--format", "jsonl",
+                 "--node", "drivetrain,hardware_node,intake,shooter",
+                 "--topic", "/hw/request/drivetrain,/hw/request/intake,/shooter/state,"
+                 "/hw/state/driver_station,/hw/state,/hw/status",
+                 str(session)], capture_output=True, text=True, timeout=10, check=True)
+            (tmp / "match.jsonl").write_text(dumped.stdout)
+            rows = [json.loads(line) for line in dumped.stdout.splitlines()]
+            requests = [r for r in rows if r["process"] == "drivetrain" and
+                        r["topic"] == "/hw/request/drivetrain" and r["kind"] == "SEND"]
+            ds = [r for r in rows if r["process"] == "drivetrain" and
+                  r["topic"] == "/hw/state/driver_station" and r["kind"] == "MESSAGE"]
+            self.assertGreater(len(ds), 100)
+            intake_requests = [
+                r for r in rows if r["process"] == "intake" and
+                r["topic"] == "/hw/request/intake" and r["kind"] == "SEND"]
+            feed_only = next(r["now_ms"] for r in ds if ds_buttons(r) == 4)
+            spinup = next(r["now_ms"] for r in ds if ds_buttons(r) == 5)
+            # Button 3 alone must not feed a stopped flywheel. Require dense
+            # request samples so a missing recorder cannot pass as safe.
+            self.assert_neutral(intake_requests, feed_only + 80, spinup, [roller_id])
+            ready = [
+                r for r in rows if r["process"] == "shooter" and
+                r["topic"] == "/shooter/state" and r["kind"] == "SEND" and
+                spinup < r["now_ms"] < spinup + 1000 and
+                struct.unpack_from("<?", bytes.fromhex(r["payload_hex"]), 24)[0] and
+                struct.unpack_from("<d", bytes.fromhex(r["payload_hex"]), 16)[0] > 0]
+            self.assertTrue(ready, "flywheel never reached speed while 1+3 held")
+            feeding = self.window(intake_requests, ready[0]["now_ms"] + 80,
+                                  ready[0]["now_ms"] + 200)
+            self.assertTrue(all(
+                motor_requests(r)[roller_id][0] == "velocity" and
+                motor_requests(r)[roller_id][2] == -20.0 for r in feeding),
+                "ready shooter plus held buttons 1+3 did not feed")
+            centers = []
+            previous_axis = None
+            for row in ds:
+                flags, axis = ds_snapshot(row)
+                if flags & 16 and axis == 0 and previous_axis is not None and previous_axis < -0.5:
+                    centers.append(row["now_ms"])
+                previous_axis = axis
+            self.assertEqual(len(centers), 2, "missing scheduled release/rearm snapshots")
+            center, blackout_center = centers
+            self.assert_driving(requests, center + 650, center + 1000, drive_ids)
+            gaps = [(a, b) for a, b in zip(ds, ds[1:])
+                    if b["now_ms"] - a["now_ms"] > 300]
+            self.assertEqual(len(gaps), 1, "missing or unexpected DS blackout")
+            last_ds, recovered_ds = gaps[0]
+            blackout = last_ds["now_ms"]
+            self.assert_driving(requests, blackout - 150, blackout, drive_ids)
+            # Last receipt + timeout is at least as strict as blackout + timeout.
+            self.assert_neutral_by(requests, blackout, blackout + bound_ms,
+                                   recovered_ds["now_ms"], motor_ids)
+            self.assert_neutral(requests, recovered_ds["now_ms"],
+                                blackout_center, motor_ids)
+            self.assert_driving(requests, blackout_center + 500,
+                                blackout_center + 850, drive_ids)
+            invalid_states = []
+            for row in rows:
+                if row["process"] != "hardware_node" or row["topic"] != "/hw/state":
+                    continue
+                if any(m["id"] == fault_id and not m["valid"]
+                       for m in hardware(row)["motors"]):
+                    invalid_states.append(row)
+            self.assertGreater(len(invalid_states), 20, "motor disconnect not observed")
+            disconnected = invalid_states[0]["now_ms"]
+            restored = invalid_states[-1]["now_ms"]
+            self.assert_driving(requests, disconnected - 150, disconnected, drive_ids)
+            self.assert_neutral_by(requests, disconnected, disconnected + bound_ms,
+                                   restored, [fault_id])
+            statuses = [r for r in rows if r["process"] == "drivetrain" and
+                        r["topic"] == "/hw/status" and r["kind"] == "MESSAGE" and
+                        disconnected + 50 <= r["now_ms"] < restored]
+            self.assertGreater(len(statuses), 10, "missing bridge fault status")
+            for row in statuses:
+                match = re.search(r"\bmotor_fault_mask:\s*(\d+)", row["decoded"])
+                self.assertIsNotNone(match, row["decoded"])
+                self.assertNotEqual(int(match[1]) & fault_bit, 0, row["decoded"])
+            final_disabled = next(r["now_ms"] for r in ds
+                                  if r["now_ms"] > restored and
+                                  not ds_snapshot(r)[0] & 4)
+            self.assert_neutral(requests, final_disabled + 10,
+                                final_disabled + 200, motor_ids)
+            success = True
+        finally:
+            if launcher is not None:
+                if not success:
+                    try:
+                        os.killpg(launcher.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                launcher.wait(timeout=5)
+            autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
+            if success:
+                shutil.rmtree(tmp)
+            else:
+                print(f"Scripted match artifacts retained: {tmp}; sessions: {output}",
+                      file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

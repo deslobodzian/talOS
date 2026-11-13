@@ -2,14 +2,12 @@
 
 An intake, an elevator, and a superstructure that sequences them, written as
 three **separate nodes** that talk only over topics. Goals travel on target
-lanes, `/<subsystem>/target/<source>`: each producer writes its own lane
-(`talos::TargetLane`) and each subsystem picks the live one for the current
-Driver Station mode (`talos::Target`):
+lanes; see [target policy and safety](../../ARCHITECTURE.md).
 
 ```
  /superstructure/target/teleop ─┐
  /superstructure/target/auto   ─┴▶ superstructure ──▶ /intake/target/superstructure   ──▶ intake   (roller + beam break)
-                                       ▲  ▲        ──▶ /elevator/target/superstructure ──▶ elevator (one motion-magic TalonFX)
+                                       ▲  ▲        ──▶ /elevator/target/superstructure ──▶ elevator (motion-magic TalonFX + bottom switch)
                                        │  └──────────── /intake/state   ◀─────────────────┘     │
                                        └─────────────── /elevator/state ◀──────────────────────┘
 ```
@@ -25,61 +23,143 @@ them, in both modes:
 | intake | `/intake/target/superstructure` | `/intake/target/superstructure` | `[targets]` in `subsystems/intake.toml` |
 | elevator | `/elevator/target/superstructure` | `/elevator/target/superstructure` | `[targets]` in `subsystems/elevator.toml` |
 
-A Target has a goal only while the robot is enabled, the Driver Station is in
-an enabled mode, and that mode's lane is active (not released), fresh
-(younger than `[robot] command_timeout_us`) and sent under the current mode
-generation (its producer had drained the Driver Station packet of this enable
-and mode). With none, a subsystem is neutral: it calls no actuator.
+
+The intake and elevator are thin wrappers over
+[`talOS/mechanisms`](../../talOS/mechanisms/README.md) building blocks: the
+intake's roller is a `RollerWithSensor` and the elevator's lift a
+`PositionMechanism`. Each node maps its own goal message to the block's
+`set_goal()` (or `stop()` without a live target), calls its `update()`, and
+maps the block's phase to its own status enum.
 
 - **intake**: IDLE → INTAKING (roller in) → HOLDING once the beam breaks (small
   hold voltage) → EJECTING (reverse for `eject_us`, 500000 µs by default) →
-  IDLE. Roller voltages are `intake_v`, `hold_v`, and `eject_v`. With no
-  target it behaves as asked for IDLE with the roller neutral; the state
-  machine still tracks the beam break and finishes a timed eject.
-- **elevator**: motion magic to the goal height while it has a target. It
-  reports STOWED at 0, MOVING, or AT_GOAL (within `tolerance_rot`), and echoes
-  the goal that `at_goal` refers to. With no target the lift is neutral (it
-  never holds an old goal); its status echoes goal 0 with `at_goal` false, and
-  reads STOWED within `tolerance_rot` of 0, MOVING elsewhere.
+  IDLE. Roller voltages are `intake_v`, `hold_v`, and `eject_v`, in the
+  `[roller]` table with `sensor = "beam_break"`. An EJECT asked while IDLE
+  does nothing (`idle_runs` is off). With no target (stale, released or
+  never sent) it behaves as asked for IDLE with the roller neutral; the state
+  machine still tracks the beam break and finishes a timed eject. Losing
+  enable cancels an eject or intake in progress (back to IDLE); a held piece
+  stays HOLDING. While the beam break's sample is invalid, `has_piece` keeps
+  its last valid value and INTAKING leaves the roller neutral
+  ([RollerWithSensor](../../talOS/mechanisms/README.md#rollerwithsensor)).
+- **elevator**: motion magic to the goal height (clamped to
+  `min_rot`..`max_rot`, 0..12, in the `[lift]` table) while it has a target. It reports STOWED at 0, MOVING,
+  or AT_GOAL (within `tolerance_rot`), and echoes the goal that `at_goal`
+  refers to. With no target the lift is neutral (it never holds an old goal);
+  its status echoes goal 0 with `at_goal` false, and reads STOWED within
+  `tolerance_rot` of 0, MOVING elsewhere. See [Homing](#homing) for HOMING and
+  HOMING_FAILED. A goal above `max_rot` is clamped and echoed as
+  `max_rot`, so a `high_rot` set above it keeps the superstructure in
+  RAISING, waiting for a height it never asked for.
 - **superstructure**: STOWED → INTAKING (on INTAKE) → HOLDING (the intake
   has the piece) → RAISING (on SCORE_HIGH, elevator to `high_rot`) → SCORING
   (the elevator is at that height; intake ejects) → STOWED (the piece is gone).
-  It republishes both mechanism lanes every tick. When either mechanism's state
-  goes stale it holds the current step and keeps sending that step's goals; it
-  never advances on old data. No goal of its own (disabled, stale, released or
-  never sent) counts as STOW.
+  Cancellation is checked every tick: STOW or no goal (disabled, stale, released
+  or never sent) abandons the active sequence immediately. With fresh mechanism
+  statuses it requests intake IDLE and elevator height 0. If either status is
+  stale, it releases **both** mechanism lanes instead of renewing a high
+  elevator goal or EJECT. The mechanisms then have no target and are neutral;
+  this is not a gravity-compensating elevator hold. The reported sequence falls
+  back to HOLDING only when a fresh intake status still sees a piece, otherwise
+  STOWED. Once both statuses return, sequencing starts from those observations
+  and the current command, not the interrupted step: a piece that left during
+  the outage is not scored again. Normal sequencing republishes both lanes
+  every tick.
 
-Every tunable (voltages, eject time, tolerance, height) is a parameter read
-from the robot config: `node.param<T>("key")` in C++, `node.param("key")` in
-Python.
+Every tunable (voltages, eject time, tolerance, heights, homing) is a parameter read
+from the robot config: the intake's and elevator's by their building block
+from its `[roller]` or `[lift]` table (`node.param<T>("lift.tolerance_rot")`),
+the superstructure's with `node.param<T>("key")` in C++, `node.param("key")`
+in Python.
 
 The nodes are implemented once in C++ (`cpp/`) and wrapped in Python (`py/`)
 via `TALOS_EXPORT_NODE` and `talos.cpp_node`, so both sets of binaries and
 tests run the exact same implementation without duplicating logic.
 
-For a subsystem shipped as its own Bzlmod repository, see
-[`../wrist_repo/`](../wrist_repo/) and its robot-side consumer
-[`../external_subsystem/`](../external_subsystem/). The root `MODULE.bazel`
-imports `@wrist//:node` with `bazel_dep` and `local_path_override`; the consumer
-tests its graph, generated manifest, and a relocated bundle:
-`bazel test //examples/external_subsystem:all` and `bazel test @wrist//...`.
+For node APIs and message/build conventions, see the
+[node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md).
 
-## Three layers
+## Homing
 
-`talos::Node` (`//talOS/node`) is generic: it gives you topics, parameters,
-`update()` every period, `StateMachine`, and `TALOS_NODE`, and knows nothing
-about robots. `talOS/devices` (`//talOS/devices`) is the hardware layer on top
-of it. `talos::Motor roller{node, "roller"}` names a device in your
-subsystem's TOML, and the layer handles `/hw/state`, the per-node hardware
-request, and neutral-when-disabled. Your code is the class in between: read
-inputs, step a state machine, set outputs, publish a status. The intake and
-elevator use all three layers. The superstructure has no hardware, but its goal
-is a `talos::Target` and its outputs are `talos::TargetLane`s, which also come
-from `talOS/devices` (a Target reads `/hw/state` and the Driver Station to know
-whether the robot is enabled and in which mode). Python has the same three
-layers (`talos.Node`, then `talos.Motor(node, "roller")` and
-`talos.Target(node, Msg)`, then your class), as a thin binding over the same
-C++ code, so both languages behave identically.
+A TalonFX counts rotations from where it powered on, and a reset (brownout,
+CAN fault) restarts that count at 0 wherever the carriage is. A goal of 10 in
+that frame is 10 rotations above the carriage, not 10 above the bottom. So
+heights count from a bottom limit switch (`[digital_inputs.bottom_limit]`,
+named by `[lift] limit_switch` with `homing = "limit_switch"`), and the lift keeps the default `position_frame = "rezero"`: the devices layer
+sends its motion-magic goals neutral until `Motor::rezero` has zeroed it, and
+again whenever a TalonFX reset or a RoboRIO reboot drops that zero
+(`zeroed()` false; see the node development guide's rezero paragraph).
+
+The switch is normally open and wired between the DIO signal pin and ground.
+The RoboRIO input's pull-up reads true while the carriage is off it and false
+once the carriage closes it, so the elevator takes "at the bottom" from a
+false reading. A cut or unplugged wire then reads "not at the bottom": homing
+fails instead of zeroing the lift mid-travel and then driving it past the top.
+
+While unzeroed the elevator reports HOMING, with `goal_rot` 0 and `at_goal`
+false. With a live, finite target it drives the lift down at `homing_v` volts
+(negative: down, toward the switch), a voltage request, which a dropped zero
+does not hold and which the TalonFX bounds by the lift's current and voltage
+limits. Once the switch has read closed on `home_samples` consecutive elevator
+periods (default 3) it calls `rezero(0)`; until then homing keeps driving,
+and any open reading, or a sample that is not `connected()`, restarts the
+count, so a one-tick glitch mid-travel does not zero the lift partway up.
+It goes on to the target's goal in the same tick only if the lift is already
+at rest (slower than `homing_stall_rps` on its last `home_samples` periods);
+otherwise it stays HOMING, neutral, until it is, so the first motion-magic
+move starts from rest instead of from the homing speed, which would carry
+the lift past the switch
+([settling](../../talOS/mechanisms/README.md#positionmechanism)).
+A lift already resting on the switch zeroes there without moving, whether or
+not the robot is enabled.
+
+HOMING_FAILED latches, neutral, in three cases:
+
+- the switch has not closed within `homing_timeout_us` of the first homing
+  command (time with no target counts too), or the zeroed lift has not come
+  to rest within `homing_timeout_us` of the first target after the zero;
+- the lift has moved slower than `homing_stall_rps` for `homing_stall_us`
+  while homing pushes it (jammed, or the motor is not turning);
+- the switch reads closed while the zeroed lift is more than
+  `home_margin_rot` above 0 (stuck closed or shorted), which the first move up
+  after the zero shows.
+
+It clears only when the Driver Station reports disabled; the next enabled
+target retries. A stale hardware link, which also makes `robot_enabled` false,
+does not clear it. The constructor refuses a `homing_v` that does not point
+down toward `home_rot` at `min_rot` (0) or exceeds half the lift's
+`max_voltage`, a `max_rot` not finite or not above `min_rot`, a
+`homing_timeout_us`, `homing_stall_rps`, `homing_stall_us` or
+`home_margin_rot` that is not positive and finite, and a `home_samples` below
+1. These are `PositionMechanism`'s limit-switch homing rules
+([talOS/mechanisms](../../talOS/mechanisms/README.md#positionmechanism)).
+
+Homing runs on any live target while unzeroed rather than on a separate
+operator request. Like every other motion it needs `robot_enabled` and a
+non-null `Target::get()`, so a disabled robot or a stale, released or
+never-sent lane moves nothing. An unzeroed elevator cannot serve any goal, the
+move is down, toward the stowed position the superstructure falls back to,
+slowly and time-bounded, and a separate request would leave an autonomous
+routine or a mid-match reset stuck until a driver noticed.
+
+The lift has no hardware soft limits (`soft_limits = false`), and config
+load refuses `soft_limits = true` on its `"rezero"` frame. The gateway checks
+soft limits only against position and motion-magic demands and passes
+duty-cycle and voltage requests, but the TalonFX (and the physics simulator)
+enforces them on the measured position in every control mode, in its
+power-on frame, from thresholds the RoboRIO applies once with the static
+motor config; no request carries them, so no rezero moves them. After a reset
+at height the reverse limit of 0 sits at the carriage, so it would stop
+homing at once, and the forward limit would allow travel past the top.
+`max_rot` bounds goals in the homed frame instead.
+
+In software that clamp is the only protection at the top of travel: it bounds
+the goals, not a carriage that overshoots, coasts or is driven by a bad gain.
+So the lift declares `forward_limit_switch = "NormallyOpen"`: a switch wired
+to the TalonFX's own forward limit input stops upward output in every control
+mode, whatever the frame (see [talOS/hardware](../../talOS/hardware/README.md)).
+That is also Phoenix's default, so with no switch wired nothing changes; use
+`"NormallyClosed"` for a switch that also stops the lift when its wire breaks.
 
 ## Layout
 
@@ -110,12 +190,30 @@ voltages, the elevator's motion-magic demand, `at_goal`, the eject, and the
 return to STOWED. It also checks that disabling the robot neutralizes every
 motor (the superstructure, losing its own goal, steps back to HOLDING), that a
 missing, released or stale goal counts as STOW, and that stale mechanism
-states never advance the superstructure. The elevator alone goes neutral on a
-stale, released or never-sent lane, while disabled, on Driver Station loss,
-with the lift disconnected and on a non-finite goal; the intake alone goes
-neutral on a stale lane while keeping its state.
-`py/superstructure_test.py` runs the same scenarios on the Python nodes with
-`talos.testing.Sim` and `config/robot_py.toml`.
+statuses release both lanes. Coordinator-only tests cover STOW during stale
+RAISING, EJECT release during SCORING when either dependency goes stale,
+release/disable/goal expiry with stale statuses, and recovery from fresh
+observations without replaying a completed score. The elevator alone carries
+the node test matrix ([TESTING.md §7](../../docs/TESTING.md#7-the-node-test-matrix)):
+it goes neutral on a stale, released or never-sent lane, while disabled, on
+Driver Station loss, with the lift disconnected, on a non-finite goal, on a
+live lane of a source its `[targets]` does not list and on a goal stamped
+with an earlier Driver Station generation, allocates nothing per tick, and
+clamps goals to its travel at both ends. Its homing tests start it unzeroed and home
+it on a live target before it reaches the goal, keep homing through a
+one-tick closed reading mid-travel, re-home it after
+`SimHardware::reset_device` at height without applying a motion-magic goal in
+the restarted frame, keep it still while disabled or with a non-finite,
+stale, released or never-sent lane, and latch HOMING_FAILED on the timeout
+(kept through a stale-link glitch, cleared by a Driver Station disable), on a
+stall and on a switch stuck closed. Another test refuses unsafe homing
+parameters, naming the key. The other tests start the lift on its closed
+switch, which reads false. The intake alone drives at a live lane and goes
+neutral while disabled, on a goal of an earlier generation, and on a stale
+lane while keeping its state.
+`py/superstructure_test.py` covers Python host integration, disabled operation
+and target loss with `talos.testing.Sim` and `config/robot_py.toml`; the shared
+C++ suite owns the detailed mechanism scenarios.
 
 ## Run it in simulation
 
@@ -140,179 +238,99 @@ RoboRIO and moves motors straight to their demands:
 Use `--config examples/superstructure/config/robot_py.toml` in either command
 to run the Python nodes instead. Both configs declare the same graph.
 
-Nothing in the example publishes `/superstructure/target/teleop` or
-`/superstructure/target/auto`; a driver or autonomous node would. Nothing
-moves without a Driver Station in an enabled mode (the real Driver Station, or
-`talOS/driver_station`'s `send_joystick`): every Target is empty and every
-motor neutral. With an enabled teleop Driver Station, the live graph sits
-STOWED and holds the elevator at 0. The check reports no errors and four
-expected warnings: `/superstructure/target/teleop` and
-`/superstructure/target/auto` are in the superstructure's target policy but
-nothing writes them yet, and `/hw/status` and `/superstructure/state` are
-published but nothing reads them, because the example has no driver,
-autonomous or telemetry node. On a real robot, a driver node reads the Driver
-Station, writes `/superstructure/target/teleop` with a
-`talos::TargetLane<SuperstructureGoal>{node, "superstructure", "teleop"}` and
-watches `/superstructure/state`.
+The gateway supplies enabled teleop Driver Station packets by default, but
+nothing in this example publishes a superstructure goal. Without a goal,
+the coordinator requests intake IDLE and elevator height 0 only while both
+mechanism statuses are fresh; otherwise it releases both mechanism lanes.
+The lightweight gateway reports every digital input false, which the
+elevator reads as its bottom switch closed, so it zeroes at once where the
+lift starts. Under the RoboRIO program in WPILib simulation, an input nothing
+drives reads true, as an unwired pull-up does, so there the elevator homes
+until its stall or timeout stop.
+
 
 ## Write your own mechanism
 
-The fast path is the scaffolder, from the repo root:
+Start from a building block: most mechanisms are a
+[`talOS/mechanisms`](../../talOS/mechanisms/README.md) class plus a target
+lane and a state publisher, as `cpp/elevator.h` and `cpp/intake.h` are; the
+library's README has a minimal node. Write the control yourself only for
+what no block covers.
+
+Generate a robot of your own whose first mechanism is a position-controlled
+wrist, from the repo root:
 
 ```sh
-bazel run //tools:new_subsystem -- wrist --lang cpp   # or --lang py
+bazel run //tools:new_robot -- my_robot --mechanism wrist --lang cpp --type position
 ```
 
-It writes `<robot>/main_processor/wrist/` (messages with an explicit
-`include_prefix`, the node, a Sim test covering the disabled and stale-target
-cases), the subsystem TOML with the lowest free CAN id marked as a
-placeholder, the `[[subsystems]]` entry in `robot.toml`, and the regenerated
-`robot_manifest.bzl` (no BUILD file lists nodes). What follows explains
-each generated piece, taking a wrist that goes to an angle as an example.
+To add the wrist to a robot that exists, run
+`bazel run //tools:new_subsystem -- wrist --lang cpp --type position --robot my_robot`
+instead. Do not scaffold into `2026-robot`, the project's testbed: its graph
+is full ([first mechanism](../../docs/FIRST_MECHANISM.md#2-make-your-robot)).
+`--dry-run` inspects the changes without writing them. Use `--lang py` for a
+Python implementation. Omitting `--type position` generates a velocity
+mechanism, not an angle-controlled wrist.
 
-1. **Messages.** Add `messages/wrist.fbs` and list it in `messages/BUILD`:
-   ```
-   namespace demo;
-   enum WristState : ubyte { STOWED, MOVING, AT_GOAL }
-   struct WristGoal   { angle_rot:double; }
-   struct WristStatus { state:WristState; angle_rot:double; at_goal:bool; }
-   ```
-   Use structs only, with no tables or strings. C++ gets
-   `#include "demo/wrist_generated.h"` and `demo::WristGoal`, with enums
-   spelled `WristState::MOVING`. Python gets `from demo.WristGoal import
-   WristGoal`. Add the state topic to `topics` in `messages/BUILD`:
-   `"wrist_status": "/wrist/state"`. C++ reads it as `topics::kWristStatus`
-   (`#include "demo/topics.h"`), Python as `topics.WRIST_STATUS`
-   (`from demo import topics`). The goal needs no topic entry: it arrives on
-   target lanes, `/wrist/target/<source>`, which `talos::Target` names from
-   the subsystem and its policy.
-2. **The class** (`cpp/wrist.h`):
-   ```cpp
-   class Wrist {
-    public:
-     using State = WristState;
-     explicit Wrist(talos::Node& node)
-         : motor_{node, "motor"},
-           goal_{node},
-           status_{node.publish<WristStatus>(topics::kWristStatus)},
-           sm_{node, State::STOWED},
-           tolerance_rot_{node.param<double>("tolerance_rot")} {}
-     void update() {
-       const WristGoal* goal = goal_.get();  // null: disabled, stale, released
-       const bool drive = goal != nullptr && motor_.connected() &&
-                          std::isfinite(goal->angle_rot());
-       if (drive) motor_.set_motion_magic(goal->angle_rot());
-       const bool at_goal =
-           drive && std::abs(motor_.position() - goal->angle_rot()) <= tolerance_rot_;
-       sm_.go(at_goal ? State::AT_GOAL : State::MOVING);
-       status_.send(WristStatus{sm_.state(), motor_.position(), at_goal});
-     }
-    private:
-     talos::Motor motor_;
-     talos::Target<WristGoal> goal_;
-     talos::Publisher<WristStatus> status_;
-     talos::StateMachine<State> sm_;
-     double tolerance_rot_;
-   };
-   ```
-   Then `cpp/wrist.cc` is two lines: the include and `TALOS_NODE(demo::Wrist)`.
-   Take every handle and topic in the constructor. Call an actuator only
-   inside `drive`: anything you don't set in an `update()` goes out neutral,
-   so with no target the wrist is neutral rather than holding an old goal, and
-   every motor is neutral while the robot is disabled. In Python it is
-   `py/wrist.py`, a `class Wrist` with `__init__(self, node)` and
-   `update(self)`, reading `self.goal = talos.Target(node, WristGoal)` with
-   `self.goal.get()` (None when there is no target).
-3. **BUILD** (`cpp/BUILD`): add `wrist.h` to `:mechanisms`, then
-   ```
-   talos_cc_node(name = "wrist", node_name = "wrist", srcs = ["wrist.cc"], deps = [":mechanisms"])
-   ```
-   The node's name and Bazel target come from this macro alone. For Python,
-   use `py/BUILD`:
-   ```
-   talos_py_node(name = "wrist", node_name = "wrist", main = "wrist.py", class_name = "Wrist",
-                 deps = ["//examples/superstructure/messages:messages_py"])
-   ```
-4. **Config.** Add `config/subsystems/wrist.toml`:
-   ```toml
-   [subsystem]
-   name = "wrist"
-   period_us = 10000
-   tolerance_rot = 0.02
+The generator writes `my_robot/main_processor/wrist/`:
 
-   [motors.motor]
-   type = "TalonFX"
-   can_id = 3
-   cruise_velocity_rps = 2.0
-   acceleration_rps2 = 8.0
-   slot0 = { p = 30.0, i = 0.0, d = 0.5, s = 0.1, v = 0.0, a = 0.0, g = 0.2 }
-   ```
-   and list it in `config/robot.toml`:
-   ```toml
-   [[subsystems]]
-   name = "wrist"
-   path = "subsystems/wrist.toml"
-   node = "//examples/superstructure/cpp:wrist"
-   ```
-   `robot_py.toml` gets the same entry with
-   `node = "//examples/superstructure/py:wrist"`. The device key
-   (`motors.motor`) is the name you give the handle. The wrist reads the
-   default `[robot.targets]` lanes (`/wrist/target/teleop`,
-   `/wrist/target/auto`); to have the superstructure drive it instead, give
-   `wrist.toml` a `[targets]` table as `elevator.toml` does, and write
-   `talos::TargetLane<WristGoal>{node, "wrist", "superstructure"}` in the
-   superstructure. Then regenerate the manifests the graph tests read;
-   `manifest_sync_test` fails until you do:
-   ```sh
-   bazel run //tools:sync_manifest -- examples/superstructure/config/robot.toml examples/superstructure/config/robot_py.toml
-   ```
-5. **Test** it in `cpp/superstructure_test.cc` or a test of its own (Python:
-   the same calls on `talos.testing.Sim`, with durations in seconds):
-   ```cpp
-   Sim sim{RobotConfig()};
-   sim.add<demo::Wrist>("wrist");
-   SimHardware hw{sim};
-   hw.enable();
-   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
-   hw.ideal_motors();
-   sim.step(10ms);  // the teleop mode begins
-   PublishTarget(sim, "wrist", "teleop", WristGoal{0.25});
-   sim.step(50ms);
-   EXPECT_EQ(hw.motor_request("wrist", "motor").mode, Mode::kMotionMagic);
-   EXPECT_TRUE(sim.latest<WristStatus>(topics::kWristStatus)->at_goal());
-   ```
-   and cover the disabled, stale, released and never-sent cases, which must
-   all leave the motor neutral (`docs/METHODOLOGY.md` §11).
-
-## Wrapping C++ nodes in Python (`py/`)
-
-Instead of maintaining a duplicate Python implementation of the C++ mechanisms,
-`cpp/mechanisms_abi.cc` exports the C++ classes with `TALOS_EXPORT_NODE`:
-
-```cpp
-TALOS_EXPORT_NODE(intake, demo::Intake)
-TALOS_EXPORT_NODE(elevator, demo::Elevator)
-TALOS_EXPORT_NODE(superstructure, demo::Superstructure)
+```text
+BUILD
+wrist_message.fbs       wrist.WristTarget(position_rot), wrist.WristState,
+                        wrist.WristHoming
+wrist.h                 wrist::Wrist
+wrist.cc                TALOS_NODE entry point
+node_test.cc
+testdata/robot.toml
+testdata/wrist.toml
+testdata/neighbor.toml  another subsystem's motor, valid while the test
+                        disconnects the wrist's
 ```
 
-and `py/intake.py`, `py/elevator.py` and `py/superstructure.py` wrap them with
-`talos.cpp_node`:
+The package's `:messages` target uses `include_prefix = "wrist"` and declares
+`/wrist/state`; its node target is `:node`. `wrist::Wrist` is a thin node
+over a `talos::mechanisms::PositionMechanism` named `wrist`, as the elevator
+is (see [Homing](#homing)): it passes a live target to `set_goal()`, calls
+`stop()` otherwise, and maps the mechanism's phase to `/wrist/state`'s
+HOMING, HOMED or FAILED. The mechanism does the rest, with the elevator's
+switch wiring, `home_samples` debounce, failure latches and parameter
+checks: Motion Magic on the motor `wrist`, at goal within `tolerance_rot`, a
+home switch, `wrist_home`, at the reverse end of travel that zeroes it,
+`position_frame = "rezero"` holding its goals until then, and goals clamped
+to `min_rot..max_rot`; the motor has no hardware soft limits.
 
-```python
-import talos
+The subsystem file is
+`my_robot/main_processor/configuration/subsystems/wrist.toml`: it contains
+`node = "//my_robot/main_processor/wrist:node"`, a 20000 µs node period,
+the mechanism's `[wrist]` parameter table, a TalonFX with the lowest unused
+CAN id in `1..62` and a home switch with the lowest unused DIO channel in
+`0..31`, both explicitly marked as placeholders. The rest of its homing
+setup is placeholder too: `max_rot = 0.001` confines every target to within
+0.001 rotations of the switch until you set the measured travel, and
+`homing_v = -0.5` (with `homing_timeout_us`, 3 s by default) needs its
+direction checked before the first enable. The generator appends the
+subsystem name and path to `configuration/robot.toml` and regenerates that
+config's manifest plus manifests of configs that include it.
+`./sim.sh --config my_robot/main_processor/configuration/robot_sim.toml --sim-gateway`
+runs the robot in simulation. `robot_sim.toml` is the simulation-only config
+`new_robot` writes: it includes `robot.toml`, which never reads it back. The
+wrist moves there only after you append the block the generator's `Next:`
+output prints to it: a teleop binding on button 3 (`position_rot = 1.0`), a
+`[targets]` override for an autonomous policy with no writer, a simulated
+travel (`max_rot`), a simulated home switch on `wrist_home` that closes just
+below where the motor starts (`sim_motor`, `sim_closed_at_rot`; see
+[the hardware README](../../talOS/hardware/README.md)), so homing drives to
+it, and simulated `slot0` gains.
+`subsystems/wrist.toml` keeps its binding commented and its gains zero, so
+none of these values reaches the robot. `Next:` also prints the `sim.sh`
+command that holds button 3.
 
-Elevator = talos.cpp_node(
-    "examples/superstructure/cpp/libmechanisms.so", "elevator")
-```
+The Python variant puts `wrist.py` and `node_test.py` in the same package,
+not in a separate `py/` directory. It uses the same schema, `:node` target
+and subsystem file, and is the same thin node over
+`talos.mechanisms.PositionMechanism` (`//talOS/python:mechanisms`), the
+C++ mechanism through the node API.
+For implementing and wiring additional behavior, use the
+[node development guide](../../docs/NODE_DEVELOPMENT_GUIDE.md).
 
-When a subsystem is written directly in Python, it uses the same `talos.Node`,
-`talos.Motor`, `talos.Target`, `talos.TargetLane` and `talos.StateMachine`
-concepts (all backed by the single C++ implementation through
-`talOS/node_api`).
 
-Python reads message fields as snake_case attributes named as in the .fbs
-(`goal.height_rot`), and `send(**fields)` takes the same names; any
-field you leave out is 0. A schema enum is a flatc class of int constants
-(`from demo.IntakeCommand import IntakeCommand`, then `IntakeCommand.EJECT`).
-Topic names come from the same `topics` dict as C++'s: `topics.ELEVATOR_STATUS`
-is `topics::kElevatorStatus`.

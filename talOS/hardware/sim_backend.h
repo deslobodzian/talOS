@@ -1,9 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <vector>
 
+#include "feedback.h"
 #include "gateway.h"
 
 namespace talos::hardware {
@@ -14,12 +16,15 @@ class SimBackend final : public Backend {
   bool Configure(const Config& config) override {
     config_ = config;
     pending_resets_.clear();
+    restoring_.fill(false);
     return true;
   }
   bool Read(State& state) override {
     state.health = health_;
     const double dt =
-        previous_time_ ? (state.sample_time_us - previous_time_) * 1e-6 : 0;
+        previous_time_
+            ? static_cast<double>(state.sample_time_us - previous_time_) * 1e-6
+            : 0;
     previous_time_ = state.sample_time_us;
     std::array<bool, kMaxMotors> resolved{};
     for (std::size_t i = 0; i < config_.motors.size(); ++i) {
@@ -46,9 +51,14 @@ class SimBackend final : public Backend {
         for (std::size_t j = 0; j < config_.motors.size(); ++j) {
           if (config_.motors[j].id != cfg.master_id || !resolved[j]) continue;
           const double sign = cfg.oppose_master ? -1.0 : 1.0;
-          samples_[i].position_rot = samples_[j].position_rot * sign;
-          samples_[i].velocity_rps = samples_[j].velocity_rps * sign;
-          samples_[i].voltage = samples_[j].voltage * sign;
+          if (commands_[i].mode == Mode::kNeutral) {
+            samples_[i].velocity_rps = 0;
+            samples_[i].voltage = 0;
+          } else {
+            samples_[i].position_rot = samples_[j].position_rot * sign;
+            samples_[i].velocity_rps = samples_[j].velocity_rps * sign;
+            samples_[i].voltage = samples_[j].voltage * sign;
+          }
           resolved[i] = true;
           progress = true;
           break;
@@ -61,7 +71,13 @@ class SimBackend final : public Backend {
         samples_[i].velocity_rps = 0.0;
         samples_[i].voltage = 0.0;
       }
+      // Placeholder effort current and constant ambient; not electrical or
+      // thermal models. The ideal backend only models explicit voltage.
+      samples_[i].temperature_c = 25.0;
+      samples_[i].supply_current_a = std::abs(samples_[i].voltage) / 12.0 *
+                                     config_.motors[i].supply_limit_a;
       state.motors[i] = samples_[i];
+      if (restoring_[i]) MarkInvalid(state.motors[i]);
     }
     for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
       state.sensors[i] = {config_.sensors[i].id, true, 0, 0};
@@ -73,7 +89,10 @@ class SimBackend final : public Backend {
       }
       for (std::size_t j = 0; j < config_.motors.size(); ++j) {
         if (config_.motors[j].feedback_sensor_id == config_.sensors[i].id) {
-          state.sensors[i].position_rot = samples_[j].position_rot;
+          // Absolute, as the RoboRIO reports a CANcoder; the motor's own
+          // position stays continuous.
+          state.sensors[i].position_rot =
+              CANcoderAbsoluteRot(samples_[j].position_rot);
           state.sensors[i].velocity_rps = samples_[j].velocity_rps;
         }
       }
@@ -99,12 +118,13 @@ class SimBackend final : public Backend {
       const auto id = config_.pwm_outputs[i].id;
       state.pwm_outputs[i] = {id, true, pwm_outputs_[id]};
     }
-    return true;
+    return AnyFeedbackValid(state);
   }
   bool Apply(std::span<const MotorRequest> commands) override {
     std::copy(commands.begin(), commands.end(), commands_.begin());
     return true;
   }
+  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
   bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
                     std::span<const PwmRequest> pwm_outputs) override {
     for (const auto& d : digital_outputs) {
@@ -133,15 +153,30 @@ class SimBackend final : public Backend {
   // device as reset; the gateway restores configuration and drops obsolete
   // demand. Restore clears latched commands without zeroing mechanism
   // positions (documented ideal-fake limit: positions re-acquire from the
-  // next command, they are not re-measured from hardware).
+  // next command, they are not re-measured from hardware). The restored
+  // chain reads invalid until a PollRestore that succeeds (RestoredWith), as
+  // on the robot; SetRestoreFails(true) fails every restore until cleared.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
     pending_resets_.clear();
     return !reset_ids.empty();
   }
-  void BeginRestoreAfterReset() override { commands_ = {}; }
-  RestoreStatus PollRestore() override { return RestoreStatus::kDone; }
+  void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (std::find(ids.begin(), ids.end(), config_.motors[i].id) != ids.end())
+        commands_[i] = MotorRequest{};
+      if (RestoredWith(config_.motors, i, ids)) restoring_[i] = true;
+    }
+  }
+  RestoreStatus PollRestore() override {
+    if (restore_fails_) return RestoreStatus::kFailed;
+    restoring_.fill(false);
+    return RestoreStatus::kDone;
+  }
+  void SetRestoreFails(bool fails) { restore_fails_ = fails; }
+  // Position demands teleport, so a step says nothing about a reset.
+  bool PositionsArePhysical() const override { return false; }
   void SetPowerHealth(double battery_v, bool brownout) {
     health_ = {true, battery_v, brownout, 0.0};
   }
@@ -171,8 +206,10 @@ class SimBackend final : public Backend {
   HealthSample health_{true, 12.0, false, 0.0};
   uint64_t previous_time_{};
   std::vector<uint16_t> pending_resets_;
+  bool restore_fails_{false};
   std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<MotorSample, kMaxMotors> samples_{};
+  std::array<bool, kMaxMotors> restoring_{};
   std::unordered_map<uint16_t, bool> digital_inputs_{};
   std::unordered_map<uint16_t, bool> digital_outputs_{};
   std::unordered_map<uint16_t, double> analog_inputs_{};

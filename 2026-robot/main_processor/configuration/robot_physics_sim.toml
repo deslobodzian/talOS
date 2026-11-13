@@ -1,4 +1,10 @@
 include = "robot.toml"
 
+[robot]
+require_target_coverage = true
+# The physics gateway's config: the launcher and hardware_node refuse it
+# without --sim.
+simulation_only = true
+
 [subsystems.drivetrain]
 integrate_heading = false

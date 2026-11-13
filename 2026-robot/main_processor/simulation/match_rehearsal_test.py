@@ -1,0 +1,346 @@
+"""A recorded driver/match rehearsal, including process death and stale input."""
+
+import bisect
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import unittest
+import uuid
+
+import autonomous_progress
+import startup_test as support
+
+
+class MatchRehearsal(unittest.TestCase):
+    window = support.FullStackSimulation.window
+    assert_driving = support.FullStackSimulation.assert_driving
+    assert_neutral = support.FullStackSimulation.assert_neutral
+
+    def print_restart_timeline(self, manifest_path, kill_ns):
+        """Show whether the old exit/spawn or the new node's startup was slow."""
+        try:
+            nodes = {n["name"]: n for n in
+                     json.loads(manifest_path.read_text())["nodes"]}
+            origin, first, send = support.restart_timeline(
+                nodes["drivetrain"]["log_paths"][-1], "/hw/request/drivetrain")
+            ms = lambda a, b: "n/a" if a is None or b is None else f"{(b - a) / 1e6:.1f} ms"
+            print(f"drivetrain restart: kill->loop origin {ms(kill_ns, origin)}, "
+                  f"origin->run() {ms(origin, first)}, "
+                  f"run()->first request {ms(first, send)}", flush=True)
+        except Exception as error:  # diagnostics must not mask the failure
+            print(f"drivetrain restart timeline unavailable: {error!r}", flush=True)
+
+    def test_match_restarts_only_killed_node_and_rejects_stale_targets(self):
+        root = support.workspace()
+        config_dir = root / "2026-robot/main_processor/configuration"
+        config = config_dir / "robot_physics_sim.toml"
+        robot = support.tomllib.loads((config_dir / "robot.toml").read_text())
+        timeout = robot["robot"]["command_timeout_us"] / 1000
+        # The drivetrain's own tick, which its first neutral request must keep.
+        period = support.tomllib.loads(
+            (config_dir / "subsystems/drivetrain.toml").read_text())["subsystem"].get(
+                "period_us", robot["robot"]["period_us"]) / 1000
+        layout = support.device_layout(config_dir / "robot.toml")
+        motor_ids = [i for i, sub, _, kind in layout
+                     if sub == "drivetrain" and kind == "motors"]
+        drive_ids = [i for i, sub, name, kind in layout
+                     if sub == "drivetrain" and kind == "motors" and
+                     name.endswith("_drive")]
+        gw_port, bridge_port = support.udp_ports()
+        tmp = Path(tempfile.mkdtemp(
+            prefix="talos-match-rehearsal-",
+            dir=os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")))
+        output = tmp / "sessions"
+        env = support.launcher_env(TALOS_SHM_NAMESPACE=f"rehearsal-{uuid.uuid4().hex}")
+        launcher = None
+        manifest_path = None
+        kill_ns = None
+        paused = None
+        success = False
+        # The gateway's schedules and the harness's signals share one
+        # node-clock time zero, which the harness picks only once every node's
+        # loop runs, so slow startup delays the match instead of eating into
+        # it. The gateway holds its time-zero state (disabled, centered stick)
+        # until then.
+        start_file = tmp / "schedule_start"
+        try:
+            (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
+            # Nodes stamp records with CLOCK_MONOTONIC_RAW on macOS, which
+            # counts host sleep; time.monotonic does not. Their difference
+            # grows only while the host sleeps (on Linux both are the same).
+            clock_skew_ns = support.node_clock_ns() - time.monotonic_ns()
+            args = [str(root / "talOS/launcher/launcher"), "--config", str(config),
+                    "--sim", "--start-sim-gateway", "--remote", "127.0.0.1",
+                    "--remote-port", str(gw_port), "--local-port", str(bridge_port),
+                    # A backstop only: the harness stops the session itself
+                    # 17 s after the start it picks.
+                    "--output-dir", str(output), "--duration-s", "120"]
+            gateway_args = [
+                "--physics", "--port", str(gw_port), "--remote-port", str(bridge_port),
+                "--schedule-start-file", str(start_file),
+                "--mode-schedule", "disabled:1,auto:4,disabled:1,teleop:9,disabled:2",
+                "--joystick-schedule",
+                "0:axes=0,0,0;buttons=0;pov=-1|"
+                "6.5:axes=0,-0.6,0;buttons=5;pov=-1|"
+                "10:axes=0,0,0;buttons=0;pov=-1|"
+                "10.4:axes=0,-0.6,0;buttons=0;pov=-1|"
+                "13:axes=0,0,0;buttons=0;pov=-1|"
+                "13.4:axes=0,-0.6,0;buttons=0;pov=-1"]
+            for arg in gateway_args:
+                args.extend(["--sim-gateway-arg", arg])
+            with (tmp / "launcher.txt").open("w+") as log:
+                launcher = subprocess.Popen(args, cwd=tmp, env=env, stdout=log,
+                                            stderr=subprocess.STDOUT,
+                                            start_new_session=True)
+                # The gateway spawns last; a node creates its log once its
+                # loop starts. Construction may take the launcher's 30 s
+                # deadline, so wait past it.
+                deadline = time.monotonic() + 40
+                while time.monotonic() < deadline:
+                    manifests = list(output.glob("*/manifest.json"))
+                    if manifests:
+                        manifest_path = manifests[0]
+                        manifest = json.loads(manifest_path.read_text())
+                        nodes = {n["name"]: n for n in manifest["nodes"]}
+                        if (nodes.get("sim_gateway", {}).get("pid", 0) > 0 and
+                                all(Path(n["log_paths"][-1]).exists()
+                                    for n in nodes.values() if n.get("log_paths"))):
+                            break
+                    self.assertIsNone(launcher.poll(), "launcher exited during startup")
+                    time.sleep(0.01)
+                else:
+                    self.fail("the stack never started")
+                # One second for the gateway to read the start and the stack to
+                # receive a disabled packet before it.
+                start_ns = support.node_clock_ns() + 1_000_000_000
+                pending = start_file.with_suffix(".tmp")
+                pending.write_text(str(start_ns))
+                pending.replace(start_file)  # atomic: the gateway reads all or none
+
+                def at(seconds):
+                    time.sleep(max(0, (start_ns + seconds * 1e9 -
+                                       support.node_clock_ns()) / 1e9))
+                    self.assertIsNone(launcher.poll(), "launcher exited during match")
+
+                # Freeze the producer before killing the consumer: its restarted
+                # process must not actuate from a pre-restart shared-memory lane.
+                at(8)
+                driver_pid = nodes["driver"]["pid"]
+                self.assertGreater(driver_pid, 0)
+                paused = driver_pid
+                os.kill(paused, signal.SIGSTOP)
+                kill_ns = support.node_clock_ns()
+                killed_pid = nodes["drivetrain"]["pid"]
+                self.assertGreater(killed_pid, 0)
+                os.kill(killed_pid, signal.SIGKILL)
+                time.sleep(0.3)  # stale target, but below driver stall supervision
+                first_resume_ns = support.node_clock_ns()
+                os.kill(paused, signal.SIGCONT)
+                paused = None
+                at(12)
+                paused = driver_pid
+                os.kill(paused, signal.SIGSTOP)
+                stop_ns = support.node_clock_ns()
+                time.sleep(0.25)
+                resume_ns = support.node_clock_ns()
+                os.kill(paused, signal.SIGCONT)
+                paused = None
+                at(17)
+                launcher.send_signal(signal.SIGINT)
+                launcher.wait(timeout=15)
+                slept_ms = (support.node_clock_ns() - time.monotonic_ns() -
+                            clock_skew_ns) / 1e6
+                # A sleeping host stops every process while the gateway's
+                # schedule clock runs on, so the recorded phases are unusable.
+                self.assertLess(slept_ms, 100,
+                                f"host slept {slept_ms:.0f} ms during the match; rerun")
+                log.seek(0)
+                diagnostics = log.read()
+            self.assertEqual(launcher.returncode, 0, diagnostics)
+            support.assert_realtime(self, diagnostics)
+            session = manifest_path.parent
+            manifest = json.loads(manifest_path.read_text())
+            self.assertGreater(manifest["end_wall_ns"], manifest["start_wall_ns"])
+            final_nodes = {n["name"]: n for n in manifest["nodes"]}
+            for name, node in final_nodes.items():
+                self.assertEqual(node["exit_code"], 0, name)
+                self.assertFalse(node["recorder_failed"], name)
+                self.assertFalse(node["quarantined"], name)
+                self.assertEqual(node["restart_count"], int(name == "drivetrain"), name)
+            self.assertNotEqual(final_nodes["drivetrain"]["pid"], killed_pid)
+            self.assertEqual(len(final_nodes["drivetrain"]["log_paths"]), 2)
+
+            dumped = subprocess.run(
+                [str(root / "talOS/launcher/log_dump"), "--format", "jsonl",
+                 "--node", "hardware_node,drivetrain,intake,shooter,autonomous,teleop",
+                 "--topic", "/hw/command,/hw/request/*,/hw/state/driver_station,"
+                 "/drivetrain/target/*",
+                 str(session)], capture_output=True, text=True, check=True, timeout=15)
+            (tmp / "match.jsonl").write_text(dumped.stdout)
+            rows = [json.loads(line) for line in dumped.stdout.splitlines()]
+            baseline = support.log_baseline_ns(session)
+            start, kill, first_resume, stop, resume = [
+                (stamp - baseline) / 1e6 for stamp in
+                (start_ns, kill_ns, first_resume_ns, stop_ns, resume_ns)]
+            requests = [r for r in rows if r["process"] == "drivetrain" and
+                        r["topic"] == "/hw/request/drivetrain" and r["kind"] == "SEND"]
+            ds = [r for r in rows if r["process"] == "intake" and
+                  r["topic"] == "/hw/state/driver_station" and r["kind"] == "MESSAGE"]
+            # Coverage, not a count: a slow host drains fewer packets. A
+            # loaded 3-vCPU macOS runner at timeshare priority (Linux still
+            # runs so) delayed the intake's drains by 260 ms, so the
+            # bound is an outage (1 s), not jitter; the neutral/driving windows
+            # below check behaviour, and session_report measures jitter on a
+            # real host.
+            ds_times = [r["now_ms"] for r in ds]
+            self.assertGreater(len(ds_times), 2)
+            gap, at = max((b - a, a) for a, b in zip(ds_times, ds_times[1:]))
+            print(f"largest Driver Station receipt gap: {gap:.1f} ms at {at:.1f} ms",
+                  flush=True)
+            self.assertLess(gap, 1000, "Driver Station stream outage")
+            # The schedule opens with 1 s disabled; the stack must be up
+            # before it ends, or the phases below lose their first entry.
+            self.assertLess(ds_times[0], start + 1000,
+                            f"first Driver Station receipt {ds_times[0] - start:.0f} ms "
+                            f"after the schedule start")
+            phases = []
+            for row in ds:
+                flags, _ = support.ds_snapshot(row)
+                if not phases or phases[-1][1] != flags:
+                    phases.append((row["now_ms"], flags))
+            self.assertEqual([f for _, f in phases], [1, 13, 1, 21, 1])
+            # The gateway switches to autonomous 1 s after the shared start;
+            # the receipt may trail it by drain latency, never precede it.
+            auto_lag = phases[1][0] - (start + 1000)
+            self.assertTrue(0 <= auto_lag < 1000,
+                            f"autonomous began {auto_lag:.0f} ms after the gateway's "
+                            f"scheduled time; it did not honor --schedule-start-file")
+            # The second producer pause ends 12.25 s after the shared start and
+            # the gateway centers the stick at 13 s. The center-to-rearm checks
+            # below need the pause over at least 100 ms before the centering.
+            self.assertLess(resume, start + 13000 - 100,
+                            f"the harness resumed the producer {resume - start - 12250:.0f} "
+                            f"ms late, too close to the stick centering")
+            # SIGKILL loses the killed process's unflushed recording (up to
+            # one recorder chunk), so pre-kill actuation is read from what the
+            # bridge actually sent to the gateway.
+            commands = [r for r in rows if r["process"] == "hardware_node" and
+                        r["topic"] == "/hw/command" and r["kind"] == "SEND"]
+            # For each node, join each outgoing request to that node's actual
+            # latest DS receipt. This includes transitions, not a hand-picked
+            # settled subset, and checks every motor (including mechanisms).
+            for name in ("drivetrain", "intake", "shooter"):
+                snapshots = [r for r in rows if r["process"] == name and
+                             r["topic"] == "/hw/state/driver_station" and
+                             r["kind"] == "MESSAGE"]
+                times = [r["now_ms"] for r in snapshots]
+                outgoing = [r for r in rows if r["process"] == name and
+                            r["topic"] == f"/hw/request/{name}" and r["kind"] == "SEND"]
+                subsystem = support.tomllib.loads(
+                    (config_dir / "subsystems" / f"{name}.toml").read_text())
+                period_us = subsystem["subsystem"].get(
+                    "period_us", robot["robot"]["period_us"])
+                # Coverage: one request per period from the first Driver
+                # Station receipt to the bridge's last command, less 1 s. The
+                # window starts at the first DS receipt, not launch, because
+                # nodes spawn one at a time with the gateway last. The 1 s
+                # covers the recording a SIGKILL discards (the log writer syncs
+                # its active chunk once a second); for drivetrain its single
+                # largest gap (the kill and restart) is also excluded. A node
+                # that stops early or stalls over 1 s still fails.
+                sent = [r["now_ms"] for r in outgoing]
+                self.assertGreater(len(sent), 1, name)
+                covered = commands[-1]["now_ms"] - ds_times[0]
+                if name == "drivetrain":
+                    covered -= max(b - a for a, b in zip(sent, sent[1:]))
+                self.assertGreater(len(sent), (covered - 1000) * 1000 / period_us,
+                                   name)
+                for row in outgoing:
+                    index = bisect.bisect_right(times, row["now_ms"]) - 1
+                    enabled = index >= 0 and support.ds_snapshot(snapshots[index])[0] & 4
+                    if not enabled:
+                        self.assertTrue(all(m == support.NEUTRAL for m in
+                                            support.motor_requests(row).values()), row)
+            auto_start, auto_end = phases[1][0], phases[2][0]
+            self.assertTrue(any(auto_start < r["now_ms"] < auto_end and
+                                any(m[0] != "neutral" and abs(m[2]) > 0.1 for m in
+                                    support.motor_requests(r).values()) for r in requests),
+                            "autonomous routine never drove")
+            intake = [r for r in rows if r["process"] == "intake" and
+                      r["topic"] == "/hw/request/intake" and r["kind"] == "SEND"]
+            self.assertTrue(any(phases[3][0] + 800 < r["now_ms"] < kill and
+                                any(m[0] != "neutral" and abs(m[2]) > 0.1 for m in
+                                    support.motor_requests(r).values()) for r in intake),
+                            "teleop mechanism buttons never actuated intake")
+            self.assert_driving(commands, kill - 150, kill, drive_ids)
+            restarted = [r for r in requests if kill + 10 < r["now_ms"] < first_resume]
+            self.assertGreater(len(restarted), 5, "consumer did not restart during pause")
+            self.assert_neutral(requests, restarted[0]["now_ms"], first_resume, motor_ids)
+            # Every non-neutral post-restart output must follow a received
+            # active target, published after the crash (not retained) and
+            # still younger than the timeout when the output was sent.
+            targets = [r for r in rows if r["process"] == "drivetrain" and
+                       r["topic"] == "/drivetrain/target/teleop" and
+                       r["kind"] == "MESSAGE" and r["now_ms"] > kill]
+            for row in requests:
+                if row["now_ms"] <= kill or not any(m[0] != "neutral" for m in
+                                                                  support.motor_requests(row).values()):
+                    continue
+                fresh = [t for t in targets if t["now_ms"] <= row["now_ms"] and
+                         0 <= row["now_ms"] - t["publish_ms"] < timeout and
+                         t["publish_ms"] > kill and
+                         bytes.fromhex(t["payload_hex"])[8] != 0]
+                self.assertTrue(fresh, f"output without fresh post-crash target: {row}")
+            self.assert_driving(requests, stop - 150, stop, drive_ids)
+            # The lane expires a timeout after the last active target the
+            # drivetrain received, not after the harness's SIGSTOP, which can
+            # follow that target by a producer tick or more. From the expiry
+            # on every request is neutral, and the first one was due on the
+            # drivetrain's first tick after it (a skipped flush would leave
+            # the bridge holding the last demand).
+            expiry = max(t["publish_ms"] for t in targets
+                         if t["now_ms"] < resume and
+                         bytes.fromhex(t["payload_hex"])[8] != 0) + timeout
+            self.assert_neutral(requests, expiry, resume, motor_ids)
+            first = next(r for r in requests if r["now_ms"] >= expiry)
+            self.assertLess(first["event_ms"], expiry + period,
+                            f"the lane outlived the first tick due after its "
+                            f"expiry at {expiry:.1f} ms: {first}")
+            center = next(r["now_ms"] for r in ds if r["now_ms"] > resume and
+                          support.ds_snapshot(r)[1] == 0)
+            self.assert_neutral(requests, resume, center, motor_ids)
+            self.assert_driving(requests, center + 700, center + 1000, drive_ids)
+            self.assert_neutral(requests, phases[-1][0] + 30,
+                                phases[-1][0] + 500, motor_ids)
+
+            success = True
+        finally:
+            if paused is not None:
+                try:
+                    os.kill(paused, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
+            if launcher is not None:
+                if not success:
+                    try:
+                        os.killpg(launcher.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                launcher.wait(timeout=5)
+            (tmp / "bazel-bin").unlink(missing_ok=True)
+            autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
+            if success:
+                shutil.rmtree(tmp)
+            else:
+                print(f"Match rehearsal artifacts retained: {tmp}", flush=True)
+                self.print_restart_timeline(manifest_path, kill_ns)
+                print((tmp / "launcher.txt").read_text(), flush=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

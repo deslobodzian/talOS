@@ -5,10 +5,9 @@
 
 A robot config's `[[subsystems]]` list is the only list of a robot's nodes.
 `talos_bundle` and `talos_graph_test` need the same nodes, and every file the
-config reads, as Bazel labels. Bazel cannot read TOML, so this script reads the
-config the way talOS/configuration/config_parser.h does (`include`, entry
-`path`/`node`/`defaults`, `[subsystem] node`/`defaults`, single-file
-`[subsystems.<name>]` tables) and writes the result as two constants:
+config reads, as Bazel labels. The C++ configuration resolver supplies the
+effective configuration and dependency closure; this script only turns its
+JSON output into two constants:
 
     NODES         every node label the config launches, sorted
     CONFIG_FILES  every file the config reads besides itself, as labels, sorted
@@ -21,12 +20,15 @@ a config that reads an unlisted file is reported stale too.
 
 import argparse
 import ast
-import copy
 import difflib
+import json
 import os
 import posixpath
 import sys
-import tomllib
+import subprocess
+import tempfile
+
+from python.runfiles import runfiles
 
 COMMAND = "bazel run //tools:sync_manifest --"
 
@@ -45,338 +47,47 @@ def manifest_path(config):
     return posixpath.join(posixpath.dirname(config), f"{stem}_manifest.bzl")
 
 
-def _join(base_dir, rel, where):
-    if posixpath.isabs(rel):
-        raise ManifestError(f"{where}: absolute path '{rel}' has no Bazel "
-                            "label; use a path relative to the file")
-    path = posixpath.normpath(posixpath.join(base_dir, rel))
-    if path == ".." or path.startswith("../"):
-        raise ManifestError(f"{where}: '{rel}' leaves the workspace")
-    return path
-
-
-_TOP_LEVEL_KEYS = ("include", "robot", "studio", "subsystems")
-_ENTRY_KEYS = ("name", "path", "node", "defaults")
-_STUDIO_KEYS = ("bridge", "webroot", "http_port", "topic", "pose_topic")
-
-
-def _check_studio(studio, where):
-    if not isinstance(studio, dict):
-        raise ManifestError(f"{where}: [studio] must be a table")
-    for key in studio:
-        if key not in _STUDIO_KEYS:
-            raise ManifestError(f"{where}: [studio] unknown key '{key}'")
-    if "topic" in studio:
-        _non_empty(studio, "topic", "[studio]")
-    if "bridge" in studio:
-        _non_empty(studio, "bridge", "[studio]")
-    if "webroot" in studio:
-        _non_empty(studio, "webroot", "[studio]")
-    if "pose_topic" in studio:
-        _non_empty(studio, "pose_topic", "[studio]")
-    if "http_port" in studio:
-        port = studio["http_port"]
-        if (not isinstance(port, int) or isinstance(port, bool) or
-                port < 1 or port > 65535):
-            raise ManifestError(
-                "[studio] field 'http_port' must be a port in [1, 65535]")
-
-
-def _non_empty(table, key, where):
-    """config_parser.h ReadNonEmpty: a present `key` must be a non-empty
-    string."""
-    value = table[key]
-    if not isinstance(value, str) or not value:
-        raise ManifestError(f"{where} field '{key}' must be a non-empty string")
-    return value
-
-
-def _check_top_level_keys(doc, path):
-    for key in doc:
-        if key not in _TOP_LEVEL_KEYS:
-            raise ManifestError(f"{path}: unknown top-level key '{key}'")
-
-def _check_teleop(teleop, sub_name):
-    if not isinstance(teleop, dict):
-        raise ManifestError(f"[subsystems.{sub_name}.teleop] must be a table")
-    for key in teleop:
-        if key != "bindings":
-            raise ManifestError(
-                f"[subsystems.{sub_name}.teleop] unknown key '{key}'")
-    if "bindings" in teleop:
-        bindings = teleop["bindings"]
-        if not isinstance(bindings, list):
-            raise ManifestError(
-                f"[subsystems.{sub_name}.teleop.bindings] must be an array")
-        for i, entry in enumerate(bindings):
-            entry_where = f"[subsystems.{sub_name}] teleop.bindings[{i}]"
-            if not isinstance(entry, dict):
-                raise ManifestError(f"{entry_where} must be a table")
-            for k in entry:
-                if k not in ("button", "axis", "pov", "pov_index", "port",
-                             "while_held", "on_toggle", "field", "scale",
-                             "deadband_frac"):
-                    raise ManifestError(f"{entry_where} unknown key '{k}'")
-            has_button = "button" in entry
-            has_axis = "axis" in entry
-            has_pov = "pov" in entry
-            if sum((has_button, has_axis, has_pov)) != 1:
-                raise ManifestError(
-                    f"{entry_where}: binding must specify exactly one of 'button', 'axis', 'pov'")
-            if "pov_index" in entry and not has_pov:
-                raise ManifestError(f"{entry_where}.pov_index requires 'pov'")
-            if has_pov:
-                angle = entry["pov"]
-                if type(angle) is not int or angle not in range(0, 360, 45):
-                    raise ManifestError(f"{entry_where}.pov must be a compass angle")
-                index = entry.get("pov_index", 0)
-                if type(index) is not int or not 0 <= index < 4:
-                    raise ManifestError(f"{entry_where}.pov_index must be in [0, 3]")
-            if "port" in entry:
-                p = entry["port"]
-                if not isinstance(p, int) or isinstance(p, bool) or p < 0 or p > 5:
-                    raise ManifestError(
-                        f"{entry_where}.port must be an integer in [0, 5]")
-            if has_button or has_pov:
-                for k in ("field", "scale", "deadband_frac"):
-                    if k in entry:
-                        raise ManifestError(
-                            f"{entry_where} button/pov binding cannot have axis keys")
-                if has_button:
-                    b = entry["button"]
-                    if type(b) is not int or not 1 <= b <= 32:
-                        raise ManifestError(
-                            f"{entry_where}.button must be an integer in [1, 32]")
-                actions = [k for k in ("while_held", "on_toggle") if k in entry]
-                if len(actions) != 1:
-                    raise ManifestError(
-                        f"{entry_where} requires exactly one of while_held/on_toggle")
-                action = actions[0]
-                values = entry[action]
-                if not isinstance(values, dict) or not values:
-                    raise ManifestError(
-                        f"{entry_where}.{action} must be a non-empty table")
-                for fk, fv in values.items():
-                    if type(fv) not in (bool, int, float, str):
-                        raise ManifestError(
-                            f"{entry_where}.{action}.{fk} must be a scalar")
-            if has_axis:
-                if "while_held" in entry or "on_toggle" in entry:
-                    raise ManifestError(
-                        f"{entry_where} axis binding cannot have action tables")
-                a = entry["axis"]
-                if not isinstance(a, int) or isinstance(a, bool) or a < 0 or a > 11:
-                    raise ManifestError(
-                        f"{entry_where}.axis must be an integer in [0, 11]")
-                if "field" not in entry:
-                    raise ManifestError(
-                        f"{entry_where} axis binding missing 'field'")
-                f = entry["field"]
-                if not isinstance(f, str) or not f:
-                    raise ManifestError(
-                        f"{entry_where}.field must be a non-empty string")
-                if "scale" not in entry:
-                    raise ManifestError(
-                        f"{entry_where} axis binding missing 'scale'")
-                sc = entry["scale"]
-                if not isinstance(sc, (int, float)) or isinstance(sc, bool):
-                    raise ManifestError(f"{entry_where}.scale must be a number")
-                if "deadband_frac" in entry:
-                    df = entry["deadband_frac"]
-                    if (not isinstance(df, (int, float)) or isinstance(df, bool)
-                            or df < 0.0 or df >= 1.0):
-                        raise ManifestError(
-                            f"{entry_where}.deadband_frac must be in [0, 1)")
-
-
-def _merge_tables(base, over):
-    """config_parser.h MergeTables: `over` wins; tables merge recursively."""
-    for key, value in over.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _merge_tables(base[key], value)
-        else:
-            base[key] = copy.deepcopy(value)
-
-
-def _entry_name(entry):
-    name = entry.get("name") if isinstance(entry, dict) else None
-    return name if isinstance(name, str) and name else None
-
-
-class _Reader:
-    """Parses the config's files, recording each one besides the config."""
-
-    def __init__(self, root, overrides, available):
-        self.root = root
-        self.overrides = overrides
-        self.available = available
-        self.files = []
-
-    def load(self, path, record=True):
-        if record and path not in self.files:
-            self.files.append(path)
-        if path in self.overrides:
-            text = self.overrides[path]
-        else:
-            if (record and self.available is not None
-                    and path not in self.available):
-                raise Stale(path)
-            try:
-                with open(os.path.join(self.root, path), encoding="utf-8") as f:
-                    text = f.read()
-            except OSError as err:
-                raise ManifestError(f"cannot read {path}: {err.strerror}")
-        try:
-            return tomllib.loads(text)
-        except tomllib.TOMLDecodeError as err:
-            raise ManifestError(f"TOML parse error in {path}: {err}")
-
-    def expand(self, entries, where):
-        """[[subsystems]] entries (paths already workspace-relative) -> the
-        [subsystems.<name>] view, as config_parser.h's ExpandManifest."""
-        views = {}
-        for entry in entries:
-            name = _entry_name(entry)
-            path = entry.get("path") if isinstance(entry, dict) else None
-            if name is None or not isinstance(path, str) or not path:
-                raise ManifestError(f"invalid [[subsystems]] entry in {where}: "
-                                    "needs 'name' and 'path'")
-            for key in entry:
-                if key not in _ENTRY_KEYS:
-                    raise ManifestError(
-                        f"unknown key '{key}' in [[subsystems]] entry "
-                        f"'{name}' in {where} (expected name, path, node, "
-                        "defaults)")
-            node = (_non_empty(entry, "node", "[[subsystems]] entry")
-                    if "node" in entry else None)
-            entry_defaults = (
-                _non_empty(entry, "defaults", "[[subsystems]] entry")
-                if "defaults" in entry else None)
-            sub = self.load(path)
-            header = sub.get("subsystem")
-            if not isinstance(header, dict) or header.get("name") != name:
-                raise ManifestError(f"{path}: [subsystem].name must match "
-                                    f"manifest entry '{name}'")
-            if name in views:
-                raise ManifestError(f"duplicate [[subsystems]] entry in "
-                                    f"{where}: '{name}'")
-            header_defaults = (_non_empty(header, "defaults", "[subsystem]")
-                               if "defaults" in header else None)
-            defaults = entry_defaults
-            if defaults is None and header_defaults is not None:
-                defaults = _join(posixpath.dirname(path), header_defaults, path)
-            if defaults is not None:
-                merged = self.load(defaults)
-                _merge_tables(merged, sub)
-                sub = merged
-                header = sub["subsystem"]
-            view = {k: v for k, v in header.items()
-                    if k not in ("name", "defaults")}
-            view.update((k, v) for k, v in sub.items() if k != "subsystem")
-            if node is not None:
-                view["node"] = node
-            views[name] = view
-        return views
-
-
-def _normalized(entries, base_dir, where):
-    """config_parser.h NormalizeManifestPaths: string `path`/`defaults`
-    relative to the workspace root; other values are left for expand."""
-    out = []
-    for entry in entries:
-        if isinstance(entry, dict):
-            entry = dict(entry)
-            for key in ("path", "defaults"):
-                if isinstance(entry.get(key), str) and entry[key]:
-                    entry[key] = _join(base_dir, entry[key], where)
-        out.append(entry)
-    return out
-
-
-def _merge_entries(base, child, where):
-    """config_parser.h MergeManifests: child entries override base by name."""
-    merged = [dict(e) if isinstance(e, dict) else e for e in base]
-    seen = set()
-    for entry in child:
-        name = _entry_name(entry)
-        if name is None:
-            raise ManifestError(f"invalid [[subsystems]] entry in {where}: "
-                                "needs 'name'")
-        if name in seen:
-            raise ManifestError(f"duplicate [[subsystems]] entry in {where}: "
-                                f"'{name}'")
-        seen.add(name)
-        match = next((m for m in merged
-                      if isinstance(m, dict) and m.get("name") == name), None)
-        if match is None:
-            merged.append(dict(entry))
-        else:
-            match.update(entry)
-    return merged
+def _resolved(root, config, overrides=None, available=None):
+    """Call the runtime resolver, supplying pending files without editing disk."""
+    resolver = runfiles.Create()
+    tool = resolver.Rlocation(
+        (resolver.CurrentRepository() or "_main") + "/talOS/configuration/resolve")
+    if not tool or not os.path.isfile(tool):
+        raise ManifestError("configuration resolver is missing from Bazel runfiles")
+    with tempfile.TemporaryDirectory() as overlay:
+        for path, content in (overrides or {}).items():
+            normalized = posixpath.normpath(path)
+            if posixpath.isabs(normalized) or normalized == ".." or normalized.startswith("../"):
+                raise ManifestError(f"{path}: pending file leaves the workspace")
+            full = os.path.join(overlay, normalized)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8") as output:
+                output.write(content)
+        command = [tool, config, overlay]
+        if available is not None:
+            allowed = os.path.join(overlay, ".available")
+            with open(allowed, "w", encoding="utf-8") as output:
+                output.write("".join(path + "\n" for path in sorted(available)))
+            command.append(allowed)
+        result = subprocess.run(command, cwd=root, text=True, capture_output=True)
+    if result.returncode:
+        message = result.stderr.strip()
+        if "UNLISTED:" in message:
+            raise Stale(message.split("UNLISTED:", 1)[1])
+        raise ManifestError(message)
+    return json.loads(result.stdout)
 
 
 def effective(root, config, overrides=None, available=None):
-    """(`config`'s canonical {name: [subsystems.<name>] table} view, sorted
-    workspace-relative paths of every file it reads besides itself).
-
-    Mirrors config_parser.h ParseRobotConfig step for step; the shared cases
-    in talOS/configuration/testdata hold both to the same decisions. Device
-    tables are not checked here: the parser does that when the config loads.
-
-    `overrides` maps a path to content that replaces the file on disk (a
-    pending edit). `available`, when given, is the set of paths that may be
-    read; any other path raises Stale.
-    """
-    reader = _Reader(root, overrides or {}, available)
-    doc = reader.load(config, record=False)
-    _check_top_level_keys(doc, config)
-    config_dir = posixpath.dirname(config)
-    if isinstance(doc.get("subsystems"), list):
-        doc["subsystems"] = _normalized(doc["subsystems"], config_dir, config)
-    if "include" in doc:
-        include = _join(config_dir, _non_empty(doc, "include", "top-level"),
-                        config)
-        base = reader.load(include)
-        _check_top_level_keys(base, include)
-        if "include" in base:
-            raise ManifestError(f"nested 'include' is not supported in {include}")
-        del doc["include"]
-        base_subs = base.get("subsystems")
-        if isinstance(base_subs, list):
-            base_subs = _normalized(base_subs, posixpath.dirname(include),
-                                    include)
-            base["subsystems"] = base_subs
-            # A list child merges into a list base by name; any other child
-            # [subsystems] merges over the base's expanded view.
-            if isinstance(doc.get("subsystems"), list):
-                base["subsystems"] = _merge_entries(
-                    base_subs, doc.pop("subsystems"), config)
-            elif "subsystems" in doc:
-                base["subsystems"] = reader.expand(base_subs, include)
-        _merge_tables(base, doc)
-        doc = base
-    if "studio" in doc:
-        _check_studio(doc["studio"], config)
-    if isinstance(doc.get("subsystems"), list):
-        doc["subsystems"] = reader.expand(doc["subsystems"], config)
-    subs = doc.get("subsystems")
-    if not isinstance(subs, dict):
-        raise ManifestError(f"{config}: missing [subsystems] table")
-    for name, table in subs.items():
-        if isinstance(table, dict):
-            if "node" in table:
-                _non_empty(table, "node", f"[subsystems.{name}]")
-            if "teleop" in table:
-                _check_teleop(table["teleop"], name)
-    return subs, sorted(reader.files)
+    """Effective subsystem tables and dependencies from the C++ resolver."""
+    result = _resolved(root, config, overrides, available)
+    return result["subsystems"], result["files"]
 
 
 def resolve(root, config, overrides=None, available=None):
-    """(sorted node labels, sorted files read), from effective()."""
-    subs, files = effective(root, config, overrides, available)
-    nodes = {t["node"] for t in subs.values()
-             if isinstance(t, dict) and "node" in t}
-    return sorted(nodes), files
+    """Sorted node labels and dependencies from the C++ resolver."""
+    result = _resolved(root, config, overrides, available)
+    return result["nodes"], result["files"]
 
 
 def package_of(root, path):

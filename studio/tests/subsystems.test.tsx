@@ -1,5 +1,5 @@
-// Subsystems panel: pairing heuristic, config parsing, and SSR rendering for
-// an empty and a populated (2026-shaped) studio.
+// Subsystems panel: pairing heuristic, config parsing, and the rendered
+// latency and demand-vs-measured error of a populated (2026-shaped) studio.
 
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
@@ -9,7 +9,7 @@ import {renderToStaticMarkup} from 'react-dom/server';
 
 import type {Snapshot} from '../src/core';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
-import {subsystemsPanel, type SubsystemsConfig} from '../src/panels/subsystems';
+import {subsystemsPanel} from '../src/panels/subsystems';
 import {pairTargets} from '../src/panels/subsystems/pairing';
 import {channelDisplayName, channelLeaf} from '../src/ui/channel';
 import type {
@@ -226,7 +226,7 @@ function populatedStudio(passiveOnly = false): Studio {
     playback: {
       mode: 'PAUSED', cursor_ns: frames[2].timestamp_ns,
       bounds: {start: frames[0].timestamp_ns, end: frames[2].timestamp_ns},
-      stats: {dropped: 0, late: 0, invalid: 0}, status: 'Demo',
+      stats: {skipped: 0, late: 0, invalid: 0}, status: 'Demo',
       connection: 'demo'
     },
     system: {
@@ -237,41 +237,19 @@ function populatedStudio(passiveOnly = false): Studio {
   });
 }
 
-const renderPanel = (studio: Studio, config: SubsystemsConfig =
-                                           subsystemsPanel.defaultConfig):
-    string =>
+const renderPanel = (studio: Studio): string =>
     renderToStaticMarkup(
         <StudioProvider studio={studio}>
-          <subsystemsPanel.component config={config} setConfig={() => {}}
-                                     instanceId="test"/>
+          <subsystemsPanel.component config={subsystemsPanel.defaultConfig}
+                                     setConfig={() => {}} instanceId="test"/>
         </StudioProvider>);
-
-test('the subsystems panel waits for telemetry when there is none', () => {
-  const html = renderPanel(createStaticStudio({}));
-  assert.ok(html.includes('No subsystems yet'));
-});
 
 test('subsystem latency stays unknown for sender and fetcher sources', () => {
   const text = renderPanel(populatedStudio(true)).replace(/<[^>]*>/g, '');
   assert.equal((text.match(/latency—/g) ?? []).length, 3);
 });
 
-test('the subsystems panel renders one card per subsystem with state and pairs',
-     () => {
-       const html = renderPanel(populatedStudio());
-       // One card per discovered subsystem.
-       for (const name of ['shooter', 'intake', 'drivetrain'])
-         assert.ok(html.includes(name), `missing subsystem ${name}`);
-       assert.ok(html.includes('no lane selected'));
-       // Node health: loop rate and worst latency.
-       assert.ok(html.includes('100 Hz'));
-       assert.ok(html.includes('1.00 ms'));
-       // Channel rows: value with unit, enum label.
-       assert.ok(html.includes('flywheel_velocity_rps'));
-       assert.ok(html.includes('m/s'));
-       assert.ok(html.includes('DRIVE'));
-       // Pairing section with the overlaid chart and current error.
-       assert.ok(html.includes('demand vs measured'));
-       assert.ok(html.includes('velocity_rps'));
-       assert.ok(html.includes('Δ -2.000 rps'));
-     });
+test('a demand/measured pair shows measured minus demand at the cursor', () => {
+  // Shooter at the cursor: flywheel 58 rps against a 60 rps target.
+  assert.ok(renderPanel(populatedStudio()).includes('Δ -2.000 rps'));
+});

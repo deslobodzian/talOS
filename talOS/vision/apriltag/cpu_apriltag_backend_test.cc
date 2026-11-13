@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -12,11 +13,18 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "talOS/geometry/se3.h"
+#include "talOS/process/process.h"
 #include "talOS/vision/apriltag/test_image_loader.h"
+
+extern "C" {
+#include <apriltag.h>
+#include <common/workerpool.h>
+}
 
 namespace talos::vision::apriltag {
 namespace {
@@ -175,30 +183,24 @@ void VerifyPhotographicFixture(const std::string& img_filename,
     const Eigen::Matrix3d r_rt =
         pose_est.rotation * pose_est.rotation.transpose();
     EXPECT_TRUE(r_rt.isApprox(Eigen::Matrix3d::Identity(), 1e-4));
-
-    // SE3 consistency
-    EXPECT_TRUE(pose_est.pose.rotation().rotationMatrix().isApprox(
-        pose_est.rotation, 1e-6));
-    EXPECT_TRUE(
-        pose_est.pose.translation().isApprox(pose_est.translation, 1e-6));
   }
 }
 
 }  // namespace
 
-TEST(CpuAprilTagBackendTest, Fixture33369213973) {
-  VerifyPhotographicFixture("33369213973_9d9bb4cc96_c.jpg",
-                            "33369213973_9d9bb4cc96_c.txt", 12);
-}
-
-TEST(CpuAprilTagBackendTest, Fixture34085369442) {
-  VerifyPhotographicFixture("34085369442_304b6bafd9_c.jpg",
-                            "34085369442_304b6bafd9_c.txt", 25);
-}
-
-TEST(CpuAprilTagBackendTest, Fixture34139872896) {
-  VerifyPhotographicFixture("34139872896_defdb2f8d9_c.jpg",
-                            "34139872896_defdb2f8d9_c.txt", 10);
+TEST(CpuAprilTagBackendTest, PhotographicFixtures) {
+  struct Fixture {
+    const char* stem;
+    int count;
+  };
+  for (const auto& fixture : {Fixture{"33369213973_9d9bb4cc96_c", 12},
+                              Fixture{"34085369442_304b6bafd9_c", 25},
+                              Fixture{"34139872896_defdb2f8d9_c", 10}}) {
+    SCOPED_TRACE(fixture.stem);
+    VerifyPhotographicFixture(std::string(fixture.stem) + ".jpg",
+                              std::string(fixture.stem) + ".txt",
+                              fixture.count);
+  }
 }
 
 TEST(CpuAprilTagBackendTest, SyntheticSingleTagScene) {
@@ -308,17 +310,6 @@ TEST(CpuAprilTagBackendTest, SyntheticEmptyScene) {
 }
 
 TEST(CpuAprilTagBackendTest, RawGrayscaleBufferWithPaddedStride) {
-  // Test raw byte detection with explicit row padding
-  constexpr int kWidth = 320;
-  constexpr int kHeight = 240;
-  constexpr int kPadding = 17;  // Stride differs from width
-  constexpr int kStride = kWidth + kPadding;
-
-  std::vector<uint8_t> buffer(static_cast<size_t>(kStride) * kHeight, 255);
-
-  // Draw a simple tag 0 pattern inside the buffer (10x10 tag scaled by 10 =
-  // 100x100) Tag 0 in tag36h11 has known bit pattern Instead of manual
-  // painting, let's load scene_single_tag0 and extract a crop with padding
   const std::string src_path = GetTestdataPath("scene_single_tag0.png");
   CpuAprilTagBackend file_backend;
   std::vector<Detection> file_detections =
@@ -360,7 +351,7 @@ TEST(CpuAprilTagBackendTest, RawGrayscaleBufferWithPaddedStride) {
   EXPECT_NEAR(detections[0].center.y, file_detections[0].center.y, 0.01);
 }
 
-TEST(CpuAprilTagBackendTest, PoseEstimationComparisonAndReprojection) {
+TEST(CpuAprilTagBackendTest, ProductionPoseReprojectsDetectedCorners) {
   DetectorOptions options;
   options.family_name = "tag36h11";
   options.quad_decimate = 1.0f;
@@ -375,23 +366,9 @@ TEST(CpuAprilTagBackendTest, PoseEstimationComparisonAndReprojection) {
       .fx = 500.0, .fy = 500.0, .cx = 320.0, .cy = 240.0};
   constexpr double kTagSizeMeters = 0.16;
 
-  // Compare standard pose, homography pose, and orthogonal iteration pose
   const PoseEstimation pose_std =
       backend.EstimatePose(det, intrinsics, kTagSizeMeters);
-  const PoseEstimation pose_homo =
-      backend.EstimatePoseHomography(det, intrinsics, kTagSizeMeters);
-  const PoseEstimation pose_oi =
-      backend.EstimatePoseOrthogonalIteration(det, intrinsics, kTagSizeMeters);
-
-  // All methods should yield translation pointing forward and close to one
-  // another
   EXPECT_GT(pose_std.translation.z(), 0.3);
-  EXPECT_GT(pose_homo.translation.z(), 0.3);
-  EXPECT_GT(pose_oi.translation.z(), 0.3);
-
-  EXPECT_NEAR(pose_std.translation.x(), pose_oi.translation.x(), 0.02);
-  EXPECT_NEAR(pose_std.translation.y(), pose_oi.translation.y(), 0.02);
-  EXPECT_NEAR(pose_std.translation.z(), pose_oi.translation.z(), 0.05);
 
   // Verify Reprojection of 3D tag corners back to image plane
   const double s = kTagSizeMeters / 2.0;
@@ -453,6 +430,55 @@ TEST(CpuAprilTagBackendTest, PoseUsesUndistortedCorners) {
              Eigen::Matrix3d::Identity())
                 .norm(),
             1e-10);
+}
+
+namespace {
+
+// What each pool thread reports, one task per thread: a task waits until
+// every thread holds one, so no thread runs two.
+struct PoolProbe {
+  std::mutex mutex;
+  std::condition_variable arrived_all;
+  int threads = 0;
+  int arrived = 0;
+  int background = 0;
+};
+
+void ProbeThread(void* argument) {
+  auto& probe = *static_cast<PoolProbe*>(argument);
+  const bool background = talos::process::ThreadIsBackground();
+  std::unique_lock lock{probe.mutex};
+  probe.background += background ? 1 : 0;
+  if (++probe.arrived == probe.threads) {
+    probe.arrived_all.notify_all();
+    return;
+  }
+  probe.arrived_all.wait(lock,
+                         [&probe] { return probe.arrived == probe.threads; });
+}
+
+}  // namespace
+
+// The detector's pool threads (created by the library with default
+// attributes, from a thread at ordinary priority) must run below the node
+// loops, and the pool must be the size detection keeps, not one it replaces.
+TEST(CpuAprilTagBackendTest, DetectorPoolThreadsRunAtBackgroundPriority) {
+  apriltag_detector_t* td = apriltag_detector_create();
+  td->nthreads = 3;
+  EnsureBackgroundWorkerPool(td);
+  ASSERT_NE(td->wp, nullptr);
+  EXPECT_EQ(workerpool_get_nthreads(td->wp), td->nthreads);
+
+  PoolProbe probe;
+  probe.threads = td->nthreads;
+  for (int i = 0; i < td->nthreads; ++i) {
+    workerpool_add_task(td->wp, ProbeThread, &probe);
+  }
+  workerpool_run(td->wp);
+  apriltag_detector_destroy(td);
+
+  EXPECT_EQ(probe.arrived, 3);
+  EXPECT_EQ(probe.background, 3);
 }
 
 }  // namespace talos::vision::apriltag

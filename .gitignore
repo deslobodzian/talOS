@@ -53,5 +53,5 @@ __pycache__/
 
 # Agent scratch (plans, session notes)
 .agents/
-.claude/
-.muse/
+.claude/*
+!.claude/agents/

@@ -18,20 +18,28 @@
 // Handles are named by their device key in this subsystem's config
 // ([motors.roller] is "roller") and are taken in the constructor.
 //
-// A layer over talos::Node's public API, nothing more: the first handle
-// attaches this node's HardwareLink (node.extension<HardwareLink>()), which
-// subscribes to /hw/state and, on the first output, publishes
-// /hw/request/<name> and flushes after every update():
+// A layer over talos::Node: the first handle attaches this node's
+// HardwareLink (node.extension<HardwareLink>()), which subscribes to /hw/state
+// and, on the first output, publishes /hw/request/<name>
+// (detail::NodeAccess::add_hardware_request, the only publisher the node
+// layer opens on a request topic) and flushes after every update():
 //   - one command per tick once a hardware state has been accepted, echoing
 //     that state's identity words like hardware::NeutralCommand;
-//   - every owned motor neutral unless set since the last flush, and all of
+//   - every owned motor neutral unless set during that update(), and all of
 //     them neutral whenever robot_enabled() is false;
-//   - digital/PWM outputs set since the last flush included as set.
+//   - digital/PWM outputs set during that update() included as set.
 // Incoming states pass hardware::AcceptState for this config's id and are
-// latched with their receive time; getters read the latched state (0 before
+// latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
-// hardware state younger than [robot] command_timeout_us. The link also
-// watches the bridge's /hw/status for the clock mapping sample_time() uses.
+// hardware state younger than [robot] command_timeout_us. While a device's
+// sample is invalid, a position getter (Motor, CANcoder and Encoder
+// position(), Gyro::yaw()) reads the last valid sample's position, through
+// the current rezero offset (0 before any valid sample), rather than the zero
+// an invalid sample carries, which would read as a jump; every other numeric
+// getter reads the sample as it is (zero for a motor's or CAN sensor's
+// rates and efforts). Only connected() says whether a reading is live. The
+// link also watches the bridge's /hw/status for the clock mapping
+// sample_time() uses.
 
 #include <cstddef>
 #include <functional>
@@ -49,6 +57,9 @@ namespace talos {
 namespace detail {
 class DriverStationLink;  // devices.cc
 }  // namespace detail
+namespace hardware {
+struct Config;  // talOS/hardware/config.h
+}  // namespace hardware
 
 // One node's end of the hardware link, attached as node.extension<
 // HardwareLink>() by the first handle.
@@ -73,9 +84,9 @@ class HardwareLink {
   // offset on /hw/status (talOS/bridge/clock_offset.h). nullopt before any
   // state, while that state is not fresh(), and until the bridge's mapping
   // for the state's gateway boot has converged. Independent of enabled().
-  // Later than the true sample time by the link's smallest latency (the
-  // bridge cannot observe it), so node.now() - sample_time() never exceeds
-  // the sample's true age: a one-sided estimate, not clock synchronisation.
+  // Absolute mapping error is bounded by /hw/status
+  // clock_offset_uncertainty_us, assuming <=1000 ppm relative clock drift.
+  // No application-specific fusion accuracy threshold is imposed here.
   std::optional<Time> sample_time() const;
   const config::RobotConfig& config() const;  // parsed node.config_path()
 
@@ -90,9 +101,43 @@ class HardwareLink {
 // constructor.
 bool robot_enabled(Node& node);
 
-// Hardware handles: cheap copyable values. Commands apply to the next flush;
-// anything not set by then is neutral. Feedback is in mechanism units
-// (sensor_to_mechanism_ratio is applied on the controller).
+// Throws std::logic_error naming `what` unless called on `node`'s loop thread
+// inside its update(), the rule every output setter enforces. For a layer
+// above that holds a request for this tick's flush (talOS/mechanisms), so a
+// request from the constructor, every() or a message callback is refused as
+// a direct device command would be.
+void RequireInUpdate(const Node& node, std::string_view what);
+
+// How old a motor's position may be at the State it arrived in
+// (Motor::position_age) for Motor::rezero to take it, and how far apart two
+// samples a rezero combines may be (PositionMechanism's CANcoder homing):
+// two status periods of [robot] status_hz (10 ms at 200 Hz). A status frame
+// is under one period old when the RoboRIO reads it, so two devices' samples
+// in one State are under one period apart; the second period absorbs
+// jitter. Any wider gap is a late frame, and a mechanism moving at v would
+// take a frame off by v times the gap (0.1 rot at 1 rot/s and the 100 ms
+// feedback bound). A refused rezero only retries on a later tick, so the
+// bound can be tight.
+Duration RezeroAgeBound(const hardware::Config& config);
+
+// How old a motor's velocity may be at its State (Motor::velocity_age) for
+// talos::mechanisms::VelocityMechanism to count a tick toward at_speed: four
+// status periods (20 ms at 200 Hz), the age at which the RoboRIO itself
+// reports a signal LATE (PhoenixBackend.cpp). Wider than RezeroAgeBound
+// because readiness is judged every tick and must not flap: at two periods
+// one late or dropped frame would drop at_speed for several ticks and cut a
+// feed short. Still far below command_timeout_us, so a velocity frozen by a
+// CAN gap stops holding at_speed long before the gateway invalidates it.
+// Like Motor::rezero's use of RezeroAgeBound, it needs no clock mapping.
+Duration ReadinessAgeBound(const hardware::Config& config);
+
+// Hardware handles: cheap copyable values. Output setters (Motor's set_* and
+// stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the
+// node's update() and apply to the flush right after it; anything not set in
+// that update() is neutral. From the constructor, every() or a message
+// callback they throw std::logic_error naming the device, since such a
+// command would reach the hardware for at most one tick. Feedback is in
+// mechanism units (sensor_to_mechanism_ratio is applied on the controller).
 class Motor {
  public:
   Motor() = default;
@@ -107,16 +152,55 @@ class Motor {
   // Commands adjusted to configured limits or neutralized for non-finite
   // values, counted once per setter call over this handle's device lifetime.
   std::uint64_t clamped_count() const;
-  // Node-shared software frame; ignored unless the sample is connected and
-  // both input and resulting offset are finite. No hardware reset is sent.
-  // Position goals use this frame; soft limits remain in the hardware frame.
+  // Node-shared software frame; ignored unless the sample is connected, its
+  // position at most RezeroAgeBound old at its State, and both input and
+  // resulting offset finite: zeroed() then stays as it was, so a homing
+  // caller retries on a later tick. No hardware reset is sent. Position
+  // goals use this frame; soft limits remain in the hardware frame.
   void rezero(double position_rot = 0);
+  // Whether a rezero holds. The zero lives in this node, so a restarted node
+  // starts unzeroed. It is dropped when its frame may have restarted: on a
+  // gateway boot id change; on a device reset count change in the State
+  // right after the last one seen (sequence + 1) that masks this motor; on a
+  // device reset count change across any other sequence step. A disconnect
+  // keeps it, and so does every reset of a motor whose config sets
+  // position_frame = "absolute". A dropped zero keeps its offset (dropping
+  // does not move position()). set_position and set_motion_magic go out
+  // neutral while no rezero holds, unless position_frame = "absolute" (a
+  // remote CANcoder's frame, usable from the first state). Other modes are
+  // never held.
+  bool zeroed() const;
 
-  double position() const;  // rotations
+  double position() const;  // rotations; the last valid one while invalid
   double velocity() const;  // rotations/s
   double voltage() const;   // applied volts
   double current() const;   // stator amps
-  bool connected() const;   // sample valid and hardware state fresh
+
+  double temperature_c() const;     // controller temperature, Celsius
+  double supply_current_a() const;  // supply amps (not stator current)
+
+  bool connected() const;  // sample valid and hardware state fresh
+  // Whether an enabled switch on the TalonFX's own forward (reverse) limit
+  // input is asserted, so the TalonFX holds output that way neutral: the
+  // motor's ForwardHardLimit (ReverseHardLimit) fault bit. Unlike the numeric
+  // getters it is false unless connected(), since a stale or invalid sample
+  // says nothing about the switch. While connected, the RoboRIO reports it
+  // only from a FaultField signal under 50 ms old (it clears the bit once
+  // that signal is staler). A normally closed switch whose wire is cut reads
+  // asserted.
+  bool forward_limit() const;
+  bool reverse_limit() const;
+  // Per-signal acquisition time on the node clock, with sample_time()'s
+  // two-way mapping uncertainty. nullopt if disconnected, mapping/state
+  // stale or invalid, or age unknown (UINT32_MAX).
+  std::optional<Time> position_time() const;
+  std::optional<Time> velocity_time() const;
+  // How old each signal's sample was at the State it arrived in (the
+  // gateway's per-signal age, carried in that State). Unlike *_time() it
+  // needs no clock mapping, so it is known from the first accepted State.
+  // nullopt unless connected(), or when the age is unknown (UINT32_MAX).
+  std::optional<Duration> position_age() const;
+  std::optional<Duration> velocity_age() const;
 
  private:
   HardwareLink* link_{nullptr};
@@ -130,6 +214,8 @@ class CANcoder {
   double position() const;  // rotations
   double velocity() const;  // rotations/s
   bool connected() const;   // sample valid and hardware state fresh
+  std::optional<Time> position_time() const;
+  std::optional<Time> velocity_time() const;
 
  private:
   HardwareLink* link_{nullptr};
@@ -143,9 +229,14 @@ class Gyro {  // Pigeon2
   // Node-shared software yaw frame; connected, finite samples/inputs only.
   // No hardware reset is sent; yaw rate is unchanged.
   void rezero(double yaw_rot = 0);
+  // Whether a rezero holds; dropped like Motor::zeroed, keeping its offset,
+  // so dropping does not move yaw().
+  bool zeroed() const;
   double yaw() const;       // rotations, CCW+
   double yaw_rate() const;  // rotations/s, CCW+
   bool connected() const;   // sample valid and hardware state fresh
+  std::optional<Time> yaw_time() const;
+  std::optional<Time> yaw_rate_time() const;
 
  private:
   HardwareLink* link_{nullptr};

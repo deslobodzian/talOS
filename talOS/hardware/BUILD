@@ -21,6 +21,7 @@ cc_library(
     srcs = ["config.cc"],
     hdrs = ["config.h"],
     visibility = ["//visibility:public"],
+    deps = ["//talOS/driver_station"],
 )
 
 cc_library(
@@ -34,6 +35,13 @@ cc_library(
         "config_error.h",
         "config_wire.h",
         "endpoint.h",
+        # Invalid samples and total feedback loss, shared with
+        # testing::SimHardware.
+        "feedback.h",
+        # Shared gating predicates, for the gateway and for hardware-owning
+        # nodes: pure functions over State, so gate_test needs no loop and no
+        # transport.
+        "gate.h",
         "gateway.h",
         "messages.h",
         "packet.h",
@@ -54,6 +62,7 @@ cc_test(
     srcs = ["gateway_test.cc"],
     deps = [
         ":hardware",
+        "//talOS/protocol",
         "@googletest//:gtest_main",
     ],
 )
@@ -78,21 +87,23 @@ cc_test(
     ],
 )
 
-# Shared gating predicates for hardware-owning subsystem nodes: pure
-# functions over State, so the test needs no loop and no transport.
-cc_library(
-    name = "gate",
-    hdrs = ["gate.h"],
-    visibility = ["//visibility:public"],
-    deps = [":hardware"],
-)
-
 cc_test(
     name = "gate_test",
     size = "small",
     srcs = ["gate_test.cc"],
     deps = [
-        ":gate",
+        ":hardware",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "codec_fuzz_test",
+    size = "small",
+    srcs = ["codec_fuzz_test.cc"],
+    deps = [
+        ":hardware",
+        "//talOS/protocol:fuzz_corpus",
         "@googletest//:gtest_main",
     ],
 )

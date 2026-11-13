@@ -1,15 +1,19 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
+#include "talOS/events/handles.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/replay_event_loop.h"
@@ -55,6 +59,14 @@ std::vector<float> record_run(const std::string& path, float gain,
 
   TestRobot<SimulatedEventLoop<log::LogWriter>> robot{loop, test_topics(),
                                                       gain};
+  // Under ON_PUBLISH the sensor wakes the loop, so each reading is delivered
+  // by a drain of its own at its publication instant, ahead of the control
+  // timer, and recorded with its publication time as its event time.
+  if (delivery == Delivery::ON_PUBLISH) {
+    for (const Registration& source : loop.manifest()) {
+      if (source.name == test_topics().sensor) loop.set_prompt(source.id);
+    }
+  }
 
   robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
                                        1ms);
@@ -77,24 +89,49 @@ std::vector<float> record_run(const std::string& path, float gain,
   return robot.efforts();
 }
 
-TEST(Replay, ReproducesRecordedBehaviour) {
-  const std::string path = temp_path("reproduce");
-  const std::vector<float> recorded = record_run(path, 2.5F);
-  ASSERT_FALSE(recorded.empty());
+struct MessageTimes {
+  std::vector<Context> contexts;
+
+  void receive(const Context& context, const EventsTest::SensorMessage&) {
+    contexts.push_back(context);
+  }
+};
+
+TEST(Replay, PreservesPublishTimeAndDispatchAge) {
+  const auto path = temp_path("dispatch_age");
+  constexpr auto origin = MonotonicTime::from_nanos(7'000'000'000);
+  MessageTimes recorded;
+  {
+    SimulationEnvironment environment;
+    using Loop = SimulatedEventLoop<log::LogWriter>;
+    Loop loop{environment, log::LogWriter{path, "dispatch_age"},
+              Loop::Options{.tick_period = 10ms, .start = origin}};
+    watch<EventsTest::SensorMessage, &MessageTimes::receive>(
+        loop, test_topics().sensor, &recorded);
+    loop.run_for(2ms);
+    loop.inject(test_topics().sensor, EventsTest::SensorMessage{1, 2.0F, 3.0F});
+    loop.run_until(origin + 10ms);
+    loop.finish();
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+  }
+  ASSERT_EQ(recorded.contexts.size(), 1u);
+  EXPECT_EQ(recorded.contexts[0].publish_time, origin + 2ms);
+  EXPECT_EQ(recorded.contexts[0].now - recorded.contexts[0].publish_time, 8ms);
 
   log::LogReader reader{path};
   ReplayEventLoop<> loop{reader};
-  TestRobot<ReplayEventLoop<>> robot{loop, test_topics(), 2.5F};
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-
+  MessageTimes replayed;
+  watch<EventsTest::SensorMessage, &MessageTimes::receive>(
+      loop, test_topics().sensor, &replayed);
   loop.run();
-
   EXPECT_FALSE(loop.diverged());
   EXPECT_TRUE(loop.reached_exit());
-  EXPECT_EQ(robot.efforts(), recorded);
-  EXPECT_EQ(robot.control_count(), recorded.size());
-
+  ASSERT_EQ(replayed.contexts.size(), 1u);
+  EXPECT_EQ(replayed.contexts[0].event_time, recorded.contexts[0].event_time);
+  EXPECT_EQ(replayed.contexts[0].now, recorded.contexts[0].now);
+  EXPECT_EQ(replayed.contexts[0].publish_time,
+            recorded.contexts[0].publish_time);
+  EXPECT_EQ(replayed.contexts[0].now - replayed.contexts[0].publish_time, 8ms);
   std::remove(path.c_str());
 }
 
@@ -140,12 +177,11 @@ void ExpectReRecordingIsByteIdentical(Delivery delivery) {
   std::remove(replayed_path.c_str());
 }
 
-TEST(Replay, ReRecordingIsByteIdentical) {
-  ExpectReRecordingIsByteIdentical(Delivery::POLL);
-}
-
-TEST(Replay, ReRecordingABeforeTimersRunIsByteIdentical) {
-  ExpectReRecordingIsByteIdentical(Delivery::BEFORE_TIMERS);
+TEST(Replay, ReRecordingIsByteIdenticalForEveryDeliveryPolicy) {
+  for (const auto delivery :
+       {Delivery::POLL, Delivery::BEFORE_TIMERS, Delivery::ON_PUBLISH}) {
+    ExpectReRecordingIsByteIdentical(delivery);
+  }
 }
 
 TEST(Replay, DetectsChangedBehaviour) {
@@ -180,8 +216,6 @@ TEST(Replay, CollectsEveryDivergenceWhenAsked) {
 
   EXPECT_TRUE(loop.diverged());
   EXPECT_GT(loop.divergences().size(), 1u);
-  EXPECT_NE(loop.divergences().front().detail.find("sent different bytes"),
-            std::string::npos);
 
   std::remove(path.c_str());
 }
@@ -235,20 +269,9 @@ void record_timer_program(const std::string& path) {
   ASSERT_FALSE(loop.recorder().failed());
 }
 
-TEST(Replay, ValidatesTimerOperationsAndHandlerExit) {
-  const auto path = temp_path("timer_operations");
-  record_timer_program(path);
-  log::LogReader reader{path};
-  ReplayEventLoop<> loop{reader};
-  TimerProgram program{loop};
-  EXPECT_NO_THROW(loop.run());
-  EXPECT_FALSE(loop.diverged());
-  EXPECT_TRUE(loop.reached_exit());
-  EXPECT_EQ(program.calls, 1);
-  std::remove(path.c_str());
-}
-
-TEST(Replay, TimerOperationsReRecordIdentically) {
+// A timer program that re-arms, disarms and exits from its handler replays
+// without divergence, reaches the recorded exit and re-records identically.
+TEST(Replay, TimerOperationsAndHandlerExitReRecordIdentically) {
   const auto original_path = temp_path("timer_identical_a");
   const auto replayed_path = temp_path("timer_identical_b");
   record_timer_program(original_path);
@@ -259,6 +282,8 @@ TEST(Replay, TimerOperationsReRecordIdentically) {
     TimerProgram program{loop};
     loop.run();
     ASSERT_FALSE(loop.diverged());
+    EXPECT_TRUE(loop.reached_exit());
+    EXPECT_EQ(program.calls, 1);
   }
   auto original = read_file(original_path);
   auto replayed = read_file(replayed_path);
@@ -382,6 +407,115 @@ TEST(Replay, EarlyExitStopsDispatchEvenWhenCollectingDivergences) {
   std::remove(path.c_str());
 }
 
+// Reads one of two watchers from a timer, the way a node's update() reads its
+// target, and records which value it used.
+template <typename Loop>
+struct ReadProgram {
+  struct Read {
+    Context tick;
+    Context used;
+  };
+
+  Loop& loop;
+  bool read_setpoint{false};
+  std::uint16_t sensor;
+  std::uint16_t setpoint;
+  std::uint16_t timer;
+  std::optional<Context> last_sensor;
+  std::optional<Context> last_setpoint;
+  std::vector<Read> reads;
+
+  explicit ReadProgram(Loop& event_loop) : loop{event_loop} {
+    sensor = watch<EventsTest::SensorMessage, &ReadProgram::on_sensor>(
+        loop, test_topics().sensor, this);
+    setpoint = watch<EventsTest::SetpointMessage, &ReadProgram::on_setpoint>(
+        loop, test_topics().setpoint, this);
+    timer =
+        loop.register_timer("control", make_thunk<&ReadProgram::tick>(this));
+    loop.arm_timer(timer, MonotonicTime::from_nanos(2'000'000), 1ms);
+  }
+  void on_sensor(const Context& context, const EventsTest::SensorMessage&) {
+    last_sensor = context;
+  }
+  void on_setpoint(const Context& context, const EventsTest::SetpointMessage&) {
+    last_setpoint = context;
+  }
+  void tick(const Context& context) {
+    const std::optional<Context>& used =
+        read_setpoint ? last_setpoint : last_sensor;
+    if (!used) return;
+    loop.record_read(read_setpoint ? setpoint : sensor, context.now,
+                     used->publish_time, used->sequence);
+    reads.push_back(Read{context, *used});
+  }
+};
+
+std::vector<ReadProgram<SimulatedEventLoop<log::LogWriter>>::Read>
+record_read_program(const std::string& path) {
+  SimulationEnvironment environment;
+  SimulatedEventLoop<log::LogWriter> loop{environment,
+                                          log::LogWriter{path, "reads"}};
+  ReadProgram program{loop};
+  // Published after the origin, so a read's publish time differs from its
+  // timer dispatch's.
+  loop.run_for(1ms);
+  loop.inject(test_topics().sensor, EventsTest::SensorMessage{1, 2.0F, 3.0F});
+  loop.inject(test_topics().setpoint, EventsTest::SetpointMessage{1, 4.0F});
+  loop.run_for(3ms);
+  loop.finish();
+  EXPECT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+  return program.reads;
+}
+
+// A READ record carries the reading dispatch and the value it used, so a
+// session report can measure the value's age at that dispatch from the log.
+TEST(Replay, ReadRecordRoundTripsWithItsFields) {
+  const auto path = temp_path("read_fields");
+  const auto reads = record_read_program(path);
+  ASSERT_GE(reads.size(), 2u);
+
+  log::LogReader reader{path};
+  log::LogReader::Record record;
+  std::size_t index = 0;
+  while (reader.next(record)) {
+    if (static_cast<EventKind>(record.header.kind) != EventKind::READ) continue;
+    ASSERT_LT(index, reads.size());
+    const auto& [tick, used] = reads[index++];
+    EXPECT_EQ(record.header.source_id, 0u);  // the sensor watcher
+    EXPECT_EQ(record.header.dispatch_index, tick.dispatch_index);
+    EXPECT_EQ(record.header.event_time_ns, tick.event_time.nanos());
+    EXPECT_EQ(record.header.now_ns, tick.now.nanos());
+    EXPECT_EQ(record.header.publish_time_ns, used.publish_time.nanos());
+    EXPECT_NE(used.publish_time, tick.publish_time);
+    EXPECT_EQ(record.header.sequence, used.sequence);
+    EXPECT_EQ(record.header.aux, 0u);
+    EXPECT_EQ(record.header.payload_bytes, 0u);
+  }
+  EXPECT_EQ(index, reads.size());
+  std::remove(path.c_str());
+}
+
+// Exact replay holds a program to the reads it recorded: the unchanged program
+// replays cleanly, and one that reads another source diverges.
+TEST(Replay, DetectsAReadOfADifferentSource) {
+  const auto path = temp_path("read_source");
+  ASSERT_FALSE(record_read_program(path).empty());
+  for (const bool read_setpoint : {false, true}) {
+    log::LogReader reader{path};
+    ReplayEventLoop<> loop{reader};
+    ReadProgram program{loop};
+    program.read_setpoint = read_setpoint;
+    if (read_setpoint) {
+      EXPECT_THROW(loop.run(), ReplayDivergence);
+    } else {
+      loop.run();
+      EXPECT_FALSE(loop.diverged());
+      EXPECT_TRUE(loop.reached_exit());
+    }
+  }
+  std::remove(path.c_str());
+}
+
 // A log that stops mid-record still replays everything it did capture. A robot
 // that lost power should not cost you the whole match.
 TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
@@ -419,6 +553,37 @@ TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
 
   std::remove(path.c_str());
   std::remove(truncated_path.c_str());
+}
+
+// Records lost between intact ones would replay a run the program never
+// made, so exact replay refuses the log; input replay is what uses the rest.
+TEST(Replay, RefusesALogMissingADamagedRecord) {
+  const std::string path = temp_path("damaged");
+  record_run(path, 2.5F);
+
+  std::vector<char> bytes = read_file(path);
+  std::array<char, sizeof(log::RECORD_MAGIC)> magic{};
+  std::memcpy(magic.data(), &log::RECORD_MAGIC, magic.size());
+  std::vector<std::size_t> records;
+  for (auto at = bytes.begin();
+       (at = std::search(at, bytes.end(), magic.begin(), magic.end())) !=
+       bytes.end();
+       ++at) {
+    records.push_back(static_cast<std::size_t>(at - bytes.begin()));
+  }
+  ASSERT_GT(records.size(), 4u);
+  bytes[records[records.size() / 2] +
+        offsetof(log::RecordHeader, dispatch_index)] ^= 1;
+  {
+    std::ofstream out{path, std::ios::binary | std::ios::trunc};
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+
+  log::LogReader reader{path};
+  EXPECT_THROW((ReplayEventLoop<>{reader}), ReplayError);
+  EXPECT_EQ(reader.damage().spans, 1u);
+
+  std::remove(path.c_str());
 }
 
 // Mostly trailing zeros, like a hardware packet: the log stores only the

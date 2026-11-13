@@ -1,13 +1,15 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_field_manifest.bzl", FIELD_CONFIG_FILES = "CONFIG_FILES", FIELD_NODES = "NODES")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
-load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES")
+load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES", PHYSICS_NODES = "NODES")
 
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "dashboard.toml",
     "robot.toml",
     "robot_field.toml",
     "robot_physics_sim.toml",
@@ -28,12 +30,16 @@ cc_test(
     size = "small",
     srcs = ["config_golden_test.cc"],
     data = [
+        "robot_field.toml",
         "robot_physics_sim.toml",
         ":robot_config",
     ] + PHYSICS_CONFIG_FILES,
     deps = [
+        "//2026-robot/main_processor/drivetrain:swerve",
+        "//2026-robot/main_processor/vision/data:field_layout_2026",
         "//talOS/configuration",
-        "//talOS/hardware:config",
+        "//talOS/telemetry:dashboard_layout",
+        "//talOS/vision/field_sim",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
@@ -44,6 +50,33 @@ talos_graph_test(
     config = "robot.toml",
     data = CONFIG_FILES,
     nodes = NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+)
+
+# A copy of robot.toml with the example elevator added, made in the test's
+# temporary directory: a ninth reader of /hw/state/driver_station passes
+# --describe-only. robot.toml itself is unchanged.
+py_test(
+    name = "fanout_graph_test",
+    size = "small",
+    srcs = ["fanout_graph_test.py"],
+    data = [
+        "robot.toml",
+        "//examples/superstructure/config:subsystems",
+        "//examples/superstructure/cpp:elevator",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+    ] + CONFIG_FILES + NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 # robot_manifest.bzl is generated from robot.toml; this fails when it is stale.
@@ -59,6 +92,11 @@ talos_graph_test(
     config = "robot_field.toml",
     data = FIELD_CONFIG_FILES,
     nodes = FIELD_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 manifest_sync_test(
@@ -66,6 +104,18 @@ manifest_sync_test(
     config = "robot_field.toml",
     config_files = FIELD_CONFIG_FILES,
     manifest = "robot_field_manifest.bzl",
+)
+
+talos_graph_test(
+    name = "physics_sim_graph_test",
+    config = "robot_physics_sim.toml",
+    data = PHYSICS_CONFIG_FILES,
+    nodes = PHYSICS_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 manifest_sync_test(

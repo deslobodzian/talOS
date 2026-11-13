@@ -1,10 +1,22 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
+load(
+    ":contract.bzl",
+    "TALOS_TOPIC_ABBREVIATIONS",
+    "TALOS_TOPIC_DIRECTION_SUFFIXES",
+    "TALOS_TOPIC_ROLES",
+    "talos_topic_problem",
+)
 
-exports_files([
-    "contract.bzl",
-    "bundle_builder.py",
-])
+exports_files(["contract.bzl"])
+
+# talos_bundle's assembly step, run in the exec configuration's hermetic
+# Python.
+py_binary(
+    name = "bundle_builder",
+    srcs = ["bundle_builder.py"],
+)
 
 py_test(
     name = "bundle_builder_test",
@@ -72,4 +84,85 @@ py_test(
     },
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
+)
+
+# talos_messages checks topic names in Starlark at load time; the grammar's
+# authority is naming::CheckTopicName. Each line of the verdicts file is
+# `<kind> <entry> <ok|bad> <topic>`: a `name` probe for each name below, and
+# one probe per role, abbreviation (`<wrong>><right>`) and direction suffix
+# in contract.bzl's tables, so the test also sees an entry either side adds
+# or drops.
+_GRAMMAR_NAMES = [
+    "/hw/state",
+    "/hw/state/driver_station",
+    "/drivetrain/target/teleop",
+    "/talos/telemetry",
+    "/a/state/b/c",
+    "/odometry2/state",
+    "/drivetrain/state/" + "x" * 13,
+    "/" + "a" * 24 + "/state",
+    "",
+    "drivetrain/state",
+    "/drivetrain/state/",
+    "/drivetrain//state",
+    "/odometry",
+    "/a/state/b/c/d",
+    "/drivetrain/state/" + "x" * 14,
+    "/Drivetrain/state",
+    "/drive-train/state",
+    "/drive.train/state",
+    "/2026/state",
+    "/drivetrain__x/state",
+    "/drivetrain_/state",
+    "/drivetrain/pose",
+]
+
+_GRAMMAR_PROBES = [("name", "-", topic) for topic in _GRAMMAR_NAMES] + [
+    (
+        "role",
+        role,
+        "/hw/" + role,
+    )
+    for role in TALOS_TOPIC_ROLES
+] + [
+    (
+        "abbreviation",
+        wrong + ">" + right,
+        "/hw/state/" + wrong,
+    )
+    for wrong, right in TALOS_TOPIC_ABBREVIATIONS.items()
+] + [
+    (
+        "suffix",
+        suffix,
+        "/hw/state/x" + suffix,
+    )
+    for suffix in TALOS_TOPIC_DIRECTION_SUFFIXES
+]
+
+genrule(
+    name = "topic_grammar_verdicts",
+    outs = ["topic_grammar_verdicts.txt"],
+    cmd = "cat << 'EOF' > $@\n" + "".join([
+        "%s %s %s %s\n" % (
+            kind,
+            entry,
+            "bad" if talos_topic_problem(topic) else "ok",
+            topic,
+        )
+        for kind, entry, topic in _GRAMMAR_PROBES
+    ]) + "EOF\n",
+    visibility = ["//visibility:private"],
+)
+
+cc_test(
+    name = "topic_grammar_test",
+    size = "small",
+    srcs = ["topic_grammar_test.cc"],
+    data = [":topic_grammar_verdicts.txt"],
+    env = {"TALOS_TOPIC_VERDICTS": "$(rootpath :topic_grammar_verdicts.txt)"},
+    deps = [
+        "//talOS/introspection:names",
+        "@googletest//:gtest_main",
+    ],
 )

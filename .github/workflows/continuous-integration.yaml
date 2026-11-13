@@ -1,42 +1,412 @@
 # https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions
 # See also: https://github.com/marketplace/actions/bazel-action
 #
+# Every push and pull request. Hosted macOS builds and runs the suite without
+# the full-graph timed tests; its sanitizer legs and soak run in nightly.yaml.
+# `gate` needs every job here and is the one check to require.
+#
+# Caches (bazel-contrib/setup-bazel): one disk cache per OS and Bazel
+# configuration (`plain`, `asan`, `tsan`; the action adds the OS to the key).
+# Only runs on main save, and of the jobs sharing a key only the one that
+# builds //... does; every other run restores main's cache.
 name: Continuous Integration
 on:
   push:
     branches:
       - main
+      - hardening/**
+      - feature/**
   pull_request:
     branches:
       - main
 
+# A newer push to the same branch or pull request cancels the older run.
+# Runs on main are never cancelled: each one saves the caches.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
 jobs:
-  build:
-    name: Bazel Build
+  linux:
+    name: Linux (build, test, clang-tidy)
     runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      TESTLOGS: linux
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
+      with:
+        # Full history is needed to diff against the PR base / push base.
+        fetch-depth: 0
+
+    - &diff-base
+      name: Choose the diff base
+      # Reused by buildifier, clang-format and clang-tidy. A pull request
+      # checks every file its branch changed since it left the base branch,
+      # so a commit whose earlier run was cancelled or failed is checked
+      # again by every later run. A topic-branch push does the same, against
+      # the merge base with main, in a job that sets DIFF_SCOPE=branch
+      # (buildifier and clang-format, which are cheap; clang-tidy keeps the
+      # pushed commits' scope, TODO.md CI-3). Otherwise a push
+      # checks the commits it pushed; on main, `before` is the old tip,
+      # which is the merge base of what was merged. A new branch (all-zero
+      # `before`) or a force push (`before` absent from the clone or not an
+      # ancestor of HEAD) falls back to the merge base with main. Where
+      # that merge base is HEAD itself (main, or a branch at main's tip),
+      # the base is HEAD's first parent.
+      env:
+        EVENT: ${{ github.event_name }}
+        BEFORE: ${{ github.event.before }}
+        BASE_REF: ${{ github.base_ref }}
+      run: |
+        if [ "$EVENT" = pull_request ]; then
+          base="$(git merge-base "origin/$BASE_REF" HEAD)"
+        elif { [ "${DIFF_SCOPE:-}" != branch ] ||
+               [ "$GITHUB_REF" = refs/heads/main ]; } &&
+             [ -n "$BEFORE" ] &&
+             [ "$BEFORE" != 0000000000000000000000000000000000000000 ] &&
+             git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
+          base="$BEFORE"
+        else
+          base="$(git merge-base origin/main HEAD)"
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then
+            base="$(git rev-parse HEAD~1)"
+          fi
+        fi
+        echo "Diff base: $(git log -1 --format='%H %s' "$base")"
+        echo "BASE=$base" >> "$GITHUB_ENV"
 
     - name: Setup bazel-action
       uses: bazel-contrib/setup-bazel@0.19.0
       with:
         # Avoid downloading Bazel every time.
         bazelisk-cache: true
-        # Store build cache per workflow.
-        disk-cache: ${{ github.workflow }}
-        # Share repository cache between workflows.
+        disk-cache: plain
         repository-cache: true
+        # This job saves the Linux plain cache, the repository cache and
+        # the bazelisk cache for every other Linux job.
+        cache-save: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Build
+      id: build
       run: bazel build //... --noshow_progress --test_output=errors
 
-    - name: Test
-      run: bazel test //... --noshow_progress --test_output=errors
+    - name: Layer check (ARCHITECTURE.md "Allowed dependencies")
+      # bazel query paths that must be empty; known exceptions are
+      # allowlisted in the script and the list may only shrink.
+      run: python3 tools/check_layers.py
 
-  build-macos:
-    name: Bazel Build (macOS)
+    - &runfiles-collisions
+      name: No runfiles path is both generated-empty and a source file
+      # A reused sandbox writes an empty generated file through a stale
+      # symlink left by another test's runfiles, truncating the source.
+      run: python3 tools/check_runfiles_collisions.py
+
+    - name: Checked-in Studio bindings match the telemetry_ts genrule
+      # pnpm and tsc read studio/src/generated; Bazel builds Studio from the
+      # //studio:telemetry_ts genrule (the same pinned flatc `pnpm generate`
+      # runs). A schema edit without `pnpm generate` fails here.
+      run: diff -ru bazel-bin/studio/src/generated studio/src/generated
+
+    # Anchored and reused by macos.
+    - &make-read-only
+      name: Make tracked source files read-only
+      # A reused Bazel sandbox once truncated talOS/python/talos/__init__.py
+      # by creating a generated empty file through a stale symlink to it
+      # (tools/check_runfiles_collisions.py now prevents that layout). With
+      # every tracked regular file read-only, a recurrence fails as "Could
+      # not copy inputs into sandbox: ... (Permission denied)" naming the
+      # test, instead of corrupting the checkout. Directories stay writable
+      # (Bazel's convenience symlinks); MODULE.bazel.lock stays writable.
+      # tools/prepush.sh runs the same script before a push.
+      run: python3 tools/make_sources_read_only.py
+
+    - name: Allow unprivileged user namespaces
+      # Ubuntu 24.04's AppArmor strips capabilities from an unprivileged
+      # user namespace, so //talOS/protocol:udp_address_change_test (REQ-RT-22's
+      # real-stack proof) could not create its tap device and skipped. The
+      # Test step below sets TALOS_REQUIRE_NETNS=1, which fails that skip.
+      # Not in the sanitizer jobs: under ThreadSanitizer, unshare in a forked
+      # child of a multithreaded process is unreliable, so there it may skip.
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    - name: Test
+      id: test
+      # Every lane but the soak (docs/TESTING.md §9). The console is kept
+      # for the failed-test step below, the build events for the lane
+      # budget step.
+      run: |
+        set -o pipefail
+        bazel test //... --noshow_progress --test_output=errors \
+          --test_env=TALOS_REQUIRE_NETNS=1 \
+          --build_event_json_file="$RUNNER_TEMP/test-events.json" 2>&1 \
+          | tee "$RUNNER_TEMP/bazel-test.log"
+
+    - name: Lane budgets (docs/TESTING.md §9)
+      # Each test action's time against its lane's budget, from this
+      # invocation's build events (a cached result keeps the time of the
+      # run that produced it). The fast lane's 5 s is printed, not
+      # enforced: the budgets were measured on an idle 8-core workstation,
+      # where every fast target ran under 5 s, and this runner ran three
+      # over it (run 43357369179: //2026-robot/main_processor:bundle_test
+      # 6.8 s, //2026-robot/main_processor/pose_estimator:node_test 5.6 s,
+      # //studio:typecheck 5.6 s). TODO.md LANE-1.
+      if: ${{ !cancelled() && (steps.test.outcome == 'success' || steps.test.outcome == 'failure') }}
+      run: >-
+        python3 tools/slow_tests.py --check
+        --bep "$RUNNER_TEMP/test-events.json"
+        --enforce heavy,integration,e2e,perf
+
+    - &checkout-unchanged
+      name: Checkout unchanged by the build and tests
+      # Runs after failed tests too: a source truncation fails the tests,
+      # and this is the evidence. Modified tracked files and untracked,
+      # non-ignored files both fail it.
+      if: ${{ !cancelled() }}
+      run: |
+        status="$(git status --porcelain --untracked-files=all)"
+        if [ -n "$status" ]; then
+          printf '%s\n' "$status"
+          git diff --stat
+          exit 1
+        fi
+
+    - &collect-failed-tests
+      name: Collect the failed tests' logs and outputs
+      # Copies each failed, timed-out or incomplete test's bazel-testlogs
+      # directory (test.log, test.xml, test.outputs/, every shard), named
+      # in Bazel's summary, beside the console log.
+      if: ${{ failure() && steps.test.outcome == 'failure' }}
+      run: |
+        out="$RUNNER_TEMP/failed-tests"
+        mkdir -p "$out"
+        cp "$RUNNER_TEMP/bazel-test.log" "$out/" || true
+        grep -oE '^//[^ ]+ +(FAILED|TIMEOUT|INCOMPLETE|NO STATUS)' \
+            "$RUNNER_TEMP/bazel-test.log" | awk '{ print $1 }' | sort -u \
+          | while read -r label; do
+              rel="${label#//}"
+              rel="${rel/://}"
+              echo "$label -> $rel"
+              if [ -d "bazel-testlogs/$rel" ]; then
+                mkdir -p "$out/$rel"
+                cp -R "bazel-testlogs/$rel/." "$out/$rel/"
+              fi
+            done
+
+    - &upload-failed-tests
+      name: Keep the failed tests' logs and outputs
+      if: ${{ failure() && steps.test.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: testlogs-${{ env.TESTLOGS }}
+        path: ${{ runner.temp }}/failed-tests/
+        if-no-files-found: ignore
+
+    # clang-tidy reuses the Bazel server and outputs of the build above, so
+    # it adds only the compilation database and the analysis. It runs when
+    # the build succeeded, whether or not the tests did.
+    - name: Install clang-tidy
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y clang-tidy-18
+
+    - name: Refresh compilation database
+      # Hedron's Compile Commands Extractor (already a dev_dependency in
+      # MODULE.bazel) generates compile_commands.json for clang-tidy. It
+      # only extracts commands; clang-tidy resolves headers through
+      # bazel-out/external, including generated ones (e.g. flatbuffers
+      # virtual includes), which the build above materialized.
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      run: bazel run @hedron_compile_commands//:refresh_all --noshow_progress
+
+    - name: Run clang-tidy on changed sources and headers
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      run: |
+        # Analyze TUs in the Bazel graph: each changed source, tests
+        # included, plus up to TUS_PER_HEADER includers of each changed
+        # header (direct or transitive; production includers for a
+        # production header). A changed source missing from the database
+        # fails the step.
+        # NUL-delimited git output also handles paths containing whitespace.
+        python3 - "$BASE" <<'PYEOF'
+        import concurrent.futures, json, os, pathlib, re, subprocess, sys, time
+        SOURCES = ('.c', '.cc', '.cpp')
+        HEADERS = ('.h', '.hpp')
+        # Sources the Linux build graph never compiles, so they have no
+        # compilation database entry: the GradleRIO program and its tests
+        # (rio-adapter job) and sources selected only for other platforms.
+        # Paths in .bazelignore are outside the graph too and are read from
+        # there.
+        OFF_GRAPH = ('2026-robot/controller_processor/rio/',
+                     'talOS/events/os/kqueue_poller.cc',
+                     'talOS/vision/capture/unsupported_source.cc')
+        # A changed header is analyzed through at most this many translation
+        # units that include it, nearest includers first.
+        TUS_PER_HEADER = 4
+        # Test code reads an optional after gtest's ASSERT_TRUE(opt), which
+        # this check cannot see through; every other check applies to tests.
+        TEST_CHECKS = '-bugprone-unchecked-optional-access'
+
+        def git(*args):
+            return [p for p in subprocess.check_output(['git', *args]).decode().split('\0') if p]
+
+        def ours(rel):
+            return not {'external', 'third_party'}.intersection(
+                pathlib.PurePosixPath(rel).parts)
+
+        def production(rel):
+            path = pathlib.PurePosixPath(rel)
+            return ours(rel) and not (
+                {'test', 'tests', 'testing', 'testdata'}.intersection(path.parts) or
+                path.stem in {'test', 'testing'} or
+                path.stem.endswith(('_test', '_testing')) or
+                'fuzz' in path.stem)
+
+        with open('.bazelignore') as f:
+            ignored = tuple(line.strip().rstrip('/') + '/' for line in f
+                            if line.strip() and not line.startswith('#'))
+        with open('compile_commands.json') as f:
+            db = json.load(f)
+        root = os.getcwd()
+        tus = set()
+        for e in db:
+            if e['file'].endswith(SOURCES):
+                rel = os.path.relpath(os.path.realpath(os.path.join(e['directory'], e['file'])), root)
+                if ours(rel):
+                    tus.add(rel)
+
+        changed = [rel for rel in git('diff', '--name-only', '--diff-filter=d', '-z', sys.argv[1], 'HEAD',
+                                      '--', *('*' + ext for ext in SOURCES + HEADERS))
+                   if ours(rel) and not rel.startswith(ignored)]
+        targets, missing = [], []
+        for rel in changed:
+            if not rel.endswith(SOURCES):
+                continue
+            if rel in tus:
+                targets.append(rel)
+            elif not rel.startswith(OFF_GRAPH):
+                missing.append(rel)
+
+        headers = [rel for rel in changed if rel.endswith(HEADERS)]
+        if headers:
+            # Reverse include graph over tracked files. A quoted include next to its
+            # includer resolves there; otherwise to every tracked header whose path
+            # ends with the spelling, which over-approximates when two headers share
+            # a suffix: an extra includer is analyzed, none missed.
+            tracked = git('ls-files', '-z', *('*' + ext for ext in SOURCES + HEADERS))
+            tracked_set = set(tracked)
+            by_name = {}
+            for rel in tracked:
+                if rel.endswith(HEADERS):
+                    by_name.setdefault(os.path.basename(rel), []).append(rel)
+            include = re.compile(rb'^\s*#\s*include\s*(["<])([^">]+)[">]', re.M)
+            includers = {}
+            for rel in tracked:
+                with open(rel, 'rb') as f:
+                    for quote, spelled in include.findall(f.read()):
+                        spelled = spelled.decode(errors='replace')
+                        local = os.path.normpath(os.path.join(os.path.dirname(rel), spelled))
+                        if quote == b'"' and local in tracked_set:
+                            resolved = [local]
+                        else:
+                            resolved = [h for h in by_name.get(os.path.basename(spelled), ())
+                                        if h == spelled or h.endswith('/' + spelled)]
+                        for header in resolved:
+                            includers.setdefault(header, set()).add(rel)
+            for header in headers:
+                found, seen, frontier = [], {header}, [header]
+                while frontier and len(found) < TUS_PER_HEADER:
+                    level = sorted({i for h in frontier for i in includers.get(h, ())} - seen,
+                                   key=lambda p: (os.path.dirname(p) != os.path.dirname(header), p))
+                    seen.update(level)
+                    found += [p for p in level if p in tus and
+                              (production(p) or not production(header))][:TUS_PER_HEADER - len(found)]
+                    frontier = [p for p in level if p.endswith(HEADERS)]
+                if found:
+                    print(f'{header}: via {", ".join(found)}')
+                    targets += found
+                elif production(header):
+                    print(f'{header}: no production translation unit includes it; not analyzed')
+                else:
+                    print(f'{header}: no translation unit includes it; not analyzed')
+        targets = list(dict.fromkeys(targets))
+
+        for rel in missing:
+            print(f'::error file={rel}::changed source has no compilation '
+                  'database entry; add it to a Bazel target or to OFF_GRAPH in this step')
+        if not targets:
+            print('No changed C++ to analyze.')
+            sys.exit(1 if missing else 0)
+        # One clang-tidy per core: a single process over a large PR's
+        # translation units ran for most of an hour.
+        def tidy(path):
+            checks = [] if production(path) else [f'--checks={TEST_CHECKS}']
+            return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', *checks, path],
+                                  capture_output=True, text=True)
+        failed = 0
+        start = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+            for path, r in zip(targets, pool.map(tidy, targets)):
+                if r.returncode != 0:
+                    failed += 1
+                    print(f'::group::{path}')
+                    print(r.stdout + r.stderr, end='')
+                    print('::endgroup::')
+        print(f'clang-tidy: {len(targets)} files, {failed} with findings, '
+              f'{time.monotonic() - start:.1f}s')
+        sys.exit(1 if failed or missing else 0)
+        PYEOF
+
+  sanitizers:
+    name: Bazel (${{ matrix.sanitizer }}, Linux)
+    # The macOS legs run in nightly.yaml.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, tsan]
+    env:
+      TESTLOGS: linux-${{ matrix.sanitizer }}
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: ${{ matrix.sanitizer }}
+        repository-cache: true
+        cache-save: ${{ github.ref == 'refs/heads/main' }}
+    - name: Test instrumented suite and bounded decoder corpora
+      id: test
+      run: |
+        set -o pipefail
+        # Every lane but the soak; the config's own filter leaves out the
+        # no_asan / no_tsan targets.
+        bazel test --config=${{ matrix.sanitizer }} \
+          --test_output=errors //... 2>&1 \
+          | tee "$RUNNER_TEMP/bazel-test.log"
+    - *collect-failed-tests
+    - *upload-failed-tests
+
+  macos:
+    name: macOS (build, test)
+    # macOS is the deployment OS: its kqueue, RTMS process-identity,
+    # F_FULLFSYNC and Metal paths compile only here. A hosted runner (3
+    # vCPU, shared) is no timing reference, and the full graph needs about
+    # 2.5 of its cores, so the full-graph timed tests (startup,
+    # match_rehearsal, accuracy) are left out here and run on Linux; the
+    # macOS sanitizer legs and soak run in nightly.yaml.
     runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      TESTLOGS: macos
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -45,18 +415,57 @@ jobs:
       uses: bazel-contrib/setup-bazel@0.19.0
       with:
         bazelisk-cache: true
-        disk-cache: ${{ github.workflow }}
+        disk-cache: plain
         repository-cache: true
+        cache-save: ${{ github.ref == 'refs/heads/main' }}
 
     - name: Build
       run: bazel build //... --noshow_progress --test_output=errors
 
+    - *runfiles-collisions
+
+    - *make-read-only
+
     - name: Test
-      run: bazel test //... --noshow_progress --test_output=errors
+      id: test
+      run: |
+        set -o pipefail
+        bazel test --noshow_progress --test_output=errors \
+          --config=no_e2e //... 2>&1 \
+          | tee "$RUNNER_TEMP/bazel-test.log"
+
+    - name: Process limits and counts after a failure
+      # TODO.md INC-5: a probe whose spawn names `fork (guardian)` or `fork`
+      # with EAGAIN ran out of process slots. These are the limits and what
+      # is still running once the tests end, not the peak.
+      if: ${{ failure() }}
+      run: |
+        sysctl kern.maxproc kern.maxprocperuid
+        echo "ulimit -u: $(ulimit -u)"
+        echo "processes: $(ps -A | wc -l)"
+        echo "processes of uid $(id -u): $(ps -U "$(id -u)" | wc -l)"
+
+    - *checkout-unchanged
+
+    - *collect-failed-tests
+
+    - *upload-failed-tests
+
+  soak:
+    name: Soak (Linux)
+    # Pushes only, with fault-order seed 0 on topic branches and seed 1 on
+    # main, so main runs an order the branches did not. The macOS soak runs
+    # in nightly.yaml.
+    if: ${{ github.event_name == 'push' }}
+    uses: ./.github/workflows/soak.yaml
+    with:
+      os: ubuntu-latest
+      seed: ${{ github.ref == 'refs/heads/main' && '1' || '0' }}
 
   rio-adapter:
     name: RIO adapter (GradleRIO)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: 2026-robot/controller_processor/rio
@@ -91,9 +500,90 @@ jobs:
       # the artifact `deploy` ships; it never runs in CI, it must compile.
       run: ./gradlew buildRio
 
-  buildifier:
-    name: Buildifier (changed BUILD files)
+  rio-in-the-loop:
+    name: RoboRIO program in the loop (WPILib sim)
+    # The deployed RoboRIO program (Robot.cpp: its Driver Station loop,
+    # gateway and Phoenix 6 backend) run as a desktop simulation against the
+    # Bazel-built bridge and drivetrain node: tools/test_drivetrain.py
+    # --wpilib drives, checks the neutral stop when commands end, replays the
+    # node's log, and checks a never-enabled robot does not move. -Pheadless
+    # (set by the script) loads no simulation GUI, so no display is needed.
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: plain
+        repository-cache: true
+        cache-save: false
+
+    - name: Setup Java (GradleRIO needs a JDK; the wrapper itself is pinned)
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 17
+
+    - name: Setup Gradle cache
+      uses: gradle/actions/setup-gradle@v4
+
+    - name: Build the main-processor side
+      run: >-
+        bazel build --noshow_progress
+        //2026-robot/main_processor/drivetrain:all
+        //talOS/bridge:hardware_node
+
+    - name: Install RoboRIO toolchain
+      # GradleRIO refuses to configure the project until it is installed,
+      # even for a desktop-only task.
+      working-directory: 2026-robot/controller_processor/rio
+      run: ./gradlew installRoboRioToolchain
+
+    - name: Keep the Phoenix simulation's device files in memory
+      # Phoenix 6 desktop simulation rewrites each simulated device's flash
+      # file (ctre_sim/*.dat, about 1250 rewrites in the 2 s after a
+      # configure) while holding the lock the loop's Phoenix calls take, so
+      # the loop waits as long as the runner's disk does (370 ms in run
+      # 43023451199). The RoboRIO has no such files. The loop's own config
+      # save (talos_config.bin) stays on disk.
+      working-directory: 2026-robot/controller_processor/rio
+      run: mkdir -p /dev/shm/ctre_sim && ln -sfn /dev/shm/ctre_sim ctre_sim
+
+    - name: Build and start the desktop simulation once
+      # The test runs Gradle with --offline, so everything simulateNative
+      # resolves (WPILib and Phoenix simulation natives) is fetched here.
+      # The robot, disabled, stops itself after two seconds. No config is
+      # pushed, so no simulated device is created here; the first configure
+      # happens in the test.
+      working-directory: 2026-robot/controller_processor/rio
+      env:
+        TALOS_SIM_DS: '0'
+        TALOS_SIM_RUN_MS: '2000'
+      run: timeout 900 ./gradlew -Pheadless simulateNative
+
+    - name: Drivetrain against the RoboRIO program
+      timeout-minutes: 10
+      run: python3 tools/test_drivetrain.py --wpilib --output-dir "$RUNNER_TEMP/rio-in-the-loop"
+
+    - name: Keep the failed run's logs
+      if: ${{ failure() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: rio-in-the-loop
+        path: ${{ runner.temp }}/rio-in-the-loop/
+        if-no-files-found: ignore
+
+  buildifier:
+    name: Buildifier (changed Starlark files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The diff base step checks the whole branch on a topic-branch push.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -102,33 +592,33 @@ jobs:
         fetch-depth: 0
 
     - name: Install buildifier
+      # Version and sha256 are pinned once, in tools/setup.sh.
       run: |
-        BUILDIFIER_VERSION=8.2.1
-        curl -sSL -o /usr/local/bin/buildifier \
-          "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION}/buildifier-linux-amd64"
-        chmod +x /usr/local/bin/buildifier
+        eval "$(grep -E '^BUILDIFIER_(VERSION|SHA256_amd64)=' tools/setup.sh)"
+        curl -fsSL --retry 3 -o "$RUNNER_TEMP/buildifier" \
+          "https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION:?}/buildifier-linux-amd64"
+        echo "${BUILDIFIER_SHA256_amd64:?}  $RUNNER_TEMP/buildifier" | sha256sum -c -
+        install -m 0755 "$RUNNER_TEMP/buildifier" /usr/local/bin/buildifier
         buildifier --version
 
-    - name: Check changed BUILD files
+    - *diff-base
+
+    - name: Check changed Starlark files
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-        else
-          BASE="${{ github.event.before }}"
-        fi
-        case "$BASE" in
-          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
-        esac
-        echo "Diff base: $BASE"
-        # Check mode only: never rewrites files. Scoped to files changed in
-        # this PR/push so pre-existing tree state stays untouched.
+        # Check mode only: never rewrites files. Scoped to the files changed
+        # since $BASE so pre-existing tree state stays untouched.
         git diff --name-only --diff-filter=d -z "$BASE" HEAD -- \
-          'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' \
+          'BUILD' 'BUILD.bazel' '*/BUILD' '*/BUILD.bazel' '*.bzl' \
+          'MODULE.bazel' '*/MODULE.bazel' \
           | xargs -0 -r buildifier --mode=check --lint=warn
 
   clang-format:
     name: clang-format (changed C++ files)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The diff base step checks the whole branch on a topic-branch push.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -140,17 +630,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y clang-format-18
 
+    - *diff-base
+
     - name: Check changed C/C++ files
       run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-        else
-          BASE="${{ github.event.before }}"
-        fi
-        case "$BASE" in
-          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
-        esac
-        echo "Diff base: $BASE"
         # --dry-run --Werror: check only, never reformats. .clang-format at
         # the repo root is picked up automatically. third_party/ is vendored
         # upstream source (metal-cpp) and keeps its upstream formatting.
@@ -158,92 +641,70 @@ jobs:
           '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' ':!third_party/' \
           | xargs -0 -r clang-format-18 --dry-run --Werror
 
-  clang-tidy:
-    name: clang-tidy (changed C++ files)
+  lint:
+    name: Source lints (no Bazel)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
-      with:
-        fetch-depth: 0
 
-    - name: Setup bazel-action
-      uses: bazel-contrib/setup-bazel@0.19.0
-      with:
-        # Avoid downloading Bazel every time.
-        bazelisk-cache: true
-        # Store build cache per workflow.
-        disk-cache: ${{ github.workflow }}
-        # Share repository cache between workflows.
-        repository-cache: true
+    - name: No wall clock in tests or node code, no test retries
+      # docs/TESTING.md §6.1, §8.1; exceptions with their reasons in
+      # tools/lint_test_time_allowlist.txt, which may only shrink.
+      run: python3 tools/lint_test_time.py
 
-    - name: Install clang-tidy
+    - name: Every relative markdown link and anchor resolves
+      if: ${{ !cancelled() }}
+      run: python3 tools/check_links.py
+
+    - name: Every SAFE, CONTRACT and P0 requirement has a tagged test
+      # docs/TESTING.md §3, docs/DESIGN.md §6; known gaps with their TODO
+      # item in tools/trace_waivers.txt, which may only shrink.
+      if: ${{ !cancelled() }}
+      run: python3 tools/trace.py --check
+
+    - name: Every node test has its matrix cases
+      # docs/TESTING.md §7; the cases missing today are listed in
+      # tools/check_node_matrix_baseline.txt (TODO.md MATRIX-1), which may
+      # only shrink: an unlisted missing case or a listed case no longer
+      # missing fails.
+      if: ${{ !cancelled() }}
+      run: >-
+        python3 tools/check_node_matrix.py
+        --baseline tools/check_node_matrix_baseline.txt
+
+  gate:
+    name: CI gate
+    # The one check to require: it fails unless every job above succeeded.
+    # Only the soak may be skipped (it runs on pushes, not pull requests).
+    # A cancelled run skips it rather than passing it.
+    if: ${{ !cancelled() }}
+    needs:
+      - linux
+      - sanitizers
+      - macos
+      - soak
+      - rio-adapter
+      - rio-in-the-loop
+      - buildifier
+      - clang-format
+      - lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Every required job passed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
       run: |
-        sudo apt-get update
-        sudo apt-get install -y clang-tidy-18
-
-    - name: Build first so generated headers exist
-      # clang-tidy resolves headers through bazel-out/external, including
-      # generated ones (e.g. flatbuffers virtual includes). refresh_all only
-      # extracts commands, so without a prior build the database points at
-      # headers that were never materialized and every TU including them
-      # fails with a compiler error. The shared disk cache keeps this fast.
-      run: bazel build //... --noshow_progress
-
-    - name: Refresh compilation database
-      # Hedron's Compile Commands Extractor (already a dev_dependency in
-      # MODULE.bazel) generates compile_commands.json for clang-tidy.
-      run: bazel run @hedron_compile_commands//:refresh_all --noshow_progress
-
-    - name: Run clang-tidy on changed sources
-      run: |
-        if [ "${{ github.event_name }}" = "pull_request" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-        else
-          BASE="${{ github.event.before }}"
-        fi
-        case "$BASE" in
-          ""|"0000000000000000000000000000000000000000") BASE="HEAD~1" ;;
-        esac
-        echo "Diff base: $BASE"
-        # .clang-tidy at the repo root is picked up automatically (checks,
-        # WarningsAsErrors, HeaderFilterRegex). Only .c/.cc/.cpp translation
-        # units present in compile_commands.json are analyzed; headers are
-        # covered through their including TUs. Files outside the Bazel graph
-        # are skipped.
-        CHANGED=$(git diff --name-only --diff-filter=d "$BASE" HEAD -- \
-          '*.c' '*.cc' '*.cpp')
-        python3 - "$BASE" $CHANGED <<'PYEOF'
-        import concurrent.futures, json, os, subprocess, sys
-        with open('compile_commands.json') as f:
-            db = json.load(f)
-        known = {os.path.realpath(e['file']) for e in db}
-        root = os.path.realpath(os.getcwd())
-        targets = []
-        for rel in sys.argv[2:]:
-            if not rel:
-                continue
-            abs_path = os.path.realpath(os.path.join(root, rel))
-            if abs_path in known:
-                targets.append(rel)
-            else:
-                print(f'skip (no compilation database entry): {rel}')
-        if not targets:
-            print('No changed sources with compilation database entries; skipping.')
-            sys.exit(0)
-        # One clang-tidy per core: a single process over a large PR's
-        # translation units ran for most of an hour.
-        def tidy(path):
-            return subprocess.run(['clang-tidy-18', '-p', '.', '--quiet', path],
-                                  capture_output=True, text=True)
-        failed = 0
-        with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
-            for path, r in zip(targets, pool.map(tidy, targets)):
-                if r.returncode != 0:
-                    failed += 1
-                    print(f'::group::{path}')
-                    print(r.stdout + r.stderr, end='')
-                    print('::endgroup::')
-        print(f'clang-tidy: {len(targets)} files, {failed} with findings')
+        python3 - <<'EOF'
+        import json, os, sys
+        may_skip = {'soak'}
+        failed = False
+        for job, need in sorted(json.loads(os.environ['NEEDS']).items()):
+            result = need['result']
+            ok = result == 'success' or (result == 'skipped' and job in may_skip)
+            failed |= not ok
+            print(f"{job}: {result}{'' if ok else '  <- not passed'}")
         sys.exit(1 if failed else 0)
-        PYEOF
+        EOF

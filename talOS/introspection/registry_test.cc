@@ -1,12 +1,29 @@
 #include "talOS/introspection/registry.h"
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <signal.h>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -18,6 +35,8 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/introspection/reporter.h"
+#include "talOS/rtms/rtms.h"
+#include "talOS/rtms/wake.h"
 
 namespace talos::introspect {
 namespace {
@@ -40,6 +59,226 @@ class Registry : public ::testing::Test {
 
   std::string path_ = temp_registry("reg");
 };
+// Always reap children, including on an assertion failure while one is stopped.
+class Children {
+ public:
+  ~Children() {
+    for (const pid_t pid : pids_) ::kill(pid, SIGKILL);
+    for (const pid_t pid : pids_) Wait(pid, nullptr, 0);
+  }
+
+  void add(pid_t pid) { pids_.push_back(pid); }
+
+  static pid_t Wait(pid_t pid, int* status, int options) {
+    pid_t result;
+    do {
+      result = ::waitpid(pid, status, options);
+    } while (result < 0 && errno == EINTR);
+    return result;
+  }
+
+  int reap(pid_t pid) {
+    int status = -1;
+    if (Wait(pid, &status, 0) == pid) {
+      pids_.erase(std::find(pids_.begin(), pids_.end(), pid));
+    }
+    return status;
+  }
+
+ private:
+  std::vector<pid_t> pids_;
+};
+
+class Pipe {
+ public:
+  Pipe() {
+    if (::pipe(fds_) < 0) throw std::runtime_error("pipe failed");
+  }
+  ~Pipe() {
+    ::close(fds_[0]);
+    ::close(fds_[1]);
+  }
+  int reader() const { return fds_[0]; }
+  int writer() const { return fds_[1]; }
+
+ private:
+  int fds_[2];
+};
+
+bool read_all(int fd, void* destination, std::size_t size) {
+  auto* bytes = static_cast<char*>(destination);
+  while (size != 0) {
+    const ssize_t count = ::read(fd, bytes, size);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    bytes += count;
+    size -= static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
+bool write_all(int fd, const void* source, std::size_t size) {
+  const auto* bytes = static_cast<const char*>(source);
+  while (size != 0) {
+    const ssize_t count = ::write(fd, bytes, size);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    bytes += count;
+    size -= static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
+TEST_F(Registry, KilledInitializerIsRecoveredByTheNextWriter) {
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    const RegistryTestHooks hooks{.initializing = [](RegistryHeader* header) {
+      // Leave partial metadata and slot residue, not just an empty header.
+      header->node_capacity = 999;
+      header->nodes[0].state.store(
+          static_cast<std::uint64_t>(SlotState::CLAIMING));
+      ::raise(SIGSTOP);
+    }};
+    try {
+      RegistryMapping mapping{path_, false, &hooks};
+      ::_exit(1);  // The parent must kill us before initialization commits.
+    } catch (...) {
+      ::_exit(2);
+    }
+  }
+  children.add(pid);
+  int status = 0;
+  ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
+  ASSERT_TRUE(WIFSTOPPED(status));
+  ASSERT_EQ(WSTOPSIG(status), SIGSTOP);
+  ASSERT_EQ(::kill(pid, SIGKILL), 0);
+  status = children.reap(pid);
+  ASSERT_TRUE(WIFSIGNALED(status));
+  ASSERT_EQ(WTERMSIG(status), SIGKILL);
+
+  // A read-only observer cannot publish initialization on a writer's behalf.
+  EXPECT_THROW((RegistryMapping{path_, true}), std::runtime_error);
+  NodeRegistration registration{{.name = "recovered"}, path_};
+  RegistryMapping mapping{path_};
+  EXPECT_EQ(mapping.header()->node_capacity, kMaxNodes);
+  EXPECT_EQ(mapping.header()->magic.load(), kMagic);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().name, "recovered");
+  EXPECT_TRUE(nodes.front().alive);
+}
+
+TEST_F(Registry, KilledClaimantDoesNotConsumeAnyOfThe32Slots) {
+  RegistryMapping mapping{path_};
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    const RegistryTestHooks hooks{
+        .claiming = [](NodeRecord*) { ::raise(SIGSTOP); }};
+    try {
+      NodeRegistration registration{{.name = "killed"}, path_, &hooks};
+      ::_exit(1);
+    } catch (...) {
+      ::_exit(2);
+    }
+  }
+  children.add(pid);
+  int status = 0;
+  ASSERT_EQ(Children::Wait(pid, &status, WUNTRACED), pid);
+  ASSERT_TRUE(WIFSTOPPED(status));
+  ASSERT_EQ(WSTOPSIG(status), SIGSTOP);
+  EXPECT_EQ(mapping.header()->nodes[0].state.load(),
+            static_cast<std::uint64_t>(SlotState::CLAIMING));
+  // The kill is before even the claimant pid/heartbeat is recorded.
+  EXPECT_EQ(mapping.header()->nodes[0].pid, 0u);
+  ASSERT_EQ(::kill(pid, SIGKILL), 0);
+  status = children.reap(pid);
+  ASSERT_TRUE(WIFSIGNALED(status));
+  ASSERT_EQ(WTERMSIG(status), SIGKILL);
+
+  std::vector<std::unique_ptr<NodeRegistration>> registrations;
+  for (std::size_t i = 0; i < kMaxNodes; ++i) {
+    registrations.push_back(std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "node" + std::to_string(i)}, path_));
+    EXPECT_EQ(registrations.back()->slot(), i);
+  }
+  EXPECT_THROW(NodeRegistration({.name = "overflow"}, path_),
+               std::runtime_error);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->nodes().size(), kMaxNodes);
+}
+
+TEST_F(Registry, ConcurrentProcessesNeverReceiveTheSameSlot) {
+  constexpr std::size_t kProcesses = 8;
+  constexpr std::size_t kClaimsPerProcess = kMaxNodes / kProcesses;
+  Pipe start;
+  Pipe results;
+  Pipe finish;
+  Children children;
+  std::array<pid_t, kProcesses> pids{};
+  for (std::size_t process = 0; process < kProcesses; ++process) {
+    const pid_t pid = ::fork();
+    ASSERT_GE(pid, 0);
+    if (pid == 0) {
+      char token;
+      if (!read_all(start.reader(), &token, 1)) ::_exit(2);
+      std::array<std::size_t, kClaimsPerProcess> slots;
+      slots.fill(kMaxNodes);  // Report failure instead of blocking the parent.
+      std::vector<std::unique_ptr<NodeRegistration>> registrations;
+      try {
+        for (std::size_t i = 0; i < kClaimsPerProcess; ++i) {
+          registrations.push_back(std::make_unique<NodeRegistration>(
+              NodeRegistration::Identity{.name = "node" +
+                                                 std::to_string(process) + "_" +
+                                                 std::to_string(i)},
+              path_));
+          slots[i] = registrations.back()->slot();
+        }
+      } catch (...) {
+        slots.fill(
+            kMaxNodes);  // Explicitly report a failed claim to the parent.
+      }
+      // One pipe-atomic report; registrations stay alive until all reports
+      // have been checked, so releasing a slot cannot hide double assignment.
+      if (!write_all(results.writer(), slots.data(), sizeof(slots))) ::_exit(3);
+      if (!read_all(finish.reader(), &token, 1)) ::_exit(4);
+      registrations.clear();
+      ::_exit(0);
+    }
+    children.add(pid);
+    pids[process] = pid;
+  }
+  const std::array<char, kProcesses> tokens{};
+  ASSERT_TRUE(write_all(start.writer(), tokens.data(), tokens.size()));
+  std::array<bool, kMaxNodes> seen{};
+  for (std::size_t process = 0; process < kProcesses; ++process) {
+    std::array<std::size_t, kClaimsPerProcess> slots{};
+    ASSERT_TRUE(read_all(results.reader(), slots.data(), sizeof(slots)));
+    for (const std::size_t slot : slots) {
+      ASSERT_LT(slot, kMaxNodes);
+      EXPECT_FALSE(seen[slot]) << "slot " << slot << " assigned twice";
+      seen[slot] = true;
+    }
+  }
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->nodes().size(), kMaxNodes);
+  EXPECT_THROW(NodeRegistration({.name = "overflow"}, path_),
+               std::runtime_error);
+  ASSERT_TRUE(write_all(finish.writer(), tokens.data(), tokens.size()));
+  for (const pid_t pid : pids) {
+    const int status = children.reap(pid);
+    ASSERT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+  }
+  EXPECT_TRUE(reader->nodes().empty());
+}
 
 event::Manifest sample_manifest() {
   event::Manifest manifest;
@@ -58,50 +297,6 @@ event::Manifest sample_manifest() {
                       .message_bytes = 64,
                       .alignment = 8});
   return manifest;
-}
-
-TEST_F(Registry, PublishesTopologyAndCountersToAReader) {
-  NodeRegistration registration{
-      {.name = "odometry", .target = "//2026-robot:odometry", .session_id = 7},
-      path_};
-  registration.publish(sample_manifest());
-  registration.set_dispatch_count(99);
-  registration.set_source(2, /*events=*/12, /*dropped=*/1, /*sequence=*/11,
-                          /*last_monotonic_ns=*/1234, /*last_latency_ns=*/56,
-                          /*max_latency_ns=*/78);
-
-  auto reader = RegistryReader::open(path_);
-  if (!reader.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = reader.value();
-
-  const auto nodes = registry.nodes();
-  ASSERT_EQ(nodes.size(), 1u);
-  const NodeSnapshot& node = nodes.front();
-
-  EXPECT_EQ(node.name, "odometry");
-  EXPECT_EQ(node.target, "//2026-robot:odometry");
-  EXPECT_EQ(node.session_id, 7u);
-  EXPECT_EQ(node.pid, static_cast<std::uint64_t>(::getpid()));
-  EXPECT_EQ(node.dispatch_count, 99u);
-  EXPECT_TRUE(node.alive);
-  ASSERT_EQ(node.sources.size(), 3u);
-
-  EXPECT_EQ(node.sources[0].kind, event::SourceKind::TIMER);
-  EXPECT_EQ(node.sources[0].name, "tick");
-  EXPECT_EQ(node.sources[0].period_ns, 5'000'000);
-
-  EXPECT_EQ(node.sources[1].kind, event::SourceKind::WATCHER);
-  EXPECT_EQ(node.sources[1].name, "/drivetrain/state");
-  EXPECT_EQ(node.sources[1].message_bytes, 48u);
-
-  EXPECT_EQ(node.sources[2].kind, event::SourceKind::SENDER);
-  EXPECT_EQ(node.sources[2].name, "/odometry/state");
-  EXPECT_EQ(node.sources[2].events, 12u);
-  EXPECT_EQ(node.sources[2].dropped, 1u);
-  EXPECT_EQ(node.sources[2].sequence, 11u);
-  EXPECT_EQ(node.sources[2].max_latency_ns, 78);
 }
 
 // What Reporter::Selection carries into publish_selections: a policy's
@@ -192,34 +387,58 @@ TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
   EXPECT_EQ(nodes.front().declared_selection_count, 0u);
 }
 
-TEST_F(Registry, SeveralNodesCoexistAndAReleasedSlotDisappears) {
-  auto reader = [this] {
-    NodeRegistration first{{.name = "a"}, path_};
-    first.publish(sample_manifest());
-    {
-      NodeRegistration second{{.name = "b"}, path_};
-      second.publish({});
-      auto view = RegistryReader::open(path_);
-      EXPECT_EQ(view->nodes().size(), 2u);
-    }
-    // `second` released its slot; `first` must still be there and must not
-    // have been disturbed by the neighbour coming and going.
-    auto view = RegistryReader::open(path_);
-    const auto nodes = view->nodes();
-    EXPECT_EQ(nodes.size(), 1u);
-    EXPECT_EQ(nodes.front().name, "a");
-    EXPECT_EQ(nodes.front().sources.size(), 3u);
-    return true;
-  }();
-  EXPECT_TRUE(reader);
+TEST_F(Registry, ReclaimedSlotRejectsUpdatesFromItsPreviousOwner) {
+  auto old = std::make_unique<NodeRegistration>(
+      NodeRegistration::Identity{.name = "old"}, path_);
+  old->publish(sample_manifest());
+  old->publish_selections(std::vector<Policy>{{{"teleop", "auto"}}});
+  RegistryMapping mapping{path_};
+  NodeRecord& slot = mapping.header()->nodes[old->slot()];
+  const auto timeout =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
+          .count();
+  slot.heartbeat_monotonic_ns.store(monotonic_now_ns() - timeout - 1,
+                                    std::memory_order_relaxed);
 
-  // Both registrations are gone now, so the registry is empty but still valid.
-  auto view = RegistryReader::open(path_);
-  if (!view.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = view.value();
-  EXPECT_TRUE(registry.nodes().empty());
+  NodeRegistration next{{.name = "new"}, path_};
+  ASSERT_EQ(next.slot(), old->slot());
+  next.publish(sample_manifest());
+  next.publish_selections(std::vector<Policy>{{{"teleop", "auto"}}});
+  next.set_dispatch_count(42);
+  next.set_source(0, 1, 2, 3, 4, 5, 6);
+  next.set_selected(0, 1);
+  const auto heartbeat =
+      slot.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+  const auto sequence = slot.sample_seq.load(std::memory_order_relaxed);
+
+  old->begin_sample();
+  EXPECT_EQ(slot.sample_seq.load(std::memory_order_relaxed), sequence);
+  old->heartbeat();
+  old->set_dispatch_count(999);
+  old->set_source(0, 999, 999, 999, 999, 999, 999);
+  old->set_selected(0, 0);
+  old->end_sample();
+  old.reset();  // Destruction must not free the reclaimed slot either.
+
+  EXPECT_EQ(slot.sample_seq.load(std::memory_order_relaxed), sequence);
+  EXPECT_EQ(slot.heartbeat_monotonic_ns.load(std::memory_order_relaxed),
+            heartbeat);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().name, "new");
+  EXPECT_EQ(nodes.front().dispatch_count, 42u);
+  ASSERT_EQ(nodes.front().sources.size(), 3u);
+  const auto& source = nodes.front().sources.front();
+  EXPECT_EQ(source.events, 1u);
+  EXPECT_EQ(source.dropped, 2u);
+  EXPECT_EQ(source.sequence, 3u);
+  EXPECT_EQ(source.last_monotonic_ns, 4);
+  EXPECT_EQ(source.last_latency_ns, 5);
+  EXPECT_EQ(source.max_latency_ns, 6);
+  ASSERT_EQ(nodes.front().selections.size(), 1u);
+  EXPECT_EQ(nodes.front().selections.front().selected, 1);
 }
 
 TEST_F(Registry, ReaderReportsNothingBeforeAnyNodeStarts) {
@@ -239,8 +458,8 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
       std::chrono::duration_cast<std::chrono::nanoseconds>(kLivenessTimeout)
           .count();
   RegistryMapping mapping{path_};
-  mapping.header()->nodes[ghost->slot()].heartbeat_wall_ns.store(
-      wall_now_ns() - timeout_ns - 1, std::memory_order_relaxed);
+  mapping.header()->nodes[ghost->slot()].heartbeat_monotonic_ns.store(
+      monotonic_now_ns() - timeout_ns - 1, std::memory_order_relaxed);
 
   {
     auto stale = RegistryReader::open(path_);
@@ -272,6 +491,238 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
   EXPECT_EQ(after.front().session_id, 1788u);
 }
 
+// A killed node's row is freed by the next claim, not once its heartbeat is
+// kLivenessTimeout old: a crash-looping roster leaves one row per run, and
+// those rows must not fill the registry for the restarts that follow.
+TEST_F(Registry, ADeadClaimantsRowIsFreedByTheNextClaim) {
+  Pipe ready;
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    try {
+      NodeRegistration registration{{.name = "killed"}, path_};
+      const char token = 1;
+      if (!write_all(ready.writer(), &token, 1)) ::_exit(2);
+      for (;;) ::pause();
+    } catch (...) {
+      ::_exit(1);
+    }
+  }
+  children.add(pid);
+  char token = 0;
+  ASSERT_TRUE(read_all(ready.reader(), &token, 1));
+  ASSERT_EQ(::kill(pid, SIGKILL), 0);
+  children.reap(pid);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  ASSERT_EQ(reader->nodes().size(), 1u);
+  EXPECT_TRUE(reader->nodes().front().alive) << "the heartbeat is still fresh";
+
+  std::vector<std::unique_ptr<NodeRegistration>> registrations;
+  for (std::size_t i = 0; i < kMaxNodes; ++i) {
+    registrations.push_back(std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "node" + std::to_string(i)}, path_));
+  }
+  const auto nodes = reader->nodes();
+  EXPECT_EQ(nodes.size(), kMaxNodes);
+  EXPECT_TRUE(std::none_of(nodes.begin(), nodes.end(),
+                           [](const auto& n) { return n.name == "killed"; }));
+}
+
+// A node in another pid namespace that shares /dev/shm (a container run with
+// --ipc=host) has a pid that names another process, or none, in this one. Its
+// row must survive this namespace's sweep while its heartbeat is fresh, or a
+// live node loses its row to every claim on the host. The node runs as pid 1
+// of a new pid namespace with its own /proc, as in a container; where this
+// process may not create one, the test is skipped.
+TEST_F(Registry, AClaimantInAnotherPidNamespaceKeepsItsRow) {
+#if !defined(__linux__)
+  GTEST_SKIP() << "pid namespaces are Linux-only";
+#else
+  Pipe forked;
+  Pipe ready;
+  Children children;
+  const pid_t outer = ::fork();
+  ASSERT_GE(outer, 0);
+  if (outer == 0) {
+    // Unprivileged where user namespaces allow it, else as root.
+    if (::unshare(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNS) != 0 &&
+        ::unshare(CLONE_NEWPID | CLONE_NEWNS) != 0) {
+      const std::int32_t error = -errno;
+      ::_exit(write_all(forked.writer(), &error, sizeof(error)) ? 0 : 2);
+    }
+    const pid_t node = ::fork();
+    if (node == 0) {
+      ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+      // Best effort: without its own /proc the node cannot check pids, but
+      // its row is still recorded from the new namespace.
+      if (::mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0) {
+        ::mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                nullptr);
+      }
+      char token = 0;
+      try {
+        NodeRegistration registration{{.name = "contained"}, path_};
+        token = 1;
+        if (!write_all(ready.writer(), &token, 1)) ::_exit(2);
+        for (;;) ::pause();
+      } catch (...) {
+        write_all(ready.writer(), &token, 1);
+        ::_exit(1);
+      }
+    }
+    const std::int32_t sent = node;
+    if (node < 0 || !write_all(forked.writer(), &sent, sizeof(sent))) {
+      ::_exit(2);
+    }
+    int status = 0;
+    while (::waitpid(node, &status, 0) < 0 && errno == EINTR) {
+    }
+    ::_exit(0);
+  }
+  children.add(outer);
+  std::int32_t node = 0;
+  ASSERT_TRUE(read_all(forked.reader(), &node, sizeof(node)));
+  if (node < 0) {
+    children.reap(outer);
+    GTEST_SKIP() << "cannot create a pid namespace: errno " << -node;
+  }
+  char token = 0;
+  const bool registered = read_all(ready.reader(), &token, 1) && token == 1;
+  if (!registered) ::kill(node, SIGKILL);
+  ASSERT_TRUE(registered) << "the contained node did not register";
+
+  // This claim sweeps the registry from this namespace.
+  NodeRegistration host{{.name = "host"}, path_};
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto nodes = reader->nodes();
+  ::kill(node, SIGKILL);
+  EXPECT_EQ(nodes.size(), 2u);
+  EXPECT_TRUE(std::any_of(nodes.begin(), nodes.end(), [](const auto& n) {
+    return n.name == "contained" && n.alive;
+  })) << "the live contained node's row was swept";
+#endif
+}
+
+// The launcher prepares the registry before it starts a node. Created under a
+// service's restrictive umask, the segment and its writer lock file still get
+// the modes another user's nodes and tools need, and a node registers in it.
+TEST_F(Registry, PreparedRegistryIsOpenableWhateverTheUmask) {
+  const std::string mapped = ShmObjectName(path_);
+  const std::string lock = LockFilePath(mapped);
+  ::unlink(lock.c_str());  // An earlier test's file has its mode already.
+  const mode_t previous = ::umask(077);
+  PrepareRegistry(path_);
+  ::umask(previous);
+
+  const int fd = ::shm_open(mapped.c_str(), O_RDONLY, 0);
+  ASSERT_GE(fd, 0);
+  struct stat segment {};
+  ASSERT_EQ(::fstat(fd, &segment), 0);
+  ::close(fd);
+  EXPECT_EQ(segment.st_mode & 0777, kRegistryMode);
+  struct stat file {};
+  ASSERT_EQ(::stat(lock.c_str(), &file), 0);
+  EXPECT_EQ(file.st_mode & 0777, kLockFileMode);
+
+  NodeRegistration registration{{.name = "node"}, path_};
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_EQ(reader->nodes().size(), 1u);
+}
+
+// A writer that wins the lock on a file a /tmp cleaner unlinked while it
+// waited takes the lock again on the file the path now names, so a writer
+// opening the path anew is still excluded. A Bazel test's lock files live in
+// its TEST_TMPDIR, which Bazel removes, rather than accumulating in /dev/shm.
+TEST_F(Registry, AWriterNeverHoldsAnUnlinkedLockFile) {
+  const std::string mapped = ShmObjectName(path_);
+  const std::string lock = LockFilePath(mapped);
+  const char* test_tmpdir = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(test_tmpdir, nullptr);
+  EXPECT_TRUE(lock.starts_with(std::string{test_tmpdir} + "/")) << lock;
+  int holder = OpenLockFile(lock, O_RDONLY);
+  ASSERT_GE(holder, 0);
+  ASSERT_EQ(::flock(holder, LOCK_EX), 0);
+  std::atomic<bool> locked{false};
+  std::atomic<bool> release{false};
+  std::jthread waiter{[&] {
+    const RegistryLock writer{mapped};
+    locked = true;
+    // Released once the main thread has tried the path's file.
+    while (!release) std::this_thread::sleep_for(1ms);
+  }};
+  // Destroyed before `waiter` joins, so a failed ASSERT below unblocks the
+  // waiter (its lock freed, its hold released) instead of hanging the test.
+  struct Unblock {
+    int& holder;
+    std::atomic<bool>& release;
+    ~Unblock() {
+      if (holder >= 0) ::close(holder);
+      release = true;
+    }
+  } unblock{holder, release};
+  std::this_thread::sleep_for(100ms);  // The waiter blocks on `holder`'s file.
+  ASSERT_EQ(::unlink(lock.c_str()), 0);
+  ::close(holder);
+  // Read by `unblock`'s destructor, which the analyzer cannot see.
+  holder = -1;  // NOLINT(clang-analyzer-deadcode.DeadStores)
+  while (!locked) std::this_thread::sleep_for(1ms);
+  const int newcomer = OpenLockFile(lock, O_RDONLY);
+  ASSERT_GE(newcomer, 0);
+  EXPECT_NE(::flock(newcomer, LOCK_EX | LOCK_NB), 0);
+  ::close(newcomer);
+}
+
+// A registry this user cannot write -- another user's, created 0644 -- would
+// leave every node unregistered and killed; preparing it refuses, naming it.
+TEST_F(Registry, AnUnwritableRegistryRefusesPreparation) {
+  if (::geteuid() == 0) GTEST_SKIP() << "root writes any segment";
+  const std::string mapped = ShmObjectName(path_);
+  const int fd = ::shm_open(mapped.c_str(), O_CREAT | O_EXCL | O_RDWR, 0444);
+  ASSERT_GE(fd, 0);
+  ::close(fd);
+  try {
+    PrepareRegistry(path_);
+    ADD_FAILURE() << "an unwritable registry was accepted";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string{e.what()}.find(mapped), std::string::npos)
+        << e.what();
+  }
+}
+
+TEST_F(Registry, HeartbeatAndSweepUseHostMonotonicTime) {
+  const auto before = monotonic_now_ns();
+  NodeRegistration healthy{{.name = "healthy"}, path_};
+  healthy.heartbeat();
+  const auto after = monotonic_now_ns();
+  RegistryMapping mapping{path_};
+  NodeRecord& row = mapping.header()->nodes[healthy.slot()];
+  const auto beat = row.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+  EXPECT_GE(beat, before);
+  EXPECT_LE(beat, after);
+
+  // Human-facing wall timestamps may be arbitrarily far in either direction.
+  // A claim sweeps existing rows; neither that sweep nor reader liveness may
+  // mistake the monotonic heartbeat for a wall-clock timestamp.
+  for (const auto wall : {int64_t{0}, int64_t{8'000'000'000'000'000'000}}) {
+    row.start_wall_ns = wall;
+    NodeRegistration newcomer{{.name = "newcomer"}, path_};
+    EXPECT_NE(newcomer.slot(), healthy.slot());
+    auto reader = RegistryReader::open(path_);
+    ASSERT_TRUE(reader.has_value());
+    const auto nodes = reader->nodes();
+    const auto found =
+        std::find_if(nodes.begin(), nodes.end(),
+                     [](const auto& n) { return n.name == "healthy"; });
+    ASSERT_NE(found, nodes.end());
+    EXPECT_TRUE(found->alive);
+    EXPECT_EQ(found->heartbeat_monotonic_ns, beat);
+  }
+}
+
 TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
   event::Manifest manifest;
   for (std::size_t i = 0; i < kMaxSourcesPerNode + 5; ++i) {
@@ -294,42 +745,216 @@ TEST_F(Registry, SourcesBeyondCapacityAreCountedButNotStored) {
   EXPECT_EQ(nodes.front().declared_source_count, manifest.size());
 }
 
-TEST_F(Registry, RefusesToRegisterMoreNodesThanTheSegmentHolds) {
-  std::vector<std::unique_ptr<NodeRegistration>> held;
-  for (std::size_t i = 0; i < kMaxNodes; ++i) {
-    held.push_back(std::make_unique<NodeRegistration>(
-        NodeRegistration::Identity{.name = "n" + std::to_string(i)}, path_));
-    held.back()->publish({});
-  }
-  // Every slot is claimed and every one is heartbeating, so a further node is
-  // refused rather than stealing a live slot.
-  EXPECT_THROW(NodeRegistration({.name = "overflow"}, path_),
-               std::runtime_error);
+// The launcher's stall check reads the row's dispatch count as the loop's
+// progress. The loop thread stores it at every dispatch, so a reporting thread
+// that cannot run -- starved below the realtime loops of a loaded host; here
+// blocked in a selection callback mid-sample -- leaves it current. Before, the
+// reporting thread copied it every 10 ms, and a starved one froze the row of
+// a loop that kept time until the launcher killed the node as stalled.
+TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "progress", &handler);
+  std::atomic<bool> hold{true};
+  std::atomic<bool> held{false};
+  Reporter reporter{{.name = "starved",
+                     .selections = {{.sources = {"teleop"},
+                                     .selected =
+                                         [&] {
+                                           held = true;
+                                           while (hold) {
+                                             std::this_thread::sleep_for(1ms);
+                                           }
+                                           return 0;
+                                         }}},
+                     .registry_path = path_}};
+  reporter.start(loop);
+  RegistryReader reader{path_};
+  const auto row = [&] {
+    const auto nodes = reader.nodes();
+    return nodes.size() == 1 ? nodes.front().dispatch_count : 0;
+  };
+  std::optional<std::uint64_t> at_hold;
+  int ticks_held = 0;
+  std::uint64_t after = 0;
+  std::uint64_t loop_count = 0;
+  handler.on_tick = [&] {
+    if (!held) return;
+    if (!at_hold) {
+      at_hold = row();
+      return;
+    }
+    // 100 ticks of 2 ms: longer than a 300 ms pause plus the old cadence
+    // needed to reach the launcher's 500 ms floor, at a fraction of the cost.
+    if (++ticks_held < 100) return;
+    after = row();
+    loop_count = loop.dispatch_count();
+    hold = false;
+    loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+  loop.run_for(5s);  // Bound only; exits once the reporter has been held.
+  hold = false;
 
-  held.pop_back();
-  EXPECT_NO_THROW(NodeRegistration({.name = "fits_now"}, path_));
+  ASSERT_TRUE(held) << reporter.error();
+  ASSERT_TRUE(at_hold) << "the loop never ticked with the reporter held";
+  EXPECT_GE(after, *at_hold + 100);
+  EXPECT_EQ(after, loop_count);
+}
+
+// A control loop the OS kept at timeshare must be visible to the launcher and
+// session_report, which read only the row: the tier, that it asked, and which
+// step the OS refused, beside the event log flags. A row whose node has not
+// asked yet reads as unreported, never as a full grant.
+TEST_F(Registry, ARefusedRealtimeGrantIsVisibleInTheRow) {
+  NodeRegistration registration{{.name = "lift", .flags = kFlagSimulation},
+                                path_};
+  registration.publish(sample_manifest());
+  registration.set_recording(/*failed=*/false, /*capped=*/true);
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto row = [&reader] {
+    const auto nodes = reader->nodes();
+    EXPECT_EQ(nodes.size(), 1u);
+    return nodes.front();
+  };
+  EXPECT_EQ(row().realtime(), std::nullopt);
+
+  registration.set_realtime(
+      {.tier = process::LoopTier::kControl,
+       .requested = true,
+       .refused = process::kStepPolicy | process::kStepRingLock});
+  const NodeSnapshot node = row();
+  ASSERT_TRUE(node.realtime().has_value());
+  EXPECT_EQ(node.realtime()->tier, process::LoopTier::kControl);
+  EXPECT_EQ(node.realtime()->grant(), process::RealtimeGrant::kRefused);
+  EXPECT_EQ(process::RefusedStepNames(node.realtime()->refused),
+            "policy, ring mlock");
+  EXPECT_NE(node.flags & kFlagSimulation, 0u);
+  EXPECT_NE(node.flags & kFlagLogCapped, 0u);
+  EXPECT_EQ(node.flags & kFlagRecorderFailed, 0u);
+}
+
+// A notification its writer could not send -- here no descriptor is left for
+// the sender's socket -- leaves the reader asleep until its backstop, and the
+// row is the only place outside the process that can say why: the reporter
+// copies the loop's count there, where the launcher and Studio read it
+// (TODO.md RT-7). The descriptor limit is lowered in a child, which owns the
+// whole scenario: a loop sending on a topic whose reader, in the same child,
+// is armed on a receiver.
+// REQ-RT-19, REQ-OPS-18
+TEST_F(Registry, AWakeItsWriterCouldNotSendIsCountedInTheRow) {
+  const std::string topic = "/waker/state/p" + std::to_string(::getpid());
+  Children children;
+  const pid_t pid = ::fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    int code = 1;
+    try {
+      event::RealtimeEventLoop<> loop;
+      struct Handler {
+        std::function<void()> on_tick;
+        void OnTick(const event::Context&) { on_tick(); }
+      } handler;
+      auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+      const std::uint16_t sender = loop.register_sender(
+          topic, sizeof(std::uint64_t), alignof(std::uint64_t), kCountSchema);
+      RTMSQueue subscriber{topic,
+                           sizeof(std::uint64_t),
+                           alignof(std::uint64_t),
+                           kCountSchema,
+                           MAX_SLOTS,
+                           {.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                            .read_mode = ReadMode::SEQUENCE}};
+      const auto reader = subscriber.register_reader();
+      WakeReceiver receiver;
+      Reporter reporter{
+          {.name = "waker", .period = 10ms, .registry_path = path_}};
+      RegistryReader rows{path_};
+      reporter.start(loop);
+      rlimit limit{};
+      bool sent = false;
+      code = 2;
+      handler.on_tick = [&] {
+        if (!sent) {
+          // The lowest free descriptor: with the soft limit there, the
+          // sender's socket cannot open. Raised again at once, so nothing
+          // else in the child is refused one.
+          const int lowest = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+          if (!reader || lowest < 0 || ::close(lowest) != 0 ||
+              ::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            loop.exit();
+            return;
+          }
+          subscriber.set_reader_wake(*reader, receiver.id());
+          const rlimit lowered{.rlim_cur = static_cast<rlim_t>(lowest),
+                               .rlim_max = limit.rlim_max};
+          const std::uint64_t value = 1;
+          sent =
+              subscriber.arm_wake(*reader) &&
+              ::setrlimit(RLIMIT_NOFILE, &lowered) == 0 &&
+              loop.send_message(sender, std::as_bytes(std::span{&value, 1})) &&
+              ::setrlimit(RLIMIT_NOFILE, &limit) == 0;
+          if (!sent) loop.exit();
+          code = 3;
+          return;
+        }
+        const auto nodes = rows.nodes();
+        if (nodes.size() == 1 && nodes.front().delivery_loss().any()) {
+          const DeliveryLoss loss = nodes.front().delivery_loss();
+          code = loss.wake_failures == 1 && loss.stalled_arms == 0 &&
+                         loss.wake_fallbacks == 0 && loss.requests_skipped == 0
+                     ? 0
+                     : 5;
+          loop.exit();
+        }
+      };
+      timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+      loop.run_for(5s);  // Bound only; exits once the row shows the count.
+    } catch (...) {
+      code = 4;
+    }
+    ::_exit(code);
+  }
+  children.add(pid);
+  const int status = children.reap(pid);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0)
+      << "2: setup, 3: the row never showed the failed wake, 4: threw, "
+         "5: the row counted something else";
 }
 
 TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   const std::string topic = "/probe/state/p" + std::to_string(::getpid());
   const std::string feed = "/probe/telemetry/p" + std::to_string(::getpid());
+  const std::string watched = "/probe/status/p" + std::to_string(::getpid());
   event::RealtimeEventLoop<> loop;
 
   struct Handler {
     std::uint64_t fired{0};
-    void OnTick(const event::Context&) { ++fired; }
+    std::function<void()> after_tick;
+    void OnTick(const event::Context&) {
+      ++fired;
+      if (after_tick) after_tick();
+    }
   } handler;
 
   auto timer =
       event::make_timer<&Handler::OnTick>(loop, "introspect_tick", &handler);
   const std::uint16_t sender = loop.register_sender(
       topic, /*message_bytes=*/8, /*alignment=*/8, kCountSchema);
+  // No callback, so latest-only: its dropped count includes skips by design.
+  const std::uint16_t latest =
+      loop.register_watcher(watched, /*message_bytes=*/8, /*alignment=*/8,
+                            kCountSchema, event::Thunk{});
   const std::size_t sources_before = loop.manifest().size();
   // What the node's Target last selected: index 1, "auto".
   std::atomic<std::int32_t> selected{1};
 
   Reporter reporter{
-      loop,
       {.name = "probe",
        .target = "//talOS/introspection:registry_test",
        .session_id = 42,
@@ -347,22 +972,50 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
                        .selected = [&selected] { return selected.load(); }}},
        .period = 20ms,
        .registry_path = path_}};
+  {
+    RegistryReader reader{path_};
+    const auto nodes = reader.nodes();
+    ASSERT_EQ(nodes.size(), 1u);
+    EXPECT_TRUE(nodes.front().flags & kFlagConstructing);
+    EXPECT_FALSE(nodes.front().alive);
+    EXPECT_EQ(nodes.front().pid, static_cast<std::uint64_t>(::getpid()));
+    EXPECT_EQ(nodes.front().session_id, 42u);
+    EXPECT_TRUE(nodes.front().sources.empty());
+    const auto first_beat = nodes.front().heartbeat_monotonic_ns;
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (reader.nodes().front().heartbeat_monotonic_ns == first_beat &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(2ms);
+    }
+    EXPECT_GT(reader.nodes().front().heartbeat_monotonic_ns, first_beat);
+  }
+  reporter.start(loop);
 
+  // Read the registry while the loop still runs: once it stops, the reporter
+  // releases the row, and a loaded host may get there before the test reads.
+  std::optional<std::vector<NodeSnapshot>> live;
+  handler.after_tick = [&] {
+    if (live || handler.fired < 20 || !reporter.published()) return;
+    auto reader = RegistryReader::open(path_);
+    if (!reader) return;
+    auto nodes = reader->nodes();
+    if (nodes.size() == 1 && nodes.front().dispatch_count > 0 &&
+        nodes.front().sources.size() == 4 &&
+        nodes.front().sources[0].events > 0) {
+      live = std::move(nodes);
+      loop.exit();
+    }
+  };
   timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
-  loop.run_for(220ms);
+  loop.run_for(5s);  // Bound only; exits as soon as a sample is visible.
 
   // Introspection must not appear in the manifest: it would change every
   // source id and make existing logs unreplayable.
   EXPECT_EQ(loop.manifest().size(), sources_before);
   ASSERT_TRUE(reporter.published()) << reporter.error();
   EXPECT_GT(handler.fired, 0u);
-
-  auto reader = RegistryReader::open(path_);
-  if (!reader.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = reader.value();
-  const auto nodes = registry.nodes();
+  ASSERT_TRUE(live) << "no registry sample while the loop ran";
+  const auto& nodes = *live;
   ASSERT_EQ(nodes.size(), 1u);
   const NodeSnapshot& node = nodes.front();
 
@@ -372,7 +1025,7 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_TRUE(node.alive);
   EXPECT_GT(node.dispatch_count, 0u);
 
-  ASSERT_EQ(node.sources.size(), 3u);
+  ASSERT_EQ(node.sources.size(), 4u);
   EXPECT_EQ(node.sources[0].kind, event::SourceKind::TIMER);
   EXPECT_EQ(node.sources[0].name, "introspect_tick");
   EXPECT_GT(node.sources[0].events, 0u);
@@ -388,15 +1041,104 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
   EXPECT_EQ(node.sources[1].events, 0u);
   EXPECT_TRUE(node.sources[1].external());
   EXPECT_FALSE(node.sources[1].optional());
+  EXPECT_FALSE(node.sources[1].latest_only());
 
-  EXPECT_EQ(node.sources[2].name, feed);
-  EXPECT_TRUE(node.sources[2].optional());
-  EXPECT_FALSE(node.sources[2].external());
+  // Only the loop knows which watchers skip to the newest message; the
+  // reporter publishes it so a viewer does not call those skips loss.
+  EXPECT_EQ(node.sources[2].id, latest);
+  EXPECT_EQ(node.sources[2].flags, naming::kSourceFlagLatestOnly);
+
+  EXPECT_EQ(node.sources[3].name, feed);
+  EXPECT_TRUE(node.sources[3].optional());
+  EXPECT_FALSE(node.sources[3].external());
 
   ASSERT_EQ(node.selections.size(), 1u);
   EXPECT_EQ(node.selections[0].sources,
             (std::vector<std::string>{"teleop", "auto"}));
   EXPECT_EQ(node.selections[0].selected_source(), "auto");
+}
+
+// While its loop runs, a node's reporting thread wakes once per refresh and
+// for nothing else: it used to wake every 10 ms to look for the loop's end,
+// 100 wakeups/s in every process, which a host running many nodes pays for.
+// Each refresh still moves the heartbeat, which keeps the row alive
+// (kLivenessTimeout). The loop runs until the heartbeat has moved twice and
+// half a second has passed since the row was published.
+// REQ-RT-21
+TEST_F(Registry, ARunningReporterWakesOnlyToRefresh) {
+  constexpr auto kPeriod = 50ms;
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+  Reporter reporter{
+      {.name = "quiet", .period = kPeriod, .registry_path = path_}};
+  reporter.start(loop);
+  RegistryReader reader{path_};
+  const auto heartbeat = [&] {
+    const auto nodes = reader.nodes();
+    return nodes.size() == 1 ? nodes.front().heartbeat_monotonic_ns : 0;
+  };
+  std::optional<std::chrono::steady_clock::time_point> since;
+  std::uint64_t wakeups_before = 0;
+  std::uint64_t wakeups = 0;
+  std::int64_t last_beat = 0;
+  int beats = 0;
+  std::chrono::steady_clock::duration window{};
+  handler.on_tick = [&] {
+    if (!reporter.published()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!since) {
+      since = now;
+      wakeups_before = reporter.wakeups();
+      last_beat = heartbeat();
+      return;
+    }
+    if (const std::int64_t beat = heartbeat(); beat != last_beat) {
+      last_beat = beat;
+      ++beats;
+    }
+    if (beats < 2 || now - *since < 500ms) return;
+    wakeups = reporter.wakeups() - wakeups_before;
+    window = now - *since;
+    loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 5ms);
+  loop.run_for(10s);  // Bound only; exits after two refreshes.
+
+  ASSERT_GE(beats, 2) << "the heartbeat stopped moving while the loop ran";
+  // One wake per period, and one more at each end of the window.
+  const auto allowed = static_cast<std::uint64_t>(window / kPeriod) + 2;
+  EXPECT_LE(wakeups, allowed)
+      << "over "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(window).count()
+      << " ms at a " << kPeriod.count() << " ms refresh";
+}
+
+// talos::Run stops its reporter as soon as the loop returns; the stop must
+// not wait out the refresh in progress, here 30 s long.
+TEST_F(Registry, StoppingAReporterEndsItsRefreshWaitAtOnce) {
+  event::RealtimeEventLoop<> loop;
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "tick", &handler);
+  Reporter reporter{{.name = "patient", .period = 30s, .registry_path = path_}};
+  reporter.start(loop);
+  handler.on_tick = [&] {
+    if (reporter.published()) loop.exit();
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 1ms);
+  loop.run_for(10s);  // Bound only; exits once the row is published.
+  ASSERT_TRUE(reporter.published()) << reporter.error();
+
+  const auto before = std::chrono::steady_clock::now();
+  reporter.stop();
+  EXPECT_LT(std::chrono::steady_clock::now() - before, 10s)
+      << "stop() waited for the 30 s refresh";
 }
 
 TEST_F(Registry, LoopCountsPublishesAndTimerDispatchesPerSource) {
@@ -512,36 +1254,11 @@ TEST_F(Registry, EndpointAttributesSurviveTheSegment) {
   EXPECT_EQ(sources[1].kind, event::SourceKind::WATCHER);
 }
 
-// The v1 case, which is also the default case: a node that declares no
-// attributes -- or a writer built before attributes existed, which wrote this
-// word as a zeroed `reserved` -- must read as neither external nor optional,
-// not as some third state.
-TEST_F(Registry, ASourceWithNoAttributesIsNeitherExternalNorOptional) {
-  NodeRegistration registration{{.name = "odometry"}, path_};
-  registration.publish(sample_manifest());
-
-  auto reader = RegistryReader::open(path_);
-  if (!reader.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = reader.value();
-  const auto nodes = registry.nodes();
-  ASSERT_EQ(nodes.size(), 1u);
-  const auto& sources = nodes.front().sources;
-  ASSERT_EQ(sources.size(), 3u);
-
-  for (const SourceSnapshot& source : sources) {
-    EXPECT_EQ(source.flags, 0u) << source.name;
-    EXPECT_FALSE(source.external()) << source.name;
-    EXPECT_FALSE(source.optional()) << source.name;
-  }
-}
-
 // A misspelled topic is reported and then published anyway. Taking the node off
 // the robot to punish a name would be a worse failure than the name, and the
 // registry showing the spelling the node actually used is the whole point: that
 // is how the two ends are found not to meet.
-TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
+TEST_F(Registry, AMisnamedTopicIsStillPublished) {
   event::Manifest manifest;
   manifest.push_back({.id = 0,
                       .kind = event::SourceKind::TIMER,
@@ -555,21 +1272,7 @@ TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
 
   NodeRegistration registration{{.name = "hardware_bridge"}, path_};
 
-  ::testing::internal::CaptureStderr();
-  EXPECT_NO_THROW(registration.publish(manifest));
-  // Publishing twice must not double the warning: the reporting thread calls
-  // into the registry forever, and a warning that repeats is a warning that
-  // gets filtered out.
   registration.publish(manifest);
-  const std::string warnings = ::testing::internal::GetCapturedStderr();
-
-  EXPECT_NE(warnings.find("/hw/cmd"), std::string::npos) << warnings;
-  EXPECT_NE(warnings.find("hardware_bridge"), std::string::npos) << warnings;
-  EXPECT_EQ(std::count(warnings.begin(), warnings.end(), '\n'), 1) << warnings;
-  // A timer's name is a label, not an address, so the topic grammar must not
-  // be applied to it.
-  EXPECT_EQ(warnings.find("tick"), std::string::npos) << warnings;
-
   auto reader = RegistryReader::open(path_);
   if (!reader.has_value()) {
     FAIL() << "Expected registry reader";
@@ -579,37 +1282,6 @@ TEST_F(Registry, AMisnamedTopicIsWarnedAboutAndStillPublished) {
   ASSERT_EQ(nodes.size(), 1u);
   ASSERT_EQ(nodes.front().sources.size(), 2u);
   EXPECT_EQ(nodes.front().sources[1].name, "/hw/cmd");
-}
-
-// The heartbeat, the dispatch count and the per-source counters move as one
-// sample: a reader that arrives between samples sees the whole sample, never
-// a fresh heartbeat paired with the previous refresh's counts.
-TEST_F(Registry, WholeSamplesReadWhole) {
-  NodeRegistration registration{{.name = "seamed"}, path_};
-  registration.publish(sample_manifest());
-
-  auto reader = RegistryReader::open(path_);
-  if (!reader.has_value()) {
-    FAIL() << "Expected registry reader";
-  }
-  const auto& registry = reader.value();
-
-  for (std::uint64_t i = 1; i <= 20; ++i) {
-    registration.begin_sample();
-    registration.heartbeat();
-    registration.set_dispatch_count(i);
-    registration.set_source(2, /*events=*/i, /*dropped=*/0, /*sequence=*/i,
-                            /*last_monotonic_ns=*/0, /*last_latency_ns=*/0,
-                            /*max_latency_ns=*/0);
-    registration.end_sample();
-
-    const auto nodes = registry.nodes();
-    ASSERT_EQ(nodes.size(), 1u);
-    EXPECT_EQ(nodes.front().dispatch_count, i);
-    ASSERT_EQ(nodes.front().sources.size(), 3u);
-    EXPECT_EQ(nodes.front().sources[2].events, i);
-    EXPECT_EQ(nodes.front().sources[2].sequence, i);
-  }
 }
 
 // A sample parked open -- the heartbeat advanced but the sample never closed
@@ -665,7 +1337,8 @@ TEST_F(Registry, WriterWithoutTheGuardReadsAsStable) {
   NodeRecord& record = mapping.header()->nodes[registration.slot()];
   record.dispatch_count.store(41, std::memory_order_relaxed);
   record.sources[2].events.store(41, std::memory_order_relaxed);
-  record.heartbeat_wall_ns.store(wall_now_ns(), std::memory_order_relaxed);
+  record.heartbeat_monotonic_ns.store(monotonic_now_ns(),
+                                      std::memory_order_relaxed);
   EXPECT_EQ(record.sample_seq.load(std::memory_order_relaxed), 0u);
 
   auto reader = RegistryReader::open(path_);

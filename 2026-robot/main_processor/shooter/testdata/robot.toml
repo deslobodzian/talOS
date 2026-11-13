@@ -1,4 +1,7 @@
-# Local shooter fixture. Device IDs are assigned by the normal parser.
+# Local shooter fixture. Device IDs are assigned by the normal parser. The
+# neighbor's motor stays connected, so a disconnected flywheel is the loss of
+# one device, as on a robot, not of all feedback (which the gateway and
+# SimHardware answer with a fault).
 [robot]
 name = "shooter_test"
 period_us = 5000
@@ -9,3 +12,7 @@ commissioned = false
 [[subsystems]]
 name = "shooter"
 path = "shooter.toml"
+
+[[subsystems]]
+name = "neighbor"
+path = "neighbor.toml"

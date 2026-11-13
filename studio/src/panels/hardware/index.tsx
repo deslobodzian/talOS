@@ -15,10 +15,11 @@ import {useMemo} from 'react';
 import {useDictionary, useSeries, useSnapshot} from '../../data/hooks';
 import {durationUs, integer} from '../../ui/formatters';
 import {DataTable, type Column} from '../../ui/DataTable';
-import {EmptyState, Stat, StatList} from '../../ui/primitives';
+import {EmptyState, StatList} from '../../ui/primitives';
 import {TimeSeriesChart} from '../../ui/TimeSeriesChart';
 import type {PanelDefinition} from '../types';
 import {bitHistory, counterRate, flagBands, type BitHistory} from './logic';
+import {ChannelReading, ChannelStat as Stat, FreshnessNotice} from '../../ui/FreshnessNotice';
 import './hardware.css';
 
 export type HardwareConfig = Record<string, never>;
@@ -66,8 +67,11 @@ const COUNTERS: CounterSpec[] = [
   {
     name: 'gateway_rejected_command_count',
     label: 'Gateway rejected',
-    note: 'Commands the gateway refused — structural or stale, or while the ' +
-        'robot is not enabled, configured, commissioned or healthy.'
+    note: 'Commands the gateway refused: structural or stale, sent while ' +
+        'it is faulted or unhealthy, or asking for output while the robot ' +
+        'is not enabled, configured or commissioned. Current neutral ' +
+        'commands are not counted while the robot is not enabled, ' +
+        'configured or commissioned.'
   },
   {
     name: 'gateway_neutralized_motor_count',
@@ -110,8 +114,8 @@ const ago = (lastSetAt: number|null, endSec: number): string => {
   return `${(endSec - lastSetAt).toFixed(1)}s ago`;
 };
 
-function BitList({title, bits, prefix, empty, endSec}: {
-  title: string;
+function BitList({title, bits, prefix, empty, endSec, channel}: {
+  title: string; channel: string;
   bits: BitHistory[];
   prefix: string;
   empty: string;
@@ -119,7 +123,7 @@ function BitList({title, bits, prefix, empty, endSec}: {
 }) {
   const meaningful = bits.filter(b => b.set || b.setCount > 0);
   return <div className="hw-block">
-    <h3>{title}</h3>
+    <h3><ChannelReading channel={channel}>{title}</ChannelReading></h3>
     {meaningful.length ?
         <ul className="bit-list">
           {meaningful.map(b =>
@@ -154,7 +158,9 @@ function HardwarePanel() {
       {seconds: 120});
   const age = useSeries([`${HW}state_age_us`], {seconds: 120});
   const masks = useSeries(
-      [`${HW}timed_out_mask`, `${HW}motor_fault_mask`], 'all');
+      [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
+       `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`],
+      'all');
 
   const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
   const counterNames = useMemo(
@@ -191,7 +197,7 @@ function HardwarePanel() {
   const columns: Column<CounterRow>[] = [
     {key: 'label', header: 'Counter', render: row =>
       <div className="counter-cell"><b>{row.label}</b><span>{row.note}</span></div>},
-    {key: 'total', header: 'Total', right: true, render: row => row.total},
+    {key: 'total', header: 'Total', right: true, render: row => <ChannelReading channel={`${HW}${row.name}`}>{row.total}</ChannelReading>},
     {key: 'rate', header: 'Rate (10 s)', right: true, render: row => row.rate}
   ];
 
@@ -212,19 +218,24 @@ function HardwarePanel() {
   const timedOutBits = bitHistory(
       masks.times, masks.values[`${HW}timed_out_mask`], subsystemCount ?? 32);
   const faultBits = bitHistory(masks.times, masks.values[`${HW}motor_fault_mask`]);
+  const forwardLimitBits = bitHistory(
+      masks.times, masks.values[`${HW}motor_forward_limit_mask`]);
+  const reverseLimitBits = bitHistory(
+      masks.times, masks.values[`${HW}motor_reverse_limit_mask`]);
 
   return <div className="hardware">
+    <FreshnessNotice prefix={HW}/>
     <section className="card">
       <div className="card-heading"><h2>Power</h2><span>HW/STATUS</span></div>
       <StatList>
-        <Stat label="Battery">{volts(batteryV)}</Stat>
-        <Stat label="Brownout" tone={brownout ? 'warn' : undefined}>
+        <Stat label="Battery" channel={`${HW}battery_v`}>{volts(batteryV)}</Stat>
+        <Stat label="Brownout" channel={`${HW}brownout`} tone={brownout ? 'warn' : undefined}>
           {brownout === undefined ? '—' : brownout ? 'yes' : 'no'}
         </Stat>
-        <Stat label="Health valid" tone={healthValid === false ? 'warn' : undefined}>
+        <Stat label="Health valid" channel={`${HW}health_valid`} tone={healthValid === false ? 'warn' : undefined}>
           {healthValid === undefined ? '—' : healthValid ? 'yes' : 'no'}
         </Stat>
-        <Stat label="CAN utilization">{percent(canFrac)}</Stat>
+        <Stat label="CAN utilization" channel={`${HW}can_utilization_frac`}>{percent(canFrac)}</Stat>
       </StatList>
       <div className="hw-block">
         <h3>Battery voltage · 2 min</h3>
@@ -249,13 +260,13 @@ function HardwarePanel() {
     <section className="card">
       <div className="card-heading"><h2>Link</h2><span>HW/STATUS</span></div>
       <StatList>
-        <Stat label="Configured" tone={configured === false ? 'warn' : undefined}>
+        <Stat label="Configured" channel={`${HW}configured`} tone={configured === false ? 'warn' : undefined}>
           {configured === undefined ? '—' : configured ? 'yes' : 'no'}
         </Stat>
-        <Stat label="Subsystems">
+        <Stat label="Subsystems" channel={`${HW}subsystem_count`}>
           {subsystemCount === undefined ? '—' : integer(subsystemCount)}
         </Stat>
-        <Stat label="State age" tone={stateAgeUs !== undefined && stateAgeUs > 20000 ? 'warn' : undefined}>
+        <Stat label="State age" channel={`${HW}state_age_us`} tone={stateAgeUs !== undefined && stateAgeUs > 20000 ? 'warn' : undefined}>
           {micros(stateAgeUs)}
         </Stat>
       </StatList>
@@ -271,7 +282,7 @@ function HardwarePanel() {
               `Command timeout ${micros(timeoutUs)}.`}
         </p>
       </div>
-      <BitList title="Subsystem timeouts (timed_out_mask)"
+      <BitList title="Subsystem timeouts (timed_out_mask)" channel={`${HW}timed_out_mask`}
                bits={timedOutBits} prefix="subsystem"
                empty="No subsystem has timed out."
                endSec={endSec}/>
@@ -280,15 +291,15 @@ function HardwarePanel() {
     <section className="card">
       <div className="card-heading"><h2>Clock</h2><span>GATEWAY ↔ NODE</span></div>
       <StatList>
-        <Stat label="Offset">{micros(num('clock_offset_us'))}</Stat>
-        <Stat label="Spread">{micros(num('clock_offset_spread_us'))}</Stat>
-        <Stat label="Valid" tone={flag('clock_offset_valid') === false ? 'warn' : undefined}>
+        <Stat label="Offset" channel={`${HW}clock_offset_us`}>{micros(num('clock_offset_us'))}</Stat>
+        <Stat label="Spread" channel={`${HW}clock_offset_spread_us`}>{micros(num('clock_offset_spread_us'))}</Stat>
+        <Stat label="Valid" channel={`${HW}clock_offset_valid`} tone={flag('clock_offset_valid') === false ? 'warn' : undefined}>
           {flag('clock_offset_valid') === undefined ? '—' :
               flag('clock_offset_valid') ? 'yes' : 'no'}
         </Stat>
-        <Stat label="Resets">{count(num('clock_resets_count'))}</Stat>
-        <Stat label="Window">{count(num('clock_window_count'))}</Stat>
-        <Stat label="Ignored">{count(num('clock_ignored_count'))}</Stat>
+        <Stat label="Resets" channel={`${HW}clock_resets_count`}>{count(num('clock_resets_count'))}</Stat>
+        <Stat label="Window" channel={`${HW}clock_window_count`}>{count(num('clock_window_count'))}</Stat>
+        <Stat label="Ignored" channel={`${HW}clock_ignored_count`}>{count(num('clock_ignored_count'))}</Stat>
       </StatList>
       <p className="chart-note">
         offset maps the gateway boot clock onto the node clock; spread is the
@@ -306,10 +317,26 @@ function HardwarePanel() {
 
     <section className="card wide">
       <div className="card-heading"><h2>Motor faults</h2><span>MOTOR_FAULT_MASK</span></div>
-      <BitList title="Motor fault mask (config order)"
+      <BitList title="Motor fault mask (config order)" channel={`${HW}motor_fault_mask`}
                bits={faultBits} prefix="motor"
                empty="No motor fault flags are set."
                endSec={endSec}/>
+    </section>
+
+    <section className="card wide">
+      <div className="card-heading"><h2>Motor limit switches</h2><span>ASSERTED</span></div>
+      <BitList title="Forward limit (config order)" channel={`${HW}motor_forward_limit_mask`}
+               bits={forwardLimitBits} prefix="motor"
+               empty="No forward limit switch is asserted."
+               endSec={endSec}/>
+      <BitList title="Reverse limit (config order)" channel={`${HW}motor_reverse_limit_mask`}
+               bits={reverseLimitBits} prefix="motor"
+               empty="No reverse limit switch is asserted."
+               endSec={endSec}/>
+      <p className="chart-note">
+        A switch asserted at the end of travel is normal; one that stays
+        asserted away from it is a normally closed switch with a cut wire.
+      </p>
     </section>
   </div>;
 }

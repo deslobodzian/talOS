@@ -21,6 +21,7 @@ cc_library(
     hdrs = ["recorder.h"],
     deps = [
         ":recording",
+        "//talOS/process",
         "//talOS/vision:frame",
         "@opencv//:core",
         "@opencv//:imgcodecs",

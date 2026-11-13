@@ -4,19 +4,17 @@
 [subsystem]
 name = "pose_estimator"
 node = "//2026-robot/main_processor/pose_estimator:node"
+# Observation-only: the robot may run without this node.
+critical = false
 period_us = 20000
 # "kalman" (wpimath SwerveDrive4PoseEstimator) or "factor_graph" (GTSAM
 # fixed-lag smoother); [kalman] / [factor_graph] below tune each.
-backend = "kalman"
+backend = "factor_graph"
 # C++ camera nodes: geometry.PoseObservation on /<name>/state, status on
 # /<name>/status. Each camera's subsystem file holds its calibration/device.
 # Under --sim they use /sim/state from sim_gateway --physics, never this estimator.
 cameras = ["front_left_camera", "front_right_camera", "rear_left_camera", "rear_right_camera"]
-# Module offsets from the robot centre, in the order of
-# [subsystems.drivetrain.geometry].modules (back_left, back_right,
-# front_left, front_right). config_golden_test checks they match.
-module_x_m = [-0.30, -0.30, 0.30, 0.30]
-module_y_m = [0.30, -0.30, 0.30, -0.30]
+# Module offsets: read from [subsystems.drivetrain.geometry].modules.
 # Observations older than this, relative to the newest drivetrain sample, are
 # rejected; at most 1.5 s (wpimath's pose buffer). The factor graph's lag.
 max_observation_age_us = 1500000
@@ -24,13 +22,22 @@ max_observation_age_us = 1500000
 observation_future_tolerance_us = 20000
 # Drivetrain state older than this makes the estimate invalid (held).
 drivetrain_timeout_us = 100000
+# Startup seed, blue-origin field frame. Trusted only once a fresh, attached,
+# disabled DS packet names an alliance; on red it is flipped about the field
+# centre (field_length_m - x, field_width_m - y, yaw + pi), as autonomous flips
+# its targets, and re-seeded on an alliance change until the first enabled
+# packet. An enabled-first restart needs camera confirmation before localized
+# is true.
 initial_x_m = 2.0
 initial_y_m = 2.0
 initial_yaw_rad = 0.0
-field_length_m = 16.54
-field_width_m = 8.21
+# Field size: field-dimensions of the tag layout
+# 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+# (config_golden_test checks they match).
+field_length_m = 16.541
+field_width_m = 8.069
 max_innovation_m = 3.0
-# Single-tag wrapped yaw innovation limit; radians (15 degrees).
+# Once-localized wrapped yaw innovation limit; radians (15 degrees).
 max_yaw_innovation_rad = 0.2618
 
 # wpimath stateStdDevs: trust in the odometry-propagated state; larger trusts
@@ -41,7 +48,8 @@ state_std_y_m = 0.1
 state_std_yaw_rad = 0.1
 
 # One sigma of each odometry step (one drivetrain sample) and of the prior on
-# the first pose (the configured initial field pose).
+# the pose the smoother starts from: the configured initial field pose, or
+# where it restarts (a relocalization, a contained GTSAM failure).
 [factor_graph]
 odometry_std_x_m = 0.01
 odometry_std_y_m = 0.01

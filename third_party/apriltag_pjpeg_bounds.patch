@@ -1,0 +1,233 @@
+diff --git a/common/pjpeg-idct.c b/common/pjpeg-idct.c
+--- a/common/pjpeg-idct.c
++++ b/common/pjpeg-idct.c
+@@ -269,7 +269,7 @@ void pjpeg_idct_2D_double(int32_t in[64], uint8_t *out, uint32_t outstride)
+ }
+ 
+ //////////////////////////////////////////////
+-static inline unsigned char njClip(const int x) {
++static inline unsigned char njClip(const int64_t x) {
+     return (x < 0) ? 0 : ((x > 0xFF) ? 0xFF : (unsigned char) x);
+ }
+ 
+@@ -281,8 +281,11 @@ static inline unsigned char njClip(const int x) {
+ #define W7 565
+ 
+ static inline void njRowIDCT(int* blk) {
+-    int x0, x1, x2, x3, x4, x5, x6, x7, x8;
+-    if (!((x1 = blk[4] << 11)
++    // 64-bit intermediates: corrupt input can carry any int coefficient, and
++    // the products below overflow int. Scale by multiplication: coefficients
++    // are signed, and a left shift of a negative value is undefined in C.
++    int64_t x0, x1, x2, x3, x4, x5, x6, x7, x8;
++    if (!((x1 = (int64_t) blk[4] * 2048)
+         | (x2 = blk[6])
+         | (x3 = blk[2])
+         | (x4 = blk[1])
+@@ -290,10 +293,10 @@ static inline void njRowIDCT(int* blk) {
+         | (x6 = blk[5])
+         | (x7 = blk[3])))
+     {
+-        blk[0] = blk[1] = blk[2] = blk[3] = blk[4] = blk[5] = blk[6] = blk[7] = blk[0] << 3;
++        blk[0] = blk[1] = blk[2] = blk[3] = blk[4] = blk[5] = blk[6] = blk[7] = blk[0] * 8;
+         return;
+     }
+-    x0 = (blk[0] << 11) + 128;
++    x0 = (int64_t) blk[0] * 2048 + 128;
+     x8 = W7 * (x4 + x5);
+     x4 = x8 + (W1 - W7) * x4;
+     x5 = x8 - (W1 + W7) * x5;
+@@ -326,8 +329,8 @@ static inline void njRowIDCT(int* blk) {
+ }
+ 
+ static inline void njColIDCT(const int* blk, unsigned char *out, int stride) {
+-    int x0, x1, x2, x3, x4, x5, x6, x7, x8;
+-    if (!((x1 = blk[8*4] << 8)
++    int64_t x0, x1, x2, x3, x4, x5, x6, x7, x8;
++    if (!((x1 = (int64_t) blk[8*4] * 256)
+         | (x2 = blk[8*6])
+         | (x3 = blk[8*2])
+         | (x4 = blk[8*1])
+@@ -335,14 +338,14 @@ static inline void njColIDCT(const int* blk, unsigned char *out, int stride) {
+         | (x6 = blk[8*5])
+         | (x7 = blk[8*3])))
+     {
+-        x1 = njClip(((blk[0] + 32) >> 6) + 128);
++        x1 = njClip((((int64_t) blk[0] + 32) >> 6) + 128);
+         for (x0 = 8;  x0;  --x0) {
+             *out = (unsigned char) x1;
+             out += stride;
+         }
+         return;
+     }
+-    x0 = (blk[0] << 8) + 8192;
++    x0 = (int64_t) blk[0] * 256 + 8192;
+     x8 = W7 * (x4 + x5) + 4;
+     x4 = (x8 + (W1 - W7) * x4) >> 3;
+     x5 = (x8 - (W1 + W7) * x5) >> 3;
+diff --git a/common/pjpeg.c b/common/pjpeg.c
+--- a/common/pjpeg.c
++++ b/common/pjpeg.c
+@@ -341,7 +341,11 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+                 int nf = bd_consume_bits(&bd, 8); // # image components
+ 
+-                if (nf < 1 || nf > 3)
++                // One frame per image; a zero or huge dimension would size
++                // MCU storage with an int overflow below.
++                if (nf < 1 || nf > 3 || pjd->components != NULL ||
++                    pjd->width == 0 || pjd->height == 0 ||
++                    pjd->width > 16384 || pjd->height > 16384)
+                     return PJPEG_ERR_SOF;
+ 
+                 pjd->ncomponents = nf;
+@@ -358,6 +362,14 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+                     // which quant table?
+                     pjd->components[i].tq = bd_consume_bits(&bd, 8);
++
++                    // Baseline sampling factors are 1-4 and quantization
++                    // tables 0-3; anything else divides by zero or indexes
++                    // past qtab.
++                    if (pjd->components[i].scalex < 1 || pjd->components[i].scalex > 4 ||
++                        pjd->components[i].scaley < 1 || pjd->components[i].scaley > 4 ||
++                        pjd->components[i].tq > 3)
++                        return PJPEG_ERR_SOF;
+                 }
+                 break;
+             }
+@@ -448,6 +460,8 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+                 // number of components in this scan
+                 uint8_t ns = bd_consume_bits(&bd, 8);
++                if (ns == 0)
++                    return PJPEG_ERR_SOS;
+ 
+                 // for each component, what is the index into our pjd->components[] array?
+                 uint8_t *comp_idx = calloc(ns, sizeof(uint8_t));
+@@ -469,8 +483,10 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                         }
+                     }
+ 
+-                    if (!found)
++                    if (!found) {
++                        free(comp_idx);
+                         return PJPEG_ERR_SOS;
++                    }
+                 }
+ 
+                 // start of spectral selection. baseline == 0
+@@ -482,8 +498,10 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                 // successive approximation bits. baseline == 0
+                 uint8_t Ahl = bd_consume_bits(&bd, 8);
+ 
+-                if (ss != 0 || se != 0x3f || Ahl != 0x00)
++                if (ss != 0 || se != 0x3f || Ahl != 0x00) {
++                    free(comp_idx);
+                     return PJPEG_ERR_SOS;
++                }
+ 
+                 // compute the dimensions of each MCU in pixels
+                 int maxmcux = 0, maxmcuy = 0;
+@@ -513,12 +531,20 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                     if ((comp->stride % alignment) != 0)
+                         comp->stride += alignment - (comp->stride % alignment);
+ 
++                    // A second scan of a component replaces its storage.
++                    free(comp->data);
+                     comp->data = calloc(comp->height * comp->stride, 1);
++                    if (comp->data == NULL) {
++                        free(comp_idx);
++                        return PJPEG_ERR_SOS;
++                    }
+                 }
+ 
+ 
+                 // each component has its own DC prediction
+                 int32_t *dcpred = calloc(ns, sizeof(int32_t));
++                // Error exits from the scan release its buffers.
++#define PJPEG_SCAN_FAIL(code) do { free(dcpred); free(comp_idx); return (code); } while (0)
+ 
+                 pjd->reset_count = 0;
+ 
+@@ -544,7 +570,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                             while (1) {
+                                 int32_t value = bd_consume_bits(&bd, 8);
+                                 if (bd.inpos > bd.inlen)
+-                                    return PJPEG_ERR_EOF;
++                                    PJPEG_SCAN_FAIL(PJPEG_ERR_EOF);
+                                 if (value == 0xff)
+                                     break;
+                                 printf("RST SYNC\n");
+@@ -554,7 +580,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+ //                            printf("%04x: RESET? %02x\n", *bd.inpos,  marker_32);
+                             if (marker_32 != (0xd0 + pjd->reset_next))
+-                                return PJPEG_ERR_RESET;
++                                PJPEG_SCAN_FAIL(PJPEG_ERR_RESET);
+ 
+                             pjd->reset_count = 0;
+                             pjd->reset_next = (pjd->reset_next + 1) & 0x7;
+@@ -578,9 +604,12 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                                     int dc_huff_table_idx = comp->tda >> 4;
+                                     int ac_huff_table_idx = 2 + (comp->tda & 0x0f);
+ 
+-                                    if (!pjd->huff_codes_present[dc_huff_table_idx] ||
++                                    // Baseline has two DC and two AC tables
++                                    // (slots 0-1 and 2-3); tda is 4+4 bits.
++                                    if (dc_huff_table_idx > 1 || ac_huff_table_idx > 3 ||
++                                        !pjd->huff_codes_present[dc_huff_table_idx] ||
+                                         !pjd->huff_codes_present[ac_huff_table_idx])
+-                                        return PJPEG_ERR_MISSING_DHT; // probably an MJPEG.
++                                        PJPEG_SCAN_FAIL(PJPEG_ERR_MISSING_DHT); // probably an MJPEG.
+ 
+ 
+                                     if (1) {
+@@ -592,11 +621,17 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                                         int ssss = huff_code->code & 0x0f; // ssss == number of additional bits to read
+                                         int32_t value = bd_consume_bits(&bd, ssss);
+ 
+-                                        // if high bit is clear, it's negative
+-                                        if ((value & (1 << (ssss-1))) == 0)
+-                                            value += ((-1) << ssss) + 1;
++                                        // if high bit is clear, it's negative.
++                                        // ssss == 0 carries no bits (value 0);
++                                        // subtract instead of shifting -1.
++                                        if (ssss > 0 && (value & (1 << (ssss-1))) == 0)
++                                            value -= (1 << ssss) - 1;
+ 
+-                                        dcpred[nsidx] += value;
++                                        // Valid baseline DC predictions stay
++                                        // within 11 bits; clamp corrupt runs
++                                        // so the sum cannot overflow.
++                                        int32_t pred = dcpred[nsidx] + value;
++                                        dcpred[nsidx] = pred > 32767 ? 32767 : pred < -32768 ? -32768 : pred;
+                                         block[0] = dcpred[nsidx] * pjd->qtab[qtabidx][0];
+                                     }
+ 
+@@ -619,10 +654,15 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+                                             int32_t value = bd_consume_bits(&bd, ssss);
+ 
+                                             // if high bit is clear, it's negative
+-                                            if ((value & (1 << (ssss-1))) == 0)
+-                                                value += ((-1) << ssss) + 1;
++                                            if (ssss > 0 && (value & (1 << (ssss-1))) == 0)
++                                                value -= (1 << ssss) - 1;
+ 
+                                             coeff += rrrr;
++                                            // A zero run past the last
++                                            // coefficient is corrupt data;
++                                            // ZZ, qtab and block hold 64.
++                                            if (coeff >= 64)
++                                                PJPEG_SCAN_FAIL(PJPEG_ERR_SOS);
+ 
+                                             block[(int) ZZ[coeff]] = value * pjd->qtab[qtabidx][coeff];
+                                         }
+@@ -651,6 +691,7 @@ static int pjpeg_decode_buffer(struct pjpeg_decode_state *pjd)
+ 
+                 free(dcpred);
+                 free(comp_idx);
++#undef PJPEG_SCAN_FAIL
+ 
+                 break;
+             }

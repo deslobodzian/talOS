@@ -1,15 +1,18 @@
-// The launcher owns every declared topic (launcher.h CreateSessionSegments):
-// a publisher killed with SIGKILL is restarted (max_restarts) and its
-// subscriber keeps receiving on the same segment, and a publisher's clean
-// exit leaves the topic in place for whoever publishes next. Real nodes, real
-// shared memory: continuity_source and continuity_sink in testdata/.
+// The launcher owns every declared topic (describe_graph.h
+// CreateSessionSegments): a publisher killed with SIGKILL is restarted
+// (max_restarts) and its subscriber keeps receiving on the same segment, and
+// a publisher's clean exit leaves the topic in place for whoever publishes
+// next. Real nodes, real shared memory: continuity_source and continuity_sink
+// in testdata/.
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +20,7 @@
 #include <fstream>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -26,6 +30,7 @@
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/launcher/launcher.h"
+#include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/rtms/rtms.h"
 
@@ -107,12 +112,13 @@ std::multiset<std::uint32_t> RunsReceived(const std::string& path) {
   return runs;
 }
 
-// One node's object in manifest.json, from its name to the closing brace.
+// One node's object in manifest.json, from its name to its run history.
 std::string ManifestEntry(const std::string& manifest, std::string_view name) {
   const std::size_t start =
       manifest.find("\"name\": \"" + std::string{name} + "\"");
   if (start == std::string::npos) return {};
-  return manifest.substr(start, manifest.find('}', start) - start);
+  // Its run history comes last; its runs repeat keys such as exit_code.
+  return manifest.substr(start, manifest.find("\"runs\": [", start) - start);
 }
 
 TEST(SessionSegments, SubscribersOutliveAKilledAndACleanlyExitedPublisher) {
@@ -126,14 +132,11 @@ name = "continuity"
 period_us = 5000
 max_restarts = 2
 
+# Non-critical: its restart's clean exit is a finished node, not a lost one.
 [subsystems.continuity_source]
 node = "//talOS/launcher:continuity_source"
 marker = ")" << marker << R"("
-
-[subsystems.continuity_source.motors.m1]
-type = "TalonFX"
-bus = "rio"
-can_id = 1
+critical = false
 
 [subsystems.continuity_sink]
 node = "//talOS/launcher:continuity_sink"
@@ -144,28 +147,51 @@ bus = "rio"
 can_id = 2
 )";
 
+  const std::string hardware_stub = config + ".hardware.sh";
+  introspect::Description hardware;
+  hardware.name = "hardware_node";
+  hardware.target = "//talOS/bridge:hardware_node";
+  std::ostringstream script;
+  script << "#!/bin/sh\n"
+         << "for arg in \"$@\"; do\n"
+         << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+         << "    cat <<'TALOS_DESCRIBE'\n"
+         << introspect::DescribeToJson(hardware) << "TALOS_DESCRIBE\n"
+         << "    exit 0\n"
+         << "  fi\n"
+         << "done\n"
+         // Alive until the session stops it: an exited stub restarts, and a
+         // stop that lands before its exec makes the session status nonzero.
+         << "trap 'exit 0' INT TERM\n"
+         << "while :; do sleep 0.05; done\n";
+  talos::launcher::testing::WriteWarmStub(hardware_stub, script.str(), 0700);
+
   LauncherOptions options;
   options.config_path = config;
   options.output_dir = out_dir;
   options.session_id = 1;
   options.simulation = true;
-  options.duration_s = 4;
+  // A ceiling only: the test stops the session once it has checked it, so no
+  // step depends on how fast this build starts a node (sanitizers are slow).
+  options.duration_s = 60;
   options.describe_timeout_ms = 4000;
-  options.binary_overrides["//talOS/bridge:hardware_node"] = "/usr/bin/true";
+  options.binary_overrides["//talOS/bridge:hardware_node"] = hardware_stub;
   options.binary_overrides["//talOS/launcher:continuity_source"] =
       Runfile("TALOS_SOURCE_NODE");
   options.binary_overrides["//talOS/launcher:continuity_sink"] =
       Runfile("TALOS_SINK_NODE");
 
   int status = -1;
-  std::jthread session{[&] { status = Launcher{options}.Run(); }};
+  std::atomic<bool> ended{false};
+  std::jthread session{[&] {
+    status = Launcher{options}.Run();
+    ended = true;
+  }};
 
   // The restart's clean exit: its log is complete.
   const std::string restart_log =
       out_dir + "/1/continuity_source.restart1.tlog";
-  const auto give_up = std::chrono::steady_clock::now() + 3s;
-  while (!LogFinished(restart_log) &&
-         std::chrono::steady_clock::now() < give_up) {
+  while (!LogFinished(restart_log) && !ended) {
     std::this_thread::sleep_for(20ms);
   }
   if (!LogFinished(restart_log)) {
@@ -180,7 +206,7 @@ can_id = 2
   SharedMemoryPtr segment{kTopic, sizeof(RTMSHeader)};
   const auto* header = static_cast<const RTMSHeader*>(segment.ptr());
   while (header->writer.owner_pid.load(std::memory_order_acquire) != 0 &&
-         std::chrono::steady_clock::now() < give_up) {
+         !ended) {
     std::this_thread::sleep_for(1ms);
   }
   ASSERT_EQ(header->writer.owner_pid.load(std::memory_order_acquire), 0u)
@@ -204,6 +230,9 @@ can_id = 2
       std::this_thread::sleep_for(20ms);
     }
   }
+  // The launcher's stop handler ends the session (and the sink) cleanly.
+  ASSERT_FALSE(ended) << "the session ended before the test stopped it";
+  ::kill(::getpid(), SIGTERM);
   session.join();
 
   EXPECT_EQ(status, 0);
@@ -232,6 +261,7 @@ can_id = 2
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(marker);
   std::filesystem::remove(config);
+  std::filesystem::remove(hardware_stub);
 }
 
 }  // namespace

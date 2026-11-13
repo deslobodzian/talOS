@@ -25,6 +25,17 @@
 // hardware layer (talOS/devices) is built exactly that way. Build a node with
 // talos_cc_node in //talOS/build:contract.bzl, which supplies its name and
 // target.
+//
+// A node belongs to the thread that builds it, which also runs its loop
+// (talos::Run, testing::Sim and the C ABI do both on one thread). Its sends,
+// and the commands of layers built on it (motors, target lanes), are taken
+// only from that thread: the constructor, update(), every() and message
+// callbacks. From any other thread they throw std::logic_error; a worker
+// thread hands its results to update() instead. Hardware outputs (motor,
+// digital and PWM setters, talOS/devices) are narrower still: they are taken
+// only inside update(), because the flush after each update() sends neutral
+// for every output it did not set; anywhere else they throw
+// std::logic_error.
 
 #include <chrono>
 #include <concepts>
@@ -81,6 +92,24 @@ struct SubscribeOptions {
   bool optional = false;  // the graph lint tolerates no publisher
 };
 
+// When a callback subscription's messages reach its callback
+// (Node::subscribe). Either way the callback receives every message in
+// sequence, at most 64 per topic per drain.
+enum class Wake : std::uint8_t {
+  // Each publication wakes the node, so the callback runs as the message
+  // arrives: for a handler that must act at once (a Driver Station
+  // listener).
+  kOnPublish,
+  // Publications never wake the node: the messages wait, in sequence, for
+  // its next drain, right before its next timer (update(), every()) or on
+  // another topic's wake. For a node that needs every message but acts on
+  // them only at its tick. A drain that stops at the 64-message cap is
+  // followed at once by another, as for kOnPublish, so a fast topic does
+  // not fall behind by a batch per tick; only more than the ring's 1023
+  // unread between two drains are lost, counted as dropped.
+  kAtDrain,
+};
+
 // Node::publish_bytes options.
 struct BytePublishOptions {
   // Ring slots; a power of two, at most 1024 (what loop topics use). Every
@@ -109,33 +138,77 @@ class Node {
 
   std::string_view name() const;  // subsystem name (== node_name)
   bool simulation() const;        // --sim
+  // True only while the binary builds this node to answer --describe (the
+  // launcher's probe), which prints what the constructor registered and exits
+  // without running update(). A node may skip building heavy native backends
+  // then, but validates every parameter and declares exactly the endpoints it
+  // declares otherwise. False under testing::Sim, in replay and in a run.
+  bool describing() const;
   Time now() const;
   std::uint64_t tick() const;  // update() calls completed so far
   Duration period() const;     // [subsystem] period_us, else [robot] period_us
   const std::string& config_path() const;  // the robot config (--config)
   // The session output directory the launcher started this node under: the
-  // parent directory of --log. nullopt without --log (tests, --describe and
-  // --replay). Frame recorders write under <session_dir>/frames/<name>/.
+  // parent directory of --log. nullopt without --log (tests) and in every
+  // offline run, --log or not (--describe, --replay, --replay-inputs), so
+  // state a node keeps per session or across restarts, gated on it, is never
+  // read or written by a replay. Frame recorders write under
+  // <session_dir>/frames/<name>/.
   std::optional<std::filesystem::path> session_dir() const;
+  // The absolute path of this subsystem's [trajectories] entry `name` (a data
+  // file such as a Choreo .traj), resolved against the file that set it, a
+  // subsystem file's entry overriding its defaults file's. A name the config
+  // does not declare throws std::invalid_argument naming the node, the
+  // subsystem and `trajectories.<name>`.
+  std::filesystem::path trajectory_path(std::string_view name) const;
 
   // Custom keys of this subsystem's TOML table. Dotted keys reach nested
-  // tables ("geometry.wheelbase_m"). T: bool, int64_t/int, double,
-  // std::string, or a TOML array as std::vector<std::string> or
-  // std::vector<double> (integer elements convert; an empty array is valid).
-  // A present key of the wrong type, or an array element of the wrong type,
-  // throws.
+  // tables ("geometry.wheelbase_m") and an index reaches an array element
+  // ("geometry.modules[0].x_m"; past the end is absent). T: bool,
+  // int64_t/int, double, std::string, or a TOML array as
+  // std::vector<std::string> or std::vector<double> (integer elements
+  // convert; an empty array is valid). A present key of the wrong type, or
+  // an array element of the wrong type, throws. Reading a key in the
+  // constructor declares it, present or not: --describe reports every key
+  // the constructor read, and the launcher refuses a subsystem key that no
+  // node read (docs/NODE_DEVELOPMENT_GUIDE.md#parameters). A key read only
+  // after construction (update(), a callback) is not declared.
   template <class T>
   T param(std::string_view key, T fallback) const;
   template <class T>
   T param(std::string_view key) const;  // throws if missing
 
+  // The same, read from another subsystem's table ([subsystems.<subsystem>]),
+  // for a value that subsystem owns (the drivetrain's module offsets), so it
+  // is configured once. Read-only and constructor-only: from update(),
+  // every() or a callback it throws std::logic_error. A subsystem the config
+  // lacks throws std::invalid_argument, even with a fallback.
+  template <class T>
+  T param_of(std::string_view subsystem, std::string_view key,
+             T fallback) const;
+  template <class T>
+  T param_of(std::string_view subsystem,
+             std::string_view key) const;  // throws if missing
+
   // Topics. Call in the constructor: registration order is what replay
   // checks a log against. A relative topic ("state", "target/teleop") expands
   // to "/<name>/<topic>"; [subsystems.<name>.remap] can redirect any topic.
-  // A node without message callbacks receives messages right before each of
-  // its timers (update(), every()); passing `on_message` to any subscription
-  // makes the node drain every 1 ms instead, so the callback runs promptly.
-  // age() counts from that delivery.
+  // publish and publish_bytes throw std::invalid_argument for a topic that
+  // resolves under /hw/request: only the devices layer writes a hardware
+  // request (talOS/devices, RULES.md 2), and its request is never remapped.
+  // A node receives messages right before each of its timers (update(),
+  // every()), and otherwise sleeps; passing `on_message` with
+  // Wake::kOnPublish (the default) makes a publication on that topic also
+  // wake the node, so the callback runs as the message arrives
+  // (testing::Sim, at the publication's instant). Each wake drains every
+  // subscription. Wake::kAtDrain keeps the callback's sequence delivery but
+  // wakes nothing: its messages wait for the node's next drain. A node with
+  // no timer has no drain to wait for, so every subscription wakes it,
+  // kAtDrain and plain ones included. Without a callback, each drain keeps
+  // only the newest available message and counts skipped messages as
+  // dropped. Callbacks receive messages in sequence, up to 64 per topic per
+  // drain. age() counts from publication, not delivery, for both
+  // subscription kinds; inside a callback it is that message's age.
   using SubscribeOptions = talos::SubscribeOptions;
   template <Message M>
   Subscription<M> subscribe(std::string_view topic,
@@ -143,13 +216,17 @@ class Node {
   template <Message M, std::invocable<const M&> F>
   Subscription<M> subscribe(std::string_view topic, F on_message,
                             SubscribeOptions options = {});
+  template <Message M, std::invocable<const M&> F>
+  Subscription<M> subscribe(std::string_view topic, F on_message, Wake wake,
+                            SubscribeOptions options = {});
   template <Message M>
   Publisher<M> publish(std::string_view topic);
   // A topic of variable-length messages, each at most max_bytes, for a feed
   // no fixed-size Message can carry. It bypasses the loop: not logged, not
   // replayed. A slot does not record the message's length, so the message
-  // must carry its own (a size-prefixed flatbuffer does). Nothing is opened
-  // until the first send(), so building the node touches no shared memory.
+  // must carry its own (a size-prefixed flatbuffer does). The topic is opened
+  // here, so a topic another live process writes throws now, not at a
+  // send(); --describe and replay open nothing.
   using BytePublishOptions = talos::BytePublishOptions;
   BytePublisher publish_bytes(std::string_view topic, std::size_t max_bytes,
                               BytePublishOptions options = {});
@@ -186,7 +263,7 @@ class Subscription {
   const M& operator*() const { return value(); }
   bool fresh() const;  // has_value() && age() < [robot] command_timeout_us
   bool fresh(Duration max_age) const;
-  Duration age() const;  // now - receive time (max if none)
+  Duration age() const;  // now - publish time (max if none)
   bool updated() const;  // a message arrived since the previous update() began
 
  private:
@@ -265,26 +342,29 @@ int Run(int argc, char** argv);
 namespace detail {
 
 template <class T>
-std::optional<T> FindParam(const Node& node, std::string_view key) {
+std::optional<T> FindParam(const Node& node, std::string_view key,
+                           NodeAccess::ParamTable subsystem = {}) {
   if constexpr (std::is_same_v<T, bool>) {
-    return NodeAccess::find_bool(node, key);
+    return NodeAccess::find_bool(node, key, subsystem);
   } else if constexpr (std::is_integral_v<T>) {
-    const std::optional<std::int64_t> value = NodeAccess::find_int(node, key);
+    const std::optional<std::int64_t> value =
+        NodeAccess::find_int(node, key, subsystem);
     if (!value) return std::nullopt;
     if (!std::in_range<T>(*value)) {
-      NodeAccess::param_error(node, key, "is out of range");
+      NodeAccess::param_error(node, key, "is out of range", subsystem);
     }
     return static_cast<T>(*value);
   } else if constexpr (std::is_floating_point_v<T>) {
-    const std::optional<double> value = NodeAccess::find_double(node, key);
+    const std::optional<double> value =
+        NodeAccess::find_double(node, key, subsystem);
     if (!value) return std::nullopt;
     return static_cast<T>(*value);
   } else if constexpr (std::is_same_v<T, std::string>) {
-    return NodeAccess::find_string(node, key);
+    return NodeAccess::find_string(node, key, subsystem);
   } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
-    return NodeAccess::find_string_list(node, key);
+    return NodeAccess::find_string_list(node, key, subsystem);
   } else if constexpr (std::is_same_v<T, std::vector<double>>) {
-    return NodeAccess::find_double_list(node, key);
+    return NodeAccess::find_double_list(node, key, subsystem);
   } else {
     static_assert(sizeof(T) == 0,
                   "param<T>: T must be bool, an integer, double, std::string, "
@@ -336,6 +416,22 @@ T Node::param(std::string_view key) const {
   return *std::move(value);
 }
 
+template <class T>
+T Node::param_of(std::string_view subsystem, std::string_view key,
+                 T fallback) const {
+  std::optional<T> value = detail::FindParam<T>(*this, key, subsystem);
+  return value ? *std::move(value) : std::move(fallback);
+}
+
+template <class T>
+T Node::param_of(std::string_view subsystem, std::string_view key) const {
+  std::optional<T> value = detail::FindParam<T>(*this, key, subsystem);
+  if (!value) {
+    detail::NodeAccess::param_error(*this, key, "is missing", subsystem);
+  }
+  return *std::move(value);
+}
+
 template <Message M>
 Subscription<M> Node::subscribe(std::string_view topic,
                                 SubscribeOptions options) {
@@ -347,6 +443,12 @@ Subscription<M> Node::subscribe(std::string_view topic,
 template <Message M, std::invocable<const M&> F>
 Subscription<M> Node::subscribe(std::string_view topic, F on_message,
                                 SubscribeOptions options) {
+  return subscribe<M>(topic, std::move(on_message), Wake::kOnPublish, options);
+}
+
+template <Message M, std::invocable<const M&> F>
+Subscription<M> Node::subscribe(std::string_view topic, F on_message, Wake wake,
+                                SubscribeOptions options) {
   detail::MessageCallback callback =
       [fn = std::move(on_message)](const void* data) {
         fn(*static_cast<const M*>(data));
@@ -354,7 +456,9 @@ Subscription<M> Node::subscribe(std::string_view topic, F on_message,
   const std::size_t index = detail::NodeAccess::add_subscription(
       *this, topic, sizeof(M), kMessageAlignment, schema::Of<M>(),
       options.optional, std::move(callback));
-  detail::NodeAccess::require_immediate_delivery(*this);
+  if (wake != Wake::kAtDrain) {
+    detail::NodeAccess::require_immediate_delivery(*this, index);
+  }
   return Subscription<M>{this, index};
 }
 

@@ -37,12 +37,15 @@ cc_library(
         "//talOS/hardware:sim_messages",
         "//talOS/msgs:geometry",
         "//talOS/node",
+        "//talOS/process",
         "//talOS/vision:camera_source",
+        "//talOS/vision:frame_mailbox",
         "//talOS/vision:localization",
         "//talOS/vision:pipeline",
         "//talOS/vision/capture",
         "//talOS/vision/field_sim",
         "//talOS/vision/field_sim:field_sim_patterns",
+        "//talOS/vision/playback",
         "//talOS/vision/recording",
         "//talOS/vision/recording:recorder",
     ],
@@ -57,6 +60,30 @@ cc_library(
     )
     for camera in CAMERAS
 ]
+
+# The node fed by a recording (talOS/vision/playback) of rendered footage.
+cc_test(
+    name = "recorded_footage_test",
+    srcs = ["recorded_footage_test.cc"],
+    data = [
+        "//2026-robot/main_processor/configuration:robot.toml",
+        "//2026-robot/main_processor/configuration:robot_config",
+    ],
+    env = {
+        "TALOS_TEST_CONFIG": "$(rlocationpath //2026-robot/main_processor/configuration:robot.toml)",
+    },
+    deps = [
+        ":vision",
+        "//talOS/node:testing",
+        "//talOS/vision/field_sim",
+        "//talOS/vision/field_sim:field_sim_patterns",
+        "//talOS/vision/playback",
+        "@googletest//:gtest_main",
+        "@opencv//:core",
+        "@opencv//:imgcodecs",
+        "@rules_cc//cc/runfiles",
+    ],
+)
 
 cc_test(
     name = "node_test",
@@ -73,8 +100,8 @@ cc_test(
     deps = [
         ":vision",
         "//talOS/configuration",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
-        "//talOS/vision/recording:replay",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],

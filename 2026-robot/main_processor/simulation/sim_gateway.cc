@@ -1,20 +1,26 @@
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "geometry/geometry_descriptor.h"
 #include "geometry/geometry_generated.h"
+#include "schedules.h"
 #include "sim/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/driver_station/schedule.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/sim_backend.h"
@@ -36,7 +42,10 @@ constexpr const char* kUsage =
     "[--start-pose X_M,Y_M,YAW_RAD] [--wheel-radius-error FRAC] "
     "[--wheel-slip-gain G] [--gyro-drift-radps R]] [--duration-s N] "
     "[--mode-schedule mode:seconds,...] [--alliance blue|red] "
-    "[--port N] [--remote-port N] [--session-id N]";
+    "[--joystick-schedule 'time:axes=...;buttons=MASK;pov=DEG|...'] "
+    "[--fault-schedule 'start:end:kind:target[:volts]|...'] "
+    "[--schedule-start-file PATH] [--port N] [--remote-port N] [--session-id "
+    "N]";
 
 // Shared-memory slot contract: docs/DATA_FLOW.md.
 static_assert(sizeof(geometry::OdometrySample) == 56);
@@ -64,11 +73,6 @@ void StartPose(const std::string& text,
   options.start_yaw_rad = FiniteNumber(text.substr(second + 1));
 }
 
-struct Phase {
-  uint32_t flags;
-  double end_s;
-};
-
 double Seconds(const std::string& text) {
   std::size_t used = 0;
   const double value = std::stod(text, &used);
@@ -85,43 +89,6 @@ uint16_t Port(const std::string& text) {
     throw std::invalid_argument("port must be between 1 and 65535");
   }
   return static_cast<uint16_t>(value);
-}
-
-std::vector<Phase> ParseSchedule(const std::string& spec) {
-  std::vector<Phase> phases;
-  std::size_t start = 0;
-  double end_s = 0;
-  while (start < spec.size()) {
-    const auto comma = spec.find(',', start);
-    const auto part = spec.substr(start, comma - start);
-    const auto colon = part.find(':');
-    if (colon == std::string::npos) {
-      throw std::invalid_argument("mode schedule needs mode:seconds phases");
-    }
-    const auto mode = part.substr(0, colon);
-    uint32_t flags = ds::kDsAttached;
-    if (mode == "auto" || mode == "autonomous") {
-      flags |= ds::kEnabled | ds::kAutonomous;
-    } else if (mode == "teleop") {
-      flags |= ds::kEnabled | ds::kTeleop;
-    } else if (mode == "test") {
-      flags |= ds::kEnabled | ds::kTest;
-    } else if (mode != "disabled") {
-      throw std::invalid_argument("unknown mode: " + mode);
-    }
-    end_s += Seconds(part.substr(colon + 1));
-    if (!std::isfinite(end_s)) {
-      throw std::invalid_argument("mode schedule duration overflow");
-    }
-    phases.push_back({flags, end_s});
-    if (comma == std::string::npos) break;
-    start = comma + 1;
-    if (start == spec.size()) {
-      throw std::invalid_argument("empty mode schedule phase");
-    }
-  }
-  if (phases.empty()) throw std::invalid_argument("empty mode schedule");
-  return phases;
 }
 
 talos::event::Manifest Manifest(bool physics) {
@@ -154,10 +121,15 @@ int main(int argc, char** argv) {
       describe |= std::string{argv[i]} == "--describe";
     }
     double duration_s = 0;
-    std::vector<Phase> phases;
+    std::vector<ds::SchedulePhase> phases;
+    std::vector<ds::JoystickEvent> joysticks;
+    std::vector<robot::simulation::FaultEvent> faults;
     ds::Alliance alliance = ds::Alliance::kBlue;
     bool physics_options = false;
     uint64_t session_id = 0;
+    // Where a harness writes the node-clock time the schedules count from;
+    // unset, they count from the loop's start.
+    std::optional<std::string> schedule_start_file;
     talos::hardware::sim::PhysicsOptions options{.start_x_m = 2.0,
                                                  .start_y_m = 2.0};
     const char* config_path = nullptr;
@@ -196,6 +168,8 @@ int main(int argc, char** argv) {
           throw std::invalid_argument(
               "--session-id must be an unsigned integer");
         }
+      } else if (arg == "--schedule-start-file" && i + 1 < argc) {
+        schedule_start_file = argv[++i];
       } else if (arg == "--port" && i + 1 < argc) {
         local_port = Port(argv[++i]);
       } else if (arg == "--remote-port" && i + 1 < argc) {
@@ -204,7 +178,12 @@ int main(int argc, char** argv) {
         const std::string value = argv[++i];
         duration_s = value == "0" ? 0 : Seconds(value);
       } else if (arg == "--mode-schedule" && i + 1 < argc) {
-        phases = ParseSchedule(argv[++i]);
+        phases = ds::ParseModeSchedule(argv[++i]);
+      } else if (arg == "--joystick-schedule" && i + 1 < argc) {
+        joysticks = ds::ParseJoystickSchedule(argv[++i]);
+      } else if (arg == "--fault-schedule" && i + 1 < argc) {
+        physics_options = true;
+        faults = robot::simulation::ParseFaults(argv[++i]);
       } else if (arg == "--alliance" && i + 1 < argc) {
         const std::string value = argv[++i];
         if (value == "blue") {
@@ -240,8 +219,14 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "sim_gateway: backend=%s\n",
                  physics ? "physics" : "ideal");
     std::random_device random;
-    talos::hardware::Gateway gateway{backend,
-                                     (uint64_t{random()} << 32) | random() | 1};
+    // One boot id for the State and the Driver Station packets alike.
+    const uint64_t boot_id = (uint64_t{random()} << 32) | random() | 1;
+    talos::hardware::Gateway gateway{backend, boot_id};
+    // No revision: it builds with the main processor's nodes, from the same
+    // Bazel checkout, so it names only the program.
+    gateway.SetBuild({.revision = 0,
+                      .program = talos::hardware::GatewayProgram::kSimGateway,
+                      .dirty = false});
     // Configure from the robot manifest before the loop: an unconfigured
     // gateway stamps config_id 0 and no configured flag, which every
     // mechanism's AcceptState/GatewayReady gates reject, so nothing
@@ -254,10 +239,29 @@ int main(int argc, char** argv) {
       auto robot_config = talos::config::ParseRobotConfig(config_path);
       auto hw_config = robot_config.hardware;
       hw_config.commissioned = true;
+      // The wire carries no motor type: a config the bridge pushes later
+      // keeps each motor's type from this parse, matched by name.
+      physics_backend.SetLocalMotorTypes(hw_config);
+      // Nor home switches ([digital_inputs.*] sim_motor): bound by name,
+      // they survive a pushed config too. Set before Reconfigure, which
+      // binds them, so the first State already reads them.
+      std::vector<talos::hardware::sim::HomeSwitch> home_switches;
+      home_switches.reserve(hw_config.digital_inputs.size());
+      for (const auto& input : hw_config.digital_inputs) {
+        const auto& sim = input.sim_home_switch;
+        if (sim.motor.empty()) continue;
+        home_switches.push_back({.input = input.name,
+                                 .motor = sim.motor,
+                                 .closed_at_rot = sim.closed_at_rot,
+                                 .closed_above = sim.closed_above,
+                                 .closed_reads = sim.closed_reads});
+      }
+      physics_backend.SetHomeSwitches(std::move(home_switches));
       if (!gateway.Reconfigure(hw_config)) {
         throw std::runtime_error(
             "sim_gateway: Reconfigure failed for the robot config");
       }
+      robot::simulation::ResolveFaults(faults, hw_config);
     }
     talos::hardware::Endpoint endpoint{gateway};
     if (endpoint.Open("127.0.0.1", local_port, "127.0.0.1", remote_port) !=
@@ -279,15 +283,36 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "sim_gateway: node registry unavailable: %s\n",
                    e.what());
     }
-    const auto start = std::chrono::steady_clock::now();
-    auto next = start;
+    // The gateway stands in for the RoboRIO, whose loop never waits behind the
+    // main processor's nodes, so it takes the bridge's tier whenever the node
+    // loops take theirs (TALOS_REALTIME=1 under --sim): left at timeshare, a
+    // host stall that the time-constraint nodes ride out would stop every
+    // State and expire their targets. Called last, from the only thread.
+    talos::process::RealtimeOutcome realtime{
+        .tier = talos::process::LoopTier::kBridge};
+    if (talos::process::RealtimeRequested(/*simulation=*/true)) {
+      realtime = talos::process::ConfigureRealtime(
+          {.period = std::chrono::microseconds{gateway.config().period_us},
+           .tier = realtime.tier});
+    }
+    if (registration) registration->set_realtime(realtime);
+    auto next = std::chrono::steady_clock::now();
+    // The mode, joystick and fault schedules and --duration-s count from one
+    // node-clock time zero, so a harness that chose it times its own actions
+    // from the same instant. Until it is known and reached, the gateway holds
+    // the schedules' time-zero state.
+    std::optional<int64_t> start_ns;
+    if (!schedule_start_file) start_ns = talos::event::Poller::now().nanos();
     std::size_t phase = 0;
+    std::size_t joystick_event = 0;
     ds::ModeTracker mode_tracker;
     ds::DriverStationData driver_station;
     driver_station.fms.alliance = alliance;
+    driver_station.boot_id = boot_id;
     std::array<uint8_t, talos::protocol::kMaxPayloadSize> ds_buffer{};
     uint64_t active_ticks = 0;
     uint64_t last_ds_us = 0;
+    uint32_t last_ds_mode = 0;  // ModeKey of the last packet sent
     uint64_t ticks = 0;
     uint64_t truth_samples = 0;
     uint64_t truth_dropped = 0;
@@ -295,12 +320,45 @@ int main(int argc, char** argv) {
     int64_t last_truth_ns = 0;
     while (!talos::process::stop_requested.load()) {
       const auto tick_time = std::chrono::steady_clock::now();
-      const double elapsed_s =
-          std::chrono::duration<double>(tick_time - start).count();
+      if (!start_ns) {
+        // Written atomically by the harness (rename), so a read sees all of
+        // it or no file.
+        std::ifstream file{*schedule_start_file};
+        if (file) {
+          try {
+            start_ns = robot::simulation::ParseScheduleStart(
+                std::string{std::istreambuf_iterator<char>{file}, {}});
+          } catch (const std::invalid_argument& e) {
+            throw std::invalid_argument(*schedule_start_file + ": " + e.what());
+          }
+          const int64_t late_ns =
+              talos::event::Poller::now().nanos() - *start_ns;
+          if (late_ns > 0) {
+            std::fprintf(stderr,
+                         "sim_gateway: schedule start is %.1f ms in the past\n",
+                         static_cast<double>(late_ns) / 1e6);
+            robot::simulation::SkipPastFaults(
+                faults, static_cast<double>(late_ns) / 1e9);
+          }
+        }
+      }
+      const int64_t since_ns =
+          start_ns ? std::max<int64_t>(
+                         0, talos::event::Poller::now().nanos() - *start_ns)
+                   : 0;
+      const auto elapsed = std::chrono::floor<std::chrono::microseconds>(
+          std::chrono::nanoseconds{since_ns});
+      const double elapsed_s = std::chrono::duration<double>(elapsed).count();
       if (duration_s > 0 && elapsed_s >= duration_s) break;
-      while (phase + 1 < phases.size() && elapsed_s >= phases[phase].end_s) {
+      while (phase + 1 < phases.size() && elapsed >= phases[phase].end) {
         ++phase;
       }
+      while (joystick_event < joysticks.size() &&
+             elapsed >= joysticks[joystick_event].start) {
+        driver_station.joysticks[0] = joysticks[joystick_event++].joystick;
+      }
+      endpoint.SetSendEnabled(
+          !robot::simulation::ApplyFaults(faults, elapsed_s, physics_backend));
       driver_station.sample_time_us =
           std::chrono::duration_cast<std::chrono::microseconds>(
               tick_time.time_since_epoch())
@@ -326,13 +384,17 @@ int main(int argc, char** argv) {
           ++truth_dropped;
         }
       }
-      // Match the RoboRIO: no more than one DS snapshot every 20 ms,
-      // independently of the hardware/physics tick rate.
-      if (last_ds_us == 0 || now - last_ds_us >= 20000) {
+      // Match the RoboRIO: a DS snapshot every 20 ms, independently of the
+      // hardware/physics tick rate, and one at once on the tick that observes
+      // a new mode.
+      const uint32_t mode = ds::ModeKey(driver_station.fms.flags);
+      if (last_ds_us == 0 || mode != last_ds_mode ||
+          now - last_ds_us >= ds::kSamplePeriodUs) {
         const auto ds_size = ds::Encode(driver_station, ds_buffer);
         endpoint.SendFrame(talos::protocol::FrameType::kDriverStation, now,
                            ds_buffer.data(), ds_size);
         last_ds_us = now;
+        last_ds_mode = mode;
       }
       ++ticks;
       if (registration) {

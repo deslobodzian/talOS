@@ -1,10 +1,14 @@
 import org.gradle.internal.os.OperatingSystem
+import org.gradle.language.cpp.tasks.CppCompile
 
 // The RoboRIO program is deliberately small: a Driver Station loop and the
 // hardware gateway. Everything else in talOS builds with Bazel, and the tests
-// for the gateway live there (//talOS/hardware:gateway_test). The only
-// GradleRIO tests are desktop simulation regressions for the Phoenix
-// backend itself (src/test/cpp); there is no command-based framework.
+// for the gateway live there (//talOS/hardware:gateway_test). The GradleRIO
+// tests (src/test/cpp) cover only this program's own sources: desktop
+// simulation regressions for the Phoenix backend, the config store, the
+// simulated Driver Station, the logger, the companion link reporter, the
+// loop watchdog and the loop's wake schedule; there is no command-based
+// framework.
 plugins {
     id "cpp"
     id "google-test"
@@ -45,8 +49,8 @@ wpi.cpp.debugSimulation = false
 // The simulation GUI is the only way to enable the robot and choose Teleoperated
 // when no real Driver Station is attached, so an interactive `simulateNative`
 // gets it. Automated runs pass -Pheadless and drive the Driver Station through
-// the TALOS_SIM_DS environment variables instead; see
-// 2026-robot/main_processor/drivetrain/README.md.
+// the TALOS_SIM_DS* environment variables instead; see
+// src/main/include/SimDriverStation.h.
 if (!project.hasProperty("headless")) {
     wpi.sim.addGui().defaultEnabled = true
 }
@@ -73,6 +77,12 @@ if (OperatingSystem.current().isWindows()) {
         it.cppCompiler.args.add('-pedantic')
         it.cppCompiler.args.add('-Werror')
         it.cppCompiler.args.add('-Wno-unused-parameter')
+        if (OperatingSystem.current().isMacOsX()) {
+            // Apple clang 21 warns inside WPILib's bundled gtest-printers.h
+            // (char8_t -> char32_t); older clangs do not know the flag.
+            it.cppCompiler.args.add('-Wno-unknown-warning-option')
+            it.cppCompiler.args.add('-Wno-character-conversion')
+        }
     }
 }
 
@@ -100,6 +110,126 @@ if (project.hasProperty("ubsan")) {
     }
 }
 
+// The companion (main processor) address the program sends State to and
+// accepts frames from: -Pcompanion=<IPv4 literal> on the command line of
+// deploy or buildRio, 10.56.87.11 without it. It is fixed in the binary,
+// never learned from a datagram, because the gateway's connected socket is
+// what keeps every other host on the network from commanding the robot
+// (talOS/protocol/README.md).
+//
+// Only the command line may set it. Gradle would also take it from
+// ~/.gradle/gradle.properties, a project gradle.properties or
+// ORG_GRADLE_PROJECT_companion, where a bench address would silently carry
+// into a later competition deploy from the same laptop; those fail the build.
+// A present but empty value (a bare -Pcompanion, or -Pcompanion=$UNSET) fails
+// too rather than falling back to the default.
+//
+// The value must be one RuntimeUdpPeer::Open can connect to and send to on
+// the RoboRIO, so the build stops here instead of every socket open failing
+// or every State going nowhere: a dotted IPv4 literal in inet_pton's form
+// (four decimal octets, no leading zeros), not in 0.0.0.0/8 ("this network",
+// 0.0.0.0 refused by Open), 127.0.0.0/8 (loopback, the RoboRIO itself) or
+// 224.0.0.0/3 (multicast, reserved, and the broadcast 255.255.255.255, whose
+// connect fails with EACCES on every retry).
+def companionFromCommandLine = gradle.startParameter.projectProperties.containsKey('companion')
+if (project.hasProperty('companion') && !companionFromCommandLine) {
+    throw new GradleException(
+            "companion=${project.property('companion')} is set outside the command line " +
+            "(gradle.properties or ORG_GRADLE_PROJECT_companion); remove it there: the " +
+            "RoboRIO companion address is accepted only as -Pcompanion=<ipv4> on the command " +
+            "line, so a bench address cannot persist into another deploy")
+}
+def companionAddress = companionFromCommandLine ?
+        gradle.startParameter.projectProperties['companion'].toString() : '10.56.87.11'
+def companionRefusal = { String text ->
+    if (text.isEmpty()) return 'it is empty (a bare -Pcompanion, or an unset variable)'
+    def octets = text.split('\\.', -1)
+    if (octets.length != 4 ||
+            !octets.every { it ==~ /0|[1-9][0-9]{0,2}/ && it.toInteger() <= 255 }) {
+        return 'it is not a dotted IPv4 literal such as 10.56.87.11 (the RoboRIO program ' +
+                'resolves no hostname; no leading zeros)'
+    }
+    def first = octets[0].toInteger()
+    if (first == 0) return 'it is in 0.0.0.0/8, which names no host'
+    if (first == 127) return 'it is a loopback address, the RoboRIO itself'
+    if (first >= 224) return 'it is a multicast, reserved or broadcast address'
+    return null
+}
+def refusal = companionRefusal(companionAddress)
+if (refusal != null) {
+    throw new GradleException("-Pcompanion=${companionAddress} refused: ${refusal}")
+}
+logger.quiet("RoboRIO companion address built in: ${companionAddress}" +
+        (companionFromCommandLine ? ' (from -Pcompanion)' :
+                ' (default, the robot network; -Pcompanion=<ipv4> to change)'))
+
+// The build this program reports in every State (talOS/hardware/messages.h,
+// GatewayBuild): RioBuild.h, written before any compile, holds the git commit
+// of this checkout and whether it has uncommitted changes, untracked files
+// included (the rule tools/workspace_status.sh applies to the main
+// processor). Without git, or outside a git checkout, the commit is "unknown"
+// and the program reports revision 0. It reads only the local repository, so
+// --offline builds get it too. The header also holds the companion address
+// above: a generated constant rather than a -D define, so no compiler's
+// quoting of a string define is involved. The task runs every build but
+// rewrites the header only when its text changes, so an unchanged checkout
+// and address recompile nothing, and a changed address recompiles Robot.cpp.
+def rioBuildHeaderDir = layout.buildDirectory.dir('generated/talos/include').get().asFile
+def runGit = { List<String> args ->
+    try {
+        def process = (['git', '-C', projectDir.absolutePath] + args).execute()
+        def out = new StringBuilder()
+        def err = new StringBuilder()
+        process.waitForProcessOutput(out, err)
+        return process.exitValue() == 0 ? out.toString().trim() : null
+    } catch (IOException ignored) {
+        return null
+    }
+}
+
+tasks.register("generateRioBuild") {
+    description = 'Write the checkout\'s git commit, dirty flag and companion address to RioBuild.h'
+    group = 'build'
+    def header = new File(rioBuildHeaderDir, 'RioBuild.h')
+    inputs.property('companion', companionAddress)
+    outputs.file(header)
+    outputs.upToDateWhen { false }
+    doLast {
+        def head = runGit(['rev-parse', 'HEAD'])
+        def commit = head != null && head ==~ /[0-9a-f]{16,}/ ? head : 'unknown'
+        // A status that cannot be read is not evidence of a clean tree.
+        def status = commit == 'unknown' ? '' : runGit(['--no-optional-locks', 'status', '--porcelain'])
+        def dirty = status == null || !status.isEmpty()
+        def revision = commit == 'unknown' ? '0' : "0x${commit.substring(0, 16)}"
+        def text = """\
+// Generated by build.gradle's generateRioBuild task; do not edit.
+#pragma once
+
+#include <cstdint>
+
+namespace talos::rio {
+// The git commit this program was built from, or "unknown".
+inline constexpr const char* kBuildCommit = "${commit}";
+// Its first 16 hex digits as one number, 0 when unknown
+// (hardware::GatewayBuild::revision).
+inline constexpr uint64_t kBuildRevision = ${revision}ull;
+// Built with uncommitted changes, untracked files included.
+inline constexpr bool kBuildDirty = ${dirty};
+// The companion (main processor) this program sends State to and accepts
+// frames from, set by -Pcompanion at build time.
+inline constexpr const char* kCompanionAddress = "${companionAddress}";
+}  // namespace talos::rio
+"""
+        if (!header.exists() || header.text != text) {
+            header.parentFile.mkdirs()
+            header.text = text
+        }
+    }
+}
+
+tasks.withType(CppCompile).configureEach {
+    dependsOn 'generateRioBuild'
+}
 
 model {
     components {
@@ -123,6 +253,7 @@ model {
                 exportedHeaders {
                     srcDir 'src/main/include'
                     srcDir '../../../talOS'
+                    srcDir rioBuildHeaderDir
                     include '**/*.h', '**/*.hpp'
                 }
             }
@@ -141,8 +272,10 @@ model {
         }
     }
     testSuites {
-        // Desktop simulation tests for the hardware gateway backend
-        // (PhoenixBackend encoder + sim honesty regressions in src/test/cpp).
+        // Desktop tests of this program's sources (src/test/cpp): the
+        // PhoenixBackend simulation regressions, ConfigStore,
+        // SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry
+        // and LoopSchedule.
         // The suite itself is auto-created per component by the google-test
         // plugin; this only points it at our sources and dependencies.
         frcUserProgramTest {
@@ -165,12 +298,14 @@ tasks.register("buildRio") {
     dependsOn 'frcUserProgramLinuxathenaReleaseExecutable'
 }
 
-// Stable entry point for the PhoenixBackend desktop simulation regressions in
-// src/test/cpp. The google-test plugin creates one RunTestExecutable task per
-// desktop variant (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
+// Stable entry point for the desktop tests in src/test/cpp (PhoenixBackend
+// simulation regressions, ConfigStore, SimDriverStation, RioLog,
+// CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule). The google-test
+// plugin creates one RunTestExecutable task per desktop variant
+// (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
 // so CI pins this aggregator instead of a platform-specific variant name.
 tasks.register("phoenixTest") {
-    description = 'Run the PhoenixBackend desktop simulation tests'
+    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule)'
     group = 'verification'
     def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
     dependsOn runTasks
@@ -202,8 +337,4 @@ tasks.register("setupCompileCommands") {
             into projectDir
         }
     }
-}
-
-tasks.named("build") {
-    finalizedBy("setupCompileCommands")
 }

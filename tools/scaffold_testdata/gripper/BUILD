@@ -42,6 +42,7 @@ cc_test(
     srcs = ["node_test.cc"],
     data = [
         "testdata/gripper.toml",
+        "testdata/neighbor.toml",
         "testdata/robot.toml",
         ":node",
     ],
@@ -52,6 +53,7 @@ cc_test(
     deps = [
         ":gripper",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

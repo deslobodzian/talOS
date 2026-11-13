@@ -1,0 +1,9 @@
+[subsystem]
+name = "autonomous"
+node = "//bot/autonomous:node"
+
+[trajectories]
+two_piece = "../trajectories/two_piece.traj"
+
+[motors.m]
+can_id = 1

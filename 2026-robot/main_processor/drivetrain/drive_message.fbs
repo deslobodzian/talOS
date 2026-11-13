@@ -11,13 +11,14 @@ struct ChassisTarget {
 
 // Published every drivetrain tick, valid or not.
 //
-// sample_time_ns: node-clock time the hardware sample behind this state was
-// taken; 0, with both flags false, while that time is unknown.
-// modules_valid: all eight module motors report and the sample time is
-// known. Otherwise the chassis speeds are 0 and the module positions hold
-// their last valid values (0 before the first).
-// yaw_valid: the heading is usable (the gyro reports, or under --sim the
-// heading integrated from valid modules) and the sample time is known.
+// sample_time_ns: oldest node-clock signal acquisition time contributing to
+// either valid product (modules or yaw); 0 when neither is valid.
+// modules_valid: all module devices report, with known drive position/velocity
+// and steer position times, each positive, not future, <=50 ms old and spanning
+// <=20 ms. Values may still update while invalid; do not use them for odometry.
+// yaw_valid: usable gyro yaw timing, or heading integrated from valid modules.
+// Gyro yaw uses the same age bound; when valid modules and yaw together span
+// >20 ms, modules take priority and yaw is invalid. See README.md for policy.
 // Otherwise yaw_rad holds the last valid heading (0 before the first).
 // vx/vy/omega: robot-relative chassis motion the modules measure.
 // yaw_rad: field heading, CCW+.

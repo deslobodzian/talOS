@@ -1,15 +1,13 @@
 # IPC
 
-Typed single-producer / multi-consumer pub/sub on top of RTMS
-(`//talOS/rtms`: lock-free shared-memory ring buffer per topic,
-broadcast under `/dev/rtms/<topic_name>`).
+Typed single-producer / multi-consumer pub/sub on top of
+[RTMS](../rtms/README.md).
 
 ## Contract
 
 - `ipc::Publisher<Message>` / `ipc::Subscriber<Message>`
   (`publisher.h`, `subscriber.h`) are thin typed front-ends over
-  `RTMSQueue`. One topic maps to one ring buffer sized
-  `sizeof(Message)` x `MAX_SLOTS`.
+  `RTMSQueue`, passing `sizeof(Message)`, `alignof(Message)` and `MAX_SLOTS`.
 - `Message` must be a trivially copyable flatbuffer **struct**
   (enforced by `concepts.h`: `NotDerivedFromFlatbufferTable` plus
   `static_assert(is_trivially_copyable)`) with a schema descriptor
@@ -22,25 +20,29 @@ broadcast under `/dev/rtms/<topic_name>`).
   subscriber that stops reading gets lapped instead of stalling the
   publisher. `Subscriber::read_next()` returns
   `Received<Message>{message, sequence, dropped}` so consumers can
-  detect laps and replay deterministically; `read()` is the plain
-  latest-value shortcut.
-- The publisher owns the topic layout outside a launcher session: it
-  passes `RTMSOptions::publisher`, so it reclaims a segment of another
-  build or schema that no live process holds. A live publisher exclusively
-  owns the topic; another publisher throws with the topic and both pids.
-  Each `Subscriber` registers one of eight shared-memory reader slots and
-  throws with the topic and limit if they are exhausted. It is move-only
-  (copying would double-release the slot), and releases it on destruction;
-  a slot whose process died is reclaimed. Segment lifetime (launcher-owned,
-  or the last holder unlinks) is RTMS's: see `talOS/rtms/rtms.h`.
+  detect laps; `read()` discards that metadata but uses the same read mode
+  (sequence delivery by default), not a latest-value shortcut.
+- `read_next()` and `read()` return `nullopt` when nothing new was
+  published and when a read fails: the writer tore it, or a process that
+  judged this one dead freed its reader slot. Failed reads count in
+  `failed_reads()`. A freed slot is claimed again by the read that finds it
+  gone, or by a later one while none is free (`registered()` is false
+  meanwhile); messages published while the subscriber had no slot count in
+  the next `Received::dropped`.
+- A subscriber can sleep on a `talos::WakeReceiver` instead of polling
+  ([RTMS "Wake channel"](../rtms/README.md#wake-channel)):
+  `set_wake_receiver(id)` names the receiver for its reader slot, and for
+  any slot it claims again after a freed one; `arm_wake()` asks for a
+  notification on the next publication and returns `true` only when it is
+  caught up, so `false` (unread data, or no slot held) means read instead
+  of sleeping.
+- The publisher passes `RTMSOptions::publisher`: a live publisher
+  exclusively owns the topic; another publisher throws with the topic and
+  both pids.
+  Each move-only `Subscriber` owns and releases a reader slot; construction
+  throws if reader slots are exhausted. Transport ownership, reader capacity
+  and segment lifetime are documented in [RTMS](../rtms/README.md).
 - Test schemas live next to their users (e.g. `ipc_test_message.fbs`,
   built with `talos_messages`).
 
-## Who uses it
-
-- `//talOS/bridge` (`talOS/bridge/node.h`) — node graph transport.
-- `//talOS/events` — realtime event loop publishing.
-- `//talOS/driver_station:send_joystick` and
-  `//2026-robot/main_processor/drivetrain:send_target` publish;
-  `drivetrain:monitor` subscribes.
 - Unit coverage in `:ipc_test`.

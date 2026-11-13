@@ -30,7 +30,11 @@ struct RobotConfig;
 }  // namespace config
 namespace introspect {
 struct Description;
+struct ParamRead;
 }  // namespace introspect
+namespace process {
+enum class LoopTier : std::uint8_t;  // talOS/process/realtime_outcome.h
+}  // namespace process
 }  // namespace talos
 
 namespace talos::detail {
@@ -52,10 +56,12 @@ struct NodeSetup {
   std::string config_path;
   std::shared_ptr<const config::RobotConfig> config;  // parsed config_path
   bool simulation = false;
+  bool describing = false;  // --describe: Node::describing()
   LoopPort* loop = nullptr;
   GraphSource graph;  // unset: no graph (null)
   // The session output directory the launcher started this node under (the
-  // parent of --log), or nullopt without --log (tests, --describe, replay).
+  // parent of --log), or nullopt without --log (tests) and in an offline run
+  // (--describe, --replay, --replay-inputs): Node::session_dir().
   std::optional<std::filesystem::path> session_dir;
 };
 
@@ -86,14 +92,30 @@ struct NodeAccess {
   // require_immediate_delivery. Called once, after the user's object is
   // built.
   static void start(Node& node);
-  // Some handler must see each message as it arrives (a subscribe callback,
-  // a Driver Station listener), so the loop drains every tick. Without it,
-  // a node with a timer (update(), an after_update hook or every()) drains
-  // only right before its own timers, which is all a node that reads latched
-  // values there needs; a node with no timer drains every tick regardless.
-  // Call before start().
-  static void require_immediate_delivery(Node& node);
-  static bool immediate_delivery(const Node& node);
+  // Throws std::logic_error, naming the node and `what`, unless called on
+  // the thread that built `node`, which runs its loop. A send or a device
+  // command touches state only that thread may (the loop's dispatch context
+  // and log, the transport, a device's pending request): publisher_send,
+  // byte_publisher_send and the devices layer's commands call it first.
+  static void require_loop_thread(const Node& node, std::string_view what);
+  // Whether the node's update() is running now: false in the constructor,
+  // in every() timers, message callbacks and after_update hooks. The devices
+  // layer refuses an output command outside it, because its flush after
+  // each update() sends neutral for every output that update() did not set.
+  // Read it only on the loop thread (after require_loop_thread).
+  static bool in_update(const Node& node);
+  // Some handler must see each message on subscription `subscription` as it
+  // arrives (a subscribe callback with Wake::kOnPublish, a Driver Station
+  // listener), so its publications wake the node: start() marks its watcher
+  // prompt and picks Delivery::ON_PUBLISH. A callback subscription without
+  // it (Wake::kAtDrain, the devices layer's /hw/state) is a sequence watcher
+  // that waits for the next drain. A node with a timer (update(), an
+  // after_update hook or every()) and no such subscription drains only right
+  // before its own timers (Delivery::BEFORE_TIMERS), which is all a node
+  // that reads latched values there needs; in a node with no timer every
+  // subscription wakes it regardless. Call before start(); throws
+  // std::out_of_range for an index add_subscription did not return.
+  static void require_immediate_delivery(Node& node, std::size_t subscription);
   // Index of the update() currently running, or of the next one between
   // ticks. State machines stamp transitions with it.
   static std::uint64_t next_update(const Node& node);
@@ -114,36 +136,59 @@ struct NodeAccess {
   // graph.
   static const DeclaredGraph* declared_graph(Node& node);
   static bool reads_graph(const Node& node);
+  // Every (subsystem, key) the constructor read with param or param_of, in
+  // first-read order: what --describe reports as the node's parameters.
+  static const std::vector<introspect::ParamRead>& params_read(
+      const Node& node);
   static const config::RobotConfig& robot_config(const Node& node);
+  // The scheduling tier talos::Run gives the node's loop thread: control when
+  // its own subsystem's devices own an actuator
+  // (hardware::Devices::owns_actuators) or it has registered a publisher on a
+  // target lane, otherwise observer. Read after construction.
+  static process::LoopTier loop_tier(const Node& node);
   // The session output directory (parent of --log), or nullopt without --log.
   static std::optional<std::filesystem::path> session_dir(const Node& node);
 
-  // A parameter of this node's subsystem table, or nullopt when absent. A
+  // A parameter of this node's subsystem table, or, with `subsystem`, of
+  // that subsystem's table (Node::param_of: constructor only, and a
+  // subsystem the config lacks throws). nullopt when the key is absent. A
   // present key of another type throws, naming it.
-  static std::optional<bool> find_bool(const Node& node, std::string_view key);
+  using ParamTable = std::optional<std::string_view>;
+  static std::optional<bool> find_bool(const Node& node, std::string_view key,
+                                       ParamTable subsystem = {});
   static std::optional<std::int64_t> find_int(const Node& node,
-                                              std::string_view key);
+                                              std::string_view key,
+                                              ParamTable subsystem = {});
   static std::optional<double> find_double(const Node& node,
-                                           std::string_view key);
+                                           std::string_view key,
+                                           ParamTable subsystem = {});
   static std::optional<std::string> find_string(const Node& node,
-                                                std::string_view key);
+                                                std::string_view key,
+                                                ParamTable subsystem = {});
   // A TOML array: of strings, or of numbers (integers convert). An empty
   // array is valid. A non-array, or an element of another type, throws
   // naming the element's index and type.
   static std::optional<std::vector<std::string>> find_string_list(
-      const Node& node, std::string_view key);
+      const Node& node, std::string_view key, ParamTable subsystem = {});
   static std::optional<std::vector<double>> find_double_list(
-      const Node& node, std::string_view key);
+      const Node& node, std::string_view key, ParamTable subsystem = {});
   // Whatever type the key has (bool, integer, float, string, or an array of
   // strings or of numbers; an empty array is an empty double list).
   static std::optional<ParamValue> find_param(const Node& node,
-                                              std::string_view key);
-  // Throws std::invalid_argument naming the node, the key and the problem.
+                                              std::string_view key,
+                                              ParamTable subsystem = {});
+  // Throws std::invalid_argument naming the node, the key, the problem and
+  // the subsystem table read.
   [[noreturn]] static void param_error(const Node& node, std::string_view key,
-                                       std::string_view problem);
+                                       std::string_view problem,
+                                       ParamTable subsystem = {});
 
   // `schema` is the topic's identity (talOS/schema/identity.h): what the
   // segment checks at attach, describe reports and the log records.
+  // Without `on_message` each drain keeps only the newest message (skipped
+  // ones count as dropped); with it every message arrives in sequence, at
+  // most 64 per drain. subscription_age() is now minus the writer's
+  // publication time for both kinds.
   static std::size_t add_subscription(Node& node, std::string_view topic,
                                       std::size_t bytes, std::size_t alignment,
                                       const schema::Identity& schema,
@@ -156,6 +201,12 @@ struct NodeAccess {
   static bool subscription_fresh(const Node& node, std::size_t index,
                                  std::chrono::nanoseconds max_age);
   static bool subscription_updated(const Node& node, std::size_t index);
+  // Logs, in the dispatch log of the handler running now, that it acted on
+  // subscription `index`'s latched message: an EventKind::READ record with
+  // the watcher, now, that message's publish time and its RTMS sequence.
+  // Nothing without a value or outside a dispatch. Target::get() calls it for
+  // the lane an update() selects.
+  static void record_read(Node& node, std::size_t index);
   // A subscription that observes a topic rather than consuming it: what a
   // framework node that reads every state topic in the declared graph opens.
   // The graph lint does not count it as a reader (names.h
@@ -164,9 +215,23 @@ struct NodeAccess {
                                   std::size_t bytes, std::size_t alignment,
                                   const schema::Identity& schema);
 
+  // Refuses (std::invalid_argument) a topic that resolves into the hardware
+  // request namespace (naming::IsHardwareRequest), as add_byte_publisher
+  // does: only add_hardware_request opens one.
   static std::size_t add_publisher(Node& node, std::string_view topic,
                                    std::size_t bytes, std::size_t alignment,
                                    const schema::Identity& schema);
+  // The devices layer's flush: this node's hardware request,
+  // naming::HardwareRequestTopic(name), never remapped, declared to describe
+  // and the registry with naming::kSourceFlagHardwareRequest (the graph lint
+  // refuses a request writer without it). Sent with publisher_send. Once per
+  // node; a second call throws std::logic_error.
+  static std::size_t add_hardware_request(Node& node, std::size_t bytes,
+                                          std::size_t alignment,
+                                          const schema::Identity& schema);
+  // The topic add_hardware_request registered, or empty: for describe and
+  // the registry.
+  static std::string_view hardware_request(const Node& node);
   static bool publisher_send(Node& node, std::size_t index, const void* data,
                              std::size_t bytes);
 
@@ -190,6 +255,11 @@ struct NodeAccess {
   static std::uint64_t byte_topic_published(const Node& node,
                                             std::size_t index);
   static std::uint64_t byte_topic_dropped(const Node& node, std::size_t index);
+  // Wake notifications byte topic `index`'s writer could not send for a
+  // reason other than a gone receiver (ByteTopic::wake_failures). Safe to
+  // call from any thread.
+  static std::uint64_t byte_topic_wake_failures(const Node& node,
+                                                std::size_t index);
 
   // Who drives this node's subsystem, for the registry: one entry per
   // talos::Target (talOS/devices/target.h), in the order they were opened.

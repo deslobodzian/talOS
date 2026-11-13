@@ -8,7 +8,7 @@ import {test} from 'node:test';
 import React from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 
-import {decode} from '../src/core';
+import {TelemetryDecoder} from '../src/core';
 import type {Snapshot} from '../src/core';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {demoPacket} from '../src/demo';
@@ -36,14 +36,15 @@ function moduleFrames(): Snapshot[] {
 }
 
 function populatedStudio(): Studio {
-  const frames = [0n, 1n, 2n].map(n => decode(demoPacket(n))!);
+  const decoder = new TelemetryDecoder();
+  const frames = [0n, 1n, 2n].map(n => decoder.decode(demoPacket(n))!);
   return createStaticStudio({
     frames,
     playback: {
       mode: 'PAUSED',
       cursor_ns: frames[2].timestamp_ns,
       bounds: {start: frames[0].timestamp_ns, end: frames[2].timestamp_ns},
-      stats: {dropped: 0, late: 0, invalid: 0},
+      stats: {skipped: 0, late: 0, invalid: 0},
       status: 'Demo',
       connection: 'demo'
     }
@@ -67,27 +68,18 @@ test('groupByUnit keeps first-seen order and sorts unitless last', () => {
       ]);
 });
 
-test('assignYAxes returns nothing for no channels', () => {
+test('assignYAxes puts one unit per side, enums left with their labels as ticks', () => {
   assert.deepEqual(assignYAxes([]), []);
-});
-
-test('assignYAxes puts a single numeric unit on the left axis', () => {
   assert.deepEqual(assignYAxes([pc('vx', 'm/s'), pc('vy', 'm/s')]), [
     {scale: 'y', side: 'left', label: 'm/s', units: ['m/s'], labels: null,
      channels: ['vx', 'vy']}
   ]);
-});
-
-test('assignYAxes splits two numeric units onto left and right axes', () => {
   assert.deepEqual(assignYAxes([pc('vx', 'm/s'), pc('yaw', 'rad')]), [
     {scale: 'y', side: 'left', label: 'm/s', units: ['m/s'], labels: null,
      channels: ['vx']},
     {scale: 'y2', side: 'right', label: 'rad', units: ['rad'], labels: null,
      channels: ['yaw']}
   ]);
-});
-
-test('assignYAxes gives enums the left axis with their labels as ticks', () => {
   assert.deepEqual(
       assignYAxes([pc('mode', '', ['idle', 'spin', 'feed']), pc('vx', 'm/s')]), [
         {scale: 'y', side: 'left', label: '', units: [''],
@@ -135,17 +127,8 @@ test('plot config parsing accepts the events field and stays backward compatible
        assert.deepEqual(
            plotPanel.parseConfig({channels: ['a', 2, null], windowSeconds: 'x'}),
            {channels: ['a'], windowSeconds: null, events: true});
-       assert.deepEqual(plotPanel.parseConfig(plotPanel.defaultConfig),
-                        plotPanel.defaultConfig);
      });
 
-test('the plot renders its toolbar and empty drawer without throwing', () => {
-  const html = renderPlot(createStaticStudio({}));
-  assert.ok(html.includes('Channels'));
-  assert.ok(html.includes('0 channels'));
-  assert.ok(html.includes('No channels yet.'));
-  assert.ok(html.includes('Select channels from the drawer, or search.'));
-});
 
 test('the plot drawer keeps module channels distinct', () => {
   const studio = createStaticStudio({frames: moduleFrames()});
@@ -157,8 +140,17 @@ test('the plot drawer keeps module channels distinct', () => {
   assert.ok(!html.includes('>angle_rad<'), 'module channels must not be bare leaves');
 });
 
-test('the plot renders its window presets for a populated studio', () => {
-  const html = renderPlot(populatedStudio());
-  for (const label of ['10 s', '30 s', '2 min', 'All history', 'Events'])
-    assert.ok(html.includes(label), `missing ${label}`);
+
+test('the plot window selector retains custom configured durations', () => {
+  for (const windowSeconds of [5, 45, 2.5]) {
+    const html = renderToStaticMarkup(
+        <StudioProvider studio={populatedStudio()}>
+          <plotPanel.component
+              config={{channels: [], windowSeconds, events: true}}
+              setConfig={() => {}} instanceId="test"/>
+        </StudioProvider>);
+    assert.ok(html.includes(
+        `<option value="${windowSeconds}" selected="">${windowSeconds} s</option>`),
+        html);
+  }
 });

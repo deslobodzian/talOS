@@ -19,7 +19,9 @@ genrule(
     srcs = ["//talOS/telemetry:telemetry.fbs"],
     outs = [
         "src/generated/talos/telemetry.ts",
+        "src/generated/talos/telemetry/alert-level.ts",
         "src/generated/talos/telemetry/channel-info.ts",
+        "src/generated/talos/telemetry/channel-kind.ts",
         "src/generated/talos/telemetry/frame.ts",
         "src/generated/talos/telemetry/pose.ts",
     ],
@@ -40,9 +42,11 @@ js_library(
         "agent/*.mjs",
         "tests/*.mjs",
     ]) + [
+        "drive.html",
         "index.html",
         "package.json",
         "tsconfig.json",
+        "vite.config.mjs",
         ":telemetry_ts",
     ],
     deps = [":node_modules"],
@@ -64,6 +68,9 @@ tsc_bin.tsc_test(
     data = [":sources"],
 )
 
+# The webroot a bundle carries (talos_bundle studio_webroot): index.html
+# (Studio, at /), drive.html (the driver dashboard, at /drive) and their
+# assets/<name>-<hash>.<ext>, both pages from vite.config.mjs's inputs.
 js_run_binary(
     name = "web_dist",
     srcs = [":sources"],
@@ -106,10 +113,12 @@ js_binary(
 # the C++ launcher really produced, so a change to its envelope fails here.
 STUDIO_TESTS = {
     "agent_test": "agent.test.ts",
+    "alerts_test": "alerts.test.ts",
     "commands_test": "commands.test.ts",
     "core_test": "core.test.ts",
     "declared_test": "declared.test.ts",
     "discovery_test": "discovery.test.ts",
+    "drive_test": "drive.test.ts",
     "events_panel_test": "events_panel.test.tsx",
     "events_test": "events.test.ts",
     "field_test": "field.test.tsx",
@@ -122,7 +131,8 @@ STUDIO_TESTS = {
     "manifest_test": "manifest.test.ts",
     "panels_test": "panels.test.tsx",
     "plot_test": "plot.test.tsx",
-    "registry_test": "registry.test.tsx",
+    "recorded_test": "recorded.test.tsx",
+    "review_golden_test": "review_golden.test.ts",
     "robot_panel_test": "robot_panel.test.tsx",
     "robot_test": "robot.test.ts",
     "session_test": "session.test.tsx",
@@ -131,13 +141,23 @@ STUDIO_TESTS = {
     "system_test": "system.test.ts",
     "view_test": "view.test.tsx",
     "vision_test": "vision.test.tsx",
+    "worker_test": "worker.test.ts",
+}
+
+# A test's data beyond the sources. review_golden: the review server's golden
+# responses, which //studio/review:review_test holds the server to. system:
+# the Studio bridge's golden graph and update, which
+# //studio/bridge:system_test holds the bridge to.
+STUDIO_TEST_DATA = {
+    "review_golden_test": ["//studio/review:golden"],
+    "system_test": ["//studio/bridge:golden"],
 }
 
 [
     js_test(
         name = name,
         chdir = "studio",
-        data = [":sources"],
+        data = [":sources"] + STUDIO_TEST_DATA.get(name, []),
         entry_point = "tests/run.mjs",
         fixed_args = [test_file],
         patch_node_fs = False,
@@ -149,7 +169,11 @@ test_suite(
     name = "tests",
     tests = [":" + name for name in STUDIO_TESTS] + [
         ":typecheck",
+        "//studio/bridge:describe_test",
+        "//studio/bridge:fast_slots_test",
+        "//studio/bridge:integration_test",
         "//studio/bridge:system_test",
+        "//studio/bridge:telemetry_test",
         "//talOS/telemetry:wire_test",
     ],
 )

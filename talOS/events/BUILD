@@ -11,6 +11,7 @@ cc_library(
         "callback.h",
         "context.h",
         "delivery.h",
+        "dispatch_observer.h",
         "manifest.h",
         "recorder.h",
         "scheduler.h",
@@ -45,7 +46,10 @@ cc_library(
         "log/log_writer.h",
     ],
     visibility = ["//visibility:public"],
-    deps = [":events_core"],
+    deps = [
+        ":events_core",
+        "//talOS/process:durable_sync",
+    ],
 )
 
 cc_test(
@@ -59,7 +63,20 @@ cc_test(
     ],
 )
 
-# Platform readiness backend. kqueue on macOS, epoll + timerfd on Linux; the
+# Integration tier (fork, SIGKILL): its own target, out of log_test's lane.
+cc_test(
+    name = "log_kill_test",
+    size = "small",
+    srcs = ["log/log_kill_test.cc"],
+    tags = ["integration"],
+    deps = [
+        ":events_log",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Platform readiness backend. kqueue on macOS, epoll_pwait2 on Linux; the
 # concrete type is picked at compile time so there is no virtual dispatch.
 cc_library(
     name = "events_os",
@@ -112,6 +129,7 @@ cc_library(
         ":events_os",
         "//talOS/ipc",
         "//talOS/rtms",
+        "//talOS/rtms:wake",
         "@flatbuffers",
     ],
 )

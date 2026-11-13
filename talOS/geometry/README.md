@@ -11,25 +11,26 @@ for spatial. Include `talOS/geometry/lie.h`.
   for SE(3).
 * `SO2` construction, composition and logarithms use angles in `(-pi, pi]`.
   `FromCosSin` accepts an unnormalized cosine/sine pair.
-* `SE2::Discretize(vx, vy, omega, dt)` takes the logarithm of the desired
-  finite-period pose `(omega * dt, {vx * dt, vy * dt})` and divides its twist
-  by `dt`. Integrating that twist with `Exp` reaches the requested pose;
-  nonpositive periods return the original velocities.
+* `SE2::Discretize(vx, vy, omega, dt)` returns the constant twist whose `Exp`
+  over `dt` reaches the finite-period pose `(omega * dt, {vx * dt, vy * dt})`.
+  Its rate stays `omega` for any `dt` (it never wraps past pi); only the linear
+  part goes through `V(omega * dt)^-1`, which grows without bound near the
+  nonzero multiples of 2 pi where no twist with that rate translates.
+  Nonpositive periods return the original velocities.
 * `SO3::FromMatrixNormalized` projects noisy matrices onto proper rotations
   using fixed-size SVD, including a determinant correction for reflections.
   `RightJacobianInverse` is the closed-form inverse of the right Jacobian.
-* `SO3::Log` is exact away from the pi branch cut and reconstructs the
-  axis by the largest-diagonal method at it; every rotation round-trips.
+* `SO3::Log` uses the skew part away from pi and reconstructs the axis by the
+  largest-diagonal method near pi.
 * `SE3::RightJacobianOfExp` is a 3rd-order BCH series (error O(|tau|^4)):
   accurate for small optimizer steps, not a large-angle formula. The
   rotation-only `SO3::RightJacobianOfExp` is exact closed form.
-* Scalar-templated (`double` default; `float` works). Autodiff scalar
-  types are future work: the small-angle branches compare against a
-  threshold, which ordering-free scalar types cannot do.
+* Scalar-templated (`double` default). Small-angle branches require scalar
+  comparisons.
 
 ## Performance notes
 
-* Fixed-size Eigen types only: zero heap allocation on any path.
+* Geometry operations use fixed-size Eigen types.
 * SE(3) stores rotation + translation separately, so composition costs a
   3x3 product plus one action instead of a 4x4 product.
 * Exp/Log are closed form (Rodrigues, V matrix): no matrix exponential,

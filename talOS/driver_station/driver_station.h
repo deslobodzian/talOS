@@ -35,7 +35,17 @@ enum DsFlags : uint32_t {
 // data, FMS attachment and joysticks do not.
 inline constexpr uint32_t kModeFlags =
     kDsAttached | kEnabled | kAutonomous | kTeleop | kTest | kEStop;
-constexpr uint32_t ModeKey(uint32_t flags) { return flags & kModeFlags; }
+
+// A mode bit names a mode only while a Driver Station is attached: with
+// none, WPILib's HAL reports teleop as its default control word. The flags a
+// sampler publishes, and its generations, drop them while detached.
+constexpr uint32_t ShownFlags(uint32_t flags) {
+  return (flags & kDsAttached) != 0 ? flags
+                                    : flags & ~(kAutonomous | kTeleop | kTest);
+}
+constexpr uint32_t ModeKey(uint32_t flags) {
+  return ShownFlags(flags) & kModeFlags;
+}
 
 constexpr std::size_t kMaxJoysticks = 6;
 constexpr std::size_t kMaxAxes = 12;
@@ -48,22 +58,22 @@ constexpr std::size_t kMaxEventNameLength = 32;
 // Encoded scalar fields and the two FMS string length prefixes. String
 // storage reserves one byte for NUL; each wire string adds one length byte.
 constexpr std::size_t kFixedEncodedSize =
-    8 + 8 + 4 + 1 + 1 + 1 + 2 + 1 + 4 + 1 + 1;
+    8 + 8 + 8 + 4 + 1 + 1 + 1 + 2 + 1 + 4 + 1 + 1;
 constexpr std::size_t kMaxJoystickEncodedSize =
     1 + 1 + 1 + 1 + 4 + 4 * kMaxAxes + 2 * kMaxPovs + kMaxNameLength;
 constexpr std::size_t kMaxEncodedSize =
     kFixedEncodedSize + (kMaxGameMessageLength - 1) +
     (kMaxEventNameLength - 1) + kMaxJoysticks * kMaxJoystickEncodedSize;
-static_assert(kFixedEncodedSize == 32,
+static_assert(kFixedEncodedSize == 40,
               "Driver Station fixed size changed; update docs/DATA_FLOW.md");
 static_assert(kMaxJoystickEncodedSize == 96,
               "Driver Station joystick size changed; update docs/DATA_FLOW.md");
-static_assert(kMaxEncodedSize == 670,
+static_assert(kMaxEncodedSize == 678,
               "Driver Station maximum size changed; update docs/DATA_FLOW.md");
 
 // The Driver Station itself only produces new data at 50 Hz, so sampling any
-// faster only duplicates packets. Must stay in sync with the
-// [subsystems.driver_station] period_us in the robot configuration.
+// faster only duplicates packets. hardware::Validate sizes the shortest
+// [robot] command_timeout_us from it.
 inline constexpr uint64_t kSamplePeriodUs = 20000;
 
 struct JoystickData {
@@ -95,31 +105,40 @@ struct FmsData {
 
 struct DriverStationData {
   uint64_t sample_time_us{0};
-  // The mode generation: the sample_time_us of the first sample in the
-  // current mode (ModeKey of the flags), never 0. Stamped by the sampler's
-  // ModeTracker; a packet that never went through one carries 0, which no
-  // target accepts.
+  // The mode generation: the time of the first observation in the current
+  // mode (ModeKey of the flags), never 0. Stamped by the sampler's ModeTracker;
+  // a packet that never went through one carries 0, which no target accepts.
   uint64_t mode_since_us{0};
+  // The sampling gateway's boot id, the same one its hardware State carries
+  // (random per program start). Sample and mode times are on that boot's
+  // clock, so they order packets only within one boot: a consumer starts
+  // its ordering over on a new boot and ignores a recently retired one.
+  // 0 from a sampler with no gateway (send_joystick).
+  uint64_t boot_id{0};
   FmsData fms{};
   std::array<JoystickData, kMaxJoysticks> joysticks{};
 
   bool operator==(const DriverStationData&) const = default;
 };
 
-// What every Driver Station sampler (the RoboRIO program, SimHardware,
-// send_joystick) runs on each sample before encoding it, so a target issued
-// under an earlier enable or mode can be told from one issued under this one
-// (talOS/devices/target.h):
+// Tracks mode generations independently of packet publication. Every hardware
+// tick must Observe the same flags used to enable the gateway, even when no
+// Driver Station packet is due. Stamp clears a detached sample's mode bits
+// (ShownFlags) and also observes it, so samplers
+// without a faster hardware tick can simply stamp each packet before encoding.
 //
-//   DriverStationData ds = Sample(now_us);
-//   tracker.Stamp(ds);
-//   Encode(ds, buffer);
+//   tracker.Observe(flags, now_us);
+//   if (sample_due) {
+//     DriverStationData ds = Sample(now_us);
+//     tracker.Stamp(ds);
+//     Encode(ds, buffer);
+//   }
 //
-// Stamp sets ds.mode_since_us to the sample_time_us of the first sample whose
-// ModeKey differs from the previous sample's. Each new generation is at least
-// 1 and later than the one before, even if sample times repeat or step back.
+// Each new generation is at least 1 and later than the one before, even if
+// observation times repeat or step back.
 class ModeTracker {
  public:
+  void Observe(uint32_t flags, uint64_t now_us);
   void Stamp(DriverStationData& ds);
 
  private:

@@ -1,0 +1,3 @@
+# A [trajectories] file that does not exist fails config load.
+accept = false
+error_contains = "trajectories.two_piece"

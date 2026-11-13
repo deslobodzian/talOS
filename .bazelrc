@@ -1,4 +1,10 @@
 common --enable_bzlmod
+# Never generate empty __init__.py files in runfiles. Bazel reuses sandbox
+# directories across tests; a generated empty file at a path where another
+# test links a tracked source is written through that stale link, truncating
+# the source (talOS/python/talos/__init__.py). tools/check_runfiles_collisions.py
+# guards this in CI.
+common --incompatible_default_to_explicit_init_py
 
 build --enable_platform_specific_config
 
@@ -7,6 +13,9 @@ build --enable_platform_specific_config
 build --test_env=PYTHONDONTWRITEBYTECODE=1
 
 build:linux --cxxopt=-std=c++23 --cxxopt=-O3
+# Build tools (the config resolver run inside bundle/manifest actions) compile
+# in the exec configuration, which ignores --cxxopt.
+build:linux --host_cxxopt=-std=c++23 --host_cxxopt=-O3
 # libjpeg-turbo 3.1.2 (BCR, via OpenCV) on x86-64 Linux defines its hidden
 # jpeg_nbits_table in the SIMD assembly library while the C library references
 # it; Bazel links test dependencies as separate shared objects, so every test
@@ -23,5 +32,46 @@ build:macos --cxxopt=-std=c++23 --cxxopt=-O3
 # than both, so without these the whole C++ tree fails to build here while
 # building fine on Linux CI.
 build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library
-build:macos --macos_minimum_os=13.4
-build:windows --cxxopt=/std:c++23 --cxxopt=-O3
+build:macos --host_cxxopt=-std=c++23 --host_cxxopt=-O3
+build:macos --host_cxxopt=-fexperimental-library --host_linkopt=-fexperimental-library
+build:macos --macos_minimum_os=13.4 --host_macos_minimum_os=13.4
+
+# Sanitizer builds instrument both C and C++ dependencies and link the
+# matching runtime. Keep stack traces useful and make UB fail the test.
+build:asan --copt=-fsanitize=address,undefined --linkopt=-fsanitize=address,undefined
+build:asan --copt=-fno-omit-frame-pointer --copt=-fno-sanitize-recover=undefined
+build:asan --copt=-O1 --cxxopt=-O1
+# No dependency exemptions: AprilTag's pjpeg (offline DetectImageFile only;
+# live detection takes raw camera buffers) is patched for its signed shifts and
+# an out-of-range coefficient run (third_party/apriltag_pjpeg_bounds.patch).
+test:asan --test_tag_filters=-no_asan
+build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
+build:tsan --copt=-fno-omit-frame-pointer --copt=-O1 --cxxopt=-O1
+test:tsan --test_tag_filters=-no_tsan
+# AprilTag parent accesses are patched to relaxed atomics; its quad-threshold
+# code remains TSan-instrumented, including parallel row-band clustering.
+# OpenCV's pthread worker activity flag is patched to atomic accesses, and its
+# upstream thread_body suppression is removed. Normal internal parallelism is
+# enabled under TSan; no OpenCV thread-count environment override is applied.
+
+# A deployable bundle: `bazel build --config=release <bundle>` records the
+# source revision and dirty flag (tools/workspace_status.sh) in
+# bundle_manifest.toml, and from there in every session manifest. Unstamped
+# builds never read the status, so they stay cached across commits.
+build:release --stamp --workspace_status_command=tools/workspace_status.sh
+
+# Test lanes (docs/TESTING.md §9). A test's lane is its tag: `heavy`,
+# `integration`, `e2e` or `perf`; an untagged test is in the fast lane, and
+# the soak is `manual`. `bazel test --config=fast //...` is the everyday loop.
+# Bazel keeps only the last --test_tag_filters, so a lane config and a
+# sanitizer config (or a CI job's own filter) must not be combined: pass one
+# filter naming both, e.g.
+#   bazel test --config=asan --test_tag_filters=-no_asan,-heavy,-integration,-e2e,-perf //...
+test:fast --test_tag_filters=-heavy,-integration,-e2e,-perf
+test:heavy --test_tag_filters=heavy
+test:integration --test_tag_filters=integration
+test:e2e --test_tag_filters=e2e
+test:perf --test_tag_filters=perf
+# Every lane but e2e: what hosted macOS runs on each push, where the
+# full-graph timed tests cannot hold their bounds.
+test:no_e2e --test_tag_filters=-e2e

@@ -26,7 +26,9 @@ cc_library(
     ],
     include_prefix = "drivetrain",
     strip_include_prefix = ".",
-    visibility = ["//visibility:private"],
+    # The config golden test checks autonomous's tolerances against the
+    # swerve hold speed.
+    visibility = ["//2026-robot/main_processor/configuration:__pkg__"],
     deps = [
         "//talOS/configuration",
         "//talOS/devices",
@@ -45,6 +47,7 @@ cc_library(
     deps = [
         ":messages",
         ":swerve",
+        "//talOS/bridge:messages",
         "//talOS/devices",
         "//talOS/node",
     ],
@@ -68,6 +71,7 @@ cc_binary(
         "//talOS/driver_station",
         "//talOS/events:events_os",
         "//talOS/hardware",
+        "//talOS/introspection:names",
         "//talOS/ipc",
     ],
 )
@@ -81,6 +85,7 @@ cc_binary(
         ":swerve",
         "//talOS/devices",
         "//talOS/hardware",
+        "//talOS/introspection:names",
         "//talOS/ipc",
         "//talOS/process",
     ],
@@ -103,6 +108,9 @@ cc_test(
         ":drivetrain",
         "//talOS/configuration",
         "//talOS/devices:testing",
+        "//talOS/introspection:describe",
+        "//talOS/node",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

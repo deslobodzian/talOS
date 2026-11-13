@@ -32,10 +32,3 @@ struct PositionState {
   at_goal:bool;
   connected:bool;
 }
-
-// Standard planar chassis velocity command for swerve or differential drives.
-struct ChassisTarget {
-  vx_mps:double;
-  vy_mps:double;
-  omega_radps:double;
-}

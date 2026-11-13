@@ -8,11 +8,13 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "talOS/devices/devices.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/node/access.h"
 #include "talOS/node/sim_access.h"
 #include "talOS/node/testing.h"
@@ -37,6 +39,9 @@ using target_test::Goal;
 using target_test::Small;
 static_assert(sizeof(TargetEnvelope<Goal>) == 24);
 static_assert(sizeof(TargetEnvelope<Small>) == 20);
+// Neither handle exists without its node: get() and send() always have one.
+static_assert(!std::is_default_constructible_v<Target<Goal>>);
+static_assert(!std::is_default_constructible_v<TargetLane<Goal>>);
 
 // The lift lets auto-align preempt the driver in teleop (robot default); the
 // wrist overrides teleop and opts into test mode.
@@ -111,12 +116,6 @@ class TargetTest : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(TargetTest, TeleopLaneDrivesInTeleop) {
-  Hold("teleop", 1.5, 20ms);
-  EXPECT_EQ(Seen(), 1.5);
-  EXPECT_EQ(lift.source, "teleop");
-}
-
 TEST_F(TargetTest, NeverSentIsNull) {
   sim.step(50ms);
   EXPECT_EQ(Seen(), std::nullopt);
@@ -149,6 +148,160 @@ TEST_F(TargetTest, StaleLaneIsNull) {
   EXPECT_EQ(Seen(), 1.0);  // still younger than command_timeout_us
   sim.step(10ms);          // 100 ms since it arrived
   EXPECT_EQ(Seen(), std::nullopt);
+}
+
+struct PausableProducer {
+  explicit PausableProducer(Node& node) : lane{node, "lift", "teleop"} {}
+  void update() { lane.send(Goal{0.5}); }
+  TargetLane<Goal> lane;
+};
+
+struct ActuatingConsumer {
+  explicit ActuatingConsumer(Node& node) : target{node}, motor{node, "m"} {}
+  void update() {
+    if (const auto* goal = target.get())
+      motor.set_duty_cycle(goal->position_rot());
+    ++updates;
+  }
+  Target<Goal> target;
+  Motor motor;
+  int updates = 0;
+};
+
+TEST(Target,
+     PausedProducerExpiresToNeutralWhileConsumerAndHardwareKeepRunning) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<PausableProducer>("wrist");
+  sim.add<ActuatingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  ASSERT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  sim.pause("wrist", 200ms);
+  sim.step(105ms);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+  sim.resume("wrist");
+  sim.step(5ms);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  hw.enable(false);
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+}
+
+TEST(Target, PausedConsumerNeverActuatesOnExpiredQueuedTargetAfterResume) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& lift = sim.add<ActuatingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  const int updates = lift.updates;
+  sim.pause("lift", 125ms);
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  sim.step(124ms);
+  EXPECT_EQ(lift.updates, updates);
+  sim.step(1ms);
+  EXPECT_EQ(lift.updates, updates + 1);
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
+}
+
+// Each update() that selects a lane logs one READ record of that lane's
+// message (its publish time), the dispatch-log evidence of the target age a
+// tick acted on; a stale or released lane, or a disabled robot, selects
+// nothing and logs nothing.
+// Asks its Target twice per update(), as a node that also reports source().
+struct RepeatedlyAskingConsumer {
+  explicit RepeatedlyAskingConsumer(Node& node)
+      : target{node}, motor{node, "m"} {}
+  void update() {
+    for (int i = 0; i < 2; ++i) {
+      if (const auto* goal = target.get())
+        motor.set_duty_cycle(goal->position_rot());
+      static_cast<void>(target.source());
+    }
+    ++updates;
+  }
+  Target<Goal> target;
+  Motor motor;
+  int updates = 0;
+};
+
+TEST(Target, EachSelectingUpdateLogsOneReadOfTheLane) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& lift = sim.add<RepeatedlyAskingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(12ms);  // off the tick grid
+  const auto reads = [&] { return detail::SimAccess::reads(sim, "lift"); };
+  ASSERT_EQ(reads().count, 0U);
+  // 20 ms of updates that log no READ.
+  const auto expect_no_reads = [&](const char* why) {
+    const std::uint64_t count = reads().count;
+    const int updates = lift.updates;
+    sim.step(20ms);
+    EXPECT_GT(lift.updates, updates) << why;
+    EXPECT_EQ(reads().count, count) << why;
+  };
+
+  const Time published = sim.now();
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  int updates = lift.updates;
+  sim.step(15ms);
+  ASSERT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kDutyCycle);
+  EXPECT_GT(lift.updates, updates);
+  EXPECT_EQ(reads().count, static_cast<std::uint64_t>(lift.updates - updates));
+  EXPECT_EQ(reads().topic, "/lift/target/teleop");
+  EXPECT_EQ(reads().publish_time, published);
+
+  sim.step(100ms);  // the lane passes command_timeout_us
+  expect_no_reads("stale lane");
+
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  sim.step(5ms);
+  const std::uint64_t fresh = reads().count;
+  ReleaseTarget<Goal>(sim, "lift", "teleop");
+  sim.step(5ms);
+  EXPECT_GT(fresh, 0U);
+  expect_no_reads("released lane");
+
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  updates = lift.updates;
+  const std::uint64_t before = reads().count;
+  sim.step(5ms);
+  EXPECT_EQ(reads().count - before,
+            static_cast<std::uint64_t>(lift.updates - updates));
+  hw.enable(false);
+  sim.step(5ms);
+  PublishTarget(sim, "lift", "teleop", Goal{0.5});
+  expect_no_reads("disabled");
+}
+
+TEST(Target, FirstDrainAfterCommandTimeoutDoesNotReviveAnOldTarget) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+[subsystems.lift]
+period_us = 200000
+[subsystems.mech.motors.m]
+can_id = 1
+)");
+  auto& lift = sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  PublishTarget(sim, "lift", "teleop", Goal{2.0});
+  sim.step(190ms);  // First consumer drain; the producer has been silent.
+  EXPECT_TRUE(robot_enabled(sim.node("lift")));
+  EXPECT_EQ(lift.target.get(), nullptr);
+  EXPECT_FALSE(lift.seen);
+  EXPECT_EQ(lift.source, "");
 }
 
 TEST_F(TargetTest, ModeSwitchIgnoresTheOldModesLane) {
@@ -188,6 +341,107 @@ TEST_F(TargetTest, TargetQueuedBeforeTheModeChangeIsRejectedInTheSameDrain) {
   sim.step(5ms);
   EXPECT_EQ(Seen(), std::nullopt);
   EXPECT_EQ(lift.source, "");
+}
+
+TEST_F(TargetTest, FlapBetweenPublishedSamplesRejectsTheOldGeneration) {
+  hw.stop_driver_station();
+  ds::ModeTracker tracker;
+  auto publish_ds = [&] {
+    auto data = DsPacket(kTeleop);
+    data.sample_time_us = static_cast<uint64_t>(sim.now().nanos() / 1000);
+    tracker.Stamp(data);
+    hardware::Packet packet{};
+    packet.size = static_cast<uint32_t>(ds::Encode(data, packet.data));
+    sim.publish(hardware::kDriverStationTopic, packet);
+    return data.mode_since_us;
+  };
+
+  const uint64_t before = publish_ds();
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, before);
+  sim.step(5ms);
+  ASSERT_EQ(Seen(), 1.0);
+
+  // No DS packet is published during these two hardware observations.
+  tracker.Observe(ds::kDsAttached | ds::kTeleop,
+                  static_cast<uint64_t>(sim.now().nanos() / 1000));
+  sim.step(5ms);
+  tracker.Observe(ds::kDsAttached | kTeleop,
+                  static_cast<uint64_t>(sim.now().nanos() / 1000));
+  sim.step(10ms);
+  const uint64_t after = publish_ds();  // 20 ms after the previous packet
+  ASSERT_GT(after, before);
+  // Still fresh, but stamped before the unreported disable/re-enable.
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, before);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  PublishTarget(sim, "lift", "teleop", Goal{3.0}, after);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), 3.0);
+}
+
+// A RoboRIO reboot restarts the gateway clock: boot B's generations are low
+// where boot A's were high. A lane stamped under A's generation never drives
+// after the consumer has taken B's packets, not even after a delayed A packet
+// arrives, and B's own generation drives only while B is enabled and fresh.
+TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
+  hw.stop_driver_station();
+  ds::ModeTracker boot_a, boot_b;
+  auto publish_ds = [&](ds::ModeTracker& tracker, uint64_t boot_id,
+                        uint64_t sample_time_us, uint32_t flags) {
+    auto data = DsPacket(flags);
+    data.boot_id = boot_id;
+    data.sample_time_us = sample_time_us;
+    tracker.Stamp(data);
+    hardware::Packet packet{};
+    packet.size = static_cast<uint32_t>(ds::Encode(data, packet.data));
+    sim.publish(hardware::kDriverStationTopic, packet);
+    return data.mode_since_us;
+  };
+  constexpr uint64_t kBootA = 0xA1, kBootB = 0xB1;
+
+  const uint64_t a = publish_ds(boot_a, kBootA, 900'000'000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{1.0}, a);
+  sim.step(5ms);
+  ASSERT_EQ(Seen(), 1.0);
+
+  const uint64_t b = publish_ds(boot_b, kBootB, 1000, kTeleop);
+  ASSERT_LT(b, a);
+  PublishTarget(sim, "lift", "teleop", Goal{2.0}, a);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  // A's last packet, delayed past the reboot, cannot bring A's generation
+  // back.
+  publish_ds(boot_a, kBootA, 900'020'000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{2.5}, a);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  publish_ds(boot_b, kBootB, 21000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{3.0}, b);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), 3.0);
+
+  // Disabled in boot B: neutral, whatever generation the lane carries.
+  const uint64_t disabled = publish_ds(boot_b, kBootB, 41000, 0);
+  PublishTarget(sim, "lift", "teleop", Goal{3.5}, b);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+  PublishTarget(sim, "lift", "teleop", Goal{3.5}, disabled);
+  sim.step(5ms);
+  EXPECT_EQ(Seen(), std::nullopt);
+
+  // Enabled again, then silent past command_timeout_us: stale is neutral.
+  const uint64_t again = publish_ds(boot_b, kBootB, 61000, kTeleop);
+  PublishTarget(sim, "lift", "teleop", Goal{4.0}, again);
+  sim.step(5ms);
+  ASSERT_EQ(Seen(), 4.0);
+  for (int i = 0; i < 30; ++i) {
+    PublishTarget(sim, "lift", "teleop", Goal{4.0}, again);
+    sim.step(5ms);
+  }
+  EXPECT_EQ(Seen(), std::nullopt);
 }
 
 TEST_F(TargetTest, TargetOfTheNewGenerationIsAcceptedInTheSameDrain) {
@@ -470,6 +724,7 @@ TEST(TargetLane, SendsAndReleasesTheEnvelope) {
   EXPECT_EQ(lift.seen, std::nullopt);
 }
 
+// REQ-SAFE-12: a lane stamps 0 while the Driver Station is disabled
 TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Producer>("producer");
@@ -554,6 +809,113 @@ struct BadLane {
 TEST(TargetLane, RejectsASourceThatIsNotATopicSegment) {
   auto sim = Sim::FromToml(kRobotToml);
   EXPECT_THROW(sim.add<BadLane>("producer"), std::invalid_argument);
+}
+
+// An operator producer that sends whenever joystick 0's button 1 is held and
+// ignores what evaluate() says: its arming alone holds the lane released.
+// Its 20 ms period samples the Driver Station less often than the 5 ms
+// packets arrive.
+struct Operator {
+  explicit Operator(Node& node)
+      : ds{node}, arming{node}, lane{node, "lift", "teleop", arming} {}
+  void update() {
+    if (!ds.connected()) saw_stale = true;
+    const bool held = ds.joystick(0).button(1);
+    if (!paused) arming.evaluate(/*neutral=*/!held);
+    if (held) {
+      lane.send(Goal{0.5});
+    } else {
+      lane.release();
+    }
+  }
+  DriverStation ds;
+  OperatorArming arming;
+  TargetLane<Goal> lane;
+  bool paused = false;
+  bool saw_stale = false;
+};
+
+// A button held through any break in what the operator saw must be released
+// once, in the new view, before the lane drives again.
+// REQ-SAFE-13: a held input is released once after each break, then re-arms
+TEST(OperatorArming, HeldInputWaitsForNeutralAfterEveryBreak) {
+  enum class Break { kDisable, kReboot, kEvaluationGap, kUnsampledRecovery };
+  for (const Break disturbance :
+       {Break::kDisable, Break::kReboot, Break::kEvaluationGap,
+        Break::kUnsampledRecovery}) {
+    SCOPED_TRACE(static_cast<int>(disturbance));
+    auto sim = Sim::FromToml(std::string{kRobotToml} +
+                             "[subsystems.operator]\nperiod_us = 20000\n");
+    auto& op = sim.add<Operator>("operator");
+    auto& lift = sim.add<Consumer<Goal>>("lift");
+    SimHardware hw{sim};
+    hw.enable();
+    const auto packet = [](std::uint32_t flags, bool held) {
+      auto data = DsPacket(flags);
+      data.joysticks[0].connected = true;
+      data.joysticks[0].button_count = 1;
+      data.joysticks[0].buttons = held ? 1u : 0u;
+      return data;
+    };
+    const auto active = [&] {
+      const auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+      return envelope.has_value() && envelope->active != 0;
+    };
+
+    // Held from startup: never armed.
+    hw.set_driver_station(packet(kTeleop, true));
+    sim.step(60ms);
+    EXPECT_FALSE(active());
+    EXPECT_EQ(lift.seen, std::nullopt);
+    hw.set_driver_station(packet(kTeleop, false));
+    sim.step(40ms);
+    hw.set_driver_station(packet(kTeleop, true));
+    sim.step(40ms);
+    ASSERT_TRUE(active());
+    ASSERT_NE(lift.seen, std::nullopt);
+
+    switch (disturbance) {
+      case Break::kDisable:
+        hw.set_driver_station(packet(0, true));
+        sim.step(40ms);
+        hw.set_driver_station(packet(kTeleop, true));
+        break;
+      case Break::kReboot:
+        hw.reboot();
+        break;
+      case Break::kEvaluationGap:  // the Driver Station stays fresh
+        op.paused = true;
+        sim.step(120ms);
+        op.paused = false;
+        break;
+      case Break::kUnsampledRecovery: {
+        // Silent just past command_timeout_us, stale only between two of
+        // the operator's 20 ms evaluations (the last packet near 150 ms and
+        // the next near 255 ms, evaluations at 240 and 260 ms): the same
+        // generation and boot come back.
+        const std::uint64_t generation = DriverStationGeneration(sim);
+        sim.step(10ms);
+        op.saw_stale = false;
+        hw.stop_driver_station();
+        sim.step(102ms);
+        hw.set_driver_station(packet(kTeleop, true));
+        sim.step(20ms);
+        ASSERT_FALSE(op.saw_stale);
+        ASSERT_EQ(DriverStationGeneration(sim), generation);
+        break;
+      }
+    }
+    sim.step(60ms);
+    EXPECT_FALSE(active());
+    EXPECT_EQ(lift.seen, std::nullopt);
+
+    hw.set_driver_station(packet(kTeleop, false));
+    sim.step(40ms);
+    hw.set_driver_station(packet(kTeleop, true));
+    sim.step(40ms);
+    EXPECT_TRUE(active());
+    EXPECT_NE(lift.seen, std::nullopt);
+  }
 }
 
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {

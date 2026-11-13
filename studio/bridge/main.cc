@@ -1,55 +1,370 @@
 #include <App.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
-#include <csignal>
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cerrno>
+#include <charconv>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
+#include "drive.h"
 #include "system.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
+#include "talOS/rtms/wake.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "talOS/telemetry/wire.h"
 #include "telemetry.h"
+// uSockets' callback poll (`us_internal_callback_t`, POLL_TYPE_CALLBACK): how
+// its own timers and UDP sockets put a descriptor in the loop. Its public API
+// has no other way to watch a descriptor it did not open.
+extern "C" {
+#include "internal/internal.h"
+}
 namespace fs = std::filesystem;
 namespace {
-volatile std::sig_atomic_t stop = 0;
-void signal_handler(int) { stop = 1; }
-struct Client {};
-struct ReaderLease {
-  RTMSQueue& queue;
-  std::size_t id;
-  ~ReaderLease() { queue.release_reader(id); }
+using studio::EgressBudget;
+struct Client {
+  // A programmer client's own bucket. A drive client is charged to its
+  // slot's (studio::DriveSlots::Budget), which outlives the connection.
+  EgressBudget budget;
+  // A driver dashboard client (/drive), sent drive_feed; otherwise a
+  // programmer client (/telemetry), sent feeds.
+  bool drive = false;
+  // What this client has been sent of the graph and the telemetry; its
+  // updates carry only what changed.
+  studio::ClientFeeds feeds;
+  studio::DriveFeed drive_feed;
 };
+// Static files and the manifest are read synchronously on the loop thread
+// that also polls RTMS, so each is capped. The static cap is a few times the
+// built Studio bundle's largest asset; the manifest cap is Studio's own
+// MAX_MANIFEST_BYTES (studio/src/data/manifest.ts), which rejects anything
+// larger anyway.
+constexpr std::uintmax_t kMaxStaticFileBytes = std::uintmax_t{4} * 1024 * 1024;
+constexpr std::uintmax_t kMaxManifestBytes = std::uintmax_t{1024} * 1024;
+// The manifest's bytes, or "" when it is absent, unreadable or over the cap.
+std::string ReadManifest(const std::string& path) {
+  if (path.empty()) return {};
+  std::error_code error;
+  const std::uintmax_t size = fs::file_size(path, error);
+  if (error || size > kMaxManifestBytes) return {};
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return {};
+  return {std::istreambuf_iterator<char>(input), {}};
+}
+// The id of the segment the shared-memory name `segment` holds now, or
+// nullopt while there is none or its creator has not finished initializing
+// it. Maps only the header, read-only, and keeps nothing open.
+std::optional<std::uint64_t> SegmentId(const std::string& segment) {
+  const int fd = ::shm_open(segment.c_str(), O_RDONLY, 0);
+  if (fd < 0) return std::nullopt;
+  std::optional<std::uint64_t> id;
+  struct stat status {};
+  // A segment still being sized is shorter than its header; mapping past
+  // its end would fault on the first read.
+  if (::fstat(fd, &status) == 0 &&
+      status.st_size >= static_cast<off_t>(sizeof(RTMSHeader))) {
+    void* mapped =
+        ::mmap(nullptr, sizeof(RTMSHeader), PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped != MAP_FAILED) {
+      const auto* header = static_cast<const RTMSHeader*>(mapped);
+      if (header->magic.load(std::memory_order_acquire) == kRtmsMagic) {
+        id = header->segment_id;
+      }
+      ::munmap(mapped, sizeof(RTMSHeader));
+    }
+  }
+  ::close(fd);
+  return id;
+}
 using Socket = uWS::WebSocket<false, true, Client>;
 struct Bridge {
-  RTMSQueue& queue;
-  std::size_t reader;
   std::string topic;
-  std::set<Socket*> clients;
+  // The telemetry topic, once its publisher's segment exists. The bridge
+  // serves HTTP and the system graph without it, waits for the segment
+  // rather than refusing to start, and re-attaches when the name comes to
+  // hold a different segment (a new launcher session, or one created after
+  // the last holder of the old one closed it).
+  std::string segment;
+  std::optional<RTMSQueue> queue;
+  std::size_t reader = 0;
+  std::uint64_t segment_id = 0;
+  bool announced_wait = false;
+  // The wake channel (talOS/rtms README "Wake channel"): the reader slot
+  // names this receiver, so a publication wakes the loop. Empty when none
+  // could be made; the loop then reads every WakeSchedule::kFallbackNs.
+  std::optional<talos::WakeReceiver> wake;
+  // The last read stopped at its page budget, or could not arm the wake:
+  // there may be pages to read, so the loop comes back in kFallbackNs.
+  bool backlog = false;
+  // Every duty the loop wakes for on its own (next_wake_ns).
+  studio::WakeSchedule schedule;
+  std::string attach_error;
+  // Every send to a client leaves in one of its passes (pass_clients).
+  studio::ClientRotation<Socket*> clients;
   us_listen_socket_t* listener = nullptr;
+  // ws_drops counts messages the socket refused; that client is then
+  // resynchronized (the whole graph, a telemetry keyframe). A graph or
+  // telemetry update the budget defers is not counted: the client's next
+  // update carries its changes. forwarded counts complete producer ticks.
   std::uint64_t invalid = 0, ws_drops = 0, forwarded = 0;
+  // Frames the publisher overwrote before this bridge read them: it never
+  // waits for the bridge, so a stalled bridge is lapped instead.
+  std::uint64_t lapped = 0;
+  // Client passes held because the client still had output buffered: a
+  // client that stopped reading costs the others no turn and no budget.
+  std::uint64_t held = 0;
+  // read_next() copies each page here and validates the copy before
+  // ingesting commits side effects (client sends, counters).
+  std::vector<std::byte> frame =
+      std::vector<std::byte>(talos::telemetry_wire::slot_bytes);
+  std::size_t max_clients = 4;
+  std::uint64_t refused = 0, egress_bytes = 0;
+  // The shared bucket and every client's rate, with the drive clients'
+  // budget reserved out of the total (studio::BridgeEgress).
+  studio::BridgeEgress egress;
+  // The driver dashboard, when [studio] dashboard names a layout that
+  // parses (studio/bridge/drive.h): /drive/layout.json, the drive clients'
+  // mask and slots, and the summary built from the launcher's manifest,
+  // the registry and, for what the manifest does not say (`critical`, or
+  // the roster when there is no manifest), the config. Drive clients that
+  // took a newer one's slot are counted in evicted.
+  std::optional<talos::telemetry::DashboardLayout> layout;
+  std::string layout_json;
+  studio::DriveMask drive_mask;
+  studio::DriveSlots<Socket*> drive_clients;
+  std::vector<studio::DriveRosterEntry> config_roster;
+  std::string manifest_path;
+  std::vector<talos::introspect::NodeSnapshot> registry_nodes;
+  bool registry_read = false;  // the last refresh could open the registry
+  std::string drive_summary;
+  std::uint64_t evicted = 0;
+  // Returns from the event loop's wait (every one, whatever woke it), and of
+  // them the ones a telemetry publication or a deadline timer woke.
+  std::uint64_t wakes = 0, publication_wakes = 0, deadline_wakes = 0;
 
-  // The decoded v2 feed: latest dictionary and latest aligned frame,
-  // backing /telemetry.json, /channels.json and the dictionary a newly
-  // connected WebSocket client is handed on open.
+  Bridge() = default;
+  Bridge(const Bridge&) = delete;
+  Bridge& operator=(const Bridge&) = delete;
+  ~Bridge() { detach(); }
+
+  void detach() {
+    if (!queue) return;
+    queue->release_reader(reader);
+    queue.reset();
+  }
+
+  // Attaches to segment `id` of the topic. False, logged once per distinct
+  // error, when the segment cannot be used yet; the next check retries.
+  bool attach(std::uint64_t id) {
+    try {
+      // A reader's policy only decides whether it may take the slot the
+      // writer is about to reuse; overwrite is right for any publisher.
+      RTMSQueue next(topic, talos::telemetry_wire::slot_bytes, 8,
+                     talos::schema::Bytes(), talos::telemetry_wire::slot_count,
+                     {OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE});
+      // Replaced while attaching: which one `next` mapped is unknown.
+      if (SegmentId(segment) != id) return false;
+      const auto claimed = next.register_reader();
+      if (!claimed) throw std::runtime_error("RTMS reader slots exhausted");
+      detach();
+      queue.emplace(std::move(next));
+      reader = *claimed;
+      if (wake) queue->set_reader_wake(reader, wake->id());
+      segment_id = id;
+      attach_error.clear();
+      std::cerr << "attached to " << topic << '\n';
+      return true;
+    } catch (const std::exception& e) {
+      if (attach_error != e.what()) {
+        attach_error = e.what();
+        std::cerr << "cannot attach to " << topic << " (" << e.what()
+                  << "); retrying\n";
+      }
+      return false;
+    }
+  }
+
+  // Attaches when the segment appears, re-attaches when the name holds a
+  // different one. A segment whose name was unlinked is kept: nothing
+  // replaces it until a new one appears.
+  void check_segment() {
+    const auto id = SegmentId(segment);
+    if (!id) {
+      if (!queue && !announced_wait) {
+        announced_wait = true;
+        std::cerr << "waiting for " << topic << " (start its publisher)\n";
+      }
+      return;
+    }
+    if (queue && *id == segment_id) return;
+    if (queue) std::cerr << topic << " was replaced; re-attaching\n";
+    attach(*id);
+  }
+
+  // Checks every 100 ms while waiting, every second once attached (a
+  // replacement is rare; each check is a few syscalls).
+  static constexpr std::int64_t kWaitingCheckNs = 100'000'000;
+  static constexpr std::int64_t kAttachedCheckNs = 1'000'000'000;
+  void watch(std::int64_t now_ns) {
+    if (now_ns < schedule.check_due_ns) return;
+    check_segment();
+    schedule.check_due_ns =
+        now_ns + (queue ? kAttachedCheckNs : kWaitingCheckNs);
+  }
+
+  // Each programmer client's own refill rate, B/s.
+  double client_rate() const {
+    return egress.plan().programmer_client_bytes_per_s;
+  }
+
+  // Whether `framed_bytes` fit the client's bucket and, for a programmer
+  // client, the shared bucket now, and the client has nothing buffered.
+  // Spends nothing. A send the budget defers is due again when its buckets
+  // will hold it (schedule); one deferred for buffered output is retried by
+  // the socket's drain handler.
+  // `now` is the pass's instant, not each client's: every client in a pass
+  // sees the buckets at one level, so a refill landing between two clients
+  // cannot hand the turn of one that could not yet afford a message to a
+  // later one with a message of the same size.
+  bool affordable(Socket* client, std::size_t framed_bytes, std::int64_t now) {
+    Client* data = client->getUserData();
+    EgressBudget* budget = budget_of(client);
+    // An evicted drive client holds no slot and is sent nothing more.
+    if (budget == nullptr) return false;
+    std::int64_t wait_ns = 0;
+    if (!egress.Affordable(*budget, data->drive, framed_bytes, now, wait_ns)) {
+      schedule.Deferred(now, wait_ns);
+      return false;
+    }
+    if (client->getBufferedAmount() != 0) {
+      ++held;
+      return false;
+    }
+    return true;
+  }
+
+  // The bucket a client's sends are charged to: a programmer client's own,
+  // a drive client's slot's; nullptr for a drive client holding no slot.
+  EgressBudget* budget_of(Socket* client) {
+    Client* data = client->getUserData();
+    return data->drive ? drive_clients.Budget(client) : &data->budget;
+  }
+
+  // Sends one message the caller found affordable and charges it.
+  bool send_now(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
+    EgressBudget* budget = budget_of(client);
+    if (budget == nullptr) return false;
+    if (client->send(bytes, opcode) == Socket::DROPPED) {
+      ++ws_drops;
+      return false;
+    }
+    const auto size = EgressBudget::framed(bytes.size());
+    egress.Spend(*budget, client->getUserData()->drive, size);
+    egress_bytes += size;
+    return true;
+  }
+
+  // Brings one client toward the latest graph and tick: each whole on join,
+  // then change-only updates, the graph first (studio::ClientFeeds).
+  // Returns whether it sent the client anything. Only a pass calls it, with
+  // the pass's instant.
+  bool pump(Socket* client, std::int64_t now_ns) {
+    // Every successful send is charged to egress_bytes (send_now).
+    const std::uint64_t charged = egress_bytes;
+    Client* data = client->getUserData();
+    if (data->drive) {
+      data->drive_feed.Pump(
+          drive_summary, telemetry_state, drive_mask.For(telemetry_state),
+          now_ns,
+          [this, client, now_ns](std::size_t framed_bytes) {
+            return affordable(client, framed_bytes, now_ns);
+          },
+          [this, client](std::string_view text) {
+            return send_now(client, text, uWS::OpCode::TEXT);
+          },
+          [this, client](std::string_view page) {
+            return send_now(client, page, uWS::OpCode::BINARY);
+          });
+      return egress_bytes != charged;
+    }
+    data->feeds.Pump(
+        system_graph, telemetry_state, now_ns, client_rate(),
+        [this, client, now_ns](std::size_t framed_bytes) {
+          return affordable(client, framed_bytes, now_ns);
+        },
+        [this, client](std::string_view text) {
+          return send_now(client, text, uWS::OpCode::TEXT);
+        },
+        [this, client](std::string_view page) {
+          return send_now(client, page, uWS::OpCode::BINARY);
+        });
+    return egress_bytes != charged;
+  }
+
+  // Offers every client what is due: each drive client, whose own bucket
+  // nobody else spends, then the programmer clients in rotation
+  // (studio::ClientRotation).
+  void pass_clients() {
+    const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+    for (Socket* client : drive_clients.clients()) pump(client, now_ns);
+    clients.Pass(
+        [this, now_ns](Socket* client) { return pump(client, now_ns); });
+  }
+
+  // A client's output drained: a drive client is offered what is due at
+  // once; a programmer client gets a pass, which offers it its turn
+  // (studio::ClientRotation::Drained).
+  void drained(Socket* client) {
+    const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+    if (client->getUserData()->drive) {
+      pump(client, now_ns);
+      return;
+    }
+    clients.Drained(client, [this, now_ns](Socket* offered) {
+      return pump(offered, now_ns);
+    });
+  }
+
+  // The drive summary from the manifest as it is now, the latest registry
+  // rows and the config's roster (studio::BuildDriveSummary). Built only while
+  // a drive client is connected, so the manifest is not read for nobody.
+  void refresh_drive_summary() {
+    drive_summary = studio::DriveSummaryJson(studio::BuildDriveSummary(
+        config_roster, registry_read ? &registry_nodes : nullptr,
+        ReadManifest(manifest_path)));
+  }
+
+  // The decoded feed: latest dictionary and latest complete tick, backing
+  // /telemetry.json, /channels.json and every client's updates.
   studio::TelemetryState telemetry_state;
 
   // Opened lazily: the bridge may well start before any node, and a viewer
   // that refuses to run until the robot is up is a viewer you cannot use to
   // watch the robot come up.
   std::optional<talos::introspect::RegistryReader> registry;
-  std::string system_json = "{}";
+  // The latest refresh; empty until the first, so no client is sent "{}".
+  studio::SystemGraphDocument system_graph;
+  bool system_json_oversized = false;
   std::int64_t started_wall_ns = talos::introspect::wall_now_ns();
 
   void refresh_system() {
@@ -59,17 +374,23 @@ struct Bridge {
 
     studio::SystemGraphInput input;
     input.bridge = {.topic = topic,
-                    .clients = clients.size(),
+                    .clients = clients.clients().size(),
                     .frames_forwarded = forwarded,
                     .invalid = invalid,
-                    .ws_drops = ws_drops};
+                    .ws_drops = ws_drops,
+                    .refused = refused,
+                    .egress_bytes = egress_bytes};
     input.wall_ns = talos::introspect::wall_now_ns();
+    input.monotonic_ns = talos::introspect::monotonic_now_ns();
     if (registry) {
       input.registry_available = true;
       input.node_capacity = registry->node_capacity();
       input.source_capacity = registry->source_capacity();
       input.nodes = registry->nodes();
     }
+    registry_nodes = input.nodes;
+    registry_read = input.registry_available;
+    if (layout && !drive_clients.clients().empty()) refresh_drive_summary();
 
     // The bridge is a participant, not a neutral observer: it holds a reader
     // slot on the telemetry topic. Leaving itself out made that topic report
@@ -77,92 +398,204 @@ struct Bridge {
     // view exists to surface -- a false one is worse than none.
     input.nodes.push_back(self());
 
-    system_json = studio::SystemGraphJson(input);
+    system_graph = studio::BuildSystemGraph(input);
 
-    // Text on the WebSocket, so a client tells the two message families apart
-    // by frame type and needs no sniffing.
-    for (auto* client : clients) {
-      if (client->getBufferedAmount() > 256 * 1024) {
-        ++ws_drops;
-        continue;
-      }
-      if (client->send(system_json, uWS::OpCode::TEXT) == Socket::DROPPED) {
-        ++ws_drops;
-      }
+    // A send must fit the egress burst, so a larger graph is never delivered
+    // whole: a client that needs it gets nothing, and Studio marks its last
+    // graph stale. Logged once per crossing, not on every refresh.
+    const bool oversized =
+        static_cast<double>(EgressBudget::framed(system_graph.json.size())) >
+        EgressBudget::kBurstBytes;
+    if (oversized && !system_json_oversized) {
+      std::cerr << "system graph is " << system_graph.json.size()
+                << " B, over the " << EgressBudget::kBurstBytes
+                << " B WebSocket egress burst; clients will not receive it "
+                   "(/system.json still serves it)\n";
     }
+    system_json_oversized = oversized;
+    // Clients are sent it by pump(), as text on the WebSocket, so a client
+    // tells the two message families apart by frame type.
   }
 
   // This process as the registry would have described it, had it a slot.
   talos::introspect::NodeSnapshot self() const {
     talos::introspect::NodeSnapshot node;
-    node.name = "studio_bridge";
+    node.name = studio::kStudioBridgeNodeName;
     node.target = "//studio/bridge:studio_bridge";
     node.pid = static_cast<std::uint64_t>(::getpid());
     node.start_wall_ns = started_wall_ns;
-    node.heartbeat_wall_ns = talos::introspect::wall_now_ns();
+    node.heartbeat_monotonic_ns = talos::introspect::monotonic_now_ns();
     node.alive = true;
     node.dispatch_count = forwarded;
     node.declared_source_count = 1;
 
     talos::introspect::SourceSnapshot source;
     // A watcher, not a fetcher: the reader is registered with
-    // ReadMode::SEQUENCE, so it sees every frame in order rather than only the
-    // newest.
+    // ReadMode::SEQUENCE, so it sees every page in order rather than only the
+    // newest, unless the publisher laps it. Lapped pages and the ticks they
+    // left incomplete count as dropped; a deferred client update loses
+    // nothing, so it does not.
     source.kind = talos::event::SourceKind::WATCHER;
     source.name = topic;
     source.message_bytes =
         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes);
     source.events = forwarded;
-    source.dropped = ws_drops;
-    source.sequence = queue.writer_sequence();
+    source.dropped = lapped + telemetry_state.incomplete_ticks;
+    source.sequence = queue ? queue->writer_sequence() : 0;
     node.sources.push_back(std::move(source));
     return node;
   }
 
+  // Reads what the topic holds, up to a page budget (`backlog` when it stops
+  // there), and brings every client toward it.
   void poll() {
-    // Bound work so HTTP and client socket processing cannot starve.
-    for (unsigned count = 0; count < 256; ++count) {
-      if (!queue.read(reader, [&](std::span<const std::byte> slot) {
-            auto bytes = talos::telemetry_wire::payload(slot);
-            if (bytes.empty()) {
-              ++invalid;
-              return;
-            }
-            if (!studio::IngestTelemetry(telemetry_state, bytes,
-                                         talos::introspect::wall_now_ns())) {
-              ++invalid;
-              return;
-            }
-            ++forwarded;
-            // Forward only frames a client can decode: one aligned with
-            // the cached dictionary (a dictionary frame aligns with
-            // itself). A value frame that arrives before any dictionary
-            // is ingested above but not sent, so the first binary frame
-            // every client sees is a dictionary frame.
-            const auto* decoded =
-                Talos::Telemetry::GetSizePrefixedFrame(bytes.data());
-            const bool aligned =
-                telemetry_state.has_dictionary && decoded != nullptr &&
-                decoded->stream_id() == telemetry_state.stream_id &&
-                decoded->dictionary_id() == telemetry_state.dictionary_id &&
-                decoded->values() != nullptr &&
-                decoded->values()->size() == telemetry_state.dictionary.size();
-            if (!aligned) return;
-            for (auto* client : clients) {
-              if (client->getBufferedAmount() > 256 * 1024) {
-                ++ws_drops;
-                continue;
-              }
-              if (client->send(bytes, uWS::OpCode::BINARY) == Socket::DROPPED) {
-                ++ws_drops;
-              }
-            }
-          })) {
-        break;
+    backlog = false;
+    if (queue) {
+      // Bound work so HTTP and client socket processing cannot starve.
+      for (unsigned count = 0;; ++count) {
+        if (count == 256) {
+          backlog = true;
+          break;
+        }
+        MessageInfo info;
+        const auto result = queue->read_next(reader, frame, info);
+        if (result == ReadResult::TORN) {
+          ++invalid;
+          continue;
+        }
+        if (result != ReadResult::OK) break;
+        lapped += info.dropped;
+        auto bytes = talos::telemetry_wire::payload(frame);
+        if (bytes.empty()) {
+          ++invalid;
+          continue;
+        }
+        const bool had_frame = telemetry_state.has_frame;
+        const std::uint64_t sequence = telemetry_state.sequence_id;
+        if (!studio::IngestTelemetry(telemetry_state, bytes,
+                                     talos::introspect::monotonic_now_ns())) {
+          ++invalid;
+          continue;
+        }
+        if (telemetry_state.has_frame &&
+            (!had_frame || telemetry_state.sequence_id != sequence)) {
+          ++forwarded;
+        }
       }
     }
+    // Every pass, not only on a new tick: a pass woken by the budget's refill
+    // or a client's heartbeat (next_wake_ns) sends what is due.
+    pass_clients();
+  }
+
+  // One pass of the loop, whatever woke it: the wake channel's protocol
+  // (drain, read until empty, arm, and read again while an arm finds a
+  // page), the segment check, the graph refresh, and every client's due
+  // sends. Each client is sent its changed counters at most every
+  // GraphFeed::kUpdateNs (or a deferral notice), so Studio keeps measuring
+  // node rates from successive graphs' counters and never marks a merely
+  // deferred graph stale.
+  void service(std::int64_t now_ns) {
+    if (wake) wake->drain();
+    watch(now_ns);
+    schedule.BeginPass();
+    // Refreshed before the clients are pumped, so a graph update due with
+    // the refresh goes out on this pass, not on the next wake.
+    if (schedule.RefreshDue(now_ns)) {
+      schedule.refreshed_ns = now_ns;
+      refresh_system();
+    }
+    poll();
+    if (!queue || !wake) return;
+    // Three tries: a slot this queue no longer holds never arms, and must
+    // not make the loop spin; it falls back to reading every kFallbackNs.
+    for (int attempt = 0; !backlog; ++attempt) {
+      if (queue->arm_wake(reader)) return;
+      if (attempt == 2) {
+        backlog = true;
+        return;
+      }
+      poll();
+    }
+  }
+
+  // When the loop must next run with no socket event or publication
+  // (studio::WakeSchedule::NextWakeNs).
+  std::int64_t next_wake_ns(std::int64_t now_ns) const {
+    return schedule.NextWakeNs(now_ns, !wake || backlog, system_graph,
+                               [this](const auto& visit) {
+                                 for (Socket* client : clients.clients())
+                                   visit(client->getUserData()->feeds);
+                                 for (Socket* client : drive_clients.clients())
+                                   visit(client->getUserData()->drive_feed);
+                               });
   }
 };
+
+// Puts `fd` in the uSockets loop as a callback poll that runs `on_ready`
+// while it is readable, leaving the descriptor for the caller to drain. The
+// poll's extension holds `user`.
+us_poll_t* WatchReadable(us_loop_t* loop, int fd, void* user,
+                         void (*on_ready)(us_internal_callback_t*)) {
+  auto* poll =
+      us_create_poll(loop, 0, sizeof(us_internal_callback_t) + sizeof(user));
+  us_poll_init(poll, fd, POLL_TYPE_CALLBACK);
+  auto* callback = reinterpret_cast<us_internal_callback_t*>(poll);
+  callback->loop = loop;
+  callback->cb_expects_the_loop = 0;
+  callback->leave_poll_ready = 1;
+  callback->cb = on_ready;
+  const auto bytes = std::bit_cast<std::array<std::byte, sizeof(user)>>(user);
+  std::memcpy(callback + 1, bytes.data(), bytes.size());
+  us_poll_start(poll, loop, LIBUS_SOCKET_READABLE);
+  return poll;
+}
+
+// The `user` WatchReadable stored with the poll.
+template <class T>
+T* WatchedUser(us_internal_callback_t* callback) {
+  std::array<std::byte, sizeof(void*)> bytes{};
+  std::memcpy(bytes.data(), callback + 1, bytes.size());
+  return static_cast<T*>(std::bit_cast<void*>(bytes));
+}
+// Cache-Control (REQ-OPS-34). Studio's Vite build names every asset it
+// emits under assets/ `<name>-<hash>.<ext>`, the hash eight characters of
+// base64url (Rollup's default; its alphabet includes '-' and '_'): such a
+// file never changes under its name, so a browser keeps it for a year.
+// Every other static file, index.html and drive.html above all, is
+// revalidated on each load (`no-cache`), so a deploy's new page and the
+// asset names it carries are seen at once. The JSON the bridge generates
+// (or re-reads, like the manifest) is a live snapshot with no validator to
+// revalidate against, so it is never stored (`no-store`).
+constexpr std::string_view kImmutableCacheControl =
+    "public, max-age=31536000, immutable";
+constexpr std::string_view kRevalidateCacheControl = "no-cache";
+constexpr std::string_view kLiveCacheControl = "no-store";
+constexpr std::size_t kAssetHashChars = 8;
+
+// Whether `relative` (a path under the webroot) is a content-hashed asset.
+bool ContentHashed(const fs::path& relative) {
+  auto part = relative.begin();
+  if (part == relative.end() || *part != "assets") return false;
+  if (++part == relative.end()) return false;
+  const fs::path& name = *part;
+  if (++part != relative.end()) return false;  // not directly under assets/
+  const std::string stem = name.stem().string();
+  if (name.extension().empty() || stem.size() < kAssetHashChars + 2 ||
+      stem[stem.size() - kAssetHashChars - 1] != '-') {
+    return false;
+  }
+  return std::all_of(stem.end() - kAssetHashChars, stem.end(), [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_';
+  });
+}
+
+std::string_view CacheControl(const fs::path& relative) {
+  return ContentHashed(relative) ? kImmutableCacheControl
+                                 : kRevalidateCacheControl;
+}
+
 std::string mime(const fs::path& p) {
   auto ext = p.extension().string();
   if (ext == ".html") return "text/html; charset=utf-8";
@@ -173,6 +606,20 @@ std::string mime(const fs::path& p) {
   if (ext == ".wasm") return "application/wasm";
   return "application/octet-stream";
 }
+// uWebSockets' idle timeout for a client, in seconds. With T - m seconds
+// gone without data from the client (or a drain of its backlog) it pings,
+// and it closes the client if nothing arrives in the next m: m is 4, 8 or
+// 16 s, 8 at T = 16 (WebSocketContextData::calculateIdleTimeoutCompnents).
+// uSockets checks timeouts every 4 s, so the ping can go up to 4 s early,
+// and a client that stopped answering loses its slot 12 to 16 s after the
+// last data it sent. 16 is the smallest T with an 8 s pong window, which
+// covers five retransmissions of a lost pong at TCP's 200 ms minimum RTO
+// (sent by 6.2 s). The bound and its reason: docs/DATA_FLOW.md "Telemetry,
+// Studio, and the radio boundary". uWebSockets refuses T below 8 or above
+// 960.
+constexpr unsigned kIdleTimeoutS = 16;
+constexpr unsigned kMinIdleTimeoutS = 8;
+constexpr unsigned kMaxIdleTimeoutS = 960;
 }  // namespace
 int main(int argc, char** argv) try {
   // `--describe`: answer what this process is without touching shared memory,
@@ -200,9 +647,19 @@ int main(int argc, char** argv) try {
     talos::introspect::Description description;
     description.name = "studio_bridge";
     description.target = "//studio/bridge:studio_bridge";
-    description.sources.push_back(
-        {talos::event::SourceKind::WATCHER, topic,
-         static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes), 0});
+    // Every topic end names its schema and ring layout (the launcher creates
+    // the segment from them): the telemetry byte topic's, as its producer
+    // declares it and as the queue below attaches.
+    talos::introspect::naming::SourceShape source{
+        talos::event::SourceKind::WATCHER, topic,
+        static_cast<std::uint32_t>(talos::telemetry_wire::slot_bytes), 0};
+    const talos::schema::Identity bytes = talos::schema::Bytes();
+    source.schema = bytes.name;
+    source.schema_hash = bytes.hash;
+    source.alignment = 8;
+    source.slots =
+        static_cast<std::uint32_t>(talos::telemetry_wire::slot_count);
+    description.sources.push_back(std::move(source));
     std::cout << talos::introspect::DescribeToJson(description);
     return 0;
   }
@@ -212,10 +669,27 @@ int main(int argc, char** argv) try {
   std::vector<const char*> args;
   std::string declared_path;
   std::string manifest_path;
+  std::string config_path;
+  unsigned idle_timeout_s = kIdleTimeoutS;
+  bool bad_idle_timeout = false;
   for (int i = 0; i < argc; ++i) {
     const std::string_view argument = argv[i];
     static constexpr std::string_view kDeclared = "--declared";
     static constexpr std::string_view kManifest = "--manifest";
+    if (argument == "--config" && i + 1 < argc) {
+      config_path = argv[++i];
+      continue;
+    }
+    if (argument == "--idle-timeout-s" && i + 1 < argc) {
+      const std::string_view value = argv[++i];
+      const auto [end, error] = std::from_chars(
+          value.data(), value.data() + value.size(), idle_timeout_s);
+      bad_idle_timeout = error != std::errc{} ||
+                         end != value.data() + value.size() ||
+                         idle_timeout_s < kMinIdleTimeoutS ||
+                         idle_timeout_s > kMaxIdleTimeoutS;
+      continue;
+    }
     if (argument == kDeclared && i + 1 < argc) {
       declared_path = argv[++i];
       continue;
@@ -239,23 +713,30 @@ int main(int argc, char** argv) try {
   const std::size_t count = args.size();
   const auto at = [&args](std::size_t i) { return args[i]; };
 
-  if (count < 2 || std::string_view(at(1)) != "--drop-newest-publisher") {
+  const bool unknown_option =
+      std::any_of(args.begin() + 1, args.end(), [](const char* argument) {
+        return std::string_view(argument).starts_with("--");
+      });
+  if (count > 4 || unknown_option || bad_idle_timeout) {
     std::cerr
-        << "Usage: studio_bridge --drop-newest-publisher "
+        << "Usage: studio_bridge "
            "[topic=/talos/telemetry] [HTTP=5800] [webroot=studio/dist]\n"
            "       [--declared PATH]   the launcher's graph.json, served at "
            "/declared.json\n"
            "       [--manifest PATH]   the launcher's manifest.json, served at "
            "/manifest.json\n"
+           "       [--config PATH]     reads [studio] max_clients and "
+           "dashboard\n"
+           "       [--idle-timeout-s S]  client idle timeout, 8 to 960 "
+           "(default 16)\n"
            "       [--describe]          print the --describe envelope and "
-           "exit\n"
-           "The publisher MUST use DROP_NEWEST; RTMS does not store this "
-           "policy in shared memory.\n";
+           "exit\n";
     return 2;
   }
-  std::signal(SIGINT, signal_handler);
-  std::signal(SIGTERM, signal_handler);
-  const char* topic = count > 2 ? at(2) : "/talos/telemetry";
+  // SIGINT and SIGTERM request a stop and make the stop pipe readable; the
+  // loop watches it, so a stop wakes the loop wherever it waits.
+  talos::process::InstallStopHandlers();
+  const char* topic = count > 1 ? at(1) : "/talos/telemetry";
 
   // The declared graph: what the launcher probed with `--describe` before it
   // spawned anything.
@@ -265,9 +746,9 @@ int main(int argc, char** argv) try {
   // start, so a name's absence from it says nothing on its own; the declared
   // graph is the other half of that comparison.
   //
-  // Served verbatim and never parsed. The launcher already wrote JSON, there is
-  // no JSON parser in this process, and re-emitting a document byte for byte is
-  // the one transformation that cannot be subtly wrong.
+  // Served verbatim and never parsed. The launcher already wrote JSON, and
+  // re-emitting a document byte for byte is the one transformation that
+  // cannot be subtly wrong.
   std::string declared_json;
   if (!declared_path.empty()) {
     std::ifstream declared(declared_path, std::ios::binary);
@@ -277,59 +758,185 @@ int main(int argc, char** argv) try {
     } else {
       // Logged once, then the bridge carries on. A viewer that cannot show
       // declared-against-actual is a much smaller failure than a bridge that
-      // will not start, and the launcher writes this file concurrently with
-      // spawning us.
+      // will not start. Under the launcher this file is written atomically
+      // before anything spawns, so this path means a standalone run with a
+      // wrong --declared path.
       std::cerr << "declared graph unreadable at " << declared_path
                 << "; /declared.json will report it absent\n";
     }
   }
-  // Refuse a missing publisher instead of silently creating an empty ring.
-  //
-  // Opened by segment name, not by topic. A topic like /talos/telemetry has an
-  // interior slash, which POSIX does not allow in an shm name, so RTMS maps it
-  // (`ShmObjectName`) before touching the OS. Checking the raw topic here
-  // looked for a segment that never exists and reported a healthy publisher as
-  // missing -- on macOS, where the unmapped name happens to be legal, this
-  // failed only once the mapping was introduced.
-  const std::string segment = ShmObjectName(topic);
-  int existing = shm_open(segment.c_str(), O_RDWR, 0);
-  if (existing < 0) {
-    throw std::runtime_error("start the telemetry publisher before the bridge");
-  }
-  close(existing);
-  RTMSQueue queue(topic, talos::telemetry_wire::slot_bytes, 8,
-                  talos::schema::Bytes(), talos::telemetry_wire::slot_count,
-                  {OverflowPolicy::DROP_NEWEST, ReadMode::SEQUENCE});
-  auto reader = queue.register_reader();
-  if (!reader) throw std::runtime_error("RTMS reader slots exhausted");
-  ReaderLease lease{queue, *reader};
+  // Port 0 asks the OS for a free port; the bound port is reported on stdout
+  // once listening, so a test never hands the bridge a port it closed first.
   auto port = [](const char* s) {
     auto p = std::stoul(s);
-    if (p == 0 || p > 65535) throw std::runtime_error("invalid port");
+    if (p > 65535) throw std::runtime_error("invalid port");
     return static_cast<std::uint16_t>(p);
   };
-  const auto root = fs::canonical(count > 4 ? at(4) : "studio/dist");
-  Bridge bridge{queue, *reader, topic};
+  const auto root = fs::canonical(count > 3 ? at(3) : "studio/dist");
+  Bridge bridge;
+  bridge.topic = topic;
+  // Watched by segment name, not by topic. A topic like /talos/telemetry has
+  // an interior slash, which POSIX does not allow in an shm name, so RTMS maps
+  // it (`ShmObjectName`) before touching the OS. The bridge attaches only
+  // once the segment exists: an empty ring of its own would wait for a
+  // publisher that might disagree with its layout.
+  bridge.segment = ShmObjectName(topic);
+  try {
+    bridge.wake.emplace();
+  } catch (const std::exception& e) {
+    std::cerr << "no wake channel (" << e.what()
+              << "); reading the topic every 1 ms\n";
+  }
+  if (!config_path.empty()) {
+    const auto robot = talos::config::ParseRobotConfig(config_path);
+    bridge.max_clients = robot.studio.max_clients;
+    // A layout that does not parse disables only the driver dashboard
+    // (/drive answers 404, nothing is reserved): Studio stays up, and the
+    // telemetry node refuses the same layout by name.
+    if (!robot.studio.dashboard.empty()) {
+      try {
+        bridge.layout =
+            talos::telemetry::ParseDashboardLayout(robot.studio.dashboard);
+      } catch (const std::exception& e) {
+        std::cerr << "driver dashboard disabled: " << e.what() << '\n';
+      }
+    }
+    // The nodes the config launches: the hardware bridge, then each
+    // subsystem with a `node`, critical unless it says otherwise. The drive
+    // summary lists them only when there is no manifest, whose roster is
+    // the launcher's own; otherwise it takes only `critical` from here.
+    bridge.config_roster.push_back(
+        {std::string{talos::introspect::naming::kHardwareBridgeNode}, true});
+    if (const auto* subsystems = robot.toml_data["subsystems"].as_table()) {
+      bridge.config_roster.reserve(subsystems->size() + 1);
+      for (auto&& [key, value] : *subsystems) {
+        const auto* table = value.as_table();
+        if (table == nullptr || !table->contains("node")) continue;
+        bridge.config_roster.push_back(
+            {std::string{key.str()}, (*table)["critical"].value_or(true)});
+      }
+    }
+  }
+  bridge.manifest_path = manifest_path;
+  bridge.egress = studio::BridgeEgress(studio::EgressPlan::Of(
+      bridge.max_clients, bridge.layout ? bridge.layout->drive_clients : 0,
+      bridge.layout ? bridge.layout->budget_bytes_per_s : 0));
+  if (bridge.layout) {
+    bridge.layout_json = talos::telemetry::DashboardLayoutJson(*bridge.layout);
+    bridge.drive_mask = studio::DriveMask(
+        talos::telemetry::RequiredChannels(*bridge.layout),
+        talos::telemetry::CarriesAlertChannels(*bridge.layout));
+    bridge.drive_clients =
+        studio::DriveSlots<Socket*>(bridge.layout->drive_clients);
+  }
   uWS::App app;
   uWS::App::WebSocketBehavior<Client> behavior{};
   behavior.maxPayloadLength = 1024;
   behavior.maxBackpressure = 512 * 1024;
-  behavior.open = [&](auto* ws) {
-    bridge.clients.insert(ws);
-    // Send the current graph immediately: a client that has to wait for the
-    // next refresh opens on an empty system view.
-    ws->send(bridge.system_json, uWS::OpCode::TEXT);
-    // Then the cached dictionary frame, so the client's first value frame
-    // is already decodable instead of waiting up to a second for the next
-    // dictionary the producer schedules.
-    if (bridge.telemetry_state.has_dictionary) {
-      ws->send(bridge.telemetry_state.dictionary_frame, uWS::OpCode::BINARY);
+  // A client that stopped answering (a laptop that dropped off the network)
+  // gives up its slot within the idle timeout (kIdleTimeoutS); one that only
+  // receives keeps it by answering the pings, as browsers do.
+  behavior.idleTimeout = static_cast<unsigned short>(idle_timeout_s);
+  behavior.sendPingsAutomatically = true;
+  behavior.upgrade = [&](auto* response, auto* request, auto* context) {
+    if (bridge.clients.clients().size() >= bridge.max_clients) {
+      ++bridge.refused;
+      response->writeStatus("503 Studio client limit")
+          ->writeHeader("Retry-After", "5")
+          ->end("Studio client limit reached");
+      return;
     }
+    response->template upgrade<Client>(
+        {}, request->getHeader("sec-websocket-key"),
+        request->getHeader("sec-websocket-protocol"),
+        request->getHeader("sec-websocket-extensions"), context);
   };
+  behavior.open = [&](auto* ws) {
+    bridge.clients.Add(ws);
+    const int fd = static_cast<int>(
+        reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
+    const int send_buffer =
+        studio::ClientSendBuffer::Bytes(bridge.client_rate());
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                     sizeof send_buffer) != 0) {
+      std::cerr << "client send buffer not set: " << std::strerror(errno)
+                << '\n';
+    }
+    // The current graph at once, so the client does not open on an empty
+    // system view, then the dictionary and a keyframe of the latest tick, so
+    // it starts with every channel instead of waiting for the next dictionary
+    // the producer schedules. That tick is as old as the last telemetry
+    // received -- possibly from before telemetry stopped -- so the client
+    // treats its first update as of unknown age.
+    // It is offered all that in this pass, in its turn.
+    bridge.pass_clients();
+  };
+  // A client held back by buffered output is offered what is due as soon as
+  // its socket drains, in a pass: behind any client owed a turn before it,
+  // so a client whose writes keep draining is not sent to twice in a turn.
+  behavior.drain = [&](auto* ws) { bridge.drained(ws); };
   behavior.close = [&](auto* ws, int, std::string_view) {
-    bridge.clients.erase(ws);
+    bridge.clients.Remove(ws);
+  };
+  // The driver dashboard's feed (README.md "Driver dashboard feed"): outside
+  // max_clients, at most the layout's drive_clients, the newest evicting the
+  // oldest; 404 without a layout.
+  uWS::App::WebSocketBehavior<Client> drive_behavior{};
+  drive_behavior.maxPayloadLength = behavior.maxPayloadLength;
+  drive_behavior.maxBackpressure = behavior.maxBackpressure;
+  drive_behavior.idleTimeout = behavior.idleTimeout;
+  drive_behavior.sendPingsAutomatically = true;
+  drive_behavior.upgrade = [&](auto* response, auto* request, auto* context) {
+    if (!bridge.layout) {
+      response->writeStatus("404 Not Found")->end();
+      return;
+    }
+    response->template upgrade<Client>(
+        Client{.drive = true}, request->getHeader("sec-websocket-key"),
+        request->getHeader("sec-websocket-protocol"),
+        request->getHeader("sec-websocket-extensions"), context);
+  };
+  drive_behavior.open = [&](auto* ws) {
+    if (!bridge.layout) return;  // the upgrade refuses /drive without one
+    ws->getUserData()->drive_feed.Configure(bridge.layout->update_hz);
+    // It takes the bucket of the slot it fills, so a reconnect never
+    // starts from a fresh burst (studio::DriveSlots).
+    if (const auto oldest = bridge.drive_clients.Admit(ws).evicted) {
+      ++bridge.evicted;
+      (*oldest)->end(studio::kDriveEvictedCloseCode,
+                     studio::kDriveEvictedReason);
+    }
+    const int fd = static_cast<int>(
+        reinterpret_cast<std::uintptr_t>(ws->getNativeHandle()));
+    const int send_buffer = studio::ClientSendBuffer::Bytes(
+        bridge.egress.plan().drive_client_bytes_per_s);
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                     sizeof send_buffer) != 0) {
+      std::cerr << "client send buffer not set: " << std::strerror(errno)
+                << '\n';
+    }
+    // The dictionary, a keyframe of the layout's channels and the summary
+    // at once, the summary from the registry as it is now (the refresh
+    // rebuilds it while a drive client is held).
+    bridge.refresh_system();
+    bridge.pass_clients();
+  };
+  drive_behavior.drain = [&](auto* ws) { bridge.drained(ws); };
+  drive_behavior.close = [&](auto* ws, int, std::string_view) {
+    bridge.drive_clients.Remove(ws);
   };
   app.ws<Client>("/telemetry", std::move(behavior));
+  app.ws<Client>("/drive", std::move(drive_behavior));
+  app.get("/drive/layout.json", [&](auto* res, auto*) {
+    if (!bridge.layout) {
+      res->writeStatus("404 Not Found")->end();
+      return;
+    }
+    res->writeHeader("Content-Type", "application/json")
+        ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
+        ->end(bridge.layout_json);
+  });
   app.get("/telemetry.json", [&](auto* res, auto*) {
     // 503 until a dictionary and an aligned frame have both arrived: an
     // empty or half-described document would read as "the robot is doing
@@ -341,8 +948,9 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(studio::TelemetryJson(bridge.telemetry_state,
-                                    talos::introspect::wall_now_ns()));
+                                    talos::introspect::monotonic_now_ns()));
   });
   app.get("/channels.json", [&](auto* res, auto*) {
     if (!bridge.telemetry_state.has_dictionary) {
@@ -351,12 +959,14 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(studio::ChannelsJson(bridge.telemetry_state));
   });
   app.get("/system.json", [&](auto* res, auto*) {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
-        ->end(bridge.system_json);
+        ->writeHeader("Cache-Control", kLiveCacheControl)
+        ->end(bridge.system_graph.json);
   });
   app.get("/declared.json", [&](auto* res, auto*) {
     // 404 rather than an empty document: "no declared graph was given" and "the
@@ -368,6 +978,7 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(declared_json);
   });
   app.get("/manifest.json", [&](auto* res, auto*) {
@@ -385,7 +996,7 @@ int main(int argc, char** argv) try {
       res->writeStatus("404 Not Found")->end();
       return;
     }
-    if (size > static_cast<std::uintmax_t>(32) * 1024 * 1024) {
+    if (size > kMaxManifestBytes) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
@@ -397,6 +1008,7 @@ int main(int argc, char** argv) try {
     std::string body((std::istreambuf_iterator<char>(input)), {});
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(body);
   });
   app.get("/*", [&](auto* res, auto* req) {
@@ -407,8 +1019,12 @@ int main(int argc, char** argv) try {
       return;
     }
     std::error_code error;
-    auto file = fs::weakly_canonical(
-        root / (url == "/" ? "index.html" : url.substr(1)), error);
+    // `/` is Studio and `/drive` the driver dashboard's page (a WebSocket
+    // upgrade of /drive is the feed, above).
+    const std::string page = url == "/"        ? "index.html"
+                             : url == "/drive" ? "drive.html"
+                                               : url.substr(1);
+    auto file = fs::weakly_canonical(root / page, error);
     if (error) {
       res->writeStatus("404 Not Found")->end();
       return;
@@ -420,8 +1036,7 @@ int main(int argc, char** argv) try {
       return;
     }
     // Files are bounded; uWS owns buffered response bytes after end().
-    if (fs::file_size(file, error) >
-        static_cast<std::uintmax_t>(32) * 1024 * 1024) {
+    if (fs::file_size(file, error) > kMaxStaticFileBytes) {
       res->writeStatus("413 Content Too Large")->end();
       return;
     }
@@ -433,46 +1048,94 @@ int main(int argc, char** argv) try {
     std::string body((std::istreambuf_iterator<char>(input)), {});
     res->writeHeader("Content-Type", mime(file))
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", CacheControl(relative))
         ->end(body);
   });
   bool listening = false;
-  app.listen(count > 3 ? port(at(3)) : 5800, [&](auto* token) {
+  app.listen(count > 2 ? port(at(2)) : 5800, [&](auto* token) {
     listening = token != nullptr;
     bridge.listener = token;
   });
   if (!listening) throw std::runtime_error("HTTP listen failed");
-  auto* timer = us_create_timer(reinterpret_cast<us_loop_t*>(uWS::Loop::get()),
-                                0, sizeof(Bridge*));
-  if (!timer) throw std::runtime_error("poll timer allocation failed");
+  std::cout << "listening "
+            << us_socket_local_port(
+                   0, reinterpret_cast<us_socket_t*>(bridge.listener))
+            << '\n'
+            << std::flush;
+  // The loop sleeps until a socket event, a publication on the topic (the
+  // wake channel's descriptor) or the timer, which is set before each wait
+  // to the bridge's next duty (Bridge::next_wake_ns). Every return from the
+  // wait ends in the post handler below, which makes the bridge's pass.
+  auto* loop = reinterpret_cast<us_loop_t*>(uWS::Loop::get());
+  auto* timer = us_create_timer(loop, 0, sizeof(Bridge*));
+  if (!timer) throw std::runtime_error("deadline timer allocation failed");
   *static_cast<Bridge**>(us_timer_ext(timer)) = &bridge;
-  // One timer at the telemetry rate; the system graph is structure, not
-  // signal, so it refreshes every 250th tick instead.
-  static constexpr unsigned kSystemRefreshTicks = 250;
-  static unsigned ticks = 0;
-  bridge.refresh_system();
-  us_timer_set(
-      timer,
-      [](us_timer_t* t) {
-        auto* b = *static_cast<Bridge**>(us_timer_ext(t));
-        if (stop) {
-          us_listen_socket_close(0, b->listener);
-          auto clients = b->clients;
-          for (auto* ws : clients) ws->close();
-          us_timer_close(t);
-          return;
-        }
-        b->poll();
-        if (++ticks >= kSystemRefreshTicks) {
-          ticks = 0;
-          b->refresh_system();
-        }
-      },
-      1, 1);
+  const auto on_deadline = [](us_timer_t* t) {
+    ++(*static_cast<Bridge**>(us_timer_ext(t)))->deadline_wakes;
+  };
+  us_poll_t* wake_poll = nullptr;
+  if (bridge.wake) {
+    wake_poll = WatchReadable(
+        loop, bridge.wake->fd(), &bridge, [](us_internal_callback_t* callback) {
+          ++WatchedUser<Bridge>(callback)->publication_wakes;
+        });
+  }
+  // The stop pipe: readable from the moment a stop is requested, so a signal
+  // landing after the pass's check and before the wait still ends the wait.
+  // Level-triggered: the pass that sees the stop removes it.
+  us_poll_t* stop_poll = nullptr;
+  if (const int stop_fd = talos::process::StopFd(); stop_fd >= 0) {
+    stop_poll =
+        WatchReadable(loop, stop_fd, &bridge, [](us_internal_callback_t*) {});
+  }
+  std::int64_t timer_due_ns = 0;
+  bool stopping = false;
+  const auto pass = [&] {
+    if (stopping) return;
+    ++bridge.wakes;
+    if (talos::process::stop_requested.load()) {
+      stopping = true;
+      us_listen_socket_close(0, bridge.listener);
+      auto clients = bridge.clients.clients();
+      for (auto* ws : clients) ws->close();
+      auto drive_clients = bridge.drive_clients.clients();
+      for (auto* ws : drive_clients) ws->close();
+      us_timer_close(timer);
+      for (us_poll_t* poll : {wake_poll, stop_poll}) {
+        if (poll == nullptr) continue;
+        us_poll_stop(poll, loop);
+        us_poll_free(poll, loop);
+      }
+      return;
+    }
+    bridge.service(talos::introspect::monotonic_now_ns());
+    const std::int64_t now_ns = talos::introspect::monotonic_now_ns();
+    const std::int64_t next_ns = bridge.next_wake_ns(now_ns);
+    // Set again only when it would fire too late, or has fired: one that
+    // fires early costs a pass that finds nothing due.
+    if (timer_due_ns <= now_ns || next_ns < timer_due_ns) {
+      // Whole milliseconds, rounded up, so it never fires before the duty.
+      const auto ms =
+          static_cast<int>((next_ns - now_ns + 999'999) / 1'000'000);
+      us_timer_set(timer, on_deadline, ms, 0);
+      timer_due_ns = now_ns + std::int64_t{ms} * 1'000'000;
+    }
+  };
+  pass();
+  // A stop makes the stop pipe readable, which ends the wait in this handler.
+  uWS::Loop::get()->addPostHandler(&bridge, [&pass](uWS::Loop*) { pass(); });
   // Normal process termination is handled below; signal exit avoids freeing a
   // running loop.
   app.run();
+  uWS::Loop::get()->removePostHandler(&bridge);
   std::cerr << "forwarded=" << bridge.forwarded << " invalid=" << bridge.invalid
-            << " ws_drops=" << bridge.ws_drops << '\n';
+            << " lapped=" << bridge.lapped << " held=" << bridge.held
+            << " ws_drops=" << bridge.ws_drops << " refused=" << bridge.refused
+            << " evicted=" << bridge.evicted
+            << " egress_bytes=" << bridge.egress_bytes
+            << " wakes=" << bridge.wakes
+            << " publication_wakes=" << bridge.publication_wakes
+            << " deadline_wakes=" << bridge.deadline_wakes << '\n';
 } catch (const std::exception& e) {
   std::cerr << e.what() << '\n';
   return 1;

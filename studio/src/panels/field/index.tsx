@@ -4,7 +4,9 @@
 // Layered on top: per-camera latest valid observations with their uncertainty
 // ellipses, and the estimator's velocity vector. Everything optional is a
 // layer with a persisted toggle; the view follows the robot or shows the whole
-// field, with wheel/drag pan-zoom and a reset button.
+// field, with wheel/drag pan-zoom and a reset button. A pose whose frame is no
+// longer current (telemetry stopped) stays on screen dimmed and marked STALE,
+// without its velocity arrow.
 //
 // Data is read only through the hooks: the estimate pose/velocity come from the
 // pose estimator (discovered by shape), the truth from `sim/state/pose/*`, and
@@ -13,18 +15,19 @@
 import {useEffect, useMemo, useRef, useState} from 'react';
 import type {ChangeEvent, PointerEvent as RPointerEvent} from 'react';
 
-import {poseValid, simTruthPose} from '../../core';
-import {discoverCameras, discoverEstimators} from '../../data/discovery';
+import {simTruthPose} from '../../core';
+import {discoverCameras, discoverEstimate} from '../../data/discovery';
 import {
   useActions,
   useChannelValue,
+  useChassis,
   useDictionary,
   usePlayback,
   useSeries,
   useSnapshot
 } from '../../data/hooks';
-import type {ChannelInfo} from '../../data/types';
 import {number} from '../../ui/formatters';
+import {FreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition, PanelProps} from '../types';
 import {
   FIELD_HEIGHT_PX,
@@ -96,38 +99,6 @@ const cameraPalette =
 const MIN_ZOOM = 0.06;  // about 1 m across, the tightest useful zoom
 const MAX_ZOOM = 2.5;
 
-type EstimateChannels = {
-  x: string; y: string; yaw: string; vx: string|null; vy: string|null;
-};
-
-// The estimate pose (and, when present, velocity) channels. The estimator
-// publishes the estimated pose; discover it by its accepted-observation
-// counter rather than by name. Falls back to the old `/pose/x_m` suffix rule
-// for recordings whose estimator predates that shape (the demo).
-function discoverEstimate(dictionary: ChannelInfo[]): EstimateChannels|null {
-  const names = new Set(dictionary.map(c => c.name));
-  for (const est of discoverEstimators(dictionary)) {
-    const x = `${est.name}/state/pose/x_m`;
-    if (!names.has(x)) continue;
-    const vx = `${est.name}/state/velocity/vx_mps`;
-    const vy = `${est.name}/state/velocity/vy_mps`;
-    return {
-      x,
-      y: `${est.name}/state/pose/y_m`,
-      yaw: `${est.name}/state/pose/yaw_rad`,
-      vx: names.has(vx) ? vx : null,
-      vy: names.has(vy) ? vy : null
-    };
-  }
-  const x = dictionary.find(c => c.name.endsWith('/pose/x_m'));
-  if (!x) return null;
-  const prefix = x.name.slice(0, -'pose/x_m'.length);
-  return {
-    x: x.name, y: prefix + 'pose/y_m', yaw: prefix + 'pose/yaw_rad',
-    vx: null, vy: null
-  };
-}
-
 type TrailPoint = PointM & {tNs: string};
 type CameraObs = {
   name: string; color: string; x: number; y: number; yaw: number|null;
@@ -166,10 +137,13 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const velocityVx = useChannelValue(estimate?.vx ?? '');
   const velocityVy = useChannelValue(estimate?.vy ?? '');
 
-  const poseOk = poseValid(snapshot);
+  // The estimate pose, and whether it is current by the reading clock.
+  const reading = useChassis();
   const truth = simTruthPose(snapshot);
-  const chassis = snapshot?.chassis ?? null;
-  const robotM = poseOk && chassis ? {x: chassis.x, y: chassis.y} : null;
+  const chassis = reading?.pose ?? null;
+  const stale = reading?.stale ?? false;
+  const robotM = chassis ? {x: chassis.x, y: chassis.y} : null;
+  const estimateOwner = estimate ? estimate.x.slice(0, estimate.x.indexOf('/') + 1) : '';
 
   const trailPoints = useMemo<TrailPoint[]>(() => {
     if (!estimate) return [];
@@ -303,8 +277,10 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const setLayer = (key: keyof FieldLayers) =>
       (e: ChangeEvent<HTMLInputElement>) =>
           setConfig({...config, layers: {...config.layers, [key]: e.target.checked}});
-  const setFollow = (e: ChangeEvent<HTMLInputElement>) =>
-      setConfig({...config, follow: e.target.checked});
+  const setFollow = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.checked) setManualView(null);
+    setConfig({...config, follow: e.target.checked});
+  };
   const setTrailSeconds = (e: ChangeEvent<HTMLInputElement>) => {
     const v = Number(e.target.value);
     if (Number.isFinite(v)) setConfig({...config, trailSeconds: Math.max(0.5, v)});
@@ -313,8 +289,8 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const point = (p: PointM) => `${toPx(p.x)},${toPy(p.y)}`;
 
   const robot = (p: PointM, color: string, name: string, yaw = 0,
-                 ghost = false) => (
-      <g key={name} opacity={ghost ? .55 : 1}
+                 ghost = false, dim = false) => (
+      <g key={name} opacity={ghost ? .55 : dim ? .35 : 1}
          strokeDasharray={ghost ? '5 4' : undefined}
          transform={`translate(${toPx(p.x)} ${toPy(p.y)}) rotate(${
              -yaw * 180 / Math.PI})`}>
@@ -327,6 +303,7 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
   const viewBoxStr = `${viewBox.x} ${viewBox.y} ${viewBox.width} ${viewBox.height}`;
 
   return <>
+    {estimateOwner && <FreshnessNotice prefix={estimateOwner}/>}
     <div className="field-controls">
       {(['trail', 'truth', 'cameras', 'velocity'] as const).map(key => (
         <label key={key}>
@@ -348,7 +325,7 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
       <button type="button" onClick={() => setManualView(null)}>Reset view</button>
     </div>
     <div className="legend">
-      {poseOk && chassis && <span><i style={{background: colors.estimate}}/>Estimate</span>}
+      {chassis && <span><i style={{background: colors.estimate}}/>Estimate</span>}
       {config.layers.trail && trailPoints.length > 1 && <span><i style={{
         width: 10, height: 2, borderRadius: 0, background: colors.estimate,
         opacity: .6
@@ -364,7 +341,7 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
         <span key={obs.name}><i style={{background: obs.color}}/>{obs.name}</span>
       ))}
     </div>
-    {snapshot && !poseOk &&
+    {snapshot && !reading &&
      <div className="empty-state" role="status">
        Awaiting pose — mechanism data only. The field view waits for a valid pose.
      </div>}
@@ -424,8 +401,8 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
           </g>
         );
       })}
-      {poseOk && chassis && robot(chassis, colors.estimate, 'chassis', chassis.yaw)}
-      {config.layers.velocity && poseOk && chassis && velocity &&
+      {chassis && robot(chassis, colors.estimate, 'chassis', chassis.yaw, false, stale)}
+      {config.layers.velocity && chassis && !stale && velocity &&
        <line x1={toPx(chassis.x)} y1={toPy(chassis.y)}
              x2={toPx(chassis.x + velocity.x)}
              y2={toPy(chassis.y + velocity.y)} stroke={colors.velocity}
@@ -441,12 +418,12 @@ function FieldPanel({config, setConfig}: PanelProps<FieldConfig>) {
         Position error {number(positionError)} m · Heading error {
             number(headingError, 1)}°
       </span>}
-      <span>{
-          poseOk && chassis ? `X ${number(chassis.x, 3)} m   Y ${
+      <span className={stale ? 'text-warn' : undefined}>{
+          chassis ? `X ${number(chassis.x, 3)} m   Y ${
                   number(chassis.y, 3)} m   θ ${
                   number(chassis.yaw * 180 / Math.PI, 1)}°` :
               snapshot ? 'Awaiting pose' :
-                         'Awaiting telemetry'}</span>
+                         'Awaiting telemetry'}{stale && <em> · STALE</em>}</span>
     </div>
   </>;
 }
@@ -472,5 +449,6 @@ export const fieldPanel: PanelDefinition<FieldConfig> = {
   description: 'Top-down field view: estimate, truth, cameras and velocity.',
   defaultConfig,
   parseConfig,
-  component: FieldPanel
+  component: FieldPanel,
+  recorded: true
 };

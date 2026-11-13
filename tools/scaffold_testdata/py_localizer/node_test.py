@@ -1,4 +1,9 @@
-"""Node tests: the class on talos.testing.Sim, and the binary."""
+"""Node tests: the class on talos.testing.Sim, and the binary.
+
+PyLocalizerTest is the node test matrix for an observer, docs/TESTING.md
+§7: the case names are the matrix's, which //tools:check_node_matrix looks
+for.
+"""
 
 import math
 import os
@@ -28,14 +33,14 @@ class PyLocalizerTest(unittest.TestCase):
         """A camera's observation of (x, y), taken now."""
         self.sim.publish(
             PoseObservation, f"/{camera}/state",
-            sample_time_ns=round(self.sim.now * 1e9), pose_x_m=x, pose_y_m=y,
+            sample_time_ns=self.sim.now_ns, pose_x_m=x, pose_y_m=y,
             pose_yaw_rad=0.5, x_std_m=std_m, y_std_m=std_m, yaw_std_rad=0.05,
             tag_count=2, valid=valid)
 
     def state(self):
         return self.sim.latest(PoseEstimate, topics.STATE)
 
-    def test_follows_a_usable_observation(self):
+    def test_publishes_from_a_live_input(self):
         self.sim.step(0.02)
         self.observe("front_camera", 1.0, 2.0)
         self.sim.step(0.04)
@@ -52,7 +57,8 @@ class PyLocalizerTest(unittest.TestCase):
         self.assertTrue(self.state().valid)
         self.assertEqual(self.state().pose_x_m, 3.0)
 
-    def test_stale_input_is_invalid_and_holds_the_pose(self):
+    # REQ-CONTRACT-25
+    def test_stale_input_clears_validity(self):
         self.sim.step(0.02)
         self.observe("front_camera", 1.0, 2.0)
         self.sim.step(0.04)
@@ -78,6 +84,36 @@ class PyLocalizerTest(unittest.TestCase):
         self.sim.step(0.04)
         self.assertFalse(self.state().valid)
         self.assertEqual(self.state().observation_accepted_count, 0)
+
+    def test_counts_every_observation_between_ticks(self):
+        self.sim.step(0.02)
+        self.observe("front_camera", 1.0, 2.0)
+        self.observe("front_camera", 1.0, 2.0, valid=False)
+        self.observe("front_camera", 1.5, 2.0)
+        self.sim.step(0.04)
+        state = self.state()
+        self.assertEqual((state.observation_accepted_count,
+                          state.observation_rejected_count), (2, 1))
+
+    # REQ-CONTRACT-18
+    def test_bad_parameter_fails_construction(self):
+        for key, settings in (
+                ("cameras", "observation_timeout_us = 500000"),
+                ("cameras", "cameras = 3"),
+                ("observation_timeout_us",
+                 'cameras = ["front_camera"]\nobservation_timeout_us = 0')):
+            with self.subTest(settings=settings):
+                sim = Sim.from_toml(
+                    "[robot]\nperiod_us = 20000\n"
+                    "command_timeout_us = 100000\n"
+                    f"[subsystems.py_localizer]\n{settings}\n"
+                    "[subsystems.chassis.motors.chassis_motor]\n"
+                    'type = "TalonFX"\ncan_id = 1\n')
+                with self.assertRaisesRegex((ValueError, talos.TalosError),
+                                            key):
+                    sim.add(node_py.PyLocalizer, "py_localizer")
+
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
 class BinaryTest(unittest.TestCase):

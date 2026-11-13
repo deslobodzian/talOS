@@ -1,0 +1,44 @@
+[subsystem]
+name = "motor"
+node = "//bench/main_processor/motor:node"
+period_us = 5000
+max_bench_voltage_v = 2.0
+
+[motors.kraken]
+type = "TalonFX"
+bus = "rio"
+# Placeholder only: a human must set the physical CAN id before commissioning.
+can_id = 1
+motor_type = "kraken_x44"
+inverted = false
+brake = false
+supply_limit_a = 30.0
+stator_limit_a = 40.0
+# Raise deliberately only after the first supervised spin.
+max_voltage = 4.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 30.0
+cruise_velocity_rps = 10.0
+acceleration_rps2 = 20.0
+# Rotor-unit feedforward measured on the restrained bench Kraken X44 at
+# 9 to 11 rps in both directions; static friction is not yet separated from it.
+slot0 = { p = 0.1, i = 0.0, d = 0.0, s = 0.0, v = 0.095, a = 0.0, g = 0.0 }
+
+[teleop]
+defaults = { mode = "VOLTAGE", voltage_v = 0.0, velocity_rps = 0.0, voltage_frac = 0.0 }
+
+# Buttons take precedence over the axis; button 1 wins when both are held.
+[[teleop.bindings]]
+button = 1
+while_held = { mode = "VELOCITY", velocity_rps = 10.0 }
+
+[[teleop.bindings]]
+button = 2
+while_held = { mode = "VELOCITY", velocity_rps = 30.0 }
+
+# Joystick 0 axis 1: normalized fraction scaled by max_bench_voltage_v.
+[[teleop.bindings]]
+axis = 1
+field = "voltage_frac"
+scale = -1.0
+deadband_frac = 0.1

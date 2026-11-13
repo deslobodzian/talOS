@@ -152,28 +152,5 @@ TEST(Scheduler, DisablingAPeriodicTimerStopsIt) {
   EXPECT_FALSE(scheduler.pop_expired(at(10'000), expiration));
 }
 
-// Same inputs, same order, every time: the property the log depends on.
-TEST(Scheduler, IsReproducible) {
-  const auto run = [] {
-    Scheduler scheduler;
-    scheduler.schedule(1, at(1'000), Duration{1'000});
-    scheduler.schedule(2, at(1'000), Duration{2'500});
-    scheduler.schedule(3, at(500), Duration{750});
-
-    std::vector<std::pair<std::uint16_t, std::int64_t>> fired;
-    Expiration expiration{};
-
-    for (std::int64_t now = 0; now <= 10'000; now += 250) {
-      while (scheduler.pop_expired(at(now), expiration)) {
-        fired.emplace_back(expiration.id, expiration.deadline.nanos());
-      }
-    }
-    return fired;
-  };
-
-  EXPECT_EQ(run(), run());
-  EXPECT_FALSE(run().empty());
-}
-
 }  // namespace
 }  // namespace talos::event

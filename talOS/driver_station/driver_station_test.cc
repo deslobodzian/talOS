@@ -3,102 +3,17 @@
 #include <gtest/gtest.h>
 
 #include <array>
-#include <cstdio>
 #include <cstring>
-#include <vector>
 
 namespace talos::driver_station {
 namespace {
 
-TEST(DriverStationTest, RoundTripEncoding) {
-  DriverStationData original{};
-  original.sample_time_us = 123456789;
-  original.mode_since_us = 123400000;
-  original.fms.flags = kDsAttached | kFmsAttached | kEnabled | kTeleop;
-  original.fms.alliance = Alliance::kRed;
-  original.fms.station = 2;
-  original.fms.match_type = MatchType::kQualification;
-  original.fms.match_number = 42;
-  original.fms.replay_number = 1;
-  original.fms.match_time_s = 135.5f;
-  std::snprintf(original.fms.game_specific_message,
-                sizeof(original.fms.game_specific_message), "AMP");
-  std::snprintf(original.fms.event_name, sizeof(original.fms.event_name),
-                "CMPTX");
-
-  // Stick 0 connected
-  original.joysticks[0].connected = true;
-  original.joysticks[0].axis_count = 4;
-  original.joysticks[0].button_count = 10;
-  original.joysticks[0].pov_count = 1;
-  original.joysticks[0].buttons = (1u << 0) | (1u << 3);
-  original.joysticks[0].axes[0] = 0.5f;
-  original.joysticks[0].axes[1] = -0.75f;
-  original.joysticks[0].axes[2] = 0.0f;
-  original.joysticks[0].axes[3] = 1.0f;
-  original.joysticks[0].povs[0] = 90;
-  std::snprintf(original.joysticks[0].name, sizeof(original.joysticks[0].name),
-                "Logitech Gamepad");
-
-  // Stick 1 connected
-  original.joysticks[1].connected = true;
-  original.joysticks[1].axis_count = 2;
-  original.joysticks[1].button_count = 4;
-  original.joysticks[1].pov_count = 0;
-  original.joysticks[1].buttons = (1u << 2);
-  original.joysticks[1].axes[0] = -0.2f;
-  original.joysticks[1].axes[1] = 0.8f;
-  std::snprintf(original.joysticks[1].name, sizeof(original.joysticks[1].name),
-                "Xbox Controller");
-
-  // Sticks 2..5 disconnected
-
-  std::array<uint8_t, 1024> buffer{};
-  const auto size = Encode(original, buffer);
-  ASSERT_GT(size, 0u);
-  ASSERT_LE(size, buffer.size());
-
-  DriverStationData decoded{};
-  ASSERT_TRUE(Decode({buffer.data(), size}, decoded));
-
-  EXPECT_EQ(decoded.sample_time_us, original.sample_time_us);
-  EXPECT_EQ(decoded.mode_since_us, original.mode_since_us);
-  EXPECT_EQ(decoded.fms.flags, original.fms.flags);
-  EXPECT_EQ(decoded.fms.alliance, original.fms.alliance);
-  EXPECT_EQ(decoded.fms.station, original.fms.station);
-  EXPECT_EQ(decoded.fms.match_type, original.fms.match_type);
-  EXPECT_EQ(decoded.fms.match_number, original.fms.match_number);
-  EXPECT_EQ(decoded.fms.replay_number, original.fms.replay_number);
-  EXPECT_FLOAT_EQ(decoded.fms.match_time_s, original.fms.match_time_s);
-  EXPECT_STREQ(decoded.fms.game_specific_message,
-               original.fms.game_specific_message);
-  EXPECT_STREQ(decoded.fms.event_name, original.fms.event_name);
-
-  // Check Stick 0
-  EXPECT_TRUE(decoded.joysticks[0].connected);
-  EXPECT_EQ(decoded.joysticks[0].axis_count, 4);
-  EXPECT_EQ(decoded.joysticks[0].button_count, 10);
-  EXPECT_EQ(decoded.joysticks[0].pov_count, 1);
-  EXPECT_EQ(decoded.joysticks[0].buttons, (1u << 0) | (1u << 3));
-  EXPECT_FLOAT_EQ(decoded.joysticks[0].axes[0], 0.5f);
-  EXPECT_FLOAT_EQ(decoded.joysticks[0].axes[1], -0.75f);
-  EXPECT_EQ(decoded.joysticks[0].povs[0], 90);
-  EXPECT_STREQ(decoded.joysticks[0].name, "Logitech Gamepad");
-
-  // Check Stick 1
-  EXPECT_TRUE(decoded.joysticks[1].connected);
-  EXPECT_EQ(decoded.joysticks[1].axis_count, 2);
-  EXPECT_FLOAT_EQ(decoded.joysticks[1].axes[0], -0.2f);
-  EXPECT_STREQ(decoded.joysticks[1].name, "Xbox Controller");
-
-  // Check Stick 2
-  EXPECT_FALSE(decoded.joysticks[2].connected);
-}
-
+// REQ-CONTRACT-02
 TEST(DriverStationTest, FullyPopulatedEncodingReachesMaximumSize) {
   DriverStationData original{};
   original.sample_time_us = 123456789;
   original.mode_since_us = 123400000;
+  original.boot_id = 0xfedcba9876543211ULL;
   original.fms.flags = kDsAttached | kFmsAttached | kEnabled | kTeleop;
   original.fms.alliance = Alliance::kBlue;
   original.fms.station = 3;
@@ -187,24 +102,46 @@ TEST(ModeTrackerTest, GenerationIsTheFirstSampleOfEachMode) {
   EXPECT_EQ(Stamp(tracker, 1140, kTeleopEnabled | kEStop), 1140u);
 }
 
-TEST(ModeTrackerTest, EveryModeFlagStartsAGeneration) {
+TEST(ModeTrackerTest, FlapBetweenPublishedSamplesStartsANewGeneration) {
+  // Hardware ticks observe any mode-flag change and its reversal before the
+  // next 20 ms packet; the packet carries the generation of the return.
   for (const uint32_t bit :
        {kDsAttached, kEnabled, kAutonomous, kTeleop, kTest, kEStop}) {
     ModeTracker tracker;
-    Stamp(tracker, 10, kTeleopEnabled);
-    EXPECT_EQ(Stamp(tracker, 20, kTeleopEnabled ^ bit), 20u) << bit;
+    Stamp(tracker, 20000, kTeleopEnabled);
+    tracker.Observe(kTeleopEnabled ^ bit, 25000);
+    tracker.Observe(kTeleopEnabled, 30000);
+    tracker.Observe(kTeleopEnabled, 35000);
+    EXPECT_EQ(Stamp(tracker, 40000, kTeleopEnabled), 30000u) << bit;
+    EXPECT_EQ(Stamp(tracker, 60000, kTeleopEnabled), 30000u) << bit;
   }
 }
 
-TEST(ModeTrackerTest, FmsAndJoysticksDoNotStartAGeneration) {
+TEST(ModeTrackerTest, SteadyHardwareTicksKeepThePublishedGeneration) {
+  // kFmsAttached is not a mode flag.
   ModeTracker tracker;
-  Stamp(tracker, 10, kTeleopEnabled);
-  DriverStationData ds = Sample(20, kTeleopEnabled | kFmsAttached);
-  ds.fms.match_time_s = 90.0f;
-  ds.joysticks[0].connected = true;
-  ds.joysticks[0].buttons = 1;
-  tracker.Stamp(ds);
-  EXPECT_EQ(ds.mode_since_us, 10u);
+  tracker.Observe(kTeleopEnabled, 20000);
+  for (uint64_t now_us = 25000; now_us <= 40000; now_us += 5000) {
+    tracker.Observe(kTeleopEnabled | kFmsAttached, now_us);
+  }
+  EXPECT_EQ(Stamp(tracker, 40000, kTeleopEnabled), 20000u);
+}
+
+// REQ-SAFE-10
+TEST(ModeTrackerTest, DetachedDriverStationShowsNoMode) {
+  // Bench, RoboRIO 2026 image, no Driver Station attached: WPILib's HAL
+  // reports teleop as its default control word, so every packet carried
+  // kTeleop with kDsAttached clear (TODO RT-16). A detached packet must name
+  // no mode, and the hardware ticks that observe the raw flags must agree
+  // with the packets on the generation.
+  ModeTracker tracker;
+  DriverStationData detached = Sample(1000, kTeleop);
+  tracker.Stamp(detached);
+  EXPECT_EQ(detached.fms.flags & (kAutonomous | kTeleop | kTest), 0u)
+      << "flags " << detached.fms.flags;
+  tracker.Observe(kTeleop, 1005);
+  tracker.Observe(0, 1010);
+  EXPECT_EQ(Stamp(tracker, 1020, kTeleop), 1000u);
 }
 
 TEST(ModeTrackerTest, GenerationIsNeverZeroAndAlwaysMovesForward) {

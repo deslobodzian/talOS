@@ -1,0 +1,2 @@
+accept = false
+error_contains = "unknown sensor key 'offest_rot'"

@@ -1,7 +1,9 @@
 """Unit tests for //tools:new_subsystem."""
 
 import os
+import re
 import tempfile
+import tomllib
 import unittest
 
 from tools import new_subsystem
@@ -29,19 +31,63 @@ class NewSubsystemTest(unittest.TestCase):
         self.assertIsNotNone(new_subsystem.check_name("wrist__arm"))
         self.assertIsNotNone(new_subsystem.check_name("wrist_"))
 
-        # Abbreviations, direction suffixes, reserved owners, keywords/modules
-        self.assertIn("target", new_subsystem.check_name("tgt"))
-        self.assertIn("drivetrain", new_subsystem.check_name("drive"))
-        self.assertIn("direction", new_subsystem.check_name("wrist_out"))
-        self.assertIn("reserved", new_subsystem.check_name("hw"))
-        self.assertIn("keyword", new_subsystem.check_name("class"))
-        self.assertIn("keyword", new_subsystem.check_name("sys"))
-        self.assertIn("keyword", new_subsystem.check_name("python"))
-        self.assertIn("collides", new_subsystem.check_name("node"))
+        # Abbreviations, reserved owners and language/module collisions.
+        for name in ("tgt", "drive", "wrist_out", "hw", "class", "sys",
+                     "python", "node"):
+            with self.subTest(name=name):
+                self.assertIsNotNone(new_subsystem.check_name(name))
 
         # Too long to leave room for /<name>/target/teleop (31 bytes max)
         self.assertIsNotNone(new_subsystem.check_name("a" * 17))
         self.assertIsNone(new_subsystem.check_name("a" * 16))
+
+    def test_check_name_uses_the_rules_of_names_h(self):
+        # check_name copies talOS/introspection/names.h's limits and lists;
+        # a rule changed on one side only fails here.
+        with open(os.path.join("talOS", "introspection", "names.h"),
+                  encoding="utf-8") as f:
+            header = f.read()
+
+        def number(constant):
+            return int(re.search(rf"\b{constant} = (\d+);", header).group(1))
+
+        def strings(array):
+            body = re.search(rf"\b{array}\[\] = \{{(.*?)\}};", header,
+                             re.DOTALL).group(1)
+            return re.findall(r'"([^"]*)"', body)
+
+        self.assertEqual(number("kMaxSegmentBytes"),
+                         new_subsystem.MAX_SEGMENT_BYTES)
+        self.assertEqual(number("kMaxTopicBytes"),
+                         new_subsystem.MAX_TOPIC_BYTES)
+        self.assertEqual(set(strings("kReservedOwners")),
+                         new_subsystem.RESERVED_OWNERS)
+        pairs = strings("kAbbreviations")
+        self.assertEqual(dict(zip(pairs[::2], pairs[1::2])),
+                         new_subsystem.ABBREVIATIONS)
+        self.assertEqual(set(strings("kDirectionSuffixes")),
+                         set(new_subsystem.DIRECTION_SUFFIXES))
+
+    # REQ-DEV-01
+    def test_subsystem_file_keys_are_the_keys_of_config_parser_h(self):
+        # A position node's parameter table is [<name>], so check_kind
+        # refuses a name the config parser reads or refuses in a subsystem
+        # file. SUBSYSTEM_FILE_KEYS copies those lists; a key added on one
+        # side only fails here, before a scaffold's table collides with it.
+        with open(os.path.join("talOS", "configuration", "config_parser.h"),
+                  encoding="utf-8") as f:
+            header = f.read()
+
+        def strings(pattern):
+            body = re.search(pattern, header, re.DOTALL).group(1)
+            return re.findall(r'"([^"]*)"', body)
+
+        framework = strings(
+            r"\bkFrameworkSubsystemKeys\[\] = \{(.*?)\};")
+        pairs = strings(r"\bkSections\[\] = \{(.*?)\};")
+        self.assertTrue(framework and pairs)
+        self.assertEqual(new_subsystem.SUBSYSTEM_FILE_KEYS,
+                         {"subsystem", *framework, *pairs[::2]})
 
     def test_plan_scaffolds_into_custom_robot_and_assigns_lowest_free_can_id(self):
         with tempfile.TemporaryDirectory() as root:
@@ -150,33 +196,88 @@ class NewSubsystemTest(unittest.TestCase):
                 with self.assertRaises(new_subsystem.Refused):
                     new_subsystem.plan(root, "bot", inherited, "py")
 
-    def test_plan_standalone_builds_against_this_checkout(self):
-        # A generated repo must build as written: it points @talos at the
-        # checkout it came from and takes its C++23 flags and Bazel version.
-        with tempfile.TemporaryDirectory() as tmp:
-            talos = os.path.join(tmp, "src", "talOS")
-            os.makedirs(talos)
-            for config, text in ((".bazelrc", "build --cxxopt=-std=c++23\n"),
-                                 (".bazelversion", "8.6.0\n")):
-                with open(os.path.join(talos, config), "w",
-                          encoding="utf-8") as f:
-                    f.write(text)
-            target = os.path.join(tmp, "repos", "wrist")
-            writes = new_subsystem.plan_standalone(target, "wrist", "cpp",
-                                                   talos)
-            by_rel = {
-                os.path.relpath(path, target).replace(os.sep, "/"): content
-                for path, _, content in writes
-            }
-            self.assertIn(
-                'local_path_override(module_name = "talos", '
-                'path = "../../src/talOS")', by_rel["MODULE.bazel"])
-            self.assertEqual(by_rel[".bazelrc"], "build --cxxopt=-std=c++23\n")
-            self.assertEqual(by_rel[".bazelversion"], "8.6.0\n")
-            # Loads stay first; every talOS label names the @talos module.
-            build = by_rel["BUILD"]
-            self.assertTrue(build.startswith("load("))
-            self.assertNotIn('"//talOS', build)
+    def test_plan_homes_a_position_mechanism_and_confines_its_travel(self):
+        # Positions count from a home switch, never from the power-on frame:
+        # the motor requires a zero, has no hardware soft limits (which act
+        # in that frame and can stop homing), and its placeholder travel,
+        # clamped by the node, is narrower than the at-goal tolerance. The
+        # homing parameters pass PositionMechanism's checks (home at
+        # min_rot, |homing_v| toward the switch and at most half max_voltage,
+        # homing on the generated switch), in both languages, and the switch
+        # gets the lowest free DIO channel, as the motor gets the lowest free
+        # CAN id.
+        for lang in ("cpp", "py"):
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as root:
+                configuration = os.path.join(root, "bot", "main_processor",
+                                             "configuration")
+                os.makedirs(os.path.join(configuration, "subsystems"))
+                for path, text in (
+                        ("BUILD", ""),
+                        ("robot.toml",
+                         '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                         'name = "shooter"\npath = "subsystems/shooter.toml"\n'),
+                        ("subsystems/shooter.toml",
+                         '[subsystem]\nname = "shooter"\n'
+                         '[digital_inputs.beam]\ndio = 0\n'
+                         '[encoders.angle]\ndio_a = 1\ndio_b = 3\n')):
+                    with open(os.path.join(configuration, path), "w",
+                              encoding="utf-8") as f:
+                        f.write(text)
+                writes, _ = new_subsystem.plan(root, "bot", "wrist", lang,
+                                               kind="position")
+                subsystem = tomllib.loads(next(
+                    new for path, _, new in writes
+                    if path == os.path.join(configuration, "subsystems",
+                                            "wrist.toml")))
+                motor = subsystem["motors"]["wrist"]
+                params = subsystem["wrist"]
+                self.assertEqual(params["homing"], "limit_switch")
+                self.assertIn(params["limit_switch"],
+                              subsystem["digital_inputs"])
+                self.assertEqual(params["min_rot"], 0)
+                travel = params["max_rot"] - params["min_rot"]
+                self.assertLessEqual(abs(params["homing_v"]),
+                                     motor["max_voltage"] / 2)
+                self.assertEqual(motor["position_frame"], "rezero")
+                self.assertIs(motor["soft_limits"], False)
+                self.assertGreater(travel, 0)
+                self.assertLess(travel, params["tolerance_rot"])
+                self.assertLess(params["homing_v"], 0)
+                for key in ("homing_timeout_us", "homing_stall_rps",
+                            "homing_stall_us", "home_margin_rot"):
+                    self.assertGreater(params[key], 0, key)
+                self.assertEqual(
+                    subsystem["digital_inputs"]["wrist_home"]["dio"], 2)
+
+    def test_position_name_cannot_shadow_a_subsystem_file_key(self):
+        # A position node's parameter table is [<name>] in its subsystem
+        # file (C++ and Python alike), so a name the framework reads there
+        # ([targets]), refuses ([motor]) or heads it with ([subsystem]) is
+        # refused.
+        for name in ("targets", "motor", "subsystem"):
+            for lang in ("cpp", "py"):
+                with self.subTest(name=name, lang=lang):
+                    self.assertIsNotNone(
+                        new_subsystem.check_kind(name, lang, "position"))
+        self.assertIsNone(new_subsystem.check_kind("wrist", "py", "position"))
+        self.assertIsNone(new_subsystem.check_kind("targets", "py", "velocity"))
+
+    def test_test_robot_has_a_neighbor_even_for_a_subsystem_so_named(self):
+        # The generated feedback case disconnects the node's motor while
+        # another subsystem's stays valid; a scaffold named like that
+        # neighbor must not merge into it (its test would lose the
+        # neighbor, or the config would name one subsystem twice).
+        for lang in ("cpp", "py"):
+            for kind in ("velocity", "position"):
+                with self.subTest(lang=lang, kind=kind):
+                    files = new_subsystem.package_files("neighbor", lang,
+                                                        kind=kind)
+                    robot = tomllib.loads(files["testdata/robot.toml"])
+                    subsystems = robot["subsystems"]
+                    names = ([entry["name"] for entry in subsystems]
+                             if lang == "cpp" else list(subsystems))
+                    self.assertEqual(len(set(names)), 2, names)
+                    self.assertIn("neighbor", names)
 
     def test_generated_packages_match_the_built_golden_packages(self):
         # tools/scaffold_testdata holds the generator's output, built and
@@ -185,6 +286,8 @@ class NewSubsystemTest(unittest.TestCase):
         # one filegroup, which hands the files to this test.
         for name, lang, kind in (("gripper", "cpp", "velocity"),
                                  ("scaffold_py", "py", "velocity"),
+                                 ("position_cpp", "cpp", "position"),
+                                 ("position_py", "py", "position"),
                                  ("localizer", "cpp", "estimator"),
                                  ("py_localizer", "py", "estimator")):
             golden = os.path.join("tools", "scaffold_testdata", name)
@@ -207,67 +310,6 @@ class NewSubsystemTest(unittest.TestCase):
                         f"{lang!r}, kind={kind!r}) (plus the golden "
                         f"filegroup in BUILD)")
 
-    def test_position_archetype_generates_motion_magic_for_cpp_and_python(self):
-        cpp_files = new_subsystem.package_files("wrist", "cpp", kind="position")
-        self.assertIn("position_rot:double;", cpp_files["wrist_message.fbs"])
-        self.assertIn("at_goal:bool;", cpp_files["wrist_message.fbs"])
-        self.assertIn("set_motion_magic", cpp_files["wrist.h"])
-        self.assertIn("Mode::kMotionMagic", cpp_files["node_test.cc"])
-
-        py_files = new_subsystem.package_files("wrist", "py", kind="position")
-        self.assertIn("set_motion_magic", py_files["wrist.py"])
-        self.assertIn("talos.Mode.MOTION_MAGIC", py_files["node_test.py"])
-
-    def test_target_lanes_replace_the_arbiter(self):
-        for kind, field in (("velocity", "velocity_rps"),
-                            ("position", "position_rot")):
-            with self.subTest(kind):
-                cpp = new_subsystem.package_files("wrist", "cpp", kind=kind)
-                fbs = cpp["wrist_message.fbs"]
-                target = fbs.split("struct WristTarget {")[1].split("}")[0]
-                # 8 bytes, wire-compatible with { double demand; }.
-                self.assertEqual(target.strip(), f"{field}:double;")
-                self.assertIn("talos::Target<Target> target_;", cpp["wrist.h"])
-                self.assertIn("target_.get()", cpp["wrist.h"])
-                self.assertIn("std::isfinite", cpp["wrist.h"])
-                for case in ("DisabledRobot", "StaleLane", "ReleasedLane",
-                             "NeverSent", "DriverStationLoss",
-                             "NonFiniteDemand"):
-                    self.assertIn(f"{case}GoesNeutral", cpp["node_test.cc"])
-                self.assertIn("PublishTarget(sim", cpp["node_test.cc"])
-                self.assertIn("ReleaseTarget<Target>", cpp["node_test.cc"])
-
-                py = new_subsystem.package_files("wrist", "py", kind=kind)
-                self.assertIn("talos.Target(node, WristTarget)", py["wrist.py"])
-                self.assertIn("math.isfinite", py["wrist.py"])
-                for case in ("disabled_robot", "stale_lane", "released_lane",
-                             "never_sent", "driver_station_loss",
-                             "non_finite_demand"):
-                    self.assertIn(f"test_{case}_sends_neutral",
-                                  py["node_test.py"])
-                self.assertIn(f"{field}=demand", py["node_test.py"])
-                for files in (cpp, py):
-                    for content in files.values():
-                        self.assertNotIn("arbiter", content)
-
-    def test_estimator_archetype_is_hardware_free_and_reads_its_cameras(self):
-        for lang, node, test in (("cpp", "localizer.h", "node_test.cc"),
-                                 ("py", "localizer.py", "node_test.py")):
-            with self.subTest(lang):
-                files = new_subsystem.package_files("localizer", lang,
-                                                    kind="estimator")
-                # No schema of its own: the shared geometry messages.
-                self.assertNotIn("localizer_message.fbs", files)
-                self.assertIn("srcs = [],", files["BUILD"])
-                self.assertIn('"//talOS/msgs:geometry"', files["BUILD"])
-                self.assertIn('"state": "/localizer/state"', files["BUILD"])
-                self.assertIn("PoseEstimate", files[node])
-                self.assertIn('"cameras"', files[node])
-                for word in ("Motor", "Target", "robot_enabled"):
-                    self.assertNotIn(word, files[node])
-                self.assertIn("optional", files[node])
-                self.assertRegex(files[test], r"(?i)disabled")
-                self.assertRegex(files[test], r"(?i)stale")
 
     def test_plan_wires_an_estimator_without_a_can_id(self):
         with tempfile.TemporaryDirectory() as root:

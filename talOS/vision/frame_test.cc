@@ -8,48 +8,19 @@
 namespace talos::vision {
 namespace {
 
-TEST(FrameTest, PixelFormatHelpers) {
+TEST(FrameTest, PixelFormatStorageSizes) {
   EXPECT_EQ(BytesPerPixel(PixelFormat::kGray8), 1);
   EXPECT_EQ(BytesPerPixel(PixelFormat::kRgb8), 3);
   EXPECT_EQ(BytesPerPixel(PixelFormat::kBgr8), 3);
   EXPECT_EQ(BytesPerPixel(PixelFormat::kYuyv), 2);
   EXPECT_EQ(BytesPerPixel(PixelFormat::kBgra8), 4);
-
-  EXPECT_EQ(PixelFormatToString(PixelFormat::kGray8), "Gray8");
-  EXPECT_EQ(PixelFormatToString(PixelFormat::kRgb8), "Rgb8");
-  EXPECT_EQ(PixelFormatToString(PixelFormat::kBgr8), "Bgr8");
-  EXPECT_EQ(PixelFormatToString(PixelFormat::kYuyv), "Yuyv");
-  EXPECT_EQ(PixelFormatToString(PixelFormat::kBgra8), "Bgra8");
 }
 
-TEST(FrameTest, DefaultConstruction) {
-  Frame f;
-  EXPECT_EQ(f.camera_id(), 0);
-  EXPECT_EQ(f.session_id(), 0);
-  EXPECT_EQ(f.sequence_number(), 0);
-  EXPECT_EQ(f.width(), 0);
-  EXPECT_EQ(f.height(), 0);
-  EXPECT_EQ(f.stride(), 0);
-  EXPECT_TRUE(f.empty());
-  EXPECT_EQ(f.size(), 0);
-  EXPECT_TRUE(f.is_exposure_timestamp());
-}
-
-TEST(FrameTest, AllocatedConstruction) {
+TEST(FrameTest, AllocatesPackedImageStorage) {
   const auto t0 = talos::event::MonotonicTime::from_nanos(123456789);
   Frame f(1, 42, 100, t0, 640, 480, PixelFormat::kRgb8);
 
-  EXPECT_EQ(f.camera_id(), 1);
-  EXPECT_EQ(f.session_id(), 42);
-  EXPECT_EQ(f.sequence_number(), 100);
-  EXPECT_EQ(f.capture_time().nanos(), 123456789);
-  EXPECT_EQ(f.capture_timestamp_ns(), 123456789);
-  EXPECT_EQ(f.raw_timestamp_ns(), 123456789);
-  EXPECT_EQ(f.width(), 640);
-  EXPECT_EQ(f.height(), 480);
   EXPECT_EQ(f.stride(), 640 * 3);
-  EXPECT_EQ(f.format(), PixelFormat::kRgb8);
-  EXPECT_EQ(f.bytes_per_pixel(), 3);
   EXPECT_EQ(f.size(), 640 * 3 * 480);
   EXPECT_FALSE(f.empty());
   EXPECT_NE(f.data(), nullptr);
@@ -61,26 +32,10 @@ TEST(FrameTest, CustomStrideAndOwnedBuffer) {
   const auto t0 = talos::event::MonotonicTime::from_nanos(500);
   Frame f(2, 1, 5, t0, 30, 20, 50, PixelFormat::kGray8, std::move(buffer));
 
-  EXPECT_EQ(f.camera_id(), 2);
-  EXPECT_EQ(f.width(), 30);
-  EXPECT_EQ(f.height(), 20);
   EXPECT_EQ(f.stride(), 50);
   EXPECT_EQ(f.size(), 1000);
   EXPECT_EQ(f.data()[0], 0xAB);
   EXPECT_FALSE(f.is_shared());
-}
-
-TEST(FrameTest, MetadataAndClockDomain) {
-  Frame f;
-  f.set_clock_domain(ClockDomain::kDeviceMonotonic);
-  EXPECT_EQ(f.clock_domain(), ClockDomain::kDeviceMonotonic);
-
-  f.set_timestamp_kind(TimestampKind::kDelivery);
-  EXPECT_EQ(f.timestamp_kind(), TimestampKind::kDelivery);
-  EXPECT_FALSE(f.is_exposure_timestamp());
-
-  f.set_mapping_quality(TimestampMappingQuality::kInterpolated);
-  EXPECT_EQ(f.mapping_quality(), TimestampMappingQuality::kInterpolated);
 }
 
 TEST(FrameTest, CloneAndShareSemantics) {

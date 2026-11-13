@@ -10,11 +10,18 @@ command_timeout_us = 100000
 period_us = 20000
 backend = "factor_graph"
 cameras = ["front_camera", "back_camera"]
-module_x_m = [-0.30, -0.30, 0.30, 0.30]
-module_y_m = [0.30, -0.30, 0.30, -0.30]
 
-# A robot config needs one motor; the drivetrain whose state the estimator
-# reads owns it. The tests publish /drivetrain/state themselves.
+# The estimator reads the module offsets from the drivetrain's geometry. A
+# robot config needs one motor; the drivetrain whose state the estimator reads
+# owns it. The tests publish /drivetrain/state themselves.
+[subsystems.drivetrain.geometry]
+modules = [
+  { x_m = -0.30, y_m = 0.30 },
+  { x_m = -0.30, y_m = -0.30 },
+  { x_m = 0.30, y_m = 0.30 },
+  { x_m = 0.30, y_m = -0.30 },
+]
+
 [subsystems.drivetrain.motors.front_left_drive]
 type = "TalonFX"
 bus = "test"

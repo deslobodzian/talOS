@@ -13,6 +13,7 @@
 #include "talOS/events/callback.h"
 #include "talOS/events/context.h"
 #include "talOS/events/delivery.h"
+#include "talOS/events/dispatch_observer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/recorder.h"
 #include "talOS/events/time.h"
@@ -49,8 +50,12 @@ struct SourceCounters {
   // this source did its job.
   std::atomic<std::uint64_t> events{0};
 
-  // Messages the transport lapped before this source read them, plus publishes
-  // the transport refused.
+  // Messages the transport lapped before this source read them, messages a
+  // latest-only watcher skipped by design, publishes the transport refused,
+  // and reads it failed: torn by the writer, or finding the reader slot freed
+  // under this watcher. For a periodic timer, the periods it missed: a
+  // dispatch `cycles` periods after the previous one (the loop overran, or
+  // was stopped) counts cycles - 1.
   std::atomic<std::uint64_t> dropped{0};
 
   // Last transport sequence this source observed, which is what makes a
@@ -106,6 +111,11 @@ class EventLoopBase {
     return counters_ ? manifest_.size() : 0;
   }
 
+  // Whether source `id` is a latest-only watcher (register_watcher), whose
+  // dropped counter includes the messages it skipped by design. Fixed once
+  // registration closes, so a reporting thread may read it during the run.
+  bool latest_only(std::uint16_t id) const { return sources_[id].latest_only; }
+
   // The only clock a handler may read. Frozen for the duration of a dispatch
   // so that two reads inside one callback cannot disagree, which is what makes
   // the recorded value sufficient to reproduce the run.
@@ -129,7 +139,22 @@ class EventLoopBase {
   bool in_dispatch() const { return active_loop_ == this; }
   bool running() const { return running_; }
 
-  std::uint64_t dispatch_count() const { return dispatch_index_; }
+  // Safe from another thread. The registry row gets it through
+  // set_dispatch_observer instead, from the loop thread.
+  std::uint64_t dispatch_count() const {
+    return dispatch_index_.load(std::memory_order_relaxed);
+  }
+
+  // Reports the dispatch count to `observer` (null detaches) at every
+  // dispatch, from the loop thread itself. The introspection Reporter passes
+  // one that stores it in the node's registry row, so the launcher's stall
+  // check sees the loop's own progress, whatever the scheduling of the
+  // reporting thread. The observer is first called at the next dispatch. It
+  // must stay valid until it is detached while the loop is not dispatching
+  // (before or after run()).
+  void set_dispatch_observer(DispatchObserver* observer) {
+    dispatch_observer_.store(observer, std::memory_order_release);
+  }
 
   // --- registration -------------------------------------------------------
   // All of these must happen before run(). Ids are handed out in call order
@@ -142,13 +167,40 @@ class EventLoopBase {
   // `schema` is the topic's identity (talOS/schema/identity.h): the
   // realtime loop's segment refuses one of another type, and the log
   // records it so a payload can be decoded.
+  //
+  // `latest_only` (implied by an empty callback) delivers only the newest
+  // available message at each drain, counting skipped ones as dropped. A
+  // sequence watcher receives every retained message in order, at most
+  // `max_messages_per_tick` per drain. Either way Context::publish_time is
+  // the writer's publication time, so `now - publish_time` is message age.
   std::uint16_t register_watcher(std::string_view topic,
                                  std::uint32_t message_bytes,
                                  std::uint32_t alignment,
-                                 const schema::Identity& schema,
-                                 Thunk callback) {
+                                 const schema::Identity& schema, Thunk callback,
+                                 bool latest_only = false) {
     return add_source(SourceKind::WATCHER, topic, message_bytes, alignment,
-                      schema, callback);
+                      schema, callback, latest_only);
+  }
+
+  // Marks watcher `id` prompt: under Delivery::ON_PUBLISH a publication on
+  // it wakes the loop to drain, because its handler must run as the message
+  // arrives. Other watchers are drained only when something else drains. Not
+  // part of the manifest: it changes when messages are drained, which the log
+  // already records, not what the program is. Before run(); throws
+  // std::logic_error after, std::invalid_argument for an id that is not a
+  // watcher.
+  void set_prompt(std::uint16_t id) {
+    if (registration_closed_) {
+      throw std::logic_error("a watcher is marked prompt only before the run");
+    }
+    if (id >= sources_.size() ||
+        sources_[id].registration.kind != SourceKind::WATCHER) {
+      throw std::invalid_argument("only a watcher can be prompt");
+    }
+    sources_[id].prompt = true;
+  }
+  bool prompt(std::uint16_t id) const {
+    return id < sources_.size() && sources_[id].prompt;
   }
 
   std::uint16_t register_sender(std::string_view topic,
@@ -193,6 +245,28 @@ class EventLoopBase {
     derived().on_exit_requested();
   }
 
+  // Records that the current dispatch used the value of watcher `source_id`
+  // that was published at `publish_time` with RTMS `sequence`, as of `now`.
+  // A measurement: it changes nothing the program sees, and exact replay
+  // checks that the replayed program reads the same value. Outside a dispatch,
+  // or for a source that is not a watcher, it does nothing.
+  void record_read(std::uint16_t source_id, MonotonicTime now,
+                   MonotonicTime publish_time, std::uint64_t sequence) {
+    if (!in_dispatch() || source_id >= manifest_.size() ||
+        manifest_[source_id].kind != SourceKind::WATCHER) {
+      return;
+    }
+    derived().on_read(source_id, now, publish_time, sequence);
+    Context read = context_;
+    read.kind = EventKind::READ;
+    read.source_id = source_id;
+    read.now = now;
+    read.publish_time = publish_time;
+    read.sequence = sequence;
+    read.dropped = 0;
+    recorder_.dispatch(read, {});
+  }
+
  protected:
   ~EventLoopBase() = default;
 
@@ -203,12 +277,18 @@ class EventLoopBase {
     Registration registration;
     Thunk callback;
     std::vector<std::byte> buffer;  // staging for watcher payloads
+    bool latest_only{false};
+    bool prompt{false};  // set_prompt
   };
 
   std::vector<Source>& sources() { return sources_; }
   const std::vector<Source>& sources() const { return sources_; }
 
   Source& source(std::uint16_t id) { return sources_[id]; }
+
+  // Called by record_read() before the record is written. The replay loop
+  // hides this to check the read against the log; other loops need nothing.
+  void on_read(std::uint16_t, MonotonicTime, MonotonicTime, std::uint64_t) {}
 
   void record_operation(EventKind kind, std::uint16_t id,
                         MonotonicTime deadline = {}, Duration period = {}) {
@@ -292,7 +372,8 @@ class EventLoopBase {
     EventLoopBase& loop_;
   };
 
-  // Freezes registration and opens the log. Every loop calls this once, first
+  // Freezes registration and starts the recorder (a background LogWriter
+  // opens its file on its own thread). Every loop calls this once, first
   // thing in run(), after set_start_time().
   void begin_run() {
     if (registration_closed_) {
@@ -306,8 +387,8 @@ class EventLoopBase {
     // movable, which rules out growing a vector of these as sources register.
     counters_ = std::make_unique<SourceCounters[]>(manifest_.size());
 
+    dispatch_index_.store(0, std::memory_order_relaxed);
     running_ = true;
-    dispatch_index_ = 0;
     context_ = Context{};
     recorder_.start(manifest_, start);
   }
@@ -317,7 +398,7 @@ class EventLoopBase {
 
     Context exit_context{};
     exit_context.kind = EventKind::EXIT;
-    exit_context.dispatch_index = ++dispatch_index_;
+    exit_context.dispatch_index = next_dispatch_index();
     exit_context.event_time = now;
     exit_context.now = now;
 
@@ -331,28 +412,41 @@ class EventLoopBase {
     Context context{};
     context.kind = EventKind::TIMER;
     context.source_id = id;
-    context.dispatch_index = ++dispatch_index_;
+    context.dispatch_index = next_dispatch_index();
     context.event_time = deadline;
     context.now = now;
     context.sequence = cycles;
 
+    // Counters only: the log already holds `cycles` as the firing's
+    // sequence, from which replay counts the same missed periods.
+    if (cycles > 1) count_dropped(id, cycles - 1);
     invoke(context, std::span<const std::byte>{});
   }
 
   void dispatch_message(std::uint16_t id, MonotonicTime event_time,
                         MonotonicTime now, std::uint64_t sequence,
                         std::uint64_t dropped,
-                        std::span<const std::byte> payload) {
+                        std::span<const std::byte> payload,
+                        MonotonicTime publish_time) {
     Context context{};
     context.kind = EventKind::MESSAGE;
     context.source_id = id;
-    context.dispatch_index = ++dispatch_index_;
+    context.dispatch_index = next_dispatch_index();
     context.event_time = event_time;
     context.now = now;
+    context.publish_time = publish_time;
     context.sequence = sequence;
     context.dropped = dropped;
 
     invoke(context, payload);
+  }
+
+  // Counts a loss against a source outside its dispatch's own `dropped`:
+  // the realtime loop's failed reads, and a periodic timer's missed periods.
+  void count_dropped(std::uint16_t id, std::uint64_t count) {
+    if (SourceCounters* counters = counter(id)) {
+      counters->dropped.fetch_add(count, std::memory_order_relaxed);
+    }
   }
 
  private:
@@ -396,7 +490,8 @@ class EventLoopBase {
 
   std::uint16_t add_source(SourceKind kind, std::string_view name,
                            std::uint32_t message_bytes, std::uint32_t alignment,
-                           const schema::Identity& schema, Thunk callback) {
+                           const schema::Identity& schema, Thunk callback,
+                           bool latest_only = false) {
     if (registration_closed_) {
       throw RegistrationError(
           "event sources must be registered before run(): '" +
@@ -432,6 +527,8 @@ class EventLoopBase {
     Source source{};
     source.registration = registration;
     source.callback = callback;
+    source.latest_only =
+        kind == SourceKind::WATCHER && (latest_only || !callback.valid());
     source.buffer.resize(message_bytes);
 
     sources_.push_back(std::move(source));
@@ -463,7 +560,20 @@ class EventLoopBase {
   Recorder recorder_{};
 
   Context context_{};
-  std::uint64_t dispatch_index_{0};
+  // Written only by the loop thread; any thread may read it. A plain
+  // load/store pair, not fetch_add: one writer needs no locked RMW per event.
+  std::atomic<std::uint64_t> dispatch_index_{0};
+  // set_dispatch_observer's; called only from this loop's thread.
+  std::atomic<DispatchObserver*> dispatch_observer_{nullptr};
+  std::uint64_t next_dispatch_index() {
+    const std::uint64_t next =
+        dispatch_index_.load(std::memory_order_relaxed) + 1;
+    dispatch_index_.store(next, std::memory_order_relaxed);
+    if (auto* observer = dispatch_observer_.load(std::memory_order_acquire)) {
+      observer->on_dispatch_count(next);
+    }
+    return next;
+  }
   MonotonicTime start_time_{};
   inline static thread_local EventLoopBase* active_loop_{nullptr};
   std::atomic<bool> running_{false};

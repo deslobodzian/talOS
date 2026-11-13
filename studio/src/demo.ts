@@ -1,8 +1,4 @@
-import {Builder} from 'flatbuffers';
-
-import {ChannelInfo} from './generated/talos/telemetry/channel-info';
-import {Frame} from './generated/talos/telemetry/frame';
-import {Pose} from './generated/talos/telemetry/pose';
+import {AlertLevel, ChannelKind, type ChannelSpec, concatPages, encodeDictionaryPages, encodeValuePages, type PageHeader, rawFromDouble} from './encode';
 import {
   type DeclaredGraph,
   type DeclaredNode,
@@ -19,7 +15,7 @@ import {
 export const DEMO_STREAM_ID = 42n;
 export const DEMO_DICTIONARY_ID = 1;
 
-const DEMO_CHANNELS: {name: string; unit: string; labels?: string[]}[] = [
+const DEMO_CHANNELS: ChannelSpec[] = [
   {name: 'velocity', unit: 'm/s'},
   {name: 'heading', unit: 'rad'},
   {name: 'voltage', unit: 'V'},
@@ -27,56 +23,90 @@ const DEMO_CHANNELS: {name: string; unit: string; labels?: string[]}[] = [
   {name: 'error', unit: 'm/s'},
   {name: 'vx', unit: 'm/s'},
   {name: 'vy', unit: 'm/s'},
-  {name: 'mode', unit: '', labels: ['disabled', 'teleop', 'auto']},
+  {name: 'mode', unit: '', labels: ['disabled', 'teleop', 'auto'],
+   kind: ChannelKind.UInt},
   {name: 'sim/state/pose/x_m', unit: 'm'},
   {name: 'sim/state/pose/y_m', unit: 'm'},
   {name: 'sim/state/pose/yaw_rad', unit: 'rad'},
+  // A Driver Station cycling through numbered qualification matches
+  // (demoMatch), and one alert of each level, so the alert views show an
+  // active list, a latch and its reset at the next match without a robot.
+  {name: 'hw/state/driver_station/enabled', unit: '', kind: ChannelKind.Bool},
+  {name: 'hw/state/driver_station/autonomous', unit: '', kind: ChannelKind.Bool},
+  {name: 'hw/state/driver_station/teleop', unit: '', kind: ChannelKind.Bool},
+  {name: 'hw/state/driver_station/match_number', unit: '', kind: ChannelKind.UInt},
+  {name: 'hw/state/driver_station/match_type', unit: '', kind: ChannelKind.UInt,
+   labels: ['none', 'practice', 'qualification', 'elimination']},
+  {name: 'hw/state/driver_station/station', unit: '', kind: ChannelKind.UInt},
+  {name: 'hw/status/alert_error_link_lost', unit: '', kind: ChannelKind.Bool,
+   alert: AlertLevel.Error},
+  {name: 'drivetrain/status/alert_warning_module_offset', unit: '',
+   kind: ChannelKind.Bool, alert: AlertLevel.Warning},
+  {name: 'autonomous/status/alert_info_routine_not_selected', unit: '',
+   kind: ChannelKind.Bool, alert: AlertLevel.Info},
+  // The Routine card: the selected routine by name (the labels telemetry
+  // attaches from the autonomous node's `routines`) and its phase.
+  {name: 'autonomous/state/routine_index', unit: '', kind: ChannelKind.UInt,
+   labels: ['none', 'two_piece', 'four_piece_amp']},
+  {name: 'autonomous/state/phase', unit: '', kind: ChannelKind.UInt,
+   labels: ['idle', 'running', 'done']},
 ];
 
+// One demo match every 60 s at 50 Hz: 5 s disabled, 15 s autonomous, 1 s
+// disabled, 35 s teleop, 4 s disabled. The info alert holds before
+// autonomous, the warning is raised twice (autonomous and teleop) and the
+// error once for 200 ms in teleop. The routine alternates between the two
+// named ones and runs for the first 10 s of autonomous.
+const DEMO_MATCH_FRAMES = 3000n;
+function demoMatch(sequence: bigint): bigint[] {
+  const match = sequence / DEMO_MATCH_FRAMES;
+  const i = Number(sequence % DEMO_MATCH_FRAMES);
+  const auto = i >= 250 && i < 1000, teleop = i >= 1050 && i < 2800;
+  const flag = (on: boolean) => on ? 1n : 0n;
+  return [
+    flag(auto || teleop), flag(auto), flag(teleop),
+    1n + match % 99n, 2n, 1n,
+    flag(i >= 1500 && i < 1510),
+    flag((i >= 400 && i < 450) || (i >= 1800 && i < 1850)),
+    flag(i < 250),
+    1n + match % 2n,
+    i < 250 ? 0n : i < 750 ? 1n : 2n
+  ];
+}
+
+// One demo tick as the bridge would send it to a client that has just
+// joined: the dictionary pages (on the first tick of each hundred) followed
+// by a keyframe of every channel, back to back in one buffer.
 export function demoPacket(sequence: bigint): Uint8Array {
-  const b = new Builder(2048);
   const t = Number(sequence % 100000n) * .02;
   const x = 8 + 5 * Math.cos(t * .35), y = 4 + 2.5 * Math.sin(t * .35),
         yaw = t * .35 + Math.PI / 2;
-  // The dictionary rides the first frame of each hundred, as the bridge's
-  // cached dictionary frame does on connect; the rest are bare values.
-  let dictionary: ReturnType<typeof Frame.createDictionaryVector>|undefined;
-  if (sequence % 100n === 0n) {
-    const entries = DEMO_CHANNELS.map(channel => {
-      // Strings and vectors first: nothing may be built while a table is open.
-      const name = b.createString(channel.name);
-      const unit = channel.unit ? b.createString(channel.unit) : undefined;
-      const labels = channel.labels ?
-          ChannelInfo.createLabelsVector(
-              b, channel.labels.map(label => b.createString(label))) :
-          undefined;
-      ChannelInfo.startChannelInfo(b);
-      ChannelInfo.addName(b, name);
-      if (unit !== undefined) ChannelInfo.addUnit(b, unit);
-      if (labels !== undefined) ChannelInfo.addLabels(b, labels);
-      return ChannelInfo.endChannelInfo(b);
-    });
-    dictionary = Frame.createDictionaryVector(b, entries);
-  }
-  const values = Frame.createValuesVector(b, [
+  const header: PageHeader = {
+    streamId: DEMO_STREAM_ID,
+    sequenceId: sequence,
+    timestampNs: 1000000000n + sequence * 20000000n,
+    dictionaryId: DEMO_DICTIONARY_ID,
+    channelCount: DEMO_CHANNELS.length
+  };
+  const doubles = [
     1.75, yaw, 12.4 - .8 * Math.sin(t * .7), 2, .2 * Math.sin(t * 2),
-    -1.75 * Math.sin(t * .35), .875 * Math.cos(t * .35),
-    Number(sequence / 50n % 3n),
+    -1.75 * Math.sin(t * .35), .875 * Math.cos(t * .35)
+  ];
+  const samples: [number, bigint][] = [
+    ...doubles.map((value, i): [number, bigint] => [i, rawFromDouble(value)]),
+    [7, sequence / 50n % 3n],
     // The estimate has a small translation/heading bias relative to truth.
     // The shared decoder turns this into the derived/ pose-error series,
     // exactly as it does for live telemetry and imported recordings.
-    x - .12 - .03 * Math.sin(t * .2), y + .08, yaw - .025
-  ]);
-  Frame.startFrame(b);
-  Frame.addStreamId(b, DEMO_STREAM_ID);
-  Frame.addSequenceId(b, sequence);
-  Frame.addTimestampNs(b, 1000000000n + sequence * 20000000n);
-  Frame.addDictionaryId(b, DEMO_DICTIONARY_ID);
-  Frame.addValues(b, values);
-  if (dictionary !== undefined) Frame.addDictionary(b, dictionary);
-  Frame.addChassis(b, Pose.createPose(b, x, y, .15, 0, 0, yaw));
-  Frame.finishSizePrefixedFrameBuffer(b, Frame.endFrame(b));
-  return b.asUint8Array();
+    ...[x - .12 - .03 * Math.sin(t * .2), y + .08, yaw - .025].map(
+        (value, i): [number, bigint] => [8 + i, rawFromDouble(value)]),
+    ...demoMatch(sequence).map((raw, i): [number, bigint] => [11 + i, raw])
+  ];
+  const pages = sequence % 100n === 0n ?
+      encodeDictionaryPages(header, DEMO_CHANNELS) : [];
+  pages.push(...encodeValuePages(
+      header, {x, y, z: .15, roll: 0, pitch: 0, yaw}, true, samples));
+  return concatPages(pages);
 }
 
 // --- system graph ----------------------------------------------------------
@@ -193,8 +223,8 @@ const DEMO_NODES: DemoNode[] = [
     name: 'hardware_node',
     target: '//talOS/bridge:hardware_node',
     pid: 4131,
-    // Drives its own 1 kHz tick rather than an event loop, so unlike every
-    // other node it declares no timer source.
+    // Drives its own loop, woken by input and its duties, rather than an
+    // event loop, so unlike every other node it declares no timer source.
     periodUs: 1000,
     // Same order as the node's own manifest: state, command, driver station,
     // then one request topic per subsystem.
@@ -408,6 +438,13 @@ function demoNode(node: DemoNode, slot: number, elapsed: number,
     dispatch_count: String(dispatches),
     declared_sources: sources.length,
     alive: elapsed - live < LIVENESS_SECONDS,
+    // A healthy demo loses no wake and skips no request.
+    delivery: {
+      wake_failures: '0',
+      stalled_arms: '0',
+      wake_fallbacks: '0',
+      requests_skipped: '0'
+    },
     // Nothing here is driving real hardware, and saying so is better than
     // letting the demo pass for a robot.
     simulation: true,

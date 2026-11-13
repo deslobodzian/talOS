@@ -48,12 +48,12 @@
         {
           "kind": "SENDER",
           "name": "/hw/status",
-          "message_bytes": 112,
+          "message_bytes": 184,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0x4c34d7f97350fc87",
+          "schema_hash": "0xd214e0d047686efe",
           "alignment": 8,
           "slots": 1024
         },
@@ -166,12 +166,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 112,
+          "message_bytes": 184,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0x4c34d7f97350fc87",
+          "schema_hash": "0xd214e0d047686efe",
           "alignment": 8,
           "slots": 1024
         },
@@ -265,12 +265,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 112,
+          "message_bytes": 184,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0x4c34d7f97350fc87",
+          "schema_hash": "0xd214e0d047686efe",
           "alignment": 8,
           "slots": 1024
         },
@@ -403,12 +403,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 112,
+          "message_bytes": 184,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0x4c34d7f97350fc87",
+          "schema_hash": "0xd214e0d047686efe",
           "alignment": 8,
           "slots": 1024
         },
@@ -514,12 +514,12 @@
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 112,
+          "message_bytes": 184,
           "external": false,
           "optional": false,
           "observer": true,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0x4c34d7f97350fc87",
+          "schema_hash": "0xd214e0d047686efe",
           "alignment": 8,
           "slots": 1024
         },

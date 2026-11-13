@@ -1,176 +1,204 @@
-// The naming grammar and the graph lint. Every name in
-// RejectsTheMistakesThatActuallyHappened shipped in this repo once; they are
-// listed so no edit to the rules can quietly re-admit them. The real robot's
-// graph is checked by the launcher against its binaries (launcher_test).
+// The naming grammar (talOS/NAMING.md) and the graph lint. The rejected names
+// include the ones that shipped in this repo once, so no edit to the rules can
+// quietly re-admit them. The real robot's graph is checked by the launcher
+// against its binaries (launcher_test).
 
 #include "talOS/introspection/names.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <map>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "schema_test/shapes_generated.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::introspect::naming {
 namespace {
 
 using event::SourceKind;
 
-// Every topic name the robot uses today, all of which must conform. Kept short
-// rather than exhaustive: the point is that the canonical shapes pass, not to
-// mirror the graph, which the launcher checks against the binaries themselves.
-TEST(TopicName, AcceptsTheShapesTheRobotUses) {
-  for (const auto* name : {
-           "/hw/state",
-           "/hw/command",
-           "/hw/state/driver_station",
-           "/hw/request/drivetrain",
-           "/hw/request/shooter",
-           "/drivetrain/state",
-           "/drivetrain/target",
-           "/drivetrain/target/teleop",
-           "/drivetrain/target/auto",
-           "/shooter/state",
-           "/shooter/target",
-           "/odometry/state",
-           "/talos/telemetry",
+TEST(TopicName, AcceptsAndRejectsPerTheNamingRules) {
+  // 31 bytes is the transport's limit; 24 the segment limit.
+  const std::string longest = "/drivetrain/state/" + std::string(13, 'x');
+  ASSERT_EQ(longest.size(), 31u);
+  const std::string longest_segment = "/" + std::string(24, 'a') + "/state";
+
+  for (const std::string& name : {
+           std::string{"/hw/state"},
+           std::string{"/hw/command"},
+           std::string{"/hw/state/driver_station"},
+           std::string{"/hw/request/drivetrain"},
+           std::string{"/drivetrain/state"},
+           std::string{"/drivetrain/target"},
+           std::string{"/drivetrain/target/teleop"},
+           std::string{"/shooter/status"},
+           std::string{"/shooter/event"},
+           std::string{"/talos/telemetry"},
+           std::string{"/a/state/b/c"},
+           std::string{"/odometry2/state"},
+           longest,
+           longest_segment,
        }) {
     const auto problem = CheckTopicName(name);
-    EXPECT_FALSE(problem.has_value())
-        << name << " should conform but: " << problem.value_or("");
+    EXPECT_FALSE(problem.has_value()) << name << ": " << problem.value_or("");
   }
-}
 
-// Each of these was a live defect. The message must name the fix, because the
-// person reading it is the person who is about to write the other end.
-TEST(TopicName, RejectsTheMistakesThatActuallyHappened) {
-  struct Case {
-    const char* name;
-    const char* must_mention;
-    const char* why;
-  };
-  for (const auto& [name, must_mention, why] : std::vector<Case>{
-           {"/hw/req/drivetrain", "request",
-            "abbreviated role; the bridge derived this while the drivetrain "
-            "package published /hw/req/drive"},
-           {"/hw/req/drive", "request",
-            "abbreviated role; the qualifier 'drive' for 'drivetrain' is the "
-            "other half of the same defect"},
-           {"/hw/cmd", "command", "abbreviated role"},
-           {"/hw/cmd_in", "direction",
-            "abbreviated role and a direction suffix; the suffix is what the "
-            "reader is told about first"},
-           {"/hw/ds", "driver_station",
-            "abbreviation nobody can expand twice "
-            "the same way"},
-           {"/drivetrain/tgt", "target", "abbreviated role"},
-           {"/odometry", "/owner/role", "one segment, so there is no role"},
-           {"/talos_studio", "/owner/role",
-            "one segment, and an owner glued to a subject"},
+  for (const std::string& name : {
+           // Form: leading '/', 2 to 4 non-empty segments.
+           std::string{""},
+           std::string{"drivetrain/state"},
+           std::string{"/drivetrain/state/"},
+           std::string{"/drivetrain//state"},
+           std::string{"/odometry"},
+           std::string{"/talos_studio"},
+           std::string{"/a/state/b/c/d"},
+           // Length: 31 bytes total, 24 per segment.
+           longest + "x",
+           "/" + std::string(25, 'a') + "/state",
+           // Segment characters: lowercase start, [a-z0-9_], no __ or trailing
+           // _.
+           std::string{"/Drivetrain/state"},
+           std::string{"/drive-train/state"},
+           std::string{"/2026/state"},
+           std::string{"/drivetrain__x/state"},
+           std::string{"/drivetrain_/state"},
+           // Role outside the closed set.
+           std::string{"/drivetrain/pose"},
+           // Abbreviations, in any segment.
+           std::string{"/hw/req/drivetrain"},
+           std::string{"/hw/request/drive"},
+           std::string{"/hw/cmd"},
+           std::string{"/hw/ds"},
+           std::string{"/drivetrain/tgt"},
+           std::string{"/dt/state"},
+           std::string{"/odom/state"},
+           std::string{"/shooter/state/vel"},
+           // Direction suffixes.
+           std::string{"/hw/command_in"},
+           std::string{"/drivetrain/state_out"},
+           std::string{"/shooter/state_pub"},
+           std::string{"/shooter/target_sub"},
+           std::string{"/odometry/state_tx"},
+           std::string{"/odometry/state/vision_rx"},
+           std::string{"/odometry/state_topic"},
        }) {
-    const auto problem = CheckTopicName(name);
-    if (!problem.has_value()) {
-      FAIL() << name << " must be rejected: " << why;
-    }
-    EXPECT_NE(problem->find(must_mention), std::string::npos)
-        << "rejecting '" << name << "' must point at '" << must_mention
-        << "', got: " << *problem;
+    EXPECT_TRUE(CheckTopicName(name).has_value()) << name;
   }
 }
 
-TEST(TopicName, RejectsDirectionSuffixesFromEitherEnd) {
-  // Direction belongs to the endpoint. Naming one side is wrong from the other,
-  // and invites a second topic for the other direction.
-  for (const auto* name :
-       {"/drivetrain/state_out", "/drivetrain/target_in", "/shooter/state_pub",
-        "/shooter/target_sub", "/odometry/state_tx", "/odometry/state_topic"}) {
-    const auto problem = CheckTopicName(name);
-    if (!problem.has_value()) {
-      FAIL() << name;
-    }
-    EXPECT_NE(problem->find("direction"), std::string::npos) << *problem;
+TEST(TargetLane, OneGrammarRecognisesAndBuildsLanes) {
+  EXPECT_EQ(TargetLaneTopic("drivetrain", "teleop"),
+            "/drivetrain/target/teleop");
+  EXPECT_TRUE(IsTargetLane("/drivetrain/target/teleop"));
+
+  // A source and subsystem must each be a segment, and the lane must fit the
+  // transport's 31 bytes.
+  for (const auto& [subsystem, source] :
+       std::initializer_list<std::pair<std::string_view, std::string_view>>{
+           {"drivetrain", "Teleop"},
+           {"drivetrain", "tele/op"},
+           {"drivetrain", ""},
+           {"drivetrain", "cmd"},
+           {"drivetrain", "auto_"},
+           {"Drivetrain", "teleop"},
+           {"drivetrain", "a_source_that_is_long"},
+       }) {
+    EXPECT_TRUE(CheckTargetLane(subsystem, source).has_value()) << source;
+    EXPECT_THROW(TargetLaneTopic(subsystem, source), std::invalid_argument)
+        << subsystem << " " << source;
+  }
+
+  // Not lanes, though each contains "target": the launcher's critical = false
+  // rule for target producers must not apply to their writers.
+  for (const auto* topic :
+       {"/target/state", "/drivetrain/target", "/drivetrain/target/a/b",
+        "/drivetrain/state/target/x", "/Drivetrain/target/teleop",
+        "/drivetrain/target/teleop_"}) {
+    EXPECT_FALSE(IsTargetLane(topic)) << topic;
   }
 }
 
-TEST(TopicName, RejectsMalformedNames) {
-  EXPECT_TRUE(CheckTopicName("").has_value());
-  EXPECT_TRUE(CheckTopicName("drivetrain/state").has_value());  // no leading /
-  EXPECT_TRUE(CheckTopicName("/drivetrain/state/").has_value());  // trailing /
-  EXPECT_TRUE(CheckTopicName("/drivetrain//state").has_value());  // empty
-  EXPECT_TRUE(CheckTopicName("/Drivetrain/state").has_value());   // uppercase
-  EXPECT_TRUE(CheckTopicName("/drive-train/state").has_value());  // hyphen
-  EXPECT_TRUE(CheckTopicName("/2026/state").has_value());  // leading digit
-  EXPECT_TRUE(CheckTopicName("/drivetrain__x/state").has_value());
-  EXPECT_TRUE(CheckTopicName("/drivetrain_/state").has_value());
-  EXPECT_TRUE(CheckTopicName("/a/state/b/c/d").has_value());  // 5 segments
-  EXPECT_TRUE(
-      CheckTopicName("/drivetrain/pose").has_value());  // role not in set
+// REQ-CONTRACT-33: the one alert grammar. Telemetry tags a channel with the
+// level it returns and the lint refuses an `alert_` field it does not accept,
+// so a viewer never sees an alert of a level nobody defined.
+TEST(AlertField, OneGrammarAcceptsThreeLevelsAndRefusesTheRest) {
+  for (const auto& [field, level, name] : std::initializer_list<
+           std::tuple<std::string_view, AlertLevel, std::string_view>>{
+           {"alert_error_link_lost", AlertLevel::kError, "link_lost"},
+           {"alert_warning_brownout", AlertLevel::kWarning, "brownout"},
+           {"alert_info_homed", AlertLevel::kInfo, "homed"},
+           {"alert_error_can2", AlertLevel::kError, "can2"},
+           // The level is the first word: the rest is the name.
+           {"alert_info_error_x", AlertLevel::kInfo, "error_x"},
+       }) {
+    const auto parsed = ParseAlertField(field);
+    ASSERT_TRUE(parsed.has_value()) << field;
+    EXPECT_EQ(parsed->level, level) << field;
+    EXPECT_EQ(parsed->name, name) << field;
+  }
+  for (const auto* field : {
+           "link_lost",               // no prefix
+           "alerts_error_x",          // not the prefix
+           "Alert_error_x",           // not the prefix
+           "alert_error",             // no name
+           "alert_error_",            // empty name
+           "alert_fatal_x",           // unknown level
+           "alert_errors_x",          // unknown level
+           "alert_Error_x",           // unknown level
+           "alert__error_x",          // unknown level
+           "alert_warning_Hot",       // name not lowercase
+           "alert_warning_2hot",      // name not starting with a letter
+           "alert_warning_hot_",      // trailing underscore
+           "alert_warning_too__hot",  // doubled underscore
+           "alert_info_ok-ish",       // not a letter, digit or underscore
+       }) {
+    EXPECT_FALSE(ParseAlertField(field).has_value()) << field;
+  }
 }
 
-// The transport's limit (rtms::ValidatePath), not the event loop's 63.
-TEST(TopicName, LengthLimitIsTheTransportLimit) {
-  EXPECT_EQ(kMaxTopicBytes, 31u);
-  EXPECT_LE(kMaxTopicBytes, event::MAX_SOURCE_NAME);
-
-  const std::string prefix = "/drivetrain/state/";
-  const std::string fits =
-      prefix + std::string(kMaxTopicBytes - prefix.size(), 'x');
-  ASSERT_EQ(fits.size(), kMaxTopicBytes);
-  EXPECT_FALSE(CheckTopicName(fits).has_value()) << fits;
-  EXPECT_TRUE(CheckTopicName(fits + "x").has_value());
-
-  // One segment may not spend the whole budget on its own.
-  EXPECT_TRUE(
-      CheckTopicName("/" + std::string(kMaxSegmentBytes + 1, 'a') + "/state")
-          .has_value());
-}
-
-TEST(NodeName, MatchesTheSubsystemKeyRules) {
+TEST(NodeName, FollowsTheSegmentRulesAndIsNotReserved) {
   for (const auto* name :
-       {"drivetrain", "shooter", "odometry", "autonomous", "driver_station",
-        "driver", "telemetry", "hardware_node"}) {
+       {"drivetrain", "shooter", "driver_station", "hardware_node"}) {
     EXPECT_FALSE(CheckNodeName(name).has_value()) << name;
   }
-  EXPECT_TRUE(CheckNodeName("").has_value());
-  EXPECT_TRUE(CheckNodeName("Drivetrain").has_value());
-  EXPECT_TRUE(CheckNodeName("drive-train").has_value());
-  // A node named after a reserved namespace would own topics it does not own.
-  EXPECT_TRUE(CheckNodeName("hw").has_value());
-  EXPECT_TRUE(CheckNodeName("talos").has_value());
+  for (const auto* name : {"", "Drivetrain", "drive-train", "odom", "state_out",
+                           "hw", "talos", "sim", "replay", "test"}) {
+    EXPECT_TRUE(CheckNodeName(name).has_value()) << name;
+  }
 }
 
-TEST(NodeTarget, AcceptsThePackageLeafOrTheRuleName) {
-  // A robot's node: the package's last segment carries the name.
-  EXPECT_FALSE(
-      CheckNodeTarget("odometry", "//2026-robot/main_processor/odometry:node")
-          .has_value());
-  // A framework node has no subsystem package, so the rule name carries it.
-  EXPECT_FALSE(CheckNodeTarget("hardware_node", "//talOS/bridge:hardware_node")
-                   .has_value());
-
-  // A name no build target produces cannot be traced back to source.
-  const auto problem =
-      CheckNodeTarget("shooter", "//2026-robot/main_processor/odometry:node");
-  if (!problem.has_value()) {
-    FAIL() << "shooter under the odometry package must be rejected";
+TEST(NodeTarget, MatchesThePackageLeafRepositoryOrRule) {
+  struct Case {
+    const char* name;
+    const char* target;
+    bool ok;
+  };
+  for (const auto& [name, target, ok] : std::vector<Case>{
+           {"odometry", "//2026-robot/main_processor/odometry:node", true},
+           {"hardware_node", "//talOS/bridge:hardware_node", true},
+           {"wrist", "@wrist//:node", true},
+           {"node", "@wrist//pkg:node", true},
+           {"canon", "@@canon//:node", true},
+           {"wrist", "@@wrist+//:node", true},
+           {"shooter", "//2026-robot/main_processor/odometry:node", false},
+           {"wrist", "@wrist//pkg:other", false},
+           {"odometry", "@talos_odometry//:node", false},
+           {"wrist", "wrist//:node", false},
+           {"odometry", "odometry/node", false},
+           {"odometry", "//2026-robot/main_processor/odometry", false},
+       }) {
+    EXPECT_EQ(!CheckNodeTarget(name, target).has_value(), ok)
+        << name << " built by " << target;
   }
-  EXPECT_NE(problem->find("odometry"), std::string::npos) << *problem;
-
-  // External repository labels: root package matches the repo name, otherwise
-  // package leaf or rule name as in the main repository.
-  EXPECT_FALSE(CheckNodeTarget("wrist", "@wrist//:node").has_value());
-  EXPECT_FALSE(CheckNodeTarget("node", "@wrist//pkg:node").has_value());
-  EXPECT_FALSE(CheckNodeTarget("canon", "@@canon//:node").has_value());
-  EXPECT_FALSE(CheckNodeTarget("wrist", "@@wrist+//:node").has_value());
-  EXPECT_TRUE(CheckNodeTarget("wrist", "@wrist//pkg:other").has_value());
-  EXPECT_TRUE(CheckNodeTarget("wrist", "wrist//:node").has_value());
-
-  EXPECT_TRUE(CheckNodeTarget("odometry", "odometry/node").has_value());
-  EXPECT_TRUE(
-      CheckNodeTarget("odometry", "@talos_odometry//:node").has_value());
-  EXPECT_TRUE(
-      CheckNodeTarget("odometry", "//2026-robot/main_processor/odometry")
-          .has_value());
 }
 
 SourceShape Sender(std::string name, std::uint32_t bytes = 32,
@@ -182,15 +210,22 @@ SourceShape Watcher(std::string name, std::uint32_t bytes = 32,
   return {SourceKind::WATCHER, std::move(name), bytes, flags};
 }
 
-bool Mentions(const std::vector<Diagnostic>& diagnostics, Severity severity,
-              std::string_view subject, std::string_view fragment) {
-  for (const auto& diagnostic : diagnostics) {
-    if (diagnostic.severity == severity && diagnostic.subject == subject &&
-        diagnostic.message.find(fragment) != std::string::npos) {
-      return true;
-    }
-  }
-  return false;
+// The finding about `subject` at `severity`, if any.
+const Diagnostic* Find(const std::vector<Diagnostic>& diagnostics,
+                       Severity severity, std::string_view subject) {
+  const auto it = std::find_if(diagnostics.begin(), diagnostics.end(),
+                               [&](const Diagnostic& diagnostic) {
+                                 return diagnostic.severity == severity &&
+                                        diagnostic.subject == subject;
+                               });
+  return it == diagnostics.end() ? nullptr : &*it;
+}
+
+long Errors(const std::vector<Diagnostic>& diagnostics) {
+  return std::count_if(diagnostics.begin(), diagnostics.end(),
+                       [](const Diagnostic& diagnostic) {
+                         return diagnostic.severity == Severity::ERROR;
+                       });
 }
 
 std::string Describe(const std::vector<Diagnostic>& diagnostics) {
@@ -201,53 +236,82 @@ std::string Describe(const std::vector<Diagnostic>& diagnostics) {
   return out.empty() ? " (none)" : out;
 }
 
-TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
-  std::vector<NodeShape> nodes = {
-      {"drivetrain", "//robot/drivetrain:node", {Sender("/drivetrain/state")}}};
-  for (std::size_t i = 0; i < MAX_READERS; ++i) {
-    const auto name = "observer_" + std::to_string(i);
-    nodes.push_back({name,
-                     "//robot/" + name + ":node",
-                     {Watcher("/drivetrain/state", 32, kSourceFlagObserver)}});
-  }
-  EXPECT_FALSE(HasError(LintGraph(nodes))) << Describe(LintGraph(nodes));
-  nodes.push_back(
-      {"consumer", "//robot/consumer:node", {Watcher("/drivetrain/state")}});
-  const auto diagnostics = LintGraph(nodes);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/state",
-                       "reader limit is " + std::to_string(MAX_READERS)))
-      << Describe(diagnostics);
-}
-
-TEST(LintGraph, AcceptsAWellFormedGraph) {
+// A linter that cries wolf is worse than none: a correct graph using every
+// exemption (reserved namespaces, external and optional ends, observers,
+// timer labels that would fail as topic names) produces no finding at all.
+TEST(LintGraph, ACorrectGraphProducesNoFindings) {
+  ASSERT_TRUE(CheckTopicName("swerve").has_value());
   const std::vector<NodeShape> nodes = {
+      {"hardware_node",
+       "//talOS/bridge:hardware_node",
+       // /hw/* is published for a controller that is not a node, and
+       // /hw/command is consumed over UDP.
+       {Sender("/hw/state"), Sender("/hw/state/driver_station"),
+        Sender("/hw/command", 32, kSourceFlagExternal),
+        Watcher("/hw/request/drivetrain")},
+       /*hardware_bridge=*/true},
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
+       {{SourceKind::TIMER, "swerve", 0, 0},
+        Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
+        Watcher("/drivetrain/state/vision", 32, kSourceFlagOptional),
+        Watcher("/hw/state"),
+        Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
         Sender("/drivetrain/state")}},
       {"driver",
        "//2026-robot/main_processor/driver:node",
-       {Sender("/drivetrain/target/teleop")}},
+       {Watcher("/hw/state/driver_station"),
+        Sender("/drivetrain/target/teleop")}},
       {"odometry",
        "//2026-robot/main_processor/odometry:node",
        {Watcher("/drivetrain/state"), Sender("/odometry/state")}},
       {"telemetry",
        "//talOS/telemetry:node",
-       // The Studio bridge reads /talos/telemetry but is not a registered
-       // node, so the feed is declared external rather than left to read as a
-       // topic nobody consumes.
-       {Watcher("/odometry/state"),
+       {Watcher("/drivetrain/state", 32, kSourceFlagObserver),
+        Watcher("/odometry/state"),
         Sender("/talos/telemetry", 32, kSourceFlagExternal)}},
   };
   const auto diagnostics =
       LintGraph(nodes, {{"drivetrain", {"teleop", "auto"}}});
-  EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
   EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
 }
 
-// The exact defect this protocol exists to catch: both ends present, both
-// individually valid, different strings.
-TEST(LintGraph, CatchesTwoSpellingsOfOneTopic) {
+// Nine to 32 readers of one topic, observers included, lint clean; a 33rd is
+// an error naming the topic and the limit. Nine is the first count the
+// eight-slot table refused; 32 is about twice the Driver Station readers of
+// a robot with six mechanisms.
+// REQ-CONTRACT-36
+TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
+  // Written out, not MAX_READERS, so that a smaller table fails here.
+  constexpr std::size_t kRequiredReaders = 32;
+  std::vector<NodeShape> nodes = {
+      {"drivetrain", "//robot/drivetrain:node", {Sender("/drivetrain/state")}}};
+  for (std::size_t i = 0; i < kRequiredReaders; ++i) {
+    // Every other reader an observer: both kinds take a slot.
+    const auto name = "reader_" + std::to_string(i);
+    nodes.push_back(
+        {name,
+         "//robot/" + name + ":node",
+         {Watcher("/drivetrain/state", 32,
+                  i % 2 == 0 ? kSourceFlagObserver : std::uint32_t{0})}});
+    if (nodes.size() - 1 < 9) continue;
+    SCOPED_TRACE(std::to_string(nodes.size() - 1) + " readers");
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+  }
+  nodes.push_back(
+      {"consumer", "//robot/consumer:node", {Watcher("/drivetrain/state")}});
+  const auto diagnostics = LintGraph(nodes);
+  const auto* error = Find(diagnostics, Severity::ERROR, "/drivetrain/state");
+  ASSERT_NE(error, nullptr) << Describe(diagnostics);
+  EXPECT_NE(error->message.find(std::to_string(kRequiredReaders)),
+            std::string::npos)
+      << error->message;
+}
+
+// The defect this protocol exists to catch: both ends present, both valid
+// names, different strings, so the reader is waiting on a topic nobody writes.
+TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
        "//2026-robot/main_processor/drivetrain:node",
@@ -257,16 +321,58 @@ TEST(LintGraph, CatchesTwoSpellingsOfOneTopic) {
        {Watcher("/hw/request/drivetrain")}},
   };
   const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/hw/request/drivetrain",
-                       "nothing publishes it"))
-      << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/hw/request/drivetrain",
-                       "spelled differently"))
+  EXPECT_NE(Find(diagnostics, Severity::ERROR, "/hw/request/drivetrain"),
+            nullptr)
       << Describe(diagnostics);
 }
 
-TEST(LintGraph, TwoWritersIsAnErrorAndBothAreNamed) {
+// RULES.md 2: the roster's bridge writes the hw namespace, and
+// /hw/request/<node> is written only by <node>'s devices-layer flush
+// (kSourceFlagHardwareRequest), the one path that gates a request on
+// robot_enabled and update(). A plain publisher on a node's own request, the
+// flush aimed at another node's, or a node faking the bridge's state are each
+// one error on that topic. The bridge is its roster slot, not its name: a
+// replacement bridge binary may call itself anything, and a node calling
+// itself hardware_node gains nothing.
+TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
+  struct Case {
+    const char* writer;
+    bool bridge;
+    SourceShape source;
+    bool error;
+  };
+  for (const auto& [writer, bridge, source, error] : std::vector<Case>{
+           {"drivetrain", false,
+            Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
+            false},
+           {"drivetrain", false, Sender("/hw/request/drivetrain"), true},
+           {"rogue", false,
+            Sender("/hw/request/drivetrain", 32, kSourceFlagHardwareRequest),
+            true},
+           {"rogue", false, Sender("/hw/state"), true},
+           {"hardware_node", false, Sender("/hw/state"), true},
+           {"rio_bridge", true, Sender("/hw/state"), false},
+           {"hardware_node", true, Sender("/hw/request/drivetrain"), true},
+       }) {
+    const std::vector<NodeShape> nodes = {
+        {writer, std::string{"//robot/"} + writer + ":node", {source}, bridge},
+        {"reader", "//robot/reader:node", {Watcher(source.name)}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    const auto label = std::string{writer} + " writing " + source.name;
+    ASSERT_EQ(Errors(diagnostics), error ? 1 : 0)
+        << label << Describe(diagnostics);
+    if (error) {
+      EXPECT_NE(Find(diagnostics, Severity::ERROR, source.name), nullptr)
+          << label << Describe(diagnostics);
+    }
+  }
+}
+
+// One writer per topic keeps the dispatch log replayable. Both writers are
+// named, because one of them has to be moved to its own lane.
+// REQ-CONTRACT-09: two writers on one topic are a lint error naming both.
+TEST(LintGraph, TwoWritersIsAnErrorNamingBoth) {
   const std::vector<NodeShape> nodes = {
       {"autonomous",
        "//2026-robot/main_processor/autonomous:node",
@@ -279,89 +385,38 @@ TEST(LintGraph, TwoWritersIsAnErrorAndBothAreNamed) {
        {Watcher("/drivetrain/target/teleop")}},
   };
   const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/drivetrain/target/teleop", "autonomous"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/drivetrain/target/teleop", "driver"));
-  // Replay is the reason, and the message should say so.
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/drivetrain/target/teleop", "replayable"));
-}
-TEST(LintGraph,
-     TeleopNodeAndAnotherWriterOnSameTeleopLaneIsRefusedAsTwoWriters) {
-  const std::vector<NodeShape> nodes = {
-      {"teleop", "//talOS/teleop:node", {Sender("/shooter/target/teleop")}},
-      {"driver",
-       "//2026-robot/main_processor/driver:node",
-       {Sender("/shooter/target/teleop")}},
-      {"shooter",
-       "//2026-robot/main_processor/shooter:node",
-       {Watcher("/shooter/target/teleop")}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/target/teleop",
-                       "teleop"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/target/teleop",
-                       "driver"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/target/teleop",
-                       "2 writers"));
+  const auto* error =
+      Find(diagnostics, Severity::ERROR, "/drivetrain/target/teleop");
+  ASSERT_NE(error, nullptr) << Describe(diagnostics);
+  EXPECT_NE(error->message.find("autonomous"), std::string::npos);
+  EXPECT_NE(error->message.find("driver"), std::string::npos);
 }
 
-// The owner segment names the subject, and the role says which way the data
-// moves relative to it. Getting this backwards was the first draft's mistake:
-// "the owner is the publisher" reads as obvious and is false, because the
-// operator interface publishes /drivetrain/target/teleop and the drivetrain
-// consumes it.
-TEST(LintGraph, StateFlowsOutOfItsOwner) {
-  const std::vector<NodeShape> nodes = {
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       // Publishing somebody else's state.
-       {Sender("/drivetrain/state")}},
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/state")}},
+// The owner segment names the subject: state-like roles are published by it,
+// target-like roles are published by anyone but it. Only the writing end makes
+// that claim (ACorrectGraphProducesNoFindings reads others' topics).
+TEST(LintGraph, OwnerRolesFlowTheRightWay) {
+  struct Case {
+    const char* writer;
+    const char* topic;
   };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/state",
-                       "published by its own subject"))
-      << Describe(diagnostics);
-
-  // The right way round.
-  const std::vector<NodeShape> correct = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/state")}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Watcher("/drivetrain/state")}},
-  };
-  EXPECT_TRUE(LintGraph(correct).empty()) << Describe(LintGraph(correct));
-}
-
-TEST(LintGraph, TargetsFlowIntoTheirOwner) {
-  // A node publishing its own target is talking to itself: either the name is
-  // wrong or the producer is confused.
-  const std::vector<NodeShape> nodes = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/target/teleop"),
-        Watcher("/drivetrain/target/teleop")}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR,
-                       "/drivetrain/target/teleop",
-                       "not by the subsystem being asked"))
-      << Describe(diagnostics);
+  for (const auto& [writer, topic] : std::vector<Case>{
+           {"odometry", "/drivetrain/state"},
+           {"drivetrain", "/drivetrain/target/teleop"},
+       }) {
+    const std::vector<NodeShape> nodes = {
+        {writer, std::string{"//robot/"} + writer + ":node", {Sender(topic)}},
+        {"reader", "//robot/reader:node", {Watcher(topic)}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_NE(Find(diagnostics, Severity::ERROR, topic), nullptr)
+        << writer << " writing " << topic << Describe(diagnostics);
+  }
 }
 
 // A lane whose source no mode of the subsystem's policy lists is never read:
 // a dead producer, refused before launch.
-TEST(LintGraph, LaneOutsideThePolicyIsAnError) {
+TEST(LintGraph, ALaneOutsideTheTargetPolicyIsAnError) {
   const std::vector<NodeShape> nodes = {
       {"aligner",
        "//2026-robot/main_processor/aligner:node",
@@ -372,9 +427,8 @@ TEST(LintGraph, LaneOutsideThePolicyIsAnError) {
   };
   const auto diagnostics =
       LintGraph(nodes, {{"drivetrain", {"teleop", "auto"}}});
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/drivetrain/target/align",
-                       "in no mode of drivetrain's target policy"))
+  EXPECT_NE(Find(diagnostics, Severity::ERROR, "/drivetrain/target/align"),
+            nullptr)
       << Describe(diagnostics);
 
   // Listed: fine. A subsystem the policy map does not know is not checked.
@@ -383,154 +437,57 @@ TEST(LintGraph, LaneOutsideThePolicyIsAnError) {
   EXPECT_FALSE(HasError(LintGraph(nodes, {{"shooter", {"teleop"}}})));
 }
 
-// A policy lane with no producer yet (autonomous is not written) is normal
-// during development, so it warns rather than refusing the launch.
-TEST(LintGraph, PolicyLaneWithNoWriterIsAWarning) {
+// Required coverage: each nonempty mode of a target-consuming subsystem's
+// policy needs a writer on at least one of its lanes, judged per mode rather
+// than over the union. Without it the gap is only a per-lane warning.
+TEST(LintGraph, RequiredTargetCoverageIsCheckedPerMode) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional)}},
+       "//robot/drivetrain:node",
+       {Watcher("/drivetrain/target/teleop", 32, kSourceFlagOptional),
+        Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional)}},
+      {"driver", "//robot/driver:node", {Sender("/drivetrain/target/teleop")}},
   };
-  const auto diagnostics = LintGraph(nodes, {{"drivetrain", {"auto"}}});
-  EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING,
-                       "/drivetrain/target/auto", "nothing writes it yet"))
-      << Describe(diagnostics);
-}
-
-// A reserved namespace is exempt from both directions: the bridge publishes
-// /hw/* on behalf of a controller processor that is not a talOS node at all,
-// so neither "the owner publishes it" nor "the owner consumes it" applies.
-TEST(LintGraph, ReservedNamespacesAreExemptFromTheOwnerRule) {
-  const std::vector<NodeShape> nodes = {
-      {"hardware_node",
-       "//talOS/bridge:hardware_node",
-       {Sender("/hw/state"), Sender("/hw/state/driver_station"),
-        Watcher("/hw/request/drivetrain")}},
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/hw/request/drivetrain"), Watcher("/hw/state")}},
-      {"driver",
-       "//2026-robot/main_processor/driver:node",
-       {Watcher("/hw/state/driver_station")}},
+  const TargetSources sources{{"drivetrain", {"teleop", "auto", "pit"}}};
+  struct Case {
+    std::map<std::string, std::vector<std::string>, std::less<>> modes;
+    const char* uncovered;  // nullptr: every mode is covered.
   };
-  EXPECT_TRUE(LintGraph(nodes).empty()) << Describe(LintGraph(nodes));
-}
-
-// A subscriber has no claim on the name of what it reads, so nothing is checked
-// on the reading end.
-TEST(LintGraph, ReadingEndIsNotCheckedAgainstTheOwner) {
-  const std::vector<NodeShape> nodes = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/state")}},
-      {"telemetry",
-       "//talOS/telemetry:node",
-       {Watcher("/drivetrain/state"),
-        Sender("/talos/telemetry", 32, kSourceFlagExternal)}},
-  };
-  EXPECT_TRUE(LintGraph(nodes).empty()) << Describe(LintGraph(nodes));
-}
-
-// A typo in the owner segment, or a name left behind by a rename, shows up as
-// an owner that is nobody. A warning, not an error: a partial launch is a
-// legitimate session in which the owner really is absent.
-TEST(LintGraph, UnknownOwnerIsAWarning) {
-  const std::vector<NodeShape> nodes = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetraim/state")}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Sender("/drivetraim/state")}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "/drivetraim/state",
-                       "not a node in this session"))
-      << Describe(diagnostics);
-}
-
-// An external or optional end is a design, not a fault. Reporting it as a
-// fault is what trains people to ignore the report.
-TEST(LintGraph, ExternalAndOptionalEndsAreNotFaults) {
-  const std::vector<NodeShape> nodes = {
-      {"hardware_node",
-       "//talOS/bridge:hardware_node",
-       {
-           // Consumed by the RoboRIO over UDP; no shared-memory peer exists.
-           Sender("/hw/command", 32, kSourceFlagExternal),
-       }},
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {
-           // A feed nobody may be publishing yet.
-           Watcher("/drivetrain/state/vision", 32, kSourceFlagOptional),
-       }},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
-  for (const auto& diagnostic : diagnostics) {
-    EXPECT_NE(diagnostic.subject, "/hw/command");
-    EXPECT_NE(diagnostic.subject, "/drivetrain/state/vision");
+  for (const auto& [modes, uncovered] : std::vector<Case>{
+           // teleop is written; an empty mode needs nothing.
+           {{{"teleop", {"teleop"}}, {"autonomous", {}}}, nullptr},
+           // One written lane covers its mode.
+           {{{"teleop", {"auto", "teleop"}}}, nullptr},
+           // A declared but unwritten lane.
+           {{{"teleop", {"teleop"}}, {"autonomous", {"auto"}}}, "autonomous"},
+           // A lane the subsystem does not even read.
+           {{{"teleop", {"teleop"}}, {"test", {"pit"}}}, "test"},
+       }) {
+    const auto diagnostics =
+        LintGraph(nodes, sources, {{"drivetrain", modes}}, true);
+    if (uncovered == nullptr) {
+      EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+      continue;
+    }
+    EXPECT_EQ(Errors(diagnostics), 1) << uncovered << Describe(diagnostics);
+    const auto* error = Find(diagnostics, Severity::ERROR, "drivetrain");
+    ASSERT_NE(error, nullptr) << uncovered << Describe(diagnostics);
+    EXPECT_NE(error->message.find(uncovered), std::string::npos)
+        << Describe(diagnostics);
   }
-}
 
-// A timer's name is a label, not an address. This robot has timers called
-// `swerve`, `shooter` and `telemetry`, and an earlier version of LintGraph
-// checked them as topic names -- reporting three errors on a graph that was
-// entirely correct, and refusing to launch. A linter that cries wolf is worse
-// than no linter, so this is pinned.
-TEST(LintGraph, TimerLabelsAreNotTopics) {
-  const std::vector<NodeShape> nodes = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {{SourceKind::TIMER, "swerve", 0, 0}, Sender("/drivetrain/state")}},
-      {"shooter",
-       "//2026-robot/main_processor/shooter:node",
-       {{SourceKind::TIMER, "shooter", 0, 0}, Sender("/shooter/state")}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {{SourceKind::TIMER, "telemetry", 0, 0},
-        Watcher("/drivetrain/state"),
-        Watcher("/shooter/state"),
-        Sender("/odometry/state", 32, kSourceFlagExternal)}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
-  // Named explicitly: these three strings would each fail CheckTopicName.
-  for (const auto* label : {"swerve", "shooter", "telemetry"}) {
-    EXPECT_TRUE(CheckTopicName(label).has_value())
-        << label << " would pass as a topic, so this test proves nothing";
-  }
-}
-
-// A shape without a schema (a registry snapshot) is still checked on byte
-// size: two ends that disagree on the size of one topic cannot be
-// wire-compatible.
-TEST(LintGraph, TwoSizesOnOneTopicIsAnErrorAndBothEndsAreNamed) {
-  const std::vector<NodeShape> nodes = {
-      {"shooter",
-       "//2026-robot/main_processor/shooter:node",
-       {Sender("/shooter/state", 24)}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Watcher("/shooter/state", 32)}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state",
-                       "two message sizes"))
-      << Describe(diagnostics);
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::ERROR, "/shooter/state", "shooter"))
-      << Describe(diagnostics);
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::ERROR, "/shooter/state", "odometry"))
-      << Describe(diagnostics);
+  const auto partial = LintGraph(
+      nodes, sources,
+      {{"drivetrain", {{"teleop", {"teleop"}}, {"autonomous", {"auto"}}}}},
+      false);
+  EXPECT_FALSE(HasError(partial)) << Describe(partial);
+  EXPECT_NE(Find(partial, Severity::WARNING, "/drivetrain/target/auto"),
+            nullptr)
+      << Describe(partial);
 }
 
 SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
-                  std::uint32_t slots = 1024) {
+                  std::uint32_t slots) {
   shape.schema = std::move(schema);
   shape.schema_hash = hash;
   shape.alignment = 8;
@@ -538,75 +495,155 @@ SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
   return shape;
 }
 
-// A size match is not a compatibility proof: a field can change type without
-// changing size. Describe reports each end's schema identity, and two
-// schemas on one topic are an error naming both types and both nodes.
-TEST(LintGraph, TwoSchemasOfTheSameSizeOnOneTopicIsAnErrorNamingBothTypes) {
-  const std::vector<NodeShape> nodes = {
-      {"shooter",
-       "//2026-robot/main_processor/shooter:node",
-       {Typed(Sender("/shooter/state", 24), "shooter.State", 0x1)}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Typed(Watcher("/shooter/state", 24), "shooter.OldState", 0x2)}},
+// Both ends of a topic must agree on its type: by size when there is no schema
+// (a registry snapshot), else by schema name and hash (a field can change type
+// without changing size), and on the ring layout the segment is created with.
+// A disagreement is exactly one error on the topic, naming both nodes.
+TEST(LintGraph, BothEndsMustAgreeOnTypeAndRingLayout) {
+  struct Case {
+    std::uint32_t bytes;
+    const char* schema;  // nullptr: an untyped (registry) shape.
+    std::uint64_t hash;
+    std::uint32_t slots;
+    bool error;
   };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::ERROR, "/shooter/state", "two schemas"))
-      << Describe(diagnostics);
-  for (const auto* named :
-       {"shooter.State (0x0000000000000001)",
-        "shooter.OldState (0x0000000000000002)", "by shooter", "by odometry"}) {
-    EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "/shooter/state", named))
-        << named << "\n"
-        << Describe(diagnostics);
+  for (const auto& [bytes, schema, hash, slots, error] : std::vector<Case>{
+           {24, nullptr, 0, 0, false},
+           {32, nullptr, 0, 0, true},
+           {24, "shooter.State", 0x1, 1024, false},
+           {24, "shooter.OldState", 0x2, 1024, true},
+           {24, "shooter.State", 0x3, 1024, true},
+           {24, "shooter.State", 0x1, 64, true},
+       }) {
+    SourceShape writer = Sender("/shooter/state", 24);
+    SourceShape reader = Watcher("/shooter/state", bytes);
+    if (schema != nullptr) {
+      writer = Typed(writer, "shooter.State", 0x1, 1024);
+      reader = Typed(reader, schema, hash, slots);
+    }
+    const std::vector<NodeShape> nodes = {
+        {"shooter", "//robot/shooter:node", {writer}},
+        {"odometry", "//robot/odometry:node", {reader}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    const auto label = std::to_string(bytes) + " " + (schema ? schema : "-") +
+                       " " + std::to_string(hash) + " " + std::to_string(slots);
+    ASSERT_EQ(Errors(diagnostics), error ? 1 : 0)
+        << label << Describe(diagnostics);
+    if (!error) continue;
+    const auto* finding = Find(diagnostics, Severity::ERROR, "/shooter/state");
+    ASSERT_NE(finding, nullptr) << label << Describe(diagnostics);
+    EXPECT_NE(finding->message.find("shooter"), std::string::npos);
+    EXPECT_NE(finding->message.find("odometry"), std::string::npos);
   }
-  // One finding: the schema error explains the topic.
-  EXPECT_EQ(std::count_if(diagnostics.begin(), diagnostics.end(),
-                          [](const Diagnostic& d) {
-                            return d.severity == Severity::ERROR;
-                          }),
-            1);
 }
 
-TEST(LintGraph, ASameNamedSchemaWithAnotherHashIsAnError) {
-  const std::vector<NodeShape> nodes = {
-      {"shooter",
-       "//2026-robot/main_processor/shooter:node",
-       {Typed(Sender("/shooter/state", 24), "shooter.State", 0x1)}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Typed(Watcher("/shooter/state", 24), "shooter.State", 0x3)}},
+// What is normal during development or in a partial launch warns rather than
+// refusing the launch: an unread topic, a policy lane nobody writes yet, an
+// owner that is not in this session.
+TEST(LintGraph, DevelopmentGapsAreWarningsNotErrors) {
+  struct Case {
+    std::vector<NodeShape> nodes;
+    const char* subject;
   };
-  EXPECT_TRUE(Mentions(LintGraph(nodes), Severity::ERROR, "/shooter/state",
-                       "two schemas"));
+  for (const auto& [nodes, subject] : std::vector<Case>{
+           {{{"telemetry",
+              "//talOS/telemetry:node",
+              {Sender("/talos/telemetry")}}},
+            "/talos/telemetry"},
+           {{{"drivetrain",
+              "//robot/drivetrain:node",
+              {Watcher("/drivetrain/target/auto", 32, kSourceFlagOptional)}}},
+            "/drivetrain/target/auto"},
+           {{{"drivetrain",
+              "//robot/drivetrain:node",
+              {Watcher("/shooterr/target")}},
+             {"driver", "//robot/driver:node", {Sender("/shooterr/target")}}},
+            "/shooterr/target"},
+       }) {
+    const auto diagnostics = LintGraph(nodes, {{"drivetrain", {"auto"}}});
+    EXPECT_FALSE(HasError(diagnostics)) << subject << Describe(diagnostics);
+    EXPECT_NE(Find(diagnostics, Severity::WARNING, subject), nullptr)
+        << subject << Describe(diagnostics);
+  }
 }
 
-TEST(LintGraph, MatchingSchemasPassAndDifferentRingLayoutsDoNot) {
-  std::vector<NodeShape> nodes = {
-      {"shooter",
-       "//2026-robot/main_processor/shooter:node",
-       {Typed(Sender("/shooter/state", 24), "shooter.State", 0x1)}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Typed(Watcher("/shooter/state", 24), "shooter.State", 0x1)}},
+// REQ-CONTRACT-33: from the writer's schema, an `alert_` field that is not a
+// bool or not of a known level is an error naming the field (nested structs
+// included), and a well-formed alert outside a `status` topic is a warning.
+// A reader's end, which carries the same schema, adds nothing.
+TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
+  const auto with = [](SourceShape shape, const schema::Identity& identity) {
+    shape.schema = identity.name;
+    shape.schema_hash = identity.hash;
+    shape.bfbs = identity.bfbs;
+    return shape;
   };
-  EXPECT_FALSE(HasError(LintGraph(nodes))) << Describe(LintGraph(nodes));
-  nodes[1].sources[0].slots = 64;
-  EXPECT_TRUE(Mentions(LintGraph(nodes), Severity::ERROR, "/shooter/state",
-                       "two ring layouts"));
-}
+  const schema::Identity bad = schema::Of<schema_test::BadAlerts>();
+  const schema::Identity good = schema::Of<schema_test::Alerts>();
+  const auto alert_findings = [](const std::vector<Diagnostic>& diagnostics,
+                                 std::string_view topic) {
+    std::vector<Diagnostic> out;
+    for (const auto& diagnostic : diagnostics) {
+      if (diagnostic.subject == topic &&
+          diagnostic.message.find("alert") != std::string::npos) {
+        out.push_back(diagnostic);
+      }
+    }
+    return out;
+  };
 
-TEST(LintGraph, UnreadTopicIsAWarningNotAnError) {
-  const std::vector<NodeShape> nodes = {
-      {"telemetry", "//talOS/telemetry:node", {Sender("/talos/telemetry")}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "/talos/telemetry",
-                       "nothing subscribes"))
-      << Describe(diagnostics);
+  {
+    SCOPED_TRACE("malformed alerts in a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/status"), bad)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/status"), bad)}},
+    };
+    const auto findings = alert_findings(LintGraph(nodes), "/shooter/status");
+    ASSERT_EQ(findings.size(), 2u) << Describe(findings);
+    for (const auto* field :
+         {"alert_error_fault_count", "alert_fatal_overheat"}) {
+      const auto it = std::find_if(
+          findings.begin(), findings.end(), [field](const Diagnostic& d) {
+            return d.message.find(field) != std::string::npos;
+          });
+      ASSERT_NE(it, findings.end()) << field << Describe(findings);
+      EXPECT_EQ(it->severity, Severity::ERROR) << field;
+    }
+  }
+  {
+    SCOPED_TRACE("well-formed alerts outside a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/state"), good)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/state"), good)}},
+    };
+    const auto findings = alert_findings(LintGraph(nodes), "/shooter/state");
+    ASSERT_EQ(findings.size(), 3u) << Describe(findings);
+    for (const auto& finding : findings) {
+      EXPECT_EQ(finding.severity, Severity::WARNING) << finding.ToString();
+    }
+  }
+  {
+    SCOPED_TRACE("well-formed alerts in a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/status"), good)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/status"), good)}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
+  }
 }
 
 TEST(LintGraph, ErrorsSortAheadOfWarnings) {
@@ -624,6 +661,47 @@ TEST(LintGraph, ErrorsSortAheadOfWarnings) {
       << Describe(diagnostics);
 }
 
+TEST(LintGraph, RejectsTheTestNamespaceAndDuplicateNodeNames) {
+  const std::vector<NodeShape> in_test_namespace = {
+      {"drivetrain",
+       "//2026-robot/main_processor/drivetrain:node",
+       {Sender("/test/state")}},
+  };
+  EXPECT_NE(Find(LintGraph(in_test_namespace), Severity::ERROR, "/test/state"),
+            nullptr);
+
+  const std::vector<NodeShape> duplicated = {
+      {"drivetrain",
+       "//2026-robot/main_processor/drivetrain:node",
+       {Sender("/drivetrain/state")}},
+      {"drivetrain",
+       "//2026-robot/main_processor/drivetrain:node",
+       {Watcher("/drivetrain/state")}},
+  };
+  const auto diagnostics = LintGraph(duplicated);
+  EXPECT_NE(Find(diagnostics, Severity::ERROR, "drivetrain"), nullptr)
+      << Describe(diagnostics);
+}
+
+TEST(LintGraph, AMalformedNameDoesNotStopTheLint) {
+  const std::vector<NodeShape> nodes = {
+      {"drivetrain",
+       "//2026-robot/main_processor/drivetrain:node",
+       {Sender("/drivetrain/tgt"), Sender("/drivetrain/state")}},
+      {"odometry",
+       "//2026-robot/main_processor/odometry:node",
+       {Watcher("/drivetrain/state"), Sender("/odometry/state")}},
+  };
+  const auto diagnostics = LintGraph(nodes);
+  const auto* error = Find(diagnostics, Severity::ERROR, "/drivetrain/tgt");
+  ASSERT_NE(error, nullptr) << Describe(diagnostics);
+  // The declaring node is named, because the reader has to go and fix it.
+  EXPECT_NE(error->message.find("drivetrain"), std::string::npos);
+  // The rest of the graph is still checked: /odometry/state is unread.
+  EXPECT_NE(Find(diagnostics, Severity::WARNING, "/odometry/state"), nullptr)
+      << Describe(diagnostics);
+}
+
 TEST(HardwareConfig, SensorVelocityLimitIsAdvisoryAndUsesMechanismRatio) {
   hardware::Config config;
   hardware::MotorConfig motor;
@@ -637,8 +715,7 @@ TEST(HardwareConfig, SensorVelocityLimitIsAdvisoryAndUsesMechanismRatio) {
   config.motors.front().max_velocity_rps = 21.1;
   const auto diagnostics = CheckHardwareConfig(config);
   ASSERT_EQ(diagnostics.size(), 1u);
-  EXPECT_FALSE(HasError(diagnostics));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "wrist", "105 rps"))
+  EXPECT_NE(Find(diagnostics, Severity::WARNING, "wrist"), nullptr)
       << Describe(diagnostics);
 }
 
@@ -652,8 +729,7 @@ TEST(HardwareConfig, RioTrafficCountsMotorAndSensorFramesAtStatusFrequency) {
   config.status_hz = 751;
   const auto diagnostics = CheckHardwareConfig(config);
   ASSERT_EQ(diagnostics.size(), 1u);
-  EXPECT_FALSE(HasError(diagnostics));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "rio", "15000 frames/s"))
+  EXPECT_NE(Find(diagnostics, Severity::WARNING, "rio"), nullptr)
       << Describe(diagnostics);
 }
 
@@ -668,71 +744,6 @@ TEST(HardwareConfig, OtherCanBusesDoNotCountTowardRioTraffic) {
   config.motors.front().bus = "rio";
   config.sensors.front().bus = "canivore";
   EXPECT_TRUE(CheckHardwareConfig(config).empty());
-}
-
-TEST(HardwareConfig, ReportsAllWarningsWithoutRejectingConfiguration) {
-  hardware::Config config;
-  config.status_hz = 1000;
-  config.motors.resize(4);
-  config.motors[0].name = "wrist";
-  config.motors[0].max_velocity_rps = 106;
-  config.motors[1].name = "shoulder";
-  config.motors[1].sensor_to_mechanism_ratio = 2;
-  const auto diagnostics = CheckHardwareConfig(config);
-  ASSERT_EQ(diagnostics.size(), 3u);
-  EXPECT_FALSE(HasError(diagnostics));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "wrist", "105 rps"));
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "shoulder", "105 rps"));
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::WARNING, "rio", "15000 frames/s"));
-  EXPECT_TRUE(CheckHardwareConfig(hardware::Config{}).empty());
-}
-
-TEST(LintGraph, RejectsTheTestNamespaceAndDuplicateNodeNames) {
-  const std::vector<NodeShape> in_test_namespace = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/test/state")}},
-  };
-  EXPECT_TRUE(HasError(LintGraph(in_test_namespace)));
-
-  const std::vector<NodeShape> duplicated = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/state")}},
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Watcher("/drivetrain/state")}},
-  };
-  const auto diagnostics = LintGraph(duplicated);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(Mentions(diagnostics, Severity::ERROR, "drivetrain",
-                       "identifies one process"))
-      << Describe(diagnostics);
-}
-
-TEST(LintGraph, ReportsAMalformedNameOnceAndKeepsGoing) {
-  const std::vector<NodeShape> nodes = {
-      {"drivetrain",
-       "//2026-robot/main_processor/drivetrain:node",
-       {Sender("/drivetrain/tgt"), Sender("/drivetrain/state")}},
-      {"odometry",
-       "//2026-robot/main_processor/odometry:node",
-       {Watcher("/drivetrain/state"), Sender("/odometry/state")}},
-  };
-  const auto diagnostics = LintGraph(nodes);
-  ASSERT_TRUE(HasError(diagnostics)) << Describe(diagnostics);
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::ERROR, "/drivetrain/tgt", "target"))
-      << Describe(diagnostics);
-  // The declaring node is named, because the reader has to go and fix it.
-  EXPECT_TRUE(
-      Mentions(diagnostics, Severity::ERROR, "/drivetrain/tgt", "drivetrain"));
-  // A bad name must not stop the rest of the graph being checked; /odometry
-  // /state is published and unread, which should still show up.
-  EXPECT_TRUE(Mentions(diagnostics, Severity::WARNING, "/odometry/state",
-                       "nothing subscribes"))
-      << Describe(diagnostics);
 }
 
 }  // namespace

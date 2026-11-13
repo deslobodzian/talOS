@@ -17,6 +17,8 @@ cc_library(
     name = "autonomous",
     hdrs = [
         "autonomous.h",
+        "progress.h",
+        "selection.h",
         "trajectory.h",
     ],
     include_prefix = "autonomous",
@@ -26,7 +28,9 @@ cc_library(
         "//2026-robot/main_processor/drivetrain:messages",
         "//2026-robot/main_processor/intake:messages",
         "//2026-robot/main_processor/shooter:messages",
+        "//talOS/configuration",
         "//talOS/devices",
+        "//talOS/memory:shared_memory",
         "//talOS/msgs:geometry",
         "//talOS/node",
     ],
@@ -55,6 +59,8 @@ cc_test(
     deps = [
         ":autonomous",
         "//talOS/devices:testing",
+        "//talOS/memory:shared_memory",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

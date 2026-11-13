@@ -1,0 +1,102 @@
+# The driver dashboard's layout ([studio] dashboard in robot.toml), served by
+# the Studio bridge at /drive. Format, widget kinds and keys:
+# talOS/telemetry/README.md "Dashboard layout". Every channel below is in the
+# 2026 telemetry dictionary (<owner>/<role>/<field path>); the telemetry node
+# refuses to start on one that is not. The routine widget shows the routine's
+# name through telemetry's [[subsystem.labels]] on
+# autonomous/state/routine_index.
+#
+# The feed's worst case: 32 named channels (the match widget's 12 included)
+# plus the six /hw/status alerts the alerts widget carries, 38 channels at
+# 20 Hz, is 23,632 B/s of the 24,000 budget, which covers 39 channels: one
+# more alert channel fits before the budget must grow.
+
+[dashboard]
+title = "Drive"
+columns = 12
+rows = 8
+update_hz = 20
+budget_bytes_per_s = 24000
+drive_clients = 2
+
+[[widgets]]
+kind = "match"
+at = [0, 0, 4, 2]
+
+[[widgets]]
+kind = "power"
+at = [4, 0, 2, 2]
+warn_below_v = 12.0
+
+[[widgets]]
+kind = "routine"
+at = [6, 0, 3, 2]
+channel = "autonomous/state/routine_index"
+phase = "autonomous/state/phase"
+
+[[widgets]]
+kind = "alerts"
+at = [9, 0, 3, 3]
+
+[[widgets]]
+kind = "field"
+at = [0, 2, 5, 4]
+pose = "pose_estimator/state/pose"
+valid = "pose_estimator/state/valid"
+localized = "pose_estimator/state/localized"
+trail_s = 5
+
+[[widgets]]
+kind = "number"
+at = [5, 2, 2, 1]
+title = "Flywheel"
+channel = "shooter/state/flywheel_velocity_rps"
+precision = 1
+
+[[widgets]]
+kind = "boolean"
+at = [7, 2, 2, 1]
+title = "At speed"
+channel = "shooter/state/at_speed"
+
+[[widgets]]
+kind = "boolean"
+at = [5, 3, 2, 1]
+title = "Shooter beam"
+channel = "shooter/state/beam_broken"
+
+[[widgets]]
+kind = "boolean"
+at = [7, 3, 2, 1]
+title = "Intake beam"
+channel = "intake/state/beam_broken"
+
+[[widgets]]
+kind = "subsystems"
+at = [9, 3, 3, 3]
+
+[[widgets]]
+kind = "text"
+at = [5, 4, 4, 1]
+title = "Intake inhibit"
+channel = "intake/state/inhibit"
+
+[[widgets]]
+kind = "graph"
+at = [5, 5, 4, 3]
+title = "Flywheel"
+channels = ["shooter/state/flywheel_velocity_rps", "shooter/state/target_velocity_rps"]
+window_s = 10
+
+[[widgets]]
+kind = "checks"
+at = [0, 6, 5, 2]
+title = "Pre-match"
+items = [
+  { label = "Battery", channel = "hw/status/battery_v", at_least = 12.5 },
+  { label = "Hardware configured", channel = "hw/status/configured", equals = true },
+  { label = "Commissioned", channel = "hw/status/commissioned", equals = true },
+  { label = "Swerve modules", channel = "drivetrain/state/modules_valid", equals = true },
+  { label = "Gyro", channel = "drivetrain/state/yaw_valid", equals = true },
+  { label = "Localized", channel = "pose_estimator/state/localized", equals = true },
+]

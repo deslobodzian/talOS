@@ -1,96 +1,43 @@
 # talOS
 
-talOS is a small ROS-like stack for FRC robots: nodes in C++ or Python run on a
-main processor and talk over shared-memory topics, and the RoboRIO is only the
-hardware layer, reached over UDP.
+talOS runs C++ and Python robot nodes on a main processor, with the RoboRIO as
+the hardware layer. See [ARCHITECTURE.md](ARCHITECTURE.md) for processors,
+layers, targets and configuration, and [talOS/NAMING.md](talOS/NAMING.md) for names.
 
-```
-your node (C++ class or Python class)
-   │  talos::Motor{node, "flywheel"}, robot_enabled(node)
-talOS/devices    hardware handles; neutral unless set, neutral when disabled
-   │  subscribe / publish / param / update() / StateMachine / TALOS_NODE
-talOS/node       generic node: topics, timers, parameters, the tick
-   │
-talOS/events  talOS/rtms  talOS/memory  talOS/ipc   loop, log/replay, shared-memory topics
-```
+API reference: [docs/NODE_DEVELOPMENT_GUIDE.md](docs/NODE_DEVELOPMENT_GUIDE.md).
+Terms: [docs/GLOSSARY.md](docs/GLOSSARY.md).
 
-A C++ node (`2026-robot/main_processor/shooter/shooter.h`, abridged):
+## Start here
 
-```cpp
-class Shooter {
- public:
-  explicit Shooter(talos::Node& node)
-      : node_{node}, flywheel_{node, "flywheel"},
-        target_{node},
-        state_{node.publish<ShooterState>(kStateTopic)} {}
-  void update() {
-    const auto* target = target_.get();
-    if (talos::robot_enabled(node_) && target && target->enabled())
-      flywheel_.set_velocity(target->target_velocity_rps());  // else neutral
-    state_.send(ShooterState{/* ... */});
-  }
- private:
-  talos::Node& node_;
-  talos::Motor flywheel_;
-  talos::Target<ShooterTarget> target_;
-  talos::Publisher<ShooterState> state_;
-};
-```
+**Adding a mechanism (a student).**
 
-`shooter.cc` is `TALOS_NODE(shooter::Shooter)`. A Python node
-(`2026-robot/main_processor/intake/intake.py`, abridged):
+1. [Install](docs/INSTALL.md), then [your first mechanism](docs/FIRST_MECHANISM.md): clone to a simulated mechanism.
+2. [Glossary](docs/GLOSSARY.md), when a word is new.
+3. [Node anatomy](docs/METHODOLOGY.md#2-anatomy-of-a-node) and [units](docs/METHODOLOGY.md#6-units).
+4. [examples/superstructure](examples/superstructure/README.md): three mechanisms that cooperate.
+5. [The node test matrix](docs/TESTING.md#7-the-node-test-matrix): the tests your node needs.
+6. [Node API reference](docs/NODE_DEVELOPMENT_GUIDE.md).
 
-```python
-import talos
-from intake.IntakeState import IntakeState
-from intake.IntakeTarget import IntakeTarget
+**Debugging a match (a programmer).**
 
-class Intake:
-    def __init__(self, node):
-        self.node = node
-        self.roller = talos.Motor(node, "roller")
-        self.beam = talos.DigitalInput(node, "intake_beam")
-        self.target = talos.Target(node, IntakeTarget)
-        self.state = node.publish(IntakeState, "/intake/state")
+1. [Architecture](ARCHITECTURE.md): the tick, targets, topics.
+2. [Reading a session](talOS/launcher/README.md#filtering-and-exporting-logs): `log_dump`, and [session measurements](talOS/launcher/README.md#session-measurements).
+3. [Studio](studio/README.md), the live viewer.
+4. [Who drives a subsystem](talOS/introspection/README.md#who-drives-a-subsystem) and [replaying a session into one node](talOS/launcher/README.md#replaying-a-session-into-one-node).
+5. [Data flow](docs/DATA_FLOW.md): every link, rate and size.
 
-    def update(self):
-        target = self.target.get()  # None while disabled, stale, or without a live lane
-        if talos.robot_enabled(self.node) and target is not None and target.enabled:
-            self.roller.set_velocity(roller_demand(target.roller_velocity_rps, self.beam.value))
-        self.state.send(beam_broken=self.beam.value, enabled=talos.robot_enabled(self.node))
-```
+**Maintaining the platform (a mentor).**
 
-To write your own mechanism, follow
-[examples/superstructure/README.md](examples/superstructure/README.md). API
-reference: [docs/NODE_DEVELOPMENT_GUIDE.md](docs/NODE_DEVELOPMENT_GUIDE.md).
-Layers and rules: [ARCHITECTURE.md](ARCHITECTURE.md). Names:
-[talOS/NAMING.md](talOS/NAMING.md). Deploying: [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
-Robot bring-up checklist: [docs/BRINGUP.md](docs/BRINGUP.md).
-
-## Layout
-
-| Path | What |
-|---|---|
-| `talOS/node`, `talOS/devices` | the node API and hardware handles (C++) |
-| `talOS/python/talos` | the same API in Python (ctypes over `talOS/node_api`) |
-| `talOS/events`, `rtms`, `memory`, `ipc`, `process` | event loop, log/replay, shared-memory topics, process plumbing |
-| `talOS/hardware`, `protocol`, `bridge` | hardware wire contract, UDP framing, `:hardware_node` (the courier to the RoboRIO) |
-| `talOS/driver_station` | Driver Station codec |
-| `talOS/msgs` | shared geometry and control message structs |
-| `talOS/telemetry` | the Studio telemetry frame schema and byte-topic wire format |
-| `talOS/configuration`, `launcher`, `introspection` | `robot.toml` parser, the launcher, graph description and names |
-| `talOS/build/contract.bzl` | `talos_cc_node`, `talos_py_node`, `talos_messages`, `talos_bundle`, `talos_graph_test` |
-| `tools/sync_manifest.py` | writes a config's `robot_manifest.bzl` (`NODES`, `CONFIG_FILES`), which the bundle and graph test read; `manifest_sync_test` fails when it is stale |
-| `2026-robot/` | this season's robot ([README](2026-robot/README.md)) |
-| `2026-robot/main_processor/{driver,autonomous}` | reusable teleop lane wiring and autonomous target production |
-| `examples/superstructure/` | intake + elevator + superstructure example |
-| `studio/` | the telemetry viewer |
-| `sim.sh`, `tools/deploy.sh`, `tools/test_drivetrain.py` | run in sim, deploy, drivetrain smoke test |
+1. [Architecture](ARCHITECTURE.md) and [names](talOS/NAMING.md).
+2. [RULES.md](RULES.md) and [the development workflow](docs/DEVELOPMENT.md).
+3. [Requirements](docs/REQUIREMENTS.md) and [testing](docs/TESTING.md).
+4. [Design notes](docs/DESIGN.md).
+5. [Deployment](docs/DEPLOYMENT.md), [bring-up](docs/BRINGUP.md) and [the bench](docs/BENCH.md).
+6. [TODO.md](TODO.md): open work.
 
 ## Install
 
-Linux/macOS: `./tools/setup.sh`. Windows: `powershell -ExecutionPolicy Bypass -File tools\setup.ps1`
-(talOS builds inside WSL2). Details, flags and troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
+Linux, macOS, or Windows inside WSL2: `./tools/setup.sh`. Details, flags and troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Build and test
 
@@ -103,27 +50,22 @@ bazel test //examples/superstructure/...
 The RoboRIO program (`2026-robot/controller_processor/rio`) builds with
 GradleRIO, not Bazel.
 
+How tests are chosen and run: [docs/TESTING.md](docs/TESTING.md). How a
+change is made and verified: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+
 ## Run in simulation
 
 ```sh
 ./sim.sh --sim-gateway --no-studio   # lightweight simulator, no WPILib needed
 ./sim.sh                             # WPILib simulation of the RoboRIO + Studio
 ./sim.sh --help
+./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway --no-studio  # another robot
 ```
 
 Check a robot's graph without starting it:
 
 ```sh
 bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configuration/robot.toml --describe-only
-```
-
-## macOS
-
-`.bazelrc` adds two macOS-only flags; without them the C++ tree does not build:
-
-```
-build:macos --cxxopt=-fexperimental-library --linkopt=-fexperimental-library  # std::jthread, std::stop_token
-build:macos --macos_minimum_os=13.4                                            # std::format floating point
 ```
 
 ## Debugging

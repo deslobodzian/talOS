@@ -23,6 +23,7 @@ cc_library(
     deps = [
         ":messages",
         "//talOS/devices",
+        "//talOS/mechanisms",
         "//talOS/node",
     ],
 )
@@ -39,6 +40,7 @@ cc_test(
     size = "small",
     srcs = ["node_test.cc"],
     data = [
+        "testdata/neighbor.toml",
         "testdata/robot.toml",
         "testdata/shooter.toml",
         ":node",
@@ -50,6 +52,7 @@ cc_test(
     deps = [
         ":shooter",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

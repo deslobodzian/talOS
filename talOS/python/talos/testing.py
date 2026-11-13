@@ -47,7 +47,11 @@ def _generation(mode_since_us):
 
 
 class Sim:
-    """One simulated clock hosting several nodes; topics are in memory."""
+    """One simulated clock hosting several nodes; topics are in memory.
+
+    Every talos.Node it hosts keeps it alive, as does every wrapper made from
+    one (subscriptions, publishers, devices), so the native Sim is destroyed
+    only once nothing can reach its nodes."""
 
     def __init__(self, config_path=None, *, _handle=None):
         self._handle = _handle or _abi.handle(
@@ -67,33 +71,59 @@ class Sim:
             self._handle, None if path is None else _abi.encode(path)))
 
     def __del__(self):
-        if getattr(self, "_handle", None):
-            lib.talos_sim_destroy(self._handle)
+        handle = getattr(self, "_handle", None)
+        if handle:
             self._handle = None
+            # Garbage collection may finalize this Sim while other objects
+            # of the same unreachable cycle still hold its nodes: their
+            # handles now raise instead of reaching freed memory.
+            for node, _ in self._nodes:
+                node._native = None
+            lib.talos_sim_destroy(handle)
 
     def add(self, cls, node_name):
         """Builds cls on a node named node_name; returns the object."""
-        factory = talos._factory(cls, self._nodes)
+        factory = talos._factory(cls, self._nodes, self)
         _abi.handle(lib.talos_sim_add(self._handle, _abi.encode(node_name),
                                       factory, None))
         return self._nodes[-1][1]
 
     def node(self, node_name):
-        return talos.Node(_abi.handle(
-            lib.talos_sim_node(self._handle, _abi.encode(node_name))))
+        """The talos.Node add() built for node_name."""
+        handle = _abi.handle(
+            lib.talos_sim_node(self._handle, _abi.encode(node_name)))
+        return next(node for node, _ in self._nodes if node._native == handle)
 
     def step(self, seconds):
         """Advances virtual time, running every node's timers and messages."""
         _abi.ok(lib.talos_sim_step(self._handle, round(seconds * _NS)))
 
+    def pause(self, node_name, seconds):
+        """Stops one node's timers and deliveries while its clock advances."""
+        _abi.ok(lib.talos_sim_pause(
+            self._handle, _abi.encode(node_name), round(seconds * _NS)))
+
+    def resume(self, node_name):
+        """Ends a pause early; missed timers coalesce, as after SIGCONT."""
+        _abi.ok(lib.talos_sim_resume(self._handle, _abi.encode(node_name)))
+
     @property
     def now(self):
+        """The Sim clock in float seconds; exact below 2**51 ns (26 days).
+        Compare times, and build message times, with now_ns."""
         return lib.talos_sim_now_ns(self._handle) / _NS
+
+    @property
+    def now_ns(self):
+        """The Sim clock in integer nanoseconds (C++ sim.now().nanos()),
+        equal to every node's now_ns."""
+        return lib.talos_sim_now_ns(self._handle)
 
     def publish(self, msg, topic, message=None, **fields):
         """Publishes on `topic`, like Publisher.send."""
-        data = message._bytes if message is not None else (
-            message_type(msg).encode(fields))
+        mtype = message_type(msg)
+        data = mtype.forward(message) if message is not None else (
+            mtype.encode(fields))
         _abi.ok(lib.talos_sim_publish_raw(self._handle, _abi.encode(topic),
                                           data, len(data)))
 
@@ -119,7 +149,8 @@ class Sim:
         with `mode_since_us` for a producer that has not seen the current
         mode (a target queued from an earlier one, a stale view: 0)."""
         mtype = message_type(msg)
-        data = message._bytes if message is not None else mtype.encode(fields)
+        data = mtype.forward(message) if message is not None else (
+            mtype.encode(fields))
         _abi.ok(lib.talos_sim_publish_target(
             self._handle, _abi.encode(subsystem), _abi.encode(source), data,
             mtype.size, mtype.alignment, _generation(mode_since_us)))
@@ -159,10 +190,17 @@ class Sim:
 class SimHardware:
     """Plays the bridge for a Sim: publishes /hw/state every robot period
     (configured; enabled after enable()) and records each node's requests.
-    It also publishes /hw/status with the bridge's own gateway clock filter,
-    so talos.hardware_sample_time_ns(node) is None until the 8th state, then
-    each state's sim sample time plus the smallest latency the filter has
-    seen (its publication time while the latency is constant)."""
+    It also publishes /hw/status with the exact known simulated clock relation,
+    retaining the 8-State convergence gate. hardware_sample_time_ns(node) is None
+    until then, and subsequently gives the true simulated sample instant.
+    In-process clock uncertainty and RTT are zero (no transport estimation).
+    Applied outputs merge by the bridge's rules: a node's outputs expire
+    once its last request is older than the bridge's owner timeout
+    (ARCHITECTURE.md, "The tick"), and every output stops at a gateway tick
+    that finds the oldest observation of any node still merged
+    command_timeout_us old; omitted outputs and disabled hardware are
+    neutral. Raw inspection retains the last explicitly requested value for
+    each device."""
 
     def __init__(self, sim):
         self._sim = sim  # outlives this
@@ -177,12 +215,26 @@ class SimHardware:
         _abi.ok(lib.talos_sim_hardware_enable(self._handle, bool(on)))
 
     def ideal_motors(self, on=True):
-        """Velocity/position/motion-magic requests are reached each period."""
+        """Velocity/position/motion-magic requests are reached each period.
+        Neutral decays velocity with tau=50 ms (brake) or 1 s (coast);
+        below 0.01 rps it stops. Voltage/duty-cycle drive is not modeled."""
         _abi.ok(lib.talos_sim_hardware_ideal_motors(self._handle, bool(on)))
 
-    def set_motor(self, node, device, position, velocity):
+    def set_motor(self, node, device, position, velocity,
+                  position_age_us=0, velocity_age_us=0,
+                  temperature_c=0, supply_current_a=0, stator_current_a=0):
+        """Inject feedback, including controller Celsius, supply amps and
+        stator amps (Motor.current)."""
         self._set(lib.talos_sim_hardware_set_motor, node, device, position,
-                  velocity)
+                  velocity, position_age_us, velocity_age_us,
+                  temperature_c, supply_current_a, stator_current_a)
+
+    def set_limit_switches(self, node, device, forward=False, reverse=False):
+        """The motor's TalonFX limit switches, asserted or not, from the next
+        state on (SimHardware::set_limit_switches); reported only, the
+        request and the ideal motor are not stopped."""
+        self._set(lib.talos_sim_hardware_set_limit_switches, node, device,
+                  bool(forward), bool(reverse))
 
     def set_digital_input(self, node, device, value):
         self._set(lib.talos_sim_hardware_set_digital_input, node, device,
@@ -195,12 +247,15 @@ class SimHardware:
         self._set(lib.talos_sim_hardware_set_encoder, node, device, position,
                   velocity)
 
-    def set_cancoder(self, node, device, position, velocity):
+    def set_cancoder(self, node, device, position, velocity,
+                     position_age_us=0, velocity_age_us=0):
         self._set(lib.talos_sim_hardware_set_cancoder, node, device, position,
-                  velocity)
+                  velocity, position_age_us, velocity_age_us)
 
-    def set_gyro(self, node, device, yaw, yaw_rate):
-        self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate)
+    def set_gyro(self, node, device, yaw, yaw_rate,
+                 yaw_age_us=0, yaw_rate_age_us=0):
+        self._set(lib.talos_sim_hardware_set_gyro, node, device, yaw, yaw_rate,
+                  yaw_age_us, yaw_rate_age_us)
 
     def set_gateway_clock(self, offset=0.0, latency=0.0):
         """From now on the gateway clock reads sim time + `offset` seconds,
@@ -213,6 +268,27 @@ class SimHardware:
         is invalid) and reads 0; every device of `node` named `device`."""
         self._set(lib.talos_sim_hardware_set_connected, node, device,
                   bool(connected))
+
+    def reset_device(self, node, device):
+        """A device reset as the gateway reports one: the next state counts
+        it in device_reset_count, and it and the state after mask the motor
+        or sensor of `node` named `device` with its followers and the motors
+        it feeds as a remote CANcoder. Raises TalosError when `node` has no
+        motor, CANcoder or gyro of that name."""
+        self._set(lib.talos_sim_hardware_reset_device, node, device)
+
+    def lose_states(self, count):
+        """The next `count` gateway ticks (and their sequence numbers) pass
+        with nothing published, as over a link outage. Each lost tick still
+        observes the Driver Station mode, as the RoboRIO does."""
+        _abi.ok(lib.talos_sim_hardware_lose_states(self._handle, int(count)))
+
+    def reboot(self):
+        """A new gateway boot id from the next state on; every applied output
+        is neutral until a request built from the new boot's state, and the
+        tick sequence, the device reset count and the Driver Station mode
+        generation start over."""
+        _abi.ok(lib.talos_sim_hardware_reboot(self._handle))
 
     def set_driver_station(self, *, enabled=False, autonomous=False,
                            teleop=False, test=False, estop=False,
@@ -249,8 +325,9 @@ class SimHardware:
         _abi.ok(lib.talos_sim_hardware_set_driver_station(self._handle, None))
 
     def motor_request(self, node, device):
-        """The last request `node` flushed for `device` (neutral before any):
-        (mode, demand, ff_volts, slot)."""
+        """Last explicitly requested (mode, demand, ff_volts, slot), neutral
+        before any request. Expiry, omitted outputs and disable do not alter
+        it."""
         out = _abi.MotorRequest()
         _abi.ok(lib.talos_sim_hardware_motor_request(
             self._handle, _abi.encode(node), _abi.encode(device), out))
@@ -258,13 +335,35 @@ class SimHardware:
                             out.slot)
 
     def digital_output(self, node, device):
+        """Last explicitly requested digital value (False before any)."""
         return bool(_abi.ok(lib.talos_sim_hardware_digital_output(
             self._handle, _abi.encode(node), _abi.encode(device))))
 
     def pwm(self, node, device):
+        """Last explicitly requested PWM value (0 before any)."""
         out = ctypes.c_double()
         _abi.ok(lib.talos_sim_hardware_pwm(self._handle, _abi.encode(node),
                                            _abi.encode(device), out))
+        return out.value
+
+    def applied_motor(self, node, device):
+        """Applied (mode, demand, ff_volts, slot), after expiry/neutral gates."""
+        out = _abi.MotorRequest()
+        _abi.ok(lib.talos_sim_hardware_applied_motor(
+            self._handle, _abi.encode(node), _abi.encode(device), out))
+        return MotorRequest(talos.Mode(out.mode), out.demand, out.ff_volts,
+                            out.slot)
+
+    def applied_digital_output(self, node, device):
+        """Applied digital value, False on expiry, omission or disable."""
+        return bool(_abi.ok(lib.talos_sim_hardware_applied_digital_output(
+            self._handle, _abi.encode(node), _abi.encode(device))))
+
+    def applied_pwm(self, node, device):
+        """Applied PWM value, 0 on expiry, omission or disable."""
+        out = ctypes.c_double()
+        _abi.ok(lib.talos_sim_hardware_applied_pwm(
+            self._handle, _abi.encode(node), _abi.encode(device), out))
         return out.value
 
     def _set(self, function, node, device, *values):

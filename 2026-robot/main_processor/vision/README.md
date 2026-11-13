@@ -16,41 +16,89 @@ capture rate, and simulation renderer selection.
 The official 2026 welded layout is embedded in the binary;
 installed bundles need no vision runfiles. Mounts map OpenCV optical coordinates
 to robot NWU using `Rz(yaw) Ry(pitch) Rx(roll)`. Positive pitch points a forward
-lens downward, preserving the previous calibration convention. The checked-in
-mounts are season-plausible defaults, not measured calibration.
+lens downward. Calibrate the mounts for the deployed robot.
 
-Shared detector and scheduling defaults (overridable per camera):
+Defaults (overridable per camera): **Shared** is the value in
+`configuration/subsystems/vision.toml` (— when it sets none); **Fallback** is
+the code's value when no file sets the key.
 
-| Key | Default | Units and meaning |
-| --- | --- | --- |
-| `subsystem.period_us` | `10000` | Node/status period in microseconds (100 Hz), not the capture period. |
-| `camera.fps` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. |
-| `camera.latency_offset_us` | `0` | Per-camera capture-stamp correction in microseconds, live **and** sim: subtract from the capture timestamp before publication. |
-| `camera.sim_timestamp_lag_us` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
-| `camera.mount_angle_std_rad` | `0.0175` | Extrinsic mount-rotation calibration uncertainty in radians (≈1 deg), live **and** sim, not sim-only. Added to the published covariance: field x/y variance gains `(range × value)²`, yaw variance gains `value²`. |
-| `camera.mount_translation_std_m` | `0.01` | Extrinsic mount-translation calibration uncertainty in metres, live **and** sim, not sim-only. Added to the published field x/y variance. |
-| `detector.decimate` | `2.0` | Dimensionless quad-search downsampling factor; 2.0 searches at half resolution, then refines edges at full resolution. |
-| `detector.threads` | `2` | Integer detector worker count. |
-| `detector.sigma` | `0.0` | Quad-search Gaussian blur sigma in pixels; zero disables blur. |
-| `detector.refine_edges` | `true` | Refine detected quad edges before decoding. |
-| `detector.hamming_threshold` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
+| Key | Shared | Fallback | Units and meaning |
+| --- | --- | --- | --- |
+| `subsystem.period_us` | `10000` | `[robot] period_us` | Node/status period in microseconds (100 Hz), not the capture period. |
+| `camera.fps` | `60` | `60` | Requested live capture rate and maximum simulated capture rate, in frames per second. Must be finite and positive. Construction refuses a value whose frame queues (`ceil(2 * period_us * fps / 1e6) + 2` results, `ceil(sim_timestamp_lag_us * fps / 1e6) + 2` delayed observations) would exceed 256 slots, naming both settings: 240 fps across a 500 ms tick or the longest sim lag needs 242. |
+| `camera.latency_offset_us` | `0` | `0` | The camera's measured stamp bias, subtracted from every live timestamp kind (after its exposure/readout correction) and from simulated timestamps. |
+| `camera.sim_timestamp_lag_us` | `0` | `0` | Sim only: stamp the rendered truth instant this many microseconds later, modeling a timestamp taken after exposure. Ignored live, but validated in both modes. |
+| `camera.readout_us` | — | `0` | Known sensor readout duration subtracted from live EOF timestamps (unknown readout is zero). |
+| `camera.frame_timeout_us` | — | `500000` | Live silence deadline; positive, at most 10,000,000 µs. Reopens a connected but silent camera on the worker (before an open's first frame the deadline is at least 3 s, below), and is the maximum live stamp age (see timestamps below) and the maximum age of a rasterized sim result. |
+| `camera.exposure_ms` | `5.0` | `0` | Shared manual exposure duration; also controls simulated exposure blur. Zero leaves duration unspecified. |
+| `camera.gain` | — | `0` | Backend-native manual gain; zero leaves gain unspecified. |
+| `camera.auto_exposure`, `camera.auto_gain` | — | `exposure_ms == 0`, `gain == 0` | True only when duration/gain is zero; with the shared values auto exposure is off and auto gain on. |
+| `camera.mount_angle_std_rad` | `0.0175` | `0.0175` | Extrinsic mount-rotation calibration uncertainty in radians (≈1 deg), live **and** sim, not sim-only. Added to the published covariance: field x/y variance gains `(range × value)²`, yaw variance gains `value²`. |
+| `camera.mount_translation_std_m` | `0.01` | `0.01` | Extrinsic mount-translation calibration uncertainty in metres, live **and** sim, not sim-only. Added to the published field x/y variance. |
+| `detector.decimate` | `2.0` | `1.0` | Dimensionless quad-search downsampling factor; 2.0 searches at half resolution, then refines edges at full resolution. |
+| `detector.threads` | `2` | `1` | Integer detector worker count. |
+| `detector.sigma` | `0.0` | `0.0` | Quad-search Gaussian blur sigma in pixels; zero disables blur. |
+| `detector.refine_edges` | `true` | `true` | Refine detected quad edges before decoding. |
+| `detector.hamming_threshold` | `1` | `1` | Maximum corrected tag-code bits (inclusive), passed to the decoder and checked for validity. |
 | `detector.min_decision_margin` | `30.0` | Minimum AprilTag decode-margin score (inclusive), measuring image-intensity contrast, not a probability or pose error. |
+| `subsystem.backend` | `"auto"` | Use Metal when available and supported, otherwise CPU (always CPU off macOS). On macOS, Metal pipelines compile on a background thread and the camera detects on the CPU until they are ready. `"cpu"` forces CPU; `"metal"` requires Metal, rejects execution fallback, and fails construction if the pipelines are not compiled within 5 s. On macOS, with `auto` or `metal`, the node logs the backend it starts on and each switch. |
 
-Both timing keys must be finite, nonnegative and strictly below 1,000,000 µs;
-construction failures name the node and key. Measure each deployed camera's
-timestamp bias and set `latency_offset_us` in its own `[camera]` table; do not
-subtract processing/transport time already excluded by its capture timestamp.
-A correction that would underflow publishes an invalid observation, never an
-unsigned-wrapped future timestamp. The live path applies only the offset.
+Timing offsets and readout must be finite, nonnegative and strictly below
+1,000,000 µs; construction failures name the node and key. The single conversion
+boundary is observation publication (`CaptureMidpoint`): mapped V4L2 SOE adds
+half the successfully configured manual exposure; EOF subtracts half exposure
+plus known readout. Unknown/automatic exposure contributes zero, never a guessed
+duration. Delivery/host receipt, AVFoundation mapped PTS (which does not
+guarantee exposure semantics) and known midpoint stamps get no exposure
+correction. Every kind then subtracts `latency_offset_us`. uvcvideo stamps are
+always treated as delivery stamps: the driver labels its buffers SOE, but with
+its default `hwtimestamps=0` stamps the host arrival of the frame's first USB
+packet. With `hwtimestamps=1` its bias is still absorbed only by
+`latency_offset_us`.
+V4L2 non-monotonic timestamps fall back to host receipt;
+AVFoundation without a synchronized sample clock does likewise. Backends retain
+the source kind rather than claiming these are all exposure timestamps.
+Measure each camera's remaining stamp bias; do not subtract processing/transport
+delay already excluded by a hardware source timestamp. Underflow or future stamps
+publish invalid observations, never an unsigned-wrapped future timestamp. So
+does a live stamp older than `frame_timeout_us` when published; one diagnostic
+names the camera when its stamps turn stale and one when they recover.
 
-Both mount-uncertainty keys must be finite and nonnegative. They model the
-residual calibration error left after mounting each camera, which the corner
-noise cannot see: a mount rotation of `mount_angle_std_rad` tilts the optical
-axis and shifts the tag lever arm by `range × angle`, and `mount_translation_std_m`
-shifts it directly, so the published covariance adds both to field x/y (and the
-angle to yaw) before the uncertainty floors. Set them from the deployed robot's
-post-mounting calibration residual — a mount measured to ±0.5 deg and ±5 mm
-would use roughly half the defaults — not from the sim's synthetic error keys.
+AVFoundation opens the format with the configured `width` × `height` whose
+frame-rate range holds `camera.fps` within a relative 1e-4, since UVC cameras
+report their rates from 100 ns intervals (30 fps as 30.00003), and sets that
+range end's own frame duration when `camera.fps` is at an end of the range,
+otherwise `1 / camera.fps` clamped into the range.
+V4L2 opens `width` × `height` at `camera.fps` (the same relative 1e-4, since
+uvcvideo states intervals in 100 ns: 120 fps is 83333 / 10000000 s) in the
+first pixel format, GREY, then YUYV, then MJPG, the device enumerates at that
+size and rate, and reports the format, size and interval `VIDIOC_S_FMT` and
+`VIDIOC_S_PARM` granted. A size or rate the device does not offer, or a grant
+other than the one asked for, fails the open naming the mode and listing the
+modes the device offers; it never opens another size or rate.
+MJPG frames (an OV9281 offers 1280 × 800 above 20 fps only as MJPG) are
+decoded to 8-bit gray on the capture thread, luma only, with OpenCV's JPEG
+decoder (libjpeg-turbo); a frame without its end-of-image marker (cut short
+on the bus) or that does not decode to the mode's size is dropped and counted.
+V4L2 sets the controls before streaming and reads each one back
+(`ApplyV4L2Controls`): auto exposure is the device's `auto_exposure` auto
+mode, else aperture priority (what UVC cameras offer); manual exposure sets
+manual mode and `exposure_time_absolute` in 100 µs units (`exposure_ms × 10`,
+rounded; an OV9281 takes 1..5000, 0.1–500 ms); `exposure_dynamic_framerate`,
+which would let the camera stretch its frame period, is turned off whenever
+the device has it; auto gain needs `gain_automatic`, and a positive `gain`
+turns it off and sets `gain` (OV9281: 0..100). A control the device lacks,
+refuses, holds at another value, or whose range excludes the request fails
+the open naming the control, and the worker retries as for any failed open;
+nothing falls back. So with the shared defaults (`gain` unset, hence
+`auto_gain`), a camera without automatic gain, such as the OV9281, does not
+open until its file sets `gain` or `auto_gain = false`.
+macOS AVFoundation supports automatic exposure mode, but not custom
+duration/ISO; there manual requests remain visible as failed rather than
+silently ignored and capture continues: `controls_applied` is false and
+`control_failure_count` increments per open whose requested controls could
+not be applied. The exposure correction is omitted after a control failure.
+
 
 The typed pipeline configuration carries `apriltag::DetectorOptions` and the
 minimum decision margin directly; there is no string parameter map. A detection
@@ -59,6 +107,14 @@ distance no greater than the threshold, as well as passing geometric validity
 checks. Failed decode-quality checks mark the detection
 invalid, excluding it from both visibility counts and localization before range
 filtering or pose solving. A high margin alone does not guarantee a valid pose.
+A tag id decoded more than once in one frame (a false decode, or a printed copy
+of a field tag elsewhere in view) enters localization once, as one of its three
+strongest decodes (higher decision margin, then lower per-tag reprojection
+error). Beside other ids it is the decode consistent with them, whatever its
+margin: each detection's single-tag poses propose robot poses, each scored by
+the joint reprojection residual with every id at its best-fitting decode, and
+the best proposal decides. A repeated id alone in the frame has nothing to
+check against and keeps its strongest decode.
 
 ## Frame recording
 
@@ -92,25 +148,25 @@ initialize the recorder logs once and leaves the camera running without it.
 | `recording.max_bytes` | `268435456` | Per-camera disk budget (256 MiB); oldest pairs deleted first. |
 
 `max_bytes` must be a nonnegative integer; the rates must be finite and
-nonnegative. Disk math: at ~2 frames/s (one sampled + one rejected at the
-defaults) and ~0.8 MB per PNG, 256 MiB holds roughly 160 s of recording per
-camera. Tune offline with
-`bazel run //talOS/vision/recording:frame_replay -- --frames <dir> --layout
-2026-robot/main_processor/vision/data/2026-rebuilt-welded.json`.
+nonnegative. Replay captured frames with:
+
+```sh
+bazel run //talOS/vision/recording:frame_replay -- --frames <dir> --layout 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
+```
 
 Shared pose-solver settings live in `[subsystem]` in `vision.toml`, with the
 same per-camera override mechanism. Both single-tag and multi-tag observations
 use the joint corner solver and publish its returned standard deviations
 directly.
 
-| Key | Default | Units and meaning |
-| --- | --- | --- |
-| `pixel_std_px` | `0.33` | Sim-measured corner-coordinate standard deviation in pixels; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
+| Key | Shared | Fallback | Units and meaning |
+| --- | --- | --- | --- |
+| `pixel_std_px` | `0.33` | Nominal corner-coordinate standard deviation in pixels, the lower bound of the residual scaling below; real cameras should use their calibration RMS. Independent of direct projection's `camera.pixel_noise_std`. |
 | `floor_z_std_m` | `0.05` | Robot-height prior standard deviation in metres about the field floor. |
 | `floor_tilt_std_rad` | `0.05` | Robot roll/pitch prior standard deviation in radians about level. |
 | `huber_delta_px` | `2.0` | Huber robust-loss transition in pixels for corner residuals. |
 | `min_xy_std_m` | `0.02` | Minimum published x/y standard deviation in metres. |
-| `min_yaw_std_rad` | `0.035` | Minimum published yaw standard deviation in radians (about 2 degrees), selected against the accuracy preset's ±1-degree yaw mounting bias. |
+| `min_yaw_std_rad` | `0.035` | Minimum published yaw standard deviation in radians (about 2 degrees). |
 
 The raster/detect invariant test measures the sim pixel noise with fixed seed
 1000, production sensor/exposure settings, five offsets at each of 1.5, 2.5,
@@ -124,54 +180,28 @@ The test requires the measured standard deviation to stay within ±30% of
 This is a simulator calibration, not a claim about physical camera noise:
 set each real camera's `pixel_std_px` from its measured calibration RMS.
 
-Pixel-coordinate residuals are divided by `pixel_std_px`; the Huber transition
-is divided by the same value. Floor z and roll/pitch residuals are divided by
-their respective prior standard deviations, so all objective rows are
-dimensionless. The reported reprojection error remains unweighted RMS pixels.
-The covariance is the inverse final undamped `Jᵀ W J`, including the floor
-prior and final Huber IRLS weights. It is mapped from right-increment SE(3)
-coordinates into field-frame x/y/yaw before applying uncertainty floors.
+The solver's information matrix assumes `pixel_std_px` corner noise. It scales
+the resulting covariance by the fit's a-posteriori variance factor
+`s² = χ² / (m − 6)`, where `χ²` sums the squared Huber-weighted whitened
+residuals over its `m` rows (two per corner plus three floor rows), clamped to
+`[1, max_reprojection_error_px² / (2 · pixel_std_px²)]`: a fit worse than the
+nominal noise publishes proportionally larger uncertainty, never less than
+nominal and at most the per-coordinate variance ratio of a fit at the 3.5 px
+joint reprojection reject threshold (about 56, a 7.5× standard deviation, at
+the defaults). It then returns field-frame x/y/yaw standard deviations after
+applying the configured uncertainty floors and mount-calibration uncertainty.
 Non-finite or non-positive-definite covariance invalidates the observation.
-The yaw floor deliberately lets the gyro dominate heading.
-The yaw floor was selected by a two-run-per-floor sweep with deterministic
-±1-degree yaw, ±0.5-degree pitch and ±0.01 m translation mounting errors:
-0.035 rad gave the lowest measured mean fused heading RMS without worsening
-mean position RMS among 0.018, 0.035, 0.07 and 0.1 rad.
-Mount errors are correlated bias, not independent per-frame noise; normalized
-observation RMS alone is not a calibration objective for the fused estimator.
-Rare ambiguous single-tag observations can still have heavy-tailed errors;
-the estimator's separate 15-degree single-tag yaw innovation gate rejects
-those jumps rather than inflating uncertainty floors to disguise them.
+Single-tag ambiguity rejection and floor-prior disambiguation are implemented
+in [localization.h](../../../talOS/vision/localization.h).
 
-The accuracy scenario's second table scores each camera's valid SEND
-observations once per sample timestamp during the same enabled window.
-Truth is interpolated at that timestamp. It reports RMS and the interpolated
-95th percentile of absolute normalized x/y/wrapped-yaw errors, plus raw yaw
-RMS in degrees. A consistent Gaussian uncertainty model has normalized RMS
-near 1 and absolute p95 near 1.96. When yaw normalized RMS exceeds 1, the table
-also reports the smallest additional yaw floor that would make that session
-consistent while retaining covariance standard deviations already above it.
-This diagnostic does not change the configured floor.
-
-With two pose candidates, ambiguity is the lower/higher reprojection-error
-ratio. The single-tag ambiguity limit is **0.2**, defined by
-`PoseValidationOptions`; multi-tag joint solves do not inherit this single-tag
-limit. The patched AprilTag ambiguity search reports its exact count of new
-minima: no alternate minimum means ambiguity `0`, whereas multiple new minima
-without a returned second pose mean unknown ambiguity `1`. Single-tag
-observations above the limit are rejected unless the floor-disambiguation
-check resolves them; an absent second pose alone cannot resolve that check.
-The floor check uses the norm of `(z/floor_z_std_m,
-roll/floor_tilt_std_rad, pitch/floor_tilt_std_rad)`. It is decisive only when
-one candidate is within a 3-sigma prior radius and the other outside 6 sigma.
-Only then may it replace the lower-reprojection primary or override the
-ambiguity rejection. A merely smaller height/tilt residual cannot select the
-other planar minimum. This prevents the pinned tag-32 near-edge observation
-from switching to a 24-degree-flipped pose under small mounting errors.
-
-Only `--sim` enables synthetic observations. `rasterize = true` (default) uses
-a preallocated image buffer, AprilTag detection, and 3D localization;
-`rasterize = false` projects visible tag corners directly into localization.
+Only `--sim` enables synthetic observations. `rasterize = true` (default)
+renders into a preallocated image buffer, then runs AprilTag detection, 3D
+localization and frame recording, all on the camera's worker thread, never in
+`update()`; `rasterize = false` projects visible tag corners directly into
+localization inside `update()`, which is bounded by the visible tag count,
+deterministic tick for tick, and allocation-free: the node keeps one
+`talos::vision::MultiTagPoseSolver`, whose scratch is reserved for every layout
+tag at construction.
 Each camera optionally subscribes to `/sim/state` (`geometry.OdometrySample`),
 published every physics tick only by `sim_gateway --physics`. Tags are rendered
 from its latest absolute true field pose, not integrated drivetrain odometry.
@@ -199,9 +229,9 @@ Rendering still uses the original truth instant. Lagged observations wait until
 the offset cancels the lag; this prevents unrealistic future-stamped fusion.
 The lag window uses a preallocated, bounded queue sized from the configured
 capture period (`ceil(lag * fps) + 2` slots); overflow drops the oldest pending
-observation and increments the dropped-frame count. Every due observation is
+observation and moves it from the processed to the dropped-frame count. Every due observation is
 published in order, including batches after a late update. Stale/missing truth
-clears pending observations and publishes invalid immediately.
+clears pending observations (counted dropped) and publishes invalid immediately.
 The first fresh truth captures immediately and anchors a `1 / camera.fps`
 deadline grid. Subsequent captures use the first drained truth at or after the
 next deadline, advancing the grid rather than resetting it to the actual truth
@@ -210,14 +240,32 @@ approximately 16.7 ms mean period. Identical truth cannot create duplicate
 frames. If a slow tick misses several deadlines, it captures once from real
 truth, advances past that truth time and counts skipped deadlines as drops;
 it never invents intermediate poses. Between captures only status publishes,
-unless lagged observations become due.
+unless lagged observations become due (or, rasterized, a worker result arrives).
+With `rasterize = true` a due capture posts one request, a copy of its
+`/sim/state` sample, into a single slot the worker takes from; a request still
+untaken when the next capture is due is replaced and counted in
+`frames_dropped_count`. Finished results wait in the bounded result queue
+described under live capture below; each update takes all of them with a
+nonblocking try-lock and handles each, in capture order, like a
+direct-projection capture (counted processed, then the lag queue). Its
+observation therefore arrives one or more updates after its capture, still stamped with the truth instant it was rendered
+from; `last_latency_us` includes the render and detection time. A result
+collected more than `frame_timeout_us` after its truth instant (node clock) is
+dropped and counted in `frames_dropped_count`, never published.
+A test that needs a raster result calls `Vision::WaitForSimWorker` after a
+step, which blocks in wall time until the worker has stored its result, so a
+slow build (sanitizers) cannot age results past that limit in simulated time.
 Truth must pass `Subscription::fresh()` (younger than
 `[robot] command_timeout_us` since receipt).
 Missing or stale truth publishes `valid = false` and unhealthy status every
 update, with exactly one diagnostic naming each camera per outage. Fresh truth
-clears that outage. WPILib/RoboRIO simulation and the ideal gateway publish no
-truth: simulated cameras need `sim_gateway --physics`, and otherwise remain
-invalid rather than inventing a world.
+clears that outage. An outage also discards the captures the worker still
+holds: their results carry the outage epoch they were posted in, and the loop
+drops and counts any result from before the latest outage, so no observation
+is published from truth captured before stale truth was seen.
+WPILib/RoboRIO simulation and the ideal gateway publish no truth: simulated
+cameras need `sim_gateway --physics`, and otherwise remain invalid rather than
+inventing a world.
 
 Simulation camera keys live under `[camera]` (shared defaults in
 `vision.toml`, with per-camera overrides in the named camera files):
@@ -228,7 +276,7 @@ Simulation camera keys live under `[camera]` (shared defaults in
 | `sensor_noise_std_gray` | Independent sensor Gaussian standard deviation in 8-bit grayscale levels; rendered images only. Shared default: 2.0. |
 | `exposure_gain_std` | Dimensionless frame-wide multiplicative gain standard deviation; rendered images only. Shared default: 0.02. |
 | `exposure_ms` | Exposure duration in milliseconds for rendered motion blur. Shared default: 5.0 ms. |
-| `rng_seed` | Nonnegative integer replay seed; each `Vision` instance explicitly owns a persistent `std::mt19937_64`, seeded after camera configuration loads and passed to both simulation paths, so successive frames differ but replay remains repeatable. |
+| `rng_seed` | Nonnegative integer seed; each `Vision` instance explicitly owns a persistent `std::mt19937_64`, seeded after camera configuration loads and passed to both simulation paths, so successive frames differ. Replay is repeatable only with `rasterize = false`: which raster captures the worker renders, and when their results arrive, depend on its speed, as for live cameras. |
 
 All four noise/exposure magnitudes must be finite and nonnegative; zero disables
 the corresponding effect. These are plausible simulation settings, not measured
@@ -243,22 +291,6 @@ model exposure or image sensor noise. Neither path adds arbitrary pose jitter
 after solving; observation standard deviations describe uncertainty rather than
 perturbing the published pose a second time.
 
-The renderer also receives caller-owned `RenderScratch` retained beside the
-camera's pixel buffer. Motion integration reuses its detection vectors, instant
-image and accumulator across frames rather than hiding mutable state in camera
-configuration or allocating temporary frame buffers on each render.
-Motion blur initializes the static background once, then accumulates deviations
-only within disjoint regions covering visible tags' start/end projected bounds.
-Bounds include the projected 1.25× quiet zone and raster rounding margin, and
-extend for intermediate curved motion or newly visible tags. Pixels outside
-these regions retain the static background. A test-only full-frame integration
-oracle requires moving-pose results to agree within one gray level. Adjacent
-cells share a preprojected 11×11 vertex lattice rather than repeating four
-projections per cell.
-Image noise, gain and exposure accumulation use OpenCV kernels over reused
-matrices. The third-party AprilTag target is compiled with `-O2` in every Bazel
-mode, including `fastbuild`: noisy-image thresholding otherwise exceeds the
-camera period even when the surrounding simulation code is unoptimized.
 
 Without `--sim`, construction validates calibration and registers topics; it
 does not open a camera. Live capture requires a nonempty `camera.device` set to
@@ -268,20 +300,72 @@ a `/dev/v4l/by-id/...` path on Linux. List macOS ids and names with
 (uses `DiscoverCaptureDevices()`); on Linux use `ls -l /dev/v4l/by-id/`.
 An empty device logs one diagnostic naming the node, disables live capture,
 and publishes invalid observations and unhealthy status on each update.
-Simulation ignores this requirement. With a configured device, construction
+Simulation ignores this requirement. A device `recording:<dir>` plays a
+recording instead of opening a camera, through the same live path
+([playback](../../../talOS/vision/playback/README.md)): each frame is stamped
+the instant playback started plus its presentation time on the recording's
+timeline, and the recording ends (a disconnect, so the worker reopens and
+replays it) one frame period after its last frame. Its frames must be
+`camera.width` × `camera.height`, and the camera's calibration must be the
+recording camera's. With a configured device, construction
 starts a worker waiting for the first node-clock tick.
 The worker owns all device open/start/stop calls and all detection/localization.
 A missing or disconnected configured device is recreated with node-clock
-backoff of 1, 2, 4, then at most 8 seconds, resetting after a processed frame. This also
-recovers first-launch permission denial and capture-loop exits. The loop passes
-time atomically and uses a nonblocking result-slot try-lock; it never opens a
-device, spawns a thread, or waits for worker work. Capture replaces one pending
-frame, and processing replaces one fixed-size completed observation. Replacements
-in either slot count as dropped frames. Shutdown wakes and joins the worker,
+backoff of 0.1, 0.2, 0.4, 0.8, then at most 1 second, resetting after a
+processed frame. This also recovers permission denial,
+capture-loop exits, and connected cameras with no frame for `frame_timeout_us`.
+The silence timer starts at successful open and resets on frame receipt;
+until an open's first frame its deadline is the longer of `frame_timeout_us`
+and 3 s, since a UVC camera's first frame arrives 0.6–1.8 s after it starts
+streaming (an OV9281 on Linux, measured);
+`stall_count` counts silence retirements and `reconnect_count` counts successful
+opens after the first successful connection. Each connection state change
+(`Connected`, `Disconnected`, `Error`) logs one line naming the node and the
+reason, the source's own (missing device, permission, unsupported mode, a
+failed V4L2 call with its errno) when it gives one; a retry that fails the same
+way logs nothing. The loop passes
+time atomically and uses a nonblocking result-queue try-lock; it never opens a
+device, spawns a thread, or waits for worker work. A test driving a live
+source calls `Vision::WaitForLiveWorker` after each step, which blocks in wall
+time until the worker has serviced that tick and every delivered frame, so a
+slow build cannot let simulated time pass a stall or retry deadline unseen.
+
+Capture hands frames to the worker through one newest-wins triple buffer
+(`talos::vision::FrameMailbox`): the source's callback copies the driver
+buffer it borrows (V4L2 mmap buffer, locked CoreVideo buffer) into the filling
+slot and swaps it with the ready slot; the worker swaps the ready slot with the
+one it processes. The worker therefore always gets the newest complete frame,
+and the frame it is processing is never overwritten. Each slot is sized by
+the first frame it holds, in the format the source negotiated when it opened
+(V4L2 delivers at most 2 B/px, AVFoundation BGRA 4 B/px), and grows only for a
+larger frame, so steady-state capture does not allocate.
+Each finished observation joins a fixed-capacity FIFO, sized at construction to
+`ceil(2 * period_us * fps / 1e6) + 2` (4 at 10 ms and 60 fps): the results that
+finish between two collections, one per frame period plus the one in progress,
+over two node periods (a late tick, or a collection whose try-lock met the
+worker storing), and one more slot for a disconnect's invalid observation.
+That covers a camera delivering at `camera.fps` whose frames are all captured
+inside the window; a live window can also finish the frame in progress and
+the one waiting in the mailbox from before it, and a camera faster than
+`camera.fps` finishes more, so a frame can still be evicted (and counted).
+Each update takes every queued result and publishes them in
+capture order, each with its own stamp, so a result is never replaced by a
+newer one while the loop keeps up; when the queue is full the oldest is
+dropped and counted, keeping the newest. `frames_processed_count` counts the
+observations the loop took. `frames_dropped_count`
+is the mailbox's single count of every frame that never reached a published
+observation: a ready frame replaced before the worker took it, a frame without
+an image, errored or short driver buffers the source reports, frames discarded
+with a retired capture session, and a finished observation evicted from the
+full result queue. Once no frame is in flight (mailbox, worker, result queue),
+processed + dropped equals captured plus the driver buffers the source
+dropped; for a simulated camera, captured plus the deadlines a slow tick
+skipped. Shutdown wakes and joins the worker,
 which stops capture before exiting. `--describe` never opens a camera.
 
-One observation is published per processed frame delivered to the loop, stamped
-with that frame's capture time minus `camera.latency_offset_us * 1000`.
+One observation is published per processed frame delivered to the loop (an
+update may publish several), stamped
+with the best-estimate mid-exposure time under the source-kind rule above.
 Missing tags and rejected estimates publish
 `valid = false`, never a held valid pose. Invalid detections are excluded from
 visibility and localization before range checking; valid camera-to-tag ranges
@@ -292,13 +376,10 @@ mean frame periods and node-clock corrected-stamp-to-publication latency in
 integer microseconds (`last_latency_us`). Simulated latency is elapsed node time
 since the corrected truth stamp, not necessarily zero; it includes delivery lag
 when that bias is corrected. Invalid underflow/future timestamps report zero
-latency and never publish a valid pose. Simulation replay uses
-`--sim --replay <log>`; no wall clock enters its outputs.
+latency, stale live stamps report their age, and neither publishes a valid
+pose. Simulation replay uses
+`--sim --replay <log>`; with `rasterize = false` no wall clock enters its
+outputs.
 
-Framework telemetry supports every scalar in the status schema and observes all
-four camera streams. Its observers intentionally do not count as control
-consumers: graph lint reports the four status-only warnings. Eight scalar status
-channels per camera preserve the robot's radio-budget check; the status uses the
-enclosing log/telemetry timestamp instead of duplicating it as a scalar.
+See [DATA_FLOW](../../../docs/DATA_FLOW.md) for telemetry transport and budgets.
 `range_rejected_count` counts detections culled before localization.
-There is no side-channel vision server.

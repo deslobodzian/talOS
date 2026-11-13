@@ -6,8 +6,60 @@
 #include <utility>
 
 #include "config_wire.h"
+#include "feedback.h"
+#include "gate.h"
 
 namespace talos::hardware {
+namespace {
+// Whether `c` addresses exactly the configured outputs, in manifest order, and
+// drives none of them: motors neutral with zero demand and feedforward, digital
+// outputs off, PWM outputs zero. The bridge forwards this merge while every
+// node's devices layer flushes neutral.
+bool DrivesNothing(const Command& c, const Config& config) {
+  if (c.count != config.motors.size() ||
+      c.digital_output_count != config.digital_outputs.size() ||
+      c.pwm_output_count != config.pwm_outputs.size()) {
+    return false;
+  }
+  for (std::size_t i = 0; i < c.count; ++i) {
+    const auto& r = c.motors[i];
+    if (r.id != config.motors[i].id || r.mode != Mode::kNeutral || r.slot > 2 ||
+        r.demand != 0 || r.feedforward_v != 0) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < c.digital_output_count; ++i) {
+    if (c.digital_outputs[i].id != config.digital_outputs[i].id ||
+        c.digital_outputs[i].value) {
+      return false;
+    }
+  }
+  for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
+    if (c.pwm_outputs[i].id != config.pwm_outputs[i].id ||
+        c.pwm_outputs[i].output != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// A State no Backend::Read filled: the gateway reads no device while a
+// configure runs or after one failed, and none under a new configuration
+// before its first Read. Every motor and CAN-sensor sample is invalid with zero
+// measurements (MarkInvalid); every RIO device sample and the health sample
+// is invalid, its value as last read.
+void MarkUnread(State& state) {
+  for (auto& m : state.motors) MarkInvalid(m);
+  for (auto& sensor : state.sensors) MarkInvalid(sensor);
+  for (auto& input : state.digital_inputs) input.valid = false;
+  for (auto& output : state.digital_outputs) output.valid = false;
+  for (auto& input : state.analog_inputs) input.valid = false;
+  for (auto& encoder : state.encoders) encoder.valid = false;
+  for (auto& output : state.pwm_outputs) output.valid = false;
+  state.health.valid = false;
+}
+}  // namespace
+
 Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
     : config_{std::move(config)}, backend_{backend} {
   state_.config_id = ConfigurationId(config_);
@@ -48,6 +100,9 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
   fault_ = !configured_;
   if (!configured_) config_error_ = backend_.last_config_error();
   backend_.Neutral();
+  unavailable_ = backend_.UnavailableDevices();
+  restore_waiting_ = !unavailable_.empty();
+  restore_retry_at_ = kRestoreInitialBackoffUs;
 }
 Gateway::Gateway(Backend& backend, uint64_t boot_id) : backend_{backend} {
   if (boot_id == 0) {
@@ -60,9 +115,10 @@ Gateway::Gateway(Backend& backend, uint64_t boot_id) : backend_{backend} {
   backend_.Neutral();
 }
 bool Gateway::Reconfigure(const Config& config) {
-  if (restoring_) return false;
+  if (restoring_ || configuring_) return false;
   // Repeated pushes never touch devices, including after a restart enabled.
   if (configured_ && config == config_) {
+    if (enabled_ && fault_) return false;
     fault_ = false;
     consecutive_apply_failures_ = 0;
     config_error_.reset();
@@ -90,6 +146,30 @@ bool Gateway::Reconfigure(const Config& config) {
     backend_.Neutral();
     return false;
   }
+  CommitConfiguration(config);
+  return true;
+}
+
+bool Gateway::BeginReconfigure(const Config& config) {
+  if (configuring_ || restoring_) return false;
+  if (configured_ && config == config_) return Reconfigure(config);
+  if (enabled_) return false;
+  try {
+    Validate(config);
+  } catch (...) {
+    return false;
+  }
+  if (!CheckCeilings(config).ok) return false;
+  Invalidate();
+  configured_ = false;
+  healthy_ = false;
+  pending_config_ = config;
+  configuring_ = true;
+  backend_.BeginConfigure(pending_config_);
+  return true;
+}
+
+void Gateway::CommitConfiguration(const Config& config) {
   config_ = config;
   state_.config_id = ConfigurationId(config_);
   state_.motor_count = config_.motors.size();
@@ -124,8 +204,17 @@ bool Gateway::Reconfigure(const Config& config) {
   fault_ = false;
   consecutive_apply_failures_ = 0;
   config_error_.reset();
+  unavailable_ = backend_.UnavailableDevices();
+  restore_waiting_ = !unavailable_.empty();
+  restore_retry_at_ = state_.sample_time_us + kRestoreInitialBackoffUs;
+  restore_backoff_us_ = kRestoreInitialBackoffUs;
+  last_requests_.fill(MotorRequest{});
+  motor_drives_from_.fill(0);
+  position_reference_.fill(PositionReference{});
+  // What the slots hold was read under the old configuration, maybe for
+  // other devices: nothing is a sample until this one's first Read.
+  MarkUnread(state_);
   Invalidate();
-  return true;
 }
 void Gateway::Invalidate() {
   active_ = false;
@@ -133,45 +222,261 @@ void Gateway::Invalidate() {
   ++state_.epoch;
   backend_.Neutral();
 }
-void Gateway::PollResets() {
-  if (restoring_) {
-    if (restore_waiting_) {
-      if (state_.sample_time_us < restore_retry_at_) return;
-      restore_waiting_ = false;
-      ++restore_attempt_count_;
-      backend_.BeginRestoreAfterReset();
+bool Gateway::DeviceUnavailable(uint16_t id) const {
+  return std::find(unavailable_.begin(), unavailable_.end(), id) !=
+         unavailable_.end();
+}
+
+void Gateway::MaskMotor(std::size_t i) {
+  state_.motors[i].valid = false;
+  // Its frame may restart before it returns: the first sample after that
+  // is a new reference, not a jump from this one.
+  position_reference_[i].valid = false;
+}
+
+void Gateway::MaskUnavailable() {
+  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+    if (DeviceUnavailable(config_.sensors[i].id))
+      state_.sensors[i].valid = false;
+  }
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const auto& motor = config_.motors[i];
+    if (DeviceUnavailable(motor.id) ||
+        (motor.feedback == Feedback::kRemoteCANcoder &&
+         DeviceUnavailable(motor.feedback_sensor_id))) {
+      MaskMotor(i);
+    }
+  }
+  // After every master is masked: config refuses follower chains, so a
+  // master is never a follower.
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    if (MasterSampleInvalid(config_.motors, state_, i)) MaskMotor(i);
+  }
+  // A command observed no later than a State in which a motor could not
+  // drive never drives it, whatever its feedback shows when it arrives.
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    if (!MayDrive(i)) motor_drives_from_[i] = state_.sample_time_us + 1;
+  }
+}
+
+bool Gateway::MayDrive(std::size_t i) const {
+  return MotorMayDrive(config_.motors, state_, i);
+}
+
+bool Gateway::ApplyMotors(std::span<const MotorRequest> requests) {
+  if (!backend_.Apply(requests)) return false;
+  const auto failed = backend_.ApplyFailedDevices();
+  // An empty motor configuration still allows independent DIO/PWM owners.
+  return requests.empty() ||
+         !std::all_of(requests.begin(), requests.end(), [&](const auto& r) {
+           return std::find(failed.begin(), failed.end(), r.id) != failed.end();
+         });
+}
+
+void Gateway::NeutralUnavailable() {
+  // A neutral pass may expose another failing motor; each extra pass isolates
+  // at least one more configured motor, so this is bounded by the motor count.
+  while (true) {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (!MayDrive(i)) {
+        last_requests_[i] = MotorRequest{config_.motors[i].id, Mode::kNeutral};
+      }
+    }
+    if (!active_) return;
+    if (!ApplyMotors({last_requests_.data(), config_.motors.size()})) {
+      ++state_.counters.apply_failure_count;
+      fault_ = ++consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit;
+      Invalidate();
       return;
     }
+    if (!IsolateFailedMotors()) return;
+    MaskUnavailable();
+  }
+}
+
+bool Gateway::IsolateFailedMotors() {
+  bool isolated = false;
+  for (const auto id : backend_.ApplyFailedDevices()) {
+    const bool motor =
+        std::any_of(config_.motors.begin(), config_.motors.end(),
+                    [id](const MotorConfig& m) { return m.id == id; });
+    if (!motor || DeviceUnavailable(id)) continue;
+    // Same quarantine as a device reset: masked, dependents neutral, restored
+    // with backoff, and only a post-isolation observation re-authorizes it.
+    std::erase(restoring_ids_, id);
+    unavailable_.push_back(id);
+    isolated = true;
+  }
+  if (isolated) {
+    restore_waiting_ = true;
+    restore_retry_at_ = std::max(restore_retry_at_, state_.sample_time_us);
+  }
+  return isolated;
+}
+
+void Gateway::PollResets() {
+  if (!configured_) return;
+  if (restoring_) {
     const auto result = backend_.PollRestore();
-    if (result == Backend::RestoreStatus::kPending) return;
-    if (result == Backend::RestoreStatus::kFailed) {
-      configured_ = false;
-      config_error_ = backend_.last_config_error();
-      restore_waiting_ = true;
+    if (result != Backend::RestoreStatus::kPending) {
+      restoring_ = false;
+      // This tick's State was read before the restore ended, whatever the
+      // backend reported for the chain in it. Masked here, the chain may
+      // drive again only on a command observing a State read after the
+      // restore (MaskUnavailable sets motor_drives_from_ past this one).
+      for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+        if (std::find(restoring_ids_.begin(), restoring_ids_.end(),
+                      config_.sensors[i].id) != restoring_ids_.end()) {
+          state_.sensors[i].valid = false;
+        }
+      }
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (RestoredWith(config_.motors, i, restoring_ids_)) MaskMotor(i);
+      }
+      if (result == Backend::RestoreStatus::kDone) {
+        const auto remaining = backend_.UnavailableDevices();
+        std::erase_if(unavailable_, [&](uint16_t id) {
+          return std::find(restoring_ids_.begin(), restoring_ids_.end(), id) !=
+                     restoring_ids_.end() &&
+                 std::find(remaining.begin(), remaining.end(), id) ==
+                     remaining.end();
+        });
+        for (auto id : remaining)
+          if (!DeviceUnavailable(id)) unavailable_.push_back(id);
+      }
+      restore_waiting_ = !unavailable_.empty();
       restore_retry_at_ = state_.sample_time_us + restore_backoff_us_;
       restore_backoff_us_ =
           std::min(restore_backoff_us_ * 2, kRestoreMaxBackoffUs);
-    } else {
-      restoring_ = false;
-      configured_ = true;
-      fault_ = false;
-      consecutive_apply_failures_ = 0;
-      config_error_.reset();
     }
-    return;
   }
-  if (!configured_) return;
+  // Keep detecting new resets even while a previous device is being restored.
   std::vector<uint16_t> reset_ids;
-  if (!backend_.PollDeviceResets(reset_ids) || reset_ids.empty()) return;
-  state_.counters.device_reset_count += reset_ids.size();
-  Invalidate();
-  restoring_ = true;
-  restore_backoff_us_ = kRestoreInitialBackoffUs;
-  ++restore_attempt_count_;
-  backend_.BeginRestoreAfterReset();
+  if (!backend_.PollDeviceResets(reset_ids)) reset_ids.clear();
+  FindPositionJumps(reset_ids);
+  if (!reset_ids.empty()) {
+    state_.counters.device_reset_count += reset_ids.size();
+    if (unavailable_.empty()) restore_backoff_us_ = kRestoreInitialBackoffUs;
+    for (auto id : reset_ids) {
+      std::erase(restoring_ids_, id);
+      if (!DeviceUnavailable(id)) unavailable_.push_back(id);
+    }
+    restore_waiting_ = true;
+    restore_retry_at_ = state_.sample_time_us;
+  }
+  MaskUnavailable();
+  // A motor that cannot drive goes neutral in this tick, not at the next
+  // command: between commands the backend keeps the last request it sent.
+  bool neutralize = !reset_ids.empty();
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    neutralize = neutralize ||
+                 (last_requests_[i].mode != Mode::kNeutral && !MayDrive(i));
+  }
+  if (neutralize) NeutralUnavailable();
+  if (!restoring_ && restore_waiting_ &&
+      state_.sample_time_us >= restore_retry_at_) {
+    restore_waiting_ = false;
+    restoring_ = true;
+    ++restore_attempt_count_;
+    restoring_ids_ = unavailable_;
+    backend_.BeginRestoreAfterReset(restoring_ids_);
+  }
+}
+
+// A TalonFX reset restarts its rotor position at zero wherever the mechanism
+// is, and Phoenix can deliver the restarted position frames before
+// HasResetOccurred() reports the reset. A rotor-feedback motor (always a
+// "rezero" position frame) whose valid position moved farther since its last
+// valid sample than kMaxRotorRps allows is therefore a reset too. The
+// interval runs from the earliest time the earlier sample can have been taken
+// (its tick minus its age), so a held frame or a gap of invalid samples
+// widens the bound instead of tripping it, to when this tick's feedback was
+// read. A step is taken modulo kPositionSpanRot, so a wrap of Phoenix's
+// fixed-point position is never a jump. Remote CANcoder motors are
+// not checked: the gateway cannot tell an absolute frame from a rezero one,
+// and their position can step legitimately when the TalonFX's remote sensor
+// frames resume.
+void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
+  if (!backend_.PositionsArePhysical()) return;
+  const uint64_t now = state_.sample_time_us;
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    const auto& m = config_.motors[i];
+    const auto& sample = state_.motors[i];
+    auto& reference = position_reference_[i];
+    // An invalid sample keeps the reference, so a reset is still caught when
+    // feedback returns; a masked motor's reference is dropped when masked.
+    if (m.feedback != Feedback::kRotor || DeviceUnavailable(m.id) ||
+        !sample.valid || !std::isfinite(sample.position_rot) ||
+        std::find(reset_ids.begin(), reset_ids.end(), m.id) !=
+            reset_ids.end()) {
+      continue;
+    }
+    if (reference.valid && read_us_ >= reference.earliest_us) {
+      // Phoenix applies only SensorToMechanismRatio to rotor feedback; the
+      // physics simulator divides by both ratios, faster when the rotor
+      // ratio is below 1.
+      const double rotor_per_mechanism =
+          m.sensor_to_mechanism_ratio * std::min(1.0, m.rotor_to_sensor_ratio);
+      const double interval_s =
+          static_cast<double>(read_us_ - reference.earliest_us +
+                              kPositionJumpSlackUs) *
+          1e-6;
+      const double step = std::remainder(
+          sample.position_rot - reference.position_rot, kPositionSpanRot);
+      if (std::abs(step) > kMaxRotorRps / rotor_per_mechanism * interval_s) {
+        reset_ids.push_back(m.id);
+        reference.valid = false;
+        continue;
+      }
+    }
+    reference = {
+        .valid = true,
+        .position_rot = sample.position_rot,
+        .earliest_us = now - std::min<uint64_t>(now, sample.position_age_us)};
+  }
+}
+
+// The backend judged each sample's status, value and isolation; the age bound
+// is the gateway's, the same for every backend. Returns whether any configured
+// motor or CAN sensor still has valid feedback (true with none configured):
+// false is total loss.
+bool Gateway::JudgeFeedbackAge() {
+  const uint64_t bound = config_.command_timeout_us;
+  const auto fresh = [bound](const auto& sample) {
+    return FeedbackFresh(sample.position_age_us, bound) &&
+           FeedbackFresh(sample.velocity_age_us, bound);
+  };
+  for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+    auto& sample = state_.motors[i];
+    sample.valid = sample.valid && fresh(sample);
+  }
+  for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+    auto& sample = state_.sensors[i];
+    sample.valid = sample.valid && fresh(sample);
+  }
+  return AnyFeedbackValid(state_);
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
+  // Every tick, whether or not its State reaches the link, so a consumer
+  // that sees sequence + 1 knows it missed nothing in between.
+  ++state_.sequence;
+  state_.sample_time_us = now;
+  if (configuring_) {
+    const auto status = backend_.PollConfigure();
+    if (status == Backend::ConfigureStatus::kPending) {
+      enabled_ = enabled;
+      return;
+    }
+    configuring_ = false;
+    if (status == Backend::ConfigureStatus::kDone) {
+      CommitConfiguration(pending_config_);
+    } else {
+      fault_ = true;
+      config_error_ = backend_.last_config_error();
+      backend_.Neutral();
+    }
+  }
   if (enabled != enabled_) {
     if (enabled && !enabled_ &&
         consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit) {
@@ -187,24 +492,55 @@ void Gateway::Tick(uint64_t now, bool enabled) {
     Invalidate();
   }
   state_.sample_time_us = now;
-  healthy_ = (configured_ || restoring_) && backend_.Read(state_);
-  if (!healthy_ && active_) Invalidate();
+  const bool was_healthy = healthy_;
+  // Judged before PollResets masks anything (Backend::Read).
+  const bool read = configured_ && backend_.Read(state_);
+  healthy_ = configured_ && JudgeFeedbackAge() && read;
+  read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
+  // Total loss starts a new epoch whether or not a command is in force: a
+  // request built from a State before it must never drive after it.
+  if (!healthy_ && (was_healthy || active_)) Invalidate();
   PollResets();
-  if (!enabled_ || !config_.commissioned || fault_ || !healthy_ ||
-      !configured_ || restoring_) {
+  // A watchdog stop is not a one-shot: with no accepted command in force,
+  // refresh neutral every tick (as disabled/fault do) so a dropped neutral is
+  // retried until a fresh command supersedes it.
+  if (!active_ || !enabled_ || !config_.commissioned || fault_ || !healthy_ ||
+      !configured_) {
     backend_.Neutral();
   }
 }
 
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
-  if (!configured_ || !config_.commissioned || !enabled_ || fault_ ||
-      restoring_ || !healthy_ || c.config_id != state_.config_id ||
-      c.boot_id != state_.boot_id || c.epoch != state_.epoch ||
-      c.observed_time_us > state_.sample_time_us || c.observed_time_us > now ||
-      now - c.observed_time_us >= config_.command_timeout_us ||
-      (have_sequence_ && sequence <= state_.last_command_sequence) ||
-      c.count != config_.motors.size()) {
-    ++state_.counters.rejected_command_count;
+  // Wrong whether or not the gateway takes commands now: another identity, an
+  // expired or future observation, a replayed sequence or another manifest
+  // size; then another epoch.
+  const bool matched_but_epoch =
+      c.config_id == state_.config_id && c.boot_id == state_.boot_id &&
+      c.observed_time_us <= state_.sample_time_us &&
+      c.observed_time_us <= now &&
+      now - c.observed_time_us < config_.command_timeout_us &&
+      !(have_sequence_ && sequence <= state_.last_command_sequence) &&
+      c.count == config_.motors.size();
+  const bool mismatched = !matched_but_epoch || c.epoch != state_.epoch;
+  // A neutral the bridge built from a State read before this epoch began,
+  // with no command accepted since: an enable or a disable, for example,
+  // starts the epoch in the tick that drains it. Refusing it is the epoch
+  // rule working, not a rejection, so it is not counted. Epoch 0 is never
+  // issued.
+  const bool superseded_neutral = matched_but_epoch && c.epoch != 0 &&
+                                  c.epoch < state_.epoch && !active_ &&
+                                  DrivesNothing(c, config_);
+  if (!configured_ || !config_.commissioned || !enabled_) {
+    // While the robot cannot drive, every node flushes neutral and the bridge
+    // keeps forwarding the merge. Refusing that is this gate working, not a
+    // rejection: counting it would bury the real ones.
+    if (!superseded_neutral && (mismatched || !DrivesNothing(c, config_))) {
+      ++state_.counters.rejected_command_count;
+    }
+    return false;
+  }
+  if (fault_ || configuring_ || !healthy_ || mismatched) {
+    if (!superseded_neutral) ++state_.counters.rejected_command_count;
     return false;
   }
   // Structure errors reject the transaction; range/feedback errors isolate a
@@ -218,18 +554,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
-    bool feedback_valid = state_.motors[i].valid;
-    if (m.feedback == Feedback::kRemoteCANcoder) {
-      bool sensor_valid = false;
-      for (std::size_t j = 0; j < state_.sensor_count; ++j) {
-        const auto& sensor = state_.sensors[j];
-        if (sensor.id == m.feedback_sensor_id) {
-          sensor_valid = sensor.valid;
-          break;
-        }
-      }
-      feedback_valid &= sensor_valid;
-    }
+    const bool feedback_valid = MotorFeedbackValid(config_.motors, state_, i) &&
+                                c.observed_time_us >= motor_drives_from_[i];
     const bool invalid =
         (r.mode != Mode::kNeutral && !feedback_valid) ||
         !std::isfinite(r.demand) || !std::isfinite(r.feedforward_v) ||
@@ -252,13 +578,15 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto master_id = config_.motors[i].master_id;
     if (master_id == 0) continue;
+    const bool valid = MotorFeedbackValid(config_.motors, state_, i) &&
+                       c.observed_time_us >= motor_drives_from_[i];
     for (std::size_t j = 0; j < c.count; ++j) {
-      if (config_.motors[j].id == master_id &&
-          requests[j].mode == Mode::kNeutral) {
-        requests[i] =
-            MotorRequest{config_.motors[i].id, Mode::kNeutral, 0, 0, 0};
-        break;
-      }
+      if (config_.motors[j].id != master_id) continue;
+      // Backends follow the master's output only for a non-neutral follower
+      // request. Independent follower demands remain ignored.
+      requests[i] = MotorRequest{config_.motors[i].id,
+                                 valid ? requests[j].mode : Mode::kNeutral};
+      break;
     }
   }
   if (c.digital_output_count != config_.digital_outputs.size() ||
@@ -281,9 +609,10 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     }
   }
   for (std::size_t i = 0; i < c.count; ++i) {
-    if (requests[i] != c.motors[i]) ++state_.counters.neutralized_motor_count;
+    if (requests[i].mode == Mode::kNeutral && requests[i] != c.motors[i])
+      ++state_.counters.neutralized_motor_count;
   }
-  if (!backend_.Apply({requests.data(), c.count}) ||
+  if (!ApplyMotors({requests.data(), c.count}) ||
       !backend_.ApplyOutputs({c.digital_outputs.data(), c.digital_output_count},
                              {c.pwm_outputs.data(), c.pwm_output_count})) {
     ++state_.counters.apply_failure_count;
@@ -291,21 +620,38 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     Invalidate();
     return false;
   }
-  consecutive_apply_failures_ = 0;
+  last_requests_ = requests;
   active_ = true;
   have_sequence_ = true;
   accepted_at_ = now;
   observed_at_ = c.observed_time_us;
   state_.last_command_sequence = sequence;
-  return true;
+  // Device-local send failures quarantine only the failed chain; the rest of
+  // this command stays applied.
+  if (IsolateFailedMotors()) {
+    MaskUnavailable();
+    NeutralUnavailable();
+  }
+  if (active_) consecutive_apply_failures_ = 0;
+  return active_;
 }
 State Gateway::snapshot() const {
   State s = state_;
+  if (!configured_) MarkUnread(s);
+  // A motor or CAN sensor sample marked invalid carries zero in every
+  // measured field, wherever it was invalidated (the backend, the age bound,
+  // a mask), so no reader takes a frozen value for a measurement. Only the
+  // published copy: reset detection skips invalid samples either way.
+  for (auto& m : s.motors) {
+    if (!m.valid) MarkInvalid(m);
+  }
+  for (auto& sensor : s.sensors) {
+    if (!sensor.valid) MarkInvalid(sensor);
+  }
   s.flags = (configured_ && config_.commissioned ? kConfigured : 0u) |
             (configured_ && enabled_ ? kEnabled : 0u) |
             (active_ ? kCommandActive : 0u) |
-            (fault_ || restoring_ || (!healthy_ && configured_) ? kHardwareFault
-                                                                : 0u);
+            (fault_ || (!healthy_ && configured_) ? kHardwareFault : 0u);
   return s;
 }
 }  // namespace talos::hardware
