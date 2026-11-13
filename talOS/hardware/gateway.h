@@ -68,7 +68,10 @@ class Backend {
   // Individual device resets. Returns true and fills reset_ids with
   // the logical IDs of devices that reset since the last poll. The gateway
   // neutralizes only affected motors and their dependents before restoring;
-  // their old observations cannot authorize motion after recovery.
+  // their old observations cannot authorize motion after recovery. It masks
+  // the restored chain in every State read before PollRestore reports the
+  // restore ended, that tick's included, whatever Read reported for it, so
+  // only a command observing a State read after the restore drives it.
   virtual bool PollDeviceResets(std::vector<uint16_t>& reset_ids) {
     reset_ids.clear();
     return false;
@@ -168,6 +171,9 @@ class Gateway {
   void PollResets();
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);
   bool DeviceUnavailable(uint16_t id) const;
+  // Marks motor `i`'s sample in this tick's State invalid and drops its
+  // position reference.
+  void MaskMotor(std::size_t i);
   void MaskUnavailable();
   // MotorMayDrive (gate.h) in this tick's State.
   bool MayDrive(std::size_t i) const;
@@ -190,7 +196,8 @@ class Gateway {
   std::vector<uint16_t> restoring_ids_;
   std::array<MotorRequest, kMaxMotors> last_requests_{};
   // Per motor, the earliest observation time a command may drive it on: one
-  // past the last State in which it could not drive (MayDrive false).
+  // past the last State in which it could not drive (MayDrive false), the
+  // State of the tick its restore ended included (PollResets masks it).
   std::array<uint64_t, kMaxMotors> motor_drives_from_{};
   // A rotor-feedback motor's last valid position since the gateway last
   // masked it, and the earliest time that sample can have been taken.

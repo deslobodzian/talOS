@@ -227,29 +227,30 @@ bool Gateway::DeviceUnavailable(uint16_t id) const {
          unavailable_.end();
 }
 
+void Gateway::MaskMotor(std::size_t i) {
+  state_.motors[i].valid = false;
+  // Its frame may restart before it returns: the first sample after that
+  // is a new reference, not a jump from this one.
+  position_reference_[i].valid = false;
+}
+
 void Gateway::MaskUnavailable() {
   for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
     if (DeviceUnavailable(config_.sensors[i].id))
       state_.sensors[i].valid = false;
   }
-  const auto mask = [this](std::size_t i) {
-    state_.motors[i].valid = false;
-    // Its frame may restart before it returns: the first sample after that
-    // is a new reference, not a jump from this one.
-    position_reference_[i].valid = false;
-  };
   for (std::size_t i = 0; i < config_.motors.size(); ++i) {
     const auto& motor = config_.motors[i];
     if (DeviceUnavailable(motor.id) ||
         (motor.feedback == Feedback::kRemoteCANcoder &&
          DeviceUnavailable(motor.feedback_sensor_id))) {
-      mask(i);
+      MaskMotor(i);
     }
   }
   // After every master is masked: config refuses follower chains, so a
   // master is never a follower.
   for (std::size_t i = 0; i < config_.motors.size(); ++i) {
-    if (MasterSampleInvalid(config_.motors, state_, i)) mask(i);
+    if (MasterSampleInvalid(config_.motors, state_, i)) MaskMotor(i);
   }
   // A command observed no later than a State in which a motor could not
   // drive never drives it, whatever its feedback shows when it arrives.
@@ -319,6 +320,19 @@ void Gateway::PollResets() {
     const auto result = backend_.PollRestore();
     if (result != Backend::RestoreStatus::kPending) {
       restoring_ = false;
+      // This tick's State was read before the restore ended, whatever the
+      // backend reported for the chain in it. Masked here, the chain may
+      // drive again only on a command observing a State read after the
+      // restore (MaskUnavailable sets motor_drives_from_ past this one).
+      for (std::size_t i = 0; i < config_.sensors.size(); ++i) {
+        if (std::find(restoring_ids_.begin(), restoring_ids_.end(),
+                      config_.sensors[i].id) != restoring_ids_.end()) {
+          state_.sensors[i].valid = false;
+        }
+      }
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (RestoredWith(config_.motors, i, restoring_ids_)) MaskMotor(i);
+      }
       if (result == Backend::RestoreStatus::kDone) {
         const auto remaining = backend_.UnavailableDevices();
         std::erase_if(unavailable_, [&](uint16_t id) {
