@@ -74,7 +74,7 @@ Climb as far as the change reaches; never skip a rung below it.
 | 0 | `task` | the narrow target its brief names | while implementing |
 | 1 | main session | `bazel test //touched/package:all` | after integrating each slice |
 | 2 | main session | the affected tests (below), and `--describe-only` on each affected config | before each commit |
-| 3 | main session | RULES.md 11 in full | before each push, from a clean worktree of the commits to push |
+| 3 | main session | RULES.md 11 in full: `tools/prepush.sh` | before each push, from a clean worktree of the commits to push |
 | 4 | CI | the workflows on the pushed commit ([TESTING.md §9](TESTING.md#9-lanes-and-ci)) | on push |
 | 5 | bench or robot | the [BENCH.md](BENCH.md) or [BRINGUP.md](BRINGUP.md) check a TODO.md item names | for a requirement verified by measurement |
 
@@ -90,6 +90,17 @@ host; the query then exits 3 with a usable partial result. A change with no
 affected tests (docs only) skips the test step: rung 2 is then
 `--describe-only` if a config changed and `python3 tools/check_links.py`
 (every relative link and anchor resolves).
+
+Rung 3 is `tools/prepush.sh [--ref <commit>]`. It checks the commit out in a
+new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
+CI's own step, runs `bazel build //...` and `bazel test //...` with no
+cached test result (build results come from the disk cache
+`~/.cache/talos-bazel-disk`), checks that they left the worktree unchanged,
+and runs the gradle and pnpm checks when the commits to push touch the
+RoboRIO program, `talOS/hardware`, `talOS/protocol` or `studio/`; every
+config's `--describe-only` runs as its `talos_graph_test`. It prints one
+line per step and exits nonzero if any failed; the script's header lists
+its flags and steps.
 
 A local macOS run does not exercise the Linux paths (`epoll`, glibc
 allocation counting, `clang-tidy`): say so in `Tests:`; such a change is

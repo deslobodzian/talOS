@@ -258,3 +258,20 @@ py_test(
     legacy_create_init = False,
     main = "slow_tests_test.py",
 )
+
+# tools/prepush.sh [--ref C] [--keep] [--skip-gradle] [--skip-studio]
+# (docs/DEVELOPMENT.md §5 rung 3) RULES.md 11's pre-push checks on a clean,
+# read-only worktree of the commit; tools/make_sources_read_only.py is CI's
+# read-only step. The test runs it with a stub bazel against a throwaway
+# repository.
+py_test(
+    name = "prepush_test",
+    size = "small",
+    srcs = ["prepush_test.py"],
+    data = [
+        "make_sources_read_only.py",
+        "prepush.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
