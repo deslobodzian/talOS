@@ -580,10 +580,12 @@ TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
 
   const auto alpha = ManifestRuns(manifest, "alpha");
   ASSERT_EQ(alpha.size(), 2u) << manifest;
-  EXPECT_NE(alpha[0].find("\"reason\": \"crash\", \"wake_failures\": 3, "
-                          "\"stalled_arms\": 1, \"wake_fallbacks\": 2, "
-                          "\"requests_skipped\": 0}"),
-            std::string::npos)
+  EXPECT_NE(
+      alpha[0].find("\"reason\": \"crash\", \"stopped_by_session\": false, "
+                    "\"wake_failures\": 3, "
+                    "\"stalled_arms\": 1, \"wake_fallbacks\": 2, "
+                    "\"requests_skipped\": 0}"),
+      std::string::npos)
       << "the crashed run keeps its last counts: " << alpha[0];
   EXPECT_NE(alpha[1].find("\"wake_failures\": 5, \"stalled_arms\": 4, "
                           "\"wake_fallbacks\": 7, \"requests_skipped\": 0}"),
@@ -665,10 +667,12 @@ TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
 
   const auto alpha = ManifestRuns(manifest, "alpha");
   ASSERT_EQ(alpha.size(), 1u) << manifest;
-  EXPECT_NE(alpha[0].find("\"reason\": \"stop\", \"wake_failures\": 2, "
-                          "\"stalled_arms\": 1, \"wake_fallbacks\": 3, "
-                          "\"requests_skipped\": 0}"),
-            std::string::npos)
+  EXPECT_NE(
+      alpha[0].find("\"reason\": \"stop\", \"stopped_by_session\": false, "
+                    "\"wake_failures\": 2, "
+                    "\"stalled_arms\": 1, \"wake_fallbacks\": 3, "
+                    "\"requests_skipped\": 0}"),
+      std::string::npos)
       << "the run's counts as it ended: " << alpha[0];
   const auto bridge = ManifestEntry(manifest, "hardware_node");
   EXPECT_NE(bridge.find("\"requests_skipped_by_subsystem\": {\"alpha\": 6}"),
@@ -1228,10 +1232,99 @@ TEST(Supervision, AMemberEndedByTheStopsOwnSignalLeavesTheSessionClean) {
       << alpha;
   const auto alpha_runs = ManifestRuns(manifest, "alpha");
   ASSERT_EQ(alpha_runs.size(), 1u) << manifest;
-  EXPECT_NE(alpha_runs[0].find("\"reason\": \"stop\""), std::string::npos)
+  EXPECT_NE(alpha_runs[0].find("\"reason\": \"stop\", "
+                               "\"stopped_by_session\": true"),
+            std::string::npos)
       << alpha_runs[0];
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+}
+
+// A signal from elsewhere that ends a member during the stop, before the
+// stop's own SIGINT could (systemd's default KillMode=control-group sends
+// every process of the unit SIGTERM along with the launcher), is recorded
+// with reason stop but not as stopped by the session, and the session ends
+// nonzero: the manifest's stopped_by_session and the exit status agree.
+// alpha ignores SIGINT, so only the test's SIGTERM can end it, and the
+// supervision clock is held, so the stop timeout's SIGKILL cannot come
+// first. Its peers handle the stop and exit 0.
+// REQ-OPS-06
+TEST(Supervision, AStopSignalFromElsewhereIsNotTheSessionsStop) {
+  auto options = BaseOptions("foreign_stop");
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  clock.Freeze();
+  options.supervision_clock = clock.clock();
+  const auto runs = TempPath("foreign_stop_runs");
+  const auto alpha_pid = TempPath("foreign_stop_alpha_pid");
+  ::remove(runs.c_str());
+  ::remove(alpha_pid.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("foreign_stop_hardware", TrappedRun(runs, kLoopUntilStopped),
+                "hardware_node");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("foreign_stop_beta", TrappedRun(runs, kLoopUntilStopped));
+  // Builtins only until the exec; the sleep inherits the ignored SIGINT.
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("foreign_stop_alpha", "trap '' INT\necho $$ > " + alpha_pid +
+                                          "\necho ready >> " + alpha_pid +
+                                          "\nexec sleep 600\n");
+  const std::string live = options.output_dir + "/" +
+                           std::to_string(options.session_id) +
+                           "/manifest.json";
+  const auto ended_by_stop = [](const std::string& manifest,
+                                std::string_view name) {
+    const auto history = ManifestRuns(manifest, name);
+    return history.size() == 1 &&
+           history[0].find("\"reason\": \"stop\"") != std::string::npos;
+  };
+  bool interrupted = false;
+  // SIGTERMs alpha's group once the stop's SIGINT has ended its peers.
+  std::jthread interrupter{[&](const std::stop_token& stop) {
+    // A give-up lets the clock run on, so the stop timeout ends alpha.
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (!stop.stop_requested() &&
+           std::chrono::steady_clock::now() < give_up) {
+      const std::string manifest = ReadFile(live);
+      const auto lines = ReadLines(alpha_pid);
+      pid_t pid = 0;
+      if (ended_by_stop(manifest, "hardware_node") &&
+          ended_by_stop(manifest, "beta") && lines.size() == 2 &&
+          std::from_chars(lines[0].data(), lines[0].data() + lines[0].size(),
+                          pid)
+                  .ec == std::errc{}) {
+        interrupted = ::kill(-pid, SIGTERM) == 0;
+        return;
+      }
+      std::this_thread::sleep_for(2ms);
+    }
+  }};
+  std::string seen;
+  const int status = RunSessionUntil(
+      options,
+      [&](const std::string&) {
+        const auto lines = ReadLines(alpha_pid);
+        return ReadLines(runs).size() == 2 && lines.size() == 2 &&
+               lines[1] == "ready";
+      },
+      seen);
+  interrupter.request_stop();
+  interrupter.join();
+  EXPECT_FALSE(seen.empty()) << "the session ended before every member ran";
+  EXPECT_TRUE(interrupted) << "alpha was never sent the SIGTERM";
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_NE(status, 0) << manifest;
+  const auto alpha_runs = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha_runs.size(), 1u) << manifest;
+  EXPECT_NE(alpha_runs[0].find("\"exit_signal\": " + std::to_string(SIGTERM) +
+                               ", \"reason\": \"stop\", "
+                               "\"stopped_by_session\": false"),
+            std::string::npos)
+      << alpha_runs[0];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(alpha_pid.c_str());
 }
 
 // The same unhandled SIGINT from elsewhere, before any stop is requested, is

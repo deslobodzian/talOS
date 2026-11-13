@@ -106,7 +106,10 @@ test('parseManifest reads run history and code identity; older manifests lack th
             end_wall_ns: 1735689601000000000, exit_code: -1, exit_signal: 9,
             reason: 'stalled'},
            {pid: 8, start_wall_ns: 1735689602000000000, end_wall_ns: 0,
-            exit_code: -1, exit_signal: 0, reason: 'running'}]
+            exit_code: -1, exit_signal: 0, reason: 'running'},
+           {pid: 9, start_wall_ns: 1735689603000000000,
+            end_wall_ns: 1735689604000000000, exit_code: -1, exit_signal: 2,
+            reason: 'stop', stopped_by_session: true}]
   };
   const document = {
     session_id: '1', config_path: '/robot.toml', config_sha256: 'abc',
@@ -121,8 +124,10 @@ test('parseManifest reads run history and code identity; older manifests lack th
   assert.equal(m.git_dirty, true);
   assert.equal(m.nodes[0].binary_sha256, 'ff');
   assert.equal(m.nodes[0].runs_dropped, 3);
-  assert.deepEqual(m.nodes[0].runs!.map(r => [r.pid, r.exit_signal, r.reason]),
-                   [[7, 9, 'stalled'], [8, 0, 'running']]);
+  assert.deepEqual(m.nodes[0].runs!.map(r => [r.pid, r.exit_signal, r.reason,
+                                              r.stopped_by_session]),
+                   [[7, 9, 'stalled', undefined], [8, 0, 'running', undefined],
+                    [9, 2, 'stop', true]]);
   const {runs: _runs, runs_dropped: _dropped, binary_sha256: _sha, ...old} = nodeJson;
   const {git_revision: _rev, git_dirty: _dirty, ...older} = document;
   const legacy = parseManifest(JSON.stringify({...older, nodes: [old]}));

@@ -194,13 +194,14 @@ void NodeProcessInfo::BeginRun(pid_t run_pid) {
   run.start_wall_ns = WallClockNanos();
 }
 
-void NodeProcessInfo::EndRun(std::string_view reason) {
+void NodeProcessInfo::EndRun(std::string_view reason, bool stopped_by_session) {
   if (runs.empty() || runs.back().end_wall_ns != 0) return;
   NodeRun& run = runs.back();
   run.end_wall_ns = WallClockNanos();
   run.exit_code = exit_code;
   run.exit_signal = exit_signal;
   run.reason = reason;
+  run.stopped_by_session = stopped_by_session;
 }
 
 void NodeProcessInfo::RecordSpawnFailure() {
@@ -310,7 +311,9 @@ std::string SessionManifest::ToJson() const {
          << ", \"end_wall_ns\": " << run.end_wall_ns
          << ", \"exit_code\": " << run.exit_code
          << ", \"exit_signal\": " << run.exit_signal
-         << ", \"reason\": " << Quoted(run.reason);
+         << ", \"reason\": " << Quoted(run.reason)
+         << ", \"stopped_by_session\": "
+         << (run.stopped_by_session ? "true" : "false");
       if (run.delivery) {
         ss << ", \"wake_failures\": " << run.delivery->wake_failures
            << ", \"stalled_arms\": " << run.delivery->stalled_arms

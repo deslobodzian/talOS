@@ -137,6 +137,11 @@ struct NodeRun {
   int exit_code{-1};       // -1 while it runs, and after a signal ended it.
   int exit_signal{0};
   std::string_view reason{kRunRunning};
+  // The stop signal the launcher itself sent ended the run (a member not yet
+  // handling a stop; EndedByOwnStopSignal): the one run ending, besides a
+  // clean exit, that leaves the session's exit status 0. False for every
+  // other run, one that handled the stop and exited 0 included.
+  bool stopped_by_session{false};
   // The last counts its registry row showed; empty while the launcher has
   // seen no row of it (a spawn that failed, a run that never registered,
   // Studio's bridge).
@@ -209,7 +214,7 @@ struct NodeProcessInfo {
   void BeginRun(pid_t run_pid);
 
   // Ends the newest run with this process's exit_code and exit_signal.
-  void EndRun(std::string_view reason);
+  void EndRun(std::string_view reason, bool stopped_by_session = false);
 
   // Records a run that could not be spawned: it has no exit of its own.
   void RecordSpawnFailure();

@@ -18,6 +18,10 @@ export type ManifestRun = {
   // 'construction_deadline', 'endpoint_mismatch', 'stop', 'stop_timeout',
   // 'spawn_failed'.
   reason: string;
+  // The launcher's own stop signal ended the run, which leaves the session's
+  // exit status 0; absent in manifests written before the launcher recorded
+  // it.
+  stopped_by_session?: boolean;
 };
 
 export type ManifestNode = {
@@ -183,7 +187,9 @@ function parseRun(value: unknown, where: string): ManifestRun {
     end_wall_ns: wallNs(source, 'end_wall_ns'),
     exit_code: integer(source, 'exit_code'),
     exit_signal: integer(source, 'exit_signal'),
-    reason: str(source, 'reason')
+    reason: str(source, 'reason'),
+    ...('stopped_by_session' in source ?
+            {stopped_by_session: bool(source, 'stopped_by_session')} : {})
   };
 }
 

@@ -138,10 +138,12 @@ export function mergeProcesses(
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
     const lastRun = m?.runs?.at(-1);
-    // The launcher's own stop signal (SIGINT) ending a member before it
-    // handled stops is a clean stop (launcher README "Session manifest").
-    const stoppedBySession =
-        lastRun?.reason === 'stop' && m?.exit_signal === SIGINT;
+    // The launcher's own stop signal ending a member before it handled stops
+    // is a clean stop (launcher README "Session manifest"): the run's
+    // stopped_by_session says so, or, in a manifest written before the
+    // launcher recorded it, reason stop with SIGINT.
+    const stoppedBySession = lastRun?.stopped_by_session ??
+        (lastRun?.reason === 'stop' && m?.exit_signal === SIGINT);
     if (m && m.exit_signal > 0 && !stoppedBySession) {
       problems.push('killed_by_signal');
     }

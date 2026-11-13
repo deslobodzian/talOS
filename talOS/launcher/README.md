@@ -483,8 +483,9 @@ run's are in its `runs`, with the reason it ended; see
 `exit_signal` is that signal's number (0 for none), which the end-of-session
 summary also names (`exit=-1 (signal 2 SIGINT)`); Studio's session panel
 shows it in the exit column and marks the node *killed by signal*, except
-a run with reason `stop` ended by the stop's own SIGINT, which it shows as
-stopped.
+a last run with `stopped_by_session` true, which it shows as stopped (for a
+manifest without that field, written by an older launcher: a run with reason
+`stop` and SIGINT).
 
 When the session ends, the launcher exits with 0, or with the last nonzero
 `exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
@@ -496,7 +497,8 @@ the stop's own signal does not count: one that was not yet handling a stop
 lines or a Python node's whole interpreter start) when the stop's SIGINT
 reached it, so an operator's Ctrl-C during startup ends the session with 0.
 Its run still records the signal: `exit_code` -1, `exit_signal` 2, `reason`
-`stop`. Only a SIGINT the launcher sent that run counts so, which it knows
+`stop`, `stopped_by_session` true, the field the exit status reads. Only
+a SIGINT the launcher sent that run counts so, which it knows
 from its own record of the stop it sent before it reaped the run, never from
 the stop flag. The launcher sends it only after the spawn has returned, which
 is after the member's exec. A terminal's Ctrl-C reaches only the launcher's
@@ -766,8 +768,12 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   ([realtime scheduling](../introspection/README.md#realtime-scheduling)).
 - per node, `runs`: one entry per run, spawn failures included: `pid` (-1
   when the spawn failed), `start_wall_ns`, `end_wall_ns` (0 while it runs),
-  `exit_code`, `exit_signal` (as for the node's last run, above) and `reason`.
-  At most 32 are kept, the first run and the newest; `runs_dropped` counts
+  `exit_code`, `exit_signal` (as for the node's last run, above), `reason`
+  and `stopped_by_session`: true only for a run the stop signal the
+  launcher sent ended (reason `stop`, SIGINT), which leaves the exit status
+  0 ([restarts](#restarts)); false for every other run, one that handled
+  the stop and exited 0 or that a signal from elsewhere ended during the
+  stop (also reason `stop`) included. At most 32 are kept, the first run and the newest; `runs_dropped` counts
   those dropped between them.
 - per node and per run, `wake_failures`, `stalled_arms`, `wake_fallbacks`
   and `requests_skipped`: what the run's registry row last showed it lost

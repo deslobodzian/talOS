@@ -327,22 +327,36 @@ test('uptime runs to the registry clock, then to the end; unknown without either
 
 // REQ-OPS-06: a member ended by the launcher's own stop signal before it
 // handled stops is a clean stop, not a signal death; any other signal death,
-// or SIGINT for any other reason, stays flagged.
+// or SIGINT for any other reason, stays flagged. The run's stopped_by_session
+// decides when the manifest has it: a SIGINT from elsewhere that ended the
+// run during the stop is reason stop too, and the launcher counted it. A
+// manifest without the field (an older launcher) falls back to reason stop
+// with SIGINT; SIGTERM (systemd's default kill mode) is never the stop's own.
 test('mergeProcesses shows a launcher-stopped member as stopped', () => {
-  const run = (reason: string, exit_signal: number) => [{
+  const run = (reason: string, exit_signal: number,
+               stopped_by_session?: boolean) => [{
     pid: 1, start_wall_ns: 1, end_wall_ns: 2, exit_code: -1, exit_signal,
-    reason
+    reason, ...(stopped_by_session === undefined ? {} : {stopped_by_session})
   }];
   const m = manifest([
-    mnode({name: 'stopped', exit_signal: 2, runs: run('stop', 2)}),
+    mnode({name: 'stopped', exit_signal: 2, runs: run('stop', 2, true)}),
+    mnode({name: 'foreign', exit_signal: 2, runs: run('stop', 2, false)}),
+    mnode({name: 'older', exit_signal: 2, runs: run('stop', 2)}),
+    mnode({name: 'terminated', exit_signal: 15, runs: run('stop', 15)}),
     mnode({name: 'crashed', exit_signal: 2, runs: run('crash', 2)}),
     mnode({name: 'killed', exit_signal: 9, runs: run('stop_timeout', 9)})
   ]);
   const rows = mergeProcesses(m, null, null, {}, false);
   const row = (n: string) => rows.find(r => r.name === n)!;
-  assert.deepEqual(row('stopped').problems, []);
-  assert.equal(row('stopped').exitSignal, null);
-  assert.equal(row('stopped').endReason, 'stop');
+  for (const name of ['stopped', 'older']) {
+    assert.deepEqual(row(name).problems, [], name);
+    assert.equal(row(name).exitSignal, null, name);
+    assert.equal(row(name).endReason, 'stop', name);
+  }
+  assert.deepEqual(row('foreign').problems, ['killed_by_signal']);
+  assert.equal(row('foreign').exitSignal, 'signal 2 SIGINT');
+  assert.deepEqual(row('terminated').problems, ['killed_by_signal']);
+  assert.equal(row('terminated').exitSignal, 'signal 15 SIGTERM');
   assert.deepEqual(row('crashed').problems, ['killed_by_signal']);
   assert.deepEqual(row('killed').problems, ['killed_by_signal']);
 });
