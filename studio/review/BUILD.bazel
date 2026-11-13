@@ -59,7 +59,10 @@ cc_binary(
 
 talos_messages(
     name = "review_test_message",
-    srcs = ["testdata/review_message.fbs"],
+    srcs = [
+        "testdata/review_alert.fbs",
+        "testdata/review_message.fbs",
+    ],
     include_prefix = "review_test",
     visibility = ["//visibility:private"],
 )

@@ -322,8 +322,8 @@ Response Review::Channels(const Session& session) const {
   std::vector<talos::telemetry::ChannelDef> dictionary;
   for (const Topic& topic : session.topics()) {
     for (const auto& channel : topic.channels) {
-      dictionary.push_back(
-          {channel.name, channel.unit, channel.labels, channel.kind});
+      dictionary.push_back({channel.name, channel.unit, channel.labels,
+                            channel.kind, channel.alert});
     }
   }
   std::string out{"{\"kind\":\"talos.telemetry.channels\",\"version\":"};
@@ -347,8 +347,10 @@ Response Review::Channels(const Session& session) const {
       if (j != 0) out += ',';
       AppendEscaped(out, channel.labels[j]);
     }
-    // No "alert" until naming::ParseAlertField exists (slice S3a).
-    out += "]}";
+    // Where and as the bridge's ChannelsJson writes it.
+    out += "],\"alert\":";
+    AppendEscaped(out, AlertLevelName(channel.alert));
+    out += '}';
   }
   out += "]}";
   return {200, "application/json", std::move(out)};

@@ -24,6 +24,8 @@
 #include "flatbuffers/flatbuffers.h"
 #include "flatbuffers/reflection_generated.h"
 #include "nlohmann/json.hpp"
+#include "review_test/review_alert_descriptor.h"
+#include "review_test/review_alert_generated.h"
 #include "review_test/review_message_descriptor.h"
 #include "review_test/review_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
@@ -641,6 +643,61 @@ TEST_F(ReviewTest, CraftedLogFailsOnlyItsSession) {
   EXPECT_EQ(review.Get("/review/sessions.json", "").status, 200);
   std::filesystem::remove_all(Library() + "/huge");
   std::filesystem::remove_all(Library() + "/loop");
+}
+
+// Guards that a reviewed session's dictionary names each alert channel's
+// level exactly as the live bridge's /channels.json does ("alert" after
+// "labels", `studio::AlertLevelName`): a `status` topic's
+// `alert_error_<name>` bool is "error", every other channel "none", so the
+// page that lists alerts reads a recorded session like a live one.
+// REQ-OPS-37
+TEST_F(ReviewTest, ChannelsCarryEachAlertLevelAsTheBridgeDoes) {
+  namespace tlog = talos::event::log;
+  using talos::event::Context;
+  using talos::event::MonotonicTime;
+  using talos::event::SourceKind;
+  const std::string dir = Library() + "/alerts";
+  std::filesystem::create_directories(dir);
+  talos::event::Registration health;
+  health.id = 2;
+  health.kind = SourceKind::SENDER;
+  health.name = "/thing/status";
+  health.message_bytes = sizeof(review_test::Health);
+  {
+    using D = talos::Descriptor<review_test::Health>;
+    health.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+  }
+  {
+    tlog::LogWriter writer{dir + "/alerts.tlog", "thing",
+                           tlog::LogWriterOptions{8192, 1, false}, 1};
+    writer.start({health}, MonotonicTime::from_nanos(kStartNs));
+    const review_test::Health message{true, false};
+    Context tick{};
+    tick.dispatch_index = 1;
+    tick.event_time = tick.now = MonotonicTime::from_nanos(kStartNs);
+    writer.send(
+        tick, 2,
+        std::span{reinterpret_cast<const std::byte*>(&message), sizeof message},
+        0, 1);
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  Review review{Library(), 1u << 20};
+  const Response channels = review.Get("/review/alerts/channels.json", "");
+  std::filesystem::remove_all(dir);
+  ASSERT_EQ(channels.status, 200) << channels.body;
+  EXPECT_NE(channels.body.find(
+                R"({"name":"thing/status/alert_error_link_lost","unit":"",)"
+                R"("kind":"bool","labels":[],"alert":"error"})"),
+            std::string::npos)
+      << channels.body;
+  EXPECT_NE(channels.body.find(R"({"name":"thing/status/ready","unit":"",)"
+                               R"("kind":"bool","labels":[],"alert":"none"})"),
+            std::string::npos)
+      << channels.body;
 }
 
 // The golden responses (testdata/golden), by file name, and the request each
