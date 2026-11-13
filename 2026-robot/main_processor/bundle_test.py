@@ -6,13 +6,18 @@ C++ node that cannot load a shared library it links, a
 Python node that cannot import its wheels or start its interpreter, or an
 install that breaks the bundle's relative symlinks fails here. The bench
 rig's bundle, which link and stop qualification install, is checked too.
-Each is described with --start-studio-bridge: a bundle that carries Studio
-must run its bridge from the install, found through the manifest's [studio]
-table, beside the index page of the webroot that table names; one that does
-not must describe without a bridge rather than fail on its absence."""
+A bundle that carries Studio is described by the command the boot service
+runs (deploy.sh enable-boot's systemd ExecStart and launchd
+ProgramArguments), which must run its bridge from the install, found through
+the manifest's [studio] table, beside the index page of the webroot that
+table names; one that does not is asked for Studio with
+--start-studio-bridge and must describe without a bridge rather than fail on
+its absence."""
 
 import json
 import os
+import plistlib
+import shlex
 import subprocess
 import tempfile
 import tomllib
@@ -27,18 +32,47 @@ BUNDLES = (
 )
 
 
-def describe(bundle, prefix, *args):
-    """Installs `bundle` under `prefix` with deploy.sh and runs the installed
-    run.sh --describe-only with `args`. Returns the process, the session's
-    graph and the installed bundle's directory."""
-    r = runfiles.Create()
-    deploy = r.Rlocation("_main/tools/deploy.sh")
-    subprocess.run(["bash", deploy, "install", bundle, "--prefix", prefix],
+def deploy_script():
+    return runfiles.Create().Rlocation("_main/tools/deploy.sh")
+
+
+def boot_command(prefix, system):
+    """The argv `deploy.sh enable-boot --dry-run` writes into the boot
+    service on `system` ("Linux": the systemd unit's ExecStart; "Darwin":
+    the LaunchDaemon's ProgramArguments), with uname and FileVault faked."""
+    with tempfile.TemporaryDirectory() as fake:
+        for name, body in (("uname", f"echo {system}"),
+                           ("fdesetup", "echo 'FileVault is Off.'")):
+            with open(os.path.join(fake, name), "w", encoding="utf-8") as f:
+                f.write(f"#!/bin/sh\n{body}\n")
+            os.chmod(os.path.join(fake, name), 0o755)
+        env = dict(os.environ, PATH=fake + os.pathsep + os.environ["PATH"])
+        out = subprocess.run(
+            ["bash", deploy_script(), "enable-boot", "--dry-run",
+             "--prefix", prefix],
+            check=True, capture_output=True, text=True, env=env,
+            timeout=60).stdout
+    if system == "Darwin":
+        plist = plistlib.loads(
+            out[out.index("<?xml"):out.index("</plist>") + 8].encode())
+        return plist["ProgramArguments"]
+    line = next(line for line in out.splitlines()
+                if line.startswith("ExecStart="))
+    return shlex.split(line.removeprefix("ExecStart="))
+
+
+def describe(bundle, prefix, command, *args):
+    """Installs `bundle` under `prefix` with deploy.sh and runs `command`
+    (an argv starting with the installed run.sh) with --describe-only and
+    `args`. Returns the process, the session's graph and the installed
+    bundle's directory."""
+    subprocess.run(["bash", deploy_script(), "install", bundle,
+                    "--prefix", prefix],
                    check=True, capture_output=True, text=True, timeout=120)
     where = os.path.join(prefix, "current")
     log_dir = os.path.join(prefix, "logs")
     env = dict(os.environ, TALOS_LOG_DIR=log_dir)
-    proc = subprocess.run(["./run.sh", "--describe-only", *args], cwd=where,
+    proc = subprocess.run([*command, "--describe-only", *args], cwd=where,
                           env=env, capture_output=True, text=True, timeout=120)
     sessions = sorted(
         (os.path.join(log_dir, name) for name in os.listdir(log_dir)
@@ -63,10 +97,20 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(src and os.path.isdir(src), src)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
-                # Asked for Studio, a bundle without it still describes.
                 studio = manifest.get("studio")
-                proc, graph, where = describe(
-                    src, os.path.join(tmp, "prefix"), "--start-studio-bridge")
+                prefix = os.path.join(tmp, "prefix")
+                if studio:
+                    # REQ-OPS-34: a booted robot serves Studio. Both boot
+                    # services run the same command, with no argument that
+                    # asks for or declines the bridge.
+                    command = boot_command(prefix, "Linux")
+                    self.assertEqual(command, boot_command(prefix, "Darwin"))
+                    args = ()
+                else:
+                    # Asked for Studio, a bundle without it still describes.
+                    command = [os.path.join(prefix, "current", "run.sh")]
+                    args = ("--start-studio-bridge",)
+                proc, graph, where = describe(src, prefix, command, *args)
                 out = proc.stdout + "\n" + proc.stderr
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIsNotNone(graph, out)

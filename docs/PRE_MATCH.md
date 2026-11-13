@@ -33,7 +33,8 @@ Open any NetworkTables dashboard (Shuffleboard, Elastic, Glass) on the
   protocol version).
 - [ ] Autonomous routine: with the robot disabled, step it with joystick 0's
   POV right/left and read the selection in Studio's
-  `autonomous/state/routine_index` (the index into `routines` in the
+  `autonomous/state/routine_index` (Studio is served from boot at
+  `http://<main-processor>:5800`, [DEPLOYMENT.md](DEPLOYMENT.md#build-a-bundle); the index into `routines` in the
   deployed [autonomous config](../2026-robot/main_processor/configuration/subsystems/autonomous.toml);
   see [BRINGUP.md](BRINGUP.md#autonomous-selection)). The Driver Station does
   not show it yet (TODO.md DEPLOY-2).
