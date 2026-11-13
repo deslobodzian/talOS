@@ -235,7 +235,7 @@ A channel is a dictionary name, `<owner>/<role>/<field path>` with no leading
 
 | `kind` | Keys (defaults) | Channels it reads |
 | --- | --- | --- |
-| `match` | none | `hw/state/driver_station/{connected, enabled, autonomous, teleop, test, estop, fms_attached, alliance, match_time_s}` |
+| `match` | none | `hw/state/driver_station/{connected, enabled, autonomous, teleop, test, estop, fms_attached, alliance, match_time_s, match_number, match_type, station}` |
 | `power` | `warn_below_v` (11.5; in (0, 20]) | `hw/status/{battery_v, brownout, health_valid}` |
 | `routine` | `channel` (required), `phase` | both |
 | `alerts` | none | every alert channel of the dictionary |
