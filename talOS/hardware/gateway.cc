@@ -42,6 +42,22 @@ bool DrivesNothing(const Command& c, const Config& config) {
   }
   return true;
 }
+
+// A State no Backend::Read filled: the gateway reads no device while a
+// configure runs or after one failed, and none under a new configuration
+// before its first Read. Every motor and CAN-sensor sample is invalid with zero
+// measurements (MarkInvalid); every RIO device sample and the health sample
+// is invalid, its value as last read.
+void MarkUnread(State& state) {
+  for (auto& m : state.motors) MarkInvalid(m);
+  for (auto& sensor : state.sensors) MarkInvalid(sensor);
+  for (auto& input : state.digital_inputs) input.valid = false;
+  for (auto& output : state.digital_outputs) output.valid = false;
+  for (auto& input : state.analog_inputs) input.valid = false;
+  for (auto& encoder : state.encoders) encoder.valid = false;
+  for (auto& output : state.pwm_outputs) output.valid = false;
+  state.health.valid = false;
+}
 }  // namespace
 
 Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
@@ -195,6 +211,9 @@ void Gateway::CommitConfiguration(const Config& config) {
   last_requests_.fill(MotorRequest{});
   motor_drives_from_.fill(0);
   position_reference_.fill(PositionReference{});
+  // What the slots hold was read under the old configuration, maybe for
+  // other devices: nothing is a sample until this one's first Read.
+  MarkUnread(state_);
   Invalidate();
 }
 void Gateway::Invalidate() {
@@ -594,6 +613,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
 }
 State Gateway::snapshot() const {
   State s = state_;
+  if (!configured_) MarkUnread(s);
   // A motor or CAN sensor sample marked invalid carries zero in every
   // measured field, wherever it was invalidated (the backend, the age bound,
   // a mask), so no reader takes a frozen value for a measurement. Only the

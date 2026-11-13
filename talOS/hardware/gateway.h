@@ -142,6 +142,9 @@ class Gateway {
   // commands and retry until the consecutive limit; re-enabling or any
   // successful Reconfigure clears the apply-failure latch.
   bool Accept(const Command& command, uint64_t sequence, uint64_t now_us);
+  // The State to publish. Every invalid motor or CAN-sensor sample carries
+  // zero measurements (MarkInvalid); while unconfigured (configuring, or the
+  // last configure failed) every sample is invalid, since no Read ran.
   State snapshot() const;
   const Config& config() const { return config_; }
   bool configured() const { return configured_; }

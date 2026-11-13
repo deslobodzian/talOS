@@ -230,6 +230,11 @@ class FakeBackend : public Backend {
         sensor.position_age_us = it->second;
       }
     }
+    for (auto& input : s.digital_inputs) {
+      input.valid = true;
+      input.value = true;
+    }
+    s.health = {.valid = true, .battery_v = 12};
     return healthy;
   }
   bool Apply(std::span<const MotorRequest> requests) override {
@@ -1600,6 +1605,107 @@ TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
   EXPECT_TRUE(g.snapshot().flags & kConfigured);
   EXPECT_TRUE(g.snapshot().flags & kEnabled);
   EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+}
+
+// While a configure runs, or after one fails, the gateway reads no device, so
+// a State it publishes then has no measurement in it: every motor and CAN
+// sensor sample invalid with zero measurements, every RIO device sample and
+// the health sample invalid. Scenario: a gateway read at 30 rotations, then
+// reconfigured over several ticks, or failing its configure; published as
+// valid, those 30 rotations are a frozen position a node takes for a live one
+// for as long as the configure lasts. An in-progress configure raises no fault
+// (every boot runs one); the first State after a successful one is read
+// again.
+// REQ-CONTRACT-32
+TEST(Gateway, UnconfiguredStatesCarryNoValidSample) {
+  class PendingBackend : public FakeBackend {
+   public:
+    void BeginConfigure(const Config&) override {}
+    ConfigureStatus PollConfigure() override { return status; }
+    ConfigureStatus status{ConfigureStatus::kPending};
+  } backend;
+  backend.measurement = 3;
+  auto config = SwerveConfig(true);
+  config.digital_inputs.push_back({40, "beam", 1});
+  for (const auto& motor : config.motors) backend.positions[motor.id] = 30;
+  const auto read = [&config](const State& s) {
+    EXPECT_EQ(s.motor_count, config.motors.size());
+    for (std::size_t i = 0; i < s.motor_count; ++i) {
+      SCOPED_TRACE(config.motors[i].name);
+      EXPECT_TRUE(s.motors[i].valid);
+      EXPECT_EQ(s.motors[i].position_rot, 30.0);
+    }
+    for (std::size_t i = 0; i < s.sensor_count; ++i) {
+      EXPECT_TRUE(s.sensors[i].valid) << config.sensors[i].name;
+    }
+    EXPECT_TRUE(s.digital_inputs[0].valid);
+    EXPECT_TRUE(s.health.valid);
+  };
+  const auto unread = [&config](const State& s) {
+    for (std::size_t i = 0; i < s.motor_count; ++i) {
+      SCOPED_TRACE(config.motors[i].name);
+      EXPECT_FALSE(s.motors[i].valid);
+      EXPECT_EQ(s.motors[i].position_rot, 0.0);
+      EXPECT_EQ(s.motors[i].velocity_rps, 0.0);
+      EXPECT_EQ(s.motors[i].voltage, 0.0);
+      EXPECT_EQ(s.motors[i].stator_current_a, 0.0);
+      EXPECT_EQ(s.motors[i].supply_current_a, 0.0);
+    }
+    for (std::size_t i = 0; i < s.sensor_count; ++i) {
+      SCOPED_TRACE(config.sensors[i].name);
+      EXPECT_FALSE(s.sensors[i].valid);
+      EXPECT_EQ(s.sensors[i].position_rot, 0.0);
+      EXPECT_EQ(s.sensors[i].velocity_rps, 0.0);
+    }
+    EXPECT_FALSE(s.digital_inputs[0].valid);
+    EXPECT_FALSE(s.health.valid);
+  };
+  Gateway g{config, backend, 1};
+  g.Tick(1000, false);
+  read(g.snapshot());
+
+  auto changed = config;
+  changed.motors[0].slots[0].p = 1;
+  ASSERT_TRUE(g.BeginReconfigure(changed));
+  for (const uint64_t now : {uint64_t{2000}, uint64_t{3000}, uint64_t{4000}}) {
+    SCOPED_TRACE("configuring at " + std::to_string(now));
+    g.Tick(now, false);
+    ASSERT_TRUE(g.configuring());
+    unread(g.snapshot());
+    EXPECT_FALSE(g.snapshot().flags & kConfigured);
+    EXPECT_FALSE(g.snapshot().flags & kHardwareFault);
+  }
+  backend.status = Backend::ConfigureStatus::kDone;
+  g.Tick(5000, false);
+  ASSERT_TRUE(g.configured());
+  {
+    SCOPED_TRACE("first State after the configure");
+    read(g.snapshot());
+    EXPECT_TRUE(g.snapshot().flags & kConfigured);
+  }
+
+  config.motors[0].slots[0].p = 2;
+  backend.status = Backend::ConfigureStatus::kPending;
+  ASSERT_TRUE(g.BeginReconfigure(config));
+  backend.status = Backend::ConfigureStatus::kFailed;
+  for (const uint64_t now : {uint64_t{6000}, uint64_t{7000}}) {
+    SCOPED_TRACE("after a failed configure, at " + std::to_string(now));
+    g.Tick(now, false);
+    ASSERT_FALSE(g.configured());
+    unread(g.snapshot());
+    EXPECT_FALSE(g.snapshot().flags & kConfigured);
+    EXPECT_TRUE(g.snapshot().flags & kHardwareFault);
+  }
+
+  // A configure that completes within one call publishes nothing read under
+  // the configuration before it either, until its own first Read.
+  ASSERT_TRUE(g.Reconfigure(changed));
+  {
+    SCOPED_TRACE("configured, not yet read");
+    unread(g.snapshot());
+  }
+  g.Tick(8000, false);
+  read(g.snapshot());
 }
 
 // Polls `done` until it holds. The deadline only bounds a hang
