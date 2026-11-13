@@ -1199,26 +1199,39 @@ TEST(HardwareNodeTest, ASocketThatCannotSendIsReplacedAndFramesFlowAgain) {
 int pending_send_error = 0;
 int TakeSendError() { return std::exchange(pending_send_error, 0); }
 
-// A send error the network clears by itself keeps the socket: the failed
-// probe goes out on the same socket kRetryUs (1 ms) later, and nothing is
-// reopened.
+// Which send errors replace the socket. One the network clears by itself
+// (the gateway's port closed, no interface yet, an ICMP host unreachable, a
+// full interface queue) keeps it: nothing is reopened. One that every later
+// send on the same socket repeats closes it, and the next Tick opens a new
+// one: ENETUNREACH is what Linux returns once the socket's source address
+// has left the host, even after a new address appears
+// (UdpAddressChangeTest), EADDRNOTAVAIL what macOS returns. Either way the
+// failed probe goes out kRetryUs (1 ms) later.
 // REQ-RT-22
-TEST(HardwareNodeTest, ATransientSendErrorKeepsTheSocket) {
+TEST(HardwareNodeTest, OnlyASendErrorTheSocketKeepsRepeatingReplacesIt) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
   ASSERT_TRUE(link.Open(cfg));
   HardwareNode& node = link.node.value();
   protocol::RuntimeUdpPeer& gateway = link.gateway;
   node.set_seams({.send_error = &TakeSendError});
+  struct Row {
+    int error;
+    bool replaced;
+  };
   uint64_t now_us = 1'000'000;
-  for (const int error :
-       {ECONNREFUSED, ENETDOWN, ENETUNREACH, EHOSTUNREACH, ENOBUFS}) {
-    SCOPED_TRACE(std::strerror(error));
-    pending_send_error = error;
+  uint64_t reopens = 0;
+  for (const Row row : {Row{ECONNREFUSED, false}, Row{ENETDOWN, false},
+                        Row{EHOSTUNREACH, false}, Row{ENOBUFS, false},
+                        Row{ENETUNREACH, true}, Row{EADDRNOTAVAIL, true}}) {
+    SCOPED_TRACE(std::strerror(row.error));
+    pending_send_error = row.error;
     node.Tick(now_us);  // the probe is due, and fails
-    EXPECT_EQ(node.socket_counters().last_send_error, error);
+    EXPECT_EQ(node.socket_counters().last_send_error, row.error);
+    EXPECT_EQ(node.udp_fd() < 0, row.replaced);
     node.Tick(now_us + 1'000);
-    EXPECT_EQ(node.socket_counters().reopens, 0u);
+    reopens += row.replaced ? 1 : 0;
+    EXPECT_EQ(node.socket_counters().reopens, reopens);
     EXPECT_EQ(NextProbeUs(gateway), now_us + 1'000);
     now_us += 200'000;  // past the next unanswered probe's retry
   }

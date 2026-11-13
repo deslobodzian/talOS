@@ -60,17 +60,19 @@ For processor ownership and layer boundaries, see
 
 A failed send never kills the bridge (`RuntimeUdpPeer` raises no
 `SIGPIPE`). When a send to the gateway fails with an error its socket never
-recovers from (`EPIPE`, as from a socket macOS marked defunct around sleep
-and wake; `ENOTCONN`, `EDESTADDRREQ`, `EADDRNOTAVAIL`, `EBADF`), the bridge
+recovers from (`protocol::SendErrorNeedsNewSocket`, whose errors per OS are
+in [talOS/protocol](../talOS/protocol/README.md): a socket shut down or
+marked defunct, or one whose source address left the host), the bridge
 closes the socket and opens a new one on the same ports (`Reopen()`, which
 keeps the frame sequence the gateway's replay gate checks): on its next pass,
 at most 1000 µs later, then at most every 100000 µs
 (`HardwareNode::kReopenRetryUs`). While it is closed nothing is sent or
 received, so the RoboRIO neutralizes at its command timeout and `/hw/status`
-`state_age_us` grows, as for an unplugged cable. Any other send error
-(`ECONNREFUSED` while the RoboRIO program is down, `ENETDOWN`,
-`ENETUNREACH`, `EHOSTUNREACH`, `ENOBUFS`) keeps the socket, and the failed
-send's duty is retried 1000 µs later. The bridge prints the errno once per
+`state_age_us` grows, as for an unplugged cable; with no route to the
+RoboRIO at all, each new socket's open fails and is retried on that
+cadence. Any other send error (`ECONNREFUSED` while the RoboRIO program is
+down, for one) keeps the socket, and the failed send's duty is retried
+1000 µs later. The bridge prints the errno once per
 outage and one line when a send succeeds again; its exit line counts
 `send_failures` and `socket_reopens`. The RoboRIO program replaces its own
 socket by the same rule (`protocol::SendErrorNeedsNewSocket`), on its 100 ms

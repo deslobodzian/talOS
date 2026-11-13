@@ -415,9 +415,11 @@ until the socket opens. The console reports the failures
 (`hardware gateway socket failed: <status> (errno <n>)`, coalesced to one line
 a second) and, once it opens, `hardware gateway socket open after <n> failed
 attempts, <s> s after the first`.
-A send that fails with an error the socket never recovers from
-(`protocol::SendErrorNeedsNewSocket`: `EPIPE`, `ENOTCONN`, `EDESTADDRREQ`,
-`EADDRNOTAVAIL`, `EBADF`, the bridge's rule in
+A send that fails with an error the socket may never recover from
+(`protocol::SendErrorNeedsNewSocket`, whose errors are in
+[talOS/protocol](../protocol/README.md): among them `ENETUNREACH`, Linux's
+error once the RoboRIO's address changes under the connected socket; the
+bridge's rule in
 [data flow](../../docs/DATA_FLOW.md#link-rates-and-endpoints)) loses the
 socket: the loop ticks the gateway disabled again, sends nothing, and opens a
 new socket on the same ports (`Endpoint::Reopen`, keeping the frame sequence)
@@ -427,8 +429,7 @@ a second. The console prints `hardware gateway socket cannot send (errno
 <n>); replacing it, nothing is sent until then` and, once replaced,
 `hardware gateway socket replaced after <n> failed attempts, <s> s after it
 could not send` (each coalesced to one line a second). Any other send error
-(`ENOBUFS`, `ECONNREFUSED`, `ENETDOWN`, `ENETUNREACH`, `EHOSTUNREACH`) keeps
-the socket. A send raises no `SIGPIPE` on either end
+(`ENOBUFS`, `ECONNREFUSED`, ...) keeps the socket. A send raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
 That loop enforces the command timeout and output neutral, so it never

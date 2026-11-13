@@ -42,6 +42,19 @@ cc_test(
     ],
 )
 
+# A child process in its own user and network namespace; skipped where the
+# host refuses an unprivileged one.
+cc_test(
+    name = "udp_address_change_test",
+    size = "small",
+    srcs = ["udp_address_change_test.cc"],
+    deps = [
+        ":protocol",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
 cc_library(
     name = "udp_test_helpers",
     testonly = True,

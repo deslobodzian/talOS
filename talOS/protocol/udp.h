@@ -128,10 +128,12 @@ class RuntimeUdpPeer {
 };
 
 // Whether a send that failed with OS error `error` (UdpStats::last_send_error)
-// left a socket that will never send again, whatever the network does, so
-// only a new one can (Reopen): EPIPE, ENOTCONN, EDESTADDRREQ, EADDRNOTAVAIL
-// and EBADF (on Windows their WSA equivalents: WSAESHUTDOWN, WSAENOTCONN,
-// WSAEDESTADDRREQ, WSAEADDRNOTAVAIL, WSAENOTSOCK). Any other error clears by
+// may have left a socket that will never send again, whatever the network
+// does, so only a new one can (Reopen): EPIPE, ENOTCONN, EDESTADDRREQ, EBADF,
+// and the socket's source address gone from the host, which Linux reports as
+// ENETUNREACH and macOS as EADDRNOTAVAIL (both are in the set on every OS; on
+// Windows the WSA equivalents: WSAESHUTDOWN, WSAENOTCONN, WSAEDESTADDRREQ,
+// WSAENOTSOCK, WSAENETUNREACH, WSAEADDRNOTAVAIL). Any other error clears by
 // itself on the same socket. Both ends' callers (the bridge's HardwareNode,
 // the RoboRIO program) decide with this one function.
 bool SendErrorNeedsNewSocket(int error);
