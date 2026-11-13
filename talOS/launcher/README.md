@@ -701,9 +701,14 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   in the supervision pass that already reads the row for liveness, and
   once more when it reaps the run: from the row the run released as it
   exited, which keeps its last sample until the next claim, or the row a
-  killed run left. So a run's values are its last sample, increases while
-  the session stopped included (the pass stops reading rows for liveness
-  then). The node's fields sum every run, dropped ones included, and
+  killed run left. A row counts as the run's only while it carries the
+  run's pid and session and a heartbeat no older than the run's spawn, so
+  an earlier run's row whose pid the run reuses is never taken for it. So
+  a run's values are its last sample, increases while the session stopped
+  included (the pass stops reading rows for liveness then), unless another
+  process claims the row it released before the launcher reaps it: the
+  run's values are then what the last supervision pass read, and an
+  increase in its final sample is lost. The node's fields sum every run, dropped ones included, and
   `requests_skipped_by_subsystem` splits the bridge's `requests_skipped` by
   the subsystem whose `/hw/request/<subsystem>` it passed over (only
   nonzero ones). A run, or a node, whose row was never seen (a spawn that

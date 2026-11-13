@@ -222,6 +222,10 @@ class Launcher {
     // Why the launcher ended the current run (kRunStalled, kRunStop, ...);
     // empty while it has not tried. Its run is recorded with this reason.
     std::string_view kill_reason;
+    // introspect::monotonic_now_ns() just before the current run's spawn:
+    // every row the run claims has a heartbeat at or after it
+    // (FinalDeliveryCounts).
+    int64_t spawned_monotonic_ns{0};
 
     // A run of this member was spawned at `spawned`, or, for every first
     // run, supervision starts then: starts its liveness (grace,

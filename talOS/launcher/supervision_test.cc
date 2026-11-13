@@ -665,6 +665,78 @@ TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// A run that ends before it claims a registry row has no counts of its own,
+// however a row left in the session by an earlier run whose pid it reuses
+// reads: the launcher's read at the reap takes only a row claimed since the
+// run was spawned. alpha's one run never registers; while it runs, the test
+// leaves a released row of this session carrying alpha's pid, lost wakes,
+// and a heartbeat from before the session, as an earlier run of the same
+// pid would, then lets alpha exit.
+// REQ-OPS-43
+TEST(Supervision, AnEarlierRunsRowWithTheSamePidIsNotTheRunsCounts) {
+  auto options = BaseOptions("stale_row");
+  options.max_restarts = 0;
+  options.duration_s = kHangSeconds;
+  const auto pid_file = TempPath("stale_row_pid");
+  const auto go_file = TempPath("stale_row_go");
+  ::remove(pid_file.c_str());
+  ::remove(go_file.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "stale_row_alpha", "echo $$ > " + pid_file + "\nwhile [ ! -e " + go_file +
+                             " ]; do sleep 0.01; done\nexit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("stale_row_beta", "exit 0\n");
+  const int64_t before = introspect::monotonic_now_ns();
+  std::atomic<bool> planted{false};
+  std::jthread plant{[&, session_id =
+                             options.session_id](const std::stop_token& stop) {
+    pid_t pid = 0;
+    while (!stop.stop_requested()) {
+      std::ifstream input{pid_file};
+      if (input >> pid) break;
+      std::this_thread::sleep_for(5ms);
+    }
+    if (pid <= 0) return;
+    {
+      introspect::NodeRegistration registration{
+          {"alpha", "//example/alpha:node", session_id, 0}};
+      introspect::RegistryMapping mapping;
+      for (auto& row : mapping.header()->nodes) {
+        if (row.state.load(std::memory_order_acquire) !=
+                static_cast<uint64_t>(introspect::SlotState::ACTIVE) ||
+            row.session_id != session_id ||
+            row.pid != static_cast<uint64_t>(::getpid()))
+          continue;
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
+                        std::memory_order_release);
+        row.pid = static_cast<uint64_t>(pid);
+        row.pid_start = 0;
+        row.heartbeat_monotonic_ns.store(before);
+        row.wake_failures.store(3);
+        row.stalled_arms.store(1);
+        row.wake_fallbacks.store(2);
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::FREE),
+                        std::memory_order_release);
+        planted = true;
+        break;
+      }
+    }
+    std::ofstream{go_file} << "go\n";
+  }};
+  RunSession(options);
+  // alpha exits only once the row is planted; a run never spawned ends the
+  // wait for its pid.
+  plant.request_stop();
+  plant.join();
+  ASSERT_TRUE(planted) << "no row to leave behind";
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha.size(), 1u) << manifest;
+  EXPECT_EQ(alpha[0].find("\"wake_failures\": 3"), std::string::npos)
+      << "an earlier run's row counted as this run's: " << alpha[0];
+  std::filesystem::remove_all(options.output_dir);
+}
+
 // session_report --strict on a finished session directory: its exit status
 // and its stderr, where it names each reason it rejects the session.
 struct StrictReport {

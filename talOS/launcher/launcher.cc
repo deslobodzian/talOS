@@ -89,13 +89,18 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
 // row as its last sample left it. The supervision pass reads rows only
 // while the session runs (WatchRun), so this read, once per reaped run, is
 // what carries the counts a run gained while the session stopped (TODO.md
-// RT-7). Of the rows still carrying the run's pid and session, the newest
-// heartbeat is the run's own (a pid reused within the session can leave an
-// earlier run's row behind); a row claimed again during the read is passed
-// over. Loads from the mapped segment only: no lock, no disk.
+// RT-7). A row is the run's only while it carries the run's pid and
+// session and a heartbeat at or after `spawned_ns`, the run's spawn on the
+// host monotonic clock: a claim stores a heartbeat, so a row the run
+// claimed has one, and a row an earlier run of a reused pid left behind
+// does not, even when the run itself claimed none. Of those, the newest
+// heartbeat wins; a row claimed again during the read is passed over. A
+// released row another process claims before the reap is no longer the
+// run's, and the run's counts are then what the supervision pass last read.
+// Loads from the mapped segment only: no lock, no disk.
 std::optional<DeliveryCounts> FinalDeliveryCounts(
-    const introspect::RegistryMapping& registry, pid_t pid,
-    uint64_t session_id) {
+    const introspect::RegistryMapping& registry, pid_t pid, uint64_t session_id,
+    int64_t spawned_ns) {
   const auto claiming = static_cast<uint64_t>(introspect::SlotState::CLAIMING);
   std::optional<DeliveryCounts> counts;
   int64_t newest = 0;
@@ -107,7 +112,7 @@ std::optional<DeliveryCounts> FinalDeliveryCounts(
       continue;
     const auto beat =
         record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
-    if (counts && beat <= newest) continue;
+    if (beat < spawned_ns || (counts && beat <= newest)) continue;
     DeliveryCounts read = DeliveryCountsOf(record);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (record.generation.load(std::memory_order_relaxed) != generation ||
@@ -679,6 +684,7 @@ int Launcher::RunSession() {
                   local_port, launches[i]);
 
     std::string spawn_error;
+    launches[i].spawned_monotonic_ns = introspect::monotonic_now_ns();
     const pid_t pid = SpawnNode(proc, launches[i], spawn_error);
     if (pid < 0) {
       SpawnFailed(proc, launches[i], options_.supervision_clock(), spawn_error);
@@ -1014,6 +1020,7 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
         std::to_string(RestartLogBudget(proc, launch.log_budget));
   }
   std::string error;
+  launch.spawned_monotonic_ns = introspect::monotonic_now_ns();
   const pid_t pid = SpawnNode(proc, launch, error);
   if (pid < 0) {
     SpawnFailed(proc, launch, now, error);
@@ -1279,10 +1286,12 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       int status = 0;
       if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
       FinishProcessGroup(proc.pid);
-      // The run's counts as it ended, before EndRun closes the run.
-      if (registry) {
+      // The run's counts as it ended, before EndRun closes the run. Studio's
+      // bridge takes no row.
+      if (registry && !(studio && i == studio->index())) {
         if (const auto loss =
-                FinalDeliveryCounts(*registry, proc.pid, options_.session_id))
+                FinalDeliveryCounts(*registry, proc.pid, options_.session_id,
+                                    launch.spawned_monotonic_ns))
           proc.RecordDeliveryLoss(*loss);
       }
       proc.exited = true;
