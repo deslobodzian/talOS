@@ -42,12 +42,14 @@ cc_test(
     ],
 )
 
-# A child process in its own user and network namespace; skipped where the
-# host refuses an unprivileged one.
+# A child process in its own user and network namespace (integration: it
+# forks). Skipped where the host refuses an unprivileged one, unless
+# TALOS_REQUIRE_NETNS=1, which CI's Linux job sets after allowing them.
 cc_test(
     name = "udp_address_change_test",
     size = "small",
     srcs = ["udp_address_change_test.cc"],
+    tags = ["integration"],
     deps = [
         ":protocol",
         "@googletest//:gtest",
