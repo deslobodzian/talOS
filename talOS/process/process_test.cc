@@ -117,6 +117,11 @@ TEST(ProcessTest, AStopHeldSinceStartIsTakenOnceTheHandlersAreInstalled) {
         << "no stop requested once the handlers were installed: the held "
            "signal is still pending";
   }
+  // The child's RequestStop wrote into the stop pipe it shares with this
+  // process: drain it so later tests start with no wake pending.
+  stop_requested.store(false);
+  while (ConsumeStopWake()) {
+  }
 }
 
 // A child a node execs must not inherit the stop pipe, and a watcher reading

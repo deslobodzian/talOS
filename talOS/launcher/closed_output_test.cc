@@ -19,6 +19,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -686,6 +687,43 @@ TEST(ClosedOutput, SpawnedChildStartsWithDefaultSignals) {
       << ExitReason(status);
   EXPECT_EQ(report, "ignored:\nblocked:\n")
       << "spawned from a thread set up so:" << set;
+}
+
+// REQ-OPS-06
+// A member whose --describe says holds_stop is spawned with exactly the stop
+// signals blocked (SIGINT, SIGTERM, SIGHUP), so a stop sent while its runtime
+// starts stays pending; nothing else is, even signals the spawning thread
+// blocks itself (SIGCHLD, SIGPIPE), or the node would never see a child exit
+// or a broken pipe.
+TEST(ClosedOutput, HeldStopSpawnBlocksExactlyTheStopSignals) {
+  const std::string probe = Runfile("TALOS_SIGNAL_PROBE");
+  ASSERT_FALSE(probe.empty()) << "TALOS_SIGNAL_PROBE";
+  sigset_t blocked;
+  sigset_t mask;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGCHLD);
+  sigaddset(&blocked, SIGPIPE);
+  ASSERT_EQ(::pthread_sigmask(SIG_BLOCK, &blocked, &mask), 0);
+  std::string error;
+  int reader = -1;
+  const pid_t child =
+      SpawnProcess({probe}, error, SpawnOutput::kStdoutPipe, &reader, nullptr,
+                   /*hold_stop=*/true);
+  ::pthread_sigmask(SIG_SETMASK, &mask, nullptr);
+  ASSERT_GT(child, 0) << error;
+  std::string report;
+  ASSERT_TRUE(AwaitEnd(reader, report)) << report;
+  ::close(reader);
+  const int status = Reap(child);
+  FinishProcessGroup(child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << ExitReason(status);
+  int held[] = {SIGINT, SIGTERM, SIGHUP};
+  std::sort(std::begin(held), std::end(held));
+  std::string expected = "ignored:\nblocked:";
+  for (const int signal : held) expected += " " + std::to_string(signal);
+  expected += "\n";
+  EXPECT_EQ(report, expected);
 }
 
 }  // namespace
