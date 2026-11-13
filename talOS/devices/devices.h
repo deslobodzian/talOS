@@ -31,8 +31,15 @@
 // Incoming states pass hardware::AcceptState for this config's id and are
 // latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
-// hardware state younger than [robot] command_timeout_us. The link also
-// watches the bridge's /hw/status for the clock mapping sample_time() uses.
+// hardware state younger than [robot] command_timeout_us. While a device's
+// sample is invalid, a position getter (Motor, CANcoder and Encoder
+// position(), Gyro::yaw()) reads the last valid sample's position, through
+// the current rezero offset (0 before any valid sample), rather than the zero
+// an invalid sample carries, which would read as a jump; every other numeric
+// getter reads the sample as it is (zero for a motor's or CAN sensor's
+// rates and efforts). Only connected() says whether a reading is live. The
+// link also watches the bridge's /hw/status for the clock mapping
+// sample_time() uses.
 
 #include <cstddef>
 #include <functional>
@@ -164,7 +171,7 @@ class Motor {
   // never held.
   bool zeroed() const;
 
-  double position() const;  // rotations
+  double position() const;  // rotations; the last valid one while invalid
   double velocity() const;  // rotations/s
   double voltage() const;   // applied volts
   double current() const;   // stator amps

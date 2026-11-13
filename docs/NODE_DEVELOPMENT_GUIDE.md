@@ -274,7 +274,14 @@ Motor `temperature_c` is device temperature in Celsius; `supply_current_a`
 is supply-side current, not `current` (stator current). All three use 0.1-unit
 wire resolution. They are observations, not automatic thermal derating.
 Check `connected`/link freshness before using readings; numeric getters latch
-the last received sample when the hardware link is stale. SimHardware
+the last received sample when the hardware link is stale. While a device's
+sample is invalid (disconnected, aged out, masked after a reset, or the
+gateway unconfigured: [fault scope](../talOS/hardware/README.md#runtime-contract)),
+a position (`Motor`, `CANcoder` and `Encoder` `position()`, `Gyro` `yaw()`)
+reads the last valid one, in the current rezero frame (0 before any valid
+sample), since the zero an invalid sample carries would read as a jump; the
+rates and efforts (velocity, yaw rate, voltage, currents) read that zero. The
+same reads reach Python through the C ABI. SimHardware
 `set_motor(..., temperature_c=..., supply_current_a=..., stator_current_a=...)`
 injects diagnostics and the stator current `current()` reads through the same
 wire codec (C++ takes these optional arguments after ages, in that order).

@@ -169,6 +169,10 @@ struct HardwareLink::Impl {
     std::uint64_t clamped_count = 0;
     double position_offset = 0;  // Motor/Gyro software zero
     bool zeroed = false;         // position_offset was set by rezero
+    // The position (yaw) of the last accepted State whose sample was valid,
+    // in the hardware frame; 0 before one. A position read returns it while
+    // the latched sample is invalid (HeldPosition).
+    double held_position = 0;
     bool digital = false;
     double pwm = 0;
     // Where this device's sample was in the state arrays last time it was
@@ -270,6 +274,7 @@ struct HardwareLink::Impl {
     if (have_state) ForgetZeros(next);
     state = next;
     have_state = true;
+    HoldPositions();
     state_published = node.now() - detail::NodeAccess::subscription_age(
                                        node, state_subscription);
   }
@@ -305,6 +310,35 @@ struct HardwareLink::Impl {
       if (consecutive && Valid(next, device)) continue;
       device.zeroed = false;
     }
+  }
+
+  // Records each position-reading device's position from the new state
+  // while its sample there is valid. A loop over this node's handles, with
+  // no allocation.
+  void HoldPositions() {
+    for (Device& device : devices) {
+      switch (device.kind) {
+        case Kind::kMotor:
+          Hold(device, state.motors, state.motor_count);
+          break;
+        case Kind::kCANcoder:
+        case Kind::kGyro:
+          Hold(device, state.sensors, state.sensor_count);
+          break;
+        case Kind::kEncoder:
+          Hold(device, state.encoders, state.encoder_count);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+  template <class Sample, std::size_t N>
+  static void Hold(Device& device, const std::array<Sample, N>& samples,
+                   std::size_t count) {
+    const Sample sample =
+        FindSample(samples, count, device.id, device.sample_index);
+    if (sample.valid) device.held_position = sample.position_rot;
   }
 
   static bool AbsoluteFrame(const Device& device) {
@@ -582,6 +616,7 @@ hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
   const auto& device = impl.At(index, Kind::kMotor);
   auto sample = FindSample(impl.state.motors, impl.state.motor_count, device.id,
                            device.sample_index);
+  if (!sample.valid) sample.position_rot = device.held_position;
   if (!impl.Fresh()) sample.valid = false;
   sample.position_rot -= device.position_offset;
   return sample;
@@ -601,6 +636,7 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
   const auto& device = impl.SensorAt(index);
   auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
                            device.id, device.sample_index);
+  if (!sample.valid) sample.position_rot = device.held_position;
   if (!impl.Fresh()) sample.valid = false;
   sample.position_rot -= device.position_offset;
   return sample;
@@ -667,6 +703,7 @@ hardware::EncoderSample HardwareAccess::encoder_sample(const HardwareLink& link,
   const auto& device = impl.At(index, Kind::kEncoder);
   auto sample = FindSample(impl.state.encoders, impl.state.encoder_count,
                            device.id, device.sample_index);
+  if (!sample.valid) sample.position_rot = device.held_position;
   if (!impl.Fresh()) sample.valid = false;
   return sample;
 }
