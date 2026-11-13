@@ -203,7 +203,7 @@ PositionMechanism::PositionMechanism(Node& node, std::string_view name)
 }
 
 bool PositionMechanism::homed() const {
-  return homing_ == Homing::kNone || motor_.zeroed();
+  return homing_ == Homing::kNone || (motor_.zeroed() && !settling_);
 }
 
 void PositionMechanism::request(Request kind, double position_rot,
@@ -275,13 +275,33 @@ void PositionMechanism::update() {
   // carries: it neither counts as closed nor continues a run of closed
   // readings, as a disconnected motor ends a homing push's evidence, and it
   // is never a stuck switch.
+  //
+  // The switch sets the frame wherever the mechanism is when the run
+  // completes, usually still moving at the homing speed (the switch need
+  // not be at a hard stop). A profiled move started then would begin at
+  // that speed and overshoot past the switch by v^2 / (2 * acceleration),
+  // so the mechanism first settles: it is not homed, and drives nothing,
+  // until its last home_samples readings with valid feedback are all slower
+  // than homing_stall_rps (an invalid one breaks the run). Velocity does not
+  // depend on the frame, and rest is rest whether or not the mechanism is
+  // enabled or has a goal, so every tick's reading counts, before the zero
+  // too: a mechanism already at rest when the switch zeroes it (on a stop,
+  // or resting on its switch at power-on) is homed at once. The homing
+  // timeout runs only while a live goal waits on the settling (settle()).
   bool switch_closed = false;
   if (limit_switch_.has_value()) {
     switch_closed = limit_switch_->connected() &&
                     limit_switch_->get() == switch_closed_reads_;
     home_count_ = !motor_.zeroed() && switch_closed ? home_count_ + 1 : 0;
-    if (home_count_ >= home_samples_) motor_.rezero(home_rot_);
+    if (home_count_ >= home_samples_) {
+      motor_.rezero(home_rot_);
+      if (motor_.zeroed()) {
+        settling_ = true;
+        reset_homing_run();  // settling gets its own homing_timeout_us
+      }
+    }
   }
+  if (!motor_.zeroed()) settling_ = false;  // a dropped zero homes again
   if (absolute_.has_value() && !motor_.zeroed() && connected_ &&
       absolute_->connected() &&
       Aligned(motor_.position_time(), absolute_->position_time(),
@@ -291,7 +311,13 @@ void PositionMechanism::update() {
   }
   position_rot_ = motor_.position();
   velocity_rps_ = motor_.velocity();
-  if (drives_home() && motor_.zeroed()) reset_homing_run();
+  if (limit_switch_.has_value()) {
+    rest_count_ = connected_ && std::abs(velocity_rps_) < homing_stall_rps_
+                      ? std::min(rest_count_ + 1, home_samples_)
+                      : 0;
+    if (rest_count_ >= home_samples_) settling_ = false;  // at rest: homed
+  }
+  if (drives_home() && homed()) reset_homing_run();
   // A switch closed with the homed mechanism more than home_margin_rot into
   // its travel (away from home) is stuck or miswired.
   const double into_travel_rot =
@@ -313,6 +339,10 @@ void PositionMechanism::update() {
       push_since_.reset();
       homing_still_since_.reset();
       idle(PositionPhase::kUnhomed);
+      return;
+    }
+    if (settling_) {
+      settle(now);
       return;
     }
     if (home(now)) return;  // still homing, or faulted
@@ -388,6 +418,21 @@ bool PositionMechanism::home(Time now) {
   driving_ = true;
   idle(PositionPhase::kHoming);
   return true;
+}
+
+// One live tick of a goal waiting while the mechanism settles after the
+// limit switch set the frame (update() counts the slow readings): neutral,
+// as the motor's neutral mode stops it, never driven against the motion.
+void PositionMechanism::settle(Time now) {
+  if (!homing_since_) homing_since_ = now;
+  // A mechanism that never comes to rest (back-driven, falling) faults as
+  // a push that never finds home does.
+  if (now - *homing_since_ >= homing_timeout_) {
+    fault(PositionFault::kHomingTimeout);
+    return;
+  }
+  motor_.stop();
+  idle(PositionPhase::kHoming);
 }
 
 void PositionMechanism::reset_homing_run() {

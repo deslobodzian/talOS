@@ -27,9 +27,9 @@ class PositionPyTest(unittest.TestCase):
         self.sim = Sim(CONFIG)
         self.sim.add(node_py.PositionPy, "position_py")
         self.hw = SimHardware(self.sim)
-        self.hw.set_motor("position_py", "position_py", 0.0, 12.5)
-        # Starts on its home switch (closed reads False, see
-        # set_home): zeroed without moving.
+        self.hw.set_motor("position_py", "position_py", 0.0, 0.0)
+        # Starts at rest on its home switch (closed reads
+        # False, see set_home): zeroed without moving.
         self.hw.set_digital_input("position_py", "position_py_home", False)
 
     def teleop(self, enabled=True):
@@ -186,7 +186,7 @@ class PositionPyTest(unittest.TestCase):
 
     # Homing. The values are testdata/robot.toml's (homing_v = -1.0,
     # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor
-    # moving at 12.5 rps.
+    # at rest.
 
     def set_home(self, closed):
         """Normally open to ground behind the input's pull-up: closed reads
