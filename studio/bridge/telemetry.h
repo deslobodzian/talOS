@@ -36,6 +36,7 @@ namespace studio {
 
 inline constexpr int kTelemetryVersion = 3;
 
+using talos::telemetry::AlertLevel;
 using talos::telemetry::ChannelKind;
 
 struct TelemetryChannelInfo {
@@ -43,6 +44,8 @@ struct TelemetryChannelInfo {
   std::string unit;
   std::vector<std::string> labels;  // non-empty: enum channel
   ChannelKind kind{Talos::Telemetry::ChannelKind_Double};
+  // Not None: a Bool alert channel of that level (talOS/NAMING.md).
+  AlertLevel alert{Talos::Telemetry::AlertLevel_None};
 };
 
 struct TelemetryPose {
@@ -121,11 +124,13 @@ inline bool DecodeDictionary(const std::vector<std::string>& pages,
       channel.name = info->name()->str();
       if (!names.insert(channel.name).second ||
           channel.name.starts_with("derived/") ||
-          info->kind() > Talos::Telemetry::ChannelKind_MAX) {
+          info->kind() > Talos::Telemetry::ChannelKind_MAX ||
+          info->alert() > Talos::Telemetry::AlertLevel_MAX) {
         return false;
       }
       channel.unit = info->unit() != nullptr ? info->unit()->str() : "";
       channel.kind = info->kind();
+      channel.alert = info->alert();
       if (info->labels() != nullptr) {
         for (const auto* label : *info->labels()) {
           channel.labels.push_back(label != nullptr ? label->str() : "");
@@ -744,6 +749,21 @@ inline std::string_view ChannelKindName(ChannelKind kind) {
   }
 }
 
+// The level as the alert grammar spells it (`alert_<level>_<name>`), "none"
+// for a channel that is not an alert.
+inline std::string_view AlertLevelName(AlertLevel level) {
+  switch (level) {
+    case Talos::Telemetry::AlertLevel_Info:
+      return "info";
+    case Talos::Telemetry::AlertLevel_Warning:
+      return "warning";
+    case Talos::Telemetry::AlertLevel_Error:
+      return "error";
+    default:
+      return "none";
+  }
+}
+
 inline void AppendPose(std::string& out, const TelemetryPose& pose) {
   out += "{\"x\":";
   AppendTelemetryDouble(out, pose.x);
@@ -844,7 +864,9 @@ inline std::string ChannelsJson(const TelemetryState& state) {
       if (j != 0) out += ',';
       AppendEscaped(out, channel.labels[j]);
     }
-    out += "]}";
+    out += "],\"alert\":";
+    AppendEscaped(out, AlertLevelName(channel.alert));
+    out += '}';
   }
   out += "]}";
   return out;
