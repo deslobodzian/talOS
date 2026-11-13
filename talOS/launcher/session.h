@@ -240,6 +240,9 @@ struct SessionManifest {
   bool simulation{false};
   int64_t start_wall_ns{0};
   int64_t end_wall_ns{0};
+  // A stop request arrived before every member was started: the members
+  // with no run were never started.
+  bool stopped_before_start{false};
   std::size_t declared_topics{0};
   std::vector<NodeProcessInfo> nodes;
 

@@ -268,9 +268,15 @@ class Launcher {
   static std::string StallReport(const NodeLaunch& launch, bool constructing,
                                  SupervisionTime now);
 
-  // From here on SIGINT, SIGTERM and SIGHUP stop the session in order
-  // (stop_requested_); SIGHUP only when it was not ignored at the
-  // launcher's start (`nohup`), and then it stays ignored.
+  // From here on SIGINT, SIGTERM and SIGHUP stop the session in order;
+  // SIGHUP only when it was not ignored at the launcher's start (`nohup`),
+  // and then it stays ignored. The handler, which may run on any thread,
+  // requests the stop with process::RequestStop (process::stop_requested,
+  // and process::StopFd() readable, which a running --describe probe waits
+  // on) and then wakes the supervision loop (SupervisionWakeup::Wake). Both
+  // are async-signal-safe. Clears a stop an earlier session of this process
+  // took. RunSession calls it before a roster-starting launch creates
+  // anything.
   static void InstallSignals();
 
   // SpawnProcess for one run of a roster member: -1 with `error` naming the
@@ -412,13 +418,6 @@ class Launcher {
   // and --allow-graph-errors was not given (CheckEndpoints): Supervise stops
   // the session and Run returns 1.
   bool endpoints_refused_{false};
-  // Set by the stop signals' handler (InstallSignals), which may run on any
-  // thread and then wakes the supervision loop (SupervisionWakeup::Wake), and
-  // read by the supervision thread: a lock-free atomic is both
-  // async-signal-safe and race-free across threads, which volatile
-  // sig_atomic_t is not.
-  static inline std::atomic<int> stop_requested_{0};
-  static_assert(std::atomic<int>::is_always_lock_free);
 };
 
 }  // namespace talos::launcher
