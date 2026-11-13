@@ -10,6 +10,7 @@
 #include <cmath>
 #include <memory>
 #include <tuple>
+#include <utility>
 
 #include "config_wire.h"
 #include "gateway.h"
@@ -620,6 +621,71 @@ TEST(SimLimitSwitches, PressedForwardSwitchStopsOnlyForwardOutput) {
     StepBackend(backend, s, now_us, 5000, 1);
     EXPECT_EQ(s.motors[0].fault_flags, 0u);
   }
+}
+
+// A home switch reads closed exactly while the motor's reported position is
+// at its point or beyond it, with no hysteresis either way: "bottom"
+// (normally open, closed at or below -0.3) and "top" (closed reads true,
+// closed at or above 0.25) as the mechanism sweeps down into its -0.3 soft
+// limit and back up. At the limit the position is exactly -0.3: "bottom" is
+// closed there, and "below" (closed one ulp further down) is open. The
+// binding survives a reconfigure, as a config the bridge pushes to
+// sim_gateway.
+// REQ-DEV-10
+TEST(SimLimitSwitches, HomeSwitchClosesAtItsPositionExactly) {
+  Config c = SingleMotorConfig();
+  c.motors[0].soft_limits = true;
+  c.motors[0].reverse_limit_rot = -0.3;
+  c.motors[0].forward_limit_rot = 0.3;
+  for (const auto& [id, name] : {std::pair<uint16_t, const char*>{1, "bottom"},
+                                 {2, "top"},
+                                 {3, "below"}}) {
+    c.digital_inputs.push_back({.id = id, .name = name, .dio = id});
+  }
+  const double below = std::nextafter(-0.3, -1.0);
+  PhysicsSimBackend backend;
+  backend.SetHomeSwitches(
+      {{.input = "bottom", .motor = "roller", .closed_at_rot = -0.3},
+       {.input = "top",
+        .motor = "roller",
+        .closed_at_rot = 0.25,
+        .closed_above = true,
+        .closed_reads = true},
+       {.input = "below", .motor = "roller", .closed_at_rot = below}});
+  ASSERT_TRUE(backend.Configure(c));
+  State s{};
+  s.motor_count = 1;
+  uint64_t now_us = 0;
+  int bottom_closed = 0;
+  int top_closed = 0;
+  const auto sweep = [&](double volts) {
+    std::array<MotorRequest, 1> command{{{1, Mode::kVoltage, 0, volts, 0.0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    for (int i = 0; i < 100; ++i) {  // 0.5 s at about 8 rps: limit to limit
+      StepBackend(backend, s, now_us, 5000, 1);
+      const double p = s.motors[0].position_rot;
+      EXPECT_EQ(s.digital_inputs[0].value, !(p <= -0.3)) << p;
+      EXPECT_EQ(s.digital_inputs[1].value, p >= 0.25) << p;
+      EXPECT_EQ(s.digital_inputs[2].value, !(p <= below)) << p;
+      bottom_closed += p <= -0.3 ? 1 : 0;
+      top_closed += p >= 0.25 ? 1 : 0;
+    }
+  };
+  sweep(-1.0);
+  ASSERT_EQ(s.motors[0].position_rot, -0.3);
+  EXPECT_FALSE(s.digital_inputs[0].value);  // closed at its point
+  EXPECT_TRUE(s.digital_inputs[2].value);   // open an ulp short of its point
+  sweep(1.0);
+  EXPECT_EQ(s.motors[0].position_rot, 0.3);
+  EXPECT_GT(bottom_closed, 0);
+  EXPECT_GT(top_closed, 0);
+
+  // Reconfigured, the axis restarts at 0, between the switches: open.
+  c.motors[0].max_voltage = 11.0;
+  ASSERT_TRUE(backend.Configure(c));
+  StepBackend(backend, s, now_us, 5000, 1);
+  EXPECT_TRUE(s.digital_inputs[0].value);
+  EXPECT_FALSE(s.digital_inputs[1].value);
 }
 
 TEST(SimBelievability, PigeonMountOffsetPrecedesInversion) {
