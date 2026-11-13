@@ -404,7 +404,7 @@ TEST(HardwareNodeTrustTest, RejectsWrongIdentityWordsEvenWithinBound) {
 // by less than the timeout. One request built from the State sampled at
 // 1000: admitted while the latest State is command_timeout_us - 1 newer,
 // refused once it is command_timeout_us newer, its demand left out.
-// REQ-SAFE-16
+// REQ-SAFE-16, REQ-SAFE-39
 TEST(HardwareNodeTrustTest,
      AdmitsARequestOnlyWhileItsStateIsYoungerThanTheTimeout) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
