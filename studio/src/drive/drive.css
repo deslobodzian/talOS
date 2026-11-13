@@ -168,8 +168,16 @@ html, body {
 
 .body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
 /* A list that cannot fit scrolls, never hides a row; its rows that matter
- * come first (view.ts). */
+ * come first (view.ts), and its heading says how many are out of view. */
 .w-subsystems .body, .w-checks .body, .w-alerts .body { overflow-y: auto; display: block; }
+.out-of-view {
+  flex: none;
+  font-size: var(--drive-tag-font);
+  font-weight: 700;
+  color: var(--warn);
+  white-space: nowrap;
+}
+.out-of-view:empty { display: none; }
 
 .big { font-size: 34px; font-weight: 700; line-height: 1.1; }
 .small { font-size: 16px; }

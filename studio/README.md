@@ -95,9 +95,10 @@ the bridge. Light and dark follow the browser's colour scheme.
   decodes the feed with Studio's `TelemetryDecoder`, latches alerts with
   `AlertTracker`, and names the failed link. It has no timers or DOM: the page
   calls `tick(now)` every 100 ms.
-- [`src/drive/view.ts`](src/drive/view.ts) renders the layout as HTML text;
-  [`src/drive/main.ts`](src/drive/main.ts) loads the layout and swaps the text
-  in.
+- [`src/drive/view.ts`](src/drive/view.ts) renders each widget as HTML text,
+  and its `Painter` replaces only a widget whose text changed;
+  [`src/drive/main.ts`](src/drive/main.ts) loads the layout and gives the
+  painter the page's elements.
 
 What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 
@@ -146,7 +147,11 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   target lane, critical ones, and the rest.
 - Lists (subsystems, checks, alerts) never hide a row: rows are 22 px, in as
   many columns as the cell's width holds (subsystems at least 150 px wide,
-  checks 220 px), and a list that still overflows scrolls. No text is under
+  checks 220 px), and a list that still overflows scrolls. A redraw keeps a
+  list where it was scrolled (only a widget whose text changed is replaced,
+  and its replacement takes the old scroll position), and the list's heading
+  says how many rows are out of view, `3 above` or `+4 below` (a row cut by
+  the edge counts), measured in the page after each draw. No text is under
   12 px. The box sizes are `METRICS` in `view.ts`, written on the page as
   the `--drive-*` properties `drive.css` reads; `listRowsFit` computes from
   them that at 1366x768 the 2026 layout's subsystems cell holds 20 rows
