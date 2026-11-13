@@ -12,7 +12,7 @@ import {test} from 'node:test';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {esc, Painter, renderDashboard, renderStatus} from '../src/drive/view';
+import {esc, listRowsFit, METRICS, Painter, renderDashboard, renderStatus} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -639,6 +639,49 @@ test('a subsystems widget with a node filter shows every named node', () => {
                'a named node missing from the summary is not shown as unknown');
   assert.doesNotMatch(html, /drivetrain/, 'a node the filter does not name is shown');
   assert.doesNotMatch(html, /more</, '"+N more" counts nodes the filter does not admit');
+});
+
+// REQ-OPS-34, REQ-OPS-39: at 1366x768 (a Driver Station laptop) every row of
+// the 2026 layout's lists is visible without scrolling: the subsystems cell
+// holds 14 nodes (the 13 of a 2026 session and one spare) and the pre-match
+// cell all its checks. Computed from the page's box sizes, which the page
+// writes as the custom properties drive.css lays out with; a browser
+// screenshot is what verifies it.
+test('the 2026 lists fit their cells at 1366x768', () => {
+  const page = {width: 1366, height: 768};
+  const subsystems = LAYOUT.widgets.find(w => w.kind === 'subsystems')!;
+  const checks = LAYOUT.widgets.find(w => w.kind === 'checks')!;
+  assert.equal(checks.kind, 'checks');
+  const nodeRows = listRowsFit(LAYOUT, subsystems.at, page, METRICS.node_column);
+  assert.ok(nodeRows >= 14,
+            `subsystems at ${JSON.stringify(subsystems.at)} shows ${nodeRows} rows, needs 14`);
+  const checkRows = listRowsFit(LAYOUT, checks.at, page, METRICS.check_column);
+  assert.ok(checkRows >= checks.items.length,
+            `checks at ${JSON.stringify(checks.at)} shows ${checkRows} rows, needs ${checks.items.length}`);
+  // The stylesheet lays out with exactly these sizes: it reads every one and
+  // no other --drive-* property.
+  const css = readFileSync(new URL('../src/drive/drive.css', import.meta.url), 'utf8');
+  const read = new Set([...css.matchAll(/var\(--drive-([a-z-]+)\)/g)].map(m => m[1]));
+  assert.deepEqual([...read].sort(),
+                   Object.keys(METRICS).map(k => k.replace(/_/g, '-')).sort());
+});
+
+// REQ-OPS-36: when the subsystems list is longer than its cell, the rows
+// that matter come first: failed nodes (critical before not), then one
+// driving from a target lane, then critical ones, then the rest.
+test('subsystems rows put failed and driving nodes first', () => {
+  const node = (name: string, extra: object) => ({name, alive: true, critical: false, restarts: 0,
+                                                  quarantined: false, drives: null, ...extra});
+  const h = harness();
+  h.connect(0);
+  h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+    registry: true, omitted: 0, nodes: [
+      node('camera', {}), node('telemetry', {critical: true}),
+      node('drivetrain', {critical: true, drives: 'teleop'}), node('vision', {alive: false}),
+      node('shooter', {critical: true, alive: false})]}));
+  const html = widgetHtml(render(h), 'Subsystems');
+  const order = [...html.matchAll(/<span class="name"[^>]*>([^<]*)</g)].map(m => m[1]);
+  assert.deepEqual(order, ['shooter', 'vision', 'drivetrain', 'telemetry', 'camera']);
 });
 
 // REQ-OPS-36: a drawing fault must not leave the last grid looking current:

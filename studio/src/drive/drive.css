@@ -2,7 +2,13 @@
  * screen read at arm's length: the grid fills the viewport and values are
  * large. System fonts only: the page makes no request beyond the bridge.
  * Every state is a word as well as a colour; STALE also dims and strikes
- * the values through. */
+ * the values through.
+ *
+ * The box sizes a list's fit depends on (page padding, gaps, the top bar,
+ * a cell's border and padding, its heading, a list row, list columns and
+ * fonts) are the --drive-* custom properties that view.ts's METRICS writes
+ * on .page; they are stated only there, so listRowsFit computes with what
+ * this sheet lays out. No text is smaller than --drive-min-font. */
 
 :root {
   color-scheme: light dark;
@@ -57,12 +63,14 @@ html, body {
   font: 16px/1.25 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
 }
 
-#drive {
+#drive { height: 100vh; }
+
+.page {
   display: flex;
   flex-direction: column;
-  height: 100vh;
-  padding: 6px;
-  gap: 6px;
+  height: 100%;
+  padding: var(--drive-page-pad);
+  gap: var(--drive-gap);
 }
 
 .loading { font-size: 22px; margin: 24px; }
@@ -71,7 +79,8 @@ html, body {
   display: flex;
   align-items: center;
   gap: 12px;
-  min-height: 40px;
+  flex: none;
+  height: var(--drive-top);
 }
 
 .top h1 { font-size: 22px; margin: 0; white-space: nowrap; }
@@ -112,13 +121,13 @@ html, body {
   cursor: pointer;
 }
 
-.meta { color: var(--muted); font-size: 0.8em; margin-left: 6px; }
+.meta { color: var(--muted); font-size: max(var(--drive-min-font), 0.8em); margin-left: 6px; }
 
 .grid {
   flex: 1;
   min-height: 0;
   display: grid;
-  gap: 6px;
+  gap: var(--drive-gap);
 }
 
 .w {
@@ -128,15 +137,18 @@ html, body {
   min-height: 0;
   overflow: hidden;
   background: var(--surface);
-  border: 1px solid var(--border);
+  border: var(--drive-cell-border) solid var(--border);
   border-radius: 6px;
-  padding: 4px 8px;
+  padding: var(--drive-cell-pad-y) var(--drive-cell-pad-x);
 }
 
 .w > header {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: none;
+  height: var(--drive-header);
+  overflow: hidden;
 }
 
 .w h2 {
@@ -155,11 +167,14 @@ html, body {
 .w h3 { margin: 4px 0 2px; font-size: 14px; color: var(--muted); font-weight: 600; }
 
 .body { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+/* A list that cannot fit scrolls, never hides a row; its rows that matter
+ * come first (view.ts). */
+.w-subsystems .body, .w-checks .body, .w-alerts .body { overflow-y: auto; display: block; }
 
 .big { font-size: 34px; font-weight: 700; line-height: 1.1; }
 .small { font-size: 16px; }
 .row { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
-.unit { font-size: 0.55em; color: var(--muted); font-weight: 600; }
+.unit { font-size: max(var(--drive-min-font), 0.55em); color: var(--muted); font-weight: 600; }
 .absent { color: var(--muted); font-style: italic; font-weight: 400; font-size: 20px; }
 .none { color: var(--muted); margin: 0; }
 
@@ -168,9 +183,11 @@ html, body {
 
 .tag {
   display: inline-block;
-  font-size: 13px;
+  flex: none;
+  font-size: var(--drive-tag-font);
+  line-height: 1;
   font-weight: 700;
-  padding: 1px 6px;
+  padding: 1px 5px;
   border-radius: 4px;
   border: 1.5px solid currentColor;
   margin-right: 4px;
@@ -203,19 +220,40 @@ html, body {
 
 ul { list-style: none; margin: 0; padding: 0; }
 
+/* List rows: one fixed height, the state words never squeezed out (a long
+ * name ellipsizes instead), in as many columns of at least --drive-*-column
+ * as the cell's width holds. */
+.nodes, .checks {
+  display: grid;
+  column-gap: var(--drive-list-gap);
+  align-content: start;
+}
+.nodes { grid-template-columns: repeat(auto-fill, minmax(var(--drive-node-column), 1fr)); }
+.checks { grid-template-columns: repeat(auto-fill, minmax(var(--drive-check-column), 1fr)); }
 .alerts li, .nodes li, .checks li {
-  font-size: 17px;
-  padding: 2px 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: var(--drive-row);
+  font-size: var(--drive-row-font);
+  line-height: 1.2;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
   overflow: hidden;
+  min-width: 0;
+}
+.alerts li > *, .nodes li > *, .checks li > * { flex: none; }
+.alerts .name, .nodes .name, .checks .name, .nodes .meta {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
 }
-.alerts .level { font-weight: 800; font-size: 13px; margin-right: 4px; }
+.alerts .level { font-weight: 800; font-size: var(--drive-tag-font); margin-right: 4px; }
 .alert-error .level { color: var(--bad); }
 .alert-warning .level { color: var(--warn); }
 .alert-info .level { color: var(--info); }
-.nodes .name, .checks .name { margin-right: 8px; font-weight: 600; }
+.nodes .name, .checks .name { font-weight: 600; }
 .nodes .more { color: var(--muted); }
 
 .field { flex: 1; min-height: 0; width: 100%; }

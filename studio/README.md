@@ -86,7 +86,7 @@ bridge at `/drive` (REQ-OPS-34). It draws the layout `[studio] dashboard` names
 [telemetry README](../talOS/telemetry/README.md#dashboard-layout)) from the
 `/drive` feed ([bridge README](bridge/README.md#driver-dashboard-feed)). It is
 plain TypeScript with no React, a second entry of the same Vite build
-([`vite.config.mjs`](vite.config.mjs)), so it loads about 45 kB
+([`vite.config.mjs`](vite.config.mjs)), so it loads about 47 kB
 (`assets/drive-*.js`, `assets/drive-*.css` and the chunk it shares with
 Studio: the telemetry decoder and the alert model) and makes no request beyond
 the bridge. Light and dark follow the browser's colour scheme.
@@ -140,8 +140,18 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   alert raised this match with its count. The routine widget names the routine
   from the channel's labels, or `routine #N` out of range. Subsystems lists
   the drive summary's nodes; `unknown` when the registry could not be read.
-  A widget whose `nodes` names them lists exactly those, in that order, one
-  the summary does not list reading `unknown`.
+  A widget whose `nodes` names them lists exactly those, one the summary
+  does not list reading `unknown`. Failed nodes come first (critical ones
+  before others), then one missing from the summary, one driving from a
+  target lane, critical ones, and the rest.
+- Lists (subsystems, checks, alerts) never hide a row: rows are 22 px, in as
+  many columns as the cell's width holds (subsystems at least 150 px wide,
+  checks 220 px), and a list that still overflows scrolls. No text is under
+  12 px. The box sizes are `METRICS` in `view.ts`, written on the page as
+  the `--drive-*` properties `drive.css` reads; `listRowsFit` computes from
+  them that at 1366x768 the 2026 layout's subsystems cell holds 20 rows
+  (two columns of 10) and its pre-match cell 12 (two of 6), computed, not
+  measured in a browser.
 - A widget kind it does not draw is an "Unsupported widget" cell, and one
   with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line. A text message, or a
