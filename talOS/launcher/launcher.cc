@@ -450,6 +450,26 @@ int Launcher::RunSession() {
     std::cerr << "launcher: no nodes declared in config\n";
     return 1;
   }
+  // A member's name is its file names (<name>.log, <name>.tlog) and its
+  // registry row. Subsystem keys are unique, so two members of one name are
+  // a subsystem and a member the launcher adds (the hardware bridge, the
+  // sim gateway, the Studio bridge): refused, naming the key, since either
+  // would take the other's files and the launcher's own would be taken for
+  // the robot's node, or the reverse.
+  for (std::size_t i = 0; i < node_specs.size(); ++i) {
+    for (std::size_t j = i + 1; j < node_specs.size(); ++j) {
+      if (node_specs[i].name != node_specs[j].name) continue;
+      const NodeSpec& added =
+          node_specs[i].studio_bridge ? node_specs[i] : node_specs[j];
+      std::cerr << "launcher: [subsystems." << node_specs[i].name
+                << "] has the name of the launcher's own "
+                << (added.studio_bridge
+                        ? "Studio bridge, which --start-studio-bridge adds"
+                        : "roster member of that name")
+                << "; rename the subsystem\n";
+      return 1;
+    }
+  }
   // A member's name is its file names (<name>.log, <name>.tlog). One that
   // breaks the node-name rule is a graph error the lint reports, but
   // --allow-graph-errors overrides the lint, and such a name can take a file
@@ -501,7 +521,7 @@ int Launcher::RunSession() {
       // registers its own.
       const auto registering = static_cast<std::size_t>(std::count_if(
           node_specs.begin(), node_specs.end(),
-          [](const NodeSpec& spec) { return spec.name != kStudioBridgeName; }));
+          [](const NodeSpec& spec) { return !spec.studio_bridge; }));
       const std::string full =
           RegistryCapacityError(introspect::RegistryReader{}, registering);
       if (!full.empty()) {
@@ -615,7 +635,7 @@ int Launcher::RunSession() {
       proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);
     }
     proc.described = described[i].answered;
-    if (spec.name == kStudioBridgeName) {
+    if (spec.studio_bridge) {
       studio.emplace(i, spec, proc, robot_config, options_, described,
                      graph_path, *output_);
     }
@@ -795,7 +815,7 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
     return 1;
   }
   if (spec->name == kHardwareNodeName || spec->name == kSimGatewayName ||
-      spec->name == kStudioBridgeName) {
+      spec->studio_bridge) {
     std::cerr << "launcher: " << spec->name
               << " is not a talos node and has no input replay\n";
     return 1;

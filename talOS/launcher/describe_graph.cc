@@ -522,7 +522,7 @@ std::vector<naming::Diagnostic> DescribeGraph(
                  "' but the binary describes itself as '" +
                  described.declared.name + "'"});
       }
-    } else if (spec.name == kStudioBridgeName) {
+    } else if (spec.studio_bridge) {
       probe_findings.push_back(StudioBridgeFinding(
           spec, described.missing, described.error, options.bundle_dir));
     } else if (described.missing) {

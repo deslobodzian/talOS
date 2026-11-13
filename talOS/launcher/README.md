@@ -263,7 +263,11 @@ resolved under `bazel-bin/` like a node's) and the webroot. A bridge whose
 unable to run: a missing library, a crash) is one warning in the graph,
 naming the `bazel build` command or the bundle, and the launcher leaves it
 out of the session, which runs without Studio, `--allow-graph-errors` or
-not; a missing webroot lets it start and fail (below). A bundle built with `talos_bundle`'s
+not; a missing webroot lets it start and fail (below). This holds for the
+member the flag adds only, never for a robot's own subsystem named
+`studio_bridge`, which is an ordinary node; with the flag, such a subsystem
+would share the bridge's name, and the launch is refused naming its
+`[subsystems.studio_bridge]` key. A bundle built with `talos_bundle`'s
 `studio_bridge` and `studio_webroot` carries both
 ([DEPLOYMENT.md](../../docs/DEPLOYMENT.md#build-a-bundle)): its manifest's
 `[studio]` table registers the bundled bridge under its label and the name

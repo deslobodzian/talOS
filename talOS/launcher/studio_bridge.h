@@ -51,20 +51,21 @@ bool ShouldRetryStudioBridge(
 bool DropUnansweredStudioBridge(std::vector<NodeSpec>& specs,
                                 std::vector<NodeDescription>& described);
 
-// The topic the bridge watches: the watcher its --describe declared (it
-// reads the `[studio] topic` key the telemetry node publishes on), or that
-// key itself when its description declares none. A bridge that did not
-// answer never gets here: Run constructs StudioBridge only after
-// DropUnansweredStudioBridge has removed one.
-std::string StudioBridgeWatchTopic(
-    const std::vector<NodeDescription>& described,
-    const config::RobotConfig& robot_config);
+// The topic the bridge watches, from `bridge`, its own description: the
+// watcher its --describe declared (it reads the `[studio] topic` key the
+// telemetry node publishes on), or that key itself when its description
+// declares none. A bridge that did not answer never gets here: Run
+// constructs StudioBridge only after DropUnansweredStudioBridge has removed
+// one.
+std::string StudioBridgeWatchTopic(const NodeDescription& bridge,
+                                   const config::RobotConfig& robot_config);
 
 class StudioBridge {
  public:
   using Clock = std::chrono::steady_clock;
 
-  // `proc` is the bridge's roster entry; it keeps no .tlog.
+  // `proc` is the bridge's roster entry, and described[index] its
+  // description; it keeps no .tlog.
   StudioBridge(std::size_t index, const NodeSpec& spec, NodeProcessInfo& proc,
                const config::RobotConfig& robot_config,
                const LauncherOptions& options,
