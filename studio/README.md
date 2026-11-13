@@ -86,7 +86,7 @@ bridge at `/drive` (REQ-OPS-34). It draws the layout `[studio] dashboard` names
 [telemetry README](../talOS/telemetry/README.md#dashboard-layout)) from the
 `/drive` feed ([bridge README](bridge/README.md#driver-dashboard-feed)). It is
 plain TypeScript with no React, a second entry of the same Vite build
-([`vite.config.mjs`](vite.config.mjs)), so it loads about 47 kB
+([`vite.config.mjs`](vite.config.mjs)), so it loads about 51 kB
 (`assets/drive-*.js`, `assets/drive-*.css` and the chunk it shares with
 Studio: the telemetry decoder and the alert model) and makes no request beyond
 the bridge. Light and dark follow the browser's colour scheme.
@@ -157,23 +157,25 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   before others), then one missing from the summary, one driving from a
   target lane, critical ones, and the rest.
 - Lists (subsystems, checks, alerts) never hide a row: rows are 22 px, in as
-  many columns as the cell's width holds (subsystems at least 150 px wide,
-  checks 220 px), and a list that still overflows scrolls. A redraw keeps a
-  list where it was scrolled (only a widget whose text changed is replaced,
-  and its replacement takes the old scroll position), and the list's heading
-  says how many rows are out of view, `3 above` or `+4 below` (a row cut by
-  the edge counts), measured in the page after each draw. No text is under
-  12 px. The box sizes are `METRICS` in `view.ts`, written on the page as
-  the `--drive-*` properties `drive.css` reads; `listRowsFit` computes from
-  them that at 1366x768 the 2026 layout's subsystems cell holds 20 rows
-  (two columns of 10) and its pre-match cell 12 (two of 6), computed, not
-  measured in a browser. A row too narrow gives up its notes (restarts,
-  drives) first, then its name down to 8 ch (ellipsized; the tooltip has the
-  whole name and the notes), and only then its state word. With 8 px per
-  character assumed (`GLYPH_PX`, a model), the 2026 subsystems columns are
-  154 px and the worst row, `FAILING` with both notes, still shows 8
-  characters of its name, enough to tell `front_left_camera` from
-  `front_right_camera`.
+  many columns as the cell's width holds (subsystems at least 140 px wide,
+  checks 220 px), and a list that still overflows scrolls. A list's body is
+  snapped to whole rows, so no row shows cut in half. A redraw keeps a list
+  where it was scrolled (only a widget whose text changed is replaced, and
+  its replacement takes the old scroll position), and the list's heading
+  says how many rows are out of view, `3 above` or `+4 below`, measured in
+  the page after each draw; a heading's session label ellipsizes before the
+  heading does. No text is under 12 px. The box sizes are `METRICS` in
+  `view.ts`, written on the page as the `--drive-*` properties `drive.css`
+  reads; `listRowsFit` computes from them that the 2026 layout's subsystems
+  cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720
+  (two of 9), and its pre-match cell 12 and 10: computed, not measured in a
+  browser. A row too narrow gives up its note (restarts, drives) first, then
+  its name down to 8 ch (ellipsized; the tooltip has the whole name and the
+  note), and only then its state word. With 8 px per character assumed
+  (`GLYPH_PX`, a model), the 2026 subsystems columns are 154 px (143 px at
+  1280x720) and the worst row, `FAILING` with a note, still shows 8
+  characters of its name (7 at 1280x720), enough to tell
+  `front_left_camera` from `front_right_camera`.
 - A widget kind it does not draw is an "Unsupported widget" cell, and one
   with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line (`N malformed messages
