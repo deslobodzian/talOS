@@ -7,7 +7,7 @@
 import {channelDisplay, type Snapshot} from '../core';
 import {alertLevelName, type ActiveAlert, type LatchedAlert} from '../data/alerts';
 import {FIELD_HEIGHT_M, FIELD_WIDTH_M} from '../panels/field/geometry';
-import type {DriveModel, Link} from './feed';
+import type {DriveModel, Link, SummaryNode} from './feed';
 import type {CheckItem, Layout, Widget} from './layout';
 
 export function esc(text: string): string {
@@ -153,9 +153,15 @@ function alertsWidget(model: DriveModel): string {
 function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): string {
   const summary = model.summary;
   if (!summary) return `<p class="none">${ABSENT}</p>`;
-  const nodes = w.nodes.length ?
-      summary.nodes.filter(n => w.nodes.includes(n.name)) : summary.nodes;
+  // A filter shows every node it names, in its order: one the summary does
+  // not list (cut off by `omitted`, or not in the session) is unknown.
+  const nodes: (SummaryNode|string)[] = w.nodes.length ?
+      w.nodes.map(name => summary.nodes.find(n => n.name === name) ?? name) :
+      summary.nodes;
   const rows = nodes.map(n => {
+    if (typeof n === 'string')
+      return `<li><span class="name">${esc(n)}</span>${tag('unknown', 'neutral')}` +
+          '<span class="meta">not in the summary</span></li>';
     const alive = !summary.registry ? tag('unknown', 'neutral') :
         n.alive ? tag('UP', 'good') : tag('DOWN', n.critical ? 'bad' : 'warn');
     const restarts = summary.supervised && n.restarts > 0 ?
@@ -165,7 +171,8 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
         `<span class="meta">drives ${esc(n.drives)}</span>` : '';
     return `<li><span class="name">${esc(n.name)}</span>${alive}${quarantined}${restarts}${drives}</li>`;
   });
-  if (summary.omitted > 0) rows.push(`<li class="more">+${summary.omitted} more</li>`);
+  if (summary.omitted > 0 && !w.nodes.length)
+    rows.push(`<li class="more">+${summary.omitted} more</li>`);
   return `<ul class="nodes">${rows.join('')}</ul>`;
 }
 
@@ -319,10 +326,14 @@ function widget(w: Widget, model: DriveModel, now: number): string {
 
 const LINK_WORD: Record<Link, string> = {
   ok: 'OK', connecting: 'CONNECTING', bridge: 'BRIDGE LINK',
-  telemetry: 'TELEMETRY', roborio: 'ROBORIO LINK', replaced: 'REPLACED'
+  telemetry: 'TELEMETRY', hardware: 'HARDWARE BRIDGE', roborio: 'ROBORIO LINK',
+  replaced: 'REPLACED'
 };
 
-export function renderStatus(model: DriveModel, now: number): string {
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+// `skipped`: the layout's widgets with no cell this page can read.
+export function renderStatus(model: DriveModel, now: number, skipped = 0): string {
   const status = model.status(now);
   const c = model.counters;
   const ignored = c.malformed_binary + c.malformed_text;
@@ -330,7 +341,10 @@ export function renderStatus(model: DriveModel, now: number): string {
       `<b>${LINK_WORD[status.link]}</b> ${esc(status.text)}` +
       (status.link === 'replaced' ?
            ' <button type="button" data-action="reconnect">Reconnect</button>' : '') +
-      (ignored ? ` <span class="meta">${ignored} malformed message${ignored === 1 ? '' : 's'} ignored</span>` : '') +
+      (ignored ? ` <span class="meta">${plural(ignored, 'malformed message')} ignored</span>` : '') +
+      (skipped > 0 ?
+           ` <span class="meta bad">${plural(skipped, 'layout widget')} not drawn: no cell this page can read</span>` :
+           '') +
       '</div>';
 }
 
@@ -344,10 +358,40 @@ export function gridStyle(layout: Layout): string {
       `grid-template-rows:repeat(${layout.rows},minmax(0,1fr))`;
 }
 
+// One frame's text, and what the page swaps in for it: null where nothing
+// changed, and `errored` when drawing failed, so the page marks the grid it
+// keeps (it shows values no longer updated) and the status line says why.
+export type Draw = {status: string; grid: string};
+export type Paint = {status: string|null; grid: string|null; errored: boolean};
+
+export class Painter {
+  private shown: Draw = {status: '', grid: ''};
+
+  paint(draw: () => Draw): Paint {
+    let next: Draw;
+    try {
+      next = draw();
+    } catch (error) {
+      // Forget what is shown, so the first good draw repaints it all.
+      this.shown = {status: '', grid: ''};
+      return {
+        status: '<div class="status link-error" role="status"><b>DRAWING ERROR</b> ' +
+            `The dashboard is not updating: ${esc(String(error))}</div>`,
+        grid: null,
+        errored: true
+      };
+    }
+    const status = next.status !== this.shown.status ? next.status : null;
+    const grid = next.grid !== this.shown.grid ? next.grid : null;
+    this.shown = next;
+    return {status, grid, errored: false};
+  }
+}
+
 // The whole page body; the page itself updates the status line and the grid
 // apart, so a button in the status line survives grid updates.
 export function renderDashboard(layout: Layout, model: DriveModel, now: number): string {
   return `<header class="top"><h1>${esc(layout.title)}</h1>` +
-      `<div class="status-slot">${renderStatus(model, now)}</div></header>` +
+      `<div class="status-slot">${renderStatus(model, now, layout.skipped)}</div></header>` +
       `<main class="grid" style="${gridStyle(layout)}">${renderWidgets(layout, model, now)}</main>`;
 }

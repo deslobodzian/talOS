@@ -302,9 +302,11 @@ export function createFrameDetectors(): FrameDetector[] {
   // is dropped by design), ownership rejections (error: a subsystem
   // addressed a device it does not own), clock resets (info). `gateway_rejected_command_count`
   // is deferred and classified. The gateway does not count an all-neutral
-  // command that lost a race with an epoch change, nor a neutral while
-  // disabled; it counts every other refused command and, while enabled and
-  // faulted, every refused neutral (TODO RT-12). The run is only a warning
+  // command that lost a race with an epoch change, nor a neutral of the
+  // current epoch while it is unconfigured, uncommissioned or disabled
+  // (Gateway::Accept); it counts every other refused command and,
+  // while it could drive but is faulted, configuring or unhealthy, every
+  // refused neutral (TODO RT-12). The run is only a warning
   // when the Driver Station stays enabled for half a second of continuous
   // increments.
   incrementDetector({

@@ -46,6 +46,9 @@ export type Layout = {
   alerts: boolean;
   channels: string[];
   widgets: Widget[];
+  // Widgets with no cell this page can read: not drawn, and counted on the
+  // status line so none vanishes silently.
+  skipped: number;
 };
 
 export class LayoutError extends Error {}
@@ -135,8 +138,8 @@ function readWidget(v: unknown, index: number): Widget|null {
 
 // Reads /drive/layout.json. Throws LayoutError only when there is no grid to
 // draw; a widget it cannot read is `unsupported`, and one with no cell is
-// left out (counted in the returned `skipped`).
-export function parseLayout(json: unknown): Layout&{skipped: number} {
+// left out and counted in `skipped`, which the status line shows.
+export function parseLayout(json: unknown): Layout {
   if (!isObject(json)) throw new LayoutError('layout is not a JSON object');
   const columns = num(json.columns, 0), rows = num(json.rows, 0);
   if (!Number.isInteger(columns) || !Number.isInteger(rows) || columns < 1 ||

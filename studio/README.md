@@ -118,7 +118,17 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   bridge link (no socket, or nothing heard for 500 ms), telemetry (messages
   but no new tick; or none 1.5 s after connecting, the time a refilling bucket
   may take to send the dictionary, which until then reads as connecting), then
-  the RoboRIO link (`hw/status/alert_error_link_lost`).
+  the hardware bridge (HARDWARE BRIDGE: no `/hw/status` sample, so
+  `hardware_node` on the main processor publishes nothing) and the RoboRIO
+  link (`hw/status/alert_error_link_lost`). It judges those two only when the
+  feed carries that channel: the layout has an `alerts` widget
+  (`/drive/layout.json` `"alerts"` true) or names the channel. A layout
+  without either does not report the hardware bridge or the RoboRIO link.
+- A drawing error keeps the last grid, marks every widget stale with a
+  dashed red border, and says DRAWING ERROR on the status line until a draw
+  succeeds.
+- The layout is read once, when the page loads: after the bridge restarts
+  with an edited layout, reload the page.
 - On a close or error it reconnects every 1 s, one socket at a time: each
   attempt starts 1 s after the previous one started, so a connect that has
   not opened by then is abandoned for the next, and a socket silent for 2 s
@@ -130,7 +140,10 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   alert raised this match with its count. The routine widget names the routine
   from the channel's labels, or `routine #N` out of range. Subsystems lists
   the drive summary's nodes; `unknown` when the registry could not be read.
-- A widget kind it does not draw is an "Unsupported widget" cell. A message
+  A widget whose `nodes` names them lists exactly those, in that order, one
+  the summary does not list reading `unknown`.
+- A widget kind it does not draw is an "Unsupported widget" cell, and one
+  with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line. A text message, or a
   binary one before the connection's first tick, is then ignored; a binary
   one after it closes the connection and reconnects, since the updates carry

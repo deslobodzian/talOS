@@ -34,7 +34,7 @@ check below.
   | **BRIDGE LINK** `Dashboard to bridge link down` or `nothing heard` | the laptop does not reach the main processor's port 5800: main processor off, still booting, off the robot network, or started with `--no-studio` | check the main processor's power and Ethernet; if it persists, [main processor not reachable](#main-processor-not-reachable) |
   | **TELEMETRY** `Telemetry stale` | the bridge is up but the telemetry node publishes nothing new: every value is stale | check the telemetry node in Studio at `/` (the pit); the robot can drive, but the dashboard shows nothing current |
   | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, a wrong address, or another protocol version; every output is neutral | read the Driver Station message log; on a protocol error redeploy both sides from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
-  | **ROBORIO LINK** `RoboRIO link unknown` | no hardware status: the hardware bridge (`hardware_node`) is not publishing | check Subsystems below |
+  | **HARDWARE BRIDGE** `Hardware bridge not publishing` | no hardware status: the hardware bridge (`hardware_node`) on the main processor is not publishing, so the RoboRIO link cannot be judged | check Subsystems below |
   | **REPLACED** | another `/drive` page took this page's slot (the layout's `drive_clients` are held) | close the other page, then press Reconnect, which takes the oldest page's slot |
 
 - [ ] Match: `DISABLED`; the alliance and station are the assigned ones; at
