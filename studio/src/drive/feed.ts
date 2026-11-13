@@ -45,14 +45,21 @@
 //     interval or the 100 ms heartbeat; until STALE_MS after the keyframe
 //     that is still `connecting`, then stale telemetry.
 //   - Robustness. A message that does not decode is counted, and nothing it
-//     carries reaches the views. A text message, or a binary one before the
-//     socket's first tick, is then ignored. A binary one after it closes the
-//     socket as an error: the updates carry only changes, so a lost page
-//     (or a later page of an update whose earlier pages the decoder applied)
-//     would leave a value wrong while later ticks read as current; the
-//     reconnect brings a whole dictionary and keyframe.
+//     carries reaches the views. A text message, or a binary one before any
+//     value page of the socket decoded, is then ignored. A binary one after
+//     that closes the socket as an error: the updates carry only changes,
+//     and a keyframe's first page clears every channel, so a lost page (or
+//     a later page of a keyframe or an update whose earlier pages the
+//     decoder applied) would leave a value wrong or absent while later
+//     ticks read as current; the reconnect brings a whole dictionary and
+//     keyframe. Such a close is the feed's fault, not the link's: until a
+//     new tick the status names the telemetry feed, and after
+//     DECODE_RETRIES of them in a row (each within DECODE_STREAK_MS of its
+//     socket opening) attempts start DECODE_RETRY_MS apart, so a feed that
+//     never decodes does not spend the slot's byte budget on a dictionary
+//     every second.
 
-import {type Snapshot, TelemetryDecoder} from '../core';
+import {type Snapshot, splitPages, TelemetryDecoder} from '../core';
 import {AlertTracker} from '../data/alerts';
 
 export const RECONNECT_MS = 1000;
@@ -61,6 +68,9 @@ export const RENDER_MS = 100;
 export const SILENCE_MS = 500;
 export const CONNECTING_GRACE_MS = 1500;
 export const DEAD_AFTER_MS = 2000;
+export const DECODE_RETRIES = 3;
+export const DECODE_RETRY_MS = 5000;
+export const DECODE_STREAK_MS = 10_000;
 export const REPLACED_CODE = 4000;
 export const LINK_LOST_CHANNEL = 'hw/status/alert_error_link_lost';
 // The longest history a graph or a field trail can ask for (README: 30 s),
@@ -178,6 +188,8 @@ export class DriveModel {
   private tickThisSocket = false;  // the connect-time keyframe arrived
   private keyframeAt = 0;
   private suspended = false;  // see suspend()
+  private valuesThisSocket = false;  // a value page of this socket decoded
+  private decodeFailures = 0;  // the page's own closes for a decode failure, in a row
   private readonly tracked: Set<string>;
   private readonly histories = new Map<string, Point[]>();
 
@@ -256,13 +268,17 @@ export class DriveModel {
 
   // The one status line: which link failed, upstream first.
   status(now: number): LinkStatus {
+    const undecodable = {link: 'telemetry' as const,
+                         text: 'Telemetry feed could not be decoded: reload the page'};
     switch (this.connection) {
       case 'replaced':
         return {link: 'replaced',
                 text: 'Replaced by another dashboard: press Reconnect to take the slot back'};
       case 'waiting':
+        if (this.decodeFailures > 0) return undecodable;
         return {link: 'bridge', text: 'Dashboard to bridge link down: reconnecting'};
       case 'connecting':
+        if (this.decodeFailures > 0) return undecodable;
         if (!this.everOpened && now - this.firstAttemptAt < CONNECTING_GRACE_MS)
           return {link: 'connecting', text: 'Connecting to the robot'};
         return {link: 'bridge', text: 'Dashboard to bridge link down: reconnecting'};
@@ -275,6 +291,7 @@ export class DriveModel {
     if (this.suspended)
       return {link: 'telemetry', text: 'Telemetry stale: the page missed time (laptop asleep), ' +
                                        'waiting for a new tick'};
+    if (this.decodeFailures > 0 && this.lastTickAt === null) return undecodable;
     if (!this.tickThisSocket) {
       if (now - this.openedAt <= CONNECTING_GRACE_MS)
         return {link: 'connecting', text: 'Connected, waiting for telemetry'};
@@ -307,6 +324,7 @@ export class DriveModel {
     this.detach();
     this.decoder.reset();
     this.tickThisSocket = false;
+    this.valuesThisSocket = false;
     this.summaryThisSocket = false;
     this.lastTickAt = null;
     this.suspended = false;  // nothing of the new socket is current before a new tick
@@ -354,12 +372,18 @@ export class DriveModel {
       this.counters.malformed_binary++;
       return;
     }
-    let snapshots: Snapshot[];
+    const snapshots: Snapshot[] = [];
     try {
-      snapshots = this.decoder.decodeAll(bytes);
+      // Page by page, to know whether a value page applied before a failure
+      // (a page that decodes after the dictionary may be one).
+      for (const page of splitPages(bytes)) {
+        const valuePage = this.decoder.currentDictionary() !== null;
+        snapshots.push(...this.decoder.decodeAll(page));
+        if (valuePage) this.valuesThisSocket = true;
+      }
     } catch {
       this.counters.malformed_binary++;
-      if (this.tickThisSocket) this.fail();
+      if (this.valuesThisSocket) this.fail(now, true);
       return;
     }
     for (const s of snapshots) this.onSnapshot(s, now);
@@ -428,6 +452,7 @@ export class DriveModel {
 
   private onClose(code: number) {
     this.detach();
+    this.decodeFailures = 0;
     if (code === REPLACED_CODE) {
       this.connection = 'replaced';
       return;
@@ -435,16 +460,23 @@ export class DriveModel {
     this.wait();
   }
 
-  private fail() {
+  // Closes the socket as an error; `decode`: the page's own close, for a
+  // message it could not decode (the feed's fault, not the link's).
+  private fail(now = 0, decode = false) {
     this.detach();
+    if (!decode) this.decodeFailures = 0;
+    else if (this.connection === 'open' && now - this.openedAt > DECODE_STREAK_MS) this.decodeFailures = 1;
+    else this.decodeFailures++;
     this.wait();
   }
 
   // The next attempt starts RECONNECT_MS after this one started: attempts
   // keep a 1 s rhythm however long a connect hangs or a socket stayed open.
+  // After DECODE_RETRIES decode failures in a row, DECODE_RETRY_MS.
   private wait() {
     this.connection = 'waiting';
-    this.nextAttemptAt = this.attemptAt + RECONNECT_MS;
+    this.nextAttemptAt = this.attemptAt +
+        (this.decodeFailures >= DECODE_RETRIES ? DECODE_RETRY_MS : RECONNECT_MS);
   }
 
   // Drops the current socket, so nothing it does later reaches the model and

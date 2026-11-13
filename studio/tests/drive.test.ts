@@ -10,7 +10,7 @@ import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
-import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
+import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DECODE_RETRY_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
 import {DrawSchedule, esc, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
 
@@ -538,8 +538,8 @@ test('the subsystems widget lists the summary, one state word per row', () => {
   assert.doesNotMatch(unknown, /DOWN/);
 });
 
-// REQ-OPS-36: before the first tick of a socket (nothing it brought can read
-// as current) a binary message that does not decode is counted and ignored,
+// REQ-OPS-36: before any value page of a socket decoded (nothing it brought
+// has changed a value) a binary message that does not decode is counted and ignored,
 // and so is a text message that does not decode at any time; the page keeps
 // decoding what follows.
 test('garbage binary before the first tick and garbage text are counted and ignored', () => {
@@ -562,7 +562,7 @@ test('garbage binary before the first tick and garbage text are counted and igno
   h.socket().send(valid);
   assert.match(widgetHtml(render(h), 'Flywheel'), /60\.0/);
   assert.doesNotMatch(widgetHtml(render(h), 'Flywheel'), /STALE/);
-  assert.match(renderStatus(h.model, h.clock.now), /8 malformed messages ignored/);
+  assert.match(renderStatus(h.model, h.clock.now), /8 malformed messages counted/);
 });
 
 // REQ-OPS-36: after a socket's first tick the updates carry only changes, so
@@ -592,6 +592,54 @@ test('a binary message that does not decode after the first tick reconnects', ()
   const flywheel = widgetHtml(render(h), 'Flywheel');
   assert.doesNotMatch(flywheel, /STALE/);
   assert.match(flywheel, /60\.0/);
+});
+
+// REQ-OPS-36: a feed the page cannot decode is not a lost link. Scenario: a
+// bridge sends a page this page's decoder refuses after each connection's
+// first ticks. The status line names the telemetry feed, not the
+// dashboard-to-bridge link (which sends the drive team to power and
+// Ethernet), and after 3 such closes in a row the page retries every
+// DECODE_RETRY_MS instead of every second, so it does not spend the slot's
+// byte budget on dictionaries.
+test('a decode failure that repeats names the feed and backs off its retries', () => {
+  const h = harness();
+  const garbage = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+  const starts: number[] = [];
+  h.connect(0);
+  h.socket().send(garbage);
+  assert.equal(h.model.status(h.clock.now).link, 'telemetry',
+               `a decode failure reads as ${h.model.status(h.clock.now).text}`);
+  for (let t = 100; t <= 12_000; t += 100) {
+    const before = h.sockets.length;
+    h.at(t);
+    if (h.sockets.length === before) continue;
+    starts.push(t);
+    h.socket().onopen!();
+    h.socket().send(...encodeDictionaryPages(header(t), CHANNELS), ...update(t, NOMINAL, true),
+                    ...update(t + 1, {}, false), garbage);
+    assert.equal(h.model.status(h.clock.now).link, 'telemetry');
+  }
+  assert.deepEqual(starts, [RECONNECT_MS, 2 * RECONNECT_MS, 2 * RECONNECT_MS + DECODE_RETRY_MS,
+                            2 * RECONNECT_MS + 2 * DECODE_RETRY_MS]);
+});
+
+// REQ-OPS-36: a keyframe of several pages applies each as it arrives, the
+// first clearing every channel. A later page that does not decode, before
+// the socket's first tick completes, would leave the channels of that page
+// absent (a false HARDWARE BRIDGE, "no data"): the socket is failed and
+// reconnects.
+test('a keyframe page that does not decode after an earlier one applied fails the socket', () => {
+  const h = harness();
+  h.model.start(0);
+  h.socket().onopen!();
+  const flywheel = INDEX.get('shooter/state/flywheel_velocity_rps')!;
+  const padding = Array.from({length: 2000}, () => [flywheel, rawFromDouble(1)] as [number, bigint]);
+  const pages = encodeValuePages(header(5), POSE, true, padding);
+  assert.ok(pages.length >= 2, 'the keyframe fits one page');
+  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS), pages[0],
+                  pages[1].slice(0, pages[1].length - 5));
+  assert.equal(h.model.counters.malformed_binary, 1);
+  assert.ok(h.sockets[0].closed, 'the socket is kept with a keyframe half applied');
 });
 
 // REQ-OPS-36: with no TCP close (Wi-Fi drop, robot off) attempts still start
