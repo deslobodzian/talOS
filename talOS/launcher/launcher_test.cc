@@ -456,8 +456,11 @@ std::string NodeDescribeThenSleep(
 // the nodes and retries happen inside the supervision loop while the session
 // runs. The counter proves a retry fired; the elapsed bound proves nothing
 // blocked for the old ~60s startup wait. The test moves the supervision
-// clock one retry interval ahead once the first attempt has failed, and the
-// nodes exit once the second has.
+// clock one retry interval ahead once the launcher has reaped the first
+// attempt, and the nodes exit once the second has failed. Moved on the
+// attempt's report alone, the clock could pass the interval while the
+// attempt was still exiting, and a pass would take it for a bridge that
+// came up.
 TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
   const std::string tag = "bridge_nonblock";
   const std::string out_dir = TempPath(tag + "_out");
@@ -496,13 +499,22 @@ TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
       until_retried("beta", "//example/beta:node", Watcher("/alpha/state")));
   options.binary_overrides["//studio/bridge:studio_bridge"] =
       WriteStubNode(tag + "_bridge",
-                    BridgeDescribeThen("echo x >> " + counter + "\nexit 1\n"));
+                    BridgeDescribeThen("echo $$ >> " + counter + "\nexit 1\n"));
 
   std::jthread advance{[&](const std::stop_token& stop) {
     const auto give_up = std::chrono::steady_clock::now() + kHang;
-    while (!stop.stop_requested() && ReadFile(counter).empty() &&
-           std::chrono::steady_clock::now() < give_up)
-      std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    const auto wait = [&](const std::function<bool()>& done) {
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    };
+    pid_t first = 0;
+    wait([&] {
+      std::istringstream{ReadFile(counter)} >> first;
+      return first > 0;
+    });
+    // Gone once reaped: its exit was handled as a starting attempt's.
+    wait([&] { return ::kill(first, 0) != 0 && errno == ESRCH; });
     clock.Advance(kStudioBridgeRetryInterval);
   }};
   const auto started = std::chrono::steady_clock::now();
