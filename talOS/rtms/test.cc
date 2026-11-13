@@ -5,12 +5,15 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -118,13 +121,150 @@ TEST(LayoutValidation, SlotsIncludeAlignedPublicationTime) {
     RTMSQueue queue{path, layout.message_size, layout.alignment, kSchema, 2};
     SharedMemoryPtr mapping{path, sizeof(RTMSHeader)};
     const auto* header = static_cast<const RTMSHeader*>(mapping.ptr());
-    EXPECT_EQ(header->version, 8u);
+    EXPECT_EQ(header->version, 9u);
     EXPECT_EQ(header->slot_stride, layout.stride);
     EXPECT_EQ(header->data_offset % rtms_slot_alignment(layout.alignment), 0u);
     EXPECT_EQ(rtms_publish_time_offset(layout.message_size),
               layout.time_offset);
     EXPECT_EQ(header->total_bytes, header->data_offset + 2 * layout.stride);
   }
+}
+
+namespace {
+
+// The header of an RTMS segment of version 8, the format before the reader
+// table grew from eight slots to 32: the same fields as RTMSHeader up to the
+// writer line, then eight 64 B reader lines, data from byte 832.
+struct Version8Header {
+  std::uint64_t magic;
+  std::uint64_t version;
+  std::uint64_t segment_id;
+  std::uint64_t total_bytes;
+  std::uint64_t slots;
+  std::uint64_t message_bytes;
+  std::uint64_t message_alignment;
+  std::uint64_t data_offset;
+  std::uint64_t slot_stride;
+  std::uint64_t schema_hash;
+  char schema_name[talos::schema::kMaxSchemaName + 1];
+  std::uint64_t lifetime;
+  alignas(CACHE_LINE) std::array<std::uint64_t, 8> writer;
+  alignas(CACHE_LINE) std::array<std::array<std::uint64_t, 8>, 8> readers;
+};
+static_assert(sizeof(Version8Header) == 832);
+
+// Leaves at `path` what a version-8 build that crashed while holding the
+// topic would: a complete version-8 segment of `bytes` bytes (its own size,
+// or padded to look like this build's), one counted holder, one reader
+// claim. Returns its bytes as written.
+std::vector<std::byte> LeaveVersion8Segment(const std::string& path,
+                                            std::size_t slots,
+                                            std::size_t bytes) {
+  const std::size_t stride = rtms_slot_stride(sizeof(Message::TestMessage),
+                                              alignof(Message::TestMessage));
+  Version8Header header{};
+  header.magic = kRtmsMagic;
+  header.version = 8;
+  header.segment_id = 0x8888;
+  header.data_offset = sizeof(Version8Header);
+  header.total_bytes = header.data_offset + stride * slots;
+  header.slots = slots;
+  header.message_bytes = sizeof(Message::TestMessage);
+  header.message_alignment = alignof(Message::TestMessage);
+  header.slot_stride = stride;
+  header.schema_hash = kSchema.hash;
+  std::memcpy(header.schema_name, kSchema.name.data(), kSchema.name.size());
+  header.lifetime = 1;
+  header.writer[0] = 5;                                       // sequence
+  header.readers[0][1] = (talos::OwnProcessWord() << 2) | 2;  // ACTIVE
+
+  std::vector<std::byte> image(
+      std::max(bytes, static_cast<std::size_t>(header.total_bytes)));
+  std::memcpy(image.data(), &header, sizeof(header));
+  ::shm_unlink(ShmObjectName(path).c_str());
+  // Written through a mapping: macOS shared memory has no read or write.
+  const int fd =
+      ::shm_open(ShmObjectName(path).c_str(), O_CREAT | O_EXCL | O_RDWR, 0666);
+  EXPECT_GE(fd, 0) << std::strerror(errno);
+  if (fd < 0) return {};
+  void* mapped = MAP_FAILED;
+  if (::ftruncate(fd, static_cast<off_t>(image.size())) == 0) {
+    mapped = ::mmap(nullptr, image.size(), PROT_READ | PROT_WRITE, MAP_SHARED,
+                    fd, 0);
+  }
+  ::close(fd);
+  EXPECT_NE(mapped, MAP_FAILED) << std::strerror(errno);
+  if (mapped == MAP_FAILED) return {};
+  std::memcpy(mapped, image.data(), image.size());
+  ::munmap(mapped, image.size());
+  return image;
+}
+
+// The first `size` bytes of the segment at `path`, or nothing when it is
+// gone or smaller (macOS may report a size rounded up to its page).
+std::vector<std::byte> SegmentBytes(const std::string& path, std::size_t size) {
+  const int fd = ::shm_open(ShmObjectName(path).c_str(), O_RDONLY, 0);
+  if (fd < 0) return {};
+  struct stat info {};
+  std::vector<std::byte> bytes;
+  if (::fstat(fd, &info) == 0 &&
+      static_cast<std::size_t>(info.st_size) >= size) {
+    void* mapped = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (mapped != MAP_FAILED) {
+      const auto* begin = static_cast<const std::byte*>(mapped);
+      bytes.assign(begin, begin + size);
+      ::munmap(mapped, size);
+    }
+  }
+  ::close(fd);
+  return bytes;
+}
+
+}  // namespace
+
+// REQ-CONTRACT-21: a segment a build before the 32-slot reader table left in
+// shared memory (version 8) is never read through this build's layout, where
+// its data would sit inside the reader table: an attach, reader or writer,
+// is refused and leaves its bytes as they were, at its own size or at this
+// build's, and a session owner replaces it with a segment of this version.
+TEST(LayoutValidation, AVersion8SegmentIsRefusedUntilASessionReplacesIt) {
+  constexpr std::size_t kSlots = 16;
+  const std::string path = make_test_path("version_8");
+  constexpr std::size_t kAlignment = alignof(Message::TestMessage);
+  const std::size_t current_bytes =
+      align_up(sizeof(RTMSHeader), rtms_slot_alignment(kAlignment)) +
+      rtms_slot_stride(sizeof(Message::TestMessage), kAlignment) * kSlots;
+  for (const std::size_t bytes : {std::size_t{0}, current_bytes}) {
+    SCOPED_TRACE(bytes == 0 ? "at its own size" : "at this build's size");
+    const std::vector<std::byte> left =
+        LeaveVersion8Segment(path, kSlots, bytes);
+    ASSERT_FALSE(left.empty());
+    for (const RTMSOptions options :
+         {overwrite_sequence_options(), RTMSOptions{.publisher = true}}) {
+      SCOPED_TRACE(options.publisher ? "writer" : "reader");
+      EXPECT_THROW(
+          (RTMSQueue{path, sizeof(Message::TestMessage),
+                     alignof(Message::TestMessage), kSchema, kSlots, options}),
+          std::runtime_error);
+      EXPECT_EQ(SegmentBytes(path, left.size()), left)
+          << "the refused attach wrote to it";
+    }
+  }
+
+  RTMSQueue session{path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    kSlots,
+                    {.session_owner = true}};
+  RTMSQueue reader{path,
+                   sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage),
+                   kSchema,
+                   kSlots,
+                   overwrite_sequence_options()};
+  EXPECT_EQ(reader.writer_sequence(), 0u) << "the version-8 sequence was kept";
+  EXPECT_TRUE(reader.register_reader().has_value());
 }
 
 TEST(ReaderOwnership, ReleaseRejectsInvalidFreeAndForeignReaders) {
@@ -1481,6 +1621,9 @@ TEST(RTMSDeadReader, AKilledReaderNoLongerHoldsADropNewestWriterBack) {
   }
 }
 
+// A table filled by a reader that was killed (every one of the MAX_READERS
+// slots) does not lock the topic: the next claim frees the dead slots.
+// REQ-CONTRACT-36
 TEST(RTMSDeadReader, SlotsOfKilledReadersAreReclaimedWhenNoneAreFree) {
   const std::string path = make_test_path("dead_slots");
   shm_unlink(ShmObjectName(path).c_str());
@@ -1909,4 +2052,123 @@ TEST(RTMSWake, AReaderThatSleepsBetweenReadsMissesNoPublication) {
   EXPECT_EQ(write_failures.load(), 0);
   // Otherwise the race was never run.
   EXPECT_GT(sleeps, 0);
+}
+
+// --- reader table
+// ---------------------------------------------------------------
+
+namespace {
+
+// The reader count REQ-CONTRACT-36 states, written out rather than taken
+// from MAX_READERS so that a smaller table fails here.
+constexpr std::size_t kRequiredReaders = 32;
+
+// One reader process of the full-table test: claims a slot, arms it on its
+// own receiver, reports that on `armed_fd`, sleeps until a publication wakes
+// it, then reads `burst` messages in order with none dropped, sleeping again
+// whenever it catches up. Returns 0, or the step that failed.
+int ReadBurstOnceWoken(const std::string& path, std::size_t slots, int burst,
+                       int armed_fd) {
+  try {
+    RTMSQueue queue{path,
+                    sizeof(Message::TestMessage),
+                    alignof(Message::TestMessage),
+                    kSchema,
+                    slots,
+                    overwrite_sequence_options()};
+    const auto reader = queue.register_reader();
+    if (!reader) return 1;
+    talos::WakeReceiver receiver;
+    queue.set_reader_wake(*reader, receiver.id());
+    if (!queue.arm_wake(*reader)) return 2;
+    const char armed = 1;
+    if (::write(armed_fd, &armed, 1) != 1) return 3;
+    if (WakeReadable(receiver, kWakeHangBoundMs) != 1) return 4;
+    receiver.drain();
+    for (int expected = 0; expected < burst;) {
+      Message::TestMessage received{};
+      MessageInfo info{};
+      const ReadResult result = queue.read_next(
+          *reader, std::as_writable_bytes(std::span{&received, 1}), info);
+      if (result == ReadResult::OK) {
+        if (received.id() != expected || info.dropped != 0) return 5;
+        ++expected;
+      } else if (result != ReadResult::EMPTY) {
+        return 6;
+      } else if (queue.arm_wake(*reader)) {
+        if (WakeReadable(receiver, kWakeHangBoundMs) != 1) return 7;
+        receiver.drain();
+      }
+    }
+    return 0;
+  } catch (...) {
+    return 8;
+  }
+}
+
+}  // namespace
+
+// A topic read by 32 processes, as the Driver Station topic of a robot with
+// six mechanisms is: every reader holds a slot at once, the first
+// publication wakes all 32 asleep on it, each reads every message of the
+// burst, and a 33rd claim finds no slot.
+// REQ-CONTRACT-36
+TEST(RTMSReaderTable, ThirtyTwoReaderProcessesAreEachWokenAndReadEverything) {
+  constexpr std::size_t kSlots = 64;
+  constexpr int kBurst = 48;  // fewer than kSlots: no reader can be lapped
+  const std::string path = make_test_path("full_table");
+  RTMSQueue writer{path,
+                   sizeof(Message::TestMessage),
+                   alignof(Message::TestMessage),
+                   kSchema,
+                   kSlots,
+                   publisher_options()};
+
+  int armed[2];
+  ASSERT_EQ(::pipe(armed), 0);
+  std::vector<pid_t> children;
+  for (std::size_t i = 0; i < kRequiredReaders; ++i) {
+    const pid_t child = ::fork();
+    if (child == 0) {
+      ::close(armed[0]);
+      ::_exit(ReadBurstOnceWoken(path, kSlots, kBurst, armed[1]));
+    }
+    if (child < 0) break;
+    children.push_back(child);
+  }
+  ::close(armed[1]);
+  ASSERT_EQ(children.size(), kRequiredReaders) << std::strerror(errno);
+
+  // Each byte is one reader holding its slot, armed. A reader that failed
+  // first closes its end without writing, so the count falls short instead
+  // of hanging.
+  std::size_t armed_readers = 0;
+  pollfd entry{.fd = armed[0], .events = POLLIN, .revents = 0};
+  while (armed_readers < kRequiredReaders &&
+         ::poll(&entry, 1, kWakeHangBoundMs) == 1) {
+    std::array<char, kRequiredReaders> bytes{};
+    const ssize_t got = ::read(armed[0], bytes.data(), bytes.size());
+    if (got <= 0) break;
+    armed_readers += static_cast<std::size_t>(got);
+  }
+  ::close(armed[0]);
+  EXPECT_EQ(armed_readers, kRequiredReaders);
+  EXPECT_FALSE(writer.register_reader().has_value())
+      << "a 33rd reader claimed a slot";
+
+  ASSERT_EQ(writer.write(BytesOf({0, 0.0F})), WriteResult::SUCCESS);
+  EXPECT_EQ(writer.wakes_sent(), kRequiredReaders)
+      << "the first publication must wake every armed reader once";
+  for (int i = 1; i < kBurst; ++i) {
+    ASSERT_EQ(writer.write(BytesOf({i, 0.0F})), WriteResult::SUCCESS);
+  }
+
+  for (std::size_t i = 0; i < children.size(); ++i) {
+    int status = 0;
+    ASSERT_EQ(::waitpid(children[i], &status, 0), children[i]);
+    EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+        << "reader " << i << " exited with " << WEXITSTATUS(status)
+        << " (1: no slot, 2: arm, 3: report, 4: never woken, 5: wrong or "
+           "dropped message, 6: read failed, 7: not woken again, 8: threw)";
+  }
 }

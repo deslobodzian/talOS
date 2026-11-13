@@ -26,12 +26,8 @@ All commands below run from the repository root.
 
 ## 2. Make your robot
 
-`2026-robot/` is the project's simulation testbed, and its graph is full: the
-launcher refuses more than eight readers of one topic, and `/hw/state/driver_station`
-already has eight. A ninth node there makes `--describe-only` fail with
-`/hw/state/driver_station: has 9 readers; RTMS reader limit is 8`. So the
-walkthrough builds a robot of its own, `my_robot`, with the wrist as its first
-mechanism:
+`2026-robot/` is the project's simulation testbed. The walkthrough builds a
+robot of its own, `my_robot`, with the wrist as its first mechanism:
 
 ```sh
 bazel run //tools:new_robot -- my_robot --mechanism wrist --lang py
@@ -420,9 +416,8 @@ read the `claw` node instead, from the session directory `sim.sh` printed:
   closed at every position, so the mechanism zeroes where it starts, and
   without that margin the stuck-switch check stops it 0.5 rotations from
   home.
-- Putting a mechanism on another robot, such as `2026-robot`, whose graph is
-  full: the scaffold takes `--robot DIR`; keep each topic at eight readers or
-  fewer. Its `Next:` names that robot's simulation config
+- Putting a mechanism on another robot, such as `2026-robot`: the scaffold
+  takes `--robot DIR`. Its `Next:` names that robot's simulation config
   (`robot_physics_sim.toml` for `2026-robot`), or the three lines that
   create one.
 

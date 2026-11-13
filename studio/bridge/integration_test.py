@@ -119,16 +119,19 @@ def upgrade(sock):
     return headers
 
 
-# An RTMS segment's header (talOS/rtms/rtms.h RTMSHeader, 832 B): the magic at
-# 0; ten u64 fields, the 128 B schema name and the lifetime word, then the
-# 64 B-aligned Writer, whose owner process word is at 256 + 8; reader slot i
-# at 320 + 64 i, its state word at + 8, holding its claimant's process word
-# above two state bits. A process word's low 22 bits are the pid
-# (talOS/rtms/process_liveness.h kProcessPidBits).
+# An RTMS segment's header (talOS/rtms/rtms.h RTMSHeader, version 9, 2368 B):
+# the magic at 0 and the version at 8; ten u64 fields, the 128 B schema name
+# and the lifetime word, then the 64 B-aligned Writer, whose owner process
+# word is at 256 + 8; reader slot i of 32 at 320 + 64 i, its state word at
+# + 8, holding its claimant's process word above two state bits. A process
+# word's low 22 bits are the pid (talOS/rtms/process_liveness.h
+# kProcessPidBits). A segment of another version is skipped: no process of
+# this build can hold it, and its reader table is not at these offsets.
 RTMS_MAGIC = 0x32534D54534F4C41
-RTMS_HEADER_BYTES = 832
+RTMS_VERSION = 9
+RTMS_HEADER_BYTES = 2368
 RTMS_WRITER_OWNER = 264
-RTMS_READERS, RTMS_MAX_READERS = 320, 8
+RTMS_READERS, RTMS_MAX_READERS = 320, 32
 PID_MASK = (1 << 22) - 1
 
 
@@ -141,7 +144,8 @@ def rtms_segments():
                 header = handle.read(RTMS_HEADER_BYTES)
         except OSError:
             continue
-        if len(header) < RTMS_HEADER_BYTES or struct.unpack_from("<Q", header)[0] != RTMS_MAGIC:
+        if (len(header) < RTMS_HEADER_BYTES
+                or struct.unpack_from("<QQ", header) != (RTMS_MAGIC, RTMS_VERSION)):
             continue
         owner = struct.unpack_from("<Q", header, RTMS_WRITER_OWNER)[0]
         readers = {(struct.unpack_from("<Q", header, RTMS_READERS + 64 * i + 8)[0] >> 2) & PID_MASK

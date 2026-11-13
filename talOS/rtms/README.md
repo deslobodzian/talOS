@@ -69,10 +69,11 @@ crashed publisher's restart is refused and dead readers' slots stay held. The
 check is `:process_liveness` (`process_liveness.h`), which the live node
 registry also uses for its rows.
 
-Each topic has eight reader slots (`MAX_READERS`), including observer
+Each topic has 32 reader slots (`MAX_READERS`), including observer
 subscriptions. Dead readers are reclaimed before registration fails. The graph
 lint rejects declared reader counts above this limit before launch; standalone
-`ipc::Subscriber` construction throws with the topic and limit if exhausted.
+`ipc::Subscriber` construction and a realtime loop's watcher registration
+throw with the topic and limit if exhausted.
 
 A queue keeps the state word it claimed each reader slot with. Once the slot
 holds another word -- another process judged this one dead and freed the slot,
@@ -139,13 +140,35 @@ set while slot *i* waits for the next publication.
   is drained by its loop's backstop
   ([talOS/events](../events/README.md#the-three-loops)). Each reader slot
   holds one connected socket in every process that writes the topic, so a
-  topic costs a writer up to `MAX_READERS` (8) descriptors.
+  topic costs a writer up to `MAX_READERS` (32) descriptors.
 - **Why no wake is lost.** The reader stores its bit before loading the
   sequence; the writer stores the sequence before loading the bits. Under
   sequential consistency at least one sees the other: the reader finds the
   publication and does not sleep, or the writer finds the bit and wakes it.
 - A `DROP_NEWEST` write refused with `BUFFER_FULL` publishes nothing and wakes
   nobody.
+
+**Publish cost.** A publication no reader is armed for costs the same
+whatever the table's size: one load of `waiters`. Otherwise the writer pays
+one `send()` per armed reader; walking the table's 32 bits to find them is
+below the timer's resolution. `//talOS/rtms:wake_fanout_bench` times
+`write()` with each armed reader in its own process asleep on its receiver
+(`bazel run -c opt //talOS/rtms:wake_fanout_bench`); on a Ryzen 9 7950X3D
+limited to 8 CPUs, Linux 7.2, no realtime priority, load average 7 to 8 from
+other builds, median over three runs of 3000 publications:
+
+| Readers armed (slots held) | 0 (0 or 32) | 1 (1) | 8 (8) | 8 (32) | 32 (32) |
+|---|---:|---:|---:|---:|---:|
+| `write()` median | 0.04 µs | 1.1 µs | 7.2–7.5 µs | 7.4–7.9 µs | 33.5–33.9 µs |
+| `write()` p99 | 0.04–0.08 µs | 1.8–2.0 µs | 9–11 µs | 12–14 µs | 55–58 µs |
+
+The bench's walk rows (slots armed with no receiver: the exchange and the
+walk, no send) take 0.04 to 0.05 µs with 8 or 32 of 32 slots armed. In
+another run under heavier load the same host paid 5.6 to 5.9 µs per armed
+reader (182 µs median for 32), so a send's cost depends on the host's state
+more than on the table; even then 32 armed readers take under 4% of a 5 ms
+tick. macOS is unmeasured. Only prompt watchers arm
+([talOS/events](../events/README.md#the-three-loops)).
 
 **Crash window.** A writer killed after exchanging `waiters` but before
 sending leaves a reader asleep beside an unread message. Whichever writer next

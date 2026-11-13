@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -25,16 +26,30 @@ bool WakePending(const talos::WakeReceiver& receiver, int ms) {
 
 }  // namespace
 
+// A topic admits 32 subscribers; the 33rd is refused with an error naming
+// the topic and the limit, and a released slot admits one again.
+// REQ-CONTRACT-36
 TEST(SubscriberTest, ReaderExhaustionRejectsAndRecoversAfterRelease) {
+  // Written out, not MAX_READERS, so that a smaller table fails here.
+  constexpr std::size_t kRequiredReaders = 32;
   const std::string topic = Topic("full");
   std::vector<std::unique_ptr<ipc::Subscriber<IPCMessage::TestMessage>>>
       readers;
-  for (std::size_t i = 0; i < MAX_READERS; ++i) {
+  for (std::size_t i = 0; i < kRequiredReaders; ++i) {
     readers.push_back(
         std::make_unique<ipc::Subscriber<IPCMessage::TestMessage>>(topic));
   }
-  EXPECT_THROW((ipc::Subscriber<IPCMessage::TestMessage>{topic}),
-               std::runtime_error);
+  try {
+    ipc::Subscriber<IPCMessage::TestMessage> extra{topic};
+    ADD_FAILURE() << "a 33rd subscriber claimed a slot";
+  } catch (const std::runtime_error& error) {
+    std::string message = error.what();
+    const auto at = message.find(topic);
+    ASSERT_NE(at, std::string::npos) << message;
+    message.erase(at, topic.size());
+    EXPECT_NE(message.find(std::to_string(kRequiredReaders)), std::string::npos)
+        << message;
+  }
   readers.pop_back();
   EXPECT_NO_THROW((ipc::Subscriber<IPCMessage::TestMessage>{topic}));
 }

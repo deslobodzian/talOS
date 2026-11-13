@@ -409,20 +409,37 @@ TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   other.join();
 }
 
+// A watcher of a topic whose 32 reader slots are held fails registration
+// with an error naming the topic and the limit, and registers once one is
+// released.
+// REQ-CONTRACT-36
 TEST(RealtimeEventLoop, ReaderExhaustionFailsRegistrationAndAllowsRetry) {
+  // Written out, not MAX_READERS, so that a smaller table fails here.
+  constexpr std::size_t kRequiredReaders = 32;
   const std::string topic = "/full_" + std::to_string(::getpid());
   RTMSQueue keeper{topic, sizeof(EventsTest::SensorMessage),
                    alignof(EventsTest::SensorMessage),
                    talos::schema::Of<EventsTest::SensorMessage>(), MAX_SLOTS};
   std::vector<std::size_t> readers;
-  for (std::size_t i = 0; i < MAX_READERS; ++i) {
+  for (std::size_t i = 0; i < kRequiredReaders; ++i) {
     auto reader = keeper.register_reader();
-    ASSERT_TRUE(reader);
+    ASSERT_TRUE(reader) << "slot " << i;
     readers.push_back(reader.value_or(std::size_t{0}));
   }
   {
     RealtimeEventLoop<> loop;
-    EXPECT_THROW(register_sensor_watcher(loop, topic), RegistrationError);
+    try {
+      register_sensor_watcher(loop, topic);
+      ADD_FAILURE() << "a 33rd reader registered";
+    } catch (const RegistrationError& error) {
+      std::string message = error.what();
+      const auto at = message.find(topic);
+      ASSERT_NE(at, std::string::npos) << message;
+      message.erase(at, topic.size());
+      EXPECT_NE(message.find(std::to_string(kRequiredReaders)),
+                std::string::npos)
+          << message;
+    }
     EXPECT_TRUE(loop.manifest().empty());
     keeper.release_reader(readers.back());
     readers.pop_back();

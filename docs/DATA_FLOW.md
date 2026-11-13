@@ -241,10 +241,11 @@ sizes asserted above.
 
 Fixed message topics store their complete native FlatBuffers struct/envelope
 plus a writer publication timestamp; there is no UDP frame header. RTMS segment
-version **8** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
+version **9** stores `[payload][padding to 8][i64 publish_time_ns][tail padding]`.
 For payload size M and alignment A, timestamp offset is `align_up(M, 8)` and
-slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **832 B** ring
-header is additional; data starts at `align_up(832, max(A, 8))`. These sizes
+slot stride is `align_up(align_up(M, 8) + 8, max(A, 8))`. The **2368 B** ring
+header (32 reader slots of 64 B) is additional; data starts at
+`align_up(2368, max(A, 8))`. These sizes
 are compile-time asserted in `talOS/rtms/rtms.h`.
 
 The timestamp uses the host monotonic clock (macOS `CLOCK_MONOTONIC_RAW`,
@@ -313,7 +314,11 @@ launcher and `studio_bridge` read it. Both sizes are compile-time asserted in
 A writer holds one connected socket per reader slot it has notified, per
 topic it writes ([wake channel](../talOS/rtms/README.md#wake-channel)), so a
 node's wake sockets are at most the readers of the topics it writes, and never
-more than `MAX_READERS` (8) per topic. For the field config
+more than `MAX_READERS` (32) per topic: the bridge, which writes four
+topics, could hold 4 × 32 = 128 (139 descriptors with its 11 others, under
+the macOS limit below) only if 32 readers of each slept on it; what each
+armed reader adds to a publication is measured under "Publish cost" in the
+[wake channel](../talOS/rtms/README.md#wake-channel). For the field config
 (`2026-robot/main_processor/configuration/robot.toml`, its `--describe-only`
 graph), counting every reader as armed:
 
