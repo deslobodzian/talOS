@@ -87,10 +87,17 @@ class SimGatewayStartup(unittest.TestCase):
                 'controller_address = "127.0.0.1"\n'
                 '[subsystems.test.motors.motor]\ncan_id = 1\n',
                 encoding="utf-8")
-            receiver.bind(("127.0.0.1", 5803))
+            # Ephemeral ports: the default 5802/5803 belong to whatever
+            # session or test is already running on the host.
+            receiver.bind(("127.0.0.1", 0))
             receiver.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
             with subprocess.Popen(
                     [str(binary()), "--config", str(config),
+                     "--port", str(gateway_port),
+                     "--remote-port", str(receiver.getsockname()[1]),
                      "--mode-schedule", "disabled:0.1,auto:0.2,teleop:0.2",
                      "--joystick-schedule",
                      "0:axes=0,0,0;buttons=0;pov=-1|"
