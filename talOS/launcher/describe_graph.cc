@@ -522,6 +522,9 @@ std::vector<naming::Diagnostic> DescribeGraph(
                  "' but the binary describes itself as '" +
                  described.declared.name + "'"});
       }
+    } else if (spec.name == kStudioBridgeName) {
+      probe_findings.push_back(StudioBridgeFinding(
+          spec, described.missing, described.error, options.bundle_dir));
     } else if (described.missing) {
       missing.push_back(spec);
     } else {
@@ -549,18 +552,17 @@ std::vector<naming::Diagnostic> DescribeGraph(
   return diagnostics;
 }
 
-std::optional<naming::Diagnostic> MissingBinariesFinding(
-    const std::vector<NodeSpec>& missing, const std::string& bundle_dir) {
-  if (missing.empty()) return std::nullopt;
-  std::string names;
+namespace {
+
+// Why the nonempty `missing` cannot be probed, and the cure: the bundle to
+// rebuild, or outside one, the `bazel build` of their labels.
+std::string MissingBinariesMessage(const std::vector<NodeSpec>& missing,
+                                   const std::string& bundle_dir) {
   std::string labels;
-  bool fatal = false;
   for (const auto& spec : missing) {
-    names += (names.empty() ? "" : ", ") + spec.name;
     if (spec.target.starts_with("//") || spec.target.starts_with("@")) {
       labels += " " + spec.target;
     }
-    fatal = fatal || spec.critical || spec.owns_actuators;
   }
   const std::string& first = missing.front().binary_path;
   std::string where = "no binary at " + first;
@@ -579,12 +581,36 @@ std::optional<naming::Diagnostic> MissingBinariesFinding(
     message = "not built (" + where + ")";
     if (!labels.empty()) message += "; build them first: bazel build" + labels;
   }
+  return message;
+}
+
+}  // namespace
+
+std::optional<naming::Diagnostic> MissingBinariesFinding(
+    const std::vector<NodeSpec>& missing, const std::string& bundle_dir) {
+  if (missing.empty()) return std::nullopt;
+  std::string names;
+  bool fatal = false;
+  for (const auto& spec : missing) {
+    names += (names.empty() ? "" : ", ") + spec.name;
+    fatal = fatal || spec.critical || spec.owns_actuators;
+  }
+  std::string message = MissingBinariesMessage(missing, bundle_dir);
   if (!fatal) {
     message += "; NON-CRITICAL: launching the rest under restart supervision";
   }
   return naming::Diagnostic{
       fatal ? naming::Severity::ERROR : naming::Severity::WARNING,
       std::move(names), std::move(message)};
+}
+
+naming::Diagnostic StudioBridgeFinding(const NodeSpec& spec, bool missing,
+                                       const std::string& error,
+                                       const std::string& bundle_dir) {
+  return {naming::Severity::WARNING, spec.name,
+          (missing ? MissingBinariesMessage({spec}, bundle_dir)
+                   : "did not answer --describe (" + error + ")") +
+              "; the session runs without Studio"};
 }
 
 std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,

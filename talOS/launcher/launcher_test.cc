@@ -1334,6 +1334,63 @@ TEST(LauncherGraphTest, MissingBinaryDoesNotHideOneThatDoesNotAnswer) {
       << fixture.graph_json();
 }
 
+// The diagnostics of `severity` graph.json records about `subject`, one per
+// line.
+std::vector<std::string> GraphFindings(const std::string& graph,
+                                       std::string_view severity,
+                                       std::string_view subject) {
+  std::vector<std::string> found;
+  std::istringstream lines{graph};
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("\"severity\": \"" + std::string{severity} + "\"") !=
+            std::string::npos &&
+        line.find("\"subject\": \"" + std::string{subject} + "\"") !=
+            std::string::npos) {
+      found.push_back(line);
+    }
+  }
+  return found;
+}
+
+// REQ-OPS-30, DEPLOY-4: --start-studio-bridge from a checkout that has not
+// built the bridge runs the session without Studio, with one warning
+// carrying the build command, not a refused graph: the bridge is an
+// observer, critical for no other member. A missing critical node is still
+// a refusal beside it.
+TEST(LauncherGraphTest, AnUnbuiltStudioBridgeIsAWarningAndLeavesTheSession) {
+  GraphFixture fixture{
+      "studio_unbuilt",
+      DescribingStub("alpha", "//example/alpha:node", {Sender("/alpha/state")}),
+      DescribingStub("beta", "//example/beta:node", {Watcher("/alpha/state")})};
+  fixture.options.start_studio_bridge = true;
+  fixture.options.binary_overrides["//studio/bridge:studio_bridge"] =
+      TempPath("never_built_studio_bridge");
+
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
+  const std::string graph = fixture.graph_json();
+  EXPECT_EQ(GraphErrors(graph), std::vector<std::string>{}) << graph;
+  const auto warnings = GraphFindings(graph, "warning", "studio_bridge");
+  ASSERT_EQ(warnings.size(), 1u) << graph;
+  EXPECT_NE(warnings[0].find("bazel build //studio/bridge:studio_bridge"),
+            std::string::npos)
+      << warnings[0];
+  ASSERT_TRUE(fixture.has_manifest());
+  const std::string manifest = ReadFile(fixture.out_dir + "/manifest.json");
+  EXPECT_NE(manifest.find("\"name\": \"alpha\""), std::string::npos)
+      << manifest;
+  EXPECT_EQ(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
+      << manifest;
+
+  fixture.options.describe_only = true;
+  fixture.options.binary_overrides["//example/alpha:node"] =
+      TempPath("never_built_alpha");
+  EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+  const std::string refused = fixture.graph_json();
+  EXPECT_EQ(GraphFindings(refused, "error", "alpha").size(), 1u) << refused;
+  EXPECT_EQ(GraphFindings(refused, "error", "studio_bridge").size(), 0u)
+      << refused;
+}
+
 // The roster is probed in parallel: each of three probes answers only once
 // all three have started, so a launcher that probed one at a time would see
 // its first probe miss the describe deadline.
@@ -1951,6 +2008,10 @@ TEST(LauncherTest, RunEndReasonKeepsACrashDuringAStop) {
   EXPECT_EQ(RunEndReason(kRunStopTimeout, true, SIGINT), kRunStop);
 }
 
+// A bundle's roster, Studio's bridge included, runs from its own directory.
+// REQ-OPS-30: a bundled bridge that cannot run on this machine (here it
+// fails its --describe, as a missing library or a crash would) is one
+// warning, and the robot's session runs without Studio.
 TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
   const std::string bundle_dir = TempPath("test_bundle_run");
   std::filesystem::create_directories(bundle_dir + "/config");
@@ -1991,18 +2052,31 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
        << "binary = \"bin/hardware_node\"\nlanguage = \"cpp\"\n"
        << "\n[[nodes]]\nname = \"alpha\"\n"
        << "targets = [\"//bundle/alpha:node\"]\n"
-       << "binary = \"bin/alpha\"\nlanguage = \"cpp\"\n";
+       << "binary = \"bin/alpha\"\nlanguage = \"cpp\"\n"
+       << "\n[studio]\nbridge = \"studio/studio_bridge\"\n"
+       << "targets = [\"//studio/bridge:studio_bridge\"]\n"
+       << "webroot = \"studio/webroot\"\n";
   }
+  std::filesystem::create_directories(bundle_dir + "/studio/webroot");
+  {
+    std::ofstream out{bundle_dir + "/studio/studio_bridge"};
+    out << "#!/bin/sh\necho 'cannot load libstudio' >&2\nexit 127\n";
+  }
+  ::chmod((bundle_dir + "/studio/studio_bridge").c_str(), 0755);
 
   LauncherOptions options;
   options.bundle_dir = bundle_dir;
   options.describe_only = true;
+  options.start_studio_bridge = true;
   options.output_dir = bundle_dir + "/logs";
   options.session_id = 1;
 
   Launcher launcher{options};
   EXPECT_EQ(launcher.Run(), 0);
-  EXPECT_TRUE(std::filesystem::exists(bundle_dir + "/logs/1/graph.json"));
+  const std::string graph = ReadFile(bundle_dir + "/logs/1/graph.json");
+  EXPECT_EQ(GraphErrors(graph), std::vector<std::string>{}) << graph;
+  EXPECT_EQ(GraphFindings(graph, "warning", "studio_bridge").size(), 1u)
+      << graph;
 
   std::filesystem::remove_all(bundle_dir);
 }

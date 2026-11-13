@@ -440,7 +440,7 @@ int Launcher::RunSession() {
   restart_limits_ = {max_restarts,
                      std::chrono::milliseconds{options_.restart_window_ms}};
 
-  const auto node_specs = DiscoverNodes(robot_config, options_);
+  auto node_specs = DiscoverNodes(robot_config, options_);
   if (options_.start_studio_bridge && BundleWithoutStudio(options_)) {
     std::cerr << "[launcher] this bundle carries no Studio (its talos_bundle "
                  "sets no studio_bridge and studio_webroot); session runs "
@@ -550,6 +550,8 @@ int Launcher::RunSession() {
     return 1;
   }
   PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
+  // Its warning is in the graph above; an observer's absence stops nothing.
+  DropUnansweredStudioBridge(node_specs, described);
 
   if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
     std::cerr << "launcher: the declared graph has errors; refusing to "

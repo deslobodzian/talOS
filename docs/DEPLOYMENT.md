@@ -68,7 +68,10 @@ commissioned through the normal bring-up process.
 `[studio] bridge` and serves the bundle's webroot unless `[studio] webroot`
 is an absolute path ([Studio bridge](../talOS/launcher/README.md#studio-bridge)).
 The boot service starts `run.sh` without it. From a bundle built without
-Studio, the flag starts nothing and the session runs without Studio.
+Studio, the flag starts nothing and the session runs without Studio; so it
+does, after one warning, when the bundled bridge cannot run on the robot (it
+does not answer `--describe`), and from a checkout whose bridge is not built
+(the warning gives the `bazel build` command).
 
 To bring up the bundle against a different controller address without editing
 the config, run `./run.sh --remote <ip>` (for example,

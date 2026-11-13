@@ -43,6 +43,14 @@ bool ShouldRetryStudioBridge(
     std::chrono::steady_clock::time_point last_spawn,
     std::chrono::steady_clock::time_point now, bool stopping);
 
+// Removes Studio's bridge from `specs` and `described` (index for index)
+// when its --describe probe did not answer, missing binary included:
+// DescribeGraph warned (StudioBridgeFinding) and the session runs without
+// Studio, as REQ-OPS-30 asks of an observer. A bridge that answered stays,
+// supervised as StudioBridge says. Returns whether it removed one.
+bool DropUnansweredStudioBridge(std::vector<NodeSpec>& specs,
+                                std::vector<NodeDescription>& described);
+
 // The topic the bridge watches: what it described (its --describe reads the
 // `[studio] topic` key the telemetry node publishes on), or that key itself
 // when the bridge did not answer.

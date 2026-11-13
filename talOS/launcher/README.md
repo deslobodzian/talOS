@@ -94,6 +94,9 @@ A member with no file at its binary path, as before a build, is not probed:
 all such members make one finding that names them and ends with the command
 that builds them, `bazel build` of their labels (in a bundle, it says the
 bundle lacks them); it is an error unless every one of them is non-critical.
+The [Studio bridge](#studio-bridge) is neither: a probe of it that does not
+answer, its binary missing or not, is one warning of its own (with the same
+build command or bundle note), and the session runs without it.
 `--describe-timeout-ms MS` sets the per-binary deadline. A binary that cannot
 be run at all is reported with the step and errno that stopped it, as a spawn
 is ([restarts](#restarts)): `did not answer --describe (execv <path>: Exec
@@ -251,8 +254,12 @@ the same setting the telemetry node reads. `--studio-http-port PORT`
 overrides `[studio] http_port` for one run. The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
 `[studio] webroot`. The bridge needs both the binary (`[studio] bridge`,
-resolved under `bazel-bin/` like a node's) and the webroot: with either missing the bridge cannot start and the session
-runs on without Studio (below). A bundle built with `talos_bundle`'s
+resolved under `bazel-bin/` like a node's) and the webroot. A bridge whose
+`--describe` probe does not answer (not built, absent from a bundle, or
+unable to run: a missing library, a crash) is one warning in the graph,
+naming the `bazel build` command or the bundle, and the launcher leaves it
+out of the session, which runs without Studio, `--allow-graph-errors` or
+not; a missing webroot lets it start and fail (below). A bundle built with `talos_bundle`'s
 `studio_bridge` and `studio_webroot` carries both
 ([DEPLOYMENT.md](../../docs/DEPLOYMENT.md#build-a-bundle)): its manifest's
 `[studio]` table registers the bundled bridge under its label and the name
