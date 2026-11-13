@@ -5,7 +5,7 @@ Bazel's autodetected toolchain lists /usr/include (and /usr/local/include)
 among its built-in include directories, so an action that resolves
 <toml++/toml.hpp> from a host package passes Bazel's undeclared-inclusion
 check on a workstation that has the package and fails to compile where it is
-absent (CI; TODO.md CI-6). Every compile writes the headers it read to its
+absent (CI; REQ-DEV-25). Every compile writes the headers it read to its
 `.d` file; this reads those files and reports each header under a host
 include prefix that is not the C library's, the kernel's or the C++ standard
 library's, naming the source file that read it.
