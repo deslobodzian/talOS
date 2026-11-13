@@ -112,7 +112,8 @@ struct LauncherOptions {
           }};
 
   // Launch a graph the linter called broken anyway. The default is refusal:
-  // two spellings of one topic are silent at runtime.
+  // two spellings of one topic are silent at runtime. Only with `simulation`:
+  // Launcher::Run refuses it otherwise, before anything is probed.
   bool allow_graph_errors{false};
 
   // Probe and lint without spawning anything, as a pre-flight check.

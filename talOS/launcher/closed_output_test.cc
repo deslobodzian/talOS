@@ -455,6 +455,7 @@ TEST(ClosedOutput, MisnamedMemberIsRefusedEvenAllowingGraphErrors) {
     options.session_id = GenerateSessionId();
     options.output_dir = TempPath(name + "_member_session");
     options.allow_graph_errors = true;
+    options.simulation = true;  // The flag requires --sim.
     options.config_path = TempPath(name + "_member") + ".toml";
     std::ofstream{options.config_path}
         << "[robot]\nname = \"member_fixture\"\nperiod_us = 5000\n\n"

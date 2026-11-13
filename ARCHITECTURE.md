@@ -292,7 +292,7 @@ handlers.
 - Who may write the `hw` namespace (the bridge, and each node's devices
   layer for its own request) is in [NAMING.md](talOS/NAMING.md#topics).
 - The launcher refuses to start a graph that breaks a naming or graph rule
-  (`--allow-graph-errors` overrides).
+  (`--allow-graph-errors`, accepted only with `--sim`, overrides).
 
 ## Configuration
 

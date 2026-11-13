@@ -1220,12 +1220,47 @@ TEST(LauncherGraphTest, AllowGraphErrorsLaunchesTheBrokenGraphAnyway) {
       DescribingStub("beta", "//example/beta:node",
                      {Watcher("/alpha/status")})};
   fixture.options.allow_graph_errors = true;
+  fixture.options.simulation = true;
 
   Launcher launcher{fixture.options};
   EXPECT_EQ(launcher.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
   EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),
             std::string::npos);
+}
+
+// REQ-CONTRACT-09: --allow-graph-errors overrides every graph refusal, the
+// safety ones included (REQ-SAFE-27/28), so it is accepted only with --sim,
+// whose loopback remote keeps it off a real controller. Without --sim the
+// launch is refused before any member is probed or spawned and before any
+// session directory exists, --describe-only included; every member's stub
+// records each invocation, --describe or not.
+TEST(LauncherGraphTest, AllowGraphErrorsWithoutSimIsRefusedBeforeAnyProbe) {
+  for (const bool describe_only : {false, true}) {
+    SCOPED_TRACE(describe_only ? "--describe-only" : "launch");
+    const std::string invoked = TempPath("allow_without_sim_invoked");
+    ::remove(invoked.c_str());
+    const auto recording = [&](std::string_view node, std::string_view target) {
+      const std::string stub = DescribingStub(node, target, {});
+      const std::string shebang = "#!/bin/sh\n";
+      return shebang + "echo \"" + std::string{node} + " $*\" >> '" + invoked +
+             "'\n" + stub.substr(shebang.size());
+    };
+    GraphFixture fixture{"allow_without_sim",
+                         recording("alpha", "//example/alpha:node"),
+                         recording("beta", "//example/beta:node")};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode(
+            "allow_without_sim_hardware",
+            recording("hardware_node", "//talOS/bridge:hardware_node"));
+    fixture.options.allow_graph_errors = true;
+    fixture.options.describe_only = describe_only;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+  }
 }
 
 TEST(LauncherGraphTest, ABinaryThatIgnoresDescribeRefusesLaunch) {
@@ -1244,6 +1279,7 @@ TEST(LauncherGraphTest, AllowGraphErrorsPermitsFailedDescribe) {
   GraphFixture fixture{"silent_allowed", kStubWithoutDescribe,
                        kStubWithoutDescribe};
   fixture.options.allow_graph_errors = true;
+  fixture.options.simulation = true;
   EXPECT_EQ(Launcher{fixture.options}.Run(), 0);
   EXPECT_TRUE(fixture.has_manifest());
   EXPECT_NE(fixture.graph_json().find("\"severity\": \"error\""),

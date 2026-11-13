@@ -348,6 +348,15 @@ int Launcher::Run() {
 }
 
 int Launcher::RunSession() {
+  // The flag overrides every graph refusal, the safety ones included
+  // (REQ-SAFE-27/28) and the live-endpoint refusal, so it never reaches a
+  // real controller: --sim requires the loopback remote (below). Refused
+  // before the config is read, so nothing is probed, written or spawned.
+  if (options_.allow_graph_errors && !options_.simulation) {
+    std::cerr << "launcher: --allow-graph-errors is accepted only with --sim; "
+                 "nothing was described or started\n";
+    return 1;
+  }
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
     std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;
