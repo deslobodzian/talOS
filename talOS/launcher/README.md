@@ -42,7 +42,9 @@ A launch that starts the roster handles a stop (SIGINT, SIGTERM, or a
 nothing behind that a normal end would not. Before phase one ends, the stop
 kills every probe still running, with its process group, at once rather
 than at its describe deadline, and starts no other; the launch then writes
-no `graph.json`, manifest or segment and exits 0, its session directory a
+no manifest or segment and exits 0 (a stop that lands while the described
+graph is being linted still leaves its `graph.json`, and a graph with errors
+is still refused with status 1), its session directory a
 launch that recorded nothing ([session segments and logs](#session-segments-and-logs)).
 Once phase two has created the session's topic segments, a stop starts no
 member that has not started yet (the manifest's `stopped_before_start`),

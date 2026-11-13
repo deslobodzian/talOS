@@ -3515,7 +3515,9 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   ASSERT_GT(probe_pid, 0) << "alpha's probe never started";
   EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "the launcher ended with " << ExitReason(status);
-  EXPECT_LT(stopping, describe_deadline)
+  // Far inside the deadline: without the stop the launcher ends about one
+  // deadline after the probe's spawn, which is a little before stopped_at.
+  EXPECT_LT(stopping, describe_deadline / 4)
       << "the stop waited for the probe's describe deadline";
   errno = 0;
   EXPECT_TRUE(::kill(probe_pid, 0) != 0 && errno == ESRCH)
