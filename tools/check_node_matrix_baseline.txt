@@ -11,4 +11,3 @@
 2026-robot/main_processor/shooter/node_test.cc 1 4 5 7 8 9 10 11
 2026-robot/main_processor/vision/node_test.cc 1 3 9 12
 2026-robot/main_processor/vision/recorded_footage_test.cc 1 3 9 12
-talOS/teleop/node_test.cc 1 2 6 9 11 12
