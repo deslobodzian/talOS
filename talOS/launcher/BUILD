@@ -468,6 +468,17 @@ cc_library(
     alwayslink = True,
 )
 
+# Gives SIGINT, SIGTERM and SIGHUP a do-nothing handler before a launcher
+# test's main, so a test that signals its own process after a session's Run
+# has returned (and put back the dispositions it found) does not end the test
+# binary.
+cc_library(
+    name = "stop_signal_guard",
+    testonly = True,
+    srcs = ["testdata/stop_signal_guard.cc"],
+    alwayslink = True,
+)
+
 cc_test(
     name = "launcher_test",
     size = "small",
@@ -490,6 +501,7 @@ cc_test(
         ":log_budget",
         ":log_merge",
         ":registry_cleanup",
+        ":stop_signal_guard",
         ":supervision_events",
         "//talOS/driver_station",
         "//talOS/events:events_log",
@@ -534,6 +546,7 @@ cc_test(
         ":launcher_lib",
         ":log_budget",
         ":registry_cleanup",
+        ":stop_signal_guard",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_log",
@@ -635,6 +648,7 @@ cc_test(
         ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
+        ":stop_signal_guard",
         ":supervision_events",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
@@ -679,6 +693,7 @@ cc_test(
         ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
+        ":stop_signal_guard",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
@@ -754,6 +769,7 @@ cc_test(
         ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
+        ":stop_signal_guard",
         "//talOS/events:events_log",
         "//talOS/rtms",
         "@googletest//:gtest_main",
@@ -859,6 +875,7 @@ cc_test(
         ":registry_cleanup",
         ":replay_message",
         ":spawn",
+        ":stop_signal_guard",
         "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/events",
