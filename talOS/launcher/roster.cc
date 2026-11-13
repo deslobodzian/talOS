@@ -183,6 +183,7 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
       kHardwareNodeName,
       robot_string("hardware_node").value_or("//talOS/bridge:hardware_node"),
       options));
+  specs.back().extra_args = ControllerArgs(robot_config, options);
 
   // 2. Subsystems.
   if (const auto* subsystems =
@@ -237,6 +238,13 @@ uint16_t EffectiveRemotePort(const config::RobotConfig& config,
 uint16_t EffectiveLocalPort(const config::RobotConfig& config,
                             const LauncherOptions& options) {
   return config::ResolveLocalPort(config, options.local_port);
+}
+
+std::vector<std::string> ControllerArgs(const config::RobotConfig& config,
+                                        const LauncherOptions& options) {
+  return {"--remote",      EffectiveRemoteAddress(config, options),
+          "--remote-port", std::to_string(EffectiveRemotePort(config, options)),
+          "--local-port",  std::to_string(EffectiveLocalPort(config, options))};
 }
 
 uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,

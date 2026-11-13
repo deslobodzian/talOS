@@ -707,8 +707,7 @@ int Launcher::RunSession() {
     if (studio && i == studio->index()) continue;
     auto& proc = procs[i];
     PrepareLaunch(node_specs[i], described[i], proc, robot_config,
-                  log_split.shares[i], log_split.window, remote, remote_port,
-                  local_port, launches[i]);
+                  log_split.shares[i], log_split.window, launches[i]);
 
     std::string spawn_error;
     launches[i].spawned_monotonic_ns = introspect::monotonic_now_ns();
@@ -757,8 +756,7 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
                              const config::RobotConfig& robot_config,
                              uint64_t log_budget,
                              std::chrono::microseconds log_window,
-                             const std::string& remote, uint16_t remote_port,
-                             uint16_t local_port, NodeLaunch& launch) const {
+                             NodeLaunch& launch) const {
   launch.restart = RestartSchedule{spec.critical};
   launch.compare_endpoints = described.answered;
   launch.declared = described.declared.sources;
@@ -797,12 +795,9 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
     if (described.answered && described.declared.reads_graph) {
       args.insert(args.end(), {"--graph", DeclaredGraphPath(options_)});
     }
-    if (proc.name == kHardwareNodeName) {
-      args.insert(args.end(), {"--remote", remote, "--remote-port",
-                               std::to_string(remote_port), "--local-port",
-                               std::to_string(local_port)});
-    }
   }
+  // The hardware bridge's controller addresses are among them
+  // (ControllerArgs), as they were in its probe.
   args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
   if (options_.duration_s > 0) {
     args.insert(args.end(),

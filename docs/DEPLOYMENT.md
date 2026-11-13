@@ -81,6 +81,15 @@ the config, run `./run.sh --remote <ip>` (for example,
 `./run.sh --remote 10.56.87.3`). This overrides the effective address for that
 launch; use `--remote-port` and `--local-port` if the ports also differ.
 
+An installed bundle runs simulated with `./run.sh --sim --remote 127.0.0.1`:
+`--sim` requires the loopback remote, and the hardware bridge's `--describe`
+probe and its runs both get the effective one
+([controller addressing](../talOS/launcher/README.md#controller-addressing)).
+A bundle carries no simulator (`--start-sim-gateway` reports the
+`[robot] sim_gateway` binary missing from the bundle), so something else must stand in for the
+RoboRIO on that host: a `sim_gateway` run from a checkout with `--config`
+naming the bundle's config, or the RoboRIO program under WPILib simulation.
+
 ## On the main processor
 
 ```sh
