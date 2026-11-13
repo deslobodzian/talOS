@@ -100,7 +100,9 @@ class Launcher {
 
   // Lints the declared graph, then runs the roster until every node exits,
   // the duration passes or a signal arrives, and writes manifest.json.
-  // Returns 0, or the last nonzero exit code of a node. With --replay-inputs
+  // Returns 0, or the last nonzero exit code of a member other than the
+  // Studio bridge (an observer, whose ending the manifest records but the
+  // status never reflects). With --replay-inputs
   // it runs only the --only node, on recorded topics (RunOnRecordedInputs).
   // Sets the process's SIGPIPE disposition to ignored, for good. While it
   // runs, std::cout, std::cerr and std::clog write into a LauncherOutput

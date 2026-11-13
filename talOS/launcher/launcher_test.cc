@@ -878,6 +878,114 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   std::filesystem::remove_all(out_dir);
 }
 
+// REQ-OPS-30: the Studio bridge is an observer, so how it ends never sets the
+// launcher's exit status, while the manifest still records it. Row
+// "ignores the stop": a bridge still starting (the supervision clock is held
+// inside its first retry interval) ignores the stop's SIGINT and is SIGKILLed
+// when the rest of the roster has stopped (StudioBridge::Finish). Row
+// "crashed": a bridge that has become stable (the clock moved one retry
+// interval past its spawn, then two passes) exits 3 mid-session and is not
+// restarted. Either way the operator's stop ends the session with 0, and the
+// bridge's entry shows the SIGKILL or the exit code. The other members die
+// of the stop's own SIGINT, which leaves the status 0 (REQ-OPS-06).
+TEST(LauncherTest, StudioBridgeEndingNeverSetsTheSessionStatus) {
+  struct Row {
+    const char* name;
+    bool crashes;
+    const char* recorded;
+  };
+  for (const Row row : {Row{"ignores the stop", false, "\"exit_signal\": 9,"},
+                        Row{"crashed", true, "\"exit_code\": 3,"}}) {
+    SCOPED_TRACE(row.name);
+    const std::string tag = "bridge_status";
+    const std::string out_dir = TempPath(tag + "_out");
+    std::filesystem::remove_all(out_dir);
+    std::filesystem::create_directories(out_dir);
+    const std::string ready = TempPath(tag + "_ready");
+    const std::string crash = TempPath(tag + "_crash");
+    ::remove(ready.c_str());
+    ::remove(crash.c_str());
+
+    LauncherOptions options;
+    options.output_dir = out_dir;
+    options.session_id = 0xB51A7ULL;
+    options.start_studio_bridge = true;
+    options.describe_timeout_ms = 4000;
+    options.duration_s = static_cast<int>(kHang.count());
+    // The stubs never take a registry row; nothing here waits for one.
+    options.heartbeat_startup_grace_ms = 60000;
+    testing::SteppedClock clock;
+    options.supervision_clock = clock.clock();
+    options.config_path = WriteFixtureToml();
+    options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+        tag + "_hardware",
+        NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node",
+                              {}, 30));
+    options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+        tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                              {Sender("/alpha/state")}, 30));
+    options.binary_overrides["//example/beta:node"] = WriteStubNode(
+        tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                             {Watcher("/alpha/state")}, 30));
+    options.binary_overrides["//studio/bridge:studio_bridge"] = WriteStubNode(
+        tag + "_bridge",
+        BridgeDescribeThen(
+            row.crashes ? ": > '" + ready + "'\nwhile [ ! -e '" + crash +
+                              "' ]; do sleep 0.01; done\nexit 3\n"
+                        : "trap '' INT\n: > '" + ready + "'\nexec sleep 30\n"));
+    const std::string live =
+        out_dir + "/" + std::to_string(options.session_id) + "/manifest.json";
+    // The bridge's entry in `manifest`, up to the next member's.
+    const auto bridge_entry = [](const std::string& manifest) {
+      const auto at = manifest.find("\"name\": \"studio_bridge\"");
+      if (at == std::string::npos) return std::string{};
+      return manifest.substr(at, manifest.find("\"name\": ", at + 1) - at);
+    };
+    testing::SupervisionPasses passes;
+    bool stopped = false;
+    std::jthread stopper{[&](const std::stop_token& stop) {
+      const testing::SteppedClock::ReleaseOnExit release{clock};
+      const auto wait = [&](const std::function<bool()>& done) {
+        const auto give_up = std::chrono::steady_clock::now() + kHang;
+        while (!stop.stop_requested() && !done() &&
+               std::chrono::steady_clock::now() < give_up)
+          std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        return !stop.stop_requested() && done();
+      };
+      if (!wait([&] { return std::filesystem::exists(ready); })) return;
+      if (row.crashes) {
+        clock.Advance(kStudioBridgeRetryInterval);
+        const uint64_t until = passes.Started() + 2;
+        if (!wait([&] { return passes.Started() >= until; })) return;
+        std::ofstream{crash}.close();
+        if (!wait([&] {
+              return bridge_entry(ReadFile(live)).find(row.recorded) !=
+                     std::string::npos;
+            }))
+          return;
+      } else {
+        // Held until the session has ended, so the bridge is still
+        // starting when the stop finds it.
+        clock.Freeze();
+      }
+      stopped = true;
+      ::kill(::getpid(), SIGTERM);
+      wait([] { return false; });
+    }};
+    const int status = Launcher{options}.Run();
+    stopper.request_stop();
+    stopper.join();
+
+    ASSERT_TRUE(stopped) << "the bridge never came up";
+    EXPECT_EQ(status, 0);
+    const std::string entry = bridge_entry(ReadFile(live));
+    EXPECT_NE(entry.find(row.recorded), std::string::npos) << entry;
+    std::filesystem::remove_all(out_dir);
+    ::remove(ready.c_str());
+    ::remove(crash.c_str());
+  }
+}
+
 // A log cut while it was being created (a short or zero-filled header) is
 // skipped by every session reader, not taken for corruption of the session.
 TEST(LauncherTest, SessionReadersSkipALogCutBeforeItsHeader) {

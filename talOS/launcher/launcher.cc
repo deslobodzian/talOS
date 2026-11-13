@@ -213,10 +213,11 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
 // Totals every run's event log into `procs` once the session has ended --
 // record counts, capped and damaged logs -- and returns the session's exit
 // status before the endpoint refusal: 0, or the last nonzero exit code of a
-// member whose last run did not end by the stop signal the launcher sent it
-// (`stopped_by_session`, one per member; EndedByOwnStopSignal).
+// member whose exit counts (`exit_not_counted`, one per member, false: not
+// the Studio bridge, and its last run did not end by the stop signal the
+// launcher sent it, EndedByOwnStopSignal).
 int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
-                  const std::vector<bool>& stopped_by_session) {
+                  const std::vector<bool>& exit_not_counted) {
   int exit_status = 0;
   for (std::size_t i = 0; i < procs.size(); ++i) {
     auto& proc = procs[i];
@@ -240,7 +241,7 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
         }
       }
     }
-    if (proc.exit_code != 0 && !stopped_by_session[i])
+    if (proc.exit_code != 0 && !exit_not_counted[i])
       exit_status = proc.exit_code;
   }
   return exit_status;
@@ -736,11 +737,17 @@ int Launcher::RunSession() {
                 << " bytes of output dropped (marked in " << path << ")\n";
   }
 
-  std::vector<bool> stopped_by_session;
-  stopped_by_session.reserve(launches.size());
-  for (const auto& launch : launches)
-    stopped_by_session.push_back(launch.stopped_by_session);
-  int exit_status = SummarizeLogs(procs, stopped_by_session);
+  // Whose last exit leaves the status alone: a run the stop's own signal
+  // ended, and the Studio bridge however it ended (an observer, REQ-OPS-30:
+  // killed while still starting, crashed, or stopped), which the manifest
+  // records all the same.
+  std::vector<bool> exit_not_counted;
+  exit_not_counted.reserve(launches.size());
+  for (std::size_t i = 0; i < launches.size(); ++i) {
+    exit_not_counted.push_back(launches[i].stopped_by_session ||
+                               (studio && i == studio->index()));
+  }
+  int exit_status = SummarizeLogs(procs, exit_not_counted);
   if (endpoints_refused_) exit_status = 1;
   manifest.nodes = std::move(procs);
 
