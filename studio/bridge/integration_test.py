@@ -107,16 +107,30 @@ def stop(processes):
             process.stdout.close()
 
 
-def upgrade(sock):
-    """Sends a WebSocket upgrade for /telemetry and returns the reply headers."""
+def upgrade(sock, path="/telemetry"):
+    """Sends a WebSocket upgrade for `path` and returns the reply headers."""
     key = base64.b64encode(os.urandom(16)).decode()
-    sock.sendall((f"GET /telemetry HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+    sock.sendall((f"GET {path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
                   f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                   f"Sec-WebSocket-Version: 13\r\n\r\n").encode())
     headers = b""
     while not headers.endswith(b"\r\n\r\n"):
         headers += receive(sock, 1)
     return headers
+
+
+CLOSE = 0x88
+
+
+def any_frame(sock):
+    """The next frame of any kind, close frames included: (opcode, payload)."""
+    first, length = receive(sock, 2)
+    length &= 127
+    if length == 126:
+        length = struct.unpack("!H", receive(sock, 2))[0]
+    elif length == 127:
+        length = struct.unpack("!Q", receive(sock, 8))[0]
+    return first, receive(sock, length)
 
 
 # An RTMS segment's header (talOS/rtms/rtms.h RTMSHeader, version 9, 2368 B):
@@ -429,7 +443,7 @@ class BridgeIntegration(unittest.TestCase):
                             ["ok", "orphaned", "unread", "bridged",
                              "unconnected", "lossy", "idle"])
 
-                # Served verbatim: the bridge has no JSON parser and re-emitting
+                # Served verbatim: the bridge never parses it, and re-emitting
                 # the launcher's bytes unchanged is the one transformation that
                 # cannot be subtly wrong.
                 with urllib.request.urlopen(
@@ -476,6 +490,102 @@ class BridgeIntegration(unittest.TestCase):
                     urllib.request.urlopen(
                         f"http://127.0.0.1:{http_port}/oversized.js", timeout=3)
                 self.assertEqual(too_large.exception.code, 413)
+            finally:
+                stop(processes)
+                for process in processes:
+                    self.assertEqual(process.returncode, 0)
+
+    # REQ-OPS-35
+    def test_drive_feed_slots_and_layout(self):
+        """/drive is served outside max_clients, evicts its oldest, and needs a layout.
+
+        With the only programmer slot taken, a driver dashboard still
+        connects; it is sent the dictionary, its masked values and the drive
+        summary, never the system graph; a second dashboard past
+        drive_clients evicts the first with a close the page can show. A
+        bridge without a layout answers 404 to both /drive endpoints.
+        """
+        workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
+        binaries = workspace / "studio/bridge"
+        topic = f"/test/telemetry/d{os.getpid()}"
+        processes = []
+        with tempfile.TemporaryDirectory() as webroot, \
+                tempfile.TemporaryDirectory() as configs:
+            Path(configs, "robot.toml").write_text(
+                "[robot]\nperiod_us = 5000\n\n"
+                "[studio]\nmax_clients = 1\ndashboard = \"dashboard.toml\"\n\n"
+                "[subsystems.alpha]\nnode = \"//test:alpha\"\ncritical = false\n")
+            Path(configs, "dashboard.toml").write_text(
+                "[dashboard]\ntitle = \"Pit\"\ndrive_clients = 1\n\n"
+                "[[widgets]]\nkind = \"number\"\nat = [0, 0, 2, 1]\n"
+                "channel = \"drive/velocity\"\n")
+            try:
+                mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(mock)
+                self.assertEqual(mock.stdout.readline().strip(), "ready")
+                bridge = subprocess.Popen([str(binaries / "studio_bridge"), topic, "0", webroot,
+                                           "--config", str(Path(configs, "robot.toml"))],
+                                          stdout=subprocess.PIPE, text=True)
+                processes.append(bridge)
+                bare = subprocess.Popen([str(binaries / "studio_bridge"), topic, "0", webroot],
+                                        stdout=subprocess.PIPE, text=True)
+                processes.append(bare)
+                port, bare_port = bound_port(bridge), bound_port(bare)
+
+                with urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/drive/layout.json", timeout=3) as response:
+                    layout = json.loads(response.read())
+                self.assertEqual(layout["title"], "Pit")
+                self.assertEqual(layout["channels"], ["drive/velocity"])
+                with self.assertRaises(urllib.error.HTTPError) as absent:
+                    urllib.request.urlopen(f"http://127.0.0.1:{bare_port}/drive/layout.json",
+                                           timeout=3)
+                self.assertEqual(absent.exception.code, 404)
+                with socket.create_connection(("127.0.0.1", bare_port), timeout=10) as ws:
+                    self.assertIn(b" 404 ", upgrade(ws, "/drive").split(b"\r\n")[0])
+
+                with socket.create_connection(("127.0.0.1", port), timeout=10) as programmer, \
+                        socket.create_connection(("127.0.0.1", port), timeout=10) as refused, \
+                        socket.create_connection(("127.0.0.1", port), timeout=10) as first, \
+                        socket.create_connection(("127.0.0.1", port), timeout=10) as second:
+                    self.assertIn(b"101 Switching Protocols", upgrade(programmer))
+                    self.assertIn(b"503", upgrade(refused).split(b"\r\n")[0])
+                    self.assertIn(b"101 Switching Protocols", upgrade(first, "/drive"))
+
+                    binary, summary = [], None
+                    while summary is None or len(binary) < 3:
+                        opcode, payload = any_frame(first)
+                        if opcode == BINARY:
+                            self.assertEqual(payload[8:12], b"TLM3")
+                            binary.append(payload)
+                            continue
+                        self.assertEqual(opcode, TEXT)
+                        document = json.loads(payload.decode())
+                        if document["kind"] == "talos.drive.heartbeat":
+                            continue  # before it holds a tick
+                        self.assertEqual(document["kind"], "talos.drive.summary",
+                                         "a drive client was sent another text message")
+                        summary = document
+                    # The dictionary first, whole, then value pages.
+                    self.assertIn(b"drive/velocity", binary[0])
+                    self.assertLessEqual(len(json.dumps(summary)), 4096)
+                    self.assertFalse(summary["supervised"])
+                    self.assertEqual([(n["name"], n["critical"], n["alive"])
+                                      for n in summary["nodes"]],
+                                     [("hardware_node", True, False), ("alpha", False, False)])
+                    self.assertEqual(summary["omitted"], 0)
+
+                    # drive_clients = 1: the newer dashboard takes the slot.
+                    self.assertIn(b"101 Switching Protocols", upgrade(second, "/drive"))
+                    while True:
+                        opcode, payload = any_frame(first)
+                        if opcode == CLOSE:
+                            break
+                    code = struct.unpack("!H", payload[:2])[0]
+                    self.assertEqual(code, 4000)
+                    self.assertEqual(payload[2:], b"replaced by a newer driver dashboard")
+                    self.assertEqual(any_frame(second)[0], BINARY)
             finally:
                 stop(processes)
                 for process in processes:

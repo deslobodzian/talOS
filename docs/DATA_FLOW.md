@@ -57,6 +57,7 @@ For processor ownership and layer boundaries, see
 | Any publisher → the loop of a reader asleep on its topic (wake) | AF_UNIX datagram, Linux abstract address / macOS `/tmp/talos-wake-<id>`; no port ([talOS/rtms](../talOS/rtms/README.md#wake-channel)) | 1 byte, at most one per reader sleep per topic: a write sends one to each reader slot armed since the last publication (a reader of a prompt subscription under `Delivery::ON_PUBLISH`, the bridge's reader of each `/hw/request/<node>`, or `studio_bridge`'s reader of `/talos/telemetry`, between its drain and its next block), none when no reader is armed; a writer taking over a topic sends one to every reader with a receiver. A lost datagram costs a node's loop up to its 1 s backstop, the bridge up to its longest wait, 10000 µs (`HardwareNode::kMaxWaitUs`), and `studio_bridge` up to its next duty, at most its 250 ms graph refresh ([Studio bridge](../studio/bridge/README.md#waking)). A send that fails other than to a gone receiver counts in the writer's registry row (`wake_failures`), and a request the bridge's latest-value read passes over in its subsystem's request row (`requests_skipped`; [wake loss](../talOS/introspection/README.md#wake-loss)). |
 | Nodes → telemetry → studio_bridge | Shared-memory states/statuses → `/talos/telemetry` byte topic | Telemetry period 10000 µs = 100 Hz, each tick as one or more value pages; dictionary pages before the first tick and every 100th (1 Hz at this rate). |
 | studio_bridge ↔ browser/agent | HTTP + WebSocket, configured port 5800 | Per client: graph, dictionary pages and a keyframe on connection, then change-only telemetry updates of at most one per producer tick and system-graph value updates of at most one per 500 ms (the whole graph again when its structure changes), deferred and coalesced when the egress budget is short. HTTP requests are not the value stream. |
+| studio_bridge → driver dashboard (`/drive`) | WebSocket, the same port | Per drive client (at most the layout's `drive_clients`, outside `max_clients`): dictionary pages and a keyframe of the layout's channels on connection, then change-only updates of those channels at most `update_hz` (default 20) a second, an empty update after 100 ms without one, and the drive summary (at most 4,096 B) on change at most every 500 ms; within the layout's `budget_bytes_per_s` (default 24,000 B/s), reserved out of the bridge's 160,000 B/s ([bridge README](../studio/bridge/README.md#driver-dashboard-feed)). |
 
 A failed send never kills the bridge (`RuntimeUdpPeer` raises no
 `SIGPIPE`). When a send to the gateway fails with an error its socket never
@@ -447,12 +448,23 @@ every change since, so a client's view is always one whole producer tick.
 skips intermediate samples whenever the budget is short; each node's event log
 is the complete record.**
 
-Studio's bridge charges every WebSocket send, with conservative framing
-overhead, against a shared **160,000 B/s** token bucket with a **64,000 B**
-burst (`EgressBudget` in `studio/bridge/telemetry.h`). Each client also has a
-`160000 / max_clients` B/s bucket with the same burst; `[studio] max_clients`
-defaults to **4** (range **1–64**). Every send leaves in a pass over the
-clients (a client that joins or drains is offered its turn by one), and each
+Studio's bridge sends at most **160,000 B/s** in all, charging every
+WebSocket send with conservative framing overhead (`EgressBudget` in
+`studio/bridge/telemetry.h`, `BridgeEgress` in `studio/bridge/drive.h`).
+With a dashboard layout (`[studio] dashboard`), each driver dashboard client
+has its own bucket of the layout's `budget_bytes_per_s` with a **64,000 B**
+burst, and `drive_clients × budget_bytes_per_s` (at most **80,000 B/s**;
+default 2 × 24,000 = **48,000 B/s**) is reserved out of the total first.
+Programmer clients (`/telemetry`) share the rest, R = 160,000 B/s less that
+reservation (**112,000 B/s** with the default layout, all of it without
+one), through a shared bucket of R B/s with a **64,000 B** burst; each
+programmer client also has an `R / max_clients` B/s bucket with the same
+burst (**28,000 B/s** at the default 4 with the default layout, 40,000 B/s
+without one); `[studio] max_clients` defaults to **4** (range **1–64**) and
+does not count drive clients. A drive client's sends are charged to its own
+bucket only, so no programmer client can defer one. At most `drive_clients`
+are held; a new one evicts the oldest (close code 4000). Every programmer
+send leaves in a pass over the clients (a client that joins or drains is offered its turn by one), and each
 pass starts just after the last client sent anything, so the shared bucket is
 granted in rotation: of the clients able to take a send (nothing buffered,
 and both buckets, as they stood when the pass began, hold its whole next
@@ -479,11 +491,14 @@ smallest timeout whose pong window (8 s) covers five retransmissions of a
 lost pong at TCP's 200 ms minimum RTO (sent by 6.2 s). Studio's browser
 answers pings, so a client that only receives stays connected. Each client's kernel send buffer is what its
 share sends in **250 ms**, at least **16 KiB** (`ClientSendBuffer` in
-`studio/bridge/telemetry.h`): 16,384 B at the default 4 clients, 40,000 B
-at 1. macOS uses that size as given; Linux reserves twice it, about the size
+`studio/bridge/telemetry.h`): 16,384 B at the default 4 clients and for a
+drive client at the default 24,000 B/s, and at 1 client 40,000 B without a
+dashboard layout (28,000 B with the default one). macOS uses that size as
+given; Linux reserves twice it, about the size
 in payload. A client that stops reading therefore backs up after that much
 of its output (0.4 s of a 40,000 B/s share; up to 6.6 s of the 2,500 B/s
-share at 64 clients), not after the 4 MiB Linux autotuning reached, about
+share at 64 clients without a dashboard layout, 9.4 s of the 1,750 B/s share
+with the default one), not after the 4 MiB Linux autotuning reached, about
 100 s of a 40,000 B/s share, plus whatever its own receive window takes,
 which its OS sets and the bridge cannot; so those times are lower bounds.
 A reading client is limited below its share only
@@ -504,7 +519,7 @@ viewer):
 | Viewer budget | Telemetry bytes/s | System graph bytes/s | Telemetry updates/s | Total, whole run |
 |---|---:|---:|---:|---:|
 | 160,000 B/s (`max_clients = 1`) | 46,700–72,200 disabled/autonomous; 57,700–62,600 teleop | 5,500–12,000 | 96–100 (every tick) | 69,500 B/s |
-| 40,000 B/s (default 4-client share) | 27,500–34,300 | 5,600–11,900 | 37–94, typically 45–55 | 39,700 B/s |
+| 40,000 B/s (4-client share, no dashboard layout) | 27,500–34,300 | 5,600–11,900 | 37–94, typically 45–55 | 39,700 B/s |
 
 A full keyframe every tick would be 2552 B, 255,200 B/s. The system graph
 (about 40 KB whole: 15 nodes, 94 sources, 28 topics) goes to a client whole
@@ -523,22 +538,24 @@ framed bytes therefore goes within
 
 on a client share of ρ B/s, where n is one framed deferral notice (71 B, sent
 at most every 750 ms while it waits): **2.0 s** for the 40 KB whole graph at
-the default 40,000 B/s share, and **55.5 s** for a graph at the 64,000 B burst
-at the 2,500 B/s share of `max_clients = 64`. The bound is on the client's own
+the 40,000 B/s share of 4 clients without a dashboard layout (**2.9 s** at
+the 28,000 B/s share with the default one), and **55.5 s** for a graph at the
+64,000 B burst at the 2,500 B/s share of `max_clients = 64` (**82.1 s** at
+its 1,750 B/s share with the default layout). The bound is on the client's own
 bucket: the shared bucket refills at the sum of every share, so it adds delay
 only while other clients spend bursts they saved, and a client whose socket
 still has output buffered is sent nothing until it drains. Telemetry keeps
 flowing beside the waiting graph, change-only, so the thinning skips samples,
 never values; while a graph waits, a reading goes stale only when one update costs more than
-about half of what the share refills in a second. At the default share updates
+about half of what the share refills in a second. At the 40,000 B/s share updates
 arrived every 500–720 ms and no deferral notice was needed. Both rows stay
 within their budget over the run; a single second can exceed the rate by up to
 the 64,000 B burst.
 
-The cost falls on structure changes. A whole graph is about a second of the
-default share, so after a node starts, stops or restarts, that client's
-telemetry runs at four updates a second for about a second (at most the
-2.0 s bound) while the graph goes. A whole graph goes at most every 2 s: in
+The cost falls on structure changes. A whole graph is about a second of a
+40,000 B/s share (1.4 s of the 28,000 B/s one), so after a node starts, stops
+or restarts, that client's telemetry runs at four updates a second for about
+that long (at most the bound above) while the graph goes. A whole graph goes at most every 2 s: in
 a crash loop, a client's graph shows restarts up to 2 s late (marked
 deferred, not stale), and its telemetry is thinned for about a second of
 every two.
