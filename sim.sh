@@ -206,8 +206,16 @@ CHECK_OUTPUT="$(bazel run --noshow_progress --ui_event_filters=-info \
 }
 # The effective config, through the launcher's own parser: the manifest's
 # node labels (current, per the check) and the labels of [robot] and
-# [studio], defaults where unset.
-TARGETS="$(./bazel-bin/talOS/configuration/resolve "$CONFIG" | python3 -c '
+# [studio], defaults where unset. A config the parser refuses stops here with
+# the parser's reason on one line; its empty output never reaches the reader.
+RESOLVE_ERRORS="$(mktemp)"
+RESOLVED="$(./bazel-bin/talOS/configuration/resolve "$CONFIG" 2>"$RESOLVE_ERRORS")"
+RESOLVE_STATUS=$?
+RESOLVE_REASON="$(tr '\n' ' ' < "$RESOLVE_ERRORS" | sed 's/ *$//')"
+rm -f "$RESOLVE_ERRORS"
+[ "$RESOLVE_STATUS" = 0 ] ||
+  die "cannot resolve $CONFIG: ${RESOLVE_REASON:-the resolver exited $RESOLVE_STATUS}"
+TARGETS="$(printf '%s\n' "$RESOLVED" | python3 -c '
 import json, sys
 config = json.load(sys.stdin)
 robot = config["effective"].get("robot", {})
