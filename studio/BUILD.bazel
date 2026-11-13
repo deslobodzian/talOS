@@ -137,9 +137,12 @@ STUDIO_TESTS = {
 }
 
 # A test's data beyond the sources. review_golden: the review server's golden
-# responses, which //studio/review:review_test holds the server to.
+# responses, which //studio/review:review_test holds the server to. system:
+# the Studio bridge's golden graph and update, which
+# //studio/bridge:system_test holds the bridge to.
 STUDIO_TEST_DATA = {
     "review_golden_test": ["//studio/review:golden"],
+    "system_test": ["//studio/bridge:golden"],
 }
 
 [
@@ -159,6 +162,7 @@ test_suite(
     tests = [":" + name for name in STUDIO_TESTS] + [
         ":typecheck",
         "//studio/bridge:describe_test",
+        "//studio/bridge:fast_slots_test",
         "//studio/bridge:integration_test",
         "//studio/bridge:system_test",
         "//studio/bridge:telemetry_test",
