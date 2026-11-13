@@ -2689,6 +2689,90 @@ TEST(PhysicsSimBackend, FailingRestoreKeepsChainInvalidAsOnTheRobot) {
   ExpectFailingRestoreKeepsPairInvalid(backend);
 }
 
+// One motor, a Pigeon 2 and a solenoid that reset together, as a CAN
+// brownout resets every device on the bus. The gateway masks both in every
+// State until the restore ends, but judges total loss on what Backend::Read
+// reports, and the backends read a restoring CAN sensor valid (only the
+// motors of the chain invalid, as PhoenixBackend does): so no State is total
+// loss, there is no fault and no new epoch, though none carries a valid
+// motion sample. What keeps that safe is the mask itself: no command
+// observing those States drives the motor, while the solenoid, outside the
+// reset chain, keeps applying. Without the Pigeon the same reset is total
+// loss (ExpectRestoringPairIsTotalLoss).
+template <typename SimulatedBackend>
+void ExpectEveryDeviceResetDrivesNoMotor(SimulatedBackend& backend) {
+  Config config;
+  config.commissioned = true;
+  MotorConfig motor;
+  motor.id = 1;
+  motor.name = "roller";
+  motor.can_id = 1;
+  config.motors = {motor};
+  config.sensors = {{11, "imu", SensorKind::kPigeon2, 30, "rio"}};
+  config.digital_outputs = {{21, "solenoid", 1}};
+  Gateway g{config, backend, 1};
+  // A command driving the motor at 2 V and the solenoid on, observing the
+  // last State.
+  const auto request = [&g, &motor] {
+    auto command = Request(g);
+    command.motors[0] = {motor.id, Mode::kVoltage, 0, 2};
+    command.digital_output_count = 1;
+    command.digital_outputs[0] = {21, true};
+    return command;
+  };
+  // Accepts `command`; returns how many motors it neutralized.
+  uint64_t sequence = 0;
+  const auto accept = [&g, &sequence](const Command& command, uint64_t now) {
+    const auto neutralized = g.snapshot().counters.neutralized_motor_count;
+    EXPECT_TRUE(g.Accept(command, ++sequence, now));
+    return g.snapshot().counters.neutralized_motor_count - neutralized;
+  };
+  g.Tick(1000, true);
+  EXPECT_EQ(accept(request(), 1000), 0u);
+  const auto epoch = g.snapshot().epoch;
+  backend.SimulateDeviceReset(motor.id);
+  backend.SimulateDeviceReset(11);
+  // The reset found, then read while restoring and restored: neither State
+  // carries a valid motion sample, and neither is total loss.
+  Command masked{};
+  for (const uint64_t now : {uint64_t{6000}, uint64_t{11000}}) {
+    SCOPED_TRACE(now);
+    g.Tick(now, true);
+    const auto s = g.snapshot();
+    EXPECT_FALSE(s.motors[0].valid);
+    EXPECT_FALSE(s.sensors[0].valid);
+    EXPECT_FALSE(s.flags & kHardwareFault);
+    EXPECT_EQ(s.epoch, epoch);
+    EXPECT_TRUE(s.digital_outputs[0].value);
+    masked = request();
+    EXPECT_EQ(accept(masked, now), 1u);  // The motor neutral, the solenoid on.
+  }
+  // Read after the restore ended. A command observing the last masked State
+  // still drives nothing; one observing this State drives.
+  g.Tick(16000, true);
+  EXPECT_TRUE(g.snapshot().motors[0].valid);
+  EXPECT_TRUE(g.snapshot().sensors[0].valid);
+  EXPECT_EQ(accept(masked, 16000), 1u);
+  g.Tick(21000, true);
+  EXPECT_DOUBLE_EQ(g.snapshot().motors[0].voltage, 0.0);
+  EXPECT_TRUE(g.snapshot().digital_outputs[0].value);
+  EXPECT_EQ(accept(request(), 21000), 0u);
+  g.Tick(26000, true);
+  EXPECT_NE(g.snapshot().motors[0].voltage, 0.0);
+}
+
+// REQ-SAFE-24, REQ-DEV-24
+TEST(SimBackend, EveryDeviceResetDrivesNoMotor) {
+  SimBackend backend;
+  ExpectEveryDeviceResetDrivesNoMotor(backend);
+}
+
+// REQ-SAFE-24, REQ-DEV-24
+TEST(PhysicsSimBackend, EveryDeviceResetDrivesNoMotor) {
+  sim::PhysicsSimBackend backend;
+  ExpectEveryDeviceResetDrivesNoMotor(backend);
+}
+
 // A TalonFX reset restarts its rotor position at zero, and the restarted
 // frames can reach the gateway before HasResetOccurred() does. A rotor-
 // feedback motor whose position steps farther than its motor can turn is

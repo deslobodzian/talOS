@@ -38,6 +38,14 @@ class Backend {
   // return true. An invalid sample gates only the affected motor and its
   // followers and dependents: neutral from the Tick that finds it, and driven
   // again only by a command observing a later State.
+  // Total loss is judged on the samples Read returns, after the age bound and
+  // before the gateway's own masks (an unavailable, restoring or send-failed
+  // device, a follower or remote-feedback motor of one, a chain whose restore
+  // ends that tick): a sample Read reports valid counts there even when the
+  // published State carries it invalid. So whether a reset that masks every
+  // motor and CAN sensor faults depends on the backend: PhoenixBackend and
+  // both simulated backends read a restoring motor invalid and a restoring
+  // CAN sensor valid. The mask alone keeps each masked motor neutral.
   virtual bool Read(State&) = 0;
   // Followers ignore demand values, but kNeutral explicitly gates their output.
   // Gateway resolves a live follower's mode from its sanitized master.
