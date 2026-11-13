@@ -33,11 +33,18 @@ the site has no `index.html`. The 2026 robot, the bench rig and
 |---|---|
 | `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set and, in a bundle that carries Studio, `--start-studio-bridge` unless given `--no-studio` (which it does not pass on); a `--config`/`--output-dir` argument replaces the default |
 | `launcher` | `//talOS/launcher` |
-| `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
+| `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, `libtalos_node.so` and its own copy of the interpreter) |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | `robot_field.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
 | `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
+
+The bundle holds no symlinks. Bazel may restore a tree artifact from its
+disk or remote cache with each symlink in it replaced by a copy of its
+target, so a bundle with one would run differently when built than when
+restored. A link Bazel declares in a node's runfiles (a py_binary venv's
+`bin/python3`) is staged as a two-line script that execs the bundled
+interpreter at its own path, where it finds its standard library.
 
 The launcher copies `config_sha256`, `git_revision` and `git_dirty` into every
 session manifest, and records each member's binary SHA-256 again when the
@@ -105,7 +112,7 @@ naming the bundle's config, or the RoboRIO program under WPILib simulation.
 A relative `--prefix` is resolved against the working directory.
 
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
-  symlinks kept), checks that the copy has an executable `run.sh`, runs
+  any symlink kept as one), checks that the copy has an executable `run.sh`, runs
   `sync`, [warms the copy](#warm-up), retains `previous`, and atomically
   replaces `current` using a temporary sibling symlink and rename (Linux and
   macOS). This selects the next bundle; restart the service to activate it.

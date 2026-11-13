@@ -4,8 +4,9 @@ Each bundle is installed the way the robot gets it (tools/deploy.sh install
 into a fresh prefix, which runs every member once without a warning), then
 --describe runs every node binary from there, so a
 C++ node that cannot load a shared library it links, a
-Python node that cannot import its wheels or start its interpreter, or an
-install that breaks the bundle's relative symlinks fails here. The bench
+Python node that cannot import its wheels or start its interpreter (as
+when Bazel restored the bundle from its cache with links copied) fails
+here. The bench
 rig's bundle, which link and stop qualification install, is checked too.
 A bundle that carries Studio is described by the command the boot service
 runs (deploy.sh enable-boot's systemd ExecStart and launchd
