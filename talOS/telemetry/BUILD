@@ -56,8 +56,9 @@ cc_test(
 
 # The channel model: a topic's channels from its schema (names by field
 # path, kinds, units, enum labels) and each one's value from a message's
-# bytes, plus the Driver Station channels. The node builds its dictionary
-# with it, and a reader of recorded messages names channels the same way.
+# bytes, plus the Driver Station and target-envelope channels. The node
+# builds its dictionary with it, and a reader of recorded messages names
+# channels the same way.
 cc_library(
     name = "channels",
     srcs = ["channels.cc"],
@@ -69,6 +70,7 @@ cc_library(
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/schema:field_path",
+        "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
         "@flatbuffers//:runtime_cc",
     ],

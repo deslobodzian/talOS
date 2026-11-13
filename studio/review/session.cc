@@ -47,36 +47,6 @@ bool IsValueRecord(const tlog::RecordHeader& header) {
          tlog::IsAcceptedSend(header);
 }
 
-// The header and message channels of a target envelope (schema.h
-// EnvelopeName), named as log_dump decodes it: {mode_since_us, active,
-// message: {...}}.
-std::vector<Channel> EnvelopeChannels(const std::string& topic,
-                                      std::string_view inner,
-                                      std::string_view bfbs) {
-  std::string prefix = topic;
-  if (prefix.starts_with('/')) prefix.erase(0, 1);
-  std::vector<Channel> channels;
-  Channel since;
-  since.name = prefix + "/mode_since_us";
-  since.unit = std::string{talos::schema::unit_for_field("mode_since_us")};
-  since.kind = Talos::Telemetry::ChannelKind_UInt;
-  since.offset = 0;
-  since.base = reflection::BaseType::ULong;
-  channels.push_back(std::move(since));
-  Channel active;
-  active.name = prefix + "/active";
-  active.kind = Talos::Telemetry::ChannelKind_Bool;
-  active.offset = talos::schema::kEnvelopeActiveOffset;
-  active.base = reflection::BaseType::Bool;
-  channels.push_back(std::move(active));
-  for (Channel& channel :
-       talos::telemetry::FlattenTopic(topic + "/message", inner, bfbs)) {
-    channel.offset += talos::schema::kEnvelopeHeaderBytes;
-    channels.push_back(std::move(channel));
-  }
-  return channels;
-}
-
 // A topic as the index pass learns it.
 struct TopicBuild {
   std::string name;
@@ -141,7 +111,8 @@ class Indexer {
         topic.decoder = Decoder::kStruct;  // nothing to decode
       } else if (const auto inner = talos::schema::EnvelopeInner(schema.name);
                  !inner.empty()) {
-        topic.channels = EnvelopeChannels(source.name, inner, schema.bfbs);
+        topic.channels =
+            talos::telemetry::EnvelopeChannels(source.name, inner, schema.bfbs);
       } else {
         topic.channels = talos::telemetry::FlattenTopic(
             source.name, schema.name, schema.bfbs);

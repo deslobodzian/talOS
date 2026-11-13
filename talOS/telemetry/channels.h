@@ -151,6 +151,15 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
                                   const FlattenOptions& options = {},
                                   std::size_t* kept = nullptr);
 
+// The channels of a target lane's envelope (talos.TargetEnvelope<inner>,
+// talOS/schema/identity.h) on `topic`, named as log_dump decodes it: the
+// header's `mode_since_us` and `active`, then struct `inner` of `bfbs` under
+// `message/`, each read at its offset in the whole envelope. Throws as
+// FlattenTopic does for `inner`.
+std::vector<Channel> EnvelopeChannels(std::string_view topic,
+                                      std::string_view inner,
+                                      std::string_view bfbs);
+
 // The Driver Station topic's channels, decoded from its packet rather than
 // read from a struct: connected, enabled, autonomous, teleop, test, estop,
 // fms_attached, alliance (labels unknown, red, blue) and match_time_s, all

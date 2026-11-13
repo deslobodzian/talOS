@@ -132,7 +132,10 @@ so a large message can be brought within the dictionary cap below by
 excluding part of it. `ReadChannel` reads one
 channel's raw sample from a message's
 bytes (absent when the message ends before it), and `DriverStationChannels`
-and `ReadDriverStation` do the same for the Driver Station packet. The node
+and `ReadDriverStation` do the same for the Driver Station packet.
+`EnvelopeChannels(topic, inner, bfbs)` lists a target lane's: its header's
+`<lane>/mode_since_us` and `<lane>/active`, then the inner struct under
+`<lane>/message/`, each at its offset in the whole envelope. The node
 builds its dictionary and reads every tick through it, so anything that
 names or decodes a recorded message with it uses the live names. Rules 5
 and 6 are the node's own.

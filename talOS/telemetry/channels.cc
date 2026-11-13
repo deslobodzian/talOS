@@ -10,6 +10,7 @@
 #include "flatbuffers/flatbuffers.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/schema/identity.h"
 #include "talOS/schema/unit_suffix.h"
 #include "talOS/telemetry/wire.h"
 
@@ -216,6 +217,33 @@ std::vector<Channel> FlattenTopic(std::string_view topic,
   Flattener flattener{*schema, topic, options, channels};
   flattener.Struct(root, schema_name, prefix, 0, 0);
   if (kept != nullptr) *kept = flattener.kept();
+  return channels;
+}
+
+std::vector<Channel> EnvelopeChannels(std::string_view topic,
+                                      std::string_view inner,
+                                      std::string_view bfbs) {
+  std::string prefix{topic};
+  if (prefix.starts_with('/')) prefix.erase(0, 1);
+  std::vector<Channel> channels;
+  Channel since;
+  since.name = prefix + "/mode_since_us";
+  since.unit = std::string{schema::unit_for_field("mode_since_us")};
+  since.kind = Talos::Telemetry::ChannelKind_UInt;
+  since.offset = 0;
+  since.base = reflection::BaseType::ULong;
+  channels.push_back(std::move(since));
+  Channel active;
+  active.name = prefix + "/active";
+  active.kind = Talos::Telemetry::ChannelKind_Bool;
+  active.offset = schema::kEnvelopeActiveOffset;
+  active.base = reflection::BaseType::Bool;
+  channels.push_back(std::move(active));
+  for (Channel& channel :
+       FlattenTopic(std::string{topic} + "/message", inner, bfbs)) {
+    channel.offset += schema::kEnvelopeHeaderBytes;
+    channels.push_back(std::move(channel));
+  }
   return channels;
 }
 
