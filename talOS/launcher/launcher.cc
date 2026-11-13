@@ -327,22 +327,29 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
 }
 
 int Launcher::Run() {
-  // Declared first, so destroyed last, on every return path: a roster
+  // Declared first, so destroyed last: when RunSession returns, a roster
   // launch's stop handlers give way to the dispositions the launcher's
-  // caller set only after RunSession has returned, which is after
-  // Supervise has reaped every member's run and killed its group (or no
-  // member was spawned, and DescribeGraph reaped every probe), and after
-  // RunSession's locals have unlinked the session's topic segments and
-  // released the session lock; and after the output drains have stopped
-  // and the session directory's lock is released, below. Until then a stop
-  // is the launcher's orderly one: none is lost, and none takes a default
-  // action (ending the launcher) while a member, a probe or a segment of
-  // the session exists. Afterwards there is nothing left for it to stop.
+  // caller set only after it has returned, which is after Supervise has
+  // reaped every member's run and killed its group (or no member was
+  // spawned, and DescribeGraph reaped every probe), and after RunSession's
+  // locals have unlinked the session's topic segments and released the
+  // session lock; and after the output drains have stopped and the session
+  // directory's lock is released, below. Until then a stop is the
+  // launcher's orderly one: none is lost, and none takes a default action
+  // (ending the launcher) while a member, a probe or a segment of the
+  // session exists. Afterwards there is nothing left for it to stop. An
+  // exception that escapes RunSession once members are spawned puts the
+  // dispositions back while those members still run: main.cc then returns
+  // 1, and each member's guardian kills its group as the launcher exits.
   StopSignals stop_signals;
   // A session must not end because whoever reads the launcher's stdout or
   // stderr went away (a `tee` or a log pipe closing): its writes then fail
   // with EPIPE, which LauncherOutput survives (REQ-OPS-33). Children start
-  // with the default again (SpawnProcess).
+  // with the default again (SpawnProcess). Unlike the stop signals it is
+  // never put back: LauncherOutput::Stop may leave a writer thread blocked
+  // in a write to a stdout or stderr nobody reads (it detaches it after its
+  // grace), and that write failing with EPIPE after Run returns must not
+  // end the process.
   std::signal(SIGPIPE, SIG_IGN);
   // From here no launcher thread writes to descriptors 1 and 2 itself.
   try {

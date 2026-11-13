@@ -785,8 +785,8 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   launcher sent ended (reason `stop`, SIGINT), which leaves the exit status
   0 ([restarts](#restarts)); false for every other run, one that handled
   the stop and exited 0 or that a signal from elsewhere ended during the
-  stop (also reason `stop`) included. At most 32 are kept, the first run and the newest; `runs_dropped` counts
-  those dropped between them.
+  stop (also reason `stop`) included. At most 32 are kept, the first run
+  and the newest; `runs_dropped` counts those dropped between them.
 - per node and per run, `wake_failures`, `stalled_arms`, `wake_fallbacks`
   and `requests_skipped`: what the run's registry row last showed it lost
   ([wake loss](../introspection/README.md#wake-loss),
