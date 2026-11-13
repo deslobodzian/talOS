@@ -5,6 +5,11 @@
 # carried over when the lint was added and not yet audited. A line whose
 # hits are gone fails the lint, so the list only shrinks.
 
+2026-robot/controller_processor/rio/src/test/cpp/ConfigStore_test.cpp clock integration: the config saver's real thread; steady_clock deadlines only bound a hang (TESTING.md §6.3)
+2026-robot/controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
+2026-robot/controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
+2026-robot/controller_processor/rio/src/test/cpp/RioLog_test.cpp clock integration: the logger's real thread held in a blocked write; the elapsed bound shows a burst of posts did not wait for it
+2026-robot/main_processor/drivetrain/monitor.cc clock operator CLI beside the node, paced on the real clock through a Clock alias; not node code
 2026-robot/main_processor/drivetrain/monitor.cc sleep operator CLI beside the node, paced on the real clock; not node code
 2026-robot/main_processor/drivetrain/send_target.cc clock operator CLI beside the node, sends for a wall-clock duration; not node code
 2026-robot/main_processor/drivetrain/send_target.cc sleep operator CLI beside the node, sends for a wall-clock duration; not node code

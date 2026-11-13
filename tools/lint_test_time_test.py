@@ -9,6 +9,8 @@ from tools import lint_test_time
 SLEEP = "std::this_thread::sleep" + "_for(1ms);\n"
 PY_SLEEP = "time.sleep" + "(0.1)\n"
 CLOCK = "auto t = std::chrono::steady_clock::" + "now();\n"
+ALIAS_CLOCK = ("using Clock = std::chrono::steady_clock; auto t = Clock::" +
+               "now();\n")
 PY_CLOCK = "t = time." + "time()\n"
 FLAKY = "    flaky = " + "True,\n"
 ATTEMPTS = "bazel test --flaky" + "_test_attempts=3 //...\n"
@@ -27,6 +29,9 @@ class LintTestTimeTest(unittest.TestCase):
     def test_new_wall_clock_or_retry_fails_naming_the_file(self):
         for path, text, extra in (
                 ("talOS/rtms/rtms_test.cc", SLEEP, {}),
+                ("talOS/rtms/alias_test.cc", ALIAS_CLOCK, {}),
+                ("2026-robot/controller_processor/rio/src/test/cpp/"
+                 "Loop_test.cpp", CLOCK, {}),
                 ("talOS/python/test_node.py", PY_CLOCK, {}),
                 ("studio/bridge/thing_test.py", PY_SLEEP, {}),
                 ("2026-robot/main_processor/shooter/shooter.cc", CLOCK,

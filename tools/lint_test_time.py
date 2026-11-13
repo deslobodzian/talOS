@@ -8,12 +8,14 @@ tracked files it finds:
 - `sleep`: a sleep call (`sleep_for`, `sleep_until`, `usleep`, `nanosleep`,
   `sleep(`, `time.sleep(`) in a test source or a node package's source;
 - `clock`: a wall-clock read (`steady_clock::now`, `system_clock::now`,
-  `high_resolution_clock::now`, `time.time(`, `time.monotonic(`) in the same
-  files;
+  `high_resolution_clock::now`, the same through an alias the file declares,
+  `using Clock = std::chrono::steady_clock;` then `Clock::now()`,
+  `time.time(`, `time.monotonic(`) in the same files;
 - `retry`: `flaky = True` or `--flaky_test_attempts` in a BUILD or `.bzl`
   file, `.bazelrc`, a workflow or a shell script.
 
-A test source is a `*_test.cc`, `*_test.py` or `test_*.py` file. A node
+A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py` or `test_*.py`
+file (`*_test.cpp`: the RoboRIO program's GradleRIO tests). A node
 package is a directory whose BUILD declares a node (talos_cc_node,
 talos_py_node, talos_cc_shared_node) under 2026-robot, bench, examples or
 tools/scaffold_testdata; a node package's tests are test sources. Comment
@@ -44,12 +46,21 @@ TIME_PATTERNS = {
     "clock": re.compile(r"\b(steady_clock|system_clock|high_resolution_clock)"
                         r"::now\s*\(|\btime\.(time|monotonic)\s*\("),
 }
+# `using Clock = std::chrono::steady_clock;` or a typedef of one: the alias's
+# `::now(` is a clock read too.
+CLOCK_ALIAS = re.compile(r"\busing\s+(\w+)\s*=\s*(?:std\s*::\s*)?"
+                         r"(?:chrono\s*::\s*)?"
+                         r"(?:steady_clock|system_clock|high_resolution_clock)"
+                         r"\s*;|\btypedef\s+(?:std\s*::\s*)?"
+                         r"(?:chrono\s*::\s*)?"
+                         r"(?:steady_clock|system_clock|high_resolution_clock)"
+                         r"\s+(\w+)\s*;")
 RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*True\b|--flaky_test_attempts")
 
 
 def is_test_source(path):
     name = os.path.basename(path)
-    return (name.endswith(("_test.cc", "_test.py")) or
+    return (name.endswith(("_test.cc", "_test.cpp", "_test.py")) or
             (name.startswith("test_") and name.endswith(".py")))
 
 
@@ -88,14 +99,23 @@ def scan(files, read):
     packages = node_packages(files, read)
     for path in files:
         patterns = {}
+        text = None
         if is_test_source(path) or (path.endswith(SOURCE_SUFFIXES) and
                                     in_package(path, packages)):
             patterns.update(TIME_PATTERNS)
+            text = read(path)
+            aliases = {a or b for a, b in CLOCK_ALIAS.findall(text)}
+            if aliases:
+                patterns["clock"] = re.compile(
+                    TIME_PATTERNS["clock"].pattern + r"|\b(" +
+                    "|".join(sorted(aliases)) + r")::now\s*\(")
         if is_retry_config(path):
             patterns["retry"] = RETRY_PATTERN
         if not patterns:
             continue
-        for number, line in enumerate(read(path).splitlines(), 1):
+        if text is None:
+            text = read(path)
+        for number, line in enumerate(text.splitlines(), 1):
             if is_comment(line):
                 continue
             for kind, pattern in patterns.items():
