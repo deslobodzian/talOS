@@ -955,7 +955,9 @@ by a shared lock of the root's `.talos-lock-probe` file, never by one
 failing call: on a root whose probe locked, a session whose `session.lock`
 cannot be locked for such a reason (an NFS lock daemon that stops
 answering) is passed over, with a warning, and a launch whose own lock
-fails so tries again rather than running without it.
+fails so tries again rather than running without it: up to 100 attempts
+1 ms apart (about 0.1 s), after which the launch is refused (`cannot create
+the session directory ...; nothing was started`, exit 1).
 
 The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or
