@@ -12,8 +12,10 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
 #include "talOS/bridge/in_process_gateway.h"
 #include "talOS/bridge/merge.h"
 #include "talOS/bridge/node.h"
@@ -795,6 +797,155 @@ TEST(HardwareNodeTrustTest,
   EXPECT_EQ(node.current_command().motors[1].mode, Mode::kDutyCycle);
   EXPECT_TRUE(node.current_command().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.5);
+}
+
+// The alerts `status` raises, by name, in field order.
+std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
+  std::vector<std::string> active;
+  if (status.alert_error_link_lost()) active.emplace_back("link_lost");
+  if (status.alert_error_not_configured()) {
+    active.emplace_back("not_configured");
+  }
+  if (status.alert_error_uncommissioned()) {
+    active.emplace_back("uncommissioned");
+  }
+  if (status.alert_error_motor_fault()) active.emplace_back("motor_fault");
+  if (status.alert_warning_owner_timed_out()) {
+    active.emplace_back("owner_timed_out");
+  }
+  if (status.alert_warning_brownout()) active.emplace_back("brownout");
+  return active;
+}
+
+// Each /hw/status alert is raised while its condition holds and cleared in
+// the first status after it stops, at the condition's own boundary; a
+// controller transition, which times every owner out in the merge until its
+// next request, raises none.
+// REQ-OPS-37
+TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
+  using Names = std::vector<std::string>;
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t timeout_us = cfg.hardware.command_timeout_us;
+  const uint64_t owner_timeout_us = OwnerTimeoutUs(5000, timeout_us);
+  ASSERT_LT(owner_timeout_us, timeout_us);
+
+  // Not --sim, so the config's own commissioned (false) stands.
+  const HardwareNode uncommissioned{cfg};
+  EXPECT_FALSE(uncommissioned.Status(1000000).commissioned());
+  EXPECT_EQ(Alerts(uncommissioned.Status(1000000)),
+            (Names{"link_lost", "not_configured", "uncommissioned",
+                   "owner_timed_out"}));
+
+  Bridge bridge{cfg};
+  HardwareNode& node = bridge.node;
+  InProcessGateway& gateway = bridge.gateway;
+  const uint64_t config_id = NodeConfigId(cfg);
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  // A request from `pub`'s subsystem built on the State of boot 11 at
+  // `epoch` sampled at `observed_us`.
+  const auto request = [&](ipc::Publisher<Packet>& pub, uint64_t epoch,
+                           uint64_t observed_us) {
+    Command command{};
+    command.config_id = config_id;
+    command.boot_id = 11;
+    command.epoch = epoch;
+    command.observed_time_us = observed_us;
+    PublishCommand(pub, command);
+  };
+  const auto acknowledge = [&](uint64_t now_us) {
+    ConfigAckPayload ack{};
+    ack.config_id = config_id;
+    std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+    ASSERT_EQ(EncodeConfigAck(ack, bytes), sizeof(ConfigAckPayload));
+    gateway.Receive(protocol::FrameType::kHardwareConfigAck, now_us, bytes);
+  };
+
+  // Before the link: no State, no acknowledgement, no request.
+  node.Tick(1000000);
+  EXPECT_TRUE(node.Status(1000000).commissioned());
+  EXPECT_EQ(Alerts(node.Status(1000000)),
+            (Names{"link_lost", "not_configured", "owner_timed_out"}));
+
+  // The link up, the configuration acknowledged, both owners merged.
+  acknowledge(1000500);
+  request(drive_pub, 1, 1000);
+  request(intake_pub, 1, 1000);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 1000), 1001000));
+  EXPECT_EQ(Alerts(node.Status(1001000)), Names{});
+
+  // Both owners silent: the alert at their owner timeout's boundary.
+  EXPECT_EQ(Alerts(node.Status(1001000 + owner_timeout_us)), Names{});
+  EXPECT_EQ(Alerts(node.Status(1001000 + owner_timeout_us + 1)),
+            Names{"owner_timed_out"});
+  // One silent owner is enough; its next request clears it.
+  request(drive_pub, 1, 60000);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 1, 60000), 1060000));
+  EXPECT_EQ(Alerts(node.Status(1060000)), Names{"owner_timed_out"});
+  request(intake_pub, 1, 60000);
+  node.Tick(1061000);
+  EXPECT_EQ(Alerts(node.Status(1061000)), Names{});
+
+  // A new epoch resets the merge (timed_out_mask), not the alert.
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 62000), 1062000));
+  EXPECT_EQ(node.Status(1062000).timed_out_mask(), 0b11u);
+  EXPECT_EQ(Alerts(node.Status(1062000)), Names{});
+
+  // No State for longer than the command timeout, while both owners keep
+  // publishing on the last one: the link alert alone, from its boundary.
+  uint64_t now_us = 1062000;
+  for (; now_us + 5000 <= 1062000 + timeout_us; now_us += 5000) {
+    request(drive_pub, 2, 62000);
+    request(intake_pub, 2, 62000);
+    node.Tick(now_us + 5000);
+  }
+  EXPECT_EQ(Alerts(node.Status(1062000 + timeout_us)), Names{});
+  EXPECT_EQ(Alerts(node.Status(1062000 + timeout_us + 1)), Names{"link_lost"});
+  now_us = 1062000 + timeout_us + 2000;
+  request(drive_pub, 2, 200000);
+  request(intake_pub, 2, 200000);
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 200000), now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+
+  // A State reporting an invalid motor sample and a brownout, then one
+  // reporting neither, then a brownout in a health sample that is not valid.
+  State state = TrustState(config_id, 11, 2, 201000);
+  state.motor_count = 1;
+  state.motors[0].id = cfg.hardware.motors[0].id;
+  state.motors[0].valid = false;
+  state.health = {true, 6.5, true, 0.2};
+  now_us += 1000;
+  request(drive_pub, 2, 201000);
+  request(intake_pub, 2, 201000);
+  ASSERT_TRUE(gateway.Deliver(state, now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), (Names{"motor_fault", "brownout"}));
+  state.sample_time_us = 202000;
+  state.motors[0].valid = true;
+  state.health = {true, 12.5, false, 0.2};
+  now_us += 1000;
+  request(drive_pub, 2, 202000);
+  request(intake_pub, 2, 202000);
+  ASSERT_TRUE(gateway.Deliver(state, now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+  state.sample_time_us = 203000;
+  state.health = {false, 0.0, true, 0.0};
+  now_us += 1000;
+  request(drive_pub, 2, 203000);
+  request(intake_pub, 2, 203000);
+  ASSERT_TRUE(gateway.Deliver(state, now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+
+  // The gateway names another configuration, then ours again, which only
+  // its acknowledgement restores.
+  now_us += 1000;
+  ASSERT_TRUE(
+      gateway.Deliver(TrustState(config_id + 1, 11, 3, 204000), now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"not_configured"});
+  now_us += 1000;
+  ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 4, 205000), now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"not_configured"});
+  acknowledge(now_us);
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
 }
 
 }  // namespace

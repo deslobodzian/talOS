@@ -506,6 +506,7 @@ void HardwareNode::Tick(uint64_t now_us) {
           full_cmd_.boot_id = partial.boot_id;
           full_cmd_.epoch = partial.epoch;
           tracker.merge.Accept(now_us, partial.observed_time_us);
+          tracker.last_accepted_us = now_us;
         }
       }
     }
@@ -638,6 +639,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
       pending_probe_boot_id_ = state.boot_id;
     }
     last_state_receipt_us_ = now_us;
+    state_accepted_ = true;
     if (state.boot_id != last_boot_id_) {
       config_push_backoff_us_ = 50000;
       // The new boot's Driver Station clock restarted with it.
@@ -725,12 +727,21 @@ static_assert(bridge::GatewayProgram::MAX ==
 bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
   uint32_t timed_out_mask = 0;
   uint32_t bit = 0;
+  // An owner silent past its owner timeout, measured from its last accepted
+  // request rather than from the merge (MergeOwner::Expire's test, but
+  // surviving the Reset() a controller transition makes).
+  bool owner_silent = false;
   // subsystems_ is a std::map, so this walks the names in sorted order.
   for (const auto& [name, tracker] : subsystems_) {
     if (bit < 32 && tracker.merge.timed_out) {
       timed_out_mask |= uint32_t{1} << bit;
     }
     ++bit;
+    if (!tracker.last_accepted_us ||
+        (now_us > *tracker.last_accepted_us &&
+         now_us - *tracker.last_accepted_us > tracker.merge.timeout_us)) {
+      owner_silent = true;
+    }
   }
   uint32_t motor_fault_mask = 0;
   uint32_t forward_limit_mask = 0;
@@ -756,6 +767,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       states_received_ > 0 && now_us > last_state_receipt_us_
           ? now_us - last_state_receipt_us_
           : 0;
+  const HealthSample& health = latest_state_.health;
   return bridge::BridgeStatus{
       states_received_,
       commands_sent_,
@@ -766,6 +778,14 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       timed_out_mask,
       static_cast<uint32_t>(subsystems_.size()),
       is_configured_,
+      config_.commissioned,
+      /*alert_error_link_lost=*/!state_accepted_ ||
+          state_age_us > config_.command_timeout_us,
+      /*alert_error_not_configured=*/!is_configured_,
+      /*alert_error_uncommissioned=*/!config_.commissioned,
+      /*alert_error_motor_fault=*/motor_fault_mask != 0,
+      /*alert_warning_owner_timed_out=*/owner_silent,
+      /*alert_warning_brownout=*/health.valid && health.brownout,
       clock_.boot_id(),
       clock_.accuracy_valid() ? clock_.bounded_offset_us() : clock_.offset_us(),
       clock_.spread_us(),
@@ -773,10 +793,10 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       clock_.ignored_count(),
       static_cast<uint32_t>(clock_.window_count()),
       clock_.converged() && clock_.accuracy_valid(),
-      latest_state_.health.valid,
-      latest_state_.health.battery_v,
-      latest_state_.health.brownout,
-      latest_state_.health.can_utilization_frac,
+      health.valid,
+      health.battery_v,
+      health.brownout,
+      health.can_utilization_frac,
       motor_fault_mask,
       forward_limit_mask,
       reverse_limit_mask,

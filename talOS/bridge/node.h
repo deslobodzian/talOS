@@ -48,6 +48,10 @@ struct SubsystemTracker {
   // (OwnerTimeoutUs), last accepted request on the bridge clock and its
   // observation on the gateway clock, reset on every controller transition.
   MergeOwner merge;
+  // Bridge-clock receipt of the last request accepted into the merge, kept
+  // across controller transitions (which reset `merge`); none yet before
+  // the first. /hw/status's alert_warning_owner_timed_out reads it.
+  std::optional<uint64_t> last_accepted_us;
   std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> subscriber;
 
   // Requests actually decoded off this subsystem's topic, and where that topic
@@ -428,6 +432,8 @@ class HardwareNode {
   // Bridge-clock receipt time of the last /hw/state frame; meaningful once
   // states_received_ is non-zero.
   uint64_t last_state_receipt_us_{0};
+  // Whether a State has been accepted (past the ordering gate) yet.
+  bool state_accepted_{false};
   ClockOffsetEstimator clock_;
   uint64_t last_probe_send_us_{};
   bool probe_waiting_{false};
