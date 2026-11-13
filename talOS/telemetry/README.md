@@ -156,10 +156,12 @@ to 8 are the node's own.
    schema reflection (`reflection::Schema`). An enum whose values would need
    more labels than the dictionary label limit, or that has no non-negative
    value, carries no labels and reads as a plain number.
-5. **Alert levels**: a `bool` field (not an array element) whose name
-   `naming::ParseAlertField` accepts (`alert_<error|warning|info>_<name>`,
-   [NAMING.md](../NAMING.md#topics)) carries that level in `alert`; every
-   other channel carries `None`. Its value is read like any bool, so a stale
+5. **Alert levels**: a `bool` field (not an array element) of a `status`
+   topic whose name `naming::ParseAlertField` accepts
+   (`alert_<error|warning|info>_<name>`, [NAMING.md](../NAMING.md#topics))
+   carries that level in `alert`; every other channel, an alert-shaped field
+   on another role included, carries `None`, so the dashboard's alerts and
+   `session_report`'s agree. Its value is read like any bool, so a stale
    alert topic is absent, never a frozen "active" or "clear".
 6. **Include/exclude globs**: In `telemetry.toml`, `include` selects whole
    topics only (default `["*"]`). `exclude` takes precedence and matches both

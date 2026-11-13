@@ -148,14 +148,23 @@ class Flattener {
     channel.offset = offset;
     channel.base = base;
     if (base == reflection::BaseType::Bool) {
-      // A bool has no unit.
-      if (whole_field) channel.alert = AlertLevelOf(field_name);
+      // A bool has no unit. Only a `status` topic carries alerts
+      // (NAMING.md), as session_report reads them; elsewhere an
+      // alert-shaped bool is a plain bool.
+      if (whole_field && IsStatusTopic()) {
+        channel.alert = AlertLevelOf(field_name);
+      }
     } else if (type_index >= 0) {
       channel.labels = EnumLabels(schema_, type_index);
     } else {
       channel.unit = std::string{schema::unit_for_field(field_name)};
     }
     channels_.push_back(std::move(channel));
+  }
+
+  bool IsStatusTopic() const {
+    const auto segments = naming::detail::Segments(topic_);
+    return segments.size() >= 2 && segments[1] == "status";
   }
 
   const reflection::Schema& schema_;
