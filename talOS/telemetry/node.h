@@ -32,6 +32,7 @@
 #include "talOS/schema/field_path.h"
 #include "talOS/schema/identity.h"
 #include "talOS/telemetry/channels.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/telemetry_generated.h"
 #include "talOS/telemetry/wire.h"
@@ -100,6 +101,15 @@ class Telemetry {
     }
 
     CheckChannelCap();
+    // The driver dashboard's layout ([studio] dashboard): the first
+    // --describe probe has no dictionary, so it checks only what the file
+    // alone decides.
+    const std::string& dashboard =
+        NodeAccess::robot_config(node).studio.dashboard;
+    if (!dashboard.empty()) {
+      const DashboardLayout layout = ParseDashboardLayout(dashboard);
+      if (graph != nullptr) CheckDashboard(layout);
+    }
     dictionary_id_ = DictionaryId(dictionary_);
     stream_id_ = RandomStreamId();
     // update() fills these without reallocating.
@@ -317,6 +327,67 @@ class Telemetry {
       it->labels = std::move(spec.labels);
     }
     labels_.clear();
+  }
+
+  // The layout against this dictionary (README "Dashboard layout"). Throws
+  // DashboardLayoutError naming the file and the key that named a channel
+  // the dictionary lacks (excluded, or no state or status topic holds it):
+  // `widgets[<i>].<key>`, `widgets[<i>].channels[<k>]` for a graph series,
+  // `widgets[<i>].items[<j>].channel` for a check, `widgets[<i>].pose` for a
+  // field's pose fields and `widgets[<i>].kind` for a match or power
+  // widget's fixed channels. Then holds the feed (the named channels, plus
+  // every alert channel for an `alerts` widget) to the layout's budget.
+  void CheckDashboard(const DashboardLayout& layout) const {
+    std::set<std::string_view> present;
+    for (const ChannelDef& def : dictionary_) present.insert(def.name);
+    const std::string file = layout.file.string();
+    const auto require = [&](std::size_t index, const std::string& key,
+                             const std::string& name, const std::string& what) {
+      if (present.contains(name)) return;
+      throw DashboardLayoutError(
+          file + ": widgets[" + std::to_string(index) + "]." + key + ": '" +
+          name + "'" + what +
+          " is not a channel of this dictionary (excluded, or no state or "
+          "status topic holds it; see talOS/telemetry/README.md)");
+    };
+    for (std::size_t i = 0; i < layout.widgets.size(); ++i) {
+      const DashboardWidget& widget = layout.widgets[i];
+      const bool fixed = widget.kind == DashboardWidgetKind::kMatch ||
+                         widget.kind == DashboardWidgetKind::kPower;
+      for (const DashboardChannel& channel : widget.channels) {
+        if (fixed) {
+          require(i, "kind", channel.name,
+                  ", which a " +
+                      std::string(DashboardWidgetKindName(widget.kind)) +
+                      " widget reads,");
+        } else if (widget.kind == DashboardWidgetKind::kField &&
+                   (channel.role == "x" || channel.role == "y" ||
+                    channel.role == "yaw")) {
+          require(i, "pose", channel.name, "");
+        } else {
+          require(i, channel.role, channel.name, "");
+        }
+      }
+      for (std::size_t k = 0; k < widget.series.size(); ++k) {
+        require(i, "channels[" + std::to_string(k) + "]", widget.series[k], "");
+      }
+      for (std::size_t j = 0; j < widget.items.size(); ++j) {
+        require(i, "items[" + std::to_string(j) + "].channel",
+                widget.items[j].channel, "");
+      }
+    }
+    // The drive feed's channel mask: what the layout names, plus every
+    // alert channel when it lists alerts.
+    const std::vector<std::string> named = RequiredChannels(layout);
+    std::set<std::string_view> feed(named.begin(), named.end());
+    if (CarriesAlertChannels(layout)) {
+      for (const ChannelDef& def : dictionary_) {
+        if (def.alert != Talos::Telemetry::AlertLevel_None) {
+          feed.insert(def.name);
+        }
+      }
+    }
+    CheckDashboardBudget(layout, feed.size());
   }
 
   static std::string ResolveTopic(Node& node) {

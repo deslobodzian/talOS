@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <initializer_list>
 #include <limits>
 #include <map>
@@ -1230,9 +1232,58 @@ TEST(TelemetryMatrix, PublishesFromALiveInput) {
   EXPECT_EQ(raw.at("shooter/status/routine_index"), 2u);
 }
 
+// The channels a dashboard layout names, each from one of its key shapes.
+struct LayoutChannels {
+  std::string routine = "shooter/status/routine_index";
+  std::string phase = "shooter/status/supply_v";  // optional key
+  std::string pose = "pose_estimator/state/pose";
+  std::string series = "pose_estimator/state/localized";  // channels[1]
+  std::string item = "shooter/status/alert_error_link_lost";
+};
+
+std::string DashboardLayoutText(const LayoutChannels& c) {
+  return R"([[widgets]]
+kind = "match"
+at = [0, 0, 4, 2]
+[[widgets]]
+kind = "routine"
+at = [4, 0, 3, 2]
+channel = ")" +
+         c.routine + R"("
+phase = ")" +
+         c.phase +
+         R"("
+[[widgets]]
+kind = "field"
+at = [7, 0, 5, 4]
+pose = ")" +
+         c.pose +
+         R"("
+valid = "pose_estimator/state/valid"
+[[widgets]]
+kind = "graph"
+at = [0, 2, 4, 2]
+channels = ["shooter/status/supply_v", ")" +
+         c.series + R"("]
+[[widgets]]
+kind = "checks"
+at = [0, 4, 4, 2]
+items = [{ label = "Link", channel = ")" +
+         c.item + R"(", equals = false }]
+[[widgets]]
+kind = "alerts"
+at = [4, 2, 3, 2]
+)";
+}
+
 // REQ-OPS-38: a [[subsystem.labels]] entry that cannot label an integer
 // channel with a string array refuses construction, naming its key, rather
 // than leaving a routine shown as a bare number.
+// REQ-OPS-39, REQ-OPS-35: so does a dashboard layout ([studio] dashboard)
+// the drive feed could not fill, naming the file and the key: a channel
+// absent from this dictionary, whichever key named it (optional keys
+// too), and a feed over its budget once the dictionary's alert channels,
+// which an `alerts` widget adds, are counted.
 TEST(TelemetryMatrix, BadParameterFailsConstruction) {
   std::string many = "[";
   for (std::size_t i = 0; i <= telemetry_wire::kMaxEnumLabels; ++i) {
@@ -1303,6 +1354,96 @@ node = "//talOS/telemetry:node"
       EXPECT_NE(std::string_view{error.what()}.find(key),
                 std::string_view::npos)
           << error.what();
+    }
+  }
+
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::string file = std::string{tmp} + "/dashboard.toml";
+  // Writes `layout` to `file` and constructs every node of a config that
+  // names it, with `telemetry` added to [subsystems.telemetry].
+  const auto construct = [&file](const std::string& layout,
+                                 const std::string& telemetry) {
+    std::ofstream(file) << layout;
+    Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+dashboard = ")" + file + R"("
+[subsystems.shooter]
+node = "//shooter:node"
+[subsystems.shooter.motors.m]
+can_id = 1
+[subsystems.hw]
+node = "//hw:node"
+[subsystems.pose_estimator]
+node = "//pose_estimator:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)" + telemetry);
+    sim.add<AlertsNode>("shooter");
+    sim.add<HardwareNode>("hw");
+    sim.add<EstimatorNode>("pose_estimator");
+    sim.add<Telemetry>("telemetry");
+  };
+  // Every key shape naming a channel the dictionary holds constructs.
+  EXPECT_NO_THROW(construct(DashboardLayoutText({}), ""));
+
+  struct LayoutCase {
+    const char* what;
+    std::string layout;
+    std::string telemetry;  // keys of [subsystems.telemetry]
+    const char* key;        // the key the error names
+  };
+  const auto with = [](auto change) {
+    LayoutChannels channels;
+    change(channels);
+    return DashboardLayoutText(channels);
+  };
+  // One number channel at 10 Hz fits 12,532 B/s exactly (dashboard_layout
+  // test); the three alert channels an `alerts` widget adds do not.
+  const std::string over_budget = R"([dashboard]
+update_hz = 10
+budget_bytes_per_s = 12532
+[[widgets]]
+kind = "number"
+at = [0, 0, 1, 1]
+channel = "shooter/status/supply_v"
+[[widgets]]
+kind = "alerts"
+at = [1, 0, 1, 1]
+)";
+  for (const auto& [what, layout, telemetry, key] : std::vector<LayoutCase>{
+           {"absent channel",
+            with([](auto& c) { c.routine = "shooter/status/nope"; }), "",
+            "widgets[1].channel"},
+           {"absent optional channel",
+            with([](auto& c) { c.phase = "autonomous/state/phase"; }), "",
+            "widgets[1].phase"},
+           {"absent pose fields",
+            with([](auto& c) { c.pose = "pose_estimator/state/nope"; }), "",
+            "widgets[2].pose"},
+           {"absent graph series",
+            with([](auto& c) { c.series = "shooter/status/nope"; }), "",
+            "widgets[3].channels[1]"},
+           {"absent check channel",
+            with([](auto& c) { c.item = "shooter/status/nope"; }), "",
+            "widgets[4].items[0].channel"},
+           {"excluded fixed channel", DashboardLayoutText({}),
+            "exclude = [\"hw/state/driver_station/alliance\"]\n",
+            "widgets[0].kind"},
+           {"over budget with alert channels", over_budget, "",
+            "[dashboard].budget_bytes_per_s"},
+       }) {
+    SCOPED_TRACE(what);
+    try {
+      construct(layout, telemetry);
+      ADD_FAILURE() << "constructed";
+    } catch (const DashboardLayoutError& error) {
+      const std::string_view message = error.what();
+      EXPECT_NE(message.find(file), std::string_view::npos) << message;
+      EXPECT_NE(message.find(key), std::string_view::npos) << message;
     }
   }
 }
