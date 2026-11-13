@@ -2040,7 +2040,7 @@ TEST(Supervision, SessionDirectoryLockIsRefreshedAndRetakenWhileHeld) {
       for (bool* outcome : {&retaken, &retaken_again}) {
         ::unlink(lock.c_str());
         clock.Advance(kLockFileRefresh);
-        *outcome = wait([&] { return SessionDirectoryLock::Held(dir); });
+        *outcome = wait([&] { return SessionDirectoryLock::Held(dir, false); });
       }
       wait([&] { return reports() > 0; });
       pass();

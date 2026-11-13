@@ -216,6 +216,11 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
                    (time - file_now) + wall_now.time_since_epoch())
             .count();
       };
+  // Whether the log root takes no advisory locks, decided once for this
+  // retention (LogRootTakesNoLocks; set once the root is known to exist):
+  // only then does a flock failing as FlockUnsupported let it remove a
+  // directory without its lock.
+  bool no_locks = false;
   // Removes the session directory `dir` unless a launch holds its lock, in
   // any shared-memory namespace: takes the lock itself
   // (SessionDirectoryLock::TakeIdle), and while holding it moves the
@@ -223,17 +228,27 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   // creating that path meanwhile (SessionDirectoryLock::Create) finds the
   // lock held or the directory gone and creates it anew, so no removal
   // reaches a directory a launch has locked. True when it is gone; a launch
-  // holding it is recorded, any other failure reported.
+  // holding it, or a lock failure that cannot tell, is said, any other
+  // failure reported.
   const auto remove_idle = [&](const fs::path& dir) {
     bool running = false;
     std::error_code removal;
     const std::optional<SessionDirectoryLock> lock =
-        SessionDirectoryLock::TakeIdle(dir, running, removal,
+        SessionDirectoryLock::TakeIdle(dir, no_locks, running, removal,
                                        options_.lock_session_directory);
     if (running) {
       say("retention passes over running session " + dir.string() +
           " (a launch holds its " + std::string{kSessionDirectoryLockFile} +
           ")");
+      return false;
+    }
+    if (!lock && removal.category() == std::generic_category() &&
+        FlockUnsupported(removal.value())) {
+      say("WARNING: retention passes over " + dir.string() +
+          ": cannot lock its " + std::string{kSessionDirectoryLockFile} + " (" +
+          removal.message() +
+          ") although this log root takes advisory locks, so a launch may "
+          "hold it");
       return false;
     }
     // A directory with no lock file and no room to create one: no launch
@@ -275,6 +290,8 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
       fs::file_type::not_found)
     return session_budget;
   error.clear();
+  no_locks = LogRootTakesNoLocks(current.parent_path(),
+                                 options_.lock_session_directory);
   for (fs::directory_iterator entry{current.parent_path(), error};
        !error && entry != fs::directory_iterator{}; entry.increment(error)) {
     if (entry->path() == current) continue;  // Counted below.
@@ -291,7 +308,7 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     }
     // A launch in any shared-memory namespace is writing it: neither counted
     // nor read.
-    if (SessionDirectoryLock::Held(entry->path(),
+    if (SessionDirectoryLock::Held(entry->path(), no_locks,
                                    options_.lock_session_directory)) {
       say("retention passes over running session " + entry->path().string() +
           " (a launch holds its " + std::string{kSessionDirectoryLockFile} +
@@ -330,7 +347,8 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   // second sweep, has removed the session.lock inside, both may remove the
   // rest at once: an entry gone meanwhile is not a failure.
   for (const auto& leftover : leftovers) {
-    if (SessionDirectoryLock::Held(leftover, options_.lock_session_directory))
+    if (SessionDirectoryLock::Held(leftover, no_locks,
+                                   options_.lock_session_directory))
       continue;
     std::error_code removal;
     fs::remove_all(leftover, removal);
