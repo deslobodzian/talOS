@@ -5,14 +5,17 @@ package(default_visibility = ["//visibility:public"])
 
 # The naming protocol, as code: the topic grammar, the closed role vocabulary
 # and the graph-level checks. Uses the transport's reader-slot limit so launch
-# validation stays consistent with runtime registration.
+# validation stays consistent with runtime registration, and reads each
+# writer's message schema for the alert-field grammar (names.cc).
 cc_library(
     name = "names",
+    srcs = ["names.cc"],
     hdrs = ["names.h"],
     deps = [
         "//talOS/events:events_core",
         "//talOS/hardware",
         "//talOS/rtms",
+        "@flatbuffers//:runtime_cc",
     ],
 )
 
@@ -67,6 +70,8 @@ cc_test(
     srcs = ["names_test.cc"],
     deps = [
         ":names",
+        "//talOS/schema:identity",
+        "//talOS/schema:test_messages",
         "@googletest//:gtest_main",
     ],
 )

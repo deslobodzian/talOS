@@ -7,14 +7,20 @@ struct Pose { x:double; y:double; z:double; roll:double; pitch:double; yaw:doubl
 // exactly; nothing is converted to a double on the wire.
 enum ChannelKind : ubyte { Double = 0, Int = 1, UInt = 2, Bool = 3 }
 
+// A Bool channel that is an alert, by level (talOS/NAMING.md, the `status`
+// role; naming::ParseAlertField); None for every other channel.
+enum AlertLevel : ubyte { None = 0, Info = 1, Warning = 2, Error = 3 }
+
 // One dictionary entry. unit is "" for unitless channels. labels, when
 // non-empty, names the values of an integer enum channel (labels[value]); an
-// empty labels list means the channel is a plain number.
+// empty labels list means the channel is a plain number. alert, when not
+// None, makes a Bool channel an alert of that level, active while 1.
 table ChannelInfo {
   name:string (required);
   unit:string;
   labels:[string];
   kind:ChannelKind;
+  alert:AlertLevel;
 }
 
 // One page of a telemetry tick. A tick is one or more value pages sharing

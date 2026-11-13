@@ -13,10 +13,13 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "schema_test/shapes_generated.h"
+#include "talOS/schema/identity.h"
 
 namespace talos::introspect::naming {
 namespace {
@@ -121,6 +124,44 @@ TEST(TargetLane, OneGrammarRecognisesAndBuildsLanes) {
         "/drivetrain/state/target/x", "/Drivetrain/target/teleop",
         "/drivetrain/target/teleop_"}) {
     EXPECT_FALSE(IsTargetLane(topic)) << topic;
+  }
+}
+
+// REQ-CONTRACT-33: the one alert grammar. Telemetry tags a channel with the
+// level it returns and the lint refuses an `alert_` field it does not accept,
+// so a viewer never sees an alert of a level nobody defined.
+TEST(AlertField, OneGrammarAcceptsThreeLevelsAndRefusesTheRest) {
+  for (const auto& [field, level, name] : std::initializer_list<
+           std::tuple<std::string_view, AlertLevel, std::string_view>>{
+           {"alert_error_link_lost", AlertLevel::kError, "link_lost"},
+           {"alert_warning_brownout", AlertLevel::kWarning, "brownout"},
+           {"alert_info_homed", AlertLevel::kInfo, "homed"},
+           {"alert_error_can2", AlertLevel::kError, "can2"},
+           // The level is the first word: the rest is the name.
+           {"alert_info_error_x", AlertLevel::kInfo, "error_x"},
+       }) {
+    const auto parsed = ParseAlertField(field);
+    ASSERT_TRUE(parsed.has_value()) << field;
+    EXPECT_EQ(parsed->level, level) << field;
+    EXPECT_EQ(parsed->name, name) << field;
+  }
+  for (const auto* field : {
+           "link_lost",               // no prefix
+           "alerts_error_x",          // not the prefix
+           "Alert_error_x",           // not the prefix
+           "alert_error",             // no name
+           "alert_error_",            // empty name
+           "alert_fatal_x",           // unknown level
+           "alert_errors_x",          // unknown level
+           "alert_Error_x",           // unknown level
+           "alert__error_x",          // unknown level
+           "alert_warning_Hot",       // name not lowercase
+           "alert_warning_2hot",      // name not starting with a letter
+           "alert_warning_hot_",      // trailing underscore
+           "alert_warning_too__hot",  // doubled underscore
+           "alert_info_ok-ish",       // not a letter, digit or underscore
+       }) {
+    EXPECT_FALSE(ParseAlertField(field).has_value()) << field;
   }
 }
 
@@ -524,6 +565,84 @@ TEST(LintGraph, DevelopmentGapsAreWarningsNotErrors) {
     EXPECT_FALSE(HasError(diagnostics)) << subject << Describe(diagnostics);
     EXPECT_NE(Find(diagnostics, Severity::WARNING, subject), nullptr)
         << subject << Describe(diagnostics);
+  }
+}
+
+// REQ-CONTRACT-33: from the writer's schema, an `alert_` field that is not a
+// bool or not of a known level is an error naming the field (nested structs
+// included), and a well-formed alert outside a `status` topic is a warning.
+// A reader's end, which carries the same schema, adds nothing.
+TEST(LintGraph, AlertFieldsAreBoolsOfAKnownLevelInAStatusTopic) {
+  const auto with = [](SourceShape shape, const schema::Identity& identity) {
+    shape.schema = identity.name;
+    shape.schema_hash = identity.hash;
+    shape.bfbs = identity.bfbs;
+    return shape;
+  };
+  const schema::Identity bad = schema::Of<schema_test::BadAlerts>();
+  const schema::Identity good = schema::Of<schema_test::Alerts>();
+  const auto alert_findings = [](const std::vector<Diagnostic>& diagnostics,
+                                 std::string_view topic) {
+    std::vector<Diagnostic> out;
+    for (const auto& diagnostic : diagnostics) {
+      if (diagnostic.subject == topic &&
+          diagnostic.message.find("alert") != std::string::npos) {
+        out.push_back(diagnostic);
+      }
+    }
+    return out;
+  };
+
+  {
+    SCOPED_TRACE("malformed alerts in a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/status"), bad)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/status"), bad)}},
+    };
+    const auto findings = alert_findings(LintGraph(nodes), "/shooter/status");
+    ASSERT_EQ(findings.size(), 2u) << Describe(findings);
+    for (const auto* field :
+         {"alert_error_fault_count", "alert_fatal_overheat"}) {
+      const auto it = std::find_if(
+          findings.begin(), findings.end(), [field](const Diagnostic& d) {
+            return d.message.find(field) != std::string::npos;
+          });
+      ASSERT_NE(it, findings.end()) << field << Describe(findings);
+      EXPECT_EQ(it->severity, Severity::ERROR) << field;
+    }
+  }
+  {
+    SCOPED_TRACE("well-formed alerts outside a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/state"), good)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/state"), good)}},
+    };
+    const auto findings = alert_findings(LintGraph(nodes), "/shooter/state");
+    ASSERT_EQ(findings.size(), 3u) << Describe(findings);
+    for (const auto& finding : findings) {
+      EXPECT_EQ(finding.severity, Severity::WARNING) << finding.ToString();
+    }
+  }
+  {
+    SCOPED_TRACE("well-formed alerts in a status topic");
+    const std::vector<NodeShape> nodes = {
+        {"shooter",
+         "//robot/shooter:node",
+         {with(Sender("/shooter/status"), good)}},
+        {"odometry",
+         "//robot/odometry:node",
+         {with(Watcher("/shooter/status"), good)}},
+    };
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
   }
 }
 

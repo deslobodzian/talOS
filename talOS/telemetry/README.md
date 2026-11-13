@@ -39,7 +39,7 @@ fits the Studio bridge's egress burst and can be sent to a client whole.
 | `stream_id` | Random per producer process (fixed for its lifetime). A change means the producer restarted. |
 | `sequence_id` | The producer's tick, incremented once per tick; every page of a tick carries it. |
 | `timestamp_ns` | The tick's producer monotonic time, nanoseconds. |
-| `dictionary_id` | FNV-1a 32 over the dictionary (names, units, kinds, labels, in order). Identifies which dictionary channel indices refer to. |
+| `dictionary_id` | FNV-1a 32 over the dictionary (names, units, kinds, alert levels, labels, in order). Identifies which dictionary channel indices refer to. |
 | `page`, `page_count` | This page's place among the tick's value pages, or the dictionary's pages. |
 | `channel_count` | Dictionary size; every channel index is below it. |
 | `chassis` | Robot `Pose` (metres, radians), on every value page; zeros until `pose/valid` reads 1. |
@@ -48,14 +48,17 @@ fits the Studio bridge's egress burst and can be sent to a client whole.
 | `absent` | Value pages (change-only updates): channels that lost their sample. |
 | `first_channel`, `dictionary` | Dictionary pages: `dictionary[i]` describes channel `first_channel + i`. |
 
-`ChannelInfo` is `{name, unit, labels, kind}`. `unit` is `""` for unitless
+`ChannelInfo` is `{name, unit, labels, kind, alert}`. `unit` is `""` for unitless
 channels. `kind` says how a sample reads: `Double` (IEEE-754 bits, NaN and
 the infinities included), `Int`
 (two's complement), `UInt`, or `Bool` (0 or 1). Integer fields travel as their
 exact value, never through a double, so 64-bit ids and counters arrive exact.
 A non-empty `labels` makes an integer channel an *enum channel*: `labels[value]`
 names its value (for example `intake/inhibit` carries the `intake::Inhibit`
-names). Out-of-range values have no label. Every string is written once,
+names). Out-of-range values have no label. A non-`None` `alert` (`Info`,
+`Warning`, `Error`) makes a `Bool` channel an *alert* of that level, active
+while 1 ([NAMING.md](../NAMING.md#topics) states which fields are alerts);
+`None` is every other channel. Every string is written once,
 never shared between offsets: Studio refuses a dictionary page whose strings,
 counted per reference, outgrow the page.
 

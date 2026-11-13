@@ -216,6 +216,68 @@ inline std::optional<std::string> CheckTopicName(std::string_view topic) {
   return std::nullopt;
 }
 
+// Alerts: a bool field of a node's own `status` message named
+// `alert_<level>_<name>` is an alert, active while true (NAMING.md, the
+// `status` role). ParseAlertField is the only reader of that grammar: the
+// graph lint checks fields with it, the telemetry dictionary tags channels
+// with its level, and every viewer reads the level from there.
+inline constexpr std::string_view kAlertPrefix = "alert_";
+
+// Ordered by severity; the values are telemetry.fbs's AlertLevel.
+enum class AlertLevel : std::uint8_t { kNone, kInfo, kWarning, kError };
+
+struct AlertField {
+  AlertLevel level{AlertLevel::kNone};
+  std::string_view name;  // the `<name>` part, a view into the field name
+};
+
+// `field` (a field name, not a path) as an alert: `alert_error_<name>`,
+// `alert_warning_<name>` or `alert_info_<name>`, where `<name>` is a
+// lowercase letter, then lowercase letters, digits and single underscores,
+// not ending in one. Anything else, including an `alert_` field of another
+// level or with no name, is nullopt.
+inline std::optional<AlertField> ParseAlertField(std::string_view field) {
+  if (!field.starts_with(kAlertPrefix)) return std::nullopt;
+  field.remove_prefix(kAlertPrefix.size());
+  struct Spelling {
+    std::string_view word;
+    AlertLevel level;
+  };
+  static constexpr Spelling kLevels[] = {{"error_", AlertLevel::kError},
+                                         {"warning_", AlertLevel::kWarning},
+                                         {"info_", AlertLevel::kInfo}};
+  for (const auto& [word, level] : kLevels) {
+    if (!field.starts_with(word)) continue;
+    const std::string_view name = field.substr(word.size());
+    if (name.empty() || name.front() < 'a' || name.front() > 'z' ||
+        name.back() == '_' || name.find("__") != std::string_view::npos) {
+      return std::nullopt;
+    }
+    for (const char c : name) {
+      if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+        return std::nullopt;
+    }
+    return AlertField{level, name};
+  }
+  return std::nullopt;
+}
+
+namespace detail {
+// One field of a message whose name starts with kAlertPrefix.
+struct AlertPrefixedField {
+  std::string path;     // field names from the root struct, joined by '.'
+  std::string name;     // the field's own name
+  bool is_bool{false};  // a bool scalar (not an array, not a struct)
+};
+
+// Every field whose name starts with kAlertPrefix in struct `root` of
+// `bfbs` (a reflection.Schema), nested structs and arrays of structs
+// included, each struct type visited once. Empty when `bfbs` does not
+// verify or does not hold `root`. In names.cc: it reads reflection.
+std::vector<AlertPrefixedField> AlertPrefixedFields(std::string_view bfbs,
+                                                    std::string_view root);
+}  // namespace detail
+
 // The node name must match the target's package leaf
 // (`//2026-robot/main_processor/odometry:node`), its repository when at the
 // repository root (`@wrist//:node`), or its rule name
@@ -453,12 +515,13 @@ inline std::optional<std::string> HardwareWriterProblem(
 // writer, two schemas or message sizes or ring layouts on one topic, a
 // malformed name, a lane its subsystem never reads, an `hw` topic written by
 // anything but the roster's bridge or, for `/hw/request/<node>`, <node>'s
-// devices-layer flush). Warnings are normal during development or in a
+// devices-layer flush, an `alert_` field that is not a bool or not
+// ParseAlertField's grammar). Warnings are normal during development or in a
 // partial launch (an unread topic, an owner not in this session, a policy
-// lane nobody writes yet). Required coverage additionally rejects a
-// target-consuming subsystem with no producer for a nonempty mode policy.
-// Timers are skipped: their names are labels, not topics. A subsystem absent
-// from target_sources is not lane-checked.
+// lane nobody writes yet, an alert outside a `status` topic). Required coverage
+// additionally rejects a target-consuming subsystem with no producer for a
+// nonempty mode policy. Timers are skipped: their names are labels, not topics.
+// A subsystem absent from target_sources is not lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
     const TargetSources& target_sources = {},
@@ -535,6 +598,31 @@ inline std::vector<Diagnostic> LintGraph(
         if (owner == "hw") {
           if (auto problem = detail::HardwareWriterProblem(node, source))
             add(Severity::ERROR, source.name, *problem);
+        }
+        // Alert fields, from the writer's schema (a shape without one, a
+        // registry snapshot, has no fields to check).
+        if (!source.bfbs.empty()) {
+          for (const auto& field :
+               detail::AlertPrefixedFields(source.bfbs, source.schema)) {
+            const auto alert = ParseAlertField(field.name);
+            if (!alert) {
+              add(Severity::ERROR, source.name,
+                  "field '" + field.path + "' (written by " + node.name +
+                      ") starts with 'alert_' but is not "
+                      "alert_<error|warning|info>_<name>");
+            } else if (!field.is_bool) {
+              add(Severity::ERROR, source.name,
+                  "alert field '" + field.path + "' (written by " + node.name +
+                      ") is not a bool; an alert is active "
+                      "while true");
+            } else if (role != "status") {
+              add(Severity::WARNING, source.name,
+                  "alert field '" + field.path + "' (written by " + node.name +
+                      ") is in a '" + role +
+                      "' topic; an alert belongs to its node's 'status' "
+                      "topic, the health it reports");
+            }
+          }
         }
         if (!detail::OneOf(kReservedOwners, owner)) {
           if (detail::OneOf(kOwnerPublishedRoles, role) && owner != node.name)
