@@ -109,6 +109,20 @@ class SimShConfigTest(unittest.TestCase):
                 self.assertIn(f"cannot resolve {CONFIG}", output)
 
     # REQ-DEV-23
+    def test_a_resolver_failure_is_one_line_with_its_reason(self):
+        # The resolver stub fails as the real one does on a config it cannot
+        # load: its reason on stderr, nothing on stdout, exit 1. sim.sh
+        # reports that reason in its own one line and exits 1, without
+        # handing the empty output to its JSON reader.
+        status, output, _ = self.run_sim(CONFIG, self.root)
+        self.assertEqual(status, 1, output)
+        lines = [line for line in output.splitlines()
+                 if line.strip() and not line.startswith("\x1b[1;36m==>")]
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn(f"cannot resolve {CONFIG}", lines[0])
+        self.assertIn("resolver stub: stop here", lines[0])
+
+    # REQ-DEV-23
     def test_refuses_an_ambiguous_missing_or_outside_config_unchecked(self):
         # A relative path naming a different file under the root and under
         # the caller's directory would silently run the root's.
