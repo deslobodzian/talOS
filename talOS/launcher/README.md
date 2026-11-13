@@ -271,7 +271,9 @@ would share the bridge's name, and the launch is refused naming its
 `studio_bridge` and `studio_webroot` carries both
 ([DEPLOYMENT.md](../../docs/DEPLOYMENT.md#build-a-bundle)): its manifest's
 `[studio]` table registers the bundled bridge under its label and the name
-`studio_bridge`, and the bundle's webroot replaces a relative
+`studio_bridge` (the name only for the member the flag adds: a subsystem
+named `studio_bridge` whose node does not resolve is missing, never the
+bundled bridge), and the bundle's webroot replaces a relative
 `[studio] webroot` (an absolute one is kept). A bundle built without them has
 no bridge: the flag adds none to the roster and the launcher says the bundle
 carries no Studio. The bridge answers `--describe`

@@ -1908,12 +1908,14 @@ TEST(LauncherBundleTest, BundledStudioResolvesThroughTheStudioKeys) {
 
   config::RobotConfig robot;  // webroot: the checkout's relative default
   robot.studio.bridge = "//viewer:bridge";
-  EXPECT_EQ(
-      MakeNodeSpec(kStudioBridgeName, robot.studio.bridge, options).binary_path,
-      bridge);
+  EXPECT_EQ(MakeNodeSpec(kStudioBridgeName, robot.studio.bridge, options,
+                         /*studio_bridge=*/true)
+                .binary_path,
+            bridge);
   // The framework's default label, unset in the config: found by name.
   EXPECT_EQ(
-      MakeNodeSpec(kStudioBridgeName, "//studio/bridge:studio_bridge", options)
+      MakeNodeSpec(kStudioBridgeName, "//studio/bridge:studio_bridge", options,
+                   /*studio_bridge=*/true)
           .binary_path,
       bridge);
   EXPECT_EQ(std::filesystem::path{EffectiveStudioWebroot(robot, options)},
@@ -2993,6 +2995,35 @@ TEST(LauncherSessions, ASubsystemNamedStudioBridgeIsAnOrdinaryNode) {
   EXPECT_NE(twice.find("[subsystems.studio_bridge]"), std::string::npos)
       << twice;
   std::filesystem::remove_all(root);
+}
+
+// A bundle registers its Studio bridge under the name `studio_bridge` too,
+// so the launcher's own bridge is found when [studio] names no bundled
+// label. A robot's subsystem of that name whose node is not built is
+// missing, never that bridge run in its place; the launcher's bridge still
+// finds it by name.
+// REQ-OPS-30
+TEST(LauncherSessions, ASubsystemNamedStudioBridgeNeverRunsTheBundledBridge) {
+  LauncherOptions options;
+  options.binary_overrides[std::string{kStudioBridgeName}] = WriteStubNode(
+      "bundled_studio_bridge",
+      DescribingStub("studio_bridge", "//studio/bridge:studio_bridge", {}));
+  options.start_studio_bridge = true;
+  const auto specs = DiscoverNodes(
+      config::ParseRobotConfigString(
+          "[robot]\nname = \"bot\"\nperiod_us = 5000\n"
+          "[subsystems.studio_bridge]\nnode = \"//example/studio:unbuilt\"\n"),
+      options);
+  const auto spec = [&](bool bridge) {
+    const auto found =
+        std::find_if(specs.begin(), specs.end(), [&](const NodeSpec& s) {
+          return s.name == kStudioBridgeName && s.studio_bridge == bridge;
+        });
+    return found == specs.end() ? std::string{"(none)"} : found->binary_path;
+  };
+  EXPECT_EQ(spec(/*bridge=*/false), "bazel-bin/example/studio/unbuilt");
+  EXPECT_EQ(spec(/*bridge=*/true),
+            options.binary_overrides[std::string{kStudioBridgeName}]);
 }
 
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
