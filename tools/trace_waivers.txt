@@ -5,7 +5,6 @@
 #
 # A test exists but its file was being edited elsewhere when the check
 # landed; tag it and delete the line.
-REQ-SAFE-24 2026-11-11 TRACE-1 tag talOS/hardware/gateway_test.cc ResetWhileEnabledNeutralizesBeforeRestore
 REQ-CONTRACT-05 2026-11-11 TRACE-1 tag talOS/hardware/gateway_test.cc RequiresEnableCommissioningAndMatchingManifest
 #
 # A Bazel package the scope table does not list.

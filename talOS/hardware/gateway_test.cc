@@ -234,6 +234,7 @@ class FakeBackend : public Backend {
   }
   bool Apply(std::span<const MotorRequest> requests) override {
     last_requests.assign(requests.begin(), requests.end());
+    calls.push_back({Call::kApply, last_requests});
     ++applied;
     // Device-local send failures. last_requests keeps what the gateway asked
     // for, so tests observe the gateway's own neutralization.
@@ -262,6 +263,7 @@ class FakeBackend : public Backend {
   void Neutral() override {
     ++neutral;
     events.push_back("neutral");
+    calls.push_back({Call::kNeutral, {}});
   }
   std::optional<ConfigError> last_config_error() const override {
     return config_error;
@@ -274,6 +276,7 @@ class FakeBackend : public Backend {
   void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
     restoring_ids.assign(ids.begin(), ids.end());
     events.push_back("restore");
+    calls.push_back({Call::kBeginRestore, {}});
   }
   RestoreStatus PollRestore() override {
     if (pending_ticks-- > 0) return RestoreStatus::kPending;
@@ -283,8 +286,16 @@ class FakeBackend : public Backend {
                restoring_ids.end();
       });
     }
+    calls.push_back({Call::kRestoreFinished, {}});
     return restore_ok ? RestoreStatus::kDone : RestoreStatus::kFailed;
   }
+  // Every output and restore call in order, with the requests each Apply
+  // carried, so a test can see what reached a device around its restore.
+  struct Call {
+    enum Kind { kApply, kNeutral, kBeginRestore, kRestoreFinished } kind;
+    std::vector<MotorRequest> requests;
+  };
+  std::vector<Call> calls;
   int pending_ticks{};
   bool configure_ok{true}, healthy{true}, apply_ok{true}, restore_ok{true};
   bool outputs_ok{true};
@@ -1922,25 +1933,105 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
   expect_safe_state(gateway.snapshot());
 }
 
+// A motor (id 1, with a follower) resets while every motor drives at velocity.
+// The backend keeps a motor's last request between commands, so the gateway
+// must send its chain neutral in the tick that finds the reset, before
+// BeginRestoreAfterReset reconfigures it, with no whole-robot Neutral() and
+// no epoch change. Through a restore spanning three ticks, the command in
+// force and one observing each State of the restore are accepted, but the
+// chain receives only neutral; after the restore, a command observing the
+// last restoring State still drives it nothing, and the first observing a
+// State after the restore drives it again. The other motors drive throughout.
+// REQ-SAFE-24
 TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
+  auto config = SwerveConfig(true);
+  constexpr uint16_t kResetId = 1;
+  auto follower = *std::find_if(
+      config.motors.begin(), config.motors.end(),
+      [](const MotorConfig& motor) { return motor.id == kResetId; });
+  follower.id = 100;
+  follower.name = "back_left_drive_follower";
+  follower.can_id = 60;
+  follower.master_id = kResetId;
+  config.motors.push_back(follower);
+  ASSERT_NO_THROW(Validate(config));
+  const auto in_chain = [&config](std::size_t i) {
+    return config.motors[i].id == kResetId ||
+           config.motors[i].master_id == kResetId;
+  };
+  // Every chain motor neutral (`chain_neutral`) and every other motor still
+  // at the velocity the commands ask for.
+  const auto expect_apply = [&](const std::vector<MotorRequest>& requests,
+                                bool chain_neutral, const std::string& where) {
+    SCOPED_TRACE(where);
+    ASSERT_EQ(requests.size(), config.motors.size());
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      const auto expected =
+          in_chain(i) && chain_neutral ? Mode::kNeutral : Mode::kVelocity;
+      EXPECT_EQ(requests[i].mode, expected) << config.motors[i].name;
+    }
+  };
+
   FakeBackend backend;
-  Gateway g{SwerveConfig(true), backend, 1};
+  backend.pending_ticks = 2;
+  Gateway g{config, backend, 1};
   g.Tick(1000, true);
-  auto stale = Request(g);
-  ASSERT_TRUE(g.Accept(stale, 1, 1000));
+  const auto before_reset = Request(g);
+  ASSERT_TRUE(g.Accept(before_reset, 1, 1000));
+  expect_apply(backend.last_requests, false, "driving before the reset");
   const auto epoch = g.snapshot().epoch;
-  backend.events.clear();
-  backend.resets.push_back(1);
-  // Enabled: reset recovery still runs — the device is already at defaults —
-  // but from the safe state, not around live demand.
-  g.Tick(2000, true);
-  ASSERT_EQ(backend.events.size(), 1u);
-  EXPECT_EQ(backend.events[0], "restore");
+  backend.calls.clear();
+  backend.resets = {kResetId};
+
+  uint64_t now = 1000;
+  uint64_t sequence = 1;
+  uint64_t last_restoring_us = 0;
+  const auto restore_finished = [&backend] {
+    return std::any_of(backend.calls.begin(), backend.calls.end(),
+                       [](const FakeBackend::Call& call) {
+                         return call.kind ==
+                                FakeBackend::Call::kRestoreFinished;
+                       });
+  };
+  while (now < 20000) {
+    now += 1000;
+    g.Tick(now, true);
+    if (restore_finished()) break;
+    last_restoring_us = now;
+    EXPECT_TRUE(g.Accept(before_reset, ++sequence, now)) << now;
+    EXPECT_TRUE(g.Accept(Request(g), ++sequence, now)) << now;
+  }
+  ASSERT_TRUE(restore_finished());
+  ASSERT_EQ(last_restoring_us, 4000u);  // Restoring through three ticks.
+  EXPECT_EQ(backend.restoring_ids, std::vector<uint16_t>{kResetId});
+
+  // Up to the end of the restore: the chain neutral before the restore
+  // begins, and nothing but neutral for it until the restore finishes.
+  bool neutral_sent = false, restore_begun = false;
+  for (std::size_t k = 0; k < backend.calls.size(); ++k) {
+    const auto& call = backend.calls[k];
+    const std::string where = "call " + std::to_string(k);
+    if (call.kind == FakeBackend::Call::kRestoreFinished) break;
+    EXPECT_NE(call.kind, FakeBackend::Call::kNeutral) << where;
+    if (call.kind == FakeBackend::Call::kBeginRestore) {
+      EXPECT_TRUE(neutral_sent) << where << ": restore before neutral";
+      restore_begun = true;
+    }
+    if (call.kind == FakeBackend::Call::kApply) {
+      expect_apply(call.requests, true, where);
+      neutral_sent = true;
+    }
+  }
+  EXPECT_TRUE(restore_begun);
   EXPECT_EQ(g.snapshot().epoch, epoch);
-  EXPECT_TRUE(g.snapshot().flags & kCommandActive);
-  EXPECT_TRUE(g.Accept(stale, 2, 2000));
-  g.Tick(3000, true);
-  EXPECT_TRUE(g.Accept(Request(g), 3, 3000));
+
+  auto restoring = Request(g);
+  restoring.observed_time_us = last_restoring_us;
+  ASSERT_TRUE(g.Accept(restoring, ++sequence, now));
+  expect_apply(backend.last_requests, true, "observed during the restore");
+  ASSERT_TRUE(g.Accept(Request(g), ++sequence, now));
+  expect_apply(backend.last_requests, false, "observed after the restore");
+  EXPECT_EQ(g.snapshot().epoch, epoch);
 }
 
 // A dropped watchdog neutral must not leave the last demand in force: every
