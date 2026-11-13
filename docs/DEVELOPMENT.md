@@ -100,7 +100,8 @@ the kernel's or the C++ standard library's), then `bazel test //...` with no
 cached test result (build results come from the disk cache
 `~/.cache/talos-bazel-disk`), checks that they left the worktree unchanged,
 and runs the gradle and pnpm checks when the commits to push touch the
-RoboRIO program, `talOS/hardware`, `talOS/protocol` or `studio/`; every
+RoboRIO program or anything under `talOS/` (its `build.gradle` takes
+headers from all of it) or `studio/`; every
 config's `--describe-only` runs as its `talos_graph_test`. It prints one
 line per step and exits nonzero if any failed; the script's header lists
 its flags and steps.

@@ -79,25 +79,50 @@ class PrepushTest(unittest.TestCase):
                               capture_output=True, text=True,
                               check=True).stdout
 
-    def prepush(self, **env):
+    def prepush(self, *args, cwd=None, **env):
         proc = subprocess.run(
-            ["bash", self.script, "--skip-gradle", "--skip-studio"],
-            cwd=self.repo, env=dict(self.env, **env), capture_output=True,
-            text=True, timeout=60)
+            ["bash", self.script, *(args or ("--skip-gradle", "--skip-studio"))],
+            cwd=cwd or self.repo, env=dict(self.env, **env),
+            capture_output=True, text=True, timeout=60)
         calls = []
         if os.path.exists(self.log):
             with open(self.log, encoding="utf-8") as f:
                 calls = [line.rstrip("\n").split("|", 2) for line in f]
         return proc.returncode, proc.stdout + proc.stderr, calls
 
+    def commit(self, path, message):
+        """Commits a new file at `path` (relative to the repository)."""
+        put(os.path.join(self.repo, path), message + "\n")
+        self.git("add", path)
+        self.git("commit", "-qm", message)
+        return self.git("rev-parse", "HEAD").strip()
+
+    def add_gradlew(self):
+        """Commits a stub gradlew that records each run in self.gradle_log."""
+        self.gradle_log = os.path.join(self.tmp, "gradle_calls")
+        path = "2026-robot/controller_processor/rio/gradlew"
+        put(os.path.join(self.repo, path),
+            f'#!/bin/sh\necho "$*" >> {shlex.quote(self.gradle_log)}\n',
+            0o755)
+        self.git("add", path)
+        self.git("commit", "-qm", "gradlew")
+
+    def gradle_ran(self):
+        ran = os.path.exists(self.gradle_log)
+        if ran:
+            os.remove(self.gradle_log)
+        return ran
+
+    def worktree_paths(self):
+        return [line.split(" ", 1)[1]
+                for line in self.git("worktree", "list", "--porcelain")
+                .splitlines() if line.startswith("worktree ")]
+
     def assert_cleaned_up(self):
         self.assertEqual(os.listdir(self.tmpdir),
                          [n for n in os.listdir(self.tmpdir)
                           if n.startswith("talos-prepush-logs.")])
-        self.assertEqual(
-            [line for line in self.git("worktree", "list", "--porcelain")
-             .splitlines() if line.startswith("worktree ")],
-            [f"worktree {self.repo}"])
+        self.assertEqual(self.worktree_paths(), [self.repo])
         self.assertTrue(os.access(os.path.join(self.repo, "src", "a.txt"),
                                   os.W_OK))
 
@@ -145,6 +170,25 @@ class PrepushTest(unittest.TestCase):
         status, out, _ = self.prepush()
         self.assertEqual(status, 0, out)
         self.assertIn("prepush: host-includes ok", out)
+
+
+    # REQ-DEV-25
+    def test_gradle_runs_for_any_source_the_roborio_program_compiles(self):
+        # build.gradle compiles talOS/driver_station/driver_station.cc and
+        # takes headers from all of talOS/.
+        self.add_gradlew()
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+        self.commit("talOS/driver_station/x.h", "driver station")
+        status, out, _ = self.prepush("--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertTrue(self.gradle_ran(), out)
+
+        self.git("branch", "-f", "pushed", "HEAD")
+        self.commit("docs/x.md", "docs")
+        status, out, _ = self.prepush("--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertFalse(self.gradle_ran(), out)
 
 
 if __name__ == "__main__":
