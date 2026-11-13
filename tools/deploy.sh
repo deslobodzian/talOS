@@ -55,7 +55,9 @@ finally:
 # hardware and no network, and may run beside a live robot. A member that
 # fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S seconds, default
 # 60; tests shorten it) is a warning naming it and never fails the command:
-# the launch judges members. Linux pays no such charge but runs the same path.
+# the launch judges members. A stop signal to deploy.sh kills the running
+# member's group and selects nothing. Members run as the invoking user (root
+# under sudo). Linux pays no such charge but runs the same path.
 WARM_UP=1
 warm_up() {
   local bundle="$1"
@@ -68,7 +70,11 @@ warm_up() {
     return 0
   fi
   say "warming up $bundle: each member's first run, one at a time"
-  python3 - "$bundle" "${TALOS_DEPLOY_WARM_UP_TIMEOUT_S:-60}" <<'EOF' ||
+  # In the background so that a signal to deploy.sh reaches the warm-up,
+  # which kills its member before exiting: bash would otherwise die alone
+  # and leave the member running. Bash runs a background job with SIGINT
+  # ignored, so the trap forwards every stop as SIGTERM.
+  python3 - "$bundle" "${TALOS_DEPLOY_WARM_UP_TIMEOUT_S:-60}" <<'EOF' &
 import json
 import os
 import signal
@@ -144,39 +150,82 @@ for var in ("BUILD_WORKSPACE_DIRECTORY", "RUNFILES_DIR",
 env["PATH"] = os.path.join(bundle, "bin") + os.pathsep + env.get("PATH", "")
 env["PYTHONDONTWRITEBYTECODE"] = "1"
 
+class Interrupted(Exception):
+    pass
+
+
+def interrupted(signum, frame):
+    raise Interrupted(signum)
+
+
+# deploy.sh forwards SIGTERM on its own SIGTERM, SIGINT or SIGHUP; the member
+# is in its own session, so no terminal or service stop reaches it.
+for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(number, interrupted)
+
+
+def kill_group(proc):
+    """Kills a member's whole process group while its leader is unreaped,
+    so the group id cannot have been reused, and reaps it."""
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.wait()
+
+
+def warm(label, binary, args, err):
+    proc = None
+    try:
+        # Its own process group, so a hung member is killed whole.
+        proc = subprocess.Popen(
+            [os.path.join(bundle, binary)] + args, cwd=bundle, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=err, start_new_session=True)
+    except OSError as e:
+        warn(f"{label}: cannot run {binary}: {e}")
+        return
+    try:
+        code = proc.wait(timeout=bound)
+    except subprocess.TimeoutExpired:
+        warn(f"{label}: still running after {bound:g} s; killed")
+        return
+    finally:
+        # Whatever ends the wait (the bound, an interrupt), the member and
+        # its group go with it.
+        kill_group(proc)
+    if code != 0:
+        err.seek(0)
+        lines = err.read()[-4096:].decode(errors="replace").splitlines()
+        # Its last line naming an error, else its last line.
+        said = [line.strip() for line in lines if line.strip()]
+        cause = next((line for line in reversed(said)
+                      if "error" in line.lower()), said[-1] if said else "")
+        warn(f"{label}: exited {code}" + (f": {cause}" if cause else ""))
+
+
 began = time.monotonic()
-for label, binary, args in members:
-    with tempfile.TemporaryFile() as err:
-        try:
-            # Its own process group, so a hung member is killed whole.
-            proc = subprocess.Popen(
-                [os.path.join(bundle, binary)] + args, cwd=bundle, env=env,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=err, start_new_session=True)
-        except OSError as e:
-            warn(f"{label}: cannot run {binary}: {e}")
-            continue
-        try:
-            code = proc.wait(timeout=bound)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-            warn(f"{label}: still running after {bound:g} s; killed")
-            continue
-        if code != 0:
-            err.seek(0)
-            lines = err.read()[-4096:].decode(errors="replace").splitlines()
-            # Its last line naming an error, else its last line.
-            said = [line.strip() for line in lines if line.strip()]
-            cause = next((line for line in reversed(said)
-                          if "error" in line.lower()), said[-1] if said else "")
-            warn(f"{label}: exited {code}" + (f": {cause}" if cause else ""))
+try:
+    for label, binary, args in members:
+        with tempfile.TemporaryFile() as err:
+            warm(label, binary, args, err)
+except Interrupted:
+    print("deploy: warm-up interrupted; its member was killed",
+          file=sys.stderr, flush=True)
+    sys.exit(130)
 print(f"deploy: warmed {len(members)} members in "
       f"{time.monotonic() - began:.1f} s", flush=True)
 EOF
+  local pid=$! status=0 stopped=0
+  trap 'stopped=1; kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP
+  wait "$pid" || status=$?
+  # A trapped signal ends the first wait early; the second waits for the
+  # warm-up to kill its member and exit.
+  if [ "$stopped" = "1" ]; then wait "$pid" 2>/dev/null || true; fi
+  trap - TERM INT HUP
+  [ "$stopped" = "0" ] || die "stopped during the warm-up; nothing selected"
+  [ "$status" = "0" ] ||
     printf 'deploy: warning: warm-up did not finish; the launch pays the rest\n' >&2
 }
 
