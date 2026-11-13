@@ -366,12 +366,12 @@ const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
 export function renderStatus(model: DriveModel, now: number, skipped = 0): string {
   const status = model.status(now);
   const c = model.counters;
-  const ignored = c.malformed_binary + c.malformed_text;
+  const malformed = c.malformed_binary + c.malformed_text;
   return `<div class="status link-${status.link}" role="status">` +
       `<b>${LINK_WORD[status.link]}</b> ${esc(status.text)}` +
       (status.link === 'replaced' ?
            ' <button type="button" data-action="reconnect">Reconnect</button>' : '') +
-      (ignored ? ` <span class="meta">${plural(ignored, 'malformed message')} ignored</span>` : '') +
+      (malformed ? ` <span class="meta">${plural(malformed, 'malformed message')} counted</span>` : '') +
       (skipped > 0 ?
            ` <span class="meta bad">${plural(skipped, 'layout widget')} not drawn: no cell this page can read</span>` :
            '') +
