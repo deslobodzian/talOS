@@ -21,6 +21,8 @@
 #include <thread>
 #include <utility>
 
+#include "talOS/process/process.h"
+
 namespace talos::launcher {
 namespace {
 
@@ -215,7 +217,8 @@ std::optional<ChildReport> ReadChildReports(int errors,
 }
 
 pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
-                   SpawnOutput output, int* reader, SpawnFailure* failure) {
+                   SpawnOutput output, int* reader, SpawnFailure* failure,
+                   bool hold_stop) {
   const auto fail = [&error, failure](std::string_view step, int code) {
     error = std::string{step} + ": " + std::strerror(code);
     if (failure != nullptr) *failure = {std::string{step}, code};
@@ -227,6 +230,12 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
   c_args.reserve(args.size() + 1);
   for (auto& arg : args) c_args.push_back(arg.data());
   c_args.push_back(nullptr);
+  // Built here: the child only passes it to sigprocmask.
+  sigset_t held;
+  sigemptyset(&held);
+  if (hold_stop) {
+    for (const int signal : process::kHeldStopSignals) sigaddset(&held, signal);
+  }
   // No stdio flush first: the child never flushes the buffers it copies (it
   // execs or _exits), and a flush here could wait on the launcher's stdout.
   const pid_t parent = ::getpid();
@@ -329,6 +338,10 @@ pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
     ::_exit(0);
   }
   ::close(lifetime[0]);
+  // After the guardian's fork, so the guardian's mask stays empty. Nothing
+  // the launcher sends reaches the group before the exec (this returns to it
+  // only then), so every stop it sends the member meets the mask.
+  ::sigprocmask(SIG_BLOCK, &held, nullptr);
   // dup2 clears close-on-exec on the copies; the pipe's own descriptors close
   // at the exec. The writer stays blocking: see ChildOutput for why.
   if (output != SpawnOutput::kInherit) {

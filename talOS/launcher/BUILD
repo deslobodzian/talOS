@@ -37,6 +37,7 @@ cc_library(
     name = "spawn",
     srcs = ["spawn.cc"],
     hdrs = ["spawn.h"],
+    deps = ["//talOS/process"],
 )
 
 # Drains every roster member's stdout and stderr into its <name>.log, and
@@ -577,6 +578,16 @@ talos_cc_node(
     ],
 )
 
+# Run as `alpha`: a runtime start-up in which a SIGINT exits 1, before
+# talos::Run installs the stop handlers (supervision_test's held stop).
+talos_cc_node(
+    name = "held_stop",
+    srcs = ["testdata/held_stop_node.cc"],
+    node_name = "alpha",
+    node_target = "//example/alpha:node",
+    visibility = ["//visibility:private"],
+)
+
 # A member that only keeps a registry row with the delivery-loss counts its
 # command line gives (supervision_test's manifest check).
 cc_binary(
@@ -598,6 +609,7 @@ cc_test(
         ":byte_wake_loss",
         ":delivery_loss_node",
         ":endpoint_drift",
+        ":held_stop",
         ":session_report",
     ],
     env = {
@@ -605,6 +617,7 @@ cc_test(
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
         "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
+        "TALOS_HELD_STOP_NODE": "$(rlocationpath :held_stop)",
         "TALOS_SESSION_REPORT": "$(rlocationpath :session_report)",
     },
     # Independent cases; HeartbeatingConstructorStillHasAFiniteDeadline alone

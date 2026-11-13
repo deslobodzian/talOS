@@ -1240,6 +1240,57 @@ TEST(Supervision, AMemberEndedByTheStopsOwnSignalLeavesTheSessionClean) {
   ::remove(runs.c_str());
 }
 
+// A stop that reaches a member while its runtime is still starting, before
+// the node framework handles a stop, and that the runtime would turn into an
+// ordinary exit 1 rather than a death by the signal (CPython importing
+// `site`: KeyboardInterrupt, "Fatal Python error: init_import_site", exit
+// 1), is held until the framework's handlers are in, and the member stops
+// cleanly: exit 0, reason stop, and the session ends 0. alpha is such a
+// runtime (testdata/held_stop_node.cc: a SIGINT exits 1 until one is
+// pending), and declares holds_stop through the framework's --describe. The
+// stop is the launcher's SIGINT, raised once alpha's runtime handler is in
+// (its `.started` marker), before beta's spawn, so beta never starts.
+// Without the hold alpha exits 1 and the run is a crash.
+// REQ-OPS-06
+TEST(Supervision, AStopDuringAMembersRuntimeStartUpIsHeldUntilItHandlesIt) {
+  auto options = BaseOptions("held_stop");
+  options.duration_s = kHangSeconds;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_TRUE(runfiles) << error;
+  const char* held_stop = std::getenv("TALOS_HELD_STOP_NODE");
+  ASSERT_NE(held_stop, nullptr) << "missing held stop node runfile";
+  options.binary_overrides["//example/alpha:node"] =
+      runfiles->Rlocation(held_stop);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("held_stop_beta", "exit 0\n");
+  const std::string started = options.output_dir + "/" +
+                              std::to_string(options.session_id) +
+                              "/alpha.tlog.started";
+  bool marked = false;
+  options.member_spawned = [&](const std::string& member) {
+    if (member != "alpha") return;
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (!(marked = std::filesystem::exists(started)) &&
+           std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(1ms);
+    ::raise(SIGINT);
+  };
+  const int status = RunSession(options);
+  EXPECT_TRUE(marked) << "alpha never reached its runtime's start-up";
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha_runs = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha_runs.size(), 1u) << manifest;
+  EXPECT_NE(alpha_runs[0].find("\"exit_code\": 0, \"exit_signal\": 0, "
+                               "\"reason\": \"stop\""),
+            std::string::npos)
+      << alpha_runs[0];
+  EXPECT_EQ(status, 0) << manifest;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 // A signal from elsewhere that ends a member during the stop, before the
 // stop's own SIGINT could (systemd's default KillMode=control-group sends
 // every process of the unit SIGTERM along with the launcher), is recorded

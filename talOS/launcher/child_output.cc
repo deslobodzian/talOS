@@ -786,10 +786,10 @@ void ChildOutput::WriteLoop() {
 
 pid_t SpawnDrained(std::vector<std::string> args, std::string& error,
                    ChildOutput& output, const std::string& path,
-                   std::string_view name, bool echo) {
+                   std::string_view name, bool echo, bool hold_stop) {
   int reader = -1;
-  const pid_t pid =
-      SpawnProcess(std::move(args), error, SpawnOutput::kPipe, &reader);
+  const pid_t pid = SpawnProcess(std::move(args), error, SpawnOutput::kPipe,
+                                 &reader, nullptr, hold_stop);
   if (pid > 0) output.Add(reader, path, name, pid, echo);
   return pid;
 }

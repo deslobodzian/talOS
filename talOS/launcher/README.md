@@ -396,7 +396,19 @@ requested on Linux).
 
 Every process the launcher spawns starts with every signal at its default
 disposition and none blocked, whatever the launcher inherited (`nohup`'s
-ignored SIGHUP, `&`'s ignored SIGINT and SIGQUIT, its own ignored SIGPIPE).
+ignored SIGHUP, `&`'s ignored SIGINT and SIGQUIT, its own ignored SIGPIPE),
+with one exception: every run of a member whose `--describe` answer says
+`holds_stop` (each binary built on `talos::Run` or `talos.run`;
+[describe](../introspection/README.md#describe)) starts with SIGINT, SIGTERM
+and SIGHUP blocked. They stay blocked through every exec of its start-up (a
+bundle's `/bin/sh` script execing the interpreter, rules_python's first
+interpreter execing the second) until the node framework installs its stop
+handlers, which unblock them: a stop sent earlier is held, not met by the
+runtime's own handling (CPython would raise `KeyboardInterrupt` and exit 1),
+and the node takes it as a stop during construction and exits 0. Probes,
+group guardians, `--replay-inputs` runs and members that do not say so
+(`hardware_node`, `sim_gateway`, the Studio bridge, foreign binaries) start
+with none blocked.
 
 A terminal hangup (an interactive ssh session or a terminal window closing
 sends SIGHUP) stops the session in order, as SIGTERM does, unless the
@@ -493,8 +505,8 @@ refused [live endpoints](#live-endpoints). The [Studio bridge](#studio-bridge)
 never counts, however it ended, nor does a member a stop left unstarted
 ([two phases](#two-phases)). A member whose last run ended by
 the stop's own signal does not count: one that was not yet handling a stop
-(between its exec and `process::InstallStopHandlers()`, a C++ node's first
-lines or a Python node's whole interpreter start) when the stop's SIGINT
+(between its exec and its stop handlers, which a member started with the stop
+held never is: [node output](#node-output)) when the stop's SIGINT
 reached it, so an operator's Ctrl-C during startup ends the session with 0.
 Its run still records the signal: `exit_code` -1, `exit_signal` 2, `reason`
 `stop`, `stopped_by_session` true, the field the exit status reads. Only

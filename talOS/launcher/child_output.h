@@ -226,9 +226,10 @@ class ChildOutput {
 };
 
 // SpawnProcess with the child's stdout and stderr drained into `path` by
-// `output` (echoed to the launcher's stdout with `echo`).
+// `output` (echoed to the launcher's stdout with `echo`), the stop signals
+// held with `hold_stop`.
 pid_t SpawnDrained(std::vector<std::string> args, std::string& error,
                    ChildOutput& output, const std::string& path,
-                   std::string_view name, bool echo);
+                   std::string_view name, bool echo, bool hold_stop = false);
 
 }  // namespace talos::launcher
