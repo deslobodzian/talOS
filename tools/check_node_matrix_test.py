@@ -1,5 +1,7 @@
 """Unit tests for //tools:check_node_matrix."""
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -138,6 +140,40 @@ class CheckNodeMatrixTest(unittest.TestCase):
             with mock.patch.dict(os.environ,
                                  {"BUILD_WORKSPACE_DIRECTORY": root}):
                 self.assertEqual(check_node_matrix.main(["bot"]), 1)
+
+    def test_baseline_fails_on_a_new_missing_case_and_a_stale_entry(self):
+        # CI runs the lint over a baseline of the cases missing today
+        # (MATRIX-1), which may only shrink: an unlisted missing case fails,
+        # and so does a listed case that is present or a path that is gone.
+        names = check_node_matrix.CASES["actuator"]
+        body = "".join(f"TEST(Arm, {names[case]}) {{}}\n"
+                       for case in range(1, 11))
+        with tempfile.TemporaryDirectory() as root:
+            for path, text in (
+                    ("bot/arm/BUILD", "talos_cc_node(\n)\n"),
+                    ("bot/arm/arm.h", "talos::Motor motor_;\n"),
+                    ("bot/arm/node_test.cc", body)):
+                os.makedirs(os.path.dirname(os.path.join(root, path)),
+                            exist_ok=True)
+                with open(os.path.join(root, path), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+            for baseline, code in (
+                    ("bot/arm/node_test.cc 11 12  # MATRIX-1\n", 0),
+                    ("bot/arm/node_test.cc 12\n", 1),
+                    ("bot/arm/node_test.cc 10 11 12\n", 1),
+                    ("bot/arm/node_test.cc 11 12\nbot/gone_test.cc 1\n", 1),
+                    ("bot/arm/node_test.cc eleven\n", 2)):
+                with self.subTest(baseline=baseline):
+                    with open(os.path.join(root, "baseline.txt"), "w",
+                              encoding="utf-8") as f:
+                        f.write(baseline)
+                    with mock.patch.dict(
+                            os.environ, {"BUILD_WORKSPACE_DIRECTORY": root}), \
+                            contextlib.redirect_stdout(io.StringIO()), \
+                            contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(check_node_matrix.main(
+                            ["bot", "--baseline", "baseline.txt"]), code)
 
 
 if __name__ == "__main__":

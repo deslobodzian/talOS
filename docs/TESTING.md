@@ -204,8 +204,10 @@ Where RULES.md 12 is read too broadly or too narrowly:
 Every node gets a `Sim`/`SimHardware` (C++) or `talos.testing` (Python) test
 file with these cases, under these names (Python: `test_<snake_case>`).
 `bazel run //tools:check_node_matrix -- [PATH...]` reports each node test's
-cases as present, n/a or missing and fails on a missing one; CI does not run
-it yet, and existing nodes still miss cases. **[review; gap: MATRIX-1]**
+cases as present, n/a or missing and fails on a missing one. **[enforced:
+the CI lint job runs it with `--baseline tools/check_node_matrix_baseline.txt`,
+the cases existing nodes still miss, which only shrinks; gap: MATRIX-1 for
+those cases]**
 
 | # | Case | Arrange | Expect |
 |---|---|---|---|

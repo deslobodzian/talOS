@@ -1,0 +1,20 @@
+# Node test matrix cases (docs/TESTING.md §7) missing today, by test file:
+# `<path> <case> [<case>...]`. TODO.md MATRIX-1 closes them.
+#
+# CI runs `python3 tools/check_node_matrix.py --baseline <this file>`, which
+# fails on a missing case not listed here and on a listed case that is no
+# longer missing. Delete a case once its test exists or its `matrix: n/a`
+# line gives the reason; never add one.
+2026-robot/main_processor/autonomous/node_test.cc 1 2 6 9 11 12
+2026-robot/main_processor/driver/node_test.cc 1 2 6 9 11 12
+2026-robot/main_processor/drivetrain/node_test.cc 1 2 3 4 5 6 7 8 9 10 11
+2026-robot/main_processor/intake/node_test.py 1 2 3 4 5 6 7 8 9 10 11
+2026-robot/main_processor/pose_estimator/node_test.py 1 3 9
+2026-robot/main_processor/shooter/node_test.cc 1 4 5 7 8 9 10 11
+2026-robot/main_processor/vision/node_test.cc 1 3 9 12
+2026-robot/main_processor/vision/recorded_footage_test.cc 1 3 9 12
+talOS/telemetry/node_test.cc 1 3 9 12
+talOS/teleop/node_test.cc 1 2 6 9 11 12
+examples/superstructure/cpp/superstructure_test.cc 1 2 3 4 5 6 7 8 9 10 11 12
+examples/wrist_repo/node_test.cc 1 2 5 7 9 10 11 12
+bench/main_processor/motor/node_test.cc 1 2 3 4 5 6 7 8 9 10 11 12
