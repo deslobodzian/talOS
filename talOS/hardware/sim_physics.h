@@ -45,7 +45,8 @@
 // tuned); with zero gains it honestly cannot hold and coasts.
 //
 // Controlled inputs/faults. Beam breaks and RoboRIO limit-switch inputs via
-// SetDigitalInput, switches on a TalonFX's own limit inputs via
+// SetDigitalInput, a home switch a motor's position closes via
+// SetHomeSwitches, switches on a TalonFX's own limit inputs via
 // Set{Forward,Reverse}LimitPressed (enforced per MotorConfig's
 // forward_limit_switch and reverse_limit_switch), soft limits from
 // MotorConfig enforced in physics, frozen feedback, per-device disconnect,
@@ -66,6 +67,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "feedback.h"
@@ -262,6 +264,24 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
   return false;
 }
 
+// A home switch the mechanism closes: the RoboRIO digital input named
+// `input` is closed while the motor named `motor` is at `closed_at_rot` or
+// beyond it, below it (`closed_above` false) or above it (true). The
+// position is the one the motor reports, in mechanism rotations of its own
+// hardware frame (before any node's rezero), taken from the physical axis
+// whether or not the motor's feedback is valid. The boundary is exact and
+// has no hysteresis. A closed switch reads `closed_reads` (false: normally
+// open to ground behind the RoboRIO's pull-up, as PositionMechanism's
+// limit_switch_closed_reads defaults), an open one the opposite. The switch
+// only reports: it stops nothing.
+struct HomeSwitch {
+  std::string input;
+  std::string motor;
+  double closed_at_rot{};
+  bool closed_above{false};
+  bool closed_reads{false};
+};
+
 // Physics-backed Backend. See the header comment for the item-by-item map.
 class PhysicsSimBackend final : public Backend {
  public:
@@ -282,6 +302,16 @@ class PhysicsSimBackend final : public Backend {
     }
   }
 
+  // The home switches (HomeSwitch), replacing any set before. They survive
+  // every later Configure, a config the bridge pushes included, matched by
+  // the input's and the motor's names; a switch whose input or motor the
+  // config does not name is inactive, and that input reads as
+  // SetDigitalInput left it. A bound input ignores SetDigitalInput.
+  void SetHomeSwitches(std::vector<HomeSwitch> switches) {
+    home_switches_ = std::move(switches);
+    BindHomeSwitches();
+  }
+
   bool Configure(const Config& config) override {
     config_ = config;
     for (auto& m : config_.motors) {
@@ -290,6 +320,7 @@ class PhysicsSimBackend final : public Backend {
         m.motor_type.value = it->second;
       }
     }
+    BindHomeSwitches();
     axes_.fill(AxisState{});
     profiles_.fill(Profile{});
     gyro_override_ = false;
@@ -448,6 +479,15 @@ class PhysicsSimBackend final : public Backend {
       const auto it = digital_inputs_.find(id);
       state.digital_inputs[i] = {
           id, true, it != digital_inputs_.end() ? it->second : false};
+    }
+    // After the motors, so a soft limit has already stopped each axis.
+    for (const BoundHomeSwitch& s : bound_home_switches_) {
+      const double position_rot = axes_[s.motor].rotor_position_rot *
+                                  FeedbackDirection(s.motor) / Gear(s.motor);
+      const bool closed = s.closed_above ? position_rot >= s.closed_at_rot
+                                         : position_rot <= s.closed_at_rot;
+      state.digital_inputs[s.input].value =
+          closed ? s.closed_reads : !s.closed_reads;
     }
     for (std::size_t i = 0; i < config_.digital_outputs.size(); ++i) {
       const auto id = config_.digital_outputs[i].id;
@@ -787,6 +827,26 @@ class PhysicsSimBackend final : public Backend {
     return -1;
   }
 
+  // Resolves home_switches_ by name against config_.
+  void BindHomeSwitches() {
+    bound_home_switches_.clear();
+    bound_home_switches_.reserve(home_switches_.size());
+    for (const HomeSwitch& s : home_switches_) {
+      std::optional<std::size_t> input;
+      std::optional<std::size_t> motor;
+      for (std::size_t i = 0; i < config_.digital_inputs.size(); ++i) {
+        if (config_.digital_inputs[i].name == s.input) input = i;
+      }
+      for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+        if (config_.motors[i].name == s.motor) motor = i;
+      }
+      if (input && motor) {
+        bound_home_switches_.push_back(
+            {*input, *motor, s.closed_at_rot, s.closed_above, s.closed_reads});
+      }
+    }
+  }
+
   void EnforceSoftLimits(const MotorConfig& m, MotorSample& out,
                          std::size_t i) {
     if (!m.soft_limits) return;
@@ -1042,6 +1102,16 @@ class PhysicsSimBackend final : public Backend {
   std::unordered_map<uint16_t, double> pwm_outputs_{};
   // By motor name; SetLocalMotorTypes.
   std::unordered_map<std::string, MotorType> local_motor_types_{};
+  // SetHomeSwitches, and those of them config_ names, by index.
+  struct BoundHomeSwitch {
+    std::size_t input;
+    std::size_t motor;
+    double closed_at_rot;
+    bool closed_above;
+    bool closed_reads;
+  };
+  std::vector<HomeSwitch> home_switches_;
+  std::vector<BoundHomeSwitch> bound_home_switches_;
   double supply_v_{12.0};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};

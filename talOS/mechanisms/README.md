@@ -176,7 +176,9 @@ Stall homing reads stator current. Component tests set it with
 over the motor's resistance, clamped to `stator_limit_a`, so it peaks at
 stall and falls with speed: a 1 V homing push into a stop draws about 30 A on
 a Kraken X60, and stall homing with a realistic `homing_stall_current_a`
-homes there.
+homes there. Limit-switch homing homes against the physics backend's home
+switch (`PhysicsSimBackend::SetHomeSwitches`, talOS/hardware/README.md
+"Simulation Backends"), which closes at a configured position of the motor.
 
 Drive keys, all required except `home_rot`: `homing_v` (V, nonzero, at most
 half the motor's `max_voltage`, pointing at `home_rot`, which must be the
@@ -274,7 +276,9 @@ the library's share of the node test matrix (docs/TESTING.md §7), requests
 refused outside `update()` and dropped after a skipped one, and each
 feature: stall homing (a stop after motion, never moving, a slow start, the
 timeout), absolute homing (including a reset), upward limit-switch homing and
-a stuck switch, an invalid switch sample (neither homing nor stuck), homing paused without a goal, hold on an unhomed mechanism,
+a stuck switch, an invalid switch sample (neither homing nor stuck), homing
+paused without a goal, hold on an unhomed mechanism, stall and limit-switch
+homing on the physics simulator's motor and home switch,
 gravity for elevator and arm, turret wrap, at-goal and at-speed edges
 (including at speed lost on a velocity sample past `ReadinessAgeBound` or
 of unknown age, and reached before the clock mapping converges, REQ-DEV-22), spin-down, faults, the roller's phases, a disable cancelling a timed run,

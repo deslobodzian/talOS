@@ -20,6 +20,7 @@
 
 #include <chrono>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -653,6 +654,72 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
   EXPECT_DOUBLE_EQ(hood.Applied().demand, 2.5);
 }
 
+// One subsystem of kRobotToml on the physics simulator (sim_gateway
+// --physics). Each Tick() the physics backend runs what the gateway applied
+// last tick, and its motor sample, and the home switch's reading once
+// SetHomeSwitch() binds one, reach the node through SimHardware (an input
+// SimHardware has never been given reads false: closed, for a normally open
+// switch).
+struct PhysicsRig {
+  explicit PhysicsRig(std::string_view subsystem)
+      : rig{subsystem},
+        config{rig.sim.node(subsystem)
+                   .extension<HardwareLink>()
+                   .config()
+                   .hardware} {
+    config.commissioned = true;
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      if (config.motors[i].name == subsystem) motor_index = i;
+    }
+    requests.resize(config.motors.size());
+    state.motor_count = static_cast<std::uint16_t>(requests.size());
+  }
+  hardware::MotorConfig& motor() { return config.motors.at(motor_index); }
+  void SetHomeSwitch(const hardware::sim::HomeSwitch& home) {
+    for (std::size_t i = 0; i < config.digital_inputs.size(); ++i) {
+      if (config.digital_inputs[i].name == home.input) home_input = i;
+    }
+    physics.SetHomeSwitches({home});
+  }
+  // Configures the physics backend and hands the node its first reading,
+  // before the Driver Station enables it.
+  void Configure() {
+    ASSERT_TRUE(physics.Configure(config));
+    Relay();
+  }
+  void Tick(double goal_rot) {
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      requests[i] = {.id = config.motors[i].id};
+    }
+    requests[motor_index] = rig.Applied();
+    ASSERT_TRUE(physics.Apply(requests));
+    Relay();
+    rig.Drive(goal_rot, 5ms);
+  }
+  void Relay() {
+    state.sample_time_us = now_us += 5000;
+    physics.Read(state);
+    const hardware::MotorSample& sample = state.motors[motor_index];
+    rig.SetMotor(sample.position_rot, sample.velocity_rps,
+                 sample.stator_current_a);
+    if (home_input) {
+      rig.hw.set_digital_input(rig.name,
+                               config.digital_inputs[*home_input].name,
+                               state.digital_inputs[*home_input].value);
+    }
+  }
+  double position_rot() const { return state.motors[motor_index].position_rot; }
+
+  Rig<> rig;
+  hardware::Config config;
+  std::size_t motor_index = 0;
+  std::optional<std::size_t> home_input;
+  hardware::sim::PhysicsSimBackend physics;
+  std::vector<hardware::MotorRequest> requests;
+  hardware::State state{};
+  std::uint64_t now_us = 0;
+};
+
 // Stall homing on the physics simulator's motor (sim_gateway --physics):
 // the hood's 1 V push runs it down into a hard stop 0.3 rot below where it
 // starts (the physics soft limit), where the winding model draws 1 V / R,
@@ -660,48 +727,50 @@ TEST(PositionMechanism, StallHomingDoesNotZeroOnASlowStart) {
 // so it homes there well inside homing_timeout_us.
 // REQ-SAFE-36
 TEST(PositionMechanism, StallHomingCompletesOnThePhysicsMotor) {
-  Rig hood{"hood"};
-  hardware::Config physics_config =
-      hood.sim.node("hood").extension<HardwareLink>().config().hardware;
-  physics_config.commissioned = true;
-  std::size_t index = physics_config.motors.size();
-  for (std::size_t i = 0; i < physics_config.motors.size(); ++i) {
-    if (physics_config.motors[i].name == "hood") index = i;
+  PhysicsRig hood{"hood"};
+  ASSERT_EQ(hood.motor().motor_type.value, hardware::MotorType::kKrakenX60);
+  hood.motor().soft_limits = true;  // the physical stop
+  hood.motor().reverse_limit_rot = -0.3;
+  hood.motor().forward_limit_rot = 10.0;
+  hood.Configure();
+  hood.rig.Start();
+  for (int i = 0; i < 100 && !hood.rig.mech().homed(); ++i) hood.Tick(0.5);
+  ASSERT_TRUE(hood.rig.mech().homed())
+      << "fault " << static_cast<int>(hood.rig.mech().fault());
+  EXPECT_LT(hood.now_us, 400'000u);  // homing_timeout_us is 500 ms
+  EXPECT_NEAR(hood.position_rot(), -0.3, 1e-9);
+  EXPECT_NEAR(hood.rig.mech().position_rot(), 0.0, 1e-9);
+}
+
+// Limit-switch homing on the physics simulator's home switch: the carriage
+// starts at 0, above its switch, which closes at -0.25 and below. Its 1 V
+// push runs it down with the switch open, and it zeroes past the switch
+// point, by no more than it travels in the few ticks home_samples and the
+// relay take (about 0.04 rot each at about 8 rot/s), not where it started.
+// REQ-SAFE-36
+TEST(PositionMechanism, LimitSwitchHomingFindsThePhysicsHomeSwitch) {
+  PhysicsRig carriage{"carriage"};
+  carriage.SetHomeSwitch(
+      {.input = "carriage_home", .motor = "carriage", .closed_at_rot = -0.25});
+  carriage.Configure();
+  carriage.rig.Start();
+  carriage.Tick(0.5);
+  carriage.Tick(0.5);
+  carriage.rig.ExpectHoming(-1.0);
+  for (int i = 0; i < 100 && !carriage.rig.mech().homed(); ++i) {
+    carriage.Tick(0.5);
   }
-  ASSERT_LT(index, physics_config.motors.size());
-  hardware::MotorConfig& motor = physics_config.motors[index];
-  ASSERT_EQ(motor.motor_type.value, hardware::MotorType::kKrakenX60);
-  motor.soft_limits = true;  // the physical stop
-  motor.reverse_limit_rot = -0.3;
-  motor.forward_limit_rot = 10.0;
-  hardware::sim::PhysicsSimBackend physics;
-  ASSERT_TRUE(physics.Configure(physics_config));
-  std::vector<hardware::MotorRequest> requests(physics_config.motors.size());
-  hardware::State state{};
-  state.motor_count = static_cast<std::uint16_t>(requests.size());
-  std::uint64_t now_us = 0;
-  // Each tick the physics motor runs what the gateway applied last tick and
-  // reports to the hood through SimHardware.
-  const auto tick = [&] {
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-      requests[i] = {.id = physics_config.motors[i].id};
-    }
-    requests[index] = hood.Applied();
-    ASSERT_TRUE(physics.Apply(requests));
-    state.sample_time_us = now_us += 5000;
-    physics.Read(state);
-    const hardware::MotorSample& sample = state.motors[index];
-    hood.SetMotor(sample.position_rot, sample.velocity_rps,
-                  sample.stator_current_a);
-    hood.Drive(0.5, 5ms);
-  };
-  hood.Start();
-  for (int i = 0; i < 100 && !hood.mech().homed(); ++i) tick();
-  ASSERT_TRUE(hood.mech().homed())
-      << "fault " << static_cast<int>(hood.mech().fault());
-  EXPECT_LT(now_us, 400'000u);  // homing_timeout_us is 500 ms
-  EXPECT_NEAR(state.motors[index].position_rot, -0.3, 1e-9);
-  EXPECT_NEAR(hood.mech().position_rot(), 0.0, 1e-9);
+  ASSERT_TRUE(carriage.rig.mech().homed())
+      << "fault " << static_cast<int>(carriage.rig.mech().fault());
+  // With the relay paused, the node reads the last relayed sample again: the
+  // frame's zero, in the motor's hardware frame, is that position less the
+  // node's.
+  carriage.rig.Drive(0.5, 10ms);
+  const double zero_rot =
+      carriage.position_rot() - carriage.rig.mech().position_rot();
+  EXPECT_LE(zero_rot, -0.25);
+  EXPECT_GT(zero_rot, -0.25 - 0.15);
+  EXPECT_EQ(carriage.rig.mech().fault(), PositionFault::kNone);
 }
 
 // A mechanism that keeps moving (no stop within reach) times out and faults.
