@@ -42,22 +42,24 @@ finally:
 
 # --- warm-up ----------------------------------------------------------------
 # Runs every member of the installed bundle at $1 once, one at a time, before
-# anything selects it: each node binary and the Studio bridge as the
-# launcher's probe runs them (`--describe --config <config>`), and the
-# launcher itself with --help. macOS charges the first exec and first load of
-# every newly written executable file (about 100 ms each, serialized
-# host-wide), per file and only on a real exec or load; a fresh bundle's first
-# launch pays it inside the launcher's parallel 15 s describe deadline and,
-# with other new executables on the host, misses it. Paid here, in turn and
-# against the files at their final path, it costs seconds once. A --describe
-# run opens no topic, socket or registry row, and builds no backend (talOS/node
-# RunMain, talOS/bridge main.cc, studio/bridge main.cc), so this touches no
-# hardware and no network, and may run beside a live robot. A member that
-# fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S seconds, default
-# 60; tests shorten it) is a warning naming it and never fails the command:
-# the launch judges members. A stop signal to deploy.sh kills the running
-# member's group and selects nothing. Members run as the invoking user (root
-# under sudo). Linux pays no such charge but runs the same path.
+# anything selects it: each node binary and the Studio bridge as the launcher's
+# probe runs them (`--describe --config <config>`), and the launcher itself with
+# --help, then on macOS every native library once (below). macOS charges the
+# first exec and first load of every newly written executable file (about 100 ms
+# each, serialized host-wide), per file and only on a real exec or load; a fresh
+# bundle's first launch pays it inside the launcher's parallel 15 s describe
+# deadline and, with other new executables on the host, misses it. Paid here, in
+# turn and against the files at their final path, it costs seconds once. A
+# --describe run opens no topic, socket or registry row, and builds no backend
+# (talOS/node RunMain, talOS/bridge main.cc, studio/bridge main.cc), so this
+# touches no hardware and no network, and may run beside a live robot; the
+# native pass runs only the libraries' static initializers, in a process of its
+# own. A member that fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S
+# seconds, default 60; tests shorten it) is a warning naming it and never fails
+# the command: the launch judges members. A stop signal to deploy.sh kills the
+# running member's group and selects nothing. Members run as the invoking user
+# (root under sudo). Linux pays no such charge but runs the same path, without
+# the native pass.
 WARM_UP=1
 warm_up() {
   local bundle="$1"
@@ -139,6 +141,39 @@ members = [(label, binary, args + ["--config", config])
            for label, binary, args in members]
 members.append(("launcher", "launcher", ["--help"]))
 
+# macOS also charges the first load of each newly written native library (a
+# Python extension module, a dylib a node loads; docs/DEPLOYMENT.md "Warm-up"
+# has the numbers), and --describe imports no backend. The charge is paid by
+# dyld's first mapping of the file, even when the load then fails on an
+# unresolved symbol, and not by reading it or `codesign -v`; it belongs to the
+# file, so the installed copy pays again. So on macOS one more member loads
+# every .so and .dylib in the bundle once, in a process of its own, ignoring
+# each failure: their static initializers run there, nothing calls into them,
+# and it exits without running any destructor. Linux charges nothing, so it is
+# skipped there.
+NATIVE_LOADER = r"""
+import ctypes, os, sys
+for root, _, files in os.walk(sys.argv[1]):
+    for name in sorted(files):
+        path = os.path.join(root, name)
+        if name.endswith((".so", ".dylib")) and not os.path.islink(path):
+            try:
+                ctypes.CDLL(path, mode=os.RTLD_LAZY | os.RTLD_LOCAL)
+            except OSError:
+                pass
+sys.stdout.flush()
+os._exit(0)
+"""
+natives = 0
+if sys.platform == "darwin":
+    for root, _, files in os.walk(bundle):
+        natives += sum(1 for name in files
+                       if name.endswith((".so", ".dylib"))
+                       and not os.path.islink(os.path.join(root, name)))
+if natives:
+    members.append(("native libraries", sys.executable,
+                    ["-c", NATIVE_LOADER, bundle]))
+
 # As run.sh starts the launcher: from the bundle, its bin/ first on PATH,
 # nothing of a Bazel run or a Python environment inherited. No .pyc is
 # written: the bundle stays as installed even when deploy.sh runs as root.
@@ -214,7 +249,8 @@ except Interrupted:
     print("deploy: warm-up interrupted; its member was killed",
           file=sys.stderr, flush=True)
     sys.exit(130)
-print(f"deploy: warmed {len(members)} members in "
+loaded = f" and {natives} native libraries" if natives else ""
+print(f"deploy: warmed {len(members) - bool(natives)} members{loaded} in "
       f"{time.monotonic() - began:.1f} s", flush=True)
 EOF
   local pid=$! status=0 stopped=0
