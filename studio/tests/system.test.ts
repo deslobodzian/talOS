@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
 import {graphStale} from '../src/data/freshness';
@@ -745,70 +746,45 @@ test('the demo declared graph is a document the parser accepts', () => {
   assert.ok(!declared.diagnostics.some(d => d.severity === 'error'));
 });
 
-// The fast values of a graph document in the order the bridge lists them
-// (studio/bridge/system.h BuildSystemGraph), written out independently of
-// SystemGraphStream so a reordering on either side is caught.
-function fastValues(doc: Json): unknown[] {
-  const values: unknown[] = [doc.wall_ns];
-  const bridge = doc.bridge as Json;
-  for (const key of ['clients', 'frames_forwarded', 'invalid', 'ws_drops',
-                     'refused', 'egress_bytes'])
-    values.push(bridge[key]);
-  for (const node of doc.nodes as Json[]) {
-    values.push(node.heartbeat_wall_ns, node.dispatch_count, node.alive);
-    const delivery = node.delivery as Json|undefined;
-    if (delivery)
-      for (const key of ['wake_failures', 'stalled_arms', 'wake_fallbacks',
-                         'requests_skipped'])
-        values.push(delivery[key]);
-    for (const source of node.sources as Json[])
-      values.push(source.events, source.dropped, source.sequence,
-                  source.last_monotonic_ns, source.last_latency_ns,
-                  source.max_latency_ns);
-    for (const selection of (node.selections ?? []) as Json[])
-      values.push(selection.selected);
-  }
-  for (const topic of doc.topics as Json[])
-    values.push(topic.published, topic.received, topic.dropped, topic.health);
-  return values;
-}
+// The bridge's own output (studio/bridge/testdata/golden, which
+// //studio/bridge:system_test requires it to reproduce byte for byte): a
+// whole graph, the update it sends at the next refresh, and that refresh's
+// whole graph. The bridge's order of the fast values is the one source;
+// these files are how Studio is held to it.
+const bridgeGolden = (name: string) => readFileSync(
+    new URL(`../bridge/testdata/golden/${name}`, import.meta.url), 'utf8');
 
-// A client holding the whole graph becomes current from updates alone, and
+// REQ-OPS-23: a client holding the whole graph becomes current from updates
+// alone, each value written into the field the bridge read it from (a slot
+// out of the bridge's order shows one counter's value as another's), and
 // stays fresh across deferral notices: a graph the radio budget holds back
 // is late, not lost, so Studio does not mark it stale. Without a notice it
 // does go stale; an update for a structure the client does not hold is
 // refused without changing what it has.
 test('graph updates and deferral notices keep a held graph current and fresh', () => {
   const stream = new SystemGraphStream();
-  // The demo omits the fields Studio does not read; the bridge sends them.
-  const bridgeShaped = (sequence: bigint, egress: string) => {
-    const doc = JSON.parse(demoSystemGraph(sequence));
-    Object.assign(doc.bridge, {refused: '0', egress_bytes: egress});
-    for (const topic of doc.topics) topic.health = 'ok';
-    return {...doc, structure: 'abc'};
-  };
-  const first = bridgeShaped(0n, '100'), later = bridgeShaped(25n, '9000');
-  assert.ok(stream.ingest(JSON.stringify(first), 0));
-  const update = (doc: Json, structure = 'abc') => JSON.stringify(
-      {kind: 'talos.system_graph.update', structure, values: fastValues(doc)});
-  const current = stream.ingest(update(later), 500)!;
-  assert.deepEqual(current, parseSystemGraph(JSON.stringify(later)));
-  assert.notDeepEqual(current, parseSystemGraph(JSON.stringify(first)));
+  const first = bridgeGolden('graph.json'), later = bridgeGolden('later.json');
+  const update = bridgeGolden('update.json');
+  const {structure} = JSON.parse(update) as {structure: string};
+  assert.ok(stream.ingest(first, 0));
+  const current = stream.ingest(update, 500)!;
+  assert.deepEqual(current, parseSystemGraph(later));
+  assert.notDeepEqual(current, parseSystemGraph(first));
 
   const deferred =
-      JSON.stringify({kind: 'talos.system_graph.deferred', structure: 'abc'});
+      JSON.stringify({kind: 'talos.system_graph.deferred', structure});
   for (const at of [1000, 1500, 2000]) {
     assert.equal(stream.ingest(deferred, at), null);
     assert.equal(graphStale(stream.arrival, at + 900, true), false);
   }
   assert.equal(graphStale(stream.arrival, 3000, true), true);
 
-  assert.throws(() => stream.ingest(update(first, 'other'), 3100),
+  assert.throws(() => stream.ingest(JSON.stringify(
+      {...JSON.parse(update), structure: 'other'}), 3100),
                 /structure not held/);
   assert.throws(() => stream.ingest(JSON.stringify(
-      {kind: 'talos.system_graph.update', structure: 'abc', values: [1]}), 3100),
+      {kind: 'talos.system_graph.update', structure, values: [1]}), 3100),
                 /do not match/);
   assert.equal(stream.arrival, 2000);
-  assert.deepEqual(stream.ingest(update(later), 3200),
-                   parseSystemGraph(JSON.stringify(later)));
+  assert.deepEqual(stream.ingest(update, 3200), parseSystemGraph(later));
 });

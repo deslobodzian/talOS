@@ -1,3 +1,4 @@
+load("@aspect_rules_js//js:defs.bzl", "js_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -51,10 +52,23 @@ cc_test(
     ],
 )
 
+# The system graph's golden files: a graph, the update the bridge sends at
+# the next refresh, and that refresh's graph. :system_test requires the
+# bridge to reproduce them byte for byte; //studio:system_test and
+# :fast_slots_test apply the update in Studio's and the Python harness's
+# fast-value order (README.md, "HTTP and WebSocket views").
+js_library(
+    name = "golden",
+    srcs = glob(["testdata/golden/*"]),
+    visibility = ["//studio:__pkg__"],
+)
+
 cc_test(
     name = "system_test",
     size = "small",
     srcs = ["tests/system_test.cc"],
+    data = glob(["testdata/golden/*"]),
+    env = {"TALOS_GOLDEN_GRAPH": "$(rlocationpath testdata/golden/graph.json)"},
     deps = [
         ":system",
         # The `/hw/*` topic names, so a test that asserts on them cannot drift
@@ -63,7 +77,22 @@ cc_test(
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
     ],
+)
+
+# Hermetic: it imports only integration_test.py's fast_slots. Not
+# precompiled, since the `local` tests that also list integration_test.py
+# compile it under other execution requirements (two actions, one output).
+py_test(
+    name = "fast_slots_test",
+    size = "small",
+    srcs = [
+        "fast_slots_test.py",
+        "integration_test.py",
+    ],
+    data = glob(["testdata/golden/*"]),
+    precompile = "disabled",
 )
 
 cc_binary(

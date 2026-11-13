@@ -370,7 +370,9 @@ function graphOf(root: Record<string, unknown>): SystemGraph {
 // the radio budget defers an update it sends `talos.system_graph.deferred`
 // instead, so a graph that is late, not lost, is not marked stale.
 
-// The fast fields, in the document order the bridge lists their values.
+// The fast fields, in the order the bridge appends their values (its
+// BuildSystemGraph is the one source of that order). //studio:system_test
+// holds this walk to the bridge's golden files (studio/bridge/testdata/golden).
 function fastSlots(root: Record<string, unknown>): [Record<string, unknown>, string][] {
   const slots: [Record<string, unknown>, string][] = [[root, 'wall_ns']];
   const bridge = record(root.bridge, 'bridge');

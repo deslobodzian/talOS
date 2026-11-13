@@ -44,9 +44,10 @@ def frame(sock):
     return first, receive(sock, length)
 
 
-# The system graph's fast values in document order (studio/bridge/system.h
-# BuildSystemGraph; studio/src/system.ts walks the same order). An update's
+# The system graph's fast values in the order studio/bridge/system.h
+# BuildSystemGraph appends them, the one source of that order. An update's
 # `values` are written over these slots of the client's document.
+# fast_slots_test holds this walk to the bridge's golden files.
 def fast_slots(document):
     slots = [(document, "wall_ns")]
     slots += [(document["bridge"], key) for key in
