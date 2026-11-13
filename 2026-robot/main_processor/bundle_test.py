@@ -222,9 +222,10 @@ class BootServiceTest(unittest.TestCase):
     # REQ-OPS-06
     def test_systemd_stops_through_the_launcher_alone(self):
         # Under systemd's default KillMode=control-group, `systemctl stop`
-        # SIGTERMs every member with the launcher: a member still starting
-        # (not yet handling a stop) dies of a signal the launcher did not
-        # send, the session exits 255 and the unit is recorded failed.
+        # SIGTERMs every member with the launcher: a member that does not
+        # declare holds_stop (hardware_node, the simulated gateway, the
+        # Studio bridge; a framework node holds it) dies of a signal the
+        # launcher did not send, the session exits 255 and the unit is recorded failed.
         # Only the launcher may get the stop; systemd's
         # SIGKILL must come after the launcher's own escalation.
         with tempfile.TemporaryDirectory() as tmp:

@@ -213,7 +213,7 @@ restarts), so the launcher's SIGKILL after its stop grace is what ends one that
 never returns. Before that point (a Python node's interpreter startup and
 imports, `--describe`, `--replay`) signals keep their default action, or the
 runtime's own (CPython turns a SIGINT into `KeyboardInterrupt` and exit 1),
-unless the launcher started the node: its `--describe` says `holds_stop`
+unless the launcher started it as a member of a session: its `--describe` says `holds_stop`
 (every `talos::Run` / `talos.run` binary does), so the launcher starts each
 run with SIGINT, SIGTERM and SIGHUP blocked, and the stop handlers unblock
 them once installed (`process::InstallStopHandlers`, on the thread that calls
@@ -222,7 +222,8 @@ then held to that point and taken as one during construction. A node must
 therefore reach `talos::Run` / `talos.run` without waiting on anything
 unbounded; one that never does is ended by the launcher's SIGKILL after its
 stop grace, as a stuck constructor is. A child process a node starts before
-then inherits the blocked signals (no 2026 node starts one).
+then, or from a thread started before then (such a thread keeps the signals
+blocked for life), inherits the blocked signals (no 2026 node starts one).
 
 ### Python garbage collection
 

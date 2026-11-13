@@ -405,10 +405,14 @@ bundle's `/bin/sh` script execing the interpreter, rules_python's first
 interpreter execing the second) until the node framework installs its stop
 handlers, which unblock them: a stop sent earlier is held, not met by the
 runtime's own handling (CPython would raise `KeyboardInterrupt` and exit 1),
-and the node takes it as a stop during construction and exits 0. Probes,
-group guardians, `--replay-inputs` runs and members that do not say so
-(`hardware_node`, `sim_gateway`, the Studio bridge, foreign binaries) start
-with none blocked.
+and the node takes it as a stop during construction and exits 0, provided
+it reaches its stop handlers within the stop timeout (`kStopTimeout`, 2 s)
+of the launcher's stop. One still starting then is SIGKILLed and recorded
+`stop_timeout`, as a stuck constructor is, and the session ends nonzero.
+Probes, group guardians, `--replay-inputs` runs, members that do not say so
+(`hardware_node`, `sim_gateway`, the Studio bridge, foreign binaries) and
+members whose `--describe` probe did not answer (a non-critical member the
+launch went ahead without) start with none blocked.
 
 A terminal hangup (an interactive ssh session or a terminal window closing
 sends SIGHUP) stops the session in order, as SIGTERM does, unless the
