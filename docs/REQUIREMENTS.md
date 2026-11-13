@@ -242,6 +242,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-22 | `VelocityMechanism::at_speed` is false unless the velocity sample it was judged on is no older than four of that motor's status periods at its State; an unknown age reads not ready. | P1 | MECHR | `at_speed` at the bound and one microsecond past it | unit |
 | REQ-DEV-23 | `new_robot <name> --mechanism <m> --lang cpp\|py` (or `--no-mechanism`, a robot with no device) writes a robot beside `2026-robot/` (config with teleop and telemetry, generated manifest, `manifest_sync_test`, `talos_graph_test`, `talos_bundle`, its first mechanism unless `--no-mechanism`) that passes `--describe-only` and its own tests as generated. `sim.sh --config` runs any robot config and refuses a stale manifest, naming the regenerate command. | P1 | ARCH "Where a new thing goes" | generated tree; `--describe-only` exit status | integration |
 | REQ-DEV-24 | Both simulated gateway backends (the ideal `SimBackend` and `PhysicsSimBackend`) report the chain a restore reapplies invalid from the reset until a restore completes, and keep it invalid while restores fail, as `PhoenixBackend` does, so a simulated restore faults, ends the command in force and starts a new epoch exactly when the robot would. | P2 | HR "Simulation Backends: Ideal vs Physics-Backed" | backend state; State validity | component |
+| REQ-DEV-25 | `tools/prepush.sh` runs RULES.md 11's pre-push checks on a clean worktree of the commit under CI's conditions (tracked files read-only by the step CI itself runs, no cached test result, no compile reading a host package header) and exits nonzero naming each failed or skipped step, leaving the checkout unchanged. | P1 | RULES 11; `docs/DEVELOPMENT.md` §5; TEST §9 | step lines and exit status | integration |
 
 ## Package scope
 
@@ -283,5 +284,5 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-41, REQ-OPS-42 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
-| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-OPS-47 |
+| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-OPS-47 |
 
