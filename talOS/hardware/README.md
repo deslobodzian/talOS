@@ -459,7 +459,14 @@ neutral, and sends nothing, as before the first open. The console prints
 sent until then` and, once replaced, `hardware gateway socket replaced after
 <n> failed attempts, <s> s after it could not send` (each coalesced to one
 line a second). Any other send error (`ENOBUFS`, `ECONNREFUSED`, ...) keeps
-the socket. A send raises no `SIGPIPE` on either end
+the socket. Every failed send is counted in a spell, which ends at a good
+send one second after its last failure (with the companion's port closed
+every other send fails with `ECONNREFUSED`); a spell prints `hardware
+gateway socket send failed (errno <n>); keeping the socket` at its first
+failure that keeps the socket and, once it ends, `hardware gateway socket
+sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`,
+`<s>` from its first failure to its last (at most one line a second). A send
+raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
 That loop enforces the command timeout and output neutral, so it never

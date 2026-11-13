@@ -116,12 +116,81 @@ TEST(SocketRetry, OnlyASendErrorTheSocketKeepsRepeatingLosesIt) {
     ASSERT_EQ(retry.Poll(now, [] { return true; }),
               SocketRetry::Event::kOpened);
     now += SocketRetry::kPeriodUs;
-    EXPECT_EQ(retry.SendFailed(now, row.error), row.lost);
+    EXPECT_EQ(retry.SendFailed(now, row.error),
+              row.lost ? SocketRetry::SendEvent::kLost
+                       : SocketRetry::SendEvent::kFailing);
     EXPECT_EQ(retry.open(), !row.lost);
     EXPECT_EQ(
         retry.Poll(now + kLoopPeriodUs, [] { return true; }),
         row.lost ? SocketRetry::Event::kReplaced : SocketRetry::Event::kNone);
   }
+}
+
+// Bench 2026-11-13: with the RoboRIO's address removed for 6 s the link was
+// lost and came back, and the console showed nothing of the RoboRIO's sends:
+// they failed with an errno that keeps the socket (EINVAL, say), or did not
+// fail. A spell of failed sends that keep the socket reports once at its
+// first failure, naming the errno, and once sends have gone kSpellQuietUs
+// without failing, with how many failed, from when to when, and the last
+// errno when it changed; the sends between report nothing (Robot.cpp prints
+// one console line for each report). A good send between failures does not
+// end the spell: while the companion's port is closed every other send fails
+// with ECONNREFUSED (the ICMP port unreachable of the one before), which
+// would otherwise start and end a spell every two sends. An error that
+// replaces the socket still reports the loss; the replacement's good sends
+// end that spell without a line of its own, the replaced line having said
+// it.
+// REQ-RT-22
+TEST(SocketRetry, AFailingSpellThatKeepsTheSocketReportsItsStartAndEnd) {
+  using SendEvent = SocketRetry::SendEvent;
+  SocketRetry retry;
+  ASSERT_EQ(retry.Poll(kStartUs, [] { return true; }),
+            SocketRetry::Event::kOpened);
+  EXPECT_EQ(retry.SendSucceeded(kStartUs), SendEvent::kNone);
+
+  const uint64_t spell_us = kStartUs + 1'000'000;
+  constexpr uint64_t kSpellUs = 6'000'000;
+  EXPECT_EQ(retry.SendFailed(spell_us, EINVAL), SendEvent::kFailing);
+  uint32_t failed = 1;
+  uint64_t last_failure_us = spell_us;
+  // Every other send fails, the errno changing halfway.
+  bool fail = false;
+  for (uint64_t now = spell_us + kLoopPeriodUs; now < spell_us + kSpellUs;
+       now += kLoopPeriodUs, fail = !fail) {
+    if (!fail) {
+      EXPECT_EQ(retry.SendSucceeded(now), SendEvent::kNone) << now;
+      continue;
+    }
+    EXPECT_EQ(
+        retry.SendFailed(now, now < spell_us + kSpellUs / 2 ? EINVAL : ENOBUFS),
+        SendEvent::kNone)
+        << now;
+    ++failed;
+    last_failure_us = now;
+  }
+  EXPECT_TRUE(retry.open());
+  EXPECT_EQ(retry.SendSucceeded(last_failure_us + SocketRetry::kSpellQuietUs -
+                                kLoopPeriodUs),
+            SendEvent::kNone)
+      << "the spell ended before sends went kSpellQuietUs without failing";
+  EXPECT_EQ(retry.SendSucceeded(last_failure_us + SocketRetry::kSpellQuietUs),
+            SendEvent::kRecovered);
+  EXPECT_EQ(retry.spell_failures(), failed);
+  EXPECT_EQ(retry.spell_start_us(), spell_us);
+  EXPECT_EQ(retry.spell_last_failure_us(), last_failure_us);
+  EXPECT_EQ(retry.spell_error(), EINVAL);
+  EXPECT_EQ(retry.last_send_error(), ENOBUFS);
+  EXPECT_EQ(retry.SendSucceeded(last_failure_us + SocketRetry::kSpellQuietUs +
+                                kLoopPeriodUs),
+            SendEvent::kNone);
+
+  const uint64_t lost_us = spell_us + 2 * kSpellUs;
+  EXPECT_EQ(retry.SendFailed(lost_us, ENETUNREACH), SendEvent::kLost);
+  ASSERT_EQ(retry.Poll(lost_us + kLoopPeriodUs, [] { return true; }),
+            SocketRetry::Event::kReplaced);
+  EXPECT_EQ(retry.SendSucceeded(lost_us + kLoopPeriodUs), SendEvent::kNone);
+  EXPECT_EQ(retry.SendSucceeded(lost_us + SocketRetry::kSpellQuietUs),
+            SendEvent::kNone);
 }
 
 #ifndef _WIN32
