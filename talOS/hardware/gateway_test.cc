@@ -2219,9 +2219,12 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
 // BeginRestoreAfterReset reconfigures it, with no whole-robot Neutral() and
 // no epoch change. Through a restore spanning three ticks, the command in
 // force and one observing each State of the restore are accepted, but the
-// chain receives only neutral; after the restore, a command observing the
-// last restoring State still drives it nothing, and the first observing a
-// State after the restore drives it again. The other motors drive throughout.
+// chain receives only neutral. This backend reads the chain valid throughout,
+// as the Backend contract allows, so the gateway alone holds it: the State of
+// the tick that completes the restore was read before the restore completed,
+// so the chain is invalid in it and a command observing it still drives the
+// chain nothing; the first command observing a State read after the restore
+// drives it again. The other motors drive throughout.
 // REQ-SAFE-24
 TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   auto config = SwerveConfig(true);
@@ -2305,10 +2308,22 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   EXPECT_TRUE(restore_begun);
   EXPECT_EQ(g.snapshot().epoch, epoch);
 
-  auto restoring = Request(g);
-  restoring.observed_time_us = last_restoring_us;
-  ASSERT_TRUE(g.Accept(restoring, ++sequence, now));
-  expect_apply(backend.last_requests, true, "observed during the restore");
+  const auto chain_valid = [&config](const State& state) {
+    for (std::size_t i = 0; i < config.motors.size(); ++i) {
+      if ((config.motors[i].id == kResetId ||
+           config.motors[i].master_id == kResetId) &&
+          state.motors[i].valid) {
+        return true;
+      }
+    }
+    return false;
+  };
+  EXPECT_FALSE(chain_valid(g.snapshot())) << "read before the restore ended";
+  ASSERT_TRUE(g.Accept(Request(g), ++sequence, now));
+  expect_apply(backend.last_requests, true, "observed as the restore ended");
+  now += 1000;
+  g.Tick(now, true);
+  EXPECT_TRUE(chain_valid(g.snapshot()));
   ASSERT_TRUE(g.Accept(Request(g), ++sequence, now));
   expect_apply(backend.last_requests, false, "observed after the restore");
   EXPECT_EQ(g.snapshot().epoch, epoch);
@@ -2672,10 +2687,11 @@ TEST(Gateway, FailedDeviceConfigureAndRestoreLeaveOthersDriving) {
   EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
   backend.restore_ok = true;
   g.Tick(501000, true);
-  g.Tick(502000, true);
-  command.observed_time_us = 502000;
+  g.Tick(502000, true);  // Restored, in a State read before it was.
+  g.Tick(503000, true);
+  command.observed_time_us = 503000;
   command.epoch = g.snapshot().epoch;
-  ASSERT_TRUE(g.Accept(command, 3, 502000));
+  ASSERT_TRUE(g.Accept(command, 3, 503000));
   EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
   EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
 }
@@ -2741,6 +2757,8 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
   g.Tick(now, true);
   EXPECT_EQ(backend.restoring_ids, std::vector<uint16_t>{failed_id});
   now += 5000;
+  g.Tick(now, true);  // Restored, in a State read before it was.
+  now += 5000;
   g.Tick(now, true);
   EXPECT_TRUE(g.snapshot().motors[0].valid);
   ASSERT_TRUE(g.Accept(command_at(now), ++sequence, now));
@@ -2755,6 +2773,8 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
     g.Tick(now, true);
   }
   ASSERT_GT(g.restore_attempt_count(), restores);
+  now += 5000;
+  g.Tick(now, true);  // Restored, in a State read before it was.
   now += 5000;
   g.Tick(now, true);
   ASSERT_TRUE(g.snapshot().motors[0].valid);
@@ -3095,10 +3115,11 @@ TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
   EXPECT_EQ(backend.last_requests[0].mode, Mode::kNeutral);
   EXPECT_EQ(backend.last_requests[1].mode, Mode::kDutyCycle);
   endpoint.Tick(262000, true);
-  endpoint.Tick(267000, true);
-  command.observed_time_us = 267000;
+  endpoint.Tick(267000, true);  // Restored, in a State read before it was.
+  endpoint.Tick(272000, true);
+  command.observed_time_us = 272000;
   command.epoch = gateway.snapshot().epoch;
-  ASSERT_TRUE(gateway.Accept(command, 3, 267000));
+  ASSERT_TRUE(gateway.Accept(command, 3, 272000));
   EXPECT_EQ(backend.last_requests[0].mode, Mode::kDutyCycle);
 }
 

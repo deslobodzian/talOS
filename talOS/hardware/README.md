@@ -343,8 +343,14 @@ observations up to the last State that masked the affected motors cannot
 authorize them after recovery.
 `PollRestore()` never blocks: Phoenix reapplies only the affected device chain
 on a worker while ticks, state publication and unrelated outputs continue.
-Failed devices retry after 250 ms, doubling to 2 s. A successful restore requires
-a command observing a State after the last masked one before resuming.
+Failed devices retry after 250 ms, doubling to 2 s. The gateway masks the chain
+(`RestoredWith`, `feedback.h`, and any listed CAN sensor) in every State read
+until its restore ends, including the State of the tick in which `PollRestore`
+reports the end, since that State was read before the poll, whatever the
+backend reported for it. A restored chain therefore drives again only on a
+command observing a State read after its restore completed: at least one more
+neutral tick, without relying on the backend to report a restoring chain
+invalid.
 `Gateway::restore_attempt_count()` counts all restore starts per boot. Motors whose control send failed join the
 same unavailable set: their followers and dependents go neutral at once, the
 rest of the command keeps applying, and restore re-applies the chain's config
@@ -364,7 +370,8 @@ gap shorter than that bound does not invalidate the feedback at the gateway;
 a consumer's own, tighter age bound still applies (the drivetrain drops
 odometry samples older than 50 ms, see its [README](../../2026-robot/main_processor/drivetrain/README.md)).
 A motor or CAN sensor sample marked invalid, by the backend, the age bound
-or the gateway's mask of an unavailable device or its follower, carries zero
+or the gateway's mask of an unavailable device, its follower, or a chain whose
+restore ended in that tick (above), carries zero
 in every measured field (position, velocity, applied voltage, stator and
 supply current; `Gateway::snapshot`), never its last values; its ages,
 temperature and fault bits are the backend's. Reset detection (above)
