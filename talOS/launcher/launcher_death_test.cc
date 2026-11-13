@@ -64,6 +64,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/launcher/testdata/first_exec.h"
 
 #if defined(__linux__) && !defined(SYS_pidfd_open)
 #define SYS_pidfd_open 434  // The same number on every architecture.
@@ -126,7 +127,7 @@ std::string WriteStub(const std::string& member, bool ignore_termination) {
                            ? "//talOS/bridge:hardware_node"
                            : "//example/" + member + ":node";
   const std::string lifetime = std::to_string(kStubLifetimeS);
-  std::ofstream out{path};
+  std::ostringstream out;
   out << "#!/bin/sh\n"
       << "for arg in \"$@\"; do\n"
       << "  if [ \"$arg\" = \"--describe\" ]; then\n"
@@ -139,9 +140,7 @@ std::string WriteStub(const std::string& member, bool ignore_termination) {
       << lifetime << " &\n"
       << "echo \"" << member << " $$ $!\" >&" << kEventFd << "\n"
       << "exec sleep " << lifetime << "\n";
-  out.close();
-  ::chmod(path.c_str(), 0755);
-  return path;
+  return talos::launcher::testing::WriteWarmStub(path, out.str());
 }
 
 // Every live process whose process group is `group`, the leader included.

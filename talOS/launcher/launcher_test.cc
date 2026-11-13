@@ -36,6 +36,7 @@
 #include "talOS/launcher/file_digest.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/log_merge.h"
+#include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
 
 namespace talos::launcher {
@@ -1063,13 +1064,7 @@ std::string WriteStubNode(std::string_view name, std::string_view script) {
   const std::string dir = ::testing::TempDir() + "/talos_launcher_stubs_" +
                           std::to_string(::getpid());
   std::filesystem::create_directories(dir);
-  const std::string path = dir + "/" + std::string{name};
-  {
-    std::ofstream out{path};
-    out << script;
-  }
-  ::chmod(path.c_str(), 0755);
-  return path;
+  return testing::WriteWarmStub(dir + "/" + std::string{name}, script);
 }
 
 // The JSON a real node prints, written by the real writer: a stub that answered
@@ -1867,11 +1862,7 @@ TEST(LauncherBundleTest, LoadBundleParsesManifestAndOverrides) {
        << "language = \"cpp\"\n";
   }
 
-  {
-    std::ofstream b(bundle_dir + "/bin/alpha");
-    b << "#!/bin/sh\nexit 0\n";
-  }
-  ::chmod((bundle_dir + "/bin/alpha").c_str(), 0755);
+  testing::WriteWarmStub(bundle_dir + "/bin/alpha", "#!/bin/sh\nexit 0\n");
 
   LauncherOptions options;
   options.bundle_dir = bundle_dir;
@@ -1913,11 +1904,8 @@ TEST(LauncherBundleTest, BundledStudioResolvesThroughTheStudioKeys) {
          << "webroot = \"studio/webroot\"\n";
     }
   };
-  {
-    std::ofstream b(bundle_dir + "/studio/studio_bridge");
-    b << "#!/bin/sh\nexit 0\n";
-  }
-  ::chmod((bundle_dir + "/studio/studio_bridge").c_str(), 0755);
+  testing::WriteWarmStub(bundle_dir + "/studio/studio_bridge",
+                         "#!/bin/sh\nexit 0\n");
   const std::string bridge = bundle_dir + "/studio/studio_bridge";
 
   write_manifest(true);
@@ -2035,20 +2023,14 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
   }
 
   const std::string alpha_bin = bundle_dir + "/bin/alpha";
-  {
-    std::ofstream out{alpha_bin};
-    out << DescribingStub("alpha", "//bundle/alpha:node",
-                          {Sender("/alpha/state")});
-  }
-  ::chmod(alpha_bin.c_str(), 0755);
+  testing::WriteWarmStub(
+      alpha_bin,
+      DescribingStub("alpha", "//bundle/alpha:node", {Sender("/alpha/state")}));
 
   const std::string hw_bin = bundle_dir + "/bin/hardware_node";
-  {
-    std::ofstream out{hw_bin};
-    out << DescribingStub("hardware_node", "//talOS/bridge:hardware_node",
-                          {Watcher("/alpha/state")});
-  }
-  ::chmod(hw_bin.c_str(), 0755);
+  testing::WriteWarmStub(
+      hw_bin, DescribingStub("hardware_node", "//talOS/bridge:hardware_node",
+                             {Watcher("/alpha/state")}));
 
   {
     std::ofstream mf(bundle_dir + "/bundle_manifest.toml");
@@ -2065,11 +2047,9 @@ TEST(LauncherBundleTest, LauncherRunsFromBundleDirectoryWithDescribeOnly) {
        << "webroot = \"studio/webroot\"\n";
   }
   std::filesystem::create_directories(bundle_dir + "/studio/webroot");
-  {
-    std::ofstream out{bundle_dir + "/studio/studio_bridge"};
-    out << "#!/bin/sh\necho 'cannot load libstudio' >&2\nexit 127\n";
-  }
-  ::chmod((bundle_dir + "/studio/studio_bridge").c_str(), 0755);
+  testing::WriteWarmStub(
+      bundle_dir + "/studio/studio_bridge",
+      "#!/bin/sh\necho 'cannot load libstudio' >&2\nexit 127\n");
 
   LauncherOptions options;
   options.bundle_dir = bundle_dir;

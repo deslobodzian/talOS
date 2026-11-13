@@ -23,6 +23,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -46,6 +47,7 @@
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/spawn.h"
+#include "talOS/launcher/testdata/first_exec.h"
 
 namespace talos::launcher {
 namespace {
@@ -296,21 +298,21 @@ node = "//talOS/launcher:replay_graph_reader"
     hardware.name = "hardware_node";
     hardware.target = "//talOS/bridge:hardware_node";
     const std::string stub = record_config_ + ".hardware.sh";
-    std::ofstream{stub} << "#!/bin/sh\n"
-                        << "for arg in \"$@\"; do\n"
-                        << "  if [ \"$arg\" = \"--describe\" ]; then\n"
-                        << "    cat <<'TALOS_DESCRIBE'\n"
-                        << introspect::DescribeToJson(hardware)
-                        << "TALOS_DESCRIBE\n"
-                        << "    exit 0\n"
-                        << "  fi\n"
-                        << "done\n"
-                        // Alive until the session ends: an exited stub
-                        // restarts, and the end's SIGINT landing before the
-                        // restart's exec makes the session status nonzero.
-                        << "trap 'exit 0' INT TERM\n"
-                        << "while :; do sleep 0.05; done\n";
-    std::filesystem::permissions(stub, std::filesystem::perms::owner_all);
+    std::ostringstream script;
+    script << "#!/bin/sh\n"
+           << "for arg in \"$@\"; do\n"
+           << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+           << "    cat <<'TALOS_DESCRIBE'\n"
+           << introspect::DescribeToJson(hardware) << "TALOS_DESCRIBE\n"
+           << "    exit 0\n"
+           << "  fi\n"
+           << "done\n"
+           // Alive until the session ends: an exited stub restarts, and the
+           // end's SIGINT landing before the restart's exec makes the session
+           // status nonzero.
+           << "trap 'exit 0' INT TERM\n"
+           << "while :; do sleep 0.05; done\n";
+    talos::launcher::testing::WriteWarmStub(stub, script.str(), 0700);
   }
 
   void TearDown() override {
