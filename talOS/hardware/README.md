@@ -421,15 +421,22 @@ A send that fails with an error the socket may never recover from
 error once the RoboRIO's address changes under the connected socket; the
 bridge's rule in
 [data flow](../../docs/DATA_FLOW.md#link-rates-and-endpoints)) loses the
-socket: the loop ticks the gateway disabled again, sends nothing, and opens a
-new socket on the same ports (`Endpoint::Reopen`, keeping the frame sequence)
-on the same 100 ms cadence, at once when no attempt was made in the last
-100 ms, so a condition that breaks every new socket costs at most ten sockets
-a second. The console prints `hardware gateway socket cannot send (errno
-<n>); replacing it, nothing is sent until then` and, once replaced,
-`hardware gateway socket replaced after <n> failed attempts, <s> s after it
-could not send` (each coalesced to one line a second). Any other send error
-(`ENOBUFS`, `ECONNREFUSED`, ...) keeps the socket. A send raises no `SIGPIPE` on either end
+socket: nothing more is sent that tick, and the loop opens a new socket on
+the same ports (`Endpoint::Reopen`, keeping the frame sequence) on the same
+100 ms cadence, at once when no attempt was made in the last 100 ms, so a
+condition that breaks every new socket costs at most ten sockets a second.
+Usually the next tick replaces it and runs as any other: the replacement is
+a link gap of one tick, and the command in force keeps its usual expiry
+(the command timeout bounds it, as for any gap). Closing the old socket
+drops what was queued on it, and a later command passes the gateway's usual
+sequence, boot, epoch and age checks. A tick with no socket open (the
+attempt failed, or is not due yet) ticks the gateway disabled, all outputs
+neutral, and sends nothing, as before the first open. The console prints
+`hardware gateway socket cannot send (errno <n>); replacing it, nothing is
+sent until then` and, once replaced, `hardware gateway socket replaced after
+<n> failed attempts, <s> s after it could not send` (each coalesced to one
+line a second). Any other send error (`ENOBUFS`, `ECONNREFUSED`, ...) keeps
+the socket. A send raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
 That loop enforces the command timeout and output neutral, so it never

@@ -19,15 +19,20 @@
 // A send that fails with an error the socket may never recover from
 // (protocol::SendErrorNeedsNewSocket: a socket shut down, or its source
 // address gone from the host, which Linux reports as ENETUNREACH) loses the
-// socket: the loop ticks the gateway disabled again, sends nothing, and the
-// next attempt opens a new socket on the same ports (Endpoint::Reopen,
-// keeping the frame sequence), on the same cadence: at once if no attempt
-// was made in the last kPeriodUs, otherwise kPeriodUs after the last, so a
-// condition that also breaks every new socket costs at most ten sockets a
-// second, and a network with no route at all costs one failed open per
-// kPeriodUs, as at boot. Any other send error (ENOBUFS, ECONNREFUSED, ...)
-// clears on the same socket and keeps it; EAGAIN is not an error here
-// (kWouldBlock).
+// socket: nothing more is sent on that tick, and the next attempt opens a new
+// socket on the same ports (Endpoint::Reopen, keeping the frame sequence),
+// on the same cadence: at once if no attempt was made in the last kPeriodUs,
+// otherwise kPeriodUs after the last, so a condition that also breaks every
+// new socket costs at most ten sockets a second, and a network with no route
+// at all costs one failed open per kPeriodUs, as at boot. Usually that is
+// the next tick, which then runs as any other: a replaced socket is a link
+// gap of one tick, and the command in force keeps its usual expiry. Closing
+// the old socket drops the datagrams queued on it, and a command that
+// arrives later passes the gateway's usual checks (sequence, boot, epoch,
+// observation age). Only a tick with no socket open (an attempt failed, or
+// none is due yet) ticks the gateway disabled and sends nothing. Any other
+// send error (ENOBUFS, ECONNREFUSED, ...) clears on the same socket and
+// keeps it; EAGAIN is not an error here (kWouldBlock).
 namespace talos::rio {
 
 class SocketRetry {
