@@ -44,23 +44,33 @@ const DEMO_CHANNELS: ChannelSpec[] = [
    kind: ChannelKind.Bool, alert: AlertLevel.Warning},
   {name: 'autonomous/status/alert_info_routine_not_selected', unit: '',
    kind: ChannelKind.Bool, alert: AlertLevel.Info},
+  // The Routine card: the selected routine by name (the labels telemetry
+  // attaches from the autonomous node's `routines`) and its phase.
+  {name: 'autonomous/state/routine_index', unit: '', kind: ChannelKind.UInt,
+   labels: ['none', 'two_piece', 'four_piece_amp']},
+  {name: 'autonomous/state/phase', unit: '', kind: ChannelKind.UInt,
+   labels: ['idle', 'running', 'done']},
 ];
 
 // One demo match every 60 s at 50 Hz: 5 s disabled, 15 s autonomous, 1 s
 // disabled, 35 s teleop, 4 s disabled. The info alert holds before
 // autonomous, the warning is raised twice (autonomous and teleop) and the
-// error once for 200 ms in teleop.
+// error once for 200 ms in teleop. The routine alternates between the two
+// named ones and runs for the first 10 s of autonomous.
 const DEMO_MATCH_FRAMES = 3000n;
 function demoMatch(sequence: bigint): bigint[] {
+  const match = sequence / DEMO_MATCH_FRAMES;
   const i = Number(sequence % DEMO_MATCH_FRAMES);
   const auto = i >= 250 && i < 1000, teleop = i >= 1050 && i < 2800;
   const flag = (on: boolean) => on ? 1n : 0n;
   return [
     flag(auto || teleop), flag(auto), flag(teleop),
-    1n + sequence / DEMO_MATCH_FRAMES % 99n, 2n, 1n,
+    1n + match % 99n, 2n, 1n,
     flag(i >= 1500 && i < 1510),
     flag((i >= 400 && i < 450) || (i >= 1800 && i < 1850)),
-    flag(i < 250)
+    flag(i < 250),
+    1n + match % 2n,
+    i < 250 ? 0n : i < 750 ? 1n : 2n
   ];
 }
 

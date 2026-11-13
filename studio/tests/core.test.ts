@@ -32,7 +32,7 @@ const frame = (i: number) => {
   return decoder.decode(demoPacket(BigInt(i)))!;
 };
 
-const DEMO_CHANNEL_COUNT = 20;
+const DEMO_CHANNEL_COUNT = 22;
 
 // One keyframe value page for `dictionaryId` (a number is a double sample,
 // NaN and the infinities included; null is absent; a bigint is an integer

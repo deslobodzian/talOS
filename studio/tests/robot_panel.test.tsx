@@ -128,6 +128,29 @@ test('recent events show only the last eight', () => {
     assert.equal(html.includes(`event-${i}<`), i >= 2, `event-${i}`);
 });
 
+// REQ-OPS-38: the Routine card names the selected routine by the label of
+// <owner>/state/routine_index, and shows the index when the channel has no
+// labels or the index is out of their range.
+test('the routine card shows the routine label, else its index', () => {
+  const text = (value: number, labels: string[]|null) => {
+    const name = 'autonomous/state/routine_index';
+    return renderPanel(createStaticStudio({
+      frames: [{
+        stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+        chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+        channels: {[name]: value}, exact: {[name]: String(value)},
+        units: {[name]: ''}, labels: labels ? {[name]: labels} : {}
+      }],
+      playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+    })).replace(/<[^>]*>/g, '|');
+  };
+  const routine = (html: string) =>
+      html.slice(html.indexOf('Routine'), html.indexOf('Power')).match(/\|([^|]+)\|+selected while/)?.[1];
+  assert.equal(routine(text(1, ['none', 'two_piece', 'four_piece_amp'])), 'two_piece');
+  assert.equal(routine(text(3, ['none', 'two_piece', 'four_piece_amp'])), '3');
+  assert.equal(routine(text(2, null)), '2');
+});
+
 // REQ-OPS-37: the Alerts card lists the active alerts by level, each with its
 // level word, and the latch with each alert's activation count, including an
 // alert no longer active.

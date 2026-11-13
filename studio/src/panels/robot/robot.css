@@ -113,6 +113,21 @@
   margin-bottom: 6px;
 }
 
+.routine-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+}
+.routine-hint {
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
 /* --- Alerts --------------------------------------------------------------- */
 
 .alerts-card {
