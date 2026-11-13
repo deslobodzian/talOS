@@ -2901,6 +2901,69 @@ TEST(LauncherSessions, AnUnlockedSessionIsLockedAtItsNextRefresh) {
   std::filesystem::remove_all(root);
 }
 
+// The flock of the launch's own session.lock failing as on a root without
+// locks (ENOLCK) while the root's probe locks: a call's refusal, not the
+// root's. The launch tries again; one whose lock keeps failing (all 100
+// attempts) is refused and starts nothing, rather than running unlocked
+// on a root where retention trusts locks.
+// REQ-OPS-11
+TEST(LauncherSessions,
+     AnOwnLockThatKeepsFailingOnALockingRootRefusesTheLaunch) {
+  auto options = SessionFixture("own_lock_fails");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  const std::string lock_file =
+      root + "/1/" + std::string{kSessionDirectoryLockFile};
+  options.lock_session_directory = [lock_file](int fd, int operation) {
+    struct stat locked {};
+    struct stat named {};
+    if (::fstat(fd, &locked) == 0 && ::stat(lock_file.c_str(), &named) == 0 &&
+        locked.st_ino == named.st_ino && locked.st_dev == named.st_dev) {
+      errno = ENOLCK;
+      return -1;
+    }
+    return ::flock(fd, operation);
+  };
+  ::testing::internal::CaptureStderr();
+  const int result = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(result, 1) << stderr_text;
+  EXPECT_FALSE(std::filesystem::exists(root + "/1/manifest.json"))
+      << stderr_text;
+  EXPECT_NE(stderr_text.find(root + "/1"), std::string::npos) << stderr_text;
+  std::filesystem::remove_all(root);
+}
+
+// The same failure once, then the lock: the launch holds it.
+// REQ-OPS-11
+TEST(LauncherSessions, AnOwnLockThatFailsOnceIsTakenOnTheNextAttempt) {
+  const std::string root = TempPath("own_lock_fails_once");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path dir = root + "/1";
+  int refusals = 0;
+  const FlockFunction lock = [&refusals](int fd, int operation) {
+    if ((operation & LOCK_EX) != 0 && refusals == 0) {
+      ++refusals;
+      errno = ENOLCK;
+      return -1;
+    }
+    return ::flock(fd, operation);
+  };
+  std::error_code error;
+  auto session = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& path, std::error_code& made) {
+        std::filesystem::create_directories(path, made);
+      },
+      error, lock);
+  ASSERT_TRUE(session.has_value()) << error.message();
+  EXPECT_EQ(refusals, 1);
+  EXPECT_TRUE(session->held());
+  EXPECT_TRUE(SessionDirectoryLock::Held(dir, /*root_takes_no_locks=*/false));
+  session.reset();
+  std::filesystem::remove_all(root);
+}
+
 // A flock failing as on a filesystem without advisory locks (ENOLCK: an NFS
 // lock daemon that stops answering) on a log root whose locks work says
 // nothing about whether a launch holds that session: retention passes the
