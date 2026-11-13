@@ -43,6 +43,8 @@ namespace fs = std::filesystem;
 namespace {
 using studio::EgressBudget;
 struct Client {
+  // A programmer client's own bucket. A drive client is charged to its
+  // slot's (studio::DriveSlots::Budget), which outlives the connection.
   EgressBudget budget;
   // A driver dashboard client (/drive), sent drive_feed; otherwise a
   // programmer client (/telemetry), sent feeds.
@@ -244,9 +246,11 @@ struct Bridge {
   // later one with a message of the same size.
   bool affordable(Socket* client, std::size_t framed_bytes, std::int64_t now) {
     Client* data = client->getUserData();
+    EgressBudget* budget = budget_of(client);
+    // An evicted drive client holds no slot and is sent nothing more.
+    if (budget == nullptr) return false;
     std::int64_t wait_ns = 0;
-    if (!egress.Affordable(data->budget, data->drive, framed_bytes, now,
-                           wait_ns)) {
+    if (!egress.Affordable(*budget, data->drive, framed_bytes, now, wait_ns)) {
       schedule.Deferred(now, wait_ns);
       return false;
     }
@@ -257,15 +261,23 @@ struct Bridge {
     return true;
   }
 
+  // The bucket a client's sends are charged to: a programmer client's own,
+  // a drive client's slot's; nullptr for a drive client holding no slot.
+  EgressBudget* budget_of(Socket* client) {
+    Client* data = client->getUserData();
+    return data->drive ? drive_clients.Budget(client) : &data->budget;
+  }
+
   // Sends one message the caller found affordable and charges it.
   bool send_now(Socket* client, std::string_view bytes, uWS::OpCode opcode) {
+    EgressBudget* budget = budget_of(client);
+    if (budget == nullptr) return false;
     if (client->send(bytes, opcode) == Socket::DROPPED) {
       ++ws_drops;
       return false;
     }
     const auto size = EgressBudget::framed(bytes.size());
-    Client* data = client->getUserData();
-    egress.Spend(data->budget, data->drive, size);
+    egress.Spend(*budget, client->getUserData()->drive, size);
     egress_bytes += size;
     return true;
   }
@@ -844,7 +856,9 @@ int main(int argc, char** argv) try {
   drive_behavior.open = [&](auto* ws) {
     if (!bridge.layout) return;  // the upgrade refuses /drive without one
     ws->getUserData()->drive_feed.Configure(bridge.layout->update_hz);
-    if (const auto oldest = bridge.drive_clients.Admit(ws)) {
+    // It takes the bucket of the slot it fills, so a reconnect never
+    // starts from a fresh burst (studio::DriveSlots).
+    if (const auto oldest = bridge.drive_clients.Admit(ws).evicted) {
       ++bridge.evicted;
       (*oldest)->end(studio::kDriveEvictedCloseCode,
                      studio::kDriveEvictedReason);
