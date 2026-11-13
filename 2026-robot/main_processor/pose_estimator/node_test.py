@@ -651,8 +651,9 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.counts(), (1, 0))
                 self.assertAlmostEqual(self.pose()[2], chassis.yaw, places=4)
 
-    def test_odometry_tracks_a_straight_line_then_an_arc(self):
-        # Runs disabled: the estimator owns no actuators and estimates
+    # REQ-CONTRACT-26
+    def test_publishes_from_a_live_input(self):
+        # Odometry along a straight line, then an arc. Runs disabled: the estimator owns no actuators and estimates
         # (and accepts vision) regardless of enable.
         for backend in BACKENDS:
             with self.subTest(backend):
@@ -777,7 +778,9 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual(self.pose(), (0.0, 0.0, 0.0))
 
     # REQ-CONTRACT-26
-    def test_stale_drivetrain_input_is_invalid_and_holds_the_pose(self):
+    def test_stale_input_clears_validity(self):
+        # The drivetrain input goes stale: /pose_estimator/state keeps
+        # publishing, invalid, with the pose held.
         for backend in BACKENDS:
             with self.subTest(backend):
                 chassis = self.start(backend)
@@ -888,16 +891,22 @@ class EstimatorTest(unittest.TestCase):
         sim.add(Reader, "pose_estimator")
         self.assertEqual(seen, list(modules))
 
-    def test_bad_config_fails_at_startup(self):
+    # REQ-CONTRACT-18
+    def test_bad_parameter_fails_construction(self):
+        """Each row: the key the error must name, and the config."""
         cases = [
             ("backend", robot_toml("particle_filter")),
+            ("backend", robot_toml("kalman").replace(
+                'backend = "kalman"', "")),
             ("max_observation_age_us",
              robot_toml("kalman", max_observation_age_us=2_000_000)),
-            ("three modules", robot_toml("kalman", modules=MODULES[:3])),
-            ("non-finite module",
+            ("geometry", robot_toml("kalman", modules=MODULES[:3])),
+            ("geometry.modules[0]",
              robot_toml("kalman", modules=(("nan", 0.3),) + MODULES[1:])),
             ("cameras", robot_toml("kalman").replace(
                 'cameras = ["front_camera", "back_camera"]', "cameras = [1]")),
+            ("cameras", robot_toml("kalman").replace(
+                'cameras = ["front_camera", "back_camera"]', "")),
             ("kalman.state_std_x_m",
              robot_toml("kalman", extra="kalman.state_std_x_m = 0.0")),
             ("factor_graph.odometry_std_yaw_rad",
@@ -912,13 +921,14 @@ class EstimatorTest(unittest.TestCase):
                     "field_length_m", "field_width_m", "max_innovation_m"):
             cases.append((key, robot_toml("kalman", extra=f"{key} = nan")))
         for value in ("0.0", "-0.1", "nan", "inf"):
-            cases.append((f"max_yaw_innovation_rad = {value}", robot_toml(
+            cases.append(("max_yaw_innovation_rad", robot_toml(
                 "kalman", extra=f"max_yaw_innovation_rad = {value}")))
         for key, toml in cases:
-            with self.subTest(key):
+            with self.subTest(key=key, config=toml):
                 sim = Sim.from_toml(toml)
-                with self.assertRaises(Exception):
+                with self.assertRaises(Exception) as raised:
                     sim.add(estimator.PoseEstimator, "pose_estimator")
+                self.assertIn(key, str(raised.exception))
 
 
 class BinaryTest(unittest.TestCase):
