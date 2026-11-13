@@ -327,21 +327,23 @@ class Session {
       while (::waitpid(launcher_, nullptr, 0) < 0 && errno == EINTR) {
       }
     }
-    // Once seen to exit, a pid may already name another process, so only
-    // the snapshot's processes the watch still sees running are killed, and
-    // only the groups whose leader is one of them. A group never
-    // snapshotted is left to its guardian, which kills it when the launcher
-    // is gone.
-    if (!gone_) {
-      const std::vector<pid_t> running = watch_.AwaitAll(Clock::now());
-      const auto alive = [&running](pid_t pid) {
-        return std::find(running.begin(), running.end(), pid) != running.end();
-      };
-      for (const auto& [member, group] : groups_) {
-        if (alive(group)) ::kill(-group, SIGKILL);
-      }
-      for (const pid_t pid : running) ::kill(pid, SIGKILL);
+    // Every group a member reported is killed here by the test's own
+    // bookkeeping, snapshotted or not: the guardians are what the case
+    // tests, so a broken one must not leak its group's sleeps past a failed
+    // case. Once seen to exit, a pid may already name another process, so
+    // only processes a watch still sees running are killed, and only the
+    // groups one of them is in: a group with a running member keeps its id.
+    std::vector<pid_t> running = started_.AwaitAll(Clock::now());
+    const std::vector<pid_t> snapshot = watch_.AwaitAll(Clock::now());
+    running.insert(running.end(), snapshot.begin(), snapshot.end());
+    const auto alive = [&running](pid_t pid) {
+      return std::find(running.begin(), running.end(), pid) != running.end();
+    };
+    for (const auto& [member, pids] : reported_) {
+      if (alive(pids.first) || alive(pids.second))
+        ::kill(-groups_[member], SIGKILL);
     }
+    for (const pid_t pid : running) ::kill(pid, SIGKILL);
     if (events_ >= 0) ::close(events_);
     std::filesystem::remove_all(output_dir_);
     // The launcher prepared the registry in this test's namespace, and a
@@ -438,6 +440,10 @@ class Session {
         if (line >> member >> pid >> grandchild) {
           groups_[member] = pid;
           reported_[member] = {pid, grandchild};
+          // Both run until something kills them (the stub's sleeps), so
+          // these are their pids still: watched now, for teardown.
+          started_.Add(pid);
+          started_.Add(grandchild);
         }
       }
     }
@@ -495,9 +501,6 @@ class Session {
     return watch_.AwaitAll(deadline);
   }
 
-  // Every snapshot process has been seen to exit: teardown signals none.
-  void Gone() { gone_ = true; }
-
   std::string Log() const { return ReadFile(log_); }
   std::size_t SnapshotSize() const { return snapshot_.size(); }
 
@@ -507,7 +510,6 @@ class Session {
   std::string log_;
   pid_t launcher_{-1};
   bool launcher_reaped_{false};
-  bool gone_{false};
   int events_{-1};
   std::map<std::string, pid_t> groups_;
   std::map<std::string, std::pair<pid_t, pid_t>> reported_;
@@ -516,6 +518,9 @@ class Session {
   // Watches every snapshot process; teardown signals only what it still
   // sees running.
   ExitWatch watch_;
+  // Watches every reported member and grandchild from its report on, for
+  // teardown alone.
+  ExitWatch started_;
 };
 
 // SIGKILLs the launcher once every member runs, then waits for every member
@@ -543,7 +548,6 @@ void ExpectGroupsDieWithTheLauncher(bool ignore_termination) {
       << session.Describe(survivors) << "\nlauncher output:\n"
       << session.Log();
   if (!survivors.empty()) return;
-  session.Gone();
   std::cout << "[launcher_death] " << session.SnapshotSize() << " processes in "
             << kMembers.size() << " groups exited " << elapsed_us
             << " us after the launcher's SIGKILL\n";
