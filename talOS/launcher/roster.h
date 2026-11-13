@@ -36,6 +36,11 @@ struct NodeSpec {
   std::vector<std::string> extra_args;
   bool critical{true};
   bool owns_actuators{false};
+  // The launcher's own Studio bridge, which DiscoverNodes adds under
+  // --start-studio-bridge: an observer (StudioBridge), never a subsystem.
+  // Set nowhere else, so a robot's subsystem named kStudioBridgeName is an
+  // ordinary node.
+  bool studio_bridge{false};
 };
 
 struct LauncherOptions {
@@ -188,8 +193,10 @@ NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
                       const LauncherOptions& options);
 
 // The roster: the hardware bridge, the subsystems, the sim gateway under
-// --sim-gateway, and the Studio bridge under --start-studio-bridge unless
-// BundleWithoutStudio(options).
+// --sim-gateway, and the Studio bridge (NodeSpec::studio_bridge) under
+// --start-studio-bridge unless BundleWithoutStudio(options). A subsystem
+// may share a name with a member the launcher adds; Launcher::Run refuses
+// such a roster.
 std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
                                     const LauncherOptions& options);
 

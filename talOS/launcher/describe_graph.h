@@ -114,8 +114,8 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // members make one finding (MissingBinariesFinding) instead of one "did not
 // answer" per node: before a build that is every node, and the cure is one
 // command. A binary that exists but does not answer keeps its own finding.
-// Studio's bridge (kStudioBridgeName), an observer, is in neither: a probe
-// of it that did not answer, its binary missing or not, is one warning
+// Studio's bridge (NodeSpec::studio_bridge), an observer, is in neither: a
+// probe of it that did not answer, its binary missing or not, is one warning
 // (StudioBridgeFinding), never an error, and Run leaves it out of the
 // session (DropUnansweredStudioBridge).
 std::vector<naming::Diagnostic> DescribeGraph(

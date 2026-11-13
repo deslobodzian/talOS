@@ -210,31 +210,22 @@ TEST(LauncherTest, StudioBridgeNeedsOnlyTheFlag) {
 }
 
 TEST(LauncherTest, StudioBridgeWatchTopicFollowsDescribe) {
-  // No description: the config's studio topic, else the default.
+  // A description without a watcher: the config's studio topic, else the
+  // default.
   config::RobotConfig robot;
-  EXPECT_EQ(StudioBridgeWatchTopic({}, robot), "/talos/telemetry");
-  robot.studio.topic = "/config/telemetry";
-  EXPECT_EQ(StudioBridgeWatchTopic({}, robot), "/config/telemetry");
-
-  // The bridge's own WATCHER wins, tracking a topic override.
   NodeDescription bridge;
   bridge.roster_name = "studio_bridge";
   bridge.answered = true;
   bridge.declared.name = "studio_bridge";
+  EXPECT_EQ(StudioBridgeWatchTopic(bridge, robot), "/talos/telemetry");
+  robot.studio.topic = "/config/telemetry";
+  EXPECT_EQ(StudioBridgeWatchTopic(bridge, robot), "/config/telemetry");
+
+  // The bridge's own WATCHER wins, tracking a topic override.
   introspect::naming::SourceShape watcher{event::SourceKind::WATCHER,
                                           "/custom/telemetry", 48, 0};
   bridge.declared.sources.push_back(watcher);
-  EXPECT_EQ(StudioBridgeWatchTopic({bridge}, robot), "/custom/telemetry");
-
-  // Other nodes never steer the bridge's subscription.
-  NodeDescription alpha;
-  alpha.roster_name = "alpha";
-  alpha.answered = true;
-  alpha.declared.name = "alpha";
-  introspect::naming::SourceShape sender{event::SourceKind::SENDER,
-                                         "/alpha/state", 48, 0};
-  alpha.declared.sources.push_back(sender);
-  EXPECT_EQ(StudioBridgeWatchTopic({alpha}, robot), "/config/telemetry");
+  EXPECT_EQ(StudioBridgeWatchTopic(bridge, robot), "/custom/telemetry");
 }
 
 // METHODOLOGY §6 for parameters: a numeric key without a unit suffix is
@@ -2962,6 +2953,45 @@ TEST(LauncherSessions, AOneOffLockFailureLeavesARunningSession) {
       << "retention removed or changed running session " << dir(2) << "\n"
       << stderr_text;
   second->reset();
+  std::filesystem::remove_all(root);
+}
+
+// `studio_bridge` is a valid subsystem name. A robot's own subsystem of
+// that name is an ordinary node: critical, its failed probe is an error that
+// refuses the launch, not the Studio bridge's warning that leaves it out of
+// the session. With --start-studio-bridge, the launcher's bridge would be a
+// second roster member of that name: the launch is refused naming the key.
+// REQ-OPS-30, REQ-OPS-01
+TEST(LauncherSessions, ASubsystemNamedStudioBridgeIsAnOrdinaryNode) {
+  auto options = SessionFixture("user_studio_bridge");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::ofstream{options.config_path}
+      << kFixtureToml
+      << "\n[subsystems.studio_bridge]\nnode = \"//example/studio:node\"\n"
+         "period_us = 5000\n";
+  options.binary_overrides["//example/studio:node"] =
+      WriteStubNode("user_studio_bridge_node", kStubWithoutDescribe);
+  options.describe_only = true;
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  const std::string refused = ::testing::internal::GetCapturedStderr();
+  const std::string graph = ReadFile(root + "/1/graph.json");
+  const auto errors = GraphErrors(graph);
+  EXPECT_TRUE(std::any_of(errors.begin(), errors.end(),
+                          [](const std::string& line) {
+                            return line.find("studio_bridge") !=
+                                   std::string::npos;
+                          }))
+      << graph << refused;
+
+  options.session_id = 2;
+  options.start_studio_bridge = true;
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  const std::string twice = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(twice.find("[subsystems.studio_bridge]"), std::string::npos)
+      << twice;
   std::filesystem::remove_all(root);
 }
 

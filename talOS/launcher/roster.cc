@@ -212,8 +212,10 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   // deployed robot is viewable too (an observer: see StudioBridge). A bundle
   // without Studio has none; probing a binary it lacks would fail the graph.
   if (options.start_studio_bridge && !BundleWithoutStudio(options)) {
-    specs.push_back(
-        MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge, options));
+    NodeSpec bridge =
+        MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge, options);
+    bridge.studio_bridge = true;
+    specs.push_back(std::move(bridge));
   }
   return specs;
 }

@@ -25,7 +25,7 @@ bool ShouldRetryStudioBridge(
 bool DropUnansweredStudioBridge(std::vector<NodeSpec>& specs,
                                 std::vector<NodeDescription>& described) {
   for (std::size_t i = 0; i < specs.size() && i < described.size(); ++i) {
-    if (specs[i].name != kStudioBridgeName || described[i].answered) continue;
+    if (!specs[i].studio_bridge || described[i].answered) continue;
     specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(i));
     described.erase(described.begin() + static_cast<std::ptrdiff_t>(i));
     return true;
@@ -33,16 +33,13 @@ bool DropUnansweredStudioBridge(std::vector<NodeSpec>& specs,
   return false;
 }
 
-std::string StudioBridgeWatchTopic(
-    const std::vector<NodeDescription>& described,
-    const config::RobotConfig& robot_config) {
+std::string StudioBridgeWatchTopic(const NodeDescription& bridge,
+                                   const config::RobotConfig& robot_config) {
   std::string topic = robot_config.studio.topic;
-  for (const auto& node : described) {
-    if (!node.answered || node.declared.name != kStudioBridgeName) continue;
-    for (const auto& source : node.declared.sources) {
-      if (source.kind == event::SourceKind::WATCHER && !source.name.empty()) {
-        topic = source.name;
-      }
+  if (!bridge.answered) return topic;
+  for (const auto& source : bridge.declared.sources) {
+    if (source.kind == event::SourceKind::WATCHER && !source.name.empty()) {
+      topic = source.name;
     }
   }
   return topic;
@@ -60,7 +57,7 @@ StudioBridge::StudioBridge(std::size_t index, const NodeSpec& spec,
       output_{output},
       http_port_{EffectiveStudioHttpPort(robot_config, options)},
       args_{spec.binary_path,
-            StudioBridgeWatchTopic(described, robot_config),
+            StudioBridgeWatchTopic(described[index], robot_config),
             std::to_string(http_port_),
             EffectiveStudioWebroot(robot_config, options),
             "--config",
