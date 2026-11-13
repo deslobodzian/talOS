@@ -59,6 +59,16 @@ class PrepushTest(unittest.TestCase):
             '[ "$1" = "${STUB_FAIL:-}" ] && { echo "stub: $1 failed"; exit 1; }\n'
             "exit 0\n",
             0o755)
+        # The network-namespace probe: STUB_NETNS=no refuses it.
+        put(os.path.join(bin_dir, "unshare"),
+            '#!/bin/sh\n[ "${STUB_NETNS:-yes}" = yes ]\n', 0o755)
+        # pnpm: records each run; STUB_PNPM_INSTALL=fail fails an install.
+        self.pnpm_log = os.path.join(self.tmp, "pnpm_calls")
+        put(os.path.join(bin_dir, "pnpm"),
+            f'#!/bin/sh\necho "$*" >> {shlex.quote(self.pnpm_log)}\n'
+            '[ "$1" = install ] && [ "${STUB_PNPM_INSTALL:-}" = fail ] && exit 1\n'
+            "exit 0\n",
+            0o755)
 
         self.env = {k: v for k, v in os.environ.items()
                     if not k.startswith("GIT_")}
@@ -171,6 +181,33 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertIn("prepush: host-includes ok", out)
 
+
+    # REQ-DEV-25
+    def test_tests_require_network_namespaces_where_the_host_allows(self):
+        # CI's Linux job allows them and sets TALOS_REQUIRE_NETNS=1, so
+        # udp_address_change_test fails rather than skips there.
+        require = "--test_env=TALOS_REQUIRE_NETNS=1"
+        for netns, required in (("yes", True), ("no", False)):
+            if os.path.exists(self.log):
+                os.remove(self.log)
+            status, out, calls = self.prepush(STUB_NETNS=netns)
+            self.assertEqual(status, 0, out)
+            test = [args for _, _, args in calls if args.startswith("test")]
+            self.assertEqual(len(test), 1, out)
+            self.assertEqual(require in test[0].split(), required, out)
+
+    # REQ-DEV-25
+    def test_studio_does_not_use_modules_installed_for_another_lockfile(self):
+        put(os.path.join(self.repo, "studio", "node_modules", "m"), "\n")
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+        self.commit("studio/pnpm-lock.yaml", "lockfile")
+        status, out, _ = self.prepush("--skip-gradle",
+                                      STUB_PNPM_INSTALL="fail")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: studio SKIPPED", out)
+        with open(self.pnpm_log, encoding="utf-8") as f:
+            self.assertEqual([line.split()[0] for line in f], ["install"])
 
     # REQ-DEV-25
     def test_gradle_runs_for_any_source_the_roborio_program_compiles(self):
