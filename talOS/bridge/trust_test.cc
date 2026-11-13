@@ -143,6 +143,8 @@ TEST(HardwareNodeTrustTest, LatestRequestNeutralizesOmittedOutputs) {
   node.Tick(1001000);
   EXPECT_TRUE(node.current_command().digital_outputs[0].value);
   EXPECT_DOUBLE_EQ(node.current_command().pwm_outputs[0].output, 0.7);
+  // Driven before it is omitted, so the neutral below is the omission's.
+  EXPECT_EQ(node.current_command().motors[1].mode, Mode::kVoltage);
   request.count = 0;
   request.digital_output_count = 0;
   request.pwm_output_count = 0;
