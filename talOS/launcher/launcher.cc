@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <system_error>
 #include <utility>
 
@@ -77,6 +79,42 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
     const std::string_view prefix{hardware::kRequestTopicPrefix};
     if (name.starts_with(prefix)) name.erase(0, prefix.size());
     counts.requests_skipped.emplace_back(std::move(name), dropped);
+  }
+  return counts;
+}
+
+// What a reaped run's row says it lost as the run ended. A run that exits
+// takes a last sample and then releases its row, which keeps that sample
+// until the next claim (NodeRegistration::release); a killed run leaves its
+// row as its last sample left it. The supervision pass reads rows only
+// while the session runs (WatchRun), so this read, once per reaped run, is
+// what carries the counts a run gained while the session stopped (TODO.md
+// RT-7). Of the rows still carrying the run's pid and session, the newest
+// heartbeat is the run's own (a pid reused within the session can leave an
+// earlier run's row behind); a row claimed again during the read is passed
+// over. Loads from the mapped segment only: no lock, no disk.
+std::optional<DeliveryCounts> FinalDeliveryCounts(
+    const introspect::RegistryMapping& registry, pid_t pid,
+    uint64_t session_id) {
+  const auto claiming = static_cast<uint64_t>(introspect::SlotState::CLAIMING);
+  std::optional<DeliveryCounts> counts;
+  int64_t newest = 0;
+  for (const auto& record : registry.header()->nodes) {
+    const auto generation = record.generation.load(std::memory_order_acquire);
+    if (record.state.load(std::memory_order_acquire) == claiming ||
+        record.pid != static_cast<uint64_t>(pid) ||
+        record.session_id != session_id)
+      continue;
+    const auto beat =
+        record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+    if (counts && beat <= newest) continue;
+    DeliveryCounts read = DeliveryCountsOf(record);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (record.generation.load(std::memory_order_relaxed) != generation ||
+        record.state.load(std::memory_order_relaxed) == claiming)
+      continue;
+    counts = std::move(read);
+    newest = beat;
   }
   return counts;
 }
@@ -1196,6 +1234,12 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       int status = 0;
       if (::waitpid(proc.pid, &status, WNOHANG) != proc.pid) continue;
       FinishProcessGroup(proc.pid);
+      // The run's counts as it ended, before EndRun closes the run.
+      if (registry) {
+        if (const auto loss =
+                FinalDeliveryCounts(*registry, proc.pid, options_.session_id))
+          proc.RecordDeliveryLoss(*loss);
+      }
       proc.exited = true;
       proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
       proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;

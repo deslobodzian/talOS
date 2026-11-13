@@ -1028,10 +1028,11 @@ class NodeRegistration {
     if (record_ != nullptr) {
       // Only free what is still ours: the slot may have been swept and
       // reclaimed after this owner went quiet (see sweep_stale), and freeing
-      // it then would yank the new owner's row out from under it.
+      // it then would yank the new owner's row out from under it. The row
+      // keeps its last sample, sources included, until the next claim clears
+      // it: the launcher reads a reaped run's final delivery loss there
+      // (DeliveryLossOf; TODO.md RT-7).
       if (owns_slot()) {
-        record_->source_count.store(0, std::memory_order_relaxed);
-        record_->selection_count.store(0, std::memory_order_relaxed);
         record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
                              std::memory_order_release);
       }

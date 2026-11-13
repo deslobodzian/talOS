@@ -530,7 +530,8 @@ hold and touches no disk. The times it sleeps until:
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
 | the session lock's hourly refresh | [one session per namespace](#one-session-per-namespace) |
 
-Everything else a pass does follows an event or another pass: reaping exits,
+Everything else a pass does follows an event or another pass: reaping exits
+(with one more read of the run's row for its final delivery counts),
 sending the stop, retrying a registry attach (at the next look), and handing
 the manifest writer a version. A member's look interval bounds how late a
 stall is seen: a run whose dispatch count stops at time S is killed by S plus
@@ -682,9 +683,12 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   and `requests_skipped`: what the run's registry row last showed it lost
   ([wake loss](../introspection/README.md#wake-loss),
   `introspect::DeliveryLossOf`), each normally 0. The launcher reads them
-  in the supervision pass that already reads the row for liveness, so a
-  run's values are the last that pass saw before it ended or the session
-  stopped. The node's fields sum every run, dropped ones included, and
+  in the supervision pass that already reads the row for liveness, and
+  once more when it reaps the run: from the row the run released as it
+  exited, which keeps its last sample until the next claim, or the row a
+  killed run left. So a run's values are its last sample, increases while
+  the session stopped included (the pass stops reading rows for liveness
+  then). The node's fields sum every run, dropped ones included, and
   `requests_skipped_by_subsystem` splits the bridge's `requests_skipped` by
   the subsystem whose `/hw/request/<subsystem>` it passed over (only
   nonzero ones). A run, or a node, whose row was never seen (a spawn that
