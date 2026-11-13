@@ -968,7 +968,14 @@ the lock rather than being refused, and retention there removes sessions as
 it did before launches locked them. Such a launch tries the lock again at
 each hourly refresh, and once it takes it (the lock and the probe failed in
 one lock-daemon hiccup, and the daemon answers again) says so once on stderr
-and is passed over by retention from then on. Whether a log root takes no locks is
+and is passed over by retention from then on. Until that refresh it is not:
+once the daemon answers again, a retention from another namespace whose
+probe now locks can take the unheld lock and remove the running session, a
+window of up to one refresh period (an hour). The retry is a `flock` on the
+supervision thread, against a lock service that has just failed: on a
+network filesystem (a hard-mounted NFS root) that call can block through its
+RPC retries, and with it supervision and the service watchdog's ping, so the
+log root should be on a local disk. Whether a log root takes no locks is
 decided once by retention, and once by the session directory's creation,
 by a shared lock of the root's `.talos-lock-probe` file, never by one
 failing call: on a root whose probe locked, a session whose `session.lock`
