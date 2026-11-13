@@ -361,6 +361,7 @@ class SessionDirectoryLock {
     kRetaken,  // It did not; the file it names now is locked instead.
     kLost,     // It did not, and the file it names cannot be locked now.
     kNone,     // No lock is held (a filesystem without advisory locks).
+    kTaken,    // None was held; the file the path names is locked now.
   };
 
   // Keeps the held lock file from looking unused, so a cleaner of old /tmp
@@ -379,17 +380,25 @@ class SessionDirectoryLock {
   // either this takes it first (kRetaken: every later retention finds it
   // held) or a retention holds it and is moving the directory away, or has
   // (kLost). A later refresh tries again.
-  Refreshed Refresh() {
-    if (fd_ < 0) return Refreshed::kNone;
+  //
+  // One that holds no lock (Create found its flock and the root's probe both
+  // failing as FlockUnsupported) tries the same lock at every refresh: the
+  // failure may have been one lock-daemon hiccup on a root whose locks work,
+  // and unlocked, a retention whose probe locks once the daemon answers
+  // again would take and remove the running session. kTaken once it locks;
+  // kNone while it cannot (a root that takes no locks).
+  Refreshed Refresh(const FlockFunction& lock = ::flock) {
+    if (fd_ < 0) {
+      const int fd = TakeCurrent(lock);
+      if (fd < 0) return Refreshed::kNone;
+      fd_ = fd;
+      introspect::TouchLockFile(fd_);
+      return Refreshed::kTaken;
+    }
     introspect::TouchLockFile(fd_);
     if (introspect::LockFileIsCurrent(fd_, path_)) return Refreshed::kHeld;
-    const int fd = introspect::OpenLockFile(path_, O_RDONLY);
+    const int fd = TakeCurrent(lock);
     if (fd < 0) return Refreshed::kLost;
-    if (::flock(fd, LOCK_EX | LOCK_NB) != 0 ||
-        !introspect::LockFileIsCurrent(fd, path_)) {
-      ::close(fd);
-      return Refreshed::kLost;
-    }
     // The old lock is on a file nobody can open by its path any more.
     ::close(std::exchange(fd_, fd));
     return Refreshed::kRetaken;
@@ -421,6 +430,19 @@ class SessionDirectoryLock {
  private:
   SessionDirectoryLock(int fd, std::string path)
       : fd_{fd}, path_{std::move(path)} {}
+
+  // The file path_ names, opened (created when absent, never its directory)
+  // and exclusively locked; -1 when it cannot be.
+  int TakeCurrent(const FlockFunction& lock) const {
+    const int fd = introspect::OpenLockFile(path_, O_RDONLY);
+    if (fd < 0) return -1;
+    if (lock(fd, LOCK_EX | LOCK_NB) != 0 ||
+        !introspect::LockFileIsCurrent(fd, path_)) {
+      ::close(fd);
+      return -1;
+    }
+    return fd;
+  }
 
   int fd_{-1};
   std::string path_;

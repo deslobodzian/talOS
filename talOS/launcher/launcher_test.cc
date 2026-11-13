@@ -2862,6 +2862,45 @@ TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
   std::filesystem::remove_all(root);
 }
 
+// One lock-daemon hiccup that fails both the session's flock and the root's
+// probe leaves the launch running unlocked (as on a root without locks). Its
+// next refresh, the daemon answering again, takes the lock, so retention in
+// another namespace, whose probe now locks, finds the session held and
+// passes it over instead of locking the unheld file and removing it.
+// REQ-OPS-11
+TEST(LauncherSessions, AnUnlockedSessionIsLockedAtItsNextRefresh) {
+  const std::string root = TempPath("lock_recovers");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path dir = root + "/1";
+  bool answering = false;
+  const FlockFunction lock = [&answering](int fd, int operation) {
+    if (answering) return ::flock(fd, operation);
+    errno = ENOLCK;
+    return -1;
+  };
+  std::error_code error;
+  auto session = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& path, std::error_code& made) {
+        std::filesystem::create_directories(path, made);
+      },
+      error, lock);
+  ASSERT_TRUE(session.has_value()) << error.message();
+  ASSERT_FALSE(session->held());
+  EXPECT_EQ(session->Refresh(lock), SessionDirectoryLock::Refreshed::kNone);
+  answering = true;
+  EXPECT_EQ(session->Refresh(lock), SessionDirectoryLock::Refreshed::kTaken);
+  EXPECT_TRUE(session->held());
+  EXPECT_TRUE(SessionDirectoryLock::Held(dir, /*root_takes_no_locks=*/false));
+  bool held = false;
+  EXPECT_FALSE(SessionDirectoryLock::TakeIdle(
+                   dir, /*root_takes_no_locks=*/false, held, error)
+                   .has_value());
+  EXPECT_TRUE(held) << error.message();
+  session.reset();
+  std::filesystem::remove_all(root);
+}
+
 // A flock failing as on a filesystem without advisory locks (ENOLCK: an NFS
 // lock daemon that stops answering) on a log root whose locks work says
 // nothing about whether a launch holds that session: retention passes the

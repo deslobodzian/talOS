@@ -946,7 +946,10 @@ is protected only from launches in its own namespace. So is one whose log
 root's filesystem takes no advisory locks (NFS without a lock daemon,
 macOS's msdos and exFAT volumes): its launch warns once and runs without
 the lock rather than being refused, and retention there removes sessions as
-it did before launches locked them. Whether a log root takes no locks is
+it did before launches locked them. Such a launch tries the lock again at
+each hourly refresh, and once it takes it (the lock and the probe failed in
+one lock-daemon hiccup, and the daemon answers again) says so once on stderr
+and is passed over by retention from then on. Whether a log root takes no locks is
 decided once by retention, and once by the session directory's creation,
 by a shared lock of the root's `.talos-lock-probe` file, never by one
 failing call: on a root whose probe locked, a session whose `session.lock`

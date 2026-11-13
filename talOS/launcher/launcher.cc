@@ -1262,9 +1262,16 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       }
       using Refreshed = SessionDirectoryLock::Refreshed;
       const Refreshed directory =
-          session_directory_ ? session_directory_->Refresh() : Refreshed::kHeld;
-      if (directory == Refreshed::kRetaken &&
-          !directory_lock_retaken_reported) {
+          session_directory_
+              ? session_directory_->Refresh(options_.lock_session_directory)
+              : Refreshed::kHeld;
+      if (directory == Refreshed::kTaken) {
+        // Once: a lock taken stays held.
+        std::cerr << "[launcher] locked " << session_directory_->path()
+                  << ", which could not be locked when the session started; "
+                     "retention passes over this session from now on\n";
+      } else if (directory == Refreshed::kRetaken &&
+                 !directory_lock_retaken_reported) {
         directory_lock_retaken_reported = true;
         std::cerr << "[launcher] " << session_directory_->path()
                   << " was removed while this session held it; locked it "
