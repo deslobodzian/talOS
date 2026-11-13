@@ -111,6 +111,10 @@ struct LauncherOptions {
           [](const std::filesystem::path& path, std::error_code& error) {
             std::filesystem::create_directories(path, error);
           }};
+  // Internal start-up seam: called on the launcher's thread once the
+  // session's topic segments exist, before the first manifest and any spawn.
+  // Empty in production.
+  std::function<void()> session_segments_created;
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime. Only with `simulation`:

@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -132,13 +133,31 @@ std::vector<naming::SourceShape> SessionTopics(
   return topics;
 }
 
+// Waits up to `wait` for `stop_fd` to read ready, and says whether it did:
+// a stop was requested. Without one (-1) it only waits.
+bool StopWithin(int stop_fd, std::chrono::milliseconds wait) {
+  if (stop_fd < 0) {
+    if (wait.count() > 0) std::this_thread::sleep_for(wait);
+    return false;
+  }
+  ::pollfd stop{stop_fd, POLLIN, 0};
+  // EINTR ends the wait early, which every caller's loop absorbs.
+  return ::poll(&stop, 1, static_cast<int>(wait.count())) > 0 &&
+         (stop.revents & POLLIN) != 0;
+}
+
 }  // namespace
 
 bool ProbeDescribe(const std::vector<std::string>& args,
                    std::chrono::milliseconds timeout,
                    introspect::Description& out, std::string& error,
-                   int injected_spawn_failures) {
+                   int injected_spawn_failures, int stop_fd) {
   error.clear();
+  const std::string stopped_error = "the launch was stopped";
+  if (StopWithin(stop_fd, std::chrono::milliseconds{0})) {
+    error = stopped_error;
+    return false;
+  }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   int answer = -1;
   pid_t pid = -1;
@@ -167,12 +186,16 @@ bool ProbeDescribe(const std::vector<std::string>& args,
                std::to_string(timeout.count()) + "ms)";
       return false;
     }
-    std::this_thread::sleep_for(backoff);
+    if (StopWithin(stop_fd, backoff)) {
+      error = stopped_error;
+      return false;
+    }
     backoff = std::min(backoff * 2, kProbeSpawnRetryMax);
   }
 
   std::string text;
   bool timed_out = false;
+  bool stopped = false;
   constexpr std::size_t kMaxDescribeBytes = std::size_t{4} * 1024 * 1024;
   for (;;) {
     const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -181,8 +204,11 @@ bool ProbeDescribe(const std::vector<std::string>& args,
       timed_out = true;
       break;
     }
-    ::pollfd waiting{answer, POLLIN, 0};
-    const int ready = ::poll(&waiting, 1, static_cast<int>(left.count()));
+    // A negative stop_fd is ignored.
+    std::array<::pollfd, 2> waiting{
+        {{answer, POLLIN, 0}, {stop_fd, POLLIN, 0}}};
+    const int ready =
+        ::poll(waiting.data(), waiting.size(), static_cast<int>(left.count()));
     if (ready < 0) {
       if (errno == EINTR) continue;
       error = std::string{"poll() failed: "} + std::strerror(errno);
@@ -190,6 +216,10 @@ bool ProbeDescribe(const std::vector<std::string>& args,
     }
     if (ready == 0) {
       timed_out = true;
+      break;
+    }
+    if ((waiting[1].revents & POLLIN) != 0) {
+      stopped = true;
       break;
     }
     char buffer[4096];
@@ -209,7 +239,7 @@ bool ProbeDescribe(const std::vector<std::string>& args,
   ::close(answer);
 
   int status = 0;
-  if (!timed_out && error.empty()) {
+  if (!timed_out && !stopped && error.empty()) {
     for (;;) {
       const pid_t result = ::waitpid(pid, &status, WNOHANG);
       if (result == pid) break;
@@ -222,16 +252,23 @@ bool ProbeDescribe(const std::vector<std::string>& args,
         timed_out = true;
         break;
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+      if (StopWithin(stop_fd, std::chrono::milliseconds{1})) {
+        stopped = true;
+        break;
+      }
     }
   }
-  if (timed_out || !error.empty()) {
+  if (timed_out || stopped || !error.empty()) {
     SignalProcessGroup(pid, SIGKILL);
     while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
     }
   }
   FinishProcessGroup(pid);
 
+  if (stopped) {
+    error = stopped_error;
+    return false;
+  }
   if (timed_out) {
     error = "no answer within " + std::to_string(timeout.count()) +
             "ms; the probe was killed";
@@ -419,7 +456,7 @@ std::vector<naming::Diagnostic> DescribeGraph(
     std::vector<NodeDescription>& out,
     const naming::TargetSources& target_sources,
     const naming::TargetModeSources& target_mode_sources,
-    bool require_target_coverage) {
+    bool require_target_coverage, int stop_fd) {
   out.clear();
   out.reserve(specs.size());
 
@@ -439,8 +476,8 @@ std::vector<naming::Diagnostic> DescribeGraph(
       described.answered = ProbeDescribe(
           args, std::chrono::milliseconds{options.describe_timeout_ms},
           described.declared, described.error,
-          injected == options.probe_spawn_failures.end() ? 0
-                                                         : injected->second);
+          injected == options.probe_spawn_failures.end() ? 0 : injected->second,
+          stop_fd);
     } catch (const std::exception& e) {
       described.answered = false;
       described.error = e.what();
@@ -467,7 +504,9 @@ std::vector<naming::Diagnostic> DescribeGraph(
         return node.answered && node.declared.reads_graph;
       });
 
-  if (any_reader) {
+  // A stop leaves the readers undescribed rather than writing a graph of
+  // the probes it cut short.
+  if (any_reader && !StopWithin(stop_fd, std::chrono::milliseconds{0})) {
     introspect::DeclaredGraph graph;
     for (const auto& described : out) {
       if (described.answered && !described.declared.reads_graph) {

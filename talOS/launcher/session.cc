@@ -241,6 +241,8 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
   ss << "  \"start_wall_ns\": " << start_wall_ns << ",\n";
   ss << "  \"end_wall_ns\": " << end_wall_ns << ",\n";
+  ss << "  \"stopped_before_start\": "
+     << (stopped_before_start ? "true" : "false") << ",\n";
   ss << "  \"nodes\": [\n";
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& n = nodes[i];

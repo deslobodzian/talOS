@@ -20,6 +20,7 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/launcher/log_budget.h"
+#include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -392,6 +393,20 @@ int Launcher::RunSession() {
   // node on recorded topics, without shared memory (RunOnRecordedInputs).
   const bool starts_roster =
       !options_.describe_only && options_.replay_inputs.empty();
+  // Before the first thing such a launch creates that outlives it (the
+  // session lock, its session directory, the probes, the topic segments,
+  // the manifest): from here a stop request is an orderly stop at whatever
+  // step it finds the launch (stopped_before_start below).
+  if (starts_roster) InstallSignals();
+  // The launch stops before its roster starts: only what a launch that
+  // recorded nothing holds exists yet (README "Session segments and logs"),
+  // and the stop's exit status is 0, as for any requested stop.
+  const auto stopped_before_start = [&] {
+    if (!starts_roster || !process::stop_requested.load()) return false;
+    std::cout << "[launcher] stop requested before the session started; "
+                 "nothing was started\n";
+    return true;
+  };
   session_lock_ = nullptr;
   std::optional<SessionLock> session_lock;
   // The lock file is absent and the log root's full filesystem has no room
@@ -571,14 +586,17 @@ int Launcher::RunSession() {
   std::vector<NodeDescription> described;
   std::vector<naming::Diagnostic> diagnostics;
   try {
-    diagnostics = DescribeGraph(node_specs, options_, described,
-                                TargetSourcesOf(robot_config),
-                                TargetModeSourcesOf(robot_config),
-                                robot_config.require_target_coverage);
+    diagnostics = DescribeGraph(
+        node_specs, options_, described, TargetSourcesOf(robot_config),
+        TargetModeSourcesOf(robot_config), robot_config.require_target_coverage,
+        starts_roster ? process::StopFd() : -1);
   } catch (const std::exception& e) {
     std::cerr << "launcher: " << e.what() << "\n";
     return 1;
   }
+  // A stop kills the probes it finds running (ProbeDescribe), so their
+  // descriptions are not the roster's: nothing is linted or recorded.
+  if (stopped_before_start()) return 0;
   for (auto& finding : LintParameterUnits(robot_config)) {
     diagnostics.push_back(std::move(finding));
   }
@@ -616,6 +634,7 @@ int Launcher::RunSession() {
     std::cout << "[launcher] describe-only: nothing was started\n";
     return 0;
   }
+  if (stopped_before_start()) return 0;
 
   // Phase two. The session's topics exist before any node does, and until
   // the session ends.
@@ -628,6 +647,7 @@ int Launcher::RunSession() {
   }
   std::cout << "[launcher] Created " << segments.size()
             << " session-owned topic segments\n";
+  if (options_.session_segments_created) options_.session_segments_created();
 
   SessionManifest manifest;
   manifest.session_id = options_.session_id;
@@ -686,8 +706,6 @@ int Launcher::RunSession() {
   PersistManifest(procs, /*durable=*/true);
   manifest_writer_->Start();
 
-  InstallSignals();
-
   // The deadline starts with the session, so a bridge that never comes up
   // cannot push the session's end out.
   const auto deadline = options_.duration_s > 0
@@ -703,9 +721,19 @@ int Launcher::RunSession() {
   std::cout << "[launcher] Controller " << remote << ":" << remote_port
             << " (local port " << local_port << ")\n";
 
+  // From the segments on, a stop ends the session through supervision and
+  // the final manifest, as any stop does: a member it finds not yet started
+  // is never started, and has no run.
   std::vector<NodeLaunch> launches(procs.size());
+  const auto stop_skips_start = [&] {
+    if (!process::stop_requested.load()) return false;
+    manifest.stopped_before_start = true;
+    session_manifest_.stopped_before_start = true;
+    return true;
+  };
   for (std::size_t i = 0; i < procs.size(); ++i) {
     if (studio && i == studio->index()) continue;
+    if (stop_skips_start()) break;
     auto& proc = procs[i];
     PrepareLaunch(node_specs[i], described[i], proc, robot_config,
                   log_split.shares[i], log_split.window, launches[i]);
@@ -723,7 +751,8 @@ int Launcher::RunSession() {
     std::cout << "[launcher] Started " << proc.name << " (pid " << pid
               << ", target " << proc.target << ")\n";
   }
-  if (studio) studio->Start(procs[studio->index()], options_.supervision_clock);
+  if (studio && !stop_skips_start())
+    studio->Start(procs[studio->index()], options_.supervision_clock);
   PersistManifest(procs);
 
   Supervise(procs, launches, studio, deadline);
@@ -738,14 +767,15 @@ int Launcher::RunSession() {
   }
 
   // Whose last exit leaves the status alone: a run the stop's own signal
-  // ended, and the Studio bridge however it ended (an observer, REQ-OPS-30:
+  // ended, the Studio bridge however it ended (an observer, REQ-OPS-30:
   // killed while still starting, crashed, or stopped), which the manifest
-  // records all the same.
+  // records all the same, and a member the stop left unstarted (no run).
   std::vector<bool> exit_not_counted;
   exit_not_counted.reserve(launches.size());
   for (std::size_t i = 0; i < launches.size(); ++i) {
     exit_not_counted.push_back(launches[i].stopped_by_session ||
-                               (studio && i == studio->index()));
+                               (studio && i == studio->index()) ||
+                               procs[i].runs.empty());
   }
   int exit_status = SummarizeLogs(procs, exit_not_counted);
   if (endpoints_refused_) exit_status = 1;
@@ -920,12 +950,17 @@ std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
 }
 
 void Launcher::InstallSignals() {
-  stop_requested_ = 0;
+  // The stop pipe exists before a stop can arrive, and a stop an earlier
+  // session of this process took is cleared, its byte read out.
+  process::StopFd();
+  process::stop_requested.store(false);
+  process::ConsumeStopWake();
   struct sigaction stop {};
-  // The flag first: the wake it writes makes the sleeping supervision loop
-  // run a pass, which reads the flag (SupervisionWakeup).
-  stop.sa_handler = [](int) {
-    stop_requested_ = 1;
+  // The flag and the stop pipe first (process::RequestStop): the wake
+  // written next makes the sleeping supervision loop run a pass, which reads
+  // the flag (SupervisionWakeup); a probe waits on the pipe (ProbeDescribe).
+  stop.sa_handler = [](int received) {
+    process::RequestStop(received);
     SupervisionWakeup::Wake();
   };
   sigemptyset(&stop.sa_mask);
@@ -1259,13 +1294,14 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     notifier.Send("WATCHDOG=1");
     const auto now = options_.supervision_clock();
     const bool past_deadline = now >= deadline;
-    const bool stopping = stop_requested_ != 0 || stop_sent || past_deadline;
+    const bool stopping =
+        process::stop_requested.load() || stop_sent || past_deadline;
     // A stop signal can land after `stopping` was sampled: systemctl stop
     // signals the launcher and then every node, so a node killed by it can
     // be reaped in this pass. Restart decisions read the flag again, so
     // once shutdown starts nothing is restarted.
     const auto stop_arrived = [&] {
-      return stopping || stop_requested_ != 0 || endpoints_refused_;
+      return stopping || process::stop_requested.load() || endpoints_refused_;
     };
     // A pass posts at most one manifest version, after its restarts (see
     // the post below).
@@ -1426,13 +1462,13 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
 
     if (all_done) {
       if (studio) {
-        studio->Finish(procs[studio->index()], stop_requested_ != 0);
+        studio->Finish(procs[studio->index()], process::stop_requested.load());
       }
       return;
     }
 
-    if (!stop_sent &&
-        (stop_requested_ != 0 || past_deadline || endpoints_refused_)) {
+    if (!stop_sent && (process::stop_requested.load() || past_deadline ||
+                       endpoints_refused_)) {
       stop_sent = true;
       shutdown_deadline = now + kStopTimeout;
       std::cout << "[launcher] Stopping children...\n";

@@ -47,13 +47,18 @@ struct NodeDescription {
 // Every other spawn failure is reported at once.
 // `injected_spawn_failures` is a test seam: the first that many attempts fail
 // as the guardian fork does under EAGAIN, without spawning.
+//
+// `stop_fd`, when not -1, reads ready once the launch is asked to stop
+// (process::StopFd()): the probe is then not spawned, or not retried, or is
+// killed with its process group and reaped at once rather than at its
+// deadline, and `error` says the launch was stopped.
 inline constexpr std::chrono::milliseconds kProbeSpawnRetryFirst{5};
 inline constexpr std::chrono::milliseconds kProbeSpawnRetryMax{200};
 
 bool ProbeDescribe(const std::vector<std::string>& args,
                    std::chrono::milliseconds timeout,
                    introspect::Description& out, std::string& error,
-                   int injected_spawn_failures = 0);
+                   int injected_spawn_failures = 0, int stop_fd = -1);
 
 // Every subsystem's target sources, for the lane checks in LintGraph.
 naming::TargetSources TargetSourcesOf(const config::RobotConfig& robot_config);
@@ -118,12 +123,16 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // probe of it that did not answer, its binary missing or not, is one warning
 // (StudioBridgeFinding), never an error, and Run leaves it out of the
 // session (DropUnansweredStudioBridge).
+//
+// `stop_fd` is ProbeDescribe's: once it reads ready, every running probe is
+// killed and none is started, so the result describes no roster and the
+// caller must not act on it.
 std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
     const naming::TargetSources& target_sources = {},
     const naming::TargetModeSources& target_mode_sources = {},
-    bool require_target_coverage = false);
+    bool require_target_coverage = false, int stop_fd = -1);
 
 // The one finding for roster members whose binary is missing, or nullopt when
 // none is. Its subject lists their names. Outside a bundle its message ends

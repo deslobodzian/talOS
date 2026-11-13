@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstddef>
@@ -743,7 +744,14 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
       const uint64_t until = passes.Started() + count;
       return wait([&] { return passes.Started() >= until; });
     };
-    if (!wait([&] { return std::filesystem::exists(trapped); })) return;
+    // beta, spawned after alpha, must have started too: a stop never starts
+    // a member it finds unstarted.
+    if (!wait([&] {
+          return std::filesystem::exists(trapped) &&
+                 runs_of(ReadFile(live), "beta")
+                         .find("\"reason\": \"running\"") != std::string::npos;
+        }))
+      return;
     // The stop's pass reads exactly `stopped_at`.
     const SupervisionTime stopped_at = clock.Freeze();
     ::kill(::getpid(), SIGTERM);
@@ -3381,6 +3389,142 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   EXPECT_NE(manifest.find("\n  \"end_wall_ns\": 0"), std::string::npos);
   EXPECT_NE(manifest.find("\"name\": \"alpha\""), std::string::npos);
   std::filesystem::remove_all(options.output_dir);
+}
+
+// Launcher::Run in a child of the test process, which starts with SIGINT at
+// its default action as a launcher process does: a stop the launcher does not
+// handle then ends the child by the signal, not the test.
+pid_t ForkLauncher(const LauncherOptions& options) {
+  const pid_t child = ::fork();
+  if (child == 0) {
+    ::signal(SIGINT, SIG_DFL);
+    ::_exit(Launcher{options}.Run());
+  }
+  return child;
+}
+
+// Whether the segment of `topic` is still in this test's namespace; unlinks
+// it when it is, so a failing case leaves nothing behind.
+bool SegmentLeft(const std::string& topic) {
+  const std::string name = ShmObjectName(topic);
+  const int fd = ::shm_open(name.c_str(), O_RDONLY, 0);
+  if (fd < 0) return false;
+  ::close(fd);
+  ::shm_unlink(name.c_str());
+  return true;
+}
+
+// A stub that answers --describe with `sources` and whose every run appends
+// `node` to `record`.
+std::string DescribeThenRecord(
+    std::string_view node, std::string_view target,
+    const std::vector<introspect::naming::SourceShape>& sources,
+    const std::string& record) {
+  std::string stub = DescribingStub(node, target, sources);
+  const std::string_view ending = "exit 0\n";
+  stub.resize(stub.size() - ending.size());
+  return stub + "echo " + std::string{node} + " >> '" + record + "'\nexit 0\n";
+}
+
+// A stop (SIGINT, as Ctrl-C sends it) that arrives once the launcher has
+// created the session's topic segments and before it has spawned a member
+// ends the session in order: no member is spawned, the segments are
+// unlinked, the manifest records the session's end and that the stop came
+// before every member started, and the launcher exits 0 as for any requested
+// stop. The SIGINT is raised on the launcher's thread at the seam, so it is
+// handled before the seam returns. Seen on the Mac mini (2026-11-13, SIGINT
+// 0.3 s after starting the 2026 simulation): the stop handlers were installed
+// only after the manifest, and the signal's default action ended the
+// launcher there, its manifest unended and its segments left behind.
+// REQ-OPS-03, REQ-OPS-06
+TEST(LauncherSessions, AStopOnceSegmentsExistEndsTheSessionBeforeAnySpawn) {
+  const std::string tag = "stop_after_segments";
+  auto options = SessionFixture(tag);
+  std::filesystem::remove_all(options.output_dir);
+  const std::string record = TempPath(tag + "_runs");
+  ::remove(record.c_str());
+  // Only bounds a launch that missed the stop.
+  options.duration_s = static_cast<int>(kHang.count());
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      DescribeThenRecord("hardware_node", "//talOS/bridge:hardware_node", {},
+                         record));
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      tag + "_alpha", DescribeThenRecord("alpha", "//example/alpha:node",
+                                         {Sender("/alpha/state")}, record));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta", DescribeThenRecord("beta", "//example/beta:node",
+                                        {Watcher("/alpha/state")}, record));
+  options.session_segments_created = [] { ::raise(SIGINT); };
+  const pid_t launcher = ForkLauncher(options);
+  ASSERT_GE(launcher, 0);
+  int status = 0;
+  ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
+  const bool left = SegmentLeft("/alpha/state");
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "the launcher ended with " << ExitReason(status);
+  EXPECT_EQ(ReadFile(record), "") << "members spawned after the stop";
+  EXPECT_FALSE(left) << "the session's /alpha/state segment was not unlinked";
+  const std::string manifest =
+      ReadFile(options.output_dir + "/1/manifest.json");
+  ASSERT_FALSE(manifest.empty()) << "no manifest.json";
+  EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
+      << manifest;
+  EXPECT_NE(manifest.find("\n  \"stopped_before_start\": true,"),
+            std::string::npos)
+      << manifest;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(record.c_str());
+}
+
+// A stop that arrives while the roster is being described ends the launch
+// without waiting for a probe that has not answered: the probe is killed
+// rather than given the rest of its describe deadline, nothing of a session
+// is written after it (no graph.json, no manifest), and the launcher exits 0.
+// REQ-OPS-06
+TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
+  const std::string tag = "stop_while_probing";
+  auto options = SessionFixture(tag);
+  std::filesystem::remove_all(options.output_dir);
+  // The deadline a stop must not wait out.
+  const std::chrono::milliseconds describe_deadline{kHang};
+  options.describe_timeout_ms = static_cast<int>(describe_deadline.count());
+  const std::string probe = TempPath(tag + "_probe_pid");
+  ::remove(probe.c_str());
+  // exec keeps the pid it wrote: the probe the launcher must kill.
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      tag + "_alpha", "#!/bin/sh\necho $$ > '" + probe + ".tmp' && mv '" +
+                          probe + ".tmp' '" + probe + "'\nexec sleep 60\n");
+  const pid_t launcher = ForkLauncher(options);
+  ASSERT_GE(launcher, 0);
+  pid_t probe_pid = 0;
+  for (const auto give_up = std::chrono::steady_clock::now() + kHang;
+       probe_pid <= 0 && std::chrono::steady_clock::now() < give_up;
+       std::this_thread::sleep_for(std::chrono::milliseconds{2})) {
+    const std::string text = ReadFile(probe);
+    pid_t read = 0;
+    if (std::from_chars(text.data(), text.data() + text.size(), read).ec ==
+        std::errc{})
+      probe_pid = read;
+  }
+  const auto stopped_at = std::chrono::steady_clock::now();
+  ::kill(launcher, SIGINT);
+  int status = 0;
+  ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
+  const auto stopping = std::chrono::steady_clock::now() - stopped_at;
+  ASSERT_GT(probe_pid, 0) << "alpha's probe never started";
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "the launcher ended with " << ExitReason(status);
+  EXPECT_LT(stopping, describe_deadline)
+      << "the stop waited for the probe's describe deadline";
+  errno = 0;
+  EXPECT_TRUE(::kill(probe_pid, 0) != 0 && errno == ESRCH)
+      << "alpha's probe (pid " << probe_pid << ") outlived the launcher";
+  const std::string session = options.output_dir + "/1";
+  EXPECT_FALSE(std::filesystem::exists(session + "/graph.json"));
+  EXPECT_FALSE(std::filesystem::exists(session + "/manifest.json"));
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(probe.c_str());
 }
 
 TEST(LauncherRemoteTest, SimulationRefusesPhysicalEffectiveRemote) {

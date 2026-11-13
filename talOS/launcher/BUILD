@@ -202,6 +202,7 @@ cc_library(
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
+        "//talOS/process",
         "//talOS/rtms",
         "@tomlplusplus//:toml++",
     ],

@@ -36,6 +36,21 @@ as nodes start, restart or exit, report a stopped event log, or run endpoints
 that differ from their probe's ([live endpoints](#live-endpoints)); normal
 shutdown adds final log counts.
 
+A launch that starts the roster handles a stop (SIGINT, SIGTERM, or a
+[hangup](#node-output)) in order from its first step, before it takes the
+[session lock](#one-session-per-namespace), so a stop at any point leaves
+nothing behind that a normal end would not. Before phase one ends, the stop
+kills every probe still running, with its process group, at once rather
+than at its describe deadline, and starts no other; the launch then writes
+no `graph.json`, manifest or segment and exits 0, its session directory a
+launch that recorded nothing ([session segments and logs](#session-segments-and-logs)).
+Once phase two has created the session's topic segments, a stop starts no
+member that has not started yet (the manifest's `stopped_before_start`),
+stops those that have as every stop does ([restarts](#restarts)), writes
+the final manifest and unlinks the segments. `--describe-only` and
+`--replay-inputs` keep the default action: a stop ends the launcher at
+once, and each probe's or the replayed node's guardian kills its group.
+
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
 
@@ -468,7 +483,8 @@ shows it in the exit column and marks the node *killed by signal*.
 When the session ends, the launcher exits with 0, or with the last nonzero
 `exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
 refused [live endpoints](#live-endpoints). The [Studio bridge](#studio-bridge)
-never counts, however it ended. A member whose last run ended by
+never counts, however it ended, nor does a member a stop left unstarted
+([two phases](#two-phases)). A member whose last run ended by
 the stop's own signal does not count: one that was not yet handling a stop
 (between its exec and `process::InstallStopHandlers()`, a C++ node's first
 lines or a Python node's whole interpreter start) when the stop's SIGINT
@@ -770,6 +786,9 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   version the launcher posts anyway, at the latest the one the run's end
   posts, so a healthy session adds no version, and a killed launcher loses
   only the increases after a count's first.
+- `stopped_before_start`: a stop request arrived before every member had
+  started ([two phases](#two-phases)); the members without `runs` were
+  never started.
 - `launcher_log`: the launcher's own `talos.log` ([node output](#node-output)).
   A member's output log is not listed: it is always
   `<output_dir>/<session_id>/<name>.log`, and the launcher's end-of-session
@@ -1054,7 +1073,8 @@ starts its nodes (`graph.json`, `declared_graph.json`, `talos.log`,
 `.tmp` of an interrupted write, and the empty `.tlog` a node leaves when it dies between
 its log writer creating the file and writing the header), is a launch that
 recorded nothing:
-`--describe-only`, a refused graph, or a launch that failed or died early. It
+`--describe-only`, a refused graph, a launch stopped while it described its
+roster, or a launch that failed or died early. It
 never counts against `log_keep_sessions` or the byte budget, and it is removed
 once another session directory is newer: one newer than every other (a
 `--describe-only` result just written, or a launch still describing) survives
