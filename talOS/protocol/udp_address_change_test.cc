@@ -24,8 +24,10 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #endif
 
 namespace talos::protocol {
@@ -209,7 +211,15 @@ TEST(UdpAddressChangeTest, ASocketWhoseSourceAddressLeftIsReplaced) {
   }
   ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
       << "the scenario's child died: status " << status;
-  if (text.starts_with("skip: ")) GTEST_SKIP() << text;
+  if (text.starts_with("skip: ")) {
+    // CI's Linux job sets this after allowing unprivileged user namespaces,
+    // so a host that still refuses them fails instead of passing unproven.
+    const char* require = std::getenv("TALOS_REQUIRE_NETNS");
+    if (require != nullptr && std::string_view{require} == "1") {
+      FAIL() << "TALOS_REQUIRE_NETNS=1, but " << text;
+    }
+    GTEST_SKIP() << text;
+  }
   EXPECT_EQ(text, "ok");
 #endif
 }
