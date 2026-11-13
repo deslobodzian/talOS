@@ -33,7 +33,8 @@ the site has no `index.html`. The 2026 robot, the bench rig and
 |---|---|
 | `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set and, in a bundle that carries Studio, `--start-studio-bridge` unless given `--no-studio` (which it does not pass on); a `--config`/`--output-dir` argument replaces the default |
 | `launcher` | `//talOS/launcher` |
-| `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, `libtalos_node.so` and its own copy of the interpreter) |
+| `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
+| `python/` | with a Python node: the Python runtime (interpreter and standard library) every Python node runs, one directory per runtime repository however many nodes carry it |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | `robot_field.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
@@ -44,13 +45,20 @@ disk or remote cache with each symlink in it replaced by a copy of its
 target, so a bundle with one would run differently when built than when
 restored. A link Bazel declares in a node's runfiles (a py_binary venv's
 `bin/python3`) is staged as a two-line script that execs the bundled
-interpreter at its own path, where it finds its standard library.
+interpreter at its own path in `python/`, where it finds its standard
+library; the process stays the one the launcher started. The runtime's
+repository is left out of each node's runfiles and staged once under
+`python/`, and the interpreter's other names there (`python`, `python3.11`,
+which Bazel's runfiles hold as copies of it) are such scripts too, so the
+bundle holds the interpreter once, however many Python nodes it carries. The
+build fails when two nodes carry different files under one runtime's name.
 
 The launcher copies `config_sha256`, `git_revision` and `git_dirty` into every
 session manifest, and records each member's binary SHA-256 again when the
 session starts ([session manifest](../talOS/launcher/README.md#session-manifest)).
 A digest covers only the file under `bin/`: not a C++ node's shared libraries
-in `lib/`, nor a Python node's runfiles beside its entry script. The bundle's
+in `lib/`, nor a Python node's runfiles beside its entry script or the
+runtime in `python/`. The bundle's
 revision covers those.
 
 The config SHA-256 is
@@ -218,7 +226,7 @@ recovery and what is synced to disk when, see [session segments and logs](../tal
 macOS charges the first exec, and first load, of every newly written
 executable file about 100 ms, one file at a time host-wide; the charge is per
 file and paid only by running or loading it, not by reading it. A fresh
-install of the 2026 bundle is about 7,800 new files, and its first launch
+install of the 2026 bundle is about 5,500 new files, and its first launch
 would pay that inside the launcher's per-probe `--describe` deadline
 ([below](#supervision-and-service-recovery)), every probe at once: with
 other new executables being written on the Mac mini, `pose_estimator` (the

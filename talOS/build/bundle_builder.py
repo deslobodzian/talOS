@@ -2,6 +2,7 @@
 """Assembles a relocatable Talos bundle directory."""
 
 import argparse
+import filecmp
 import hashlib
 import json
 import os
@@ -50,9 +51,36 @@ def safe_copy(src, dest):
     make_writable(dest)
 
 
-def stage_link(name, rf_dir, rf_rel, link, bundle_root):
-    """Stages the runfile `rf_rel`, a link Bazel declared to `link` (relative
-    to the link's directory in the runfiles tree), without a symlink.
+# Where a bundle holds the Python runtimes its nodes share, by repository.
+RUNTIME_DIR = "python"
+
+
+def write_exec_script(dest, target, note):
+    """Writes `dest` as a script that execs `target` (a path in the bundle)
+    by its path relative to `dest`, so the bundle runs wherever it is
+    installed. The exec keeps the pid, and the target runs as its own file:
+    an interpreter finds its library from where it is."""
+    rel = os.path.relpath(target, os.path.dirname(dest))
+    if os.path.lexists(dest):
+        make_writable(dest)
+        os.remove(dest)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n"
+                f"# {note}\n"
+                f'exec "$(dirname "$0")"/{shlex.quote(rel)} "$@"\n')
+    make_executable(dest)
+
+
+def link_target(rf_rel, link):
+    """The runfile a link at `rf_rel` to `link` (relative to the link's
+    directory in the runfiles tree) names, as a runfiles-relative path."""
+    return os.path.normpath(os.path.join(os.path.dirname(rf_rel), link))
+
+
+def stage_link(name, dest, rf_rel, link, target, bundle_root):
+    """Stages the runfile `rf_rel` at `dest`, a link Bazel declared to `link`
+    whose target the bundle holds at `target`, without a symlink.
 
     Bazel may restore a tree artifact from its cache with every symlink in
     it replaced by a copy of its target, so the bundle holds none and runs
@@ -61,20 +89,61 @@ def stage_link(name, rf_dir, rf_rel, link, bundle_root):
     its own location, so a copy of it elsewhere would not run (a py_binary
     venv's bin/python3; the node's stage-2 bootstrap then adds the venv's
     site-packages itself). Any other file is staged as a copy."""
-    dest = os.path.join(rf_dir, rf_rel)
-    target = os.path.normpath(os.path.join(os.path.dirname(dest), link))
     if not (target.startswith(bundle_root) and os.path.isfile(target)):
         sys.exit(f"bundle: node '{name}': runfile {rf_rel} links to {link}, "
                  "which the bundle does not hold")
     if not os.access(target, os.X_OK):
         safe_copy(target, dest)
         return
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with open(dest, "w", encoding="utf-8") as f:
-        f.write("#!/bin/sh\n"
-                f"# {rf_rel} -> {link}, kept out of the bundle as a link.\n"
-                f'exec "$(dirname "$0")"/{shlex.quote(link)} "$@"\n')
-    make_executable(dest)
+    write_exec_script(dest, target,
+                      f"{rf_rel} -> {link}, kept out of the bundle as a link.")
+
+
+def runtime_repositories(files, links):
+    """The repositories of a Python node's runfiles that hold its
+    interpreter: those a declared link (a venv's bin/python3) names an
+    executable in. `files` maps each staged runfile to its source; `links`
+    lists (runfile, link) pairs."""
+    repos = set()
+    for rf_rel, link in links:
+        target = link_target(rf_rel, link)
+        repo = target.split(os.sep, 1)[0]
+        if (repo not in ("_main", os.pardir) and target in files
+                and os.access(files[target], os.X_OK)):
+            repos.add(repo)
+    return repos
+
+
+def stage_runtime_file(name, src, rf_rel, dest, staged_runtimes):
+    """Stages a runtime's file at `dest` in the bundle's one runtime
+    directory, once for every node that carries it. Exits when an earlier
+    node carried different bytes there: one directory cannot serve both."""
+    repo = rf_rel.split(os.sep, 1)[0]
+    first = staged_runtimes.setdefault(repo, name)
+    if os.path.exists(dest):
+        if not filecmp.cmp(src, dest, shallow=False):
+            sys.exit(f"bundle: nodes '{first}' and '{name}' carry different "
+                     f"Python runtimes named {repo} ({rf_rel} differs)")
+        return
+    safe_copy(src, dest)
+
+
+def alias_interpreter_copies(interpreter):
+    """Restages every other executable file of `interpreter`'s directory
+    with its exact bytes (rules_python's runfiles copy it as python,
+    python3 and python3.11) as a script that execs it, so the bundle holds
+    the interpreter once."""
+    size = os.path.getsize(interpreter)
+    bin_dir = os.path.dirname(interpreter)
+    for entry in sorted(os.listdir(bin_dir)):
+        path = os.path.join(bin_dir, entry)
+        if (path != interpreter and os.path.isfile(path)
+                and os.access(path, os.X_OK)
+                and os.path.getsize(path) == size
+                and filecmp.cmp(path, interpreter, shallow=False)):
+            write_exec_script(path, interpreter,
+                              f"{entry}: the interpreter, held once as "
+                              f"{os.path.basename(interpreter)}.")
 
 
 def node_targets(node):
@@ -230,6 +299,10 @@ def main():
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
     staged_libs = {}
+    # python/: each Python runtime repository, with the first node that
+    # carried it, and the interpreters venv links exec there.
+    staged_runtimes = {}
+    interpreters = set()
     bundle_root = out_dir + os.sep
     for node in spec.get("nodes", []):
         name = node["name"]
@@ -244,12 +317,16 @@ def main():
         # exist is a symlink Bazel declared unresolved, such as a py_binary
         # venv's bin/python3. Its target is relative to the runfiles tree, so
         # it is staged after the files (stage_link), and must name one of
-        # them.
+        # them. The repository holding the interpreter such a link names is
+        # staged once for every node, under python/ (the interpreter and its
+        # library are most of a bundle's bytes); the link's script execs it
+        # there, and the interpreter finds its library beside it as before.
         rf_entries = node.get("runfiles", [])
         if rf_entries:
             rf_dir = os.path.join(bin_dir, f"{name}.runfiles")
             os.makedirs(rf_dir, exist_ok=True)
             repo_mapping_src = None
+            files = {}
             links = []
             for rf in rf_entries:
                 rf_src = rf["src_path"]
@@ -260,11 +337,28 @@ def main():
                 if not os.path.exists(rf_src):
                     sys.exit(f"bundle: node '{name}': runfile {rf_rel} is "
                              f"missing: {rf_src}")
+                files[os.path.normpath(rf_rel)] = rf_src
+            runtimes = runtime_repositories(files, links)
+
+            def staged_at(rf_rel):
+                if rf_rel.split(os.sep, 1)[0] in runtimes:
+                    return os.path.join(out_dir, RUNTIME_DIR, rf_rel)
+                return os.path.join(rf_dir, rf_rel)
+
+            for rf_rel, rf_src in files.items():
+                if rf_rel.split(os.sep, 1)[0] in runtimes:
+                    stage_runtime_file(name, rf_src, rf_rel, staged_at(rf_rel),
+                                       staged_runtimes)
+                    continue
                 safe_copy(rf_src, os.path.join(rf_dir, rf_rel))
                 if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
                     repo_mapping_src = rf_src
             for rf_rel, link in links:
-                stage_link(name, rf_dir, rf_rel, link, bundle_root)
+                target = link_target(rf_rel, link)
+                stage_link(name, os.path.join(rf_dir, rf_rel), rf_rel, link,
+                           staged_at(target), bundle_root)
+                if target.split(os.sep, 1)[0] in runtimes:
+                    interpreters.add(staged_at(target))
 
             if repo_mapping_src:
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))
@@ -289,6 +383,9 @@ def main():
             "binary_sha256": binary_sha256,
             "language": lang,
         })
+
+    for interpreter in sorted(interpreters):
+        alias_interpreter_copies(interpreter)
 
     # 5. Studio: the bridge binary and the built site it serves, which the
     # launcher's LoadBundle registers for --start-studio-bridge.

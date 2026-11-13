@@ -14,8 +14,9 @@ ProgramArguments), which must run its bridge from the install, found through
 the manifest's [studio] table, beside the index page of the webroot that
 table names; one that does not is asked for Studio with
 --start-studio-bridge and must describe without a bridge rather than fail on
-its absence. Install's warm-up is checked on a bundle of stubs that record
-each run.
+its absence. Every Python node's venv runs the one interpreter its bundle
+holds. Install's warm-up is checked on a bundle of stubs that record each
+run.
 
 On macOS each newly written executable's first exec costs about 100 ms, and
 seconds under parallel load (TODO.md MAC-2), and every installed stub is a
@@ -23,6 +24,7 @@ new file. So a stub runs under the default 60 s bound, except in the one
 case that waits out a short bound: there every member has already run once
 from its installed path, so only the stub that never exits can reach it."""
 
+import filecmp
 import json
 import os
 import plistlib
@@ -152,6 +154,51 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],
                                  manifest["config_sha256"])
+
+    # REQ-OPS-48
+    def test_every_python_node_runs_the_one_interpreter_the_bundle_holds(self):
+        # The interpreter is most of a bundle's bytes, which a deploy copies
+        # to the robot: one copy per Python node, and per name rules_python
+        # gives it, made the 2026 bundle 749 MB.
+        r = runfiles.Create()
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}
+        for name in BUNDLES:
+            with self.subTest(name):
+                src = r.Rlocation(f"_main/{name}")
+                with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
+                    manifest = tomllib.load(f)
+                ran = set()
+                for node in manifest["nodes"]:
+                    if node["language"] != "python":
+                        continue
+                    venvs = [
+                        os.path.join(parent, "python3")
+                        for parent, _, files in os.walk(os.path.join(
+                            src, node["binary"] + ".runfiles"))
+                        if parent.endswith(".venv/bin") and "python3" in files]
+                    self.assertTrue(venvs, node["name"])
+                    for venv in venvs:
+                        proc = subprocess.run(
+                            [venv, "-I", "-S", "-c",
+                             "import os, sys; "
+                             "print(os.path.realpath(sys.executable))"],
+                            capture_output=True, text=True, env=env,
+                            timeout=60)
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        ran.add(proc.stdout.strip())
+                if not ran:
+                    continue
+                self.assertEqual(len(ran), 1, ran)
+                interpreter = ran.pop()
+                size = os.path.getsize(interpreter)
+                copies = [
+                    os.path.relpath(path, src)
+                    for parent, _, files in os.walk(src)
+                    for path in (os.path.join(parent, f) for f in files)
+                    if os.path.getsize(path) == size
+                    and filecmp.cmp(path, interpreter, shallow=False)]
+                self.assertEqual(len(copies), 1, copies)
 
 
 # The launcher's orderly stop: SIGINT to every member, SIGKILL to any still

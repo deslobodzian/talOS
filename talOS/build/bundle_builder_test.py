@@ -1,7 +1,7 @@
 """Tests bundle_builder.py's check of a bundle's nodes against its config,
 its config staging (relative layout and identity), its manifest's binary
-digests and stamped revision, its staging of runfiles
-and of C++ nodes' shared libraries in lib/, its check of a bundled Studio
+digests and stamped revision, its staging of runfiles (the Python
+runtime once, in python/) and of C++ nodes' shared libraries in lib/, its check of a bundled Studio
 against the config, and its run.sh (including the Studio it starts), and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
@@ -26,6 +26,8 @@ def put(path, text):
 
 
 HARDWARE_NODE = "//talOS/bridge:hardware_node"
+# A Python runtime's repository as a node's runfiles name it.
+RUNTIME = "rules_python++python+python_3_11"
 
 
 def node(tmp, name, target=None):
@@ -334,6 +336,90 @@ class BundleBuilderTest(unittest.TestCase):
                         capture_output=True, text=True, timeout=60)
                     self.assertEqual((run.returncode, run.stdout),
                                      (0, "ran -c pass\n"), run.stderr)
+
+    def python_nodes(self, tmp, interpreters):
+        """Specs of Python nodes, one per {name: interpreter text}, each
+        carrying the runtime repository RUNTIME as rules_python's runfiles
+        do: the interpreter as bin/python3 and again, as copies, under its
+        other names, its standard library, and a venv whose bin/python3 is a
+        link Bazel declared to it."""
+        venv_python = "_main/{0}/_node_bin.venv/bin/python3"
+        specs = []
+        for name, text in interpreters.items():
+            src = os.path.join(tmp, "src", name)
+            real = os.path.join(src, "python3")
+            put(real, text)
+            os.chmod(real, 0o755)
+            put(os.path.join(src, "encodings.py"), "")
+            link = os.path.join(src, "venv", "bin", "python3")
+            os.makedirs(os.path.dirname(link))
+            os.symlink("../../../../" + RUNTIME + "/bin/python3", link)
+            rf = [{"src_path": real, "rf_rel": f"{RUNTIME}/bin/{alias}"}
+                  for alias in ("python", "python3", "python3.11")]
+            rf += [{"src_path": os.path.join(src, "encodings.py"),
+                    "rf_rel": RUNTIME + "/lib/python3.11/encodings/__init__.py"},
+                   {"src_path": link, "rf_rel": venv_python.format(name)}]
+            specs.append(dict(node(tmp, name, f"//{name}:node"),
+                              language="python", runfiles=rf))
+        return specs
+
+    # REQ-OPS-48
+    def test_python_nodes_share_one_interpreter(self):
+        # Each Python node's runfiles carry the whole interpreter (rules_python
+        # copies it under python, python3 and python3.11): a 52 MB file six
+        # times over for two nodes, most of a 749 MB bundle copied to the
+        # robot on every deploy. The bundle holds it once, and every node's
+        # venv still runs it where it finds its library, built or restored.
+        interpreter = ('#!/bin/sh\nhome="$(dirname "$(realpath "$0")")/.."\n'
+                       'test -d "$home/lib/python3.11/encodings" || {\n'
+                       '  echo "No module named encodings" >&2; exit 1; }\n'
+                       'echo "ran $*"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = self.python_nodes(tmp, {"a": interpreter, "b": interpreter})
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE)] + nodes,
+                ["//a:node", "//b:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            held = []
+            for parent, dirs, files in os.walk(built):
+                for name in dirs + files:
+                    path = os.path.join(parent, name)
+                    self.assertFalse(os.path.islink(path), path)
+                    if os.path.isfile(path):
+                        with open(path, encoding="utf-8",
+                                  errors="replace") as f:
+                            if f.read() == interpreter:
+                                held.append(os.path.relpath(path, built))
+            self.assertEqual(len(held), 1, held)
+            restored = os.path.join(tmp, "restored")
+            shutil.copytree(built, restored, symlinks=False)
+            for tree in (built, restored):
+                for name in ("a", "b"):
+                    venv = os.path.join(
+                        tree, "bin", f"{name}.runfiles", "_main", name,
+                        "_node_bin.venv", "bin", "python3")
+                    with self.subTest(tree=os.path.basename(tree), node=name):
+                        run = subprocess.run([venv, "-c", "pass"],
+                                             capture_output=True, text=True,
+                                             timeout=60)
+                        self.assertEqual((run.returncode, run.stdout),
+                                         (0, "ran -c pass\n"), run.stderr)
+
+    def test_two_different_runtimes_under_one_name_fail(self):
+        # One runtime directory serves every node, so two nodes that carry
+        # different interpreters under one repository name cannot share it.
+        with tempfile.TemporaryDirectory() as tmp:
+            nodes = self.python_nodes(tmp, {"a": "#!/bin/sh\necho 3.11.1\n",
+                                            "b": "#!/bin/sh\necho 3.11.2\n"})
+            proc = self.assemble(
+                tmp, {"c/robot.toml": "[robot]\n"},
+                [node(tmp, "hardware_node", HARDWARE_NODE)] + nodes,
+                ["//a:node", "//b:node"])
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(RUNTIME, proc.stderr)
+            self.assertIn("'a'", proc.stderr)
 
     def test_run_script_passes_output_root_without_a_session_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
