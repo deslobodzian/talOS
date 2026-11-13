@@ -297,6 +297,24 @@ TEST(ConfigTest, RejectsNonBooleanTargetCoverage) {
   ExpectRejected("[robot]\nrequire_target_coverage = \"true\"\n");
 }
 
+// REQ-CONTRACT-09: a commissioned robot requires target coverage, so a
+// config that commissions it and turns coverage off contradicts itself and
+// is refused, naming both keys; either key alone loads.
+TEST(ConfigTest, CommissionedRefusesTargetCoverageTurnedOff) {
+  try {
+    Parse("[robot]\ncommissioned = true\nrequire_target_coverage = false\n");
+    ADD_FAILURE() << "loaded a commissioned config without coverage";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("commissioned"), std::string::npos) << what;
+    EXPECT_NE(what.find("require_target_coverage"), std::string::npos) << what;
+  }
+  EXPECT_NO_THROW(Parse(
+      "[robot]\ncommissioned = false\nrequire_target_coverage = false\n"));
+  EXPECT_NO_THROW(
+      Parse("[robot]\ncommissioned = true\nrequire_target_coverage = true\n"));
+}
+
 TEST(ConfigTest, RejectsInvalidStudioOptions) {
   ExpectRejected("[studio]\nhttp_port = 70000\n");
   ExpectRejected("[studio]\nmax_clients = 0\n");

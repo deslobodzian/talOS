@@ -165,7 +165,11 @@ subsystem. A missing optional policy lane remains a warning. With
 `[robot] require_target_coverage = true` (default `false`), every described
 subsystem that reads its own target lanes must have at least one writer among
 each nonempty Driver Station mode's policy sources; missing coverage is a graph
-error naming the subsystem, mode, and lanes.
+error naming the subsystem, mode, and lanes. `commissioned = true` requires
+target coverage as `require_target_coverage = true` does (the config file's
+`commissioned`, not `--sim`'s in-memory one), and config load refuses it
+beside an explicit `require_target_coverage = false`; a subsystem with no
+producer for a mode yet empties that mode in its `[targets]`.
 
 The mode generation is what keeps a target issued under an earlier enable or
 mode from ever actuating. The RoboRIO program (and `SimHardware`,

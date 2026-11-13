@@ -1557,35 +1557,60 @@ TEST(LauncherGraphTest, DescribeOnlyReportsABrokenGraphAsAFailure) {
   EXPECT_FALSE(fixture.has_manifest());
 }
 
-TEST(LauncherGraphTest, DescribeOnlyEnforcesOptInPerModeTargetCoverage) {
-  for (const bool required : {false, true}) {
+// REQ-CONTRACT-09: alpha reads its teleop and auto lanes and only teleop has
+// a writer. Coverage is required by `require_target_coverage = true` and by
+// `commissioned = true` (the config file's, whatever --sim does in memory):
+// either refuses the graph with one error naming alpha, the mode and its
+// lanes. An uncommissioned config without coverage required keeps the
+// unwritten lane a warning.
+TEST(LauncherGraphTest, DescribeOnlyEnforcesTargetCoverageWhenRequired) {
+  struct Row {
+    const char* name;
+    const char* robot_keys;
+    bool refused;
+  };
+  for (const Row row : {
+           Row{"optional_mode_coverage", "require_target_coverage = false\n",
+               false},
+           Row{"required_mode_coverage", "require_target_coverage = true\n",
+               true},
+           Row{"commissioned_mode_coverage", "commissioned = true\n", true},
+       }) {
+    SCOPED_TRACE(row.name);
     auto teleop_lane = Watcher("/alpha/target/teleop");
     auto auto_lane = Watcher("/alpha/target/auto");
     teleop_lane.flags = introspect::naming::kSourceFlagOptional;
     auto_lane.flags = introspect::naming::kSourceFlagOptional;
-    GraphFixture fixture{
-        required ? "required_mode_coverage" : "optional_mode_coverage",
-        DescribingStub("alpha", "//example/alpha:node",
-                       {teleop_lane, auto_lane}),
-        DescribingStub("beta", "//example/beta:node",
-                       {Sender("/alpha/target/teleop")})};
+    GraphFixture fixture{row.name,
+                         DescribingStub("alpha", "//example/alpha:node",
+                                        {teleop_lane, auto_lane}),
+                         DescribingStub("beta", "//example/beta:node",
+                                        {Sender("/alpha/target/teleop")})};
     std::string toml{kFixtureToml};
     const std::string header = "[robot]\n";
-    toml.insert(toml.find(header) + header.size(),
-                std::string{"require_target_coverage = "} +
-                    (required ? "true\n" : "false\n"));
+    toml.insert(toml.find(header) + header.size(), row.robot_keys);
     {
       std::ofstream config{fixture.options.config_path};
       config << toml;
     }
     fixture.options.describe_only = true;
     Launcher launcher{fixture.options};
-    EXPECT_EQ(launcher.Run(), required ? 1 : 0);
+    EXPECT_EQ(launcher.Run(), row.refused ? 1 : 0);
     EXPECT_FALSE(fixture.has_manifest());
     const auto graph = fixture.graph_json();
-    EXPECT_NE(graph.find("/alpha/target/auto"), std::string::npos);
-    EXPECT_EQ(graph.find("\"severity\": \"error\"") != std::string::npos,
-              required);
+    const auto uncovered = GraphFindings(graph, "error", "alpha");
+    if (row.refused) {
+      ASSERT_EQ(uncovered.size(), 1u) << graph;
+      EXPECT_NE(uncovered[0].find("autonomous"), std::string::npos)
+          << uncovered[0];
+      EXPECT_NE(uncovered[0].find("/alpha/target/auto"), std::string::npos)
+          << uncovered[0];
+    } else {
+      EXPECT_EQ(GraphErrors(graph), std::vector<std::string>{}) << graph;
+      EXPECT_EQ(GraphFindings(graph, "warning", "/alpha/target/auto").size(),
+                1u)
+          << graph;
+    }
   }
 }
 
