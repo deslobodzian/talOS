@@ -9,6 +9,8 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "autonomous/autonomous_message_generated.h"
@@ -81,21 +83,23 @@ class Autonomous {
         ds_{node},
         phase_{node, Phase::kInhibited},
         state_{node.publish<AutonomousState>(topics::kState)} {
-    if (feed_duration_ <= talos::Duration::zero()) {
-      throw std::invalid_argument(
-          "autonomous: feed_duration_us must be positive");
-    }
-    if (autonomous_period_ <= talos::Duration::zero()) {
-      throw std::invalid_argument(
-          "autonomous: autonomous_period_us must be positive");
-    }
-    if (selection_port_ < 0 || selection_port_ > 5 || selection_pov_ < 0 ||
-        selection_pov_ > 3 || !PovAngle(selection_next_) ||
-        !PovAngle(selection_previous_) ||
-        selection_next_ == selection_previous_) {
-      throw std::invalid_argument("autonomous: invalid selection input");
-    }
-    ValidateFinite();
+    // feed_duration_us, the timeouts and every routine key are checked by
+    // LoadRoutines and PositiveSeconds above.
+    if (autonomous_period_ <= talos::Duration::zero())
+      BadParameter(node, "autonomous_period_us", "must be positive");
+    if (selection_port_ < 0 || selection_port_ > 5)
+      BadParameter(node, "selection_port_index", "must be in [0, 5]");
+    if (selection_pov_ < 0 || selection_pov_ > 3)
+      BadParameter(node, "selection_pov_index", "must be in [0, 3]");
+    if (!PovAngle(selection_next_))
+      BadParameter(node, "selection_next_direction_index", "must be in [0, 7]");
+    if (!PovAngle(selection_previous_))
+      BadParameter(node, "selection_previous_direction_index",
+                   "must be in [0, 7]");
+    if (selection_next_ == selection_previous_)
+      BadParameter(node, "selection_previous_direction_index",
+                   "must differ from selection_next_direction_index");
+    ValidateController();
     signature_ = RoutineSignature(routines_);
   }
 
@@ -363,13 +367,22 @@ class Autonomous {
             .hardware.command_timeout_us};
   }
 
+  // Every construction error names its key as the config spells it, in the
+  // form talos::Node::param uses for a wrong type.
+  [[noreturn]] static void BadParameter(const talos::Node& node,
+                                        std::string_view key,
+                                        std::string_view problem) {
+    const std::string name{node.name()};
+    throw std::invalid_argument(name + ": parameter '" + std::string{key} +
+                                "' " + std::string{problem} +
+                                " in [subsystems." + name + "]");
+  }
+
   static double PositiveSeconds(talos::Node& node, const char* key,
                                 double fallback) {
     const double value = node.param(key, fallback);
-    if (!std::isfinite(value) || value <= 0) {
-      throw std::invalid_argument(std::string{"autonomous: "} + key +
-                                  " must be positive and finite");
-    }
+    if (!std::isfinite(value) || value <= 0)
+      BadParameter(node, key, "must be finite and positive");
     return value;
   }
 
@@ -528,16 +541,18 @@ class Autonomous {
     const auto names = node.param<std::vector<std::string>>(
         "routines", {"preload", "none", "shoot_only", "taxi"});
     if (names.empty() || names.size() > 256)
-      throw std::invalid_argument(
-          "autonomous: routines must contain 1..256 names");
+      BadParameter(node, "routines", "must list 1..256 names");
     std::vector<Routine> result;
+    result.reserve(names.size());
     for (const auto& name : names) {
       if (name != "preload" && name != "none" && name != "shoot_only" &&
           name != "taxi")
-        throw std::invalid_argument("autonomous: unknown routine " + name);
+        BadParameter(node, "routines",
+                     "names unknown routine '" + name +
+                         "' (known: preload, none, shoot_only, taxi)");
       if (std::any_of(result.begin(), result.end(),
                       [&](const Routine& r) { return r.name == name; }))
-        throw std::invalid_argument("autonomous: duplicate routine " + name);
+        BadParameter(node, "routines", "names '" + name + "' twice");
       Routine r{};
       r.name = name;
       r.collect = name == "preload";
@@ -552,27 +567,38 @@ class Autonomous {
                              Completion::kWaypoint, Timeout::kDrive});
       r.actions.push_back({Phase::kHold, Prerequisite::kNone,
                            Completion::kNever, Timeout::kNone});
-      const auto param = [&](const char* key, double fallback) {
-        const double value = node.param("routine." + name + "." + key,
-                                        node.param(key, fallback));
-        if (!std::isfinite(value))
-          throw std::invalid_argument(
-              "autonomous: nonfinite routine parameter");
+      // A routine key overrides the common one. The common value is checked
+      // first, so a bad effective value names the routine key only when the
+      // routine sets it.
+      const auto param = [&](const char* key, double fallback, bool positive) {
+        const auto check = [&](std::string_view where, double value) {
+          if (!std::isfinite(value) || (positive && value <= 0))
+            BadParameter(
+                node, where,
+                positive ? "must be finite and positive" : "must be finite");
+        };
+        const double common = node.param(key, fallback);
+        check(key, common);
+        const std::string routine_key = "routine." + name + "." + key;
+        const double value = node.param(routine_key, common);
+        check(routine_key, value);
         return value;
       };
-      r.shooter = param("shooter_velocity_rps", 60);
-      r.intake = param("intake_velocity_rps", 30);
-      r.feed = param("feed_velocity_rps", -20);
-      r.x = param("target_x_m", 2);
-      r.y = param("target_y_m", 0);
-      r.yaw = param("target_yaw_rad", 0);
+      r.shooter = param("shooter_velocity_rps", 60, false);
+      r.intake = param("intake_velocity_rps", 30, false);
+      r.feed = param("feed_velocity_rps", -20, false);
+      r.x = param("target_x_m", 2, false);
+      r.y = param("target_y_m", 0, false);
+      r.yaw = param("target_yaw_rad", 0, false);
       // feed_duration_us is an integer in the existing public configuration.
-      r.feed_us = node.param<int>("routine." + name + ".feed_duration_us",
-                                  node.param<int>("feed_duration_us", 500000));
-      r.spinup_s = param("spinup_timeout_s", 2);
-      r.drive_s = param("drive_timeout_s", 10);
-      if (r.feed_us <= 0 || r.spinup_s <= 0 || r.drive_s <= 0)
-        throw std::invalid_argument("autonomous: invalid routine duration");
+      const int common_feed_us = node.param<int>("feed_duration_us", 500000);
+      if (common_feed_us <= 0)
+        BadParameter(node, "feed_duration_us", "must be positive");
+      const std::string feed_key = "routine." + name + ".feed_duration_us";
+      r.feed_us = node.param<int>(feed_key, common_feed_us);
+      if (r.feed_us <= 0) BadParameter(node, feed_key, "must be positive");
+      r.spinup_s = param("spinup_timeout_s", 2, true);
+      r.drive_s = param("drive_timeout_s", 10, true);
       result.push_back(std::move(r));
     }
     return result;
@@ -582,7 +608,8 @@ class Autonomous {
     const auto name = node.param<std::string>("default_routine", "preload");
     for (std::size_t i = 0; i < routines.size(); ++i)
       if (routines[i].name == name) return static_cast<std::uint8_t>(i);
-    throw std::invalid_argument("autonomous: default routine not in routines");
+    BadParameter(node, "default_routine",
+                 "names '" + name + "', which routines does not list");
   }
   static std::uint64_t RoutineSignature(const std::vector<Routine>& routines) {
     std::uint64_t hash = 14695981039346656037ULL;
@@ -592,12 +619,20 @@ class Autonomous {
     }
     return hash;
   }
-  void ValidateFinite() const {
-    for (double value :
-         {position_tolerance_, yaw_tolerance_, max_linear_, max_angular_,
-          field_length_, field_width_, kp_xy_, kp_yaw_}) {
+  void ValidateController() const {
+    const std::pair<const char*, double> checked[] = {
+        {"position_tolerance_m", position_tolerance_},
+        {"yaw_tolerance_rad", yaw_tolerance_},
+        {"max_linear_mps", max_linear_},
+        {"max_angular_radps", max_angular_},
+        {"field_length_m", field_length_},
+        {"field_width_m", field_width_},
+        {"xy_feedback_per_m_mps", kp_xy_},
+        {"yaw_feedback_per_rad_radps", kp_yaw_},
+    };
+    for (const auto& [key, value] : checked) {
       if (!std::isfinite(value) || value <= 0)
-        throw std::invalid_argument("autonomous: invalid controller parameter");
+        BadParameter(node_, key, "must be finite and positive");
     }
   }
   void ApplyRoutine() {
