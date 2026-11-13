@@ -3477,6 +3477,91 @@ TEST(LauncherSessions, AStopOnceSegmentsExistEndsTheSessionBeforeAnySpawn) {
   ::remove(record.c_str());
 }
 
+// A stop (SIGINT) that arrives between two spawns: the members already
+// started are stopped as every stop stops them (the stop's SIGINT, which
+// ends these sleeping stubs: run reason `stop`, exit_signal 2), no member
+// after them is spawned, the manifest ends with `stopped_before_start` and
+// no run for the unstarted, the segments are unlinked, and the launcher
+// exits 0: neither the stopped runs nor the unstarted members count against
+// the status. The SIGINT is raised on the launcher's thread right after the
+// second spawn, so it is handled before the third member's turn. Each stub
+// sleeps by exec, so the stop's signal never finds a shell waiting on a
+// child.
+// REQ-OPS-06
+TEST(LauncherSessions, AStopBetweenTwoSpawnsStopsTheStartedAndStartsNoOther) {
+  const std::string tag = "stop_between_spawns";
+  auto options = SessionFixture(tag);
+  std::filesystem::remove_all(options.output_dir);
+  const std::string spawned = TempPath(tag + "_spawned");
+  ::remove(spawned.c_str());
+  // Only bounds a launch that missed the stop; each member outsleeps it.
+  options.duration_s = static_cast<int>(kHang.count());
+  const int sleep_s = 3 * options.duration_s;
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node", {},
+                            sleep_s));
+  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
+      tag + "_alpha", NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                            {Sender("/alpha/state")}, sleep_s));
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, sleep_s));
+  options.member_spawned = [spawned,
+                            count = 0](const std::string& member) mutable {
+    std::ofstream{spawned, std::ios::app} << member << "\n";
+    if (++count == 2) ::raise(SIGINT);
+  };
+  const pid_t launcher = ForkLauncher(options);
+  ASSERT_GE(launcher, 0);
+  int status = 0;
+  ASSERT_EQ(::waitpid(launcher, &status, 0), launcher);
+  const bool left = SegmentLeft("/alpha/state");
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "the launcher ended with " << ExitReason(status);
+  EXPECT_FALSE(left) << "the session's /alpha/state segment was not unlinked";
+  std::vector<std::string> started;
+  {
+    std::istringstream lines{ReadFile(spawned)};
+    for (std::string line; std::getline(lines, line);) started.push_back(line);
+  }
+  EXPECT_EQ(started.size(), 2u) << "members spawned: " << ReadFile(spawned);
+  const std::string manifest =
+      ReadFile(options.output_dir + "/1/manifest.json");
+  ASSERT_FALSE(manifest.empty()) << "no manifest.json";
+  EXPECT_EQ(manifest.find("\n  \"end_wall_ns\": 0,"), std::string::npos)
+      << manifest;
+  EXPECT_NE(manifest.find("\n  \"stopped_before_start\": true,"),
+            std::string::npos)
+      << manifest;
+  // `name`'s runs: the text between its "runs": [ and the closing ].
+  const auto runs_of = [&manifest](const std::string& name) {
+    const auto at = manifest.find("\"name\": \"" + name + "\"");
+    const auto runs = manifest.find("\"runs\": [", at);
+    if (at == std::string::npos || runs == std::string::npos)
+      return std::string{"(no entry)"};
+    return manifest.substr(runs, manifest.find(']', runs) + 1 - runs);
+  };
+  int unstarted = 0;
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string runs = runs_of(name);
+    if (std::find(started.begin(), started.end(), name) == started.end()) {
+      ++unstarted;
+      EXPECT_EQ(runs, "\"runs\": []") << name << " was never started";
+      continue;
+    }
+    // One run, ended by the stop's own SIGINT.
+    EXPECT_EQ(runs.find("{\"pid\": "), runs.rfind("{\"pid\": ")) << runs;
+    EXPECT_NE(runs.find("\"exit_signal\": " + std::to_string(SIGINT) +
+                        ", \"reason\": \"stop\""),
+              std::string::npos)
+        << name << ": " << runs;
+  }
+  EXPECT_EQ(unstarted, 1) << manifest;
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(spawned.c_str());
+}
+
 // A stop that arrives while the roster is being described ends the launch
 // without waiting for a probe that has not answered: the probe is killed
 // rather than given the rest of its describe deadline, nothing of a session
