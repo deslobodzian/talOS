@@ -175,6 +175,23 @@ class NewRobotTest(unittest.TestCase):
                     for table in robot.values():
                         self.assertNotIn("motors", table)
 
+    # REQ-CONTRACT-09
+    def test_commissioning_needs_only_the_commissioned_flag(self):
+        # A person commissions a generated robot by setting commissioned =
+        # true at the robot (docs/BRINGUP.md); config load then requires
+        # target coverage, so the generated config must not have turned it
+        # off. With no mechanism every subsystem is covered, so the graph
+        # passes. (A temporary copy, never a robot's own config: RULES.md 4.)
+        with tempfile.TemporaryDirectory() as tmp:
+            work, launcher, env = workspace(tmp)
+            generate(work, None, None)
+            edit(os.path.join(work, CONFIG),
+                 [("commissioned = false", "commissioned = true")])
+            status, output, graph = describe(work, launcher, env,
+                                             os.path.join(tmp, "out"))
+            self.assertEqual(status, 0, output)
+            self.assertIsNotNone(graph)
+
     # REQ-SAFE-40
     def test_simulation_config_is_refused_without_sim(self):
         # robot_sim.toml holds simulation gains, bindings and travel (the
@@ -210,8 +227,9 @@ class NewRobotTest(unittest.TestCase):
                 work, launcher, env = workspace(tmp)
                 generate(work, mechanism, "cpp", kind)
                 edit(os.path.join(work, CONFIG),
-                     [("require_target_coverage = false",
-                       "require_target_coverage = true"),
+                     [("commissioned = false\n",
+                       "commissioned = false\n"
+                       "require_target_coverage = true\n"),
                       ("autonomous = []", 'autonomous = ["auto"]')])
                 status, output, _ = describe(work, launcher, env,
                                              os.path.join(tmp, "before"),

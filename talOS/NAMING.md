@@ -59,7 +59,8 @@ hardware bridge (the launcher's `hardware_node` roster entry, whatever binary
 `[robot] hardware_node` names and whatever name it describes), except
 `/hw/request/<node>`, which only `<node>`'s devices-layer flush writes (its
 endpoint carries the `hardware_request` attribute; RULES.md 2). Independently
-of the lint, which `--allow-graph-errors` overrides, a node's `publish` and
+of the lint, which `--allow-graph-errors` overrides (accepted only with
+`--sim`; [launcher](launcher/README.md#two-phases)), a node's `publish` and
 `publish_bytes` (C++, or Python through `talOS/node_api`) refuse any topic
 under `/hw/request`, remapped or not, at construction. A topic nobody reads, a
 policy lane nobody writes yet, or a topic whose owner is not a node in the

@@ -74,7 +74,9 @@ matter now:
 - `[robot.targets]` says which **target lanes** each Driver Station mode
   listens to. Here a subsystem obeys the `teleop` lane in teleop and nothing in
   autonomous. `require_target_coverage = true`, once every mechanism has a
-  producer, makes the launcher refuse a subsystem nobody can drive.
+  producer, makes the launcher refuse a subsystem nobody can drive; a
+  commissioned robot always requires it
+  ([architecture: targets](../ARCHITECTURE.md#targets)).
 - `sim_gateway` names the program that stands in for the RoboRIO, the robot's
   hardware layer, when you simulate.
 - `robot_sim.toml` is the **simulation config**: `include = "robot.toml"`
@@ -207,7 +209,9 @@ there because with every gain zero the physics simulation stalls the motor
 
 The `can_id` in the subsystem file is a placeholder. On a real robot a
 person sets the physical id and `commissioned = true` at the robot; nobody
-does it from a desk ([bring-up](BRINGUP.md#human-commissioning)). The
+does it from a desk ([bring-up](BRINGUP.md#human-commissioning)). A
+commissioned robot requires target coverage, so by then every mechanism needs
+a producer in each mode its policy lists. The
 binding goes into the subsystem file only once its gains are tuned on the
 mechanism.
 

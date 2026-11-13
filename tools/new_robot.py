@@ -70,12 +70,12 @@ period_us = @PERIOD@
 command_timeout_us = @TIMEOUT@
 status_hz = 200.0
 # A person sets this true at the robot, after checking every CAN id; never
-# from a desk (docs/BRINGUP.md).
+# from a desk (docs/BRINGUP.md). A commissioned robot also requires target
+# coverage: the launcher refuses a subsystem that some Driver Station mode's
+# policy lanes leave without a writer. require_target_coverage = true asks
+# for that before commissioning, once every mechanism has a teleop binding
+# or other producer.
 commissioned = false
-# true: the launcher refuses a subsystem that some Driver Station mode's
-# policy lanes leave without a writer. Turn it on once every mechanism has a
-# teleop binding or other producer.
-require_target_coverage = false
 # The program that stands in for the RoboRIO under `./sim.sh --sim-gateway`.
 sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
 
