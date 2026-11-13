@@ -3052,6 +3052,7 @@ TEST(ConfigWire, PersistenceValidatesCrcAndAssemblerResetsAfterCompletion) {
             ConfigAssembler::Status::kIncomplete);
 }
 
+// REQ-SAFE-21: an identical push succeeds enabled without device traffic
 TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
   Config restored;
   ASSERT_TRUE(
