@@ -1314,7 +1314,9 @@ at <address>:<port> (ran <s> s)` on stderr instead). PASS names the first
 accepted State's time from the start of the log (`first_state_ms` in
 `--json`), from the bridge's first `/hw/state` record (it publishes only a
 State it accepted), else from the first `/hw/status` record with a nonzero
-`state_age_us` or a clear `alert_error_link_lost`; FAIL is `/hw/status`
+`state_age_us` or a clear `alert_error_link_lost`, less that record's
+`state_age_us` (the record follows the State by up to one status period;
+clamped at 0); FAIL is `/hw/status`
 records and none of either; NOT MEASURED is neither topic logged.
 The Alerts section lists each alert that was ever active, as
 `<topic>/<field path>` with its level, from the `alerts` of its status

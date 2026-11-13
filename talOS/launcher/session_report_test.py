@@ -191,7 +191,7 @@ class SessionReportTest(unittest.TestCase):
         for label, session, verdict, first in (
                 ("no State", unheard, "FAIL", None),
                 ("a State", heard_at_120 + state, "PASS", 118),
-                ("a State, /hw/state unlogged", heard_at_120, "PASS", 120),
+                ("a State, /hw/state unlogged", heard_at_120, "PASS", 117),
                 ("no evidence", [], "NOT MEASURED", None)):
             with self.subTest(label):
                 report = session_report.analyze({"end_wall_ns": 1, "nodes": []}, session)
