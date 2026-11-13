@@ -47,10 +47,9 @@ def deploy_script():
     return runfiles.Create().Rlocation("_main/tools/deploy.sh")
 
 
-def boot_command(prefix, system):
-    """The argv `deploy.sh enable-boot --dry-run` writes into the boot
-    service on `system` ("Linux": the systemd unit's ExecStart; "Darwin":
-    the LaunchDaemon's ProgramArguments), with uname and FileVault faked."""
+def enable_boot(prefix, system):
+    """What `deploy.sh enable-boot --dry-run` prints on `system` ("Linux"
+    or "Darwin"), with uname and FileVault faked."""
     with tempfile.TemporaryDirectory() as fake:
         for name, body in (("uname", f"echo {system}"),
                            ("fdesetup", "echo 'FileVault is Off.'")):
@@ -58,11 +57,18 @@ def boot_command(prefix, system):
                 f.write(f"#!/bin/sh\n{body}\n")
             os.chmod(os.path.join(fake, name), 0o755)
         env = dict(os.environ, PATH=fake + os.pathsep + os.environ["PATH"])
-        out = subprocess.run(
+        return subprocess.run(
             ["bash", deploy_script(), "enable-boot", "--dry-run",
              "--prefix", prefix],
             check=True, capture_output=True, text=True, env=env,
             timeout=60).stdout
+
+
+def boot_command(prefix, system):
+    """The argv enable-boot writes into the boot service on `system`
+    ("Linux": the systemd unit's ExecStart; "Darwin": the LaunchDaemon's
+    ProgramArguments)."""
+    out = enable_boot(prefix, system)
     if system == "Darwin":
         plist = plistlib.loads(
             out[out.index("<?xml"):out.index("</plist>") + 8].encode())
@@ -146,6 +152,33 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],
                                  manifest["config_sha256"])
+
+
+# The launcher's orderly stop: SIGINT to every member, SIGKILL to any still
+# alive kStopTimeout (talOS/launcher/launcher.h; `stop_timeout` in the
+# launcher README's "Session manifest") later, then the final manifest.
+LAUNCHER_STOP_TIMEOUT_S = 2
+
+
+class BootServiceTest(unittest.TestCase):
+    # REQ-OPS-06
+    def test_systemd_stops_through_the_launcher_alone(self):
+        # Under systemd's default KillMode=control-group, `systemctl stop`
+        # SIGTERMs every member with the launcher: a member still starting
+        # (not yet handling a stop) dies of a signal the launcher did not
+        # send, the session exits 255 and the unit is recorded failed
+        # (TODO.md DEPLOY-9). Only the launcher may get the stop; systemd's
+        # SIGKILL must come after the launcher's own escalation.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = enable_boot(os.path.join(tmp, "prefix"), "Linux")
+        service = out[out.index("[Service]"):out.index("[Install]")]
+        unit = dict(line.split("=", 1) for line in service.splitlines()
+                    if "=" in line)
+        self.assertEqual(unit.get("KillMode"), "mixed", service)
+        stop_s = unit.get("TimeoutStopSec", "")
+        self.assertRegex(stop_s, r"^\d+s?$", service)
+        self.assertGreater(int(stop_s.rstrip("s")), LAUNCHER_STOP_TIMEOUT_S,
+                           service)
 
 
 # Each stub records, under its installed path, "start" with its pid, what
