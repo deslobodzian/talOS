@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -276,34 +277,59 @@ TEST(HardwareNodeTest, RunEndsItsWaitOnAStop) {
       << "a wait begun after the stop ran to its deadline";
 }
 
-// Run()'s exit status with no gateway answering: a stop is a requested end
+// Run()'s exit status and its no-State warning. A stop is a requested end
 // whether or not a State ever arrived, so 0 (the launcher stops a session
 // whose controller is not up yet: a RoboRIO still booting, or the simulated
 // gateway, spawned after the bridge, not spawned yet), while a run that
-// reaches its --duration-s without one State is a failure, 1.
+// reaches its --duration-s without one State is a failure, 1. Either way a
+// run that heard no State says so on stderr, since under the launcher (which
+// always stops the bridge) the exit status cannot; a run that heard one
+// does not.
 // REQ-OPS-06
 TEST(HardwareNodeTest, ExitStatusWithoutAStateIsZeroOnlyForAStop) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
-  for (const bool stop : {true, false}) {
-    SCOPED_TRACE(stop ? "stopped" : "--duration-s 1 elapsed");
+  struct Row {
+    const char* name;
+    bool stop;
+    bool state;
+  };
+  for (const Row row : {Row{"stopped", true, false},
+                        Row{"--duration-s 1 elapsed", false, false},
+                        Row{"stopped after a State", true, true}}) {
+    SCOPED_TRACE(row.name);
     Link link;
-    ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+    ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/row.state));
     HardwareNode& node = link.node.value();
     ipc::Subscriber<bridge::BridgeStatus> statuses{bridge::topics::kStatus};
+    ipc::Subscriber<Packet> states{
+        kStateTopic,
+        RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
     int status = -1;
+    ::testing::internal::CaptureStderr();
     std::thread runner{
-        [&node, &status, stop] { status = node.Run(stop ? 0 : 1); }};
-    if (stop) {
-      const bool running = WaitFor([&] { return statuses.read().has_value(); });
+        [&node, &status, &row] { status = node.Run(row.stop ? 0 : 1); }};
+    bool running = true;
+    bool forwarded = true;
+    if (row.stop) {
+      running = WaitFor([&] { return statuses.read().has_value(); });
+      if (row.state) {
+        forwarded = SendState(link.gateway,
+                              TrustState(NodeConfigId(cfg), 11, 1, 1000)) &&
+                    WaitFor([&] { return Forwarded(states, 1000); });
+      }
       process::RequestStop();
-      runner.join();
-      process::stop_requested.store(false);
-      ASSERT_TRUE(running) << "no /hw/status while Run() ran";
-    } else {
-      runner.join();
     }
-    EXPECT_EQ(node.states_received(), 0u);
-    EXPECT_EQ(status, stop ? 0 : 1);
+    runner.join();
+    process::stop_requested.store(false);
+    const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(running) << "no /hw/status while Run() ran";
+    ASSERT_TRUE(forwarded) << "the gateway's State was not forwarded";
+    EXPECT_EQ(node.states_received(), row.state ? 1u : 0u);
+    EXPECT_EQ(status, row.stop ? 0 : 1);
+    EXPECT_EQ(stderr_text.find("ended without receiving a State") !=
+                  std::string::npos,
+              !row.state)
+        << stderr_text;
   }
 }
 

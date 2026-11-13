@@ -1117,15 +1117,22 @@ int HardwareNode::Run(int duration_s) {
   const auto clock_us = [] {
     return static_cast<uint64_t>(event::Poller::now().nanos() / 1000);
   };
+  const uint64_t start_us = clock_us();
   const uint64_t end_us =
       duration_s > 0
-          ? clock_us() + (static_cast<uint64_t>(duration_s) * 1'000'000)
+          ? start_us + (static_cast<uint64_t>(duration_s) * 1'000'000)
           : std::numeric_limits<uint64_t>::max();
   bool woke_readable = false;
+  // Set where the loop ends at --duration-s, so a stop that lands after
+  // that break still counts as a run that reached its duration.
+  bool reached_duration = false;
   while (!talos::process::stop_requested.load()) {
     if (request_wake_) request_wake_->drain();
     const uint64_t now_us = clock_us();
-    if (now_us >= end_us) break;
+    if (now_us >= end_us) {
+      reached_duration = true;
+      break;
+    }
     const Wait wait = Pass(now_us);
     if (woke_readable) {
       if (tick_datagrams_ > 0) ++wakeups_.udp;
@@ -1154,8 +1161,7 @@ int HardwareNode::Run(int duration_s) {
       }
     }
   }
-  // Ended by a stop (SIGINT, SIGTERM), not by --duration-s.
-  const bool stopped = talos::process::stop_requested.load();
+  const uint64_t ran_us = clock_us() - start_us;
   CloseWaits();
 
   PublishIntrospection();
@@ -1195,11 +1201,23 @@ int HardwareNode::Run(int duration_s) {
     ReportLogFailure();
     log_failed = log_->failed();
   }
-  // A run that reached its --duration-s without one State never heard the
-  // controller: a failure. A stop is a requested end either way: the
-  // launcher may stop a session before the controller is up (a RoboRIO
-  // still booting, or a simulated gateway not spawned yet).
-  const bool unheard = states_received_ == 0 && !stopped;
+  // A run without one State never heard the controller. It says so on
+  // stderr either way, beside the summary, since under the launcher the
+  // exit status cannot: the launcher ends a bounded session by stopping
+  // every member at its own deadline, before the bridge reaches its
+  // --duration-s, and a stop exits 0 whether or not a State arrived (the
+  // controller may not be up yet: a RoboRIO still booting, or a simulated
+  // gateway not spawned yet). Only a run that reached its own --duration-s
+  // (a bridge run directly) fails for it.
+  if (states_received_ == 0) {
+    std::fflush(stdout);  // after the summary in a shared log
+    std::fprintf(stderr,
+                 "hardware_node warning: ended without receiving a State "
+                 "from the controller at %s:%u (ran %.1f s)\n",
+                 remote_ip_.c_str(), static_cast<unsigned>(remote_port_),
+                 static_cast<double>(ran_us) / 1e6);
+  }
+  const bool unheard = states_received_ == 0 && reached_duration;
   return log_failed || unheard ? 1 : 0;
 }
 
