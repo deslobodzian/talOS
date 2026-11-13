@@ -244,7 +244,8 @@ def controller_link(states, state_source, status_records, status_source):
     detail). The bridge publishes /hw/state only for a State it accepted, so
     its first record is the first acceptance; without one, /hw/status says
     whether any was accepted (state_age_us is 0 and alert_error_link_lost true
-    until the first). Under the launcher the bridge's exit status cannot say
+    until the first), and the first record after one, less its state_age_us,
+    dates it. Under the launcher the bridge's exit status cannot say
     this: the launcher ends a bounded session by stopping it, and a stop
     exits 0 whether or not a State arrived."""
     if states:
@@ -258,10 +259,14 @@ def controller_link(states, state_source, status_records, status_source):
         return fields.get("state_age_us", 0) > 0 or fields.get("alert_error_link_lost") is False
     accepted = [r for r in status_records if after_a_state(r)]
     if accepted:
-        first = accepted[0]["publish_ms"]
+        # A status record follows its State by up to one status period; its
+        # state_age_us dates the State itself.
+        age_us = scalars(accepted[0]["decoded"]).get("state_age_us", 0)
+        first = max(0, accepted[0]["publish_ms"] - age_us / 1000)
         return True, True, first, (
-            f"first /hw/status after an accepted State at {first:.6g} ms from the start "
-            f"of the log ({status_source}; no /hw/state record)")
+            f"first accepted State at {first:.6g} ms from the start of the log "
+            f"(first /hw/status after it less its state_age_us, {status_source}; "
+            "no /hw/state record)")
     if status_records:
         span = status_records[-1]["publish_ms"] - status_records[0]["publish_ms"]
         return True, False, None, (
