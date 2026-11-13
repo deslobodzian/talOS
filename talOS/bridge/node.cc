@@ -1154,6 +1154,8 @@ int HardwareNode::Run(int duration_s) {
       }
     }
   }
+  // Ended by a stop (SIGINT, SIGTERM), not by --duration-s.
+  const bool stopped = talos::process::stop_requested.load();
   CloseWaits();
 
   PublishIntrospection();
@@ -1193,7 +1195,12 @@ int HardwareNode::Run(int duration_s) {
     ReportLogFailure();
     log_failed = log_->failed();
   }
-  return states_received_ > 0 && !log_failed ? 0 : 1;
+  // A run that reached its --duration-s without one State never heard the
+  // controller: a failure. A stop is a requested end either way: the
+  // launcher may stop a session before the controller is up (a RoboRIO
+  // still booting, or a simulated gateway not spawned yet).
+  const bool unheard = states_received_ == 0 && !stopped;
+  return log_failed || unheard ? 1 : 0;
 }
 
 bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,

@@ -276,6 +276,37 @@ TEST(HardwareNodeTest, RunEndsItsWaitOnAStop) {
       << "a wait begun after the stop ran to its deadline";
 }
 
+// Run()'s exit status with no gateway answering: a stop is a requested end
+// whether or not a State ever arrived, so 0 (the launcher stops a session
+// whose controller is not up yet: a RoboRIO still booting, or the simulated
+// gateway, spawned after the bridge, not spawned yet), while a run that
+// reaches its --duration-s without one State is a failure, 1.
+// REQ-OPS-06
+TEST(HardwareNodeTest, ExitStatusWithoutAStateIsZeroOnlyForAStop) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  for (const bool stop : {true, false}) {
+    SCOPED_TRACE(stop ? "stopped" : "--duration-s 1 elapsed");
+    Link link;
+    ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+    HardwareNode& node = link.node.value();
+    ipc::Subscriber<bridge::BridgeStatus> statuses{bridge::topics::kStatus};
+    int status = -1;
+    std::thread runner{
+        [&node, &status, stop] { status = node.Run(stop ? 0 : 1); }};
+    if (stop) {
+      const bool running = WaitFor([&] { return statuses.read().has_value(); });
+      process::RequestStop();
+      runner.join();
+      process::stop_requested.store(false);
+      ASSERT_TRUE(running) << "no /hw/status while Run() ran";
+    } else {
+      runner.join();
+    }
+    EXPECT_EQ(node.states_received(), 0u);
+    EXPECT_EQ(status, stop ? 0 : 1);
+  }
+}
+
 // Under Run(), with one request and nothing after it, the heartbeats and the
 // owner timeout's neutral command still go out on their own. The bounds are
 // the requirement's: each frame no earlier than its duty, and before the
