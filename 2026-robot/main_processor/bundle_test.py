@@ -16,14 +16,18 @@ table names; one that does not is asked for Studio with
 its absence. Install's warm-up is checked on a bundle of stubs that record
 each run.
 
-On macOS, which charges each newly written executable's first exec, a stub
-written here pays it well inside the warm-up's bound, which only the stub
-that never exits reaches."""
+On macOS each newly written executable's first exec costs about 100 ms, and
+seconds under parallel load (TODO.md MAC-2), and every installed stub is a
+new file. So a stub runs under the default 60 s bound, except in the one
+case that waits out a short bound: there every member has already run once
+from its installed path, so only the stub that never exits can reach it."""
 
 import json
 import os
 import plistlib
+import select
 import shlex
+import signal
 import subprocess
 import tempfile
 import tomllib
@@ -152,7 +156,12 @@ current="$(readlink "$STUB_PREFIX/current" || echo -)"
 printf 'start %s %s %s %s\\n' "$me" "$$" "$current" "$*" >> "$STUB_LOG"
 case "$(basename "$0")" in
   fails) printf 'end %s\\n' "$me" >> "$STUB_LOG"; exit 3 ;;
-  hangs) exec tail -f /dev/null ;;
+  hangs)
+    # STUB_PREWARM: run once to pay a first exec, then exit. STUB_FIFO: say
+    # it is running.
+    [ -z "${STUB_PREWARM:-}" ] || exit 0
+    [ -z "${STUB_FIFO:-}" ] || echo up > "$STUB_FIFO"
+    exec tail -f /dev/null ;;
 esac
 printf 'end %s\\n' "$me" >> "$STUB_LOG"
 """
@@ -185,9 +194,6 @@ def stub_bundle(root, nodes):
         f.write("\n".join(lines) + "\n")
 
 
-# Untagged: no requirement row yet states that an installed bundle's first
-# launch must describe within the launcher's probe deadline (macOS charges
-# each newly written executable's first exec, serialized host-wide).
 class WarmUpTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -195,10 +201,9 @@ class WarmUpTest(unittest.TestCase):
         self.tmp = tmp.name
         self.prefix = os.path.join(self.tmp, "prefix")
         self.log = os.path.join(self.tmp, "stub.log")
-        # Bounds only the member that never exits: on macOS each stub's
-        # first exec costs about 100 ms (TODO.md MAC-2).
-        self.env = dict(os.environ, STUB_LOG=self.log, STUB_PREFIX=self.prefix,
-                        TALOS_DEPLOY_WARM_UP_TIMEOUT_S="3")
+        # The default bound: no fresh stub is killed for its first exec.
+        self.env = dict(os.environ, STUB_LOG=self.log, STUB_PREFIX=self.prefix)
+        self.env.pop("TALOS_DEPLOY_WARM_UP_TIMEOUT_S", None)
 
     def deploy(self, *args):
         proc = subprocess.run(
@@ -253,7 +258,7 @@ class WarmUpTest(unittest.TestCase):
 
     # REQ-OPS-47
     def test_install_runs_each_member_once_in_turn_before_selecting(self):
-        nodes = ("alpha", "fails", "hangs", "omega")
+        nodes = ("alpha", "fails", "omega")
         proc = self.install("bundle", nodes)
         bundle = os.path.realpath(os.path.join(self.prefix, "current"))
         self.assert_warmed_in_turn(bundle, nodes, "-", proc)
@@ -276,6 +281,52 @@ class WarmUpTest(unittest.TestCase):
                          old)
         self.assert_warmed_in_turn(os.path.realpath(old), nodes, new, proc)
 
+
+    # REQ-OPS-47
+    def test_a_hung_member_is_killed_at_its_bound(self):
+        # Every member of `previous` has run once from its installed path,
+        # so within the short bound only `hangs` is slow.
+        nodes = ("alpha", "hangs", "omega")
+        self.install("old", nodes, "--no-warm-up")
+        old = os.path.realpath(os.path.join(self.prefix, "current"))
+        prewarm = dict(self.env, STUB_PREWARM="1",
+                       STUB_LOG=os.path.join(self.tmp, "prewarm.log"))
+        for rel in [f"bin/{n}" for n in nodes] + [
+                "studio/studio_bridge", "launcher"]:
+            subprocess.run([os.path.join(old, rel)], env=prewarm, check=True,
+                           timeout=60)
+        self.install("new", nodes, "--no-warm-up")
+        new = os.readlink(os.path.join(self.prefix, "current"))
+        self.env["TALOS_DEPLOY_WARM_UP_TIMEOUT_S"] = "3"
+        proc = self.deploy("rollback")
+        self.assert_warmed_in_turn(old, nodes, new, proc)
+
+    # REQ-OPS-47
+    def test_a_stopped_warm_up_kills_its_member_and_selects_nothing(self):
+        src = os.path.join(self.tmp, "bundle")
+        stub_bundle(src, ("alpha", "hangs", "omega"))
+        fifo = os.path.join(self.tmp, "running")
+        os.mkfifo(fifo)
+        # Read and write: the stub's open never blocks, and no EOF wakes us.
+        reader = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        deploy = subprocess.Popen(
+            ["bash", deploy_script(), "install", src, "--prefix", self.prefix],
+            env=dict(self.env, STUB_FIFO=fifo), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True)
+        self.addCleanup(deploy.kill)
+        ready, _, _ = select.select([reader], [], [], 60)
+        self.assertTrue(ready, "the hung member never started")
+        deploy.send_signal(signal.SIGTERM)
+        out, err = deploy.communicate(timeout=60)
+        self.assertNotEqual(deploy.returncode, 0, out + err)
+        self.assertFalse(os.path.lexists(os.path.join(self.prefix, "current")),
+                         out + err)
+        records = self.records()
+        started = [os.path.basename(r[1]) for r in records if r[0] == "start"]
+        self.assertEqual(started, ["studio_bridge", "alpha", "hangs"], records)
+        with self.assertRaises(ProcessLookupError, msg="hung member alive"):
+            os.kill(int(records[-1][2]), 0)
 
 if __name__ == "__main__":
     unittest.main()

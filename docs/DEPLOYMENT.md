@@ -220,9 +220,17 @@ and can run beside a running robot. On the Mac mini it takes about 4.5 s,
 and the first launch then describes in under a second. A member that exits
 nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
-succeeds: the launch judges its members. Linux has no such charge; the
-warm-up runs there too and costs well under a second. `--no-warm-up` skips
-it, leaving the charge to the first launch.
+succeeds: the launch judges its members. A member that detaches a process
+into a new session (`setsid()`) leaves the group that kill reaches. Stopping
+`deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
+member's process group, selects nothing and exits 1. Linux has no such
+charge; the warm-up runs there too (0.4 s for the 2026 bundle on a Linux
+workstation). `--no-warm-up` skips it, leaving the charge to the first
+launch.
+
+The members run as the user that runs `deploy.sh`, root under `sudo`: the
+bundle's code runs at install time with that privilege, so install only a
+bundle you would launch.
 
 ### Boot service output
 
