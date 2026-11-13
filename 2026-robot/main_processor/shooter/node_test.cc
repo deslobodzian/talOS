@@ -9,6 +9,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "shooter/shooter.h"
@@ -61,6 +62,7 @@ class ShooterTest : public ::testing::Test {
   }
   void ExpectNeutral() const {
     EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kNeutral);
+    EXPECT_EQ(hw.applied_motor("shooter", "flywheel").mode, Mode::kNeutral);
     EXPECT_DOUBLE_EQ(State().target_velocity_rps(), 0.0);
     EXPECT_FALSE(State().at_speed());
   }
@@ -70,7 +72,8 @@ class ShooterTest : public ::testing::Test {
   SimHardware hw{sim};
 };
 
-TEST_F(ShooterTest, SpinsToAFreshTargetAndReportsAtSpeed) {
+// REQ-SAFE-07
+TEST_F(ShooterTest, DrivesAtALiveLane) {
   Teleop();
   hw.ideal_motors();
   Hold(80.0, 60ms);
@@ -158,7 +161,8 @@ TEST_F(ShooterTest, ChangedTargetAndZeroTargetClearReadiness) {
   EXPECT_FALSE(State().at_speed());
 }
 
-TEST_F(ShooterTest, DisconnectedMotorClearsReadiness) {
+// REQ-CONTRACT-25
+TEST_F(ShooterTest, DisconnectedFeedbackGoesNeutral) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
   Hold(80.0, 40ms);
@@ -177,13 +181,15 @@ TEST_F(ShooterTest, DisconnectedMotorClearsReadiness) {
   EXPECT_TRUE(State().at_speed());
 }
 
-TEST_F(ShooterTest, NeverSentStaysNeutral) {
+// REQ-SAFE-07
+TEST_F(ShooterTest, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
   ExpectNeutral();
   EXPECT_TRUE(State().enabled());
 }
 
+// REQ-SAFE-07
 TEST_F(ShooterTest, StaleLaneGoesNeutral) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
@@ -195,7 +201,8 @@ TEST_F(ShooterTest, StaleLaneGoesNeutral) {
   ExpectNeutral();
 }
 
-TEST_F(ShooterTest, ReleasedLaneGoesNeutralAtOnce) {
+// REQ-SAFE-07
+TEST_F(ShooterTest, ReleasedLaneGoesNeutral) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
   Hold(80.0, 40ms);
@@ -205,6 +212,7 @@ TEST_F(ShooterTest, ReleasedLaneGoesNeutralAtOnce) {
   ExpectNeutral();
 }
 
+// REQ-SAFE-02
 TEST_F(ShooterTest, DisabledRobotGoesNeutral) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
@@ -217,6 +225,7 @@ TEST_F(ShooterTest, DisabledRobotGoesNeutral) {
   EXPECT_FALSE(State().enabled());
 }
 
+// REQ-SAFE-07
 TEST_F(ShooterTest, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(80.0, 40ms);
@@ -227,8 +236,12 @@ TEST_F(ShooterTest, DriverStationLossGoesNeutral) {
   ExpectNeutral();
 }
 
-TEST_F(ShooterTest, AutonomousIgnoresTheTeleopLaneAndFollowsTheAutoLane) {
+// REQ-SAFE-07
+TEST_F(ShooterTest, OtherModesLaneIsIgnored) {
   Teleop();
+  Hold(80.0, 40ms, "auto");  // autonomous's lane, live, in teleop
+  ExpectNeutral();
+  talos::testing::ReleaseTarget<ShooterTarget>(sim, "shooter", "auto");
   Hold(80.0, 40ms);
   ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
   hw.set_driver_station(
@@ -243,7 +256,8 @@ TEST_F(ShooterTest, AutonomousIgnoresTheTeleopLaneAndFollowsTheAutoLane) {
   EXPECT_DOUBLE_EQ(request.demand, 60.0);
 }
 
-TEST_F(ShooterTest, TargetFromBeforeAReenableStaysNeutralInTheSameDrain) {
+// REQ-SAFE-09
+TEST_F(ShooterTest, EarlierGenerationTargetIsIgnored) {
   Teleop();
   Hold(80.0, 40ms);
   ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
@@ -267,15 +281,24 @@ TEST_F(ShooterTest, TargetFromBeforeAReenableStaysNeutralInTheSameDrain) {
   EXPECT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
 }
 
-TEST_F(ShooterTest, NonFiniteTargetGoesNeutral) {
+// REQ-SAFE-04
+TEST_F(ShooterTest, NonFiniteDemandGoesNeutral) {
   Teleop();
-  Hold(std::numeric_limits<double>::quiet_NaN(), 40ms);
-  ExpectNeutral();
+  for (const double rps : {std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity()}) {
+    SCOPED_TRACE(rps);
+    Hold(80.0, 40ms);
+    ASSERT_EQ(hw.motor_request("shooter", "flywheel").mode, Mode::kVelocity);
+    Hold(rps, 40ms);
+    ExpectNeutral();
+  }
 }
 
-// RULES.md 3: the steady-state tick (target read, readiness, velocity
-// request, flush, state publish) allocates nothing. The target is published
-// before the window and stays fresh through it (60 ms < command_timeout_us).
+// REQ-RT-06 (RULES.md 3): the steady-state tick (target read, readiness,
+// velocity request, flush, state publish) allocates nothing. The target is
+// published before the window and stays fresh through it (60 ms <
+// command_timeout_us).
 TEST_F(ShooterTest, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
@@ -293,7 +316,9 @@ TEST_F(ShooterTest, UpdateDoesNotAllocate) {
   EXPECT_TRUE(State().at_speed());
 }
 
-TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {
+// Each bad [flywheel] parameter throws at construction, naming the key.
+// REQ-SAFE-37
+TEST(ShooterParameters, BadParameterFailsConstruction) {
   for (const char* setting :
        {"at_speed_entry_rps = 0", "at_speed_entry_rps = -1",
         "at_speed_entry_rps = nan", "at_speed_entry_rps = inf",
@@ -302,6 +327,9 @@ TEST(ShooterParameters, RejectInvalidReadinessParametersAtConstruction) {
         "at_speed_exit_frac = inf", "at_speed_entry_tick_count = 0",
         "at_speed_entry_tick_count = -1"}) {
     SCOPED_TRACE(setting);
+    const std::string key =
+        "flywheel." +
+        std::string{setting}.substr(0, std::string_view{setting}.find(' '));
     auto sim = Sim::FromToml(std::string{R"(
 [robot]
 period_us = 5000
@@ -315,7 +343,13 @@ max_velocity_rps = 100.0
 [subsystems.shooter.digital_inputs.beam_break]
 dio = 0
 )");
-    EXPECT_THROW(sim.add<Shooter>("shooter"), std::invalid_argument);
+    try {
+      sim.add<Shooter>("shooter");
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(key), std::string::npos)
+          << error.what();
+    }
   }
 }
 
