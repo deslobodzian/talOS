@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -3560,6 +3561,37 @@ TEST(LauncherSessions, AStopBetweenTwoSpawnsStopsTheStartedAndStartsNoOther) {
   EXPECT_EQ(unstarted, 1) << manifest;
   std::filesystem::remove_all(options.output_dir);
   ::remove(spawned.c_str());
+}
+
+// A launch that starts the roster takes SIGINT, SIGTERM and SIGHUP for its
+// stop; once Run has returned each is what it was before, so a later
+// --describe-only or --replay-inputs run in the same process gets its
+// caller's action (README "Two phases"), not a handler that only sets a flag
+// nobody reads. Each starts with a handler of the test's own, which a reset
+// to the default action would not put back. No signal is raised: the test
+// process's default action would end it.
+// REQ-OPS-06
+TEST(LauncherSessions, ARosterRunPutsBackTheStopSignalDispositions) {
+  auto options = SessionFixture("signal_restore");
+  std::filesystem::remove_all(options.output_dir);
+  constexpr std::array kStopSignals{SIGINT, SIGTERM, SIGHUP};
+  struct sigaction own {};
+  own.sa_handler = [](int) {};
+  sigemptyset(&own.sa_mask);
+  std::array<struct sigaction, kStopSignals.size()> before{};
+  for (std::size_t i = 0; i < kStopSignals.size(); ++i)
+    ASSERT_EQ(::sigaction(kStopSignals[i], &own, &before[i]), 0);
+  const int status = Launcher{options}.Run();
+  std::array<struct sigaction, kStopSignals.size()> after{};
+  for (std::size_t i = 0; i < kStopSignals.size(); ++i)
+    ::sigaction(kStopSignals[i], &before[i], &after[i]);
+  EXPECT_EQ(status, 0);
+  for (std::size_t i = 0; i < kStopSignals.size(); ++i) {
+    EXPECT_EQ(after[i].sa_handler, own.sa_handler)
+        << "signal " << SignalText(kStopSignals[i])
+        << " kept the launcher's handler after Run returned";
+  }
+  std::filesystem::remove_all(options.output_dir);
 }
 
 // A stop that arrives while the roster is being described ends the launch

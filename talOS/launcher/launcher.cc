@@ -327,6 +327,18 @@ Launcher::Launcher(LauncherOptions options) : options_{std::move(options)} {
 }
 
 int Launcher::Run() {
+  // Declared first, so destroyed last, on every return path: a roster
+  // launch's stop handlers give way to the dispositions the launcher's
+  // caller set only after RunSession has returned, which is after
+  // Supervise has reaped every member's run and killed its group (or no
+  // member was spawned, and DescribeGraph reaped every probe), and after
+  // RunSession's locals have unlinked the session's topic segments and
+  // released the session lock; and after the output drains have stopped
+  // and the session directory's lock is released, below. Until then a stop
+  // is the launcher's orderly one: none is lost, and none takes a default
+  // action (ending the launcher) while a member, a probe or a segment of
+  // the session exists. Afterwards there is nothing left for it to stop.
+  StopSignals stop_signals;
   // A session must not end because whoever reads the launcher's stdout or
   // stderr went away (a `tee` or a log pipe closing): its writes then fail
   // with EPIPE, which LauncherOutput survives (REQ-OPS-33). Children start
@@ -339,7 +351,7 @@ int Launcher::Run() {
     std::cerr << "launcher: " << e.what() << "; nothing was started\n";
     return 1;
   }
-  const int status = RunSession();
+  const int status = RunSession(stop_signals);
   // Every member has been reaped, so its pipe has ended; then the
   // launcher's own lines get the descriptors' linger.
   if (output_) output_->Stop();
@@ -349,7 +361,7 @@ int Launcher::Run() {
   return status;
 }
 
-int Launcher::RunSession() {
+int Launcher::RunSession(StopSignals& stop_signals) {
   // The flag overrides every graph refusal, the safety ones included
   // (REQ-SAFE-27/28) and the live-endpoint refusal, so it never reaches a
   // real controller: --sim requires the loopback remote (below). Refused
@@ -397,7 +409,7 @@ int Launcher::RunSession() {
   // session lock, its session directory, the probes, the topic segments,
   // the manifest): from here a stop request is an orderly stop at whatever
   // step it finds the launch (stopped_before_start below).
-  if (starts_roster) InstallSignals();
+  if (starts_roster) stop_signals.Install();
   // The launch stops before its roster starts: only what a launch that
   // recorded nothing holds exists yet (README "Session segments and logs"),
   // and the stop's exit status is 0, as for any requested stop.
@@ -948,6 +960,21 @@ std::string Launcher::StallReport(const NodeLaunch& launch, bool constructing,
               ? "still moving)"
               : "unchanged too, for " + ms(run.heartbeat_changed_at()) +
                     " ms)");
+}
+
+void Launcher::StopSignals::Install() {
+  if (!installed_) {
+    for (std::size_t i = 0; i < kSignals.size(); ++i)
+      ::sigaction(kSignals[i], nullptr, &saved_[i]);
+    installed_ = true;
+  }
+  InstallSignals();
+}
+
+Launcher::StopSignals::~StopSignals() {
+  if (!installed_) return;
+  for (std::size_t i = 0; i < kSignals.size(); ++i)
+    ::sigaction(kSignals[i], &saved_[i], nullptr);
 }
 
 void Launcher::InstallSignals() {
