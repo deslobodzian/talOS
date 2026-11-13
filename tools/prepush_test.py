@@ -40,17 +40,22 @@ class PrepushTest(unittest.TestCase):
         os.makedirs(self.tmpdir)
         self.log = os.path.join(self.tmp, "bazel_calls")
         self.out_path = os.path.join(self.tmp, "bazel-out")
-        put(os.path.join(self.out_path, "x.d"), DEPFILE)
+        # What the stub's build writes under the output path.
+        self.built = os.path.join(self.tmp, "built")
+        put(os.path.join(self.built, "x.d"), DEPFILE)
 
         # Each call records its working directory, its arguments, and
-        # whether the tracked file is writable there; STUB_FAIL fails that
-        # subcommand.
+        # whether the tracked file is writable there; a build writes the
+        # `.d` files under self.built to the output path; STUB_FAIL fails
+        # that subcommand.
         bin_dir = os.path.join(self.tmp, "bin")
         put(os.path.join(bin_dir, "bazel"),
             "#!/bin/sh\n"
             'if [ -w src/a.txt ]; then mode=writable; else mode=read-only; fi\n'
             f'echo "$PWD|$mode|$*" >> {shlex.quote(self.log)}\n'
             f'[ "$1" = info ] && echo {shlex.quote(self.out_path)}\n'
+            f'[ "$1" = build ] && mkdir -p {shlex.quote(self.out_path)} &&'
+            f' cp -R {shlex.quote(self.built)}/. {shlex.quote(self.out_path)}/\n'
             '[ "$1" = "${STUB_FAIL:-}" ] && { echo "stub: $1 failed"; exit 1; }\n'
             "exit 0\n",
             0o755)
@@ -109,13 +114,19 @@ class PrepushTest(unittest.TestCase):
             self.assertEqual(mode, "read-only", f"{step} ran on writable sources")
             self.assertIn("//...", args.split())
         self.assertIn("--nocache_test_results", steps["test"][2].split())
+        # Without these a compile that hit the disk cache leaves no `.d`
+        # file on disk, and host-includes cannot see what it read.
+        self.assertIn("--experimental_inmemory_dotd_files=false",
+                      steps["build"][2].split())
+        self.assertIn(r"--remote_download_regex=.*\.d$",
+                      steps["build"][2].split())
         self.assertIn("prepush: host-includes ok", out)
         self.assertIn("prepush: test ok", out)
         self.assert_cleaned_up()
 
     # REQ-DEV-25
     def test_a_failing_step_fails_the_run_naming_it(self):
-        put(os.path.join(self.out_path, "y.d"),
+        put(os.path.join(self.built, "y.d"),
             "y.o: y.cc /usr/include/toml++/toml.hpp\n")
         status, out, _ = self.prepush(STUB_FAIL="test")
         self.assertNotEqual(status, 0, out)
@@ -124,6 +135,16 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("prepush: test FAILED", out)
         self.assertIn("prepush: build ok", out)
         self.assert_cleaned_up()
+
+    # REQ-DEV-25
+    def test_host_includes_reads_only_this_builds_depfiles(self):
+        # A `.d` file an earlier run left in the reused output base, for a
+        # target this commit no longer has.
+        put(os.path.join(self.out_path, "gone.d"),
+            "gone.o: gone.cc /usr/include/toml++/toml.hpp\n")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: host-includes ok", out)
 
 
 if __name__ == "__main__":
