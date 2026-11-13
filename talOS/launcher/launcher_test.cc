@@ -2781,8 +2781,7 @@ TEST(LauncherSessions, RetentionKeepsASessionLockedAfterItsListing) {
   // beta) and talos.log: one byte short, so retention removes what it can.
   const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
   const auto launch = std::make_shared<std::optional<SessionDirectoryLock>>();
-  options.available_bytes = [launch, listed,
-                             floor](const std::filesystem::path&) {
+  options.available_bytes = [launch, listed](const std::filesystem::path&) {
     if (!*launch) {
       std::error_code error;
       *launch = SessionDirectoryLock::Create(
