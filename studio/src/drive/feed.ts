@@ -23,9 +23,12 @@
 //     ago), so it sets the values, shown stale, and never makes them current.
 //     The bridge's empty update every 100 ms re-sends the held tick when
 //     nothing changed, so a sequence_id that stops means the producer
-//     stopped. With the page ticking every RENDER_MS, a value is shown stale
-//     at most STALE_MS + RENDER_MS = 400 ms after its last update, inside
-//     REQ-OPS-36's 500 ms.
+//     stopped. The page draws at nextChangeAt() (view.ts DrawSchedule), so
+//     a value is shown stale STALE_MS after the receipt of its last new
+//     tick; with the bridge delivering that tick up to its 100 ms heartbeat
+//     late, 400 ms plus the network's delay after the producer's last tick,
+//     inside REQ-OPS-36's 500 ms. After suspend() (the page's clock missed a
+//     sleep) nothing is current until a new tick.
 //   - The failed link, upstream first: dashboard to bridge (no socket, or no
 //     message, heartbeat included, for SILENCE_MS: the bridge sends one at
 //     least every 100 ms), then telemetry (messages arrive but no new tick),
@@ -174,6 +177,7 @@ export class DriveModel {
   private summaryThisSocket = false;
   private tickThisSocket = false;  // the connect-time keyframe arrived
   private keyframeAt = 0;
+  private suspended = false;  // see suspend()
   private readonly tracked: Set<string>;
   private readonly histories = new Map<string, Point[]>();
 
@@ -218,15 +222,32 @@ export class DriveModel {
   // Whether the values held are current: a new tick within STALE_MS on an
   // open socket.
   fresh(now: number): boolean {
-    return this.connection === 'open' && this.lastTickAt !== null &&
+    return this.connection === 'open' && this.lastTickAt !== null && !this.suspended &&
         now - this.lastTickAt <= STALE_MS &&
         now - this.lastMessageAt <= SILENCE_MS;
   }
 
   // Whether the summary was sent on this socket, which is still heard.
   summaryFresh(now: number): boolean {
-    return this.connection === 'open' && this.summaryThisSocket &&
+    return this.connection === 'open' && this.summaryThisSocket && !this.suspended &&
         now - this.lastMessageAt <= SILENCE_MS;
+  }
+
+  // The earliest time from `now` at which fresh() or summaryFresh() turns
+  // false by time alone, or null when nothing held is current; the page
+  // draws then.
+  nextChangeAt(now: number): number|null {
+    if (this.connection !== 'open' || this.suspended) return null;
+    const deadlines = [this.lastMessageAt + SILENCE_MS];
+    if (this.lastTickAt !== null) deadlines.push(this.lastTickAt + STALE_MS);
+    const ahead = deadlines.filter(t => t >= now);
+    return ahead.length ? Math.min(...ahead) : null;
+  }
+
+  // The page's clock may have missed time (performance.now() standing still
+  // across a sleep): nothing held reads current until a new tick.
+  suspend() {
+    this.suspended = true;
   }
 
   history(channel: string): readonly Point[] {
@@ -251,6 +272,9 @@ export class DriveModel {
     if (now - this.lastMessageAt > SILENCE_MS)
       return {link: 'bridge', text: 'Dashboard to bridge link: nothing heard for ' +
                                     seconds(now - this.lastMessageAt)};
+    if (this.suspended)
+      return {link: 'telemetry', text: 'Telemetry stale: the page missed time (laptop asleep), ' +
+                                       'waiting for a new tick'};
     if (!this.tickThisSocket) {
       if (now - this.openedAt <= CONNECTING_GRACE_MS)
         return {link: 'connecting', text: 'Connected, waiting for telemetry'};
@@ -285,6 +309,7 @@ export class DriveModel {
     this.tickThisSocket = false;
     this.summaryThisSocket = false;
     this.lastTickAt = null;
+    this.suspended = false;  // nothing of the new socket is current before a new tick
     this.connection = 'connecting';
     if (this.counters.connects === 0) this.firstAttemptAt = now;
     this.attemptAt = now;
@@ -380,7 +405,10 @@ export class DriveModel {
     this.record(s);
     // The connect-time keyframe is as old as the bridge's newest tick, which
     // the page cannot tell: only a tick after it on this socket is current.
-    if (!keyframe) this.lastTickAt = now;
+    if (!keyframe) {
+      this.lastTickAt = now;
+      this.suspended = false;
+    }
   }
 
   private record(s: Snapshot) {

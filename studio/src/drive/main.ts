@@ -1,13 +1,14 @@
 // The driver dashboard page (drive.html, served at /drive): loads the layout
 // from /drive/layout.json, holds one /drive feed socket through DriveModel
-// and redraws every RENDER_MS. Everything it loads comes from the bridge that
-// served it; it keeps nothing in browser storage.
+// and redraws every RENDER_MS and at each freshness deadline (DrawSchedule).
+// Everything it loads comes from the bridge that served it; it keeps nothing
+// in browser storage.
 
 import './drive.css';
 
 import {DriveModel, type DriveSocket, RECONNECT_MS, RENDER_MS} from './feed';
 import {type Layout, parseLayout} from './layout';
-import {esc, METRICS, outOfView, outOfViewText, Painter, renderShell, renderStatus, renderWidget, type Surface} from './view';
+import {DrawSchedule, esc, METRICS, outOfView, outOfViewText, Painter, renderShell, renderStatus, renderWidget, type Surface} from './view';
 
 const root = document.getElementById('drive')!;
 const now = () => performance.now();
@@ -90,24 +91,31 @@ async function run() {
   // A drawing fault must not stop the page or leave the grid looking
   // current: Painter reports it, and the grid is marked until a good draw.
   const painter = new Painter(surface);
-  const render = () => {
+  const schedule = new DrawSchedule(model, t => {
     painter.paint(() => {
-      const t = now();
       model.tick(t);
       return {status: renderStatus(model, t, layout.skipped),
               widgets: layout.widgets.map(w => renderWidget(w, model, t))};
     });
     countOutOfView();
-  };
+  }, {
+    now,
+    wall: () => Date.now(),
+    setTimeout: (fn, ms) => window.setTimeout(fn, ms),
+    clearTimeout: handle => window.clearTimeout(handle)
+  });
   root.addEventListener('click', event => {
     if ((event.target as Element).closest('[data-action="reconnect"]')) {
       model.reconnect(now());
-      render();
+      schedule.frame();
     }
   });
+  // A background tab's timers run at most once a second: on its return the
+  // page draws at once rather than show a frame up to 1 s old as current.
+  document.addEventListener('visibilitychange', () => schedule.frame());
   model.start(now());
-  render();
-  setInterval(render, RENDER_MS);
+  schedule.frame();
+  setInterval(() => schedule.frame(), RENDER_MS);
 }
 
 void run();
