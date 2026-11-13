@@ -109,6 +109,17 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
+// Whether ShmObjectName maps names into a namespace of their own
+// (talOS/memory/shared_memory_ptr.h): one of its variables is set and not
+// empty.
+bool Namespaced() {
+  for (const char* name : {"TALOS_SHM_NAMESPACE", "TEST_TMPDIR"}) {
+    const char* value = std::getenv(name);
+    if (value != nullptr && *value != '\0') return true;
+  }
+  return false;
+}
+
 int RemainingMs(Clock::time_point deadline) {
   const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
       deadline - std::chrono::steady_clock::now());
@@ -334,8 +345,10 @@ class Session {
     if (events_ >= 0) ::close(events_);
     std::filesystem::remove_all(output_dir_);
     // The launcher prepared the registry in this test's namespace, and a
-    // registry outlives its sessions by design.
-    talos::introspect::RegistryMapping::unlink();
+    // registry outlives its sessions by design. Without a namespace
+    // (TEST_TMPDIR, TALOS_SHM_NAMESPACE) the name is the production
+    // registry's, which a live session beside the test may be using.
+    if (Namespaced()) talos::introspect::RegistryMapping::unlink();
   }
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
