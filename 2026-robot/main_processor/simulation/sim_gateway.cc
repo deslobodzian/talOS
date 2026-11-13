@@ -11,6 +11,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "geometry/geometry_descriptor.h"
@@ -241,6 +242,21 @@ int main(int argc, char** argv) {
       // The wire carries no motor type: a config the bridge pushes later
       // keeps each motor's type from this parse, matched by name.
       physics_backend.SetLocalMotorTypes(hw_config);
+      // Nor home switches ([digital_inputs.*] sim_motor): bound by name,
+      // they survive a pushed config too. Set before Reconfigure, which
+      // binds them, so the first State already reads them.
+      std::vector<talos::hardware::sim::HomeSwitch> home_switches;
+      home_switches.reserve(hw_config.digital_inputs.size());
+      for (const auto& input : hw_config.digital_inputs) {
+        const auto& sim = input.sim_home_switch;
+        if (sim.motor.empty()) continue;
+        home_switches.push_back({.input = input.name,
+                                 .motor = sim.motor,
+                                 .closed_at_rot = sim.closed_at_rot,
+                                 .closed_above = sim.closed_above,
+                                 .closed_reads = sim.closed_reads});
+      }
+      physics_backend.SetHomeSwitches(std::move(home_switches));
       if (!gateway.Reconfigure(hw_config)) {
         throw std::runtime_error(
             "sim_gateway: Reconfigure failed for the robot config");

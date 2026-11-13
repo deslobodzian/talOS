@@ -311,8 +311,10 @@ runs the robot in simulation. `robot_sim.toml` is the simulation-only config
 wrist moves there only after you append the block the generator's `Next:`
 output prints to it: a teleop binding on button 3 (`position_rot = 1.0`), a
 `[targets]` override for an autonomous policy with no writer, a simulated
-travel (`max_rot`, and a `home_margin_rot` past it, because the simulator's
-home switch reads closed at every position) and simulated `slot0` gains.
+travel (`max_rot`), a simulated home switch on `wrist_home` that closes just
+below where the motor starts (`sim_motor`, `sim_closed_at_rot`; see
+[the hardware README](../../talOS/hardware/README.md)), so homing drives to
+it, and simulated `slot0` gains.
 `subsystems/wrist.toml` keeps its binding commented and its gains zero, so
 none of these values reaches the robot. `Next:` also prints the `sim.sh`
 command that holds button 3.

@@ -415,10 +415,9 @@ read the `claw` node instead, from the session directory `sim.sh` printed:
   rules every node follows: [node guide](NODE_DEVELOPMENT_GUIDE.md) and
   [methodology](METHODOLOGY.md).
 - A position mechanism's block also sets a simulated travel and gains, and
-  a `home_margin_rot` past the travel: the simulator's home switch reads
-  closed at every position, so the mechanism zeroes where it starts, and
-  without that margin the stuck-switch check stops it 0.5 rotations from
-  home.
+  a simulated home switch (`sim_motor`, `sim_closed_at_rot` on its
+  `[digital_inputs.*]` entry) that closes 0.1 rotations below where the
+  motor starts, so the mechanism homes by driving to it, as on the robot.
 - Putting a mechanism on another robot, such as `2026-robot`: the scaffold
   takes `--robot DIR`. Its `Next:` names that robot's simulation config
   (`robot_physics_sim.toml` for `2026-robot`), or the three lines that

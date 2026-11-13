@@ -3,7 +3,8 @@ position mechanism (position_cpp), edited exactly as their `Next:` output
 says and run the way it says (the launcher with sim_gateway --physics and
 its mode and joystick schedules, as `./sim.sh --sim-gateway` starts them),
 moves each motor to the goal its teleop binding holds while button 3 is
-held. The node binaries are new_subsystem's goldens, which
+held, the position mechanism after homing on its simulated home switch.
+The node binaries are new_subsystem's goldens, which
 new_subsystem_test keeps equal to its output."""
 
 import json
@@ -171,6 +172,16 @@ class ScaffoldSimTest(unittest.TestCase):
                         self.assertLessEqual(
                             abs(float(at_goal[0]["position_rot"]) - goal),
                             tolerance)
+                        # It homed by driving to the simulated switch, not
+                        # by zeroing where it started on a switch that
+                        # reads closed everywhere.
+                        (switch,) = subsystems[mechanism][
+                            "digital_inputs"].values()
+                        homing = [float(f["position_rot"]) for f in driven
+                                  if f["homing"] == "HOMING"]
+                        self.assertTrue(homing, f"{mechanism} never homed")
+                        self.assertLessEqual(min(homing),
+                                             switch["sim_closed_at_rot"])
                     else:
                         goal = binding["while_held"]["velocity_rps"]
                         fastest = max(float(f["velocity_rps"])
