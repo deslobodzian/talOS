@@ -8,6 +8,7 @@ load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES")
 package(default_visibility = ["//visibility:public"])
 
 exports_files([
+    "dashboard.toml",
     "robot.toml",
     "robot_field.toml",
     "robot_physics_sim.toml",
@@ -36,6 +37,7 @@ cc_test(
         "//2026-robot/main_processor/drivetrain:swerve",
         "//2026-robot/main_processor/vision/data:field_layout_2026",
         "//talOS/configuration",
+        "//talOS/telemetry:dashboard_layout",
         "//talOS/vision/field_sim",
         "@googletest//:gtest",
         "@googletest//:gtest_main",

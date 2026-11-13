@@ -5,6 +5,7 @@
 
 #include "drivetrain/geometry.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "talOS/vision/field_sim/field_layout_loader.h"
 #include "vision/data/field_layout_2026.h"
 
@@ -25,6 +26,23 @@ TEST(ConfigTest, EveryDeploymentRemainsUncommissionedWithBoundedCommands) {
     EXPECT_EQ(config.hardware.command_timeout_us, 100000u);
     for (const char* name : {"drivetrain", "shooter", "intake"}) {
       EXPECT_TRUE(config.TargetsFor(name).test.empty()) << name;
+    }
+  }
+}
+
+// Every deployment serves the drive team a dashboard whose layout the page
+// can draw within its feed budget (talOS/telemetry/README.md "Dashboard
+// layout"); that each channel exists is the telemetry node's check.
+// REQ-OPS-39
+TEST(ConfigTest, EveryDeploymentNamesAValidDashboardLayout) {
+  for (const char* path : kDeployments) {
+    SCOPED_TRACE(path);
+    const auto config = ParseRobotConfig(path);
+    ASSERT_FALSE(config.studio.dashboard.empty());
+    try {
+      talos::telemetry::ParseDashboardLayout(config.studio.dashboard);
+    } catch (const talos::telemetry::DashboardLayoutError& error) {
+      ADD_FAILURE() << error.what();
     }
   }
 }

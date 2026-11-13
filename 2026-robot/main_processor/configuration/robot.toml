@@ -31,13 +31,16 @@ test = []
 # supervises it when asked (--start-studio-bridge, which sim.sh passes unless
 # --no-studio) and carries it in the declared graph. It watches `topic`, the
 # telemetry node's byte topic (/talos/telemetry). All keys optional; shown
-# values are the defaults.
+# values are the defaults. `dashboard`, unset by default, names the driver
+# dashboard's layout relative to this file (talOS/telemetry/README.md
+# "Dashboard layout").
 [studio]
 bridge = "//studio/bridge:studio_bridge"
 http_port = 5800
 webroot = "bazel-bin/studio/dist"
 topic = "/talos/telemetry"
 pose_topic = "/pose_estimator/state"
+dashboard = "dashboard.toml"
 
 # Subsystem manifest. Each entry names one subsystem and the file holding its
 # config, pathed relative to this file; an optional `node = "//pkg:target"`
