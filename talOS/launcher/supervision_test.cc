@@ -2060,5 +2060,104 @@ TEST(Supervision, SessionDirectoryLockIsRefreshedAndRetakenWhileHeld) {
   ::remove(runs.c_str());
 }
 
+// Options for a session in which nothing falls due on its own for an hour
+// (the session lock's refresh): no member is looked at, stalls, misses its
+// grace or construction deadline, or ends, and the duration is an hour. A
+// test adds the one deadline it checks; the loop must wake for it alone.
+LauncherOptions NothingDueOptions(std::string_view tag, const std::string& runs,
+                                  std::string_view member_prefix = "") {
+  auto options = BaseOptions(tag);
+  options.max_restarts = 0;
+  options.duration_s = 3600;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 3'600'000;
+  options.construction_timeout = 1h;
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] = WriteStub(
+        std::string{tag} + "_" + name,
+        std::string{member_prefix} + RecordLogArgThen(runs, "exec sleep 60\n"),
+        name);
+  }
+  return options;
+}
+
+// The stop timeout's SIGKILL is a deadline of its own: with members that
+// ignore the stop's SIGINT and nothing else due, the loop wakes for it, so
+// the session ends one stop timeout after SIGTERM, each run ended
+// stop_timeout. A loop that did not sleep until it would sleep for an hour;
+// the test then wakes it itself after kStopTimeout + 10 s (the hang bound,
+// docs/TESTING.md §6.3) and fails.
+// REQ-OPS-06, REQ-OPS-45
+TEST(Supervision, StopTimeoutAloneWakesTheLoop) {
+  const auto runs = TempPath("stop_wake_runs");
+  ::remove(runs.c_str());
+  auto options = NothingDueOptions("stop_wake", runs, "trap '' INT HUP\n");
+  std::atomic<bool> returned{false};
+  bool rescued = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const auto wait = [&](const std::function<bool()>& done,
+                          std::chrono::steady_clock::duration bound) {
+      const auto give_up = std::chrono::steady_clock::now() + bound;
+      while (!stop.stop_requested() && !done() &&
+             std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(2ms);
+      return done();
+    };
+    wait([&] { return ReadLines(runs).size() == 3; }, 10s);
+    ::kill(::getpid(), SIGTERM);
+    if (!wait([&] { return returned.load(); }, kStopTimeout + 10s)) {
+      rescued = true;
+      SupervisionWakeup::Wake();
+    }
+  }};
+  RunSession(options);
+  returned = true;
+  driver.join();
+  EXPECT_FALSE(rescued) << "the stop timeout's SIGKILL waited for a wake";
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_FALSE(history.empty()) << manifest;
+  EXPECT_NE(history.back().find("\"reason\": \"stop_timeout\""),
+            std::string::npos)
+      << history.back();
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// The Studio bridge's retry is a deadline of its own: its first attempt
+// exits at once, nothing else is due, and the loop wakes one retry
+// interval later to spawn the second. A loop that did not sleep until it
+// would not retry for an hour; 10 s bounds the wait (docs/TESTING.md §6.3).
+// REQ-OPS-30, REQ-OPS-45
+TEST(Supervision, StudioBridgeRetryAloneWakesTheLoop) {
+  const auto runs = TempPath("studio_wake_runs");
+  const auto attempts = TempPath("studio_wake_attempts");
+  ::remove(runs.c_str());
+  ::remove(attempts.c_str());
+  auto options = NothingDueOptions("studio_wake", runs);
+  options.start_studio_bridge = true;
+  options.binary_overrides["//studio/bridge:studio_bridge"] =
+      WriteStub("studio_wake_bridge", "echo x >> " + attempts + "\nexit 1\n",
+                "studio_bridge");
+  bool retried = false;
+  std::jthread driver{[&](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (!stop.stop_requested() && ReadLines(attempts).size() < 2 &&
+           std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(2ms);
+    retried = ReadLines(attempts).size() >= 2;
+    ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  driver.join();
+  EXPECT_TRUE(retried) << "the bridge's retry waited for an unrelated wake";
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(attempts.c_str());
+}
+
 }  // namespace
 }  // namespace talos::launcher
