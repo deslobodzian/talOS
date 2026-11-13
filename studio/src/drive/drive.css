@@ -151,8 +151,9 @@ html, body {
   overflow: hidden;
 }
 
+/* The heading gives way last: a long session label in it ellipsizes first. */
 .w h2 {
-  flex: 1;
+  flex: 1 1 auto;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
@@ -162,6 +163,14 @@ html, body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.w > header .meta {
+  flex: 0 1000 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .w h3 { margin: 4px 0 2px; font-size: 14px; color: var(--muted); font-weight: 600; }

@@ -526,7 +526,7 @@ test('the subsystems widget lists the summary, one state word per row', () => {
       node('hardware_node', {}), node('drivetrain', {restarts: 2, drives: 'teleop'}),
       node('shooter', {alive: false, quarantined: true})]}));
   const html = widgetHtml(render(h), 'Subsystems');
-  assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 2<\/span><span class="meta">drives teleop/);
+  assert.match(html, /drivetrain<\/span><span class="tag tag-good">UP<\/span><span class="meta">restarts 2 · drives teleop/);
   assert.match(html, /shooter<\/span><span class="tag tag-bad">FAILING<\/span>/);
   for (const row of html.match(/<li>.*?<\/li>/g) ?? [])
     assert.ok((row.match(/class="tag /g) ?? []).length <= 1, `two state words in ${row}`);
@@ -756,23 +756,27 @@ test('a subsystems widget with a node filter shows every named node', () => {
   assert.doesNotMatch(html, /more</, '"+N more" counts nodes the filter does not admit');
 });
 
-// REQ-OPS-34, REQ-OPS-39: at 1366x768 (a Driver Station laptop) every row of
-// the 2026 layout's lists is visible without scrolling: the subsystems cell
-// holds 14 nodes (the 13 of a 2026 session and one spare) and the pre-match
-// cell all its checks. Computed from the page's box sizes, which the page
-// writes as the custom properties drive.css lays out with; a browser
-// screenshot is what verifies it.
-test('the 2026 lists fit their cells at 1366x768', () => {
-  const page = {width: 1366, height: 768};
+// REQ-OPS-49: at 1366x768 (a Driver Station laptop) every row of the 2026
+// layout's lists is visible without scrolling: the subsystems cell holds 14
+// nodes (the 13 of a 2026 session and one spare) and the pre-match cell all
+// its checks. At 1280x720 (a smaller laptop) the subsystems cell is 294 px
+// wide: with columns of at least 150 px it fell to one column of 9 rows, so
+// the minimum is low enough for two there too, and every row still fits.
+// Computed from the page's box sizes, which the page writes as the custom
+// properties drive.css lays out with; a browser screenshot verifies it.
+test('the 2026 lists fit their cells at 1366x768 and 1280x720', () => {
   const subsystems = LAYOUT.widgets.find(w => w.kind === 'subsystems')!;
   const checks = LAYOUT.widgets.find(w => w.kind === 'checks')!;
   assert.equal(checks.kind, 'checks');
-  const nodeRows = listRowsFit(LAYOUT, subsystems.at, page, METRICS.node_column);
-  assert.ok(nodeRows >= 14,
-            `subsystems at ${JSON.stringify(subsystems.at)} shows ${nodeRows} rows, needs 14`);
-  const checkRows = listRowsFit(LAYOUT, checks.at, page, METRICS.check_column);
-  assert.ok(checkRows >= checks.items.length,
-            `checks at ${JSON.stringify(checks.at)} shows ${checkRows} rows, needs ${checks.items.length}`);
+  for (const page of [{width: 1366, height: 768}, {width: 1280, height: 720}]) {
+    const size = `${page.width}x${page.height}`;
+    const nodeRows = listRowsFit(LAYOUT, subsystems.at, page, METRICS.node_column);
+    assert.ok(nodeRows >= 14,
+              `${size}: subsystems at ${JSON.stringify(subsystems.at)} shows ${nodeRows} rows, needs 14`);
+    const checkRows = listRowsFit(LAYOUT, checks.at, page, METRICS.check_column);
+    assert.ok(checkRows >= checks.items.length,
+              `${size}: checks at ${JSON.stringify(checks.at)} shows ${checkRows} rows, needs ${checks.items.length}`);
+  }
   // The stylesheet lays out with exactly these sizes: it reads every one and
   // no other --drive-* property.
   const css = readFileSync(new URL('../src/drive/drive.css', import.meta.url), 'utf8');
@@ -782,11 +786,11 @@ test('the 2026 lists fit their cells at 1366x768', () => {
 });
 
 // REQ-OPS-49: each row keeps its name readable beside its state. At 1366x768
-// the 2026 subsystems cell gives two columns; the worst-case row (each state
-// word, with both notes, restarts and drives) still shows the name's floor,
-// and enough of each 2026 node name to tell them apart (front_left_camera
-// from front_right_camera). A model: glyph widths are GLYPH_PX, not a
-// browser's; a browser screenshot verifies it.
+// and 1280x720 the 2026 subsystems cell gives two columns; the worst-case row
+// (each state word, with its note of restarts and drives) still shows the
+// name's floor, and enough of each 2026 node name to tell them apart
+// (front_left_camera from front_right_camera). A model: glyph widths are
+// GLYPH_PX, not a browser's; a browser screenshot verifies it.
 test('a 2026 subsystems row keeps a readable name beside its widest state word', () => {
   const names = ['hardware_node', 'autonomous', 'drivetrain', 'intake', 'driver', 'pose_estimator',
                  'shooter', 'telemetry', 'teleop', 'front_left_camera', 'front_right_camera',
@@ -794,17 +798,20 @@ test('a 2026 subsystems row keeps a readable name beside its widest state word',
   // The shortest prefix length that tells every name apart.
   let distinct = 1;
   while (new Set(names.map(n => n.slice(0, distinct))).size < names.length) distinct++;
-  const subsystems = LAYOUT.widgets.find(w => w.kind === 'subsystems')!;
-  const column = listColumns(LAYOUT, subsystems.at, {width: 1366, height: 768}, METRICS.node_column);
-  for (const word of Object.values(NODE_STATE)) {
-    const shown = nameCharsShown(column.width, word, 2);
-    assert.ok(shown + 1 >= METRICS.name_min_ch,
-              `${word}: a ${column.width.toFixed(1)} px column leaves the name ${shown} characters, ` +
-              `under its floor of ${METRICS.name_min_ch} ch, so the word is squeezed`);
-    assert.ok(shown >= distinct,
-              `${word}: the name shows ${shown} characters, ${distinct} tell the 2026 nodes apart`);
-  }
   assert.ok(METRICS.name_min_ch - 1 >= distinct, 'the name floor cannot tell the 2026 nodes apart');
+  const subsystems = LAYOUT.widgets.find(w => w.kind === 'subsystems')!;
+  for (const page of [{width: 1366, height: 768}, {width: 1280, height: 720}]) {
+    const column = listColumns(LAYOUT, subsystems.at, page, METRICS.node_column);
+    for (const word of Object.values(NODE_STATE)) {
+      const at = `${page.width}x${page.height}, ${word}, a ${column.width.toFixed(1)} px column`;
+      const shown = nameCharsShown(column.width, word, 1);
+      assert.ok(shown + 1 >= METRICS.name_min_ch,
+                `${at}: the name keeps ${shown} characters, under its floor of ` +
+                `${METRICS.name_min_ch} ch, so the word is squeezed`);
+      assert.ok(shown >= distinct, `${at}: the name shows ${shown} characters, ${distinct} ` +
+                                   'tell the 2026 nodes apart');
+    }
+  }
 });
 
 // REQ-OPS-36: when the subsystems list is longer than its cell, the rows

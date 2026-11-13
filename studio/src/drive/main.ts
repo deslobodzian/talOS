@@ -71,12 +71,20 @@ async function run() {
       grid.classList.toggle('errored', on);
     }
   };
-  // Each list widget's heading says how many of its rows are out of view,
-  // measured here where the rows are laid out (outOfView does the counting).
+  // Each list widget's body shows whole rows only (its height snapped to a
+  // multiple of the row height, from the space its cell leaves it), and its
+  // heading says how many rows are out of view, measured here where the rows
+  // are laid out (outOfView does the counting).
   const countOutOfView = () => {
-    for (const list of grid.querySelectorAll('.w')) {
+    for (const list of grid.querySelectorAll<HTMLElement>('.w')) {
       const badge = list.querySelector('.out-of-view'), b = body(list);
       if (!badge || !b) continue;
+      const room = list.clientHeight - 2 * METRICS.cell_pad_y - METRICS.header;
+      const height = `${Math.max(1, Math.floor(room / METRICS.row)) * METRICS.row}px`;
+      if (b.style.height !== height) {
+        b.style.flex = 'none';
+        b.style.height = height;
+      }
       let text = '';
       if (b.scrollHeight > b.clientHeight) {
         const origin = b.getBoundingClientRect().top - b.scrollTop;

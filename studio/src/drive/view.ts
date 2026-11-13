@@ -195,10 +195,11 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
     const restarts = summary.supervised && n.restarts > 0 ? `restarts ${n.restarts}` : '';
     const drives = summary.registry && n.drives !== null ? `drives ${n.drives}` : '';
     // The name's tooltip repeats what a narrow row may cut off.
-    const title = [n.name, restarts, drives].filter(Boolean).join(' · ');
+    // One note for both, so a narrow row loses one gap to it, not two.
+    const note = [restarts, drives].filter(Boolean).join(' · ');
+    const title = [n.name, note].filter(Boolean).join(' · ');
     return `<li><span class="name" title="${esc(title)}">${esc(n.name)}</span>${state}` +
-        (restarts ? `<span class="meta">${restarts}</span>` : '') +
-        (drives ? `<span class="meta">${esc(drives)}</span>` : '') + '</li>';
+        (note ? `<span class="meta">${esc(note)}</span>` : '') + '</li>';
   });
   if (summary.omitted > 0 && !w.nodes.length)
     rows.push(`<li class="more">+${summary.omitted} more</li>`);
@@ -536,7 +537,7 @@ export const METRICS = {
   tag_font: 12,
   min_font: 12,       // no text is smaller
   list_gap: 8,        // between list columns
-  node_column: 150,   // the narrowest subsystems column: a name and a state word
+  node_column: 140,   // the narrowest subsystems column: two fit the 2026 cell at 1280 px
   check_column: 220,  // the narrowest checks column: a verdict and a label
   item_gap: 4,        // between a row's name, state word and notes
   tag_pad_x: 5,       // a state word's padding left and right
@@ -587,7 +588,8 @@ export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
 }
 
 // How many characters of a row's name show beside `word` and `notes` notes
-// (restarts, drives: shrunk to nothing first, each still a gap) in a list
+// (a subsystems row has at most one, restarts and drives: shrunk to nothing
+// first, still a gap) in a list
 // column `width` px wide, by the GLYPH_PX model: what the row leaves after
 // its gaps and the word's box, less one character for the ellipsis of a cut
 // name.
