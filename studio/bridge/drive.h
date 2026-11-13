@@ -8,7 +8,8 @@
  *   client's budget reserved out of it before programmer clients share the
  *   rest, so no programmer client can defer a drive client's send.
  * - DriveSlots: the drive clients held, outside `max_clients`; a new one
- *   evicts the oldest.
+ *   evicts the oldest. Each slot owns its client's egress bucket, so a
+ *   reconnect never starts from a fresh burst.
  * - DriveMask: which dictionary channels a drive client is sent.
  * - BuildDriveSummary / DriveSummaryJson: the drive summary, what the
  *   `subsystems` widget needs that channels cannot give (a dead node raises
@@ -75,7 +76,8 @@ struct EgressPlan {
 };
 
 // Every send's budget: a programmer client's is charged to its own bucket
-// and to the shared one, a drive client's to its own bucket only. The shared
+// and to the shared one, a drive client's to its slot's bucket only
+// (DriveSlots::Budget). The shared
 // bucket refills at the programmer share alone, so however much programmer
 // clients spend, a drive client's sends wait only for its own bucket, and
 // the rates add up to the total.
@@ -121,34 +123,78 @@ inline constexpr int kDriveEvictedCloseCode = 4000;
 inline constexpr std::string_view kDriveEvictedReason =
     "replaced by a newer driver dashboard";
 
-// The drive clients held, oldest first. A laptop reconnecting after a Wi-Fi
-// drop always gets in: its new connection evicts the oldest, which may be
-// its own dead one that the idle timeout has not closed yet.
+// The drive clients held, oldest first, each in one of `capacity` slots. A
+// laptop reconnecting after a Wi-Fi drop always gets in: its new connection
+// evicts the oldest, which may be its own dead one that the idle timeout has
+// not closed yet.
+//
+// Each slot owns the egress bucket its client is charged to (BridgeEgress),
+// and a bucket outlives the clients that hold its slot: a connection takes
+// the bucket of the slot it fills, as the evicted or departed client left
+// it. So reconnecting never mints bytes, and every drive client together
+// sends at most `capacity` buckets' rate and burst, however often pages
+// reconnect (REQ-OPS-35).
 template <class Client>
 class DriveSlots {
  public:
-  explicit DriveSlots(std::size_t capacity = 0) : capacity_{capacity} {}
+  static constexpr std::size_t kNoSlot = static_cast<std::size_t>(-1);
 
-  // Holds `client` as the newest. Returns the oldest when that leaves more
-  // than the capacity held: it is no longer held, and the caller closes it.
-  std::optional<Client> Admit(Client client) {
-    clients_.push_back(client);
-    if (clients_.size() <= capacity_) return std::nullopt;
-    Client oldest = clients_.front();
-    clients_.erase(clients_.begin());
-    return oldest;
+  struct Admission {
+    std::size_t slot{kNoSlot};      // the slot the client now holds
+    std::optional<Client> evicted;  // the oldest, which lost that slot
+  };
+
+  explicit DriveSlots(std::size_t capacity = 0)
+      : slots_(capacity), budgets_(capacity) {}
+
+  // Holds `client` as the newest, in a free slot, or else in the oldest's,
+  // which is then no longer held and is returned for the caller to close.
+  // With no slots at all, `client` itself is returned and nothing is held.
+  Admission Admit(Client client) {
+    if (slots_.empty()) return {kNoSlot, client};
+    Admission admission;
+    if (order_.size() == slots_.size()) {
+      admission.evicted = order_.front();
+      order_.erase(order_.begin());
+      admission.slot = SlotOf(*admission.evicted);
+    } else {
+      admission.slot = static_cast<std::size_t>(
+          std::find(slots_.begin(), slots_.end(), std::nullopt) -
+          slots_.begin());
+    }
+    slots_[admission.slot] = client;
+    order_.push_back(client);
+    return admission;
   }
 
+  // Frees `client`'s slot, if it holds one; the slot's bucket stays.
   void Remove(Client client) {
-    clients_.erase(std::remove(clients_.begin(), clients_.end(), client),
-                   clients_.end());
+    const std::size_t slot = SlotOf(client);
+    if (slot == kNoSlot) return;
+    slots_[slot].reset();
+    order_.erase(std::remove(order_.begin(), order_.end(), client),
+                 order_.end());
   }
 
-  const std::vector<Client>& clients() const { return clients_; }
+  // The bucket `client` is charged to; nullptr when it holds no slot (it
+  // was evicted), so it is sent nothing more.
+  EgressBudget* Budget(Client client) {
+    const std::size_t slot = SlotOf(client);
+    return slot == kNoSlot ? nullptr : &budgets_[slot];
+  }
+
+  const std::vector<Client>& clients() const { return order_; }
 
  private:
-  std::size_t capacity_;
-  std::vector<Client> clients_;
+  std::size_t SlotOf(Client client) const {
+    const auto at = std::find(slots_.begin(), slots_.end(), client);
+    return at == slots_.end() ? kNoSlot
+                              : static_cast<std::size_t>(at - slots_.begin());
+  }
+
+  std::vector<std::optional<Client>> slots_;
+  std::vector<EgressBudget> budgets_;  // by slot
+  std::vector<Client> order_;          // held, oldest first
 };
 
 // Which dictionary channels a drive client is sent: the layout's channels
@@ -402,9 +448,10 @@ class DriveSummaryFeed {
 // One /drive client: the dictionary, then the masked telemetry at most
 // `update_hz` updates a second, then the summary. It is sent no system graph.
 // Until it holds a telemetry tick (no telemetry yet, or a new dictionary
-// awaiting its keyframe), kHeartbeat goes whenever nothing else has for
-// ClientFeed::kHeartbeatNs, so the page tells a bridge that is up but has no
-// telemetry from a link that is down.
+// awaiting its keyframe or the budget for its pages), kHeartbeat goes
+// whenever nothing else has for ClientFeed::kHeartbeatNs and the budget
+// affords it, so the page tells a bridge that is up but has no telemetry
+// from a link that is down.
 class DriveFeed {
  public:
   static constexpr std::string_view kHeartbeat =

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -456,14 +457,93 @@ TEST(BridgeEgress, AProgrammerFloodNeverDefersADriveClient) {
 // laptop reconnecting after a Wi-Fi drop always gets a slot.
 TEST(DriveSlots, ANewClientPastCapacityEvictsTheOldest) {
   DriveSlots<char> slots(2);
-  EXPECT_FALSE(slots.Admit('a').has_value());
-  EXPECT_FALSE(slots.Admit('b').has_value());
-  EXPECT_EQ(slots.Admit('c'), 'a');
+  EXPECT_FALSE(slots.Admit('a').evicted.has_value());
+  EXPECT_FALSE(slots.Admit('b').evicted.has_value());
+  const auto c = slots.Admit('c');
+  EXPECT_EQ(c.evicted, 'a');
+  EXPECT_EQ(c.slot, 0u) << "c takes the slot a held";
+  EXPECT_EQ(slots.Budget('a'), nullptr) << "an evicted client is sent nothing";
   EXPECT_EQ(slots.clients(), (std::vector<char>{'b', 'c'}));
   slots.Remove('b');
-  EXPECT_FALSE(slots.Admit('d').has_value());
-  EXPECT_EQ(slots.Admit('e'), 'c');
+  const auto d = slots.Admit('d');
+  EXPECT_FALSE(d.evicted.has_value());
+  EXPECT_EQ(d.slot, 1u) << "d takes the slot b freed";
+  EXPECT_EQ(slots.Admit('e').evicted, 'c');
   EXPECT_EQ(slots.clients(), (std::vector<char>{'d', 'e'}));
+}
+
+// REQ-OPS-35
+// Reconnecting never mints bytes: three pages on two slots replace each
+// other every 20 ms for 10 s, and each new connection is sent the
+// dictionary, a keyframe and a 4,000 B summary from the bucket of the slot
+// it fills. Every drive byte sent by any instant t stays within
+// drive_clients x budget_bytes_per_s x t + drive_clients x burst, so the
+// reservation out of the bridge's 160,000 B/s holds. Once the churn stops,
+// the newest page still gets the whole dictionary, in order, then a
+// keyframe.
+TEST(DriveSlots, ReconnectingNeverMintsBytes) {
+  constexpr std::uint32_t kDriveClients = 2;
+  constexpr std::uint32_t kBudget = 24000;
+  constexpr std::int64_t kChurnEndNs = 10'000'000'000;
+  BridgeEgress egress{EgressPlan::Of(4, kDriveClients, kBudget)};
+  DriveSlots<int> slots(kDriveClients);
+  std::map<int, DriveFeed> feeds;
+  std::map<int, std::vector<std::string>> binaries;
+  TelemetryState state = WithDictionary();
+  Tick(state, 1, 0.5);
+  DriveMask mask({"drive/velocity"}, true);
+  const std::string summary(4000, 's');
+  double sent = 0;
+  const auto pump = [&](int client, std::int64_t now) {
+    EgressBudget* budget = slots.Budget(client);
+    ASSERT_NE(budget, nullptr);
+    const auto charge = [&](std::string_view bytes) {
+      const std::size_t framed = EgressBudget::framed(bytes.size());
+      egress.Spend(*budget, true, framed);
+      sent += static_cast<double>(framed);
+      return true;
+    };
+    feeds[client].Pump(
+        summary, state, mask.For(state), now,
+        [&](std::size_t framed) {
+          std::int64_t wait = 0;
+          return egress.Affordable(*budget, true, framed, now, wait);
+        },
+        charge,
+        [&](std::string_view page) {
+          binaries[client].emplace_back(page);
+          return charge(page);
+        });
+  };
+  int next = 0;
+  for (std::int64_t now = 0; now <= kChurnEndNs; now += kMs) {
+    if (now % (20 * kMs) == 0) {
+      const auto admitted = slots.Admit(next);
+      if (admitted.evicted) feeds.erase(*admitted.evicted);
+      feeds[next].Configure(20);
+      ++next;
+    }
+    for (const int client : slots.clients()) pump(client, now);
+    const double bound =
+        static_cast<double>(kDriveClients) * kBudget *
+            (static_cast<double>(now) * 1e-9) +
+        static_cast<double>(kDriveClients) * EgressBudget::kBurstBytes;
+    ASSERT_LE(sent, bound) << "drive bytes past the reservation at " << now
+                           << " ns, after " << next << " connections";
+  }
+  const int newest = next - 1;
+  for (std::int64_t now = kChurnEndNs; now <= kChurnEndNs + 1'000'000'000;
+       now += kMs) {
+    pump(newest, now);
+  }
+  const std::vector<std::string>& got = binaries[newest];
+  ASSERT_GT(got.size(), state.dictionary_pages.size());
+  for (std::size_t i = 0; i < state.dictionary_pages.size(); ++i) {
+    EXPECT_EQ(got[i], state.dictionary_pages[i]) << "dictionary page " << i;
+  }
+  const auto* first_update = Talos::Telemetry::GetSizePrefixedFrame(
+      got[state.dictionary_pages.size()].data());
+  EXPECT_TRUE(first_update->keyframe());
 }
 
 }  // namespace

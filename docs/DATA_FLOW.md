@@ -451,9 +451,10 @@ is the complete record.**
 Studio's bridge sends at most **160,000 B/s** in all, charging every
 WebSocket send with conservative framing overhead (`EgressBudget` in
 `studio/bridge/telemetry.h`, `BridgeEgress` in `studio/bridge/drive.h`).
-With a dashboard layout (`[studio] dashboard`), each driver dashboard client
+With a dashboard layout (`[studio] dashboard`), each driver dashboard slot
 has its own bucket of the layout's `budget_bytes_per_s` with a **64,000 B**
-burst, and `drive_clients × budget_bytes_per_s` (at most **80,000 B/s**;
+burst, which a connection takes over as the slot's last one left it (so a
+page that reconnects starts from no fresh burst), and `drive_clients × budget_bytes_per_s` (at most **80,000 B/s**;
 default 2 × 24,000 = **48,000 B/s**) is reserved out of the total first.
 Programmer clients (`/telemetry`) share the rest, R = 160,000 B/s less that
 reservation (**112,000 B/s** with the default layout, all of it without
@@ -461,8 +462,10 @@ one), through a shared bucket of R B/s with a **64,000 B** burst; each
 programmer client also has an `R / max_clients` B/s bucket with the same
 burst (**28,000 B/s** at the default 4 with the default layout, 40,000 B/s
 without one); `[studio] max_clients` defaults to **4** (range **1–64**) and
-does not count drive clients. A drive client's sends are charged to its own
-bucket only, so no programmer client can defer one. At most `drive_clients`
+does not count drive clients. A drive client's sends are charged to its
+slot's bucket only, so no programmer client can defer one, and all of them
+together send at most the reservation and `drive_clients` bursts however
+often pages reconnect. At most `drive_clients`
 are held; a new one evicts the oldest (close code 4000). Every programmer
 send leaves in a pass over the clients (a client that joins or drains is offered its turn by one), and each
 pass starts just after the last client sent anything, so the shared bucket is

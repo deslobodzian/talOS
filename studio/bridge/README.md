@@ -237,16 +237,35 @@ after that close takes the slot back from the newer page in turn, so with
 more pages open than `drive_clients` they keep replacing each other. Feed
 clients have the same idle timeout and pings as `/telemetry`.
 
-**Budget.** Each feed client has its own token bucket of the layout's
-`budget_bytes_per_s` with the 64,000 B burst, charged for every message with
-its WebSocket framing, and is charged to nothing else.
-`drive_clients × budget_bytes_per_s` is reserved out of the bridge's
+**Budget.** Each slot has its own token bucket of the layout's
+`budget_bytes_per_s` with the 64,000 B burst, and a feed client is charged,
+for every message with its WebSocket framing, to the bucket of the slot it
+holds and to nothing else. A bucket belongs to the slot, not the
+connection: a new connection takes the bucket of the slot it fills (the one
+it evicted or one a closed client freed) as it stands, so reconnecting never
+mints bytes, and every feed client together sends at most
+`drive_clients × budget_bytes_per_s` plus `drive_clients` bursts however
+often pages reconnect. That much is reserved out of the bridge's
 160,000 B/s before programmer clients share the rest
 ([Data flow](../../docs/DATA_FLOW.md#telemetry-studio-and-the-radio-boundary)),
 so a programmer client's traffic never defers a feed message. A message the
-client's bucket cannot afford waits (telemetry coalesces into the next
-update); telemetry construction holds the budget at or above the feed's worst
-case, so that happens only while the burst refills after the dictionary.
+bucket cannot afford waits (telemetry coalesces into the next update) and
+goes once the bucket holds it; telemetry construction holds the budget at
+or above the feed's worst case, so that happens only while the bucket
+refills after a dictionary.
+
+A page that connects into a bucket the slot's previous connections drained
+(pages that keep reconnecting) is accepted at once and then waits for its
+dictionary. Meanwhile it hears `talos.drive.heartbeat` every 100 ms (36 B
+each, affordable within 1.5 ms of being due at 24,000 B/s) and possibly a
+summary; the dictionary pages follow, whole and in order, as soon as the
+bucket holds each, then the keyframe. From an empty bucket that takes at
+most about 0.8 s on the 2026 config at the default 24,000 B/s (its
+11,496 B dictionary, a keyframe of at most 2,592 B and one 4,096 B
+summary, framed, at the rate less the heartbeats). Text messages can
+arrive between two dictionary pages; the binary pages stay in order. The
+page shows that time as connected with no telemetry yet, never as a lost
+link.
 
 **Messages.** The bridge only sends; what a client sends is ignored (at most
 1024 B a message). A message is binary or text by its WebSocket frame type.
@@ -292,8 +311,10 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
 
 - **`talos.drive.heartbeat`**: exactly `{"kind":"talos.drive.heartbeat"}`.
   Sent only while the client holds no telemetry tick (no telemetry yet, or a
-  new dictionary before its keyframe), when nothing has been sent for
-  100 ms.
+  new dictionary before its keyframe, including one that waits for the
+  slot's bucket), when nothing has been sent for 100 ms. Like any message it
+  goes only when the bucket affords it, which a bucket refilling at the
+  layout's rate does within `36 / budget_bytes_per_s` seconds.
 - **`talos.drive.summary`**: what the `subsystems` widget needs that
   channels cannot give (a dead node raises no alert). Sent on connect and
   whenever it changes, at most once per 500 ms
@@ -324,8 +345,9 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   | `nodes[].drives` | string or null | the target lane source (`teleop`, `auto`, ...) its first `Target` with a selection last selected; null when it is not alive, reads no target, or its `Target::get()` was last null |
   | `omitted` | number | nodes left off the end of `nodes` to keep the message within 4,096 bytes; normally 0 |
 
-So a feed client hears something at least every 100 ms while the bridge
-runs and its socket drains: 500 ms of silence means the dashboard-to-bridge
+So a feed client hears something at least every 100 ms (plus the moments
+its bucket needs for a 36 B heartbeat) while the bridge runs and its socket
+drains: 500 ms of silence means the dashboard-to-bridge
 link, a `sequence_id` that stops advancing means stale telemetry, and the
 RoboRIO link is its own alert channel (`hw/status/alert_error_link_lost`).
 `DriveFeed` in [`drive.h`](drive.h) is the feed, `//studio/bridge:drive_test`
