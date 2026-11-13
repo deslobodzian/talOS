@@ -334,10 +334,12 @@ sanitizer in one filter, not two configs:
 A target that takes more than 5 s states why in a comment on its BUILD
 rule: what it waits for in real time and its lane. `python3
 tools/slow_tests.py --threshold 5` lists, slowest first, every test action in
-`bazel-testlogs` (the last result of each, cached or not) over the
-threshold. With `--check` it exits 1 when an action exceeds its lane's
-budget above (lane tags from `bazel query`, or `--lanes FILE`); CI does not
-run it yet (LANE-1).
+`bazel-testlogs` (the last result of each, cached or not, timed to the
+millisecond) over the threshold; `--bep FILE` reads one invocation's
+`--build_event_json_file` instead, and no test result at all is an error.
+With `--check` it exits 1 when an action exceeds its lane's budget above
+(lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`); CI does
+not run it yet (LANE-1).
 
 CI policy:
 

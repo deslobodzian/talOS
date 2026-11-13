@@ -5,22 +5,31 @@
     python3 tools/slow_tests.py --bep events.json
     python3 tools/slow_tests.py --check          # fail on a lane budget
     python3 tools/slow_tests.py --check --lanes lanes.txt
+    python3 tools/slow_tests.py --check --bep events.json --enforce heavy,e2e
 
-By default it reads every `test.xml` under `bazel-testlogs` (from the
-workspace root), so it needs no extra `bazel test` flag: each file is the
-last run of one test action (a target, or one of its shards or
-`--runs_per_test` runs), cached or not. A googletest file gives the
-binary's own time; for any other test Bazel writes the file itself with the
-action's wall time in whole seconds, refined by Python unittest's own
-"Ran N tests in X s" when the log holds one. With `--bep FILE` (written by
-`bazel test --build_event_json_file=FILE`) it reads that invocation's
-attempt durations instead, in milliseconds.
+By default it reads every test action's result under `bazel-testlogs` (from
+the workspace root), so it needs no extra `bazel test` flag: each directory
+is the last run of one test action (a target, or one of its shards or
+`--runs_per_test` runs), cached or not. An action's time is the wall time
+Bazel records in its `test.cache_status` (`TestResultData`, Bazel's
+src/main/protobuf/test_status.proto, field 12 `run_duration_millis`), in
+milliseconds, the time Bazel prints after PASSED; without that file, its
+`test.xml`'s: googletest's own time, or Bazel's whole seconds refined by
+Python unittest's "Ran N tests in X s".
+
+`bazel-testlogs` is whatever the latest bazel invocation pointed it at,
+which another configuration's run can leave empty or stale. To read one
+invocation's results, pass `--testlogs` (that invocation's `bazel info
+bazel-testlogs`) or `--bep FILE` (written by `bazel test
+--build_event_json_file=FILE`): its attempt durations, in milliseconds, and
+each target's tags. Finding no test result at all is an error.
 
 The budgets are docs/TESTING.md §9. Without `--check` it reports and exits
 0. With `--check` it exits 1 when a test action exceeds its lane's budget: a
 target with no lane tag is in the fast lane (5 s). The lane tags come from
-`--lanes FILE` (lines of `<label> <lane>`; unlisted labels are fast), or,
-without it, from one `bazel query` per lane.
+`--lanes FILE` (lines of `<label> <lane>`; unlisted labels are fast), else
+from the `--bep` file's target tags, else from one `bazel query` per lane.
+`--enforce LANE,...` fails only those lanes' overruns and prints the others.
 """
 
 import argparse
@@ -55,11 +64,69 @@ def xml_seconds(text):
     return max(sum(cases), sum(ran))
 
 
+def varint(data, offset):
+    """(value, next offset) of the protobuf varint at `offset`."""
+    value = shift = 0
+    while True:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, offset
+
+
+# TestResultData.run_duration_millis (Bazel's test_status.proto).
+RUN_DURATION_MILLIS = 12
+
+
+def cache_status_seconds(data):
+    """The run time a test.cache_status records, or None when it has none."""
+    offset, seconds = 0, None
+    try:
+        while offset < len(data):
+            key, offset = varint(data, offset)
+            field, wire = key >> 3, key & 7
+            if wire == 0:
+                value, offset = varint(data, offset)
+                if field == RUN_DURATION_MILLIS:
+                    seconds = value / 1000
+            elif wire == 1:
+                offset += 8
+            elif wire == 2:
+                length, offset = varint(data, offset)
+                offset += length
+            elif wire == 5:
+                offset += 4
+            else:
+                return None
+    except IndexError:
+        return None
+    return seconds
+
+
+def action_seconds(directory, files):
+    """One test action's run time from its test logs directory, or None."""
+    if "test.cache_status" in files:
+        with open(os.path.join(directory, "test.cache_status"), "rb") as handle:
+            seconds = cache_status_seconds(handle.read())
+        if seconds is not None:
+            return seconds
+    if "test.xml" not in files:
+        return None
+    with open(os.path.join(directory, "test.xml"), encoding="utf-8",
+              errors="replace") as handle:
+        try:
+            return xml_seconds(handle.read())
+        except ElementTree.ParseError:
+            return None
+
+
 def from_testlogs(testlogs):
-    """(label, seconds) for each test.xml under the `testlogs` tree."""
+    """(label, seconds) for each test action under the `testlogs` tree."""
     results = []
     for directory, _, files in os.walk(testlogs, followlinks=True):
-        if "test.xml" not in files:
+        if "test.xml" not in files and "test.cache_status" not in files:
             continue
         parts = os.path.relpath(directory, testlogs).split(os.sep)
         suffix = ""
@@ -68,12 +135,7 @@ def from_testlogs(testlogs):
         if len(parts) < 2:
             continue
         label = "//" + "/".join(parts[:-1]) + ":" + parts[-1] + suffix
-        with open(os.path.join(directory, "test.xml"), encoding="utf-8",
-                  errors="replace") as handle:
-            try:
-                seconds = xml_seconds(handle.read())
-            except ElementTree.ParseError:
-                continue
+        seconds = action_seconds(directory, files)
         if seconds is not None:
             results.append((label, seconds))
     return results
@@ -90,12 +152,16 @@ def duration_seconds(result):
 
 
 def from_bep(lines):
-    """(label, seconds) for each test attempt in a BEP JSON stream."""
-    results = []
+    """([(label, seconds)] for each test attempt, {label: lane} for each
+    completed target) from a BEP JSON stream."""
+    results, lanes = [], {}
     for line in lines:
         if not line.strip():
             continue
         event = json.loads(line)
+        completed = event.get("id", {}).get("targetCompleted")
+        if completed and "tag" in event.get("completed", {}):
+            lanes[completed["label"]] = lane_of(event["completed"]["tag"])
         key = event.get("id", {}).get("testResult")
         seconds = duration_seconds(event.get("testResult", {}))
         if key is None or seconds is None:
@@ -104,13 +170,18 @@ def from_bep(lines):
         tags = [f"{name} {key[name]}" for name in ("shard", "run", "attempt")
                 if key.get(name, 1) != 1]
         results.append((label + (f" ({', '.join(tags)})" if tags else ""), seconds))
-    return results
+    return results, lanes
 
 
 # Lane budgets in seconds (docs/TESTING.md §9). An untagged test is fast.
 BUDGETS = {"fast": 5.0, "heavy": 120.0, "integration": 30.0, "e2e": 180.0,
            "perf": 60.0}
 LANE_TAGS = ("heavy", "integration", "e2e", "perf")
+
+
+def lane_of(tags):
+    """The lane a target's tags put it in."""
+    return next((lane for lane in LANE_TAGS if lane in tags), "fast")
 
 
 def read_lanes(lines):
@@ -166,29 +237,49 @@ def main(argv=None):
     parser.add_argument("--bep", help="a --build_event_json_file to read instead")
     parser.add_argument("--check", action="store_true",
                         help="exit 1 when a test exceeds its lane's budget")
-    parser.add_argument("--lanes", help="`<label> <lane>` lines (default: bazel query)")
+    parser.add_argument("--lanes", help="`<label> <lane>` lines (default: the "
+                        "--bep file's tags, else bazel query)")
+    parser.add_argument("--enforce", default=",".join(BUDGETS),
+                        help="comma-separated lanes whose overruns fail "
+                        "--check (default: every lane)")
     args = parser.parse_args(argv)
+    enforced = set(filter(None, args.enforce.split(",")))
+    if not enforced <= set(BUDGETS):
+        parser.error(f"--enforce: unknown lane in {args.enforce!r}; lanes are "
+                     f"{', '.join(BUDGETS)}")
+    bep_lanes = {}
     if args.bep:
         with open(args.bep, encoding="utf-8") as handle:
-            results = from_bep(handle)
+            results, bep_lanes = from_bep(handle)
+        source = args.bep
     else:
         if not os.path.isdir(args.testlogs):
             parser.error(f"{args.testlogs}: no test logs; run bazel test first")
         results = from_testlogs(args.testlogs)
+        source = args.testlogs
+    if not results:
+        parser.error(f"{source}: no test results; pass the invocation's "
+                     "--testlogs or --bep")
     if not args.check:
         report(results, args.threshold, sys.stdout)
         return 0
     if args.lanes:
         with open(args.lanes, encoding="utf-8") as handle:
             lanes = read_lanes(handle)
+    elif bep_lanes and all(label.split(" ", 1)[0] in bep_lanes
+                           for label, _ in results):
+        lanes = bep_lanes
     else:
         lanes = query_lanes()
     over = over_budget(results, lanes)
+    failed = [row for row in over if row[2] in enforced]
     for label, seconds, lane in over:
+        note = "" if lane in enforced else " (not enforced)"
         print(f"{seconds:8.1f} s  {label}  over the {lane} lane's "
-              f"{BUDGETS.get(lane, BUDGETS['fast']):g} s", file=sys.stdout)
-    print(f"{len(over)} of {len(results)} test actions over their lane budget")
-    return 1 if over else 0
+              f"{BUDGETS.get(lane, BUDGETS['fast']):g} s{note}", file=sys.stdout)
+    print(f"{len(over)} of {len(results)} test actions over their lane budget, "
+          f"{len(failed)} in an enforced lane ({', '.join(sorted(enforced))})")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
