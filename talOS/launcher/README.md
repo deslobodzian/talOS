@@ -249,6 +249,8 @@ it. The key passes through `include` like every `[robot]` key, so a
 simulation config that includes `robot.toml` sets it in its own `[robot]`;
 config load refuses a file that sets it `false` over an included file that
 sets it `true`, naming both files.
+`hardware_node` started by hand refuses such a config the same way
+([hardware README, "Configuration"](../hardware/README.md#configuration)).
 
 A `--sim` session runs its nodes and the bridge without
 [realtime scheduling](../../docs/NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling)

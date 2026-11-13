@@ -162,7 +162,7 @@ a producer and its subsystem, so a subsystem's safety depends only on its own
 process and the bridge. Each `get()` records the selected source in the node's
 live registry row, which is how Studio's system view shows who drives each
 subsystem. A missing optional policy lane remains a warning. With
-`[robot] require_target_coverage = true` (default `false`), every described
+`[robot] require_target_coverage = true` (default: `commissioned`'s value), every described
 subsystem that reads its own target lanes must have at least one writer among
 each nonempty Driver Station mode's policy sources; missing coverage is a graph
 error naming the subsystem, mode, and lanes. `commissioned = true` requires

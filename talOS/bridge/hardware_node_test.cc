@@ -397,7 +397,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   EXPECT_TRUE(logged_state);
 }
 
-// TODO.md SIM-4: a config that declares itself for simulation only (here
+// A config that declares itself for simulation only (here
 // through its own [robot] over an included deployable base, as a scaffolded
 // robot_sim.toml does) never reaches a controller from a hardware_node started
 // by hand without --sim: it exits non-zero naming the key, the config and the

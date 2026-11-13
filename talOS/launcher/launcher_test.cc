@@ -1377,7 +1377,7 @@ TEST(LauncherGraphTest, AllowGraphErrorsWithoutSimIsRefusedBeforeAnyProbe) {
   }
 }
 
-// TODO.md SIM-4: a config whose `[robot] simulation_only = true` (here set by
+// A config whose `[robot] simulation_only = true` (here set by
 // a simulation config that includes the deployable fixture) runs only with
 // --sim. Without it the launch is refused before any member is probed or
 // spawned and before any session directory exists; with --sim it runs, and
