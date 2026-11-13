@@ -363,8 +363,12 @@ What each job runs, and on which trigger, is in
 A workstation run misses what only CI's conditions expose: a clean checkout
 with no untracked or uncommitted file, every tracked file read-only (a test
 that copies a source with its mode and then writes the copy fails there;
-copy contents, `shutil.copyfile`), and test results never cached from an
-earlier run. `tools/prepush.sh`, the pre-push rung
+copy contents, `shutil.copyfile`), test results never cached from an
+earlier run, and no host package headers: Bazel's autodetected toolchain
+searches `/usr/include`, so an include that no declared dependency provides
+compiles against a workstation's installed package and fails in CI
+(`tools/check_host_includes.py` reads the build's `.d` files for it).
+`tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them.
 

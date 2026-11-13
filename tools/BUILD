@@ -262,16 +262,31 @@ py_test(
 # tools/prepush.sh [--ref C] [--keep] [--skip-gradle] [--skip-studio]
 # (docs/DEVELOPMENT.md §5 rung 3) RULES.md 11's pre-push checks on a clean,
 # read-only worktree of the commit; tools/make_sources_read_only.py is CI's
-# read-only step. The test runs it with a stub bazel against a throwaway
-# repository.
+# read-only step, and tools/check_host_includes.py runs after the build. The
+# test runs it with a stub bazel against a throwaway repository.
 py_test(
     name = "prepush_test",
     size = "small",
     srcs = ["prepush_test.py"],
     data = [
+        "check_host_includes.py",
         "make_sources_read_only.py",
         "prepush.sh",
     ],
     legacy_create_init = False,
     deps = ["@rules_python//python/runfiles"],
+)
+
+# python3 tools/check_host_includes.py DIR (tools/prepush.sh, after the build)
+# No compile read a header from the host's include tree but the C library's,
+# the kernel's and the C++ standard library's.
+py_test(
+    name = "check_host_includes_test",
+    size = "small",
+    srcs = [
+        "check_host_includes.py",
+        "check_host_includes_test.py",
+    ],
+    legacy_create_init = False,
+    main = "check_host_includes_test.py",
 )

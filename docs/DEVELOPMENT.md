@@ -93,7 +93,9 @@ affected tests (docs only) skips the test step: rung 2 is then
 
 Rung 3 is `tools/prepush.sh [--ref <commit>]`. It checks the commit out in a
 new worktree under `${TMPDIR:-/tmp}`, makes its tracked files read-only with
-CI's own step, runs `bazel build //...` and `bazel test //...` with no
+CI's own step, runs `bazel build //...`, then `tools/check_host_includes.py`
+(no compile read a header from the host's include tree but the C library's,
+the kernel's or the C++ standard library's), then `bazel test //...` with no
 cached test result (build results come from the disk cache
 `~/.cache/talos-bazel-disk`), checks that they left the worktree unchanged,
 and runs the gradle and pnpm checks when the commits to push touch the
