@@ -238,6 +238,39 @@ def alert_summary(records):
     return dict(sorted(summary.items()))
 
 
+def controller_link(states, state_source, status_records, status_source):
+    """Whether the bridge accepted a State from the controller: (measured,
+    passes, first accepted State in ms from the start of the log or None,
+    detail). The bridge publishes /hw/state only for a State it accepted, so
+    its first record is the first acceptance; without one, /hw/status says
+    whether any was accepted (state_age_us is 0 and alert_error_link_lost true
+    until the first). Under the launcher the bridge's exit status cannot say
+    this: the launcher ends a bounded session by stopping it, and a stop
+    exits 0 whether or not a State arrived."""
+    if states:
+        first = states[0]["publish_ms"]
+        return True, True, first, (
+            f"first accepted State at {first:.6g} ms from the start of the log "
+            f"({state_source} /hw/state); the wait before it includes the controller's boot")
+
+    def after_a_state(record):
+        fields = scalars(record["decoded"])
+        return fields.get("state_age_us", 0) > 0 or fields.get("alert_error_link_lost") is False
+    accepted = [r for r in status_records if after_a_state(r)]
+    if accepted:
+        first = accepted[0]["publish_ms"]
+        return True, True, first, (
+            f"first /hw/status after an accepted State at {first:.6g} ms from the start "
+            f"of the log ({status_source}; no /hw/state record)")
+    if status_records:
+        span = status_records[-1]["publish_ms"] - status_records[0]["publish_ms"]
+        return True, False, None, (
+            "the bridge never received a State from the controller: no /hw/state record, "
+            f"and {len(status_records)} /hw/status records ({status_source}) over "
+            f"{span:.6g} ms report none accepted")
+    return False, False, None, "no /hw/state or /hw/status record"
+
+
 def analyze(manifest, records, log_damage=(), output_drops=None):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
@@ -303,6 +336,9 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
         # have no recorded input or no acceptance threshold and never pass.
         verdicts.append({"measurement": name, "verdict": "NOT MEASURED" if not measured else
                          "PASS" if passes else "FAIL", "required": required, "detail": detail})
+    link_measured, link_passes, first_state_ms, link_detail = controller_link(
+        states, source, status_records, status_source)
+    verdict("controller link", link_measured, link_passes, link_detail)
     for name, values in (("overall", overall), ("enabled", enabled)):
         s = stats(values)
         verdict(name + " state median", s is not None,
@@ -383,6 +419,8 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
             # launcher_drops(); informational: output logs are not
             # acceptance evidence, the event logs are.
             "output_drops": output_drops,
+            # controller_link(); null unless the bridge accepted a State.
+            "first_state_ms": first_state_ms,
             "state_stream": source, "state_overall": stats(overall),
             "state_enabled": stats(enabled), "enabled_gaps_ge_100_ms": gaps,
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},

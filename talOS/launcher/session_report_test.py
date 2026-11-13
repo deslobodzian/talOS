@@ -170,6 +170,36 @@ class SessionReportTest(unittest.TestCase):
         self.assertEqual(session_report.strict_failures(report),
                          session_report.strict_failures(session_report.analyze(manifest, [])))
 
+    # REQ-OPS-06, REQ-OPS-16: under the launcher a bounded session ends by
+    # its stop, which the bridge exits 0 for whether or not the controller
+    # ever answered, so the report judges the link from the log: the
+    # bridge's /hw/state (it publishes only a State it accepted), else
+    # /hw/status (state_age_us 0 and alert_error_link_lost true until the
+    # first), else NOT MEASURED.
+    def test_controller_link_fails_a_session_that_never_heard_a_state(self):
+        def record(process, kind, topic, publish, decoded=""):
+            return dict(process=process, kind=kind, topic=topic, publish_ms=publish,
+                        now_ms=publish + 1, event_ms=publish + 1, decoded=decoded)
+        def status(publish, age_us, link_lost):
+            return record("drivetrain", "MESSAGE", "/hw/status", publish,
+                          f"{{states_received_count: 0, state_age_us: {age_us}, "
+                          f"alert_error_link_lost: {link_lost}}}")
+        unheard = [status(t, 0, "true") for t in range(0, 8000, 20)]
+        heard_at_120 = [status(t, 0 if t < 120 else 3000, "true" if t < 120 else "false")
+                        for t in range(0, 8000, 20)]
+        state = [record("hardware_node", "SEND", "/hw/state", t) for t in (118, 123)]
+        for label, session, verdict, first in (
+                ("no State", unheard, "FAIL", None),
+                ("a State", heard_at_120 + state, "PASS", 118),
+                ("a State, /hw/state unlogged", heard_at_120, "PASS", 120),
+                ("no evidence", [], "NOT MEASURED", None)):
+            with self.subTest(label):
+                report = session_report.analyze({"end_wall_ns": 1, "nodes": []}, session)
+                link = {v["measurement"]: v for v in report["verdicts"]}["controller link"]
+                self.assertEqual((link["verdict"], report["first_state_ms"]), (verdict, first))
+                self.assertEqual("controller link: " + verdict in
+                                 session_report.strict_failures(report), verdict != "PASS")
+
     def test_target_age_at_tick_limit(self):
         def record(kind, topic, now, age_ms=0, **extra):
             return dict(process="lift", kind=kind, topic=topic, now_ms=now, event_ms=now,
@@ -242,8 +272,9 @@ class SessionReportTest(unittest.TestCase):
             # No target lane was dispatched: only that required row is
             # NOT MEASURED; timer lateness is informational.
             ({"end_wall_ns": 1, "nodes": [bridge, studio]}, records, 1),
-            # The hardware node recorded no /hw/state: six required verdicts.
-            ({"end_wall_ns": 1, "nodes": [bridge]}, [], 6),
+            # The hardware node recorded no /hw/state: seven required
+            # verdicts, the controller link among them.
+            ({"end_wall_ns": 1, "nodes": [bridge]}, [], 7),
             ({"end_wall_ns": 0, "nodes": [{**bridge, **flags}, studio]}, records, 5),
         )
         for manifest, session, failures in cases:
