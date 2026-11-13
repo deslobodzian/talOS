@@ -25,6 +25,7 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/introspection/names.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_inputs.h"
 #include "talOS/launcher/log_merge.h"
@@ -189,6 +190,9 @@ std::string HardwareJson(const talos::launcher::MergedRecord& r,
   return talos::launcher::HardwareRecordJson(kind, r.payload, names);
 }
 
+// Defined after DecodedFields, which it walks.
+std::string AlertsJson(std::string_view topic, const std::string& decoded);
+
 void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
                   bool json, const talos::launcher::DeviceNames* names) {
   const std::string schema = r.source == nullptr ? "" : r.source->schema.name;
@@ -215,6 +219,10 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
               << ",\"schema\":" << quote(schema) << ",\"payload_hex\":";
     ExportPayloadHex(r.payload);
     std::cout << ",\"decoded\":" << quote(decoded);
+    if (const auto alerts = AlertsJson(r.source_name(), decoded);
+        !alerts.empty()) {
+      std::cout << ",\"alerts\":" << alerts;
+    }
     if (!hardware.empty()) std::cout << ",\"hardware\":" << hardware;
     if (r.source_name() == talos::hardware::kDriverStationTopic &&
         r.payload.size() == sizeof(talos::hardware::Packet)) {
@@ -347,6 +355,53 @@ class DecodedFields {
   const Visit& visit_;
   std::size_t at_{0};
 };
+
+const char* AlertLevelName(talos::introspect::naming::AlertLevel level) {
+  using talos::introspect::naming::AlertLevel;
+  switch (level) {
+    case AlertLevel::kError:
+      return "error";
+    case AlertLevel::kWarning:
+      return "warning";
+    case AlertLevel::kInfo:
+      return "info";
+    case AlertLevel::kNone:
+      break;
+  }
+  return "none";
+}
+
+// The alerts of a record of a `status` topic (NAMING.md): each bool field,
+// nested ones included, whose own name ParseAlertField reads, as a JSON array
+// of {name: its field path, level, active}; empty for any other record, or a
+// status message with no alert field.
+std::string AlertsJson(std::string_view topic, const std::string& decoded) {
+  const auto segments = talos::introspect::naming::detail::Segments(topic);
+  if (segments.size() < 2 || segments[1] != "status" || decoded.empty()) {
+    return "";
+  }
+  std::string alerts;
+  DecodedFields::Walk(
+      decoded, [&alerts](const std::string& path, std::string_view token) {
+        if (token != "true" && token != "false") return;  // Not a bool.
+        std::string_view field{path};
+        if (const auto dot = field.rfind('.'); dot != std::string_view::npos) {
+          field.remove_prefix(dot + 1);
+        }
+        const auto alert = talos::introspect::naming::ParseAlertField(field);
+        if (!alert) return;
+        alerts += alerts.empty() ? "[" : ",";
+        alerts.append("{\"name\":")
+            .append(JsonString(path))
+            .append(",\"level\":\"")
+            .append(AlertLevelName(alert->level))
+            .append("\",\"active\":")
+            .append(token)
+            .append("}");
+      });
+  if (!alerts.empty()) alerts += ']';
+  return alerts;
+}
 
 // --format summary: one topic's records folded in as they stream past, so a
 // session of any length takes memory in proportion to its topics and their

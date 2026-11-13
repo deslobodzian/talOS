@@ -1106,6 +1106,15 @@ descriptor-decoded payload text (for a schema-less hardware Packet, a
 truncated hex preview). JSON strings are escaped; CSV fields containing
 commas, quotes, or newlines are quoted and embedded quotes are doubled.
 
+A JSONL record of a `status` topic (a topic whose role segment is `status`)
+also carries `alerts`, each alert field of its message in field order:
+`{"name": <field path>, "level": "error"|"warning"|"info", "active": <bool>}`,
+where an alert is a `bool` field whose own name
+`naming::ParseAlertField` reads ([NAMING.md](../NAMING.md#topics)) and a
+nested one is named by its path (`health.alert_warning_hot`). A record with
+no alert field, of any other topic, or an `alert_` field that names no level
+gets none; CSV and the text dump carry the state in `decoded` only.
+
 The hardware packet topics (`/hw/state`, `/hw/command`, `/hw/request/<node>`,
 `/hw/state/driver_station`) have no FlatBuffers schema, so `hardware` holds
 them decoded with the wire codecs themselves (`hardware_record.h`): a JSON
