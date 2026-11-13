@@ -1,6 +1,6 @@
 """Unit tests for tools/check_host_includes.py on fixture `.d` files.
 
-TODO.md CI-6: a compile that read <toml++/toml.hpp> from /usr/include passed
+REQ-DEV-25: a compile that read <toml++/toml.hpp> from /usr/include passed
 on the workstation and failed in CI, where no such package is installed.
 """
 

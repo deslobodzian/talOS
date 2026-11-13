@@ -1,6 +1,6 @@
 """Tests for tools/prepush.sh with a stub `bazel`, so nothing builds.
 
-TODO.md CI-7: CI tests with every tracked file read-only, and a test that
+REQ-DEV-25: CI tests with every tracked file read-only, and a test that
 rewrote a copy of a source passed on the workstation and failed in CI. The
 pre-push command must test a clean worktree of the commit under CI's
 read-only step, leave the checkout as it was, and fail naming the step.
