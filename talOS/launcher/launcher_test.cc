@@ -1085,6 +1085,17 @@ std::string DescribingStub(
          "exit 0\n";
 }
 
+// DescribingStub that first appends "<node> <its arguments>" to `record`, on
+// every invocation, --describe or not.
+std::string RecordingStub(
+    std::string_view node, std::string_view target, const std::string& record,
+    const std::vector<introspect::naming::SourceShape>& sources = {}) {
+  const std::string stub = DescribingStub(node, target, sources);
+  const std::string shebang = "#!/bin/sh\n";
+  return shebang + "echo \"" + std::string{node} + " $*\" >> '" + record +
+         "'\n" + stub.substr(shebang.size());
+}
+
 // A node written before --describe existed, or one halfway through being
 // written: it rejects the flag the way every node used to.
 constexpr std::string_view kStubWithoutDescribe =
@@ -1240,19 +1251,14 @@ TEST(LauncherGraphTest, AllowGraphErrorsWithoutSimIsRefusedBeforeAnyProbe) {
     SCOPED_TRACE(describe_only ? "--describe-only" : "launch");
     const std::string invoked = TempPath("allow_without_sim_invoked");
     ::remove(invoked.c_str());
-    const auto recording = [&](std::string_view node, std::string_view target) {
-      const std::string stub = DescribingStub(node, target, {});
-      const std::string shebang = "#!/bin/sh\n";
-      return shebang + "echo \"" + std::string{node} + " $*\" >> '" + invoked +
-             "'\n" + stub.substr(shebang.size());
-    };
-    GraphFixture fixture{"allow_without_sim",
-                         recording("alpha", "//example/alpha:node"),
-                         recording("beta", "//example/beta:node")};
+    GraphFixture fixture{
+        "allow_without_sim",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
     fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
-        WriteStubNode(
-            "allow_without_sim_hardware",
-            recording("hardware_node", "//talOS/bridge:hardware_node"));
+        WriteStubNode("allow_without_sim_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
     fixture.options.allow_graph_errors = true;
     fixture.options.describe_only = describe_only;
 
@@ -1260,6 +1266,50 @@ TEST(LauncherGraphTest, AllowGraphErrorsWithoutSimIsRefusedBeforeAnyProbe) {
     EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
     EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
     ::remove(invoked.c_str());
+  }
+}
+
+// TODO.md SIM-4: a config whose `[robot] simulation_only = true` (here set by
+// a simulation config that includes the deployable fixture) runs only with
+// --sim. Without it the launch is refused before any member is probed or
+// spawned and before any session directory exists; with --sim it runs, and
+// --describe-only, which touches no hardware, lints it.
+// REQ-SAFE-40
+TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
+  struct Row {
+    const char* name;
+    bool simulation;
+    bool describe_only;
+    bool refused;
+  };
+  for (const Row row :
+       {Row{"launch", false, false, true}, Row{"--sim", true, false, false},
+        Row{"--describe-only", false, true, false}}) {
+    SCOPED_TRACE(row.name);
+    const std::string invoked = TempPath("simulation_only_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "simulation_only",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("simulation_only_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    const std::string sim_config = TempPath("simulation_only") + ".toml";
+    std::ofstream{sim_config} << "include = \"" << fixture.options.config_path
+                              << "\"\n[robot]\nsimulation_only = true\n";
+    fixture.options.config_path = sim_config;
+    fixture.options.simulation = row.simulation;
+    fixture.options.describe_only = row.describe_only;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), row.refused ? 1 : 0);
+    EXPECT_EQ(std::filesystem::exists(invoked), !row.refused)
+        << ReadFile(invoked);
+    EXPECT_EQ(std::filesystem::exists(fixture.out_dir), !row.refused)
+        << fixture.out_dir;
+    ::remove(invoked.c_str());
+    ::remove(sim_config.c_str());
   }
 }
 

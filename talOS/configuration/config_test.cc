@@ -859,6 +859,42 @@ node = "//py:extra"
                std::invalid_argument);
 }
 
+// TODO.md SIM-4: `[robot] simulation_only` reaches the config through an
+// include like any [robot] key, and an including file may set it true over a
+// deployable base. Once a file sets it true, a file including that one
+// cannot set it back to false: refused, naming the key and both files.
+// REQ-SAFE-40
+TEST_F(ManifestTest, SimulationOnlyIsInheritedAndNeverUnsetByAnInclude) {
+  Write("deployable.toml", "[robot]\nperiod_us = 5000\n" + std::string{kMotor});
+  Write("sim.toml",
+        "include = \"deployable.toml\"\n[robot]\n"
+        "simulation_only = true\n");
+  Write("sim_only_base.toml",
+        "[robot]\nsimulation_only = true\n" + std::string{kMotor});
+  Write("inherits.toml", "include = \"sim_only_base.toml\"\n");
+  Write("unsets.toml",
+        "include = \"sim_only_base.toml\"\n[robot]\n"
+        "simulation_only = false\n");
+  const auto parse = [this](std::string_view file) {
+    return ParseRobotConfig((dir_ / file).string());
+  };
+  EXPECT_FALSE(parse("deployable.toml").simulation_only);
+  EXPECT_TRUE(parse("sim.toml").simulation_only);
+  EXPECT_TRUE(parse("inherits.toml").simulation_only);
+  try {
+    parse("unsets.toml");
+    ADD_FAILURE() << "unsets.toml loaded as a deployable config";
+  } catch (const std::invalid_argument& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("simulation_only"), std::string::npos) << what;
+    EXPECT_NE(what.find("unsets.toml"), std::string::npos) << what;
+    EXPECT_NE(what.find("sim_only_base.toml"), std::string::npos) << what;
+  }
+  Write("not_bool.toml",
+        "[robot]\nsimulation_only = 1\n" + std::string{kMotor});
+  EXPECT_THROW(parse("not_bool.toml"), std::invalid_argument);
+}
+
 TEST_F(ManifestTest, SubsystemDefaultsLayerDeviceAndSubsystemTables) {
   Write("subsystems/mech_defaults.toml", R"(
 [subsystem]

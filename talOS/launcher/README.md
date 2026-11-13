@@ -233,6 +233,19 @@ bazel run //talOS/launcher -- \
   --sim-gateway-arg --wheel-radius-error --sim-gateway-arg 0.1
 ```
 
+A config whose settings are for simulation only (simulated gains, bindings,
+wide travel) says so with `[robot] simulation_only = true` (default `false`),
+and the launcher then refuses to start it without `--sim`, right after
+loading the config, before anything is probed or spawned:
+
+    launcher: /path/robot_sim.toml sets [robot] simulation_only = true; run it with --sim (or --describe-only); nothing was started
+
+`--describe-only` and `--replay-inputs`, which touch no hardware, still run
+it. The key passes through `include` like every `[robot]` key, so a
+simulation config that includes `robot.toml` sets it in its own `[robot]`;
+config load refuses a file that sets it `false` over an included file that
+sets it `true`, naming both files.
+
 A `--sim` session runs its nodes and the bridge without
 [realtime scheduling](../../docs/NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling)
 unless the launcher's environment sets `TALOS_REALTIME=1`, which every child

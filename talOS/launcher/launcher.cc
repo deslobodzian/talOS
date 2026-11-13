@@ -435,6 +435,14 @@ int Launcher::RunSession() {
     }
     return 1;
   }
+  // A simulation config (its gains, bindings and travel) never drives real
+  // hardware. --describe-only and --replay-inputs touch none.
+  if (robot_config.simulation_only && !options_.simulation && starts_roster) {
+    std::cerr << "launcher: " << options_.config_path
+              << " sets [robot] simulation_only = true; run it with --sim "
+                 "(or --describe-only); nothing was started\n";
+    return 1;
+  }
   std::string effective_remote;
   try {
     effective_remote = EffectiveRemoteAddress(robot_config, options_);
