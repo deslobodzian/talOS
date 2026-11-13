@@ -98,6 +98,7 @@ cc_library(
     hdrs = ["node.h"],
     deps = [
         ":channels",
+        ":dashboard_layout",
         ":frames",
         ":schema",
         ":wire",

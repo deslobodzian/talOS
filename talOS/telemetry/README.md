@@ -265,6 +265,21 @@ name, or one listed twice in a widget; a check with no condition or with
 distinct channels than the limits above; drive reservations over 80,000 B/s;
 and a budget below the worst case.
 
+**Against the dictionary.** The telemetry node parses the layout at
+construction, so a bad layout refuses the node: `talos_graph_test`, which
+requires every node described, fails, while `--describe-only` only warns
+that telemetry did not answer. Once the declared graph has built its
+dictionary, it also refuses, naming the file and the key, a channel the
+layout names that the dictionary lacks (excluded, or no state or status
+topic holds it), whether the key is required or optional:
+`widgets[<i>].<key>`, `widgets[<i>].channels[<k>]` for a graph,
+`widgets[<i>].items[<j>].channel` for a check, `widgets[<i>].pose` for a
+field's pose fields, and `widgets[<i>].kind` for a `match` or `power`
+widget's fixed channels. It then runs `CheckDashboardBudget` for the whole
+feed: the named channels plus, with an `alerts` widget, every alert channel
+of the dictionary. The launcher's first `--describe` probe has no graph, so
+it checks only what the file alone decides.
+
 **Worst case.** One drive client can be sent, in a second,
 `update_hz` keyframes of the feed's channels plus two summaries and ten
 heartbeats:
