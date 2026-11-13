@@ -121,7 +121,8 @@ A relative `--prefix` is resolved against the working directory.
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
   Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
-  three-second supervision watchdog, `LimitRTPRIO=49` and
+  three-second supervision watchdog, a stop through the launcher alone
+  ([below](#supervision-and-service-recovery)), `LimitRTPRIO=49` and
   `LimitMEMLOCK=infinity`, so the unprivileged service gets the
   [realtime scheduling](NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling) its
   nodes request). macOS: refuses while FileVault is on (`fdesetup status`
@@ -312,6 +313,22 @@ session after either a watchdog failure or a launcher exit, however often:
 seconds by default, manual restarts included). `systemctl stop talos` still
 stops the service deliberately. Notifications use `NOTIFY_SOCKET` directly,
 including Linux abstract (`@...`) Unix datagram sockets, without libsystemd.
+
+A stop goes through the launcher alone. `KillMode=mixed` sends systemd's
+SIGTERM only to the launcher, which stops the session in order: SIGINT to
+each member, SIGKILL to any still alive 2 s later (`stop_timeout` in the
+[session manifest](../talOS/launcher/README.md#session-manifest)), then
+the final manifest. systemd SIGKILLs whatever remains once the launcher
+exits, or at `TimeoutStopSec=90`: 90 s against the launcher's 2 s, so the
+launcher's own escalation and its final write always come first. systemd's
+default, `KillMode=control-group`, would SIGTERM every member as well, and
+a member still starting, not yet handling a stop, would die of a signal the
+launcher did not send, ending the session 255 and the unit failed. launchd
+needs no such setting: stopping the job (`launchctl bootout`) sends SIGTERM
+to the launcher's process alone, SIGKILL after its `ExitTimeOut` (not set
+in the plist, so launchd's system-defined default; `man launchd.plist`),
+and when the launcher exits kills only the launcher's own process group,
+which no member is in.
 
 Each node (including description probes and the Studio bridge) owns a process
 group. Restart, stop and shutdown signal that whole group, not just its

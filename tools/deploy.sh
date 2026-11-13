@@ -365,6 +365,11 @@ for parent, dirs, files in os.walk(root, onerror=lambda e: sys.exit(str(e))):
   # Restart=always. LimitRTPRIO/LimitMEMLOCK let the unprivileged service
   # take the realtime scheduling nodes request: SCHED_FIFO up to the bridge's
   # priority 49, and mlockall (docs/NODE_DEVELOPMENT_GUIDE.md).
+  # KillMode=mixed: `systemctl stop` sends SIGTERM to the launcher alone,
+  # which stops its members itself (SIGINT, then SIGKILL after 2 s); systemd
+  # SIGKILLs whatever remains once the launcher exits or TimeoutStopSec
+  # passes. The default, control-group, SIGTERMs every member too, and one
+  # still starting dies of it, failing the session and the unit.
   local unit="[Unit]
 Description=talOS robot bundle
 After=network-online.target
@@ -377,6 +382,8 @@ User=$user
 Environment=\"TALOS_LOG_DIR=$PREFIX/logs\"
 ExecStart=$PREFIX/current/run.sh
 TimeoutStartSec=1200
+KillMode=mixed
+TimeoutStopSec=90
 WatchdogSec=3
 Restart=always
 RestartSec=2
