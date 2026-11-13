@@ -475,8 +475,8 @@ the socket. Every failed send is counted in a spell, which ends at a good
 send one second after its last failure (with the companion's port closed
 every other send fails with `ECONNREFUSED`); a spell prints `hardware
 gateway socket send failed (errno <n>); keeping the socket` at its first
-failure that keeps the socket and, once it ends, `hardware gateway socket
-sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`,
+failure that keeps the socket and, once such a spell ends, `hardware gateway
+socket sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`,
 `<s>` from its first failure to its last (at most one line a second). A send
 raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).

@@ -114,7 +114,6 @@ class SocketRetry {
     return SendEvent::kFailing;
   }
 
-  // A send on the open socket succeeded: ends the spell, if one is open.
   // A send on the open socket succeeded at `now_us`: ends the spell once
   // this long has passed since its last failure.
   static constexpr uint64_t kSpellQuietUs = 1'000'000;

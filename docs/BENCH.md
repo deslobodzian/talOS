@@ -282,8 +282,8 @@ sleep precision. Releasing a lane is not a mechanical brake.
   running, record `/hw/status` `can_utilization_frac` with the config's
   `status_hz` at 200, then at 50 (reconfigure between). For a robot
   estimate (16 Talon FX and 4 CANcoders) scale the refresh and devices
-  phases per device by 20, control per motor by 16, keep health and other
-  as measured, and scale `can_utilization_frac` per device at each rate by
+  phases per device by 20, control per motor by 16, keep health, other, link, driver
+  station and loop as measured, and scale `can_utilization_frac` per device at each rate by
   20; compare with the 5 ms period and a full bus. A one-motor bench gives
   no per-device slope (a fixed cost per call is counted as per device), so
   the estimate is an upper bound. The decision is TODO.md RT-5.
