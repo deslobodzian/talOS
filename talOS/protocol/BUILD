@@ -34,7 +34,6 @@ cc_test(
     name = "udp_test",
     size = "small",
     srcs = ["udp_test.cc"],
-    tags = ["exclusive"],
     deps = [
         ":protocol",
         ":udp_test_helpers",
