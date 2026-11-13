@@ -1278,6 +1278,11 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                      "would no longer be refused\n";
       }
       using Refreshed = SessionDirectoryLock::Refreshed;
+      // An unheld session.lock is retried only here, at supervision start
+      // and then hourly: between two tries a retention whose probe locks
+      // again may remove this session, and on a network log root this flock
+      // can block supervision and the watchdog ping (README "Session
+      // segments and logs"; TODO.md LOG-10).
       const Refreshed directory =
           session_directory_
               ? session_directory_->Refresh(options_.lock_session_directory)
