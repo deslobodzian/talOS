@@ -61,6 +61,7 @@ cc_test(
     deps = [
         ":mechanisms",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",

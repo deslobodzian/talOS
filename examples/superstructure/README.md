@@ -185,10 +185,13 @@ missing, released or stale goal counts as STOW, and that stale mechanism
 statuses release both lanes. Coordinator-only tests cover STOW during stale
 RAISING, EJECT release during SCORING when either dependency goes stale,
 release/disable/goal expiry with stale statuses, and recovery from fresh
-observations without replaying a completed score. The elevator alone goes
-neutral on a stale, released or never-sent lane, while disabled, on Driver
-Station loss, with the lift disconnected and on a non-finite goal, and clamps
-goals to its travel at both ends. Its homing tests start it unzeroed and home
+observations without replaying a completed score. The elevator alone carries
+the node test matrix ([TESTING.md §7](../../docs/TESTING.md#7-the-node-test-matrix)):
+it goes neutral on a stale, released or never-sent lane, while disabled, on
+Driver Station loss, with the lift disconnected, on a non-finite goal, on a
+live lane of a source its `[targets]` does not list and on a goal stamped
+with an earlier Driver Station generation, allocates nothing per tick, and
+clamps goals to its travel at both ends. Its homing tests start it unzeroed and home
 it on a live target before it reaches the goal, keep homing through a
 one-tick closed reading mid-travel, re-home it after
 `SimHardware::reset_device` at height without applying a motion-magic goal in
@@ -196,8 +199,10 @@ the restarted frame, keep it still while disabled or with a non-finite,
 stale, released or never-sent lane, and latch HOMING_FAILED on the timeout
 (kept through a stale-link glitch, cleared by a Driver Station disable), on a
 stall and on a switch stuck closed. Another test refuses unsafe homing
-parameters. The other tests start the lift on its closed switch, which reads
-false. The intake alone goes neutral on a stale lane while keeping its state.
+parameters, naming the key. The other tests start the lift on its closed
+switch, which reads false. The intake alone drives at a live lane and goes
+neutral while disabled, on a goal of an earlier generation, and on a stale
+lane while keeping its state.
 `py/superstructure_test.py` covers Python host integration, disabled operation
 and target loss with `talos.testing.Sim` and `config/robot_py.toml`; the shared
 C++ suite owns the detailed mechanism scenarios.
