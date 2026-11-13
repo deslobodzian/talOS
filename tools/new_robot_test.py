@@ -8,7 +8,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
 
 from python.runfiles import runfiles
@@ -18,6 +17,7 @@ from tools import new_subsystem
 from tools import sync_manifest
 
 CONFIG = "my_robot/main_processor/configuration/robot.toml"
+SIM_CONFIG = "my_robot/main_processor/configuration/robot_sim.toml"
 SUBSYSTEMS = "my_robot/main_processor/configuration/subsystems"
 
 
@@ -94,11 +94,18 @@ def generate(work, mechanism, lang, kind="velocity"):
     return can_id
 
 
-def describe(work, launcher, env, out):
+def append_simulation_block(work, mechanism, kind):
+    """Appends `mechanism`'s simulation block to the robot's simulation
+    config, as its `Next:` says."""
+    with open(os.path.join(work, SIM_CONFIG), "a", encoding="utf-8") as f:
+        f.write(new_subsystem.simulation_block(mechanism, kind))
+
+
+def describe(work, launcher, env, out, config=CONFIG):
     """The launcher's --describe-only on the generated robot: (exit status,
     output, graph.json or None)."""
     proc = subprocess.run(
-        [launcher, "--config", CONFIG, "--describe-only", "--output-dir",
+        [launcher, "--config", config, "--describe-only", "--output-dir",
          out],
         cwd=work, env=env, capture_output=True, text=True, timeout=60)
     graph = None
@@ -130,8 +137,10 @@ class NewRobotTest(unittest.TestCase):
             with self.subTest(lang=lang), tempfile.TemporaryDirectory() as tmp:
                 work, launcher, env = workspace(tmp)
                 self.assertEqual(generate(work, mechanism, lang), 1)
-                # What its manifest_sync_test checks.
+                # What its manifest_sync_test and sim_manifest_sync_test
+                # check.
                 self.assertEqual(sync_manifest.check(work, CONFIG), "")
+                self.assertEqual(sync_manifest.check(work, SIM_CONFIG), "")
 
                 status, output, graph = describe(work, launcher, env,
                                                  os.path.join(tmp, "out"))
@@ -143,12 +152,15 @@ class NewRobotTest(unittest.TestCase):
                             "teleop"]))
 
     # REQ-DEV-23
-    def test_next_steps_edits_make_the_mechanism_drivable(self):
+    def test_next_steps_block_makes_the_mechanism_drivable_in_simulation(
+            self):
         # A scaffold leaves its teleop binding commented and its gains zero,
         # so on a robot that requires target coverage (2026-robot's policy)
-        # the launcher refuses it as generated. The edits `Next:` lists,
-        # applied exactly, give the mechanism a producer in every mode the
-        # policy covers and a teleop target it can reach.
+        # the launcher refuses it as generated. The simulation block `Next:`
+        # prints, appended to the simulation config, gives the mechanism a
+        # producer in every mode the policy covers and a teleop target it can
+        # reach there, and leaves robot.toml's mechanism unbound. Whether the
+        # block's values move the motor is scaffold_sim_test's (e2e).
         for mechanism, kind in (("gripper", "velocity"),
                                 ("position_cpp", "position")):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
@@ -159,23 +171,30 @@ class NewRobotTest(unittest.TestCase):
                        "require_target_coverage = true"),
                       ("autonomous = []", 'autonomous = ["auto"]')])
                 status, output, _ = describe(work, launcher, env,
-                                             os.path.join(tmp, "before"))
+                                             os.path.join(tmp, "before"),
+                                             SIM_CONFIG)
                 self.assertNotEqual(status, 0, output)
                 self.assertIn("target coverage required for mode 'teleop'",
                               output)
 
-                subsystem = os.path.join(work, SUBSYSTEMS, f"{mechanism}.toml")
-                for _, _, _, replacements in new_subsystem.simulation_edits(
-                        mechanism, kind):
-                    edit(subsystem, replacements)
+                append_simulation_block(work, mechanism, kind)
                 status, output, _ = describe(work, launcher, env,
-                                             os.path.join(tmp, "after"))
+                                             os.path.join(tmp, "after"),
+                                             SIM_CONFIG)
                 self.assertEqual(status, 0, output)
                 self.assertNotIn("error:", output)
+                # ./sim.sh's manifest check still passes.
+                self.assertEqual(sync_manifest.check(work, SIM_CONFIG), "")
+                # The robot's own config gets neither the binding nor the
+                # simulated gains.
+                robot, _ = sync_manifest.effective(work, CONFIG)
+                self.assertNotIn("teleop", robot[mechanism])
+                for motor in robot[mechanism]["motors"].values():
+                    self.assertEqual(set(motor["slot0"].values()), {0.0})
 
                 # The bound target is one the node does not clamp away.
-                with open(subsystem, "rb") as f:
-                    table = tomllib.load(f)
+                subsystems, _ = sync_manifest.effective(work, SIM_CONFIG)
+                table = subsystems[mechanism]
                 (binding,) = table["teleop"]["bindings"]
                 (motor,) = table["motors"].values()
                 if kind == "position":

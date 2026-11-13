@@ -297,13 +297,17 @@ setup is placeholder too: `max_rot = 0.001` confines every target to within
 direction checked before the first enable. The generator appends the
 subsystem name and path to `configuration/robot.toml` and regenerates that
 config's manifest plus manifests of configs that include it.
-`./sim.sh --config my_robot/main_processor/configuration/robot.toml --sim-gateway`
-runs the robot. The wrist moves there only after the edits the generator's
-`Next:` output lists, in order: uncomment the `[[teleop.bindings]]` (with a
-`position_rot` inside the travel), set `[targets]` for a robot whose
-autonomous policy has no writer, set `max_rot`, and give `slot0` gains. It
-also prints the `sim.sh` command that holds button 3, and what the launcher
-says if a step is skipped.
+`./sim.sh --config my_robot/main_processor/configuration/robot_sim.toml --sim-gateway`
+runs the robot in simulation. `robot_sim.toml` is the simulation-only config
+`new_robot` writes: it includes `robot.toml`, which never reads it back. The
+wrist moves there only after you append the block the generator's `Next:`
+output prints to it: a teleop binding on button 3 (`position_rot = 1.0`), a
+`[targets]` override for an autonomous policy with no writer, a simulated
+travel (`max_rot`, and a `home_margin_rot` past it, because the simulator's
+home switch reads closed at every position) and simulated `slot0` gains.
+`subsystems/wrist.toml` keeps its binding commented and its gains zero, so
+none of these values reaches the robot. `Next:` also prints the `sim.sh`
+command that holds button 3.
 
 The Python variant puts `wrist.py` and `node_test.py` in the same package,
 not in a separate `py/` directory. It uses the same schema, `:node` target

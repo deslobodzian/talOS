@@ -86,6 +86,42 @@ py_test(
     ],
 )
 
+# A scaffolded velocity and position mechanism, edited as their `Next:` says,
+# reach their teleop goals under sim_gateway --physics. Over 5 s, e2e lane:
+# the launcher runs the robot's graph for `Next:`'s 8 s mode and joystick
+# schedule in real time (the gateway has no faster-than-real-time mode).
+py_test(
+    name = "scaffold_sim_test",
+    size = "medium",
+    timeout = "short",
+    srcs = [
+        "new_robot.py",
+        "new_robot_test.py",
+        "new_subsystem.py",
+        "scaffold_sim_test.py",
+    ],
+    data = [
+        "//2026-robot/main_processor/simulation:sim_gateway",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+        "//talOS/launcher:log_dump",
+        "//talOS/telemetry:node",
+        "//talOS/teleop:node",
+        "//tools/scaffold_testdata/gripper:node",
+        "//tools/scaffold_testdata/position_cpp:node",
+    ],
+    legacy_create_init = False,
+    main = "scaffold_sim_test.py",
+    tags = [
+        "e2e",
+        "exclusive",
+    ],
+    deps = [
+        ":sync_manifest_lib",
+        "@rules_python//python/runfiles",
+    ],
+)
+
 # ./sim.sh --config: which file a path names, and its refusals (missing,
 # outside the repository, ambiguous, stale manifest), with a stub bazel and
 # resolver so nothing builds or starts.
