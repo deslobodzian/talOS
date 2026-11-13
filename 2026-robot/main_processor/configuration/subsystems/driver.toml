@@ -3,6 +3,8 @@
 name = "driver"
 node = "//2026-robot/main_processor/driver:node"
 period_us = 20000
+# Full-stick speeds, finite and > 0; deadband_frac in [0, 1). Construction
+# fails naming the key for a value out of its range.
 max_linear_mps = 4.0
 max_angular_radps = 6.0
 deadband_frac = 0.05
@@ -10,10 +12,11 @@ deadband_frac = 0.05
 # Heading loss stops translation until centred, then uses robot-relative.
 # Fresh heading plus centred translation restores driver-relative driving.
 field_oriented = true
-# Joystick 0 button (1-based) that re-zeroes driver-forward to the current
-# heading; non-positive disables re-zero. No joystick 0 [[teleop.bindings]]
-# button may share it (config_golden_test checks).
+# Joystick 0 button (1-based, at most 32) that re-zeroes driver-forward to
+# the current heading; non-positive disables re-zero. No joystick 0
+# [[teleop.bindings]] button may share it (config_golden_test checks).
 rezero_button_id = 4
-# Angular correction in rad/s per radian of wrapped heading error. The held
-# heading is where the robot stops turning, as the drivetrain measures it.
+# Angular correction in rad/s per radian of wrapped heading error, finite
+# and >= 0 (0 turns the hold off). The held heading is where the robot stops
+# turning, as the drivetrain measures it.
 heading_hold_radps = 4.0

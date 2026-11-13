@@ -425,6 +425,47 @@ TEST(Driver, DriverStationLossReleasesItsLanes) {
   EXPECT_EQ(harness.chassis_count(), after_release);
 }
 
+// REQ-CONTRACT-18
+TEST(Driver, BadParameterFailsConstruction) {
+  const struct {
+    const char* key;
+    const char* setting;  // [subsystems.driver]
+  } rows[] = {
+      {"max_linear_mps", "max_linear_mps = -4.0"},
+      {"max_linear_mps", "max_linear_mps = nan"},
+      {"max_angular_radps", "max_angular_radps = 0.0"},
+      {"max_angular_radps", "max_angular_radps = inf"},
+      {"deadband_frac", "deadband_frac = 1.0"},
+      {"deadband_frac", "deadband_frac = -0.1"},
+      {"deadband_frac", "deadband_frac = nan"},
+      {"heading_hold_radps", "heading_hold_radps = -1.0"},
+      {"heading_hold_radps", "heading_hold_radps = nan"},
+      {"rezero_button_id", "rezero_button_id = 33"},
+      {"heading_timeout_s", "heading_timeout_s = 0.0"},
+      {"heading_timeout_s", "heading_timeout_s = nan"},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.setting);
+    Sim sim = Sim::FromToml(std::string{R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+
+[subsystems.driver]
+)"} + row.setting + "\n");
+    try {
+      sim.add<Driver>("driver");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
 TEST(Driver, StartupHeldAxesOrRezeroCannotArmProducer) {
   for (const auto& held :
        {Stick(0, -1, 0), Stick(0, 0, -1), Stick(0, 0, 0, 1)}) {
