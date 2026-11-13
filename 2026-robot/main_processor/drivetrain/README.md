@@ -29,8 +29,9 @@ preserving the direction of the velocity change, so a constant field velocity
 held while rotating is reached rather than chased in the turning robot frame;
 the previous command is rotated by the heading change since the last tick
 (robot-frame limiting while the heading is invalid on either tick). Rotation is
-limited independently. Each
-defaults to `0.0`; non-positive or non-finite values leave that limit disabled.
+limited independently. Each must be finite and nonnegative and defaults to
+`0.0`, which leaves that limit disabled; any other value fails construction
+naming the key.
 The period is the configured node update period, not elapsed wall time.
 Disabled, stale/released or non-finite targets and fewer than two live modules
 neutralize immediately and reset both ramps to zero. Re-enabling starts a new
