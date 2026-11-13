@@ -1232,6 +1232,45 @@ TEST(TelemetryMatrix, PublishesFromALiveInput) {
   EXPECT_EQ(raw.at("shooter/status/routine_index"), 2u);
 }
 
+// Test node publishing the alert-shaped schema on its `state` topic.
+class StateAlertsNode {
+ public:
+  explicit StateAlertsNode(talos::Node& node)
+      : state_{node.publish<schema_test::Alerts>("/arm/state")} {}
+
+  talos::Publisher<schema_test::Alerts> state_;
+};
+
+// REQ-OPS-37, REQ-CONTRACT-33: an alert is a `status` topic's field, as
+// session_report reads it; an alert-shaped bool on another role is a plain
+// bool, so the dashboard's alert feed (and its budget count) and the
+// post-match report agree on which channels are alerts.
+TEST(TelemetryMatrix, TagsAlertsOnlyOnStatusTopics) {
+  std::string config{kAlertsConfig};
+  config += R"(
+[subsystems.arm]
+node = "//arm:node"
+)";
+  Sim sim = Sim::FromToml(config);
+  sim.add<AlertsNode>("shooter");
+  sim.add<StateAlertsNode>("arm");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  const auto dict = DictionaryMap(telemetry);
+  ASSERT_TRUE(dict.contains("arm/state/alert_warning_hot"));
+  EXPECT_EQ(static_cast<int>(dict.at("arm/state/alert_warning_hot")->alert),
+            static_cast<int>(Talos::Telemetry::AlertLevel_None));
+  EXPECT_EQ(
+      static_cast<int>(dict.at("shooter/status/alert_warning_hot")->alert),
+      static_cast<int>(Talos::Telemetry::AlertLevel_Warning));
+  // What the `alerts` widget adds to the feed mask and its budget.
+  std::size_t alerts = 0;
+  for (const auto& [name, info] : dict) {
+    if (info->alert != Talos::Telemetry::AlertLevel_None) ++alerts;
+  }
+  EXPECT_EQ(alerts, 3u);
+}
+
 // The channels a dashboard layout names, each from one of its key shapes.
 struct LayoutChannels {
   std::string routine = "shooter/status/routine_index";
