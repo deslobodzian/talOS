@@ -469,6 +469,11 @@ cc_test(
     name = "launcher_test",
     size = "small",
     srcs = ["launcher_test.cc"],
+    # Independent cases (each writes its own files; a stub is written once
+    # per process). Unsharded, the Mac mini took up to 58.9 s of the 60 s
+    # small limit at ten parallel runs (TODO.md MAC-2); four shards hold
+    # about a quarter each.
+    shard_count = 4,
     # Each spawn is two fork()s; under macOS ASan/TSan one fork costs about
     # 30/375 ms (1.5 ms plain), so session timing windows cannot hold there.
     # The Linux sanitizer legs still run this test.
