@@ -24,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -743,6 +744,123 @@ TEST(Supervision, AnEarlierRunsRowWithTheSamePidIsNotTheRunsCounts) {
   EXPECT_EQ(alpha[0].find("\"wake_failures\": 3"), std::string::npos)
       << "an earlier run's row counted as this run's: " << alpha[0];
   std::filesystem::remove_all(options.output_dir);
+}
+
+// The same row left active, as a SIGKILLed run leaves it until the next
+// claim frees it, earlier in the registry than the row the run that reuses
+// its pid claims late (a Python node's interpreter start). The supervision
+// pass's read must take the run's own row, never one older than the run's
+// spawn: the earlier row's dispatch count never moves, so taking it charges
+// the run the earlier run's counts and kills it as stalled once the startup
+// grace (5 s) is over, though its own row shows progress at every look. The
+// test plays both rows and moves the supervision clock 400 ms (inside the
+// 500 ms heartbeat timeout) per step, with progress in the run's row each
+// step, until the grace is well over; then alpha exits.
+// REQ-OPS-05, REQ-OPS-43
+TEST(Supervision, AnEarlierRunsActiveRowIsNotTheRunsRow) {
+  auto options = BaseOptions("stale_active_row");
+  options.max_restarts = 0;
+  options.duration_s = kHangSeconds;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
+  const testing::SteppedClock::ReleaseOnExit release{clock};
+  const auto pid_file = TempPath("stale_active_row_pid");
+  const auto go_file = TempPath("stale_active_row_go");
+  ::remove(pid_file.c_str());
+  ::remove(go_file.c_str());
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "stale_active_row_alpha",
+      "echo $$ > " + pid_file + ".tmp && mv " + pid_file + ".tmp " + pid_file +
+          "\nwhile [ ! -e " + go_file + " ]; do sleep 0.01; done\nexit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("stale_active_row_beta", "exit 0\n");
+  const int64_t before = introspect::monotonic_now_ns();
+  testing::SupervisionPasses passes;
+  bool planted = false;
+  bool passed = false;
+  std::jthread driver{[&, session_id =
+                              options.session_id](const std::stop_token& stop) {
+    const auto give_up = std::chrono::steady_clock::now() + 20s;
+    pid_t pid = 0;
+    while (!stop.stop_requested() &&
+           std::chrono::steady_clock::now() < give_up) {
+      std::ifstream input{pid_file};
+      if (input >> pid) break;
+      std::this_thread::sleep_for(2ms);
+    }
+    introspect::RegistryMapping mapping;
+    // Claims a row here and hands it to alpha's pid: the registration no
+    // longer owns it, so its destructor leaves it active. A claim takes the
+    // first free row, so the earlier run's comes first.
+    const auto plant = [&](int64_t heartbeat, uint64_t wake_failures) {
+      const introspect::NodeRegistration registration{
+          {"alpha", "//example/alpha:node", session_id, 0}};
+      auto& rows = mapping.header()->nodes;
+      for (auto& row : rows) {
+        if (row.state.load(std::memory_order_acquire) !=
+                static_cast<uint64_t>(introspect::SlotState::ACTIVE) ||
+            row.session_id != session_id ||
+            row.pid != static_cast<uint64_t>(::getpid()))
+          continue;
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::CLAIMING),
+                        std::memory_order_release);
+        row.pid = static_cast<uint64_t>(pid);
+        row.pid_start = 0;
+        row.flags.store(0, std::memory_order_release);
+        row.heartbeat_monotonic_ns.store(heartbeat);
+        row.dispatch_count.store(7);
+        row.wake_failures.store(wake_failures);
+        row.state.store(static_cast<uint64_t>(introspect::SlotState::ACTIVE),
+                        std::memory_order_release);
+        return static_cast<std::ptrdiff_t>(&row - &rows[0]);
+      }
+      return std::ptrdiff_t{-1};
+    };
+    const std::ptrdiff_t earlier = pid > 0 ? plant(before, 3) : -1;
+    const std::ptrdiff_t own =
+        earlier >= 0 ? plant(introspect::monotonic_now_ns(), 0) : -1;
+    planted = earlier >= 0 && own > earlier;
+    // A whole pass has run since now (RunSessionUntil).
+    const auto pass = [&] {
+      const uint64_t after = passes.Started() + 2;
+      while (passes.Started() < after &&
+             std::chrono::steady_clock::now() < give_up) {
+        SupervisionWakeup::Wake();
+        std::this_thread::sleep_for(2ms);
+      }
+      return passes.Started() >= after;
+    };
+    passed = planted;
+    for (int step = 0; passed && step < 15; ++step) {
+      auto& row = mapping.header()->nodes[own];
+      row.dispatch_count.fetch_add(1);
+      row.heartbeat_monotonic_ns.store(introspect::monotonic_now_ns());
+      clock.Advance(400ms);
+      passed = pass();
+    }
+    std::ofstream{go_file} << "go\n";
+    // Their pid is gone: freed, as the next claim would.
+    for (const std::ptrdiff_t row : {earlier, own}) {
+      if (row >= 0)
+        mapping.header()->nodes[row].state.store(
+            static_cast<uint64_t>(introspect::SlotState::FREE),
+            std::memory_order_release);
+    }
+  }};
+  RunSession(options);
+  driver.join();
+  ASSERT_TRUE(planted) << "no rows to plant";
+  EXPECT_TRUE(passed) << "the supervision passes did not run";
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha.size(), 1u) << manifest;
+  EXPECT_NE(alpha[0].find("\"reason\": \"exit\""), std::string::npos)
+      << "judged by the earlier run's row: " << alpha[0];
+  EXPECT_EQ(alpha[0].find("\"wake_failures\": 3"), std::string::npos)
+      << "an earlier run's row counted as this run's: " << alpha[0];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(pid_file.c_str());
+  ::remove(go_file.c_str());
 }
 
 // session_report --strict on a finished session directory: its exit status
