@@ -1,0 +1,15 @@
+// A `status` message for log_dump_test's alerts: two alerts of different
+// levels, one nested a struct down, and a field that starts with `alert_`
+// but names no level (ParseAlertField reads none from it).
+namespace alert_test;
+
+struct Health {
+  alert_warning_hot:bool;
+}
+
+struct Status {
+  alert_error_link_lost:bool;
+  alert_critical_overheat:bool;
+  health:Health;
+  supply_v:float;
+}

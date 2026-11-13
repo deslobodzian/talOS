@@ -253,8 +253,17 @@ cc_binary(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/hardware",
+        "//talOS/introspection:names",
         "//talOS/schema:decode",
     ],
+)
+
+# A status message with alert fields, for log_dump_test.
+talos_messages(
+    name = "alert_message",
+    srcs = ["testdata/alert_message.fbs"],
+    include_prefix = "alert_test",
+    visibility = ["//visibility:private"],
 )
 
 cc_test(
@@ -264,6 +273,7 @@ cc_test(
     data = [":log_dump"],
     env = {"TALOS_LOG_DUMP": "$(rlocationpath :log_dump)"},
     deps = [
+        ":alert_message",
         ":continuity_message",
         "//talOS/configuration",
         "//talOS/events:events_core",

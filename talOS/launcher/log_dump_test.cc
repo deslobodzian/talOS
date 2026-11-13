@@ -14,6 +14,8 @@
 #include <string>
 #include <vector>
 
+#include "alert_test/alert_message_descriptor.h"
+#include "alert_test/alert_message_generated.h"
 #include "continuity_test/continuity_message_descriptor.h"
 #include "continuity_test/continuity_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
@@ -311,6 +313,60 @@ TEST_F(LogDumpTest, SummaryGivesCountsLatestValueAndRangePerTopic) {
   EXPECT_TRUE(has(alpha, "topic /alpha/state continuity_test.Count"));
   EXPECT_TRUE(has(alpha, "  records alpha TIMER 2"));
   EXPECT_FALSE(has(alpha, "topic /gamma/state continuity_test.Count"));
+}
+
+// Guards: each record of a node's `status` topic carries every alert field's
+// level and state, nested ones by path, so a session read offline shows when
+// each alert was raised; an `alert_` field that names no level, the same
+// message on a topic of another role, and a record with no alert field get
+// none.
+// REQ-OPS-37
+TEST_F(LogDumpTest, StatusRecordsCarryTheirAlerts) {
+  using D = talos::Descriptor<alert_test::Status>;
+  talos::event::log::LogWriter writer{
+      directory_ + "/watchdog.tlog", "watchdog",
+      talos::event::log::LogWriterOptions{4096, 1, false}, 42};
+  std::vector<talos::event::Registration> sources;
+  for (const std::uint16_t id : {1, 2}) {
+    talos::event::Registration source;
+    source.id = id;
+    source.kind = talos::event::SourceKind::SENDER;
+    source.name = id == 1 ? "/watchdog/status" : "/watchdog/state";
+    source.message_bytes = sizeof(alert_test::Status);
+    source.schema = {std::string{D::kName}, D::kHash,
+                     std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
+                                 D::kBfbs.size()}};
+    sources.push_back(source);
+  }
+  writer.start(sources, talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  const alert_test::Status status{true, true, alert_test::Health{false}, 12.5F};
+  for (const std::uint16_t id : {1, 2}) {
+    talos::event::Context ctx{};
+    ctx.kind = talos::event::EventKind::SEND;
+    ctx.source_id = id;
+    ctx.dispatch_index = id;
+    ctx.event_time = talos::event::MonotonicTime::from_nanos(1'000'000'000);
+    ctx.now = ctx.event_time;
+    ctx.publish_time = ctx.event_time;
+    writer.send(ctx, id, std::as_bytes(std::span{&status, 1}), 0, id);
+  }
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto status_json =
+      Run({"--format", "jsonl", "--topic", "/watchdog/status"});
+  EXPECT_NE(status_json.find(
+                ",\"alerts\":[{\"name\":\"alert_error_link_lost\",\"level\":"
+                "\"error\",\"active\":true},{\"name\":\"health.alert_warning_"
+                "hot\",\"level\":\"warning\",\"active\":false}]}"),
+            std::string::npos)
+      << status_json;
+  for (const std::string topic : {"/watchdog/state", "/alpha/state"}) {
+    const auto json = Run({"--format", "jsonl", "--topic", topic});
+    EXPECT_NE(json.find("\"topic\":\"" + topic + "\""), std::string::npos)
+        << json;
+    EXPECT_EQ(json.find("\"alerts\""), std::string::npos) << json;
+  }
 }
 
 TEST_F(LogDumpTest, RejectsInvalidOptions) {
