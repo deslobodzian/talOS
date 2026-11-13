@@ -530,6 +530,13 @@ struct SimHardware::Impl {
         0,
         0,
         true,
+        true,   // commissioned, as under --sim
+        false,  // alert_error_link_lost: a State goes with each status
+        false,  // alert_error_not_configured
+        false,  // alert_error_uncommissioned
+        false,  // alert_error_motor_fault: the mask is 0
+        false,  // alert_warning_owner_timed_out: timed_out_mask is 0
+        state.health.valid && state.health.brownout,
         clock.boot_id(),
         -gateway_offset.count() / 1000,
         clock.spread_us(),

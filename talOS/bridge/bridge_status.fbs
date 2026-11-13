@@ -26,6 +26,29 @@ enum GatewayProgram : ubyte {
 // also requires commissioned, is false. Display only; actuation is gated on the
 // State's flags (robot_enabled).
 //
+// commissioned is the configuration this bridge pushes: the config's
+// `commissioned`, which --sim forces true.
+//
+// The alert_<level>_<name> fields are alerts (talOS/NAMING.md "Topics"):
+// each is true while its condition holds in the status published, and false
+// as soon as it no longer does; nothing latches. Each is derived from what
+// the bridge already tracks:
+// - alert_error_link_lost: no State accepted yet, or state_age_us above
+//   [robot] command_timeout_us. Clears on the next accepted State.
+// - alert_error_not_configured: configured is false. Clears on the current
+//   boot's acknowledgement.
+// - alert_error_uncommissioned: commissioned is false. Never in simulation.
+// - alert_error_motor_fault: motor_fault_mask is nonzero.
+// - alert_warning_owner_timed_out: an actuator-owning subsystem has had no
+//   request accepted for longer than its owner timeout (ARCHITECTURE.md
+//   "The tick"), or none yet. Unlike timed_out_mask, a controller
+//   transition (boot, epoch, enable or fault edge), which times every owner
+//   out until its next request, does not raise it. Clears on that
+//   subsystem's next accepted request.
+// - alert_warning_brownout: health_valid and brownout.
+// motor_fault and brownout describe the last accepted State, as the fields
+// they read do: while link_lost holds they are that State's.
+//
 // clock_offset_us maps gateway sample time to node time. Valid only after
 // eight ordered States and a causal two-way probe exchange of this boot.
 // clock_offset_uncertainty_us bounds absolute mapping error assuming
@@ -46,6 +69,15 @@ struct BridgeStatus {
   timed_out_mask:uint32;
   subsystem_count:uint32;
   configured:bool;
+  // These seven fill the padding after configured: the struct stays 192 B
+  // and every later field keeps its offset.
+  commissioned:bool;
+  alert_error_link_lost:bool;
+  alert_error_not_configured:bool;
+  alert_error_uncommissioned:bool;
+  alert_error_motor_fault:bool;
+  alert_warning_owner_timed_out:bool;
+  alert_warning_brownout:bool;
   clock_boot_id:uint64;
   clock_offset_us:int64;
   clock_offset_spread_us:uint64;

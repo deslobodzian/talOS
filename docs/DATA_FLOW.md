@@ -278,7 +278,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | 200 | 192 B fixed `bridge.BridgeStatus`, alignment 8 |
+| `/hw/status`: bridge → telemetry/observers | 200 | 192 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and the six alerts fill the padding after `configured` |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
 | `/autonomous/state`: autonomous → telemetry | 16 | 2 B AutonomousState: phase enum and selected/latched routine_index (ubyte); routine adds one 8 B telemetry scalar |
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
@@ -431,9 +431,9 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| `robot.toml`, `robot_field.toml` | 169 | 3, 2504 B (largest 1168 / 1200 B) | 2 pages, 11096 B |
-| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 176 | 3, 2592 B (largest 1168 / 1200 B) | 2 pages, 11480 B |
-| Bench `robot.toml`, `robot_bench.toml` | 64 | 1, 928 B | 1 page, 3896 B |
+| `robot.toml`, `robot_field.toml` | 176 | 3, 2592 B (largest 1168 / 1200 B) | 2 pages, 11496 B |
+| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 183 | 3, 2672 B (largest 1168 / 1200 B) | 2 pages, 11880 B |
+| Bench `robot.toml`, `robot_bench.toml` | 71 | 1, 1008 B | 1 page, 4296 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
