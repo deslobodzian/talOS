@@ -1154,6 +1154,10 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
         continue;
       const auto beat =
           record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+      // An earlier run's row whose pid this run reuses, left active by its
+      // kill until the next claim frees it: every row this run claims beats
+      // at or after its spawn (FinalDeliveryCounts reads the same way).
+      if (beat < launch.spawned_monotonic_ns) continue;
       const auto dispatch =
           record.dispatch_count.load(std::memory_order_relaxed);
       const auto flags = record.flags.load(std::memory_order_acquire);
