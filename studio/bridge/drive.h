@@ -262,6 +262,8 @@ struct DriveSummaryNode {
 struct DriveSummary {
   std::string session;     // "" while no source names it
   bool supervised{false};  // restarts and quarantine come from a manifest
+  // The live registry was read; when false, `alive` means unknown.
+  bool registry{false};
   std::vector<DriveSummaryNode> nodes;
 };
 
@@ -285,14 +287,19 @@ struct DriveRosterEntry {
 // from `config` by name (true for a member the config does not list, such
 // as the sim gateway). Without a manifest, or one listing no member yet,
 // they are `config`'s nodes in its order. `alive` and `drives` come from
-// the live registry's rows of that name. A manifest that does not parse is
+// the live registry's rows of that name (`registry`; nullptr when it could
+// not be read, and the summary then says `registry: false` rather than
+// every node dead as a fact). A manifest that does not parse is
 // treated as absent, so the summary says `supervised: false` rather than
 // zero restarts as a fact; the session then comes from the registry.
 inline DriveSummary BuildDriveSummary(
     const std::vector<DriveRosterEntry>& config,
-    const std::vector<talos::introspect::NodeSnapshot>& registry,
+    const std::vector<talos::introspect::NodeSnapshot>* registry,
     std::string_view manifest_json) {
   DriveSummary summary;
+  summary.registry = registry != nullptr;
+  const std::vector<talos::introspect::NodeSnapshot> unread;
+  const auto& rows = registry != nullptr ? *registry : unread;
   nlohmann::json manifest;
   if (!manifest_json.empty()) {
     manifest = nlohmann::json::parse(manifest_json, nullptr, false);
@@ -307,7 +314,7 @@ inline DriveSummary BuildDriveSummary(
     }
   }
   if (summary.session.empty()) {
-    for (const auto& row : registry) {
+    for (const auto& row : rows) {
       if (row.alive && row.session_id != 0) {
         summary.session = std::to_string(row.session_id);
         break;
@@ -351,7 +358,7 @@ inline DriveSummary BuildDriveSummary(
     }
   }
   for (DriveSummaryNode& node : summary.nodes) {
-    for (const auto& row : registry) {
+    for (const auto& row : rows) {
       if (row.name != node.name || !row.alive) continue;
       node.alive = true;
       for (const auto& selection : row.selections) {
@@ -396,6 +403,7 @@ inline std::string DriveSummaryJson(
   std::string head = "{\"kind\":\"talos.drive.summary\",\"session\":";
   AppendEscaped(head, summary.session);
   head += summary.supervised ? ",\"supervised\":true" : ",\"supervised\":false";
+  head += summary.registry ? ",\"registry\":true" : ",\"registry\":false";
   head += ",\"nodes\":[";
   std::vector<std::string> nodes;
   nodes.reserve(summary.nodes.size());
