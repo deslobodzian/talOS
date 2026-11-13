@@ -5,7 +5,6 @@
 #include <iterator>
 #include <system_error>
 #include <utility>
-#include <vector>
 
 #include "hardware/config_wire.h"
 
@@ -14,12 +13,12 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 
 #include "process/durable_sync.h"
 #endif
 
 #ifdef __linux__
-#include <pthread.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #endif
@@ -28,7 +27,7 @@ namespace talos::rio {
 namespace {
 
 #ifndef _WIN32
-bool WriteAll(int fd, const std::vector<uint8_t>& bytes) {
+bool WriteAll(int fd, std::span<const uint8_t> bytes) {
   std::size_t written = 0;
   while (written < bytes.size()) {
     const auto result =
@@ -41,10 +40,8 @@ bool WriteAll(int fd, const std::vector<uint8_t>& bytes) {
 }
 
 // The rename is durable only once the directory entry is synced.
-bool SyncDirectoryOf(const std::filesystem::path& path) {
-  auto directory = path.parent_path();
-  if (directory.empty()) directory = ".";
-  const int fd = ::open(directory.c_str(), O_RDONLY | O_CLOEXEC);
+bool SyncDirectory(const char* directory) {
+  const int fd = ::open(directory, O_RDONLY | O_CLOEXEC);
   if (fd < 0) return false;
   const bool synced = process::DurableSync(fd) == 0;
   return ::close(fd) == 0 && synced;
@@ -62,35 +59,40 @@ std::optional<hardware::Config> LoadConfigFile(const std::string& path) {
   return config;
 }
 
-bool SaveConfigFile(const std::string& path, const hardware::Config& config) {
-  const auto bytes = hardware::PersistedConfig(config);
-  const std::string temporary = path + ".tmp";
-  std::error_code error;
+ConfigFile::ConfigFile(std::string path)
+    : path_{std::move(path)},
+      temporary_{path_ + ".tmp"},
+      directory_{std::filesystem::path{path_}.parent_path().string()} {
+  if (directory_.empty()) directory_ = ".";
+}
+
+bool ConfigFile::Save(std::span<const uint8_t> persisted) const {
 #ifndef _WIN32
-  const int fd =
-      ::open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  const int fd = ::open(temporary_.c_str(),
+                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd < 0) return false;
-  bool ok = WriteAll(fd, bytes) && process::DurableSync(fd) == 0;
+  bool ok = WriteAll(fd, persisted) && process::DurableSync(fd) == 0;
   ok = ::close(fd) == 0 && ok;
-  if (ok) std::filesystem::rename(temporary, path, error);
-  if (!ok || error) {
-    std::filesystem::remove(temporary, error);
+  if (ok) ok = std::rename(temporary_.c_str(), path_.c_str()) == 0;
+  if (!ok) {
+    ::unlink(temporary_.c_str());
     return false;
   }
-  return SyncDirectoryOf(path);
+  return SyncDirectory(directory_.c_str());
 #else
   // Desktop simulation only: Windows has no fsync; the rename keeps it atomic.
+  std::error_code error;
   bool ok = false;
   {
-    std::ofstream file{temporary, std::ios::binary | std::ios::trunc};
-    file.write(reinterpret_cast<const char*>(bytes.data()),
-               static_cast<std::streamsize>(bytes.size()));
+    std::ofstream file{temporary_, std::ios::binary | std::ios::trunc};
+    file.write(reinterpret_cast<const char*>(persisted.data()),
+               static_cast<std::streamsize>(persisted.size()));
     file.flush();
     ok = static_cast<bool>(file);
   }
-  if (ok) std::filesystem::rename(temporary, path, error);
+  if (ok) std::filesystem::rename(temporary_, path_, error);
   if (!ok || error) {
-    std::filesystem::remove(temporary, error);
+    std::filesystem::remove(temporary_, error);
     return false;
   }
   return true;
@@ -110,29 +112,42 @@ ConfigPersister::ConfigPersister(Save save, uint64_t on_disk_id)
 ConfigPersister::~ConfigPersister() { Stop(); }
 
 void ConfigPersister::Start() {
-  if (thread_.joinable()) return;
+  if (started_) return;
   stop_ = false;
+#ifdef _WIN32
   thread_ = std::thread([this] { Run(); });
+#else
+  if (const int error = pthread_create(&thread_, nullptr, &RunThread, this))
+    throw std::system_error{error, std::generic_category(),
+                            "config saver thread"};
+#endif
+  started_ = true;
 }
 
 void ConfigPersister::Stop() {
-  if (!thread_.joinable()) return;
+  if (!started_) return;
   {
     std::lock_guard lock{mutex_};
     stop_ = true;
   }
   wake_.notify_one();
+#ifdef _WIN32
   thread_.join();
+#else
+  pthread_join(thread_, nullptr);
+#endif
+  started_ = false;
 }
 
 void ConfigPersister::Acknowledged(const hardware::Config& config) {
+  const uint64_t id = hardware::ConfigurationId(config);
   // Already on disk, with nothing handed over since that could be written
   // after it: nothing to save. Otherwise this is the newest, even when the
   // file holds it (A on disk, B in flight, A acknowledged: A must follow B).
-  if (outstanding_ == 0 && !unsaved_ &&
-      hardware::ConfigurationId(config) == on_disk_id_)
-    return;
-  unsaved_ = config;
+  if (outstanding_ == 0 && !unsaved_ && id == on_disk_id_) return;
+  // Encoded here, on the loop thread, which owns the bytes from here to the
+  // Tick() that frees them: the saver neither allocates nor frees.
+  unsaved_ = Persisted{id, hardware::PersistedConfig(config)};
 }
 
 uint32_t ConfigPersister::Tick(bool disabled) {
@@ -144,9 +159,8 @@ uint32_t ConfigPersister::Tick(bool disabled) {
   const auto failed = static_cast<uint32_t>(failed_ - collected_failed_);
   collected_failed_ = failed_;
   on_disk_id_ = saved_id_;
-  // A saved configuration comes back to be freed here, after the unlock: its
-  // memory is this thread's (see done_).
-  std::optional<hardware::Config> saved = std::move(done_);
+  // A saved configuration comes back to be freed here, after the unlock.
+  std::optional<Persisted> saved = std::move(done_);
   done_.reset();
   bool wake = saved.has_value() && pending_.has_value();
   if (unsaved_ && disabled) {
@@ -162,11 +176,23 @@ uint32_t ConfigPersister::Tick(bool disabled) {
   return failed;
 }
 
+#ifndef _WIN32
+void* ConfigPersister::RunThread(void* persister) {
+  static_cast<ConfigPersister*>(persister)->Run();
+  return nullptr;
+}
+#endif
+
+// Allocates and frees nothing: every Persisted moves between slots that are
+// empty (moving a vector out leaves nothing to free), and save_ is required
+// not to.
 void ConfigPersister::Run() {
 #ifdef __linux__
   // Below the loop thread, like the logger: a save is not urgent.
   pthread_setname_np(pthread_self(), "talos-config");
   setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 19);
+#elif defined(__APPLE__)
+  pthread_setname_np("talos-config");
 #endif
   std::unique_lock lock{mutex_};
   for (;;) {
@@ -175,26 +201,28 @@ void ConfigPersister::Run() {
     wake_.wait(lock, [this] {
       return (pending_.has_value() && !done_.has_value()) || stop_;
     });
-    // Stop saves what was handed over first.
-    if (!pending_) return;
-    // Moves the configuration's storage, and leaves pending_ empty with
-    // nothing to free.
-    hardware::Config config = std::move(*pending_);
+    // Stop saves what was handed over first. saving_ is always empty here:
+    // it stays occupied only after a save while stopping, and the loop, no
+    // longer ticking, hands over nothing after that one.
+    if (!pending_ || saving_) return;
+    saving_.emplace(std::move(*pending_));
     pending_.reset();
     lock.unlock();
-    const bool ok = save_(config);
-    const uint64_t id = ok ? hardware::ConfigurationId(config) : 0;
+    const bool ok = save_(saving_->bytes);
     lock.lock();
     ++finished_;
     if (ok) {
-      saved_id_ = id;
+      saved_id_ = saving_->id;
     } else {
       ++failed_;
     }
-    // Back to the loop thread, which allocated it, to free: `config` is left
-    // empty. Only while stopping, when the loop no longer ticks, can done_
-    // still hold the last one; this thread frees that.
-    done_ = std::move(config);
+    // Back to the loop thread, which allocated it, to free. Only while
+    // stopping can done_ still hold the last one; this one then stays in
+    // saving_ (see there).
+    if (!done_) {
+      done_.emplace(std::move(*saving_));
+      saving_.reset();
+    }
   }
 }
 
