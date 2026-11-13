@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <optional>
@@ -773,6 +774,104 @@ TEST(PositionMechanism, LimitSwitchHomingFindsThePhysicsHomeSwitch) {
   EXPECT_EQ(carriage.rig.mech().fault(), PositionFault::kNone);
 }
 
+// The first move after limit-switch homing starts from rest. The physics
+// carriage reaches its switch (-0.25, no hard stop there) at the homing
+// speed, 1 V / (12 V / 100 rps) = 8.3 rps; a Motion Magic profile started at
+// that speed with acceleration_rps2 = 2 would run on v^2 / (2 a), about 17
+// rotations, past the switch before turning back. Settling in neutral
+// instead stops it near the switch: it pushes on for the ticks home_samples
+// and the relay take (the zero lands within 0.15 rot past the switch, as
+// above), then the brake's decay (time constant 20 ms, 25% of the speed per
+// 5 ms step) carries it v * dt * 0.75 / 0.25 = 0.125 rot further. So it
+// never goes more than 0.3 rot past the switch, and once at rest the profile
+// takes it to its goal.
+// REQ-SAFE-36
+TEST(PositionMechanism, LimitSwitchHomingSettlesBeforeTheFirstMove) {
+  PhysicsRig carriage{"carriage"};
+  carriage.SetHomeSwitch(
+      {.input = "carriage_home", .motor = "carriage", .closed_at_rot = -0.25});
+  carriage.motor().acceleration_rps2 = 2.0;
+  carriage.motor().slots[0] = {.p = 1.0, .d = 0.05, .v = 0.12};
+  carriage.Configure();
+  carriage.rig.Start();
+  double lowest_rot = 0.0;
+  // 3 s: the move from rest, 0.9 rot at 2 rot/s^2, takes about 1.3 s.
+  for (int i = 0; i < 600 && !carriage.rig.mech().at_goal(); ++i) {
+    carriage.Tick(0.5);
+    lowest_rot = std::min(lowest_rot, carriage.position_rot());
+  }
+  EXPECT_GE(lowest_rot, -0.25 - 0.3);
+  EXPECT_TRUE(carriage.rig.mech().at_goal())
+      << "phase " << static_cast<int>(carriage.rig.mech().phase()) << " fault "
+      << static_cast<int>(carriage.rig.mech().fault()) << " at "
+      << carriage.position_rot();
+}
+
+// While it settles the mechanism is still homing: neutral, not homed, and
+// bounded by homing_timeout_us. One that never comes to rest (back-driven
+// past its switch at 0.5 rot/s, ten times homing_stall_rps) faults with the
+// homing timeout and never takes a goal. Invalid feedback on the way, which
+// SimHardware sends as velocity 0, is no reading, not rest.
+// REQ-SAFE-36
+TEST(PositionMechanism, LimitSwitchHomingThatNeverSettlesTimesOut) {
+  Rig carriage{"carriage"};
+  carriage.SetMotor(1.0, -0.5);  // moving down: no stall
+  carriage.hw.set_digital_input("carriage", "carriage_home", true);  // open
+  carriage.Start();
+  carriage.Drive(0.5, 30ms);
+  carriage.ExpectHoming(-1.0);
+  carriage.hw.set_digital_input("carriage", "carriage_home", false);
+  carriage.Drive(0.5, 30ms);  // the switch has set the frame
+  EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+  bool moved = false;
+  for (int i = 0; i < 100; ++i) {  // 500 ms, homing_timeout_us
+    carriage.hw.set_connected("carriage", "carriage", i < 40 || i >= 50);
+    carriage.Drive(0.5, 5ms);
+    moved |= carriage.Applied().mode != Mode::kNeutral;
+  }
+  EXPECT_FALSE(moved);
+  EXPECT_FALSE(carriage.mech().homed());
+  EXPECT_EQ(carriage.mech().fault(), PositionFault::kHomingTimeout);
+  carriage.ExpectNeutral();
+}
+
+// A Driver Station disable while settling ends the homing run, as it does
+// during the push: neutral, unhomed, and the timeout starts over, so 400 ms
+// settling before the disable and 300 ms after it (more than
+// homing_timeout_us in all) does not fault. Re-enabled, it still takes no
+// goal until it has come to rest.
+// REQ-SAFE-36
+TEST(PositionMechanism, DisableWhileSettlingEndsTheHomingRun) {
+  Rig carriage{"carriage"};
+  carriage.SetMotor(1.0, -0.5);
+  carriage.hw.set_digital_input("carriage", "carriage_home", true);
+  carriage.Start();
+  carriage.Drive(0.5, 30ms);
+  carriage.hw.set_digital_input("carriage", "carriage_home", false);
+  carriage.Drive(0.5, 400ms);  // settling, still moving
+  ASSERT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+
+  carriage.hw.set_driver_station(DsPacket(ds::kTeleop));
+  carriage.sim.step(20ms);
+  EXPECT_EQ(carriage.mech().phase(), PositionPhase::kUnhomed);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  carriage.Start();
+  carriage.Drive(0.5, 300ms);
+  EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+  EXPECT_EQ(carriage.mech().phase(), PositionPhase::kHoming);
+  EXPECT_FALSE(carriage.mech().homed());
+  carriage.ExpectNeutral();
+
+  carriage.SetMotor(0.9);  // at rest
+  carriage.Drive(0.5, 30ms);
+  EXPECT_TRUE(carriage.mech().homed());
+  EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
+}
+
 // A mechanism that keeps moving (no stop within reach) times out and faults.
 // REQ-SAFE-36
 TEST(PositionMechanism, StallHomingTimesOutWhileStillMoving) {
@@ -817,9 +916,10 @@ TEST(PositionMechanism, HoldNeverStartsHoming) {
 }
 
 // Limit-switch homing upward (positive homing_v, home_rot at max_rot 2.0,
-// a switch that reads true when closed): the closed switch sets the frame,
-// a closed switch at home is fine, and one closed well below home (into the
-// travel) is stuck.
+// a switch that reads true when closed): the closed switch sets the frame
+// (here at a stop, so the top is at rest and settles at once), a closed
+// switch at home is fine, and one closed well below home (into the travel)
+// is stuck.
 // REQ-SAFE-36
 TEST(PositionMechanism, LimitSwitchHomingUpwardAndAStuckSwitch) {
   Rig top{"top"};
@@ -828,7 +928,8 @@ TEST(PositionMechanism, LimitSwitchHomingUpwardAndAStuckSwitch) {
   top.Drive(1.0, 30ms);
   top.ExpectHoming(1.0);
   top.hw.set_digital_input("top", "top_switch", true);  // closed
-  top.Drive(1.0, 20ms);  // home_samples (2) closed readings
+  top.SetMotor(5.0);                                    // and stopped
+  top.Drive(1.0, 20ms);  // home_samples (2) closed, and slow, readings
   EXPECT_TRUE(top.mech().homed());
   EXPECT_EQ(top.mech().fault(), PositionFault::kNone);  // closed at home
   EXPECT_EQ(top.Applied().mode, Mode::kMotionMagic);
@@ -872,8 +973,11 @@ TEST(PositionMechanism, LimitSwitchHomingIgnoresAnInvalidSwitchSample) {
   carriage.Drive(0.5, 10ms);
   carriage.ExpectHoming(-1.0);
   carriage.Drive(0.5, 5ms);  // the second consecutive valid closed reading
+  EXPECT_NEAR(carriage.mech().position_rot(), 0.0, 1e-9);  // the frame
+  EXPECT_FALSE(carriage.mech().homed());  // still moving: it settles first
+  carriage.SetMotor(1.0);                 // at rest, read on the next tick
+  carriage.Drive(0.5, 15ms);              // then home_samples (2) slow readings
   ASSERT_TRUE(carriage.mech().homed());
-  EXPECT_NEAR(carriage.mech().position_rot(), 0.0, 1e-9);
 
   // Homed and 0.5 into its travel, the switch open, then invalid.
   carriage.SetMotor(1.5);

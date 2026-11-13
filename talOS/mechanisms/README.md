@@ -166,7 +166,7 @@ on the next tick; a stall push keeps pushing meanwhile.
 | `homing` | Frame from | Keys |
 |---|---|---|
 | `"none"` | the motor's absolute frame; construction refuses a `"rezero"`-frame motor, which would never drive | |
-| `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too. A switch sample that is not `connected()` (an input not answering, a gateway configuring) is no reading: it does not count, and it ends a run of closed readings, as a disconnected motor ends a homing push | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
+| `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too. A switch sample that is not `connected()` (an input not answering, a gateway configuring) is no reading: it does not count, and it ends a run of closed readings, as a disconnected motor ends a homing push. Homing then completes only once the mechanism is at rest (see settling below) | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
 | `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only once the current push has moved it `homing_min_travel_rot` from where that push began or has lasted `homing_min_push_us`, so a slow start is not taken for the stop; a goal lost mid-push ends the push, and its motion does not count for the next, and a one-tick position step faster than the motor's `max_velocity_rps` allows (a frame jump, not motion) starts the push over | the drive keys, `homing_stall_current_a` (A, required, > 0 and below the motor's `stator_limit_a`), `homing_min_push_us` (µs, required, > 0), `homing_min_travel_rot` (rot, required, > 0 and less than the travel); `homing_timeout_us` must exceed `homing_min_push_us + homing_stall_us` plus two node periods. Since stillness under load after the minimum push is taken as the stop, `homing_v` must be enough to move the mechanism against its worst-case load (friction, gravity, a held piece) anywhere in its travel; a push too weak to move it homes wherever it sticks |
 | `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, with acquisition times (`position_time()`) known and at most `RezeroAgeBound` apart, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1), `absolute_offset_rot` (rot, default 0), `absolute_margin_rot` (rot, required, > 0). The RoboRIO configures every CANcoder's discontinuity at 0.5, so it reads absolute position in [-0.5, 0.5) rotations (`PhoenixBackend.cpp`); the frame can name only the one sensor rotation `absolute_offset_rot ± 0.5·|absolute_rot_per_sensor_rot|`. The whole physical range must lie strictly inside it: the travel `min_rot..max_rot` widened by `absolute_margin_rot` at each end, which must cover the hard stops and any overshoot past the travel, since a mechanism resting just past the window reads across the discontinuity and takes a frame a whole sensor rotation away. `SimHardware` and the physics simulator wrap a CANcoder reading the same way |
 
@@ -180,6 +180,25 @@ homes there. Limit-switch homing homes against the physics backend's home
 switch (`PhysicsSimBackend::SetHomeSwitches`, talOS/hardware/README.md
 "Simulation Backends"), which closes at a configured position of the motor.
 
+The switch sets the frame wherever the mechanism is when the run of closed
+readings completes, usually still moving at the homing speed, and the switch
+need not be at a hard stop. A profiled move started then would begin at that
+speed and overshoot past the switch by about v² / (2 × `acceleration_rps2`).
+So a limit-switch mechanism settles first: it stays unhomed (`homed()` false;
+`kHoming` with `driving()` false on a live goal, `kUnhomed` otherwise),
+commanding neutral (the motor's `brake` or coast), until its last
+`home_samples` readings with valid feedback were all slower than
+`homing_stall_rps`; an invalid reading breaks the run. Readings count on
+every tick, enabled or not, with or without a goal, and before the zero too,
+so a mechanism already at rest when the switch zeroes it (against a stop, or
+resting on its switch at power-on) is homed at once. On a live goal the
+settling is bounded by `homing_timeout_us`, counted from its first live tick
+after the zero: one that
+never comes to rest (back-driven, falling) faults `kHomingTimeout`. A Driver
+Station disable while settling ends the homing run as during the push: the
+timeout starts over. Stall homing sets its frame only on stillness, and
+absolute homing does not move the mechanism, so neither settles.
+
 Drive keys, all required except `home_rot`: `homing_v` (V, nonzero, at most
 half the motor's `max_voltage`, pointing at `home_rot`, which must be the
 travel end that way: `min_rot` for a negative `homing_v`, `max_rot` for a
@@ -187,7 +206,7 @@ positive one), `home_rot` (rot, default 0), `homing_timeout_us` (> 0),
 `homing_stall_rps` (rot/s, > 0), `homing_stall_us` (> 0). Homing drives
 `homing_v` only on a live goal; losing the goal ends the push (its motion
 evidence starts over with the next) but not the timeout, which counts from the first push since the last zero or Driver
-Station disable. The timeout always faults; it never homes. A device reset or
+Station disable (for settling, since the zero or a disable). The timeout always faults; it never homes. A device reset or
 a RoboRIO reboot that drops the zero sends the mechanism back to homing.
 
 Faults latch neutral (`kFaulted`) until `clear_fault()` or a Driver Station
@@ -289,8 +308,10 @@ feature: stall homing (a stop after motion, never moving, a slow start, the
 timeout), absolute homing (including a reset), upward limit-switch homing and
 a stuck switch, an invalid switch sample (neither homing nor stuck), homing
 paused without a goal, hold on an unhomed mechanism, stall and limit-switch
-homing on the physics simulator's motor and home switch,
-gravity for elevator and arm, turret wrap, at-goal and at-speed edges
+homing on the physics simulator's motor and home switch, settling after
+limit-switch homing (no overshoot past a switch with no hard stop on the
+physics simulator, a timeout when it never comes to rest, a disable ending
+the run), gravity for elevator and arm, turret wrap, at-goal and at-speed edges
 (including at speed lost on a velocity sample past `ReadinessAgeBound` or
 of unknown age, and reached before the clock mapping converges, REQ-DEV-22), spin-down, faults, the roller's phases, an invalid piece-sensor sample
 (a held piece kept, intaking neutral, a debounce started over), a disable

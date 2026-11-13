@@ -101,17 +101,23 @@ false. With a live, finite target it drives the lift down at `homing_v` volts
 (negative: down, toward the switch), a voltage request, which a dropped zero
 does not hold and which the TalonFX bounds by the lift's current and voltage
 limits. Once the switch has read closed on `home_samples` consecutive elevator
-periods (default 3) it calls `rezero(0)` and goes on to the target's goal in
-the same tick; until then homing keeps driving, and any open reading, or a
-sample that is not `connected()`, restarts the count, so a one-tick glitch
-mid-travel does not zero the lift partway up.
-A lift already on the switch zeroes there without moving, whether or not the
-robot is enabled.
+periods (default 3) it calls `rezero(0)`; until then homing keeps driving,
+and any open reading, or a sample that is not `connected()`, restarts the
+count, so a one-tick glitch mid-travel does not zero the lift partway up.
+It goes on to the target's goal in the same tick only if the lift is already
+at rest (slower than `homing_stall_rps` on its last `home_samples` periods);
+otherwise it stays HOMING, neutral, until it is, so the first motion-magic
+move starts from rest instead of from the homing speed, which would carry
+the lift past the switch
+([settling](../../talOS/mechanisms/README.md#positionmechanism)).
+A lift already resting on the switch zeroes there without moving, whether or
+not the robot is enabled.
 
 HOMING_FAILED latches, neutral, in three cases:
 
 - the switch has not closed within `homing_timeout_us` of the first homing
-  command (time with no target counts too);
+  command (time with no target counts too), or the zeroed lift has not come
+  to rest within `homing_timeout_us` of the first target after the zero;
 - the lift has moved slower than `homing_stall_rps` for `homing_stall_us`
   while homing pushes it (jammed, or the motor is not turning);
 - the switch reads closed while the zeroed lift is more than

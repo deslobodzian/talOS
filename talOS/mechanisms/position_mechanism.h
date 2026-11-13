@@ -58,7 +58,9 @@ namespace talos::mechanisms {
 enum class PositionPhase : std::uint8_t {
   kUnhomed,  // no position frame yet, and not driving home this tick
              // (no goal, or hold(): only set_goal() starts homing)
-  kHoming,   // driving homing_v toward home this tick
+  kHoming,   // homing on a live goal this tick: driving homing_v toward
+             // home, or (limit switch) neutral while the mechanism comes to
+             // rest after the switch set the frame (driving() tells which)
   kReady,    // homed, no goal this tick (neutral)
   kMoving,   // driving to a goal, not yet at it
   kAtGoal,   // within tolerance_rot of the goal for at_goal_debounce_us
@@ -113,8 +115,9 @@ class PositionMechanism {
 
   PositionPhase phase() const { return phase_; }
   PositionFault fault() const { return fault_; }
-  // The position frame holds: always for homing = "none", else
-  // Motor::zeroed().
+  // Homing is complete: always for homing = "none", else Motor::zeroed(),
+  // and for a limit switch only once the mechanism has come to rest after
+  // the switch set the frame (see settle()).
   bool homed() const;
   bool at_goal() const { return phase_ == PositionPhase::kAtGoal; }
   // An output (a goal, or homing) went out this tick.
@@ -145,6 +148,7 @@ class PositionMechanism {
   void request(Request kind, double position_rot, double feedforward_v);
   void reset_fault();
   bool home(Time now);
+  void settle(Time now);
   void reset_homing_run();
   void fault(PositionFault reason);
   void idle(PositionPhase phase);
@@ -218,6 +222,10 @@ class PositionMechanism {
   double push_last_rot_{0};           // position at the last push tick
   Time push_last_at_{};
   std::optional<Time> homing_still_since_;
+  // A limit switch has set the frame and the mechanism has not yet come to
+  // rest: home_samples consecutive valid readings below homing_stall_rps.
+  bool settling_{false};
+  int rest_count_{0};  // consecutive such readings, at most home_samples
   std::optional<double> held_rot_;
   std::optional<double> goal_anchor_rot_;  // move timer restarts past it
   Time goal_since_{};

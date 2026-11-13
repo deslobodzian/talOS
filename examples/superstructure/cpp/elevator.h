@@ -20,14 +20,14 @@ namespace demo {
 // config; the travel, min_rot (0) to max_rot, is enforced on the homed frame.
 //
 // Heights count from the bottom switch (homing = "limit_switch"), not from
-// where the TalonFX powered on: until the switch has zeroed the lift, it is
-// HOMING, and a TalonFX reset or a RoboRIO reboot drops the zero and starts
-// homing again. While HOMING with a live, finite target it drives down at
-// homing_v until the switch has read closed on home_samples consecutive
-// ticks; one closed sample mid-travel does not zero it. The switch zeroes an
-// idle lift too. It is normally open, wired to ground behind the input's
-// pull-up (limit_switch_closed_reads = false), so a cut wire reads "not at
-// the bottom" and can only make homing fail, never zero the lift mid-travel.
+// where the TalonFX powered on: until the switch has zeroed the lift and it has
+// come to rest, it is HOMING, and a TalonFX reset or a RoboRIO reboot drops the
+// zero and starts homing again. While HOMING with a live, finite target it
+// drives down at homing_v until the switch has read closed on home_samples
+// consecutive ticks; one closed sample mid-travel does not zero it. The switch
+// zeroes an idle lift too. It is normally open, wired to ground behind the
+// input's pull-up (limit_switch_closed_reads = false), so a cut wire reads "not
+// at the bottom" and can only make homing fail, never zero the lift mid-travel.
 //
 // HOMING_FAILED is the mechanism's latched fault: homing timed out or pushed
 // a still lift, or the switch read closed with the zeroed lift more than

@@ -1167,7 +1167,7 @@ PY_POSITION_PARAMETERS = '''\
 PY_POSITION_TESTS = '''
     # Homing. The values are testdata/robot.toml's (homing_v = -1.0,
     # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor
-    # moving at 12.5 rps.
+    # at rest.
 
     def set_home(self, closed):
         """Normally open to ground behind the input's pull-up: closed reads
@@ -1403,8 +1403,8 @@ max_velocity_rps = 100.0
 cruise_velocity_rps = 1.0
 acceleration_rps2 = 2.0
 # Positions count from the home switch, not from where the motor powered on:
-# Motion Magic goals go out neutral until the switch zeroes the motor, and
-# again after a motor reset or RoboRIO reboot drops that zero. Only a remote
+# Motion Magic goals go out neutral until the switch zeroes the motor and it
+# has come to rest, and again after a motor reset or RoboRIO reboot drops that zero. Only a remote
 # CANcoder's frame may be "absolute" (usable unzeroed, surviving a reset).
 position_frame = "rezero"
 # No hardware soft limits: the TalonFX applies them to its power-on position
@@ -2367,9 +2367,9 @@ def mechanism_files(name, lang, kind):
                 ("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC"),
                 ("state.velocity_rps, 12.5", "state.position_rot, 0.0"),
                 ('0.0, 12.5)\n',
-                 '0.0, 12.5)\n'
-                 '        # Starts on its home switch (closed reads False, see\n'
-                 '        # set_home): zeroed without moving.\n'
+                 '0.0, 0.0)\n'
+                 '        # Starts at rest on its home switch (closed reads\n'
+                 '        # False, see set_home): zeroed without moving.\n'
                  f'        self.hw.set_digital_input("{name}", '
                  f'"{name}_home", False)\n'),
                 ("\n\nclass BinaryTest",
@@ -2663,12 +2663,9 @@ max_rot = 2.0
 [{sub}.digital_inputs.{name}_home]
 sim_motor = "{motor}"
 sim_closed_at_rot = -0.1
-# The simulated motor's gains, not the mechanism's, and its profile's
-# acceleration: the first move after homing starts from the homing speed,
-# and the simulation has no hard stop at the switch to end it.
+# The simulated motor's gains, not the mechanism's.
 [{sub}.motors.{motor}]
 slot0 = {{ {gains} }}
-acceleration_rps2 = 20.0
 """
     return block + f"""\
 # The simulated motor's feedforward (volts per rps), not the mechanism's:
