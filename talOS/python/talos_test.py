@@ -510,6 +510,7 @@ can_id = 3
         self.assertEqual(hw.motor_request("lift", "lift"),
                          (talos.Mode.MOTION_MAGIC, 1.5, 0.25, 2))
 
+    # REQ-SAFE-06: a motor setter outside update() raises, naming the motor
     def test_motor_command_outside_update_raises(self):
         # The flush after each update() sends neutral for every motor that
         # update() did not set, so a command from every() would pulse.

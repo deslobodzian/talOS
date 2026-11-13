@@ -121,6 +121,7 @@ TEST(HardwareNodeTrustTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   EXPECT_TRUE(Commands(gateway.TakeSent()).empty());
 }
 
+// REQ-SAFE-03, REQ-SAFE-19: omitted DIO, PWM and motors go neutral
 TEST(HardwareNodeTrustTest, LatestRequestNeutralizesOmittedOutputs) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Bridge bridge{cfg};

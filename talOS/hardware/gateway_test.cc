@@ -1126,6 +1126,7 @@ TEST(Gateway, RejectsWholeTransactionBeforeApplyingAnyMotor) {
   }
   EXPECT_EQ(backend.applied, 0);
 }
+// REQ-SAFE-21: outputs are neutralized before devices are reconfigured
 TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -1150,6 +1151,7 @@ TEST(Gateway, NeutralizesOutputsBeforeReconfiguringDevices) {
   EXPECT_EQ(backend.events[1], "configure");
   EXPECT_EQ(backend.events[2], "neutral");
 }
+// REQ-SAFE-21: an identical push succeeds with no device traffic
 TEST(Gateway, RepeatedConfigurationPushIsIdempotent) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -1198,6 +1200,8 @@ TEST(Gateway, ReconfigurationRequiresDisabledOperation) {
   EXPECT_TRUE(g.Reconfigure(changed));
   EXPECT_EQ(backend.configure_calls, configures + 1);
 }
+// REQ-SAFE-23: repeated global apply failures latch a fault that re-enable
+// clears
 TEST(Gateway, ApplyFailureRetriesThenLatchesAndReenableClears) {
   FakeBackend backend;
   Gateway g{SwerveConfig(true), backend, 1};
@@ -2639,6 +2643,7 @@ TEST(Gateway, EveryMotorOrOutputApplyFailureStillLatches) {
   }
 }
 
+// REQ-SAFE-23: a global apply failure latches even while a chain is isolated
 TEST(Gateway, GlobalFailureDuringIsolationStillLatches) {
   FakeBackend backend;
   const auto config = SwerveConfig(true);
