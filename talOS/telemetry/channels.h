@@ -171,9 +171,11 @@ std::vector<Channel> EnvelopeChannels(std::string_view topic,
 
 // The Driver Station topic's channels, decoded from its packet rather than
 // read from a struct: connected, enabled, autonomous, teleop, test, estop,
-// fms_attached, alliance (labels unknown, red, blue) and match_time_s, all
-// under "hw/state/driver_station/".
-inline constexpr std::size_t kDriverStationChannelCount = 9;
+// fms_attached, alliance (labels unknown, red, blue), match_time_s,
+// match_number, match_type (labels none, practice, qualification,
+// elimination) and station (the FMS driver station number, 0 when none),
+// all under "hw/state/driver_station/".
+inline constexpr std::size_t kDriverStationChannelCount = 12;
 std::vector<Channel> DriverStationChannels();
 
 // The raw sample of each DriverStationChannels() channel, in that order, from

@@ -142,7 +142,7 @@ and `ReadDriverStation` do the same for the Driver Station packet.
 `<lane>/message/`, each at its offset in the whole envelope. The node
 builds its dictionary and reads every tick through it, so anything that
 names or decodes a recorded message with it uses the live names. Rules 6
-and 7 are the node's own.
+to 8 are the node's own.
 
 1. **Naming**: Channel names follow wire conventions `<owner>/<role>/<field>`
    (for example `drivetrain/state/vx_mps`, `pose/valid`).
@@ -175,6 +175,27 @@ and 7 are the node's own.
    `geometry.Pose2d` struct. Telemetry extracts `x_m`, `y_m`, and `yaw_rad` via
    reflection. Missing, stale, invalid or nonfinite pose data makes `pose/valid`
    and `chassis` zero.
+8. **Labels from configuration**: an integer channel whose values index
+   another subsystem's string-array parameter is named by it, at
+   construction, with one `[[subsystem.labels]]` table per channel in
+   `telemetry.toml`:
+
+   ```toml
+   [[subsystem.labels]]
+   channel = "autonomous/state/routine_index"  # an integer channel of this dictionary
+   from = "autonomous.routines"                # <subsystem>.<key>: an array of strings
+   ```
+
+   The labels travel as the channel's `labels`, like an enum's, so Studio
+   and the dashboard show the routine's name and never read TOML. The node
+   reads `from` with `param_of`; construction is refused, naming the key
+   (`labels[<i>].channel` or `labels[<i>].from`), for a missing key, a
+   `from` that is not `<subsystem>.<key>`, a subsystem the config lacks, a
+   missing parameter, a value that is not a non-empty array of strings,
+   more than 1024 labels or a label over the dictionary string limit, and,
+   once the graph is known, a channel absent from the dictionary (excluded,
+   or in no state or status topic), not an integer, or already labelled.
+   The labels cost dictionary bytes only, nothing per tick.
 
 ## Dashboard layout
 
