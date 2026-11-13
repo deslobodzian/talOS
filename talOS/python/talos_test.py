@@ -216,6 +216,8 @@ class RunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
+    # REQ-OPS-06: holds_stop, by which the launcher holds a stop through a
+    # Python node's start-up, reaches its --describe as params do.
     def test_describe_reports_every_param_the_constructor_read(self):
         # The launcher refuses a subsystem key no node reads, so a Python
         # node's reads (set or not, its own table or another's) must reach
@@ -241,6 +243,7 @@ class RunTest(unittest.TestCase):
                                 capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         described = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertTrue(described["holds_stop"])
         self.assertEqual(described["params"], [
             {"subsystem": "planner", "key": "height_rot"},
             {"subsystem": "planner", "key": "absent_v"},
