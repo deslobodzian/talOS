@@ -1286,12 +1286,15 @@ TEST(HardwareNodeTrustTest, TransitionAtTwoPeriodsOfSilenceRaisesNoTimeout) {
 // The session's start is no owner timeout: until a State is accepted and the
 // gateway has acknowledged the configuration (alert_error_link_lost and
 // alert_error_not_configured speak meanwhile), no owner is reported silent,
-// and from then each has its owner timeout to be heard. One whose node never
-// starts is reported at that boundary. A gateway reboot is a new start: no
-// owner is reported until the new boot acknowledges, then each has its
-// owner timeout again, and a still-silent one counts a new episode.
+// and an owner this bridge has never accepted a request from is never
+// reported, however long the link has been ready: the launcher reports a
+// node that does not start (REQ-OPS-05). An owner once heard stays heard
+// across a gateway reboot: silent through it, it is reported one owner
+// timeout after the new boot acknowledges, with no request since, and counts
+// an episode.
 // REQ-OPS-20
-TEST(HardwareNodeTrustTest, AnOwnerNeverHeardRaisesOnlyOnceTheLinkIsReady) {
+TEST(HardwareNodeTrustTest,
+     NeverHeardOwnerIsNotReportedAHeardOneIsAfterReboot) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   const uint64_t config_id = NodeConfigId(cfg);
   const std::vector<uint16_t>& drive = cfg.subsystems.at("drivetrain").motors;
@@ -1309,6 +1312,7 @@ TEST(HardwareNodeTrustTest, AnOwnerNeverHeardRaisesOnlyOnceTheLinkIsReady) {
       now_us += 5000;
       PublishCommand(drive_pub, NeutralCommand(state, drive));
       node.Tick(now_us);
+      EXPECT_EQ(TimedOutMask(node, now_us), 0u);
     }
   };
 
@@ -1321,31 +1325,82 @@ TEST(HardwareNodeTrustTest, AnOwnerNeverHeardRaisesOnlyOnceTheLinkIsReady) {
   now_us = kStartUs + 1000;
   drive_until(boot11, kStartUs + 100'000);
   EXPECT_TRUE(node.Status(now_us).alert_error_not_configured());
-  EXPECT_EQ(TimedOutMask(node, now_us), 0u);
 
-  // Acknowledged: the link is ready; the intake is reported one owner
-  // timeout later, the drivetrain never.
+  // Acknowledged: the link is ready. Neither the drivetrain, heard every
+  // 5 ms, nor the intake, never heard, is reported, for many owner timeouts.
   const uint64_t ready_us = now_us + 500;
   Acknowledge(rig, config_id, ready_us);
-  drive_until(boot11, ready_us + owner_timeout_us + 20'000);
-  EXPECT_EQ(TimedOutMask(node, ready_us + owner_timeout_us), 0u);
-  EXPECT_EQ(TimedOutMask(node, ready_us + owner_timeout_us + 1), 0b10u);
-  EXPECT_EQ(node.owner_timeouts("intake"), 1u);
+  drive_until(boot11, ready_us + (5 * owner_timeout_us));
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
 
-  // The gateway reboots: nothing is reported until boot 12 acknowledges.
+  // The drivetrain's node stops, then the gateway reboots: nothing is
+  // reported until boot 12 acknowledges.
   const State boot12 = TrustState(config_id, 12, 1, 500);
   now_us += 1000;
   ASSERT_TRUE(rig.gateway.Deliver(boot12, now_us));
   EXPECT_TRUE(node.Status(now_us).alert_error_not_configured());
   EXPECT_EQ(TimedOutMask(node, now_us), 0u);
-  drive_until(boot12, now_us + 30'000);
-  EXPECT_EQ(TimedOutMask(node, now_us), 0u);
-  const uint64_t reready_us = now_us + 500;
+  const uint64_t reready_us = now_us + 30'000;
   Acknowledge(rig, config_id, reready_us);
-  drive_until(boot12, reready_us + owner_timeout_us + 20'000);
+  // Once ready again, the drivetrain (bit 0), heard before the reboot, is
+  // reported one owner timeout later; the intake still is not.
   EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us), 0u);
-  EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us + 1), 0b10u);
-  EXPECT_EQ(node.owner_timeouts("intake"), 2u);
+  EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us + 1), 0b01u);
+  node.Tick(reready_us + owner_timeout_us + 1);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 1u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+  EXPECT_EQ(TimedOutMask(node, reready_us + (10 * owner_timeout_us)), 0b01u);
+}
+
+// A Python node's first request reached the bridge about 157 ms into every
+// simulated session, three owner timeouts after the link became ready, and
+// set its timed_out_mask bit and alert_warning_owner_timed_out at every
+// start-up (11 of 11 sessions, macOS): the dashboard latches that alert for
+// the match. An owner is not reported before the bridge has accepted a
+// request from it, and a refused request (an obsolete identity, or a device
+// another subsystem owns) is not one.
+// REQ-OPS-20
+TEST(HardwareNodeTrustTest, AnOwnerFirstHeardLateRaisesNoTimeout) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const std::vector<uint16_t>& drive = cfg.subsystems.at("drivetrain").motors;
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  constexpr uint64_t kReadyUs = 1'000'000;
+  constexpr uint64_t kFirstIntakeUs = kReadyUs + 155'000;
+  ASSERT_GT(kFirstIntakeUs - kReadyUs, 3 * owner_timeout_us);
+
+  Acknowledge(rig, config_id, kReadyUs - 500);
+  State state = TrustState(config_id, 11, 1, 1000);
+  ASSERT_TRUE(rig.gateway.Deliver(state, kReadyUs));
+  // A State every 5 ms; the drivetrain flushes on each from the start, the
+  // intake sends one request of an obsolete epoch and one addressing the
+  // drivetrain's motor, then its first good one at kFirstIntakeUs.
+  for (uint64_t now_us = kReadyUs + 5000; now_us <= kFirstIntakeUs;
+       now_us += 5000) {
+    PublishCommand(drive_pub, NeutralCommand(state, drive));
+    if (now_us == kReadyUs + 10'000) {
+      Command obsolete = NeutralCommand(state, roller);
+      obsolete.epoch = 0;
+      PublishCommand(intake_pub, obsolete);
+    } else if (now_us == kReadyUs + 20'000) {
+      PublishCommand(intake_pub, NeutralCommand(state, drive));
+    } else if (now_us == kFirstIntakeUs) {
+      PublishCommand(intake_pub, NeutralCommand(state, roller));
+    }
+    state.sample_time_us += 5000;
+    ASSERT_TRUE(rig.gateway.Deliver(state, now_us));
+    EXPECT_EQ(TimedOutMask(node, now_us), 0u) << "at " << now_us;
+  }
+  ASSERT_EQ(node.identity_rejected(), 1u);
+  ASSERT_EQ(node.ownership_rejected(), 1u);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
   EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
 }
 

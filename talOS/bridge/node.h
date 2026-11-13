@@ -52,6 +52,13 @@ struct SubsystemTracker {
   // alert_warning_owner_timed_out, HardwareNode::OwnerSilent), tracked apart
   // from `merge`, whose Reset() at every controller transition must keep
   // dropping the owner's demands without the status reporting a timeout.
+  // An owner is reported only once `heard`: this bridge process has accepted
+  // a request from it (one refused for identity or ownership is not heard).
+  // Nothing clears it, a gateway reboot or link loss included, so a session's
+  // start, however late a node's first request, reports no owner, and one
+  // whose node never sends is left to the launcher (REQ-OPS-05). It gates
+  // only the status and the exit summary: the merge, and so the owner
+  // timeout's neutral, treats a never-heard owner as before.
   // Silence counts on the bridge clock from `silence_from_us`: the link
   // becoming ready (a State accepted and the current boot configured: the
   // session's start, or a gateway reboot's end), the last accepted request,
@@ -60,11 +67,12 @@ struct SubsystemTracker {
   // are refused, so its next one comes up to a period later). One such
   // transition per accepted request, so a gateway that keeps transitioning
   // cannot hide an owner none of whose requests is accepted.
+  bool heard{false};
   std::optional<uint64_t> silence_from_us;
   bool transition_since_accepted{false};
-  // Whether OwnerSilent held at this subsystem's last evaluation in Tick(),
-  // and the rising edges seen: distinct owner-timeout episodes, the exit
-  // summary's timeouts=.
+  // Whether OwnerSilent held at this subsystem's last evaluation in Tick()
+  // (the exit summary's timed_out=), and the rising edges seen: distinct
+  // owner-timeout episodes, the exit summary's timeouts=.
   bool silent{false};
   uint64_t timeouts{0};
   std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> subscriber;
@@ -338,10 +346,11 @@ class HardwareNode {
   // silence at `now_us`, as the session's start does.
   void UpdateLinkReady(uint64_t now_us);
   // Whether `tracker`'s owner is silent at `now_us` as /hw/status reports
-  // it: the link is ready and nothing restarted its silence
-  // (silence_from_us) for longer than its owner timeout. False while the
-  // link is not ready, when alert_error_link_lost or
-  // alert_error_not_configured says why nothing merges.
+  // it: the link is ready, the owner has been heard, and nothing restarted
+  // its silence (silence_from_us) for longer than its owner timeout. False
+  // while the link is not ready, when alert_error_link_lost or
+  // alert_error_not_configured says why nothing merges, and for an owner
+  // never heard (SubsystemTracker::heard).
   bool OwnerSilent(const SubsystemTracker& tracker, uint64_t now_us) const;
   void NeutralizeAll();
   // Rebuilds the id -> position tables below and every tracker's slots from
