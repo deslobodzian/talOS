@@ -5,6 +5,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstddef>
 #include <iostream>
 
 #include "talOS/launcher/spawn.h"
@@ -19,6 +20,17 @@ bool ShouldRetryStudioBridge(
   if (attempts_made >= kStudioBridgeMaxAttempts) return false;
   if (now - first_attempt >= kStudioBridgeStartupWindow) return false;
   return now - last_spawn >= kStudioBridgeRetryInterval;
+}
+
+bool DropUnansweredStudioBridge(std::vector<NodeSpec>& specs,
+                                std::vector<NodeDescription>& described) {
+  for (std::size_t i = 0; i < specs.size() && i < described.size(); ++i) {
+    if (specs[i].name != kStudioBridgeName || described[i].answered) continue;
+    specs.erase(specs.begin() + static_cast<std::ptrdiff_t>(i));
+    described.erase(described.begin() + static_cast<std::ptrdiff_t>(i));
+    return true;
+  }
+  return false;
 }
 
 std::string StudioBridgeWatchTopic(

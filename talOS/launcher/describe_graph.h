@@ -114,6 +114,10 @@ std::string DeclaredGraphPath(const LauncherOptions& options);
 // members make one finding (MissingBinariesFinding) instead of one "did not
 // answer" per node: before a build that is every node, and the cure is one
 // command. A binary that exists but does not answer keeps its own finding.
+// Studio's bridge (kStudioBridgeName), an observer, is in neither: a probe
+// of it that did not answer, its binary missing or not, is one warning
+// (StudioBridgeFinding), never an error, and Run leaves it out of the
+// session (DropUnansweredStudioBridge).
 std::vector<naming::Diagnostic> DescribeGraph(
     const std::vector<NodeSpec>& specs, const LauncherOptions& options,
     std::vector<NodeDescription>& out,
@@ -130,6 +134,15 @@ std::vector<naming::Diagnostic> DescribeGraph(
 // otherwise a warning.
 std::optional<naming::Diagnostic> MissingBinariesFinding(
     const std::vector<NodeSpec>& missing, const std::string& bundle_dir);
+
+// The warning for Studio's bridge when its probe did not answer: its binary
+// is `missing` (with the build command or the bundle, as
+// MissingBinariesFinding says it), or it gave `error`; either way the
+// session runs without Studio (REQ-OPS-30: its absence or failure never
+// stops another member).
+naming::Diagnostic StudioBridgeFinding(const NodeSpec& spec, bool missing,
+                                       const std::string& error,
+                                       const std::string& bundle_dir);
 
 // How a run's live endpoints differ from what its --describe probe declared,
 // or empty when they agree. An endpoint is a topic end: its kind (SENDER,
