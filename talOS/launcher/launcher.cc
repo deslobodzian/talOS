@@ -216,7 +216,7 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
 // status before the endpoint refusal: 0, or the last nonzero exit code of a
 // member whose exit counts (`exit_not_counted`, one per member, false: not
 // the Studio bridge, and its last run did not end by the stop signal the
-// launcher sent it, EndedByOwnStopSignal).
+// launcher sent it, NodeRun::stopped_by_session).
 int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
                   const std::vector<bool>& exit_not_counted) {
   int exit_status = 0;
@@ -780,15 +780,16 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   }
 
   // Whose last exit leaves the status alone: a run the stop's own signal
-  // ended, the Studio bridge however it ended (an observer, REQ-OPS-30:
+  // ended (its manifest run's stopped_by_session, so the two never
+  // disagree), the Studio bridge however it ended (an observer, REQ-OPS-30:
   // killed while still starting, crashed, or stopped), which the manifest
   // records all the same, and a member the stop left unstarted (no run).
   std::vector<bool> exit_not_counted;
-  exit_not_counted.reserve(launches.size());
-  for (std::size_t i = 0; i < launches.size(); ++i) {
-    exit_not_counted.push_back(launches[i].stopped_by_session ||
-                               (studio && i == studio->index()) ||
-                               procs[i].runs.empty());
+  exit_not_counted.reserve(procs.size());
+  for (std::size_t i = 0; i < procs.size(); ++i) {
+    const auto& runs = procs[i].runs;
+    exit_not_counted.push_back(runs.empty() || runs.back().stopped_by_session ||
+                               (studio && i == studio->index()));
   }
   int exit_status = SummarizeLogs(procs, exit_not_counted);
   if (endpoints_refused_) exit_status = 1;
@@ -1044,7 +1045,6 @@ void Launcher::ShowRestart(NodeProcessInfo& proc,
 void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   liveness.Begin(spawned);
   kill_reason = {};
-  stopped_by_session = false;
   heartbeat_killed = false;
   endpoints_checked = false;
   realtime_reported = false;
@@ -1415,10 +1415,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
       // Read only from the launcher's own record of what it sent, never
       // from the stop flag: a stop signal from elsewhere that ended the run
-      // first is not the session's (EndedByOwnStopSignal).
-      launch.stopped_by_session =
-          EndedByOwnStopSignal(launch.kill_reason, status);
-      proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status));
+      // first is not the session's (EndedByOwnStopSignal). Recorded in the
+      // run, which the exit status reads too (exit_not_counted).
+      proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status),
+                  EndedByOwnStopSignal(launch.kill_reason, status));
       const bool is_bridge = studio && i == studio->index();
       if (is_bridge && studio->Starting(i)) continue;
       launch.restart.RunEnded(clean);

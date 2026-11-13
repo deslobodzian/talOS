@@ -87,8 +87,9 @@ inline constexpr std::chrono::seconds kStopTimeout{2};
 // kStopSignal ended it (waitpid `status`). A member not yet handling a stop
 // (between its exec and process::InstallStopHandlers()) ends so. Such a run
 // is the session's own stop: it does not make the session's exit status
-// nonzero. A signal from elsewhere does not count, nor does the stop
-// timeout's SIGKILL.
+// nonzero, and its manifest run says so (NodeRun::stopped_by_session, which
+// the exit status reads). A signal from elsewhere does not count, nor does
+// the stop timeout's SIGKILL.
 bool EndedByOwnStopSignal(std::string_view kill_reason, int status);
 
 // ---------------------------------------------------------------------------
@@ -262,9 +263,6 @@ class Launcher {
     // Why the launcher ended the current run (kRunStalled, kRunStop, ...);
     // empty while it has not tried. Its run is recorded with this reason.
     std::string_view kill_reason;
-    // The last ended run ended by the stop signal the launcher sent it
-    // (EndedByOwnStopSignal): it leaves the session's exit status 0.
-    bool stopped_by_session{false};
     // introspect::monotonic_now_ns() just before the current run's spawn:
     // every row the run claims has a heartbeat at or after it
     // (FinalDeliveryCounts).
