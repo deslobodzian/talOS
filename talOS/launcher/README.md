@@ -881,7 +881,11 @@ is close-on-exec and a guardian closes every descriptor, so no node or
 helper holds it: a node that outlives its launcher (its guardian kills its
 process group at once) or a process it daemonized never keeps a dead
 session. Retention passes over every directory whose lock is held, without
-counting or reading it, and says so on stderr; a session
+counting or reading it, and says so on stderr. So a launch running in
+another namespace in the same log root counts toward neither this launch's
+`log_keep_sessions` nor its byte budget, and the free floor keeps room for
+this session alone: two sessions running at once there may together hold
+twice `log_max_bytes`, so size a shared log root for both. A session
 whose manifest has no `end_wall_ns` and whose lock nobody holds was left by
 a launcher that died (a power loss, a kill) and is retained like any other.
 To remove a directory, retention takes its lock (creating `session.lock`
