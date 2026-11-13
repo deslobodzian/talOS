@@ -36,6 +36,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #else
 #include <libproc.h>
@@ -316,10 +317,20 @@ class Session {
       while (::waitpid(launcher_, nullptr, 0) < 0 && errno == EINTR) {
       }
     }
-    // Once seen to exit, a pid may already name another process.
+    // Once seen to exit, a pid may already name another process, so only
+    // the snapshot's processes the watch still sees running are killed, and
+    // only the groups whose leader is one of them. A group never
+    // snapshotted is left to its guardian, which kills it when the launcher
+    // is gone.
     if (!gone_) {
-      for (const auto& [member, group] : groups_) ::kill(-group, SIGKILL);
-      for (const pid_t pid : snapshot_) ::kill(pid, SIGKILL);
+      const std::vector<pid_t> running = watch_.AwaitAll(Clock::now());
+      const auto alive = [&running](pid_t pid) {
+        return std::find(running.begin(), running.end(), pid) != running.end();
+      };
+      for (const auto& [member, group] : groups_) {
+        if (alive(group)) ::kill(-group, SIGKILL);
+      }
+      for (const pid_t pid : running) ::kill(pid, SIGKILL);
     }
     if (events_ >= 0) ::close(events_);
     std::filesystem::remove_all(output_dir_);
@@ -353,6 +364,7 @@ class Session {
     argv.push_back(nullptr);
     std::cout.flush();
     std::fflush(nullptr);
+    const pid_t test = ::getpid();
     const pid_t pid = ::fork();
     if (pid < 0) {
       error = std::string{"fork: "} + std::strerror(errno);
@@ -365,6 +377,18 @@ class Session {
           ::dup2(log, STDERR_FILENO) < 0 || ::dup2(events[1], kEventFd) < 0)
         ::_exit(100);
       if (log > STDERR_FILENO) ::close(log);
+#ifdef __linux__
+      // In a group of its own, the launcher would outlive a test Bazel kills
+      // on its timeout, and supervise its stubs on; it dies with the test
+      // instead. The death signal survives execv. A test already gone
+      // before it was set would never send it.
+      if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != test)
+        ::_exit(102);
+#else
+      // macOS has no parent-death signal: a test killed on its timeout
+      // leaves this launcher running, to be stopped by hand.
+      (void)test;
+#endif
       ::execv(argv[0], argv.data());
       ::_exit(101);
     }
@@ -409,7 +433,7 @@ class Session {
   }
 
   // Every member of every reported group, each watched from now on.
-  bool Snapshot(ExitWatch& watch, std::string& error) {
+  bool Snapshot(std::string& error) {
     for (const auto& [member, group] : groups_) {
       const std::vector<pid_t> members = GroupMembers(group);
       const auto [leader, grandchild] = reported_[member];
@@ -422,7 +446,7 @@ class Session {
         }
       }
       for (const pid_t pid : members) {
-        if (!watch.Add(pid)) {
+        if (!watch_.Add(pid)) {
           error = "cannot watch pid " + std::to_string(pid) + ": " +
                   std::strerror(errno);
           return false;
@@ -453,6 +477,12 @@ class Session {
     return text;
   }
 
+  // Waits until every snapshot process has exited or `deadline` passes;
+  // the ones still running.
+  std::vector<pid_t> AwaitAll(Clock::time_point deadline) {
+    return watch_.AwaitAll(deadline);
+  }
+
   // Every snapshot process has been seen to exit: teardown signals none.
   void Gone() { gone_ = true; }
 
@@ -471,6 +501,9 @@ class Session {
   std::map<std::string, std::pair<pid_t, pid_t>> reported_;
   std::vector<pid_t> snapshot_;
   std::map<pid_t, std::string> owner_;
+  // Watches every snapshot process; teardown signals only what it still
+  // sees running.
+  ExitWatch watch_;
 };
 
 // SIGKILLs the launcher once every member runs, then waits for every member
@@ -481,15 +514,14 @@ void ExpectGroupsDieWithTheLauncher(bool ignore_termination) {
   ASSERT_TRUE(session.Start(error)) << error;
   ASSERT_TRUE(session.AwaitMembers(error)) << error << "\nlauncher output:\n"
                                            << session.Log();
-  ExitWatch watch;
-  ASSERT_TRUE(session.Snapshot(watch, error)) << error;
+  ASSERT_TRUE(session.Snapshot(error)) << error;
   // Leader, guardian and grandchild in each group.
   ASSERT_GE(session.SnapshotSize(), 3 * kMembers.size());
 
   const Clock::time_point killed = std::chrono::steady_clock::now();
   session.KillLauncher();
   const std::vector<pid_t> survivors =
-      watch.AwaitAll(killed + std::chrono::milliseconds{kHangMs});
+      session.AwaitAll(killed + std::chrono::milliseconds{kHangMs});
   const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
                               std::chrono::steady_clock::now() - killed)
                               .count();
