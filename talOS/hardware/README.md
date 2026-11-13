@@ -426,9 +426,23 @@ remains healthy while any configured motor or CAN sensor has valid feedback
 (or none are configured). Total loss of all configured motor/CAN-sensor
 feedback neutralizes every output and advances
 the command epoch on the tick it is found, whether or not a command is in
-force. Failed global Apply or backend configuration failure also
-neutralizes every output; individual device configuration or control-send
-failures do not. A rejected configuration push need not invalidate the active
+force; the fault is not latched, and clears in the same epoch on the first
+State with valid feedback. Total loss is judged on the samples
+`Backend::Read` reports, after the age bound and before the gateway's masks
+(unavailable, restoring or send-failed devices, their followers and
+remote-feedback motors, a chain whose restore ends that tick). A State can
+therefore carry every motor and CAN-sensor sample invalid with
+`kHardwareFault` clear: the tick in which a reset of every device is found
+(its samples read before the gateway learned of the reset), a master whose feedback is invalid with only its
+followers configured, and a restore of every motor and CAN sensor at once,
+since `PhoenixBackend` and both simulated backends read a restoring CAN
+sensor valid (only a restoring motor invalid). Each masked motor still goes
+neutral and drives again only on a command observing a later State, while
+digital and PWM outputs keep applying and `robot_enabled` stays true. With
+no CAN sensor configured, a reset of every motor (the bench's one TalonFX) is
+total loss from the tick after it is found until its restore ends. Failed
+global Apply or backend configuration failure also neutralizes every output;
+individual device configuration or control-send failures do not. A rejected configuration push need not invalidate the active
 configuration.
 DIO/analog/PWM and RIO encoder validity never sink the backend.
 

@@ -493,6 +493,7 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   }
   state_.sample_time_us = now;
   const bool was_healthy = healthy_;
+  // Judged before PollResets masks anything (Backend::Read).
   const bool read = configured_ && backend_.Read(state_);
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
