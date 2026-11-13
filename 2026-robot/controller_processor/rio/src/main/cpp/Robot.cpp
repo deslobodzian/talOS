@@ -57,6 +57,7 @@ constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;
 constexpr uint16_t kSocketLostMessage = 4;
 constexpr uint16_t kSocketReplacedMessage = 5;
+constexpr uint16_t kSocketSendMessage = 6;
 
 void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
   talos::rio::LogEvent event;
@@ -425,17 +426,59 @@ void Robot::StartCompetition() {
     // (SocketRetry::SendFailed): nothing more is sent this tick, and the next
     // due Poll replaces it, usually on the next tick, which then runs as
     // usual; a tick with no socket open ticks the gateway disabled and sends
-    // nothing, as before the first open. Any other send error keeps it.
+    // nothing, as before the first open. Any other send error keeps it, and
+    // a spell of them prints a line when it starts and one once sends have
+    // gone a second without failing (one key, so RioLog prints at most one
+    // a second).
     const auto sent = [&](talos::protocol::UdpStatus status) {
-      if (status != talos::protocol::UdpStatus::kSocketError) return;
-      const int error = endpoint_->udp_stats().last_send_error;
-      if (!socket_retry.SendFailed(now_us, error)) return;
-      char text[128];
-      std::snprintf(text, sizeof(text),
-                    "hardware gateway socket cannot send (errno %d); "
-                    "replacing it, nothing is sent until then",
-                    error);
-      Report(*log_, kSocketLostMessage, text);
+      using SendEvent = talos::rio::SocketRetry::SendEvent;
+      SendEvent event = SendEvent::kNone;
+      if (status == talos::protocol::UdpStatus::kOk) {
+        event = socket_retry.SendSucceeded(now_us);
+      } else if (status == talos::protocol::UdpStatus::kSocketError) {
+        event = socket_retry.SendFailed(now_us,
+                                        endpoint_->udp_stats().last_send_error);
+      }
+      char text[160];
+      switch (event) {
+        case SendEvent::kNone:
+          return;
+        case SendEvent::kLost:
+          std::snprintf(text, sizeof(text),
+                        "hardware gateway socket cannot send (errno %d); "
+                        "replacing it, nothing is sent until then",
+                        socket_retry.last_send_error());
+          Report(*log_, kSocketLostMessage, text);
+          return;
+        case SendEvent::kFailing:
+          std::snprintf(text, sizeof(text),
+                        "hardware gateway socket send failed (errno %d); "
+                        "keeping the socket",
+                        socket_retry.spell_error());
+          Report(*log_, kSocketSendMessage, text);
+          return;
+        case SendEvent::kRecovered: {
+          // The last errno only when the spell's changed.
+          char last[32] = "";
+          if (socket_retry.last_send_error() != socket_retry.spell_error()) {
+            std::snprintf(last, sizeof(last), ", last errno %d",
+                          socket_retry.last_send_error());
+          }
+          // From the spell's first failure to its last: the line comes
+          // SocketRetry::kSpellQuietUs after that.
+          std::snprintf(
+              text, sizeof(text),
+              "hardware gateway socket sending again: %u sends failed over "
+              "%.3f s (errno %d%s)",
+              static_cast<unsigned>(socket_retry.spell_failures()),
+              static_cast<double>(socket_retry.spell_last_failure_us() -
+                                  socket_retry.spell_start_us()) /
+                  1e6,
+              socket_retry.spell_error(), last);
+          Report(*log_, kSocketSendMessage, text);
+          return;
+        }
+      }
     };
     if (socket_retry.open()) {
       // Endpoint handles clock probes even disabled/uncommissioned, echoing

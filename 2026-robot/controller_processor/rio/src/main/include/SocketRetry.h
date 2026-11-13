@@ -32,7 +32,10 @@
 // observation age). Only a tick with no socket open (an attempt failed, or
 // none is due yet) ticks the gateway disabled and sends nothing. Any other
 // send error (ENOBUFS, ECONNREFUSED, ...) clears on the same socket and
-// keeps it; EAGAIN is not an error here (kWouldBlock).
+// keeps it; EAGAIN is not an error here (kWouldBlock). Every failed send is
+// counted in its spell (SendEvent), which the loop reports when it starts and
+// when sends succeed again, so a failure that keeps the socket shows on the
+// console too.
 namespace talos::rio {
 
 class SocketRetry {
@@ -65,20 +68,70 @@ class SocketRetry {
     return Event::kFailed;
   }
 
+  // What a send's outcome is for the console (Robot.cpp prints one line for
+  // each but kNone). A spell is a run of failed sends, on the socket or its
+  // replacements, ended by a send that succeeds kSpellQuietUs after the last
+  // of them: good sends between failures do not end it (while the
+  // companion's port is closed, every other send fails with ECONNREFUSED).
+  enum class SendEvent : uint8_t {
+    kNone,
+    // The spell's first failure with an error that keeps the socket.
+    kFailing,
+    // An error the socket can never send past: it is lost (see SendFailed).
+    kLost,
+    // A send succeeded, ending a spell that reported kFailing.
+    kRecovered,
+  };
+
   // A send on the open socket failed at `now_us` with OS error `error`
-  // (UdpStats::last_send_error). When the socket can never send again it is
-  // lost: open() is false from here, replacing() true until a Poll replaces
-  // it, and failures() counts that replacement's failed attempts. Returns
-  // whether it was lost; any other error keeps it.
-  bool SendFailed(uint64_t now_us, int error) {
-    if (!open_ || !protocol::SendErrorNeedsNewSocket(error)) return false;
-    open_ = false;
-    replacing_ = true;
-    lost_us_ = now_us;
-    failures_ = 0;
-    first_failure_us_ = 0;
-    return true;
+  // (UdpStats::last_send_error; 0 for a short send). When the socket can
+  // never send again it is lost: open() is false from here, replacing() true
+  // until a Poll replaces it, and failures() counts that replacement's
+  // failed attempts. Any other error keeps it. Counts the failure in the
+  // spell, starting one if none is open.
+  SendEvent SendFailed(uint64_t now_us, int error) {
+    if (!open_) return SendEvent::kNone;
+    if (!in_spell_) {
+      in_spell_ = true;
+      spell_reported_ = false;
+      spell_failures_ = 0;
+      spell_start_us_ = now_us;
+    }
+    ++spell_failures_;
+    spell_last_failure_us_ = now_us;
+    last_send_error_ = error;
+    if (protocol::SendErrorNeedsNewSocket(error)) {
+      open_ = false;
+      replacing_ = true;
+      lost_us_ = now_us;
+      failures_ = 0;
+      first_failure_us_ = 0;
+      return SendEvent::kLost;
+    }
+    if (spell_reported_) return SendEvent::kNone;
+    spell_reported_ = true;
+    spell_error_ = error;
+    return SendEvent::kFailing;
   }
+
+  // A send on the open socket succeeded: ends the spell, if one is open.
+  // A send on the open socket succeeded at `now_us`: ends the spell once
+  // this long has passed since its last failure.
+  static constexpr uint64_t kSpellQuietUs = 1'000'000;
+  SendEvent SendSucceeded(uint64_t now_us) {
+    if (!in_spell_ || now_us - spell_last_failure_us_ < kSpellQuietUs)
+      return SendEvent::kNone;
+    in_spell_ = false;
+    return spell_reported_ ? SendEvent::kRecovered : SendEvent::kNone;
+  }
+
+  // The current or last spell: its failed sends, the times of the first and
+  // the last, the error its kFailing named, and the last send error.
+  uint32_t spell_failures() const { return spell_failures_; }
+  uint64_t spell_start_us() const { return spell_start_us_; }
+  uint64_t spell_last_failure_us() const { return spell_last_failure_us_; }
+  int spell_error() const { return spell_error_; }
+  int last_send_error() const { return last_send_error_; }
 
   bool open() const { return open_; }
   // Lost and not yet replaced: `open` must open the same ports again
@@ -99,6 +152,13 @@ class SocketRetry {
   uint32_t failures_{0};
   uint64_t first_failure_us_{0};
   uint64_t lost_us_{0};
+  bool in_spell_{false};
+  bool spell_reported_{false};
+  uint32_t spell_failures_{0};
+  uint64_t spell_start_us_{0};
+  uint64_t spell_last_failure_us_{0};
+  int spell_error_{0};
+  int last_send_error_{0};
 };
 
 }  // namespace talos::rio
