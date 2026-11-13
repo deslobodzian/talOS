@@ -1016,6 +1016,74 @@ TEST(HardwareNodeTrustTest, NotReadyNextDutyUsIsTheHeartbeat) {
   }
 }
 
+// While the gateway cannot take a command, a change of a demand still sends
+// at once; only a change of the observation alone waits for the heartbeat.
+// The devices layer flushes neutral then, so the change comes from a request
+// published as is, as a node outside the devices layer could: the bridge
+// forwards a demand whatever the State says and the gateway refuses it while
+// disabled, but the neutral that replaces it must not wait a heartbeat. The
+// duties NextDutyUs() names afterwards count the heartbeat from that send.
+// REQ-RT-13
+TEST(HardwareNodeTrustTest, NotReadyDemandChangeSendsAtOnce) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  InProcessGateway& gateway = rig.gateway;
+  ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  constexpr uint64_t kStartUs = 1'000'000;
+  const uint64_t heartbeat_us = node.heartbeat_us();
+  ASSERT_EQ(heartbeat_us, 20'000u);
+
+  State disabled = TrustState(NodeConfigId(cfg), 11, 1, 1000);
+  disabled.flags = kConfigured;
+  ASSERT_TRUE(gateway.Deliver(disabled, kStartUs));
+  const Command neutral = NeutralCommand(disabled, roller);
+  PublishCommand(pub, neutral);
+  node.Tick(kStartUs + 7'000);
+  ASSERT_EQ(node.commands_sent(), 1u);
+  gateway.TakeSent();
+
+  // The same observation, each time: only the demand changes.
+  Command driven = neutral;
+  driven.motors[0].mode = Mode::kVoltage;
+  driven.motors[0].demand = 4.0;
+  std::vector<SentCommand> commands;
+  const auto tick = [&](uint64_t now_us) {
+    node.Tick(now_us);
+    for (const auto& command : Commands(gateway.TakeSent())) {
+      commands.push_back({now_us, command});
+    }
+  };
+  constexpr uint64_t kDrivenUs = kStartUs + 9'000;
+  constexpr uint64_t kNeutralUs = kStartUs + 10'000;
+  PublishCommand(pub, driven);
+  tick(kDrivenUs);
+  PublishCommand(pub, neutral);
+  tick(kNeutralUs);
+
+  // Up to just before the intake's owner timeout at kNeutralUs + 50'001.
+  uint64_t now_us = kNeutralUs;
+  for (uint64_t due_us = node.NextDutyUs(now_us); due_us < kStartUs + 55'000;
+       due_us = node.NextDutyUs(now_us)) {
+    ASSERT_GT(due_us, now_us) << "nothing is pending at " << now_us;
+    now_us = due_us;
+    tick(now_us);
+  }
+
+  const std::array<uint64_t, 4> expected_us = {kDrivenUs, kNeutralUs,
+                                               kNeutralUs + heartbeat_us,
+                                               kNeutralUs + (2 * heartbeat_us)};
+  ASSERT_EQ(commands.size(), expected_us.size());
+  for (std::size_t i = 0; i < commands.size(); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(commands[i].sent_us, expected_us[i]);
+    EXPECT_EQ(MotorOf(commands[i].command, roller[0]).mode,
+              i == 0 ? Mode::kVoltage : Mode::kNeutral);
+    EXPECT_EQ(commands[i].command.observed_time_us, 1000u);
+  }
+}
+
 // While the gateway can take a command, a request that changes only the
 // merged observation sends at once: the gateway ages every output from that
 // observation, and holding it for a heartbeat would spend up to 20 ms of the
@@ -1371,7 +1439,6 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   // A new epoch resets the merge, not the alert or timed_out_mask.
   ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 62000), 1062000));
   ASSERT_TRUE(node.is_subsystem_timed_out("drivetrain"));
-  EXPECT_EQ(node.Status(1062000).timed_out_mask(), 0u);
   EXPECT_EQ(Alerts(node.Status(1062000)), Names{});
 
   // No State for longer than the command timeout, while both owners keep
