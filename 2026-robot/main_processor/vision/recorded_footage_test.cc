@@ -2,6 +2,11 @@
 // talos::vision::playback reaches the node's live capture path unmodified and
 // publishes observations stamped on the recording's own timeline. The
 // footage is rendered by the repo's field renderer from a known robot pose.
+//
+// The camera node's matrix (docs/TESTING.md §7) is node_test.cc's; this file
+// is one playback scenario through the node, in its own target because it
+// renders footage.
+// matrix: n/a 1, 3, 9, 12 (the node's matrix is in node_test.cc)
 
 #include <gtest/gtest.h>
 

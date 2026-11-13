@@ -198,7 +198,12 @@ void CheckPose(bool rasterize) {
   EXPECT_TRUE(rear_wall_observed);
 }
 
-TEST(VisionTest, FastProjectionLocalizesWhileDisabled) { CheckPose(false); }
+// The node test matrix for an observer, docs/TESTING.md §7: the case names
+// are the matrix's, which //tools:check_node_matrix looks for. The camera
+// localizes from live gateway truth, with no Driver Station or target: its
+// observations are not gated on robot_enabled.
+// REQ-CONTRACT-25
+TEST(VisionTest, PublishesFromALiveInput) { CheckPose(false); }
 TEST(VisionTest, RasterDetectorAndLocalizationRunWhileDisabled) {
   CheckPose(true);
 }
@@ -499,52 +504,52 @@ TEST(VisionTest, MissingTruthPublishesInvalidAndOneDiagnosticPerCamera) {
   }
 }
 
-TEST(VisionTest, StaleTruthIsInvalidAndRecoveryAllowsANewOutageDiagnostic) {
+// REQ-CONTRACT-25: once its truth input is older than command_timeout_us the
+// camera keeps publishing, invalid and unhealthy, and is valid again as soon
+// as truth returns.
+TEST(VisionTest, StaleInputClearsValidity) {
   auto sim = MakeSim(false);
   sim.add<Vision>("rear_right_camera");
   sim.publish(sim::topics::kState, Truth(sim));
   sim.step(50ms);
-  auto observation =
-      sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  if (!observation.has_value()) {
-    FAIL() << "missing camera observation";
-  }
-  ASSERT_TRUE(observation->valid());
-  ::testing::internal::CaptureStderr();
+  const auto observed = [&] {
+    const auto observation =
+        sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
+    EXPECT_TRUE(observation.has_value());
+    return observation.value_or(geometry::PoseObservation{});
+  };
+  const auto status = [&] {
+    const auto latest = sim.latest<VisionStatus>("/rear_right_camera/status");
+    EXPECT_TRUE(latest.has_value());
+    return latest.value_or(VisionStatus{});
+  };
+  ASSERT_TRUE(observed().valid());
   sim.step(250ms);  // Beyond command_timeout_us, even from the first drain.
-  const auto first_diagnostic = ::testing::internal::GetCapturedStderr();
-  observation =
-      sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  if (!observation.has_value()) {
-    FAIL() << "missing camera observation";
-  }
-  EXPECT_FALSE(observation->valid());
-  auto status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  if (!status.has_value()) {
-    FAIL() << "missing camera status";
-  }
-  EXPECT_FALSE(status->healthy());
-  EXPECT_EQ(status->visible_tag_count(), 0u);
-  EXPECT_EQ(std::count(first_diagnostic.begin(), first_diagnostic.end(), '\n'),
-            1);
+  const auto stale = observed();
+  EXPECT_FALSE(stale.valid());  // a new observation: the last one was valid
+  EXPECT_FALSE(status().healthy());
+  EXPECT_EQ(status().visible_tag_count(), 0u);
   sim.publish(sim::topics::kState, Truth(sim));
   sim.step(50ms);
-  observation =
-      sim.latest<geometry::PoseObservation>("/rear_right_camera/state");
-  if (!observation.has_value()) {
-    FAIL() << "missing camera observation";
+  EXPECT_TRUE(observed().valid());
+  EXPECT_TRUE(status().healthy());
+}
+
+// Each truth outage logs one diagnostic, and a recovery lets the next outage
+// log again.
+TEST(VisionTest, EachTruthOutageLogsOneDiagnostic) {
+  auto sim = MakeSim(false);
+  sim.add<Vision>("rear_right_camera");
+  for (int outage = 0; outage < 2; ++outage) {
+    SCOPED_TRACE(outage);
+    sim.publish(sim::topics::kState, Truth(sim));
+    sim.step(50ms);
+    ::testing::internal::CaptureStderr();
+    sim.step(250ms);
+    const auto diagnostic = ::testing::internal::GetCapturedStderr();
+    EXPECT_EQ(std::count(diagnostic.begin(), diagnostic.end(), '\n'), 1)
+        << diagnostic;
   }
-  EXPECT_TRUE(observation->valid());
-  status = sim.latest<VisionStatus>("/rear_right_camera/status");
-  if (!status.has_value()) {
-    FAIL() << "missing camera status";
-  }
-  EXPECT_TRUE(status->healthy());
-  ::testing::internal::CaptureStderr();
-  sim.step(250ms);
-  const auto second_diagnostic = ::testing::internal::GetCapturedStderr();
-  EXPECT_EQ(
-      std::count(second_diagnostic.begin(), second_diagnostic.end(), '\n'), 1);
 }
 
 TEST(VisionTest, FacingAwayPublishesInvalidInsteadOfHoldingLastPose) {
@@ -673,56 +678,6 @@ talos::testing::Sim WithCameraOverride(const char* section, const char* key,
        << "\n[subsystems.front_left_camera" << section << "]\n"
        << key << " = " << value << '\n';
   return talos::testing::Sim::FromToml(text.str());
-}
-
-TEST(VisionTest, SimMountErrorsMustBeFinite) {
-  for (const auto* key :
-       {"sim_mount_error_x_m", "sim_mount_error_y_m", "sim_mount_error_z_m",
-        "sim_mount_error_roll_rad", "sim_mount_error_pitch_rad",
-        "sim_mount_error_yaw_rad"}) {
-    for (const auto* value : {"nan", "inf", "-inf"}) {
-      auto sim = WithCameraOverride(".camera", key, value);
-      EXPECT_THROW(sim.add<Vision>("front_left_camera"), std::runtime_error);
-    }
-  }
-}
-
-TEST(VisionTest, RejectsInvalidTimingSettings) {
-  for (const auto* key : {"latency_offset_us", "sim_timestamp_lag_us"}) {
-    for (const auto* value : {"-1.0", "nan", "inf", "-inf", "1000000.0"}) {
-      SCOPED_TRACE(std::string(key) + "=" + value);
-      auto sim = WithCameraOverride(".camera", key, value);
-      EXPECT_THROW(sim.add<Vision>("front_left_camera"), std::exception);
-    }
-  }
-}
-
-TEST(VisionTest, RejectsInvalidDetectorAndCaptureSettings) {
-  struct Case {
-    const char* section;
-    const char* key;
-    const char* value;
-  };
-  for (const auto& test :
-       {Case{".detector", "decimate", "0.5"},
-        Case{".detector", "decimate", "nan"},
-        Case{".detector", "threads", "17"}, Case{".detector", "threads", "1.5"},
-        Case{".detector", "sigma", "5.0"},
-        Case{".detector", "refine_edges", "\"yes\""},
-        Case{".detector", "hamming_threshold", "3"},
-        Case{".detector", "min_decision_margin", "-1.0"},
-        Case{".detector", "min_decision_margin", "inf"},
-        Case{"", "backend", "\"invalid\""}, Case{".camera", "fps", "0.0"},
-        Case{".camera", "fps", "-1.0"}, Case{".camera", "fps", "nan"},
-        Case{".camera", "fps", "inf"}, Case{".camera", "width", "0"},
-        Case{".camera", "height", "0"}}) {
-    const std::string key =
-        std::string(test.section[0] ? test.section + 1 : "") +
-        (test.section[0] ? "." : "") + test.key;
-    SCOPED_TRACE(key);
-    auto sim = WithCameraOverride(test.section, test.key, test.value);
-    EXPECT_THROW(sim.add<Vision>("front_left_camera"), std::exception);
-  }
 }
 
 // A typo such as fps = 1e9 sized the result queue at 2e7 slots per vector
@@ -1332,27 +1287,72 @@ TEST(VisionTest, RecordingDisabledWritesNothing) {
   EXPECT_FALSE(std::filesystem::exists(disabled / "frames"));
 }
 
-TEST(VisionTest, InvalidRecordingParamsFailConstruction) {
-  for (const char* bad :
-       {"recording.max_bytes = -1\n", "recording.sample_hz = -1.0\n",
-        "recording.rejected_hz = nan\n"}) {
-    SCOPED_TRACE(bad);
-    const auto session = RecordingTempDir("bad");
-    auto sim = MakeSim(true, true, {}, bad);
-    sim.set_session_dir(session);
-    EXPECT_THROW(sim.add<Vision>("rear_right_camera"), std::invalid_argument);
+// REQ-CONTRACT-18: a camera setting out of range refuses construction,
+// naming the key. Each row sets one key of front_left_camera's subsystem
+// section (`section` ""), its [camera] or its [detector] table; a recording
+// row also gives the node a session directory, where recording validates.
+TEST(VisionTest, BadParameterFailsConstruction) {
+  struct Row {
+    const char* section;
+    const char* key;
+    const char* value;
+    bool recording;
+  };
+  std::vector<Row> rows;
+  for (const char* key :
+       {"sim_mount_error_x_m", "sim_mount_error_y_m", "sim_mount_error_z_m",
+        "sim_mount_error_roll_rad", "sim_mount_error_pitch_rad",
+        "sim_mount_error_yaw_rad"}) {
+    for (const char* value : {"nan", "inf", "-inf"}) {
+      rows.push_back({".camera", key, value, false});
+    }
   }
-}
-
-TEST(VisionTest, InvalidMountUncertaintyParamsFailConstruction) {
-  // Mount calibration uncertainty must be finite and nonnegative.
-  for (const char* bad :
-       {"mount_angle_std_rad = -1\n", "mount_angle_std_rad = nan\n",
-        "mount_translation_std_m = -0.1\n",
-        "mount_translation_std_m = inf\n"}) {
-    SCOPED_TRACE(bad);
-    auto sim = MakeSim(true, true, bad);
-    EXPECT_THROW(sim.add<Vision>("rear_right_camera"), std::runtime_error);
+  for (const char* key : {"latency_offset_us", "sim_timestamp_lag_us"}) {
+    for (const char* value : {"-1.0", "nan", "inf", "-inf", "1000000.0"}) {
+      rows.push_back({".camera", key, value, false});
+    }
+  }
+  for (const Row& row : {
+           Row{".camera", "mount_angle_std_rad", "-1", false},
+           Row{".camera", "mount_angle_std_rad", "nan", false},
+           Row{".camera", "mount_translation_std_m", "-0.1", false},
+           Row{".camera", "mount_translation_std_m", "inf", false},
+           Row{".detector", "decimate", "0.5", false},
+           Row{".detector", "decimate", "nan", false},
+           Row{".detector", "threads", "17", false},
+           Row{".detector", "threads", "1.5", false},
+           Row{".detector", "sigma", "5.0", false},
+           Row{".detector", "refine_edges", "\"yes\"", false},
+           Row{".detector", "hamming_threshold", "3", false},
+           Row{".detector", "min_decision_margin", "-1.0", false},
+           Row{".detector", "min_decision_margin", "inf", false},
+           Row{"", "backend", "\"invalid\"", false},
+           Row{".camera", "fps", "0.0", false},
+           Row{".camera", "fps", "-1.0", false},
+           Row{".camera", "fps", "nan", false},
+           Row{".camera", "fps", "inf", false},
+           Row{".camera", "width", "0", false},
+           Row{".camera", "height", "0", false},
+           Row{"", "recording.max_bytes", "-1", true},
+           Row{"", "recording.sample_hz", "-1.0", true},
+           Row{"", "recording.rejected_hz", "nan", true},
+       }) {
+    rows.push_back(row);
+  }
+  for (const Row& row : rows) {
+    const std::string key{row.key};
+    SCOPED_TRACE(std::string{row.section} + " " + key + " = " + row.value);
+    auto sim = WithCameraOverride(row.section, row.key, row.value);
+    if (row.recording) sim.set_session_dir(RecordingTempDir("bad"));
+    try {
+      sim.add<Vision>("front_left_camera");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::exception& error) {
+      // The leaf key: a dotted key may be named by its table and leaf.
+      const std::string leaf = key.substr(key.rfind('.') + 1);
+      EXPECT_NE(std::string{error.what()}.find(leaf), std::string::npos)
+          << error.what();
+    }
   }
 }
 
@@ -1760,10 +1760,10 @@ std::shared_ptr<const std::vector<std::uint8_t>> RenderCameraView(
   return pixels;
 }
 
-// RULES.md 3: with a live camera, detection and localization run on the
+// REQ-RT-06: with a live camera, detection and localization run on the
 // worker; update() only hands the worker the time and publishes what it
 // finished, and allocates nothing. Only the test (loop) thread is counted.
-TEST(VisionTest, LiveUpdateDoesNotAllocate) {
+TEST(VisionTest, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
     GTEST_SKIP() << why;
@@ -1799,7 +1799,7 @@ TEST(VisionTest, LiveUpdateDoesNotAllocate) {
             before->frames_processed_count() + 1);
 }
 
-// RULES.md 3: the direct-projection sim localizes inside update(); once
+// REQ-RT-06: the direct-projection sim localizes inside update(); once
 // warmed, a capture allocates nothing.
 TEST(VisionTest, DirectProjectionUpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
