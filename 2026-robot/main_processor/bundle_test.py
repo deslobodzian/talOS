@@ -201,10 +201,14 @@ class BundleTest(unittest.TestCase):
                 self.assertEqual(len(copies), 1, copies)
 
 
-# The launcher's orderly stop: SIGINT to every member, SIGKILL to any still
-# alive kStopTimeout (talOS/launcher/launcher.h; `stop_timeout` in the
-# launcher README's "Session manifest") later, then the final manifest.
-LAUNCHER_STOP_TIMEOUT_S = 2
+def launcher_stop_timeout_s():
+    """The launcher's orderly stop: SIGINT to every member, SIGKILL to any
+    still alive kStopTimeout (talOS/launcher/launcher.h) later, then the
+    final manifest. Printed by a binary built from that constant."""
+    path = runfiles.Create().Rlocation(
+        "_main/2026-robot/main_processor/bundle_test_stop_timeout")
+    return int(subprocess.run([path], check=True, capture_output=True,
+                              text=True, timeout=60).stdout)
 
 
 class BootServiceTest(unittest.TestCase):
@@ -224,7 +228,7 @@ class BootServiceTest(unittest.TestCase):
         self.assertEqual(unit.get("KillMode"), "mixed", service)
         stop_s = unit.get("TimeoutStopSec", "")
         self.assertRegex(stop_s, r"^\d+s?$", service)
-        self.assertGreater(int(stop_s.rstrip("s")), LAUNCHER_STOP_TIMEOUT_S,
+        self.assertGreater(int(stop_s.rstrip("s")), launcher_stop_timeout_s(),
                            service)
 
 

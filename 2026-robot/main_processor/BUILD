@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_python//python:defs.bzl", "py_test")
 load("//2026-robot/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
 load("//2026-robot/main_processor/configuration:robot_field_manifest.bzl", "CONFIG_FILES", "NODES")
@@ -27,11 +28,20 @@ talos_bundle(
     nodes = ["//talOS/bridge:hardware_node"] + RELOCATION_NODES,
 )
 
+# bundle_test only: prints the launcher's stop timeout in seconds.
+cc_binary(
+    name = "bundle_test_stop_timeout",
+    testonly = True,
+    srcs = ["bundle_test_stop_timeout.cc"],
+    deps = ["//talOS/launcher:launcher_lib"],
+)
+
 py_test(
     name = "bundle_test",
     size = "small",
     srcs = ["bundle_test.py"],
     data = [
+        ":bundle_test_stop_timeout",
         ":relocation_bundle",
         ":robot_bundle",
         "//bench/main_processor:bench_bundle",
