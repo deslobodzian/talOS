@@ -750,6 +750,7 @@ int Launcher::RunSession() {
     PersistManifest(procs);
     std::cout << "[launcher] Started " << proc.name << " (pid " << pid
               << ", target " << proc.target << ")\n";
+    if (options_.member_spawned) options_.member_spawned(proc.name);
   }
   if (studio && !stop_skips_start())
     studio->Start(procs[studio->index()], options_.supervision_clock);

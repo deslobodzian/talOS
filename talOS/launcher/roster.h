@@ -115,6 +115,10 @@ struct LauncherOptions {
   // session's topic segments exist, before the first manifest and any spawn.
   // Empty in production.
   std::function<void()> session_segments_created;
+  // Internal start-up seam: called on the launcher's thread with a roster
+  // member's name right after its first run was spawned, before the next
+  // member's. Empty in production.
+  std::function<void(const std::string& member)> member_spawned;
 
   // Launch a graph the linter called broken anyway. The default is refusal:
   // two spellings of one topic are silent at runtime. Only with `simulation`:
