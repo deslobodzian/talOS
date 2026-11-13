@@ -269,8 +269,9 @@ outputs and described target-lane senders cannot be non-critical; the hardware
 bridge is always critical. Naming and graph errors remain fatal, as does a
 critical node's first run whose
 [live endpoints](../talOS/launcher/README.md#live-endpoints) differ from its
-probe (a non-critical node's is killed alone), so `run.sh` does not weaken the
-graph checks with `--allow-graph-errors`.
+probe (a non-critical node's is killed alone). The launcher accepts
+`--allow-graph-errors` only with `--sim`, so a deployed launch cannot weaken
+the graph checks.
 `--describe-timeout-ms MS` adjusts the existing 15000 ms per-probe deadline
 and can be passed through `run.sh`.
 

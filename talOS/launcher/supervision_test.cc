@@ -363,6 +363,7 @@ TEST(Supervision, LiveEndpointsThatDifferFromTheProbeStopTheSession) {
 
   auto allowed = EndpointOptions("endpoint_drift_allowed", true);
   allowed.allow_graph_errors = true;
+  allowed.simulation = true;  // The flag requires --sim.
   std::string seen;
   // Its exit status is alpha's, which a slow log sync at shutdown can turn
   // into a SIGKILL under disk load.
@@ -532,6 +533,7 @@ TEST(Supervision, StoppedEventLogReachesTheLiveManifest) {
 TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
   auto options = BaseOptions("delivery_loss");
   options.allow_graph_errors = true;
+  options.simulation = true;  // The flag requires --sim.
   options.duration_s = kHangSeconds;
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
@@ -621,6 +623,7 @@ TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
 TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
   auto options = BaseOptions("stop_loss");
   options.allow_graph_errors = true;  // The bridge stub's request watcher.
+  options.simulation = true;          // The flag requires --sim.
   options.duration_s = kHangSeconds;
   std::string error;
   std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
@@ -2099,6 +2102,7 @@ TEST(Supervision, StalledLoopIsKilledAndRestartedThoughItsHeartbeatMoves) {
 TEST(Supervision, UndescribedNodeAllowedExplicitlyStillMustRegister) {
   auto options = BaseOptions("undescribed_out", "max_restarts = 1\n");
   options.allow_graph_errors = true;
+  options.simulation = true;  // The flag requires --sim.
   options.heartbeat_startup_grace_ms = 0;
   options.duration_s = 3;
   const auto runs = TempPath("undescribed_runs");

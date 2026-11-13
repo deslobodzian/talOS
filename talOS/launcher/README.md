@@ -42,7 +42,13 @@ shutdown adds final log counts.
 `--allow-graph-errors` overrides graph-error refusal, and the refusal of a
 [live endpoint mismatch](#live-endpoints), but not the refusal of a misnamed
 roster member ([node output](#node-output)). Missing descriptions cannot create
-segments for undeclared topics.
+segments for undeclared topics. Since it overrides the safety refusals too, it
+is accepted only with `--sim`, whose remote is loopback
+([controller addressing](#controller-addressing)): without it the launcher
+refuses the flag before it reads the config, so nothing is probed, written or
+spawned, `--describe-only` included:
+
+    launcher: --allow-graph-errors is accepted only with --sim; nothing was described or started
 
 ## One session per namespace
 
