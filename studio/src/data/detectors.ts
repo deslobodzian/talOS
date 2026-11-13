@@ -274,22 +274,39 @@ export function createFrameDetectors(): FrameDetector[] {
       const a = val(prev, 'hw/status/timed_out_mask'),
             b = val(next, 'hw/status/timed_out_mask');
       if (a === undefined || b === undefined || a === b) return [];
-      return [{
-        severity: 'warn',
-        category: 'hardware',
-        title: 'Timed-out mask changed',
-        detail: maskDetail(b),
-        channel: 'hw/status/timed_out_mask'
-      }];
+      // A bit is set only while that subsystem's requests have been silent
+      // for its owner timeout on a ready link (bit i: the i-th
+      // actuator-owning subsystem in sorted name order), and every bit
+      // clears while the gateway is not configured: a set bit is the
+      // problem, a cleared one its end.
+      const before = BigInt(Math.trunc(a)), after = BigInt(Math.trunc(b));
+      const added = after & ~before, cleared = before & ~after;
+      return [
+        ...(added ? [{
+          severity: 'warn' as const, category: 'hardware' as const,
+          title: 'Subsystem requests timed out',
+          detail: `subsystem ${maskDetail(Number(added))}`,
+          channel: 'hw/status/timed_out_mask'
+        }] : []),
+        ...(cleared ? [{
+          severity: 'info' as const, category: 'hardware' as const,
+          title: 'Subsystem request timeouts cleared',
+          detail: `subsystem ${maskDetail(Number(cleared))}`,
+          channel: 'hw/status/timed_out_mask'
+        }] : [])
+      ];
     }
   },
   // Link counters, reported as runs: gateway counts and identity rejections
   // (warn: an obsolete request from before a reconfiguration or epoch change
   // is dropped by design), ownership rejections (error: a subsystem
   // addressed a device it does not own), clock resets (info). `gateway_rejected_command_count`
-  // is deferred and classified: while the robot is not enabled the gateway
-  // refuses commands as designed, so the run is only a warning when the Driver
-  // Station stays enabled for half a second of continuous increments.
+  // is deferred and classified. The gateway does not count an all-neutral
+  // command that lost a race with an epoch change, nor a neutral while
+  // disabled; it counts every other refused command and, while enabled and
+  // faulted, every refused neutral (TODO RT-12). The run is only a warning
+  // when the Driver Station stays enabled for half a second of continuous
+  // increments.
   incrementDetector({
     id: 'counter-gateway',
     match: name => /^hw\/status\/gateway_[^/]*_count$/.test(name),
