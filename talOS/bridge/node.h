@@ -180,8 +180,9 @@ class HardwareNode {
     // OpenWaits() calls that fell back to polling. Stays 0.
     uint64_t wait_fallbacks{0};
     // Request topics whose failed arms the kMaxIdlePasses guard stopped
-    // holding the loop awake, each counted once until a read returns a
-    // request from it again; the registry row's stalled_arms. Stays 0.
+    // holding the loop awake, each counted once until its arm succeeds or a
+    // read returns a request from it again; the registry row's
+    // stalled_arms. Stays 0.
     uint64_t stalled_arms{0};
   };
   const Wakeups& wakeups() const { return wakeups_; }
