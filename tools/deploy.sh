@@ -8,12 +8,12 @@
 #   current -> bundles/<stamp>   what boot and `run` use
 #   previous -> bundles/<stamp>  rollback target
 #
-#   ./tools/deploy.sh install <bundle> [--prefix DIR]
+#   ./tools/deploy.sh install <bundle> [--prefix DIR] [--no-warm-up]
 #   ./tools/deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run]
 #   ./tools/deploy.sh boot-check
 #   ./tools/deploy.sh logs [--prefix DIR] [LOG_ROOT]
 #   ./tools/deploy.sh fetch [--prefix DIR] DEST
-#   ./tools/deploy.sh rollback [--prefix DIR]
+#   ./tools/deploy.sh rollback [--prefix DIR] [--no-warm-up]
 #   ./tools/deploy.sh prune [--prefix DIR] [--keep N]
 #
 set -euo pipefail
@@ -40,10 +40,151 @@ finally:
 ' "$1" "$2"
 }
 
+# --- warm-up ----------------------------------------------------------------
+# Runs every member of the installed bundle at $1 once, one at a time, before
+# anything selects it: each node binary and the Studio bridge as the
+# launcher's probe runs them (`--describe --config <config>`), and the
+# launcher itself with --help. macOS charges the first exec and first load of
+# every newly written executable file (about 100 ms each, serialized
+# host-wide), per file and only on a real exec or load; a fresh bundle's first
+# launch pays it inside the launcher's parallel 15 s describe deadline and,
+# with other new executables on the host, misses it. Paid here, in turn and
+# against the files at their final path, it costs seconds once. A --describe
+# run opens no topic, socket or registry row, and builds no backend (talOS/node
+# RunMain, talOS/bridge main.cc, studio/bridge main.cc), so this touches no
+# hardware and no network, and may run beside a live robot. A member that
+# fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S seconds, default
+# 60; tests shorten it) is a warning naming it and never fails the command:
+# the launch judges members. Linux pays no such charge but runs the same path.
+WARM_UP=1
+warm_up() {
+  local bundle="$1"
+  if [ "$WARM_UP" != "1" ]; then
+    say "warm-up skipped (--no-warm-up): the first launch pays each member's first run"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '+ warm up %s (each member once, in turn)\n' "$bundle"
+    return 0
+  fi
+  say "warming up $bundle: each member's first run, one at a time"
+  python3 - "$bundle" "${TALOS_DEPLOY_WARM_UP_TIMEOUT_S:-60}" <<'EOF' ||
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+bundle, bound_text = sys.argv[1:]
+
+
+def warn(message):
+    print(f"deploy: warning: warm-up: {message}", file=sys.stderr, flush=True)
+
+
+try:
+    bound = float(bound_text)
+except ValueError:
+    bound = 0.0
+if not bound > 0:
+    warn(f"bound {bound_text!r} is not a positive number of seconds; using 60")
+    bound = 60.0
+
+# bundle_manifest.toml as talOS/build/bundle_builder.py writes it: one
+# `key = <JSON literal>` per line. Read by line, since macOS's python3 (3.9)
+# has no tomllib.
+config = None
+members = []
+section = None
+name = None
+try:
+    with open(os.path.join(bundle, "bundle_manifest.toml"),
+              encoding="utf-8") as f:
+        manifest = f.read().splitlines()
+except OSError as e:
+    warn(f"cannot read bundle_manifest.toml ({e}); nothing warmed")
+    sys.exit(0)
+for line in manifest:
+    line = line.strip()
+    if line.startswith("["):
+        section, name = line, None
+        continue
+    key, sep, value = line.partition(" = ")
+    if not sep:
+        continue
+    try:
+        value = json.loads(value)
+    except ValueError:
+        continue
+    if section is None and key == "config_path":
+        config = value
+    elif section == "[[nodes]]" and key == "name":
+        name = value
+    elif section == "[[nodes]]" and key == "binary":
+        members.append((name or value, value, ["--describe"]))
+    elif section == "[studio]" and key == "bridge":
+        members.append(("studio_bridge", value, ["--describe"]))
+if config is None:
+    warn("bundle_manifest.toml names no config_path; nothing warmed")
+    sys.exit(0)
+members = [(label, binary, args + ["--config", config])
+           for label, binary, args in members]
+members.append(("launcher", "launcher", ["--help"]))
+
+# As run.sh starts the launcher: from the bundle, its bin/ first on PATH,
+# nothing of a Bazel run or a Python environment inherited. No .pyc is
+# written: the bundle stays as installed even when deploy.sh runs as root.
+env = dict(os.environ)
+for var in ("BUILD_WORKSPACE_DIRECTORY", "RUNFILES_DIR",
+            "RUNFILES_MANIFEST_FILE", "JAVA_RUNFILES", "PYTHON_RUNFILES",
+            "PYTHONPATH", "VIRTUAL_ENV", "PYTHONHOME"):
+    env.pop(var, None)
+env["PATH"] = os.path.join(bundle, "bin") + os.pathsep + env.get("PATH", "")
+env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+began = time.monotonic()
+for label, binary, args in members:
+    with tempfile.TemporaryFile() as err:
+        try:
+            # Its own process group, so a hung member is killed whole.
+            proc = subprocess.Popen(
+                [os.path.join(bundle, binary)] + args, cwd=bundle, env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=err, start_new_session=True)
+        except OSError as e:
+            warn(f"{label}: cannot run {binary}: {e}")
+            continue
+        try:
+            code = proc.wait(timeout=bound)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            warn(f"{label}: still running after {bound:g} s; killed")
+            continue
+        if code != 0:
+            err.seek(0)
+            lines = err.read()[-4096:].decode(errors="replace").splitlines()
+            # Its last line naming an error, else its last line.
+            said = [line.strip() for line in lines if line.strip()]
+            cause = next((line for line in reversed(said)
+                          if "error" in line.lower()), said[-1] if said else "")
+            warn(f"{label}: exited {code}" + (f": {cause}" if cause else ""))
+print(f"deploy: warmed {len(members)} members in "
+      f"{time.monotonic() - began:.1f} s", flush=True)
+EOF
+    printf 'deploy: warning: warm-up did not finish; the launch pays the rest\n' >&2
+}
+
 # --- install ---------------------------------------------------------------
-# Copies the bundle and flips `current` atomically, keeping `previous` for
-# rollback. Selects only a complete copy, synced to disk first: a power cut
-# right after the flip must not boot a half-written bundle.
+# Copies the bundle, warms it in place and flips `current` atomically,
+# keeping `previous` for rollback. Selects only a complete copy, synced to
+# disk first: a power cut right after the flip must not boot a half-written
+# bundle.
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
@@ -63,6 +204,7 @@ cmd_install() {
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
+  warm_up "$dest"
   if [ -L "$PREFIX/current" ]; then
     select_bundle "$(readlink "$PREFIX/current")" "$PREFIX/previous"
   fi
@@ -451,12 +593,15 @@ EOF
 # --- rollback ---------------------------------------------------------------
 # Whole-bundle rollback with its matching configuration and runtime: swaps
 # `current` back to `previous`. Never mixes node versions across bundles, and
-# never selects a `previous` that no longer holds a bundle.
+# never selects a `previous` that no longer holds a bundle. Warms `previous`
+# first: one installed by a deploy.sh without the warm-up, and never
+# launched, has never run (an already-run one costs about 10 ms a member).
 cmd_rollback() {
   [ -L "$PREFIX/current" ] || die "no current bundle at $PREFIX/current"
   [ -L "$PREFIX/previous" ] && [ -x "$PREFIX/previous/run.sh" ] ||
     die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
   local cur; cur="$(readlink "$PREFIX/current")"
+  warm_up "$(cd "$PREFIX/previous" && pwd -P)"
   select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
   select_bundle "$cur" "$PREFIX/previous"
   say "rolled back: current -> $(readlink "$PREFIX/current"); restart the service to activate"
@@ -514,6 +659,7 @@ main() {
     case "$1" in
       --prefix) PREFIX="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
+      --no-warm-up) WARM_UP=0; shift ;;
       *) rest+=("$1"); shift ;;
     esac
   done

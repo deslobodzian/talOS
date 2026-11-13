@@ -1,7 +1,8 @@
 """Installed bundles describe their graph and keep their config identity.
 
 Each bundle is installed the way the robot gets it (tools/deploy.sh install
-into a fresh prefix), then --describe runs every node binary from there, so a
+into a fresh prefix, which runs every member once without a warning), then
+--describe runs every node binary from there, so a
 C++ node that cannot load a shared library it links, a
 Python node that cannot import its wheels or start its interpreter, or an
 install that breaks the bundle's relative symlinks fails here. The bench
@@ -12,7 +13,12 @@ ProgramArguments), which must run its bridge from the install, found through
 the manifest's [studio] table, beside the index page of the webroot that
 table names; one that does not is asked for Studio with
 --start-studio-bridge and must describe without a bridge rather than fail on
-its absence."""
+its absence. Install's warm-up is checked on a bundle of stubs that record
+each run.
+
+On macOS, which charges each newly written executable's first exec, a stub
+written here pays it well inside the warm-up's bound, which only the stub
+that never exits reaches."""
 
 import json
 import os
@@ -64,11 +70,11 @@ def boot_command(prefix, system):
 def describe(bundle, prefix, command, *args):
     """Installs `bundle` under `prefix` with deploy.sh and runs `command`
     (an argv starting with the installed run.sh) with --describe-only and
-    `args`. Returns the process, the session's graph and the installed
-    bundle's directory."""
-    subprocess.run(["bash", deploy_script(), "install", bundle,
-                    "--prefix", prefix],
-                   check=True, capture_output=True, text=True, timeout=120)
+    `args`. Returns the process, the session's graph, the installed
+    bundle's directory and the install's stderr."""
+    install = subprocess.run(["bash", deploy_script(), "install", bundle,
+                              "--prefix", prefix], check=True,
+                             capture_output=True, text=True, timeout=120)
     where = os.path.join(prefix, "current")
     log_dir = os.path.join(prefix, "logs")
     env = dict(os.environ, TALOS_LOG_DIR=log_dir)
@@ -80,9 +86,9 @@ def describe(bundle, prefix, command, *args):
         key=os.path.getmtime, reverse=True)
     graph = os.path.join(sessions[0], "graph.json") if sessions else ""
     if not os.path.isfile(graph):
-        return proc, None, where
+        return proc, None, where, install.stderr
     with open(graph, encoding="utf-8") as f:
-        return proc, json.load(f), where
+        return proc, json.load(f), where, install.stderr
 
 
 class BundleTest(unittest.TestCase):
@@ -110,8 +116,12 @@ class BundleTest(unittest.TestCase):
                     # Asked for Studio, a bundle without it still describes.
                     command = [os.path.join(prefix, "current", "run.sh")]
                     args = ("--start-studio-bridge",)
-                proc, graph, where = describe(src, prefix, command, *args)
+                proc, graph, where, installed = describe(
+                    src, prefix, command, *args)
                 out = proc.stdout + "\n" + proc.stderr
+                # Install ran every member the way the probe will, so each
+                # one's first exec is paid before the first launch.
+                self.assertNotIn("warning: warm-up", installed)
                 self.assertEqual(proc.returncode, 0, out)
                 self.assertIsNotNone(graph, out)
                 # The bundle holds exactly the nodes its config launches, so
@@ -131,6 +141,140 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],
                                  manifest["config_sha256"])
+
+
+# Each stub records, under its installed path, "start" with its pid, what
+# $STUB_PREFIX/current selected then ("-" for nothing) and its argv before
+# acting, and "end" after, so the log orders every warm-up run.
+STUB = """#!/usr/bin/env bash
+me="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+current="$(readlink "$STUB_PREFIX/current" || echo -)"
+printf 'start %s %s %s %s\\n' "$me" "$$" "$current" "$*" >> "$STUB_LOG"
+case "$(basename "$0")" in
+  fails) printf 'end %s\\n' "$me" >> "$STUB_LOG"; exit 3 ;;
+  hangs) exec tail -f /dev/null ;;
+esac
+printf 'end %s\\n' "$me" >> "$STUB_LOG"
+"""
+
+def stub_bundle(root, nodes):
+    """A bundle laid out as talos_bundle writes one, every executable a
+    stub: `nodes` (`fails` exits 3, `hangs` never exits, any other exits
+    0), a Studio bridge, the launcher and run.sh."""
+    for sub in ("bin", "config", "studio"):
+        os.makedirs(os.path.join(root, sub))
+    with open(os.path.join(root, "config", "robot.toml"), "w",
+              encoding="utf-8") as f:
+        f.write("[robot]\n")
+    for rel in [f"bin/{n}" for n in nodes] + [
+            "studio/studio_bridge", "launcher", "run.sh"]:
+        with open(os.path.join(root, rel), "w", encoding="utf-8") as f:
+            f.write(STUB)
+        os.chmod(os.path.join(root, rel), 0o755)
+    lines = ['bundle_version = 1', 'config_path = "config/robot.toml"',
+             'config_sha256 = "0"', '', '[studio]',
+             'bridge = "studio/studio_bridge"', 'bridge_sha256 = "0"',
+             'targets = ["//studio/bridge:studio_bridge"]',
+             'webroot = "studio/webroot"']
+    for n in nodes:
+        lines += ['', '[[nodes]]', f'name = "{n}"',
+                  f'targets = ["//x:{n}"]', f'binary = "bin/{n}"',
+                  'binary_sha256 = "0"', 'language = "cpp"']
+    with open(os.path.join(root, "bundle_manifest.toml"), "w",
+              encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# Untagged: no requirement row yet states that an installed bundle's first
+# launch must describe within the launcher's probe deadline (macOS charges
+# each newly written executable's first exec, serialized host-wide).
+class WarmUpTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.prefix = os.path.join(self.tmp, "prefix")
+        self.log = os.path.join(self.tmp, "stub.log")
+        # Bounds only the member that never exits: on macOS each stub's
+        # first exec costs about 100 ms (TODO.md MAC-2).
+        self.env = dict(os.environ, STUB_LOG=self.log, STUB_PREFIX=self.prefix,
+                        TALOS_DEPLOY_WARM_UP_TIMEOUT_S="3")
+
+    def deploy(self, *args):
+        proc = subprocess.run(
+            ["bash", deploy_script(), *args, "--prefix", self.prefix],
+            capture_output=True, text=True, env=self.env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc
+
+    def install(self, name, nodes, *args):
+        src = os.path.join(self.tmp, name)
+        stub_bundle(src, nodes)
+        return self.deploy("install", src, *args)
+
+    def records(self):
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding="utf-8") as f:
+            return [line.split(" ", 4) for line in f.read().splitlines()]
+
+    def assert_warmed_in_turn(self, bundle, nodes, selected, proc):
+        """Every member of the installed `bundle` ran exactly once, one at a
+        time, while `current` still selected `selected`, and nothing else
+        ran; a member that failed or hung is named in a warning."""
+        records = self.records()
+        out = proc.stdout + proc.stderr
+        describe = "--describe --config config/robot.toml"
+        # The installed files (the macOS charge is per file), never run.sh.
+        started = sorted((r[1], r[4] if len(r) > 4 else "")
+                         for r in records if r[0] == "start")
+        want = sorted(
+            [(os.path.join(bundle, "bin", n), describe) for n in nodes]
+            + [(os.path.join(bundle, "studio", "studio_bridge"), describe),
+               (os.path.join(bundle, "launcher"), "--help")])
+        self.assertEqual(started, want, out)
+        hung_pids = []
+        for i, r in enumerate(records):
+            if r[0] != "start":
+                continue
+            self.assertEqual(r[3], selected, records)
+            if os.path.basename(r[1]) == "hangs":
+                # Killed before the next starts, its pid gone by the return.
+                hung_pids.append(int(r[2]))
+                self.assertNotEqual(records[i + 1:i + 2], [["end", r[1]]])
+                continue
+            self.assertEqual(records[i + 1][:2], ["end", r[1]], records)
+        self.assertEqual(len(hung_pids), "hangs" in nodes, records)
+        for pid in hung_pids:
+            with self.assertRaises(ProcessLookupError, msg="hung member alive"):
+                os.kill(pid, 0)
+        for name in ("fails", "hangs"):
+            self.assertEqual(name in proc.stderr, name in nodes, out)
+
+    # REQ-OPS-47
+    def test_install_runs_each_member_once_in_turn_before_selecting(self):
+        nodes = ("alpha", "fails", "hangs", "omega")
+        proc = self.install("bundle", nodes)
+        bundle = os.path.realpath(os.path.join(self.prefix, "current"))
+        self.assert_warmed_in_turn(bundle, nodes, "-", proc)
+
+    # REQ-OPS-47
+    def test_no_warm_up_runs_nothing(self):
+        self.install("bundle", ("alpha",), "--no-warm-up")
+        self.assertEqual(self.records(), [])
+
+    # REQ-OPS-47
+    def test_rollback_warms_the_previous_bundle_before_selecting_it(self):
+        # `previous` as a deploy.sh that predates the warm-up leaves it.
+        nodes = ("alpha", "fails")
+        self.install("old", nodes, "--no-warm-up")
+        old = os.readlink(os.path.join(self.prefix, "current"))
+        self.install("new", nodes, "--no-warm-up")
+        new = os.readlink(os.path.join(self.prefix, "current"))
+        proc = self.deploy("rollback")
+        self.assertEqual(os.readlink(os.path.join(self.prefix, "current")),
+                         old)
+        self.assert_warmed_in_turn(os.path.realpath(old), nodes, new, proc)
 
 
 if __name__ == "__main__":

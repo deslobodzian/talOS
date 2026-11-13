@@ -84,12 +84,12 @@ launch; use `--remote-port` and `--local-port` if the ports also differ.
 ## On the main processor
 
 ```sh
-./tools/deploy.sh install <bundle> [--prefix /opt/talos]
+./tools/deploy.sh install <bundle> [--prefix /opt/talos] [--no-warm-up]
 ./tools/deploy.sh enable-boot [--prefix /opt/talos] [--user talos] [--dry-run]
 ./tools/deploy.sh boot-check
 ./tools/deploy.sh logs [--prefix /opt/talos] [LOG_ROOT]
 ./tools/deploy.sh fetch [--prefix /opt/talos] DEST
-./tools/deploy.sh rollback [--prefix /opt/talos]
+./tools/deploy.sh rollback [--prefix /opt/talos] [--no-warm-up]
 ./tools/deploy.sh prune [--prefix /opt/talos] [--keep 3]
 ```
 
@@ -97,9 +97,9 @@ A relative `--prefix` is resolved against the working directory.
 
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
   symlinks kept), checks that the copy has an executable `run.sh`, runs
-  `sync`, retains `previous`, and atomically replaces `current` using
-  a temporary sibling symlink and rename (Linux and macOS). This selects the
-  next bundle; restart the service to activate it.
+  `sync`, [warms the copy](#warm-up), retains `previous`, and atomically
+  replaces `current` using a temporary sibling symlink and rename (Linux and
+  macOS). This selects the next bundle; restart the service to activate it.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
@@ -161,7 +161,10 @@ A relative `--prefix` is resolved against the working directory.
   rejected rather than merged; choose a fresh destination for each collection.
 - **rollback** swaps `current` and `previous`: the whole previous bundle, with
   its own config. It refuses when `current` is missing or `previous` no longer
-  holds a bundle. Selection does not change already-running processes: a
+  holds a bundle. It [warms](#warm-up) `previous` before selecting it: one
+  installed by a `deploy.sh` without the warm-up and never launched has never
+  run. A bundle that has already run needs none, and its warm-up costs about
+  10 ms a member. Selection does not change already-running processes: a
   running launcher restarts nodes from the bundle it started in.
   With the robot disabled, activate install/rollback with
   `sudo systemctl restart talos` on Linux, or
@@ -191,6 +194,35 @@ Each node's stdout and stderr, every run of it, land in
 
 For event-log byte budgets, retention, capped recordings, manifest-write
 recovery and what is synced to disk when, see [session segments and logs](../talOS/launcher/README.md#session-segments-and-logs).
+
+### Warm-up
+
+macOS charges the first exec, and first load, of every newly written
+executable file about 100 ms, one file at a time host-wide; the charge is per
+file and paid only by running or loading it, not by reading it. A fresh
+install of the 2026 bundle is about 7,800 new files, and its first launch
+would pay that inside the launcher's per-probe `--describe` deadline
+([below](#supervision-and-service-recovery)), every probe at once: with
+other new executables being written on the Mac mini, `pose_estimator` (the
+bundle's Python interpreter and about 54 native libraries) took over 15 s
+alone, and the launch was refused.
+
+So `install` and `rollback` run every member of the bundle they are about to
+select once, one at a time, from its final path: each `[[nodes]]` binary of
+`bundle_manifest.toml` and the `[studio]` bridge with
+`--describe --config <config_path>`, as the launcher's probe runs them, and
+the launcher with `--help`. They run from the bundle directory with `bin/`
+first on `PATH`, Bazel's and Python's environment variables unset (as
+`run.sh` does), and `PYTHONDONTWRITEBYTECODE=1`, so the read-only bundle
+stays as installed even under sudo. A `--describe` run opens no topic,
+socket or registry row, so the warm-up touches no hardware and no network
+and can run beside a running robot. On the Mac mini it takes about 4.5 s,
+and the first launch then describes in under a second. A member that exits
+nonzero, or is still running after 60 s (then its process group is killed),
+is a `deploy: warning: warm-up: <name>: ...` line and the command still
+succeeds: the launch judges its members. Linux has no such charge; the
+warm-up runs there too and costs well under a second. `--no-warm-up` skips
+it, leaving the charge to the first launch.
 
 ### Boot service output
 
