@@ -252,6 +252,9 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
       return false;
     }
     fs::remove_all(removing, removal);
+    // Once its session.lock is gone, another launch's sweep of leftovers
+    // (below) may be removing the same tree: what vanished under it is gone.
+    if (removal == std::errc::no_such_file_or_directory) removal.clear();
     if (removal) report("cannot remove", removing, removal);
     return !removal;
   };
@@ -323,13 +326,16 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     report("removes nothing; cannot list", current.parent_path(), error);
     return session_budget;
   }
-  // Held only by a retention removing it now.
+  // Held only by a retention removing it now. Once that retention, or a
+  // second sweep, has removed the session.lock inside, both may remove the
+  // rest at once: an entry gone meanwhile is not a failure.
   for (const auto& leftover : leftovers) {
     if (SessionDirectoryLock::Held(leftover, options_.lock_session_directory))
       continue;
     std::error_code removal;
     fs::remove_all(leftover, removal);
-    if (removal) report("cannot remove", leftover, removal);
+    if (removal && removal != std::errc::no_such_file_or_directory)
+      report("cannot remove", leftover, removal);
   }
   for (const auto& launch : abandoned) {
     if (launch.time >= newest) continue;
