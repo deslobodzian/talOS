@@ -315,7 +315,10 @@ session or its `--duration-s` deadline. While it is still starting it does not
 hold the session open. Once it has survived a second it is supervised like any
 node, except that it is never restarted under the policy below. If it never
 comes up it is marked failed in the manifest and the session runs on without
-Studio.
+Studio. A bridge still starting when the session stops is SIGKILLed once the
+other members have ended. How the bridge ended (that kill, a crash, its exit
+code) is in its manifest entry and never in the launcher's exit status: an
+operator's stop of a session whose bridge died still exits 0.
 
 ## Node output
 
@@ -462,7 +465,8 @@ shows it in the exit column and marks the node *killed by signal*.
 
 When the session ends, the launcher exits with 0, or with the last nonzero
 `exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
-refused [live endpoints](#live-endpoints). A member whose last run ended by
+refused [live endpoints](#live-endpoints). The [Studio bridge](#studio-bridge)
+never counts, however it ended. A member whose last run ended by
 the stop's own signal does not count: one that was not yet handling a stop
 (between its exec and `process::InstallStopHandlers()`, a C++ node's first
 lines or a Python node's whole interpreter start) when the stop's SIGINT
