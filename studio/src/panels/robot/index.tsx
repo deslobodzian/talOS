@@ -1,14 +1,13 @@
 // The robot panel: the at-a-glance answer to "what is the robot doing right
-// now". A dense grid of cards over Driver Station, routine phase, power, link,
-// pose, alerts, the discovered subsystems and cameras, and the recent event
-// feed. It
-// reads only through the data hooks and discovers owners/channels by shape, so
-// it stays robot-agnostic: no 2026 node names are hard-coded here.
+// now". A dense grid of cards over Driver Station, routine and phase, power,
+// link, pose, alerts, the discovered subsystems and cameras, and the recent
+// event feed. It reads only through the data hooks and discovers
+// owners/channels by shape, so it stays robot-agnostic: no 2026 node names are hard-coded here.
 
 import {useMemo} from 'react';
 import type {ReactNode} from 'react';
 
-import {poseError, simTruthPose} from '../../core';
+import {channelDisplay, poseError, simTruthPose} from '../../core';
 import {activeAlerts} from '../../data/alerts';
 import {
   useActions,
@@ -252,6 +251,17 @@ function RobotPanel() {
   const phaseChannel = useMemo(() => dictionary.find(
       c => /^[^/]+\/state\/phase$/.test(c.name) && c.labels.length > 0) ?? null,
       [dictionary]);
+  // The selected routine: <owner>/state/routine_index, the phase owner's when
+  // it has one. Its labels are the routine names telemetry attaches
+  // ([[subsystem.labels]]); without them, or out of their range, the index.
+  const routineChannel = useMemo(() => {
+    const routines = dictionary.filter(c => /^[^/]+\/state\/routine_index$/.test(c.name));
+    const owner = phaseChannel?.name.slice(0, phaseChannel.name.indexOf('/'));
+    return routines.find(c => c.name === `${owner}/state/routine_index`) ??
+        routines[0] ?? null;
+  }, [dictionary, phaseChannel]);
+  const routine = routineChannel && snapshot ?
+      channelDisplay(snapshot, routineChannel.name) : '';
 
   // Gateway counters (any hw/status/gateway_*_count), discovered rather than
   // hard-coded so every counter the hardware reports is shown.
@@ -330,17 +340,23 @@ function RobotPanel() {
       </Card>
 
       <Card title="Routine" eyebrow="PHASE">
-        {!phaseChannel ?
-             <EmptyState>no phase channel discovered</EmptyState> :
+        {!phaseChannel && !routineChannel ?
+             <EmptyState>no routine or phase channel discovered</EmptyState> :
              <div className="routine-card">
-               <div className="phase-current"><ChannelReading channel={phaseChannel.name}>{phase.current ?? '—'}</ChannelReading></div>
-               <StatList>
-                 <Stat label="In phase" channel={phaseChannel.name}>{phase.seconds == null || !Number.isFinite(phase.seconds) ? '—' :
-                     phase.seconds < 60 ? `${phase.seconds.toFixed(1)} s` :
-                     phase.seconds < 3600 ? `${(phase.seconds / 60).toFixed(1)} min` :
-                     `${(phase.seconds / 3600).toFixed(1)} h`}</Stat>
-                 <Stat label="Previous">{phase.previous ?? '—'}</Stat>
-               </StatList>
+               {routineChannel && <div className="routine-name">
+                 <ChannelReading channel={routineChannel.name}>{routine || '—'}</ChannelReading>
+                 <span className="routine-hint">selected while disabled, latched at autonomous start</span>
+               </div>}
+               {phaseChannel && <>
+                 <div className="phase-current"><ChannelReading channel={phaseChannel.name}>{phase.current ?? '—'}</ChannelReading></div>
+                 <StatList>
+                   <Stat label="In phase" channel={phaseChannel.name}>{phase.seconds == null || !Number.isFinite(phase.seconds) ? '—' :
+                       phase.seconds < 60 ? `${phase.seconds.toFixed(1)} s` :
+                       phase.seconds < 3600 ? `${(phase.seconds / 60).toFixed(1)} min` :
+                       `${(phase.seconds / 3600).toFixed(1)} h`}</Stat>
+                   <Stat label="Previous">{phase.previous ?? '—'}</Stat>
+                 </StatList>
+               </>}
              </div>}
       </Card>
 
