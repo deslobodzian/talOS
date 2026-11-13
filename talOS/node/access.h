@@ -255,6 +255,11 @@ struct NodeAccess {
   static std::uint64_t byte_topic_published(const Node& node,
                                             std::size_t index);
   static std::uint64_t byte_topic_dropped(const Node& node, std::size_t index);
+  // Wake notifications byte topic `index`'s writer could not send for a
+  // reason other than a gone receiver (ByteTopic::wake_failures). Safe to
+  // call from any thread.
+  static std::uint64_t byte_topic_wake_failures(const Node& node,
+                                                std::size_t index);
 
   // Who drives this node's subsystem, for the registry: one entry per
   // talos::Target (talOS/devices/target.h), in the order they were opened.

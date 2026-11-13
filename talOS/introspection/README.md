@@ -160,13 +160,15 @@ process to show it but one stderr line. The row counts it, in three
 `uint64` fields at the end of `NodeRecord`, cumulative since the claim and
 each normally 0: `wake_failures`, the notifications this node's writers
 could not send for a reason other than a gone receiver
-(`RTMSQueue::wake_failures()` summed over the loop's senders: no descriptor
-left, say); `stalled_arms`, prompt watchers whose failed arms stopped
-holding its loop awake; and `wake_fallbacks`, runs that could not build
-their wake receiver and drain on a poll tick instead. The `Reporter` copies
-`RealtimeEventLoop::wake_loss()` in each full sample
-(`NodeRegistration::set_wake_loss`); the hardware bridge, whose loop is its
-own, stores its publishers' failures and its `OpenWaits()` fallbacks, and
+(`RTMSQueue::wake_failures()` summed over the loop's senders and the node's
+byte topics, `Node::publish_bytes`, which its loop does not write, such as
+`/talos/telemetry`: no descriptor left, say); `stalled_arms`, prompt
+watchers whose failed arms stopped holding its loop awake; and
+`wake_fallbacks`, runs that could not build their wake receiver and drain
+on a poll tick instead. The `Reporter` copies
+`RealtimeEventLoop::wake_loss()` in each full sample, adding each
+`ExtraSource::wake_failures` (`NodeRegistration::set_wake_loss`); the
+hardware bridge, whose loop is its own, stores its publishers' failures and its `OpenWaits()` fallbacks, and
 no stalled arms. A wake to the bridge that is lost shows as the requests its
 latest-value read of `/hw/request/<node>` then passes over: each counts in
 `dropped` of that subsystem's request source in the bridge's row, which is
