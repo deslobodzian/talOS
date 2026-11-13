@@ -521,6 +521,21 @@ talos_cc_node(
     deps = [":continuity_message"],
 )
 
+# Run as `alpha`: loses one wake notification on its byte topic
+# (supervision_test's strict report check).
+talos_cc_node(
+    name = "byte_wake_loss",
+    srcs = ["testdata/byte_wake_loss_node.cc"],
+    node_name = "alpha",
+    node_target = "//example/alpha:node",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//talOS/rtms",
+        "//talOS/rtms:wake",
+        "//talOS/schema:identity",
+    ],
+)
+
 # A member that only keeps a registry row with the delivery-loss counts its
 # command line gives (supervision_test's manifest check).
 cc_binary(
@@ -539,13 +554,17 @@ cc_test(
     srcs = ["supervision_test.cc"],
     data = [
         ":alpha",
+        ":byte_wake_loss",
         ":delivery_loss_node",
         ":endpoint_drift",
+        ":session_report",
     ],
     env = {
+        "TALOS_BYTE_WAKE_LOSS_NODE": "$(rlocationpath :byte_wake_loss)",
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
         "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
         "TALOS_ENDPOINT_DRIFT_NODE": "$(rlocationpath :endpoint_drift)",
+        "TALOS_SESSION_REPORT": "$(rlocationpath :session_report)",
     },
     # Independent cases; HeartbeatingConstructorStillHasAFiniteDeadline alone
     # waits out a real 3 s construction deadline (its 2 s grace covers a

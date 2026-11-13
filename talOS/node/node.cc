@@ -870,6 +870,10 @@ class SharedByteTopic final : public ByteTopic {
     return queue_.write(message) == WriteResult::SUCCESS;
   }
 
+  std::uint64_t wake_failures() const override {
+    return queue_.wake_failures();
+  }
+
  private:
   RTMSQueue queue_;
 };
@@ -936,6 +940,11 @@ std::uint64_t NodeAccess::byte_topic_published(const Node& node,
 std::uint64_t NodeAccess::byte_topic_dropped(const Node& node,
                                              std::size_t index) {
   return node.impl_->ByteAt(index).dropped.load(std::memory_order_relaxed);
+}
+
+std::uint64_t NodeAccess::byte_topic_wake_failures(const Node& node,
+                                                   std::size_t index) {
+  return node.impl_->ByteAt(index).sink->wake_failures();
 }
 
 std::size_t NodeAccess::add_selection(Node& node,
@@ -1227,7 +1236,8 @@ std::uint32_t ByteTopicFlags(const NodeAccess::ByteTopicShape& topic) {
 }
 
 // Byte topics bypass the loop, so its manifest misses them; they are
-// declared to the registry here, with their own counters.
+// declared to the registry here, with their own counters, wake failures
+// included (the loop's wake_loss() sums only its own senders).
 std::vector<introspect::Reporter::ExtraSource> ByteTopicSources(
     const Node& node) {
   std::vector<introspect::Reporter::ExtraSource> sources;
@@ -1244,6 +1254,10 @@ std::vector<introspect::Reporter::ExtraSource> ByteTopicSources(
                    i] { return NodeAccess::byte_topic_published(node, i); },
         .dropped = [&node,
                     i] { return NodeAccess::byte_topic_dropped(node, i); },
+        .wake_failures =
+            [&node, i] {
+              return NodeAccess::byte_topic_wake_failures(node, i);
+            },
     });
   }
   return sources;

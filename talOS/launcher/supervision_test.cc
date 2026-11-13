@@ -592,6 +592,83 @@ TEST(Supervision, DeliveryLossOfEachRunReachesTheManifest) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// session_report --strict on a finished session directory: its exit status
+// and its stderr, where it names each reason it rejects the session.
+struct StrictReport {
+  int status{-1};
+  std::string stderr_text;
+};
+
+StrictReport RunStrictReport(const rules_cc::cc::runfiles::Runfiles& runfiles,
+                             const std::string& session_dir) {
+  // The report finds log_dump through these, in this test's runfiles.
+  for (const auto& [key, value] : runfiles.EnvVars())
+    ::setenv(key.c_str(), value.c_str(), 1);
+  const char* report = std::getenv("TALOS_SESSION_REPORT");
+  if (report == nullptr) return {};
+  const std::string errors = TempPath("strict_report.stderr");
+  const std::string command = "'" + runfiles.Rlocation(report) +
+                              "' --strict '" + session_dir +
+                              "' >/dev/null 2>'" + errors + "'";
+  const int status = std::system(command.c_str());
+  return {.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+          .stderr_text = ReadFile(errors)};
+}
+
+// A wake notification lost on a topic its node's loop does not write -- a
+// byte topic (Node::publish_bytes), as /talos/telemetry is -- fails the
+// session end to end: the fixture node (testdata/byte_wake_loss_node.cc)
+// cannot send one notification on /alpha/telemetry for want of a
+// descriptor, its registry row counts it, the launcher records it in the
+// session manifest, and session_report --strict rejects the session naming
+// alpha (TODO.md RT-7). The bridge and beta are stubs that lose nothing.
+// REQ-OPS-43, REQ-RT-19
+TEST(Supervision, AWakeLostOnAByteTopicFailsTheStrictReport) {
+  auto options = BaseOptions("byte_wake_loss");
+  options.max_restarts = 0;
+  options.duration_s = kHangSeconds;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* node = std::getenv("TALOS_BYTE_WAKE_LOSS_NODE");
+  const char* stub = std::getenv("TALOS_DELIVERY_LOSS_NODE");
+  ASSERT_NE(node, nullptr);
+  ASSERT_NE(stub, nullptr);
+  const auto lossless = [&](std::string_view name, std::string_view target) {
+    return WriteStub("byte_wake_loss_" + std::string{name},
+                     "exec " + runfiles->Rlocation(stub) + " " +
+                         std::string{name} + " " + std::string{target} +
+                         " 0,0,0,0,run \"$@\"\n",
+                     name);
+  };
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      lossless("hardware_node", "//talOS/bridge:hardware_node");
+  options.binary_overrides["//example/beta:node"] =
+      lossless("beta", "//example/beta:node");
+  options.binary_overrides["//example/alpha:node"] = runfiles->Rlocation(node);
+  std::string seen;
+  EXPECT_EQ(RunSessionUntil(
+                options,
+                [](const std::string& live) {
+                  return ManifestEntry(live, "alpha")
+                             .find("\"wake_failures\": 1,\n") !=
+                         std::string::npos;
+                },
+                seen),
+            0);
+  ASSERT_FALSE(seen.empty()) << "no live manifest carried alpha's lost wake";
+
+  const StrictReport report = RunStrictReport(*runfiles, options.output_dir);
+  EXPECT_EQ(report.status, 2) << report.stderr_text;
+  EXPECT_NE(report.stderr_text.find(
+                "session_report: strict: alpha: wake_failures=1\n"),
+            std::string::npos)
+      << report.stderr_text;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 TEST(Supervision,
      NonCriticalDescribeFailureWarnsAndRestartsWithoutBlockingPeers) {
   auto options = BaseOptions("optional_probe");

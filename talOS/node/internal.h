@@ -34,6 +34,10 @@ class ByteTopic {
   // False when the message was not published (a drop_newest queue was full).
   // The caller has checked the length against max_bytes.
   virtual bool write(std::span<const std::byte> message) = 0;
+  // Wake notifications this writer could not send for a reason other than a
+  // gone receiver (RTMSQueue::wake_failures()); 0 where nothing is notified.
+  // Safe to call from any thread: the registry's thread reads it.
+  virtual std::uint64_t wake_failures() const { return 0; }
 };
 
 // The loop a Node is registered on, with the loop type erased. The three loop

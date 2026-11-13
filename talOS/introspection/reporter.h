@@ -96,6 +96,11 @@ class Reporter {
     // that takes a lock the loop might hold.
     std::function<std::uint64_t()> events;
     std::function<std::uint64_t()> dropped;
+    // Wake notifications this topic's writer could not send for a reason
+    // other than a gone receiver (RTMSQueue::wake_failures()), added to the
+    // loop's in the row's wake_failures: the loop counts only its own
+    // senders. Same threading rule; empty for none.
+    std::function<std::uint64_t()> wake_failures;
   };
 
   // One of the node's Targets (talOS/devices/target.h): who drives the
@@ -342,11 +347,16 @@ class Reporter {
                               /*max_latency_ns=*/0);
     }
 
-    // What the loop's wake channel lost (RealtimeEventLoop::wake_loss); a
+    // What the loop's wake channel lost (RealtimeEventLoop::wake_loss), and
+    // the notifications the node's own topics' writers failed to send; a
     // simulated or replayed loop has no wake channel to lose.
     if constexpr (requires { loop.wake_loss(); }) {
       const auto loss = loop.wake_loss();
-      registration.set_wake_loss(loss.wake_failures, loss.stalled_arms,
+      std::uint64_t wake_failures = loss.wake_failures;
+      for (const ExtraSource& extra : options_.extra) {
+        if (extra.wake_failures) wake_failures += extra.wake_failures();
+      }
+      registration.set_wake_loss(wake_failures, loss.stalled_arms,
                                  loss.wake_fallbacks);
     }
 
