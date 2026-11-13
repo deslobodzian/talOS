@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "talOS/introspection/registry.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "talOS/telemetry/frames.h"
 #include "talOS/telemetry/wire.h"
 
@@ -145,7 +146,7 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
     SCOPED_TRACE(c.alerts ? "with an alerts widget" : "without");
     TelemetryState state = WithDictionary();
     Tick(state, 1, 0.5);
-    DriveMask mask({"not/in/dictionary", "drive/velocity"}, c.alerts);
+    DriveMask mask({{"drive/velocity", "not/in/dictionary"}, c.alerts});
     DriveFeed feed;
     feed.Configure(20);
     Received received;
@@ -173,6 +174,33 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
   }
 }
 
+// REQ-OPS-36
+// The RoboRIO link's alert channel reaches a drive client whatever the
+// layout's widgets, so the page can name a lost link: a layout with no
+// `alerts` widget gets it beside its own channel, and one with an `alerts`
+// widget gets the same channels.
+TEST(DriveFeed, CarriesTheRoboRioLinkChannelWithoutAnAlertsWidget) {
+  const std::string number =
+      "[[widgets]]\nkind = \"number\"\nat = [0, 0, 1, 1]\n"
+      "channel = \"drive/velocity\"\n";
+  for (const bool alerts_widget : {false, true}) {
+    SCOPED_TRACE(alerts_widget ? "with an alerts widget" : "without");
+    const auto layout = talos::telemetry::ParseDashboardLayoutString(
+        number + (alerts_widget
+                      ? "[[widgets]]\nkind = \"alerts\"\nat = [1, 0, 1, 1]\n"
+                      : ""),
+        "dashboard.toml");
+    TelemetryState state = WithDictionary();
+    DriveMask mask(talos::telemetry::DriveFeedChannels(layout));
+    DriveFeed feed;
+    feed.Configure(layout.update_hz);
+    Received received;
+    Tick(state, 1, 0.5);
+    Pump(feed, state, mask.For(state), 0, received);
+    EXPECT_EQ(received.channels(), (std::set<std::uint32_t>{0, 4}));
+  }
+}
+
 // REQ-OPS-35
 // With a change every 10 ms, a 20 Hz layout's client gets an update every
 // 50 ms and no more, and the last change still reaches it, at the instant
@@ -181,7 +209,7 @@ TEST(DriveFeed, AtMostUpdateHzUpdatesASecondAndTheLastChangeArrives) {
   constexpr std::uint32_t kUpdateHz = 20;
   constexpr std::int64_t kIntervalNs = 1'000'000'000 / kUpdateHz;
   TelemetryState state = WithDictionary();
-  DriveMask mask({"drive/velocity"}, false);
+  DriveMask mask({{"drive/velocity"}, false});
   DriveFeed feed;
   feed.Configure(kUpdateHz);
   Received received;
@@ -215,7 +243,7 @@ TEST(DriveFeed, AtMostUpdateHzUpdatesASecondAndTheLastChangeArrives) {
 // never the newer one whose values it has not been sent.
 TEST(DriveFeed, HeldChangesStillHeartbeatTheTickTheClientHolds) {
   TelemetryState state = WithDictionary();
-  DriveMask mask({"drive/velocity"}, false);
+  DriveMask mask({{"drive/velocity"}, false});
   DriveFeed feed;
   feed.Configure(2);
   Received received;
@@ -259,7 +287,7 @@ TEST(DriveFeed, HeldChangesStillHeartbeatTheTickTheClientHolds) {
 // telemetry heartbeat takes over and the text heartbeat stops.
 TEST(DriveFeed, WithoutTelemetryTheBridgeStillHeartbeats) {
   TelemetryState state;  // nothing published yet
-  DriveMask mask({"drive/velocity"}, false);
+  DriveMask mask({{"drive/velocity"}, false});
   DriveFeed feed;
   feed.Configure(20);
   Received received;
@@ -531,7 +559,7 @@ TEST(DriveSlots, ReconnectingNeverMintsBytes) {
   std::map<int, std::vector<std::string>> binaries;
   TelemetryState state = WithDictionary();
   Tick(state, 1, 0.5);
-  DriveMask mask({"drive/velocity"}, true);
+  DriveMask mask({{"drive/velocity"}, true});
   const std::string summary(4000, 's');
   double sent = 0;
   const auto pump = [&](int client, std::int64_t now) {

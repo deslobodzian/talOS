@@ -376,18 +376,16 @@ class Telemetry {
                 widget.items[j].channel, "");
       }
     }
-    // The drive feed's channel mask: what the layout names, plus every
-    // alert channel when it lists alerts.
-    const std::vector<std::string> named = RequiredChannels(layout);
-    std::set<std::string_view> feed(named.begin(), named.end());
-    if (CarriesAlertChannels(layout)) {
-      for (const ChannelDef& def : dictionary_) {
-        if (def.alert != Talos::Telemetry::AlertLevel_None) {
-          feed.insert(def.name);
-        }
-      }
-    }
-    CheckDashboardBudget(layout, feed.size());
+    // The drive feed's channels in this dictionary (DriveFeedChannels: the
+    // layout's, the RoboRIO link's alert, and every alert channel with an
+    // `alerts` widget; dictionary names are distinct).
+    const DriveChannels feed = DriveFeedChannels(layout);
+    const auto carried = static_cast<std::size_t>(
+        std::ranges::count_if(dictionary_, [&feed](const ChannelDef& def) {
+          return feed.Carries(def.name,
+                              def.alert != Talos::Telemetry::AlertLevel_None);
+        }));
+    CheckDashboardBudget(layout, carried);
   }
 
   static std::string ResolveTopic(Node& node) {

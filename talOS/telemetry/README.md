@@ -211,9 +211,10 @@ resolved path from `config::RobotConfig::studio.dashboard` (empty when unset).
 `DashboardLayoutJson(layout)` is the layout as the dashboard page reads it
 (`/drive/layout.json`), so no TOML parser is needed in TypeScript. What needs
 the telemetry dictionary takes its inputs from the layout: the names that must
-be in it (`RequiredChannels`), whether the feed also carries every alert
-channel (`CarriesAlertChannels`), and the budget for the feed's full channel
-count (`CheckDashboardBudget`).
+be in it (`RequiredChannels`), the channels the drive feed carries
+(`DriveFeedChannels`, the one rule the telemetry node's budget check, the
+Studio bridge's mask and `/drive/layout.json` share), and the budget for the
+feed's full channel count (`CheckDashboardBudget`).
 
 ```toml
 [dashboard]                 # optional; every key optional, defaults shown
@@ -278,8 +279,11 @@ topic holds it), whether the key is required or optional:
 `widgets[<i>].items[<j>].channel` for a check, `widgets[<i>].pose` for a
 field's pose fields, and `widgets[<i>].kind` for a `match` or `power`
 widget's fixed channels. It then runs `CheckDashboardBudget` for the whole
-feed: the named channels plus, with an `alerts` widget, every alert channel
-of the dictionary. The launcher's first `--describe` probe has no graph, so
+feed, every dictionary channel `DriveFeedChannels` carries: the named
+channels, the hardware bridge's `hw/status/alert_error_link_lost` (whatever
+the widgets, so the page can name a lost RoboRIO link; a graph without the
+bridge has no such channel and adds nothing) and, with an `alerts` widget,
+every alert channel of the dictionary, each counted once. The launcher's first `--describe` probe has no graph, so
 it checks only what the file alone decides.
 
 **Worst case.** One drive client can be sent, in a second,
@@ -296,13 +300,15 @@ samples a 1200 B page always holds, 4096 B the drive summary's cap at most
 every 500 ms, and an empty update goes out every 100 ms (`wire.h`).
 Parsing requires `budget_bytes_per_s` to cover the named channels;
 `CheckDashboardBudget(layout, count)` checks it for a feed of `count`
-channels, such as the named ones plus the dictionary's alert channels.
+channels, such as the dictionary's channels the feed carries.
 At 20 Hz a 24,000 B/s budget covers 39 channels.
 
 **`/drive/layout.json`.** One object; every key present, defaults filled
-in, an unset optional number `null`, `"channels"` the sorted distinct named
-channels (the named part of the drive feed's channel mask), `"alerts"`
-whether the feed also carries every alert channel, `"file"` the layout's file
+in, an unset optional number `null`, `"channels"` the sorted distinct
+channels the layout names plus `hw/status/alert_error_link_lost` (the named
+part of the drive feed's channel mask; a name the dictionary lacks is never
+sent), `"alerts"` whether the feed also carries every alert channel, `"file"`
+the layout's file
 name. Each widget has `kind`, `at`, `title` and a `channels` object from role
 to channel name (a widget's single channels; for `match` and `power` the
 roles are the field names above, for `field` `x`, `y`, `yaw`, `valid`,
@@ -315,7 +321,8 @@ roles are the field names above, for `field` `x`, `y`, `yaw`, `valid`,
 ```json
 {"version":1,"file":"dashboard.toml","title":"Drive","columns":12,"rows":8,
  "update_hz":20,"budget_bytes_per_s":24000,"drive_clients":2,"alerts":false,
- "channels":["autonomous/state/phase","autonomous/state/routine_index"],
+ "channels":["autonomous/state/phase","autonomous/state/routine_index",
+             "hw/status/alert_error_link_lost"],
  "widgets":[{"kind":"routine","at":[0,0,4,2],"title":"",
    "channels":{"channel":"autonomous/state/routine_index",
                "phase":"autonomous/state/phase"}}]}

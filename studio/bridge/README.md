@@ -302,7 +302,9 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
    tick's chassis pose. An update leaves the client holding the masked
    values of the tick it is stamped with.
 3. **The mask.** Channel `i` of the dictionary is in the client's mask when
-   its name is in `/drive/layout.json` `"channels"`, or when that document's
+   its name is in `/drive/layout.json` `"channels"` (which always lists
+   `hw/status/alert_error_link_lost`, the RoboRIO link, whatever the
+   widgets), or when that document's
    `"alerts"` is true and the channel's `alert` is not `None`
    (`/channels.json` `"alert"` other than `"none"`). Only masked channels are
    ever carried or named absent. Every other channel, and a layout channel

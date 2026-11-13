@@ -823,9 +823,8 @@ int main(int argc, char** argv) try {
       bridge.layout ? bridge.layout->budget_bytes_per_s : 0));
   if (bridge.layout) {
     bridge.layout_json = talos::telemetry::DashboardLayoutJson(*bridge.layout);
-    bridge.drive_mask = studio::DriveMask(
-        talos::telemetry::RequiredChannels(*bridge.layout),
-        talos::telemetry::CarriesAlertChannels(*bridge.layout));
+    bridge.drive_mask =
+        studio::DriveMask(talos::telemetry::DriveFeedChannels(*bridge.layout));
     bridge.drive_clients =
         studio::DriveSlots<Socket*>(bridge.layout->drive_clients);
   }
