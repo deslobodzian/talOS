@@ -1121,6 +1121,55 @@ TEST(Devices, DisconnectedDevicesReadInvalidAndZero) {
   EXPECT_DOUBLE_EQ(mech.a.position(), 1.5);
 }
 
+// An invalid sample carries zero (hardware::MarkInvalid), which is no
+// position: read through a rezero it would be a jump to -offset, and on any
+// position a jump to 0, that a display, a log or an odometry delta takes for
+// motion. Scenario: a rezeroed motor at 1 (raw 3), a rezeroed gyro at 0 (raw
+// 0.25), a CANcoder at 0.2 and an encoder at 0.4 all stop answering. Each
+// position reads the last valid value it had, connected() reads false, and
+// the rates read the State's zero; the next valid sample is read as it is.
+// REQ-CONTRACT-34
+TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.set_motor("mech", "b", 3, 2);
+  hw.set_gyro("mech", "gyro", 0.25, 0.5);
+  hw.set_cancoder("mech", "cc", 0.2, 0.3);
+  hw.set_encoder("mech", "enc", 0.4, 0.6);
+  sim.step(10ms);
+  mech.b.rezero(1);
+  mech.gyro.rezero();
+  ASSERT_TRUE(mech.b.zeroed());
+  ASSERT_TRUE(mech.gyro.zeroed());
+
+  for (const char* device : {"b", "gyro", "cc", "enc"}) {
+    hw.set_connected("mech", device, false);
+  }
+  sim.step(10ms);
+  ASSERT_FALSE(mech.b.connected());
+  ASSERT_FALSE(mech.gyro.connected());
+  ASSERT_FALSE(mech.cc.connected());
+  ASSERT_FALSE(mech.enc.connected());
+  EXPECT_DOUBLE_EQ(mech.b.position(), 1);
+  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
+  EXPECT_DOUBLE_EQ(mech.cc.position(), 0.2);
+  EXPECT_DOUBLE_EQ(mech.enc.position(), 0.4);
+  EXPECT_EQ(mech.b.velocity(), 0.0);
+  EXPECT_EQ(mech.gyro.yaw_rate(), 0.0);
+  EXPECT_EQ(mech.cc.velocity(), 0.0);
+  EXPECT_EQ(mech.enc.velocity(), 0.0);
+
+  hw.set_motor("mech", "b", 5, 2);
+  hw.set_gyro("mech", "gyro", 0.5, 0.5);
+  for (const char* device : {"b", "gyro", "cc", "enc"}) {
+    hw.set_connected("mech", device, true);
+  }
+  sim.step(10ms);
+  EXPECT_DOUBLE_EQ(mech.b.position(), 3);
+  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0.25);
+}
+
 // Two handles on one node share its subscription and both hear each packet.
 struct Pilot {
   explicit Pilot(Node& n)
