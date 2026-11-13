@@ -1,5 +1,5 @@
 # Node test matrix cases (docs/TESTING.md §7) missing today, by test file:
-# `<path> <case> [<case>...]`. TODO.md MATRIX-1 closes them.
+# `<path> <case> [<case>...]`. None today.
 #
 # CI runs `python3 tools/check_node_matrix.py --baseline <this file>`, which
 # fails on a missing case not listed here and on a listed case that is no
