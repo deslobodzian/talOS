@@ -142,11 +142,34 @@ DashboardLayout ParseDashboardLayoutString(std::string_view toml,
                                            const std::filesystem::path& file);
 
 // The distinct channel names the layout reads, sorted: what the telemetry
-// dictionary must hold and the named part of the drive feed's channel mask.
+// dictionary must hold.
 std::vector<std::string> RequiredChannels(const DashboardLayout& layout);
 // Whether the feed also carries every alert channel of the dictionary (an
 // `alerts` widget), which the layout cannot name.
 bool CarriesAlertChannels(const DashboardLayout& layout);
+
+// The hardware bridge's RoboRIO-link alert, which every drive feed carries
+// whatever the layout's widgets, so the page can name a lost RoboRIO link
+// (REQ-OPS-36). A dictionary without it (a graph with no hardware bridge)
+// simply lacks it: nothing requires it.
+inline constexpr std::string_view kDriveLinkLostChannel =
+    "hw/status/alert_error_link_lost";
+
+// Which dictionary channels a drive client is sent: the one rule the
+// telemetry node's budget check, the Studio bridge's channel mask and
+// /drive/layout.json share.
+struct DriveChannels {
+  // Sorted, distinct: RequiredChannels plus kDriveLinkLostChannel. A name
+  // the dictionary lacks is never sent.
+  std::vector<std::string> named;
+  bool alerts{false};  // CarriesAlertChannels: every alert channel too
+  bool operator==(const DriveChannels&) const = default;
+
+  // Whether the dictionary channel `name` is sent; `alert` is whether its
+  // alert level is not None.
+  bool Carries(std::string_view name, bool alert) const;
+};
+DriveChannels DriveFeedChannels(const DashboardLayout& layout);
 
 // The bytes one drive client can be sent in a second (README "Dashboard
 // layout", worst case): `update_hz` keyframes of `channel_count` channels,
@@ -157,7 +180,7 @@ std::uint64_t DashboardWorstCaseBytesPerSecond(std::uint32_t update_hz,
 // `[dashboard].budget_bytes_per_s` when the worst case of a feed carrying
 // `channel_count` channels exceeds the layout's budget. Parsing runs it
 // with the named channels; a holder of the dictionary runs it again with
-// the dictionary's alert channels added.
+// the count of its channels DriveFeedChannels carries.
 void CheckDashboardBudget(const DashboardLayout& layout,
                           std::size_t channel_count);
 

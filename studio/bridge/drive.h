@@ -36,6 +36,7 @@
 #include "studio/bridge/system.h"
 #include "studio/bridge/telemetry.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/telemetry/dashboard_layout.h"
 #include "talOS/telemetry/wire.h"
 
 namespace studio {
@@ -197,18 +198,16 @@ class DriveSlots {
   std::vector<Client> order_;          // held, oldest first
 };
 
-// Which dictionary channels a drive client is sent: the layout's channels
-// (telemetry::RequiredChannels) and, with an `alerts` widget
-// (telemetry::CarriesAlertChannels), every alert channel of the dictionary.
-// A named channel the dictionary lacks is simply never sent; the page shows
-// it as absent.
+// Which dictionary channels a drive client is sent, by the layout's
+// telemetry::DriveFeedChannels: its named channels (the layout's own and the
+// RoboRIO link's alert) and, with an `alerts` widget, every alert channel of
+// the dictionary. A named channel the dictionary lacks is simply never sent;
+// the page shows it as absent.
 class DriveMask {
  public:
   DriveMask() = default;
-  DriveMask(std::vector<std::string> channels, bool alerts)
-      : channels_{std::move(channels)}, alerts_{alerts} {
-    std::sort(channels_.begin(), channels_.end());
-  }
+  explicit DriveMask(talos::telemetry::DriveChannels channels)
+      : channels_{std::move(channels)} {}
 
   // The mask for `state`'s dictionary, indexed like it: 1 for a channel the
   // client is sent. Recomputed only when the dictionary changes.
@@ -226,11 +225,11 @@ class DriveMask {
     mask_.assign(state.dictionary.size(), 0);
     for (std::size_t i = 0; i < state.dictionary.size(); ++i) {
       const TelemetryChannelInfo& channel = state.dictionary[i];
-      const bool named =
-          std::binary_search(channels_.begin(), channels_.end(), channel.name);
-      const bool alert =
-          alerts_ && channel.alert != Talos::Telemetry::AlertLevel_None;
-      mask_[i] = named || alert ? 1 : 0;
+      mask_[i] =
+          channels_.Carries(channel.name,
+                            channel.alert != Talos::Telemetry::AlertLevel_None)
+              ? 1
+              : 0;
     }
     known_ = true;
     stream_id_ = state.stream_id;
@@ -239,8 +238,7 @@ class DriveMask {
   }
 
  private:
-  std::vector<std::string> channels_;
-  bool alerts_{false};
+  talos::telemetry::DriveChannels channels_;
   bool known_{false};
   std::uint64_t stream_id_{0};
   std::uint32_t dictionary_id_{0};

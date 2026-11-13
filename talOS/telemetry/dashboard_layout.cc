@@ -784,6 +784,21 @@ bool CarriesAlertChannels(const DashboardLayout& layout) {
   });
 }
 
+bool DriveChannels::Carries(std::string_view name, bool alert) const {
+  return (alerts && alert) || std::ranges::binary_search(named, name);
+}
+
+DriveChannels DriveFeedChannels(const DashboardLayout& layout) {
+  DriveChannels channels{RequiredChannels(layout),
+                         CarriesAlertChannels(layout)};
+  const auto at =
+      std::ranges::lower_bound(channels.named, kDriveLinkLostChannel);
+  if (at == channels.named.end() || *at != kDriveLinkLostChannel) {
+    channels.named.emplace(at, kDriveLinkLostChannel);
+  }
+  return channels;
+}
+
 std::uint64_t DashboardWorstCaseBytesPerSecond(std::uint32_t update_hz,
                                                std::size_t channel_count) {
   using namespace telemetry_wire;
@@ -828,10 +843,11 @@ std::string DashboardLayoutJson(const DashboardLayout& layout) {
       ",\"update_hz\":" + std::to_string(layout.update_hz) +
       ",\"budget_bytes_per_s\":" + std::to_string(layout.budget_bytes_per_s) +
       ",\"drive_clients\":" + std::to_string(layout.drive_clients);
+  const DriveChannels feed = DriveFeedChannels(layout);
   AppendKey(out, "alerts");
-  out += CarriesAlertChannels(layout) ? "true" : "false";
+  out += feed.alerts ? "true" : "false";
   AppendKey(out, "channels");
-  AppendStrings(out, RequiredChannels(layout));
+  AppendStrings(out, feed.named);
   AppendKey(out, "widgets");
   out += '[';
   for (std::size_t i = 0; i < layout.widgets.size(); ++i) {

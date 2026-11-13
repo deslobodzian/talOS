@@ -109,6 +109,7 @@ items = [
       R"("hw/state/driver_station/match_type",)"
       R"("hw/state/driver_station/station",)"
       R"("hw/state/driver_station/teleop","hw/state/driver_station/test",)"
+      R"("hw/status/alert_error_link_lost",)"
       R"("hw/status/battery_v","hw/status/brownout","hw/status/health_valid",)"
       R"("intake/state/beam_broken","intake/state/inhibit",)"
       R"("pose_estimator/state/localized","pose_estimator/state/pose/x_m",)"

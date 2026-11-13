@@ -1487,6 +1487,87 @@ at = [1, 0, 1, 1]
   }
 }
 
+// Test node: the hardware bridge's /hw/status with an alert of each level
+// (schema_test.Alerts), so the dictionary holds
+// hw/status/alert_error_link_lost as a graph with the bridge does.
+class HardwareStatusNode {
+ public:
+  explicit HardwareStatusNode(talos::Node& node)
+      : status_{node.publish<schema_test::Alerts>("/hw/status")} {}
+
+  talos::Publisher<schema_test::Alerts> status_;
+};
+
+// REQ-OPS-35, REQ-OPS-36: the drive feed carries the RoboRIO link's alert
+// channel whatever the layout's widgets, so construction counts it in the
+// worst case once the dictionary holds it, and once only beside an `alerts`
+// widget; a graph without /hw/status adds nothing.
+TEST(TelemetryMatrix, DriveFeedBudgetCountsTheRoboRioLinkChannel) {
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  ASSERT_NE(tmp, nullptr);
+  const std::string file = std::string{tmp} + "/link_dashboard.toml";
+  const auto construct = [&file](std::uint32_t budget, bool alerts_widget,
+                                 bool hardware_status) {
+    std::ofstream(file) << "[dashboard]\nupdate_hz = 10\n"
+                        << "budget_bytes_per_s = " << budget << "\n"
+                        << "[[widgets]]\nkind = \"number\"\n"
+                        << "at = [0, 0, 1, 1]\n"
+                        << "channel = \"shooter/status/supply_v\"\n"
+                        << (alerts_widget ? "[[widgets]]\nkind = \"alerts\"\n"
+                                            "at = [1, 0, 1, 1]\n"
+                                          : "");
+    Sim sim = Sim::FromToml(R"(
+[robot]
+period_us = 10000
+[studio]
+topic = "/talos/telemetry"
+dashboard = ")" + file + R"("
+[subsystems.shooter]
+node = "//shooter:node"
+[subsystems.hw]
+node = "//hw:node"
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+)");
+    sim.add<AlertsNode>("shooter");
+    if (hardware_status) sim.add<HardwareStatusNode>("hw");
+    sim.add<Telemetry>("telemetry");
+  };
+  // update_hz 10: 10 x (12 x channels + 210) + 10,312 B/s, so one channel
+  // needs 12,532, two 12,652 and seven (the number, the shooter's three
+  // alerts and /hw/status's three) 13,252.
+  struct Case {
+    const char* what;
+    std::uint32_t budget;
+    bool alerts_widget;
+    bool hardware_status;
+    bool constructs;
+  };
+  for (const Case& c : {
+           Case{"no /hw/status: the named channel only", 12532, false, false,
+                true},
+           Case{"the link channel counts", 12532, false, true, false},
+           Case{"the link channel fits", 12652, false, true, true},
+           Case{"beside an alerts widget, counted once", 13252, true, true,
+                true},
+       }) {
+    SCOPED_TRACE(c.what);
+    if (c.constructs) {
+      EXPECT_NO_THROW(construct(c.budget, c.alerts_widget, c.hardware_status));
+      continue;
+    }
+    try {
+      construct(c.budget, c.alerts_widget, c.hardware_status);
+      ADD_FAILURE() << "constructed";
+    } catch (const DashboardLayoutError& error) {
+      EXPECT_NE(
+          std::string_view{error.what()}.find("[dashboard].budget_bytes_per_s"),
+          std::string_view::npos)
+          << error.what();
+    }
+  }
+}
+
 // REQ-OPS-37: an alert whose topic went stale is absent, neither a frozen
 // "active" nor a "clear", while the node keeps publishing its other inputs.
 TEST(TelemetryMatrix, StaleInputClearsValidity) {
