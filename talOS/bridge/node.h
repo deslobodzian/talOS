@@ -48,10 +48,25 @@ struct SubsystemTracker {
   // (OwnerTimeoutUs), last accepted request on the bridge clock and its
   // observation on the gateway clock, reset on every controller transition.
   MergeOwner merge;
-  // Bridge-clock receipt of the last request accepted into the merge, kept
-  // across controller transitions (which reset `merge`); none yet before
-  // the first. /hw/status's alert_warning_owner_timed_out reads it.
-  std::optional<uint64_t> last_accepted_us;
+  // Owner silence as /hw/status reports it (timed_out_mask and
+  // alert_warning_owner_timed_out, HardwareNode::OwnerSilent), tracked apart
+  // from `merge`, whose Reset() at every controller transition must keep
+  // dropping the owner's demands without the status reporting a timeout.
+  // Silence counts on the bridge clock from `silence_from_us`: the link
+  // becoming ready (a State accepted and the current boot configured: the
+  // session's start, or a gateway reboot's end), the last accepted request,
+  // or the first controller transition since that request while the owner
+  // was not silent (its requests in flight then carry the old identity and
+  // are refused, so its next one comes up to a period later). One such
+  // transition per accepted request, so a gateway that keeps transitioning
+  // cannot hide an owner none of whose requests is accepted.
+  std::optional<uint64_t> silence_from_us;
+  bool transition_since_accepted{false};
+  // Whether OwnerSilent held at this subsystem's last evaluation in Tick(),
+  // and the rising edges seen: distinct owner-timeout episodes, the exit
+  // summary's timeouts=.
+  bool silent{false};
+  uint64_t timeouts{0};
   std::unique_ptr<ipc::Subscriber<talos::hardware::Packet>> subscriber;
 
   // Requests actually decoded off this subsystem's topic, and where that topic
@@ -226,6 +241,12 @@ class HardwareNode {
     auto it = subsystems_.find(name);
     return it != subsystems_.end() && it->second.merge.timed_out;
   }
+  // Owner-timeout episodes of subsystem `name` so far (SubsystemTracker),
+  // as the exit summary prints them; 0 for a name that owns no actuator.
+  uint64_t owner_timeouts(const std::string& name) const {
+    auto it = subsystems_.find(name);
+    return it != subsystems_.end() ? it->second.timeouts : 0;
+  }
   const Command& current_command() const { return full_cmd_; }
   uint64_t identity_rejected() const { return identity_rejected_; }
   uint64_t ownership_rejected() const { return ownership_rejected_; }
@@ -308,8 +329,20 @@ class HardwareNode {
   // nothing is sent until each publishes a fresh request. Called on every
   // controller transition: reboot, config change, disable/re-enable, and fault
   // recovery (all of which the gateway reports as a new boot, config, epoch,
-  // or enabled/fault edge).
-  void InvalidateRequests();
+  // or enabled/fault edge), at `now_us`, which starts the silence of each
+  // owner not yet silent (SubsystemTracker::silence_from_us).
+  void InvalidateRequests(uint64_t now_us);
+  // Whether the link is ready for requests (a State accepted and the
+  // current gateway boot has acknowledged this configuration), after a
+  // gateway frame received at `now_us`. Becoming ready starts every owner's
+  // silence at `now_us`, as the session's start does.
+  void UpdateLinkReady(uint64_t now_us);
+  // Whether `tracker`'s owner is silent at `now_us` as /hw/status reports
+  // it: the link is ready and nothing restarted its silence
+  // (silence_from_us) for longer than its owner timeout. False while the
+  // link is not ready, when alert_error_link_lost or
+  // alert_error_not_configured says why nothing merges.
+  bool OwnerSilent(const SubsystemTracker& tracker, uint64_t now_us) const;
   void NeutralizeAll();
   // Rebuilds the id -> position tables below and every tracker's slots from
   // full_cmd_'s actuator layout. The first occurrence of an id wins, matching
@@ -450,6 +483,8 @@ class HardwareNode {
   uint64_t last_state_receipt_us_{0};
   // Whether a State has been accepted (past the ordering gate) yet.
   bool state_accepted_{false};
+  // UpdateLinkReady()'s last answer.
+  bool link_ready_{false};
   ClockOffsetEstimator clock_;
   uint64_t last_probe_send_us_{};
   bool probe_waiting_{false};
