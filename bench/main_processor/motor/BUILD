@@ -40,6 +40,7 @@ cc_test(
     deps = [
         ":motor",
         "//talOS/devices:testing",
+        "//talOS/node:allocation_probe",
         "//talOS/node:testing",
         "//talOS/teleop",
         "@googletest//:gtest_main",

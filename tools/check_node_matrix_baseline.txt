@@ -14,4 +14,3 @@
 talOS/teleop/node_test.cc 1 2 6 9 11 12
 examples/superstructure/cpp/superstructure_test.cc 1 2 3 4 5 6 7 8 9 10 11 12
 examples/wrist_repo/node_test.cc 1 2 5 7 9 10 11 12
-bench/main_processor/motor/node_test.cc 1 2 3 4 5 6 7 8 9 10 11 12
