@@ -7,7 +7,10 @@ routines = ["preload", "none", "shoot_only", "taxi"]
 default_routine = "preload"
 selection_port_index = 0
 selection_pov_index = 0
-# Eighth-turn directions clockwise from up: right = 2, left = 6.
+# Joystick port 0..5, POV 0..3. Eighth-turn directions clockwise from up,
+# 0..7 and different: right = 2, left = 6. A key out of range, or any
+# non-finite or (durations, limits, tolerances, gains) non-positive value
+# below, fails construction naming the key.
 selection_next_direction_index = 2
 selection_previous_direction_index = 6
 # Feedback at these tolerances must exceed the drivetrain's wheel hold speed

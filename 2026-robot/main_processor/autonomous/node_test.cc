@@ -1145,16 +1145,39 @@ TEST_P(AutonomousRestartMatchTest, RecordFromAnotherMatchIsIgnored) {
 
 INSTANTIATE_TEST_SUITE_P(Gaps, AutonomousRestartMatchTest, ::testing::Bool());
 
-TEST(AutonomousParameters, RejectsInvalidRoutineAndSelectionConfiguration) {
-  for (const char* setting :
-       {"routines = []", "routines = ['missing']",
-        "routines = ['none', 'none']", "default_routine = 'missing'",
-        "selection_port_index = 6", "selection_pov_index = -1",
-        "selection_next_direction_index = 8",
-        "selection_previous_direction_index = 2",
-        "routine.taxi.target_x_m = nan",
-        "routine.shoot_only.spinup_timeout_s = 0.0"}) {
-    SCOPED_TRACE(setting);
+// REQ-CONTRACT-18
+TEST(AutonomousParameters, BadParameterFailsConstruction) {
+  const struct {
+    const char* key;
+    const char* setting;
+  } rows[] = {
+      {"routines", "routines = []"},
+      {"routines", "routines = ['missing']"},
+      {"routines", "routines = ['none', 'none']"},
+      {"default_routine", "default_routine = 'missing'"},
+      {"selection_port_index", "selection_port_index = 6"},
+      {"selection_pov_index", "selection_pov_index = -1"},
+      {"selection_next_direction_index", "selection_next_direction_index = 8"},
+      {"selection_previous_direction_index",
+       "selection_previous_direction_index = 2"},
+      {"routine.taxi.target_x_m", "routine.taxi.target_x_m = nan"},
+      {"routine.shoot_only.spinup_timeout_s",
+       "routine.shoot_only.spinup_timeout_s = 0.0"},
+      {"spinup_timeout_s", "spinup_timeout_s = 0.0"},
+      {"spinup_timeout_s", "spinup_timeout_s = -1.0"},
+      {"spinup_timeout_s", "spinup_timeout_s = nan"},
+      {"spinup_timeout_s", "spinup_timeout_s = inf"},
+      {"drive_timeout_s", "drive_timeout_s = 0.0"},
+      {"drive_timeout_s", "drive_timeout_s = -1.0"},
+      {"drive_timeout_s", "drive_timeout_s = nan"},
+      {"drive_timeout_s", "drive_timeout_s = inf"},
+      {"autonomous_period_us", "autonomous_period_us = 0"},
+      {"feed_duration_us", "feed_duration_us = 0"},
+      {"feed_duration_us", "feed_duration_us = -1"},
+      {"max_linear_mps", "max_linear_mps = 0.0"},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.setting);
     auto sim = talos::testing::Sim::FromToml(std::string{R"(
 [robot]
 period_us = 20000
@@ -1162,29 +1185,14 @@ command_timeout_us = 100000
 [subsystems.mechanism.motors.unused]
 can_id = 1
 [subsystems.autonomous]
-)"} + setting);
-    EXPECT_THROW(sim.add<Autonomous>("autonomous"), std::invalid_argument);
-  }
-}
-
-TEST(AutonomousParameters, RejectsNonpositiveAndNonfinitePhaseDurations) {
-  for (const char* setting :
-       {"spinup_timeout_s = 0.0", "spinup_timeout_s = -1.0",
-        "spinup_timeout_s = nan", "spinup_timeout_s = inf",
-        "drive_timeout_s = 0.0", "drive_timeout_s = -1.0",
-        "drive_timeout_s = nan", "drive_timeout_s = inf",
-        "autonomous_period_us = 0", "feed_duration_us = 0",
-        "feed_duration_us = -1"}) {
-    SCOPED_TRACE(setting);
-    auto sim = talos::testing::Sim::FromToml(std::string{R"(
-[robot]
-period_us = 20000
-command_timeout_us = 100000
-[subsystems.mechanism.motors.unused]
-can_id = 1
-[subsystems.autonomous]
-)"} + setting);
-    EXPECT_THROW(sim.add<Autonomous>("autonomous"), std::invalid_argument);
+)"} + row.setting);
+    try {
+      sim.add<Autonomous>("autonomous");
+      ADD_FAILURE() << "constructed";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
   }
 }
 
