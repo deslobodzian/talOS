@@ -325,8 +325,9 @@ serialize it (`exclusive`) or run it unsandboxed (`local`).
 
 Each lane has a `.bazelrc` config: `bazel test --config=fast //...` is the
 everyday loop; `--config=heavy`, `--config=integration`, `--config=e2e` and
-`--config=perf` run one lane. `bazel test //...` runs every lane but the soak;
-it is what runs before a push ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)).
+`--config=perf` run one lane, and `--config=no_e2e` every lane but e2e.
+`bazel test //...` runs every lane but the soak; it is what runs before a
+push ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)).
 Bazel keeps only the last `--test_tag_filters`, so a lane is combined with a
 sanitizer in one filter, not two configs:
 `bazel test --config=asan --test_tag_filters=-no_asan,-heavy,-integration,-e2e,-perf //...`.
@@ -338,8 +339,11 @@ tools/slow_tests.py --threshold 5` lists, slowest first, every test action in
 millisecond) over the threshold; `--bep FILE` reads one invocation's
 `--build_event_json_file` instead, and no test result at all is an error.
 With `--check` it exits 1 when an action exceeds its lane's budget above
-(lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`); CI does
-not run it yet (LANE-1).
+(lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`).
+**[enforced: the Linux job, after the suite, for the heavy, integration,
+e2e and perf lanes; gap: LANE-1 for the fast lane, which a hosted runner
+does not hold (the workflow step names the targets) and which is checked
+locally only]**
 
 CI policy:
 
@@ -347,8 +351,9 @@ CI policy:
   requests to `main`, so a work branch uses one of those prefixes. A pull
   request is not required.
 - Linux carries the full per-push gate: build, suite, sanitizers, lint.
-- Hosted macOS runs only the build and the tests outside the e2e and soak
-  lanes on each push; macOS sanitizers and the macOS soak run nightly.
+- CI jobs select lanes by the configs above: Linux runs `//...` plain and under `--config=asan` and
+  `--config=tsan`; hosted macOS runs only the build and `--config=no_e2e`
+  on each push; macOS sanitizers and the macOS soak run nightly.
 
 What each job runs, and on which trigger, is in
 [`.github/workflows/`](../.github/workflows/); this file does not restate it.
