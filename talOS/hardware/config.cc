@@ -32,8 +32,8 @@ struct Hash {
 }  // namespace
 
 void Validate(const Config& c) {
-  Require(!c.motors.empty() && c.motors.size() <= kMaxMotors &&
-              c.sensors.size() <= kMaxSensors &&
+  // No device at all is a robot brought up before its first mechanism.
+  Require(c.motors.size() <= kMaxMotors && c.sensors.size() <= kMaxSensors &&
               c.digital_inputs.size() <= kMaxDigitalInputs &&
               c.digital_outputs.size() <= kMaxDigitalOutputs &&
               c.analog_inputs.size() <= kMaxAnalogInputs &&

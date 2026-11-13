@@ -628,6 +628,40 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
   expect_outputs(true);
 }
 
+// A robot brought up before its first mechanism: a config with no motor and
+// no CAN sensor loads, and with nothing whose feedback could be lost there is
+// no total-loss fault (Gateway.ARobotWithNoMotorConfiguresAndEnables is the
+// gateway's side), so robot_enabled() follows enable and a digital output
+// drives.
+// REQ-CONTRACT-35
+TEST(SimHardwareTotalLoss, ARobotWithNoMotorIsNoFeedbackLoss) {
+  struct Lights {
+    explicit Lights(Node& n) : node{n}, led{n, "led"} {}
+    void update() {
+      enabled = robot_enabled(node);
+      led.set(true);
+    }
+    Node& node;
+    DigitalOutput led;
+    bool enabled = false;
+  };
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 50000
+
+[subsystems.lights.digital_outputs.led]
+dio = 0
+)");
+  auto& lights = sim.add<Lights>("lights");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(20ms);
+  EXPECT_EQ(LatestState(sim).flags & hardware::kHardwareFault, 0u);
+  EXPECT_TRUE(lights.enabled);
+  EXPECT_TRUE(hw.applied_digital_output("lights", "led"));
+}
+
 // REQ-SAFE-22, REQ-DEV-07: the gateway judges total loss on the samples the
 // RoboRIO reports, before it masks a follower of an invalid master or the
 // motor a reset CANcoder feeds (Gateway::Tick judges, PollResets masks

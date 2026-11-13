@@ -76,7 +76,10 @@ remote without it keeps the configured value.
 
 Both endpoints compute a canonical configuration fingerprint. Changing a CAN
 address, offset, limit, or gain changes that ID; commands with a different ID
-are refused. This is a compatibility check, not authentication. Configuration
+are refused. This is a compatibility check, not authentication. A configuration
+with no device at all, or no motor, is valid: a robot is brought up (link,
+Driver Station, telemetry) before its first mechanism, and with no motor or
+CAN sensor there is no feedback to lose, so no total-loss fault. Configuration
 validation rejects duplicate IDs/names/addresses, invalid numeric values,
 remote encoder references that do not exist on the motor's bus, and a
 `status_hz` giving fewer than four status periods per `command_timeout_us`

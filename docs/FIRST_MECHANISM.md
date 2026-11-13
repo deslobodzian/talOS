@@ -57,9 +57,9 @@ Next:
 ```
 
 Run it through `bazel run`; `python3 tools/new_robot.py` alone fails with
-`No module named 'tools'`. `--dry-run` prints every file without writing. A
-robot needs a mechanism from the start: the hardware configuration refuses a
-robot with no motor. `my_robot/README.md` says what each file is; the ones that
+`No module named 'tools'`. `--dry-run` prints every file without writing.
+`new_robot` always writes the robot with its first mechanism.
+`my_robot/README.md` says what each file is; the ones that
 matter now:
 
 - A **node** is one program (one process) that does one job; a **subsystem**

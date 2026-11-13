@@ -20,9 +20,8 @@ Writes <DIR>/<name>/ (DIR defaults to the workspace root):
     main_processor/configuration/robot_sim_manifest.bzl
 
 plus what `//tools:new_subsystem -- <mech> --robot <DIR>/<name>` writes for
-the first mechanism (its package, subsystem file and [[subsystems]] entry):
-the hardware config refuses a robot with no motor, so a robot without one
-would not launch. The framework's teleop and telemetry nodes are the other
+the first mechanism (its package, subsystem file and [[subsystems]] entry).
+The framework's teleop and telemetry nodes are the other
 subsystems; the hardware bridge joins every launch on its own. More
 mechanisms come from new_subsystem, and `./sim.sh --config
 <robot_sim.toml> --sim-gateway` runs the robot in simulation. The robot name follows the node-name rules (talOS/NAMING.md,
@@ -267,11 +266,9 @@ def plan(root, name, mechanism, lang, kind="velocity", parent="."):
     """([(path, None, content)], placeholder CAN id) for a new robot at
     <root>/<parent>/<name> with its first mechanism.
 
-    A robot needs a mechanism: the hardware config refuses one with no motor
-    (talOS/hardware/config.cc, "invalid hardware device count"). The robot is
-    assembled in a scratch copy of its directory and new_subsystem adds the
-    mechanism there, so nothing in the workspace is written until both
-    succeed."""
+    The robot is assembled in a scratch copy of its directory and
+    new_subsystem adds the mechanism there, so nothing in the workspace is
+    written until both succeed."""
     if problem := check_robot_name(name):
         raise Refused(problem)
     if problem := (new_subsystem.check_name(mechanism)
@@ -321,8 +318,7 @@ def main(argv):
     parser.add_argument("name", help="robot name and directory, e.g. "
                         "my_robot (talOS/NAMING.md node-name rules)")
     parser.add_argument("--mechanism", required=True,
-                        help="its first mechanism, as new_subsystem's name; "
-                        "a robot needs at least one motor")
+                        help="its first mechanism, as new_subsystem's name")
     parser.add_argument("--lang", choices=("cpp", "py"), required=True,
                         help="the mechanism's language")
     parser.add_argument("--type", dest="kind",
