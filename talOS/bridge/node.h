@@ -277,9 +277,9 @@ class HardwareNode {
   // Whether a subsystem request may merge: same configuration, boot, and
   // epoch as last observed (exact match), and an observation its MergeOwner
   // admits against last_sample_time_us_ (MergeOwner::Admits: younger than
-  // command_timeout_us, never future, monotonic per subsystem). That age
-  // bound is the gateway's own, which re-enforces it, so it remains the
-  // safety backstop.
+  // command_timeout_us, never future, monotonic per subsystem). The gateway
+  // enforces the same age against its own clock, which is later than the
+  // latest State's sample, so it remains the safety backstop.
   bool HasRequestIdentity(const SubsystemTracker& tracker,
                           const Command& partial) const;
   // Whether every actuator a request addresses belongs to the subsystem that

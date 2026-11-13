@@ -397,11 +397,14 @@ TEST(HardwareNodeTrustTest, RejectsWrongIdentityWordsEvenWithinBound) {
 // A request merges only while the State it was built from is younger than
 // command_timeout_us against the latest State (MergeOwner::Admits, given
 // HardwareNode's bound): the age bound the gateway itself applies to a
-// command's observation. A wider bound would merge a request the gateway
-// must refuse, and its observation, the oldest merged, would then make the
-// gateway refuse every owner's outputs; a narrower one, such as the 50 ms
-// owner timeout, would drop a live owner whose request lags the latest State
-// by less than the timeout. One request built from the State sampled at
+// command's observation, except that the gateway counts from its own clock,
+// later than the latest State's sample by up to a RoboRIO tick and the
+// transit. So a request just inside the bound can still merge and be refused
+// there (the cost ARCHITECTURE.md "The tick" accepts); a wider bound would
+// merge requests the gateway always refuses, whose observation, the oldest
+// merged, makes it refuse every owner's outputs; a narrower one, such as the
+// 50 ms owner timeout, would drop a live owner whose request lags the latest
+// State by less than the timeout. One request built from the State sampled at
 // 1000: admitted while the latest State is command_timeout_us - 1 newer,
 // refused once it is command_timeout_us newer, its demand left out.
 // REQ-SAFE-16, REQ-SAFE-39
