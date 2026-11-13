@@ -62,6 +62,9 @@ const SIGNAL_NAMES: Record<number, string> = {
   14: 'SIGALRM', 15: 'SIGTERM'
 };
 
+// The signal the launcher sends to stop a session's members.
+const SIGINT = 2;
+
 // The launcher's own spelling (SignalText in talOS/launcher/spawn.h).
 export function signalText(signal: number): string {
   const name = SIGNAL_NAMES[signal];
@@ -134,14 +137,20 @@ export function mergeProcesses(
     if (m && m.restart_count > 0) problems.push('restarted');
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
-    if (m && m.exit_signal > 0) problems.push('killed_by_signal');
+    const lastRun = m?.runs?.at(-1);
+    // The launcher's own stop signal (SIGINT) ending a member before it
+    // handled stops is a clean stop (launcher README "Session manifest").
+    const stoppedBySession =
+        lastRun?.reason === 'stop' && m?.exit_signal === SIGINT;
+    if (m && m.exit_signal > 0 && !stoppedBySession) {
+      problems.push('killed_by_signal');
+    }
     if (m && m.endpoint_mismatch) problems.push('endpoint_mismatch');
     // Declared but never registered is only a claim when there is a registry
     // to compare against; with no live graph it cannot be made (the same rule
     // `declaredStatus` follows).
     if (graph && d && !r) problems.push('never_registered');
 
-    const lastRun = m?.runs?.at(-1);
     rows.push({
       name,
       target: m?.target ?? r?.target ?? d?.target ?? '',
@@ -150,7 +159,7 @@ export function mergeProcesses(
       hasManifest: m !== undefined,
       restarts: m?.restart_count ?? 0,
       exitCode: m && m.exit_code >= 0 ? m.exit_code : null,
-      exitSignal: m && m.exit_signal > 0 ? signalText(m.exit_signal) : null,
+      exitSignal: m && m.exit_signal > 0 && !stoppedBySession ? signalText(m.exit_signal) : null,
       endReason: lastRun && lastRun.reason !== 'running' &&
               lastRun.reason !== 'exit' ? lastRun.reason : null,
       recorderFailed: m?.recorder_failed ?? false,

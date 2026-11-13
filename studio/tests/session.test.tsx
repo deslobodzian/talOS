@@ -324,3 +324,25 @@ test('uptime runs to the registry clock, then to the end; unknown without either
   ended.end_wall_ns = '1735689605000000000';   // 5 s after start
   assert.equal(uptime(ended, null), '5.0 s');
 });
+
+// REQ-OPS-06: a member ended by the launcher's own stop signal before it
+// handled stops is a clean stop, not a signal death; any other signal death,
+// or SIGINT for any other reason, stays flagged.
+test('mergeProcesses shows a launcher-stopped member as stopped', () => {
+  const run = (reason: string, exit_signal: number) => [{
+    pid: 1, start_wall_ns: 1, end_wall_ns: 2, exit_code: -1, exit_signal,
+    reason
+  }];
+  const m = manifest([
+    mnode({name: 'stopped', exit_signal: 2, runs: run('stop', 2)}),
+    mnode({name: 'crashed', exit_signal: 2, runs: run('crash', 2)}),
+    mnode({name: 'killed', exit_signal: 9, runs: run('stop_timeout', 9)})
+  ]);
+  const rows = mergeProcesses(m, null, null, {}, false);
+  const row = (n: string) => rows.find(r => r.name === n)!;
+  assert.deepEqual(row('stopped').problems, []);
+  assert.equal(row('stopped').exitSignal, null);
+  assert.equal(row('stopped').endReason, 'stop');
+  assert.deepEqual(row('crashed').problems, ['killed_by_signal']);
+  assert.deepEqual(row('killed').problems, ['killed_by_signal']);
+});
