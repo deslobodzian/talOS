@@ -143,7 +143,9 @@ constexpr const char* kNoDeadbandRobotRelative =
 constexpr const char* kNoDeadbandFieldOriented =
     "deadband_frac = 0.0\nfield_oriented = true\n";
 
-TEST(Driver, MapsStickAxesToChassisRequests) {
+// Node test matrix (docs/TESTING.md §7), producer: cases 1, 2, 6, 11 and 12
+// below under the names //tools:check_node_matrix looks for.
+TEST(Driver, SendsAtALiveInput) {
   Harness harness{kNoDeadbandRobotRelative};
   // Forward is negative axis 1, left is negative axis 0, CCW is negative 2.
   harness.Push(DsState(kTeleopEnabled, Stick(-0.5f, -0.75f, -0.25f, 1)));
@@ -390,7 +392,8 @@ TEST(Driver, RequestsNothingWhenDisabledAutonomousOrDisconnected) {
   }
 }
 
-TEST(Driver, ReleasesLaneOnceOnTheDisableEdge) {
+// REQ-SAFE-13
+TEST(Driver, DisabledRobotReleasesItsLanes) {
   Harness harness{kNoDeadbandRobotRelative};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   ASSERT_TRUE(harness.chassis_active());
@@ -406,7 +409,8 @@ TEST(Driver, ReleasesLaneOnceOnTheDisableEdge) {
   EXPECT_EQ(harness.chassis_count(), after_release);
 }
 
-TEST(Driver, ASilentDriverStationReleasesLaneOnce) {
+// REQ-SAFE-13
+TEST(Driver, DriverStationLossReleasesItsLanes) {
   Harness harness{kNoDeadbandRobotRelative};
   harness.Push(DsState(kTeleopEnabled, Stick(0, -1.0f, 0)));
   ASSERT_TRUE(harness.chassis_active());
@@ -489,7 +493,8 @@ TEST(Driver, OwnEvaluationGapRequiresNeutralWithoutObservingStaleDs) {
 // packet is enabled teleop again, but under a new mode generation; a gateway
 // reboot likewise starts a new generation, whatever its mode_since_us. Either
 // way a held stick must return to neutral before it drives.
-TEST(Driver, HeldStickWaitsForNeutralInEveryNewModeGeneration) {
+// REQ-SAFE-14
+TEST(Driver, NewGenerationDisarms) {
   Harness harness{kNoDeadbandRobotRelative};
   const ds::DriverStationData held = DsState(kTeleopEnabled, Stick(0, -1, 0));
   harness.Push(held);
@@ -684,7 +689,8 @@ TEST_F(TeleopChain, DisablingOrLosingTheDriverStationStopsTheModules) {
 // write, the driver's update(), and the drivetrain's target read and module
 // requests allocate nothing. SimHardware forwards the held packet every
 // period through the window.
-TEST_F(TeleopChain, SteadyTeleopAllocatesNothing) {
+// REQ-RT-06
+TEST_F(TeleopChain, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
     GTEST_SKIP() << why;
