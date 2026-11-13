@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -72,9 +73,22 @@ std::string_view RunEndReason(std::string_view kill_reason, bool stopping,
 // one. Reads the log's directory.
 bool CappedLogStopped(const std::string& log_path);
 
-// How long a stopping session gives a member after its SIGINT before it
+// The signal a stopping session sends every running member's group, once.
+inline constexpr int kStopSignal = SIGINT;
+
+// How long a stopping session gives a member after its kStopSignal before it
 // kills the member's group (SIGKILL; run reason stop_timeout).
 inline constexpr std::chrono::seconds kStopTimeout{2};
+
+// Whether a run ended by the stop signal the launcher sent it: the session's
+// stop signaled it (`kill_reason` kRunStop, or kRunStopTimeout when the
+// SIGKILL found it already ended) before the launcher reaped it, and
+// kStopSignal ended it (waitpid `status`). A member not yet handling a stop
+// (between its exec and process::InstallStopHandlers()) ends so. Such a run
+// is the session's own stop: it does not make the session's exit status
+// nonzero. A signal from elsewhere does not count, nor does the stop
+// timeout's SIGKILL.
+bool EndedByOwnStopSignal(std::string_view kill_reason, int status);
 
 // ---------------------------------------------------------------------------
 // Launcher
@@ -222,6 +236,9 @@ class Launcher {
     // Why the launcher ended the current run (kRunStalled, kRunStop, ...);
     // empty while it has not tried. Its run is recorded with this reason.
     std::string_view kill_reason;
+    // The last ended run ended by the stop signal the launcher sent it
+    // (EndedByOwnStopSignal): it leaves the session's exit status 0.
+    bool stopped_by_session{false};
     // introspect::monotonic_now_ns() just before the current run's spawn:
     // every row the run claims has a heartbeat at or after it
     // (FinalDeliveryCounts).

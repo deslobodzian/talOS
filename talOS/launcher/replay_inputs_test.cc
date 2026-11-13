@@ -308,8 +308,8 @@ node = "//talOS/launcher:replay_graph_reader"
            << "  fi\n"
            << "done\n"
            // Alive until the session ends: an exited stub restarts, and the
-           // end's SIGINT landing before the restart's exec makes the session
-           // status nonzero.
+           // end's SIGINT landing before the restart's trap ends it by the
+           // signal rather than the exit 0 its handler gives.
            << "trap 'exit 0' INT TERM\n"
            << "while :; do sleep 0.05; done\n";
     talos::launcher::testing::WriteWarmStub(stub, script.str(), 0700);

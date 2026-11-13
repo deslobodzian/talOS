@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -287,9 +288,9 @@ bool Running(const std::string& manifest) {
 // `ready` held for: empty when the session ended first. Set
 // options.duration_s to kHangSeconds. `ready` must also wait until every
 // member still running handles the stop (a talos node or
-// delivery_loss_node once Registered, a shell stub once its trap is set):
-// one stopped before that dies of the launcher's SIGINT, and a member
-// ended by a signal makes the session's status nonzero.
+// delivery_loss_node once Registered, a shell stub once its trap is set)
+// when the test asserts how a run ended: one stopped before that dies of
+// the launcher's SIGINT instead of exiting as its handler would.
 int RunSessionUntil(LauncherOptions& options,
                     const std::function<bool(const std::string&)>& ready,
                     std::string& seen) {
@@ -647,8 +648,8 @@ TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
   EXPECT_EQ(RunSessionUntil(
                 options,
                 [session](const std::string&) {
-                  // beta too: a stub stopped before it handles the stop
-                  // dies of the SIGINT (RunSessionUntil).
+                  // beta too: every member ends as its stop handler has
+                  // it (RunSessionUntil).
                   return Registered("alpha", session) &&
                          Registered("hardware_node", session) &&
                          Registered("beta", session);
@@ -805,8 +806,8 @@ TEST(Supervision, AWakeLostOnAByteTopicFailsTheStrictReport) {
   EXPECT_EQ(RunSessionUntil(
                 options,
                 [session](const std::string& live) {
-                  // The lossless stubs too: one stopped before it handles
-                  // the stop dies of the SIGINT (RunSessionUntil).
+                  // The lossless stubs too: every member ends as its stop
+                  // handler has it (RunSessionUntil).
                   return ManifestEntry(live, "alpha")
                                  .find("\"wake_failures\": 1,\n") !=
                              std::string::npos &&
@@ -1021,9 +1022,10 @@ TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
   auto options = BaseOptions("clean_stop");
   const auto runs = TempPath("clean_stop_runs");
   ::remove(runs.c_str());
-  // Every roster member must stay alive until shutdown. An exit-0 hardware
-  // stub otherwise restarts and can receive SIGINT before exec, where the
-  // default signal disposition correctly produces a nonzero session status.
+  // Every roster member must stay alive until shutdown, with its stop
+  // handler set: an exit-0 hardware stub otherwise restarts, and the stop's
+  // SIGINT can reach the restart before its trap, ending it by the signal
+  // rather than the exit 0 asserted below.
   for (const std::string name : {"hardware_node", "alpha", "beta"}) {
     const std::string target = name == "hardware_node"
                                    ? "//talOS/bridge:hardware_node"
@@ -1066,6 +1068,111 @@ TEST(Supervision, RequestedStopDoesNotRestartCleanExits) {
   }
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
+}
+
+// A stop that reaches a member before it handles one: between its exec and
+// process::InstallStopHandlers() (a C++ node's first lines, a Python node's
+// whole interpreter start) the stop's SIGINT kills it. That is the session's
+// own stop, not a failed member: an operator's Ctrl-C during startup ends
+// the session with status 0, the member is not restarted, and its run says
+// how it ended (reason stop, exit_signal SIGINT). alpha never installs a
+// handler, which holds that window open; its peers handle the stop.
+// REQ-OPS-06
+TEST(Supervision, AMemberEndedByTheStopsOwnSignalLeavesTheSessionClean) {
+  auto options = BaseOptions("unhandled_stop");
+  options.duration_s = kHangSeconds;
+  const auto runs = TempPath("unhandled_stop_runs");
+  ::remove(runs.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("unhandled_stop_hardware", TrappedRun(runs, kLoopUntilStopped),
+                "hardware_node");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("unhandled_stop_beta", TrappedRun(runs, kLoopUntilStopped));
+  // exec: the member is the sleep, which the SIGINT ends whatever the shell
+  // would do with it.
+  options.binary_overrides["//example/alpha:node"] = WriteStub(
+      "unhandled_stop_alpha", RecordLogArgThen(runs, "exec sleep 600\n"));
+  std::string seen;
+  const int status = RunSessionUntil(
+      options, [&](const std::string&) { return ReadLines(runs).size() == 3; },
+      seen);
+  EXPECT_FALSE(seen.empty()) << "the session ended before every member ran";
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_EQ(status, 0) << manifest;
+  const std::string alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"exit_code\": -1"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"exit_signal\": " + std::to_string(SIGINT)),
+            std::string::npos)
+      << alpha;
+  const auto alpha_runs = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha_runs.size(), 1u) << manifest;
+  EXPECT_NE(alpha_runs[0].find("\"reason\": \"stop\""), std::string::npos)
+      << alpha_runs[0];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
+// The same unhandled SIGINT from elsewhere, before any stop is requested, is
+// a member that crashed: the launcher did not send it, so the session that
+// is then stopped ends nonzero, with the crash as alpha's last run.
+// REQ-OPS-06
+TEST(Supervision, ASigintTheStopDidNotSendIsStillACrash) {
+  auto options = BaseOptions("foreign_sigint");
+  options.duration_s = kHangSeconds;
+  options.max_restarts = 0;
+  const auto runs = TempPath("foreign_sigint_runs");
+  const auto alpha_pid = TempPath("foreign_sigint_alpha_pid");
+  ::remove(runs.c_str());
+  ::remove(alpha_pid.c_str());
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("foreign_sigint_hardware", TrappedRun(runs, kLoopUntilStopped),
+                "hardware_node");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("foreign_sigint_beta", TrappedRun(runs, kLoopUntilStopped));
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("foreign_sigint_alpha",
+                "echo $$ > " + alpha_pid + ".tmp && mv " + alpha_pid + ".tmp " +
+                    alpha_pid + "\nexec sleep 600\n");
+  // SIGINTs alpha's group, as the launcher's stop would, once it runs.
+  std::jthread interrupter{[&](const std::stop_token& stop) {
+    for (; !stop.stop_requested(); std::this_thread::sleep_for(2ms)) {
+      const auto lines = ReadLines(alpha_pid);
+      pid_t pid = 0;
+      if (lines.empty() ||
+          std::from_chars(lines[0].data(), lines[0].data() + lines[0].size(),
+                          pid)
+                  .ec != std::errc{})
+        continue;
+      ::kill(-pid, SIGINT);
+      return;
+    }
+  }};
+  std::string seen;
+  const int status = RunSessionUntil(
+      options,
+      [&](const std::string& manifest) {
+        const auto alpha = ManifestRuns(manifest, "alpha");
+        return ReadLines(runs).size() == 2 && alpha.size() == 1 &&
+               alpha[0].find("\"reason\": \"crash\"") != std::string::npos;
+      },
+      seen);
+  interrupter.request_stop();
+  EXPECT_FALSE(seen.empty()) << "the session ended before alpha crashed";
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_NE(status, 0) << manifest;
+  const std::string alpha = ManifestEntry(manifest, "alpha");
+  EXPECT_NE(alpha.find("\"restart_count\": 0"), std::string::npos) << alpha;
+  EXPECT_NE(alpha.find("\"exit_signal\": " + std::to_string(SIGINT)),
+            std::string::npos)
+      << alpha;
+  const auto alpha_runs = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(alpha_runs.size(), 1u) << manifest;
+  EXPECT_NE(alpha_runs[0].find("\"reason\": \"crash\""), std::string::npos)
+      << alpha_runs[0];
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+  ::remove(alpha_pid.c_str());
 }
 
 TEST(Supervision, MissingConfigFailsFastWithClearError) {

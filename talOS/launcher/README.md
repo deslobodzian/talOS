@@ -435,6 +435,26 @@ run's are in its `runs`, with the reason it ended; see
 summary also names (`exit=-1 (signal 2 SIGINT)`); Studio's session panel
 shows it in the exit column and marks the node *killed by signal*.
 
+When the session ends, the launcher exits with 0, or with the last nonzero
+`exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
+refused [live endpoints](#live-endpoints). A member whose last run ended by
+the stop's own signal does not count: one that was not yet handling a stop
+(between its exec and `process::InstallStopHandlers()`, a C++ node's first
+lines or a Python node's whole interpreter start) when the stop's SIGINT
+reached it, so an operator's Ctrl-C during startup ends the session with 0.
+Its run still records the signal: `exit_code` -1, `exit_signal` 2, `reason`
+`stop`. Only a SIGINT the launcher sent that run counts so, which it knows
+from its own record of the stop it sent before it reaped the run, never from
+the stop flag. The launcher sends it only after the spawn has returned, which
+is after the member's exec. A terminal's Ctrl-C reaches only the launcher's
+process group, never a member's (each has its own). Still counted: a
+signal before the stop, another signal (a SIGTERM that systemd's default
+`KillMode=control-group` sends every process of the unit along with the
+launcher), and the stop timeout's SIGKILL.
+A SIGINT from elsewhere that ends the run after the launcher's last look at
+it and before its own SIGINT is indistinguishable from it and counts as the
+stop's.
+
 A run whose event log stops early says so in its registry row while it runs
 (see [event log state](../introspection/README.md#event-log-state)). A node
 creates its log on the writer thread once its loop starts, never on the loop
@@ -512,7 +532,8 @@ The requested-stop supervision test acknowledges installed signal handlers in
 all three stub nodes before signaling the launcher. Every stub stays alive until
 that stop, and the test checks zero restarts and clean exits for the whole roster.
 An immediately exiting hardware stub instead exercises an unrelated restart/stop
-race: a signal before its executable starts can legitimately terminate it.
+race: the stop's signal reaching a restart before its trap is set ends it by
+that signal.
 
 With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
 and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
@@ -731,7 +752,7 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 | `heartbeat_missing` | was killed because no registry row of it was found once the startup grace and its heartbeat timeout had passed |
 | `construction_deadline` | was killed for constructing longer than the deadline |
 | `endpoint_mismatch` | was killed, or its session stopped, for [live endpoints](#live-endpoints) that differ from its probe |
-| `stop` | ended as the session's stop (signal, `--duration-s`) asks: exit 0, SIGINT or SIGTERM |
+| `stop` | ended as the session's stop (signal, `--duration-s`) asks: exit 0, SIGINT or SIGTERM (which of these leave the launcher's exit status 0: [restarts](#restarts)) |
 | `stop_timeout` | outlived the 2 s after the stop's SIGINT and was killed (SIGKILL) |
 | `spawn_failed` | could not be spawned (`exit_code` -1, `exit_signal` 0) |
 
