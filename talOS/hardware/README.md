@@ -365,7 +365,16 @@ or the gateway's mask of an unavailable device or its follower, carries zero
 in every measured field (position, velocity, applied voltage, stator and
 supply current; `Gateway::snapshot`), never its last values; its ages,
 temperature and fault bits are the backend's. Reset detection (above)
-skips an invalid sample, so its zero is never a position step. Invalid motor
+skips an invalid sample, so its zero is never a position step.
+While the gateway is unconfigured (a configure in progress, every boot
+restore included, or the last configure failed) it reads no device, so every
+State it publishes then carries no measurement: every motor and CAN-sensor
+sample is invalid with those zeros, and every RIO device sample and the
+health sample is invalid, keeping its value as last read. The same holds
+under a new configuration until its first `Backend::Read`, in the tick that
+completes the configure. A configure in progress is not a fault: such a
+State has `kConfigured` and `kEnabled` clear and, unless the configure failed,
+`kHardwareFault` clear. Invalid motor
 motion feedback, or a missing or invalid remote CANcoder, neutralizes only that
 motor and its followers; healthy motors in the same command continue driving.
 The neutral starts in the tick that finds the feedback invalid, while a command
