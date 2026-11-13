@@ -162,6 +162,75 @@ class SimGatewayStartup(unittest.TestCase):
                 self.assertEqual(generations, sorted(set(generations)))
                 self.assertIn((1, 3, 32, 1, 5, -0.5, 90), joystick_samples)
 
+    # REQ-DEV-10
+    def test_physics_home_switches_read_from_the_config(self):
+        """[digital_inputs.*] sim_motor binds a home switch in --physics: with
+        the lift motor at rest at 0 rotations, a switch closed at or below
+        -0.1 reads open (true, normally open) and one closed at or below 0.1
+        reads closed (false); closed_above and closed_reads apply; an input
+        with no sim_motor reads false."""
+        with tempfile.TemporaryDirectory() as tmp, socket.socket(
+                socket.AF_INET, socket.SOCK_DGRAM) as receiver:
+            config = Path(tmp) / "robot.toml"
+            config.write_text(
+                '[robot]\nname = "home_switch_test"\nperiod_us = 5000\n'
+                'controller_address = "127.0.0.1"\n'
+                '[subsystems.test.motors.lift]\ncan_id = 1\n'
+                '[subsystems.test.digital_inputs]\n'
+                'a_away = { dio = 0, sim_motor = "lift", '
+                'sim_closed_at_rot = -0.1 }\n'
+                'b_at = { dio = 1, sim_motor = "lift", '
+                'sim_closed_at_rot = 0.1 }\n'
+                'c_above = { dio = 2, sim_motor = "lift", '
+                'sim_closed_at_rot = -0.1, sim_closed_above = true, '
+                'sim_closed_reads = true }\n'
+                'd_unbound = { dio = 3 }\n',
+                encoding="utf-8")
+            receiver.bind(("127.0.0.1", 0))
+            receiver.settimeout(0.1)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
+                reserve.bind(("127.0.0.1", 0))
+                gateway_port = reserve.getsockname()[1]
+            with subprocess.Popen(
+                    [str(binary()), "--config", str(config), "--physics",
+                     "--port", str(gateway_port),
+                     "--remote-port", str(receiver.getsockname()[1]),
+                     "--duration-s", "0.3"],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True) as proc:
+                inputs = None
+                deadline = time.monotonic() + 10
+                try:
+                    while inputs is None and time.monotonic() < deadline:
+                        try:
+                            packet = receiver.recv(4096)
+                        except socket.timeout:
+                            if proc.poll() is not None:
+                                break
+                            continue
+                        if struct.unpack_from("<H", packet, 12)[0] != 20:
+                            continue
+                        # talOS/hardware/messages.cc Encode(State): an 84-byte
+                        # base after the 40-byte frame header, whose counts
+                        # start at 70; 45 bytes per motor; then (id, valid,
+                        # value) per digital input.
+                        motors, sensors, digital_inputs = struct.unpack_from(
+                            "<HHH", packet, 40 + 70)
+                        self.assertEqual((motors, sensors), (1, 0))
+                        offset = 40 + 84 + 45 * motors
+                        inputs = [struct.unpack_from("<H??", packet,
+                                                     offset + 4 * i)
+                                  for i in range(digital_inputs)]
+                    stdout, stderr = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                # Logical ids follow the sorted device names (a..d, then lift).
+                self.assertEqual(inputs, [(1, True, True), (2, True, False),
+                                          (3, True, True), (4, True, False)])
+
 
 NEUTRAL = ("neutral", 0, 0.0, 0.0)
 

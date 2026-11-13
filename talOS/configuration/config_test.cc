@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -610,6 +612,62 @@ TEST_F(ManifestTest, MotorTypeSetsThePhysicsModelAndRefusesUnknownTypes) {
       EXPECT_NE(what.find(part), std::string::npos) << what;
     }
   }
+}
+
+// A simulated home switch is bound in configuration, but only sim_gateway
+// --physics reads it: the RoboRIO's config, and so its ConfigurationId, is
+// the same with and without it, and a key that could not bind is refused
+// naming the key and the input.
+// REQ-DEV-10
+TEST(ConfigTest, SimHomeSwitchKeysStayOffTheWireAndRefuseWhatCannotBind) {
+  const std::string input = "[subsystems.test.digital_inputs.home]\ndio = 3\n";
+  const auto plain = Parse(input);
+  const auto with = Parse(input +
+                          "sim_motor = \"m1\"\nsim_closed_at_rot = -0.1\n"
+                          "sim_closed_above = true\nsim_closed_reads = true\n");
+  const auto& sim = with.hardware.digital_inputs.at(0).sim_home_switch;
+  EXPECT_EQ(sim.motor, "m1");
+  EXPECT_EQ(sim.closed_at_rot, -0.1);
+  EXPECT_TRUE(sim.closed_above);
+  EXPECT_TRUE(sim.closed_reads);
+  EXPECT_TRUE(
+      plain.hardware.digital_inputs.at(0).sim_home_switch.motor.empty());
+  EXPECT_EQ(hardware::ConfigurationId(with.hardware),
+            hardware::ConfigurationId(plain.hardware));
+
+  const auto expect_refused = [&](const std::string& body,
+                                  std::initializer_list<const char*> parts) {
+    SCOPED_TRACE(body);
+    try {
+      Parse(input + body);
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      for (const char* part : parts) {
+        EXPECT_NE(what.find(part), std::string::npos) << what;
+      }
+    }
+  };
+  for (const char* key :
+       {"sim_closed_at_rot", "sim_closed_above", "sim_closed_reads"}) {
+    const std::string value =
+        std::string_view{key} == "sim_closed_at_rot" ? "0.0" : "true";
+    expect_refused(std::string{key} + " = " + value + "\n",
+                   {key, "home", "sim_motor"});
+  }
+  expect_refused("sim_motor = \"m1\"\n", {"sim_closed_at_rot", "home"});
+  for (const char* value : {"nan", "inf"}) {
+    expect_refused(
+        std::string{"sim_motor = \"m1\"\nsim_closed_at_rot = "} + value + "\n",
+        {"sim_closed_at_rot", "home", "finite"});
+  }
+  // A motor of another subsystem, and a device that is no motor.
+  expect_refused(
+      "sim_motor = \"m2\"\nsim_closed_at_rot = 0.0\n"
+      "[subsystems.other.motors.m2]\ncan_id = 2\n",
+      {"sim_motor", "m2", "home"});
+  expect_refused("sim_motor = \"home\"\nsim_closed_at_rot = 0.0\n",
+                 {"sim_motor", "'home'"});
 }
 
 TEST_F(ManifestTest, MergesSubsystemFilesAndKeepsTopLevelTables) {

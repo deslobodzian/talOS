@@ -2655,16 +2655,20 @@ autonomous = []
         gains = (zero.replace("p = 0.0", "p = 1.0")
                  .replace("d = 0.0", "d = 0.05").replace("v = 0.0", "v = 0.12"))
         return block + f"""\
-# The simulated travel. The simulator's home switch reads closed at every
-# position (an unset DIO reads false: closed, for a normally open switch),
-# so the {name} zeroes where it starts; a margin past the travel keeps the
-# stuck-switch check from stopping it home_margin_rot from home.
+# The simulated travel.
 [{sub}.{name}]
 max_rot = 2.0
-home_margin_rot = 2.5
-# The simulated motor's gains, not the mechanism's.
+# The simulated home switch: it reads closed while the motor, which starts
+# at 0, is at or below -0.1 rotations, where homing_v drives it.
+[{sub}.digital_inputs.{name}_home]
+sim_motor = "{motor}"
+sim_closed_at_rot = -0.1
+# The simulated motor's gains, not the mechanism's, and its profile's
+# acceleration: the first move after homing starts from the homing speed,
+# and the simulation has no hard stop at the switch to end it.
 [{sub}.motors.{motor}]
 slot0 = {{ {gains} }}
+acceleration_rps2 = 20.0
 """
     return block + f"""\
 # The simulated motor's feedforward (volts per rps), not the mechanism's:

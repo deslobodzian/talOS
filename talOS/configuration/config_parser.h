@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -710,6 +711,38 @@ inline void CheckDeviceKeys(const toml::table& t, const std::string& name,
   }
 }
 
+// A digital input, with its simulated home switch (DigitalInputConfig::
+// sim_home_switch): the sim_closed_* keys need sim_motor, which needs a
+// finite sim_closed_at_rot. Whether sim_motor names a motor of the same
+// subsystem is checked once every device is parsed.
+inline RawDevice ParseDigitalInput(const toml::table& t,
+                                   const std::string& name) {
+  CheckDeviceKeys(t, name, "digital input",
+                  {"dio", "sim_motor", "sim_closed_at_rot", "sim_closed_above",
+                   "sim_closed_reads"});
+  hardware::DigitalInputConfig input{.dio = ReadRequired<int>(t, "dio", name)};
+  auto& sim = input.sim_home_switch;
+  if (!t.contains("sim_motor")) {
+    for (const char* key :
+         {"sim_closed_at_rot", "sim_closed_above", "sim_closed_reads"}) {
+      if (t.contains(key)) {
+        throw std::invalid_argument(std::string(key) + " for digital input " +
+                                    name + " needs sim_motor");
+      }
+    }
+    return RawDevice{.config = std::move(input)};
+  }
+  sim.motor = ReadNonEmpty(t, "sim_motor", "", "digital input");
+  sim.closed_at_rot = ReadRequired<double>(t, "sim_closed_at_rot", name);
+  if (!std::isfinite(sim.closed_at_rot)) {
+    throw std::invalid_argument("sim_closed_at_rot for digital input " + name +
+                                " must be finite");
+  }
+  sim.closed_above = Read(t, "sim_closed_above", sim.closed_above);
+  sim.closed_reads = Read(t, "sim_closed_reads", sim.closed_reads);
+  return RawDevice{.config = std::move(input)};
+}
+
 inline RawDevice ParseSensor(const toml::table& t, const std::string& name) {
   CheckDeviceKeys(t, name, "sensor",
                   {"type", "bus", "can_id", "inverted", "offset_rot"});
@@ -1218,11 +1251,7 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     each("motors", detail::ParseMotor);
     each("sensors", detail::ParseSensor);
     each("encoders", detail::ParseEncoder);
-    each("digital_inputs", [](const toml::table& t, const std::string& n) {
-      detail::CheckDeviceKeys(t, n, "digital input", {"dio"});
-      return detail::RawDevice{.config = hardware::DigitalInputConfig{
-                                   .dio = ReadRequired<int>(t, "dio", n)}};
-    });
+    each("digital_inputs", detail::ParseDigitalInput);
     each("digital_outputs", [](const toml::table& t, const std::string& n) {
       detail::CheckDeviceKeys(t, n, "digital output", {"dio"});
       return detail::RawDevice{.config = hardware::DigitalOutputConfig{
@@ -1299,6 +1328,21 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     }
     require_same_subsystem(*master, dev.subsystem, dev.name);
     motor->master_id = std::get<hardware::MotorConfig>(master->config).id;
+  }
+
+  // A simulated home switch's motor is a motor of the input's subsystem.
+  for (const auto& dev : raw_devices) {
+    const auto* input = std::get_if<hardware::DigitalInputConfig>(&dev.config);
+    if (input == nullptr || input->sim_home_switch.motor.empty()) continue;
+    const std::string& motor = input->sim_home_switch.motor;
+    const auto* found = find(motor);
+    if (found == nullptr || found->subsystem != dev.subsystem ||
+        !std::holds_alternative<hardware::MotorConfig>(found->config)) {
+      throw std::invalid_argument(
+          "[subsystems." + dev.subsystem + "].digital_inputs." + dev.name +
+          ": sim_motor '" + motor + "' names no motor of subsystem '" +
+          dev.subsystem + "'");
+    }
   }
 
   // Swerve geometry module references must name this subsystem's devices.

@@ -108,10 +108,29 @@ struct SensorConfig {
   bool operator==(const SensorConfig&) const = default;
 };
 
+// A simulated home switch on a digital input: the physics simulator reads it
+// closed while `motor`'s reported position (mechanism rotations, hardware
+// frame) is at or below `closed_at_rot` (at or above when `closed_above`),
+// and reads `closed_reads` while closed. Like LocalMotorType, not on the
+// config wire and equal whatever its value.
+struct LocalHomeSwitch {
+  std::string motor;  // Empty: no simulated switch.
+  double closed_at_rot{};
+  bool closed_above{false};
+  bool closed_reads{false};
+  bool operator==(const LocalHomeSwitch&) const { return true; }
+};
+
 struct DigitalInputConfig {
   uint16_t id{};
   std::string name;
   int dio{};
+  // [digital_inputs.*] sim_motor, sim_closed_at_rot, sim_closed_above and
+  // sim_closed_reads. Not sent to the controller and not part of
+  // ConfigurationId; sim_gateway --physics hands them to the physics backend
+  // from its own parse of the robot config
+  // (sim::PhysicsSimBackend::SetHomeSwitches).
+  LocalHomeSwitch sim_home_switch{};
   bool operator==(const DigitalInputConfig&) const = default;
 };
 
