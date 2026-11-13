@@ -331,7 +331,11 @@ def main():
     with open(os.path.join(out_dir, "bundle_manifest.toml"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
-    # 7. run.sh
+    # 7. run.sh. A bundle that carries Studio starts its bridge by default,
+    # so a booted robot (deploy.sh enable-boot runs run.sh bare) and a run
+    # by hand serve the same Studio; --no-studio, which run.sh consumes,
+    # declines it. A bridge that cannot run is one warning (REQ-OPS-30).
+    start_studio = "true" if studio else "false"
     run_sh_path = os.path.join(out_dir, "run.sh")
     with open(run_sh_path, "w") as f:
         f.write(f"""#!/usr/bin/env bash
@@ -347,11 +351,15 @@ cd "${{SCRIPT_DIR}}"
 
 has_config=false
 has_output_dir=false
+start_studio={start_studio}
+args=()
 for arg in "$@"; do
   case "$arg" in
+    --no-studio) start_studio=false; continue ;;
     --config|--config=*) has_config=true ;;
     --output-dir|--output-dir=*) has_output_dir=true ;;
   esac
+  args+=("$arg")
 done
 
 extra_args=()
@@ -361,8 +369,11 @@ fi
 if [[ "$has_output_dir" == "false" && -n "${{TALOS_LOG_DIR:-}}" ]]; then
   extra_args+=(--output-dir "${{TALOS_LOG_DIR}}")
 fi
+if [[ "$start_studio" == "true" ]]; then
+  extra_args+=(--start-studio-bridge)
+fi
 
-exec "./launcher" --bundle "${{SCRIPT_DIR}}" ${{extra_args[@]+"${{extra_args[@]}}"}} "$@"
+exec "./launcher" --bundle "${{SCRIPT_DIR}}" ${{extra_args[@]+"${{extra_args[@]}}"}} ${{args[@]+"${{args[@]}}"}}
 """)
     make_executable(run_sh_path)
 

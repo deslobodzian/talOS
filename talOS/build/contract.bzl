@@ -1085,8 +1085,8 @@ def talos_bundle(name, config, **kwargs):
       **kwargs: passed to the bundle rule: nodes, the hardware node plus the
         manifest's NODES; config_files, its CONFIG_FILES; and, for a robot
         viewed with Studio, studio_bridge and studio_webroot (the bridge
-        binary and the built site), which put Studio in the bundle for
-        `run.sh --start-studio-bridge`.
+        binary and the built site), which put Studio in the bundle; its
+        run.sh then starts the bridge unless given --no-studio.
     """
     config_label = native.package_relative_label(config)
     manifest = config_label.same_package_label(

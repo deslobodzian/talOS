@@ -31,7 +31,7 @@ the site has no `index.html`. The 2026 robot, the bench rig and
 
 | Entry | What |
 |---|---|
-| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set; a `--config`/`--output-dir` argument replaces the default |
+| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set and, in a bundle that carries Studio, `--start-studio-bridge` unless given `--no-studio` (which it does not pass on); a `--config`/`--output-dir` argument replaces the default |
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
@@ -63,15 +63,18 @@ simulation and the field bundle. The overlay does not
 change CAN ids or commissioning: hardware must still be checked and
 commissioned through the normal bring-up process.
 
-`./run.sh --start-studio-bridge` serves Studio from the bundle on
-`[studio] http_port` (5800): the launcher runs the bundle's bridge for
-`[studio] bridge` and serves the bundle's webroot unless `[studio] webroot`
-is an absolute path ([Studio bridge](../talOS/launcher/README.md#studio-bridge)).
-The boot service starts `run.sh` without it. From a bundle built without
-Studio, the flag starts nothing and the session runs without Studio; so it
-does, after one warning, when the bundled bridge cannot run on the robot (it
-does not answer `--describe`), and from a checkout whose bridge is not built
-(the warning gives the `bazel build` command).
+A bundle that carries Studio serves it whenever `run.sh` runs, by hand or
+from the boot service: `run.sh` passes the launcher `--start-studio-bridge`,
+which runs the bundle's bridge for `[studio] bridge` on `[studio] http_port`
+(5800; Studio at `/`, the driver dashboard at `/drive`) and serves the
+bundle's webroot unless `[studio] webroot` is an absolute path
+([Studio bridge](../talOS/launcher/README.md#studio-bridge)).
+`./run.sh --no-studio` runs the session without it. From a bundle built
+without Studio, `run.sh` does not ask for it, and `--start-studio-bridge`
+starts nothing: the session runs without Studio; so it does, after one
+warning, when the bundled bridge cannot run on the robot (it does not answer
+`--describe`), and from a checkout whose bridge is not built (the warning
+gives the `bazel build` command).
 
 To bring up the bundle against a different controller address without editing
 the config, run `./run.sh --remote <ip>` (for example,
@@ -97,8 +100,10 @@ A relative `--prefix` is resolved against the working directory.
   `sync`, retains `previous`, and atomically replaces `current` using
   a temporary sibling symlink and rename (Linux and macOS). This selects the
   next bundle; restart the service to activate it.
-- **enable-boot** starts `<prefix>/current/run.sh` at boot as `--user`
-  (default `talos`; the account must exist). Linux: writes and enables
+- **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
+  boot as `--user` (default `talos`; the account must exist), so a booted
+  robot serves the Studio its bundle carries ([above](#build-a-bundle)).
+  Linux: writes and enables
   `/etc/systemd/system/talos.service` (`Type=notify`, `Restart=always`, a
   three-second supervision watchdog, `LimitRTPRIO=49` and
   `LimitMEMLOCK=infinity`, so the unprivileged service gets the

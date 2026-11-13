@@ -2,7 +2,7 @@
 its config staging (relative layout and identity), its manifest's binary
 digests and stamped revision, its staging of runfiles
 and of C++ nodes' shared libraries in lib/, its check of a bundled Studio
-against the config, and its run.sh, and
+against the config, and its run.sh (including the Studio it starts), and
 tools/deploy.sh's bundle selection, pruning and session commands."""
 
 import json
@@ -320,6 +320,41 @@ class BundleBuilderTest(unittest.TestCase):
             args = json.loads(proc.stdout)
             self.assertEqual(args[args.index("--bundle") + 1],
                              os.path.realpath(out))
+
+    # REQ-OPS-34
+    def test_run_script_starts_a_carried_studio_unless_declined(self):
+        # The boot service runs run.sh bare, so the default is what a booted
+        # robot gets. --no-studio is run.sh's own and must not reach the
+        # launcher, which would refuse it.
+        for carried, given, starts in ((True, [], True),
+                                       (True, ["--no-studio"], False),
+                                       (False, [], False)):
+            with self.subTest(carried=carried, given=given), \
+                    tempfile.TemporaryDirectory() as tmp:
+                studio = None
+                if carried:
+                    bridge = os.path.join(tmp, "src", "studio_bridge")
+                    put(bridge, "")
+                    webroot = os.path.join(tmp, "src", "dist")
+                    put(os.path.join(webroot, "index.html"), "<html>")
+                    studio = {"bridge_path": bridge,
+                              "bridge_label": "//viewer:bridge",
+                              "webroot_path": webroot}
+                proc = self.assemble(
+                    tmp, {"c/robot.toml": "[robot]\n"},
+                    [node(tmp, "hardware_node", HARDWARE_NODE)], (),
+                    studio=studio)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                out = os.path.join(tmp, "out")
+                self.echo_launcher(out)
+                proc = subprocess.run(
+                    [os.path.join(out, "run.sh"), *given, "--duration-s", "1"],
+                    capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                args = json.loads(proc.stdout)
+                self.assertEqual("--start-studio-bridge" in args, starts, args)
+                self.assertNotIn("--no-studio", args)
+                self.assertEqual(args[-2:], ["--duration-s", "1"])
 
 
 class DeployTest(unittest.TestCase):
