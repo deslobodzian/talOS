@@ -122,14 +122,22 @@ function harness() {
     model.tick(ms);
   };
   const socket = () => sockets[sockets.length - 1];
-  // Connects and receives the dictionary and a keyframe at `ms`.
-  const connect = (ms: number, values = NOMINAL, seq = 1) => {
+  // Opens a socket at `ms` and receives what the bridge sends on connect: the
+  // dictionary and a keyframe of the tick it holds, `seq`.
+  const join = (ms: number, values: Record<string, number>, seq: number) => {
     at(ms);
     model.start(ms);
     socket().onopen!();
     socket().send(...encodeDictionaryPages(header(seq), CHANNELS), ...update(seq, values, true));
   };
-  return {model, sockets, at, socket, connect, clock};
+  // Connects to a live producer at `ms`: the connect-time keyframe of tick
+  // `seq - 1`, then an update of tick `seq` (nothing changed), which is what
+  // makes the values current.
+  const connect = (ms: number, values = NOMINAL, seq = 1) => {
+    join(ms, values, seq - 1);
+    socket().send(...update(seq, {}, false));
+  };
+  return {model, sockets, at, socket, join, connect, clock};
 }
 
 const render = (h: ReturnType<typeof harness>) => renderDashboard(LAYOUT, h.model, h.clock.now);
@@ -211,6 +219,55 @@ test('values go stale within 500 ms of the last new tick, whatever else arrives'
   h.at(600);
   h.socket().send(...update(2, {}, false));
   assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'));
+});
+
+// REQ-OPS-36: on connect the bridge sends a keyframe of the newest tick it
+// holds, however old. Scenario: the telemetry node died minutes ago and the
+// coach reloads /drive; the keyframe's values must read stale, never current.
+// With a live producer the next message, an update of a newer tick, makes
+// them current.
+test('a connect-time keyframe shows its values stale until a newer tick arrives', () => {
+  const h = harness();
+  h.join(0, NOMINAL, 100);
+  const flywheel = () => widgetHtml(render(h), 'Flywheel');
+  assert.match(flywheel(), /tag-stale">STALE/, 'the connect-time keyframe is shown current');
+  assert.match(flywheel(), /52\.3/, 'the keyframe values are shown, marked');
+  assert.equal(h.model.status(h.clock.now).link, 'connecting');
+  // The producer is dead: the bridge restamps tick 100 every 100 ms.
+  for (let t = 100; t <= 1000; t += 100) {
+    h.at(t);
+    h.socket().send(...update(100, {}, false));
+    assert.match(flywheel(), /STALE/, `shown current at ${t} ms on the repeated keyframe tick`);
+  }
+  assert.equal(h.model.status(h.clock.now).link, 'telemetry');
+
+  const live = harness();
+  live.join(0, NOMINAL, 100);
+  live.at(100);
+  live.socket().send(...update(101, {}, false));
+  assert.doesNotMatch(widgetHtml(render(live), 'Flywheel'), /STALE/,
+                      'a newer tick after the keyframe is not current');
+  assert.equal(live.model.status(live.clock.now).link, 'ok');
+});
+
+// REQ-OPS-36: Wi-Fi drops at T, the producer runs on to T+3 s and dies, the
+// page reconnects at T+6 s. The connect-time keyframe is newer than the tick
+// the page held but 3 s old: it must not read as current either.
+test('a reconnect does not show the connect-time keyframe as current', () => {
+  const h = harness();
+  h.connect(0, NOMINAL, 2);
+  h.socket().onclose!({code: 1006, reason: ''});
+  for (let t = 100; h.sockets.length < 2; t += 100) h.at(t);
+  const reconnectedAt = h.clock.now;
+  h.socket().onopen!();
+  h.socket().send(...encodeDictionaryPages(header(60), CHANNELS),
+                  ...update(60, {...NOMINAL, 'shooter/state/flywheel_velocity_rps': 70}, true));
+  const held = widgetHtml(render(h), 'Flywheel');
+  assert.match(held, /70\.0/, 'the keyframe does not replace the held values');
+  assert.match(held, /STALE/, 'the connect-time keyframe after a reconnect is shown current');
+  h.at(reconnectedAt + 100);
+  h.socket().send(...update(61, {}, false));
+  assert.doesNotMatch(widgetHtml(render(h), 'Flywheel'), /STALE/);
 });
 
 // REQ-OPS-36: a value never received is absent, not zero.
@@ -295,7 +352,8 @@ test('reconnects every second after a close or an error, one socket at a time', 
   h.at(1200 + RECONNECT_MS);
   assert.equal(h.sockets.length, 3);
   h.socket().onopen!();
-  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS), ...update(5, NOMINAL, true));
+  h.socket().send(...encodeDictionaryPages(header(5), CHANNELS), ...update(5, NOMINAL, true),
+                  ...update(6, {}, false));
   assert.equal(h.model.status(h.clock.now).link, 'ok');
 });
 

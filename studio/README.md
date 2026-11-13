@@ -102,9 +102,18 @@ the bridge. Light and dark follow the browser's colour scheme.
 What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 
 - Every value is current only while a new telemetry tick (a `sequence_id`
-  that advanced) arrived within 300 ms; otherwise its widget is dimmed, struck
-  through and tagged STALE, at most 400 ms after the last tick. A channel never
-  received reads "no data", never zero.
+  that advanced) arrived on the current connection within 300 ms; otherwise
+  its widget is dimmed, struck through and tagged STALE, at most 400 ms after
+  the last tick. A channel never received reads "no data", never zero.
+- The first tick a connection brings never counts: it is the bridge's
+  connect-time keyframe, which repeats the newest tick the bridge holds,
+  however old. So a reload or a reconnect shows the keyframe's values tagged
+  STALE, with the status line on CONNECTING (`Connected, waiting for a new
+  tick`), until the next update of a newer tick makes them current. From a
+  live producer that update follows the keyframe within one update interval
+  when a value changed, else with the bridge's 100 ms heartbeat (which
+  restamps the newest tick): within 100 ms on the 2026 layout (`update_hz`
+  20). With none 300 ms after the keyframe the status line reads TELEMETRY.
 - One status line names the failed link, upstream first: the dashboard to
   bridge link (no socket, or nothing heard for 500 ms), telemetry (messages
   but no new tick; or none 1.5 s after connecting, the time a refilling bucket
