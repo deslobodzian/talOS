@@ -63,10 +63,14 @@ class FanoutGraphTest(unittest.TestCase):
             source_dir = os.path.dirname(r.Rlocation(CONFIG))
             os.makedirs(config_dir)
             # robot.toml and the data file it names ([studio] dashboard).
+            # Contents only, not modes: CI makes tracked files read-only, and
+            # robot.toml is rewritten below.
             for name in ("robot.toml", "dashboard.toml"):
-                shutil.copy(os.path.join(source_dir, name), config_dir)
+                shutil.copyfile(os.path.join(source_dir, name),
+                                os.path.join(config_dir, name))
             shutil.copytree(os.path.join(source_dir, "subsystems"),
-                            os.path.join(config_dir, "subsystems"))
+                            os.path.join(config_dir, "subsystems"),
+                            copy_function=shutil.copyfile)
 
             with open(r.Rlocation(ELEVATOR), encoding="utf-8") as handle:
                 elevator = handle.read()
