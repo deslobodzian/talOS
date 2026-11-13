@@ -163,13 +163,32 @@ void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
         std::max(phase_window_.max_ns[i], tick_phase_ns_[i]);
     tick_phase_ns_[i] = 0;
   }
+  tick_total_ns_ = 0;
+  boundary_total_ns_ = 0;
   phase_window_.motors = tick_motors_;
   phase_window_.sensors = tick_sensors_;
 }
 
 void RioLog::AddPhase(TickPhase phase, uint64_t duration_ns) {
   const auto i = static_cast<std::size_t>(phase);
-  if (i < kPhaseCount) tick_phase_ns_[i] += duration_ns;
+  if (i >= kPhaseCount) return;
+  tick_phase_ns_[i] += duration_ns;
+  tick_total_ns_ += duration_ns;
+}
+
+void RioLog::BeginTick(uint64_t now_ns) {
+  boundary_ns_ = now_ns;
+  boundary_total_ns_ = tick_total_ns_;
+}
+
+void RioLog::ClosePhase(TickPhase phase, uint64_t now_ns) {
+  const uint64_t elapsed = now_ns - boundary_ns_;
+  const uint64_t nested = tick_total_ns_ - boundary_total_ns_;
+  // The backend's phases lie inside the interval on the same clock, so
+  // `nested` never exceeds it; the guard keeps a clock fault from wrapping.
+  AddPhase(phase, elapsed > nested ? elapsed - nested : 0);
+  boundary_ns_ = now_ns;
+  boundary_total_ns_ = tick_total_ns_;
 }
 
 void RioLog::SetTickDevices(std::size_t motors, std::size_t sensors) {
@@ -196,18 +215,22 @@ void RioLog::WritePhases(uint64_t now_us, bool force) {
       const auto at = [](TickPhase phase) {
         return static_cast<std::size_t>(phase);
       };
-      char text[256];
+      char text[512];
       std::snprintf(
           text, sizeof(text),
           "[rio] tick phases: refresh mean/max %.1f/%.1f us, devices "
           "%.1f/%.1f us, control %.1f/%.1f us, health %.1f/%.1f us, other "
-          "%.1f/%.1f us over %llu ticks (motors=%u sensors=%u)\n",
+          "%.1f/%.1f us, link %.1f/%.1f us, driver station %.1f/%.1f us, "
+          "loop %.1f/%.1f us over %llu ticks (motors=%u sensors=%u)\n",
           mean_us[at(TickPhase::kRefresh)], max_us[at(TickPhase::kRefresh)],
           mean_us[at(TickPhase::kDevices)], max_us[at(TickPhase::kDevices)],
           mean_us[at(TickPhase::kControl)], max_us[at(TickPhase::kControl)],
           mean_us[at(TickPhase::kHealth)], max_us[at(TickPhase::kHealth)],
           mean_us[at(TickPhase::kOther)], max_us[at(TickPhase::kOther)],
-          static_cast<unsigned long long>(ticks),
+          mean_us[at(TickPhase::kLink)], max_us[at(TickPhase::kLink)],
+          mean_us[at(TickPhase::kDriverStation)],
+          max_us[at(TickPhase::kDriverStation)], mean_us[at(TickPhase::kLoop)],
+          max_us[at(TickPhase::kLoop)], static_cast<unsigned long long>(ticks),
           static_cast<unsigned>(
               published_motors_.load(std::memory_order_relaxed)),
           static_cast<unsigned>(

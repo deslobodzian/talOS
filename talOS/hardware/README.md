@@ -487,17 +487,24 @@ loop's timing faults: overruns (a tick's work, from wake to sleep, longer than
 the period) and late ticks (a tick starting more than 1.5 periods after the
 previous, a starved loop however short its work), with that second's longest
 work and interval. Every 10 s, when the loop ticked in that window, it
-prints where the backend's part of those ticks went:
+prints where those ticks' work went:
 
 ```
-[rio] tick phases: refresh mean/max <a>/<b> us, devices <a>/<b> us, control <a>/<b> us, health <a>/<b> us, other <a>/<b> us over <n> ticks (motors=<m> sensors=<s>)
+[rio] tick phases: refresh mean/max <a>/<b> us, devices <a>/<b> us, control <a>/<b> us, health <a>/<b> us, other <a>/<b> us, link <a>/<b> us, driver station <a>/<b> us, loop <a>/<b> us over <n> ticks (motors=<m> sensors=<s>)
 ```
 
 per tick, the mean and longest time in `BaseStatusSignal::RefreshAll`
 (refresh), the per-device validity, latency and `HasResetOccurred` pass
 (devices), TalonFX `SetControl` for every motor, whether a command's or
 neutral (control), the CAN status and battery reads (health), and the rest
-of the backend's tick calls (other). `PhoenixBackend` takes one
+of the backend's tick calls (other); and the loop's own: the socket retry,
+the endpoint's tick (receive, the gateway's command and State work, the
+State send; with no socket open, the gateway's tick) and the Driver Station
+packet's send, less the backend phases inside them (link), reading the
+Driver Station and sampling and encoding its packet (driver station), and
+the watchdog beat, companion report and config persister (loop). A tick's
+phases sum to its work, the time the loop timing line's longest work
+measures. `PhoenixBackend` takes one
 steady-clock reading per phase boundary, ten per disabled tick, and adds
 them on the loop thread without locks; the window passes to the logger at
 the loop's next tick ([bench measurement](../../docs/BENCH.md#fault-injection-and-timing)).

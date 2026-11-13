@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -217,6 +218,48 @@ TEST(RioLog, TickPhasesReportEachWindowsMeanAndMaxThenReset) {
         "control 0.0/0.0 us", "over 1 ticks"}) {
     EXPECT_NE(lines[1].find(expected), std::string::npos)
         << "expected \"" << expected << "\" in: " << lines[1];
+  }
+}
+
+// Bench 2026-11-13: when the RoboRIO's address returned, a tick's work was
+// 9419 us while every phase in the window stayed under 0.3 ms; the time was
+// in a part of the tick no phase measured. The loop's own phases take what
+// lies between their boundaries less the backend's phases nested inside, so
+// a tick's phases add up to its work: here 200 + 150 + 100 + 9150 + 100 us
+// = 9700 us, the link holding the endpoint tick's time outside the backend.
+// REQ-OPS-29
+TEST(RioLog, TickPhasesSumToTheTicksWork) {
+  using talos::rio::TickPhase;
+  std::vector<std::string> lines;
+  RioLog log{[&](std::string_view line) { lines.emplace_back(line); }};
+  log.Drain(0);  // starts the window clock
+
+  constexpr uint64_t kStartNs = 7'000'000'000;
+  log.BeginTick(kStartNs);
+  log.ClosePhase(TickPhase::kDriverStation, kStartNs + 200'000);
+  // The endpoint's tick, with the backend's phases inside it.
+  log.AddPhase(TickPhase::kRefresh, 150'000);
+  log.AddPhase(TickPhase::kControl, 100'000);
+  log.ClosePhase(TickPhase::kLink, kStartNs + 9'600'000);
+  log.ClosePhase(TickPhase::kLoop, kStartNs + 9'700'000);
+  log.RecordTick(0, 9'700, 5'000);
+
+  log.Drain(RioLog::kPhaseWindowUs);  // asks the loop for the window
+  log.BeginTick(kStartNs + 10'000'000);
+  log.RecordTick(10'000, 0, 5'000);  // hands it over
+  log.Drain(RioLog::kPhaseWindowUs + 20'000);
+  // Besides the loop timing line the overrun prints.
+  const auto phases =
+      std::find_if(lines.begin(), lines.end(), [](const std::string& line) {
+        return line.find("tick phases") != std::string::npos;
+      });
+  ASSERT_NE(phases, lines.end());
+  for (const char* expected :
+       {"refresh mean/max 150.0/150.0 us", "control 100.0/100.0 us",
+        "link 9150.0/9150.0 us", "driver station 200.0/200.0 us",
+        "loop 100.0/100.0 us", "over 1 ticks"}) {
+    EXPECT_NE(phases->find(expected), std::string::npos)
+        << "expected \"" << expected << "\" in: " << *phases;
   }
 }
 
