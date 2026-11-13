@@ -420,9 +420,10 @@ void Robot::StartCompetition() {
       Report(*log_, kSocketReplacedMessage, text);
     }
     // A send that finds the socket unable to send again loses it
-    // (SocketRetry::SendFailed): from there this loop ticks the gateway
-    // disabled and sends nothing, as before the first open, until a Poll
-    // replaces it. Any other send error keeps it.
+    // (SocketRetry::SendFailed): nothing more is sent this tick, and the next
+    // due Poll replaces it, usually on the next tick, which then runs as
+    // usual; a tick with no socket open ticks the gateway disabled and sends
+    // nothing, as before the first open. Any other send error keeps it.
     const auto sent = [&](talos::protocol::UdpStatus status) {
       if (status != talos::protocol::UdpStatus::kSocketError) return;
       const int error = endpoint_->udp_stats().last_send_error;
