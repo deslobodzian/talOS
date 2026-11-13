@@ -117,6 +117,20 @@ class TraceTest(unittest.TestCase):
                 # The quarantined test's tag does not count.
                 self.assertIn("REQ-SAFE-01 (P0, SAFE) has no tagged test", out)
 
+    def test_an_escaped_pipe_stays_inside_its_cell(self):
+        # REQ-OPS-37's form: Markdown's `\|` is a pipe inside a cell, so the
+        # priority after it is still the third cell, here an untested P0.
+        escaped = ("| REQ-OPS-02 | A field named `alert_<error\\|warning>` "
+                   "alerts. | P0 | ARCH | x | unit |\n")
+        files = tree(**{"docs/REQUIREMENTS.md": catalogue(
+            row("REQ-SAFE-01", "P0"), escaped)})
+        failures, out = check(files)
+        self.assertEqual(failures, 1, out)
+        self.assertIn("REQ-OPS-02 (P0, OPS) has no tagged test", out)
+        report = io.StringIO()
+        trace.report(sorted(files), lambda p: files.get(p, ""), TODAY, report)
+        self.assertIn("REQ-OPS-02 P0 [unit]", report.getvalue())
+
     def test_package_missing_from_scope_table_fails_naming_it(self):
         failures, out = check(tree(**{
             "talOS/vision/BUILD": "",

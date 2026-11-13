@@ -80,8 +80,18 @@ class Requirement:
         return self.area in ("SAFE", "CONTRACT") or self.priority == "P0"
 
 
+# A cell boundary: a pipe Markdown does not escape (`\|` is a pipe in a cell).
+CELL_BOUNDARY = re.compile(r"(?<!\\)\|")
+
+
 def split_row(line):
-    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+    """A table row's cells; the outer pipes are optional, as in Markdown."""
+    cells = [cell.strip() for cell in CELL_BOUNDARY.split(line.strip())]
+    if len(cells) > 1 and not cells[0]:
+        cells = cells[1:]
+    if len(cells) > 1 and not cells[-1]:
+        cells = cells[:-1]
+    return cells
 
 
 def parse_requirements(text):
