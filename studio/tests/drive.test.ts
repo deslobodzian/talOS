@@ -10,9 +10,9 @@ import {readFileSync} from 'node:fs';
 import {test} from 'node:test';
 
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
-import {CONNECTING_GRACE_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
+import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {renderDashboard, renderStatus} from '../src/drive/view';
+import {esc, renderDashboard, renderStatus} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -164,7 +164,8 @@ test('renders every widget of the 2026 layout in its cell', () => {
                             `grid-row:${row + 1} / span ${height}"`),
               `widget ${w.kind} at ${JSON.stringify(w.at)} not drawn current in its cell`);
   }
-  assert.equal(LAYOUT.widgets.length, 13);
+  assert.equal(html.match(/<section /g)?.length, LAYOUT.widgets.length,
+               'a widget is dropped or drawn twice');
   assert.ok(!html.includes('Unsupported'), 'a 2026 widget kind is unsupported');
   assert.match(widgetHtml(html, 'Match'), /AUTO/);
   assert.match(widgetHtml(html, 'Match'), /0:12/);
@@ -207,9 +208,6 @@ test('values go stale within 500 ms of the last new tick, whatever else arrives'
     h.socket().send(...update(1, {}, false));
   }
   assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'), 'stale while current');
-  // The page redraws every RENDER_MS: the latest draw that can still show
-  // the value current is STALE_MS after it, the first stale one within 500.
-  assert.ok(STALE_MS + RENDER_MS <= 500, `${STALE_MS} + ${RENDER_MS} ms exceeds 500 ms`);
   h.at(STALE_MS + 1);
   const stale = widgetHtml(render(h), 'Flywheel');
   assert.match(stale, /class="w w-number stale"/);
@@ -219,6 +217,26 @@ test('values go stale within 500 ms of the last new tick, whatever else arrives'
   h.at(600);
   h.socket().send(...update(2, {}, false));
   assert.ok(!widgetHtml(render(h), 'Flywheel').includes('STALE'));
+});
+
+// REQ-OPS-36: the page draws every RENDER_MS at a phase unrelated to the
+// ticks, while the bridge restamps the last tick every 100 ms. Whatever the
+// phase, the first draw that shows the value stale comes within 500 ms of
+// the last new tick.
+test('the page draws a stopped value stale within 500 ms at any draw phase', () => {
+  for (let phase = 0; phase < RENDER_MS; phase += 10) {
+    const h = harness();
+    h.connect(0);  // the last new tick, at 0
+    let shownStale = Infinity;
+    for (let t = 1; t <= 1000 && shownStale === Infinity; t++) {
+      h.at(t);
+      if (t % 100 === 0) h.socket().send(...update(1, {}, false));
+      if (t % RENDER_MS === phase && widgetHtml(render(h), 'Flywheel').includes('STALE'))
+        shownStale = t;
+    }
+    assert.ok(shownStale <= 500,
+              `draw phase ${phase} ms: first stale draw at ${shownStale} ms, bound 500 ms (REQ-OPS-36)`);
+  }
 });
 
 // REQ-OPS-36: on connect the bridge sends a keyframe of the newest tick it
@@ -336,20 +354,22 @@ test('the status line names the failed link', () => {
 });
 
 // REQ-OPS-36: on a close or an error the page reconnects every 1 s, one
-// socket at a time.
+// socket at a time: each attempt starts 1 s after the one before it started.
 test('reconnects every second after a close or an error, one socket at a time', () => {
   const h = harness();
   h.connect(0);
   h.at(200);
   h.socket().onclose!({code: 1006, reason: ''});
-  h.at(200 + RECONNECT_MS - 1);
-  assert.equal(h.sockets.length, 1, 'reconnected before 1 s');
-  h.at(200 + RECONNECT_MS);
-  assert.equal(h.sockets.length, 2, 'no reconnect at 1 s');
+  h.at(RECONNECT_MS - 1);
+  assert.equal(h.sockets.length, 1, 'reconnected within 1 s of the last attempt');
+  h.at(RECONNECT_MS);
+  assert.equal(h.sockets.length, 2, 'no reconnect 1 s after the last attempt');
   // The attempt fails at once (the bridge is down): the next goes 1 s later.
   h.sockets[1].onerror!();
   assert.ok(h.sockets[1].closed, 'an errored socket is closed');
-  h.at(1200 + RECONNECT_MS);
+  h.at(2 * RECONNECT_MS - 1);
+  assert.equal(h.sockets.length, 2, 'reconnected within 1 s of the last attempt');
+  h.at(2 * RECONNECT_MS);
   assert.equal(h.sockets.length, 3);
   h.socket().onopen!();
   h.socket().send(...encodeDictionaryPages(header(5), CHANNELS), ...update(5, NOMINAL, true),
@@ -425,22 +445,150 @@ test('the subsystems widget lists the summary, unknown as unknown', () => {
   assert.doesNotMatch(unknown, /DOWN/);
 });
 
-// REQ-OPS-36: a malformed frame or message is counted and ignored; the page
-// keeps decoding what follows.
-test('garbage binary and text are counted and ignored', () => {
+// REQ-OPS-36: before the first tick of a socket (nothing it brought can read
+// as current) a binary message that does not decode is counted and ignored,
+// and so is a text message that does not decode at any time; the page keeps
+// decoding what follows.
+test('garbage binary before the first tick and garbage text are counted and ignored', () => {
   const h = harness();
-  h.connect(0);
-  h.at(50);
+  h.at(0);
+  h.model.start(0);
+  h.socket().onopen!();
   const valid = update(2, {'shooter/state/flywheel_velocity_rps': 60}, false)[0];
   h.socket().send(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]),
-                  valid.slice(0, valid.length - 5), new Uint8Array(0));
+                  valid.slice(0, valid.length - 5), new Uint8Array(0), valid);
   h.socket().onmessage!({data: 42});
+  h.socket().send(...encodeDictionaryPages(header(0), CHANNELS), ...update(0, NOMINAL, true),
+                  ...update(1, {}, false));
+  h.at(50);
   h.socket().send('{not json', '[]', '{"kind":"talos.drive.summary","registry":true,"supervised":true,"nodes":5}',
                   '{"kind":"talos.drive.something_new"}');
   assert.deepEqual(h.model.counters,
-                   {connects: 1, malformed_binary: 4, malformed_text: 3, ignored_text: 1});
+                   {connects: 1, malformed_binary: 5, malformed_text: 3, ignored_text: 1});
   assert.equal(h.model.connection, 'open');
   h.socket().send(valid);
   assert.match(widgetHtml(render(h), 'Flywheel'), /60\.0/);
-  assert.match(renderStatus(h.model, h.clock.now), /7 malformed messages ignored/);
+  assert.doesNotMatch(widgetHtml(render(h), 'Flywheel'), /STALE/);
+  assert.match(renderStatus(h.model, h.clock.now), /8 malformed messages ignored/);
+});
+
+// REQ-OPS-36: after a socket's first tick the updates carry only changes, so
+// a page that does not decode loses what it changed, and later updates would
+// advance the sequence over a wrong value. Scenario: the flywheel goes to 60
+// in a page that arrives corrupt; the page must close the socket (counted),
+// reconnect, and read nothing current until the new socket's keyframe and
+// the tick after it.
+test('a binary message that does not decode after the first tick reconnects', () => {
+  const h = harness();
+  h.connect(0);
+  h.at(50);
+  const lost = update(2, {'shooter/state/flywheel_velocity_rps': 60}, false)[0];
+  const first = h.socket();
+  first.send(lost.slice(0, lost.length - 5));
+  assert.equal(h.model.counters.malformed_binary, 1);
+  assert.ok(first.closed, 'the socket is kept after a lost change-only update');
+  first.onmessage?.({data: update(3, {}, false)[0].slice().buffer});
+  assert.match(widgetHtml(render(h), 'Flywheel'), /STALE/, 'current after a lost update');
+  for (let t = 100; h.sockets.length < 2; t += 100) h.at(t);
+  h.socket().onopen!();
+  h.socket().send(...encodeDictionaryPages(header(3), CHANNELS),
+                  ...update(3, {...NOMINAL, 'shooter/state/flywheel_velocity_rps': 60}, true));
+  assert.match(widgetHtml(render(h), 'Flywheel'), /STALE/, 'the keyframe is shown current');
+  h.at(h.clock.now + 100);
+  h.socket().send(...update(4, {}, false));
+  const flywheel = widgetHtml(render(h), 'Flywheel');
+  assert.doesNotMatch(flywheel, /STALE/);
+  assert.match(flywheel, /60\.0/);
+});
+
+// REQ-OPS-36: with no TCP close (Wi-Fi drop, robot off) attempts still start
+// every 1 s: a connect that has not opened by then is abandoned for the
+// next, one socket at a time, and the status line names the bridge link once
+// the first connect's grace is over.
+test('a connect that never opens is abandoned and retried every second', () => {
+  const h = harness();
+  const starts: number[] = [];
+  h.model.start(0);
+  for (let t = 0; t <= 2500; t += 100) {
+    h.at(t);
+    while (starts.length < h.sockets.length) starts.push(t);
+  }
+  assert.deepEqual(starts, [0, RECONNECT_MS, 2 * RECONNECT_MS]);
+  assert.ok(h.sockets.slice(0, -1).every(s => s.closed), 'an abandoned connect is not closed');
+  assert.equal(h.model.status(h.clock.now).link, 'bridge');
+});
+
+// REQ-OPS-36: an open socket that hears nothing for DEAD_AFTER_MS (the
+// bridge sends something every 100 ms) is a dead path: it is closed and a
+// new attempt starts, without waiting for the OS to time it out.
+test('an open socket silent for 2 s is torn down and replaced', () => {
+  const h = harness();
+  h.connect(0);
+  h.at(DEAD_AFTER_MS - 1);
+  assert.equal(h.sockets[0].closed, false, 'closed while within the silence bound');
+  h.at(DEAD_AFTER_MS);
+  assert.ok(h.sockets[0].closed, 'a silent socket is kept open');
+  assert.equal(h.sockets.length, 2, 'no new attempt after a silent socket');
+});
+
+// REQ-OPS-36: the summary is shown current only while it was sent on the
+// socket that is now heard; after a reconnect the old one reads STALE until
+// the bridge sends one on the new socket.
+test('a summary from a previous socket reads stale until a new one arrives', () => {
+  const summary = JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+                                  registry: true, omitted: 0, nodes: []});
+  const h = harness();
+  h.connect(0);
+  h.socket().send(summary);
+  assert.doesNotMatch(widgetHtml(render(h), 'Subsystems'), /STALE/);
+  h.socket().onclose!({code: 1006, reason: ''});
+  for (let t = 100; h.sockets.length < 2; t += 100) h.at(t);
+  h.socket().onopen!();
+  h.socket().send(...encodeDictionaryPages(header(3), CHANNELS), ...update(3, NOMINAL, true),
+                  ...update(4, {}, false));
+  assert.match(widgetHtml(render(h), 'Subsystems'), /STALE/,
+               'a summary from the previous socket is shown current');
+  h.socket().send(summary);
+  assert.doesNotMatch(widgetHtml(render(h), 'Subsystems'), /STALE/);
+});
+
+// Every string from the layout, the dictionary or the summary is escaped
+// where it is drawn: a name with markup in it is shown as text and never
+// becomes markup on the page the drive team reads.
+test('markup in every drawn string is escaped', () => {
+  const markers = {
+    title: '<x-title>', check: '<x-check>', enum: '<x-enum>', alert: '<x-alert>',
+    owner: '<x-owner>', session: '<x-session>', node: '<x-node>', drives: '<x-drives>'
+  };
+  const mode = 'e/state/mode';
+  const alarm = `${markers.owner}/status/alert_error_${markers.alert}`;
+  const channels: ChannelSpec[] = [
+    {name: mode, unit: '', kind: ChannelKind.UInt, labels: [markers.enum]},
+    {name: alarm, unit: '', kind: ChannelKind.Bool, alert: AlertLevel.Error}
+  ];
+  const head = {streamId: 9n, sequenceId: 1n, timestampNs: 1n,
+                dictionaryId: dictionaryId(channels), channelCount: channels.length};
+  const layout = parseLayout({columns: 4, rows: 1, widgets: [
+    {kind: 'text', at: [0, 0, 1, 1], title: markers.title, channels: {channel: mode}},
+    {kind: 'checks', at: [1, 0, 1, 1], title: '', channels: {},
+     items: [{label: markers.check, channel: mode}]},
+    {kind: 'alerts', at: [2, 0, 1, 1], title: '', channels: {}},
+    {kind: 'subsystems', at: [3, 0, 1, 1], title: '', channels: {}, nodes: []},
+  ]});
+  const h = harness();
+  h.model.start(0);
+  h.socket().onopen!();
+  h.socket().send(...encodeDictionaryPages(head, channels),
+                  ...encodeValuePages(head, POSE, true, [[0, 0n], [1, 1n]]),
+                  ...encodeValuePages({...head, sequenceId: 2n}, POSE, false, []),
+                  JSON.stringify({kind: 'talos.drive.summary', session: markers.session,
+                                  supervised: true, registry: true, omitted: 0,
+                                  nodes: [{name: markers.node, alive: true, critical: true,
+                                           restarts: 0, quarantined: false,
+                                           drives: markers.drives}]}));
+  const html = renderDashboard(layout, h.model, 0);
+  for (const [site, marker] of Object.entries(markers)) {
+    assert.ok(!html.includes(marker), `${site}: ${marker} drawn as markup`);
+    assert.ok(html.includes(esc(marker)), `${site}: ${marker} not drawn as text`);
+  }
 });

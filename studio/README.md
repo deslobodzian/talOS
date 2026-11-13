@@ -119,16 +119,22 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   but no new tick; or none 1.5 s after connecting, the time a refilling bucket
   may take to send the dictionary, which until then reads as connecting), then
   the RoboRIO link (`hw/status/alert_error_link_lost`).
-- On a close or error it reconnects every 1 s, one socket at a time; a connect
-  that has not opened in 2 s, or a socket silent for 2 s, counts as an error.
-  After close 4000 it shows that another dashboard replaced it and reconnects
-  only when Reconnect is pressed.
+- On a close or error it reconnects every 1 s, one socket at a time: each
+  attempt starts 1 s after the previous one started, so a connect that has
+  not opened by then is abandoned for the next, and a socket silent for 2 s
+  counts as an error. After close 4000 it shows that another dashboard
+  replaced it and reconnects only when Reconnect is pressed. The drive
+  summary from a previous connection reads STALE until the new one sends its
+  own.
 - Alerts: active ones error first, each with its level as a word, and every
   alert raised this match with its count. The routine widget names the routine
   from the channel's labels, or `routine #N` out of range. Subsystems lists
   the drive summary's nodes; `unknown` when the registry could not be read.
 - A widget kind it does not draw is an "Unsupported widget" cell. A message
-  that does not decode is counted on the status line and ignored.
+  that does not decode is counted on the status line. A text message, or a
+  binary one before the connection's first tick, is then ignored; a binary
+  one after it closes the connection and reconnects, since the updates carry
+  only changes and a lost one would leave a value wrong.
 
 ## Add a panel
 
