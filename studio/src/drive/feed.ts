@@ -15,8 +15,12 @@
 //     a dead network path does not wait for the OS to time the socket out.
 //   - Freshness. The telemetry is current while a tick newer than the one
 //     held (a sequence_id that advanced, or a new stream) arrived within
-//     STALE_MS; the bridge's empty update every 100 ms re-sends the held tick
-//     when nothing changed, so a sequence_id that stops means the producer
+//     STALE_MS on this socket, after the first tick it brought. That first
+//     tick is the bridge's connect-time keyframe, which repeats the newest
+//     tick the bridge holds however old (the producer may have died minutes
+//     ago), so it sets the values, shown stale, and never makes them current.
+//     The bridge's empty update every 100 ms re-sends the held tick when
+//     nothing changed, so a sequence_id that stops means the producer
 //     stopped. With the page ticking every RENDER_MS, a value is shown stale
 //     at most STALE_MS + RENDER_MS = 400 ms after its last update, inside
 //     REQ-OPS-36's 500 ms.
@@ -26,7 +30,10 @@
 //     then the RoboRIO link (`hw/status/alert_error_link_lost`). Right after
 //     a socket opens the bridge may still be refilling the slot's bucket
 //     before the dictionary (README: at most about 0.8 s on the 2026 config):
-//     for CONNECTING_GRACE_MS that is `connecting`, not a lost link.
+//     for CONNECTING_GRACE_MS that is `connecting`, not a lost link. After
+//     the keyframe, a live producer's next tick follows within the update
+//     interval or the 100 ms heartbeat; until STALE_MS after the keyframe
+//     that is still `connecting`, then stale telemetry.
 //   - Robustness. A binary or text message that does not decode is counted
 //     and ignored; nothing it carries reaches the views.
 
@@ -145,9 +152,11 @@ export class DriveModel {
   private openedAt = 0;      // when it opened
   private nextAttemptAt = 0; // while waiting
   private lastMessageAt = 0; // any message on the current socket
-  private lastTickAt: number|null = null;  // a tick newer than the held one
+  // A tick newer than the held one, on this socket after its keyframe.
+  private lastTickAt: number|null = null;
   private summaryAt: number|null = null;
-  private tickThisSocket = false;
+  private tickThisSocket = false;  // the connect-time keyframe arrived
+  private keyframeAt = 0;
   private readonly tracked: Set<string>;
   private readonly histories = new Map<string, Point[]>();
 
@@ -224,9 +233,15 @@ export class DriveModel {
               text: 'Telemetry stale: bridge connected, no telemetry for ' +
                   seconds(now - this.openedAt)};
     }
-    if (this.lastTickAt === null || now - this.lastTickAt > STALE_MS)
-      return {link: 'telemetry', text: 'Telemetry stale: no new tick for ' +
-                                       seconds(now - (this.lastTickAt ?? this.openedAt))};
+    if (this.lastTickAt === null) {
+      if (now - this.keyframeAt <= STALE_MS)
+        return {link: 'connecting', text: 'Connected, waiting for a new tick'};
+      return {link: 'telemetry', text: 'Telemetry stale: no new tick in ' +
+                                       seconds(now - this.keyframeAt) + ' since connecting'};
+    }
+    if (now - this.lastTickAt > STALE_MS)
+      return {link: 'telemetry',
+              text: 'Telemetry stale: no new tick for ' + seconds(now - this.lastTickAt)};
     const s = this.latest;
     if (s?.alerts?.[LINK_LOST_CHANNEL] !== undefined) {
       const lost = s.channels[LINK_LOST_CHANNEL];
@@ -241,6 +256,7 @@ export class DriveModel {
     this.detach();
     this.decoder.reset();
     this.tickThisSocket = false;
+    this.lastTickAt = null;
     this.connection = 'connecting';
     this.attemptAt = now;
     this.counters.connects++;
@@ -321,14 +337,20 @@ export class DriveModel {
 
   private onSnapshot(s: Snapshot, now: number) {
     const held = this.latest;
-    const advanced = held === null || s.stream_id !== held.stream_id ||
+    const newer = held === null || s.stream_id !== held.stream_id ||
         BigInt(s.sequence_id) > BigInt(held.sequence_id);
+    const keyframe = !this.tickThisSocket;
     this.latest = s;
-    this.tickThisSocket = true;
-    if (!advanced) return;
-    this.lastTickAt = now;
+    if (keyframe) {
+      this.tickThisSocket = true;
+      this.keyframeAt = now;
+    }
+    if (!newer) return;
     this.alerts.push(s);
     this.record(s);
+    // The connect-time keyframe is as old as the bridge's newest tick, which
+    // the page cannot tell: only a tick after it on this socket is current.
+    if (!keyframe) this.lastTickAt = now;
   }
 
   private record(s: Snapshot) {
