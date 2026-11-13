@@ -315,10 +315,26 @@ class HardwareNode {
   // full_cmd_'s actuator layout. The first occurrence of an id wins, matching
   // a front-to-back search.
   void IndexActuators();
-  // Change-driven publication: send when the merge differs
-  // from the last send, otherwise only on the bounded heartbeat. Timeout
-  // neutralization changes the merge, so it always sends immediately.
-  bool ShouldSendCommand(uint64_t now_us);
+  // When the merged command is next due on the wire, the one rule Tick()
+  // sends by and NextDutyUs() wakes for: `now_us` when it changed since the
+  // last send (or none was sent since the last controller transition), else
+  // the heartbeat, last_send_us_ + heartbeat_us_. While the latest State
+  // says the gateway cannot take a command (GatewayReady false: not
+  // configured and commissioned, not enabled, or faulted), a change of the
+  // observation alone is no change. The demands it would carry are neutral:
+  // the gateway starts a new epoch whenever it stops being ready, so every
+  // request of the latest State's epoch was built from a State that was not
+  // ready either, and nodes flush neutral then (InvalidateRequests dropped
+  // every earlier one). Holding it only lets the gateway's held command look
+  // older, never drive. Every edge back to ready is a controller transition
+  // (a new epoch, or the fault edge), which sends the next merge at once.
+  // The heartbeat carries the newer observation instead, so the rate is one
+  // command per heartbeat whatever the owners' phases. A change of a demand,
+  // an output or an identity word still sends at once. While the gateway can
+  // take a command, every change sends at once: holding the observation
+  // would age the command early at the gateway (ARCHITECTURE.md "The
+  // tick").
+  uint64_t CommandDueUs(uint64_t now_us) const;
   // Every frame to the gateway leaves here: a send that fails with an error
   // the socket never recovers from closes it (SocketCounters). Returns the
   // send's status; kSocketError while the socket is closed.

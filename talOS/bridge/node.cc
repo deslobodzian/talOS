@@ -15,6 +15,7 @@
 #include "bridge/topics.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/os/poller.h"
+#include "talOS/hardware/gate.h"
 #include "talOS/introspection/names.h"
 #include "talOS/process/process.h"
 
@@ -549,15 +550,16 @@ void HardwareNode::Tick(uint64_t now_us) {
   // 3. Send unified command if we have observed state. Active demands retain
   // their request observation; only the final timeout's fully neutral command
   // adopts the latest state so the gateway accepts it. Publication is
-  // change-driven with a bounded heartbeat: each request that changes the
-  // merge (a new sample changes its observation headers) sends at once, and
-  // an unchanged merge resends only when the heartbeat elapses. The
-  // gateway's 100 ms timeout keeps 5x margin over the heartbeat. Subsystem
-  // timeouts still neutralize through the merge, and a changed merge always
-  // sends immediately.
+  // change-driven with a bounded heartbeat (CommandDueUs): a request that
+  // changes the merge sends at once, except that while the gateway cannot
+  // take a command a new observation alone waits for the heartbeat, and an
+  // unchanged merge resends only when the heartbeat elapses. The gateway's
+  // 100 ms timeout keeps 5x margin over the heartbeat. Subsystem timeouts
+  // neutralize through the merge, and a changed demand always sends
+  // immediately.
   if (last_boot_id_ != 0 &&
       (any_subsystem_active || last_sent_had_active_subsystem_)) {
-    if (ShouldSendCommand(now_us)) {
+    if (now_us >= CommandDueUs(now_us)) {
       talos::hardware::Packet cmd_pkt{};
       cmd_pkt.size = static_cast<uint32_t>(Encode(full_cmd_, cmd_pkt.data));
       if (cmd_pkt.size > 0) {
@@ -861,9 +863,15 @@ void HardwareNode::ReportLogFailure() {
   log_failure_reported_ = true;
 }
 
-bool HardwareNode::ShouldSendCommand(uint64_t now_us) {
-  if (!have_last_sent_ || full_cmd_ != last_sent_cmd_) return true;
-  return now_us - last_send_us_ >= heartbeat_us_;
+uint64_t HardwareNode::CommandDueUs(uint64_t now_us) const {
+  if (!have_last_sent_) return now_us;
+  bool changed = full_cmd_ != last_sent_cmd_;
+  if (changed && !GatewayReady(latest_state_)) {
+    Command unobserved = full_cmd_;
+    unobserved.observed_time_us = last_sent_cmd_.observed_time_us;
+    changed = unobserved != last_sent_cmd_;
+  }
+  return changed ? now_us : last_send_us_ + heartbeat_us_;
 }
 
 uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
@@ -900,10 +908,8 @@ uint64_t HardwareNode::NextDutyUs(uint64_t now_us) const {
   }
   if (!socket_closed && last_boot_id_ != 0 &&
       (any_subsystem_active || last_sent_had_active_subsystem_)) {
-    // ShouldSendCommand: a changed merge at once, else the heartbeat.
-    due(!have_last_sent_ || full_cmd_ != last_sent_cmd_
-            ? now_us
-            : last_send_us_ + heartbeat_us_);
+    // Tick's own send rule: a changed merge at once, else the heartbeat.
+    due(CommandDueUs(now_us));
   }
   // No config push: Tick pushes only on receiving a State, which wakes the
   // loop itself.
