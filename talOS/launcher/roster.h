@@ -188,9 +188,13 @@ std::string ResolveBinary(
     const std::map<std::string, std::string>& overrides = {});
 
 // ResolveBinary, falling back to an override keyed by the node's name when
-// the target does not resolve to an executable.
+// the target does not resolve to an executable. `studio_bridge` marks the
+// launcher's own Studio bridge (NodeSpec::studio_bridge); only it falls
+// back to the override named kStudioBridgeName, the bundled bridge
+// (LoadBundle), which a subsystem of that name never runs.
 NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
-                      const LauncherOptions& options);
+                      const LauncherOptions& options,
+                      bool studio_bridge = false);
 
 // The roster: the hardware bridge, the subsystems, the sim gateway under
 // --sim-gateway, and the Studio bridge (NodeSpec::studio_bridge) under

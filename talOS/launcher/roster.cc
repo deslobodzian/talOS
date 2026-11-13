@@ -158,10 +158,12 @@ std::string ResolveBinary(const std::string& target_or_path,
 }
 
 NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
-                      const LauncherOptions& options) {
+                      const LauncherOptions& options, bool studio_bridge) {
   NodeSpec spec{std::string{name}, target,
                 ResolveBinary(target, options.binary_overrides)};
-  if (::access(spec.binary_path.c_str(), X_OK) != 0) {
+  spec.studio_bridge = studio_bridge;
+  if (::access(spec.binary_path.c_str(), X_OK) != 0 &&
+      (studio_bridge || name != kStudioBridgeName)) {
     auto it = options.binary_overrides.find(spec.name);
     if (it != options.binary_overrides.end()) spec.binary_path = it->second;
   }
@@ -212,10 +214,8 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   // deployed robot is viewable too (an observer: see StudioBridge). A bundle
   // without Studio has none; probing a binary it lacks would fail the graph.
   if (options.start_studio_bridge && !BundleWithoutStudio(options)) {
-    NodeSpec bridge =
-        MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge, options);
-    bridge.studio_bridge = true;
-    specs.push_back(std::move(bridge));
+    specs.push_back(MakeNodeSpec(kStudioBridgeName, robot_config.studio.bridge,
+                                 options, /*studio_bridge=*/true));
   }
   return specs;
 }
