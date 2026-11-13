@@ -185,14 +185,19 @@ class ClientTimeout(unittest.TestCase):
                     f"healthy client closed: {healthy.error}")
                 self.assertGreaterEqual(healthy.pings, 1, "the bridge never pinged")
             finally:
+                # Shut down, join, then close: a shutdown wakes the healthy
+                # thread's recv at once, but on macOS closing the descriptor
+                # under it does not, and a close racing its wake left it
+                # waiting out the socket's HANG_S timeout.
                 for sock in sockets:
                     try:
                         sock.shutdown(socket.SHUT_RDWR)
                     except OSError:
                         pass
-                    sock.close()
                 if healthy:
                     healthy.join(HANG_S)
+                for sock in sockets:
+                    sock.close()
                 stop(processes)
                 self.assertEqual(bridge.returncode, 0)
 
