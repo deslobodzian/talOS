@@ -23,6 +23,7 @@ NODES = [
 
 # Every file robot.toml reads besides itself.
 CONFIG_FILES = [
+    "//2026-robot/main_processor/configuration:dashboard.toml",
     "//2026-robot/main_processor/configuration:subsystems/autonomous.toml",
     "//2026-robot/main_processor/configuration:subsystems/driver.toml",
     "//2026-robot/main_processor/configuration:subsystems/drivetrain.toml",
