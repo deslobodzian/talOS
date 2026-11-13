@@ -312,6 +312,7 @@ class PhysicsSimBackend final : public Backend {
     encoders_.clear();
     pwm_outputs_.clear();
     pending_resets_.clear();
+    restoring_.fill(false);
     supply_v_ = 12.0;
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
@@ -361,6 +362,12 @@ class PhysicsSimBackend final : public Backend {
         out.stator_current_a = 0;
         out.temperature_c = 0;
         out.supply_current_a = 0;
+        out.fault_flags = 0;
+        continue;
+      }
+      if (restoring_[i]) {
+        MarkInvalid(out);
+        out.temperature_c = 25.0;
         out.fault_flags = 0;
         continue;
       }
@@ -527,6 +534,8 @@ class PhysicsSimBackend final : public Backend {
   }
   // Restore only reset motors, preserving positions and unrelated motion.
   // The gateway neutralizes dependent motors before starting restoration.
+  // The restored chain reads invalid until a PollRestore that succeeds
+  // (RestoredWith), as on the robot.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
@@ -534,6 +543,9 @@ class PhysicsSimBackend final : public Backend {
     return !reset_ids.empty();
   }
   void BeginRestoreAfterReset(std::span<const uint16_t> ids) override {
+    for (std::size_t i = 0; i < config_.motors.size(); ++i) {
+      if (RestoredWith(config_.motors, i, ids)) restoring_[i] = true;
+    }
     for (auto id : ids) {
       const int i = MotorIndex(id);
       if (i >= 0) {
@@ -553,7 +565,9 @@ class PhysicsSimBackend final : public Backend {
     }
   }
   RestoreStatus PollRestore() override {
-    return restore_fails_ ? RestoreStatus::kFailed : RestoreStatus::kDone;
+    if (restore_fails_) return RestoreStatus::kFailed;
+    restoring_.fill(false);
+    return RestoreStatus::kDone;
   }
   void SetRestoreFails(bool fails) { restore_fails_ = fails; }
   void FreezeFeedback(uint16_t motor_id) {
@@ -591,6 +605,7 @@ class PhysicsSimBackend final : public Backend {
     applied_volts_.fill(0.0);
     powered_.fill(false);
     frozen_.fill(false);
+    restoring_.fill(false);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
     yaw_rot_ = 0.0;
@@ -1032,6 +1047,7 @@ class PhysicsSimBackend final : public Backend {
   double yaw_rate_rps_{0.0};
   std::vector<uint16_t> pending_resets_;
   bool restore_fails_{false};
+  std::array<bool, kMaxMotors> restoring_{};
 };
 
 }  // namespace talos::hardware::sim

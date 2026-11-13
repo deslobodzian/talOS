@@ -654,6 +654,7 @@ TEST(SimBelievability, ResetRestorePreservesPhysicalRotorPosition) {
   ASSERT_GT(state.motors[0].velocity_rps, 0.0);
   const std::array<uint16_t, 1> reset_ids{1};
   backend.BeginRestoreAfterReset(reset_ids);
+  ASSERT_EQ(backend.PollRestore(), Backend::RestoreStatus::kDone);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_DOUBLE_EQ(state.motors[0].position_rot, position);
   EXPECT_DOUBLE_EQ(state.motors[0].velocity_rps, 0.0);
