@@ -140,7 +140,9 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
 - Alerts: active ones error first, each with its level as a word, and every
   alert raised this match with its count. The routine widget names the routine
   from the channel's labels, or `routine #N` out of range. Subsystems lists
-  the drive summary's nodes; `unknown` when the registry could not be read.
+  the drive summary's nodes, each with one state word, the most severe:
+  `FAILING` (quarantined: the launcher paused its restarts, so it is not
+  running), `unknown` when the registry could not be read, `DOWN`, `UP`.
   A widget whose `nodes` names them lists exactly those, one the summary
   does not list reading `unknown`. Failed nodes come first (critical ones
   before others), then one missing from the summary, one driving from a
@@ -156,7 +158,13 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   the `--drive-*` properties `drive.css` reads; `listRowsFit` computes from
   them that at 1366x768 the 2026 layout's subsystems cell holds 20 rows
   (two columns of 10) and its pre-match cell 12 (two of 6), computed, not
-  measured in a browser.
+  measured in a browser. A row too narrow gives up its notes (restarts,
+  drives) first, then its name down to 8 ch (ellipsized; the tooltip has the
+  whole name and the notes), and only then its state word. With 8 px per
+  character assumed (`GLYPH_PX`, a model), the 2026 subsystems columns are
+  154 px and the worst row, `FAILING` with both notes, still shows 8
+  characters of its name, enough to tell `front_left_camera` from
+  `front_right_camera`.
 - A widget kind it does not draw is an "Unsupported widget" cell, and one
   with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line. A text message, or a

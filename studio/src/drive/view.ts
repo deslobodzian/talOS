@@ -168,6 +168,9 @@ function nodeRank(n: SummaryNode|string, summary: DriveSummary): number {
   return n.critical ? 4 : 5;
 }
 
+// A subsystems row's state words (the row width model sizes for the widest).
+export const NODE_STATE = {failing: 'FAILING', down: 'DOWN', up: 'UP', unknown: 'unknown'} as const;
+
 function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): string {
   const summary = model.summary;
   if (!summary) return `<p class="none">${ABSENT}</p>`;
@@ -181,16 +184,21 @@ function subsystemsWidget(model: DriveModel, w: Widget&{kind: 'subsystems'}): st
                     .map(e => e.n);
   const rows = nodes.map(n => {
     if (typeof n === 'string')
-      return `<li><span class="name" title="${esc(n)}">${esc(n)}</span>${tag('unknown', 'neutral')}` +
+      return `<li><span class="name" title="${esc(n)}">${esc(n)}</span>${tag(NODE_STATE.unknown, 'neutral')}` +
           '<span class="meta">not in the summary</span></li>';
-    const alive = !summary.registry ? tag('unknown', 'neutral') :
-        n.alive ? tag('UP', 'good') : tag('DOWN', n.critical ? 'bad' : 'warn');
-    const restarts = summary.supervised && n.restarts > 0 ?
-        `<span class="meta">restarts ${n.restarts}</span>` : '';
-    const quarantined = summary.supervised && n.quarantined ? tag('QUARANTINED', 'bad') : '';
-    const drives = !summary.registry ? '' : n.drives !== null ?
-        `<span class="meta">drives ${esc(n.drives)}</span>` : '';
-    return `<li><span class="name" title="${esc(n.name)}">${esc(n.name)}</span>${alive}${quarantined}${restarts}${drives}</li>`;
+    // One state word, the most severe: a quarantined node is not running
+    // (the launcher paused its restarts), so FAILING says all DOWN would.
+    const state = summary.supervised && n.quarantined ? tag(NODE_STATE.failing, 'bad') :
+        !summary.registry ? tag(NODE_STATE.unknown, 'neutral') :
+        n.alive           ? tag(NODE_STATE.up, 'good') :
+                            tag(NODE_STATE.down, n.critical ? 'bad' : 'warn');
+    const restarts = summary.supervised && n.restarts > 0 ? `restarts ${n.restarts}` : '';
+    const drives = summary.registry && n.drives !== null ? `drives ${n.drives}` : '';
+    // The name's tooltip repeats what a narrow row may cut off.
+    const title = [n.name, restarts, drives].filter(Boolean).join(' · ');
+    return `<li><span class="name" title="${esc(title)}">${esc(n.name)}</span>${state}` +
+        (restarts ? `<span class="meta">${restarts}</span>` : '') +
+        (drives ? `<span class="meta">${esc(drives)}</span>` : '') + '</li>';
   });
   if (summary.omitted > 0 && !w.nodes.length)
     rows.push(`<li class="more">+${summary.omitted} more</li>`);
@@ -314,7 +322,7 @@ function checksWidget(s: Snapshot|null, w: Widget&{kind: 'checks'}): string {
     const pass = checkPasses(s, item);
     const verdict = pass === null ? tag('NO DATA', 'neutral') :
         pass ? tag('OK', 'good') : tag('FAIL', 'bad');
-    return `<li>${verdict}<span class="name">${esc(item.label)}</span></li>`;
+    return `<li>${verdict}<span class="name" title="${esc(item.label)}">${esc(item.label)}</span></li>`;
   });
   return `<ul class="checks">${rows.join('')}</ul>`;
 }
@@ -480,22 +488,34 @@ export const METRICS = {
   min_font: 12,       // no text is smaller
   list_gap: 8,        // between list columns
   node_column: 150,   // the narrowest subsystems column: a name and a state word
-  check_column: 220   // the narrowest checks column: a verdict and a label
+  check_column: 220,  // the narrowest checks column: a verdict and a label
+  item_gap: 4,        // between a row's name, state word and notes
+  tag_pad_x: 5,       // a state word's padding left and right
+  tag_border: 1.5,    // and its border
+  name_min_ch: 8      // a row's name never narrower (in ch), the word shrinks first
 } as const;
+
+// Glyph widths in px, a model the stylesheet cannot state: an average
+// character of a row's name (14 px, semibold, lowercase and `_`) and of a
+// state word (12 px, bold, upper case). Measured system-ui faces are
+// narrower (QUARANTINED, 11 characters, is about 100 px with its padding),
+// so the model errs towards a narrower name.
+export const GLYPH_PX = {name: 8, tag: 8} as const;
 
 export function pageStyle(): string {
   return Object.entries(METRICS)
-      .map(([name, px]) => `--drive-${name.replace(/_/g, '-')}:${px}px`)
+      .map(([name, n]) => `--drive-${name.replace(/_/g, '-')}:${n}${name.endsWith('_ch') ? 'ch' : 'px'}`)
       .join(';');
 }
 
-// How many list rows fit, without scrolling, in the body of a widget at
-// `at` of `layout`'s grid on a `page` of that many px: the rows of one
-// column times the columns of at least `column` px that fit its width (CSS
-// grid `repeat(auto-fill, minmax(column, 1fr))`). Computed from METRICS and
-// the stylesheet's box model, not measured.
-export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
-                            page: {width: number; height: number}, column: number): number {
+// The columns of a list in the body of a widget at `at` of `layout`'s grid
+// on a `page` of that many px: as many of at least `column` px as fit its
+// width (CSS grid `repeat(auto-fill, minmax(column, 1fr))`), each `width`
+// px, and the rows one column shows. Computed from METRICS and the
+// stylesheet's box model, not measured.
+export function listColumns(layout: {columns: number; rows: number}, at: Cell,
+                            page: {width: number; height: number}, column: number):
+    {columns: number; width: number; rows: number} {
   const m = METRICS;
   const gridW = page.width - 2 * m.page_pad;
   const gridH = page.height - 2 * m.page_pad - m.top - m.gap;
@@ -506,7 +526,26 @@ export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
   const bodyW = cellW - 2 * m.cell_border - 2 * m.cell_pad_x;
   const bodyH = cellH - 2 * m.cell_border - 2 * m.cell_pad_y - m.header;
   const columns = Math.max(1, Math.floor((bodyW + m.list_gap) / (column + m.list_gap)));
-  return Math.floor(bodyH / m.row) * columns;
+  return {columns, width: (bodyW - (columns - 1) * m.list_gap) / columns,
+          rows: Math.floor(bodyH / m.row)};
+}
+
+// How many list rows fit, without scrolling, in that body.
+export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
+                            page: {width: number; height: number}, column: number): number {
+  const fit = listColumns(layout, at, page, column);
+  return fit.rows * fit.columns;
+}
+
+// How many characters of a row's name show beside `word` and `notes` notes
+// (restarts, drives: shrunk to nothing first, each still a gap) in a list
+// column `width` px wide, by the GLYPH_PX model: what the row leaves after
+// its gaps and the word's box, less one character for the ellipsis of a cut
+// name.
+export function nameCharsShown(width: number, word: string, notes: number): number {
+  const m = METRICS;
+  const tagW = word.length * GLYPH_PX.tag + 2 * m.tag_pad_x + 2 * m.tag_border;
+  return Math.floor((width - (1 + notes) * m.item_gap - tagW) / GLYPH_PX.name) - 1;
 }
 
 // The page body: the top bar with its status slot, and the grid, holding
