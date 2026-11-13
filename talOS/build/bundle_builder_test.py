@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -55,7 +56,7 @@ class BundleBuilderTest(unittest.TestCase):
         put(launcher, "")
         spec = os.path.join(tmp, "spec.json")
         with open(spec, "w", encoding="utf-8") as f:
-            json.dump({"bundle_name": "b", "launcher_path": launcher,
+            json.dump({"launcher_path": launcher,
                        "config": entries[0], "config_files": entries[1:],
                        "nodes": list(nodes),
                        "default_hardware_node": HARDWARE_NODE,
@@ -255,12 +256,11 @@ class BundleBuilderTest(unittest.TestCase):
     def test_runfiles_the_bundle_cannot_hold_fail(self):
         # A Python node imports from its runfiles only on the robot. A link
         # Bazel left unresolved (a py_binary venv's bin/python3) points into
-        # the runfiles tree, so it is staged as a link that must resolve there.
+        # the runfiles tree, so what it names must be in the bundle.
         interpreter = "rules_python++python+python_3_11/bin/python3"
         venv_python = "_main/py/_node_bin.venv/bin/python3"
         gone = "_main/py/gone.py"
-        for staged, problem in (((interpreter, venv_python), None),
-                                ((venv_python,), venv_python),
+        for staged, problem in (((venv_python,), venv_python),
                                 ((gone,), gone)):
             with self.subTest(staged=staged), tempfile.TemporaryDirectory() as tmp:
                 put(os.path.join(tmp, "src", "python3"), "")
@@ -277,14 +277,63 @@ class BundleBuilderTest(unittest.TestCase):
                 proc = self.assemble(tmp, {"c/robot.toml": "[robot]\n"},
                                      [node(tmp, "hardware_node", HARDWARE_NODE), py],
                                      ["//py:node"])
-                if problem is not None:
-                    self.assertNotEqual(proc.returncode, 0)
-                    self.assertIn(problem, proc.stderr)
-                    continue
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                tree = os.path.join(tmp, "out", "bin", "py.runfiles")
-                self.assertEqual(os.path.realpath(os.path.join(tree, venv_python)),
-                                 os.path.realpath(os.path.join(tree, interpreter)))
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(problem, proc.stderr)
+
+    # REQ-OPS-48
+    def test_a_bundle_restored_from_a_cache_runs_its_python_nodes(self):
+        # A bundle is a tree artifact, and Bazel may hand one back from its
+        # disk or remote cache with each symlink inside it replaced by a copy
+        # of its target (a `bazel test` that restores the bundle as a test's
+        # input did, TODO.md TEST-21). The venv's bin/python3, a link to the
+        # bundled interpreter, then became a copy that looks for its standard
+        # library beside itself, and every Python node died at start with
+        # "No module named 'encodings'". The bundle must run the same whether
+        # built or restored: it holds no symlink, and the venv's interpreter,
+        # run from a copy that dereferences every link, finds its library.
+        interpreter = "rules_python++python+python_3_11/bin/python3"
+        stdlib = "rules_python++python+python_3_11/lib/python3.11/encodings/__init__.py"
+        venv_python = "_main/py/_node_bin.venv/bin/python3"
+        with tempfile.TemporaryDirectory() as tmp:
+            # As CPython does, the stand-in resolves its own links and looks
+            # for its library from where its file is.
+            real = os.path.join(tmp, "src", "python3")
+            put(real, '#!/bin/sh\nhome="$(dirname "$(realpath "$0")")/.."\n'
+                'test -d "$home/lib/python3.11/encodings" || {\n'
+                '  echo "No module named encodings" >&2; exit 1; }\n'
+                'echo "ran $*"\n')
+            os.chmod(real, 0o755)
+            put(os.path.join(tmp, "src", "encodings.py"), "")
+            # Up from the venv's bin/ to the runfiles root, as Bazel
+            # declares it; from src/venv/bin it resolves nowhere.
+            link = os.path.join(tmp, "src", "venv", "bin", "python3")
+            os.makedirs(os.path.dirname(link))
+            os.symlink("../../../../" + interpreter, link)
+            py = dict(node(tmp, "py"), language="python", runfiles=[
+                {"src_path": real, "rf_rel": interpreter},
+                {"src_path": os.path.join(tmp, "src", "encodings.py"),
+                 "rf_rel": stdlib},
+                {"src_path": link, "rf_rel": venv_python}])
+            proc = self.assemble(tmp, {"c/robot.toml": "[robot]\n"},
+                                 [node(tmp, "hardware_node", HARDWARE_NODE), py],
+                                 ["//py:node"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            built = os.path.join(tmp, "out")
+            links = [os.path.relpath(os.path.join(parent, name), built)
+                     for parent, dirs, files in os.walk(built)
+                     for name in dirs + files
+                     if os.path.islink(os.path.join(parent, name))]
+            self.assertEqual(links, [])
+            restored = os.path.join(tmp, "restored")
+            shutil.copytree(built, restored, symlinks=False)
+            for tree in (built, restored):
+                with self.subTest(tree=os.path.basename(tree)):
+                    run = subprocess.run(
+                        [os.path.join(tree, "bin", "py.runfiles", venv_python),
+                         "-c", "pass"],
+                        capture_output=True, text=True, timeout=60)
+                    self.assertEqual((run.returncode, run.stdout),
+                                     (0, "ran -c pass\n"), run.stderr)
 
     def test_run_script_passes_output_root_without_a_session_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:

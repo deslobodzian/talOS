@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import sys
@@ -49,16 +50,31 @@ def safe_copy(src, dest):
     make_writable(dest)
 
 
-def safe_symlink(target, link_path):
-    parent = os.path.dirname(link_path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    if os.path.islink(link_path) or os.path.exists(link_path):
-        if os.path.isdir(link_path) and not os.path.islink(link_path):
-            shutil.rmtree(link_path)
-        else:
-            os.remove(link_path)
-    os.symlink(target, link_path)
+def stage_link(name, rf_dir, rf_rel, link, bundle_root):
+    """Stages the runfile `rf_rel`, a link Bazel declared to `link` (relative
+    to the link's directory in the runfiles tree), without a symlink.
+
+    Bazel may restore a tree artifact from its cache with every symlink in
+    it replaced by a copy of its target, so the bundle holds none and runs
+    the same either way. An executable is staged as a script that execs its
+    target where the bundle holds it: an interpreter finds its library from
+    its own location, so a copy of it elsewhere would not run (a py_binary
+    venv's bin/python3; the node's stage-2 bootstrap then adds the venv's
+    site-packages itself). Any other file is staged as a copy."""
+    dest = os.path.join(rf_dir, rf_rel)
+    target = os.path.normpath(os.path.join(os.path.dirname(dest), link))
+    if not (target.startswith(bundle_root) and os.path.isfile(target)):
+        sys.exit(f"bundle: node '{name}': runfile {rf_rel} links to {link}, "
+                 "which the bundle does not hold")
+    if not os.access(target, os.X_OK):
+        safe_copy(target, dest)
+        return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n"
+                f"# {rf_rel} -> {link}, kept out of the bundle as a link.\n"
+                f'exec "$(dirname "$0")"/{shlex.quote(link)} "$@"\n')
+    make_executable(dest)
 
 
 def node_targets(node):
@@ -171,11 +187,6 @@ def main():
     launcher_dest = os.path.join(out_dir, "launcher")
     safe_copy(launcher_src, launcher_dest)
     make_executable(launcher_dest)
-    bundle_name = spec.get("bundle_name", "")
-    if bundle_name:
-        named_launcher_dir = os.path.join(out_dir, bundle_name)
-        os.makedirs(named_launcher_dir, exist_ok=True)
-        safe_symlink("../launcher", os.path.join(named_launcher_dir, "launcher"))
 
     # 2. Config. Every file keeps its path relative to the others under
     # config/, rooted at their deepest common directory, so the config's
@@ -219,7 +230,7 @@ def main():
     # library, but never two different libraries under one name.
     lib_dir = os.path.join(out_dir, "lib")
     staged_libs = {}
-    bundle_root = os.path.realpath(out_dir) + os.sep
+    bundle_root = out_dir + os.sep
     for node in spec.get("nodes", []):
         name = node["name"]
         lang = node["language"]
@@ -232,8 +243,8 @@ def main():
         # Runfiles. Each is an input of this action, so one that does not
         # exist is a symlink Bazel declared unresolved, such as a py_binary
         # venv's bin/python3. Its target is relative to the runfiles tree, so
-        # it is staged as the same link after the files, and must then resolve
-        # inside the bundle.
+        # it is staged after the files (stage_link), and must name one of
+        # them.
         rf_entries = node.get("runfiles", [])
         if rf_entries:
             rf_dir = os.path.join(bin_dir, f"{name}.runfiles")
@@ -253,12 +264,7 @@ def main():
                 if rf_rel.endswith(".repo_mapping") or rf_rel == "_repo_mapping":
                     repo_mapping_src = rf_src
             for rf_rel, link in links:
-                dest = os.path.join(rf_dir, rf_rel)
-                safe_symlink(link, dest)
-                real = os.path.realpath(dest)
-                if not (real.startswith(bundle_root) and os.path.exists(real)):
-                    sys.exit(f"bundle: node '{name}': runfile {rf_rel} links "
-                             f"to {link}, which the bundle does not hold")
+                stage_link(name, rf_dir, rf_rel, link, bundle_root)
 
             if repo_mapping_src:
                 safe_copy(repo_mapping_src, os.path.join(rf_dir, "_repo_mapping"))

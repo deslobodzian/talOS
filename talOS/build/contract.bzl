@@ -904,7 +904,6 @@ def _talos_bundle_impl(ctx):
         }
 
     spec = {
-        "bundle_name": ctx.label.name,
         "bundle_version": 1,
         "launcher_path": launcher_exec.path,
         "config": {"src_path": ctx.file.config.path, "short_path": ctx.file.config.short_path},

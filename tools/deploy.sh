@@ -245,9 +245,9 @@ cmd_install() {
   # Resolve the operand first: -P would copy a symlinked bundle path (a
   # runfiles entry, a link into bazel-out) as a link, not the bundle.
   bundle="$(cd "$bundle" && pwd -P)" || die "cannot resolve $bundle"
-  # -RP keeps the bundle's relative symlinks (GNU and BSD alike). macOS
-  # `cp -r` dereferences them; a copied venv python3 then cannot find
-  # @executable_path/../lib/libpython3.11.dylib and every Python node fails.
+  # talos_bundle writes no symlinks (Bazel's cache may hand one back as a
+  # copy, docs/DEPLOYMENT.md); -RP copies any other bundle's as links (GNU
+  # and BSD alike), never as copies of what they name.
   run cp -RP "$bundle" "$dest"
   run chmod -R a-w "$dest" 2>/dev/null || true
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
