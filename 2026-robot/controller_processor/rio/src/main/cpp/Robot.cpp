@@ -44,6 +44,14 @@ uint64_t SteadyUs(std::chrono::steady_clock::time_point time) {
 // The gateway's clock and the loop's: microseconds of steady_clock.
 uint64_t NowUs() { return SteadyUs(std::chrono::steady_clock::now()); }
 
+// The same clock in nanoseconds, the tick phases' (RioLog::AddPhase).
+uint64_t NowNs() {
+  return static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 #ifdef __FRC_ROBORIO__
 constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 #else
@@ -352,8 +360,16 @@ void Robot::StartCompetition() {
   // Tick starts, so the logger can report a loop woken late (starved of the
   // CPU) even when each tick's own work is short.
   std::optional<uint64_t> previous_tick_start_us;
+  using talos::rio::TickPhase;
   while (running_.load(std::memory_order_relaxed)) {
-    const uint64_t tick_start_us = NowUs();
+    // The tick's work runs from this clock read to the one before RecordTick,
+    // and its phases cover exactly that span: the backend adds its own
+    // (AddPhase) and the loop closes its phases at each boundary below
+    // (ClosePhase, less the backend's nested inside), so the phases of a tick
+    // sum to the work RecordTick receives.
+    const uint64_t tick_start_ns = NowNs();
+    const uint64_t tick_start_us = tick_start_ns / 1000;
+    log_->BeginTick(tick_start_ns);
     const uint64_t tick_interval_us =
         previous_tick_start_us ? tick_start_us - *previous_tick_start_us : 0;
     previous_tick_start_us = tick_start_us;
@@ -378,6 +394,7 @@ void Robot::StartCompetition() {
     const uint64_t now_us = NowUs();
     const uint32_t mode_flags = DriverStationModeFlags();
     ds_mode.Observe(mode_flags, now_us);
+    log_->ClosePhase(TickPhase::kDriverStation, NowNs());
     auto open_status = talos::protocol::UdpStatus::kOk;
     int open_errno = 0;
     const auto socket_event = socket_retry.Poll(now_us, [&] {
@@ -486,6 +503,8 @@ void Robot::StartCompetition() {
       sent(endpoint_->Tick(
           now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
                       (mode_flags & talos::driver_station::kEStop) == 0));
+      // The socket retry and the endpoint's tick.
+      log_->ClosePhase(TickPhase::kLink, NowNs());
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and
@@ -507,13 +526,18 @@ void Robot::StartCompetition() {
         ds.boot_id = boot_id;
         // Encode() returns 0 if the payload will not fit; send nothing rather
         // than an empty frame the receiver would forward as a decode failure.
-        if (const auto ds_size = talos::driver_station::Encode(ds, ds_buffer)) {
+        const auto ds_size = talos::driver_station::Encode(ds, ds_buffer);
+        log_->ClosePhase(TickPhase::kDriverStation, NowNs());
+        if (ds_size) {
           sent(endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
                                     now_us, ds_buffer.data(), ds_size));
+          log_->ClosePhase(TickPhase::kLink, NowNs());
         }
       }
     } else {
       gateway_->Tick(now_us, false);
+      // The socket retry and the gateway's tick.
+      log_->ClosePhase(TickPhase::kLink, NowNs());
     }
 
     // Arms the watchdog only while a command is in force (a tick without one
@@ -544,7 +568,9 @@ void Robot::StartCompetition() {
       Report(*log_, kPersistMessage, "cannot persist hardware configuration");
     }
 
-    const uint64_t end_us = NowUs();
+    const uint64_t end_ns = NowNs();
+    log_->ClosePhase(TickPhase::kLoop, end_ns);
+    const uint64_t end_us = end_ns / 1000;
     // Start-to-start interval and wake-to-sleep work against the period,
     // which the logger thread reports once a second as late ticks and
     // overruns.

@@ -33,21 +33,37 @@
 // longest work and longest interval. None has a field in State, so all stay
 // RIO-local.
 //
-// Every 10 s it also prints where the backend's part of the ticks went
-// (TickPhase), when that window had ticks: per phase the mean and longest
-// time per tick, and the device counts. The loop thread adds a tick's phases
-// with plain arithmetic and hands a finished window over on the first tick
-// after the logger asks for it: relaxed stores between an acquire fence and a
-// release store, once per window.
+// Every 10 s it also prints where the ticks' work went (TickPhase), when that
+// window had ticks: per phase the mean and longest time per tick, and the
+// device counts. The loop thread adds a tick's phases with plain arithmetic
+// and hands a finished window over on the first tick after the logger asks
+// for it: relaxed stores between an acquire fence and a release store, once
+// per window.
 namespace talos::rio {
 
-// Where the backend's share of a tick goes (PhoenixBackend measures it).
+// Where a tick's work goes. PhoenixBackend measures the backend's phases
+// (AddPhase); the loop (Robot.cpp) measures its own between boundaries
+// (BeginTick, ClosePhase), less the backend's phases nested inside them, so
+// a tick's phases sum to its work, wake to sleep, as RecordTick receives it.
 enum class TickPhase : uint8_t {
   kRefresh,  // BaseStatusSignal::RefreshAll over every device signal
   kDevices,  // per-device validity, latency and reset (HasResetOccurred) pass
   kControl,  // TalonFX SetControl for every motor (Apply or Neutral)
   kHealth,   // CAN status, battery voltage, brownout
-  kOther,    // the rest of Read, Apply, ApplyOutputs and Neutral
+  kOther,    // the rest of the backend's phases in Read, Apply, ApplyOutputs
+             // and Neutral
+  // The loop's: the socket retry, the endpoint's tick (receive, the
+  // gateway's own command and State work, the State send) or, with no socket
+  // open, the gateway's tick alone, and the Driver Station packet's send,
+  // less the backend phases inside them.
+  kLink,
+  // The loop's: reading the Driver Station (RefreshData, the mode report,
+  // the mode flags; the desktop simulation's Driver Station) and sampling
+  // and encoding its packet.
+  kDriverStation,
+  // The loop's: the watchdog beat, the companion report, the config
+  // persister's tick.
+  kLoop,
   kCount,
 };
 
@@ -140,6 +156,15 @@ class RioLog {
   // `phase`, and records the device counts the phase line reports. Plain
   // arithmetic on loop-thread state; RecordTick closes the tick.
   void AddPhase(TickPhase phase, uint64_t duration_ns);
+  // The loop thread: the tick's work starts at `now_ns` (steady clock), its
+  // first phase boundary.
+  void BeginTick(uint64_t now_ns);
+  // The loop thread: adds to `phase` the time from the previous boundary
+  // (BeginTick or ClosePhase) to `now_ns`, less what AddPhase added since
+  // (the backend's phases, nested in the loop's calls), and makes `now_ns`
+  // the next boundary. A tick closed up to its last instant this way has
+  // phases that sum to its work.
+  void ClosePhase(TickPhase phase, uint64_t now_ns);
   void SetTickDevices(std::size_t motors, std::size_t sensors);
   static constexpr uint64_t kPhaseWindowUs = 10'000'000;
 
@@ -220,6 +245,11 @@ class RioLog {
     uint32_t sensors{0};
   };
   std::array<uint64_t, kPhaseCount> tick_phase_ns_{};
+  // This tick's phases summed, and that sum and the time at the last
+  // boundary.
+  uint64_t tick_total_ns_{0};
+  uint64_t boundary_total_ns_{0};
+  uint64_t boundary_ns_{0};
   uint32_t tick_motors_{0};
   uint32_t tick_sensors_{0};
   PhaseWindow phase_window_{};
