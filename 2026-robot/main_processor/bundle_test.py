@@ -30,8 +30,10 @@ import os
 import plistlib
 import select
 import shlex
+import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -374,6 +376,30 @@ class WarmUpTest(unittest.TestCase):
                          old)
         self.assert_warmed_in_turn(os.path.realpath(old), nodes, new, proc)
 
+
+    # REQ-OPS-47
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "only macOS charges a native library's first load")
+    def test_install_loads_each_native_library_once_before_selecting(self):
+        src = os.path.join(self.tmp, "bundle")
+        stub_bundle(src, ("alpha",))
+        rel = "bin/alpha.runfiles/site/mark.cpython-311-darwin.so"
+        os.makedirs(os.path.dirname(os.path.join(src, rel)))
+        shutil.copy(runfiles.Create().Rlocation(
+            "_main/2026-robot/main_processor/bundle_test_native_mark.so"),
+            os.path.join(src, rel))
+        # A library that fails to load (sorted first) stops nothing.
+        with open(os.path.join(os.path.dirname(os.path.join(src, rel)),
+                               "broken.so"), "wb") as f:
+            f.write(b"not a Mach-O file")
+        proc = self.deploy("install", src)
+        bundle = os.path.realpath(os.path.join(self.prefix, "current"))
+        # The installed copy (the charge is per file), loaded once, while
+        # nothing was selected yet.
+        marks = [(os.path.realpath(r[1]), r[2])
+                 for r in self.records() if r[0] == "native"]
+        self.assertEqual(marks, [(os.path.join(bundle, rel), "-")],
+                         proc.stdout + proc.stderr)
 
     # REQ-OPS-47
     def test_a_hung_member_is_killed_at_its_bound(self):

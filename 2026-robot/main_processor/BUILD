@@ -36,11 +36,21 @@ cc_binary(
     deps = ["//talOS/launcher:launcher_lib"],
 )
 
+# bundle_test only: a native library whose load leaves a mark (the
+# warm-up's macOS native-library pass).
+cc_binary(
+    name = "bundle_test_native_mark.so",
+    testonly = True,
+    srcs = ["bundle_test_native_mark.c"],
+    linkshared = True,
+)
+
 py_test(
     name = "bundle_test",
     size = "small",
     srcs = ["bundle_test.py"],
     data = [
+        ":bundle_test_native_mark.so",
         ":bundle_test_stop_timeout",
         ":relocation_bundle",
         ":robot_bundle",

@@ -237,14 +237,23 @@ So `install` and `rollback` run every member of the bundle they are about to
 select once, one at a time, from its final path: each `[[nodes]]` binary of
 `bundle_manifest.toml` and the `[studio]` bridge with
 `--describe --config <config_path>`, as the launcher's probe runs them, and
-the launcher with `--help`. They run from the bundle directory with `bin/`
+the launcher with `--help`. On macOS one more member then loads every
+`.so` and `.dylib` in the bundle once (58 in the 2026 bundle), in a process
+of its own, ignoring each failure: `--describe` imports no backend, so a
+node's first imports (about 2 s of `pose_estimator`'s numpy and wpimath)
+would otherwise still pay. dyld's first mapping of a file pays its charge
+even when the load then fails on an unresolved symbol; reading the file or
+`codesign -v` does not. The loaded libraries' static initializers run in that
+process, nothing calls into them, and it exits without running a destructor.
+Linux skips it. The members run from the bundle directory with `bin/`
 first on `PATH`, Bazel's and Python's environment variables unset (as
 `run.sh` does), and `PYTHONDONTWRITEBYTECODE=1`, so the read-only bundle
 stays as installed even under sudo. A `--describe` run opens no topic,
 socket or registry row, so the warm-up touches no hardware and no network
-and can run beside a running robot. On the Mac mini it takes about 5 s,
-and the first launch then describes in under a second. A member that exits
-nonzero, or is still running after 60 s (then its process group is killed),
+and can run beside a running robot. On the Mac mini it takes about 11 s
+(5 s without the native libraries), and the first launch then describes in
+under a second and constructs `pose_estimator` as fast as the second. A
+member that exits nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
 succeeds: the launch judges its members. A member that detaches a process
 into a new session (`setsid()`) leaves the group that kill reaches. Stopping
