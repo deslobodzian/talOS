@@ -478,7 +478,9 @@ run's are in its `runs`, with the reason it ended; see
 `exit_code` is -1 while a run is live and after a signal ended it, and
 `exit_signal` is that signal's number (0 for none), which the end-of-session
 summary also names (`exit=-1 (signal 2 SIGINT)`); Studio's session panel
-shows it in the exit column and marks the node *killed by signal*.
+shows it in the exit column and marks the node *killed by signal*, except
+a run with reason `stop` ended by the stop's own SIGINT, which it shows as
+stopped.
 
 When the session ends, the launcher exits with 0, or with the last nonzero
 `exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
