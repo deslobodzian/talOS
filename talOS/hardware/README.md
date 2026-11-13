@@ -277,9 +277,15 @@ Duplicate/reordered command sequences, old sessions, expired observations, and
 structural errors reject the whole command. Non-finite or out-of-range motor
 demands/feedforward neutralize only that motor. Per-boot counters report refused
 commands, neutralized motors, apply failures, and device resets. The refused
-count omits a current, all-neutral command while the gateway is disabled,
-uncommissioned or unconfigured: the bridge keeps forwarding those while the
-robot cannot drive. Each command supplies every configured motor in manifest
+count omits two refusals of an all-neutral command (every motor neutral with
+zero demand and feedforward, every digital output off, every PWM output
+zero): a current one while the gateway is disabled, uncommissioned or
+unconfigured, since the bridge keeps forwarding those while the robot cannot
+drive; and one that passes every other check but carries an earlier epoch
+while no command is in force, since the bridge built it from a State read
+before this epoch began (at an enable or a disable, for example). Any other
+refused command counts, an earlier-epoch command that drives an output
+included. Each command supplies every configured motor in manifest
 order.
 The bridge neutralizes omitted subsystem actuators. `/hw/status` exposes the
 latest accepted health sample, motor fault mask, gateway counters and gateway
