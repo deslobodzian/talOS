@@ -241,10 +241,14 @@ can neither refuse nor displace one. A new connection past `drive_clients`
 is accepted, and the oldest held one is closed with WebSocket close code
 **4000** and reason **`replaced by a newer driver dashboard`**, so a laptop
 that reconnects after a Wi-Fi drop always gets in, even while its dead
-connection waits for the idle timeout. A page that reconnects by itself
-after that close takes the slot back from the newer page in turn, so with
-more pages open than `drive_clients` they keep replacing each other. Feed
-clients have the same idle timeout and pings as `/telemetry`.
+connection waits for the idle timeout. A page that receives close 4000
+(`replaced by a newer driver dashboard`) must not reconnect by itself: it
+shows that it was replaced and reconnects only on a user action. On every
+other close or error it reconnects every 1 s. A page that reconnected by
+itself after 4000 would take the slot back from the newer page in turn,
+so with more pages open than `drive_clients` they would keep replacing
+each other and the Driver Station's page would flap. Feed clients have
+the same idle timeout and pings as `/telemetry`.
 
 **Budget.** Each slot has its own token bucket of the layout's
 `budget_bytes_per_s` with the 64,000 B burst, and a feed client is charged,
