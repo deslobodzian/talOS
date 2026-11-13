@@ -144,14 +144,21 @@ uint32_t ConfigPersister::Tick(bool disabled) {
   const auto failed = static_cast<uint32_t>(failed_ - collected_failed_);
   collected_failed_ = failed_;
   on_disk_id_ = saved_id_;
-  if (!unsaved_ || !disabled) return failed;
-  // A configuration handed over but not yet started is superseded: its save
-  // never runs, so it was never outstanding twice.
-  if (!pending_) ++outstanding_;
-  pending_ = std::move(unsaved_);
-  unsaved_.reset();
+  // A saved configuration comes back to be freed here, after the unlock: its
+  // memory is this thread's (see done_).
+  std::optional<hardware::Config> saved = std::move(done_);
+  done_.reset();
+  bool wake = saved.has_value() && pending_.has_value();
+  if (unsaved_ && disabled) {
+    // A configuration handed over but not yet started is superseded: its
+    // save never runs, so it was never outstanding twice.
+    if (!pending_) ++outstanding_;
+    pending_ = std::move(unsaved_);
+    unsaved_.reset();
+    wake = true;
+  }
   lock.unlock();
-  wake_.notify_one();
+  if (wake) wake_.notify_one();
   return failed;
 }
 
@@ -163,20 +170,31 @@ void ConfigPersister::Run() {
 #endif
   std::unique_lock lock{mutex_};
   for (;;) {
-    wake_.wait(lock, [this] { return pending_.has_value() || stop_; });
+    // The next save waits for the loop to take the last one back (done_),
+    // except when stopping.
+    wake_.wait(lock, [this] {
+      return (pending_.has_value() && !done_.has_value()) || stop_;
+    });
     // Stop saves what was handed over first.
     if (!pending_) return;
-    const hardware::Config config = std::move(*pending_);
+    // Moves the configuration's storage, and leaves pending_ empty with
+    // nothing to free.
+    hardware::Config config = std::move(*pending_);
     pending_.reset();
     lock.unlock();
     const bool ok = save_(config);
+    const uint64_t id = ok ? hardware::ConfigurationId(config) : 0;
     lock.lock();
     ++finished_;
     if (ok) {
-      saved_id_ = hardware::ConfigurationId(config);
+      saved_id_ = id;
     } else {
       ++failed_;
     }
+    // Back to the loop thread, which allocated it, to free: `config` is left
+    // empty. Only while stopping, when the loop no longer ticks, can done_
+    // still hold the last one; this thread frees that.
+    done_ = std::move(config);
   }
 }
 

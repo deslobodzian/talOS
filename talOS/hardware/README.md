@@ -33,7 +33,9 @@ saves acknowledged configuration bytes with a CRC32 to
 configuration over on its first disabled tick after the acknowledgement, and
 a saver thread (`talos-config`, nice 19) syncs storage while the loop ticks
 on: the loop only try-locks the handover, never waits on the save, and polls
-its outcome on later ticks. A configuration acknowledged while a save runs is
+its outcome on later ticks, taking the saved configuration back to free
+itself (the saver frees nothing the loop allocated, so it never holds an
+allocator lock the loop could wait on). A configuration acknowledged while a save runs is
 saved after it, newest last; a failed save prints `cannot persist hardware
 configuration`, keeps the previous file, and an identical push saves it
 again. Startup validates
