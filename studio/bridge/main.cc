@@ -558,6 +558,44 @@ T* WatchedUser(us_internal_callback_t* callback) {
   std::memcpy(bytes.data(), callback + 1, bytes.size());
   return static_cast<T*>(std::bit_cast<void*>(bytes));
 }
+// Cache-Control (REQ-OPS-34). Studio's Vite build names every asset it
+// emits under assets/ `<name>-<hash>.<ext>`, the hash eight characters of
+// base64url (Rollup's default; its alphabet includes '-' and '_'): such a
+// file never changes under its name, so a browser keeps it for a year.
+// Every other static file, index.html and drive.html above all, is
+// revalidated on each load (`no-cache`), so a deploy's new page and the
+// asset names it carries are seen at once. The JSON the bridge generates
+// (or re-reads, like the manifest) is a live snapshot with no validator to
+// revalidate against, so it is never stored (`no-store`).
+constexpr std::string_view kImmutableCacheControl =
+    "public, max-age=31536000, immutable";
+constexpr std::string_view kRevalidateCacheControl = "no-cache";
+constexpr std::string_view kLiveCacheControl = "no-store";
+constexpr std::size_t kAssetHashChars = 8;
+
+// Whether `relative` (a path under the webroot) is a content-hashed asset.
+bool ContentHashed(const fs::path& relative) {
+  auto part = relative.begin();
+  if (part == relative.end() || *part != "assets") return false;
+  if (++part == relative.end()) return false;
+  const fs::path& name = *part;
+  if (++part != relative.end()) return false;  // not directly under assets/
+  const std::string stem = name.stem().string();
+  if (name.extension().empty() || stem.size() < kAssetHashChars + 2 ||
+      stem[stem.size() - kAssetHashChars - 1] != '-') {
+    return false;
+  }
+  return std::all_of(stem.end() - kAssetHashChars, stem.end(), [](char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_';
+  });
+}
+
+std::string_view CacheControl(const fs::path& relative) {
+  return ContentHashed(relative) ? kImmutableCacheControl
+                                 : kRevalidateCacheControl;
+}
+
 std::string mime(const fs::path& p) {
   auto ext = p.extension().string();
   if (ext == ".html") return "text/html; charset=utf-8";
@@ -896,6 +934,7 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(bridge.layout_json);
   });
   app.get("/telemetry.json", [&](auto* res, auto*) {
@@ -909,6 +948,7 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(studio::TelemetryJson(bridge.telemetry_state,
                                     talos::introspect::monotonic_now_ns()));
   });
@@ -919,11 +959,13 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(studio::ChannelsJson(bridge.telemetry_state));
   });
   app.get("/system.json", [&](auto* res, auto*) {
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(bridge.system_graph.json);
   });
   app.get("/declared.json", [&](auto* res, auto*) {
@@ -936,6 +978,7 @@ int main(int argc, char** argv) try {
     }
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(declared_json);
   });
   app.get("/manifest.json", [&](auto* res, auto*) {
@@ -965,6 +1008,7 @@ int main(int argc, char** argv) try {
     std::string body((std::istreambuf_iterator<char>(input)), {});
     res->writeHeader("Content-Type", "application/json")
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", kLiveCacheControl)
         ->end(body);
   });
   app.get("/*", [&](auto* res, auto* req) {
@@ -1004,6 +1048,7 @@ int main(int argc, char** argv) try {
     std::string body((std::istreambuf_iterator<char>(input)), {});
     res->writeHeader("Content-Type", mime(file))
         ->writeHeader("X-Content-Type-Options", "nosniff")
+        ->writeHeader("Cache-Control", CacheControl(relative))
         ->end(body);
   });
   bool listening = false;

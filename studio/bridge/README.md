@@ -58,6 +58,14 @@ The manual runtime command still takes its topic positionally.
 | `/drive/layout.json` | The driver dashboard's layout (`DashboardLayoutJson`) | 404 without a layout |
 | `/drive` | WebSocket upgrade: the [driver dashboard feed](#driver-dashboard-feed); any other GET: `drive.html` from the web directory | 404 without a layout (the upgrade); 404 without the file (the page) |
 
+Every 200 carries `Cache-Control` (REQ-OPS-34):
+
+| Response | `Cache-Control` | Why |
+|---|---|---|
+| A content-hashed asset: a file directly under `assets/` named `<name>-<hash>.<ext>`, the hash 8 characters of `A-Za-z0-9_-` (what Studio's Vite build emits) | `public, max-age=31536000, immutable` | its bytes never change under that name |
+| Every other static file: `index.html` and `drive.html` however reached (`/`, `/index.html`, `/drive`, `/drive.html`), a favicon, an unhashed file under `assets/` | `no-cache` | revalidated on every load, so a deploy's new page, and the asset names it carries, is seen at once |
+| The JSON endpoints (`/channels.json`, `/telemetry.json`, `/system.json`, `/declared.json`, `/manifest.json`, `/drive/layout.json`) | `no-store` | live snapshots with no validator to revalidate against, so never stored |
+
 For example:
 
 ```sh
