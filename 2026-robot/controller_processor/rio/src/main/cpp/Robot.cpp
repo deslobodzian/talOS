@@ -610,11 +610,15 @@ void Robot::StartCompetition() {
   // record for that test, which finds it by its start
   // (tools/test_drivetrain.py SUMMARY), not a line to place in time.
   const auto final_state = gateway_->snapshot();
+  // A configuration may have no motor (REQ-CONTRACT-35): then no wheel moved,
+  // as sim_gateway prints it.
+  const bool has_wheel = final_state.motor_count > 0;
   std::printf(
       "sim_robot: active_ticks=%llu first_wheel_rotations=%.6f "
       "first_wheel_rps=%.6f command_active=%d\n",
       static_cast<unsigned long long>(active_ticks),
-      final_state.motors[0].position_rot, final_state.motors[0].velocity_rps,
+      has_wheel ? final_state.motors[0].position_rot : 0.0,
+      has_wheel ? final_state.motors[0].velocity_rps : 0.0,
       (final_state.flags & talos::hardware::kCommandActive) != 0);
   std::fflush(stdout);
 #endif
