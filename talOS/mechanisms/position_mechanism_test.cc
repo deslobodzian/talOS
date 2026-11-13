@@ -147,6 +147,23 @@ home_margin_rot = 0.2
 homing_timeout_us = 500000
 homing_stall_rps = 0.05
 homing_stall_us = 200000
+
+[subsystems.carriage.motors.carriage]
+can_id = 11
+[subsystems.carriage.digital_inputs.carriage_home]
+dio = 1
+[subsystems.carriage.carriage]
+tolerance_rot = 0.01
+min_rot = 0.0
+max_rot = 2.0
+homing = "limit_switch"
+limit_switch = "carriage_home"
+homing_v = -1.0
+home_samples = 2
+home_margin_rot = 0.2
+homing_timeout_us = 500000
+homing_stall_rps = 0.05
+homing_stall_us = 200000
 )";
 
 // A robot node around one PositionMechanism: its goal is the teleop lane's,
@@ -751,6 +768,54 @@ TEST(PositionMechanism, LimitSwitchHomingUpwardAndAStuckSwitch) {
   top.Drive(1.0, 20ms);
   EXPECT_EQ(top.mech().fault(), PositionFault::kSwitchStuck);
   top.ExpectNeutral();
+}
+
+// A switch reading counts only while its sample is valid
+// (DigitalInput::connected()). An input that stops answering, or a gateway
+// still configuring, sends an invalid sample; SimHardware's reads false,
+// which is closed for the carriage's normally open switch: it must not home
+// the carriage where it is, an invalid reading breaks a run of closed ones
+// as a disconnected motor ends a homing push's evidence, and on a homed
+// carriage it is not a stuck switch.
+// REQ-SAFE-36
+TEST(PositionMechanism, LimitSwitchHomingIgnoresAnInvalidSwitchSample) {
+  Rig carriage{"carriage"};
+  carriage.SetMotor(1.0, -0.5);  // moving down: no stall
+  carriage.hw.set_digital_input("carriage", "carriage_home", true);  // open
+  carriage.Start();
+  carriage.Drive(0.5, 30ms);
+  carriage.ExpectHoming(-1.0);
+
+  carriage.hw.set_connected("carriage", "carriage_home", false);
+  carriage.Drive(0.5, 50ms);  // ten invalid "closed" readings; home_samples 2
+  carriage.ExpectHoming(-1.0);
+  EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+
+  // Valid closed, invalid, valid closed: not two consecutive closed readings.
+  // The node reads each State on its tick after SimHardware publishes it, so
+  // these ticks read: invalid, valid closed, invalid twice, valid closed.
+  carriage.hw.set_digital_input("carriage", "carriage_home", false);  // closed
+  carriage.hw.set_connected("carriage", "carriage_home", true);
+  carriage.Drive(0.5, 5ms);
+  carriage.hw.set_connected("carriage", "carriage_home", false);
+  carriage.Drive(0.5, 10ms);
+  carriage.hw.set_connected("carriage", "carriage_home", true);
+  carriage.Drive(0.5, 10ms);
+  carriage.ExpectHoming(-1.0);
+  carriage.Drive(0.5, 5ms);  // the second consecutive valid closed reading
+  ASSERT_TRUE(carriage.mech().homed());
+  EXPECT_NEAR(carriage.mech().position_rot(), 0.0, 1e-9);
+
+  // Homed and 0.5 into its travel, the switch open, then invalid.
+  carriage.SetMotor(1.5);
+  carriage.hw.set_digital_input("carriage", "carriage_home", true);
+  carriage.Drive(0.5, 20ms);
+  EXPECT_EQ(carriage.mech().phase(), PositionPhase::kAtGoal);
+  carriage.hw.set_connected("carriage", "carriage_home", false);
+  carriage.Drive(0.5, 20ms);
+  EXPECT_EQ(carriage.mech().fault(), PositionFault::kNone);
+  EXPECT_EQ(carriage.mech().phase(), PositionPhase::kAtGoal);
+  EXPECT_EQ(carriage.Applied().mode, Mode::kMotionMagic);
 }
 
 // Absolute homing takes the frame from the CANcoder (scaled, offset) without

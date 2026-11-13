@@ -100,8 +100,9 @@ false. With a live, finite target it drives the lift down at `homing_v` volts
 does not hold and which the TalonFX bounds by the lift's current and voltage
 limits. Once the switch has read closed on `home_samples` consecutive elevator
 periods (default 3) it calls `rezero(0)` and goes on to the target's goal in
-the same tick; until then homing keeps driving, and any open reading restarts
-the count, so a one-tick glitch mid-travel does not zero the lift partway up.
+the same tick; until then homing keeps driving, and any open reading, or a
+sample that is not `connected()`, restarts the count, so a one-tick glitch
+mid-travel does not zero the lift partway up.
 A lift already on the switch zeroes there without moving, whether or not the
 robot is enabled.
 
