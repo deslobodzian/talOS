@@ -651,24 +651,6 @@ TEST(VisionTest, AbsoluteTruthJumpsAndCameraRestartsNeverReseedTheWorld) {
   check(restarted, truth);
 }
 
-TEST(VisionTest, RejectsInvalidSyntheticExposureAndSensorConfiguration) {
-  for (const auto* key :
-       {"sensor_noise_std_gray", "exposure_gain_std", "exposure_ms"}) {
-    for (const auto* value : {"-1.0", "nan", "inf"}) {
-      SCOPED_TRACE(std::string(key) + "=" + value);
-      std::ostringstream text;
-      text << "include = "
-           << std::quoted(
-                  std::filesystem::absolute(Runfile("TALOS_TEST_CONFIG"))
-                      .string())
-           << "\n[subsystems.front_left_camera.camera]\n"
-           << key << " = " << value << '\n';
-      auto sim = talos::testing::Sim::FromToml(text.str());
-      EXPECT_THROW(sim.add<Vision>("front_left_camera"), std::runtime_error);
-    }
-  }
-}
-
 talos::testing::Sim WithCameraOverride(const char* section, const char* key,
                                        const char* value) {
   std::ostringstream text;
@@ -1312,7 +1294,22 @@ TEST(VisionTest, BadParameterFailsConstruction) {
       rows.push_back({".camera", key, value, false});
     }
   }
+  for (const char* key :
+       {"sensor_noise_std_gray", "exposure_gain_std", "exposure_ms"}) {
+    for (const char* value : {"-1.0", "nan", "inf"}) {
+      rows.push_back({".camera", key, value, false});
+    }
+  }
   for (const Row& row : {
+           Row{".camera", "fx", "0.0", false},
+           Row{".camera", "cy", "nan", false},
+           Row{".camera", "x_m", "nan", false},
+           Row{".camera", "yaw_rad", "inf", false},
+           Row{".camera", "max_range_m", "0.0", false},
+           Row{".camera", "min_tag_px", "-1.0", false},
+           Row{".camera", "facing_min", "1.5", false},
+           Row{".camera", "pixel_noise_std", "nan", false},
+           Row{".camera", "rng_seed", "-1", false},
            Row{".camera", "mount_angle_std_rad", "-1", false},
            Row{".camera", "mount_angle_std_rad", "nan", false},
            Row{".camera", "mount_translation_std_m", "-0.1", false},
