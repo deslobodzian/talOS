@@ -285,7 +285,7 @@ class BundleBuilderTest(unittest.TestCase):
         # A bundle is a tree artifact, and Bazel may hand one back from its
         # disk or remote cache with each symlink inside it replaced by a copy
         # of its target (a `bazel test` that restores the bundle as a test's
-        # input did, TODO.md TEST-21). The venv's bin/python3, a link to the
+        # input did). The venv's bin/python3, a link to the
         # bundled interpreter, then became a copy that looks for its standard
         # library beside itself, and every Python node died at start with
         # "No module named 'encodings'". The bundle must run the same whether
