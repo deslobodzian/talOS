@@ -201,6 +201,43 @@ def request_to_command(records):
     return process, delays
 
 
+def alert_summary(records):
+    """Each alert that was ever active, as `<topic>/<field path>`: its level,
+    the stream it was read from, its first activation, activation count, and
+    longest and total active time, from the `alerts` log_dump puts on a status
+    topic's records (log_dump names the fields; nothing here parses a name).
+    Times are publication times (publish_ms), so a reader's receipt delay
+    does not stretch an interval: an alert is active from the first record
+    showing it true to the first showing it false, or, still active at the
+    end, to its topic's last record."""
+    summary = {}
+    for topic in sorted({r["topic"] for r in records if r.get("alerts")}):
+        source, rows = stream(records, topic)
+        rows = sorted((r for r in rows if r.get("alerts")), key=lambda r: r["publish_ms"])
+        since, intervals, levels = {}, {}, {}
+        for r in rows:
+            for alert in r["alerts"]:
+                name = alert["name"]
+                levels[name] = alert["level"]
+                intervals.setdefault(name, [])
+                if alert["active"] and name not in since:
+                    since[name] = r["publish_ms"]
+                elif not alert["active"] and name in since:
+                    intervals[name].append((since.pop(name), r["publish_ms"]))
+        for name, start in since.items():
+            intervals[name].append((start, rows[-1]["publish_ms"]))
+        for name, spans in intervals.items():
+            if not spans:
+                continue
+            durations = [end - start for start, end in spans]
+            summary[f"{topic}/{name}"] = {
+                "level": levels[name], "stream": source,
+                "first_active_ms": spans[0][0], "activations": len(spans),
+                "longest_ms": max(durations), "total_ms": sum(durations),
+                "active_at_end": name in since}
+    return dict(sorted(summary.items()))
+
+
 def analyze(manifest, records, log_damage=(), output_drops=None):
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
@@ -353,10 +390,14 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
             "timer_lateness": {k: stats(v) for k, v in sorted(timers.items())},
             "bridge_request_to_command": {"process": bridge, "latency": stats(bridge_delays)},
             "never_enabled": never_enabled,
-            "status_stream": status_source, "status": status_summary, "verdicts": verdicts,
+            "status_stream": status_source, "status": status_summary,
+            # alert_summary(); informational, as the operator-visibility
+            # design has it: --strict does not judge alerts.
+            "alerts": alert_summary(records), "verdicts": verdicts,
             "limitations": ["State timing is bridge IPC publication or one consumer dispatch stream, not raw UDP arrival; never pooled duplicate readers.",
                             "Enabled uses the logged DS enabled bit, held until its next observation; DS silence is not proof of continued physical enablement.",
                             "Bridge request to command runs from the requesting tick's start to the command's publication on /hw/command, not its delivery to the RoboRIO: a command whose UDP send failed is still counted (the bridge's send_failures, on its exit line, says whether any did); with several owners the merged observation can be another owner's older request, overstating it.",
+                            "Alert times are publication times of their status topic: an alert is timed from the first record showing it active to the first showing it clear (or that topic's last record), so a topic published every P ms resolves them to P, and a publisher that stops (a crash) holds its last state until its next record.",
                             "Counter deltas exclude unknown increments before the first sample and during resets; clock mapping is not absolute synchronization.",
                             "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."]}
 
@@ -437,6 +478,18 @@ def markdown(report):
     lines += ["", "## /hw/status", f"Stream: {report['status_stream'] or 'NOT MEASURED'}"]
     for field, values in report["status"].items():
         lines.append(f"- {field}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
+    lines += ["", "## Alerts",
+              "Informational, not judged by --strict. Publication times in ms; first "
+              "activation from the start of the log."]
+    if report["alerts"]:
+        lines += ["| Alert | Level | First active | Activations | Longest | Total | Active at end |",
+                  "|---|---|---:|---:|---:|---:|---|"]
+        lines += [f"| {name} | {a['level']} | {a['first_active_ms']:.6g} | {a['activations']} | "
+                  f"{a['longest_ms']:.6g} | {a['total_ms']:.6g} | "
+                  f"{'yes' if a['active_at_end'] else 'no'} |"
+                  for name, a in report["alerts"].items()]
+    else:
+        lines.append("- no alert was active")
     lines += ["", "## Verdicts"]
     lines += [f"- **{v['verdict']}** {v['measurement']}" +
               ("" if v["required"] else " (informational, not required)") + f": {v['detail']}"

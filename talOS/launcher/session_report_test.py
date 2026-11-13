@@ -130,6 +130,46 @@ class SessionReportTest(unittest.TestCase):
         self.assertEqual(report["status"]["clock_offset_valid"]["fraction"], 2 / 3)
         self.assertEqual(report["status"]["clock_uncertainty_us"]["min"], 2)
 
+    # REQ-OPS-37: per alert, its first activation, activation count, and
+    # longest and total active time, from the `alerts` log_dump put on the
+    # publisher's status records, timed by publication: each record here is
+    # received 0 to 9 ms after it was published, and a reader's copies of the
+    # topic, received later still, are never pooled with the publisher's.
+    def test_alerts_report_activations_and_active_time_by_publication(self):
+        def record(process, kind, publish, delay, link_lost, hot):
+            return dict(process=process, kind=kind, topic="/watchdog/status",
+                        publish_ms=publish, now_ms=publish + delay, event_ms=publish + delay,
+                        # An `alert_` field naming no level: log_dump gives
+                        # it no `alerts` entry, and the report reads none.
+                        decoded="{alert_critical_overheat: true}",
+                        alerts=[{"name": "alert_error_link_lost", "level": "error",
+                                 "active": link_lost},
+                                {"name": "health.alert_warning_hot", "level": "warning",
+                                 "active": hot},
+                                {"name": "alert_info_homed", "level": "info",
+                                 "active": False}])
+        # link_lost rises at 20, falls at 40, rises at 55 and is still active
+        # at the topic's last record, 60; hot is active from 35 to 40.
+        timeline = ((10, 1, False, False), (20, 9, True, False), (35, 0, True, True),
+                    (40, 6, False, False), (55, 2, True, False), (60, 3, True, False))
+        records = [record("watchdog", "SEND", *row) for row in timeline]
+        records += [record("telemetry", "MESSAGE", publish, 50, True, True)
+                    for publish, *_ in timeline]
+        manifest = {"end_wall_ns": 1, "nodes": []}
+        report = session_report.analyze(manifest, records)
+        self.assertEqual(report["alerts"], {
+            "/watchdog/status/alert_error_link_lost": {
+                "level": "error", "stream": "watchdog/SEND", "first_active_ms": 20,
+                "activations": 2, "longest_ms": 20, "total_ms": 25, "active_at_end": True},
+            "/watchdog/status/health.alert_warning_hot": {
+                "level": "warning", "stream": "watchdog/SEND", "first_active_ms": 35,
+                "activations": 1, "longest_ms": 5, "total_ms": 5, "active_at_end": False}})
+        self.assertIn("| /watchdog/status/alert_error_link_lost | error | 20 | 2 | 20 | 25 | yes |",
+                      session_report.markdown(report).splitlines())
+        # Informational: an error alert does not change what --strict rejects.
+        self.assertEqual(session_report.strict_failures(report),
+                         session_report.strict_failures(session_report.analyze(manifest, [])))
+
     def test_target_age_at_tick_limit(self):
         def record(kind, topic, now, age_ms=0, **extra):
             return dict(process="lift", kind=kind, topic=topic, now_ms=now, event_ms=now,
