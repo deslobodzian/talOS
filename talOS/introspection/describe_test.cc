@@ -56,6 +56,7 @@ void ExpectSameDescription(const Description& written,
   EXPECT_EQ(read.name, written.name);
   EXPECT_EQ(read.target, written.target);
   EXPECT_EQ(read.reads_graph, written.reads_graph);
+  EXPECT_EQ(read.holds_stop, written.holds_stop);
   EXPECT_EQ(read.params, written.params);
   ASSERT_EQ(read.sources.size(), written.sources.size());
   for (std::size_t i = 0; i < written.sources.size(); ++i) {
@@ -97,6 +98,7 @@ TEST(Describe, RoundTripsEveryField) {
        {"/drivetrain/target", naming::kSourceFlagOptional},
        {"/driver_station/state", naming::kSourceFlagObserver}});
   written.reads_graph = true;
+  written.holds_stop = true;
   written.params = {{"drivetrain", "geometry.modules[0].x_m"},
                     {R"(od"d)", "sources"},
                     {"describe_version", R"(odd]}{["key)"}};

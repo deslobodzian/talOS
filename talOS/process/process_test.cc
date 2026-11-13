@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 #include <poll.h>
 #include <pthread.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <csignal>
@@ -80,6 +82,41 @@ TEST(ProcessTest, RepeatedStopsNeverBlockAndStaleWakesAreReadOut) {
   EXPECT_TRUE(Readable(StopFd()));  // for every other watcher
   stop_requested.store(false);
   EXPECT_FALSE(ConsumeStopWake());
+}
+
+// A stop sent to a node the launcher started with the stop signals blocked
+// (a member whose --describe says holds_stop) while its runtime was still
+// starting stays pending, and becomes the node's stop the moment it installs
+// its handlers: stop_requested is set when InstallStopHandlers returns. Here
+// the signal is process-directed, as the launcher's kill of the member's
+// group is, and arrives before the handlers exist. Each row runs in a forked
+// child, whose exit code is the flag: 0 for a requested stop, 1 for a stop
+// still pending or lost.
+// REQ-OPS-06
+TEST(ProcessTest, AStopHeldSinceStartIsTakenOnceTheHandlersAreInstalled) {
+  for (const int signal : {SIGINT, SIGTERM}) {
+    SCOPED_TRACE(signal);
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+      stop_requested.store(false);
+      sigset_t held;
+      sigemptyset(&held);
+      for (const int stop : kHeldStopSignals) sigaddset(&held, stop);
+      ::pthread_sigmask(SIG_BLOCK, &held, nullptr);
+      ::kill(::getpid(), signal);
+      InstallStopHandlers();
+      ::_exit(stop_requested.load() ? 0 : 1);
+    }
+    int status = 0;
+    ASSERT_EQ(::waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status))
+        << "the held signal ended the process (signal "
+        << (WIFSIGNALED(status) ? WTERMSIG(status) : 0) << ")";
+    EXPECT_EQ(WEXITSTATUS(status), 0)
+        << "no stop requested once the handlers were installed: the held "
+           "signal is still pending";
+  }
 }
 
 // A child a node execs must not inherit the stop pipe, and a watcher reading

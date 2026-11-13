@@ -1179,7 +1179,7 @@ std::string ConfigFlag() {
   return "--config '" + Runfile("TALOS_TEST_CONFIG") + "'";
 }
 
-// REQ-CONTRACT-12
+// REQ-CONTRACT-12, REQ-OPS-06
 TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   const Result result = RunBinary("--describe " + ConfigFlag());
   ASSERT_EQ(result.status, 0) << result.output;
@@ -1192,6 +1192,9 @@ TEST(Binary, DescribeListsEveryEndpointIncludingOptionalOnes) {
   EXPECT_EQ(described.name, "test_node");
   EXPECT_EQ(described.target, "//talOS/node:test_node");
   EXPECT_FALSE(described.reads_graph);
+  // A run installs the stop handlers first thing, so the launcher may hold
+  // a stop through its start-up.
+  EXPECT_TRUE(described.holds_stop);
   // The constructor's one param read is the node's declared parameter.
   EXPECT_EQ(described.params,
             (std::vector<introspect::ParamRead>{{"test_node", "step"}}));

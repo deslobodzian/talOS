@@ -1,11 +1,12 @@
 #pragma once
 
-// Process-lifetime plumbing shared by every talOS node binary: stop signals
+// Process-lifetime plumbing shared by every talOS node binary: stop signals,
 // the realtime scheduling of the thread that runs the loop, and the
 // background scheduling of helper threads.
 
 #include <signal.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -46,6 +47,16 @@ int StopFd() noexcept;
 // lost.
 bool ConsumeStopWake() noexcept;
 
+// The signals a supervisor may hold in a process it starts until that
+// process handles a stop: SIGINT and SIGTERM, which InstallStopHandlers
+// takes, and SIGHUP, which keeps its default action. A binary whose
+// --describe says `holds_stop` (introspect::Description) may be started with
+// these blocked, so that a stop sent while its runtime is still starting (an
+// interpreter importing its modules, which would turn a SIGINT into
+// KeyboardInterrupt and an exit 1) stays pending until InstallStopHandlers
+// unblocks them.
+inline constexpr std::array kHeldStopSignals{SIGINT, SIGTERM, SIGHUP};
+
 // SIGINT and SIGTERM call RequestStop instead of ending the process, and the
 // stop pipe exists before either can arrive. The handlers restart an
 // interrupted system call (SA_RESTART): a stop must not turn a blocking call
@@ -54,6 +65,16 @@ bool ConsumeStopWake() noexcept;
 // select, sleeps and timed socket calls still return EINTR); the launcher
 // escalates to SIGKILL after its grace period. std::signal already installed
 // restarting handlers, so behaviour after construction is unchanged.
+//
+// Then it unblocks kHeldStopSignals on the calling thread (pthread_sigmask),
+// so call it from the thread that is to take a stop, the main thread: a
+// signal the process received while they were blocked is delivered to it
+// before this returns, and a held SIGINT or SIGTERM therefore reads as a
+// requested stop here (a held SIGHUP ends the process, as it would have on
+// arrival). Threads created before the call keep their mask, so with the
+// signals held from the start they never take a stop. In a process started
+// with none of them blocked (by hand, `bazel run`, a test) the unblock
+// changes nothing.
 void InstallStopHandlers();
 
 struct RealtimeOptions {

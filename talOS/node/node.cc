@@ -1320,11 +1320,16 @@ int RunMain(int argc, char** argv, const char* node_name,
       const Hosted hosted =
           Host(std::make_unique<OfflinePort<event::SimulatedEventLoop<>>>(loop),
                node_name, flags, make);
-      std::printf("%s",
-                  introspect::DescribeToJson(
-                      DescribeNode(*hosted.node, node_target, loop.manifest(),
-                                   introspect::LoopSourceFlags(loop)))
-                      .c_str());
+      introspect::Description description =
+          DescribeNode(*hosted.node, node_target, loop.manifest(),
+                       introspect::LoopSourceFlags(loop));
+      // A run installs the stop handlers below, right after its flags parse
+      // and before anything that can wait, and they unblock what a launcher
+      // holds: a stop sent while this binary (or the Python interpreter
+      // hosting it) was starting is held until then, then taken as one
+      // during construction.
+      description.holds_stop = true;
+      std::printf("%s", introspect::DescribeToJson(description).c_str());
       return 0;
     }
     if (!flags.replay_path.empty()) {

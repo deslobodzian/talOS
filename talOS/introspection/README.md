@@ -105,6 +105,11 @@ a subsystem key no node lists
 the version is unchanged: a describe without it (Studio's bridge writes its
 own, and a binary built before the field) reads as `params` nullopt, "not
 reported", which the launcher does not judge, while `[]` reports none.
+`holds_stop` is true from every binary built on the node framework (C++ and
+Python alike, set once in its `--describe` path): its run installs the stop
+handlers before anything that can wait, and that unblocks SIGINT, SIGTERM and
+SIGHUP (`process::kHeldStopSignals`), so it may be started with them blocked
+and a stop sent during its start-up taken then. Absent reads as false.
 
 ## Who drives a subsystem
 

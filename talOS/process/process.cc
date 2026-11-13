@@ -388,6 +388,12 @@ void InstallStopHandlers() {
   action.sa_flags = SA_RESTART;
   sigaction(SIGINT, &action, nullptr);
   sigaction(SIGTERM, &action, nullptr);
+  // After the handlers: a stop held since the exec is delivered by this call
+  // and must meet RequestStop, not the default action.
+  sigset_t held;
+  sigemptyset(&held);
+  for (const int signal : kHeldStopSignals) sigaddset(&held, signal);
+  ::pthread_sigmask(SIG_UNBLOCK, &held, nullptr);
 }
 
 LoopPolicy PolicyFor(const RealtimeOptions& options) noexcept {

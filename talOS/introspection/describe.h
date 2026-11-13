@@ -70,6 +70,14 @@ struct Description {
   // describes it again with the graph in hand (see DeclaredGraph below).
   bool reads_graph = false;
 
+  // The binary may be started with process::kHeldStopSignals blocked: its
+  // run calls process::InstallStopHandlers, which unblocks them, before
+  // anything that can wait. A stop sent before then stays pending instead of
+  // meeting the runtime's own handling (CPython's KeyboardInterrupt) or its
+  // default action, and is taken once the handlers are in. False for a
+  // binary that does not say so.
+  bool holds_stop = false;
+
   // Every parameter key the node's constructor read, in first-read order:
   // what the node declares it reads, so the launcher can refuse a subsystem
   // key no node reads. nullopt when the describe did not report them (a
@@ -177,6 +185,8 @@ inline std::string DescribeToJson(const Description& description) {
   AppendJsonString(out, description.target);
   out += ",\n  \"reads_graph\": ";
   out += description.reads_graph ? "true" : "false";
+  out += ",\n  \"holds_stop\": ";
+  out += description.holds_stop ? "true" : "false";
   // Before the sources, whose reader looks only past them.
   if (description.params) {
     out += ",\n  \"params\": [";
@@ -339,6 +349,9 @@ class DescribeReader {
       std::size_t flag = 0;
       out.reads_graph =
           Field(header, "reads_graph", flag) && Boolean(header, flag);
+      flag = 0;
+      out.holds_stop =
+          Field(header, "holds_stop", flag) && Boolean(header, flag);
       std::size_t params = 0;
       if (Field(header, "params", params) &&
           !Params(header, params, out.params.emplace(), error)) {
