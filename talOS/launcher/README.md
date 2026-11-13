@@ -1289,6 +1289,17 @@ session, state inter-arrival median/nearest-rank p99/max,
 enabled gaps of at least 100 ms, target MESSAGE receipt ages, timer dispatch
 lateness, the bridge's request-to-command delay, every scalar
 `/hw/status` field, and the alerts.
+The required "controller link" verdict is whether the bridge ever accepted
+a State from the controller, which a launched session's exit status cannot
+say (the launcher ends a bounded session by stopping every member, and a
+stopped bridge exits 0 whether or not a State arrived; it prints
+`hardware_node warning: ended without receiving a State from the controller
+at <address>:<port> (ran <s> s)` on stderr instead). PASS names the first
+accepted State's time from the start of the log (`first_state_ms` in
+`--json`), from the bridge's first `/hw/state` record (it publishes only a
+State it accepted), else from the first `/hw/status` record with a nonzero
+`state_age_us` or a clear `alert_error_link_lost`; FAIL is `/hw/status`
+records and none of either; NOT MEASURED is neither topic logged.
 The Alerts section lists each alert that was ever active, as
 `<topic>/<field path>` with its level, from the `alerts` of its status
 topic's records (above; the publisher's stream, else one reader's): its

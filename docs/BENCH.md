@@ -36,7 +36,13 @@ release all controls, and explicitly re-enable only after checking recovery.
   `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --sim --start-sim-gateway --output-dir /tmp/bench-smoke --duration-s 20`.
   Expected: motor, teleop, telemetry, hardware_node and the generic ideal sim
   gateway remain running until normal shutdown; completed manifest has no
-  crashes/restarts or failed logs. Simulation overrides commissioning only in
+  crashes/restarts or failed logs; the bridge heard the gateway:
+  `bazel run //talOS/launcher:session_report -- /tmp/bench-smoke/<session-id>`
+  shows **PASS** controller link (or `hardware_node.log`'s `states=` line is
+  above 0, with no `hardware_node warning: ended without receiving a State`
+  line). The exit status cannot show this: the launcher ends the session by
+  stopping every member, and a stop exits 0 whether or not a State ever
+  arrived. Simulation overrides commissioning only in
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
 - [ ] From `2026-robot/controller_processor/rio`, run `./gradlew deploy`.
   Expected: generic gateway starts on the RIO and its console line
