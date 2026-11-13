@@ -5,7 +5,7 @@
 # fails on a missing case not listed here and on a listed case that is no
 # longer missing. Delete a case once its test exists or its `matrix: n/a`
 # line gives the reason; never add one.
-2026-robot/main_processor/autonomous/node_test.cc 1 2 6 9 11 12
+2026-robot/main_processor/autonomous/node_test.cc 9
 2026-robot/main_processor/driver/node_test.cc 9
 2026-robot/main_processor/drivetrain/node_test.cc 1 2 3 4 5 6 7 8 9 10 11
 2026-robot/main_processor/shooter/node_test.cc 1 4 5 7 8 9 10 11

@@ -458,7 +458,8 @@ TEST_F(AutonomousTest, ResumedDriveReplansFromCurrentPose) {
 // RULES.md 3: a driving tick (trajectory sample, controller, progress
 // record, three lane writes, state publish) allocates nothing. The pose is
 // published before the window and stays fresh through it.
-TEST_F(AutonomousTest, DrivingTickDoesNotAllocate) {
+// REQ-RT-06
+TEST_F(AutonomousTest, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
     GTEST_SKIP() << why;
@@ -570,20 +571,31 @@ TEST_P(AutonomousPoseTest, UnusablePosePausesTrajectoryUntilRecovery) {
 
 INSTANTIATE_TEST_SUITE_P(PoseValidity, AutonomousPoseTest, ::testing::Bool());
 
-TEST_F(AutonomousTest, DisabledAndTeleopReleaseAllLanes) {
-  Mode(0);
-  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
-  EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+// Node test matrix (docs/TESTING.md §7), producer: cases 1, 2, 6 and 12 under
+// the names //tools:check_node_matrix looks for.
+// matrix: n/a 11 (autonomous maps no operator input to disarm)
+// A new generation in the same match resumes the paused step without
+// refiring (ReenableInSameMatchResumesStepWithoutRefiring), and a restarted
+// process starts INHIBITED (RestartIntoEnabledAutoIsInhibitedUntilRearmed).
+
+// Every lane is released while the robot is not enabled in autonomous:
+// before the first enable, disabled in autonomous (FMS between the
+// autonomous and teleop periods) and enabled in teleop.
+TEST_F(AutonomousTest, DisabledRobotReleasesItsLanes) {
+  ExpectReleased();
   Mode(ds::kEnabled | ds::kAutonomous);
-  EXPECT_TRUE(Lane<shooter::ShooterTarget>("shooter").active);
+  ASSERT_TRUE(Lane<shooter::ShooterTarget>("shooter").active);
+  Mode(ds::kAutonomous);
+  ExpectReleased();
+  Mode(ds::kEnabled | ds::kAutonomous);
+  ASSERT_TRUE(Lane<shooter::ShooterTarget>("shooter").active);
   Mode(ds::kEnabled | ds::kTeleop);
-  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
-  EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+  ExpectReleased();
 }
 
-TEST_F(AutonomousTest, WaitsForSpeedFeedsThenRotatesDriveAndHolds) {
+// The preload routine on live inputs: it waits for the shooter at speed,
+// feeds, then drives to its waypoint, collecting, and holds.
+TEST_F(AutonomousTest, SendsAtALiveInput) {
   Mode(ds::kEnabled | ds::kAutonomous);
   EXPECT_DOUBLE_EQ(
       Lane<shooter::ShooterTarget>("shooter").message.target_velocity_rps(),
@@ -709,17 +721,21 @@ TEST_F(AutonomousTest, RedRotatesWaypointAndHeading) {
   EXPECT_GT(std::abs(Drive().omega_radps()), 0);
 }
 
-TEST_F(AutonomousTest, BeamStopsCollectionAndDriverStationLossReleases) {
+TEST_F(AutonomousTest, BeamStopsCollection) {
   StartDrive();
+  ASSERT_EQ(Intake(), 30);
   sim.publish(intake::topics::kState,
               intake::IntakeState{true, 0, true, 0, intake::Inhibit::DRIVE});
   sim.step(20ms);
   EXPECT_EQ(Intake(), 0);
+}
+
+TEST_F(AutonomousTest, DriverStationLossReleasesItsLanes) {
+  StartDrive();
+  ASSERT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   hw.stop_driver_station();
-  sim.step(160ms);
-  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_FALSE(Lane<shooter::ShooterTarget>("shooter").active);
-  EXPECT_FALSE(Lane<intake::IntakeTarget>("intake").active);
+  sim.step(160ms);  // past command_timeout_us: the Driver Station view is stale
+  ExpectReleased();
 }
 
 TEST_F(AutonomousTest, SelectionEdgesAreSeededDisabledOnlyAndLatchedAtArm) {
