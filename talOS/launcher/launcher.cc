@@ -599,8 +599,8 @@ int Launcher::RunSession() {
 
   if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
     std::cerr << "launcher: the declared graph has errors; refusing to "
-                 "start. Fix the errors above, or pass --allow-graph-errors "
-                 "to launch anyway.\n";
+                 "start. Fix the errors above, or, in simulation, pass "
+                 "--allow-graph-errors with --sim to launch anyway.\n";
     return 1;
   }
   if (options_.describe_only) {
@@ -1123,8 +1123,8 @@ bool Launcher::CheckEndpoints(NodeProcessInfo& proc, NodeLaunch& launch,
     endpoints_refused_ = true;
     launch.kill_reason = kRunEndpointMismatch;
     std::cerr << "stopping the session. A node must declare the same "
-                 "endpoints whether or not Node::describing(); pass "
-                 "--allow-graph-errors to run anyway.\n";
+                 "endpoints whether or not Node::describing(); in "
+                 "simulation, --sim --allow-graph-errors runs anyway.\n";
   } else {
     std::cerr << "a critical member's restart: the session keeps running\n";
   }
