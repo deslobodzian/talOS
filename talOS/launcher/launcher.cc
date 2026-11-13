@@ -1183,7 +1183,11 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
   const SupervisionWakeup wakeup;
   notifier.Send("READY=1");
   auto next_lock_refresh = std::chrono::steady_clock::time_point::min();
+  const bool refreshes_locks =
+      session_lock_ != nullptr || session_directory_.has_value();
   bool lock_lost_reported = false;
+  bool directory_lock_retaken_reported = false;
+  bool directory_lock_lost_reported = false;
   for (;;) {
     notifier.Send("WATCHDOG=1");
     const auto now = options_.supervision_clock();
@@ -1199,13 +1203,32 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     // A pass posts at most one manifest version, after its restarts (see
     // the post below).
     bool manifest_changed = false;
-    if (session_lock_ != nullptr && now >= next_lock_refresh) {
-      next_lock_refresh = now + kSessionLockRefresh;
-      if (!session_lock_->Refresh() && !lock_lost_reported) {
+    if (refreshes_locks && now >= next_lock_refresh) {
+      next_lock_refresh = now + kLockFileRefresh;
+      if (session_lock_ != nullptr && !session_lock_->Refresh() &&
+          !lock_lost_reported) {
         lock_lost_reported = true;
         std::cerr << "[launcher] the session lock " << session_lock_->path()
                   << " was removed; a second launcher in this namespace "
                      "would no longer be refused\n";
+      }
+      using Refreshed = SessionDirectoryLock::Refreshed;
+      const Refreshed directory =
+          session_directory_ ? session_directory_->Refresh() : Refreshed::kHeld;
+      if (directory == Refreshed::kRetaken &&
+          !directory_lock_retaken_reported) {
+        directory_lock_retaken_reported = true;
+        std::cerr << "[launcher] " << session_directory_->path()
+                  << " was removed while this session held it; locked it "
+                     "again on a new file, so retention passes over this "
+                     "session again\n";
+      } else if (directory == Refreshed::kLost &&
+                 !directory_lock_lost_reported) {
+        directory_lock_lost_reported = true;
+        std::cerr << "[launcher] " << session_directory_->path()
+                  << " was removed and cannot be locked again (retention "
+                     "holds it, or the session directory was moved away); "
+                     "retention may remove this running session\n";
       }
     }
     // Read-only, the attach takes no lock (RegistryMapping): no node can
@@ -1351,7 +1374,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
     const auto due = [&wake](SupervisionTime at) { wake = std::min(wake, at); };
     // The pass's WATCHDOG=1 went out at about `now`.
     if (watchdog) due(now + *watchdog);
-    if (session_lock_ != nullptr) due(next_lock_refresh);
+    if (refreshes_locks) due(next_lock_refresh);
     if (stop_sent) {
       // Once passed, its SIGKILLs are sent; the exits they cause wake it.
       if (now < shutdown_deadline) due(shutdown_deadline);

@@ -1940,5 +1940,112 @@ TEST(Supervision, ChildExitAndStopSignalWakeTheSleepingLoop) {
   ::remove(trigger.c_str());
 }
 
+// LOG-9: a launch holds its session directory's session.lock for the whole
+// session, which can outlast a /tmp cleaner's age (3 unused days on macOS,
+// 10 under systemd-tmpfiles) in the default log root /tmp/talos_logs; with
+// the file deleted, a later launch's retention would create one, take it
+// and remove the running session. The supervision loop touches it with the
+// session lock, once per kLockFileRefresh on the supervision clock: aged by
+// the test, it stays aged through a pass half a refresh later and is
+// touched by the pass a whole refresh later. Removed under the running
+// session (as a cleaner that ran before a refresh would), it is locked again
+// at the next refresh, so retention finds it held, and that is reported
+// once in talos.log however often it happens. Only the test moves the
+// clock; each wait only bounds a hang.
+// REQ-OPS-11, REQ-OPS-45
+TEST(Supervision, SessionDirectoryLockIsRefreshedAndRetakenWhileHeld) {
+  auto options = BaseOptions("lock_refresh");
+  options.max_restarts = 0;
+  // Hours pass on the supervision clock: nothing else may fall due.
+  options.duration_s = 1'000'000;
+  options.heartbeat_periods = 1'000'000;
+  options.heartbeat_startup_grace_ms = 1'000'000'000;
+  options.construction_timeout = 1000h;
+  testing::SteppedClock clock;
+  options.supervision_clock = clock.clock();
+  const auto runs = TempPath("lock_refresh_runs");
+  ::remove(runs.c_str());
+  for (const std::string name : {"hardware_node", "alpha", "beta"}) {
+    const std::string target = name == "hardware_node"
+                                   ? "//talOS/bridge:hardware_node"
+                                   : "//example/" + name + ":node";
+    options.binary_overrides[target] = WriteStub(
+        "lock_refresh_" + name, TrappedRun(runs, kLoopUntilStopped), name);
+  }
+  const std::string dir =
+      options.output_dir + "/" + std::to_string(options.session_id);
+  const std::string lock = dir + "/" + std::string{kSessionDirectoryLockFile};
+  const std::string talos_log = dir + "/" + std::string{kLauncherOutputFile};
+  constexpr time_t kAged = 1'000'000;  // 1970: older than any cleaner's age.
+  const auto age = [&lock] {
+    const timespec times[2] = {{kAged, 0}, {kAged, 0}};
+    return ::utimensat(AT_FDCWD, lock.c_str(), times, 0) == 0;
+  };
+  const auto aged = [&lock] {
+    struct stat status {};
+    return ::stat(lock.c_str(), &status) == 0 && status.st_mtime == kAged;
+  };
+  constexpr std::string_view kRetaken = "was removed while this session held";
+  const auto reports = [&talos_log, kRetaken] {
+    const std::string text = ReadFile(talos_log);
+    std::size_t count = 0;
+    for (std::size_t at = text.find(kRetaken); at != std::string::npos;
+         at = text.find(kRetaken, at + 1))
+      ++count;
+    return count;
+  };
+  testing::SupervisionPasses passes;
+  bool started = false;
+  bool aged_before_due = false;
+  bool touched_when_due = false;
+  bool retaken = false;
+  bool retaken_again = false;
+  std::jthread driver{[&] {
+    const auto give_up = std::chrono::steady_clock::now() + 20s;
+    const auto wait = [&](const std::function<bool()>& done) {
+      while (!done() && std::chrono::steady_clock::now() < give_up)
+        std::this_thread::sleep_for(2ms);
+      return done();
+    };
+    // A whole pass has run since now (RunSessionUntil).
+    const auto pass = [&] {
+      const uint64_t after = passes.Started() + 2;
+      return wait([&] {
+        SupervisionWakeup::Wake();
+        return passes.Started() >= after;
+      });
+    };
+    started =
+        wait([&] { return ReadLines(runs).size() == 3; }) && pass() && age();
+    const std::chrono::nanoseconds half =
+        std::chrono::nanoseconds{kLockFileRefresh} / 2;
+    if (started) {
+      clock.Advance(half);
+      aged_before_due = pass() && aged();
+      clock.Advance(half);
+      touched_when_due = wait([&] { return !aged(); });
+      // Removed twice, each time refreshed into a lock retention sees.
+      for (bool* outcome : {&retaken, &retaken_again}) {
+        ::unlink(lock.c_str());
+        clock.Advance(kLockFileRefresh);
+        *outcome = wait([&] { return SessionDirectoryLock::Held(dir); });
+      }
+      wait([&] { return reports() > 0; });
+      pass();
+    }
+    ::kill(::getpid(), SIGTERM);
+  }};
+  RunSession(options);
+  driver.join();
+  ASSERT_TRUE(started) << "not every member started";
+  EXPECT_TRUE(aged_before_due) << "touched before its refresh was due";
+  EXPECT_TRUE(touched_when_due) << lock << " was not touched when due";
+  EXPECT_TRUE(retaken) << "a removed " << lock << " was not locked again";
+  EXPECT_TRUE(retaken_again) << "removed again, it was not locked again";
+  EXPECT_EQ(reports(), 1u) << ReadFile(talos_log);
+  std::filesystem::remove_all(options.output_dir);
+  ::remove(runs.c_str());
+}
+
 }  // namespace
 }  // namespace talos::launcher

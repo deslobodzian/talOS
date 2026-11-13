@@ -382,14 +382,13 @@ class Launcher {
   const SessionLock* session_lock_{nullptr};
   // The new session directory's lock (CreateSessionDirectory), held until
   // Run returns, so no launch's retention, in any shared-memory namespace,
-  // removes the directory while this launch writes it.
+  // removes the directory while this launch writes it; refreshed by
+  // Supervise with the session lock.
   std::optional<SessionDirectoryLock> session_directory_;
   // A critical member's first run's live endpoints differed from its probe
   // and --allow-graph-errors was not given (CheckEndpoints): Supervise stops
   // the session and Run returns 1.
   bool endpoints_refused_{false};
-  // Far inside macOS clean-tmps' 3 unused days (introspect::TouchLockFile).
-  static constexpr std::chrono::hours kSessionLockRefresh{1};
   // Set by the stop signals' handler (InstallSignals), which may run on any
   // thread and then wakes the supervision loop (SupervisionWakeup::Wake), and
   // read by the supervision thread: a lock-free atomic is both
