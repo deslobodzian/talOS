@@ -156,6 +156,47 @@ class IntakeTest(unittest.TestCase):
         self.assertEqual(self.applied().mode, talos.Mode.NEUTRAL)
         self.assertEqual(self.state().inhibit, Inhibit.FEEDBACK_INVALID)
 
+    # REQ-CONTRACT-25
+    def test_invalid_beam_stops_collection_not_feeding(self):
+        """An invalid beam sample (connected False) reads false: collecting
+        on it would pull into a piece the intake may already hold."""
+        ready = dict(timestamp_ns=0, flywheel_velocity_rps=60.0,
+                     target_velocity_rps=60.0, at_speed=True,
+                     beam_broken=False, enabled=True)
+        self.hw.set_digital_input("intake", "intake_beam", True)
+        self.teleop()
+        self.hold(0.0)
+        self.assertTrue(self.state().beam_broken)
+        # (beam valid, broken, ask) -> applied mode, demand, inhibit,
+        # reported beam_broken (the last valid reading while invalid).
+        steps = [
+            (False, True, 25.0, talos.Mode.NEUTRAL, 0.0,
+             Inhibit.FEEDBACK_INVALID, True),
+            (True, False, 25.0, talos.Mode.VELOCITY, 25.0, Inhibit.DRIVE,
+             False),
+            (False, False, 25.0, talos.Mode.NEUTRAL, 0.0,
+             Inhibit.FEEDBACK_INVALID, False),
+            (True, True, 25.0, talos.Mode.VELOCITY, 0.0, Inhibit.DRIVE, True),
+            (False, True, -5.0, talos.Mode.VELOCITY, -5.0, Inhibit.DRIVE,
+             True),  # feeding bypasses the beam, valid or not
+        ]
+        for valid, broken, ask, mode, demand, inhibit, reported in steps:
+            with self.subTest(valid=valid, broken=broken, ask=ask):
+                self.hw.set_digital_input("intake", "intake_beam", broken)
+                self.hw.set_connected("intake", "intake_beam", valid)
+                self.sim.publish(ShooterState, shooter_topics.STATE, **ready)
+                self.hold(ask)
+                self.assertTrue(talos.robot_enabled(self.sim.node("intake")))
+                self.assertEqual(self.request().mode, mode)
+                applied = self.applied()
+                self.assertEqual(applied.mode, mode)
+                if mode == talos.Mode.VELOCITY:
+                    self.assertEqual(applied.demand, demand)
+                state = self.state()
+                self.assertEqual(state.inhibit, inhibit)
+                self.assertEqual(state.requested_velocity_rps, demand)
+                self.assertEqual(state.beam_broken, reported)
+
     # REQ-SAFE-04
     def test_non_finite_demand_goes_neutral(self):
         for ask in (math.nan, math.inf, -math.inf):

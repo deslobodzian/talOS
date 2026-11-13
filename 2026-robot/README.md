@@ -50,7 +50,8 @@ Enabled inputs never change it. Tune the list, default, POV binding and
 `shoot_only` shoots the preload then holds. `preload` preserves the full sequence:
 it waits for fresh shooter `at_speed`, then feeds for 500 ms at
 -20 rps: negative roller demand is allowed through the intake beam interlock,
-whereas positive collection stops when a piece breaks the beam. It then stops
+whereas positive collection stops when a piece breaks the beam, and is
+neutral (`FEEDBACK_INVALID`) while the beam has no valid sample. It then stops
 the shooter and drives toward the configured waypoint with bounded field-frame
 position/heading feedback rotated into robot coordinates. The waypoint is in
 blue-origin coordinates; Red rotates both translation and heading by pi about
