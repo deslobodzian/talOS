@@ -446,6 +446,13 @@ void HardwareNode::Tick(uint64_t now_us) {
   // 2. Read subsystem requests and perform timeout neutralization
   bool any_subsystem_active = false;
   for (auto& [name, tracker] : subsystems_) {
+    // An owner-timeout episode starts on OwnerSilent's rising edge. Taken
+    // before the read, so an episode the request read below ends is
+    // counted even when no Tick fell inside it.
+    const bool silent = OwnerSilent(tracker, now_us);
+    if (silent && !tracker.silent) ++tracker.timeouts;
+    tracker.silent = silent;
+
     std::optional<ipc::Received<talos::hardware::Packet>> received;
     if (tracker.subscriber) received = tracker.subscriber->read_next();
 
@@ -507,7 +514,9 @@ void HardwareNode::Tick(uint64_t now_us) {
           full_cmd_.boot_id = partial.boot_id;
           full_cmd_.epoch = partial.epoch;
           tracker.merge.Accept(now_us, partial.observed_time_us);
-          tracker.last_accepted_us = now_us;
+          tracker.silence_from_us = now_us;
+          tracker.transition_since_accepted = false;
+          tracker.silent = false;
         }
       }
     }
@@ -603,6 +612,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
         }
       }
     }
+    UpdateLinkReady(now_us);
     return;
   }
 
@@ -676,7 +686,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
         (state.epoch != last_epoch_) ||
         ((state.flags ^ last_state_flags_) & (kEnabled | kHardwareFault));
     if (transition) {
-      InvalidateRequests();
+      InvalidateRequests(now_us);
     }
 
     last_boot_id_ = state.boot_id;
@@ -684,6 +694,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     last_sample_time_us_ = state.sample_time_us;
     last_state_flags_ = state.flags;
     latest_state_ = state;
+    UpdateLinkReady(now_us);
 
     talos::hardware::Packet pkt{};
     pkt.size = static_cast<uint32_t>(Encode(state, pkt.data));
@@ -729,21 +740,17 @@ static_assert(bridge::GatewayProgram::MAX ==
 bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
   uint32_t timed_out_mask = 0;
   uint32_t bit = 0;
-  // An owner silent past its owner timeout, measured from its last accepted
-  // request rather than from the merge (MergeOwner::Expire's test, but
-  // surviving the Reset() a controller transition makes).
+  // Owners silent past their owner timeout (OwnerSilent), not the merge's
+  // timed_out, which every controller transition sets until the owner's
+  // next request: the mask and the alert read the same rule.
   bool owner_silent = false;
   // subsystems_ is a std::map, so this walks the names in sorted order.
   for (const auto& [name, tracker] : subsystems_) {
-    if (bit < 32 && tracker.merge.timed_out) {
-      timed_out_mask |= uint32_t{1} << bit;
-    }
-    ++bit;
-    if (!tracker.last_accepted_us ||
-        (now_us > *tracker.last_accepted_us &&
-         now_us - *tracker.last_accepted_us > tracker.merge.timeout_us)) {
+    if (OwnerSilent(tracker, now_us)) {
+      if (bit < 32) timed_out_mask |= uint32_t{1} << bit;
       owner_silent = true;
     }
+    ++bit;
   }
   uint32_t motor_fault_mask = 0;
   uint32_t forward_limit_mask = 0;
@@ -861,6 +868,24 @@ void HardwareNode::ReportLogFailure() {
   std::fprintf(stderr, "hardware_node: log capture stopped: %s\n",
                log_->error().c_str());
   log_failure_reported_ = true;
+}
+
+void HardwareNode::UpdateLinkReady(uint64_t now_us) {
+  const bool ready = state_accepted_ && is_configured_;
+  if (ready && !link_ready_) {
+    for (auto& [name, tracker] : subsystems_) {
+      tracker.silence_from_us = now_us;
+      tracker.transition_since_accepted = false;
+    }
+  }
+  link_ready_ = ready;
+}
+
+bool HardwareNode::OwnerSilent(const SubsystemTracker& tracker,
+                               uint64_t now_us) const {
+  if (!link_ready_ || !tracker.silence_from_us) return false;
+  const uint64_t from_us = *tracker.silence_from_us;
+  return now_us > from_us && now_us - from_us > tracker.merge.timeout_us;
 }
 
 uint64_t HardwareNode::CommandDueUs(uint64_t now_us) const {
@@ -1130,9 +1155,11 @@ int HardwareNode::Run(int duration_s) {
               static_cast<unsigned long long>(identity_rejected_),
               static_cast<unsigned long long>(ownership_rejected_));
   for (const auto& [name, tracker] : subsystems_) {
-    std::printf("hardware_node: sub=%s requests=%llu timed_out=%d\n",
-                name.c_str(), static_cast<unsigned long long>(tracker.requests),
-                tracker.merge.timed_out ? 1 : 0);
+    std::printf(
+        "hardware_node: sub=%s requests=%llu timeouts=%llu timed_out=%d\n",
+        name.c_str(), static_cast<unsigned long long>(tracker.requests),
+        static_cast<unsigned long long>(tracker.timeouts),
+        tracker.merge.timed_out ? 1 : 0);
   }
   std::printf(
       "hardware_node: passes=%llu wakeups udp=%llu request=%llu "
@@ -1201,10 +1228,18 @@ void HardwareNode::NeutralizeAll() {
   }
 }
 
-void HardwareNode::InvalidateRequests() {
+void HardwareNode::InvalidateRequests(uint64_t now_us) {
   NeutralizeAll();
   for (auto& [name, tracker] : subsystems_) {
     tracker.merge.Reset();
+    // The owner's requests in flight carry the old identity and are
+    // refused, so its next accepted one comes up to a period later: its
+    // silence restarts here, once per accepted request, unless it was
+    // already silent (a transition must not hide that).
+    if (!tracker.transition_since_accepted && !OwnerSilent(tracker, now_us)) {
+      tracker.silence_from_us = now_us;
+      tracker.transition_since_accepted = true;
+    }
   }
   // Force the next merged command onto the wire even if its demands happen
   // to equal the pre-transition ones: the identity headers differ, but the

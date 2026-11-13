@@ -69,6 +69,28 @@ unsigned ConfigPushes(const std::vector<InProcessGateway::Frame>& frames) {
   return count;
 }
 
+// /hw/status's timed_out_mask as of `now_us`, checking that
+// alert_warning_owner_timed_out, which reads the same rule, agrees.
+uint32_t TimedOutMask(const HardwareNode& node, uint64_t now_us) {
+  const bridge::BridgeStatus status = node.Status(now_us);
+  EXPECT_EQ(status.alert_warning_owner_timed_out(),
+            status.timed_out_mask() != 0)
+      << "at " << now_us;
+  return status.timed_out_mask();
+}
+
+// The gateway acknowledging configuration `config_id` at `now_us`, and the
+// Tick that takes it in.
+void Acknowledge(Bridge& rig, uint64_t config_id, uint64_t now_us) {
+  ConfigAckPayload ack{};
+  ack.config_id = config_id;
+  ack.status = ConfigAckStatus::kOk;
+  std::array<uint8_t, sizeof(ConfigAckPayload)> bytes{};
+  ASSERT_EQ(EncodeConfigAck(ack, bytes), sizeof(ConfigAckPayload));
+  rig.gateway.Receive(protocol::FrameType::kHardwareConfigAck, now_us, bytes);
+  rig.node.Tick(now_us);
+}
+
 // REQ-SAFE-15
 TEST(HardwareNodeTrustTest, LastSubsystemTimeoutSendsOneFreshNeutralFrame) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -742,6 +764,7 @@ TEST(HardwareNodeTrustTest,
   Bridge bridge{cfg};
   HardwareNode& node = bridge.node;
   const uint64_t config_id = NodeConfigId(cfg);
+  Acknowledge(bridge, config_id, 999'500);
   ASSERT_TRUE(
       bridge.gateway.Deliver(TrustState(config_id, 11, 1, 1000), 1000000));
 
@@ -1022,6 +1045,242 @@ TEST(HardwareNodeTrustTest, ReadyObservationChangeSendsAtOnce) {
   EXPECT_EQ(commands[0].observed_time_us, 2000u);
 }
 
+// A controller transition resets every owner in the merge until its next
+// request, which must keep dropping their demands; /hw/status must not
+// report it as an owner timeout. Seen: a timed_out_mask bit for one status
+// at the disabled-to-enabled edge in 3 to 5 of 10 sim runs, which Studio's
+// link-timeout-mask detector warns on (TODO.md RT-12). An owner that does go
+// silent sets its bit one microsecond past its owner timeout, clears it with
+// its next accepted request, and counts one owner-timeout episode however
+// many ticks pass in it.
+// REQ-OPS-20
+TEST(HardwareNodeTrustTest,
+     EnableEdgeSetsNoTimedOutBitAndASilentOwnerCountsOneTimeout) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const std::vector<uint16_t>& drive = cfg.subsystems.at("drivetrain").motors;
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  constexpr uint64_t kStartUs = 1'000'000;
+
+  // Disabled, both owners flushing neutral every 5 ms.
+  State disabled = TrustState(config_id, 11, 1, 1000);
+  disabled.flags = kConfigured;
+  Acknowledge(rig, config_id, kStartUs - 500);
+  ASSERT_TRUE(rig.gateway.Deliver(disabled, kStartUs));
+  for (uint64_t now_us = kStartUs + 1000; now_us < kStartUs + 20'000;
+       now_us += 5000) {
+    PublishCommand(drive_pub, NeutralCommand(disabled, drive));
+    PublishCommand(intake_pub, NeutralCommand(disabled, roller));
+    node.Tick(now_us);
+  }
+  ASSERT_EQ(node.Status(kStartUs + 19'000).timed_out_mask(), 0u);
+
+  // The enable edge: a new epoch, which times both owners out in the merge.
+  constexpr uint64_t kEnableUs = kStartUs + 20'000;
+  const State enabled = TrustState(config_id, 11, 2, 20'000);
+  ASSERT_TRUE(rig.gateway.Deliver(enabled, kEnableUs));
+  ASSERT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
+  EXPECT_EQ(TimedOutMask(node, kEnableUs), 0u);
+
+  // Both owners' first requests of the new epoch, then the intake falls
+  // silent while the drivetrain keeps its period.
+  constexpr uint64_t kLastIntakeUs = kEnableUs + 1000;
+  PublishCommand(drive_pub, NeutralCommand(enabled, drive));
+  PublishCommand(intake_pub, NeutralCommand(enabled, roller));
+  node.Tick(kLastIntakeUs);
+  EXPECT_EQ(node.Status(kLastIntakeUs).timed_out_mask(), 0u);
+  uint64_t now_us = kLastIntakeUs;
+  while (now_us < kLastIntakeUs + owner_timeout_us + 30'000) {
+    now_us += 5000;
+    PublishCommand(drive_pub, NeutralCommand(enabled, drive));
+    node.Tick(now_us);
+  }
+  EXPECT_EQ(TimedOutMask(node, kLastIntakeUs + owner_timeout_us), 0u);
+  EXPECT_EQ(TimedOutMask(node, kLastIntakeUs + owner_timeout_us + 1), 0b10u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 1u);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
+
+  // A transition while the intake is silent keeps its bit: no transition
+  // hides an owner already silent.
+  const State next = TrustState(config_id, 11, 3, 30'000);
+  now_us += 1000;
+  ASSERT_TRUE(rig.gateway.Deliver(next, now_us));
+  EXPECT_EQ(TimedOutMask(node, now_us), 0b10u);
+
+  // The intake's next request clears its bit; the episode stays counted.
+  now_us += 4000;
+  PublishCommand(drive_pub, NeutralCommand(next, drive));
+  PublishCommand(intake_pub, NeutralCommand(next, roller));
+  node.Tick(now_us);
+  EXPECT_EQ(node.Status(now_us).timed_out_mask(), 0u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 1u);
+  EXPECT_EQ(node.identity_rejected(), 0u);
+}
+
+// Two actuator owners at the longest period config load allows, a quarter
+// of the command timeout, so each owner timeout is exactly two periods.
+constexpr std::string_view kQuarterTimeoutToml = R"(
+[robot]
+name = "quarter_robot"
+period_us = 5000
+
+[subsystems.drivetrain]
+period_us = 25000
+
+[subsystems.drivetrain.motors.drive]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+
+[subsystems.intake]
+period_us = 25000
+
+[subsystems.intake.motors.roller]
+type = "TalonFX"
+bus = "rio"
+can_id = 2
+)";
+
+// A new-epoch State lands just after both owners drained for their next
+// tick, so the requests they flush in it carry the old epoch and are
+// refused, and each owner's next accepted request comes two periods (its
+// whole owner timeout) after its last, plus any jitter. Measured from the
+// last accepted request, that raised alert_warning_owner_timed_out (and a
+// timed_out_mask bit) for one status at any jitter, and the dashboard
+// latches an alert for the match. Silence counts from the transition
+// instead; an owner that stays silent for its owner timeout after the
+// transition still raises, at exactly that boundary.
+// REQ-OPS-20
+TEST(HardwareNodeTrustTest, TransitionAtTwoPeriodsOfSilenceRaisesNoTimeout) {
+  auto cfg = config::ParseRobotConfigString(kQuarterTimeoutToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  constexpr uint64_t kPeriodUs = 25'000;
+  ASSERT_EQ(kPeriodUs * 4, cfg.hardware.command_timeout_us);
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(kPeriodUs, cfg.hardware.command_timeout_us);
+  ASSERT_EQ(owner_timeout_us, 2 * kPeriodUs);
+  const std::vector<uint16_t>& drive = cfg.subsystems.at("drivetrain").motors;
+  const std::vector<uint16_t>& roller = cfg.subsystems.at("intake").motors;
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  ipc::Publisher<Packet> intake_pub{RequestTopic("intake")};
+  constexpr uint64_t kStartUs = 1'000'000;
+
+  const State first = TrustState(config_id, 11, 1, 1000);
+  Acknowledge(rig, config_id, kStartUs - 500);
+  ASSERT_TRUE(rig.gateway.Deliver(first, kStartUs));
+  constexpr uint64_t kAcceptedUs = kStartUs + 1000;
+  PublishCommand(drive_pub, NeutralCommand(first, drive));
+  PublishCommand(intake_pub, NeutralCommand(first, roller));
+  node.Tick(kAcceptedUs);
+  ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+
+  // The new epoch, 1 us before both owners' next flush, which it refuses.
+  constexpr uint64_t kTransitionUs = kAcceptedUs + kPeriodUs - 1;
+  const State second = TrustState(config_id, 11, 2, 1000 + kPeriodUs);
+  ASSERT_TRUE(rig.gateway.Deliver(second, kTransitionUs));
+  PublishCommand(drive_pub, NeutralCommand(first, drive));
+  PublishCommand(intake_pub, NeutralCommand(first, roller));
+  node.Tick(kAcceptedUs + kPeriodUs);
+  ASSERT_EQ(node.identity_rejected(), 2u);
+
+  // Two periods and one microsecond since each owner's last accepted
+  // request: no timeout.
+  EXPECT_EQ(TimedOutMask(node, kAcceptedUs + owner_timeout_us + 1), 0u);
+  // The intake's next tick, a millisecond late, merges; the drivetrain's
+  // node has stopped.
+  constexpr uint64_t kIntakeBackUs = kAcceptedUs + (2 * kPeriodUs) + 1000;
+  PublishCommand(intake_pub, NeutralCommand(second, roller));
+  node.Tick(kIntakeBackUs);
+  ASSERT_FALSE(node.is_subsystem_timed_out("intake"));
+  // Another transition restarts the silence of the intake, heard since the
+  // first, but not of the drivetrain: one per accepted request.
+  const State third = TrustState(config_id, 11, 3, 2000 + kPeriodUs);
+  ASSERT_TRUE(rig.gateway.Deliver(third, kIntakeBackUs + 1000));
+  EXPECT_EQ(TimedOutMask(node, kTransitionUs + owner_timeout_us), 0u);
+  EXPECT_EQ(TimedOutMask(node, kTransitionUs + owner_timeout_us + 1), 0b01u);
+  node.Tick(kTransitionUs + owner_timeout_us + 1);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 1u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 0u);
+  EXPECT_EQ(TimedOutMask(node, kIntakeBackUs + 1000 + owner_timeout_us + 1),
+            0b11u);
+}
+
+// The session's start is no owner timeout: until a State is accepted and the
+// gateway has acknowledged the configuration (alert_error_link_lost and
+// alert_error_not_configured speak meanwhile), no owner is reported silent,
+// and from then each has its owner timeout to be heard. One whose node never
+// starts is reported at that boundary. A gateway reboot is a new start: no
+// owner is reported until the new boot acknowledges, then each has its
+// owner timeout again, and a still-silent one counts a new episode.
+// REQ-OPS-20
+TEST(HardwareNodeTrustTest, AnOwnerNeverHeardRaisesOnlyOnceTheLinkIsReady) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const uint64_t config_id = NodeConfigId(cfg);
+  const std::vector<uint16_t>& drive = cfg.subsystems.at("drivetrain").motors;
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  Bridge rig{cfg};
+  HardwareNode& node = rig.node;
+  ipc::Publisher<Packet> drive_pub{RequestTopic("drivetrain")};
+  constexpr uint64_t kStartUs = 1'000'000;
+  // The drivetrain flushing every 5 ms on `state` from now_us up to
+  // `to_us`; the intake's node never started.
+  uint64_t now_us = kStartUs;
+  const auto drive_until = [&](const State& state, uint64_t to_us) {
+    for (; now_us + 5000 <= to_us;) {
+      now_us += 5000;
+      PublishCommand(drive_pub, NeutralCommand(state, drive));
+      node.Tick(now_us);
+    }
+  };
+
+  // No State, then a State of a boot that has not acknowledged.
+  node.Tick(kStartUs);
+  EXPECT_TRUE(node.Status(kStartUs).alert_error_link_lost());
+  EXPECT_EQ(TimedOutMask(node, kStartUs + owner_timeout_us + 1), 0u);
+  const State boot11 = TrustState(config_id, 11, 1, 1000);
+  ASSERT_TRUE(rig.gateway.Deliver(boot11, kStartUs + 1000));
+  now_us = kStartUs + 1000;
+  drive_until(boot11, kStartUs + 100'000);
+  EXPECT_TRUE(node.Status(now_us).alert_error_not_configured());
+  EXPECT_EQ(TimedOutMask(node, now_us), 0u);
+
+  // Acknowledged: the link is ready; the intake is reported one owner
+  // timeout later, the drivetrain never.
+  const uint64_t ready_us = now_us + 500;
+  Acknowledge(rig, config_id, ready_us);
+  drive_until(boot11, ready_us + owner_timeout_us + 20'000);
+  EXPECT_EQ(TimedOutMask(node, ready_us + owner_timeout_us), 0u);
+  EXPECT_EQ(TimedOutMask(node, ready_us + owner_timeout_us + 1), 0b10u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 1u);
+
+  // The gateway reboots: nothing is reported until boot 12 acknowledges.
+  const State boot12 = TrustState(config_id, 12, 1, 500);
+  now_us += 1000;
+  ASSERT_TRUE(rig.gateway.Deliver(boot12, now_us));
+  EXPECT_TRUE(node.Status(now_us).alert_error_not_configured());
+  EXPECT_EQ(TimedOutMask(node, now_us), 0u);
+  drive_until(boot12, now_us + 30'000);
+  EXPECT_EQ(TimedOutMask(node, now_us), 0u);
+  const uint64_t reready_us = now_us + 500;
+  Acknowledge(rig, config_id, reready_us);
+  drive_until(boot12, reready_us + owner_timeout_us + 20'000);
+  EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us), 0u);
+  EXPECT_EQ(TimedOutMask(node, reready_us + owner_timeout_us + 1), 0b10u);
+  EXPECT_EQ(node.owner_timeouts("intake"), 2u);
+  EXPECT_EQ(node.owner_timeouts("drivetrain"), 0u);
+}
+
 // The alerts `status` raises, by name, in field order.
 std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
   std::vector<std::string> active;
@@ -1043,8 +1302,9 @@ std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
 // Each /hw/status alert is raised while its condition holds and cleared in
 // the first status after it stops, at the condition's own boundary; a
 // controller transition, which times every owner out in the merge until its
-// next request, raises none.
-// REQ-OPS-37
+// next request, raises none, and before the link is ready only the link and
+// configuration alerts speak.
+// REQ-OPS-20, REQ-OPS-37
 TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   using Names = std::vector<std::string>;
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -1056,8 +1316,7 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   const HardwareNode uncommissioned{cfg};
   EXPECT_FALSE(uncommissioned.Status(1000000).commissioned());
   EXPECT_EQ(Alerts(uncommissioned.Status(1000000)),
-            (Names{"link_lost", "not_configured", "uncommissioned",
-                   "owner_timed_out"}));
+            (Names{"link_lost", "not_configured", "uncommissioned"}));
 
   Bridge bridge{cfg};
   HardwareNode& node = bridge.node;
@@ -1088,7 +1347,7 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   node.Tick(1000000);
   EXPECT_TRUE(node.Status(1000000).commissioned());
   EXPECT_EQ(Alerts(node.Status(1000000)),
-            (Names{"link_lost", "not_configured", "owner_timed_out"}));
+            (Names{"link_lost", "not_configured"}));
 
   // The link up, the configuration acknowledged, both owners merged.
   acknowledge(1000500);
@@ -1109,9 +1368,10 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   node.Tick(1061000);
   EXPECT_EQ(Alerts(node.Status(1061000)), Names{});
 
-  // A new epoch resets the merge (timed_out_mask), not the alert.
+  // A new epoch resets the merge, not the alert or timed_out_mask.
   ASSERT_TRUE(gateway.Deliver(TrustState(config_id, 11, 2, 62000), 1062000));
-  EXPECT_EQ(node.Status(1062000).timed_out_mask(), 0b11u);
+  ASSERT_TRUE(node.is_subsystem_timed_out("drivetrain"));
+  EXPECT_EQ(node.Status(1062000).timed_out_mask(), 0u);
   EXPECT_EQ(Alerts(node.Status(1062000)), Names{});
 
   // No State for longer than the command timeout, while both owners keep

@@ -497,15 +497,14 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
       bridge::topics::kStatus,
       RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::LATEST}};
 
-  // The first tick publishes. Nothing has arrived from the controller, and
-  // both actuator subsystems (drivetrain bit 0, intake bit 1: sorted name
-  // order) are timed out.
+  // The first tick publishes. Nothing has arrived from the controller, so
+  // no actuator subsystem is reported silent yet.
   node.Tick(999000);
   const bridge::BridgeStatus initial = node.Status(999000);
   EXPECT_EQ(initial.states_received_count(), 0u);
   EXPECT_EQ(initial.state_age_us(), 0u);
   EXPECT_EQ(initial.subsystem_count(), 2u);
-  EXPECT_EQ(initial.timed_out_mask(), 0b11u);
+  EXPECT_EQ(initial.timed_out_mask(), 0u);
   EXPECT_FALSE(initial.configured());
   auto published = status_sub.read();
   ASSERT_TRUE(published.has_value());
@@ -538,7 +537,9 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_EQ(node.Status(1000000).state_age_us(), 0u);
   EXPECT_EQ(node.Status(1003500).state_age_us(), 3500u);
 
-  // Only the drivetrain publishes: the silent intake keeps its bit.
+  // Only the drivetrain publishes. The silent intake (bit 1; drivetrain is
+  // bit 0, sorted name order) gets its bit one owner timeout after the link
+  // became ready, with the first State.
   ipc::Publisher<talos::hardware::Packet> drive_pub{RequestTopic("drivetrain")};
   Command drive_ok{};
   drive_ok.config_id = config_id;
@@ -551,7 +552,11 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   node.Tick(1001000);
   ASSERT_FALSE(node.is_subsystem_timed_out("drivetrain"));
   ASSERT_TRUE(node.is_subsystem_timed_out("intake"));
-  EXPECT_EQ(node.Status(1001000).timed_out_mask(), 0b10u);
+  EXPECT_EQ(node.Status(1001000).timed_out_mask(), 0u);
+  const uint64_t owner_timeout_us =
+      OwnerTimeoutUs(5000, cfg.hardware.command_timeout_us);
+  EXPECT_EQ(node.Status(1000000 + owner_timeout_us + 1).timed_out_mask(),
+            0b10u);
   EXPECT_EQ(node.Status(1001000).commands_sent_count(), 1u);
 
   // Every 20 ms of bridge time, not every tick: the last publication was the
@@ -564,8 +569,9 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_TRUE(published.has_value());
   const bridge::BridgeStatus later = published.value_or(bridge::BridgeStatus{});
   EXPECT_TRUE(later == node.Status(1019000));
-  // The drivetrain, quiet for 18 ms, is still inside its owner timeout.
-  EXPECT_EQ(later.timed_out_mask(), 0b10u);
+  // The drivetrain, quiet for 18 ms, is still inside its owner timeout, and
+  // so is the intake, 19 ms after the link became ready.
+  EXPECT_EQ(later.timed_out_mask(), 0u);
   EXPECT_EQ(later.state_age_us(), 19000u);
   EXPECT_TRUE(later.configured());
 }
