@@ -39,7 +39,7 @@ Abbreviations are rejected (`tgt`, `cmd`, `req`, `ds`, `dt`, `drive`, `odom`,
 `pos`, `vel`, …; use the full word), and so are direction suffixes (`_in`,
 `_out`, `_pub`, `_sub`, `_tx`, `_rx`, `_topic`, `_send`, `_recv`).
 
-The graph lint also rejects two writers on one topic, more than eight declared
+The graph lint also rejects two writers on one topic, more than 32 declared
 readers per topic (including observers), a read topic nobody writes (unless an
 endpoint declares it `optional` or `external`), conflicting schemas, message
 sizes or ring layouts, a target lane whose source is in no mode of that

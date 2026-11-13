@@ -57,7 +57,7 @@ or `_us`. [Topics and messages](../ARCHITECTURE.md#topics-and-messages),
 different hash fails. [Topics and messages](../ARCHITECTURE.md#topics-and-messages).
 
 **RTMS.** The shared-memory topic layer (`talOS/rtms`) under every topic; one
-writer, up to eight declared readers per topic.
+writer, up to 32 declared readers per topic.
 [Layers](../ARCHITECTURE.md#layers),
 [names](../talOS/NAMING.md#topics).
 

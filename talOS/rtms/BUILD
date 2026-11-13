@@ -1,4 +1,5 @@
 load("@flatbuffers//:build_defs.bzl", "flatbuffer_cc_library")
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
@@ -84,5 +85,18 @@ cc_test(
         "@googletest//:gtest",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
+    ],
+)
+
+# What a publication costs its writer with 0, 1, 8 and 32 reader processes
+# asleep on the topic (README.md "Publish cost"). Run by hand:
+# bazel run -c opt //talOS/rtms:wake_fanout_bench
+cc_binary(
+    name = "wake_fanout_bench",
+    srcs = ["wake_fanout_bench.cc"],
+    deps = [
+        ":rtms",
+        ":wake",
+        "//talOS/schema:identity",
     ],
 )

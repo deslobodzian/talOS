@@ -1,4 +1,5 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load("@rules_python//python:defs.bzl", "py_test")
 load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_field_manifest.bzl", FIELD_CONFIG_FILES = "CONFIG_FILES", FIELD_NODES = "NODES")
@@ -54,6 +55,28 @@ talos_graph_test(
         "no_asan",
         "no_tsan",
     ],
+)
+
+# A copy of robot.toml with the example elevator added, made in the test's
+# temporary directory: a ninth reader of /hw/state/driver_station passes
+# --describe-only. robot.toml itself is unchanged.
+py_test(
+    name = "fanout_graph_test",
+    size = "small",
+    srcs = ["fanout_graph_test.py"],
+    data = [
+        "robot.toml",
+        "//examples/superstructure/config:subsystems",
+        "//examples/superstructure/cpp:elevator",
+        "//talOS/bridge:hardware_node",
+        "//talOS/launcher",
+    ] + CONFIG_FILES + NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 # robot_manifest.bzl is generated from robot.toml; this fails when it is stale.

@@ -235,21 +235,37 @@ TEST(LintGraph, ACorrectGraphProducesNoFindings) {
   EXPECT_TRUE(diagnostics.empty()) << Describe(diagnostics);
 }
 
+// Nine to 32 readers of one topic, observers included, lint clean; a 33rd is
+// an error naming the topic and the limit. Nine is the first count the
+// eight-slot table refused; 32 is about twice the Driver Station readers of
+// a robot with six mechanisms.
+// REQ-CONTRACT-36
 TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
+  // Written out, not MAX_READERS, so that a smaller table fails here.
+  constexpr std::size_t kRequiredReaders = 32;
   std::vector<NodeShape> nodes = {
       {"drivetrain", "//robot/drivetrain:node", {Sender("/drivetrain/state")}}};
-  for (std::size_t i = 0; i < MAX_READERS; ++i) {
-    const auto name = "observer_" + std::to_string(i);
-    nodes.push_back({name,
-                     "//robot/" + name + ":node",
-                     {Watcher("/drivetrain/state", 32, kSourceFlagObserver)}});
+  for (std::size_t i = 0; i < kRequiredReaders; ++i) {
+    // Every other reader an observer: both kinds take a slot.
+    const auto name = "reader_" + std::to_string(i);
+    nodes.push_back(
+        {name,
+         "//robot/" + name + ":node",
+         {Watcher("/drivetrain/state", 32,
+                  i % 2 == 0 ? kSourceFlagObserver : std::uint32_t{0})}});
+    if (nodes.size() - 1 < 9) continue;
+    SCOPED_TRACE(std::to_string(nodes.size() - 1) + " readers");
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
   }
-  EXPECT_FALSE(HasError(LintGraph(nodes))) << Describe(LintGraph(nodes));
   nodes.push_back(
       {"consumer", "//robot/consumer:node", {Watcher("/drivetrain/state")}});
   const auto diagnostics = LintGraph(nodes);
-  EXPECT_NE(Find(diagnostics, Severity::ERROR, "/drivetrain/state"), nullptr)
-      << Describe(diagnostics);
+  const auto* error = Find(diagnostics, Severity::ERROR, "/drivetrain/state");
+  ASSERT_NE(error, nullptr) << Describe(diagnostics);
+  EXPECT_NE(error->message.find(std::to_string(kRequiredReaders)),
+            std::string::npos)
+      << error->message;
 }
 
 // The defect this protocol exists to catch: both ends present, both valid

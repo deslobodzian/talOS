@@ -10,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -497,7 +498,8 @@ class RealtimeEventLoop
       transport.reader_id = transport.queue->register_reader();
       if (!transport.reader_id) {
         throw RegistrationError("no reader slots available for '" +
-                                registration.name + "'");
+                                registration.name + "' (RTMS reader limit " +
+                                std::to_string(MAX_READERS) + ")");
       }
       transport.next_sequence =
           transport.queue->reader_sequence(*transport.reader_id);

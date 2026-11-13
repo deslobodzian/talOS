@@ -22,7 +22,10 @@
 inline constexpr size_t CACHE_LINE = 64;  // C++ I think as a function for this.
 inline constexpr size_t MAX_SLOTS = 1u << 10;  // 1024 slots maximum
 inline constexpr size_t MASK = MAX_SLOTS - 1;  // Mask for fixed size
-inline constexpr size_t MAX_READERS = 8;
+// Reader slots per topic, observers included; the graph lint refuses a
+// topic with more declared readers. At most 64: Writer::waiters holds one
+// bit per slot.
+inline constexpr size_t MAX_READERS = 32;
 
 inline constexpr std::size_t align_up(std::size_t value,
                                       std::size_t alignment) {
@@ -135,7 +138,7 @@ struct RTMSOptions {
 // The segment format, checked before any other header field is trusted.
 inline constexpr std::uint64_t kRtmsMagic =
     0x32534D54534F4C41ULL;  // "ALOSTMS2"
-inline constexpr std::uint64_t kRtmsVersion = 8;
+inline constexpr std::uint64_t kRtmsVersion = 9;
 
 // RTMSHeader::lifetime: a session-owned flag, a closing flag, and the count
 // of queues attached to a segment that is not session-owned.
@@ -203,7 +206,9 @@ struct RTMSHeader {
   Reader readers[MAX_READERS];
 };
 
-static_assert(sizeof(RTMSHeader) == 832);
+// docs/DATA_FLOW.md "Main-processor shared-memory slots" states this size.
+static_assert(sizeof(RTMSHeader) == 2368);
+static_assert(MAX_READERS <= 64, "Writer::waiters has one bit per slot");
 
 // Ring buffer queue over one named shared-memory segment.
 //
