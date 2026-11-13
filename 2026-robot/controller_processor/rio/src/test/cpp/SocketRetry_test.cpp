@@ -140,7 +140,7 @@ TEST(SocketRetry, OnlyASendErrorTheSocketKeepsRepeatingLosesIt) {
 // replaces the socket still reports the loss; the replacement's good sends
 // end that spell without a line of its own, the replaced line having said
 // it.
-// REQ-RT-22
+// REQ-OPS-28
 TEST(SocketRetry, AFailingSpellThatKeepsTheSocketReportsItsStartAndEnd) {
   using SendEvent = SocketRetry::SendEvent;
   SocketRetry retry;
