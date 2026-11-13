@@ -1,7 +1,9 @@
-"""Scaffolds a talos robot, a sibling of 2026-robot/, with its first mechanism.
+"""Scaffolds a talos robot, a sibling of 2026-robot/, with its first
+mechanism or with none.
 
     bazel run //tools:new_robot -- <name> --mechanism <mech> --lang cpp|py \\
         [--type velocity|position] [--dir DIR] [--dry-run]
+    bazel run //tools:new_robot -- <name> --no-mechanism [--dir DIR] [--dry-run]
 
 Writes <DIR>/<name>/ (DIR defaults to the workspace root):
 
@@ -21,6 +23,8 @@ Writes <DIR>/<name>/ (DIR defaults to the workspace root):
 
 plus what `//tools:new_subsystem -- <mech> --robot <DIR>/<name>` writes for
 the first mechanism (its package, subsystem file and [[subsystems]] entry).
+With --no-mechanism the robot has no device (a hardware config with none is
+valid, REQ-CONTRACT-35) and both manifests are generated here.
 The framework's teleop and telemetry nodes are the other
 subsystems; the hardware bridge joins every launch on its own. More
 mechanisms come from new_subsystem, and `./sim.sh --config
@@ -264,15 +268,17 @@ def robot_files(robot, name):
 
 def plan(root, name, mechanism, lang, kind="velocity", parent="."):
     """([(path, None, content)], placeholder CAN id) for a new robot at
-    <root>/<parent>/<name> with its first mechanism.
+    <root>/<parent>/<name> with its first mechanism, or with none when
+    `mechanism` is None (CAN id None).
 
     The robot is assembled in a scratch copy of its directory and
     new_subsystem adds the mechanism there, so nothing in the workspace is
     written until both succeed."""
     if problem := check_robot_name(name):
         raise Refused(problem)
-    if problem := (new_subsystem.check_name(mechanism)
-                   or new_subsystem.check_kind(mechanism, lang, kind)):
+    if mechanism is not None and (
+            problem := (new_subsystem.check_name(mechanism)
+                        or new_subsystem.check_kind(mechanism, lang, kind))):
         raise Refused(problem)
     real_root = os.path.realpath(root)
     base = os.path.realpath(os.path.join(root, parent))
@@ -291,17 +297,39 @@ def plan(root, name, mechanism, lang, kind="velocity", parent="."):
             os.makedirs(os.path.dirname(full), exist_ok=True)
             with open(full, "w", encoding="utf-8") as f:
                 f.write(content)
-        # new_subsystem resolves the config with the real resolver, adds the
-        # [[subsystems]] entry and generates robot_manifest.bzl.
-        writes, can_id = new_subsystem.plan(scratch, robot, mechanism, lang,
-                                            kind)
-        for path, _, content in writes:
-            files[rel(scratch, path)] = content
+        if mechanism is None:
+            # Nothing adds an entry, so generate both manifests here.
+            can_id = None
+            configuration = f"{robot}/main_processor/configuration"
+            for config in (f"{configuration}/robot.toml",
+                           f"{configuration}/{new_subsystem.SIM_CONFIGS[0]}"):
+                try:
+                    manifest = sync_manifest.generate(scratch, config)
+                except sync_manifest.ManifestError as err:
+                    raise Refused(f"cannot generate the manifest of "
+                                  f"{config}: {err}")
+                files[sync_manifest.manifest_path(config)] = manifest
+        else:
+            # new_subsystem resolves the config with the real resolver, adds
+            # the [[subsystems]] entry and generates robot_manifest.bzl.
+            writes, can_id = new_subsystem.plan(scratch, robot, mechanism,
+                                                lang, kind)
+            for path, _, content in writes:
+                files[rel(scratch, path)] = content
     return ([(os.path.join(real_root, path), None, content)
              for path, content in files.items()], can_id)
 
 
 def next_steps(robot, mechanism, can_id, kind, lang):
+    if mechanism is None:
+        configuration = f"{robot}/main_processor/configuration"
+        return f"""\
+Next:
+  bazel test //{robot}/...
+  bazel build //talOS/launcher //talOS/bridge:hardware_node //talOS/teleop:node //talOS/telemetry:node
+  bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only
+  Add a mechanism:
+    bazel run //tools:new_subsystem -- <name> --lang cpp|py --robot {robot}"""
     # A new robot has no config_golden_test.cc (only 2026-robot and bench
     # do).
     steps = new_subsystem.next_steps(robot, mechanism, can_id, kind, lang)
@@ -313,24 +341,33 @@ def next_steps(robot, mechanism, can_id, kind, lang):
 def main(argv):
     parser = argparse.ArgumentParser(
         prog="bazel run //tools:new_robot --",
-        description="Scaffold a talos robot with its first mechanism: "
-        "configuration, manifest, graph test and bundle.")
+        description="Scaffold a talos robot with its first mechanism, or "
+        "none: configuration, manifest, graph test and bundle.")
     parser.add_argument("name", help="robot name and directory, e.g. "
                         "my_robot (talOS/NAMING.md node-name rules)")
-    parser.add_argument("--mechanism", required=True,
-                        help="its first mechanism, as new_subsystem's name")
-    parser.add_argument("--lang", choices=("cpp", "py"), required=True,
-                        help="the mechanism's language")
+    first = parser.add_mutually_exclusive_group(required=True)
+    first.add_argument("--mechanism",
+                       help="its first mechanism, as new_subsystem's name")
+    first.add_argument("--no-mechanism", action="store_true",
+                       help="no mechanism and no device: the hardware "
+                       "bridge, teleop and telemetry only")
+    parser.add_argument("--lang", choices=("cpp", "py"),
+                        help="the mechanism's language (with --mechanism)")
     parser.add_argument("--type", dest="kind",
-                        choices=("velocity", "position"), default="velocity",
-                        help="the mechanism's archetype (default: "
-                        "%(default)s)")
+                        choices=("velocity", "position"),
+                        help="the mechanism's archetype (default: velocity)")
     parser.add_argument("--dir", default=".",
                         help="directory to create the robot in, relative to "
                         "the workspace root (default: the root)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file without writing")
     args = parser.parse_args(argv)
+    if args.mechanism is not None and args.lang is None:
+        parser.error("--mechanism needs --lang")
+    if args.no_mechanism and (args.lang is not None
+                              or args.kind is not None):
+        parser.error("--no-mechanism takes no --lang or --type")
+    args.kind = args.kind or "velocity"
 
     root = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
     if not root:

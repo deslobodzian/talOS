@@ -1,5 +1,5 @@
-"""Tests for //tools:new_robot: the generated robot passes the launcher's
-graph lint as generated, the edits its `Next:` output lists make its
+"""Tests for //tools:new_robot: the generated robot, with a mechanism or
+none, passes the launcher's graph lint as generated, the edits its `Next:` output lists make its
 mechanism drivable, and a name that cannot be a robot is refused."""
 
 import json
@@ -90,7 +90,8 @@ def generate(work, mechanism, lang, kind="velocity"):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-    stand_in_binary(work, mechanism, lang)
+    if mechanism is not None:
+        stand_in_binary(work, mechanism, lang)
     return can_id
 
 
@@ -150,6 +151,29 @@ class NewRobotTest(unittest.TestCase):
                     sorted(n["name"] for n in graph["nodes"]),
                     sorted([mechanism, "hardware_node", "telemetry",
                             "teleop"]))
+
+    # REQ-CONTRACT-35
+    def test_robot_with_no_mechanism_passes_the_graph_lint(self):
+        # A robot with no device: the hardware bridge, teleop with nothing to
+        # bind and telemetry. Its manifests are not written by new_subsystem,
+        # so both must come out current here.
+        with tempfile.TemporaryDirectory() as tmp:
+            work, launcher, env = workspace(tmp)
+            self.assertIsNone(generate(work, None, None))
+            for config in (CONFIG, SIM_CONFIG):
+                with self.subTest(config=config):
+                    self.assertEqual(sync_manifest.check(work, config), "")
+                    status, output, graph = describe(
+                        work, launcher, env,
+                        os.path.join(tmp, os.path.basename(config)), config)
+                    self.assertEqual(status, 0, output)
+                    self.assertNotIn("error:", output)
+                    self.assertEqual(
+                        sorted(n["name"] for n in graph["nodes"]),
+                        ["hardware_node", "telemetry", "teleop"])
+                    robot, _ = sync_manifest.effective(work, config)
+                    for table in robot.values():
+                        self.assertNotIn("motors", table)
 
     # REQ-DEV-23
     def test_next_steps_block_makes_the_mechanism_drivable_in_simulation(
