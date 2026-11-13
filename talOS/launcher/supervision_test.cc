@@ -1253,14 +1253,18 @@ TEST(Supervision, ASigintTheStopDidNotSendIsStillACrash) {
       WriteStub("foreign_sigint_beta", TrappedRun(runs, kLoopUntilStopped));
   options.binary_overrides["//example/alpha:node"] =
       WriteStub("foreign_sigint_alpha",
-                "echo $$ > " + alpha_pid + ".tmp && mv " + alpha_pid + ".tmp " +
-                    alpha_pid + "\nexec sleep 600\n");
+                // Builtins only until the exec: a shell that is waiting for
+                // a child when the SIGINT arrives (bash, macOS's /bin/sh)
+                // survives it if that child exits normally.
+                "echo $$ > " + alpha_pid + "\necho ready >> " + alpha_pid +
+                    "\nexec sleep 600\n");
   // SIGINTs alpha's group, as the launcher's stop would, once it runs.
   std::jthread interrupter{[&](const std::stop_token& stop) {
     for (; !stop.stop_requested(); std::this_thread::sleep_for(2ms)) {
       const auto lines = ReadLines(alpha_pid);
       pid_t pid = 0;
-      if (lines.empty() ||
+      // The second line says the first is whole.
+      if (lines.size() < 2 || lines[1] != "ready" ||
           std::from_chars(lines[0].data(), lines[0].data() + lines[0].size(),
                           pid)
                   .ec != std::errc{})
