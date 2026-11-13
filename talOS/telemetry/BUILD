@@ -136,3 +136,28 @@ cc_test(
         "@googletest//:gtest_main",
     ],
 )
+
+# The driver dashboard's layout ([studio] dashboard): parsed and validated
+# without the telemetry dictionary, its channel list and worst-case feed
+# bytes, and the JSON the Studio bridge serves as /drive/layout.json.
+cc_library(
+    name = "dashboard_layout",
+    srcs = ["dashboard_layout.cc"],
+    hdrs = ["dashboard_layout.h"],
+    deps = [
+        ":wire",
+        "//talOS/introspection:names",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
+cc_test(
+    name = "dashboard_layout_test",
+    size = "small",
+    srcs = ["tests/dashboard_layout_test.cc"],
+    deps = [
+        ":dashboard_layout",
+        ":wire",
+        "@googletest//:gtest_main",
+    ],
+)

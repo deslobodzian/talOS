@@ -1,0 +1,3 @@
+# A [studio] dashboard file that does not exist fails config load.
+accept = false
+error_contains = "[studio] dashboard"

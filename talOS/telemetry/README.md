@@ -166,3 +166,110 @@ and 6 are the node's own.
    `geometry.Pose2d` struct. Telemetry extracts `x_m`, `y_m`, and `yaw_rad` via
    reflection. Missing, stale, invalid or nonfinite pose data makes `pose/valid`
    and `chassis` zero.
+
+## Dashboard layout
+
+The driver dashboard's layout is the file `[studio] dashboard` in `robot.toml`
+names, relative to the file that sets it. Config load refuses a missing file, and the file is in the config's
+`CONFIG_FILES`, so `talos_bundle` ships it
+([ARCHITECTURE.md](../../ARCHITECTURE.md#configuration)). A consumer reads the
+resolved path from `config::RobotConfig::studio.dashboard` (empty when unset).
+`//talOS/telemetry:dashboard_layout` (`dashboard_layout.h`) is the one parser:
+`ParseDashboardLayout(file)` checks everything the file alone decides, and
+`DashboardLayoutJson(layout)` is the layout as the dashboard page reads it
+(`/drive/layout.json`), so no TOML parser is needed in TypeScript. What needs
+the telemetry dictionary takes its inputs from the layout: the names that must
+be in it (`RequiredChannels`), whether the feed also carries every alert
+channel (`CarriesAlertChannels`), and the budget for the feed's full channel
+count (`CheckDashboardBudget`).
+
+```toml
+[dashboard]                 # optional; every key optional, defaults shown
+title = "Drive"             # at most 64 bytes
+columns = 12                # grid cells, 1..24
+rows = 8                    # 1..24
+update_hz = 20              # drive feed updates a second, 1..50
+budget_bytes_per_s = 24000  # each drive client's egress budget
+drive_clients = 2           # 1..4; drive_clients x budget_bytes_per_s <= 80000
+
+[[widgets]]                 # 1 to 64 widgets, drawn in file order
+kind = "number"             # required
+at = [0, 0, 2, 1]           # required: column, row, width, height
+title = "Flywheel"          # optional, at most 64 bytes; "" uses the kind's heading
+channel = "shooter/state/flywheel_velocity_rps"
+```
+
+A channel is a dictionary name, `<owner>/<role>/<field path>` with no leading
+`/` (letters, digits, `_` and `/`), at most 256 bytes. A layout reads at most
+256 distinct channels. Each kind takes only its own keys:
+
+| `kind` | Keys (defaults) | Channels it reads |
+| --- | --- | --- |
+| `match` | none | `hw/state/driver_station/{connected, enabled, autonomous, teleop, test, estop, fms_attached, alliance, match_time_s}` |
+| `power` | `warn_below_v` (11.5; in (0, 20]) | `hw/status/{battery_v, brownout, health_valid}` |
+| `routine` | `channel` (required), `phase` | both |
+| `alerts` | none | every alert channel of the dictionary |
+| `subsystems` | `nodes`: node names to show (all) | none: the bridge's drive summary |
+| `field` | `pose` (required: the prefix of `x_m`, `y_m`, `yaw_rad`), `valid`, `localized`, `trail_s` (5; [0, 30]) | the three pose fields, `valid`, `localized` |
+| `number` | `channel` (required), `label` (""), `precision` (2; 0..6), `warn_below`, `warn_above` (below < above) | `channel` |
+| `boolean` | `channel` (required), `label` (""), `good` (true: the value drawn green) | `channel` |
+| `text` | `channel` (required), `label` ("") | `channel`, shown by its enum label |
+| `graph` | `channels` (required, 1 to 8), `window_s` (10; (0, 30]), `min`, `max` (min < max) | `channels` |
+| `checks` | `items` (required, 1 to 16) of `{ label, channel, equals }` or `{ label, channel, at_least, at_most }` (either bound, or both) | each item's `channel` |
+
+A check passes while its channel's value meets every condition: `equals`
+takes a bool (a Bool channel), a number, or a string (an enum channel's
+label). `camera`, `mechanism`, `chooser` and `tunable` are reserved kinds,
+and a `field` widget's `trajectory` a reserved key: each is refused by name
+until its slice lands.
+
+Parsing refuses, naming the file, then `[dashboard].<key>` or
+`widgets[<index>].<key>` (index from 0; for example `widgets[3].at`,
+`widgets[1].items[0].equals`): a TOML syntax error (with its line and
+column); an unknown top-level key, `[dashboard]` key or widget key; a missing,
+unknown or reserved `kind`; a missing required key; a value of the wrong type
+or outside its range; a cell that is not four integers, is empty, lies
+outside the grid or overlaps an earlier widget; a malformed channel or node
+name, or one listed twice in a widget; a check with no condition or with
+`equals` beside a bound; more widgets, graph channels, check items or
+distinct channels than the limits above; drive reservations over 80,000 B/s;
+and a budget below the worst case.
+
+**Worst case.** One drive client can be sent, in a second,
+`update_hz` keyframes of the feed's channels plus two summaries and ten
+heartbeats:
+
+```
+update_hz x (12 x channels + pages x 210) + 2 x (4096 + 10) + 10 x 210
+pages = max(1, ceil(channels / 83))
+```
+
+210 B is a value page's overhead bound plus a WebSocket header, 83 the
+samples a 1200 B page always holds, 4096 B the drive summary's cap at most
+every 500 ms, and an empty update goes out every 100 ms (`wire.h`).
+Parsing requires `budget_bytes_per_s` to cover the named channels;
+`CheckDashboardBudget(layout, count)` checks it for a feed of `count`
+channels, such as the named ones plus the dictionary's alert channels.
+At 20 Hz a 24,000 B/s budget covers 39 channels.
+
+**`/drive/layout.json`.** One object; every key present, defaults filled
+in, an unset optional number `null`, `"channels"` the sorted distinct named
+channels (the named part of the drive feed's channel mask), `"alerts"`
+whether the feed also carries every alert channel, `"file"` the layout's file
+name. Each widget has `kind`, `at`, `title` and a `channels` object from role
+to channel name (a widget's single channels; for `match` and `power` the
+roles are the field names above, for `field` `x`, `y`, `yaw`, `valid`,
+`localized`), then its options: `power` `warn_below_v`; `subsystems`
+`nodes`; `field` `trail_s`; `number` `label`, `precision`, `warn_below`,
+`warn_above`; `boolean` `label`, `good`; `text` `label`; `graph` `series`
+(its channels), `window_s`, `min`, `max`; `checks` `items`, each
+`{label, channel, equals, at_least, at_most}`.
+
+```json
+{"version":1,"file":"dashboard.toml","title":"Drive","columns":12,"rows":8,
+ "update_hz":20,"budget_bytes_per_s":24000,"drive_clients":2,"alerts":false,
+ "channels":["autonomous/state/phase","autonomous/state/routine_index"],
+ "widgets":[{"kind":"routine","at":[0,0,4,2],"title":"",
+   "channels":{"channel":"autonomous/state/routine_index",
+               "phase":"autonomous/state/phase"}}]}
+```

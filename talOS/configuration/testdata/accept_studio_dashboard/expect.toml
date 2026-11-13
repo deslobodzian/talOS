@@ -1,0 +1,5 @@
+# [studio] dashboard resolves against the file that sets it (here the
+# include), and the layout is a dependency of the config, so it is bundled.
+accept = true
+nodes = ["//a:node"]
+files = ["base/a.toml", "base/layouts/dashboard.toml", "base/robot.toml"]

@@ -299,7 +299,8 @@ handlers.
 ```
 configuration/robot.toml        [robot] period, timeouts, controller address
                                 [robot.targets] target lanes per Driver Station mode
-                                [studio] viewer bridge
+                                [studio] viewer bridge; dashboard = "dashboard.toml", the driver
+                                dashboard's layout (talOS/telemetry/README.md)
                                 [[subsystems]] name + path, one per subsystem
 configuration/subsystems/*.toml [subsystem] name, node = "//...:node", period_us,
                                 custom keys (node.param), [motors.*] and other devices,
@@ -335,7 +336,7 @@ so `bazel run //tools:sync_manifest -- <dir>/robot.toml` writes
 `<dir>/robot_manifest.bzl` (`<stem>_manifest.bzl` for any other config name):
 `NODES`, every node label the config launches, and `CONFIG_FILES`, every file
 it reads besides itself (`include`, `path`, `defaults`, `[trajectories]`
-files). `talos_bundle`, which ships them at the same relative layout, and
+files, `[studio] dashboard`). `talos_bundle`, which ships them at the same relative layout, and
 `talos_graph_test` take those constants; no BUILD file lists nodes or
 subsystem files. Each config package has a `manifest_sync_test`
 (`tools/sync_manifest.bzl`). `talos_bundle` additionally runs the same check as

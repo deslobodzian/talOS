@@ -502,6 +502,46 @@ TEST_F(ManifestTest, TrajectoryPathResolvesAgainstTheSubsystemFile) {
   }
 }
 
+// The bridge and the telemetry node open the dashboard layout at the path
+// config load resolved: against the file that set the key, the including
+// file's setting winning, and a missing file is refused naming that file and
+// the key. (Shared cases accept_studio_dashboard and
+// reject_studio_dashboard_missing_file prove it is a listed dependency.)
+// REQ-OPS-39
+TEST_F(ManifestTest, StudioDashboardResolvesAgainstTheFileThatSetsIt) {
+  std::filesystem::create_directories(dir_ / "base" / "layouts");
+  Write("base/layouts/dashboard.toml", "");
+  Write("subsystems/test.toml",
+        "[subsystem]\nname = \"test\"\n[motors.m]\ncan_id = 1\n");
+  Write(
+      "base/robot.toml",
+      "[studio]\ndashboard = \"layouts/dashboard.toml\"\n"
+      "[[subsystems]]\nname = \"test\"\npath = \"../subsystems/test.toml\"\n");
+  Write("robot.toml", "include = \"base/robot.toml\"\n");
+  EXPECT_TRUE(
+      std::filesystem::equivalent(ParseRobotConfig(Robot()).studio.dashboard,
+                                  dir_ / "base/layouts/dashboard.toml"));
+
+  Write("drive.toml", "");
+  Write("robot.toml",
+        "include = \"base/robot.toml\"\n[studio]\ndashboard = "
+        "\"drive.toml\"\n");
+  EXPECT_TRUE(std::filesystem::equivalent(
+      ParseRobotConfig(Robot()).studio.dashboard, dir_ / "drive.toml"));
+
+  Write("robot.toml",
+        "include = \"base/robot.toml\"\n[studio]\ndashboard = "
+        "\"missing.toml\"\n");
+  try {
+    ParseRobotConfig(Robot());
+    ADD_FAILURE() << "a missing dashboard layout was accepted";
+  } catch (const std::invalid_argument& error) {
+    const std::string what = error.what();
+    EXPECT_NE(what.find(Robot()), std::string::npos) << what;
+    EXPECT_NE(what.find("[studio] dashboard"), std::string::npos) << what;
+  }
+}
+
 // The TalonFX applies soft limits in its own position frame, which a reset
 // restarts unless it is a remote CANcoder's absolute frame.
 TEST_F(ManifestTest, RefusesSoftLimitsOutsideAnAbsolutePositionFrame) {

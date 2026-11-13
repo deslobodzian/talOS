@@ -56,6 +56,16 @@ static_assert(kMaxUpdateBytes <= kClientBurstBytes,
               "a keyframe of kMaxChannels must fit the Studio bridge's "
               "egress burst; update docs/DATA_FLOW.md with either");
 
+// The driver dashboard feed's rates, which a dashboard layout's worst case
+// (talOS/telemetry:dashboard_layout) counts: with nothing new to send, a
+// client gets an empty update every kHeartbeatIntervalNs (the Studio
+// bridge's heartbeat, studio/bridge ClientFeed), and the drive summary text
+// message (REQ-OPS-35) is at most kDriveSummaryMaxBytes, at most once per
+// kDriveSummaryIntervalNs.
+inline constexpr std::int64_t kHeartbeatIntervalNs = 100'000'000;
+inline constexpr std::size_t kDriveSummaryMaxBytes = 4096;
+inline constexpr std::int64_t kDriveSummaryIntervalNs = 500'000'000;
+
 // Slot geometry for the /talos/telemetry byte topic. One slot holds one
 // value page or one dictionary page; a dictionary takes as many pages as it
 // needs, each at most one slot, so one channel's entry (name, unit, labels)
