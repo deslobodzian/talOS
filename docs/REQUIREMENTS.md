@@ -134,6 +134,7 @@ numbered section, a number in RULES a rule:
 | REQ-CONTRACT-33 | `naming::ParseAlertField` is the only alert grammar. `LintGraph` errors on an `alert_` field that is not a `bool`, or whose level is not `error`, `warning` or `info`, and warns on one outside a `status` topic. | P1 | NAMING | lint diagnostics (TODO VIS-1 until built) | unit |
 | REQ-CONTRACT-34 | While a device's sample is invalid, a node's position read (`Motor`, `CANcoder` and `Encoder` position, `Gyro` yaw; C++, C ABI and Python alike) returns the last valid sample's hardware-frame position through the current rezero offset (0 before any valid sample), and its rate and effort reads return the sample's zero; `connected()` is false. | P1 | HR "Fault scope"; NDG "Hardware" | device reads across an invalid sample | component |
 | REQ-CONTRACT-35 | A hardware configuration with no motor, or no device, is valid: it loads, crosses the config wire, configures every backend and runs with no total-loss fault; its digital and PWM outputs drive under the same gates. | P2 | HR "Configuration" | config load; State flags; outputs | component |
+| REQ-CONTRACT-36 | A topic admits `MAX_READERS` (32) readers across processes, observers included, each reading every message within the 1023-message overwrite window; the graph lint refuses a 33rd declared reader, and `ipc::Subscriber` and the realtime loop refuse a 33rd registration, naming the topic and the limit. A segment of another layout version is refused, never misread. | P1 | NAMING "Topics"; RTMS; DF "Main-processor shared-memory slots" | lint diagnostic; registration error | unit + component + integration |
 
 ### RT: tick timing, drain semantics, realtime tiers, no allocation
 
@@ -247,8 +248,8 @@ serves none is listed as such with the TODO.md item that settles it
 
 | Package | Serves |
 |---|---|
-| `talOS/rtms`, `talOS/memory`, `talOS/ipc` | REQ-SAFE-08, REQ-CONTRACT-07, REQ-CONTRACT-21, REQ-CONTRACT-22, REQ-RT-12, REQ-RT-19, REQ-OPS-03 |
-| `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-RT-19, REQ-RT-21, REQ-CONTRACT-20, REQ-OPS-12 to REQ-OPS-14, REQ-OPS-31 |
+| `talOS/rtms`, `talOS/memory`, `talOS/ipc` | REQ-SAFE-08, REQ-CONTRACT-07, REQ-CONTRACT-21, REQ-CONTRACT-36, REQ-CONTRACT-22, REQ-RT-12, REQ-RT-19, REQ-OPS-03 |
+| `talOS/events` | REQ-RT-01 to REQ-RT-05, REQ-RT-11, REQ-RT-19, REQ-RT-21, REQ-CONTRACT-20, REQ-CONTRACT-36, REQ-OPS-12 to REQ-OPS-14, REQ-OPS-31 |
 | `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-RT-19, REQ-RT-21, REQ-DEV-08, REQ-CONTRACT-31 |
 | `talOS/devices` | REQ-SAFE-01 to REQ-SAFE-09, REQ-SAFE-12, REQ-SAFE-13, REQ-CONTRACT-23, REQ-DEV-07 |
 | `talOS/bridge` | REQ-SAFE-11, REQ-SAFE-15, REQ-SAFE-16, REQ-SAFE-19, REQ-CONTRACT-04, REQ-RT-13, REQ-RT-20, REQ-RT-22, REQ-OPS-20, REQ-OPS-21 |
@@ -257,7 +258,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31 |
 | `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-26 (`tlog_to_wpilog`), REQ-OPS-30, REQ-OPS-32, REQ-DEV-04, REQ-OPS-33, REQ-OPS-43 |
-| `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
+| `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-36, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09 |
 | `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09 |
