@@ -69,6 +69,54 @@ TEST(TelemetryChannels, AValueEndingPastTheMessageIsNotRead) {
   EXPECT_FALSE(ReadDriverStation(packet_bytes.first(packet_end - 1), values));
 }
 
+// REQ-OPS-41: studio_review reads a recorded target lane through these
+// channels. Each reads its own field of the whole envelope: the header's
+// generation and active flag, and every inner field at the header's offset
+// past where the bare struct has it (a channel read at the bare offset would
+// show the header's bytes as the message).
+TEST(TelemetryChannels, EnvelopeChannelsReadTheHeaderAndTheMessageBehindIt) {
+  const schema::Identity identity = schema::Of<schema_test::Mixed>();
+  const schema_test::Mixed message{
+      true,
+      2.5,
+      schema_test::Level::TOP,
+      7,
+      schema_test::Inner{schema_test::Mode::HIGH, 0.25f},
+      -1.5f};
+  struct Envelope {
+    std::uint64_t mode_since_us;
+    std::uint8_t active;
+    std::array<std::uint8_t, 7> padding;
+    schema_test::Mixed message;
+  };
+  static_assert(offsetof(Envelope, active) == schema::kEnvelopeActiveOffset);
+  static_assert(offsetof(Envelope, message) == schema::kEnvelopeHeaderBytes);
+  const Envelope envelope{123'456, 1, {}, message};
+  const std::span<const std::byte> bytes =
+      std::as_bytes(std::span{&envelope, 1});
+
+  const std::vector<Channel> inner =
+      FlattenTopic("/demo/target/teleop/message", identity.name, identity.bfbs);
+  const std::vector<Channel> channels =
+      EnvelopeChannels("/demo/target/teleop", identity.name, identity.bfbs);
+  ASSERT_EQ(channels.size(), inner.size() + 2);
+  std::uint64_t raw = 0;
+  ASSERT_TRUE(ReadChannel(channels[0], bytes, raw));
+  EXPECT_EQ(raw, 123'456u) << channels[0].name;
+  ASSERT_TRUE(ReadChannel(channels[1], bytes, raw));
+  EXPECT_EQ(raw, 1u) << channels[1].name;
+  const std::span<const std::byte> bare = std::as_bytes(std::span{&message, 1});
+  for (std::size_t i = 0; i < inner.size(); ++i) {
+    SCOPED_TRACE(inner[i].name);
+    const Channel& channel = channels[i + 2];
+    EXPECT_EQ(channel.name, inner[i].name);
+    std::uint64_t expected = 0;
+    ASSERT_TRUE(ReadChannel(inner[i], bare, expected));
+    ASSERT_TRUE(ReadChannel(channel, bytes, raw));
+    EXPECT_EQ(raw, expected);
+  }
+}
+
 // One field of a crafted reflection struct.
 struct CraftedField {
   reflection::BaseType base;
