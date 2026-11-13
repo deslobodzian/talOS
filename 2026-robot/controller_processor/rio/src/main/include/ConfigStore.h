@@ -45,7 +45,9 @@ std::optional<hardware::Config> BeginRestore(hardware::Gateway& gateway,
 // flash). The two share one mutex, which the saver holds only to move a
 // configuration in or a result out, never across a save, and which the loop
 // thread only ever try-locks: when it is taken, the tick goes on and the next
-// one tries again. The loop thread never waits on the save.
+// one tries again. The loop thread never waits on the save, nor on a lock
+// the saver can hold in the allocator: the saver frees no memory the loop
+// thread allocated, handing each saved configuration back to Tick() to free.
 //
 // The newest acknowledged configuration is the one left on disk: one
 // acknowledged while a save is in flight is saved after it, and one handed
@@ -75,6 +77,18 @@ class ConfigPersister {
   void Start();
   // Saves what was handed over and not yet saved, then joins the thread.
   // Called after the loop has stopped ticking (also by the destructor).
+  //
+  // The join is unbounded: a save stuck in fsync keeps Stop() from
+  // returning. Bounding it could not let the program exit sooner: Linux does
+  // not finish exiting a process while one of its threads sleeps
+  // uninterruptibly in fsync, and returning without the join would leave the
+  // saver touching this object after its destruction (and std::thread's
+  // destructor would terminate). Robot.cpp calls Stop() only after
+  // neutralizing every output. On the RoboRIO it is not reached in normal
+  // operation: with no HAL main loop, StartCompetition returns only on
+  // EndCompetition, and the program is otherwise ended by a signal
+  // (redeploy, restart robot code), which cuts a save short; the save's
+  // rename keeps the file whole either way.
   void Stop();
 
   // Loop thread: a configuration the gateway acknowledged
@@ -106,6 +120,12 @@ class ConfigPersister {
   std::mutex mutex_;
   std::condition_variable wake_;
   std::optional<hardware::Config> pending_;
+  // The last configuration saved, handed back for Tick() to free. The loop
+  // thread allocated its storage (Acknowledged copies it), and the saver
+  // frees none of it: once the saver's tcache is full, glibc's free takes the
+  // allocating arena's lock, and a nice-19 thread preempted holding it would
+  // stall the loop's next allocation (no priority inheritance).
+  std::optional<hardware::Config> done_;
   uint64_t finished_{0};
   uint64_t failed_{0};
   uint64_t saved_id_;

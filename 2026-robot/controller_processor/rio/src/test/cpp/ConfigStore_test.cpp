@@ -7,11 +7,15 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <new>
 #include <span>
 #include <string>
 #include <thread>
@@ -20,6 +24,69 @@
 #include "hardware/gateway.h"
 
 namespace hw = talos::hardware;
+
+// Which thread frees a watched block, for
+// ConfigPersister.TheSaverFreesNothingTheLoopAllocated. Global new and delete
+// are replaced for this test binary with malloc and free (the pair the
+// default ones use), so every block is freed through Freed().
+namespace {
+std::array<std::atomic<const void*>, 4> watched{};
+std::atomic<int> freed_by_loop{0};
+std::atomic<int> freed_elsewhere{0};
+thread_local bool on_loop_thread = false;
+
+void Freed(void* block) {
+  if (block == nullptr) return;
+  for (auto& slot : watched) {
+    const void* expected = block;
+    if (slot.load(std::memory_order_relaxed) == block &&
+        slot.compare_exchange_strong(expected, nullptr)) {
+      (on_loop_thread ? freed_by_loop : freed_elsewhere)
+          .fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+void* Allocate(std::size_t size) {
+  if (void* block = std::malloc(size == 0 ? 1 : size)) return block;
+  throw std::bad_alloc{};
+}
+}  // namespace
+
+// Every unaligned form, so a sanitizer's own new is never paired with free.
+void* operator new(std::size_t size) { return Allocate(size); }
+void* operator new[](std::size_t size) { return Allocate(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+  return std::malloc(size == 0 ? 1 : size);
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+  return std::malloc(size == 0 ? 1 : size);
+}
+void operator delete(void* block, const std::nothrow_t&) noexcept {
+  Freed(block);
+  std::free(block);
+}
+void operator delete[](void* block, const std::nothrow_t&) noexcept {
+  Freed(block);
+  std::free(block);
+}
+void operator delete(void* block) noexcept {
+  Freed(block);
+  std::free(block);
+}
+void operator delete[](void* block) noexcept {
+  Freed(block);
+  std::free(block);
+}
+void operator delete(void* block, std::size_t) noexcept {
+  Freed(block);
+  std::free(block);
+}
+void operator delete[](void* block, std::size_t) noexcept {
+  Freed(block);
+  std::free(block);
+}
 
 namespace {
 
@@ -214,6 +281,56 @@ TEST(ConfigPersister, AFailedSaveIsReportedOnceAndAnIdenticalPushRetriesIt) {
   persister.Stop();
   EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a),
                                                      hw::ConfigurationId(a)}));
+}
+
+// The loop thread allocates the configuration it hands over (Acknowledged
+// copies it); were the saver to free it, glibc's free, once the saver's
+// tcache is full, takes the arena lock the loop thread allocates under, and
+// the nice-19 saver preempted holding it stalls the loop. So the saver hands
+// each saved configuration back, and the loop's next Tick() frees it: here
+// the copy's motor array and a motor name too long for the string's inline
+// buffer, watched from the save until they are freed.
+// REQ-CONTRACT-06
+TEST(ConfigPersister, TheSaverFreesNothingTheLoopAllocated) {
+  on_loop_thread = true;
+  freed_by_loop = 0;
+  freed_elsewhere = 0;
+  hw::Config a = ConfigWithMotor(1);
+  a.motors[0].name = "a_motor_name_longer_than_any_inline_string_buffer";
+  std::mutex mutex;
+  bool done = false;
+  talos::rio::ConfigPersister persister{
+      [&](const hw::Config& config) {
+        watched[0].store(config.motors.data());
+        watched[1].store(config.motors[0].name.data());
+        std::lock_guard lock{mutex};
+        done = true;
+        return true;
+      },
+      0};
+  persister.Start();
+  persister.Acknowledged(a);
+
+  // Ticks, as the loop does, until the save ran and both blocks are freed
+  // (10 s bounds a hang): a tick that finds the saver holding the mutex
+  // hands nothing over, and the next one does. Then the saver has finished
+  // too, and has freed neither.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  while (freed_by_loop.load() + freed_elsewhere.load() < 2 &&
+         std::chrono::steady_clock::now() < deadline) {
+    persister.Tick(true);
+    std::this_thread::yield();
+  }
+  persister.Stop();
+  {
+    std::lock_guard lock{mutex};
+    ASSERT_TRUE(done) << "the save never ran";
+  }
+  EXPECT_EQ(freed_elsewhere.load(), 0)
+      << "blocks of the handed-over configuration the saver thread freed";
+  EXPECT_EQ(freed_by_loop.load(), 2);
+  on_loop_thread = false;
 }
 
 }  // namespace
