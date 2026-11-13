@@ -213,7 +213,11 @@ in the config or a flag, is an integer in [1, 65535]; config load or flag
 parsing refuses anything else. The launcher
 resolves the effective endpoint once per launch, prints it
 (`[launcher] Controller <addr>:<port> ...`), and always starts
-`hardware_node` with an explicit `--remote/--remote-port/--local-port` triple.
+`hardware_node` with an explicit `--remote/--remote-port/--local-port` triple,
+which its `--describe` probe gets too (`ControllerArgs`): the bridge refuses
+`--sim` without the loopback remote, so a probe left to the config's
+address would refuse `--sim --remote 127.0.0.1` on a config naming the
+RoboRIO.
 Running the bridge standalone resolves identically: its own `--remote` wins,
 otherwise its `--config` supplies the address. Simulation requires the loopback
 remote. On hardware, commissioning gates commands; see

@@ -3284,5 +3284,47 @@ TEST(LauncherRemoteTest, SimulationRefusesPhysicalEffectiveRemote) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// REQ-OPS-25, TODO.md DEPLOY-7: `--sim --remote 127.0.0.1` on a config whose
+// controller_address is the RoboRIO's. hardware_node refuses --sim without
+// the loopback remote, so its --describe probe must get the effective
+// --remote the launch gives it, not fall back to the config's address. The
+// stub refuses as the bridge does: before the fix it was probed without
+// --remote, did not answer, and the critical bridge refused the graph.
+TEST(LauncherRemoteTest, BridgeProbeGetsTheEffectiveRemote) {
+  auto options = SessionFixture("probe_remote");
+  {
+    std::string toml{kFixtureToml};
+    const std::string header = "[robot]\n";
+    toml.insert(toml.find(header) + header.size(),
+                "controller_address = \"10.56.87.2\"\n");
+    std::ofstream{options.config_path} << toml;
+  }
+  const std::string stub =
+      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {});
+  const std::string shebang = "#!/bin/sh\n";
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      "probe_remote_hardware",
+      shebang +
+          "remote=\"\"\nprev=\"\"\n"
+          "for arg in \"$@\"; do\n"
+          "  if [ \"$prev\" = \"--remote\" ]; then remote=\"$arg\"; fi\n"
+          "  prev=\"$arg\"\n"
+          "done\n"
+          "if [ \"$remote\" != \"127.0.0.1\" ]; then\n"
+          "  echo \"--sim requires --remote 127.0.0.1, got '$remote'\" >&2\n"
+          "  exit 1\n"
+          "fi\n" +
+          stub.substr(shebang.size()));
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.describe_only = true;
+  EXPECT_EQ(Launcher{options}.Run(), 0);
+  const std::string graph =
+      ReadFile(options.output_dir + "/" + std::to_string(options.session_id) +
+               "/graph.json");
+  EXPECT_EQ(graph.find("\"described\": false"), std::string::npos) << graph;
+  std::filesystem::remove_all(options.output_dir);
+}
+
 }  // namespace
 }  // namespace talos::launcher

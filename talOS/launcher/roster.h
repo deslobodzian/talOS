@@ -32,7 +32,8 @@ struct NodeSpec {
   std::string name;
   std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
   std::string binary_path;
-  // Forwarded unchanged to both --describe and runtime.
+  // Forwarded unchanged to both --describe and runtime: the hardware
+  // bridge's ControllerArgs, the sim gateway's --sim-gateway-arg values.
   std::vector<std::string> extra_args;
   bool critical{true};
   bool owns_actuators{false};
@@ -197,11 +198,22 @@ NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
                       const LauncherOptions& options,
                       bool studio_bridge = false);
 
-// The roster: the hardware bridge, the subsystems, the sim gateway under
-// --sim-gateway, and the Studio bridge (NodeSpec::studio_bridge) under
-// --start-studio-bridge unless BundleWithoutStudio(options). A subsystem
-// may share a name with a member the launcher adds; Launcher::Run refuses
-// such a roster.
+// The controller addressing the hardware bridge is described and started
+// with: `--remote`, `--remote-port` and `--local-port`, each the effective
+// value (a flag wins over the config). DiscoverNodes puts them in the
+// bridge's NodeSpec::extra_args, so its --describe probe and every run get
+// the same ones: hardware_node refuses --sim without the loopback remote,
+// and a probe that fell back to the config's address would refuse
+// `--sim --remote 127.0.0.1` on a config naming the RoboRIO. Throws as
+// config::ResolveControllerAddress does on an invalid --remote.
+std::vector<std::string> ControllerArgs(const config::RobotConfig& config,
+                                        const LauncherOptions& options);
+
+// The roster: the hardware bridge (with ControllerArgs), the subsystems, the
+// sim gateway under --sim-gateway, and the Studio bridge
+// (NodeSpec::studio_bridge) under --start-studio-bridge unless
+// BundleWithoutStudio(options). A subsystem may share a name with a member
+// the launcher adds; Launcher::Run refuses such a roster.
 std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
                                     const LauncherOptions& options);
 
