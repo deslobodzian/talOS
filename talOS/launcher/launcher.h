@@ -9,6 +9,7 @@
 
 #include <sys/types.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -114,8 +115,31 @@ class Launcher {
   int Run();
 
  private:
-  // Run's body, with the launcher's output taken.
-  int RunSession();
+  // A roster-starting launch's stop handlers for the length of one Run:
+  // Install saves the dispositions of SIGINT, SIGTERM and SIGHUP it finds,
+  // then installs the handlers (InstallSignals); the destructor puts the
+  // saved dispositions back. Run owns one, so they are put back on every
+  // return path, in the order Run states.
+  class StopSignals {
+   public:
+    StopSignals() = default;
+    ~StopSignals();
+    StopSignals(const StopSignals&) = delete;
+    StopSignals& operator=(const StopSignals&) = delete;
+    StopSignals(StopSignals&&) = delete;
+    StopSignals& operator=(StopSignals&&) = delete;
+
+    void Install();
+
+   private:
+    static constexpr std::array kSignals{SIGINT, SIGTERM, SIGHUP};
+    bool installed_{false};
+    std::array<struct sigaction, kSignals.size()> saved_{};
+  };
+
+  // Run's body, with the launcher's output taken. A launch that starts the
+  // roster installs `stop_signals` before it creates anything.
+  int RunSession(StopSignals& stop_signals);
 
   // Replaces manifest.json with the session's state and `procs`. Before the
   // first node starts, and for the final manifest, it is written here and in
@@ -275,8 +299,8 @@ class Launcher {
   // and process::StopFd() readable, which a running --describe probe waits
   // on) and then wakes the supervision loop (SupervisionWakeup::Wake). Both
   // are async-signal-safe. Clears a stop an earlier session of this process
-  // took. RunSession calls it before a roster-starting launch creates
-  // anything.
+  // took. StopSignals::Install calls it, which RunSession calls before a
+  // roster-starting launch creates anything.
   static void InstallSignals();
 
   // SpawnProcess for one run of a roster member: -1 with `error` naming the

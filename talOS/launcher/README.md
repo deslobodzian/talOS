@@ -49,7 +49,9 @@ launch that recorded nothing ([session segments and logs](#session-segments-and-
 Once phase two has created the session's topic segments, a stop starts no
 member that has not started yet (the manifest's `stopped_before_start`),
 stops those that have as every stop does ([restarts](#restarts)), writes
-the final manifest and unlinks the segments. `--describe-only` and
+the final manifest and unlinks the segments. The launch keeps its stop
+handling until every member is reaped and the segments are unlinked, and
+then puts back the dispositions it found. `--describe-only` and
 `--replay-inputs` keep the default action: a stop ends the launcher at
 once, and each probe's or the replayed node's guardian kills its group.
 
