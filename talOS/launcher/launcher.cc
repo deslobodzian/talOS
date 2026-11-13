@@ -212,10 +212,14 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
 
 // Totals every run's event log into `procs` once the session has ended --
 // record counts, capped and damaged logs -- and returns the session's exit
-// status before the endpoint refusal: 0, or the last nonzero exit code.
-int SummarizeLogs(std::vector<NodeProcessInfo>& procs) {
+// status before the endpoint refusal: 0, or the last nonzero exit code of a
+// member whose last run did not end by the stop signal the launcher sent it
+// (`stopped_by_session`, one per member; EndedByOwnStopSignal).
+int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
+                  const std::vector<bool>& stopped_by_session) {
   int exit_status = 0;
-  for (auto& proc : procs) {
+  for (std::size_t i = 0; i < procs.size(); ++i) {
+    auto& proc = procs[i];
     // Every run's log: a restarted node's records are the sum of its runs.
     for (const auto& path : proc.log_paths) {
       if (std::filesystem::exists(event::log::CappedMarkerPath(path)))
@@ -236,7 +240,8 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs) {
         }
       }
     }
-    if (proc.exit_code != 0) exit_status = proc.exit_code;
+    if (proc.exit_code != 0 && !stopped_by_session[i])
+      exit_status = proc.exit_code;
   }
   return exit_status;
 }
@@ -300,6 +305,11 @@ std::string_view RunEndReason(std::string_view kill_reason, bool stopping,
   if (kill_reason == kRunStopTimeout && signal == SIGKILL)
     return kRunStopTimeout;
   return clean || signal == SIGINT || signal == SIGTERM ? kRunStop : kRunCrash;
+}
+
+bool EndedByOwnStopSignal(std::string_view kill_reason, int status) {
+  return (kill_reason == kRunStop || kill_reason == kRunStopTimeout) &&
+         WIFSIGNALED(status) && WTERMSIG(status) == kStopSignal;
 }
 
 bool CappedLogStopped(const std::string& log_path) {
@@ -710,7 +720,11 @@ int Launcher::RunSession() {
                 << " bytes of output dropped (marked in " << path << ")\n";
   }
 
-  int exit_status = SummarizeLogs(procs);
+  std::vector<bool> stopped_by_session;
+  stopped_by_session.reserve(launches.size());
+  for (const auto& launch : launches)
+    stopped_by_session.push_back(launch.stopped_by_session);
+  int exit_status = SummarizeLogs(procs, stopped_by_session);
   if (endpoints_refused_) exit_status = 1;
   manifest.nodes = std::move(procs);
 
@@ -948,6 +962,7 @@ void Launcher::ShowRestart(NodeProcessInfo& proc,
 void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
   liveness.Begin(spawned);
   kill_reason = {};
+  stopped_by_session = false;
   heartbeat_killed = false;
   endpoints_checked = false;
   realtime_reported = false;
@@ -1299,6 +1314,11 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       proc.exit_signal = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
       manifest_changed = true;
       const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+      // Read only from the launcher's own record of what it sent, never
+      // from the stop flag: a stop signal from elsewhere that ended the run
+      // first is not the session's (EndedByOwnStopSignal).
+      launch.stopped_by_session =
+          EndedByOwnStopSignal(launch.kill_reason, status);
       proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status));
       const bool is_bridge = studio && i == studio->index();
       if (is_bridge && studio->Starting(i)) continue;
@@ -1384,7 +1404,9 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
-        SignalProcessGroup(proc.pid, SIGINT);
+        // The exit this causes is reaped by a later pass, which reads the
+        // kill_reason set here (EndedByOwnStopSignal).
+        SignalProcessGroup(proc.pid, kStopSignal);
         if (launches[i].kill_reason.empty()) launches[i].kill_reason = kRunStop;
       }
     }
