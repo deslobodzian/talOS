@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -409,9 +408,12 @@ class TopicSummary {
     if (token == "true" || token == "false") {
       value = token == "true" ? 1 : 0;
     } else {
-      const auto [end, error] =
-          std::from_chars(token.data(), token.data() + token.size(), value);
-      if (error != std::errc{} || end != token.data() + token.size() ||
+      // strtod, not from_chars: libc++ has no floating-point from_chars
+      // before macOS 26.
+      const std::string text{token};
+      char* end = nullptr;
+      value = std::strtod(text.c_str(), &end);
+      if (text.empty() || end != text.c_str() + text.size() ||
           std::isnan(value)) {
         return;
       }
