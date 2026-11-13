@@ -6,5 +6,4 @@
 # longer missing. Delete a case once its test exists or its `matrix: n/a`
 # line gives the reason; never add one.
 2026-robot/main_processor/autonomous/node_test.cc 9
-2026-robot/main_processor/driver/node_test.cc 9
 2026-robot/main_processor/drivetrain/node_test.cc 9

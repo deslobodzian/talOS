@@ -5,10 +5,13 @@
 #include <cmath>
 #include <cstdio>
 #include <numbers>
+#include <stdexcept>
+#include <string>
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
 #include "talOS/devices/devices.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/node/node.h"
 #include "talOS/teleop/deadband.h"
 
@@ -25,13 +28,13 @@ class Driver {
  public:
   explicit Driver(talos::Node& node)
       : node_{node},
-        max_linear_mps_{node.param("max_linear_mps", 4.0)},
-        max_angular_radps_{node.param("max_angular_radps", 6.0)},
-        deadband_frac_{node.param("deadband_frac", 0.05)},
+        max_linear_mps_{Positive(node, "max_linear_mps", 4.0)},
+        max_angular_radps_{Positive(node, "max_angular_radps", 6.0)},
+        deadband_frac_{DeadbandFrac(node)},
         field_oriented_{node.param("field_oriented", true)},
         heading_timeout_{HeadingTimeout(node)},
-        rezero_button_id_{node.param("rezero_button_id", 1)},
-        heading_hold_radps_{node.param("heading_hold_radps", 0.0)},
+        rezero_button_id_{RezeroButton(node)},
+        heading_hold_radps_{HeadingHoldGain(node)},
         // Every state, in sequence, so no invalid one hides a valid one, but
         // at the node's next drain (a packet's wake or update()): waking on
         // each drivetrain tick would only store a value. Opened before the
@@ -71,12 +74,58 @@ class Driver {
                                          : "waiting for neutral");
   }
 
+  // Parameter checks run once, here in the constructor; the message names
+  // the key the way talos::Node::param does for a wrong type.
+  [[noreturn]] static void BadParameter(const talos::Node& node,
+                                        const char* key, const char* problem) {
+    const std::string name{node.name()};
+    throw std::invalid_argument(name + ": parameter '" + key + "' " + problem +
+                                " in [subsystems." + name + "]");
+  }
+
+  // Stick full scale: a negative one inverts the stick, zero ignores it.
+  static double Positive(const talos::Node& node, const char* key,
+                         double fallback) {
+    const double value = node.param(key, fallback);
+    if (!std::isfinite(value) || value <= 0)
+      BadParameter(node, key, "must be finite and positive");
+    return value;
+  }
+
+  // A fraction of full stick, [0, 1): at 1 no deflection leaves the deadband.
+  static double DeadbandFrac(const talos::Node& node) {
+    const double value = node.param("deadband_frac", 0.05);
+    if (!std::isfinite(value) || value < 0 || value >= 1)
+      BadParameter(node, "deadband_frac", "must be in [0, 1)");
+    return value;
+  }
+
+  // Zero turns the hold off; a negative gain drives away from the heading.
+  static double HeadingHoldGain(const talos::Node& node) {
+    const double value = node.param("heading_hold_radps", 0.0);
+    if (!std::isfinite(value) || value < 0)
+      BadParameter(node, "heading_hold_radps", "must be finite and >= 0");
+    return value;
+  }
+
+  // A Driver Station joystick has at most kMaxButtons (32) buttons, numbered
+  // from 1; a non-positive id turns re-zero off.
+  static int RezeroButton(const talos::Node& node) {
+    const int value = node.param("rezero_button_id", 1);
+    if (value > static_cast<int>(talos::driver_station::kMaxButtons))
+      BadParameter(node, "rezero_button_id",
+                   "must be at most 32 (non-positive disables re-zero)");
+    return value;
+  }
+
   // Five 20 ms periods by default, so one or two dropped packets do not flap
-  // the frame. A non-positive or non-finite value keeps the default.
+  // the frame.
   static talos::Duration HeadingTimeout(const talos::Node& node) {
     const double s = node.param("heading_timeout_s", 0.1);
+    if (!std::isfinite(s) || s <= 0)
+      BadParameter(node, "heading_timeout_s", "must be finite and positive");
     return std::chrono::duration_cast<talos::Duration>(
-        std::chrono::duration<double>{std::isfinite(s) && s > 0 ? s : 0.1});
+        std::chrono::duration<double>{s});
   }
 
   // The drivetrain owns the heading. A state it marks invalid (no gyro) or a
