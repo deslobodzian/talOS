@@ -567,21 +567,41 @@ class Vision {
     require(std::isfinite(solver_options_.mount_translation_std_m) &&
                 solver_options_.mount_translation_std_m >= 0,
             "camera.mount_translation_std_m");
-    if (!intr.IsValid() || !std::isfinite(camera_.max_range_m) ||
-        !(camera_.max_range_m > 0) || !std::isfinite(camera_.min_tag_px) ||
-        !(camera_.min_tag_px >= 0) || !(camera_.facing_min >= 0) ||
-        !(camera_.facing_min <= 1) || !std::isfinite(camera_.pixel_noise_std) ||
-        !(camera_.pixel_noise_std >= 0) ||
-        !std::isfinite(camera_.sensor_noise_std_gray) ||
-        !(camera_.sensor_noise_std_gray >= 0) ||
-        !std::isfinite(camera_.exposure_gain_std) ||
-        !(camera_.exposure_gain_std >= 0) ||
-        !std::isfinite(camera_.exposure_ms) || !(camera_.exposure_ms >= 0) ||
-        !(camera_.exposure_ms < 214748364) || seed < 0 ||
-        !camera_.mounting.T_robot_camera.matrix().allFinite()) {
-      throw std::runtime_error("invalid vision camera: " +
-                               std::string(node_.name()));
+    // Each key on its own, so the error names it (the ranges are those
+    // CameraIntrinsics::IsValid and the simulation paths rely on).
+    require(intr.fx > 0, "camera.fx");
+    require(intr.fy > 0, "camera.fy");
+    require(intr.cx > 0, "camera.cx");
+    require(intr.cy > 0, "camera.cy");
+    for (const auto& [key, value] : {
+             std::pair{"camera.x_m", extrinsics_.x_m},
+             std::pair{"camera.y_m", extrinsics_.y_m},
+             std::pair{"camera.z_m", extrinsics_.z_m},
+             std::pair{"camera.roll_rad", extrinsics_.roll_rad},
+             std::pair{"camera.pitch_rad", extrinsics_.pitch_rad},
+             std::pair{"camera.yaw_rad", extrinsics_.yaw_rad},
+         }) {
+      require(std::isfinite(value), key);
     }
+    require(std::isfinite(camera_.max_range_m) && camera_.max_range_m > 0,
+            "camera.max_range_m");
+    require(std::isfinite(camera_.min_tag_px) && camera_.min_tag_px >= 0,
+            "camera.min_tag_px");
+    require(camera_.facing_min >= 0 && camera_.facing_min <= 1,
+            "camera.facing_min");
+    require(
+        std::isfinite(camera_.pixel_noise_std) && camera_.pixel_noise_std >= 0,
+        "camera.pixel_noise_std");
+    require(std::isfinite(camera_.sensor_noise_std_gray) &&
+                camera_.sensor_noise_std_gray >= 0,
+            "camera.sensor_noise_std_gray");
+    require(std::isfinite(camera_.exposure_gain_std) &&
+                camera_.exposure_gain_std >= 0,
+            "camera.exposure_gain_std");
+    require(std::isfinite(camera_.exposure_ms) && camera_.exposure_ms >= 0 &&
+                camera_.exposure_ms < 214748364,
+            "camera.exposure_ms");
+    require(seed >= 0, "camera.rng_seed");
     capture_config_.camera_id = camera_id_;
     capture_config_.device_path = device_;
     capture_config_.width = width;
