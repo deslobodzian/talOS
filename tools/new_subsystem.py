@@ -1285,7 +1285,9 @@ period_us = @PERIOD@
 
 # Zero-code robot wiring: uncomment to have the teleop node write a
 # Driver Station button on the /@NAME@/target/teleop lane, without editing any
-# C++ or Python files in other packages.
+# C++ or Python files in other packages. Only once slot0 is tuned on the
+# mechanism: every config of this robot reads this file. A simulation-only
+# binding goes in the simulation-only config new_subsystem's `Next:` names.
 # [[teleop.bindings]]
 # button = 3
 # while_held = { velocity_rps = 20.0 }
@@ -1362,7 +1364,9 @@ home_samples = 3
 
 # Zero-code robot wiring: uncomment to have the teleop node write a
 # Driver Station button on the /@NAME@/target/teleop lane, without editing any
-# C++ or Python files in other packages.
+# C++ or Python files in other packages. Only once slot0 is tuned on the
+# mechanism: every config of this robot reads this file. A simulation-only
+# binding goes in the simulation-only config new_subsystem's `Next:` names.
 # [[teleop.bindings]]
 # button = 3
 # while_held = { position_rot = 0.0 }
@@ -2583,111 +2587,125 @@ def show(root, writes):
 # What ./sim.sh drives a scaffold with: teleop after a second disabled, and
 # joystick 0's button 3 (bit 2) pressed from second 3 to second 6, after a
 # neutral sample that arms the teleop lane (talos::OperatorArming).
-SIM_RUN = ("--sim-gateway --no-studio --duration-s 8 "
-           "--mode-schedule 'disabled:1,teleop:10' \\\n      "
-           "--joystick-schedule "
-           "'0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|"
-           "6:axes=0;buttons=0;pov=-1'")
+SIM_DURATION_S = 8
+MODE_SCHEDULE = "disabled:1,teleop:10"
+JOYSTICK_SCHEDULE = ("0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|"
+                     "6:axes=0;buttons=0;pov=-1")
+SIM_RUN = (f"--sim-gateway --no-studio --duration-s {SIM_DURATION_S} "
+           f"--mode-schedule '{MODE_SCHEDULE}' \\\n      "
+           f"--joystick-schedule '{JOYSTICK_SCHEDULE}'")
 
 
-def simulation_edits(name, kind):
-    """The edits to a scaffolded mechanism's subsystem file, in order, that
-    make it move under `./sim.sh --sim-gateway` with button 3 held.
+# The robot's simulation-only configs, in the order next_steps looks for
+# one: `include = "robot.toml"` plus each mechanism's simulation block.
+# new_robot writes robot_sim.toml with its manifest; 2026-robot's is
+# robot_physics_sim.toml.
+SIM_CONFIGS = ("robot_sim.toml", "robot_physics_sim.toml")
 
-    The scaffold leaves them undone on purpose: a fresh scaffold must never
-    drive a real mechanism from a button or on gains nobody tuned. Each edit
-    is (key, what to do, what happens if it is skipped, [(old, new)] text
-    replacements in the generated file); next_steps prints them and
-    new_robot_test applies them.
+SIM_CONFIG_HEADER = """\
+# Simulation only: ./sim.sh --config @CONFIG@ --sim-gateway
+# robot.toml never reads this file, so nothing here reaches the robot.
+include = "robot.toml"
+"""
+
+
+def sim_config(root, robot):
+    """(workspace-relative simulation config of `robot`, whether it exists):
+    the first of SIM_CONFIGS that does, else robot_sim.toml to create."""
+    configuration = f"{robot}/main_processor/configuration"
+    for name in SIM_CONFIGS:
+        if os.path.isfile(os.path.join(root, configuration, name)):
+            return f"{configuration}/{name}", True
+    return f"{configuration}/{SIM_CONFIGS[0]}", False
+
+
+def simulation_block(name, kind):
+    """The TOML a student appends to the robot's simulation config so that
+    `name` moves under `./sim.sh --sim-gateway` with button 3 held.
+
+    The values go there, not in the subsystem file, because the robot's own
+    configs never read the simulation config: a live button binding, gains
+    nobody tuned and an unmeasured travel cannot reach a real robot,
+    commissioned or not. The scaffold leaves the subsystem file with its
+    binding commented and every gain zero. next_steps prints the block;
+    new_robot_test and scaffold_sim_test append it as printed.
     """
     lane = f"/{name}/target/teleop"
+    sub = f"subsystems.{name}"
     if kind == "position":
-        motor, demand, field = name, "position_rot = 0.0", "position_rot"
-        moved = "position_rot = 1.0"
+        motor, demand = name, "position_rot = 1.0"
+        measure = " and\n# measure its travel"
     else:
-        motor, demand, field = f"{name}_motor", "velocity_rps = 20.0", None
-        moved = demand
-    binding = ("# [[teleop.bindings]]\n# button = 3\n"
-               f"# while_held = {{ {demand} }}\n")
-    edits = [(
-        "[[teleop.bindings]]",
-        "uncomment it" + (f", with {moved}" if field else "")
-        + f": holding joystick button 3 writes {moved} on {lane}.",
-        f"nothing writes {lane}, so the {name} never gets a target; with "
-        "[robot] require_target_coverage = true the launcher refuses the "
-        f"graph: \"target coverage required for mode 'teleop', but none of "
-        f"its policy lanes has a writer: {lane}\".",
-        [(binding, binding.replace("# ", "").replace(demand, moved))],
-    ), (
-        "[targets]",
-        "uncomment it, with autonomous = []: until an autonomous node writes "
-        f"/{name}/target/auto, the teleop binding is the {name}'s only "
-        "producer.",
-        "where [robot.targets] autonomous lists \"auto\" (2026-robot's "
-        "does) and require_target_coverage = true, the launcher refuses the "
-        "graph: \"target coverage required for mode 'autonomous', but none "
-        f"of its policy lanes has a writer: /{name}/target/auto\".",
-        [('# [targets]\n# teleop = ["teleop"]\n# autonomous = ["auto"]\n',
-          '[targets]\nteleop = ["teleop"]\nautonomous = []\n')],
-    )]
-    zero = ("slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, "
-            "a = 0.0, g = 0.0 }")
+        motor, demand, measure = f"{name}_motor", "velocity_rps = 20.0", ""
+    block = f"""\
+# {name}: simulation values only. robot.toml never reads this file; before
+# a real robot drives the {name}, tune slot0 on the mechanism{measure}.
+# Holding joystick button 3 writes {demand} on {lane}.
+[[{sub}.teleop.bindings]]
+button = 3
+while_held = {{ {demand} }}
+# Until an autonomous node writes /{name}/target/auto, the binding is the
+# {name}'s only producer; a policy that lists "auto" with
+# require_target_coverage = true refuses the graph without this.
+[{sub}.targets]
+autonomous = []
+"""
+    zero = "p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0"
     if kind == "position":
-        edits += [(
-            f"[{name}] max_rot",
-            "set 2.0 (in simulation; on the robot, the measured travel).",
-            "every target is clamped to within 0.001 rotations of the home "
-            "switch, so the mechanism stays there.",
-            [("max_rot = 0.001\n", "max_rot = 2.0\n")],
-        ), (
-            f"[motors.{motor}] slot0",
-            "set p = 1.0, d = 0.05, v = 0.12, the simulated motor's gains.",
-            "with every gain zero the motor does not follow the profile, so "
-            "the physics simulation never moves it.",
-            [(zero, zero.replace("p = 0.0", "p = 1.0")
-              .replace("d = 0.0", "d = 0.05").replace("v = 0.0", "v = 0.12"))],
-        )]
-    else:
-        edits.append((
-            f"[motors.{motor}] slot0",
-            "set v = 0.12 (volts per rps), the simulated motor's feedforward.",
-            f"with every gain zero the physics simulation stalls the motor: "
-            f"/{name}/state velocity_rps stays 0.",
-            [(zero, zero.replace("v = 0.0", "v = 0.12"))],
-        ))
-    return edits
+        gains = (zero.replace("p = 0.0", "p = 1.0")
+                 .replace("d = 0.0", "d = 0.05").replace("v = 0.0", "v = 0.12"))
+        return block + f"""\
+# The simulated travel. The simulator's home switch reads closed at every
+# position (an unset DIO reads false: closed, for a normally open switch),
+# so the {name} zeroes where it starts; a margin past the travel keeps the
+# stuck-switch check from stopping it home_margin_rot from home.
+[{sub}.{name}]
+max_rot = 2.0
+home_margin_rot = 2.5
+# The simulated motor's gains, not the mechanism's.
+[{sub}.motors.{motor}]
+slot0 = {{ {gains} }}
+"""
+    return block + f"""\
+# The simulated motor's feedforward (volts per rps), not the mechanism's:
+# with every gain zero the physics simulation stalls the motor.
+[{sub}.motors.{motor}]
+slot0 = {{ {zero.replace("v = 0.0", "v = 0.12")} }}
+"""
 
 
 def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
-               golden_test=False):
+               golden_test=False, sim=None):
     """What to do after scaffolding `name` into `robot`. `golden_test`: the
     robot pins its hardware config in configuration/config_golden_test.cc
-    (2026-robot does; a new_robot robot does not)."""
+    (2026-robot does; a new_robot robot does not). `sim`: sim_config's
+    (path, exists) for the robot; default, a robot_sim.toml that exists."""
     del lang  # both languages' nodes read the same keys
     package = f"//{robot}/main_processor/{name}"
     configuration = f"{robot}/main_processor/configuration"
     subsystem = f"{configuration}/subsystems/{name}.toml"
-    check = f"""
-  bazel build //talOS/launcher //talOS/bridge:hardware_node //{robot}/main_processor/...
-  bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only"""
+    sim_path, sim_exists = sim or (f"{configuration}/{SIM_CONFIGS[0]}", True)
+    build = (f"  bazel build //talOS/launcher //talOS/bridge:hardware_node "
+             f"//{robot}/main_processor/...")
     if can_id is None:  # an estimator
         return f"""\
 Next:
-  bazel test {package}:all{check}
+  bazel test {package}:all
+{build}
+  bazel run //talOS/launcher -- --config $PWD/{configuration}/robot.toml --describe-only
   {subsystem}
     List the camera nodes in `cameras`; point telemetry at the pose with
     [studio] pose_topic = "/{name}/state"."""
-    edits = "".join(
-        "\n" + textwrap.fill(f"{i}. {key}: {what}", 79,
-                             initial_indent="    ",
-                             subsequent_indent="       ",
-                             break_on_hyphens=False)
-        + "\n" + textwrap.fill(f"Skipped: {skipped}", 79,
-                               initial_indent="       ",
-                               subsequent_indent="       ",
-                               break_on_hyphens=False)
-        for i, (key, what, skipped, _) in enumerate(
-            simulation_edits(name, kind), 1))
+    lines = simulation_block(name, kind)
+    if sim_exists:
+        step, manifest = "append these lines to", ""
+    else:
+        step = "create"
+        lines = fill(SIM_CONFIG_HEADER, CONFIG=sim_path) + lines
+        manifest = (
+            "\n  and generate its manifest, which ./sim.sh checks:\n"
+            f"  bazel run //tools:sync_manifest -- {sim_path}")
+    lines = textwrap.indent(lines, "    ").rstrip("\n")
     travel = """
     The home switch's dio is a placeholder too: replace it with its physical
     channel. Set max_rot to the measured travel. Wire the switch normally
@@ -2703,12 +2721,17 @@ Next:
     return f"""\
 Next:
   bazel test {package}:all
-  To see it move in simulation, edit {subsystem}, in order:{edits}
-  Then check the graph and run it (button 3 held from second 3 to 6):{check}
-  ./sim.sh --config {configuration}/robot.toml {SIM_RUN}
+  To see it move in simulation, {step} {sim_path},
+  the simulation-only config; {subsystem}
+  keeps its binding commented and its gains zero:
+{lines}{manifest}
+  Then check the graph and run it (button 3 held from second 3 to 6):
+{build}
+  bazel run //talOS/launcher -- --config $PWD/{sim_path} --describe-only
+  ./sim.sh --config {sim_path} {SIM_RUN}
   Before a real robot drives the motor, in {subsystem}:
     can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
-    The simulation's gains are not the mechanism's: tune slot0 on it.{golden}"""
+    Tune slot0 on the mechanism before uncommenting its teleop binding.{golden}"""
 
 
 def standalone_next_steps(target_dir, name, kind="velocity"):
@@ -2792,7 +2815,7 @@ def main(argv):
             root, args.robot, "main_processor", "configuration",
             "config_golden_test.cc"))
         print(next_steps(args.robot, args.name, can_id, args.kind, args.lang,
-                         golden_test))
+                         golden_test, sim_config(root, args.robot)))
     return 0
 
 

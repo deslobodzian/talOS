@@ -40,6 +40,8 @@ bazel run //tools:new_robot -- my_robot --mechanism wrist --lang py
 ```text
 wrote my_robot/README.md
 wrote my_robot/main_processor/configuration/robot.toml
+wrote my_robot/main_processor/configuration/robot_sim.toml
+wrote my_robot/main_processor/configuration/robot_sim_manifest.bzl
 wrote my_robot/main_processor/configuration/subsystems/teleop.toml
 wrote my_robot/main_processor/configuration/subsystems/telemetry.toml
 wrote my_robot/main_processor/configuration/BUILD
@@ -76,15 +78,21 @@ matter now:
   producer, makes the launcher refuse a subsystem nobody can drive.
 - `sim_gateway` names the program that stands in for the RoboRIO, the robot's
   hardware layer, when you simulate.
+- `robot_sim.toml` is the **simulation config**: `include = "robot.toml"`
+  plus what only a simulation may use, such as a button binding and the
+  simulated motor's gains. `robot.toml` never reads it, so nothing you put
+  there reaches the robot.
 - `robot_manifest.bzl` is the **manifest**: a generated list of the node
   binaries and config files the robot needs. Bazel cannot read TOML, so it
   reads this file instead. Edit `robot.toml` or a subsystem file in a way
   that adds or removes a node or file, and regenerate it with
   `bazel run //tools:sync_manifest -- my_robot/main_processor/configuration/robot.toml`
   (a stale manifest fails the build, and `sim.sh`, with that command).
+  `robot_sim_manifest.bzl` is the simulation config's.
 - The configuration `BUILD` holds the robot's checks (`manifest_sync_test`,
-  `graph_test`) and `robot_bundle`, what [deployment](DEPLOYMENT.md)
-  installs on the main processor.
+  `graph_test`, and their `sim_` twins for `robot_sim.toml`) and
+  `robot_bundle`, what [deployment](DEPLOYMENT.md) installs on the main
+  processor.
 
 ## 3. Python track
 
@@ -162,36 +170,45 @@ class Wrist:
 ### Configure the subsystem
 
 `my_robot/main_processor/configuration/subsystems/wrist.toml` describes the
-motor and the node's inputs. The scaffold leaves it unable to move on its
-own, so that it never drives a real mechanism untuned; its `Next:` output
-lists each edit, in order, with what happens if it is skipped. Here two
-edits make it move (a robot that requires target coverage and lists `auto`
-in autonomous, as `2026-robot` does, also needs the `[targets]` table
-uncommented with `autonomous = []`). Uncomment the teleop
-binding, which tells the framework's `teleop` node to write a target on
-`/wrist/target/teleop` while Driver Station joystick button 3 is held:
+motor and the node's inputs. The scaffold leaves it unable to move: its
+teleop binding is commented out and every gain is zero ("untuned"), so it
+never drives a real mechanism on values nobody measured. To see it move in
+simulation, append the block its `Next:` output prints to `robot_sim.toml`,
+the simulation config; the subsystem file stays as it is:
 
 ```toml
-[[teleop.bindings]]
+# wrist: simulation values only. robot.toml never reads this file; before
+# a real robot drives the wrist, tune slot0 on the mechanism.
+# Holding joystick button 3 writes velocity_rps = 20.0 on /wrist/target/teleop.
+[[subsystems.wrist.teleop.bindings]]
 button = 3
 while_held = { velocity_rps = 20.0 }
-```
-
-And give the motor's velocity loop a feedforward. The scaffold leaves every
-gain at zero ("untuned"), and the physics simulation then stalls the motor
-([simulation backends](../talOS/hardware/README.md#simulation-backends-ideal-vs-physics-backed)):
-
-```toml
+# Until an autonomous node writes /wrist/target/auto, the binding is the
+# wrist's only producer; a policy that lists "auto" with
+# require_target_coverage = true refuses the graph without this.
+[subsystems.wrist.targets]
+autonomous = []
+# The simulated motor's feedforward (volts per rps), not the mechanism's:
+# with every gain zero the physics simulation stalls the motor.
+[subsystems.wrist.motors.wrist_motor]
 slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 ```
 
-The `can_id` there is a placeholder. On a real robot a person sets the
-physical id and `commissioned = true` at the robot; nobody does it from a
-desk ([bring-up](BRINGUP.md#human-commissioning)).
+`[subsystems.wrist]` is the wrist's subsystem file as `robot.toml` loads it,
+and these tables are merged over it. The binding tells the framework's
+`teleop` node to write a target on `/wrist/target/teleop` while Driver
+Station joystick button 3 is held. Without it nothing writes the wrist's
+lane: the launcher warns (`/wrist/target/teleop: is in the target policy of
+wrist but nothing writes it yet`), as it does for `robot.toml`, and with
+`require_target_coverage = true` it refuses the graph. The feedforward is
+there because with every gain zero the physics simulation stalls the motor
+([simulation backends](../talOS/hardware/README.md#simulation-backends-ideal-vs-physics-backed)).
 
-Without the binding, nothing writes the wrist's lane: the launcher warns
-(`/wrist/target/teleop: is in the target policy of wrist but nothing writes it
-yet`), and with `require_target_coverage = true` it refuses the graph.
+The `can_id` in the subsystem file is a placeholder. On a real robot a
+person sets the physical id and `commissioned = true` at the robot; nobody
+does it from a desk ([bring-up](BRINGUP.md#human-commissioning)). The
+binding goes into the subsystem file only once its gains are tuned on the
+mechanism.
 
 ### Run the generated test
 
@@ -215,7 +232,7 @@ process. When you change what the node does, change `node_test.py` with it.
 
 ```sh
 bazel build //talOS/launcher //talOS/bridge:hardware_node //my_robot/main_processor/...
-bazel run //talOS/launcher -- --config $PWD/my_robot/main_processor/configuration/robot.toml --describe-only
+bazel run //talOS/launcher -- --config $PWD/my_robot/main_processor/configuration/robot_sim.toml --describe-only
 ```
 
 ```text
@@ -230,8 +247,9 @@ Nodes described: 4/4, topics: 8
 [launcher] describe-only: nothing was started
 ```
 
-`bazel test //my_robot/...` runs the same check (`graph_test`), the
-manifest's `manifest_sync_test` and the node test together.
+`bazel test //my_robot/...` runs the same check (`sim_graph_test`, and
+`graph_test` for `robot.toml`), the manifests' sync tests and the node test
+together.
 
 The launcher runs every node binary with `--describe`, which makes the node
 build itself, report the topics it reads and writes, and exit, then checks the
@@ -245,14 +263,14 @@ A warning is fine; an `error:` line means the launcher would refuse to start.
 ### Run it in simulation
 
 ```sh
-./sim.sh --config my_robot/main_processor/configuration/robot.toml \
+./sim.sh --config my_robot/main_processor/configuration/robot_sim.toml \
   --sim-gateway --no-studio --duration-s 8 \
   --mode-schedule 'disabled:1,teleop:10' \
   --joystick-schedule '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|6:axes=0;buttons=0;pov=-1'
 ```
 
 ```text
-==> checking my_robot/main_processor/configuration/robot.toml
+==> checking my_robot/main_processor/configuration/robot_sim.toml
 ==> building
 INFO: Build completed successfully, 107 total actions
 ==> starting node graph (log: /tmp/talos_logs/1794458306/sim/launcher.log)
@@ -363,8 +381,9 @@ class Claw {
 
 It is the Python node line for line; the framework is written once and
 wrapped for Python ([node guide](NODE_DEVELOPMENT_GUIDE.md#node) lists each
-call in both languages). Do the same two edits to
-`subsystems/claw.toml` (the teleop binding and `v = 0.12`), then:
+call in both languages). Append the claw's block from its `Next:` output to
+`robot_sim.toml` as you did the wrist's (both bind button 3, so one press
+drives both), then:
 
 ```sh
 bazel test //my_robot/...
@@ -396,10 +415,16 @@ read the `claw` node instead, from the session directory `sim.sh` printed:
 - Settings read from the config (`node.param`), the full API, and the
   rules every node follows: [node guide](NODE_DEVELOPMENT_GUIDE.md) and
   [methodology](METHODOLOGY.md).
+- A position mechanism's block also sets a simulated travel and gains, and
+  a `home_margin_rot` past the travel: the simulator's home switch reads
+  closed at every position, so the mechanism zeroes where it starts, and
+  without that margin the stuck-switch check stops it 0.5 rotations from
+  home.
 - Putting a mechanism on another robot, such as `2026-robot`, whose graph is
   full: the scaffold takes `--robot DIR`; keep each topic at eight readers or
-  fewer and give the new subsystem a `[targets]` table if autonomous has no
-  writer for it.
+  fewer. Its `Next:` names that robot's simulation config
+  (`robot_physics_sim.toml` for `2026-robot`), or the three lines that
+  create one.
 
 When a step fails, the launcher's message names the rule; the
 [glossary](GLOSSARY.md) points to the section that defines each term in it.
