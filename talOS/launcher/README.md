@@ -247,9 +247,13 @@ the launcher's back; without the flag it is not started:
 bridge = "//studio/bridge:studio_bridge"  # binary target to supervise
 http_port = 5800                          # HTTP/WebSocket port
 webroot = "bazel-bin/studio/dist"         # static web directory, relative to the launcher's working directory
+dashboard = "dashboard.toml"              # driver dashboard layout, relative to this file; no default
 ```
 
-Every key shown is optional. The watched topic comes from `[studio] topic`,
+Every key shown is optional. `dashboard` names the driver dashboard's
+layout ([talOS/telemetry](../telemetry/README.md#dashboard-layout)); config
+load refuses a missing file, and the file is in the config's
+`CONFIG_FILES` and its bundle. The watched topic comes from `[studio] topic`,
 the same setting the telemetry node reads. `--studio-http-port PORT`
 overrides `[studio] http_port` for one run. The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set

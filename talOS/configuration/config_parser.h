@@ -19,7 +19,8 @@
 //
 // A subsystem's [trajectories] table names data files (name = "path",
 // relative to the file that sets it); config load requires each to exist,
-// and the build lists each in the config's CONFIG_FILES (resolve.cc).
+// and the build lists each in the config's CONFIG_FILES (resolve.cc). So
+// does [studio] dashboard, the driver dashboard's layout file.
 
 #include <arpa/inet.h>
 
@@ -131,6 +132,11 @@ struct RobotConfig {
     std::string webroot{"bazel-bin/studio/dist"};
     std::string topic{"/talos/telemetry"};
     std::string pose_topic;
+    // The driver dashboard's layout file (talOS/telemetry:dashboard_layout),
+    // resolved against the file that set `dashboard` (in a config parsed
+    // from a string, the working directory); empty when unset. Config load
+    // refused a file that does not exist.
+    std::string dashboard;
   };
   StudioConfig studio;
 
@@ -417,6 +423,37 @@ void RequireTrajectories(const toml::table& holder,
         source == sources.end() ? fallback : source->second;
     data(path, where + ": trajectories." + name);
     RequireTrajectoryFile(where, name, path);
+  }
+}
+
+// [studio] dashboard names a file relative to the file that sets it:
+// rewrites the path in `document` (read from `file`) against `file`'s
+// directory and returns `file`, or "" when `document` does not set it.
+inline std::string RebaseStudioDashboard(toml::table& document,
+                                         const std::string& file) {
+  auto* studio = document["studio"].as_table();
+  if (studio == nullptr || !studio->contains("dashboard")) return {};
+  const auto value = (*studio)["dashboard"].value_exact<std::string>();
+  if (!value || value->empty()) {
+    throw std::invalid_argument(
+        file + ": [studio] dashboard must be a non-empty string path");
+  }
+  const std::filesystem::path base = std::filesystem::path(file).parent_path();
+  const std::filesystem::path rel{*value};
+  studio->insert_or_assign(
+      "dashboard", (rel.is_absolute() || base.empty() ? rel : base / rel)
+                       .lexically_normal()
+                       .string());
+  return file;
+}
+
+// The dashboard layout file must exist; the error names where it was set,
+// the key and the path as resolved.
+inline void RequireStudioDashboard(const std::string& where,
+                                   const std::string& path) {
+  if (!std::filesystem::is_regular_file(path)) {
+    throw std::invalid_argument(where + ": [studio] dashboard: no such file '" +
+                                path + "'");
   }
 }
 
@@ -1065,7 +1102,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     for (auto&& [k, v] : *studio) {
       if (k.str() != "bridge" && k.str() != "webroot" &&
           k.str() != "http_port" && k.str() != "topic" &&
-          k.str() != "pose_topic" && k.str() != "max_clients") {
+          k.str() != "pose_topic" && k.str() != "max_clients" &&
+          k.str() != "dashboard") {
         throw std::invalid_argument("[studio] unknown key '" +
                                     std::string(k.str()) + "'");
       }
@@ -1089,6 +1127,10 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     if (studio->contains("pose_topic")) {
       s.pose_topic =
           detail::ReadNonEmpty(*studio, "pose_topic", "", "[studio]");
+    }
+    if (studio->contains("dashboard")) {
+      s.dashboard = detail::ReadNonEmpty(*studio, "dashboard", "", "[studio]");
+      detail::RequireStudioDashboard("config", s.dashboard);
     }
   }
 
@@ -1554,9 +1596,9 @@ inline toml::table ExpandManifest(const toml::array& manifest,
 // Resolve once for runtime and build tools. Readers may track dependencies or
 // supply pending file contents without changing include/manifest semantics.
 // `data(path, label)` sees every non-TOML file the config names (the
-// effective [trajectories] entries), resolved against the file that names
-// it, with a label naming that file and trajectories.<name>, before config
-// load requires it to exist.
+// effective [trajectories] entries and [studio] dashboard), resolved against
+// the file that names it, with a label naming that file and the key, before
+// config load requires it to exist.
 template <typename Reader = decltype(&detail::ParseTomlFile),
           typename DataFile = decltype(&detail::IgnoreDataFile)>
 inline toml::table ResolveRobotConfig(const std::string& path,
@@ -1570,6 +1612,9 @@ inline toml::table ResolveRobotConfig(const std::string& path,
   // overrides is never required.
   std::map<std::string, detail::TrajectorySources> table_sources;
   detail::RebaseSubsystemTablesTrajectories(tbl, path, table_sources);
+  // Where the effective [studio] dashboard was set: this file's wins over
+  // its include's.
+  std::string dashboard_source = detail::RebaseStudioDashboard(tbl, path);
   if (auto* manifest = tbl["subsystems"].as_array()) {
     detail::NormalizeManifestPaths(*manifest, path);
   }
@@ -1584,6 +1629,9 @@ inline toml::table ResolveRobotConfig(const std::string& path,
             .string();
     toml::table base = read(inc_file);
     detail::CheckTopLevelKeys(base);
+    const std::string base_dashboard =
+        detail::RebaseStudioDashboard(base, inc_file);
+    if (dashboard_source.empty()) dashboard_source = base_dashboard;
     std::map<std::string, detail::TrajectorySources> base_sources;
     detail::RebaseSubsystemTablesTrajectories(base, inc_file, base_sources);
     for (auto& [subsystem, entries] : table_sources) {
@@ -1613,6 +1661,12 @@ inline toml::table ResolveRobotConfig(const std::string& path,
     }
     detail::MergeTables(base, tbl);
     tbl = std::move(base);
+  }
+  if (!dashboard_source.empty()) {
+    const std::string dashboard =
+        tbl["studio"]["dashboard"].value_or(std::string{});
+    data(dashboard, dashboard_source + ": [studio] dashboard");
+    detail::RequireStudioDashboard(dashboard_source, dashboard);
   }
   if (auto* subs = tbl["subsystems"].as_table()) {
     for (const auto& [subsystem, entries] : table_sources) {
