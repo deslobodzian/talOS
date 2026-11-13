@@ -881,7 +881,7 @@ is close-on-exec and a guardian closes every descriptor, so no node or
 helper holds it: a node that outlives its launcher (its guardian kills its
 process group at once) or a process it daemonized never keeps a dead
 session. Retention passes over every directory whose lock is held, without
-counting or reading it, and records each in `retention.txt`; a session
+counting or reading it, and says so on stderr; a session
 whose manifest has no `end_wall_ns` and whose lock nobody holds was left by
 a launcher that died (a power loss, a kill) and is retained like any other.
 To remove a directory, retention takes its lock (creating `session.lock`
@@ -928,14 +928,17 @@ recording (each camera's `[recording] max_bytes`, summed) exceeds half of
 
 Each launch records in its own session directory's `retention.txt` (written
 once that directory exists, synced with `DurableSync`) every session it
-removed, with its size, its class and the limit it exceeded, every running
-session it passed over, every session it could not read or remove, a free
-floor it could not reach, and free space it could not read; a launch with
-nothing to record writes none. A directory holding a `retention.txt` is
+removed, with its size, its class and the limit it exceeded; a launch that
+removed nothing writes none. A directory holding a `retention.txt` is
 never removed as a launch that recorded nothing (below), so the record
-outlives a launch that died before its manifest. All but the removal of a
-session that ran no match and a running session passed over are also a
-line on the launcher's stderr. Start times are the main processor's wall
+outlives a launch that died before its manifest. The removal of a match or
+an unclassifiable session is also a warning on the launcher's stderr, and
+the rest retention has to say goes only there: every running session it
+passed over, every session it could not read or remove, a free floor it
+could not reach, and free space it could not read. So a launch that stops
+before its manifest beside a running session (a refused graph, a missing
+binary, a service restarting it) still leaves an abandoned launch, not a
+record to keep. Start times are the main processor's wall
 clock, so a coprocessor without a real-time clock or time sync orders
 sessions only as well as its clock survives a reboot.
 
