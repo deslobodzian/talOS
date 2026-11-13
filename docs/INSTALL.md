@@ -31,7 +31,7 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | `flatc` | none: `pnpm generate` runs Bazel's pinned `@flatbuffers//:flatc` (same as the `//studio:telemetry_ts` genrule) | – | – | run `pnpm generate` in WSL |
 | clang-format 18, clang-tidy 18 | lint (`tools/format.sh`, `tools/tidy.sh`) | PyPI wheels `==18.1.8` in a private venv under `~/.cache/talos/clang-18` (via `uv` if present, else `python3 -m venv`); no system package | same | in WSL |
 | buildifier | lint | GitHub release (sha256-verified) | brew | in WSL |
-| WPILib 2026 | Glass, AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
+| WPILib 2026 | AdvantageScope, sim GUI | optional | optional | manual installer (not on winget) |
 
 CI uses clang-format/clang-tidy 18 and buildifier 8.2.1. `tools/setup.sh`
 installs the 18.1.8 wheels, which are the same upstream release line as CI's

@@ -40,7 +40,7 @@ release all controls, and explicitly re-enable only after checking recovery.
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
 - [ ] From `2026-robot/controller_processor/rio`, run `./gradlew deploy`.
   Expected: generic gateway starts on the RIO and its console line
-  `hardware gateway build <commit> companion 10.56.87.11:5803` names the
+  `[<s>.<ms>] hardware gateway build <commit> companion 10.56.87.11:5803` names the
   Mini. Record deploy result and RIO console banner.
 - [ ] Build `bazel build //bench/main_processor:bench_bundle`; on the Mini run
   `./tools/deploy.sh install bazel-bin/bench/main_processor/bench_bundle`.
@@ -115,12 +115,12 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
 ## Uncommissioned and disabled checks
 
 - [ ] Keep `commissioned = false` and exercise controls while DS disabled.
-  Expected: RIO console reports `commissioned=0`; `/hw/status.configured`
-  and SmartDashboard `companion/configured` are true (the RoboRIO applied and
-  acknowledged the uncommissioned config) while `companion/commissioned` and
-  the `/hw/state` flag `configured` (the hardware log's `configured`, which
-  also requires `commissioned`) are false; no motor motion occurs. Record
-  console and `/motor/state`.
+  Expected: RIO console reports `commissioned=0`; in Studio, `/hw/status`
+  `configured` is true (the RoboRIO's current boot applied and acknowledged
+  the uncommissioned config) while `/hw/status` `commissioned` (with
+  `alert_error_uncommissioned` active) and the `/hw/state` flag `configured`
+  (the hardware log's `configured`, which also requires `commissioned`) are
+  false; no motor motion occurs. Record console and `/motor/state`.
   Refusal is intentional, not a CAN fault to bypass.
 - [ ] Inspect `/hw/status`: receive counters should advance and identity and
   ownership rejection counters should not grow. Expected: low state age once
@@ -143,8 +143,9 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
 - [ ] Only a human, after those checks, sets commissioning true in the base
   and deployment configs and updates [the golden config test](../bench/main_processor/configuration/config_golden_test.cc) to the measured
   configuration in the same change. Repeat Mini build/test, bundle install and
-  launch. Expected: RIO acknowledges configuration; `companion/commissioned`
-  and the `/hw/state` flag `configured` become true. Record reviewed
+  launch. Expected: RIO acknowledges configuration; `/hw/status`
+  `configured` and `commissioned` (Studio) and the `/hw/state` flag
+  `configured` become true. Record reviewed
   change/config hash and RIO acknowledgment.
 - [ ] With DS disabled move joystick 0 axis 1 and hold buttons 1/2. Expected:
   neutral mode/source NONE, zero drive, no motion. Release all controls before
@@ -204,9 +205,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   and release before any re-enable. Expected also: once the program runs,
   States resume within 100 ms of the RIO's network having a route to the
   Mini; a program that started before that route prints
-  `hardware gateway socket failed: SocketError (errno 101)` (coalesced to one
-  line a second) and then `hardware gateway socket open after <n> failed
-  attempts, <s> s after the first`. Record old/new boot ids, clock reset
+  `[<s>.<ms>] hardware gateway socket failed: SocketError (errno 101)`
+  (coalesced to one line a second) and then `[<s>.<ms>] hardware gateway
+  socket open after <n> failed attempts, <s> s after the first`. Record old/new boot ids, clock reset
   count, the RIO console as written on the RIO (a network console viewer
   loses lines while the link is down; the program's lines carry the RIO's
   seconds since boot, which the first State's `sample_time_us` in the
@@ -262,15 +263,15 @@ sleep precision. Releasing a lane is not a mechanical brake.
   note which threads the listing shows the spinners also starved. Disable
   and release before any re-enable.
 - [ ] RoboRIO loop priority. The loop runs at `SCHED_FIFO` 10; its start
-  line on the RIO console must read `hardware gateway loop SCHED_FIFO 10,
-  watchdog SCHED_FIFO 30`.
+  line on the RIO console must read `[<s>.<ms>] hardware gateway loop
+  SCHED_FIFO 10, watchdog SCHED_FIFO 30`.
   In the same enabled session as the representative captures below, record
   the RIO console's loop timing lines (overruns, late ticks, max work, max
   interval) over 10 minutes of driving with an ssh session running `top` on
   the RoboRIO, and the gateway's State sample intervals (p50, p90, p99, max)
   from the session. Then `touch /home/lvuser/talos_loop_default_sched`,
-  restart robot code (the start line must read `hardware gateway loop
-  SCHED_OTHER 0, watchdog SCHED_FIFO 30
+  restart robot code (the start line must read `[<s>.<ms>] hardware gateway
+  loop SCHED_OTHER 0, watchdog SCHED_FIFO 30
   (/home/lvuser/talos_loop_default_sched present)`), repeat
   the session and the stall check above, and `rm` the file. Record late
   ticks, State intervals, Driver Station and CAN health under both; the
