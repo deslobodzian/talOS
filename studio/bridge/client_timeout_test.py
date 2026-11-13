@@ -123,7 +123,7 @@ def closed_by_peer(socks, deadline):
 
 
 class ClientTimeout(unittest.TestCase):
-    # REQ-OPS-23
+    # REQ-OPS-23, REQ-OPS-46
     def test_dead_client_slot_is_reclaimed_and_a_quiet_client_stays(self):
         """Clients that stop answering lose their slots; one answering pings keeps its own.
 
