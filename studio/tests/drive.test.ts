@@ -12,7 +12,7 @@ import {test} from 'node:test';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {esc, renderDashboard, renderStatus} from '../src/drive/view';
+import {esc, Painter, renderDashboard, renderStatus} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -76,6 +76,10 @@ const NOMINAL: Record<string, number> = {
   [LINK_LOST]: 0, [OWNER_TIMED_OUT]: 0
 };
 
+// The same with /hw/status not published: its alert channels absent.
+const WITHOUT_HW_STATUS_ALERTS = Object.fromEntries(
+    Object.entries(NOMINAL).filter(([name]) => name !== LINK_LOST && name !== OWNER_TIMED_OUT));
+
 const raw = (name: string, value: number) =>
     CHANNELS[INDEX.get(name)!].kind === ChannelKind.Double ? rawFromDouble(value) : BigInt(value);
 // One update's pages: a keyframe of `values` (every other channel absent), or
@@ -104,7 +108,8 @@ class FakeSocket implements DriveSocket {
 }
 
 // A model on a clock the test sets; `sockets` is every socket it opened.
-function harness() {
+// `carried` is what /drive/layout.json says the feed carries.
+function harness(carried: {channels: readonly string[]; alerts: boolean} = LAYOUT) {
   const sockets: FakeSocket[] = [];
   const tracked = ['shooter/state/flywheel_velocity_rps', 'shooter/state/target_velocity_rps',
                    'pose_estimator/state/pose/x_m', 'pose_estimator/state/pose/y_m'];
@@ -114,7 +119,7 @@ function harness() {
     const s = new FakeSocket();
     sockets.push(s);
     return s;
-  }, tracked);
+  }, tracked, carried);
   const clock = {now: 0};
   model.clock = () => clock.now;
   const at = (ms: number) => {
@@ -183,17 +188,22 @@ test('renders every widget of the 2026 layout in its cell', () => {
   assert.match(checks, /tag-bad">FAIL<\/span><span class="name">Commissioned/);
 });
 
-// REQ-OPS-39: a kind this page does not draw is a visible cell, not a blank.
-test('an unknown widget kind renders a visible unsupported cell', () => {
+// REQ-OPS-39: a widget this page cannot draw is never a silent blank: a kind
+// it does not draw is a visible cell, and one with no cell it can read (a
+// layout from another version) is counted on the status line.
+test('a widget the page cannot draw is shown, never a silent blank', () => {
   const layout = parseLayout({columns: 4, rows: 2, widgets: [
     {kind: 'camera', at: [0, 0, 2, 1], title: '', channels: {}},
     {kind: 'number', at: [2, 0, 2, 1], title: 'Speed', channels: {}},
+    {kind: 'boolean', at: [0, 1], title: 'Ready', channels: {}},
   ]});
   const h = harness();
   const html = renderDashboard(layout, h.model, 0);
   assert.match(html, /grid-column:1 \/ span 2;grid-row:1 \/ span 1[^>]*><header><h2>Unsupported widget<\/h2>/);
   assert.match(html, /Unsupported widget "camera"/);
   assert.match(html, /<h2>Speed<\/h2>.*no data/);
+  const status = html.slice(html.indexOf('role="status"'), html.indexOf('</div>', html.indexOf('role="status"')));
+  assert.match(status, /1 layout widget not drawn/, 'a widget with no readable cell vanished silently');
 });
 
 // REQ-OPS-36: a value is shown stale within 500 ms of its last update. The
@@ -305,7 +315,8 @@ test('a channel never received is shown as no data, not zero', () => {
 // REQ-OPS-36: the status line names the link that failed, upstream first,
 // and the bucket refill after connecting reads as connecting.
 test('the status line names the failed link', () => {
-  const cases: {name: string; arrange: (h: ReturnType<typeof harness>) => void; link: Link}[] = [
+  const cases: {name: string; arrange: (h: ReturnType<typeof harness>) => void; link: Link;
+                carried?: {channels: readonly string[]; alerts: boolean}}[] = [
     {name: 'all links up', link: 'ok', arrange: h => h.connect(0)},
     {name: 'socket closed', link: 'bridge', arrange: h => {
       h.connect(0);
@@ -343,9 +354,24 @@ test('the status line names the failed link', () => {
       h.at(50);
       h.socket().send(...update(2, {[LINK_LOST]: 1}, false));
     }},
+    {name: 'RoboRIO link lost, named by a layout without an alerts widget', link: 'roborio',
+     carried: {channels: [...LAYOUT.channels, LINK_LOST], alerts: false}, arrange: h => {
+      h.connect(0);
+      h.at(50);
+      h.socket().send(...update(2, {[LINK_LOST]: 1}, false));
+    }},
+    {name: 'no hw/status: the hardware bridge is not publishing', link: 'hardware', arrange: h => {
+      h.connect(0, WITHOUT_HW_STATUS_ALERTS);
+    }},
+    // The feed never carries the channel for this layout, so its absence
+    // says nothing about the RoboRIO link.
+    {name: 'layout without an alerts widget', link: 'ok',
+     carried: {channels: LAYOUT.channels, alerts: false}, arrange: h => {
+      h.connect(0, WITHOUT_HW_STATUS_ALERTS);
+    }},
   ];
   for (const c of cases) {
-    const h = harness();
+    const h = harness(c.carried);
     c.arrange(h);
     const status = h.model.status(h.clock.now);
     assert.equal(status.link, c.link, `${c.name}: ${status.text}`);
@@ -591,4 +617,45 @@ test('markup in every drawn string is escaped', () => {
     assert.ok(!html.includes(marker), `${site}: ${marker} drawn as markup`);
     assert.ok(html.includes(esc(marker)), `${site}: ${marker} not drawn as text`);
   }
+});
+
+// REQ-OPS-36: a subsystems widget that names its nodes shows each of them. A
+// named node the summary does not list (cut off by `omitted`, or not in the
+// session) reads unknown, never vanishes, and "+N more" never counts nodes
+// the widget would not show.
+test('a subsystems widget with a node filter shows every named node', () => {
+  const layout = parseLayout({columns: 1, rows: 1, widgets: [
+    {kind: 'subsystems', at: [0, 0, 1, 1], title: '', channels: {}, nodes: ['shooter', 'intake']}]});
+  const node = (name: string) => ({name, alive: true, critical: true, restarts: 0,
+                                   quarantined: false, drives: null});
+  const h = harness();
+  h.connect(0);
+  h.socket().send(JSON.stringify({kind: 'talos.drive.summary', session: '42', supervised: true,
+                                  registry: true, omitted: 3,
+                                  nodes: [node('drivetrain'), node('shooter')]}));
+  const html = renderDashboard(layout, h.model, 0);
+  assert.match(html, /shooter<\/span><span class="tag tag-good">UP/);
+  assert.match(html, /intake<\/span><span class="tag tag-neutral">unknown/,
+               'a named node missing from the summary is not shown as unknown');
+  assert.doesNotMatch(html, /drivetrain/, 'a node the filter does not name is shown');
+  assert.doesNotMatch(html, /more</, '"+N more" counts nodes the filter does not admit');
+});
+
+// REQ-OPS-36: a drawing fault must not leave the last grid looking current:
+// the frame says so on the status line and marks the grid, and the next good
+// draw repaints both even when it draws the same text as before the fault.
+test('a drawing error marks the grid and the next draw repaints it', () => {
+  const painter = new Painter();
+  const good = {status: '<div>status</div>', grid: '<section>grid</section>'};
+  assert.deepEqual(painter.paint(() => good), {...good, errored: false});
+  assert.deepEqual(painter.paint(() => good), {status: null, grid: null, errored: false});
+  const failed = painter.paint(() => {
+    throw new Error('<x-fault>');
+  });
+  assert.equal(failed.errored, true, 'a drawing error leaves the grid unmarked');
+  assert.equal(failed.grid, null);
+  assert.match(failed.status!, /link-error/);
+  assert.ok(failed.status!.includes(esc('<x-fault>')), failed.status!);
+  assert.deepEqual(painter.paint(() => good), {...good, errored: false},
+                   'the page is not repainted after a drawing error');
 });

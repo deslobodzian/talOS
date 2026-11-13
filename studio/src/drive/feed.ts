@@ -29,7 +29,12 @@
 //   - The failed link, upstream first: dashboard to bridge (no socket, or no
 //     message, heartbeat included, for SILENCE_MS: the bridge sends one at
 //     least every 100 ms), then telemetry (messages arrive but no new tick),
-//     then the RoboRIO link (`hw/status/alert_error_link_lost`). Right after
+//     then the hardware bridge (`hw/status` absent: hardware_node publishes
+//     nothing) and the RoboRIO link (`hw/status/alert_error_link_lost`).
+//     Those two only when the feed carries that channel, which the bridge's
+//     mask does when /drive/layout.json lists it in `channels` or has
+//     `alerts` true (an `alerts` widget); otherwise the channel's absence
+//     says nothing, and the status line says nothing of either. Right after
 //     a socket opens the bridge may still be refilling the slot's bucket
 //     before the dictionary (README: at most about 0.8 s on the 2026 config):
 //     for CONNECTING_GRACE_MS that is `connecting`, not a lost link. After
@@ -90,8 +95,13 @@ export type DriveSummary = {
 };
 
 export type Connection = 'connecting'|'open'|'waiting'|'replaced';
-export type Link = 'ok'|'connecting'|'bridge'|'telemetry'|'roborio'|'replaced';
+export type Link =
+    'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'roborio'|'replaced';
 export type LinkStatus = {link: Link; text: string};
+
+// What /drive/layout.json says the feed carries: its named `channels`, and
+// with `alerts` every alert channel of the dictionary.
+export type Carried = {channels: readonly string[]; alerts: boolean};
 
 export type Point = {t_s: number; v: number};
 
@@ -167,11 +177,21 @@ export class DriveModel {
   private readonly tracked: Set<string>;
   private readonly histories = new Map<string, Point[]>();
 
-  // `tracked`: the channels whose history a graph or a field trail draws.
+  // `tracked`: the channels whose history a graph or a field trail draws;
+  // `carried`: what the layout says the feed carries.
   constructor(private readonly url: string,
               private readonly openSocket: SocketFactory,
-              tracked: Iterable<string> = []) {
+              tracked: Iterable<string> = [],
+              private readonly carried: Carried = {channels: [], alerts: false}) {
     this.tracked = new Set(tracked);
+  }
+
+  // Whether the feed carries `name` in `s`'s dictionary, so its absence is
+  // a fact about its topic rather than about the mask.
+  private carries(s: Snapshot, name: string): boolean {
+    if (s.units[name] === undefined) return false;
+    return this.carried.channels.includes(name) ||
+        (this.carried.alerts && s.alerts?.[name] !== undefined);
   }
 
   // Opens the first socket.
@@ -248,10 +268,12 @@ export class DriveModel {
       return {link: 'telemetry',
               text: 'Telemetry stale: no new tick for ' + seconds(now - this.lastTickAt)};
     const s = this.latest;
-    if (s?.alerts?.[LINK_LOST_CHANNEL] !== undefined) {
+    if (s && this.carries(s, LINK_LOST_CHANNEL)) {
       const lost = s.channels[LINK_LOST_CHANNEL];
+      // No sample of /hw/status: the process that failed is the hardware
+      // bridge on the main processor, not the link it reports.
       if (lost === undefined)
-        return {link: 'roborio', text: 'RoboRIO link unknown: no hardware status'};
+        return {link: 'hardware', text: 'Hardware bridge not publishing: no hardware status'};
       if (lost !== 0) return {link: 'roborio', text: 'RoboRIO link lost'};
     }
     return {link: 'ok', text: 'Connected: telemetry current'};

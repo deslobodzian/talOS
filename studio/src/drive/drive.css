@@ -92,11 +92,13 @@ html, body {
 .status b { margin-right: 6px; }
 .status.link-ok b { color: var(--good); }
 .status.link-connecting b { color: var(--info); }
-.status.link-bridge, .status.link-telemetry, .status.link-roborio, .status.link-replaced {
+.status.link-bridge, .status.link-telemetry, .status.link-hardware, .status.link-roborio,
+.status.link-replaced, .status.link-error {
   border-color: var(--bad);
 }
-.status.link-bridge b, .status.link-telemetry b, .status.link-roborio b,
-.status.link-replaced b { color: var(--bad); }
+.status.link-bridge b, .status.link-telemetry b, .status.link-hardware b,
+.status.link-roborio b, .status.link-replaced b, .status.link-error b { color: var(--bad); }
+.status .meta.bad { color: var(--bad); }
 
 .status button {
   font: inherit;
@@ -185,6 +187,12 @@ html, body {
 .w.stale .big, .w.stale .legend b, .w.stale .checks .name, .w.stale .nodes .name {
   text-decoration: line-through;
 }
+/* A drawing error: the grid keeps its last draw, which no longer updates,
+ * so every widget reads stale and the status line says DRAWING ERROR. */
+.grid.errored .w .body { opacity: 0.45; }
+.grid.errored .w .big, .grid.errored .w .legend b, .grid.errored .w .checks .name,
+.grid.errored .w .nodes .name { text-decoration: line-through; }
+.grid.errored .w { border: 2px dashed var(--bad); }
 
 .mode-good { color: var(--good); }
 .mode-bad { color: var(--bad); }
