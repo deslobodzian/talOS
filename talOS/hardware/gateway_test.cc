@@ -688,6 +688,100 @@ TEST(Gateway, RejectsOldBootEpochSequenceAndDelayedCommands) {
   EXPECT_TRUE(
       g.Accept(Request(g), 0, 101000));  // A restarted companion can reconnect.
 }
+// `c` with every motor neutral at zero demand and feedforward.
+Command AllMotorsNeutral(Command c) {
+  for (std::size_t i = 0; i < c.count; ++i) c.motors[i] = {c.motors[i].id};
+  return c;
+}
+// The bridge keeps forwarding the neutral merge it built from the last State
+// it saw. The tick that first sees an enable or a disable starts a new epoch
+// before it accepts the commands drained with it, so a neutral already sent
+// is refused there for its epoch. That is the epoch rule working, not a
+// rejection: counting it would raise the counter at about one clean enable
+// in ten, where operators expect it flat.
+// REQ-SAFE-17
+TEST(Gateway, NeutralInFlightAcrossAnEpochChangeIsNotARejection) {
+  for (const bool enabling : {true, false}) {
+    SCOPED_TRACE(enabling ? "enable edge" : "disable edge");
+    FakeBackend backend;
+    Gateway g{SwerveConfig(true), backend, 1};
+    g.Tick(1000, !enabling);
+    if (!enabling) {
+      ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+    }
+    const auto in_flight = AllMotorsNeutral(Request(g));
+    g.Tick(2000, enabling);
+    ASSERT_GT(g.snapshot().epoch, in_flight.epoch);
+    const auto applied = backend.applied;
+    EXPECT_FALSE(g.Accept(in_flight, 2, 2000));
+    EXPECT_EQ(backend.applied, applied);
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+  }
+}
+// Only a neutral that can have been in flight across the epoch change is
+// exempt. An older-epoch command that drives any output (the counter's
+// safety case), one arriving while a command of the new epoch is in force,
+// one of a newer or never-issued epoch, and one that fails another check too
+// are each refused and counted.
+// REQ-SAFE-17
+TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
+  // Neutral, its outputs off, observing `g`'s State.
+  const auto neutral = [](const Gateway& g) {
+    auto c = AllMotorsNeutral(Request(g));
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, false};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, 0.0};
+    return c;
+  };
+  enum class Epoch { kOlder, kNewer, kNeverIssued };
+  struct Row {
+    const char* name;
+    Epoch epoch;
+    bool command_in_force;
+    bool expired;
+    void (*change)(Command&);
+  };
+  const auto none = [](Command&) {};
+  const Row rows[] = {
+      {"older epoch, a motor driven", Epoch::kOlder, false, false,
+       [](Command& c) {
+         c.motors[0] = {c.motors[0].id, Mode::kVelocity, 0, 1};
+       }},
+      {"older epoch, digital output on", Epoch::kOlder, false, false,
+       [](Command& c) { c.digital_outputs[0].value = true; }},
+      {"older epoch, PWM output on", Epoch::kOlder, false, false,
+       [](Command& c) { c.pwm_outputs[0].output = 0.5; }},
+      {"older epoch, a command in force", Epoch::kOlder, true, false, none},
+      {"newer epoch", Epoch::kNewer, false, false, none},
+      {"epoch never issued", Epoch::kNeverIssued, false, false, none},
+      {"older epoch, another boot", Epoch::kOlder, false, false,
+       [](Command& c) { ++c.boot_id; }},
+      {"older epoch, expired observation", Epoch::kOlder, false, true, none},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.name);
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, false);
+    auto command = neutral(g);
+    row.change(command);
+    g.Tick(2000, true);
+    if (row.epoch == Epoch::kNewer) command.epoch = g.snapshot().epoch + 1;
+    if (row.epoch == Epoch::kNeverIssued) command.epoch = 0;
+    if (row.command_in_force) {
+      ASSERT_TRUE(g.Accept(neutral(g), 1, 2000));
+    }
+    const uint64_t now = row.expired ? 1000 + config.command_timeout_us : 2000;
+    const auto applied = backend.applied;
+    EXPECT_FALSE(g.Accept(command, 2, now));
+    EXPECT_EQ(backend.applied, applied);
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  }
+}
 // The RoboRIO's loop watchdog arms on command_expiry_us, so it must be the
 // first tick time that invalidates the command, counted from the older of its
 // acceptance and the State it was built from.

@@ -512,25 +512,34 @@ void Gateway::Tick(uint64_t now, bool enabled) {
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   // Wrong whether or not the gateway takes commands now: another identity, an
   // expired or future observation, a replayed sequence or another manifest
-  // size.
-  const bool mismatched =
-      c.config_id != state_.config_id || c.boot_id != state_.boot_id ||
-      c.epoch != state_.epoch || c.observed_time_us > state_.sample_time_us ||
-      c.observed_time_us > now ||
-      now - c.observed_time_us >= config_.command_timeout_us ||
-      (have_sequence_ && sequence <= state_.last_command_sequence) ||
-      c.count != config_.motors.size();
+  // size; then another epoch.
+  const bool matched_but_epoch =
+      c.config_id == state_.config_id && c.boot_id == state_.boot_id &&
+      c.observed_time_us <= state_.sample_time_us &&
+      c.observed_time_us <= now &&
+      now - c.observed_time_us < config_.command_timeout_us &&
+      !(have_sequence_ && sequence <= state_.last_command_sequence) &&
+      c.count == config_.motors.size();
+  const bool mismatched = !matched_but_epoch || c.epoch != state_.epoch;
+  // A neutral the bridge built from a State read before this epoch began,
+  // with no command accepted since: an enable or a disable, for example,
+  // starts the epoch in the tick that drains it. Refusing it is the epoch
+  // rule working, not a rejection, so it is not counted. Epoch 0 is never
+  // issued.
+  const bool superseded_neutral = matched_but_epoch && c.epoch != 0 &&
+                                  c.epoch < state_.epoch && !active_ &&
+                                  DrivesNothing(c, config_);
   if (!configured_ || !config_.commissioned || !enabled_) {
     // While the robot cannot drive, every node flushes neutral and the bridge
     // keeps forwarding the merge. Refusing that is this gate working, not a
     // rejection: counting it would bury the real ones.
-    if (mismatched || !DrivesNothing(c, config_)) {
+    if (!superseded_neutral && (mismatched || !DrivesNothing(c, config_))) {
       ++state_.counters.rejected_command_count;
     }
     return false;
   }
   if (fault_ || configuring_ || !healthy_ || mismatched) {
-    ++state_.counters.rejected_command_count;
+    if (!superseded_neutral) ++state_.counters.rejected_command_count;
     return false;
   }
   // Structure errors reject the transaction; range/feedback errors isolate a
