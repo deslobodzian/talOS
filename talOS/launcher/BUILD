@@ -434,6 +434,19 @@ cc_library(
     ],
 )
 
+# Unlinks the test namespace's registry segment after a process test's last
+# test, so the launcher's tests leave /dev/shm as they found it.
+cc_library(
+    name = "registry_cleanup",
+    testonly = True,
+    srcs = ["testdata/registry_cleanup.cc"],
+    deps = [
+        "//talOS/introspection:registry",
+        "@googletest//:gtest",
+    ],
+    alwayslink = True,
+)
+
 cc_test(
     name = "launcher_test",
     size = "small",
@@ -449,6 +462,7 @@ cc_test(
         ":launcher_lib",
         ":log_budget",
         ":log_merge",
+        ":registry_cleanup",
         ":supervision_events",
         "//talOS/driver_station",
         "//talOS/events:events_log",
@@ -492,6 +506,7 @@ cc_test(
     deps = [
         ":launcher_lib",
         ":log_budget",
+        ":registry_cleanup",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_log",
@@ -579,6 +594,7 @@ cc_test(
     ],
     deps = [
         ":launcher_lib",
+        ":registry_cleanup",
         ":supervision_events",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
@@ -621,6 +637,7 @@ cc_test(
     ],
     deps = [
         ":launcher_lib",
+        ":registry_cleanup",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
     ],
@@ -692,6 +709,7 @@ cc_test(
     deps = [
         ":continuity_message",
         ":launcher_lib",
+        ":registry_cleanup",
         "//talOS/events:events_log",
         "//talOS/rtms",
         "@googletest//:gtest_main",
@@ -793,6 +811,7 @@ cc_test(
     ],
     deps = [
         ":launcher_lib",
+        ":registry_cleanup",
         ":replay_message",
         ":spawn",
         "//talOS/bridge:messages",
