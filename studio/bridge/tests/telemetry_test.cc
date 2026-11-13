@@ -18,6 +18,7 @@
 namespace studio {
 namespace {
 
+using talos::telemetry::AlertLevel;
 using talos::telemetry::ChannelDef;
 using talos::telemetry::PageHeader;
 using talos::telemetry::RawFromDouble;
@@ -1079,6 +1080,43 @@ TEST(ChannelsJson, DescribesTheDictionaryOnItsOwn) {
   EXPECT_NE(json.find("\"kind\":\"uint\",\"labels\":[\"DRIVE\","
                       "\"TARGET_STALE\"]"),
             std::string::npos);
+}
+
+// REQ-OPS-37
+// Each channel carries its alert level, so Studio and the driver dashboard
+// read levels from /channels.json without decoding dictionary pages or
+// parsing field names.
+TEST(ChannelsJson, CarriesEachChannelsAlertLevel) {
+  std::vector<ChannelDef> dictionary = SmallDictionary();
+  const std::vector<std::pair<std::string, AlertLevel>> alerts{
+      {"hw/status/alert_info_ready", Talos::Telemetry::AlertLevel_Info},
+      {"hw/status/alert_warning_brownout",
+       Talos::Telemetry::AlertLevel_Warning},
+      {"hw/status/alert_error_link_lost", Talos::Telemetry::AlertLevel_Error}};
+  dictionary.reserve(dictionary.size() + alerts.size());
+  for (const auto& [name, level] : alerts) {
+    dictionary.push_back(
+        {name, "", {}, Talos::Telemetry::ChannelKind_Bool, level});
+  }
+  TelemetryState state;
+  ASSERT_TRUE(IngestAll(state, DictionaryPages(dictionary)));
+  const std::string json = ChannelsJson(state);
+  EXPECT_NE(json.find("\"name\":\"drive/velocity\",\"unit\":\"m/s\","
+                      "\"kind\":\"double\",\"labels\":[],\"alert\":\"none\"}"),
+            std::string::npos)
+      << json;
+  for (const auto& [name, spelled] :
+       std::vector<std::pair<std::string, std::string>>{
+           {"hw/status/alert_info_ready", "info"},
+           {"hw/status/alert_warning_brownout", "warning"},
+           {"hw/status/alert_error_link_lost", "error"}}) {
+    EXPECT_NE(json.find("\"name\":\"" + name +
+                        "\",\"unit\":\"\",\"kind\":\"bool\",\"labels\":[],"
+                        "\"alert\":\"" +
+                        spelled + "\"}"),
+              std::string::npos)
+        << name << " in " << json;
+  }
 }
 
 TEST(TelemetryJson, RejectsBytesThatAreNotV3Pages) {

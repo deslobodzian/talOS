@@ -46,7 +46,7 @@ The manual runtime command still takes its topic positionally.
 
 | Endpoint | Contents | Unavailable response |
 |---|---|---|
-| `/channels.json` | Dictionary: channel names, units, kinds and enum labels | 503 until a dictionary arrives |
+| `/channels.json` | Dictionary: channel names, units, kinds, enum labels and alert levels | 503 until a dictionary arrives |
 | `/telemetry.json` | Latest complete tick, keyed by channel name | 503 until a dictionary and a complete tick for it arrive |
 | `/system.json` | Node registry and bridge statistics | Reports `registry.available: false` when the registry cannot be opened |
 | `/declared.json` | Startup copy of the declared graph file | 404 if absent, empty or unreadable |
@@ -72,7 +72,11 @@ in the tick (its topic was not published) is `null`. `age_ms` measures time sinc
 tick, on the bridge's monotonic clock, so a wall-clock step does not change
 it; an old value does not automatically become null as time passes.
 The dictionary JSON has `kind: "talos.telemetry.channels"`, `version: 3`, and
-per channel `kind` (`double`, `int`, `uint` or `bool`).
+per channel `name`, `unit`, `kind` (`double`, `int`, `uint` or `bool`),
+`labels` and `alert`: `none`, or for an alert channel (a `bool` status field
+named `alert_<level>_<name>`, [NAMING.md](../../talOS/NAMING.md)) its level,
+`info`, `warning` or `error`. A dictionary carrying an unknown alert level is
+refused like any other undecodable dictionary.
 
 The bridge verifies every page, assembles dictionaries and ticks, and applies
 a tick only when all of its pages arrived. On WebSocket open it attempts to
