@@ -19,20 +19,23 @@ enum GatewayProgram : ubyte {
 // dropped ones included. timed_out_mask has bit i set while the i-th
 // actuator-owning subsystem, in sorted name order, is silent: the link is
 // ready (a State accepted and the current gateway boot has acknowledged
-// this configuration) and, for longer than its owner timeout
+// this configuration), the bridge has accepted a request from that
+// subsystem since it started, and, for longer than its owner timeout
 // (ARCHITECTURE.md "The tick"), none of its requests has been accepted
-// since the later of the link becoming ready (the session's start, or a
-// gateway reboot's acknowledgement) and that subsystem's last controller
-// transition (boot, configuration, epoch, enable or fault edge) at which it
-// was not already silent, one transition per accepted request or
-// link-ready edge. So a
-// controller transition alone sets no bit, nor does a session's start
-// before its owners' first requests; a subsystem whose node never starts
-// gets its bit one owner timeout after the link is ready. While the link is
-// not ready the mask is 0 and alert_error_link_lost or
-// alert_error_not_configured says why. Only the first 32 fit.
-// subsystem_count is the number of those subsystems. The bridge's exit
-// summary prints each subsystem's count of silent episodes (timeouts=).
+// since the latest of its last accepted request, the link becoming ready
+// (the session's start, or a gateway reboot's acknowledgement) and that
+// subsystem's last controller transition (boot, configuration, epoch,
+// enable or fault edge) at which it was not already silent, one transition
+// per accepted request or link-ready edge. So a controller transition, a
+// session's start (however late an owner's first request) or a gateway
+// reboot alone sets no bit, and a subsystem whose node never sends a
+// request never gets one (the launcher reports a member that does not
+// start or stalls). While the link is not ready the mask is 0 and
+// alert_error_link_lost or alert_error_not_configured says why. Only the
+// first 32 fit. subsystem_count is the number of those subsystems. The
+// bridge's exit summary prints, per subsystem, its count of silent
+// episodes (timeouts=) and whether it was silent at the bridge's last pass
+// (timed_out=).
 // configured is whether the current gateway boot acknowledged this bridge's
 // configuration: a State from a new boot, or naming another configuration,
 // clears it until the next acknowledgement. An uncommissioned config is
@@ -55,7 +58,8 @@ enum GatewayProgram : ubyte {
 // - alert_error_motor_fault: motor_fault_mask is nonzero.
 // - alert_warning_owner_timed_out: timed_out_mask is nonzero, so it raises
 //   neither at a controller transition, which times every owner out in the
-//   merge until its next request, nor at the session's start. Clears on the
+//   merge until its next request, nor at the session's start, nor for an
+//   owner the bridge has never accepted a request from. Clears on the
 //   silent subsystem's next accepted request, or when the link stops being
 //   ready.
 // - alert_warning_brownout: health_valid and brownout.

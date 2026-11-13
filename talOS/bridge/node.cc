@@ -514,6 +514,7 @@ void HardwareNode::Tick(uint64_t now_us) {
           full_cmd_.boot_id = partial.boot_id;
           full_cmd_.epoch = partial.epoch;
           tracker.merge.Accept(now_us, partial.observed_time_us);
+          tracker.heard = true;
           tracker.silence_from_us = now_us;
           tracker.transition_since_accepted = false;
           tracker.silent = false;
@@ -883,7 +884,7 @@ void HardwareNode::UpdateLinkReady(uint64_t now_us) {
 
 bool HardwareNode::OwnerSilent(const SubsystemTracker& tracker,
                                uint64_t now_us) const {
-  if (!link_ready_ || !tracker.silence_from_us) return false;
+  if (!link_ready_ || !tracker.heard || !tracker.silence_from_us) return false;
   const uint64_t from_us = *tracker.silence_from_us;
   return now_us > from_us && now_us - from_us > tracker.merge.timeout_us;
 }
@@ -1154,12 +1155,15 @@ int HardwareNode::Run(int duration_s) {
   std::printf("hardware_node: identity_rejected=%llu ownership_rejected=%llu\n",
               static_cast<unsigned long long>(identity_rejected_),
               static_cast<unsigned long long>(ownership_rejected_));
+  // timed_out= is OwnerSilent at the last Tick, as /hw/status reported it,
+  // not the merge's timed_out, which every controller transition and an
+  // owner never heard hold true.
   for (const auto& [name, tracker] : subsystems_) {
     std::printf(
         "hardware_node: sub=%s requests=%llu timeouts=%llu timed_out=%d\n",
         name.c_str(), static_cast<unsigned long long>(tracker.requests),
         static_cast<unsigned long long>(tracker.timeouts),
-        tracker.merge.timed_out ? 1 : 0);
+        tracker.silent ? 1 : 0);
   }
   std::printf(
       "hardware_node: passes=%llu wakeups udp=%llu request=%llu "
