@@ -166,7 +166,7 @@ on the next tick; a stall push keeps pushing meanwhile.
 | `homing` | Frame from | Keys |
 |---|---|---|
 | `"none"` | the motor's absolute frame; construction refuses a `"rezero"`-frame motor, which would never drive | |
-| `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
+| `"limit_switch"` | `rezero(home_rot)` after `home_samples` consecutive closed readings while unzeroed; zeroes an idle mechanism too. A switch sample that is not `connected()` (an input not answering, a gateway configuring) is no reading: it does not count, and it ends a run of closed readings, as a disconnected motor ends a homing push | `limit_switch` (digital input name), `limit_switch_closed_reads` (bool, default false: normally open to ground behind the pull-up, so a cut wire reads open), `home_samples` (default 3), `home_margin_rot` (> 0), plus the drive keys |
 | `"stall"` | `rezero(home_rot)` once the push has held the mechanism still (`|velocity| < homing_stall_rps`) under load (`|current()| >= homing_stall_current_a`, stator amps) for `homing_stall_us`, counted only once the current push has moved it `homing_min_travel_rot` from where that push began or has lasted `homing_min_push_us`, so a slow start is not taken for the stop; a goal lost mid-push ends the push, and its motion does not count for the next, and a one-tick position step faster than the motor's `max_velocity_rps` allows (a frame jump, not motion) starts the push over | the drive keys, `homing_stall_current_a` (A, required, > 0 and below the motor's `stator_limit_a`), `homing_min_push_us` (µs, required, > 0), `homing_min_travel_rot` (rot, required, > 0 and less than the travel); `homing_timeout_us` must exceed `homing_min_push_us + homing_stall_us` plus two node periods. Since stillness under load after the minimum push is taken as the stop, `homing_v` must be enough to move the mechanism against its worst-case load (friction, gravity, a held piece) anywhere in its travel; a push too weak to move it homes wherever it sticks |
 | `"absolute"` | `rezero(sensor * absolute_rot_per_sensor_rot + absolute_offset_rot)` whenever unzeroed and both read, with acquisition times (`position_time()`) known and at most `RezeroAgeBound` apart, without motion | `absolute_sensor` (CANcoder name), `absolute_rot_per_sensor_rot` (default 1), `absolute_offset_rot` (rot, default 0), `absolute_margin_rot` (rot, required, > 0). The RoboRIO configures every CANcoder's discontinuity at 0.5, so it reads absolute position in [-0.5, 0.5) rotations (`PhoenixBackend.cpp`); the frame can name only the one sensor rotation `absolute_offset_rot ± 0.5·|absolute_rot_per_sensor_rot|`. The whole physical range must lie strictly inside it: the travel `min_rot..max_rot` widened by `absolute_margin_rot` at each end, which must cover the hard stops and any overshoot past the travel, since a mechanism resting just past the window reads across the discontinuity and takes a frame a whole sensor rotation away. `SimHardware` and the physics simulator wrap a CANcoder reading the same way |
 
@@ -192,8 +192,8 @@ Faults latch neutral (`kFaulted`) until `clear_fault()` or a Driver Station
 that reports disabled; a stale link does not clear them:
 `kHomingTimeout`; `kHomingStall` (limit-switch homing pushed a mechanism
 slower than `homing_stall_rps` for `homing_stall_us`); `kSwitchStuck` (the
-switch reads closed with the homed mechanism more than `home_margin_rot` into
-its travel); `kStall`; `kMoveTimeout`.
+switch reads closed, on a valid sample, with the homed mechanism more than
+`home_margin_rot` into its travel); `kStall`; `kMoveTimeout`.
 
 `hold()` drives to the position the mechanism had when the current run of
 `hold()` calls began; it too needs a live target.
@@ -274,7 +274,7 @@ the library's share of the node test matrix (docs/TESTING.md §7), requests
 refused outside `update()` and dropped after a skipped one, and each
 feature: stall homing (a stop after motion, never moving, a slow start, the
 timeout), absolute homing (including a reset), upward limit-switch homing and
-a stuck switch, homing paused without a goal, hold on an unhomed mechanism,
+a stuck switch, an invalid switch sample (neither homing nor stuck), homing paused without a goal, hold on an unhomed mechanism,
 gravity for elevator and arm, turret wrap, at-goal and at-speed edges
 (including at speed lost on a velocity sample past `ReadinessAgeBound` or
 of unknown age, and reached before the clock mapping converges, REQ-DEV-22), spin-down, faults, the roller's phases, a disable cancelling a timed run,

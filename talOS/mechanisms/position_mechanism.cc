@@ -270,10 +270,15 @@ void PositionMechanism::update() {
   // each other, so a late frame of either never sets a frame off by the
   // mechanism's motion in between. A refused rezero (Motor::rezero also
   // refuses a late motor position) leaves the motor unzeroed, so the next
-  // tick tries again.
+  // tick tries again. A switch sample that is not connected() (an input not
+  // answering, a gateway configuring) is no reading, whatever value it
+  // carries: it neither counts as closed nor continues a run of closed
+  // readings, as a disconnected motor ends a homing push's evidence, and it
+  // is never a stuck switch.
   bool switch_closed = false;
   if (limit_switch_.has_value()) {
-    switch_closed = limit_switch_->get() == switch_closed_reads_;
+    switch_closed = limit_switch_->connected() &&
+                    limit_switch_->get() == switch_closed_reads_;
     home_count_ = !motor_.zeroed() && switch_closed ? home_count_ + 1 : 0;
     if (home_count_ >= home_samples_) motor_.rezero(home_rot_);
   }
