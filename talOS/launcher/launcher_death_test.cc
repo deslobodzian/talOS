@@ -230,6 +230,7 @@ class ExitWatch {
       const int wait_ms = RemainingMs(deadline);
 #ifdef __linux__
       std::vector<pollfd> ready;
+      ready.reserve(running.size());
       for (const pid_t pid : running)
         ready.push_back({pidfds_[pid], POLLIN, 0});
       const int polled =
@@ -347,6 +348,7 @@ class Session {
                                   // The stubs never take a registry row.
                                   "--heartbeat-startup-grace-ms", "60000"};
     std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
     for (auto& arg : args) argv.push_back(arg.data());
     argv.push_back(nullptr);
     std::cout.flush();
