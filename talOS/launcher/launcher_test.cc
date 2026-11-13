@@ -2654,6 +2654,64 @@ TEST(LauncherSessions, RetentionKeepsAnotherNamespacesRunningSession) {
   std::filesystem::remove_all(root);
 }
 
+// LOG-9: a launch that locks a session directory after retention listed it
+// as idle, and before retention removes it (one given that --session-id, or
+// a running one whose refresh locked its removed session.lock again,
+// SessionDirectoryLock::Refresh), keeps it whole: retention removes a
+// directory only while it holds that lock itself, so it passes it over and
+// records that. The launch is injected through the free space read, which
+// retention makes after its listing and before the removals the free space
+// floor asks for; the injected lock is another open file description in this
+// process, which flock treats as another holder.
+// REQ-OPS-11
+TEST(LauncherSessions, RetentionKeepsASessionLockedAfterItsListing) {
+  auto options = SessionFixture("locked_after_listing");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_max_bytes = 10000000\n");
+  std::ofstream{options.config_path} << configuration;
+  const std::string listed = root + "/1";
+  WriteSessionManifest(listed, 1, 1001, 1101);
+  WriteDriverStationLog(listed, "late", 1, {false}, 4096);
+  // What its own launch left.
+  std::ofstream{listed + "/" + std::string{kSessionDirectoryLockFile}}.close();
+  const auto before = DirectoryContents(listed);
+  // An output log for each of the fixture's roster (hardware_node, alpha,
+  // beta) and talos.log: one byte short, so retention removes what it can.
+  const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
+  const auto launch = std::make_shared<std::optional<SessionDirectoryLock>>();
+  options.available_bytes = [launch, listed,
+                             floor](const std::filesystem::path&) {
+    if (!*launch) {
+      std::error_code error;
+      *launch = SessionDirectoryLock::Create(
+          listed,
+          [](const std::filesystem::path& path, std::error_code& failed) {
+            std::filesystem::create_directories(path, failed);
+          },
+          error);
+    }
+    return std::optional<uint64_t>{floor - 1};
+  };
+  options.session_id = 2;
+  ASSERT_EQ(Launcher{options}.Run(), 0);
+  ASSERT_TRUE(launch->has_value())
+      << "the injected launch could not lock " << listed;
+  auto after = std::filesystem::exists(listed) ? DirectoryContents(listed)
+                                               : decltype(before){};
+  // The verdict retention's read of it leaves (InspectSession).
+  after.erase("session_class");
+  EXPECT_TRUE(after == before)
+      << "retention removed or changed the session a launch locked";
+  EXPECT_NE(ReadFile(root + "/2/" + std::string{kRetentionRecordFile})
+                .find("passes over running session " + listed),
+            std::string::npos);
+  launch->reset();
+  std::filesystem::remove_all(root);
+}
+
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);

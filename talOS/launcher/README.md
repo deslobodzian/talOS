@@ -528,7 +528,7 @@ hold and touches no disk. The times it sleeps until:
 | `--duration-s`'s end, until the stop is sent | the stop |
 | the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
-| the session lock's hourly refresh | [one session per namespace](#one-session-per-namespace) |
+| the hourly refresh of the session lock and of the session directory's `session.lock` | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
 
 Everything else a pass does follows an event or another pass: reaping exits
 (with one more read of the run's row for its final delivery counts),
@@ -883,9 +883,19 @@ holding the lock, and removes it there; a launch creating that path
 meanwhile finds the lock held or the directory gone and creates it again,
 so no launch writes into a directory being removed. A
 `.talos-removing-<session_id>` directory a removal cut short goes at the
-next launch's retention. A running launcher that holds no `session.lock`
-(one built before it existed) is protected only from launches in its own
-namespace.
+next launch's retention. The supervision loop touches its `session.lock`
+hourly, with the session lock (one `futimens` on the held descriptor, which
+writes and syncs nothing itself), so a cleaner of `/tmp` files unused for
+days (macOS's after 3, systemd-tmpfiles' after 10) never deletes it under a
+long session in the default `/tmp/talos_logs`. If the path stops naming the
+locked file (removed by hand, or by a cleaner before a refresh), retention
+could take the directory from then on; the next refresh locks the file the
+path names (creating it, never the directory) and says so once on stderr. That adds
+no window: it and a retention lock the same file, so either the launch
+holds it first and every later retention passes the session over, or a
+retention holds it and is removing the directory, which is reported too. A
+running launcher that holds no `session.lock` (one built before it existed)
+is protected only from launches in its own namespace.
 
 The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or

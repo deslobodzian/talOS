@@ -26,6 +26,11 @@ namespace talos::launcher {
 // a regular file named after its ShmObjectName (introspect::LockFilePath).
 inline constexpr std::string_view kSessionLockName = "/talos_session";
 
+// How often a running launcher refreshes the lock files it holds
+// (SessionLock::Refresh, SessionDirectoryLock::Refresh): far inside macOS
+// clean-tmps' 3 unused days and systemd-tmpfiles' 10 for /tmp.
+inline constexpr std::chrono::hours kLockFileRefresh{1};
+
 // One launcher session per shared-memory namespace. A session owner replaces
 // every declared topic's segment at startup and unlinks them at its end
 // (RTMSOptions::session_owner), so a second launcher in the same namespace --
@@ -220,7 +225,7 @@ class SessionDirectoryLock {
       }
       if (::flock(fd, LOCK_EX | LOCK_NB) == 0) {
         if (introspect::LockFileIsCurrent(fd, path)) {
-          return SessionDirectoryLock{fd};
+          return SessionDirectoryLock{fd, path};
         }
         ::close(fd);
         continue;
@@ -280,8 +285,48 @@ class SessionDirectoryLock {
         error = std::make_error_code(std::errc::no_such_file_or_directory);
       return std::nullopt;
     }
-    return SessionDirectoryLock{fd};
+    return SessionDirectoryLock{fd, path};
   }
+
+  // What Refresh found.
+  enum class Refreshed {
+    kHeld,     // The path names the locked file.
+    kRetaken,  // It did not; the file it names now is locked instead.
+    kLost,     // It did not, and the file it names cannot be locked now.
+  };
+
+  // Keeps the held lock file from looking unused, so a cleaner of old /tmp
+  // files (the default log root is /tmp/talos_logs) does not delete it under
+  // a long session: retention would then find no lock file, create one, take
+  // it and remove the running session. The touch is one futimens(2) on the
+  // open descriptor (introspect::TouchLockFile), an update of the inode's
+  // times that writes and syncs nothing itself; the check is an fstat and an
+  // lstat of the path. Call it at least daily (kLockFileRefresh).
+  //
+  // When the path no longer names the locked file (removed by hand, or by a
+  // cleaner before a refresh), a retention could take the directory from the
+  // removal on, and nothing can close that window after the fact. Locking
+  // the file the path names now, as Create does (creating it, never the
+  // directory), adds none: a retention and this both flock that one inode, so
+  // either this takes it first (kRetaken: every later retention finds it
+  // held) or a retention holds it and is moving the directory away, or has
+  // (kLost). A later refresh tries again.
+  Refreshed Refresh() {
+    introspect::TouchLockFile(fd_);
+    if (introspect::LockFileIsCurrent(fd_, path_)) return Refreshed::kHeld;
+    const int fd = introspect::OpenLockFile(path_, O_RDONLY);
+    if (fd < 0) return Refreshed::kLost;
+    if (::flock(fd, LOCK_EX | LOCK_NB) != 0 ||
+        !introspect::LockFileIsCurrent(fd, path_)) {
+      ::close(fd);
+      return Refreshed::kLost;
+    }
+    // The old lock is on a file nobody can open by its path any more.
+    ::close(std::exchange(fd_, fd));
+    return Refreshed::kRetaken;
+  }
+
+  const std::string& path() const { return path_; }
 
   ~SessionDirectoryLock() {
     if (fd_ >= 0) ::close(fd_);
@@ -290,19 +335,22 @@ class SessionDirectoryLock {
   SessionDirectoryLock(const SessionDirectoryLock&) = delete;
   SessionDirectoryLock& operator=(const SessionDirectoryLock&) = delete;
   SessionDirectoryLock(SessionDirectoryLock&& other) noexcept
-      : fd_{std::exchange(other.fd_, -1)} {}
+      : fd_{std::exchange(other.fd_, -1)}, path_{std::move(other.path_)} {}
   SessionDirectoryLock& operator=(SessionDirectoryLock&& other) noexcept {
     if (this != &other) {
       if (fd_ >= 0) ::close(fd_);
       fd_ = std::exchange(other.fd_, -1);
+      path_ = std::move(other.path_);
     }
     return *this;
   }
 
  private:
-  explicit SessionDirectoryLock(int fd) : fd_{fd} {}
+  SessionDirectoryLock(int fd, std::string path)
+      : fd_{fd}, path_{std::move(path)} {}
 
   int fd_{-1};
+  std::string path_;
 };
 
 }  // namespace talos::launcher
