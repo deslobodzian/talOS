@@ -2329,6 +2329,51 @@ TEST(Gateway, ResetWhileEnabledNeutralizesBeforeRestore) {
   EXPECT_EQ(g.snapshot().epoch, epoch);
 }
 
+// PhoenixBackend leaves a restoring CANcoder's own sample valid (RestoredWith,
+// feedback.h), so in the tick whose PollRestore ends its restore the State
+// holds a value read while it was reconfigured. The gateway masks it there,
+// as it masks the motor it feeds, so a node reading the CANcoder directly
+// (absolute homing) never takes that value. The motor drives again only on a
+// command observing the next State; the other motors drive throughout.
+// REQ-SAFE-24
+TEST(Gateway, RestoredCANcoderIsInvalidInTheTickItsRestoreEnds) {
+  const auto config = SwerveConfig(true);
+  const auto steer = MotorIndex(config, Feedback::kRemoteCANcoder);
+  const auto drive = MotorIndex(config, Feedback::kRotor);
+  const uint16_t encoder_id = config.motors[steer].feedback_sensor_id;
+  const auto encoder = static_cast<std::size_t>(
+      std::find_if(config.sensors.begin(), config.sensors.end(),
+                   [encoder_id](const auto& s) { return s.id == encoder_id; }) -
+      config.sensors.begin());
+  FakeBackend backend;  // Reads the CANcoder valid throughout, as Phoenix does.
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  ASSERT_TRUE(g.Accept(Request(g), 1, 1000));
+  backend.resets = {encoder_id};
+  g.Tick(2000, true);  // Reset found: masked, the restore begun.
+  ASSERT_EQ(backend.restoring_ids, std::vector<uint16_t>{encoder_id});
+  EXPECT_FALSE(g.snapshot().sensors[encoder].valid);
+  backend.calls.clear();
+  g.Tick(3000, true);  // The restore ends, in a State read before it did.
+  ASSERT_TRUE(std::any_of(
+      backend.calls.begin(), backend.calls.end(), [](const auto& call) {
+        return call.kind == FakeBackend::Call::kRestoreFinished;
+      }));
+  auto s = g.snapshot();
+  EXPECT_FALSE(s.sensors[encoder].valid);
+  EXPECT_FALSE(s.motors[steer].valid);
+  ASSERT_TRUE(g.Accept(Request(g), 2, 3000));
+  EXPECT_EQ(backend.last_requests[steer].mode, Mode::kNeutral);
+  EXPECT_EQ(backend.last_requests[drive].mode, Mode::kVelocity);
+
+  g.Tick(4000, true);
+  s = g.snapshot();
+  EXPECT_TRUE(s.sensors[encoder].valid);
+  EXPECT_TRUE(s.motors[steer].valid);
+  ASSERT_TRUE(g.Accept(Request(g), 3, 4000));
+  EXPECT_EQ(backend.last_requests[steer].mode, Mode::kVelocity);
+}
+
 // A dropped watchdog neutral must not leave the last demand in force: every
 // Tick without an accepted command refreshes neutral until a fresh command
 // supersedes it, matching the disabled and unhealthy paths.
