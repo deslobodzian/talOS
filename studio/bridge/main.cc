@@ -155,6 +155,7 @@ struct Bridge {
   std::vector<studio::DriveRosterEntry> config_roster;
   std::string manifest_path;
   std::vector<talos::introspect::NodeSnapshot> registry_nodes;
+  bool registry_read = false;  // the last refresh could open the registry
   std::string drive_summary;
   std::uint64_t evicted = 0;
   // Returns from the event loop's wait (every one, whatever woke it), and of
@@ -349,7 +350,8 @@ struct Bridge {
   // a drive client is connected, so the manifest is not read for nobody.
   void refresh_drive_summary() {
     drive_summary = studio::DriveSummaryJson(studio::BuildDriveSummary(
-        config_roster, registry_nodes, ReadManifest(manifest_path)));
+        config_roster, registry_read ? &registry_nodes : nullptr,
+        ReadManifest(manifest_path)));
   }
 
   // The decoded feed: latest dictionary and latest complete tick, backing
@@ -387,6 +389,7 @@ struct Bridge {
       input.nodes = registry->nodes();
     }
     registry_nodes = input.nodes;
+    registry_read = input.registry_available;
     if (layout && !drive_clients.clients().empty()) refresh_drive_summary();
 
     // The bridge is a participant, not a neutral observer: it holds a reader

@@ -326,6 +326,7 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
 
   ```json
   {"kind":"talos.drive.summary","session":"42","supervised":true,
+   "registry":true,
    "nodes":[{"name":"hardware_node","alive":true,"critical":true,"restarts":0,
              "quarantined":false,"drives":null},
             {"name":"drivetrain","alive":true,"critical":true,"restarts":1,
@@ -337,6 +338,7 @@ identifier `TLM3` ([`telemetry.fbs`](../../talOS/telemetry/telemetry.fbs)).
   |---|---|---|
   | `session` | string | the launcher's session id (the manifest's `session_id`), else a live registry row's, else `""` |
   | `supervised` | bool | the manifest was read; when false, `restarts` 0 and `quarantined` false mean unknown, not none |
+  | `registry` | bool | the live registry could be read at this refresh; when false, every `alive` false and `drives` null mean unknown, not dead |
   | `nodes` | array | with a manifest, every member of its `nodes` in its order but the Studio bridge itself (`studio_bridge`), so `sim_gateway` too when the launcher supervises one; without a manifest, or while it lists no member yet, every node the config launches: `hardware_node`, then each `[subsystems.<name>]` with a `node`, by name |
   | `nodes[].name` | string | the node name |
   | `nodes[].alive` | bool | a live registry row of that name exists (a node that never registered, or died, is false) |

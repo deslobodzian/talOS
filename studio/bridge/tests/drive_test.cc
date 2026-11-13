@@ -385,7 +385,7 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
       R"({"name": "sim_gateway", "restart_count": 2, "quarantined": false},)"
       R"({"name": "studio_bridge", "restart_count": 0, "quarantined": false}]})";
 
-  const DriveSummary summary = BuildDriveSummary(config, registry, manifest);
+  const DriveSummary summary = BuildDriveSummary(config, &registry, manifest);
   EXPECT_EQ(summary.session, "42");
   EXPECT_TRUE(summary.supervised);
   std::vector<std::string> names;
@@ -413,13 +413,34 @@ TEST(DriveSummary, BuildsFromManifestRosterRegistryAndConfig) {
   EXPECT_TRUE(gateway.critical) << "a member the config does not list";
 
   const DriveSummary unsupervised =
-      BuildDriveSummary(config, registry, "{not json");
+      BuildDriveSummary(config, &registry, "{not json");
   EXPECT_FALSE(unsupervised.supervised);
   EXPECT_EQ(unsupervised.session, "41");
   ASSERT_EQ(unsupervised.nodes.size(), config.size());
   EXPECT_EQ(unsupervised.nodes[2].name, "intake");
   EXPECT_FALSE(unsupervised.nodes[2].critical);
   EXPECT_EQ(unsupervised.nodes[2].restarts, 0u);
+}
+
+// REQ-OPS-35
+// A registry the bridge cannot open is said, `"registry":false` right
+// after `supervised`, so the page reads every `alive: false` as unknown
+// instead of every node dead; a readable one, even with no row, says true.
+TEST(DriveSummary, SaysWhenTheRegistryIsUnreadable) {
+  const std::vector<DriveRosterEntry> config{{"hardware_node", true}};
+  const DriveSummary unread = BuildDriveSummary(config, nullptr, "");
+  EXPECT_FALSE(unread.registry);
+  EXPECT_NE(DriveSummaryJson(unread).find(
+                R"("supervised":false,"registry":false,"nodes":[)"),
+            std::string::npos)
+      << DriveSummaryJson(unread);
+  const std::vector<talos::introspect::NodeSnapshot> none;
+  const DriveSummary read = BuildDriveSummary(config, &none, "");
+  EXPECT_TRUE(read.registry);
+  EXPECT_NE(DriveSummaryJson(read).find(
+                R"("supervised":false,"registry":true,"nodes":[)"),
+            std::string::npos)
+      << DriveSummaryJson(read);
 }
 
 // REQ-OPS-35
