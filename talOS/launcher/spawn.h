@@ -142,7 +142,13 @@ inline constexpr int kChildOutputPipeBytes = 256 * 1024;
 // fork + execv of args[0], in its own process group, its output as `output`
 // says, with every catchable signal at its default disposition and none
 // blocked, whatever the launcher's dispositions and the calling thread's mask
-// are (its guardian alone ignores SIGINT and SIGTERM); for a pipe, `*reader`
+// are (its guardian alone ignores SIGINT and SIGTERM); with `hold_stop`,
+// process::kHeldStopSignals (SIGINT, SIGTERM, SIGHUP) are blocked in the
+// child from before its exec, for a member whose --describe says it unblocks
+// them once it handles a stop (introspect::Description::holds_stop): a stop
+// sent before then stays pending. The mask survives exec, so a script that
+// execs its interpreter, and that interpreter's exec of another, keep it;
+// the guardian never has them blocked. For a pipe, `*reader`
 // receives the read end (close-on-exec). Returns
 // the child's pid once it has exec'd, which the close-on-exec error pipe it
 // shares with the launcher shows by closing. A child that fails before or at
@@ -155,7 +161,8 @@ inline constexpr int kChildOutputPipeBytes = 256 * 1024;
 // (SpawnMutex).
 pid_t SpawnProcess(std::vector<std::string> args, std::string& error,
                    SpawnOutput output = SpawnOutput::kInherit,
-                   int* reader = nullptr, SpawnFailure* failure = nullptr);
+                   int* reader = nullptr, SpawnFailure* failure = nullptr,
+                   bool hold_stop = false);
 
 // "9 SIGKILL": a signal's number, which differs between Linux and macOS
 // for some signals, and its name where it has a portable one.

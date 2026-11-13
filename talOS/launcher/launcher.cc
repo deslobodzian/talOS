@@ -811,6 +811,7 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
   launch.restart = RestartSchedule{spec.critical};
   launch.compare_endpoints = described.answered;
   launch.declared = described.declared.sources;
+  launch.holds_stop = described.answered && described.declared.holds_stop;
   auto period_us =
       robot_config.toml_data["subsystems"][proc.name]["period_us"]
           .value_or<int64_t>(
@@ -1020,7 +1021,7 @@ pid_t Launcher::SpawnNode(const NodeProcessInfo& proc, const NodeLaunch& launch,
   }
   return SpawnDrained(launch.args, error, *output_,
                       NodeOutputPath(options_.output_dir, proc.name), proc.name,
-                      /*echo=*/true);
+                      /*echo=*/true, launch.holds_stop);
 }
 
 std::chrono::milliseconds Launcher::ScheduleRestart(NodeProcessInfo& proc,

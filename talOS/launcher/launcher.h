@@ -85,7 +85,8 @@ inline constexpr std::chrono::seconds kStopTimeout{2};
 // stop signaled it (`kill_reason` kRunStop, or kRunStopTimeout when the
 // SIGKILL found it already ended) before the launcher reaped it, and
 // kStopSignal ended it (waitpid `status`). A member not yet handling a stop
-// (between its exec and process::InstallStopHandlers()) ends so. Such a run
+// (between its exec and its stop handlers) ends so, unless its probe said
+// holds_stop: its runs start with the stop held (SpawnProcess). Such a run
 // is the session's own stop: it does not make the session's exit status
 // nonzero, and its manifest run says so (NodeRun::stopped_by_session, which
 // the exit status reads). A signal from elsewhere does not count, nor does
@@ -257,6 +258,9 @@ class Launcher {
     // has published them; `endpoints_checked` says this run's was.
     bool compare_endpoints{false};
     bool endpoints_checked{false};
+    // Its probe said holds_stop: every run is spawned with the stop signals
+    // held until it handles a stop (SpawnProcess's hold_stop).
+    bool holds_stop{false};
     std::vector<naming::SourceShape> declared;
     // A non-critical member killed for a mismatch: never restarted.
     bool endpoints_stopped{false};
