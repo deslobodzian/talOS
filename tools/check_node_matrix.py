@@ -38,7 +38,7 @@ missing, one test file (or node package without one) per line:
 `<path> <case> [<case>...]`, `#` starting a comment. A missing case it lists
 is not a failure; a missing case it does not list is, and so is a listed
 case that is no longer missing, or a listed path that no longer exists, so
-the baseline only shrinks. CI runs it this way (TODO.md MATRIX-1).
+the baseline only shrinks. CI runs it this way.
 """
 
 import argparse

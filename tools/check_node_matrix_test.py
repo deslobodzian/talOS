@@ -142,8 +142,8 @@ class CheckNodeMatrixTest(unittest.TestCase):
                 self.assertEqual(check_node_matrix.main(["bot"]), 1)
 
     def test_baseline_fails_on_a_new_missing_case_and_a_stale_entry(self):
-        # CI runs the lint over a baseline of the cases missing today
-        # (MATRIX-1), which may only shrink: an unlisted missing case fails,
+        # CI runs the lint over a baseline of the cases missing today,
+        # which may only shrink: an unlisted missing case fails,
         # and so does a listed case that is present or a path that is gone.
         names = check_node_matrix.CASES["actuator"]
         body = "".join(f"TEST(Arm, {names[case]}) {{}}\n"
@@ -159,7 +159,7 @@ class CheckNodeMatrixTest(unittest.TestCase):
                           encoding="utf-8") as f:
                     f.write(text)
             for baseline, code in (
-                    ("bot/arm/node_test.cc 11 12  # MATRIX-1\n", 0),
+                    ("bot/arm/node_test.cc 11 12  # known gap\n", 0),
                     ("bot/arm/node_test.cc 12\n", 1),
                     ("bot/arm/node_test.cc 10 11 12\n", 1),
                     ("bot/arm/node_test.cc 11 12\nbot/gone_test.cc 1\n", 1),
