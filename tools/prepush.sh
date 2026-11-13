@@ -17,8 +17,8 @@
 # --nocache_test_results //...`, checkout-unchanged; then, when the commits
 # to push (@{upstream}..<ref>, or every file if the branch has no upstream)
 # touch them: gradle (`phoenixTest buildRio -Pheadless --offline`, for
-# 2026-robot/controller_processor/, talOS/hardware/, talOS/protocol/) and
-# studio-test and studio-build (`pnpm test`, `pnpm build`, for studio/).
+# 2026-robot/controller_processor/ and talOS/, whose headers the RoboRIO
+# program's build.gradle exports) and studio-test and studio-build (`pnpm test`, `pnpm build`, for studio/).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`); logs stay in a
 # directory under ${TMPDIR:-/tmp}.
@@ -170,7 +170,9 @@ run_step checkout-unchanged sh -c \
   'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||
   true
 
-rio_paths=(2026-robot/controller_processor/ talOS/hardware/ talOS/protocol/)
+# build.gradle compiles sources from talOS/protocol, talOS/hardware and
+# talOS/driver_station and exports every header under talOS/.
+rio_paths=(2026-robot/controller_processor/ talOS/)
 if [ "$skip_gradle" = 1 ]; then
   report "gradle skipped (--skip-gradle)"
 elif ! touches "${rio_paths[@]}"; then
