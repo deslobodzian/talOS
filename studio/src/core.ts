@@ -1,6 +1,7 @@
 import {ByteBuffer} from 'flatbuffers';
 
 import {type ChannelSpec, doubleFromRaw, encodeDictionaryPages, encodeValuePages, rawFromDouble} from './encode';
+import {AlertLevel} from './generated/talos/telemetry/alert-level';
 import {ChannelKind} from './generated/talos/telemetry/channel-kind';
 import {Frame} from './generated/talos/telemetry/frame';
 import {Pose as WirePose} from './generated/talos/telemetry/pose';
@@ -22,7 +23,10 @@ export type Snapshot = {
   exact?: Record<string, string>;
   units: Record<string, string>;
   labels: Record<string, string[]>;
-  kinds?: Readonly<Record<string, ChannelKind>>
+  kinds?: Readonly<Record<string, ChannelKind>>;
+  // The level of each alert channel the dictionary declares (none other has
+  // an entry), whether or not it has a reading in this snapshot.
+  alerts?: Readonly<Record<string, AlertLevel>>
 };
 
 export type PlanarPose = Pick<Pose, 'x'|'y'|'yaw'>;
@@ -152,7 +156,8 @@ function verify(bytes: Uint8Array) {
     const q = ref(f[13]), n = u32(q);
     check(q + 4, n * 4);
     for (let i = 0; i < n; i++) {
-      const entry = table(ref(q + 4 + i * 4), [4, 4, 4, 1]);
+      // name, unit, labels, kind, alert level.
+      const entry = table(ref(q + 4 + i * 4), [4, 4, 4, 1, 1]);
       string(entry[0]);
       if (entry[1]) string(entry[1]);
       stringVector(entry[2]);
@@ -178,7 +183,8 @@ const pose = (p: WirePose|null): Pose => {
 };
 
 // A decoded dictionary: channel names and kinds in channel order, and units,
-// labels and kinds frozen and shared by every snapshot decoded against it, so
+// labels, kinds and alert levels (alert channels only) frozen and shared by
+// every snapshot decoded against it, so
 // a long timeline holds one copy per dictionary rather than one per sample.
 // `derivedUnits` adds the units of Studio's derived/ channels, for the
 // snapshots that carry them.
@@ -189,6 +195,7 @@ export type Dictionary = {
   units: Readonly<Record<string, string>>;
   labels: Readonly<Record<string, string[]>>;
   kinds: Readonly<Record<string, ChannelKind>>;
+  alerts: Readonly<Record<string, AlertLevel>>;
   derivedUnits?: Readonly<Record<string, string>>;
 };
 
@@ -336,7 +343,8 @@ export class TelemetryDecoder {
     const names: string[] = [], kindList: ChannelKind[] = [];
     const units: Record<string, string> = Object.create(null),
           labels: Record<string, string[]> = Object.create(null),
-          kinds: Record<string, ChannelKind> = Object.create(null);
+          kinds: Record<string, ChannelKind> = Object.create(null),
+          alerts: Record<string, AlertLevel> = Object.create(null);
     const seen = new Set<string>();
     for (const part of complete.pages) {
       if (part.firstChannel() !== names.length)
@@ -350,11 +358,14 @@ export class TelemetryDecoder {
           throw Error('Reserved derived/ channel namespace');
         const kind = info.kind();
         if (!(kind in ChannelKind)) throw Error('Unknown channel kind');
+        const alert = info.alert();
+        if (!(alert in AlertLevel)) throw Error('Unknown alert level');
         seen.add(name);
         names.push(name);
         kindList.push(kind);
         kinds[name] = kind;
         units[name] = info.unit() ?? '';
+        if (alert !== AlertLevel.None) alerts[name] = alert;
         if (info.labelsLength()) {
           const channelLabels: string[] = [];
           for (let j = 0; j < info.labelsLength(); j++)
@@ -370,7 +381,8 @@ export class TelemetryDecoder {
     this.stream = streamId;
     this.dictionary = {
       id: complete.id, names, kindList, units: Object.freeze(units),
-      labels: Object.freeze(labels), kinds: Object.freeze(kinds)
+      labels: Object.freeze(labels), kinds: Object.freeze(kinds),
+      alerts: Object.freeze(alerts)
     };
     if (!same) {
       this.raw = new BigUint64Array(names.length);
@@ -416,7 +428,8 @@ export class TelemetryDecoder {
       exact,
       units: dictionary.units,
       labels: dictionary.labels,
-      kinds: dictionary.kinds
+      kinds: dictionary.kinds,
+      alerts: dictionary.alerts
     };
     // Derive once, before history/UI/RPC consume the snapshot. Missing inputs
     // leave no reading (or unit) rather than inventing a zero-error sample.
@@ -470,7 +483,8 @@ export function exportPages(frames: Snapshot[],
         name,
         unit: next.units[name],
         labels: next.labels[name],
-        kind: next.kindList[i]
+        kind: next.kindList[i],
+        alert: next.alerts[name]
       }));
       pages.push(...encodeDictionaryPages(header(current), channels));
     }

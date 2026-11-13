@@ -10,6 +10,7 @@ import {renderToStaticMarkup} from 'react-dom/server';
 
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import type {RobotEvent, Series} from '../src/data/types';
+import {AlertLevel} from '../src/data/alerts';
 import {robotPanel, maskBits, windowDelta, phaseFromSeries, badgeFor} from '../src/panels/robot';
 
 const renderPanel = (studio: Studio): string =>
@@ -125,4 +126,42 @@ test('recent events show only the last eight', () => {
   const html = renderPanel(createStaticStudio({events}));
   for (let i = 0; i < 10; i++)
     assert.equal(html.includes(`event-${i}<`), i >= 2, `event-${i}`);
+});
+
+// REQ-OPS-37: the Alerts card lists the active alerts by level, each with its
+// level word, and the latch with each alert's activation count, including an
+// alert no longer active.
+test('the alerts card lists active alerts by level and the latch with counts', () => {
+  const alerts = {
+    'hw/status/alert_error_link_lost': AlertLevel.Error,
+    'drivetrain/status/alert_warning_module_offset': AlertLevel.Warning,
+    'autonomous/status/alert_info_routine_not_selected': AlertLevel.Info
+  };
+  const frame = (ms: number, on: string[]) => ({
+    stream_id: 'a', sequence_id: String(ms), timestamp_ns: String(ms * 1000000),
+    dictionary_id: 1, chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+    channels: Object.fromEntries(Object.keys(alerts).map(n => [n, on.includes(n) ? 1 : 0])),
+    units: Object.fromEntries(Object.keys(alerts).map(n => [n, ''])), labels: {}, alerts
+  });
+  const text = (frames: ReturnType<typeof frame>[]) => renderPanel(createStaticStudio({
+    frames, playback: {mode: 'PAUSED', cursor_ns: frames.at(-1)!.timestamp_ns}
+  })).replace(/<[^>]*>/g, '|');
+  const html = text([
+    frame(1000, ['drivetrain/status/alert_warning_module_offset']),
+    frame(1100, []),
+    frame(1200, ['autonomous/status/alert_info_routine_not_selected',
+                 'drivetrain/status/alert_warning_module_offset',
+                 'hw/status/alert_error_link_lost']),
+    frame(1300, ['autonomous/status/alert_info_routine_not_selected',
+                 'drivetrain/status/alert_warning_module_offset'])
+  ]);
+  const active = html.slice(html.indexOf('Alerts'), html.indexOf('Raised'));
+  assert.match(active, /WARN\|+drivetrain\|+module offset.*INFO\|+autonomous\|+routine not selected/);
+  assert.doesNotMatch(active, /link lost/);
+  const latch = html.slice(html.indexOf('Raised'), html.indexOf('Recent events'));
+  assert.match(latch, /ERROR\|+hw\|+link lost\|+first [^|]* ×1\|.*WARN\|+drivetrain\|+module offset\|+first [^|]* ×2 · active/);
+
+  const quiet = text([frame(1000, [])]);
+  assert.match(quiet, /no active alerts/);
+  assert.match(quiet, /no alerts raised/);
 });

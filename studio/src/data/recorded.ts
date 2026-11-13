@@ -19,6 +19,7 @@
 // merged.
 
 import type {Pose, Snapshot} from '../core';
+import type {AlertLevel} from '../generated/talos/telemetry/alert-level';
 import {discoverEstimate, type EstimateChannels} from './discovery';
 import {
   decodeSeries,
@@ -320,6 +321,7 @@ export class RecordedSource implements DataSource {
     const exact: Record<string, string> = {};
     const units: Record<string, string> = {};
     const labels: Record<string, string[]> = {};
+    const alerts: Record<string, AlertLevel> = {};
     const samples = new Map<string, ChannelSample>();
     for (const [name, sample] of review.channels) {
       channels[name] = sample.value;
@@ -327,6 +329,7 @@ export class RecordedSource implements DataSource {
       const info = this.infos.get(name);
       units[name] = info?.unit ?? '';
       if (info?.labels.length) labels[name] = info.labels;
+      if (info?.alert) alerts[name] = info.alert;
       samples.set(name, {value: sample.value, timestamp_ns: sample.sample_ns});
     }
     this.snapshot = {
@@ -340,7 +343,8 @@ export class RecordedSource implements DataSource {
       channels,
       exact,
       units,
-      labels
+      labels,
+      alerts
     };
     this.samples = samples;
     this.chassisReading = this.readChassis();
@@ -533,6 +537,11 @@ export class RecordedSource implements DataSource {
   }
   modeBands() {
     return NO_BANDS;
+  }
+  // The review server's alert intervals are not served yet; a snapshot still
+  // carries the alerts active at the playhead.
+  alertLatch() {
+    return null;
   }
 }
 

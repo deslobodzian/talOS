@@ -6,6 +6,8 @@ import {Builder, ByteBuffer} from 'flatbuffers';
 import {
   channelDisplay,
   Coordinator,
+  dictionaryKey,
+  exportPages,
   JitterBuffer,
   MAX_ENUM_LABELS,
   MAX_FRAME_BYTES,
@@ -15,7 +17,9 @@ import {
   Timeline,
 } from '../src/core';
 import {demoPacket, demoSystemGraph} from '../src/demo';
-import {ChannelKind, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
+import {AlertLevel, ChannelKind, concatPages, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
+import {parseChannels} from '../src/data/review';
+import {TelemetryStore} from '../src/data/store';
 import {ChannelInfo} from '../src/generated/talos/telemetry/channel-info';
 import {Frame} from '../src/generated/talos/telemetry/frame';
 import {Pose} from '../src/generated/talos/telemetry/pose';
@@ -28,7 +32,7 @@ const frame = (i: number) => {
   return decoder.decode(demoPacket(BigInt(i)))!;
 };
 
-const DEMO_CHANNEL_COUNT = 11;
+const DEMO_CHANNEL_COUNT = 20;
 
 // One keyframe value page for `dictionaryId` (a number is a double sample,
 // NaN and the infinities included; null is absent; a bigint is an integer
@@ -493,6 +497,46 @@ test('snapshots share their dictionary\'s frozen units and labels', () => {
   const plain = decoder.decode(valueFrame(3n, 1, [1, 0, 12, 2, 0, 0, 0, 1]))!;
   assert.equal(a.units['derived/pose_error_m'], 'm');
   assert.equal('derived/pose_error_m' in plain.units, false);
+});
+
+// REQ-OPS-37: an alert channel's level reaches the channel model from the
+// live dictionary pages, from a TLM3 export of them (an imported recording)
+// and from the review server's channels.json; an unknown level is refused.
+test('alert levels reach ChannelInfo from dictionary pages, an export and the review server', () => {
+  const channels = [
+    {name: 'hw/status/alert_error_link_lost', unit: '', kind: ChannelKind.Bool,
+     alert: AlertLevel.Error},
+    {name: 'arm/status/alert_info_homing', unit: '', kind: ChannelKind.Bool,
+     alert: AlertLevel.Info},
+    {name: 'arm/status/homed', unit: '', kind: ChannelKind.Bool}
+  ];
+  const header = {streamId: 7n, sequenceId: 1n, timestampNs: 5n, dictionaryId: 9,
+                  channelCount: channels.length};
+  const pages = [...encodeDictionaryPages(header, channels),
+                 ...encodeValuePages(header, {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+                                     true, [[0, 1n], [1, 0n], [2, 1n]])];
+  const decoder = new TelemetryDecoder();
+  const live = decoder.decodeAll(concatPages(pages))[0];
+  const expected = {'hw/status/alert_error_link_lost': AlertLevel.Error,
+                    'arm/status/alert_info_homing': AlertLevel.Info};
+  assert.deepEqual({...live.alerts}, expected);
+  const store = new TelemetryStore(() => {});
+  store.ingest([live], true);
+  assert.equal(store.channelInfo('hw/status/alert_error_link_lost')?.alert, AlertLevel.Error);
+  assert.equal(store.channelInfo('arm/status/homed')?.alert, undefined);
+
+  const dictionary = decoder.currentDictionary()!;
+  const exported = exportPages([live], new Map([[dictionaryKey(live), dictionary]]));
+  const imported = new TelemetryDecoder().decodeAll(concatPages(exported))[0];
+  assert.deepEqual({...imported.alerts}, expected);
+
+  const review = parseChannels({channels: [
+    {name: 'hw/status/alert_error_link_lost', unit: '', labels: [], alert: 'error'},
+    {name: 'arm/status/homed', unit: '', labels: []}
+  ]});
+  assert.deepEqual(review.map(c => c.alert), [AlertLevel.Error, undefined]);
+  assert.throws(() => parseChannels({channels: [
+    {name: 'a/status/alert_fatal_x', unit: '', labels: [], alert: 'fatal'}]}), /alert/);
 });
 
 test('derived heading series wraps both directions across 180 degrees', () => {

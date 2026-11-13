@@ -1,6 +1,7 @@
 // The robot panel: the at-a-glance answer to "what is the robot doing right
 // now". A dense grid of cards over Driver Station, routine phase, power, link,
-// pose, the discovered subsystems and cameras, and the recent event feed. It
+// pose, alerts, the discovered subsystems and cameras, and the recent event
+// feed. It
 // reads only through the data hooks and discovers owners/channels by shape, so
 // it stays robot-agnostic: no 2026 node names are hard-coded here.
 
@@ -8,8 +9,10 @@ import {useMemo} from 'react';
 import type {ReactNode} from 'react';
 
 import {poseError, simTruthPose} from '../../core';
+import {activeAlerts} from '../../data/alerts';
 import {
   useActions,
+  useAlertLatch,
   useDictionary,
   useEvents,
   useRobotStatus,
@@ -29,6 +32,7 @@ import {channelLeaf} from '../../ui/channel';
 import {duration, number} from '../../ui/formatters';
 import {EmptyState, StatList} from '../../ui/primitives';
 import {Sparkline} from '../../ui/Sparkline';
+import {ActiveAlertList, LatchedAlertList, latchSpan} from '../../ui/AlertList';
 import type {PanelDefinition} from '../types';
 import {ChannelReading, ChannelStat as Stat, FreshnessNotice} from '../../ui/FreshnessNotice';
 import './robot.css';
@@ -232,6 +236,7 @@ function RobotPanel() {
   const status = useRobotStatus();
   const events = useEvents();
   const actions = useActions();
+  const latch = useAlertLatch();
 
   const graph = system.graph;
   const channels = snapshot?.channels ?? {};
@@ -301,6 +306,9 @@ function RobotPanel() {
       null;
 
   const recent = useMemo(() => events.slice(-8), [events]);
+  const alerts = useMemo(() => activeAlerts(snapshot), [snapshot]);
+  const hasAlertChannels = useMemo(
+      () => dictionary.some(c => c.alert), [dictionary]);
 
   return <div className="robot-panel">
     <FreshnessNotice/>
@@ -418,6 +426,19 @@ function RobotPanel() {
              </div>}
       </Card>
 
+      <Card title="Alerts" eyebrow={`${alerts.length} ACTIVE`}>
+        {!hasAlertChannels ?
+             <EmptyState>no alert channels in the dictionary</EmptyState> :
+             <div className="alerts-card">
+               <ActiveAlertList alerts={alerts} latch={latch}
+                                now_ns={snapshot?.timestamp_ns ?? null}/>
+               <div className="alerts-latched">
+                 <h3>Raised · {latchSpan(latch)}</h3>
+                 <LatchedAlertList latch={latch} now_ns={snapshot?.timestamp_ns ?? null}/>
+               </div>
+             </div>}
+      </Card>
+
       <Card title="Recent events" eyebrow={`${events.length} TOTAL`}>
         {recent.length ?
              <ul className="events">
@@ -458,7 +479,7 @@ export const robotPanel: PanelDefinition<RobotConfig> = {
   id: 'robot',
   title: 'Robot',
   category: 'Robot',
-  description: 'At a glance: Driver Station, routine, power, link, pose, subsystems, cameras and events.',
+  description: 'At a glance: Driver Station, routine, power, link, pose, alerts, subsystems, cameras and events.',
   defaultConfig,
   parseConfig,
   component: RobotPanel,

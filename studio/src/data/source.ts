@@ -6,6 +6,7 @@
 // a recorded source fetches what a getter misses and notifies on arrival.
 
 import {poseValid, type Pose, type Snapshot} from '../core';
+import type {AlertLatch} from './alerts';
 import type {TelemetryStore} from './store';
 import type {
   ChannelInfo,
@@ -41,6 +42,9 @@ export interface DataSource {
   chassis(): {pose: Pose; sample_ns: string}|null;
   events(): RobotEvent[];
   modeBands(): ModeBand[];
+  // Every alert raised since the current match began, as of the newest data
+  // (data/alerts.ts); null where the source cannot know it.
+  alertLatch(): AlertLatch|null;
 }
 
 export class LiveSource implements DataSource {
@@ -83,5 +87,8 @@ export class LiveSource implements DataSource {
   }
   modeBands() {
     return this.store.modeBands();
+  }
+  alertLatch() {
+    return this.store.alertLatch();
   }
 }
