@@ -3241,8 +3241,7 @@ TEST(LauncherSessions, AOneOffLockFailureLeavesARunningSession) {
   const auto second = std::make_shared<std::optional<SessionDirectoryLock>>();
   const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
   const std::string listed = dir(2);
-  options.available_bytes = [second, listed,
-                             floor](const std::filesystem::path&) {
+  options.available_bytes = [second, listed](const std::filesystem::path&) {
     if (!*second) {
       std::error_code failed;
       *second = SessionDirectoryLock::Create(
