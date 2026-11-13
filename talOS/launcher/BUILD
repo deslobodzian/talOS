@@ -432,6 +432,14 @@ cc_test(
     ],
 )
 
+# Stub scripts for the launcher's process tests, executed once when written
+# so the host's first-exec charge is not paid inside a probe deadline.
+cc_library(
+    name = "first_exec",
+    testonly = True,
+    hdrs = ["testdata/first_exec.h"],
+)
+
 # What the launcher's process tests wait on instead of a duration: the
 # supervision loop's passes and a supervision clock the test moves ahead.
 cc_library(
@@ -469,6 +477,7 @@ cc_test(
         "no_macos_sanitizer",
     ],
     deps = [
+        ":first_exec",
         ":launcher_lib",
         ":log_budget",
         ":log_merge",
@@ -603,6 +612,7 @@ cc_test(
         "no_macos_sanitizer",
     ],
     deps = [
+        ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
         ":supervision_events",
@@ -646,6 +656,7 @@ cc_test(
         "no_macos_sanitizer",
     ],
     deps = [
+        ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
         "@googletest//:gtest_main",
@@ -663,6 +674,7 @@ cc_test(
     env = {"TALOS_LAUNCHER": "$(rlocationpath :launcher)"},
     tags = ["integration"],
     deps = [
+        ":first_exec",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "@googletest//:gtest_main",
@@ -718,6 +730,7 @@ cc_test(
     tags = ["integration"],
     deps = [
         ":continuity_message",
+        ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
         "//talOS/events:events_log",
@@ -820,6 +833,7 @@ cc_test(
         "no_macos_sanitizer",
     ],
     deps = [
+        ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
         ":replay_message",

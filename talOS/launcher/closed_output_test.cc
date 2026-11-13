@@ -30,11 +30,13 @@
 #include <iterator>
 #include <memory>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <string_view>
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/launcher/launcher.h"
+#include "talOS/launcher/testdata/first_exec.h"
 
 namespace talos::launcher {
 namespace {
@@ -75,7 +77,7 @@ std::string WriteStub(std::string_view tag, std::string_view body,
   description.target = node == "hardware_node"
                            ? "//talOS/bridge:hardware_node"
                            : "//example/" + std::string{node} + ":node";
-  std::ofstream out{path};
+  std::ostringstream out;
   out << "#!/bin/sh\n"
       << "for arg in \"$@\"; do\n"
       << "  if [ \"$arg\" = \"--describe\" ]; then\n"
@@ -85,9 +87,7 @@ std::string WriteStub(std::string_view tag, std::string_view body,
       << "  fi\n"
       << "done\n"
       << body;
-  out.close();
-  ::chmod(path.c_str(), 0755);
-  return path;
+  return talos::launcher::testing::WriteWarmStub(path, out.str());
 }
 
 std::string ReadFile(const std::string& path) {

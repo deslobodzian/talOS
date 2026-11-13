@@ -20,6 +20,7 @@
 #include <fstream>
 #include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -29,6 +30,7 @@
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/launcher/launcher.h"
+#include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/rtms/rtms.h"
 
@@ -149,22 +151,20 @@ can_id = 2
   introspect::Description hardware;
   hardware.name = "hardware_node";
   hardware.target = "//talOS/bridge:hardware_node";
-  std::ofstream{hardware_stub} << "#!/bin/sh\n"
-                               << "for arg in \"$@\"; do\n"
-                               << "  if [ \"$arg\" = \"--describe\" ]; then\n"
-                               << "    cat <<'TALOS_DESCRIBE'\n"
-                               << introspect::DescribeToJson(hardware)
-                               << "TALOS_DESCRIBE\n"
-                               << "    exit 0\n"
-                               << "  fi\n"
-                               << "done\n"
-                               // Alive until the session stops it: an exited
-                               // stub restarts, and a stop that lands before
-                               // its exec makes the session status nonzero.
-                               << "trap 'exit 0' INT TERM\n"
-                               << "while :; do sleep 0.05; done\n";
-  std::filesystem::permissions(hardware_stub,
-                               std::filesystem::perms::owner_all);
+  std::ostringstream script;
+  script << "#!/bin/sh\n"
+         << "for arg in \"$@\"; do\n"
+         << "  if [ \"$arg\" = \"--describe\" ]; then\n"
+         << "    cat <<'TALOS_DESCRIBE'\n"
+         << introspect::DescribeToJson(hardware) << "TALOS_DESCRIBE\n"
+         << "    exit 0\n"
+         << "  fi\n"
+         << "done\n"
+         // Alive until the session stops it: an exited stub restarts, and a
+         // stop that lands before its exec makes the session status nonzero.
+         << "trap 'exit 0' INT TERM\n"
+         << "while :; do sleep 0.05; done\n";
+  talos::launcher::testing::WriteWarmStub(hardware_stub, script.str(), 0700);
 
   LauncherOptions options;
   options.config_path = config;
