@@ -914,7 +914,13 @@ is protected only from launches in its own namespace. So is one whose log
 root's filesystem takes no advisory locks (NFS without a lock daemon,
 macOS's msdos and exFAT volumes): its launch warns once and runs without
 the lock rather than being refused, and retention there removes sessions as
-it did before launches locked them.
+it did before launches locked them. Whether a log root takes no locks is
+decided once by retention, and once by the session directory's creation,
+by a shared lock of the root's `.talos-lock-probe` file, never by one
+failing call: on a root whose probe locked, a session whose `session.lock`
+cannot be locked for such a reason (an NFS lock daemon that stops
+answering) is passed over, with a warning, and a launch whose own lock
+fails so tries again rather than running without it.
 
 The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or

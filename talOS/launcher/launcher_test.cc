@@ -2869,6 +2869,102 @@ TEST(LauncherSessions, ALogRootWithoutLocksStillLaunches) {
   std::filesystem::remove_all(root);
 }
 
+// A flock failing as on a filesystem without advisory locks (ENOLCK: an NFS
+// lock daemon that stops answering) on a log root whose locks work says
+// nothing about whether a launch holds that session: retention passes the
+// session over rather than removing it unlocked. Two running sessions, both
+// old enough to go for the free space floor: 1 is locked from the start
+// and every flock of its session.lock fails (retention's listing check),
+// 2 is locked after the listing, as in
+// RetentionKeepsASessionLockedAfterItsListing, and retention's exclusive
+// flock of its session.lock fails (the removal's own lock). Every other
+// flock, the root's probe included, is real.
+// REQ-OPS-11
+TEST(LauncherSessions, AOneOffLockFailureLeavesARunningSession) {
+  auto options = SessionFixture("lock_hiccup");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  std::string configuration{kFixtureToml};
+  configuration.insert(configuration.find("period_us"),
+                       "log_max_bytes = 10000000\n");
+  std::ofstream{options.config_path} << configuration;
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  const auto create = [](const std::filesystem::path& path,
+                         std::error_code& failed) {
+    std::filesystem::create_directories(path, failed);
+  };
+  WriteSessionManifest(dir(1), 1, 1001);
+  WriteDriverStationLog(dir(1), "late", 1, {false}, 4096);
+  std::error_code error;
+  const auto first = SessionDirectoryLock::Create(dir(1), create, error);
+  ASSERT_TRUE(first.has_value() && first->held()) << error.message();
+  WriteSessionManifest(dir(2), 2, 1002);
+  WriteDriverStationLog(dir(2), "late", 2, {false}, 4096);
+  std::ofstream{dir(2) + "/" + std::string{kSessionDirectoryLockFile}}.close();
+  const auto before_first = DirectoryContents(dir(1));
+  const auto before_second = DirectoryContents(dir(2));
+  const auto inode = [](const std::string& path) {
+    struct stat status {};
+    return ::stat(path.c_str(), &status) == 0 ? status.st_ino : ino_t{0};
+  };
+  const ino_t first_lock =
+      inode(dir(1) + "/" + std::string{kSessionDirectoryLockFile});
+  const ino_t second_lock =
+      inode(dir(2) + "/" + std::string{kSessionDirectoryLockFile});
+  ASSERT_NE(first_lock, ino_t{0});
+  ASSERT_NE(second_lock, ino_t{0});
+  options.lock_session_directory = [first_lock, second_lock](int fd,
+                                                             int operation) {
+    struct stat status {};
+    if (::fstat(fd, &status) == 0 &&
+        (status.st_ino == first_lock ||
+         (status.st_ino == second_lock && (operation & LOCK_EX) != 0))) {
+      errno = ENOLCK;
+      return -1;
+    }
+    return ::flock(fd, operation);
+  };
+  const auto second = std::make_shared<std::optional<SessionDirectoryLock>>();
+  const uint64_t floor = 10'000'000 + (3 + 1) * kChildOutputLogMaxBytes;
+  const std::string listed = dir(2);
+  options.available_bytes = [second, listed,
+                             floor](const std::filesystem::path&) {
+    if (!*second) {
+      std::error_code failed;
+      *second = SessionDirectoryLock::Create(
+          listed,
+          [](const std::filesystem::path& path, std::error_code& made) {
+            std::filesystem::create_directories(path, made);
+          },
+          failed);
+    }
+    // Short by more than both sessions hold, so each is a removal.
+    return std::optional<uint64_t>{floor / 2};
+  };
+  options.session_id = 3;
+  ::testing::internal::CaptureStderr();
+  const int result = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  ASSERT_EQ(result, 0) << stderr_text;
+  ASSERT_TRUE(second->has_value() && (*second)->held())
+      << "the injected launch could not lock " << listed;
+  auto after_first = std::filesystem::exists(dir(1)) ? DirectoryContents(dir(1))
+                                                     : decltype(before_first){};
+  auto after_second = std::filesystem::exists(dir(2))
+                          ? DirectoryContents(dir(2))
+                          : decltype(before_second){};
+  // The verdict retention's read of a listed session leaves (InspectSession).
+  after_second.erase("session_class");
+  EXPECT_TRUE(after_first == before_first)
+      << "retention removed or changed running session " << dir(1) << "\n"
+      << stderr_text;
+  EXPECT_TRUE(after_second == before_second)
+      << "retention removed or changed running session " << dir(2) << "\n"
+      << stderr_text;
+  second->reset();
+  std::filesystem::remove_all(root);
+}
+
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);
