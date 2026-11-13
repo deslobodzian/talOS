@@ -145,23 +145,24 @@ class Launcher {
   // the limits are met, and each later removal is counted as freeing its bytes,
   // so a filesystem that frees nothing at once (a snapshot holding the
   // blocks) does not empty the log root.
-  // Every removal, and every session that could not be read or removed, is
-  // recorded in the new session's kRetentionRecordFile, written durably;
-  // removing a match or an unclassifiable session is also a warning on
-  // stderr.
+  // Every removal, and only a removal, is recorded in the new session's
+  // kRetentionRecordFile, written durably, so a launch that stops before
+  // its manifest stays abandoned (Classify); removing a match or an
+  // unclassifiable session is also a warning on stderr. A session it could
+  // not read or remove, a running one passed over, and the free space it
+  // could not read or reach are said on stderr only.
   // A session that cannot be read or removed (another user's, unreadable,
   // removed meanwhile) is passed over, never counted against the others:
   // retention never stops a launch.
   // A directory whose lock a launch holds (SessionDirectoryLock), in any
-  // shared-memory namespace, is passed over: neither counted nor read, and
-  // recorded. Any other is removed only while retention holds that lock
-  // itself, after moving the directory out of its session's path, so a
-  // manifest without an end_wall_ns is one whose launcher died (a power
-  // loss, a kill), not a live one. Directories such a move left behind when
-  // a removal was cut short are removed.
-  // Only a launch that may prune removes anything: Pruning::kLocked holds
-  // the session lock. Pruning::kUnlocked found the lock file absent with no
-  // room to create it, so no launcher holds the lock it would take, but one
+  // shared-memory namespace, is passed over: neither counted nor read. Any
+  // other is removed only while retention holds that lock itself, after moving
+  // the directory out of its session's path, so a manifest without an
+  // end_wall_ns is one whose launcher died (a power loss, a kill), not a live
+  // one. Directories such a move left behind when a removal was cut short are
+  // removed. Only a launch that may prune removes anything: Pruning::kLocked
+  // holds the session lock. Pruning::kUnlocked found the lock file absent with
+  // no room to create it, so no launcher holds the lock it would take, but one
   // in the same state may take it while this lists: it removes only
   // sessions whose manifest records an end_wall_ns, and no abandoned launch
   // (which may be that launch describing). --describe-only and --replay-inputs

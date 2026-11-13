@@ -2644,9 +2644,9 @@ std::map<std::string, std::string> DirectoryContents(const std::string& dir) {
 // running session's manifest has no end_wall_ns, as a launch that lost power
 // leaves, and log_keep_sessions = 2 makes it old enough to remove. A launch
 // here, holding this namespace's session lock, must leave every byte of it
-// in place and record that it passed it over; trusting its own session lock,
-// it removed the session while it was being written. A session of the other
-// namespace whose launcher died is still removed.
+// in place and say on stderr that it passed it over; trusting its own session
+// lock, it removed the session while it was being written. A session of the
+// other namespace whose launcher died is still removed.
 TEST(LauncherSessions, RetentionKeepsAnotherNamespacesRunningSession) {
   auto options = SessionFixture("other_namespace");
   const std::string root = options.output_dir;
@@ -2722,7 +2722,9 @@ TEST(LauncherSessions, RetentionKeepsAnotherNamespacesRunningSession) {
   ASSERT_TRUE(before.contains("manifest.json"));
 
   options.session_id = 4;
+  ::testing::internal::CaptureStderr();
   const int result = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
   const bool survived = std::filesystem::exists(dir(2));
   const auto after = survived ? DirectoryContents(dir(2)) : decltype(before){};
   ::close(release[1]);
@@ -2741,9 +2743,13 @@ TEST(LauncherSessions, RetentionKeepsAnotherNamespacesRunningSession) {
   EXPECT_FALSE(std::filesystem::exists(dir(1)));
   EXPECT_TRUE(std::filesystem::exists(dir(3) + "/manifest.json"));
   EXPECT_TRUE(std::filesystem::exists(dir(4) + "/manifest.json"));
-  EXPECT_NE(
+  EXPECT_NE(stderr_text.find("passes over running session " + dir(2)),
+            std::string::npos)
+      << stderr_text;
+  EXPECT_EQ(
       ReadFile(dir(4) + "/" + std::string{kRetentionRecordFile}).find(dir(2)),
-      std::string::npos);
+      std::string::npos)
+      << "retention.txt records removals only";
   std::filesystem::remove_all(root);
 }
 
@@ -2752,7 +2758,7 @@ TEST(LauncherSessions, RetentionKeepsAnotherNamespacesRunningSession) {
 // a running one whose refresh locked its removed session.lock again,
 // SessionDirectoryLock::Refresh), keeps it whole: retention removes a
 // directory only while it holds that lock itself, so it passes it over and
-// records that. The launch is injected through the free space read, which
+// says so. The launch is injected through the free space read, which
 // retention makes after its listing and before the removals the free space
 // floor asks for; the injected lock is another open file description in this
 // process, which flock treats as another holder.
@@ -2789,7 +2795,10 @@ TEST(LauncherSessions, RetentionKeepsASessionLockedAfterItsListing) {
     return std::optional<uint64_t>{floor - 1};
   };
   options.session_id = 2;
-  ASSERT_EQ(Launcher{options}.Run(), 0);
+  ::testing::internal::CaptureStderr();
+  const int result = Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  ASSERT_EQ(result, 0) << stderr_text;
   ASSERT_TRUE(launch->has_value())
       << "the injected launch could not lock " << listed;
   auto after = std::filesystem::exists(listed) ? DirectoryContents(listed)
@@ -2798,10 +2807,53 @@ TEST(LauncherSessions, RetentionKeepsASessionLockedAfterItsListing) {
   after.erase("session_class");
   EXPECT_TRUE(after == before)
       << "retention removed or changed the session a launch locked";
-  EXPECT_NE(ReadFile(root + "/2/" + std::string{kRetentionRecordFile})
-                .find("passes over running session " + listed),
-            std::string::npos);
+  EXPECT_NE(stderr_text.find("passes over running session " + listed),
+            std::string::npos)
+      << stderr_text;
   launch->reset();
+  std::filesystem::remove_all(root);
+}
+
+// A launch that stops before its manifest (here a refused graph; also a
+// missing binary, a failed probe, a service restarting it in a loop) leaves
+// an abandoned directory, which a later launch removes once a newer one
+// exists, so a crash loop leaves its last attempt's and the one before it,
+// not one per attempt. That
+// holds while another launch runs in the same log root: retention passing
+// that session over must not mark each attempt's directory as a record
+// (retention.txt) to keep.
+// REQ-OPS-11
+TEST(LauncherSessions, ACrashLoopBesideARunningSessionLeavesOneDirectory) {
+  auto options = SessionFixture("crash_loop");
+  const std::string root = options.output_dir;
+  std::filesystem::remove_all(root);
+  const auto dir = [&root](int id) { return root + "/" + std::to_string(id); };
+  WriteSessionManifest(dir(1), 1, 1001);
+  std::error_code error;
+  const auto running = SessionDirectoryLock::Create(
+      dir(1),
+      [](const std::filesystem::path& path, std::error_code& failed) {
+        std::filesystem::create_directories(path, failed);
+      },
+      error);
+  ASSERT_TRUE(running.has_value()) << error.message();
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode("crash_loop_silent_alpha", kStubWithoutDescribe);
+  const auto start = std::filesystem::file_time_type::clock::now();
+  constexpr int kAttempts = 5;
+  for (int id = 2; id < 2 + kAttempts; ++id) {
+    options.session_id = static_cast<uint64_t>(id);
+    ASSERT_EQ(Launcher{options}.Run(), 1) << "attempt " << id;
+    // Each attempt's directory is newer than the last's.
+    std::filesystem::last_write_time(dir(id), start + std::chrono::minutes{id});
+  }
+  int left = 0;
+  for (int id = 2; id < 2 + kAttempts; ++id) {
+    left += std::filesystem::exists(dir(id)) ? 1 : 0;
+  }
+  EXPECT_LE(left, 2) << "attempts' directories left behind";
+  EXPECT_TRUE(std::filesystem::exists(dir(2 + kAttempts - 1)));
+  EXPECT_TRUE(std::filesystem::exists(dir(1) + "/manifest.json"));
   std::filesystem::remove_all(root);
 }
 

@@ -183,15 +183,21 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   if (pruning == Pruning::kNone) return session_budget;
   const bool unlocked = pruning == Pruning::kUnlocked;
   const fs::path current{options_.output_dir};
+  // `record` holds removals only: a launch that removed nothing leaves no
+  // retention.txt, so the directory of one that stopped before its
+  // manifest stays an abandoned launch (Classify), whatever else it saw.
   const auto note = [&record](const std::string& line, bool warn) {
     record += line + "\n";
     if (warn) std::cerr << "[launcher] " << line << "\n";
   };
-  const auto report = [&note](std::string_view what, const fs::path& path,
-                              const std::error_code& error) {
-    note("retention " + std::string{what} + " " + path.string() + " (" +
-             error.message() + ")",
-         true);
+  // Everything else retention has to say goes to stderr only.
+  const auto say = [](const std::string& line) {
+    std::cerr << "[launcher] " << line << "\n";
+  };
+  const auto report = [&say](std::string_view what, const fs::path& path,
+                             const std::error_code& error) {
+    say("retention " + std::string{what} + " " + path.string() + " (" +
+        error.message() + ")");
   };
   struct Session {
     fs::path path;
@@ -224,10 +230,9 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     const std::optional<SessionDirectoryLock> lock =
         SessionDirectoryLock::TakeIdle(dir, running, removal);
     if (running) {
-      note("retention passes over running session " + dir.string() +
-               " (a launch holds its " +
-               std::string{kSessionDirectoryLockFile} + ")",
-           false);
+      say("retention passes over running session " + dir.string() +
+          " (a launch holds its " + std::string{kSessionDirectoryLockFile} +
+          ")");
       return false;
     }
     // A directory with no lock file and no room to create one: no launch
@@ -283,10 +288,9 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     // A launch in any shared-memory namespace is writing it: neither counted
     // nor read.
     if (SessionDirectoryLock::Held(entry->path())) {
-      note("retention passes over running session " + entry->path().string() +
-               " (a launch holds its " +
-               std::string{kSessionDirectoryLockFile} + ")",
-           false);
+      say("retention passes over running session " + entry->path().string() +
+          " (a launch holds its " + std::string{kSessionDirectoryLockFile} +
+          ")");
       continue;
     }
     const auto time = entry->last_write_time(unreadable);
@@ -395,10 +399,9 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
   std::optional<uint64_t> available =
       options_.available_bytes(current.parent_path());
   if (!available) {
-    note("WARNING: retention cannot read the free space under " +
-             current.parent_path().string() +
-             "; removes nothing to keep room for the new session",
-         true);
+    say("WARNING: retention cannot read the free space under " +
+        current.parent_path().string() +
+        "; removes nothing to keep room for the new session");
     return session_budget;
   }
   for (; next != sessions.end() && *available < free_floor; ++next) {
@@ -411,12 +414,10 @@ uint64_t Launcher::ApplyRetention(const config::RobotConfig& config,
     }
   }
   if (*available < free_floor) {
-    note("WARNING: retention leaves " + std::to_string(*available) +
-             " bytes free under " + current.parent_path().string() +
-             ", less than " + std::to_string(free_floor) +
-             " the new session may need, with no older session it can "
-             "remove",
-         true);
+    say("WARNING: retention leaves " + std::to_string(*available) +
+        " bytes free under " + current.parent_path().string() + ", less than " +
+        std::to_string(free_floor) +
+        " the new session may need, with no older session it can remove");
   }
   return session_budget;
 }
