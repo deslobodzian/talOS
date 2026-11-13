@@ -154,8 +154,8 @@ class SimBackend final : public Backend {
   // demand. Restore clears latched commands without zeroing mechanism
   // positions (documented ideal-fake limit: positions re-acquire from the
   // next command, they are not re-measured from hardware). The restored
-  // chain reads invalid until the next PollRestore (RestoredWith), as on the
-  // robot.
+  // chain reads invalid until a PollRestore that succeeds (RestoredWith), as
+  // on the robot; SetRestoreFails(true) fails every restore until cleared.
   void SimulateDeviceReset(uint16_t id) { pending_resets_.push_back(id); }
   bool PollDeviceResets(std::vector<uint16_t>& reset_ids) override {
     reset_ids = pending_resets_;
@@ -170,9 +170,11 @@ class SimBackend final : public Backend {
     }
   }
   RestoreStatus PollRestore() override {
+    if (restore_fails_) return RestoreStatus::kFailed;
     restoring_.fill(false);
     return RestoreStatus::kDone;
   }
+  void SetRestoreFails(bool fails) { restore_fails_ = fails; }
   // Position demands teleport, so a step says nothing about a reset.
   bool PositionsArePhysical() const override { return false; }
   void SetPowerHealth(double battery_v, bool brownout) {
@@ -204,6 +206,7 @@ class SimBackend final : public Backend {
   HealthSample health_{true, 12.0, false, 0.0};
   uint64_t previous_time_{};
   std::vector<uint16_t> pending_resets_;
+  bool restore_fails_{false};
   std::array<MotorRequest, kMaxMotors> commands_{};
   std::array<MotorSample, kMaxMotors> samples_{};
   std::array<bool, kMaxMotors> restoring_{};

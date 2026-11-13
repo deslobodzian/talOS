@@ -2458,14 +2458,8 @@ TEST(Gateway, PhysicsResetPreservesPositionAndRejectsOldDemand) {
   EXPECT_DOUBLE_EQ(restored.voltage, 0.0);
 }
 
-// A config of one master and its follower, driving, whose master resets. On
-// the robot PhoenixBackend::Read reports both invalid from the tick after the
-// restore begins until PollRestore completes it, so that State has no valid
-// feedback: total loss, which faults, ends the command in force and starts a
-// new epoch. The next State is healthy again, and only a command of the new
-// epoch drives the pair. A simulated backend must fault the same way.
-template <typename SimulatedBackend>
-void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
+// One master (id 1) and its follower (id 2), and nothing else.
+Config MasterFollowerConfig() {
   Config config;
   config.commissioned = true;
   MotorConfig master;
@@ -2478,18 +2472,33 @@ void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
   follower.can_id = 2;
   follower.master_id = master.id;
   config.motors = {master, follower};
-  Gateway g{config, backend, 1};
+  return config;
+}
+// Accepts a command, observing `g`'s State, that drives every motor at 2 V.
+bool DriveAtTwoVolts(Gateway& g, uint64_t sequence, uint64_t now) {
+  auto command = Request(g);
+  for (std::size_t i = 0; i < command.count; ++i) {
+    command.motors[i] = {command.motors[i].id, Mode::kVoltage, 0, 2};
+  }
+  return g.Accept(command, sequence, now);
+}
+
+// A config of one master and its follower, driving, whose master resets. On
+// the robot PhoenixBackend::Read reports both invalid from the tick after the
+// restore begins until PollRestore completes it, so that State has no valid
+// feedback: total loss, which faults, ends the command in force and starts a
+// new epoch. The next State is healthy again, and only a command of the new
+// epoch drives the pair. A simulated backend must fault the same way.
+template <typename SimulatedBackend>
+void ExpectRestoringPairIsTotalLoss(SimulatedBackend& backend) {
+  Gateway g{MasterFollowerConfig(), backend, 1};
   const auto drive = [&g](uint64_t sequence, uint64_t now) {
-    auto command = Request(g);
-    for (std::size_t i = 0; i < command.count; ++i) {
-      command.motors[i] = {command.motors[i].id, Mode::kVoltage, 0, 2};
-    }
-    return g.Accept(command, sequence, now);
+    return DriveAtTwoVolts(g, sequence, now);
   };
   g.Tick(1000, true);
   ASSERT_TRUE(drive(1, 1000));
   const auto epoch = g.snapshot().epoch;
-  backend.SimulateDeviceReset(master.id);
+  backend.SimulateDeviceReset(1);
   g.Tick(2000, true);  // Reset found: the pair neutral, the restore begun.
   ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
   const auto before_loss = Request(g);
@@ -2525,6 +2534,65 @@ TEST(SimBackend, RestoringChainIsInvalidAsOnTheRobot) {
 TEST(PhysicsSimBackend, RestoringChainIsInvalidAsOnTheRobot) {
   sim::PhysicsSimBackend backend;
   ExpectRestoringPairIsTotalLoss(backend);
+}
+
+// The same pair, whose master resets and whose first two restores fail. On
+// the robot a device whose restore failed stays unavailable, and
+// PhoenixBackend::Read reports it invalid, until a later restore completes
+// it (retried at the gateway's backoff, 250 ms then 500 ms), so every State
+// until then is total loss; the pair drives again only once a restore
+// succeeds, on a command observing a State read after it. A simulated backend
+// that reported the pair valid again after a failed restore would let the
+// gateway judge those States healthy.
+template <typename SimulatedBackend>
+void ExpectFailingRestoreKeepsPairInvalid(SimulatedBackend& backend) {
+  Gateway g{MasterFollowerConfig(), backend, 1};
+  g.Tick(1000, true);
+  ASSERT_TRUE(DriveAtTwoVolts(g, 1, 1000));
+  backend.SetRestoreFails(true);
+  backend.SimulateDeviceReset(1);
+  uint64_t now = 2000;
+  g.Tick(now, true);  // Reset found: the pair neutral, restore 1 begun.
+  ASSERT_EQ(g.restore_attempt_count(), 1u);
+  // Restores 1 and 2 fail at their polls; the tick that begins restore 3 ends
+  // the loop.
+  while (g.restore_attempt_count() < 3 && now < 2000000) {
+    now += 5000;
+    g.Tick(now, true);
+    const auto s = g.snapshot();
+    ASSERT_FALSE(s.motors[0].valid) << "tick " << now;
+    ASSERT_FALSE(s.motors[1].valid) << "tick " << now;
+    ASSERT_TRUE(s.flags & kHardwareFault) << "tick " << now;
+  }
+  ASSERT_EQ(g.restore_attempt_count(), 3u) << "tick " << now;
+  backend.SetRestoreFails(false);
+  now += 5000;
+  g.Tick(now, true);  // Restored, in a State read before it was.
+  auto s = g.snapshot();
+  EXPECT_FALSE(s.motors[0].valid);
+  EXPECT_TRUE(s.flags & kHardwareFault);
+  now += 5000;
+  g.Tick(now, true);
+  s = g.snapshot();
+  EXPECT_TRUE(s.motors[0].valid);
+  EXPECT_TRUE(s.motors[1].valid);
+  EXPECT_FALSE(s.flags & kHardwareFault);
+  ASSERT_TRUE(DriveAtTwoVolts(g, 2, now));
+  g.Tick(now + 5000, true);
+  EXPECT_NE(g.snapshot().motors[0].voltage, 0.0);
+  EXPECT_NE(g.snapshot().motors[1].voltage, 0.0);
+}
+
+// REQ-DEV-24
+TEST(SimBackend, FailingRestoreKeepsChainInvalidAsOnTheRobot) {
+  SimBackend backend;
+  ExpectFailingRestoreKeepsPairInvalid(backend);
+}
+
+// REQ-DEV-24
+TEST(PhysicsSimBackend, FailingRestoreKeepsChainInvalidAsOnTheRobot) {
+  sim::PhysicsSimBackend backend;
+  ExpectFailingRestoreKeepsPairInvalid(backend);
 }
 
 // A TalonFX reset restarts its rotor position at zero, and the restarted
