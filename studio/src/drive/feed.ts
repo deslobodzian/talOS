@@ -5,14 +5,16 @@
 // tests drive it with an injected clock and a fake socket.
 //
 // It holds (REQ-OPS-36):
-//   - One socket at a time. On any close or error, except close 4000
-//     (`replaced by a newer driver dashboard`), the next attempt starts
-//     RECONNECT_MS after it. After 4000 it stays closed, reports `replaced`,
-//     and connects again only on reconnect(), a user action: a page that
-//     reconnected by itself would take the slot back from the newer page.
-//     A connect that has not opened after CONNECT_TIMEOUT_MS, or an open
-//     socket silent for DEAD_AFTER_MS, is closed and counts as an error, so
-//     a dead network path does not wait for the OS to time the socket out.
+//   - One socket at a time. Attempts start every RECONNECT_MS: on any close
+//     or error, except close 4000 (`replaced by a newer driver dashboard`),
+//     the next attempt starts RECONNECT_MS after the previous one started
+//     (at once when that is past), and a connect still pending then is
+//     abandoned for the next. After 4000 it stays closed, reports
+//     `replaced`, and connects again only on reconnect(), a user action: a
+//     page that reconnected by itself would take the slot back from the
+//     newer page. An open socket silent for DEAD_AFTER_MS is closed and
+//     counts as an error, so a dead network path does not wait for the OS
+//     to time the socket out.
 //   - Freshness. The telemetry is current while a tick newer than the one
 //     held (a sequence_id that advanced, or a new stream) arrived within
 //     STALE_MS on this socket, after the first tick it brought. That first
@@ -34,8 +36,13 @@
 //     the keyframe, a live producer's next tick follows within the update
 //     interval or the 100 ms heartbeat; until STALE_MS after the keyframe
 //     that is still `connecting`, then stale telemetry.
-//   - Robustness. A binary or text message that does not decode is counted
-//     and ignored; nothing it carries reaches the views.
+//   - Robustness. A message that does not decode is counted, and nothing it
+//     carries reaches the views. A text message, or a binary one before the
+//     socket's first tick, is then ignored. A binary one after it closes the
+//     socket as an error: the updates carry only changes, so a lost page
+//     (or a later page of an update whose earlier pages the decoder applied)
+//     would leave a value wrong while later ticks read as current; the
+//     reconnect brings a whole dictionary and keyframe.
 
 import {type Snapshot, TelemetryDecoder} from '../core';
 import {AlertTracker} from '../data/alerts';
@@ -45,7 +52,6 @@ export const STALE_MS = 300;
 export const RENDER_MS = 100;
 export const SILENCE_MS = 500;
 export const CONNECTING_GRACE_MS = 1500;
-export const CONNECT_TIMEOUT_MS = 2000;
 export const DEAD_AFTER_MS = 2000;
 export const REPLACED_CODE = 4000;
 export const LINK_LOST_CHANNEL = 'hw/status/alert_error_link_lost';
@@ -148,13 +154,14 @@ export class DriveModel {
   private socket: DriveSocket|null = null;
   private decoder = new TelemetryDecoder();
   private everOpened = false;
+  private firstAttemptAt = 0;  // the page's first connect
   private attemptAt = 0;     // when the current socket was created
   private openedAt = 0;      // when it opened
   private nextAttemptAt = 0; // while waiting
   private lastMessageAt = 0; // any message on the current socket
   // A tick newer than the held one, on this socket after its keyframe.
   private lastTickAt: number|null = null;
-  private summaryAt: number|null = null;
+  private summaryThisSocket = false;
   private tickThisSocket = false;  // the connect-time keyframe arrived
   private keyframeAt = 0;
   private readonly tracked: Set<string>;
@@ -179,15 +186,13 @@ export class DriveModel {
   }
 
   tick(now: number) {
-    if (this.connection === 'waiting' && now >= this.nextAttemptAt) {
-      this.connect(now);
-    } else if (this.connection === 'connecting' &&
-               now - this.attemptAt >= CONNECT_TIMEOUT_MS) {
-      this.fail(now);
+    if (this.connection === 'connecting' && now - this.attemptAt >= RECONNECT_MS) {
+      this.fail();  // abandoned for the next attempt, due now
     } else if (this.connection === 'open' &&
                now - this.lastMessageAt >= DEAD_AFTER_MS) {
-      this.fail(now);
+      this.fail();
     }
+    if (this.connection === 'waiting' && now >= this.nextAttemptAt) this.connect(now);
   }
 
   // Whether the values held are current: a new tick within STALE_MS on an
@@ -200,8 +205,8 @@ export class DriveModel {
 
   // Whether the summary was sent on this socket, which is still heard.
   summaryFresh(now: number): boolean {
-    return this.connection === 'open' && this.summaryAt !== null &&
-        this.summaryAt >= this.openedAt && now - this.lastMessageAt <= SILENCE_MS;
+    return this.connection === 'open' && this.summaryThisSocket &&
+        now - this.lastMessageAt <= SILENCE_MS;
   }
 
   history(channel: string): readonly Point[] {
@@ -217,7 +222,7 @@ export class DriveModel {
       case 'waiting':
         return {link: 'bridge', text: 'Dashboard to bridge link down: reconnecting'};
       case 'connecting':
-        if (!this.everOpened && now - this.attemptAt < CONNECTING_GRACE_MS)
+        if (!this.everOpened && now - this.firstAttemptAt < CONNECTING_GRACE_MS)
           return {link: 'connecting', text: 'Connecting to the robot'};
         return {link: 'bridge', text: 'Dashboard to bridge link down: reconnecting'};
       case 'open':
@@ -256,15 +261,17 @@ export class DriveModel {
     this.detach();
     this.decoder.reset();
     this.tickThisSocket = false;
+    this.summaryThisSocket = false;
     this.lastTickAt = null;
     this.connection = 'connecting';
+    if (this.counters.connects === 0) this.firstAttemptAt = now;
     this.attemptAt = now;
     this.counters.connects++;
     let socket: DriveSocket;
     try {
       socket = this.openSocket(this.url);
     } catch {
-      this.wait(now);
+      this.wait();
       return;
     }
     this.socket = socket;
@@ -273,8 +280,8 @@ export class DriveModel {
     // fake socket in a test calls them through deliver*().
     socket.onopen = () => this.onOpen(this.clock());
     socket.onmessage = event => this.onMessage(event.data, this.clock());
-    socket.onclose = event => this.onClose(event.code, this.clock());
-    socket.onerror = () => this.fail(this.clock());
+    socket.onclose = event => this.onClose(event.code);
+    socket.onerror = () => this.fail();
   }
 
   // The time handlers use; the page sets it to performance.now, a test to
@@ -305,6 +312,7 @@ export class DriveModel {
       snapshots = this.decoder.decodeAll(bytes);
     } catch {
       this.counters.malformed_binary++;
+      if (this.tickThisSocket) this.fail();
       return;
     }
     for (const s of snapshots) this.onSnapshot(s, now);
@@ -328,7 +336,7 @@ export class DriveModel {
         return;
       }
       this.summary = summary;
-      this.summaryAt = now;
+      this.summaryThisSocket = true;
       return;
     }
     if (typeof kind === 'string') this.counters.ignored_text++;
@@ -368,23 +376,25 @@ export class DriveModel {
     }
   }
 
-  private onClose(code: number, now: number) {
+  private onClose(code: number) {
     this.detach();
     if (code === REPLACED_CODE) {
       this.connection = 'replaced';
       return;
     }
-    this.wait(now);
+    this.wait();
   }
 
-  private fail(now: number) {
+  private fail() {
     this.detach();
-    this.wait(now);
+    this.wait();
   }
 
-  private wait(now: number) {
+  // The next attempt starts RECONNECT_MS after this one started: attempts
+  // keep a 1 s rhythm however long a connect hangs or a socket stayed open.
+  private wait() {
     this.connection = 'waiting';
-    this.nextAttemptAt = now + RECONNECT_MS;
+    this.nextAttemptAt = this.attemptAt + RECONNECT_MS;
   }
 
   // Drops the current socket, so nothing it does later reaches the model and
