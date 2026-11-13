@@ -463,6 +463,17 @@ class DrivetrainTest : public ::testing::Test {
       EXPECT_EQ(Request(module.steer).mode, Mode::kNeutral) << module.name;
     }
   }
+  // What the gateway applies, after its enable and expiry gates.
+  void ExpectAppliedNeutral() const {
+    for (const SwerveModule& module : geometry.modules) {
+      EXPECT_EQ(hw.applied_motor("drivetrain", module.drive).mode,
+                Mode::kNeutral)
+          << module.name;
+      EXPECT_EQ(hw.applied_motor("drivetrain", module.steer).mode,
+                Mode::kNeutral)
+          << module.name;
+    }
+  }
   // DrivetrainState messages published so far.
   std::uint64_t StateCount() const {
     return talos::detail::SimAccess::message_count(sim, topics::kState,
@@ -515,7 +526,8 @@ TEST_F(DrivetrainTest, DeclaresEveryGeometryKeyTheConfigSets) {
   }
 }
 
-TEST_F(DrivetrainTest, DrivesEveryModuleToAFreshTarget) {
+// REQ-SAFE-07
+TEST_F(DrivetrainTest, DrivesAtALiveLane) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   const double rps = 1.0 / (kTau * geometry.modules[0].wheel_radius_m);
@@ -700,7 +712,8 @@ TEST_F(DrivetrainFieldSlewTest, ConstantFieldVelocityWhileRotatingIsReached) {
   EXPECT_NEAR(std::atan2(field_vy, field_vx), 0.0, 0.1);
 }
 
-TEST_F(DrivetrainTest, NeverSentStaysNeutralButStillReportsState) {
+// REQ-SAFE-07
+TEST_F(DrivetrainTest, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
   ExpectNeutral();
@@ -708,19 +721,22 @@ TEST_F(DrivetrainTest, NeverSentStaysNeutralButStillReportsState) {
   EXPECT_TRUE(State().enabled());
 }
 
-TEST_F(DrivetrainTest, DisabledRobotGoesNeutralAndStillReportsValidModules) {
+// REQ-SAFE-02
+TEST_F(DrivetrainTest, DisabledRobotGoesNeutral) {
   Teleop();
   hw.enable(false);
   const std::uint64_t before = StateCount();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ExpectNeutral();
+  ExpectAppliedNeutral();
   ExpectPublishedEveryTick(before, 40ms);
   EXPECT_FALSE(State().enabled());
   EXPECT_TRUE(State().modules_valid());
   EXPECT_TRUE(State().yaw_valid());
 }
 
-TEST_F(DrivetrainTest, DriverStationLossOrOtherModeLaneGoesNeutral) {
+// REQ-SAFE-07
+TEST_F(DrivetrainTest, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
@@ -729,6 +745,14 @@ TEST_F(DrivetrainTest, DriverStationLossOrOtherModeLaneGoesNeutral) {
   hw.stop_driver_station();
   Hold(ChassisTarget{1.0, 0, 0}, 160ms);
   ExpectNeutral();
+}
+
+// REQ-SAFE-07
+TEST_F(DrivetrainTest, OtherModesLaneIsIgnored) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms, "auto");  // auto's lane, in teleop
+  ExpectNeutral();
+  talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "auto");
 
   // Autonomous selects the auto lane; teleop's keeps talking to nobody.
   hw.set_driver_station(
@@ -740,7 +764,42 @@ TEST_F(DrivetrainTest, DriverStationLossOrOtherModeLaneGoesNeutral) {
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 }
 
-TEST_F(DrivetrainTest, StaleLaneGoesNeutralOnTheFirstTickAtTheTimeout) {
+// REQ-SAFE-07
+TEST_F(DrivetrainTest, ReleasedLaneGoesNeutral) {
+  Teleop();
+  Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+  ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+  talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "teleop");
+  sim.step(5ms);  // the next tick
+  ExpectNeutral();
+}
+
+// REQ-SAFE-04: a non-finite component of the chassis target drives no
+// module, and the published state stays finite.
+TEST_F(DrivetrainTest, NonFiniteDemandGoesNeutral) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  Teleop();
+  for (const ChassisTarget& bad :
+       {ChassisTarget{kNaN, 0, 0}, ChassisTarget{0, kNaN, 0},
+        ChassisTarget{0, 0, kNaN}, ChassisTarget{kInf, 0, 0},
+        ChassisTarget{0, -kInf, 0}, ChassisTarget{0, 0, kInf}}) {
+    SCOPED_TRACE(::testing::Message() << bad.vx_mps() << ", " << bad.vy_mps()
+                                      << ", " << bad.omega_radps());
+    Hold(ChassisTarget{1.0, 0, 0}, 40ms);
+    ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
+    Hold(bad, 40ms);
+    ExpectNeutral();
+    const DrivetrainState state = State();
+    EXPECT_TRUE(std::isfinite(state.vx_mps()));
+    EXPECT_TRUE(std::isfinite(state.vy_mps()));
+    EXPECT_TRUE(std::isfinite(state.omega_radps()));
+    EXPECT_TRUE(std::isfinite(state.yaw_rad()));
+  }
+}
+
+// REQ-SAFE-07
+TEST_F(DrivetrainTest, StaleLaneGoesNeutral) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   sim.step(75ms);  // last publication is 95 ms old: still fresh
@@ -751,7 +810,8 @@ TEST_F(DrivetrainTest, StaleLaneGoesNeutralOnTheFirstTickAtTheTimeout) {
   ExpectNeutral();
 }
 
-TEST_F(DrivetrainTest, TargetFromBeforeAReenableStaysNeutralInTheSameDrain) {
+// REQ-SAFE-09
+TEST_F(DrivetrainTest, EarlierGenerationTargetIsIgnored) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
   ASSERT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
@@ -966,7 +1026,10 @@ TEST_F(DrivetrainTest, EquallyOldSignalsAreRejectedEvenWithoutSkew) {
   EXPECT_EQ(State().sample_time_ns(), 0u);
 }
 
-TEST_F(DrivetrainTest, ADisconnectedMotorNeutralizesOnlyItsModule) {
+// REQ-CONTRACT-25: the matrix's "neutral" is the affected module's: one
+// lost module leaves three that still translate (kinematics_.UsableSubset),
+// so only its module goes neutral while robot_enabled stays true.
+TEST_F(DrivetrainTest, DisconnectedFeedbackGoesNeutral) {
   Teleop();
   for (std::size_t i = 0; i < kModuleCount; ++i) {
     hw.set_motor("drivetrain", geometry.modules[i].drive,
@@ -1353,6 +1416,7 @@ TEST(Drivetrain, LinkDropKeepsPublishingInvalidStateAndHoldsPositions) {
 
 // --- allocation ------------------------------------------------------------
 
+// REQ-RT-06
 TEST_F(DrivetrainTest, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
