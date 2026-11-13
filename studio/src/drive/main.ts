@@ -7,7 +7,7 @@ import './drive.css';
 
 import {DriveModel, type DriveSocket, RECONNECT_MS, RENDER_MS} from './feed';
 import {type Layout, parseLayout} from './layout';
-import {esc, Painter, renderDashboard, renderStatus, renderWidgets} from './view';
+import {esc, METRICS, outOfView, outOfViewText, Painter, renderShell, renderStatus, renderWidget, type Surface} from './view';
 
 const root = document.getElementById('drive')!;
 const now = () => performance.now();
@@ -44,22 +44,60 @@ async function run() {
                                url => new WebSocket(url) as unknown as DriveSocket,
                                tracked(layout), layout);
   model.clock = now;
-  root.innerHTML = renderDashboard(layout, model, now());
+  root.innerHTML = renderShell(layout);
   const status = root.querySelector('.status-slot')!;
   const grid = root.querySelector<HTMLElement>('.grid')!;
+  const body = (e: Element) => e.querySelector<HTMLElement>('.body');
+  const surface: Surface<Element> = {
+    status: html => {
+      status.innerHTML = html;
+    },
+    create: html => {
+      const template = document.createElement('template');
+      template.innerHTML = html;
+      return template.content.firstElementChild!;
+    },
+    put: (_index, next, previous) => {
+      if (previous) grid.replaceChild(next, previous);
+      else grid.appendChild(next);
+    },
+    scrollTop: e => body(e)?.scrollTop ?? 0,
+    setScrollTop: (e, top) => {
+      const b = body(e);
+      if (b) b.scrollTop = Math.max(0, Math.min(top, b.scrollHeight - b.clientHeight));
+    },
+    errored: on => {
+      grid.classList.toggle('errored', on);
+    }
+  };
+  // Each list widget's heading says how many of its rows are out of view,
+  // measured here where the rows are laid out (outOfView does the counting).
+  const countOutOfView = () => {
+    for (const list of grid.querySelectorAll('.w')) {
+      const badge = list.querySelector('.out-of-view'), b = body(list);
+      if (!badge || !b) continue;
+      let text = '';
+      if (b.scrollHeight > b.clientHeight) {
+        const origin = b.getBoundingClientRect().top - b.scrollTop;
+        const tops = [...b.querySelectorAll('li')].map(li => li.getBoundingClientRect().top - origin);
+        text = outOfViewText(outOfView(tops, METRICS.row, b.clientHeight, b.scrollTop));
+      }
+      if (badge.textContent !== text) badge.textContent = text;
+    }
+  };
+  grid.addEventListener('scroll', countOutOfView, {capture: true, passive: true});
+  window.addEventListener('resize', countOutOfView);
   // A drawing fault must not stop the page or leave the grid looking
   // current: Painter reports it, and the grid is marked until a good draw.
-  const painter = new Painter();
+  const painter = new Painter(surface);
   const render = () => {
-    const frame = painter.paint(() => {
+    painter.paint(() => {
       const t = now();
       model.tick(t);
       return {status: renderStatus(model, t, layout.skipped),
-              grid: renderWidgets(layout, model, t)};
+              widgets: layout.widgets.map(w => renderWidget(w, model, t))};
     });
-    if (frame.status !== null) status.innerHTML = frame.status;
-    if (frame.grid !== null) grid.innerHTML = frame.grid;
-    grid.classList.toggle('errored', frame.errored);
+    countOutOfView();
   };
   root.addEventListener('click', event => {
     if ((event.target as Element).closest('[data-action="reconnect"]')) {

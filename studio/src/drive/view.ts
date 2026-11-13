@@ -57,11 +57,17 @@ function heading(w: Widget): string {
   return HEADING[w.kind] ?? w.kind;
 }
 
+// The widgets whose body is a list that scrolls when it cannot fit: their
+// heading carries an empty `.out-of-view` the page fills after each paint
+// (main.ts, outOfView below) with how many rows are out of view.
+const LISTS = new Set(['subsystems', 'checks', 'alerts']);
+
 function shell(w: Widget, stale: boolean, body: string, extra = ''): string {
   const {column, row, width, height} = w.at;
   return `<section class="w w-${esc(w.kind)}${stale ? ' stale' : ''}" ` +
       `style="grid-column:${column + 1} / span ${width};grid-row:${row + 1} / span ${height}">` +
       `<header><h2>${esc(heading(w))}</h2>${extra}` +
+      (LISTS.has(w.kind) ? '<span class="out-of-view"></span>' : '') +
       (stale ? '<span class="tag tag-stale">STALE</span>' : '') +
       `</header><div class="body">${body}</div></section>`;
 }
@@ -313,7 +319,8 @@ function checksWidget(s: Snapshot|null, w: Widget&{kind: 'checks'}): string {
   return `<ul class="checks">${rows.join('')}</ul>`;
 }
 
-function widget(w: Widget, model: DriveModel, now: number): string {
+// One widget's markup: a <section> in its cell of the grid.
+export function renderWidget(w: Widget, model: DriveModel, now: number): string {
   const s = model.latest;
   const stale = !model.fresh(now);
   switch (w.kind) {
@@ -365,7 +372,7 @@ export function renderStatus(model: DriveModel, now: number, skipped = 0): strin
 
 // The widgets, for the grid element (gridStyle sizes it).
 export function renderWidgets(layout: Layout, model: DriveModel, now: number): string {
-  return layout.widgets.map(w => widget(w, model, now)).join('');
+  return layout.widgets.map(w => renderWidget(w, model, now)).join('');
 }
 
 export function gridStyle(layout: Layout): string {
@@ -373,34 +380,87 @@ export function gridStyle(layout: Layout): string {
       `grid-template-rows:repeat(${layout.rows},minmax(0,1fr))`;
 }
 
-// One frame's text, and what the page swaps in for it: null where nothing
-// changed, and `errored` when drawing failed, so the page marks the grid it
-// keeps (it shows values no longer updated) and the status line says why.
-export type Draw = {status: string; grid: string};
-export type Paint = {status: string|null; grid: string|null; errored: boolean};
+// What the page draws into: main.ts implements it on the DOM, a test with
+// plain objects. `E` is one widget's element.
+export interface Surface<E> {
+  status(html: string): void;
+  create(html: string): E;
+  // Puts `next` at `index` of the grid, in place of `previous` if any.
+  put(index: number, next: E, previous: E|undefined): void;
+  // The scroll offset of the element's list body (0 without one), and
+  // setting it, clamped to what the body can scroll.
+  scrollTop(element: E): number;
+  setScrollTop(element: E, top: number): void;
+  errored(on: boolean): void;
+}
 
-export class Painter {
-  private shown: Draw = {status: '', grid: ''};
+// One frame: the status line, and each widget's markup in layout order.
+export type Frame = {status: string; widgets: string[]};
 
-  paint(draw: () => Draw): Paint {
-    let next: Draw;
+// Paints frames widget by widget. The page redraws every RENDER_MS, and with
+// a live producer some widget (a graph, the battery, the match clock)
+// changes nearly every frame: a widget whose markup did not change keeps
+// its element, so a list's scroll position and a row's tooltip survive. A
+// widget whose markup changed is replaced, and the new element takes the old
+// one's list scroll position. A drawing error leaves the grid as it is,
+// marks it (it shows values no longer updated) and says so on the status
+// line.
+export class Painter<E> {
+  private status = '';
+  private markup: string[] = [];
+  private elements: E[] = [];
+
+  constructor(private readonly surface: Surface<E>) {}
+
+  paint(draw: () => Frame) {
+    let next: Frame;
     try {
       next = draw();
     } catch (error) {
-      // Forget what is shown, so the first good draw repaints it all.
-      this.shown = {status: '', grid: ''};
-      return {
-        status: '<div class="status link-error" role="status"><b>DRAWING ERROR</b> ' +
-            `The dashboard is not updating: ${esc(String(error))}</div>`,
-        grid: null,
-        errored: true
-      };
+      // Forget the status shown, so the first good draw repaints it.
+      this.status = '';
+      this.surface.status('<div class="status link-error" role="status"><b>DRAWING ERROR</b> ' +
+                          `The dashboard is not updating: ${esc(String(error))}</div>`);
+      this.surface.errored(true);
+      return;
     }
-    const status = next.status !== this.shown.status ? next.status : null;
-    const grid = next.grid !== this.shown.grid ? next.grid : null;
-    this.shown = next;
-    return {status, grid, errored: false};
+    if (next.status !== this.status) this.surface.status(this.status = next.status);
+    next.widgets.forEach((html, i) => {
+      if (html === this.markup[i]) return;
+      this.markup[i] = html;
+      const previous = this.elements[i];
+      const element = this.surface.create(html);
+      this.surface.put(i, element, previous);
+      this.elements[i] = element;
+      const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
+      if (top > 0) this.surface.setScrollTop(element, top);
+    });
+    this.surface.errored(false);
   }
+}
+
+// How many rows of a list are out of view: `rowTops` are its rows' offsets
+// from the top of the list's scroll area (rows of one line share an offset
+// in a list of several columns), each `rowHeight` tall, of which the area
+// shows `visibleHeight` from `scrollTop`. A row cut by an edge counts as out
+// of view. The page measures the offsets after each paint (main.ts); this is
+// the arithmetic.
+export function outOfView(rowTops: readonly number[], rowHeight: number, visibleHeight: number,
+                          scrollTop: number): {above: number; below: number} {
+  let above = 0, below = 0;
+  for (const top of rowTops) {
+    if (top + rowHeight > scrollTop + visibleHeight + 0.5) below++;
+    else if (top < scrollTop - 0.5) above++;
+  }
+  return {above, below};
+}
+
+// The heading's words for it: "N above", "+N below", or both.
+export function outOfViewText(n: {above: number; below: number}): string {
+  const words: string[] = [];
+  if (n.above > 0) words.push(`${n.above} above`);
+  if (n.below > 0) words.push(`+${n.below} below`);
+  return words.join(' · ');
 }
 
 // The page's box sizes in px, written onto the page as custom properties
@@ -449,12 +509,19 @@ export function listRowsFit(layout: {columns: number; rows: number}, at: Cell,
   return Math.floor(bodyH / m.row) * columns;
 }
 
-// The whole page body; the page itself updates the status line and the grid
-// apart, so a button in the status line survives grid updates.
-export function renderDashboard(layout: Layout, model: DriveModel, now: number): string {
+// The page body: the top bar with its status slot, and the grid, holding
+// `status` and `grid`. The page writes it empty and paints both apart
+// (Painter), so a button in the status line survives grid updates.
+export function renderShell(layout: Layout, status = '', grid = ''): string {
   return `<div class="page" style="${pageStyle()}">` +
       `<header class="top"><h1>${esc(layout.title)}</h1>` +
-      `<div class="status-slot">${renderStatus(model, now, layout.skipped)}</div></header>` +
-      `<main class="grid" style="${gridStyle(layout)}">${renderWidgets(layout, model, now)}</main>` +
+      `<div class="status-slot">${status}</div></header>` +
+      `<main class="grid" style="${gridStyle(layout)}">${grid}</main>` +
       '</div>';
+}
+
+// The whole page as one frame draws it.
+export function renderDashboard(layout: Layout, model: DriveModel, now: number): string {
+  return renderShell(layout, renderStatus(model, now, layout.skipped),
+                     renderWidgets(layout, model, now));
 }

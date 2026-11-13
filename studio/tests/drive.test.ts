@@ -12,7 +12,7 @@ import {test} from 'node:test';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {esc, listRowsFit, METRICS, Painter, renderDashboard, renderStatus} from '../src/drive/view';
+import {esc, listRowsFit, METRICS, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, type Surface} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -684,21 +684,82 @@ test('subsystems rows put failed and driving nodes first', () => {
   assert.deepEqual(order, ['shooter', 'vision', 'drivetrain', 'telemetry', 'camera']);
 });
 
+// A Surface of plain objects: `grid` holds the element at each index, so a
+// test can tell a kept element from a replaced one by identity.
+type FakeElement = {html: string; scrollTop: number};
+function fakeSurface() {
+  const page = {status: '', errored: false, grid: [] as FakeElement[], puts: 0};
+  const surface: Surface<FakeElement> = {
+    status: html => {
+      page.status = html;
+    },
+    create: html => ({html, scrollTop: 0}),
+    put: (index, next) => {
+      page.grid[index] = next;
+      page.puts++;
+    },
+    scrollTop: e => e.scrollTop,
+    setScrollTop: (e, top) => {
+      e.scrollTop = top;
+    },
+    errored: on => {
+      page.errored = on;
+    }
+  };
+  return {page, surface};
+}
+
+// REQ-OPS-49: the page redraws every RENDER_MS and with a live producer some
+// widget changes nearly every frame. A widget whose markup did not change
+// keeps its element (a list's scroll position and a row's tooltip survive);
+// one whose rows changed is replaced and keeps its list's scroll position.
+test('the painter replaces only a changed widget and keeps a list scrolled', () => {
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const frame = (graph: string, nodes: string) =>
+      () => ({status: '<div>OK</div>', widgets: [graph, nodes]});
+  painter.paint(frame('<section>graph 1</section>', '<section>a b c</section>'));
+  const [graph, list] = page.grid;
+  assert.ok(graph && list, 'the first paint draws every widget');
+  list.scrollTop = 44;  // the driver scrolled the list
+  painter.paint(frame('<section>graph 2</section>', '<section>a b c</section>'));
+  assert.notEqual(page.grid[0], graph, 'a changed widget is not repainted');
+  assert.equal(page.grid[1], list, 'an unchanged list is replaced, losing its scroll and hover');
+  painter.paint(frame('<section>graph 2</section>', '<section>a b c d</section>'));
+  assert.notEqual(page.grid[1], list, 'a list whose rows changed is not repainted');
+  assert.equal(page.grid[1].scrollTop, 44, 'a repainted list returns to its top');
+});
+
+// REQ-OPS-49: a list that scrolls says how many rows are out of view. Rows
+// 22 px tall in two columns, 14 rows on 7 lines, a body 100 px tall scrolled
+// to 30: lines at 0 and 22 are above (cut by the top edge counts), 44 to 88
+// show, 110 and 132 are below.
+test('the out-of-view count of a scrolled list', () => {
+  const tops = [0, 1, 2, 3, 4, 5, 6].flatMap(line => [line * 22, line * 22]);
+  assert.deepEqual(outOfView(tops, 22, 100, 0), {above: 0, below: 6});
+  assert.deepEqual(outOfView(tops, 22, 100, 30), {above: 4, below: 4});
+  assert.deepEqual(outOfView(tops, 22, 154, 0), {above: 0, below: 0});
+  assert.equal(outOfViewText({above: 4, below: 4}), '4 above · +4 below');
+  assert.equal(outOfViewText({above: 0, below: 0}), '');
+});
+
 // REQ-OPS-36: a drawing fault must not leave the last grid looking current:
 // the frame says so on the status line and marks the grid, and the next good
 // draw repaints both even when it draws the same text as before the fault.
 test('a drawing error marks the grid and the next draw repaints it', () => {
-  const painter = new Painter();
-  const good = {status: '<div>status</div>', grid: '<section>grid</section>'};
-  assert.deepEqual(painter.paint(() => good), {...good, errored: false});
-  assert.deepEqual(painter.paint(() => good), {status: null, grid: null, errored: false});
-  const failed = painter.paint(() => {
+  const {page, surface} = fakeSurface();
+  const painter = new Painter(surface);
+  const good = () => ({status: '<div>status</div>', widgets: ['<section>grid</section>']});
+  painter.paint(good);
+  const shown = page.grid[0];
+  painter.paint(() => {
     throw new Error('<x-fault>');
   });
-  assert.equal(failed.errored, true, 'a drawing error leaves the grid unmarked');
-  assert.equal(failed.grid, null);
-  assert.match(failed.status!, /link-error/);
-  assert.ok(failed.status!.includes(esc('<x-fault>')), failed.status!);
-  assert.deepEqual(painter.paint(() => good), {...good, errored: false},
-                   'the page is not repainted after a drawing error');
+  assert.equal(page.errored, true, 'a drawing error leaves the grid unmarked');
+  assert.equal(page.grid[0], shown);
+  assert.match(page.status, /link-error/);
+  assert.ok(page.status.includes(esc('<x-fault>')), page.status);
+  painter.paint(good);
+  assert.equal(page.errored, false);
+  assert.equal(page.status, '<div>status</div>', 'the status line is not repainted after a drawing error');
 });
