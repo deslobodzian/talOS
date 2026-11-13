@@ -28,7 +28,9 @@ The budgets are docs/TESTING.md §9. Without `--check` it reports and exits
 0. With `--check` it exits 1 when a test action exceeds its lane's budget: a
 target with no lane tag is in the fast lane (5 s). The lane tags come from
 `--lanes FILE` (lines of `<label> <lane>`; unlisted labels are fast), else
-from the `--bep` file's target tags, else from one `bazel query` per lane.
+from the `--bep` file's target tags (an untagged target is fast), else from
+one `bazel query` per lane; a query that fails or finds no lane-tagged test
+is an error.
 `--enforce LANE,...` fails only those lanes' overruns and prints the others.
 """
 
@@ -160,8 +162,10 @@ def from_bep(lines):
             continue
         event = json.loads(line)
         completed = event.get("id", {}).get("targetCompleted")
-        if completed and "tag" in event.get("completed", {}):
-            lanes[completed["label"]] = lane_of(event["completed"]["tag"])
+        if completed:
+            # proto3 JSON omits an empty `tag`: an untagged target is fast.
+            lanes[completed["label"]] = lane_of(
+                event.get("completed", {}).get("tag", []))
         key = event.get("id", {}).get("testResult")
         seconds = duration_seconds(event.get("testResult", {}))
         if key is None or seconds is None:
@@ -195,15 +199,25 @@ def read_lanes(lines):
 
 
 def query_lanes():
-    """{label: lane} for every test carrying a lane tag, from bazel query."""
+    """{label: lane} for every test carrying a lane tag, from bazel query.
+
+    Exits when a query fails (any exit but 0, or 3: a partial result under
+    --keep_going) or when no test carries a lane tag: either would put every
+    test in the fast lane and pass an enforced lane's overrun."""
     lanes = {}
     for lane in LANE_TAGS:
         expression = f"attr(tags, '[\\[ ]{lane}[,\\]]', tests(//...))"
-        output = subprocess.run(
+        query = subprocess.run(
             ["bazel", "query", "--keep_going", "--noshow_progress", expression],
-            capture_output=True, text=True, check=False).stdout
-        for label in output.split():
+            capture_output=True, text=True, check=False)
+        if query.returncode not in (0, 3):
+            sys.exit(f"slow_tests: bazel query for the {lane} lane exited "
+                     f"{query.returncode}; lanes unknown\n{query.stderr}")
+        for label in query.stdout.split():
             lanes[label] = lane
+    if not lanes:
+        sys.exit("slow_tests: bazel query found no test in any lane "
+                 f"({', '.join(LANE_TAGS)}); lanes unknown")
     return lanes
 
 
