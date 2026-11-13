@@ -360,6 +360,14 @@ CI policy:
 What each job runs, and on which trigger, is in
 [`.github/workflows/`](../.github/workflows/); this file does not restate it.
 
+A workstation run misses what only CI's conditions expose: a clean checkout
+with no untracked or uncommitted file, every tracked file read-only (a test
+that copies a source with its mode and then writes the copy fails there;
+copy contents, `shutil.copyfile`), and test results never cached from an
+earlier run. `tools/prepush.sh`, the pre-push rung
+([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
+them.
+
 ## 10. Running tests locally
 
 Which tests to run before a commit or a push is the

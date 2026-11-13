@@ -58,7 +58,7 @@ Breaking one of these is a review blocker.
     the tests the change affects and launcher `--describe-only` on every
     affected config ([docs/DEVELOPMENT.md §5](docs/DEVELOPMENT.md#5-verification-ladder)).
     Before each push it runs, from a clean worktree of the commits to be
-    pushed: `bazel build //...` and `bazel test --test_output=errors //...`;
+    pushed (`tools/prepush.sh` does this): `bazel build //...` and `bazel test --test_output=errors //...`;
     launcher `--describe-only` on every affected config for topic, node or
     config changes; `./gradlew phoenixTest` and `./gradlew buildRio` for
     RoboRIO program changes; `pnpm test` and `pnpm build` for `studio/`
