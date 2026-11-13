@@ -136,7 +136,9 @@ corrected by vision like on a real robot.
 `./sim.sh --sim-gateway`, the accuracy scenario, and full-stack startup tests
 select `configuration/robot_physics_sim.toml`. It includes `robot.toml` and
 sets only `[subsystems.drivetrain] integrate_heading = false` (and restates
-the base's `[robot] require_target_coverage = true`), so odometry
+the base's `[robot] require_target_coverage = true`, and sets
+`[robot] simulation_only = true`, so the launcher and `hardware_node` refuse
+it without `--sim`), so odometry
 uses the physics gateway's modeled Pigeon, including gyro drift. WPILib and
 ideal simulation keep `robot.toml`'s module-integrated simulated heading,
 because those backends report a permanently zero Pigeon yaw.

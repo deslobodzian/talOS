@@ -2606,6 +2606,10 @@ SIM_CONFIG_HEADER = """\
 # Simulation only: ./sim.sh --config @CONFIG@ --sim-gateway
 # robot.toml never reads this file, so nothing here reaches the robot.
 include = "robot.toml"
+
+[robot]
+# The launcher and hardware_node refuse this config without --sim.
+simulation_only = true
 """
 
 

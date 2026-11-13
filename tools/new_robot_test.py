@@ -175,6 +175,25 @@ class NewRobotTest(unittest.TestCase):
                     for table in robot.values():
                         self.assertNotIn("motors", table)
 
+    # REQ-SAFE-40
+    def test_simulation_config_is_refused_without_sim(self):
+        # robot_sim.toml holds simulation gains, bindings and travel (the
+        # blocks new_subsystem's `Next:` appends): the launcher refuses to
+        # start it without --sim, before anything is probed or spawned.
+        # --duration-s bounds a launch that wrongly starts.
+        with tempfile.TemporaryDirectory() as tmp:
+            work, launcher, env = workspace(tmp)
+            generate(work, None, None)
+            proc = subprocess.run(
+                [launcher, "--config", SIM_CONFIG, "--duration-s", "1",
+                 "--output-dir", os.path.join(tmp, "out")],
+                cwd=work, env=env, capture_output=True, text=True, timeout=60)
+            output = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 1, output)
+            self.assertIn("sets [robot] simulation_only = true; run it with "
+                          "--sim (or --describe-only); nothing was started",
+                          output)
+
     # REQ-DEV-23
     def test_next_steps_block_makes_the_mechanism_drivable_in_simulation(
             self):

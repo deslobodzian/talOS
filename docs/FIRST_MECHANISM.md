@@ -80,7 +80,9 @@ matter now:
 - `robot_sim.toml` is the **simulation config**: `include = "robot.toml"`
   plus what only a simulation may use, such as a button binding and the
   simulated motor's gains. `robot.toml` never reads it, so nothing you put
-  there reaches the robot.
+  there reaches the robot, and its `[robot] simulation_only = true` makes the
+  launcher and `hardware_node` refuse it without `--sim`
+  ([launcher](../talOS/launcher/README.md#lightweight-simulation-gateway)).
 - `robot_manifest.bzl` is the **manifest**: a generated list of the node
   binaries and config files the robot needs. Bazel cannot read TOML, so it
   reads this file instead. Edit `robot.toml` or a subsystem file in a way
@@ -420,8 +422,8 @@ read the `claw` node instead, from the session directory `sim.sh` printed:
   motor starts, so the mechanism homes by driving to it, as on the robot.
 - Putting a mechanism on another robot, such as `2026-robot`: the scaffold
   takes `--robot DIR`. Its `Next:` names that robot's simulation config
-  (`robot_physics_sim.toml` for `2026-robot`), or the three lines that
-  create one.
+  (`robot_physics_sim.toml` for `2026-robot`), or the lines that create one
+  (with `[robot] simulation_only = true`).
 
 When a step fails, the launcher's message names the rule; the
 [glossary](GLOSSARY.md) points to the section that defines each term in it.
