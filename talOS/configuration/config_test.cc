@@ -859,7 +859,7 @@ node = "//py:extra"
                std::invalid_argument);
 }
 
-// TODO.md SIM-4: `[robot] simulation_only` reaches the config through an
+// `[robot] simulation_only` reaches the config through an
 // include like any [robot] key, and an including file may set it true over a
 // deployable base. Once a file sets it true, a file including that one
 // cannot set it back to false: refused, naming the key and both files.
