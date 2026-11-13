@@ -48,12 +48,16 @@ jobs:
       # Reused by buildifier, clang-format and clang-tidy. A pull request
       # checks every file its branch changed since it left the base branch,
       # so a commit whose earlier run was cancelled or failed is checked
-      # again by every later run. A push checks the commits it pushed; on
-      # main, `before` is the old tip, which is the merge base of what was
-      # merged. A new branch (all-zero `before`) or a force push (`before`
-      # absent from the clone or not an ancestor of HEAD) falls back to the
-      # merge base with main; on main, where that merge base is HEAD itself,
-      # to HEAD's first parent.
+      # again by every later run. A topic-branch push does the same, against
+      # the merge base with main, in a job that sets DIFF_SCOPE=branch
+      # (buildifier and clang-format, which are cheap; clang-tidy keeps the
+      # pushed commits' scope, TODO.md CI-3). Otherwise a push
+      # checks the commits it pushed; on main, `before` is the old tip,
+      # which is the merge base of what was merged. A new branch (all-zero
+      # `before`) or a force push (`before` absent from the clone or not an
+      # ancestor of HEAD) falls back to the merge base with main. Where
+      # that merge base is HEAD itself (main, or a branch at main's tip),
+      # the base is HEAD's first parent.
       env:
         EVENT: ${{ github.event_name }}
         BEFORE: ${{ github.event.before }}
@@ -61,7 +65,9 @@ jobs:
       run: |
         if [ "$EVENT" = pull_request ]; then
           base="$(git merge-base "origin/$BASE_REF" HEAD)"
-        elif [ -n "$BEFORE" ] &&
+        elif { [ "${DIFF_SCOPE:-}" != branch ] ||
+               [ "$GITHUB_REF" = refs/heads/main ]; } &&
+             [ -n "$BEFORE" ] &&
              [ "$BEFORE" != 0000000000000000000000000000000000000000 ] &&
              git merge-base --is-ancestor "$BEFORE" HEAD 2>/dev/null; then
           base="$BEFORE"
@@ -573,6 +579,9 @@ jobs:
     name: Buildifier (changed Starlark files)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # The diff base step checks the whole branch on a topic-branch push.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -605,6 +614,9 @@ jobs:
     name: clang-format (changed C++ files)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # The diff base step checks the whole branch on a topic-branch push.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
