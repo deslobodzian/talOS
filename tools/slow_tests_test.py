@@ -4,8 +4,10 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import slow_tests
 
@@ -107,13 +109,57 @@ class SlowTestsTest(unittest.TestCase):
             json.dumps({"id": {"testResult": {"label": "//a:new_test", "run": 1,
                                               "shard": 1, "attempt": 1}},
                         "testResult": {"testAttemptDuration": "3.5s"}}),
+            # proto3 JSON omits an empty repeated field: an untagged target.
+            json.dumps({"id": {"targetCompleted": {"label": "//a:unit_test"}},
+                        "completed": {"success": True}}),
             json.dumps({"id": {"progress": {}}, "progress": {}}),
             ""]
         results, lanes = slow_tests.from_bep(lines)
         self.assertEqual(results, [("//a:slow_test (run 2)", 4.25),
                                    ("//a:new_test", 3.5)])
         self.assertEqual(lanes, {"//a:slow_test": "integration",
-                                 "//a:new_test": "fast"})
+                                 "//a:new_test": "fast", "//a:unit_test": "fast"})
+
+    def test_check_fails_an_enforced_overrun_without_bazel_query(self):
+        # CI's event file: most fast-lane targets carry no tag, so their
+        # targetCompleted event has no `tag` field. The lanes must come from
+        # the events alone; a query that cannot run must not pass the check.
+        events = [
+            ({"targetCompleted": {"label": "//a:unit_test"}}, {"success": True}),
+            ({"testResult": {"label": "//a:unit_test"}},
+             {"testAttemptDurationMillis": "1000"}),
+            ({"targetCompleted": {"label": "//a:sim_test"}},
+             {"success": True, "tag": ["integration"]}),
+            ({"testResult": {"label": "//a:sim_test"}},
+             {"testAttemptDurationMillis": "45000"})]
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TEST_TMPDIR")) as root:
+            bep = os.path.join(root, "events.json")
+            with open(bep, "w", encoding="utf-8") as handle:
+                for key, body in events:
+                    name = next(iter(key))
+                    event = {"id": key,
+                             "completed" if name == "targetCompleted" else name: body}
+                    handle.write(json.dumps(event) + "\n")
+            unavailable = subprocess.CompletedProcess([], 2, stdout="", stderr="")
+            with mock.patch.object(slow_tests.subprocess, "run",
+                                   return_value=unavailable), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                code = slow_tests.main(["--check", "--bep", bep,
+                                        "--enforce", "integration"])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("over the integration lane's 30 s", out.getvalue())
+
+    def test_lane_query_fails_loudly_when_bazel_query_fails_or_finds_nothing(self):
+        for returncode, stdout in ((2, "//a:sim_test\n"), (0, ""), (3, "")):
+            result = subprocess.CompletedProcess([], returncode, stdout=stdout,
+                                                 stderr="ERROR: no server")
+            with self.subTest(returncode=returncode, stdout=stdout):
+                with mock.patch.object(slow_tests.subprocess, "run",
+                                       return_value=result), \
+                        self.assertRaises(SystemExit) as raised, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    slow_tests.query_lanes()
+                self.assertNotEqual(raised.exception.code, 0)
 
     def test_check_holds_untagged_tests_to_five_seconds_and_tagged_to_their_lane(self):
         results = [("//a:unit_test", 5.5), ("//a:ok_test", 4.9),

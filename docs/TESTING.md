@@ -341,7 +341,8 @@ tools/slow_tests.py --threshold 5` lists, slowest first, every test action in
 millisecond) over the threshold; `--bep FILE` reads one invocation's
 `--build_event_json_file` instead, and no test result at all is an error.
 With `--check` it exits 1 when an action exceeds its lane's budget above
-(lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`).
+(lane tags from `--lanes FILE`, the `--bep` file, or `bazel query`, where a
+failed query or one finding no lane-tagged test is an error).
 **[enforced: the Linux job, after the suite, for the heavy, integration,
 e2e and perf lanes; gap: LANE-1 for the fast lane, which a hosted runner
 does not hold (the workflow step names the targets) and which is checked
