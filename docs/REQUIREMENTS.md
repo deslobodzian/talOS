@@ -214,6 +214,7 @@ numbered section, a number in RULES a rule:
 | REQ-OPS-45 | The launcher's supervision loop does not poll: between passes it sleeps until the earliest deadline a pass decides on (each running member's next registry look, at most a quarter of its heartbeat timeout after the last, and its stall, grace and construction deadlines; pending restarts; the Studio bridge's retry; the session duration; the stop timeout; half of `WATCHDOG_USEC`; the refresh of the session lock and of the session directory's `session.lock`), and a child's exit or a stop signal starts a pass at once, from any thread. A run whose dispatch count stops at S is killed by the later of the end of its startup grace and S + heartbeat timeout + a quarter of that timeout, plus however late the launcher itself wakes. | P1 | LR "Supervision passes"; DEP "Supervision and service recovery" | passes counted over an idle session; wake after a child exit and after a stop signal; kill time against the stall | integration |
 | REQ-OPS-46 | The Studio bridge frees the slot of a client that stops answering within 16 s of the last data it sent, and never closes a client that answers its pings. | P2 | DF "Telemetry, Studio, and the radio boundary" | dead clients closed within the bound and a new connection then accepted; a quiet client still served past it | integration |
 | REQ-OPS-47 | After `deploy.sh install` or `rollback` returns, every member of the selected bundle has already run once from its installed path, one at a time and before `current` selects the bundle: each node and the Studio bridge with `--describe`, and the launcher, so a first launch does not pay the host's first-run charge for new executables inside the launcher's `--describe` deadline. A member that fails or outlives its bound is a warning naming it, never a failed install; `--no-warm-up` skips the step. | P1 | DEP "Warm-up" | install output; member run order against the `current` switch | integration (macOS first-launch time: bench, TODO DEPLOY-6) |
+| REQ-OPS-48 | A `talos_bundle` holds no symlinks, so a bundle Bazel restores from a disk or remote cache is the same files as one it built, and every member, a Python node's interpreter included, runs from wherever the bundle is installed. | P1 | DEP "Build a bundle" | built tree; install warm-up of a cache-restored bundle | unit + integration |
 
 ### DEV: scaffold, simulation, describe-only, standalone subsystem, robot libraries
 
@@ -265,7 +266,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-33, REQ-CONTRACT-36, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09 |
-| `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09 |
+| `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09, REQ-OPS-48 |
 | `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27 |
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22, REQ-OPS-35, REQ-OPS-37, REQ-OPS-38, REQ-OPS-39 |
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
