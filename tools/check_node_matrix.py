@@ -1,6 +1,7 @@
 """Checks node tests against the node test matrix (docs/TESTING.md §7).
 
     bazel run //tools:check_node_matrix -- [PATH...]
+    python3 tools/check_node_matrix.py --baseline tools/check_node_matrix_baseline.txt
 
 Each PATH is a node test file (`*_test.cc`, `*_test.py`) or a directory,
 relative to the workspace. With none it checks every node package under
@@ -31,8 +32,16 @@ Comments in the test file, each on its own line (`//` in C++, `#` in Python):
 Case 12 never applies to a Python node. Prints one row per test file, then
 each missing case or bad comment; exits 1 when there is any, 2 on a bad
 argument.
+
+`--baseline FILE` (relative to the workspace) lists cases known to be
+missing, one test file (or node package without one) per line:
+`<path> <case> [<case>...]`, `#` starting a comment. A missing case it lists
+is not a failure; a missing case it does not list is, and so is a listed
+case that is no longer missing, or a listed path that no longer exists, so
+the baseline only shrinks. CI runs it this way (TODO.md MATRIX-1).
 """
 
+import argparse
 import os
 import re
 import sys
@@ -255,17 +264,52 @@ def targets(workspace, paths):
     return found
 
 
+def read_baseline(text):
+    """{(path, case)} from baseline lines `<path> <case> [<case>...]`."""
+    entries = set()
+    for number, line in enumerate(text.splitlines(), 1):
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        if len(fields) < 2 or not all(f.isdigit() for f in fields[1:]):
+            raise MatrixError(f"baseline line {number}: expected "
+                              f"'<path> <case> [<case>...]', got {line!r}")
+        entries.update((fields[0], int(case)) for case in fields[1:])
+    return entries
+
+
+def stale_entries(baseline, missing, checked, exists):
+    """Baseline entries that no longer hold: the path was checked and the
+    case is not missing, or the path no longer exists."""
+    return sorted(entry for entry in baseline - missing
+                  if entry[0] in checked or not exists(entry[0]))
+
+
 def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("paths", nargs="*", metavar="PATH")
+    parser.add_argument("--baseline", help="known missing cases, which may "
+                        "only shrink (relative to the workspace)")
+    args = parser.parse_args(argv)
     workspace = os.environ.get("BUILD_WORKSPACE_DIRECTORY", os.getcwd())
     try:
-        found = targets(workspace, argv)
+        found = targets(workspace, args.paths)
+        baseline = set()
+        if args.baseline:
+            baseline = read_baseline(read(os.path.join(workspace,
+                                                       args.baseline)))
     except FileNotFoundError as missing:
         print(f"check_node_matrix: no such file or directory: {missing}",
               file=sys.stderr)
         return 2
+    except MatrixError as error:
+        print(f"check_node_matrix: {args.baseline}: {error}", file=sys.stderr)
+        return 2
     failed = False
+    missing, checked = set(), set()
     for path, role in found:
         shown = os.path.relpath(path, workspace)
+        checked.add(shown)
         if os.path.isdir(path):
             # A node package with no test file has no case at all.
             result = {case: ("missing", "no test file")
@@ -281,9 +325,21 @@ def main(argv):
                          for case, (status, _) in result.items())
         print(f"{shown}  [{role}]  {cells}")
         for case, (status, detail) in result.items():
-            if status == "missing":
+            if status != "missing":
+                continue
+            missing.add((shown, case))
+            if (shown, case) not in baseline:
                 failed = True
                 print(f"  missing case {case}: {detail}")
+    if args.baseline:
+        stale = stale_entries(baseline, missing, checked, lambda p: (
+            os.path.exists(os.path.join(workspace, p))))
+        for path, case in stale:
+            failed = True
+            print(f"  {args.baseline}: {path} case {case} is no longer "
+                  f"missing: remove it from the baseline")
+        print(f"{len(missing & baseline)} missing cases in the baseline "
+              f"({args.baseline}), {len(stale)} stale")
     return 1 if failed else 0
 
 

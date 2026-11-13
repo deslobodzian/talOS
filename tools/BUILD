@@ -168,9 +168,11 @@ py_test(
     deps = [":sync_manifest_lib"],
 )
 
-# bazel run //tools:check_node_matrix -- [PATH...]
+# bazel run //tools:check_node_matrix -- [--baseline FILE] [PATH...]
 # Reports each node test's docs/TESTING.md §7 matrix cases: present, n/a
-# with its reason, or missing (exit 1).
+# with its reason, or missing (exit 1). CI (the lint job) runs it with
+# --baseline check_node_matrix_baseline.txt, the missing cases that may only
+# shrink.
 py_binary(
     name = "check_node_matrix",
     srcs = ["check_node_matrix.py"],

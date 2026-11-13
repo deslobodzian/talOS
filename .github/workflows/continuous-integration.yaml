@@ -650,6 +650,16 @@ jobs:
       if: ${{ !cancelled() }}
       run: python3 tools/trace.py --check
 
+    - name: Every node test has its matrix cases
+      # docs/TESTING.md §7; the cases missing today are listed in
+      # tools/check_node_matrix_baseline.txt (TODO.md MATRIX-1), which may
+      # only shrink: an unlisted missing case or a listed case no longer
+      # missing fails.
+      if: ${{ !cancelled() }}
+      run: >-
+        python3 tools/check_node_matrix.py
+        --baseline tools/check_node_matrix_baseline.txt
+
   gate:
     name: CI gate
     # The one check to require: it fails unless every job above succeeded.
