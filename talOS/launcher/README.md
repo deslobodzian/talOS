@@ -902,7 +902,11 @@ no window: it and a retention lock the same file, so either the launch
 holds it first and every later retention passes the session over, or a
 retention holds it and is removing the directory, which is reported too. A
 running launcher that holds no `session.lock` (one built before it existed)
-is protected only from launches in its own namespace.
+is protected only from launches in its own namespace. So is one whose log
+root's filesystem takes no advisory locks (NFS without a lock daemon,
+macOS's msdos and exFAT volumes): its launch warns once and runs without
+the lock rather than being refused, and retention there removes sessions as
+it did before launches locked them.
 
 The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or
