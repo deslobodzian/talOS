@@ -41,7 +41,7 @@ cc_binary(
 cc_binary(
     name = "bundle_test_native_mark.so",
     testonly = True,
-    srcs = ["bundle_test_native_mark.c"],
+    srcs = ["bundle_test_native_mark.cc"],
     linkshared = True,
 )
 
