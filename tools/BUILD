@@ -243,8 +243,9 @@ py_test(
     main = "trace_test.py",
 )
 
-# python3 tools/slow_tests.py [--threshold 5] [--check] (not a CI check yet)
-# Lists the tests over a time budget, slowest first, from bazel-testlogs.
+# python3 tools/slow_tests.py [--threshold 5] [--check] (CI: the Linux job,
+# after the suite) Lists the tests over a time budget, slowest first, from
+# bazel-testlogs or a build event file; --check fails on a lane budget.
 py_test(
     name = "slow_tests_test",
     size = "small",

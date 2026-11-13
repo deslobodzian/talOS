@@ -72,3 +72,6 @@ test:heavy --test_tag_filters=heavy
 test:integration --test_tag_filters=integration
 test:e2e --test_tag_filters=e2e
 test:perf --test_tag_filters=perf
+# Every lane but e2e: what hosted macOS runs on each push, where the
+# full-graph timed tests cannot hold their bounds.
+test:no_e2e --test_tag_filters=-e2e
