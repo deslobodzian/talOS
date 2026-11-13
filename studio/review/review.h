@@ -11,7 +11,8 @@
 //       and the launcher's session_class file only (no log is read, and
 //       nothing is ever written into the library)
 //   GET /review/<id>/channels.json
-//       the bridge's /channels.json document ("alert" comes with slice S3a)
+//       the bridge's /channels.json document, "alert" included (each
+//       channel's level, studio::AlertLevelName; stream_id "0")
 //   GET /review/<id>/bounds.json
 //       {"start_ns","end_ns","origin_wall_ns","max_series_values",
 //        "max_series_channels"}: the last two, plain numbers, are
