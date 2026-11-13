@@ -8,27 +8,24 @@
 // shard and inherited by every process the test starts, so this removes only
 // what the test created, never another process's segment. Process segments
 // of a session (its topics) are the launcher's to unlink at session end.
-// Run outside Bazel with neither TEST_TMPDIR nor TALOS_SHM_NAMESPACE set,
-// the name is the production registry's, which a live session beside the
-// test (./sim.sh) is using: it is left alone then.
+// When the registry's name is not namespaced (run outside Bazel with
+// neither variable set, or with TALOS_SHM_NAMESPACE set and empty, which
+// ShmObjectName takes over TEST_TMPDIR), it is the production registry's,
+// which a live session beside the test (./sim.sh) is using: it is left
+// alone then.
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-
 #include "talOS/introspection/registry.h"
+#include "talOS/memory/shared_memory_ptr.h"
 
 namespace {
 
-// Whether ShmObjectName maps names into a namespace of their own
-// (talOS/memory/shared_memory_ptr.h): one of its variables is set and not
-// empty.
+// Whether the registry's shared-memory name is namespaced, decided by the
+// mapping RegistryMapping::unlink uses, never by reading its variables
+// again.
 bool Namespaced() {
-  for (const char* name : {"TALOS_SHM_NAMESPACE", "TEST_TMPDIR"}) {
-    const char* value = std::getenv(name);
-    if (value != nullptr && *value != '\0') return true;
-  }
-  return false;
+  return ShmObjectName(talos::introspect::kRegistryPath).starts_with("/~");
 }
 
 class RegistryCleanup : public ::testing::Environment {

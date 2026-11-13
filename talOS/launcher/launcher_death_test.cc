@@ -65,6 +65,7 @@
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/launcher/testdata/first_exec.h"
+#include "talOS/memory/shared_memory_ptr.h"
 
 #if defined(__linux__) && !defined(SYS_pidfd_open)
 #define SYS_pidfd_open 434  // The same number on every architecture.
@@ -109,15 +110,12 @@ std::string ReadFile(const std::string& path) {
                      std::istreambuf_iterator<char>());
 }
 
-// Whether ShmObjectName maps names into a namespace of their own
-// (talOS/memory/shared_memory_ptr.h): one of its variables is set and not
-// empty.
+// Whether the registry's shared-memory name is namespaced, decided by the
+// mapping RegistryMapping::unlink uses (ShmObjectName takes a set
+// TALOS_SHM_NAMESPACE, even an empty one meaning production names, over
+// TEST_TMPDIR), never by reading its variables again.
 bool Namespaced() {
-  for (const char* name : {"TALOS_SHM_NAMESPACE", "TEST_TMPDIR"}) {
-    const char* value = std::getenv(name);
-    if (value != nullptr && *value != '\0') return true;
-  }
-  return false;
+  return ShmObjectName(talos::introspect::kRegistryPath).starts_with("/~");
 }
 
 int RemainingMs(Clock::time_point deadline) {
@@ -347,9 +345,9 @@ class Session {
     if (events_ >= 0) ::close(events_);
     std::filesystem::remove_all(output_dir_);
     // The launcher prepared the registry in this test's namespace, and a
-    // registry outlives its sessions by design. Without a namespace
-    // (TEST_TMPDIR, TALOS_SHM_NAMESPACE) the name is the production
-    // registry's, which a live session beside the test may be using.
+    // registry outlives its sessions by design. Not namespaced, the name is
+    // the production registry's, which a live session beside the test may
+    // be using.
     if (Namespaced()) talos::introspect::RegistryMapping::unlink();
   }
   Session(const Session&) = delete;
