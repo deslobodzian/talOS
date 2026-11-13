@@ -123,9 +123,10 @@ boundary does not guarantee a TCP/IP packet boundary.
 ## Automatic channels and units
 
 Channels are discovered automatically from the graph descriptors. Rules 1 to
-4 are `//talOS/telemetry:channels` (`channels.h`), the one implementation of
+5 are `//talOS/telemetry:channels` (`channels.h`), the one implementation of
 the channel model: `FlattenTopic(topic, schema_name, bfbs)` lists a topic's
-channels (name, kind, unit, labels, and the scalar's offset and type) from
+channels (name, kind, unit, labels, alert level, and the scalar's offset
+and type) from
 its schema, refusing a schema that names an object it does not hold, holds
 a struct that contains itself, nests structs more than 16 deep, or expands
 to more than 4096 struct instances (`channels.h`; a recorded log's schema
@@ -140,8 +141,8 @@ and `ReadDriverStation` do the same for the Driver Station packet.
 `<lane>/mode_since_us` and `<lane>/active`, then the inner struct under
 `<lane>/message/`, each at its offset in the whole envelope. The node
 builds its dictionary and reads every tick through it, so anything that
-names or decodes a recorded message with it uses the live names. Rules 5
-and 6 are the node's own.
+names or decodes a recorded message with it uses the live names. Rules 6
+and 7 are the node's own.
 
 1. **Naming**: Channel names follow wire conventions `<owner>/<role>/<field>`
    (for example `drivetrain/state/vx_mps`, `pose/valid`).
@@ -155,7 +156,12 @@ and 6 are the node's own.
    schema reflection (`reflection::Schema`). An enum whose values would need
    more labels than the dictionary label limit, or that has no non-negative
    value, carries no labels and reads as a plain number.
-5. **Include/exclude globs**: In `telemetry.toml`, `include` selects whole
+5. **Alert levels**: a `bool` field (not an array element) whose name
+   `naming::ParseAlertField` accepts (`alert_<error|warning|info>_<name>`,
+   [NAMING.md](../NAMING.md#topics)) carries that level in `alert`; every
+   other channel carries `None`. Its value is read like any bool, so a stale
+   alert topic is absent, never a frozen "active" or "clear".
+6. **Include/exclude globs**: In `telemetry.toml`, `include` selects whole
    topics only (default `["*"]`). `exclude` takes precedence and matches both
    whole topics and individual dictionary channel names: excluding a topic
    removes all its channels; excluding a channel leaves its siblings intact.
@@ -165,7 +171,7 @@ and 6 are the node's own.
    from every camera without hiding its other status fields. Automatic
    channels such as `pose/valid` can also be excluded. Only retained channels
    enter the dictionary and the pages.
-6. **Pose extraction**: `[studio] pose_topic` selects a topic containing a
+7. **Pose extraction**: `[studio] pose_topic` selects a topic containing a
    `geometry.Pose2d` struct. Telemetry extracts `x_m`, `y_m`, and `yaw_rad` via
    reflection. Missing, stale, invalid or nonfinite pose data makes `pose/valid`
    and `chassis` zero.

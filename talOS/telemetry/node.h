@@ -255,7 +255,8 @@ class Telemetry {
 
   std::size_t AddChannel(std::string name, ChannelKind kind,
                          std::string unit = "",
-                         std::vector<std::string> labels = {}) {
+                         std::vector<std::string> labels = {},
+                         AlertLevel alert = Talos::Telemetry::AlertLevel_None) {
     if (detail::MatchesAnyGlob(name, exclude_globs_)) {
       return std::numeric_limits<std::size_t>::max();
     }
@@ -288,8 +289,8 @@ class Telemetry {
     check_length("name", name);
     check_length("unit", unit);
     for (const std::string& label : labels) check_length("label", label);
-    dictionary_.push_back(
-        ChannelDef{std::move(name), std::move(unit), std::move(labels), kind});
+    dictionary_.push_back(ChannelDef{std::move(name), std::move(unit),
+                                     std::move(labels), kind, alert});
     return dictionary_.size() - 1;
   }
 
@@ -531,7 +532,8 @@ class Telemetry {
     topic.message_bytes = source.message_bytes;
     for (Channel& channel : channels) {
       const std::size_t index =
-          AddChannel(channel.name, channel.kind, channel.unit, channel.labels);
+          AddChannel(channel.name, channel.kind, channel.unit, channel.labels,
+                     channel.alert);
       if (index == std::numeric_limits<std::size_t>::max()) continue;
       topic.readers.push_back(FieldReader{index, std::move(channel)});
     }

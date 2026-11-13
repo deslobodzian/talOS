@@ -6,11 +6,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "geometry/geometry_generated.h"
@@ -1136,6 +1138,107 @@ stale_timeout_us = 50000
   EXPECT_FALSE(channels.contains("pose_estimator/state/twist/vx_mps"));
 }
 
+// Test node whose status carries an alert of each level (schema_test.Alerts).
+class AlertsNode {
+ public:
+  explicit AlertsNode(talos::Node& node)
+      : status_{node.publish<schema_test::Alerts>("/shooter/status")} {}
+
+  talos::Publisher<schema_test::Alerts> status_;
+};
+
+constexpr std::string_view kAlertsConfig = R"(
+[robot]
+period_us = 10000
+
+[studio]
+topic = "/talos/telemetry"
+
+[subsystems.shooter]
+node = "//shooter:node"
+
+[subsystems.shooter.motors.m]
+can_id = 1
+
+[subsystems.demo]
+node = "//demo:node"
+
+[subsystems.telemetry]
+node = "//talOS/telemetry:node"
+stale_timeout_us = 50000
+)";
+
+// Observer matrix (docs/TESTING.md §7): the node observes every state and
+// status topic; an input's "validity" is its channels' presence.
+
+// REQ-OPS-37: each alert field's channel carries its level in the dictionary
+// (other fields none) and its value each tick, so a viewer lists it by level
+// without parsing its name.
+TEST(TelemetryMatrix, PublishesFromALiveInput) {
+  Sim sim = Sim::FromToml(std::string{kAlertsConfig});
+  auto& shooter = sim.add<AlertsNode>("shooter");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  const auto dict = DictionaryMap(telemetry);
+  using Talos::Telemetry::AlertLevel;
+  for (const auto& [name, level] :
+       std::initializer_list<std::pair<std::string_view, AlertLevel>>{
+           {"shooter/status/alert_error_link_lost",
+            Talos::Telemetry::AlertLevel_Error},
+           {"shooter/status/alert_warning_hot",
+            Talos::Telemetry::AlertLevel_Warning},
+           {"shooter/status/alert_info_homed",
+            Talos::Telemetry::AlertLevel_Info},
+           {"shooter/status/routine_index", Talos::Telemetry::AlertLevel_None},
+           {"shooter/status/supply_v", Talos::Telemetry::AlertLevel_None},
+       }) {
+    ASSERT_TRUE(dict.contains(std::string{name})) << name;
+    EXPECT_EQ(static_cast<int>(dict.at(std::string{name})->alert),
+              static_cast<int>(level))
+        << name;
+  }
+
+  shooter.status_.send(schema_test::Alerts{true, false, true, 2, 12.5});
+  sim.step(20ms);
+  const auto raw =
+      DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
+  EXPECT_EQ(raw.at("shooter/status/alert_error_link_lost"), 1u);
+  EXPECT_EQ(raw.at("shooter/status/alert_warning_hot"), 0u);
+  EXPECT_EQ(raw.at("shooter/status/alert_info_homed"), 1u);
+}
+
+// REQ-OPS-37: an alert whose topic went stale is absent, neither a frozen
+// "active" nor a "clear", while the node keeps publishing its other inputs.
+TEST(TelemetryMatrix, StaleInputClearsValidity) {
+  Sim sim = Sim::FromToml(std::string{kAlertsConfig});
+  auto& shooter = sim.add<AlertsNode>("shooter");
+  auto& shapes = sim.add<ShapesNode>("demo");
+  auto& telemetry = sim.add<Telemetry>("telemetry");
+
+  shooter.status_.send(schema_test::Alerts{true, true, false, 0, 12.0});
+  shapes.arrays_.send(schema_test::Arrays{});
+  sim.step(20ms);
+  auto raw = DecodeRaw(telemetry, LatestFrame(sim, "/talos/telemetry").get());
+  ASSERT_EQ(raw.at("shooter/status/alert_error_link_lost"), 1u);
+  ASSERT_EQ(raw.at("shooter/status/alert_info_homed"), 0u);
+
+  // Past stale_timeout_us (50 ms) with the demo topic still fresh.
+  for (int i = 0; i < 8; ++i) {
+    shapes.arrays_.send(schema_test::Arrays{});
+    sim.step(10ms);
+  }
+  const auto frame = LatestFrame(sim, "/talos/telemetry");
+  ASSERT_NE(frame, nullptr);
+  ASSERT_TRUE(frame->keyframe());
+  raw = DecodeRaw(telemetry, frame.get());
+  EXPECT_TRUE(raw.contains("demo/status/samples_m/0"));
+  for (const auto* name : {"shooter/status/alert_error_link_lost",
+                           "shooter/status/alert_warning_hot",
+                           "shooter/status/alert_info_homed"}) {
+    EXPECT_FALSE(raw.contains(name)) << name;
+  }
+}
+
 // Sources whose every topic changes on each of their ticks: nested structs,
 // arrays and enums, a pose, a Driver Station packet, and enough topics that
 // one telemetry tick takes several value pages.
@@ -1147,6 +1250,7 @@ class LiveSources {
       : node_{node},
         mixed_{node.publish<schema_test::Mixed>("/demo/state")},
         arrays_{node.publish<schema_test::Arrays>("/demo/status")},
+        alerts_{node.publish<schema_test::Alerts>("/demo/status/alerts")},
         pose_{node.publish<::geometry::PoseEstimate>("/pose_estimator/state")},
         driver_station_{
             node.publish<hardware::Packet>("/hw/state/driver_station")} {
@@ -1164,6 +1268,9 @@ class LiveSources {
         schema_test::Inner{schema_test::Mode::HIGH, static_cast<float>(tick)},
         0.5f});
     arrays_.send(schema_test::Arrays{});
+    const bool odd = node_.tick() % 2 != 0;
+    alerts_.send(schema_test::Alerts{
+        odd, !odd, odd, static_cast<std::uint8_t>(node_.tick()), tick});
     pose_.send(::geometry::PoseEstimate{0, ::geometry::Pose2d{tick, 1.0, 0.5},
                                         ::geometry::Twist2d{0.0, 0.0, 0.0},
                                         true, true, 0, 0});
@@ -1185,14 +1292,16 @@ class LiveSources {
   talos::Node& node_;
   talos::Publisher<schema_test::Mixed> mixed_;
   talos::Publisher<schema_test::Arrays> arrays_;
+  talos::Publisher<schema_test::Alerts> alerts_;
   talos::Publisher<::geometry::PoseEstimate> pose_;
   talos::Publisher<hardware::Packet> driver_station_;
   std::vector<talos::Publisher<schema_test::Inner>> paging_;
 };
 
-// RULES.md 3: with every source changing each tick, the producer's reads,
-// value pages and its dictionary resend (every 100th tick) allocate nothing.
-TEST(TelemetryTest, SteadyStateTickDoesNotAllocate) {
+// RULES.md 3: with every source changing each tick (alerts toggling among
+// them), the producer's reads, value pages and its dictionary resend (every
+// 100th tick, alert levels included) allocate nothing.
+TEST(TelemetryMatrix, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
       !why.empty()) {
     GTEST_SKIP() << why;

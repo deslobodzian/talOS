@@ -13,6 +13,8 @@
 //   unit     from the field name's suffix (talOS/schema/unit_suffix.h);
 //            none for a bool or an enum
 //   labels   an enum's value names, indexed by value (EnumLabels)
+//   alert    a bool field naming an alert (`alert_<level>_<name>`,
+//            naming::ParseAlertField) carries its level; None otherwise
 //   value    the raw 64-bit sample a telemetry page carries (ReadChannel)
 //
 // Flattening allocates and throws (construction time); ReadChannel and
@@ -41,6 +43,8 @@ struct Channel {
   std::string unit;
   std::vector<std::string> labels;  // non-empty: enum channel
   ChannelKind kind{Talos::Telemetry::ChannelKind_Double};
+  // A bool field (not an array element) named as an alert: its level.
+  AlertLevel alert{Talos::Telemetry::AlertLevel_None};
   // Where the scalar is in the message and its reflected type. None for a
   // channel ReadChannel does not read (DriverStationChannels).
   std::size_t offset{0};
@@ -135,9 +139,14 @@ struct FlattenOptions {
   bool truncate{false};
 };
 
+// The wire level of `field`'s alert (naming::ParseAlertField), None when it
+// does not name one.
+AlertLevel AlertLevelOf(std::string_view field);
+
 // Every scalar of struct `schema_name` in `bfbs` (a reflection.Schema) that
 // `options` keeps, in field id order with nested structs and arrays
-// expanded in place, named under `topic`. Throws std::invalid_argument
+// expanded in place, named under `topic`; a bool field's alert level from
+// AlertLevelOf. Throws std::invalid_argument
 // naming the topic when `bfbs` does not verify or lacks the struct, or when
 // a field names an object the schema does not hold, a struct contains
 // itself, structs nest deeper than kMaxNestingDepth, the walk passes
