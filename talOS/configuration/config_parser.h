@@ -121,6 +121,12 @@ struct RobotConfig {
   // config file sets `commissioned = true`, which refuses an explicit false.
   bool require_target_coverage{false};
 
+  // `[robot] simulation_only`, default false: the config (simulation gains,
+  // bindings, wide travel) must never drive real hardware, so the launcher
+  // refuses it without --sim. Once a file sets it true, a file including
+  // that one cannot set it back to false (ResolveRobotConfig refuses).
+  bool simulation_only{false};
+
   // Sim-session viewer. Studio's bridge is a host-side process, not a robot
   // node, so it is not a subsystem; this table carries what the launcher
   // needs to start and supervise it in sim sessions. `topic` is the topic it
@@ -1115,6 +1121,8 @@ inline RobotConfig ParseRobotConfigTable(toml::table tbl,
     }
     result.require_target_coverage =
         Read(*robot, "require_target_coverage", hw.commissioned);
+    result.simulation_only =
+        Read(*robot, "simulation_only", result.simulation_only);
     result.controller_address = detail::ReadNonEmpty(
         *robot, "controller_address", result.controller_address, "[robot]");
     if (!detail::IsIpv4Address(result.controller_address)) {
@@ -1700,6 +1708,18 @@ inline toml::table ResolveRobotConfig(const std::string& path,
     if (base.contains("include")) {
       throw std::invalid_argument("nested 'include' is not supported in " +
                                   inc_file);
+    }
+    // A simulation-only config stays one in every config that includes it:
+    // an override back to false would make simulation settings drivable.
+    if (base["robot"]["simulation_only"].value_exact<bool>().value_or(false) &&
+        !tbl["robot"]["simulation_only"].value_exact<bool>().value_or(true)) {
+      throw std::invalid_argument(
+          path +
+          " sets [robot] simulation_only = false, but the file it "
+          "includes, " +
+          inc_file +
+          ", sets it true; a simulation-only config cannot be included as "
+          "a deployable one");
     }
     if (auto* base_manifest = base["subsystems"].as_array()) {
       detail::NormalizeManifestPaths(*base_manifest, inc_file);
