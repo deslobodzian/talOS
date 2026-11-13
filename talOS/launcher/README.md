@@ -481,7 +481,8 @@ is after the member's exec. A terminal's Ctrl-C reaches only the launcher's
 process group, never a member's (each has its own). Still counted: a
 signal before the stop, another signal (a SIGTERM that systemd's default
 `KillMode=control-group` sends every process of the unit along with the
-launcher), and the stop timeout's SIGKILL.
+launcher; the unit `deploy.sh` writes sets `KillMode=mixed`, which signals
+the launcher alone), and the stop timeout's SIGKILL.
 A SIGINT from elsewhere that ends the run after the launcher's last look at
 it and before its own SIGINT is indistinguishable from it and counts as the
 stop's.

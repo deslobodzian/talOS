@@ -166,8 +166,8 @@ class BootServiceTest(unittest.TestCase):
         # Under systemd's default KillMode=control-group, `systemctl stop`
         # SIGTERMs every member with the launcher: a member still starting
         # (not yet handling a stop) dies of a signal the launcher did not
-        # send, the session exits 255 and the unit is recorded failed
-        # (TODO.md DEPLOY-9). Only the launcher may get the stop; systemd's
+        # send, the session exits 255 and the unit is recorded failed.
+        # Only the launcher may get the stop; systemd's
         # SIGKILL must come after the launcher's own escalation.
         with tempfile.TemporaryDirectory() as tmp:
             out = enable_boot(os.path.join(tmp, "prefix"), "Linux")
