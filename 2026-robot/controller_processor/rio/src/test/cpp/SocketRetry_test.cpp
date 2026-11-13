@@ -125,20 +125,49 @@ TEST(SocketRetry, OnlyASendErrorTheSocketKeepsRepeatingLosesIt) {
 }
 
 #ifndef _WIN32
-// A loopback UDP port the OS just handed out and released.
-uint16_t FreeLoopbackPort() {
-  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-  if (fd < 0) return 0;
+// The port a bound socket holds; 0 when it has none.
+uint16_t BoundPort(int fd) {
   sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   socklen_t size = sizeof(address);
-  const bool bound =
-      ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
-      ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0;
-  ::close(fd);
-  return bound ? ntohs(address.sin_port) : 0;
+  if (fd < 0 ||
+      ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) != 0) {
+    return 0;
+  }
+  return ntohs(address.sin_port);
 }
+
+// A UDP port the OS hands out, held for the test's lifetime by a wildcard
+// socket with SO_REUSEADDR: a socket bound to 127.0.0.1 on it with
+// SO_REUSEADDR too (Linux and macOS) still can, and no socket opened without
+// it (the default for every talOS peer) can take the port while that socket
+// is closed between replacements.
+class HeldPort {
+ public:
+  HeldPort() : fd_{::socket(AF_INET, SOCK_DGRAM, 0)} {
+    int enabled = 1;
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (fd_ < 0 ||
+        ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &enabled,
+                     sizeof(enabled)) != 0 ||
+        ::bind(fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) !=
+            0) {
+      return;
+    }
+    port_ = BoundPort(fd_);
+  }
+  ~HeldPort() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+  HeldPort(const HeldPort&) = delete;
+  HeldPort& operator=(const HeldPort&) = delete;
+  uint16_t port() const { return port_; }
+
+ private:
+  int fd_;
+  uint16_t port_{0};
+};
 
 // The gateway's socket can no longer send (shut down for writing here: EPIPE,
 // as from a socket the kernel marked defunct; every later send on it fails).
@@ -150,23 +179,27 @@ uint16_t FreeLoopbackPort() {
 // REQ-RT-22
 TEST(SocketRetry, ASocketThatCannotSendIsReplacedOnItsPorts) {
   namespace protocol = talos::protocol;
-  const uint16_t gateway_port = FreeLoopbackPort();
-  const uint16_t companion_port = FreeLoopbackPort();
-  ASSERT_NE(gateway_port, 0);
-  ASSERT_NE(companion_port, 0);
+  const HeldPort gateway_port;
+  ASSERT_NE(gateway_port.port(), 0);
+  // The companion keeps the port it is given at port 0.
   protocol::RuntimeUdpPeer companion;
-  ASSERT_EQ(
-      companion.Open("127.0.0.1", companion_port, "127.0.0.1", gateway_port),
-      protocol::UdpStatus::kOk);
+  ASSERT_EQ(companion.Open("127.0.0.1", 0, "127.0.0.1", gateway_port.port()),
+            protocol::UdpStatus::kOk);
+  const uint16_t companion_port = BoundPort(companion.NativeFd());
+  ASSERT_NE(companion_port, 0);
   protocol::RuntimeUdpPeer gateway;
   SocketRetry retry;
   // What Robot.cpp's loop passes: Endpoint::Reopen while replacing,
-  // Endpoint::Open before the first socket.
+  // Endpoint::Open before the first socket (here with SO_REUSEADDR, beside
+  // the socket that holds its port).
+  protocol::UdpSocketOptions options;
+  options.reuse_address = true;
   const auto open = [&] {
     return (retry.replacing()
                 ? gateway.Reopen()
-                : gateway.Open("127.0.0.1", gateway_port, "127.0.0.1",
-                               companion_port)) == protocol::UdpStatus::kOk;
+                : gateway.Open("127.0.0.1", gateway_port.port(), "127.0.0.1",
+                               companion_port, options)) ==
+           protocol::UdpStatus::kOk;
   };
   const auto send = [&](uint64_t now_us) {
     const auto status =
