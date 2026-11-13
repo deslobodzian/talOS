@@ -1475,5 +1475,67 @@ TEST(DrivetrainBinary, LoggedSimRunReplaysWithoutDivergence) {
       << replay.output;
 }
 
+// The test config with the first `find` in drivetrain.toml replaced by
+// `replace`, written under TEST_TMPDIR.
+std::string ConfigEdited(const std::string& find, const std::string& replace) {
+  const std::filesystem::path source = ConfigPath();
+  const char* tmp = std::getenv("TEST_TMPDIR");
+  const std::filesystem::path dir =
+      std::filesystem::path{tmp != nullptr ? tmp : "/tmp"} /
+      "drivetrain_config";
+  std::filesystem::create_directories(dir);
+  // copy_file keeps the source's mode: a read-only checkout (CI) yields a
+  // read-only copy that overwrite_existing could not replace next time.
+  std::filesystem::remove(dir / "robot.toml");
+  std::filesystem::copy_file(source, dir / "robot.toml");
+  std::stringstream text;
+  text << std::ifstream{source.parent_path() / "drivetrain.toml"}.rdbuf();
+  std::string toml = text.str();
+  const std::size_t at = toml.find(find);
+  if (at == std::string::npos) {
+    throw std::runtime_error("drivetrain.toml has no '" + find + "'");
+  }
+  toml.replace(at, find.size(), replace);
+  std::ofstream{dir / "drivetrain.toml"} << toml;
+  return (dir / "robot.toml").string();
+}
+
+// Each bad drivetrain parameter throws at construction, naming the key.
+// REQ-CONTRACT-18
+TEST(DrivetrainParameters, BadParameterFailsConstruction) {
+  struct Row {
+    const char* find;
+    const char* replace;
+    const char* key;
+  };
+  for (const Row& row : {
+           Row{"wheel_radius_m = 0.0508\n", "", "wheel_radius_m"},
+           Row{"wheel_radius_m = 0.0508", "wheel_radius_m = 0",
+               "wheel_radius_m"},
+           Row{"wheel_radius_m = 0.0508", "wheel_radius_m = nan",
+               "wheel_radius_m"},
+           Row{"x_m = -0.3, y_m = 0.3,", "x_m = inf, y_m = 0.3,", "x_m"},
+           Row{"x_m = -0.3, y_m = 0.3,", "y_m = 0.3,", "x_m"},
+           Row{"[subsystem]\n", "[subsystem]\nmax_linear_accel_mps2 = -1\n",
+               "max_linear_accel_mps2"},
+           Row{"[subsystem]\n", "[subsystem]\nmax_linear_accel_mps2 = nan\n",
+               "max_linear_accel_mps2"},
+           Row{"[subsystem]\n", "[subsystem]\nmax_angular_accel_radps2 = -1\n",
+               "max_angular_accel_radps2"},
+           Row{"[subsystem]\n", "[subsystem]\nmax_angular_accel_radps2 = inf\n",
+               "max_angular_accel_radps2"},
+       }) {
+    SCOPED_TRACE(row.replace);
+    Sim sim{ConfigEdited(row.find, row.replace)};
+    try {
+      sim.add<Drivetrain>("drivetrain");
+      ADD_FAILURE() << "accepted";
+    } catch (const std::invalid_argument& error) {
+      EXPECT_NE(std::string{error.what()}.find(row.key), std::string::npos)
+          << error.what();
+    }
+  }
+}
+
 }  // namespace
 }  // namespace drivetrain

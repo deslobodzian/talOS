@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
+#include <string>
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
@@ -46,10 +48,8 @@ class Drivetrain {
         // this false to use the physics gateway's modeled Pigeon (and drift).
         integrate_heading_{
             node.param<bool>("integrate_heading", node.simulation())},
-        max_linear_accel_mps2_{
-            node.param<double>("max_linear_accel_mps2", 0.0)},
-        max_angular_accel_radps2_{
-            node.param<double>("max_angular_accel_radps2", 0.0)},
+        max_linear_accel_mps2_{AccelLimit(node, "max_linear_accel_mps2")},
+        max_angular_accel_radps2_{AccelLimit(node, "max_angular_accel_radps2")},
         status_{node.subscribe<bridge::BridgeStatus>(bridge::topics::kStatus)},
         target_{node},
         state_{node.publish<DrivetrainState>(topics::kState)} {
@@ -220,6 +220,21 @@ class Drivetrain {
   }
 
  private:
+  // An acceleration limit, finite and >= 0; 0 (the default) is no limit. A
+  // negative or non-finite value fails construction naming the key, rather
+  // than reading as no limit in update().
+  static double AccelLimit(const talos::Node& node, const char* key) {
+    const double value = node.param<double>(key, 0.0);
+    if (!std::isfinite(value) || value < 0) {
+      const std::string name{node.name()};
+      throw std::invalid_argument(name + ": parameter '" + key +
+                                  "' must be finite and >= 0 (0 is no "
+                                  "limit) in [subsystems." +
+                                  name + "]");
+    }
+    return value;
+  }
+
   // Ten control ticks of age and four of skew (at the usual 5 ms period)
   // bound the error from publishing asynchronous values without extrapolation.
   static constexpr std::int64_t kMaxMeasurementAgeNs = 50'000'000;
