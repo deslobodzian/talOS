@@ -18,17 +18,34 @@
 namespace talos::protocol {
 namespace {
 
+// The port the OS bound `peer` to, when its Open() asked for port 0.
+uint16_t BoundPort(const RuntimeUdpPeer& peer) {
+  sockaddr_in address{};
+  socklen_t size = sizeof(address);
+  if (::getsockname(peer.NativeFd(), reinterpret_cast<sockaddr*>(&address),
+                    &size) != 0) {
+    return 0;
+  }
+  return ntohs(address.sin_port);
+}
+
 // Both send paths (copying and in-buffer) reach the peer intact and number
-// their frames from one sequence.
+// their frames from one sequence. Both ends bind port 0: the receiving end
+// stays unconnected, so it opens before it knows the sender's port, and the
+// sender connects to the port the receiver was given.
 TEST(RuntimeUdpTest, SendsFramesOverLoopback) {
   RuntimeUdpPeer mac;
   RuntimeUdpPeer rio;
   UdpSocketOptions options;
   options.non_blocking = false;
+  UdpSocketOptions unconnected = options;
+  unconnected.connect_peer = false;
 
-  ASSERT_EQ(rio.Open("127.0.0.1", 59101, "127.0.0.1", 59100, options),
+  ASSERT_EQ(rio.Open("127.0.0.1", 0, "127.0.0.1", 0, unconnected),
             UdpStatus::kOk);
-  ASSERT_EQ(mac.Open("127.0.0.1", 59100, "127.0.0.1", 59101, options),
+  const uint16_t rio_port = BoundPort(rio);
+  ASSERT_NE(rio_port, 0);
+  ASSERT_EQ(mac.Open("127.0.0.1", 0, "127.0.0.1", rio_port, options),
             UdpStatus::kOk);
 
   const std::array<uint8_t, 6> payload = {1, 2, 3, 4, 5, 6};
@@ -63,14 +80,6 @@ TEST(RuntimeUdpTest, SendsFramesOverLoopback) {
   }
 }
 
-TEST(RuntimeUdpTest, NonBlockingReceiveReportsWouldBlock) {
-  RuntimeUdpPeer peer;
-  ASSERT_EQ(peer.Open("127.0.0.1", 59102, "127.0.0.1", 59103), UdpStatus::kOk);
-
-  DecodedFrame received;
-  EXPECT_EQ(peer.TryReceive(&received), UdpStatus::kWouldBlock);
-}
-
 // A loopback UDP port the OS just handed out and released, so the test does
 // not depend on a fixed port in the ephemeral range staying free.
 uint16_t FreeLoopbackPort() {
@@ -85,6 +94,16 @@ uint16_t FreeLoopbackPort() {
       ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0;
   ::close(fd);
   return bound ? ntohs(address.sin_port) : 0;
+}
+
+TEST(RuntimeUdpTest, NonBlockingReceiveReportsWouldBlock) {
+  const uint16_t remote = FreeLoopbackPort();
+  ASSERT_NE(remote, 0);
+  RuntimeUdpPeer peer;
+  ASSERT_EQ(peer.Open("127.0.0.1", 0, "127.0.0.1", remote), UdpStatus::kOk);
+
+  DecodedFrame received;
+  EXPECT_EQ(peer.TryReceive(&received), UdpStatus::kWouldBlock);
 }
 
 // A second process opening a live peer's port -- a second hardware bridge
