@@ -364,10 +364,11 @@ sleep precision. Releasing a lane is not a mechanical brake.
   configured and the robot disabled, record three consecutive `[rio] tick
   phases` console lines (one per 10 s; [format](../talOS/hardware/README.md)):
   each phase's mean and max in µs, and the motor and sensor counts. Then,
-  with the bridge running, record `/hw/status` `can_utilization_frac` with
-  the config's `status_hz` at 200, then at 50 (reconfigure between). For a
-  robot estimate (16 Talon FX and 4 CANcoders) scale the refresh and devices
-  phases per device (the measured phase over the bench's five devices) by
+  with the bridge running, record `/hw/status` `can_utilization_frac` (the
+  busiest configured bus: on the bench, the `Shooter` CANivore all five
+  devices are on) with the config's `status_hz` at 200, then at 50
+  (reconfigure between). For a robot estimate (16 Talon FX and 4
+  CANcoders) scale the refresh and devices phases per device (the measured phase over the bench's five devices) by
   20, control per motor (over its three motors) by 16, keep health, other,
   link, driver station and loop as measured, and scale
   `can_utilization_frac` per device at each rate by 20; compare with the

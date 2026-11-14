@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "CanBusHealth.h"
 #include "RioLog.h"
 #include "hardware/gateway.h"
 
@@ -110,6 +111,9 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::array<bool, talos::hardware::kMaxMotors> apply_failing_{};
   std::vector<uint16_t> apply_failed_;
   bool last_brownout_{false};
+  // State's CAN health: the busiest of the RoboRIO's bus and the configured
+  // CANivores (CanBusHealth.h). Rebuilt by Configure, polled by Read.
+  talos::rio::CanBusHealth can_health_;
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;
   std::vector<std::unique_ptr<frc::DigitalOutput>> digital_outputs_;

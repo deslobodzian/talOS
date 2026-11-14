@@ -103,8 +103,9 @@ applies the highest requested rate to a shared frame. The Phoenix desktop
 rate test checks the effective rates: the current and temperature reads share
 a frame already requested at 200 Hz, adding no requested status-frame traffic.
 This is not a measured
-whole-bus utilization percentage: use `/hw/status` CAN utilization during
-physical bring-up, including all other devices and control traffic.
+whole-bus utilization percentage: use `/hw/status` CAN utilization (the
+busiest configured bus, RoboRIO or CANivore) during physical bring-up,
+including all other devices and control traffic.
 Temperature older than 500 ms and supply current older than 50 ms read as zero
 without invalidating motion feedback, like existing effort diagnostics.
 Standalone ideal/physics simulation reports ambient 25 °C and placeholder
