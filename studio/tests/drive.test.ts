@@ -624,6 +624,37 @@ test('a decode failure that repeats names the feed and backs off its retries', (
                             2 * RECONNECT_MS + 2 * DECODE_RETRY_MS]);
 });
 
+// REQ-OPS-36: the decode failure is named only until a socket shows the feed
+// decodes, or shows nothing undecodable. Scenario: one decode close, the
+// reconnect opens, and the telemetry node has stopped. Either the bridge
+// sends its held tick's dictionary and keyframe (they decode: the line names
+// the stalled telemetry, not the decoder), or it sends heartbeats only (past
+// CONNECTING_GRACE_MS with no undecodable page, the line says no telemetry).
+// "reload the page" must not stick while the socket stays open.
+test('a clean reconnect after a decode failure ends the decode status', () => {
+  const garbage = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+  for (const keyframe of [true, false]) {
+    const h = harness();
+    h.connect(0);
+    h.socket().send(garbage);
+    assert.ok(h.model.status(h.clock.now).undecodable);
+    h.at(RECONNECT_MS);
+    h.socket().onopen!();
+    if (keyframe)
+      h.socket().send(...encodeDictionaryPages(header(1), CHANNELS), ...update(1, NOMINAL, true));
+    for (let t = RECONNECT_MS + 100; t <= RECONNECT_MS + 3000; t += 100) {
+      h.at(t);
+      h.socket().send(keyframe ? update(1, {}, false)[0] : '{"kind":"talos.drive.heartbeat"}');
+      const status = h.model.status(t);
+      const label = `${keyframe ? 'keyframe' : 'heartbeats only'}, ${t} ms: ${status.text}`;
+      if (keyframe || t - RECONNECT_MS > CONNECTING_GRACE_MS) {
+        assert.ok(!status.undecodable, `${label}: still names a decode failure`);
+        if (t - RECONNECT_MS > CONNECTING_GRACE_MS) assert.equal(status.link, 'telemetry', label);
+      }
+    }
+  }
+});
+
 // REQ-OPS-36: a page from another bridge version, whose every page (the
 // dictionary included) fails verification, is named as a feed that could not
 // be decoded, not as a telemetry node publishing nothing (which sends the

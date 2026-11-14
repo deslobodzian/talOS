@@ -58,8 +58,9 @@
 //     a later page of a keyframe or an update whose earlier pages the
 //     decoder applied) would leave a value wrong or absent while later
 //     ticks read as current; the reconnect brings a whole dictionary and
-//     keyframe. Such a close is the feed's fault, not the link's: until a
-//     new tick the status names the telemetry feed, and after
+//     keyframe. Such a close is the feed's fault, not the link's: the status
+//     names the telemetry feed until a later socket decodes a value page or
+//     stays open CONNECTING_GRACE_MS without one that fails, and after
 //     DECODE_RETRIES of them in a row (each within DECODE_STREAK_MS of its
 //     socket opening) attempts start DECODE_RETRY_MS apart, so a feed that
 //     never decodes does not spend the slot's byte budget on a dictionary
@@ -196,7 +197,17 @@ export class DriveModel {
   private keyframeAt = 0;
   private suspended = false;  // see suspend()
   private valuesThisSocket = false;  // a value page of this socket decoded
-  private decodeFailures = 0;  // the page's own closes for a decode failure, in a row
+  // The page's own closes for a decode failure, in a row: the streak that
+  // backs attempts off to DECODE_RETRY_MS. A close by the bridge or a
+  // failure of the link ends it; so does a decode close more than
+  // DECODE_STREAK_MS after its socket opened, which starts a new streak of
+  // one. While it is above 0 the status line names the undecodable feed,
+  // until the socket after the close shows the feed decodes (a value page
+  // decoded on it) or shows nothing undecodable (open CONNECTING_GRACE_MS,
+  // the dictionary and keyframe's bound, without a decode close): from then
+  // the line judges that socket like any other, while the streak itself
+  // carries on to the next decode close.
+  private decodeFailures = 0;
   private readonly tracked: Set<string>;
   private readonly histories = new Map<string, Point[]>();
 
@@ -298,7 +309,9 @@ export class DriveModel {
     if (this.suspended)
       return {link: 'telemetry', text: 'Telemetry stale: the page missed time (laptop asleep), ' +
                                        'waiting for a new tick'};
-    if (this.decodeFailures > 0 && this.lastTickAt === null) return undecodable;
+    if (this.decodeFailures > 0 && !this.valuesThisSocket &&
+        now - this.openedAt <= CONNECTING_GRACE_MS)
+      return undecodable;
     if (!this.tickThisSocket) {
       if (now - this.openedAt <= CONNECTING_GRACE_MS)
         return {link: 'connecting', text: 'Connected, waiting for telemetry'};
