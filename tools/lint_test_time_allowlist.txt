@@ -26,6 +26,7 @@ studio/bridge/bandwidth_test.py sleep seeded: integration, real bridge process; 
 studio/bridge/client_timeout_test.py clock integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
 studio/bridge/integration_test.py clock seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
 studio/bridge/integration_test.py sleep seeded: integration, real bridge process; sleeps unaudited (TEST-8 names studio/bridge)
+studio/bridge/stop_test.py clock integration: times a real bridge's stop against a quarter of the launcher's stop timeout (REQ-OPS-06, launcher.h kStopTimeout)
 talOS/bridge/hardware_node_test.cc clock seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
 talOS/bridge/hardware_node_test.cc sleep seeded: integration, bridge over UDP loopback; sleeps unaudited against TESTING.md §6.3
 talOS/bridge/run_test.cc clock seeded: integration, bridge loop over UDP; wake latency on the real clock
