@@ -12,7 +12,7 @@
 #include <string>
 
 #include "talOS/geometry/se2.h"
-#include "talOS/geometry/so2.h"
+#include "talOS/geometry/swerve_module.h"
 
 namespace drivetrain {
 
@@ -137,21 +137,17 @@ class SwerveKinematics {
       if (!std::isfinite(current[i].steer_rot)) return std::nullopt;
       const double wheel_vx = vx - omega * module.y_m;
       const double wheel_vy = vy + omega * module.x_m;
-      double speed = std::hypot(wheel_vx, wheel_vy);
+      const double speed = std::hypot(wheel_vx, wheel_vy);
       out[i].steer_rot = current[i].steer_rot;
       if (speed < HoldSpeed(module)) continue;
-      using Rotation = talos::geometry::SO2<double>;
-      double delta = (Rotation(ToRadians(current[i].steer_rot)).inverse() *
-                      Rotation(std::atan2(wheel_vy, wheel_vx)))
-                         .angle();
-      if (std::abs(delta) > std::numbers::pi / 2.0) {
-        speed = -speed;
-        delta = std::atan2(std::sin(delta + std::numbers::pi),
-                           std::cos(delta + std::numbers::pi));
-      }
-      speed *= std::max(0.0, std::cos(delta));
-      out[i].drive_rps = WheelRps(speed, module.wheel_radius_m);
-      out[i].steer_rot += ToRotations(delta);
+      // An overflowed wheel speed has no setpoint (OptimizeSwerveModule
+      // would give zero): refuse the whole command instead.
+      if (!std::isfinite(speed)) return std::nullopt;
+      const auto setpoint = talos::geometry::OptimizeSwerveModule(
+          speed, std::atan2(wheel_vy, wheel_vx),
+          ToRadians(current[i].steer_rot));
+      out[i].drive_rps = WheelRps(setpoint.speed, module.wheel_radius_m);
+      out[i].steer_rot += ToRotations(setpoint.steer_delta_rad);
       if (!std::isfinite(out[i].drive_rps) || !std::isfinite(out[i].steer_rot))
         return std::nullopt;
       if (std::abs(out[i].drive_rps) > module.max_drive_rps)

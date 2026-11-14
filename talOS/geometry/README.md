@@ -28,6 +28,19 @@ for spatial. Include `talOS/geometry/lie.h`.
 * Scalar-templated (`double` default). Small-angle branches require scalar
   comparisons.
 
+## Swerve module setpoint
+
+`talOS/geometry/swerve_module.h`: `OptimizeSwerveModule(speed,
+asked_heading_rad, measured_rad)` returns the `SwerveModuleSetpoint` a swerve
+module drives to. The steering change is the shortest rotation from the
+measured angle (unwrapped, any magnitude) to the asked heading; past a
+quarter turn it takes the opposite heading, negates the speed and sets
+`reversed` (exactly a quarter turn keeps the asked heading). The speed is
+then scaled by `max(0, cos(steer_delta_rad))`, so `steer_delta_rad` is in
+`[-pi/2, pi/2]`. A non-finite input returns `{0, 0, false}`. It allocates
+nothing. The 2026 drivetrain (`ToModuleStates`) and the bench
+`swerve_module` node take their module setpoints from it.
+
 ## Performance notes
 
 * Geometry operations use fixed-size Eigen types.

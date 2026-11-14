@@ -11,8 +11,10 @@ ChassisTarget publisher -> drivetrain node -> hardware bridge -> RoboRIO
 
 The drivetrain discretizes chassis velocity by taking the SE2 logarithm of
 the desired finite-period translation and rotation, compensating motion skew.
-It selects the shorter steering path, cosine-scales drive speed by azimuth
-error, and desaturates wheel speeds. A wheel asked for less than 0.25% of
+It takes each module's shorter steering path and cosine-scaled drive speed
+from `talos::geometry::OptimizeSwerveModule`
+([geometry](../../../talOS/geometry/README.md#swerve-module-setpoint)), and
+desaturates wheel speeds. A wheel asked for less than 0.25% of
 its own top speed (its drive `max_velocity_rps` at its wheel radius; 0.0116
 m/s on the robot) holds the measured steering angle at zero drive, so
 heading-hold noise does not re-steer the modules. That is a dead band for any
