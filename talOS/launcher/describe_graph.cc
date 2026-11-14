@@ -415,7 +415,10 @@ std::vector<naming::Diagnostic> LintParameterKeys(
         }
         if (!files.empty()) message += ")";
       }
-      message += " is read by no node's constructor (Node::param)";
+      message +=
+          " is read by no node's constructor; delete it from the config, or "
+          "read it in the node's constructor with Node::param (node.param in "
+          "Python)";
       const std::string* nearest = nullptr;
       std::size_t distance = std::max<std::size_t>(2, key.size() / 3) + 1;
       for (const auto& candidate : read) {
