@@ -832,23 +832,35 @@ test('subsystems rows put failed and driving nodes first', () => {
   assert.deepEqual(order, ['shooter', 'vision', 'drivetrain', 'telemetry', 'camera']);
 });
 
-// A Surface of plain objects: `grid` holds the element at each index, so a
-// test can tell a kept element from a replaced one by identity.
-type FakeElement = {html: string; scrollTop: number};
+// A Surface of plain objects that lays out like a browser: `grid` holds the
+// element at each index, so a test can tell a kept element from a replaced
+// one by identity. Each element's list body holds its `<li>` rows, ROW px
+// each, in a cell that leaves it ROOM px. A detached element has no layout
+// box: its scroll offset reads 0 and setting one does nothing. A new body
+// fills its cell (ROOM px) until fit() snaps it to whole rows, and its
+// scroll offset is clamped to what it can scroll at that moment.
+const ROW = METRICS.row, ROOM = 100;
+type FakeElement = {html: string; top: number; attached: boolean; height: number; content: number};
 function fakeSurface() {
   const page = {status: '', errored: false, grid: [] as FakeElement[], puts: 0};
   const surface: Surface<FakeElement> = {
     status: html => {
       page.status = html;
     },
-    create: html => ({html, scrollTop: 0}),
-    put: (index, next) => {
+    create: html => ({html, top: 0, attached: false, height: ROOM,
+                      content: (html.match(/<li>/g)?.length ?? 0) * ROW}),
+    put: (index, next, previous) => {
+      if (previous) previous.attached = false;
+      next.attached = true;
       page.grid[index] = next;
       page.puts++;
     },
-    scrollTop: e => e.scrollTop,
+    fit: e => {
+      if (e.attached) e.height = Math.floor(ROOM / ROW) * ROW;
+    },
+    scrollTop: e => e.attached ? e.top : 0,
     setScrollTop: (e, top) => {
-      e.scrollTop = top;
+      if (e.attached) e.top = Math.max(0, Math.min(top, e.content - e.height));
     },
     errored: on => {
       page.errored = on;
@@ -856,26 +868,41 @@ function fakeSurface() {
   };
   return {page, surface};
 }
+const rows = (n: number) => `<section><ul>${'<li>row</li>'.repeat(n)}</ul></section>`;
 
 // REQ-OPS-49: the page redraws every RENDER_MS and with a live producer some
 // widget changes nearly every frame. A widget whose markup did not change
 // keeps its element (a list's scroll position and a row's tooltip survive);
 // one whose rows changed is replaced and keeps its list's scroll position.
+// Scenario: the driver scrolls the subsystems list down and a restart count
+// changes; the new list must not start at the top. Scrolled to its bottom,
+// it must stay at its bottom (its last row whole), not lose the part of a
+// row its body is shorter by once snapped to whole rows.
 test('the painter replaces only a changed widget and keeps a list scrolled', () => {
   const {page, surface} = fakeSurface();
   const painter = new Painter(surface);
-  const frame = (graph: string, nodes: string) =>
-      () => ({status: '<div>OK</div>', widgets: [graph, nodes]});
-  painter.paint(frame('<section>graph 1</section>', '<section>a b c</section>'));
+  // As the page does: each paint, then every list snapped to whole rows.
+  const paint = (graph: string, nodes: string) => {
+    painter.paint(() => ({status: '<div>OK</div>', widgets: [graph, nodes]}));
+    page.grid.forEach(e => surface.fit(e));
+  };
+  paint('<section>graph 1</section>', rows(10));
   const [graph, list] = page.grid;
   assert.ok(graph && list, 'the first paint draws every widget');
-  list.scrollTop = 44;  // the driver scrolled the list
-  painter.paint(frame('<section>graph 2</section>', '<section>a b c</section>'));
+  surface.setScrollTop(list, 2 * ROW);  // the driver scrolled the list
+  paint('<section>graph 2</section>', rows(10));
   assert.notEqual(page.grid[0], graph, 'a changed widget is not repainted');
   assert.equal(page.grid[1], list, 'an unchanged list is replaced, losing its scroll and hover');
-  painter.paint(frame('<section>graph 2</section>', '<section>a b c d</section>'));
+  paint('<section>graph 2</section>', rows(11));
   assert.notEqual(page.grid[1], list, 'a list whose rows changed is not repainted');
-  assert.equal(page.grid[1].scrollTop, 44, 'a repainted list returns to its top');
+  assert.equal(surface.scrollTop(page.grid[1]), 2 * ROW, 'a repainted list returns to its top');
+  // Scrolled to the bottom: 11 rows in a body of 4 whole rows.
+  const bottom = 11 * ROW - Math.floor(ROOM / ROW) * ROW;
+  surface.setScrollTop(page.grid[1], bottom);
+  assert.equal(surface.scrollTop(page.grid[1]), bottom);
+  paint('<section>graph 2</section>', `${rows(11)} `);
+  assert.equal(surface.scrollTop(page.grid[1]), bottom,
+               'a list scrolled to its bottom no longer is after a repaint (its last row cut)');
 });
 
 // REQ-OPS-49: a list that scrolls says how many rows are out of view. Rows
