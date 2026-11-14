@@ -396,8 +396,12 @@ export interface Surface<E> {
   create(html: string): E;
   // Puts `next` at `index` of the grid, in place of `previous` if any.
   put(index: number, next: E, previous: E|undefined): void;
-  // The scroll offset of the element's list body (0 without one), and
-  // setting it, clamped to what the body can scroll.
+  // Sizes the element's list body, if any, to the whole rows its cell
+  // leaves it (on the grid, so laid out).
+  fit(element: E): void;
+  // The scroll offset of the element's list body (0 without one, and 0 off
+  // the grid, where an element has no layout box), and setting it, clamped
+  // to what the body can scroll as it is now sized.
   scrollTop(element: E): number;
   setScrollTop(element: E, top: number): void;
   errored(on: boolean): void;
@@ -411,9 +415,12 @@ export type Frame = {status: string; widgets: string[]};
 // changes nearly every frame: a widget whose markup did not change keeps
 // its element, so a list's scroll position and a row's tooltip survive. A
 // widget whose markup changed is replaced, and the new element takes the old
-// one's list scroll position. A drawing error leaves the grid as it is,
-// marks it (it shows values no longer updated) and says so on the status
-// line.
+// one's list scroll position: read before the old element leaves the grid
+// (off it, it reads 0) and set once the new body is sized to whole rows (set
+// before, it is clamped to a taller body's range, so a list scrolled to its
+// bottom would lose part of a row). A drawing error leaves the grid as it
+// is, marks it (it shows values no longer updated) and says so on the
+// status line.
 export class Painter<E> {
   private status = '';
   private markup: string[] = [];
@@ -438,10 +445,11 @@ export class Painter<E> {
       if (html === this.markup[i]) return;
       this.markup[i] = html;
       const previous = this.elements[i];
+      const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
       const element = this.surface.create(html);
       this.surface.put(i, element, previous);
       this.elements[i] = element;
-      const top = previous === undefined ? 0 : this.surface.scrollTop(previous);
+      this.surface.fit(element);
       if (top > 0) this.surface.setScrollTop(element, top);
     });
     this.surface.errored(false);

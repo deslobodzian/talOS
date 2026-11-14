@@ -49,6 +49,18 @@ async function run() {
   const status = root.querySelector('.status-slot')!;
   const grid = root.querySelector<HTMLElement>('.grid')!;
   const body = (e: Element) => e.querySelector<HTMLElement>('.body');
+  // Each list widget's body shows whole rows only: its height snapped to a
+  // multiple of the row height, from the space its cell leaves it.
+  const fit = (list: Element) => {
+    const b = body(list);
+    if (!b || !list.querySelector('.out-of-view')) return;
+    const room = list.clientHeight - 2 * METRICS.cell_pad_y - METRICS.header;
+    const height = `${Math.max(1, Math.floor(room / METRICS.row)) * METRICS.row}px`;
+    if (b.style.height !== height) {
+      b.style.flex = 'none';
+      b.style.height = height;
+    }
+  };
   const surface: Surface<Element> = {
     status: html => {
       status.innerHTML = html;
@@ -62,29 +74,25 @@ async function run() {
       if (previous) grid.replaceChild(next, previous);
       else grid.appendChild(next);
     },
+    fit,
     scrollTop: e => body(e)?.scrollTop ?? 0,
+    // The browser clamps it to what the body, as now sized, can scroll.
     setScrollTop: (e, top) => {
       const b = body(e);
-      if (b) b.scrollTop = Math.max(0, Math.min(top, b.scrollHeight - b.clientHeight));
+      if (b) b.scrollTop = top;
     },
     errored: on => {
       grid.classList.toggle('errored', on);
     }
   };
-  // Each list widget's body shows whole rows only (its height snapped to a
-  // multiple of the row height, from the space its cell leaves it), and its
-  // heading says how many rows are out of view, measured here where the rows
-  // are laid out (outOfView does the counting).
+  // Each list widget's heading says how many rows are out of view, measured
+  // here where the rows are laid out (outOfView does the counting), after
+  // each paint, scroll and resize (which also refits the body).
   const countOutOfView = () => {
     for (const list of grid.querySelectorAll<HTMLElement>('.w')) {
       const badge = list.querySelector('.out-of-view'), b = body(list);
       if (!badge || !b) continue;
-      const room = list.clientHeight - 2 * METRICS.cell_pad_y - METRICS.header;
-      const height = `${Math.max(1, Math.floor(room / METRICS.row)) * METRICS.row}px`;
-      if (b.style.height !== height) {
-        b.style.flex = 'none';
-        b.style.height = height;
-      }
+      fit(list);
       let text = '';
       if (b.scrollHeight > b.clientHeight) {
         const origin = b.getBoundingClientRect().top - b.scrollTop;
