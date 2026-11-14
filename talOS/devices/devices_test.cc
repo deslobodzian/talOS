@@ -432,13 +432,14 @@ TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
   hw.reset();
   sim.step(150ms);
   EXPECT_FALSE(mech.a.connected());
-  // Like the other numeric getters, stale feedback remains latched.
+  // A stale link keeps the last temperature, as the gateway's invalid sample
+  // does (hardware::MarkInvalid); its supply current reads zero.
   EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 75.0);
-  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 9.5);
+  EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 0);
 }
 
 // The TalonFX's own limit switches read as asserted only from a connected
-// sample; unlike the numeric getters, a stale or invalid one is not latched.
+// sample; a stale or invalid one reads no limit.
 TEST(Devices, MotorLimitSwitchesReadOnlyFromAConnectedSample) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -1168,6 +1169,46 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
   sim.step(10ms);
   EXPECT_DOUBLE_EQ(mech.b.position(), 3);
   EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0.25);
+}
+
+// A stale link is an invalid sample too: connected() reads false, and a node
+// cannot tell it from the gateway's. Scenario: a rezeroed motor at 1 (raw 3)
+// turning at 2 rot/s and drawing current, a rezeroed gyro turning at -0.5
+// rot/s and a CANcoder at 0.2 turning at 0.3 rot/s, then no State for longer
+// than command_timeout_us. Each position holds its last valid value through
+// its rezero offset, and every rate and effort reads zero, not the last live
+// value (a yaw rate of -0.5 rot/s on a gyro reported disconnected).
+// REQ-CONTRACT-34
+TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  auto hw = std::make_unique<SimHardware>(sim);
+  hw->set_motor("mech", "b", 3, 2, 0, 0, 40.0, 18.0, 30.0);
+  hw->set_gyro("mech", "gyro", 0.25, -0.5);
+  hw->set_cancoder("mech", "cc", 0.2, 0.3);
+  sim.step(10ms);
+  mech.b.rezero(1);
+  mech.gyro.rezero();
+  ASSERT_TRUE(mech.b.zeroed());
+  ASSERT_TRUE(mech.gyro.zeroed());
+  ASSERT_DOUBLE_EQ(mech.b.velocity(), 2);
+  ASSERT_DOUBLE_EQ(mech.b.current(), 30.0);
+  ASSERT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
+
+  hw.reset();       // the bridge goes silent
+  sim.step(150ms);  // past [robot] command_timeout_us
+  ASSERT_FALSE(mech.b.connected());
+  ASSERT_FALSE(mech.gyro.connected());
+  ASSERT_FALSE(mech.cc.connected());
+  EXPECT_DOUBLE_EQ(mech.b.position(), 1);
+  EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
+  EXPECT_DOUBLE_EQ(mech.cc.position(), 0.2);
+  EXPECT_EQ(mech.b.velocity(), 0.0);
+  EXPECT_EQ(mech.b.voltage(), 0.0);
+  EXPECT_EQ(mech.b.current(), 0.0);
+  EXPECT_EQ(mech.b.supply_current_a(), 0.0);
+  EXPECT_EQ(mech.gyro.yaw_rate(), 0.0);
+  EXPECT_EQ(mech.cc.velocity(), 0.0);
 }
 
 // Two handles on one node share its subscription and both hear each packet.

@@ -17,6 +17,7 @@
 #include "bridge/topics.h"
 #include "talOS/bridge/boot_history.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/hardware/feedback.h"
 #include "talOS/hardware/gate.h"
 #include "talOS/hardware/packet.h"
 
@@ -610,15 +611,32 @@ bool HardwareAccess::gyro_zeroed(const HardwareLink& link, std::size_t index) {
   return link.impl_->At(index, Kind::kGyro).zeroed;
 }
 
+namespace {
+// A motor or CAN-sensor sample as a node reads it. An invalid one, whether
+// the gateway invalidated it or the link is stale (no State younger than
+// command_timeout_us, which a node cannot tell apart through connected()),
+// carries the gateway's zeros (hardware::MarkInvalid: rate and effort fields
+// zero, temperature and fault bits as last reported) with the last valid
+// position in place of its zero. Every position reads through the rezero
+// offset.
+template <class Impl, class Device, class Sample>
+void InvalidateUnlessFresh(const Impl& impl, const Device& device,
+                           Sample& sample) {
+  if (!sample.valid || !impl.Fresh()) {
+    hardware::MarkInvalid(sample);
+    sample.position_rot = device.held_position;
+  }
+  sample.position_rot -= device.position_offset;
+}
+}  // namespace
+
 hardware::MotorSample HardwareAccess::motor_sample(const HardwareLink& link,
                                                    std::size_t index) {
   const auto& impl = *link.impl_;
   const auto& device = impl.At(index, Kind::kMotor);
   auto sample = FindSample(impl.state.motors, impl.state.motor_count, device.id,
                            device.sample_index);
-  if (!sample.valid) sample.position_rot = device.held_position;
-  if (!impl.Fresh()) sample.valid = false;
-  sample.position_rot -= device.position_offset;
+  InvalidateUnlessFresh(impl, device, sample);
   return sample;
 }
 
@@ -636,9 +654,7 @@ hardware::SensorSample HardwareAccess::sensor_sample(const HardwareLink& link,
   const auto& device = impl.SensorAt(index);
   auto sample = FindSample(impl.state.sensors, impl.state.sensor_count,
                            device.id, device.sample_index);
-  if (!sample.valid) sample.position_rot = device.held_position;
-  if (!impl.Fresh()) sample.valid = false;
-  sample.position_rot -= device.position_offset;
+  InvalidateUnlessFresh(impl, device, sample);
   return sample;
 }
 
