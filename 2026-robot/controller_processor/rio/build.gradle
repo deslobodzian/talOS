@@ -300,12 +300,12 @@ tasks.register("buildRio") {
 
 // Stable entry point for the desktop tests in src/test/cpp (PhoenixBackend
 // simulation regressions, ConfigStore, SimDriverStation, RioLog,
-// CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule). The google-test
-// plugin creates one RunTestExecutable task per desktop variant
+// CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth). The
+// google-test plugin creates one RunTestExecutable task per desktop variant
 // (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
 // so CI pins this aggregator instead of a platform-specific variant name.
 tasks.register("phoenixTest") {
-    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule)'
+    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth)'
     group = 'verification'
     def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
     dependsOn runTasks

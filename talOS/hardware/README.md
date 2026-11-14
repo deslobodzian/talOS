@@ -269,8 +269,14 @@ revision it was built from and whether that checkout was dirty; set with
 and identified motor/sensor samples. Motor samples contain mechanism
 position/velocity, voltage, stator and supply current, temperature, and the
 Phoenix fault bitfield. State also carries valid power/CAN health (battery
-volts, brownout, and CAN utilization fraction) and per-boot gateway safety
-counters. Peers of another protocol version (`kProtocolVersion`, see
+volts, brownout, and the CAN utilization fraction of the busiest configured
+bus) and per-boot gateway safety counters. The busiest configured bus is the
+RoboRIO's own bus or any CANivore a configured motor or sensor is on; the
+RoboRIO program reads one CANivore every 100 ms, and a CANivore whose status
+read fails drops out of the maximum, with a console line, until it reads
+again
+([`CanBusHealth.h`](../../2026-robot/controller_processor/rio/src/main/include/CanBusHealth.h)).
+Peers of another protocol version (`kProtocolVersion`, see
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)) are rejected rather than decoded.
 CANcoder samples contain angle
 and velocity; Pigeon2 samples contain yaw and yaw rate, expressed in rotations.
@@ -511,7 +517,8 @@ raises no `SIGPIPE` on either end
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, late-feedback, apply
-and neutral send transitions, device resets, brownout) to `RioLog`
+and neutral send transitions, device resets, brownout, a CANivore's status
+read failing and recovering) to `RioLog`
 (`src/main/include/RioLog.h`): a preallocated 256-event queue that never
 waits, dropping and counting events when full. A logger thread at nice 19
 (Linux) writes them to stderr, at most one line per second for each kind and
@@ -535,7 +542,9 @@ prints where those ticks' work went:
 per tick, the mean and longest time in `BaseStatusSignal::RefreshAll`
 (refresh), the per-device validity, latency and `HasResetOccurred` pass
 (devices), TalonFX `SetControl` for every motor, whether a command's or
-neutral (control), the CAN status and battery reads (health), and the rest
+neutral (control), the CAN status reads (the RoboRIO's bus every tick, one
+CANivore's, which Phoenix says can block up to 1 ms, every 100 ms) and the
+battery reads (health), and the rest
 of the backend's tick calls (other); and the loop's own: the socket retry,
 the endpoint's tick (receive, the gateway's command and State work, the
 State send; with no socket open, the gateway's tick) and the Driver Station
@@ -695,7 +704,7 @@ Build without deploying:
 ```sh
 cd 2026-robot/controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway

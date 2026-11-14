@@ -58,8 +58,8 @@ constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 constexpr const char* kConfigPath = "talos_config.bin";
 #endif
 
-// RioLog kMessage indices (rate-limit keys) of this file's reports; index 0 is
-// PhoenixBackend's configure failure.
+// RioLog kMessage indices (rate-limit keys) of this file's reports; 0 and 7
+// are PhoenixBackend's (configure failure, CAN bus status).
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;

@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <ctre/phoenix6/CANBus.hpp>
 #include <ctre/phoenix6/controls/DutyCycleOut.hpp>
 #include <ctre/phoenix6/controls/Follower.hpp>
 #include <ctre/phoenix6/controls/MotionMagicVoltage.hpp>
@@ -13,6 +15,7 @@
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <limits>
 #include <string>
+#include <string_view>
 
 #include "hardware/gate.h"
 
@@ -159,8 +162,42 @@ constexpr double kSimNeutralCoastTauS = 1.0;
 // Friction holds a nearly-stopped unpowered rotor instead of creeping forever
 // (same standstill snap as StepAxis).
 constexpr double kSimNeutralStandstillRps = 0.01;
-// RioLog kMessage index of the configure-failure line (its rate-limit key).
+// RioLog kMessage indices (rate-limit keys) of this file's lines; Robot.cpp
+// uses 1 to 6.
 constexpr uint16_t kConfigureFailedMessage = 0;
+constexpr uint16_t kCanBusStatusMessage = 7;
+
+// One CANivore's status: Phoenix 6 reports its utilization from 0 to 1, the
+// unit of State's can_utilization_frac. Can block for up to 1 ms (CANBus.hpp),
+// so CanBusHealth calls it at most once per CanBusHealth::kSamplePeriodUs.
+talos::rio::CanBusHealth::Sample ReadCanivore(std::string_view bus) {
+  const auto status = ph::CANBus{bus}.GetStatus();
+  return {status.Status.IsOK(), status.BusUtilization, status.Status.GetName()};
+}
+
+// Posts a CANivore's failing or recovered status read. Loop thread: a
+// bounded format into the event, no allocation.
+void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
+                     const talos::rio::CanBusHealth::Result& result) {
+  talos::rio::LogEvent event;
+  event.index = kCanBusStatusMessage;
+  const int bus_length =
+      static_cast<int>(std::min<std::size_t>(bus.size(), 63));
+  const char* status = result.status != nullptr ? result.status : "?";
+  if (result.event == talos::rio::CanBusHealth::Event::kFailing) {
+    std::snprintf(event.text, sizeof event.text,
+                  "[phoenix] CAN bus %.*s status read failing: %s; CAN "
+                  "utilization leaves it out until it reads again",
+                  bus_length, bus.data(), status);
+  } else {
+    std::snprintf(event.text, sizeof event.text,
+                  "[phoenix] CAN bus %.*s status read recovered after %u "
+                  "failed reads",
+                  bus_length, bus.data(),
+                  static_cast<unsigned>(result.spell_failures));
+  }
+  log.Post(event);
+}
 }  // namespace
 
 PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
@@ -206,6 +243,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   apply_failed_.clear();
   apply_failed_.reserve(c.motors.size());
   last_brownout_ = false;
+  can_health_.Configure(c, is_simulation_);
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
   const auto note_failure = [this](const std::string& name,
@@ -601,9 +639,14 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
 bool PhoenixBackend::Read(hw::State& s) {
   using talos::rio::TickPhase;
   const uint64_t read_start_ns = NowNs();
+  // The RoboRIO bus every tick; at most one CANivore per sample period.
+  const auto can = can_health_.Poll(
+      read_start_ns / 1000,
+      frc::RobotController::GetCANStatus().percentBusUtilization, ReadCanivore);
+  if (can.event != talos::rio::CanBusHealth::Event::kNone)
+    LogCanBusStatus(*log_, can_health_.bus(can.bus), can);
   s.health = {true, frc::RobotController::GetBatteryVoltage().value(),
-              frc::RobotController::IsBrownedOut(),
-              frc::RobotController::GetCANStatus().percentBusUtilization};
+              frc::RobotController::IsBrownedOut(), can.utilization_frac};
   uint64_t refresh_start_ns = NowNs();
   log_->AddPhase(TickPhase::kHealth, refresh_start_ns - read_start_ns);
   if (is_simulation_) {
