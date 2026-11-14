@@ -143,9 +143,10 @@ launcher checks every subsystem table against them (`LintParameterKeys`): a
 key that is not a framework key (`config::kFrameworkSubsystemKeys`) and that
 no node read is an error naming the subsystem, the key as `param` names it
 (`detector.sigma`, `geometry.modules[0].x_m`), the files that set it and,
-when one is close, the nearest key a node read there:
+when one is close, the nearest key a node read there, one error per key with
+the remedy (delete the key, or read it with `param`):
 
-    error: elevator: parameter 'homing_vv' (.../subsystems/elevator.toml) is read by no node's constructor (Node::param); did you mean 'homing_v'?
+    error: elevator: parameter 'homing_vv' (.../subsystems/elevator.toml) is read by no node's constructor; delete it from the config, or read it in the node's constructor with Node::param (node.param in Python); did you mean 'homing_v'?
 
 A key counts as read when a node read it, an element of it when the config
 holds an array (`names[1]` reads `names`), or a key inside it when the config
