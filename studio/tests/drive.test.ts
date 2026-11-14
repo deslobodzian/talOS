@@ -539,9 +539,10 @@ test('the subsystems widget lists the summary, one state word per row', () => {
 });
 
 // REQ-OPS-36: before any value page of a socket decoded (nothing it brought
-// has changed a value) a binary message that does not decode is counted and ignored,
-// and so is a text message that does not decode at any time; the page keeps
-// decoding what follows.
+// has changed a value) and within CONNECTING_GRACE_MS of its opening, a
+// binary message that does not decode is counted and ignored, and so is a
+// text message that does not decode at any time; the page keeps decoding
+// what follows.
 test('garbage binary before the first tick and garbage text are counted and ignored', () => {
   const h = harness();
   h.at(0);
@@ -607,8 +608,8 @@ test('a decode failure that repeats names the feed and backs off its retries', (
   const starts: number[] = [];
   h.connect(0);
   h.socket().send(garbage);
-  assert.equal(h.model.status(h.clock.now).link, 'telemetry',
-               `a decode failure reads as ${h.model.status(h.clock.now).text}`);
+  assert.ok(h.model.status(h.clock.now).undecodable,
+            `a decode failure reads as ${h.model.status(h.clock.now).text}`);
   for (let t = 100; t <= 12_000; t += 100) {
     const before = h.sockets.length;
     h.at(t);
@@ -617,10 +618,50 @@ test('a decode failure that repeats names the feed and backs off its retries', (
     h.socket().onopen!();
     h.socket().send(...encodeDictionaryPages(header(t), CHANNELS), ...update(t, NOMINAL, true),
                     ...update(t + 1, {}, false), garbage);
-    assert.equal(h.model.status(h.clock.now).link, 'telemetry');
+    assert.ok(h.model.status(h.clock.now).undecodable, `${t} ms: ${h.model.status(h.clock.now).text}`);
   }
   assert.deepEqual(starts, [RECONNECT_MS, 2 * RECONNECT_MS, 2 * RECONNECT_MS + DECODE_RETRY_MS,
                             2 * RECONNECT_MS + 2 * DECODE_RETRY_MS]);
+});
+
+// REQ-OPS-36: a page from another bridge version, whose every page (the
+// dictionary included) fails verification, is named as a feed that could not
+// be decoded, not as a telemetry node publishing nothing (which sends the
+// team to the wrong node), and backed off like any undecodable feed.
+// Scenario: the bridge sends a TLM2 dictionary and keyframe on each connect
+// and an update every 100 ms. A corrupt message before the dictionary, within
+// CONNECTING_GRACE_MS of the socket opening, is still only counted (the
+// garbage test above); one after it, with no value page decoded, closes the
+// socket for a decode failure.
+test('a feed none of whose pages decode is named and backed off', () => {
+  const h = harness();
+  const foreign = (pages: Uint8Array[]) => pages.map(page => {
+    const copy = page.slice();
+    copy.set([...'TLM2'].map(c => c.charCodeAt(0)), 8);
+    return copy;
+  });
+  const starts: number[] = [];
+  let named: number|null = null;
+  for (let t = 0; t <= 14_000; t += 100) {
+    const before = h.sockets.length;
+    h.at(t);
+    if (t === 0) h.model.start(0);
+    if (h.sockets.length !== before) {
+      starts.push(t);
+      h.socket().onopen!();
+      h.socket().send(...foreign([...encodeDictionaryPages(header(t), CHANNELS),
+                                  ...update(t, NOMINAL, true)]));
+    } else if (h.model.connection === 'open') {
+      h.socket().send(...foreign(update(t + 1, {}, false)));
+    }
+    const status = h.model.status(t);
+    if (named === null && status.undecodable) named = t;
+    if (named !== null)
+      assert.ok(status.undecodable, `${t} ms: the undecodable feed reads as ${status.text}`);
+  }
+  assert.equal(named, CONNECTING_GRACE_MS + 100,
+               `an undecodable feed is named at ${named} ms, ${h.model.status(h.clock.now).text}`);
+  assert.deepEqual(starts, [0, 1700, 3400, 3400 + DECODE_RETRY_MS, 3400 + 2 * DECODE_RETRY_MS]);
 });
 
 // REQ-OPS-36: a keyframe of several pages applies each as it arrives, the
