@@ -1,0 +1,22 @@
+namespace gyro;
+
+// The bench Pigeon 2's heading, published every tick whether or not the
+// robot is enabled. Angles are radians, CCW+, in the Pigeon's own yaw frame
+// (the node never rezeroes it).
+struct GyroState {
+  // The node clock when this state was published.
+  sample_time_ns:uint64;
+  // While the sample is invalid (connected false), the last valid yaw.
+  yaw_rad:double;
+  // 0 while the sample is invalid.
+  yaw_rate_radps:double;
+  // Age of each acquisition at sample_time_ns;
+  // std::numeric_limits<uint64>::max() when unknown (not connected).
+  yaw_age_us:uint64;
+  yaw_rate_age_us:uint64;
+  // Gyro::connected: the sample is valid and the hardware state fresh.
+  connected:bool;
+  // HardwareLink::fresh: an accepted hardware state younger than
+  // command_timeout_us.
+  hardware_fresh:bool;
+}
