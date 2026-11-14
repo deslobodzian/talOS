@@ -33,9 +33,7 @@ cc_test(
     size = "small",
     srcs = ["node_test.cc"],
     data = [
-        "testdata/robot.toml",
         "//bench/main_processor/configuration:robot_config",
-        "//bench/main_processor/configuration:subsystems/swerve_module.toml",
     ],
     deps = [
         ":swerve_module",

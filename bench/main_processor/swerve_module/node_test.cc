@@ -26,9 +26,9 @@ using talos::testing::DsPacket;
 using talos::testing::PublishTarget;
 using talos::testing::ReleaseTarget;
 namespace ds = talos::driver_station;
-// The bench config plus the swerve module's subsystem file (see the file).
-constexpr const char* kConfig =
-    "bench/main_processor/swerve_module/testdata/robot.toml";
+// The bench config: the module's drive, steer and encoder are three of its
+// devices, so losing one is not the gateway's total-loss fault.
+constexpr const char* kConfig = "bench/main_processor/configuration/robot.toml";
 constexpr const char* kNode = "swerve_module";
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 constexpr double kTwoPi = 2.0 * std::numbers::pi;

@@ -6,8 +6,9 @@ max_bench_voltage_v = 2.0
 
 [motors.kraken]
 type = "TalonFX"
-bus = "rio"
-# Placeholder only: a human must set the physical CAN id before commissioning.
+# The bench Kraken's own id and bus, read from the device. The config stays
+# uncommissioned until a person has checked inversion and limits at the bench.
+bus = "Shooter"
 can_id = 1
 motor_type = "kraken_x44"
 inverted = false

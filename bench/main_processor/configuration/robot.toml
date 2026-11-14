@@ -20,6 +20,14 @@ name = "motor"
 path = "subsystems/motor.toml"
 
 [[subsystems]]
+name = "swerve_module"
+path = "subsystems/swerve_module.toml"
+
+[[subsystems]]
+name = "gyro"
+path = "subsystems/gyro.toml"
+
+[[subsystems]]
 name = "teleop"
 path = "subsystems/teleop.toml"
 
