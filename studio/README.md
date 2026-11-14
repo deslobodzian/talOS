@@ -190,8 +190,10 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   channel, so a lost page would leave a value wrong or absent. That close is
   the feed's fault, not the link's: the status line reads TELEMETRY
   `Telemetry feed could not be decoded: reload the page` until a later
-  connection decodes a value page or stays open 1.5 s without a message
-  that fails, and after 3 such closes in a row (each within
+  connection decodes a value page or stays open past 1.5 s without a binary
+  message that fails to decode (one that fails within the 1.5 s keeps the
+  line until the next one closes the connection), and after 3 such closes
+  in a row (each within
   10 s of its connection opening) attempts start 5 s apart instead of 1 s,
   so a feed that never decodes does not spend the slot's byte budget on a
   dictionary every second.
