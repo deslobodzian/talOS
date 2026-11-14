@@ -284,7 +284,7 @@ TEST(DashboardLayoutTest, WorstCaseBudgetIsHeldAtItsBoundary) {
   EXPECT_EQ(DashboardWorstCaseBytesPerSecond(1, 83), 83 * 12 + 210 + kFixed);
   EXPECT_EQ(DashboardWorstCaseBytesPerSecond(1, 84), 84 * 12 + 420 + kFixed);
   EXPECT_EQ(DashboardWorstCaseBytesPerSecond(20, 25),
-            20 * (25 * 12 + 210) + kFixed);
+            std::uint64_t{20} * (25 * 12 + 210) + kFixed);
 
   // One number widget at 10 Hz: 10 x (12 + 210) + kFixed = 12532 B/s.
   const auto layout = [](int budget) {
