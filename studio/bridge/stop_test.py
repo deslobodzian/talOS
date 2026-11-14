@@ -130,7 +130,11 @@ class BridgeStop(unittest.TestCase):
         connection are both pending when it resumes.
         """
         self.bridge.send_signal(signal.SIGSTOP)
-        os.waitid(os.P_PID, self.bridge.pid, os.WSTOPPED)
+        # waitpid with WUNTRACED (os.waitid is missing on macOS before Python
+        # 3.13) reports the stop without reaping, so Popen.wait() still gets
+        # the exit status.
+        _, status = os.waitpid(self.bridge.pid, os.WUNTRACED)
+        self.assertTrue(os.WIFSTOPPED(status))
         self.connect()
         sent_at = time.monotonic()
         self.bridge.send_signal(signal.SIGINT)
