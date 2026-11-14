@@ -271,10 +271,14 @@ position/velocity, voltage, stator and supply current, temperature, and the
 Phoenix fault bitfield. State also carries valid power/CAN health (battery
 volts, brownout, and the CAN utilization fraction of the busiest configured
 bus) and per-boot gateway safety counters. The busiest configured bus is the
-RoboRIO's own bus or any CANivore a configured motor or sensor is on; the
-RoboRIO program reads one CANivore every 100 ms, and a CANivore whose status
-read fails drops out of the maximum, with a console line, until it reads
-again
+RoboRIO's own bus or any CANivore a configured motor or sensor is on. A
+CANivore's status read blocks about 1 ms, so a helper thread
+(`talos-canbus`, `SCHED_OTHER`, started only for a configuration with a
+CANivore and never in simulation) reads one CANivore every 100 ms, the buses
+in turn, and the loop only copies the figures it published. A CANivore whose
+last read failed, or whose last read is three of its own sampling periods
+old on the loop's clock (300 ms with one CANivore), drops out of the
+maximum, with a console line, until it reads again
 ([`CanBusHealth.h`](../../2026-robot/controller_processor/rio/src/main/include/CanBusHealth.h)).
 Peers of another protocol version (`kProtocolVersion`, see
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)) are rejected rather than decoded.
@@ -517,8 +521,8 @@ raises no `SIGPIPE` on either end
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, late-feedback, apply
-and neutral send transitions, device resets, brownout, a CANivore's status
-read failing and recovering) to `RioLog`
+and neutral send transitions, device resets, brownout, a CANivore leaving
+and rejoining CAN utilization) to `RioLog`
 (`src/main/include/RioLog.h`): a preallocated 256-event queue that never
 waits, dropping and counting events when full. A logger thread at nice 19
 (Linux) writes them to stderr, at most one line per second for each kind and
@@ -542,8 +546,8 @@ prints where those ticks' work went:
 per tick, the mean and longest time in `BaseStatusSignal::RefreshAll`
 (refresh), the per-device validity, latency and `HasResetOccurred` pass
 (devices), TalonFX `SetControl` for every motor, whether a command's or
-neutral (control), the CAN status reads (the RoboRIO's bus every tick, one
-CANivore's, which Phoenix says can block up to 1 ms, every 100 ms) and the
+neutral (control), the RoboRIO bus's CAN status read, the copy of the
+CANivore figures `talos-canbus` published (never a CANivore read) and the
 battery reads (health), and the rest
 of the backend's tick calls (other); and the loop's own: the socket retry,
 the endpoint's tick (receive, the gateway's command and State work, the
