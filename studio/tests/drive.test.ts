@@ -12,7 +12,7 @@ import {test} from 'node:test';
 import {AlertLevel, ChannelKind, type ChannelSpec, dictionaryId, encodeDictionaryPages, encodeValuePages, rawFromDouble} from '../src/encode';
 import {CONNECTING_GRACE_MS, DEAD_AFTER_MS, DECODE_RETRY_MS, DriveModel, type DriveSocket, type Link, RECONNECT_MS, RENDER_MS, REPLACED_CODE, SILENCE_MS, STALE_MS} from '../src/drive/feed';
 import {parseLayout} from '../src/drive/layout';
-import {DrawSchedule, esc, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
+import {DrawSchedule, esc, GLYPH_PX, listColumns, listRowsFit, METRICS, nameCharsShown, NODE_STATE, outOfView, outOfViewText, Painter, renderDashboard, renderStatus, STALE_DRAW_LAG_MS, type Surface, type Timers} from '../src/drive/view';
 
 const LAYOUT = parseLayout(JSON.parse(
     readFileSync(new URL('./drive_layout_2026.json', import.meta.url), 'utf8')));
@@ -897,7 +897,8 @@ test('the 2026 lists fit their cells at 1366x768 and 1280x720', () => {
 // REQ-OPS-49: each row keeps its name readable beside its state. At 1366x768
 // and 1280x720 the 2026 subsystems cell gives two columns; the worst-case row
 // (each state word, with its note of restarts and drives) still shows the
-// name's floor, and enough of each 2026 node name to tell them apart
+// name's floor (so the row's edge, which clips and does not ellipsize, never
+// reaches the word), and enough of each 2026 node name to tell them apart
 // (front_left_camera from front_right_camera). A model: glyph widths are
 // GLYPH_PX, not a browser's; a browser screenshot verifies it.
 test('a 2026 subsystems row keeps a readable name beside its widest state word', () => {
@@ -907,20 +908,54 @@ test('a 2026 subsystems row keeps a readable name beside its widest state word',
   // The shortest prefix length that tells every name apart.
   let distinct = 1;
   while (new Set(names.map(n => n.slice(0, distinct))).size < names.length) distinct++;
-  assert.ok(METRICS.name_min_ch - 1 >= distinct, 'the name floor cannot tell the 2026 nodes apart');
+  const floor = METRICS.name_min / GLYPH_PX.name;  // the name's floor, in characters
+  assert.ok(floor - 1 >= distinct, 'the name floor cannot tell the 2026 nodes apart');
   const subsystems = LAYOUT.widgets.find(w => w.kind === 'subsystems')!;
   for (const page of [{width: 1366, height: 768}, {width: 1280, height: 720}]) {
     const column = listColumns(LAYOUT, subsystems.at, page, METRICS.node_column);
     for (const word of Object.values(NODE_STATE)) {
       const at = `${page.width}x${page.height}, ${word}, a ${column.width.toFixed(1)} px column`;
       const shown = nameCharsShown(column.width, word, 1);
-      assert.ok(shown + 1 >= METRICS.name_min_ch,
+      assert.ok(shown + 1 >= floor,
                 `${at}: the name keeps ${shown} characters, under its floor of ` +
-                `${METRICS.name_min_ch} ch, so the word is squeezed`);
+                `${floor}, so the row cuts the word`);
       assert.ok(shown >= distinct, `${at}: the name shows ${shown} characters, ${distinct} ` +
                                    'tell the 2026 nodes apart');
     }
   }
+});
+
+// REQ-OPS-49: the page never hides a row's state word. The stylesheet lets a
+// list row's name and notes give up width (ellipsized, the tooltip has the
+// rest) but never its state word: a flex item that may shrink takes a share
+// of any overflow in proportion to its size, so a word allowed to shrink at
+// all ellipsized ("U…" for UP beside front_right_camera at 1280x720, a
+// 29.19 px box for a 29.22 px word). That the row's edge does not cut the
+// word either is the readable-name test above: the name's floor, read here
+// from the same property, leaves the widest word its width.
+test('a list row never shrinks its state word', () => {
+  const css = readFileSync(new URL('../src/drive/drive.css', import.meta.url), 'utf8')
+                  .replace(/\/\*[\s\S]*?\*\//g, '');
+  // Every rule that can reach a list row's state word: one naming the word
+  // in a list, every child of a list row, or every word.
+  const reaches = (s: string) => s.trim() === '.tag' ||
+      /\.(nodes|checks|alerts)\b.*(\.tag\b|li\s*>\s*\*)/.test(s);
+  const wordRules = [...css.matchAll(/([^{}]+)\{([^}]*)\}/g)]
+                        .filter(([, sel]) => sel.split(',').some(reaches));
+  assert.ok(wordRules.length >= 2, 'no rule reaches a list row\'s state word: the selectors moved');
+  for (const [, sel, body] of wordRules) {
+    const rule = `"${sel.trim().replace(/\s+/g, ' ')}"`;
+    const flex = /(?:^|;)\s*flex\s*:\s*([^;]+)/.exec(body)?.[1].trim();
+    const shrink = /flex-shrink\s*:\s*([^;]+)/.exec(body)?.[1].trim();
+    assert.ok(flex === undefined || flex === 'none' || /^\S+\s+0(\s|$)/.test(flex),
+              `${rule} lets the state word shrink (flex: ${flex})`);
+    assert.ok(shrink === undefined || shrink === '0', `${rule} sets flex-shrink: ${shrink}`);
+    assert.doesNotMatch(body, /text-overflow\s*:\s*ellipsis/, `${rule} ellipsizes the state word`);
+    assert.doesNotMatch(body, /overflow\s*:\s*hidden/, `${rule} hides the state word's overflow`);
+  }
+  // The name's floor is METRICS.name_min, the floor the readable-name test
+  // models.
+  assert.match(css, /\.nodes \.name[^{]*\{[^}]*min-width:\s*var\(--drive-name-min\)/);
 });
 
 // REQ-OPS-49: when the subsystems list is longer than its cell, the rows
