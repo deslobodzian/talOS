@@ -439,7 +439,7 @@ since `PhoenixBackend` and both simulated backends read a restoring CAN
 sensor valid (only a restoring motor invalid). Each masked motor still goes
 neutral and drives again only on a command observing a later State, while
 digital and PWM outputs keep applying and `robot_enabled` stays true. With
-no CAN sensor configured, a reset of every motor (the bench's one TalonFX) is
+no CAN sensor configured, a reset of every motor is
 total loss from the tick after it is found until its restore ends. Failed
 global Apply or backend configuration failure also neutralizes every output;
 individual device configuration or control-send failures do not. A rejected configuration push need not invalidate the active

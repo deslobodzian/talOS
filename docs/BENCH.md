@@ -1,12 +1,24 @@
-# One-Kraken bench bring-up
+# Bench bring-up
 
-Use `bench/` for a RoboRIO, Mac mini and one restrained Kraken X44. The bench
-config names only a TalonFX, not a motor model, and its `slot0` feedforward is
-provisional for any model.
-The RIO runs the existing generic gateway; no 2026 robot mechanisms are launched.
-Every checked-in bench config is **uncommissioned**. CAN id 1 is a placeholder,
-not a claim about the connected motor. Keep a spotter at DS disable and a safe
-power disconnect; neutral output does not instantly stop a coasting rotor.
+`bench/` is a RoboRIO, a Mac mini and five CAN devices, all on one CANivore
+bus named `Shooter` plugged into the RoboRIO. The ids and bus are the
+devices' own, read from them:
+
+| Device | CAN id | Node | Device name |
+|---|---:|---|---|
+| Talon FX (Kraken X44), the restrained bare motor | 1 | `motor` | `kraken` |
+| Talon FX (Kraken X60), swerve module drive | 5 | `swerve_module` | `drive` |
+| Talon FX (Kraken X44), swerve module steer | 6 | `swerve_module` | `steer` |
+| CANcoder, swerve module azimuth | 3 | `swerve_module` | `encoder` |
+| Pigeon 2 | 0 | `gyro` | `pigeon` |
+
+The RIO runs the existing generic gateway; no 2026 robot mechanisms are
+launched. Every checked-in bench config is **uncommissioned**. The bare
+motor's `slot0` feedforward is measured on it; the swerve module's
+reductions, gains, limits and CANcoder offset are provisional
+([its subsystem file](../bench/main_processor/configuration/subsystems/swerve_module.toml)).
+Keep a spotter at DS disable and a safe power disconnect; neutral output does
+not instantly stop a coasting rotor or wheel.
 
 For every trial record operator/date, config hash, Mini/RIO versions, wiring,
 DS mode, control inputs, session directory and RIO console output. Stop and
@@ -15,9 +27,21 @@ release all controls, and explicitly re-enable only after checking recovery.
 
 ## Build, network and deployment
 
-- [ ] Secure the bare motor, remove loose couplings, guard its shaft, provide
-  appropriate fused power/CAN termination, and leave DS disabled. Expected:
-  no motion or exposed rotating hazards. Record wiring, power supply and guard.
+- [ ] Secure the bare motor, remove loose couplings, guard its shaft, clamp
+  the swerve module with its wheel off the ground, mount the Pigeon flat,
+  provide appropriate fused power and CANivore termination, and leave DS
+  disabled. Expected: no motion or exposed rotating hazards. Record wiring,
+  power supply and guards.
+- [ ] Inspect the graph the bench launches. Three node packages:
+  [`motor`](../bench/main_processor/motor) (C++, or `motor.py` under
+  `robot_py.toml`) publishes `/motor/state`;
+  [`swerve_module`](../bench/main_processor/swerve_module) (C++) publishes
+  `/swerve_module/state`; [`gyro`](../bench/main_processor/gyro) (Python, an
+  observer that reads no target) publishes `/gyro/state`. Beside them run
+  the framework `teleop` (writes `/motor/target/teleop` and
+  `/swerve_module/target/teleop`), `telemetry` and `hardware_node`.
+  Expected: the `--describe-only` runs below describe exactly these six
+  nodes. Record the output.
 - [ ] Assign Mini `10.56.87.11` and RIO `10.56.87.2`; verify bidirectional
   connectivity. The RIO program's default companion address is the Mini's
   (on another network, see [below](#bench-on-another-network)).
@@ -34,8 +58,8 @@ release all controls, and explicitly re-enable only after checking recovery.
   `bench/main_processor/configuration/robot_py.toml`. Expected: valid graphs. Record output.
 - [ ] Before hardware deployment, run
   `bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot.toml --sim --start-sim-gateway --output-dir /tmp/bench-smoke --duration-s 20`.
-  Expected: motor, teleop, telemetry, hardware_node and the generic ideal sim
-  gateway remain running until normal shutdown; completed manifest has no
+  Expected: motor, swerve_module, gyro, teleop, telemetry, hardware_node and
+  the generic ideal sim gateway remain running until normal shutdown; completed manifest has no
   crashes/restarts or failed logs; the bridge heard the gateway:
   `bazel run //talOS/launcher:session_report -- /tmp/bench-smoke/<session-id>`
   shows **PASS** controller link (or `hardware_node.log`'s `states=` line is
@@ -94,7 +118,7 @@ run it without `--sim` (one-off, `--remote <roborio-ipv4>` on the plain
 `robot.toml` does the same):
 
 ```sh
-bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node //talOS/teleop:node //talOS/telemetry:node
+bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node //bench/main_processor/swerve_module:node //bench/main_processor/gyro:node //talOS/teleop:node //talOS/telemetry:node
 bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot_lan.toml --output-dir /tmp/bench-rio
 ```
 
@@ -108,15 +132,26 @@ Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
 ### Bench with the Python motor node
 
 [`robot_py.toml`](../bench/main_processor/configuration/robot_py.toml) is
-`robot.toml` with the motor node swapped for its Python twin,
+`robot.toml` with the bare motor's node swapped for its Python twin,
 [`motor.py`](../bench/main_processor/motor/motor.py) (same subsystem files,
 parameters, gating and `/motor/state`). Every check in this file applies
 unchanged; run it against the RIO with:
 
 ```sh
-bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node_py //talOS/teleop:node //talOS/telemetry:node
+bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node_py //bench/main_processor/swerve_module:node //bench/main_processor/gyro:node //talOS/teleop:node //talOS/telemetry:node
 bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot_py.toml --remote <roborio-ipv4> --output-dir /tmp/bench-rio-py
 ```
+
+### Identifying devices without Phoenix Tuner X
+
+- [ ] While a robot program (the gateway, or Phoenix's temporary diagnostics
+  program) runs on the RoboRIO, read the bus from its Phoenix diagnostic
+  server, from any machine on the network:
+  `curl 'http://<roborio>:1250/?action=getdevices'`. Each device's entry
+  gives its `ID`, `Model`, `Name`, `CurrentVers` and `CANivoreDevName`.
+  Expected: the five devices of the table above, each at its id, all on
+  `Shooter`. Record the response. The same server also takes write actions
+  (`setid`, `setname`); only a person at the bench uses those.
 
 ## Uncommissioned and disabled checks
 
@@ -132,15 +167,39 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
   ownership rejection counters should not grow. Expected: low state age once
   frames actually arrive; zero age before the first frame proves nothing.
   Record counters and state age, plus `/motor/state` connected/fault validity.
+- [ ] With the robot disabled and uncommissioned, read the three states.
+  Expected: all five devices report connected: `/motor/state` `connected`;
+  `/swerve_module/state` `drive_connected`, `steer_connected` and
+  `encoder_connected`; `/gyro/state` `connected` (with `hardware_fresh`).
+  Turn the module's azimuth by hand: `encoder_absolute_position_rot` and
+  `steer_position_rot` move together and by the same amount, since the
+  steer motor reads the CANcoder's frame (the absolute position wraps in
+  [-0.5, 0.5); the steer position does not). Turn the Pigeon
+  counter-clockwise seen from above: `yaw_rad` rises. Nothing moves under
+  power. Record the states and the angles turned.
 
 ## Human commissioning and first spin
 
-- [ ] With power safe and DS disabled, a human identifies the one physical
-  TalonFX in Phoenix Tuner X, checks firmware/CAN bus/id and inversion, and
-  sets the real CAN id/inversion in [the motor config](../bench/main_processor/configuration/subsystems/motor.toml).
-  Expected: exactly the intended Kraken resolves; positive demand and feedback
-  direction agree after the supervised spin. Record measured id, inversion and
-  firmware. Do not reuse an unchecked placeholder.
+- [ ] With power safe and DS disabled, a human checks every device's
+  firmware, bus and id against the table above (the
+  [device listing](#identifying-devices-without-phoenix-tuner-x) or Phoenix
+  Tuner X) and the bare motor's inversion in
+  [the motor config](../bench/main_processor/configuration/subsystems/motor.toml).
+  Expected: exactly the intended devices resolve; positive demand and
+  feedback direction agree after the supervised spin. Record ids, inversion
+  and firmware.
+- [ ] Before commissioning, a person enters the swerve module's drive
+  reduction (`[motors.drive] sensor_to_mechanism_ratio`; until then the
+  drive and `max_drive_velocity_rps` are in rotor units), its steer
+  reduction (`[motors.steer] rotor_to_sensor_ratio`, rotor rotations per
+  CANcoder rotation) and the CANcoder's `offset_rot` (heading 0 is the
+  module's forward) in
+  [its subsystem file](../bench/main_processor/configuration/subsystems/swerve_module.toml),
+  whose values are provisional until then, and checks each motor's and the
+  encoder's direction (`inverted`): a positive steer demand turns the wheel
+  the way `encoder_absolute_position_rot` rises, and a positive drive demand
+  rolls the wheel forward at heading 0. Record the reductions, the offset
+  and the directions.
 - [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling 4 V, node
   `max_bench_voltage_v = 2.0`, ratio 1.0, velocity ceiling 30 rps and slot0 gains
   (measured feedforward 0.095 V/rotor-rps). Expected: these match the bare
@@ -168,6 +227,25 @@ bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/r
   on release. Button 1 wins if both are held; buttons override axis mode.
   Record requested/measured speed, voltage, current and overshoot. A 4 V ceiling
   may prevent reaching 30 rps under load; do not raise limits automatically.
+- [ ] Swerve module, wheel off the ground. Its
+  [bindings](../bench/main_processor/configuration/subsystems/swerve_module.toml)
+  are hold-to-run: it moves only while button 6 is held; the axes alone
+  send a NEUTRAL target. Joystick 0 axis 4 asks the wheel heading
+  (`steer_angle_rot`, scale 0.25: a quarter turn either way at full stick,
+  in the CANcoder's frame, so a centred stick asks heading 0); axis 5 asks
+  the drive velocity, stick forward positive (`drive_velocity_rps`, scale
+  -10), which the node caps at `max_drive_velocity_rps` (10, in the drive's
+  configured unit); both have a 10% deadband. Each module motor's hardware
+  ceiling is `max_voltage` 4 V. First steer step: enable teleop, hold button
+  6 with axis 5 centred, move axis 4 a little, release, disable. Expected:
+  only the steer moves, to `commanded_steer_position_rot` by the short way;
+  `mode` DRIVE and `source` TELEOP only while held, NEUTRAL on release and
+  on disable. First drive spin: hold button 6, push axis 5 slightly
+  forward, release, disable. Expected: the wheel rolls forward at
+  `commanded_drive_velocity_rps` (`reversed` is true when the module took
+  the opposite heading and reversed the drive), neutral on release and on
+  disable. Record commanded and measured positions, velocities, voltages
+  and currents.
 
 `/motor/state` exposes position, velocity, applied voltage, stator current,
 supply current (`supply_current_a`), controller temperature (`temperature_degc`),
@@ -220,7 +298,7 @@ sleep precision. Releasing a lane is not a mechanical brake.
   bridge log maps to session time) beside `dmesg`'s link-up lines, the
   first State's arrival in the bridge log, config acknowledgment and fresh
   DS/target acceptance after safe recovery.
-- [ ] Reset the TalonFX alone (briefly interrupt its power) while DS is
+- [ ] Reset the bare motor's TalonFX (id 1) alone (briefly interrupt its power) while DS is
   disabled and the motor rests at least 10 rotations from 0, with
   `hardware_node --log` recording. Expected: in the first State whose motor
   position has restarted near 0, the motor is invalid and
@@ -282,18 +360,20 @@ sleep precision. Releasing a lane is not a mechanical brake.
   the session and the stall check above, and `rm` the file. Record late
   ticks, State intervals, Driver Station and CAN health under both; the
   decision is TODO.md RT-5.
-- [ ] Per-device tick cost. With the one motor configured and the robot
-  disabled, record three consecutive `[rio] tick phases` console lines
-  (one per 10 s; [format](../talOS/hardware/README.md)): each phase's mean
-  and max in µs, and the motor and sensor counts. Then, with the bridge
-  running, record `/hw/status` `can_utilization_frac` with the config's
-  `status_hz` at 200, then at 50 (reconfigure between). For a robot
-  estimate (16 Talon FX and 4 CANcoders) scale the refresh and devices
-  phases per device by 20, control per motor by 16, keep health, other, link, driver
-  station and loop as measured, and scale `can_utilization_frac` per device at each rate by
-  20; compare with the 5 ms period and a full bus. A one-motor bench gives
-  no per-device slope (a fixed cost per call is counted as per device), so
-  the estimate is an upper bound. The decision is TODO.md RT-5.
+- [ ] Per-device tick cost. With the bench's three motors and two sensors
+  configured and the robot disabled, record three consecutive `[rio] tick
+  phases` console lines (one per 10 s; [format](../talOS/hardware/README.md)):
+  each phase's mean and max in µs, and the motor and sensor counts. Then,
+  with the bridge running, record `/hw/status` `can_utilization_frac` with
+  the config's `status_hz` at 200, then at 50 (reconfigure between). For a
+  robot estimate (16 Talon FX and 4 CANcoders) scale the refresh and devices
+  phases per device (the measured phase over the bench's five devices) by
+  20, control per motor (over its three motors) by 16, keep health, other,
+  link, driver station and loop as measured, and scale
+  `can_utilization_frac` per device at each rate by 20; compare with the
+  5 ms period and a full bus. One device count gives no per-device slope (a
+  fixed cost per call is counted as per device), so the estimate is an
+  upper bound. The decision is TODO.md RT-5.
 - [ ] Capture representative enabled sessions, fetch them (below) and run
   `bazel run //talOS/launcher:session_report -- --strict <session-dir>`.
   Expected: `/hw/state` median about 5 ms, p99 <10 ms, no 100 ms gap while
@@ -344,7 +424,7 @@ sleep precision. Releasing a lane is not a mechanical brake.
   `./tools/deploy.sh enable-boot --user <service-account>`. Inspect
   `sudo launchctl print system/org.talos.robot`, then reboot the Mini with
   nobody logged in. Expected: one installed stack starts using the bench
-  address, logs are writable without repair, config hash matches, and the motor
-  remains neutral while disabled. Record launchd status, boot session and
+  address, logs are writable without repair, config hash matches, and every
+  motor remains neutral while disabled. Record launchd status, boot session and
   disabled observations. For regression use `./tools/deploy.sh rollback`,
   stop/restart, and recheck the selected whole-bundle hash before use.
