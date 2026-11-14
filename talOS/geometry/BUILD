@@ -4,8 +4,9 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
 package(default_visibility = ["//visibility:public"])
 
-# Header-only Lie groups (SO2/SE2/SO3/SE3) on Eigen. No sources, no
-# state: every consumer pays only for what it inlines.
+# Header-only Lie groups (SO2/SE2/SO3/SE3) on Eigen, and the swerve module
+# setpoint built on SO2. No sources, no state: every consumer pays only for
+# what it inlines.
 cc_library(
     name = "geometry",
     hdrs = [
@@ -14,6 +15,7 @@ cc_library(
         "se3.h",
         "so2.h",
         "so3.h",
+        "swerve_module.h",
     ],
     deps = ["@eigen3//:eigen"],
 )
@@ -22,6 +24,17 @@ cc_test(
     name = "geometry_test",
     size = "small",
     srcs = ["geometry_test.cc"],
+    deps = [
+        ":geometry",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "swerve_module_test",
+    size = "small",
+    srcs = ["swerve_module_test.cc"],
     deps = [
         ":geometry",
         "@googletest//:gtest",
