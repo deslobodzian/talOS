@@ -1,8 +1,10 @@
 # talOS/mechanisms
 
-Configured building blocks for the common FRC mechanisms, so a subsystem node
-is a thin wrapper: a target lane in, a state out, and one library object that
-does the control, homing, readiness and fault handling.
+Optional configured building blocks for the common FRC mechanisms: a
+subsystem node that uses one is a thin wrapper (a target lane in, a state out,
+and one library object that does the control, homing, readiness and fault
+handling), and a node may instead drive its devices directly
+([writing the arm yourself](../../docs/FIRST_MECHANISM.md#writing-the-arm-yourself)).
 
 | Class | For | State message |
 |---|---|---|
