@@ -1,10 +1,14 @@
 """Unit tests for //tools:new_subsystem."""
 
+import contextlib
+import io
 import os
 import re
 import tempfile
+import textwrap
 import tomllib
 import unittest
+from unittest import mock
 
 from tools import new_subsystem
 
@@ -162,6 +166,61 @@ class NewSubsystemTest(unittest.TestCase):
                  practice])
             self.assertIn('    "//custom-bot/main_processor/wrist:node",\n',
                           by_rel[practice])
+
+    # REQ-DEV-01
+    def test_each_mechanism_gets_its_own_teleop_button(self):
+        # Two mechanisms on one button both move on one press. Each scaffold
+        # binds a button no other binding of the robot uses: neither one
+        # live in the simulation config (the first mechanism's, appended as
+        # its `Next:` says) nor one still commented in a subsystem file (the
+        # second's, not appended yet). Its `Next:` runs the simulation with
+        # that button held.
+        with tempfile.TemporaryDirectory() as root:
+            configuration = os.path.join(root, "bot", "main_processor",
+                                         "configuration")
+            os.makedirs(os.path.join(configuration, "subsystems"))
+            sim = os.path.join(configuration, "robot_sim.toml")
+            for path, text in (
+                    ("BUILD", ""),
+                    ("robot.toml",
+                     '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                     'name = "teleop"\npath = "subsystems/teleop.toml"\n'),
+                    ("subsystems/teleop.toml",
+                     '[subsystem]\nname = "teleop"\n'
+                     'node = "//talOS/teleop:node"\n'),
+                    ("robot_sim.toml", new_subsystem.fill(
+                        new_subsystem.SIM_CONFIG_HEADER,
+                        CONFIG="bot/main_processor/configuration/"
+                        "robot_sim.toml")),
+                    ("robot_sim_manifest.bzl", "")):
+                with open(os.path.join(configuration, path), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+
+            def scaffold(name, *args):
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=root), \
+                        contextlib.redirect_stdout(out):
+                    status = new_subsystem.main(
+                        [name, "--robot", "bot", *args])
+                self.assertEqual(status, 0, out.getvalue())
+                return out.getvalue()
+
+            def button(steps):
+                (bound,) = re.findall(r"^ +button = (\d+)$", steps, re.M)
+                (mask,) = re.findall(r"\|3:axes=0;buttons=(\d+);", steps)
+                self.assertEqual(int(mask), 1 << (int(bound) - 1), steps)
+                return int(bound)
+
+            first = scaffold("wrist", "--lang", "py")
+            block = first.split("gains zero:\n")[1].split("  Then")[0]
+            with open(sim, "a", encoding="utf-8") as f:
+                f.write(textwrap.dedent(block))
+            second = scaffold("arm", "--lang", "cpp", "--type", "position")
+            third = scaffold("roller", "--lang", "py")
+            buttons = [button(steps) for steps in (first, second, third)]
+            self.assertEqual(len(set(buttons)), 3, buttons)
 
     def test_plan_sees_inherited_subsystems_and_can_ids(self):
         # Ids and names reach robot.toml only through an include, a custom

@@ -15,7 +15,10 @@ configuration/robot.toml, and regenerates configuration/robot_manifest.bzl
 (//tools:sync_manifest), which the bundle and graph test read, plus the
 manifest of every other config in the robot that includes robot.toml.
 Names and CAN ids already taken are read from the effective config, so a
-subsystem inherited through `include`, `defaults` or a custom `path` counts.
+subsystem inherited through `include`, `defaults` or a custom `path` counts;
+the teleop binding it writes commented, and its `Next:` simulation block,
+take the lowest joystick 0 button from 3 that no other binding of the robot
+(live, or commented in a subsystem file) uses.
 Everything is checked before anything is written, so a refused run leaves the
 tree untouched. --standalone writes the package as its own Bzlmod repository
 in DIR instead, building against this checkout.
@@ -30,6 +33,7 @@ import argparse
 import difflib
 import keyword
 import os
+import re
 import sys
 import textwrap
 import tomllib
@@ -83,6 +87,13 @@ LONGEST_LANE = "teleop"
 PERIOD_US = 20000
 MAX_CAN_ID = 62  # 63 is the CAN broadcast id
 MAX_DIO = 31  # talOS/hardware/config.cc: DIO channels 0..31
+# The joystick 0 buttons a scaffold's teleop binding may take, lowest first
+# (talOS/teleop/README.md: buttons 1..32). It starts at 3, the button every
+# scaffold took before it skipped the ones a robot already binds.
+TELEOP_BUTTONS = range(3, 33)
+# The teleop node's own subsystem file, whose comments show a binding as an
+# example; no button of its is taken.
+TELEOP_NODE = "//talOS/teleop:node"
 # Keys of a subsystem file that the framework reads or refuses
 # (talOS/configuration/config_parser.h: kFrameworkSubsystemKeys and
 # CheckSubsystemKeys' singular spellings), and its [subsystem] header. A
@@ -1289,7 +1300,7 @@ period_us = @PERIOD@
 # mechanism: every config of this robot reads this file. A simulation-only
 # binding goes in the simulation-only config new_subsystem's `Next:` names.
 # [[teleop.bindings]]
-# button = 3
+# button = @BUTTON@
 # while_held = { velocity_rps = 20.0 }
 
 # Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
@@ -1368,7 +1379,7 @@ home_samples = 3
 # mechanism: every config of this robot reads this file. A simulation-only
 # binding goes in the simulation-only config new_subsystem's `Next:` names.
 # [[teleop.bindings]]
-# button = 3
+# button = @BUTTON@
 # while_held = { position_rot = 0.0 }
 
 # Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
@@ -2440,6 +2451,66 @@ def used_dio_channels(subsystems):
     return channels
 
 
+# A binding a subsystem file keeps commented until its gains are tuned, as
+# this scaffold writes it: `# [[teleop.bindings]]` and its `# key = value`
+# lines.
+COMMENTED_BINDING = re.compile(
+    r"^#[ \t]*\[\[teleop\.bindings\]\][ \t]*\n((?:#[ \t]*\w+[ \t]*=.*\n)*)",
+    re.M)
+
+
+def teleop_button(root, robot):
+    """The lowest of TELEOP_BUTTONS that no joystick 0 button of `robot`
+    takes: a [[teleop.bindings]] button in the effective view of robot.toml
+    or of its simulation config, one still commented in a file they read,
+    or a node's `*_button_id` parameter (driver's rezero_button_id)."""
+    configuration = f"{robot}/main_processor/configuration"
+    configs = [f"{configuration}/robot.toml"]
+    sim, sim_exists = sim_config(root, robot)
+    if sim_exists:
+        configs.append(sim)
+    taken, files = set(), set()
+    for config in configs:
+        try:
+            subsystems, read_files = sync_manifest.effective(root, config)
+        except sync_manifest.ManifestError as err:
+            raise Refused(f"cannot read {config}: {err}")
+        files.update([config, *read_files])
+        for table in subsystems.values():
+            for binding in table.get("teleop", {}).get("bindings", []):
+                if (binding.get("port", 0) == 0
+                        and isinstance(binding.get("button"), int)):
+                    taken.add(binding["button"])
+            taken.update(value for key, value in table.items()
+                         if key.endswith("_button_id")
+                         and isinstance(value, int))
+    binding_files = []
+    for path in sorted(files):
+        with open(os.path.join(root, path), encoding="utf-8") as f:
+            text = f.read()
+        try:
+            header = tomllib.loads(text).get("subsystem", {})
+        except tomllib.TOMLDecodeError:
+            header = {}
+        if header.get("node") == TELEOP_NODE:
+            continue
+        if "teleop.bindings" in text or "_button_id" in text:
+            binding_files.append(path)
+        for match in COMMENTED_BINDING.finditer(text):
+            keys = dict(re.findall(r"^#[ \t]*(\w+)[ \t]*=[ \t]*(\S+)",
+                                   match.group(1), re.M))
+            if keys.get("port", "0") == "0" and keys.get("button",
+                                                         "").isdigit():
+                taken.add(int(keys["button"]))
+    button = next((b for b in TELEOP_BUTTONS if b not in taken), None)
+    if button is None:
+        raise Refused(
+            f"every joystick 0 button {TELEOP_BUTTONS[0]}.."
+            f"{TELEOP_BUTTONS[-1]} is bound (live or commented) in "
+            f"{', '.join(binding_files)}; free one for the new binding")
+    return button
+
+
 def plan(root, robot, name, lang, kind="velocity"):
     """([(path, old content or None, new content)], placeholder CAN id, or
     None for an estimator, which owns no devices)."""
@@ -2464,8 +2535,9 @@ def plan(root, robot, name, lang, kind="velocity"):
     if name in subsystems:
         raise Refused(f"{config} already has subsystem '{name}'")
 
-    can_id = None
+    can_id = button = None
     if kind != "estimator":
+        button = teleop_button(root, robot)
         used = used_can_ids(subsystems)
         can_id = next((i for i in range(1, MAX_CAN_ID + 1) if i not in used),
                       None)
@@ -2488,7 +2560,7 @@ def plan(root, robot, name, lang, kind="velocity"):
          "estimator": ESTIMATOR_SUBSYSTEM_TOML}[kind],
         NAME=name, PASCAL=pascal(name), ROBOT=robot,
         PACKAGE=f"{robot}/main_processor/{name}", PERIOD=PERIOD_US,
-        CAN_ID=can_id, DIO=dio)
+        CAN_ID=can_id, DIO=dio, BUTTON=button)
     writes.append((subsystem_toml, None, subsystem))
 
     old = read(robot_toml)
@@ -2585,15 +2657,24 @@ def show(root, writes):
 
 
 # What ./sim.sh drives a scaffold with: teleop after a second disabled, and
-# joystick 0's button 3 (bit 2) pressed from second 3 to second 6, after a
-# neutral sample that arms the teleop lane (talos::OperatorArming).
+# joystick 0's button (button 3: bit 2) pressed from second 3 to second 6,
+# after a neutral sample that arms the teleop lane (talos::OperatorArming).
 SIM_DURATION_S = 8
 MODE_SCHEDULE = "disabled:1,teleop:10"
-JOYSTICK_SCHEDULE = ("0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=4;pov=-1|"
-                     "6:axes=0;buttons=0;pov=-1")
-SIM_RUN = (f"--sim-gateway --no-studio --duration-s {SIM_DURATION_S} "
-           f"--mode-schedule '{MODE_SCHEDULE}' \\\n      "
-           f"--joystick-schedule '{JOYSTICK_SCHEDULE}'")
+
+
+def joystick_schedule(button):
+    return (f"0:axes=0;buttons=0;pov=-1|3:axes=0;buttons={1 << (button - 1)};"
+            "pov=-1|6:axes=0;buttons=0;pov=-1")
+
+
+JOYSTICK_SCHEDULE = joystick_schedule(TELEOP_BUTTONS[0])
+
+
+def sim_run(button):
+    return (f"--sim-gateway --no-studio --duration-s {SIM_DURATION_S} "
+            f"--mode-schedule '{MODE_SCHEDULE}' \\\n      "
+            f"--joystick-schedule '{joystick_schedule(button)}'")
 
 
 # The robot's simulation-only configs, in the order next_steps looks for
@@ -2623,9 +2704,10 @@ def sim_config(root, robot):
     return f"{configuration}/{SIM_CONFIGS[0]}", False
 
 
-def simulation_block(name, kind):
+def simulation_block(name, kind, button=TELEOP_BUTTONS[0]):
     """The TOML a student appends to the robot's simulation config so that
-    `name` moves under `./sim.sh --sim-gateway` with button 3 held.
+    `name` moves under `./sim.sh --sim-gateway` with joystick 0's `button`
+    held (teleop_button's choice).
 
     The values go there, not in the subsystem file, because the robot's own
     configs never read the simulation config: a live button binding, gains
@@ -2644,9 +2726,9 @@ def simulation_block(name, kind):
     block = f"""\
 # {name}: simulation values only. robot.toml never reads this file; before
 # a real robot drives the {name}, tune slot0 on the mechanism{measure}.
-# Holding joystick button 3 writes {demand} on {lane}.
+# Holding joystick button {button} writes {demand} on {lane}.
 [[{sub}.teleop.bindings]]
-button = 3
+button = {button}
 while_held = {{ {demand} }}
 # Until an autonomous node writes /{name}/target/auto, the binding is the
 # {name}'s only producer; a policy that lists "auto" with
@@ -2680,11 +2762,12 @@ slot0 = {{ {zero.replace("v = 0.0", "v = 0.12")} }}
 
 
 def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
-               golden_test=False, sim=None):
+               golden_test=False, sim=None, button=TELEOP_BUTTONS[0]):
     """What to do after scaffolding `name` into `robot`. `golden_test`: the
     robot pins its hardware config in configuration/config_golden_test.cc
     (2026-robot does; a new_robot robot does not). `sim`: sim_config's
-    (path, exists) for the robot; default, a robot_sim.toml that exists."""
+    (path, exists) for the robot; default, a robot_sim.toml that exists.
+    `button`: teleop_button's choice for the robot before the scaffold."""
     del lang  # both languages' nodes read the same keys
     package = f"//{robot}/main_processor/{name}"
     configuration = f"{robot}/main_processor/configuration"
@@ -2701,7 +2784,7 @@ Next:
   {subsystem}
     List the camera nodes in `cameras`; point telemetry at the pose with
     [studio] pose_topic = "/{name}/state"."""
-    lines = simulation_block(name, kind)
+    lines = simulation_block(name, kind, button)
     if sim_exists:
         step, manifest = "append these lines to", ""
     else:
@@ -2730,10 +2813,10 @@ Next:
   the simulation-only config; {subsystem}
   keeps its binding commented and its gains zero:
 {lines}{manifest}
-  Then check the graph and run it (button 3 held from second 3 to 6):
+  Then check the graph and run it (button {button} held from second 3 to 6):
 {build}
   bazel run //talOS/launcher -- --config $PWD/{sim_path} --describe-only
-  ./sim.sh --config {sim_path} {SIM_RUN}
+  ./sim.sh --config {sim_path} {sim_run(button)}
   Before a real robot drives the motor, in {subsystem}:
     can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
     Tune slot0 on the mechanism before uncommenting its teleop binding.{golden}"""
@@ -2799,6 +2882,9 @@ def main(argv):
         else:
             writes, can_id = plan(root, args.robot, args.name, args.lang,
                                   kind=args.kind)
+            # Plan's choice, from the robot as it stands before the writes.
+            button = (teleop_button(root, args.robot)
+                      if can_id is not None else None)
     except Refused as refused:
         print(f"new_subsystem: refused: {refused}", file=sys.stderr)
         return 1
@@ -2820,7 +2906,7 @@ def main(argv):
             root, args.robot, "main_processor", "configuration",
             "config_golden_test.cc"))
         print(next_steps(args.robot, args.name, can_id, args.kind, args.lang,
-                         golden_test, sim_config(root, args.robot)))
+                         golden_test, sim_config(root, args.robot), button))
     return 0
 
 
