@@ -717,7 +717,18 @@ CC_POSITION_PARAMETERS = """\
 # mechanism's phase reaches /@NAME@/state. The homing rules themselves are
 # talOS/mechanisms' and tested there.
 CC_POSITION_TESTS = """\
-// Homing. The values are testdata/@NAME@.toml's.
+// The mechanism library's behaviour. The tests from here to the binary test
+// cover what talos::mechanisms::PositionMechanism does for this node: it
+// homes on the switch before the first goal, counts positions from there,
+// clamps goals to min_rot..max_rot and latches FAILED when homing does not
+// move. If you drive the Motor yourself instead, replace them with tests of
+// your own behaviour. The tests above are the node test matrix
+// (docs/TESTING.md §7) that every actuator node keeps; they expect Motion
+// Magic requests (Mode::kMotionMagic), PositionMechanism's mode, so change
+// that if your node drives another, and replace the matrix's n/a 9 with
+// BadParameterFailsConstruction once the node reads parameters of its own.
+//
+// The values are testdata/@NAME@.toml's.
 constexpr double kHomingVolts = -1.0;
 constexpr double kMaxRot = 100.0;
 
@@ -1176,7 +1187,19 @@ PY_POSITION_PARAMETERS = '''\
 # mechanism's phase reaches /@NAME@/state). The homing rules themselves are
 # talOS/mechanisms' and tested there.
 PY_POSITION_TESTS = '''
-    # Homing. The values are testdata/robot.toml's (homing_v = -1.0,
+    # The mechanism library's behaviour. The tests from here to BinaryTest
+    # cover what talos.mechanisms.PositionMechanism does for this node: it
+    # homes on the switch before the first goal, counts positions from
+    # there, clamps goals to min_rot..max_rot and latches FAILED when homing
+    # does not move. If you drive the Motor yourself instead, replace them
+    # with tests of your own behaviour. The tests above are the node test
+    # matrix (docs/TESTING.md §7) that every actuator node keeps; they expect
+    # Motion Magic requests (talos.Mode.MOTION_MAGIC), PositionMechanism's
+    # mode, so change that if your node drives another, and replace the
+    # matrix's n/a 9 with test_bad_parameter_fails_construction once the
+    # node reads parameters of its own.
+    #
+    # The values are testdata/robot.toml's (homing_v = -1.0,
     # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor
     # at rest.
 

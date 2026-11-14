@@ -252,7 +252,18 @@ TEST_F(PositionCppTest, UpdateDoesNotAllocate) {
   EXPECT_EQ(Request(), Mode::kMotionMagic);
 }
 
-// Homing. The values are testdata/position_cpp.toml's.
+// The mechanism library's behaviour. The tests from here to the binary test
+// cover what talos::mechanisms::PositionMechanism does for this node: it
+// homes on the switch before the first goal, counts positions from there,
+// clamps goals to min_rot..max_rot and latches FAILED when homing does not
+// move. If you drive the Motor yourself instead, replace them with tests of
+// your own behaviour. The tests above are the node test matrix
+// (docs/TESTING.md §7) that every actuator node keeps; they expect Motion
+// Magic requests (Mode::kMotionMagic), PositionMechanism's mode, so change
+// that if your node drives another, and replace the matrix's n/a 9 with
+// BadParameterFailsConstruction once the node reads parameters of its own.
+//
+// The values are testdata/position_cpp.toml's.
 constexpr double kHomingVolts = -1.0;
 constexpr double kMaxRot = 100.0;
 
