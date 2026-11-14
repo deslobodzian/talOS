@@ -1,0 +1,44 @@
+namespace swerve_module;
+enum ModuleMode : ubyte { NEUTRAL = 0, DRIVE = 1 }
+enum TargetSource : ubyte { NONE, TELEOP }
+
+struct ModuleTarget {
+  mode:ModuleMode;
+  // The drive motor's configured mechanism unit (rotor rotations until the
+  // module's drive reduction is entered in the subsystem file).
+  drive_velocity_rps:double;
+  // Asked wheel heading in the CANcoder's frame.
+  steer_angle_rot:double;
+}
+
+struct ModuleState {
+  sample_time_ns:uint64;
+  // Age of the hardware state the feedback below came from; UINT64_MAX while
+  // no fresh state has arrived.
+  hardware_age_us:uint64;
+  drive_position_rot:double;
+  drive_velocity_rps:double;
+  drive_applied_voltage_v:double;
+  drive_stator_current_a:double;
+  // The steer motor's position closes on the remote CANcoder, so it is the
+  // CANcoder's (unwrapped) frame.
+  steer_position_rot:double;
+  steer_velocity_rps:double;
+  steer_applied_voltage_v:double;
+  steer_stator_current_a:double;
+  // The CANcoder's absolute position, in [-0.5, 0.5).
+  encoder_absolute_position_rot:double;
+  encoder_velocity_rps:double;
+  // The setpoint after geometry::OptimizeSwerveModule while mode is DRIVE;
+  // 0 otherwise.
+  commanded_drive_velocity_rps:double;
+  commanded_steer_position_rot:double;
+  drive_connected:bool;
+  steer_connected:bool;
+  encoder_connected:bool;
+  enabled:bool;
+  mode:ModuleMode;
+  source:TargetSource;
+  // The module took the opposite heading and reversed the drive.
+  reversed:bool;
+}
