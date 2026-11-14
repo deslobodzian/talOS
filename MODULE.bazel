@@ -43,6 +43,8 @@ bazel_dep(name = "tomlplusplus", version = "3.4.0")
 # NDEBUG; and any non-ASCII character in buckets its whitespace classifier
 # leaves unfiltered (U+00B1 '±' in our own vision.toml comments) reaches
 # TOML_UNREACHABLE. Regressions: //talOS/configuration:config_fuzz_test.
+# The patch also marks toml.hpp a system header (`#pragma GCC system_header`),
+# so its deprecation warnings do not fill every build that includes it.
 single_version_override(
     module_name = "tomlplusplus",
     patch_strip = 1,
