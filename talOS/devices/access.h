@@ -73,7 +73,8 @@ struct HardwareAccess {
   // The latched sample for a device; all zeros (valid == false) until an
   // accepted hardware state carries it. A motor's, CAN sensor's or encoder's
   // invalid sample carries the last valid position instead of its own
-  // (devices.h); a motor's and CAN sensor's position is in the rezero frame.
+  // (devices.h); a motor's and CAN sensor's position is in the rezero frame,
+  // and on a stale state its sample is invalid with MarkInvalid's zeros.
   static hardware::MotorSample motor_sample(const HardwareLink& link,
                                             std::size_t index);
   // Motor::forward_limit / reverse_limit: the sample's hardware-limit fault
