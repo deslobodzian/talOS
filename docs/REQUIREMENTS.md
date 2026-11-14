@@ -245,6 +245,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-23 | `new_robot <name> --mechanism <m> --lang cpp\|py` (or `--no-mechanism`, a robot with no device) writes a robot beside `2026-robot/` (config with teleop and telemetry, generated manifest, `manifest_sync_test`, `talos_graph_test`, `talos_bundle`, its first mechanism unless `--no-mechanism`) that passes `--describe-only` and its own tests as generated. `sim.sh --config` runs any robot config and refuses a stale manifest, naming the regenerate command. | P1 | ARCH "Where a new thing goes" | generated tree; `--describe-only` exit status | integration |
 | REQ-DEV-24 | Both simulated gateway backends (the ideal `SimBackend` and `PhysicsSimBackend`) report the chain a restore reapplies invalid from the reset until a restore completes, and keep it invalid while restores fail, as `PhoenixBackend` does, so a simulated restore faults, ends the command in force and starts a new epoch exactly when the robot would. | P2 | HR "Simulation Backends: Ideal vs Physics-Backed" | backend state; State validity | component |
 | REQ-DEV-25 | `tools/prepush.sh` runs RULES.md 11's pre-push checks on a clean worktree of the commit under CI's conditions (tracked files read-only by the step CI itself runs, no cached test result, no compile reading a host package header) and exits nonzero naming each failed or skipped step, leaving the checkout unchanged. | P1 | RULES 11; `docs/DEVELOPMENT.md` §5; TEST §9 | step lines and exit status | integration |
+| REQ-DEV-26 | `geometry::OptimizeSwerveModule` turns an asked wheel speed and heading into the equivalent setpoint whose steering change from the measured angle is at most a quarter turn, reversing the speed when it takes the opposite heading, and scales the speed by the cosine of that steering change, never below zero; a non-finite input gives zero speed and no steering change. The 2026 drivetrain and the bench swerve module node take their module setpoints from it, so one implementation is exercised in simulation and on the bench. | P1 | ARCH "Layers"; `talOS/geometry/README.md` | returned speed, steering change and `reversed` | unit |
 
 ## Package scope
 
@@ -268,7 +269,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09 |
 | `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09, REQ-OPS-48 |
-| `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27 |
+| `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27, REQ-DEV-26 |
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22, REQ-OPS-35, REQ-OPS-37, REQ-OPS-38, REQ-OPS-39 |
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
 | `talOS/trajectory` | REQ-DEV-13 to REQ-DEV-15, REQ-DEV-20; REQ-RT-06 for the calls an `update()` makes (`sample`, `EventCursor::advance`, `HolonomicFollower::step`, `assign` within `reserve`, `MakeStraightLine`) |
@@ -282,7 +283,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/main_processor/pose_estimator` | REQ-CONTRACT-26; its second backend: none beyond it (TODO.md SCOPE-1) |
 | `2026-robot/main_processor/vision` | REQ-CONTRACT-27 |
 | `2026-robot/main_processor/simulation` | REQ-DEV-05, REQ-DEV-06; composition evidence for REQ-SAFE-31, REQ-SAFE-33 |
-| `2026-robot/main_processor/configuration`, `bench` | REQ-SAFE-26, REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15 |
+| `2026-robot/main_processor/configuration`, `bench` | REQ-SAFE-26, REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15; the bench nodes: REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-DEV-26 (swerve module) |
 | `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
