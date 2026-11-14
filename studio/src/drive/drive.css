@@ -239,9 +239,12 @@ ul { list-style: none; margin: 0; padding: 0; }
 /* List rows: one fixed height, in as many columns of at least
  * --drive-*-column as the cell's width holds. A row too narrow for its
  * content gives up width in this order: its notes (restarts, drives) to
- * nothing, then its name down to --drive-name-min-ch (ellipsized; the full
- * name is its tooltip), and only then its state word (ellipsized).
- * nameCharsShown in view.ts models this. */
+ * nothing, then its name down to --drive-name-min (ellipsized; the full
+ * name is its tooltip). Its state word never shrinks (flex: none, no
+ * ellipsis): a flex item that may shrink takes a share of any overflow,
+ * however small its factor. A column narrower than the name's floor, the
+ * gaps and the word clips the word at the row's edge, unmarked; the 2026
+ * layout's columns hold them (nameCharsShown in view.ts models this). */
 .nodes, .checks {
   display: grid;
   column-gap: var(--drive-list-gap);
@@ -263,14 +266,13 @@ ul { list-style: none; margin: 0; padding: 0; }
 }
 .alerts li > *, .nodes li > *, .checks li > * { flex: none; }
 .alerts .name, .nodes .name, .checks .name,
-.alerts .meta, .nodes .meta, .nodes .tag, .checks .tag {
+.alerts .meta, .nodes .meta {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .alerts .meta, .nodes .meta { flex: 0 10000 auto; margin-left: 0; }
-.alerts .name, .nodes .name, .checks .name { flex: 0 100 auto; min-width: var(--drive-name-min-ch); }
-.nodes .tag, .checks .tag { flex: 0 1 auto; }
+.alerts .name, .nodes .name, .checks .name { flex: 0 100 auto; min-width: var(--drive-name-min); }
 .alerts .level { font-weight: 800; font-size: var(--drive-tag-font); margin-right: 4px; }
 .alert-error .level { color: var(--bad); }
 .alert-warning .level { color: var(--warn); }

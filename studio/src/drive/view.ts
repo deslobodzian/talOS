@@ -550,7 +550,7 @@ export const METRICS = {
   item_gap: 4,        // between a row's name, state word and notes
   tag_pad_x: 5,       // a state word's padding left and right
   tag_border: 1.5,    // and its border
-  name_min_ch: 8      // a row's name never narrower (in ch), the word shrinks first
+  name_min: 64        // a row's name never narrower: 8 characters at GLYPH_PX.name; its word never shrinks
 } as const;
 
 // Glyph widths in px, a model the stylesheet cannot state: an average
@@ -562,7 +562,7 @@ export const GLYPH_PX = {name: 8, tag: 8} as const;
 
 export function pageStyle(): string {
   return Object.entries(METRICS)
-      .map(([name, n]) => `--drive-${name.replace(/_/g, '-')}:${n}${name.endsWith('_ch') ? 'ch' : 'px'}`)
+      .map(([name, n]) => `--drive-${name.replace(/_/g, '-')}:${n}px`)
       .join(';');
 }
 

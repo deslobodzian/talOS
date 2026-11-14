@@ -170,10 +170,11 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720
   (two of 9), and its pre-match cell 12 and 10: computed, not measured in a
   browser. A row too narrow gives up its note (restarts, drives) first, then
-  its name down to 8 ch (ellipsized; the tooltip has the whole name and the
-  note), and only then its state word. With 8 px per character assumed
-  (`GLYPH_PX`, a model), the 2026 subsystems columns are 154 px (143 px at
-  1280x720) and the worst row, `FAILING` with a note, still shows 8
+  its name down to 64 px (ellipsized; the tooltip has the whole name and the
+  note); its state word never shrinks or ellipsizes, so a column narrower than
+  the name's floor, the gaps and the word cuts the word at the row's edge.
+  With 8 px per character assumed (`GLYPH_PX`, a model), the 2026
+  subsystems columns are 154 px (143 px at 1280x720) and the worst row, `FAILING` with a note, still shows 8
   characters of its name (7 at 1280x720), enough to tell
   `front_left_camera` from `front_right_camera`.
 - A widget kind it does not draw is an "Unsupported widget" cell, and one
