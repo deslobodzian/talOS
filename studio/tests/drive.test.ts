@@ -189,7 +189,7 @@ test('renders every widget of the 2026 layout in its cell', () => {
   assert.match(checks, /tag-bad">FAIL<\/span><span class="name"[^>]*>Commissioned/);
 });
 
-// REQ-OPS-39: a widget this page cannot draw is never a silent blank: a kind
+// REQ-OPS-49: a widget this page cannot draw is never a silent blank: a kind
 // it does not draw is a visible cell, and one with no cell it can read (a
 // layout from another version) is counted on the status line.
 test('a widget the page cannot draw is shown, never a silent blank', () => {
@@ -765,8 +765,8 @@ test('a summary from a previous socket reads stale until a new one arrives', () 
   assert.doesNotMatch(widgetHtml(render(h), 'Subsystems'), /STALE/);
 });
 
-// Every string from the layout, the dictionary or the summary is escaped
-// where it is drawn: a name with markup in it is shown as text and never
+// REQ-OPS-49: every string from the layout, the dictionary or the summary is
+// escaped where it is drawn: a name with markup in it is shown as text and never
 // becomes markup on the page the drive team reads.
 test('markup in every drawn string is escaped', () => {
   const markers = {
@@ -806,7 +806,7 @@ test('markup in every drawn string is escaped', () => {
   }
 });
 
-// REQ-OPS-36: a subsystems widget that names its nodes shows each of them. A
+// REQ-OPS-49: a subsystems widget that names its nodes shows each of them. A
 // named node the summary does not list (cut off by `omitted`, or not in the
 // session) reads unknown, never vanishes, and "+N more" never counts nodes
 // the widget would not show.
@@ -886,7 +886,7 @@ test('a 2026 subsystems row keeps a readable name beside its widest state word',
   }
 });
 
-// REQ-OPS-36: when the subsystems list is longer than its cell, the rows
+// REQ-OPS-49: when the subsystems list is longer than its cell, the rows
 // that matter come first: failed nodes (critical before not), then one
 // driving from a target lane, then critical ones, then the rest.
 test('subsystems rows put failed and driving nodes first', () => {
@@ -990,10 +990,12 @@ test('the out-of-view count of a scrolled list', () => {
   assert.equal(outOfViewText({above: 0, below: 0}), '');
 });
 
-// REQ-OPS-36: a drawing fault must not leave the last grid looking current:
-// the frame says so on the status line and marks the grid, and the next good
-// draw repaints both even when it draws the same text as before the fault.
-test('a drawing error marks the grid and the next draw repaints it', () => {
+// REQ-OPS-49, REQ-OPS-36: a drawing fault is named on the status line and
+// must not leave the last grid looking current: the frame says so there and
+// marks the grid, which keeps its elements. The next good draw clears the
+// mark and repaints the status line, even when it draws the same text as
+// before the fault.
+test('a drawing error marks the grid and the next good draw clears it', () => {
   const {page, surface} = fakeSurface();
   const painter = new Painter(surface);
   const good = () => ({status: '<div>status</div>', widgets: ['<section>grid</section>']});

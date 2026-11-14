@@ -174,7 +174,7 @@ TEST(DriveFeed, SendsTheDictionaryThenOnlyItsMask) {
   }
 }
 
-// REQ-OPS-36
+// REQ-OPS-35
 // The RoboRIO link's alert channel reaches a drive client whatever the
 // layout's widgets, so the page can name a lost link: a layout with no
 // `alerts` widget gets it beside its own channel, and one with an `alerts`
