@@ -112,8 +112,12 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::vector<uint16_t> apply_failed_;
   bool last_brownout_{false};
   // State's CAN health: the busiest of the RoboRIO's bus and the configured
-  // CANivores (CanBusHealth.h). Rebuilt by Configure, polled by Read.
+  // CANivores (CanBusHealth.h). Configure rebuilds both through the sampler,
+  // whose thread reads the CANivores; Read polls what it published. Declared
+  // before configure_, so a Configure still running finishes before the
+  // sampler joins its thread, and the sampler after the health it writes.
   talos::rio::CanBusHealth can_health_;
+  talos::rio::CanBusSampler can_sampler_;
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;
   std::vector<std::unique_ptr<frc::DigitalOutput>> digital_outputs_;
