@@ -2870,6 +2870,23 @@ Next (standalone subsystem repo at {target_dir}):
        bazel run //tools:sync_manifest -- <robot.toml>"""
 
 
+KINDS = {
+    "velocity": "a motor held at a speed, such as a flywheel or roller",
+    "position": "a motor moved to a position counted from a home switch, "
+                "such as an arm, wrist or elevator",
+    "estimator": "a pose estimator from camera observations, with no device",
+}
+
+
+def kind_summary(kind):
+    """The archetype generated and the others, printed before `Next:`, since
+    leaving out --type gives a velocity node without saying so."""
+    others = "".join(f"\n    {other}: {what}"
+                     for other, what in KINDS.items() if other != kind)
+    return (f"Type: {kind}, {KINDS[kind]}.\n"
+            f"  Other types (--type {'|'.join(KINDS)}):{others}")
+
+
 def shown(base, path):
     """`path` relative to `base` when inside it, else absolute."""
     relative = rel(base, path)
@@ -2884,7 +2901,7 @@ def main(argv):
     parser.add_argument("name", help="node name, e.g. wrist (talOS/NAMING.md)")
     parser.add_argument("--lang", choices=("cpp", "py"), required=True)
     parser.add_argument("--type", dest="kind",
-                        choices=("velocity", "position", "estimator"),
+                        choices=tuple(KINDS),
                         default="velocity",
                         help="archetype: a velocity or position mechanism, or "
                         "a hardware-free pose estimator (default: %(default)s)")
@@ -2927,6 +2944,7 @@ def main(argv):
                       newline=NEWLINES.get(path, "\n")) as f:
                 f.write(content)
             print(f"wrote {shown(root, path)}")
+    print(kind_summary(args.kind))
     if args.standalone:
         print(standalone_next_steps(shown(root, target_dir), args.name,
                                     args.kind))
