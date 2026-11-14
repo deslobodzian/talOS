@@ -23,11 +23,10 @@ py_test(
     srcs = ["node_py_test.py"],
     data = [
         "gyro.py",
-        "testdata/robot.toml",
+        "//bench/main_processor/configuration:robot.toml",
         "//bench/main_processor/configuration:robot_config",
-        "//bench/main_processor/configuration:subsystems/gyro.toml",
     ],
-    env = {"TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)"},
+    env = {"TALOS_TEST_CONFIG": "$(rlocationpath //bench/main_processor/configuration:robot.toml)"},
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [

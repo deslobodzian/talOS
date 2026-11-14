@@ -39,6 +39,9 @@ cc_test(
     ],
     deps = [
         ":motor",
+        # The swerve module's lane type only: the teleop case stands in a
+        # reader for the bench swerve module's bound lane.
+        "//bench/main_processor/swerve_module:messages",
         "//talOS/devices:testing",
         "//talOS/node:allocation_probe",
         "//talOS/node:testing",
@@ -88,6 +91,7 @@ py_test(
     ],
     deps = [
         ":messages_py",
+        "//bench/main_processor/swerve_module:messages_py",
         "//talOS/bridge:messages_py",
         "//talOS/python:teleop",
         "//talOS/python:testing",

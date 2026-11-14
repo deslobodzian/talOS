@@ -20,6 +20,7 @@ from motor.MotorState import MotorState
 from motor.MotorTarget import MotorTarget
 from motor.TargetSource import TargetSource
 from python.runfiles import runfiles
+from swerve_module.ModuleTarget import ModuleTarget
 from talos import teleop
 from talos.testing import Sim, SimHardware, Stick
 
@@ -285,6 +286,18 @@ class BenchMotorTest(unittest.TestCase):
         self.assertFalse(state.reverse_limit)
 
 
+class ModuleLaneReader:
+    """The bench config binds the swerve module's lane too, and teleop needs
+    a reader of every bound lane; this stands in for the swerve module
+    node."""
+
+    def __init__(self, node):
+        self.target = talos.Target(node, ModuleTarget)
+
+    def update(self):
+        pass
+
+
 class BenchTeleopTest(unittest.TestCase):
     """subsystems/motor.toml's [teleop] bindings through the framework
     teleop node to motor.py, as node_test.cc's BenchTeleop does in C++."""
@@ -292,6 +305,7 @@ class BenchTeleopTest(unittest.TestCase):
     def test_configured_axis_buttons_release_and_disable(self):
         sim = Sim(CONFIG)
         sim.add(bench.BenchMotor, "motor")
+        sim.add(ModuleLaneReader, "swerve_module")
         sim.add(teleop.Teleop, "teleop")
         hw = SimHardware(sim)
         hw.enable()

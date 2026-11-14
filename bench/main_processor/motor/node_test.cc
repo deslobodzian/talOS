@@ -10,6 +10,7 @@
 #include <string>
 
 #include "motor/motor.h"
+#include "swerve_module/module_message_generated.h"
 #include "talOS/devices/testing.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/node/testing.h"
@@ -318,9 +319,19 @@ TEST_F(MotorTest, ReportsLimitSwitchesAndClearsThemOnStaleState) {
   EXPECT_FALSE(State().reverse_limit());
 }
 
+// The bench config binds the swerve module's lane too, and teleop needs a
+// reader of every bound lane; this stands in for the swerve module node,
+// whose package this one may not depend on.
+struct ModuleLaneReader {
+  explicit ModuleLaneReader(talos::Node& node) : target{node} {}
+  void update() {}
+  talos::Target<swerve_module::ModuleTarget> target;
+};
+
 TEST(BenchTeleop, ConfiguredAxisButtonsReleaseAndDisable) {
   talos::testing::Sim sim{kConfig};
   sim.add<BenchMotor>("motor");
+  sim.add<ModuleLaneReader>("swerve_module");
   sim.add<talos::teleop::Teleop>("teleop");
   talos::testing::SimHardware hw{sim};
   hw.enable();

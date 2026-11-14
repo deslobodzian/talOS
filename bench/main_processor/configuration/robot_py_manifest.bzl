@@ -7,7 +7,9 @@ Regenerate after changing the config:
 
 # Every node label robot_py.toml launches.
 NODES = [
+    "//bench/main_processor/gyro:node",
     "//bench/main_processor/motor:node_py",
+    "//bench/main_processor/swerve_module:node",
     "//talOS/telemetry:node",
     "//talOS/teleop:node",
 ]
@@ -15,7 +17,9 @@ NODES = [
 # Every file robot_py.toml reads besides itself.
 CONFIG_FILES = [
     "//bench/main_processor/configuration:robot.toml",
+    "//bench/main_processor/configuration:subsystems/gyro.toml",
     "//bench/main_processor/configuration:subsystems/motor.toml",
+    "//bench/main_processor/configuration:subsystems/swerve_module.toml",
     "//bench/main_processor/configuration:subsystems/telemetry.toml",
     "//bench/main_processor/configuration:subsystems/teleop.toml",
 ]

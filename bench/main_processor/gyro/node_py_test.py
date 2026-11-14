@@ -1,6 +1,6 @@
 """gyro.py, the bench Pigeon 2 observer, on talos.testing.Sim, configured by
-testdata/robot.toml: configuration/robot.toml plus subsystems/gyro.toml, so
-the bench motor stays connected beside the Pigeon.
+the bench's configuration/robot.toml, so the bench motors stay connected
+beside the Pigeon.
 
 BenchGyroTest is the node test matrix for an observer, docs/TESTING.md §7
 (the case names are the matrix's, which //tools:check_node_matrix looks
