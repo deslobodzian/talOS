@@ -214,6 +214,22 @@ py_test(
     ],
 )
 
+# The stop with each kind of connection a browser or client can leave open.
+py_test(
+    name = "stop_test",
+    size = "medium",
+    srcs = [
+        "integration_test.py",
+        "stop_test.py",
+    ],
+    data = [":studio_bridge"],
+    main = "stop_test.py",
+    tags = [
+        "integration",
+        "local",
+    ],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",

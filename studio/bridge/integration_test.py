@@ -90,9 +90,7 @@ def bound_port(bridge):
 def stop(processes):
     """SIGTERM every process still running, then reap each (SIGKILL after 5 s).
 
-    All are signalled before any is waited for: a bridge exits at its next
-    loop wake, up to a second after the signal, and waiting for each in turn
-    added those seconds up.
+    All are signalled before any is waited for, so their stops overlap.
     """
     for process in processes:
         if process.poll() is None:

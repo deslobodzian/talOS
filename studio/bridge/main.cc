@@ -1093,18 +1093,26 @@ int main(int argc, char** argv) try {
     if (stopping) return;
     ++bridge.wakes;
     if (talos::process::stop_requested.load()) {
+      // The loop runs while any socket or poll is open, so the stop closes
+      // every one at once, waiting on no peer: the listener, each WebSocket
+      // (no close handshake) and each plain HTTP connection, idle, silent
+      // or mid-request, which uWS would otherwise hold until its 10 s HTTP
+      // idle timeout. A response cut short this way stays visibly
+      // incomplete: every one carries its Content-Length and every
+      // WebSocket message its frame length.
       stopping = true;
-      us_listen_socket_close(0, bridge.listener);
-      auto clients = bridge.clients.clients();
-      for (auto* ws : clients) ws->close();
-      auto drive_clients = bridge.drive_clients.clients();
-      for (auto* ws : drive_clients) ws->close();
+      app.close();
       us_timer_close(timer);
       for (us_poll_t* poll : {wake_poll, stop_poll}) {
         if (poll == nullptr) continue;
         us_poll_stop(poll, loop);
         us_poll_free(poll, loop);
       }
+      // This pass runs after the loop frees the sockets closed in this
+      // iteration, so the ones just closed are freed only by the next one,
+      // and the loop leaves only once they are. Without this wake that next
+      // iteration waited for uWebSockets' one-second date timer.
+      us_wakeup_loop(loop);
       return;
     }
     bridge.service(talos::introspect::monotonic_now_ns());

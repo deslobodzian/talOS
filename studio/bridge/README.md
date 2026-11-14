@@ -392,7 +392,13 @@ checks every second whether the name now holds a different segment (a new
 launcher session, or one created after the old one's last holder closed it) and
 re-attaches. A segment whose name was unlinked is kept until a new one appears.
 Each wait, attachment and replacement is logged once to stderr.
-Graceful SIGINT/SIGTERM releases the reader slot. Static files are read
+SIGINT or SIGTERM stops the bridge in one loop pass, well inside the
+launcher's stop timeout: it closes the listener and every connection at once,
+WebSocket or plain HTTP (idle keep-alive, silent or mid-request), waiting on
+no peer and no timer, then releases the reader slot and exits 0
+(`:stop_test`). A response or message cut short is visibly incomplete to its
+client (each HTTP response carries its `Content-Length`, each WebSocket
+message its frame length). Static files are read
 synchronously on the thread that reads telemetry and capped at 4 MiB each
 (413 above it), a few times the built Studio bundle's largest asset. The server
 has no authentication or TLS; use it only on a trusted robot/development
