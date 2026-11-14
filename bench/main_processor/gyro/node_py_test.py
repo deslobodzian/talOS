@@ -22,6 +22,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG = runfiles.Create().Rlocation(os.environ["TALOS_TEST_CONFIG"])
 bench = talos.load(os.path.join(HERE, "gyro.py"))
 
+# GyroState's slot size, recorded in docs/DATA_FLOW.md; the Python node's
+# static_assert (RULES.md 9): a changed field fails the test at import.
+if GyroState.SizeOf() != 48:
+    raise AssertionError("GyroState size changed; update docs/DATA_FLOW.md")
+
 # std::numeric_limits<std::uint64_t>::max(): an unknown age.
 UNKNOWN = 2**64 - 1
 # subsystems/gyro.toml's period_us, in seconds.
@@ -43,6 +48,7 @@ class BenchGyroTest(unittest.TestCase):
     def state(self):
         return self.sim.latest(GyroState, topics.STATE)
 
+    # REQ-CONTRACT-25
     def test_publishes_from_a_live_input(self):
         # A quarter turn and a half turn a second clockwise: a rotations
         # value (0.25, -0.5) or a flipped sign fails it.
@@ -57,6 +63,7 @@ class BenchGyroTest(unittest.TestCase):
         self.assertNotEqual(state.yaw_age_us, UNKNOWN)
         self.assertEqual(state.yaw_age_us - state.yaw_rate_age_us, 1000)
 
+    # REQ-CONTRACT-25
     def test_stale_input_clears_validity(self):
         self.hw.set_gyro("gyro", "pigeon", 0.25, -0.5)
         self.sim.step(2 * PERIOD_S)
@@ -94,6 +101,7 @@ class BenchGyroTest(unittest.TestCase):
         self.assertTrue(state.connected)
         self.assertAlmostEqual(state.yaw_rad, -math.pi / 4)
 
+    # REQ-CONTRACT-25
     def test_publishes_while_disabled(self):
         # An observer reports enabled or not: the gateway enables, then
         # disables, and a heading turned while disabled is still reported.
