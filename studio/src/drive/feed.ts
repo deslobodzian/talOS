@@ -60,7 +60,9 @@
 //     ticks read as current; the reconnect brings a whole dictionary and
 //     keyframe. Such a close is the feed's fault, not the link's: the status
 //     names the telemetry feed until a later socket decodes a value page or
-//     stays open CONNECTING_GRACE_MS without one that fails, and after
+//     stays open past CONNECTING_GRACE_MS with no binary message that fails
+//     to decode (one that fails inside the grace holds the name until the
+//     close the next one makes), and after
 //     DECODE_RETRIES of them in a row (each within DECODE_STREAK_MS of its
 //     socket opening) attempts start DECODE_RETRY_MS apart, so a feed that
 //     never decodes does not spend the slot's byte budget on a dictionary
@@ -201,13 +203,15 @@ export class DriveModel {
   // backs attempts off to DECODE_RETRY_MS. A close by the bridge or a
   // failure of the link ends it; so does a decode close more than
   // DECODE_STREAK_MS after its socket opened, which starts a new streak of
-  // one. While it is above 0 the status line names the undecodable feed,
-  // until the socket after the close shows the feed decodes (a value page
-  // decoded on it) or shows nothing undecodable (open CONNECTING_GRACE_MS,
-  // the dictionary and keyframe's bound, without a decode close): from then
-  // the line judges that socket like any other, while the streak itself
-  // carries on to the next decode close.
+  // one. While it is above 0 the status line names the undecodable feed on
+  // the current socket while no value page has decoded on it and either it
+  // has been open at most CONNECTING_GRACE_MS (the dictionary and keyframe's
+  // bound) or a binary message on it failed to decode (undecodableThisSocket:
+  // one inside the grace carries the line across it to the decode close the
+  // next one makes). Otherwise the line judges that socket like any other,
+  // while the streak itself carries on to the next decode close.
   private decodeFailures = 0;
+  private undecodableThisSocket = false;  // a binary message of this socket failed to decode
   private readonly tracked: Set<string>;
   private readonly histories = new Map<string, Point[]>();
 
@@ -310,7 +314,7 @@ export class DriveModel {
       return {link: 'telemetry', text: 'Telemetry stale: the page missed time (laptop asleep), ' +
                                        'waiting for a new tick'};
     if (this.decodeFailures > 0 && !this.valuesThisSocket &&
-        now - this.openedAt <= CONNECTING_GRACE_MS)
+        (now - this.openedAt <= CONNECTING_GRACE_MS || this.undecodableThisSocket))
       return undecodable;
     if (!this.tickThisSocket) {
       if (now - this.openedAt <= CONNECTING_GRACE_MS)
@@ -345,6 +349,7 @@ export class DriveModel {
     this.decoder.reset();
     this.tickThisSocket = false;
     this.valuesThisSocket = false;
+    this.undecodableThisSocket = false;
     this.summaryThisSocket = false;
     this.lastTickAt = null;
     this.suspended = false;  // nothing of the new socket is current before a new tick
@@ -403,6 +408,7 @@ export class DriveModel {
       }
     } catch {
       this.counters.malformed_binary++;
+      this.undecodableThisSocket = true;
       if (this.valuesThisSocket || now - this.openedAt > CONNECTING_GRACE_MS) this.fail(now, true);
       return;
     }

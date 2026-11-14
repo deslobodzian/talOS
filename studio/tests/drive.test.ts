@@ -695,6 +695,43 @@ test('a feed none of whose pages decode is named and backed off', () => {
   assert.deepEqual(starts, [0, 1700, 3400, 3400 + DECODE_RETRY_MS, 3400 + 2 * DECODE_RETRY_MS]);
 });
 
+// REQ-OPS-36: once named, a feed that stays undecodable stays named on every
+// reconnect. Scenario: as above, but the line is read every 50 ms, between
+// the bridge's 100 ms updates. On each reconnect an update arrives exactly
+// CONNECTING_GRACE_MS after the socket opened (only counted, being within
+// the grace) and the next one, 100 ms later, closes it: in between, the line
+// must not tell the team "no telemetry" (look at the telemetry node) instead
+// of "reload the page".
+test('an undecodable feed stays named across the grace of each reconnect', () => {
+  const h = harness();
+  const foreign = (pages: Uint8Array[]) => pages.map(page => {
+    const copy = page.slice();
+    copy.set([...'TLM2'].map(c => c.charCodeAt(0)), 8);
+    return copy;
+  });
+  let opened = 0;
+  let named = false;
+  let reconnects = 0;
+  for (let t = 0; t <= 14_000; t += 50) {
+    const before = h.sockets.length;
+    h.at(t);
+    if (t === 0) h.model.start(0);
+    if (h.sockets.length !== before) {
+      opened = t;
+      if (named) reconnects++;
+      h.socket().onopen!();
+      h.socket().send(...foreign([...encodeDictionaryPages(header(t), CHANNELS),
+                                  ...update(t, NOMINAL, true)]));
+    } else if (h.model.connection === 'open' && (t - opened) % 100 === 0) {
+      h.socket().send(...foreign(update(t + 1, {}, false)));
+    }
+    const status = h.model.status(t);
+    if (status.undecodable) named = true;
+    else if (named) assert.fail(`${t} ms (${t - opened} ms after open): the named feed reads as ${status.text}`);
+  }
+  assert.ok(reconnects >= 3, `${reconnects} reconnects after the feed was named`);
+});
+
 // REQ-OPS-36: a keyframe of several pages applies each as it arrives, the
 // first clearing every channel. A later page that does not decode, before
 // the socket's first tick completes, would leave the channels of that page
