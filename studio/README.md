@@ -180,10 +180,15 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   with no cell the page can read is counted on the status line. A message
   that does not decode is counted on the status line (`N malformed messages
   counted`). A text message, or a binary one before any value page of the
-  connection decoded, is then ignored; a binary one after that closes the
-  connection and reconnects, since the updates carry only changes and a
-  keyframe's first page clears every channel, so a lost page would leave a
-  value wrong or absent. That close is the feed's fault, not the link's:
+  connection decoded and within 1.5 s of its opening (before the
+  dictionary), is then ignored. A binary one after that grace with no value
+  page decoded closes the connection and reconnects: the dictionary and a
+  keyframe come within it, so the feed is one the page cannot read (a page
+  from another bridge version fails every page, the dictionary included) or
+  they were lost. So does a binary one after a value page decoded, since the
+  updates carry only changes and a keyframe's first page clears every
+  channel, so a lost page would leave a value wrong or absent. That close is
+  the feed's fault, not the link's:
   until a new tick the status line reads TELEMETRY `Telemetry feed could not
   be decoded: reload the page`, and after 3 such closes in a row (each within
   10 s of its connection opening) attempts start 5 s apart instead of 1 s,

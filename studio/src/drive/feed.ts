@@ -46,8 +46,14 @@
 //     that is still `connecting`, then stale telemetry.
 //   - Robustness. A message that does not decode is counted, and nothing it
 //     carries reaches the views. A text message, or a binary one before any
-//     value page of the socket decoded, is then ignored. A binary one after
-//     that closes the socket as an error: the updates carry only changes,
+//     value page of the socket decoded and within CONNECTING_GRACE_MS of its
+//     opening (a corrupt message before the dictionary), is then ignored. A
+//     binary one after the grace with no value page decoded closes the socket
+//     as an error: the bridge sends the dictionary and a keyframe within the
+//     grace, so the feed is one this page cannot read (a page from another
+//     bridge version fails every page, the dictionary included) or its
+//     dictionary or keyframe was lost. A binary one after a value page
+//     decoded closes it too: the updates carry only changes,
 //     and a keyframe's first page clears every channel, so a lost page (or
 //     a later page of a keyframe or an update whose earlier pages the
 //     decoder applied) would leave a value wrong or absent while later
@@ -110,7 +116,8 @@ export type DriveSummary = {
 export type Connection = 'connecting'|'open'|'waiting'|'replaced';
 export type Link =
     'ok'|'connecting'|'bridge'|'telemetry'|'hardware'|'roborio'|'replaced';
-export type LinkStatus = {link: Link; text: string};
+// `undecodable`: the line names a feed the page could not decode.
+export type LinkStatus = {link: Link; text: string; undecodable?: true};
 
 // What /drive/layout.json says the feed carries: its named `channels`, and
 // with `alerts` every alert channel of the dictionary.
@@ -268,7 +275,7 @@ export class DriveModel {
 
   // The one status line: which link failed, upstream first.
   status(now: number): LinkStatus {
-    const undecodable = {link: 'telemetry' as const,
+    const undecodable = {link: 'telemetry' as const, undecodable: true as const,
                          text: 'Telemetry feed could not be decoded: reload the page'};
     switch (this.connection) {
       case 'replaced':
@@ -383,7 +390,7 @@ export class DriveModel {
       }
     } catch {
       this.counters.malformed_binary++;
-      if (this.valuesThisSocket) this.fail(now, true);
+      if (this.valuesThisSocket || now - this.openedAt > CONNECTING_GRACE_MS) this.fail(now, true);
       return;
     }
     for (const s of snapshots) this.onSnapshot(s, now);
