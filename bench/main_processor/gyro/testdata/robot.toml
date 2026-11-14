@@ -1,0 +1,8 @@
+# The bench robot (configuration/robot.toml) plus the gyro subsystem file,
+# whose Pigeon 2 sits beside the bench motor: losing only the Pigeon is the
+# loss of one device, not the gateway's total-loss fault.
+include = "../../configuration/robot.toml"
+
+[[subsystems]]
+name = "gyro"
+path = "../../configuration/subsystems/gyro.toml"
