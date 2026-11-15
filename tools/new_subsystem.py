@@ -859,8 +859,7 @@ CC_POSITION_FIXTURE = """\
 
 # Replaces CC_TEST's case 9 for a position mechanism.
 CC_POSITION_PARAMETERS = """\
-// matrix: n/a 9 (PositionMechanism's parameters, tested in talos's
-// talOS/mechanisms)
+// matrix: n/a 9 (PositionMechanism's parameters, tested in talos)
 """
 
 # The node's own logic over the mechanism: the config homes it, and the
@@ -1530,8 +1529,7 @@ if __name__ == "__main__":
 
 # Replaces PY_TEST's case 9 for a position mechanism.
 PY_POSITION_PARAMETERS = '''\
-    # matrix: n/a 9 (PositionMechanism parameters, tested in talos's
-    # talOS/mechanisms)
+    # matrix: n/a 9 (PositionMechanism parameters, tested in talos)
 '''
 
 # Inserted into PY_TEST for a position mechanism before BinaryTest: the

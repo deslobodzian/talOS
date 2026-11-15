@@ -11,17 +11,19 @@ from tools import check_node_matrix
 from tools import new_subsystem
 
 # Every archetype //tools:new_subsystem generates, with its matrix role.
-SCAFFOLDS = (("gripper", "cpp", "velocity", "actuator"),
-             ("scaffold_py", "py", "velocity", "actuator"),
-             ("position_cpp", "cpp", "position", "actuator"),
-             ("position_py", "py", "position", "actuator"),
-             ("localizer", "cpp", "estimator", "observer"),
-             ("py_localizer", "py", "estimator", "observer"))
+SCAFFOLDS = (("gripper", "cpp", "velocity", False, "actuator"),
+             ("scaffold_py", "py", "velocity", False, "actuator"),
+             ("position_cpp", "cpp", "position", False, "actuator"),
+             ("position_py", "py", "position", False, "actuator"),
+             ("position_raw_cpp", "cpp", "position", True, "actuator"),
+             ("position_raw_py", "py", "position", True, "actuator"),
+             ("localizer", "cpp", "estimator", False, "observer"),
+             ("py_localizer", "py", "estimator", False, "observer"))
 
 
-def scaffold(name, lang, kind):
+def scaffold(name, lang, kind, raw):
     """(node test text, [non-test sources]) of a generated package."""
-    files = new_subsystem.package_files(name, lang, kind=kind)
+    files = new_subsystem.package_files(name, lang, kind=kind, raw=raw)
     test = files.pop("node_test.cc" if lang == "cpp" else "node_test.py")
     return test, [text for path, text in files.items()
                   if path.endswith((".h", ".cc", ".py"))]
@@ -36,9 +38,9 @@ class CheckNodeMatrixTest(unittest.TestCase):
     def test_every_scaffold_has_its_whole_matrix(self):
         # The templates are the matrix's reference: each generated test file
         # has every case its inferred role requires, or a reasoned n/a.
-        for name, lang, kind, role in SCAFFOLDS:
+        for name, lang, kind, raw, role in SCAFFOLDS:
             with self.subTest(name):
-                test, sources = scaffold(name, lang, kind)
+                test, sources = scaffold(name, lang, kind, raw)
                 self.assertEqual(check_node_matrix.infer_role(sources), role)
                 _, result = check_node_matrix.check(test, lang, role)
                 self.assertEqual(missing(result), {})
@@ -46,9 +48,11 @@ class CheckNodeMatrixTest(unittest.TestCase):
     def test_a_scaffold_without_case_11_fails(self):
         # A node test that loses the earlier-generation case (REQ-SAFE-09)
         # fails the lint, naming it.
-        for name, lang, kind, role in SCAFFOLDS[:4]:
+        for name, lang, kind, raw, role in SCAFFOLDS:
+            if role != "actuator":
+                continue
             with self.subTest(name):
-                test, _ = scaffold(name, lang, kind)
+                test, _ = scaffold(name, lang, kind, raw)
                 case_11 = ("EarlierGenerationTargetIsIgnored" if lang == "cpp"
                            else "test_earlier_generation_target_is_ignored")
                 self.assertIn(case_11, test)

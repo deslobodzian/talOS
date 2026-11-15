@@ -192,8 +192,7 @@ TEST_F(PositionCppTest, NonFiniteDemandGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
-// matrix: n/a 9 (PositionMechanism's parameters, tested in talos's
-// talOS/mechanisms)
+// matrix: n/a 9 (PositionMechanism's parameters, tested in talos)
 
 // REQ-SAFE-07
 TEST_F(PositionCppTest, OtherModesLaneIsIgnored) {
