@@ -247,6 +247,32 @@ class PositionRawPyTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertEqual(self.state().homing, PositionRawPyHoming.FAILED)
 
+    # REQ-DEV-01: off the switch, a goal past either end of the travel
+    # demands that end, MAX_ROT (2.0) or 0.
+    def test_goal_outside_the_travel_clamps_to_it(self):
+        self.hw.ideal_motors()
+        self.teleop()
+        self.set_home(False)  # zeroed on the switch, it leaves it
+        self.hold(5.0, 0.06)
+        demand = self.hw.motor_request("position_raw_py", "position_raw_py").demand
+        self.assertEqual(demand, 2.0)
+        self.hold(-1.0, 0.06)
+        demand = self.hw.motor_request("position_raw_py", "position_raw_py").demand
+        self.assertEqual(demand, 0.0)
+
+    # REQ-DEV-01: the switch zeroes the motor only once it moves slower
+    # than REST_RPS (0.05).
+    def test_zero_waits_for_rest(self):
+        self.hw.set_motor("position_raw_py", "position_raw_py", 0.0, -1.0)  # on it, moving
+        self.teleop()
+        self.hold(1.0, 0.06)
+        self.assertEqual(self.state().homing, PositionRawPyHoming.HOMING)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)  # no push on it
+        self.hw.set_motor("position_raw_py", "position_raw_py", 0.0, 0.0)  # at rest
+        self.hold(1.0, 0.06)
+        self.assertEqual(self.state().homing, PositionRawPyHoming.HOMED)
+        self.assertEqual(self.mode(), talos.Mode.MOTION_MAGIC)
+
 
 class BinaryTest(unittest.TestCase):
     def run_binary(self, *argv):

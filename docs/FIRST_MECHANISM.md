@@ -684,9 +684,12 @@ placeholders sized for the simulation; set each for your mechanism:
 The subsystem file has no `[arm]` table, and the `Next:` simulation block
 no `[subsystems.arm.arm]`: those keys are the library's parameters, and
 the launcher refuses a key no node reads. `node_test.cc` carries the node
-test matrix, with goals inside the travel, and three tests of the node's
-own homing: `HomingThatNeverReachesTheSwitchFails`,
-`FailureLatchesUntilDisabled` and `StuckSwitchStopsWithinTheMargin`. The
+test matrix, with goals inside the travel, and five tests of the node's
+own homing and limits: `HomingThatNeverReachesTheSwitchFails`,
+`FailureLatchesUntilDisabled`, `StuckSwitchStopsWithinTheMargin`,
+`GoalOutsideTheTravelClampsToIt` (goals of 5.0 and -1.0 demand 2.0 and 0)
+and `ZeroWaitsForRest` (no zero while the motor still moves on the
+switch). The
 fixture starts the arm on its switch (closed); `StartOffHome()` opens it.
 `hw.ideal_motors()` makes the simulated motor reach each demand at once,
 so in the last test the switch, never opened, is still closed with the arm

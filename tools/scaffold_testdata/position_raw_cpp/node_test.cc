@@ -305,6 +305,35 @@ TEST_F(PositionRawCppTest, StuckSwitchStopsWithinTheMargin) {
   EXPECT_EQ(Latest().homing(), PositionRawCppHoming::FAILED);
 }
 
+// REQ-DEV-01: off the switch, a goal past either end of the travel
+// demands that end, kMaxRot (2.0) or 0.
+TEST_F(PositionRawCppTest, GoalOutsideTheTravelClampsToIt) {
+  hw.ideal_motors();
+  Teleop();
+  SetHome(false);  // zeroed on the switch, it leaves it
+  Hold(5.0, 60ms);
+  EXPECT_DOUBLE_EQ(
+      hw.motor_request("position_raw_cpp", "position_raw_cpp").demand, 2.0);
+  Hold(-1.0, 60ms);
+  EXPECT_DOUBLE_EQ(
+      hw.motor_request("position_raw_cpp", "position_raw_cpp").demand, 0.0);
+}
+
+// REQ-DEV-01: the switch zeroes the motor only once it moves slower than
+// kRestRps (0.05).
+TEST_F(PositionRawCppTest, ZeroWaitsForRest) {
+  // On the switch, still moving.
+  hw.set_motor("position_raw_cpp", "position_raw_cpp", 0.0, -1.0);
+  Teleop();
+  Hold(1.0, 60ms);
+  EXPECT_EQ(Latest().homing(), PositionRawCppHoming::HOMING);
+  EXPECT_EQ(Request(), Mode::kNeutral);  // on the switch: no push
+  hw.set_motor("position_raw_cpp", "position_raw_cpp", 0.0, 0.0);  // at rest
+  Hold(1.0, 60ms);
+  EXPECT_EQ(Latest().homing(), PositionRawCppHoming::HOMED);
+  EXPECT_EQ(Request(), Mode::kMotionMagic);
+}
+
 struct Result {
   int status;
   std::string output;
