@@ -10,7 +10,9 @@ exports_files([
 # bazel run //tools:new_subsystem -- <name> --lang cpp|py [--type T [--raw]] [--robot R] [--standalone DIR] [--dry-run]
 # Writes a node package under <robot>/main_processor/<name>/, adds it to that
 # robot's robot.toml and regenerates its manifest, or scaffolds a standalone
-# Bzlmod repo.
+# Bzlmod repo. From a robot repository, `bazel run @talos//tools:new_subsystem
+# -- <name> --lang cpp|py [--config PATH] [--package-dir DIR]` does the same
+# there, naming talOS by @talos//.
 py_binary(
     name = "new_subsystem",
     srcs = ["new_subsystem.py"],
