@@ -103,9 +103,9 @@ applies the highest requested rate to a shared frame. The Phoenix desktop
 rate test checks the effective rates: the current and temperature reads share
 a frame already requested at 200 Hz, adding no requested status-frame traffic.
 This is not a measured
-whole-bus utilization percentage: use `/hw/status` CAN utilization (the
-busiest configured bus still read, RoboRIO or CANivore) during physical bring-up,
-including all other devices and control traffic.
+whole-bus utilization percentage: use each `/hw/status` `can_buses` slot's
+utilization (one per configured bus, the RoboRIO's and each CANivore's)
+during physical bring-up, including all other devices and control traffic.
 Temperature older than 500 ms and supply current older than 50 ms read as zero
 without invalidating motion feedback, like existing effort diagnostics.
 Standalone ideal/physics simulation reports ambient 25 °C and placeholder
@@ -116,7 +116,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **7**.
+One datagram contains exactly one protocol frame, version **8**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -126,7 +126,7 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
-| State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 34` | 1406 | 1446 | 26 |
+| State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` | 1419 | 1459 | 13 |
 | Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
 | Config chunk, type 22 | 24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
@@ -136,8 +136,18 @@ need no IP fragmentation (`talOS/protocol/frame.h`, `frame.cc`, `types.h`).
 State/Command maxima use caps **M=16, S=12, DI=8, DO=4, AI=4, E=4,
 PWM=4** (`talOS/hardware/config.h`). The 84-byte State prefix is seven u64,
 the gateway build (10: u64 revision, u8 program, u8 dirty), u32 flags and
-seven u16 counts; its 34-byte suffix is health (18) + four u32 counters
-(16). Command prefix is four u64 + three u16 counts = 38.
+seven u16 counts; its 47-byte suffix is health (31) + four u32 counters
+(16). Health is valid u8, battery f64, brownout u8, then one CAN bus's slot:
+bus count u8, bus index u8, read state u8, utilization f32, bus-off u32,
+transmit-buffer-full u32, receive and transmit error counters u8 (saturated
+at 255), failed reads u32 (19 B). All of a robot's bus slots, up to four
+(`hardware::kMaxCanBuses`: "rio" and three more), would not fit the
+headroom, so each State carries one, slot `sequence % count`, and the bridge
+assembles `/hw/status` `can_buses` from consecutive States
+(`CanBusTable`, `talOS/bridge/can_buses.h`); a bus's slot is refreshed every `count` States. A
+decoder rejects a count above 4, an index at or past the count (or past 0
+when the count is 0), an unknown read state and a utilization that is not
+finite. Command prefix is four u64 + three u16 counts = 38.
 The sixth u64 is `clock_probe_time_us`, echoing a probe received before the
 current gateway tick began. Zero means no probe yet. It does not affect
 command acceptance, ACK sequence, epoch, or actuator watchdogs.
@@ -178,16 +188,16 @@ The canonical parser merges `2026-robot/main_processor/configuration/robot.toml`
 and its subsystem files. Current device counts are **10 motors, 5 sensors,
 2 digital inputs, 0 digital outputs, 0 analog inputs, 0 encoders, 0 PWM outputs**.
 
-- State: `84 + 10×45 + 5×27 + 2×4 + 34` = **711 B** payload,
-  **751 B** frame, **721 B** payload headroom.
+- State: `84 + 10×45 + 5×27 + 2×4 + 47` = **724 B** payload,
+  **764 B** frame, **708 B** payload headroom.
 - Command: `38 + 10×20` = **238 B** payload, **278 B** frame,
   **1194 B** payload headroom.
 - Serialized Config: **3251 B**; `ceil(3251 / 1408)` = **3 chunks**.
   Chunk data lengths **1408, 1408, 435 B**, payload lengths **1432, 1432,
   459 B**, datagram lengths **1472, 1472, 499 B**. One push is **3443 B**
   of talOS frames (`3251 + 3×24 + 3×40`), excluding UDP/IP headers.
-- State at 200 Hz: **150200 B/s** in talOS frames (`751×200`), or
-  **1.2016 Mbit/s**, on the wired internal link, not the robot radio.
+- State at 200 Hz: **152800 B/s** in talOS frames (`764×200`), or
+  **1.2224 Mbit/s**, on the wired internal link, not the robot radio.
 
 
 ## Dynamic and multi-frame messages
@@ -276,11 +286,11 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
-| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 711, ≤1406 |
+| `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data currently 724, ≤1419 |
 | `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data currently 238, ≤410 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
-| `/hw/status`: bridge → telemetry/observers | 200 | 192 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and the six alerts fill the padding after `configured` |
+| `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`; `can_buses` is four 20 B `CanBusStatus` slots at the end |
 | `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; chassis/shooter/intake payload 40/24/20 B, slots 48/32/32 B |
 | `/autonomous/state`: autonomous → telemetry | 16 | 2 B AutonomousState: phase enum and selected/latched routine_index (ubyte); routine adds one 8 B telemetry scalar |
 | `/drivetrain/state`: drivetrain → estimator/driver/telemetry | 120 | 112 B DrivetrainState: padded time/flags header 16 + chassis/yaw 32 + four module positions 64 |
@@ -435,9 +445,9 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| `robot.toml`, `robot_field.toml` | 176 | 3, 2592 B (largest 1168 / 1200 B) | 2 pages, 11496 B |
-| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 183 | 3, 2672 B (largest 1168 / 1200 B) | 2 pages, 11880 B |
-| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 99 | 2, 1504 B (largest 1168 / 1200 B) | 1 page, 6144 B |
+| `robot.toml`, `robot_field.toml` | 205 | 3, 2936 B (largest 1168 / 1200 B) | 2 pages, 13696 B |
+| `robot_physics_sim.toml` + `--sim --start-sim-gateway --sim-gateway-arg --physics` | 212 | 3, 3024 B (largest 1168 / 1200 B) | 2 pages, 14080 B |
+| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 128 | 2, 1856 B (largest 1168 / 1200 B) | 1 page, 8344 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
@@ -603,5 +613,5 @@ wrong-identity commands, and disabled/stale-target actuation is neutralized.
 The configured command timeout is **100 ms**; a single loss does not imply an
 immediate timeout. The maximum frame fits the IPv4 MTU without fragmentation.
 
-The device caps are a hard one-datagram budget: State has **36 B**
+The device caps are a hard one-datagram budget: State has **13 B**
 worst-case payload headroom.

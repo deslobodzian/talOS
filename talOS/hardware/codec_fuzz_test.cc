@@ -91,6 +91,9 @@ TEST(HardwareCodecFuzzTest, BoundedMutations) {
       state.analog_input_count = kMaxAnalogInputs;
       state.encoder_count = kMaxEncoders;
       state.pwm_output_count = kMaxPwmOutputs;
+      state.health.can_bus_count = kMaxCanBuses;
+      state.health.can_bus_index = kMaxCanBuses - 1;
+      state.health.can_bus = {CanBusReadState::kStale, 0.5F, 1, 2, 3, 4, 5};
     }
     std::vector<uint8_t> encoded(kMaxStateSize);
     encoded.resize(Encode(state, encoded));

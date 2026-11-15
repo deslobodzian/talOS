@@ -57,6 +57,7 @@ void MarkUnread(State& state) {
   for (auto& encoder : state.encoders) encoder.valid = false;
   for (auto& output : state.pwm_outputs) output.valid = false;
   state.health.valid = false;
+  state.health.can_bus = {};
 }
 }  // namespace
 
@@ -75,6 +76,7 @@ Gateway::Gateway(Config config, Backend& backend, uint64_t boot_id)
   state_.analog_input_count = config_.analog_inputs.size();
   state_.encoder_count = config_.encoders.size();
   state_.pwm_output_count = config_.pwm_outputs.size();
+  state_.health.can_bus_count = static_cast<uint8_t>(CanBuses(config_).count);
   for (std::size_t i = 0; i < config_.motors.size(); ++i) {
     state_.motors[i].id = config_.motors[i].id;
   }
@@ -179,6 +181,7 @@ void Gateway::CommitConfiguration(const Config& config) {
   state_.analog_input_count = config_.analog_inputs.size();
   state_.encoder_count = config_.encoders.size();
   state_.pwm_output_count = config_.pwm_outputs.size();
+  state_.health.can_bus_count = static_cast<uint8_t>(CanBuses(config_).count);
   for (std::size_t i = 0; i < config_.motors.size(); ++i) {
     state_.motors[i].id = config_.motors[i].id;
   }
@@ -462,6 +465,12 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   // that sees sequence + 1 knows it missed nothing in between.
   ++state_.sequence;
   state_.sample_time_us = now;
+  // One CAN bus's slot per State, in turn; Backend::Read fills it.
+  const uint8_t buses = state_.health.can_bus_count;
+  const uint8_t bus_index =
+      buses == 0 ? 0 : static_cast<uint8_t>(state_.sequence % buses);
+  state_.health.can_bus_index = bus_index;
+  state_.health.can_bus = {};
   if (configuring_) {
     const auto status = backend_.PollConfigure();
     if (status == Backend::ConfigureStatus::kPending) {
@@ -495,6 +504,9 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   const bool was_healthy = healthy_;
   // Judged before PollResets masks anything (Backend::Read).
   const bool read = configured_ && backend_.Read(state_);
+  // The slot's place is the gateway's, whatever Read wrote over it.
+  state_.health.can_bus_count = buses;
+  state_.health.can_bus_index = bus_index;
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
   // Total loss starts a new epoch whether or not a command is in force: a

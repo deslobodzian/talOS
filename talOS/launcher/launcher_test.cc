@@ -1062,10 +1062,10 @@ TEST(LauncherTest, ExpectedLogRateCountsWhatEachLogStoresAtItsRate) {
        packet(SourceKind::FETCHER, hardware::RequestTopic("beta"))}};
   const TopicLoads loads = DeclaredTopicLoads({alpha, beta, bridge}, robot);
 
-  // Two motors: 84 + 2 x 45 + 34 encoded bytes after the Packet's size word.
+  // Two motors: 84 + 2 x 45 + 47 encoded bytes after the Packet's size word.
   const TopicLoad state = loads.at(hardware::kStateTopic);
   EXPECT_DOUBLE_EQ(state.per_second, 200);
-  EXPECT_DOUBLE_EQ(state.stored_bytes, 4 + 84 + 2 * 45 + 34);
+  EXPECT_DOUBLE_EQ(state.stored_bytes, 4 + 84 + 2 * 45 + 47);
   // A request carries its owner's one motor: 38 + 20.
   EXPECT_DOUBLE_EQ(loads.at(hardware::RequestTopic("beta")).stored_bytes,
                    4 + 38 + 20);

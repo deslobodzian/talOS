@@ -315,6 +315,7 @@ class PhysicsSimBackend final : public Backend {
 
   bool Configure(const Config& config) override {
     config_ = config;
+    can_bus_count_ = CanBuses(config_).count;
     for (auto& m : config_.motors) {
       if (const auto it = local_motor_types_.find(m.name);
           it != local_motor_types_.end()) {
@@ -369,7 +370,8 @@ class PhysicsSimBackend final : public Backend {
   }
 
   bool Read(State& state) override {
-    state.health = {true, supply_v_, brownout_, 0.0};
+    ReadPower(state.health, {true, supply_v_, brownout_});
+    ReadSimulatedCanBus(state.health, can_bus_count_);
     double dt = 0.0;
     if (previous_time_) {
       const int64_t delta =
@@ -1075,6 +1077,7 @@ class PhysicsSimBackend final : public Backend {
   }
 
   Config config_;
+  std::size_t can_bus_count_{};
   PhysicsOptions options_;
   WorldState truth_;
   double gyro_zero_yaw_rad_{};

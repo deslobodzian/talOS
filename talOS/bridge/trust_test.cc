@@ -1557,6 +1557,9 @@ std::vector<std::string> Alerts(const bridge::BridgeStatus& status) {
     active.emplace_back("owner_timed_out");
   }
   if (status.alert_warning_brownout()) active.emplace_back("brownout");
+  if (status.alert_warning_can_bus_unread()) {
+    active.emplace_back("can_bus_unread");
+  }
   return active;
 }
 
@@ -1656,7 +1659,7 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   state.motor_count = 1;
   state.motors[0].id = cfg.hardware.motors[0].id;
   state.motors[0].valid = false;
-  state.health = {true, 6.5, true, 0.2};
+  state.health = {true, 6.5, true};
   now_us += 1000;
   request(drive_pub, 2, 201000);
   request(intake_pub, 2, 201000);
@@ -1664,18 +1667,40 @@ TEST(HardwareNodeTrustTest, StatusAlertsFollowTheirConditions) {
   EXPECT_EQ(Alerts(node.Status(now_us)), (Names{"motor_fault", "brownout"}));
   state.sample_time_us = 202000;
   state.motors[0].valid = true;
-  state.health = {true, 12.5, false, 0.2};
+  state.health = {true, 12.5, false};
   now_us += 1000;
   request(drive_pub, 2, 202000);
   request(intake_pub, 2, 202000);
   ASSERT_TRUE(gateway.Deliver(state, now_us));
   EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
   state.sample_time_us = 203000;
-  state.health = {false, 0.0, true, 0.0};
+  state.health = {false, 0.0, true};
   now_us += 1000;
   request(drive_pub, 2, 203000);
   request(intake_pub, 2, 203000);
   ASSERT_TRUE(gateway.Deliver(state, now_us));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
+
+  // A State whose CAN bus slot reads FAILED, one reporting another bus, then
+  // that bus reading OK again.
+  const auto can_bus = [&](uint64_t sample_time_us, uint8_t index,
+                           CanBusReadState read_state) {
+    state.sample_time_us = sample_time_us;
+    state.health = {.valid = true,
+                    .battery_v = 12.5,
+                    .can_bus_count = 2,
+                    .can_bus_index = index,
+                    .can_bus = {.read_state = read_state}};
+    now_us += 100;
+    request(drive_pub, 2, sample_time_us);
+    request(intake_pub, 2, sample_time_us);
+    return gateway.Deliver(state, now_us);
+  };
+  ASSERT_TRUE(can_bus(203100, 1, CanBusReadState::kFailed));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"can_bus_unread"});
+  ASSERT_TRUE(can_bus(203200, 0, CanBusReadState::kOk));
+  EXPECT_EQ(Alerts(node.Status(now_us)), Names{"can_bus_unread"});
+  ASSERT_TRUE(can_bus(203300, 1, CanBusReadState::kOk));
   EXPECT_EQ(Alerts(node.Status(now_us)), Names{});
 
   // The gateway names another configuration, then ours again, which only

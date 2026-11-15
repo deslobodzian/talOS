@@ -128,11 +128,38 @@ struct PwmSample {
   double output{};
   bool operator==(const PwmSample&) const = default;
 };
+// How a CAN bus's last status read stands (CanBusSample::read_state). Wire
+// values, never renumbered: decode rejects a value above kSimulated.
+enum class CanBusReadState : uint8_t {
+  kNone,       // not reported in this State (another bus's turn, or unread)
+  kOk,         // the last read succeeded and is current
+  kPending,    // not read yet, within the stale bound of the first tick
+  kFailed,     // the last read failed
+  kStale,      // no read within the stale bound
+  kSimulated,  // a simulated gateway: no bus to read, every figure 0
+};
+inline constexpr CanBusReadState kLastCanBusReadState =
+    CanBusReadState::kSimulated;
+// One CAN bus's health, as the gateway last read it. In any state but kOk the
+// figures are the last good read's (0 before one).
+struct CanBusSample {
+  CanBusReadState read_state{};
+  float utilization_frac{};
+  uint32_t bus_off_count{}, transmit_buffer_full_count{};
+  uint8_t receive_error_count{}, transmit_error_count{};  // saturate at 255
+  uint32_t read_failure_count{};  // since this configuration was applied
+  bool operator==(const CanBusSample&) const = default;
+};
+// Power, and one CAN bus's health per State: can_bus is slot can_bus_index
+// of the can_bus_count slots CanBuses(config) lists, in turn (the gateway
+// takes index = sequence % count), so a reader assembles the table from
+// consecutive States (bridge::CanBusTable).
 struct HealthSample {
   bool valid{};
   double battery_v{};
   bool brownout{};
-  double can_utilization_frac{};
+  uint8_t can_bus_count{}, can_bus_index{};
+  CanBusSample can_bus{};
   bool operator==(const HealthSample&) const = default;
 };
 struct GatewayCounters {
@@ -216,7 +243,12 @@ inline constexpr std::size_t kMaxCommandSize =
     kMaxDigitalOutputs * kDigitalOutputRequestSize +
     kMaxPwmOutputs * kPwmRequestSize;
 
-inline constexpr std::size_t kHealthSampleSize = 1 + 8 + 1 + 8;
+// Read state u8, utilization f32, bus-off u32, buffer-full u32, receive and
+// transmit error counters u8, failed reads u32.
+inline constexpr std::size_t kCanBusSampleSize = 1 + 4 + 4 + 4 + 1 + 1 + 4;
+// Valid u8, battery f64, brownout u8, bus count u8, bus index u8, the bus.
+inline constexpr std::size_t kHealthSampleSize =
+    1 + 8 + 1 + 1 + 1 + kCanBusSampleSize;
 inline constexpr std::size_t kGatewayCountersSize = std::size_t{4} * 4;
 // Revision u64, program u8, dirty u8.
 inline constexpr std::size_t kGatewayBuildSize = 8 + 1 + 1;
@@ -242,7 +274,8 @@ inline constexpr std::size_t kMaxStateSize =
 static_assert(kMaxCommandSize == 410, "Update docs/DATA_FLOW.md");
 static_assert(kStateBaseSize - kHealthSampleSize - kGatewayCountersSize == 84,
               "Update docs/DATA_FLOW.md");
-static_assert(kMaxStateSize == 1406, "Update docs/DATA_FLOW.md");
+static_assert(kHealthSampleSize == 31, "Update docs/DATA_FLOW.md");
+static_assert(kMaxStateSize == 1419, "Update docs/DATA_FLOW.md");
 
 // Explicit little-endian codecs: no padding, native bool layout, or alignment
 // assumptions cross the RoboRIO/companion boundary.

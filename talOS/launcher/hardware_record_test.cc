@@ -148,6 +148,35 @@ class HardwareRecordTest : public testing::Test {
   std::uint16_t drive_{};
 };
 
+// Each State reports one CAN bus; the record names it from the config the
+// session ran, by its slot, with its read state and counters.
+// REQ-OPS-20, REQ-OPS-15
+TEST_F(HardwareRecordTest, StateNamesItsCanBusSlotFromTheRunConfig) {
+  for (auto& motor : config_.motors) {
+    if (motor.name == "flywheel") motor.bus = "Shooter";
+  }
+  names_ = DeviceNames::FromConfig(config_);
+  talos::hardware::State state;
+  state.config_id = talos::hardware::ConfigurationId(config_);
+  state.health.can_bus_count = 2;
+  state.health.can_bus_index = 1;
+  state.health.can_bus = {
+      talos::hardware::CanBusReadState::kFailed, 0.25F, 3, 4, 255, 7, 9};
+  const auto health =
+      Members(Members(HardwareRecordJson(HardwareRecord::kState, Encoded(state),
+                                         &names_))
+                  .at("health"));
+  EXPECT_EQ(health.at("can_bus_count"), "2");
+  const auto bus = Members(health.at("can_bus"));
+  EXPECT_EQ(bus.at("index"), "1");
+  EXPECT_EQ(bus.at("name"), "\"Shooter\"");
+  EXPECT_EQ(bus.at("read_state"), "\"failed\"");
+  EXPECT_EQ(bus.at("utilization_frac"), "0.25");
+  EXPECT_EQ(bus.at("bus_off_count"), "3");
+  EXPECT_EQ(bus.at("receive_error_count"), "255");
+  EXPECT_EQ(bus.at("read_failure_count"), "9");
+}
+
 // After a match the per-motor demand and the applied output, current, faults
 // and limit bits must be readable by device name, not by byte offset.
 TEST_F(HardwareRecordTest, StateAndCommandNameDevicesOfTheRunConfig) {

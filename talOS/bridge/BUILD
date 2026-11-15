@@ -30,6 +30,18 @@ cc_library(
     deps = [":boot_history"],
 )
 
+# The /hw/status CAN bus table, assembled from the one bus slot each State
+# reports, also run by talos::testing::SimHardware when it plays the bridge.
+cc_library(
+    name = "can_buses",
+    hdrs = ["can_buses.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":messages",
+        "//talOS/hardware",
+    ],
+)
+
 # The request merge rules (owner timeout, admission, merged observation),
 # also run by talos::testing::SimHardware when it plays the bridge.
 cc_library(
@@ -45,6 +57,7 @@ cc_library(
     hdrs = ["node.h"],
     visibility = ["//visibility:public"],
     deps = [
+        ":can_buses",
         ":clock_offset",
         ":merge",
         ":messages",
@@ -183,6 +196,18 @@ cc_test(
     srcs = ["clock_offset_test.cc"],
     deps = [
         ":clock_offset",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "can_buses_test",
+    size = "small",
+    srcs = ["can_buses_test.cc"],
+    deps = [
+        ":can_buses",
+        ":messages",
+        "//talOS/hardware",
         "@googletest//:gtest_main",
     ],
 )

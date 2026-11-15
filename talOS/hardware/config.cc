@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <set>
@@ -60,6 +61,7 @@ void Validate(const Config& c) {
   }
   Require(Positive(c.status_hz) && c.status_hz <= 1000,
           "invalid status frequency");
+  CanBuses(c);
   // The gateway counts motion feedback command_timeout_us old as invalid
   // (FeedbackFresh, gate.h). Four status periods inside it, the factor an
   // actuator owner's period has too, keep a slow rate from reading as a
@@ -191,6 +193,36 @@ void Validate(const Config& c) {
     Require(pwm.channel >= 0 && pwm.channel <= 19, "invalid PWM channel");
     Require(pwm_channels.insert(pwm.channel).second, "duplicate PWM channel");
   }
+}
+
+CanBusList CanBuses(const Config& c) {
+  std::vector<std::string_view> others;
+  const auto add = [&](std::string_view bus) {
+    if (bus != "rio" &&
+        std::find(others.begin(), others.end(), bus) == others.end()) {
+      others.push_back(bus);
+    }
+  };
+  for (const auto& m : c.motors) add(m.bus);
+  for (const auto& s : c.sensors) add(s.bus);
+  // std::string_view compares as unsigned bytes (char_traits<char>).
+  std::sort(others.begin(), others.end());
+  if (others.size() > kMaxCanBuses - 1) {
+    std::string names;
+    for (const auto bus : others) {
+      if (!names.empty()) names += ", ";
+      names += bus;
+    }
+    throw std::invalid_argument(
+        "the config names " + std::to_string(others.size()) +
+        " CAN buses besides rio (" + names + "); at most " +
+        std::to_string(kMaxCanBuses - 1) + " fit /hw/status");
+  }
+  CanBusList list;
+  list.names[0] = "rio";
+  list.count = 1;
+  for (const auto bus : others) list.names[list.count++] = bus;
+  return list;
 }
 
 uint64_t ConfigurationId(const Config& c) {

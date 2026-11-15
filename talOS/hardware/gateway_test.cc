@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "config_wire.h"
@@ -42,7 +43,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   state.encoder_count = kMaxEncoders;
   state.pwm_output_count = kMaxPwmOutputs;
   std::array<uint8_t, kMaxStateSize> state_bytes{};
-  ASSERT_EQ(Encode(state, state_bytes), 1406u);
+  ASSERT_EQ(Encode(state, state_bytes), 1419u);
   State decoded_state;
   ASSERT_TRUE(Decode(state_bytes, decoded_state));
   EXPECT_EQ(decoded_state, state);
@@ -87,6 +88,71 @@ TEST(Messages, GatewayBuildRejectsUnknownProgramsAndNonBooleanDirty) {
   state.build.program = static_cast<GatewayProgram>(
       static_cast<uint8_t>(kLastGatewayProgram) + 1);
   EXPECT_EQ(Encode(state, bytes), 0u);
+}
+
+// Each State carries one CAN bus's health. Every field crosses the wire
+// exactly; a bus count above kMaxCanBuses, an index the count has no slot
+// for, a read state this build does not know or a utilization that is no
+// number is a malformed State, and none of them encodes.
+// REQ-OPS-20, REQ-CONTRACT-30
+TEST(Messages, CanBusSlotRoundTripsAndRejectsWhatItCannotPlace) {
+  State state;
+  state.health = {.valid = true,
+                  .battery_v = 12.5,
+                  .can_bus_count = 3,
+                  .can_bus_index = 2,
+                  .can_bus = {CanBusReadState::kFailed, 0.375F, 70000, 9, 255,
+                              128, 0x01020304}};
+  std::array<uint8_t, kMaxStateSize> bytes{};
+  const auto size = Encode(state, bytes);
+  ASSERT_NE(size, 0u);
+  State decoded;
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_EQ(decoded.health, state.health);
+
+  // A State with no device: the health sample follows the 84-byte prefix
+  // (valid, battery f64, brownout, then the bus count and index, the read
+  // state and the utilization f32).
+  constexpr std::size_t kCount = 84 + 10;
+  constexpr std::size_t kIndex = kCount + 1;
+  constexpr std::size_t kReadState = kCount + 2;
+  constexpr std::size_t kUtilization = kCount + 3;
+  struct Corruption {
+    const char* what;
+    std::size_t offset;
+    std::vector<uint8_t> value;
+  };
+  const Corruption corruptions[] = {
+      {"count above kMaxCanBuses", kCount, {5}},
+      {"index at the count", kIndex, {3}},
+      {"index past a zero count's one slot", kCount, {0}},
+      {"read state above kSimulated", kReadState, {6}},
+      {"NaN utilization", kUtilization, {0x00, 0x00, 0xc0, 0x7f}},
+      {"infinite utilization", kUtilization, {0x00, 0x00, 0x80, 0x7f}},
+  };
+  for (const auto& corruption : corruptions) {
+    SCOPED_TRACE(corruption.what);
+    auto copy = bytes;
+    std::copy(corruption.value.begin(), corruption.value.end(),
+              copy.begin() + static_cast<std::ptrdiff_t>(corruption.offset));
+    EXPECT_FALSE(Decode(std::span{copy}.first(size), decoded));
+  }
+
+  // No bus at all (a State before any configuration): count 0, index 0.
+  EXPECT_TRUE(Decode(std::span{bytes}.first(Encode(State{}, bytes)), decoded));
+
+  for (const HealthSample& unplaceable :
+       {HealthSample{.can_bus_count = 5},
+        HealthSample{.can_bus_count = 3, .can_bus_index = 3},
+        HealthSample{.can_bus_index = 1},
+        HealthSample{
+            .can_bus_count = 1,
+            .can_bus = {.read_state = static_cast<CanBusReadState>(6)}}}) {
+    state.health = unplaceable;
+    EXPECT_EQ(Encode(state, bytes), 0u)
+        << "count " << int{unplaceable.can_bus_count} << " index "
+        << int{unplaceable.can_bus_index};
+  }
 }
 
 TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
@@ -462,6 +528,84 @@ TEST(Config, RejectsAmbiguousHardwareAndInvalidFeedback) {
   c.motors[0].slots[0].p = std::numeric_limits<double>::quiet_NaN();
   EXPECT_THROW(Validate(c), std::invalid_argument);
 }
+// One motor on each of `buses`, for the CAN bus tests.
+Config BusConfig(const std::vector<std::string>& buses) {
+  Config c;
+  uint16_t id = 1;
+  for (const auto& bus : buses) {
+    MotorConfig m;
+    m.id = id;
+    m.name = "motor" + std::to_string(id);
+    m.can_id = id;
+    m.bus = bus;
+    c.motors.push_back(m);
+    ++id;
+  }
+  return c;
+}
+
+// /hw/status's slot i is the same bus on the RoboRIO and the bridge: "rio"
+// first whether or not a device names it, then every other bus once, in byte
+// order. More than three besides "rio" do not fit and are refused, naming
+// each bus.
+// REQ-OPS-20
+TEST(Config, CanBusesListRioThenTheOthersInByteOrderAndRefuseAFifth) {
+  const auto names = [](const Config& c) {
+    const CanBusList list = CanBuses(c);
+    return std::vector<std::string>{
+        list.names.begin(),
+        list.names.begin() + static_cast<std::ptrdiff_t>(list.count)};
+  };
+  EXPECT_EQ(names(Config{}), std::vector<std::string>{"rio"});
+  auto c = BusConfig({"b", "rio", "B", "b"});
+  SensorConfig sensor;
+  sensor.id = 99;
+  sensor.name = "encoder";
+  sensor.can_id = 1;
+  sensor.bus = "a";
+  c.sensors.push_back(sensor);
+  EXPECT_NO_THROW(Validate(c));
+  EXPECT_EQ(names(c), (std::vector<std::string>{"rio", "B", "a", "b"}));
+
+  c.motors[1].bus = "Shooter";
+  try {
+    Validate(c);
+    FAIL() << "four buses besides rio were accepted";
+  } catch (const std::invalid_argument& e) {
+    for (const char* bus : {"B", "Shooter", "a", "b"}) {
+      EXPECT_NE(std::string{e.what()}.find(bus), std::string::npos)
+          << bus << " is not named: " << e.what();
+    }
+  }
+}
+
+// The gateway reports one bus per State, in turn (index = sequence % count),
+// so each bus's slot comes every `count` States, and the slot is what the
+// backend read for that bus: a simulated backend reads kSimulated, one that
+// reads no bus leaves it kNone rather than an idle bus's zeros.
+// REQ-OPS-20
+TEST(Gateway, ReportsEachCanBusInTurn) {
+  const Config config = BusConfig({"Shooter", "rio", "Arm"});
+  SimBackend simulated;
+  FakeBackend unread;
+  const std::pair<Backend*, CanBusReadState> cases[] = {
+      {&simulated, CanBusReadState::kSimulated},
+      {&unread, CanBusReadState::kNone}};
+  for (const auto& [backend, expected] : cases) {
+    Gateway g{config, *backend, 1};
+    std::vector<int> indices;
+    for (uint64_t tick = 1; tick <= 6; ++tick) {
+      g.Tick(tick * 5000, false);
+      const State s = g.snapshot();
+      SCOPED_TRACE(tick);
+      EXPECT_EQ(s.health.can_bus_count, 3);
+      indices.push_back(s.health.can_bus_index);
+      EXPECT_EQ(s.health.can_bus.read_state, expected);
+    }
+    EXPECT_EQ(indices, (std::vector<int>{1, 2, 0, 1, 2, 0}));
+  }
+}
+
 // Feedback command_timeout_us old is invalid, so a status rate with fewer than
 // four frames in that time would read as a dropout at every frame: 40 Hz at
 // the 100 ms timeout loads, anything slower is refused naming both keys.
@@ -1388,7 +1532,8 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   state.analog_input_count = kMaxAnalogInputs;
   state.encoder_count = kMaxEncoders;
   state.pwm_output_count = kMaxPwmOutputs;
-  state.health = {true, 9.2, true, 0.73};
+  state.health = {true, 9.2, true,
+                  4,    3,   {CanBusReadState::kStale, 0.73F, 1, 2, 3, 4, 5}};
   state.counters = {1, 2, 3, 4};
   state.sequence = 0x0102030405060708;
   state.build = {0x0123456789abcdefull, GatewayProgram::kRoboRio, true};
@@ -1431,7 +1576,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   // The same per-device widths the payload-budget static_asserts in messages.cc
   // are built from, so raising a device cap moves both together or neither.
   constexpr std::size_t kWidestState =
-      70 + 14 + 34 + kMaxMotors * 45 + kMaxSensors * 27 +
+      70 + 14 + 47 + kMaxMotors * 45 + kMaxSensors * 27 +
       kMaxDigitalInputs * 4 + kMaxDigitalOutputs * 4 + kMaxAnalogInputs * 15 +
       kMaxEncoders * 23 + kMaxPwmOutputs * 11;
   ASSERT_EQ(state_size, kWidestState);

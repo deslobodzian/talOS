@@ -50,9 +50,12 @@ check below.
   ([BRINGUP.md](BRINGUP.md#autonomous-selection)).
 - [ ] Alerts: Active reads `none`. Each alert names its owner and its
   condition (`hw link lost`, `hw not configured`, `hw uncommissioned`,
-  `hw motor fault`, `hw owner timed out`, `hw brownout`; what each means:
+  `hw motor fault`, `hw owner timed out`, `hw brownout`, `hw can bus
+  unread`; what each means:
   [bridge_status.fbs](../talOS/bridge/bridge_status.fbs)). `owner timed out`: an actuator node is
-  not commanding (down or crash-looping; see Subsystems). The Raised list
+  not commanding (down or crash-looping; see Subsystems). `can bus unread`:
+  a CAN bus's status read is failing or stopped, so its health is unknown
+  (Studio's Hardware panel and the RoboRIO console name the bus). The Raised list
   keeps every alert seen this match with its count: read it after the match.
 - [ ] Field: the robot drawn at its starting position, with no `POSE NOT
   VALID` (odometry not integrating fresh input) or `NOT LOCALIZED` (the

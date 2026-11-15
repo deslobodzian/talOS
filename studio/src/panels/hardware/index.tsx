@@ -1,7 +1,8 @@
 // The hardware panel: everything about the main-processor <-> RoboRIO link and
 // power, read off /hw/status. Four views over the same snapshot:
 //
-//   Power   — battery voltage and CAN utilization, with brownout bands.
+//   Power   — battery voltage with brownout bands, and each CAN bus's
+//             utilization, read state and error counters.
 //   Link    — state age and the actuator-owning subsystem timeouts.
 //   Clock   — the gateway<->node clock mapping.
 //   Counters and the motor fault mask — the bridge and gateway's tallies,
@@ -13,6 +14,7 @@
 import {useMemo} from 'react';
 
 import {useDictionary, useSeries, useSnapshot} from '../../data/hooks';
+import {canBuses, canBusReading, canBusUnread, type CanBus} from '../../data/robot';
 import {durationUs, integer} from '../../ui/formatters';
 import {DataTable, type Column} from '../../ui/DataTable';
 import {EmptyState, StatList} from '../../ui/primitives';
@@ -100,8 +102,6 @@ const rateString = (rate: number|null): string =>
 
 const volts = (v: number|undefined) =>
     v === undefined ? '—' : `${v.toFixed(2)} V`;
-const percent = (f: number|undefined) =>
-    f === undefined ? '—' : `${(f * 100).toFixed(0)}%`;
 const micros = (us: number|undefined) =>
     us === undefined ? '—' : durationUs(us);
 // A uint64 counter, with the absent case shown as "no data".
@@ -142,27 +142,62 @@ function BitList({title, bits, prefix, empty, endSec, channel}: {
   </div>;
 }
 
+const BUS_COLORS = ['var(--info)', 'var(--accent)', 'var(--warn)', 'var(--ok)'];
+
+const counter = (value: number|null) => value === null ? '—' : integer(value);
+
+// One row per CAN bus /hw/status lists: its utilization while its last read
+// is current, else its read state (a failed or stale bus is never a "0%"),
+// and its controller's error counters and the failed reads since the
+// configuration.
+function CanBusTable({buses}: {buses: CanBus[]}) {
+  const columns: Column<CanBus>[] = [
+    {key: 'label', header: 'CAN bus', render: bus => <b>{bus.label}</b>},
+    {key: 'state', header: 'Utilization', right: true, render: bus =>
+      <ChannelReading channel={bus.channel}>
+        <span className={canBusUnread(bus) ? 'can-unread' : undefined}>{canBusReading(bus)}</span>
+      </ChannelReading>},
+    {key: 'busOff', header: 'Bus off', right: true, render: bus => counter(bus.busOff)},
+    {key: 'transmitBufferFull', header: 'TX full', right: true,
+     render: bus => counter(bus.transmitBufferFull)},
+    {key: 'receiveErrors', header: 'REC', right: true, render: bus => counter(bus.receiveErrors)},
+    {key: 'transmitErrors', header: 'TEC', right: true, render: bus => counter(bus.transmitErrors)},
+    {key: 'readFailures', header: 'Failed reads', right: true,
+     render: bus => counter(bus.readFailures)}
+  ];
+  return <div className="hw-block">
+    <h3>CAN buses</h3>
+    {buses.length ?
+        <DataTable rows={buses} columns={columns} rowKey={bus => String(bus.index)}/> :
+        <EmptyState>No CAN bus reported.</EmptyState>}
+  </div>;
+}
+
 function HardwarePanel() {
   const snapshot = useSnapshot();
   const dictionary = useDictionary();
 
   const ch = snapshot?.channels ?? {};
+  const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
   const num = (name: string): number|undefined => ch[`${HW}${name}`];
   const flag = (name: string): boolean|undefined => {
     const v = num(name);
     return v === undefined ? undefined : v !== 0;
   };
 
+  const buses = canBuses(ch);
+  const busChannels = useMemo(
+      () => [0, 1, 2, 3].map(i => `${HW}can_buses/${i}/utilization_frac`)
+          .filter(name => present.has(name)),
+      [present]);
   const power = useSeries(
-      [`${HW}battery_v`, `${HW}brownout`, `${HW}can_utilization_frac`],
-      {seconds: 120});
+      [`${HW}battery_v`, `${HW}brownout`, ...busChannels], {seconds: 120});
   const age = useSeries([`${HW}state_age_us`], {seconds: 120});
   const masks = useSeries(
       [`${HW}timed_out_mask`, `${HW}motor_fault_mask`,
        `${HW}motor_forward_limit_mask`, `${HW}motor_reverse_limit_mask`],
       'all');
 
-  const present = useMemo(() => new Set(dictionary.map(c => c.name)), [dictionary]);
   const counterNames = useMemo(
       () => COUNTERS.filter(c => present.has(`${HW}${c.name}`))
           .map(c => `${HW}${c.name}`),
@@ -173,7 +208,6 @@ function HardwarePanel() {
 
   const batteryV = num('battery_v');
   const brownout = flag('brownout');
-  const canFrac = num('can_utilization_frac');
   const healthValid = flag('health_valid');
   const stateAgeUs = num('state_age_us');
   const configured = flag('configured');
@@ -235,7 +269,6 @@ function HardwarePanel() {
         <Stat label="Health valid" channel={`${HW}health_valid`} tone={healthValid === false ? 'warn' : undefined}>
           {healthValid === undefined ? '—' : healthValid ? 'yes' : 'no'}
         </Stat>
-        <Stat label="CAN utilization" channel={`${HW}can_utilization_frac`}>{percent(canFrac)}</Stat>
       </StatList>
       <div className="hw-block">
         <h3>Battery voltage · 2 min</h3>
@@ -247,14 +280,18 @@ function HardwarePanel() {
             brownout === undefined ? 'unknown' : brownout ? 'active' : 'clear'
           }).</p>
       </div>
-      <div className="hw-block">
-        <h3>CAN utilization · 2 min</h3>
-        <TimeSeriesChart
-            lines={[{name: 'can_utilization_frac', color: 'var(--info)',
-                     times: power.times,
-                     values: power.values[`${HW}can_utilization_frac`]}]}
-            height={72} legend={false}/>
-      </div>
+      <CanBusTable buses={buses}/>
+      {busChannels.length > 0 &&
+        <div className="hw-block">
+          <h3>CAN utilization · 2 min</h3>
+          <TimeSeriesChart
+              lines={busChannels.map((name, i) => ({
+                name: buses[i]?.label ?? name,
+                color: BUS_COLORS[i % BUS_COLORS.length],
+                times: power.times, values: power.values[name]}))}
+              height={72} legend={busChannels.length > 1}/>
+          <p className="chart-note">A failed or stale bus holds its last good figure here; its row above says which.</p>
+        </div>}
     </section>
 
     <section className="card">

@@ -179,7 +179,7 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   HardwareNode& node = link.node.value();
   protocol::RuntimeUdpPeer& gateway = link.gateway;
   State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
-  state.health = {true, 9.5, true, 0.81};
+  state.health = {true, 9.5, true};
   state.motor_count = 2;
   state.motors[0].id = cfg.hardware.motors[1].id;
   state.motors[0].valid = true;
@@ -191,7 +191,6 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   EXPECT_TRUE(status.health_valid());
   EXPECT_DOUBLE_EQ(status.battery_v(), 9.5);
   EXPECT_TRUE(status.brownout());
-  EXPECT_DOUBLE_EQ(status.can_utilization_frac(), 0.81);
   EXPECT_EQ(status.motor_fault_mask(), 2u);
   state.health = {};
   EXPECT_EQ(status.motor_forward_limit_mask(), 0u);
@@ -235,6 +234,95 @@ TEST(HardwareNodeTest, ReportsLatestGatewayHealthAndConfiguredMotorFaults) {
   EXPECT_EQ(node.Status(1004000).motor_fault_mask(), 0u);
   EXPECT_EQ(node.Status(1004000).motor_forward_limit_mask(), 3u);
   EXPECT_EQ(node.Status(1004000).motor_reverse_limit_mask(), 2u);
+}
+
+// The RoboRIO's States each report one CAN bus, in turn; over the real link
+// /hw/status carries every configured bus's slot with the figures its last
+// report read, and alert_warning_can_bus_unread while one of them fails.
+// REQ-OPS-20
+TEST(HardwareNodeTest, PublishesEachCanBusSlotAndAlertsOnAFailingBus) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  cfg.hardware.motors[1].bus = "Shooter";  // Slots: 0 "rio", 1 "Shooter".
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  State state = TrustState(NodeConfigId(cfg), 42, 1, 1000);
+  state.health = {.valid = true,
+                  .battery_v = 12.5,
+                  .can_bus_count = 2,
+                  .can_bus_index = 0,
+                  .can_bus = {CanBusReadState::kOk, 0.04F, 0, 0, 0, 0, 0}};
+  ASSERT_TRUE(InjectState(node, link.gateway, state, 1'000'000));
+  state.sample_time_us = 6000;
+  state.health.can_bus_index = 1;
+  state.health.can_bus = {CanBusReadState::kFailed, 0.16F, 2, 5, 96, 130, 3};
+  ASSERT_TRUE(InjectState(node, link.gateway, state, 1'005'000));
+
+  const auto status = node.Status(1'005'000);
+  EXPECT_EQ(status.can_bus_count(), 2);
+  const auto& rio = *status.can_buses()->Get(0);
+  EXPECT_EQ(rio.read_state(), bridge::CanBusReadState::OK);
+  EXPECT_FLOAT_EQ(rio.utilization_frac(), 0.04F);
+  const auto& shooter = *status.can_buses()->Get(1);
+  EXPECT_EQ(shooter.read_state(), bridge::CanBusReadState::FAILED);
+  EXPECT_FLOAT_EQ(shooter.utilization_frac(), 0.16F);
+  EXPECT_EQ(shooter.bus_off_count(), 2u);
+  EXPECT_EQ(shooter.transmit_buffer_full_count(), 5u);
+  EXPECT_EQ(shooter.receive_error_count(), 96);
+  EXPECT_EQ(shooter.transmit_error_count(), 130);
+  EXPECT_EQ(shooter.read_failure_count(), 3u);
+  EXPECT_TRUE(status.alert_warning_can_bus_unread());
+}
+
+// A RoboRIO program one protocol version behind (version 7 States carry no
+// CAN bus slot) is refused frame by frame: no State is accepted, so the link
+// stays lost, and the bridge names the version on stderr once, not per frame.
+// REQ-CONTRACT-01
+TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  Link link;
+  ASSERT_TRUE(link.Open(cfg));
+  HardwareNode& node = link.node.value();
+  talos::hardware::Packet payload{};
+  payload.size = static_cast<uint32_t>(
+      Encode(TrustState(NodeConfigId(cfg), 42, 1, 1000), payload.data));
+  std::array<uint8_t, protocol::kMaxFrameSize> frame{};
+  const std::size_t size = protocol::EncodeFrame(
+      protocol::FrameType::kHardwareState, protocol::kFlagNone, 1, 1000,
+      payload.data.data(), payload.size, frame.data(), frame.size());
+  ASSERT_NE(size, 0u);
+  frame[8] = static_cast<uint8_t>(protocol::kProtocolVersion - 1);
+  frame[9] = 0;
+
+  ::testing::internal::CaptureStderr();
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_EQ(::send(link.gateway.NativeFd(), frame.data(), size, 0),
+              static_cast<ssize_t>(size));
+  }
+  // A current frame behind them: once the bridge has it, it read both.
+  driver_station::DriverStationData data{};
+  data.sample_time_us = 1000;
+  std::vector<uint8_t> ds(1024);
+  ds.resize(driver_station::Encode(data, ds));
+  ASSERT_EQ(link.gateway.SendFrame(protocol::FrameType::kDriverStation, 1, 1000,
+                                   ds.data(), ds.size()),
+            protocol::UdpStatus::kOk);
+  const bool delivered = WaitFor([&] {
+    node.Tick(1'000'000);
+    return node.driver_station_packets_received() > 0;
+  });
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  ASSERT_TRUE(delivered);
+  EXPECT_EQ(node.states_received(), 0u);
+  EXPECT_TRUE(node.Status(1'000'000).alert_error_link_lost());
+  const std::string version =
+      "protocol " + std::to_string(protocol::kProtocolVersion - 1);
+  std::size_t lines = 0;
+  for (auto at = err.find(version); at != std::string::npos;
+       at = err.find(version, at + 1)) {
+    ++lines;
+  }
+  EXPECT_EQ(lines, 1u) << err;
 }
 
 // /hw/status names the build of the gateway boot the bridge accepted, and a

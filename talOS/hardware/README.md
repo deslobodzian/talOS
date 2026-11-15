@@ -268,24 +268,45 @@ revision it was built from and whether that checkout was dirty; set with
 `Gateway::SetBuild`, never acted on), enable/configuration/fault flags,
 and identified motor/sensor samples. Motor samples contain mechanism
 position/velocity, voltage, stator and supply current, temperature, and the
-Phoenix fault bitfield. State also carries valid power/CAN health (battery
-volts, brownout, and the CAN utilization fraction of the busiest configured
-bus still read) and per-boot gateway safety counters. The configured buses
-are the RoboRIO's own bus and any CANivore a configured motor or sensor is
-on. A CANivore's status read blocks about 1 ms, so a reader thread
-(`talos-canbus`, `SCHED_OTHER`, started only for a configuration with a
-CANivore and never in simulation) reads one CANivore every 100 ms, the buses
-in turn, and the loop only copies the figures it published. A CANivore whose
-last read failed, or whose last read is three of its own sampling periods
-old on the loop's clock (300 ms with one CANivore), drops out of the
-maximum until it reads again. The figure then covers only the buses still
-read, and with every CANivore out it is the RoboRIO bus's alone, 0 when
-nothing is on that bus: `/hw/status` cannot tell an idle CANivore from a
-dead one, and the only sign is the RoboRIO console line printed when each
-bus drops out and returns. A new configuration (or the backend's
-destruction) waits at most 50 ms for the reader to stop; a reader stuck in a
-status read that never returns is abandoned with a console line naming the
-bus, and while two abandoned readers are still blocked no new one starts
+Phoenix fault bitfield. State also carries valid power health (battery
+volts, brownout), one CAN bus's health, and per-boot gateway safety
+counters.
+
+The CAN buses are `CanBuses(config)` (`config.h`): slot 0 is the RoboRIO's
+own bus, `"rio"`, whether or not a device names it (the power distribution
+and pneumatics modules share it), then each other bus a motor or sensor
+names (a CANivore), in byte order. A config naming more than three buses
+besides `"rio"` is refused. Each State carries one slot, `sequence % count`
+(`HealthSample::can_bus_index`, `can_bus_count`), with the bus's read state,
+utilization, bus-off and transmit-buffer-full counts, receive and transmit
+error counters (saturated at 255) and the failed reads since the
+configuration was applied; the bridge assembles them into `/hw/status`
+`can_buses` and prints the slot table (index and bus name) on stderr when it
+opens. A read state is `OK` (the last read succeeded and is current),
+`PENDING` (not read yet, within the stale bound of the first tick), `FAILED`
+(the last read failed), `STALE` (no read within the bound) or `SIMULATED`
+(`sim_gateway`, `SimHardware` and the RoboRIO program under WPILib
+simulation, which read no bus; every figure 0); in any state but `OK` the
+figures are the last good read's. `alert_warning_can_bus_unread` holds while
+a slot reads `FAILED` or `STALE`.
+
+On the RoboRIO a bus status read is a vendor library call: the RoboRIO's
+bus through `HAL_CAN_GetCANStatus` (a NetComm call;
+`frc::RobotController::GetCANStatus` would throw on a failed one, which
+reads `FAILED` instead) and a CANivore through Phoenix's
+`CANBus::GetStatus`, which blocks about 1 ms. A reader thread
+(`talos-canbus`, `SCHED_OTHER`, started for every configuration with a
+device, never for one with none and never in simulation) reads one bus every
+100 ms, the buses in turn, and the loop only copies what it published. A
+bus whose last read is three of its own sampling periods old on the loop's
+clock (600 ms with "rio" and one CANivore) reads `STALE`, and the RoboRIO
+console prints each bus's failing spell when it starts and ends. A
+configuration with no device reads no bus, and its "rio" slot is reported
+as not read (`NONE`). A new configuration (or the backend's destruction)
+waits at most 50 ms for the reader to stop; a reader stuck in a status read
+that never returns is abandoned with a console line naming the bus, and
+while two abandoned readers are still blocked no new one starts and every
+bus reads `STALE`
 ([`CanBusHealth.h`](../../2026-robot/controller_processor/rio/src/main/include/CanBusHealth.h)).
 Peers of another protocol version (`kProtocolVersion`, see
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)) are rejected rather than decoded.
@@ -528,8 +549,8 @@ raises no `SIGPIPE` on either end
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, late-feedback, apply
-and neutral send transitions, device resets, brownout, a CANivore leaving
-and rejoining CAN utilization, an abandoned CANivore reader) to `RioLog`
+and neutral send transitions, device resets, brownout, a CAN bus's read
+failing and recovering, an abandoned CAN bus reader) to `RioLog`
 (`src/main/include/RioLog.h`): a preallocated 256-event queue that never
 waits, dropping and counting events when full. A logger thread at nice 19
 (Linux) writes them to stderr, at most one line per second for each kind and
@@ -696,9 +717,10 @@ refreshes resume starts a new mode generation. The reader's start line,
 `driver station reader SCHED_FIFO 5` (or `... (SCHED_FIFO 5 refused, errno
 <n>)`), gives what the kernel holds. A program stop waits at most 100 ms for
 the reader and then abandons it in its call, with the line `driver station
-reader did not stop within 100 ms (...); it was abandoned`. The loop's one
-remaining NetComm library call is the health phase's RoboRIO CAN status read
-(`frc::RobotController::GetCANStatus`, `HAL_CAN_GetCANStatus`).
+reader did not stop within 100 ms (...); it was abandoned`. The loop makes
+no other NetComm library call: the RoboRIO's CAN status read
+(`HAL_CAN_GetCANStatus`) runs on the `talos-canbus` reader, and the loop
+copies its result.
 
 A tick that ends by its deadline sleeps to it, so the loop keeps its phase.
 One that ends past it (an overrun, or a wake more than a period late) drops
