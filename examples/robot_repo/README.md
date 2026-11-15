@@ -58,6 +58,7 @@ applies only in talOS's own workspace, so a repository that depends on talOS
 builds OpenCV unpatched; it differs only under `--config=tsan`
 ([docs/INSTALL.md](../../docs/INSTALL.md)).
 
-Studio's bridge (`@talos//studio/bridge:studio_bridge`) does not build from
-a repository that depends on talOS: its BUILD files load rules that talOS
-declares as development dependencies.
+Studio's bridge (`@talos//studio/bridge:studio_bridge`) builds from a
+repository that depends on talOS; Studio's pages (`@talos//studio:web_dist`)
+do not, since they need rules_js and pnpm, development dependencies of
+talOS.

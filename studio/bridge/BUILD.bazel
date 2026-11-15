@@ -1,4 +1,4 @@
-load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("@aspect_bazel_lib//lib:copy_to_bin.bzl", "copy_to_bin")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
@@ -90,7 +90,12 @@ cc_test(
 # bridge to reproduce them byte for byte; //studio:system_test and
 # :fast_slots_test apply the update in Studio's and the Python harness's
 # fast-value order (README.md, "HTTP and WebSocket views").
-js_library(
+# copy_to_bin, not rules_js's js_library: a robot repository builds
+# :studio_bridge from this package, so it loads nothing from aspect_rules_js,
+# a development dependency of talOS that a dependent module does not get.
+# The copies sit in the output tree, where //studio's js_test reads data
+# (it cannot copy another package's source files itself).
+copy_to_bin(
     name = "golden",
     srcs = glob(["testdata/golden/*"]),
     visibility = ["//studio:__pkg__"],
