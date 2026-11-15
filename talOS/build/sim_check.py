@@ -25,6 +25,8 @@ It passes only when:
 
 - the events above came before the hang bound;
 - the launch kept running until the check stopped it and then exited 0;
+- the session has a readable manifest (a launcher that refuses its graph
+  writes none);
 - every member in the session's manifest ran exactly once (a second run is
   a restart) and exited with code 0 and no signal;
 - the session holds the simulator and at least one node besides it and the
@@ -439,13 +441,24 @@ def controller_link(session, log_dump, report):
 
 def judge(session, log_dump, report):
     """The session's problems (module docstring), empty if it passes."""
-    with open(os.path.join(session, "manifest.json"), encoding="utf-8") as f:
-        manifest = json.load(f)
+    try:
+        with open(os.path.join(session, "manifest.json"),
+                  encoding="utf-8") as f:
+            manifest = json.load(f)
+        nodes = manifest["nodes"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        # The launcher writes the manifest before it starts a member, so a
+        # launch that refused its graph leaves none; its output says why.
+        what = ("no manifest" if isinstance(error, FileNotFoundError)
+                else f"an unreadable manifest ({error})")
+        return [f"the session {os.path.basename(session)} has {what}: the "
+                "launch ended before it started the robot; its output above "
+                "says why"]
     problems = []
     if manifest.get("stopped_before_start"):
         problems.append("the session stopped before every member started")
     names = []
-    for node in manifest["nodes"]:
+    for node in nodes:
         name = node["name"]
         names.append(name)
         runs = node.get("runs", [])
