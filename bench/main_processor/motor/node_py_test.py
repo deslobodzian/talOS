@@ -2,12 +2,13 @@
 testdata/robot.toml: configuration/robot.toml (whose subsystems/motor.toml
 robot_py.toml also launches) plus a neighbor motor that stays connected.
 
-BenchMotorTest is the node test matrix, docs/TESTING.md §7 (the case names
-are the matrix's, which //tools:check_node_matrix looks for), plus the cases
-of node_test.cc it does not already cover. ParityTest runs the C++ node
-(motor.h, hosted through libbench_motor.so) and motor.py on SCENARIO through
-talos.parity, which requires the same /motor/state bytes and the same
-requested and applied motor output after every step.
+node_test.cc carries the node test matrix (docs/TESTING.md §7) for the C++
+node. ParityTest runs that C++ node (motor.h, hosted through
+libbench_motor.so) and motor.py on SCENARIO through talos.parity, which
+requires the same /motor/state bytes and the same requested and applied
+motor output after every step; the `matrix: parity` comments name the steps
+that cover each case. What a parity run cannot compare is tested here:
+construction (case 9) and the framework teleop node driving motor.py.
 """
 
 import math
@@ -19,7 +20,6 @@ from motor import topics
 from motor.ControlMode import ControlMode
 from motor.MotorState import MotorState
 from motor.MotorTarget import MotorTarget
-from motor.TargetSource import TargetSource
 from python.runfiles import runfiles
 from swerve_module.ModuleTarget import ModuleTarget
 from talos import parity, teleop
@@ -41,164 +41,8 @@ MAX_VOLTS = 2.0
 TIMEOUT_S = 0.1
 
 
-class Bench:
-    """One simulated bench: a motor node class on a Sim with SimHardware,
-    driven the way node_test.cc's MotorTest drives the C++ node."""
-
-    def __init__(self, cls):
-        self.sim = Sim(CONFIG)
-        self.sim.add(cls, "motor")
-        self.hw = SimHardware(self.sim)
-
-    def enable(self):
-        """Gateway enabled, Driver Station enabled in teleop."""
-        self.hw.enable()
-        self.hw.set_driver_station(enabled=True, teleop=True)
-        self.sim.step(0.05)
-
-    def send(self, mode, voltage_v=0.0, velocity_rps=0.0, voltage_frac=0.0,
-             mode_since_us=None):
-        """One teleop target, stamped like a producer that has drained the
-        newest Driver Station packet (or with `mode_since_us`), then 10 ms."""
-        self.sim.publish_target(MotorTarget, "motor", "teleop",
-                                mode_since_us=mode_since_us, mode=mode,
-                                voltage_v=voltage_v,
-                                velocity_rps=velocity_rps,
-                                voltage_frac=voltage_frac)
-        self.sim.step(0.01)
-
-    def release(self):
-        self.sim.release_target(MotorTarget, "motor", "teleop")
-        self.sim.step(0.01)
-
-    def request(self):
-        """What the node asked for."""
-        return self.hw.motor_request("motor", "kraken")
-
-    def applied(self):
-        """What the gateway applies, after its enable and expiry gates."""
-        return self.hw.applied_motor("motor", "kraken")
-
-    def state(self):
-        return self.sim.latest(MotorState, topics.STATE)
-
-
 class BenchMotorTest(unittest.TestCase):
-    def setUp(self):
-        self.bench = Bench(bench.BenchMotor)
-        self.sim, self.hw = self.bench.sim, self.bench.hw
-
-    def assert_drives(self, mode, demand):
-        for name, request in (("request", self.bench.request()),
-                              ("applied", self.bench.applied())):
-            with self.subTest(output=name):
-                self.assertEqual(request[:2], (mode, demand))
-
-    def assert_neutral(self):
-        self.assertEqual(self.bench.request().mode, NEUTRAL)
-        self.assertEqual(self.bench.applied().mode, NEUTRAL)
-        state = self.bench.state()
-        self.assertEqual(state.mode, ControlMode.NEUTRAL)
-        self.assertEqual(state.source, TargetSource.NONE)
-
-    # REQ-SAFE-07
-    def test_drives_at_a_live_lane(self):
-        self.bench.enable()
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-        state = self.bench.state()
-        self.assertTrue(state.enabled)
-        self.assertEqual(state.mode, ControlMode.VELOCITY)
-        self.assertEqual(state.source, TargetSource.TELEOP)
-        # An explicit NEUTRAL target drives nothing, whatever else it says.
-        self.bench.send(ControlMode.NEUTRAL, voltage_v=2.0, velocity_rps=30.0)
-        self.assert_neutral()
-
-    def test_voltage_is_clamped_and_axis_uses_node_scale(self):
-        self.bench.enable()
-        self.bench.send(ControlMode.VOLTAGE, voltage_v=20.0)
-        self.assert_drives(VOLTAGE, MAX_VOLTS)
-        self.bench.send(ControlMode.VOLTAGE, voltage_v=-20.0)
-        self.assertEqual(self.bench.request().demand, -MAX_VOLTS)
-        self.bench.send(ControlMode.VOLTAGE, voltage_frac=0.25)
-        self.assertEqual(self.bench.request().demand, 0.25 * MAX_VOLTS)
-        self.assertEqual(self.bench.state().source, TargetSource.TELEOP)
-
-    # REQ-SAFE-02
-    def test_disabled_robot_goes_neutral(self):
-        self.bench.enable()
-        self.hw.set_motor("motor", "kraken", 0.0, 0.0, 0, 0, 48.5, 3.25)
-        self.bench.send(ControlMode.VOLTAGE, voltage_v=1.0)
-        self.assert_drives(VOLTAGE, 1.0)
-        self.hw.enable(False)
-        self.sim.step(0.01)
-        self.assert_neutral()
-        state = self.bench.state()  # still published, health still visible
-        self.assertFalse(state.enabled)
-        self.assertTrue(state.connected)
-        self.assertEqual(state.temperature_degc, 48.5)
-        self.assertAlmostEqual(state.supply_current_a, 3.3)
-
-    # REQ-SAFE-07
-    def test_stale_lane_goes_neutral(self):
-        self.bench.enable()
-        self.hw.set_motor("motor", "kraken", 0.0, 0.0, 0, 0, 48.5, 3.25)
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-        self.sim.step(TIMEOUT_S + 0.01)
-        self.assert_neutral()
-        state = self.bench.state()  # still published, health still visible
-        self.assertEqual(state.temperature_degc, 48.5)
-        self.assertAlmostEqual(state.supply_current_a, 3.3)
-
-    # REQ-SAFE-07
-    def test_released_lane_goes_neutral(self):
-        self.bench.enable()
-        self.bench.send(ControlMode.VOLTAGE, voltage_v=1.0)
-        self.assert_drives(VOLTAGE, 1.0)
-        self.bench.release()
-        self.assert_neutral()
-
-    # REQ-SAFE-01
-    def test_never_sent_goes_neutral(self):
-        self.bench.enable()
-        self.assert_neutral()
-        self.assertTrue(self.bench.state().enabled)
-
-    # REQ-SAFE-07
-    def test_driver_station_loss_goes_neutral(self):
-        self.bench.enable()
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-        self.hw.stop_driver_station()
-        for _ in range(16):  # the lane stays live past the DS view's expiry
-            self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_neutral()
-
-    # REQ-CONTRACT-25
-    def test_disconnected_feedback_goes_neutral(self):
-        self.bench.enable()
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-        self.hw.set_connected("motor", "kraken", False)
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_neutral()
-        state = self.bench.state()
-        # The neighbor keeps the robot enabled: the node's own gate decides.
-        self.assertTrue(state.enabled)
-        self.assertFalse(state.connected)
-        self.assertFalse(state.acquisition_valid)
-
-    # REQ-SAFE-04
-    def test_non_finite_demand_goes_neutral(self):
-        self.bench.enable()
-        for field, mode in (("voltage_v", ControlMode.VOLTAGE),
-                            ("voltage_frac", ControlMode.VOLTAGE),
-                            ("velocity_rps", ControlMode.VELOCITY)):
-            for value in (math.nan, math.inf):
-                with self.subTest(field=field, value=value):
-                    self.bench.send(mode, **{field: value})
-                    self.assert_neutral()
+    # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
     # REQ-CONTRACT-18
     def test_bad_parameter_fails_construction(self):
@@ -213,78 +57,6 @@ class BenchMotorTest(unittest.TestCase):
                 with self.assertRaisesRegex((ValueError, talos.TalosError),
                                             "max_bench_voltage_v"):
                     sim.add(bench.BenchMotor, "motor")
-
-    # REQ-SAFE-07
-    def test_other_modes_lane_is_ignored(self):
-        # The bench policy lists no autonomous source, so only the teleop
-        # lane exists: it must not drive in autonomous.
-        self.hw.enable()
-        self.hw.set_driver_station(enabled=True, autonomous=True)
-        self.sim.step(0.05)
-        for _ in range(4):
-            self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_neutral()
-        self.hw.set_driver_station(enabled=True, teleop=True)
-        self.sim.step(0.05)
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-
-    # REQ-SAFE-09
-    def test_earlier_generation_target_is_ignored(self):
-        self.bench.enable()
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-        before = self.sim.driver_station_generation
-        self.hw.set_driver_station(teleop=True)  # disabled
-        self.sim.step(0.04)
-        self.hw.set_driver_station(enabled=True, teleop=True)
-        self.sim.step(0.02)
-        self.assertNotEqual(self.sim.driver_station_generation, before)
-        # A target its producer queued under the earlier enable.
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0,
-                        mode_since_us=before)
-        self.assert_neutral()
-        # The same target stamped with the current generation drives at once.
-        self.bench.send(ControlMode.VELOCITY, velocity_rps=10.0)
-        self.assert_drives(VELOCITY, 10.0)
-
-    # matrix: n/a 12 (a Python tick allocates in the interpreter)
-
-    def test_reports_injected_feedback_and_acquisition_ages(self):
-        self.bench.enable()
-        self.hw.set_motor("motor", "kraken", 4.5, -7.0, 2000, 1000, 42.5, 6.25)
-        self.sim.step(0.01)
-        state = self.bench.state()
-        self.assertEqual(state.position_rot, 4.5)
-        self.assertEqual(state.velocity_rps, -7.0)
-        self.assertEqual(state.temperature_degc, 42.5)
-        self.assertAlmostEqual(state.supply_current_a, 6.3)
-        self.assertTrue(state.connected)
-        self.assertTrue(state.acquisition_valid)
-        self.assertEqual(state.position_age_us - state.velocity_age_us, 1000)
-        self.hw.set_connected("motor", "kraken", False)
-        self.sim.step(0.01)
-        state = self.bench.state()
-        self.assertFalse(state.connected)
-        self.assertFalse(state.acquisition_valid)
-        self.assertEqual(state.temperature_degc, 0.0)
-        self.assertEqual(state.supply_current_a, 0.0)
-
-    def test_reports_limit_switches_and_clears_them_on_stale_state(self):
-        self.bench.enable()
-        for forward, reverse in ((True, False), (False, True)):
-            with self.subTest(forward=forward, reverse=reverse):
-                self.hw.set_limit_switches("motor", "kraken", forward, reverse)
-                self.sim.step(0.01)
-                state = self.bench.state()
-                self.assertEqual(state.forward_limit, forward)
-                self.assertEqual(state.reverse_limit, reverse)
-        self.hw.set_limit_switches("motor", "kraken", True, True)
-        self.hw.lose_states(1000)
-        self.sim.step(0.2)
-        state = self.bench.state()
-        self.assertFalse(state.forward_limit)
-        self.assertFalse(state.reverse_limit)
 
 
 class ModuleLaneReader:
@@ -330,16 +102,34 @@ class BenchTeleopTest(unittest.TestCase):
 
 def target(mode, generation=None, voltage_v=0.0, velocity_rps=0.0,
            voltage_frac=0.0):
-    """A teleop MotorTarget, as Bench.send sends it."""
+    """A teleop MotorTarget stamped with the current generation, or with
+    the one remembered as `generation`, then 10 ms."""
     return parity.send(MotorTarget, "teleop", generation=generation,
                        mode=mode, voltage_v=voltage_v,
                        velocity_rps=velocity_rps, voltage_frac=voltage_frac)
 
 
-# Each step's input; talos.parity compares /motor/state and the kraken's
-# requested and applied output after it.
+# The matrix cases node_test.cc proves for the C++ node, and the steps that
+# put motor.py through the same inputs:
+# matrix: parity 1 node_test.cc "velocity", "teleop, current generation"
+# matrix: parity 2 node_test.cc "gateway disabled"
+# matrix: parity 3 node_test.cc "stale lane"
+# matrix: parity 4 node_test.cc "released"
+# matrix: parity 5 node_test.cc "enabled, never sent"
+# matrix: parity 6 node_test.cc "Driver Station lost"
+# matrix: parity 7 node_test.cc "disconnected"
+# matrix: parity 8 node_test.cc "non-finite voltage", "non-finite axis"
+# matrix: parity 8 node_test.cc "infinite velocity"
+# matrix: parity 10 node_test.cc "autonomous, teleop lane"
+# matrix: parity 11 node_test.cc "autonomous, earlier teleop generation"
+# matrix: parity 11 node_test.cc "teleop, autonomous generation"
+# matrix: parity 11 node_test.cc "teleop, first teleop generation"
+# node_test.cc's VoltageIsClampedAndAxisUsesNodeScale: the three voltage
+# steps; ReportsInjectedFeedbackAndAcquisitionAges: "feedback" and
+# "disconnected"; ReportsLimitSwitchesAndClearsThemOnStaleState: "limit
+# switches" and "hardware state lost".
 SCENARIO = [
-    ("disabled", parity.wait(0.05)),
+    ("disabled", parity.wait(0.05), parity.require_published()),
     ("enabled, never sent", parity.gateway(True),
      parity.driver_station(enabled=True, teleop=True, then=0.05)),
     ("voltage above the clamp", target(ControlMode.VOLTAGE, voltage_v=20.0)),
@@ -352,9 +142,10 @@ SCENARIO = [
      parity.device("set_motor", "kraken", 4.5, -7.0, 2000, 1000, 42.5, 6.25,
                    12.0),
      target(ControlMode.VELOCITY, velocity_rps=-3.0)),
-    ("non-finite voltage", target(ControlMode.VOLTAGE, voltage_v=math.nan)),
-    ("infinite velocity", target(ControlMode.VELOCITY, velocity_rps=math.inf)),
     ("released", parity.release(MotorTarget, "teleop")),
+    ("non-finite voltage", target(ControlMode.VOLTAGE, voltage_v=math.nan)),
+    ("non-finite axis", target(ControlMode.VOLTAGE, voltage_frac=math.nan)),
+    ("infinite velocity", target(ControlMode.VELOCITY, velocity_rps=math.inf)),
     ("stale lane", target(ControlMode.VOLTAGE, voltage_frac=0.25),
      parity.wait(TIMEOUT_S + 0.01)),
     ("limit switches",
@@ -381,11 +172,13 @@ SCENARIO = [
      target(ControlMode.VELOCITY, "first teleop", velocity_rps=10.0)),
     ("teleop, current generation",
      target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("gateway disabled", parity.gateway(False),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("gateway enabled again", parity.gateway(True, then=0.02),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
     ("Driver Station lost", parity.stop_driver_station(),
      *[target(ControlMode.VELOCITY, velocity_rps=10.0)] * 16),
     ("hardware state lost", parity.lose_states(1000), parity.wait(0.2)),
-    ("gateway disabled", parity.gateway(False),
-     target(ControlMode.VELOCITY, velocity_rps=10.0)),
 ]
 
 

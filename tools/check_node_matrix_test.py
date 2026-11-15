@@ -119,6 +119,40 @@ class CheckNodeMatrixTest(unittest.TestCase):
             body + "// matrix: n/a 9, 12\n", "cpp", "observer")
         self.assertEqual(sorted(missing(result)), [9, 12])
 
+    def test_a_parity_claim_holds_only_with_its_run_cpp_case_and_steps(self):
+        # A Python twin may cover a case by its talos.parity scenario only
+        # when the file runs one, the C++ test carries the case, and the
+        # steps it names are in the scenario; otherwise the lint fails
+        # naming the case, so a case cannot be dropped by a bare comment.
+        cpp = "TEST_F(ArmTest, StaleLaneGoesNeutral) {}\n"
+        run = ('SCENARIO = [\n    ("stale lane", wait(0.2)),\n]\n'
+               "    parity.assert_same_behaviour(Cpp, Py, CONFIG, \"arm\",\n"
+               "                                 SCENARIO)\n")
+        claim = '# matrix: parity 3 node_test.cc "stale lane"\n'
+
+        def sibling(files):
+            return files.get
+
+        _, result = check_node_matrix.check(
+            claim + run, "py", "actuator", sibling({"node_test.cc": cpp}))
+        self.assertEqual(result[3][0], "parity")
+        for why, text, files in (
+                ("no parity run", claim + run.split("    parity.")[0],
+                 {"node_test.cc": cpp}),
+                ("C++ file lacks the case", claim + run,
+                 {"node_test.cc": "TEST_F(ArmTest, Other) {}\n"}),
+                ("no C++ file", claim + run, {}),
+                ("missing step",
+                 claim.replace("stale lane", "stale target") + run,
+                 {"node_test.cc": cpp}),
+                ("construction cannot be compared",
+                 claim.replace("parity 3", "parity 9") + run,
+                 {"node_test.cc": cpp})):
+            with self.subTest(why), self.assertRaisesRegex(
+                    check_node_matrix.MatrixError, r"parity [39]:"):
+                check_node_matrix.check(text, "py", "actuator",
+                                        sibling(files))
+
     def test_finds_node_packages_and_the_nodes_a_manifest_launches(self):
         # bot/arm is under the scanned root; lib/teleop only in its manifest.
         with tempfile.TemporaryDirectory() as root:

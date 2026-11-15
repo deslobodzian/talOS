@@ -209,7 +209,7 @@ Where RULES.md 12 is read too broadly or too narrowly:
 Every node gets a `Sim`/`SimHardware` (C++) or `talos.testing` (Python) test
 file with these cases, under these names (Python: `test_<snake_case>`).
 `bazel run //tools:check_node_matrix -- [PATH...]` reports each node test's
-cases as present, n/a or missing and fails on a missing one. **[enforced:
+cases as present, n/a, parity (below) or missing and fails on a missing one. **[enforced:
 the CI lint job runs it with `--baseline tools/check_node_matrix_baseline.txt`,
 a list of known-missing cases that only shrinks and is empty today]**
 
@@ -247,11 +247,18 @@ actuator; a Python package that only wraps C++ nodes (`talos.cpp_node`) is
 checked in its C++ package.
 
 A node implemented in both languages (a C++ class and a Python class, not a
-`talos.cpp_node` wrapper) also runs one shared scenario through
-`talos.parity` against both (REQ-CONTRACT-14): the inputs of matrix cases
-1 to 8, 10 and 11 as steps, including a Driver Station mode change (teleop,
-disabled, autonomous, teleop) with targets stamped under each earlier
-generation. The
+`talos.cpp_node` wrapper) carries the full matrix in its C++ test. Its
+Python test runs one scenario through `talos.parity` against both
+(REQ-CONTRACT-14) and claims each case it covers with
+`# matrix: parity <case> <C++ test file> "<step>"[, "<step>"]` instead of
+repeating the test. The lint accepts a claim only when the file calls
+`assert_same_behaviour`, the C++ file has that case as a test, and every
+named step is in the file's scenario table; the scenario includes a Driver
+Station mode change (teleop, disabled, autonomous, teleop) with targets
+stamped under each earlier generation. Cases 9 and 12 cannot be claimed (a
+parity run compares no construction and no allocation), so construction
+and anything only the Python node does keep their own Python tests.
+`bench/main_processor/motor/node_py_test.py` is the example; the
 [node development guide](NODE_DEVELOPMENT_GUIDE.md#testing) gives the API.
 
 A case that does not apply is a comment in the test file naming why:

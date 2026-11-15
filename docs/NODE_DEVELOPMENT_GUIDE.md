@@ -627,8 +627,9 @@ callable taking the run's `sim`, `hw` and `node`), against a node's C++ class
 topics=[(M, topic)], motors=[...], digital_outputs=[...], pwms=[...])` fails
 at the first step after which a listed topic's bytes or a requested or
 applied output differ (or a topic a `parity.require_published()` step names
-has no message), naming the step and both decoded values. See
-`bench/main_processor/motor/node_py_test.py`.
+has no message), naming the step and both decoded values. How a parity run
+stands in for a Python twin's matrix cases is in
+[TESTING.md §7](TESTING.md#7-the-node-test-matrix).
 
 ## Adding a pose estimator
 

@@ -28,6 +28,15 @@ Comments in the test file, each on its own line (`//` in C++, `#` in Python):
 - `matrix: n/a <case>[, <case>] (reason)`: those cases do not apply.
 - `matrix: role <role> (reason)`: overrides the inferred role. An actuator
   stays an actuator, and `hosted` is refused in a file that defines tests.
+- `matrix: parity <case> <C++ test file> "<step>"[, "<step>"]` (Python
+  only): the C++ twin's test file, beside this one, carries the case, and
+  this file's `talos.parity` scenario runs the Python node through the
+  named steps, compared with the C++ node. It is accepted only when this
+  file calls `assert_same_behaviour`, the C++ file has the case as a test,
+  and each step is a name in this file's scenario table (`("<step>",`).
+  Several lines may claim one case; their steps add up. Cases 9 and 12
+  cannot be claimed: a parity run compares neither construction nor
+  allocation. A claim that does not hold fails, naming the case.
 
 Case 12 never applies to a Python node. Prints one row per test file, then
 each missing case or bad comment; exits 1 when there is any, 2 on a bad
@@ -83,7 +92,8 @@ CASES = {
     "hosted": {},
 }
 PYTHON_EXEMPT = {12: "a Python tick allocates in the interpreter"}
-CELL = {"present": "ok", "n/a": "na", "missing": "MISSING"}
+CELL = {"present": "ok", "n/a": "na", "parity": "pa",
+        "missing": "MISSING"}
 
 NODE_RULE = re.compile(r"^\s*talos_(cc|py|cc_shared)_node\(", re.MULTILINE)
 NODES = re.compile(r"^NODES = \[(.*?)\]", re.MULTILINE | re.DOTALL)
@@ -108,6 +118,15 @@ ROLE = re.compile(r"^[ \t]*(?://|#)[ \t]*matrix:[ \t]*role[ \t]+(\w+)(.*)$",
 NOT_APPLICABLE = re.compile(
     r"^[ \t]*(?://|#)[ \t]*matrix:[ \t]*n/a[ \t]+(\d+(?:[ \t]*,[ \t]*\d+)*)"
     r"(.*)$", re.MULTILINE)
+PARITY = re.compile(r"^[ \t]*#[ \t]*matrix:[ \t]*parity\b(.*)$",
+                    re.MULTILINE)
+PARITY_CLAIM = re.compile(
+    r"^[ \t]+(\d+)[ \t]+([\w./-]+\.cc)[ \t]+"
+    r"(\"[^\"]+\"(?:[ \t]*,[ \t]*\"[^\"]+\")*)[ \t]*$")
+PARITY_RUN = re.compile(r"^[ \t]*(?:[\w.]+\.)?assert_same_behaviour\(",
+                        re.MULTILINE)
+# A parity run compares ticks, not a constructor or an allocation count.
+NOT_PARITY = {9: "construction", 12: "allocation"}
 CC_TEST = re.compile(r"^\s*TEST(?:_F|_P)?\(\s*\w+\s*,\s*(\w+)\s*\)",
                      re.MULTILINE)
 PY_TEST = re.compile(r"^\s*def\s+(test_\w+)\s*\(", re.MULTILINE)
@@ -143,11 +162,52 @@ def infer_role(sources):
     return "observer"
 
 
-def check(text, lang, role):
+def parity_claims(text, role, sibling):
+    """{case: detail} from a Python test's `matrix: parity` comments, each
+    checked; `sibling(name)` is the text of a file beside the test, or None.
+    Raises MatrixError naming the case of a claim that does not hold."""
+    claims = {}
+    for match in PARITY.finditer(text):
+        claim = PARITY_CLAIM.match(match.group(1))
+        if not claim:
+            raise MatrixError(
+                f"matrix: parity{match.group(1)}: expected "
+                f'\'parity <case> <C++ test file> "<step>"[, "<step>"]\'')
+        case, cc_file = int(claim.group(1)), claim.group(2)
+        steps = re.findall(r'"([^"]+)"', claim.group(3))
+        if case in NOT_PARITY:
+            raise MatrixError(f"matrix: parity {case}: a parity run does not "
+                              f"compare {NOT_PARITY[case]}")
+        if case not in CASES[role]:
+            raise MatrixError(f"matrix: parity {case}: not a case of the "
+                              f"{role} role")
+        if not PARITY_RUN.search(text):
+            raise MatrixError(f"matrix: parity {case}: the file runs no "
+                              f"talos.parity assert_same_behaviour")
+        cc_text = sibling(cc_file)
+        if cc_text is None:
+            raise MatrixError(f"matrix: parity {case}: no C++ test file "
+                              f"{cc_file}")
+        name = CASES[role][case]
+        if name not in CC_TEST.findall(cc_text):
+            raise MatrixError(f"matrix: parity {case}: {cc_file} has no "
+                              f"test {name}")
+        for step in steps:
+            if not re.search(rf'\(\s*"{re.escape(step)}"\s*,', text):
+                raise MatrixError(f"matrix: parity {case}: no scenario step "
+                                  f"{step!r}")
+        claims.setdefault(case, (f"{cc_file} {name}", []))[1].extend(steps)
+    return {case: f"{test}; steps " + ", ".join(repr(s) for s in steps)
+            for case, (test, steps) in claims.items()}
+
+
+def check(text, lang, role, sibling=lambda name: None):
     """(role, {case: (status, detail)}) for one test file's text, `role`
-    being the package's inferred role: status is "present", "n/a" or
-    "missing"; detail is the case's name in `lang`, or the n/a reason.
-    Raises MatrixError for a role override the rules refuse."""
+    being the package's inferred role: status is "present", "n/a", "parity"
+    or "missing"; detail is the case's name in `lang`, the n/a reason or
+    the parity claim. `sibling(name)` reads a file beside the test (None
+    when there is none), for a parity claim's C++ test. Raises MatrixError
+    for a role override or a parity claim the rules refuse."""
     names = set((PY_TEST if lang == "py" else CC_TEST).findall(text))
     for match in ROLE.finditer(text):
         override, why = match.group(1), reason(match.group(2))
@@ -167,14 +227,18 @@ def check(text, lang, role):
     for match in NOT_APPLICABLE.finditer(text):
         for case in re.findall(r"\d+", match.group(1)):
             not_applicable[int(case)] = reason(match.group(2))
+    parity = {}
     if lang == "py":
         for case, why in PYTHON_EXEMPT.items():
             not_applicable.setdefault(case, why)
+        parity = parity_claims(text, role, sibling)
     result = {}
     for case, name in CASES[role].items():
         name = f"test_{snake(name)}" if lang == "py" else name
         if name in names:
             result[case] = ("present", name)
+        elif case in parity:
+            result[case] = ("parity", parity[case])
         elif not_applicable.get(case):
             result[case] = ("n/a", not_applicable[case])
         elif case in not_applicable:
@@ -187,6 +251,14 @@ def check(text, lang, role):
 def read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
+
+
+def beside(path):
+    """A reader of the files in `path`'s directory: their text, or None."""
+    def read_beside(name):
+        full = os.path.join(os.path.dirname(path), name)
+        return read(full) if os.path.isfile(full) else None
+    return read_beside
 
 
 def is_test(name):
@@ -316,7 +388,8 @@ def main(argv):
                       for case in CASES[role]}
         else:
             try:
-                role, result = check(read(path), language(path), role)
+                role, result = check(read(path), language(path), role,
+                                     beside(path))
             except MatrixError as error:
                 failed = True
                 print(f"{shown}  [{role}]  {error}")
