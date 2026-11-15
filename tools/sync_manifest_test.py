@@ -226,7 +226,19 @@ class SyncManifestTest(unittest.TestCase):
                 self.assertEqual(
                     sync_manifest.main(["--check", "bot/robot.toml"]), 1)
             self.assertIn("bot/trajectories/taxi.traj", errors.getvalue())
-            self.assertIn(sync_manifest.COMMAND, errors.getvalue())
+            self.assertIn("bazel run //tools:sync_manifest -- bot/robot.toml",
+                          errors.getvalue())
+            # REQ-DEV-30: where talOS is a dependency (canonical name
+            # talos+), the command names it as that repository runs it.
+            with mock.patch.object(sync_manifest, "current_repository",
+                                   return_value="talos+"):
+                errors = io.StringIO()
+                with contextlib.redirect_stderr(errors):
+                    self.assertEqual(
+                        sync_manifest.main(["--check", "bot/robot.toml"]), 1)
+            self.assertIn(
+                "bazel run @talos//tools:sync_manifest -- bot/robot.toml",
+                errors.getvalue())
             sync_manifest.write(self.root, "bot/robot.toml")
             with open(os.path.join(self.root, "bot/robot_manifest.bzl"),
                       encoding="utf-8") as f:
