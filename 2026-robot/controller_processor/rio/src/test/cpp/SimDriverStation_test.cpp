@@ -105,11 +105,42 @@ TEST_F(SimDriverStationTest, AutoEnableDisablesOnceAtDeadline) {
   EXPECT_FALSE(Published().enabled);
 }
 
-// What the gateway would send: the Driver Station packet sampled the way
-// Robot.cpp samples it, through WPILib.
+// What the gateway would send: a refresh, as the Driver Station reader's
+// thread makes it, and its snapshot (SnapshotDriverStation).
 talos::driver_station::DriverStationData Sampled() {
   frc::DriverStation::RefreshData();
   return talos::driver_station::SampleDriverStation(1);
+}
+
+// The Driver Station packet is one refresh whole only while the reader's
+// thread is the program's one refresher of WPILib's cache
+// (DriverStationReader.h). A scripted mode or joystick event runs on the
+// loop thread, so it must hand its data to the HAL and wake the reader, not
+// refresh the cache itself (DriverStationSim::NotifyNewData does): a refresh
+// there could land between the reader's read of the control word and of the
+// joysticks, a snapshot with one refresh's mode and another's sticks. So the
+// cache shows the event only after a refresh, and the next refresh shows it
+// whole.
+// REQ-SAFE-13
+TEST_F(SimDriverStationTest, ScriptedEventsLeaveTheRefreshToTheReader) {
+  namespace ds = talos::driver_station;
+  frc::DriverStation::RefreshData();
+  ASSERT_FALSE(frc::DriverStation::IsEnabled());
+  const auto t0 = SimDriverStation::Clock::time_point{} + 1h;
+  auto settings = Active();
+  settings.enable_when_configured = true;
+  settings.joysticks = ParseJoystickSchedule("0:axes=0.25;buttons=1;pov=-1");
+  SimDriverStation sim{settings, t0};
+  sim.Update(t0 + 1s, true);
+  ASSERT_TRUE(Published().enabled);
+  EXPECT_FALSE(frc::DriverStation::IsEnabled())
+      << "the simulated Driver Station refreshed WPILib's cache itself";
+
+  const auto packet = Sampled();
+  EXPECT_NE(packet.fms.flags & ds::kEnabled, 0u);
+  ASSERT_TRUE(packet.joysticks[0].connected);
+  EXPECT_FLOAT_EQ(packet.joysticks[0].axes[0], 0.25f);
+  EXPECT_EQ(packet.joysticks[0].buttons, 1u);
 }
 
 // A scripted joystick must reach the gateway's Driver Station packet as a
