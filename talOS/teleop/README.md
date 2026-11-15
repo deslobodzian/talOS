@@ -73,6 +73,6 @@ neutral for one evaluation: buttons and POVs released, and each axis finite
 and inside the wider of its `deadband_frac` and 0.05
 (`kArmingNeutralFloorFrac`, `deadband.h`). The floor lets a stick resting a few
 counts off zero arm a binding with no deadband; such a binding still outputs
-the raw axis, so its first command after arming is under 5 % of `scale`. A bound POV must centre even if held in a different direction than
+the raw axis, so its first command after arming is at most 5 % of `scale`. A bound POV must centre even if held in a different direction than
 its binding. Edge history is seeded from that snapshot, so a button held through
 a restart neither commands nor flips a toggle.
