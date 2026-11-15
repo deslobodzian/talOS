@@ -2876,13 +2876,14 @@ KINDS = {
 }
 
 
-def kind_summary(kind):
-    """The archetype generated and the others, printed before `Next:`, since
-    leaving out --type gives a velocity node without saying so."""
-    others = "".join(f"\n    {other}: {what}"
-                     for other, what in KINDS.items() if other != kind)
+def kind_summary(kind, kinds=tuple(KINDS)):
+    """The archetype generated and the others of `kinds` (the tool's --type
+    choices), printed before `Next:`, since leaving out --type gives a
+    velocity node without saying so."""
+    others = "".join(f"\n    {other}: {KINDS[other]}"
+                     for other in kinds if other != kind)
     return (f"Type: {kind}, {KINDS[kind]}.\n"
-            f"  Other types (--type {'|'.join(KINDS)}):{others}")
+            f"  Other types (--type {'|'.join(kinds)}):{others}")
 
 
 def shown(base, path):

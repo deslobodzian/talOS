@@ -30,7 +30,9 @@ subsystems; the hardware bridge joins every launch on its own. More
 mechanisms come from new_subsystem, and `./sim.sh --config
 <robot_sim.toml> --sim-gateway` runs the robot in simulation. The robot name follows the node-name rules (talOS/NAMING.md,
 new_subsystem's check_name): it becomes a Bazel package and a Python import
-root. Everything is checked before anything is written.
+root. Everything is checked before anything is written. It then prints
+the mechanism's type and the other --type choices, as new_subsystem does
+(its kind_summary), and the next steps.
 
 Run it with `bazel run` (`bazel run //tools:new_robot -- --help` lists the
 options): it imports //tools:sync_manifest, which finds the configuration
@@ -236,6 +238,10 @@ at the robot and sets `commissioned = true`.
 """
 
 
+# The archetypes a first mechanism may take: a robot's first is an actuator.
+KINDS = ("velocity", "position")
+
+
 def check_robot_name(name):
     """Why `name` cannot name a robot, or None. A robot directory is a Bazel
     package and an import root beside talOS/, so it follows the node-name
@@ -354,7 +360,7 @@ def main(argv):
     parser.add_argument("--lang", choices=("cpp", "py"),
                         help="the mechanism's language (with --mechanism)")
     parser.add_argument("--type", dest="kind",
-                        choices=("velocity", "position"),
+                        choices=KINDS,
                         help="the mechanism's archetype (default: velocity)")
     parser.add_argument("--dir", default=".",
                         help="directory to create the robot in, relative to "
@@ -391,6 +397,8 @@ def main(argv):
             print(f"wrote {shown(root, path)}")
     real_root = os.path.realpath(root)
     robot = rel(real_root, os.path.join(real_root, args.dir, args.name))
+    if args.mechanism is not None:
+        print(new_subsystem.kind_summary(args.kind, KINDS))
     print(next_steps(robot, args.mechanism, can_id, args.kind, args.lang))
     return 0
 
