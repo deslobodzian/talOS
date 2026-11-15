@@ -1,15 +1,20 @@
 """Pose estimator: swerve odometry fused with camera pose observations.
 
-Every tick the estimator folds the newest drivetrain sample (module positions
-and gyro yaw, taken at sample_time_ns) into its estimate, adds every camera
-observation that arrived since the previous tick and passes the checks below,
-in capture-time order, and publishes the field pose on /pose_estimator/state.
-It owns no actuators and runs whether the robot is enabled or not.
+The estimator folds every drivetrain sample (module positions and gyro yaw,
+taken at sample_time_ns) into its estimate, in sequence; every tick it adds
+every camera observation that arrived since the previous tick and passes the
+checks below, in capture-time order, and publishes the field pose on
+/pose_estimator/state. It owns no actuators and runs whether the robot is
+enabled or not.
 
-Camera observations arrive through callback subscriptions, which deliver every
-message in sequence (a latest-value read would lose all but the newest frame
-per tick, and an invalid frame could hide a valid one). The callback only
-queues valid, tagged frames, at most MAX_PENDING_OBSERVATIONS per camera;
+Both inputs arrive through at-drain callback subscriptions, which deliver
+every message in sequence at the drain right before update() and wake
+nothing. A latest-value read would keep one drivetrain sample of the four the
+drivetrain publishes per tick, integrating odometry over 20 ms steps that
+cannot follow a robot turning while it drives, and would lose all but the
+newest camera frame per tick (and an invalid frame could hide a valid one).
+The drivetrain callback integrates each sample; the camera callback only
+queues valid, tagged frames, at most MAX_PENDING_OBSERVATIONS per camera, and
 update() fuses the queue.
 
 The configured initial_* pose is the startup seed in the blue-origin field
@@ -281,10 +286,10 @@ class FactorGraphBackend:
     follows the constant twist between the two samples (the same arc the
     odometry step assumes), so the attachment adds no error for motion of
     constant velocity across one sample interval; otherwise it adds the
-    deviation from that arc over at most half an interval (centimetres only
-    under extreme acceleration at 20 ms samples), plus nothing of the time
-    offset, which nearest-key attachment alone would cost: speed times half
-    an interval, 4 cm at 4 m/s.
+    deviation from that arc over at most half an interval (millimetres only
+    under extreme acceleration at the drivetrain's 5 ms samples), plus
+    nothing of the time offset, which nearest-key attachment alone would
+    cost: speed times half an interval, 1 cm at 4 m/s.
 
     A GTSAM exception leaves iSAM2 unusable (the failed factor stays in its
     graph and every later update fails), so none escapes: the smoother
@@ -511,7 +516,11 @@ class PoseEstimator:
             backend_class = (KalmanBackend if backend == "kalman"
                              else FactorGraphBackend)
             self.backend = backend_class(kinematics, *backend_args)
-        self.drive = node.subscribe(DrivetrainState, drivetrain_topics.STATE)
+        # Every drivetrain sample, in sequence, integrated by the drain before
+        # update() (AT_DRAIN: the drivetrain's 200 Hz ticks wake nothing).
+        self.drive = node.subscribe(
+            DrivetrainState, drivetrain_topics.STATE,
+            callback=self.on_drivetrain_state, wake=talos.Wake.AT_DRAIN)
         cameras = node.param("cameras")
         if (not isinstance(cameras, list)
                 or not all(isinstance(c, str) and c for c in cameras)):
@@ -534,6 +543,10 @@ class PoseEstimator:
         self.accepted = 0
         self.rejected = 0
         self.odometry_rejected_count = 0
+        self.odometry_integrated_count = 0
+        # The newest delivered drivetrain state when integrate() found it
+        # usable, else None: update()'s validity and velocity come from it.
+        self.drive_sample = None
         self.checked_ns = 0
         self.relocalization_candidates = []
         self.localized = False
@@ -558,9 +571,21 @@ class PoseEstimator:
             self.rejected += 1
         queue.append(o)
 
+    def on_drivetrain_state(self, d):
+        """Drivetrain callback, every state in sequence, at the drain before
+        the next update(): integrate it."""
+        self.drive_sample = d if self.integrate(d) else None
+
     def update(self):
         self.observe_driver_station()
-        drive = self.integrate()
+        drive = self.drive_sample
+        # Fresh: the newest delivered state, counted from its publication; a
+        # sample the gateway stopped refreshing is as stale as no message.
+        if (drive is not None
+                and (not self.drive.fresh(self.drivetrain_timeout_s)
+                     or self.node.now - self.latest_ns / _NS
+                     > self.drivetrain_timeout_s)):
+            drive = None
         if self.first_ns is not None and self.seed_alliance is not None:
             if (self.seed_alliance != self.seeded_alliance
                     and not self.vision_localized):
@@ -620,21 +645,22 @@ class PoseEstimator:
         self.backend.reset(self.backend.yaw, self.backend.positions, pose)
         self.seeded_alliance = self.seed_alliance
 
-    def integrate(self):
-        """Folds in a new drivetrain sample; returns the drivetrain state
-        when the estimate is valid this tick (fresh, usable, integrated),
-        else None."""
+    def integrate(self, d):
+        """Folds in one delivered drivetrain state; whether it is usable
+        (fresh at delivery, valid, in order, plausible). A state older than
+        drivetrain_timeout_us when delivered (a backlog after a stall) is
+        not integrated: the next fresh one folds in the wheel travel since
+        the last integrated sample in one step."""
         if not self.drive.fresh(self.drivetrain_timeout_s):
-            return None
-        d = self.drive.value
+            return False  # age counts from this state's publication
         positions = module_positions(d)
         if not (d.modules_valid and d.yaw_valid and d.sample_time_ns > 0
                 and positions is not None and math.isfinite(d.yaw_rad)):
-            return None
+            return False
         if (d.sample_time_ns < self.checked_ns
                 or (d.sample_time_ns == self.checked_ns
                     and self.checked_ns > self.latest_ns)):
-            return None
+            return False
         if d.sample_time_ns > self.latest_ns:
             time_s, yaw = d.sample_time_ns / _NS, Rotation2d(d.yaw_rad)
             if self.first_ns is None:
@@ -652,14 +678,12 @@ class PoseEstimator:
                     # Adopt the new frame without integrating its jump.
                     self.backend.reset(yaw, positions)
                     self.checked_ns = d.sample_time_ns
-                    return None
+                    return False
                 self.backend.add_odometry(time_s, yaw, positions)
+            self.odometry_integrated_count += 1
             self.latest_ns = d.sample_time_ns
             self.checked_ns = d.sample_time_ns
-        # A sample the gateway stopped refreshing is as stale as no message.
-        if self.node.now - self.latest_ns / _NS > self.drivetrain_timeout_s:
-            return None
-        return d
+        return True
 
     def observe(self, o, camera):
         if self.acceptable(o, camera) and self.backend.add_observation(

@@ -1,4 +1,4 @@
-"""Wall-clock duration of PoseEstimator.update() under a synthetic match load.
+"""Wall-clock cost of a PoseEstimator tick under a synthetic match load.
 
     bazel run //2026-robot/main_processor/pose_estimator:update_benchmark -- \
         [--backend kalman|factor_graph|both] [--seconds N]
@@ -6,10 +6,11 @@
 Runs the real PoseEstimator on talos.testing.Sim with the production
 config's pose_estimator settings (only `backend` replaced), the drivetrain
 publishing at its configured period and every configured camera at ~60 Hz,
-and times each update() with time.perf_counter_ns. Exits non-zero when the
-workload was not the intended one: an observation or odometry step rejected,
-or the estimate not valid and localized at the end. Timing is reported, never
-judged. See README.md "Update benchmark".
+and times each tick (update() plus the drivetrain callbacks, which integrate
+the odometry, since the previous one) with time.perf_counter_ns. Exits
+non-zero when the workload was not the intended one: an observation or
+odometry step rejected, or the estimate not valid and localized at the end.
+Timing is reported, never judged. See README.md "Update benchmark".
 """
 
 import argparse
@@ -159,17 +160,26 @@ class Camera:
 
 def timed(estimator_class):
     class TimedPoseEstimator(estimator_class):
-        """Records (sim time, update() ns, observations accepted) per tick."""
+        """Records (sim time, tick ns, observations accepted) per tick: a
+        tick is update() plus the drivetrain callbacks the drain before it
+        ran."""
 
         def __init__(self, node):
             super().__init__(node)
             self.ticks = []
+            self.odometry_ns = 0
+
+        def on_drivetrain_state(self, d):
+            start = time.perf_counter_ns()
+            super().on_drivetrain_state(d)
+            self.odometry_ns += time.perf_counter_ns() - start
 
         def update(self):
             accepted = self.accepted
             start = time.perf_counter_ns()
             super().update()
-            elapsed = time.perf_counter_ns() - start
+            elapsed = time.perf_counter_ns() - start + self.odometry_ns
+            self.odometry_ns = 0
             self.ticks.append(
                 (self.node.now, elapsed, self.accepted - accepted))
 
