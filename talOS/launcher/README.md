@@ -51,7 +51,9 @@ shutdown adds final log counts.
 spawning the roster, it stops the session as a signal does
 ([restarts](#restarts)). Members are started without a `--duration-s` of
 their own, so only that stop ends a member that runs well; a member whose
-launcher dies is killed by its guardian ([restarts](#restarts)).
+launcher dies is killed by its guardian ([restarts](#restarts)). A launcher
+that is alive but stuck sends no stop and its guardians do not act: its
+members run on until the launcher is killed.
 
 A launch that starts the roster handles a stop (SIGINT, SIGTERM, or a
 [hangup](#node-output)) in order from its first step, before it takes the
