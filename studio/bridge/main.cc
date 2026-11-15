@@ -606,6 +606,20 @@ std::string mime(const fs::path& p) {
   if (ext == ".wasm") return "application/wasm";
   return "application/octet-stream";
 }
+// What `/` and `/drive` answer, 503, while the webroot holds no such page,
+// and what the bridge logs at startup: a webroot nobody built (a fresh
+// checkout, or a robot repository whose talOS submodule never built them) is
+// the usual cause, so the answer names the folder and the command.
+std::string MissingPage(const fs::path& webroot, std::string_view page) {
+  return "Studio's pages are not built: " + webroot.string() + " has no " +
+         std::string(page) +
+         ".\nBuild them with `bazel build //studio:web_dist` in talOS's "
+         "checkout (from a robot repository: `cd talos && bazel build "
+         "//studio:web_dist`, then start the session again). "
+         "studio/README.md, \"Built pages\", says where each workspace serves "
+         "them from.\n";
+}
+
 // uWebSockets' idle timeout for a client, in seconds. With T - m seconds
 // gone without data from the client (or a drain of its backlog) it pings,
 // and it closes the client if nothing arrives in the next m: m is 4, 8 or
@@ -772,7 +786,14 @@ int main(int argc, char** argv) try {
     if (p > 65535) throw std::runtime_error("invalid port");
     return static_cast<std::uint16_t>(p);
   };
-  const auto root = fs::canonical(count > 3 ? at(3) : "studio/dist");
+  // Resolved per request, not here: a webroot that does not exist (its pages
+  // never built) leaves the bridge serving its feeds and answering the pages
+  // with how to build them, and pages built while it runs are served at once.
+  const fs::path webroot = fs::absolute(count > 3 ? at(3) : "studio/dist");
+  if (std::error_code absent;
+      !fs::is_regular_file(webroot / "drive.html", absent)) {
+    std::cerr << MissingPage(webroot, "drive.html");
+  }
   Bridge bridge;
   bridge.topic = topic;
   // Watched by segment name, not by topic. A topic like /talos/telemetry has
@@ -1023,7 +1044,9 @@ int main(int argc, char** argv) try {
     const std::string page = url == "/"        ? "index.html"
                              : url == "/drive" ? "drive.html"
                                                : url.substr(1);
-    auto file = fs::weakly_canonical(root / page, error);
+    const fs::path root = fs::weakly_canonical(webroot, error);
+    const fs::path file =
+        error ? fs::path{} : fs::weakly_canonical(root / page, error);
     if (error) {
       res->writeStatus("404 Not Found")->end();
       return;
@@ -1031,6 +1054,13 @@ int main(int argc, char** argv) try {
     auto relative = file.lexically_relative(root);
     if (relative.empty() || *relative.begin() == ".." ||
         !fs::is_regular_file(file, error)) {
+      if (page == "index.html" || page == "drive.html") {
+        res->writeStatus("503 Service Unavailable")
+            ->writeHeader("Content-Type", "text/plain; charset=utf-8")
+            ->writeHeader("Cache-Control", kLiveCacheControl)
+            ->end(MissingPage(root, page));
+        return;
+      }
       res->writeStatus("404 Not Found")->end();
       return;
     }

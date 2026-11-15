@@ -232,6 +232,7 @@ test_suite(
         "//studio/bridge:describe_test",
         "//studio/bridge:fast_slots_test",
         "//studio/bridge:integration_test",
+        "//studio/bridge:missing_pages_test",
         "//studio/bridge:system_test",
         "//studio/bridge:telemetry_test",
         "//talOS/telemetry:wire_test",

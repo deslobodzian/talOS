@@ -22,7 +22,11 @@ line read from stdin instead, so a test controls when the topic is idle.
 ## Arguments
 
 The optional positions are topic (default `/talos/telemetry`), HTTP/WebSocket
-port (5800), and static web directory (`studio/dist`). Once listening, the
+port (5800), and static web directory (`studio/dist`). A web directory that
+does not exist or holds no `index.html` or `drive.html` is logged at startup
+and answered at `/` and `/drive` with 503 and the command that builds the
+pages ([built pages](../README.md#built-pages)); the feeds are served
+either way. Once listening, the
 bridge prints `listening <port>` on stdout; port 0 asks the OS for a free port,
 which that line reports (how the bridge tests avoid racing other processes for
 a port).

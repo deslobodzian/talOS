@@ -339,13 +339,15 @@ load refuses a missing file, and the file is in the config's
 the same setting the telemetry node reads. `--studio-http-port PORT`
 overrides `[studio] http_port` for one run. The default webroot exists only
 in a checkout that has run `bazel build //studio:web_dist`; elsewhere set
-`[studio] webroot`. The bridge needs both the binary (`[studio] bridge`,
-resolved under `bazel-bin/` like a node's) and the webroot. A bridge whose
+`[studio] webroot` (a robot repository's: [built pages](../../studio/README.md#built-pages)).
+The bridge needs the binary (`[studio] bridge`, resolved under `bazel-bin/`
+like a node's); without the webroot's pages it still runs, and answers `/`
+and `/drive` with how to build them. A bridge whose
 `--describe` probe does not answer (not built, absent from a bundle, or
 unable to run: a missing library, a crash) is one warning in the graph,
 naming the `bazel build` command or the bundle, and the launcher leaves it
 out of the session, which runs without Studio, `--allow-graph-errors` or
-not; a missing webroot lets it start and fail (below). This holds for the
+not. This holds for the
 member the flag adds only, never for a robot's own subsystem named
 `studio_bridge`, which is an ordinary node; with the flag, such a subsystem
 would share the bridge's name, and the launch is refused naming its
