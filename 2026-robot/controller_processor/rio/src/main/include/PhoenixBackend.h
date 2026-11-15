@@ -83,6 +83,8 @@ class PhoenixBackend final : public talos::hardware::Backend {
   friend class PhoenixBackendRecovery;
   friend class PhoenixBackendWatchdog;
   void UpdateSimulation(double dt);
+  // Builds refresh_signals_ and refresh_groups_ from signals_ (Configure).
+  void GroupSignalsByNetwork(const talos::hardware::Config& c);
 
   // Declared first, so destroyed last: the configure worker (configure_) may
   // still post while the backend is destroyed.
@@ -120,6 +122,16 @@ class PhoenixBackend final : public talos::hardware::Backend {
   talos::rio::CanBusHealth can_health_;
   talos::rio::CanBusSampler can_sampler_;
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;
+  // signals_ again, each CAN bus's contiguous, and each bus's span of them:
+  // Read refreshes one span per RefreshAll, since Phoenix refuses a call
+  // whose signals are on two networks. Built by Configure.
+  struct RefreshGroup {
+    std::size_t begin{0};
+    std::size_t count{0};
+  };
+  std::vector<ctre::phoenix6::BaseStatusSignal*> refresh_signals_;
+  std::array<RefreshGroup, talos::hardware::kMaxCanBuses> refresh_groups_{};
+  std::size_t refresh_group_count_{0};
   std::vector<std::unique_ptr<frc::DigitalInput>> digital_inputs_;
   std::vector<std::unique_ptr<frc::DigitalOutput>> digital_outputs_;
   std::vector<std::unique_ptr<frc::AnalogInput>> analog_inputs_;

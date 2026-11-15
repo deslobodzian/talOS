@@ -578,6 +578,37 @@ TEST(PhoenixBackendHealth, AnAsynchronousConfigureReportsEachBusSimulated) {
   configure(one, 1);
 }
 
+// A robot may put some devices on the RoboRIO's own bus and the rest on a
+// CANivore (TODO.md CAN-1's remedy for the 2026 robot's 107 % "rio" bus).
+// Phoenix refreshes the signals of one CAN network per RefreshAll: one call
+// over both returned InvalidNetwork and refreshed none, so every motor and
+// CAN sensor on both buses read invalid and the gateway saw total feedback
+// loss; that robot would never move. Each network's devices read valid,
+// fresh feedback.
+// REQ-SAFE-22
+TEST(PhoenixBackendBuses, DevicesOnTwoCanNetworksReadValidFeedback) {
+  EnsureHal();
+  hw::Config config;
+  const auto encoder = [](uint16_t id, const std::string& name,
+                          const std::string& bus) {
+    hw::SensorConfig s;
+    s.id = id;
+    s.name = name;
+    s.kind = hw::SensorKind::kCANcoder;
+    s.can_id = id;
+    s.bus = bus;
+    return s;
+  };
+  config.motors.push_back(TestMotor(41, "rio_motor", 41));
+  config.motors.push_back(TestMotor(42, "shooter_motor", 42));
+  config.motors.back().bus = "Shooter";
+  config.sensors.push_back(encoder(43, "rio_encoder", "rio"));
+  config.sensors.push_back(encoder(44, "shooter_encoder", "Shooter"));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  EXPECT_TRUE(AwaitReady(backend, config));
+}
+
 // Missing gains yield ~0 V, so a closed-loop demand must neither spin the
 // rotor nor teleport its position to the target.
 class PhoenixBackendZeroGains
@@ -864,13 +895,21 @@ class PhoenixBackendRecovery : public ::testing::Test {
   static auto& MotorConfig(PhoenixBackend& backend, std::size_t i) {
     return backend.config_.motors[i];
   }
+  // The signals Read refreshes: these tests' devices are all on "rio", one
+  // network, so one span covers them.
+  static void Refreshed(PhoenixBackend& backend) {
+    ASSERT_EQ(backend.refresh_group_count_, 1u);
+    backend.refresh_groups_[0] = {0, backend.refresh_signals_.size()};
+  }
   static void StopRefreshing(PhoenixBackend& backend,
                              ctre::phoenix6::BaseStatusSignal& signal) {
-    std::erase(backend.signals_, &signal);
+    std::erase(backend.refresh_signals_, &signal);
+    Refreshed(backend);
   }
   static void ResumeRefreshing(PhoenixBackend& backend,
                                ctre::phoenix6::BaseStatusSignal& signal) {
-    backend.signals_.push_back(&signal);
+    backend.refresh_signals_.push_back(&signal);
+    Refreshed(backend);
   }
   // Holds the rotor still under whatever voltage the TalonFX applies, so it
   // draws stall current, by taking the backend's rotor model out of the loop.
@@ -885,10 +924,11 @@ class PhoenixBackendRecovery : public ::testing::Test {
   }
   static void StopRefreshingHealth(PhoenixBackend& backend) {
     auto& motor = Motor(backend, 0);
-    std::erase_if(backend.signals_, [&](auto* signal) {
+    std::erase_if(backend.refresh_signals_, [&](auto* signal) {
       return signal == &motor.GetDeviceTemp(false) ||
              signal == &motor.GetSupplyCurrent(false);
     });
+    Refreshed(backend);
     // Exercise hardware telemetry handling, without the ambient sim override.
     backend.is_simulation_ = false;
   }
