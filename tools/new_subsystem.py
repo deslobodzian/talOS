@@ -22,7 +22,9 @@ take the lowest joystick 0 button from 3 that no other binding of the robot
 (live, or commented in a subsystem file) uses.
 Everything is checked before anything is written, so a refused run leaves the
 tree untouched. --standalone writes the package as its own Bzlmod repository
-in DIR instead, building against this checkout.
+in DIR instead, building against this checkout (from a robot repository:
+the talOS checkout the tool runs from, such as its talos/ submodule, or
+--talos-checkout DIR; it refuses when talOS is a module Bazel fetched).
 
 From a robot repository that depends on talOS (sync_manifest's test: this
 script runs from the talOS module, not the main repository):
@@ -46,6 +48,7 @@ resolver in Bazel runfiles, so `python3 tools/new_subsystem.py` fails with
 """
 
 import argparse
+import ast
 import collections
 import difflib
 import keyword
@@ -2219,9 +2222,9 @@ one. Only update() reads the queues, so the callback waits for the drain
 before it (at-drain) instead of waking the node for every frame. As
 generated it follows the most certain usable observation of the tick and is
 valid while one arrived within observation_timeout_us; fuse odometry here
-(see 2026-robot/main_processor/pose_estimator, which runs wpimath's
-SwerveDrive4PoseEstimator or a GTSAM smoother). It drives nothing, so it
-runs whether the robot is enabled or not."""
+(for example wpimath's SwerveDrive4PoseEstimator or a GTSAM smoother, from
+talOS's Python requirements). It drives nothing, so it runs whether the
+robot is enabled or not."""
 
 CC_ESTIMATOR_HEADER = """\
 #pragma once
@@ -3491,25 +3494,76 @@ def coverage_required(root, configs):
     """Whether any of `configs` resolves [robot] require_target_coverage
     true (talOS/configuration/config_parser.h: the key, which defaults to
     `commissioned`), with its `include` (one level) merged under it."""
-    def robot_table(path):
-        with open(os.path.join(root, path), "rb") as f:
-            table = tomllib.load(f)
-        robot = {}
-        include = table.get("include")
-        if isinstance(include, str):
-            base = (include if posixpath.isabs(include) else posixpath.join(
-                posixpath.dirname(path), include))
-            with open(os.path.join(root, base), "rb") as f:
-                robot.update(tomllib.load(f).get("robot", {}))
-        robot.update(table.get("robot", {}))
-        return robot
-
     for path in configs:
-        robot = robot_table(path)
+        robot = robot_table(root, path)
         if robot.get("require_target_coverage",
                      robot.get("commissioned", False)) is True:
             return True
     return False
+
+
+def robot_table(root, config):
+    """The [robot] table of `config` with its `include` (one level) merged
+    under it, as config_parser.h resolves it."""
+    with open(os.path.join(root, config), "rb") as f:
+        table = tomllib.load(f)
+    robot = {}
+    include = table.get("include")
+    if isinstance(include, str):
+        base = (include if posixpath.isabs(include) else posixpath.join(
+            posixpath.dirname(config), include))
+        with open(os.path.join(root, base), "rb") as f:
+            robot.update(tomllib.load(f).get("robot", {}))
+    robot.update(table.get("robot", {}))
+    return robot
+
+
+# What the launcher starts beside the nodes when [robot] names none
+# (talOS/configuration), as a robot repository names them.
+DEFAULT_PROGRAMS = {"hardware_node": "//talOS/bridge:hardware_node",
+                    "sim_gateway": "//talOS/simulation:sim_gateway"}
+
+
+def sim_programs(root, config, talos):
+    """Labels of the hardware bridge and simulator `config` runs: its
+    [robot] hardware_node and sim_gateway, else talOS's."""
+    robot = robot_table(root, config)
+    return [robot.get(key) if isinstance(robot.get(key), str)
+            else talos + label for key, label in DEFAULT_PROGRAMS.items()]
+
+
+def sim_target_config(root):
+    """The config the root package's talos_sim (`//:sim`, else the only
+    one) runs, workspace-relative, or None if the BUILD file has none or
+    names it by anything but a string literal."""
+    for build in ("BUILD.bazel", "BUILD"):
+        path = os.path.join(root, build)
+        if os.path.isfile(path):
+            break
+    else:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            module = ast.parse(f.read())
+    except SyntaxError:
+        return None
+    configs = {}
+    for node in ast.walk(module):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "talos_sim"):
+            keywords = {k.arg: k.value for k in node.keywords}
+            name, config = keywords.get("name"), keywords.get("config")
+            if (isinstance(name, ast.Constant) and isinstance(config, ast.Constant)
+                    and isinstance(config.value, str)):
+                configs[name.value] = config.value
+    label = configs.get("sim") or (
+        next(iter(configs.values())) if len(configs) == 1 else None)
+    if label is None:
+        return None
+    if label.startswith("//"):
+        package, _, target = label[2:].partition(":")
+        return posixpath.join(package, target or posixpath.basename(package))
+    return label.removeprefix(":")
 
 
 def without_producer(subsystem, name):
@@ -3573,6 +3627,29 @@ def robot_configs(root, directory):
                 if os.path.isfile(config):
                     found.append(rel(root, config))
     return found
+
+
+def talos_checkout(script):
+    """The talOS checkout `script` (this file, through its runfiles symlink)
+    lives in, or None when it is not a durable checkout: Bazel's copy of a
+    fetched module, under an output base's external/ directory, is
+    replaced or removed by Bazel, so nothing may point at it."""
+    top = os.path.dirname(os.path.dirname(os.path.realpath(script)))
+    try:
+        with open(os.path.join(top, "MODULE.bazel"), encoding="utf-8") as f:
+            module = f.read()
+    except OSError:
+        return None
+    if not re.search(r'name\s*=\s*"talos"', module):
+        return None
+    ancestor = top
+    while os.path.dirname(ancestor) != ancestor:
+        parent = os.path.dirname(ancestor)
+        if (os.path.basename(ancestor) == "external"
+                and os.path.isdir(os.path.join(parent, "execroot"))):
+            return None
+        ancestor = parent
+    return top
 
 
 def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
@@ -3646,6 +3723,19 @@ def sim_run(button):
     return (f"--sim-gateway --no-studio --duration-s {SIM_DURATION_S} "
             f"--mode-schedule '{MODE_SCHEDULE}' \\\n      "
             f"--joystick-schedule '{joystick_schedule(button)}'")
+
+
+def launcher_sim_run(talos, config, button):
+    """sim_run's schedules for the launcher itself, run from a robot
+    repository on its simulation config, as talos_sim runs it (--sim,
+    --start-sim-gateway, the physics simulator)."""
+    return (f"bazel run {talos}//talOS/launcher -- --config $PWD/{config} "
+            f"--sim --duration-s {SIM_DURATION_S} \\\n      "
+            "--start-sim-gateway --sim-gateway-arg --physics \\\n      "
+            f"--sim-gateway-arg --mode-schedule "
+            f"--sim-gateway-arg '{MODE_SCHEDULE}' \\\n      "
+            f"--sim-gateway-arg --joystick-schedule "
+            f"--sim-gateway-arg '{joystick_schedule(button)}'")
 
 
 def dependent_sim_run(button):
@@ -3751,7 +3841,8 @@ slot0 = {{ {zero.replace("v = 0.0", "v = 0.12")} }}
 
 def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
                golden_test=False, sim=None, button=TELEOP_BUTTONS[0],
-               raw=False, coverage=False):
+               raw=False, coverage=False, sim_target=None,
+               programs=()):
     """What to do after scaffolding `name` into `robot`. `golden_test`: the
     robot pins its hardware config in configuration/config_golden_test.cc
     (2026-robot does; a new_robot robot does not). `sim`: sim_config's
@@ -3762,7 +3853,12 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
     `coverage`: the robot requires target coverage, so the subsystem file
     lists no lane (without_producer) until its producer is added.
     `robot`: a robot directory of talOS, or a Layout; in a robot repository
-    the commands are the ones it runs (`@talos//` tools, `bazel run //:sim`)."""
+    the commands are the ones it runs (`@talos//` tools). There
+    `sim_target` is sim_target_config's answer for the repository (the
+    config its root talos_sim runs, or None if it cannot tell): `bazel run
+    //:sim` runs the simulation config only when that is it, otherwise the
+    launcher runs it directly after `programs` (the hardware bridge and
+    simulator the config names) are built."""
     layout = layout_of(robot)
     package = f"//{layout.package(name)}"
     configuration = layout.configuration
@@ -3773,10 +3869,17 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
     if talos:
         build = ("  bazel test //...    # the graph test and manifest check "
                  "of the robot repository")
-        run = (f"  where //:sim's talos_sim runs {sim_path}:\n"
-               f"  {dependent_sim_run(button)}")
+        if sim_target == sim_path:
+            run = f"  {dependent_sim_run(button)}"
+        else:
+            why = (f"//:sim runs {sim_target}, not {sim_path}"
+                   if sim_target else
+                   f"no root talos_sim names {sim_path} as its config")
+            run = (f"  {why}, so run it with the launcher:\n"
+                   f"  bazel build {' '.join(programs)}\n"
+                   f"  {launcher_sim_run(talos, sim_path, button)}")
         sync = f"bazel run {talos}//tools:sync_manifest --"
-        checks = "the manifest_sync_test checks"
+        checks = "a talos_sim or graph test of it reads"
     else:
         build = (f"  bazel build //talOS/launcher //talOS/bridge:hardware_node "
                  f"//{layout.packages}/...")
@@ -3802,7 +3905,14 @@ Next:
         if talos:
             header = header.replace(
                 f"./sim.sh --config {sim_path} --sim-gateway",
-                "bazel run //:sim, whose talos_sim names this file")
+                "the launcher runs it with --sim")
+        # The include is resolved from this file's directory, which is the
+        # config's (sim_config), so it is the config's file name.
+        base = posixpath.basename(layout.config)
+        header = header.replace('include = "robot.toml"',
+                                f'include = "{base}"').replace(
+                                    "# robot.toml never reads",
+                                    f"# {base} never reads")
         lines = header + lines
         manifest = (
             f"\n  and generate its manifest, which {checks}:\n"
@@ -3857,7 +3967,8 @@ Next:
     Tune slot0 on the mechanism before uncommenting its teleop binding{listing}.{own}{golden}"""
 
 
-def standalone_next_steps(target_dir, name, kind="velocity", raw=False):
+def standalone_next_steps(target_dir, name, kind="velocity", raw=False,
+                          talos=""):
     edit = {"velocity": "add the motor's physical can_id",
             "position": "add the motor's physical can_id and the home "
                         "switch's dio, set its travel and homing_v",
@@ -3875,7 +3986,7 @@ Next (standalone subsystem repo at {target_dir}):
      configuration/subsystems/{name}.toml, {edit},
      list it in robot.toml ([[subsystems]] name = "{name}",
      path = "subsystems/{name}.toml") and regenerate the manifest:
-       bazel run //tools:sync_manifest -- <robot.toml>"""
+       bazel run {talos}//tools:sync_manifest -- <robot.toml>"""
 
 
 KINDS = {
@@ -3954,6 +4065,11 @@ def main(argv):
     parser.add_argument("--standalone", metavar="DIR",
                         help="scaffold a standalone Bzlmod subsystem repo in DIR "
                         "instead of wiring into --robot")
+    parser.add_argument("--talos-checkout", metavar="DIR",
+                        help="with --standalone in a robot repository: the "
+                        "talOS checkout the new repository builds against "
+                        "(default: the one this tool runs from, when it is "
+                        "a checkout such as the talos/ submodule)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file and edit without writing")
     args = parser.parse_args(argv)
@@ -3964,6 +4080,10 @@ def main(argv):
     if talos and args.robot:
         parser.error("--robot names a robot directory of talOS; in a robot "
                      "repository name its config with --config")
+    if args.talos_checkout and not (talos and args.standalone):
+        parser.error("--talos-checkout is for --standalone in a robot "
+                     "repository; in talOS the new repository builds against "
+                     "this checkout")
     if not talos and (args.config or args.package_dir):
         parser.error("--config and --package-dir are for a robot repository; "
                      "in talOS name the robot directory with --robot")
@@ -3981,8 +4101,22 @@ def main(argv):
                                      talos)
         if args.standalone:
             target_dir = os.path.join(root, args.standalone)
-            writes = plan_standalone(target_dir, args.name, args.lang, root,
-                                     kind=args.kind, raw=args.raw)
+            # The new repository overrides @talos with a talOS checkout and
+            # takes its .bazelrc: this one in talOS; from a robot
+            # repository, the checkout this tool runs from (its submodule).
+            talos_root = root
+            if talos:
+                talos_root = (os.path.join(root, args.talos_checkout)
+                              if args.talos_checkout
+                              else talos_checkout(__file__))
+                if talos_root is None:
+                    raise Refused(
+                        "the talOS this tool runs from is Bazel's copy of a "
+                        "fetched module, not a checkout the new repository "
+                        "can point at; pass --talos-checkout DIR (the talOS "
+                        "checkout, e.g. the talos/ submodule)")
+            writes = plan_standalone(target_dir, args.name, args.lang,
+                                     talos_root, kind=args.kind, raw=args.raw)
             can_id = None
         else:
             writes, can_id = plan(root, robot, args.name, args.lang,
@@ -4006,15 +4140,20 @@ def main(argv):
     print(kind_summary(args.kind, raw=args.raw))
     if args.standalone:
         print(standalone_next_steps(shown(root, target_dir), args.name,
-                                    args.kind, args.raw))
+                                    args.kind, args.raw, talos))
     else:
         golden_test = os.path.isfile(os.path.join(
             root, layout_of(robot).configuration, "config_golden_test.cc"))
         coverage = can_id is not None and coverage_required(
             root, including_configs(root, robot))
+        layout = layout_of(robot)
+        sim_target = programs = None
+        if layout.talos:
+            sim_target = sim_target_config(root)
+            programs = sim_programs(root, layout.config, layout.talos)
         print(next_steps(robot, args.name, can_id, args.kind, args.lang,
                          golden_test, sim_config(root, robot), button,
-                         args.raw, coverage))
+                         args.raw, coverage, sim_target, programs or ()))
     return 0
 
 

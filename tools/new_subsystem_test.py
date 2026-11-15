@@ -649,6 +649,121 @@ class NewSubsystemTest(unittest.TestCase):
                 self.assertIn(flag, out.getvalue())
                 self.assertEqual(snapshot(top), before, out.getvalue())
 
+    # REQ-DEV-01
+    def test_standalone_from_a_robot_repository_builds_against_talos(self):
+        # --standalone run from a robot repository writes a repository that
+        # overrides @talos with the talOS checkout the tool runs from (the
+        # robot's talos/ submodule) and takes its .bazelrc, not the robot
+        # repository's; when that talOS is Bazel's copy of a fetched module
+        # (under an output base's external/), it refuses and writes nothing.
+        def write(path, text):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+        for case in ("checkout", "fetched"):
+            with self.subTest(case=case), \
+                    tempfile.TemporaryDirectory() as top, \
+                    mock.patch.object(new_subsystem.sync_manifest,
+                                      "current_repository",
+                                      return_value="talos+"):
+                talos = (os.path.join(top, "robot", "talos")
+                         if case == "checkout" else
+                         os.path.join(top, "base", "external", "talos+"))
+                os.makedirs(os.path.join(top, "base", "execroot"))
+                for directory, name in ((talos, "talos"),
+                                        (os.path.join(top, "robot"),
+                                         "robot")):
+                    write(os.path.join(directory, "MODULE.bazel"),
+                          f'module(name = "{name}")\n')
+                    write(os.path.join(directory, ".bazelrc"),
+                          f"# {name}\n")
+                    write(os.path.join(directory, ".bazelversion"), "8.4.2\n")
+                script = os.path.join(talos, "tools", "new_subsystem.py")
+                write(script, "")
+                target = os.path.join(top, "arm")
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=os.path.join(
+                                         top, "robot")), \
+                        mock.patch.object(new_subsystem, "__file__", script), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(out):
+                    status = new_subsystem.main(
+                        ["arm", "--lang", "py", "--standalone", "../arm"])
+                if case == "fetched":
+                    self.assertNotEqual(status, 0, out.getvalue())
+                    self.assertFalse(os.path.exists(target), out.getvalue())
+                    continue
+                self.assertEqual(status, 0, out.getvalue())
+                with open(os.path.join(target, ".bazelrc"),
+                          encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "# talos\n")
+                with open(os.path.join(target, "MODULE.bazel"),
+                          encoding="utf-8") as f:
+                    (path,) = re.findall(
+                        r'module_name = "talos",\n\s*path = "([^"]*)"',
+                        f.read())
+                self.assertEqual(
+                    os.path.realpath(os.path.join(target, path)),
+                    os.path.realpath(talos))
+
+    # REQ-DEV-01
+    def test_robot_repository_simulation_steps_run_the_simulation_config(self):
+        # The simulation config `Next:` has the student create includes the
+        # robot config by its own name, from its own directory, so it
+        # resolves with the new subsystem in it; and the printed run runs
+        # that config: `bazel run //:sim` only when the root talos_sim names
+        # it, else the launcher on it directly with --sim.
+        files = {
+            "MODULE.bazel": 'module(name = "robot")\n',
+            "cfg/practice.toml": ROBOT_WITH_ROLLER,
+            "cfg/subsystems/roller.toml": ROLLER,
+            "cfg/BUILD": "",
+            "roller/BUILD": "",
+        }
+        for sim in ("//cfg:practice.toml", "//cfg:robot_sim.toml"):
+            with self.subTest(sim=sim), \
+                    tempfile.TemporaryDirectory() as root, \
+                    mock.patch.object(new_subsystem.sync_manifest,
+                                      "current_repository",
+                                      return_value="talos+"):
+                build = (f'talos_sim(\n    name = "sim",\n'
+                         f'    config = "{sim}",\n)\n')
+                for path, text in {**files, "BUILD.bazel": build}.items():
+                    os.makedirs(os.path.dirname(os.path.join(root, path)),
+                                exist_ok=True)
+                    with open(os.path.join(root, path), "w",
+                              encoding="utf-8") as f:
+                        f.write(text)
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=root), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(out):
+                    status = new_subsystem.main(
+                        ["feeder", "--lang", "py", "--config",
+                         "cfg/practice.toml"])
+                steps = out.getvalue()
+                self.assertEqual(status, 0, steps)
+                block = steps.split("gains zero:\n")[1].split(
+                    "\n  and generate")[0]
+                with open(os.path.join(root, "cfg", "robot_sim.toml"), "w",
+                          encoding="utf-8") as f:
+                    f.write(textwrap.dedent(block))
+                subsystems, _ = new_subsystem.sync_manifest.effective(
+                    root, "cfg/robot_sim.toml")
+                self.assertIn("feeder", subsystems)
+                (run,) = [line.strip() for line in steps.splitlines()
+                          if line.strip().startswith("bazel run")
+                          and "--duration-s" in line]
+                if sim.endswith("robot_sim.toml"):
+                    self.assertTrue(run.startswith("bazel run //:sim --"),
+                                    steps)
+                else:
+                    self.assertIn("--config $PWD/cfg/robot_sim.toml --sim",
+                                  run)
+
     def test_plan_wires_an_estimator_without_a_can_id(self):
         with tempfile.TemporaryDirectory() as root:
             configuration = os.path.join(root, "bot", "main_processor",
