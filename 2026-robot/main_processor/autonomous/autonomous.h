@@ -204,20 +204,33 @@ class Autonomous {
             target.y_m = field_width_ - target.y_m;
             target.yaw_rad = WrapAngle(target.yaw_rad + std::numbers::pi);
           }
-          trajectory_ = Trajectory::FromPoses(
+          // A pose no trajectory can start from (one so far off the field
+          // that the plan overflows) is unusable: released below, as an
+          // unlocalized one is, and the next tick plans again.
+          const auto planned = Trajectory::FromPoses(
               p, geometry::Pose2d{target.x_m, target.y_m, target.yaw_rad},
               max_linear_, max_angular_);
-          trajectory_started_ = true;
-          trajectory_elapsed_ = talos::Duration::zero();
-          trajectory_last_update_ = phase_.time_in_state();
+          if (planned) {
+            trajectory_ = *planned;
+            trajectory_started_ = true;
+            trajectory_elapsed_ = talos::Duration::zero();
+            trajectory_last_update_ = phase_.time_in_state();
+          }
           trajectory_pose_available_ = false;
         }
-        if (trajectory_pose_available_) {
-          trajectory_elapsed_ +=
-              phase_.time_in_state() - trajectory_last_update_;
+        if (trajectory_started_) {
+          if (trajectory_pose_available_) {
+            trajectory_elapsed_ +=
+                phase_.time_in_state() - trajectory_last_update_;
+          }
+          trajectory_last_update_ = phase_.time_in_state();
+          trajectory_pose_available_ = true;
         }
-        trajectory_last_update_ = phase_.time_in_state();
-        trajectory_pose_available_ = true;
+      } else {
+        trajectory_pose_available_ = false;
+      }
+      if (trajectory_pose_available_) {
+        const auto& p = pose_->pose();
         const double elapsed =
             std::chrono::duration<double>(trajectory_elapsed_).count();
         const auto desired = trajectory_.SampleAt(elapsed);
@@ -236,8 +249,6 @@ class Autonomous {
             intake = intake_velocity_;
           }
         }
-      } else {
-        trajectory_pose_available_ = false;
       }
     }
     if (phase_.is(Phase::kHold)) {
@@ -653,8 +664,14 @@ class Autonomous {
         return true;
       case Prerequisite::kShooterReady:
         return shooter_ready;
-      case Prerequisite::kLocalizedPose:
-        return pose_.fresh() && pose_->valid() && pose_->localized();
+      case Prerequisite::kLocalizedPose: {
+        // A non-finite pose is no position, whatever its flags say.
+        if (!pose_.fresh() || !pose_->valid() || !pose_->localized())
+          return false;
+        const auto& p = pose_->pose();
+        return std::isfinite(p.x_m()) && std::isfinite(p.y_m()) &&
+               std::isfinite(p.yaw_rad());
+      }
     }
     return false;
   }

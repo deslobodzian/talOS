@@ -4,6 +4,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <stdexcept>
@@ -44,8 +46,10 @@ TEST(TrajectoryTest, InterpolatesMultipleSamplesAndCompletes) {
 }
 
 TEST(TrajectoryTest, RampStartsAndEndsAtRest) {
-  const auto trajectory = Trajectory::FromPoses(
-      geometry::Pose2d{0, 0, 0}, geometry::Pose2d{3, 0, 1}, 2, 3);
+  const auto planned = Trajectory::FromPoses(geometry::Pose2d{0, 0, 0},
+                                             geometry::Pose2d{3, 0, 1}, 2, 3);
+  ASSERT_TRUE(planned.has_value());
+  const Trajectory& trajectory = *planned;
   EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).vx_mps, 0);
   EXPECT_NEAR(trajectory.SampleAt(trajectory.total_time_s() / 2).vx_mps, 2,
               1e-9);
@@ -570,6 +574,42 @@ TEST_P(AutonomousPoseTest, UnusablePosePausesTrajectoryUntilRecovery) {
 }
 
 INSTANTIATE_TEST_SUITE_P(PoseValidity, AutonomousPoseTest, ::testing::Bool());
+
+// REQ-SAFE-34, RULES.md 3: a pose the estimator marks valid and localized
+// but that no trajectory can start from is unusable, not an exception out
+// of update() (which would kill the node mid-routine). A non-finite pose,
+// or one so far off that the planned distance overflows, releases the drive
+// lane in DRIVE, as an unlocalized pose does; a non-finite pose while
+// following also releases it rather than sending a zero target. The next
+// usable pose plans and drives.
+TEST_F(AutonomousTest, UnplannablePoseReleasesTheDriveLane) {
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  Mode(ds::kEnabled | ds::kAutonomous);
+  Shooter(true);
+  sim.step(20ms);
+  ReadyFor(520ms);  // SPINUP and FEED done; DRIVE has no pose yet
+  ASSERT_EQ(Phase(), autonomous::Phase::DRIVE);
+  for (const auto& [x, y, yaw] :
+       {std::array{kNaN, 0.0, 0.0}, std::array{0.0, kInf, 0.0},
+        std::array{0.0, 0.0, -kInf}, std::array{-1.5e308, -1.5e308, 0.0}}) {
+    SCOPED_TRACE(::testing::Message() << x << ", " << y << ", " << yaw);
+    Pose(x, y, yaw);
+    sim.step(20ms);
+    EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+    EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  }
+  Pose();
+  sim.step(20ms);
+  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  Pose(kNaN, 0, 0);
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  Pose();
+  sim.step(20ms);
+  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+}
 
 // Node test matrix (docs/TESTING.md §7), producer: cases 1, 2, 6 and 12 under
 // the names //tools:check_node_matrix looks for.
