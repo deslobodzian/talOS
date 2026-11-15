@@ -470,6 +470,38 @@ can_id = 1
   }
 }
 
+// REQ-CONTRACT-18: under a command timeout shorter than the 0.1 s default
+// (config load accepts 80 ms at a 5 ms period), an absent heading_timeout_s
+// defaults to the timeout, so the driver still constructs; the same value
+// written explicitly is refused, naming the key.
+TEST(Driver, HeadingTimeoutDefaultFollowsAShortCommandTimeout) {
+  for (const char* setting : {"", "heading_timeout_s = 0.1"}) {
+    SCOPED_TRACE(setting);
+    Sim sim = Sim::FromToml(std::string{R"(
+[robot]
+period_us = 5000
+command_timeout_us = 80000
+
+[subsystems.mechanism.motors.unused]
+can_id = 1
+
+[subsystems.driver]
+)"} + setting + "\n");
+    if (*setting == '\0') {
+      EXPECT_NO_THROW(sim.add<Driver>("driver"));
+    } else {
+      try {
+        sim.add<Driver>("driver");
+        ADD_FAILURE() << "constructed";
+      } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find("heading_timeout_s"),
+                  std::string::npos)
+            << error.what();
+      }
+    }
+  }
+}
+
 TEST(Driver, StartupHeldAxesOrRezeroCannotArmProducer) {
   for (const auto& held :
        {Stick(0, -1, 0), Stick(0, 0, -1), Stick(0, 0, 0, 1)}) {
