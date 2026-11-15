@@ -198,8 +198,10 @@ button = 3
 while_held = { velocity_rps = 20.0 }
 # Until an autonomous node writes /flywheel/target/auto, the binding is the
 # flywheel's only producer; a policy that lists "auto" with
-# require_target_coverage = true refuses the graph without this.
+# require_target_coverage = true refuses the graph without this. Its lane
+# is listed here, since the subsystem file may list none.
 [subsystems.flywheel.targets]
+teleop = ["teleop"]
 autonomous = []
 # The simulated motor's feedforward (volts per rps), not the mechanism's:
 # with every gain zero the physics simulation stalls the motor.
@@ -227,7 +229,13 @@ does it from a desk ([bring-up](BRINGUP.md#human-commissioning)). A
 commissioned robot requires target coverage, so by then every mechanism needs
 a producer in each mode its policy lists. The
 binding goes into the subsystem file only once its gains are tuned on the
-mechanism.
+mechanism. In a robot that already requires coverage (its config, or one
+that includes it, sets `require_target_coverage = true`, or
+`commissioned = true`), the scaffold writes the subsystem file's `[targets]`
+uncommented with every mode empty, since the coverage check judges only a
+mode that lists a lane: the graph passes and the mechanism stays neutral.
+Uncommenting the binding there goes with `teleop = ["teleop"]` in that
+table; the simulation block above lists it for the simulation config.
 
 ### Run the generated test
 

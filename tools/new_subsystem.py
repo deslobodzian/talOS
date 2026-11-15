@@ -3444,6 +3444,9 @@ def plan(root, robot, name, lang, kind="velocity", raw=False):
         NAME=name, PASCAL=pascal(name), CONFIG=config,
         PACKAGE=layout.package(name), PERIOD=PERIOD_US,
         CAN_ID=can_id, DIO=dio, BUTTON=button)
+    configs = including_configs(root, layout)
+    if kind != "estimator" and coverage_required(root, configs):
+        subsystem = without_producer(subsystem, name)
     writes.append((subsystem_toml, None, subsystem))
 
     old = read(robot_toml)
@@ -3455,15 +3458,8 @@ def plan(root, robot, name, lang, kind="velocity", raw=False):
     # other manifest in the robot whose config reads it (an `include` of
     # it), which the new entry changes too.
     overrides = {config: new_robot, rel(root, subsystem_toml): subsystem}
-    configs = [config] + [
-        other for other in robot_configs(root, layout.configs_root)
-        if other != config]
     for path in configs:
         try:
-            if path != config:
-                _, files = sync_manifest.resolve(root, path, overrides)
-                if config not in files:
-                    continue
             manifest = sync_manifest.generate(root, path, overrides=overrides)
         except sync_manifest.ManifestError as err:
             raise Refused(f"cannot regenerate the manifest of {path}: {err}")
@@ -3471,6 +3467,90 @@ def plan(root, robot, name, lang, kind="velocity", raw=False):
         old = read(manifest_file) if os.path.isfile(manifest_file) else None
         writes.append((manifest_file, old, manifest))
     return writes, can_id
+
+
+def including_configs(root, robot):
+    """The config of `robot` (a robot directory or a Layout), then every
+    other config of the robot that has a manifest and reads it (an `include`
+    of it): the configs a new [[subsystems]] entry changes."""
+    layout = layout_of(robot)
+    configs = [layout.config]
+    for other in robot_configs(root, layout.configs_root):
+        if other == layout.config:
+            continue
+        try:
+            _, files = sync_manifest.resolve(root, other)
+        except sync_manifest.ManifestError as err:
+            raise Refused(f"cannot regenerate the manifest of {other}: {err}")
+        if layout.config in files:
+            configs.append(other)
+    return configs
+
+
+def coverage_required(root, configs):
+    """Whether any of `configs` resolves [robot] require_target_coverage
+    true (talOS/configuration/config_parser.h: the key, which defaults to
+    `commissioned`), with its `include` (one level) merged under it."""
+    def robot_table(path):
+        with open(os.path.join(root, path), "rb") as f:
+            table = tomllib.load(f)
+        robot = {}
+        include = table.get("include")
+        if isinstance(include, str):
+            base = (include if posixpath.isabs(include) else posixpath.join(
+                posixpath.dirname(path), include))
+            with open(os.path.join(root, base), "rb") as f:
+                robot.update(tomllib.load(f).get("robot", {}))
+        robot.update(table.get("robot", {}))
+        return robot
+
+    for path in configs:
+        robot = robot_table(path)
+        if robot.get("require_target_coverage",
+                     robot.get("commissioned", False)) is True:
+            return True
+    return False
+
+
+def without_producer(subsystem, name):
+    """`subsystem` (a filled subsystem file) for a robot that requires
+    target coverage: an explicit [targets] table with every mode empty. The
+    launcher's coverage lint judges only a mode whose policy lists a lane,
+    and with no lane talos::Target::get() is null, so the node stays
+    neutral until a person lists a lane together with its producer."""
+    return edited(subsystem, [
+        ("# binding goes in the simulation-only config new_subsystem's "
+         "`Next:` names.\n",
+         "# binding goes in the simulation-only config new_subsystem's "
+         "`Next:` names.\n"
+         '# Uncomment it together with teleop = ["teleop"] in [targets] '
+         "below.\n"),
+        (f"# Which /{name}/target/<source> lanes drive the {name} in each "
+         "Driver Station\n"
+         "# mode, highest priority first. Without this table [robot.targets] "
+         "applies\n"
+         '# (teleop = ["teleop"], autonomous = ["auto"]); listed modes '
+         "replace it.\n"
+         "# [targets]\n"
+         '# teleop = ["teleop"]\n'
+         '# autonomous = ["auto"]\n',
+         f"# Which /{name}/target/<source> lanes drive the {name} in each "
+         "Driver Station\n"
+         "# mode, highest priority first; listed modes replace "
+         "[robot.targets]. The\n"
+         f"# {name} has no producer yet, and this robot requires a writer for "
+         "every\n"
+         "# lane a mode lists ([robot] require_target_coverage), so every "
+         "mode is\n"
+         f"# empty and the {name} stays neutral. List a lane together with "
+         "its\n"
+         '# producer: "teleop" with the teleop binding above, "auto" once an\n'
+         f"# autonomous node writes /{name}/target/auto.\n"
+         "[targets]\n"
+         "teleop = []\n"
+         "autonomous = []\n"
+         "test = []\n"),
+    ])
 
 
 def robot_configs(root, directory):
@@ -3635,8 +3715,10 @@ button = {button}
 while_held = {{ {demand} }}
 # Until an autonomous node writes /{name}/target/auto, the binding is the
 # {name}'s only producer; a policy that lists "auto" with
-# require_target_coverage = true refuses the graph without this.
+# require_target_coverage = true refuses the graph without this. Its lane
+# is listed here, since the subsystem file may list none.
 [{sub}.targets]
+teleop = ["teleop"]
 autonomous = []
 """
     zero = "p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0"
@@ -3669,7 +3751,7 @@ slot0 = {{ {zero.replace("v = 0.0", "v = 0.12")} }}
 
 def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
                golden_test=False, sim=None, button=TELEOP_BUTTONS[0],
-               raw=False):
+               raw=False, coverage=False):
     """What to do after scaffolding `name` into `robot`. `golden_test`: the
     robot pins its hardware config in configuration/config_golden_test.cc
     (2026-robot does; a new_robot robot does not). `sim`: sim_config's
@@ -3677,6 +3759,8 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
     `button`: teleop_button's choice for the robot before the scaffold.
     `raw`: a --raw position node, whose constants are in its own file
     (`lang` names it); otherwise both languages read the same keys.
+    `coverage`: the robot requires target coverage, so the subsystem file
+    lists no lane (without_producer) until its producer is added.
     `robot`: a robot directory of talOS, or a Layout; in a robot repository
     the commands are the ones it runs (`@talos//` tools, `bazel run //:sim`)."""
     layout = layout_of(robot)
@@ -3751,6 +3835,8 @@ Next:
     {constants}
     are placeholders sized for the simulation: measure the travel, check
     the push moves toward the switch, time it, and set each."""
+    listing = (' and listing teleop = ["teleop"] in its [targets]'
+               if coverage else "")
     golden = f"""
   {configuration}/config_golden_test.cc
     pins the hardware config: update it once a human has checked the CAN id.""" \
@@ -3768,7 +3854,7 @@ Next:
 {run}
   Before a real robot drives the motor, in {subsystem}:
     can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
-    Tune slot0 on the mechanism before uncommenting its teleop binding.{own}{golden}"""
+    Tune slot0 on the mechanism before uncommenting its teleop binding{listing}.{own}{golden}"""
 
 
 def standalone_next_steps(target_dir, name, kind="velocity", raw=False):
@@ -3924,9 +4010,11 @@ def main(argv):
     else:
         golden_test = os.path.isfile(os.path.join(
             root, layout_of(robot).configuration, "config_golden_test.cc"))
+        coverage = can_id is not None and coverage_required(
+            root, including_configs(root, robot))
         print(next_steps(robot, args.name, can_id, args.kind, args.lang,
                          golden_test, sim_config(root, robot), button,
-                         args.raw))
+                         args.raw, coverage))
     return 0
 
 

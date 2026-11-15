@@ -44,6 +44,16 @@ id) and simulation-only lines for a `robot_sim.toml`. This fixture's
 `//:sim` runs `robot.toml`, not that file, and no `manifest_sync_test`
 checks it, so here those lines do not make the mechanism move.
 
+`bazel test //...` passes right after the scaffold. In a robot whose config
+requires target coverage (`[robot] require_target_coverage = true`, set
+directly or by a config that includes it, or `commissioned = true`), the
+subsystem file gets an uncommented `[targets]` with every mode empty: the
+new subsystem has no producer yet, the coverage check judges only modes
+that list a lane, and with none the node stays neutral. Listing
+`teleop = ["teleop"]` there goes with uncommenting its teleop binding. This
+fixture does not require coverage, so its file keeps `[targets]` commented
+and `[robot.targets]` applies.
+
 ## Simulation
 
 `bazel run //:sim -- ARGS` runs `launcher --config robot.toml --sim
