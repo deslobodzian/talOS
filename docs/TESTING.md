@@ -295,7 +295,11 @@ producer that has drained it would.
 `bazel run //tools:new_subsystem` generates the matrix skeleton; its golden
 packages (`tools/scaffold_testdata/*`) are the reference, checked by
 `new_subsystem_test` **[enforced]**, and every one has its whole matrix
-(`check_node_matrix_test` **[enforced]**).
+(`check_node_matrix_test` **[enforced]**). What it writes into a robot
+repository builds and passes `bazel test //...` there, with and without
+target coverage required (`tools/check_robot_repo_scaffold.sh`, in a copy
+of `examples/robot_repo`) **[enforced: CI's dependent-repositories job and
+`tools/prepush.sh`]**.
 
 ## 8. Flakes
 
