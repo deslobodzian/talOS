@@ -568,12 +568,20 @@ class Vision {
                 solver_options_.mount_translation_std_m >= 0,
             "camera.mount_translation_std_m");
     // Each key on its own, so the error names it (the ranges are those
-    // CameraIntrinsics::IsValid and the simulation paths rely on).
-    require(intr.fx > 0, "camera.fx");
-    require(intr.fy > 0, "camera.fy");
-    require(intr.cx > 0, "camera.cx");
-    require(intr.cy > 0, "camera.cy");
+    // CameraIntrinsics::IsValid and the simulation paths rely on): a finite
+    // positive focal length, the principal point inside the image, and
+    // finite distortion coefficients, so no NaN or infinity reaches the
+    // undistortion or the solver.
+    require(std::isfinite(intr.fx) && intr.fx > 0, "camera.fx");
+    require(std::isfinite(intr.fy) && intr.fy > 0, "camera.fy");
+    require(intr.cx > 0 && intr.cx < width, "camera.cx");
+    require(intr.cy > 0 && intr.cy < height, "camera.cy");
     for (const auto& [key, value] : {
+             std::pair{"camera.k1", intr.k1},
+             std::pair{"camera.k2", intr.k2},
+             std::pair{"camera.k3", intr.k3},
+             std::pair{"camera.p1", intr.p1},
+             std::pair{"camera.p2", intr.p2},
              std::pair{"camera.x_m", extrinsics_.x_m},
              std::pair{"camera.y_m", extrinsics_.y_m},
              std::pair{"camera.z_m", extrinsics_.z_m},

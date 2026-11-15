@@ -1300,9 +1300,18 @@ TEST(VisionTest, BadParameterFailsConstruction) {
       rows.push_back({".camera", key, value, false});
     }
   }
+  // The calibration: finite, a positive focal length, the principal point
+  // inside the configured 1280 x 720 image.
+  for (const char* key :
+       {"fx", "fy", "cx", "cy", "k1", "k2", "k3", "p1", "p2"}) {
+    for (const char* value : {"nan", "inf", "-inf"}) {
+      rows.push_back({".camera", key, value, false});
+    }
+  }
   for (const Row& row : {
            Row{".camera", "fx", "0.0", false},
-           Row{".camera", "cy", "nan", false},
+           Row{".camera", "cx", "1280.0", false},
+           Row{".camera", "cy", "720.0", false},
            Row{".camera", "x_m", "nan", false},
            Row{".camera", "yaw_rad", "inf", false},
            Row{".camera", "max_range_m", "0.0", false},
@@ -1534,6 +1543,7 @@ TEST(VisionTest, LiveControlsReachBackendAndFailuresAppearInStatus) {
     LiveTestVision::device = device;
     auto sim = MakeSim(false, true,
                        "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                       "cx = 80.0\ncy = 60.0\n"
                        "exposure_ms = 4.5\ngain = 12\n"
                        "auto_exposure = false\nauto_gain = false\n",
                        "period_us = 1000\n");
@@ -1573,6 +1583,7 @@ TEST(VisionTest, SilentLiveCameraReopensWithBackoffAndCountsRecovery) {
   LiveTestVision::device = device;
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 50000\n",
                      "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
@@ -1620,6 +1631,7 @@ TEST(VisionTest, LiveCameraGetsTimeForItsFirstFrame) {
   LiveTestVision::device = device;
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 500000\n",
                      "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
@@ -1669,6 +1681,7 @@ TEST(VisionTest, FlowingLiveFramesDoNotReconnectAndUseSourceTiming) {
   // test above.
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 10000000\nexposure_ms = 4\n"
                      "readout_us = 1000\nlatency_offset_us = 10000\n",
                      "period_us = 1000\n");
@@ -1769,6 +1782,7 @@ TEST(VisionTest, UpdateDoesNotAllocate) {
   LiveTestVision::device = device;
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 10000000\n",
                      "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
@@ -1884,6 +1898,7 @@ TEST(VisionTest, SlowWorkerProcessesNewestLiveFrameAndCountsDrops) {
   LiveTestVision::device = device;
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 10000000\n",
                      "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
@@ -1935,6 +1950,7 @@ TEST(VisionTest, LiveResultsFinishedBetweenTicksPublishInOrderOrDropOldest) {
   LiveTestVision::device = device;
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 10000000\n",
                      "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
@@ -1987,6 +2003,7 @@ TEST(VisionTest, FailingOpenLogsOncePerTransitionAndBackoffIsCapped) {
   ::testing::internal::CaptureStderr();
   auto sim = MakeSim(false, true,
                      "device = \"fake\"\nwidth = 160\nheight = 120\n"
+                     "cx = 80.0\ncy = 60.0\n"
                      "frame_timeout_us = 10000000\n",
                      "period_us = 1000\n");
   auto& camera = sim.add<LiveTestVision>("rear_right_camera");
