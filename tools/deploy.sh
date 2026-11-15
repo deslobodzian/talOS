@@ -62,9 +62,15 @@ finally:
 # the native pass.
 WARM_UP=1
 warm_up() {
-  local bundle="$1"
+  local bundle="$1" command="$2"
   if [ "$WARM_UP" != "1" ]; then
-    say "warm-up skipped (--no-warm-up): the first launch pays each member's first run"
+    # install's graph check that follows runs every member and the launcher
+    # (all at once, inside the probes' deadline) but loads no native library.
+    if [ "$command" = "install" ]; then
+      say "warm-up skipped (--no-warm-up): the graph check pays each member's first run, all at once; on macOS the first launch pays each native library's first load"
+    else
+      say "warm-up skipped (--no-warm-up): the first launch pays each member's first run"
+    fi
     return 0
   fi
   if [ "$DRY_RUN" = "1" ]; then
@@ -269,18 +275,22 @@ EOF
 # The launch's own first phase, run on the installed copy before anything
 # selects it: the copy's run.sh with --describe-only, so the bundle's launcher
 # probes every member with --describe on the config run.sh passes (Studio's
-# bridge included when the bundle carries it) and lints the graph exactly as
-# the boot service's launch will, then exits. A graph it refuses (a naming or
-# graph-lint error, a critical member that does not answer, a parameter key
-# no node reads) would make the boot service restart a refusing launcher
-# forever, so install refuses it; the launcher's warnings stay warnings. The
-# check needs no controller, shared memory, registry, session lock or
-# realtime privilege: --describe-only takes none of them and a --describe run
-# opens no device. Its session directory goes to a temporary root, removed
-# afterwards. --no-warm-up does not skip it; on macOS a fresh bundle's probes
-# then pay the first-run charge inside their deadline, as a first launch
-# would. There is no override: the launcher accepts --allow-graph-errors only
-# with --sim, so a robot could never launch such a bundle.
+# bridge included when the bundle carries it), lints the graph and exits. A
+# graph it refuses (a naming or graph-lint error, a critical member that does
+# not answer, a parameter key no node reads) would make the boot service
+# restart a refusing launcher forever, so install refuses it. Its warnings
+# (the graph's `  warning: ` lines; a non-critical member that did not answer
+# is one) do not refuse and are printed. Not covered: --describe-only skips
+# the `[robot] simulation_only` refusal a launch without --sim makes, and the
+# check runs as the installing person with their environment, not as the
+# boot service's account with its PATH (TODO.md DEPLOY-10). The check needs
+# no controller, shared memory, registry, session lock or realtime
+# privilege: --describe-only takes none of them and a --describe run opens no
+# device. Its session directory goes to a temporary root, removed afterwards.
+# --no-warm-up does not skip it; on macOS a fresh bundle's probes then pay
+# the first-run charge inside their deadline. There is no override: the
+# launcher accepts --allow-graph-errors only with --sim, so a robot could
+# never launch such a bundle.
 check_graph() {
   local bundle="$1"
   if [ "$DRY_RUN" = "1" ]; then
@@ -305,9 +315,17 @@ check_graph() {
     die "stopped during the graph check; nothing selected"
   fi
   if [ "$status" = "0" ]; then
-    say "the launcher accepts the graph"
+    # PrintDeclaredGraph writes each diagnostic as "  warning: <subject>: ...".
+    local warnings
+    warnings="$(grep '^  warning: ' "$scratch/output" || true)"
+    if [ -n "$warnings" ]; then
+      say "the launcher accepts the graph, with warnings:"
+      printf '%s\n' "$warnings" | sed 's/^/  | /'
+    else
+      say "the launcher accepts the graph"
+    fi
   else
-    printf 'deploy: the launcher refuses this bundle (exit %s):\n' "$status" >&2
+    printf "deploy: the launcher's check of this bundle failed (exit %s); its output:\n" "$status" >&2
     sed 's/^/  | /' "$scratch/output" >&2
   fi
   rm -rf "$scratch"
@@ -339,7 +357,7 @@ cmd_install() {
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
-  warm_up "$dest"
+  warm_up "$dest" install
   if ! check_graph "$dest"; then
     local stays="nothing is selected"
     if [ -L "$PREFIX/current" ]; then
@@ -754,7 +772,7 @@ cmd_rollback() {
   [ -L "$PREFIX/previous" ] && [ -x "$PREFIX/previous/run.sh" ] ||
     die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
   local cur; cur="$(readlink "$PREFIX/current")"
-  warm_up "$(cd "$PREFIX/previous" && pwd -P)"
+  warm_up "$(cd "$PREFIX/previous" && pwd -P)" rollback
   select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
   select_bundle "$cur" "$PREFIX/previous"
   say "rolled back: current -> $(readlink "$PREFIX/current"); restart the service to activate"
