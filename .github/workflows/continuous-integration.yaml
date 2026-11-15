@@ -542,9 +542,13 @@ jobs:
     # The deployed RoboRIO program (Robot.cpp: its Driver Station loop,
     # gateway and Phoenix 6 backend) run as a desktop simulation against the
     # Bazel-built bridge and drivetrain node: tools/test_drivetrain.py
-    # --wpilib drives, checks the neutral stop when commands end, replays the
-    # node's log, and checks a never-enabled robot does not move. -Pheadless
-    # (set by the script) loads no simulation GUI, so no display is needed.
+    # --wpilib drives, checks the robot ends neutral after the target, node,
+    # bridge and Driver Station have stopped in turn, replays the node's log,
+    # checks a never-enabled robot does not move, and, with the Driver Station
+    # still enabled, kills every main-processor process mid-drive and checks
+    # from the RoboRIO program's own States that it neutralizes every output
+    # on its first tick at or past the command's expiry. -Pheadless (set by
+    # the script) loads no simulation GUI, so no display is needed.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
