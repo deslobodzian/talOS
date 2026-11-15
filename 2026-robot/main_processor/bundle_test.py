@@ -15,7 +15,9 @@ the manifest's [studio] table, beside the index page of the webroot that
 table names; one that does not is asked for Studio with
 --start-studio-bridge and must describe without a bridge rather than fail on
 its absence. Every Python node's venv runs its runtime's one interpreter,
-which its bundle holds once under python/<repository>/. Install's warm-up is checked on a bundle of stubs that record each
+which its bundle holds once under python/<repository>/. Install refuses a
+bundle whose graph its own launcher refuses. Install's warm-up, and the
+order of its graph check, are checked on a bundle of stubs that record each
 run.
 
 On macOS each newly written executable's first exec costs about 100 ms, and
@@ -210,6 +212,58 @@ class BundleTest(unittest.TestCase):
                     self.assertEqual(len(copies), 1, (repo, copies))
 
 
+class InstallCheckTest(unittest.TestCase):
+    # REQ-OPS-01, REQ-CONTRACT-09: install selects only a bundle its own
+    # launcher accepts, so the boot service never restarts a launcher that
+    # refuses every launch.
+    def test_install_refuses_a_bundle_the_launcher_refuses(self):
+        src = runfiles.Create().Rlocation(
+            "_main/bench/main_processor/bench_bundle")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            prefix = os.path.join(tmp, "prefix")
+            current = os.path.join(prefix, "current")
+
+            def install(bundle):
+                return subprocess.run(
+                    ["bash", deploy_script(), "install", bundle,
+                     "--prefix", prefix],
+                    capture_output=True, text=True, timeout=120)
+
+            proc = install(src)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            good = os.readlink(current)
+            # The smallest graph error a person makes: a misspelled
+            # parameter, a key no node reads.
+            # The sandbox links each input file; copy what they name.
+            bad = os.path.join(tmp, "bad")
+            shutil.copytree(src, bad)
+            with open(os.path.join(bad, "bundle_manifest.toml"), "rb") as f:
+                config = tomllib.load(f)["config_path"]
+            motor = os.path.join(bad, os.path.dirname(config), "subsystems",
+                                 "motor.toml")
+            with open(motor, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("max_bench_voltage_v = 2.0\n", text)
+            os.chmod(motor, 0o644)
+            with open(motor, "w", encoding="utf-8") as f:
+                f.write(text.replace("max_bench_voltage_v = 2.0\n",
+                                     "max_bench_voltage_v = 2.0\n"
+                                     "max_bench_voltag_v = 2.0\n"))
+            proc = install(bad)
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            # The launcher's own finding and refusal, and what stays.
+            self.assertIn("max_bench_voltag_v", out)
+            self.assertIn("refusing to start", out)
+            self.assertIn(f"{bad} not installed", out)
+            self.assertIn(f"; current stays {good}\n", out)
+            self.assertEqual(os.readlink(current), good, out)
+            self.assertFalse(os.path.lexists(os.path.join(prefix, "previous")),
+                             out)
+            self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
+                             [os.path.basename(good)], out)
+
+
 def launcher_stop_timeout_s():
     """The launcher's orderly stop: SIGINT to every member, SIGKILL to any
     still alive kStopTimeout (talOS/launcher/launcher.h) later, then the
@@ -312,11 +366,28 @@ class WarmUpTest(unittest.TestCase):
         stub_bundle(src, nodes)
         return self.deploy("install", src, *args)
 
-    def records(self):
+    def records(self, check=False):
+        """The warm-up's records, or with `check` install's graph check's
+        (the installed run.sh, which the warm-up never runs)."""
         if not os.path.exists(self.log):
             return []
         with open(self.log, encoding="utf-8") as f:
-            return [line.split(" ", 4) for line in f.read().splitlines()]
+            return [r for r in (line.split(" ", 4)
+                                for line in f.read().splitlines())
+                    if (os.path.basename(r[1]) == "run.sh") == check]
+
+    def assert_checked_after_warm_up(self, bundle):
+        """The installed run.sh ran once, with --describe-only, after every
+        warm-up run and before `current` selected anything."""
+        log = self.records(check=True)
+        self.assertEqual([r[0] for r in log], ["start", "end"], log)
+        self.assertEqual(log[0][1], os.path.join(bundle, "run.sh"), log)
+        self.assertEqual(log[0][3], "-", log)
+        self.assertTrue(log[0][4].startswith("--describe-only --output-dir "),
+                        log)
+        with open(self.log, encoding="utf-8") as f:
+            last = f.read().splitlines()[-1]
+        self.assertEqual(last, f"end {os.path.join(bundle, 'run.sh')}")
 
     def assert_warmed_in_turn(self, bundle, nodes, selected, proc):
         """Every member of the installed `bundle` ran exactly once, one at a
@@ -325,7 +396,8 @@ class WarmUpTest(unittest.TestCase):
         records = self.records()
         out = proc.stdout + proc.stderr
         describe = "--describe --config config/robot.toml"
-        # The installed files (the macOS charge is per file), never run.sh.
+        # The installed files (the macOS charge is per file); run.sh is the
+        # graph check's, which records() leaves out.
         started = sorted((r[1], r[4] if len(r) > 4 else "")
                          for r in records if r[0] == "start")
         want = sorted(
@@ -357,11 +429,15 @@ class WarmUpTest(unittest.TestCase):
         proc = self.install("bundle", nodes)
         bundle = os.path.realpath(os.path.join(self.prefix, "current"))
         self.assert_warmed_in_turn(bundle, nodes, "-", proc)
+        self.assert_checked_after_warm_up(bundle)
 
     # REQ-OPS-47
     def test_no_warm_up_runs_nothing(self):
         self.install("bundle", ("alpha",), "--no-warm-up")
         self.assertEqual(self.records(), [])
+        # The graph check is no part of the warm-up.
+        self.assert_checked_after_warm_up(
+            os.path.realpath(os.path.join(self.prefix, "current")))
 
     # REQ-OPS-47
     def test_rollback_warms_the_previous_bundle_before_selecting_it(self):

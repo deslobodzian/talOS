@@ -126,9 +126,12 @@ A relative `--prefix` is resolved against the working directory.
 
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
   any symlink kept as one), checks that the copy has an executable `run.sh`, runs
-  `sync`, [warms the copy](#warm-up), retains `previous`, and atomically
-  replaces `current` using a temporary sibling symlink and rename (Linux and
-  macOS). This selects the next bundle; restart the service to activate it.
+  `sync`, [warms the copy](#warm-up), [checks its graph](#graph-check),
+  retains `previous`, and atomically replaces `current` using a temporary
+  sibling symlink and rename (Linux and macOS). This selects the next bundle;
+  restart the service to activate it. A bundle whose graph the launcher
+  refuses is not installed: its copy is removed and `current` and `previous`
+  stay as they were.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
@@ -259,7 +262,8 @@ and can run beside a running robot. On the Mac mini it takes about 11 s
 under a second and constructs `pose_estimator` as fast as the second. A
 member that exits nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
-succeeds: the launch judges its members. A member that detaches a process
+succeeds: install's [graph check](#graph-check), and rollback's launch, judge
+the members. A member that detaches a process
 into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
 member's process group, selects nothing and exits 1. Linux has no such
@@ -270,6 +274,41 @@ launch.
 The members run as the user that runs `deploy.sh`, root under `sudo`: the
 bundle's code runs at install time with that privilege, so install only a
 bundle you would launch.
+
+### Graph check
+
+After the warm-up, `install` runs the copy's own `run.sh --describe-only`
+with a temporary `--output-dir`: the bundle's launcher, on the config and
+with the Studio bridge `run.sh` gives it, probes every member with
+`--describe` and lints the graph, the first phase of every launch
+([two phases](../talOS/launcher/README.md#two-phases)), and exits. Whatever
+that refuses (a naming or graph rule, a critical member that does not
+answer, a parameter key no node reads) the boot service's launch would
+refuse every time it restarts, with nothing running and the driver
+dashboard showing only a lost link. So such a bundle is not installed:
+`deploy.sh` prints the launcher's output, each line prefixed `  | `,
+removes the copy, and exits 1 with
+
+```
+deploy: error: <bundle> not installed (the paths above were its removed copy, <prefix>/bundles/<stamp>); current stays <prefix>/bundles/<selected>
+```
+
+(`nothing is selected` on a first install). The bundle given still holds
+every file the launcher names, at the same path below it. Warnings, from the
+launcher or the warm-up, do not refuse. Stopping `deploy.sh` during the
+check stops the launcher, selects nothing and exits 1.
+
+The check takes nothing a running robot holds: `--describe-only` takes no
+session lock, shared memory, registry row, controller link or realtime
+priority, and a `--describe` run opens no device, so it needs neither the
+RoboRIO nor a camera and can run beside a live session. It adds about 0.3 s
+for the 2026 bundle on a Linux workstation. `--no-warm-up` does not skip it;
+on macOS a fresh bundle's probes then pay the first-run charge inside their
+deadline, as its first launch would, so a probe that times out there is
+answered by installing again without `--no-warm-up`. There is no override:
+the launcher accepts `--allow-graph-errors` only with `--sim`, so a robot
+could never launch such a bundle. `rollback` does not check: it selects a
+bundle that was selected before.
 
 ### Boot service output
 
