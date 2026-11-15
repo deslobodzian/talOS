@@ -252,6 +252,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-27 | Driven against the drivetrain node by a pose that follows the measured chassis motion, autonomous's drive action keeps the robot within 0.10 m of its straight path, ends (HOLD) within its planned duration plus 1 s, and leaves the robot within `position_tolerance_m` and `yaw_tolerance_rad` of its goal 0.5 s after HOLD; pushed 0.3 m off the path gradually (over 0.2 s, with an estimate that follows the push), the robot is within 0.10 m of the path from 1 s after the push began until HOLD, which comes within the planned duration plus 1.5 s; after a pose outage it replans from the live pose and still arrives. | P1 | R26 "Nodes" | true pose against the path and goal; `/autonomous/state` phase | component (simulation, ideal motors) |
 | REQ-DEV-28 | When an estimate differs from the previous one by more than its velocity explains plus `replan_step_m` or `replan_step_rad`, the drive action replans from it on that tick without releasing its lane. | P1 | R26 "Nodes" | `/drivetrain/target/auto` envelope and target on that tick | component |
 | REQ-DEV-29 | A build that uses talOS as a dependency compiles talOS's patched toml++; the consuming repository carries no override or patch file for it. | P1 | `MODULE.bazel`; TODO REPO-1 | the dependent repository's `MODULE.bazel`; `@talos//talOS/configuration:config_fuzz_test` built there | integration |
+| REQ-DEV-30 | A robot repository that names talOS only through `@talos//` labels and pins it with `local_path_override` passes its own `bazel test //...` (its graph test and node tests), builds its bundle, and runs `bazel run //:sim` for a bounded time with exit 0, every member of the session having run and exited 0. | P1 | ARCH "Where a new thing goes" | fixture test results; session manifest | integration |
 
 ## Package scope
 
@@ -274,7 +275,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-33, REQ-CONTRACT-36, REQ-CONTRACT-37, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09, REQ-RT-23 |
-| `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09, REQ-OPS-48 |
+| `talOS/schema`, `talOS/build` | REQ-CONTRACT-07, REQ-CONTRACT-08, REQ-CONTRACT-19, REQ-DEV-09, REQ-DEV-30, REQ-OPS-48 |
 | `talOS/msgs`, `talOS/geometry` | REQ-CONTRACT-25 to REQ-CONTRACT-27, REQ-DEV-26 |
 | `talOS/telemetry` | REQ-CONTRACT-28, REQ-OPS-22, REQ-OPS-35, REQ-OPS-37, REQ-OPS-38, REQ-OPS-39 |
 | `talOS/teleop` | REQ-SAFE-13, REQ-SAFE-14, REQ-CONTRACT-24 |
@@ -293,5 +294,5 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
-| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-OPS-47 |
+| `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-DEV-30, REQ-OPS-47 |
 
