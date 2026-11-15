@@ -5,23 +5,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iomanip>
 #include <iostream>
-#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
 
-#include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/hardware/packet.h"
@@ -250,33 +245,6 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
   }
 }
 
-// The "config_path" string of a session's manifest.json (session.cc
-// SessionManifest::ToJson, escaped by introspect::AppendJsonString), or empty.
-std::string ManifestConfigPath(const std::filesystem::path& session) {
-  std::ifstream stream{session / "manifest.json"};
-  const std::string text{std::istreambuf_iterator<char>{stream}, {}};
-  constexpr std::string_view kKey = "\"config_path\"";
-  auto at = text.find(kKey);
-  if (at == std::string::npos) return "";
-  at = text.find('"', text.find(':', at + kKey.size()));
-  if (at == std::string::npos) return "";
-  std::string value;
-  for (std::size_t i = at + 1; i < text.size(); ++i) {
-    const char c = text[i];
-    if (c == '"') return value;
-    if (c != '\\') {
-      value += c;
-    } else if (i + 1 < text.size() && text[i + 1] != 'u') {
-      value += text[++i];
-    } else if (i + 5 < text.size()) {
-      value += static_cast<char>(
-          std::strtol(text.substr(i + 2, 4).c_str(), nullptr, 16));
-      i += 5;
-    }
-  }
-  return "";
-}
-
 // Every scalar of a DecodeToText string (talOS/schema/decode.h) with its
 // field path: `{a: 1, b: {c: [2, 3]}}` gives a=1, b.c[0]=2 and b.c[1]=3. A
 // `<...>` (a payload the schema could not decode) is one scalar. Text of any
@@ -500,43 +468,22 @@ class TopicSummary {
   std::map<std::string, std::size_t> range_index_;
 };
 
-// A relative config path is the launcher's or the user's, relative to where
-// they ran: under `bazel run` that is BUILD_WORKING_DIRECTORY, since this
-// binary then runs in its runfiles directory; otherwise the working directory.
-std::string ResolveConfigPath(const std::string& path) {
-  const char* base = std::getenv("BUILD_WORKING_DIRECTORY");
-  if (path.empty() || std::filesystem::path{path}.is_absolute() ||
-      base == nullptr || *base == '\0') {
-    return path;
-  }
-  return (std::filesystem::path{base} / path).string();
-}
-
 // Device names for the hardware packets: from --config, else from the config
-// a session directory's manifest names, when that file can still be read.
-// Without one, devices are identified by logical id only.
+// a session directory's manifest names, when that file can still be read
+// (hardware_record.h). Without one, devices are identified by logical id only.
 std::optional<talos::launcher::DeviceNames> LoadDeviceNames(
     const Options& options) {
-  std::string path = options.config;
-  if (path.empty()) {
-    for (const auto& input : options.paths) {
-      std::error_code ec;
-      if (!std::filesystem::is_directory(input, ec)) continue;
-      path = ManifestConfigPath(input);
-      if (!path.empty()) break;
-    }
-    if (path.empty()) return std::nullopt;
-  }
-  path = ResolveConfigPath(path);
-  try {
-    return talos::launcher::DeviceNames::FromConfig(
-        talos::config::ParseRobotConfig(path).hardware);
-  } catch (const std::exception& e) {
+  const std::string path =
+      talos::launcher::SessionConfigPath(options.config, options.paths);
+  if (path.empty()) return std::nullopt;
+  std::string error;
+  auto names = talos::launcher::LoadDeviceNames(path, error);
+  if (!names) {
     std::fprintf(stderr,
                  "log_dump: hardware devices by id only, config %s: %s\n",
-                 path.c_str(), e.what());
-    return std::nullopt;
+                 path.c_str(), error.c_str());
   }
+  return names;
 }
 
 }  // namespace

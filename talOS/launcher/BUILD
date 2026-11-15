@@ -231,13 +231,15 @@ cc_binary(
     deps = [":launcher_lib"],
 )
 
-# The hardware packet topics decoded with their wire codecs, for log_dump.
+# The hardware packet topics decoded with their wire codecs, for log_dump
+# and tlog_to_wpilog.
 cc_library(
     name = "hardware_record",
     srcs = ["hardware_record.cc"],
     hdrs = ["hardware_record.h"],
     visibility = ["//studio/review:__pkg__"],
     deps = [
+        "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",
         "//talOS/hardware:config",
@@ -266,7 +268,6 @@ cc_binary(
         ":hardware_record",
         ":log_inputs",
         ":log_merge",
-        "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/hardware",
@@ -391,11 +392,14 @@ cc_binary(
     srcs = ["tlog_to_wpilog.cc"],
     visibility = ["//visibility:public"],
     deps = [
+        ":hardware_record",
         ":log_inputs",
         ":log_merge",
         ":wpilog",
+        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/hardware",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
         "@flatbuffers//:runtime_cc",
@@ -439,8 +443,12 @@ cc_test(
     env = {"TALOS_TLOG_TO_WPILOG": "$(rlocationpath :tlog_to_wpilog)"},
     deps = [
         ":wpilog_message",
+        "//talOS/configuration",
+        "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/hardware",
+        "//talOS/hardware:config",
         "//talOS/msgs:geometry",
         "//talOS/schema:identity",
         "@flatbuffers//:runtime_cc",
