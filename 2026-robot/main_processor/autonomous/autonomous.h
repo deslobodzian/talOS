@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <numbers>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -17,7 +16,6 @@
 #include "autonomous/progress.h"
 #include "autonomous/selection.h"
 #include "autonomous/topics.h"
-#include "autonomous/trajectory.h"
 #include "drivetrain/drive_message_generated.h"
 #include "geometry/geometry_generated.h"
 #include "intake/intake_message_generated.h"
@@ -26,7 +24,11 @@
 #include "shooter/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/devices.h"
+#include "talOS/geometry/se2.h"
 #include "talOS/node/node.h"
+#include "talOS/trajectory/holonomic_follower.h"
+#include "talOS/trajectory/straight_line.h"
+#include "talOS/trajectory/trajectory.h"
 
 namespace autonomous {
 
@@ -51,6 +53,10 @@ class Autonomous {
         yaw_tolerance_{node.param("yaw_tolerance_rad", 0.05)},
         max_linear_{node.param("max_linear_mps", 2.0)},
         max_angular_{node.param("max_angular_radps", 3.0)},
+        max_linear_accel_{node.param("max_linear_accel_mps2", 4.0)},
+        max_angular_accel_{node.param("max_angular_accel_radps2", 6.0)},
+        replan_step_m_{node.param("replan_step_m", 0.15)},
+        replan_step_rad_{node.param("replan_step_rad", 0.1)},
         field_length_{node.param("field_length_m", 16.541)},
         field_width_{node.param("field_width_m", 8.069)},
         kp_xy_{node.param("xy_feedback_per_m_mps", 1.0)},
@@ -100,6 +106,17 @@ class Autonomous {
       BadParameter(node, "selection_previous_direction_index",
                    "must differ from selection_next_direction_index");
     ValidateController();
+    // After ValidateController, so a bad gain or tolerance names its key.
+    talos::trajectory::FollowerConfig follower;
+    follower.translation = {.kp = kp_xy_};
+    follower.heading = {.kp = kp_yaw_};
+    follower.max_linear_mps = max_linear_;
+    follower.max_angular_radps = max_angular_;
+    follower.position_tolerance_m = position_tolerance_;
+    follower.heading_tolerance_rad = yaw_tolerance_;
+    follower_ = talos::trajectory::HolonomicFollower{follower};
+    // A plan inside update() rebuilds the path without allocating.
+    path_.reserve(talos::trajectory::kStraightLineSamples);
     signature_ = RoutineSignature(routines_);
   }
 
@@ -107,10 +124,16 @@ class Autonomous {
     const auto now = node_.now();
     if (feeding_) feed_elapsed_ += now - feed_last_update_;
     feeding_ = false;
+    // A drive tick continues the path only if the previous tick sent a
+    // path-following target in the same generation. After any other tick
+    // (released, stopped, another phase, a resume) it plans again from the
+    // live pose: the robot braked while its lane was released, so the old
+    // path's reference would ask for its cruise speed at once.
+    continuing_ = following_;
+    following_ = false;
     // Silence is not a mode transition: preserve progress and wall deadlines,
-    // but never keep commanding lanes or advance feed/trajectory time.
+    // but never keep commanding lanes or advance feed time.
     if (!ds_.connected()) {
-      trajectory_pose_available_ = false;
       selection_seeded_ = false;
       CheckDeadline(now);
       Stop();
@@ -195,55 +218,31 @@ class Autonomous {
     }
     if (CurrentAction().completion == Completion::kWaypoint) {
       shooter = 0;
+      // A pose that is not fresh, valid, localized and usable releases the
+      // drive lane on this tick (below), and the next usable one plans
+      // again. A step in a usable estimate plans again on this tick without
+      // releasing: a release would neutralize the drivetrain at once,
+      // skipping its slew limit.
       if (PrerequisiteMet(CurrentAction(), shooter_ready)) {
-        const auto& p = pose_->pose();
-        if (!trajectory_started_) {
-          auto target = TrajectorySample{0, target_x_, target_y_, target_yaw_};
-          if (red_) {
-            target.x_m = field_length_ - target.x_m;
-            target.y_m = field_width_ - target.y_m;
-            target.yaw_rad = WrapAngle(target.yaw_rad + std::numbers::pi);
-          }
-          // UsablePose keeps the plan finite; should it not be (a waypoint
-          // the config puts beyond the double range), the lane is released
-          // below, as for an unlocalized pose, and the next tick plans again.
-          const auto planned = Trajectory::FromPoses(
-              p, geometry::Pose2d{target.x_m, target.y_m, target.yaw_rad},
-              max_linear_, max_angular_);
-          if (planned) {
-            trajectory_ = *planned;
-            trajectory_started_ = true;
-            trajectory_elapsed_ = talos::Duration::zero();
-            trajectory_last_update_ = phase_.time_in_state();
-          }
-          trajectory_pose_available_ = false;
+        const auto& estimate = *pose_;
+        const talos::Time estimate_time = now - pose_.age();
+        if (!continuing_ || Stepped(estimate, estimate_time)) {
+          Plan(estimate.pose(), now);
         }
-        if (trajectory_started_) {
-          if (trajectory_pose_available_) {
-            trajectory_elapsed_ +=
-                phase_.time_in_state() - trajectory_last_update_;
-          }
-          trajectory_last_update_ = phase_.time_in_state();
-          trajectory_pose_available_ = true;
-        }
-      } else {
-        trajectory_pose_available_ = false;
-      }
-      if (trajectory_pose_available_) {
-        const auto& p = pose_->pose();
-        const double elapsed =
-            std::chrono::duration<double>(trajectory_elapsed_).count();
-        const auto desired = trajectory_.SampleAt(elapsed);
-        const double dx = desired.x_m - p.x_m(), dy = desired.y_m - p.y_m();
-        const double da = WrapAngle(desired.yaw_rad - p.yaw_rad());
-        if (elapsed >= trajectory_.total_time_s() &&
-            std::hypot(dx, dy) <= position_tolerance_ &&
-            std::abs(da) <= yaw_tolerance_) {
+        const auto out =
+            planned_ ? follower_.step_pose(
+                           path_, Seconds(now - plan_started_), estimate.pose(),
+                           continuing_ ? Seconds(now - followed_at_) : 0.0,
+                           talos::trajectory::SpeedsFrame::kRobot)
+                     : talos::trajectory::FollowerOutput{};
+        if (out.finished) {
           Advance(now);
-        } else {
-          drive =
-              HolonomicController{kp_xy_, kp_yaw_, max_linear_, max_angular_}
-                  .Calculate(desired, p);
+        } else if (out.valid) {
+          drive = out.speeds.as<drivetrain::ChassisTarget>();
+          following_ = true;
+          followed_at_ = now;
+          previous_estimate_ = estimate;
+          previous_estimate_time_ = estimate_time;
           if (routines_[latched_].collect && intake_state_.fresh() &&
               !intake_state_->beam_broken()) {
             intake = intake_velocity_;
@@ -257,7 +256,7 @@ class Autonomous {
     }
     // Write-ahead: the record holds this step before its commands go out.
     Persist();
-    if (phase_.is(Phase::kDrive) && !trajectory_pose_available_) {
+    if (phase_.is(Phase::kDrive) && !following_) {
       drive_.release();
     } else {
       drive_.send(drive);
@@ -333,12 +332,21 @@ class Autonomous {
   double shooter_velocity_, intake_velocity_, feed_velocity_;
   double target_x_, target_y_, target_yaw_;
   double position_tolerance_, yaw_tolerance_, max_linear_, max_angular_;
+  double max_linear_accel_, max_angular_accel_;
+  double replan_step_m_, replan_step_rad_;
   double field_length_, field_width_, kp_xy_, kp_yaw_;
-  Trajectory trajectory_;
-  talos::Duration trajectory_elapsed_{};
-  talos::Duration trajectory_last_update_{};
-  bool trajectory_pose_available_ = false;
-  bool trajectory_started_ = false;
+  // The drive action's path, a straight line planned from the live pose,
+  // and its follower; planned_ is false while no plan could be built.
+  talos::trajectory::Trajectory path_;
+  talos::trajectory::HolonomicFollower follower_;
+  bool planned_ = false;
+  bool following_ = false;   // this tick sent a path-following target
+  bool continuing_ = false;  // ... and so did the previous one
+  talos::Time plan_started_{};
+  talos::Time followed_at_{};
+  // The estimate the last following tick drove on, and its publication time.
+  geometry::PoseEstimate previous_estimate_{};
+  talos::Time previous_estimate_time_{};
   talos::Duration feed_duration_;
   double spinup_timeout_s_, drive_timeout_s_;
   talos::Duration autonomous_period_;
@@ -400,8 +408,7 @@ class Autonomous {
   void ResetRoutine() {
     phase_.go(Phase::kIdle);
     generation_ = 0;
-    trajectory_started_ = false;
-    trajectory_pose_available_ = false;
+    continuing_ = false;
     feeding_ = false;
     feed_elapsed_ = talos::Duration::zero();
   }
@@ -515,8 +522,71 @@ class Autonomous {
   // stopped, and may have been moved, while disabled.
   void Resume() {
     generation_ = ds_.data().mode_since_us;
-    trajectory_started_ = false;
-    trajectory_pose_available_ = false;
+    continuing_ = false;
+  }
+
+  static double Seconds(talos::Duration duration) {
+    return std::chrono::duration<double>(duration).count();
+  }
+
+  // A straight line from `start` to the routine's waypoint (rotated about
+  // the field centre for Red), rest to rest within the speed and
+  // acceleration limits, followed from its start. A line that cannot be
+  // built (UsablePose keeps the start finite and near the field, but a
+  // waypoint the config puts beyond the double range overflows) leaves
+  // planned_ false: the lane is released, as for an unusable pose, and the
+  // next tick plans again.
+  void Plan(const geometry::Pose2d& start, talos::Time now) {
+    using talos::geometry::SE2;
+    SE2<double> goal{target_yaw_, SE2<double>::Vector2{target_x_, target_y_}};
+    if (red_) {
+      goal = talos::trajectory::Flip(
+          goal, talos::trajectory::AllianceFlip::kRotate,
+          talos::trajectory::FieldDimensions{field_length_, field_width_});
+    }
+    const SE2<double> from{start.yaw_rad(),
+                           SE2<double>::Vector2{start.x_m(), start.y_m()}};
+    planned_ = static_cast<bool>(talos::trajectory::MakeStraightLine(
+        from, goal,
+        {max_linear_, max_linear_accel_, max_angular_, max_angular_accel_},
+        path_));
+    follower_.reset();
+    plan_started_ = now;
+  }
+
+  // Whether `estimate` moved from the one the last following tick drove on
+  // by more than its velocity explains plus replan_step_m or
+  // replan_step_rad: a correction (vision returning, a re-seed), not motion.
+  // The estimate's velocity is the chassis's, robot frame
+  // (/drivetrain/state's); the motion it explains is the mean of the two
+  // estimates' field-frame velocities over the time between their
+  // publications, so a re-read of the same estimate explains, and moves,
+  // nothing.
+  bool Stepped(const geometry::PoseEstimate& estimate,
+               talos::Time estimate_time) const {
+    const geometry::PoseEstimate& before = previous_estimate_;
+    const double dt_s =
+        std::max(Seconds(estimate_time - previous_estimate_time_), 0.0);
+    const auto field_velocity = [](const geometry::PoseEstimate& e) {
+      const double c = std::cos(e.pose().yaw_rad());
+      const double s = std::sin(e.pose().yaw_rad());
+      return std::array<double, 2>{
+          c * e.velocity().vx_mps() - s * e.velocity().vy_mps(),
+          s * e.velocity().vx_mps() + c * e.velocity().vy_mps()};
+    };
+    const auto v0 = field_velocity(before);
+    const auto v1 = field_velocity(estimate);
+    const double dx_m = estimate.pose().x_m() - before.pose().x_m() -
+                        0.5 * (v0[0] + v1[0]) * dt_s;
+    const double dy_m = estimate.pose().y_m() - before.pose().y_m() -
+                        0.5 * (v0[1] + v1[1]) * dt_s;
+    const double omega_radps = 0.5 * (before.velocity().omega_radps() +
+                                      estimate.velocity().omega_radps());
+    const double dyaw_rad = talos::trajectory::WrapAngle(
+        estimate.pose().yaw_rad() - before.pose().yaw_rad() -
+        omega_radps * dt_s);
+    return std::hypot(dx_m, dy_m) > replan_step_m_ ||
+           std::abs(dyaw_rad) > replan_step_rad_;
   }
 
   void CheckDeadline(talos::Time now) {
@@ -636,6 +706,10 @@ class Autonomous {
         {"yaw_tolerance_rad", yaw_tolerance_},
         {"max_linear_mps", max_linear_},
         {"max_angular_radps", max_angular_},
+        {"max_linear_accel_mps2", max_linear_accel_},
+        {"max_angular_accel_radps2", max_angular_accel_},
+        {"replan_step_m", replan_step_m_},
+        {"replan_step_rad", replan_step_rad_},
         {"field_length_m", field_length_},
         {"field_width_m", field_width_},
         {"xy_feedback_per_m_mps", kp_xy_},

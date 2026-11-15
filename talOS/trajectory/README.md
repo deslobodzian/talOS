@@ -244,9 +244,6 @@ inside `update()` uses `reserve()` once and `assign()` (or
 `MakeStraightLine()`) per rebuild. The trajectory library does no actuation gating: the
 drivetrain's `Target` and `robot_enabled` still decide whether anything moves.
 
-`2026-robot/main_processor/autonomous` does not use this library (TODO.md
-TRAJ-1).
-
 ## Tests
 
 `bazel test //talOS/trajectory:all`. `straight_line_test` checks generated

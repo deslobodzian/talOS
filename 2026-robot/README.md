@@ -52,14 +52,26 @@ it waits for fresh shooter `at_speed`, then feeds for 500 ms at
 -20 rps: negative roller demand is allowed through the intake beam interlock,
 whereas positive collection stops when a piece breaks the beam, and is
 neutral (`FEEDBACK_INVALID`) while the beam has no valid sample. It then stops
-the shooter and drives toward the configured waypoint with bounded field-frame
-position/heading feedback rotated into robot coordinates. The waypoint is in
+the shooter and drives to the configured waypoint along a straight path
+planned from the live pose with `talOS/trajectory`'s `MakeStraightLine`: rest
+to rest within `max_linear_mps`, `max_angular_radps`, `max_linear_accel_mps2`
+and `max_angular_accel_radps2`, the accelerations under the drivetrain's slew
+limits. A `HolonomicFollower` follows it: the path's velocity plus
+`xy_feedback_per_m_mps` and `yaw_feedback_per_rad_radps` times the pose error,
+rotated into robot coordinates. The waypoint is in
 blue-origin coordinates; Red rotates both translation and heading by pi about
 the field centre, as the estimator does with its blue-origin starting pose. Invalid,
 unlocalized, stale or non-finite pose, or one more than a field length (width)
-beyond the field's ends (sides), stops drive and collection immediately; stale
-intake feedback inhibits collection. Reaching the waypoint releases all lanes until mode
-exit. Feed counts only commanded feeding time and continuously requires matching
+beyond the field's ends (sides), stops drive and collection immediately (the
+drive lane is released), and the next usable pose plans the path again from
+where the robot stands. An estimate that moved from the last one by more than
+its velocity explains plus `replan_step_m` or `replan_step_rad` (a vision
+correction) plans again on that tick without releasing the lane. Every plan
+starts from rest, so a replan while moving brakes the robot under the
+drivetrain's slew limit before it accelerates along the new path. Stale
+intake feedback inhibits collection. Reaching the waypoint (the path's time
+over, the pose within `position_tolerance_m` and `yaw_tolerance_rad`) releases
+all lanes until mode exit. Feed counts only commanded feeding time and continuously requires matching
 fresh shooter readiness. Spinup/feed share a wall-clock deadline; drive has its
 own, neither extended by outages. Disable, teleop or DS loss releases all lanes.
 
