@@ -18,6 +18,17 @@ The launcher parses those manifests, assembles the graph they describe, and runs
 `naming::LintGraph` over it. Every finding is printed. If any of them is an
 error, nothing is spawned and the launcher exits non-zero.
 
+Beside the graph, `naming::CheckHardwareConfig` checks the hardware config
+for advisory limits, warnings that never refuse a launch: a motor whose
+`max_velocity_rps * sensor_to_mechanism_ratio` passes 105 rps, and each CAN
+bus whose estimated utilization passes 70 %. The estimate is per bus, from
+that bus's Talon FX, CANcoder and Pigeon 2 counts at the config's
+`status_hz`, with CTR Electronics' per-device figures (classic CAN on
+`"rio"`, CAN FD on a CANivore) plus 5 % for the vendor's diagnostic server,
+calibrated to the bench's measured CANivore utilization
+(`EstimateCanBusLoads` in `talOS/introspection/names.h`); the warning names
+the bus, its estimate and its device counts.
+
 Subsystems default to `critical = true`. A failed probe (timeout, crash or
 import error) is fatal for a critical node. Set `[subsystem] critical = false`
 (inline: `[subsystems.<name>]`) only when the robot may run without that node.
