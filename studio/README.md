@@ -210,7 +210,8 @@ own, opens `/drive` in the host's headless Chromium or Chrome and drives it
 over the DevTools protocol with no dependency beyond Python
 ([`tests/browser/`](tests/browser/): `cdp.py` the client, `probe.js` the
 checks run in the page, `watch.py` the file-change wait for the bridge's
-`listening` line). Once every subsystems row reads UP and the status line
+`listening` line; `//studio:browser_helpers_test` tests `children.py` and
+`watch.py` on their own, in every lane). Once every subsystems row reads UP and the status line
 reads OK, it asserts from the live DOM:
 
 - at 1366x768 and 1280x720: the page does not scroll and no element extends
