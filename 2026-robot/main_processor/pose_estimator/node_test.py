@@ -1136,6 +1136,10 @@ class EstimatorTest(unittest.TestCase):
             ("factor_graph.odometry_std_yaw_rad",
              robot_toml("factor_graph",
                         extra="factor_graph.odometry_std_yaw_rad = -1.0")),
+            # No stand-in: the estimator's own period is another number.
+            ("period_us", robot_toml("factor_graph").replace(
+                "[subsystems.drivetrain]\nperiod_us = 5000\n",
+                "[subsystems.drivetrain]\n")),
         ]
         for axis in ("x_m", "y_m", "yaw_rad"):
             key = f"factor_graph.prior_std_{axis}"

@@ -72,8 +72,8 @@ probe's time.
   interval dt gets it scaled by √(dt / period) (white noise, variance
   proportional to time): half of it at the drivetrain's 5 ms against a
   20 ms period, more for a longer step after a gap. dt is floored at the
-  drivetrain's `period_us` (read from its subsystem table; without one, the
-  estimator's own period): a state's sample time is its oldest reading, so
+  drivetrain's `period_us` (read from its subsystem table, which must set
+  it: construction fails without it): a state's sample time is its oldest reading, so
   when the most-lagging device changes a step can be microseconds long
   while its wheel travel spans at least one refresh, and a sigma scaled by
   that dt would be over-confident (at nanoseconds, iSAM2 fails and
