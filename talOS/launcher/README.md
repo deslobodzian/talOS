@@ -47,6 +47,12 @@ as nodes start, restart or exit, report a stopped event log, or run endpoints
 that differ from their probe's ([live endpoints](#live-endpoints)); normal
 shutdown adds final log counts.
 
+`--duration-s N` bounds the session: N seconds after the launcher starts
+spawning the roster, it stops the session as a signal does
+([restarts](#restarts)). Members are started without a `--duration-s` of
+their own, so only that stop ends a member that runs well; a member whose
+launcher dies is killed by its guardian ([restarts](#restarts)).
+
 A launch that starts the roster handles a stop (SIGINT, SIGTERM, or a
 [hangup](#node-output)) in order from its first step, before it takes the
 [session lock](#one-session-per-namespace), so a stop at any point leaves
