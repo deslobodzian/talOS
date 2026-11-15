@@ -376,10 +376,18 @@ wrote my_robot/main_processor/configuration/subsystems/claw.toml
 ...
 ```
 
-As with `new_robot`, `--type` picks the archetype: `velocity` (the default,
-as here), `position` ([section 6](#6-position-mechanisms-the-library-or-your-own-code))
-or `estimator` (a pose estimator with no hardware). `--help` lists every
-flag.
+After the files it names the archetype it generated and the other
+`--type` choices:
+
+```text
+Type: velocity, a motor held at a speed, such as a flywheel or roller.
+  Other types (--type velocity|position|estimator):
+    position: a motor moved to a position counted from a home switch, such as an arm, wrist or elevator
+    estimator: a pose estimator from camera observations, with no device
+```
+
+`velocity` is the default; `position` is
+[section 6](#6-position-mechanisms-the-library-or-your-own-code).
 
 The message file has the same shape as the Python one. The node is a header
 plus a one-line entry point, `TALOS_NODE(claw::Claw)` in `claw.cc`:
@@ -407,11 +415,12 @@ It is the Python node line for line; the framework is written once and
 wrapped for Python ([node guide](NODE_DEVELOPMENT_GUIDE.md#node) lists each
 call in both languages). Append the claw's block from its `Next:` output to
 `robot_sim.toml` as you did the flywheel's. Each mechanism needs a button of
-its own: the scaffold picks the lowest one no mechanism of the robot binds
-and prints it in `Next:`. Check that no two mechanisms bind the same button
-after you edit one; change `button = ...` in the block you append to move a
-mechanism (this track moved the claw to button 6). The launcher does not
-warn about a shared button; one press then drives both. Then:
+its own: the scaffold gives a new mechanism the lowest button no binding in
+the robot's configs uses, and prints it in `Next:`. Here that is button 4,
+since the flywheel holds 3 (on a robot whose first mechanism is the claw, it
+is 3). The launcher does not warn about a shared button, and one press then
+drives both, so when you change a binding, check that no two mechanisms bind
+the same button. Then:
 
 ```sh
 bazel test //my_robot/...
@@ -419,14 +428,14 @@ bazel test //my_robot/...
 
 The Python track's `sim.sh` and `log_dump` commands work for the claw, with
 the claw's button in the joystick schedule's mask (button `n` is bit `n-1`,
-so button 6 is `buttons=32`) and the `claw` node read from the session
-directory `sim.sh` printed:
+so button 4 is `buttons=8`, as the claw's `Next:` prints) and the `claw`
+node read from the session directory `sim.sh` printed:
 
 ```sh
 ./sim.sh --config my_robot/main_processor/configuration/robot_sim.toml \
   --sim-gateway --no-studio --duration-s 8 \
   --mode-schedule 'disabled:1,teleop:10' \
-  --joystick-schedule '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=32;pov=-1|6:axes=0;buttons=0;pov=-1'
+  --joystick-schedule '0:axes=0;buttons=0;pov=-1|3:axes=0;buttons=8;pov=-1|6:axes=0;buttons=0;pov=-1'
 ./bazel-bin/talOS/launcher/log_dump --format summary --node claw --topic /claw/state /tmp/talos_logs/<session>
 ./bazel-bin/talOS/launcher/log_dump --node claw --topic /claw/state /tmp/talos_logs/<session> \
   | grep ClawState | awk 'NR%50==1'
@@ -436,10 +445,10 @@ directory `sim.sh` printed:
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
-      claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
-      claw.ClawState {enabled: true, velocity_rps: 19.999999976099026, connected: true}
+      claw.ClawState {enabled: true, velocity_rps: 0, connected: true}
+      claw.ClawState {enabled: true, velocity_rps: 19.99999998432553, connected: true}
       claw.ClawState {enabled: true, velocity_rps: 19.999999999999986, connected: true}
-      claw.ClawState {enabled: true, velocity_rps: 19.999999999999986, connected: true}
+      claw.ClawState {enabled: false, velocity_rps: 19.999999999999986, connected: true}
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
 ```
 
@@ -454,18 +463,20 @@ your own, and its test. The C++ differences follow at the end.
 ### A second button
 
 Add a second binding to the flywheel's block in `robot_sim.toml`, under the
-first:
+first. It needs a button no mechanism holds: the flywheel has 3 and the claw
+4, so use 5, the lowest free one (a robot without the claw would use 4):
 
 ```toml
 [[subsystems.flywheel.teleop.bindings]]
-button = 4
+button = 5
 while_held = { velocity_rps = 40.0 }
 ```
 
-Each `[[...teleop.bindings]]` entry is one trigger. Holding button 4 now asks
+Each `[[...teleop.bindings]]` entry is one trigger. Holding button 5 now asks
 for 40 rps; with both held, the binding listed first wins. Axes, the POV,
 toggles and defaults are in [declarative teleop bindings](../talOS/teleop/README.md).
-In `sim.sh`'s joystick schedule button 4 is `buttons=8`.
+In `sim.sh`'s joystick schedule button 5 is `buttons=16`. The scaffold reads
+this binding too, so the next mechanism it writes gets button 6.
 
 ### A new state field
 
@@ -565,7 +576,7 @@ bazel test //my_robot/main_processor/flywheel:all
 After the first build, an edit-and-test round takes about a second and a half
 for this Python node and about three seconds for the C++ claw (measured on a
 warm cache; your machine will differ). Run the simulation again with button
-4 in the schedule and the summary shows `range goal_rps 0 40` and
+5 in the schedule and the summary shows `range goal_rps 0 40` and
 `range at_speed false true`.
 
 ### In C++
@@ -598,7 +609,9 @@ in phases (unhomed, pushing toward the switch at `homing_v`, zeroing after
 `home_samples` closed readings, then waiting at rest before the first move),
 clamps every goal to `min_rot..max_rot`, and latches faults neutral (a homing
 timeout or stall, a switch stuck closed mid-travel) until the Driver Station
-reports disabled. Its README has every key and phase.
+reports disabled. Its README has every key and phase. The scaffold's
+summary line reads `Type: position, a motor moved to a position counted
+from a home switch, such as an arm, wrist or elevator.`
 
 Its `Next:` block carries simulation keys a velocity block does not: the
 simulated travel (`[subsystems.arm.arm] max_rot`), a home switch that closes
@@ -608,13 +621,17 @@ driving to the switch, as on the robot.
 
 ### Writing the arm yourself
 
-A node may drive its `Motor` directly instead. To replace the scaffolded
-mechanism with your own code:
+A node may drive its `Motor` directly instead. Then the cases the library
+handles for you are yours: owning the node means owning them. An arm that
+homes on a switch must at least bound its push toward the switch, notice a
+switch stuck closed, and push gently. To replace the scaffolded mechanism
+with your own code:
 
 1. In `arm.h`, replace the `PositionMechanism` member with the devices it
-   used, and `update()` with your control. One version, which zeroes on the
-   switch once the arm is at rest and then runs Motion Magic inside a fixed
-   travel:
+   used, and `update()` with your control. Drop the `position_mechanism.h`
+   include and `HomingState()`. This version zeroes on the switch once the
+   arm is at rest, then runs Motion Magic inside a fixed travel, and reports
+   `FAILED` (the scaffolded `ArmState`'s `homing` field) on either fault:
 
    ```cpp
    #include <algorithm>
@@ -634,37 +651,81 @@ mechanism with your own code:
          motor_.rezero(0.0);
        }
        const Target* t = target_.get();  // null: disabled, stale or released
-       const bool drive = t != nullptr && motor_.connected() &&
-                          std::isfinite(t->position_rot());
+       const bool live = t != nullptr && motor_.connected() &&
+                         std::isfinite(t->position_rot());
+       if (!live) {  // released or disabled: the next press may try again
+         failed_ = false;
+         push_ticks_ = 0;
+       }
+       // Closed well above zero: the switch is stuck, or the zero is wrong.
+       if (motor_.zeroed() && on_switch && motor_.position() > kHomeMarginRot) {
+         failed_ = true;
+       }
+       bool drove = false;
        double goal = 0.0;
-       if (drive && motor_.zeroed()) {
+       if (live && !failed_ && motor_.zeroed()) {
          goal = std::clamp(t->position_rot(), 0.0, kMaxRot);
          motor_.set_motion_magic(goal);
-       } else if (drive && !on_switch) {
-         motor_.set_voltage(-0.5);  // toward the switch; on it, brake to rest
+         drove = true;
+       } else if (live && !failed_ && !on_switch) {
+         if (++push_ticks_ > kMaxPushTicks) {
+           failed_ = true;  // pushed long enough to cross the travel: no switch
+         } else {
+           motor_.set_voltage(kHomingVolts);  // toward the switch
+           drove = true;
+         }
        }
-       const bool at_goal = drive && motor_.zeroed() &&
-                            std::abs(motor_.position() - goal) < 0.05;
-       state_.send(State{drive, motor_.position(), motor_.connected(), at_goal,
-                         motor_.zeroed() ? Homing::HOMED : Homing::HOMING});
+       const bool at_goal =
+           drove && motor_.zeroed() && std::abs(motor_.position() - goal) < 0.05;
+       Homing homing = motor_.zeroed() ? Homing::HOMED : Homing::HOMING;
+       if (failed_) homing = Homing::FAILED;
+       state_.send(
+           State{drove, motor_.position(), motor_.connected(), at_goal, homing});
      }
 
     private:
-     static constexpr double kMaxRot = 2.0;
+     static constexpr double kMaxRot = 2.0;         // travel above the switch
+     static constexpr double kHomingVolts = -0.5;   // a gentle push down
+     static constexpr int kMaxPushTicks = 50;       // 1 s at period_us = 20000
+     static constexpr double kHomeMarginRot = 0.25;
      talos::Motor motor_;
      talos::DigitalInput home_;
      talos::Target<Target> target_;
      talos::Publisher<State> state_;
+     bool failed_ = false;
+     int push_ticks_ = 0;
    ```
 
-   Drop the `position_mechanism.h` include and `HomingState()`. This arm has
-   no homing timeout and never reports `FAILED`: what the library decided is
-   now yours to write, or not.
+   - **The push is bounded.** A switch that never closes (a cut wire reads
+     open) would otherwise push the arm into its bottom stop for as long as
+     the button is held. In the simulation the push moves the arm about 4 rot/s, so it
+     crosses the 2-rotation travel and the 0.1 rotations to the switch in
+     about half a second; `kMaxPushTicks` allows twice that.
+     On your mechanism, time a push across the full travel at `kHomingVolts`
+     and allow about twice that, in ticks of the subsystem's `period_us`.
+   - **A stuck switch is caught.** A switch stuck or shorted closed with the
+     arm mid-travel at power-on zeroes the arm there, and Motion Magic would
+     then take it up to `kMaxRot` past the real top. Closed with the arm more
+     than `kHomeMarginRot` above zero, the switch cannot be right, so the arm
+     stops.
+   - **Failed stays failed** (neutral) until the target is released, or the
+     robot disabled, and asked again.
+   - **The push is gentle.** `kHomingVolts` is low, and the motor's
+     `stator_limit_a` bounds how hard any command, the push included, can
+     drive the arm into a stop. The scaffold's 80 A is the motor's limit,
+     not your arm's: give `[motors.arm]` in `subsystems/arm.toml` a
+     provisional low value, such as `stator_limit_a = 20.0`, and choose the
+     real one for your mechanism. Soft limits do not bound this travel: they
+     stay in the motor's power-on frame, which a rezero does not move, and
+     config load refuses them unless `position_frame = "absolute"`.
+
+   The [mechanisms README](../talOS/mechanisms/README.md#positionmechanism)
+   treats each case more fully (homing stall checks, settling, timeouts).
 2. In `BUILD`, remove `"//talOS/mechanisms"` from the `arm` library's `deps`.
 3. Delete the `[arm]` table from `subsystems/arm.toml`, and
-   `[subsystems.arm.arm]` from `robot_sim.toml`: those keys are the
-   library's parameters. Left in, the launcher refuses the graph, one line
-   per key, for example:
+   `[subsystems.arm.arm]` from the block you append to `robot_sim.toml`:
+   those keys are the library's parameters. Left in, the launcher refuses
+   the graph, one line per key, for example:
 
    ```text
    error: arm: parameter 'arm.homing' (.../subsystems/arm.toml) is read by no node's constructor; delete it from the config, or read it in the node's constructor with Node::param (node.param in Python)
@@ -673,15 +734,68 @@ mechanism with your own code:
    `[motors.arm]` and `[digital_inputs.arm_home]` (with its simulation keys)
    stay while the node opens them. A device the node no longer opens is not
    refused; delete its table anyway.
-4. Fix the tests. Of the fourteen generated, four test the library's
-   behaviour and fail:
-   `DrivesAtALiveLane` and `OtherModesLaneIsIgnored` ask for goals beyond
-   this arm's travel (rewrite them with goals inside it), and
-   `HomesBeforeTheFirstGoal` and `HomingThatDoesNotMoveFails` test the
-   library's homing (delete them, with the `StartOffHome()` helper and the
-   constants only they use, and test your own homing instead). Delete the
-   `[arm]` table from `testdata/arm.toml` too; the test's `Sim` does not
-   refuse it, but nothing reads it.
+4. Fix the tests. `node_test.cc` marks the library's own tests with a
+   comment, "The mechanism library's behaviour": `HomesBeforeTheFirstGoal`
+   and `HomingThatDoesNotMoveFails`. Delete that section, with the constants
+   it declares, and the `[arm]` table from `testdata/arm.toml` (the test's
+   `Sim` does not refuse it, but nothing reads it). With this arm two of the
+   matrix tests above that comment fail as well: `DrivesAtALiveLane` and
+   `OtherModesLaneIsIgnored` ask for goals of 30 and 20 rotations, beyond
+   `kMaxRot`; give them goals inside the travel, such as 1.5 and 1.0. Then
+   test your own homing, as section 5 tested `at_speed`:
+
+   ```cpp
+   // The arm's own homing bounds (arm.h).
+   TEST_F(ArmTest, HomingThatNeverReachesTheSwitchFails) {
+     StartOffHome();  // the switch never closes, as with a cut wire
+     Teleop();
+     Hold(1.0, 900ms);
+     ASSERT_EQ(Request(), Mode::kVoltage);  // still pushing toward the switch
+     Hold(1.0, 200ms);                      // past the 1 s bound
+     EXPECT_EQ(Request(), Mode::kNeutral);
+     EXPECT_EQ(Latest().homing(), ArmHoming::FAILED);
+     ReleaseTarget<Target>(sim, "arm", "teleop");
+     sim.step(40ms);
+     Hold(1.0, 40ms);  // asked again: it pushes again
+     EXPECT_EQ(Request(), Mode::kVoltage);
+   }
+
+   TEST_F(ArmTest, SwitchStuckClosedFails) {
+     hw.ideal_motors();
+     Teleop();  // zeroes on the switch, which never opens
+     Hold(1.0, 60ms);
+     EXPECT_EQ(Request(), Mode::kNeutral);
+     EXPECT_EQ(Latest().homing(), ArmHoming::FAILED);
+   }
+   ```
+
+   The fixture starts the arm on its switch (closed); `StartOffHome()`
+   opens it, and `hw.ideal_motors()` makes the simulated motor reach each
+   demand at once, so the stuck switch is still closed with the arm at 1.0.
+
+The arm's `Next:` gives it button 6 (the flywheel holds 3 and 5, the claw
+4), so `buttons=32` in the joystick schedule drives it. Run as before, it
+homes, then moves to 1.0 and reports `at_goal`. To see the bounded push,
+set `sim_closed_at_rot = -10.0` in the arm's block, a switch the push never
+reaches, run again, and read the session:
+
+```sh
+./bazel-bin/talOS/launcher/log_dump --node arm --topic /arm/state /tmp/talos_logs/<session> \
+  | grep -E 'enabled: true|FAILED' | awk 'NR%10==1' | head -7
+```
+
+```text
+      arm.ArmState {enabled: true, position_rot: 0, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -0.6280790655151809, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -1.4583326755683261, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -2.2917628214617314, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -3.124953825612035, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: false, position_rot: -3.9582871491459746, connected: true, at_goal: false, homing: FAILED}
+      arm.ArmState {enabled: false, position_rot: -4.041422007321671, connected: true, at_goal: false, homing: FAILED}
+```
+
+It pushed for one second, stopped and reported `FAILED`, neutral, until the
+button was released. Put `sim_closed_at_rot` back to `-0.1` afterwards.
 
 Whatever your code does, a position or Motion Magic demand goes out neutral
 until `Motor::rezero` holds for the motor, unless its config sets
