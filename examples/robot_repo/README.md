@@ -14,9 +14,10 @@ workspace.
 
 ```sh
 cd examples/robot_repo
-bazel test //...                       # graph test, node tests, sim smoke test
+bazel test //...                       # graph test, node tests, sim smoke and Studio tests
 bazel build //:robot_bundle            # the deployable bundle
 bazel run //:sim -- --duration-s 10    # the robot against the simulator
+bazel run //:sim -- --start-studio-bridge   # with Studio (below)
 bazel run @talos//tools:sync_manifest -- robot.toml   # after editing [[subsystems]]
 ```
 
@@ -34,6 +35,41 @@ every member's loop has started, then 1 s more, stops it, and fails unless
 every member the session records ran once and exited 0 and the bridge
 received State from the simulator. A robot repository adds the same few lines; what the check
 judges is in `talos_sim_test`'s docstring (`talOS/build/contract.bzl`).
+
+## Studio
+
+`bazel run //:sim -- --start-studio-bridge` also runs talOS's Studio bridge
+as a session member: Studio at `http://localhost:5800` (`[studio]
+http_port`, or `--studio-http-port PORT`) and the driver dashboard at
+`/drive`. The pages come from the talOS checkout, which builds them as its
+own workspace:
+
+```sh
+(cd ../.. && bazel build //studio:web_dist)   # in a robot repository: (cd talos && bazel build //studio:web_dist)
+```
+
+`MODULE.bazel`'s `studio_web` reads that build's folder (`path`, here
+`../../bazel-bin/studio/dist`, in a robot repository
+`talos/bazel-bin/studio/dist`), `BUILD.bazel`'s `//:studio_webroot` makes it
+one directory in `//:sim`'s `data`, and `robot.toml`'s `[studio] webroot`
+names it (`bazel-bin/studio_webroot`); `@talos//studio/bridge:webroot.bzl`
+says how. Until the pages are built, `/` and `/drive` answer 503 with the
+command above; Bazel fetches the folder again when they are built, so the
+next `bazel run //:sim` serves them. This robot has no `[studio] dashboard`
+layout, so `/drive` shows no widgets
+([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
+
+`studio_test` runs `//:sim --start-studio-bridge` on free ports until the
+launcher reports the bridge up, requires `/drive` to answer with the page or
+with that command, stops the session, and requires the bridge to have run
+once and exited 0. It is not a `talos_sim_test`, which waits for every
+member's registry row; the bridge takes none.
+
+`robot_bundle` carries no Studio: `talos_bundle` refuses a webroot without
+`index.html`, and this fixture's checks run where the pages are not built.
+A robot repository that builds them adds
+`studio_bridge = "@talos//studio/bridge:studio_bridge"` and
+`studio_webroot = ":studio_webroot"` to its `talos_bundle`.
 
 ## What a robot repository names by `@talos//`
 
@@ -57,8 +93,3 @@ patched archive. talOS's OpenCV patch is a `single_version_override`, which
 applies only in talOS's own workspace, so a repository that depends on talOS
 builds OpenCV unpatched; it differs only under `--config=tsan`
 ([docs/INSTALL.md](../../docs/INSTALL.md)).
-
-Studio's bridge (`@talos//studio/bridge:studio_bridge`) builds from a
-repository that depends on talOS; Studio's pages (`@talos//studio:web_dist`)
-do not, since they need rules_js and pnpm, development dependencies of
-talOS.

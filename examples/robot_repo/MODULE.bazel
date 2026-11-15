@@ -12,6 +12,18 @@ local_path_override(
     path = "../..",
 )
 
+# Studio's pages (/ and /drive), as the talOS checkout builds them: in a robot
+# repository `path = "talos/bazel-bin/studio/dist"`, built by
+# `cd talos && bazel build //studio:web_dist`. Until then //:studio_webroot
+# is empty and the bridge answers its pages with that command
+# (@talos//studio/bridge:webroot.bzl).
+studio_web = use_repo_rule("@talos//studio/bridge:webroot.bzl", "studio_web")
+
+studio_web(
+    name = "studio_web",
+    path = "../../bazel-bin/studio/dist",
+)
+
 bazel_dep(name = "rules_cc", version = "0.2.18")
 bazel_dep(name = "rules_python", version = "2.0.1")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
