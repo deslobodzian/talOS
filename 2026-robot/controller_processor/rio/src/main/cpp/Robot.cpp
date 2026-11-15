@@ -1,6 +1,5 @@
 #include "Robot.h"
 
-#include <frc/DriverStation.h>
 #include <hal/DriverStation.h>
 
 #include <array>
@@ -74,34 +73,6 @@ void Report(talos::rio::RioLog& log, uint16_t index, std::string_view text) {
   log.Post(event);
 }
 
-// Reports the mode this program is running in, which the Driver Station
-// displays: the one piece of TimedRobot's job that has to be done. Whether a
-// lapse in these reports disables the robot is not established (docs/BENCH.md,
-// loop stall check); a stalled loop's outputs are LoopWatchdog's.
-void ObserveMode() {
-  if (frc::DriverStation::IsDisabled()) {
-    HAL_ObserveUserProgramDisabled();
-  } else if (frc::DriverStation::IsAutonomous()) {
-    HAL_ObserveUserProgramAutonomous();
-  } else if (frc::DriverStation::IsTest()) {
-    HAL_ObserveUserProgramTest();
-  } else {
-    HAL_ObserveUserProgramTeleop();
-  }
-}
-
-uint32_t DriverStationModeFlags() {
-  namespace ds = talos::driver_station;
-  uint32_t flags = 0;
-  if (frc::DriverStation::IsDSAttached()) flags |= ds::kDsAttached;
-  if (frc::DriverStation::IsEnabled()) flags |= ds::kEnabled;
-  if (frc::DriverStation::IsAutonomous()) flags |= ds::kAutonomous;
-  if (frc::DriverStation::IsTeleop()) flags |= ds::kTeleop;
-  if (frc::DriverStation::IsTest()) flags |= ds::kTest;
-  if (frc::DriverStation::IsEStopped()) flags |= ds::kEStop;
-  return flags;
-}
-
 // The loop watchdog's SCHED_FIFO priority: above the loop thread's, so it
 // preempts a loop that never sleeps. It is also above the kernel's interrupt
 // threads (kIrqThreadPriority), which it delays on its CPU only for the length
@@ -114,6 +85,18 @@ uint32_t DriverStationModeFlags() {
 constexpr int kWatchdogPriority = 30;
 #else
 constexpr int kWatchdogPriority = 0;
+#endif
+
+// The Driver Station reader's SCHED_FIFO priority (DriverStationReader.h, the
+// thread that makes every NetComm call the loop used to): below the loop's,
+// so a refresh never delays a tick, and above every default-scheduled thread
+// (ssh, the logger), so the refreshes that keep the gateway's view of the
+// Driver Station fresh are not starved by them. Desktop simulation keeps the
+// default scheduling.
+#ifdef __FRC_ROBORIO__
+constexpr int kDriverStationPriority = 5;
+#else
+constexpr int kDriverStationPriority = 0;
 #endif
 
 #ifdef __FRC_ROBORIO__
@@ -133,6 +116,8 @@ constexpr int kIrqThreadPriority = 15;
 constexpr int kLoopPriority = 10;
 static_assert(kLoopPriority > 0 && kLoopPriority < kIrqThreadPriority &&
               kIrqThreadPriority < kWatchdogPriority);
+static_assert(kDriverStationPriority > 0 &&
+              kDriverStationPriority < kLoopPriority);
 
 // Present at program start: the loop keeps the default scheduling (a bench
 // comparison, or a field fallback that needs no rebuild).
@@ -321,6 +306,18 @@ void Robot::StartCompetition() {
   // on CAN: device configuration runs on the backend's worker.
   HAL_ObserveUserProgramStarting();
 
+  // From here every NetComm call of the Driver Station's (the refresh, the
+  // mode report) is the reader's, on its own thread; the loop only reads what
+  // it last refreshed (DriverStationReader.h). Started before the loop raises
+  // itself; the reader sets its own priority.
+  talos::rio::DriverStationReader driver_station{
+      talos::rio::DriverStationReader::WpilibCalls(), NowUs,
+      [](std::string_view line) {
+        std::printf("%s%.*s\n", talos::rio::ConsoleTime(NowUs()).c_str(),
+                    static_cast<int>(line.size()), line.data());
+      }};
+  driver_station.Start(kDriverStationPriority);
+
   // Disarmed until a tick ends with a command in force.
   watchdog_->Start(NowUs, kWatchdogPriority);
 
@@ -354,7 +351,8 @@ void Robot::StartCompetition() {
   // The mode (ModeKey) of the last packet sent.
   uint32_t last_ds_mode = 0;
   // Observe every hardware tick, including transitions between DS packets.
-  // Real and desktop Driver Stations are both read back through WPILib.
+  // Real and desktop Driver Stations are both read back through WPILib, by
+  // the reader's thread.
   talos::driver_station::ModeTracker ds_mode;
 
   // Tick starts, so the logger can report a loop woken late (starved of the
@@ -388,11 +386,12 @@ void Robot::StartCompetition() {
         (gateway_->snapshot().flags & talos::hardware::kCommandActive) != 0;
 #endif
 
-    frc::DriverStation::RefreshData();
-    ObserveMode();
-
+    // The Driver Station as the reader last refreshed it, no mode once that
+    // refresh is command_timeout_us old (the default Config's before a
+    // configuration): no NetComm call on this thread.
     const uint64_t now_us = NowUs();
-    const uint32_t mode_flags = DriverStationModeFlags();
+    const uint32_t mode_flags =
+        driver_station.Read(now_us, gateway_->config().command_timeout_us);
     ds_mode.Observe(mode_flags, now_us);
     log_->ClosePhase(TickPhase::kDriverStation, NowNs());
     auto open_status = talos::protocol::UdpStatus::kOk;
@@ -519,7 +518,9 @@ void Robot::StartCompetition() {
       if (socket_retry.open() && (mode != last_ds_mode || sample_due)) {
         last_ds_sample_us = now_us;
         last_ds_mode = mode;
-        auto ds = talos::driver_station::SampleDriverStation(now_us);
+        // This tick's flags, so the packet and ds_mode agree on the mode.
+        auto ds =
+            talos::driver_station::SampleDriverStation(now_us, mode_flags);
         ds_mode.Stamp(ds);
         // The same boot id as this program's State: a consumer orders
         // packets within one boot and starts over on a new one.
@@ -585,6 +586,9 @@ void Robot::StartCompetition() {
 
   // The loop no longer beats; the shutdown below neutralizes on its own.
   watchdog_->Stop();
+  // Bounded: a reader inside a NetComm call that does not return is
+  // abandoned, not waited for.
+  driver_station.Stop();
 
   // A configure still running on the backend's worker (the boot restore or a
   // push) owns the devices; neutralizing them now would race it. Poll it to
