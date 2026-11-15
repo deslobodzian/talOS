@@ -41,6 +41,14 @@ GRAPH = {
     "//2026-robot/main_processor/driver:node_test": (
         None, ["//2026-robot/main_processor/driver:driver",
                "//2026-robot/main_processor/drivetrain:drivetrain"]),
+    "//2026-robot/main_processor/autonomous:autonomous": (
+        None, ["//2026-robot/main_processor/drivetrain:messages",
+               "//talOS/devices:devices"]),
+    "//2026-robot/main_processor/autonomous:node": (
+        "talos_cc_node", ["//2026-robot/main_processor/autonomous:autonomous"]),
+    "//2026-robot/main_processor/autonomous:closed_loop_test": (
+        None, ["//2026-robot/main_processor/autonomous:autonomous",
+               "//2026-robot/main_processor/drivetrain:drivetrain"]),
     "//examples/superstructure/cpp:mechanisms": (
         None, ["//talOS/devices:devices"]),
     "//examples/superstructure/cpp:libmechanisms.so": (
