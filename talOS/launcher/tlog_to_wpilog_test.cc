@@ -34,9 +34,14 @@
 #include "flatbuffers/reflection.h"
 #include "geometry/geometry_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "talOS/configuration/config_parser.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
+#include "talOS/hardware/config.h"
+#include "talOS/hardware/messages.h"
+#include "talOS/hardware/packet.h"
 #include "talOS/schema/identity.h"
 #include "wpilog_test/wpilog_message_descriptor.h"
 #include "wpilog_test/wpilog_message_generated.h"
@@ -840,6 +845,249 @@ TEST_F(TlogToWpilogTest, LogNamedTwiceIsReadOnce) {
   const auto dropped = log.of("/talos_log/dropped/viewer/odometry/state");
   ASSERT_EQ(dropped.size(), 2u);
   EXPECT_EQ(AsInt64(dropped[1].payload), 3);
+}
+
+// ---- Hardware packets ----------------------------------------------------
+
+constexpr std::string_view kHardwareToml = R"(
+[robot]
+period_us = 5000
+
+[subsystems.shooter]
+period_us = 10000
+
+[subsystems.shooter.motors.flywheel]
+type = "TalonFX"
+can_id = 2
+)";
+
+template <class Message>
+talos::hardware::Packet Encoded(const Message& message) {
+  talos::hardware::Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(talos::hardware::Encode(message, packet.data));
+  return packet;
+}
+
+talos::hardware::Packet EncodedDriverStation(
+    const talos::driver_station::DriverStationData& data) {
+  talos::hardware::Packet packet{};
+  packet.size = static_cast<std::uint32_t>(
+      talos::driver_station::Encode(data, packet.data));
+  return packet;
+}
+
+// A session as the bridge and a shooter node record it: the bridge sends
+// /hw/state/driver_station (disabled at 10 ms, enabled at 30 ms with a
+// joystick, disabled at 50 ms) and /hw/state (the flywheel at 20 and 40 ms,
+// then two packets that do not decode at 45 ms: one whose Packet size
+// claims more than its buffer, one the State codec rejects); the shooter
+// sends /hw/request/shooter at 35 ms. The packets are the wire codecs'
+// bytes. `dir`/robot.toml is the run config, which manifest.json names when
+// `manifest` is true. Returns the flywheel's logical id.
+std::uint16_t WriteHardwareSession(const std::string& dir, bool manifest) {
+  namespace hw = talos::hardware;
+  namespace ds = talos::driver_station;
+  using talos::event::EventKind;
+  using talos::event::SourceKind;
+  std::filesystem::create_directories(dir);
+  std::ofstream{dir + "/robot.toml"} << kHardwareToml;
+  if (manifest) {
+    std::ofstream{dir + "/manifest.json"}
+        << "{\n  \"session_id\": 42,\n  \"config_path\": \"" << dir
+        << "/robot.toml\",\n  \"nodes\": []\n}\n";
+  }
+  const hw::Config config =
+      talos::config::ParseRobotConfigString(kHardwareToml).hardware;
+  const std::uint16_t flywheel = config.motors.at(0).id;
+  const talos::event::log::LogWriterOptions options{std::size_t{1} << 16U, 1,
+                                                    false};
+  {
+    talos::event::log::LogWriter writer{dir + "/hardware_node.tlog",
+                                        "hardware_node", options, 42};
+    writer.start(
+        {Topic<hw::Packet>(1, SourceKind::SENDER, hw::kStateTopic),
+         Topic<hw::Packet>(2, SourceKind::SENDER, hw::kDriverStationTopic)},
+        talos::event::MonotonicTime::from_nanos(kStartNs));
+    std::uint64_t sequence = 0;
+    const auto send = [&](std::uint16_t source, double ms,
+                          const hw::Packet& packet) {
+      ++sequence;
+      writer.send(At(EventKind::TIMER, 9, sequence, ms, ms, ms, 1), source,
+                  BytesOf(packet), 0, sequence);
+    };
+    for (const auto& [ms, enabled] :
+         {std::pair{10.0, false}, std::pair{30.0, true},
+          std::pair{50.0, false}}) {
+      ds::DriverStationData data;
+      data.mode_since_us = static_cast<std::uint64_t>(ms * 1000);
+      data.fms.flags = ds::kDsAttached | ds::kTeleop |
+                       (enabled ? std::uint32_t{ds::kEnabled} : 0U);
+      auto& stick = data.joysticks[0];
+      stick.connected = true;
+      stick.axis_count = 2;
+      stick.axes = {enabled ? 0.5F : 0.0F, -0.25F};
+      stick.button_count = 3;
+      stick.buttons = enabled ? 0b101U : 0U;
+      stick.pov_count = 1;
+      stick.povs = {90};
+      send(2, ms, EncodedDriverStation(data));
+    }
+    for (const auto& [ms, velocity_rps] :
+         {std::pair{20.0, 42.5}, std::pair{40.0, 50.0}}) {
+      hw::State state;
+      state.config_id = hw::ConfigurationId(config);
+      state.flags = hw::kConfigured | (ms > 30 ? hw::kEnabled : 0U);
+      state.motor_count = 1;
+      state.motors[0].id = flywheel;
+      state.motors[0].valid = true;
+      state.motors[0].velocity_rps = velocity_rps;
+      state.motors[0].stator_current_a = 30.5;
+      state.motors[0].supply_current_a = 12.5;
+      send(1, ms, Encoded(state));
+    }
+    hw::Packet hostile{};
+    hostile.size = 0xFFFFFFFFU;
+    send(1, 45, hostile);
+    hw::Packet garbage{};
+    garbage.size = 3;
+    garbage.data = {0xFF, 0xFF, 0xFF};
+    send(1, 45.5, garbage);
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  {
+    talos::event::log::LogWriter writer{dir + "/shooter.tlog", "shooter",
+                                        options, 42};
+    writer.start(
+        {Topic<hw::Packet>(1, SourceKind::SENDER, hw::RequestTopic("shooter"))},
+        talos::event::MonotonicTime::from_nanos(kStartNs));
+    hw::Command command;
+    command.config_id = hw::ConfigurationId(config);
+    command.count = 1;
+    command.motors[0] = {flywheel, hw::Mode::kVelocity, 0, 50.0, 1.5};
+    writer.send(At(EventKind::TIMER, 9, 1, 35, 35, 35, 1), 1,
+                BytesOf(Encoded(command)), 0, 1);
+    writer.flush();
+    EXPECT_FALSE(writer.failed()) << writer.error();
+  }
+  return flywheel;
+}
+
+bool Boolean(const Value& value) { return value.payload == Bytes{1}; }
+
+// Guards: the hardware packets, which carry no FlatBuffers schema, are
+// decoded with log_dump's wire decoder into typed entries, devices named
+// from the config the session's manifest names: the Driver Station's
+// enabled flag as a boolean timeline at each packet's publish time, a
+// joystick's axes, buttons and POVs as arrays, a motor's measured velocity
+// and currents with their units, and a request's mode and demand.
+// REQ-OPS-26
+TEST_F(TlogToWpilogTest, HardwarePacketsBecomeNamedTypedEntries) {
+  const std::string dir = root_ + "/hardware";
+  WriteHardwareSession(dir, true);
+  const Wpilog log = Convert({dir});
+
+  const auto enabled = log.of("/hw/state/driver_station/enabled");
+  ASSERT_EQ(enabled.size(), 3u);
+  EXPECT_EQ(log.entry("/hw/state/driver_station/enabled")->type, "boolean");
+  EXPECT_EQ(enabled[0].time_us, 10000u);
+  EXPECT_FALSE(Boolean(enabled[0]));
+  EXPECT_EQ(enabled[1].time_us, 30000u);
+  EXPECT_TRUE(Boolean(enabled[1]));
+  EXPECT_EQ(enabled[2].time_us, 50000u);
+  EXPECT_FALSE(Boolean(enabled[2]));
+  EXPECT_EQ(log.of("/hw/state/driver_station/mode")[1].payload,
+            (Bytes{'t', 'e', 'l', 'e', 'o', 'p'}));
+
+  const std::string stick = "/hw/state/driver_station/joysticks/0/";
+  EXPECT_EQ(log.entry(stick + "axes")->type, "double[]");
+  const auto axes = log.of(stick + "axes");
+  ASSERT_EQ(axes.size(), 3u);
+  ASSERT_EQ(axes[1].payload.size(), 16u);
+  EXPECT_EQ(AsDouble(axes[1].payload, 0), 0.5);
+  EXPECT_EQ(AsDouble(axes[1].payload, 1), -0.25);
+  EXPECT_EQ(log.entry(stick + "buttons")->type, "boolean[]");
+  EXPECT_EQ(log.of(stick + "buttons")[1].payload, (Bytes{1, 0, 1}));
+  EXPECT_EQ(log.entry(stick + "povs")->type, "int64[]");
+  EXPECT_EQ(AsInt64(log.of(stick + "povs")[1].payload), 90);
+
+  const std::string motor = "/hw/state/motors/flywheel/";
+  const auto velocity = log.of(motor + "velocity_rps");
+  ASSERT_EQ(velocity.size(), 2u);
+  EXPECT_EQ(velocity[0].time_us, 20000u);
+  EXPECT_EQ(AsDouble(velocity[0].payload), 42.5);
+  EXPECT_EQ(AsDouble(velocity[1].payload), 50.0);
+  EXPECT_EQ(log.entry(motor + "velocity_rps")->type, "double");
+  EXPECT_NE(
+      log.entry(motor + "velocity_rps")
+          ->metadata.find(R"("schema":"talos.hardware.Packet","unit":"rot/s")"),
+      std::string::npos)
+      << log.entry(motor + "velocity_rps")->metadata;
+  EXPECT_EQ(AsDouble(log.of(motor + "stator_current_a")[0].payload), 30.5);
+  EXPECT_EQ(AsDouble(log.of(motor + "supply_current_a")[0].payload), 12.5);
+  EXPECT_NE(
+      log.entry(motor + "supply_current_a")->metadata.find(R"("unit":"A")"),
+      std::string::npos);
+  EXPECT_TRUE(Boolean(log.of(motor + "valid")[0]));
+  const auto state_enabled = log.of("/hw/state/enabled");
+  ASSERT_EQ(state_enabled.size(), 2u);
+  EXPECT_FALSE(Boolean(state_enabled[0]));
+  EXPECT_TRUE(Boolean(state_enabled[1]));
+
+  const std::string request = "/hw/request/shooter/motors/flywheel/";
+  EXPECT_EQ(log.entry(request + "mode")->type, "string");
+  const auto mode = log.of(request + "mode");
+  ASSERT_EQ(mode.size(), 1u);
+  EXPECT_EQ(mode[0].time_us, 35000u);
+  EXPECT_EQ(std::string(mode[0].payload.begin(), mode[0].payload.end()),
+            "velocity");
+  EXPECT_EQ(AsDouble(log.of(request + "demand")[0].payload), 50.0);
+}
+
+// Guards: a hardware packet that does not decode (a Packet size past its
+// buffer, bytes the codec rejects) is skipped alone, counted and named on
+// stderr; the topic's other packets and the rest of the session convert.
+// REQ-OPS-26
+TEST_F(TlogToWpilogTest, UndecodableHardwarePacketIsSkippedAlone) {
+  const std::string dir = root_ + "/hardware";
+  WriteHardwareSession(dir, true);
+  const std::string out = root_ + "/hardware.wpilog";
+  const Result result = Run({dir, "-o", out});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_NE(result.output.find("skipped 2 /hw/state packets that do not "
+                               "decode; the first: Packet size 4294967295 "
+                               "exceeds its"),
+            std::string::npos)
+      << result.output;
+  const Wpilog log = Read(out);
+  EXPECT_EQ(log.of("/hw/state/motors/flywheel/velocity_rps").size(), 2u);
+  EXPECT_EQ(log.of("/hw/state/enabled").size(), 2u);
+  EXPECT_EQ(log.of("/hw/state/driver_station/enabled").size(), 3u);
+}
+
+// Guards: a session whose run config cannot be found still converts its
+// hardware packets, each device named by its logical id, and says why.
+// REQ-OPS-26
+TEST_F(TlogToWpilogTest, HardwareWithoutConfigNamesDevicesById) {
+  const std::string dir = root_ + "/hardware";
+  const std::uint16_t flywheel = WriteHardwareSession(dir, false);
+  const std::string out = root_ + "/by_id.wpilog";
+  const Result result = Run({dir, "-o", out});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  EXPECT_NE(result.output.find("hardware devices named by logical id: no "
+                               "robot config"),
+            std::string::npos)
+      << result.output;
+  const Wpilog log = Read(out);
+  const std::string id = std::to_string(flywheel);
+  EXPECT_EQ(
+      AsDouble(
+          log.of("/hw/state/motors/" + id + "/velocity_rps").at(1).payload),
+      50.0);
+  EXPECT_EQ(log.of("/hw/request/shooter/motors/" + id + "/demand").size(), 1u);
+  EXPECT_EQ(log.entry("/hw/state/motors/flywheel/velocity_rps"), nullptr);
+  EXPECT_EQ(log.of("/hw/state/driver_station/enabled").size(), 3u);
 }
 
 // The names in `directory`, sorted.

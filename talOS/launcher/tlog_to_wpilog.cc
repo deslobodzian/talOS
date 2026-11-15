@@ -1,13 +1,15 @@
 // tlog_to_wpilog: talOS dispatch logs (.tlog) as one WPILib DataLog
 // (.wpilog), so a session opens in AdvantageScope. Offline only.
 //
-//   tlog_to_wpilog <log-file-or-session-dir> [more ...] -o <out.wpilog>
+//   tlog_to_wpilog [--config robot.toml] <log-file-or-session-dir> [more ...]
+//                  -o <out.wpilog>
 //
 // The logs are streamed through MergeLogs (log_merge.h, as log_dump
 // reads them), and each payload is walked with flatbuffers/reflection.h
 // from the schema the log carries, so no recording build is needed. The
-// mapping, the clock and the caveats are in talOS/launcher/README.md,
-// "Converting a session to WPILOG".
+// hardware packets, which carry no schema, are decoded by log_dump's
+// decoder (hardware_record.h). The mapping, the clock and the caveats are
+// in talOS/launcher/README.md, "Converting a session to WPILOG".
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -40,8 +42,11 @@
 
 #include "flatbuffers/reflection.h"
 #include "flatbuffers/verifier.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/hardware/messages.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_inputs.h"
 #include "talOS/launcher/log_merge.h"
 #include "talOS/launcher/wpilog.h"
@@ -487,9 +492,265 @@ class Entries {
   std::set<std::string> renames_;
 };
 
+// One decoded hardware packet's values (hardware_record.h), each written by
+// `write` from `payload`: entries `<topic>/<field path>`, a device by its
+// config name when `names` match the packet's config_id, else by its
+// logical id. README.md lists the fields.
+class HardwareValues {
+ public:
+  using Write = std::function<void(const std::string& suffix, const char* type,
+                                   std::string_view unit)>;
+
+  HardwareValues(std::vector<std::uint8_t>& payload, Write write)
+      : payload_{payload}, write_{std::move(write)} {}
+
+  // Whether a packet was written with logical ids where names were wanted:
+  // no names, or a config_id that is not theirs.
+  bool unnamed() const { return unnamed_; }
+
+  void State(const talos::hardware::State& s,
+             const talos::launcher::DeviceNames* names) {
+    const auto* n = Names(names, s.config_id);
+    UInt("config_id", s.config_id);
+    UInt("boot_id", s.boot_id);
+    UInt("epoch", s.epoch);
+    UInt("sample_time_us", s.sample_time_us);
+    UInt("sequence", s.sequence);
+    UInt("last_command_sequence", s.last_command_sequence);
+    namespace hw = talos::hardware;
+    Bool("configured", (s.flags & hw::kConfigured) != 0);
+    Bool("enabled", (s.flags & hw::kEnabled) != 0);
+    Bool("command_active", (s.flags & hw::kCommandActive) != 0);
+    Bool("hardware_fault", (s.flags & hw::kHardwareFault) != 0);
+    Each(s.motors, s.motor_count, "motors/", n ? &n->motors : nullptr,
+         [&](const std::string& p, const hw::MotorSample& m) {
+           Bool(p + "valid", m.valid);
+           Double(p + "position_rot", m.position_rot);
+           Double(p + "velocity_rps", m.velocity_rps);
+           Double(p + "voltage", m.voltage, "V");
+           Double(p + "stator_current_a", m.stator_current_a);
+           Double(p + "supply_current_a", m.supply_current_a);
+           Double(p + "temperature_c", m.temperature_c, "°C");
+           Int(p + "position_age_us", m.position_age_us);
+           Int(p + "velocity_age_us", m.velocity_age_us);
+           Int(p + "fault_flags", m.fault_flags);
+           Bool(p + "faulted", hw::MotorFaulted(m.fault_flags));
+           Bool(p + "forward_limit",
+                (m.fault_flags & hw::kMotorForwardHardLimitFlag) != 0);
+           Bool(p + "reverse_limit",
+                (m.fault_flags & hw::kMotorReverseHardLimitFlag) != 0);
+         });
+    Each(s.sensors, s.sensor_count, "sensors/", n ? &n->sensors : nullptr,
+         [&](const std::string& p, const hw::SensorSample& x) {
+           Bool(p + "valid", x.valid);
+           Double(p + "position_rot", x.position_rot);
+           Double(p + "velocity_rps", x.velocity_rps);
+           Int(p + "position_age_us", x.position_age_us);
+           Int(p + "velocity_age_us", x.velocity_age_us);
+         });
+    Each(s.digital_inputs, s.digital_input_count, "digital_inputs/",
+         n ? &n->digital_inputs : nullptr,
+         [&](const std::string& p, const hw::DigitalInputSample& x) {
+           Bool(p + "valid", x.valid);
+           Bool(p + "value", x.value);
+         });
+    Each(s.digital_outputs, s.digital_output_count, "digital_outputs/",
+         n ? &n->digital_outputs : nullptr,
+         [&](const std::string& p, const hw::DigitalOutputSample& x) {
+           Bool(p + "valid", x.valid);
+           Bool(p + "value", x.value);
+         });
+    Each(s.analog_inputs, s.analog_input_count, "analog_inputs/",
+         n ? &n->analog_inputs : nullptr,
+         [&](const std::string& p, const hw::AnalogInputSample& x) {
+           Bool(p + "valid", x.valid);
+           Double(p + "voltage", x.voltage, "V");
+           Int(p + "age_us", x.age_us);
+         });
+    Each(s.encoders, s.encoder_count, "encoders/", n ? &n->encoders : nullptr,
+         [&](const std::string& p, const hw::EncoderSample& x) {
+           Bool(p + "valid", x.valid);
+           Double(p + "position_rot", x.position_rot);
+           Double(p + "velocity_rps", x.velocity_rps);
+           Int(p + "age_us", x.age_us);
+         });
+    Each(s.pwm_outputs, s.pwm_output_count, "pwm_outputs/",
+         n ? &n->pwm_outputs : nullptr,
+         [&](const std::string& p, const hw::PwmSample& x) {
+           Bool(p + "valid", x.valid);
+           Double(p + "output", x.output);
+         });
+    Bool("health/valid", s.health.valid);
+    Double("health/battery_v", s.health.battery_v);
+    Bool("health/brownout", s.health.brownout);
+    Int("health/can_bus_count", s.health.can_bus_count);
+    // Each State reports one CAN bus slot, the next one each time: an entry
+    // per bus, by its name when the config gives it.
+    const std::size_t index = s.health.can_bus_index;
+    const std::string bus =
+        "health/can_bus/" +
+        (n != nullptr && index < n->can_buses.size() ? n->can_buses[index]
+                                                     : std::to_string(index)) +
+        "/";
+    const hw::CanBusSample& b = s.health.can_bus;
+    Text(bus + "read_state",
+         talos::launcher::CanBusReadStateName(b.read_state));
+    Double(bus + "utilization_frac", b.utilization_frac);
+    Int(bus + "bus_off_count", b.bus_off_count);
+    Int(bus + "transmit_buffer_full_count", b.transmit_buffer_full_count);
+    Int(bus + "receive_error_count", b.receive_error_count);
+    Int(bus + "transmit_error_count", b.transmit_error_count);
+    Int(bus + "read_failure_count", b.read_failure_count);
+    Int("counters/rejected_command_count", s.counters.rejected_command_count);
+    Int("counters/neutralized_motor_count", s.counters.neutralized_motor_count);
+    Int("counters/apply_failure_count", s.counters.apply_failure_count);
+    Int("counters/device_reset_count", s.counters.device_reset_count);
+  }
+
+  void Command(const talos::hardware::Command& c,
+               const talos::launcher::DeviceNames* names) {
+    const auto* n = Names(names, c.config_id);
+    UInt("config_id", c.config_id);
+    UInt("boot_id", c.boot_id);
+    UInt("epoch", c.epoch);
+    UInt("observed_time_us", c.observed_time_us);
+    namespace hw = talos::hardware;
+    Each(c.motors, c.count, "motors/", n ? &n->motors : nullptr,
+         [&](const std::string& p, const hw::MotorRequest& m) {
+           Text(p + "mode", talos::launcher::HardwareModeName(m.mode));
+           Int(p + "slot", m.slot);
+           // Duty ratio, volts, rotations/s or rotations, by the mode.
+           Double(p + "demand", m.demand);
+           Double(p + "feedforward_v", m.feedforward_v);
+         });
+    Each(c.digital_outputs, c.digital_output_count, "digital_outputs/",
+         n ? &n->digital_outputs : nullptr,
+         [&](const std::string& p, const hw::DigitalOutputRequest& x) {
+           Bool(p + "value", x.value);
+         });
+    Each(c.pwm_outputs, c.pwm_output_count, "pwm_outputs/",
+         n ? &n->pwm_outputs : nullptr,
+         [&](const std::string& p, const hw::PwmRequest& x) {
+           Double(p + "output", x.output);
+         });
+  }
+
+  // `seen` holds a bit per joystick port connected in an earlier packet of
+  // this topic, so a port that disconnects reads connected = false.
+  void DriverStation(const talos::driver_station::DriverStationData& d,
+                     std::uint32_t& seen) {
+    namespace ds = talos::driver_station;
+    const std::uint32_t flags = d.fms.flags;
+    UInt("sample_time_us", d.sample_time_us);
+    UInt("mode_since_us", d.mode_since_us);
+    UInt("boot_id", d.boot_id);
+    Bool("ds_attached", (flags & ds::kDsAttached) != 0);
+    Bool("fms_attached", (flags & ds::kFmsAttached) != 0);
+    Bool("enabled", (flags & ds::kEnabled) != 0);
+    Bool("autonomous", (flags & ds::kAutonomous) != 0);
+    Bool("teleop", (flags & ds::kTeleop) != 0);
+    Bool("test", (flags & ds::kTest) != 0);
+    Bool("estop", (flags & ds::kEStop) != 0);
+    Text("mode", talos::launcher::DriverStationModeName(flags));
+    Text("alliance", talos::launcher::AllianceName(d.fms.alliance));
+    Int("station", d.fms.station);
+    Text("match_type", talos::launcher::MatchTypeName(d.fms.match_type));
+    Int("match_number", d.fms.match_number);
+    Int("replay_number", d.fms.replay_number);
+    Double("match_time_s", d.fms.match_time_s, "s");
+    for (std::size_t port = 0; port < d.joysticks.size(); ++port) {
+      const ds::JoystickData& j = d.joysticks[port];
+      const std::uint32_t bit = 1U << port;
+      if (!j.connected && (seen & bit) == 0) continue;
+      const std::string p = "joysticks/" + std::to_string(port) + "/";
+      Bool(p + "connected", j.connected);
+      if (!j.connected) continue;
+      seen |= bit;
+      payload_.clear();
+      for (std::size_t i = 0; i < j.axis_count && i < j.axes.size(); ++i) {
+        talos::wpilog::AppendDouble(payload_, j.axes[i]);
+      }
+      write_(p + "axes", "double[]", {});
+      // Button i + 1 (as the Driver Station numbers them) is element i.
+      payload_.clear();
+      for (std::size_t i = 0; i < j.button_count && i < ds::kMaxButtons; ++i) {
+        talos::wpilog::AppendBoolean(payload_, ((j.buttons >> i) & 1U) != 0);
+      }
+      write_(p + "buttons", "boolean[]", {});
+      payload_.clear();
+      for (std::size_t i = 0; i < j.pov_count && i < j.povs.size(); ++i) {
+        talos::wpilog::AppendInt64(payload_, j.povs[i]);
+      }
+      write_(p + "povs", "int64[]", {});
+    }
+  }
+
+ private:
+  const talos::launcher::DeviceNames* Names(
+      const talos::launcher::DeviceNames* names, std::uint64_t config_id) {
+    if (names != nullptr && names->Matches(config_id)) return names;
+    unnamed_ = true;
+    return nullptr;
+  }
+
+  static std::string Find(const std::map<std::uint16_t, std::string>& names,
+                          std::uint16_t id) {
+    const auto found = names.find(id);
+    return found == names.end() ? std::string{} : found->second;
+  }
+
+  // Calls `item(path, sample)` for the first `count` samples, `path` being
+  // `group` then the device's name or logical id and a '/'.
+  template <class Array, class Item>
+  void Each(const Array& samples, std::size_t count, const char* group,
+            const std::map<std::uint16_t, std::string>* names, Item item) {
+    for (std::size_t i = 0; i < count && i < samples.size(); ++i) {
+      const auto id = samples[i].id;
+      std::string path{group};
+      const auto name = names == nullptr ? std::string{} : Find(*names, id);
+      path += name.empty() ? std::to_string(id) : name;
+      path += '/';
+      item(path, samples[i]);
+    }
+  }
+
+  void Bool(const std::string& suffix, bool value) {
+    payload_.clear();
+    talos::wpilog::AppendBoolean(payload_, value);
+    write_(suffix, "boolean", {});
+  }
+  void Int(const std::string& suffix, std::int64_t value) {
+    payload_.clear();
+    talos::wpilog::AppendInt64(payload_, value);
+    write_(suffix, "int64", talos::schema::unit_for_field(suffix));
+  }
+  // An unsigned 64-bit value (an id, a time, a sequence): its bits, as a
+  // ulong field is.
+  void UInt(const std::string& suffix, std::uint64_t value) {
+    Int(suffix, static_cast<std::int64_t>(value));
+  }
+  void Double(const std::string& suffix, double value) {
+    Double(suffix, value, talos::schema::unit_for_field(suffix));
+  }
+  void Double(const std::string& suffix, double value, std::string_view unit) {
+    payload_.clear();
+    talos::wpilog::AppendDouble(payload_, value);
+    write_(suffix, "double", unit);
+  }
+  void Text(const std::string& suffix, std::string_view value) {
+    payload_.assign(value.begin(), value.end());
+    write_(suffix, "string", {});
+  }
+
+  std::vector<std::uint8_t>& payload_;
+  Write write_;
+  bool unnamed_{false};
+};
+
 struct Options {
   std::vector<std::string> inputs;
   std::string output;
+  std::string config;
 };
 
 bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
@@ -499,12 +760,12 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
       while (++i < argc) options.inputs.emplace_back(argv[i]);
       break;
     }
-    if (arg == "-o" || arg == "--output") {
+    if (arg == "-o" || arg == "--output" || arg == "--config") {
       if (++i == argc) {
         error = "missing value for " + arg;
         return false;
       }
-      options.output = argv[i];
+      (arg == "--config" ? options.config : options.output) = argv[i];
       continue;
     }
     if (arg.size() > 1 && arg.starts_with('-')) {
@@ -633,14 +894,23 @@ bool SelectItems(const std::vector<std::string>& files,
   return true;
 }
 
+struct Damaged {
+  std::size_t count{0};
+  std::string first;  // why the first one did not decode
+};
+
 struct Totals {
   std::size_t entries{0};
   std::size_t values{0};
   std::map<std::string, std::string> skipped;  // topic -> why
+  std::map<std::string, Damaged> damaged;      // hardware topic -> records
+  bool hardware_unnamed{false};  // a hardware packet's devices by id
 };
 
-// Writes `items` to `writer`; see README.md for the mapping.
+// Writes `items` to `writer`; see README.md for the mapping. `names` (may be
+// null) labels the hardware packets' devices.
 Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
+                  const talos::launcher::DeviceNames* names,
                   talos::wpilog::Writer& writer) {
   Totals totals;
   Entries entries{writer};
@@ -661,6 +931,27 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
     ++totals.values;
   };
 
+  // The hardware packets, decoded by hardware_record.h. Metadata by unit:
+  // few distinct ones, written for every value.
+  std::map<std::string, std::string, std::less<>> hardware_metadata;
+  std::map<std::string, std::uint32_t> joysticks_seen;  // topic -> ports
+  talos::launcher::HardwarePacket packet;
+  const std::string* hardware_topic = nullptr;
+  std::uint64_t hardware_time_us = 0;
+  HardwareValues hardware{
+      payload,
+      [&](const std::string& suffix, const char* type, std::string_view unit) {
+        auto metadata = hardware_metadata.find(unit);
+        if (metadata == hardware_metadata.end()) {
+          metadata = hardware_metadata
+                         .emplace(std::string{unit},
+                                  Metadata(talos::schema::kPacketName, unit))
+                         .first;
+        }
+        write(Join(*hardware_topic, suffix), *hardware_topic, suffix, type,
+              metadata->second, hardware_time_us);
+      }};
+
   for (const Item& item : items) {
     const std::uint64_t time_us = Micros(item.time_ns, start_ns);
     const std::string& process = item.log->process_name;
@@ -677,6 +968,34 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
     }
     if (!item.values) continue;
     const talos::schema::Identity& identity = item.source->schema;
+    const auto kind = talos::launcher::HardwareRecordOf(topic, identity.name);
+    if (kind != talos::launcher::HardwareRecord::kNone) {
+      // A packet that does not decode (damaged, cut, from another wire
+      // version) is skipped alone; the topic's other packets still convert.
+      const std::string why =
+          talos::launcher::DecodeHardwareRecord(kind, item.payload, packet);
+      if (!why.empty()) {
+        Damaged& damaged = totals.damaged[topic];
+        if (damaged.count++ == 0) damaged.first = why;
+        continue;
+      }
+      hardware_topic = &topic;
+      hardware_time_us = time_us;
+      switch (kind) {
+        case talos::launcher::HardwareRecord::kState:
+          hardware.State(packet.state, names);
+          break;
+        case talos::launcher::HardwareRecord::kCommand:
+          hardware.Command(packet.command, names);
+          break;
+        case talos::launcher::HardwareRecord::kDriverStation:
+          hardware.DriverStation(packet.driver_station, joysticks_seen[topic]);
+          break;
+        case talos::launcher::HardwareRecord::kNone:
+          break;
+      }
+      continue;
+    }
     auto plan_at = plans.find({topic, identity.name, identity.hash});
     if (plan_at == plans.end()) {
       plan_at = plans
@@ -713,6 +1032,7 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
     }
   }
   totals.entries = entries.size();
+  totals.hardware_unnamed = hardware.unnamed();
   return totals;
 }
 
@@ -824,13 +1144,31 @@ int Convert(const Options& options) {
   std::size_t records = 0;
   if (!SelectItems(files, items, records, error)) return Fail(error);
 
+  // Device names for the hardware packets, as log_dump finds them: --config,
+  // else the config the session's manifest names. Without one, a device's
+  // entries are named by its logical id.
+  const std::string config_path =
+      talos::launcher::SessionConfigPath(options.config, options.inputs);
+  std::optional<talos::launcher::DeviceNames> device_names;
+  std::string unnamed_why =
+      "no robot config (--config, or a session "
+      "directory whose manifest.json names one)";
+  if (!config_path.empty()) {
+    std::string config_error;
+    device_names = talos::launcher::LoadDeviceNames(config_path, config_error);
+    unnamed_why = device_names
+                      ? "a packet's config_id is not that of " + config_path
+                      : "config " + config_path + ": " + config_error;
+  }
+
   std::ofstream out{temp.path(), std::ios::binary | std::ios::trunc};
   if (!out) return Fail("cannot write " + options.output);
   Totals totals;
   try {
     talos::wpilog::Writer writer{
         out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
-    totals = WriteItems(items, start_ns, writer);
+    totals = WriteItems(items, start_ns,
+                        device_names ? &*device_names : nullptr, writer);
     out.flush();
     const bool written = writer.ok() && out.good();
     out.close();
@@ -844,6 +1182,17 @@ int Convert(const Options& options) {
   for (const auto& [topic, why] : totals.skipped) {
     std::fprintf(stderr, "tlog_to_wpilog: skipped %s: %s\n", topic.c_str(),
                  why.c_str());
+  }
+  for (const auto& [topic, damaged] : totals.damaged) {
+    std::fprintf(stderr,
+                 "tlog_to_wpilog: skipped %zu %s packets that do not decode; "
+                 "the first: %s\n",
+                 damaged.count, topic.c_str(), damaged.first.c_str());
+  }
+  if (totals.hardware_unnamed) {
+    std::fprintf(stderr,
+                 "tlog_to_wpilog: hardware devices named by logical id: %s\n",
+                 unnamed_why.c_str());
   }
   std::printf(
       "tlog_to_wpilog: %zu files, %zu records -> %zu entries, %zu "
@@ -860,8 +1209,8 @@ int main(int argc, char** argv) {
   std::string error;
   if (!ParseOptions(argc, argv, options, error)) {
     std::fprintf(stderr,
-                 "tlog_to_wpilog: %s\nusage: %s <log-file-or-session-dir> "
-                 "[more ...] -o <out.wpilog>\n",
+                 "tlog_to_wpilog: %s\nusage: %s [--config robot.toml] "
+                 "<log-file-or-session-dir> [more ...] -o <out.wpilog>\n",
                  error.c_str(), argv[0]);
     return 1;
   }

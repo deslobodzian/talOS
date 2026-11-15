@@ -898,6 +898,7 @@ header:
 | `:roster` | `roster.h` | `LauncherOptions`, the bundle manifest, `DiscoverNodes` and binary resolution |
 | `:describe_graph` | `describe_graph.h` | phase one: `ProbeDescribe`, `DescribeGraph`, the parameter lints, `EndpointMismatch`, session segments, `graph.json` |
 | `:log_inputs` | `log_inputs.h` | `LogInputFiles`, the log files `log_dump`'s and `tlog_to_wpilog`'s inputs name, each once |
+| `:hardware_record` | `hardware_record.h` | the hardware packets decoded with the wire codecs (`DecodeHardwareRecord`, `HardwareRecordJson`) and the run config's device names (`SessionConfigPath`, `LoadDeviceNames`), for `log_dump` and `tlog_to_wpilog` |
 | `:log_merge` | `log_merge.h` | `MergeLogs`, a session's records streamed to a visitor in time order; `log_dump` and `tlog_to_wpilog` link it, not the supervisor |
 | `:supervision_policy` | `supervision_policy.h` | the [restart](#restarts) and kill decisions as functions of the supervision clock: `RestartSchedule` (backoff, rolling budget, quarantine) at the time a pass sampled, `RunLiveness` (stall, missing row, construction deadline) at the times read around each row read, and when to look at the row next ([supervision passes](#supervision-passes)) |
 | `:launcher_lib` | `launcher.h`, `studio_bridge.h`, `service_notifier.h` | the supervisor (`Launcher`; retention in `launcher_retention.cc`), which samples the clock, reads the registry, spawns, reaps and kills, and asks `:supervision_policy` what to do; and the Studio bridge |
@@ -1436,15 +1437,23 @@ synchronization accuracy. See `docs/BRINGUP.md` for the bench checks.
 `.tlog`s as one WPILib DataLog (`.wpilog`, format 1.0), the file
 AdvantageScope and WPILib's DataLogTool open. It streams the logs through
 the same `MergeLogs` as `log_dump`, decodes payloads from the
-schemas the logs carry (no recording build needed), and writes the file with
-its own small writer (`wpilog.h`; no WPILib dependency). Offline only.
+schemas the logs carry (no recording build needed) and the hardware packets
+with `log_dump`'s wire decoder (`hardware_record.h`), and writes the file
+with its own small writer (`wpilog.h`; no WPILib dependency). Offline only.
 REQ-OPS-26 states what it guarantees.
 
 ```sh
 bazel run //talOS/launcher:tlog_to_wpilog -- /tmp/talos_logs/<session> \
   -o /tmp/match.wpilog
 bazel run //talOS/launcher:tlog_to_wpilog -- a.tlog b.tlog -o /tmp/ab.wpilog
+bazel run //talOS/launcher:tlog_to_wpilog -- --config $PWD/robot.toml \
+  a.tlog -o /tmp/a.wpilog
 ```
+
+`--config robot.toml` names the config whose device names label the
+hardware packets, found as `log_dump --config` finds it
+([filtering and exporting](#filtering-and-exporting-logs)): without the
+flag, the `config_path` of a session directory's `manifest.json`.
 
 Inputs are `.tlog` files or session directories, all from one session,
 read as [`log_dump`](#filtering-and-exporting-logs) reads them: kept
@@ -1462,12 +1471,67 @@ Mapping:
 | a target lane (`TargetEnvelope<M>`) | `<topic>/mode_since_us`, `<topic>/active`, `<topic>/message/<field>` | `int64`, `boolean`, as above |
 | a `geometry.Pose2d` (talOS/msgs), as well as its three fields | `<topic>/<path to it>`, or `<topic>/pose` when the Pose2d is the whole message | `double[]` `[x_m, y_m, yaw_rad]`, AdvantageScope's legacy number-array pose |
 | a reader's dropped count (`aux` of a MESSAGE record) | `/talos_log/dropped/<node><topic>`, cumulative | `int64` |
+| a hardware packet (`/hw/state`, `/hw/state/driver_station`, `/hw/request/<node>`, `/hw/command`) | `<topic>/<field>`, below | `boolean`, `int64`, `double`, `string`, arrays |
 
 Field names keep their unit suffix (`position_m`), and each entry's metadata
 is JSON naming the schema and, from the suffix, the unit
 (`{"source":"talos.tlog","schema":"geometry.PoseEstimate","unit":"m"}`).
 Pose2d is the only extra mapping; other messages (a swerve module position,
 an odometry sample) appear only as their fields.
+
+The hardware packets carry no FlatBuffers schema; each is decoded with the
+wire codecs (`DecodeHardwareRecord`, the decoder behind `log_dump`'s
+`hardware` field) and written under its topic with the field names
+`log_dump` gives (schema `talos.hardware.Packet` in the metadata, units
+from the suffix, and `V` for `voltage`, `°C` for `temperature_c`, `s` for
+`match_time_s`). A device is named `<group>/<name>` by its config name when
+the packet's `config_id` is that config's (as `log_dump` names it), else
+`<group>/<logical id>`; the converter then says on stderr why ("hardware
+devices named by logical id: ..."). Integers and 64-bit ids are `int64`
+(an id keeps its bits), measurements `double`, flags `boolean`, names of
+modes and states `string`.
+
+- `/hw/state`: `config_id`, `boot_id`, `epoch`, `sample_time_us`,
+  `sequence`, `last_command_sequence`; `configured`, `enabled`,
+  `command_active`, `hardware_fault`;
+  `motors/<motor>/` `valid`, `position_rot`, `velocity_rps`, `voltage`,
+  `stator_current_a`, `supply_current_a`, `temperature_c`,
+  `position_age_us`, `velocity_age_us`, `fault_flags`, `faulted`,
+  `forward_limit`, `reverse_limit` (`/hw/state/motors/flywheel/velocity_rps`);
+  `sensors/<sensor>/` `valid`, `position_rot`, `velocity_rps` and their ages;
+  `digital_inputs/` and `digital_outputs/<device>/` `valid`, `value`;
+  `analog_inputs/<device>/` `valid`, `voltage`, `age_us`;
+  `encoders/<device>/` `valid`, `position_rot`, `velocity_rps`, `age_us`;
+  `pwm_outputs/<device>/` `valid`, `output`; `health/` `valid`, `battery_v`,
+  `brownout`, `can_bus_count`, and per CAN bus (a State reports one bus,
+  the next each time) `health/can_bus/<bus name or slot>/` `read_state`,
+  `utilization_frac` and its error counts; `counters/` the gateway's four
+  counts.
+- `/hw/request/<node>` and `/hw/command`: `config_id`, `boot_id`, `epoch`,
+  `observed_time_us`; `motors/<motor>/` `mode` (`string`: `neutral`,
+  `duty_cycle`, `voltage`, `velocity`, `position`, `motion_magic`), `slot`,
+  `demand` (in the mode's unit), `feedforward_v`;
+  `digital_outputs/<device>/value`, `pwm_outputs/<device>/output`
+  (`/hw/request/shooter/motors/flywheel/demand`).
+- `/hw/state/driver_station`: `sample_time_us`, `mode_since_us` (the mode
+  generation), `boot_id`; the flags `ds_attached`, `fms_attached`,
+  `enabled`, `autonomous`, `teleop`, `test`, `estop` as booleans, `mode`
+  (`string`, as `log_dump` names it); `alliance`, `station`, `match_type`,
+  `match_number`, `replay_number`, `match_time_s`; per joystick port
+  `joysticks/<port>/` `connected` (from the first packet the port is
+  connected in, so a disconnect shows), `axes` (`double[]`), `buttons`
+  (`boolean[]`, element i is button i + 1, `button_count` long: AdvantageScope
+  shows each element as its own on/off line, where a bit mask would read as
+  one number) and `povs` (`int64[]`, as the Driver Station reports them).
+
+Not exported, though `log_dump` prints them: the gateway build
+(`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), the raw
+Driver Station `flags` word, the game-specific message, the event name and
+joystick names. A hardware packet that does not decode (a payload of the
+wrong size, a `Packet` size past its buffer, bytes the codec rejects) is
+skipped alone and counted on stderr per topic with the first reason; the
+topic's other packets convert. The codecs are this build's, as for
+`log_dump`.
 
 An entry name belongs to the first topic to publish a value under it. A
 topic whose field path lands on a name another topic owns (`/arm/state`
@@ -1497,15 +1561,12 @@ Which records, and when:
   stamped with the publish time of the message after the gap. Wall-clock
   time is not used.
 - Timer, exit, scheduling and READ records carry no message and are skipped. Byte
-  topics (`talos.Bytes`, such as `/talos/telemetry`), the hardware packet, and
-  any topic whose schema cannot be read are skipped, each named once on
-  stderr.
+  topics (`talos.Bytes`, such as `/talos/telemetry`) and any topic whose
+  schema cannot be read are skipped, each named once on stderr.
 
 Caveats: a `ulong` field becomes `int64` with its bits kept, so a value above
 2^63 - 1 reads negative (a `sample_time_ns` never gets there); enums are their
-numeric value, not their name; hardware packets (`/hw/state`,
-`/hw/request/<node>`), which `log_dump` decodes with the wire codecs, are not
-converted. Damage is read as `log_dump` reads it: a damaged record or a cut
+numeric value, not their name. Damage is read as `log_dump` reads it: a damaged record or a cut
 tail is skipped with a warning naming the log, and a log cut inside its
 header is skipped. A file that is not a `.tlog`, a manifest that fails its
 checksum, an unsupported format version, a mismatched session id, or no

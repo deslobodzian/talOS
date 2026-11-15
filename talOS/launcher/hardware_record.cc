@@ -2,9 +2,15 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <system_error>
 
+#include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
@@ -145,42 +151,6 @@ void Name(Json& json, const std::map<std::uint16_t, std::string>* names,
   if (it != names->end()) json.Key("name").Text(it->second);
 }
 
-const char* ReadStateName(hardware::CanBusReadState state) {
-  switch (state) {
-    case hardware::CanBusReadState::kNone:
-      return "none";
-    case hardware::CanBusReadState::kOk:
-      return "ok";
-    case hardware::CanBusReadState::kPending:
-      return "pending";
-    case hardware::CanBusReadState::kFailed:
-      return "failed";
-    case hardware::CanBusReadState::kStale:
-      return "stale";
-    case hardware::CanBusReadState::kSimulated:
-      return "simulated";
-  }
-  return "unknown";
-}
-
-const char* ModeName(hardware::Mode mode) {
-  switch (mode) {
-    case hardware::Mode::kNeutral:
-      return "neutral";
-    case hardware::Mode::kDutyCycle:
-      return "duty_cycle";
-    case hardware::Mode::kVoltage:
-      return "voltage";
-    case hardware::Mode::kVelocity:
-      return "velocity";
-    case hardware::Mode::kPosition:
-      return "position";
-    case hardware::Mode::kMotionMagic:
-      return "motion_magic";
-  }
-  return "unknown";
-}
-
 // One array member of `count` samples, each written by `item`.
 template <typename Array, typename Item>
 void Samples(Json& json, std::string_view key, const Array& samples,
@@ -292,7 +262,7 @@ void StateJson(Json& json, const hardware::State& s, const DeviceNames* n) {
   if (n != nullptr && s.health.can_bus_index < n->can_buses.size()) {
     json.Key("name").Text(n->can_buses[s.health.can_bus_index]);
   }
-  json.Key("read_state").Text(ReadStateName(bus.read_state));
+  json.Key("read_state").Text(CanBusReadStateName(bus.read_state));
   json.Key("utilization_frac").Number(bus.utilization_frac, 9);
   json.Key("bus_off_count").Int(bus.bus_off_count);
   json.Key("transmit_buffer_full_count").Int(bus.transmit_buffer_full_count);
@@ -317,7 +287,7 @@ void CommandJson(Json& json, const hardware::Command& c, const DeviceNames* n) {
   Samples(json, "motors", c.motors, c.count,
           [&](const hardware::MotorRequest& m) {
             Name(json, n ? &n->motors : nullptr, m.id);
-            json.Key("mode").Text(ModeName(m.mode));
+            json.Key("mode").Text(HardwareModeName(m.mode));
             json.Key("slot").Int(m.slot);
             json.Key("demand").Number(m.demand);
             json.Key("feedforward_v").Number(m.feedforward_v);
@@ -338,48 +308,13 @@ std::string_view Bounded(const char* text, std::size_t capacity) {
   return {text, strnlen(text, capacity)};
 }
 
-// The mode the Driver Station selected (its flags), whether or not the robot
-// is enabled in it; not a node's own view of the mode.
-const char* DsModeName(std::uint32_t flags) {
-  if ((flags & ds::kTest) != 0) return "test";
-  if ((flags & ds::kAutonomous) != 0) return "autonomous";
-  if ((flags & ds::kTeleop) != 0) return "teleop";
-  return "none";
-}
-
-const char* AllianceName(ds::Alliance alliance) {
-  switch (alliance) {
-    case ds::Alliance::kRed:
-      return "red";
-    case ds::Alliance::kBlue:
-      return "blue";
-    case ds::Alliance::kUnknown:
-      break;
-  }
-  return "unknown";
-}
-
-const char* MatchTypeName(ds::MatchType type) {
-  switch (type) {
-    case ds::MatchType::kPractice:
-      return "practice";
-    case ds::MatchType::kQualification:
-      return "qualification";
-    case ds::MatchType::kElimination:
-      return "elimination";
-    case ds::MatchType::kNone:
-      break;
-  }
-  return "none";
-}
-
 void DriverStationJson(Json& json, const ds::DriverStationData& d) {
   const std::uint32_t flags = d.fms.flags;
   json.Key("sample_time_us").UInt(d.sample_time_us);
   json.Key("mode_since_us").UInt(d.mode_since_us);
   json.Key("boot_id").Id(d.boot_id);
   json.Key("flags").Int(flags);
-  json.Key("mode").Text(DsModeName(flags));
+  json.Key("mode").Text(DriverStationModeName(flags));
   json.Key("ds_attached").Bool((flags & ds::kDsAttached) != 0);
   json.Key("fms_attached").Bool((flags & ds::kFmsAttached) != 0);
   json.Key("enabled").Bool((flags & ds::kEnabled) != 0);
@@ -433,7 +368,133 @@ const char* TypeName(HardwareRecord kind) {
   return "none";
 }
 
+// The "config_path" string of a session's manifest.json (session.cc
+// SessionManifest::ToJson, escaped by introspect::AppendJsonString), or empty.
+std::string ManifestConfigPath(const std::filesystem::path& session) {
+  std::ifstream stream{session / "manifest.json"};
+  const std::string text{std::istreambuf_iterator<char>{stream}, {}};
+  constexpr std::string_view kKey = "\"config_path\"";
+  auto at = text.find(kKey);
+  if (at == std::string::npos) return "";
+  at = text.find('"', text.find(':', at + kKey.size()));
+  if (at == std::string::npos) return "";
+  std::string value;
+  for (std::size_t i = at + 1; i < text.size(); ++i) {
+    const char c = text[i];
+    if (c == '"') return value;
+    if (c != '\\') {
+      value += c;
+    } else if (i + 1 < text.size() && text[i + 1] != 'u') {
+      value += text[++i];
+    } else if (i + 5 < text.size()) {
+      value += static_cast<char>(
+          std::strtol(text.substr(i + 2, 4).c_str(), nullptr, 16));
+      i += 5;
+    }
+  }
+  return "";
+}
+
 }  // namespace
+
+const char* CanBusReadStateName(hardware::CanBusReadState state) {
+  switch (state) {
+    case hardware::CanBusReadState::kNone:
+      return "none";
+    case hardware::CanBusReadState::kOk:
+      return "ok";
+    case hardware::CanBusReadState::kPending:
+      return "pending";
+    case hardware::CanBusReadState::kFailed:
+      return "failed";
+    case hardware::CanBusReadState::kStale:
+      return "stale";
+    case hardware::CanBusReadState::kSimulated:
+      return "simulated";
+  }
+  return "unknown";
+}
+
+const char* HardwareModeName(hardware::Mode mode) {
+  switch (mode) {
+    case hardware::Mode::kNeutral:
+      return "neutral";
+    case hardware::Mode::kDutyCycle:
+      return "duty_cycle";
+    case hardware::Mode::kVoltage:
+      return "voltage";
+    case hardware::Mode::kVelocity:
+      return "velocity";
+    case hardware::Mode::kPosition:
+      return "position";
+    case hardware::Mode::kMotionMagic:
+      return "motion_magic";
+  }
+  return "unknown";
+}
+
+const char* DriverStationModeName(std::uint32_t flags) {
+  if ((flags & ds::kTest) != 0) return "test";
+  if ((flags & ds::kAutonomous) != 0) return "autonomous";
+  if ((flags & ds::kTeleop) != 0) return "teleop";
+  return "none";
+}
+
+const char* AllianceName(ds::Alliance alliance) {
+  switch (alliance) {
+    case ds::Alliance::kRed:
+      return "red";
+    case ds::Alliance::kBlue:
+      return "blue";
+    case ds::Alliance::kUnknown:
+      break;
+  }
+  return "unknown";
+}
+
+const char* MatchTypeName(ds::MatchType type) {
+  switch (type) {
+    case ds::MatchType::kPractice:
+      return "practice";
+    case ds::MatchType::kQualification:
+      return "qualification";
+    case ds::MatchType::kElimination:
+      return "elimination";
+    case ds::MatchType::kNone:
+      break;
+  }
+  return "none";
+}
+
+std::string SessionConfigPath(const std::string& config,
+                              const std::vector<std::string>& inputs) {
+  std::string path = config;
+  if (path.empty()) {
+    for (const auto& input : inputs) {
+      std::error_code ec;
+      if (!std::filesystem::is_directory(input, ec)) continue;
+      path = ManifestConfigPath(input);
+      if (!path.empty()) break;
+    }
+    if (path.empty()) return path;
+  }
+  const char* base = std::getenv("BUILD_WORKING_DIRECTORY");
+  if (std::filesystem::path{path}.is_absolute() || base == nullptr ||
+      *base == '\0') {
+    return path;
+  }
+  return (std::filesystem::path{base} / path).string();
+}
+
+std::optional<DeviceNames> LoadDeviceNames(const std::string& path,
+                                           std::string& error) {
+  try {
+    return DeviceNames::FromConfig(config::ParseRobotConfig(path).hardware);
+  } catch (const std::exception& e) {
+    error = e.what();
+    return std::nullopt;
+  }
+}
 
 HardwareRecord HardwareRecordOf(std::string_view topic,
                                 std::string_view schema_name) {
@@ -472,6 +533,49 @@ DeviceNames DeviceNames::FromConfig(const hardware::Config& config) {
   return names;
 }
 
+std::string DecodeHardwareRecord(HardwareRecord kind,
+                                 std::span<const std::byte> payload,
+                                 HardwarePacket& out) {
+  if (payload.size() != sizeof(hardware::Packet)) {
+    return "payload is " + std::to_string(payload.size()) + " bytes, not a " +
+           std::to_string(sizeof(hardware::Packet)) + "-byte hardware Packet";
+  }
+  hardware::Packet packet{};
+  std::memcpy(&packet, payload.data(), sizeof packet);
+  if (packet.size > packet.data.size()) {
+    return "Packet size " + std::to_string(packet.size) + " exceeds its " +
+           std::to_string(packet.data.size()) + "-byte buffer";
+  }
+  const auto bytes = packet.bytes();
+  const auto rejected = [&](const char* what) {
+    return std::string{"the "} + what + " codec rejected " +
+           std::to_string(bytes.size()) + " bytes";
+  };
+  try {
+    switch (kind) {
+      case HardwareRecord::kState:
+        out.state = {};
+        if (!hardware::Decode(bytes, out.state)) return rejected("State");
+        return "";
+      case HardwareRecord::kCommand:
+        out.command = {};
+        if (!hardware::Decode(bytes, out.command)) return rejected("Command");
+        return "";
+      case HardwareRecord::kDriverStation:
+        out.driver_station = {};
+        if (!ds::Decode(bytes, out.driver_station)) {
+          return rejected("Driver Station");
+        }
+        return "";
+      case HardwareRecord::kNone:
+        break;
+    }
+    return "not a hardware packet topic";
+  } catch (const std::exception& e) {
+    return e.what();
+  }
+}
+
 std::string HardwareRecordJson(HardwareRecord kind,
                                std::span<const std::byte> payload,
                                const DeviceNames* names) {
@@ -483,47 +587,27 @@ std::string HardwareRecordJson(HardwareRecord kind,
     out += '}';
     return out;
   };
-  if (payload.size() != sizeof(hardware::Packet)) {
-    return fail("payload is " + std::to_string(payload.size()) +
-                " bytes, not a " + std::to_string(sizeof(hardware::Packet)) +
-                "-byte hardware Packet");
-  }
-  hardware::Packet packet{};
-  std::memcpy(&packet, payload.data(), sizeof packet);
-  if (packet.size > packet.data.size()) {
-    return fail("Packet size " + std::to_string(packet.size) + " exceeds its " +
-                std::to_string(packet.data.size()) + "-byte buffer");
-  }
-  const auto bytes = packet.bytes();
-  const auto rejected = [&](const char* what) {
-    return fail(std::string{"the "} + what + " codec rejected " +
-                std::to_string(bytes.size()) + " bytes");
-  };
+  HardwarePacket packet;
+  const std::string error = DecodeHardwareRecord(kind, payload, packet);
+  if (!error.empty()) return fail(error);
   try {
     switch (kind) {
-      case HardwareRecord::kState: {
-        hardware::State state;
-        if (!hardware::Decode(bytes, state)) return rejected("State");
-        StateJson(json, state,
-                  names && names->Matches(state.config_id) ? names : nullptr);
+      case HardwareRecord::kState:
+        StateJson(
+            json, packet.state,
+            names && names->Matches(packet.state.config_id) ? names : nullptr);
         break;
-      }
-      case HardwareRecord::kCommand: {
-        hardware::Command command;
-        if (!hardware::Decode(bytes, command)) return rejected("Command");
-        CommandJson(
-            json, command,
-            names && names->Matches(command.config_id) ? names : nullptr);
+      case HardwareRecord::kCommand:
+        CommandJson(json, packet.command,
+                    names && names->Matches(packet.command.config_id)
+                        ? names
+                        : nullptr);
         break;
-      }
-      case HardwareRecord::kDriverStation: {
-        ds::DriverStationData data;
-        if (!ds::Decode(bytes, data)) return rejected("Driver Station");
-        DriverStationJson(json, data);
+      case HardwareRecord::kDriverStation:
+        DriverStationJson(json, packet.driver_station);
         break;
-      }
       case HardwareRecord::kNone:
-        return fail("not a hardware packet topic");
+        break;
     }
   } catch (const std::exception& e) {
     out = "{";
