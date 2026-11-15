@@ -232,6 +232,13 @@ class InstallCheckTest(unittest.TestCase):
             proc = install(src)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             good = os.readlink(current)
+            # Accepted, the launcher's warnings are shown, and only they:
+            # the bench graph has topics nobody reads.
+            shown = [line for line in proc.stdout.splitlines()
+                     if line.startswith("  | ")]
+            self.assertTrue(shown, proc.stdout)
+            for line in shown:
+                self.assertTrue(line.startswith("  |   warning: "), proc.stdout)
             # The smallest graph error a person makes: a misspelled
             # parameter, a key no node reads.
             # The sandbox links each input file; copy what they name.
@@ -255,6 +262,9 @@ class InstallCheckTest(unittest.TestCase):
             # The launcher's own finding and refusal, and what stays.
             self.assertIn("max_bench_voltag_v", out)
             self.assertIn("refusing to start", out)
+            # The key is the reason: every member of the copy answered.
+            self.assertNotIn("did not answer --describe", out)
+            self.assertNotIn("(not described)", out)
             self.assertIn(f"{bad} not installed", out)
             self.assertIn(f"; current stays {good}\n", out)
             self.assertEqual(os.readlink(current), good, out)

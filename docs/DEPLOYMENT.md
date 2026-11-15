@@ -268,8 +268,11 @@ into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
 member's process group, selects nothing and exits 1. Linux has no such
 charge; the warm-up runs there too (0.4 s for the 2026 bundle on a Linux
-workstation). `--no-warm-up` skips it, leaving the charge to the first
-launch.
+workstation). `--no-warm-up` skips it. After `install`, the
+[graph check](#graph-check) still runs every member and the launcher once,
+all at once inside the probes' deadline, so the first launch pays only, on
+macOS, each native library's first load; after `rollback`, which has no
+check, the first launch pays every first run.
 
 The members run as the user that runs `deploy.sh`, root under `sudo`: the
 bundle's code runs at install time with that privilege, so install only a
@@ -285,9 +288,11 @@ with the Studio bridge `run.sh` gives it, probes every member with
 that refuses (a naming or graph rule, a critical member that does not
 answer, a parameter key no node reads) the boot service's launch would
 refuse every time it restarts, with nothing running and the driver
-dashboard showing only a lost link. So such a bundle is not installed:
-`deploy.sh` prints the launcher's output, each line prefixed `  | `,
-removes the copy, and exits 1 with
+dashboard showing only a lost link. When the launcher exits nonzero, for
+that or for a host failure such as a full `TMPDIR`, the bundle is not
+installed: `deploy.sh` prints `deploy: the launcher's check of this bundle
+failed (exit <status>); its output:` and the launcher's output, each line
+prefixed `  | `, removes the copy, and exits 1 with
 
 ```
 deploy: error: <bundle> not installed (the paths above were its removed copy, <prefix>/bundles/<stamp>); current stays <prefix>/bundles/<selected>
@@ -295,7 +300,10 @@ deploy: error: <bundle> not installed (the paths above were its removed copy, <p
 
 (`nothing is selected` on a first install). The bundle given still holds
 every file the launcher names, at the same path below it. Warnings, from the
-launcher or the warm-up, do not refuse. Stopping `deploy.sh` during the
+launcher or the warm-up, do not refuse; on acceptance the launcher's graph
+warnings (its `  warning: ` lines, among them a non-critical member that did
+not answer `--describe` and so will not run) are printed, prefixed the same
+way. Stopping `deploy.sh` during the
 check stops the launcher, selects nothing and exits 1.
 
 The check takes nothing a running robot holds: `--describe-only` takes no
@@ -309,6 +317,17 @@ answered by installing again without `--no-warm-up`. There is no override:
 the launcher accepts `--allow-graph-errors` only with `--sim`, so a robot
 could never launch such a bundle. `rollback` does not check: it selects a
 bundle that was selected before.
+
+The check is not the whole launch. It does not cover:
+
+- `[robot] simulation_only = true`: `--describe-only` accepts such a config,
+  which a launch without `--sim` refuses, so a bundle built from a
+  simulation config installs and the boot service's launch then exits 1.
+- The boot service's account and environment: the check runs as the person
+  running `deploy.sh`, with their environment, while the service runs as
+  its account with its own `PATH`, so a member that resolves a program
+  through `PATH` (a Python member's `#!/usr/bin/env python3`) can find a
+  different one at boot (TODO.md DEPLOY-10).
 
 ### Boot service output
 
