@@ -84,7 +84,8 @@ differ in how much of it is generated or borrowed, not in whether there is code.
 |---|---|
 | Driver controls, telemetry, target lanes | TOML for the framework nodes (`teleop`, `telemetry`) and the target policy |
 | A common mechanism | a node from the scaffold (`--type velocity`, `position` or `estimator`), edited to fit; it may call `talOS/mechanisms` |
-| Something unusual or performance-critical | a Python or C++ node written from nothing, with or without the mechanism helpers |
+| Something unusual | a Python or C++ node written from nothing, with or without the mechanism helpers |
+| A fast control loop | a C++ node: a Python node that owns a motor runs at 20 ms or slower (REQ-RT-23) |
 
 ## Day-to-day workflows
 
