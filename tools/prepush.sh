@@ -16,7 +16,8 @@
 # Steps, in order: read-only, `bazel build //...`, host-includes, `bazel test
 # --nocache_test_results //...`, then, when the commits to push
 # (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
-# upstream) touch MODULE.bazel, third_party/, talOS/, tools/ or the fixtures,
+# upstream) touch MODULE.bazel, REPO.bazel, third_party/, talOS/, tools/ or
+# the fixtures,
 # dependent-robot_repo and dependent-wrist_repo (`bazel test //...
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
 # and examples/wrist_repo, the repositories that depend on talOS),
@@ -232,7 +233,12 @@ fi
 # The repositories that depend on talOS as @talos, each its own workspace,
 # as CI's robot-repo job runs them. They write only ignored files (their
 # bazel-* links and lockfiles), which checkout-unchanged then confirms.
-dependent_paths=(MODULE.bazel third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
+# What they build from talOS: its module file, REPO.bazel (which applies to
+# @talos as to any repository), the toml++ build file and patch in
+# third_party/, and packages under talOS/ and tools/ (`bazel query
+# 'buildfiles(deps(//...))'` in each). talOS's .bazelrc and .bazelversion
+# are not read there (each fixture has its own copies), nor is studio/.
+dependent_paths=(MODULE.bazel REPO.bazel third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
 if ! touches "${dependent_paths[@]}"; then
   report "dependents not needed (nothing under ${dependent_paths[*]} since $upstream)"
 elif [ ! -d "$wt/examples/robot_repo" ]; then
