@@ -1,8 +1,8 @@
-"""Generated from robot.toml by //tools:sync_manifest. Do not edit.
+"""Generated from robot.toml by @talos//tools:sync_manifest. Do not edit.
 
 Regenerate after changing the config:
 
-    bazel run //tools:sync_manifest -- robot.toml
+    bazel run @talos//tools:sync_manifest -- robot.toml
 """
 
 # Every node label robot.toml launches.

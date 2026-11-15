@@ -3,6 +3,8 @@
     bazel run //tools:sync_manifest -- <robot.toml>...
     bazel run //tools:sync_manifest -- --check <robot.toml>...
 
+(`@talos//tools:sync_manifest` in a repository that depends on talOS.)
+
 A robot config's `[[subsystems]]` list is the only list of a robot's nodes.
 `talos_bundle` and `talos_graph_test` need the same nodes, and every file the
 config reads, as Bazel labels. The C++ configuration resolver supplies the
@@ -13,7 +15,9 @@ JSON output into two constants:
     CONFIG_FILES  every file the config reads besides itself, as labels, sorted
 
 `--check` writes nothing; it exits 1 with a diff and the regenerate command
-when a manifest is stale. `manifest_sync_test` (tools/sync_manifest.bzl) runs
+when a manifest is stale. The command, and the one the generated file
+names, is the one that runs in the repository the script runs from
+(`command()`). `manifest_sync_test` (tools/sync_manifest.bzl) runs
 it under `bazel test`, where only the files the manifest lists are present, so
 a config that reads an unlisted file is reported stale too.
 """
@@ -30,7 +34,24 @@ import tempfile
 
 from python.runfiles import runfiles
 
-COMMAND = "bazel run //tools:sync_manifest --"
+
+def current_repository():
+    """The canonical name of the repository this script is in: empty when
+    talOS is the main repository."""
+    files = runfiles.Create()
+    return (files.CurrentRepository() if files else "") or ""
+
+
+def command():
+    """The regenerate command as the repository being worked in runs it:
+    `//tools:sync_manifest` in talOS, `@<module>//tools:sync_manifest` where
+    talOS is a dependency (its canonical name, `<module>+`, less the suffix:
+    the name a dependent MODULE.bazel's bazel_dep gives it by default)."""
+    repository = current_repository()
+    if repository:
+        module = repository.split("+", 1)[0].split("~", 1)[0]
+        return f"bazel run @{module}//tools:sync_manifest --"
+    return "bazel run //tools:sync_manifest --"
 
 
 class ManifestError(Exception):
@@ -120,12 +141,14 @@ def render(config, nodes, file_labels):
                 "".join(f'    "{v}",\n' for v in values) + "]\n")
 
     name = posixpath.basename(config)
+    regenerate = command()
+    tool = regenerate.split()[2]
     return (
-        f'"""Generated from {name} by //tools:sync_manifest. Do not edit.\n'
+        f'"""Generated from {name} by {tool}. Do not edit.\n'
         "\n"
         "Regenerate after changing the config:\n"
         "\n"
-        f"    {COMMAND} {config}\n"
+        f"    {regenerate} {config}\n"
         '"""\n'
         "\n"
         f"# Every node label {name} launches.\n" +
@@ -166,7 +189,7 @@ def check(root, config):
     (in a test's runfiles); a file the manifest does not list is stale.
     """
     out = manifest_path(config)
-    fix = f"Regenerate it with:\n    {COMMAND} {config}\n"
+    fix = f"Regenerate it with:\n    {command()} {config}\n"
     try:
         with open(os.path.join(root, out), encoding="utf-8") as f:
             current = f.read()
@@ -204,7 +227,7 @@ def write(root, config):
 
 def main(argv):
     parser = argparse.ArgumentParser(
-        prog=COMMAND,
+        prog=command(),
         description="Write <stem>_manifest.bzl (NODES, CONFIG_FILES) beside "
         "each robot config, or check that it is current.")
     parser.add_argument("configs", nargs="+", metavar="robot.toml",
