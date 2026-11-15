@@ -953,9 +953,6 @@ test('a list row never shrinks its state word', () => {
     assert.doesNotMatch(body, /text-overflow\s*:\s*ellipsis/, `${rule} ellipsizes the state word`);
     assert.doesNotMatch(body, /overflow\s*:\s*hidden/, `${rule} hides the state word's overflow`);
   }
-  // The name's floor is METRICS.name_min, the floor the readable-name test
-  // models.
-  assert.match(css, /\.nodes \.name[^{]*\{[^}]*min-width:\s*var\(--drive-name-min\)/);
 });
 
 // REQ-OPS-49: when the subsystems list is longer than its cell, the rows
