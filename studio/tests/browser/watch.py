@@ -11,6 +11,7 @@ is watched from then on, whenever it appeared.
 """
 
 import ctypes
+import errno
 import os
 from pathlib import Path
 import select
@@ -37,7 +38,12 @@ class _Inotify:
             return False
         mask = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE
         if self.libc.inotify_add_watch(self.fd, os.fsencode(path), mask) < 0:
-            return False
+            error = ctypes.get_errno()
+            if error in (errno.ENOENT, errno.ENOTDIR):
+                return False  # gone since it was listed: the next listing decides
+            # Anything else (the user's watch limit, ENOSPC) would leave the
+            # wait blind until its bound: fail now, naming it.
+            raise OSError(error, f"inotify_add_watch: {os.strerror(error)}", path)
         self.watched.add(path)
         return True
 
