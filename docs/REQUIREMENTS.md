@@ -248,6 +248,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-24 | Both simulated gateway backends (the ideal `SimBackend` and `PhysicsSimBackend`) report the chain a restore reapplies invalid from the reset until a restore completes, and keep it invalid while restores fail, as `PhoenixBackend` does, so a simulated restore faults, ends the command in force and starts a new epoch exactly when the robot would. | P2 | HR "Simulation Backends: Ideal vs Physics-Backed" | backend state; State validity | component |
 | REQ-DEV-25 | `tools/prepush.sh` runs RULES.md 11's pre-push checks on a clean worktree of the commit under CI's conditions (tracked files read-only by the step CI itself runs, no cached test result, no compile reading a host package header) and exits nonzero naming each failed or skipped step, leaving the checkout unchanged. | P1 | RULES 11; `docs/DEVELOPMENT.md` §5; TEST §9 | step lines and exit status | integration |
 | REQ-DEV-26 | `geometry::OptimizeSwerveModule` turns an asked wheel speed and heading into the equivalent setpoint whose steering change from the measured angle is at most a quarter turn, reversing the speed when it takes the opposite heading, and scales the speed by the cosine of that steering change, never below zero; a non-finite input gives zero speed and no steering change. The 2026 drivetrain and the bench swerve module node take their module setpoints from it, so one implementation is exercised in simulation and on the bench. | P1 | ARCH "Layers"; `talOS/geometry/README.md` | returned speed, steering change and `reversed` | unit |
+| REQ-DEV-28 | When an estimate differs from the previous one by more than its velocity explains plus `replan_step_m` or `replan_step_rad`, the drive action replans from it on that tick without releasing its lane. | P1 | R26 "Nodes" | `/drivetrain/target/auto` envelope and target on that tick | component |
 
 ## Package scope
 
@@ -281,7 +282,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/aiming` | REQ-DEV-16 to REQ-DEV-19 |
 | `2026-robot/main_processor/{shooter,drivetrain,intake}` | REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-SAFE-31, REQ-SAFE-32 (intake), REQ-CONTRACT-25 |
 | `2026-robot/main_processor/driver` | REQ-SAFE-14, REQ-SAFE-31 |
-| `2026-robot/main_processor/autonomous` | REQ-SAFE-31, REQ-SAFE-33, REQ-SAFE-34 |
+| `2026-robot/main_processor/autonomous` | REQ-SAFE-31, REQ-SAFE-33, REQ-SAFE-34, REQ-DEV-28 |
 | `2026-robot/main_processor/pose_estimator` | REQ-CONTRACT-26; its second backend: none beyond it (TODO.md SCOPE-1) |
 | `2026-robot/main_processor/vision` | REQ-CONTRACT-27 |
 | `2026-robot/main_processor/simulation` | REQ-DEV-05, REQ-DEV-06; composition evidence for REQ-SAFE-31, REQ-SAFE-33 |
