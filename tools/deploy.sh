@@ -56,7 +56,7 @@ finally:
 # native pass runs only the libraries' static initializers, in a process of its
 # own. A member that fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S
 # seconds, default 60; tests shorten it) is a warning naming it and never fails
-# the command: the launch judges members. A stop signal to deploy.sh kills the
+# the command: install's graph check judges members. A stop signal to deploy.sh kills the
 # running member's group and selects nothing. Members run as the invoking user
 # (root under sudo). Linux pays no such charge but runs the same path, without
 # the native pass.
@@ -265,11 +265,61 @@ EOF
     printf 'deploy: warning: warm-up did not finish; the launch pays the rest\n' >&2
 }
 
+# --- graph check ------------------------------------------------------------
+# The launch's own first phase, run on the installed copy before anything
+# selects it: the copy's run.sh with --describe-only, so the bundle's launcher
+# probes every member with --describe on the config run.sh passes (Studio's
+# bridge included when the bundle carries it) and lints the graph exactly as
+# the boot service's launch will, then exits. A graph it refuses (a naming or
+# graph-lint error, a critical member that does not answer, a parameter key
+# no node reads) would make the boot service restart a refusing launcher
+# forever, so install refuses it; the launcher's warnings stay warnings. The
+# check needs no controller, shared memory, registry, session lock or
+# realtime privilege: --describe-only takes none of them and a --describe run
+# opens no device. Its session directory goes to a temporary root, removed
+# afterwards. --no-warm-up does not skip it; on macOS a fresh bundle's probes
+# then pay the first-run charge inside their deadline, as a first launch
+# would. There is no override: the launcher accepts --allow-graph-errors only
+# with --sim, so a robot could never launch such a bundle.
+check_graph() {
+  local bundle="$1"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '+ %s/run.sh --describe-only --output-dir <temporary root>\n' "$bundle"
+    return 0
+  fi
+  say "checking the graph: $bundle/run.sh --describe-only"
+  local scratch
+  scratch="$(mktemp -d "${TMPDIR:-/tmp}/talos_install_check.XXXXXX")" ||
+    die "cannot create a temporary directory for the graph check; nothing selected"
+  local pid status=0 stopped=0
+  # In the background, as the warm-up, so that a stop reaches the launcher.
+  PYTHONDONTWRITEBYTECODE=1 "$bundle/run.sh" --describe-only \
+    --output-dir "$scratch" </dev/null >"$scratch/output" 2>&1 &
+  pid=$!
+  trap 'stopped=1; kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP
+  wait "$pid" || status=$?
+  if [ "$stopped" = "1" ]; then wait "$pid" 2>/dev/null || true; fi
+  trap - TERM INT HUP
+  if [ "$stopped" = "1" ]; then
+    rm -rf "$scratch"
+    die "stopped during the graph check; nothing selected"
+  fi
+  if [ "$status" = "0" ]; then
+    say "the launcher accepts the graph"
+  else
+    printf 'deploy: the launcher refuses this bundle (exit %s):\n' "$status" >&2
+    sed 's/^/  | /' "$scratch/output" >&2
+  fi
+  rm -rf "$scratch"
+  return "$status"
+}
+
 # --- install ---------------------------------------------------------------
-# Copies the bundle, warms it in place and flips `current` atomically,
-# keeping `previous` for rollback. Selects only a complete copy, synced to
-# disk first: a power cut right after the flip must not boot a half-written
-# bundle.
+# Copies the bundle, warms it in place, checks its graph and flips `current`
+# atomically, keeping `previous` for rollback. Selects only a complete copy,
+# synced to disk first: a power cut right after the flip must not boot a
+# half-written bundle. A copy the launcher refuses is removed, so neither a
+# selection nor prune's newest --keep N ever counts it.
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
@@ -290,6 +340,17 @@ cmd_install() {
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
   warm_up "$dest"
+  if ! check_graph "$dest"; then
+    local stays="nothing is selected"
+    if [ -L "$PREFIX/current" ]; then
+      stays="current stays $(readlink "$PREFIX/current")"
+    fi
+    chmod -R u+w "$dest" 2>/dev/null || true
+    rm -rf "$dest"
+    # The launcher's paths name the removed copy and check directory; the
+    # bundle given holds the same files at the same relative paths.
+    die "$bundle not installed (the paths above were its removed copy, $dest); $stays"
+  fi
   if [ -L "$PREFIX/current" ]; then
     select_bundle "$(readlink "$PREFIX/current")" "$PREFIX/previous"
   fi
