@@ -1,5 +1,5 @@
 load("@aspect_rules_js//js:defs.bzl", "js_binary", "js_library", "js_run_binary", "js_test")
-load("@rules_python//python:defs.bzl", "py_test")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("@studio_npm//:defs.bzl", "npm_link_all_packages")
 load("@studio_npm//studio:typescript/package_json.bzl", tsc_bin = "bin")
 load("@studio_npm//studio:vite/package_json.bzl", vite_bin = "bin")
@@ -179,9 +179,7 @@ py_test(
     size = "medium",
     srcs = [
         "tests/browser/cdp.py",
-        "tests/browser/children.py",
         "tests/browser/drive_browser_test.py",
-        "tests/browser/watch.py",
     ],
     data = [
         "tests/browser/probe.js",
@@ -201,7 +199,30 @@ py_test(
         "no_asan",
         "no_tsan",
     ],
-    deps = ["//2026-robot/main_processor/simulation:autonomous_progress"],
+    deps = [
+        ":browser_helpers",
+        "//2026-robot/main_processor/simulation:autonomous_progress",
+    ],
+)
+
+# children.py and watch.py on their own: no browser, no robot, not e2e, so
+# every lane and both operating systems run their process and file-event
+# paths (pidfd or waitid, inotify, kqueue).
+py_library(
+    name = "browser_helpers",
+    testonly = True,
+    srcs = [
+        "tests/browser/children.py",
+        "tests/browser/watch.py",
+    ],
+)
+
+py_test(
+    name = "browser_helpers_test",
+    size = "small",
+    srcs = ["tests/browser/helpers_test.py"],
+    main = "tests/browser/helpers_test.py",
+    deps = [":browser_helpers"],
 )
 
 test_suite(
