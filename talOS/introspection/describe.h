@@ -78,6 +78,14 @@ struct Description {
   // binary that does not say so.
   bool holds_stop = false;
 
+  // The node's update() is a callback through the C ABI
+  // (talos_node_set_update): a Python node's, whose every tick runs the
+  // interpreter. False for a C++ update(), a talos.cpp_node's included, for a
+  // node without one, and for a binary that does not say so. The launcher
+  // holds such a node to a slower period when it owns actuators
+  // (LintPythonActuatorPeriods).
+  bool abi_update = false;
+
   // Every parameter key the node's constructor read, in first-read order:
   // what the node declares it reads, so the launcher can refuse a subsystem
   // key no node reads. nullopt when the describe did not report them (a
@@ -187,6 +195,8 @@ inline std::string DescribeToJson(const Description& description) {
   out += description.reads_graph ? "true" : "false";
   out += ",\n  \"holds_stop\": ";
   out += description.holds_stop ? "true" : "false";
+  out += ",\n  \"abi_update\": ";
+  out += description.abi_update ? "true" : "false";
   // Before the sources, whose reader looks only past them.
   if (description.params) {
     out += ",\n  \"params\": [";
@@ -352,6 +362,9 @@ class DescribeReader {
       flag = 0;
       out.holds_stop =
           Field(header, "holds_stop", flag) && Boolean(header, flag);
+      flag = 0;
+      out.abi_update =
+          Field(header, "abi_update", flag) && Boolean(header, flag);
       std::size_t params = 0;
       if (Field(header, "params", params) &&
           !Params(header, params, out.params.emplace(), error)) {

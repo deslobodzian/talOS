@@ -11,8 +11,10 @@
 
 namespace {
 
+// Its update() is C++, which cpp_node_test's describe case reads back.
 struct Probe {
   explicit Probe(talos::Node&) {}
+  void update() {}
 };
 
 // A pointer to a non-virtual member function under the Itanium C++ ABI

@@ -502,7 +502,9 @@ int32_t talos_node_every(TalosNode* node, int64_t period_ns, TalosCallback fn,
 
 int32_t talos_node_set_update(TalosNode* node, TalosCallback fn, void* user) {
   return Guard<int32_t>(TALOS_ERR, [&] {
-    NodeAccess::set_update(AsNode(node), Callback(fn, user, "update"));
+    talos::Node& target = AsNode(node);
+    NodeAccess::set_update(target, Callback(fn, user, "update"));
+    NodeAccess::mark_abi_update(target);
     return TALOS_OK;
   });
 }

@@ -96,6 +96,8 @@ struct Node::Impl {
   detail::GraphSource graph;
   std::optional<std::filesystem::path> session_dir;
   bool reads_graph = false;
+  // update is a callback through the C ABI (NodeAccess::mark_abi_update).
+  bool abi_update = false;
   // A publisher on a target lane (`/<sub>/target/<source>`) is registered.
   bool writes_target_lane = false;
   // The topic add_hardware_request registered, or empty.
@@ -371,7 +373,15 @@ std::unique_ptr<Node> NodeAccess::create(NodeSetup setup) {
 void NodeAccess::set_update(Node& node, std::function<void()> update) {
   node.impl_->CheckOpen("set_update");
   node.impl_->update = std::move(update);
+  node.impl_->abi_update = false;
 }
+
+void NodeAccess::mark_abi_update(Node& node) {
+  node.impl_->CheckOpen("mark_abi_update");
+  node.impl_->abi_update = true;
+}
+
+bool NodeAccess::abi_update(const Node& node) { return node.impl_->abi_update; }
 
 void NodeAccess::start(Node& node) {
   Node::Impl& impl = *node.impl_;
@@ -1299,6 +1309,7 @@ introspect::Description DescribeNode(
     description.sources.push_back(std::move(source));
   }
   description.reads_graph = NodeAccess::reads_graph(node);
+  description.abi_update = NodeAccess::abi_update(node);
   description.params = NodeAccess::params_read(node);
   return description;
 }

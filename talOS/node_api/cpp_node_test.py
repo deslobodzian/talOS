@@ -4,10 +4,12 @@ Python drives, not in a private copy of their own."""
 
 import ctypes
 import ctypes.util
+import json
 import os
 import shutil
 import subprocess
 import sys
+import textwrap
 import unittest
 
 from python.runfiles import runfiles
@@ -125,6 +127,36 @@ class CppNodeTest(unittest.TestCase):
         child = subprocess.run([sys.executable, __file__], env=env,
                                capture_output=True, text=True, check=False)
         self.assertEqual(child.returncode, 0, child.stdout + child.stderr)
+
+    def test_describe_reports_a_hosted_update_as_cpp(self):
+        # REQ-RT-23: a hosted C++ node's update() runs no Python, so its
+        # --describe says no abi_update and the launcher's Python actuator
+        # period rule does not apply to it.
+        script = textwrap.dedent("""
+            import sys, tempfile
+            import talos
+
+            Probe = talos.cpp_node(sys.argv[1], "probe")
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write("[robot]\\nperiod_us = 5000\\n"
+                             "command_timeout_us = 100000\\n"
+                             "[subsystems.probe]\\n")
+                config.flush()
+                sys.exit(talos.run(Probe, "probe", "//talOS/node_api:probe",
+                                   ["probe", "--describe", "--config",
+                                    config.name]))
+        """)
+        files = runfiles.Create()
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path))
+        result = subprocess.run(
+            [sys.executable, "-c", script,
+             files.Rlocation(os.environ["TALOS_PROBE_LIB"])],
+            env=env, capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        described = json.loads(result.stdout[result.stdout.index("{"):])
+        # The probe's update() is installed: its tick timer is declared.
+        self.assertIn("TIMER", [s["kind"] for s in described["sources"]])
+        self.assertFalse(described["abi_update"])
 
 
 if __name__ == "__main__":

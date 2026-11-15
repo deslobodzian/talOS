@@ -1,7 +1,8 @@
 #pragma once
 
 // Phase one of a launch: every roster member's --describe probe, the graph
-// they declare, its lint (LintGraph plus the parameter checks), the session's
+// they declare, its lint (LintGraph plus the parameter and Python period
+// checks), the session's
 // topic segments, and the declared graph's record on disk.
 
 #include <chrono>
@@ -92,6 +93,22 @@ std::vector<naming::Diagnostic> LintParameterKeys(
     const config::RobotConfig& robot_config,
     const std::vector<NodeDescription>& described,
     const std::string& config_path = {});
+
+// The shortest period_us of a Python node that owns actuators
+// (docs/METHODOLOGY.md §10): a Python update() carries the interpreter's and
+// its garbage collector's jitter, which a faster actuator loop cannot absorb.
+inline constexpr std::int64_t kMinPythonActuatorPeriodUs = 20000;
+
+// One error per subsystem whose own node answered --describe with its
+// update() through the C ABI (introspect::Description::abi_update: a Python
+// node; a talos.cpp_node, whose update() is C++, is not one), whose devices
+// own a motor, digital output or PWM output (hardware::Devices::
+// owns_actuators), and whose period_us (its own, else [robot] period_us) is
+// below kMinPythonActuatorPeriodUs, naming the subsystem, its period_us, the
+// minimum and the fix.
+std::vector<naming::Diagnostic> LintPythonActuatorPeriods(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described);
 
 // Where the launcher writes the declared graph that graph-reading nodes get
 // as `--graph` (introspect::DeclaredGraph): beside graph.json in the session

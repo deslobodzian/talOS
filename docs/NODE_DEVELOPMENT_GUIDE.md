@@ -242,6 +242,14 @@ built before the freeze and dropped afterwards is never collected, so drop
 construction-time scratch inside the constructor. `talos.testing.Sim` does
 not freeze.
 
+Even frozen, the interpreter and the young-generation collections add jitter
+to each tick, so a Python node whose own subsystem owns a motor, digital
+output or PWM output runs at `period_us` 20000 or slower: the launcher refuses
+a faster one ([Python actuator periods](../talOS/launcher/README.md#python-actuator-periods)).
+A faster actuator loop is written in C++, or as a C++ class wrapped with
+`talos.cpp_node` ([C++ nodes hosted from Python](#c-nodes-hosted-from-python)),
+whose `update()` runs no Python.
+
 ## Hardware
 
 Handles are named by their device key in the subsystem config
