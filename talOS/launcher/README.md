@@ -1326,6 +1326,8 @@ bazel run //talOS/launcher:session_report -- --strict /tmp/logs/session
 bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 ```
 
+A repository that depends on talOS runs `@talos//talOS/launcher:session_report`.
+
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
 identity and source revision, node exits/restarts/quarantine/recorder
