@@ -37,6 +37,11 @@ constexpr size_t BytesPerPixel(PixelFormat format) {
   return 1;
 }
 
+// The capture formats' sizes are what the sources' stride checks rest on.
+static_assert(BytesPerPixel(PixelFormat::kGray8) == 1);
+static_assert(BytesPerPixel(PixelFormat::kYuyv) == 2);
+static_assert(BytesPerPixel(PixelFormat::kBgra8) == 4);
+
 constexpr std::string_view PixelFormatToString(PixelFormat format) {
   switch (format) {
     case PixelFormat::kGray8:
