@@ -6,6 +6,7 @@ load(
     "TALOS_TOPIC_ABBREVIATIONS",
     "TALOS_TOPIC_DIRECTION_SUFFIXES",
     "TALOS_TOPIC_ROLES",
+    "talos_sim",
     "talos_topic_problem",
 )
 
@@ -13,7 +14,71 @@ exports_files([
     "contract.bzl",
     # The runner talos_graph_test and talos_sim run.
     "launcher_runner.py",
+    # The check talos_sim_test runs.
+    "sim_check.py",
 ])
+
+# Unlinks the test namespace's live registry after talos_sim_test's session
+# (sim_check.py).
+cc_binary(
+    name = "registry_unlink",
+    srcs = ["registry_unlink.cc"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
+    ],
+)
+
+# integration (REQ-DEV-30): a launch still running at its bound leaves no
+# process of its session, in its process group or another.
+py_test(
+    name = "sim_check_hang_test",
+    size = "small",
+    srcs = [
+        "sim_check.py",
+        "sim_check_hang_test.py",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
+# The session sim_check_no_state_test judges: telemetry beside the bridge
+# and a simulator that sends its State to the wrong port.
+talos_sim(
+    name = "no_state_sim",
+    testonly = True,
+    config = "//talOS/build/testdata/sim_check:robot.toml",
+    data = ["//talOS/build/testdata/sim_check:sim_gateway"],
+    nodes = ["//talOS/telemetry:node"],
+)
+
+# e2e (REQ-DEV-30): sim_check fails a session whose bridge never received a
+# State, naming the controller link, where every member ran once and
+# exited 0.
+py_test(
+    name = "sim_check_no_state_test",
+    size = "medium",
+    timeout = "short",
+    srcs = [
+        "sim_check.py",
+        "sim_check_no_state_test.py",
+    ],
+    data = [
+        ":no_state_sim",
+        ":registry_unlink",
+        "//talOS/launcher:log_dump",
+        "//talOS/launcher:session_report",
+    ],
+    env = {
+        "LOG_DUMP": "$(rlocationpath //talOS/launcher:log_dump)",
+        "REGISTRY_UNLINK": "$(rlocationpath :registry_unlink)",
+        "SIM": "$(rlocationpath :no_state_sim)",
+    },
+    legacy_create_init = False,
+    tags = ["e2e"],
+    deps = ["@rules_python//python/runfiles"],
+)
 
 # talos_bundle's assembly step, run in the exec configuration's hermetic
 # Python.

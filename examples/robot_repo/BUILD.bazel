@@ -1,5 +1,4 @@
-load("@rules_python//python:defs.bzl", "py_test")
-load("@talos//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test", "talos_sim")
+load("@talos//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test", "talos_sim", "talos_sim_test")
 load("@talos//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
 
@@ -43,20 +42,11 @@ talos_sim(
     nodes = NODES,
 )
 
-# e2e: `bazel run //:sim -- --duration-s 3` on free loopback ports, every
-# member running and exiting 0. Takes 3 s of real time (the simulator has no
-# faster-than-real-time mode) plus startup.
-py_test(
+# e2e: the robot runs against the simulator for 3 s on free loopback ports:
+# every member runs once and exits 0, and the bridge receives State from
+# the simulator (talos_sim_test, talOS/build/contract.bzl). Takes 3 s of
+# real time (the simulator has no faster-than-real-time mode) plus startup.
+talos_sim_test(
     name = "sim_smoke_test",
-    size = "medium",
-    timeout = "short",
-    srcs = ["sim_smoke_test.py"],
-    data = [":sim"],
-    env = {"SIM": "$(rlocationpath :sim)"},
-    legacy_create_init = False,
-    tags = [
-        "e2e",
-        "exclusive",
-    ],
-    deps = ["@rules_python//python/runfiles"],
+    sim = ":sim",
 )
