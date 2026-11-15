@@ -19,12 +19,16 @@
 // TimedRobot brings a mode-callback framework, a Notifier, the command
 // scheduler hooks and LiveWindow with it, none of which this program uses.
 // What the Driver Station needs from robot code is narrow: say the program
-// has started, and report the mode the program is running in on every
-// iteration, which the Driver Station displays. That is what StartCompetition
-// does, and nothing more. Whether the Driver Station or the RoboRIO disables
-// the robot when those reports stop is not established (docs/BENCH.md, loop
-// stall check), and nothing relies on it: if this loop stops ticking with a
-// command in force, LoopWatchdog neutralizes the outputs.
+// has started, and report the mode the program is running in, which the
+// Driver Station displays. StartCompetition says the first, and its Driver
+// Station reader thread (DriverStationReader.h) reports the mode after each
+// refresh of the Driver Station data (on each Driver Station packet, or 20 ms
+// after the previous refresh without one), while this loop
+// has ticked within the last 20 ms; nothing more. Whether the Driver Station
+// or the RoboRIO disables the robot when those reports stop is not
+// established (docs/BENCH.md, loop stall check), and nothing relies on it: if
+// this loop stops ticking with a command in force, LoopWatchdog neutralizes
+// the outputs.
 class Robot : public frc::RobotBase {
  public:
   void StartCompetition() override;

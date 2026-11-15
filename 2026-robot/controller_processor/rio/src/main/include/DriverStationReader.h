@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -15,14 +16,18 @@
 
 namespace talos::driver_station {
 
-// The Driver Station packet the gateway sends, from WPILib's cache (no
-// NetComm call: every getter it uses copies the HAL's cache under the HAL's
-// own mutex), with `flags` (DsFlags) as its flags: the loop passes the flags
-// it decided this tick (rio::DriverStationReader::Read), so the packet and
-// the loop's ModeTracker never see two different modes in one tick.
-DriverStationData SampleDriverStation(uint64_t now_us, uint32_t flags);
+// Fills `out` with what WPILib's HAL cache holds now: the control word as
+// flags (DsFlags), alliance and station, match information and time, and
+// every joystick's axes, buttons, POVs and name. HAL getters only (each a
+// copy under the HAL's own mutex, the joysticks in one,
+// HAL_GetAllJoystickData): no NetComm call and no WPILib warning. The cache
+// changes only on a refresh (HAL_RefreshDSData), so called on the thread that
+// refreshes, between two of its refreshes, every field comes from the same one.
+// `sample_time_us`, `mode_since_us` and `boot_id` are left 0.
+void SnapshotDriverStation(DriverStationData& out);
 
-// The same, with the flags of the control word WPILib's cache holds now.
+// SnapshotDriverStation stamped with `now_us`: a desktop test's view of the
+// packet after its own refresh.
 DriverStationData SampleDriverStation(uint64_t now_us);
 
 }  // namespace talos::driver_station
@@ -55,40 +60,59 @@ constexpr ProgramMode ProgramModeOf(uint32_t flags) {
 // never refreshes: a helper thread (talos-ds) waits for a new Driver Station
 // packet or kWaitTimeoutUs, whichever comes first (`wait`; WPILib's new-data
 // event, which NetComm's own thread sets on each packet), refreshes WPILib's
-// cache and reads its control word (`refresh`, returning DsFlags), and
-// publishes the flags with the refresh's completion time on the loop's clock
-// in one atomic word. Then, only while the loop has called Read within
-// kLoopTickWindowUs, it reports the program's mode for those flags
-// (`observe`, also a NetComm call), so a stalled loop stops the reports as
-// it did when the loop made them.
+// cache and snapshots all of it (`refresh`), and publishes the snapshot with
+// the refresh's completion time on the loop's clock. Then, only while the
+// loop has called Read within kLoopTickWindowUs, it reports the program's
+// mode for the snapshot's flags (`observe`, also a NetComm call), so a
+// stalled loop stops the reports as it did when the loop made them.
 //
 // The loop calls Read once per tick: it records the tick and returns the
-// last refresh's flags, or 0 (no Driver Station, so no mode and disabled)
-// when none has completed within `stale_us` (the gateway's
-// command_timeout_us). A refresh that does not return, a wedged daemon,
-// therefore disables the gateway within command_timeout_us plus one tick of
-// the last refresh that did, and when refreshes resume the mode comes back
-// as a new mode generation (driver_station::ModeTracker sees the flags go
-// through 0). Read never waits, locks or calls into WPILib.
+// latest published snapshot, or a neutral one (DriverStationData{}: flags 0,
+// so no Driver Station, no mode and disabled; every joystick disconnected,
+// no axis, button or POV) when none has completed within `stale_us` (the
+// gateway's command_timeout_us). A refresh that does not return, a wedged
+// daemon, therefore disables the gateway within command_timeout_us plus one
+// tick of the last refresh that did, and when refreshes resume the mode comes
+// back as a new mode generation (driver_station::ModeTracker sees the flags go
+// through 0). Read never waits, locks or calls into WPILib: one atomic load,
+// and one atomic exchange when a new snapshot is there.
+//
+// Consistency. Each snapshot the loop gets is one refresh's, whole: its flags,
+// alliance, station, match fields, match time and every joystick come from the
+// same HAL_RefreshDSData, because only talos-ds refreshes in this program and
+// it snapshots before its next refresh; and the loop only ever reads a
+// snapshot the helper has finished and no longer writes (a triple buffer: the
+// helper fills its own slot and swaps it in with one atomic exchange, the loop
+// swaps out the newest with another). Within that refresh the joysticks are
+// one Driver Station packet's (HAL_GetAllJoystickData), the control word the
+// same packet's unless NetComm reports the Driver Station detached (then 0),
+// and the match information and joystick names the latest the HAL had
+// received by that refresh. Successive Reads return snapshots in the order
+// they were published, possibly skipping some, never an older one after a
+// newer. The packet the loop sends at a tick is the snapshot it read at that
+// tick's start, so the packet's flags are the flags that tick's gateway
+// enable and ModeTracker used.
 //
 // Stop (also the destructor) wakes the helper and waits for it to exit for
 // at most `stop_bound`. A helper still inside a NetComm call by then is
 // abandoned: detached, `report` gets one line, and Stop returns. Everything
 // an abandoned helper can still touch (the calls, the clock, the published
-// word) is shared with it (std::shared_ptr), never the reader itself, and it
-// neither publishes nor reports a mode after Stop has begun. Start runs the
-// helper once; a stopped reader is not restarted.
+// snapshots) is shared with it (std::shared_ptr), never the reader itself.
+// The helper checks the stop flag after each call it makes and then
+// publishes nothing more and reports no mode; a publication or report it
+// had already decided on when Stop set the flag still completes. Start runs
+// the helper once; a stopped reader is not restarted.
 class DriverStationReader {
  public:
   // What the helper calls. `wait` returns on a new Driver Station packet or
   // after at most kWaitTimeoutUs; `wake` makes the pending or next `wait`
   // return at once (called by Stop, from another thread); `refresh` updates
-  // WPILib's cache and returns its control word as DsFlags; `observe`
-  // reports the program's mode. `refresh` and `observe` may block.
+  // WPILib's cache and fills `out` with all of it (SnapshotDriverStation);
+  // `observe` reports the program's mode. `refresh` and `observe` may block.
   struct Calls {
     std::function<void()> wait;
     std::function<void()> wake;
-    std::function<uint32_t()> refresh;
+    std::function<void(driver_station::DriverStationData& out)> refresh;
     std::function<void(ProgramMode)> observe;
   };
   // Microseconds on the loop's clock (steady_clock).
@@ -116,36 +140,47 @@ class DriverStationReader {
 
   // WPILib's calls: the HAL's new-data event (HAL_ProvideNewDataEventHandle)
   // waited on with kWaitTimeoutUs, frc::DriverStation::RefreshData then
-  // HAL_GetControlWord, and HAL_ObserveUserProgram*.
+  // SnapshotDriverStation, and HAL_ObserveUserProgram*.
   static Calls WpilibCalls();
 
   // Starts the helper, named talos-ds. `realtime_priority` 1-99 puts it on
   // SCHED_FIFO at that priority (SCHED_RESET_ON_FORK, so a thread it starts
   // does not inherit it) on Linux, and it reports what the kernel holds; 0
   // keeps the starter's scheduling. A helper that cannot be created is
-  // reported, and Read then returns 0 for good.
+  // reported, and Read then returns the neutral snapshot for good.
   void Start(int realtime_priority);
   void Stop();
 
   // The loop thread, once per tick at `now_us` (the clock's): see the class
-  // comment.
-  uint32_t Read(uint64_t now_us, uint64_t stale_us);
+  // comment. The reference stays valid, and unchanged, until the next Read.
+  const driver_station::DriverStationData& Read(uint64_t now_us,
+                                                uint64_t stale_us);
 
  private:
-  // No refresh completed yet / no Read yet.
+  // No Read yet.
   static constexpr uint64_t kNever = std::numeric_limits<uint64_t>::max();
-  // A refresh's flags (every DsFlags bit fits) below its completion time.
-  static constexpr unsigned kFlagBits = 8;
+  // The middle slot's index, and the bit that says the helper has put a
+  // snapshot there the loop has not taken.
+  static constexpr uint8_t kIndexMask = 0x3;
+  static constexpr uint8_t kFresh = 0x4;
+
+  struct Snapshot {
+    bool refreshed{false};
+    uint64_t refreshed_us{0};
+    driver_station::DriverStationData data{};
+  };
 
   struct Shared {
     Calls calls;
     Clock clock;
     Report report;
     int realtime_priority{0};
-    // (completion time << kFlagBits) | flags of the last refresh, or kNever:
-    // one word, so the loop never pairs one refresh's flags with another's
-    // time.
-    std::atomic<uint64_t> refreshed{kNever};
+    // The triple buffer. The helper owns one slot (it starts with 0), the
+    // loop one (front_, 2), and `middle` names the third, with kFresh while
+    // it holds a snapshot the loop has not taken. Each side writes or reads
+    // only the slot it owns; the exchanges on `middle` hand slots over.
+    std::array<Snapshot, 3> slots{};
+    std::atomic<uint8_t> middle{1};
     // The loop's last Read time, or kNever.
     std::atomic<uint64_t> tick_us{kNever};
     std::atomic<bool> stop{false};
@@ -159,6 +194,8 @@ class DriverStationReader {
 
   const std::shared_ptr<Shared> shared_;
   const std::chrono::microseconds stop_bound_;
+  // The loop's slot.
+  uint8_t front_{2};
   std::thread thread_;
 };
 
