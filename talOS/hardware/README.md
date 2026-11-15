@@ -270,15 +270,22 @@ and identified motor/sensor samples. Motor samples contain mechanism
 position/velocity, voltage, stator and supply current, temperature, and the
 Phoenix fault bitfield. State also carries valid power/CAN health (battery
 volts, brownout, and the CAN utilization fraction of the busiest configured
-bus) and per-boot gateway safety counters. The busiest configured bus is the
-RoboRIO's own bus or any CANivore a configured motor or sensor is on. A
-CANivore's status read blocks about 1 ms, so a helper thread
+bus still read) and per-boot gateway safety counters. The configured buses
+are the RoboRIO's own bus and any CANivore a configured motor or sensor is
+on. A CANivore's status read blocks about 1 ms, so a reader thread
 (`talos-canbus`, `SCHED_OTHER`, started only for a configuration with a
 CANivore and never in simulation) reads one CANivore every 100 ms, the buses
 in turn, and the loop only copies the figures it published. A CANivore whose
 last read failed, or whose last read is three of its own sampling periods
 old on the loop's clock (300 ms with one CANivore), drops out of the
-maximum, with a console line, until it reads again
+maximum until it reads again. The figure then covers only the buses still
+read, and with every CANivore out it is the RoboRIO bus's alone, 0 when
+nothing is on that bus: `/hw/status` cannot tell an idle CANivore from a
+dead one, and the only sign is the RoboRIO console line printed when each
+bus drops out and returns. A new configuration (or the backend's
+destruction) waits at most 50 ms for the reader to stop; a reader stuck in a
+status read that never returns is abandoned with a console line naming the
+bus, and while two abandoned readers are still blocked no new one starts
 ([`CanBusHealth.h`](../../2026-robot/controller_processor/rio/src/main/include/CanBusHealth.h)).
 Peers of another protocol version (`kProtocolVersion`, see
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)) are rejected rather than decoded.
@@ -522,7 +529,7 @@ That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, late-feedback, apply
 and neutral send transitions, device resets, brownout, a CANivore leaving
-and rejoining CAN utilization) to `RioLog`
+and rejoining CAN utilization, an abandoned CANivore reader) to `RioLog`
 (`src/main/include/RioLog.h`): a preallocated 256-event queue that never
 waits, dropping and counting events when full. A logger thread at nice 19
 (Linux) writes them to stderr, at most one line per second for each kind and

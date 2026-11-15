@@ -3,8 +3,10 @@
 // status read blocks about 1 ms, so a sampler thread makes it and the 5 ms
 // loop only copies what it published; a failed or stale read never passes for
 // a healthy bus, a configuration change never mixes the old buses' reads into
-// the new set, and nothing reads a CANivore for a configuration or a
-// simulation that has none.
+// the new set, a read that never returns blocks neither a configuration nor
+// destruction, and nothing reads a CANivore for a configuration or a
+// simulation that has none. The CanBusSampler tests run real threads and
+// wait on their reads (TESTING.md §6.3).
 #include "CanBusHealth.h"
 
 #include <gtest/gtest.h>
@@ -17,6 +19,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -266,39 +269,83 @@ TEST(CanBusHealth, AReadInFlightAcrossAConfigurationPublishesNothing) {
   EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + kPeriodUs, 0.05), 0.2);
 }
 
-// Records each read the sampler thread makes, for the test to wait on.
-struct Recorder {
+// The reader threads' reads, for a test to steer and wait on. A bus's reads
+// return at once while it has `free_reads` left, then block until the test
+// releases that bus: a vendor call that does not return, until it does.
+// Shared (std::shared_ptr) with the read function, so a reader the sampler
+// abandoned keeps it alive. Every wait is on a read, never on time; the 10 s
+// bound only fails a test that would otherwise hang (TESTING.md §6.3).
+struct Gate {
   std::mutex mutex;
-  std::condition_variable read;
+  std::condition_variable changed;
   std::vector<std::string> reads;
+  std::vector<std::string> blocked;
+  std::map<std::string, int, std::less<>> free_reads;
+  std::map<std::string, double, std::less<>> frac;
+  std::vector<std::string> released;
 
-  // Waits (on reads, not on time; the bound only fails the test) until
-  // `count` reads of `bus` were made.
-  bool WaitFor(std::string_view bus, std::ptrdiff_t count) {
+  CanBusHealth::Sample Read(std::string_view bus) {
     std::unique_lock lock{mutex};
-    return read.wait_for(lock, std::chrono::seconds{10}, [&] {
-      return std::count(reads.begin(), reads.end(), bus) >= count;
-    });
+    reads.emplace_back(bus);
+    const auto free = free_reads.find(bus);
+    if (free != free_reads.end() && free->second > 0) {
+      --free->second;
+    } else {
+      blocked.emplace_back(bus);
+      changed.notify_all();
+      changed.wait(lock, [&] { return Count(released, bus) > 0; });
+      blocked.erase(std::find(blocked.begin(), blocked.end(), bus));
+    }
+    changed.notify_all();
+    const auto it = frac.find(bus);
+    return {true, it == frac.end() ? 0.0 : it->second, "OK"};
+  }
+
+  static std::ptrdiff_t Count(const std::vector<std::string>& in,
+                              std::string_view bus) {
+    return std::count(in.begin(), in.end(), bus);
+  }
+  template <typename Predicate>
+  bool WaitUntil(Predicate predicate) {
+    std::unique_lock lock{mutex};
+    return changed.wait_for(lock, std::chrono::seconds{10}, predicate);
+  }
+  bool WaitForReads(std::string_view bus, std::ptrdiff_t count) {
+    return WaitUntil([&] { return Count(reads, bus) >= count; });
+  }
+  bool WaitBlocked(std::string_view bus) {
+    return WaitUntil([&] { return Count(blocked, bus) > 0; });
+  }
+  void Release(std::string_view bus) {
+    {
+      const std::lock_guard lock{mutex};
+      released.emplace_back(bus);
+    }
+    changed.notify_all();
   }
 };
 
+CanBusSampler::Read ReadThrough(const std::shared_ptr<Gate>& gate) {
+  return [gate](std::string_view bus) { return gate->Read(bus); };
+}
+
+constexpr auto kNeverAbandon = std::chrono::seconds{10};
+constexpr auto kAbandonAtOnce = std::chrono::microseconds{0};
+
 // The thread runs only for a configuration with a CANivore (not for one with
-// no device, REQ-CONTRACT-35), never under simulation, and a new configuration stops and joins it first: once
-// Reconfigure returns, no bus the new configuration dropped is read again.
+// no device, REQ-CONTRACT-35), never under simulation, and a new
+// configuration stops it before applying: once
+// Reconfigure returns, no read of a bus it dropped starts. (A stop bound
+// that never abandons, so a slow host cannot turn this into an abandonment.)
 // REQ-OPS-20, REQ-CONTRACT-35
 TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
   CanBusHealth health;
-  Recorder recorder;
-  CanBusSampler sampler{health,
-                        [&recorder](std::string_view bus) {
-                          {
-                            const std::lock_guard lock{recorder.mutex};
-                            recorder.reads.emplace_back(bus);
-                          }
-                          recorder.read.notify_all();
-                          return CanBusHealth::Sample{true, 0.2, "OK"};
-                        },
-                        +[] { return kStartUs; }, /*period_us=*/1'000};
+  auto gate = std::make_shared<Gate>();
+  gate->free_reads["Shooter"] = 1'000'000;
+  gate->free_reads["Arm"] = 1'000'000;
+  gate->frac["Arm"] = 0.2;
+  CanBusSampler sampler{health,  ReadThrough(gate),   +[] { return kStartUs; },
+                        nullptr, /*period_us=*/1'000, kNeverAbandon};
 
   sampler.Reconfigure(hw::Config{}, false);
   EXPECT_FALSE(sampler.running());
@@ -306,20 +353,19 @@ TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
   EXPECT_FALSE(sampler.running());
   sampler.Reconfigure(Devices({"Shooter"}, {}), /*simulation=*/true);
   EXPECT_FALSE(sampler.running());
-  EXPECT_TRUE(recorder.reads.empty());
 
   sampler.Reconfigure(Devices({"Shooter"}, {}), false);
   EXPECT_TRUE(sampler.running());
-  ASSERT_TRUE(recorder.WaitFor("Shooter", 2));
+  ASSERT_TRUE(gate->WaitForReads("Shooter", 2));
   sampler.Reconfigure(Devices({"Arm"}, {}), false);
-  ASSERT_TRUE(recorder.WaitFor("Arm", 2));
+  ASSERT_TRUE(gate->WaitForReads("Arm", 2));
   sampler.Stop();
   EXPECT_FALSE(sampler.running());
 
   // Every Shooter read, then every Arm read: none of Shooter after the first
   // of Arm.
-  const std::lock_guard lock{recorder.mutex};
-  const auto& reads = recorder.reads;
+  const std::lock_guard lock{gate->mutex};
+  const auto& reads = gate->reads;
   const auto first_arm = std::find(reads.begin(), reads.end(), "Arm");
   EXPECT_EQ(std::count(reads.begin(), first_arm, "Shooter"),
             first_arm - reads.begin());
@@ -327,6 +373,107 @@ TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
       << "a bus the new configuration dropped was read after it";
   Loop loop{health};
   EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.0), 0.2);
+}
+
+// A CANivore status read that never returns must block neither a new
+// configuration nor the backend's destruction (both run Stop, the first
+// outside the device lock the loop watchdog's neutral needs). Past the stop
+// bound (here 0, so the test waits on nothing) the reader is abandoned with
+// one console line naming the bus; the new configuration's reader reads the
+// new bus; the abandoned read's late result lands in a Board nobody reads;
+// and the reader, once its read returns, exits on its own and is counted out.
+// REQ-OPS-20
+TEST(CanBusSampler, AReadThatNeverReturnsIsAbandonedNotWaitedFor) {
+  CanBusHealth health;
+  auto gate = std::make_shared<Gate>();
+  gate->frac["Shooter"] = 0.9;
+  gate->frac["Arm"] = 0.2;
+  gate->free_reads["Arm"] = 1;
+  auto stuck = std::make_shared<CanBusSampler::StuckReaders>();
+  std::vector<std::string> lines;
+  {
+    CanBusSampler sampler{
+        health,
+        ReadThrough(gate),
+        +[] { return kStartUs; },
+        [&lines](std::string_view line) { lines.emplace_back(line); },
+        /*period_us=*/1'000,
+        kAbandonAtOnce,
+        stuck};
+    sampler.Reconfigure(Devices({"Shooter"}, {}), false);
+    ASSERT_TRUE(gate->WaitBlocked("Shooter"));
+
+    sampler.Reconfigure(Devices({"Arm"}, {}), false);
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_NE(lines[0].find("Shooter"), std::string::npos) << lines[0];
+    EXPECT_EQ(stuck->count(), 1);
+    EXPECT_TRUE(sampler.running());
+    // Arm's first read returns, its second blocks: the first is published.
+    ASSERT_TRUE(gate->WaitBlocked("Arm"));
+    Loop loop{health};
+    EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.0), 0.2);
+
+    gate->Release("Shooter");
+    ASSERT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
+    EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.0), 0.2)
+        << "the abandoned read's 0.9 reached the new configuration";
+    EXPECT_TRUE(loop.changes.empty());
+    // Destroyed with Arm's read blocked: returns, abandoning it too.
+  }
+  ASSERT_EQ(lines.size(), 2u);
+  EXPECT_NE(lines[1].find("Arm"), std::string::npos) << lines[1];
+  EXPECT_EQ(stuck->count(), 1);
+  // Let it finish, so no reader is still running when the test ends.
+  gate->Release("Arm");
+  EXPECT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
+}
+
+// A CANivore whose every read hangs must not cost a thread per new
+// configuration: with two abandoned readers still blocked, Reconfigure
+// starts none, says so once, and that configuration's CANivores go stale.
+// Once those reads return, the next configuration starts a reader again.
+// REQ-OPS-20
+TEST(CanBusSampler, StartsNoReaderWhileTwoAbandonedOnesAreStillBlocked) {
+  CanBusHealth health;
+  auto gate = std::make_shared<Gate>();
+  auto stuck = std::make_shared<CanBusSampler::StuckReaders>();
+  std::vector<std::string> lines;
+  {
+    CanBusSampler sampler{
+        health,
+        ReadThrough(gate),
+        +[] { return kStartUs; },
+        [&lines](std::string_view line) { lines.emplace_back(line); },
+        /*period_us=*/1'000,
+        kAbandonAtOnce,
+        stuck};
+    sampler.Reconfigure(Devices({"A"}, {}), false);
+    ASSERT_TRUE(gate->WaitBlocked("A"));
+    sampler.Reconfigure(Devices({"B"}, {}), false);
+    ASSERT_TRUE(gate->WaitBlocked("B"));
+    sampler.Reconfigure(Devices({"C"}, {}), false);
+    EXPECT_EQ(stuck->count(), 2);
+    EXPECT_FALSE(sampler.running()) << "a third reader started";
+    ASSERT_EQ(lines.size(), 3u) << "A abandoned, B abandoned, none started";
+    Loop loop{health};
+    loop.Poll(kStartUs, 0.0);
+    loop.Poll(kStartUs + health.StaleUs(), 0.0);
+    ASSERT_EQ(loop.changes.size(), 1u);
+    EXPECT_TRUE(loop.changes[0].stale);
+
+    gate->Release("A");
+    gate->Release("B");
+    ASSERT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
+    sampler.Reconfigure(Devices({"D"}, {}), false);
+    EXPECT_TRUE(sampler.running());
+    ASSERT_TRUE(gate->WaitBlocked("D"));
+  }
+  gate->Release("D");
+  EXPECT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
+  {
+    const std::lock_guard lock{gate->mutex};
+    EXPECT_EQ(Gate::Count(gate->reads, "C"), 0);
+  }
 }
 
 }  // namespace

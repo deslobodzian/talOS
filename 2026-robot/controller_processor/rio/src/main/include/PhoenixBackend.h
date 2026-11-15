@@ -115,7 +115,8 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // CANivores (CanBusHealth.h). Configure rebuilds both through the sampler,
   // whose thread reads the CANivores; Read polls what it published. Declared
   // before configure_, so a Configure still running finishes before the
-  // sampler joins its thread, and the sampler after the health it writes.
+  // sampler stops its reader (bounded: CanBusSampler::Stop), and the sampler
+  // after the health it reconfigures.
   talos::rio::CanBusHealth can_health_;
   talos::rio::CanBusSampler can_sampler_;
   std::vector<ctre::phoenix6::BaseStatusSignal*> signals_;

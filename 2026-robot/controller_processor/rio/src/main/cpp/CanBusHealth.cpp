@@ -1,6 +1,7 @@
 #include "CanBusHealth.h"
 
-#include <chrono>
+#include <cstdio>
+#include <string>
 #include <system_error>
 #include <utility>
 
@@ -13,39 +14,9 @@
 
 namespace talos::rio {
 
-CanBusSampler::CanBusSampler(CanBusHealth& health, Read read, Clock clock,
-                             uint64_t period_us)
-    : health_{health},
-      read_{std::move(read)},
-      clock_{clock},
-      period_us_{period_us} {}
-
-CanBusSampler::~CanBusSampler() { Stop(); }
-
-void CanBusSampler::Reconfigure(const hardware::Config& config,
-                                bool simulation) {
-  Stop();
-  health_.Configure(config, simulation);
-  if (health_.bus_count() == 0) return;
-  stop_ = false;
-  try {
-    thread_ = std::thread([this] { Run(); });
-  } catch (const std::system_error&) {
-    // No reads: Poll reports every bus stale (see the header).
-  }
-}
-
-void CanBusSampler::Stop() {
-  if (!thread_.joinable()) return;
-  {
-    const std::lock_guard lock{mutex_};
-    stop_ = true;
-  }
-  wake_.notify_one();
-  thread_.join();
-}
-
-void CanBusSampler::Run() {
+void CanBusSampler::Run(const std::shared_ptr<CanBusHealth::Board>& board,
+                        const Read& read, Clock clock, uint64_t period_us,
+                        const std::shared_ptr<StuckReaders>& stuck) {
 #ifdef __linux__
   pthread_setname_np(pthread_self(), "talos-canbus");
   const sched_param param{};
@@ -53,14 +24,117 @@ void CanBusSampler::Run() {
 #elif defined(__APPLE__)
   pthread_setname_np("talos-canbus");
 #endif
-  std::unique_lock lock{mutex_};
-  while (!stop_) {
-    lock.unlock();
-    health_.SampleNext(clock_(), read_);
-    lock.lock();
-    wake_.wait_for(lock, std::chrono::microseconds{period_us_},
-                   [this] { return stop_; });
+  const std::chrono::microseconds period{period_us};
+  while (board->SampleNext(clock(), read) && board->WaitPeriod(period)) {
   }
+  if (board->Exit()) stuck->Exited();
+}
+
+CanBusSampler::CanBusSampler(CanBusHealth& health, Read read, Clock clock,
+                             Report report, uint64_t period_us,
+                             std::chrono::microseconds stop_bound,
+                             std::shared_ptr<StuckReaders> stuck)
+    : health_{health},
+      read_{std::move(read)},
+      clock_{clock},
+      report_{std::move(report)},
+      period_us_{period_us},
+      stop_bound_{stop_bound},
+      stuck_{std::move(stuck)} {}
+
+CanBusSampler::~CanBusSampler() {
+  Stop();
+  for (auto& slot : abandoned_) {
+    if (!slot.thread.joinable()) continue;
+    // One that has exited is past its last use of anything shared; one still
+    // blocked owns what it touches (see the header).
+    if (slot.board->exited()) {
+      slot.thread.join();
+    } else {
+      slot.thread.detach();
+    }
+  }
+}
+
+void CanBusSampler::Reap() {
+  for (auto& slot : abandoned_) {
+    if (slot.thread.joinable() && slot.board->exited()) {
+      slot.thread.join();
+      slot.board.reset();
+    }
+  }
+}
+
+void CanBusSampler::Reconfigure(const hardware::Config& config,
+                                bool simulation) {
+  Stop();
+  Reap();
+  health_.Configure(config, simulation);
+  std::shared_ptr<CanBusHealth::Board> board = health_.board();
+  if (!board) return;
+  const int stuck = stuck_->count();
+  if (stuck >= kMaxStuckReaders) {
+    char line[160];
+    std::snprintf(line, sizeof line,
+                  "[phoenix] CAN bus readers: %d abandoned readers still "
+                  "blocked in a status read; none started, so every CANivore "
+                  "leaves CAN utilization",
+                  stuck);
+    if (report_) report_(line);
+    return;
+  }
+  try {
+    thread_ = std::thread{
+        [board, read = read_, clock = clock_, period_us = period_us_,
+         stuck = stuck_] { Run(board, read, clock, period_us, stuck); }};
+    board_ = std::move(board);
+  } catch (const std::system_error&) {
+    // No reads: Poll reports every bus stale (see the header).
+  }
+}
+
+void CanBusSampler::Stop() {
+  if (!thread_.joinable()) return;
+  std::string in_flight;
+  const bool exited =
+      board_->StopAndWait(stop_bound_, [&](std::string_view bus) {
+        stuck_->Add();
+        in_flight.assign(bus);
+      });
+  if (exited) {
+    thread_.join();
+    board_.reset();
+    return;
+  }
+  Reap();
+  bool parked = false;
+  for (auto& slot : abandoned_) {
+    if (slot.thread.joinable()) continue;
+    slot.thread = std::move(thread_);
+    slot.board = std::move(board_);
+    parked = true;
+    break;
+  }
+  if (!parked) {
+    thread_.detach();
+    board_.reset();
+  }
+  const auto bound_ms = static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(stop_bound_)
+          .count());
+  char line[160];
+  if (in_flight.empty()) {
+    std::snprintf(line, sizeof line,
+                  "[phoenix] CAN bus reader did not stop within %llu ms with "
+                  "no read in flight; it was abandoned",
+                  bound_ms);
+  } else {
+    std::snprintf(line, sizeof line,
+                  "[phoenix] CAN bus %.63s status read did not return within "
+                  "%llu ms; its reader was abandoned",
+                  in_flight.c_str(), bound_ms);
+  }
+  if (report_) report_(line);
 }
 
 }  // namespace talos::rio
