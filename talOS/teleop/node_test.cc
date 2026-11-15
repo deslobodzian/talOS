@@ -656,6 +656,67 @@ TEST(TeleopNode, HeldAxisMustReturnToNeutralAfterDsLossOrDisable) {
   }
 }
 
+// kAxisToml with its axis binding's deadband_frac set to `frac`, or left out
+// when `frac` is empty.
+std::string AxisTomlWithDeadband(std::string_view frac) {
+  std::string config{kAxisToml};
+  const std::string old_line{"deadband_frac = 0.125\n"};
+  config.replace(config.find(old_line), old_line.size(),
+                 frac.empty() ? std::string{}
+                              : "deadband_frac = " + std::string{frac} + "\n");
+  return config;
+}
+
+// REQ-SAFE-13: a real stick rests a few counts off zero. With no
+// deadband_frac the binding outputs the raw axis, but arming still counts the
+// axis neutral inside kArmingNeutralFloorFrac, so the lane goes active at rest
+// (and its first command is under the floor's share of scale) instead of
+// never arming.
+TEST(TeleopNode, AxisWithoutDeadbandArmsWhenRestingOffZero) {
+  Sim sim = MakeSim(AxisTomlWithDeadband(""));
+  auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+  sim.add<Teleop>("teleop");
+  SimHardware hw{sim};
+  hw.enable();
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.01f)));
+  Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.01f)));
+  ASSERT_TRUE(arm.seen) << "axis 0 resting at 0.01, no deadband_frac: the "
+                           "teleop lane never armed";
+  EXPECT_NEAR(arm.seen->velocity_rps(), 0.01 * 10.0, 1e-6);
+  EXPECT_LE(std::abs(arm.seen->velocity_rps()), kArmingNeutralFloorFrac * 10.0);
+}
+
+// REQ-SAFE-14: after a disable with the axis held, the lane rearms only once
+// the axis returns inside the wider of its deadband_frac and
+// kArmingNeutralFloorFrac (0.05); the floor never narrows a wider deadband.
+TEST(TeleopNode, HeldAxisRearmsInsideTheWiderOfDeadbandAndFloor) {
+  struct Row {
+    const char* deadband;
+    float rest;
+    bool arms;
+  };
+  constexpr std::uint32_t kTeleopDisabled = ds::kTeleop | ds::kDsAttached;
+  for (const Row& row : {Row{"", 0.04f, true}, Row{"", 0.06f, false},
+                         Row{"0.2", 0.15f, true}, Row{"0.2", 0.25f, false}}) {
+    SCOPED_TRACE(std::string{"deadband_frac '"} + row.deadband +
+                 "', axis returns to " + std::to_string(row.rest));
+    Sim sim = MakeSim(AxisTomlWithDeadband(row.deadband));
+    auto& arm = sim.add<ConsumerNode<control::VelocityTarget>>("arm");
+    sim.add<Teleop>("teleop");
+    SimHardware hw{sim};
+    hw.enable();
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick()));
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
+    ASSERT_TRUE(arm.seen);
+    Push(hw, sim, DsPacket(kTeleopDisabled, MakeStick(0.5f)));
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
+    EXPECT_FALSE(arm.seen) << "held at 0.5 through a disable";
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(row.rest)));
+    Push(hw, sim, DsPacket(kTeleopEnabled, MakeStick(0.5f)));
+    EXPECT_EQ(arm.seen.has_value(), row.arms);
+  }
+}
+
 struct PausableTeleop {
   explicit PausableTeleop(talos::Node& node) : teleop{node} {}
   void update() {

@@ -42,8 +42,9 @@ Button and POV triggers require exactly one non-empty scalar assignment table:
 `while_held` or `on_toggle`. Values are checked against the target's reflected
 schema, including numeric types, booleans and enum labels; nested struct fields
 use slash-separated paths ([field paths](../schema/README.md)). Axis triggers instead require a floating-point `field`
-and `scale`, with optional `deadband_frac` in [0, 1), and reject action tables
-and `pov_index`.
+and `scale`, with optional `deadband_frac` in [0, 1) (default 0: the raw axis;
+it also widens the band the axis must return to before rearming, below), and
+reject action tables and `pov_index`.
 
 Numeric assignments must be finite and representable by their destination
 fields. A nonfinite axis input or an axis output outside its destination field's
@@ -68,7 +69,10 @@ outside teleop, in every new Driver Station mode generation or gateway boot
 after a bound joystick reconnects, and after the node's own evaluations stall
 for at least `command_timeout_us`. While
 rearming it publishes no active target until every connected bound input is
-neutral (axes inside their deadband, buttons and POVs released) for one
-evaluation. A bound POV must centre even if held in a different direction than
+neutral for one evaluation: buttons and POVs released, and each axis finite
+and inside the wider of its `deadband_frac` and 0.05
+(`kArmingNeutralFloorFrac`, `deadband.h`). The floor lets a stick resting a few
+counts off zero arm a binding with no deadband; such a binding still outputs
+the raw axis, so its first command after arming is under 5 % of `scale`. A bound POV must centre even if held in a different direction than
 its binding. Edge history is seeded from that snapshot, so a button held through
 a restart neither commands nor flips a toggle.

@@ -471,7 +471,9 @@ Button and POV bindings require exactly one nonempty scalar table:
 rising edge and resets on disable, leaving teleop or joystick disconnect.
 While held, toggled on or deflected past deadband, `teleop` publishes active
 targets with the bound fields encoded; released or in neutral, it calls
-`release()`.
+`release()`. After a disable or any other disarm it publishes nothing until
+every bound input returns to neutral, an axis inside the wider of its
+`deadband_frac` and 0.05 ([rearming](../talOS/teleop/README.md)).
 
 Republish a lane every period; use `release()` when the producer has no target.
 In tests, `PublishTarget` / `sim.publish_target` stamp the newest Driver Station
