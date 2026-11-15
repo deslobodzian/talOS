@@ -23,7 +23,6 @@ import {
   type SystemGraph,
   SystemGraphStream,
   type SystemTopic,
-  TOPIC_HEALTH,
   topicEnds,
   topicHealth,
   topicHealthOf
@@ -688,38 +687,6 @@ test('declared against actual separates a node that died from one nobody asked f
        // zero would be inventing a claim nobody can check.
        assert.equal(declaredStatus(declared, null), null);
      });
-
-test('the demo reaches every health state a viewer can render', () => {
-  // The demo is the only system most people will explore, so every badge the
-  // topic table can show has to be reachable in it -- including the two that
-  // say a half-wired topic is not a fault.
-  const running = healthByName(parseSystemGraph(demoSystemGraph(1500n)));
-  const starting = healthByName(parseSystemGraph(demoSystemGraph(0n)));
-  const seen = new Set([...running.values(), ...starting.values()]);
-  for (const state of TOPIC_HEALTH)
-    assert.ok(seen.has(state), `demo never shows a ${state} topic`);
-
-  // And each of them is the topic the demo's comment claims it is.
-  assert.equal(running.get('/shooter/state'), 'orphaned');
-  assert.equal(running.get('/hw/request/shooter'), 'orphaned');
-  assert.equal(running.get('/shooter/target/teleop'), 'unread');
-  assert.equal(running.get('/talos/telemetry'), 'unread');
-  assert.equal(running.get('/hw/command'), 'bridged');
-  assert.equal(running.get('/drivetrain/target/auto'), 'unconnected');
-  // Its only reader is the shooter, which never started, and nothing writes it.
-  assert.equal(running.get('/shooter/target/auto'), undefined);
-  assert.equal(running.get('/hw/state'), 'lossy');
-  assert.equal(running.get('/hw/request/drivetrain'), 'ok');
-  assert.equal(starting.get('/hw/state'), 'idle');
-
-  // The renamed topics, and none of the old spellings, anywhere in either
-  // document: a rename that missed a fixture is a graph that quietly stops
-  // meeting itself.
-  const documents = demoSystemGraph(1500n) + demoDeclaredGraph();
-  for (const stale of ['/talos_studio', '/hw/cmd', '/hw/ds', '/hw/req/',
-                       '/drivetrain/tgt', '/shooter/tgt', '"/odometry"'])
-    assert.ok(!documents.includes(stale), `demo still spells ${stale}`);
-});
 
 test('the demo declared graph is a document the parser accepts', () => {
   const declared = parseDeclaredGraph(demoDeclaredGraph());

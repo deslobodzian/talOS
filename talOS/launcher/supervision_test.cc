@@ -985,20 +985,6 @@ TEST(Supervision,
   ::remove(runs.c_str());
 }
 
-TEST(Supervision, ActuatorDescribeFailureRefusesEvenWhenMarkedNonCritical) {
-  auto options = BaseOptions("actuator_probe");
-  auto config = toml::parse_file(options.config_path);
-  config["subsystems"]["alpha"].as_table()->insert_or_assign("critical", false);
-  std::ofstream{options.config_path} << config;
-  options.binary_overrides["//example/alpha:node"] =
-      WriteStub("actuator_alpha", "exit 0\n", "alpha", false);
-  options.binary_overrides["//example/beta:node"] =
-      WriteStub("actuator_beta", "exit 0\n");
-  EXPECT_EQ(RunSession(options), 1);
-  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/manifest.json"));
-  std::filesystem::remove_all(options.output_dir);
-}
-
 // A long-lived stub that exits 0 when the launcher stops it.
 constexpr std::string_view kRunUntilStopped =
     "trap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";

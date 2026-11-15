@@ -11,7 +11,7 @@ import type {Snapshot} from '../src/core';
 import {createStaticStudio, type Studio, StudioProvider} from '../src/data/studio';
 import {subsystemsPanel} from '../src/panels/subsystems';
 import {pairTargets} from '../src/panels/subsystems/pairing';
-import {channelDisplayName, channelLeaf} from '../src/ui/channel';
+import {channelDisplayName} from '../src/ui/channel';
 import type {
   SourceKind,
   SystemGraph,
@@ -70,11 +70,8 @@ test('pairTargets does not pair unrelated channels', () => {
   assert.deepEqual(pairTargets([{name: 'x/state/target', unit: 'rps'}]), []);
 });
 
-test('channelLeaf and channelDisplayName strip owner/role prefixes', () => {
-  assert.equal(channelLeaf('shooter/state/target_velocity_rps'),
-               'target_velocity_rps');
-  assert.equal(channelDisplayName('shooter/state/flywheel_velocity_rps'),
-               'flywheel_velocity_rps');
+test('channelDisplayName keeps the nested field path after owner/role', () => {
+  // module0/distance_m and module1/distance_m must not both read distance_m.
   assert.equal(channelDisplayName('drivetrain/state/module0/distance_m'),
                'module0/distance_m');
 });

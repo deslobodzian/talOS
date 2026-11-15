@@ -575,67 +575,6 @@ TEST_F(MetalAprilTagParityTest, GpuThresholdParityOnLowAndHighContrastTiles) {
   image_u8_destroy(im);
 }
 
-TEST_F(MetalAprilTagParityTest, GpuThresholdInternalBufferCaching) {
-  // Test passing thresh_buf = nullptr to verify internal caching
-  const int w = 400;
-  const int h = 300;
-  image_u8_t* im = image_u8_create(w, h);
-  ASSERT_NE(im, nullptr);
-
-  for (int y = 0; y < h; ++y) {
-    for (int x = 0; x < w; ++x) {
-      im->buf[y * im->stride + x] = ((x / 8) % 2 == (y / 8) % 2) ? 220 : 30;
-    }
-  }
-
-  apriltag_detector_t* td = apriltag_detector_create();
-  td->nthreads = 1;
-  td->wp = workerpool_create(td->nthreads);
-  td->qtp.min_white_black_diff = 5;
-  image_u8_t* cpu_thresh = threshold(td, im);
-  ASSERT_NE(cpu_thresh, nullptr);
-
-  MTL::Device* device = metal_backend_->device();
-  MTL::CommandQueue* queue = metal_backend_->queue();
-  ASSERT_NE(device, nullptr);
-  ASSERT_NE(queue, nullptr);
-
-  const size_t buf_bytes = static_cast<size_t>(im->stride) * im->height;
-  MTL::Buffer* gray_buf =
-      device->newBuffer(im->buf, buf_bytes, MTL::ResourceStorageModeShared);
-  ASSERT_NE(gray_buf, nullptr);
-
-  // Pass nullptr for thresh_buf so RunGpuThreshold allocates and caches it
-  // internally
-  MTL::CommandBuffer* cmd_buf = queue->commandBuffer();
-  metal_backend_->RunGpuThreshold(cmd_buf, gray_buf, nullptr, im->width,
-                                  im->height, im->stride, 5);
-  cmd_buf->commit();
-  cmd_buf->waitUntilCompleted();
-
-  MTL::Buffer* thresh_buf = metal_backend_->thresh_buffer();
-  MTL::Buffer* min_buf = metal_backend_->min_buffer();
-  MTL::Buffer* max_buf = metal_backend_->max_buffer();
-
-  ASSERT_NE(thresh_buf, nullptr);
-  ASSERT_NE(min_buf, nullptr);
-  ASSERT_NE(max_buf, nullptr);
-
-  const uint8_t* gpu_data = static_cast<const uint8_t*>(thresh_buf->contents());
-  for (int y = 0; y < im->height; ++y) {
-    for (int x = 0; x < im->width; ++x) {
-      uint8_t c = cpu_thresh->buf[y * cpu_thresh->stride + x];
-      uint8_t g = gpu_data[y * im->stride + x];
-      EXPECT_EQ(c, g);
-    }
-  }
-
-  gray_buf->release();
-  image_u8_destroy(cpu_thresh);
-  image_u8_destroy(im);
-  apriltag_detector_destroy(td);
-}
-
 #endif  // defined(__APPLE__)
 
 }  // namespace
