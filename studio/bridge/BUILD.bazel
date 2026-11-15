@@ -235,6 +235,23 @@ py_test(
     ],
 )
 
+# A webroot whose pages were never built: the bridge runs and its pages name
+# the build command.
+py_test(
+    name = "missing_pages_test",
+    size = "small",
+    srcs = [
+        "integration_test.py",
+        "missing_pages_test.py",
+    ],
+    data = [":studio_bridge"],
+    main = "missing_pages_test.py",
+    tags = [
+        "integration",
+        "local",
+    ],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",
