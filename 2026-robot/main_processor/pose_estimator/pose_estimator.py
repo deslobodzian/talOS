@@ -150,11 +150,10 @@ def _std_devs(node, table, prefix, defaults):
 
 def _drivetrain_period_s(node):
     """The drivetrain's period_us, the shortest interval its states'
-    readings span; without one it runs at [robot] period_us, which a node
-    cannot read, so the estimator's own period stands in."""
-    period_us = node.param_of(DRIVETRAIN, "period_us", None)
-    if period_us is None:
-        return node.period
+    readings span. Required in the drivetrain's own table: without one the
+    drivetrain runs at [robot] period_us, which a node cannot read, and the
+    estimator's own period is a different number on the robot."""
+    period_us = node.param_of(DRIVETRAIN, "period_us")
     if not (math.isfinite(period_us) and period_us > 0):
         raise ValueError(f"pose_estimator: {DRIVETRAIN} period_us must be "
                          f"positive, got {period_us}")
