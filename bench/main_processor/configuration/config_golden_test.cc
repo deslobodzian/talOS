@@ -50,7 +50,7 @@ const Device* Find(const std::vector<Device>& devices,
   return it == devices.end() ? nullptr : &*it;
 }
 
-// REQ-SAFE-26: every bench config stays uncommissioned and names the
+// Every bench config stays uncommissioned (RULES.md 4) and names the
 // bench's devices at their own bus and CAN ids, with the conservative limits
 // of its first supervised spins; an accidental id, bus, kind, limit or
 // `commissioned` change fails here before it reaches the hardware.
