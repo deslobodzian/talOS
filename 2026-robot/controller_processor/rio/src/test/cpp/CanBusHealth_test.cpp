@@ -282,10 +282,10 @@ struct Recorder {
   }
 };
 
-// The thread runs only for a configuration with a CANivore, never under
-// simulation, and a new configuration stops and joins it first: once
+// The thread runs only for a configuration with a CANivore (not for one with
+// no device, REQ-CONTRACT-35), never under simulation, and a new configuration stops and joins it first: once
 // Reconfigure returns, no bus the new configuration dropped is read again.
-// REQ-OPS-20
+// REQ-OPS-20, REQ-CONTRACT-35
 TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
   CanBusHealth health;
   Recorder recorder;
@@ -300,6 +300,8 @@ TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
                         },
                         +[] { return kStartUs; }, /*period_us=*/1'000};
 
+  sampler.Reconfigure(hw::Config{}, false);
+  EXPECT_FALSE(sampler.running());
   sampler.Reconfigure(Devices({"rio"}, {"rio"}), false);
   EXPECT_FALSE(sampler.running());
   sampler.Reconfigure(Devices({"Shooter"}, {}), /*simulation=*/true);
