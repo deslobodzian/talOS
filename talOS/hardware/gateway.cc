@@ -465,16 +465,11 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   // that sees sequence + 1 knows it missed nothing in between.
   ++state_.sequence;
   state_.sample_time_us = now;
-  // One CAN bus's slot per State, in turn; Backend::Read fills it.
-  const uint8_t buses = state_.health.can_bus_count;
-  const uint8_t bus_index =
-      buses == 0 ? 0 : static_cast<uint8_t>(state_.sequence % buses);
-  state_.health.can_bus_index = bus_index;
-  state_.health.can_bus = {};
   if (configuring_) {
     const auto status = backend_.PollConfigure();
     if (status == Backend::ConfigureStatus::kPending) {
       enabled_ = enabled;
+      PlaceCanBusSlot();
       return;
     }
     configuring_ = false;
@@ -486,6 +481,11 @@ void Gateway::Tick(uint64_t now, bool enabled) {
       backend_.Neutral();
     }
   }
+  // After the configure block: a configuration committed in this tick
+  // (CommitConfiguration) sets the count this State's slot comes from.
+  PlaceCanBusSlot();
+  const uint8_t buses = state_.health.can_bus_count;
+  const uint8_t bus_index = state_.health.can_bus_index;
   if (enabled != enabled_) {
     if (enabled && !enabled_ &&
         consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit) {
@@ -520,6 +520,13 @@ void Gateway::Tick(uint64_t now, bool enabled) {
       !configured_) {
     backend_.Neutral();
   }
+}
+
+void Gateway::PlaceCanBusSlot() {
+  const uint8_t buses = state_.health.can_bus_count;
+  state_.health.can_bus_index =
+      buses == 0 ? 0 : static_cast<uint8_t>(state_.sequence % buses);
+  state_.health.can_bus = {};
 }
 
 bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {

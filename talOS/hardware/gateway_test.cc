@@ -606,6 +606,55 @@ TEST(Gateway, ReportsEachCanBusInTurn) {
   }
 }
 
+// The RoboRIO's backend configures asynchronously: PollConfigure reports
+// kPending for some ticks, then kDone, and the gateway commits the new
+// configuration inside that tick. Scenario (bench, a 60 s session): every
+// State then carried can_bus_count 0, the count from before the commit
+// written back over the committed one, so /hw/status showed no CAN bus at
+// all. The committed configuration's buses must be in the commit tick's
+// State and every later one, and a reconfiguration to fewer buses (or to no
+// device) must never leave an index at or past the new count, which would
+// not even encode.
+// REQ-OPS-20
+TEST(Gateway, AnAsynchronousConfigureReportsItsOwnCanBuses) {
+  class AsyncBackend : public FakeBackend {
+   public:
+    void BeginConfigure(const Config&) override {
+      status = ConfigureStatus::kPending;
+    }
+    ConfigureStatus PollConfigure() override { return status; }
+    ConfigureStatus status{ConfigureStatus::kPending};
+  } backend;
+  Gateway g{backend, 1};
+  uint64_t now = 0;
+  const auto tick = [&] {
+    now += 5000;
+    g.Tick(now, false);
+    const State s = g.snapshot();
+    std::array<uint8_t, kMaxStateSize> bytes{};
+    EXPECT_NE(Encode(s, bytes), 0u) << "count " << int{s.health.can_bus_count}
+                                    << " index " << int{s.health.can_bus_index};
+    return s;
+  };
+  const auto configure = [&](const Config& config, int expected) {
+    SCOPED_TRACE(expected);
+    ASSERT_TRUE(g.BeginReconfigure(config));
+    tick();  // pending
+    backend.status = Backend::ConfigureStatus::kDone;
+    std::vector<int> indices;
+    for (int i = 0; i < 4; ++i) {
+      const State s = tick();  // the first is the commit tick
+      EXPECT_EQ(int{s.health.can_bus_count}, expected) << "tick " << i;
+      indices.push_back(s.health.can_bus_index);
+    }
+    for (const int index : indices) EXPECT_LT(index, expected);
+    if (expected > 1) EXPECT_NE(indices[0], indices[1]) << "no rotation";
+  };
+  configure(BusConfig({"rio", "Shooter"}), 2);
+  configure(BusConfig({"rio"}), 1);
+  configure(Config{}, 1);  // "rio" has a slot even with no device
+}
+
 // Feedback command_timeout_us old is invalid, so a status rate with fewer than
 // four frames in that time would read as a dropout at every frame: 40 Hz at
 // the 100 ms timeout loads, anything slower is refused naming both keys.

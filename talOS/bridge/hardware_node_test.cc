@@ -46,6 +46,8 @@
 #include "talOS/events/manifest.h"
 #include "talOS/events/os/poller.h"
 #include "talOS/events/time.h"
+#include "talOS/hardware/endpoint.h"
+#include "talOS/hardware/gateway.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/protocol/udp_test_helpers.h"
@@ -272,6 +274,59 @@ TEST(HardwareNodeTest, PublishesEachCanBusSlotAndAlertsOnAFailingBus) {
   EXPECT_EQ(shooter.transmit_error_count(), 130);
   EXPECT_EQ(shooter.read_failure_count(), 3u);
   EXPECT_TRUE(status.alert_warning_can_bus_unread());
+}
+
+// A gateway backend that configures as the RoboRIO's does, asynchronously:
+// PollConfigure reports kPending for `pending_polls` polls, then kDone.
+// It reads no device and leaves every CAN bus slot unread.
+class AsyncBackend final : public Backend {
+ public:
+  bool Configure(const Config&) override { return true; }
+  void BeginConfigure(const Config&) override { polls_ = 0; }
+  ConfigureStatus PollConfigure() override {
+    return ++polls_ > pending_polls ? ConfigureStatus::kDone
+                                    : ConfigureStatus::kPending;
+  }
+  bool Read(State&) override { return true; }
+  bool Apply(std::span<const MotorRequest>) override { return true; }
+  std::span<const uint16_t> ApplyFailedDevices() const override { return {}; }
+  void Neutral() override {}
+  int pending_polls{3};
+
+ private:
+  int polls_{0};
+};
+
+// The bridge against a real Gateway and Endpoint, as the RoboRIO runs them:
+// the bridge pushes its configuration, the gateway applies it
+// asynchronously and acknowledges it, and the States after it carry the
+// configuration's buses. Scenario (bench, a 60 s session): the gateway's
+// count from before the asynchronous commit was written back over the
+// committed one, so every State carried can_bus_count 0 and /hw/status no
+// bus, while a test that hands the bridge built States could not see it.
+// REQ-OPS-20
+TEST(HardwareNodeTest, ReportsTheBusesOfAnAsynchronouslyAppliedConfiguration) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  cfg.hardware.motors[1].bus = "Shooter";  // Slots: 0 "rio", 1 "Shooter".
+  Link link;
+  ASSERT_TRUE(link.Open(cfg, /*open_gateway=*/false));
+  HardwareNode& node = link.node.value();
+  AsyncBackend backend;
+  Gateway gateway{backend, 42};
+  Endpoint endpoint{gateway};
+  Release(link.gateway_reservation);
+  ASSERT_EQ(endpoint.Open("127.0.0.1", link.gateway_port, "127.0.0.1",
+                          link.node_port),
+            protocol::UdpStatus::kOk);
+  uint64_t now = 1'000'000;
+  ASSERT_TRUE(WaitFor([&] {
+    now += 5000;
+    endpoint.Tick(now, false);
+    node.Tick(now);
+    return node.is_configured() && node.Status(now).can_bus_count() != 0;
+  })) << "can_bus_count "
+      << int{node.Status(now).can_bus_count()};
+  EXPECT_EQ(node.Status(now).can_bus_count(), 2);
 }
 
 // A RoboRIO program one protocol version behind (version 7 States carry no
