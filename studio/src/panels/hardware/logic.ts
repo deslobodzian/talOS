@@ -1,6 +1,8 @@
-// Pure derivations for the hardware panel: counter rates, bitmask history and
-// flag bands, computed over the columnar Series the store hands back. Nothing
+// Pure derivations for the hardware panel: counter rates, bitmask history,
+// flag bands and CAN utilization lines, computed over the columnar Series the store hands back. Nothing
 // here reads the store or React, so it is unit-tested directly.
+
+import {canBusLabel, canBusReadState} from '../../data/robot';
 
 // A contiguous span (seconds since the series origin) where a 0/1 flag read 1.
 export type Band = {start: number; end: number};
@@ -94,5 +96,50 @@ export function flagBands(
   }
   if (start !== null && flag.length > 0)
     out.push({start, end: times[flag.length - 1]});
+  return out;
+}
+
+// One CAN bus's utilization line: NaN (a gap) at every sample whose read
+// state is not OK.
+export type CanBusLine = {index: number; name: string; values: Float64Array};
+
+const CAN = 'hw/status/can_buses/';
+// /hw/status's fixed can_buses array; can_bus_count of its slots are in use.
+const CAN_BUS_SLOTS = 4;
+
+const busesInUse = (count: number|undefined): number =>
+    count === undefined || !Number.isFinite(count) ?
+        0 : Math.max(0, Math.min(CAN_BUS_SLOTS, Math.trunc(count)));
+
+// The channels the utilization chart reads for `count` buses (can_bus_count):
+// each bus's figure and its read state.
+export function canBusSeriesChannels(count: number|undefined): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < busesInUse(count); i++)
+    out.push(`${CAN}${i}/utilization_frac`, `${CAN}${i}/read_state`);
+  return out;
+}
+
+// One line per bus in use, never per slot: /hw/status always carries all four
+// slots, and an unused one reads 0. A sample counts only while its read state
+// is OK; in any other state the figure is the last good read's (0 before
+// one), so it is a gap, never an idle bus. A slot whose series is missing
+// draws an empty line.
+export function canBusLines(
+    count: number|undefined,
+    series: {times: ArrayLike<number>;
+             values: Record<string, ArrayLike<number>|undefined>}): CanBusLine[] {
+  const out: CanBusLine[] = [];
+  const n = series.times.length;
+  for (let index = 0; index < busesInUse(count); index++) {
+    const frac = series.values[`${CAN}${index}/utilization_frac`];
+    const state = series.values[`${CAN}${index}/read_state`];
+    const values = new Float64Array(n).fill(NaN);
+    if (frac && state) {
+      for (let i = 0; i < n; i++)
+        if (canBusReadState(state[i]) === 'ok') values[i] = frac[i];
+    }
+    out.push({index, name: canBusLabel(index), values});
+  }
   return out;
 }

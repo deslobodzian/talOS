@@ -45,9 +45,16 @@ export type CanBusReadState = 'none'|'ok'|'pending'|'failed'|'stale'|'simulated'
 const CAN_BUS_READ_STATES: CanBusReadState[] =
     ['none', 'ok', 'pending', 'failed', 'stale', 'simulated'];
 
-// One /hw/status can_buses slot. In any state but 'ok' the figures are the
-// last good read's (0 before one), so a failed or stale bus is shown by its
-// state, never by its figure.
+// A read_state channel's value as its state; null for an absent or unknown
+// value.
+export const canBusReadState = (value: number|undefined): CanBusReadState|null =>
+    value === undefined ? null : CAN_BUS_READ_STATES[value] ?? null;
+
+// One /hw/status can_buses slot. In any state but 'ok' /hw/status carries the
+// last good read's figures (0 before one), so `frac` is the utilization only
+// while the last read is current and null otherwise: a failed, stale or
+// unread bus is shown by its state, never by a figure. The counters are the
+// last good read's.
 export type CanBus = {
   index: number;
   label: string;
@@ -76,12 +83,12 @@ export function canBuses(channels: Record<string, number>): CanBus[] {
       const v = channels[prefix + field];
       return v === undefined ? null : v;
     };
-    const state = read('read_state');
+    const state = canBusReadState(channels[prefix + 'read_state']);
     out.push({
       index,
       label: canBusLabel(index),
-      state: state === null ? null : CAN_BUS_READ_STATES[state] ?? null,
-      frac: read('utilization_frac'),
+      state,
+      frac: state === 'ok' ? read('utilization_frac') : null,
       busOff: read('bus_off_count'),
       transmitBufferFull: read('transmit_buffer_full_count'),
       receiveErrors: read('receive_error_count'),
@@ -94,12 +101,13 @@ export function canBuses(channels: Record<string, number>): CanBus[] {
 }
 
 // What a bus's utilization reads as: a percentage only while its last read is
-// current ('ok'); otherwise the state itself, so a bus that stopped reading
-// never looks idle.
+// current ('ok'); otherwise the state itself ('not read' before any report),
+// so a bus that stopped or never started reading never looks idle.
 export function canBusReading(bus: CanBus): string {
+  if (bus.state === null) return '—';
   if (bus.state === 'ok')
     return bus.frac === null ? '—' : `${(bus.frac * 100).toFixed(0)}%`;
-  if (bus.state === null || bus.state === 'none') return '—';
+  if (bus.state === 'none') return 'not read';
   return bus.state;
 }
 
