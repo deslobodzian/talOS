@@ -66,7 +66,13 @@ probe's time.
 - `factor_graph`: `gtsam.IncrementalFixedLagSmoother` (iSAM2) over one
   `Pose2` per integrated drivetrain sample. `BetweenFactorPose2` from
   `SwerveDrive4Kinematics.toTwist2d` (dx, dy) and the gyro's yaw change
-  (dtheta), sigma `[factor_graph] odometry_std_*` per sample; a prior
+  (dtheta). `[factor_graph] odometry_std_*` is the odometry's sigma over
+  one update period of the node (`period_us`); a factor spanning a sample
+  interval dt gets it scaled by √(dt / period) (white noise, variance
+  proportional to time): half of it at the drivetrain's 5 ms against a
+  20 ms period, more for a longer step after a gap. The odometry therefore
+  weighs the same against the cameras whatever the drivetrain's rate; a
+  prior
   (`prior_std_*`) on the configured initial pose; each
   accepted observation is a `PriorFactorPose2` on the sample nearer its
   time, moved by the odometry between the two along the constant twist

@@ -124,11 +124,12 @@ class Chassis:
             fields[f"module{i}_angle_rad"] = self.angles[i]
         self.sim.publish(DrivetrainState, drivetrain_topics.STATE, **fields)
 
-    def drive(self, vx, vy, omega, seconds, slip=1.0, **publish):
-        for _ in range(round(seconds / DT)):
-            self.advance(vx, vy, omega, slip)
+    def drive(self, vx, vy, omega, seconds, slip=1.0, dt=DT, **publish):
+        """Publishes every dt (DT by default)."""
+        for _ in range(round(seconds / dt)):
+            self.advance(vx, vy, omega, slip, dt=dt)
             self.publish(**publish)
-            self.sim.step(DT)
+            self.sim.step(dt)
 
     def hold(self, seconds, **publish):
         """Stationary, still publishing every DT."""
@@ -722,6 +723,29 @@ class EstimatorTest(unittest.TestCase):
                 self.assertTrue(e.valid)
                 self.assertEqual(e.sample_time_ns,
                                  self.sim.now_ns - round(DRIVETRAIN_DT * 1e9))
+
+    # REQ-CONTRACT-26
+    def test_factor_graph_fusion_does_not_depend_on_the_drivetrain_rate(self):
+        """odometry_std_* is the odometry's uncertainty over one update
+        period, whatever the drivetrain's rate: the same motion (wheels
+        reporting 90% of the travel) and the same observations of the true
+        pose, with states every 20 ms or every 5 ms, fuse to the same pose.
+        One configured sigma per 5 ms factor instead would double the
+        odometry's sigma per period and pull the estimate further toward
+        the cameras."""
+        fused = {}
+        for dt in (DT, DRIVETRAIN_DT):
+            chassis = self.start("factor_graph")
+            for _ in range(10):
+                chassis.drive(1.0, 0.0, 0.0, 0.1, slip=0.9, dt=dt)
+                self.observe(x=chassis.x, y=0.0, yaw=0.0,
+                             std=(0.05, 0.05, 0.05))
+            chassis.drive(1.0, 0.0, 0.0, DT, slip=0.9, dt=dt)
+            self.assertEqual(self.counts(), (10, 0))
+            fused[dt] = self.pose()[0] - chassis.x
+        self.assertAlmostEqual(fused[DRIVETRAIN_DT], fused[DT], delta=0.001,
+                               msg=f"error from truth by state period: "
+                                   f"{fused}")
 
     # REQ-CONTRACT-26
     def test_a_stall_backlog_is_integrated_in_order_unless_stale(self):
