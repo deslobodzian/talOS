@@ -595,7 +595,9 @@ class Relay:
             self._send(self.robot_side, data, 5802)
 
     def _send(self, sock, data, port):
-        # Called with the lock held; counts what a cut should have stopped.
+        # Called with the lock held. Both callers return before this once the
+        # link is cut, so the count stays 0 unless a later edit forwards
+        # without checking `forwarding`: the harness checking itself.
         if not self.forwarding:
             self.forwarded_after_cut += 1
         try:

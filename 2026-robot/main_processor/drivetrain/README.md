@@ -172,7 +172,7 @@ makes the same assertions, because both run the same
 with the Driver Station never enabled, the drivetrain must not move at all;
 and with it enabled and the wheels driven, a relay standing in for the main
 processor's socket cuts the link at once (the main-processor processes then
-stop cleanly, sending nothing past the cut), and the RoboRIO program alone
+stop cleanly; nothing they send past the cut reaches the RoboRIO), and the RoboRIO program alone
 must neutralize every output on its first tick at or past the last command's
 expiry, which the harness reads from the RoboRIO's own States at the relay.
 It runs Gradle `--offline`, so the first run needs one online
