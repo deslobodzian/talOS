@@ -5,8 +5,9 @@
 first truthy result. The change comes from the kernel (inotify on Linux,
 kqueue on macOS), so nothing sleeps; `bound_s` only bounds a hang, through a
 timer that writes to a pipe the wait also watches, and reads no clock.
-`paths()` is asked again after every change, so a file or directory that
-appears later (a session directory, a log) is watched from then on.
+`paths()` is asked again after every change, and again until it names nothing
+new, so a file or directory that appears later (a session directory, a log)
+is watched from then on, whenever it appeared.
 """
 
 import ctypes
@@ -31,11 +32,14 @@ class _Inotify:
         self.watched = set()
 
     def add(self, path):
+        """True when `path` is newly watched."""
         if path in self.watched:
-            return
+            return False
         mask = _IN_MODIFY | _IN_CLOSE_WRITE | _IN_MOVED_TO | _IN_CREATE
-        if self.libc.inotify_add_watch(self.fd, os.fsencode(path), mask) >= 0:
-            self.watched.add(path)
+        if self.libc.inotify_add_watch(self.fd, os.fsencode(path), mask) < 0:
+            return False
+        self.watched.add(path)
+        return True
 
     def drain(self):
         try:
@@ -55,17 +59,19 @@ class _Kqueue:
         self.files = {}
 
     def add(self, path):
+        """True when `path` is newly watched."""
         if path in self.files:
-            return
+            return False
         try:
             fd = os.open(path, getattr(os, "O_EVTONLY", os.O_RDONLY))
         except OSError:
-            return
+            return False
         self.files[path] = fd
         event = select.kevent(fd, filter=select.KQ_FILTER_VNODE,
                               flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
                               fflags=select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)
         self.queue.control([event], 0, 0)
+        return True
 
     def drain(self):
         self.queue.control(None, 64, 0)
@@ -94,9 +100,14 @@ def wait_for(check, paths, bound_s, what):
     try:
         while True:
             # Watch before checking, so a change between the two wakes us.
-            for path in paths():
-                if Path(path).exists():
-                    notify.add(str(path))
+            # A path created after paths() listed them and before its
+            # directory was watched raised no event (and on macOS a
+            # directory's watch reports no write to a file inside it), so
+            # the listing repeats until it adds nothing: whatever appears
+            # after that is reported by a watch already in place.
+            while [path for path in paths()
+                   if Path(path).exists() and notify.add(str(path))]:
+                pass
             result = check()
             if result:
                 return result

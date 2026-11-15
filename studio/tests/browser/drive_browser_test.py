@@ -472,5 +472,37 @@ class ChildSignalsItsGroupOnlyUnreaped(unittest.TestCase):
         self.assertEqual(sent, [(child.pid, signal.SIGKILL)])
 
 
+class WatchSeesAFileCreatedBeforeItsDirectoryIsWatched(unittest.TestCase):
+    """wait_for lists the paths, then watches them: a file created between
+    the two is in no list and raised no event on its directory, so the write
+    that satisfies the check would wake nothing (a session's
+    studio_bridge.log, created while the session directory was being
+    watched, timed the startup out)."""
+
+    def test_a_write_to_a_file_created_in_that_window_wakes_the_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "member.log"
+            listed = []
+            checked = []
+
+            def paths():
+                found = [Path(tmp), *Path(tmp).glob("*.log")]
+                if not listed:
+                    log.touch()  # created after the listing, before the watch
+                listed.append(found)
+                return found
+
+            def check():
+                text = log.read_text()
+                if not checked:
+                    log.write_text("listening\n")  # the only later change
+                checked.append(text)
+                return text
+
+            # 10 s only bounds a hang.
+            self.assertEqual(watch.wait_for(check, paths, 10, "the write"), "listening\n")
+            self.assertEqual(checked[0], "", "the check ran after the write: nothing proved")
+
+
 if __name__ == "__main__":
     unittest.main()
