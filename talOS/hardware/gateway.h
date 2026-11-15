@@ -178,6 +178,12 @@ class Gateway {
 
  private:
   void Invalidate();
+  // This tick's CAN bus slot: index `sequence % count` of the applied
+  // configuration's buses (state_.health.can_bus_count, set only where a
+  // configuration is committed), cleared for Backend::Read to fill. Called
+  // once the tick knows its configuration: after a commit in the tick, or
+  // before returning while a configure is pending.
+  void PlaceCanBusSlot();
   bool JudgeFeedbackAge();
   void PollResets();
   void FindPositionJumps(std::vector<uint16_t>& reset_ids);

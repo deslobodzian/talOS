@@ -530,17 +530,52 @@ TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
 
 // Under WPILib simulation no CAN bus is read: the slot the gateway asks for
 // reads SIMULATED, never a failing bus or an idle one.
+//
+// Through the gateway, as the RoboRIO runs it: PhoenixBackend configures on
+// a worker (BeginConfigure, PollConfigure), and the gateway commits the
+// configuration in the tick that finds it done. Scenario (bench, a 60 s
+// session): with that asynchronous commit every State carried
+// can_bus_count 0, the pre-commit count written back over the committed
+// one. Each State must carry the committed configuration's buses, in turn,
+// after a second configuration with fewer buses too.
 // REQ-OPS-20
-TEST(PhoenixBackendHealth, SimulationReportsItsCanBusSimulated) {
+TEST(PhoenixBackendHealth, AnAsynchronousConfigureReportsEachBusSimulated) {
   EnsureHal();
   PhoenixBackend backend(true);
-  hw::Config config;
-  config.motors.push_back(TestMotor(1, "health_motor", 1));
-  ASSERT_TRUE(backend.Configure(config));
-  hw::State state;
-  state.health.can_bus_count = 1;
-  backend.Read(state);
-  EXPECT_EQ(state.health.can_bus.read_state, hw::CanBusReadState::kSimulated);
+  hw::Gateway gateway{backend, 1};
+  uint64_t now = 0;
+  const auto configure = [&](const hw::Config& config, int buses) {
+    SCOPED_TRACE(buses);
+    ASSERT_TRUE(gateway.BeginReconfigure(config));
+    const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+    while (!gateway.configured()) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+          << "the configure never completed";
+      gateway.Tick(now += 5000, false);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::vector<int> indices;
+    for (int i = 0; i < 2 * buses; ++i) {
+      gateway.Tick(now += 5000, false);
+      const hw::State s = gateway.snapshot();
+      EXPECT_EQ(int{s.health.can_bus_count}, buses) << "tick " << i;
+      EXPECT_EQ(s.health.can_bus.read_state, hw::CanBusReadState::kSimulated)
+          << "tick " << i;
+      indices.push_back(s.health.can_bus_index);
+    }
+    std::sort(indices.begin(), indices.end());
+    indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
+    EXPECT_EQ(static_cast<int>(indices.size()), buses)
+        << "not every bus's slot came round";
+  };
+  hw::Config two;
+  two.motors.push_back(TestMotor(1, "rio_motor", 1));
+  two.motors.push_back(TestMotor(2, "shooter_motor", 2));
+  two.motors.back().bus = "Shooter";
+  configure(two, 2);
+  hw::Config one;
+  one.motors.push_back(TestMotor(1, "rio_motor", 1));
+  configure(one, 1);
 }
 
 // Missing gains yield ~0 V, so a closed-loop demand must neither spin the

@@ -157,6 +157,7 @@ cc_test(
         "//talOS/events:events_log",
         "//talOS/events:events_os",
         "//talOS/events:input_replay",
+        "//talOS/hardware",
         "//talOS/introspection:registry",
         "//talOS/ipc",
         "//talOS/node:allocation_probe",
