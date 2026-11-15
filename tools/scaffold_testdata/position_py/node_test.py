@@ -1,7 +1,8 @@
 """Node tests: the class on talos.testing.Sim, and the binary.
 
-PositionPyTest is the node test matrix, docs/TESTING.md §7: the case names are
-the matrix's, which //tools:check_node_matrix looks for.
+PositionPyTest is the node test matrix, docs/TESTING.md §7 in the talos
+repository: the case names are the matrix's, which talos's
+//tools:check_node_matrix looks for.
 """
 
 import os
@@ -141,7 +142,8 @@ class PositionPyTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
 
-    # matrix: n/a 9 (PositionMechanism parameters, tested in talOS/mechanisms)
+    # matrix: n/a 9 (PositionMechanism parameters, tested in talos's
+    # talOS/mechanisms)
 
     # REQ-SAFE-07
     def test_other_modes_lane_is_ignored(self):
@@ -190,11 +192,12 @@ class PositionPyTest(unittest.TestCase):
     # there, clamps goals to min_rot..max_rot and latches FAILED when homing
     # does not move. If you drive the Motor yourself instead, replace them
     # with tests of your own behaviour. The tests above are the node test
-    # matrix (docs/TESTING.md §7) that every actuator node keeps; they expect
-    # Motion Magic requests (talos.Mode.MOTION_MAGIC), PositionMechanism's
-    # mode, so change that if your node drives another, and replace the
-    # matrix's n/a 9 with test_bad_parameter_fails_construction once the
-    # node reads parameters of its own.
+    # matrix (docs/TESTING.md §7 in the talos repository) that every actuator
+    # node keeps; they expect Motion Magic requests
+    # (talos.Mode.MOTION_MAGIC), PositionMechanism's mode, so change that if
+    # your node drives another, and replace the matrix's n/a 9 with
+    # test_bad_parameter_fails_construction once the node reads parameters of
+    # its own.
     #
     # The values are testdata/robot.toml's (homing_v = -1.0,
     # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor

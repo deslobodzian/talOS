@@ -360,7 +360,7 @@ namespace @NAME@ {
 //
 // The control is a talos::mechanisms::PositionMechanism, configured by the
 // subsystem file: the motor [motors.@NAME@] and the
-// parameter table [@NAME@] (keys and units in
+// parameter table [@NAME@] (keys and units in the talos repository's
 // talOS/mechanisms/README.md). It runs Motion Magic to the goal, clamped to
 // min_rot..max_rot, and homes on the switch @NAME@_home:
 // positions count from that switch, not from where the motor powered on.
@@ -462,8 +462,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
-// The node test matrix, docs/TESTING.md §7: the case names are the matrix's,
-// which //tools:check_node_matrix looks for.
+// The node test matrix, docs/TESTING.md §7 in the talos repository: the case
+// names are the matrix's, which talos's //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
  protected:
   using Target = @PASCAL@::Target;
@@ -713,7 +713,8 @@ CC_POSITION_FIXTURE = """\
 
 # Replaces CC_TEST's case 9 for a position mechanism.
 CC_POSITION_PARAMETERS = """\
-// matrix: n/a 9 (PositionMechanism's parameters, tested in talOS/mechanisms)
+// matrix: n/a 9 (PositionMechanism's parameters, tested in talos's
+// talOS/mechanisms)
 """
 
 # The node's own logic over the mechanism: the config homes it, and the
@@ -726,10 +727,11 @@ CC_POSITION_TESTS = """\
 // clamps goals to min_rot..max_rot and latches FAILED when homing does not
 // move. If you drive the Motor yourself instead, replace them with tests of
 // your own behaviour. The tests above are the node test matrix
-// (docs/TESTING.md §7) that every actuator node keeps; they expect Motion
-// Magic requests (Mode::kMotionMagic), PositionMechanism's mode, so change
-// that if your node drives another, and replace the matrix's n/a 9 with
-// BadParameterFailsConstruction once the node reads parameters of its own.
+// (docs/TESTING.md §7 in the talos repository) that every actuator node
+// keeps; they expect Motion Magic requests (Mode::kMotionMagic),
+// PositionMechanism's mode, so change that if your node drives another, and
+// replace the matrix's n/a 9 with BadParameterFailsConstruction once the node
+// reads parameters of its own.
 //
 // The values are testdata/@NAME@.toml's.
 constexpr double kHomingVolts = -1.0;
@@ -934,14 +936,14 @@ Reports what it did on /@NAME@/state. Producers write lanes
 The control is a talos.mechanisms.PositionMechanism (the C++
 talos::mechanisms::PositionMechanism), configured by the subsystem file: the
 motor [motors.@NAME@] and the parameter table [@NAME@] (keys and units in
-talOS/mechanisms/README.md). It runs Motion Magic to the goal, clamped to
-min_rot..max_rot, and homes on the switch @NAME@_home: positions count from
-that switch, not from where the motor powered on. Until the switch has
-zeroed the motor, and again after a motor reset or a RoboRIO reboot drops
-that zero, a live goal drives toward the switch at homing_v instead. A
-homing timeout, a homing push that does not move, or the switch reading
-closed well into the travel (stuck) latches FAILED, neutral, until the
-Driver Station reports disabled.
+the talos repository's talOS/mechanisms/README.md). It runs Motion Magic to
+the goal, clamped to min_rot..max_rot, and homes on the switch @NAME@_home:
+positions count from that switch, not from where the motor powered on.
+Until the switch has zeroed the motor, and again after a motor reset or a
+RoboRIO reboot drops that zero, a live goal drives toward the switch at
+homing_v instead. A homing timeout, a homing push that does not move, or the
+switch reading closed well into the travel (stuck) latches FAILED, neutral,
+until the Driver Station reports disabled.
 """
 
 import talos
@@ -982,8 +984,9 @@ class @PASCAL@:
 PY_TEST = '''\
 """Node tests: the class on talos.testing.Sim, and the binary.
 
-@PASCAL@Test is the node test matrix, docs/TESTING.md §7: the case names are
-the matrix's, which //tools:check_node_matrix looks for.
+@PASCAL@Test is the node test matrix, docs/TESTING.md §7 in the talos
+repository: the case names are the matrix's, which talos's
+//tools:check_node_matrix looks for.
 """
 
 import os
@@ -1185,7 +1188,8 @@ if __name__ == "__main__":
 
 # Replaces PY_TEST's case 9 for a position mechanism.
 PY_POSITION_PARAMETERS = '''\
-    # matrix: n/a 9 (PositionMechanism parameters, tested in talOS/mechanisms)
+    # matrix: n/a 9 (PositionMechanism parameters, tested in talos's
+    # talOS/mechanisms)
 '''
 
 # Inserted into PY_TEST for a position mechanism before BinaryTest: the
@@ -1199,11 +1203,12 @@ PY_POSITION_TESTS = '''
     # there, clamps goals to min_rot..max_rot and latches FAILED when homing
     # does not move. If you drive the Motor yourself instead, replace them
     # with tests of your own behaviour. The tests above are the node test
-    # matrix (docs/TESTING.md §7) that every actuator node keeps; they expect
-    # Motion Magic requests (talos.Mode.MOTION_MAGIC), PositionMechanism's
-    # mode, so change that if your node drives another, and replace the
-    # matrix's n/a 9 with test_bad_parameter_fails_construction once the
-    # node reads parameters of its own.
+    # matrix (docs/TESTING.md §7 in the talos repository) that every actuator
+    # node keeps; they expect Motion Magic requests
+    # (talos.Mode.MOTION_MAGIC), PositionMechanism's mode, so change that if
+    # your node drives another, and replace the matrix's n/a 9 with
+    # test_bad_parameter_fails_construction once the node reads parameters of
+    # its own.
     #
     # The values are testdata/robot.toml's (homing_v = -1.0,
     # max_rot = 100.0, homing_stall_us = 200000). setUp leaves the motor
@@ -1373,7 +1378,7 @@ node = "//@PACKAGE@:node"
 period_us = @PERIOD@
 
 # The @NAME@'s talos::mechanisms::PositionMechanism parameters (keys and
-# units: talOS/mechanisms/README.md).
+# units: talOS/mechanisms/README.md in the talos repository).
 [@NAME@]
 # /@NAME@/state reports at_goal while the motor is within this of its target.
 tolerance_rot = 0.05
@@ -1520,7 +1525,8 @@ STANDALONE_POSITION_DEFAULTS_TOML = """\
 # there. Until then the travel confines every target to within 0.001
 # rotations of the home switch. The motor requires a zero from the home switch
 # (normally open, to ground) and has no hardware soft limits; see the node's
-# header comment and talOS/mechanisms/README.md for the [@NAME@] keys.
+# header comment and talOS/mechanisms/README.md in the talos repository for
+# the [@NAME@] keys.
 [subsystem]
 name = "@NAME@"
 node = "@@NAME@//:node"
@@ -1757,8 +1763,9 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
-// The node test matrix for an observer, docs/TESTING.md §7: the case names
-// are the matrix's, which //tools:check_node_matrix looks for.
+// The node test matrix for an observer, docs/TESTING.md §7 in the talos
+// repository: the case names are the matrix's, which talos's
+// //tools:check_node_matrix looks for.
 class @PASCAL@Test : public ::testing::Test {
  protected:
   using State = @PASCAL@::State;
@@ -2018,9 +2025,9 @@ class @PASCAL@:
 PY_ESTIMATOR_TEST = '''\
 """Node tests: the class on talos.testing.Sim, and the binary.
 
-@PASCAL@Test is the node test matrix for an observer, docs/TESTING.md
-§7: the case names are the matrix's, which //tools:check_node_matrix looks
-for.
+@PASCAL@Test is the node test matrix for an observer, docs/TESTING.md §7 in
+the talos repository: the case names are the matrix's, which talos's
+//tools:check_node_matrix looks for.
 """
 
 import math

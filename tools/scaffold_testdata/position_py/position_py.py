@@ -7,14 +7,14 @@ Reports what it did on /position_py/state. Producers write lanes
 The control is a talos.mechanisms.PositionMechanism (the C++
 talos::mechanisms::PositionMechanism), configured by the subsystem file: the
 motor [motors.position_py] and the parameter table [position_py] (keys and units in
-talOS/mechanisms/README.md). It runs Motion Magic to the goal, clamped to
-min_rot..max_rot, and homes on the switch position_py_home: positions count from
-that switch, not from where the motor powered on. Until the switch has
-zeroed the motor, and again after a motor reset or a RoboRIO reboot drops
-that zero, a live goal drives toward the switch at homing_v instead. A
-homing timeout, a homing push that does not move, or the switch reading
-closed well into the travel (stuck) latches FAILED, neutral, until the
-Driver Station reports disabled.
+the talos repository's talOS/mechanisms/README.md). It runs Motion Magic to
+the goal, clamped to min_rot..max_rot, and homes on the switch position_py_home:
+positions count from that switch, not from where the motor powered on.
+Until the switch has zeroed the motor, and again after a motor reset or a
+RoboRIO reboot drops that zero, a live goal drives toward the switch at
+homing_v instead. A homing timeout, a homing push that does not move, or the
+switch reading closed well into the travel (stuck) latches FAILED, neutral,
+until the Driver Station reports disabled.
 """
 
 import talos
