@@ -39,7 +39,8 @@ TEST(Schedules, FaultIntervalsUseExistingHooksAndRestoreOnTheirEnd) {
   EXPECT_FALSE(state.motors[0].valid);
   EXPECT_FALSE(state.sensors[0].valid);
   EXPECT_FALSE(ApplyFaults(events, 2, backend));
-  EXPECT_DOUBLE_EQ(backend.supply_voltage(), 12);
+  EXPECT_DOUBLE_EQ(backend.supply_voltage(),
+                   talos::hardware::kSimRestingSupplyV);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_TRUE(state.motors[0].valid);
   EXPECT_TRUE(state.sensors[0].valid);
@@ -155,7 +156,8 @@ TEST(Schedules, AdjacentFaultsRestoreBeforeActivatingInAnyInputOrder) {
   ApplyFaults(events, 3, backend);
   ASSERT_TRUE(backend.Read(state));
   EXPECT_TRUE(state.motors[0].valid);
-  EXPECT_DOUBLE_EQ(backend.supply_voltage(), 12);
+  EXPECT_DOUBLE_EQ(backend.supply_voltage(),
+                   talos::hardware::kSimRestingSupplyV);
 }
 
 }  // namespace

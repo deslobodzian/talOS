@@ -143,8 +143,9 @@ TEST(SimFollowers, PhysicsResolvesOrderOppositionAndNeutral) {
       commands[slave] = Duty(2, -0.9);  // Followers ignore independent demands.
       ASSERT_TRUE(backend.Apply(commands));
       backend.Step(0.005);
-      EXPECT_DOUBLE_EQ(backend.applied_voltage(master), 6.0);
-      EXPECT_DOUBLE_EQ(backend.applied_voltage(slave), oppose ? -6.0 : 6.0);
+      const double half = 0.5 * kSimRestingSupplyV;  // Duty scales the bus.
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(master), half);
+      EXPECT_DOUBLE_EQ(backend.applied_voltage(slave), oppose ? -half : half);
       State state{};
       ASSERT_TRUE(backend.Read(state));
       EXPECT_DOUBLE_EQ(state.motors[slave].velocity_rps,
@@ -251,7 +252,8 @@ void CheckPowerHealth() {
   Sim backend;
   Gateway gateway{SingleMotorConfig(), backend, 1};
   gateway.Tick(1000, false);
-  EXPECT_EQ(gateway.snapshot().health, (HealthSample{true, 12.0, false, 0.0}));
+  EXPECT_EQ(gateway.snapshot().health,
+            (HealthSample{true, kSimRestingSupplyV, false, 0.0}));
   backend.SetPowerHealth(6.5, true);
   gateway.Tick(2000, true);
   EXPECT_EQ(gateway.snapshot().health, (HealthSample{true, 6.5, true, 0.0}));
@@ -392,7 +394,7 @@ TEST(SimBelievability, VoltageRampsMechanismAndPositionIntegrates) {
   StepBackend(backend, s, now_us, 5000, 200);  // Another second.
   // Near steady state, the second second adds ~vel * 1 s.
   EXPECT_NEAR(s.motors[0].position_rot - pos_1s, vel_1s, vel_1s * 0.25 + 1.0);
-  EXPECT_NEAR(s.motors[0].voltage, 6.0, 1e-9);
+  EXPECT_NEAR(s.motors[0].voltage, 0.5 * kSimRestingSupplyV, 1e-9);
 }
 
 // Honesty: zero gains yield ~0 V, so velocity/position demands stall.
@@ -1099,7 +1101,9 @@ struct WorldFixture {
     Advance(2000);  // Settle azimuths before applying drive power.
     for (std::size_t i = 0; i < 4; ++i) {
       const double speed = std::hypot(vx - omega * y[i], vy + omega * x[i]);
-      commands[2 * i] = Duty(2 * i + 1, speed / (100.0 * kTau * kRadius));
+      // Duty scales the resting supply; free speed is 100 rps at 12 V.
+      commands[2 * i] = Duty(2 * i + 1, speed / (100.0 * kTau * kRadius) *
+                                            12.0 / kSimRestingSupplyV);
     }
     EXPECT_TRUE(backend.Apply(commands));
   }

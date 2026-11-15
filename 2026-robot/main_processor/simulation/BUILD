@@ -38,6 +38,23 @@ cc_test(
     ],
 )
 
+# REQ-DEV-05: the simulated resting supply passes the 2026 dashboard's
+# pre-match Battery check, read from dashboard.toml.
+cc_test(
+    name = "resting_supply_test",
+    size = "small",
+    srcs = [
+        "resting_supply_test.cc",
+        "schedules.h",
+    ],
+    data = ["//2026-robot/main_processor/configuration:dashboard.toml"],
+    deps = [
+        "//talOS/hardware",
+        "@googletest//:gtest_main",
+        "@tomlplusplus//:toml++",
+    ],
+)
+
 # Removes the autonomous progress record a namespaced sim session leaves.
 py_library(
     name = "autonomous_progress",
