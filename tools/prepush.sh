@@ -255,7 +255,9 @@ else
   # What new_subsystem writes, built in a copy of robot_repo, with and
   # without target coverage required, as CI's robot-repo job runs it.
   if [ -f "$wt/tools/check_robot_repo_scaffold.sh" ]; then
-    run_step scaffold-robot_repo bash tools/check_robot_repo_scaffold.sh \
+    # The step runs from the worktree: hand it the absolute TMPDIR.
+    run_step scaffold-robot_repo env "TMPDIR=$tmp" \
+      bash tools/check_robot_repo_scaffold.sh \
       --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
       true
   fi
