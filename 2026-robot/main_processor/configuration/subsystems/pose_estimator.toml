@@ -48,7 +48,8 @@ state_std_y_m = 0.1
 state_std_yaw_rad = 0.1
 
 # One sigma of the odometry accumulated over one update period (period_us;
-# each drivetrain sample's factor gets it scaled by sqrt(its dt / period)),
+# each drivetrain sample's factor gets it scaled by sqrt(its dt / period),
+# its dt floored at the drivetrain's period_us),
 # and of the prior on the pose the smoother starts from: the configured
 # initial field pose, or where it restarts (a relocalization, a contained
 # GTSAM failure).

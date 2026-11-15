@@ -71,9 +71,14 @@ probe's time.
   one update period of the node (`period_us`); a factor spanning a sample
   interval dt gets it scaled by √(dt / period) (white noise, variance
   proportional to time): half of it at the drivetrain's 5 ms against a
-  20 ms period, more for a longer step after a gap. The odometry therefore
-  weighs the same against the cameras whatever the drivetrain's rate; a
-  prior
+  20 ms period, more for a longer step after a gap. dt is floored at the
+  drivetrain's `period_us` (read from its subsystem table; without one, the
+  estimator's own period): a state's sample time is its oldest reading, so
+  when the most-lagging device changes a step can be microseconds long
+  while its wheel travel spans at least one refresh, and a sigma scaled by
+  that dt would be over-confident (at nanoseconds, iSAM2 fails and
+  restarts). The odometry therefore weighs the same against the cameras
+  whatever the drivetrain's rate; a prior
   (`prior_std_*`) on the configured initial pose; each
   accepted observation is a `PriorFactorPose2` on the sample nearer its
   time, moved by the odometry between the two along the constant twist
