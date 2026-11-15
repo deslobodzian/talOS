@@ -42,7 +42,9 @@ is rejected (and counted) when its camera's queue overflowed before update()
 ran, or when it carries a non-finite value or a standard deviation below
 MIN_OBSERVATION_STD_M / MIN_OBSERVATION_STD_RAD, arrives before any odometry,
 was taken before the first odometry sample, is too old or too far in the
-future, or is outside the field.
+future, or is outside the field. A measurement too far ahead of odometry
+but not of the node's clock waits one tick for drivetrain states still in
+the backlog (awaits_odometry) before that check rejects it.
 Once localized, measurements pass position and wrapped-yaw innovation gates
 against the estimate at their sample time. An untrusted startup seed does not
 gate measurements. Localization (and large innovations once localized) requires
@@ -588,10 +590,15 @@ class PoseEstimator:
         the next update(): queue a measurement for it."""
         if not o.valid or o.tag_count < 1:
             return  # no measurement: neither fused nor counted
+        self.queue(queue, o, False)
+
+    def queue(self, queue, o, deferred):
+        """Queues o (deferred: already held back once), dropping and
+        counting the oldest on overflow."""
         if len(queue) >= MAX_PENDING_OBSERVATIONS:
             queue.popleft()
             self.rejected += 1
-        queue.append(o)
+        queue.append((o, deferred))
 
     def on_drivetrain_state(self, d):
         """Drivetrain callback, every state in sequence, at the drain before
@@ -616,13 +623,17 @@ class PoseEstimator:
         # Every queued observation, oldest capture first (stable: ties keep
         # camera, then arrival order).
         batch = sorted(
-            ((o.sample_time_ns, camera, o)
-             for camera, queue in self.pending.items() for o in queue),
+            ((o.sample_time_ns, camera, o, deferred)
+             for camera, queue in self.pending.items()
+             for o, deferred in queue),
             key=operator.itemgetter(0))
         for queue in self.pending.values():
             queue.clear()
-        for _, camera, o in batch:
-            self.observe(o, camera)
+        for _, camera, o, deferred in batch:
+            if not deferred and self.awaits_odometry(o):
+                self.queue(self.pending[camera], o, True)
+            else:
+                self.observe(o, camera)
         pose = self.backend.pose() if self.first_ns is not None else Pose2d()
         self.state.send(
             sample_time_ns=self.latest_ns,
@@ -737,6 +748,19 @@ class PoseEstimator:
                 time_ns - reference[1][0] >= self.update_period_ns
                 or len(reference) > MAX_REFERENCE_SAMPLES):
             reference.popleft()
+
+    def awaits_odometry(self, o):
+        """Whether o is ahead of the integrated odometry by more than the
+        future tolerance but not of the node's clock: the drivetrain
+        states up to its time can still be undelivered (after a stall the
+        drain before update() delivers only the 64 oldest of the backlog;
+        the rest follow at once after it). Such a frame waits one tick
+        instead of being rejected as future; the next tick judges it by the
+        usual rules, so a frame still ahead of odometry then is rejected."""
+        time_s = o.sample_time_ns / _NS
+        return (self.first_ns is not None
+                and time_s - self.latest_ns / _NS > self.future_tolerance_s
+                and time_s <= self.node.now)
 
     def observe(self, o, camera):
         if self.acceptable(o, camera) and self.backend.add_observation(

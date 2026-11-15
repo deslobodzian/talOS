@@ -836,6 +836,33 @@ class EstimatorTest(unittest.TestCase):
                     self.assertEqual(self.node.odometry_rejected_count, 0)
                     self.assertTrue(self.estimate().valid)
 
+    # REQ-CONTRACT-26
+    def test_camera_frames_from_a_long_stall_are_fused(self):
+        """A 450 ms pause queues 90 drivetrain states and frames from both
+        cameras. The drain after it delivers only the 64 oldest states (all
+        stale) before the due update(), but every frame: a frame ahead of
+        odometry only because the rest of the states are still to come
+        waits one tick for them instead of being rejected as future, and is
+        fused once they arrive."""
+        pause_s = 0.45
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                chassis.hold(0.1, dt=DRIVETRAIN_DT)
+                self.assertTrue(self.estimate().localized)
+                self.sim.pause("pose_estimator", pause_s)
+                frames = 0
+                for step in range(round(pause_s / DRIVETRAIN_DT)):
+                    chassis.publish()
+                    if step % 4 == 0:
+                        for camera in ("front_camera", "back_camera"):
+                            self.observe(camera, time_ns=self.sim.now_ns)
+                            frames += 1
+                    self.sim.step(DRIVETRAIN_DT)
+                chassis.hold(2 * DT, dt=DRIVETRAIN_DT)
+                self.assertEqual(self.counts(), (frames, 0))
+                self.assertTrue(self.estimate().valid)
+
     def test_a_delayed_observation_corrects_the_estimate(self):
         for backend in BACKENDS:
             with self.subTest(backend):
