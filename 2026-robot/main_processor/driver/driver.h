@@ -119,15 +119,17 @@ class Driver {
     return value;
   }
 
-  // Five 20 ms periods by default, so one or two dropped packets do not flap
-  // the frame. At most [robot] command_timeout_us: the heading turns the
-  // stick into a direction, and no other input that drives the robot is
-  // trusted for longer (the bound also keeps the nanosecond count in range).
+  // At most [robot] command_timeout_us: the heading turns the stick into a
+  // direction, and no other input that drives the robot is trusted for
+  // longer (the bound also keeps the nanosecond count in range). By default
+  // five 20 ms periods, so one or two dropped packets do not flap the frame,
+  // or the command timeout if that is shorter.
   static talos::Duration HeadingTimeout(const talos::Node& node) {
-    const double s = node.param("heading_timeout_s", 0.1);
     const auto limit_us = talos::config::ParseRobotConfig(node.config_path())
                               .hardware.command_timeout_us;
-    if (!std::isfinite(s) || s <= 0 || s > limit_us / 1e6)
+    const double limit_s = limit_us / 1e6;
+    const double s = node.param("heading_timeout_s", std::min(0.1, limit_s));
+    if (!std::isfinite(s) || s <= 0 || s > limit_s)
       BadParameter(node, "heading_timeout_s",
                    ("must be > 0 and at most [robot] command_timeout_us (" +
                     std::to_string(limit_us) + " us)")
