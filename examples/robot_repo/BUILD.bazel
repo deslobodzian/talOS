@@ -42,10 +42,10 @@ talos_sim(
     nodes = NODES,
 )
 
-# e2e: the robot runs against the simulator for 3 s on free loopback ports:
-# every member runs once and exits 0, and the bridge receives State from
-# the simulator (talos_sim_test, talOS/build/contract.bzl). Takes 3 s of
-# real time (the simulator has no faster-than-real-time mode) plus startup.
+# e2e: the robot runs against the simulator on free loopback ports until it
+# is up, then 1 s more: every member runs once and exits 0, and the bridge
+# receives State from the simulator (talos_sim_test,
+# talOS/build/contract.bzl). Takes its startup plus 1 s of real time.
 talos_sim_test(
     name = "sim_smoke_test",
     sim = ":sim",

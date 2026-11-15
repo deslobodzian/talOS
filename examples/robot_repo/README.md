@@ -28,10 +28,11 @@ unless ARGS include `--start-studio-bridge`. The simulator is the one
 `data`. The launcher gives it the bridge's ports (`[robot] controller_port`
 and `local_port`, or ARGS' `--remote-port` and `--local-port`).
 
-`sim_smoke_test` is `talos_sim_test(sim = ":sim")`: it runs `//:sim` for 3 s
-with those two flags on free ports, and fails unless every member the
-session records ran once and exited 0 and the bridge received State from
-the simulator. A robot repository adds the same few lines; what the check
+`sim_smoke_test` is `talos_sim_test(sim = ":sim")`: it runs `//:sim` with
+those two flags on free ports until the bridge has accepted a State and
+every member's loop has started, then 1 s more, stops it, and fails unless
+every member the session records ran once and exited 0 and the bridge
+received State from the simulator. A robot repository adds the same few lines; what the check
 judges is in `talos_sim_test`'s docstring (`talOS/build/contract.bzl`).
 
 ## What a robot repository names by `@talos//`

@@ -1,13 +1,14 @@
 """integration: a launch talos_sim_test's check stops as a hang leaves no
 process of its session behind (REQ-DEV-30).
 
-The stand-in launch ignores SIGTERM, as a hung launcher may, and has two
-children that ignore it too: one in its process group, one leading a group
-of its own, as every launcher member does. The check gets the stand-in's
-pids from it once all three run, checks that its listing of the session
-finds exactly those, stops the launch at once as a hang, and then finds no
-process of the session. Killing only the launch's own process (what
-`subprocess.run(timeout=...)` does) leaves both children running.
+The stand-in launch ignores SIGINT and SIGTERM, as a hung launcher may,
+and has two children that ignore them too: one in its process group, one
+leading a group of its own, as every launcher member does. The check gets
+the stand-in's pids from it once all three run, checks that its listing of
+the session finds exactly those, stops the launch with no wait for SIGINT
+or SIGTERM to work, and then finds no process of the session. Killing only
+the launch's own process (what `subprocess.run(timeout=...)` does) leaves
+both children running.
 """
 
 import os
@@ -24,6 +25,7 @@ READY_TIMEOUT_S = 10
 
 STAND_IN = r"""
 import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_IGN)
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 pids = [os.getpid()]
 for own_group in (False, True):
@@ -66,8 +68,8 @@ class SimCheckHangTest(unittest.TestCase):
             pids = {int(pid) for pid in os.read(read_fd, 4096).split()}
             self.assertEqual(len(pids), 3, pids)
             self.assertEqual(sim_check.session_processes(launch.sid), pids)
-            status, _ = launch.finish(hang_s=0, stop_wait_s=0, exit_wait_s=0)
-        self.assertIsNone(status)
+            in_order, _ = launch.finish(stop_wait_s=0, exit_wait_s=0)
+        self.assertFalse(in_order)
         self.assertEqual(sim_check.session_processes(launch.sid), set(),
                          f"left running of {sorted(pids)}")
 
