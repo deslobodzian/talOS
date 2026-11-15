@@ -721,8 +721,8 @@ bazel run //talOS/launcher:restart_latency -- \
   --start-sim-gateway --sim-gateway-arg=--physics
 ```
 
-It runs the session on loopback ports it picks (`{remote_port}` and
-`{local_port}` in gateway arguments name them) under its own
+It runs the session on loopback ports it picks (the launcher passes them to
+the simulator it starts) under its own
 `TALOS_SHM_NAMESPACE`,
 kills `--node` (default `drivetrain`) `--kills` times (default 10), spaced
 500 ms past `--restart-window-ms` (default 1500), and removes the session and
