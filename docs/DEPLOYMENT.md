@@ -302,8 +302,8 @@ deploy: error: <bundle> not installed (the paths above were its removed copy, <p
 every file the launcher names, at the same path below it. Warnings, from the
 launcher or the warm-up, do not refuse; on acceptance the launcher's graph
 warnings (its `  warning: ` lines, among them a non-critical member that did
-not answer `--describe` and so will not run) are printed, prefixed the same
-way. Stopping `deploy.sh` during the
+not answer `--describe`, which the launch still starts, and a Studio bridge
+that did not, which it leaves out) are printed, prefixed the same way. Stopping `deploy.sh` during the
 check stops the launcher, selects nothing and exits 1.
 
 The check takes nothing a running robot holds: `--describe-only` takes no
