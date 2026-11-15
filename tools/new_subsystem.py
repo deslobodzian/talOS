@@ -3276,19 +3276,45 @@ def dependent_layout(root, config=None, packages=None, talos="@talos"):
         if config is None:
             raise Refused(f"no {' or '.join(DEPENDENT_CONFIGS)} in {root}; "
                           "name the robot config with --config")
-    config = posixpath.normpath(config.replace(os.sep, "/"))
-    if os.path.isabs(config):
-        config = rel(root, config)
+    config = in_repository(root, config, "--config")
     if not os.path.isfile(os.path.join(root, config)):
-        raise Refused(f"{config} not found; is --config right?")
+        raise Refused(f"--config {config} not found")
     if packages is None:
         try:
             subsystems, _ = sync_manifest.effective(root, config)
         except sync_manifest.ManifestError as err:
             raise Refused(f"cannot read {config}: {err}")
         packages = package_dir(subsystems, config)
-    packages = posixpath.normpath(packages.replace(os.sep, "/"))
-    return Layout(config, "" if packages == "." else packages, talos, "")
+    packages = in_repository(root, packages, "--package-dir")
+    return Layout(config, packages, talos, "")
+
+
+REPOSITORY_MARKERS = ("MODULE.bazel", "WORKSPACE", "WORKSPACE.bazel")
+
+
+def in_repository(root, path, flag):
+    """`path` (relative to `root`, or absolute) as a path relative to the
+    repository at `root` ("" for the root itself), refused naming `flag`
+    when it resolves outside the repository (after `..` and symlinks) or
+    into a repository nested in it, such as the talos/ submodule: its labels
+    would name nothing, and its writes would land outside the robot. An
+    absolute path inside the repository is taken as its relative form."""
+    top = os.path.realpath(root)
+    full = os.path.realpath(os.path.join(root, path))
+    relative = os.path.relpath(full, top).replace(os.sep, "/")
+    if relative == ".." or relative.startswith("../"):
+        raise Refused(f"{flag} {path} is outside the robot repository {root}")
+    relative = "" if relative == "." else relative
+    parts = relative.split("/") if relative else []
+    for depth in range(1, len(parts) + 1):
+        directory = os.path.join(top, *parts[:depth])
+        if any(os.path.isfile(os.path.join(directory, marker))
+               for marker in REPOSITORY_MARKERS):
+            nested = "/".join(parts[:depth])
+            raise Refused(f"{flag} {path} is in {nested}/, a repository "
+                          "nested in the robot repository (it holds a "
+                          "MODULE.bazel or WORKSPACE), not the robot's")
+    return relative
 
 
 def package_dir(subsystems, config):

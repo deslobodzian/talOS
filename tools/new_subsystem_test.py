@@ -30,6 +30,12 @@ def manifest_text(root, config):
         return f.read()
 
 
+# A robot config with one subsystem of its own, and that subsystem's file.
+ROBOT_WITH_ROLLER = ('[robot]\nname = "robot_repo"\n\n[[subsystems]]\n'
+                     'name = "roller"\npath = "subsystems/roller.toml"\n')
+ROLLER = '[subsystem]\nname = "roller"\nnode = "//roller:node"\n'
+
+
 class NewSubsystemTest(unittest.TestCase):
     def test_check_name_accepts_valid_names_and_rejects_invalid_ones(self):
         self.assertIsNone(new_subsystem.check_name("wrist"))
@@ -560,6 +566,70 @@ class NewSubsystemTest(unittest.TestCase):
                 with open(os.path.join(root, "talos", "robot_manifest.bzl"),
                           encoding="utf-8") as f:
                     self.assertEqual(f.read(), "")
+
+    # REQ-DEV-01
+    def test_robot_repository_paths_stay_in_the_repository(self):
+        # --config and --package-dir name places in the robot repository:
+        # one that is absolute outside it, escapes it through `..`, or lies
+        # in a nested repository (the talos/ submodule) is refused before
+        # anything is written; such a path would write outside the robot,
+        # or label its node `///tmp/...:node` or `//../x:node`.
+        files = {
+            "MODULE.bazel": 'module(name = "robot")\n',
+            "BUILD.bazel": 'exports_files(glob(["subsystems/*.toml"]))\n',
+            "robot.toml": ROBOT_WITH_ROLLER,
+            "subsystems/roller.toml": ROLLER,
+            "talos/MODULE.bazel": 'module(name = "talos")\n',
+            "talos/bot/BUILD": "",
+            "talos/bot/robot.toml": ROBOT_WITH_ROLLER,
+            "talos/bot/subsystems/roller.toml": ROLLER,
+        }
+
+        def snapshot(directory):
+            tree = {}
+            for current, _, names in os.walk(directory):
+                for f in names:
+                    path = os.path.join(current, f)
+                    with open(path, "rb") as text:
+                        tree[path] = text.read()
+            return tree
+
+        for flag, value in (
+                ("--config", "{outside}/robot.toml"),
+                ("--config", "../outside/robot.toml"),
+                ("--config", "talos/bot/robot.toml"),
+                ("--package-dir", "{outside}"),
+                ("--package-dir", "../outside"),
+                ("--package-dir", "talos/bot")):
+            with self.subTest(flag=flag, value=value), \
+                    tempfile.TemporaryDirectory() as top, \
+                    mock.patch.object(new_subsystem.sync_manifest,
+                                      "current_repository",
+                                      return_value="talos+"):
+                root = os.path.join(top, "robot")
+                outside = os.path.join(top, "outside")
+                for path, text in {
+                        **{f"robot/{p}": t for p, t in files.items()},
+                        "outside/robot.toml": ROBOT_WITH_ROLLER,
+                        "outside/subsystems/roller.toml": ROLLER,
+                        "outside/BUILD": ""}.items():
+                    os.makedirs(os.path.dirname(os.path.join(top, path)),
+                                exist_ok=True)
+                    with open(os.path.join(top, path), "w",
+                              encoding="utf-8") as f:
+                        f.write(text)
+                before = snapshot(top)
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=root), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(out):
+                    status = new_subsystem.main(
+                        ["feeder", "--lang", "py", flag,
+                         value.format(outside=outside)])
+                self.assertNotEqual(status, 0, out.getvalue())
+                self.assertIn(flag, out.getvalue())
+                self.assertEqual(snapshot(top), before, out.getvalue())
 
     def test_plan_wires_an_estimator_without_a_can_id(self):
         with tempfile.TemporaryDirectory() as root:
