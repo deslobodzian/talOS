@@ -295,16 +295,24 @@ class FactorGraphBackend:
     graph and every later update fails), so none escapes: the smoother
     restarts (_restart) at the last good estimate. A failed odometry step
     is kept; a failed observation is dropped and reported as not fused.
+
+    odometry_std is the odometry's uncertainty accumulated over one update
+    period of the node. Each BetweenFactor covers one drivetrain sample
+    interval dt and gets that sigma scaled by sqrt(dt / period) (white noise:
+    variance grows with time), so the odometry weighs the same against the
+    cameras whatever the drivetrain's rate, and a longer step after a gap
+    is trusted less.
     """
 
-    def __init__(self, kinematics, lag_s, initial, odometry_std, prior_std):
+    def __init__(self, kinematics, update_period_s, lag_s, initial,
+                 odometry_std, prior_std):
         # Loaded here, for this backend only, so a kalman configuration never
         # loads gtsam's ~150 MB of native code.
         self.gtsam = importlib.import_module("gtsam")
         self.kinematics = kinematics
         self.lag_s = lag_s
-        self.odometry_noise = self.gtsam.noiseModel.Diagonal.Sigmas(
-            np.array(odometry_std))
+        self.update_period_s = update_period_s
+        self.odometry_std = np.array(odometry_std)
         self.prior_noise = self.gtsam.noiseModel.Diagonal.Sigmas(
             np.array(prior_std))
         self.smoother = None
@@ -337,9 +345,13 @@ class FactorGraphBackend:
         guess = self.estimate.exp(twist)
         sample = self._append(time_s, previous.odometry.exp(twist))
         graph = self.gtsam.NonlinearFactorGraph()
+        # dt > 0: integrate() passes only samples newer than the last one.
+        noise = self.gtsam.noiseModel.Diagonal.Sigmas(
+            self.odometry_std * math.sqrt(
+                (time_s - previous.time_s) / self.update_period_s))
         graph.add(self.gtsam.BetweenFactorPose2(
             previous.key, sample.key, self._pose2(Pose2d().exp(twist)),
-            self.odometry_noise))
+            noise))
         values = self.gtsam.Values()
         values.insert(sample.key, self._pose2(guess))
         stamps = self.gtsam.FixedLagSmootherKeyTimestampMap()
@@ -496,7 +508,7 @@ class PoseEstimator:
         kalman_args = (initial, _std_devs(node, "kalman", "state_std",
                                           (0.1, 0.1, 0.1)))
         factor_graph_args = (
-            self.max_age_s, initial,
+            node.period, self.max_age_s, initial,
             _std_devs(node, "factor_graph", "odometry_std",
                       (0.01, 0.01, 0.005)),
             _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5)))
