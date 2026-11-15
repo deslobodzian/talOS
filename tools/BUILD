@@ -173,7 +173,7 @@ py_test(
 
 # bazel run //tools:check_node_matrix -- [--baseline FILE] [PATH...]
 # Reports each node test's docs/TESTING.md §7 matrix cases: present, n/a
-# with its reason, or missing (exit 1). CI (the lint job) runs it with
+# with its reason, covered by a parity run, or missing (exit 1). CI (the lint job) runs it with
 # --baseline check_node_matrix_baseline.txt, the missing cases that may only
 # shrink.
 py_binary(
