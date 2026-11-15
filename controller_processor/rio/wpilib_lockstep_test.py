@@ -22,7 +22,7 @@ def _one(pattern, text, what):
 class WpilibLockstepTest(unittest.TestCase):
     def test_gradlerio_and_robotpy_pin_one_release(self):
         gradle = _one(r'id "edu\.wpi\.first\.GradleRIO" version "([^"]+)"',
-                      _read("_main/2026-robot/controller_processor/rio/build.gradle"),
+                      _read("_main/controller_processor/rio/build.gradle"),
                       "GradleRIO plugin version")
         requirements = _read("_main/talOS/python/requirements.txt")
         native = _one(r"^robotpy-native-wpimath==(\S+)", requirements,

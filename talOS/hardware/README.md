@@ -6,7 +6,7 @@ controllers own their PID and Motion Magic calculations; the gateway does not
 implement a second motor PID loop.
 
 `Backend` in `gateway.h` is the platform boundary. `PhoenixBackend` under
-`2026-robot/controller_processor/rio/` implements it with Phoenix 6 on the
+`controller_processor/rio/` implements it with Phoenix 6 on the
 RoboRIO. `SimBackend` (`sim_backend.h`) provides ideal actuators and
 `sim::PhysicsSimBackend` (`sim_physics.h`) a physics-backed model for software
 tests and `sim_gateway`.
@@ -245,7 +245,7 @@ stop is the gateway retry rate, not a measured device guarantee.
 
 References: [CTRE remote sensor control](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/remote-sensors.html)
 and [Motion Magic](https://v6.docs.ctr-electronics.com/en/latest/docs/api-reference/device-specific/talonfx/motion-magic.html).
-Phoenix 6 is pinned in `2026-robot/controller_processor/rio/vendordeps/Phoenix6.json`.
+Phoenix 6 is pinned in `controller_processor/rio/vendordeps/Phoenix6.json`.
 
 ## Runtime Contract
 
@@ -310,7 +310,7 @@ waits at most 50 ms for the reader to stop; a reader stuck in a status read
 that never returns is abandoned with a console line naming the bus, and
 while two abandoned readers are still blocked no new one starts and every
 bus reads `STALE`
-([`CanBusHealth.h`](../../2026-robot/controller_processor/rio/src/main/include/CanBusHealth.h)).
+([`CanBusHealth.h`](../../controller_processor/rio/src/main/include/CanBusHealth.h)).
 Peers of another protocol version (`kProtocolVersion`, see
 [DATA_FLOW.md](../../docs/DATA_FLOW.md)) are rejected rather than decoded.
 CANcoder samples contain angle
@@ -489,7 +489,7 @@ DIO/analog/PWM and RIO encoder validity never sink the backend.
 
 ## RoboRIO
 
-`2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp` is the thin WPILib
+`controller_processor/rio/src/main/cpp/Robot.cpp` is the thin WPILib
 adapter. Its companion (main processor) address is fixed when it is built:
 `./gradlew deploy -Pcompanion=<ipv4>` (or `buildRio`), `10.56.87.11` without
 the property. `build.gradle` takes it only from the command line: a
@@ -782,7 +782,7 @@ commit's first 16 hex digits
 Build without deploying:
 
 ```sh
-cd 2026-robot/controller_processor/rio
+cd controller_processor/rio
 ./gradlew buildRio
 ./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader
 ```

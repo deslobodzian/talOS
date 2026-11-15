@@ -291,7 +291,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/main_processor/vision` | REQ-CONTRACT-27 |
 | `2026-robot/main_processor/simulation` | REQ-DEV-05, REQ-DEV-06; composition evidence for REQ-SAFE-31, REQ-SAFE-33 |
 | `2026-robot/main_processor/configuration`, `bench` | REQ-SAFE-26, REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15; the bench nodes: REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-DEV-26 (swerve module) |
-| `2026-robot/controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24 |
+| `controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
 | `tools`, `examples` | REQ-CONTRACT-19, REQ-CONTRACT-31, REQ-DEV-01 to REQ-DEV-03, REQ-DEV-12, REQ-DEV-23, REQ-DEV-25, REQ-DEV-30, REQ-OPS-47 |

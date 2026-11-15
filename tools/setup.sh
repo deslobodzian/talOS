@@ -24,7 +24,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RIO_DIR="$ROOT/2026-robot/controller_processor/rio"
+RIO_DIR="$ROOT/controller_processor/rio"
 ROBOT_CONFIG="2026-robot/main_processor/configuration/robot.toml"
 
 # Pins. Bazel itself, Python 3.11, Node 22.14.0 and pnpm inside Bazel are

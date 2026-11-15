@@ -21,7 +21,7 @@
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
 # and examples/wrist_repo, the repositories that depend on talOS),
 # checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
-# --offline`, for 2026-robot/controller_processor/ and talOS/, whose headers
+# --offline`, for controller_processor/ and talOS/, whose headers
 # the RoboRIO program's build.gradle exports) and studio-test and
 # studio-build (`pnpm test`, `pnpm build`, for studio/).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
@@ -251,7 +251,7 @@ run_step checkout-unchanged sh -c \
 
 # build.gradle compiles sources from talOS/protocol, talOS/hardware and
 # talOS/driver_station and exports every header under talOS/.
-rio_paths=(2026-robot/controller_processor/ talOS/)
+rio_paths=(controller_processor/ talOS/)
 if [ "$skip_gradle" = 1 ]; then
   report "gradle skipped (--skip-gradle)"
 elif ! touches "${rio_paths[@]}"; then
@@ -259,7 +259,7 @@ elif ! touches "${rio_paths[@]}"; then
 else
   export JAVA_HOME="${JAVA_HOME:-$HOME/wpilib/2026/jdk}"
   run_step gradle sh -c \
-    'cd 2026-robot/controller_processor/rio && ./gradlew phoenixTest buildRio -Pheadless --offline' ||
+    'cd controller_processor/rio && ./gradlew phoenixTest buildRio -Pheadless --offline' ||
     true
 fi
 

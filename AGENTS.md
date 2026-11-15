@@ -31,7 +31,7 @@ bazel run //talOS/launcher -- --config $PWD/2026-robot/main_processor/configurat
 - Packet/slot size changes: follow RULES.md 9 (`docs/DATA_FLOW.md` and the size assert).
 - Graph/naming changes (topics, nodes, configs): run `--describe-only` on every
   affected config; the launcher refuses a graph that breaks a rule.
-- RoboRIO program (`2026-robot/controller_processor/rio`) builds with GradleRIO,
+- RoboRIO program (`controller_processor/rio`) builds with GradleRIO,
   not Bazel: `./gradlew phoenixTest` and `./gradlew buildRio` from that directory.
 - Studio (`studio/`): `pnpm test`, `pnpm build` (runs `tsc --noEmit`);
   regenerate TS bindings with `pnpm generate` after editing `talOS/telemetry/telemetry.fbs`.

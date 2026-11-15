@@ -30,7 +30,7 @@ class LintTestTimeTest(unittest.TestCase):
         for path, text, extra in (
                 ("talOS/rtms/rtms_test.cc", SLEEP, {}),
                 ("talOS/rtms/alias_test.cc", ALIAS_CLOCK, {}),
-                ("2026-robot/controller_processor/rio/src/test/cpp/"
+                ("controller_processor/rio/src/test/cpp/"
                  "Loop_test.cpp", CLOCK, {}),
                 ("talOS/python/test_node.py", PY_CLOCK, {}),
                 ("studio/bridge/thing_test.py", PY_SLEEP, {}),

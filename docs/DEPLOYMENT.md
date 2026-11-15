@@ -380,7 +380,7 @@ reader's time namespace, so a node in another would judge live claims dead.
 
 ## RoboRIO
 
-`2026-robot/controller_processor/rio` is deployed with GradleRIO
+`controller_processor/rio` is deployed with GradleRIO
 (`./gradlew deploy` in that directory). It sends to the companion address it
 was built with, port 5803: `10.56.87.11` unless the main processor's address
 differs, then `./gradlew deploy -Pcompanion=<ipv4>`

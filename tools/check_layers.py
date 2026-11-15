@@ -12,7 +12,8 @@ ARCHITECTURE.md "Layers" and "Allowed dependencies"
   never depends on a layer above it, nor on the talOS packages built on the
   stack (the bridge, launcher, framework nodes, node_api, python), and
   talOS/node drives no hardware (it never depends on talOS/hardware);
-- nothing under talOS/ depends on a robot, an example, the bench or studio/;
+- nothing under talOS/ depends on a robot, an example, the bench, a
+  controller processor's program or studio/;
 - talOS/geometry never depends on talOS/vision;
 - talOS/python reaches the rest of talOS only through talOS/node_api's C ABI,
   generated messages and schemas, and C++ nodes exported for talos.cpp_node;
@@ -55,7 +56,8 @@ ON_THE_STACK = (
 HARDWARE = "talOS/hardware"
 
 # Robot code and what sits beside talOS; talOS never depends on them.
-OUTSIDE_TALOS = ("2026-robot", "bench", "examples", "studio")
+OUTSIDE_TALOS = ("2026-robot", "bench", "controller_processor", "examples",
+                 "studio")
 
 # Where robot, example and bench node packages live.
 NODE_ROOTS = ("2026-robot", "bench", "examples")
