@@ -55,7 +55,8 @@ check below.
   [bridge_status.fbs](../talOS/bridge/bridge_status.fbs)). `owner timed out`: an actuator node is
   not commanding (down or crash-looping; see Subsystems). `can bus unread`:
   a CAN bus's status read is failing or stopped, so its health is unknown
-  (Studio's Hardware panel and the RoboRIO console name the bus). The Raised list
+  (Studio's Hardware panel shows which bus by its slot, `rio` first; the
+  RoboRIO console names it). The Raised list
   keeps every alert seen this match with its count: read it after the match.
 - [ ] Field: the robot drawn at its starting position, with no `POSE NOT
   VALID` (odometry not integrating fresh input) or `NOT LOCALIZED` (the
