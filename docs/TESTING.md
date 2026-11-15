@@ -241,6 +241,14 @@ observer). A
 actuator; a Python package that only wraps C++ nodes (`talos.cpp_node`) is
 checked in its C++ package.
 
+A node implemented in both languages (a C++ class and a Python class, not a
+`talos.cpp_node` wrapper) also runs one shared scenario through
+`talos.parity` against both (REQ-CONTRACT-14): the inputs of matrix cases
+1 to 8, 10 and 11 as steps, including a Driver Station mode change (teleop,
+disabled, autonomous, teleop) with targets stamped under each earlier
+generation. The
+[node development guide](NODE_DEVELOPMENT_GUIDE.md#testing) gives the API.
+
 A case that does not apply is a comment in the test file naming why:
 `// matrix: n/a 7 (no feedback device)`. Case 12 does not apply to:
 
