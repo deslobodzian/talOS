@@ -1,7 +1,8 @@
 """Node tests: the class on talos.testing.Sim, and the binary.
 
-ScaffoldPyTest is the node test matrix, docs/TESTING.md §7: the case names are
-the matrix's, which //tools:check_node_matrix looks for.
+ScaffoldPyTest is the node test matrix, docs/TESTING.md §7 in the talos
+repository: the case names are the matrix's, which talos's
+//tools:check_node_matrix looks for.
 """
 
 import os

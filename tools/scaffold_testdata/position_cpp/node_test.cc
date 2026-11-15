@@ -44,8 +44,8 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
-// The node test matrix, docs/TESTING.md §7: the case names are the matrix's,
-// which //tools:check_node_matrix looks for.
+// The node test matrix, docs/TESTING.md §7 in the talos repository: the case
+// names are the matrix's, which talos's //tools:check_node_matrix looks for.
 class PositionCppTest : public ::testing::Test {
  protected:
   using Target = PositionCpp::Target;
@@ -192,7 +192,8 @@ TEST_F(PositionCppTest, NonFiniteDemandGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
-// matrix: n/a 9 (PositionMechanism's parameters, tested in talOS/mechanisms)
+// matrix: n/a 9 (PositionMechanism's parameters, tested in talos's
+// talOS/mechanisms)
 
 // REQ-SAFE-07
 TEST_F(PositionCppTest, OtherModesLaneIsIgnored) {
@@ -258,10 +259,11 @@ TEST_F(PositionCppTest, UpdateDoesNotAllocate) {
 // clamps goals to min_rot..max_rot and latches FAILED when homing does not
 // move. If you drive the Motor yourself instead, replace them with tests of
 // your own behaviour. The tests above are the node test matrix
-// (docs/TESTING.md §7) that every actuator node keeps; they expect Motion
-// Magic requests (Mode::kMotionMagic), PositionMechanism's mode, so change
-// that if your node drives another, and replace the matrix's n/a 9 with
-// BadParameterFailsConstruction once the node reads parameters of its own.
+// (docs/TESTING.md §7 in the talos repository) that every actuator node
+// keeps; they expect Motion Magic requests (Mode::kMotionMagic),
+// PositionMechanism's mode, so change that if your node drives another, and
+// replace the matrix's n/a 9 with BadParameterFailsConstruction once the node
+// reads parameters of its own.
 //
 // The values are testdata/position_cpp.toml's.
 constexpr double kHomingVolts = -1.0;

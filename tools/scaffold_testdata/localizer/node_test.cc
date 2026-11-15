@@ -37,8 +37,9 @@ std::string Runfile(const char* env) {
   return runfiles->Rlocation(location);
 }
 
-// The node test matrix for an observer, docs/TESTING.md §7: the case names
-// are the matrix's, which //tools:check_node_matrix looks for.
+// The node test matrix for an observer, docs/TESTING.md §7 in the talos
+// repository: the case names are the matrix's, which talos's
+// //tools:check_node_matrix looks for.
 class LocalizerTest : public ::testing::Test {
  protected:
   using State = Localizer::State;

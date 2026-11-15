@@ -15,7 +15,7 @@ namespace position_cpp {
 //
 // The control is a talos::mechanisms::PositionMechanism, configured by the
 // subsystem file: the motor [motors.position_cpp] and the
-// parameter table [position_cpp] (keys and units in
+// parameter table [position_cpp] (keys and units in the talos repository's
 // talOS/mechanisms/README.md). It runs Motion Magic to the goal, clamped to
 // min_rot..max_rot, and homes on the switch position_cpp_home:
 // positions count from that switch, not from where the motor powered on.
