@@ -74,15 +74,22 @@ Options:
   --alliance A      blue or red (default blue): TALOS_SIM_DS_ALLIANCE with
                     --headless, the simulator's --alliance with --sim-gateway
   --no-studio       skip the Studio bridge and the browser
-  --no-rio          use an existing controller (skip WPILib sim and gateway)
+  --no-rio          use an existing controller (skip WPILib sim and gateway);
+                    without --sim-gateway it refuses --mode-schedule,
+                    --joystick-schedule and --alliance (that controller's
+                    Driver Station decides them)
   --sim-gateway     start the lightweight physics simulator instead of WPILib
-                    (implies --no-rio; conflicts with WPILib sim)
+                    (implies --no-rio; aliases --with-sim-gateway,
+                    --lightweight-sim)
   --gateway-arg ARG forward one argument verbatim to sim_gateway (repeatable;
                     requires --sim-gateway, which always enables --physics)
   --no-open         start Studio but do not open a browser
   --duration-s N    pass --duration-s N to the launcher
   --http-port N     Studio HTTP port (default 5800)
   -h, --help        this message
+
+Each run's session logs go to /tmp/talos_logs/<session_id> (launcher and
+controller output in its sim/ subdirectory).
 USAGE
 }
 

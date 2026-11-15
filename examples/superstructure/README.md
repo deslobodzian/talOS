@@ -168,7 +168,8 @@ messages/          shared by the C++ and Python nodes
   intake.fbs  elevator.fbs  superstructure.fbs   namespace demo; structs + enums
   BUILD                                          talos_messages(topics = {...}, include_prefix = "demo")
 config/
-  subsystems/      intake.toml  elevator.toml  superstructure.toml: devices + params
+  subsystems/      intake.toml  elevator.toml  superstructure.toml: devices + params;
+                   telemetry.toml: the telemetry node's subsystem
   robot.toml       the example robot's manifest, launching cpp/
   robot_py.toml    the same manifest, launching py/ (only the `node =` lines differ)
 cpp/               the C++ node implementations, shared library, and test
