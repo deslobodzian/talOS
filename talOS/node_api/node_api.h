@@ -155,7 +155,9 @@ int64_t talos_node_publish_bytes(TalosNode* node, const char* topic,
                                  int32_t drop_newest, int32_t external);
 int32_t talos_node_every(TalosNode* node, int64_t period_ns, TalosCallback fn,
                          void* user);
-// The update() the framework calls every period.
+// The update() the framework calls every period. --describe then reports the
+// node's update as one through the C ABI ("abi_update"), which the launcher
+// holds to its Python actuator period rule.
 int32_t talos_node_set_update(TalosNode* node, TalosCallback fn, void* user);
 
 // Subscription `index`: the latest message (zeros until the first), ...

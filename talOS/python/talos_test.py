@@ -250,6 +250,33 @@ class RunTest(unittest.TestCase):
             {"subsystem": "follower", "key": "gain"},
         ])
 
+    # REQ-RT-23: a Python update() reaches --describe as abi_update, by which
+    # the launcher holds a Python actuator owner to 20 ms or slower.
+    def test_describe_reports_a_python_update(self):
+        probe = textwrap.dedent("""
+            import sys, tempfile
+            import talos
+
+            class Probe:
+                def __init__(self, node):
+                    pass
+
+                def update(self):
+                    pass
+
+            with tempfile.NamedTemporaryFile("w", suffix=".toml") as config:
+                config.write(sys.argv[1])
+                config.flush()
+                sys.exit(talos.run(Probe, "planner", "//talOS/python:probe",
+                                   ["probe", "--describe", "--config",
+                                    config.name]))
+        """)
+        result = subprocess.run([sys.executable, "-c", probe, ROBOT_TOML],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        described = json.loads(result.stdout[result.stdout.index("{"):])
+        self.assertTrue(described["abi_update"])
+
 
 class BorrowedLifetimeTest(unittest.TestCase):
     def test_wrappers_keep_sim_alive_until_native_teardown(self):

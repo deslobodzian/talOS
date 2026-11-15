@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cerrno>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -18,11 +19,13 @@
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <system_error>
 #include <thread>
 #include <tuple>
 #include <utility>
 
+#include "talOS/hardware/config.h"
 #include "talOS/launcher/session.h"
 #include "talOS/launcher/spawn.h"
 #include "talOS/schema/identity.h"
@@ -441,6 +444,36 @@ std::vector<naming::Diagnostic> LintParameterKeys(
           {silent.empty() ? naming::Severity::ERROR : naming::Severity::WARNING,
            name, std::move(message)});
     }
+  }
+  return findings;
+}
+
+std::vector<naming::Diagnostic> LintPythonActuatorPeriods(
+    const config::RobotConfig& robot_config,
+    const std::vector<NodeDescription>& described) {
+  std::vector<naming::Diagnostic> findings;
+  for (const auto& node : described) {
+    if (!node.answered || !node.declared.abi_update) continue;
+    const hardware::Devices* devices =
+        robot_config.GetDevices(node.roster_name);
+    if (devices == nullptr || !devices->owns_actuators()) continue;
+    // As the node reads it (Node's constructor), and config load has
+    // already refused a period_us that is not an integer.
+    std::int64_t period_us = robot_config.hardware.period_us;
+    if (const toml::table* table =
+            robot_config.GetSubsystemTable(node.roster_name)) {
+      period_us = (*table)["period_us"].value_or(period_us);
+    }
+    if (period_us >= kMinPythonActuatorPeriodUs) continue;
+    findings.push_back(
+        {naming::Severity::ERROR, node.roster_name,
+         "a Python node owning a motor, digital output or PWM output runs at "
+         "period_us " +
+             std::to_string(period_us) + ", below the minimum of " +
+             std::to_string(kMinPythonActuatorPeriodUs) +
+             " us for one (docs/METHODOLOGY.md §10); set its period_us to " +
+             std::to_string(kMinPythonActuatorPeriodUs) +
+             " or slower, or write the node in C++"});
   }
   return findings;
 }

@@ -86,7 +86,13 @@ struct NodeAccess {
   static std::unique_ptr<Node> create(NodeSetup setup);
 
   // Called on every tick before the after_update hooks. Set before start().
+  // Clears abi_update.
   static void set_update(Node& node, std::function<void()> update);
+  // node_api's talos_node_set_update: the update() just set is a callback
+  // through the C ABI, a Python node's, so its ticks run the interpreter.
+  // --describe reports it (introspect::Description::abi_update).
+  static void mark_abi_update(Node& node);
+  static bool abi_update(const Node& node);
   // Registers the tick timer (when there is an update() or an after_update
   // hook), arms it one period after now, and picks the loop's delivery: see
   // require_immediate_delivery. Called once, after the user's object is

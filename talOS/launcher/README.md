@@ -161,6 +161,24 @@ is not checked either, which is a warning, and while any such node exists
 every finding is a warning. Probes run with the session's `--sim`, so a key a
 node reads only in simulation is unread on the robot.
 
+## Python actuator periods
+
+A Python node adds its interpreter's and garbage collector's jitter to every
+tick, so one that owns actuators runs at 20 ms or slower
+([METHODOLOGY.md §10](../../docs/METHODOLOGY.md#10-performance)). After phase
+one the launcher checks every subsystem whose own node's describe reports
+`abi_update` (its `update()` is a callback through the C ABI: a Python node's;
+a `talos.cpp_node`'s `update()` is C++ and is not one) and whose devices own a
+motor, digital output or PWM output (`LintPythonActuatorPeriods`): a
+`period_us`, its own or else `[robot] period_us`, below 20000 is an error
+naming the subsystem, its period and the minimum:
+
+    error: motor: a Python node owning a motor, digital output or PWM output runs at period_us 5000, below the minimum of 20000 us for one (docs/METHODOLOGY.md §10); set its period_us to 20000 or slower, or write the node in C++
+
+Since an actuator owner's `period_us` is also at most a quarter of
+`command_timeout_us` ([the tick](../../ARCHITECTURE.md#the-tick)), a config
+with a Python actuator owner needs a `command_timeout_us` of at least 80000.
+
 ## Live endpoints
 
 The lint checks the graph the probes declared, so a node must declare the same

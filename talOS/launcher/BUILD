@@ -76,12 +76,27 @@ cc_library(
         ":spawn",
         "//talOS/configuration",
         "//talOS/events:events_core",
+        "//talOS/hardware:config",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
         "//talOS/rtms",
         "//talOS/schema:identity",
         "//talOS/schema:unit_suffix",
         "@tomlplusplus//:toml++",
+    ],
+)
+
+# The graph rule on a Python actuator owner's period, on parsed configs and
+# hand-built descriptions.
+cc_test(
+    name = "python_period_test",
+    size = "small",
+    srcs = ["python_period_test.cc"],
+    deps = [
+        ":describe_graph",
+        "//talOS/configuration",
+        "//talOS/introspection:names",
+        "@googletest//:gtest_main",
     ],
 )
 

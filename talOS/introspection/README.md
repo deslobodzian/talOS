@@ -97,7 +97,7 @@ stderr without refusing publication. Timer labels are not checked as topics.
 
 `describe.h` writes and reads a node's `--describe` answer
 (`DescribeToJson`, `DescribeReader`; format version 1): its name, target,
-`reads_graph`, `params` and `sources`. `params` lists every parameter key the
+`reads_graph`, `holds_stop`, `abi_update`, `params` and `sources`. `params` lists every parameter key the
 node's constructor read (`Node::param`, `param_of`; set in the config or not),
 in first-read order, as `{"subsystem": ..., "key": ...}`; the launcher refuses
 a subsystem key no node lists
@@ -110,6 +110,12 @@ Python alike, set once in its `--describe` path): its run installs the stop
 handlers before anything that can wait, and that unblocks SIGINT, SIGTERM and
 SIGHUP (`process::kHeldStopSignals`), so it may be started with them blocked
 and a stop sent during its start-up taken then. Absent reads as false.
+`abi_update` is true when the node's `update()` was installed through the C
+ABI (`talos_node_set_update`), which only a Python node does; a C++
+`update()`, a `talos.cpp_node`'s included, leaves it false, as does a
+describe without the field. The launcher holds such a node that owns
+actuators to 20 ms or slower
+([Python actuator periods](../launcher/README.md#python-actuator-periods)).
 
 ## Who drives a subsystem
 
