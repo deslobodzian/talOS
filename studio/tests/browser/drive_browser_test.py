@@ -27,7 +27,6 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 import tomllib
 import unittest
 import uuid
@@ -464,10 +463,7 @@ class ChildSignalsItsGroupOnlyUnreaped(unittest.TestCase):
         self.assertTrue(child.signal_group(signal.SIGKILL))
         # exited() sees the exit and leaves it unreaped: reap() still reads
         # the SIGKILL status, which a reaped pid would have lost.
-        deadline = time.monotonic() + 10
-        while not child.exited():
-            self.assertLess(time.monotonic(), deadline, "the killed child never read as exited")
-            time.sleep(0.01)
+        self.assertTrue(child.wait_exited(10), "the killed child never read as exited")
         self.assertTrue(child.exited())
         self.assertEqual(child.reap(), -signal.SIGKILL)
         self.assertFalse(child.signal_group(signal.SIGKILL))

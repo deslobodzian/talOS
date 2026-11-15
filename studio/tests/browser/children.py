@@ -32,6 +32,33 @@ def _exited_unreaped(pid):
         kq.close()
 
 
+def _wait_exited_unreaped(pid, timeout):
+    """Waits up to `timeout` seconds for child `pid` to exit, without reaping
+    it or polling: a pidfd on Linux (a blocking waitid with WNOWAIT where
+    Python lacks pidfd_open), the kqueue NOTE_EXIT event on macOS."""
+    if hasattr(os, "pidfd_open"):
+        fd = os.pidfd_open(pid)
+        try:
+            return bool(select.select([fd], [], [], timeout)[0])
+        finally:
+            os.close(fd)
+    if hasattr(os, "waitid"):
+        # A Linux Python built without pidfd_open: block on the exit itself
+        # (no timeout; the caller's own test timeout bounds it).
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+        return True
+    kq = select.kqueue()
+    try:
+        event = select.kevent(pid, select.KQ_FILTER_PROC,
+                              select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)
+        try:
+            return bool(kq.control([event], 1, timeout))
+        except ProcessLookupError:
+            return True
+    finally:
+        kq.close()
+
+
 class Child:
     def __init__(self, args, killpg=os.killpg, **popen):
         """`killpg` is the group signal (a test passes a recorder)."""
@@ -50,6 +77,12 @@ class Child:
         if self.reaped:
             return True
         return _exited_unreaped(self.pid)
+
+    def wait_exited(self, timeout):
+        """Whether the leader exits within `timeout` seconds; never reaps."""
+        if self.reaped:
+            return True
+        return _wait_exited_unreaped(self.pid, timeout)
 
     def signal_group(self, sig):
         """Signals the group; False once reaped, when it signals nothing."""
