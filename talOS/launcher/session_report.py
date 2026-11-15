@@ -546,11 +546,16 @@ def markdown(report):
 
 
 def log_dump_path():
+    """log_dump from this tool's runfiles, in whichever repository holds
+    talOS: the main one (`_main`) or a dependency (its canonical name)."""
     files = runfiles.Create()
-    binary = files.Rlocation("_main/talOS/launcher/log_dump") if files else None
+    repository = (files.CurrentRepository() or "_main") if files else ""
+    binary = files.Rlocation(f"{repository}/talOS/launcher/log_dump") if files else None
     if not binary or not Path(binary).is_file():
         raise FileNotFoundError(
-            "log_dump runfile not found; run with bazel run //talOS/launcher:session_report")
+            "log_dump runfile not found; run with `bazel run //talOS/launcher:session_report` "
+            "in talOS, or `bazel run @talos//talOS/launcher:session_report` in a "
+            "repository that depends on it")
     return binary
 
 

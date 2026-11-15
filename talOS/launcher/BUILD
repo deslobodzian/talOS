@@ -328,6 +328,8 @@ cc_binary(
     name = "session_report_fixture",
     testonly = True,
     srcs = ["testdata/session_report_fixture.cc"],
+    # examples/robot_repo's session_report_test records its session with it.
+    visibility = ["//visibility:public"],
     deps = [
         ":session",
         "//talOS/driver_station",

@@ -14,10 +14,11 @@ workspace.
 
 ```sh
 cd examples/robot_repo
-bazel test //...                       # graph test, node tests, sim smoke and Studio tests
+bazel test //...                       # graph test, node tests, sim smoke, Studio and session_report tests
 bazel build //:robot_bundle            # the deployable bundle
 bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)
+bazel run @talos//talOS/launcher:session_report -- <session dir>   # a recorded session's report
 bazel run @talos//tools:sync_manifest -- robot.toml   # after editing [[subsystems]]
 ```
 
