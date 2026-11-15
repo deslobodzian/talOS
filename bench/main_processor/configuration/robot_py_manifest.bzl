@@ -19,6 +19,7 @@ CONFIG_FILES = [
     "//bench/main_processor/configuration:robot.toml",
     "//bench/main_processor/configuration:subsystems/gyro.toml",
     "//bench/main_processor/configuration:subsystems/motor.toml",
+    "//bench/main_processor/configuration:subsystems/motor_py.toml",
     "//bench/main_processor/configuration:subsystems/swerve_module.toml",
     "//bench/main_processor/configuration:subsystems/telemetry.toml",
     "//bench/main_processor/configuration:subsystems/teleop.toml",

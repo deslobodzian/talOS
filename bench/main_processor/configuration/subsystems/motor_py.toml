@@ -1,0 +1,10 @@
+# The bench motor for robot_py.toml's Python twin (motor/motor.py): every
+# device, limit and parameter is motor.toml's (`defaults`); only the node and
+# the period differ. A Python node that owns a motor runs at period_us 20000
+# or slower (docs/METHODOLOGY.md §10), which also keeps it within a quarter
+# of [robot] command_timeout_us (100000).
+[subsystem]
+name = "motor"
+defaults = "motor.toml"
+node = "//bench/main_processor/motor:node_py"
+period_us = 20000

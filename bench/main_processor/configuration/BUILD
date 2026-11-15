@@ -8,7 +8,8 @@ load(":robot_py_manifest.bzl", PY_CONFIG_FILES = "CONFIG_FILES", PY_NODES = "NOD
 package(default_visibility = ["//visibility:public"])
 
 # robot.toml launches the C++ motor node, robot_py.toml the Python one (same
-# subsystem files; only the motor's `node =` differs), and robot_bench.toml
+# subsystem files, except the motor's motor_py.toml: motor.toml's devices
+# with the Python node at 20 ms), and robot_bench.toml
 # is robot.toml at the bench's RoboRIO address. Each has a generated
 # <stem>_manifest.bzl; regenerate with `bazel run //tools:sync_manifest --
 # <config>` after editing it.
@@ -36,8 +37,8 @@ cc_test(
     srcs = ["config_golden_test.cc"],
     data = [
         "robot_bench.toml",
-        "robot_py.toml",
         ":robot_config",
+        ":robot_py_config",
     ],
     deps = [
         "//talOS/configuration",
