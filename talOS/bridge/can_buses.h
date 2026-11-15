@@ -33,8 +33,7 @@ static_assert(static_cast<uint8_t>(::bridge::CanBusReadState::SIMULATED) ==
               static_cast<uint8_t>(CanBusReadState::kSimulated));
 static_assert(::bridge::CanBusReadState::MAX ==
                   ::bridge::CanBusReadState::SIMULATED &&
-              kLastCanBusReadState ==
-                  CanBusReadState::kSimulated);
+              kLastCanBusReadState == CanBusReadState::kSimulated);
 static_assert(kMaxCanBuses == 4,
               "BridgeStatus::can_buses holds kMaxCanBuses slots");
 
@@ -64,9 +63,7 @@ class CanBusTable {
   }
 
   uint8_t count() const { return count_; }
-  const CanBusSample& slot(std::size_t index) const {
-    return slots_[index];
-  }
+  const CanBusSample& slot(std::size_t index) const { return slots_[index]; }
 
   // alert_warning_can_bus_unread: a slot below the count reads kFailed or
   // kStale.
