@@ -10,9 +10,9 @@ one. Only update() reads the queues, so the callback waits for the drain
 before it (at-drain) instead of waking the node for every frame. As
 generated it follows the most certain usable observation of the tick and is
 valid while one arrived within observation_timeout_us; fuse odometry here
-(see 2026-robot/main_processor/pose_estimator, which runs wpimath's
-SwerveDrive4PoseEstimator or a GTSAM smoother). It drives nothing, so it
-runs whether the robot is enabled or not.
+(for example wpimath's SwerveDrive4PoseEstimator or a GTSAM smoother, from
+talOS's Python requirements). It drives nothing, so it runs whether the
+robot is enabled or not.
 """
 
 import collections

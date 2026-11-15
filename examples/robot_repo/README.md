@@ -40,9 +40,10 @@ includes `robot.toml`. Its labels name talOS by `@talos//`. `--config PATH`
 names another robot config (default `robot.toml`, else
 `main_processor/configuration/robot.toml`); `--package-dir DIR` puts the
 package elsewhere. Its `Next:` lists the placeholders to replace (the CAN
-id) and simulation-only lines for a `robot_sim.toml`. This fixture's
-`//:sim` runs `robot.toml`, not that file, and no `manifest_sync_test`
-checks it, so here those lines do not make the mechanism move.
+id) and simulation-only lines for a `robot_sim.toml`, then the command that
+runs it: `bazel run //:sim` when the root `talos_sim` names that file, else
+(as here, where `//:sim` runs `robot.toml`) `@talos//talOS/launcher` on it
+with `--sim --start-sim-gateway`.
 
 `bazel test //...` passes right after the scaffold. In a robot whose config
 requires target coverage (`[robot] require_target_coverage = true`, set
