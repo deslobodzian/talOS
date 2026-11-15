@@ -1,3 +1,5 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@talos//studio/bridge:webroot.bzl", "studio_webroot")
 load("@talos//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test", "talos_sim", "talos_sim_test")
 load("@talos//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
@@ -8,6 +10,16 @@ exports_files(["robot.toml"] + glob(["subsystems/*.toml"]))
 
 # The simulator robot.toml's [robot] sim_gateway names.
 SIMULATOR = "@talos//talOS/simulation:sim_gateway"
+
+# The Studio bridge robot.toml's [studio] bridge names.
+STUDIO_BRIDGE = "@talos//studio/bridge:studio_bridge"
+
+# Studio's pages, bazel-bin/studio_webroot, robot.toml's [studio] webroot:
+# empty until the talOS checkout builds them (MODULE.bazel's studio_web).
+studio_webroot(
+    name = "studio_webroot",
+    srcs = ["@studio_web//:files"],
+)
 
 # Fails, with the regenerate command, when robot_manifest.bzl is stale.
 manifest_sync_test(
@@ -34,11 +46,17 @@ talos_bundle(
 )
 
 # `bazel run //:sim -- [launcher arguments]` runs the robot against the
-# simulator, e.g. `bazel run //:sim -- --duration-s 10`.
+# simulator, e.g. `bazel run //:sim -- --duration-s 10`, and with
+# `-- --start-studio-bridge` serves Studio on http://localhost:5800
+# ([studio] http_port) and the driver dashboard at /drive.
 talos_sim(
     name = "sim",
     config = "robot.toml",
-    data = CONFIG_FILES + [SIMULATOR],
+    data = CONFIG_FILES + [
+        SIMULATOR,
+        STUDIO_BRIDGE,
+        ":studio_webroot",
+    ],
     nodes = NODES,
 )
 
@@ -49,4 +67,21 @@ talos_sim(
 talos_sim_test(
     name = "sim_smoke_test",
     sim = ":sim",
+)
+
+# e2e: //:sim with --start-studio-bridge until the bridge is up; /drive
+# answers (the page, or how to build it), and after the stop the bridge ran
+# once and exited 0. About 2 s of real time plus startup. Not a
+# talos_sim_test: that check waits for every member's registry row, and the
+# Studio bridge takes none.
+py_test(
+    name = "studio_test",
+    size = "small",
+    srcs = ["studio_test.py"],
+    data = [":sim"],
+    tags = [
+        "e2e",
+        "exclusive",
+    ],
+    deps = ["@rules_python//python/runfiles"],
 )
