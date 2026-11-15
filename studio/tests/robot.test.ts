@@ -2,7 +2,12 @@ import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
 import type {Snapshot} from '../src/core';
-import {driverStationMode, robotStatus} from '../src/data/robot';
+import {
+  canBusReading,
+  canBusUnread,
+  driverStationMode,
+  robotStatus
+} from '../src/data/robot';
 import type {SystemGraph, SystemNode} from '../src/system';
 import type {SystemState} from '../src/data/types';
 
@@ -80,7 +85,7 @@ test('robotStatus nulls when channels absent', () => {
   assert.equal(status.ds.alliance, null);
   assert.equal(status.power.battery_v, 12.3);
   assert.equal(status.power.brownout, null);
-  assert.equal(status.power.can_frac, null);
+  assert.deepEqual(status.power.canBuses, []);
   assert.equal(status.power.healthValid, null);
   assert.equal(status.link.stateAge_us, null);
   assert.equal(status.link.configured, null);
@@ -105,4 +110,26 @@ test('alliance is read through its enum labels; out of range is null', () => {
       noSystem).ds.alliance;
   assert.equal(alliance(1), 'blue');
   assert.equal(alliance(5), null);
+});
+
+// REQ-OPS-20: /hw/status lists one slot per configured CAN bus, "rio" first;
+// a bus reads as a percentage only while its last read is current, so a
+// failed or stale one (whose figure is its last good read's) never passes
+// for an idle bus.
+test('CAN buses read their utilization only while their last read is current', () => {
+  const B = 'hw/status/can_buses/';
+  const status = robotStatus(snap({
+    'hw/status/can_bus_count': 3,
+    [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.04,
+    [B + '1/read_state']: 3, [B + '1/utilization_frac']: 0,
+    [B + '1/read_failure_count']: 12,
+    [B + '2/read_state']: 4, [B + '2/utilization_frac']: 0.16,
+    [B + '3/read_state']: 1, [B + '3/utilization_frac']: 0.5
+  }), noSystem);
+  const buses = status.power.canBuses;
+  assert.deepEqual(buses.map(b => b.label), ['rio', 'CAN bus 1', 'CAN bus 2']);
+  assert.deepEqual(buses.map(b => b.state), ['ok', 'failed', 'stale']);
+  assert.deepEqual(buses.map(canBusReading), ['4%', 'failed', 'stale']);
+  assert.deepEqual(buses.map(canBusUnread), [false, true, true]);
+  assert.equal(buses[1].readFailures, 12);
 });

@@ -8,6 +8,7 @@
 #include <exception>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -30,7 +31,7 @@ static_assert(std::string_view{kNodeName} ==
 // 8-byte alignment (talos::kMessageAlignment). ipc::Publisher lays the slot out
 // at alignof(Message), so the two agree only while this holds.
 static_assert(alignof(bridge::BridgeStatus) == 8);
-static_assert(sizeof(bridge::BridgeStatus) == 192,
+static_assert(sizeof(bridge::BridgeStatus) == 264,
               "BridgeStatus size changed; update docs/DATA_FLOW.md");
 // Each actuator-owning subsystem owns at least one such device.
 static_assert(kMaxMotors + kMaxDigitalOutputs + kMaxPwmOutputs <= 32,
@@ -62,6 +63,7 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
   // alone must not decide it, since nodes never see the remote.
   if (simulation_) config_.commissioned = true;
   config_id_ = ConfigurationId(config_);
+  can_buses_ = CanBusTable{config_id_};
   // Heartbeat keeps a live-but-unchanged merge refreshing the gateway at 5x
   // margin inside the command timeout, whatever the config chose. The clamp
   // keeps steady-state traffic near the slowest actuator period (20 ms)
@@ -149,6 +151,7 @@ bool HardwareNode::Open() {
 }
 
 void HardwareNode::OpenTopics() {
+  ReportCanBuses();
   state_pub_ =
       std::make_unique<ipc::Publisher<talos::hardware::Packet>>(kStateTopic);
   cmd_pub_ =
@@ -704,6 +707,7 @@ void HardwareNode::HandleGatewayFrame(const protocol::DecodedFrame& frame,
     last_sample_time_us_ = state.sample_time_us;
     last_state_flags_ = state.flags;
     latest_state_ = state;
+    can_buses_.Observe(state);
     UpdateLinkReady(now_us);
 
     talos::hardware::Packet pkt{};
@@ -787,7 +791,7 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
           ? now_us - last_state_receipt_us_
           : 0;
   const HealthSample& health = latest_state_.health;
-  return bridge::BridgeStatus{
+  bridge::BridgeStatus status{
       states_received_,
       commands_sent_,
       identity_rejected_,
@@ -815,7 +819,8 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       health.valid,
       health.battery_v,
       health.brownout,
-      health.can_utilization_frac,
+      /*alert_warning_can_bus_unread=*/false,  // can_buses_.Fill
+      /*can_bus_count=*/0,
       motor_fault_mask,
       forward_limit_mask,
       reverse_limit_mask,
@@ -829,6 +834,19 @@ bridge::BridgeStatus HardwareNode::Status(uint64_t now_us) const {
       clock_.uncertainty_us(),
       clock_.round_trip_us(),
   };
+  can_buses_.Fill(status);
+  return status;
+}
+
+void HardwareNode::ReportCanBuses() const {
+  const CanBusList buses = CanBuses(config_);
+  std::string table;
+  for (std::size_t i = 0; i < buses.count; ++i) {
+    table += table.empty() ? "" : ", ";
+    table += std::to_string(i) + " " + std::string{buses.names[i]};
+  }
+  std::fprintf(stderr, "hardware_node: /hw/status can_buses slots: %s\n",
+               table.c_str());
 }
 
 void HardwareNode::ReportGatewayBuild(const State& state) {

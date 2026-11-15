@@ -525,9 +525,22 @@ TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
   backend.Read(state);  // Power health does not depend on CAN sample freshness.
   EXPECT_TRUE(state.health.valid);
   EXPECT_DOUBLE_EQ(state.health.battery_v, 7.1);
-  EXPECT_GE(state.health.can_utilization_frac, 0.0);
-  EXPECT_LE(state.health.can_utilization_frac, 1.0);
   frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});
+}
+
+// Under WPILib simulation no CAN bus is read: the slot the gateway asks for
+// reads SIMULATED, never a failing bus or an idle one.
+// REQ-OPS-20
+TEST(PhoenixBackendHealth, SimulationReportsItsCanBusSimulated) {
+  EnsureHal();
+  PhoenixBackend backend(true);
+  hw::Config config;
+  config.motors.push_back(TestMotor(1, "health_motor", 1));
+  ASSERT_TRUE(backend.Configure(config));
+  hw::State state;
+  state.health.can_bus_count = 1;
+  backend.Read(state);
+  EXPECT_EQ(state.health.can_bus.read_state, hw::CanBusReadState::kSimulated);
 }
 
 // Missing gains yield ~0 V, so a closed-loop demand must neither spin the

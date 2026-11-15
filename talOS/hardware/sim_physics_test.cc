@@ -252,11 +252,14 @@ void CheckPowerHealth() {
   Sim backend;
   Gateway gateway{SingleMotorConfig(), backend, 1};
   gateway.Tick(1000, false);
+  // One bus, "rio", simulated: its slot in every State.
+  const CanBusSample simulated{.read_state = CanBusReadState::kSimulated};
   EXPECT_EQ(gateway.snapshot().health,
-            (HealthSample{true, kSimRestingSupplyV, false, 0.0}));
+            (HealthSample{true, kSimRestingSupplyV, false, 1, 0, simulated}));
   backend.SetPowerHealth(6.5, true);
   gateway.Tick(2000, true);
-  EXPECT_EQ(gateway.snapshot().health, (HealthSample{true, 6.5, true, 0.0}));
+  EXPECT_EQ(gateway.snapshot().health,
+            (HealthSample{true, 6.5, true, 1, 0, simulated}));
   // Health remains observable without a live command, including
   // timeout/disable.
   gateway.Tick(200000, true);

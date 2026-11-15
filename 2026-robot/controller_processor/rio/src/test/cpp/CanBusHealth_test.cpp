@@ -1,12 +1,14 @@
-// What State's CAN health reports: the busiest of the RoboRIO's own bus and
-// every CANivore the applied configuration has a device on. A CANivore's
-// status read blocks about 1 ms, so a sampler thread makes it and the 5 ms
-// loop only copies what it published; a failed or stale read never passes for
-// a healthy bus, a configuration change never mixes the old buses' reads into
-// the new set, a read that never returns blocks neither a configuration nor
-// destruction, and nothing reads a CANivore for a configuration or a
-// simulation that has none. The CanBusSampler tests run real threads and
-// wait on their reads (TESTING.md §6.3).
+// What State's CAN health reports: one slot per configured CAN bus, the
+// RoboRIO's own first, each with its utilization, its controller's error
+// counters, its read state and its failed reads. A bus status read is a
+// vendor library call (HAL_CAN_GetCANStatus, CANBus::GetStatus), so a
+// sampler thread makes it and the 5 ms loop only copies what it published; a
+// failed or stale read never passes for a healthy bus, a configuration
+// change never mixes the old buses' reads into the new set, a read that
+// never returns blocks neither a configuration, the loop nor destruction,
+// and nothing is read for a simulation or a configuration with no device.
+// The CanBusSampler tests run real threads and wait on their reads
+// (TESTING.md §6.3).
 #include "CanBusHealth.h"
 
 #include <gtest/gtest.h>
@@ -26,6 +28,7 @@
 #include <vector>
 
 #include "hardware/config.h"
+#include "hardware/messages.h"
 
 namespace {
 
@@ -34,6 +37,7 @@ using talos::rio::CanBusHealth;
 using talos::rio::CanBusSampler;
 using Change = CanBusHealth::Change;
 using Event = CanBusHealth::Event;
+using hw::CanBusReadState;
 
 constexpr uint64_t kLoopPeriodUs = 5'000;
 constexpr uint64_t kPeriodUs = CanBusHealth::kSamplePeriodUs;
@@ -65,16 +69,18 @@ hw::Config Devices(const std::vector<std::string>& motor_buses,
   return config;
 }
 
-// A CANivore reader answering each bus's current figure (OK), and recording
-// which bus each read asked for.
+CanBusHealth::Sample Ok(double frac) { return {true, frac, 0, 0, 0, 0, "OK"}; }
+
+// A bus reader answering each bus's current read (OK with its figure, or
+// what `samples` holds), and recording which bus each read asked for.
 struct Buses {
-  std::map<std::string, double, std::less<>> frac;
+  std::map<std::string, CanBusHealth::Sample, std::less<>> samples;
   std::vector<std::string> reads;
   CanBusHealth::Sample operator()(std::string_view bus) {
     reads.emplace_back(bus);
-    const auto it = frac.find(bus);
-    if (it == frac.end()) return {false, 0.0, "CANBusNotFound"};
-    return {true, it->second, "OK"};
+    const auto it = samples.find(bus);
+    if (it == samples.end()) return {false, 0.0, 0, 0, 0, 0, "CANBusNotFound"};
+    return it->second;
   }
 };
 
@@ -83,160 +89,165 @@ struct Loop {
   explicit Loop(CanBusHealth& polled) : health{polled} {}
   CanBusHealth& health;
   std::vector<Change> changes;
-  double Poll(uint64_t now_us, double rio_frac) {
-    return health.Poll(now_us, rio_frac, [this](const Change& change) {
-      changes.push_back(change);
-    });
+  void Poll(uint64_t now_us) {
+    health.Poll(now_us,
+                [this](const Change& change) { changes.push_back(change); });
   }
 };
 
 // Scenario (bench, 2026-11-14): three Talon FX, a CANcoder and a Pigeon 2,
-// all on the CANivore "Shooter"; the RoboRIO's own bus carries nothing and
-// reads 0. A 30 s session read can_utilization_frac 0 throughout, so a
-// saturated CANivore was invisible. The figure must be the CANivore's, read
-// once for the five devices.
+// all on the CANivore "Shooter", and nothing on the RoboRIO's own bus. One
+// number for every bus read 0 throughout a 30 s session, so a saturated
+// CANivore was invisible. Each bus now has its own slot, "rio" first, with
+// its utilization and its controller's counters, the error counters
+// saturating at 255.
 // REQ-OPS-20
-TEST(CanBusHealth, ReportsTheCanivoreTheBenchDevicesAreOn) {
+TEST(CanBusHealth, ReportsEachBusInItsOwnSlot) {
   CanBusHealth health;
   health.Configure(
       Devices({"Shooter", "Shooter", "Shooter"}, {"Shooter", "Shooter"}),
       /*simulation=*/false);
+  ASSERT_EQ(health.bus_count(), 2u);
   Buses buses;
-  buses.frac["Shooter"] = 0.31;
+  buses.samples["rio"] = Ok(0.0);
+  buses.samples["Shooter"] = {true, 0.31, 2, 7, 300, 96, "OK"};
   health.SampleNext(kStartUs, buses);
+  health.SampleNext(kStartUs + kPeriodUs, buses);
+  EXPECT_EQ(buses.reads, (std::vector<std::string>{"rio", "Shooter"}));
   Loop loop{health};
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + kLoopPeriodUs, 0.0), 0.31)
+  loop.Poll(kStartUs + kPeriodUs + kLoopPeriodUs);
+  EXPECT_EQ(health.Slot(0),
+            (hw::CanBusSample{.read_state = CanBusReadState::kOk}));
+  EXPECT_EQ(health.Slot(1),
+            (hw::CanBusSample{CanBusReadState::kOk, 0.31F, 2, 7, 255, 96, 0}))
       << "the RoboRIO bus's 0 hid the CANivore's load";
-  EXPECT_EQ(buses.reads, std::vector<std::string>{"Shooter"});
+  EXPECT_EQ(health.Slot(2), hw::CanBusSample{}) << "no third bus";
   EXPECT_TRUE(loop.changes.empty());
 }
 
-// The field is one number for every bus: the busiest of them, whichever
-// that is, including the RoboRIO's own bus, which carries the power and
-// pneumatics modules whether or not a configured device is on it. The
-// CANivores are read in turn, so each one's figure is refreshed every
-// (buses) sampling periods.
-// REQ-OPS-20
-TEST(CanBusHealth, ReportsTheBusiestOfTheRoboRioBusAndEveryCanivore) {
+// Under WPILib simulation Phoenix simulates every device whatever its bus:
+// nothing is read, and every slot the configuration lists reads SIMULATED.
+// A configuration with no device at all reads no bus either (no reader
+// thread, REQ-CONTRACT-35), and its "rio" slot is not reported.
+// REQ-OPS-20, REQ-CONTRACT-35
+TEST(CanBusHealth, SimulationAndAnEmptyConfigReadNoBus) {
   CanBusHealth health;
-  health.Configure(Devices({"rio", "Shooter", "Arm"}, {"Arm"}), false);
-  Buses buses;
-  buses.frac["Shooter"] = 0.5;
-  buses.frac["Arm"] = 0.1;
-  for (int i = 0; i < 4; ++i)
-    health.SampleNext(kStartUs + static_cast<uint64_t>(i) * kPeriodUs, buses);
-  EXPECT_EQ(buses.reads,
-            (std::vector<std::string>{"Shooter", "Arm", "Shooter", "Arm"}));
+  health.Configure(Devices({"Shooter"}, {"rio"}), /*simulation=*/true);
+  EXPECT_EQ(health.bus_count(), 0u);
+  EXPECT_EQ(health.board(), nullptr);
   Loop loop{health};
-  const uint64_t now = kStartUs + 3 * kPeriodUs + kLoopPeriodUs;
-  EXPECT_DOUBLE_EQ(loop.Poll(now, 0.2), 0.5);
-  EXPECT_DOUBLE_EQ(loop.Poll(now + kLoopPeriodUs, 0.6), 0.6);
-}
-
-// The 2026 robot and every simulation config put every device on "rio", and
-// under WPILib simulation Phoenix simulates a CANivore's devices without one:
-// neither has a bus to read, and the field stays the RoboRIO bus's figure
-// exactly, as before CANivores counted.
-// REQ-OPS-20
-TEST(CanBusHealth, ARoboRioOnlyOrSimulatedConfigHasNoCanivoreToRead) {
-  for (const bool simulation : {false, true}) {
-    CanBusHealth health;
-    health.Configure(simulation ? Devices({"Shooter"}, {"Shooter"})
-                                : Devices({"rio", "rio"}, {"rio"}),
-                     simulation);
-    EXPECT_EQ(health.bus_count(), 0u);
-    Buses buses;
-    health.SampleNext(kStartUs, buses);
-    EXPECT_TRUE(buses.reads.empty()) << "simulation=" << simulation;
-    Loop loop{health};
-    for (uint64_t now = kStartUs; now < kStartUs + 1'000'000;
-         now += kLoopPeriodUs) {
-      const double rio = 0.01 * static_cast<double>((now / kLoopPeriodUs) % 50);
-      EXPECT_EQ(loop.Poll(now, rio), rio);
-    }
-    EXPECT_TRUE(loop.changes.empty());
+  loop.Poll(kStartUs + 1'000'000);
+  for (std::size_t i = 0; i < 2; ++i) {
+    EXPECT_EQ(health.Slot(i).read_state, CanBusReadState::kSimulated)
+        << "slot " << i;
   }
+  EXPECT_EQ(health.Slot(2).read_state, CanBusReadState::kNone);
+
+  health.Configure(hw::Config{}, /*simulation=*/false);
+  EXPECT_EQ(health.board(), nullptr);
+  loop.Poll(kStartUs + 2'000'000);
+  EXPECT_EQ(health.Slot(0).read_state, CanBusReadState::kNone);
+  EXPECT_TRUE(loop.changes.empty());
 }
 
-// A CANivore whose status read fails (unplugged, renamed, its daemon down)
-// must not read as an idle bus, nor keep its last figure as if current: it
-// drops out of the maximum until it reads again. The loop reports the spell
-// once when it starts and once, with its count, when it ends.
+// A bus whose status read fails (a CANivore unplugged or renamed, the
+// RoboRIO's NetComm call refused) reads FAILED, never an idle bus, keeping
+// its last good figures, and counts every failed read since the
+// configuration was applied. The loop reports the spell once when it starts
+// and once, with its count, when it ends.
 // REQ-OPS-20
-TEST(CanBusHealth, AFailedReadDropsItsBusOutUntilItReadsAgain) {
+TEST(CanBusHealth, AFailedReadReadsFailedAndIsCounted) {
   CanBusHealth health;
-  health.Configure(Devices({"Shooter"}, {}), false);
+  health.Configure(Devices({"rio"}, {}), false);
   Loop loop{health};
   uint64_t now = kStartUs;
   const auto read = [&](CanBusHealth::Sample sample) {
     health.SampleNext(now, [&](std::string_view) { return sample; });
     now += kLoopPeriodUs;
-    const double frac = loop.Poll(now, 0.05);
+    loop.Poll(now);
     now += kPeriodUs - kLoopPeriodUs;
-    return frac;
+    return health.Slot(0);
   };
-  EXPECT_DOUBLE_EQ(read({true, 0.7, "OK"}), 0.7);
+  EXPECT_EQ(read({true, 0.7, 1, 2, 3, 4, "OK"}),
+            (hw::CanBusSample{CanBusReadState::kOk, 0.7F, 1, 2, 3, 4, 0}));
   EXPECT_TRUE(loop.changes.empty());
 
-  EXPECT_DOUBLE_EQ(read({false, 0.0, "CANBusNotFound"}), 0.05)
-      << "a failed bus kept its earlier figure";
+  EXPECT_EQ(read(CanBusHealth::FromHal(0.2F, 9, 9, 9, 9, -1)),
+            (hw::CanBusSample{CanBusReadState::kFailed, 0.7F, 1, 2, 3, 4, 1}))
+      << "a failed read did not keep the last good figures";
   ASSERT_EQ(loop.changes.size(), 1u);
   EXPECT_EQ(loop.changes[0].event, Event::kFailing);
   EXPECT_FALSE(loop.changes[0].stale);
-  EXPECT_STREQ(loop.changes[0].status, "CANBusNotFound");
 
-  read({false, 0.0, "CANBusNotFound"});
+  read({false, 0.0, 0, 0, 0, 0, "CANBusNotFound"});
   // An OK status with a figure that is no fraction is a failed read too.
-  EXPECT_DOUBLE_EQ(read({true, std::numeric_limits<double>::quiet_NaN(), "OK"}),
-                   0.05);
+  EXPECT_EQ(read(Ok(std::numeric_limits<double>::quiet_NaN())).read_state,
+            CanBusReadState::kFailed);
   EXPECT_EQ(loop.changes.size(), 1u);
 
-  EXPECT_DOUBLE_EQ(read({true, 0.4, "OK"}), 0.4);
+  const auto recovered = read(Ok(0.4));
+  EXPECT_EQ(recovered.read_state, CanBusReadState::kOk);
+  EXPECT_FLOAT_EQ(recovered.utilization_frac, 0.4F);
+  EXPECT_EQ(recovered.read_failure_count, 3u)
+      << "failed reads count since the configuration, not since the spell";
   ASSERT_EQ(loop.changes.size(), 2u);
   EXPECT_EQ(loop.changes[1].event, Event::kRecovered);
   EXPECT_EQ(loop.changes[1].spell_failures, 3u);
+
+  health.Configure(Devices({"rio"}, {}), false);
+  EXPECT_EQ(health.Slot(0).read_failure_count, 0u)
+      << "a new configuration kept the previous one's failures";
 }
 
 // A vendor call that never returns, or a sampler starved of the CPU, leaves
-// the last figure published. It counts only until the bus's read is three of
-// its own sampling periods old on the loop's clock (two buses: 600 ms), then
-// the bus drops out as a failed read would; a bus never read drops out the
-// same time after the loop's first tick. A read stamped after the loop's
-// clock reading (published between the two) is current.
+// the last read published. It reads current only until it is three of its
+// bus's own sampling periods old on the loop's clock (two buses: 600 ms),
+// then the slot reads STALE; a bus never read reads PENDING until the same
+// time after the loop's first tick, then STALE. A read stamped after the
+// loop's clock reading (published between the two) is current.
 // REQ-OPS-20
-TEST(CanBusHealth, AFigureNotRefreshedWithinThreeOfItsPeriodsDropsOut) {
+TEST(CanBusHealth, AReadNotRefreshedWithinThreeOfItsPeriodsReadsStale) {
   CanBusHealth health;
-  health.Configure(Devices({"Shooter", "Arm"}, {}), false);
+  health.Configure(Devices({"Shooter"}, {}), false);
   ASSERT_EQ(health.StaleUs(), 600'000u);
   Buses buses;
-  buses.frac["Shooter"] = 0.3;
-  buses.frac["Arm"] = 0.6;
+  buses.samples["rio"] = Ok(0.3);
+  buses.samples["Shooter"] = Ok(0.6);
   Loop loop{health};
-  // The loop's first tick comes before any read; Arm's first read is late.
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.05), 0.05);
-  health.SampleNext(kStartUs + 1'000, buses);  // Shooter
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.05), 0.3);
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + 600'000 - 1, 0.05), 0.3);
+  // The loop's first tick comes before any read; Shooter's first is late.
+  loop.Poll(kStartUs);
+  EXPECT_EQ(health.Slot(0).read_state, CanBusReadState::kPending);
+  health.SampleNext(kStartUs + 1'000, buses);  // rio
+  loop.Poll(kStartUs);
+  EXPECT_EQ(health.Slot(0).read_state, CanBusReadState::kOk);
+  loop.Poll(kStartUs + 600'000 - 1);
+  EXPECT_EQ(health.Slot(1).read_state, CanBusReadState::kPending);
   EXPECT_TRUE(loop.changes.empty());
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + 600'000, 0.05), 0.3);
-  ASSERT_EQ(loop.changes.size(), 1u) << "Arm, never read, did not drop out";
+  loop.Poll(kStartUs + 600'000);
+  EXPECT_EQ(health.Slot(1).read_state, CanBusReadState::kStale);
+  ASSERT_EQ(loop.changes.size(), 1u) << "Shooter, never read, did not fail";
   EXPECT_EQ(loop.changes[0].bus, 1u);
   EXPECT_TRUE(loop.changes[0].stale);
   EXPECT_EQ(loop.changes[0].status, nullptr);
 
-  // The sampler hangs in its next call: Shooter's figure ages out.
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + 601'000 - 1, 0.05), 0.3);
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + 601'000, 0.05), 0.05)
-      << "a figure older than the stale bound still counted";
+  // The sampler hangs in its next call: rio's read ages out, its figure kept.
+  loop.Poll(kStartUs + 601'000 - 1);
+  EXPECT_EQ(health.Slot(0).read_state, CanBusReadState::kOk);
+  loop.Poll(kStartUs + 601'000);
+  EXPECT_EQ(health.Slot(0),
+            (hw::CanBusSample{.read_state = CanBusReadState::kStale,
+                              .utilization_frac = 0.3F}))
+      << "a read older than the stale bound still read current";
   ASSERT_EQ(loop.changes.size(), 2u);
   EXPECT_EQ(loop.changes[1].bus, 0u);
   EXPECT_TRUE(loop.changes[1].stale);
   EXPECT_STREQ(loop.changes[1].status, "OK");
 
-  // It returns: Arm, then Shooter, each back with no failed read counted.
+  // It returns: Shooter, then rio, each back with no failed read counted.
   health.SampleNext(kStartUs + 700'000, buses);
   health.SampleNext(kStartUs + 800'000, buses);
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + 800'000, 0.05), 0.6);
+  loop.Poll(kStartUs + 800'000);
+  EXPECT_EQ(health.Slot(1).read_state, CanBusReadState::kOk);
   ASSERT_EQ(loop.changes.size(), 4u);
   EXPECT_EQ(loop.changes[2].event, Event::kRecovered);
   EXPECT_EQ(loop.changes[3].event, Event::kRecovered);
@@ -246,27 +257,29 @@ TEST(CanBusHealth, AFigureNotRefreshedWithinThreeOfItsPeriodsDropsOut) {
 // A configuration can be applied while the sampler is inside a read of a bus
 // the new configuration drops (the vendor call cannot be interrupted). That
 // read keeps a name of its own to the end, and publishes nothing: the new
-// set's figures come only from its own reads.
+// set's slots come only from its own reads.
 // REQ-OPS-20
 TEST(CanBusHealth, AReadInFlightAcrossAConfigurationPublishesNothing) {
   CanBusHealth health;
-  health.Configure(Devices({"Shooter"}, {}), false);
+  health.Configure(Devices({}, {"Shooter"}), false);
   std::vector<std::string> reads;
   health.SampleNext(kStartUs, [&](std::string_view bus) {
     health.Configure(Devices({}, {"Arm"}), false);
     reads.emplace_back(bus);
-    return CanBusHealth::Sample{true, 0.9, "OK"};
+    return Ok(0.9);
   });
-  EXPECT_EQ(reads, std::vector<std::string>{"Shooter"});
+  EXPECT_EQ(reads, std::vector<std::string>{"rio"});
   Loop loop{health};
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + kLoopPeriodUs, 0.05), 0.05)
-      << "the dropped bus's read landed in the new set";
+  loop.Poll(kStartUs + kLoopPeriodUs);
+  EXPECT_EQ(health.Slot(0).read_state, CanBusReadState::kPending)
+      << "the old configuration's read landed in the new set";
   EXPECT_TRUE(loop.changes.empty());
   Buses buses;
-  buses.frac["Arm"] = 0.2;
+  buses.samples["rio"] = Ok(0.2);
   health.SampleNext(kStartUs + kPeriodUs, buses);
-  EXPECT_EQ(buses.reads, std::vector<std::string>{"Arm"});
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs + kPeriodUs, 0.05), 0.2);
+  EXPECT_EQ(buses.reads, std::vector<std::string>{"rio"});
+  loop.Poll(kStartUs + kPeriodUs);
+  EXPECT_FLOAT_EQ(health.Slot(0).utilization_frac, 0.2F);
 }
 
 // The reader threads' reads, for a test to steer and wait on. A bus's reads
@@ -298,7 +311,7 @@ struct Gate {
     }
     changed.notify_all();
     const auto it = frac.find(bus);
-    return {true, it == frac.end() ? 0.0 : it->second, "OK"};
+    return Ok(it == frac.end() ? 0.0 : it->second);
   }
 
   static std::ptrdiff_t Count(const std::vector<std::string>& in,
@@ -332,15 +345,17 @@ CanBusSampler::Read ReadThrough(const std::shared_ptr<Gate>& gate) {
 constexpr auto kNeverAbandon = std::chrono::seconds{10};
 constexpr auto kAbandonAtOnce = std::chrono::microseconds{0};
 
-// The thread runs only for a configuration with a CANivore (not for one with
-// no device, REQ-CONTRACT-35), never under simulation, and a new
-// configuration stops it before applying: once
-// Reconfigure returns, no read of a bus it dropped starts. (A stop bound
-// that never abandons, so a slow host cannot turn this into an abandonment.)
+// The thread runs for every configuration with a device, the RoboRIO's own
+// bus being read even with every device on it, but not for one with no
+// device (REQ-CONTRACT-35) and never under simulation; a new configuration
+// stops it before applying: once Reconfigure returns, no read of a bus it
+// dropped starts. (A stop bound that never abandons, so a slow host cannot
+// turn this into an abandonment.)
 // REQ-OPS-20, REQ-CONTRACT-35
-TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
+TEST(CanBusSampler, RunsForEveryConfigWithADeviceAndStopsReadingDroppedBuses) {
   CanBusHealth health;
   auto gate = std::make_shared<Gate>();
+  gate->free_reads["rio"] = 1'000'000;
   gate->free_reads["Shooter"] = 1'000'000;
   gate->free_reads["Arm"] = 1'000'000;
   gate->frac["Arm"] = 0.2;
@@ -348,44 +363,71 @@ TEST(CanBusSampler, RunsOnlyForCanivoresAndStopsReadingDroppedBuses) {
                         nullptr, /*period_us=*/1'000, kNeverAbandon};
 
   sampler.Reconfigure(hw::Config{}, false);
-  EXPECT_FALSE(sampler.running());
-  sampler.Reconfigure(Devices({"rio"}, {"rio"}), false);
-  EXPECT_FALSE(sampler.running());
+  EXPECT_FALSE(sampler.running()) << "an empty configuration started one";
   sampler.Reconfigure(Devices({"Shooter"}, {}), /*simulation=*/true);
-  EXPECT_FALSE(sampler.running());
+  EXPECT_FALSE(sampler.running()) << "simulation started one";
+  sampler.Reconfigure(Devices({"rio"}, {"rio"}), false);
+  EXPECT_TRUE(sampler.running());
+  ASSERT_TRUE(gate->WaitForReads("rio", 2));
 
   sampler.Reconfigure(Devices({"Shooter"}, {}), false);
-  EXPECT_TRUE(sampler.running());
   ASSERT_TRUE(gate->WaitForReads("Shooter", 2));
   sampler.Reconfigure(Devices({"Arm"}, {}), false);
   ASSERT_TRUE(gate->WaitForReads("Arm", 2));
   sampler.Stop();
   EXPECT_FALSE(sampler.running());
 
-  // Every Shooter read, then every Arm read: none of Shooter after the first
-  // of Arm.
+  // Shooter is never read after the first read of Arm.
   const std::lock_guard lock{gate->mutex};
   const auto& reads = gate->reads;
   const auto first_arm = std::find(reads.begin(), reads.end(), "Arm");
-  EXPECT_EQ(std::count(reads.begin(), first_arm, "Shooter"),
-            first_arm - reads.begin());
-  EXPECT_EQ(std::count(first_arm, reads.end(), "Arm"), reads.end() - first_arm)
+  EXPECT_EQ(std::count(first_arm, reads.end(), "Shooter"), 0)
       << "a bus the new configuration dropped was read after it";
   Loop loop{health};
-  EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.0), 0.2);
+  loop.Poll(kStartUs);
+  EXPECT_FLOAT_EQ(health.Slot(1).utilization_frac, 0.2F);
 }
 
-// A CANivore status read that never returns must block neither a new
-// configuration nor the backend's destruction (both run Stop, the first
-// outside the device lock the loop watchdog's neutral needs). Past the stop
-// bound (here 0, so the test waits on nothing) the reader is abandoned with
-// one console line naming the bus; the new configuration's reader reads the
-// new bus; the abandoned read's late result lands in a Board nobody reads;
-// and the reader, once its read returns, exits on its own and is counted out.
+// The loop's copy never waits on a read in flight: with the reader blocked
+// in one bus's vendor call, a Poll returns at once with what the other bus's
+// finished read published.
+// REQ-OPS-20, REQ-RT-13
+TEST(CanBusSampler, TheLoopCopiesWithoutWaitingOnAReadInFlight) {
+  CanBusHealth health;
+  auto gate = std::make_shared<Gate>();
+  gate->free_reads["rio"] = 1;
+  gate->frac["rio"] = 0.05;
+  auto stuck = std::make_shared<CanBusSampler::StuckReaders>();
+  {
+    CanBusSampler sampler{
+        health,  ReadThrough(gate),   +[] { return kStartUs; },
+        nullptr, /*period_us=*/1'000, kAbandonAtOnce,
+        stuck};
+    sampler.Reconfigure(Devices({"Shooter"}, {}), false);
+    ASSERT_TRUE(gate->WaitBlocked("Shooter"));
+    Loop loop{health};
+    loop.Poll(kStartUs);
+    EXPECT_EQ(health.Slot(0),
+              (hw::CanBusSample{.read_state = CanBusReadState::kOk,
+                                .utilization_frac = 0.05F}));
+    EXPECT_EQ(health.Slot(1).read_state, CanBusReadState::kPending);
+  }
+  gate->Release("Shooter");
+  EXPECT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
+}
+
+// A status read that never returns must block neither a new configuration
+// nor the backend's destruction (both run Stop, the first outside the device
+// lock the loop watchdog's neutral needs). Past the stop bound (here 0, so
+// the test waits on nothing) the reader is abandoned with one console line
+// naming the bus; the new configuration's reader reads the new buses; the
+// abandoned read's late result lands in a Board nobody reads; and the
+// reader, once its read returns, exits on its own and is counted out.
 // REQ-OPS-20
 TEST(CanBusSampler, AReadThatNeverReturnsIsAbandonedNotWaitedFor) {
   CanBusHealth health;
   auto gate = std::make_shared<Gate>();
+  gate->free_reads["rio"] = 1'000'000;
   gate->frac["Shooter"] = 0.9;
   gate->frac["Arm"] = 0.2;
   gate->free_reads["Arm"] = 1;
@@ -411,11 +453,13 @@ TEST(CanBusSampler, AReadThatNeverReturnsIsAbandonedNotWaitedFor) {
     // Arm's first read returns, its second blocks: the first is published.
     ASSERT_TRUE(gate->WaitBlocked("Arm"));
     Loop loop{health};
-    EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.0), 0.2);
+    loop.Poll(kStartUs);
+    EXPECT_FLOAT_EQ(health.Slot(1).utilization_frac, 0.2F);
 
     gate->Release("Shooter");
     ASSERT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
-    EXPECT_DOUBLE_EQ(loop.Poll(kStartUs, 0.0), 0.2)
+    loop.Poll(kStartUs);
+    EXPECT_FLOAT_EQ(health.Slot(1).utilization_frac, 0.2F)
         << "the abandoned read's 0.9 reached the new configuration";
     EXPECT_TRUE(loop.changes.empty());
     // Destroyed with Arm's read blocked: returns, abandoning it too.
@@ -428,10 +472,10 @@ TEST(CanBusSampler, AReadThatNeverReturnsIsAbandonedNotWaitedFor) {
   EXPECT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
 }
 
-// A CANivore whose every read hangs must not cost a thread per new
-// configuration: with two abandoned readers still blocked, Reconfigure
-// starts none, says so once, and that configuration's CANivores go stale.
-// Once those reads return, the next configuration starts a reader again.
+// A bus whose every read hangs must not cost a thread per new configuration:
+// with two abandoned readers still blocked, Reconfigure starts none, says so
+// once, and that configuration's buses go stale. Once those reads return,
+// the next configuration starts a reader again.
 // REQ-OPS-20
 TEST(CanBusSampler, StartsNoReaderWhileTwoAbandonedOnesAreStillBlocked) {
   CanBusHealth health;
@@ -447,23 +491,25 @@ TEST(CanBusSampler, StartsNoReaderWhileTwoAbandonedOnesAreStillBlocked) {
         /*period_us=*/1'000,
         kAbandonAtOnce,
         stuck};
+    // Every read of rio blocks: each configuration's reader is stuck in it.
     sampler.Reconfigure(Devices({"A"}, {}), false);
-    ASSERT_TRUE(gate->WaitBlocked("A"));
+    ASSERT_TRUE(gate->WaitUntil([&] { return gate->blocked.size() == 1; }));
     sampler.Reconfigure(Devices({"B"}, {}), false);
-    ASSERT_TRUE(gate->WaitBlocked("B"));
+    ASSERT_TRUE(gate->WaitUntil([&] { return gate->blocked.size() == 2; }));
     sampler.Reconfigure(Devices({"C"}, {}), false);
     EXPECT_EQ(stuck->count(), 2);
     EXPECT_FALSE(sampler.running()) << "a third reader started";
-    ASSERT_EQ(lines.size(), 3u) << "A abandoned, B abandoned, none started";
+    ASSERT_EQ(lines.size(), 3u) << "two abandoned, then none started";
     Loop loop{health};
-    loop.Poll(kStartUs, 0.0);
-    loop.Poll(kStartUs + health.StaleUs(), 0.0);
-    ASSERT_EQ(loop.changes.size(), 1u);
+    loop.Poll(kStartUs);
+    loop.Poll(kStartUs + health.StaleUs());
+    ASSERT_EQ(loop.changes.size(), 2u);
     EXPECT_TRUE(loop.changes[0].stale);
+    EXPECT_EQ(health.Slot(1).read_state, CanBusReadState::kStale);
 
-    gate->Release("A");
-    gate->Release("B");
+    gate->Release("rio");
     ASSERT_TRUE(stuck->WaitUntilNone(std::chrono::seconds{10}));
+    gate->free_reads["rio"] = 1;
     sampler.Reconfigure(Devices({"D"}, {}), false);
     EXPECT_TRUE(sampler.running());
     ASSERT_TRUE(gate->WaitBlocked("D"));

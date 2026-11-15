@@ -38,6 +38,9 @@ class Backend {
   // return true. An invalid sample gates only the affected motor and its
   // followers and dependents: neutral from the Tick that finds it, and driven
   // again only by a command observing a later State.
+  // Read also fills `state.health.can_bus`, the health of CAN bus
+  // `state.health.can_bus_index` (CanBuses order), or leaves it kNone; the
+  // gateway sets the index and count and clears the slot before each Read.
   // Total loss is judged on the samples Read returns, after the age bound and
   // before the gateway's own masks (an unavailable, restoring or send-failed
   // device, a follower or remote-feedback motor of one, a chain whose restore

@@ -15,18 +15,39 @@ namespace talos::hardware {
 // passes a pre-match battery check. SetPowerHealth and the physics backend's
 // SetSupplyVoltage override it.
 inline constexpr double kSimRestingSupplyV = 12.8;
+// The power health a simulated backend reports (HealthSample's power fields).
+struct SimPower {
+  bool valid{};
+  double battery_v{};
+  bool brownout{};
+};
+inline void ReadPower(HealthSample& health, const SimPower& power) {
+  health.valid = power.valid;
+  health.battery_v = power.battery_v;
+  health.brownout = power.brownout;
+}
+// A simulated gateway has no CAN bus to read: the slot the gateway asks for,
+// one of `bus_count` (CanBuses of the applied config), reads kSimulated with
+// every figure 0.
+inline void ReadSimulatedCanBus(HealthSample& health, std::size_t bus_count) {
+  if (health.can_bus_index < bus_count) {
+    health.can_bus = {.read_state = CanBusReadState::kSimulated};
+  }
+}
 // A deterministic ideal-actuator fake for integration tests, not a motor or
 // tire physics model. Real hardware always uses the Phoenix backend.
 class SimBackend final : public Backend {
  public:
   bool Configure(const Config& config) override {
     config_ = config;
+    can_bus_count_ = CanBuses(config_).count;
     pending_resets_.clear();
     restoring_.fill(false);
     return true;
   }
   bool Read(State& state) override {
-    state.health = health_;
+    ReadPower(state.health, power_);
+    ReadSimulatedCanBus(state.health, can_bus_count_);
     const double dt =
         previous_time_
             ? static_cast<double>(state.sample_time_us - previous_time_) * 1e-6
@@ -184,7 +205,7 @@ class SimBackend final : public Backend {
   // Position demands teleport, so a step says nothing about a reset.
   bool PositionsArePhysical() const override { return false; }
   void SetPowerHealth(double battery_v, bool brownout) {
-    health_ = {true, battery_v, brownout, 0.0};
+    power_ = {true, battery_v, brownout};
   }
 
   void SetDigitalInput(uint16_t id, bool value) { digital_inputs_[id] = value; }
@@ -209,7 +230,8 @@ class SimBackend final : public Backend {
     double velocity_rps{};
   };
   Config config_;
-  HealthSample health_{true, kSimRestingSupplyV, false, 0.0};
+  std::size_t can_bus_count_{};
+  SimPower power_{true, kSimRestingSupplyV, false};
   uint64_t previous_time_{};
   std::vector<uint16_t> pending_resets_;
   bool restore_fails_{false};

@@ -10,6 +10,41 @@ enum GatewayProgram : ubyte {
   SIM_GATEWAY,
 }
 
+// How a CAN bus's last status read stands (hardware::CanBusReadState; the
+// values match, and a new one comes with a protocol version bump):
+// - OK: the last read succeeded and is current.
+// - PENDING: not read yet, within the RoboRIO's stale bound of its first tick
+//   under this configuration.
+// - FAILED: the last read failed (a vendor error, or no fraction).
+// - STALE: no read within that bound (a reader stuck in a vendor call, or
+//   starved).
+// - SIMULATED: a simulated gateway, which has no bus to read; every figure 0.
+// - NONE: no State of this boot and configuration has reported the slot yet.
+enum CanBusReadState : ubyte {
+  NONE,
+  OK,
+  PENDING,
+  FAILED,
+  STALE,
+  SIMULATED,
+}
+
+// One CAN bus's health (hardware::CanBusSample), as the last State that
+// reported it read it. In any read_state but OK the figures are the last
+// good read's (0 before one). The error counters are the controller's: bus-off
+// events and transmit-buffer-full events since it started, and its current
+// receive and transmit error counters (REC, TEC; saturated at 255).
+// read_failure_count counts failed reads since the configuration was applied.
+struct CanBusStatus {
+  utilization_frac:float;
+  bus_off_count:uint32;
+  transmit_buffer_full_count:uint32;
+  read_failure_count:uint32;
+  receive_error_count:ubyte;
+  transmit_error_count:ubyte;
+  read_state:CanBusReadState;
+}
+
 // The hardware bridge's health, published by hardware_node on /hw/status every
 // 20 ms. The counters are cumulative since the bridge started.
 //
@@ -65,8 +100,20 @@ enum GatewayProgram : ubyte {
 //   silent subsystem's next accepted request, or when the link stops being
 //   ready.
 // - alert_warning_brownout: health_valid and brownout.
-// motor_fault and brownout describe the last accepted State, as the fields
-// they read do: while link_lost holds they are that State's.
+// - alert_warning_can_bus_unread: a slot below can_bus_count reads FAILED or
+//   STALE. Clears when every such slot's next report reads otherwise.
+// motor_fault, brownout and can_bus_unread describe the last accepted
+// States, as the fields they read do: while link_lost holds they are those
+// States'.
+//
+// can_buses holds one slot per CAN bus the configuration names, slot 0 the
+// RoboRIO's own bus ("rio"), then the others in byte order
+// (hardware::CanBuses; hardware_node prints the slot table on stderr), and
+// can_bus_count of them are in use. Each State carries one bus's slot in
+// turn, so the bridge keeps the last report of each, only from States of
+// its own configuration, and a new gateway boot or a State of another
+// configuration empties the table (every slot NONE) until the slots are
+// reported again.
 //
 // clock_offset_us maps gateway sample time to node time. Valid only after
 // eight ordered States and a causal two-way probe exchange of this boot.
@@ -88,8 +135,7 @@ struct BridgeStatus {
   timed_out_mask:uint32;
   subsystem_count:uint32;
   configured:bool;
-  // These seven fill the padding after configured: the struct stays 192 B
-  // and every later field keeps its offset.
+  // These seven fill the padding after configured.
   commissioned:bool;
   alert_error_link_lost:bool;
   alert_error_not_configured:bool;
@@ -107,7 +153,9 @@ struct BridgeStatus {
   health_valid:bool;
   battery_v:double;
   brownout:bool;
-  can_utilization_frac:double;
+  // These two fill the padding after brownout.
+  alert_warning_can_bus_unread:bool;
+  can_bus_count:ubyte;
   // Bit i (configured motor order): invalid feedback or controller fault flags
   // other than an asserted soft or hard limit or an active current limit
   // (hardware::MotorFaulted).
@@ -134,4 +182,5 @@ struct BridgeStatus {
   // relative oscillator drift. Local logs only (excluded from robot radio).
   clock_offset_uncertainty_us:uint64;
   clock_min_round_trip_us:uint64;
+  can_buses:[CanBusStatus:4];
 }

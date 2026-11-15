@@ -77,8 +77,8 @@ void CanBusSampler::Reconfigure(const hardware::Config& config,
     char line[160];
     std::snprintf(line, sizeof line,
                   "[phoenix] CAN bus readers: %d abandoned readers still "
-                  "blocked in a status read; none started, so every CANivore "
-                  "leaves CAN utilization",
+                  "blocked in a status read; none started, so every CAN bus "
+                  "reads stale",
                   stuck);
     if (report_) report_(line);
     return;

@@ -111,9 +111,9 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::array<bool, talos::hardware::kMaxMotors> apply_failing_{};
   std::vector<uint16_t> apply_failed_;
   bool last_brownout_{false};
-  // State's CAN health: the busiest of the RoboRIO's bus and the configured
-  // CANivores (CanBusHealth.h). Configure rebuilds both through the sampler,
-  // whose thread reads the CANivores; Read polls what it published. Declared
+  // State's CAN health: one slot per configured CAN bus, the RoboRIO's own
+  // first (CanBusHealth.h). Configure rebuilds both through the sampler,
+  // whose thread reads the buses; Read polls what it published. Declared
   // before configure_, so a Configure still running finishes before the
   // sampler stops its reader (bounded: CanBusSampler::Stop), and the sampler
   // after the health it reconfigures.

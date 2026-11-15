@@ -1,6 +1,7 @@
 #include "PhoenixBackend.h"
 
 #include <frc/RobotController.h>
+#include <hal/CAN.h>
 
 #include <algorithm>
 #include <cmath>
@@ -168,18 +169,39 @@ constexpr uint16_t kConfigureFailedMessage = 0;
 constexpr uint16_t kCanBusStatusMessage = 7;
 constexpr uint16_t kCanBusReaderMessage = 8;
 
-// One CANivore's status: Phoenix 6 reports its utilization from 0 to 1, the
-// unit of State's can_utilization_frac. Blocks up to 1 ms (CANBus.hpp; about
-// 1 ms on the bench), so only CanBusSampler's thread calls it.
-talos::rio::CanBusHealth::Sample ReadCanivore(std::string_view bus) {
+// One CAN bus's status, utilization from 0 to 1 (the unit of State's
+// CanBusSample::utilization_frac) and its controller's counters: the
+// RoboRIO's own bus through HAL_CAN_GetCANStatus (a NetComm library call;
+// frc::RobotController::GetCANStatus would throw on a failed one), a
+// CANivore through Phoenix 6, which blocks up to 1 ms (CANBus.hpp; about
+// 1 ms on the bench). Only CanBusSampler's thread calls it.
+talos::rio::CanBusHealth::Sample ReadCanBus(std::string_view bus) {
+  if (bus == "rio") {
+    float utilization = 0;
+    uint32_t bus_off = 0;
+    uint32_t tx_full = 0;
+    uint32_t receive_errors = 0;
+    uint32_t transmit_errors = 0;
+    int32_t status = 0;
+    HAL_CAN_GetCANStatus(&utilization, &bus_off, &tx_full, &receive_errors,
+                         &transmit_errors, &status);
+    return talos::rio::CanBusHealth::FromHal(
+        utilization, bus_off, tx_full, receive_errors, transmit_errors, status);
+  }
   const auto status = ph::CANBus{bus}.GetStatus();
-  return {status.Status.IsOK(), status.BusUtilization, status.Status.GetName()};
+  return {status.Status.IsOK(),
+          status.BusUtilization,
+          status.BusOffCount,
+          status.TxFullCount,
+          status.REC,
+          status.TEC,
+          status.Status.GetName()};
 }
 
 uint64_t SteadyUs() { return NowNs() / 1000; }
 
-// Posts a CANivore leaving or rejoining CAN utilization. Loop thread: a
-// bounded format into the event, no allocation.
+// Posts a CAN bus's slot leaving or returning to OK. Loop thread: a bounded
+// format into the event, no allocation.
 void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
                      uint64_t stale_us,
                      const talos::rio::CanBusHealth::Change& change) {
@@ -191,20 +213,20 @@ void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
   if (change.event == talos::rio::CanBusHealth::Event::kRecovered) {
     std::snprintf(event.text, sizeof event.text,
                   "[phoenix] CAN bus %.*s status read again (%llu failed "
-                  "reads in the spell); back in CAN utilization",
+                  "reads in the spell); /hw/status reads it OK",
                   bus_length, bus.data(),
                   static_cast<unsigned long long>(change.spell_failures));
   } else if (change.stale) {
     std::snprintf(event.text, sizeof event.text,
                   "[phoenix] CAN bus %.*s status not read for %llu ms (last "
-                  "status %s); CAN utilization leaves it out until it reads "
+                  "status %s); /hw/status reads it STALE until it reads "
                   "again",
                   bus_length, bus.data(),
                   static_cast<unsigned long long>(stale_us / 1000), status);
   } else {
     std::snprintf(event.text, sizeof event.text,
-                  "[phoenix] CAN bus %.*s status read failing: %s; CAN "
-                  "utilization leaves it out until it reads again",
+                  "[phoenix] CAN bus %.*s status read failing: %s; "
+                  "/hw/status reads it FAILED until it reads again",
                   bus_length, bus.data(), status);
   }
   log.Post(event);
@@ -216,7 +238,7 @@ PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
       log_{log ? log : owned_log_.get()},
       // The sampler reports an abandoned reader from the configure worker or
       // this backend's destructor; log_ outlives it.
-      can_sampler_{can_health_, ReadCanivore, SteadyUs,
+      can_sampler_{can_health_, ReadCanBus, SteadyUs,
                    [this](std::string_view line) {
                      talos::rio::LogEvent event;
                      event.index = kCanBusReaderMessage;
@@ -246,9 +268,9 @@ PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
 bool PhoenixBackend::Configure(const hw::Config& c) {
   hw::Validate(c);
   // Before the device lock, so WatchdogNeutral never waits on it: stops the
-  // CANivore reader (at most CanBusSampler::kStopBound, abandoning one stuck
-  // in a vendor call) and starts one only for a configuration with a
-  // CANivore.
+  // CAN bus reader (at most CanBusSampler::kStopBound, abandoning one stuck
+  // in a vendor call) and starts one for a configuration with a device, none
+  // under simulation.
   can_sampler_.Reconfigure(c, is_simulation_);
   const std::lock_guard devices_lock{devices_mutex_};
   restore_operations_.clear();
@@ -663,17 +685,17 @@ PhoenixBackend::RestoreStatus PhoenixBackend::PollRestore() {
 bool PhoenixBackend::Read(hw::State& s) {
   using talos::rio::TickPhase;
   const uint64_t read_start_ns = NowNs();
-  // The RoboRIO bus every tick; the CANivores as the sampler thread last
-  // published them (no vendor call here).
-  const double can_utilization_frac = can_health_.Poll(
-      read_start_ns / 1000,
-      frc::RobotController::GetCANStatus().percentBusUtilization,
-      [this](const talos::rio::CanBusHealth::Change& change) {
-        LogCanBusStatus(*log_, can_health_.bus(change.bus),
-                        can_health_.StaleUs(), change);
-      });
-  s.health = {true, frc::RobotController::GetBatteryVoltage().value(),
-              frc::RobotController::IsBrownedOut(), can_utilization_frac};
+  // Every CAN bus as the sampler thread last published it (no vendor call
+  // here); State carries the slot the gateway asked for.
+  can_health_.Poll(read_start_ns / 1000,
+                   [this](const talos::rio::CanBusHealth::Change& change) {
+                     LogCanBusStatus(*log_, can_health_.bus(change.bus),
+                                     can_health_.StaleUs(), change);
+                   });
+  s.health.valid = true;
+  s.health.battery_v = frc::RobotController::GetBatteryVoltage().value();
+  s.health.brownout = frc::RobotController::IsBrownedOut();
+  s.health.can_bus = can_health_.Slot(s.health.can_bus_index);
   uint64_t refresh_start_ns = NowNs();
   log_->AddPhase(TickPhase::kHealth, refresh_start_ns - read_start_ns);
   if (is_simulation_) {

@@ -108,3 +108,33 @@ test('the hardware panel omits counters the bridge never declared', () => {
   assert.ok(!html.includes('States received'));
   assert.ok(!html.includes('Commands sent'));
 });
+
+// REQ-OPS-20: a CAN bus whose read failed shows its state where an idle bus
+// would show 0%, and each bus has its own row, slot 0 named "rio".
+test('the hardware panel shows a failed CAN bus as failed, not as 0%', () => {
+  const B = 'hw/status/can_buses/';
+  const studio = createStaticStudio({
+    frames: [{
+      stream_id: 'a', sequence_id: '0', timestamp_ns: '1000000000', dictionary_id: 1,
+      chassis: {x: 0, y: 0, z: 0, roll: 0, pitch: 0, yaw: 0},
+      channels: {
+        'hw/status/battery_v': 12.0, 'hw/status/can_bus_count': 2,
+        [B + '0/read_state']: 1, [B + '0/utilization_frac']: 0.25,
+        [B + '1/read_state']: 3, [B + '1/utilization_frac']: 0,
+        [B + '1/bus_off_count']: 4
+      },
+      units: {}, labels: {}
+    }],
+    playback: {mode: 'PAUSED', cursor_ns: '1000000000'}
+  });
+  const html = renderToStaticMarkup(
+      <StudioProvider studio={studio}>
+        <hardwarePanel.component config={hardwarePanel.defaultConfig}
+                                 setConfig={() => {}} instanceId="test"/>
+      </StudioProvider>);
+  assert.ok(html.includes('>rio<'), html);
+  assert.ok(html.includes('CAN bus 1'));
+  assert.ok(html.includes('25%'));
+  assert.ok(html.includes('can-unread">failed<'), 'the failed bus is not marked');
+  assert.ok(!html.includes('>0%<'), 'the failed bus reads as an idle one');
+});

@@ -8,7 +8,9 @@
 // one JSON object: what log_dump prints for those records.
 //
 //   /hw/state                 {"type":"state","config_id":"...","enabled":true,
-//                              "motors":[{"id":1,"name":"flywheel",...}],...}
+//                              "motors":[{"id":1,"name":"flywheel",...}],...,
+//                              "health":{...,"can_bus":{"index":1,
+//                              "name":"Shooter","read_state":"ok",...}}}
 //   /hw/command, /hw/request  {"type":"command",...,"motors":[{"id":1,
 //                              "name":"flywheel","mode":"velocity",...}]}
 //   /hw/state/driver_station  {"type":"driver_station","mode":"teleop",
@@ -16,7 +18,8 @@
 //   a payload that will not   {"type":"state","error":"..."}
 //   decode
 //
-// Device names come from the robot config the session ran (DeviceNames) and
+// Device and CAN bus names come from the robot config the session ran
+// (DeviceNames) and
 // are given only for a packet whose config_id is that config's, so a config
 // edited after the match never mislabels a device; the logical id always is.
 //
@@ -31,6 +34,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "talOS/hardware/config.h"
 
@@ -56,6 +60,8 @@ struct DeviceNames {
   std::uint64_t commissioned_config_id{};
   std::map<std::uint16_t, std::string> motors, sensors, digital_inputs,
       digital_outputs, analog_inputs, encoders, pwm_outputs;
+  // The State's CAN bus slots, in slot order (hardware::CanBuses).
+  std::vector<std::string> can_buses;
 
   static DeviceNames FromConfig(const hardware::Config& config);
   bool Matches(std::uint64_t id) const {

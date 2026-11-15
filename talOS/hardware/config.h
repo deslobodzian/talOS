@@ -1,8 +1,10 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace talos::hardware {
@@ -204,7 +206,23 @@ struct Config {
 };
 
 // Throws before any device is opened. Unknown references and duplicate names,
-// logical IDs, or CAN addresses on a bus are rejected.
+// logical IDs, or CAN addresses on a bus are rejected, and so is a config
+// naming more than kMaxCanBuses - 1 CAN buses besides "rio" (CanBuses).
 void Validate(const Config& config);
 uint64_t ConfigurationId(const Config& config);
+
+// The CAN buses whose health State carries (HealthSample::can_bus) and
+// /hw/status reports, one slot each.
+// Slot 0 is "rio" always; then each other distinct bus a motor or sensor
+// names, in byte order. config_id covers bus names, so slot i is the same
+// bus on both ends; changing this order needs a protocol bump.
+inline constexpr std::size_t kMaxCanBuses = 4;
+struct CanBusList {
+  std::array<std::string_view, kMaxCanBuses> names{};
+  std::size_t count{};
+};
+// The names view `config`'s own strings ("rio" excepted), so they live as
+// long as `config` does not change. Throws std::invalid_argument naming the
+// buses when there are more than kMaxCanBuses - 1 besides "rio".
+CanBusList CanBuses(const Config& config);
 }  // namespace talos::hardware

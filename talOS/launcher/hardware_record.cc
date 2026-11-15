@@ -145,6 +145,24 @@ void Name(Json& json, const std::map<std::uint16_t, std::string>* names,
   if (it != names->end()) json.Key("name").Text(it->second);
 }
 
+const char* ReadStateName(hardware::CanBusReadState state) {
+  switch (state) {
+    case hardware::CanBusReadState::kNone:
+      return "none";
+    case hardware::CanBusReadState::kOk:
+      return "ok";
+    case hardware::CanBusReadState::kPending:
+      return "pending";
+    case hardware::CanBusReadState::kFailed:
+      return "failed";
+    case hardware::CanBusReadState::kStale:
+      return "stale";
+    case hardware::CanBusReadState::kSimulated:
+      return "simulated";
+  }
+  return "unknown";
+}
+
 const char* ModeName(hardware::Mode mode) {
   switch (mode) {
     case hardware::Mode::kNeutral:
@@ -266,7 +284,22 @@ void StateJson(Json& json, const hardware::State& s, const DeviceNames* n) {
   json.Key("valid").Bool(s.health.valid);
   json.Key("battery_v").Number(s.health.battery_v);
   json.Key("brownout").Bool(s.health.brownout);
-  json.Key("can_utilization_frac").Number(s.health.can_utilization_frac);
+  // The one CAN bus slot this State reports (each State reports the next).
+  json.Key("can_bus_count").Int(s.health.can_bus_count);
+  const hardware::CanBusSample& bus = s.health.can_bus;
+  json.Key("can_bus").Raw("{");
+  json.Key("index").Int(s.health.can_bus_index);
+  if (n != nullptr && s.health.can_bus_index < n->can_buses.size()) {
+    json.Key("name").Text(n->can_buses[s.health.can_bus_index]);
+  }
+  json.Key("read_state").Text(ReadStateName(bus.read_state));
+  json.Key("utilization_frac").Number(bus.utilization_frac, 9);
+  json.Key("bus_off_count").Int(bus.bus_off_count);
+  json.Key("transmit_buffer_full_count").Int(bus.transmit_buffer_full_count);
+  json.Key("receive_error_count").Int(bus.receive_error_count);
+  json.Key("transmit_error_count").Int(bus.transmit_error_count);
+  json.Key("read_failure_count").Int(bus.read_failure_count);
+  json.Raw("}");
   json.Raw("}");
   json.Key("counters").Raw("{");
   json.Key("rejected_command_count").Int(s.counters.rejected_command_count);
@@ -432,6 +465,10 @@ DeviceNames DeviceNames::FromConfig(const hardware::Config& config) {
   add(names.analog_inputs, config.analog_inputs);
   add(names.encoders, config.encoders);
   add(names.pwm_outputs, config.pwm_outputs);
+  const hardware::CanBusList buses = hardware::CanBuses(config);
+  for (std::size_t i = 0; i < buses.count; ++i) {
+    names.can_buses.emplace_back(buses.names[i]);
+  }
   return names;
 }
 

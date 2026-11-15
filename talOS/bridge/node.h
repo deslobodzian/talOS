@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
+#include "talOS/bridge/can_buses.h"
 #include "talOS/bridge/clock_offset.h"
 #include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
@@ -412,6 +413,10 @@ class HardwareNode {
   // One stderr line per gateway boot naming its program and build (the
   // launcher keeps it in the node's session log; /hw/status carries it too).
   static void ReportGatewayBuild(const State& state);
+  // One stderr line naming the CAN bus in each /hw/status can_buses slot
+  // (hardware::CanBuses), printed when the bridge opens: its configuration
+  // is fixed for its run.
+  void ReportCanBuses() const;
   // Prints the packet log's error once, whether capture stopped or the log
   // failed (e.g. its file could not be created).
   void ReportLogFailure();
@@ -463,6 +468,8 @@ class HardwareNode {
   std::unique_ptr<event::log::LogWriter> log_;
   bool log_failure_reported_{false};
   State latest_state_{};
+  // /hw/status can_buses, assembled from the accepted States.
+  CanBusTable can_buses_{0};
   // Run()'s registry refreshes, on the bridge clock.
   uint64_t next_introspection_us_{0};
   uint64_t next_liveness_us_{0};

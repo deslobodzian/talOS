@@ -12,6 +12,8 @@
 #include <string_view>
 #include <vector>
 
+#include "bridge/bridge_status_generated.h"
+#include "bridge/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/access.h"
 #include "talOS/devices/devices.h"
@@ -626,6 +628,35 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
   sim.step(10ms);
   EXPECT_TRUE(other.enabled);
   expect_outputs(true);
+}
+
+// A simulated robot has no CAN bus to read: SimHardware's /hw/status lists
+// every bus the config names, "rio" first, as SIMULATED, never as a failing
+// bus or an idle one, so no test under Sim raises
+// alert_warning_can_bus_unread.
+// REQ-OPS-20
+TEST(SimHardware, ReportsEachConfiguredCanBusSimulated) {
+  auto sim = Sim::FromToml(R"(
+[robot]
+period_us = 5000
+command_timeout_us = 50000
+
+[subsystems.shooter.motors.flywheel]
+can_id = 1
+bus = "Shooter"
+)");
+  SimHardware hw{sim};
+  sim.step(20ms);
+  const auto status =
+      sim.latest<::bridge::BridgeStatus>(::bridge::topics::kStatus);
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(status->can_bus_count(), 2);
+  for (int i = 0; i < 2; ++i) {
+    EXPECT_EQ(status->can_buses()->Get(i)->read_state(),
+              ::bridge::CanBusReadState::SIMULATED)
+        << "slot " << i;
+  }
+  EXPECT_FALSE(status->alert_warning_can_bus_unread());
 }
 
 // A robot brought up before its first mechanism: a config with no motor and

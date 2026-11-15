@@ -9,6 +9,7 @@ import type {ReactNode} from 'react';
 
 import {channelDisplay, poseError, simTruthPose} from '../../core';
 import {activeAlerts} from '../../data/alerts';
+import {canBusReading, canBusUnread} from '../../data/robot';
 import {
   useActions,
   useAlertLatch,
@@ -361,7 +362,7 @@ function RobotPanel() {
       </Card>
 
       <Card title="Power" eyebrow="HW/STATUS">
-        {status.power.battery_v === null && status.power.can_frac === null ?
+        {status.power.battery_v === null && status.power.canBuses.length === 0 ?
              <EmptyState>no power data</EmptyState> :
              <div className="power-card">
                <div className="battery-row">
@@ -375,8 +376,11 @@ function RobotPanel() {
                  <Stat label="Brownout" channel="hw/status/brownout" tone={status.power.brownout ? 'warn' : undefined}>
                    {status.power.brownout === null ? '—' : status.power.brownout ? 'yes' : 'no'}
                  </Stat>
-                 <Stat label="CAN util" channel="hw/status/can_utilization_frac">{status.power.can_frac == null ? '—' :
-                     `${number(status.power.can_frac * 100, 1)} %`}</Stat>
+                 {status.power.canBuses.map(bus =>
+                   <Stat key={bus.index} label={bus.index === 0 ? 'CAN rio' : bus.label}
+                         channel={bus.channel} tone={canBusUnread(bus) ? 'warn' : undefined}>
+                     {canBusReading(bus)}
+                   </Stat>)}
                </StatList>
              </div>}
       </Card>

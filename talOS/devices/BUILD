@@ -39,6 +39,7 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         ":devices",
+        "//talOS/bridge:can_buses",
         "//talOS/bridge:clock_offset",
         "//talOS/bridge:merge",
         "//talOS/bridge:messages",
@@ -57,6 +58,7 @@ cc_test(
     deps = [
         ":devices",
         ":testing",
+        "//talOS/bridge:messages",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/hardware",

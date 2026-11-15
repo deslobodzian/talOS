@@ -386,7 +386,7 @@ was built with, port 5803: `10.56.87.11` unless the main processor's address
 differs, then `./gradlew deploy -Pcompanion=<ipv4>`
 ([RoboRIO](../talOS/hardware/README.md#roborio)).
 Deploy it from the same checkout as the main-processor bundle: each side
-rejects frames of another protocol version (currently 7; see
+rejects frames of another protocol version (currently 8; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
 when that happens; the RoboRIO reports it in the Driver Station message log
 (a `talos companion link` error naming both versions,

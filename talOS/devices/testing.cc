@@ -15,6 +15,7 @@
 
 #include "bridge/bridge_status_generated.h"
 #include "bridge/topics.h"
+#include "talOS/bridge/can_buses.h"
 #include "talOS/bridge/clock_offset.h"
 #include "talOS/bridge/merge.h"
 #include "talOS/configuration/config_parser.h"
@@ -72,6 +73,9 @@ struct SimHardware::Impl {
   Sim& sim;
   config::RobotConfig config;
   std::uint64_t config_id = 0;
+  // CanBuses(config.hardware).count, and /hw/status's table of them.
+  std::uint8_t can_bus_count = 1;
+  hardware::CanBusTable can_buses{0};
   Duration period{};
   bool enabled = false;
   bool ideal = false;
@@ -409,6 +413,13 @@ struct SimHardware::Impl {
     state.epoch = epoch;
     state.sample_time_us = GatewayUs(latency);
     state.flags = hardware::kConfigured | (enabled ? hardware::kEnabled : 0u);
+    // A simulated gateway's CAN bus slot, one bus per State in turn, as
+    // Gateway::Tick and the simulated backends report it.
+    state.health.can_bus_count = can_bus_count;
+    state.health.can_bus_index =
+        static_cast<std::uint8_t>(state.sequence % can_bus_count);
+    state.health.can_bus = {.read_state =
+                                hardware::CanBusReadState::kSimulated};
 
     auto fill = [](auto& samples, auto& count, const auto& configs,
                    auto sample_of) {
@@ -520,6 +531,7 @@ struct SimHardware::Impl {
     if (clock.Observe(state.boot_id, state.sample_time_us, Micros(sim.now()))) {
       latest_sample_us = state.sample_time_us;
     }
+    can_buses.Observe(state);
     ::bridge::BridgeStatus status{
         states_sent,
         0,
@@ -547,7 +559,8 @@ struct SimHardware::Impl {
         state.health.valid,
         state.health.battery_v,
         state.health.brownout,
-        state.health.can_utilization_frac,
+        false,  // alert_warning_can_bus_unread: can_buses.Fill
+        0,      // can_bus_count: can_buses.Fill
         0,
         0,
         0,
@@ -560,6 +573,7 @@ struct SimHardware::Impl {
         state.build.revision,
         0,
         0};
+    can_buses.Fill(status);
     sim.publish(::bridge::topics::kStatus, status);
   }
 
@@ -584,6 +598,9 @@ SimHardware::SimHardware(Sim& sim) : impl_{std::make_shared<Impl>(sim)} {
   impl.config = config::ParseRobotConfig(SimAccess::config_path(sim));
   impl.config.hardware.commissioned = true;
   impl.config_id = hardware::ConfigurationId(impl.config.hardware);
+  impl.can_bus_count =
+      static_cast<std::uint8_t>(hardware::CanBuses(impl.config.hardware).count);
+  impl.can_buses = hardware::CanBusTable{impl.config_id};
   impl.period = std::chrono::microseconds{impl.config.hardware.period_us};
   for (const auto& [name, devices] : impl.config.subsystems) {
     if (!devices.owns_actuators()) continue;
