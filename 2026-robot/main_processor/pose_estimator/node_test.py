@@ -748,6 +748,61 @@ class EstimatorTest(unittest.TestCase):
                                    f"{fused}")
 
     # REQ-CONTRACT-26
+    def test_a_single_sample_jump_is_rejected_at_the_drivetrain_rate(self):
+        """With a state every 5 ms, one wheel reading 30 cm ahead in one
+        state is implausible over any update period (10 m/s x 20 ms =
+        20 cm), as it was when one state per tick was checked: rejected at
+        that state, its jump not integrated."""
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                chassis.drive(1.0, 0.0, 0.0, 0.1, dt=DRIVETRAIN_DT)
+                before = self.pose()[0]
+                chassis.advance(1.0, 0.0, 0.0, dt=DRIVETRAIN_DT)
+                chassis.distances[0] += 0.30
+                chassis.publish()
+                self.sim.step(DRIVETRAIN_DT)
+                chassis.drive(1.0, 0.0, 0.0, DT, dt=DRIVETRAIN_DT)
+                self.assertEqual(self.node.odometry_rejected_count, 1)
+                self.assertLess(self.pose()[0], before + 0.05)
+
+    # REQ-CONTRACT-26
+    def test_a_late_wheel_catching_up_is_not_rejected(self):
+        """sample_time_ns is the oldest reading in a state, and wheels are
+        read at their own times. Wheels 0 and 1 read 2.6 and 2.5 ms before
+        each 5 ms state; once wheel 1 misses a refresh, its old reading
+        makes the state's sample time advance 0.1 ms while wheel 0 advanced
+        5 ms (4.5 cm at 4.5 m/s, below the 10 m/s limit over an update
+        period, far above it over 0.1 ms). Judged over an update period,
+        that is plausible: nothing is rejected and the pose follows the
+        wheels."""
+        speed = 4.5
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend, enabled=True)
+                # The start state: every wheel at 0, read at first_ns.
+                t0 = self.node.first_ns
+                mean_by_sample = {t0: 0.0}
+                read_ns = [0] * len(MODULES)
+                for step in range(40):
+                    now = self.sim.now_ns
+                    for i in range(len(MODULES)):
+                        if not (step == 20 and i == 1):  # wheel 1 misses
+                            read_ns[i] = now - (2_600_000 if i == 0
+                                                else 2_500_000)
+                        chassis.distances[i] = speed * (read_ns[i] - t0) / 1e9
+                    sample_ns = min(read_ns)
+                    mean_by_sample[sample_ns] = (sum(chassis.distances)
+                                                 / len(MODULES))
+                    chassis.publish(sample_time_ns=sample_ns)
+                    self.sim.step(DRIVETRAIN_DT)
+                self.assertEqual(self.node.odometry_rejected_count, 0)
+                e = self.estimate()
+                self.assertTrue(e.valid)
+                self.assertAlmostEqual(
+                    e.pose_x_m, mean_by_sample[e.sample_time_ns], delta=1e-6)
+
+    # REQ-CONTRACT-26
     def test_a_stall_backlog_is_integrated_in_order_unless_stale(self):
         """The node paused while the drivetrain keeps publishing: on resume
         the drain delivers the backlog in sequence. A backlog younger than

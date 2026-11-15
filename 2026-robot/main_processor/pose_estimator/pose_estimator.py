@@ -104,6 +104,10 @@ _SAMPLE_TIME = operator.attrgetter("time_s")
 # longer stall drops (and counts as rejected) the oldest, which the age limit
 # would mostly reject anyway; it also bounds the work of one update().
 MAX_PENDING_OBSERVATIONS = 64
+# Accepted drivetrain samples kept to judge plausibility over an update
+# period: about five at 200 Hz; the cap only bounds pathological sample
+# times.
+MAX_REFERENCE_SAMPLES = 64
 _KNOWN_ALLIANCES = (talos.Alliance.BLUE, talos.Alliance.RED)
 
 
@@ -560,6 +564,12 @@ class PoseEstimator:
         # usable, else None: update()'s validity and velocity come from it.
         self.drive_sample = None
         self.checked_ns = 0
+        # Accepted drivetrain samples (sample_time_ns, yaw, positions) since
+        # the last start or reset, back to the newest one at least one
+        # update period older than the newest: what a new sample's
+        # plausibility is judged against.
+        self.update_period_ns = round(node.period * _NS)
+        self.reference = collections.deque()
         self.relocalization_candidates = []
         self.localized = False
         # The startup seed: open to the Driver Station until its first
@@ -678,24 +688,55 @@ class PoseEstimator:
             if self.first_ns is None:
                 self.backend.start(time_s, yaw, positions)
                 self.first_ns = d.sample_time_ns
+            elif not self.plausible(d.sample_time_ns, yaw, positions):
+                self.odometry_rejected_count += 1
+                # Adopt the new frame without integrating its jump.
+                self.backend.reset(yaw, positions)
+                self.reference.clear()
+                self.reference.append((d.sample_time_ns, yaw, positions))
+                self.checked_ns = d.sample_time_ns
+                return False
             else:
-                dt = (d.sample_time_ns - self.checked_ns) / _NS
-                distance = max(abs(new.distance - old.distance)
-                               for old, new in zip(self.backend.positions, positions))
-                yaw_step = abs(math.remainder(
-                    (yaw - self.backend.yaw).radians(), 2 * math.pi))
-                if (distance > self.max_odometry_speed_mps * dt
-                        or yaw_step > self.max_odometry_yaw_rate_radps * dt):
-                    self.odometry_rejected_count += 1
-                    # Adopt the new frame without integrating its jump.
-                    self.backend.reset(yaw, positions)
-                    self.checked_ns = d.sample_time_ns
-                    return False
                 self.backend.add_odometry(time_s, yaw, positions)
+            self.remember(d.sample_time_ns, yaw, positions)
             self.odometry_integrated_count += 1
             self.latest_ns = d.sample_time_ns
             self.checked_ns = d.sample_time_ns
         return True
+
+    def plausible(self, time_ns, yaw, positions):
+        """Whether the step from the reference sample (the newest accepted
+        one at least an update period older, else the oldest since the last
+        start or reset) stays within the wheel speed and yaw rate limits.
+        Judged over an update period, as when one sample was integrated per
+        tick: sample_time_ns is a state's oldest reading and a wheel may be
+        read up to the drivetrain's skew bound later, so between two 5 ms
+        states a wheel catching up after a missed refresh can show far more
+        travel than the sample times' difference."""
+        reference = self.reference[0]
+        for candidate in reversed(self.reference):
+            if time_ns - candidate[0] >= self.update_period_ns:
+                reference = candidate
+                break
+        reference_ns, reference_yaw, reference_positions = reference
+        dt = (time_ns - reference_ns) / _NS
+        distance = max(abs(new.distance - old.distance)
+                       for old, new in zip(reference_positions, positions))
+        yaw_step = abs(math.remainder(
+            (yaw - reference_yaw).radians(), 2 * math.pi))
+        return (distance <= self.max_odometry_speed_mps * dt
+                and yaw_step <= self.max_odometry_yaw_rate_radps * dt)
+
+    def remember(self, time_ns, yaw, positions):
+        """Adds an accepted sample to the reference window and drops those
+        no later sample can need: older than the newest one at least an
+        update period before time_ns."""
+        reference = self.reference
+        reference.append((time_ns, yaw, positions))
+        while len(reference) > 1 and (
+                time_ns - reference[1][0] >= self.update_period_ns
+                or len(reference) > MAX_REFERENCE_SAMPLES):
+            reference.popleft()
 
     def observe(self, o, camera):
         if self.acceptable(o, camera) and self.backend.add_observation(
