@@ -632,14 +632,19 @@ TEST_F(DrivetrainSlewTest,
 class DrivetrainSlewResetTest : public DrivetrainSlewTest,
                                 public ::testing::WithParamInterface<int> {};
 
-TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
+// Every tick without a drivable target forgets the slew-limited command, so
+// the next target ramps up from zero rather than from where the robot was
+// going before the gate. One case per way update() finds no drivable target:
+// disabled, a stale lane (Target::get() null, as a released lane is), a
+// non-finite target, and no usable module. That the gate's own tick goes
+// neutral is the node test matrix's (DisabledRobotGoesNeutral,
+// StaleLaneGoesNeutral, ReleasedLaneGoesNeutral, NonFiniteDemandGoesNeutral,
+// DisconnectedFeedbackGoesNeutral).
+TEST_P(DrivetrainSlewResetTest, SlewRestartsFromZeroAfterASafetyGate) {
   Teleop();
   Hold(ChassisTarget{1.0, 0.0, 2.0}, 40ms);
   ExpectCommand({0.8, 0.0, 1.6});
   switch (GetParam()) {
-    case 0:
-      talos::testing::ReleaseTarget<ChassisTarget>(sim, "drivetrain", "teleop");
-      break;
     case 1:
       hw.enable(false);
       break;
@@ -662,7 +667,6 @@ TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
   // changes are visible directly on the next tick.
   const auto visibility = (GetParam() == 1 || GetParam() == 4) ? 10ms : 5ms;
   sim.step(visibility);
-  ExpectNeutral();
   hw.enable();
   for (const auto& module : geometry.modules)
     hw.set_connected("drivetrain", module.steer, true);
@@ -673,7 +677,7 @@ TEST_P(DrivetrainSlewResetTest, UnsafeInputNeutralizesAndRestartsFromZero) {
 }
 
 INSTANTIATE_TEST_SUITE_P(SafetyGates, DrivetrainSlewResetTest,
-                         ::testing::Values(0, 1, 2, 3, 4));
+                         ::testing::Values(1, 2, 3, 4));
 
 class DrivetrainFieldSlewTest : public DrivetrainTest {
  protected:
