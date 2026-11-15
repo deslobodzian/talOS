@@ -221,9 +221,10 @@ class Teleop {
                         : stick.button(binding.button));
   }
 
-  // Every connected bound input at rest: axes finite and inside their
-  // deadband, buttons released, POVs centred (a bound POV held in another
-  // direction is not at rest).
+  // Every connected bound input at rest: axes finite and inside the wider of
+  // their deadband and kArmingNeutralFloorFrac (ArmingNeutral), buttons
+  // released, POVs centred (a bound POV held in another direction is not at
+  // rest).
   bool InputsNeutral() const {
     for (const auto& sub : subsystems_) {
       for (const auto& binding : sub.bindings) {
@@ -232,8 +233,7 @@ class Teleop {
         const bool released = binding.pov ? stick.pov(binding.pov_index) < 0
                                           : !Pressed(binding, stick);
         const double axis = binding.is_button ? 0.0 : stick.axis(binding.axis);
-        if (!released || !std::isfinite(axis) ||
-            std::abs(axis) > binding.deadband_frac) {
+        if (!released || !ArmingNeutral(axis, binding.deadband_frac)) {
           return false;
         }
       }
