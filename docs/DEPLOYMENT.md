@@ -384,7 +384,9 @@ reader's time namespace, so a node in another would judge live claims dead.
 (`./gradlew deploy` in that directory). It sends to the companion address it
 was built with, port 5803: `10.56.87.11` unless the main processor's address
 differs, then `./gradlew deploy -Pcompanion=<ipv4>`
-([RoboRIO](../talOS/hardware/README.md#roborio)).
+([RoboRIO](../talOS/hardware/README.md#roborio)). Deployed from a copy with no
+git history, add `-PtalosRevision=<first 16 hex digits of its commit>` so its
+State still names the build ([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the same checkout as the main-processor bundle: each side
 rejects frames of another protocol version (currently 8; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once

@@ -161,7 +161,8 @@ simulation 2, `sim_gateway` 3; a decoder rejects any other value, and a dirty
 byte other than 0 or 1) and its source: the first 16 hex digits of its git
 commit as one number (0 when unknown) and whether it was built with
 uncommitted changes. GradleRIO writes them into the RoboRIO program
-(`generateRioBuild` in its `build.gradle`); `sim_gateway` sends revision 0.
+(`generateRioBuild` in its `build.gradle`, or `-PtalosRevision` for a copy
+with no git history); `sim_gateway` sends revision 0.
 Every State carries it (10 B × 200 Hz = 2000 B/s on the wired link) rather
 than one frame per boot, so it always arrives with the boot id it belongs to
 and every State the bridge's `--log` records names its build.

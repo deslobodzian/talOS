@@ -771,7 +771,14 @@ task, which every compile depends on, writes `build/generated/talos/include/RioB
 with the checkout's git commit and whether it has uncommitted changes,
 untracked files included; without git or outside a checkout the commit is
 `unknown` and the State's revision 0. It reads only the local repository, so
-`--offline` builds get it, and rewrites the header only when it changes. The
+`--offline` builds get it, and rewrites the header only when it changes. A
+build from a copy with no git history passes
+`-PtalosRevision=<16 lowercase hex digits>` on the command line instead,
+which replaces git: the commit is those digits and the build is reported
+clean. Like `-Pcompanion` it is refused from a `gradle.properties` or the
+environment, and a value that is not exactly 16 lowercase hex digits, or is
+all zeros (revision 0 means unknown), fails the build (`rioBuildStampTest`,
+which `phoenixTest` runs, checks the stamp). The
 header also carries the companion address. The program prints both on its
 console at start (`hardware gateway build <commit> companion <address>:5803`,
 the address `127.0.0.1` under simulation), and the State reports the
@@ -784,7 +791,7 @@ Build without deploying:
 ```sh
 cd controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
