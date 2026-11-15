@@ -17,6 +17,7 @@ screenshot and the failing elements (outerHTML and geometry) in the test's
 undeclared outputs and prints their paths.
 """
 
+import atexit
 import json
 import os
 from pathlib import Path
@@ -56,20 +57,52 @@ def workspace():
     return Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
 
 
+# The processes the run started (the launcher, the browser): stopped on any
+# exit of this process, a SIGTERM (Bazel's timeout) included. Each runs in a
+# session of its own, so a signal to this process's group misses them; under
+# Bazel on Linux the test runner reaps them anyway, run directly or elsewhere
+# nothing else does.
+_STOPS = []
+
+
+def _stop_all():
+    while _STOPS:
+        try:
+            _STOPS.pop()()
+        except Exception as error:  # noqa: BLE001: stop the rest regardless
+            print(f"cleanup: {error!r}", flush=True)
+
+
+def _on_sigterm(signum, _frame):
+    print("SIGTERM: stopping the session and the browser", flush=True)
+    _stop_all()
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+atexit.register(_stop_all)
+signal.signal(signal.SIGTERM, _on_sigterm)
+
+
 def free_ports(count):
-    """`count` ports free for both TCP and UDP now, below the host's
-    ephemeral range: the launcher spawns the bridge and the gateway a second
-    or more after this returns, and a port the OS picked for bind(0) is in
-    the range every connect() and DNS lookup on the host draws from, so it
-    could be taken by then (the launcher refuses port 0)."""
+    """`count` ports free for both TCP and UDP on every address now, below
+    the host's ephemeral range.
+
+    The launcher refuses port 0 (`--studio-http-port`, `--remote-port`,
+    `--local-port`; `sim_gateway --port` too), so these are reserved and
+    released, and its members bind them a second or more later
+    (docs/TESTING.md §6.4). Below the ephemeral range no connect() or DNS
+    lookup on the host draws one meanwhile; a port taken anyway fails the
+    wait for the bridge, naming the port and the member's own log line
+    (Session.bind_failure)."""
     ports, port = [], 20000 + os.getpid() % 10000
     for _ in range(12000):
-        port =20000 + (port - 20000 + 1) % 12000  # stays below 32768
+        port = 20000 + (port - 20000 + 1) % 12000  # stays below 32768
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp, \
                     socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-                tcp.bind(("127.0.0.1", port))
-                udp.bind(("127.0.0.1", port))
+                tcp.bind(("0.0.0.0", port))
+                udp.bind(("0.0.0.0", port))
         except OSError:
             continue
         ports.append(port)
@@ -85,6 +118,13 @@ class Session:
         self.output = tmp / "sessions"
         self.namespace = f"drive-browser-{uuid.uuid4().hex}"
         self.http_port, gw_port, bridge_port = free_ports(3)
+        # Each member that binds a reserved port, the port, and what its log
+        # says when the bind fails (studio/bridge/main.cc, sim_gateway.cc,
+        # talOS/bridge/main.cc).
+        self.binds = (("studio_bridge", self.http_port, "HTTP listen failed"),
+                      ("sim_gateway", gw_port, "cannot open simulation socket"),
+                      ("hardware_node", bridge_port,
+                       "failed to open hardware node network/ipc resources"))
         # The launcher resolves node labels and [studio] webroot under
         # bazel-bin/ of its working directory: the runfiles tree.
         (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
@@ -107,6 +147,7 @@ class Session:
             env["TALOS_REALTIME"] = "1"
         self.proc = subprocess.Popen(args, cwd=tmp, env=env, stdout=self.log,
                                      stderr=subprocess.STDOUT, start_new_session=True)
+        _STOPS.append(lambda: self.stop(grace_s=10))
         self.tmp = tmp
         self.dir = None
 
@@ -116,6 +157,9 @@ class Session:
         def listening():
             if self.proc.poll() is not None:
                 raise RuntimeError(f"launcher exited {self.proc.returncode} during startup")
+            failure = self.bind_failure()
+            if failure:
+                raise RuntimeError(failure)
             for log in self.output.glob("*/studio_bridge.log"):
                 if f"listening {self.http_port}\n" in log.read_text(errors="replace"):
                     return log.parent
@@ -123,19 +167,35 @@ class Session:
 
         def paths():
             return [self.tmp, self.output, *self.output.glob("*/"),
-                    *self.output.glob("*/studio_bridge.log")]
+                    *self.output.glob("*/*.log")]
 
         self.dir = watch.wait_for(listening, paths, STARTUP_S, "the Studio bridge's listening line")
+
+    def bind_failure(self):
+        """A member's failed bind of its reserved port, named, or None."""
+        for member, port, marker in self.binds:
+            for log in self.output.glob(f"*/{member}.log"):
+                line = next((line for line in log.read_text(errors="replace").splitlines()
+                             if marker in line), None)
+                if line:
+                    return (f"{member} could not bind its reserved port {port} (taken after "
+                            f"free_ports released it?): {log.name} says {line!r} "
+                            "(the session's logs are kept with the outputs)")
+        return None
 
     def pid(self, name):
         nodes = json.loads((self.dir / "manifest.json").read_text())["nodes"]
         return next(n["pid"] for n in nodes if n["name"] == name)
 
-    def stop(self):
+    def stop(self, grace_s=30):
+        """Stops the session as an operator does (SIGINT: the launcher stops
+        its members, each in a process group of its own); SIGKILLs the
+        launcher after grace_s, whose members then die with it (Linux:
+        PR_SET_PDEATHSIG)."""
         if self.proc.poll() is None:
             os.killpg(self.proc.pid, signal.SIGINT)
             try:
-                self.proc.wait(timeout=30)
+                self.proc.wait(timeout=grace_s)
             except subprocess.TimeoutExpired:
                 os.killpg(self.proc.pid, signal.SIGKILL)
                 self.proc.wait()
@@ -164,7 +224,7 @@ class DriveDashboardInBrowser(unittest.TestCase):
         try:
             cls.session = Session(root, cls.tmp)
             cls.session.wait_listening()
-            cls.browser = cdp.Browser(binary, cls.tmp)
+            cls.browser = cdp.Browser(binary, cls.tmp, register=_STOPS.append)
             cls.page = cls.browser.page
             cls.page.viewport(*VIEWPORTS[0])
             probe = (Path(__file__).parent / "probe.js").read_text()
@@ -341,6 +401,10 @@ class DriveDashboardInBrowser(unittest.TestCase):
         pid = self.session.pid(PRODUCER)
         armed_at = self.page.evaluate(f"__probe.armStale({WAIT_MS})")
         os.kill(pid, signal.SIGSTOP)
+        # Not part of the bound: how much of the measurement is the harness
+        # (the page's reply reaching this process, and this process's turn
+        # to stop the producer), printed so a failure shows it.
+        stopped_by = self.page.evaluate("performance.now()")
         try:
             try:
                 result = self.page.evaluate("window.__stale")
@@ -356,12 +420,14 @@ class DriveDashboardInBrowser(unittest.TestCase):
         print(f"{label}: {result['widgets']} widgets stale {result['staleAt'] - armed_at:.1f} ms "
               f"after the page clock read before SIGSTOP (+{period_ms:.0f} ms producer period "
               f"= {latency_ms:.1f} ms, bound {STALE_BOUND_MS} ms); status "
-              f"{result['status']['text']!r} at {result['namedAt'] - armed_at:.1f} ms", flush=True)
+              f"{result['status']['text']!r} at {result['namedAt'] - armed_at:.1f} ms; "
+              f"the stop came within {stopped_by - armed_at:.1f} ms of the read", flush=True)
         if latency_ms > STALE_BOUND_MS:
             self.check(label, [{
                 "check": "stale too late", "element": ".w", "detail":
                 f"{latency_ms:.1f} ms from the producer's last tick at the latest, "
-                f"bound {STALE_BOUND_MS} ms (REQ-OPS-36)", "result": result}])
+                f"bound {STALE_BOUND_MS} ms (REQ-OPS-36); the stop came within "
+                f"{stopped_by - armed_at:.1f} ms of the page's clock read", "result": result}])
         self.assertIn("TELEMETRY", result["status"]["text"], result)
         self.wait(label, "__probe.current()", "current again after the producer resumed")
 

@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -171,7 +172,9 @@ class Page:
 class Browser:
     """A headless browser with a fresh profile under `tmp`, and its one page."""
 
-    def __init__(self, binary, tmp, timeout_s=60):
+    def __init__(self, binary, tmp, timeout_s=60, register=None):
+        """`register(close)` is called once the browser runs, so a caller
+        can stop it from a signal handler while this still waits on it."""
         self.profile = Path(tmp) / "browser-profile"
         self.profile.mkdir(parents=True)
         self.log_path = Path(tmp) / "browser.log"
@@ -188,6 +191,8 @@ class Browser:
              "--disable-backgrounding-occluded-windows", "about:blank"],
             stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         self.ws = None
+        if register is not None:
+            register(self.close)
         try:
             active = self.profile / "DevToolsActivePort"
 
@@ -214,10 +219,10 @@ class Browser:
     def close(self):
         if self.ws is not None:
             self.ws.close()
-        if self.proc.poll() is None:
-            try:
-                os.killpg(self.proc.pid, 9)
-            except ProcessLookupError:
-                pass
+        # The whole group: renderers and helpers may outlive the main process.
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         self.proc.wait()
         self.log.close()

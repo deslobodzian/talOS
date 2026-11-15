@@ -180,6 +180,11 @@ Where RULES.md 12 is read too broadly or too narrowly:
    `sleep(100ms); EXPECT(...)` is banned.
 4. **Ports are bound at 0** and read back. `exclusive` is for tests that own
    a host-wide resource (the whole-graph e2e tests), not for fixed ports.
+   The exception is a port handed to the launcher, which refuses 0 for the
+   Studio bridge and the gateway link: the test reserves one and releases it
+   before the launch, so another process can take it first, and the test
+   says so when that happens (`//studio:drive_browser_test` names the
+   member's failed-bind log line).
 5. **Randomness is seeded and printed**, settable from the environment
    (`TALOS_SOAK_SEED`).
 6. **A wall-clock bound comes from a requirement.** A perf test or timed e2e

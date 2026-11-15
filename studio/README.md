@@ -233,7 +233,12 @@ reads OK, it asserts from the live DOM:
   page is current again.
 
 Every wait is on an event (a file change, a DOM mutation, an animation
-frame), bounded only against a hang. A failed check saves a screenshot and
+frame), bounded only against a hang. The launcher refuses port 0, so the
+test reserves the bridge's and the gateway link's ports and releases them
+before the launch; a member that then cannot bind one fails the run at
+once, naming the port and the member's log line. Any exit of the test,
+SIGTERM from Bazel's timeout included, stops the session and the browser,
+which run in sessions of their own. A failed check saves a screenshot and
 the failing elements' CSS path, outerHTML and geometry (`<label>.png`,
 `<label>.json`), and the session's logs, to the test's undeclared outputs
 (`bazel-testlogs/studio/drive_browser_test/test.outputs/`), and prints their
