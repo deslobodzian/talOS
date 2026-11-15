@@ -142,12 +142,21 @@ probe's time.
   Each wheel's implied speed must be at most `max_odometry_speed_mps` (10 m/s);
   wrapped gyro steps must be at most
   `max_odometry_yaw_rate_radps` (25 rad/s). Both limits must be positive and
-  finite. Rejected steps hold the pose, invalidate that tick, and increment
-  the node's `odometry_rejected_count` (not an observation rejection or an
-  extra telemetry channel). The new encoder/yaw frame becomes the baseline
-  so later physically plausible motion recovers without integrating the jump.
-  Repeated rejected frames and older timestamps stay invalid without counting
-  again or changing that baseline.
+  finite. They are judged over an update period (`period_us`), as when one
+  sample was integrated per tick, not over one 5 ms step: against the newest
+  accepted sample at least that much older, or, sooner after a start or a
+  rejection, the oldest accepted since. A state's `sample_time_ns` is its
+  oldest reading and a wheel may be read up to the drivetrain's skew bound
+  later, so a wheel catching up after a missed CAN refresh can show 10 ms of
+  travel between two states whose sample times differ by far less. Stale,
+  invalid and out-of-order states never enter that comparison. A rejected
+  state holds the pose, increments the node's `odometry_rejected_count`
+  (not an observation rejection or an extra telemetry channel), and
+  invalidates the tick when it is the newest state delivered before it. The
+  new encoder/yaw frame becomes the baseline, and the comparison restarts
+  from it, so later physically plausible motion recovers without
+  integrating the jump. Repeated rejected frames and older timestamps stay
+  invalid without counting again or changing that baseline.
 - `valid` = odometry integrated at least once, the newest drivetrain
   message fresh (`drivetrain_timeout_us`) and usable, and its sample no
   older than that timeout. Otherwise the pose is held and the velocity
@@ -241,7 +250,9 @@ startup confirmation,
 missing/detached DS startup and process-lifetime localization latching;
 estimation while disabled; every 200 Hz drivetrain state integrated (a
 chassis spinning while it translates, against the closed-form line), and a
-stall's backlog integrated in order with its stale states skipped; stale,
+stall's backlog integrated in order with its stale states skipped; a
+30 cm one-state wheel jump rejected and a late wheel catching up after a
+missed refresh accepted; stale,
 frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
 replaying without divergence. For `factor_graph` alone (Kalman has no such
