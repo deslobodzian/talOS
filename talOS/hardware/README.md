@@ -682,7 +682,9 @@ snapshot (an atomic load, and an exchange when there is a new one; no lock,
 no WPILib call) and uses that one snapshot for the gateway's enable, the
 mode generation and, when one is due, the whole Driver Station packet. So
 the packet is always one refresh's data: the HAL's cache changes only on a
-refresh, only `talos-ds` refreshes, and it snapshots before its next one;
+refresh, only `talos-ds` refreshes (on the RoboRIO and in desktop
+simulation, whose scripted Driver Station only queues its data and wakes
+`talos-ds`), and it snapshots before its next one;
 the joysticks are one Driver Station packet's. Once the last completed
 refresh is `command_timeout_us` old (the gateway's, the default Config's
 100 ms before a configuration), the loop reads no Driver Station: flags 0,

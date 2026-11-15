@@ -79,8 +79,8 @@ constexpr ProgramMode ProgramModeOf(uint32_t flags) {
 //
 // Consistency. Each snapshot the loop gets is one refresh's, whole: its flags,
 // alliance, station, match fields, match time and every joystick come from the
-// same HAL_RefreshDSData, because only talos-ds refreshes in this program and
-// it snapshots before its next refresh; and the loop only ever reads a
+// same HAL_RefreshDSData, because talos-ds is the program's one refresher
+// and it snapshots before its next refresh; and the loop only ever reads a
 // snapshot the helper has finished and no longer writes (a triple buffer: the
 // helper fills its own slot and swaps it in with one atomic exchange, the loop
 // swaps out the newest with another). Within that refresh the joysticks are
@@ -92,6 +92,16 @@ constexpr ProgramMode ProgramModeOf(uint32_t flags) {
 // newer. The packet the loop sends at a tick is the snapshot it read at that
 // tick's start, so the packet's flags are the flags that tick's gateway
 // enable and ModeTracker used.
+//
+// The one-refresher rule: in src/main, frc::DriverStation::RefreshData (and
+// with it HAL_RefreshDSData) is called only by WpilibCalls' refresh, and
+// nothing calls frc::sim::DriverStationSim::NotifyNewData, which refreshes on
+// its caller's thread. The desktop simulation's Driver Station
+// (SimDriverStation) hands its data over with
+// HALSIM_NotifyDriverStationNewData, which only queues it and sets the
+// new-data event talos-ds waits on, as the WPILib simulation GUI and
+// Driver Station socket plugins do (SimDriverStation_test,
+// ScriptedEventsLeaveTheRefreshToTheReader).
 //
 // Stop (also the destructor) wakes the helper and waits for it to exit for
 // at most `stop_bound`. A helper still inside a NetComm call by then is

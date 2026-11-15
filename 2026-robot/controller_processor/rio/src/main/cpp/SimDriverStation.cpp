@@ -4,6 +4,7 @@
 
 #include <frc/simulation/DriverStationSim.h>
 #include <hal/DriverStationTypes.h>
+#include <hal/simulation/DriverStationData.h>
 
 #include <chrono>
 #include <cstdint>
@@ -26,6 +27,15 @@ SimMode ModeOf(uint32_t flags) {
           .autonomous = (flags & ds::kAutonomous) != 0,
           .test = (flags & ds::kTest) != 0};
 }
+
+// Hands what was just set to the HAL as a new Driver Station packet and
+// wakes the Driver Station reader (its new-data event), which refreshes
+// WPILib's cache on its own thread. Not DriverStationSim::NotifyNewData:
+// that also refreshes the cache (frc::DriverStation::RefreshData) on the
+// calling thread, the loop, and the reader's snapshot is one refresh whole
+// only while the reader is the program's one refresher
+// (DriverStationReader.h).
+void NotifyReader() { HALSIM_NotifyDriverStationNewData(); }
 
 const char* ModeName(const SimMode& mode) {
   if (!mode.enabled) return "disabled";
@@ -180,7 +190,7 @@ void SimDriverStation::UpdateJoystick(Clock::time_point now) {
   for (int pov = 0; pov < stick.pov_count; ++pov) {
     DriverStationSim::SetJoystickPOV(0, pov, stick.povs[pov]);
   }
-  DriverStationSim::NotifyNewData();
+  NotifyReader();
   std::printf("%ssimulated Driver Station: joystick event %zu\n",
               TimeOf(now).c_str(), joystick_event_);
   std::fflush(stdout);
@@ -191,7 +201,7 @@ void SimDriverStation::Publish(SimMode mode) {
   frc::sim::DriverStationSim::SetAutonomous(mode.autonomous);
   frc::sim::DriverStationSim::SetTest(mode.test);
   frc::sim::DriverStationSim::SetEnabled(mode.enabled);
-  frc::sim::DriverStationSim::NotifyNewData();
+  NotifyReader();
 }
 
 }  // namespace talos::rio
