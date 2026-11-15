@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <numbers>
+#include <optional>
 #include <span>
 #include <stdexcept>
 
@@ -50,13 +51,18 @@ class Trajectory {
 
   // A synchronized trapezoid: accelerate for 1/4, cruise for 1/2,
   // decelerate for 1/4 of the duration. Hermite interpolation is exact
-  // on these constant-acceleration segments.
-  static Trajectory FromPoses(const geometry::Pose2d& start,
-                              const geometry::Pose2d& target,
-                              double max_linear_mps, double max_angular_radps) {
+  // on these constant-acceleration segments. nullopt, never an exception,
+  // when no finite trajectory joins the poses: a speed limit that is not
+  // finite and positive, a pose that is not finite, or poses so far apart
+  // that the distance or duration overflows. The start is a run-time pose
+  // estimate, so the caller treats nullopt as an unusable pose.
+  static std::optional<Trajectory> FromPoses(const geometry::Pose2d& start,
+                                             const geometry::Pose2d& target,
+                                             double max_linear_mps,
+                                             double max_angular_radps) {
     if (!(std::isfinite(max_linear_mps) && max_linear_mps > 0 &&
           std::isfinite(max_angular_radps) && max_angular_radps > 0)) {
-      throw std::invalid_argument("trajectory speed limits");
+      return std::nullopt;
     }
     const double dx = target.x_m() - start.x_m();
     const double dy = target.y_m() - start.y_m();
@@ -76,6 +82,15 @@ class Trajectory {
                     velocity * dx,
                     velocity * dy,
                     velocity * da};
+    }
+    // The constructor's own checks (finite values, rising times), here
+    // without its exception. Times rise whenever the duration is finite.
+    for (const auto& sample : samples) {
+      for (double value :
+           {sample.time_s, sample.x_m, sample.y_m, sample.yaw_rad,
+            sample.vx_mps, sample.vy_mps, sample.omega_radps}) {
+        if (!std::isfinite(value)) return std::nullopt;
+      }
     }
     return Trajectory{samples};
   }
