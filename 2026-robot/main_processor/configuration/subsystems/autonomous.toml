@@ -37,8 +37,10 @@ replan_step_rad = 0.1
 # (config_golden_test checks they match).
 field_length_m = 16.541
 field_width_m = 8.069
-# Feedback velocity per metre/radian of pose error.
-xy_feedback_per_m_mps = 1.0
+# Feedback velocity per metre/radian of pose error. 2.0 brings a 0.3 m shove
+# back within 0.10 m of the path in 1 s against the drivetrain in simulation
+# (autonomous closed_loop_test); 1.0 leaves 0.15 m.
+xy_feedback_per_m_mps = 2.0
 yaw_feedback_per_rad_radps = 1.0
 # The game's autonomous period. A re-enable in autonomous this long after the
 # routine armed belongs to another match and starts it over; sooner, in the

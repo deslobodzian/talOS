@@ -112,7 +112,7 @@ TEST(ConfigTest, AutonomousToleranceFeedbackClearsTheSwerveHoldSpeed) {
         (*autonomous)["position_tolerance_m"].value_or(0.10);
     const double yaw_tolerance_rad =
         (*autonomous)["yaw_tolerance_rad"].value_or(0.05);
-    const double kp_xy = (*autonomous)["xy_feedback_per_m_mps"].value_or(1.0);
+    const double kp_xy = (*autonomous)["xy_feedback_per_m_mps"].value_or(2.0);
     const double kp_yaw =
         (*autonomous)["yaw_feedback_per_rad_radps"].value_or(1.0);
     const auto geometry = drivetrain::BuildSwerveGeometry(config, "drivetrain");
