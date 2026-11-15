@@ -371,8 +371,8 @@ built, through [`bridge/webroot.bzl`](bridge/webroot.bzl), as
 the commands a student types. A webroot that does not exist or holds no
 `index.html` or `drive.html` is not an error for the bridge: it serves its
 feeds, logs each missing page at startup, and answers `/` and `/drive` with
-503 naming the folder, the build command and, for a robot, installing the
-bundle again. `talos_bundle` refuses a `studio_webroot` with no `index.html`
+503 naming the folder, the build command and, for a robot, installing a
+rebuilt bundle and restarting the service. `talos_bundle` refuses a `studio_webroot` with no `index.html`
 or `drive.html`.
 
 See the [bridge README](bridge/README.md) for serving the frontend with a live

@@ -626,7 +626,8 @@ std::string MissingPage(const fs::path& webroot, std::string_view page) {
       "(from a robot repository: `cd talos && bazel build //studio:web_dist`), "
       "then start the session again";
   const std::string install =
-      "install the bundle again with `tools/deploy.sh install <bundle>` "
+      "install a bundle built from the current checkout with "
+      "`tools/deploy.sh install <bundle>`, then restart the service "
       "(docs/DEPLOYMENT.md)";
   if (bundle) {
     return "Studio's pages are missing from the installed bundle: " + where +
