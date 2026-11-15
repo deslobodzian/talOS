@@ -6,6 +6,8 @@ DrivetrainState the way the drivetrain does (module positions, gyro yaw,
 sample time); the expected poses are closed-form, not another estimator.
 """
 
+import contextlib
+import io
 import json
 import math
 import os
@@ -63,9 +65,12 @@ cameras = [{names}]
 max_observation_age_us = {max_observation_age_us}
 {extra}
 
-# The estimator reads the module offsets from the drivetrain's geometry. A
-# robot config needs one motor: the drivetrain's, whose state the tests
-# publish themselves.
+# The estimator reads the module offsets from the drivetrain's geometry and
+# its period. A robot config needs one motor: the drivetrain's, whose state
+# the tests publish themselves.
+[subsystems.drivetrain]
+period_us = 5000
+
 [subsystems.drivetrain.geometry]
 modules = [
 {module_rows}]
@@ -723,6 +728,39 @@ class EstimatorTest(unittest.TestCase):
                 self.assertTrue(e.valid)
                 self.assertEqual(e.sample_time_ns,
                                  self.sim.now_ns - round(DRIVETRAIN_DT * 1e9))
+
+    # REQ-CONTRACT-26
+    def test_factor_graph_survives_sample_time_steps_of_a_nanosecond(self):
+        """A state's sample time is its oldest reading, so when the
+        most-lagging device changes, the sample time can advance by a
+        microsecond or a nanosecond while the wheels moved a refresh's
+        worth. Here every other 5 ms state does so. Each step's odometry
+        sigma is floored at the drivetrain's period, so the smoother never
+        fails (no failure report on stderr) and a 1 ns step fuses as a
+        1 us one does: the same observations correct the pose alike."""
+        fused = {}
+        for step_ns in (1000, 1):
+            chassis = self.start("factor_graph")
+            sample_ns = self.estimate().sample_time_ns
+            states = 0
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                for tick in range(204):
+                    chassis.advance(1.0, 0.0, 0.0, 0.9, dt=DRIVETRAIN_DT)
+                    states += 1
+                    sample_ns = (sample_ns + step_ns if states % 2
+                                 else self.sim.now_ns)
+                    chassis.publish(sample_time_ns=sample_ns)
+                    self.sim.step(DRIVETRAIN_DT)
+                    if tick % 20 == 19 and tick < 200:
+                        self.observe(x=chassis.x, y=0.0, yaw=0.0,
+                                     time_ns=sample_ns,
+                                     std=(0.05, 0.05, 0.05))
+            self.assertEqual(self.counts(), (10, 0))
+            self.assertNotIn("failure", stderr.getvalue())
+            fused[step_ns] = self.pose()[0] - chassis.x
+        self.assertAlmostEqual(fused[1], fused[1000], delta=0.001,
+                               msg=f"error from truth by step: {fused}")
 
     # REQ-CONTRACT-26
     def test_factor_graph_fusion_does_not_depend_on_the_drivetrain_rate(self):

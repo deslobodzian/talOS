@@ -148,6 +148,19 @@ def _std_devs(node, table, prefix, defaults):
                  for axis, default in zip(("x_m", "y_m", "yaw_rad"), defaults))
 
 
+def _drivetrain_period_s(node):
+    """The drivetrain's period_us, the shortest interval its states'
+    readings span; without one it runs at [robot] period_us, which a node
+    cannot read, so the estimator's own period stands in."""
+    period_us = node.param_of(DRIVETRAIN, "period_us", None)
+    if period_us is None:
+        return node.period
+    if not (math.isfinite(period_us) and period_us > 0):
+        raise ValueError(f"pose_estimator: {DRIVETRAIN} period_us must be "
+                         f"positive, got {period_us}")
+    return period_us / _US
+
+
 def _module_offsets(node):
     """(x_m, y_m) per module, read from the drivetrain's own geometry.
 
@@ -307,17 +320,22 @@ class FactorGraphBackend:
     interval dt and gets that sigma scaled by sqrt(dt / period) (white noise:
     variance grows with time), so the odometry weighs the same against the
     cameras whatever the drivetrain's rate, and a longer step after a gap
-    is trusted less.
+    is trusted less. dt is floored at the drivetrain's period: a state's
+    sample time is its oldest reading, so when the most-lagging device
+    changes a step can be microseconds long while its wheel travel spans at
+    least one refresh, and a sigma scaled by that dt would be over-confident
+    (and, at nanoseconds, makes iSAM2 fail and restart).
     """
 
-    def __init__(self, kinematics, update_period_s, lag_s, initial,
-                 odometry_std, prior_std):
+    def __init__(self, kinematics, update_period_s, min_step_s, lag_s,
+                 initial, odometry_std, prior_std):
         # Loaded here, for this backend only, so a kalman configuration never
         # loads gtsam's ~150 MB of native code.
         self.gtsam = importlib.import_module("gtsam")
         self.kinematics = kinematics
         self.lag_s = lag_s
         self.update_period_s = update_period_s
+        self.min_step_s = min_step_s
         self.odometry_std = np.array(odometry_std)
         self.prior_noise = self.gtsam.noiseModel.Diagonal.Sigmas(
             np.array(prior_std))
@@ -351,10 +369,10 @@ class FactorGraphBackend:
         guess = self.estimate.exp(twist)
         sample = self._append(time_s, previous.odometry.exp(twist))
         graph = self.gtsam.NonlinearFactorGraph()
-        # dt > 0: integrate() passes only samples newer than the last one.
         noise = self.gtsam.noiseModel.Diagonal.Sigmas(
             self.odometry_std * math.sqrt(
-                (time_s - previous.time_s) / self.update_period_s))
+                max(time_s - previous.time_s, self.min_step_s)
+                / self.update_period_s))
         graph.add(self.gtsam.BetweenFactorPose2(
             previous.key, sample.key, self._pose2(Pose2d().exp(twist)),
             noise))
@@ -514,7 +532,7 @@ class PoseEstimator:
         kalman_args = (initial, _std_devs(node, "kalman", "state_std",
                                           (0.1, 0.1, 0.1)))
         factor_graph_args = (
-            node.period, self.max_age_s, initial,
+            node.period, _drivetrain_period_s(node), self.max_age_s, initial,
             _std_devs(node, "factor_graph", "odometry_std",
                       (0.01, 0.01, 0.005)),
             _std_devs(node, "factor_graph", "prior_std", (1.0, 1.0, 0.5)))
