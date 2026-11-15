@@ -82,6 +82,10 @@ ALLOWLIST = {
     ("2026-robot/main_processor/driver", "2026-robot/main_processor/drivetrain"):
         "driver's node_test composes the teleop chain with "
         "drivetrain::Drivetrain under Sim (TODO ARCH-2)",
+    ("2026-robot/main_processor/autonomous",
+     "2026-robot/main_processor/drivetrain"):
+        "autonomous's closed_loop_test drives drivetrain::Drivetrain under "
+        "Sim (TODO ARCH-2)",
 }
 
 

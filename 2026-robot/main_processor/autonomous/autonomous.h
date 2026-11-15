@@ -59,7 +59,7 @@ class Autonomous {
         replan_step_rad_{node.param("replan_step_rad", 0.1)},
         field_length_{node.param("field_length_m", 16.541)},
         field_width_{node.param("field_width_m", 8.069)},
-        kp_xy_{node.param("xy_feedback_per_m_mps", 1.0)},
+        kp_xy_{node.param("xy_feedback_per_m_mps", 2.0)},
         kp_yaw_{node.param("yaw_feedback_per_rad_radps", 1.0)},
         feed_duration_{std::chrono::microseconds{
             node.param<int>("feed_duration_us", 500000)}},
