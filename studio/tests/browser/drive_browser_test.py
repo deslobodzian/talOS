@@ -460,6 +460,9 @@ class ChildSignalsItsGroupOnlyUnreaped(unittest.TestCase):
                                killpg=killpg, stdin=subprocess.PIPE)
         self.addCleanup(child.proc.stdin.close)
         self.assertFalse(child.exited())
+        # A child that does not exit ends the wait at its timeout: a lost
+        # SIGKILL must fail below in seconds, not hang until Bazel's timeout.
+        self.assertFalse(child.wait_exited(0.05), "a live child read as exited")
         self.assertTrue(child.signal_group(signal.SIGKILL))
         # exited() sees the exit and leaves it unreaped: reap() still reads
         # the SIGKILL status, which a reaped pid would have lost.
