@@ -11,7 +11,7 @@ goes through Gradle, but it exercises the actual `Robot` loop and the actual
 Driver Station enable path, so it also runs two scenarios that the
 stand-alone gateway cannot: with the Driver Station never enabled, the
 drivetrain must not move at all; and with the Driver Station still enabled
-and the wheels driven, every main-processor process dies at once, and the
+and the wheels driven, the main processor falls silent at once, and the
 RoboRIO program alone must neutralize every output on its first tick at or
 past the command's expiry (REQ-SAFE-16, REQ-SAFE-17, REQ-SAFE-18), judged
 from its own States on its own clock.
@@ -27,6 +27,7 @@ Run from any directory.
 """
 
 import argparse
+import json
 import os
 import re
 import selectors
@@ -40,9 +41,12 @@ import threading
 import time
 from pathlib import Path
 
-# The gateway outlives the bridge and the bridge outlives the node, so the last
-# thing the test observes is the gateway neutralizing its motors once commands
-# stop arriving.
+# The gateway outlives the bridge and the bridge outlives the node, so the
+# driving scenario's final State comes after commands stop arriving. That
+# State does not single out the gateway's own stop: the target is released at
+# 2 s and the node and bridge exit first, and under --wpilib the Driver
+# Station also disables at 9 s. The silent-main-processor scenario checks the
+# gateway's own stop.
 GATEWAY_SECONDS = 10
 BRIDGE_SECONDS = 8
 NODE_SECONDS = 6
@@ -82,8 +86,15 @@ LOOP_STALLED = "RoboRIO loop stalled past an expired command"
 # gateway socket opening: bring-up and driving take about 2 s, the judged
 # silence a quarter second.
 SILENT_GATEWAY_SECONDS = 6
-# How long the main-processor processes would run; they are killed first.
+# How long the bridge and node would run; they are stopped first.
 SILENT_MAIN_SECONDS = 30
+# send_target has no stop handler, so it ends on its own: its target holds
+# this long, through the cut (about half a second after it starts), and its
+# exit closes its queues.
+SILENT_TARGET_SECONDS = 3
+# Bounds a stop handler that hangs; past it the process is SIGKILLed and the
+# run fails, since a killed holder leaves its shared memory behind.
+STOP_SECONDS = 10
 # A drive motor under the 1 m/s target settles near 2.5 V and 3 rps in the
 # Phoenix simulation, and neutral reads exactly 0 V: past both of these on
 # its way up, the motor is plainly driven and turning.
@@ -118,6 +129,8 @@ COUNTERS = struct.Struct("<4I")
 # config, boot, epoch, observed time; motor, digital and PWM counts.
 COMMAND_BASE = struct.Struct("<4Q3H")
 MOTOR_REQUEST = struct.Struct("<HBBdd")
+DIGITAL_OUTPUT_REQUEST_SIZE = 3
+PWM_REQUEST_SIZE = 10
 NEUTRAL_MODE = 0
 FLAG_CONFIGURED, FLAG_ENABLED = 1, 2
 FLAG_COMMAND_ACTIVE, FLAG_HARDWARE_FAULT = 4, 8
@@ -159,19 +172,25 @@ class Scenario:
             root / "2026-robot/main_processor/configuration/robot.toml")
         self.output = output
         self.children = []
-        self.killed = set()
+        self.names = {}
+        self.stopped = set()
         self.files = []
 
     def start(self, name, argv, cwd=None, env=None):
         log = (self.output / (name + ".txt")).open("w")
         self.files.append(log)
-        # Its own process group: Gradle forks the simulated robot, and killing
-        # Gradle alone would leave that robot holding port 5802.
+        # Its own process group, so a signal reaches the whole child. Gradle
+        # is the exception: the simulated robot runs under the Gradle daemon,
+        # in the daemon's group, not the wrapper's. It stops on its own at
+        # TALOS_SIM_RUN_MS; when the wrapper's group is signalled first, the
+        # wrapper exits and the daemon cancels the build, which stops the
+        # robot and frees port 5802.
         process = subprocess.Popen(
             argv, stdout=log, stderr=subprocess.STDOUT,
             cwd=cwd or self.root, env=env, start_new_session=True,
         )
         self.children.append(process)
+        self.names[process.pid] = name
         return process
 
     def start_sim_gateway(self, seconds):
@@ -215,7 +234,7 @@ class Scenario:
         self.wait_for("hardware gateway config=", gateway)
         return gateway
 
-    def wait_for(self, needle, process):
+    def wait_for(self, needle, process, others=()):
         path = self.output / "gateway.txt"
         deadline = time.monotonic() + WPILIB_STARTUP_TIMEOUT
         while time.monotonic() < deadline:
@@ -223,6 +242,10 @@ class Scenario:
                 return
             if process.poll() is not None:
                 raise RuntimeError(f"Gateway exited early; see {self.output}")
+            ended = self.exited(others)
+            if ended:
+                raise RuntimeError(f"waiting for '{needle}': {ended}; see "
+                                   f"{self.output}")
             time.sleep(0.25)
         raise RuntimeError(f"Gateway never started; see {self.output}")
 
@@ -252,19 +275,42 @@ class Scenario:
                              "0", str(target_seconds)])
         return node, sender
 
-    def kill(self, processes):
-        """SIGKILL each process's group: no handler runs, nothing more is sent."""
+    def stop(self, processes):
+        """SIGTERM each process's group and wait for its stop handler.
+
+        Returns the names of those that did not exit 0 within STOP_SECONDS
+        (SIGKILLed then). A clean exit closes their shared-memory queues, and
+        the last closer unlinks each; a killed holder would leave it.
+        """
         for process in processes:
-            _terminate_group(process, signal.SIGKILL)
+            _terminate_group(process, signal.SIGTERM)
+        failed = []
+        deadline = time.monotonic() + STOP_SECONDS
         for process in processes:
-            process.wait()
-            self.killed.add(process.pid)
+            try:
+                code = process.wait(
+                    timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                _terminate_group(process, signal.SIGKILL)
+                code = process.wait()
+            self.stopped.add(process.pid)
+            if code != 0:
+                failed.append(f"{self.names[process.pid]} ({code})")
+        return failed
+
+    def exited(self, processes):
+        """The name and exit code of the first of these that has exited."""
+        for process in processes:
+            if process.poll() is not None:
+                name = self.names[process.pid]
+                return f"{name} exited ({process.returncode})"
+        return None
 
     def wait(self):
         failed = False
         for child in self.children:
             code = child.wait(timeout=WPILIB_STARTUP_TIMEOUT)
-            if code != 0 and child.pid not in self.killed:
+            if code != 0 and child.pid not in self.stopped:
                 failed = True
         # A host sleep explains a failed process or a loop stall, so it is
         # reported first.
@@ -362,13 +408,16 @@ def check_ports():
             probe.bind(("0.0.0.0", port))
 
 
-def robot_setting(config, key):
-    """A number from robot.toml's [robot] table, which sets it directly."""
-    found = re.search(rf"^{key}\s*=\s*([0-9.]+)\s*$", config.read_text(),
-                      re.MULTILINE)
-    if not found:
-        raise RuntimeError(f"{config} sets no [robot] {key}")
-    return float(found.group(1))
+def robot_settings(config, *keys):
+    """Values from robot.toml's [robot] table, which sets them directly."""
+    # Imported here: tomllib is Python 3.11+, and only --wpilib needs it, so
+    # an older system python3 still runs the sim_gateway mode.
+    import tomllib
+    robot = tomllib.loads(config.read_text()).get("robot", {})
+    missing = [key for key in keys if key not in robot]
+    if missing:
+        raise RuntimeError(f"{config} sets no [robot] {', '.join(missing)}")
+    return [robot[key] for key in keys]
 
 
 def decode_frame(data):
@@ -441,8 +490,14 @@ def decode_state(payload):
 
 def decode_command(payload):
     """(observed_time_us, [(motor id, mode)]) of a Command."""
-    (_config, _boot, _epoch, observed_us, motor_count, _digital,
-     _pwm) = COMMAND_BASE.unpack_from(payload)
+    (_config, _boot, _epoch, observed_us, motor_count, digital_count,
+     pwm_count) = COMMAND_BASE.unpack_from(payload)
+    expected = (COMMAND_BASE.size + motor_count * MOTOR_REQUEST.size +
+                digital_count * DIGITAL_OUTPUT_REQUEST_SIZE +
+                pwm_count * PWM_REQUEST_SIZE)
+    if len(payload) != expected:
+        raise RuntimeError(f"Command of {len(payload)} bytes, its counts give "
+                           f"{expected}: update this script's decoder")
     motors = []
     for i in range(motor_count):
         offset = COMMAND_BASE.size + i * MOTOR_REQUEST.size
@@ -458,9 +513,10 @@ class Relay:
     It holds 127.0.0.1:5803, where the RoboRIO program sends, and relays
     every datagram both ways between it and a bridge started on other
     ports, recording each State it receives and each command it forwards.
-    `cut()` is the main processor dying: from then on nothing reaches the
-    RoboRIO, and the relay only listens. Its sends keep leaving without an
-    error, as they would towards a powered-off host, which answers nothing.
+    The cut (`wait(..., cut=True)`) is the main processor dying: from then
+    on nothing crosses the relay in either direction, and it only listens. Its
+    sends keep leaving without an error, as they would towards a powered-off
+    host, which answers nothing.
     """
 
     def __init__(self):
@@ -482,6 +538,7 @@ class Relay:
         self.relay_port = self.bridge_side.getsockname()[1]
         self.condition = threading.Condition()
         self.forwarding = True
+        self.forwarded_after_cut = 0
         self.states = []
         self.commands = {}
         self.driver_station_after_cut = 0
@@ -513,15 +570,15 @@ class Relay:
             selector.close()
 
     def _from_robot(self, data):
-        with self.condition:
-            forwarding = self.forwarding
-        if forwarding:
-            self._send(self.bridge_side, data, self.bridge_port)
         frame = decode_frame(data)
-        if frame is None:
-            return
-        frame_type, _sequence, payload = frame
         with self.condition:
+            # Under the lock, as on the other path: nothing is forwarded
+            # once the cut is made.
+            if self.forwarding:
+                self._send(self.bridge_side, data, self.bridge_port)
+            if frame is None:
+                return
+            frame_type, _sequence, payload = frame
             if frame_type == STATE_FRAME:
                 self.states.append(decode_state(payload))
                 self.condition.notify_all()
@@ -535,35 +592,55 @@ class Relay:
             frame = decode_frame(data)
             if frame is not None and frame[0] == COMMAND_FRAME:
                 self.commands[frame[1]] = decode_command(frame[2])
-            # Under the lock, so nothing is forwarded after cut() returns.
             self._send(self.robot_side, data, 5802)
 
-    @staticmethod
-    def _send(sock, data, port):
+    def _send(self, sock, data, port):
+        # Called with the lock held; counts what a cut should have stopped.
+        if not self.forwarding:
+            self.forwarded_after_cut += 1
         try:
             sock.sendto(data, ("127.0.0.1", port))
         except OSError:
             pass  # nobody bound there yet: the datagram is lost, as on a link
 
-    def cut(self):
-        with self.condition:
-            self.forwarding = False
+    def wait(self, predicate, what, exited, cut=False):
+        """Wait for predicate() over the recorded traffic, under the lock.
 
-    def wait(self, predicate, what, alive):
-        """Wait for predicate() over the recorded traffic, under the lock."""
+        exited() names a process that ended first, or returns None. With cut,
+        the cut is made under the same lock that saw predicate() hold, so no
+        datagram passes between the two.
+        """
         deadline = time.monotonic() + SILENT_WAIT_SECONDS
         with self.condition:
             while not predicate():
                 if self.error is not None:
                     raise RuntimeError(f"relay failed: {self.error!r}")
-                if not alive():
-                    raise RuntimeError(f"{what}: the RoboRIO program exited "
-                                       f"first")
+                ended = exited()
+                if ended:
+                    raise RuntimeError(f"{what}: {ended} first")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise RuntimeError(f"{what}: not within "
                                        f"{SILENT_WAIT_SECONDS} s")
                 self.condition.wait(min(remaining, 0.5))
+            if cut:
+                self.forwarding = False
+
+    def dump(self, output):
+        """Write what the relay recorded, one JSON object a line, for CI's
+        artifacts: every State (relay_states.jsonl) and every forwarded
+        command by frame sequence (relay_commands.jsonl)."""
+        with self.condition:
+            states = list(self.states)
+            commands = sorted(self.commands.items())
+        with (output / "relay_states.jsonl").open("w") as out:
+            for state in states:
+                out.write(json.dumps(state) + "\n")
+        with (output / "relay_commands.jsonl").open("w") as out:
+            for sequence, (observed_us, motors) in commands:
+                out.write(json.dumps({"sequence": sequence,
+                                      "observed_us": observed_us,
+                                      "motors": motors}) + "\n")
 
     def close(self):
         self.stopping.set()
@@ -646,6 +723,12 @@ def run_disabled_scenario(root, output_root):
     return output
 
 
+def turning(state):
+    """Some valid motor sample is driven and turning."""
+    return any(valid and abs(volts) >= DRIVEN_VOLTS and abs(rps) >= DRIVEN_RPS
+               for _, valid, rps, volts in state["motors"])
+
+
 def driven(relay):
     """The newest State shows a turning motor under a driving command."""
     if not relay.states:
@@ -655,9 +738,7 @@ def driven(relay):
     command = relay.commands.get(state["last_command_sequence"])
     return ((state["flags"] & wanted) == wanted and command is not None and
             any(mode != NEUTRAL_MODE for _, mode in command[1]) and
-            any(valid and abs(volts) >= DRIVEN_VOLTS and
-                abs(rps) >= DRIVEN_RPS
-                for _, valid, rps, volts in state["motors"]))
+            turning(state))
 
 
 def judge_silence(states, commands, timeout_us, status_hz):
@@ -708,6 +789,13 @@ def judge_silence(states, commands, timeout_us, status_hz):
             f"the command stopped at {stop['sample_us']} us, "
             f"{expiry_us - stop['sample_us']} us before its expiry: another "
             f"stop than the command timeout")
+    # A steer motor holding its angle in position mode is a non-neutral
+    # command alone; the wheels must still be turning up to the stop.
+    if not turning(before):
+        raise RuntimeError(
+            f"State {before['sequence']}, the last before the stop, has no "
+            f"valid motor at >= {DRIVEN_VOLTS} V and >= {DRIVEN_RPS} rps: "
+            f"{before['motors']}")
     # The timeout's own mark: still enabled and healthy, a new epoch, and no
     # apply failure or device reset, the gateway's other stops.
     wanted = FLAG_CONFIGURED | FLAG_ENABLED
@@ -719,12 +807,17 @@ def judge_silence(states, commands, timeout_us, status_hz):
             stop["resets"] != before["resets"]):
         raise RuntimeError(f"stop State {stop} after {before}: not the "
                            f"command timeout")
-    # Every output stays neutral while the Driver Station stays enabled. The
-    # motor voltage is a Phoenix status signal, read four status periods
-    # after the neutral (talOS/hardware/README.md: a status signal is late
-    # from then), and a motor sample must be valid to count.
+    # Every output stays neutral while the Driver Station stays enabled. A
+    # motor's voltage is its Phoenix MotorVoltage status signal, so the
+    # NeutralOut sent in the stop tick reaches it a status period or more
+    # later. The 0 V check therefore starts four status periods
+    # (4 / status_hz) after the stop State; that window only delays where the
+    # check starts. No document bounds this lag: every State from there to
+    # the end of the observation (about 100 ms more) must read 0 V on a valid
+    # sample, so a longer lag fails the run. The measured lag is reported.
     settled_us = stop["sample_us"] + 4 * 1_000_000 / status_hz
     settled = 0
+    zero_after_us = None
     for s in states:
         if s["sequence"] < stop["sequence"]:
             continue
@@ -733,11 +826,16 @@ def judge_silence(states, commands, timeout_us, status_hz):
             raise RuntimeError(f"after the stop, State {s['sequence']} has "
                                f"flags {s['flags']:#x} and command "
                                f"{s['last_command_sequence']}")
+        if zero_after_us is None and all(
+                valid and volts == 0.0 for _, valid, _, volts in s["motors"]):
+            zero_after_us = s["sample_us"] - stop["sample_us"]
         if s["sample_us"] < settled_us:
             continue
         settled += 1
         live = [(i, volts) for i, valid, _, volts in s["motors"]
                 if not valid or volts != 0.0]
+        # The 2026 config has no digital or PWM output, so these two lines
+        # check nothing there; they hold any config that has them.
         live += [(i, value) for i, _, value in s["digital_outputs"] if value]
         live += [(i, output) for i, _, output in s["pwm_outputs"]
                  if output != 0.0]
@@ -752,6 +850,7 @@ def judge_silence(states, commands, timeout_us, status_hz):
         "stop_after_observed_us": stop["sample_us"] - observed_us,
         "stop_after_expiry_us": stop["sample_us"] - expiry_us,
         "stop_tick_interval_us": stop["sample_us"] - before["sample_us"],
+        "zero_volts_after_stop_us": zero_after_us,
         "settled_states": settled,
     }
 
@@ -764,65 +863,108 @@ def judge_silence(states, commands, timeout_us, status_hz):
 def run_silent_main_processor_scenario(root, output_root):
     """The main processor dies while the robot drives, enabled.
 
-    Every main-processor process is killed at once (SIGKILL, so no release,
-    neutral request or disable goes out), the Driver Station stays enabled,
-    and only the RoboRIO program can stop the wheels. Its States are read at
-    the relay that stood in for the main processor's socket, not through the
-    dead bridge.
+    The relay cuts the link while a wheel turns: from then on nothing the
+    main processor sends reaches the RoboRIO program, and the Driver Station
+    stays enabled, so only the RoboRIO program can stop the wheels. Its
+    States are read at the relay, not through the bridge.
+
+    The cut is the death. The bridge's socket is connected to the relay
+    alone, the RoboRIO program's to 127.0.0.1:5803 alone (which the relay
+    holds), and the node and send_target use no socket, so after the cut no
+    release, neutral request or disable from any of them can reach the
+    RoboRIO: to it, a cut followed by clean stops is the same silence as a
+    SIGKILL, or a coprocessor losing power. The bridge and node are then
+    stopped with SIGTERM and send_target ends on its own, because a killed
+    process never closes its shared-memory queues and leaves their
+    production-name segments in /dev/shm for every later run.
     """
     output = Path(tempfile.mkdtemp(prefix="talos-silent-", dir=output_root))
     config = root / "2026-robot/main_processor/configuration/robot.toml"
-    timeout_us = int(robot_setting(config, "command_timeout_us"))
-    status_hz = robot_setting(config, "status_hz")
+    timeout_us, status_hz = robot_settings(config, "command_timeout_us",
+                                           "status_hz")
 
     with Relay() as relay, Scenario(root, output, wpilib=True) as scenario:
         gateway = scenario.start_wpilib_gateway(SILENT_GATEWAY_SECONDS,
                                                 enable_when_configured=True)
-
-        def alive():
-            return gateway.poll() is None
-
         bridge = scenario.start_bridge(
             SILENT_MAIN_SECONDS,
             ["--remote", "127.0.0.1", "--remote-port", str(relay.relay_port),
              "--local-port", str(relay.bridge_port)])
-        scenario.wait_for("simulated Driver Station: enabling", gateway)
+        scenario.wait_for("simulated Driver Station: enabling", gateway,
+                          [bridge])
         node, sender = scenario.start_node(
             output / "drive.tlog", SILENT_MAIN_SECONDS,
-            target_seconds=SILENT_MAIN_SECONDS)
+            target_seconds=SILENT_TARGET_SECONDS)
         relay.wait(lambda: driven(relay),
-                   "no State showed a driven, turning motor", alive)
-        relay.cut()
-        scenario.kill([bridge, node, sender])
+                   "no State showed a driven, turning motor",
+                   lambda: scenario.exited([gateway, bridge, node, sender]),
+                   cut=True)
         with relay.condition:
             cut_sample_us = relay.states[-1]["sample_us"]
             driven_volts = max(abs(volts) for *_, volts in
                                relay.states[-1]["motors"])
-        # Every command the RoboRIO had was built from a State the relay
-        # passed before the cut, so the expiry is at most one timeout past
-        # cut_sample_us; one more covers the stop and the settled outputs.
-        relay.wait(lambda: relay.states[-1]["sample_us"] >=
-                   cut_sample_us + 2 * timeout_us,
-                   "the RoboRIO program stopped sending States", alive)
-        with relay.condition:
-            if relay.driver_station_after_cut == 0:
-                raise RuntimeError("the Driver Station sent nothing after the "
-                                   "main processor died")
-            measured = judge_silence(list(relay.states), dict(relay.commands),
-                                     timeout_us, status_hz)
-        scenario.wait()
+
+        failure = None
+        try:
+            unclean = scenario.stop([bridge, node])
+            # Every command the RoboRIO had was built from a State the relay
+            # passed before the cut, so the expiry is at most one timeout
+            # past cut_sample_us; one more covers the stop and the settled
+            # outputs.
+            relay.wait(lambda: relay.states[-1]["sample_us"] >=
+                       cut_sample_us + 2 * timeout_us,
+                       "States through the expiry",
+                       lambda: scenario.exited([gateway]))
+            with relay.condition:
+                if relay.forwarded_after_cut:
+                    raise RuntimeError(f"the relay forwarded "
+                                       f"{relay.forwarded_after_cut} "
+                                       f"datagrams after the cut")
+                if relay.driver_station_after_cut == 0:
+                    raise RuntimeError("the Driver Station sent nothing after "
+                                       "the main processor died")
+                measured = judge_silence(list(relay.states),
+                                         dict(relay.commands), timeout_us,
+                                         status_hz)
+            if unclean:
+                raise RuntimeError(
+                    f"not stopped cleanly within {STOP_SECONDS} s by SIGTERM "
+                    f"(exit code; SIGKILLed past the bound): "
+                    f"{', '.join(unclean)}")
+        except RuntimeError as error:
+            failure = error
+        finally:
+            relay.dump(output)
+        # The robot's exit, a host sleep or a late tick explains a judgement
+        # failure, so they are checked first and the judgement follows them.
+        try:
+            scenario.wait()
+        except RuntimeError as error:
+            if failure is None:
+                raise
+            raise RuntimeError(f"{error}; then: {failure}") from failure
+        if failure is not None:
+            raise RuntimeError(f"{failure} (see {output})") from failure
 
     print(f"silent main processor: driven at {driven_volts:.2f} V when it "
           f"died; neutral {measured['stop_after_observed_us']}"
           f" us after the last command's observed State (command_timeout_us "
           f"{timeout_us}), {measured['stop_after_expiry_us']} us past its "
           f"expiry, on a tick {measured['stop_tick_interval_us']} us after "
-          f"the last driven one; {measured['settled_states']} settled States "
-          f"all neutral")
+          f"the last driven one; motors at 0 V "
+          f"{measured['zero_volts_after_stop_us']} us after the stop, "
+          f"{measured['settled_states']} settled States all neutral")
     return output
 
 
+def _exit_on_sigterm(signum, _frame):
+    # Raised in the main thread, so every Scenario and Relay `with` block
+    # stops its processes and closes its sockets on the way out.
+    raise SystemExit(128 + signum)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--wpilib",

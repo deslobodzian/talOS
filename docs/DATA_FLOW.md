@@ -182,6 +182,10 @@ struct padding. Position, velocity and voltage remain binary64. Motor stator
 current, supply current and device temperature use signed little-endian int16
 in 0.1 A / 0.1 °C units, rounded to nearest (ties away from zero), saturated
 to [-3276.8, 3276.7]; nonfinite inputs fail encoding.
+Two Python tests decode these layouts inline and change with them:
+`tools/test_drivetrain.py` (frame header, State, Command) and
+`2026-robot/main_processor/simulation/startup_test.py` (State counts and
+digital inputs, the Driver Station payload).
 
 ### Actual 2026 robot
 

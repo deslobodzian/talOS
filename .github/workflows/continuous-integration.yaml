@@ -545,7 +545,7 @@ jobs:
     # --wpilib drives, checks the robot ends neutral after the target, node,
     # bridge and Driver Station have stopped in turn, replays the node's log,
     # checks a never-enabled robot does not move, and, with the Driver Station
-    # still enabled, kills every main-processor process mid-drive and checks
+    # still enabled, cuts the main processor off mid-drive and checks
     # from the RoboRIO program's own States that it neutralizes every output
     # on its first tick at or past the command's expiry. -Pheadless (set by
     # the script) loads no simulation GUI, so no display is needed.
