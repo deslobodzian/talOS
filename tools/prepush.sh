@@ -32,7 +32,10 @@
 # results may not. Where this host allows an unprivileged user and network
 # namespace (the probe below), the test step sets TALOS_REQUIRE_NETNS=1 as
 # CI's Linux job does, so //talOS/protocol:udp_address_change_test fails
-# rather than skips; elsewhere it may skip, and the run says so. JAVA_HOME
+# rather than skips; elsewhere it may skip, and the run says so. Likewise,
+# where it finds the browser //studio:drive_browser_test would use, it sets
+# TALOS_REQUIRE_BROWSER=1 (and passes TALOS_BROWSER when set); with none,
+# that test skips and the run says so. JAVA_HOME
 # defaults to ~/wpilib/2026/jdk. Studio trusts the checkout's installed
 # studio/node_modules when present, unless the commits to push change
 # studio/pnpm-lock.yaml: then, as when none is installed, it runs `pnpm
@@ -195,8 +198,29 @@ if run_step build sh -c \
   else
     report "test may skip udp_address_change_test: this host refuses an unprivileged network namespace (CI requires it)"
   fi
+  # The browser the drive_browser_test would find: TALOS_BROWSER, else its
+  # names on the test's default PATH, else macOS's Chrome.
+  browser=()
+  browser_path="${TALOS_BROWSER:-}"
+  if [ -z "$browser_path" ]; then
+    for name in chromium chromium-browser google-chrome google-chrome-stable; do
+      browser_path="$(PATH=/bin:/usr/bin:/usr/local/bin command -v "$name")" && break
+      browser_path=""
+    done
+  fi
+  if [ -z "$browser_path" ] && [ -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ]; then
+    browser_path="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  fi
+  if [ -n "$browser_path" ]; then
+    browser=(--test_env=TALOS_REQUIRE_BROWSER=1)
+    [ -n "${TALOS_BROWSER:-}" ] && browser+=(--test_env=TALOS_BROWSER)
+    report "test requires a browser for drive_browser_test ($browser_path; TALOS_REQUIRE_BROWSER=1, as CI)"
+  else
+    report "test will skip drive_browser_test: no Chromium or Chrome on this host (CI requires one)"
+  fi
   run_step test bazel test //... --test_output=errors --nocache_test_results \
-    ${netns[@]+"${netns[@]}"} "${bazel_flags[@]}" || true
+    ${netns[@]+"${netns[@]}"} ${browser[@]+"${browser[@]}"} \
+    "${bazel_flags[@]}" || true
 else
   skip host-includes "the build failed"
   skip test "the build failed"

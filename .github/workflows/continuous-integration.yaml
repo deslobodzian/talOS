@@ -138,11 +138,14 @@ jobs:
       id: test
       # Every lane but the soak (docs/TESTING.md §9). The console is kept
       # for the failed-test step below, the build events for the lane
-      # budget step.
+      # budget step. TALOS_REQUIRE_BROWSER=1 fails, rather than skips,
+      # //studio:drive_browser_test if it finds no browser; the runner's
+      # Google Chrome is /usr/bin/google-chrome, on the test's default PATH.
       run: |
         set -o pipefail
         bazel test //... --noshow_progress --test_output=errors \
           --test_env=TALOS_REQUIRE_NETNS=1 \
+          --test_env=TALOS_REQUIRE_BROWSER=1 \
           --build_event_json_file="$RUNNER_TEMP/test-events.json" 2>&1 \
           | tee "$RUNNER_TEMP/bazel-test.log"
 

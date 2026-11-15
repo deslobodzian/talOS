@@ -104,11 +104,14 @@ RoboRIO program or anything under `talOS/` (its `build.gradle` takes
 headers from all of it) or `studio/`; every robot and example config's
 `--describe-only` runs as its `talos_graph_test` (the bundle test's
 fixture, `2026-robot/main_processor/bundle_testdata`, has only a
-`manifest_sync_test`). It differs from CI in two places, and says which
+`manifest_sync_test`). It differs from CI in three places, and says which
 applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so
 `//talOS/protocol:udp_address_change_test` may skip where CI fails it;
-and Studio's checks use the checkout's installed `studio/node_modules`
+where it finds no browser
+([the test's search](../studio/README.md#driver-dashboard-in-a-browser))
+it leaves `TALOS_REQUIRE_BROWSER=1` unset, so `//studio:drive_browser_test`
+skips where CI fails it; and Studio's checks use the checkout's installed `studio/node_modules`
 (an offline `pnpm install` when there is none or the commits change
 `studio/pnpm-lock.yaml`, and studio SKIPPED if that fails). It prints one
 line per step and exits nonzero if any failed; the script's header lists

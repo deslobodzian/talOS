@@ -245,7 +245,9 @@ It needs Chromium or Chrome on the host: `TALOS_BROWSER` (passed with
 `google-chrome` or `google-chrome-stable` on the test's `PATH`, else macOS's
 `/Applications/Google Chrome.app`. Without one it skips: Bazel reports a
 skipped `py_test` as passed, so its log's `SKIPPED:` line names what it
-looked for, and `--test_env=TALOS_REQUIRE_BROWSER=1` makes that a failure.
+looked for, and `--test_env=TALOS_REQUIRE_BROWSER=1` makes that a failure, as CI's Linux job and
+`tools/prepush.sh` (where it finds a browser) set it
+([TESTING.md §9](../docs/TESTING.md#9-lanes-and-ci)).
 
 ```sh
 bazel test //studio:drive_browser_test --test_output=errors
