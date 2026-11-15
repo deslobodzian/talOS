@@ -5,8 +5,10 @@
 // so no two tests share state, ports, or shared memory. Stubs describe an
 // empty graph unless a test explicitly exercises a failed probe.
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <gtest/gtest.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
 #include <sys/file.h>
@@ -1442,6 +1444,117 @@ TEST(Supervision, ASigintTheStopDidNotSendIsStillACrash) {
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(alpha_pid.c_str());
+}
+
+// A loopback UDP port nothing holds now.
+uint16_t FreeUdpPort() {
+  const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  socklen_t length = sizeof address;
+  const bool bound =
+      fd >= 0 &&
+      ::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof address) == 0 &&
+      ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) == 0;
+  if (fd >= 0) ::close(fd);
+  if (!bound) throw std::runtime_error("no free UDP port");
+  return ntohs(address.sin_port);
+}
+
+// The pid of `session`'s hardware_node once its loop has started (its
+// registry row reports the loop's realtime outcome, which the bridge does
+// right before it starts counting its own --duration-s), else 0.
+pid_t BridgeLoopStarted(uint64_t session) {
+  const auto registry = introspect::RegistryReader::open();
+  if (!registry) return 0;
+  for (const auto& node : registry->nodes()) {
+    if (node.name == "hardware_node" && node.session_id == session &&
+        node.alive && node.realtime())
+      return static_cast<pid_t>(node.pid);
+  }
+  return 0;
+}
+
+// A bounded session (--duration-s) ends at the launcher's stop, never at a
+// member's own duration: the real bridge, with no controller listening (so
+// no State ever arrives), would exit 1 at a --duration-s of its own, and the
+// session would record that run as a crash, and restart it while the
+// deadline has not yet passed on the launcher's clock. Scenario: that clock
+// is held short of the 1 s deadline, as a launcher that wakes late (or, on
+// macOS, a host that slept: a member's loop clock counts the sleep) has it,
+// while the bridge's loop runs the session's 1 s and a quarter second more
+// of real time (or until it exits on its own); then the deadline passes.
+// The bridge's one run must end as the stop asks (exit 0, reason stop, not
+// restarted) and the session exit 0.
+// REQ-OPS-06
+TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
+  auto options = BaseOptions("bounded_stop");
+  options.duration_s = 1;
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.remote_port = FreeUdpPort();
+  options.local_port = FreeUdpPort();
+  // The stubs never take a registry row; nothing here waits for one.
+  options.heartbeat_startup_grace_ms = 60000;
+  // The stubs send no hardware request, so they own no device the real
+  // bridge would read one for.
+  auto config = toml::parse_file(options.config_path);
+  for (const char* name : {"alpha", "beta"})
+    config["subsystems"][name].as_table()->erase("motors");
+  std::ofstream{options.config_path} << config;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_TRUE(runfiles) << error;
+  const char* bridge = std::getenv("TALOS_BRIDGE");
+  ASSERT_NE(bridge, nullptr) << "missing bridge runfile";
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      runfiles->Rlocation(bridge);
+  for (const std::string name : {"alpha", "beta"}) {
+    options.binary_overrides["//example/" + name + ":node"] = WriteStub(
+        "bounded_stop_" + name,
+        "trap 'exit 0' INT TERM\n" + std::string{kLoopUntilStopped}, name);
+  }
+  testing::SteppedClock clock;
+  const SupervisionTime held = clock.Freeze();
+  options.supervision_clock = clock.clock();
+  bool ran_its_duration = false;
+  std::jthread mover{[&](const std::stop_token& stop) {
+    // Every exit lets the clock run on, so the deadline still ends the
+    // session and the assertions below say what went wrong.
+    const testing::SteppedClock::ReleaseOnExit release{clock};
+    const auto give_up = std::chrono::steady_clock::now() + 20s;
+    pid_t pid = 0;
+    while (!stop.stop_requested() &&
+           (pid = BridgeLoopStarted(options.session_id)) == 0 &&
+           std::chrono::steady_clock::now() < give_up)
+      std::this_thread::sleep_for(2ms);
+    if (pid == 0) return;
+    const auto own_end = std::chrono::steady_clock::now() +
+                         std::chrono::seconds{options.duration_s} + 250ms;
+    while (!stop.stop_requested() && ::kill(pid, 0) == 0 &&
+           std::chrono::steady_clock::now() < own_end)
+      std::this_thread::sleep_for(2ms);
+    ran_its_duration = true;
+    clock.HoldAt(held + std::chrono::seconds{options.duration_s});
+  }};
+  const int status = RunSession(options);
+  mover.request_stop();
+  mover.join();
+  ASSERT_TRUE(ran_its_duration) << "the bridge's loop never started";
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  EXPECT_EQ(status, 0) << manifest;
+  const std::string entry = ManifestEntry(manifest, "hardware_node");
+  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos) << entry;
+  const auto runs = ManifestRuns(manifest, "hardware_node");
+  ASSERT_EQ(runs.size(), 1u) << manifest;
+  EXPECT_NE(runs[0].find("\"exit_code\": 0, \"exit_signal\": 0, "
+                         "\"reason\": \"stop\""),
+            std::string::npos)
+      << runs[0];
+  std::filesystem::remove_all(options.output_dir);
 }
 
 TEST(Supervision, MissingConfigFailsFastWithClearError) {

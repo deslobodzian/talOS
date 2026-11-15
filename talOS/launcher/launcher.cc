@@ -873,10 +873,12 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
   // The hardware bridge's controller addresses are among them
   // (ControllerArgs), as they were in its probe.
   args.insert(args.end(), spec.extra_args.begin(), spec.extra_args.end());
-  if (options_.duration_s > 0) {
-    args.insert(args.end(),
-                {"--duration-s", std::to_string(options_.duration_s)});
-  }
+  // No --duration-s: the session's deadline is the launcher's alone
+  // (Supervise), so nothing but its stop ends a member that runs well. A
+  // member's own duration would count from its own start on its own clock
+  // (on macOS one that counts host sleep), and could run out first: a bridge
+  // that heard no State then exits 1, a crash. A member whose launcher dies
+  // is killed by its guardian (spawn.h).
 }
 
 void Launcher::PersistManifest(const std::vector<NodeProcessInfo>& procs,

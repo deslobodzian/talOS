@@ -1221,12 +1221,12 @@ int HardwareNode::Run(int duration_s) {
   }
   // A run without one State never heard the controller. It says so on
   // stderr either way, beside the summary, since under the launcher the
-  // exit status cannot: the launcher ends a bounded session by stopping
-  // every member at its own deadline, before the bridge reaches its
-  // --duration-s, and a stop exits 0 whether or not a State arrived (the
-  // controller may not be up yet: a RoboRIO still booting, or a simulated
-  // gateway not spawned yet). Only a run that reached its own --duration-s
-  // (a bridge run directly) fails for it.
+  // exit status cannot: the launcher passes its members no --duration-s and
+  // ends a bounded session by stopping every member at its own deadline,
+  // and a stop exits 0 whether or not a State arrived (the controller may
+  // not be up yet: a RoboRIO still booting, or a simulated gateway not
+  // spawned yet). Only a run that reached its own --duration-s (a bridge run
+  // directly) fails for it.
   if (states_received_ == 0) {
     std::fflush(stdout);  // after the summary in a shared log
     std::fprintf(stderr,

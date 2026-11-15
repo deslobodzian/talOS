@@ -649,8 +649,10 @@ cc_test(
         ":endpoint_drift",
         ":held_stop",
         ":session_report",
+        "//talOS/bridge:hardware_node",
     ],
     env = {
+        "TALOS_BRIDGE": "$(rlocationpath //talOS/bridge:hardware_node)",
         "TALOS_BYTE_WAKE_LOSS_NODE": "$(rlocationpath :byte_wake_loss)",
         "TALOS_CONSTRUCTION_NODE": "$(rlocationpath :alpha)",
         "TALOS_DELIVERY_LOSS_NODE": "$(rlocationpath :delivery_loss_node)",
