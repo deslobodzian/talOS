@@ -1,0 +1,8 @@
+# The framework's telemetry node: publishes every state and status topic
+# in the graph on [studio] topic for Studio and the session logs.
+[subsystem]
+name = "telemetry"
+node = "@talos//talOS/telemetry:node"
+# Observation only: the robot runs without it.
+critical = false
+period_us = 10000

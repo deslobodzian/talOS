@@ -398,6 +398,36 @@ jobs:
     - *collect-failed-tests
     - *upload-failed-tests
 
+  robot-repo:
+    name: Repositories depending on talOS (examples/robot_repo, wrist_repo)
+    # Each is its own workspace with talOS as @talos (local_path_override),
+    # so talOS compiles again under external/talos+ and none of the Linux
+    # job's action keys match: this job keeps its own disk cache. The
+    # config fuzz test is the toml++ parser patch's regression, built as a
+    # dependency (REQ-DEV-29).
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v7
+    - name: Setup bazel-action
+      uses: bazel-contrib/setup-bazel@0.19.0
+      with:
+        bazelisk-cache: true
+        disk-cache: robot-repo
+        repository-cache: true
+        cache-save: ${{ github.ref == 'refs/heads/main' }}
+    - name: Robot repository (graph, node and sim tests, bundle)
+      working-directory: examples/robot_repo
+      run: |
+        bazel test --test_output=errors //... \
+          @talos//talOS/configuration:config_fuzz_test
+    - name: Standalone subsystem repository
+      working-directory: examples/wrist_repo
+      run: |
+        bazel test --test_output=errors //... \
+          @talos//talOS/configuration:config_fuzz_test
+
   macos:
     name: macOS (build, test)
     # macOS is the deployment OS: its kqueue, RTMS process-identity,

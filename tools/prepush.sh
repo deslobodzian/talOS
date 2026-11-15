@@ -14,9 +14,13 @@
 #   --skip-studio  do not run Studio's pnpm checks
 #
 # Steps, in order: read-only, `bazel build //...`, host-includes, `bazel test
-# --nocache_test_results //...`, checkout-unchanged; then, when the commits
-# to push (<ref>@{upstream}..<ref>; every file when <ref> is not a branch
-# with an upstream) touch them: gradle (`phoenixTest buildRio -Pheadless
+# --nocache_test_results //...`, then, when the commits to push
+# (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
+# upstream) touch MODULE.bazel, third_party/, talOS/, tools/ or the fixtures,
+# dependent-robot_repo and dependent-wrist_repo (`bazel test //...
+# @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
+# and examples/wrist_repo, the repositories that depend on talOS),
+# checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
 # --offline`, for 2026-robot/controller_processor/ and talOS/, whose headers
 # the RoboRIO program's build.gradle exports) and studio-test and
 # studio-build (`pnpm test`, `pnpm build`, for studio/).
@@ -224,6 +228,22 @@ if run_step build sh -c \
 else
   skip host-includes "the build failed"
   skip test "the build failed"
+fi
+# The repositories that depend on talOS as @talos, each its own workspace,
+# as CI's robot-repo job runs them. They write only ignored files (their
+# bazel-* links and lockfiles), which checkout-unchanged then confirms.
+dependent_paths=(MODULE.bazel third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
+if ! touches "${dependent_paths[@]}"; then
+  report "dependents not needed (nothing under ${dependent_paths[*]} since $upstream)"
+elif [ ! -d "$wt/examples/robot_repo" ]; then
+  report "dependents not needed (this commit has no examples/robot_repo)"
+else
+  for dependent in robot_repo wrist_repo; do
+    run_step "dependent-$dependent" sh -c \
+      'cd "examples/$1" && shift && bazel test //... @talos//talOS/configuration:config_fuzz_test "$@"' _ \
+      "$dependent" --test_output=errors --nocache_test_results --noshow_progress \
+      "--disk_cache=$disk_cache" || true
+  done
 fi
 run_step checkout-unchanged sh -c \
   'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||

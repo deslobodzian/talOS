@@ -1093,6 +1093,34 @@ def talos_bundle(name, config, **kwargs):
     )
     _talos_bundle(name = name, config = config, manifest = manifest, **kwargs)
 
+# The launcher and the runner that starts it from a runfiles tree
+# (launcher_runner.py), shared by talos_graph_test and talos_sim.
+_LAUNCHER = Label("//talOS/launcher:launcher")
+_LAUNCHER_RUNNER = Label("//talOS/build:launcher_runner.py")
+
+def _launcher_runner_data(config, nodes, data):
+    """The runner's runfiles: config, launcher, hardware node, nodes, data."""
+    seen = {}
+    labels = []
+    for item in [config, _LAUNCHER, _HARDWARE_NODE] + list(nodes) + list(data):
+        lbl = native.package_relative_label(item)
+        if lbl not in seen:
+            seen[lbl] = True
+            labels.append(lbl)
+    return labels
+
+def _rlocation(label):
+    """`label`'s runfiles path, as $(rlocationpath) would expand it."""
+    return "/".join([label.repo_name or "_main"] + ([label.package] if label.package else []) + [label.name])
+
+def _launcher_runner_args(config):
+    return [
+        "--launcher",
+        "$(rlocationpath %s)" % _LAUNCHER,
+        "--config",
+        "$(rlocationpath %s)" % native.package_relative_label(config),
+    ]
+
 def talos_graph_test(
         name,
         config,
@@ -1102,7 +1130,8 @@ def talos_graph_test(
     """Probes every node in `config` with `launcher --describe-only` and lints the graph.
 
     The graph must list the hardware node and one node per entry of `nodes`,
-    each of them described.
+    each of them described. The config must be in the main repository; talOS
+    may be the main repository or a dependency (@talos).
 
     Args:
       name: test target name.
@@ -1117,84 +1146,75 @@ def talos_graph_test(
     # so no two subsystems of a passing graph share an entry.
     expected_nodes = len({
         native.package_relative_label(item): True
-        for item in ["//talOS/bridge:hardware_node"] + list(nodes)
+        for item in [_HARDWARE_NODE] + list(nodes)
     })
-    config_label = native.package_relative_label(config)
-    config_rel = (config_label.package + "/" + config_label.name) if config_label.package else config_label.name
-    runner_py = name + "_graph_test.py"
-    content = (
-        "import json\n" +
-        "import os\n" +
-        "import subprocess\n" +
-        "import tempfile\n" +
-        "import unittest\n" +
-        "from python.runfiles import runfiles\n\n\n" +
-        "class GraphTest(unittest.TestCase):\n" +
-        "    def test_graph(self):\n" +
-        "        r = runfiles.Create()\n" +
-        "        launcher = r.Rlocation(\"_main/talOS/launcher/launcher\")\n" +
-        "        self.assertTrue(launcher and os.path.exists(launcher), f\"missing launcher: {launcher}\")\n" +
-        "        runfiles_root = os.environ.get(\"RUNFILES_DIR\")\n" +
-        "        if not runfiles_root or not os.path.isdir(os.path.join(runfiles_root, \"_main\")):\n" +
-        "            runfiles_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(launcher))))\n" +
-        "        main_dir = os.path.join(runfiles_root, \"_main\")\n\n" +
-        "        with tempfile.TemporaryDirectory() as tmp:\n" +
-        "            work_dir = os.path.join(tmp, \"ws\")\n" +
-        "            out_dir = os.path.join(tmp, \"out\")\n" +
-        "            os.makedirs(work_dir)\n" +
-        "            os.makedirs(out_dir)\n" +
-        "            bazel_bin = os.path.join(work_dir, \"bazel-bin\")\n" +
-        "            os.makedirs(bazel_bin)\n" +
-        "            for entry in os.listdir(main_dir):\n" +
-        "                src = os.path.join(main_dir, entry)\n" +
-        "                os.symlink(src, os.path.join(work_dir, entry))\n" +
-        "                os.symlink(src, os.path.join(bazel_bin, entry))\n" +
-        "            if not os.path.exists(os.path.join(bazel_bin, \"external\")):\n" +
-        "                os.symlink(runfiles_root, os.path.join(bazel_bin, \"external\"))\n\n" +
-        "            env = dict(os.environ, **r.EnvVars())\n" +
-        "            env[\"RUNFILES_DIR\"] = runfiles_root\n" +
-        "            env.pop(\"PYTHONPATH\", None)\n" +
-        "            env.pop(\"BUILD_WORKSPACE_DIRECTORY\", None)\n\n" +
-        "            proc = subprocess.run(\n" +
-        "                [launcher, \"--config\", \"%s\", \"--describe-only\", \"--output-dir\", out_dir],\n" % config_rel +
-        "                cwd=work_dir,\n" +
-        "                env=env,\n" +
-        "                capture_output=True,\n" +
-        "                text=True,\n" +
-        "                timeout=120,\n" +
-        "            )\n" +
-        "            self.assertEqual(proc.returncode, 0, proc.stdout + \"\\n\" + proc.stderr)\n" +
-        "            # The launcher writes into <output-dir>/<session_id>/.\n" +
-        "            sessions = [os.path.join(out_dir, d) for d in os.listdir(out_dir)\n" +
-        "                        if os.path.isdir(os.path.join(out_dir, d))]\n" +
-        "            self.assertEqual(len(sessions), 1, sessions)\n" +
-        "            with open(os.path.join(sessions[0], \"graph.json\"), \"r\") as f:\n" +
-        "                graph = json.load(f)\n" +
-        "            nodes = graph[\"nodes\"]\n" +
-        "            self.assertEqual(len(nodes), %d, [n.get(\"name\") for n in nodes])\n" % expected_nodes +
-        "            for node in nodes:\n" +
-        "                self.assertTrue(\n" +
-        "                    node.get(\"described\"),\n" +
-        "                    f\"node {node.get('name')} ({node.get('target')}) failed --describe: {node.get('describe_error')}\",\n" +
-        "                )\n\n\n" +
-        "if __name__ == \"__main__\":\n" +
-        "    unittest.main()\n"
-    )
-    _heredoc_genrule(name + "_runner_gen", runner_py, content)
-    seen = {}
-    all_data = []
-    for item in [config, "//talOS/launcher:launcher", "//talOS/bridge:hardware_node"] + list(nodes) + list(data):
-        lbl = native.package_relative_label(item)
-        if lbl not in seen:
-            seen[lbl] = True
-            all_data.append(lbl)
     size = kwargs.pop("size", "small")
     py_test(
         name = name,
         size = size,
-        srcs = [runner_py],
-        main = runner_py,
-        data = all_data,
+        srcs = [_LAUNCHER_RUNNER],
+        main = _LAUNCHER_RUNNER,
+        args = _launcher_runner_args(config) + ["--graph-nodes", str(expected_nodes)],
+        data = _launcher_runner_data(config, nodes, data),
+        legacy_create_init = False,
+        deps = [Label("@rules_python//python/runfiles")],
+        **kwargs
+    )
+
+def talos_sim(
+        name,
+        config,
+        nodes,
+        data = [],
+        **kwargs):
+    """Runs `config` in simulation: `bazel run :<name> -- [launcher args]`.
+
+    An executable whose runfiles hold the launcher, the hardware node, every
+    node and `data`. It runs `launcher --config <config> --sim
+    --start-sim-gateway --sim-gateway-arg --physics` and then the arguments
+    given after `--` (`--duration-s 3`, `--sim-gateway-arg --mode-schedule
+    --sim-gateway-arg ...`, `--start-studio-bridge`), and exits with the
+    launcher's status. A relative `--output-dir` is taken from where
+    `bazel run` was invoked. Nothing is copied per run.
+
+    Args:
+      name: target name.
+      config: the robot.toml file or label, in the main repository.
+      nodes: the node binaries `config` names: the NODES of its generated manifest.
+      data: every other file the session reads: the manifest's CONFIG_FILES
+        and the simulator the config's [robot] sim_gateway names.
+      **kwargs: passed to py_binary.
+    """
+
+    # `bazel run` applies a py_binary's `args`, but a test that runs the
+    # binary from its runfiles does not, so a generated main holds them.
+    main_py = name + "_sim.py"
+    runner_args = [
+        "--launcher",
+        _rlocation(_LAUNCHER),
+        "--config",
+        _rlocation(native.package_relative_label(config)),
+        "--sim",
+        "--",
+    ]
+    _heredoc_genrule(name + "_main_gen", main_py, "\n".join([
+        "import importlib.util",
+        "import sys",
+        "",
+        "from python.runfiles import runfiles",
+        "",
+        "path = runfiles.Create().Rlocation(%r, source_repo=\"\")" % _rlocation(_LAUNCHER_RUNNER),
+        "spec = importlib.util.spec_from_file_location(\"launcher_runner\", path)",
+        "runner = importlib.util.module_from_spec(spec)",
+        "spec.loader.exec_module(runner)",
+        "sys.exit(runner.main(%r + sys.argv[1:]))" % runner_args,
+        "",
+    ]))
+    py_binary(
+        name = name,
+        srcs = [main_py],
+        main = main_py,
+        data = _launcher_runner_data(config, nodes, data) + [_LAUNCHER_RUNNER],
         legacy_create_init = False,
         deps = [Label("@rules_python//python/runfiles")],
         **kwargs

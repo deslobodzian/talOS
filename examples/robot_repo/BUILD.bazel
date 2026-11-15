@@ -1,0 +1,62 @@
+load("@rules_python//python:defs.bzl", "py_test")
+load("@talos//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test", "talos_sim")
+load("@talos//tools:sync_manifest.bzl", "manifest_sync_test")
+load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
+
+package(default_visibility = ["//visibility:public"])
+
+exports_files(["robot.toml"] + glob(["subsystems/*.toml"]))
+
+# The simulator robot.toml's [robot] sim_gateway names.
+SIMULATOR = "@talos//2026-robot/main_processor/simulation:sim_gateway"
+
+# Fails, with the regenerate command, when robot_manifest.bzl is stale.
+manifest_sync_test(
+    name = "manifest_sync_test",
+    config = "robot.toml",
+    config_files = CONFIG_FILES,
+    manifest = "robot_manifest.bzl",
+)
+
+# Runs every node with --describe and lints the graph, as
+# `launcher --describe-only` does.
+talos_graph_test(
+    name = "graph_test",
+    config = "robot.toml",
+    data = CONFIG_FILES,
+    nodes = NODES,
+)
+
+talos_bundle(
+    name = "robot_bundle",
+    config = "robot.toml",
+    config_files = CONFIG_FILES,
+    nodes = ["@talos//talOS/bridge:hardware_node"] + NODES,
+)
+
+# `bazel run //:sim -- [launcher arguments]` runs the robot against the
+# simulator, e.g. `bazel run //:sim -- --duration-s 10`.
+talos_sim(
+    name = "sim",
+    config = "robot.toml",
+    data = CONFIG_FILES + [SIMULATOR],
+    nodes = NODES,
+)
+
+# e2e: `bazel run //:sim -- --duration-s 3` on free loopback ports, every
+# member running and exiting 0. Takes 3 s of real time (the simulator has no
+# faster-than-real-time mode) plus startup.
+py_test(
+    name = "sim_smoke_test",
+    size = "medium",
+    timeout = "short",
+    srcs = ["sim_smoke_test.py"],
+    data = [":sim"],
+    env = {"SIM": "$(rlocationpath :sim)"},
+    legacy_create_init = False,
+    tags = [
+        "e2e",
+        "exclusive",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)

@@ -1,0 +1,25 @@
+module(
+    name = "robot",
+    version = "0.1.0",
+)
+
+# talOS, pinned at the commit of the checkout two directories up. A robot
+# repository holds talOS the same way, as a git submodule at the commit it
+# builds against, and points path at that submodule.
+bazel_dep(name = "talos", version = "0.1.0")
+local_path_override(
+    module_name = "talos",
+    path = "../..",
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.18")
+bazel_dep(name = "rules_python", version = "2.0.1")
+bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+
+# talOS's Python nodes and pip wheels are built for 3.11; the root module
+# picks the default interpreter, so a robot repository names the same one.
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.11",
+)
