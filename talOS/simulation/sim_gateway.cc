@@ -28,6 +28,7 @@
 #include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/process/process.h"
+#include "talOS/simulation/ports.h"
 #include "talOS/simulation/schedules.h"
 
 namespace {
@@ -132,8 +133,9 @@ int main(int argc, char** argv) {
     talos::hardware::sim::PhysicsOptions options{.start_x_m = 2.0,
                                                  .start_y_m = 2.0};
     const char* config_path = nullptr;
-    uint16_t local_port = 5802;
-    uint16_t remote_port = 5803;
+    // 0 until a flag sets one; unset, the config's port applies.
+    uint16_t port_flag = 0;
+    uint16_t remote_port_flag = 0;
     for (int i = 1; i < argc; ++i) {
       const std::string arg{argv[i]};
       if (arg == "--describe" || (describe && arg == "--sim")) continue;
@@ -170,9 +172,9 @@ int main(int argc, char** argv) {
       } else if (arg == "--schedule-start-file" && i + 1 < argc) {
         schedule_start_file = argv[++i];
       } else if (arg == "--port" && i + 1 < argc) {
-        local_port = Port(argv[++i]);
+        port_flag = Port(argv[++i]);
       } else if (arg == "--remote-port" && i + 1 < argc) {
-        remote_port = Port(argv[++i]);
+        remote_port_flag = Port(argv[++i]);
       } else if (arg == "--duration-s" && i + 1 < argc) {
         const std::string value = argv[++i];
         duration_s = value == "0" ? 0 : Seconds(value);
@@ -234,8 +236,11 @@ int main(int argc, char** argv) {
     // commissioned hardware, and a simulator that coasts every demand to
     // zero for lack of a commissioning bit would conceal the control it is
     // meant to exercise.
+    talos::simulation::GatewayPorts ports{};
     {
       auto robot_config = talos::config::ParseRobotConfig(config_path);
+      ports = talos::simulation::ResolveGatewayPorts(robot_config, port_flag,
+                                                     remote_port_flag);
       auto hw_config = robot_config.hardware;
       hw_config.commissioned = true;
       // The wire carries no motor type: a config the bridge pushes later
@@ -263,7 +268,7 @@ int main(int argc, char** argv) {
       talos::simulation::ResolveFaults(faults, hw_config);
     }
     talos::hardware::Endpoint endpoint{gateway};
-    if (endpoint.Open("127.0.0.1", local_port, "127.0.0.1", remote_port) !=
+    if (endpoint.Open("127.0.0.1", ports.listen, "127.0.0.1", ports.send) !=
         talos::protocol::UdpStatus::kOk) {
       throw std::runtime_error("cannot open simulation socket");
     }

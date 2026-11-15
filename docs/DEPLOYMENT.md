@@ -104,7 +104,11 @@ probe and its runs both get the effective one
 A bundle carries no simulator (`--start-sim-gateway` reports the
 `[robot] sim_gateway` binary missing from the bundle), so something else must stand in for the
 RoboRIO on that host: a `sim_gateway` run from a checkout with `--config`
-naming the bundle's config, or the RoboRIO program under WPILib simulation.
+naming the bundle's config, which then uses that config's `[robot]
+controller_port` and `local_port`, or the RoboRIO program under WPILib
+simulation. A launch that changes the ports with `--remote-port` and
+`--local-port` needs the same values given to a hand-run `sim_gateway` as
+`--port` and `--remote-port`.
 
 ## On the main processor
 

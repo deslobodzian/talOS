@@ -42,11 +42,13 @@ packets on `/hw/state/driver_station`, just as it does for the RoboRIO.
 Packets are emitted every 20000 µs (50 Hz), and at once on the tick a new mode
 starts, matching the RoboRIO, even when physics and hardware snapshots run at
 200 Hz.
-`--port N` selects the gateway's loopback UDP listening port (default 5802);
-`--remote-port N` selects the bridge's receiving port (default 5803). The
-launcher sets both from the ports it gives the bridge (`[robot]
-controller_port` and `local_port`, or its `--remote-port` and
-`--local-port`), so a session needs no port argument written by hand.
+The gateway listens on loopback UDP `[robot] controller_port` of its
+`--config` and sends to `[robot] local_port`, the ports a bridge on the same
+config uses; `--port N` and `--remote-port N` override them. The launcher
+passes both flags from the ports it gives the bridge (the config's, or its
+own `--remote-port` and `--local-port`), so neither a launched nor a
+hand-run simulator needs a port argument written by hand, unless the launch
+overrides the config's ports.
 The schedules and `--duration-s` count from one time zero on the
 main-processor node clock (`talos::event::Poller::now()`: `CLOCK_MONOTONIC` on
 Linux, `CLOCK_MONOTONIC_RAW` on macOS, which counts host sleep). By default it
