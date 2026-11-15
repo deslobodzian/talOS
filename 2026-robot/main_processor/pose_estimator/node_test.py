@@ -28,6 +28,8 @@ estimator = talos.load(os.path.join(HERE, "pose_estimator.py"))
 
 BACKENDS = ("kalman", "factor_graph")
 DT = 0.02
+# The drivetrain's own period: it publishes /drivetrain/state at 200 Hz.
+DRIVETRAIN_DT = 0.005
 # The estimator's field-size defaults (the 2026 tag layout).
 FIELD_LENGTH_M = 16.541
 FIELD_WIDTH_M = 8.069
@@ -86,26 +88,26 @@ class Chassis:
         self.angles = [0.0] * len(MODULES)
         self.velocity = (0.0, 0.0, 0.0)
 
-    def advance(self, vx, vy, omega, slip=1.0):
-        """One DT of constant robot-frame velocity; `slip` scales what the
+    def advance(self, vx, vy, omega, slip=1.0, dt=DT):
+        """One dt of constant robot-frame velocity; `slip` scales what the
         wheels report (1: no slip)."""
         if omega == 0.0:
             c, s = math.cos(self.yaw), math.sin(self.yaw)
-            self.x += (vx * c - vy * s) * DT
-            self.y += (vx * s + vy * c) * DT
+            self.x += (vx * c - vy * s) * dt
+            self.y += (vx * s + vy * c) * dt
         else:  # exact constant-twist arc
-            yaw_end = self.yaw + omega * DT
+            yaw_end = self.yaw + omega * dt
             self.x += (vx * (math.sin(yaw_end) - math.sin(self.yaw))
                        + vy * (math.cos(yaw_end) - math.cos(self.yaw))) / omega
             self.y += (vx * (math.cos(self.yaw) - math.cos(yaw_end))
                        + vy * (math.sin(yaw_end) - math.sin(self.yaw))) / omega
-        self.yaw += omega * DT
+        self.yaw += omega * dt
         for i, (mx, my) in enumerate(MODULES):
             wx, wy = vx - omega * my, vy + omega * mx
             speed = math.hypot(wx, wy)
             if speed > 0.0:
                 self.angles[i] = math.atan2(wy, wx)
-            self.distances[i] += speed * DT * slip
+            self.distances[i] += speed * dt * slip
         self.velocity = (vx, vy, omega)
 
     def publish(self, *, sample_time_ns=None, modules_valid=True,
@@ -131,6 +133,21 @@ class Chassis:
     def hold(self, seconds, **publish):
         """Stationary, still publishing every DT."""
         self.drive(0.0, 0.0, 0.0, seconds, **publish)
+
+    def spin_while_translating(self, speed, omega, seconds):
+        """Field-frame velocity (speed, 0) held while the chassis spins at
+        omega, published every DRIVETRAIN_DT. The robot-frame velocity turns
+        at -omega, so the wheels follow no constant twist: the truth is
+        integrated in 0.5 ms arcs, and the analytic pose is the straight
+        line (x + speed * t, y) with yaw + omega * t."""
+        substeps = 10
+        for _ in range(round(seconds / DRIVETRAIN_DT)):
+            for _ in range(substeps):
+                c, s = math.cos(self.yaw), math.sin(self.yaw)
+                self.advance(speed * c, -speed * s, omega,
+                             dt=DRIVETRAIN_DT / substeps)
+            self.publish()
+            self.sim.step(DRIVETRAIN_DT)
 
 
 class EstimatorTest(unittest.TestCase):
@@ -676,6 +693,69 @@ class EstimatorTest(unittest.TestCase):
                 self.assertEqual((e.velocity_vx_mps, e.velocity_omega_radps),
                                  (1.0, 1.0))
                 self.assertEqual(self.counts(), (0, 0))
+
+    # REQ-CONTRACT-26
+    def test_every_drivetrain_sample_is_integrated(self):
+        """Spinning at 6 rad/s while translating at 2 m/s, the drivetrain
+        publishing every 5 ms: the estimate integrates all four samples per
+        tick and stays on the straight line (1.1 cm off it after 1 s).
+        Integrating only each tick's newest sample, 20 ms twists, ends
+        5.6 cm off it."""
+        speed, omega, seconds = 2.0, 6.0, 1.0
+        for backend in BACKENDS:
+            with self.subTest(backend=backend):
+                chassis = self.start(backend)
+                start = (chassis.x, chassis.y, chassis.yaw)
+                integrated = self.node.odometry_integrated_count
+                chassis.spin_while_translating(speed, omega, seconds)
+                x, y, yaw = self.pose()
+                error = math.hypot(x - (start[0] + speed * seconds),
+                                   y - start[1])
+                self.assertLess(error, 0.02, f"{backend}: pose ({x}, {y})")
+                self.assertAlmostEqual(
+                    math.remainder(yaw - (start[2] + omega * seconds),
+                                   2 * math.pi), 0.0, delta=1e-6)
+                self.assertEqual(
+                    self.node.odometry_integrated_count - integrated,
+                    round(seconds / DRIVETRAIN_DT))
+                e = self.estimate()
+                self.assertTrue(e.valid)
+                self.assertEqual(e.sample_time_ns,
+                                 self.sim.now_ns - round(DRIVETRAIN_DT * 1e9))
+
+    # REQ-CONTRACT-26
+    def test_a_stall_backlog_is_integrated_in_order_unless_stale(self):
+        """The node paused while the drivetrain keeps publishing: on resume
+        the drain delivers the backlog in sequence. A backlog younger than
+        drivetrain_timeout_us (100 ms) is integrated whole. From a longer
+        one only the samples delivered within that timeout of their
+        publication are (the 20 of its last 100 ms, then the ones after
+        the resume): an older sample is stale, and the first fresh one
+        folds in its wheel travel in one step, as after a silent
+        drivetrain (test_stale_input_clears_validity)."""
+        speed, omega, timeout_s = 2.0, 3.0, 0.1
+        for backend in BACKENDS:
+            for pause_s in (0.06, 0.25):
+                with self.subTest(backend=backend, pause_s=pause_s):
+                    chassis = self.start(backend)
+                    chassis.spin_while_translating(speed, omega, 0.1)
+                    before = self.node.odometry_integrated_count
+                    self.sim.pause("pose_estimator", pause_s)
+                    chassis.spin_while_translating(speed, omega, pause_s + DT)
+                    integrated = self.node.odometry_integrated_count - before
+                    published = round((pause_s + DT) / DRIVETRAIN_DT)
+                    if pause_s < timeout_s:
+                        self.assertEqual(integrated, published)
+                        self.assertPose((chassis.x, chassis.y, chassis.yaw),
+                                        delta=0.02)
+                    else:
+                        self.assertGreaterEqual(
+                            integrated, round(timeout_s / DRIVETRAIN_DT))
+                        self.assertLessEqual(
+                            integrated,
+                            round((timeout_s + DT) / DRIVETRAIN_DT))
+                    self.assertEqual(self.node.odometry_rejected_count, 0)
+                    self.assertTrue(self.estimate().valid)
 
     def test_a_delayed_observation_corrects_the_estimate(self):
         for backend in BACKENDS:

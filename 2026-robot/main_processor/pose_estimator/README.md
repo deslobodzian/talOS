@@ -10,7 +10,7 @@ disabled. Telemetry draws it through `[subsystems.telemetry] pose_topic`.
 
 | Topic | Type | |
 |---|---|---|
-| `/drivetrain/state` | `drivetrain.DrivetrainState` | `sample_time_ns`, `modules_valid`, `yaw_valid`, `yaw_rad`, `module0`..`module3` (distance, angle), chassis velocity |
+| `/drivetrain/state` | `drivetrain.DrivetrainState` | `sample_time_ns`, `modules_valid`, `yaw_valid`, `yaw_rad`, `module0`..`module3` (distance, angle), chassis velocity; an at-drain callback subscription, every state integrated |
 | `/<camera>/state`, per name in `cameras` | `geometry.PoseObservation` | optional callback subscriptions, delivered in sequence: a listed camera that is not running is no graph error |
 | `/pose_estimator/state` | `geometry.PoseEstimate` | pose at the newest integrated `sample_time_ns`, the drivetrain's chassis velocity, `valid`, `localized`, accepted/rejected observation counts |
 
@@ -21,6 +21,21 @@ The estimator also reads the Driver Station through `talos.DriverStation`,
 in `update()` (no packet listener). Only a fresh, attached packet can
 classify startup; an absent, stale or detached Driver Station is not evidence
 of a normal disabled boot.
+
+Every drivetrain state is integrated: `/drivetrain/state` is a callback
+subscription opened with `wake=talos.Wake.AT_DRAIN`, so the drivetrain's
+200 Hz publications wake nothing and the drain right before each `update()`
+delivers the four or so states published since the previous one, in
+sequence; the callback integrates each at its own `sample_time_ns`. A
+latest-value read would integrate one state per 20 ms tick, whose single
+twist cannot follow a robot whose robot-frame velocity turns within it (one
+that spins while it drives): in `node_test`, 1 s at 2 m/s spinning at
+6 rad/s ends 5.6 cm off the true pose that way, against 1.1 cm with every
+state. After a stall the drain delivers the backlog in batches of at most
+64, in order; a state delivered `drivetrain_timeout_us` or more after its
+publication is stale and not integrated, so the first fresh one folds in
+the wheel travel since the last integrated state, and at most about
+`drivetrain_timeout_us` of states (20 at 100 ms) are integrated at once.
 
 Every camera observation is delivered: each camera subscription has a
 callback, so the framework delivers its messages in sequence, and the
@@ -115,8 +130,9 @@ probe's time.
   restart sample.
   Invalid or no-tag camera states are skipped without incrementing either
   counter; `observation_rejected_count` counts offered measurements refused.
-- A drivetrain sample is integrated once, when `sample_time_ns` increased,
-  `modules_valid` and `yaw_valid` hold and every value is finite.
+- A drivetrain sample is integrated once, when it is delivered less than
+  `drivetrain_timeout_us` after its publication, `sample_time_ns`
+  increased, `modules_valid` and `yaw_valid` hold and every value is finite.
   Each wheel's implied speed must be at most `max_odometry_speed_mps` (10 m/s);
   wrapped gyro steps must be at most
   `max_odometry_yaw_rate_radps` (25 rad/s). Both limits must be positive and
@@ -126,9 +142,10 @@ probe's time.
   so later physically plausible motion recovers without integrating the jump.
   Repeated rejected frames and older timestamps stay invalid without counting
   again or changing that baseline.
-- `valid` = odometry integrated at least once, the drivetrain message fresh
-  (`drivetrain_timeout_us`) and usable, and its sample no older than that
-  timeout. Otherwise the pose is held and the velocity reads zero.
+- `valid` = odometry integrated at least once, the newest drivetrain
+  message fresh (`drivetrain_timeout_us`) and usable, and its sample no
+  older than that timeout. Otherwise the pose is held and the velocity
+  reads zero.
 - `localized` = the integrated estimate has a trusted field frame, either
   from a trusted alliance seed or the camera confirmation above.
   It is false before the first integrated sample. Once true, it stays true
@@ -159,7 +176,9 @@ bazel run //2026-robot/main_processor/pose_estimator:update_benchmark -- \
 
 runs the `PoseEstimator` class on `talos.testing.Sim` over the production
 `robot.toml` with only `backend` replaced (default both, one after the
-other), and times every `update()` with `time.perf_counter_ns`. The
+other), and times every tick with `time.perf_counter_ns`: `update()` plus
+the drivetrain callbacks the drain before it ran, which integrate the
+odometry. The
 workload, with a fixed seed, lasts `--seconds` simulated seconds per backend
 (default 900):
 
@@ -174,9 +193,10 @@ workload, with a fixed seed, lasts `--seconds` simulated seconds per backend
   localized from the first sample and every observation is fused.
 
 As in production, a tick fuses every observation that arrived since the
-previous one (about five with four 60 fps cameras at 20 ms). The report
+previous one (about five with four 60 fps cameras at 20 ms) and integrates
+about four drivetrain states. The report
 gives the host (platform, CPU model, Python, CPU count) and package
-versions, then per backend: ticks, p50, p99, p99.9 and max `update()`
+versions, then per backend: ticks, p50, p99, p99.9 and max tick
 duration, the fraction of ticks longer than the period (`>period`),
 observations fused per tick (mean, and the fraction of ticks that fused at
 least four), the maximum during the first lag window (warm-up, excluded from
@@ -186,8 +206,9 @@ final estimate is not valid and localized, i.e. the workload was not the
 one described; it never judges timing. `update_benchmark_test` runs it for
 3 s per backend.
 
-It measures `update()` alone in one process, not the camera callbacks that
-queue observations. Like `talos.run`, it freezes the
+It measures that Python work alone in one process: not the camera callbacks
+that queue observations, nor the framework's decoding of each delivered
+message. Like `talos.run`, it freezes the
 garbage collector's heap once the estimator is built (see
 [Node API: Python garbage collection](../../../docs/NODE_DEVELOPMENT_GUIDE.md#python-garbage-collection)).
 It does not measure the node loop's dispatch or lateness, real-time
@@ -212,7 +233,10 @@ disabled with odometry since startup kept, fixed once enabled),
 enabled-first restart recovery without seed innovation gating, cross-camera
 startup confirmation,
 missing/detached DS startup and process-lifetime localization latching;
-estimation while disabled; stale, frozen and invalid drivetrain input; repeated samples; `cameras`
+estimation while disabled; every 200 Hz drivetrain state integrated (a
+chassis spinning while it translates, against the closed-form line), and a
+stall's backlog integrated in order with its stale states skipped; stale,
+frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
 replaying without divergence. For `factor_graph` alone (Kalman has no such
 failure), a raising smoother update rejects that observation or keeps that
