@@ -26,7 +26,7 @@ port (5800), and static web directory (`studio/dist`). A web directory that
 does not exist or holds no `index.html` or `drive.html` is logged at startup
 and answered at `/` and `/drive` with 503 naming the command that builds the
 pages ([built pages](../README.md#built-pages)) and, for a robot, installing
-the bundle again (first when the web directory is an installed bundle's
+a rebuilt bundle and restarting the service (first when the web directory is an installed bundle's
 `studio/webroot`); the feeds are served
 either way. Once listening, the
 bridge prints `listening <port>` on stdout; port 0 asks the OS for a free port,
