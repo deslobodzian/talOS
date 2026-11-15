@@ -204,8 +204,18 @@ class Browser:
                 text = active.read_text() if active.exists() else ""
                 return text if text.count("\n") >= 1 and text.split("\n")[1] else None
 
-            port, path = watch.wait_for(port_file, lambda: [self.profile, active], timeout_s,
-                                        f"{binary} DevTools port").split("\n")[:2]
+            try:
+                found = watch.wait_for(port_file, lambda: [self.profile, active], timeout_s,
+                                       f"{binary} DevTools port")
+            except TimeoutError as late:
+                # Say which side was late: the browser (no file, or its log
+                # says why) or the wait (the file is there and complete).
+                self.log.flush()
+                wrote = repr(active.read_text()) if active.exists() else "absent"
+                tail = self.log_path.read_text(errors="replace")[-2000:]
+                raise TimeoutError(f"{late}; {active.name} {wrote}; "
+                                   f"{self.log_path.name} ends: {tail!r}") from late
+            port, path = found.split("\n")[:2]
             self.ws = WebSocket(f"ws://127.0.0.1:{port.strip()}{path.strip()}", timeout_s)
             browser = Page(self.ws, None)
             target = browser.call("Target.createTarget", url="about:blank")["targetId"]
