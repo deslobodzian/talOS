@@ -567,11 +567,11 @@ class Vision {
     require(std::isfinite(solver_options_.mount_translation_std_m) &&
                 solver_options_.mount_translation_std_m >= 0,
             "camera.mount_translation_std_m");
-    // Each key on its own, so the error names it (the ranges are those
-    // CameraIntrinsics::IsValid and the simulation paths rely on): a finite
-    // positive focal length, the principal point inside the image, and
-    // finite distortion coefficients, so no NaN or infinity reaches the
-    // undistortion or the solver.
+    // Each key on its own, so the error names it: a finite positive focal
+    // length, the principal point inside the image, and finite distortion
+    // coefficients, so no NaN or infinity reaches the undistortion or the
+    // solver. Stricter than CameraIntrinsics::IsValid, which checks only
+    // that the four pinhole values are positive.
     require(std::isfinite(intr.fx) && intr.fx > 0, "camera.fx");
     require(std::isfinite(intr.fy) && intr.fy > 0, "camera.fy");
     require(intr.cx > 0 && intr.cx < width, "camera.cx");
