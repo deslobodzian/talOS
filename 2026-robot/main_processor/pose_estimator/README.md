@@ -32,7 +32,8 @@ twist cannot follow a robot whose robot-frame velocity turns within it (one
 that spins while it drives): in `node_test`, 1 s at 2 m/s spinning at
 6 rad/s ends 5.6 cm off the true pose that way, against 1.1 cm with every
 state. After a stall the drain delivers the backlog in batches of at most
-64, in order; a state delivered `drivetrain_timeout_us` or more after its
+64, in order: the first batch, then the due `update()`, then the rest at
+once; a state delivered `drivetrain_timeout_us` or more after its
 publication is stale and not integrated, so the first fresh one folds in
 the wheel travel since the last integrated state, and at most about
 `drivetrain_timeout_us` of states (20 at 100 ms) are integrated at once.
@@ -167,8 +168,12 @@ probe's time.
   for the process lifetime, including enable/disable transitions, Driver
   Station loss and stale or invalid odometry. It is not a freshness flag:
   field-pose consumers must require both `valid` and `localized`.
-- Each observation is fused once, in the `update()` after it arrives.
-  Invalid or no-tag camera states are skipped; offered measurements are
+- Each observation is fused once, in the `update()` after it arrives, or
+  the one after that when it is more than `observation_future_tolerance_us`
+  newer than the latest odometry sample but not newer than the node's
+  clock: after a stall the first `update()` has seen only the first 64
+  drivetrain states of the backlog, and such a frame waits one tick for the
+  rest instead of being rejected as future. Invalid or no-tag camera states are skipped; offered measurements are
   rejected (counted) when their camera's queue overflowed, a value is
   non-finite, a std dev is below 1e-4 m (x, y) or 1e-4 rad (yaw), finer
   than any camera resolves (in the factor graph such a sigma only
@@ -252,7 +257,8 @@ estimation while disabled; every 200 Hz drivetrain state integrated (a
 chassis spinning while it translates, against the closed-form line), and a
 stall's backlog integrated in order with its stale states skipped; a
 30 cm one-state wheel jump rejected and a late wheel catching up after a
-missed refresh accepted; stale,
+missed refresh accepted; camera frames from a stall of more than 64 states
+fused after the rest of the backlog arrives; stale,
 frozen and invalid drivetrain input; repeated samples; `cameras`
 wiring; startup errors naming the bad key; `--describe` and a logged sim run
 replaying without divergence. For `factor_graph` alone (Kalman has no such
