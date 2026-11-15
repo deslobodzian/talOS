@@ -258,8 +258,11 @@ TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
 // The same, across threads with the helper refreshing as fast as it can,
 // writing kA and kB in turn field by field: every Read the loop makes is one
 // of them whole (or no Driver Station, before the first), its flags and its
-// inputs from the same refresh. The publication's memory ordering is what
-// this exercises; the test above pins the slot handover.
+// inputs from the same refresh, so the protocol as implemented hands over no
+// torn or mixed snapshot on this host. It cannot catch a memory-ordering
+// error: on the x86-64 test host a relaxed exchange compiles like an
+// acquire-release one. Ordering is covered only by a thread sanitizer run or
+// an ARM host (TODO.md BENCH-3).
 // REQ-SAFE-13
 TEST(DriverStationReader, ReadsDuringConstantRefreshesSeeOnlyWholeRefreshes) {
   constexpr int kRefreshes = 10'000;
