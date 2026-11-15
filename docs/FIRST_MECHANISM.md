@@ -623,15 +623,18 @@ driving to the switch, as on the robot.
 
 A node may drive its `Motor` directly instead. Then the cases the library
 handles for you are yours: owning the node means owning them. An arm that
-homes on a switch must at least bound its push toward the switch, notice a
-switch stuck closed, and push gently. To replace the scaffolded mechanism
+homes on a switch must at least bound its push toward the switch, check
+that the switch opens when the arm leaves it, latch a failure, and push
+gently. To replace the scaffolded mechanism
 with your own code:
 
 1. In `arm.h`, replace the `PositionMechanism` member with the devices it
    used, and `update()` with your control. Drop the `position_mechanism.h`
    include and `HomingState()`. This version zeroes on the switch once the
    arm is at rest, then runs Motion Magic inside a fixed travel, and reports
-   `FAILED` (the scaffolded `ArmState`'s `homing` field) on either fault:
+   `FAILED` (the scaffolded `ArmState`'s `homing` field) on either fault. It
+   reads the Driver Station (`talos::DriverStation`) only to clear a
+   failure:
 
    ```cpp
    #include <algorithm>
@@ -640,34 +643,49 @@ with your own code:
      explicit Arm(talos::Node& node)
          : motor_{node, "arm"},
            home_{node, "arm_home"},
+           ds_{node},
            target_{node},
            state_{node.publish<State>(topics::kState)} {}
 
      void update() {
-       // The switch reads false when closed. Zero there once the arm is at
-       // rest, so the first move does not start at homing speed.
+       // The switch reads false when closed, true when open.
        const bool on_switch = home_.connected() && !home_.get();
+       const bool off_switch = home_.connected() && home_.get();
+       // Zero on the switch once the arm is at rest, so the first move does
+       // not start at homing speed.
        if (!motor_.zeroed() && on_switch && std::abs(motor_.velocity()) < 0.05) {
          motor_.rezero(0.0);
        }
-       const Target* t = target_.get();  // null: disabled, stale or released
-       const bool live = t != nullptr && motor_.connected() &&
-                         std::isfinite(t->position_rot());
-       if (!live) {  // released or disabled: the next press may try again
+       if (motor_.zeroed()) {
+         push_ticks_ = 0;  // homed: a later re-home pushes from zero
+         if (off_switch) left_switch_ = true;
+       } else {
+         left_switch_ = false;  // a dropped zero homes and checks again
+       }
+       // Only a Driver Station that reports disabled clears a failure: not a
+       // release, a stale lane or a feedback blip.
+       if (ds_.connected() && !ds_.enabled()) {
          failed_ = false;
          push_ticks_ = 0;
        }
-       // Closed well above zero: the switch is stuck, or the zero is wrong.
-       if (motor_.zeroed() && on_switch && motor_.position() > kHomeMarginRot) {
+       // Still closed after the first move off it: the switch is stuck, or
+       // the zero is wrong.
+       if (motor_.zeroed() && !left_switch_ &&
+           motor_.position() > kHomeMarginRot - 0.05) {
          failed_ = true;
        }
+       const Target* t = target_.get();  // null: disabled, stale or released
+       const bool live = t != nullptr && motor_.connected() &&
+                         std::isfinite(t->position_rot()) && !failed_;
        bool drove = false;
        double goal = 0.0;
-       if (live && !failed_ && motor_.zeroed()) {
-         goal = std::clamp(t->position_rot(), 0.0, kMaxRot);
+       if (live && motor_.zeroed()) {
+         // Until the switch has opened, no farther than kHomeMarginRot.
+         const double top = left_switch_ ? kMaxRot : kHomeMarginRot;
+         goal = std::clamp(t->position_rot(), 0.0, top);
          motor_.set_motion_magic(goal);
          drove = true;
-       } else if (live && !failed_ && !on_switch) {
+       } else if (live && !on_switch) {
          if (++push_ticks_ > kMaxPushTicks) {
            failed_ = true;  // pushed long enough to cross the travel: no switch
          } else {
@@ -684,15 +702,17 @@ with your own code:
      }
 
     private:
-     static constexpr double kMaxRot = 2.0;         // travel above the switch
-     static constexpr double kHomingVolts = -0.5;   // a gentle push down
-     static constexpr int kMaxPushTicks = 50;       // 1 s at period_us = 20000
-     static constexpr double kHomeMarginRot = 0.25;
+     static constexpr double kMaxRot = 2.0;          // travel above the switch
+     static constexpr double kHomingVolts = -0.5;    // a gentle push down
+     static constexpr int kMaxPushTicks = 50;        // 1 s at period_us = 20000
+     static constexpr double kHomeMarginRot = 0.15;  // the switch opens by here
      talos::Motor motor_;
      talos::DigitalInput home_;
+     talos::DriverStation ds_;
      talos::Target<Target> target_;
      talos::Publisher<State> state_;
      bool failed_ = false;
+     bool left_switch_ = false;
      int push_ticks_ = 0;
    ```
 
@@ -703,13 +723,22 @@ with your own code:
      about half a second; `kMaxPushTicks` allows twice that.
      On your mechanism, time a push across the full travel at `kHomingVolts`
      and allow about twice that, in ticks of the subsystem's `period_us`.
-   - **A stuck switch is caught.** A switch stuck or shorted closed with the
-     arm mid-travel at power-on zeroes the arm there, and Motion Magic would
-     then take it up to `kMaxRot` past the real top. Closed with the arm more
-     than `kHomeMarginRot` above zero, the switch cannot be right, so the arm
-     stops.
-   - **Failed stays failed** (neutral) until the target is released, or the
-     robot disabled, and asked again.
+   - **A stuck switch is caught early.** A switch stuck or shorted closed
+     with the arm mid-travel at power-on zeroes the arm there, and Motion
+     Magic would then take it up to `kMaxRot` past the real top. So after
+     each zero, the arm goes no farther than `kHomeMarginRot` above it until
+     the switch has read open; still closed within 0.05 of that, the switch
+     cannot be right, and the arm fails. That is what is not caught: from a
+     wrong zero the arm can still move up to `kHomeMarginRot`, which from a
+     zero near the top is into the far stop, at the stator limit. Keep
+     `kHomeMarginRot` as small as your switch allows: the distance from
+     the zero at which it reliably opens, plus a little. In the simulation
+     it opens about 0.06 rotations up.
+   - **Failed stays failed** (neutral) until the Driver Station reports
+     disabled. Releasing the button, a stale lane, a non-finite target or a
+     motor that briefly reads disconnected does not clear it, so none of
+     them starts another push into the stop. `Target::get()` returns null for
+     a release and a stale lane alike, so the node cannot tell them apart.
    - **The push is gentle.** `kHomingVolts` is low, and the motor's
      `stator_limit_a` bounds how hard any command, the push included, can
      drive the arm into a stop. The scaffold's 80 A is the motor's limit,
@@ -741,8 +770,11 @@ with your own code:
    `Sim` does not refuse it, but nothing reads it). With this arm two of the
    matrix tests above that comment fail as well: `DrivesAtALiveLane` and
    `OtherModesLaneIsIgnored` ask for goals of 30 and 20 rotations, beyond
-   `kMaxRot`; give them goals inside the travel, such as 1.5 and 1.0. Then
-   test your own homing, as section 5 tested `at_speed`:
+   `kMaxRot`; give them goals inside the travel, such as 1.5 and 1.0, and
+   in `OtherModesLaneIsIgnored` open the switch after `Teleop()` with
+   `SetHome(false);`, as `DrivesAtALiveLane` does, since until the switch
+   opens this arm goes no farther than `kHomeMarginRot`. Then test your own
+   homing, as section 5 tested `at_speed`:
 
    ```cpp
    // The arm's own homing bounds (arm.h).
@@ -754,24 +786,42 @@ with your own code:
      Hold(1.0, 200ms);                      // past the 1 s bound
      EXPECT_EQ(Request(), Mode::kNeutral);
      EXPECT_EQ(Latest().homing(), ArmHoming::FAILED);
-     ReleaseTarget<Target>(sim, "arm", "teleop");
+   }
+
+   TEST_F(ArmTest, FailureLatchesUntilDisabled) {
+     StartOffHome();
+     Teleop();
+     Hold(1.0, 1100ms);
+     ASSERT_EQ(Latest().homing(), ArmHoming::FAILED);
+     sim.step(150ms);   // the lane goes stale while the button is held
+     Hold(1.0, 200ms);  // live again: no second push
+     EXPECT_EQ(Request(), Mode::kNeutral);
+     EXPECT_EQ(Latest().homing(), ArmHoming::FAILED);
+     hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
      sim.step(40ms);
-     Hold(1.0, 40ms);  // asked again: it pushes again
+     Teleop();  // enabled again: a new homing run
+     Hold(1.0, 40ms);
      EXPECT_EQ(Request(), Mode::kVoltage);
    }
 
-   TEST_F(ArmTest, SwitchStuckClosedFails) {
+   TEST_F(ArmTest, StuckSwitchStopsWithinTheMargin) {
      hw.ideal_motors();
-     Teleop();  // zeroes on the switch, which never opens
-     Hold(1.0, 60ms);
+     hw.set_motor("arm", "arm", 1.9, 0.0);  // powered on near the top
+     Teleop();  // the switch, stuck closed, zeroes it there
+     for (int tick = 0; tick < 10; ++tick) {
+       Hold(1.5, 20ms);
+       // Never more than kHomeMarginRot (0.15) above the false zero.
+       EXPECT_LE(hw.motor_request("arm", "arm").demand, 1.9 + 0.15 + 1e-9);
+     }
      EXPECT_EQ(Request(), Mode::kNeutral);
      EXPECT_EQ(Latest().homing(), ArmHoming::FAILED);
    }
    ```
 
    The fixture starts the arm on its switch (closed); `StartOffHome()`
-   opens it, and `hw.ideal_motors()` makes the simulated motor reach each
-   demand at once, so the stuck switch is still closed with the arm at 1.0.
+   opens it. `hw.ideal_motors()` makes the simulated motor reach each
+   demand at once, so in the last test the switch, never opened, is still
+   closed with the arm 0.15 above a zero taken 1.9 rotations up its travel.
 
 The arm's `Next:` gives it button 6 (the flywheel holds 3 and 5, the claw
 4), so `buttons=32` in the joystick schedule drives it. Run as before, it
@@ -786,16 +836,17 @@ reaches, run again, and read the session:
 
 ```text
       arm.ArmState {enabled: true, position_rot: 0, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -0.6280790655151809, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -1.4583326755683261, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -2.2917628214617314, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: true, position_rot: -3.124953825612035, connected: true, at_goal: false, homing: HOMING}
-      arm.ArmState {enabled: false, position_rot: -3.9582871491459746, connected: true, at_goal: false, homing: FAILED}
-      arm.ArmState {enabled: false, position_rot: -4.041422007321671, connected: true, at_goal: false, homing: FAILED}
+      arm.ArmState {enabled: true, position_rot: -0.6280830927531091, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -1.4583784821684451, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -2.291666972683709, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: true, position_rot: -3.12498714320045, connected: true, at_goal: false, homing: HOMING}
+      arm.ArmState {enabled: false, position_rot: -3.9583204667361236, connected: true, at_goal: false, homing: FAILED}
+      arm.ArmState {enabled: false, position_rot: -4.041459627262723, connected: true, at_goal: false, homing: FAILED}
 ```
 
-It pushed for one second, stopped and reported `FAILED`, neutral, until the
-button was released. Put `sim_closed_at_rot` back to `-0.1` afterwards.
+It pushed for one second, stopped and reported `FAILED`, neutral, and still
+reported `FAILED` after the button was released: only a disable clears it.
+Put `sim_closed_at_rot` back to `-0.1` afterwards.
 
 Whatever your code does, a position or Motion Magic demand goes out neutral
 until `Motor::rezero` holds for the motor, unless its config sets
