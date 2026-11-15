@@ -1,0 +1,26 @@
+namespace position_raw_cpp;
+
+// What a producer asks for on its lane, /position_raw_cpp/target/<source>. The node
+// drives the motor with Motion Magic only while the robot is enabled and a
+// lane of its target policy is live.
+struct PositionRawCppTarget {
+  position_rot:double;
+}
+
+// Whether positions count from the home switch yet: HOMING until the switch
+// zeroes the motor (it drives toward the switch only with a live target);
+// FAILED once the push toward the switch ran past its bound, or the switch
+// still read closed after the first move off it (neutral until the Driver
+// Station reports disabled).
+enum PositionRawCppHoming : ubyte { HOMING, HOMED, FAILED }
+
+// What the position_raw_cpp is doing, published every tick. enabled: it drove the motor
+// this tick (homing or Motion Magic). position_rot counts from the home
+// switch once HOMED; before that it is the motor's unhomed position.
+struct PositionRawCppState {
+  enabled:bool;
+  position_rot:double;
+  connected:bool;
+  at_goal:bool;
+  homing:PositionRawCppHoming;
+}

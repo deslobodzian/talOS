@@ -343,12 +343,15 @@ class NewSubsystemTest(unittest.TestCase):
         # tested by `bazel test //...`: the templates compile and their
         # tests pass only while this equality holds. Each golden BUILD adds
         # one filegroup, which hands the files to this test.
-        for name, lang, kind in (("gripper", "cpp", "velocity"),
-                                 ("scaffold_py", "py", "velocity"),
-                                 ("position_cpp", "cpp", "position"),
-                                 ("position_py", "py", "position"),
-                                 ("localizer", "cpp", "estimator"),
-                                 ("py_localizer", "py", "estimator")):
+        for name, lang, kind, raw in (
+                ("gripper", "cpp", "velocity", False),
+                ("scaffold_py", "py", "velocity", False),
+                ("position_cpp", "cpp", "position", False),
+                ("position_py", "py", "position", False),
+                ("position_raw_cpp", "cpp", "position", True),
+                ("position_raw_py", "py", "position", True),
+                ("localizer", "cpp", "estimator", False),
+                ("py_localizer", "py", "estimator", False)):
             golden = os.path.join("tools", "scaffold_testdata", name)
             on_disk = {}
             for directory, _, files in os.walk(golden):
@@ -357,7 +360,8 @@ class NewSubsystemTest(unittest.TestCase):
                     with open(path, encoding="utf-8") as text:
                         on_disk[os.path.relpath(path, golden).replace(
                             os.sep, "/")] = text.read()
-            generated = new_subsystem.package_files(name, lang, kind=kind)
+            generated = new_subsystem.package_files(name, lang, kind=kind,
+                                                    raw=raw)
             generated["BUILD"] += GOLDEN_FILEGROUP
             with self.subTest(name):
                 self.assertEqual(sorted(on_disk), sorted(generated))
@@ -366,8 +370,58 @@ class NewSubsystemTest(unittest.TestCase):
                         on_disk[path], content,
                         f"{golden}/{path} differs from the generator's "
                         f"output, new_subsystem.package_files({name!r}, "
-                        f"{lang!r}, kind={kind!r}) (plus the golden "
-                        f"filegroup in BUILD)")
+                        f"{lang!r}, kind={kind!r}, raw={raw!r}) (plus the "
+                        f"golden filegroup in BUILD)")
+
+    # REQ-DEV-01
+    def test_raw_position_node_is_the_students_own_code(self):
+        # --raw writes the homing and limits into the node's own file: the
+        # package depends on no mechanism library, and the subsystem file
+        # (robot and standalone) has no [<name>] table, which no node would
+        # read and the launcher would refuse. --raw without --type position
+        # is refused before anything is read.
+        for lang in ("cpp", "py"):
+            with self.subTest(lang=lang), tempfile.TemporaryDirectory() as root:
+                configuration = os.path.join(root, "bot", "main_processor",
+                                             "configuration")
+                os.makedirs(os.path.join(configuration, "subsystems"))
+                for path, text in (
+                        ("BUILD", ""),
+                        ("robot.toml",
+                         '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                         'name = "shooter"\npath = "subsystems/shooter.toml"\n'),
+                        ("subsystems/shooter.toml",
+                         '[subsystem]\nname = "shooter"\n')):
+                    with open(os.path.join(configuration, path), "w",
+                              encoding="utf-8") as f:
+                        f.write(text)
+                writes, _ = new_subsystem.plan(root, "bot", "arm", lang,
+                                               kind="position", raw=True)
+                by_rel = {os.path.relpath(path, root).replace(os.sep, "/"): new
+                          for path, _, new in writes}
+                for path, content in by_rel.items():
+                    if path.startswith("bot/main_processor/arm/"):
+                        for library in ("talOS/mechanisms", "talos.mechanisms",
+                                        "PositionMechanism"):
+                            self.assertNotIn(library, content, path)
+                subsystem = tomllib.loads(by_rel[
+                    "bot/main_processor/configuration/subsystems/arm.toml"])
+                self.assertNotIn("arm", subsystem)
+                self.assertIn("arm_home", subsystem["digital_inputs"])
+                self.assertEqual(subsystem["motors"]["arm"]["position_frame"],
+                                 "rezero")
+                defaults = tomllib.loads(new_subsystem.package_files(
+                    "arm", lang, standalone=True, kind="position",
+                    raw=True)["defaults.toml"])
+                self.assertNotIn("arm", defaults)
+        for kind in ("velocity", "estimator"):
+            with self.subTest(kind=kind), \
+                    contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit) as exit_:
+                new_subsystem.main(["arm", "--lang", "cpp", "--type", kind,
+                                    "--raw"])
+            self.assertEqual(exit_.exception.code, 2)
+            self.assertIn("--raw", err.getvalue())
 
 
     def test_plan_wires_an_estimator_without_a_can_id(self):

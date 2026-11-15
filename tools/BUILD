@@ -7,7 +7,7 @@ exports_files([
     "sync_manifest.py",
 ])
 
-# bazel run //tools:new_subsystem -- <name> --lang cpp|py [--robot R] [--standalone DIR] [--dry-run]
+# bazel run //tools:new_subsystem -- <name> --lang cpp|py [--type T [--raw]] [--robot R] [--standalone DIR] [--dry-run]
 # Writes a node package under <robot>/main_processor/<name>/, adds it to that
 # robot's robot.toml and regenerates its manifest, or scaffolds a standalone
 # Bzlmod repo.
@@ -31,6 +31,8 @@ py_test(
         "//tools/scaffold_testdata/localizer:golden",
         "//tools/scaffold_testdata/position_cpp:golden",
         "//tools/scaffold_testdata/position_py:golden",
+        "//tools/scaffold_testdata/position_raw_cpp:golden",
+        "//tools/scaffold_testdata/position_raw_py:golden",
         "//tools/scaffold_testdata/py_localizer:golden",
         "//tools/scaffold_testdata/scaffold_py:golden",
     ],

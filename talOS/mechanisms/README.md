@@ -5,6 +5,9 @@ subsystem node that uses one is a thin wrapper (a target lane in, a state out,
 and one library object that does the control, homing, readiness and fault
 handling), and a node may instead drive its devices directly
 ([writing the arm yourself](../../docs/FIRST_MECHANISM.md#writing-the-arm-yourself)).
+`new_subsystem --type position` generates a node on `PositionMechanism`;
+with `--raw` it writes the homing and limits out in the node's own file
+instead.
 
 | Class | For | State message |
 |---|---|---|
