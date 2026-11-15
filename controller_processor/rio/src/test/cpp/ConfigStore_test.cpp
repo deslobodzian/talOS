@@ -226,10 +226,22 @@ class GatedStore {
     finished_.push_back(id);
     return ok;
   }
-  // Waits for the save of the `n`th configuration to start.
-  bool AwaitStarted(std::size_t n) {
-    std::unique_lock lock{mutex_};
-    return changed_.wait_for(lock, kHang, [&] { return started_.size() >= n; });
+  // Ticks `persister`, as the loop does, until the save of the `n`th
+  // configuration starts. Tick() only try-locks, so one tick can lose the
+  // mutex to the saver thread (as it starts, or as it moves a save in or out)
+  // and hand nothing over; the next tick retries. The deadline only bounds a
+  // hang.
+  bool TickUntilStarted(talos::rio::ConfigPersister& persister, std::size_t n) {
+    const auto deadline = std::chrono::steady_clock::now() + kHang;
+    for (;;) {
+      persister.Tick(true);
+      {
+        std::lock_guard lock{mutex_};
+        if (started_.size() >= n) return true;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      std::this_thread::yield();
+    }
   }
   void Release() {
     std::lock_guard lock{mutex_};
@@ -285,8 +297,7 @@ TEST(ConfigPersister, TicksDoNotWaitForASlowSaveAndTheNewestIsSavedLast) {
   persister.Start();
 
   persister.Acknowledged(a);
-  persister.Tick(true);
-  ASSERT_TRUE(store.AwaitStarted(1)) << "A's save never started";
+  ASSERT_TRUE(store.TickUntilStarted(persister, 1)) << "A's save never started";
 
   for (int tick = 0; tick < 200; ++tick) {
     if (tick == 10) persister.Acknowledged(b);
@@ -328,7 +339,8 @@ TEST(ConfigPersister, AFailedSaveIsReportedOnceAndAnIdenticalPushRetriesIt) {
   EXPECT_EQ(persister.Tick(true), 0u) << "the failure was reported twice";
 
   persister.Acknowledged(a);
-  persister.Tick(true);
+  ASSERT_TRUE(store.TickUntilStarted(persister, 2))
+      << "the retry never started";
   persister.Stop();
   EXPECT_EQ(store.finished(), (std::vector<uint64_t>{hw::ConfigurationId(a),
                                                      hw::ConfigurationId(a)}));
