@@ -10,6 +10,7 @@ cc_binary(
     srcs = ["sim_gateway.cc"],
     visibility = ["//visibility:public"],
     deps = [
+        ":ports",
         ":schedules",
         "//talOS/configuration",
         "//talOS/driver_station",
@@ -22,6 +23,23 @@ cc_binary(
         "//talOS/ipc",
         "//talOS/msgs:geometry",
         "//talOS/process",
+    ],
+)
+
+# The simulator's UDP ports: its flags, else the config's (REQ-DEV-31).
+cc_library(
+    name = "ports",
+    hdrs = ["ports.h"],
+    deps = ["//talOS/configuration"],
+)
+
+cc_test(
+    name = "ports_test",
+    srcs = ["ports_test.cc"],
+    deps = [
+        ":ports",
+        "//talOS/configuration",
+        "@googletest//:gtest_main",
     ],
 )
 
