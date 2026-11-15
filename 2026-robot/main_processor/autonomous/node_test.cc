@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <numbers>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 
@@ -29,49 +30,6 @@ namespace autonomous {
 namespace {
 using namespace std::chrono_literals;
 namespace ds = talos::driver_station;
-
-TEST(TrajectoryTest, InterpolatesMultipleSamplesAndCompletes) {
-  const std::array<TrajectorySample, 3> samples{
-      {{0, 0, 0, 0, 1, 0, 0}, {1, 1, 0, 0, 1, 0, 0}, {2, 2, 0, 0, 1, 0, 0}}};
-  Trajectory trajectory{samples};
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0.5).x_m, 0.5);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(1.5).x_m, 1.5);
-  EXPECT_DOUBLE_EQ(trajectory.total_time_s(), 2);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(2).x_m, 2);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(3).x_m, 2);
-  trajectory.FlipForRed(16.541, 8.069);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).x_m, 16.541);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).y_m, 8.069);
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).vx_mps, -1);
-}
-
-TEST(TrajectoryTest, RampStartsAndEndsAtRest) {
-  const auto planned = Trajectory::FromPoses(geometry::Pose2d{0, 0, 0},
-                                             geometry::Pose2d{3, 0, 1}, 2, 3);
-  ASSERT_TRUE(planned.has_value());
-  const Trajectory& trajectory = *planned;
-  EXPECT_DOUBLE_EQ(trajectory.SampleAt(0).vx_mps, 0);
-  EXPECT_NEAR(trajectory.SampleAt(trajectory.total_time_s() / 2).vx_mps, 2,
-              1e-9);
-  const auto end = trajectory.SampleAt(trajectory.total_time_s());
-  EXPECT_DOUBLE_EQ(end.x_m, 3);
-  EXPECT_DOUBLE_EQ(end.yaw_rad, 1);
-  EXPECT_DOUBLE_EQ(end.vx_mps, 0);
-}
-
-TEST(TrajectoryTest, CombinesFeedforwardFeedbackAndRobotFrameLimits) {
-  const HolonomicController controller{2, 3, 10, 4};
-  const auto target =
-      controller.Calculate({0, 2, 1, std::numbers::pi / 2 + 0.2, 1, 2, 0.5},
-                           geometry::Pose2d{1, 1, std::numbers::pi / 2});
-  EXPECT_NEAR(target.vx_mps(), 2, 1e-9);
-  EXPECT_NEAR(target.vy_mps(), -3, 1e-9);
-  EXPECT_NEAR(target.omega_radps(), 1.1, 1e-9);
-  const auto limited = HolonomicController{1, 1, 2, 3}.Calculate(
-      {0, 100, 100, 0, 0, 0, 100}, geometry::Pose2d{});
-  EXPECT_NEAR(std::hypot(limited.vx_mps(), limited.vy_mps()), 2, 1e-9);
-  EXPECT_DOUBLE_EQ(limited.omega_radps(), 3);
-}
 
 std::string Runfile(const char* env) {
   std::string error;
@@ -123,12 +81,13 @@ class AutonomousTest : public ::testing::Test {
     sim.publish(shooter::topics::kState,
                 shooter::ShooterState{0, 60, 60, ready, true, true});
   }
+  // An estimate at (x, y, yaw), moving forward at vx_mps (robot frame).
   void Pose(double x = 0, double y = 0, double yaw = 0, bool valid = true,
-            bool localized = true) {
-    sim.publish(
-        "/pose_estimator/state",
-        geometry::PoseEstimate{0, geometry::Pose2d{x, y, yaw},
-                               geometry::Twist2d{}, valid, localized, 0, 0});
+            bool localized = true, double vx_mps = 0) {
+    sim.publish("/pose_estimator/state",
+                geometry::PoseEstimate{0, geometry::Pose2d{x, y, yaw},
+                                       geometry::Twist2d{vx_mps, 0, 0}, valid,
+                                       localized, 0, 0});
     sim.publish(intake::topics::kState,
                 intake::IntakeState{true, 0, false, 0, intake::Inhibit::DRIVE});
   }
@@ -459,9 +418,11 @@ TEST_F(AutonomousTest, ResumedDriveReplansFromCurrentPose) {
   EXPECT_GT(Drive().vy_mps(), 0);
 }
 
-// RULES.md 3: a driving tick (trajectory sample, controller, progress
-// record, three lane writes, state publish) allocates nothing. The pose is
-// published before the window and stays fresh through it.
+// RULES.md 3: a driving tick (path sample, follower step, progress record,
+// three lane writes, state publish) allocates nothing, nor does planning
+// the path again from the live pose. The pose is published before the
+// window and stays fresh through it; it has stepped 0.3 m from the last one
+// driven on, so the window's first tick plans again.
 // REQ-RT-06
 TEST_F(AutonomousTest, UpdateDoesNotAllocate) {
   if (const auto why = talos::testing::AllocationProbe::Unsupported();
@@ -471,13 +432,20 @@ TEST_F(AutonomousTest, UpdateDoesNotAllocate) {
   StartDrive();
   Pose();
   sim.step(20ms);
-  Pose();
-  talos::testing::AllocationProbe probe;
-  probe.start();
-  sim.step(60ms);
-  EXPECT_EQ(probe.stop(), 0u) << probe.sites();
+  Pose(-0.3);
+  talos::testing::AllocationProbe replan;
+  replan.start();
+  sim.step(20ms);
+  EXPECT_EQ(replan.stop(), 0u) << replan.sites();
+  const auto replanned = Drive();
+  talos::testing::AllocationProbe follow;
+  follow.start();
+  sim.step(40ms);
+  EXPECT_EQ(follow.stop(), 0u) << follow.sites();
   EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
   EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  // A plan's first tick commands rest (its reference is the pose, still).
+  EXPECT_DOUBLE_EQ(replanned.vx_mps(), 0);
   EXPECT_GT(Drive().vx_mps(), 0);
 }
 
@@ -550,10 +518,21 @@ INSTANTIATE_TEST_SUITE_P(
 class AutonomousPoseTest : public AutonomousTest,
                            public ::testing::WithParamInterface<bool> {};
 
+// The drive lane is released on the tick the pose turns invalid or
+// unlocalized, and the next usable pose plans the path again from where the
+// robot stands, which the released drivetrain braked to: its first tick
+// commands rest and its second the same as the first plan's second tick (the
+// same pose), not the paused path's reference, which would ask at once for
+// the speed it had reached.
 // REQ-SAFE-34
-TEST_P(AutonomousPoseTest, UnusablePosePausesTrajectoryUntilRecovery) {
+TEST_P(AutonomousPoseTest, UnusablePoseReleasesThenReplans) {
   StartDrive();
-  const auto before = Drive();
+  const auto second_tick = Drive();
+  ASSERT_GT(second_tick.vx_mps(), 0);
+  for (int i = 0; i < 10; ++i) {
+    Pose();
+    sim.step(20ms);
+  }
   Pose(0, 0, 0, GetParam(), !GetParam());
   sim.step(20ms);
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
@@ -561,16 +540,17 @@ TEST_P(AutonomousPoseTest, UnusablePosePausesTrajectoryUntilRecovery) {
   EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 0);
-  sim.step(5s);
+  sim.step(1s);
   Pose();
   sim.step(20ms);
   EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
   EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_DOUBLE_EQ(Drive().vx_mps(), before.vx_mps());
-  EXPECT_DOUBLE_EQ(Drive().vy_mps(), before.vy_mps());
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
   Pose();
   sim.step(20ms);
-  EXPECT_GT(Drive().vx_mps(), before.vx_mps());
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), second_tick.vx_mps());
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), second_tick.vy_mps());
 }
 
 INSTANTIATE_TEST_SUITE_P(PoseValidity, AutonomousPoseTest, ::testing::Bool());
@@ -745,28 +725,69 @@ TEST_F(AutonomousTest, PoseOutageDoesNotExtendDriveDeadline) {
   ExpectReleased();
 }
 
-TEST_F(AutonomousTest, StalePosePausesTrajectoryUntilRecovery) {
+// REQ-SAFE-34
+TEST_F(AutonomousTest, StalePoseReleasesThenReplans) {
   StartDrive();
-  auto last_active = Drive();
-  for (int i = 0; i < 6; ++i) {
-    sim.step(20ms);
-    if (Lane<drivetrain::ChassisTarget>("drivetrain").active) {
-      last_active = Drive();
-    }
-  }
+  const auto second_tick = Drive();
+  ASSERT_GT(second_tick.vx_mps(), 0);
+  for (int i = 0; i < 6; ++i) sim.step(20ms);
   EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
   EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().vy_mps(), 0);
   EXPECT_DOUBLE_EQ(Drive().omega_radps(), 0);
   EXPECT_EQ(Intake(), 0);
-  sim.step(5s);
+  sim.step(1s);
   Pose();
   sim.step(20ms);
   EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
   EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
-  EXPECT_DOUBLE_EQ(Drive().vx_mps(), last_active.vx_mps());
-  EXPECT_DOUBLE_EQ(Drive().vy_mps(), last_active.vy_mps());
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), 0);
+  Pose();
+  sim.step(20ms);
+  EXPECT_DOUBLE_EQ(Drive().vx_mps(), second_tick.vx_mps());
+  EXPECT_DOUBLE_EQ(Drive().vy_mps(), second_tick.vy_mps());
 }
+
+// A usable estimate that moved from the last one driven on by more than its
+// velocity explains plus replan_step_m (0.15 m) or replan_step_rad (0.1 rad)
+// plans the path again from it on that tick, without releasing the drive
+// lane: the plan's first tick commands rest. Motion the velocity explains,
+// and a smaller correction, keep following the path.
+struct StepCase {
+  const char* name;
+  double x_m, yaw_rad, vx_mps;  // the next estimate, from rest at the origin
+  bool replans;
+};
+void PrintTo(const StepCase& row, std::ostream* out) { *out << row.name; }
+
+class AutonomousStepTest : public AutonomousTest,
+                           public ::testing::WithParamInterface<StepCase> {};
+
+// REQ-DEV-28
+TEST_P(AutonomousStepTest, EstimateStepReplansWithoutReleasing) {
+  const StepCase& row = GetParam();
+  StartDrive();
+  // The estimate the next one is judged against, moving as it does: an
+  // estimate published 20 ms later at vx_mps has moved vx_mps * 20 ms.
+  Pose(0, 0, 0, true, true, row.vx_mps);
+  sim.step(20ms);
+  Pose(row.x_m, 0, row.yaw_rad, true, true, row.vx_mps);
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  const auto drive = Drive();
+  const bool at_rest =
+      drive.vx_mps() == 0 && drive.vy_mps() == 0 && drive.omega_radps() == 0;
+  EXPECT_EQ(at_rest, row.replans) << drive.vx_mps() << ", " << drive.vy_mps()
+                                  << ", " << drive.omega_radps();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    Steps, AutonomousStepTest,
+    ::testing::Values(StepCase{"0.2 m step", 0.2, 0, 0, true},
+                      StepCase{"0.15 rad step", 0, 0.15, 0, true},
+                      StepCase{"0.1 m step", 0.1, 0, 0, false},
+                      StepCase{"0.2 m at 10 m/s", 0.2, 0, 10, false}));
 
 TEST_F(AutonomousTest, RedRotatesWaypointAndHeading) {
   StartDrive(true);
@@ -1229,6 +1250,10 @@ TEST(AutonomousParameters, BadParameterFailsConstruction) {
       {"feed_duration_us", "feed_duration_us = 0"},
       {"feed_duration_us", "feed_duration_us = -1"},
       {"max_linear_mps", "max_linear_mps = 0.0"},
+      {"max_linear_accel_mps2", "max_linear_accel_mps2 = 0.0"},
+      {"max_angular_accel_radps2", "max_angular_accel_radps2 = inf"},
+      {"replan_step_m", "replan_step_m = -0.15"},
+      {"replan_step_rad", "replan_step_rad = nan"},
   };
   for (const auto& row : rows) {
     SCOPED_TRACE(row.setting);

@@ -19,7 +19,6 @@ cc_library(
         "autonomous.h",
         "progress.h",
         "selection.h",
-        "trajectory.h",
     ],
     include_prefix = "autonomous",
     strip_include_prefix = ".",
@@ -30,9 +29,11 @@ cc_library(
         "//2026-robot/main_processor/shooter:messages",
         "//talOS/configuration",
         "//talOS/devices",
+        "//talOS/geometry",
         "//talOS/memory:shared_memory",
         "//talOS/msgs:geometry",
         "//talOS/node",
+        "//talOS/trajectory",
     ],
 )
 

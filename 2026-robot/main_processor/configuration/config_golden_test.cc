@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <string>
+#include <utility>
 
 #include "drivetrain/geometry.h"
 #include "talOS/configuration/config_parser.h"
@@ -121,6 +122,33 @@ TEST(ConfigTest, AutonomousToleranceFeedbackClearsTheSwerveHoldSpeed) {
       EXPECT_GT(kp_xy * position_tolerance_m, kMargin * hold_mps);
       EXPECT_GT(kp_yaw * yaw_tolerance_rad * std::hypot(module.x_m, module.y_m),
                 kMargin * hold_mps);
+    }
+  }
+}
+
+// Autonomous plans its path within its own acceleration limits and the
+// drivetrain slews every chassis target within its own. A path that asks
+// for more than the drivetrain gives leaves the robot behind its reference
+// on every start and stop, so autonomous's limits stay at or under the
+// drivetrain's (0 there is no limit).
+TEST(ConfigTest, AutonomousAccelerationStaysWithinTheDrivetrainSlewLimits) {
+  for (const char* path : kDeployments) {
+    SCOPED_TRACE(path);
+    const auto config = ParseRobotConfig(path);
+    const toml::table* autonomous = config.GetSubsystemTable("autonomous");
+    const toml::table* drivetrain = config.GetSubsystemTable("drivetrain");
+    ASSERT_NE(autonomous, nullptr);
+    ASSERT_NE(drivetrain, nullptr);
+    // Each key with autonomous.h's default; the drivetrain's is 0.
+    const std::pair<const char*, double> limits[] = {
+        {"max_linear_accel_mps2", 4.0}, {"max_angular_accel_radps2", 6.0}};
+    for (const auto& [key, fallback] : limits) {
+      SCOPED_TRACE(key);
+      const double planned = (*autonomous)[key].value_or(fallback);
+      const double slew = (*drivetrain)[key].value_or(0.0);
+      if (slew > 0) {
+        EXPECT_LE(planned, slew);
+      }
     }
   }
 }

@@ -18,8 +18,19 @@ selection_previous_direction_index = 6
 # (config_golden_test checks it).
 position_tolerance_m = 0.10
 yaw_tolerance_rad = 0.05
+# The drive action's straight path, planned from the live pose: speed and
+# acceleration limits. The accelerations stay under the drivetrain's chassis
+# slew limits (subsystems/drivetrain.toml; config_golden_test checks it), so
+# the drivetrain can follow the path's reference.
 max_linear_mps = 2.0
 max_angular_radps = 3.0
+max_linear_accel_mps2 = 4.0
+max_angular_accel_radps2 = 6.0
+# An estimate that moved from the last one by this much more than its
+# velocity explains (a vision correction, a re-seed) plans the path again
+# from it, keeping the drive lane.
+replan_step_m = 0.15
+replan_step_rad = 0.1
 # Common controller limits; each routine below owns its action parameters.
 # Field size: field-dimensions of the tag layout
 # 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json
