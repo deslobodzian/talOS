@@ -560,7 +560,9 @@ of the backend's tick calls (other); and the loop's own: the socket retry,
 the endpoint's tick (receive, the gateway's command and State work, the
 State send; with no socket open, the gateway's tick) and the Driver Station
 packet's send, less the backend phases inside them (link), reading the
-Driver Station and sampling and encoding its packet (driver station), and
+flags the Driver Station reader last refreshed and sampling and encoding the
+Driver Station packet from WPILib's cache (driver station; the refresh and
+the mode report are the reader's, outside every phase, below), and
 the watchdog beat, companion report and config persister (loop). A tick's
 phases sum to its work, the time the loop timing line's longest work
 measures. `PhoenixBackend` takes one
@@ -568,7 +570,7 @@ steady-clock reading per phase boundary, ten per disabled tick, and adds
 them on the loop thread without locks; the window passes to the logger at
 the loop's next tick ([bench measurement](../../docs/BENCH.md#fault-injection-and-timing)).
 `State` has no field for these, so they are RIO-local.
-Each of these lines, and the program's three start lines, begins with
+Each of these lines, and the program's start lines, begins with
 `[<seconds>.<milliseconds>]` on the gateway's steady clock: on the RoboRIO,
 time since its kernel booted, the clock of State's `sample_time_us`, so a
 `hardware_node --log` record of a State places the RIO's lines on the
@@ -656,12 +658,45 @@ both and, at default scheduling, why: `(<file> present)`, `(watchdog holds
 no SCHED_FIFO above 10)` or `(SCHED_FIFO 10 refused, errno <n>)`. Desktop
 simulation keeps default scheduling.
 
+The loop makes none of the Driver Station's NetComm calls. WPILib's refresh
+(`frc::DriverStation::RefreshData`, `HAL_RefreshDSData`) asks NetComm for
+the control word every time, and with no Driver Station attached that is a
+synchronous round trip to `FRC_NetCommDaemon` (`SCHED_OTHER`), serialized
+with every other thread's NetComm call; the mode report
+(`HAL_ObserveUserProgram*`) is a NetComm call too. A reader thread,
+`talos-ds` (`src/main/include/DriverStationReader.h`), makes them instead,
+at `SCHED_FIFO` 5 on the RoboRIO (`kDriverStationPriority` in `Robot.cpp`,
+below the loop and above every default-scheduled thread, with
+`SCHED_RESET_ON_FORK`; default scheduling under desktop simulation). It
+waits for WPILib's new-data event, which NetComm's own thread sets on each
+Driver Station packet, or 20 ms without one; refreshes WPILib's cache; and
+publishes the control word's flags with the refresh's completion time in one
+atomic word. After each refresh, while the loop's last tick is at most 20 ms
+old, it reports the program's mode, so a stalled loop still stops the
+reports. Each tick the loop reads that word (no lock, no WPILib call) and
+takes its flags for the gateway's enable, the mode generation and the Driver
+Station packet, whose other fields it copies from WPILib's cache (the HAL's
+getters copy under the HAL's own mutex and call no NetComm). Once the last
+completed refresh is `command_timeout_us` old (the gateway's, the default
+Config's 100 ms before a configuration), the loop reads no Driver Station:
+flags 0, no mode, disabled. A daemon that does not answer, or a starved
+reader, therefore disables the gateway within `command_timeout_us` plus one
+tick of the last refresh that completed, and the mode the loop reads when
+refreshes resume starts a new mode generation. The reader's start line,
+`driver station reader SCHED_FIFO 5` (or `... (SCHED_FIFO 5 refused, errno
+<n>)`), gives what the kernel holds. A program stop waits at most 100 ms for
+the reader and then abandons it in its call, with the line `driver station
+reader did not stop within 100 ms (...); it was abandoned`. The loop's one
+remaining NetComm library call is the health phase's RoboRIO CAN status read
+(`frc::RobotController::GetCANStatus`, `HAL_CAN_GetCANStatus`).
+
 A tick that ends by its deadline sleeps to it, so the loop keeps its phase.
 One that ends past it (an overrun, or a wake more than a period late) drops
 the missed ticks instead of running them back to back, sleeps 500 µs and
 counts the next period from there, so the phase moves
 (`src/main/include/LoopSchedule.h`). Whenever it runs, the loop takes the
-CPU from every thread on its core below `SCHED_FIFO` 10: the logger, the
+CPU from every thread on its core below `SCHED_FIFO` 10: the Driver Station
+reader (`SCHED_FIFO` 5), the logger, the
 companion reporter and the config saver (nice 19), ssh, the program's CAN threads (`can_psend`,
 `can_recv`), netcomm, and the three `SCHED_RR` threads. The 500 µs bounds
 the share a loop that overruns every tick takes; a loop whose work is just
@@ -715,14 +750,15 @@ Build without deploying:
 ```sh
 cd 2026-robot/controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
 against `PhoenixBackend` with Phoenix sim state. The RoboRIO program derives
 from `frc::RobotBase`, not `frc::TimedRobot`, and runs its own fixed-rate
-loop. It refreshes and forwards Driver Station data and reports the mode it
-is running in, which the Driver Station displays; whether the Driver Station
+loop. Its Driver Station reader refreshes the Driver Station data the loop
+forwards and reports the mode the program is running in, which the Driver
+Station displays; whether the Driver Station
 disables the robot when those reports stop is unverified (the loop stall
 check in [BENCH.md](../../docs/BENCH.md#fault-injection-and-timing)), and
 the loop watchdog does not rely on it.
