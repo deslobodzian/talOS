@@ -73,6 +73,34 @@ class SimCheckHangTest(unittest.TestCase):
         self.assertEqual(sim_check.session_processes(launch.sid), set(),
                          f"left running of {sorted(pids)}")
 
+    # REQ-DEV-30
+    def test_a_check_that_raises_leaves_no_process(self):
+        # The launch has no duration of its own that would end it: whatever
+        # goes wrong while the check waits, leaving the `with` stops it.
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        with tempfile.TemporaryFile() as output:
+            with self.assertRaisesRegex(RuntimeError, "the wait broke"):
+                with sim_check.Launch(
+                        [sys.executable, "-c", STAND_IN, str(write_fd)],
+                        output, pass_fds=(write_fd,)) as launch:
+                    os.close(write_fd)
+                    self.addCleanup(lambda: kill_all(
+                        sim_check.session_processes(launch.sid)))
+                    ready, _, _ = select.select([read_fd], [], [],
+                                                READY_TIMEOUT_S)
+                    self.assertTrue(ready, "no pids from the stand-in")
+                    pids = {int(p) for p in os.read(read_fd, 4096).split()}
+                    self.assertEqual(
+                        sim_check.session_processes(launch.sid), pids)
+                    # The stand-in ignores SIGINT and SIGTERM: do not wait
+                    # the real bounds for them.
+                    launch.finish = lambda finish=launch.finish: finish(
+                        stop_wait_s=0, exit_wait_s=0)
+                    raise RuntimeError("the wait broke")
+        self.assertEqual(sim_check.session_processes(launch.sid), set(),
+                         f"left running of {sorted(pids)}")
+
 
 if __name__ == "__main__":
     unittest.main()
