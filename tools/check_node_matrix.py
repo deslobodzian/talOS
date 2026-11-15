@@ -33,7 +33,9 @@ Comments in the test file, each on its own line (`//` in C++, `#` in Python):
   this file's `talos.parity` scenario runs the Python node through the
   named steps, compared with the C++ node. It is accepted only when this
   file calls `assert_same_behaviour`, the C++ file has the case as a test,
-  and each step is a name in this file's scenario table (`("<step>",`).
+  and each step names a step of the scenario that call runs (a list
+  literal, or a module-level name assigned one, read with `ast`). Whether
+  that step exercises the case is for review.
   Several lines may claim one case; their steps add up. Cases 9 and 12
   cannot be claimed: a parity run compares neither construction nor
   allocation. A claim that does not hold fails, naming the case.
@@ -51,6 +53,7 @@ the baseline only shrinks. CI runs it this way.
 """
 
 import argparse
+import ast
 import os
 import re
 import sys
@@ -123,8 +126,6 @@ PARITY = re.compile(r"^[ \t]*#[ \t]*matrix:[ \t]*parity\b(.*)$",
 PARITY_CLAIM = re.compile(
     r"^[ \t]+(\d+)[ \t]+([\w./-]+\.cc)[ \t]+"
     r"(\"[^\"]+\"(?:[ \t]*,[ \t]*\"[^\"]+\")*)[ \t]*$")
-PARITY_RUN = re.compile(r"^[ \t]*(?:[\w.]+\.)?assert_same_behaviour\(",
-                        re.MULTILINE)
 # A parity run compares ticks, not a constructor or an allocation count.
 NOT_PARITY = {9: "construction", 12: "allocation"}
 CC_TEST = re.compile(r"^\s*TEST(?:_F|_P)?\(\s*\w+\s*,\s*(\w+)\s*\)",
@@ -162,11 +163,52 @@ def infer_role(sources):
     return "observer"
 
 
+def scenario_steps(text):
+    """The step names of the scenarios `text` passes to
+    assert_same_behaviour (its fifth argument or `scenario=`): a list
+    literal there, or a module-level name last assigned one. None when the
+    file has no such call. Raises MatrixError when a call's scenario is not
+    such a literal, since its steps cannot then be read."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as error:
+        raise MatrixError(f"matrix: parity: cannot parse the file: {error}")
+    assigned = {}
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            for name in statement.targets:
+                if isinstance(name, ast.Name):
+                    assigned[name.id] = statement.value
+    steps = None
+    for call in ast.walk(tree):
+        if not (isinstance(call, ast.Call) and getattr(
+                call.func, "attr", getattr(call.func, "id", None))
+                == "assert_same_behaviour"):
+            continue
+        scenario = next((k.value for k in call.keywords
+                         if k.arg == "scenario"),
+                        call.args[4] if len(call.args) > 4 else None)
+        if isinstance(scenario, ast.Name):
+            scenario = assigned.get(scenario.id)
+        if not isinstance(scenario, (ast.List, ast.Tuple)):
+            raise MatrixError(
+                f"matrix: parity: line {call.lineno}: the scenario passed to "
+                f"assert_same_behaviour is not a list literal or a "
+                f"module-level name assigned one")
+        steps = steps or set()
+        steps.update(step.elts[0].value for step in scenario.elts
+                     if isinstance(step, ast.Tuple) and step.elts
+                     and isinstance(step.elts[0], ast.Constant)
+                     and isinstance(step.elts[0].value, str))
+    return steps
+
+
 def parity_claims(text, role, sibling):
     """{case: detail} from a Python test's `matrix: parity` comments, each
     checked; `sibling(name)` is the text of a file beside the test, or None.
     Raises MatrixError naming the case of a claim that does not hold."""
     claims = {}
+    steps_run = None
     for match in PARITY.finditer(text):
         claim = PARITY_CLAIM.match(match.group(1))
         if not claim:
@@ -181,7 +223,9 @@ def parity_claims(text, role, sibling):
         if case not in CASES[role]:
             raise MatrixError(f"matrix: parity {case}: not a case of the "
                               f"{role} role")
-        if not PARITY_RUN.search(text):
+        if steps_run is None:
+            steps_run = scenario_steps(text)
+        if steps_run is None:
             raise MatrixError(f"matrix: parity {case}: the file runs no "
                               f"talos.parity assert_same_behaviour")
         cc_text = sibling(cc_file)
@@ -193,9 +237,10 @@ def parity_claims(text, role, sibling):
             raise MatrixError(f"matrix: parity {case}: {cc_file} has no "
                               f"test {name}")
         for step in steps:
-            if not re.search(rf'\(\s*"{re.escape(step)}"\s*,', text):
-                raise MatrixError(f"matrix: parity {case}: no scenario step "
-                                  f"{step!r}")
+            if step not in steps_run:
+                raise MatrixError(f"matrix: parity {case}: no step {step!r} "
+                                  f"in the scenario assert_same_behaviour "
+                                  f"runs")
         claims.setdefault(case, (f"{cc_file} {name}", []))[1].extend(steps)
     return {case: f"{test}; steps " + ", ".join(repr(s) for s in steps)
             for case, (test, steps) in claims.items()}

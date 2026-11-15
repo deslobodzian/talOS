@@ -126,6 +126,7 @@ class CheckNodeMatrixTest(unittest.TestCase):
         # naming the case, so a case cannot be dropped by a bare comment.
         cpp = "TEST_F(ArmTest, StaleLaneGoesNeutral) {}\n"
         run = ('SCENARIO = [\n    ("stale lane", wait(0.2)),\n]\n'
+               "def test_parity():\n"
                "    parity.assert_same_behaviour(Cpp, Py, CONFIG, \"arm\",\n"
                "                                 SCENARIO)\n")
         claim = '# matrix: parity 3 node_test.cc "stale lane"\n'
@@ -137,13 +138,20 @@ class CheckNodeMatrixTest(unittest.TestCase):
             claim + run, "py", "actuator", sibling({"node_test.cc": cpp}))
         self.assertEqual(result[3][0], "parity")
         for why, text, files in (
-                ("no parity run", claim + run.split("    parity.")[0],
+                ("no parity run", claim + run.split("def test_parity")[0],
                  {"node_test.cc": cpp}),
                 ("C++ file lacks the case", claim + run,
                  {"node_test.cc": "TEST_F(ArmTest, Other) {}\n"}),
                 ("no C++ file", claim + run, {}),
                 ("missing step",
                  claim.replace("stale lane", "stale target") + run,
+                 {"node_test.cc": cpp}),
+                # The step is a tuple in the file, but not in the scenario
+                # the parity run is given.
+                ("step outside the scenario",
+                 claim.replace("stale lane", "stale target") + run
+                 + 'UNUSED = [("stale target", wait(0.2))]\n'
+                 + 'check(("stale target", 1))\n',
                  {"node_test.cc": cpp}),
                 ("construction cannot be compared",
                  claim.replace("parity 3", "parity 9") + run,

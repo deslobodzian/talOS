@@ -253,8 +253,9 @@ Python test runs one scenario through `talos.parity` against both
 `# matrix: parity <case> <C++ test file> "<step>"[, "<step>"]` instead of
 repeating the test. The lint accepts a claim only when the file calls
 `assert_same_behaviour`, the C++ file has that case as a test, and every
-named step is in the file's scenario table; the scenario includes a Driver
-Station mode change (teleop, disabled, autonomous, teleop) with targets
+named step is a step of the scenario that call is given. Whether a named
+step exercises its case the lint cannot check: that is a review item
+**[review]**. The scenario includes a Driver Station mode change (teleop, disabled, autonomous, teleop) with targets
 stamped under each earlier generation. Cases 9 and 12 cannot be claimed (a
 parity run compares no construction and no allocation), so construction
 and anything only the Python node does keep their own Python tests.
