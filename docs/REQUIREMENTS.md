@@ -253,6 +253,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-28 | When an estimate differs from the previous one by more than its velocity explains plus `replan_step_m` or `replan_step_rad`, the drive action replans from it on that tick without releasing its lane. | P1 | R26 "Nodes" | `/drivetrain/target/auto` envelope and target on that tick | component |
 | REQ-DEV-29 | A build that uses talOS as a dependency compiles talOS's patched toml++; the consuming repository carries no override or patch file for it. | P1 | `MODULE.bazel`; TODO REPO-1 | the dependent repository's `MODULE.bazel`; `@talos//talOS/configuration:config_fuzz_test` built there | integration |
 | REQ-DEV-30 | A robot repository that names talOS only through `@talos//` labels and pins it with `local_path_override` passes its own `bazel test //...` (its graph test and node tests), builds its bundle, and runs `bazel run //:sim` for a bounded time with exit 0, every member of the session having run and exited 0. | P1 | ARCH "Where a new thing goes" | fixture test results; session manifest | integration |
+| REQ-DEV-31 | `//talOS/simulation:sim_gateway` stands in for the RoboRIO for any robot config. Its devices come only from the config's hardware. It listens on `[robot] controller_port` and sends to `[robot] local_port`, or the ports the launcher was given (`--remote-port`/`--local-port`), with no port argument written by hand. | P1 | ARCH "Two processors" | ports used; State received | component |
 
 ## Package scope
 
