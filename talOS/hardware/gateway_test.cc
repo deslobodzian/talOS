@@ -674,6 +674,24 @@ TEST(Config, StatusRateBelowFourPerTimeoutIsRefused) {
     EXPECT_NE(message.find("command_timeout_us"), std::string::npos) << message;
   }
 }
+
+// A command timeout above half a second would let a stalled node or a lost
+// link keep a motor driving that long: 500000 us loads, one more is refused
+// naming the key.
+// REQ-SAFE-26
+TEST(Config, CommandTimeoutAboveHalfASecondIsRefused) {
+  auto c = SwerveConfig(true);
+  c.command_timeout_us = 500000;
+  EXPECT_NO_THROW(Validate(c));
+  c.command_timeout_us = 500001;
+  try {
+    Validate(c);
+    ADD_FAILURE() << "command_timeout_us 500001 loaded";
+  } catch (const std::invalid_argument& error) {
+    const std::string message = error.what();
+    EXPECT_NE(message.find("command_timeout_us"), std::string::npos) << message;
+  }
+}
 // One device of every kind, every motor setting class (follower, remote
 // CANcoder, soft and switch limits, three gain slots) off its default, and
 // the main-processor-only motor settings, which never reach the wire, set.
