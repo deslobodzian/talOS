@@ -223,7 +223,7 @@ void NoReport(std::string_view line) { ADD_FAILURE() << line; }
 // helper stopped mid-snapshot (B's flags and first axis written, a NetComm
 // call that has not returned), the loop's Read returns at once with the last
 // whole snapshot, A; once the helper finishes, B whole.
-// REQ-SAFE-13, REQ-RT-13
+// REQ-SAFE-13, REQ-RT-13, REQ-RT-24
 TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
@@ -342,6 +342,7 @@ TEST(DriverStationReader, AViewNotRefreshedWithinTheTimeoutHasNoDriverStation) {
 // loop's last Read is at most 20 ms old, so a stalled loop stops the reports,
 // as it did when the loop made them; and it reports the mode of the flags it
 // just refreshed.
+// REQ-RT-24
 TEST(DriverStationReader, ReportsTheModeOnlyWhileTheLoopTicks) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
