@@ -163,8 +163,8 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   where it was scrolled (only a widget whose text changed is replaced, and
   its replacement takes the old scroll position), and the list's heading
   says how many rows are out of view, `3 above` or `+4 below`, measured in
-  the page after each draw; a heading's session label ellipsizes before the
-  heading does. No text is under 12 px. The box sizes are `METRICS` in
+  the page after each draw; a heading's session label ellipsizes and the
+  heading itself never shrinks. No text is under 12 px. The box sizes are `METRICS` in
   `view.ts`, written on the page as the `--drive-*` properties `drive.css`
   reads; `listRowsFit` computes from them that the 2026 layout's subsystems
   cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720

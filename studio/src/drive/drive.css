@@ -151,9 +151,11 @@ html, body {
   overflow: hidden;
 }
 
-/* The heading gives way last: a long session label in it ellipsizes first. */
+/* The heading never shrinks: a long session label beside it ellipsizes
+   instead. (A shrink factor of 1 against the label's 1000 still took a
+   fraction of a pixel from the heading, enough to cut its last letter.) */
 .w h2 {
-  flex: 1 1 auto;
+  flex: 1 0 auto;
   margin: 0;
   font-size: 15px;
   font-weight: 600;
