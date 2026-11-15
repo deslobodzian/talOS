@@ -317,6 +317,8 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     return false;
   };
   config_ = c;
+  refresh_signals_.clear();
+  refresh_group_count_ = 0;
   signals_.clear();
   motors_.clear();
   sensors_.clear();
@@ -484,6 +486,7 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
     motors_.push_back(std::move(motor));
   }
+  GroupSignalsByNetwork(c);
 
   if (is_simulation_) {
     for (auto& motor : motors_) {
@@ -591,6 +594,34 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   // Structural validity succeeded; unavailable devices are isolated and
   // retried.
   return true;
+}
+
+void PhoenixBackend::GroupSignalsByNetwork(const hw::Config& c) {
+  // Phoenix 6's BaseStatusSignal::RefreshAll (StatusSignal.hpp) "\return
+  // InvalidNetwork if signals are on different CAN bus networks", and then
+  // refreshes none of them. Each bus a device names is its own network, so
+  // the signals are reordered bus by bus (hw::CanBuses order) and Read
+  // refreshes each bus's span with one call. Allocates here, never in Read.
+  const auto bus_of = [&c](uint16_t id) -> std::string_view {
+    for (const auto& m : c.motors)
+      if (m.id == id) return m.bus;
+    for (const auto& s : c.sensors)
+      if (s.id == id) return s.bus;
+    return {};
+  };
+  refresh_signals_.clear();
+  refresh_signals_.reserve(signals_.size());
+  refresh_group_count_ = 0;
+  const hw::CanBusList buses = hw::CanBuses(c);
+  for (std::size_t b = 0; b < buses.count; ++b) {
+    const std::size_t begin = refresh_signals_.size();
+    for (std::size_t i = 0; i < signals_.size(); ++i)
+      if (bus_of(signal_ids_[i]) == buses.names[b])
+        refresh_signals_.push_back(signals_[i]);
+    if (refresh_signals_.size() > begin)
+      refresh_groups_[refresh_group_count_++] = {
+          begin, refresh_signals_.size() - begin};
+  }
 }
 
 bool PhoenixBackend::PollDeviceResets(std::vector<uint16_t>& reset_ids) {
@@ -711,8 +742,14 @@ bool PhoenixBackend::Read(hw::State& s) {
     log_->AddPhase(TickPhase::kOther, simulated_ns - refresh_start_ns);
     refresh_start_ns = simulated_ns;
   }
-  ph::BaseStatusSignal::RefreshAll(
-      false, std::span<ph::BaseStatusSignal* const>{signals_});
+  // One RefreshAll per CAN network: Phoenix refreshes nothing for a call
+  // whose signals span two (GroupSignalsByNetwork).
+  for (std::size_t g = 0; g < refresh_group_count_; ++g) {
+    const RefreshGroup& group = refresh_groups_[g];
+    ph::BaseStatusSignal::RefreshAll(
+        false, std::span<ph::BaseStatusSignal* const>{
+                   refresh_signals_.data() + group.begin, group.count});
+  }
   const uint64_t devices_start_ns = NowNs();
   log_->AddPhase(TickPhase::kRefresh, devices_start_ns - refresh_start_ns);
   bool healthy = motors_.empty() && sensors_.empty();

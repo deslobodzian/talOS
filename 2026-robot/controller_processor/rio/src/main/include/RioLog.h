@@ -46,7 +46,7 @@ namespace talos::rio {
 // (BeginTick, ClosePhase), less the backend's phases nested inside them, so
 // a tick's phases sum to its work, wake to sleep, as RecordTick receives it.
 enum class TickPhase : uint8_t {
-  kRefresh,  // BaseStatusSignal::RefreshAll over every device signal
+  kRefresh,  // BaseStatusSignal::RefreshAll, one per CAN network
   kDevices,  // per-device validity, latency and reset (HasResetOccurred) pass
   kControl,  // TalonFX SetControl for every motor (Apply or Neutral)
   kHealth,   // CAN status, battery voltage, brownout

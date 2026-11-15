@@ -222,7 +222,10 @@ The backend then calls
 `OptimizeBusUtilization()` on each TalonFX, CANcoder, and Pigeon2. Per-device
 optimization keeps the explicitly selected signals while stopping unused
 default frames; it does not replace measuring the real bus. Reads refresh the
-cached signals non-blockingly. One-shot control requests are refreshed by the
+cached signals non-blockingly, with one `BaseStatusSignal::RefreshAll` per
+CAN bus: Phoenix refreshes none of the signals of a call that spans two
+networks (it returns `InvalidNetwork`), so the backend groups the signals by
+bus when it configures. One-shot control requests are refreshed by the
 bridge heartbeat (at most 20 ms), not on every gateway tick.
 Outside pending asynchronous configuration, neutral refresh remains every
 gateway tick whenever no accepted command is active: disabled, faulted,
@@ -571,12 +574,11 @@ prints where those ticks' work went:
 [rio] tick phases: refresh mean/max <a>/<b> us, devices <a>/<b> us, control <a>/<b> us, health <a>/<b> us, other <a>/<b> us, link <a>/<b> us, driver station <a>/<b> us, loop <a>/<b> us over <n> ticks (motors=<m> sensors=<s>)
 ```
 
-per tick, the mean and longest time in `BaseStatusSignal::RefreshAll`
-(refresh), the per-device validity, latency and `HasResetOccurred` pass
+per tick, the mean and longest time in `BaseStatusSignal::RefreshAll`, one
+call per CAN bus (refresh), the per-device validity, latency and `HasResetOccurred` pass
 (devices), TalonFX `SetControl` for every motor, whether a command's or
-neutral (control), the RoboRIO bus's CAN status read, the copy of the
-CANivore figures `talos-canbus` published (never a CANivore read) and the
-battery reads (health), and the rest
+neutral (control), the copy of the CAN bus figures `talos-canbus`
+published (never a CAN status read) and the battery reads (health), and the rest
 of the backend's tick calls (other); and the loop's own: the socket retry,
 the endpoint's tick (receive, the gateway's command and State work, the
 State send; with no socket open, the gateway's tick) and the Driver Station
