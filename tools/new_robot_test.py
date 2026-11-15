@@ -95,11 +95,12 @@ def generate(work, mechanism, lang, kind="velocity"):
     return can_id
 
 
-def append_simulation_block(work, mechanism, kind):
-    """Appends `mechanism`'s simulation block to the robot's simulation
-    config, as its `Next:` says."""
+def append_simulation_block(work, mechanism, kind,
+                            button=new_subsystem.TELEOP_BUTTONS[0]):
+    """Appends `mechanism`'s simulation block, binding `button`, to the
+    robot's simulation config, as its `Next:` says."""
     with open(os.path.join(work, SIM_CONFIG), "a", encoding="utf-8") as f:
-        f.write(new_subsystem.simulation_block(mechanism, kind))
+        f.write(new_subsystem.simulation_block(mechanism, kind, button))
 
 
 def describe(work, launcher, env, out, config=CONFIG):

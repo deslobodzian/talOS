@@ -1,9 +1,11 @@
 """e2e: a robot scaffolded with a C++ velocity mechanism (gripper) and a
 position mechanism (position_cpp), edited exactly as their `Next:` output
 says and run the way it says (the launcher with sim_gateway --physics and
-its mode and joystick schedules, as `./sim.sh --sim-gateway` starts them),
-moves each motor to the goal its teleop binding holds while button 3 is
-held, the position mechanism after homing on its simulated home switch.
+its mode schedule, as `./sim.sh --sim-gateway` starts them), moves each
+motor to the goal its teleop binding holds while the button its `Next:`
+names is held, the position mechanism after homing on its simulated home
+switch. The joystick schedule holds each mechanism's button in turn, so it
+also shows that position_cpp's button does not move the gripper.
 The node binaries are new_subsystem's goldens, which
 new_subsystem_test keeps equal to its output."""
 
@@ -21,7 +23,8 @@ from tools import new_robot_test as harness
 from tools import new_subsystem
 from tools import sync_manifest
 
-MECHANISMS = (("gripper", "velocity"), ("position_cpp", "position"))
+# position_cpp first: the gripper's check uses when it reached its goal.
+MECHANISMS = (("position_cpp", "position"), ("gripper", "velocity"))
 
 # talOS/introspection/registry.h kRegistryPath. The launcher creates the
 # registry and deliberately leaves it for later sessions, so the test
@@ -62,8 +65,13 @@ def udp_ports():
 
 def scaffold(work):
     """The robot new_robot writes with the gripper, plus position_cpp from
-    new_subsystem, with their node binaries standing in for a build."""
+    new_subsystem, with their node binaries standing in for a build; returns
+    each mechanism's button, teleop_button's choice before its scaffold (the
+    one its `Next:` prints)."""
+    buttons = {}
     harness.generate(work, "gripper", "cpp")
+    buttons["gripper"] = new_subsystem.TELEOP_BUTTONS[0]  # a new robot's
+    buttons["position_cpp"] = new_subsystem.teleop_button(work, "my_robot")
     writes, _ = new_subsystem.plan(work, "my_robot", "position_cpp", "cpp",
                                    "position")
     for path, _, content in writes:
@@ -71,14 +79,28 @@ def scaffold(work):
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
     harness.stand_in_binary(work, "position_cpp", "cpp")
+    return buttons
 
 
-def follow_next(work):
+def follow_next(work, buttons):
     """Appends each mechanism's simulation block to the simulation config,
     as its `Next:` says; returns that config, the one `Next:` runs."""
     for mechanism, kind in MECHANISMS:
-        harness.append_simulation_block(work, mechanism, kind)
+        harness.append_simulation_block(work, mechanism, kind,
+                                        buttons[mechanism])
     return harness.SIM_CONFIG
+
+
+# Each mechanism's `Next:` holds its own button from second 3 to 6
+# (new_subsystem.joystick_schedule). Run together, position_cpp's is held
+# over those seconds, its time to home and reach its goal, then only the
+# gripper's to the end of the run.
+def joystick_schedule(buttons):
+    def held(mechanism):
+        return f"axes=0;buttons={1 << (buttons[mechanism] - 1)};pov=-1"
+    return (f"0:axes=0;buttons=0;pov=-1|3:{held('position_cpp')}"
+            f"|6:{held('gripper')}"
+            f"|{new_subsystem.SIM_DURATION_S}:axes=0;buttons=0;pov=-1")
 
 
 def states(log_dump, session, mechanism):
@@ -101,14 +123,16 @@ def states(log_dump, session, mechanism):
 
 
 class ScaffoldSimTest(unittest.TestCase):
-    # REQ-DEV-23
+    # REQ-DEV-01, REQ-DEV-23
     def test_next_steps_move_each_mechanism_to_its_goal(self):
         r = runfiles.Create()
         log_dump = r.Rlocation("_main/talOS/launcher/log_dump")
         with tempfile.TemporaryDirectory() as tmp:
             work, launcher, env = harness.workspace(tmp)
-            scaffold(work)
-            config = follow_next(work)
+            buttons = scaffold(work)
+            # Two mechanisms on one press is what teleop_button prevents.
+            self.assertNotEqual(buttons["gripper"], buttons["position_cpp"])
+            config = follow_next(work, buttons)
             subsystems, _ = sync_manifest.effective(work, config)
 
             gateway_port, bridge_port = udp_ports()
@@ -124,7 +148,7 @@ class ScaffoldSimTest(unittest.TestCase):
                 "--physics", "--port", str(gateway_port), "--remote-port",
                 str(bridge_port), "--mode-schedule",
                 new_subsystem.MODE_SCHEDULE, "--joystick-schedule",
-                new_subsystem.JOYSTICK_SCHEDULE]
+                joystick_schedule(buttons)]
             args = [launcher, "--config", config, "--sim",
                     "--start-sim-gateway"]
             for arg in gateway_args:
@@ -147,11 +171,12 @@ class ScaffoldSimTest(unittest.TestCase):
             (session,) = os.listdir(output)
             session = os.path.join(output, session)
 
+            reached = []  # when position_cpp first reached its goal
             for mechanism, kind in MECHANISMS:
                 with self.subTest(mechanism=mechanism):
                     (binding,) = subsystems[mechanism]["teleop"]["bindings"]
-                    driven = [fields for _, fields in
-                              states(log_dump, session, mechanism)
+                    rows = states(log_dump, session, mechanism)
+                    driven = [fields for _, fields in rows
                               if fields["enabled"] == "true"]
                     self.assertTrue(driven, f"{mechanism} never drove: "
                                     f"{diagnostics}")
@@ -169,6 +194,9 @@ class ScaffoldSimTest(unittest.TestCase):
                             f"{tolerance}: positions "
                             f"{min(positions)}..{max(positions)}, homing "
                             f"{sorted({f['homing'] for f in driven})}")
+                        reached.append(next(
+                            ms for ms, f in rows if f["enabled"] == "true"
+                            and f["at_goal"] == "true"))
                         self.assertLessEqual(
                             abs(float(at_goal[0]["position_rot"]) - goal),
                             tolerance)
@@ -190,6 +218,15 @@ class ScaffoldSimTest(unittest.TestCase):
                         self.assertGreaterEqual(
                             fastest, 0.99 * goal,
                             f"{mechanism} reached {fastest} of {goal} rps")
+                        # It stood still until position_cpp, under
+                        # its own button alone, reached its goal.
+                        (moved,) = reached
+                        before = [abs(float(f["velocity_rps"]))
+                                  for ms, f in rows if ms <= moved]
+                        self.assertLess(
+                            max(before), 0.1 * goal,
+                            f"{mechanism} moved at {max(before)} rps while "
+                            f"only position_cpp's button was held")
 
 
 if __name__ == "__main__":
