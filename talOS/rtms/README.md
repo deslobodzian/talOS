@@ -11,7 +11,12 @@ the event Poller (`CLOCK_MONOTONIC_RAW` on macOS, `CLOCK_MONOTONIC` elsewhere).
 and replay. `read_next()` returns that timestamp as `MessageInfo::publish_time_ns`
 alongside the sequence and dropped-message count. The payload and timestamp are
 copied before the same slot-validity check; an overwritten candidate exposes
-neither its timestamp nor its metadata as an accepted message. A reader the
+neither its timestamp nor its metadata as an accepted message. The copy and an
+overwrite of the same slot by a writer that lapped the reader race by design (a
+seqlock: the copy is discarded unless the check after it passes); that is a
+data race by the C++ memory model, which the thread sanitizer reports when
+writer and reader share one mapping
+([TESTING.md §2](../../docs/TESTING.md#where-a-behaviour-is-tested)). A reader the
 writer laps skips to the oldest message still intact and counts the skipped ones
 as dropped, whatever overflow policy the reader assumed.
 

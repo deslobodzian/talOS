@@ -88,6 +88,39 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "ring_test_payload",
+    testonly = True,
+    hdrs = ["ring_test_payload.h"],
+)
+
+# Writer and reader threads on one mapping, so the thread sanitizer sees the
+# ring's slot accesses as accesses to the same bytes (docs/TESTING.md §2).
+cc_test(
+    name = "ring_handoff_test",
+    size = "small",
+    srcs = ["ring_handoff_test.cc"],
+    deps = [
+        ":ring_test_payload",
+        ":rtms",
+        "//talOS/schema:identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "ring_lap_test",
+    size = "small",
+    srcs = ["ring_lap_test.cc"],
+    tags = ["no_tsan"],  # the lapped copy is a data race by design; tsan reports it
+    deps = [
+        ":ring_test_payload",
+        ":rtms",
+        "//talOS/schema:identity",
+        "@googletest//:gtest_main",
+    ],
+)
+
 # What a publication costs its writer with 0, 1, 8 and 32 reader processes
 # asleep on the topic (README.md "Publish cost"). Run by hand:
 # bazel run -c opt //talOS/rtms:wake_fanout_bench
