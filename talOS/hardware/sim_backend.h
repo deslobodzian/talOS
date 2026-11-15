@@ -9,6 +9,12 @@
 #include "gateway.h"
 
 namespace talos::hardware {
+
+// The supply both simulated backends report at rest: a charged 12 V
+// lead-acid battery's open-circuit voltage, so a healthy simulated robot
+// passes a pre-match battery check. SetPowerHealth and the physics backend's
+// SetSupplyVoltage override it.
+inline constexpr double kSimRestingSupplyV = 12.8;
 // A deterministic ideal-actuator fake for integration tests, not a motor or
 // tire physics model. Real hardware always uses the Phoenix backend.
 class SimBackend final : public Backend {
@@ -203,7 +209,7 @@ class SimBackend final : public Backend {
     double velocity_rps{};
   };
   Config config_;
-  HealthSample health_{true, 12.0, false, 0.0};
+  HealthSample health_{true, kSimRestingSupplyV, false, 0.0};
   uint64_t previous_time_{};
   std::vector<uint16_t> pending_resets_;
   bool restore_fails_{false};

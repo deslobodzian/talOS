@@ -769,9 +769,14 @@ Both implement `Backend`, both share the gateway safe-state policy
 (disable/timeout/failure neutralizes every output type), and both step on the
 explicit `sample_time_us` clock, so Gateway ticks with explicit timestamps are
 exactly reproducible.
-Both publish valid 12 V, no-brownout, zero-CAN-load health by default;
+Both publish valid, no-brownout, zero-CAN-load health resting at a charged
+battery's 12.8 V (`kSimRestingSupplyV`, `sim_backend.h`), so a healthy
+simulated robot passes the pre-match battery check;
 `SetPowerHealth(volts, brownout)` injects low-power telemetry. Physics also uses
-the injected voltage as its motor supply. Health is observable while disabled
+the reported voltage as its motor supply: a duty-cycle demand applies that
+fraction of it (0.5 is 6.4 V at rest), while voltage and closed-loop modes are
+clamped to `max_voltage` (12 V when unset) and the motor models keep their 12 V
+free-speed and stall ratings. Health is observable while disabled
 or without a live command. On the real backend, neutral disables PWM pulses
 (`PWM::SetDisabled`) rather than commanding servo centre, and de-energizes DIO.
 

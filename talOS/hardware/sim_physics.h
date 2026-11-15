@@ -72,6 +72,7 @@
 
 #include "feedback.h"
 #include "gateway.h"
+#include "sim_backend.h"
 
 namespace talos::hardware::sim {
 
@@ -344,7 +345,7 @@ class PhysicsSimBackend final : public Backend {
     pwm_outputs_.clear();
     pending_resets_.clear();
     restoring_.fill(false);
-    supply_v_ = 12.0;
+    supply_v_ = kSimRestingSupplyV;
     yaw_rot_ = 0.0;
     yaw_rate_rps_ = 0.0;
     truth_ = {options_.start_x_m, options_.start_y_m, options_.start_yaw_rad};
@@ -1112,7 +1113,7 @@ class PhysicsSimBackend final : public Backend {
   };
   std::vector<HomeSwitch> home_switches_;
   std::vector<BoundHomeSwitch> bound_home_switches_;
-  double supply_v_{12.0};
+  double supply_v_{kSimRestingSupplyV};
   double yaw_rot_{0.0};
   double yaw_rate_rps_{0.0};
   std::vector<uint16_t> pending_resets_;

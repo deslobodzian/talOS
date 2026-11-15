@@ -195,7 +195,8 @@ inline bool ApplyFaults(std::vector<FaultEvent>& events, double elapsed_s,
         backend.UnfreezeFeedback(event.id);
       }
     } else if (event.kind == FaultKind::kSupply) {
-      backend.SetSupplyVoltage(active ? event.volts : 12.0);
+      backend.SetSupplyVoltage(active ? event.volts
+                                      : talos::hardware::kSimRestingSupplyV);
     } else if (event.kind == FaultKind::kForwardLimit) {
       backend.SetForwardLimitPressed(event.id, active);
     } else if (event.kind == FaultKind::kReverseLimit) {
