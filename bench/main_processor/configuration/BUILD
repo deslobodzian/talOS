@@ -51,6 +51,12 @@ talos_graph_test(
     config = "robot.toml",
     data = CONFIG_FILES,
     nodes = NODES,
+    # Launches a Python node (gyro); ctypes cannot load sanitizer runtimes
+    # in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 talos_graph_test(
@@ -58,6 +64,12 @@ talos_graph_test(
     config = "robot_bench.toml",
     data = BENCH_CONFIG_FILES,
     nodes = BENCH_NODES,
+    # Launches a Python node (gyro); ctypes cannot load sanitizer runtimes
+    # in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
 )
 
 talos_graph_test(
