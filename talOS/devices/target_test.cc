@@ -328,6 +328,7 @@ TEST_F(TargetTest, LaneFromBeforeTheModeChangeIsIgnored) {
   EXPECT_EQ(Seen(), 1.25);
 }
 
+// REQ-SAFE-09
 TEST_F(TargetTest, TargetQueuedBeforeTheModeChangeIsRejectedInTheSameDrain) {
   Hold("teleop", 1.0, 20ms);
   ASSERT_EQ(Seen(), 1.0);
