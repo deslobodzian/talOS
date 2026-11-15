@@ -40,8 +40,9 @@ includes `robot.toml`. Its labels name talOS by `@talos//`. `--config PATH`
 names another robot config (default `robot.toml`, else
 `main_processor/configuration/robot.toml`); `--package-dir DIR` puts the
 package elsewhere. Its `Next:` lists the placeholders to replace (the CAN
-id) and the simulation-only lines that make the mechanism move under
-`bazel run //:sim`.
+id) and simulation-only lines for a `robot_sim.toml`. This fixture's
+`//:sim` runs `robot.toml`, not that file, and no `manifest_sync_test`
+checks it, so here those lines do not make the mechanism move.
 
 ## Simulation
 
