@@ -22,6 +22,8 @@ cc_library(
     ],
     include_prefix = "autonomous",
     strip_include_prefix = ".",
+    # The closed-loop test runs autonomous with the real drivetrain.
+    visibility = ["//2026-robot/main_processor/integration:__pkg__"],
     deps = [
         ":messages",
         "//2026-robot/main_processor/drivetrain:messages",
@@ -42,32 +44,6 @@ talos_cc_node(
     srcs = ["autonomous.cc"],
     node_name = "autonomous",
     deps = [":autonomous"],
-)
-
-# The drive action against the real drivetrain node on the robot config,
-# with the test playing the pose estimator (closed_loop_test.cc).
-cc_test(
-    name = "closed_loop_test",
-    size = "small",
-    srcs = ["closed_loop_test.cc"],
-    data = [
-        "//2026-robot/main_processor/configuration:robot.toml",
-        "//2026-robot/main_processor/configuration:robot_config",
-    ],
-    env = {
-        "TALOS_TEST_CONFIG": "$(rlocationpath //2026-robot/main_processor/configuration:robot.toml)",
-    },
-    deps = [
-        ":autonomous",
-        "//2026-robot/main_processor/drivetrain",
-        "//talOS/configuration",
-        "//talOS/devices:testing",
-        "//talOS/geometry",
-        "//talOS/node:testing",
-        "//talOS/trajectory",
-        "@googletest//:gtest_main",
-        "@rules_cc//cc/runfiles",
-    ],
 )
 
 cc_test(

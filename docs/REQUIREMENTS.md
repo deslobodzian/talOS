@@ -287,6 +287,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/main_processor/{shooter,drivetrain,intake}` | REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-SAFE-31, REQ-SAFE-32 (intake), REQ-CONTRACT-25 |
 | `2026-robot/main_processor/driver` | REQ-SAFE-14, REQ-SAFE-31 |
 | `2026-robot/main_processor/autonomous` | REQ-SAFE-31, REQ-SAFE-33, REQ-SAFE-34, REQ-DEV-27, REQ-DEV-28 |
+| `2026-robot/main_processor/integration` | composition evidence: autonomous with the drivetrain for REQ-DEV-27, REQ-DEV-28, REQ-SAFE-34; the teleop chain for REQ-SAFE-14, REQ-RT-06 |
 | `2026-robot/main_processor/pose_estimator` | REQ-CONTRACT-26; its second backend: none beyond it (TODO.md SCOPE-1) |
 | `2026-robot/main_processor/vision` | REQ-CONTRACT-27 |
 | `2026-robot/main_processor/simulation` | REQ-DEV-05, REQ-DEV-06; composition evidence for REQ-SAFE-31, REQ-SAFE-33 |

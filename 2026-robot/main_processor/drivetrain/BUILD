@@ -42,12 +42,9 @@ cc_library(
     hdrs = ["drivetrain.h"],
     include_prefix = "drivetrain",
     strip_include_prefix = ".",
-    # The driver's teleop-chain test and autonomous's closed-loop test run
-    # the real drivetrain.
-    visibility = [
-        "//2026-robot/main_processor/autonomous:__pkg__",
-        "//2026-robot/main_processor/driver:__pkg__",
-    ],
+    # The teleop chain and autonomous closed-loop tests run the real
+    # drivetrain.
+    visibility = ["//2026-robot/main_processor/integration:__pkg__"],
     deps = [
         ":messages",
         ":swerve",

@@ -4,8 +4,8 @@
 // motors. The test plays the pose estimator: it integrates the chassis
 // motion /drivetrain/state measures into the true pose, and publishes that
 // pose (plus any correction a case injects) on /pose_estimator/state at the
-// estimator's 20 ms period, with the measured velocity.
-// matrix: n/a 1, 2, 6, 9, 11, 12 (the node's matrix is in node_test.cc)
+// estimator's 20 ms period, with the measured velocity. The autonomous node's
+// test matrix is in autonomous/node_test.cc.
 
 #include <gtest/gtest.h>
 
