@@ -263,7 +263,7 @@ Actuator flush and disable semantics are in
 
 ### Mechanism building blocks
 
-Before writing a mechanism's control by hand, check
+A node may drive its `Motor` directly, or use an optional block from
 [talOS/mechanisms](../talOS/mechanisms/README.md): `PositionMechanism`
 (elevator, arm, hood, wrist, turret: motion magic, soft limits, gravity
 feedforward, limit-switch, stall or CANcoder homing, wrap, at-goal debounce,
