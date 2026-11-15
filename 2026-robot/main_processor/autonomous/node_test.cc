@@ -609,6 +609,20 @@ TEST_F(AutonomousTest, UnplannablePoseReleasesTheDriveLane) {
   Pose();
   sim.step(20ms);
   EXPECT_TRUE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  // A finite pose far off the field, while following: released on its
+  // first tick (the drivetrain then goes neutral: ReleasedLaneGoesNeutral),
+  // and the DRIVE deadline (drive_timeout_s, 10 s) still ends in ABORTED.
+  Pose(-1.5e308, -1.5e308, 0);
+  sim.step(20ms);
+  EXPECT_EQ(Phase(), autonomous::Phase::DRIVE);
+  EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  for (int i = 0; i < 500 && Phase() == autonomous::Phase::DRIVE; ++i) {
+    Pose(-1.5e308, -1.5e308, 0);
+    sim.step(20ms);
+    EXPECT_FALSE(Lane<drivetrain::ChassisTarget>("drivetrain").active);
+  }
+  EXPECT_EQ(Phase(), autonomous::Phase::ABORTED);
+  ExpectReleased();
 }
 
 // Node test matrix (docs/TESTING.md §7), producer: cases 1, 2, 6 and 12 under
