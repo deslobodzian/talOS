@@ -4,12 +4,32 @@ A process group is named by its leader's pid, which the kernel can hand to a
 new process once the leader is reaped and the group is empty. So `Child`
 signals its group only while the leader is unreaped (running, or a zombie
 this process has not waited for), checks for an exit without reaping it
-(waitid with WNOWAIT), and records the reap: after `reap()` every
-`signal_group` is a no-op, whatever the caller does twice.
+(waitid with WNOWAIT; on macOS, whose Python has no os.waitid, a kqueue
+NOTE_EXIT registration, which an exited, unreaped child answers at once),
+and records the reap: after `reap()` every `signal_group` is a no-op,
+whatever the caller does twice.
 """
 
 import os
+import select
 import subprocess
+
+
+def _exited_unreaped(pid):
+    """Whether child `pid` exited, without reaping it."""
+    if hasattr(os, "waitid"):
+        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        return info is not None and info.si_pid == pid
+    kq = select.kqueue()
+    try:
+        event = select.kevent(pid, select.KQ_FILTER_PROC,
+                              select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)
+        try:
+            return bool(kq.control([event], 1, 0))
+        except ProcessLookupError:
+            return True  # an unreaped child's pid is never reused: it exited
+    finally:
+        kq.close()
 
 
 class Child:
@@ -29,8 +49,7 @@ class Child:
         the group's, cannot be reused yet)."""
         if self.reaped:
             return True
-        info = os.waitid(os.P_PID, self.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        return info is not None and info.si_pid == self.pid
+        return _exited_unreaped(self.pid)
 
     def signal_group(self, sig):
         """Signals the group; False once reaped, when it signals nothing."""
