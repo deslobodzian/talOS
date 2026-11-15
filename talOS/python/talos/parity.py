@@ -6,10 +6,13 @@ assert_same_behaviour runs each on its own talos.testing.Sim with
 SimHardware, plays the same scenario on both, and after every step compares
 the newest message of each listed topic byte for byte and each listed
 output, requested and applied. The first step that differs raises
-AssertionError naming the step and both values, decoded.
+AssertionError naming the step and both values, decoded; a topic one side
+has published and the other has not differs. A step that holds
+require_published() also fails when either side has no message on those
+topics after it.
 
     SCENARIO = [
-        ("disabled", parity.wait(0.05)),
+        ("disabled", parity.wait(0.05), parity.require_published()),
         ("enabled", parity.gateway(True),
                     parity.driver_station(enabled=True, teleop=True,
                                           then=0.05)),
@@ -110,6 +113,17 @@ def lose_states(count, then=0.0):
     return _then(lambda rig: rig.hw.lose_states(count), then)
 
 
+class require_published:
+    """A step marker: after this step each of `topics` (every listed topic
+    when none is named) must have a message on both sides."""
+
+    def __init__(self, *topics):
+        self.topics = topics
+
+    def __call__(self, rig):
+        pass
+
+
 def _key(value):
     """`value` with floats as their bits, so NaN equals NaN and -0.0 does
     not equal 0.0, as in a byte comparison. A message compares its bytes."""
@@ -143,13 +157,25 @@ def assert_same_behaviour(cpp_cls, py_cls, config, node, scenario, *,
     own Sim over `config`; raises AssertionError at the first step after
     which a topic in `topics` [(message class, topic)], or a requested or
     applied output of a device named in `motors`, `digital_outputs` or
-    `pwms`, differs, or when a topic was never published by either."""
+    `pwms`, differs, or a topic a require_published marker names has no
+    message on a side, and when a topic was never published by either."""
     if not scenario:
         raise ValueError("an empty scenario compares nothing")
+    listed = [topic for _, topic in topics]
     rigs = {"C++": Rig(cpp_cls, config, node),
             "Python": Rig(py_cls, config, node)}
     published = set()
     for index, (name, *actions) in enumerate(scenario, 1):
+        step = f"{node}: step {index} {name!r}"
+        required = set()
+        for action in actions:
+            if isinstance(action, require_published):
+                unknown = set(action.topics) - set(listed)
+                if unknown:
+                    raise ValueError(f"{step}: require_published names "
+                                     f"{', '.join(sorted(unknown))}, not in "
+                                     f"topics")
+                required.update(action.topics or listed)
         observed = {}
         for language, rig in rigs.items():
             for action in actions:
@@ -157,13 +183,17 @@ def assert_same_behaviour(cpp_cls, py_cls, config, node, scenario, *,
             observed[language] = _observe(rig, topics, motors,
                                           digital_outputs, pwms)
         for (what, cpp), (_, py) in zip(observed["C++"], observed["Python"]):
+            if what in required and (cpp is None or py is None):
+                raise AssertionError(
+                    f"{step}: {what} required but not published\n"
+                    f"  C++:    {cpp!r}\n  Python: {py!r}")
             if cpp is not None or py is not None:
                 published.add(what)
             if _key(cpp) != _key(py):
                 raise AssertionError(
-                    f"{node}: step {index} {name!r}: {what} differs\n"
+                    f"{step}: {what} differs\n"
                     f"  C++:    {cpp!r}\n  Python: {py!r}")
-    silent = [topic for _, topic in topics if topic not in published]
+    silent = [topic for topic in listed if topic not in published]
     if silent:
         raise AssertionError(f"{node}: {', '.join(silent)} never published "
                              f"in the scenario: nothing was compared")
