@@ -143,6 +143,7 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   EXPECT_TRUE(mech.a.connected());
 }
 
+// REQ-SAFE-02
 TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -185,6 +186,7 @@ TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
 }
 
+// REQ-SAFE-02
 TEST(Devices, StaleStateForcesNeutralButKeepsFlushing) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
