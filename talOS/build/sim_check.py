@@ -5,7 +5,9 @@ from the session it records.
         --session-report RLOCATION --registry-unlink RLOCATION
 
 It runs `<sim> --output-dir <tmp> --remote 127.0.0.1 --remote-port P
---local-port Q` on free loopback ports, with no --duration-s, and waits for
+--local-port Q --duration-s <backstop>` on free loopback ports (the duration
+lies past every bound below and only ends a launch whose check was killed
+outright; the check stops the launch itself), and waits for
 two events: the bridge has accepted a State (its `hardware_node: gateway
 boot ` line in `<session>/hardware_node.log`, printed on the first State it
 accepts from each gateway boot), and every member of the session's manifest
@@ -348,7 +350,10 @@ def wait_ready(launch, out, timeout_s):
 
 class Launch:
     """A command run in a session of its own, its output to `output` (a
-    file: a pipe would stay open while any process holds it)."""
+    file: a pipe would stay open while any process holds it). Used as a
+    context manager it is stopped on the way out, whatever happened inside:
+    a check that raises, or is ended by a signal, leaves no process of the
+    launch behind."""
 
     def __init__(self, args, output, pass_fds=()):
         self.process = subprocess.Popen(
@@ -357,6 +362,14 @@ class Launch:
             pass_fds=pass_fds)
         # setsid made the child its session's and process group's leader.
         self.sid = self.process.pid
+        self.stopped = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.finish()
+        return False
 
     def _signal_group(self, signum):
         try:
@@ -369,7 +382,10 @@ class Launch:
         exit within `stop_wait_s` is stopped as a hang (module docstring).
         Returns (whether it stopped on SIGINT, or had already exited; the
         pids of its session that had to be killed after it ended). Leaves
-        no process of the session behind either way."""
+        no process of the session behind either way. A second call returns
+        the first one's result."""
+        if self.stopped is not None:
+            return self.stopped
         in_order = True
         if self.process.poll() is None:
             self.process.send_signal(signal.SIGINT)
@@ -391,7 +407,8 @@ class Launch:
             except ProcessLookupError:
                 pass
         wait_exited(left, KILL_WAIT_S)
-        return in_order, sorted(left)
+        self.stopped = (in_order, sorted(left))
+        return self.stopped
 
 
 def load_session_report(path):
@@ -481,13 +498,19 @@ def check(sim, settle_s, log_dump, session_report, registry_unlink,
         out = os.path.join(tmp, "sessions")
         os.makedirs(out)
         output_path = os.path.join(tmp, "launch.log")
+        # The check stops the launch itself. The launcher's own duration is
+        # only a backstop for a check killed outright (SIGKILL after Bazel's
+        # timeout), which could stop nothing: it lies past every bound the
+        # check waits on, and a launch that ends on its own fails below.
+        backstop_s = ready_s + settle_s + HANG_MARGIN_S
         args = [sim, "--output-dir", out, "--remote", "127.0.0.1",
                 "--remote-port", str(gateway_port),
-                "--local-port", str(bridge_port)]
+                "--local-port", str(bridge_port),
+                "--duration-s", str(backstop_s)]
         problems = []
         try:
-            with open(output_path, "wb") as output:
-                launch = Launch(args, output)
+            with open(output_path, "wb") as output, \
+                    Launch(args, output) as launch:
                 waiting = wait_ready(launch, out, ready_s)
                 if waiting:
                     problems.append(
@@ -544,6 +567,9 @@ def main(argv):
         parser.add_argument(flag, required=True)
     parser.add_argument("--settle-s", type=int, required=True)
     args = parser.parse_args(argv)
+    # Bazel ends a test at its timeout with SIGTERM: leave through the
+    # finally blocks, which stop the launch, as Ctrl-C does.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     try:
         ready_s = ready_bound(args.settle_s)
     except ValueError as error:
