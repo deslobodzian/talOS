@@ -80,7 +80,7 @@ numbered section, a number in RULES a rule:
 | REQ-SAFE-23 | A device-local send failure isolates that motor chain, a global apply failure neutralizes every output, and repeated global failures latch a fault cleared only as HR "Runtime Contract" states. | P0 | HR "Runtime Contract" | fault flag; outputs | component |
 | REQ-SAFE-24 | A device reset (vendor latch or impossible position step) neutralizes only the affected chain, restores it without blocking ticks, and requires a command observing a State read after the restore completed before that chain drives again, whatever the backend reports while it restores. | P0 | HR "Runtime Contract" | reset counter; outputs; tick continuity | component |
 | REQ-SAFE-25 | When the RoboRIO loop stops beating past its command expiry, the loop watchdog neutralizes every output on each check until a beat moves the time, with one DS error per stall, at the margins HR "RoboRIO" states. | P0 | HR "RoboRIO"; ARCH "The tick" | backend neutral calls; DS error | component + bench |
-| REQ-SAFE-26 | Config load refuses a `command_timeout_us` outside the range ARCH "The tick" states, an actuator owner whose `period_us` exceeds the stated fraction of it, a `status_hz` that gives fewer than four status periods per `command_timeout_us`, `soft_limits = true` on a rezero-frame motor, and `position_frame = "absolute"` without `RemoteCANcoder` feedback. | P0 | ARCH "The tick"; HR "Configuration"; code `talOS/configuration/config_parser.h` | exception naming the key | unit |
+| REQ-SAFE-26 | Config load refuses a `command_timeout_us` outside the range ARCH "The tick" states, an actuator owner whose `period_us` exceeds the stated fraction of it, a `status_hz` that gives fewer than four status periods per `command_timeout_us`, `soft_limits = true` on a rezero-frame motor, and `position_frame = "absolute"` without `RemoteCANcoder` feedback. | P0 | ARCH "The tick"; HR "Configuration"; code `talOS/hardware/config.cc`, `talOS/configuration/config_parser.h` | exception naming the key | unit |
 | REQ-SAFE-27 | Only the bridge writes `hw` topics except `/hw/request/<node>`, which only `<node>`'s devices flush writes: `publish`/`publish_bytes` throw on any `/hw/request` topic at construction (C++ and Python) and `LintGraph` errors on any other `hw` writer. | P0 | RULES 2; NAMING "Topics" | constructor exception; lint diagnostic | unit + component |
 | REQ-SAFE-28 | A node that owns a motor, DIO or PWM output or describes a target-lane sender cannot be `critical = false` (graph error), and the hardware bridge is always critical. | P0 | LR "Two phases"; DEP "Supervision and service recovery" | lint diagnostic; launcher exit | unit |
 | REQ-SAFE-29 | A critical member (actuator owner, bridge) that crashes, stalls or exits 0 mid-session restarts forever on the capped backoff LR "Restarts" states, is never quarantined, and only `--max-restarts 0` disables it. | P0 | LR "Restarts"; DEP "Supervision and service recovery" | manifest `restart_count`, `runs[].reason`; restart timing | unit + integration |
@@ -268,7 +268,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/node` | REQ-SAFE-06, REQ-SAFE-27, REQ-CONTRACT-18, REQ-RT-01, REQ-RT-05, REQ-RT-06, REQ-RT-19, REQ-RT-21, REQ-DEV-08, REQ-CONTRACT-31 |
 | `talOS/devices` | REQ-SAFE-01 to REQ-SAFE-09, REQ-SAFE-12, REQ-SAFE-13, REQ-CONTRACT-23, REQ-DEV-07 |
 | `talOS/bridge` | REQ-SAFE-11, REQ-SAFE-15, REQ-SAFE-16, REQ-SAFE-19, REQ-SAFE-40, REQ-CONTRACT-04, REQ-RT-13, REQ-RT-20, REQ-RT-22, REQ-OPS-20, REQ-OPS-21, REQ-OPS-37 |
-| `talOS/hardware` | REQ-SAFE-17 to REQ-SAFE-24, REQ-CONTRACT-02, REQ-CONTRACT-05, REQ-CONTRACT-06, REQ-CONTRACT-30, REQ-DEV-10, REQ-DEV-24, REQ-CONTRACT-32, REQ-CONTRACT-35 |
+| `talOS/hardware` | REQ-SAFE-17 to REQ-SAFE-24, REQ-SAFE-26, REQ-CONTRACT-02, REQ-CONTRACT-05, REQ-CONTRACT-06, REQ-CONTRACT-30, REQ-DEV-10, REQ-DEV-24, REQ-CONTRACT-32, REQ-CONTRACT-35 |
 | `talOS/protocol` | REQ-CONTRACT-01, REQ-CONTRACT-03, REQ-RT-22 |
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-SAFE-40, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31, REQ-DEV-29 |
@@ -293,7 +293,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `2026-robot/main_processor/pose_estimator` | REQ-CONTRACT-26; its second backend: none beyond it (TODO.md SCOPE-1) |
 | `2026-robot/main_processor/vision` | REQ-CONTRACT-27 |
 | `2026-robot/main_processor/simulation` | REQ-DEV-05, REQ-DEV-06; composition evidence for REQ-SAFE-31, REQ-SAFE-33 |
-| `2026-robot/main_processor/configuration`, `bench` | REQ-SAFE-26, REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15; the bench nodes: REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-DEV-26 (swerve module) |
+| `2026-robot/main_processor/configuration`, `bench` | REQ-CONTRACT-19; bench procedures for REQ-RT-14, REQ-RT-15; the bench nodes: REQ-SAFE-01 to REQ-SAFE-09 through the node test matrix, REQ-DEV-26 (swerve module) |
 | `controller_processor/rio` | REQ-SAFE-10, REQ-SAFE-17 to REQ-SAFE-25, REQ-CONTRACT-06, REQ-OPS-24, REQ-OPS-27 to REQ-OPS-29, REQ-RT-24 |
 | `studio` | REQ-SAFE-35, REQ-CONTRACT-28, REQ-CONTRACT-29, REQ-OPS-23, REQ-OPS-36, REQ-OPS-41, REQ-OPS-42, REQ-OPS-49 |
 | `studio/agent` | none in the catalogue (TODO.md SCOPE-2) |
