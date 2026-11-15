@@ -386,12 +386,14 @@ void Robot::StartCompetition() {
         (gateway_->snapshot().flags & talos::hardware::kCommandActive) != 0;
 #endif
 
-    // The Driver Station as the reader last refreshed it, no mode once that
-    // refresh is command_timeout_us old (the default Config's before a
-    // configuration): no NetComm call on this thread.
+    // The Driver Station as the reader last refreshed it, one refresh whole
+    // (flags and inputs alike), or no Driver Station once that refresh is
+    // command_timeout_us old (the default Config's before a configuration):
+    // no NetComm call on this thread. Valid until the next tick's Read.
     const uint64_t now_us = NowUs();
-    const uint32_t mode_flags =
+    const talos::driver_station::DriverStationData& driver_station_view =
         driver_station.Read(now_us, gateway_->config().command_timeout_us);
+    const uint32_t mode_flags = driver_station_view.fms.flags;
     ds_mode.Observe(mode_flags, now_us);
     log_->ClosePhase(TickPhase::kDriverStation, NowNs());
     auto open_status = talos::protocol::UdpStatus::kOk;
@@ -518,9 +520,10 @@ void Robot::StartCompetition() {
       if (socket_retry.open() && (mode != last_ds_mode || sample_due)) {
         last_ds_sample_us = now_us;
         last_ds_mode = mode;
-        // This tick's flags, so the packet and ds_mode agree on the mode.
-        auto ds =
-            talos::driver_station::SampleDriverStation(now_us, mode_flags);
+        // This tick's view, so the packet is one refresh's and agrees with
+        // ds_mode and the gateway's enable on the mode.
+        talos::driver_station::DriverStationData ds = driver_station_view;
+        ds.sample_time_us = now_us;
         ds_mode.Stamp(ds);
         // The same boot id as this program's State: a consumer orders
         // packets within one boot and starts over on a new one.

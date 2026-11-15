@@ -5,8 +5,10 @@
 #include <wpi/Synchronization.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <string_view>
 #include <system_error>
 #include <utility>
@@ -20,16 +22,18 @@
 
 namespace talos::driver_station {
 
-// The wire enum is cast straight from WPILib's below, so a reordering on
+// The wire enum is cast straight from the HAL's below, so a reordering on
 // either side has to fail the build rather than mislabel a match.
-static_assert(static_cast<int>(MatchType::kNone) ==
-              static_cast<int>(frc::DriverStation::MatchType::kNone));
+static_assert(static_cast<int>(MatchType::kNone) == HAL_kMatchType_none);
 static_assert(static_cast<int>(MatchType::kPractice) ==
-              static_cast<int>(frc::DriverStation::MatchType::kPractice));
+              HAL_kMatchType_practice);
 static_assert(static_cast<int>(MatchType::kQualification) ==
-              static_cast<int>(frc::DriverStation::MatchType::kQualification));
+              HAL_kMatchType_qualification);
 static_assert(static_cast<int>(MatchType::kElimination) ==
-              static_cast<int>(frc::DriverStation::MatchType::kElimination));
+              HAL_kMatchType_elimination);
+static_assert(kMaxJoysticks == HAL_kMaxJoysticks);
+static_assert(kMaxAxes <= HAL_kMaxJoystickAxes);
+static_assert(kMaxPovs <= HAL_kMaxJoystickPOVs);
 
 namespace {
 
@@ -41,10 +45,15 @@ void CopyString(std::string_view src, char (&dst)[N]) {
   dst[count] = '\0';
 }
 
+// A HAL string of at most N bytes, ending at its first NUL.
+template <std::size_t N>
+std::string_view Terminated(const char (&src)[N]) {
+  return {src, strnlen(src, N)};
+}
+
 // A control word as DsFlags, as WPILib's IsDSAttached, IsFMSAttached,
 // IsEnabled (attached and enabled), IsAutonomous, IsTeleop (neither
-// autonomous nor test), IsTest and IsEStopped read it: one copy of the
-// cache, so the flags all come from one refresh.
+// autonomous nor test), IsTest and IsEStopped read it.
 uint32_t FlagsOf(const HAL_ControlWord& word) {
   uint32_t flags = 0;
   if (word.dsAttached) flags |= kDsAttached;
@@ -57,79 +66,96 @@ uint32_t FlagsOf(const HAL_ControlWord& word) {
   return flags;
 }
 
-uint32_t CachedFlags() {
-  HAL_ControlWord word{};
-  HAL_GetControlWord(&word);
-  return FlagsOf(word);
-}
-
 }  // namespace
 
-DriverStationData SampleDriverStation(uint64_t now_us) {
-  return SampleDriverStation(now_us, CachedFlags());
+// Each field as frc::DriverStation's getter of it reads the HAL (GetAlliance,
+// GetLocation, GetMatchType ... GetMatchTime, IsJoystickConnected,
+// GetStickAxis, GetStickButtons, GetStickPOV, GetJoystickName), without their
+// range warnings, which are HAL_SendError calls into NetComm.
+void SnapshotDriverStation(DriverStationData& out) {
+  out = DriverStationData{};
+
+  HAL_ControlWord word{};
+  HAL_GetControlWord(&word);
+  out.fms.flags = FlagsOf(word);
+
+  int32_t status = 0;
+  switch (HAL_GetAllianceStation(&status)) {
+    case HAL_AllianceStationID_kRed1:
+      out.fms.alliance = Alliance::kRed;
+      out.fms.station = 1;
+      break;
+    case HAL_AllianceStationID_kRed2:
+      out.fms.alliance = Alliance::kRed;
+      out.fms.station = 2;
+      break;
+    case HAL_AllianceStationID_kRed3:
+      out.fms.alliance = Alliance::kRed;
+      out.fms.station = 3;
+      break;
+    case HAL_AllianceStationID_kBlue1:
+      out.fms.alliance = Alliance::kBlue;
+      out.fms.station = 1;
+      break;
+    case HAL_AllianceStationID_kBlue2:
+      out.fms.alliance = Alliance::kBlue;
+      out.fms.station = 2;
+      break;
+    case HAL_AllianceStationID_kBlue3:
+      out.fms.alliance = Alliance::kBlue;
+      out.fms.station = 3;
+      break;
+    default:
+      break;
+  }
+
+  HAL_MatchInfo info{};
+  HAL_GetMatchInfo(&info);
+  out.fms.match_type = static_cast<MatchType>(info.matchType);
+  out.fms.match_number = info.matchNumber;
+  out.fms.replay_number = info.replayNumber;
+  status = 0;
+  out.fms.match_time_s = static_cast<float>(HAL_GetMatchTime(&status));
+  CopyString(
+      std::string_view{reinterpret_cast<const char*>(info.gameSpecificMessage),
+                       std::min<std::size_t>(info.gameSpecificMessageSize,
+                                             sizeof info.gameSpecificMessage)},
+      out.fms.game_specific_message);
+  CopyString(Terminated(info.eventName), out.fms.event_name);
+
+  // One copy of every joystick, under one HAL lock.
+  std::array<HAL_JoystickAxes, HAL_kMaxJoysticks> axes{};
+  std::array<HAL_JoystickPOVs, HAL_kMaxJoysticks> povs{};
+  std::array<HAL_JoystickButtons, HAL_kMaxJoysticks> buttons{};
+  HAL_GetAllJoystickData(axes.data(), povs.data(), buttons.data());
+  for (std::size_t i = 0; i < kMaxJoysticks; ++i) {
+    auto& j = out.joysticks[i];
+    j.connected =
+        axes[i].count > 0 || buttons[i].count > 0 || povs[i].count > 0;
+    if (!j.connected) continue;
+    j.axis_count = static_cast<uint8_t>(
+        std::clamp<int>(axes[i].count, 0, static_cast<int>(kMaxAxes)));
+    for (std::size_t a = 0; a < j.axis_count; ++a) {
+      j.axes[a] = axes[i].axes[a];
+    }
+    j.button_count = static_cast<uint8_t>(
+        std::min<int>(buttons[i].count, static_cast<int>(kMaxButtons)));
+    j.buttons = buttons[i].buttons;
+    j.pov_count = static_cast<uint8_t>(
+        std::clamp<int>(povs[i].count, 0, static_cast<int>(kMaxPovs)));
+    for (std::size_t p = 0; p < j.pov_count; ++p) {
+      j.povs[p] = povs[i].povs[p];
+    }
+    HAL_JoystickDescriptor descriptor{};
+    HAL_GetJoystickDescriptor(static_cast<int32_t>(i), &descriptor);
+    CopyString(Terminated(descriptor.name), j.name);
+  }
 }
 
-DriverStationData SampleDriverStation(uint64_t now_us, uint32_t flags) {
-  DriverStationData ds{};
+DriverStationData SampleDriverStation(uint64_t now_us) {
+  DriverStationData ds;
+  SnapshotDriverStation(ds);
   ds.sample_time_us = now_us;
-  ds.fms.flags = flags;
-
-  // Alliance & Location
-  const auto alliance = frc::DriverStation::GetAlliance();
-  if (alliance.has_value()) {
-    ds.fms.alliance = (*alliance == frc::DriverStation::Alliance::kRed)
-                          ? Alliance::kRed
-                          : Alliance::kBlue;
-  }
-  const auto location = frc::DriverStation::GetLocation();
-  if (location.has_value()) {
-    ds.fms.station = static_cast<uint8_t>(*location);
-  }
-
-  // Match info
-  ds.fms.match_type =
-      static_cast<MatchType>(frc::DriverStation::GetMatchType());
-  ds.fms.match_number =
-      static_cast<uint16_t>(frc::DriverStation::GetMatchNumber());
-  ds.fms.replay_number =
-      static_cast<uint8_t>(frc::DriverStation::GetReplayNumber());
-  ds.fms.match_time_s =
-      static_cast<float>(frc::DriverStation::GetMatchTime().value());
-  CopyString(frc::DriverStation::GetGameSpecificMessage(),
-             ds.fms.game_specific_message);
-  CopyString(frc::DriverStation::GetEventName(), ds.fms.event_name);
-
-  // Joysticks
-  for (std::size_t i = 0; i < kMaxJoysticks; ++i) {
-    auto& j = ds.joysticks[i];
-    j.connected = frc::DriverStation::IsJoystickConnected(static_cast<int>(i));
-    if (!j.connected) continue;
-
-    j.axis_count = static_cast<uint8_t>(std::min<int>(
-        frc::DriverStation::GetStickAxisCount(static_cast<int>(i)),
-        static_cast<int>(kMaxAxes)));
-    for (std::size_t a = 0; a < j.axis_count; ++a) {
-      j.axes[a] = static_cast<float>(frc::DriverStation::GetStickAxis(
-          static_cast<int>(i), static_cast<int>(a)));
-    }
-
-    j.button_count = static_cast<uint8_t>(std::min<int>(
-        frc::DriverStation::GetStickButtonCount(static_cast<int>(i)), 32));
-    j.buttons = static_cast<uint32_t>(
-        frc::DriverStation::GetStickButtons(static_cast<int>(i)));
-
-    j.pov_count = static_cast<uint8_t>(
-        std::min<int>(frc::DriverStation::GetStickPOVCount(static_cast<int>(i)),
-                      static_cast<int>(kMaxPovs)));
-    for (std::size_t p = 0; p < j.pov_count; ++p) {
-      j.povs[p] = static_cast<int16_t>(frc::DriverStation::GetStickPOV(
-          static_cast<int>(i), static_cast<int>(p)));
-    }
-
-    CopyString(frc::DriverStation::GetJoystickName(static_cast<int>(i)),
-               j.name);
-  }
-
   return ds;
 }
 
@@ -139,10 +165,12 @@ namespace talos::rio {
 
 namespace ds = driver_station;
 
-static_assert((ds::kDsAttached | ds::kFmsAttached | ds::kEnabled |
-               ds::kAutonomous | ds::kTeleop | ds::kTest | ds::kEStop) <
-                  (1u << 8),
-              "every DsFlags bit must fit below a refresh's time");
+namespace {
+
+// What the loop reads with no refresh within its bound: no Driver Station.
+const ds::DriverStationData kNoDriverStation{};
+
+}  // namespace
 
 DriverStationReader::DriverStationReader(Calls calls, Clock clock,
                                          Report report,
@@ -176,9 +204,9 @@ DriverStationReader::Calls DriverStationReader::WpilibCalls() {
                        static_cast<double>(kWaitTimeoutUs) / 1e6, &timed_out);
   };
   calls.wake = [new_data] { new_data->event.Set(); };
-  calls.refresh = [] {
+  calls.refresh = [](ds::DriverStationData& out) {
     frc::DriverStation::RefreshData();
-    return ds::CachedFlags();
+    ds::SnapshotDriverStation(out);
   };
   calls.observe = [](ProgramMode mode) {
     switch (mode) {
@@ -247,15 +275,24 @@ void DriverStationReader::Stop() {
   }
 }
 
-uint32_t DriverStationReader::Read(uint64_t now_us, uint64_t stale_us) {
+const ds::DriverStationData& DriverStationReader::Read(uint64_t now_us,
+                                                       uint64_t stale_us) {
   shared_->tick_us.store(now_us, std::memory_order_release);
-  const uint64_t refreshed = shared_->refreshed.load(std::memory_order_acquire);
-  if (refreshed == kNever) return 0;
-  const uint64_t at_us = refreshed >> kFlagBits;
+  // Takes the newest snapshot, if the helper has published one since the
+  // last Read, handing the slot read until now back to the helper.
+  if ((shared_->middle.load(std::memory_order_acquire) & kFresh) != 0) {
+    front_ = shared_->middle.exchange(front_, std::memory_order_acq_rel) &
+             kIndexMask;
+  }
+  const Snapshot& snapshot = shared_->slots[front_];
+  if (!snapshot.refreshed) return kNoDriverStation;
   // A refresh completed after this tick's clock reading is current; one
   // command_timeout_us old is stale, as the gateway's own command expiry is.
-  if (at_us < now_us && now_us - at_us >= stale_us) return 0;
-  return static_cast<uint32_t>(refreshed & ((uint64_t{1} << kFlagBits) - 1));
+  if (snapshot.refreshed_us < now_us &&
+      now_us - snapshot.refreshed_us >= stale_us) {
+    return kNoDriverStation;
+  }
+  return snapshot.data;
 }
 
 void DriverStationReader::Run(const std::shared_ptr<Shared>& shared) {
@@ -295,21 +332,29 @@ void DriverStationReader::Run(const std::shared_ptr<Shared>& shared) {
   const auto stopping = [&shared] {
     return shared->stop.load(std::memory_order_acquire);
   };
+  // The helper's slot: the loop never reads it until it is swapped out.
+  uint8_t back = 0;
   while (!stopping()) {
     shared->calls.wait();
     if (stopping()) break;
-    const uint32_t flags = shared->calls.refresh();
-    // A time that would not fit below the flags is held at the largest that
-    // does (2^56 us, two thousand years of uptime).
-    const uint64_t done_us =
-        std::min(shared->clock(), (kNever >> kFlagBits) - 1);
+    Snapshot& slot = shared->slots[back];
+    shared->calls.refresh(slot.data);
+    const uint64_t done_us = shared->clock();
+    const uint32_t flags = slot.data.fms.flags;
+    slot.refreshed_us = done_us;
+    slot.refreshed = true;
     if (stopping()) break;
-    shared->refreshed.store((done_us << kFlagBits) | flags,
-                            std::memory_order_release);
+    // Publishes the slot whole and takes back the one the loop last
+    // returned, or the unread one this replaces. The slot is the loop's to
+    // read from here on.
+    back = shared->middle.exchange(static_cast<uint8_t>(back | kFresh),
+                                   std::memory_order_acq_rel) &
+           kIndexMask;
     const uint64_t tick_us = shared->tick_us.load(std::memory_order_acquire);
     const bool loop_ticking =
         tick_us != kNever &&
         (tick_us >= done_us || done_us - tick_us <= kLoopTickWindowUs);
+    if (stopping()) break;
     if (loop_ticking) shared->calls.observe(ProgramModeOf(flags));
   }
   {

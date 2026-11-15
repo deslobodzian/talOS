@@ -57,11 +57,11 @@ enum class TickPhase : uint8_t {
   // open, the gateway's tick alone, and the Driver Station packet's send,
   // less the backend phases inside them.
   kLink,
-  // The loop's: reading the Driver Station (the flags the talos-ds thread
-  // last refreshed, DriverStationReader::Read, and the mode generation; the
-  // desktop simulation's Driver Station) and sampling and encoding its packet
-  // from WPILib's cache. The refresh and the mode report are that thread's,
-  // outside every phase.
+  // The loop's: reading the Driver Station (the snapshot the talos-ds
+  // thread last published, DriverStationReader::Read, and the mode
+  // generation; the desktop simulation's Driver Station) and copying and
+  // encoding that snapshot as its packet. The refresh, the snapshot and the
+  // mode report are that thread's, outside every phase.
   kDriverStation,
   // The loop's: the watchdog beat, the companion report, the config
   // persister's tick.

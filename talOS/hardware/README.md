@@ -559,10 +559,10 @@ battery reads (health), and the rest
 of the backend's tick calls (other); and the loop's own: the socket retry,
 the endpoint's tick (receive, the gateway's command and State work, the
 State send; with no socket open, the gateway's tick) and the Driver Station
-packet's send, less the backend phases inside them (link), reading the
-flags the Driver Station reader last refreshed and sampling and encoding the
-Driver Station packet from WPILib's cache (driver station; the refresh and
-the mode report are the reader's, outside every phase, below), and
+packet's send, less the backend phases inside them (link), taking the
+Driver Station reader's latest snapshot and copying and encoding it as the
+Driver Station packet (driver station; the refresh, the snapshot and the
+mode report are the reader's, outside every phase, below), and
 the watchdog beat, companion report and config persister (loop). A tick's
 phases sum to its work, the time the loop timing line's longest work
 measures. `PhoenixBackend` takes one
@@ -669,17 +669,25 @@ at `SCHED_FIFO` 5 on the RoboRIO (`kDriverStationPriority` in `Robot.cpp`,
 below the loop and above every default-scheduled thread, with
 `SCHED_RESET_ON_FORK`; default scheduling under desktop simulation). It
 waits for WPILib's new-data event, which NetComm's own thread sets on each
-Driver Station packet, or 20 ms without one; refreshes WPILib's cache; and
-publishes the control word's flags with the refresh's completion time in one
-atomic word. After each refresh, while the loop's last tick is at most 20 ms
-old, it reports the program's mode, so a stalled loop still stops the
-reports. Each tick the loop reads that word (no lock, no WPILib call) and
-takes its flags for the gateway's enable, the mode generation and the Driver
-Station packet, whose other fields it copies from WPILib's cache (the HAL's
-getters copy under the HAL's own mutex and call no NetComm). Once the last
-completed refresh is `command_timeout_us` old (the gateway's, the default
-Config's 100 ms before a configuration), the loop reads no Driver Station:
-flags 0, no mode, disabled. A daemon that does not answer, or a starved
+Driver Station packet, or 20 ms without one; refreshes WPILib's cache;
+snapshots all of it with HAL getters (control word, alliance and station,
+match information and time, every joystick's axes, buttons and POVs in one
+`HAL_GetAllJoystickData` copy, and names; no WPILib getter, whose range
+warnings are NetComm calls); and publishes the snapshot with the refresh's
+completion time through a triple buffer: it fills a slot the loop cannot
+see and hands it over with one atomic exchange. After each refresh, while
+the loop's last tick is at most 20 ms old, it reports the program's mode, so
+a stalled loop still stops the reports. Each tick the loop takes the newest
+snapshot (an atomic load, and an exchange when there is a new one; no lock,
+no WPILib call) and uses that one snapshot for the gateway's enable, the
+mode generation and, when one is due, the whole Driver Station packet. So
+the packet is always one refresh's data: the HAL's cache changes only on a
+refresh, only `talos-ds` refreshes, and it snapshots before its next one;
+the joysticks are one Driver Station packet's. Once the last completed
+refresh is `command_timeout_us` old (the gateway's, the default Config's
+100 ms before a configuration), the loop reads no Driver Station: flags 0,
+no mode, disabled, every joystick disconnected with no axis, button or POV.
+A daemon that does not answer, or a starved
 reader, therefore disables the gateway within `command_timeout_us` plus one
 tick of the last refresh that completed, and the mode the loop reads when
 refreshes resume starts a new mode generation. The reader's start line,

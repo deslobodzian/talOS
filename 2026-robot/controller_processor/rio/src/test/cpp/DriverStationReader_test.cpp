@@ -1,8 +1,9 @@
 // The RoboRIO loop's Driver Station view without NetComm on the loop thread.
 // WPILib's refresh asks FRC_NetCommDaemon for the control word, a round trip
 // that took up to 13.5 ms on the bench with no Driver Station attached and
-// made the 5 ms loop overrun; DriverStationReader moves it, and the mode
-// report, to a helper thread. These tests run that thread for real, with its
+// made the 5 ms loop overrun; DriverStationReader moves it, the snapshot of
+// what it refreshed and the mode report to a helper thread, and the loop
+// reads whole snapshots. These tests run that thread for real, with its
 // WPILib calls replaced by a Gate the test steers, and wait on the Gate's
 // events, never on time (TESTING.md §6.3); the clock is injected.
 #include "DriverStationReader.h"
@@ -39,24 +40,62 @@ constexpr uint32_t kAutonomousEnabled =
 // A stop bound that never abandons on a slow host.
 constexpr auto kNeverAbandon = std::chrono::seconds{10};
 
+// One refresh's Driver Station: `flags`, and stick 0 with two axes and
+// `buttons`.
+ds::DriverStationData Sample(uint32_t flags, float axis0, float axis1,
+                             uint32_t buttons) {
+  ds::DriverStationData sample{};
+  sample.fms.flags = flags;
+  sample.fms.alliance = ds::Alliance::kBlue;
+  sample.fms.station = 1;
+  auto& stick = sample.joysticks[0];
+  stick.connected = true;
+  stick.axis_count = 2;
+  stick.axes[0] = axis0;
+  stick.axes[1] = axis1;
+  stick.button_count = 4;
+  stick.buttons = buttons;
+  return sample;
+}
+
+// Two refreshes that any field-by-field mix of them differs from: enabled
+// with the stick at (0, 0.9), then disabled with it at (0.9, 0) and a button
+// down. Mixed at the gate below (A's fields under B's flags and first axis)
+// they read disabled at (0.9, 0.9) with no button.
+const ds::DriverStationData kA = Sample(kTeleopEnabled, 0.0f, 0.9f, 0);
+const ds::DriverStationData kB = Sample(ds::kDsAttached, 0.9f, 0.0f, 1);
+const ds::DriverStationData kNoDriverStation{};
+
+std::string Describe(const ds::DriverStationData& view) {
+  const auto& stick = view.joysticks[0];
+  return "flags=" + std::to_string(view.fms.flags) +
+         " connected=" + std::to_string(stick.connected) + " axes=(" +
+         std::to_string(stick.axes[0]) + ", " + std::to_string(stick.axes[1]) +
+         ") buttons=" + std::to_string(stick.buttons);
+}
+
 // The helper's WPILib calls, for a test to steer and wait on. `wait` returns
-// once per packet the test posts (or for good once Stop wakes it); `refresh`
-// returns `flags` at once, unless the test holds it, in which case it blocks
-// until released: a NetComm call that does not return, until it does.
-// Shared (std::shared_ptr) with the calls, so a helper the reader abandoned
-// keeps it alive; `destroyed` is told how many modes it saw when the last
-// holder lets go. Every wait is on an event; the 10 s bound only fails a test
-// that would otherwise hang.
+// once per packet the test posts (at once in `free_run`, or for good once
+// Stop wakes it). `refresh` writes `sample` (in `free_run`, kA and kB in
+// turn) one field at a time, as the HAL's cache would be read: the flags and
+// stick 0's first axis, then, unless the test holds it there (a NetComm call
+// that has not returned, mid-snapshot), the rest. Shared (std::shared_ptr)
+// with the calls, so a helper the reader abandoned keeps it alive;
+// `destroyed` is told how many modes it saw when the last holder lets go.
+// Every wait is on an event; the 10 s bound only fails a test that would
+// otherwise hang.
 struct Gate {
   std::mutex mutex;
   std::condition_variable changed;
   int posted = 0;
   int taken = 0;
   bool woken = false;
+  bool free_run = false;
   int waits = 0;
+  std::atomic<int> refreshes{0};
   bool hold = false;
   bool held = false;
-  uint32_t flags = 0;
+  ds::DriverStationData sample{};
   std::vector<ProgramMode> observed;
   std::shared_ptr<std::promise<std::size_t>> destroyed;
 
@@ -69,7 +108,7 @@ struct Gate {
     std::unique_lock lock{mutex};
     ++waits;
     changed.notify_all();
-    changed.wait(lock, [this] { return woken || taken < posted; });
+    changed.wait(lock, [this] { return free_run || woken || taken < posted; });
     if (taken < posted) ++taken;
   }
   void Wake() {
@@ -79,15 +118,21 @@ struct Gate {
     }
     changed.notify_all();
   }
-  uint32_t Refresh() {
+  void Refresh(ds::DriverStationData& out) {
     std::unique_lock lock{mutex};
+    const int count = refreshes.load() + 1;
+    const ds::DriverStationData& next =
+        free_run ? (count % 2 == 1 ? kA : kB) : sample;
+    out.fms.flags = next.fms.flags;
+    out.joysticks[0].axes[0] = next.joysticks[0].axes[0];
     if (hold) {
       held = true;
       changed.notify_all();
       changed.wait(lock, [this] { return !hold; });
       held = false;
     }
-    return flags;
+    out = next;
+    refreshes.store(count);
   }
   void Observe(ProgramMode mode) {
     const std::lock_guard lock{mutex};
@@ -107,15 +152,25 @@ struct Gate {
     }
     changed.notify_all();
   }
-  // Posts a packet and waits until the helper has refreshed, reported (or
-  // not) and is waiting for the next one.
-  bool Step() {
-    Post();
+  // Waits until the helper has handled every posted packet (refreshed,
+  // published, reported or not) and is waiting for the next one.
+  bool WaitIdle() {
     return WaitUntil([this] { return waits > posted; });
   }
-  void SetFlags(uint32_t value) {
+  bool Step() {
+    Post();
+    return WaitIdle();
+  }
+  void SetSample(const ds::DriverStationData& value) {
     const std::lock_guard lock{mutex};
-    flags = value;
+    sample = value;
+  }
+  void FreeRun() {
+    {
+      const std::lock_guard lock{mutex};
+      free_run = true;
+    }
+    changed.notify_all();
   }
   void Hold() {
     const std::lock_guard lock{mutex};
@@ -141,7 +196,7 @@ DriverStationReader::Calls CallsThrough(const std::shared_ptr<Gate>& gate) {
   DriverStationReader::Calls calls;
   calls.wait = [gate] { gate->Wait(); };
   calls.wake = [gate] { gate->Wake(); };
-  calls.refresh = [gate] { return gate->Refresh(); };
+  calls.refresh = [gate](ds::DriverStationData& out) { gate->Refresh(out); };
   calls.observe = [gate](ProgramMode mode) { gate->Observe(mode); };
   return calls;
 }
@@ -159,89 +214,126 @@ DriverStationReader::Clock ClockThrough(const TestClock& clock) {
 // which these tests must not see.
 void NoReport(std::string_view line) { ADD_FAILURE() << line; }
 
-// The RoboRIO loop must tick on its own clock whatever NetComm does: with
-// the helper inside a refresh that has not returned (the daemon's round
-// trip), the loop's Read returns at once with the last refreshed flags. A
-// Read that waited for the refresh in flight (a lock held across it) would
-// stall the loop, and with it the State per gateway tick, for the length of
-// the round trip.
-// REQ-RT-13
-TEST(DriverStationReader, ALoopReadDoesNotWaitForARefreshInFlight) {
+// The packet the loop sends must be one Driver Station refresh, never a mix
+// of two: a mixed sample can show every input neutral although no packet
+// did (stick 0 moving from (0, 0.9) to (0.9, 0), read half before and half
+// after, is (0, 0) or (0.9, 0.9)), and right after a new mode generation
+// OperatorArming arms on an all-neutral sample, so the next packet drives
+// on a stick being held. And the loop must not wait for a refresh: with the
+// helper stopped mid-snapshot (B's flags and first axis written, a NetComm
+// call that has not returned), the loop's Read returns at once with the last
+// whole snapshot, A; once the helper finishes, B whole.
+// REQ-SAFE-13, REQ-RT-13
+TEST(DriverStationReader, ALoopReadIsOneWholeRefreshAndNeverWaitsForOne) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
   DriverStationReader reader{CallsThrough(gate), ClockThrough(clock), NoReport,
                              kNeverAbandon};
   reader.Start(0);
-  gate->SetFlags(kTeleopEnabled);
+  gate->SetSample(kA);
   ASSERT_TRUE(gate->Step());
-  EXPECT_EQ(reader.Read(kT0, kTimeoutUs), kTeleopEnabled);
+  const ds::DriverStationData first = reader.Read(kT0, kTimeoutUs);
+  EXPECT_TRUE(first == kA) << Describe(first);
 
+  gate->SetSample(kB);
   gate->Hold();
-  gate->SetFlags(0);
   gate->Post();
   ASSERT_TRUE(gate->WaitHeld());
-  auto read = std::async(std::launch::async,
-                         [&] { return reader.Read(kT0 + 5'000, kTimeoutUs); });
+  auto read = std::async(std::launch::async, [&] {
+    return ds::DriverStationData{reader.Read(kT0 + 5'000, kTimeoutUs)};
+  });
   const bool returned =
       read.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
   gate->Release();
   ASSERT_TRUE(returned) << "the loop's Read waited for the refresh in flight";
-  EXPECT_EQ(read.get(), kTeleopEnabled)
-      << "the loop's Read did not return the last refreshed flags";
+  const ds::DriverStationData during = read.get();
+  EXPECT_TRUE(during == kA) << "read mid-snapshot: " << Describe(during)
+                            << ", expected " << Describe(kA);
+
+  ASSERT_TRUE(gate->WaitIdle());
+  const ds::DriverStationData after = reader.Read(kT0 + 5'000, kTimeoutUs);
+  EXPECT_TRUE(after == kB) << Describe(after);
+}
+
+// The same, across threads with the helper refreshing as fast as it can,
+// writing kA and kB in turn field by field: every Read the loop makes is one
+// of them whole (or no Driver Station, before the first), its flags and its
+// inputs from the same refresh. The publication's memory ordering is what
+// this exercises; the test above pins the slot handover.
+// REQ-SAFE-13
+TEST(DriverStationReader, ReadsDuringConstantRefreshesSeeOnlyWholeRefreshes) {
+  constexpr int kRefreshes = 10'000;
+  auto gate = std::make_shared<Gate>();
+  const TestClock clock = MakeClock();
+  DriverStationReader reader{CallsThrough(gate), ClockThrough(clock), NoReport,
+                             kNeverAbandon};
+  reader.Start(0);
+  gate->FreeRun();
+  int reads = 0;
+  int mixed = 0;
+  ds::DriverStationData first_mixed{};
+  while (gate->refreshes.load() < kRefreshes) {
+    const ds::DriverStationData& view = reader.Read(kT0, kTimeoutUs);
+    ++reads;
+    if (!(view == kA || view == kB || view == kNoDriverStation)) {
+      if (mixed++ == 0) first_mixed = view;
+    }
+  }
+  EXPECT_EQ(mixed, 0) << "of " << reads
+                      << " reads; the first: " << Describe(first_mixed);
 }
 
 // A refresh that does not return (a wedged NetComm daemon) must not leave
-// the gateway enabled on the last flags it saw: once the last completed
+// the gateway enabled on the last snapshot it saw: once the last completed
 // refresh is command_timeout_us old, the loop reads no Driver Station (flags
-// 0), so the gateway disables. When the refresh returns, the mode comes back
-// as a new mode generation, never the one issued before the gap, so no
-// target stamped with the old generation can drive (ARCHITECTURE.md
-// "Targets"). The loop's sequence here is Robot.cpp's: Read, then the
-// ModeTracker observes the flags and stamps the packet.
+// 0, so the gateway disables; every stick disconnected, no axis or button),
+// and when the refresh returns, the mode comes back as a new mode
+// generation, never the one issued before the gap, so no target stamped
+// with the old generation can drive (ARCHITECTURE.md "Targets"). The loop's
+// sequence here is Robot.cpp's: Read, then the ModeTracker observes the
+// flags and stamps the packet built from the same view.
 // REQ-SAFE-10
-TEST(DriverStationReader, AViewNotRefreshedWithinTheTimeoutHasNoMode) {
+TEST(DriverStationReader, AViewNotRefreshedWithinTheTimeoutHasNoDriverStation) {
   auto gate = std::make_shared<Gate>();
   const TestClock clock = MakeClock();
   DriverStationReader reader{CallsThrough(gate), ClockThrough(clock), NoReport,
                              kNeverAbandon};
   reader.Start(0);
   ds::ModeTracker tracker;
-  struct Tick {
-    uint32_t flags;
-    uint64_t generation;
-  };
   const auto tick = [&](uint64_t now_us) {
-    const uint32_t flags = reader.Read(now_us, kTimeoutUs);
-    tracker.Observe(flags, now_us);
-    ds::DriverStationData packet{};
+    ds::DriverStationData packet = reader.Read(now_us, kTimeoutUs);
+    tracker.Observe(packet.fms.flags, now_us);
     packet.sample_time_us = now_us;
-    packet.fms.flags = flags;
     tracker.Stamp(packet);
-    return Tick{flags, packet.mode_since_us};
+    return packet;
   };
 
-  gate->SetFlags(kTeleopEnabled);
+  gate->SetSample(kA);
   ASSERT_TRUE(gate->Step());
-  const Tick enabled = tick(kT0);
-  ASSERT_EQ(enabled.flags, kTeleopEnabled);
+  const ds::DriverStationData enabled = tick(kT0);
+  ASSERT_EQ(enabled.fms.flags, kTeleopEnabled);
 
   gate->Hold();
   gate->Post();
   ASSERT_TRUE(gate->WaitHeld());
-  const Tick last_fresh = tick(kT0 + kTimeoutUs - 1);
-  EXPECT_EQ(last_fresh.flags, kTeleopEnabled)
+  const ds::DriverStationData last_fresh = tick(kT0 + kTimeoutUs - 1);
+  EXPECT_EQ(last_fresh.fms.flags, kTeleopEnabled)
       << "a refresh younger than the timeout read as stale";
-  EXPECT_EQ(last_fresh.generation, enabled.generation);
-  const Tick stale = tick(kT0 + kTimeoutUs);
-  EXPECT_EQ(stale.flags, 0u)
+  EXPECT_EQ(last_fresh.mode_since_us, enabled.mode_since_us);
+  ds::DriverStationData stale = tick(kT0 + kTimeoutUs);
+  EXPECT_EQ(stale.fms.flags, 0u)
       << "a refresh " << kTimeoutUs << " us old still drives the gateway";
+  stale.sample_time_us = 0;
+  stale.mode_since_us = 0;
+  EXPECT_TRUE(stale == kNoDriverStation)
+      << "a stale view carries inputs: " << Describe(stale);
 
   clock->store(kT0 + kTimeoutUs + 5'000);
   gate->Release();
-  ASSERT_TRUE(gate->WaitUntil([&] { return gate->waits > gate->posted; }));
-  const Tick resumed = tick(kT0 + kTimeoutUs + 5'000);
-  EXPECT_EQ(resumed.flags, kTeleopEnabled);
-  EXPECT_GT(resumed.generation, enabled.generation)
+  ASSERT_TRUE(gate->WaitIdle());
+  const ds::DriverStationData resumed = tick(kT0 + kTimeoutUs + 5'000);
+  EXPECT_EQ(resumed.fms.flags, kTeleopEnabled);
+  EXPECT_GT(resumed.mode_since_us, enabled.mode_since_us)
       << "the mode came back under the generation issued before the gap";
 }
 
@@ -256,7 +348,7 @@ TEST(DriverStationReader, ReportsTheModeOnlyWhileTheLoopTicks) {
   DriverStationReader reader{CallsThrough(gate), ClockThrough(clock), NoReport,
                              kNeverAbandon};
   reader.Start(0);
-  gate->SetFlags(kAutonomousEnabled);
+  gate->SetSample(Sample(kAutonomousEnabled, 0.0f, 0.0f, 0));
   ASSERT_TRUE(gate->Step());
   EXPECT_TRUE(gate->Observed().empty()) << "reported before the loop ticked";
 
@@ -270,7 +362,7 @@ TEST(DriverStationReader, ReportsTheModeOnlyWhileTheLoopTicks) {
   EXPECT_EQ(gate->Observed().size(), 1u)
       << "reported with the loop's last tick 20.001 ms old";
 
-  gate->SetFlags(ds::kDsAttached | ds::kAutonomous);
+  gate->SetSample(Sample(ds::kDsAttached | ds::kAutonomous, 0.0f, 0.0f, 0));
   reader.Read(kT0 + DriverStationReader::kLoopTickWindowUs + 1, kTimeoutUs);
   ASSERT_TRUE(gate->Step());
   EXPECT_EQ(gate->Observed(),
@@ -300,7 +392,7 @@ TEST(DriverStationReader, StopAbandonsARefreshThatDoesNotReturn) {
         std::chrono::microseconds{0}};
     reader.Start(0);
     reader.Read(kT0, kTimeoutUs);
-    gate->SetFlags(kTeleopEnabled);
+    gate->SetSample(kA);
     gate->Hold();
     gate->Post();
     ASSERT_TRUE(gate->WaitHeld());
