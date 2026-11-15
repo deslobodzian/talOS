@@ -142,8 +142,7 @@ class PositionPyTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
 
-    # matrix: n/a 9 (PositionMechanism parameters, tested in talos's
-    # talOS/mechanisms)
+    # matrix: n/a 9 (PositionMechanism parameters, tested in talos)
 
     # REQ-SAFE-07
     def test_other_modes_lane_is_ignored(self):
