@@ -1,17 +1,23 @@
 # Proposal: robots as TOML plus node folders
 
 Status: a proposal from a design discussion on 2026-11-13. Nothing here is
-built or approved. Commands and file names marked "proposed" do not exist yet.
+built or approved, except where a section says the position is decided.
+Commands and file names marked "proposed" do not exist yet.
 
 ## Goal
 
 Students and mentors design subsystems and coordinators as nodes that are easy
-to add to a robot, and building one is fast.
+to add to a robot, and building one is fast. Easy means a short path from
+nothing to a running, tested node the student owns and can change, not a
+mechanism configured without code.
 
 ## Recommendation
 
 1. **talOS is a stable framework, released rarely and consumed prebuilt.** It
-   ships the runtime, standard messages and a set of stock nodes.
+   ships the runtime, standard messages, libraries (geometry, kinematics,
+   controllers, trajectories, vision, the optional mechanism helpers), the
+   framework nodes a robot configures in TOML (`teleop`, `telemetry`) and the
+   scaffold that starts a new node.
 2. **Each season's robot is one repo of its own**, made of TOML files plus one
    folder per custom node.
 3. **A node moves to its own repo only on its second use** (another robot or
@@ -26,8 +32,13 @@ A repo per node from the start is workable but not recommended; see
 
 - runtime, devices, launcher, simulator, Studio
 - standard messages that all nodes speak
-- stock nodes used from TOML alone: swerve, position mechanism, velocity
-  mechanism, roller with sensor, camera, pose estimator, teleop, telemetry
+- framework nodes configured in TOML: `teleop`, `telemetry`
+- libraries robot nodes are built on: `talOS/geometry` (and its kinematics),
+  `talOS/vision`, `talOS/trajectory`, controllers, and `talOS/mechanisms`
+  (position, velocity and roller-with-sensor helpers a node may call)
+
+talOS ships no mechanism, drivetrain, camera or pose-estimator node. Those are
+robot code (decided).
 
 **Robot repo** (one per season, created from a template):
 
@@ -39,6 +50,9 @@ robot-2026/
   trajectories/
   dashboard.toml
   nodes/
+    drivetrain/          swerve node built on talOS geometry and kinematics
+    camera/              built on talOS/vision
+    pose_estimator/
     intake/              node code, default TOML, its own test
     shooter/
     superstructure/      a coordinator: same shape as a subsystem
@@ -63,31 +77,36 @@ learn.
 
 ## Three levels of effort
 
+Every mechanism is a node the student writes and owns (decided). The levels
+differ in how much of it is generated or borrowed, not in whether there is code.
+
 | What you need | What you write |
 |---|---|
-| A standard mechanism | a TOML file pointing at a stock talOS node |
-| Something unusual | a Python node in `nodes/` |
-| Something performance-critical | a C++ node in `nodes/` |
+| Driver controls, telemetry, target lanes | TOML for the framework nodes (`teleop`, `telemetry`) and the target policy |
+| A common mechanism | a node from the scaffold (`--type velocity`, `position` or `estimator`), edited to fit; it may call `talOS/mechanisms` |
+| Something unusual or performance-critical | a Python or C++ node written from nothing, with or without the mechanism helpers |
 
 ## Day-to-day workflows
 
-**Add a subsystem** (commands proposed):
+**Add a subsystem:**
 
-1. `talos new intake --type roller` creates the folder and its `robot.toml`
-   entry.
-2. Edit the node and run `talos test intake` until it behaves.
-3. Run `talos sim`.
+1. `bazel run //tools:new_subsystem -- intake --lang py --type velocity`
+   creates the node package, its test, its subsystem file and its
+   `robot.toml` entry.
+2. Edit the node and run its test (`bazel test //<robot>/main_processor/intake:all`)
+   until it behaves.
+3. Run `./sim.sh`.
 
-**Change a stock node such as swerve:**
+In a robot repo outside talOS the same steps become proposed `talos new`,
+`talos test` and `talos sim` commands.
+
+**Change a robot node such as swerve:**
 
 | Change | What to do |
 |---|---|
 | A gain, limit or geometry value | edit the robot's TOML |
-| Behavior every robot should get | change talOS against a local override, release it, bump the robot's pin |
-| Behavior only this robot needs, or an emergency fix | copy the node into `nodes/` and point the TOML at the copy |
-
-A copied node stops receiving talOS fixes. The copy command should record the
-talOS version it came from so a later diff is easy.
+| The node's behavior | edit the node in `nodes/` |
+| A library the node uses (kinematics, vision, mechanism helpers) | change talOS against a local override, release it, bump the robot's pin |
 
 ## Build speed
 
@@ -177,9 +196,7 @@ grouping is done with:
 - a scaffolded robot's simulator points into `2026-robot`
 - no remote build cache
 - the node list needs a manual regenerate step after a TOML change
-- no stock mechanism nodes; each robot writes a wrapper
 - each subsystem defines its own messages
-- swerve, pose estimator and camera nodes live in `2026-robot`
 
 ## Work, in order
 
@@ -188,7 +205,7 @@ grouping is done with:
 | 1 | Remote build cache filled by CI | Medium |
 | 2 | Robot repo outside talOS: tagged releases, standalone robot scaffold, sim entry point, generic sim gateway in talOS, Studio and bundle from an external repo, a home for the RoboRIO program | Large |
 | 3 | Generate the node list from `robot.toml` during the build | Medium |
-| 4 | Stock nodes and standard messages, one node at a time, starting with roller and position | Large |
+| 4 | Standard messages, one message family at a time, starting with roller and position | Large |
 | 5 | Migrate `2026-robot` into the template | Medium |
 | 6 | Prebuilt talOS release per platform, if the cache alone is not fast enough | Large |
 
@@ -199,11 +216,12 @@ runs in simulation.
 
 - **Requirements.** The catalogue covers a standalone subsystem repo
   (`REQ-DEV-02`) and a robot beside `2026-robot/` (`REQ-DEV-23`). A standalone
-  robot repo, stock nodes and a remote cache each need a new requirement.
+  robot repo, standard messages and a remote cache each need a new requirement.
 - **Design notes** for steps 2 and 4: how talOS is distributed, and what the
   standard target and state messages are.
 - **Cache hosting.** It is an outside service the team runs or pays for.
-- **Generic messages.** Stock nodes need shared message types, so
+- **Generic messages.** Shared message types let dashboards and
+  coordinators treat mechanisms alike, so
   `IntakeTarget.roller_velocity_rps` becomes something like a shared
   `VelocityTarget`. Logs and dashboards lose the per-mechanism field names.
 
