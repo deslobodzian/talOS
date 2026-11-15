@@ -9,8 +9,11 @@ import {renderToStaticMarkup} from 'react-dom/server';
 
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import {hardwarePanel} from '../src/panels/hardware';
+import {canBuses, canBusReading} from '../src/data/robot';
 import {
   bitHistory,
+  canBusLines,
+  canBusSeriesChannels,
   counterRate,
   flagBands,
 } from '../src/panels/hardware/logic';
@@ -85,6 +88,58 @@ test('decimateMinMax breaks runs at NaN gaps', () => {
   assert.equal(runs.length, 2);
   assert.deepEqual(runs[0].map(s => s.yMax), [3]);
   assert.deepEqual(runs[1].map(s => s.yMax), [6]);
+});
+
+// /hw/status always carries all four can_buses slots, whatever can_bus_count
+// says: a series holding every slot, as the store hands it back.
+function canBusSeries(slots: Array<{state: number[]; frac: number[]}>) {
+  const values: Record<string, Float64Array> = {};
+  for (let i = 0; i < 4; i++) {
+    const slot = slots[i] ?? {state: [0, 0, 0], frac: [0, 0, 0]};
+    values[`hw/status/can_buses/${i}/read_state`] = Float64Array.from(slot.state);
+    values[`hw/status/can_buses/${i}/utilization_frac`] = Float64Array.from(slot.frac);
+  }
+  return {times: Float64Array.from([0, 1, 2]), values};
+}
+
+// REQ-OPS-20: the utilization chart draws the can_bus_count buses in use, not
+// the four fixed slots /hw/status carries.
+test('the CAN utilization chart draws only the buses in use', () => {
+  const series = canBusSeries([{state: [1, 1, 1], frac: [0.1, 0.2, 0.3]}]);
+  const lines = canBusLines(1, series);
+  assert.deepEqual(lines.map(l => l.name), ['rio']);
+  assert.deepEqual(Array.from(lines[0].values), [0.1, 0.2, 0.3]);
+  // No configuration reported yet: no bus, and no line.
+  assert.deepEqual(canBusLines(0, series), []);
+  assert.deepEqual(canBusLines(undefined, series), []);
+  assert.deepEqual(canBusSeriesChannels(0), []);
+});
+
+// REQ-OPS-20: a bus whose read failed, went stale or never happened has no
+// utilization (its figure is the last good read's, 0 before one): the chart
+// breaks its line there and the bus model carries no figure, so it never
+// reads as an idle bus.
+test('an unread CAN bus has no utilization, in the chart or the model', () => {
+  const series = canBusSeries([
+    {state: [1, 3, 1], frac: [0.2, 0.2, 0.3]},  // OK, FAILED, OK
+    {state: [0, 3, 4], frac: [0, 0, 0]}         // NONE, FAILED, STALE
+  ]);
+  const lines = canBusLines(2, series);
+  assert.equal(lines.length, 2);
+  assert.deepEqual(Array.from(lines[0].values), [0.2, NaN, 0.3]);
+  assert.ok(Array.from(lines[1].values).every(v => Number.isNaN(v)),
+            `the unread bus is drawn at ${Array.from(lines[1].values)}`);
+
+  const B = 'hw/status/can_buses/';
+  const buses = canBuses({
+    'hw/status/can_bus_count': 2,
+    [B + '0/read_state']: 0, [B + '0/utilization_frac']: 0,
+    [B + '1/read_state']: 3, [B + '1/utilization_frac']: 0,
+    [B + '1/bus_off_count']: 4
+  });
+  assert.deepEqual(buses.map(b => b.frac), [null, null]);
+  assert.deepEqual(buses.map(canBusReading), ['not read', 'failed']);
+  assert.equal(buses[1].busOff, 4);
 });
 
 // --- rendering -------------------------------------------------------------

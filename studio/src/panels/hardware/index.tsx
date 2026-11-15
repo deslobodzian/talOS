@@ -20,7 +20,14 @@ import {DataTable, type Column} from '../../ui/DataTable';
 import {EmptyState, StatList} from '../../ui/primitives';
 import {TimeSeriesChart} from '../../ui/TimeSeriesChart';
 import type {PanelDefinition} from '../types';
-import {bitHistory, counterRate, flagBands, type BitHistory} from './logic';
+import {
+  bitHistory,
+  canBusLines,
+  canBusSeriesChannels,
+  counterRate,
+  flagBands,
+  type BitHistory
+} from './logic';
 import {ChannelReading, ChannelStat as Stat, FreshnessNotice} from '../../ui/FreshnessNotice';
 import './hardware.css';
 
@@ -186,10 +193,8 @@ function HardwarePanel() {
   };
 
   const buses = canBuses(ch);
-  const busChannels = useMemo(
-      () => [0, 1, 2, 3].map(i => `${HW}can_buses/${i}/utilization_frac`)
-          .filter(name => present.has(name)),
-      [present]);
+  const busCount = num('can_bus_count');
+  const busChannels = useMemo(() => canBusSeriesChannels(busCount), [busCount]);
   const power = useSeries(
       [`${HW}battery_v`, `${HW}brownout`, ...busChannels], {seconds: 120});
   const age = useSeries([`${HW}state_age_us`], {seconds: 120});
@@ -249,6 +254,7 @@ function HardwarePanel() {
   }
 
   const brownoutBands = flagBands(power.times, power.values[`${HW}brownout`]);
+  const busLines = canBusLines(busCount, power);
   const timedOutBits = bitHistory(
       masks.times, masks.values[`${HW}timed_out_mask`], subsystemCount ?? 32);
   const faultBits = bitHistory(masks.times, masks.values[`${HW}motor_fault_mask`]);
@@ -281,16 +287,16 @@ function HardwarePanel() {
           }).</p>
       </div>
       <CanBusTable buses={buses}/>
-      {busChannels.length > 0 &&
+      {busLines.length > 0 &&
         <div className="hw-block">
           <h3>CAN utilization · 2 min</h3>
           <TimeSeriesChart
-              lines={busChannels.map((name, i) => ({
-                name: buses[i]?.label ?? name,
-                color: BUS_COLORS[i % BUS_COLORS.length],
-                times: power.times, values: power.values[name]}))}
-              height={72} legend={busChannels.length > 1}/>
-          <p className="chart-note">A failed or stale bus holds its last good figure here; its row above says which.</p>
+              lines={busLines.map(line => ({
+                name: line.name,
+                color: BUS_COLORS[line.index % BUS_COLORS.length],
+                times: power.times, values: line.values}))}
+              height={72} legend={busLines.length > 1}/>
+          <p className="chart-note">A bus's line breaks wherever its read was not current (failed, stale or not yet read); its row above says which.</p>
         </div>}
     </section>
 
