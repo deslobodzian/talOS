@@ -64,7 +64,7 @@ cc_test(
 
 # REQ-DEV-31: the launcher starts the simulator on the config's ports. Over
 # 1 s, integration lane: the launcher runs the bridge and the simulator over
-# loopback UDP for a 1 s session (--duration-s counts whole seconds).
+# loopback UDP until the bridge accepts a State, then stops the session.
 py_test(
     name = "launcher_ports_test",
     size = "small",

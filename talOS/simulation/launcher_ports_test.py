@@ -3,19 +3,25 @@ ports, with no port written by hand, so the bridge receives its State."""
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import unittest
 
 from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
 
-DURATION_S = 1
-# Bounds a hang, not the run, which lasts DURATION_S: below Bazel's 60 s
-# `short` timeout, so a hang fails with the launcher's output.
-LAUNCH_TIMEOUT_S = 30
+# Each bounds a hang, not the run (docs/TESTING.md §6): the test waits for
+# the bridge's first accepted State, then stops the session. Together below
+# Bazel's 60 s `short` timeout, so a hang fails with the launcher's output.
+FIRST_STATE_TIMEOUT_S = 15
+STOP_TIMEOUT_S = 20
 LOG_DUMP_TIMEOUT_S = 10
+# What hardware_node prints on the first State it accepts from a gateway
+# boot (HardwareNode::ReportGatewayBuild); the launcher echoes it.
+FIRST_STATE_LINE = "hardware_node: gateway boot "
 # talOS/introspection/registry.h kRegistryPath. The launcher leaves the
 # registry for later sessions, so the test unlinks its own.
 REGISTRY = "/talos_registry.6"
@@ -89,24 +95,42 @@ class LauncherPortsTest(unittest.TestCase):
                         "[subsystems]\n")
             output = os.path.join(work, "sessions")
             args = [launcher, "--config", config, "--sim",
-                    "--start-sim-gateway", "--output-dir", output,
-                    "--duration-s", str(DURATION_S)]
-            try:
-                run = subprocess.run(args, cwd=work, capture_output=True,
-                                     text=True, timeout=LAUNCH_TIMEOUT_S,
-                                     check=False)
-            except subprocess.TimeoutExpired as hung:
-                self.fail(f"launcher still running after {hung.timeout:.0f} "
-                          f"s: {hung.stdout!r} {hung.stderr!r}")
+                    "--start-sim-gateway", "--output-dir", output]
+            lines = []
+            first_state = threading.Event()
+
+            def drain(stream):
+                for line in stream:
+                    lines.append(line)
+                    if line.startswith(FIRST_STATE_LINE):
+                        first_state.set()
+
+            with subprocess.Popen(args, cwd=work, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT,
+                                  text=True) as run:
+                reader = threading.Thread(target=drain, args=(run.stdout,))
+                reader.start()
+                received = first_state.wait(FIRST_STATE_TIMEOUT_S)
+                # SIGINT stops the session in order, as Ctrl-C does.
+                run.send_signal(signal.SIGINT)
+                try:
+                    run.wait(STOP_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    run.kill()
+                    run.wait()
+                reader.join()
             diagnostics = (f"ports {controller_port}, {local_port} "
                            f"(released before the launch; another process "
-                           f"may have taken one)\n{run.stdout}{run.stderr}")
+                           f"may have taken one)\n{''.join(lines)}")
+            self.assertTrue(received,
+                            f"the bridge accepted no State within "
+                            f"{FIRST_STATE_TIMEOUT_S} s: {diagnostics}")
             self.assertEqual(run.returncode, 0, diagnostics)
             (session,) = os.listdir(output)
             published = states_published(log_dump,
                                          os.path.join(output, session))
-        # The simulator ticks every 5 ms, so a 1 s session carries about
-        # 200; one proves the State crossed the config's ports.
+        # The bridge publishes each State it accepts; one proves the State
+        # crossed the config's ports.
         self.assertGreater(published, 0,
                            f"no /hw/state published: {diagnostics}")
 
