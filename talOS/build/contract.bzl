@@ -1226,25 +1226,31 @@ _LOG_DUMP = Label("//talOS/launcher:log_dump")
 _SESSION_REPORT = Label("//talOS/launcher:session_report")
 _REGISTRY_UNLINK = Label("//talOS/build:registry_unlink")
 
-def talos_sim_test(name, sim, duration_s = 3, **kwargs):
-    """Runs the talos_sim target `sim` for `duration_s` and judges its session.
+def talos_sim_test(name, sim, settle_s = 1, **kwargs):
+    """Runs the talos_sim target `sim` until it is up, stops it and judges its session.
 
-    Fails unless the launch exits 0; every member of the session's manifest
-    ran exactly once and exited with code 0 and no signal; the session holds
-    the simulator and a node besides it and the hardware bridge; and the
-    bridge received State from the simulator (session_report's "controller
-    link" verdict). A launch still running near Bazel's timeout is stopped
-    with every process it started, and fails with its output. The check is
-    talOS/build/sim_check.py.
+    The session runs until the bridge has accepted a State from the
+    simulator and every member's loop has started (however long the members
+    take to construct), then `settle_s` more, and is then stopped in order
+    with SIGINT. The test fails unless that happens before a bound derived
+    from Bazel's timeout (a hang, stopped with every process it started and
+    reported with its output); the launch runs until stopped and exits 0;
+    every member of the session's manifest ran exactly once and exited with
+    code 0 and no signal; the session holds the simulator and a node besides
+    it and the hardware bridge; and the bridge received State (session_report's
+    "controller link" verdict). The check is talOS/build/sim_check.py.
 
     Tagged `e2e` (it runs the whole config) and `exclusive` (it does, on as
-    many cores as the robot uses), as Bazel's `medium` size with the `short`
-    timeout unless given.
+    many cores as the robot uses), as Bazel's `medium` size (its `moderate`
+    timeout) unless given.
 
     Args:
       name: test target name.
       sim: the label of a talos_sim target.
-      duration_s: how long the session runs, in seconds of real time.
+      settle_s: seconds the session runs once it is up, before the stop: a
+        member that fails soon after starting fails the test. It does not
+        bound startup. A value leaving less than 10 s of the timeout for
+        startup, after 45 s for the stop, fails the test before it starts.
       **kwargs: passed to py_test.
     """
     sim_label = native.package_relative_label(sim)
@@ -1252,14 +1258,13 @@ def talos_sim_test(name, sim, duration_s = 3, **kwargs):
     py_test(
         name = name,
         size = kwargs.pop("size", "medium"),
-        timeout = kwargs.pop("timeout", "short"),
         srcs = [_SIM_CHECK],
         main = _SIM_CHECK,
         args = [
             "--sim",
             "$(rlocationpath %s)" % sim_label,
-            "--duration-s",
-            str(duration_s),
+            "--settle-s",
+            str(settle_s),
             "--log-dump",
             "$(rlocationpath %s)" % _LOG_DUMP,
             "--session-report",

@@ -1,13 +1,28 @@
-"""The check talos_sim_test (contract.bzl) runs: a talos_sim target for a
-bounded time, judged from the session it records.
+"""The check talos_sim_test (contract.bzl) runs: a talos_sim target, judged
+from the session it records.
 
-    sim_check.py --sim RLOCATION --duration-s N --log-dump RLOCATION
+    sim_check.py --sim RLOCATION --settle-s N --log-dump RLOCATION
         --session-report RLOCATION --registry-unlink RLOCATION
 
-It runs `<sim> --duration-s N --output-dir <tmp> --remote 127.0.0.1
---remote-port P --local-port Q` on free loopback ports and passes only when:
+It runs `<sim> --output-dir <tmp> --remote 127.0.0.1 --remote-port P
+--local-port Q` on free loopback ports, with no --duration-s, and waits for
+two events: the bridge has accepted a State (its `hardware_node: gateway
+boot ` line in `<session>/hardware_node.log`, printed on the first State it
+accepts from each gateway boot), and every member of the session's manifest
+has a run whose loop has started (the manifest's per-node `realtime`, which
+the launcher records from the run's registry row once the node reports it,
+right before its loop runs, and posts as a manifest version). It wakes on
+file events (inotify on Linux, kqueue on macOS) and on the launch's exit,
+never on a timer. Once both hold, the session runs `settle_s` more and then
+gets SIGINT, so the launcher stops it in order. A member whose run ends
+before then ends the wait at once. So a slow-starting member (a Python node
+importing a large library, a loaded host) delays the stop, and only the
+hang bound below can fail a session for being slow.
 
-- the launch exits 0 before its hang bound;
+It passes only when:
+
+- the events above came before the hang bound;
+- the launch kept running until the check stopped it and then exited 0;
 - every member in the session's manifest ran exactly once (a second run is
   a restart) and exited with code 0 and no signal;
 - the session holds the simulator and at least one node besides it and the
@@ -15,29 +30,30 @@ It runs `<sim> --duration-s N --output-dir <tmp> --remote 127.0.0.1
 - the bridge received State from the simulator: session_report's
   "controller link" verdict (talOS/launcher/session_report.py,
   controller_link), from the session's /hw/state and /hw/status records,
-  is PASS. The exit statuses cannot say this: the launcher ends a bounded
-  session by stopping every member, and a stopped bridge exits 0 whether or
-  not a State arrived;
+  is PASS. The exit statuses cannot say this: a stopped bridge exits 0
+  whether or not a State arrived;
 - no process of the launch is left once it has ended.
 
 The members come from the session's manifest, never from a list here.
 
-A hang. The launch runs in a session of its own (setsid). Still running at
-its bound, which is Bazel's TEST_TIMEOUT less the time the stop below may
-take, it gets SIGTERM to its process group (the runner and the launcher,
-which stops its session in order), then SIGKILL after STOP_WAIT_S. Each
-member leads a process group of its own in the same session and dies with
-the launcher by its guardian (talOS/launcher, REQ-SAFE-30), so the check
-then waits, on the kernel's exit notifications, for every process left in
-the launch's session, kills any still there after EXIT_WAIT_S, and fails
-naming them. A failure prints the launch's output.
+A hang. The launch runs in a session of its own (setsid). The wait for the
+events is bounded by Bazel's TEST_TIMEOUT less `settle_s` and the bounds of
+the steps after it (HANG_MARGIN_S); a launch that does not stop within
+STOP_WAIT_S of its SIGINT gets SIGTERM to its process group (the runner and
+the launcher), then SIGKILL after STOP_WAIT_S more. Each member leads a
+process group of its own in the same session and dies with the launcher by
+its guardian (talOS/launcher, REQ-SAFE-30), so the check then waits, on
+the kernel's exit notifications, for every process left in the launch's
+session, kills any still there after EXIT_WAIT_S, and fails naming them.
+A process that left the session (a grandchild calling setsid) is not seen.
+A failure prints the launch's output.
 
 Shared memory. The launch runs in the test's namespace (TEST_TMPDIR, which
 ShmObjectName maps every name into), so it never touches a robot's. The
 launcher unlinks its session's topics when it stops in order; the live
 registry it leaves for later sessions is unlinked by registry_unlink,
 which takes the name from ShmObjectName itself. A launch killed past its
-stop leaves its topics; the next run in the same namespace replaces them.
+stop leaves its topics in the namespace.
 """
 
 import argparse
@@ -59,17 +75,26 @@ from python.runfiles import runfiles
 # the launcher gives the bridge and the simulator in every session.
 BRIDGE = "hardware_node"
 SIMULATOR = "sim_gateway"
+# What the bridge prints on the first State it accepts from a gateway boot
+# (HardwareNode::ReportGatewayBuild), which the launcher writes to its log.
+FIRST_STATE_LINE = "hardware_node: gateway boot "
 
 # Bounds on waits that end on an event; each only bounds a hang
 # (docs/TESTING.md §6.3). The launcher's stop gives each member 2 s after
 # its SIGINT, then reaps; a killed process exits at once.
 STOP_WAIT_S = 10
-EXIT_WAIT_S = 10
-KILL_WAIT_S = 10
-LOG_DUMP_TIMEOUT_S = 30
-# Bazel's timeout less what a hang's stop may take, so a hang fails with
-# the launch's output instead of being killed by Bazel.
-HANG_MARGIN_S = STOP_WAIT_S + EXIT_WAIT_S + KILL_WAIT_S + 5
+EXIT_WAIT_S = 5
+KILL_WAIT_S = 5
+LOG_DUMP_TIMEOUT_S = 10
+# What the steps after the wait for the events may take, so that a hang
+# fails with the launch's output instead of being killed by Bazel.
+HANG_MARGIN_S = 2 * STOP_WAIT_S + EXIT_WAIT_S + KILL_WAIT_S + \
+    LOG_DUMP_TIMEOUT_S + 5
+# The shortest wait for the events worth running: a timeout or settle_s
+# leaving less is refused before anything starts.
+MIN_READY_S = 10
+# Bazel's `short` timeout, for a run outside `bazel test`.
+DEFAULT_TIMEOUT_S = 60
 
 
 def udp_ports():
@@ -114,19 +139,31 @@ def session_processes(sid):
     return found
 
 
+LINUX = sys.platform.startswith("linux")
 # pidfd_open(2)'s number on every Linux architecture. Python builds
 # against an older glibc (the hermetic interpreter's) lack os.pidfd_open.
 SYS_PIDFD_OPEN = 434
+# inotify(7): a file written, a directory entry created or renamed in.
+IN_MODIFY = 0x2
+IN_MOVED_TO = 0x80
+IN_CREATE = 0x100
+
+
+def libc():
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def raise_errno():
+    code = ctypes.get_errno()
+    raise OSError(code, os.strerror(code))  # ESRCH: ProcessLookupError
 
 
 def pidfd_open(pid):
     if hasattr(os, "pidfd_open"):
         return os.pidfd_open(pid)
-    libc = ctypes.CDLL(None, use_errno=True)
-    fd = libc.syscall(SYS_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
+    fd = libc().syscall(SYS_PIDFD_OPEN, ctypes.c_int(pid), ctypes.c_uint(0))
     if fd < 0:
-        code = ctypes.get_errno()
-        raise OSError(code, os.strerror(code))  # ESRCH: ProcessLookupError
+        raise_errno()
     return fd
 
 
@@ -135,7 +172,7 @@ def wait_exited(pids, timeout_s):
     those still running. Waits on the kernel's exit notification (a pidfd on
     Linux, a kqueue process filter on macOS), not by polling."""
     deadline = time.monotonic() + timeout_s
-    if sys.platform.startswith("linux"):
+    if LINUX:
         poller = select.poll()
         open_fds = {}
         try:
@@ -181,6 +218,134 @@ def wait_exited(pids, timeout_s):
         queue.close()
 
 
+class Watch:
+    """Wakes on a change to a watched directory's entries or a watched
+    file's contents, or on process `pid`'s exit (inotify and a pidfd on
+    Linux, kqueue on macOS)."""
+
+    def __init__(self, pid):
+        self._fds = []
+        if LINUX:
+            self._inotify = libc().inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if self._inotify < 0:
+                raise_errno()
+            self._fds.append(self._inotify)
+            self._poll = select.poll()
+            self._poll.register(self._inotify, select.POLLIN)
+            try:
+                pidfd = pidfd_open(pid)
+            except ProcessLookupError:
+                return  # already exited: the caller sees it
+            self._fds.append(pidfd)
+            self._poll.register(pidfd, select.POLLIN)
+        else:
+            self._queue = select.kqueue()
+            try:
+                self._queue.control([select.kevent(
+                    pid, select.KQ_FILTER_PROC,
+                    select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                    select.KQ_NOTE_EXIT)], 0, 0)
+            except ProcessLookupError:
+                pass
+
+    def add(self, path, directory):
+        if LINUX:
+            mask = IN_CREATE | IN_MOVED_TO if directory else IN_MODIFY
+            if libc().inotify_add_watch(self._inotify, os.fsencode(path),
+                                        ctypes.c_uint32(mask)) < 0:
+                raise_errno()
+            return
+        fd = os.open(path, getattr(os, "O_EVTONLY", os.O_RDONLY))
+        self._fds.append(fd)
+        self._queue.control([select.kevent(
+            fd, select.KQ_FILTER_VNODE, select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+            select.KQ_NOTE_WRITE | select.KQ_NOTE_EXTEND)], 0, 0)
+
+    def wait(self, timeout_s):
+        if LINUX:
+            for fd, _ in self._poll.poll(max(0, timeout_s) * 1000):
+                if fd == self._inotify:
+                    try:
+                        while os.read(self._inotify, 65536):
+                            pass
+                    except BlockingIOError:
+                        pass
+            return
+        self._queue.control(None, 16, max(0, timeout_s))
+
+    def close(self):
+        for fd in self._fds:
+            os.close(fd)
+        if not LINUX:
+            self._queue.close()
+
+
+def readiness(session):
+    """(done, waiting for): done once the bridge has accepted a State and
+    every member's loop has started, or as soon as any member's run has
+    ended, which no wait can mend."""
+    waiting = []
+    try:
+        with open(os.path.join(session, f"{BRIDGE}.log"), "rb") as f:
+            if FIRST_STATE_LINE.encode() not in f.read():
+                waiting.append("a State accepted by the bridge")
+    except OSError:
+        waiting.append("a State accepted by the bridge")
+    try:
+        with open(os.path.join(session, "manifest.json"),
+                  encoding="utf-8") as f:
+            nodes = json.load(f)["nodes"]
+    except (OSError, ValueError, KeyError):
+        return False, waiting + ["the session manifest"]
+    starting = []
+    for node in nodes:
+        runs = node.get("runs") or []
+        if runs and runs[-1].get("end_wall_ns"):
+            return True, []
+        if not runs or not node.get("realtime"):
+            starting.append(node["name"])
+    if starting:
+        waiting.append(f"the loops of {', '.join(starting)} to start")
+    return not waiting, waiting
+
+
+def wait_ready(launch, out, timeout_s):
+    """Waits for readiness() of the session the launch writes under `out`,
+    for the launch's exit, or `timeout_s`: returns what it was still
+    waiting for (empty when ready or the launch exited)."""
+    deadline = time.monotonic() + timeout_s
+    watch = Watch(launch.process.pid)
+    try:
+        watch.add(out, directory=True)
+        session = None
+        log_watched = False
+        waiting = ["the session directory"]
+        while launch.process.poll() is None:
+            # Watches are added before the files are read, so a change
+            # after a read wakes the next wait.
+            if session is None:
+                found = [os.path.join(out, d) for d in os.listdir(out)
+                         if os.path.isdir(os.path.join(out, d))]
+                if found:
+                    session = found[0]
+                    watch.add(session, directory=True)
+            if session is not None:
+                log = os.path.join(session, f"{BRIDGE}.log")
+                if not log_watched and os.path.exists(log):
+                    watch.add(log, directory=False)
+                    log_watched = True
+                done, waiting = readiness(session)
+                if done:
+                    return []
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return waiting
+            watch.wait(left)
+        return []
+    finally:
+        watch.close()
+
+
 class Launch:
     """A command run in a session of its own, its output to `output` (a
     file: a pipe would stay open while any process holds it)."""
@@ -199,22 +364,25 @@ class Launch:
         except ProcessLookupError:
             pass
 
-    def finish(self, hang_s, stop_wait_s=STOP_WAIT_S,
-               exit_wait_s=EXIT_WAIT_S):
-        """Waits up to `hang_s` for the launch; one still running is stopped
-        as a hang (module docstring). Returns (its exit status, None if it
-        hung; the pids of its session that had to be killed after it
-        ended). Leaves no process of the session behind either way."""
-        status = None
-        try:
-            status = self.process.wait(timeout=hang_s)
-        except subprocess.TimeoutExpired:
-            self._signal_group(signal.SIGTERM)
+    def finish(self, stop_wait_s=STOP_WAIT_S, exit_wait_s=EXIT_WAIT_S):
+        """Stops the launch with SIGINT, as Ctrl-C does; one that does not
+        exit within `stop_wait_s` is stopped as a hang (module docstring).
+        Returns (whether it stopped on SIGINT, or had already exited; the
+        pids of its session that had to be killed after it ended). Leaves
+        no process of the session behind either way."""
+        in_order = True
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGINT)
             try:
                 self.process.wait(timeout=stop_wait_s)
             except subprocess.TimeoutExpired:
-                self._signal_group(signal.SIGKILL)
-                self.process.wait()
+                in_order = False
+                self._signal_group(signal.SIGTERM)
+                try:
+                    self.process.wait(timeout=stop_wait_s)
+                except subprocess.TimeoutExpired:
+                    self._signal_group(signal.SIGKILL)
+                    self.process.wait()
         left = wait_exited(session_processes(self.sid), exit_wait_s)
         left |= session_processes(self.sid)
         for pid in left:
@@ -223,7 +391,7 @@ class Launch:
             except ProcessLookupError:
                 pass
         wait_exited(left, KILL_WAIT_S)
-        return status, sorted(left)
+        return in_order, sorted(left)
 
 
 def load_session_report(path):
@@ -286,18 +454,26 @@ def judge(session, log_dump, report):
     return problems
 
 
-def hang_bound(duration_s):
-    """Seconds the launch may run before it is stopped as a hang."""
-    timeout = os.environ.get("TEST_TIMEOUT")
-    if timeout:
-        return max(duration_s, int(timeout) - HANG_MARGIN_S)
-    return duration_s + HANG_MARGIN_S
+def ready_bound(settle_s):
+    """Seconds the wait for the events may take: Bazel's timeout less
+    `settle_s` and HANG_MARGIN_S. Raises ValueError, naming both, when that
+    leaves less than MIN_READY_S."""
+    timeout = int(os.environ.get("TEST_TIMEOUT") or DEFAULT_TIMEOUT_S)
+    bound = timeout - settle_s - HANG_MARGIN_S
+    if bound < MIN_READY_S:
+        raise ValueError(
+            f"settle_s = {settle_s} leaves {bound} s of the test's {timeout} "
+            f"s timeout to wait for the session to start (at least "
+            f"{MIN_READY_S} s are needed after {HANG_MARGIN_S} s for the "
+            "stop): lower settle_s or give the test a longer timeout")
+    return bound
 
 
-def check(sim, duration_s, log_dump, session_report, registry_unlink,
-          hang_s):
-    """Runs `sim` for `duration_s` and judges it: (problems, diagnostics);
-    no problems is a pass."""
+def check(sim, settle_s, log_dump, session_report, registry_unlink,
+          ready_s):
+    """Runs `sim`, waits up to `ready_s` for it to be ready, lets it run
+    `settle_s` more, stops it and judges it: (problems, diagnostics); no
+    problems is a pass."""
     report = load_session_report(session_report)
     gateway_port, bridge_port = udp_ports()
     with tempfile.TemporaryDirectory(
@@ -305,12 +481,25 @@ def check(sim, duration_s, log_dump, session_report, registry_unlink,
         out = os.path.join(tmp, "sessions")
         os.makedirs(out)
         output_path = os.path.join(tmp, "launch.log")
-        args = [sim, "--duration-s", str(duration_s), "--output-dir", out,
-                "--remote", "127.0.0.1", "--remote-port", str(gateway_port),
+        args = [sim, "--output-dir", out, "--remote", "127.0.0.1",
+                "--remote-port", str(gateway_port),
                 "--local-port", str(bridge_port)]
+        problems = []
         try:
             with open(output_path, "wb") as output:
-                status, killed = Launch(args, output).finish(hang_s)
+                launch = Launch(args, output)
+                waiting = wait_ready(launch, out, ready_s)
+                if waiting:
+                    problems.append(
+                        f"after {ready_s} s, still waiting for "
+                        f"{'; '.join(waiting)}")
+                elif launch.process.poll() is None:
+                    try:
+                        launch.process.wait(timeout=settle_s)
+                    except subprocess.TimeoutExpired:
+                        pass
+                ended = launch.process.poll()
+                in_order, killed = launch.finish()
         finally:
             subprocess.run([registry_unlink], check=False)
         with open(output_path, encoding="utf-8", errors="replace") as f:
@@ -318,16 +507,19 @@ def check(sim, duration_s, log_dump, session_report, registry_unlink,
                            f"{bridge_port} (released before the launch; "
                            "another process may have taken one)\n"
                            f"launch output:\n{f.read()}")
-        problems = []
-        if status is None:
-            problems.append(f"the launch was still running after {hang_s} s "
-                            "and was stopped")
+        status = launch.process.returncode
+        if ended is not None:
+            problems.append(f"the launch ended on its own (exit {ended}) "
+                            "before the check stopped it")
+        elif not in_order:
+            problems.append(f"the launch did not stop within {STOP_WAIT_S} s "
+                            "of SIGINT and was killed")
         elif status != 0:
             problems.append(f"the launch exited {status}")
         if killed:
             problems.append("processes of the launch outlived it and were "
                             f"killed: {killed}")
-        if status is not None:
+        if in_order:
             sessions = [os.path.join(out, d) for d in os.listdir(out)
                         if os.path.isdir(os.path.join(out, d))]
             if len(sessions) != 1:
@@ -350,19 +542,23 @@ def main(argv):
     for flag in ("--sim", "--log-dump", "--session-report",
                  "--registry-unlink"):
         parser.add_argument(flag, required=True)
-    parser.add_argument("--duration-s", type=int, required=True)
+    parser.add_argument("--settle-s", type=int, required=True)
     args = parser.parse_args(argv)
-    hang_s = hang_bound(args.duration_s)
+    try:
+        ready_s = ready_bound(args.settle_s)
+    except ValueError as error:
+        sys.exit(f"sim_check: {error}")
     problems, diagnostics = check(
-        rlocation(args.sim), args.duration_s, rlocation(args.log_dump),
+        rlocation(args.sim), args.settle_s, rlocation(args.log_dump),
         rlocation(args.session_report), rlocation(args.registry_unlink),
-        hang_s)
+        ready_s)
     if problems:
         print(diagnostics, file=sys.stderr)
         print("sim_check: FAILED\n" + "\n".join(f"  {p}" for p in problems),
               file=sys.stderr)
         return 1
-    print(f"sim_check: passed ({args.duration_s} s session)")
+    print(f"sim_check: passed (stopped {args.settle_s} s after the session "
+          "was ready)")
     return 0
 
 
