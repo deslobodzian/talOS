@@ -59,7 +59,7 @@ class PositionCpp {
 
   // A helper, not a requirement: it homes, clamps goals to the travel and
   // latches faults. The node may drive its talos::Motor directly instead
-  // (docs/FIRST_MECHANISM.md).
+  // (docs/FIRST_MECHANISM.md in the talos repository).
   talos::mechanisms::PositionMechanism mechanism_;
   talos::Target<Target> target_;
   talos::Publisher<State> state_;
