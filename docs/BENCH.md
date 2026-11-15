@@ -68,7 +68,7 @@ release all controls, and explicitly re-enable only after checking recovery.
   stopping every member, and a stop exits 0 whether or not a State ever
   arrived. Simulation overrides commissioning only in
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
-- [ ] From `2026-robot/controller_processor/rio`, run `./gradlew deploy`.
+- [ ] From `controller_processor/rio`, run `./gradlew deploy`.
   Expected: generic gateway starts on the RIO and its console line
   `[<s>.<ms>] hardware gateway build <commit> companion 10.56.87.11:5803` names the
   Mini. Record deploy result and RIO console banner.
@@ -89,7 +89,7 @@ release all controls, and explicitly re-enable only after checking recovery.
 ### Bench on another network
 
 On a LAN that is not `10.56.87.x`, build the RIO program for the main
-processor's address, from `2026-robot/controller_processor/rio`:
+processor's address, from `controller_processor/rio`:
 `./gradlew deploy -Pcompanion=<main-processor-ipv4>` (also `buildRio`), on
 the command line each time: Gradle refuses it from a `gradle.properties` or
 the environment, and an empty, hostname or unusable address stops the build. Check that the build's

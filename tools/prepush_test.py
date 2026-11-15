@@ -110,7 +110,7 @@ class PrepushTest(unittest.TestCase):
     def add_gradlew(self):
         """Commits a stub gradlew that records each run in self.gradle_log."""
         self.gradle_log = os.path.join(self.tmp, "gradle_calls")
-        path = "2026-robot/controller_processor/rio/gradlew"
+        path = "controller_processor/rio/gradlew"
         put(os.path.join(self.repo, path),
             f'#!/bin/sh\necho "$*" >> {shlex.quote(self.gradle_log)}\n',
             0o755)

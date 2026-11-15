@@ -92,7 +92,7 @@ second. Underflow/future stamps publish invalid.
 Timing sources: `2026-robot/main_processor/configuration/robot.toml:1-16`, its
 `subsystems/*.toml`, `talOS/bridge/node.cc` (`Tick`, `PushConfig`,
 `CommandDueUs`), `talOS/hardware/endpoint.h` (`Endpoint::Tick`),
-`2026-robot/controller_processor/rio/src/main/cpp/Robot.cpp`
+`controller_processor/rio/src/main/cpp/Robot.cpp`
 (`Robot::StartCompetition`), and
 `2026-robot/main_processor/simulation/sim_gateway.cc`.
 

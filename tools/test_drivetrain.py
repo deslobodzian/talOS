@@ -4,7 +4,7 @@ Two gateways can stand at the RoboRIO end of the UDP link, and both are tested
 the same way because both run the same `talos::hardware::Gateway`:
 
     python3 tools/test_drivetrain.py            # //2026-robot/main_processor/simulation:sim_gateway
-    python3 tools/test_drivetrain.py --wpilib   # 2026-robot/controller_processor/rio/, under WPILib simulation
+    python3 tools/test_drivetrain.py --wpilib   # controller_processor/rio/, under WPILib simulation
 
 The second one is the real RoboRIO program. It is slower to start, because it
 goes through Gradle, but it exercises the actual `Robot` loop and the actual
@@ -156,7 +156,7 @@ class Scenario:
             # project that owns the RoboRIO program.
             ["./gradlew", "--offline", "--quiet", "-Pheadless",
              "simulateNative"],
-            cwd=self.root / "2026-robot/controller_processor/rio",
+            cwd=self.root / "controller_processor/rio",
             env=environment,
         )
         # The robot prints this once its gateway socket is open, which is the
@@ -400,7 +400,7 @@ def main():
                 "//talOS/bridge:hardware_node first")
 
     if args.wpilib:
-        gradlew = root / "2026-robot/controller_processor/rio/gradlew"
+        gradlew = root / "controller_processor/rio/gradlew"
         if not gradlew.is_file():
             raise RuntimeError(f"No Gradle wrapper at {gradlew}")
 

@@ -245,7 +245,7 @@ jobs:
         # (rio-adapter job) and sources selected only for other platforms.
         # Paths in .bazelignore are outside the graph too and are read from
         # there.
-        OFF_GRAPH = ('2026-robot/controller_processor/rio/',
+        OFF_GRAPH = ('controller_processor/rio/',
                      'talOS/events/os/kqueue_poller.cc',
                      'talOS/vision/capture/unsupported_source.cc')
         # A changed header is analyzed through at most this many translation
@@ -501,7 +501,7 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
-        working-directory: 2026-robot/controller_processor/rio
+        working-directory: controller_processor/rio
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -573,7 +573,7 @@ jobs:
     - name: Install RoboRIO toolchain
       # GradleRIO refuses to configure the project until it is installed,
       # even for a desktop-only task.
-      working-directory: 2026-robot/controller_processor/rio
+      working-directory: controller_processor/rio
       run: ./gradlew installRoboRioToolchain
 
     - name: Keep the Phoenix simulation's device files in memory
@@ -583,7 +583,7 @@ jobs:
       # the loop waits as long as the runner's disk does (370 ms in run
       # 43023451199). The RoboRIO has no such files. The loop's own config
       # save (talos_config.bin) stays on disk.
-      working-directory: 2026-robot/controller_processor/rio
+      working-directory: controller_processor/rio
       run: mkdir -p /dev/shm/ctre_sim && ln -sfn /dev/shm/ctre_sim ctre_sim
 
     - name: Build and start the desktop simulation once
@@ -592,7 +592,7 @@ jobs:
       # The robot, disabled, stops itself after two seconds. No config is
       # pushed, so no simulated device is created here; the first configure
       # happens in the test.
-      working-directory: 2026-robot/controller_processor/rio
+      working-directory: controller_processor/rio
       env:
         TALOS_SIM_DS: '0'
         TALOS_SIM_RUN_MS: '2000'

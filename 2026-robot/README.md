@@ -1,9 +1,9 @@
 # 2026-robot
 
-| | runs | built with |
-|---|---|---|
-| `main_processor/` | the talOS nodes | Bazel |
-| `controller_processor/rio/` | the RoboRIO program: the hardware layer, over UDP | GradleRIO |
+`main_processor/` holds this robot's talOS nodes and configs, built with
+Bazel. The RoboRIO program it deploys, the hardware layer over UDP, is
+talOS's [`controller_processor/rio/`](../controller_processor/rio/), built
+with GradleRIO.
 
 ## Nodes
 
@@ -157,7 +157,7 @@ python3 tools/test_drivetrain.py     # drivetrain smoke test with log replay
 
 With the WPILib simulation, its GUI is the Driver Station: enable Teleoperated.
 Headless, the RoboRIO program's desktop-only stand-in
-(`controller_processor/rio/src/main/include/SimDriverStation.h`) names the blue
+([`SimDriverStation.h`](../controller_processor/rio/src/main/include/SimDriverStation.h)) names the blue
 alliance (`--alliance red` for red), enables teleop once the gateway is
 configured, or runs `--mode-schedule` phases from that
 moment (the lightweight simulator's schedule runs from its start).

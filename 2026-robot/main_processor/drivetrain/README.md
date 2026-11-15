@@ -166,7 +166,7 @@ actual robot program instead, under WPILib simulation:
 python3 tools/test_drivetrain.py --wpilib
 ```
 
-This swaps `sim_gateway` for `./gradlew simulateNative` in `2026-robot/controller_processor/rio/` and
+This swaps `sim_gateway` for `./gradlew simulateNative` in `controller_processor/rio/` and
 makes the same assertions, because both run the same
 `talos::hardware::Gateway`. The harness also runs a second WPILib scenario:
 with the Driver Station never enabled, the drivetrain must not move at all.

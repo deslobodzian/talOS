@@ -241,9 +241,9 @@ model {
             sources.cpp {
                 source {
                     srcDir 'src/main/cpp'
-                    srcDir '../../../talOS/protocol'
-                    srcDir '../../../talOS/hardware'
-                    srcDir '../../../talOS/driver_station'
+                    srcDir '../../talOS/protocol'
+                    srcDir '../../talOS/hardware'
+                    srcDir '../../talOS/driver_station'
                     // Only the gateway-side translation units; the rest of
                     // those packages (tests, sims, companion-side nodes)
                     // builds with Bazel.
@@ -252,7 +252,7 @@ model {
                 }
                 exportedHeaders {
                     srcDir 'src/main/include'
-                    srcDir '../../../talOS'
+                    srcDir '../../talOS'
                     srcDir rioBuildHeaderDir
                     include '**/*.h', '**/*.hpp'
                 }

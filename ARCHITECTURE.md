@@ -4,7 +4,7 @@
 
 The **main processor** (a coprocessor running Linux, or a laptop in
 simulation) runs every node. The **controller processor** (the RoboRIO,
-`2026-robot/controller_processor/rio`) is only the hardware layer: it owns the
+`controller_processor/rio`) is only the hardware layer: it owns the
 motors, sensors and the Driver Station link and runs no robot logic.
 
 They talk over UDP (`talOS/protocol`; gateway port 5802, main-processor port

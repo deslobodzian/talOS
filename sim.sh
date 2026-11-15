@@ -297,9 +297,9 @@ bazel build $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then
   # The robot's own RoboRIO program when it has one beside its
-  # main_processor/, else 2026-robot's; the bridge sends either its hardware
+  # main_processor/, else talOS's; the bridge sends either its hardware
   # config.
-  RIO_DIR="$ROOT/2026-robot/controller_processor/rio"
+  RIO_DIR="$ROOT/controller_processor/rio"
   case "$CONFIG" in
     */main_processor/configuration/*)
       OWN_RIO="$ROOT/${CONFIG%%/main_processor/configuration/*}/controller_processor/rio"
