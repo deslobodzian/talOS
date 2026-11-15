@@ -13,6 +13,7 @@ whatever the caller does twice.
 import os
 import select
 import subprocess
+import threading
 
 
 def _exited_unreaped(pid):
@@ -34,19 +35,33 @@ def _exited_unreaped(pid):
 
 def _wait_exited_unreaped(pid, timeout):
     """Waits up to `timeout` seconds for child `pid` to exit, without reaping
-    it or polling: a pidfd on Linux (a blocking waitid with WNOWAIT where
-    Python lacks pidfd_open), the kqueue NOTE_EXIT event on macOS."""
+    it or polling: a pidfd on Linux; where Python lacks pidfd_open, a waitid
+    with WNOWAIT blocking in a helper thread whose completion is awaited for
+    `timeout`; the kqueue NOTE_EXIT event where it lacks waitid too (macOS).
+    A child already reaped elsewhere counts as exited on every path."""
     if hasattr(os, "pidfd_open"):
-        fd = os.pidfd_open(pid)
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return True
         try:
             return bool(select.select([fd], [], [], timeout)[0])
         finally:
             os.close(fd)
     if hasattr(os, "waitid"):
-        # A Linux Python built without pidfd_open: block on the exit itself
-        # (no timeout; the caller's own test timeout bounds it).
-        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
-        return True
+        done = threading.Event()
+
+        def block():
+            try:
+                os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+            except ChildProcessError:
+                pass  # reaped elsewhere: it exited
+            done.set()
+
+        # A daemon: when the child outlives `timeout` the thread stays blocked
+        # in waitid and must not keep the interpreter alive.
+        threading.Thread(target=block, daemon=True).start()
+        return done.wait(timeout)
     kq = select.kqueue()
     try:
         event = select.kevent(pid, select.KQ_FILTER_PROC,
