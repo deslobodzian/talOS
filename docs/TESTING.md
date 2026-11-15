@@ -282,8 +282,9 @@ the host can run it. It is never noise.
    `tools/lint_test_time.py` for `flaky = True` and `--flaky_test_attempts`;
    review for reruns]**
 2. **Diagnose from the artifact.** `soak_test` and `match_rehearsal_test`
-   write their session directories to Bazel's undeclared test outputs; the
-   other e2e and perf tests write theirs to temporary directories that do
+   write their session directories to Bazel's undeclared test outputs, and
+   `//studio:drive_browser_test` its session's logs, a screenshot and the
+   failing elements when a check fails; the other e2e and perf tests write theirs to temporary directories that do
    not survive the run **[gap: LANE-1]**. A flake is closed by a named mechanism and a test
    that pins it (§5), not by a green rerun.
 3. **Quarantine is explicit and expires.** A test that fails without a
