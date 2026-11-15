@@ -363,26 +363,16 @@ bazel build //studio:web_dist
 
 The bridge serves the pages from its webroot (`[studio] webroot`):
 `bazel-bin/studio/dist`, what `//studio:web_dist` builds, in talOS's own
-checkout, and the bundle's copy in a bundle. `//studio:web_dist` needs
-rules_js and pnpm, development dependencies of talOS, so a repository that
-depends on talOS cannot build it. It reads the folder its talOS submodule
-built instead, through [`bridge/webroot.bzl`](bridge/webroot.bzl): a
-`studio_web` repository in its `MODULE.bazel` naming
-`talos/bazel-bin/studio/dist`, a `studio_webroot` target in its `BUILD.bazel`
-that makes it one directory, in its `talos_sim`'s `data` and named by its
-`[studio] webroot` ([examples/robot_repo](../examples/robot_repo/README.md#studio)
-is written that way). So a student types:
-
-```sh
-(cd talos && bazel build //studio:web_dist)   # once, and after moving the talOS pin
-bazel run //:sim -- --start-studio-bridge     # Studio at http://localhost:5800, the driver dashboard at /drive
-```
-
-Until the pages are built that directory is empty, and a webroot that holds
-no `index.html` or `drive.html`, or does not exist, is not an error for the
-bridge: it serves its feeds and answers `/` and `/drive` with 503 and a text
-naming the folder and the build command, which it also logs at startup.
-`talos_bundle` refuses a `studio_webroot` with no `index.html`.
+checkout, and the bundle's copy in a bundle. A repository that depends on
+talOS cannot build `//studio:web_dist` (it needs rules_js and pnpm,
+development dependencies of talOS); it serves the pages its talOS checkout
+built, through [`bridge/webroot.bzl`](bridge/webroot.bzl), as
+[examples/robot_repo](../examples/robot_repo/README.md#studio) shows with
+the commands a student types. A webroot that does not exist or holds no
+`index.html` or `drive.html` is not an error for the bridge: it serves its
+feeds, logs each missing page at startup, and answers `/` and `/drive` with
+503 naming the folder and the build command. `talos_bundle` refuses a
+`studio_webroot` with no `index.html`.
 
 See the [bridge README](bridge/README.md) for serving the frontend with a live
 feed, the [agent README](agent/README.md) for headless queries, and

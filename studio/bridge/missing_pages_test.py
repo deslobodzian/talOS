@@ -57,6 +57,11 @@ class MissingPages(unittest.TestCase):
                 bridge.send_signal(signal.SIGINT)
                 bridge.wait(timeout=HANG_S)
                 self.assertEqual(bridge.returncode, 0)
+                # Its log names each missing page, as the answers do.
+                log = bridge.stderr.read()
+                for page in ("index.html", "drive.html"):
+                    with self.subTest(log=page):
+                        self.assertIn(page, log)
             finally:
                 if bridge.poll() is None:
                     bridge.kill()

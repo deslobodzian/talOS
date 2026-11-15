@@ -44,7 +44,7 @@ test = []
 # Studio, the live viewer: its bridge shows what the telemetry node
 # publishes on `topic`. `bridge` names talOS's; the default names this
 # repository. `webroot` is BUILD.bazel's //:studio_webroot, the pages the
-# talOS checkout built (empty until then; the bridge's pages then say how).
+# talOS checkout built (until then the bridge's pages say how to build them).
 [studio]
 bridge = "@talos//studio/bridge:studio_bridge"
 webroot = "bazel-bin/studio_webroot"
