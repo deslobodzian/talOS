@@ -215,9 +215,10 @@ class NewRobotTest(unittest.TestCase):
     # REQ-DEV-23
     def test_next_steps_block_makes_the_mechanism_drivable_in_simulation(
             self):
-        # A scaffold leaves its teleop binding commented and its gains zero,
-        # so on a robot that requires target coverage (2026-robot's policy)
-        # the launcher refuses it as generated. The simulation block `Next:`
+        # A scaffold leaves its teleop binding commented and its gains zero.
+        # This robot turns target coverage on (2026-robot's policy) after the
+        # scaffold, so its subsystem file lists the default lanes with no
+        # writer and the launcher refuses it. The simulation block `Next:`
         # prints, appended to the simulation config, gives the mechanism a
         # producer in every mode the policy covers and a teleop target it can
         # reach there, and leaves robot.toml's mechanism unbound. Whether the

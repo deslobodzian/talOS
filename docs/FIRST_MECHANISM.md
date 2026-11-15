@@ -215,7 +215,8 @@ framework's `teleop` node to write a target on `/flywheel/target/teleop`
 while Driver Station joystick button 3 is held. Without it nothing writes the
 flywheel's lane: the launcher warns (`/flywheel/target/teleop: is in the
 target policy of flywheel but nothing writes it yet`), as it does for
-`robot.toml`, and with `require_target_coverage = true` it refuses the graph.
+`robot.toml`. A robot that requires target coverage refuses a listed lane
+nothing writes, which is why the scaffold lists none there (below).
 The feedforward is there because with every gain zero the physics simulation
 stalls the motor
 ([simulation backends](../talOS/hardware/README.md#simulation-backends-ideal-vs-physics-backed)).
