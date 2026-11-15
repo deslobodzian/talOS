@@ -126,7 +126,9 @@ PARITY = re.compile(r"^[ \t]*#[ \t]*matrix:[ \t]*parity\b(.*)$",
 PARITY_CLAIM = re.compile(
     r"^[ \t]+(\d+)[ \t]+([\w./-]+\.cc)[ \t]+"
     r"(\"[^\"]+\"(?:[ \t]*,[ \t]*\"[^\"]+\")*)[ \t]*$")
-# A parity run compares ticks, not a constructor or an allocation count.
+# A parity run compares the listed topics and outputs at every tick (each
+# boundary of the node's period) and at each step's end (talos.parity), not
+# a constructor or an allocation count.
 NOT_PARITY = {9: "construction", 12: "allocation"}
 CC_TEST = re.compile(r"^\s*TEST(?:_F|_P)?\(\s*\w+\s*,\s*(\w+)\s*\)",
                      re.MULTILINE)

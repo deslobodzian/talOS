@@ -43,6 +43,22 @@ py_library(
     deps = [":testing"],
 )
 
+py_test(
+    name = "parity_test",
+    size = "small",
+    srcs = ["parity_test.py"],
+    legacy_create_init = False,
+    # ctypes cannot initialize sanitizer runtimes inside the Python host.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = [
+        ":parity",
+        ":test_messages_py",
+    ],
+)
+
 # Optional framework teleop node, backed by the same implementation as C++.
 py_library(
     name = "teleop",

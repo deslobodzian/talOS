@@ -251,7 +251,11 @@ A node implemented in both languages (a C++ class and a Python class, not a
 Python test runs one scenario through `talos.parity` against both
 (REQ-CONTRACT-14) and claims each case it covers with
 `# matrix: parity <case> <C++ test file> "<step>"[, "<step>"]` instead of
-repeating the test. The lint accepts a claim only when the file calls
+repeating the test. The run compares the newest message of each listed
+topic byte for byte, and each listed output requested and applied, at every
+tick of every step (each boundary of the node's period on the Sim clock,
+one simulated instant on both sides) and at each step's end, so a
+divergence that converges again within a step still fails. The lint accepts a claim only when the file calls
 `assert_same_behaviour`, the C++ file has that case as a test, and every
 named step is a step of the scenario that call is given. Whether a named
 step exercises its case the lint cannot check: that is a review item
