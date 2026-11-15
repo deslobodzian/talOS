@@ -166,6 +166,7 @@ constexpr double kSimNeutralStandstillRps = 0.01;
 // uses 1 to 6.
 constexpr uint16_t kConfigureFailedMessage = 0;
 constexpr uint16_t kCanBusStatusMessage = 7;
+constexpr uint16_t kCanBusReaderMessage = 8;
 
 // One CANivore's status: Phoenix 6 reports its utilization from 0 to 1, the
 // unit of State's can_utilization_frac. Blocks up to 1 ms (CANBus.hpp; about
@@ -213,7 +214,15 @@ void LogCanBusStatus(talos::rio::RioLog& log, std::string_view bus,
 PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
     : owned_log_{log ? nullptr : std::make_unique<talos::rio::RioLog>()},
       log_{log ? log : owned_log_.get()},
-      can_sampler_{can_health_, ReadCanivore, SteadyUs},
+      // The sampler reports an abandoned reader from the configure worker or
+      // this backend's destructor; log_ outlives it.
+      can_sampler_{can_health_, ReadCanivore, SteadyUs,
+                   [this](std::string_view line) {
+                     talos::rio::LogEvent event;
+                     event.index = kCanBusReaderMessage;
+                     event.SetText(line);
+                     log_->Post(event);
+                   }},
       is_simulation_{is_simulation} {
   if (owned_log_) owned_log_->Start();
 }
@@ -235,8 +244,13 @@ PhoenixBackend::ConfigureStatus PhoenixBackend::PollConfigure() {
 }
 
 bool PhoenixBackend::Configure(const hw::Config& c) {
-  const std::lock_guard devices_lock{devices_mutex_};
   hw::Validate(c);
+  // Before the device lock, so WatchdogNeutral never waits on it: stops the
+  // CANivore reader (at most CanBusSampler::kStopBound, abandoning one stuck
+  // in a vendor call) and starts one only for a configuration with a
+  // CANivore.
+  can_sampler_.Reconfigure(c, is_simulation_);
+  const std::lock_guard devices_lock{devices_mutex_};
   restore_operations_.clear();
   unavailable_.clear();
   signal_ids_.clear();
@@ -254,8 +268,6 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
   apply_failed_.clear();
   apply_failed_.reserve(c.motors.size());
   last_brownout_ = false;
-  // Joins the old sampler thread; starts one only for CANivores.
-  can_sampler_.Reconfigure(c, is_simulation_);
   // The first failed device apply wins the precise error: device
   // name, bus, CAN ID, operation, and the raw vendor status value.
   const auto note_failure = [this](const std::string& name,
