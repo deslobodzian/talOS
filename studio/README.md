@@ -168,8 +168,9 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   `view.ts`, written on the page as the `--drive-*` properties `drive.css`
   reads; `listRowsFit` computes from them that the 2026 layout's subsystems
   cell holds 20 rows at 1366x768 (two columns of 10) and 18 at 1280x720
-  (two of 9), and its pre-match cell 12 and 10: computed, not measured in a
-  browser. A row too narrow gives up its note (restarts, drives) first, then
+  (two of 9), and its pre-match cell 12 and 10. The
+  [browser check](#driver-dashboard-in-a-browser) sees the 14 subsystem rows
+  and 6 checks of a simulated session whole at both sizes. A row too narrow gives up its note (restarts, drives) first, then
   its name down to 64 px (ellipsized; the tooltip has the whole name and the
   note); its state word never shrinks or ellipsizes, so a column narrower than
   the name's floor, the gaps and the word cuts the word at the row's edge.
@@ -198,6 +199,57 @@ What it shows (REQ-OPS-36, REQ-OPS-37, REQ-OPS-38):
   10 s of its connection opening) attempts start 5 s apart instead of 1 s,
   so a feed that never decodes does not spend the slot's byte budget on a
   dictionary every second.
+
+### Driver dashboard in a browser
+
+`//studio:drive_browser_test` (e2e lane) checks the page as a browser lays it
+out, which the unit tests' fake surface cannot. It launches the 2026 physics
+simulation with the Studio bridge (`robot_physics_sim.toml`, as
+`./sim.sh --sim-gateway` does) on ports and a shared-memory namespace of its
+own, opens `/drive` in the host's headless Chromium or Chrome and drives it
+over the DevTools protocol with no dependency beyond Python
+([`tests/browser/`](tests/browser/): `cdp.py` the client, `probe.js` the
+checks run in the page, `watch.py` the file-change wait for the bridge's
+`listening` line). Once every subsystems row reads UP and the status line
+reads OK, it asserts from the live DOM:
+
+- at 1366x768 and 1280x720: the page does not scroll and no element extends
+  past the viewport or is cut by an ancestor's overflow; every widget shows a
+  value (no `no data`, `NO DATA`, `NO POSE` or `unknown`) and none reads
+  STALE (the pre-match checks render whole; whether they pass is the
+  simulator's data); every state word, tag and heading is whole, its text no
+  wider than its box by even one 1/64 px layout unit; no text is under 12 px;
+  the subsystems and checks lists fit without scrolling; the four camera rows
+  read differently as rendered;
+- at 1366x500, where the subsystems list scrolls: every visible row is whole
+  and the heading's `N above` / `+N below` equals the rows the boxes show,
+  after a scroll by script too; scrolled to the bottom and to the middle, the
+  list keeps its `scrollTop` when SIGKILLing `shooter` (the launcher restarts
+  it) changes that row; the list's heading and words are whole;
+- with the `telemetry` node SIGSTOPped, every widget but subsystems reads
+  STALE within REQ-OPS-36's 500 ms of the producer's last tick at the latest
+  (the page's `performance.now()` read just before the stop, plus one 10 ms
+  producer period) and the status line reads TELEMETRY; after SIGCONT the
+  page is current again.
+
+Every wait is on an event (a file change, a DOM mutation, an animation
+frame), bounded only against a hang. A failed check saves a screenshot and
+the failing elements' CSS path, outerHTML and geometry (`<label>.png`,
+`<label>.json`), and the session's logs, to the test's undeclared outputs
+(`bazel-testlogs/studio/drive_browser_test/test.outputs/`), and prints their
+paths; each layout viewport's screenshot (`layout-<size>-seen.png`) is kept
+whatever the result.
+
+It needs Chromium or Chrome on the host: `TALOS_BROWSER` (passed with
+`--test_env=TALOS_BROWSER=/path`), else `chromium`, `chromium-browser`,
+`google-chrome` or `google-chrome-stable` on the test's `PATH`, else macOS's
+`/Applications/Google Chrome.app`. Without one it skips: Bazel reports a
+skipped `py_test` as passed, so its log's `SKIPPED:` line names what it
+looked for, and `--test_env=TALOS_REQUIRE_BROWSER=1` makes that a failure.
+
+```sh
+bazel test //studio:drive_browser_test --test_output=errors
+```
 
 ## Add a panel
 
@@ -416,4 +468,6 @@ Panels are tested through their pure derivations, plus react-dom/server renders
 against `createStaticStudio` only where the rendered output carries a behaviour
 (staleness, unknown versus absent readings, parse errors). The data layer
 (store, events, discovery, robot status, manifest, hooks), the layout tree,
-the command palette and the registry have their own tests.
+the command palette and the registry have their own tests. The driver
+dashboard's layout, scrolling and freshness in a real browser are
+[`//studio:drive_browser_test`](#driver-dashboard-in-a-browser)'s.
