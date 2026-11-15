@@ -204,9 +204,9 @@ class Autonomous {
             target.y_m = field_width_ - target.y_m;
             target.yaw_rad = WrapAngle(target.yaw_rad + std::numbers::pi);
           }
-          // A pose no trajectory can start from (one so far off the field
-          // that the plan overflows) is unusable: released below, as an
-          // unlocalized one is, and the next tick plans again.
+          // UsablePose keeps the plan finite; should it not be (a waypoint
+          // the config puts beyond the double range), the lane is released
+          // below, as for an unlocalized pose, and the next tick plans again.
           const auto planned = Trajectory::FromPoses(
               p, geometry::Pose2d{target.x_m, target.y_m, target.yaw_rad},
               max_linear_, max_angular_);
@@ -664,16 +664,24 @@ class Autonomous {
         return true;
       case Prerequisite::kShooterReady:
         return shooter_ready;
-      case Prerequisite::kLocalizedPose: {
-        // A non-finite pose is no position, whatever its flags say.
-        if (!pose_.fresh() || !pose_->valid() || !pose_->localized())
-          return false;
-        const auto& p = pose_->pose();
-        return std::isfinite(p.x_m()) && std::isfinite(p.y_m()) &&
-               std::isfinite(p.yaw_rad());
-      }
+      case Prerequisite::kLocalizedPose:
+        return pose_.fresh() && pose_->valid() && pose_->localized() &&
+               UsablePose(pose_->pose());
     }
     return false;
+  }
+  // The one test of a pose for planning and following alike: finite, and at
+  // most one field length (width) beyond the field's ends (sides), so in
+  // [-L, 2L] x [-W, 2W]. Vision accepts tag estimates only on the field, so
+  // that margin never refuses a real estimate's drift near a wall, while a
+  // pose that is no position on this field (NaN, inf, 1e308) is unusable,
+  // whatever its flags say: the drive lane is released and the DRIVE
+  // deadline keeps counting. Coordinates within tens of metres also keep
+  // the planner's distance and the controller's error finite.
+  bool UsablePose(const geometry::Pose2d& p) const {
+    return std::isfinite(p.yaw_rad()) &&
+           std::abs(p.x_m() - field_length_ / 2) <= 1.5 * field_length_ &&
+           std::abs(p.y_m() - field_width_ / 2) <= 1.5 * field_width_;
   }
   const Action& CurrentAction() const {
     return routines_[latched_].actions[action_];

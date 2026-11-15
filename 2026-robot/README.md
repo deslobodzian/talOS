@@ -56,9 +56,9 @@ the shooter and drives toward the configured waypoint with bounded field-frame
 position/heading feedback rotated into robot coordinates. The waypoint is in
 blue-origin coordinates; Red rotates both translation and heading by pi about
 the field centre, as the estimator does with its blue-origin starting pose. Invalid,
-unlocalized, stale or non-finite pose, or one no trajectory to the waypoint can
-start from, stops drive and collection immediately; stale intake
-feedback inhibits collection. Reaching the waypoint releases all lanes until mode
+unlocalized, stale or non-finite pose, or one more than a field length (width)
+beyond the field's ends (sides), stops drive and collection immediately; stale
+intake feedback inhibits collection. Reaching the waypoint releases all lanes until mode
 exit. Feed counts only commanded feeding time and continuously requires matching
 fresh shooter readiness. Spinup/feed share a wall-clock deadline; drive has its
 own, neither extended by outages. Disable, teleop or DS loss releases all lanes.
