@@ -128,7 +128,11 @@ class NewSubsystemTest(unittest.TestCase):
             # not must be left alone.
             for path, text in (
                     ("practice/BUILD", ""),
-                    ("practice/robot.toml", 'include = "../configuration/robot.toml"\n'),
+                    # It requires target coverage, so the new subsystem's
+                    # file lists no lane until its producer is added.
+                    ("practice/robot.toml",
+                     'include = "../configuration/robot.toml"\n'
+                     '[robot]\nrequire_target_coverage = true\n'),
                     ("practice/robot_manifest.bzl", ""),
                     ("other/BUILD", ""),
                     ("other/robot.toml", '[subsystems.x]\nnode = "//x:node"\n'),
@@ -150,7 +154,8 @@ class NewSubsystemTest(unittest.TestCase):
             self.assertNotIn("target", build.split("topics = {")[1].split("}")[0])
             subsystem = by_rel[
                 "custom-bot/main_processor/configuration/subsystems/wrist.toml"]
-            self.assertIn('# [targets]\n# teleop = ["teleop"]', subsystem)
+            self.assertEqual(tomllib.loads(subsystem)["targets"],
+                             {"teleop": [], "autonomous": [], "test": []})
             self.assertNotIn("arbitrat", subsystem)
             self.assertIn(
                 "can_id = 2",
@@ -454,8 +459,10 @@ class NewSubsystemTest(unittest.TestCase):
             return (f'[subsystem]\nname = "{name}"\nnode = "{label}"\n'
                     'period_us = 20000\n')
 
-        def robot(entries):
-            return '[robot]\nname = "robot_repo"\n' + "".join(
+        def robot(entries, coverage=False):
+            return ('[robot]\nname = "robot_repo"\n'
+                    + ("require_target_coverage = true\n" if coverage
+                       else "")) + "".join(
                 f'\n[[subsystems]]\nname = "{name}"\n'
                 f'path = "subsystems/{name}.toml"\n' for name in entries)
 
@@ -475,7 +482,8 @@ class NewSubsystemTest(unittest.TestCase):
             "BUILD.bazel": "",
             f"{configuration}/BUILD":
                 'exports_files(glob(["*.toml", "subsystems/*.toml"]))\n',
-            f"{configuration}/robot.toml": robot(["teleop", "shooter"]),
+            f"{configuration}/robot.toml": robot(["teleop", "shooter"],
+                                                 coverage=True),
             f"{configuration}/robot_field.toml":
                 'include = "robot.toml"\n',
             f"{configuration}/subsystems/teleop.toml":
@@ -546,6 +554,16 @@ class NewSubsystemTest(unittest.TestCase):
                         f"{name}.toml")])
                     self.assertEqual(subsystem["subsystem"]["node"],
                                      f"//{package}:node")
+                    # A robot that requires target coverage lints a mode
+                    # only when its policy lists a lane: the new subsystem,
+                    # with no producer yet, lists none in any mode (and
+                    # stays neutral); otherwise [robot.targets] applies.
+                    if layout == "2026":
+                        self.assertEqual(subsystem.get("targets"),
+                                         {"teleop": [], "autonomous": [],
+                                          "test": []})
+                    else:
+                        self.assertNotIn("targets", subsystem)
                     with open(os.path.join(root, configs[0]), "rb") as f:
                         entries = tomllib.load(f)["subsystems"]
                     self.assertIn({"name": name,
