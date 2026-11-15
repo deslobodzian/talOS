@@ -10,6 +10,7 @@
 
 #include "drivetrain/drive_message_generated.h"
 #include "drivetrain/topics.h"
+#include "talOS/configuration/config_parser.h"
 #include "talOS/devices/devices.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/node/node.h"
@@ -119,11 +120,18 @@ class Driver {
   }
 
   // Five 20 ms periods by default, so one or two dropped packets do not flap
-  // the frame.
+  // the frame. At most [robot] command_timeout_us: the heading turns the
+  // stick into a direction, and no other input that drives the robot is
+  // trusted for longer (the bound also keeps the nanosecond count in range).
   static talos::Duration HeadingTimeout(const talos::Node& node) {
     const double s = node.param("heading_timeout_s", 0.1);
-    if (!std::isfinite(s) || s <= 0)
-      BadParameter(node, "heading_timeout_s", "must be finite and positive");
+    const auto limit_us = talos::config::ParseRobotConfig(node.config_path())
+                              .hardware.command_timeout_us;
+    if (!std::isfinite(s) || s <= 0 || s > limit_us / 1e6)
+      BadParameter(node, "heading_timeout_s",
+                   ("must be > 0 and at most [robot] command_timeout_us (" +
+                    std::to_string(limit_us) + " us)")
+                       .c_str());
     return std::chrono::duration_cast<talos::Duration>(
         std::chrono::duration<double>{s});
   }

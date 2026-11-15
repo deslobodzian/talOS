@@ -10,6 +10,7 @@ cc_library(
     visibility = ["//visibility:private"],
     deps = [
         "//2026-robot/main_processor/drivetrain:messages",
+        "//talOS/configuration",
         "//talOS/devices",
         "//talOS/driver_station",
         "//talOS/node",
