@@ -300,7 +300,10 @@ class ClosedLoop : public ::testing::Test {
 
 // The robot keeps within 0.10 m of its straight path, holds within 1 s of
 // the path's planned duration (2.74 s), and stands within the routine's
-// tolerances of its goal 0.5 s later.
+// tolerances of its goal 0.5 s later. On the way it never passes the goal,
+// along the path or in heading, by more than those tolerances: a robot that
+// did would have to turn back to arrive. REQ-DEV-27 states no tighter
+// bound, so none is asserted.
 // REQ-DEV-27
 TEST_F(ClosedLoop, DrivesItsPathAndArrives) {
   const Outcome run = Drive({});
@@ -308,6 +311,8 @@ TEST_F(ClosedLoop, DrivesItsPathAndArrives) {
   ASSERT_TRUE(run.hold_s.has_value()) << run;
   EXPECT_LE(*run.hold_s, run.planned_s + 1.0) << run;
   EXPECT_EQ(run.released_ticks, 0) << run;
+  EXPECT_LE(run.overshoot_m, position_tolerance_m_) << run;
+  EXPECT_LE(run.overshoot_rad, yaw_tolerance_rad_) << run;
   ExpectArrived(run, run.settled_truth);
 }
 
