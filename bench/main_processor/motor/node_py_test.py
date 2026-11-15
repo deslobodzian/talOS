@@ -118,8 +118,9 @@ def target(mode, generation=None, voltage_v=0.0, velocity_rps=0.0,
 # matrix: parity 5 node_test.cc "enabled, never sent"
 # matrix: parity 6 node_test.cc "Driver Station lost"
 # matrix: parity 7 node_test.cc "disconnected"
-# matrix: parity 8 node_test.cc "non-finite voltage", "non-finite axis"
-# matrix: parity 8 node_test.cc "infinite velocity"
+# matrix: parity 8 node_test.cc "NaN voltage", "infinite voltage"
+# matrix: parity 8 node_test.cc "NaN axis", "infinite axis"
+# matrix: parity 8 node_test.cc "NaN velocity", "infinite velocity"
 # matrix: parity 10 node_test.cc "autonomous, teleop lane"
 # matrix: parity 11 node_test.cc "autonomous, earlier teleop generation"
 # matrix: parity 11 node_test.cc "teleop, autonomous generation"
@@ -143,8 +144,11 @@ SCENARIO = [
                    12.0),
      target(ControlMode.VELOCITY, velocity_rps=-3.0)),
     ("released", parity.release(MotorTarget, "teleop")),
-    ("non-finite voltage", target(ControlMode.VOLTAGE, voltage_v=math.nan)),
-    ("non-finite axis", target(ControlMode.VOLTAGE, voltage_frac=math.nan)),
+    ("NaN voltage", target(ControlMode.VOLTAGE, voltage_v=math.nan)),
+    ("infinite voltage", target(ControlMode.VOLTAGE, voltage_v=math.inf)),
+    ("NaN axis", target(ControlMode.VOLTAGE, voltage_frac=math.nan)),
+    ("infinite axis", target(ControlMode.VOLTAGE, voltage_frac=math.inf)),
+    ("NaN velocity", target(ControlMode.VELOCITY, velocity_rps=math.nan)),
     ("infinite velocity", target(ControlMode.VELOCITY, velocity_rps=math.inf)),
     ("stale lane", target(ControlMode.VOLTAGE, voltage_frac=0.25),
      parity.wait(TIMEOUT_S + 0.01)),

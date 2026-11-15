@@ -29,6 +29,7 @@ namespace ds = talos::driver_station;
 constexpr const char* kConfig =
     "bench/main_processor/motor/testdata/robot.toml";
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr double kInf = std::numeric_limits<double>::infinity();
 // A live 10 rps velocity target.
 MotorTarget Velocity() { return {ControlMode::VELOCITY, 0.0, 10.0, 0.0}; }
 
@@ -150,9 +151,11 @@ TEST_F(MotorTest, NonFiniteDemandGoesNeutral) {
   Enable();
   for (const MotorTarget& target :
        {MotorTarget{ControlMode::VOLTAGE, kNaN, 0.0, 0.0},
+        MotorTarget{ControlMode::VOLTAGE, kInf, 0.0, 0.0},
         MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, kNaN},
-        MotorTarget{ControlMode::VELOCITY, 0.0,
-                    std::numeric_limits<double>::infinity(), 0.0}}) {
+        MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, kInf},
+        MotorTarget{ControlMode::VELOCITY, 0.0, kNaN, 0.0},
+        MotorTarget{ControlMode::VELOCITY, 0.0, kInf, 0.0}}) {
     SCOPED_TRACE(::testing::Message()
                  << "mode " << static_cast<int>(target.mode()) << " voltage_v "
                  << target.voltage_v() << " voltage_frac "
