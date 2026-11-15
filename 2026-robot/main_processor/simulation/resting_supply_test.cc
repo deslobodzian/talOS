@@ -4,12 +4,12 @@
 #include <gtest/gtest.h>
 
 #include <string>
-#include <toml++/toml.hpp>
 
 #include "schedules.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/hardware/sim_backend.h"
 #include "talOS/hardware/sim_physics.h"
+#include "toml.hpp"
 
 namespace robot::simulation {
 namespace {
