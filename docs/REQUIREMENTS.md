@@ -251,6 +251,7 @@ numbered section, a number in RULES a rule:
 | REQ-DEV-26 | `geometry::OptimizeSwerveModule` turns an asked wheel speed and heading into the equivalent setpoint whose steering change from the measured angle is at most a quarter turn, reversing the speed when it takes the opposite heading, and scales the speed by the cosine of that steering change, never below zero; a non-finite input gives zero speed and no steering change. The 2026 drivetrain and the bench swerve module node take their module setpoints from it, so one implementation is exercised in simulation and on the bench. | P1 | ARCH "Layers"; `talOS/geometry/README.md` | returned speed, steering change and `reversed` | unit |
 | REQ-DEV-27 | Driven against the drivetrain node by a pose that follows the measured chassis motion, autonomous's drive action keeps the robot within 0.10 m of its straight path, ends (HOLD) within its planned duration plus 1 s, and leaves the robot within `position_tolerance_m` and `yaw_tolerance_rad` of its goal 0.5 s after HOLD; pushed 0.3 m off the path gradually (over 0.2 s, with an estimate that follows the push), the robot is within 0.10 m of the path from 1 s after the push began until HOLD, which comes within the planned duration plus 1.5 s; after a pose outage it replans from the live pose and still arrives. | P1 | R26 "Nodes" | true pose against the path and goal; `/autonomous/state` phase | component (simulation, ideal motors) |
 | REQ-DEV-28 | When an estimate differs from the previous one by more than its velocity explains plus `replan_step_m` or `replan_step_rad`, the drive action replans from it on that tick without releasing its lane. | P1 | R26 "Nodes" | `/drivetrain/target/auto` envelope and target on that tick | component |
+| REQ-DEV-29 | A build that uses talOS as a dependency compiles talOS's patched toml++; the consuming repository carries no override or patch file for it. | P1 | `MODULE.bazel`; TODO REPO-1 | the dependent repository's `MODULE.bazel`; `@talos//talOS/configuration:config_fuzz_test` built there | integration |
 
 ## Package scope
 
@@ -268,7 +269,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/hardware` | REQ-SAFE-17 to REQ-SAFE-24, REQ-CONTRACT-02, REQ-CONTRACT-05, REQ-CONTRACT-06, REQ-CONTRACT-30, REQ-DEV-10, REQ-DEV-24, REQ-CONTRACT-32, REQ-CONTRACT-35 |
 | `talOS/protocol` | REQ-CONTRACT-01, REQ-CONTRACT-03, REQ-RT-22 |
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
-| `talOS/configuration` | REQ-SAFE-26, REQ-SAFE-40, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31 |
+| `talOS/configuration` | REQ-SAFE-26, REQ-SAFE-40, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31, REQ-DEV-29 |
 | `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-SAFE-40, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-26 (`tlog_to_wpilog`), REQ-OPS-30, REQ-OPS-32, REQ-DEV-04, REQ-OPS-33, REQ-OPS-37, REQ-OPS-43, REQ-RT-23 |
 | `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-33, REQ-CONTRACT-36, REQ-CONTRACT-37, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
