@@ -3518,8 +3518,10 @@ def robot_table(root, config):
     return robot
 
 
-# What the launcher starts beside the nodes when [robot] names none
-# (talOS/configuration), as a robot repository names them.
+# The hardware bridge and simulator talOS provides, as a robot repository
+# names them; used for the printed build when [robot] names neither. The
+# launcher itself starts a simulator only when the config names one
+# (talOS/launcher/roster.cc).
 DEFAULT_PROGRAMS = {"hardware_node": "//talOS/bridge:hardware_node",
                     "sim_gateway": "//talOS/simulation:sim_gateway"}
 
