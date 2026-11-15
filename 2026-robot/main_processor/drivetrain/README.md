@@ -168,8 +168,13 @@ python3 tools/test_drivetrain.py --wpilib
 
 This swaps `sim_gateway` for `./gradlew simulateNative` in `controller_processor/rio/` and
 makes the same assertions, because both run the same
-`talos::hardware::Gateway`. The harness also runs a second WPILib scenario:
-with the Driver Station never enabled, the drivetrain must not move at all.
+`talos::hardware::Gateway`. The harness also runs two more WPILib scenarios:
+with the Driver Station never enabled, the drivetrain must not move at all;
+and with it enabled and the wheels driven, every main-processor process is
+killed at once, and the RoboRIO program alone must neutralize every output
+on its first tick at or past the last command's expiry, which the harness
+reads from the RoboRIO's own States at a relay standing in for the main
+processor's socket.
 It runs Gradle `--offline`, so the first run needs one online
 `./gradlew simulateNative` beforehand. CI's
 `rio-in-the-loop` job runs it on Linux with `--output-dir`, which puts each
