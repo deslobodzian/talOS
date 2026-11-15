@@ -87,9 +87,10 @@ py_test(
 )
 
 # A scaffolded velocity and position mechanism, edited as their `Next:` says,
-# reach their teleop goals under sim_gateway --physics. Over 5 s, e2e lane:
-# the launcher runs the robot's graph for `Next:`'s 8 s mode and joystick
-# schedule in real time (the gateway has no faster-than-real-time mode).
+# reach their teleop goals under sim_gateway --physics, and a --no-mechanism
+# robot runs there with no alert, reject or fault. Over 5 s, e2e lane: the
+# launcher runs the graphs for `Next:`'s 8 s mode and joystick schedule and
+# 3 s more in real time (the gateway has no faster-than-real-time mode).
 py_test(
     name = "scaffold_sim_test",
     size = "medium",
