@@ -6,3 +6,7 @@
 
 # Standalone Bzlmod example; consumed through @wrist, not main-repo packages.
 examples/wrist_repo
+
+# Standalone robot repository fixture: its own workspace (cd into it), which
+# depends on this checkout through @talos.
+examples/robot_repo

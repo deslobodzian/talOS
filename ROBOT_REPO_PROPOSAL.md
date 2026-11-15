@@ -184,6 +184,8 @@ grouping is done with:
 - a node package is self-contained: code, messages, its own test
 - teleop bindings live in each subsystem's own TOML
 - a node in its own repo with default TOML works (`examples/wrist_repo`)
+- a robot in its own repo builds, tests, bundles and runs in simulation
+  against a talOS checkout (`examples/robot_repo`)
 - Python and shared-library C++ nodes go through one prebuilt-friendly library
   (`libtalos_node.so`)
 - scaffolding for a new robot and a new subsystem
@@ -191,7 +193,7 @@ grouping is done with:
 
 **Gaps:**
 
-- a robot can only live inside the talOS checkout
+- no scaffold writes a robot repository (`new_robot` writes beside `2026-robot/`)
 - talOS is only consumable from a sibling checkout, not a pinned release
 - `sim.sh` refuses a config outside the repository
 - a scaffolded robot's simulator points into `2026-robot`
@@ -216,8 +218,9 @@ runs in simulation.
 ## Decisions needed before any code
 
 - **Requirements.** The catalogue covers a standalone subsystem repo
-  (`REQ-DEV-02`) and a robot beside `2026-robot/` (`REQ-DEV-23`). A standalone
-  robot repo, standard messages and a remote cache each need a new requirement.
+  (`REQ-DEV-02`), a robot beside `2026-robot/` (`REQ-DEV-23`) and a robot
+  repository depending on talOS (`REQ-DEV-30`). Standard messages and a
+  remote cache each need a new requirement.
 - **Design notes** for steps 2 and 4: how talOS is distributed, and what the
   standard target and state messages are.
 - **Cache hosting.** It is an outside service the team runs or pays for.

@@ -9,7 +9,11 @@ load(
     "talos_topic_problem",
 )
 
-exports_files(["contract.bzl"])
+exports_files([
+    "contract.bzl",
+    # The runner talos_graph_test and talos_sim run.
+    "launcher_runner.py",
+])
 
 # talos_bundle's assembly step, run in the exec configuration's hermetic
 # Python.
