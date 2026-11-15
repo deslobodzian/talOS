@@ -716,6 +716,7 @@ jobs:
     needs:
       - linux
       - sanitizers
+      - robot-repo
       - macos
       - soak
       - rio-adapter
