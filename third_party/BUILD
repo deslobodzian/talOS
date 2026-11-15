@@ -12,3 +12,11 @@ alias(
     name = "apriltag",
     actual = "@apriltag//:apriltag",
 )
+
+# talOS's patched toml++ (MODULE.bazel), for a repository that depends on
+# talOS and reads TOML itself (`#include "toml.hpp"`): the repository's own
+# name for it, @tomlplusplus, is visible only inside talOS.
+alias(
+    name = "tomlplusplus",
+    actual = "@tomlplusplus//:toml++",
+)
