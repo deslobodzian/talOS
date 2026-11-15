@@ -5,8 +5,9 @@ robot_py.toml also launches) plus a neighbor motor that stays connected.
 BenchMotorTest is the node test matrix, docs/TESTING.md §7 (the case names
 are the matrix's, which //tools:check_node_matrix looks for), plus the cases
 of node_test.cc it does not already cover. ParityTest runs the C++ node
-(motor.h, hosted through libbench_motor.so) and motor.py on one input script
-and requires the same /motor/state bytes and the same motor requests.
+(motor.h, hosted through libbench_motor.so) and motor.py on SCENARIO through
+talos.parity, which requires the same /motor/state bytes and the same
+requested and applied motor output after every step.
 """
 
 import math
@@ -21,7 +22,7 @@ from motor.MotorTarget import MotorTarget
 from motor.TargetSource import TargetSource
 from python.runfiles import runfiles
 from swerve_module.ModuleTarget import ModuleTarget
-from talos import teleop
+from talos import parity, teleop
 from talos.testing import Sim, SimHardware, Stick
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -327,67 +328,75 @@ class BenchTeleopTest(unittest.TestCase):
         self.assertEqual(push(buttons=(1,), enabled=False).mode, NEUTRAL)
 
 
+def target(mode, generation=None, voltage_v=0.0, velocity_rps=0.0,
+           voltage_frac=0.0):
+    """A teleop MotorTarget, as Bench.send sends it."""
+    return parity.send(MotorTarget, "teleop", generation=generation,
+                       mode=mode, voltage_v=voltage_v,
+                       velocity_rps=velocity_rps, voltage_frac=voltage_frac)
+
+
+# Each step's input; talos.parity compares /motor/state and the kraken's
+# requested and applied output after it.
+SCENARIO = [
+    ("disabled", parity.wait(0.05)),
+    ("enabled, never sent", parity.gateway(True),
+     parity.driver_station(enabled=True, teleop=True, then=0.05)),
+    ("voltage above the clamp", target(ControlMode.VOLTAGE, voltage_v=20.0)),
+    ("voltage below the clamp", target(ControlMode.VOLTAGE, voltage_v=-20.0)),
+    ("voltage and axis",
+     target(ControlMode.VOLTAGE, voltage_v=0.5, voltage_frac=-1.5)),
+    ("velocity", target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("explicit neutral", target(ControlMode.NEUTRAL, voltage_v=2.0)),
+    ("feedback",
+     parity.device("set_motor", "kraken", 4.5, -7.0, 2000, 1000, 42.5, 6.25,
+                   12.0),
+     target(ControlMode.VELOCITY, velocity_rps=-3.0)),
+    ("non-finite voltage", target(ControlMode.VOLTAGE, voltage_v=math.nan)),
+    ("infinite velocity", target(ControlMode.VELOCITY, velocity_rps=math.inf)),
+    ("released", parity.release(MotorTarget, "teleop")),
+    ("stale lane", target(ControlMode.VOLTAGE, voltage_frac=0.25),
+     parity.wait(TIMEOUT_S + 0.01)),
+    ("limit switches",
+     parity.device("set_limit_switches", "kraken", True, False, then=0.01)),
+    ("disconnected", parity.device("set_connected", "kraken", False),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("reconnected", parity.device("set_connected", "kraken", True),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    # Teleop -> disabled -> autonomous -> teleop under the bench policy
+    # (teleop ["teleop"], autonomous []): no lane drives in autonomous, and
+    # a target stamped under an earlier generation never drives.
+    ("Driver Station disabled", parity.remember_generation("first teleop"),
+     parity.driver_station(teleop=True, then=0.04),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("autonomous, teleop lane",
+     parity.driver_station(enabled=True, autonomous=True, then=0.05),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("autonomous, earlier teleop generation",
+     target(ControlMode.VELOCITY, "first teleop", velocity_rps=10.0)),
+    ("teleop, autonomous generation", parity.remember_generation("auto"),
+     parity.driver_station(enabled=True, teleop=True, then=0.02),
+     target(ControlMode.VELOCITY, "auto", velocity_rps=10.0)),
+    ("teleop, first teleop generation",
+     target(ControlMode.VELOCITY, "first teleop", velocity_rps=10.0)),
+    ("teleop, current generation",
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("Driver Station lost", parity.stop_driver_station(),
+     *[target(ControlMode.VELOCITY, velocity_rps=10.0)] * 16),
+    ("hardware state lost", parity.lose_states(1000), parity.wait(0.2)),
+    ("gateway disabled", parity.gateway(False),
+     target(ControlMode.VELOCITY, velocity_rps=10.0)),
+]
+
+
 class ParityTest(unittest.TestCase):
-    """The C++ node and motor.py, each on its own Sim, given one input
-    script: every step must publish the same /motor/state bytes and leave
-    the same requested and applied motor output."""
+    """The C++ node (libbench_motor.so) and motor.py on one scenario."""
 
-    @staticmethod
-    def script(cls):
-        b = Bench(cls)
-        hw = b.hw
-        steps = [
-            ("disabled", lambda: b.sim.step(0.05)),
-            ("enabled, never sent", b.enable),
-            ("voltage above the clamp",
-             lambda: b.send(ControlMode.VOLTAGE, voltage_v=20.0)),
-            ("voltage below the clamp",
-             lambda: b.send(ControlMode.VOLTAGE, voltage_v=-20.0)),
-            ("voltage and axis",
-             lambda: b.send(ControlMode.VOLTAGE, voltage_v=0.5,
-                            voltage_frac=-1.5)),
-            ("velocity", lambda: b.send(ControlMode.VELOCITY,
-                                        velocity_rps=10.0)),
-            ("explicit neutral",
-             lambda: b.send(ControlMode.NEUTRAL, voltage_v=2.0)),
-            ("feedback",
-             lambda: (hw.set_motor("motor", "kraken", 4.5, -7.0, 2000, 1000,
-                                   42.5, 6.25, 12.0),
-                      b.send(ControlMode.VELOCITY, velocity_rps=-3.0))),
-            ("non-finite voltage",
-             lambda: b.send(ControlMode.VOLTAGE, voltage_v=math.nan)),
-            ("released", b.release),
-            ("stale lane", lambda: (b.send(ControlMode.VOLTAGE,
-                                           voltage_frac=0.25),
-                                    b.sim.step(TIMEOUT_S + 0.01))),
-            ("limit switches",
-             lambda: (hw.set_limit_switches("motor", "kraken", True, False),
-                      b.sim.step(0.01))),
-            ("disconnected",
-             lambda: (hw.set_connected("motor", "kraken", False),
-                      b.send(ControlMode.VELOCITY, velocity_rps=10.0))),
-            ("reconnected",
-             lambda: (hw.set_connected("motor", "kraken", True),
-                      b.send(ControlMode.VELOCITY, velocity_rps=10.0))),
-            ("hardware state lost",
-             lambda: (hw.lose_states(1000), b.sim.step(0.2))),
-            ("gateway disabled",
-             lambda: (hw.enable(False),
-                      b.send(ControlMode.VELOCITY, velocity_rps=10.0))),
-        ]
-        trace = []
-        for name, step in steps:
-            step()
-            trace.append((name, b.state(), b.request(), b.applied()))
-        return trace
-
+    # REQ-CONTRACT-14
     def test_publishes_and_requests_what_the_cpp_node_does(self):
-        cpp = self.script(CppBenchMotor)
-        py = self.script(bench.BenchMotor)
-        for (name, *expected), (_, *actual) in zip(cpp, py):
-            with self.subTest(step=name):
-                self.assertIsNotNone(expected[0])
-                self.assertEqual(actual, expected)
+        parity.assert_same_behaviour(
+            CppBenchMotor, bench.BenchMotor, CONFIG, "motor", SCENARIO,
+            topics=[(MotorState, topics.STATE)], motors=["kraken"])
 
 
 if __name__ == "__main__":

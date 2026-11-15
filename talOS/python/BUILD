@@ -32,6 +32,17 @@ py_library(
     deps = [":talos"],
 )
 
+# `talos.parity`: one scenario against a node's C++ (talos.cpp_node) and
+# Python versions, compared step by step on talos.testing.
+py_library(
+    name = "parity",
+    testonly = True,
+    srcs = ["talos/parity.py"],
+    imports = ["."],
+    visibility = ["//visibility:public"],
+    deps = [":testing"],
+)
+
 # Optional framework teleop node, backed by the same implementation as C++.
 py_library(
     name = "teleop",

@@ -93,6 +93,7 @@ py_test(
         ":messages_py",
         "//bench/main_processor/swerve_module:messages_py",
         "//talOS/bridge:messages_py",
+        "//talOS/python:parity",
         "//talOS/python:teleop",
         "//talOS/python:testing",
         "@rules_python//python/runfiles",

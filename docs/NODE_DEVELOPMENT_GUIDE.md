@@ -609,6 +609,17 @@ Sim clock is `sim.now_ns`, integer nanoseconds equal to each node's
 `now_ns` (use it to compare times and build message times), and `sim.now`,
 float seconds. See `2026-robot/main_processor/intake/node_test.py`.
 
+`talos.parity` (`//talOS/python:parity`, testonly) runs one scenario, a list
+of named steps (`parity.send`, `release`, `driver_station`,
+`remember_generation`, `gateway`, `device`, `lose_states`, `wait`, or any
+callable taking the run's `sim`, `hw` and `node`), against a node's C++ class
+(`talos.cpp_node`) and its Python class, each on its own `Sim` with
+`SimHardware`: `parity.assert_same_behaviour(cpp, py, config, node, scenario,
+topics=[(M, topic)], motors=[...], digital_outputs=[...], pwms=[...])` fails
+at the first step after which a listed topic's bytes or a requested or
+applied output differ, naming the step and both decoded values. See
+`bench/main_processor/motor/node_py_test.py`.
+
 ## Adding a pose estimator
 
 An estimator is a hardware-free node: it reads state topics and publishes a
