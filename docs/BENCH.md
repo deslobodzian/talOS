@@ -365,7 +365,7 @@ sleep precision. Releasing a lane is not a mechanical brake.
   phases` console lines (one per 10 s; [format](../talOS/hardware/README.md)):
   each phase's mean and max in µs, and the motor and sensor counts. Then,
   with the bridge running, record `/hw/status` `can_utilization_frac` (the
-  busiest configured bus: on the bench, the `Shooter` CANivore all five
+  busiest configured bus still read: on the bench, the `Shooter` CANivore all five
   devices are on) with the config's `status_hz` at 200, then at 50
   (reconfigure between). For a robot estimate (16 Talon FX and 4
   CANcoders) scale the refresh and devices phases per device (the measured phase over the bench's five devices) by
