@@ -38,7 +38,8 @@ def _wait_exited_unreaped(pid, timeout):
     it or polling: a pidfd on Linux; where Python lacks pidfd_open, a waitid
     with WNOWAIT blocking in a helper thread whose completion is awaited for
     `timeout`; the kqueue NOTE_EXIT event where it lacks waitid too (macOS).
-    A child already reaped elsewhere counts as exited on every path."""
+    A child already reaped elsewhere counts as exited, until its pid is
+    reused; only reap() reaps a child of these tests."""
     if hasattr(os, "pidfd_open"):
         try:
             fd = os.pidfd_open(pid)
