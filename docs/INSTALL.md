@@ -144,6 +144,11 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   is atomic. The same test's OpenCV case requests four workers and converts
   colour through `CpuAprilTagBackend::Execute`'s `cvtColor`; Apple's GCD
   backend ignores the requested size, so only Linux runs exercise the patch.
+  It is a `single_version_override`, which Bazel applies only in the root
+  module: a repository that depends on talOS builds OpenCV unpatched, and
+  only its `--config=tsan` runs report that flag's race. (talOS fetches
+  toml++ as its own patched archive instead, so its parser patch reaches
+  every repository that depends on talOS.)
 - `third_party/apriltag_pjpeg_bounds.patch`: bounds and overflow fixes in AprilTag's JPEG
   decoder (`pjpeg.c`), used only by the offline `DetectImageFile` API; live
   capture passes raw GREY/YUYV buffers to `Detect`.

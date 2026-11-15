@@ -35,21 +35,27 @@ python.toolchain(
 )
 use_repo(python, "python_3_11")
 
-# For configuration
-bazel_dep(name = "tomlplusplus", version = "3.4.0")
+# For configuration: toml++ 3.4.0, fetched as talOS's own patched archive (as
+# AprilTag below) rather than a BCR bazel_dep with single_version_override,
+# because Bazel applies an override only in the root module: a repository
+# that depends on talOS would otherwise build the unpatched parser.
+# The patch removes two parser UBs: a table header whose first character
+# cannot start a key (`[#motors]`) asserts, or is UB under NDEBUG; and any
+# non-ASCII character in buckets its whitespace classifier leaves unfiltered
+# (U+00B1 '±' in our own vision.toml comments) reaches TOML_UNREACHABLE.
+# Regressions: //talOS/configuration:config_fuzz_test. It also marks toml.hpp
+# a system header (`#pragma GCC system_header`), so its deprecation warnings
+# do not fill every build that includes it.
+configuration_http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
-# toml++ 3.4.0 has two parser UBs the patch removes: a table header whose
-# first character cannot start a key (`[#motors]`) asserts, or is UB under
-# NDEBUG; and any non-ASCII character in buckets its whitespace classifier
-# leaves unfiltered (U+00B1 '±' in our own vision.toml comments) reaches
-# TOML_UNREACHABLE. Regressions: //talOS/configuration:config_fuzz_test.
-# The patch also marks toml.hpp a system header (`#pragma GCC system_header`),
-# so its deprecation warnings do not fill every build that includes it.
-single_version_override(
-    module_name = "tomlplusplus",
-    patch_strip = 1,
+configuration_http_archive(
+    name = "tomlplusplus",
+    build_file = "//third_party:tomlplusplus.BUILD.bazel",
+    integrity = "sha256-hRf2WTik+q6cz467NmMaOMHK37XvqF2acuFbnpfSUVU=",
+    patch_args = ["-p1"],
     patches = ["//third_party:tomlplusplus_parser_ub.patch"],
-    version = "3.4.0",
+    strip_prefix = "tomlplusplus-3.4.0",
+    urls = ["https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz"],
 )
 
 # Choreo .traj (JSON) trajectories, read by //talOS/trajectory at load time.
@@ -115,6 +121,11 @@ pip.parse(
 use_repo(pip, "pypi")
 
 bazel_dep(name = "opencv", version = "4.12.0")
+
+# Root-only, unlike toml++: the patch only makes the worker pool's `isActive`
+# flag atomic and drops OpenCV's thread-sanitizer exemption for it, so a
+# repository depending on talOS builds OpenCV as upstream ships it, and only a
+# --config=tsan run there reports that race (docs/INSTALL.md).
 single_version_override(
     module_name = "opencv",
     patch_strip = 1,
