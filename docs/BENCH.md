@@ -133,8 +133,13 @@ Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
 
 [`robot_py.toml`](../bench/main_processor/configuration/robot_py.toml) is
 `robot.toml` with the bare motor's node swapped for its Python twin,
-[`motor.py`](../bench/main_processor/motor/motor.py) (same subsystem files,
-parameters, gating and `/motor/state`). Every check in this file applies
+[`motor.py`](../bench/main_processor/motor/motor.py) (same devices,
+parameters, gating and `/motor/state`). Its motor subsystem file,
+[`motor_py.toml`](../bench/main_processor/configuration/subsystems/motor_py.toml),
+is `motor.toml` (its `defaults`) at `period_us` 20000, since a Python
+actuator owner runs at 20 ms or slower
+([launcher](../talOS/launcher/README.md#python-actuator-periods)): read
+"one motor tick" below as 20 ms. Every other check in this file applies
 unchanged; run it against the RIO with:
 
 ```sh
