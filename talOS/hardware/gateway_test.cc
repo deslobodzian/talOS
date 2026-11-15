@@ -195,6 +195,115 @@ TEST(Messages, MotorDiagnosticsUseSaturatingSignedTenths) {
   }
 }
 
+// A Command the main processor and the RoboRIO agree on byte for byte,
+// whatever either host's byte order: every integer and IEEE 754 double
+// little-endian, no padding.
+// REQ-CONTRACT-03
+TEST(Messages, CommandIsLittleEndianOnTheWire) {
+  Command command;
+  command.config_id = 0x0102030405060708ull;
+  command.boot_id = 0x1112131415161718ull;
+  command.epoch = 0x2122232425262728ull;
+  command.observed_time_us = 0x3132333435363738ull;
+  command.count = 1;
+  command.motors[0] = {0x0102, Mode::kVoltage, 1, 1.0, -2.0};
+  command.digital_output_count = 1;
+  command.digital_outputs[0] = {0x0304, true};
+  command.pwm_output_count = 1;
+  command.pwm_outputs[0] = {0x0506, 0.5};
+  const std::vector<uint8_t> expected{
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,   // config_id
+      0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,   // boot_id
+      0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,   // epoch
+      0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,   // observed_time_us
+      1,    0,    1,    0,    1,    0,                  // counts
+      0x02, 0x01, 2,    1,                              // motor id, mode, slot
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // demand 1.0
+      0,    0,    0,    0,    0,    0,    0,    0xC0,   // feedforward_v -2.0
+      0x04, 0x03, 1,                                    // digital output
+      0x06, 0x05,                                       // pwm id
+      0,    0,    0,    0,    0,    0,    0xE0, 0x3F};  // pwm output 0.5
+  std::array<uint8_t, kMaxCommandSize> bytes{};
+  const auto size = Encode(command, bytes);
+  ASSERT_EQ(size, expected.size());
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+  Command decoded;
+  ASSERT_TRUE(Decode(expected, decoded));
+  EXPECT_EQ(decoded, command);
+}
+
+// The State the RoboRIO sends, byte for byte: integers, doubles, the float
+// CAN utilization and the signed-tenths diagnostics all little-endian.
+// REQ-CONTRACT-03
+TEST(Messages, StateIsLittleEndianOnTheWire) {
+  State state;
+  state.config_id = 0x0102030405060708ull;
+  state.boot_id = 0x1112131415161718ull;
+  state.epoch = 0x2122232425262728ull;
+  state.sample_time_us = 0x3132333435363738ull;
+  state.last_command_sequence = 0x4142434445464748ull;
+  state.clock_probe_time_us = 0x5152535455565758ull;
+  state.sequence = 0x6162636465666768ull;
+  state.build = {0x7172737475767778ull, GatewayProgram::kRoboRio, true};
+  state.flags = 0x0A0B0C0D;
+  state.motor_count = 1;
+  auto& motor = state.motors[0];
+  motor.id = 0x0708;
+  motor.valid = true;
+  motor.position_rot = 1.0;
+  motor.velocity_rps = -2.0;
+  motor.voltage = 0.5;
+  motor.stator_current_a = 12.3;
+  motor.position_age_us = 0x01020304;
+  motor.velocity_age_us = 0x05060708;
+  motor.fault_flags = 0x090A0B0C;
+  motor.temperature_c = -4.5;
+  motor.supply_current_a = 0.1;
+  state.health.valid = true;
+  state.health.battery_v = 12.5;
+  state.health.can_bus_count = 2;
+  state.health.can_bus_index = 1;
+  state.health.can_bus = {
+      CanBusReadState::kOk, 0.25f, 0x11121314, 0x21222324, 5, 6, 0x31323334};
+  state.counters = {0x41424344, 0x51525354, 0x61626364, 0x71727374};
+  const std::vector<uint8_t> expected{
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // config_id
+      0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,  // boot_id
+      0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,  // epoch
+      0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,  // sample_time_us
+      0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,  // last_command_sequence
+      0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51,  // clock_probe_time_us
+      0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61,  // sequence
+      0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71,  // build.revision
+      1,    1,                                         // program, dirty
+      0x0D, 0x0C, 0x0B, 0x0A,                          // flags
+      1,    0,    0,    0,    0,    0,    0,    0,     // device counts
+      0,    0,    0,    0,    0,    0,                 //
+      0x08, 0x07, 1,                                   // motor id, valid
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,  // position_rot 1.0
+      0,    0,    0,    0,    0,    0,    0,    0xC0,  // velocity_rps -2.0
+      0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // voltage 0.5
+      123,  0,                                         // stator 12.3 A
+      0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05,  // ages
+      0x0C, 0x0B, 0x0A, 0x09,                          // fault_flags
+      0xD3, 0xFF, 1,    0,                             // -4.5 C, 0.1 A
+      1,                                               // health valid
+      0,    0,    0,    0,    0,    0,    0x29, 0x40,  // battery_v 12.5
+      0,    2,    1,    1,                             // brownout..read_state
+      0,    0,    0x80, 0x3E,                          // utilization 0.25f
+      0x14, 0x13, 0x12, 0x11, 0x24, 0x23, 0x22, 0x21,  // bus-off, buffer-full
+      5,    6,    0x34, 0x33, 0x32, 0x31,              // rx, tx, failures
+      0x44, 0x43, 0x42, 0x41, 0x54, 0x53, 0x52, 0x51,  // counters
+      0x64, 0x63, 0x62, 0x61, 0x74, 0x73, 0x72, 0x71};
+  std::array<uint8_t, kMaxStateSize> bytes{};
+  const auto size = Encode(state, bytes);
+  ASSERT_EQ(size, expected.size());
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+  State decoded;
+  ASSERT_TRUE(Decode(expected, decoded));
+  EXPECT_EQ(decoded, state);
+}
+
 struct ModuleConfig {
   const char* name;
   uint16_t drive_id, steer_id, encoder_id;
