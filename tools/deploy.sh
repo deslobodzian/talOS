@@ -299,7 +299,9 @@ check_graph() {
   fi
   say "checking the graph: $bundle/run.sh --describe-only"
   local scratch
-  scratch="$(mktemp -d "${TMPDIR:-/tmp}/talos_install_check.XXXXXX")" ||
+  # macOS's TMPDIR ends in a slash; the launcher prints paths under this.
+  scratch="${TMPDIR:-/tmp}"
+  scratch="$(mktemp -d "${scratch%/}/talos_install_check.XXXXXX")" ||
     die "cannot create a temporary directory for the graph check; nothing selected"
   local pid status=0 stopped=0
   # In the background, as the warm-up, so that a stop reaches the launcher.
