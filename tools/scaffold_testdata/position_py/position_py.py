@@ -29,7 +29,7 @@ class PositionPy:
     def __init__(self, node):
         # A helper, not a requirement: it homes, clamps goals to the travel
         # and latches faults. The node may drive its talos.Motor directly
-        # instead (docs/FIRST_MECHANISM.md).
+        # instead (docs/FIRST_MECHANISM.md in the talos repository).
         self.mechanism = PositionMechanism(node, "position_py")
         self.target = talos.Target(node, PositionPyTarget)
         self.state = node.publish(PositionPyState, topics.STATE)
