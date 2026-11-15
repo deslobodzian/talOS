@@ -623,13 +623,15 @@ float seconds. See `2026-robot/main_processor/intake/node_test.py`.
 of named steps (`parity.send`, `release`, `driver_station`,
 `stop_driver_station`, `require_published`,
 `remember_generation`, `gateway`, `device`, `lose_states`, `wait`, or any
-callable taking the run's `sim`, `hw` and `node`), against a node's C++ class
+callable taking the run's rig, which holds its `sim`, `hw` and `node` and
+advances time with `rig.advance`), against a node's C++ class
 (`talos.cpp_node`) and its Python class, each on its own `Sim` with
 `SimHardware`: `parity.assert_same_behaviour(cpp, py, config, node, scenario,
 topics=[(M, topic)], motors=[...], digital_outputs=[...], pwms=[...])` fails
-at the first step after which a listed topic's bytes or a requested or
-applied output differ (or a topic a `parity.require_published()` step names
-has no message), naming the step and both decoded values. How a parity run
+at the first tick of a step (each boundary of the node's period), or step
+end, at which a listed topic's bytes or a requested or applied output differ
+(or a topic a `parity.require_published()` step names has no message at the
+step's end), naming the step, the tick and both decoded values. How a parity run
 stands in for a Python twin's matrix cases is in
 [TESTING.md §7](TESTING.md#7-the-node-test-matrix).
 
