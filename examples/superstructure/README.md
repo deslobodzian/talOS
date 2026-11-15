@@ -251,11 +251,13 @@ until its stall or timeout stop.
 
 ## Write your own mechanism
 
-Start from a building block: most mechanisms are a
-[`talOS/mechanisms`](../../talOS/mechanisms/README.md) class plus a target
-lane and a state publisher, as `cpp/elevator.h` and `cpp/intake.h` are; the
-library's README has a minimal node. Write the control yourself only for
-what no block covers.
+A mechanism node is a target lane, a state publisher and the control
+between them. The control can be a
+[`talOS/mechanisms`](../../talOS/mechanisms/README.md) class, as in
+`cpp/elevator.h` and `cpp/intake.h` (the library's README has a minimal
+node), or your own code driving the node's `Motor` directly: the library
+is an optional helper
+([the library, or your own code](../../docs/FIRST_MECHANISM.md#6-position-mechanisms-the-library-or-your-own-code)).
 
 Generate a robot of your own whose first mechanism is a position-controlled
 wrist, from the repo root:
