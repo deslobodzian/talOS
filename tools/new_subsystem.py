@@ -2697,8 +2697,6 @@ def joystick_schedule(button):
             "pov=-1|6:axes=0;buttons=0;pov=-1")
 
 
-JOYSTICK_SCHEDULE = joystick_schedule(TELEOP_BUTTONS[0])
-
 
 def sim_run(button):
     return (f"--sim-gateway --no-studio --duration-s {SIM_DURATION_S} "
