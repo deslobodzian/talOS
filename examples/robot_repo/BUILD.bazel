@@ -15,7 +15,8 @@ SIMULATOR = "@talos//talOS/simulation:sim_gateway"
 STUDIO_BRIDGE = "@talos//studio/bridge:studio_bridge"
 
 # Studio's pages, bazel-bin/studio_webroot, robot.toml's [studio] webroot:
-# empty until the talOS checkout builds them (MODULE.bazel's studio_web).
+# only NOT_BUILT.txt until the talOS checkout builds them (MODULE.bazel's
+# studio_web).
 studio_webroot(
     name = "studio_webroot",
     srcs = ["@studio_web//:files"],

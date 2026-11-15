@@ -16,10 +16,15 @@ leaves in its talOS checkout, read from outside Bazel's package tree:
 
 `//:studio_webroot` is then one directory, `bazel-bin/studio_webroot`, for a
 `talos_sim`'s `data` and `talos_bundle`'s `studio_webroot`, and the robot's
-`[studio] webroot` names it. Until the pages are built (`cd talos && bazel
-build //studio:web_dist`) the directory is empty: the bridge then answers `/`
-and `/drive` with that command, and `talos_bundle` refuses it.
+`[studio] webroot` names it. How a robot repository uses it:
+examples/robot_repo/README.md, "Studio".
 """
+
+# Written into the directory while the pages are not built: Bazel leaves an
+# empty directory out of a target's runfiles, and the bridge must still be
+# given a folder that exists (to answer its pages with this command).
+_NOT_BUILT = "NOT_BUILT.txt"
+_NOT_BUILT_TEXT = "The Studio pages are not built: cd talos && bazel build //studio:web_dist"
 
 def _studio_web_impl(rctx):
     path = rctx.attr.path
@@ -76,7 +81,8 @@ def _studio_webroot_impl(ctx):
         command = "out=\"$1\"; shift; mkdir -p \"$out\"; " +
                   "while [ $# -gt 0 ]; do " +
                   "mkdir -p \"$out/$(dirname \"$2\")\" && cp \"$1\" \"$out/$2\" || exit 1; " +
-                  "shift 2; done",
+                  "shift 2; done; " +
+                  ("[ -e \"$out/index.html\" ] || echo '%s' > \"$out/%s\"" % (_NOT_BUILT_TEXT, _NOT_BUILT)),
         mnemonic = "StudioWebroot",
         progress_message = "Collecting Studio's pages into %{output}",
     )
@@ -94,6 +100,7 @@ studio_webroot = rule(
             doc = "A studio_web repository's `:files`.",
         ),
     },
-    doc = "Studio's pages as one directory named after the target (empty " +
-          "while they are not built), the webroot the Studio bridge serves.",
+    doc = "Studio's pages as one directory named after the target (holding " +
+          "only NOT_BUILT.txt while they are not built), the webroot the " +
+          "Studio bridge serves.",
 )

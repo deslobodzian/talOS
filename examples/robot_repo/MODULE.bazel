@@ -15,8 +15,8 @@ local_path_override(
 # Studio's pages (/ and /drive), as the talOS checkout builds them: in a robot
 # repository `path = "talos/bazel-bin/studio/dist"`, built by
 # `cd talos && bazel build //studio:web_dist`. Until then //:studio_webroot
-# is empty and the bridge answers its pages with that command
-# (@talos//studio/bridge:webroot.bzl).
+# holds only NOT_BUILT.txt and the bridge answers its pages with that
+# command (README.md "Studio").
 studio_web = use_repo_rule("@talos//studio/bridge:webroot.bzl", "studio_web")
 
 studio_web(

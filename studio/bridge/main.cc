@@ -790,10 +790,15 @@ int main(int argc, char** argv) try {
   // never built) leaves the bridge serving its feeds and answering the pages
   // with how to build them, and pages built while it runs are served at once.
   const fs::path webroot = fs::absolute(count > 3 ? at(3) : "studio/dist");
-  if (std::error_code absent;
-      !fs::is_regular_file(webroot / "drive.html", absent)) {
-    std::cerr << MissingPage(webroot, "drive.html");
+  std::string missing_pages;
+  constexpr std::array<std::string_view, 2> kPages{"index.html", "drive.html"};
+  for (const std::string_view page : kPages) {
+    if (std::error_code absent; !fs::is_regular_file(webroot / page, absent)) {
+      missing_pages +=
+          (missing_pages.empty() ? "" : " or ") + std::string(page);
+    }
   }
+  if (!missing_pages.empty()) std::cerr << MissingPage(webroot, missing_pages);
   Bridge bridge;
   bridge.topic = topic;
   // Watched by segment name, not by topic. A topic like /talos/telemetry has

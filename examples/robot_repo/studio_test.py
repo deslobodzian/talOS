@@ -8,6 +8,7 @@ with SIGINT as Ctrl-C does, and reads the session's manifest.
 import glob
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -47,9 +48,21 @@ class StudioBridgeInSession(unittest.TestCase):
         that depends on talOS (it loaded rules_js), so this target did not
         build; and a bridge the launcher drops leaves no manifest row, so
         the row is required here rather than only its exit."""
+        out = tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))
+        try:
+            self.check_session(out)
+        except AssertionError as error:
+            # The bridge's own output, which the launcher does not echo: a
+            # port another process took first reads there, not in the
+            # launch's lines (talOS docs/TESTING.md §6.4).
+            logs = glob.glob(os.path.join(out, "*", "studio_bridge.log"))
+            text = "".join(open(log, encoding="utf-8").read() for log in logs)
+            raise AssertionError(f"{error}\n--- studio_bridge.log ---\n"
+                                 f"{text or '(none written)'}") from None
+
+    def check_session(self, out):
         sim = runfiles.Create().Rlocation("_main/sim")
         gateway, bridge, studio = free_ports()
-        out = tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))
         launch = subprocess.Popen(
             [sim, "--start-studio-bridge", "--studio-http-port", str(studio),
              "--output-dir", out, "--remote", "127.0.0.1",
@@ -83,12 +96,21 @@ class StudioBridgeInSession(unittest.TestCase):
                     status, body = answer.status, answer.read().decode()
             except urllib.error.HTTPError as error:
                 status, body = error.code, error.read().decode()
-            # The page, or (pages not built) the command that builds them.
+            # The page, or (pages not built) the command that builds them,
+            # naming the folder the bridge was given: //:studio_webroot, an
+            # existing directory, so a webroot the config or //:sim's data
+            # miswires (a folder that does not exist) fails here too.
             if status == 200:
                 self.assertIn("<html", body.lower())
             else:
                 self.assertEqual(status, 503, body)
                 self.assertIn("//studio:web_dist", body)
+                folder = re.search(r"not built: (.*) has no ", body)
+                self.assertIsNotNone(folder, body)
+                self.assertEqual(os.path.basename(folder[1]), "studio_webroot",
+                                 body)
+                self.assertTrue(os.path.isdir(folder[1]),
+                                f"{folder[1]} is not a directory: {body}")
             launch.send_signal(signal.SIGINT)
             self.assertEqual(launch.wait(timeout=STOP_WAIT_S), 0,
                              "".join(output))

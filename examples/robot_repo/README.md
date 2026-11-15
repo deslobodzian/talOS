@@ -43,26 +43,32 @@ judges is in `talos_sim_test`'s docstring (`talOS/build/contract.bzl`).
 as a session member: Studio at `http://localhost:5800` (`[studio]
 http_port`, or `--studio-http-port PORT`) and the driver dashboard at
 `/drive`. The pages come from the talOS checkout, which builds them as its
-own workspace:
+own workspace. In a robot repository, whose talOS is the submodule
+`talos/`, a student types:
 
 ```sh
-(cd ../.. && bazel build //studio:web_dist)   # in a robot repository: (cd talos && bazel build //studio:web_dist)
+(cd talos && bazel build //studio:web_dist)   # once, and after moving the talOS pin
+bazel run //:sim -- --start-studio-bridge     # Studio at http://localhost:5800, the driver dashboard at /drive
 ```
+
+(here, `(cd ../.. && bazel build //studio:web_dist)`).
 
 `MODULE.bazel`'s `studio_web` reads that build's folder (`path`, here
 `../../bazel-bin/studio/dist`, in a robot repository
 `talos/bazel-bin/studio/dist`), `BUILD.bazel`'s `//:studio_webroot` makes it
 one directory in `//:sim`'s `data`, and `robot.toml`'s `[studio] webroot`
 names it (`bazel-bin/studio_webroot`); `@talos//studio/bridge:webroot.bzl`
-says how. Until the pages are built, `/` and `/drive` answer 503 with the
-command above; Bazel fetches the folder again when they are built, so the
+says how. Until the pages are built, `//:studio_webroot` holds only
+`NOT_BUILT.txt` (Bazel leaves an empty directory out of runfiles), and `/`
+and `/drive` answer 503 with the command above; Bazel fetches the folder again when they are built, so the
 next `bazel run //:sim` serves them. This robot has no `[studio] dashboard`
 layout, so `/drive` shows no widgets
 ([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
 
 `studio_test` runs `//:sim --start-studio-bridge` on free ports until the
 launcher reports the bridge up, requires `/drive` to answer with the page or
-with that command, stops the session, and requires the bridge to have run
+with that command naming `//:studio_webroot`'s folder (so a webroot the
+config or `//:sim`'s `data` miswires fails it), stops the session, and requires the bridge to have run
 once and exited 0. It is not a `talos_sim_test`, which waits for every
 member's registry row; the bridge takes none.
 
