@@ -11,8 +11,9 @@ They talk over UDP (`talOS/protocol`; gateway port 5802, main-processor port
 5803). On the main processor `//talOS/bridge:hardware_node` is the courier: it
 collects each node's `/hw/request/<node>`, sends the commands to the RoboRIO,
 and publishes what comes back on `/hw/state` and `/hw/state/driver_station`.
-In simulation `//2026-robot/main_processor/simulation:sim_gateway` (or the
-RoboRIO program under WPILib simulation) takes the RoboRIO's place.
+In simulation `//talOS/simulation:sim_gateway`, which the launcher starts on
+the ports it gives the bridge, or the RoboRIO program under WPILib
+simulation takes the RoboRIO's place.
 
 See [Data flow and byte budgets](docs/DATA_FLOW.md) for every transport,
 producer/consumer, rate, dynamic payload, and shared-memory slot size.
@@ -62,6 +63,7 @@ Beside the stack:
 | `talOS/bridge` | `:hardware_node`; publishes link health, RoboRIO power and each CAN bus's health (assembled by `:can_buses`, which `testing::SimHardware` also runs), gateway counters and build, and the gateway-to-node clock mapping (`:clock_offset`, read by `HardwareLink::sample_time()`) on `/hw/status` (`bridge::BridgeStatus`); `:merge` holds the request merge rules (owner timeout, merged observation) that `testing::SimHardware` also runs; `--log` records every command and State it publishes, with the sequence and stamp its readers see |
 | `talOS/driver_station` | Driver Station codec |
 | `talOS/launcher` | spawns and supervises the nodes in a config (restarts crashed or stalled nodes per its [restart policy](talOS/launcher/README.md#restarts)); writes each session to `<output-dir>/<session_id>/` with a manifest kept current and old sessions pruned; `--describe-only` lints the graph; `:log_dump` prints its `.tlog`s and `:tlog_to_wpilog` converts them to `.wpilog` |
+| `talOS/simulation` | `:sim_gateway`, the lightweight simulator that stands in for the RoboRIO for any robot config: devices from the config's hardware, ideal or `--physics` backend, scripted mode, joystick and fault schedules, `/sim/state` truth; the launcher starts it under `--start-sim-gateway` on the bridge's ports |
 | `talOS/introspection` | `--describe`, the naming rules (`names.h`), the live registry Studio reads |
 | `talOS/process` | stop handlers and the stop pipe a node's loop and the launcher's start-up watch, `ConfigureRealtime` for node binaries and `ConfigureBackgroundThread` for their helper threads; `DurableSync`, the power-loss-safe sync of the launcher's session files and event logs |
 | `talOS/msgs` | shared geometry and control message structs (field and chassis angles in radians; `SwerveModulePosition`, `PoseObservation`, `PoseEstimate`) |

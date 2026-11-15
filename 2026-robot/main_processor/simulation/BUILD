@@ -1,55 +1,19 @@
-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 load("//2026-robot/main_processor/configuration:robot_physics_sim_manifest.bzl", "CONFIG_FILES", "NODES")
 
 package(default_visibility = ["//visibility:public"])
 
-cc_binary(
-    name = "sim_gateway",
-    srcs = [
-        "schedules.h",
-        "sim_gateway.cc",
-    ],
-    deps = [
-        "//talOS/configuration",
-        "//talOS/driver_station",
-        "//talOS/driver_station:schedule",
-        "//talOS/events:events_os",
-        "//talOS/hardware",
-        "//talOS/hardware:sim_messages",
-        "//talOS/introspection:describe",
-        "//talOS/introspection:registry",
-        "//talOS/ipc",
-        "//talOS/msgs:geometry",
-        "//talOS/process",
-    ],
-)
-
-cc_test(
-    name = "schedules_test",
-    srcs = [
-        "schedules.h",
-        "schedules_test.cc",
-    ],
-    deps = [
-        "//talOS/hardware",
-        "@googletest//:gtest_main",
-    ],
-)
-
 # REQ-DEV-05: the simulated resting supply passes the 2026 dashboard's
 # pre-match Battery check, read from dashboard.toml.
 cc_test(
     name = "resting_supply_test",
     size = "small",
-    srcs = [
-        "resting_supply_test.cc",
-        "schedules.h",
-    ],
+    srcs = ["resting_supply_test.cc"],
     data = ["//2026-robot/main_processor/configuration:dashboard.toml"],
     deps = [
         "//talOS/hardware",
+        "//talOS/simulation:schedules",
         "@googletest//:gtest_main",
         "@tomlplusplus//:toml++",
     ],
@@ -71,11 +35,11 @@ py_test(
     timeout = "short",
     srcs = ["startup_test.py"],
     data = [
-        ":sim_gateway",
         "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
         "//talOS/bridge:hardware_node",
         "//talOS/launcher",
         "//talOS/launcher:log_dump",
+        "//talOS/simulation:sim_gateway",
     ] + CONFIG_FILES + NODES,
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
@@ -99,11 +63,11 @@ py_test(
         "startup_test.py",
     ],
     data = [
-        ":sim_gateway",
         "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
         "//talOS/bridge:hardware_node",
         "//talOS/launcher",
         "//talOS/launcher:log_dump",
+        "//talOS/simulation:sim_gateway",
     ] + CONFIG_FILES + NODES,
     imports = ["."],
     tags = [
@@ -119,11 +83,11 @@ py_library(
     name = "accuracy",
     srcs = ["accuracy.py"],
     data = [
-        ":sim_gateway",
         "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
         "//talOS/bridge:hardware_node",
         "//talOS/launcher",
         "//talOS/launcher:log_dump",
+        "//talOS/simulation:sim_gateway",
     ] + CONFIG_FILES + NODES,
     imports = ["."],
     deps = [
@@ -166,7 +130,7 @@ py_test(
         "startup_test.py",
     ],
     data = [
-        ":sim_gateway",
+        "//talOS/simulation:sim_gateway",
         "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
         # The bridge refuses to start without its webroot,
         # [studio] webroot = bazel-bin/studio/dist.

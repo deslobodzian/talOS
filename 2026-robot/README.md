@@ -20,7 +20,8 @@ with GradleRIO.
 | `telemetry` (`//talOS/telemetry:node`) | C++ | framework telemetry node; Studio frames; the pose from `[studio] pose_topic` | the state and status topics, `/hw/state/driver_station`, `/hw/status` | `/talos/telemetry` |
 | `hardware_node` (`//talOS/bridge:hardware_node`) | C++ | UDP courier to the RoboRIO | `/hw/request/<node>` | `/hw/state`, `/hw/state/driver_station`, `/hw/status`, `/hw/command` |
 
-Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway`.
+Simulation stands in for the RoboRIO with talOS's `//talOS/simulation:sim_gateway`;
+the 2026 end-to-end tests against it are in `main_processor/simulation`.
 
 A node package's own targets link no other node's class. Tests that run
 several of these nodes together under `Sim` (the teleop chain from a joystick
@@ -167,7 +168,7 @@ alliance (`--alliance red` for red), enables teleop once the gateway is
 configured, or runs `--mode-schedule` phases from that
 moment (the lightweight simulator's schedule runs from its start).
 `--joystick-schedule` scripts joystick 0 on the same clock, in the lightweight
-simulator's syntax ([simulation/README.md](main_processor/simulation/README.md#scripted-joystick-and-fault-schedules));
+simulator's syntax ([talOS/simulation/README.md](../talOS/simulation/README.md#scripted-joystick-and-fault-schedules));
 headless it goes through WPILib's simulated Driver Station, so the gateway
 reads it as it would a real stick. The stick keeps its scripted value when the
 schedule disables; the robot goes neutral because it is disabled.

@@ -246,7 +246,7 @@ the bridge and the RoboRIO (set a motor's feedback, the Driver Station mode).
 [Testing](NODE_DEVELOPMENT_GUIDE.md#testing).
 
 **Sim gateway.** The lightweight simulator process
-(`//2026-robot/main_processor/simulation:sim_gateway`) that plays the RoboRIO
+(`//talOS/simulation:sim_gateway`) that plays the RoboRIO
 for a running graph; `./sim.sh --sim-gateway`. Its backend is ideal (motors
 reach demands at once) or physics (`--physics`).
 [Lightweight simulation gateway](../talOS/launcher/README.md#lightweight-simulation-gateway),

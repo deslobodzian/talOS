@@ -25,10 +25,9 @@ bazel run @talos//tools:sync_manifest -- robot.toml   # after editing [[subsyste
 runfiles (`talos_sim`, `talOS/build/contract.bzl`); it starts no Studio bridge
 unless ARGS include `--start-studio-bridge`. The simulator is the one
 `[robot] sim_gateway` names, which `BUILD.bazel` also lists in the target's
-`data`. It listens on 5802 and sends to 5803 unless given
-`--sim-gateway-arg --port --sim-gateway-arg P` and `--sim-gateway-arg
---remote-port --sim-gateway-arg P`; `sim_smoke_test` passes both, and the
-bridge's `--remote-port` and `--local-port`, on free ports.
+`data`. The launcher gives it the bridge's ports (`[robot] controller_port`
+and `local_port`, or ARGS' `--remote-port` and `--local-port`);
+`sim_smoke_test` passes those two flags, on free ports, and nothing else.
 
 ## What a robot repository names by `@talos//`
 

@@ -580,7 +580,6 @@ def run_scenario(duration_s, output_dir, min_yaw_std_rad=None,
                 "--physics", "--wheel-radius-error", "-0.02",
                 "--wheel-slip-gain", "0.05", "--gyro-drift-radps", "0.002",
                 "--mode-schedule", f"disabled:1,auto:{seconds}",
-                "--port", str(gateway_port), "--remote-port", str(bridge_port),
             ]
             args = ["--config", str(live_config), "--sim", "--start-sim-gateway",
                     "--remote", "127.0.0.1", "--remote-port", str(gateway_port),

@@ -382,6 +382,18 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;
   }
+  // The launcher gives the simulator the bridge's ports (SimulatorArgs); a
+  // port written by hand as well could only disagree with the bridge's.
+  for (const std::string& arg : options_.sim_gateway_args) {
+    if (IsSimulatorPortArg(arg)) {
+      std::cerr << "launcher: --sim-gateway-arg " << arg
+                << " is refused: the launcher passes the simulator --port "
+                   "and --remote-port from [robot] controller_port and "
+                   "local_port, or from its --remote-port and --local-port; "
+                   "set those instead\n";
+      return 1;
+    }
+  }
   std::string bundle_error;
   if (!LoadBundle(options_, bundle_error)) {
     std::cerr << "launcher: " << bundle_error << "\n";

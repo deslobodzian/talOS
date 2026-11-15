@@ -198,7 +198,7 @@ class Soak(unittest.TestCase):
                     "--local-port", str(bridge_port), "--output-dir", str(output),
                     "--duration-s", f"{duration:.0f}"]
             gateway_args = [
-                "--physics", "--port", str(gw_port), "--remote-port", str(bridge_port),
+                "--physics",
                 "--mode-schedule",
                 f"disabled:{LEAD_S:.0f},teleop:{teleop_s:.0f},disabled:{LEAD_S:.0f}",
                 "--joystick-schedule", joystick_schedule(teleop_s)]

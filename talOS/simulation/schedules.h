@@ -10,7 +10,7 @@
 
 #include "talOS/hardware/sim_physics.h"
 
-namespace robot::simulation {
+namespace talos::simulation {
 
 inline std::vector<std::string> Split(const std::string& text, char delimiter) {
   std::vector<std::string> parts;
@@ -210,4 +210,4 @@ inline bool ApplyFaults(std::vector<FaultEvent>& events, double elapsed_s,
   return blackout;
 }
 
-}  // namespace robot::simulation
+}  // namespace talos::simulation

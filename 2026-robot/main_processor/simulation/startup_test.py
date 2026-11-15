@@ -25,7 +25,7 @@ def workspace():
 
 
 def binary():
-    return workspace() / "2026-robot/main_processor/simulation/sim_gateway"
+    return workspace() / "talOS/simulation/sim_gateway"
 
 
 def udp_ports():
@@ -440,7 +440,7 @@ class FullStackSimulation(unittest.TestCase):
                 args = [str(root / "talOS/launcher/launcher"),
                         "--config", str(config), "--sim", "--start-sim-gateway"]
                 gateway_args = [
-                    "--physics", "--port", str(gw_port), "--remote-port", str(bridge_port),
+                    "--physics",
                     "--mode-schedule", "disabled:0.5,auto:0.5,teleop:6,disabled:1",
                     "--joystick-schedule",
                     "0:axes=0,0,0;buttons=0;pov=-1|"

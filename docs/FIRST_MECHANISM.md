@@ -308,7 +308,7 @@ and the RoboRIO. Without `--config` it runs `2026-robot`. The mode schedule is
 `mode:seconds` phases (disabled for 1 s, then teleop). The joystick schedule is
 `seconds:axes=...;buttons=MASK;pov=DEG` snapshots of joystick 0, each held
 until the next: button 3 is bit 2 of the mask, so `buttons=4` presses it from
-second 3 to second 6 ([syntax](../2026-robot/main_processor/simulation/README.md#scripted-joystick-and-fault-schedules)).
+second 3 to second 6 ([syntax](../talOS/simulation/README.md#scripted-joystick-and-fault-schedules)).
 `./sim.sh --help` lists the rest.
 
 ### See the result

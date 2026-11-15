@@ -10,8 +10,9 @@ ARCHITECTURE.md "Layers" and "Allowed dependencies"
 
 - the stack: rtms (with memory and ipc) < events < node < devices; a layer
   never depends on a layer above it, nor on the talOS packages built on the
-  stack (the bridge, launcher, framework nodes, node_api, python), and
-  talOS/node drives no hardware (it never depends on talOS/hardware);
+  stack (the bridge, launcher, simulator, framework nodes, node_api,
+  python), and talOS/node drives no hardware (it never depends on
+  talOS/hardware);
 - nothing under talOS/ depends on a robot, an example, the bench, a
   controller processor's program or studio/;
 - talOS/geometry never depends on talOS/vision;
@@ -54,6 +55,7 @@ ON_THE_STACK = (
     "talOS/mechanisms",
     "talOS/node_api",
     "talOS/python",
+    "talOS/simulation",
     "talOS/telemetry",
     "talOS/teleop",
 )

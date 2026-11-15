@@ -104,10 +104,10 @@ py_test(
         "scaffold_sim_test.py",
     ],
     data = [
-        "//2026-robot/main_processor/simulation:sim_gateway",
         "//talOS/bridge:hardware_node",
         "//talOS/launcher",
         "//talOS/launcher:log_dump",
+        "//talOS/simulation:sim_gateway",
         "//talOS/telemetry:node",
         "//talOS/teleop:node",
         "//tools/scaffold_testdata/gripper:node",

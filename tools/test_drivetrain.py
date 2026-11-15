@@ -3,7 +3,7 @@
 Two gateways can stand at the RoboRIO end of the UDP link, and both are tested
 the same way because both run the same `talos::hardware::Gateway`:
 
-    python3 tools/test_drivetrain.py            # //2026-robot/main_processor/simulation:sim_gateway
+    python3 tools/test_drivetrain.py            # //talOS/simulation:sim_gateway
     python3 tools/test_drivetrain.py --wpilib   # controller_processor/rio/, under WPILib simulation
 
 The second one is the real RoboRIO program. It is slower to start, because it
@@ -16,7 +16,7 @@ Logs go to a new directory under the system temporary directory, or under
 --output-dir when given (CI keeps that directory when the run fails).
 
 First build: bazel build //2026-robot/main_processor/drivetrain:all \
-                         //2026-robot/main_processor/simulation:sim_gateway \
+                         //talOS/simulation:sim_gateway \
                          //talOS/bridge:hardware_node
              (for --wpilib, Gradle builds the robot program itself)
 Run from any directory.
@@ -94,12 +94,11 @@ class Scenario:
         self.wpilib = wpilib
         self.slept_at_start = host_sleep_seconds()
         self.binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
-        # sim_gateway moved out of the drivetrain package into simulation, so
-        # it is spelled out separately: pointing it at the drivetrain package
-        # silently picks up a stale binary left over from before the split
-        # instead of failing.
+        # sim_gateway is talOS's (talOS/simulation), not the drivetrain
+        # package's, so it is spelled out separately: a stale binary left in
+        # the drivetrain package would otherwise be picked up silently.
         self.sim_gateway = (
-            root / "bazel-bin/2026-robot/main_processor/simulation/sim_gateway")
+            root / "bazel-bin/talOS/simulation/sim_gateway")
         # The bridge is framework code and lives under talOS, not with the
         # robot's drivetrain. Pointing this at the drivetrain package silently
         # picks up a stale binary left over from before the split instead of
@@ -385,7 +384,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
     sim_gateway = (
-        root / "bazel-bin/2026-robot/main_processor/simulation/sim_gateway")
+        root / "bazel-bin/talOS/simulation/sim_gateway")
 
     needed = [binaries / "node", binaries / "send_target",
               root / "bazel-bin/talOS/bridge/hardware_node",
@@ -396,7 +395,7 @@ def main():
         if not path.is_file():
             raise RuntimeError(
                 "Build //2026-robot/main_processor/drivetrain:all, "
-                "//2026-robot/main_processor/simulation:sim_gateway, and "
+                "//talOS/simulation:sim_gateway, and "
                 "//talOS/bridge:hardware_node first")
 
     if args.wpilib:

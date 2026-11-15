@@ -8,7 +8,7 @@ require_target_coverage = true
 controller_address = "127.0.0.1"
 controller_port = 5802
 local_port = 5803
-sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
+sim_gateway = "//talOS/simulation:sim_gateway"
 
 [robot.targets]
 teleop = ["teleop"]

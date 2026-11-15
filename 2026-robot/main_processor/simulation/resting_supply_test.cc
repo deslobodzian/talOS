@@ -5,13 +5,13 @@
 
 #include <string>
 
-#include "schedules.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/hardware/sim_backend.h"
 #include "talOS/hardware/sim_physics.h"
+#include "talOS/simulation/schedules.h"
 #include "toml.hpp"
 
-namespace robot::simulation {
+namespace talos::simulation {
 namespace {
 
 double BatteryThreshold() {
@@ -63,4 +63,4 @@ TEST(RestingSupply, HealthySimulatedRobotPassesTheBatteryCheck) {
 }
 
 }  // namespace
-}  // namespace robot::simulation
+}  // namespace talos::simulation

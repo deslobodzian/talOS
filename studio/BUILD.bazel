@@ -187,10 +187,10 @@ py_test(
         "tests/browser/probe.js",
         ":web_dist",
         "//2026-robot/main_processor/configuration:robot_physics_sim.toml",
-        "//2026-robot/main_processor/simulation:sim_gateway",
         "//studio/bridge:studio_bridge",
         "//talOS/bridge:hardware_node",
         "//talOS/launcher",
+        "//talOS/simulation:sim_gateway",
     ] + SIM_CONFIG_FILES + SIM_NODES,
     main = "tests/browser/drive_browser_test.py",
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
