@@ -52,7 +52,10 @@ new subsystem has no producer yet, the coverage check judges only modes
 that list a lane, and with none the node stays neutral. Listing
 `teleop = ["teleop"]` there goes with uncommenting its teleop binding. This
 fixture does not require coverage, so its file keeps `[targets]` commented
-and `[robot.targets]` applies.
+and `[robot.targets]` applies. `tools/check_robot_repo_scaffold.sh`
+(prepush and CI) holds both cases: it scaffolds a C++ and a Python
+subsystem into a copy of this fixture, as it is and with coverage required,
+and runs `bazel test //...` there.
 
 ## Simulation
 

@@ -20,8 +20,10 @@
 # the fixtures,
 # dependent-robot_repo and dependent-wrist_repo (`bazel test //...
 # @talos//talOS/configuration:config_fuzz_test` inside examples/robot_repo
-# and examples/wrist_repo, the repositories that depend on talOS),
-# checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
+# and examples/wrist_repo, the repositories that depend on talOS) and
+# scaffold-robot_repo (tools/check_robot_repo_scaffold.sh: a C++ and a
+# Python subsystem scaffolded into a copy of examples/robot_repo, then
+# `bazel test //...` there), checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
 # --offline`, for controller_processor/ and talOS/, whose headers
 # the RoboRIO program's build.gradle exports) and studio-test and
 # studio-build (`pnpm test`, `pnpm build`, for studio/).
@@ -250,6 +252,13 @@ else
       "$dependent" --test_output=errors --nocache_test_results --noshow_progress \
       "--disk_cache=$disk_cache" || true
   done
+  # What new_subsystem writes, built in a copy of robot_repo, with and
+  # without target coverage required, as CI's robot-repo job runs it.
+  if [ -f "$wt/tools/check_robot_repo_scaffold.sh" ]; then
+    run_step scaffold-robot_repo bash tools/check_robot_repo_scaffold.sh \
+      --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
+      true
+  fi
 fi
 run_step checkout-unchanged sh -c \
   'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||

@@ -422,6 +422,10 @@ jobs:
       run: |
         bazel test --test_output=errors //... \
           @talos//talOS/configuration:config_fuzz_test
+    - name: Scaffolded subsystems in a copy of the robot repository
+      # new_subsystem's C++ and Python output, built and tested in a
+      # robot repository with and without target coverage required.
+      run: tools/check_robot_repo_scaffold.sh
     - name: Standalone subsystem repository
       working-directory: examples/wrist_repo
       run: |
