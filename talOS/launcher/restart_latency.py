@@ -274,16 +274,13 @@ class Session:
         self.namespace = f"restart-latency-{uuid.uuid4().hex}"
         self.directory = None
         remote_port, local_port = udp_ports()
-        gateway_args = [arg.replace("{remote_port}", str(remote_port))
-                        .replace("{local_port}", str(local_port))
-                        for arg in args.sim_gateway_arg]
         command = [launcher_path(), "--config", str(args.config), "--sim",
                    "--remote", "127.0.0.1", "--remote-port", str(remote_port),
                    "--local-port", str(local_port), "--output-dir", str(self.output),
                    "--restart-window-ms", str(args.restart_window_ms)]
         if args.start_sim_gateway:
             command.append("--start-sim-gateway")
-        for arg in gateway_args:
+        for arg in args.sim_gateway_arg:
             command.extend(["--sim-gateway-arg", arg])
         # The nodes resolve their own runfiles; this binary's must not leak in.
         env = {key: value for key, value in os.environ.items()
@@ -464,8 +461,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Gateway arguments take '=' (--sim-gateway-arg=--physics); "
-               "{remote_port} and {local_port} in them become the session's "
-               "loopback controller and bridge ports.")
+               "the launcher passes the simulator the session's ports.")
     parser.add_argument("--config", type=Path, required=True,
                         help="robot config, absolute or workspace-relative")
     parser.add_argument("--node", default="drivetrain",
