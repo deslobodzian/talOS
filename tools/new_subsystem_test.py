@@ -3,6 +3,7 @@
 import contextlib
 import io
 import os
+import posixpath
 import re
 import tempfile
 import textwrap
@@ -20,6 +21,13 @@ filegroup(
     visibility = ["//tools:__pkg__"],
 )
 """
+
+
+def manifest_text(root, config):
+    """The text of `config`'s manifest under `root`."""
+    path = new_subsystem.sync_manifest.manifest_path(config)
+    with open(os.path.join(root, path), encoding="utf-8") as f:
+        return f.read()
 
 
 class NewSubsystemTest(unittest.TestCase):
@@ -423,6 +431,135 @@ class NewSubsystemTest(unittest.TestCase):
             self.assertEqual(exit_.exception.code, 2)
             self.assertIn("--raw", err.getvalue())
 
+
+    # REQ-DEV-01
+    def test_scaffolds_into_a_robot_repository_that_depends_on_talos(self):
+        # `bazel run @talos//tools:new_subsystem` from a robot repository
+        # (talOS a dependency: sync_manifest.current_repository() is
+        # `talos+`) writes the package where the config's own nodes are,
+        # names talOS by @talos// and its own packages relative to its root,
+        # and regenerates every manifest of a config that includes the edited
+        # one, as manifest_sync_test checks it, without reading the talOS
+        # submodule's configs. Two layouts: examples/robot_repo's (config and
+        # packages at the root) and a talOS robot's moved into its own
+        # repository (main_processor/configuration/robot.toml beside a
+        # config including it, packages in main_processor/).
+        def node(name, label):
+            return (f'[subsystem]\nname = "{name}"\nnode = "{label}"\n'
+                    'period_us = 20000\n')
+
+        def robot(entries):
+            return '[robot]\nname = "robot_repo"\n' + "".join(
+                f'\n[[subsystems]]\nname = "{name}"\n'
+                f'path = "subsystems/{name}.toml"\n' for name in entries)
+
+        fixture = {
+            "MODULE.bazel": 'module(name = "robot")\n',
+            "BUILD.bazel": 'exports_files(glob(["subsystems/*.toml"]))\n',
+            "robot.toml": robot(["teleop", "roller"]),
+            "subsystems/teleop.toml":
+                node("teleop", "@talos//talOS/teleop:node"),
+            "subsystems/roller.toml": node("roller", "//roller:node")
+                + '[motors.roller_motor]\ncan_id = 1\n',
+            "roller/BUILD": "",
+        }
+        configuration = "main_processor/configuration"
+        real = {
+            "MODULE.bazel": 'module(name = "robot_2026")\n',
+            "BUILD.bazel": "",
+            f"{configuration}/BUILD":
+                'exports_files(glob(["*.toml", "subsystems/*.toml"]))\n',
+            f"{configuration}/robot.toml": robot(["teleop", "shooter"]),
+            f"{configuration}/robot_field.toml":
+                'include = "robot.toml"\n',
+            f"{configuration}/subsystems/teleop.toml":
+                node("teleop", "@talos//talOS/teleop:node"),
+            f"{configuration}/subsystems/shooter.toml":
+                node("shooter", "//main_processor/shooter:node"),
+            "main_processor/shooter/BUILD": "",
+        }
+        # The talOS submodule: its configs are not the robot's, and this one
+        # cannot even be read.
+        submodule = {
+            "talos/MODULE.bazel": 'module(name = "talos")\n',
+            "talos/BUILD": "",
+            "talos/robot.toml": 'include = "missing.toml"\n',
+            "talos/robot_manifest.bzl": "",
+        }
+        talos_label = re.compile(r"(?<![@\w])//talOS/")
+        for layout, files, packages, configs, scaffolds in (
+                ("robot_repo", fixture, "", ["robot.toml"],
+                 [("intake", "cpp"), ("arm", "py")]),
+                ("2026", real, "main_processor",
+                 [f"{configuration}/robot.toml",
+                  f"{configuration}/robot_field.toml"],
+                 [("climber", "py")])):
+            with self.subTest(layout=layout), \
+                    tempfile.TemporaryDirectory() as root, \
+                    mock.patch.object(new_subsystem.sync_manifest,
+                                      "current_repository",
+                                      return_value="talos+"):
+                for path, text in {**files, **submodule}.items():
+                    os.makedirs(os.path.dirname(os.path.join(root, path)),
+                                exist_ok=True)
+                    with open(os.path.join(root, path), "w",
+                              encoding="utf-8") as f:
+                        f.write(text)
+                for config in configs:
+                    new_subsystem.sync_manifest.write(root, config)
+                for name, lang in scaffolds:
+                    out = io.StringIO()
+                    with mock.patch.dict(os.environ,
+                                         BUILD_WORKSPACE_DIRECTORY=root), \
+                            contextlib.redirect_stdout(out), \
+                            contextlib.redirect_stderr(out):
+                        status = new_subsystem.main([name, "--lang", lang])
+                    self.assertEqual(status, 0, out.getvalue())
+                    package = posixpath.join(packages, name)
+                    self.assertTrue(os.path.isfile(
+                        os.path.join(root, package,
+                                     {"cpp": "node_test.cc",
+                                      "py": "node_test.py"}[lang])),
+                        out.getvalue())
+                    written = {}
+                    for path in (posixpath.join(package, "BUILD"),
+                                 posixpath.join(
+                                     posixpath.dirname(configs[0]),
+                                     "subsystems", f"{name}.toml")):
+                        with open(os.path.join(root, path),
+                                  encoding="utf-8") as f:
+                            written[path] = f.read()
+                    for path, text in written.items():
+                        self.assertIsNone(talos_label.search(text), path)
+                        self.assertNotIn("2026-robot", text, path)
+                    self.assertIn(
+                        'load("@talos//talOS/build:contract.bzl"',
+                        written[posixpath.join(package, "BUILD")])
+                    subsystem = tomllib.loads(written[posixpath.join(
+                        posixpath.dirname(configs[0]), "subsystems",
+                        f"{name}.toml")])
+                    self.assertEqual(subsystem["subsystem"]["node"],
+                                     f"//{package}:node")
+                    with open(os.path.join(root, configs[0]), "rb") as f:
+                        entries = tomllib.load(f)["subsystems"]
+                    self.assertIn({"name": name,
+                                   "path": f"subsystems/{name}.toml"},
+                                  entries)
+                    for config in configs:
+                        # Current as manifest_sync_test sees it, and as
+                        # sync_manifest itself writes it.
+                        self.assertEqual(
+                            new_subsystem.sync_manifest.check(root, config),
+                            "", config)
+                        manifest = manifest_text(root, config)
+                        self.assertEqual(
+                            manifest,
+                            new_subsystem.sync_manifest.generate(root,
+                                                                 config))
+                        self.assertIn(f'    "//{package}:node",\n', manifest)
+                with open(os.path.join(root, "talos", "robot_manifest.bzl"),
+                          encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "")
 
     def test_plan_wires_an_estimator_without_a_can_id(self):
         with tempfile.TemporaryDirectory() as root:

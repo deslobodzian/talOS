@@ -7,7 +7,7 @@ two directories up; in a robot repository, a git submodule) and pinned in
 Its BUILD files and configs name talOS only through `@talos//` labels.
 
 It holds a C++ node (`roller/`) and a Python node (`gate/`), written as
-`//tools:new_subsystem` writes them, each with its Sim test, plus talOS's
+`@talos//tools:new_subsystem` writes them, each with its Sim test, plus talOS's
 teleop and telemetry nodes, all listed in `robot.toml`. talOS's own
 `bazel build //...` skips this directory (`.bazelignore`); it is a separate
 workspace.
@@ -21,6 +21,29 @@ bazel run //:sim -- --start-studio-bridge   # with Studio (below)
 bazel run @talos//talOS/launcher:session_report -- <session dir>   # a recorded session's report
 bazel run @talos//tools:sync_manifest -- robot.toml   # after editing [[subsystems]]
 ```
+
+## Add a subsystem
+
+From the repository's root:
+
+```sh
+bazel run @talos//tools:new_subsystem -- intake --lang cpp   # or --lang py; --type position|estimator
+bazel test //...
+```
+
+It writes the node package (messages, node, Sim test) beside the config's
+other nodes (here `intake/`; in a robot whose nodes are
+`//main_processor/<name>:node`, `main_processor/intake/`), its subsystem
+file in `subsystems/`, the `[[subsystems]]` entry in `robot.toml`, and
+regenerates `robot_manifest.bzl` and the manifest of every other config that
+includes `robot.toml`. Its labels name talOS by `@talos//`. `--config PATH`
+names another robot config (default `robot.toml`, else
+`main_processor/configuration/robot.toml`); `--package-dir DIR` puts the
+package elsewhere. Its `Next:` lists the placeholders to replace (the CAN
+id) and the simulation-only lines that make the mechanism move under
+`bazel run //:sim`.
+
+## Simulation
 
 `bazel run //:sim -- ARGS` runs `launcher --config robot.toml --sim
 --start-sim-gateway --sim-gateway-arg --physics ARGS` from the target's
