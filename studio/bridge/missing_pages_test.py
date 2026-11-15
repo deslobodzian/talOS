@@ -24,7 +24,8 @@ class MissingPages(unittest.TestCase):
         throw at startup (`fs::canonical`) and exit 1, so the launcher
         retried it for a minute and recorded the session member failed, and
         nothing named the command that builds the pages. It now runs, `/` and
-        `/drive` answer 503 naming `//studio:web_dist`, and it stops with 0.
+        `/drive` answer 503 naming `//studio:web_dist` and, for a robot whose
+        installed bundle lost them, `tools/deploy.sh install`; it stops with 0.
         """
         workspace = Path(os.environ["TEST_SRCDIR"]) / os.environ.get("TEST_WORKSPACE", "_main")
         with tempfile.TemporaryDirectory() as parent:
@@ -47,8 +48,11 @@ class MissingPages(unittest.TestCase):
                             urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
                                                    timeout=HANG_S)
                         self.assertEqual(answer.exception.code, 503)
-                        self.assertIn("//studio:web_dist",
-                                      answer.exception.read().decode())
+                        body = answer.exception.read().decode()
+                        # Both remedies: a checkout builds the pages, a
+                        # robot installs its bundle again.
+                        self.assertIn("//studio:web_dist", body)
+                        self.assertIn("tools/deploy.sh install", body)
                 # Any other file is simply absent.
                 with self.assertRaises(urllib.error.HTTPError) as other:
                     urllib.request.urlopen(f"http://127.0.0.1:{port}/favicon.svg",

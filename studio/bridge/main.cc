@@ -607,17 +607,36 @@ std::string mime(const fs::path& p) {
   return "application/octet-stream";
 }
 // What `/` and `/drive` answer, 503, while the webroot holds no such page,
-// and what the bridge logs at startup: a webroot nobody built (a fresh
-// checkout, or a robot repository whose talOS submodule never built them) is
-// the usual cause, so the answer names the folder and the command.
+// and what the bridge logs at startup. Two readers see it: a developer whose
+// checkout (or robot repository's talOS submodule) never built the pages, and
+// a drive team whose installed bundle lost them. `talos_bundle` places the
+// webroot at `<bundle>/studio/webroot` beside `bundle_manifest.toml`, so a
+// webroot with that manifest two levels up is served from a bundle and the
+// answer leads with installing it again; it names both remedies either way.
 std::string MissingPage(const fs::path& webroot, std::string_view page) {
-  return "Studio's pages are not built: " + webroot.string() + " has no " +
-         std::string(page) +
-         ".\nBuild them with `bazel build //studio:web_dist` in talOS's "
-         "checkout (from a robot repository: `cd talos && bazel build "
-         "//studio:web_dist`, then start the session again). "
-         "studio/README.md, \"Built pages\", says where each workspace serves "
-         "them from.\n";
+  std::error_code absent;
+  const bool bundle =
+      webroot.filename() == "webroot" &&
+      webroot.parent_path().filename() == "studio" &&
+      fs::is_regular_file(
+          webroot.parent_path().parent_path() / "bundle_manifest.toml", absent);
+  const std::string where = webroot.string() + " has no " + std::string(page);
+  const std::string build =
+      "build them with `bazel build //studio:web_dist` in talOS's checkout "
+      "(from a robot repository: `cd talos && bazel build //studio:web_dist`), "
+      "then start the session again";
+  const std::string install =
+      "install the bundle again with `tools/deploy.sh install <bundle>` "
+      "(docs/DEPLOYMENT.md)";
+  if (bundle) {
+    return "Studio's pages are missing from the installed bundle: " + where +
+           ".\nOn the robot, " + install + ". In a development checkout, " +
+           build + ".\n";
+  }
+  return "Studio's pages are not built: " + where +
+         ".\nIn a development checkout, " + build + ". On a robot, " + install +
+         ". studio/README.md, \"Built pages\", says where each workspace "
+         "serves them from.\n";
 }
 
 // uWebSockets' idle timeout for a client, in seconds. With T - m seconds

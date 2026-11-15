@@ -36,6 +36,7 @@ check below.
   | **TELEMETRY** `Telemetry feed could not be decoded: reload the page` | the page could not decode what the bridge sent (a page built for another bridge version, or a corrupt message); it reconnects by itself, every 5 s after 3 failures in a row | reload the page; if it persists, the page and the bridge come from different builds: redeploy the bundle |
   | **ROBORIO LINK** `RoboRIO link lost` | the main processor accepts no hardware state from the RoboRIO: RoboRIO off, its program not running, a wrong address, or another protocol version; every output is neutral | read the Driver Station message log; on a protocol error redeploy both sides from one checkout ([DEPLOYMENT.md](DEPLOYMENT.md#roborio)) |
   | **HARDWARE BRIDGE** `Hardware bridge not publishing` | no hardware status: the hardware bridge (`hardware_node`) on the main processor is not publishing, so the RoboRIO link cannot be judged | check Subsystems below |
+  | `/drive` shows `Studio's pages are missing from the installed bundle` (or `are not built`) instead of the dashboard | the bridge runs, but the installed bundle has no dashboard pages | with the robot disabled, install the bundle again ([DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)) |
   | **REPLACED** | another `/drive` page took this page's slot (the layout's `drive_clients` are held) | close the other page, then press Reconnect, which takes the oldest page's slot |
 
 - [ ] Match: `DISABLED`; the alliance and station are the assigned ones; at
