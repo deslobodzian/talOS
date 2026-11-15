@@ -127,7 +127,7 @@ control nodes (those that own an output or write a lane), then observers.
 [realtime scheduling](NODE_DEVELOPMENT_GUIDE.md#realtime-scheduling).
 
 **Tier (test tier).** What a test may touch: unit, component, contract,
-integration, e2e or soak. [Tiers](TESTING.md#2-tiers-by-what-the-test-may-touch).
+integration, e2e, soak, fuzz/property or perf. [Tiers](TESTING.md#2-tiers-by-what-the-test-may-touch).
 
 ## Hardware link
 
