@@ -979,6 +979,35 @@ TEST_F(@PASCAL@Test, StuckSwitchStopsWithinTheMargin) {
   EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
 }
 
+// REQ-DEV-01: off the switch, a goal past either end of the travel
+// demands that end, kMaxRot (2.0) or 0.
+TEST_F(@PASCAL@Test, GoalOutsideTheTravelClampsToIt) {
+  hw.ideal_motors();
+  Teleop();
+  SetHome(false);  // zeroed on the switch, it leaves it
+  Hold(5.0, 60ms);
+  EXPECT_DOUBLE_EQ(
+      hw.motor_request("@NAME@", "@NAME@").demand, 2.0);
+  Hold(-1.0, 60ms);
+  EXPECT_DOUBLE_EQ(
+      hw.motor_request("@NAME@", "@NAME@").demand, 0.0);
+}
+
+// REQ-DEV-01: the switch zeroes the motor only once it moves slower than
+// kRestRps (0.05).
+TEST_F(@PASCAL@Test, ZeroWaitsForRest) {
+  // On the switch, still moving.
+  hw.set_motor("@NAME@", "@NAME@", 0.0, -1.0);
+  Teleop();
+  Hold(1.0, 60ms);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::HOMING);
+  EXPECT_EQ(Request(), Mode::kNeutral);  // on the switch: no push
+  hw.set_motor("@NAME@", "@NAME@", 0.0, 0.0);  // at rest
+  Hold(1.0, 60ms);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::HOMED);
+  EXPECT_EQ(Request(), Mode::kMotionMagic);
+}
+
 """
 
 CC_TESTDATA_ROBOT = """\
@@ -1659,6 +1688,32 @@ PY_POSITION_RAW_TESTS = '''
             self.assertLessEqual(demand, 1.9 + 0.15 + 1e-9)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+
+    # REQ-DEV-01: off the switch, a goal past either end of the travel
+    # demands that end, MAX_ROT (2.0) or 0.
+    def test_goal_outside_the_travel_clamps_to_it(self):
+        self.hw.ideal_motors()
+        self.teleop()
+        self.set_home(False)  # zeroed on the switch, it leaves it
+        self.hold(5.0, 0.06)
+        demand = self.hw.motor_request("@NAME@", "@NAME@").demand
+        self.assertEqual(demand, 2.0)
+        self.hold(-1.0, 0.06)
+        demand = self.hw.motor_request("@NAME@", "@NAME@").demand
+        self.assertEqual(demand, 0.0)
+
+    # REQ-DEV-01: the switch zeroes the motor only once it moves slower
+    # than REST_RPS (0.05).
+    def test_zero_waits_for_rest(self):
+        self.hw.set_motor("@NAME@", "@NAME@", 0.0, -1.0)  # on it, moving
+        self.teleop()
+        self.hold(1.0, 0.06)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.HOMING)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)  # no push on it
+        self.hw.set_motor("@NAME@", "@NAME@", 0.0, 0.0)  # at rest
+        self.hold(1.0, 0.06)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.HOMED)
+        self.assertEqual(self.mode(), talos.Mode.MOTION_MAGIC)
 '''
 
 PY_POSITION_TESTDATA_ROBOT = """\
