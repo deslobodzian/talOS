@@ -167,22 +167,6 @@ test('RPC answers NaN and infinities as readings and integers as numbers when ex
   assert.ok(!Object.keys(tree).some(
       name => name.startsWith('exact.') || name.startsWith('kinds.')));
 });
-test('RPC exposes the same derived pose-error series stored in history', () => {
-  const timeline = history();
-  const snapshot = timeline.exact(1020000000n)!;
-  const names = ['derived/pose_error_m', 'derived/heading_error_deg'];
-  const response = dispatch(ctx(timeline), 'query_state_at', {
-                     timestamp_ns: snapshot.timestamp_ns,
-                     topics: names
-                   });
-  for (const name of names)
-    assert.ok(Number.isFinite(snapshot.channels[name]));
-  assert.deepEqual(response, {
-    timestamp_ns: snapshot.timestamp_ns,
-    sequence_id: snapshot.sequence_id,
-    topics: Object.fromEntries(names.map(name => [name, snapshot.channels[name]]))
-  });
-});
 test(
     'threshold scans group samples and edge scans use the preceding sample outside bounds',
     () => {

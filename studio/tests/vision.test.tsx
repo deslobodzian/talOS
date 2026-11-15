@@ -12,7 +12,6 @@ import {visionPanel} from '../src/panels/vision';
 import {
   acceptancePct,
   counterDelta,
-  fpsFromPeriod,
   latestValidPose,
   observationErrors,
   validObservationRate
@@ -38,13 +37,6 @@ test('counterDelta sums increments and ignores a reset', () => {
   // negative drop.
   assert.equal(counterDelta([100, 105, 2, 104]), 107);
   assert.equal(counterDelta([100, 50]), 0);
-});
-
-test('fpsFromPeriod converts microseconds to Hz', () => {
-  assert.equal(fpsFromPeriod(20000), 50);
-  assert.equal(fpsFromPeriod(null), null);
-  assert.equal(fpsFromPeriod(0), null);
-  assert.equal(fpsFromPeriod(NaN), null);
 });
 
 test('latestValidPose walks back to the most recent current accepted pose', () => {

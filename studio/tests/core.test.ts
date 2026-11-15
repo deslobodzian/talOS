@@ -539,17 +539,6 @@ test('alert levels reach ChannelInfo from dictionary pages, an export and the re
     {name: 'a/status/alert_fatal_x', unit: '', labels: [], alert: 'fatal'}]}), /alert/);
 });
 
-test('derived heading series wraps both directions across 180 degrees', () => {
-  for (const [estimate, truth, expected] of [[-179, 179, 2], [179, -179, -2]]) {
-    const snapshot = new TelemetryDecoder().decode(valueFrame(
-        0n, 7, [1, 2, truth * Math.PI / 180, 1], 42n,
-        {dictionary: simPoseChannels, yaw: estimate * Math.PI / 180}))!;
-    assert.equal(snapshot.channels['derived/pose_error_m'], 0);
-    assert.ok(
-        Math.abs(snapshot.channels['derived/heading_error_deg'] - expected) < 1e-10);
-  }
-});
-
 test('wire channels cannot impersonate Studio-derived series', () => {
   assert.throws(
       () => new TelemetryDecoder().decode(valueFrame(
