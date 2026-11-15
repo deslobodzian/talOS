@@ -1,0 +1,18 @@
+# Local position_raw_cpp fixture. Device IDs are assigned by the normal parser.
+# The neighbor subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
+[robot]
+name = "position_raw_cpp_test"
+period_us = 20000
+command_timeout_us = 100000
+status_hz = 200.0
+commissioned = false
+
+[[subsystems]]
+name = "position_raw_cpp"
+path = "position_raw_cpp.toml"
+
+[[subsystems]]
+name = "neighbor"
+path = "neighbor.toml"

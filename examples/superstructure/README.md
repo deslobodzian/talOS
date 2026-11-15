@@ -273,7 +273,11 @@ instead. Do not scaffold into `2026-robot`, the project's testbed: its graph
 is full ([first mechanism](../../docs/FIRST_MECHANISM.md#2-make-your-robot)).
 `--dry-run` inspects the changes without writing them. Use `--lang py` for a
 Python implementation. Omitting `--type position` generates a velocity
-mechanism, not an angle-controlled wrist.
+mechanism, not an angle-controlled wrist. With `new_subsystem`, adding
+`--raw` to `--type position` writes the wrist's homing and limits in
+`wrist.h` itself instead of using the library
+([writing the arm yourself](../../docs/FIRST_MECHANISM.md#writing-the-arm-yourself));
+the rest of this section describes the library version.
 
 The generator writes `my_robot/main_processor/wrist/`:
 

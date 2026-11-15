@@ -1,0 +1,13 @@
+[subsystem]
+name = "position_raw_cpp"
+period_us = 20000
+
+[motors.position_raw_cpp]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+position_frame = "rezero"
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[digital_inputs.position_raw_cpp_home]
+dio = 0

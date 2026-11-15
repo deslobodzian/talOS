@@ -1,13 +1,14 @@
 """Scaffolds a talos subsystem: a node package plus its robot wiring.
 
     bazel run //tools:new_subsystem -- <name> --lang cpp|py \\
-        [--type velocity|position|estimator] [--robot 2026-robot] \\
+        [--type velocity|position|estimator] [--raw] [--robot 2026-robot] \\
         [--standalone DIR] [--dry-run]
 
 Writes <robot>/main_processor/<name>/ (messages, node, Sim test, testdata),
 modelled on that robot's shooter (C++) and intake (Python) packages (a
 --type position node wraps talos::mechanisms::PositionMechanism, in Python
-talos.mechanisms.PositionMechanism), or for
+talos.mechanisms.PositionMechanism; with --raw it writes the homing and
+limits out in the node's own file instead, on its Motor), or for
 --type estimator a hardware-free node publishing geometry.PoseEstimate from
 the PoseObservations of its `cameras`, then adds
 configuration/subsystems/<name>.toml and its [[subsystems]] entry in
@@ -151,11 +152,12 @@ def check_name(name):
     return None
 
 
-def check_kind(name, lang, kind):
+def check_kind(name, lang, kind, raw=False):
     """Why `name` cannot name a subsystem of this language and kind, or
-    None. Both languages' position nodes take the same [<name>] table."""
+    None. Both languages' library position nodes take the same [<name>]
+    table; a --raw one has none."""
     del lang
-    if kind == "position" and name in SUBSYSTEM_FILE_KEYS:
+    if kind == "position" and not raw and name in SUBSYSTEM_FILE_KEYS:
         return (f"node name '{name}' would name the position mechanism's "
                 f"parameter table [{name}], which the subsystem file "
                 "reserves")
@@ -238,6 +240,14 @@ struct @PASCAL@State {
   homing:@PASCAL@Homing;
 }
 """
+
+POSITION_RAW_FBS = POSITION_FBS.replace(
+    "// FAILED once homing timed out or stalled, or the switch read closed well\n"
+    "// away from the zero (neutral until the Driver Station reports disabled).\n",
+    "// FAILED once the push toward the switch ran past its bound, or the switch\n"
+    "// still read closed after the first move off it (neutral until the Driver\n"
+    "// Station reports disabled).\n")
+assert POSITION_RAW_FBS != POSITION_FBS
 
 MESSAGES_BUILD = """\
 # @PASCAL@Target / @PASCAL@State (namespace @NAME@) and the @NAME@'s topics.
@@ -408,6 +418,142 @@ class @PASCAL@ {
   talos::mechanisms::PositionMechanism mechanism_;
   talos::Target<Target> target_;
   talos::Publisher<State> state_;
+};
+
+}  // namespace @NAME@
+"""
+
+# --type position --raw: the same mechanism with every homing and limit rule
+# written out in the student's own file, no talOS/mechanisms. The behaviour
+# is docs/FIRST_MECHANISM.md §6's.
+CC_POSITION_RAW_HEADER = """\
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+
+@INCLUDES@
+
+namespace @NAME@ {
+
+// Drives the mechanism to the position its target asks for and reports
+// what it did on /@NAME@/state. Producers write lanes
+// /@NAME@/target/<source> with talos::TargetLane; the
+// policy comes from [robot.targets] or the subsystem's [targets].
+//
+// Every line of the control is here, in this file: it homes on the switch
+// @NAME@_home, then runs Motion Magic inside a fixed travel.
+// Positions count from that switch, not from where the motor powered on.
+// Until the switch has zeroed the motor, and again after a motor reset or a
+// RoboRIO reboot drops that zero, a live goal pushes toward the switch at
+// kHomingVolts instead. A push that runs past its bound, or the switch still
+// reading closed after the first move off it, latches FAILED, neutral, until
+// the Driver Station reports disabled. docs/FIRST_MECHANISM.md §6 in the
+// talos repository explains each rule.
+class @PASCAL@ {
+ public:
+  using Target = @PASCAL@Target;
+  using State = @PASCAL@State;
+  using Homing = @PASCAL@Homing;
+
+  explicit @PASCAL@(talos::Node& node)
+      : motor_{node, "@NAME@"},
+        home_{node, "@NAME@_home"},
+        ds_{node},
+        target_{node},
+        state_{node.publish<State>(topics::kState)} {}
+
+  void update() {
+    // The switch reads false when closed, true when open.
+    const bool on_switch = home_.connected() && !home_.get();
+    const bool off_switch = home_.connected() && home_.get();
+    // Zero on the switch once the motor is at rest, so the first move does
+    // not start at homing speed.
+    if (!motor_.zeroed() && on_switch &&
+        std::abs(motor_.velocity()) < kRestRps) {
+      motor_.rezero(0.0);
+    }
+    if (motor_.zeroed()) {
+      push_ticks_ = 0;  // homed: a later re-home pushes from zero
+      if (off_switch) left_switch_ = true;
+    } else {
+      left_switch_ = false;  // a dropped zero homes and checks again
+    }
+    // Only a Driver Station that reports disabled clears a failure: not a
+    // release, a stale lane or a feedback blip, any of which would otherwise
+    // start another push into the stop.
+    if (ds_.connected() && !ds_.enabled()) {
+      failed_ = false;
+      push_ticks_ = 0;
+    }
+    // Still closed after the first move off it: the switch is stuck, or the
+    // zero is wrong. Stop before the move reaches kHomeMarginRot.
+    if (motor_.zeroed() && !left_switch_ &&
+        motor_.position() > kHomeMarginRot - kToleranceRot) {
+      failed_ = true;
+    }
+    const Target* t = target_.get();  // null: disabled, stale or released
+    const bool live = t != nullptr && motor_.connected() &&
+                      std::isfinite(t->position_rot()) && !failed_;
+    bool drove = false;
+    double goal = 0.0;
+    if (live && motor_.zeroed()) {
+      // Until the switch has opened, no farther than kHomeMarginRot.
+      const double top = left_switch_ ? kMaxRot : kHomeMarginRot;
+      goal = std::clamp(t->position_rot(), 0.0, top);
+      motor_.set_motion_magic(goal);
+      drove = true;
+    } else if (live && !on_switch) {
+      // The push is bounded: a switch that never closes (a cut wire reads
+      // open) would otherwise push into the stop while the button is held.
+      if (++push_ticks_ > kMaxPushTicks) {
+        failed_ = true;  // pushed long enough to cross the travel: no switch
+      } else {
+        motor_.set_voltage(kHomingVolts);  // toward the switch
+        drove = true;
+      }
+    }
+    // Otherwise nothing is set and the flush sends neutral.
+    const bool at_goal = drove && motor_.zeroed() &&
+                         std::abs(motor_.position() - goal) < kToleranceRot;
+    Homing homing = motor_.zeroed() ? Homing::HOMED : Homing::HOMING;
+    if (failed_) homing = Homing::FAILED;
+    state_.send(
+        State{drove, motor_.position(), motor_.connected(), at_goal, homing});
+  }
+
+ private:
+  // PLACEHOLDER values, sized for the simulation new_subsystem's `Next:`
+  // describes. Set each for your mechanism before the robot drives it.
+  //
+  // Travel above the switch, in rotations: goals clamp to 0..kMaxRot.
+  // Measure it on the mechanism.
+  static constexpr double kMaxRot = 2.0;
+  // The homing push, in volts; negative drives toward the switch. Keep it
+  // low: with the motor's stator_limit_a it bounds how hard the push meets
+  // the stop. Check its direction before the first enable.
+  static constexpr double kHomingVolts = -0.5;
+  // The push bound, in ticks of the subsystem's period_us: time a push
+  // across the full travel at kHomingVolts and allow about twice that.
+  // 50 ticks is 1 s at period_us = 20000.
+  static constexpr int kMaxPushTicks = 50;
+  // The switch must read open by here after each zero, in rotations: the
+  // distance from the zero at which it reliably opens, plus a little. Keep
+  // it small: from a wrong zero the mechanism can still move this far.
+  static constexpr double kHomeMarginRot = 0.15;
+  // Within this of the goal, /@NAME@/state reports at_goal.
+  static constexpr double kToleranceRot = 0.05;
+  // Slower than this the motor is at rest, and the switch may zero it.
+  static constexpr double kRestRps = 0.05;
+
+  talos::Motor motor_;
+  talos::DigitalInput home_;
+  talos::DriverStation ds_;
+  talos::Target<Target> target_;
+  talos::Publisher<State> state_;
+  bool failed_ = false;
+  bool left_switch_ = false;
+  int push_ticks_ = 0;
 };
 
 }  // namespace @NAME@
@@ -781,6 +927,61 @@ TEST_F(@PASCAL@Test, HomingThatDoesNotMoveFails) {
 
 """
 
+# Replaces CC_POSITION_TESTS for --raw: the node's own homing bounds.
+CC_POSITION_RAW_TESTS = """\
+// The node's own homing bounds. The tests above are the node test matrix
+// (docs/TESTING.md §7 in the talos repository) that every actuator node
+// keeps; these guard the rules this node adds. Their times and positions
+// follow the constants in
+// @NAME@.h: kMaxPushTicks (50 ticks, 1 s),
+// kHomeMarginRot (0.15) and kMaxRot (2.0); change them together.
+
+// REQ-DEV-01
+TEST_F(@PASCAL@Test, HomingThatNeverReachesTheSwitchFails) {
+  StartOffHome();  // the switch never closes, as with a cut wire
+  Teleop();
+  Hold(1.0, 900ms);
+  ASSERT_EQ(Request(), Mode::kVoltage);  // still pushing toward the switch
+  Hold(1.0, 200ms);                      // past the 1 s bound
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
+}
+
+// REQ-DEV-01
+TEST_F(@PASCAL@Test, FailureLatchesUntilDisabled) {
+  StartOffHome();
+  Teleop();
+  Hold(1.0, 1100ms);
+  ASSERT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
+  sim.step(150ms);   // the lane goes stale while the button is held
+  Hold(1.0, 200ms);  // live again: no second push
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
+  hw.set_driver_station(DsPacket(ds::kTeleop));  // disabled
+  sim.step(40ms);
+  Teleop();  // enabled again: a new homing run
+  Hold(1.0, 40ms);
+  EXPECT_EQ(Request(), Mode::kVoltage);
+}
+
+// REQ-DEV-01
+TEST_F(@PASCAL@Test, StuckSwitchStopsWithinTheMargin) {
+  hw.ideal_motors();
+  // Powered on near the top; the switch, stuck closed, zeroes it there.
+  hw.set_motor("@NAME@", "@NAME@", 1.9, 0.0);
+  Teleop();
+  for (int tick = 0; tick < 10; ++tick) {
+    Hold(1.5, 20ms);
+    // Never more than kHomeMarginRot (0.15) above the false zero.
+    EXPECT_LE(hw.motor_request("@NAME@", "@NAME@").demand,
+              1.9 + 0.15 + 1e-9);
+  }
+  EXPECT_EQ(Request(), Mode::kNeutral);
+  EXPECT_EQ(Latest().homing(), @PASCAL@Homing::FAILED);
+}
+
+"""
+
 CC_TESTDATA_ROBOT = """\
 # Local @NAME@ fixture. Device IDs are assigned by the normal parser.
 # The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
@@ -842,6 +1043,22 @@ homing_timeout_us = 500000
 homing_stall_rps = 0.1
 homing_stall_us = 200000
 home_margin_rot = 0.5
+
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+can_id = 1
+position_frame = "rezero"
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[digital_inputs.@NAME@_home]
+dio = 0
+"""
+
+CC_POSITION_RAW_TESTDATA_SUBSYSTEM = """\
+[subsystem]
+name = "@NAME@"
+period_us = @PERIOD@
 
 [motors.@NAME@]
 type = "TalonFX"
@@ -979,6 +1196,131 @@ class @PASCAL@:
         self.state.send(enabled=m.driving, position_rot=m.position_rot,
                         connected=m.connected, at_goal=m.at_goal,
                         homing=homing)
+'''
+
+# --type position --raw in Python: CC_POSITION_RAW_HEADER's control, line for
+# line.
+PY_POSITION_RAW_NODE = '''\
+"""@PASCAL@: drives the mechanism to the position its target asks for.
+
+Reports what it did on /@NAME@/state. Producers write lanes
+/@NAME@/target/<source> with talos.TargetLane; the policy comes from
+[robot.targets] or the subsystem's [targets].
+
+Every line of the control is here, in this file: it homes on the switch
+@NAME@_home, then runs Motion Magic inside a fixed travel.
+Positions count from that switch, not from where the motor powered on. Until
+the switch has zeroed the motor, and again after a motor reset or a RoboRIO
+reboot drops that zero, a live goal pushes toward the switch at HOMING_VOLTS
+instead. A push that runs past its bound, or the switch still reading closed
+after the first move off it, latches FAILED, neutral, until the Driver
+Station reports disabled. docs/FIRST_MECHANISM.md §6 in the talos repository
+explains each rule.
+"""
+
+import math
+
+import talos
+@FROM_IMPORTS@
+
+# PLACEHOLDER values, sized for the simulation new_subsystem's `Next:`
+# describes. Set each for your mechanism before the robot drives it.
+#
+# Travel above the switch, in rotations: goals clamp to 0..MAX_ROT. Measure
+# it on the mechanism.
+MAX_ROT = 2.0
+# The homing push, in volts; negative drives toward the switch. Keep it low:
+# with the motor's stator_limit_a it bounds how hard the push meets the stop.
+# Check its direction before the first enable.
+HOMING_VOLTS = -0.5
+# The push bound, in ticks of the subsystem's period_us: time a push across
+# the full travel at HOMING_VOLTS and allow about twice that. 50 ticks is 1 s
+# at period_us = 20000.
+MAX_PUSH_TICKS = 50
+# The switch must read open by here after each zero, in rotations: the
+# distance from the zero at which it reliably opens, plus a little. Keep it
+# small: from a wrong zero the mechanism can still move this far.
+HOME_MARGIN_ROT = 0.15
+# Within this of the goal, /@NAME@/state reports at_goal.
+TOLERANCE_ROT = 0.05
+# Slower than this the motor is at rest, and the switch may zero it.
+REST_RPS = 0.05
+
+
+class @PASCAL@:
+    def __init__(self, node):
+        self.motor = talos.Motor(node, "@NAME@")
+        self.home = talos.DigitalInput(node, "@NAME@_home")
+        self.ds = talos.DriverStation(node)
+        self.target = talos.Target(node, @PASCAL@Target)
+        self.state = node.publish(@PASCAL@State, topics.STATE)
+        self.failed = False
+        self.left_switch = False
+        self.push_ticks = 0
+
+    def update(self):
+        motor = self.motor
+        # The switch reads False when closed, True when open.
+        home_connected = self.home.connected
+        on_switch = home_connected and not self.home.value
+        off_switch = home_connected and self.home.value
+        # Zero on the switch once the motor is at rest, so the first move
+        # does not start at homing speed.
+        if (not motor.zeroed and on_switch
+                and abs(motor.velocity) < REST_RPS):
+            motor.rezero(0.0)
+        zeroed = motor.zeroed
+        if zeroed:
+            self.push_ticks = 0  # homed: a later re-home pushes from zero
+            if off_switch:
+                self.left_switch = True
+        else:
+            self.left_switch = False  # a dropped zero homes and checks again
+        # Only a Driver Station that reports disabled clears a failure: not a
+        # release, a stale lane or a feedback blip, any of which would
+        # otherwise start another push into the stop.
+        if self.ds.connected and not self.ds.enabled:
+            self.failed = False
+            self.push_ticks = 0
+        # Still closed after the first move off it: the switch is stuck, or
+        # the zero is wrong. Stop before the move reaches HOME_MARGIN_ROT.
+        if (zeroed and not self.left_switch
+                and motor.position > HOME_MARGIN_ROT - TOLERANCE_ROT):
+            self.failed = True
+        t = self.target.get()  # None: disabled, stale or released
+        connected = motor.connected
+        live = (t is not None and connected
+                and math.isfinite(t.position_rot) and not self.failed)
+        drove = False
+        goal = 0.0
+        if live and zeroed:
+            # Until the switch has opened, no farther than HOME_MARGIN_ROT.
+            top = MAX_ROT if self.left_switch else HOME_MARGIN_ROT
+            goal = min(max(t.position_rot, 0.0), top)
+            motor.set_motion_magic(goal)
+            drove = True
+        elif live and not on_switch:
+            # The push is bounded: a switch that never closes (a cut wire
+            # reads open) would otherwise push into the stop while the
+            # button is held.
+            self.push_ticks += 1
+            if self.push_ticks > MAX_PUSH_TICKS:
+                # Pushed long enough to cross the travel: no switch.
+                self.failed = True
+            else:
+                motor.set_voltage(HOMING_VOLTS)  # toward the switch
+                drove = True
+        # Otherwise nothing is set and the flush sends neutral.
+        position = motor.position
+        at_goal = drove and zeroed and abs(position - goal) < TOLERANCE_ROT
+        if self.failed:
+            homing = @PASCAL@Homing.FAILED
+        elif zeroed:
+            homing = @PASCAL@Homing.HOMED
+        else:
+            homing = @PASCAL@Homing.HOMING
+        self.state.send(enabled=drove, position_rot=position,
+                        connected=connected, at_goal=at_goal, homing=homing)
 '''
 
 PY_TEST = '''\
@@ -1258,6 +1600,69 @@ PY_POSITION_TESTS = '''
         self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
 '''
 
+# Replaces PY_POSITION_TESTS for --raw: the node's own homing bounds.
+PY_POSITION_RAW_TESTS = '''
+    # The node's own homing bounds. The tests above are the node test
+    # matrix (docs/TESTING.md §7 in the talos repository) that every
+    # actuator node keeps; these guard the rules this node adds. Their
+    # times and positions follow the constants in
+    # @NAME@.py: MAX_PUSH_TICKS (50 ticks, 1 s),
+    # HOME_MARGIN_ROT (0.15) and MAX_ROT (2.0); change them together.
+    # setUp starts the motor at rest on its switch.
+
+    def set_home(self, closed):
+        """Normally open to ground behind the input's pull-up: closed reads
+        False."""
+        self.hw.set_digital_input("@NAME@", "@NAME@_home",
+                                  not closed)
+
+    def start_off_home(self):
+        """Powered on off the switch, unzeroed, and moving when pushed."""
+        self.set_home(False)
+        self.hw.set_motor("@NAME@", "@NAME@", 0.0, -1.0)
+
+    # REQ-DEV-01
+    def test_homing_that_never_reaches_the_switch_fails(self):
+        self.start_off_home()  # the switch never closes, as with a cut wire
+        self.teleop()
+        self.hold(1.0, 0.9)
+        # Still pushing toward the switch.
+        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
+        self.hold(1.0, 0.2)  # past the 1 s bound
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+
+    # REQ-DEV-01
+    def test_failure_latches_until_disabled(self):
+        self.start_off_home()
+        self.teleop()
+        self.hold(1.0, 1.1)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+        self.sim.step(0.15)  # the lane goes stale while the button is held
+        self.hold(1.0, 0.2)  # live again: no second push
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+        self.hw.set_driver_station(teleop=True)  # disabled
+        self.sim.step(0.04)
+        self.teleop()  # enabled again: a new homing run
+        self.hold(1.0, 0.04)
+        self.assertEqual(self.mode(), talos.Mode.VOLTAGE)
+
+    # REQ-DEV-01
+    def test_stuck_switch_stops_within_the_margin(self):
+        self.hw.ideal_motors()
+        # Powered on near the top; the switch, stuck closed, zeroes it there.
+        self.hw.set_motor("@NAME@", "@NAME@", 1.9, 0.0)
+        self.teleop()
+        for _ in range(10):
+            self.hold(1.5, 0.02)
+            # Never more than HOME_MARGIN_ROT (0.15) above the false zero.
+            demand = self.hw.motor_request("@NAME@", "@NAME@").demand
+            self.assertLessEqual(demand, 1.9 + 0.15 + 1e-9)
+        self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
+        self.assertEqual(self.state().homing, @PASCAL@Homing.FAILED)
+'''
+
 PY_POSITION_TESTDATA_ROBOT = """\
 # @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
 # The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
@@ -1279,6 +1684,32 @@ homing_timeout_us = 500000
 homing_stall_rps = 0.1
 homing_stall_us = 200000
 home_margin_rot = 0.5
+
+[subsystems.@NAME@.motors.@NAME@]
+type = "TalonFX"
+bus = "test"
+can_id = 1
+position_frame = "rezero"
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+[subsystems.@NAME@.digital_inputs.@NAME@_home]
+dio = 0
+
+[subsystems.@NEIGHBOR@.motors.wheel]
+type = "TalonFX"
+bus = "test"
+can_id = 2
+"""
+
+PY_POSITION_RAW_TESTDATA_ROBOT = """\
+# @PASCAL@ test robot: one motor homed on one switch, and a neighbor.
+# The @NEIGHBOR@ subsystem's motor stays connected: losing the node's motor
+# is one device lost, as on a robot, which only the node's own feedback
+# gate stops. Losing every motor and CAN sensor is the gateway's fault.
+[robot]
+name = "@NAME@_test"
+period_us = @PERIOD@
+command_timeout_us = 100000
 
 [subsystems.@NAME@.motors.@NAME@]
 type = "TalonFX"
@@ -1479,6 +1910,92 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
 dio = @DIO@
 """
 
+# --type position --raw: the travel, push and margin are constants in the
+# node's own file, so the subsystem file has no [<name>] table.
+POSITION_RAW_SUBSYSTEM_TOML = """\
+# @PASCAL@ subsystem, generated by //tools:new_subsystem. Parsed via the
+# [[subsystems]] manifest in @ROBOT@/main_processor/configuration/robot.toml
+# and merged with the other subsystem files into one canonical view before
+# validation. The @NAME@'s travel, homing push and switch margin are
+# constants in its node (kMaxRot, kHomingVolts, kMaxPushTicks,
+# kHomeMarginRot in C++; MAX_ROT, ... in Python), not keys here.
+[subsystem]
+name = "@NAME@"
+node = "//@PACKAGE@:node"
+period_us = @PERIOD@
+
+# Zero-code robot wiring: uncomment to have the teleop node write a
+# Driver Station button on the /@NAME@/target/teleop lane, without editing any
+# C++ or Python files in other packages. Only once slot0 is tuned on the
+# mechanism: every config of this robot reads this file. A simulation-only
+# binding goes in the simulation-only config new_subsystem's `Next:` names.
+# [[teleop.bindings]]
+# button = @BUTTON@
+# while_held = { position_rot = 0.0 }
+
+# Which /@NAME@/target/<source> lanes drive the @NAME@ in each Driver Station
+# mode, highest priority first. Without this table [robot.targets] applies
+# (teleop = ["teleop"], autonomous = ["auto"]); listed modes replace it.
+# [targets]
+# teleop = ["teleop"]
+# autonomous = ["auto"]
+
+# Device names are robot-wide, so the motor is named after the subsystem.
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+# PLACEHOLDER: the lowest id the robot config does not use yet, not the
+# motor's.
+# Replace it with the physical CAN id before the robot drives this motor.
+can_id = @CAN_ID@
+# Flip `inverted` if a positive position moves the mechanism the wrong way;
+# `brake` resists motion while no target drives it, coast lets it move freely.
+inverted = false
+brake = true
+supply_limit_a = 40.0
+# How hard any command, the homing push included, can drive the mechanism
+# into a stop. PLACEHOLDER: a provisional low value, not the motor's 80 A
+# limit; choose the real one for your mechanism.
+stator_limit_a = 20.0
+max_voltage = 12.0
+# Sensor rotations per mechanism rotation: positions, the profile and the
+# node's travel are in mechanism rotations.
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+# The Motion Magic profile every move follows (cruise at most
+# max_velocity_rps); raise it once the mechanism is tuned.
+cruise_velocity_rps = 1.0
+acceleration_rps2 = 2.0
+# Positions count from the home switch, not from where the motor powered on:
+# Motion Magic goals go out neutral until the node zeroes the motor on the
+# switch (Motor::rezero), and again after a motor reset or RoboRIO reboot
+# drops that zero.
+position_frame = "rezero"
+# No hardware soft limits: the TalonFX applies them to its power-on position
+# in every control mode, which a rezero does not move; config load refuses
+# them unless position_frame = "absolute". The node's kMaxRot bounds goals.
+# Overtravel: that clamp is the only top-of-travel protection in software. At
+# the robot, wire a forward limit switch to the TalonFX's own limit input,
+# which stops forward output in every control mode whatever the frame, and
+# set forward_limit_switch = "NormallyOpen" (Phoenix's default) or
+# "NormallyClosed" to match it.
+soft_limits = false
+# Position gains (slot 0). ALL ZERO means UNTUNED: the motor will not follow
+# its target. Tune g to hold the mechanism against gravity (add
+# gravity_type = "Arm" for a pivot), s to break static friction, v and a
+# until it tracks the profile, then p until it settles at the goal.
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+# The home switch at the reverse end of travel (position 0): normally open,
+# between the DIO signal pin and ground, so the input's pull-up reads true off
+# the switch and false on it. A cut or unplugged wire reads "not home": the
+# homing push then fails at its bound instead of zeroing mid-travel.
+# PLACEHOLDER: the lowest DIO channel the robot config does not use yet, not
+# the switch's. Replace it with the physical channel.
+[digital_inputs.@NAME@_home]
+dio = @DIO@
+"""
+
 MANIFEST_ENTRY = """\
 
 [[subsystems]]
@@ -1552,6 +2069,40 @@ inverted = false
 brake = true
 supply_limit_a = 40.0
 stator_limit_a = 80.0
+max_voltage = 12.0
+sensor_to_mechanism_ratio = 1.0
+max_velocity_rps = 100.0
+cruise_velocity_rps = 1.0
+acceleration_rps2 = 2.0
+position_frame = "rezero"
+soft_limits = false
+slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.0, a = 0.0, g = 0.0 }
+
+# The home switch, normally open to ground; the robot's file adds its dio.
+[digital_inputs.@NAME@_home]
+"""
+
+STANDALONE_POSITION_RAW_DEFAULTS_TOML = """\
+# @PASCAL@ subsystem defaults, shipped by the @@NAME@ repository.
+# The robot's own subsystem file starts as a copy of this one, with the
+# motor's physical can_id and the home switch's dio added; inversions, the
+# stator limit and tuned slot0 gains go there. The travel, homing push and
+# switch margin are constants in the node (@NAME@.h or @NAME@.py): set them
+# for the mechanism. The motor requires a zero from the home switch
+# (normally open, to ground) and has no hardware soft limits; see the node's
+# header comment.
+[subsystem]
+name = "@NAME@"
+node = "@@NAME@//:node"
+period_us = @PERIOD@
+
+[motors.@NAME@]
+type = "TalonFX"
+bus = "rio"
+inverted = false
+brake = true
+supply_limit_a = 40.0
+stator_limit_a = 20.0
 max_voltage = 12.0
 sensor_to_mechanism_ratio = 1.0
 max_velocity_rps = 100.0
@@ -2261,11 +2812,13 @@ def estimator_files(name, lang):
 
 # ---------------------------------------------------------------- generation
 
-def package_files(name, lang, standalone=False, kind="velocity"):
-    """{relative path: content} of the new package."""
+def package_files(name, lang, standalone=False, kind="velocity", raw=False):
+    """{relative path: content} of the new package. `raw`: a position node
+    that writes out its own homing and limits instead of using
+    talOS/mechanisms."""
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US)
     files = (estimator_files(name, lang) if kind == "estimator"
-             else mechanism_files(name, lang, kind))
+             else mechanism_files(name, lang, kind, raw))
     if standalone:
         # talOS labels name the @talos module; the repo root is the package,
         # so defaults.toml is exported after the loads.
@@ -2281,11 +2834,12 @@ def package_files(name, lang, standalone=False, kind="velocity"):
         )
         files["MODULE.bazel"] = fill(
             STANDALONE_MODULE, EXTRA_DEPS=extra_deps, **values)
-        files["defaults.toml"] = fill({
-            "velocity": STANDALONE_DEFAULTS_TOML,
-            "position": STANDALONE_POSITION_DEFAULTS_TOML,
-            "estimator": STANDALONE_ESTIMATOR_DEFAULTS_TOML,
-        }[kind], **values)
+        files["defaults.toml"] = fill(
+            STANDALONE_POSITION_RAW_DEFAULTS_TOML if raw else {
+                "velocity": STANDALONE_DEFAULTS_TOML,
+                "position": STANDALONE_POSITION_DEFAULTS_TOML,
+                "estimator": STANDALONE_ESTIMATOR_DEFAULTS_TOML,
+            }[kind], **values)
     return files
 
 
@@ -2294,12 +2848,14 @@ def neighbor_of(name):
     return "bystander" if name == "neighbor" else "neighbor"
 
 
-def mechanism_files(name, lang, kind):
-    """{relative path: content} of a one-motor velocity/position package."""
+def mechanism_files(name, lang, kind, raw=False):
+    """{relative path: content} of a one-motor velocity/position package;
+    `raw`: package_files'."""
     values = dict(NAME=name, PASCAL=pascal(name), PERIOD=PERIOD_US,
                   NEIGHBOR=neighbor_of(name))
     messages = fill(MESSAGES_BUILD, **values)
-    fbs_template = POSITION_FBS if kind == "position" else FBS
+    fbs_template = (POSITION_RAW_FBS if raw else
+                    POSITION_FBS if kind == "position" else FBS)
     files = {f"{name}_message.fbs": fill(fbs_template, **values)}
     if lang == "cpp":
         node_includes = [f"{name}/topics.h",
@@ -2319,6 +2875,55 @@ def mechanism_files(name, lang, kind):
         cc_test = fill(CC_TEST, INCLUDES=includes(test_includes), **values)
         testdata_subsystem = CC_TESTDATA_SUBSYSTEM
         if kind == "position":
+            # The motor is named after the subsystem; the fixture starts it
+            # on its home switch.
+            cc_test = edited(cc_test, [
+                (f'"{name}_motor"', f'"{name}"'),
+                ("Mode::kVelocity", "Mode::kMotionMagic"),
+                ("velocity_rps()", "position_rot()"),
+                ("  SimHardware hw{sim};\n};\n",
+                 fill(CC_POSITION_FIXTURE, **values)),
+                # Moving off a switch that still reads closed is a fault.
+                ("  Teleop();\n  Hold(30.0, 60ms);\n",
+                 "  Teleop();\n"
+                 "  SetHome(false);  // zeroed on the switch, it leaves it\n"
+                 "  Hold(30.0, 60ms);\n"),
+            ])
+        if kind == "position" and raw:
+            # The node's own homing and limits on its Motor and home switch:
+            # no talOS/mechanisms, no parameter table.
+            hdr_template = CC_POSITION_RAW_HEADER
+            pascal_name = values["PASCAL"]
+            cc_test = edited(cc_test, [
+                # A motor at rest on its home switch zeroes on its first tick.
+                ("    sim.step(10ms);  // the mode is current before any lane "
+                 "arrives\n",
+                 "    // The mode is current before any lane arrives, and a "
+                 "motor at rest on\n"
+                 "    // its home switch has zeroed.\n"
+                 "    sim.step(60ms);\n"),
+                # Goals inside the node's travel, kMaxRot.
+                ("  Hold(30.0, 60ms);\n\n", "  Hold(1.5, 60ms);\n\n"),
+                ("  EXPECT_DOUBLE_EQ(request.demand, 30.0);\n",
+                 "  EXPECT_DOUBLE_EQ(request.demand, 1.5);\n"),
+                ("  EXPECT_DOUBLE_EQ(state.position_rot(), 30.0);\n",
+                 "  EXPECT_DOUBLE_EQ(state.position_rot(), 1.5);\n"),
+                (f"TEST_F({pascal_name}Test, OtherModesLaneIsIgnored) {{\n"
+                 "  Teleop();\n",
+                 f"TEST_F({pascal_name}Test, OtherModesLaneIsIgnored) {{\n"
+                 "  Teleop();\n"
+                 "  // Until the switch opens, no farther than "
+                 "kHomeMarginRot.\n"
+                 "  SetHome(false);\n"),
+                ('  Hold(20.0, 40ms, "auto");\n',
+                 '  Hold(1.0, 40ms, "auto");\n'),
+                ("  EXPECT_DOUBLE_EQ(request.demand, 20.0);\n",
+                 "  EXPECT_DOUBLE_EQ(request.demand, 1.0);\n"),
+                ("struct Result {",
+                 fill(CC_POSITION_RAW_TESTS, **values) + "struct Result {"),
+            ])
+            testdata_subsystem = CC_POSITION_RAW_TESTDATA_SUBSYSTEM
+        elif kind == "position":
             # A thin node over talos::mechanisms::PositionMechanism, whose
             # name is both its motor and its parameter table.
             node_includes.append("talOS/mechanisms/position_mechanism.h")
@@ -2328,11 +2933,6 @@ def mechanism_files(name, lang, kind):
                  '        "//talOS/node",\n'),
             ])
             cc_test = edited(cc_test, [
-                (f'"{name}_motor"', f'"{name}"'),
-                ("Mode::kVelocity", "Mode::kMotionMagic"),
-                ("velocity_rps()", "position_rot()"),
-                ("  SimHardware hw{sim};\n};\n",
-                 fill(CC_POSITION_FIXTURE, **values)),
                 # A motor on its home switch zeroes after home_samples ticks.
                 ("    sim.step(10ms);  // the mode is current before any lane "
                  "arrives\n",
@@ -2340,11 +2940,6 @@ def mechanism_files(name, lang, kind):
                  "motor on its home\n"
                  "    // switch has zeroed (home_samples ticks).\n"
                  "    sim.step(60ms);\n"),
-                # Moving off a switch that still reads closed is a fault.
-                ("  Teleop();\n  Hold(30.0, 60ms);\n",
-                 "  Teleop();\n"
-                 "  SetHome(false);  // zeroed on the switch, it leaves it\n"
-                 "  Hold(30.0, 60ms);\n"),
                 (f"// matrix: n/a 9 (the {name} reads no parameters)\n",
                  fill(CC_POSITION_PARAMETERS, **values)),
                 ("struct Result {",
@@ -2382,16 +2977,65 @@ def mechanism_files(name, lang, kind):
         node = fill(PY_NODE, **values)
         py_test = fill(PY_TEST, FROM_IMPORTS=from_imports, **values)
         testdata_robot = PY_TESTDATA_ROBOT
+        node_imports = {
+            name: "topics",
+            f"{name}.{pascal_name}Homing": f"{pascal_name}Homing",
+            f"{name}.{pascal_name}State": f"{pascal_name}State",
+            f"{name}.{pascal_name}Target": f"{pascal_name}Target",
+        }
         if kind == "position":
+            # The motor is named after the subsystem; setUp starts it at
+            # rest on its home switch.
+            py_test = edited(py_test, [
+                (f'"{name}_motor"', f'"{name}"'),
+                ("velocity_rps=demand", "position_rot=demand"),
+                ("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC"),
+                ("state.velocity_rps, 12.5", "state.position_rot, 0.0"),
+                ('0.0, 12.5)\n',
+                 '0.0, 0.0)\n'
+                 '        # Starts at rest on its home switch (closed reads\n'
+                 '        # False, see set_home): zeroed without moving.\n'
+                 f'        self.hw.set_digital_input("{name}", '
+                 f'"{name}_home", False)\n'),
+            ])
+        if kind == "position" and raw:
+            # The node's own homing and limits on its Motor and home switch:
+            # no talos.mechanisms, no parameter table.
+            node = fill(PY_POSITION_RAW_NODE, FROM_IMPORTS="\n".join(
+                f"from {module} import {node_imports[module]}"
+                for module in sorted(node_imports, key=str.lower)), **values)
+            py_test = edited(py_test, [
+                # A motor at rest on its home switch zeroes on its first
+                # tick.
+                ("        self.sim.step(0.01)\n",
+                 "        self.sim.step(0.06)  # at rest on a switch: zeroed\n"),
+                # Goals inside the node's travel, MAX_ROT, off the switch.
+                ("        self.teleop()\n        self.hold(30.0, 0.06)\n",
+                 "        self.teleop()\n"
+                 "        self.set_home(False)  # zeroed on the switch, it "
+                 "leaves it\n"
+                 "        self.hold(1.5, 0.06)\n"),
+                ("        self.assertEqual(request.demand, 30.0)\n",
+                 "        self.assertEqual(request.demand, 1.5)\n"),
+                ('        self.teleop()\n'
+                 '        self.hold(30.0, 0.04, source="auto")',
+                 '        self.teleop()\n'
+                 '        self.set_home(False)  # until it opens, no farther '
+                 'than HOME_MARGIN_ROT\n'
+                 '        self.hold(30.0, 0.04, source="auto")'),
+                ('        self.hold(20.0, 0.04, source="auto")\n',
+                 '        self.hold(1.0, 0.04, source="auto")\n'),
+                ("        self.assertEqual(request.demand, 20.0)\n",
+                 "        self.assertEqual(request.demand, 1.0)\n"),
+                ("\n\nclass BinaryTest",
+                 fill(PY_POSITION_RAW_TESTS, **values)
+                 + "\n\nclass BinaryTest"),
+            ])
+            testdata_robot = PY_POSITION_RAW_TESTDATA_ROBOT
+        elif kind == "position":
             # A thin node over talos.mechanisms.PositionMechanism, whose name
             # is both its motor and its parameter table.
-            node_imports = {
-                name: "topics",
-                f"{name}.{pascal_name}Homing": f"{pascal_name}Homing",
-                f"{name}.{pascal_name}State": f"{pascal_name}State",
-                f"{name}.{pascal_name}Target": f"{pascal_name}Target",
-                "talos.mechanisms": "PositionMechanism, PositionPhase",
-            }
+            node_imports["talos.mechanisms"] = "PositionMechanism, PositionPhase"
             node = fill(PY_POSITION_NODE, FROM_IMPORTS="\n".join(
                 f"from {module} import {node_imports[module]}"
                 for module in sorted(node_imports, key=str.lower)), **values)
@@ -2404,21 +3048,11 @@ def mechanism_files(name, lang, kind):
                  '        "//talOS/python:testing",\n'),
             ])
             py_test = edited(py_test, [
-                (f'"{name}_motor"', f'"{name}"'),
-                ("velocity_rps=demand", "position_rot=demand"),
                 (f"    # matrix: n/a 9 (the {name} reads no parameters)\n",
                  fill(PY_POSITION_PARAMETERS, **values)),
                 # A motor on its home switch zeroes after home_samples ticks.
                 ("        self.sim.step(0.01)\n",
                  "        self.sim.step(0.06)  # home_samples ticks on a switch\n"),
-                ("talos.Mode.VELOCITY", "talos.Mode.MOTION_MAGIC"),
-                ("state.velocity_rps, 12.5", "state.position_rot, 0.0"),
-                ('0.0, 12.5)\n',
-                 '0.0, 0.0)\n'
-                 '        # Starts at rest on its home switch (closed reads\n'
-                 '        # False, see set_home): zeroed without moving.\n'
-                 f'        self.hw.set_digital_input("{name}", '
-                 f'"{name}_home", False)\n'),
                 ("\n\nclass BinaryTest",
                  fill(PY_POSITION_TESTS, **values) + "\n\nclass BinaryTest"),
             ])
@@ -2547,10 +3181,10 @@ def teleop_button(root, robot):
     return button
 
 
-def plan(root, robot, name, lang, kind="velocity"):
+def plan(root, robot, name, lang, kind="velocity", raw=False):
     """([(path, old content or None, new content)], placeholder CAN id, or
     None for an estimator, which owns no devices)."""
-    if problem := check_name(name) or check_kind(name, lang, kind):
+    if problem := check_name(name) or check_kind(name, lang, kind, raw):
         raise Refused(problem)
     processor = os.path.join(root, robot, "main_processor")
     configuration = os.path.join(processor, "configuration")
@@ -2589,8 +3223,10 @@ def plan(root, robot, name, lang, kind="velocity"):
                           f"{rel(root, configuration)}")
 
     writes = [(os.path.join(package, path), None, content)
-              for path, content in package_files(name, lang, kind=kind).items()]
+              for path, content in package_files(name, lang, kind=kind,
+                                                 raw=raw).items()]
     subsystem = fill(
+        POSITION_RAW_SUBSYSTEM_TOML if raw else
         {"velocity": SUBSYSTEM_TOML,
          "position": POSITION_SUBSYSTEM_TOML,
          "estimator": ESTIMATOR_SUBSYSTEM_TOML}[kind],
@@ -2639,14 +3275,15 @@ def robot_configs(root, robot):
     return found
 
 
-def plan_standalone(target_dir, name, lang, talos_root, kind="velocity"):
+def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
+                    raw=False):
     """[(path, None, content)] for a standalone Bzlmod subsystem repository
     that builds against the talOS checkout at `talos_root` as it stands."""
-    if problem := check_name(name) or check_kind(name, lang, kind):
+    if problem := check_name(name) or check_kind(name, lang, kind, raw):
         raise Refused(problem)
     if os.path.exists(target_dir) and os.listdir(target_dir):
         raise Refused(f"{target_dir} already exists and is not empty")
-    files = package_files(name, lang, standalone=True, kind=kind)
+    files = package_files(name, lang, standalone=True, kind=kind, raw=raw)
     # Real paths, so a symlinked directory (macOS /tmp) cannot skew it.
     talos_path = os.path.relpath(os.path.realpath(talos_root),
                                  os.path.realpath(target_dir)).replace(
@@ -2738,10 +3375,11 @@ def sim_config(root, robot):
     return f"{configuration}/{SIM_CONFIGS[0]}", False
 
 
-def simulation_block(name, kind, button=TELEOP_BUTTONS[0]):
+def simulation_block(name, kind, button=TELEOP_BUTTONS[0], raw=False):
     """The TOML a student appends to the robot's simulation config so that
     `name` moves under `./sim.sh --sim-gateway` with joystick 0's `button`
-    held (teleop_button's choice).
+    held (teleop_button's choice). A --raw position node's travel is a
+    constant in its file, so its block sets none.
 
     The values go there, not in the subsystem file, because the robot's own
     configs never read the simulation config: a live button binding, gains
@@ -2774,12 +3412,15 @@ autonomous = []
     if kind == "position":
         gains = (zero.replace("p = 0.0", "p = 1.0")
                  .replace("d = 0.0", "d = 0.05").replace("v = 0.0", "v = 0.12"))
-        return block + f"""\
+        travel = "" if raw else f"""\
 # The simulated travel.
 [{sub}.{name}]
 max_rot = 2.0
+"""
+        push = "the homing push" if raw else "homing_v"
+        return block + travel + f"""\
 # The simulated home switch: it reads closed while the motor, which starts
-# at 0, is at or below -0.1 rotations, where homing_v drives it.
+# at 0, is at or below -0.1 rotations, where {push} drives it.
 [{sub}.digital_inputs.{name}_home]
 sim_motor = "{motor}"
 sim_closed_at_rot = -0.1
@@ -2796,13 +3437,15 @@ slot0 = {{ {zero.replace("v = 0.0", "v = 0.12")} }}
 
 
 def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
-               golden_test=False, sim=None, button=TELEOP_BUTTONS[0]):
+               golden_test=False, sim=None, button=TELEOP_BUTTONS[0],
+               raw=False):
     """What to do after scaffolding `name` into `robot`. `golden_test`: the
     robot pins its hardware config in configuration/config_golden_test.cc
     (2026-robot does; a new_robot robot does not). `sim`: sim_config's
     (path, exists) for the robot; default, a robot_sim.toml that exists.
-    `button`: teleop_button's choice for the robot before the scaffold."""
-    del lang  # both languages' nodes read the same keys
+    `button`: teleop_button's choice for the robot before the scaffold.
+    `raw`: a --raw position node, whose constants are in its own file
+    (`lang` names it); otherwise both languages read the same keys."""
     package = f"//{robot}/main_processor/{name}"
     configuration = f"{robot}/main_processor/configuration"
     subsystem = f"{configuration}/subsystems/{name}.toml"
@@ -2818,7 +3461,7 @@ Next:
   {subsystem}
     List the camera nodes in `cameras`; point telemetry at the pose with
     [studio] pose_topic = "/{name}/state"."""
-    lines = simulation_block(name, kind, button)
+    lines = simulation_block(name, kind, button, raw)
     if sim_exists:
         step, manifest = "append these lines to", ""
     else:
@@ -2836,6 +3479,25 @@ Next:
     Only the node's clamp stops the mechanism past the top: wire a forward
     limit switch to the TalonFX's limit input and set
     forward_limit_switch.""" if kind == "position" else ""
+    own = ""
+    if raw:
+        source = (f"{robot}/main_processor/{name}/"
+                  + (f"{name}.h" if lang == "cpp" else f"{name}.py"))
+        constants = ("kMaxRot, kHomingVolts, kMaxPushTicks and kHomeMarginRot"
+                     if lang == "cpp" else
+                     "MAX_ROT, HOMING_VOLTS, MAX_PUSH_TICKS and HOME_MARGIN_ROT")
+        travel = f"""
+    The home switch's dio is a placeholder too: replace it with its physical
+    channel. Wire the switch normally open to ground. Set stator_limit_a
+    (20 A, provisional) for your mechanism.
+    Only the node's clamp stops the mechanism past the top: wire a forward
+    limit switch to the TalonFX's limit input and set
+    forward_limit_switch."""
+        own = f"""
+  In {source}:
+    {constants}
+    are placeholders sized for the simulation: measure the travel, check
+    the push moves toward the switch, time it, and set each."""
     golden = f"""
   {configuration}/config_golden_test.cc
     pins the hardware config: update it once a human has checked the CAN id.""" \
@@ -2853,14 +3515,16 @@ Next:
   ./sim.sh --config {sim_path} {sim_run(button)}
   Before a real robot drives the motor, in {subsystem}:
     can_id = {can_id} is a placeholder: replace it with the motor's physical id.{travel}
-    Tune slot0 on the mechanism before uncommenting its teleop binding.{golden}"""
+    Tune slot0 on the mechanism before uncommenting its teleop binding.{own}{golden}"""
 
 
-def standalone_next_steps(target_dir, name, kind="velocity"):
+def standalone_next_steps(target_dir, name, kind="velocity", raw=False):
     edit = {"velocity": "add the motor's physical can_id",
             "position": "add the motor's physical can_id and the home "
                         "switch's dio, set its travel and homing_v",
             "estimator": "list its camera nodes in `cameras`"}[kind]
+    if raw:  # its travel and homing push are constants in the node
+        edit = "add the motor's physical can_id and the home switch's dio"
     return f"""\
 Next (standalone subsystem repo at {target_dir}):
   1. Run its tests (MODULE.bazel overrides @talos with this checkout):
@@ -2883,13 +3547,30 @@ KINDS = {
 }
 
 
-def kind_summary(kind, kinds=tuple(KINDS)):
+# How a position node is written: printed by kind_summary, one line each.
+POSITION_CONTROL = {
+    False: "on talOS/mechanisms' PositionMechanism: less code, behaviour "
+           "shared and tested there",
+    True: "every line of homing and limits written in your own file, with "
+          "its tests",
+}
+
+
+def kind_summary(kind, kinds=tuple(KINDS), raw=None):
     """The archetype generated and the others of `kinds` (the tool's --type
     choices), printed before `Next:`, since leaving out --type gives a
-    velocity node without saying so."""
+    velocity node without saying so. `raw` (new_subsystem's --raw; None for
+    a tool without it): a position node also names how it was written and
+    the other way."""
     others = "".join(f"\n    {other}: {KINDS[other]}"
                      for other in kinds if other != kind)
-    return (f"Type: {kind}, {KINDS[kind]}.\n"
+    control = ""
+    if kind == "position" and raw is not None:
+        control = (f"\n  Written {'with --raw' if raw else 'without --raw'}: "
+                   f"{POSITION_CONTROL[raw]}.\n"
+                   f"    {'without' if raw else 'with'} --raw: "
+                   f"{POSITION_CONTROL[not raw]}")
+    return (f"Type: {kind}, {KINDS[kind]}.{control}\n"
             f"  Other types (--type {'|'.join(kinds)}):{others}")
 
 
@@ -2911,6 +3592,11 @@ def main(argv):
                         default="velocity",
                         help="archetype: a velocity or position mechanism, or "
                         "a hardware-free pose estimator (default: %(default)s)")
+    parser.add_argument("--raw", action="store_true",
+                        help="with --type position: write every line of "
+                        "homing and limits in the node's own file, with its "
+                        "tests, instead of using talOS/mechanisms' "
+                        "PositionMechanism (less code, shared behaviour)")
     parser.add_argument("--robot", default="2026-robot",
                         help="robot directory (default: %(default)s)")
     parser.add_argument("--standalone", metavar="DIR",
@@ -2919,6 +3605,9 @@ def main(argv):
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file and edit without writing")
     args = parser.parse_args(argv)
+    if args.raw and args.kind != "position":
+        parser.error(f"--raw writes a position node's homing and limits; "
+                     f"it takes --type position, not --type {args.kind}")
 
     root = os.environ.get("BUILD_WORKSPACE_DIRECTORY")
     if not root:
@@ -2929,11 +3618,11 @@ def main(argv):
         if args.standalone:
             target_dir = os.path.join(root, args.standalone)
             writes = plan_standalone(target_dir, args.name, args.lang, root,
-                                     kind=args.kind)
+                                     kind=args.kind, raw=args.raw)
             can_id = None
         else:
             writes, can_id = plan(root, args.robot, args.name, args.lang,
-                                  kind=args.kind)
+                                  kind=args.kind, raw=args.raw)
             # Plan's choice, from the robot as it stands before the writes.
             button = (teleop_button(root, args.robot)
                       if can_id is not None else None)
@@ -2950,16 +3639,17 @@ def main(argv):
                       newline=NEWLINES.get(path, "\n")) as f:
                 f.write(content)
             print(f"wrote {shown(root, path)}")
-    print(kind_summary(args.kind))
+    print(kind_summary(args.kind, raw=args.raw))
     if args.standalone:
         print(standalone_next_steps(shown(root, target_dir), args.name,
-                                    args.kind))
+                                    args.kind, args.raw))
     else:
         golden_test = os.path.isfile(os.path.join(
             root, args.robot, "main_processor", "configuration",
             "config_golden_test.cc"))
         print(next_steps(args.robot, args.name, can_id, args.kind, args.lang,
-                         golden_test, sim_config(root, args.robot), button))
+                         golden_test, sim_config(root, args.robot), button,
+                         args.raw))
     return 0
 
 
