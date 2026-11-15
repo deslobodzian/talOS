@@ -1219,3 +1219,57 @@ def talos_sim(
         deps = [Label("@rules_python//python/runfiles")],
         **kwargs
     )
+
+# talos_sim_test's check and what it judges a session with.
+_SIM_CHECK = Label("//talOS/build:sim_check.py")
+_LOG_DUMP = Label("//talOS/launcher:log_dump")
+_SESSION_REPORT = Label("//talOS/launcher:session_report")
+_REGISTRY_UNLINK = Label("//talOS/build:registry_unlink")
+
+def talos_sim_test(name, sim, duration_s = 3, **kwargs):
+    """Runs the talos_sim target `sim` for `duration_s` and judges its session.
+
+    Fails unless the launch exits 0; every member of the session's manifest
+    ran exactly once and exited with code 0 and no signal; the session holds
+    the simulator and a node besides it and the hardware bridge; and the
+    bridge received State from the simulator (session_report's "controller
+    link" verdict). A launch still running near Bazel's timeout is stopped
+    with every process it started, and fails with its output. The check is
+    talOS/build/sim_check.py.
+
+    Tagged `e2e` (it runs the whole config) and `exclusive` (it does, on as
+    many cores as the robot uses), as Bazel's `medium` size with the `short`
+    timeout unless given.
+
+    Args:
+      name: test target name.
+      sim: the label of a talos_sim target.
+      duration_s: how long the session runs, in seconds of real time.
+      **kwargs: passed to py_test.
+    """
+    sim_label = native.package_relative_label(sim)
+    tags = kwargs.pop("tags", [])
+    py_test(
+        name = name,
+        size = kwargs.pop("size", "medium"),
+        timeout = kwargs.pop("timeout", "short"),
+        srcs = [_SIM_CHECK],
+        main = _SIM_CHECK,
+        args = [
+            "--sim",
+            "$(rlocationpath %s)" % sim_label,
+            "--duration-s",
+            str(duration_s),
+            "--log-dump",
+            "$(rlocationpath %s)" % _LOG_DUMP,
+            "--session-report",
+            _rlocation(_SESSION_REPORT.same_package_label("session_report.py")),
+            "--registry-unlink",
+            "$(rlocationpath %s)" % _REGISTRY_UNLINK,
+        ],
+        data = [sim_label, _LOG_DUMP, _SESSION_REPORT, _REGISTRY_UNLINK],
+        legacy_create_init = False,
+        tags = tags + [tag for tag in ["e2e", "exclusive"] if tag not in tags],
+        deps = [Label("@rules_python//python/runfiles")],
+        **kwargs
+    )
