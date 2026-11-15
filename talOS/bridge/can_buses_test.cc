@@ -11,8 +11,8 @@ namespace {
 
 constexpr uint64_t kConfigId = 0xc0ffee;
 
-State Report(uint64_t boot_id, uint64_t config_id, uint8_t count,
-             uint8_t index, CanBusSample bus) {
+State Report(uint64_t boot_id, uint64_t config_id, uint8_t count, uint8_t index,
+             CanBusSample bus) {
   State state;
   state.boot_id = boot_id;
   state.config_id = config_id;
@@ -79,7 +79,8 @@ TEST(CanBusTable, IgnoresAnotherConfigurationAndStartsOverOnANewBoot) {
 // reported (NONE), still pending or simulated raises nothing.
 // REQ-OPS-20
 TEST(CanBusTable, AlertsOnAFailedOrStaleBusUntilItReadsAgain) {
-  for (const auto unread : {CanBusReadState::kFailed, CanBusReadState::kStale}) {
+  for (const auto unread :
+       {CanBusReadState::kFailed, CanBusReadState::kStale}) {
     SCOPED_TRACE(static_cast<int>(unread));
     CanBusTable table{kConfigId};
     table.Observe(Report(7, kConfigId, 3, 0, kOk));
