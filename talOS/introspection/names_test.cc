@@ -719,31 +719,82 @@ TEST(HardwareConfig, SensorVelocityLimitIsAdvisoryAndUsesMechanismRatio) {
       << Describe(diagnostics);
 }
 
-TEST(HardwareConfig, RioTrafficCountsMotorAndSensorFramesAtStatusFrequency) {
-  hardware::Config config;
-  config.motors.resize(3);
-  config.sensors.resize(4);
-  config.status_hz = 750;
-  EXPECT_TRUE(CheckHardwareConfig(config).empty());
-
-  config.status_hz = 751;
-  const auto diagnostics = CheckHardwareConfig(config);
-  ASSERT_EQ(diagnostics.size(), 1u);
-  EXPECT_NE(Find(diagnostics, Severity::WARNING, "rio"), nullptr)
-      << Describe(diagnostics);
+// `motors` Talon FX, `cancoders` CANcoders and `gyros` Pigeon 2 on `bus`.
+void AddDevices(hardware::Config& config, const std::string& bus,
+                std::size_t motors, std::size_t cancoders, std::size_t gyros) {
+  for (std::size_t i = 0; i < motors; ++i) {
+    hardware::MotorConfig motor;
+    motor.bus = bus;
+    config.motors.push_back(motor);
+  }
+  for (std::size_t i = 0; i < cancoders + gyros; ++i) {
+    hardware::SensorConfig sensor;
+    sensor.bus = bus;
+    sensor.kind = i < cancoders ? hardware::SensorKind::kCANcoder
+                                : hardware::SensorKind::kPigeon2;
+    config.sensors.push_back(sensor);
+  }
 }
 
-TEST(HardwareConfig, OtherCanBusesDoNotCountTowardRioTraffic) {
-  hardware::Config config;
-  config.status_hz = 1000;
-  config.motors.resize(3);
-  config.sensors.resize(2);
-  ASSERT_EQ(CheckHardwareConfig(config).size(), 1u);
-  config.motors.front().bus = "canivore";
-  EXPECT_TRUE(CheckHardwareConfig(config).empty());
-  config.motors.front().bus = "rio";
-  config.sensors.front().bus = "canivore";
-  EXPECT_TRUE(CheckHardwareConfig(config).empty());
+// Each CAN bus's load is estimated from its own devices and judged on its
+// own: the bench's five devices on a CANivore stay far under 70 %, a full
+// swerve-and-mechanisms load on one CANivore and ten motors on the
+// RoboRIO's classic bus warn, naming the bus, and two CANivores each under
+// the threshold do not warn however much they carry together.
+// REQ-CONTRACT-37
+TEST(HardwareConfig, EachCanBusIsWarnedAboveSeventyPercentOnItsOwnLoad) {
+  struct Case {
+    const char* what;
+    std::vector<std::tuple<std::string, std::size_t, std::size_t, std::size_t>>
+        buses;
+    std::vector<std::string> warned;
+  };
+  const Case cases[] = {
+      {"bench: 3 motors, a CANcoder and a Pigeon 2 on a CANivore",
+       {{"Shooter", 3, 1, 1}},
+       {}},
+      {"20 motors, 4 CANcoders and a Pigeon 2 on one CANivore",
+       {{"canivore", 20, 4, 1}},
+       {"canivore"}},
+      {"10 motors on the RoboRIO's bus", {{"rio", 10, 0, 0}}, {"rio"}},
+      {"12 motors on each of two CANivores",
+       {{"left", 12, 0, 0}, {"right", 12, 0, 0}},
+       {}},
+  };
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.what);
+    hardware::Config config;
+    config.status_hz = 200;
+    for (const auto& [bus, motors, cancoders, gyros] : c.buses) {
+      AddDevices(config, bus, motors, cancoders, gyros);
+    }
+    const auto diagnostics = CheckHardwareConfig(config);
+    std::vector<std::string> warned;
+    for (const auto& d : diagnostics) {
+      EXPECT_EQ(d.severity, Severity::WARNING) << d.ToString();
+      warned.push_back(d.subject);
+      EXPECT_NE(d.message.find("0.70"), std::string::npos) << d.ToString();
+    }
+    EXPECT_EQ(warned, c.warned) << Describe(diagnostics);
+  }
+  // The estimate the warning names, calibrated to the bench's measured 0.16
+  // to 0.18: 2 x (3 x 0.018 + 0.009 + 0.013) + 0.05.
+  hardware::Config bench;
+  bench.status_hz = 200;
+  AddDevices(bench, "Shooter", 3, 1, 1);
+  const auto loads = EstimateCanBusLoads(bench);
+  ASSERT_EQ(loads.size(), 1u);
+  EXPECT_NEAR(loads[0].estimate_frac, 0.202, 1e-9);
+  // Ten motors on "rio": 2 x 10 x 0.041 + 0.05, named with its counts.
+  hardware::Config rio;
+  rio.status_hz = 200;
+  AddDevices(rio, "rio", 10, 0, 0);
+  const auto diagnostics = CheckHardwareConfig(rio);
+  ASSERT_EQ(diagnostics.size(), 1u);
+  EXPECT_NE(diagnostics[0].message.find("0.87"), std::string::npos)
+      << diagnostics[0].message;
+  EXPECT_NE(diagnostics[0].message.find("10 motors"), std::string::npos)
+      << diagnostics[0].message;
 }
 
 }  // namespace

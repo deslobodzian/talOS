@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -374,12 +375,59 @@ struct Diagnostic {
   }
 };
 
-// Advisory hardware limits, not configuration errors: the estimate counts
-// status frames on the roboRIO CAN bus only, not CANivore traffic.
+// A CAN bus's estimated utilization (0 to 1) above which
+// CheckHardwareConfig warns.
+inline constexpr double kCanBusWarnFrac = 0.70;
+
+// A CAN bus's estimated utilization from its devices (CheckHardwareConfig).
+// Per device at a 100 Hz status rate, from CTR Electronics' Phoenix 6 "CAN
+// Bus Utilization" page
+// (https://v6.docs.ctr-electronics.com/en/stable/docs/migration/canbus-utilization.html),
+// which also advises keeping a bus below 90 %: on CAN FD (a CANivore: any
+// bus but "rio") a Talon FX 0.018, a CANcoder 0.009, a Pigeon 2 0.013; on
+// classic CAN ("rio") 0.041, 0.017 and 0.031. Each device's figure scales
+// with its status rate over 100 Hz, and every CAN device sends at the
+// config's `status_hz` (no device sets its own rate). Each bus adds 0.05
+// for the vendor's diagnostic server. Calibration: the bench's three Talon
+// FX, CANcoder and Pigeon 2 on a CANivore at 200 Hz estimate 0.152 plus
+// that 0.05, against 0.16 to 0.18 measured on /hw/status.
+struct CanBusLoad {
+  std::string bus;
+  std::size_t motors{0}, cancoders{0}, gyros{0};
+  double estimate_frac{0};
+};
+inline std::vector<CanBusLoad> EstimateCanBusLoads(
+    const hardware::Config& config) {
+  std::map<std::string, CanBusLoad, std::less<>> buses;
+  const auto at = [&](const std::string& bus) -> CanBusLoad& {
+    CanBusLoad& load = buses[bus];
+    load.bus = bus;
+    return load;
+  };
+  for (const auto& motor : config.motors) ++at(motor.bus).motors;
+  for (const auto& sensor : config.sensors) {
+    CanBusLoad& load = at(sensor.bus);
+    ++(sensor.kind == hardware::SensorKind::kPigeon2 ? load.gyros
+                                                     : load.cancoders);
+  }
+  std::vector<CanBusLoad> out;
+  out.reserve(buses.size());
+  for (auto& [name, load] : buses) {
+    const bool classic = name == "rio";
+    const double per_100_hz =
+        static_cast<double>(load.motors) * (classic ? 0.041 : 0.018) +
+        static_cast<double>(load.cancoders) * (classic ? 0.017 : 0.009) +
+        static_cast<double>(load.gyros) * (classic ? 0.031 : 0.013);
+    load.estimate_frac = per_100_hz * config.status_hz / 100.0 + 0.05;
+    out.push_back(std::move(load));
+  }
+  return out;
+}
+
+// Advisory hardware limits, not configuration errors.
 inline std::vector<Diagnostic> CheckHardwareConfig(
     const hardware::Config& config) {
   std::vector<Diagnostic> out;
-  std::size_t rio_frames_per_update = 0;
   for (const auto& motor : config.motors) {
     const double sensor_velocity =
         motor.max_velocity_rps * motor.sensor_to_mechanism_ratio;
@@ -391,21 +439,19 @@ inline std::vector<Diagnostic> CheckHardwareConfig(
                " rps, exceeding the recommended 105 rps; check gearing and "
                "the configured maximum velocity"});
     }
-    if (motor.bus == "rio") rio_frames_per_update += 4;
   }
-  for (const auto& sensor : config.sensors) {
-    if (sensor.bus == "rio") rio_frames_per_update += 2;
-  }
-  const double rio_frames_per_second =
-      static_cast<double>(rio_frames_per_update) * config.status_hz;
-  if (rio_frames_per_second > 15000.0) {
-    out.push_back(
-        {Severity::WARNING, "rio",
-         "estimated CAN status traffic (4 * motors + 2 * sensors) * "
-         "status_hz is " +
-             std::to_string(rio_frames_per_second) +
-             " frames/s, exceeding the recommended 15000 frames/s; reduce "
-             "status_hz or move devices to another CAN bus"});
+  for (const auto& load : EstimateCanBusLoads(config)) {
+    if (load.estimate_frac <= kCanBusWarnFrac) continue;
+    char line[256];
+    std::snprintf(line, sizeof line,
+                  "estimated CAN bus utilization %.2f (%zu motors, %zu "
+                  "CANcoders, %zu gyros at status_hz %g, on %s) is above "
+                  "%.2f; reduce status_hz or move devices to another CAN bus",
+                  load.estimate_frac, load.motors, load.cancoders, load.gyros,
+                  config.status_hz,
+                  load.bus == "rio" ? "classic CAN" : "CAN FD",
+                  kCanBusWarnFrac);
+    out.push_back({Severity::WARNING, load.bus, line});
   }
   return out;
 }
