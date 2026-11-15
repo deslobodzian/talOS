@@ -22,6 +22,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
+import children
 import watch
 
 BROWSER_NAMES = ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable")
@@ -179,7 +180,8 @@ class Browser:
         self.profile.mkdir(parents=True)
         self.log_path = Path(tmp) / "browser.log"
         self.log = self.log_path.open("w")
-        self.proc = subprocess.Popen(
+        self.closed = False
+        self.child = children.Child(
             [binary, "--headless=new", "--remote-debugging-port=0",
              f"--user-data-dir={self.profile}", "--no-first-run",
              "--no-default-browser-check", "--disable-extensions",
@@ -189,7 +191,7 @@ class Browser:
              "--disable-background-timer-throttling",
              "--disable-renderer-backgrounding",
              "--disable-backgrounding-occluded-windows", "about:blank"],
-            stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
+            stdout=self.log, stderr=subprocess.STDOUT)
         self.ws = None
         if register is not None:
             register(self.close)
@@ -197,9 +199,8 @@ class Browser:
             active = self.profile / "DevToolsActivePort"
 
             def port_file():
-                if self.proc.poll() is not None:
-                    raise RuntimeError(f"{binary} exited {self.proc.returncode}; "
-                                       f"see {self.log_path}")
+                if self.child.exited():
+                    raise RuntimeError(f"{binary} exited; see {self.log_path}")
                 text = active.read_text() if active.exists() else ""
                 return text if text.count("\n") >= 1 and text.split("\n")[1] else None
 
@@ -217,12 +218,14 @@ class Browser:
             raise
 
     def close(self):
+        """Kills the browser's whole group (renderers and helpers may outlive
+        the main process) while its leader is unreaped, then reaps it. Once:
+        a second call does nothing."""
+        if self.closed:
+            return
+        self.closed = True
         if self.ws is not None:
             self.ws.close()
-        # The whole group: renderers and helpers may outlive the main process.
-        try:
-            os.killpg(self.proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        self.proc.wait()
+        self.child.signal_group(signal.SIGKILL)
+        self.child.reap()
         self.log.close()

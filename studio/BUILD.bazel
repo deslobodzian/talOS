@@ -179,6 +179,7 @@ py_test(
     size = "medium",
     srcs = [
         "tests/browser/cdp.py",
+        "tests/browser/children.py",
         "tests/browser/drive_browser_test.py",
         "tests/browser/watch.py",
     ],

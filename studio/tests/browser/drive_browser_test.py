@@ -33,6 +33,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parent))
 import cdp  # noqa: E402
+import children  # noqa: E402
 import watch  # noqa: E402
 
 import autonomous_progress  # noqa: E402
@@ -61,14 +62,21 @@ def workspace():
 # exit of this process, a SIGTERM (Bazel's timeout) included. Each runs in a
 # session of its own, so a signal to this process's group misses them; under
 # Bazel on Linux the test runner reaps them anyway, run directly or elsewhere
-# nothing else does.
+# nothing else does. Each stop runs once: `_stop` takes it off the list
+# first, and each is idempotent besides.
 _STOPS = []
+
+
+def _stop(stop):
+    if stop in _STOPS:
+        _STOPS.remove(stop)
+    stop()
 
 
 def _stop_all():
     while _STOPS:
         try:
-            _STOPS.pop()()
+            _stop(_STOPS[-1])
         except Exception as error:  # noqa: BLE001: stop the rest regardless
             print(f"cleanup: {error!r}", flush=True)
 
@@ -145,9 +153,10 @@ class Session:
         env = dict(os.environ, TALOS_SHM_NAMESPACE=self.namespace)
         if sys.platform == "darwin":
             env["TALOS_REALTIME"] = "1"
-        self.proc = subprocess.Popen(args, cwd=tmp, env=env, stdout=self.log,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-        _STOPS.append(lambda: self.stop(grace_s=10))
+        self.launcher = children.Child(args, cwd=tmp, env=env, stdout=self.log,
+                                       stderr=subprocess.STDOUT)
+        _STOPS.append(self.stop)
+        self.stopped = False
         self.tmp = tmp
         self.dir = None
 
@@ -155,8 +164,8 @@ class Session:
         """The session directory, once the bridge's log says it listens."""
 
         def listening():
-            if self.proc.poll() is not None:
-                raise RuntimeError(f"launcher exited {self.proc.returncode} during startup")
+            if self.launcher.exited():
+                raise RuntimeError("launcher exited during startup")
             failure = self.bind_failure()
             if failure:
                 raise RuntimeError(failure)
@@ -187,18 +196,21 @@ class Session:
         nodes = json.loads((self.dir / "manifest.json").read_text())["nodes"]
         return next(n["pid"] for n in nodes if n["name"] == name)
 
-    def stop(self, grace_s=30):
+    def stop(self, grace_s=10):
         """Stops the session as an operator does (SIGINT: the launcher stops
         its members, each in a process group of its own); SIGKILLs the
         launcher after grace_s, whose members then die with it (Linux:
-        PR_SET_PDEATHSIG)."""
-        if self.proc.poll() is None:
-            os.killpg(self.proc.pid, signal.SIGINT)
-            try:
-                self.proc.wait(timeout=grace_s)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-                self.proc.wait()
+        PR_SET_PDEATHSIG). Once: a second call does nothing."""
+        if self.stopped:
+            return
+        self.stopped = True
+        if not self.launcher.exited():
+            self.launcher.signal_group(signal.SIGINT)
+        try:
+            self.launcher.reap(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            self.launcher.signal_group(signal.SIGKILL)
+            self.launcher.reap()
         self.log.close()
         autonomous_progress.remove(self.namespace)
 
@@ -245,10 +257,10 @@ class DriveDashboardInBrowser(unittest.TestCase):
     def tearDownClass(cls):
         failed = False
         if cls.browser is not None:
-            cls.browser.close()
+            _stop(cls.browser.close)
         if cls.session is not None:
-            cls.session.stop()
-            failed = cls.session.proc.returncode not in (0, -signal.SIGINT)
+            _stop(cls.session.stop)
+            failed = cls.session.launcher.returncode not in (0, -signal.SIGINT)
         if cls.session is not None and (failed or getattr(cls, "kept", False)):
             kept = cls.outputs / "session"
             if cls.session.output.exists():
@@ -430,6 +442,29 @@ class DriveDashboardInBrowser(unittest.TestCase):
                 f"{stopped_by - armed_at:.1f} ms of the page's clock read", "result": result}])
         self.assertIn("TELEMETRY", result["status"]["text"], result)
         self.wait(label, "__probe.current()", "current again after the producer resumed")
+
+
+class ChildSignalsItsGroupOnlyUnreaped(unittest.TestCase):
+    """The cleanup above may run twice (tearDownClass, then atexit or a
+    SIGTERM): a group whose leader was reaped is never signalled again,
+    since its pid may by then lead an unrelated group."""
+
+    def test_no_signal_after_reap(self):
+        sent = []
+
+        def killpg(pid, sig):
+            sent.append((pid, sig))
+            os.killpg(pid, sig)
+
+        child = children.Child([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                               killpg=killpg, stdin=subprocess.PIPE)
+        self.addCleanup(child.proc.stdin.close)
+        self.assertFalse(child.exited())
+        self.assertTrue(child.signal_group(signal.SIGKILL))
+        self.assertEqual(child.reap(), -signal.SIGKILL)
+        self.assertFalse(child.signal_group(signal.SIGKILL))
+        child.reap()
+        self.assertEqual(sent, [(child.pid, signal.SIGKILL)])
 
 
 if __name__ == "__main__":
