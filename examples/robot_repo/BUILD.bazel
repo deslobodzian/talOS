@@ -8,7 +8,7 @@ package(default_visibility = ["//visibility:public"])
 exports_files(["robot.toml"] + glob(["subsystems/*.toml"]))
 
 # The simulator robot.toml's [robot] sim_gateway names.
-SIMULATOR = "@talos//2026-robot/main_processor/simulation:sim_gateway"
+SIMULATOR = "@talos//talOS/simulation:sim_gateway"
 
 # Fails, with the regenerate command, when robot_manifest.bzl is stale.
 manifest_sync_test(

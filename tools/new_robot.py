@@ -79,7 +79,7 @@ status_hz = 200.0
 # or other producer.
 commissioned = false
 # The program that stands in for the RoboRIO under `./sim.sh --sim-gateway`.
-sim_gateway = "//2026-robot/main_processor/simulation:sim_gateway"
+sim_gateway = "//talOS/simulation:sim_gateway"
 
 # Where the RoboRIO is, as seen from the main processor: loopback for
 # simulation. On the robot set its address (e.g. "10.TE.AM.2") or pass the

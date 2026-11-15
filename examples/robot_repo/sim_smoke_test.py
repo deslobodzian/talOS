@@ -63,10 +63,6 @@ class SimSmokeTest(unittest.TestCase):
                     "--remote", "127.0.0.1",
                     "--remote-port", str(gateway_port),
                     "--local-port", str(bridge_port)]
-            # The simulator takes no ports from the launcher: pass them.
-            for arg in ("--port", str(gateway_port), "--remote-port",
-                        str(bridge_port)):
-                args += ["--sim-gateway-arg", arg]
             try:
                 run = subprocess.run(args, capture_output=True, text=True,
                                      timeout=LAUNCH_TIMEOUT_S, check=False)

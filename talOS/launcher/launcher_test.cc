@@ -1386,6 +1386,33 @@ TEST(LauncherGraphTest, AllowGraphErrorsWithoutSimIsRefusedBeforeAnyProbe) {
   }
 }
 
+// REQ-DEV-31: the launcher passes the simulator the bridge's ports, so a
+// port written by hand as well is refused before anything is probed or a
+// session directory exists, rather than left to disagree with the bridge's.
+TEST(LauncherGraphTest, ASimulatorPortWrittenByHandIsRefusedBeforeAnyProbe) {
+  for (const std::string_view flag : {"--port", "--remote-port"}) {
+    SCOPED_TRACE(flag);
+    const std::string invoked = TempPath("simulator_port_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "simulator_port",
+        RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("simulator_port_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    fixture.options.simulation = true;
+    fixture.options.start_sim_gateway = true;
+    fixture.options.sim_gateway_args = {"--physics", std::string{flag}, "5900"};
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+  }
+}
+
 // A config whose `[robot] simulation_only = true` (here set by
 // a simulation config that includes the deployable fixture) runs only with
 // --sim. Without it the launch is refused before any member is probed or

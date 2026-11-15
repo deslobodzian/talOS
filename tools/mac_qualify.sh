@@ -127,9 +127,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   section "sudo for purge"
   sudo -v || echo "no sudo credentials: Python node restarts will be reported warm"
 fi
-GATEWAY="--start-sim-gateway --sim-gateway-arg=--physics
-  --sim-gateway-arg=--port --sim-gateway-arg={remote_port}
-  --sim-gateway-arg=--remote-port --sim-gateway-arg={local_port}"
+GATEWAY="--start-sim-gateway --sim-gateway-arg=--physics"
 # shellcheck disable=SC2086
 run_step "restart latency, idle" \
   bazel run //talOS/launcher:restart_latency -- --config "$PHYSICS_SIM" \

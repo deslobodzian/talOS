@@ -81,7 +81,7 @@ class MatchRehearsal(unittest.TestCase):
                     # 17 s after the start it picks.
                     "--output-dir", str(output), "--duration-s", "120"]
             gateway_args = [
-                "--physics", "--port", str(gw_port), "--remote-port", str(bridge_port),
+                "--physics",
                 "--schedule-start-file", str(start_file),
                 "--mode-schedule", "disabled:1,auto:4,disabled:1,teleop:9,disabled:2",
                 "--joystick-schedule",

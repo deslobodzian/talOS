@@ -23,7 +23,7 @@ commissioned = false
 # RoboRIO. Its default, //talOS/bridge:hardware_node, names this repository.
 hardware_node = "@talos//talOS/bridge:hardware_node"
 # The program that stands in for the RoboRIO under `bazel run //:sim`.
-sim_gateway = "@talos//2026-robot/main_processor/simulation:sim_gateway"
+sim_gateway = "@talos//talOS/simulation:sim_gateway"
 
 # Where the RoboRIO is, as seen from the main processor: loopback for
 # simulation. On the robot set its address (e.g. "10.TE.AM.2") or pass the

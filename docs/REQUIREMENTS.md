@@ -37,7 +37,7 @@ numbered section, a number in RULES a rule:
 | ER | [talOS/events/README.md](../talOS/events/README.md) |
 | RTMS | [talOS/rtms/README.md](../talOS/rtms/README.md) |
 | R26 | [2026-robot/README.md](../2026-robot/README.md) |
-| SR | [2026-robot/main_processor/simulation/README.md](../2026-robot/main_processor/simulation/README.md) |
+| SR | [talOS/simulation/README.md](../talOS/simulation/README.md) |
 | DEP | [DEPLOYMENT.md](DEPLOYMENT.md) |
 | BR | [BRINGUP.md](BRINGUP.md) |
 | INSTALL | [INSTALL.md](INSTALL.md) |
@@ -273,6 +273,7 @@ serves none is listed as such with the TODO.md item that settles it
 | `talOS/driver_station` | REQ-SAFE-10, REQ-SAFE-11 |
 | `talOS/configuration` | REQ-SAFE-26, REQ-SAFE-40, REQ-CONTRACT-10, REQ-CONTRACT-17, REQ-CONTRACT-31, REQ-DEV-29 |
 | `talOS/launcher` | REQ-SAFE-28 to REQ-SAFE-30, REQ-SAFE-40, REQ-CONTRACT-09, REQ-CONTRACT-11, REQ-CONTRACT-12, REQ-OPS-01 to REQ-OPS-11, REQ-OPS-14 to REQ-OPS-16, REQ-OPS-19, REQ-OPS-25, REQ-OPS-26 (`tlog_to_wpilog`), REQ-OPS-30, REQ-OPS-32, REQ-DEV-04, REQ-OPS-33, REQ-OPS-37, REQ-OPS-43, REQ-RT-23 |
+| `talOS/simulation` | REQ-DEV-05 (the simulator and its schedules), REQ-DEV-31 |
 | `talOS/introspection` | REQ-CONTRACT-08, REQ-CONTRACT-09, REQ-CONTRACT-33, REQ-CONTRACT-36, REQ-CONTRACT-37, REQ-RT-18, REQ-RT-21, REQ-OPS-17, REQ-OPS-18, REQ-OPS-32 |
 | `talOS/process` | REQ-RT-08 to REQ-RT-10, REQ-RT-21, REQ-OPS-06, REQ-OPS-12 |
 | `talOS/node_api`, `talOS/python` | REQ-SAFE-06, REQ-CONTRACT-13 to REQ-CONTRACT-15, REQ-DEV-09, REQ-RT-23 |

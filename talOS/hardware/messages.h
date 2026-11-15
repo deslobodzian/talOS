@@ -176,7 +176,7 @@ enum class GatewayProgram : uint8_t {
   kUnknown = 0,            // a gateway that does not say (tests, SimHardware)
   kRoboRio = 1,            // the RoboRIO program on a RoboRIO
   kRoboRioSimulation = 2,  // the RoboRIO program under WPILib simulation
-  kSimGateway = 3,         // //2026-robot/main_processor/simulation:sim_gateway
+  kSimGateway = 3,         // //talOS/simulation:sim_gateway
 };
 inline constexpr GatewayProgram kLastGatewayProgram =
     GatewayProgram::kSimGateway;

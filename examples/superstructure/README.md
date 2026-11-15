@@ -223,7 +223,7 @@ to, lints the whole graph, and exits:
 
 ```sh
 bazel build //talOS/launcher //talOS/bridge:hardware_node \
-  //2026-robot/main_processor/simulation:sim_gateway \
+  //talOS/simulation:sim_gateway \
   //examples/superstructure/cpp:all //examples/superstructure/py:all
 ./bazel-bin/talOS/launcher/launcher --config examples/superstructure/config/robot.toml --describe-only
 ```

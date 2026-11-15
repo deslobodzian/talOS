@@ -33,7 +33,7 @@ struct NodeSpec {
   std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
   std::string binary_path;
   // Forwarded unchanged to both --describe and runtime: the hardware
-  // bridge's ControllerArgs, the sim gateway's --sim-gateway-arg values.
+  // bridge's ControllerArgs, the sim gateway's SimulatorArgs.
   std::vector<std::string> extra_args;
   bool critical{true};
   bool owns_actuators{false};
@@ -217,8 +217,20 @@ NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
 std::vector<std::string> ControllerArgs(const config::RobotConfig& config,
                                         const LauncherOptions& options);
 
+// The simulator's arguments: `--port` (the bridge's effective
+// `--remote-port`, which the simulator listens on) and `--remote-port` (the
+// bridge's effective `--local-port`, which it sends to), then the
+// --sim-gateway-arg values. The simulator stands in for the controller the
+// bridge addresses, so the two always agree on the ports (REQ-DEV-31).
+std::vector<std::string> SimulatorArgs(const config::RobotConfig& config,
+                                       const LauncherOptions& options);
+
+// A --sim-gateway-arg value Launcher::Run refuses: a port flag of the
+// simulator's, which SimulatorArgs already passes.
+bool IsSimulatorPortArg(std::string_view arg);
+
 // The roster: the hardware bridge (with ControllerArgs), the subsystems, the
-// sim gateway under --sim-gateway, and the Studio bridge
+// sim gateway under --sim-gateway (with SimulatorArgs), and the Studio bridge
 // (NodeSpec::studio_bridge) under --start-studio-bridge unless
 // BundleWithoutStudio(options). A subsystem may share a name with a member
 // the launcher adds; Launcher::Run refuses such a roster.

@@ -147,9 +147,7 @@ class Session:
                 # inside its 10 ms period's 500 ms floor: a longer stall
                 # timeout keeps the launcher from killing it meanwhile.
                 "--heartbeat-periods", "300",
-                "--sim-gateway-arg", "--physics",
-                "--sim-gateway-arg", "--port", "--sim-gateway-arg", str(gw_port),
-                "--sim-gateway-arg", "--remote-port", "--sim-gateway-arg", str(bridge_port)]
+                "--sim-gateway-arg", "--physics"]
         env = dict(os.environ, TALOS_SHM_NAMESPACE=self.namespace)
         if sys.platform == "darwin":
             env["TALOS_REALTIME"] = "1"

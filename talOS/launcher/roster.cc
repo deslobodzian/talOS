@@ -167,7 +167,6 @@ NodeSpec MakeNodeSpec(std::string_view name, const std::string& target,
     auto it = options.binary_overrides.find(spec.name);
     if (it != options.binary_overrides.end()) spec.binary_path = it->second;
   }
-  if (name == kSimGatewayName) spec.extra_args = options.sim_gateway_args;
   return spec;
 }
 
@@ -208,6 +207,7 @@ std::vector<NodeSpec> DiscoverNodes(const config::RobotConfig& robot_config,
   if (options.start_sim_gateway && options.simulation) {
     if (auto gateway = robot_string("sim_gateway")) {
       specs.push_back(MakeNodeSpec(kSimGatewayName, *gateway, options));
+      specs.back().extra_args = SimulatorArgs(robot_config, options);
     }
   }
 
@@ -245,6 +245,20 @@ std::vector<std::string> ControllerArgs(const config::RobotConfig& config,
   return {"--remote",      EffectiveRemoteAddress(config, options),
           "--remote-port", std::to_string(EffectiveRemotePort(config, options)),
           "--local-port",  std::to_string(EffectiveLocalPort(config, options))};
+}
+
+std::vector<std::string> SimulatorArgs(const config::RobotConfig& config,
+                                       const LauncherOptions& options) {
+  std::vector<std::string> args{
+      "--port", std::to_string(EffectiveRemotePort(config, options)),
+      "--remote-port", std::to_string(EffectiveLocalPort(config, options))};
+  args.insert(args.end(), options.sim_gateway_args.begin(),
+              options.sim_gateway_args.end());
+  return args;
+}
+
+bool IsSimulatorPortArg(std::string_view arg) {
+  return arg == "--port" || arg == "--remote-port";
 }
 
 uint16_t EffectiveStudioHttpPort(const config::RobotConfig& config,

@@ -161,8 +161,7 @@ class ScaffoldSimTest(unittest.TestCase):
         env["TEST_TMPDIR"] = namespace
         self.addCleanup(unlink_registry, namespace)
         gateway_args = [
-            "--physics", "--port", str(gateway_port), "--remote-port",
-            str(bridge_port), "--mode-schedule",
+            "--physics", "--mode-schedule",
             new_subsystem.MODE_SCHEDULE] + gateway_extra
         args = [launcher, "--config", config, "--sim", "--start-sim-gateway"]
         for arg in gateway_args:

@@ -275,9 +275,17 @@ remote. On hardware, commissioning gates commands; see
 ## Lightweight simulation gateway
 
 `--sim --start-sim-gateway` starts the binary named by `[robot] sim_gateway`
-as a roster member. Repeat `--sim-gateway-arg ARG` to forward individual
-arguments verbatim, in order, to **both** its `--describe` probe and runtime.
-The forwarding flag requires `--start-sim-gateway`. For example:
+(`//talOS/simulation:sim_gateway`, [its README](../simulation/README.md)) as
+a roster member. The launcher passes it the bridge's ports
+(`SimulatorArgs`): `--port` is the effective controller port the bridge sends
+to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
+effective local port the bridge listens on (`[robot] local_port`, or
+`--local-port`), so the two always agree. Repeat `--sim-gateway-arg ARG` to
+forward further arguments verbatim, in order, after those, to **both** its
+`--describe` probe and runtime. The forwarding flag requires
+`--start-sim-gateway`, and a `--port` or `--remote-port` among its values is
+refused before anything is probed: set the config's ports or the launcher's
+flags instead. For example:
 
 ```sh
 bazel run //talOS/launcher -- \
@@ -710,13 +718,12 @@ config's nodes come from `bazel-bin`, so build them first:
 ```sh
 bazel run //talOS/launcher:restart_latency -- \
   --config 2026-robot/main_processor/configuration/robot_physics_sim.toml \
-  --start-sim-gateway --sim-gateway-arg=--physics \
-  --sim-gateway-arg=--port --sim-gateway-arg={remote_port} \
-  --sim-gateway-arg=--remote-port --sim-gateway-arg={local_port}
+  --start-sim-gateway --sim-gateway-arg=--physics
 ```
 
 It runs the session on loopback ports it picks (`{remote_port}` and
-`{local_port}` in gateway arguments) under its own `TALOS_SHM_NAMESPACE`,
+`{local_port}` in gateway arguments name them) under its own
+`TALOS_SHM_NAMESPACE`,
 kills `--node` (default `drivetrain`) `--kills` times (default 10), spaced
 500 ms past `--restart-window-ms` (default 1500), and removes the session and
 its segments afterwards (`--keep` keeps the directory). The session lives in

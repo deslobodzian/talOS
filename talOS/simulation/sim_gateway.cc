@@ -16,7 +16,6 @@
 
 #include "geometry/geometry_descriptor.h"
 #include "geometry/geometry_generated.h"
-#include "schedules.h"
 #include "sim/topics.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
@@ -29,14 +28,14 @@
 #include "talOS/introspection/registry.h"
 #include "talOS/ipc/publisher.h"
 #include "talOS/process/process.h"
+#include "talOS/simulation/schedules.h"
 
 namespace {
 
 namespace ds = talos::driver_station;
 
 constexpr const char* kNodeName = "sim_gateway";
-constexpr const char* kNodeTarget =
-    "//2026-robot/main_processor/simulation:sim_gateway";
+constexpr const char* kNodeTarget = "//talOS/simulation:sim_gateway";
 constexpr const char* kUsage =
     "usage: sim_gateway --config PATH [--physics "
     "[--start-pose X_M,Y_M,YAW_RAD] [--wheel-radius-error FRAC] "
@@ -123,7 +122,7 @@ int main(int argc, char** argv) {
     double duration_s = 0;
     std::vector<ds::SchedulePhase> phases;
     std::vector<ds::JoystickEvent> joysticks;
-    std::vector<robot::simulation::FaultEvent> faults;
+    std::vector<talos::simulation::FaultEvent> faults;
     ds::Alliance alliance = ds::Alliance::kBlue;
     bool physics_options = false;
     uint64_t session_id = 0;
@@ -183,7 +182,7 @@ int main(int argc, char** argv) {
         joysticks = ds::ParseJoystickSchedule(argv[++i]);
       } else if (arg == "--fault-schedule" && i + 1 < argc) {
         physics_options = true;
-        faults = robot::simulation::ParseFaults(argv[++i]);
+        faults = talos::simulation::ParseFaults(argv[++i]);
       } else if (arg == "--alliance" && i + 1 < argc) {
         const std::string value = argv[++i];
         if (value == "blue") {
@@ -261,7 +260,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(
             "sim_gateway: Reconfigure failed for the robot config");
       }
-      robot::simulation::ResolveFaults(faults, hw_config);
+      talos::simulation::ResolveFaults(faults, hw_config);
     }
     talos::hardware::Endpoint endpoint{gateway};
     if (endpoint.Open("127.0.0.1", local_port, "127.0.0.1", remote_port) !=
@@ -326,7 +325,7 @@ int main(int argc, char** argv) {
         std::ifstream file{*schedule_start_file};
         if (file) {
           try {
-            start_ns = robot::simulation::ParseScheduleStart(
+            start_ns = talos::simulation::ParseScheduleStart(
                 std::string{std::istreambuf_iterator<char>{file}, {}});
           } catch (const std::invalid_argument& e) {
             throw std::invalid_argument(*schedule_start_file + ": " + e.what());
@@ -337,7 +336,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "sim_gateway: schedule start is %.1f ms in the past\n",
                          static_cast<double>(late_ns) / 1e6);
-            robot::simulation::SkipPastFaults(
+            talos::simulation::SkipPastFaults(
                 faults, static_cast<double>(late_ns) / 1e9);
           }
         }
@@ -358,7 +357,7 @@ int main(int argc, char** argv) {
         driver_station.joysticks[0] = joysticks[joystick_event++].joystick;
       }
       endpoint.SetSendEnabled(
-          !robot::simulation::ApplyFaults(faults, elapsed_s, physics_backend));
+          !talos::simulation::ApplyFaults(faults, elapsed_s, physics_backend));
       driver_station.sample_time_us =
           std::chrono::duration_cast<std::chrono::microseconds>(
               tick_time.time_since_epoch())

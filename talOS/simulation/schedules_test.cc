@@ -1,11 +1,11 @@
-#include "schedules.h"
+#include "talOS/simulation/schedules.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <vector>
 
-namespace robot::simulation {
+namespace talos::simulation {
 namespace {
 
 TEST(Schedules, RejectsMalformedFaultsRatherThanSilentlySkippingThem) {
@@ -161,4 +161,4 @@ TEST(Schedules, AdjacentFaultsRestoreBeforeActivatingInAnyInputOrder) {
 }
 
 }  // namespace
-}  // namespace robot::simulation
+}  // namespace talos::simulation
