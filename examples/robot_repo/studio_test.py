@@ -119,6 +119,7 @@ class StudioBridgeInSession(unittest.TestCase):
                 os.killpg(launch.pid, signal.SIGKILL)
                 launch.wait()
             reader.join(timeout=STOP_WAIT_S)
+            launch.stdout.close()
         manifests = glob.glob(os.path.join(out, "*", "manifest.json"))
         self.assertEqual(len(manifests), 1, manifests)
         with open(manifests[0], encoding="utf-8") as f:

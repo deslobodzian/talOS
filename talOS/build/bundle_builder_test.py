@@ -219,23 +219,27 @@ class BundleBuilderTest(unittest.TestCase):
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertIn(problem, proc.stderr)
 
+    # REQ-OPS-34
     def test_studio_must_be_the_configs_bridge_and_a_built_site(self):
         # A bundle whose bridge is not the one [studio] names would run
         # another viewer, found by name; a site with no index page serves
-        # nothing.
-        for configured, index, problem in (
-                (None, True, None),
-                ("//viewer:bridge", True, None),
-                ("//other:bridge", True, "//other:bridge"),
-                (None, False, "index.html")):
-            with self.subTest(configured=configured, index=index), \
+        # nothing; one with no driver dashboard leaves the drive team without
+        # `/drive` (REQ-OPS-34). Either refusal names the build command.
+        for configured, pages, problem in (
+                (None, ("index.html", "drive.html"), None),
+                ("//viewer:bridge", ("index.html", "drive.html"), None),
+                ("//other:bridge", ("index.html", "drive.html"),
+                 "//other:bridge"),
+                (None, ("drive.html",), "index.html"),
+                (None, ("index.html",), "drive.html")):
+            with self.subTest(configured=configured, pages=pages), \
                     tempfile.TemporaryDirectory() as tmp:
                 bridge = os.path.join(tmp, "src", "studio_bridge")
                 put(bridge, "")
                 webroot = os.path.join(tmp, "src", "dist")
                 os.makedirs(webroot)
-                if index:
-                    put(os.path.join(webroot, "index.html"), "<html>")
+                for page in pages:
+                    put(os.path.join(webroot, page), "<html>")
                 proc = self.assemble(
                     tmp, {"c/robot.toml": "[robot]\n"},
                     [node(tmp, "hardware_node", HARDWARE_NODE)], (),
@@ -247,6 +251,9 @@ class BundleBuilderTest(unittest.TestCase):
                 if problem is not None:
                     self.assertNotEqual(proc.returncode, 0)
                     self.assertIn(problem, proc.stderr)
+                    if problem.endswith(".html"):
+                        self.assertIn("bazel build //studio:web_dist",
+                                      proc.stderr)
                     continue
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 out = os.path.join(tmp, "out")
@@ -488,6 +495,7 @@ class BundleBuilderTest(unittest.TestCase):
                     put(bridge, "")
                     webroot = os.path.join(tmp, "src", "dist")
                     put(os.path.join(webroot, "index.html"), "<html>")
+                    put(os.path.join(webroot, "drive.html"), "<html>")
                     studio = {"bridge_path": bridge,
                               "bridge_label": "//viewer:bridge",
                               "webroot_path": webroot}

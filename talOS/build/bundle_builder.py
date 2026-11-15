@@ -216,7 +216,8 @@ def check_nodes(spec, resolved):
 
 def check_studio(spec, resolved):
     """Exits when the bundle carries a Studio bridge other than the one its
-    config's `[studio] bridge` names, or a webroot with no index.html. Unset,
+    config's `[studio] bridge` names, or a webroot without Studio's pages
+    (index.html, and drive.html for the driver dashboard). Unset,
     the launcher's default label is used and falls back to the bundled bridge
     by name."""
     studio = spec.get("studio")
@@ -228,9 +229,12 @@ def check_studio(spec, resolved):
         sys.exit(f"bundle: studio_bridge {studio['bridge_label']} is not the "
                  f"[studio] bridge {configured} that "
                  f"{spec['config']['short_path']} names")
-    if not os.path.isfile(os.path.join(studio["webroot_path"], "index.html")):
-        sys.exit(f"bundle: studio_webroot {studio['webroot_path']} holds no "
-                 "index.html")
+    for page in ("index.html", "drive.html"):
+        if not os.path.isfile(os.path.join(studio["webroot_path"], page)):
+            sys.exit(f"bundle: studio_webroot {studio['webroot_path']} holds "
+                     f"no {page}; build Studio's pages with `bazel build "
+                     "//studio:web_dist` in talOS's checkout (from a robot "
+                     "repository: `cd talos && bazel build //studio:web_dist`)")
 
 
 def source_revision(path):
