@@ -39,16 +39,19 @@ GRAPH = {
     "//2026-robot/main_processor/driver:node": (
         "talos_cc_node", ["//2026-robot/main_processor/driver:driver"]),
     "//2026-robot/main_processor/driver:node_test": (
-        None, ["//2026-robot/main_processor/driver:driver",
-               "//2026-robot/main_processor/drivetrain:drivetrain"]),
+        None, ["//2026-robot/main_processor/driver:driver"]),
     "//2026-robot/main_processor/autonomous:autonomous": (
         None, ["//2026-robot/main_processor/drivetrain:messages",
                "//talOS/devices:devices"]),
     "//2026-robot/main_processor/autonomous:node": (
         "talos_cc_node", ["//2026-robot/main_processor/autonomous:autonomous"]),
-    "//2026-robot/main_processor/autonomous:closed_loop_test": (
+    "//2026-robot/main_processor/integration:closed_loop_test": (
         None, ["//2026-robot/main_processor/autonomous:autonomous",
                "//2026-robot/main_processor/drivetrain:drivetrain"]),
+    "//2026-robot/main_processor/configuration:config_golden_test": (
+        None, ["//2026-robot/main_processor/drivetrain:drivetrain"]),
+    "//2026-robot/main_processor:robot_bundle": (
+        None, ["//2026-robot/main_processor/drivetrain:node"]),
     "//examples/superstructure/cpp:mechanisms": (
         None, ["//talOS/devices:devices"]),
     "//examples/superstructure/cpp:libmechanisms.so": (
@@ -57,6 +60,13 @@ GRAPH = {
         "talos_py_node", ["//examples/superstructure/cpp:libmechanisms.so",
                           "//talOS/python:talos"]),
 }
+
+# What `attr(testonly, 1, ...)` returns: every test rule.
+TESTONLY = frozenset({
+    "//2026-robot/main_processor/driver:node_test",
+    "//2026-robot/main_processor/integration:closed_loop_test",
+    "//2026-robot/main_processor/configuration:config_golden_test",
+})
 
 
 def package(label):
@@ -80,7 +90,8 @@ class FakeBazel:
         return {label for label, (generator, _) in self.graph.items()
                 if any(matches(label, p) for p in target_set.include)
                 and not any(matches(label, p) for p in target_set.exclude)
-                and generator not in target_set.except_generators}
+                and generator not in target_set.except_generators
+                and not (target_set.except_testonly and label in TESTONLY)}
 
     def node_packages(self):
         return sorted({package(label)
@@ -142,6 +153,15 @@ class CheckLayersTest(unittest.TestCase):
                 ("//talOS/python:talos", "//talOS/node:node"),
                 ("//2026-robot/main_processor/drivetrain:drivetrain",
                  "//2026-robot/main_processor/driver:driver"),
+                # A node's production library, and a node's own test, never
+                # link another node's class.
+                ("//2026-robot/main_processor/autonomous:autonomous",
+                 "//2026-robot/main_processor/drivetrain:drivetrain"),
+                ("//2026-robot/main_processor/driver:node_test",
+                 "//2026-robot/main_processor/drivetrain:drivetrain"),
+                # Outside node packages only a testonly target links one.
+                ("//2026-robot/main_processor/integration:harness",
+                 "//2026-robot/main_processor/drivetrain:drivetrain"),
                 ("//examples/superstructure/py:elevator",
                  "//examples/superstructure/cpp:mechanisms")):
             with self.subTest(frm=frm, to=to):
@@ -154,9 +174,14 @@ class CheckLayersTest(unittest.TestCase):
 
     # REQ-CONTRACT-16
     def test_allowed_dependencies_pass(self):
-        # Today's graph with its allowlisted dependencies, plus a dependency
-        # through a gateway, on messages, or on a node exported for
-        # talos.cpp_node.
+        # Today's graph, with its allowlisted dependencies and testonly
+        # targets outside node packages that link nodes' libraries (an
+        # integration test of two nodes, a config golden test), and a bundle
+        # of node binaries.
+        failures, out = run(GRAPH)
+        self.assertEqual(failures, 0, out)
+        # Plus a dependency through a gateway, on messages, or on a node
+        # exported for talos.cpp_node.
         for frm, to, generator in (
                 ("//talOS/python:talos", "//talOS/msgs:control_py", None),
                 ("//2026-robot/main_processor/drivetrain:drivetrain",

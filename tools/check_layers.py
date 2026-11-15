@@ -19,7 +19,14 @@ ARCHITECTURE.md "Layers" and "Allowed dependencies"
   generated messages and schemas, and C++ nodes exported for talos.cpp_node;
 - a robot, example or bench node package depends directly on no rule of
   another node package but its talos_messages targets and the C++ nodes it
-  exports for talos.cpp_node.
+  exports for talos.cpp_node; this holds for every target of the package,
+  its tests included, so a node's own targets never link another node's
+  class;
+- outside node packages (under the same roots), only a testonly target
+  links a node package's rule other than those and its node binaries: a
+  test of several nodes together, such as
+  //2026-robot/main_processor/integration, may link their libraries, and
+  nothing that ships can.
 
 ALLOWLIST holds today's known exceptions, each with its reason and the
 TODO.md item that removes it. It may only shrink: an entry whose dependency
@@ -81,13 +88,6 @@ ALLOWLIST = {
     ("talOS/devices", "talOS/bridge"):
         "talOS/devices:testing (SimHardware) runs the bridge's merge rules, "
         "//talOS/bridge:merge (TODO ARCH-2)",
-    ("2026-robot/main_processor/driver", "2026-robot/main_processor/drivetrain"):
-        "driver's node_test composes the teleop chain with "
-        "drivetrain::Drivetrain under Sim (TODO ARCH-2)",
-    ("2026-robot/main_processor/autonomous",
-     "2026-robot/main_processor/drivetrain"):
-        "autonomous's closed_loop_test drives drivetrain::Drivetrain under "
-        "Sim (TODO ARCH-2)",
 }
 
 
@@ -98,18 +98,19 @@ class Set:
     A pattern is `pkg/...` (the package and every package below it) or
     `pkg:*` (one package). `rules_only` keeps rule targets only (no source
     or generated files); `except_generators` drops the targets a named macro
-    generated.
+    generated; `except_testonly` drops testonly targets (every test rule).
     """
     include: tuple
     exclude: tuple = ()
     rules_only: bool = False
     except_generators: tuple = ()
+    except_testonly: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class Check:
     """`frm` must not reach any of `to` (kind "path": through any number of
-    dependencies; kind "direct": in one)."""
+    dependencies; kind "direct": in one). `source` narrows `frm`'s set."""
     name: str
     frm: str
     to: tuple
@@ -117,6 +118,7 @@ class Check:
     exclude: tuple = ()
     rules_only: bool = False
     except_generators: tuple = ()
+    source: Set = None
 
     def target_set(self, to):
         return Set(tuple(to), self.exclude, self.rules_only,
@@ -124,7 +126,8 @@ class Check:
 
     def search(self, backend, to):
         """The path or direct dependencies from `frm` to `to`, or []."""
-        source, target = Set((self.frm,)), self.target_set(to)
+        source = self.source or Set((self.frm,))
+        target = self.target_set(to)
         if self.kind == "path":
             return backend.somepath(source, target)
         return backend.direct(source, target)
@@ -164,6 +167,18 @@ def checks(node_packages):
                 f"node package {package} shares only messages", f"{package}:*",
                 others, kind="direct", rules_only=True,
                 except_generators=SHARED_GENERATORS))
+    every_node = tuple(f"{p}:*" for p in node_packages)
+    for root in NODE_ROOTS:
+        if not every_node:
+            break
+        # Node binaries are executables a bundle carries, not a class.
+        result.append(Check(
+            f"only testonly targets outside node packages under {root} link "
+            f"a node", recursive(root), every_node, kind="direct",
+            rules_only=True,
+            except_generators=SHARED_GENERATORS + NODE_GENERATORS,
+            source=Set((recursive(root),), every_node, rules_only=True,
+                       except_testonly=True)))
     return result
 
 
@@ -221,6 +236,8 @@ def render(target_set):
         generators = "|".join(target_set.except_generators)
         expr = (f"({expr}) except "
                 f"attr(generator_function, \"^({generators})$\", {expr})")
+    if target_set.except_testonly:
+        expr = f"({expr}) except attr(testonly, 1, {expr})"
     return expr
 
 

@@ -22,6 +22,11 @@ with GradleRIO.
 
 Simulation stands in for the RoboRIO with `main_processor/simulation:sim_gateway`.
 
+A node package's own targets link no other node's class. Tests that run
+several of these nodes together under `Sim` (the teleop chain from a joystick
+packet to module requests; autonomous's drive against the drivetrain) live in
+`main_processor/integration`, which holds no node.
+
 Camera calibration is in `main_processor/configuration/subsystems/<name>_camera.toml`,
 layered over shared defaults in `subsystems/vision.toml`. The field layout is embedded
 into each node binary, so deployed bundles require no vision runfiles.
