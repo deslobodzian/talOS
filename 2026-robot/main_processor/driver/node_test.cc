@@ -443,6 +443,10 @@ TEST(Driver, BadParameterFailsConstruction) {
       {"rezero_button_id", "rezero_button_id = 33"},
       {"heading_timeout_s", "heading_timeout_s = 0.0"},
       {"heading_timeout_s", "heading_timeout_s = nan"},
+      // Longer than command_timeout_us (100 ms here), and far past what a
+      // nanosecond count holds (it used to overflow the conversion).
+      {"heading_timeout_s", "heading_timeout_s = 0.2"},
+      {"heading_timeout_s", "heading_timeout_s = 1e300"},
   };
   for (const auto& row : rows) {
     SCOPED_TRACE(row.setting);
