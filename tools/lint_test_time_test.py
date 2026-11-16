@@ -70,6 +70,20 @@ class LintTestTimeTest(unittest.TestCase):
                 failures, out = lint(files, allowlist)
                 self.assertEqual(failures, expected, out)
 
+    # REQ-RT-17: a file allowed two waits may not gain a third, and once one
+    # is gone the count comes down with it.
+    def test_an_allowlist_count_bounds_the_hits_and_only_shrinks(self):
+        path = "talOS/launcher/launcher_test.cc"
+        files = {path: SLEEP + "int x;\n" + SLEEP}
+        for count, expected, said in (("2", 0, "no new"),
+                                      ("1", 1, f"{path}:1, 3: 2 sleep hits, "
+                                               "1 allowed"),
+                                      ("3", 1, "lower it to 2")):
+            with self.subTest(count):
+                failures, out = lint(files, f"{path} sleep {count} spawns")
+                self.assertEqual(failures, expected, out)
+                self.assertIn(said, out)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -179,7 +179,8 @@ Where RULES.md 12 is read too broadly or too narrowly:
    never sleep, read `steady_clock::now` or `time.time`, or wait on a real
    timer. Nodes use `node.now()`; `Sim` owns time. **[enforced:
    `tools/lint_test_time.py` over every test source; a test of a higher tier
-   that uses the real clock is listed with its reason in
+   that uses the real clock is listed with its reason and its number of
+   hit lines, which may only shrink, in
    `tools/lint_test_time_allowlist.txt`]**
 2. **Logic with a deadline takes its clock as a parameter**, so the policy
    (supervision deadlines, restart windows, retry intervals) is a component
