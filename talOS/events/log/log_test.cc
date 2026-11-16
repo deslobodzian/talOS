@@ -1235,7 +1235,7 @@ TEST(LogBackgroundWriter, FullPoolOpensAGapAndHalfAFreePoolResumesIt) {
   EXPECT_EQ(back.gaps, 2u);
   EXPECT_TRUE(back.damage.clean());
   // The first GAP, field by field: dispatches 66 to 566 dropped whole.
-  const std::size_t first = 2 * 65;
+  const std::size_t first = std::size_t{2} * 65;
   ASSERT_GT(back.records.size(), first);
   const std::optional<LogGap> gap =
       GapOf(back.records[first].header, back.records[first].payload);
@@ -1260,7 +1260,7 @@ TEST(LogBackgroundWriter, FullPoolOpensAGapAndHalfAFreePoolResumesIt) {
   const std::size_t split_send = 2 * (second_gap - 1) + 1;
   const LogGap second = CopyWithGap(whole, copied, split_send, split_send + 1);
   EXPECT_EQ(second.detail.flags, GAP_SPLITS_DISPATCH);
-  CopyWithGap(copied, copy, first, 2 * 566);
+  CopyWithGap(copied, copy, first, std::size_t{2} * 566);
   EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
   for (const auto& file : {path, whole, copied, copy}) ::unlink(file.c_str());
 }
@@ -1330,7 +1330,7 @@ TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
     }
     const ReadBack back = ReadAll(path, false);
     ASSERT_EQ(back.records.size(), 2u * 65 + 2);
-    const ReadBack::Read& read = back.records[2 * 65];
+    const ReadBack::Read& read = back.records[std::size_t{2} * 65];
     const std::optional<LogGap> gap = GapOf(read.header, read.payload);
     ASSERT_TRUE(gap.has_value());
     EXPECT_EQ(gap->detail.flags, GAP_CLOSED_AT_FLUSH);
@@ -1340,7 +1340,7 @@ TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
               static_cast<std::uint16_t>(EventKind::EXIT));
 
     WriteGatedReference(whole, 70);
-    CopyWithGap(whole, copy, 2 * 65, 2 * 70 + 1);
+    CopyWithGap(whole, copy, std::size_t{2} * 65, std::size_t{2} * 70 + 1);
     EXPECT_EQ(RecordBytes(path), RecordBytes(copy));
     for (const auto& file : {path, whole, copy}) ::unlink(file.c_str());
   }
