@@ -430,7 +430,10 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   the logs', and matches a member's `log_paths` to the logs by file name, so
   a session copied elsewhere still matches; logs without one (outside a
   launcher session) are judged by their `.capped` markers alone. A manifest
-  that is not JSON is refused, naming it.
+  that is not JSON is refused, naming it. It is read with
+  `session_manifest.h`, the reader `log_dump` and Studio's review also use
+  (`talOS/launcher/hardware_record.h`) and whose key names the launcher's
+  writer uses.
 
 Replay feeds a topic the program did not watch live from the session origin,
 including messages it would have missed during startup; its output may differ

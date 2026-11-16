@@ -1,7 +1,6 @@
 #include "talOS/launcher/hardware_record.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -9,7 +8,6 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <system_error>
 #include <utility>
 
@@ -21,6 +19,7 @@
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/manifest.h"
+#include "talOS/events/session_manifest.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/protocol/types.h"
@@ -464,45 +463,26 @@ const char* TypeName(HardwareRecord kind) {
   return "none";
 }
 
-std::string ManifestText(const std::filesystem::path& session) {
-  std::ifstream stream{session / "manifest.json"};
-  return {std::istreambuf_iterator<char>{stream}, {}};
-}
-
-// Where the value of member `key` of a manifest.json starts (past its colon
-// and any white space), or npos.
-std::size_t ManifestValue(const std::string& text, std::string_view key) {
-  const std::string quoted = "\"" + std::string{key} + "\"";
-  auto at = text.find(quoted);
-  if (at == std::string::npos) return at;
-  at = text.find(':', at + quoted.size());
-  if (at == std::string::npos) return at;
-  return text.find_first_not_of(" \t\r\n", at + 1);
-}
-
-// The unsigned integer member `key` of a manifest.json's text; nullopt when
-// it has none, or one that is not a decimal integer.
-std::optional<std::uint64_t> ManifestInteger(const std::string& text,
-                                             std::string_view key) {
-  const std::size_t at = ManifestValue(text, key);
-  if (at == std::string::npos || text[at] < '0' || text[at] > '9') {
-    return std::nullopt;
+// What the log tools read of `<session>/manifest.json` (session.cc
+// SessionManifest::ToJson, read by event::session_manifest::Parse); nothing
+// when it is missing or not JSON.
+event::session_manifest::Fields ManifestFields(
+    const std::filesystem::path& session) {
+  const std::optional<std::string> text =
+      event::session_manifest::ReadText(session);
+  if (!text) return {};
+  try {
+    return event::session_manifest::Parse(*text);
+  } catch (const event::session_manifest::ManifestError&) {
+    return {};
   }
-  char* end = nullptr;
-  errno = 0;
-  const unsigned long long value = std::strtoull(text.c_str() + at, &end, 10);
-  if (errno != 0 ||
-      (*end != ',' && *end != '\n' && *end != ' ' && *end != '}')) {
-    return std::nullopt;
-  }
-  return value;
 }
 
-// The "hardware_protocol_version" of a manifest.json's text (session.cc
-// SessionManifest::ToJson): nullopt when it has none, or a value that is not
-// a version (an integer from 1 to 65535).
-std::optional<std::uint16_t> ManifestProtocolVersion(const std::string& text) {
-  const auto value = ManifestInteger(text, "hardware_protocol_version");
+// A manifest's hardware_protocol_version: nullopt when it has none, or a
+// value that is not a version (an integer from 1 to 65535).
+std::optional<std::uint16_t> ManifestProtocolVersion(
+    const event::session_manifest::Fields& manifest) {
+  const auto& value = manifest.hardware_protocol_version;
   if (!value || *value < 1 || *value > 0xFFFF) return std::nullopt;
   return static_cast<std::uint16_t>(*value);
 }
@@ -518,29 +498,6 @@ std::optional<std::uint64_t> LogSessionId(const std::filesystem::path& path) {
     return std::nullopt;
   }
   return header.session_id;
-}
-
-// The "config_path" string of a session's manifest.json (session.cc
-// SessionManifest::ToJson, escaped by introspect::AppendJsonString), or empty.
-std::string ManifestConfigPath(const std::filesystem::path& session) {
-  const std::string text = ManifestText(session);
-  const std::size_t at = ManifestValue(text, "config_path");
-  if (at == std::string::npos || text[at] != '"') return "";
-  std::string value;
-  for (std::size_t i = at + 1; i < text.size(); ++i) {
-    const char c = text[i];
-    if (c == '"') return value;
-    if (c != '\\') {
-      value += c;
-    } else if (i + 1 < text.size() && text[i + 1] != 'u') {
-      value += text[++i];
-    } else if (i + 5 < text.size()) {
-      value += static_cast<char>(
-          std::strtol(text.substr(i + 2, 4).c_str(), nullptr, 16));
-      i += 5;
-    }
-  }
-  return "";
 }
 
 // How far into a log FirstBridgeStatusVersion looks, in record event time
@@ -609,7 +566,7 @@ std::string SessionConfigPath(const std::string& config,
     for (const auto& input : inputs) {
       std::error_code ec;
       if (!std::filesystem::is_directory(input, ec)) continue;
-      path = ManifestConfigPath(input);
+      path = ManifestFields(input).config_path.value_or("");
       if (!path.empty()) break;
     }
     if (path.empty()) return path;
@@ -774,7 +731,7 @@ RecordedProtocol RecordedProtocolVersion(
     std::optional<std::uint64_t> session;
     std::error_code ec;
     if (std::filesystem::is_directory(input, ec)) {
-      found.manifest = ManifestProtocolVersion(ManifestText(input));
+      found.manifest = ManifestProtocolVersion(ManifestFields(input));
       logs = event::log::FindLogFiles(input);
     } else {
       // A log named alone: with its session when the manifest beside it is
@@ -783,11 +740,10 @@ RecordedProtocol RecordedProtocolVersion(
       const std::filesystem::path dir = file.has_parent_path()
                                             ? file.parent_path()
                                             : std::filesystem::path{"."};
-      const std::string text = ManifestText(dir);
-      const auto manifest_session = ManifestInteger(text, "session_id");
+      const event::session_manifest::Fields manifest = ManifestFields(dir);
       session = LogSessionId(file);
-      if (manifest_session && manifest_session == session) {
-        found.manifest = ManifestProtocolVersion(text);
+      if (manifest.session_id && manifest.session_id == session) {
+        found.manifest = ManifestProtocolVersion(manifest);
         logs = event::log::FindLogFiles(dir.string());
       } else {
         logs = {input};

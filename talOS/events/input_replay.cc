@@ -3,20 +3,20 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <map>
-#include <nlohmann/json.hpp>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/session_manifest.h"
 
 namespace talos::event {
 
@@ -54,47 +54,43 @@ struct ManifestMarks {
 };
 
 // By file name, the logs of every member the session manifest beside the
-// logs (`<directory>/manifest.json`, talOS/launcher/session.cc) marks
-// `log_gap`, `log_capped` or `recorder_failed`, with those marks; empty when
-// there is no manifest, or it is another session's or has no session_id.
-// Throws std::runtime_error naming a manifest that is not JSON, or whose
-// `log_gap`, `log_capped`, `recorder_failed` or `log_paths` is not what the
-// launcher writes.
+// logs (`<directory>/manifest.json`, talOS/launcher/session.cc, read by
+// session_manifest::Parse) marks `log_gap`, `log_capped` or
+// `recorder_failed`, with those marks; empty when there is no manifest, or
+// it is another session's or has no session_id. Throws std::runtime_error
+// naming a manifest that is not JSON, or whose `log_gap`, `log_capped`,
+// `recorder_failed` or `log_paths` is not what the launcher writes.
 std::map<std::string, ManifestMarks> MarkedLogNames(
     const std::filesystem::path& directory, std::uint64_t session_id) {
-  const std::filesystem::path path = directory / "manifest.json";
-  std::ifstream stream{path};
-  if (!stream) return {};
-  std::map<std::string, ManifestMarks> names;
+  const std::optional<std::string> text = session_manifest::ReadText(directory);
+  if (!text) return {};
+  const auto error = [&](std::string_view what) {
+    return std::runtime_error(
+        "cannot read the session manifest " +
+        (directory / session_manifest::kFileName).string() + ": " +
+        std::string{what});
+  };
+  session_manifest::Fields manifest;
   try {
-    const nlohmann::json manifest = nlohmann::json::parse(stream);
-    if (!manifest.is_object()) return {};
-    const auto id = manifest.find("session_id");
-    if (id == manifest.end() || !id->is_number_unsigned() ||
-        id->get<std::uint64_t>() != session_id) {
-      return {};
+    manifest = session_manifest::Parse(*text);
+  } catch (const session_manifest::ManifestError& e) {
+    throw error(e.what());
+  }
+  if (manifest.session_id != session_id) return {};
+  std::map<std::string, ManifestMarks> names;
+  for (const session_manifest::Member& node : manifest.nodes) {
+    const ManifestMarks marks{.log_gap = node.log_gap,
+                              .log_capped = node.log_capped,
+                              .recorder_failed = node.recorder_failed};
+    if (!marks.log_gap && !marks.log_capped && !marks.recorder_failed) {
+      continue;
     }
-    const auto nodes = manifest.find("nodes");
-    if (nodes == manifest.end()) return {};
-    for (const nlohmann::json& node :
-         nodes->get_ref<const nlohmann::json::array_t&>()) {
-      const ManifestMarks marks{
-          .log_gap = node.value("log_gap", false),
-          .log_capped = node.value("log_capped", false),
-          .recorder_failed = node.value("recorder_failed", false)};
-      if (!marks.log_gap && !marks.log_capped && !marks.recorder_failed) {
-        continue;
-      }
-      for (const nlohmann::json& log :
-           node.at("log_paths").get_ref<const nlohmann::json::array_t&>()) {
-        names[std::filesystem::path{log.get<std::string>()}
-                  .filename()
-                  .string()] = marks;
-      }
+    if (!node.log_paths) {
+      throw error("a marked member's log_paths is not an array of strings");
     }
-  } catch (const nlohmann::json::exception& e) {
-    throw std::runtime_error("cannot read the session manifest " +
-                             path.string() + ": " + e.what());
+    for (const std::string& log : *node.log_paths) {
+      names[std::filesystem::path{log}.filename().string()] = marks;
+    }
   }
   return names;
 }

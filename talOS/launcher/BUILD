@@ -24,6 +24,7 @@ cc_library(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:session_manifest",
         "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:lock_file",
@@ -249,6 +250,7 @@ cc_library(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:session_manifest",
         "//talOS/hardware",
         "//talOS/hardware:config",
         "//talOS/protocol",
@@ -966,5 +968,21 @@ cc_test(
         "//talOS/protocol",
         "@googletest//:gtest_main",
         "@rules_cc//cc/runfiles",
+    ],
+)
+
+# Input replay reads the session manifest the launcher's own writer wrote.
+cc_test(
+    name = "manifest_replay_test",
+    size = "small",
+    srcs = ["manifest_replay_test.cc"],
+    deps = [
+        ":replay_message",
+        ":session",
+        "//talOS/events",
+        "//talOS/events:events_core",
+        "//talOS/events:events_log",
+        "//talOS/events:input_replay",
+        "@googletest//:gtest_main",
     ],
 )
