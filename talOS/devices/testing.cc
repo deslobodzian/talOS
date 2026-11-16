@@ -765,6 +765,8 @@ void SimHardware::reboot() {
   impl_->resetting.clear();
   impl_->unable.clear();
   impl_->motor_drives_from.clear();
+  // The rebooted RoboRIO has received no temperature signal yet.
+  impl_->temperature_read_us.clear();
   impl_->ds_mode = driver_station::ModeTracker{};
 }
 
