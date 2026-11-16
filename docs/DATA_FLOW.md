@@ -339,8 +339,9 @@ A writer holds one connected socket per reader slot it has notified, per
 topic it writes ([wake channel](../talOS/rtms/README.md#wake-channel)), so a
 node's wake sockets are at most the readers of the topics it writes, and never
 more than `MAX_READERS` (32) per topic: the bridge, which writes four
-topics, could hold 4 × 32 = 128 (139 descriptors with its 11 others, under
-the macOS limit below) only if 32 readers of each slept on it; what each
+topics, could hold 4 × 32 = 128 wake sockets (plus its few other
+descriptors, under the macOS limit below) only if 32 readers of each slept
+on it; what each
 armed reader adds to a publication is measured under "Publish cost" in the
 [wake channel](../talOS/rtms/README.md#wake-channel). In a robot's
 `--describe-only` graph, counting every reader as armed, the bridge is the
@@ -353,9 +354,9 @@ are its own topics' readers, a few each.
 Besides its wake sockets a node holds a few descriptors (`/proc/<pid>/fd`
 on Linux: stdio and log pipes, the event-log file, the poller,
 the stop pipe, its wake receiver; the bridge's UDP socket). The bench's
-peak, the bridge's 11 + 12 = 23, leaves 233 of macOS's default soft
-`RLIMIT_NOFILE` of 256 (and 1001 of Linux's usual 1024), so nodes do not
-raise the limit. A node
+peak, the bridge's 12 wake sockets, leaves 244 of macOS's default soft
+`RLIMIT_NOFILE` of 256 (and 1012 of Linux's usual 1024) for those few, so
+nodes do not raise the limit. A node
 that did run out would show it in its registry row's `wake_failures`, and in
 the session manifest, where `session_report --strict` rejects it.
 
