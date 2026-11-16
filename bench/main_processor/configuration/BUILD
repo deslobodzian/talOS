@@ -3,6 +3,7 @@ load("//talOS/build:contract.bzl", "talos_graph_test")
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_bench_manifest.bzl", BENCH_CONFIG_FILES = "CONFIG_FILES", BENCH_NODES = "NODES")
 load(":robot_manifest.bzl", "CONFIG_FILES", "NODES")
+load(":robot_physics_sim_manifest.bzl", PHYSICS_CONFIG_FILES = "CONFIG_FILES", PHYSICS_NODES = "NODES")
 load(":robot_py_manifest.bzl", PY_CONFIG_FILES = "CONFIG_FILES", PY_NODES = "NODES")
 
 package(default_visibility = ["//visibility:public"])
@@ -10,12 +11,14 @@ package(default_visibility = ["//visibility:public"])
 # robot.toml launches the C++ motor node, robot_py.toml the Python one (same
 # subsystem files, except the motor's motor_py.toml: motor.toml's devices
 # with the Python node at 20 ms), and robot_bench.toml
-# is robot.toml at the bench's RoboRIO address. Each has a generated
+# is robot.toml at the bench's RoboRIO address. robot_physics_sim.toml is
+# robot_py.toml's graph for the physics simulator (launcher --sim) only. Each has a generated
 # <stem>_manifest.bzl; regenerate with `bazel run //tools:sync_manifest --
 # <config>` after editing it.
 exports_files([
     "robot.toml",
     "robot_bench.toml",
+    "robot_physics_sim.toml",
     "robot_py.toml",
 ])
 
@@ -103,4 +106,23 @@ manifest_sync_test(
     config = "robot_py.toml",
     config_files = PY_CONFIG_FILES,
     manifest = "robot_py_manifest.bzl",
+)
+
+talos_graph_test(
+    name = "physics_sim_graph_test",
+    config = "robot_physics_sim.toml",
+    data = PHYSICS_CONFIG_FILES,
+    nodes = PHYSICS_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+)
+
+manifest_sync_test(
+    name = "physics_sim_manifest_sync_test",
+    config = "robot_physics_sim.toml",
+    config_files = PHYSICS_CONFIG_FILES,
+    manifest = "robot_physics_sim_manifest.bzl",
 )
