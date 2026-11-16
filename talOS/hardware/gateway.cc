@@ -587,6 +587,15 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     }
     return false;
   }
+  // Motor `i` may drive on this command only with valid feedback, observed
+  // after the last State in which it could not drive and after the last
+  // State of total loss: a failed read pass is total loss whatever samples
+  // the backend left valid.
+  const auto may_drive = [&](std::size_t i) {
+    return MotorFeedbackValid(config_.motors, state_, i) &&
+           c.observed_time_us >= motor_drives_from_[i] &&
+           c.observed_time_us >= outputs_drive_from_;
+  };
   // Structure errors reject the transaction; range/feedback errors isolate a
   // motor.
   std::array<MotorRequest, kMaxMotors> requests{};
@@ -598,10 +607,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
-    const bool feedback_valid = MotorFeedbackValid(config_.motors, state_, i) &&
-                                c.observed_time_us >= motor_drives_from_[i];
     const bool invalid =
-        (r.mode != Mode::kNeutral && !feedback_valid) ||
+        (r.mode != Mode::kNeutral && !may_drive(i)) ||
         !std::isfinite(r.demand) || !std::isfinite(r.feedforward_v) ||
         std::abs(r.feedforward_v) > m.max_voltage ||
         (r.mode == Mode::kDutyCycle && std::abs(r.demand) > 1) ||
@@ -625,8 +632,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto master_id = config_.motors[i].master_id;
     if (master_id == 0) continue;
-    const bool valid = MotorFeedbackValid(config_.motors, state_, i) &&
-                       c.observed_time_us >= motor_drives_from_[i];
+    const bool valid = may_drive(i);
     for (std::size_t j = 0; j < c.count; ++j) {
       if (config_.motors[j].id != master_id) continue;
       // Backends follow the master's output only for a non-neutral follower
@@ -663,8 +669,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       ++state_.counters.neutralized_motor_count;
   }
   // A command observing a State of total loss drives no output after the
-  // loss clears in its epoch: its motors are held by motor_drives_from_, its
-  // digital outputs go false and its PWM outputs off.
+  // loss clears in its epoch: its motors are held (may_drive), its digital
+  // outputs go false and its PWM outputs off.
   auto digital_outputs = c.digital_outputs;
   auto pwm_outputs = c.pwm_outputs;
   if (c.observed_time_us < outputs_drive_from_) {

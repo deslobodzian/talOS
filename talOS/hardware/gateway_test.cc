@@ -1598,6 +1598,37 @@ TEST(Gateway, ACommandObservingTotalLossDrivesNoOutputAfterIt) {
             (PwmRequest{41, PwmMode::kPulse, 0.5}));
 }
 
+// A failed read pass is total loss whatever the samples show, and the Backend
+// contract lets Read return false with a sample still valid. A command
+// observing such a State must hold that motor once the loss clears, as it
+// holds the digital and PWM outputs: the hold may not depend on the backend
+// also marking every sample invalid.
+// REQ-SAFE-22
+TEST(Gateway, ACommandObservingAFailedReadHoldsAValidMotor) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.read_fails = true;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  ASSERT_TRUE(g.snapshot().motors[0].valid);
+  const auto during = Request(g);
+  backend.read_fails = false;
+  g.Tick(11000, true);
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  ASSERT_EQ(g.snapshot().epoch, during.epoch);
+  ASSERT_TRUE(g.Accept(during, 1, 11000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kNeutral) << "motor " << request.id;
+  }
+
+  ASSERT_TRUE(g.Accept(Request(g), 2, 11000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kVelocity) << "motor " << request.id;
+    EXPECT_EQ(request.demand, 1) << "motor " << request.id;
+  }
+}
+
 // Total loss is judged on the State as published, the gateway's masks
 // included: a follower of an invalid master, or the motor a reset CANcoder
 // feeds, counts as lost though the backend reads it valid. With such a pair as
