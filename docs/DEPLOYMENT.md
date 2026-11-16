@@ -174,8 +174,10 @@ A relative `--prefix` is resolved against the working directory.
   retains `previous`, and atomically replaces `current` using a temporary
   sibling symlink and rename (Linux and macOS). This selects the next bundle;
   restart the service to activate it. A bundle whose graph the launcher
-  refuses is not installed: its copy is removed and `current` and `previous`
-  stay as they were. A `talos_bundle` holds no symlinks, but a bundle Bazel's
+  refuses, or whose install fails after the copy (a copy without an
+  executable `run.sh`, a graph check that cannot create its temporary
+  directory), is not installed: its copy is removed and `current` and
+  `previous` stay as they were. A `talos_bundle` holds no symlinks, but a bundle Bazel's
   sandbox staged, or one copied with its links, is a tree of links into a
   build tree, which would dangle after a `bazel clean`: install copies a
   link whose target leaves the bundle (an absolute target, a relative one

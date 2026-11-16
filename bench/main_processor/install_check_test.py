@@ -278,6 +278,47 @@ class InstallCheckTest(unittest.TestCase):
                                        msg="the copy outlived deploy.sh"):
                     os.kill(copier, 0)
 
+    # REQ-OPS-48: an install that fails after its copy, before it selects,
+    # removes the copy as a refused bundle does, so no stray bundles/<stamp>
+    # is left for prune to count: a copy whose run.sh is not executable (a
+    # `cp` first on PATH copies, then clears it), and a graph check that
+    # cannot create its temporary directory (a failing `mktemp`).
+    def test_an_install_failing_after_its_copy_removes_it(self):
+        real_cp = shutil.which("cp")
+        fakes = {
+            "run_sh": ("cp", f'#!/bin/sh\n"{real_cp}" "$@" || exit\n'
+                       'chmod a-x "$3/run.sh"\n'),
+            "mktemp": ("mktemp", "#!/bin/sh\nexit 1\n"),
+        }
+        for case, (program, script) in fakes.items():
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                    ignore_cleanup_errors=True) as tmp:
+                src = os.path.join(tmp, "bundle")
+                os.makedirs(src)
+                with open(os.path.join(src, "run.sh"), "w",
+                          encoding="utf-8") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(os.path.join(src, "run.sh"), 0o755)
+                fake = os.path.join(tmp, "fake")
+                os.makedirs(fake)
+                with open(os.path.join(fake, program), "w",
+                          encoding="utf-8") as f:
+                    f.write(script)
+                os.chmod(os.path.join(fake, program), 0o755)
+                prefix = os.path.join(tmp, "prefix")
+                proc = subprocess.run(
+                    ["bash", deploy_script(), "install", src, "--prefix",
+                     prefix, "--no-warm-up"],
+                    env=dict(os.environ,
+                             PATH=fake + os.pathsep + os.environ["PATH"]),
+                    capture_output=True, text=True, timeout=60)
+                out = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, out)
+                self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
+                                 [], out)
+                self.assertFalse(os.path.lexists(
+                    os.path.join(prefix, "current")), out)
+
 
 if __name__ == "__main__":
     unittest.main()
