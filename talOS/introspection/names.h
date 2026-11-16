@@ -496,6 +496,17 @@ inline std::string JoinTargetLane(std::string_view subsystem,
 }
 }  // namespace detail
 
+// Whether an observer (kSourceFlagObserver: telemetry) alone reads `topic` by
+// design: its role is one its owner publishes (kOwnerPublishedRoles: state,
+// status, event, telemetry). Nothing acts on an instruction (target, request,
+// command) an observer only records. LintGraph's "is read only by observers"
+// warning and Studio's topic health both apply this one test.
+inline bool ObserverReads(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() >= 2 &&
+         detail::OneOf(kOwnerPublishedRoles, segments[1]);
+}
+
 // Whether `topic` is in the hardware request namespace: `/hw/request` or any
 // topic below it, well formed or not. Only a node's devices-layer flush
 // writes there (detail::NodeAccess::add_hardware_request); the generic
@@ -812,7 +823,7 @@ inline std::vector<Diagnostic> LintGraph(
       add(Severity::WARNING, topic.name,
           "is published but nothing subscribes to it");
     } else if (!topic.exempt && topic.readers.empty() &&
-               !detail::OneOf(kOwnerPublishedRoles, role)) {
+               !ObserverReads(topic.name)) {
       add(Severity::WARNING, topic.name,
           "is read only by observers (telemetry); nothing acts on a '" + role +
               "' topic, so its reader is missing or subscribes to a "
