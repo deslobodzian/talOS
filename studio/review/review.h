@@ -15,11 +15,16 @@
 //       channel's level, studio::AlertLevelName; stream_id "0")
 //   GET /review/<id>/bounds.json
 //       {"start_ns","end_ns","origin_wall_ns","max_series_values",
-//        "max_series_channels","hardware_not_decoded"}: the two max_ ones,
-//       plain numbers, are kMaxSeriesValues and kMaxSeriesChannels, which a
-//       client splits its series requests by; hardware_not_decoded is null,
-//       or log_dump's line for a session whose hardware packets are not
-//       served (Session::hardware_not_decoded)
+//        "max_series_channels","hardware_not_decoded","gaps"}: the two max_
+//       ones, plain numbers, are kMaxSeriesValues and kMaxSeriesChannels,
+//       which a client splits its series requests by; hardware_not_decoded
+//       is null, or log_dump's line for a session whose hardware packets
+//       are not served (Session::hardware_not_decoded); gaps, always
+//       present, lists every GAP record (Session::gaps, in its order) as
+//       {"process","start_ns","end_ns","records","dispatches","sends",
+//       "closed_at_flush"}: records, dispatches and sends plain numbers,
+//       closed_at_flush true for a gap the writer's stop closed; the
+//       session's start_ns..end_ns covers every gap's span
 //       wall time of a session time t_ns is origin_wall_ns + t_ns
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}

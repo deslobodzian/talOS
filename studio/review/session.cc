@@ -195,6 +195,20 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       file = it->second;
     }
     LogFile& log_file = session->files_[file];
+    if (const auto gap = tlog::GapOf(r.header, r.payload)) {
+      // No checkpoint and no value: only its span, in the bounds too.
+      session->gaps_.push_back(
+          {gap->start_ns, gap->resumed_ns, gap->detail.records,
+           gap->detail.dispatches, gap->detail.sends,
+           static_cast<std::uint32_t>(file),
+           (gap->detail.flags & tlog::GAP_CLOSED_AT_FLUSH) != 0});
+      const std::int64_t low = std::min(gap->start_ns, gap->resumed_ns);
+      const std::int64_t high = std::max(gap->start_ns, gap->resumed_ns);
+      if (!any || low < session->start_ns_) session->start_ns_ = low;
+      if (!any || high > session->end_ns_) session->end_ns_ = high;
+      any = true;
+      return true;
+    }
     const std::int64_t event_ns = r.header.event_time_ns;
     const std::int64_t second = FloorSecond(event_ns);
     if (log_file.checkpoints.empty() ||
@@ -248,6 +262,14 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     throw std::runtime_error(error);
   }
   if (!any) throw std::runtime_error("no records in " + dir.string());
+  std::stable_sort(session->gaps_.begin(), session->gaps_.end(),
+                   [&files = session->files_](const Gap& a, const Gap& b) {
+                     if (a.start_ns != b.start_ns) {
+                       return a.start_ns < b.start_ns;
+                     }
+                     return files[a.file].process < files[b.file].process;
+                   });
+  session->gaps_.shrink_to_fit();
   if (protocol.foreign()) {
     constexpr std::string_view kWarning = "warning: ";
     session->hardware_not_decoded_ = protocol.Warning().substr(kWarning.size());
@@ -364,7 +386,7 @@ std::size_t Session::log_seconds() const {
 }
 
 std::size_t Session::index_bytes() const {
-  return log_seconds() * sizeof(Checkpoint);
+  return log_seconds() * sizeof(Checkpoint) + gaps_.size() * sizeof(Gap);
 }
 
 bool Session::Decode(const Topic& topic, std::span<const std::byte> payload,

@@ -16,8 +16,12 @@
 // event time that holds a record: where that second's first record starts
 // (an offset meaningful only with its file's path) and which of the file's
 // sources recorded a value (an accepted SEND or a MESSAGE record) that
-// second. That is 24 B per log-file second whatever the record rate, and
-// nothing per record: every later read seeks to a checkpoint
+// second, and per GAP record one Gap. That is 24 B per log-file second
+// whatever the record rate, plus 48 B per gap, and nothing per record: a
+// GAP record makes no checkpoint and holds no value, so a read finds in a
+// gap's span only what the log holds there (nothing of the process that
+// dropped it), as for any stretch a topic was not published. Every later
+// read seeks to a checkpoint
 // (event::log::VisitLog's start_offset) and reads only the seconds it needs,
 // through one window.
 //
@@ -75,6 +79,24 @@ struct Checkpoint {
   std::uint64_t sources{0};
 };
 static_assert(sizeof(Checkpoint) == 24, "REQ-OPS-42: 24 B per log-file second");
+
+// One GAP record of a log file (talOS/events/log/format.h): where its writer
+// dropped records. start_ns and end_ns are its LogGap's start_ns and
+// resumed_ns: every record it dropped named a time in [start_ns, end_ns],
+// and end_ns is when capture resumed, or, for one closed at the stop, when
+// the writer was stopped. The counts are its GapRecord's (zero for a GAP
+// whose payload is not one, which no writer makes). 48 B, beside the
+// checkpoints (REQ-OPS-42).
+struct Gap {
+  std::int64_t start_ns{0};
+  std::int64_t end_ns{0};
+  std::uint64_t records{0};
+  std::uint64_t dispatches{0};
+  std::uint64_t sends{0};
+  std::uint32_t file{0};  // index into Session::files()
+  bool closed_at_flush{false};
+};
+static_assert(sizeof(Gap) == 48, "REQ-OPS-42: 48 B per GAP record");
 
 struct LogFile {
   std::string path;
@@ -150,7 +172,9 @@ class Session {
   // printed as log_dump prints it.
   static std::unique_ptr<Session> Open(const std::filesystem::path& dir);
 
-  // The earliest and latest event time of any record.
+  // The earliest and latest event time of any record, and the start and
+  // end of any gap: a gap's span is time its process ran, though its log
+  // holds no record of it.
   std::int64_t start_ns() const { return start_ns_; }
   std::int64_t end_ns() const { return end_ns_; }
   // The wall clock at zero on the session's clock, so a time t_ns is at
@@ -160,6 +184,10 @@ class Session {
   std::int64_t origin_wall_ns() const { return origin_wall_ns_; }
 
   const std::vector<LogFile>& files() const { return files_; }
+  // Every intact GAP record of the session, by start, then process, then
+  // the merge's order. A damaged one is damage (read and warned about as
+  // log_dump does) and is not listed.
+  const std::vector<Gap>& gaps() const { return gaps_; }
   const std::vector<Topic>& topics() const { return topics_; }
   const talos::telemetry::Channel& channel(ChannelRef ref) const {
     return topics_[ref.topic].channels[ref.channel];
@@ -173,7 +201,7 @@ class Session {
     return hardware_not_decoded_;
   }
 
-  // The index's checkpoints: what grows with the session's length.
+  // The index's checkpoints and gaps: what grows with the session's length.
   std::size_t index_bytes() const;
   std::size_t log_seconds() const;
 
@@ -204,6 +232,7 @@ class Session {
               std::vector<std::uint8_t>& present) const;
 
   std::vector<LogFile> files_;
+  std::vector<Gap> gaps_;
   std::vector<Topic> topics_;
   std::unordered_map<std::string, ChannelRef> by_name_;
   // Per hardware topic: channel name -> index.

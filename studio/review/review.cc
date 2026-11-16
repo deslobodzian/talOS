@@ -373,7 +373,23 @@ Response Review::Bounds(const Session& session) const {
   } else {
     AppendEscaped(out, session.hardware_not_decoded());
   }
-  out += '}';
+  out += ",\"gaps\":[";
+  for (const Gap& gap : session.gaps()) {
+    if (out.back() != '[') out += ',';
+    out += "{\"process\":";
+    AppendEscaped(out, session.files()[gap.file].process);
+    out += ",\"start_ns\":";
+    AppendI64(out, gap.start_ns);
+    out += ",\"end_ns\":";
+    AppendI64(out, gap.end_ns);
+    out += ",\"records\":" + std::to_string(gap.records);
+    out += ",\"dispatches\":" + std::to_string(gap.dispatches);
+    out += ",\"sends\":" + std::to_string(gap.sends);
+    out += ",\"closed_at_flush\":";
+    out += gap.closed_at_flush ? "true" : "false";
+    out += '}';
+  }
+  out += "]}";
   return {200, "application/json", std::move(out)};
 }
 
