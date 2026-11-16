@@ -1887,3 +1887,37 @@ TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
     EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut") << why;
   }
 }
+
+class PhoenixBackendPeakVoltage : public PhoenixBackendTorque {};
+
+// The TalonFX's peak voltage, which holds every voltage-based request
+// (VoltageOut, VelocityVoltage, PositionVoltage, MotionMagicVoltage) to
+// max_voltage on the device: configured at ±max_voltage, and applied again
+// by the restore after a reset returned the device to Phoenix's defaults.
+// REQ-SAFE-44
+TEST_F(PhoenixBackendPeakVoltage, IsMaxVoltageAfterConfigureAndRestore) {
+  EnsureHal();
+  hw::Config config;
+  auto motor = TestMotor(1, "roller", 1);
+  motor.max_voltage = 2.0;
+  config.motors.push_back(motor);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+
+  const ctre::phoenix6::configs::TalonFXConfiguration defaults;
+  ASSERT_TRUE(AwaitAnswer([&] {
+                return Motor(backend, 0).GetConfigurator().Apply(defaults);
+              }).IsOK());
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  ASSERT_NE(applied.Voltage.PeakForwardVoltage.value(), 2.0) << "not reset";
+  const std::array<uint16_t, 1> ids{1};
+  ASSERT_TRUE(RestorePass(backend, ids));
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakForwardVoltage.value(), 2.0);
+  EXPECT_DOUBLE_EQ(applied.Voltage.PeakReverseVoltage.value(), -2.0);
+}
