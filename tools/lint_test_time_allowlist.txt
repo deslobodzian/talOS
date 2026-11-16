@@ -8,8 +8,8 @@
 # or none (delete the line), so the list only shrinks.
 
 controller_processor/rio/src/test/cpp/ConfigStore_test.cpp clock 6 integration: the config saver's real thread; steady_clock deadlines only bound a hang (TESTING.md §6.3)
-controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock 30 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
-controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep 9 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
+controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp clock 33 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads poll its status frames until a 10 s deadline that bounds a hang
+controller_processor/rio/src/test/cpp/PhoenixBackend_test.cpp sleep 10 integration: CTRE's Phoenix 6 simulator advances on the real clock; reads are paced 10 ms apart as PumpReads paces them
 controller_processor/rio/src/test/cpp/RioLog_test.cpp clock 2 integration: the logger's real thread held in a blocked write; the elapsed bound shows a burst of posts did not wait for it
 bench/main_processor/simulation/soak_test.py clock 4 soak: injected kills and stalls on the real clock (TESTING.md §2)
 bench/main_processor/simulation/soak_test.py sleep 4 soak: injected kills and stalls on the real clock (TESTING.md §2)
