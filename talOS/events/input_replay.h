@@ -125,9 +125,11 @@ struct RecordedMessage {
 // is judged by them. Each topic notes the first such log it is fed from
 // (refused_log), which ReplayInputs refuses, as it does a damaged stretch
 // that nothing bounds. The replayed program's run start is read from its
-// first run's log: one whose first segment the byte cap deleted lost the
-// firing it is read from, and ReplayInputs refuses it
-// (run_start_refused_log), fed topic or not. The manifest is
+// first run's log: one whose first segment was not read (the byte cap
+// deleted it, or its header is incomplete) may have lost the firing it is
+// read from, as may one with a segment missing or unread before its first
+// firing read, and ReplayInputs refuses it (run_start_refused_log), fed
+// topic or not. The manifest is
 // `manifest.json` in the directory holding the logs
 // (talOS/launcher/README.md, "Session manifest"), used when its session_id
 // is the logs'; it names a member's logs by the paths they were recorded at
@@ -159,23 +161,26 @@ class RecordedSession {
   // Where the replayed program's loop starts (SimulatedEventLoop::Options):
   // its first recorded run's loop origin, and the instant that run's loop
   // began running, which its construction put after the origin (the first
-  // timer firing's deadline minus its manifest offset; the origin when it
-  // had no timer). For a program the session did not log, start() for both.
+  // timer firing's deadline minus its manifest offset, in whichever segment
+  // of that run's log holds it; the origin when it had no timer, or none
+  // fired). For a program the session did not log, start() for both.
   // Where the replay ends: the latest time the program's own logs recorded
   // (its exit), or end().
   MonotonicTime loop_start() const { return loop_start_; }
   MonotonicTime run_start() const { return run_start_; }
   MonotonicTime loop_end() const { return loop_end_; }
 
-  // The file of the replayed program's first run's log its run start would
-  // be read from, when that log's manifest arms a timer and the byte cap
-  // deleted its first segment (log::LogSegmentPath(log, 0); a rotated log
-  // keeps its later ones), and why, naming the sign: its `<log>.capped`
-  // marker, the session manifest's `log_capped`, or else only that the
-  // segment is gone. The run start's firing
-  // was in that segment; the oldest kept one's first firing may be whole
-  // periods later, so ReplayInputs refuses the log, whatever it feeds.
-  // Empty when none.
+  // When the replayed program's first run's log arms a timer: the first
+  // file of it read, when that is not its first segment
+  // (log::LogSegmentPath(log, 0); a rotated log keeps its later ones) nor
+  // the log of a run never rotated, and why, naming the sign: that segment's
+  // incomplete header, the log's `<log>.capped` marker, the session
+  // manifest's `log_capped`, or else only that the segment is gone; or the
+  // first file read that does not continue the segment before it (one
+  // between them missing or unread) while no firing was read before it. The
+  // run start's firing may have been in the segment not read; a later one's
+  // first firing may be whole periods later, so ReplayInputs refuses the
+  // log, whatever it feeds. Empty when none.
   const std::string& run_start_refused_log() const {
     return run_start_refused_log_;
   }

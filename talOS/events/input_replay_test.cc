@@ -8,10 +8,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1424,8 +1426,191 @@ TEST(InputReplay, OneFileOfARotatedLogReadsTheWholeLog) {
     EXPECT_FALSE(report.stopped_at_gap.has_value());
     EXPECT_EQ(TimerFirings(out + "/ticker.tlog"), live);
   }
+  EXPECT_EQ(
+      RecordedSession(dir + "//ticker.segment1.tlog", "ticker").log_paths(),
+      log::LogSegmentFiles(path));
   std::filesystem::remove_all(dir);
   std::filesystem::remove_all(out);
+}
+
+// The deadline of every timer firing in every kept file of the log at
+// `path`, oldest segment first.
+std::vector<std::int64_t> LogTimerFirings(const std::string& path) {
+  std::vector<std::int64_t> firings;
+  for (const std::string& file : log::LogSegmentFiles(path)) {
+    const std::vector<std::int64_t> more = TimerFirings(file);
+    firings.insert(firings.end(), more.begin(), more.end());
+  }
+  return firings;
+}
+
+// Reads the sensor, and ticks every millisecond from 20 ms into its run;
+// given `rearm`, its first reading re-arms the tick to `rearm` after it.
+class SlowTicker {
+ public:
+  explicit SlowTicker(Loop& loop, std::optional<Duration> rearm = {})
+      : tick_{make_timer<&SlowTicker::on_tick>(loop, "tick", this)},
+        rearm_{rearm} {
+    watch<EventsTest::SensorMessage, &SlowTicker::on_sensor>(
+        loop, kTopics.sensor, this);
+    tick_.setup_periodic(loop.monotonic_now() + 20ms, 1ms);
+  }
+
+ private:
+  void on_tick(const Context&) {}
+  void on_sensor(const Context& context, const EventsTest::SensorMessage&) {
+    if (rearm_) tick_.setup_periodic(context.now + *rearm_, 1ms);
+    rearm_.reset();
+  }
+
+  Timer<Loop> tick_;
+  std::optional<Duration> rearm_;
+};
+
+// Records the producer to kSessionMs and a SlowTicker (`slow`), its run
+// starting kLateRun after the origin, to `exit`, into `dir`.
+void RecordSlowTicker(const std::string& dir, MonotonicTime exit,
+                      std::optional<Duration> rearm = {}) {
+  SimulationEnvironment environment;
+  Loop producer_loop{environment,
+                     log::LogWriter{dir + "/producer.tlog", "producer"},
+                     Loop::Options{.start = kOrigin}};
+  Loop slow_loop{
+      environment, log::LogWriter{dir + "/slow.tlog", "slow"},
+      Loop::Options{.start = kOrigin, .run_start = kOrigin + kLateRun}};
+  const Producer producer{producer_loop};
+  SlowTicker slow{slow_loop, rearm};
+  for (int ms = 1; ms <= kSessionMs; ++ms) {
+    const MonotonicTime now = kOrigin + std::chrono::milliseconds{ms};
+    producer_loop.run_until(now);
+    if (now <= exit) slow_loop.run_until(now);
+  }
+  producer_loop.finish();
+  slow_loop.finish();
+}
+
+// Replays `slow` from the session in `dir` into `out`/slow.tlog: what
+// ReplayInputs throws, or none.
+std::optional<std::string> ReplaySlowTicker(
+    const std::string& dir, const std::string& out,
+    std::optional<Duration> rearm = {}) {
+  const RecordedSession session{dir, "slow"};
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/slow.tlog", "slow"},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
+  SlowTicker slow{loop, rearm};
+  try {
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+  } catch (const ReplayError& e) {
+    EXPECT_EQ(loop.dispatch_count(), 0u);
+    return e.what();
+  }
+  return std::nullopt;
+}
+
+// Zero-fills the file header of the log file at `path`, as a crash while
+// it was being created leaves one: a reader skips the file.
+void ZeroFileHeader(const std::string& path) {
+  std::fstream file{path, std::ios::binary | std::ios::in | std::ios::out};
+  const std::array<char, sizeof(log::FileHeader::magic)> zeros{};
+  file.write(zeros.data(), zeros.size());
+}
+
+// A replayed program's run start is read from its first timer firing, in
+// whichever segment of its first run's log holds it: a byte cap that
+// rotated the log before that firing (the program drained inputs first)
+// leaves its first segment with none, and the run start is not the
+// origin, but the first firing's deadline less its offset, so its timers
+// replay at their live deadlines. A timer the run re-armed before its
+// first firing gives no run start, in a later segment too (each repeats
+// the log's manifest). Only a log read from its first segment on, each
+// segment continuing the one before it, proves which firing is first: one
+// whose first segment, or a segment before the first firing read, could
+// not be read is refused, naming the file. A run that exited before its
+// first deadline has no firing in any segment: its run start is its
+// origin, and it is fed what it received, firing nothing.
+// REQ-OPS-14
+TEST(InputReplay, ARunStartIsReadFromTheFirstSegmentWithAFiring) {
+  {
+    SCOPED_TRACE("its first firing in its second segment");
+    const std::string dir = TempDir("late_firing");
+    const std::string out = TempDir("late_firing_out");
+    RecordSlowTicker(dir, kOrigin + std::chrono::milliseconds{kSessionMs});
+    const std::string path = dir + "/slow.tlog";
+    const std::vector<std::int64_t> live = TimerFirings(path);
+    ASSERT_FALSE(live.empty());
+    RotateAt(path, {kOrigin + 15ms, kOrigin + 40ms});
+    ASSERT_TRUE(TimerFirings(log::LogSegmentPath(path, 0)).empty());
+    ASSERT_EQ(LogTimerFirings(path), live);
+    EXPECT_EQ(ReplaySlowTicker(dir, out), std::nullopt);
+    EXPECT_EQ(TimerFirings(out + "/slow.tlog"), live);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("re-armed in its first segment, fired in its second");
+    const std::string dir = TempDir("rearmed_firing");
+    const std::string out = TempDir("rearmed_firing_out");
+    RecordSlowTicker(dir, kOrigin + std::chrono::milliseconds{kSessionMs},
+                     30ms);
+    const std::string path = dir + "/slow.tlog";
+    const std::vector<std::int64_t> live = TimerFirings(path);
+    ASSERT_FALSE(live.empty());
+    RotateAt(path, {kOrigin + 15ms});
+    ASSERT_TRUE(TimerFirings(log::LogSegmentPath(path, 0)).empty());
+    EXPECT_EQ(ReplaySlowTicker(dir, out, 30ms), std::nullopt);
+    EXPECT_EQ(TimerFirings(out + "/slow.tlog"), live);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("its first segment's header incomplete");
+    const std::string dir = TempDir("head_unread");
+    const std::string out = TempDir("head_unread_out");
+    RecordSlowTicker(dir, kOrigin + std::chrono::milliseconds{kSessionMs});
+    const std::string path = dir + "/slow.tlog";
+    RotateAt(path, {kOrigin + 30ms, kOrigin + 45ms});
+    ZeroFileHeader(log::LogSegmentPath(path, 0));
+    const std::optional<std::string> refused = ReplaySlowTicker(dir, out);
+    EXPECT_NE(refused.value_or("").find(log::LogSegmentPath(path, 0)),
+              std::string::npos)
+        << refused.value_or("replayed, not refused");
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("the segment holding its first firing unread");
+    const std::string dir = TempDir("first_firing_unread");
+    const std::string out = TempDir("first_firing_unread_out");
+    RecordSlowTicker(dir, kOrigin + std::chrono::milliseconds{kSessionMs});
+    const std::string path = dir + "/slow.tlog";
+    RotateAt(path, {kOrigin + 15ms, kOrigin + 30ms, kOrigin + 45ms});
+    ASSERT_TRUE(TimerFirings(log::LogSegmentPath(path, 0)).empty());
+    ASSERT_FALSE(TimerFirings(log::LogSegmentPath(path, 1)).empty());
+    ZeroFileHeader(log::LogSegmentPath(path, 1));
+    const std::optional<std::string> refused = ReplaySlowTicker(dir, out);
+    EXPECT_NE(refused.value_or("").find(log::LogSegmentPath(path, 2)),
+              std::string::npos)
+        << refused.value_or("replayed, not refused");
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("exited before its first deadline");
+    const std::string dir = TempDir("no_firing");
+    const std::string out = TempDir("no_firing_out");
+    RecordSlowTicker(dir, kOrigin + 18ms);
+    const std::string path = dir + "/slow.tlog";
+    ASSERT_TRUE(TimerFirings(path).empty());
+    RotateAt(path, {kOrigin + 10ms});
+    EXPECT_EQ(RecordedSession(dir, "slow").run_start(), kOrigin);
+    EXPECT_EQ(ReplaySlowTicker(dir, out), std::nullopt);
+    EXPECT_TRUE(TimerFirings(out + "/slow.tlog").empty());
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
 }
 
 // Closes this process's descriptor of the file at `path`, as a disk that

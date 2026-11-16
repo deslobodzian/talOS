@@ -350,8 +350,9 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   loop's schedule counts from when its `run()` began, after construction
   (`RealtimeEventLoop`), so the loop starts at its first run's origin
   (`loop_start()`) with its run starting where that run's did (`run_start()`:
-  its first timer firing's deadline minus the timer's manifest offset): its
-  timers fire at the recorded deadlines. A topic it watched live is fed from
+  its first timer firing's deadline minus the timer's manifest offset, in
+  whichever segment of that run's log holds it, or the origin when no timer
+  fired): its timers fire at the recorded deadlines. A topic it watched live is fed from
   its own receipts alone, each at the drain that delivered it live (its
   `MESSAGE` record's event time), with its recorded publication time; the
   replayed drain runs at its deadline, without the live loop's wake-up
@@ -434,13 +435,15 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   `ReplayError` before anything runs, naming the log, the sign and the topic;
   a node binary prints it and exits 1. The replayed program's own first
   run's log is refused the same way, fed topic or not, when its manifest
-  arms a timer and the byte cap deleted its first segment
-  (`<stem>.segment0.tlog`): the firing `run_start()` is read from was there,
-  and the oldest kept segment's first firing may be whole periods later
-  (`RecordedSession::run_start_refused_log`, naming the file it would be
-  read from and the `.capped` marker or `log_capped`). A capped log that
-  kept its first segment (capture stopped at the cap) still gives the run
-  start. `RecordedSession` reads the
+  arms a timer and its first segment (`<stem>.segment0.tlog`) was not read
+  (the byte cap deleted it, or its header is incomplete), or a segment
+  before the first firing read is missing or unreadable: the firing
+  `run_start()` is read from may have been there, and a later segment's
+  first firing may be whole periods later
+  (`RecordedSession::run_start_refused_log`, naming the first file read, or
+  the one that does not continue the segment before it, and the sign). A
+  capped log that kept its first segment (capture stopped at the cap) still
+  gives the run start. `RecordedSession` reads the
   `manifest.json` in the directory holding the logs when its `session_id` is
   the logs', and matches a member's `log_paths` to the logs by file name, so
   a session copied elsewhere still matches; logs without one (outside a
