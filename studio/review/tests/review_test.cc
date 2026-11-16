@@ -4,6 +4,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -35,6 +36,7 @@
 #include "talOS/events/context.h"
 #include "talOS/events/log/format.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/protocol/types.h"
 
 namespace studio::review {
 namespace {
@@ -552,6 +554,53 @@ TEST_F(ReviewTest, UnknownLogVersionIsRefusedNamingFileAndVersions) {
               std::string::npos)
         << response.body;
   }
+  std::filesystem::remove_all(dir);
+}
+
+// Guards: a session recorded under another hardware protocol (its manifest
+// says so, though every packet decodes under this build) serves no hardware
+// channel, the Driver Station's included, while its schema'd topics are
+// served; bounds.json carries log_dump's line naming both versions, and the
+// fixture session, of this build's protocol, carries null.
+// REQ-OPS-41
+TEST_F(ReviewTest, SessionOfAnotherHardwareProtocolServesNoHardwareChannel) {
+  const std::string dir = Library() + "/older";
+  testing::WriteFixtureSession(dir);
+  const std::uint16_t other = talos::protocol::kProtocolVersion - 1;
+  {
+    std::ifstream in{dir + "/manifest.json"};
+    std::string text{std::istreambuf_iterator<char>{in}, {}};
+    text.insert(
+        1, "\n  \"hardware_protocol_version\": " + std::to_string(other) + ",");
+    std::ofstream{dir + "/manifest.json"} << text;
+  }
+  Review review{Library(), 1u << 20};
+  const Response channels = review.Get("/review/older/channels.json", "");
+  ASSERT_EQ(channels.status, 200) << channels.body;
+  std::vector<std::string> names;
+  for (const auto& channel : json::parse(channels.body)["channels"]) {
+    names.push_back(channel["name"]);
+  }
+  EXPECT_EQ(std::count_if(names.begin(), names.end(),
+                          [](const std::string& name) {
+                            return name.starts_with("hw/");
+                          }),
+            0);
+  EXPECT_EQ(std::count(names.begin(), names.end(), "shooter/state/position_m"),
+            1);
+  const json bounds =
+      json::parse(review.Get("/review/older/bounds.json", "").body);
+  ASSERT_TRUE(bounds["hardware_not_decoded"].is_string()) << bounds;
+  const std::string line = bounds["hardware_not_decoded"];
+  for (const std::uint16_t version :
+       {other, talos::protocol::kProtocolVersion}) {
+    EXPECT_NE(line.find(" " + std::to_string(version)), std::string::npos)
+        << line;
+  }
+  EXPECT_TRUE(
+      json::parse(
+          review.Get("/review/s1/bounds.json", "").body)["hardware_not_decoded"]
+          .is_null());
   std::filesystem::remove_all(dir);
 }
 
