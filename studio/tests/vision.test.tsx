@@ -12,6 +12,7 @@ import {visionPanel} from '../src/panels/vision';
 import {
   acceptancePct,
   counterDelta,
+  fpsFromPeriod,
   latestValidPose,
   observationErrors,
   validObservationRate
@@ -37,6 +38,16 @@ test('counterDelta sums increments and ignores a reset', () => {
   // negative drop.
   assert.equal(counterDelta([100, 105, 2, 104]), 107);
   assert.equal(counterDelta([100, 50]), 0);
+});
+
+// A camera that has not timed a frame publishes a zero period; dividing by it
+// would show an infinite (or, for a negative or NaN period, a meaningless)
+// frame rate as a reading.
+test('fpsFromPeriod is the frame rate, or unknown for a period that is not one', () => {
+  assert.equal(fpsFromPeriod(20000), 50);
+  for (const period of [0, -20000, NaN, Infinity, null, undefined]) {
+    assert.equal(fpsFromPeriod(period), null, String(period));
+  }
 });
 
 test('latestValidPose walks back to the most recent current accepted pose', () => {
