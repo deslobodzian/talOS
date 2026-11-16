@@ -274,7 +274,7 @@ Python implementation. Omitting `--type position` generates a velocity
 mechanism, not an angle-controlled wrist. With `new_subsystem`, adding
 `--raw` to `--type position` writes the wrist's homing and limits in
 `wrist.h` itself instead of using the library
-([writing the arm yourself](../../docs/FIRST_MECHANISM.md#writing-the-arm-yourself));
+([writing the arm yourself](../../talOS/mechanisms/README.md#writing-the-arm-yourself));
 the rest of this section describes the library version.
 
 The generator writes `wrist/`:

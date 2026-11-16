@@ -600,7 +600,9 @@ summary() {
     fi
     return 1
   fi
-  printf '\nNext steps (from %s):\n' "$ROOT"
+  printf '\nNext steps, for a robot of your own (docs/FIRST_MECHANISM.md), from %s:\n' "$ROOT"
+  printf '  bazel run //tools:new_robot -- my_robot --standalone ../my_robot\n'
+  printf 'Working on talOS itself:\n'
   printf '  bazel build //...\n'
   printf '  bazel test //...\n'
   printf '  ./sim.sh --sim-gateway --no-studio\n'
