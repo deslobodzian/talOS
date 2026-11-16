@@ -14,8 +14,9 @@ stale within REQ-OPS-36's bound once the telemetry node stops.
 
 A reserved port another process takes first fails the startup at once,
 naming the member and the port, not after STARTUP_S
-(HeldHttpPortIsNamedAtOnce holds the bridge's port to prove it; it needs no
-browser). With no browser on the host the browser checks skip, naming why; with
+(HeldHttpPortIsNamedAtOnce holds the bridge's port to prove it), and a graph
+the launcher refuses fails it at once naming the refusal
+(RefusedGraphIsNamedAtOnce); neither needs a browser. With no browser on the host the browser checks skip, naming why; with
 TALOS_REQUIRE_BROWSER=1 that is a failure. A failed check leaves a
 screenshot and the failing elements (outerHTML and geometry) in the test's
 undeclared outputs and prints their paths.
@@ -31,6 +32,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
 import unittest
 import uuid
@@ -127,7 +129,7 @@ class Session:
     """The launched bench simulation with the Studio bridge on a free port,
     or on `http_port` when given."""
 
-    def __init__(self, root, tmp, http_port=None):
+    def __init__(self, root, tmp, http_port=None, config=None):
         self.output = tmp / "sessions"
         self.namespace = f"drive-browser-{uuid.uuid4().hex}"
         self.http_port, gw_port, bridge_port = free_ports(3)
@@ -148,7 +150,7 @@ class Session:
         (tmp / "bazel-bin").symlink_to(root, target_is_directory=True)
         self.log_path = tmp / "launcher.txt"
         self.log = self.log_path.open("w")
-        args = [str(root / "talOS/launcher/launcher"), "--config", str(root / CONFIG),
+        args = [str(root / "talOS/launcher/launcher"), "--config", str(config or root / CONFIG),
                 "--sim", "--start-sim-gateway", "--start-studio-bridge",
                 "--studio-http-port", str(self.http_port),
                 "--remote", "127.0.0.1", "--remote-port", str(gw_port),
@@ -167,6 +169,12 @@ class Session:
         self.stopped = False
         self.tmp = tmp
         self.dir = None
+        # The launcher's exit writes nothing wait_listening watches (its log
+        # is this process's open file), so a refused graph would wait out
+        # STARTUP_S: a helper waits for the exit and creates a file there.
+        exited = tmp / "launcher.exited"
+        threading.Thread(target=lambda: self.launcher.wait_exited(STARTUP_S)
+                         and exited.touch(), daemon=True).start()
 
     def wait_listening(self):
         """The session directory, once the bridge's log says it listens."""
@@ -178,7 +186,13 @@ class Session:
             if failure:
                 raise RuntimeError(failure)
             if self.launcher.exited():
-                raise RuntimeError("launcher exited during startup")
+                lines = [line.strip() for line in self.log_path.read_text(
+                    errors="replace").splitlines() if line.strip()]
+                # Its error lines, or else its last words (a refusal that
+                # says "cannot ..." without the word).
+                said = [line for line in lines if "error" in line] or lines[-3:]
+                raise RuntimeError("launcher exited during startup: " +
+                                   (" | ".join(said) or "it printed nothing"))
             for log in self.output.glob("*/studio_bridge.log"):
                 if f"listening {self.http_port}\n" in log.read_text(errors="replace"):
                     return log.parent
@@ -493,6 +507,55 @@ class HeldHttpPortIsNamedAtOnce(unittest.TestCase):
             print(f"held port {port}: {raised.exception}", flush=True)
             self.assertIn("studio_bridge", str(raised.exception))
             self.assertIn(str(port), str(raised.exception))
+        except BaseException:
+            if session is not None:
+                print("--- launcher.txt (tail)\n" + session.log_path.read_text(
+                    errors="replace")[-4000:], flush=True)
+            raise
+        finally:
+            if session is not None:
+                _stop(session.stop)
+            (tmp / "bazel-bin").unlink(missing_ok=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def refused_config(root, tmp):
+    """This target's graph with a key no node reads in the motor's file, which
+    the launcher refuses as a graph error (talOS/launcher/README.md,
+    "Parameter keys"). Returns the config's path."""
+    browser = root / CONFIG
+    here = browser.parent
+    bench = "../../../bench/main_processor/configuration/"
+    motor = (here / bench / "subsystems/motor_py.toml").resolve()
+    text = browser.read_text()
+    for relative, absolute in ((bench + "robot.toml", here / bench / "robot.toml"),
+                               ("dashboard.toml", here / "dashboard.toml"),
+                               (bench + "subsystems/motor_py.toml", tmp / "motor.toml")):
+        text = text.replace(f'"{relative}"', f'"{Path(absolute).resolve()}"')
+    (tmp / "motor.toml").write_text(
+        motor.read_text().replace('defaults = "motor.toml"',
+                                  f'defaults = "{motor.parent / "motor.toml"}"')
+        + "\n[unread]\nvalue_m = 1.0\n")
+    (tmp / "robot.toml").write_text(text)
+    return tmp / "robot.toml"
+
+
+# REQ-OPS-36, as HeldHttpPortIsNamedAtOnce. Needs no browser.
+class RefusedGraphIsNamedAtOnce(unittest.TestCase):
+    """The launcher refuses the graph and exits before any member starts, so
+    no member log ever appears and its exit writes nothing the wait watches:
+    the wait must still end on that exit, naming the launcher's refusal, not
+    wait out STARTUP_S for a listening line."""
+
+    def test_a_refused_graph_fails_the_wait_naming_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="refused-", dir=os.environ.get("TEST_TMPDIR")))
+        session = None
+        try:
+            session = Session(workspace(), tmp, config=refused_config(workspace(), tmp))
+            with self.assertRaises(RuntimeError) as raised:
+                session.wait_listening()
+            print(f"refused graph: {raised.exception}", flush=True)
+            self.assertIn("unread.value_m", str(raised.exception))
         except BaseException:
             if session is not None:
                 print("--- launcher.txt (tail)\n" + session.log_path.read_text(
