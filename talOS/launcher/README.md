@@ -1398,7 +1398,13 @@ first). Every log is read through a fixed window (`WindowedLogReader`), never
 whole, so memory grows with the number of logs, not with their length. Each
 mode reads the session twice: once for the earliest event time every printed
 time is relative to and for the record count, printing the gap and damage
-warnings then, before any output; once to print. On a generated 210 MiB session (8
+warnings then, before any output; once to print. That baseline is the
+inputs' own: a log file named alone is timed from its first kept record, so
+its times are not session-relative; name the session directory (with
+`--node` to keep the one process) for times from the session's earliest
+record. The text dump names the baseline under its file list
+(`times: ms after event time <ns> ns, the earliest record of these logs`),
+so two dumps' baselines can be compared. On a generated 210 MiB session (8
 logs, 1.72 million 128-byte records; `bazel run -c opt
 //talOS/launcher:log_memory_bench`, Linux x86-64) `log_dump`'s peak resident
 memory is 5.6 MiB, text or JSONL, where reading every log whole and holding
