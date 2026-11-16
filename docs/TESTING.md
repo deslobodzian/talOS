@@ -179,7 +179,10 @@ Where RULES.md 12 is read too broadly or too narrowly:
    never sleep, read `steady_clock::now` or `time.time`, or wait on a real
    timer. Nodes use `node.now()`; `Sim` owns time. **[enforced:
    `tools/lint_test_time.py` over every test source, Studio's TypeScript
-   tests included (`setTimeout`, `Date.now`, `performance.now`); a test of
+   tests included (`setTimeout`, `Date.now`, `performance.now`), and the
+   test helpers they include (`*_test_support`, `*_test_helpers`,
+   `*_testing`, the `testing` Sim headers and module, headers under a
+   `testdata` directory); a test of
    a higher tier that uses the real clock is listed with its reason and its
    number of hit lines, which may only shrink, in
    `tools/lint_test_time_allowlist.txt`]**
