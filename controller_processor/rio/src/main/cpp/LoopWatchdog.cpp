@@ -50,13 +50,39 @@ void LoopWatchdog::Poll(uint64_t now_us) {
       static_cast<unsigned long long>((now_us - deadline) / 1000),
       neutral ? "neutralized" : "could not reach (retrying)",
       static_cast<unsigned long long>(stall));
-  outputs_.Report(text);
+  Queue(text);
+}
+
+void LoopWatchdog::Queue(const char* text) {
+  const uint64_t head = report_head_.load(std::memory_order_relaxed);
+  if (head - report_tail_.load(std::memory_order_acquire) >= kReportSlots) {
+    dropped_reports_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  auto& slot = reports_[head % kReportSlots];
+  // Truncating, like the poll's own formatting on this thread.
+  std::snprintf(slot.data(), slot.size(), "%s", text);
+  report_head_.store(head + 1, std::memory_order_release);
+}
+
+void LoopWatchdog::DeliverReports() {
+  uint64_t tail = report_tail_.load(std::memory_order_relaxed);
+  const uint64_t head = report_head_.load(std::memory_order_acquire);
+  for (; tail != head; ++tail) {
+    outputs_.Report(reports_[tail % kReportSlots].data());
+    // Frees the slot for the watchdog thread only after the report.
+    report_tail_.store(tail + 1, std::memory_order_release);
+  }
 }
 
 void LoopWatchdog::Start(std::function<uint64_t()> clock,
                          int realtime_priority) {
   if (thread_.joinable()) return;
   stop_.store(false, std::memory_order_relaxed);
+  stop_reporter_.store(false, std::memory_order_relaxed);
+  // From this thread, so it takes the caller's scheduling, not the
+  // watchdog's realtime priority.
+  reporter_ = std::thread([this] { RunReporter(); });
   held_priority_.store(0, std::memory_order_relaxed);
   // Owned here and outliving the wait; the thread only sets it.
   auto requested = std::make_shared<std::promise<void>>();
@@ -71,6 +97,20 @@ void LoopWatchdog::Stop() {
   if (!thread_.joinable()) return;
   stop_.store(true, std::memory_order_relaxed);
   thread_.join();
+  // After the watchdog thread, so its last report is delivered.
+  stop_reporter_.store(true, std::memory_order_relaxed);
+  reporter_.join();
+}
+
+void LoopWatchdog::RunReporter() {
+#ifdef __linux__
+  pthread_setname_np(pthread_self(), "talos_wd_report");
+#endif
+  while (!stop_reporter_.load(std::memory_order_relaxed)) {
+    DeliverReports();
+    std::this_thread::sleep_for(kReportPeriod);
+  }
+  DeliverReports();
 }
 
 void LoopWatchdog::Run(const std::function<uint64_t()>& clock,
@@ -88,7 +128,7 @@ void LoopWatchdog::Run(const std::function<uint64_t()>& clock,
                   "%sRoboRIO loop watchdog: realtime priority %d refused; it "
                   "runs at default scheduling, and so does the loop",
                   time, realtime_priority);
-    outputs_.Report(text);
+    Queue(text);
   }
 #ifdef __linux__
   // What the kernel holds for this thread, not what was asked (nor glibc's
