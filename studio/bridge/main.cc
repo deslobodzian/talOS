@@ -636,7 +636,7 @@ fs::path LinkedOut(const fs::path& webroot, std::string_view page) {
   std::error_code error;
   const fs::path root = fs::weakly_canonical(webroot, error);
   if (error) return {};
-  const fs::path file = fs::weakly_canonical(root / page, error);
+  fs::path file = fs::weakly_canonical(root / page, error);
   if (error || !fs::is_regular_file(file, error)) return {};
   const fs::path relative = file.lexically_relative(root);
   if (!relative.empty() && *relative.begin() != "..") return {};
