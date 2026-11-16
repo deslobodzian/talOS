@@ -2,8 +2,10 @@
 #
 # Builds what `bazel run @talos//tools:new_subsystem` writes into a robot
 # repository: in a copy of examples/robot_repo (the fixture is never
-# modified), it scaffolds a C++ and a Python subsystem and runs
-# `bazel test //...`, the graph test, node tests and sim smoke test included.
+# modified), it scaffolds a C++ and a Python subsystem, appends the
+# simulation block each `Next:` prints to the robot_sim.toml the first
+# scaffold wrote, and runs `bazel test //...`: the graph tests of robot.toml
+# and robot_sim.toml, node tests and sim smoke test included.
 # REQ-DEV-01, REQ-DEV-23, REQ-DEV-30.
 #
 #   tools/check_robot_repo_scaffold.sh [BAZEL_FLAG...]
@@ -29,7 +31,8 @@
 #              fails if //... descends into talos/ (the .bazelignore
 #              new_robot writes keeps it out).
 # The copy's MODULE.bazel points @talos (and studio_web), and its .bazelrc
-# its import of talos.bazelrc, at the talOS checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
+# its import of talos.bazelrc (check_copy_lock.sh's point_rc_at_talos), at
+# the talOS checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
 # `bazel test` (tools/prepush.sh passes its --disk_cache and
 # --nocache_test_results; CI's disk cache comes from its bazelrc).
 #
@@ -74,6 +77,7 @@ cleanup() {
     (cd "$copy" && bazel shutdown >/dev/null 2>&1)
   fi
   remove_copy
+  rm -f "$copy".*.out
   rm -rf "$fresh"
   rm -rf "$lock"
 }
@@ -116,13 +120,14 @@ reset_copy() {
     "$module" > "$module.new" && mv "$module.new" "$module" ||
     die "cannot rewrite $module"
   # .bazelrc takes talOS's flags from the same checkout (talos_pin_test).
-  local rc="$copy/.bazelrc"
-  grep -qxF 'import %workspace%/../../talos.bazelrc' "$rc" &&
-    grep -qF -- '--workspace_status_command=../../tools/workspace_status.sh' "$rc" ||
+  local rc="$copy/.bazelrc" status
+  grep -qF -- '--workspace_status_command=../../tools/workspace_status.sh' "$rc" ||
+    die "$fixture/.bazelrc no longer runs talOS's status script from ../..; update this script"
+  point_rc_at_talos "$rc" ../.. "$talos"
+  status=$?
+  [ "$status" = 2 ] && die "cannot rewrite $rc"
+  [ "$status" = 1 ] &&
     die "$fixture/.bazelrc no longer imports talOS from ../..; update this script"
-  sed -e "s|^import %workspace%/\\.\\./\\.\\./talos\\.bazelrc\$|import $talos/talos.bazelrc|" \
-    -e "s|--workspace_status_command=\\.\\./\\.\\./tools/|--workspace_status_command=$talos/tools/|" \
-    "$rc" > "$rc.new" && mv "$rc.new" "$rc" || die "cannot rewrite $rc"
 }
 
 # [robot] require_target_coverage = true, and the empty [targets] policy
@@ -170,8 +175,21 @@ as_submodule() {
   bazel build --nobuild ${bazel_flags[@]+"${bazel_flags[@]}"} //...
 }
 
-scaffold() {  # scaffold NAME LANG
-  bazel run ${bazel_flags[@]+"${bazel_flags[@]}"} @talos//tools:new_subsystem -- "$1" --lang "$2"
+# scaffold NAME LANG: its output also kept in $copy.NAME.out for append_sim.
+scaffold() {
+  bazel run ${bazel_flags[@]+"${bazel_flags[@]}"} @talos//tools:new_subsystem -- "$1" --lang "$2" |
+    tee "$copy.$1.out"
+}
+
+# append_sim NAME: appends the simulation block NAME's `Next:` printed to
+# robot_sim.toml, which the first scaffold wrote with its sim_graph_test.
+append_sim() {
+  local block
+  block="$(awk '/gains zero:$/ { on = 1; next } /^  Then / { on = 0 }
+    on { sub(/^    /, ""); print }' "$copy.$1.out")" || return 1
+  [ -n "$block" ] && [ -f robot_sim.toml ] ||
+    { echo "no simulation block in $1's Next:, or no robot_sim.toml" >&2; return 1; }
+  printf '%s\n' "$block" >> robot_sim.toml
 }
 
 for variant in plain coverage new_robot; do
@@ -185,6 +203,8 @@ for variant in plain coverage new_robot; do
   fi
   phase "$variant: scaffold intake (cpp)" scaffold intake cpp
   phase "$variant: scaffold feeder (py)" scaffold feeder py
+  phase "$variant: append both simulation blocks to robot_sim.toml" \
+    eval 'append_sim intake && append_sim feeder'
   phase "$variant: bazel test //..." \
     bazel test --test_output=errors ${bazel_flags[@]+"${bazel_flags[@]}"} //...
   if [ "$variant" = new_robot ]; then

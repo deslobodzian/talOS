@@ -22,8 +22,8 @@ namespace position_raw_cpp {
 // RoboRIO reboot drops that zero, a live goal pushes toward the switch at
 // kHomingVolts instead. A push that runs past its bound, or the switch still
 // reading closed after the first move off it, latches FAILED, neutral, until
-// the Driver Station reports disabled. docs/FIRST_MECHANISM.md §6 in the
-// talos repository explains each rule.
+// the Driver Station reports disabled. "Writing the arm yourself" in the
+// talos repository's mechanisms README explains each rule.
 class PositionRawCpp {
  public:
   using Target = PositionRawCppTarget;

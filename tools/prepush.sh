@@ -244,9 +244,11 @@ fi
 # What they build from talOS: its module file, REPO.bazel (which applies to
 # @talos as to any repository), the toml++ build file and patch in
 # third_party/, and packages under talOS/ and tools/ (`bazel query
-# 'buildfiles(deps(//...))'` in each). talOS's .bazelrc and .bazelversion
-# are not read there (each fixture has its own copies), nor is studio/.
-dependent_paths=(MODULE.bazel REPO.bazel third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
+# 'buildfiles(deps(//...))'` in each). Each fixture's .bazelrc imports
+# talOS's talos.bazelrc, and robot_repo's talos_pin_test compares its
+# .bazelversion with talOS's; talOS's own .bazelrc and studio/ are not
+# read there.
+dependent_paths=(MODULE.bazel REPO.bazel talos.bazelrc .bazelversion third_party/ talOS/ tools/ examples/robot_repo/ examples/wrist_repo/)
 if ! touches "${dependent_paths[@]}"; then
   report "dependents not needed (nothing under ${dependent_paths[*]} since $upstream)"
 elif [ ! -d "$wt/examples/robot_repo" ]; then

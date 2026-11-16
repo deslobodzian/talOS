@@ -16,7 +16,9 @@
 #   bazel build --override_module=talos=<this checkout> //...
 #   bazel test  --override_module=talos=<this checkout> --test_output=errors //...
 #
-# with the copy's own .bazelrc and every BAZEL_FLAG (tools/prepush.sh
+# with the copy's own .bazelrc, whose `import %workspace%/talos/talos.bazelrc`
+# and status command under talos/ (the submodule, empty in the copy) are
+# pointed at this checkout first, and every BAZEL_FLAG (tools/prepush.sh
 # passes its --disk_cache and --nocache_test_results). Each config's
 # --describe-only runs as that repository's talos_graph_test targets, part
 # of its `bazel test //...`.
@@ -93,6 +95,9 @@ rm -f "$copy".*.log
 mkdir -p "$copy" || die "cannot make $copy"
 git --no-optional-locks -C "$source_repo" archive --format=tar HEAD | tar -xf - -C "$copy" ||
   die "cannot copy $source_repo's HEAD to $copy"
+# Its talos.bazelrc import and status script, this checkout's.
+point_rc_at_talos "$copy/.bazelrc" talos "$talos"
+[ "$?" = 2 ] && die "cannot rewrite $copy/.bazelrc"
 echo "robot-check: $source_repo at $robot_commit, against talOS $talos at $talos_commit, in $copy"
 
 verdict_failed() {  # verdict_failed PHASE LOG

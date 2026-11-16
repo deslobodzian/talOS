@@ -775,14 +775,15 @@ config's nodes come from `bazel-bin`, so build them first:
 
 ```sh
 bazel run //talOS/launcher:restart_latency -- \
-  --config 2026-robot/main_processor/configuration/robot_physics_sim.toml \
-  --start-sim-gateway --sim-gateway-arg=--physics
+  --config bench/main_processor/configuration/robot_physics_sim.toml \
+  --node swerve_module --start-sim-gateway --sim-gateway-arg=--physics
 ```
 
 It runs the session on loopback ports it picks (the launcher passes them to
 the simulator it starts) under its own
 `TALOS_SHM_NAMESPACE`,
-kills `--node` (default `drivetrain`) `--kills` times (default 10), spaced
+kills `--node` (required: a critical node that sends its
+`/hw/request/<node>`) `--kills` times (default 10), spaced
 500 ms past `--restart-window-ms` (default 1500), and removes the session and
 its segments afterwards (`--keep` keeps the directory). The session lives in
 `TMPDIR`, which selects the disk (a tmpfs `/tmp` is not one). `--disk-load N`

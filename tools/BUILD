@@ -10,7 +10,7 @@ exports_files([
     "trace.py",
 ])
 
-# bazel run //tools:new_subsystem -- <name> --lang cpp|py [--type T [--raw]] [--robot R] [--standalone DIR] [--dry-run]
+# bazel run //tools:new_subsystem -- <name> --lang cpp|py [--type T [--raw]] (--robot R | --standalone DIR) [--dry-run]
 # Writes a node package under <robot>/main_processor/<name>/, adds it to that
 # robot's robot.toml and regenerates its manifest, or scaffolds a standalone
 # Bzlmod repo. From a robot repository, `bazel run @talos//tools:new_subsystem
@@ -50,7 +50,8 @@ py_test(
 # Creates DIR, outside this checkout, as a robot repository depending on
 # talOS: a copy of examples/robot_repo as new_robot.py's TEMPLATE places it.
 # bazel run //tools:new_robot -- <name> --mechanism M --lang cpp|py [--dir DIR]
-# Writes a robot beside 2026-robot/: its configuration (teleop, telemetry),
+# Writes a robot directory at the workspace root, like bench/: its
+# configuration (teleop, telemetry),
 # generated manifest, graph test and bundle, and its first mechanism through
 # new_subsystem.
 py_binary(

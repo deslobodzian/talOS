@@ -59,6 +59,8 @@ class CheckRobotRepositoryTest(unittest.TestCase):
         put(os.path.join(bin_dir, "bazel"),
             "#!/bin/sh\n"
             f'echo "$PWD|$*" >> {shlex.quote(self.log)}\n'
+            # The flags Bazel would read there.
+            f"[ -f .bazelrc ] && cp .bazelrc {shlex.quote(self.tmp)}/seen_rc\n"
             "touch bazel-out MODULE.bazel.lock\n"
             # A failing test: its log, as --test_output=errors prints it,
             # then Bazel's result line.
@@ -133,6 +135,33 @@ class CheckRobotRepositoryTest(unittest.TestCase):
         listed = listed[:next(i for i, line in enumerate(listed)
                               if not line.startswith("  "))]
         self.assertEqual(listed, ["  //x:y_test FAILED in 1s"], result.stdout)
+
+    # REQ-DEV-32
+    def test_the_copy_reads_this_checkouts_flags(self):
+        # A robot repository imports talos.bazelrc from its talos/ submodule:
+        # the pinned commit's flags, and in the archive copy an empty
+        # directory, so the import would fail. The copy Bazel runs in
+        # imports this checkout's talos.bazelrc and runs its status script;
+        # the repository's own lines stay as they are.
+        put(os.path.join(self.robot, ".bazelrc"),
+            "import %workspace%/talos/talos.bazelrc\n"
+            "build --jobs=2\n"
+            "build:release "
+            "--workspace_status_command=talos/tools/workspace_status.sh\n")
+        git(self.robot, "add", ".bazelrc")
+        git(self.robot, "-c", "user.name=t", "-c", "user.email=t@t",
+            "commit", "-q", "-m", "import talos.bazelrc")
+        result = self.run_script(self.robot)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        talos = os.path.realpath(
+            os.path.join(os.path.dirname(self.script), ".."))
+        with open(os.path.join(self.tmp, "seen_rc"), encoding="utf-8") as f:
+            self.assertEqual(
+                f.read(),
+                f"import {talos}/talos.bazelrc\n"
+                "build --jobs=2\n"
+                "build:release "
+                f"--workspace_status_command={talos}/tools/workspace_status.sh\n")
 
 
 if __name__ == "__main__":

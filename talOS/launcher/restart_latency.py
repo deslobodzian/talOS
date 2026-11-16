@@ -464,8 +464,9 @@ def main():
                "the launcher passes the simulator the session's ports.")
     parser.add_argument("--config", type=Path, required=True,
                         help="robot config, absolute or workspace-relative")
-    parser.add_argument("--node", default="drivetrain",
-                        help="critical node to SIGKILL; it must send /hw/request/<node>")
+    parser.add_argument("--node", required=True,
+                        help="critical node to SIGKILL; it must send /hw/request/<node> "
+                             "(bench's robot_physics_sim.toml: swerve_module)")
     parser.add_argument("--kills", type=int, default=10)
     parser.add_argument("--restart-window-ms", type=int, default=1500,
                         help="launcher restart window; kills are spaced 500 ms past it")
