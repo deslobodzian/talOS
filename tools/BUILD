@@ -44,6 +44,13 @@ py_test(
     ],
     legacy_create_init = False,
     main = "new_subsystem_test.py",
+    # Its only instrumented code is the configuration resolver, which it
+    # starts about 70 times (three per scaffold's plan). Under TSan on the
+    # hosted macOS runner each start costs most of a second, past the small
+    # timeout (TODO.md CI-10); plain it takes 0.2 s. The resolver starts no
+    # thread; its library runs under TSan in //talOS/configuration:test and
+    # :config_fuzz_test.
+    tags = ["no_tsan"],  # ~70 resolver starts; single-threaded; see above
     deps = [":sync_manifest_lib"],
 )
 
@@ -100,9 +107,10 @@ py_test(
 
 # A scaffolded velocity and position mechanism, edited as their `Next:` says,
 # reach their teleop goals under sim_gateway --physics, and a --no-mechanism
-# robot runs there with no alert, reject or fault. Over 5 s, e2e lane: the
-# launcher runs the graphs for `Next:`'s 8 s mode and joystick schedule and
-# 3 s more in real time (the gateway has no faster-than-real-time mode).
+# robot runs there with no alert, reject or fault. Over 5 s, e2e lane: once
+# each session is up, the test runs it for `Next:`'s 8 s mode and joystick
+# schedule and 3 s more in real time (the gateway has no
+# faster-than-real-time mode), timed from the schedules' start.
 py_test(
     name = "scaffold_sim_test",
     size = "medium",
@@ -112,6 +120,8 @@ py_test(
         "new_robot_test.py",
         "new_subsystem.py",
         "scaffold_sim_test.py",
+        # Its wait for a session to be up, and its ordered stop.
+        "//talOS/build:sim_check.py",
     ],
     data = [
         "//talOS/bridge:hardware_node",

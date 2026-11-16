@@ -36,12 +36,14 @@
 //     get() from the constructor, every(), a callback or an earlier
 //     update() does not count, and any one of the node's Targets will do;
 //   - in a tick that drives, every owned motor not set during that update()
-//     is neutral, and digital/PWM outputs set during it are included as set;
+//     is neutral, and digital/PWM outputs set during it are included as set
+//     (a PWM output stopped or set non-finite as off: no pulse);
 //   - in a tick that does not drive, every motor is neutral, every digital
-//     output false and every PWM output 0, and the command still goes out;
-//     the first such tick of each enabled spell in which update() set an
-//     output non-neutral prints one line on stderr naming the node, and
-//     every such tick marks the node's registry row outputs held
+//     output false and every PWM output off, and the command still goes
+//     out; the first such tick of each enabled spell in which update() set
+//     an output non-neutral (a PWM output to any pulse, 0 included) prints
+//     one line on stderr naming the node, and every such tick marks the
+//     node's registry row outputs held
 //     (detail::NodeAccess::set_outputs_held), which the next flush that
 //     drives, sets nothing or runs disabled clears.
 // Incoming states pass hardware::AcceptState for this config's id and are
@@ -158,10 +160,10 @@ Duration RezeroAgeBound(const hardware::Config& config);
 Duration ReadinessAgeBound(const hardware::Config& config);
 
 // Hardware handles: cheap copyable values. Output setters (Motor's set_* and
-// stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the
-// node's update() and apply to the flush right after it; anything not set in
-// that update() is neutral. From the constructor, every() or a message
-// callback they throw std::logic_error naming the device, since such a
+// stop(), DigitalOutput::set, PwmOutput::set and stop()) are taken only
+// inside the node's update() and apply to the flush right after it; anything
+// not set in that update() is neutral. From the constructor, every() or a
+// message callback they throw std::logic_error naming the device, since such a
 // command would reach the hardware for at most one tick. Feedback is in
 // mechanism units (sensor_to_mechanism_ratio is applied on the controller).
 class Motor {
@@ -174,6 +176,14 @@ class Motor {
   void set_velocity(double rps, double ff_volts = 0, int slot = 0);  // PID
   void set_position(double rot, double ff_volts = 0, int slot = 0);  // PID
   void set_motion_magic(double rot, double ff_volts = 0, int slot = 0);
+  // Stator current, amperes, through Phoenix TorqueCurrentFOC. Needs
+  // [motors.*] foc = true and max_torque_current_a > 0, else it throws
+  // std::invalid_argument naming the motor and the key. Clamped to
+  // +-max_torque_current_a (clamped_count counts it); non-finite: neutral.
+  // 0 A is a driving request, not neutral; stop() is neutral. What the motor
+  // does at exactly 0 A: talOS/hardware/README.md, Supported Hardware
+  // Requests.
+  void set_torque_current(double amperes);
   void stop();  // neutral
   // Commands adjusted to configured limits or neutralized for non-finite
   // values, counted once per setter call over this handle's device lifetime.
@@ -193,8 +203,8 @@ class Motor {
   // position_frame = "absolute". A dropped zero keeps its offset (dropping
   // does not move position()). set_position and set_motion_magic go out
   // neutral while no rezero holds, unless position_frame = "absolute" (a
-  // remote CANcoder's frame, usable from the first state). Other modes are
-  // never held.
+  // remote CANcoder's frame, usable from the first state). Other modes,
+  // torque current included, are never held.
   bool zeroed() const;
 
   double position() const;  // rotations; the last valid one while invalid
@@ -321,7 +331,13 @@ class PwmOutput {
  public:
   PwmOutput() = default;
   PwmOutput(Node& node, std::string_view name);
+  // A pulse for `output`, clamped to [-1, 1] on frc::PWM::SetSpeed's scale:
+  // 0 is the 1.5 ms centre pulse, which centres a servo and holds a PWM
+  // motor controller at neutral. A non-finite output sends no pulse.
   void set(double output);
+  // No pulse in this tick's flush: a servo goes limp and a PWM motor
+  // controller sees no signal. The same as not calling set() in this update().
+  void stop();
 
  private:
   HardwareLink* link_{nullptr};

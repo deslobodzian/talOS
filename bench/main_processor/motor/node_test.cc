@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 
@@ -25,13 +26,20 @@ using talos::testing::DsPacket;
 using talos::testing::PublishTarget;
 using talos::testing::ReleaseTarget;
 namespace ds = talos::driver_station;
-// The bench config plus a neighbor motor that stays connected (see the file).
+// The bench config plus a neighbor motor that stays connected, with torque
+// mode on (foc, max_torque_current_a 5 A, max_bench_torque_current_a 2 A).
 constexpr const char* kConfig =
     "bench/main_processor/motor/testdata/robot.toml";
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 constexpr double kInf = std::numeric_limits<double>::infinity();
 // A live 10 rps velocity target.
-MotorTarget Velocity() { return {ControlMode::VELOCITY, 0.0, 10.0, 0.0}; }
+MotorTarget Velocity() { return {ControlMode::VELOCITY, 0.0, 10.0, 0.0, 0.0}; }
+MotorTarget Torque(double amperes) {
+  return {ControlMode::TORQUE_CURRENT, 0.0, 0.0, 0.0, amperes};
+}
+MotorTarget Voltage(double volts) {
+  return {ControlMode::VOLTAGE, volts, 0.0, 0.0, 0.0};
+}
 
 // The node test matrix, docs/TESTING.md §7: the case names are the matrix's,
 // which //tools:check_node_matrix looks for. This node drives the bench
@@ -71,13 +79,36 @@ class MotorTest : public ::testing::Test {
   talos::testing::SimHardware hw{sim};
 };
 
-// REQ-SAFE-07
-TEST_F(MotorTest, DrivesAtALiveLane) {
+// A live target of each mode that drives, and what the gateway applies for
+// it: cases 1 and 12 run once per mode, since each mode has its own setter
+// and clamp. The other cases' code (the gate before the mode branch) is the
+// same for every mode, so they run with a velocity target only.
+struct Driving {
+  const char* name;
+  MotorTarget target;
+  Mode applied;
+  double demand;
+};
+void PrintTo(const Driving& driving, std::ostream* out) {
+  *out << driving.name;
+}
+class DrivingTest : public MotorTest,
+                    public ::testing::WithParamInterface<Driving> {};
+INSTANTIATE_TEST_SUITE_P(
+    Modes, DrivingTest,
+    ::testing::Values(Driving{"Velocity", Velocity(), Mode::kVelocity, 10.0},
+                      // Within max_bench_torque_current_a (2 A).
+                      Driving{"TorqueCurrent", Torque(1.5),
+                              Mode::kTorqueCurrent, 1.5}),
+    [](const auto& info) { return std::string{info.param.name}; });
+
+// REQ-SAFE-07, REQ-SAFE-43 (stator amperes reach the request as sent)
+TEST_P(DrivingTest, DrivesAtALiveLane) {
   Enable();
-  Send(Velocity());
-  EXPECT_EQ(Applied().mode, Mode::kVelocity);
-  EXPECT_DOUBLE_EQ(Applied().demand, 10.0);
-  EXPECT_EQ(State().mode(), ControlMode::VELOCITY);
+  Send(GetParam().target);
+  EXPECT_EQ(Applied().mode, GetParam().applied);
+  EXPECT_DOUBLE_EQ(Applied().demand, GetParam().demand);
+  EXPECT_EQ(State().mode(), GetParam().target.mode());
   EXPECT_EQ(State().source(), TargetSource::TELEOP);
   EXPECT_TRUE(State().enabled());
 }
@@ -117,7 +148,7 @@ TEST_F(MotorTest, StaleLaneGoesNeutral) {
 // this node's evidence.
 TEST_F(MotorTest, ReleasedLaneGoesNeutral) {
   Enable();
-  Send(MotorTarget{ControlMode::VOLTAGE, 1.0, 0.0, 0.0});
+  Send(Voltage(1.0));
   ASSERT_EQ(Applied().mode, Mode::kVoltage);
   ReleaseTarget<MotorTarget>(sim, "motor", "teleop");
   sim.step(10ms);
@@ -160,21 +191,24 @@ TEST_F(MotorTest, DisconnectedFeedbackGoesNeutral) {
   EXPECT_FALSE(State().connected());
 }
 
-// REQ-SAFE-04
+// REQ-SAFE-04. An infinite torque current would otherwise clamp to the
+// node's cap and drive.
 TEST_F(MotorTest, NonFiniteDemandGoesNeutral) {
   Enable();
   for (const MotorTarget& target :
-       {MotorTarget{ControlMode::VOLTAGE, kNaN, 0.0, 0.0},
-        MotorTarget{ControlMode::VOLTAGE, kInf, 0.0, 0.0},
-        MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, kNaN},
-        MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, kInf},
-        MotorTarget{ControlMode::VELOCITY, 0.0, kNaN, 0.0},
-        MotorTarget{ControlMode::VELOCITY, 0.0, kInf, 0.0}}) {
+       {MotorTarget{ControlMode::VOLTAGE, kNaN, 0.0, 0.0, 0.0},
+        MotorTarget{ControlMode::VOLTAGE, kInf, 0.0, 0.0, 0.0},
+        MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, kNaN, 0.0},
+        MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, kInf, 0.0},
+        MotorTarget{ControlMode::VELOCITY, 0.0, kNaN, 0.0, 0.0},
+        MotorTarget{ControlMode::VELOCITY, 0.0, kInf, 0.0, 0.0}, Torque(kNaN),
+        Torque(kInf), Torque(-kInf)}) {
     SCOPED_TRACE(::testing::Message()
                  << "mode " << static_cast<int>(target.mode()) << " voltage_v "
                  << target.voltage_v() << " voltage_frac "
                  << target.voltage_frac() << " velocity_rps "
-                 << target.velocity_rps());
+                 << target.velocity_rps() << " torque_current_a "
+                 << target.torque_current_a());
     Send(Velocity());
     ASSERT_EQ(Applied().mode, Mode::kVelocity);
     Send(target);
@@ -184,22 +218,47 @@ TEST_F(MotorTest, NonFiniteDemandGoesNeutral) {
   }
 }
 
-// REQ-CONTRACT-18
+// REQ-CONTRACT-18. A positive torque cap is refused unless the motor
+// allows torque current (REQ-SAFE-43), so a misconfigured bench fails at
+// launch, not at the first press of button 3.
 TEST(MotorParameters, BadParameterFailsConstruction) {
-  for (const char* value : {"0.0", "-1.0", "nan", "inf", "'two'"}) {
-    SCOPED_TRACE(value);
+  constexpr const char* kTorque = "foc = true\nmax_torque_current_a = 5.0\n";
+  struct Bad {
+    const char* key;     // the node parameter
+    const char* value;   // its value
+    const char* kraken;  // extra [motors.kraken] lines
+    const char* names;   // what the error names besides the key
+  };
+  for (const Bad& bad : {
+           Bad{"max_bench_voltage_v", "0.0", "", ""},
+           Bad{"max_bench_voltage_v", "-1.0", "", ""},
+           Bad{"max_bench_voltage_v", "nan", "", ""},
+           Bad{"max_bench_voltage_v", "inf", "", ""},
+           Bad{"max_bench_voltage_v", "'two'", "", ""},
+           Bad{"max_bench_torque_current_a", "-1.0", kTorque, ""},
+           Bad{"max_bench_torque_current_a", "nan", kTorque, ""},
+           Bad{"max_bench_torque_current_a", "inf", kTorque, ""},
+           Bad{"max_bench_torque_current_a", "'two'", kTorque, ""},
+           // A motor that allows no torque current: no foc, or no limit.
+           Bad{"max_bench_torque_current_a", "2.0", "", "foc = true"},
+           Bad{"max_bench_torque_current_a", "2.0", "foc = true\n",
+               "max_torque_current_a > 0"},
+       }) {
+    SCOPED_TRACE(::testing::Message()
+                 << bad.key << " = " << bad.value << ", " << bad.kraken);
     auto sim = talos::testing::Sim::FromToml(
         std::string{"[robot]\nperiod_us = 5000\ncommand_timeout_us = 100000\n"
-                    "[subsystems.motor]\nmax_bench_voltage_v = "} +
-        value +
-        "\n[subsystems.motor.motors.kraken]\ntype = 'TalonFX'\ncan_id = 1\n");
+                    "[subsystems.motor]\n"} +
+        bad.key + " = " + bad.value +
+        "\n[subsystems.motor.motors.kraken]\ntype = 'TalonFX'\ncan_id = 1\n" +
+        bad.kraken);
     try {
       sim.add<BenchMotor>("motor");
       ADD_FAILURE() << "constructed";
     } catch (const std::invalid_argument& error) {
-      EXPECT_NE(std::string{error.what()}.find("max_bench_voltage_v"),
-                std::string::npos)
-          << error.what();
+      const std::string what{error.what()};
+      EXPECT_NE(what.find(bad.key), std::string::npos) << what;
+      EXPECT_NE(what.find(bad.names), std::string::npos) << what;
     }
   }
 }
@@ -253,39 +312,80 @@ TEST_F(MotorTest, EarlierGenerationTargetIsIgnored) {
 // REQ-RT-06: the steady-state tick (target read, request, flush, state
 // publish) allocates nothing. The target stays fresh through the window
 // (60 ms < command_timeout_us).
-TEST_F(MotorTest, UpdateDoesNotAllocate) {
+TEST_P(DrivingTest, UpdateDoesNotAllocate) {
   if (const auto why = AllocationProbe::Unsupported(); !why.empty()) {
     GTEST_SKIP() << why;
   }
   Enable();
-  Hold(Velocity(), 30ms);
-  PublishTarget(sim, "motor", "teleop", Velocity());
+  Hold(GetParam().target, 30ms);
+  PublishTarget(sim, "motor", "teleop", GetParam().target);
   AllocationProbe probe;
   probe.start();
   sim.step(60ms);
   EXPECT_EQ(probe.stop(), 0u) << probe.sites();
-  EXPECT_EQ(Applied().mode, Mode::kVelocity);
+  EXPECT_EQ(Applied().mode, GetParam().applied);
 }
 
 // The node's own cap (max_bench_voltage_v, 2 V) holds below the motor's
 // configured max_voltage (4 V), and scales the teleop axis.
 TEST_F(MotorTest, VoltageIsClampedAndAxisUsesNodeScale) {
   Enable();
-  Send(MotorTarget{ControlMode::VOLTAGE, 20.0, 0.0, 0.0});
+  Send(Voltage(20.0));
   EXPECT_EQ(Applied().mode, Mode::kVoltage);
   EXPECT_DOUBLE_EQ(Applied().demand, 2.0);
-  Send(MotorTarget{ControlMode::VOLTAGE, -20.0, 0.0, 0.0});
+  Send(Voltage(-20.0));
   EXPECT_DOUBLE_EQ(Applied().demand, -2.0);
-  Send(MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, 0.25});
+  Send(MotorTarget{ControlMode::VOLTAGE, 0.0, 0.0, 0.25, 0.0});
   EXPECT_DOUBLE_EQ(Applied().demand, 0.5);
   EXPECT_EQ(State().source(), TargetSource::TELEOP);
+}
+
+// REQ-SAFE-43: the node's cap (max_bench_torque_current_a, 2 A) holds below
+// the motor's max_torque_current_a (5 A), and 0 A is sent as zero torque,
+// not neutral (docs/BENCH.md's 0 A step depends on it).
+TEST_F(MotorTest, TorqueCurrentIsClampedToTheNodeCapAndZeroIsSent) {
+  Enable();
+  Send(Torque(8.0));
+  EXPECT_EQ(Applied().mode, Mode::kTorqueCurrent);
+  EXPECT_DOUBLE_EQ(Applied().demand, 2.0);
+  Send(Torque(-8.0));
+  EXPECT_DOUBLE_EQ(Applied().demand, -2.0);
+  EXPECT_EQ(State().mode(), ControlMode::TORQUE_CURRENT);
+  Send(Torque(0.0));
+  EXPECT_EQ(Applied().mode, Mode::kTorqueCurrent);
+  EXPECT_DOUBLE_EQ(Applied().demand, 0.0);
+  EXPECT_EQ(State().mode(), ControlMode::TORQUE_CURRENT);
+}
+
+// REQ-SAFE-43: the committed bench config (max_bench_torque_current_a 0, no
+// foc) drives nothing for a torque target, so its button 3 moves nothing,
+// while a voltage target still drives.
+TEST(MotorTorque, TorqueModeOffAtTheCommittedCap) {
+  talos::testing::Sim sim{"bench/main_processor/configuration/robot.toml"};
+  sim.add<BenchMotor>("motor");
+  talos::testing::SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
+  sim.step(50ms);
+  const auto send = [&](const MotorTarget& target) {
+    PublishTarget(sim, "motor", "teleop", target);
+    sim.step(10ms);
+  };
+  send(Torque(1.5));
+  EXPECT_EQ(hw.motor_request("motor", "kraken").mode, Mode::kNeutral);
+  EXPECT_EQ(hw.applied_motor("motor", "kraken").mode, Mode::kNeutral);
+  EXPECT_EQ(sim.latest<MotorState>(topics::kState).value().mode(),
+            ControlMode::NEUTRAL);
+  send(Voltage(1.0));
+  EXPECT_EQ(hw.applied_motor("motor", "kraken").mode, Mode::kVoltage);
+  EXPECT_DOUBLE_EQ(hw.applied_motor("motor", "kraken").demand, 1.0);
 }
 
 TEST_F(MotorTest, NeutralModeTargetGoesNeutral) {
   Enable();
   Send(Velocity());
   ASSERT_EQ(Applied().mode, Mode::kVelocity);
-  Send(MotorTarget{ControlMode::NEUTRAL, 2.0, 30.0, 0.0});
+  Send(MotorTarget{ControlMode::NEUTRAL, 2.0, 30.0, 0.0, 1.0});
   Neutral();
 }
 
@@ -362,7 +462,7 @@ TEST(BenchTeleop, ConfiguredAxisButtonsReleaseAndDisable) {
   auto& stick = packet.joysticks[0];
   stick.connected = true;
   stick.axis_count = 2;
-  stick.button_count = 2;
+  stick.button_count = 3;
   const auto push = [&] {
     hw.set_driver_station(packet);
     sim.step(20ms);
@@ -379,6 +479,15 @@ TEST(BenchTeleop, ConfiguredAxisButtonsReleaseAndDisable) {
   stick.buttons = 3;
   push();
   EXPECT_DOUBLE_EQ(hw.motor_request("motor", "kraken").demand, 10.0);
+  // Button 3: TORQUE_CURRENT 2 A (the test config turns torque mode on);
+  // button 1 wins over it.
+  stick.buttons = 4;
+  push();
+  EXPECT_EQ(hw.motor_request("motor", "kraken").mode, Mode::kTorqueCurrent);
+  EXPECT_DOUBLE_EQ(hw.motor_request("motor", "kraken").demand, 2.0);
+  stick.buttons = 5;
+  push();
+  EXPECT_EQ(hw.motor_request("motor", "kraken").mode, Mode::kVelocity);
   stick.buttons = 0;
   stick.axes[1] = 0.0;
   push();

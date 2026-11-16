@@ -473,6 +473,39 @@ class DevicesTest(unittest.TestCase):
                 with self.assertRaises(talos.TalosError):
                     accessor("lift", "missing")
 
+    # REQ-SAFE-03: PwmOutput.set(0.0) is the centre pulse and stop() no pulse
+    # (None), and stop() outside update() raises naming the device
+    def test_pwm_stop_sends_no_pulse_and_set_zero_is_the_centre(self):
+        class Servo:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.servo = talos.PwmOutput(node, "servo")
+                self.stop = False
+
+            def update(self):
+                if self.stop:
+                    self.servo.stop()
+                else:
+                    self.servo.set(0.0)
+
+        sim = Sim.from_toml(ROBOT_TOML + """
+[subsystems.lift.pwm_outputs.servo]
+channel = 0
+""")
+        servo = sim.add(Servo, "lift")
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"'servo'.*outside update\(\)"):
+            servo.servo.stop()
+        hw = SimHardware(sim)
+        hw.enable()
+        sim.step(0.03)
+        self.assertEqual(hw.pwm("lift", "servo"), 0.0)
+        self.assertEqual(hw.applied_pwm("lift", "servo"), 0.0)
+        servo.stop = True
+        sim.step(0.03)
+        self.assertIsNone(hw.pwm("lift", "servo"))
+        self.assertIsNone(hw.applied_pwm("lift", "servo"))
+
     def test_signal_acquisition_times_preserve_unequal_ages(self):
         class Signals:
             def __init__(self, node):
@@ -585,6 +618,34 @@ can_id = 3
         with self.assertRaisesRegex(talos.TalosError,
                                     r"motor 'lift'.*outside update\(\)"):
             sim.step(0.05)
+
+    # REQ-SAFE-43: set_torque_current reaches the request as stator amperes,
+    # clamped to the motor's limit and counted, and on a motor whose config
+    # lacks foc it raises naming the motor and the key
+    def test_torque_current_clamps_and_needs_the_config(self):
+        class Torquer:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.lift = talos.Motor(node, "lift")
+
+            def update(self):
+                self.lift.set_torque_current(8.0)
+
+        sim = Sim.from_toml(ROBOT_TOML.replace(
+            "can_id = 1\n",
+            "can_id = 1\nfoc = true\nmax_torque_current_a = 5.0\n"))
+        torquer = sim.add(Torquer, "lift")
+        hw = SimHardware(sim)
+        hw.enable()
+        sim.step(0.03)
+        self.assertEqual(hw.motor_request("lift", "lift"),
+                         (talos.Mode.TORQUE_CURRENT, 5.0, 0.0, 0))
+        self.assertGreater(torquer.lift.clamped_count, 0)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Torquer, "lift")
+        with self.assertRaisesRegex(talos.TalosError, r"'lift'.*foc = true"):
+            sim.step(0.03)
 
     def test_hardware_link_freshness_and_age(self):
         class Watcher:

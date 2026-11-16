@@ -179,7 +179,7 @@ struct HardwareLink::Impl {
     // the latched sample is invalid (HeldPosition).
     double held_position = 0;
     bool digital = false;
-    double pwm = 0;
+    hardware::PwmRequest pwm{};  // off: no pulse
     // Where this device's sample was in the state arrays last time it was
     // read; a hint only, checked against the id on every read.
     mutable std::size_t sample_index = 0;
@@ -376,15 +376,16 @@ struct HardwareLink::Impl {
   }
 
   // Whether update() `tick` set an output to something other than neutral: a
-  // motor mode other than neutral, a digital output true or a PWM output not
-  // 0.
+  // motor mode other than neutral, a digital output true or a PWM output to
+  // a pulse (0, the centre pulse, included).
   bool SetNonNeutral(std::uint64_t tick) const {
     for (const Device& device : devices) {
       if (device.set_update != tick) continue;
       if ((device.kind == Kind::kMotor &&
            device.motor.mode != hardware::Mode::kNeutral) ||
           (device.kind == Kind::kDigitalOutput && device.digital) ||
-          (device.kind == Kind::kPwm && device.pwm != 0.0)) {
+          (device.kind == Kind::kPwm &&
+           device.pwm.mode != hardware::PwmMode::kOff)) {
         return true;
       }
     }
@@ -417,8 +418,8 @@ struct HardwareLink::Impl {
               device.id, drive && device.digital};
         } else if (device.kind == Kind::kPwm &&
                    command.pwm_output_count < hardware::kMaxPwmOutputs) {
-          command.pwm_outputs[command.pwm_output_count++] = {
-              device.id, drive ? device.pwm : 0.0};
+          command.pwm_outputs[command.pwm_output_count++] =
+              drive ? device.pwm : hardware::PwmRequest{.id = device.id};
         }
       }
       Packet packet{};
@@ -575,13 +576,26 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                 " is not 0, 1 or 2");
   }
   const auto& config = *device.motor_config;
+  if (mode == hardware::Mode::kTorqueCurrent &&
+      !(config.foc && config.max_torque_current_a > 0)) {
+    // TorqueCurrentFOC is a Phoenix Pro request bounded only by the motor's
+    // own limit: a motor without both keys could only be neutralized by the
+    // gateway, so a node asking for it fails in its first update(), in Sim
+    // too, naming what to set.
+    throw std::invalid_argument(
+        std::string{link.impl_->node.name()} +
+        ": Motor::set_torque_current on motor '" + device.name +
+        "' needs [motors." + device.name + "] " +
+        (config.foc ? "max_torque_current_a > 0"
+                    : "foc = true and max_torque_current_a > 0"));
+  }
   if (mode == hardware::Mode::kPosition ||
       mode == hardware::Mode::kMotionMagic) {
     // A position needs a frame that no reset has restarted since it was
     // taken: a rezero that still holds, or a remote CANcoder's absolute frame
     // ([motors.*] position_frame = "absolute"). The rotor position a TalonFX
     // powers on or resets with is no frame: neutral until the node rezeroes.
-    // Other modes need no frame.
+    // Other modes, torque current included, need no frame.
     if (!device.zeroed && !config.absolute_position_frame.value) {
       device.motor = {.id = device.id};
       link.impl_->Commanded(device);
@@ -617,6 +631,10 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
           demand = std::clamp(demand, config.reverse_limit_rot,
                               config.forward_limit_rot);
         }
+        break;
+      case hardware::Mode::kTorqueCurrent:  // 0 A drives: not neutral
+        demand = std::clamp(demand, -config.max_torque_current_a,
+                            config.max_torque_current_a);
         break;
       case hardware::Mode::kNeutral:
         break;
@@ -807,7 +825,18 @@ void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
   auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::set");
-  device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
+  device.pwm =
+      std::isfinite(output)
+          ? hardware::PwmRequest{.id = device.id,
+                                 .mode = hardware::PwmMode::kPulse,
+                                 .output = std::clamp(output, -1.0, 1.0)}
+          : hardware::PwmRequest{.id = device.id};
+  link.impl_->Commanded(device);
+}
+
+void HardwareAccess::pwm_stop(HardwareLink& link, std::size_t index) {
+  auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::stop");
+  device.pwm = hardware::PwmRequest{.id = device.id};
   link.impl_->Commanded(device);
 }
 
@@ -841,6 +870,10 @@ void Motor::set_position(double rot, double ff_volts, int slot) {
 void Motor::set_motion_magic(double rot, double ff_volts, int slot) {
   HardwareAccess::motor_set(*link_, index_, Mode::kMotionMagic, rot, ff_volts,
                             slot);
+}
+void Motor::set_torque_current(double amperes) {
+  HardwareAccess::motor_set(*link_, index_, Mode::kTorqueCurrent, amperes, 0,
+                            0);
 }
 void Motor::stop() {
   HardwareAccess::motor_set(*link_, index_, Mode::kNeutral, 0, 0, 0);
@@ -984,6 +1017,7 @@ PwmOutput::PwmOutput(Node& node, std::string_view name)
 void PwmOutput::set(double output) {
   HardwareAccess::pwm_set(*link_, index_, output);
 }
+void PwmOutput::stop() { HardwareAccess::pwm_stop(*link_, index_); }
 
 // --- Driver Station ----------------------------------------------------------
 

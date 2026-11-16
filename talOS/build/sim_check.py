@@ -21,6 +21,12 @@ before then ends the wait at once. So a slow-starting member (a Python node
 importing a large library, a loaded host) delays the stop, and only the
 hang bound below can fail a session for being slow.
 
+A caller of check() that expects no State (a test of this check) can bound
+the wait for the State alone by `state_s`, counted from the moment every
+member's loop has started rather than from the launch, so a slow start-up
+(a sanitizer build, a loaded host) still gets the whole hang bound to start
+the session; the expiry is a problem of its own.
+
 It passes only when:
 
 - the events above came before the hang bound;
@@ -82,6 +88,8 @@ SIMULATOR = "sim_gateway"
 # What the bridge prints on the first State it accepts from a gateway boot
 # (HardwareNode::ReportGatewayBuild), which the launcher writes to its log.
 FIRST_STATE_LINE = "hardware_node: gateway boot "
+# What readiness() waits for until FIRST_STATE_LINE is in the bridge's log.
+WAITING_FOR_STATE = "a State accepted by the bridge"
 
 # Bounds on waits that end on an event; each only bounds a hang
 # (docs/TESTING.md §6.3). The launcher's stop gives each member 2 s after
@@ -292,9 +300,9 @@ def readiness(session):
     try:
         with open(os.path.join(session, f"{BRIDGE}.log"), "rb") as f:
             if FIRST_STATE_LINE.encode() not in f.read():
-                waiting.append("a State accepted by the bridge")
+                waiting.append(WAITING_FOR_STATE)
     except OSError:
-        waiting.append("a State accepted by the bridge")
+        waiting.append(WAITING_FOR_STATE)
     try:
         with open(os.path.join(session, "manifest.json"),
                   encoding="utf-8") as f:
@@ -313,11 +321,14 @@ def readiness(session):
     return not waiting, waiting
 
 
-def wait_ready(launch, out, timeout_s):
+def wait_ready(launch, out, timeout_s, state_s=None):
     """Waits for readiness() of the session the launch writes under `out`,
-    for the launch's exit, or `timeout_s`: returns what it was still
-    waiting for (empty when ready or the launch exited)."""
+    for the launch's exit, or `timeout_s`: returns the problem, empty when
+    ready or the launch exited. With `state_s`, once every member's loop has
+    started and only the State is missing, the wait ends `state_s` after
+    that moment (never past `timeout_s`)."""
     deadline = time.monotonic() + timeout_s
+    state_deadline = None
     watch = Watch(launch.process.pid)
     try:
         watch.add(out, directory=True)
@@ -340,12 +351,19 @@ def wait_ready(launch, out, timeout_s):
                     log_watched = True
                 done, waiting = readiness(session)
                 if done:
-                    return []
-            left = deadline - time.monotonic()
-            if left <= 0:
-                return waiting
-            watch.wait(left)
-        return []
+                    return ""
+                if (state_s is not None and state_deadline is None
+                        and waiting == [WAITING_FOR_STATE]):
+                    state_deadline = time.monotonic() + state_s
+            now = time.monotonic()
+            if state_deadline is not None and now >= state_deadline:
+                return (f"no State accepted by the bridge within {state_s} "
+                        "s of every member's loop starting")
+            if now >= deadline:
+                return (f"after {timeout_s} s, still waiting for "
+                        f"{'; '.join(waiting)}")
+            watch.wait(min(deadline, state_deadline or deadline) - now)
+        return ""
     finally:
         watch.close()
 
@@ -357,11 +375,11 @@ class Launch:
     a check that raises, or is ended by a signal, leaves no process of the
     launch behind."""
 
-    def __init__(self, args, output, pass_fds=()):
+    def __init__(self, args, output, pass_fds=(), cwd=None, env=None):
         self.process = subprocess.Popen(
             args, stdin=subprocess.DEVNULL, stdout=output,
             stderr=subprocess.STDOUT, start_new_session=True,
-            pass_fds=pass_fds)
+            pass_fds=pass_fds, cwd=cwd, env=env)
         # setsid made the child its session's and process group's leader.
         self.sid = self.process.pid
         self.stopped = None
@@ -500,10 +518,11 @@ def ready_bound(settle_s):
 
 
 def check(sim, settle_s, log_dump, session_report, registry_unlink,
-          ready_s):
-    """Runs `sim`, waits up to `ready_s` for it to be ready, lets it run
-    `settle_s` more, stops it and judges it: (problems, diagnostics); no
-    problems is a pass."""
+          ready_s, state_s=None):
+    """Runs `sim`, waits up to `ready_s` for it to be ready (with `state_s`,
+    for the State only `state_s` past every member's loop starting; module
+    docstring), lets it run `settle_s` more, stops it and judges it:
+    (problems, diagnostics); no problems is a pass."""
     report = load_session_report(session_report)
     gateway_port, bridge_port = udp_ports()
     with tempfile.TemporaryDirectory(
@@ -524,11 +543,9 @@ def check(sim, settle_s, log_dump, session_report, registry_unlink,
         try:
             with open(output_path, "wb") as output, \
                     Launch(args, output) as launch:
-                waiting = wait_ready(launch, out, ready_s)
-                if waiting:
-                    problems.append(
-                        f"after {ready_s} s, still waiting for "
-                        f"{'; '.join(waiting)}")
+                unready = wait_ready(launch, out, ready_s, state_s)
+                if unready:
+                    problems.append(unready)
                 elif launch.process.poll() is None:
                     try:
                         launch.process.wait(timeout=settle_s)

@@ -232,6 +232,8 @@ class HardwareProtocolCheck {
 // The names log_dump gives these values, shared so every tool spells them
 // alike.
 const char* HardwareModeName(hardware::Mode mode);
+// "off" (no pulse) or "pulse".
+const char* PwmModeName(hardware::PwmMode mode);
 const char* CanBusReadStateName(hardware::CanBusReadState state);
 // The mode the Driver Station selected (its flags), whether or not the robot
 // is enabled in it: "teleop", "autonomous", "test" or "none".

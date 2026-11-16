@@ -55,7 +55,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   command.digital_output_count = kMaxDigitalOutputs;
   command.pwm_output_count = kMaxPwmOutputs;
   std::array<uint8_t, kMaxCommandSize> command_bytes{};
-  ASSERT_EQ(Encode(command, command_bytes), 410u);
+  ASSERT_EQ(Encode(command, command_bytes), 414u);
   Command decoded_command;
   ASSERT_TRUE(Decode(command_bytes, decoded_command));
   EXPECT_EQ(decoded_command, command);
@@ -210,7 +210,7 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
   command.digital_output_count = 1;
   command.digital_outputs[0] = {0x0304, true};
   command.pwm_output_count = 1;
-  command.pwm_outputs[0] = {0x0506, 0.5};
+  command.pwm_outputs[0] = {0x0506, PwmMode::kPulse, 0.5};
   const std::vector<uint8_t> expected{
       0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,   // config_id
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,   // boot_id
@@ -222,6 +222,7 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
       0,    0,    0,    0,    0,    0,    0,    0xC0,   // feedforward_v -2.0
       0x04, 0x03, 1,                                    // digital output
       0x06, 0x05,                                       // pwm id
+      1,                                                // pwm mode pulse
       0,    0,    0,    0,    0,    0,    0xE0, 0x3F};  // pwm output 0.5
   std::array<uint8_t, kMaxCommandSize> bytes{};
   const auto size = Encode(command, bytes);
@@ -230,6 +231,78 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
   Command decoded;
   ASSERT_TRUE(Decode(expected, decoded));
   EXPECT_EQ(decoded, command);
+}
+
+// A PWM request is off (no pulse) or a pulse, and off has one byte string:
+// mode 0 and output +0.0. A pulse of 0 (the 1.5 ms centre, which centres a
+// servo) and off both round-trip as sent, never one for the other. A mode
+// byte above kLastPwmMode, or an off request whose output bytes are not all
+// zero (-0.0 included), neither encodes nor decodes: a peer reading such
+// bytes cannot know which of the two was meant.
+// REQ-SAFE-03, REQ-CONTRACT-03
+TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
+  Command command;
+  command.pwm_output_count = 2;
+  command.pwm_outputs[0] = {0x0506, PwmMode::kOff, 0.0};
+  command.pwm_outputs[1] = {0x0708, PwmMode::kPulse, 0.0};
+  std::array<uint8_t, kMaxCommandSize> bytes{};
+  const auto size = Encode(command, bytes);
+  ASSERT_EQ(size, kCommandBaseSize + 2 * kPwmRequestSize);
+  Command decoded;
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_EQ(decoded.pwm_outputs[0], command.pwm_outputs[0]);
+  EXPECT_EQ(decoded.pwm_outputs[1], command.pwm_outputs[1]);
+
+  // Byte offsets of the first request's mode and output.
+  const std::size_t mode_at = kCommandBaseSize + 2;
+  const std::size_t output_at = mode_at + 1;
+  const struct {
+    const char* label;
+    PwmRequest request;
+    std::size_t byte;
+    uint8_t value;
+  } rows[] = {
+      {"mode 2", {0x0506, static_cast<PwmMode>(2), 0.0}, mode_at, 2},
+      {"mode 255", {0x0506, static_cast<PwmMode>(255), 0.0}, mode_at, 255},
+      {"off with a nonzero output",
+       {0x0506, PwmMode::kOff, 0.5},
+       output_at + 7,
+       0x3F},
+      {"off with output -0.0",
+       {0x0506, PwmMode::kOff, -0.0},
+       output_at + 7,
+       0x80},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    Command bad = command;
+    bad.pwm_outputs[0] = row.request;
+    std::array<uint8_t, kMaxCommandSize> refused{};
+    EXPECT_EQ(Encode(bad, refused), 0u);
+    auto corrupted = bytes;
+    corrupted[row.byte] = row.value;
+    EXPECT_FALSE(Decode(std::span{corrupted}.first(size), decoded));
+  }
+}
+
+// The motor mode byte runs to kLastMode, torque current (6), and no further:
+// a torque-current request round-trips as sent, and a mode byte past it is
+// refused, so a peer of a later protocol is never misread.
+// REQ-SAFE-43, REQ-CONTRACT-03
+TEST(Messages, MotorModeRunsToTorqueCurrentAndNoFurther) {
+  Command command;
+  command.count = 1;
+  command.motors[0] = {0x0102, Mode::kTorqueCurrent, 0, -2.5, 0.0};
+  std::array<uint8_t, kMaxCommandSize> bytes{};
+  const auto size = Encode(command, bytes);
+  ASSERT_EQ(size, kCommandBaseSize + kMotorRequestSize);
+  const std::size_t mode_at = kCommandBaseSize + 2;
+  ASSERT_EQ(bytes[mode_at], 6);
+  Command decoded;
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_EQ(decoded, command);
+  bytes[mode_at] = 7;
+  EXPECT_FALSE(Decode(std::span{bytes}.first(size), decoded));
 }
 
 // The State the RoboRIO sends, byte for byte: integers, doubles, the float
@@ -584,6 +657,84 @@ TEST(Config, LimitSwitchesTravelOnTheWireAndFingerprint) {
   ASSERT_NE(at.first, bytes.end());
   *at.first = 3;
   EXPECT_FALSE(DeserializeConfig(bytes, decoded));
+}
+
+// The RoboRIO sets EnableFOC from foc, so both ends must agree on it: it
+// travels on the config wire as one byte, 0 or 1, and changes the config id.
+// A follower copies its master's output, so it cannot set foc.
+// REQ-CONTRACT-39
+TEST(Config, FocTravelsOnTheWireAndFingerprintAndAFollowerCannotSetIt) {
+  auto c = SwerveConfig(true);
+  const auto default_id = ConfigurationId(c);
+  c.motors[0].foc = true;
+  EXPECT_NE(ConfigurationId(c), default_id);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(c), decoded));
+  EXPECT_EQ(decoded, c);
+
+  // The one byte that differs from foc = false is foc's; 2 is refused.
+  auto bytes = SerializeConfig(c);
+  auto off = c;
+  off.motors[0].foc = false;
+  const auto off_bytes = SerializeConfig(off);
+  ASSERT_EQ(bytes.size(), off_bytes.size());
+  const auto at = std::mismatch(bytes.begin(), bytes.end(), off_bytes.begin());
+  ASSERT_NE(at.first, bytes.end());
+  EXPECT_EQ(*at.first, 1);
+  *at.first = 2;
+  EXPECT_FALSE(DeserializeConfig(bytes, decoded));
+
+  auto follower = c;
+  follower.motors[1].master_id = follower.motors[0].id;
+  EXPECT_NO_THROW(Validate(follower));
+  follower.motors[1].foc = true;
+  EXPECT_THROW(Validate(follower), std::invalid_argument);
+}
+
+// The gateway checks a torque-current demand against max_torque_current_a
+// and the RoboRIO sets its peak torque current from it, so both ends must
+// agree on it: it travels on the config wire and changes the config id.
+// REQ-SAFE-43
+TEST(Config, TorqueCurrentLimitTravelsOnTheWireAndFingerprint) {
+  auto c = SwerveConfig(true);
+  c.motors[0].foc = true;
+  const auto no_limit_id = ConfigurationId(c);
+  c.motors[0].max_torque_current_a = 12.5;
+  EXPECT_NE(ConfigurationId(c), no_limit_id);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(c), decoded));
+  EXPECT_EQ(decoded, c);
+}
+
+// A RoboRIO's saved configuration written before foc existed (each motor
+// record one byte shorter) is refused at startup rather than misread, so the
+// RoboRIO boots unconfigured, as with a corrupt file, until the bridge
+// pushes its configuration.
+// REQ-CONTRACT-39
+TEST(ConfigWire, APersistedConfigWithoutTheFocByteIsRefused) {
+  const auto c = SwerveConfig(true);
+  ASSERT_GT(c.motors.size(), 1u);
+  auto bytes = SerializeConfig(c);
+  // Each motor's foc byte is the one that differs when only its foc does.
+  std::vector<std::ptrdiff_t> foc_offsets;
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    auto on = c;
+    on.motors[i].foc = true;
+    const auto on_bytes = SerializeConfig(on);
+    ASSERT_EQ(on_bytes.size(), bytes.size());
+    const auto at = std::mismatch(bytes.begin(), bytes.end(), on_bytes.begin());
+    ASSERT_NE(at.first, bytes.end());
+    foc_offsets.push_back(at.first - bytes.begin());
+  }
+  for (auto it = foc_offsets.rbegin(); it != foc_offsets.rend(); ++it)
+    bytes.erase(bytes.begin() + *it);
+  const uint32_t crc = ComputeCrc32(bytes);
+  for (int i = 0; i < 4; ++i)
+    bytes.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+  Config loaded;
+  EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
+  ASSERT_TRUE(LoadPersistedConfig(PersistedConfig(c), loaded));
+  EXPECT_EQ(loaded, c);
 }
 
 TEST(SimBackend, PigeonMountCalibrationReachesIdealBackend) {
@@ -1040,7 +1191,8 @@ TEST(Gateway, NeutralInFlightAcrossAnEpochChangeIsNotARejection) {
 }
 // Only a neutral that can have been in flight across the epoch change is
 // exempt. An older-epoch command that drives any output (the counter's
-// safety case), one arriving while a command of the new epoch is in force,
+// safety case; a PWM pulse of 0 is the 1.5 ms centre pulse, so it drives),
+// one arriving while a command of the new epoch is in force,
 // one of a newer or never-issued epoch, and one that fails another check too
 // are each refused and counted.
 // REQ-SAFE-17
@@ -1054,7 +1206,7 @@ TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
     c.digital_output_count = 1;
     c.digital_outputs[0] = {40, false};
     c.pwm_output_count = 1;
-    c.pwm_outputs[0] = {41, 0.0};
+    c.pwm_outputs[0] = {41, PwmMode::kOff, 0.0};
     return c;
   };
   enum class Epoch { kOlder, kNewer, kNeverIssued };
@@ -1073,8 +1225,8 @@ TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
        }},
       {"older epoch, digital output on", Epoch::kOlder, false, false,
        [](Command& c) { c.digital_outputs[0].value = true; }},
-      {"older epoch, PWM output on", Epoch::kOlder, false, false,
-       [](Command& c) { c.pwm_outputs[0].output = 0.5; }},
+      {"older epoch, PWM pulsing at its centre", Epoch::kOlder, false, false,
+       [](Command& c) { c.pwm_outputs[0].mode = PwmMode::kPulse; }},
       {"older epoch, a command in force", Epoch::kOlder, true, false, none},
       {"newer epoch", Epoch::kNewer, false, false, none},
       {"epoch never issued", Epoch::kNeverIssued, false, false, none},
@@ -1100,6 +1252,47 @@ TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
     EXPECT_FALSE(g.Accept(command, 2, now));
     EXPECT_EQ(backend.applied, applied);
     EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  }
+}
+// The gateway hands each PWM request to the backend as the command carries
+// it: off as off (no pulse), a pulse of 0 as a pulse (the centre). A pulse
+// outside [-1, 1] or not finite, or a mode the wire does not define, rejects
+// the whole command and applies nothing.
+// REQ-SAFE-03, REQ-SAFE-17
+TEST(Gateway, PwmRequestsReachTheBackendAsSentAndABadOneRejectsTheCommand) {
+  auto config = SwerveConfig(true);
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const struct {
+    const char* label;
+    PwmRequest request;
+    bool accepted;
+  } rows[] = {
+      {"off", {41, PwmMode::kOff, 0.0}, true},
+      {"a pulse of 0", {41, PwmMode::kPulse, 0.0}, true},
+      {"a pulse of -1", {41, PwmMode::kPulse, -1.0}, true},
+      {"a pulse above 1", {41, PwmMode::kPulse, 1.5}, false},
+      {"a pulse not finite", {41, PwmMode::kPulse, std::nan("")}, false},
+      {"mode 2", {41, static_cast<PwmMode>(2), 0.0}, false},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    auto command = Request(g);
+    command.pwm_output_count = 1;
+    command.pwm_outputs[0] = row.request;
+    const int applied = backend.applied;
+    EXPECT_EQ(g.Accept(command, 1, 1000), row.accepted);
+    EXPECT_EQ(backend.applied - applied, row.accepted ? 1 : 0);
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count,
+              row.accepted ? 0u : 1u);
+    if (row.accepted) {
+      ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
+      EXPECT_EQ(backend.last_pwm_outputs[0], row.request);
+    } else {
+      EXPECT_TRUE(backend.last_pwm_outputs.empty());
+    }
   }
 }
 // The RoboRIO's loop watchdog arms on command_expiry_us, so it must be the
@@ -1685,7 +1878,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   c.digital_output_count = 1;
   c.digital_outputs[0] = {4, true};
   c.pwm_output_count = 1;
-  c.pwm_outputs[0] = {7, 0.85};
+  c.pwm_outputs[0] = {7, PwmMode::kPulse, 0.85};
   std::array<uint8_t, protocol::kMaxPayloadSize> bytes{};
   const auto size = Encode(c, bytes);
   Command decoded;
@@ -2432,7 +2625,10 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
 // The RoboRIO program reports to the drive team whether its companion is
 // talking, and in which protocol. A clock probe alone (all the bridge sends
 // while nothing is commanded) is contact; a frame of another protocol version
-// is recorded with that version, not dropped unseen.
+// is recorded with that version, not dropped unseen, and is not contact: a
+// Command from a bridge one protocol behind (whose PWM requests, for one,
+// have another layout) never reaches the gateway.
+// REQ-CONTRACT-01
 TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
   SimBackend backend;
   Gateway gateway{backend, 2004};
@@ -2465,14 +2661,15 @@ TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
   EXPECT_EQ(contact.command_us, 2000u);
   EXPECT_EQ(contact.version_mismatch_us, 0u);
 
-  const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion + 1);
-  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 0, nullptr,
-                                0, foreign),
+  const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion - 1);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 0, 0,
+                                command.data(), command_size, foreign),
             protocol::UdpStatus::kOk);
   ASSERT_TRUE(tick_until(3000, contact.version_mismatch_us));
   EXPECT_EQ(contact.version_mismatch_us, 3000u);
   EXPECT_EQ(contact.mismatched_version, foreign);
   EXPECT_EQ(contact.frame_us, 2000u);
+  EXPECT_EQ(contact.command_us, 2000u);
 }
 
 TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
@@ -2567,12 +2764,12 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
     cmd.digital_output_count = 1;
     cmd.digital_outputs[0] = {4, true};
     cmd.pwm_output_count = 1;
-    cmd.pwm_outputs[0] = {7, 0.85};
+    cmd.pwm_outputs[0] = {7, PwmMode::kPulse, 0.85};
     return cmd;
   };
   auto expect_driven = [](FailableSim& backend, const State& s) {
     EXPECT_TRUE(backend.sim.GetDigitalOutput(4));
-    EXPECT_DOUBLE_EQ(backend.sim.GetPwm(7), 0.85);
+    EXPECT_EQ(backend.sim.GetPwm(7), (PwmRequest{7, PwmMode::kPulse, 0.85}));
     ASSERT_GT(s.motor_count, 0u);
     EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 10.0);
     EXPECT_EQ(s.digital_outputs[0].value, true);
@@ -2580,7 +2777,8 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
   };
   auto expect_safe_backends = [](FailableSim& backend) {
     EXPECT_FALSE(backend.sim.GetDigitalOutput(4));
-    EXPECT_DOUBLE_EQ(backend.sim.GetPwm(7), 0.0);
+    // No pulse: off, not a pulse of 0 (which centres a servo).
+    EXPECT_EQ(backend.sim.GetPwm(7), (PwmRequest{.id = 7}));
   };
   auto expect_safe_state = [](const State& s) {
     ASSERT_GT(s.motor_count, 0u);
@@ -3330,7 +3528,7 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
     c.digital_output_count = 1;
     c.digital_outputs[0] = {40, true};
     c.pwm_output_count = 1;
-    c.pwm_outputs[0] = {41, 0.5};
+    c.pwm_outputs[0] = {41, PwmMode::kPulse, 0.5};
     return c;
   };
   const auto expect_isolated = [&](const char* phase) {
@@ -3342,7 +3540,8 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
     ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
     EXPECT_TRUE(backend.last_digital_outputs[0].value);
     ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
-    EXPECT_DOUBLE_EQ(backend.last_pwm_outputs[0].output, 0.5);
+    EXPECT_EQ(backend.last_pwm_outputs[0],
+              (PwmRequest{41, PwmMode::kPulse, 0.5}));
     const auto s = g.snapshot();
     EXPECT_FALSE(s.motors[0].valid);
     EXPECT_FALSE(s.motors[1].valid);
@@ -3638,6 +3837,60 @@ TEST(Gateway, RangeErrorsNeutralizeOnlyTheirMotor) {
     EXPECT_DOUBLE_EQ(g.snapshot().motors[1].velocity_rps, 1);
   }
   EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, invalid.size());
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+}
+
+// A torque-current request reaches the backend as sent only for a motor with
+// foc and a positive max_torque_current_a, within that limit and with no
+// feedforward; 0 A is a driving request, applied as sent, not neutral. Any
+// other torque-current request neutralizes that motor alone (counted), while
+// the rest of the command drives. A follower takes its master's mode, torque
+// current included, and goes neutral with it.
+// REQ-SAFE-43
+TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
+  FakeBackend backend;
+  auto config = SwerveConfig(true);
+  config.motors[0].foc = true;
+  config.motors[0].max_torque_current_a = 10;
+  config.motors[2].foc = true;  // No limit: the mode stays refused.
+  config.motors[4].master_id = config.motors[0].id;
+  ASSERT_EQ(config.motors[4].bus, config.motors[0].bus);
+  Gateway g{config, backend, 1};
+  const struct {
+    const char* label;
+    std::size_t motor;
+    double demand, feedforward_v;
+    bool sent;
+  } rows[] = {
+      {"at the limit", 0, -10, 0, true},
+      {"0 A", 0, 0, 0, true},
+      {"over the limit", 0, 10.5, 0, false},
+      {"with feedforward", 0, 5, 0.5, false},
+      {"no foc, no limit", 1, 0, 0, false},
+      {"foc, no limit", 2, 0, 0, false},
+  };
+  uint64_t now = 1000, sequence = 1;
+  uint32_t neutralized = 0;
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    g.Tick(now, true);
+    auto command = Request(g);
+    const MotorRequest torque{config.motors[row.motor].id, Mode::kTorqueCurrent,
+                              0, row.demand, row.feedforward_v};
+    command.motors[row.motor] = torque;
+    ASSERT_TRUE(g.Accept(command, sequence++, now++));
+    ASSERT_EQ(backend.last_requests.size(), config.motors.size());
+    const MotorRequest neutral{torque.id, Mode::kNeutral, 0, 0, 0};
+    EXPECT_EQ(backend.last_requests[row.motor], row.sent ? torque : neutral);
+    // A neutralized motor 0 takes its follower with it; both count.
+    neutralized += row.sent ? 0 : row.motor == 0 ? 2 : 1;
+    EXPECT_EQ(backend.last_requests[3], command.motors[3]);
+    if (row.motor == 0) {
+      EXPECT_EQ(backend.last_requests[4].mode,
+                row.sent ? Mode::kTorqueCurrent : Mode::kNeutral);
+    }
+  }
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, neutralized);
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
 }
 

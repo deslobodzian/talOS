@@ -107,7 +107,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **8**.
+One datagram contains exactly one protocol frame, version **11**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -128,13 +128,13 @@ classification and `--replay-inputs`
 So a bump makes earlier sessions' hardware packets unreadable to this build's
 tools, and a change without one decodes them wrongly with no warning. The
 `wire_golden_test`s in `talOS/hardware` and `talOS/driver_station` pin the
-bytes of a fully populated State, Command and Driver Station packet to the
-current version and fail on any change until it is bumped.
+bytes of a fully populated State, Command, configuration and Driver Station
+packet to the current version and fail on any change until it is bumped.
 
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
 | State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` | 1419 | 1459 | 13 |
-| Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
+| Command, type 21 | `38 + 20M + 3DO + 11PWM` | 414 | 454 | 1018 |
 | Config chunk, type 22 | 24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
 | DriverStation, type 24 | 40 fixed + two FMS strings + six variable joysticks | 678 | 718 | 754 |
@@ -176,13 +176,13 @@ and every State the bridge's `--log` records names its build.
 
 | Device | State bytes / device | Command bytes / device | Encoded fields |
 |---|---:|---:|---|
-| Motor | 45 | 20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 + slot1 + demand8 + feedforward8. |
+| Motor | 45 | 20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 (0 neutral, 1 duty cycle, 2 voltage, 3 velocity, 4 position, 5 motion magic, 6 torque current; a decoder rejects any other) + slot1 + demand8 (duty ratio, volts, mechanism rotations/s, rotations, or stator amperes) + feedforward8 (volts; 0 unless velocity, position or motion magic). |
 | Sensor | 27 | — | id2 + valid1 + two doubles16 + two ages8 |
 | Digital input | 4 | — | id2 + valid1 + value1 |
 | Digital output | 4 | 3 | State id2 + valid1 + value1; command id2 + value1 |
 | Analog input | 15 | — | id2 + valid1 + voltage8 + age4 |
 | Encoder | 23 | — | id2 + valid1 + position8 + velocity8 + age4 |
-| PWM output | 11 | 10 | State id2 + valid1 + output8; command id2 + output8 |
+| PWM output | 11 | 11 | State id2 + valid1 + output8 (0 while it sends no pulse); command id2 + mode1 (0 off: no pulse, output +0.0; 1 a pulse, output in [-1, 1]; a decoder rejects any other mode, or an off output that is not +0.0) + output8 |
 
 These are codec sizes (`talOS/hardware/messages.h`, `messages.cc`), not native
 struct padding. Position, velocity and voltage remain binary64. Motor stator
@@ -238,9 +238,9 @@ checks CRC32, deserializes and validates caps, then reconfigures. A new config I
 replaces the assembly; inconsistent metadata or invalid assembled data is
 rejected. Completion/backend failure or malformed data produces the 73-byte ACK
 with status/reason (`config_wire.h`, `endpoint.h`).
-Hardware configuration assembly rejects serialized totals above **10,083 B**
+Hardware configuration assembly rejects serialized totals above **10,227 B**
 (`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
-**1,408 B**; chunk counts cannot exceed 10,083 or the serialized byte count.
+**1,408 B**; chunk counts cannot exceed 10,227 or the serialized byte count.
 Transfer metadata and chunk geometry must remain consistent, and assembler
 exceptions reject the transfer without escaping the gateway safety loop.
 
@@ -296,11 +296,11 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
 | `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data 320 on the bench ([actual bench robot](#actual-bench-robot)), ≤1419 |
-| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data 98 on the bench, ≤410 |
+| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data 98 on the bench, ≤414 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
 | `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four 20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change, but a change to its layout makes earlier sessions unreplayable into every node with devices ([replay after a schema change](../talOS/launcher/README.md#replay-after-a-schema-change)) |
-| `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; the bench's motor/swerve_module payload 48/40 B, slots 56/48 B; the superstructure example's elevator/intake/superstructure 24/17/17 B, slots 32/32/32 B |
+| `/<sub>/target/<source>`: producer → target resolver | `align_up(16 + sizeof(message), 8) + 8` | TargetEnvelope payload: mode-generation/active header 16 + FlatBuffers struct; the bench's motor/swerve_module payload 56/40 B (motor's 40 B MotorTarget pinned in the bench motor node), slots 64/48 B; the superstructure example's elevator/intake/superstructure 24/17/17 B, slots 32/32/32 B |
 | `/motor/state` (bench only): motor → telemetry/logs | 104 | 96 B MotorState including device temperature, supply current and limit switches; pinned in bench motor node |
 | `/swerve_module/state` (bench only): swerve_module → telemetry/logs | 128 | 120 B ModuleState: drive, steer and CANcoder feedback, the commanded setpoint and flags; pinned in `swerve_module.h` |
 | `/gyro/state` (bench only): gyro → telemetry/logs | 56 | 48 B GyroState: yaw, yaw rate, their ages and two flags, including padding; Python node, size pinned at import by `bench/main_processor/gyro/node_py_test.py` |
@@ -463,8 +463,8 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
-| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8400 B |
-| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1952 B (largest 1168 / 1200 B) | 1 page, 8784 B |
+| Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8424 B |
+| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1952 B (largest 1168 / 1200 B) | 1 page, 8808 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):

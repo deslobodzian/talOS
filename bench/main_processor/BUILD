@@ -46,11 +46,22 @@ cc_binary(
 )
 
 # warm_up_test only: a native library whose load leaves a mark (the
-# warm-up's macOS native-library pass).
+# warm-up's macOS native-library pass). Never instrumented: deploy.sh loads
+# it into an uninstrumented python3, and on macOS a sanitizer's runtime is a
+# dylib that aborts ("Interceptors are not working") when dlopen'd after
+# start, so under --config=asan or tsan the load would kill the warm-up.
+# -fno-sanitize=all leaves it no sanitizer call; the global --linkopt still
+# names the runtime after this rule's linkopts, so ld64 drops the dylibs
+# nothing references.
 cc_binary(
     name = "bundle_test_native_mark.so",
     testonly = True,
     srcs = ["bundle_test_native_mark.cc"],
+    copts = ["-fno-sanitize=all"],
+    linkopts = select({
+        "@platforms//os:macos": ["-Wl,-dead_strip_dylibs"],
+        "//conditions:default": [],
+    }),
     linkshared = True,
 )
 

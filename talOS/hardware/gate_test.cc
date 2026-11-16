@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -57,6 +58,47 @@ TEST(GateTest, FeedbackFreshBoundary) {
   constexpr uint32_t kUnknown = std::numeric_limits<uint32_t>::max();
   EXPECT_FALSE(FeedbackFresh(kUnknown, kTimeoutUs));
   EXPECT_FALSE(FeedbackFresh(kUnknown, uint64_t{kUnknown} + 1));
+}
+
+// The torque-current rule the gateway and the RoboRIO both hold: a foc motor
+// with a positive limit, |demand| within it (the limit itself included), and
+// a feedforward equal to 0 (-0.0 is 0); anything non-finite fails.
+// REQ-SAFE-43
+TEST(GateTest, TorqueCurrentAllowedBoundaries) {
+  constexpr double kNan = std::numeric_limits<double>::quiet_NaN();
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  const struct {
+    const char* label;
+    bool foc;
+    double limit_a, demand_a, feedforward_v;
+    bool allowed;
+  } rows[] = {
+      {"within", true, 5, 2, 0, true},
+      {"0 A", true, 5, 0, 0, true},
+      {"at the limit", true, 5, 5, 0, true},
+      {"at the reverse limit", true, 5, -5, 0, true},
+      {"-0.0 feedforward", true, 5, 2, -0.0, true},
+      {"over the limit", true, 5, std::nextafter(5.0, 6.0), 0, false},
+      {"under the reverse limit", true, 5, -5.5, 0, false},
+      {"NaN demand", true, 5, kNan, 0, false},
+      {"infinite demand", true, 5, kInf, 0, false},
+      {"-infinite demand", true, 5, -kInf, 0, false},
+      {"feedforward", true, 5, 2, 0.5, false},
+      {"NaN feedforward", true, 5, 2, kNan, false},
+      {"infinite feedforward", true, 5, 2, kInf, false},
+      {"no foc", false, 5, 2, 0, false},
+      {"no limit", true, 0, 0, 0, false},
+      {"NaN limit", true, kNan, 0, 0, false},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    MotorConfig m;
+    m.foc = row.foc;
+    m.max_torque_current_a = row.limit_a;
+    const MotorRequest r{2, Mode::kTorqueCurrent, 0, row.demand_a,
+                         row.feedforward_v};
+    EXPECT_EQ(TorqueCurrentAllowed(m, r), row.allowed);
+  }
 }
 
 TEST(GateTest, GatewayReadyNeedsConfiguredAndEnabledWithoutFault) {
