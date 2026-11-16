@@ -3508,7 +3508,7 @@ TEST(LauncherSessions, AOneOffLockFailureLeavesARunningSession) {
 // refuses the launch, not the Studio bridge's warning that leaves it out of
 // the session. With --start-studio-bridge, the launcher's bridge would be a
 // second roster member of that name: the launch is refused naming the key.
-// REQ-OPS-30, REQ-OPS-01
+// REQ-OPS-30, REQ-OPS-01, REQ-CONTRACT-42
 TEST(LauncherSessions, ASubsystemNamedStudioBridgeIsAnOrdinaryNode) {
   auto options = SessionFixture("user_studio_bridge");
   const std::string root = options.output_dir;
@@ -3577,7 +3577,8 @@ TEST(LauncherSessions, ASubsystemNamedStudioBridgeNeverRunsTheBundledBridge) {
 // claiming the bridge's name and `/hw/state`) would be a second member of that
 // name; it is refused before anything is probed or spawned, naming the key,
 // even with --sim --allow-graph-errors, which would override the lint's `hw`
-// writer error. REQ-SAFE-28, REQ-CONTRACT-09
+// writer error.
+// REQ-SAFE-28, REQ-CONTRACT-09, REQ-CONTRACT-42
 TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
   auto options = SessionFixture("subsystem_hardware_node");
   std::filesystem::remove_all(options.output_dir);
@@ -3608,7 +3609,8 @@ TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
 // launcher adds no gateway, is an ordinary node: started under --sim with
 // --log (its event log in the manifest) and --sim, and replayable. The
 // launcher's own gateway is still started with --config and no --log, and
-// with it such a subsystem is refused, naming the key. REQ-OPS-09, REQ-OPS-14
+// with it such a subsystem is refused, naming the key.
+// REQ-OPS-09, REQ-OPS-14, REQ-CONTRACT-42
 TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
   struct Outcome {
     int status{-1};

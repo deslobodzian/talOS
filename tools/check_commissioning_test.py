@@ -1,6 +1,6 @@
 """Unit tests for tools/check_commissioning.py on a scratch git repository.
 
-RULES.md 4 (no docs/REQUIREMENTS.md row yet): an agent's commit that sets
+REQ-DEV-33 (RULES.md 4): an agent's commit that sets
 `commissioned = true` or changes a CAN id in a robot config fails; the same
 change in an example, or by a person's commit carrying
 `Commissioned-By: <name>`, passes.
@@ -58,7 +58,7 @@ class CheckCommissioningTest(unittest.TestCase):
         self.put(f"{root}/robot.toml", "[robot]\ncommissioned = true\n")
         self.put(f"{root}/subsystems/motor.toml", MOTOR.replace("= 1", "= 7"))
 
-    # RULES.md 4
+    # REQ-DEV-33, RULES.md 4
     def test_robot_config_commissioning_or_can_id_change_fails(self):
         self.edit_configs("bench/main_processor/configuration")
         self.commit("bench: tidy the config")
@@ -70,7 +70,7 @@ class CheckCommissioningTest(unittest.TestCase):
         self.assertIn("motor.toml:3: removes a CAN id: can_id = 1", text)
         self.assertIn("motor.toml:3: sets a CAN id: can_id = 7", text)
 
-    # RULES.md 4
+    # REQ-DEV-33, RULES.md 4
     def test_trailer_covers_only_its_own_commit(self):
         self.edit_configs("bench/main_processor/configuration")
         self.commit("bench: commission at the robot",
@@ -83,7 +83,7 @@ class CheckCommissioningTest(unittest.TestCase):
         found = check_commissioning.check(self.base)
         self.assertEqual(len(found), 2, found)
 
-    # RULES.md 4: every spelling the TOML parser accepts is seen.
+    # REQ-DEV-33, RULES.md 4: every spelling the TOML parser accepts is seen.
     def test_dotted_inline_quoted_and_commented_keys_fail(self):
         config = "bench/main_processor/configuration/robot.toml"
         for line in ("robot.commissioned = true",
@@ -98,7 +98,7 @@ class CheckCommissioningTest(unittest.TestCase):
                 self.commit("bench: respell")
                 self.assertTrue(check_commissioning.check(before), line)
 
-    # RULES.md 4: a comment or string naming the key is not the key.
+    # REQ-DEV-33, RULES.md 4: a comment or string naming the key is not the key.
     def test_comment_mentioning_the_key_passes(self):
         self.put("bench/main_processor/configuration/robot.toml",
                  ROBOT + "# set commissioned = true at the robot\n"
@@ -106,14 +106,14 @@ class CheckCommissioningTest(unittest.TestCase):
         self.commit("bench: comment")
         self.assertEqual(check_commissioning.check(self.base), [])
 
-    # RULES.md 4: the developer's git configuration changes nothing.
+    # REQ-DEV-33, RULES.md 4: the developer's git configuration changes nothing.
     def test_no_prefix_diff_config_still_fails(self):
         self.git("config", "diff.noprefix", "true")
         self.edit_configs("bench/main_processor/configuration")
         self.commit("bench: tidy the config")
         self.assertEqual(len(check_commissioning.check(self.base)), 3)
 
-    # RULES.md 4: examples carry placeholder ids.
+    # REQ-DEV-33, RULES.md 4: examples carry placeholder ids.
     def test_example_config_passes(self):
         self.edit_configs("examples/robot")
         self.commit("examples: renumber the placeholder")

@@ -1,6 +1,6 @@
 """Unit tests for tools/check_deps_listed.py on in-memory files.
 
-METHODOLOGY.md §13 rule 5 (no docs/REQUIREMENTS.md row yet): a bazel_dep
+REQ-DEV-34 (METHODOLOGY.md §13 rule 5): a bazel_dep
 the §13 "Bazel module" table does not list, and a row naming a module
 MODULE.bazel no longer has, each fail.
 """
@@ -36,12 +36,12 @@ def methodology(*rows):
 
 
 class CheckDepsListedTest(unittest.TestCase):
-    # METHODOLOGY.md §13 rule 5
+    # REQ-DEV-34, METHODOLOGY.md §13 rule 5
     def test_table_equal_to_bazel_deps_passes(self):
         self.assertEqual(
             check_deps_listed.check(MODULE, methodology(*ALL)), [])
 
-    # METHODOLOGY.md §13 rule 5
+    # REQ-DEV-34, METHODOLOGY.md §13 rule 5
     def test_unlisted_and_stale_modules_fail(self):
         self.assertEqual(
             check_deps_listed.check(
