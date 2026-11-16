@@ -465,7 +465,13 @@ damaged tail's prefix as it does a truncated log's.
 `log::LogReader` holds the whole file; `log::WindowedLogReader` (and
 `VisitLog` on it) reads the same records, damage skipped the same way,
 through a fixed 64 KiB window, so a reader of a whole session (`log_dump`,
-Studio's review) holds memory per log, not per record.
+Studio's review) holds memory per log, not per record. The process's
+windowed readers keep at most 64 file descriptors open between them, and an
+open that finds the process out of descriptors first closes the least
+recently read one; a reader whose descriptor was closed opens its file again
+at its next window, refusing (naming it) a path that now holds another file,
+such as a log rotated while it was read. A session of more logs than
+`RLIMIT_NOFILE` therefore reads whole.
 
 Every record a reader returns carries its byte offset in its file
 (`Record::offset`; a rotated log's segment is a file of its own, and the

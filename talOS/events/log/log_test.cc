@@ -722,6 +722,67 @@ ReadBack ReadAll(const std::string& path, bool windowed) {
   return back;
 }
 
+// A session merge (log_dump, session_report, Studio's review) holds a
+// WindowedLogReader per log at once: readers of more logs than the
+// descriptor limit all open and read, interleaved, exactly what each log
+// holds, since a reader holds a descriptor only while it reads.
+// REQ-OPS-15
+TEST(WindowedLogReaderLimits, MoreReadersThanTheDescriptorLimit) {
+  const std::string source = TempPath("fd_limit_source");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(source, LogWriter::kDefaultBufferBytes);
+  constexpr std::size_t kSpare = 4;
+  constexpr std::size_t kLogs = 4 * kSpare;
+  std::vector<std::string> paths;
+  for (std::size_t i = 0; i < kLogs; ++i) {
+    paths.push_back(TempPath("fd_limit_" + std::to_string(i)));
+    std::filesystem::copy_file(
+        source, paths.back(),
+        std::filesystem::copy_options::overwrite_existing);
+  }
+  // At most kSpare descriptors are free below the lowered limit.
+  std::size_t open_now = 0;
+  for (const auto& entry : std::filesystem::directory_iterator{"/dev/fd"}) {
+    (void)entry;
+    ++open_now;
+  }
+  rlimit saved{};
+  ASSERT_EQ(0, ::getrlimit(RLIMIT_NOFILE, &saved));
+  rlimit lowered = saved;
+  lowered.rlim_cur = static_cast<rlim_t>(open_now + kSpare);
+  ASSERT_EQ(0, ::setrlimit(RLIMIT_NOFILE, &lowered));
+  std::vector<std::vector<ReadBack::Read>> got(kLogs);
+  std::string error;
+  try {
+    std::vector<WindowedLogReader> readers;
+    readers.reserve(kLogs);
+    for (const std::string& path : paths) readers.emplace_back(path);
+    LogReader::Record record;
+    for (bool more = true; more;) {
+      more = false;
+      for (std::size_t i = 0; i < kLogs; ++i) {
+        if (!readers[i].next(record)) continue;
+        more = true;
+        got[i].push_back(
+            {record.header, {record.payload.begin(), record.payload.end()}});
+      }
+    }
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+  ASSERT_EQ(0, ::setrlimit(RLIMIT_NOFILE, &saved));
+  EXPECT_EQ(error, "");
+  for (std::size_t i = 0; i < kLogs; ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_EQ(got[i].size(), expected.size());
+    for (std::size_t r = 0; r < expected.size(); ++r) {
+      ExpectRecordEquals(expected[r], got[i][r].view());
+    }
+    ::unlink(paths[i].c_str());
+  }
+  ::unlink(source.c_str());
+}
+
 // Where the fixture's record of `kind` in dispatch `dispatch` is.
 std::size_t FixtureIndex(const std::vector<ExpectedRecord>& expected,
                          std::uint64_t dispatch, EventKind kind) {

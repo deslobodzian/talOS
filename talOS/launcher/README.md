@@ -1373,8 +1373,9 @@ logs, 1.72 million 128-byte records; `bazel run -c opt
 //talOS/launcher:log_memory_bench`, Linux x86-64) `log_dump`'s peak resident
 memory is 5.6 MiB, text or JSONL, where reading every log whole and holding
 each record took 632 MiB. Each open log costs about 128 KiB (its window and
-header buffer) plus its manifest and schemas, and keeps a file descriptor
-open for the whole read.
+header buffer) plus its manifest and schemas. A session may hold more logs
+than `RLIMIT_NOFILE` allows open files: readers keep at most 64 descriptors
+open between them ([windowed reader](../events/README.md)).
 
 ```sh
 bazel run //talOS/launcher:log_dump -- /tmp/logs/session \
