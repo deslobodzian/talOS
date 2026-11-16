@@ -227,9 +227,24 @@ can_id = 2
     for (std::uint32_t i = 0; i < 10; ++i) {
       const Count count{2, i};
       publisher.write(std::as_bytes(std::span<const Count, 1>{&count, 1}));
-      std::this_thread::sleep_for(20ms);
     }
   }
+  // The stop below would race the sink's next drain: wait until it has read
+  // the last of them (its reader slot's sequence reaches the writer's), which
+  // it dispatches, and so logs, in the same drain.
+  const auto sink_read_all = [header] {
+    const std::uint64_t written =
+        header->writer.sequence.load(std::memory_order_acquire);
+    for (const auto& reader : header->readers) {
+      if ((reader.state.load(std::memory_order_acquire) & 3) ==
+              static_cast<std::uint64_t>(ReaderState::ACTIVE) &&
+          reader.sequence.load(std::memory_order_acquire) >= written) {
+        return true;
+      }
+    }
+    return false;
+  };
+  while (!sink_read_all() && !ended) std::this_thread::yield();
   // The launcher's stop handler ends the session (and the sink) cleanly.
   ASSERT_FALSE(ended) << "the session ended before the test stopped it";
   ::kill(::getpid(), SIGTERM);
