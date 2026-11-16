@@ -9,6 +9,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -1031,6 +1032,14 @@ std::int32_t NodeAccess::selected(const Node& node, std::size_t index) {
 // --- the binary --------------------------------------------------------------
 
 namespace detail {
+
+// Tests only: when set, called with the options of the event log a run
+// writes (a live run's, or --replay-inputs' output log) just before that
+// writer is made, so an in-process test can hold the writer thread
+// (LogWriterOptions::before_write) and see what a run whose own log has a
+// gap reports. Empty otherwise. node_test declares it where it uses it.
+std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+
 namespace {
 
 // Flags every node binary accepts.
@@ -1233,12 +1242,13 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
   const event::RecordedSession session{flags.replay_inputs, node_name};
   event::SimulationEnvironment environment;
-  Loop loop{
-      environment,
-      event::log::LogWriter{flags.log_path, node_name,
-                            event::log::LogWriterOptions{}, flags.session_id},
-      Loop::Options{.start = session.loop_start(),
-                    .run_start = session.run_start()}};
+  event::log::LogWriterOptions log_options;
+  if (log_options_for_test) log_options_for_test(log_options);
+  Loop loop{environment,
+            event::log::LogWriter{flags.log_path, node_name, log_options,
+                                  flags.session_id},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
   const Hosted hosted =
       Host(std::make_unique<OfflinePort<Loop>>(loop), node_name, flags, make);
   const event::InputReplayReport report =
@@ -1476,6 +1486,7 @@ int RunMain(int argc, char** argv, const char* node_name,
     event::log::LogWriterOptions log_options;
     log_options.max_bytes = flags.log_max_bytes;
     log_options.window = flags.log_window;
+    if (log_options_for_test) log_options_for_test(log_options);
     // The loop reads the stop flag between dispatches, so a stop takes effect
     // after the current dispatch even when overdue timers never let it wait
     // (an update() that overruns its period).
