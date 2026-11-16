@@ -30,7 +30,7 @@ namespace naming = introspect::naming;
 
 struct NodeSpec {
   std::string name;
-  std::string target;  // e.g. "//2026-robot/main_processor/drivetrain:node"
+  std::string target;  // e.g. "//bench/main_processor/swerve_module:node"
   std::string binary_path;
   // Forwarded unchanged to both --describe and runtime: the hardware
   // bridge's ControllerArgs, the sim gateway's SimulatorArgs.

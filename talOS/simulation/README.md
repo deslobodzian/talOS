@@ -12,17 +12,17 @@ launcher starts it under `--sim --start-sim-gateway`
 ```sh
 # Ideal actuators (fast logic tests); defaults to enabled teleop, blue alliance.
 bazel run //talOS/simulation:sim_gateway -- \
-  --config "$PWD/2026-robot/main_processor/configuration/robot.toml"
+  --config "$PWD/bench/main_processor/configuration/robot.toml"
 
 # Physics-backed ground truth with optional odometry error, bounded to ten seconds.
 bazel run //talOS/simulation:sim_gateway -- \
-  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --config "$PWD/bench/main_processor/configuration/robot.toml" \
   --physics --start-pose 2,2,0 --wheel-radius-error 0.1 \
   --wheel-slip-gain 0.2 --gyro-drift-radps 0.01 --duration-s 10
 
 # Script a disabled / autonomous / teleop cycle on the red alliance.
 bazel run //talOS/simulation:sim_gateway -- \
-  --config "$PWD/2026-robot/main_processor/configuration/robot.toml" \
+  --config "$PWD/bench/main_processor/configuration/robot.toml" \
   --mode-schedule disabled:0.2,auto:0.5,teleop:0.5,disabled:0.2 \
   --alliance red --duration-s 1.5
 ```
@@ -109,10 +109,10 @@ mark the asserted switches.
 
 ```sh
 bazel run //talOS/simulation:sim_gateway -- \
-  --config "$PWD/2026-robot/main_processor/configuration/robot_physics_sim.toml" \
+  --config "$PWD/bench/main_processor/configuration/robot_physics_sim.toml" \
   --physics --mode-schedule disabled:0.5,teleop:5 --duration-s 6 \
   --joystick-schedule '0:axes=0,0,0;buttons=0;pov=-1|1:axes=0,-0.6,0;buttons=0;pov=-1|3:axes=0,0,0;buttons=0;pov=-1|3.3:axes=0,-0.6,0;buttons=0;pov=-1' \
-  --fault-schedule '2:2.5:udp_blackout:bridge|4:5:motor_disconnect:back_left_drive'
+  --fault-schedule '2:2.5:udp_blackout:bridge|4:5:motor_disconnect:drive'
 ```
 
 `./sim.sh --sim-gateway` selects the physics backend. Its repeatable
@@ -186,5 +186,5 @@ simulator's State. `sim_gateway_test` (integration, about 1 s) runs the
 simulator alone: `--describe` and its flag checks, a run without a config,
 the Driver Station packets of a mode and joystick schedule, and the home
 switches `--physics` reads from a config. A robot's full-graph tests against the simulator live
-with the robot (the 2026 ones:
-[2026-robot simulation tests](../../2026-robot/main_processor/simulation/README.md)).
+with the robot (the bench's:
+[bench simulation tests](../../bench/main_processor/simulation/README.md)).

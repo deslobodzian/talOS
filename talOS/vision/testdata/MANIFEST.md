@@ -3,8 +3,8 @@
 Photographic fixtures, canonical `tag36h11` samples and synthetic scenes for
 the AprilTag detector tests (CPU backend, Metal parity, sanitizer fixtures).
 
-`2026-rebuilt-welded.json` is a copy of the robot's
-`2026-robot/main_processor/vision/data/2026-rebuilt-welded.json`, exported so
+`2026-rebuilt-welded.json` is a copy of the field layout of the same name in
+the 2026 robot's repository (its vision node's data), exported so
 framework simulation tests do not depend on robot code.
 
 ## 1. Photographic Fixtures

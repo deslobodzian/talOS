@@ -284,7 +284,7 @@ dictionary. Meanwhile it hears `talos.drive.heartbeat` every 100 ms (36 B
 each, affordable within 1.5 ms of being due at 24,000 B/s) and possibly a
 summary; the dictionary pages follow, whole and in order, as soon as the
 bucket holds each, then the keyframe. From an empty bucket that takes at
-most about 0.8 s on the 2026 config at the default 24,000 B/s (its
+most about 0.8 s on the 2026 robot's config at the default 24,000 B/s (its
 11,496 B dictionary, a keyframe of at most 2,592 B and one 4,096 B
 summary, framed, at the rate less the heartbeats). Text messages can
 arrive between two dictionary pages; the binary pages stay in order. The

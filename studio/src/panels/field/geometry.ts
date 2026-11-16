@@ -4,8 +4,8 @@
 // +X pointing right (away from the blue wall) and +Y pointing up; SVG y grows
 // downward, so `toPy` flips.
 
-// The 2026 field: field-dimensions of the robot's tag layout,
-// 2026-robot/main_processor/vision/data/2026-rebuilt-welded.json.
+// The 2026 field: field-dimensions of the 2026 robot's tag layout, copied to
+// talOS/vision/testdata/2026-rebuilt-welded.json.
 export const FIELD_WIDTH_M = 16.541;
 export const FIELD_HEIGHT_M = 8.069;
 export const PX_PER_M = 50;

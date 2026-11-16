@@ -113,8 +113,8 @@ export function demoPacket(sequence: bigint): Uint8Array {
 //
 // A stand-in for what the bridge reads out of the live node registry, so every
 // system view is explorable with no robot attached. The node and topic set is
-// the real one from 2026-robot/main_processor/configuration/robot.toml and the
-// node headers, because a demo that shows a system nobody runs teaches the
+// the real one from the 2026 robot's robot.toml and node headers (in that
+// robot's repository), because a demo that shows a system nobody runs teaches the
 // wrong thing.
 
 type DemoSource = {

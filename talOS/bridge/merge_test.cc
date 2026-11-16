@@ -14,7 +14,7 @@ namespace talos::hardware {
 namespace {
 
 constexpr std::uint64_t kCommandTimeoutUs = 100000;
-// A 5 ms owner under a 100 ms command timeout: every 2026-robot subsystem.
+// A 5 ms owner under a 100 ms command timeout: every 2026 robot subsystem.
 constexpr std::uint64_t kOwnerTimeoutUs = 50000;
 
 MergeOwner Owner() {
