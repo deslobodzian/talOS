@@ -1,16 +1,21 @@
 """Installed bundles describe their graph and keep their config identity.
 
-Each bundle is installed the way the robot gets it (tools/deploy.sh install
-into a fresh prefix, which runs every member once without a warning), then
---describe runs every node binary from there, so a
-C++ node that cannot load a shared library it links, a
-Python node that cannot import its wheels or start its interpreter (as
-when Bazel restored the bundle from its cache with links copied) fails
-here. The subjects are the bench robot's bundles: the deployable one, which
-carries Studio and which link and stop qualification install; the Python
-bench robot's, with two Python nodes; and a test config that reaches its
-files through `include`, a parent-directory `defaults`, a custom `path` and
-an entry `node`. A bundle that carries Studio is described by the command the boot service
+Each bundle is installed the way the robot gets it: its files copied as
+real files (Bazel's sandbox hands the test a tree of links into the build
+tree, which deploy.sh would copy as links), then tools/deploy.sh install
+into a fresh prefix, which runs every member once without a warning. Then
+--describe runs every node binary from there, so a C++ node that cannot
+load a shared library it links, or a Python node that cannot import its
+wheels or start its interpreter (as when Bazel restored the bundle from its
+cache with links copied), fails here. A Python node's native wheel (numpy's
+extension modules and the libraries the wheel bundles) must also load from
+the installed files and nowhere else. The subjects are the bench robot's
+bundles: the deployable one, which carries Studio and which link and stop
+qualification install; the Python bench robot's, with two Python nodes;
+and a test config that reaches its files through `include`, a
+parent-directory `defaults`, a custom `path` and an entry `node`, and adds
+a Python node importing numpy (the bench robot's own nodes import no native
+wheel). A bundle that carries Studio is described by the command the boot service
 runs (deploy.sh enable-boot's systemd ExecStart and launchd
 ProgramArguments), which must run its bridge from the install, found through
 the manifest's [studio] table, beside the index page of the webroot that
@@ -29,6 +34,7 @@ case that waits out a short bound: there every member has already run once
 from its installed path, so only the stub that never exits can reach it."""
 
 import filecmp
+import glob
 import json
 import os
 import plistlib
@@ -49,6 +55,42 @@ BUNDLES = (
     "bench/main_processor/bench_py_bundle",
     "bench/main_processor/relocation_bundle",
 )
+
+# Python nodes whose bundle holds a native wheel, and the modules of it that
+# must load from the installed files: the package, and the extension module
+# that links the libraries the wheel bundles.
+NATIVE_IMPORTS = {
+    "native_wheel": ("numpy", "numpy._core._multiarray_umath"),
+}
+
+# What a Python node's interpreter must not inherit from the test: the
+# installed venv alone decides what it imports.
+CLEAN_ENV = {k: v for k, v in os.environ.items()
+             if k not in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV",
+                          "RUNFILES_DIR", "RUNFILES_MANIFEST_FILE",
+                          "PYTHON_RUNFILES")}
+
+# Run by a node's venv interpreter: adds the site-packages directory it is
+# given, imports each module named after it and prints, as JSON, the real
+# path of each module's file and (where /proc exists) of every mapped file
+# whose path names one of their packages.
+IMPORT_PROBE = """
+import importlib, json, os, site, sys
+site.addsitedir(sys.argv[1])
+modules = sys.argv[2:]
+files = [os.path.realpath(importlib.import_module(m).__file__)
+         for m in modules]
+mapped = set()
+if os.path.exists("/proc/self/maps"):
+    roots = {m.split(".")[0] for m in modules}
+    with open("/proc/self/maps") as maps:
+        for line in maps:
+            fields = line.split(maxsplit=5)
+            path = fields[5].strip() if len(fields) == 6 else ""
+            if path.startswith("/") and any(r in path for r in roots):
+                mapped.add(os.path.realpath(path))
+print(json.dumps({"files": files, "mapped": sorted(mapped)}))
+"""
 
 
 def deploy_script():
@@ -86,6 +128,26 @@ def boot_command(prefix, system):
     return shlex.split(line.removeprefix("ExecStart="))
 
 
+def as_shipped(src, tmp):
+    """`src` as real files. Bazel's Linux sandbox links each file of a
+    bundle into the test's runfiles, and deploy.sh install copies links as
+    links (cp -RP), so installing `src` itself would run the build tree's
+    files; a talos_bundle holds no links of its own (REQ-OPS-48)."""
+    if not os.path.islink(os.path.join(src, "run.sh")):
+        return src
+    copy = os.path.join(tmp, os.path.basename(src))
+    shutil.copytree(src, copy, symlinks=False)
+    return copy
+
+
+def python_venvs(bundle, node):
+    """The venv interpreters under a Python node's runfiles in `bundle`."""
+    return [os.path.join(parent, "python3")
+            for parent, _, files in os.walk(os.path.join(
+                bundle, node["binary"] + ".runfiles"))
+            if parent.endswith(".venv/bin") and "python3" in files]
+
+
 def describe(bundle, prefix, command, *args):
     """Installs `bundle` under `prefix` with deploy.sh and runs `command`
     (an argv starting with the installed run.sh) with --describe-only and
@@ -120,6 +182,7 @@ class BundleTest(unittest.TestCase):
                     ignore_cleanup_errors=True) as tmp:
                 src = r.Rlocation(f"_main/{name}")
                 self.assertTrue(src and os.path.isdir(src), src)
+                src = as_shipped(src, tmp)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
                 studio = manifest.get("studio")
@@ -160,6 +223,41 @@ class BundleTest(unittest.TestCase):
                 self.assertTrue(manifest["config_sha256"])
                 self.assertEqual(graph["config_sha256"],
                                  manifest["config_sha256"])
+                # REQ-OPS-48
+                self.assert_native_wheels_load_from(
+                    os.path.realpath(where), manifest)
+
+    def assert_native_wheels_load_from(self, installed, manifest):
+        """Each NATIVE_IMPORTS node's modules, imported by its installed venv
+        with the import path its bootstrap gives it (rules_python's stage 2:
+        RUNFILES_DIR, then the venv's site-packages, whose bazel.pth adds the
+        node's imports), load from files under `installed`, as does every
+        library of the wheel they map."""
+        for node in manifest["nodes"]:
+            modules = NATIVE_IMPORTS.get(node["name"])
+            if not modules:
+                continue
+            venvs = python_venvs(installed, node)
+            self.assertEqual(len(venvs), 1, (node["name"], venvs))
+            sites = glob.glob(os.path.join(
+                os.path.dirname(os.path.dirname(venvs[0])),
+                "lib", "python3.*", "site-packages"))
+            self.assertEqual(len(sites), 1, (node["name"], sites))
+            proc = subprocess.run(
+                [venvs[0], "-c", IMPORT_PROBE, sites[0], *modules],
+                capture_output=True, text=True, timeout=120,
+                env=dict(CLEAN_ENV, RUNFILES_DIR=os.path.join(
+                    installed, node["binary"] + ".runfiles")),
+                cwd=os.path.dirname(installed))
+            self.assertEqual(proc.returncode, 0,
+                             f"{node['name']}: {proc.stderr}")
+            loaded = json.loads(proc.stdout)
+            if sys.platform == "linux":
+                self.assertTrue(loaded["mapped"], (node["name"], loaded))
+            for path in loaded["files"] + loaded["mapped"]:
+                self.assertTrue(path.startswith(installed + os.sep),
+                                f"{node['name']}: {path} is not under "
+                                f"{installed}")
 
     # REQ-OPS-48
     def test_every_python_node_runs_its_runtimes_one_interpreter(self):
@@ -179,11 +277,7 @@ class BundleTest(unittest.TestCase):
                 for node in manifest["nodes"]:
                     if node["language"] != "python":
                         continue
-                    venvs = [
-                        os.path.join(parent, "python3")
-                        for parent, _, files in os.walk(os.path.join(
-                            src, node["binary"] + ".runfiles"))
-                        if parent.endswith(".venv/bin") and "python3" in files]
+                    venvs = python_venvs(src, node)
                     self.assertTrue(venvs, node["name"])
                     for venv in venvs:
                         proc = subprocess.run(
