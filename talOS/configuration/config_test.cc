@@ -89,6 +89,43 @@ TEST(ConfigTest, MotorFocDefaultsOffAndIsRefusedOnAFollower) {
   }
 }
 
+// REQ-SAFE-43: max_torque_current_a defaults to 0, which refuses the
+// torque-current mode, so a config written before the key drives no motor in
+// it. Config load refuses a value that is negative, non-finite, above
+// stator_limit_a, set without foc = true (TorqueCurrentFOC is a Phoenix Pro
+// request) or set on a follower, naming the motor and the key.
+TEST(ConfigTest, MotorTorqueCurrentLimitNeedsFocAndStaysWithinTheStatorLimit) {
+  EXPECT_EQ(Parse("").hardware.motors.at(0).max_torque_current_a, 0.0);
+  EXPECT_EQ(Parse("foc = true\nstator_limit_a = 30.0\n"
+                  "max_torque_current_a = 30.0\n")
+                .hardware.motors.at(0)
+                .max_torque_current_a,
+            30.0);
+  const auto expect_refused = [](std::string_view body,
+                                 std::string_view motor) {
+    try {
+      Parse(body);
+      ADD_FAILURE() << "loaded " << body;
+    } catch (const std::invalid_argument& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find("max_torque_current_a"), std::string::npos) << what;
+      EXPECT_NE(what.find(motor), std::string::npos) << what;
+    }
+  };
+  for (const auto* value : {"-1.0", "nan", "inf", "-inf"}) {
+    expect_refused(
+        std::string("foc = true\nmax_torque_current_a = ") + value + "\n",
+        "m1");
+  }
+  expect_refused(
+      "foc = true\nstator_limit_a = 30.0\nmax_torque_current_a = 30.5\n", "m1");
+  expect_refused("max_torque_current_a = 5.0\n", "m1");
+  expect_refused(
+      "foc = true\n[subsystems.test.motors.m2]\ncan_id = 2\n"
+      "follow = \"m1\"\nmax_torque_current_a = 5.0\n",
+      "m2");
+}
+
 // An absent key keeps Phoenix's default (an enabled normally open switch), so
 // a robot that never names its limit inputs behaves as before the keys existed.
 TEST(ConfigTest, MotorLimitSwitchesDefaultToPhoenixAndRejectUnknownTypes) {

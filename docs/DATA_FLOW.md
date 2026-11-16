@@ -107,7 +107,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **10**.
+One datagram contains exactly one protocol frame, version **11**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -176,7 +176,7 @@ and every State the bridge's `--log` records names its build.
 
 | Device | State bytes / device | Command bytes / device | Encoded fields |
 |---|---:|---:|---|
-| Motor | 45 | 20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 + slot1 + demand8 + feedforward8. |
+| Motor | 45 | 20 | State: id2 + valid1 + position/velocity/voltage doubles24 + stator-current int16(2) + three u32 fields12 + temperature int16(2) + supply-current int16(2). Command: id2 + mode1 (0 neutral, 1 duty cycle, 2 voltage, 3 velocity, 4 position, 5 motion magic, 6 torque current; a decoder rejects any other) + slot1 + demand8 (duty ratio, volts, mechanism rotations/s, rotations, or stator amperes) + feedforward8 (volts; 0 unless velocity, position or motion magic). |
 | Sensor | 27 | — | id2 + valid1 + two doubles16 + two ages8 |
 | Digital input | 4 | — | id2 + valid1 + value1 |
 | Digital output | 4 | 3 | State id2 + valid1 + value1; command id2 + value1 |
@@ -238,9 +238,9 @@ checks CRC32, deserializes and validates caps, then reconfigures. A new config I
 replaces the assembly; inconsistent metadata or invalid assembled data is
 rejected. Completion/backend failure or malformed data produces the 73-byte ACK
 with status/reason (`config_wire.h`, `endpoint.h`).
-Hardware configuration assembly rejects serialized totals above **10,099 B**
+Hardware configuration assembly rejects serialized totals above **10,227 B**
 (`kMaxSerializedConfigSize`) before allocation. Chunk data is limited to
-**1,408 B**; chunk counts cannot exceed 10,099 or the serialized byte count.
+**1,408 B**; chunk counts cannot exceed 10,227 or the serialized byte count.
 Transfer metadata and chunk geometry must remain consistent, and assembler
 exceptions reject the transfer without escaping the gateway safety loop.
 

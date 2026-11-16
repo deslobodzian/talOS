@@ -1342,6 +1342,41 @@ TEST(TargetGate, ACentrePulseWithoutATargetIsHeld) {
   EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
 }
 
+// A 0 A torque-current demand is a driving request, not neutral: in a tick
+// with a live target it drives, and set without one it is held (sent
+// neutral) and the node reports outputs held.
+// REQ-SAFE-43, REQ-SAFE-41
+TEST(TargetGate, AZeroTorqueDemandIsAnOutputTheGateHolds) {
+  struct Holding {
+    explicit Holding(Node& n) : node{n}, target{n}, motor{n, "m"} {}
+    void update() {
+      target.get();  // a live target lets this tick drive
+      motor.set_torque_current(0.0);
+    }
+    Node& node;
+    Target<Goal> target;
+    Motor motor;
+  };
+  std::string toml{kGateToml};
+  toml.insert(toml.find("can_id = 1\n") + 11,
+              "foc = true\nmax_torque_current_a = 5\n");
+  auto sim = Sim::FromToml(toml);
+  auto& gate = sim.add<Holding>("gate");
+  SimHardware hw{sim};
+  hw.set_driver_station(DsPacket(kTeleop));
+  hw.enable();
+  sim.step(20ms);
+  ASSERT_TRUE(robot_enabled(gate.node));
+  EXPECT_EQ(hw.applied_motor("gate", "m").mode, hardware::Mode::kNeutral);
+  EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
+
+  PublishTarget(sim, "gate", "teleop", Goal{0.5});
+  sim.step(5ms);
+  EXPECT_EQ(hw.applied_motor("gate", "m").mode, hardware::Mode::kTorqueCurrent);
+  EXPECT_EQ(hw.applied_motor("gate", "m").demand, 0.0);
+  EXPECT_FALSE(detail::NodeAccess::outputs_held(gate.node));
+}
+
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
   EXPECT_EQ(detail::TargetEnvelopeBytes(24, 8), 40u);
   EXPECT_EQ(detail::TargetEnvelopeBytes(4, 4), 20u);

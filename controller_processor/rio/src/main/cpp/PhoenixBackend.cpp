@@ -12,6 +12,7 @@
 #include <ctre/phoenix6/controls/MotionMagicVoltage.hpp>
 #include <ctre/phoenix6/controls/NeutralOut.hpp>
 #include <ctre/phoenix6/controls/PositionVoltage.hpp>
+#include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VelocityVoltage.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <limits>
@@ -84,6 +85,15 @@ bool ValidMotionFeedback(const Position& position, const Velocity& velocity,
          hw::FeedbackFresh(Age(velocity), command_timeout_us) &&
          std::isfinite(position.GetValue().value()) &&
          std::isfinite(velocity.GetValue().value());
+}
+
+// TorqueCurrentFOC's MaxAbsDutyCycle: max_voltage over the battery voltage,
+// so the mode never applies more than max_voltage, the ceiling
+// PeakForwardVoltage sets for every voltage-based request but not for this
+// one. 0 (no output) while no battery reading has been taken.
+double TorqueDutyCap(double max_voltage, double battery_v) {
+  if (!(battery_v > 0)) return 0.0;
+  return std::clamp(max_voltage / battery_v, 0.0, 1.0);
 }
 
 // Posts a feedback validity change: the loop thread only copies it.
@@ -428,6 +438,19 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     cfg.Audio.BeepOnConfig = false;
     cfg.Voltage.PeakForwardVoltage = units::volt_t{m.max_voltage};
     cfg.Voltage.PeakReverseVoltage = units::volt_t{-m.max_voltage};
+    // TorqueCurrentFOC's peak, both ways: max_torque_current_a, or for a
+    // follower, which copies its master's torque output and may not set the
+    // key, its master's; 0 A on a motor without the mode, so a torque
+    // request produces nothing there. The stator limit above applies in
+    // addition, the supply limit in every mode; TorqueNeutralDeadband keeps
+    // Phoenix's 0 A.
+    double torque_peak_a = m.max_torque_current_a;
+    for (const auto& master : c.motors)
+      if (m.master_id != 0 && master.id == m.master_id)
+        torque_peak_a = master.max_torque_current_a;
+    cfg.TorqueCurrent.PeakForwardTorqueCurrent = units::ampere_t{torque_peak_a};
+    cfg.TorqueCurrent.PeakReverseTorqueCurrent =
+        units::ampere_t{-torque_peak_a};
     cfg.Feedback.RotorToSensorRatio = m.rotor_to_sensor_ratio;
     cfg.Feedback.SensorToMechanismRatio = m.sensor_to_mechanism_ratio;
     if (m.feedback == hw::Feedback::kRemoteCANcoder) {
@@ -488,6 +511,21 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetDeviceTemp(false));
     signals_.push_back(&motor->GetSupplyCurrent(false));
     for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
+    // Phoenix's Follower contract (controls/Follower.hpp): "The leader must
+    // ensure the status signal corresponding to its control output type
+    // (DutyCycle, MotorVoltage, TorqueCurrent) is enabled ... no slower than
+    // 20 Hz." So a master that may run TorqueCurrentFOC and has a follower
+    // asks for TorqueCurrent at status_hz, which OptimizeBusUtilization then
+    // keeps. In SDK 26.3 it shares a frame the motion feedback already holds
+    // at status_hz, so no simulation test can tell; asked for, it does not
+    // depend on that layout.
+    if (m.max_torque_current_a > 0 &&
+        std::any_of(c.motors.begin(), c.motors.end(), [&m](const auto& other) {
+          return other.master_id == m.id;
+        })) {
+      signals_.push_back(&motor->GetTorqueCurrent(false));
+      signal_ids_.push_back(m.id);
+    }
     motors_.push_back(std::move(motor));
   }
   // FOC needs a Phoenix Pro licence, and so does a follower of a foc master,
@@ -834,6 +872,10 @@ bool PhoenixBackend::Read(hw::State& s) {
                    });
   s.health.valid = true;
   s.health.battery_v = frc::RobotController::GetBatteryVoltage().value();
+  // The torque-current duty cap's divisor (TorqueDutyCap): a lost reading
+  // keeps the last real one.
+  if (std::isfinite(s.health.battery_v) && s.health.battery_v > 1.0)
+    last_battery_v_ = s.health.battery_v;
   s.health.brownout = frc::RobotController::IsBrownedOut();
   s.health.can_bus = can_health_.Slot(s.health.can_bus_index);
   uint64_t refresh_start_ns = NowNs();
@@ -1231,6 +1273,25 @@ bool PhoenixBackend::Apply(std::span<const hw::MotorRequest> commands) {
                 .WithEnableFOC(config.foc)
                 .WithUpdateFreqHz(0_Hz));
         break;
+      case hw::Mode::kTorqueCurrent:
+        // Stator amperes, within the peak Configure set. The other fields
+        // keep Phoenix's defaults: Deadband 0 A, OverrideCoastDurNeutral
+        // false, limit switches and soft limits honoured, no timesync. A
+        // 0 A demand is sent as TorqueCurrentFOC, not NeutralOut; what the
+        // motor does at exactly 0 A is unmeasured (talOS/hardware/README.md,
+        // "Supported Hardware Requests"). A request the gateway would have
+        // neutralized is this motor's neutral here too.
+        if (!hw::TorqueCurrentAllowed(config, r)) {
+          sim_neutral_[i] = true;
+          result = m.SetControl(ph::controls::NeutralOut{});
+          break;
+        }
+        result = m.SetControl(
+            ph::controls::TorqueCurrentFOC{units::ampere_t{r.demand}}
+                .WithMaxAbsDutyCycle(
+                    TorqueDutyCap(config.max_voltage, last_battery_v_))
+                .WithUpdateFreqHz(0_Hz));
+        break;
       default:
         return false;
     }
@@ -1325,7 +1386,11 @@ void PhoenixBackend::UpdateSimulation(double dt) {
     // coasts to a stop here instead of jumping to the requested demand. Never
     // consult the request demand for physics: that shortcut hides bad tuning.
     // Neutral is unpowered: velocity decays per the brake config and the
-    // position keeps integrating while the rotor rolls on.
+    // position keeps integrating while the rotor rolls on. Under
+    // TorqueCurrentFOC Phoenix reports the volts its current loop applies
+    // against this rotor's speed, up to the duty cap, so a demand
+    // accelerates the rotor; at 0 A it reports 0 V, and this model then
+    // stops the rotor (talOS/hardware/README.md says what is known of 0 A).
     double target_rotor_rps = 0.0;
     double tau = 0.01;
     if (sim_neutral_[i]) {

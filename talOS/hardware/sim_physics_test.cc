@@ -346,6 +346,51 @@ TEST(SimMotorDiagnostics, MotorHeldAtASoftLimitReadsStalled) {
   EXPECT_NEAR(s.motors[0].stator_current_a, 366.0 / 12.0, 1e-9);  // X60
 }
 
+// A torque-current demand passes that stator current through the winding at
+// the rotor's speed, in the motor's configured direction, so a free rotor
+// accelerates under it and levels at the speed of max_voltage, as
+// TorqueCurrentFOC's duty cap (max_voltage over the battery) holds it on the
+// robot; the current never exceeds max_torque_current_a. 0 A is zero torque,
+// powered: the rotor spins on rather than braking as neutral does.
+// REQ-SAFE-43
+TEST(SimMotorDiagnostics, TorqueCurrentAcceleratesToTheVoltageCeiling) {
+  for (const bool inverted : {false, true}) {
+    SCOPED_TRACE(inverted);
+    auto cfg = SingleMotorConfig();  // Kraken X60, brake
+    cfg.motors[0].inverted = inverted;
+    cfg.motors[0].foc = true;
+    cfg.motors[0].max_torque_current_a = 5.0;
+    cfg.motors[0].max_voltage = 4.0;
+    PhysicsSimBackend backend;
+    ASSERT_TRUE(backend.Configure(cfg));
+    std::array<MotorRequest, 1> command{
+        {{1, Mode::kTorqueCurrent, 0, 8.0, 0.0}}};
+    ASSERT_TRUE(backend.Apply(command));
+    State s{};
+    s.motor_count = 1;
+    uint64_t now_us = 0;
+    StepBackend(backend, s, now_us, 5000, 1);  // At rest: clamped to 5 A.
+    EXPECT_NEAR(s.motors[0].stator_current_a, 5.0, 1e-9);
+    command[0].demand = 2.0;
+    ASSERT_TRUE(backend.Apply(command));
+    StepBackend(backend, s, now_us, 5000, 200);  // 1 s: still accelerating
+    EXPECT_GT(s.motors[0].velocity_rps, 1.0);
+    EXPECT_LT(s.motors[0].velocity_rps, 30.0);
+    EXPECT_GT(s.motors[0].stator_current_a, 1.5);
+    EXPECT_LE(s.motors[0].stator_current_a, 2.0);
+    StepBackend(backend, s, now_us, 5000, 800);  // 5 s: at the 4 V ceiling
+    const double ceiling_rps = 4.0 / 12.0 * 100.0;
+    EXPECT_NEAR(s.motors[0].velocity_rps, ceiling_rps, 0.01 * ceiling_rps);
+    EXPECT_NEAR(s.motors[0].voltage, 4.0, 1e-9);
+    EXPECT_LE(s.motors[0].stator_current_a, 2.0);
+    command[0].demand = 0.0;
+    ASSERT_TRUE(backend.Apply(command));
+    StepBackend(backend, s, now_us, 5000, 200);  // 1 s of zero torque
+    EXPECT_NEAR(s.motors[0].velocity_rps, ceiling_rps, 0.01 * ceiling_rps);
+    EXPECT_NEAR(s.motors[0].stator_current_a, 0.0, 1e-9);
+  }
+}
+
 // The wire config carries no motor type, so a config the bridge pushes to
 // sim_gateway that differs from the one it holds reconfigures the physics
 // backend with every motor a Kraken X60. Each motor keeps the type of the

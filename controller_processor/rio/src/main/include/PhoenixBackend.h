@@ -194,6 +194,11 @@ class PhoenixBackend final : public talos::hardware::Backend {
   // Empty: its IsProLicensed signal off simulation, and true under
   // simulation, which needs no licence. phoenixTest sets it.
   std::function<std::optional<bool>(std::size_t motor_index)> pro_licensed_;
+  // The battery voltage a torque-current request's duty cap divides
+  // max_voltage by (Apply): Read's last reading that was finite and above
+  // 1 V, kept across a reading that is not. 0 until the first such reading,
+  // and the cap is then 0: no torque-current request drives on a guess.
+  double last_battery_v_{0};
 
   bool is_simulation_{false};
   std::optional<std::chrono::steady_clock::time_point> last_sim_time_;

@@ -29,13 +29,13 @@ namespace talos::hardware {
 namespace {
 
 // The encodings this file pins and the protocol version they belong to.
-constexpr std::uint16_t kGoldenVersion = 10;
+constexpr std::uint16_t kGoldenVersion = 11;
 constexpr std::size_t kStateBytes = 1419;
 constexpr std::uint64_t kStateHash = 0x270781b104f788b0;
 constexpr std::size_t kCommandBytes = 414;
-constexpr std::uint64_t kCommandHash = 0xe43b8a06779c5ed5;
-constexpr std::size_t kConfigBytes = 10099;
-constexpr std::uint64_t kConfigHash = 0x0e91cec772122683;
+constexpr std::uint64_t kCommandHash = 0xa05ceda133052918;
+constexpr std::size_t kConfigBytes = 10227;
+constexpr std::uint64_t kConfigHash = 0x181304adda19ad10;
 
 std::uint64_t Fnv1a64(std::span<const std::uint8_t> bytes) {
   std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -147,7 +147,7 @@ Command FullCommand() {
   c.pwm_output_count = kMaxPwmOutputs;
   for (std::size_t i = 0; i < kMaxMotors; ++i) {
     c.motors[i] = {static_cast<std::uint16_t>(0x800 + i),
-                   static_cast<Mode>(i % 6), static_cast<std::uint8_t>(i % 2),
+                   static_cast<Mode>(i % 7), static_cast<std::uint8_t>(i % 2),
                    0.5 + static_cast<double>(i),
                    -0.25 - static_cast<double>(i)};
   }
@@ -213,6 +213,7 @@ Config FullConfig() {
           0.75 + j, 1.5 + j,  2.25 + j,  static_cast<GravityType>((i + s) % 2)};
     }
     m.foc = i % 2 == 0;
+    m.max_torque_current_a = m.foc ? 20.125 + k : 0;
     c.motors.push_back(m);
   }
   for (std::size_t i = 0; i < kMaxSensors; ++i) {
@@ -259,7 +260,7 @@ Config FullConfig() {
 // Guards: the State and Command bytes of protocol kGoldenVersion. A failure
 // here is a wire change: bump kProtocolVersion (docs/DATA_FLOW.md) and
 // regenerate the constants above from the values this prints.
-// REQ-OPS-51
+// REQ-OPS-51, REQ-SAFE-43
 TEST(WireGolden, StateAndCommandBytesBelongToTheirProtocolVersion) {
   ASSERT_EQ(protocol::kProtocolVersion, kGoldenVersion)
       << "kProtocolVersion changed: regenerate this file's constants for "
@@ -285,7 +286,7 @@ TEST(WireGolden, StateAndCommandBytesBelongToTheirProtocolVersion) {
 // Guards: the config bytes of protocol kGoldenVersion, which the bridge
 // pushes and the RoboRIO saves. A failure here is a wire change: bump
 // kProtocolVersion (docs/DATA_FLOW.md) and regenerate the constants above.
-// REQ-OPS-51, REQ-CONTRACT-39
+// REQ-OPS-51, REQ-CONTRACT-39, REQ-SAFE-43
 TEST(WireGolden, ConfigBytesBelongToTheirProtocolVersion) {
   ASSERT_EQ(protocol::kProtocolVersion, kGoldenVersion);
   const std::vector<std::uint8_t> config = SerializeConfig(FullConfig());

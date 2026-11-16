@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 34u
+#define TALOS_NODE_ABI_VERSION 35u
 
 enum {
   TALOS_OK = 0,
@@ -205,6 +205,7 @@ enum {  // talos::hardware::Mode
   TALOS_MODE_VELOCITY = 3,
   TALOS_MODE_POSITION = 4,
   TALOS_MODE_MOTION_MAGIC = 5,
+  TALOS_MODE_TORQUE_CURRENT = 6,  // stator amperes; ff_volts 0, slot 0
 };
 
 // A device of this node's subsystem, by its config key ([motors.roller] is
@@ -228,9 +229,11 @@ int32_t talos_hardware_fresh(TalosNode* node, int64_t max_age_ns);
 int32_t talos_hardware_age(TalosNode* node, int64_t* out_ns);
 
 // One motor command for the flush after this update() (Motor::set_* /
-// stop). Like talos_digital_output_set and talos_pwm_set, it fails (naming
-// the device) outside the node's update() callback: the flush sends neutral
-// for every output that update() did not set.
+// stop). TALOS_MODE_TORQUE_CURRENT is Motor::set_torque_current: it fails,
+// naming the motor and the key, unless the motor's config allows the mode.
+// Like talos_digital_output_set and talos_pwm_set, it fails (naming the
+// device) outside the node's update() callback: the flush sends neutral for
+// every output that update() did not set.
 int32_t talos_motor_set(TalosNode* node, int64_t index, int32_t mode,
                         double demand, double ff_volts, int32_t slot);
 // Monotonic per-device count of adjusted/neutralized motor setter calls.

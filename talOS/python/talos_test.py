@@ -619,6 +619,34 @@ can_id = 3
                                     r"motor 'lift'.*outside update\(\)"):
             sim.step(0.05)
 
+    # REQ-SAFE-43: set_torque_current reaches the request as stator amperes,
+    # clamped to the motor's limit and counted, and on a motor whose config
+    # lacks foc it raises naming the motor and the key
+    def test_torque_current_clamps_and_needs_the_config(self):
+        class Torquer:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.lift = talos.Motor(node, "lift")
+
+            def update(self):
+                self.lift.set_torque_current(8.0)
+
+        sim = Sim.from_toml(ROBOT_TOML.replace(
+            "can_id = 1\n",
+            "can_id = 1\nfoc = true\nmax_torque_current_a = 5.0\n"))
+        torquer = sim.add(Torquer, "lift")
+        hw = SimHardware(sim)
+        hw.enable()
+        sim.step(0.03)
+        self.assertEqual(hw.motor_request("lift", "lift"),
+                         (talos.Mode.TORQUE_CURRENT, 5.0, 0.0, 0))
+        self.assertGreater(torquer.lift.clamped_count, 0)
+
+        sim = Sim.from_toml(ROBOT_TOML)
+        sim.add(Torquer, "lift")
+        with self.assertRaisesRegex(talos.TalosError, r"'lift'.*foc = true"):
+            sim.step(0.03)
+
     def test_hardware_link_freshness_and_age(self):
         class Watcher:
             def __init__(self, node):

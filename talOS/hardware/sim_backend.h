@@ -43,6 +43,10 @@ inline PwmSample PwmSampleOf(const PwmRequest& request) {
 }
 // A deterministic ideal-actuator fake for integration tests, not a motor or
 // tire physics model. Real hardware always uses the Phoenix backend.
+// Velocity, position and motion-magic demands are reached at once and a
+// voltage demand is reported as applied; duty-cycle and torque-current
+// demands are not modelled (velocity 0, voltage 0): the physics backend
+// (sim_physics.h) models them.
 class SimBackend final : public Backend {
  public:
   bool Configure(const Config& config) override {

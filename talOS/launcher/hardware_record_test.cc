@@ -334,6 +334,16 @@ TEST_F(HardwareRecordTest, StateAndCommandNameDevicesOfTheRunConfig) {
   EXPECT_EQ(motor["feedforward_v"], "0.5");
   EXPECT_EQ(Find(command_json.at("motors"), "name", "\"drive\"")["mode"],
             "\"neutral\"");
+  // REQ-SAFE-43: a torque-current demand reads as amperes in its own mode.
+  auto torque = command;
+  torque.motors[1] = {drive_, talos::hardware::Mode::kTorqueCurrent, 0, -2.5,
+                      0.0};
+  motor = Find(Members(HardwareRecordJson(HardwareRecord::kCommand,
+                                          Encoded(torque), &names_))
+                   .at("motors"),
+               "name", "\"drive\"");
+  EXPECT_EQ(motor["mode"], "\"torque_current\"");
+  EXPECT_EQ(motor["demand"], "-2.5");
   auto pwm = Find(command_json.at("pwm_outputs"), "name", "\"hood\"");
   EXPECT_EQ(pwm["mode"], "\"pulse\"");
   EXPECT_EQ(pwm["output"], "0");
