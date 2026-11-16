@@ -3,7 +3,10 @@
 robot_physics_sim.toml is robot_py.toml run against the physics simulator.
 Config load refuses a nested include, so it repeats robot_py.toml's overrides
 on the same include instead of including it, and adds only
-[robot] simulation_only. This fails when the two differ in anything else.
+[robot] simulation_only. This compares them with [studio] dropped from both
+and [robot] simulation_only dropped from robot_physics_sim.toml, so it fails
+when the include, the other [robot] overrides or the [[subsystems]] entries
+differ, and not on a [studio] difference.
 
 //studio:drive_browser_test opens Studio's driver dashboard against
 studio/tests/browser/robot.toml, which must be the bench's physics
@@ -57,7 +60,7 @@ def without_simulation_only(config):
 
 
 class PhysicsSimCopyTest(unittest.TestCase):
-    # REQ-CONTRACT-19: as below; here the physics sim graph against the
+    # REQ-CONTRACT-41: as below; here the physics sim graph against the
     # Python bench robot it runs.
     def test_physics_sim_repeats_the_python_bench_overrides(self):
         r = runfiles.Create()
@@ -66,7 +69,7 @@ class PhysicsSimCopyTest(unittest.TestCase):
             overrides(r.Rlocation(PYTHON)),
         )
 
-    # REQ-CONTRACT-19: a config derived from another fails a test when it
+    # REQ-CONTRACT-41: a config derived from another fails a test when it
     # goes stale, as a manifest does; here drive_browser_test's config
     # against the bench's simulated graph it copies.
     def test_copies_repeat_the_physics_sim_overrides(self):
