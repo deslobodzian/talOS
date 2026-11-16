@@ -148,6 +148,9 @@ bazel build //talOS/bridge:hardware_node //bench/main_processor/motor:node_py //
 bazel run //talOS/launcher -- --config $PWD/bench/main_processor/configuration/robot_py.toml --remote <roborio-ipv4> --output-dir /tmp/bench-rio-py
 ```
 
+[`robot_physics_sim.toml`](../bench/main_processor/configuration/robot_physics_sim.toml)
+is the same graph for the physics simulator only (`simulation_only`; launch it with `--sim`).
+
 ### Identifying devices without Phoenix Tuner X
 
 - [ ] While a robot program (the gateway, or Phoenix's temporary diagnostics

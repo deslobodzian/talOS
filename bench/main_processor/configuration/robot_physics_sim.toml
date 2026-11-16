@@ -1,0 +1,16 @@
+# robot_py.toml (the bench with the Python motor owner at 20 ms, plus
+# swerve_module, gyro, teleop and telemetry) run entirely in simulation
+# against the physics simulator (//talOS/simulation:sim_gateway, launcher
+# `--sim`). Config load refuses a nested include, so this file includes
+# robot.toml and repeats robot_py.toml's one override; keep them alike.
+# Devices, CAN ids and buses are robot.toml's, unchanged.
+include = "robot.toml"
+
+[robot]
+# The physics gateway's config: the launcher and hardware_node refuse it
+# without --sim.
+simulation_only = true
+
+[[subsystems]]
+name = "motor"
+path = "subsystems/motor_py.toml"
