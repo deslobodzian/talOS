@@ -727,7 +727,14 @@ With `NOTIFY_SOCKET` set, the launcher sends `READY=1` on entry to supervision
 and `WATCHDOG=1` on every loop iteration, using nonblocking Unix datagrams
 (including Linux `@` abstract names), and, when systemd sets `WATCHDOG_USEC`,
 runs an iteration at least every half of it ([supervision passes](#supervision-passes)).
-A hung loop therefore stops feeding the service watchdog. The loop waits on no
+A hung loop therefore stops feeding the service watchdog. That watchdog is
+the only bound on a deployed session whose launcher hangs: nothing but the
+launcher's stop ends a member that runs well, and a member's guardian acts
+only when the launcher's process ends, so systemd's `WatchdogSec=` (set by
+the unit `deploy.sh` writes) kills the hung launcher and with it, through
+the guardians, every member. A session run by hand, or under launchd, which
+has no watchdog, has no such bound: its members run until the launcher is
+killed. The loop waits on no
 lock a node can hold: its registry attach is read-only, which
 [takes no lock](../introspection/README.md#the-segment).
 See [deployment](../../docs/DEPLOYMENT.md) for the generated systemd watchdog
