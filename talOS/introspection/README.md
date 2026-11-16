@@ -255,7 +255,9 @@ by the next claim, and a pid reused since does not keep it. A claimant in
 another pid namespace sharing `/dev/shm` cannot be looked up from this one, so
 its row is freed only once its heartbeat is `kLivenessTimeout` old. Both are
 rechecked after the ACTIVE-to-CLAIMING transition so a refresh observed during
-the sweep can keep the row.
+the sweep can keep the row. `RegistryReader::nodes()` makes the same process
+check, so until that claim a killed node's row reads `alive = false` at once,
+its heartbeat still fresh.
 
 Each claim bumps a generation counter before the slot goes ACTIVE. A reader
 snapshots the generation, copies the identity fields, and re-reads it; a change
