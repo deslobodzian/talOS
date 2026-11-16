@@ -129,7 +129,7 @@ struct LauncherOptions {
   bool describe_only{false};
   // With `describe_only`: also make the refusals a launch with the same
   // options makes before it probes, those that need no lock, shared memory,
-  // socket or process (Launcher::RunSession). Launcher::Run refuses it
+  // socket or process. Launcher::RunSession makes them, and refuses this
   // without `describe_only`.
   bool describe_as_launch{false};
 
