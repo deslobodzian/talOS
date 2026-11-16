@@ -797,7 +797,7 @@ std::string WriteGappedSession(const std::string& dir) {
       RecordIndex(restart, [](const tlog::RecordHeader& h) {
         return h.kind ==
                    static_cast<std::uint16_t>(talos::event::EventKind::TIMER) &&
-               h.event_time_ns == kStartNs + 490 * 20 * kMs;
+               h.event_time_ns == kStartNs + 490 * (20 * kMs);
       });
   std::size_t records = 0;
   {
@@ -846,7 +846,9 @@ TEST_F(ReviewTest, BoundsListEveryGap) {
       "c=shooter/state/position_m&start_ns=" + std::to_string(gap_start) +
           "&end_ns=" + std::to_string(gap_start + 200 * kMs) + "&points=2");
   ASSERT_EQ(series.status, 200) << series.body;
-  for (const Bucket& bucket : ParseSeries(series.body)[0]) {
+  const auto parsed = ParseSeries(series.body);
+  ASSERT_EQ(parsed.size(), 1u);
+  for (const Bucket& bucket : parsed[0]) {
     EXPECT_EQ(bucket.count, 0u);
   }
   const Response snapshot =
@@ -857,11 +859,11 @@ TEST_F(ReviewTest, BoundsListEveryGap) {
       json::parse(snapshot.body)["channels"]["shooter/state/position_m"];
   EXPECT_EQ(position["value"], testing::ShotPosition(489));
   EXPECT_EQ(position["sample_ns"],
-            std::to_string(kStartNs + 489 * 20 * kMs + kMs / 2));
+            std::to_string(kStartNs + 489 * (20 * kMs) + kMs / 2));
 
   const auto session = Session::Open(dir);
   EXPECT_EQ(session->index_bytes(),
-            session->log_seconds() * sizeof(Checkpoint) + 2 * 48);
+            session->log_seconds() * sizeof(Checkpoint) + std::size_t{2} * 48);
   std::filesystem::remove_all(dir);
 }
 
