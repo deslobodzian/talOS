@@ -1087,11 +1087,10 @@ class NodeRegistration {
       // Only free what is still ours: the slot may have been swept and
       // reclaimed after this owner went quiet (see sweep_stale), and freeing
       // it then would yank the new owner's row out from under it. The row
-      // keeps its last sample, sources included, until the next claim clears
-      // it, which takes it only once no other row is free or its heartbeat
-      // is kLivenessTimeout old (claim): the launcher reads a reaped run's
-      // final delivery loss and event log flags there (DeliveryLossOf;
-      // TODO.md RT-7).
+      // keeps its last sample, sources included, until a claim takes it
+      // (claim says which first): the launcher reads a reaped run's final
+      // delivery loss and event log flags there (DeliveryLossOf; TODO.md
+      // RT-7).
       if (owns_slot()) {
         record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
                              std::memory_order_release);
@@ -1159,18 +1158,21 @@ class NodeRegistration {
   // Takes a free slot, or -- only when none is free -- one whose owner stopped
   // heartbeating long enough ago to be considered gone. Rows of gone owners
   // are swept first (see sweep_stale), so the fallback below only fires for a
-  // slot that went quiet between the sweep and the claim. A free slot whose
-  // last heartbeat is younger than kLivenessTimeout -- a row its owner
-  // released moments ago -- is taken only when no other is free: it holds
-  // that run's last sample until the launcher reaps the run and reads it
-  // (its delivery loss and event log flags), and a peer starting meanwhile
-  // must not overwrite it.
+  // slot that went quiet between the sweep and the claim. A released row
+  // holds its run's last sample until the launcher reaps the run and reads
+  // it (its delivery loss and event log flags), so of the free slots a claim
+  // takes the lowest whose heartbeat is at least kLivenessTimeout old (never
+  // used, swept, or released long ago); failing that, the free slot whose
+  // heartbeat is oldest, the one released longest ago. A row released moments
+  // ago is therefore overwritten before its reap only when every other slot
+  // is held or was released after it (a restart storm). Two rules, not one
+  // oldest-first scan, so a swept slot is reclaimed in place.
   static NodeRecord* claim(RegistryHeader* header, const Identity& identity,
                            const RegistryTestHooks* test_hooks) {
     sweep_stale(header);
     NodeRecord* record = claim_where(header, SlotState::FREE, true);
     if (record == nullptr) {
-      record = claim_where(header, SlotState::FREE, false);
+      record = claim_oldest_free(header);
     }
     if (record == nullptr) {
       record = claim_where(header, SlotState::ACTIVE, true);
@@ -1210,6 +1212,37 @@ class NodeRegistration {
     record->state.store(static_cast<std::uint64_t>(SlotState::ACTIVE),
                         std::memory_order_release);
     return record;
+  }
+
+  // The FREE slot with the oldest heartbeat, taken (CLAIMING); null when
+  // none is free. Claims hold RegistryLock, so the slot found stays FREE;
+  // a lost exchange (a sweeper's) rescans.
+  static NodeRecord* claim_oldest_free(RegistryHeader* header) {
+    for (std::size_t attempt = 0; attempt < kMaxNodes; ++attempt) {
+      NodeRecord* oldest = nullptr;
+      std::int64_t oldest_beat = 0;
+      for (std::size_t i = 0; i < kMaxNodes; ++i) {
+        NodeRecord& record = header->nodes[i];
+        if (record.state.load(std::memory_order_acquire) !=
+            static_cast<std::uint64_t>(SlotState::FREE)) {
+          continue;
+        }
+        const std::int64_t beat =
+            record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
+        if (oldest == nullptr || beat < oldest_beat) {
+          oldest = &record;
+          oldest_beat = beat;
+        }
+      }
+      if (oldest == nullptr) return nullptr;
+      std::uint64_t expected = static_cast<std::uint64_t>(SlotState::FREE);
+      if (oldest->state.compare_exchange_strong(
+              expected, static_cast<std::uint64_t>(SlotState::CLAIMING),
+              std::memory_order_acq_rel)) {
+        return oldest;
+      }
+    }
+    return nullptr;
   }
 
   static NodeRecord* claim_where(RegistryHeader* header, SlotState from,
@@ -1360,7 +1393,8 @@ struct NodeSnapshot {
   }
   // kFlagOutputsHeld: the devices flush is holding back outputs it set.
   bool outputs_held() const { return (flags & kFlagOutputsHeld) != 0; }
-  // kFlagLogGap: the node's event log dropped records and marked them.
+  // kFlagLogGap: the node's event log has dropped records (set when a gap
+  // opens).
   bool log_gap() const { return (flags & kFlagLogGap) != 0; }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};

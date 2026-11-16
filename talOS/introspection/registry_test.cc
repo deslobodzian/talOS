@@ -366,6 +366,7 @@ TEST_F(Registry, OutputsHeldSetsAndClearsWithoutTouchingTheOtherFlags) {
 }
 
 TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
+  std::size_t crowded = 0;
   {
     std::vector<Policy> policies(kMaxSelectionsPerNode + 1,
                                  Policy{{"teleop", "auto"}});
@@ -376,6 +377,7 @@ TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
     NodeRegistration registration{{.name = "crowded"}, path_};
     registration.publish({});
     registration.publish_selections(policies);
+    crowded = registration.slot();
     const std::int32_t last =
         static_cast<std::int32_t>(policies.front().sources.size() - 1);
     registration.set_selected(0, last);
@@ -400,9 +402,20 @@ TEST_F(Registry, SelectionsBeyondTheSlotAreCountedAndARecycledSlotHasNone) {
     }
   }
 
-  // The slot is free again; a node without Targets must not inherit the
-  // previous owner's.
+  // The slot is free again, released long enough ago to be the next claim's
+  // (claim): a node without Targets must not inherit the previous owner's.
+  {
+    RegistryMapping mapping{path_};
+    mapping.header()->nodes[crowded].heartbeat_monotonic_ns.store(
+        monotonic_now_ns() -
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                kLivenessTimeout)
+                .count() -
+            1,
+        std::memory_order_relaxed);
+  }
   NodeRegistration next{{.name = "plain"}, path_};
+  ASSERT_EQ(next.slot(), crowded);
   next.publish({});
   auto reader = RegistryReader::open(path_);
   if (!reader.has_value()) {
@@ -894,15 +907,11 @@ TEST_F(Registry, ALogGapIsItsOwnFlagAndOutlivesTheGap) {
   EXPECT_EQ(node.flags & (kFlagRecorderFailed | kFlagLogCapped), 0u);
 }
 
-// The Reporter copies a gap in the loop's own event log into the row, which
-// is all the launcher has of a run killed during one: a running loop whose
-// LogWriter dropped one record too large for its buffers shows kFlagLogGap.
-// REQ-OPS-52
 // A run that exits right after its row showed a log gap is marked only from
 // the row it released, which the launcher reads when it reaps the run. A
-// claim made before that reap (a peer starting, or a restart storm) must not
-// take that row while another is free, or the run's last sample, its gap bit
-// among it, is gone before the launcher reads it.
+// claim made before that reap (a peer starting) must not take that row while
+// a row unused or released earlier is free, or the run's last sample, its
+// gap bit among it, is gone before the launcher reads it.
 // REQ-OPS-52
 TEST_F(Registry, AClaimTakesARecentlyReleasedRowOnlyWhenNoOtherIsFree) {
   std::size_t released = 0;
@@ -932,6 +941,38 @@ TEST_F(Registry, AClaimTakesARecentlyReleasedRowOnlyWhenNoOtherIsFree) {
   EXPECT_EQ(last.slot(), released);
 }
 
+// When rows released in the last kLivenessTimeout are all that is free (a
+// restart storm), a claim takes the one released longest ago: a run's row is
+// overwritten before its reap only if every other row is held or was
+// released after it. Here the higher of two such rows was released first.
+// REQ-OPS-52
+TEST_F(Registry, AClaimTakesTheRecentRowReleasedLongestAgo) {
+  std::vector<std::unique_ptr<NodeRegistration>> rows;
+  while (rows.size() < kMaxNodes) {
+    rows.push_back(std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name = "row" + std::to_string(rows.size())},
+        path_));
+  }
+  const std::size_t later = rows[5]->slot();
+  const std::size_t earlier = rows[20]->slot();
+  ASSERT_LT(later, earlier);
+  rows[20].reset();
+  rows[5].reset();
+  // Released 2 s and 1 s ago: both younger than kLivenessTimeout.
+  RegistryMapping mapping{path_};
+  const std::int64_t now = monotonic_now_ns();
+  mapping.header()->nodes[earlier].heartbeat_monotonic_ns.store(
+      now - 2'000'000'000, std::memory_order_relaxed);
+  mapping.header()->nodes[later].heartbeat_monotonic_ns.store(
+      now - 1'000'000'000, std::memory_order_relaxed);
+  NodeRegistration next{{.name = "next"}, path_};
+  EXPECT_EQ(next.slot(), earlier);
+}
+
+// The Reporter copies a gap in the loop's own event log into the row, which
+// is all the launcher has of a run killed during one: a running loop whose
+// LogWriter dropped one record too large for its buffers shows kFlagLogGap.
+// REQ-OPS-52
 TEST_F(Registry, TheReporterCopiesTheLoopsLogGapIntoTheRow) {
   const std::string log = ::testing::TempDir() + "/registry_gap_" +
                           std::to_string(::getpid()) + ".tlog";
