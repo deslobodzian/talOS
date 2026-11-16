@@ -124,6 +124,11 @@ namespace talos::introspect {
 // every earlier writer left clear, which reads as "not reported" -- all an
 // earlier build could have said -- and every earlier reader ignores.
 //
+// Nor did naming::kSourceFlagUntargetedOutputs: a bit of SourceRecord::flags
+// that every earlier writer left clear, which reads as "gated on a live
+// target" -- all an earlier build could have said -- and every earlier
+// reader tests only the bits it knows.
+//
 // Nor did counting a timer's missed periods in SourceRecord::dropped: a
 // timer's `dropped` was always 0, which still reads as "no overrun".
 inline constexpr std::uint32_t kRegistryVersion = 6;

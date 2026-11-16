@@ -79,6 +79,7 @@ void ExpectSameDescription(const Description& written,
 // shift onto the next source), schema bytes at every base64 padding length,
 // the full 64-bit hash, names that need escaping, and parameter keys holding
 // the brackets, braces and field names a scanning reader would stop at.
+// REQ-SAFE-42: the hardware request's untargeted_outputs marking survives.
 TEST(Describe, RoundTripsEveryField) {
   event::Manifest manifest = sample_manifest();
   std::string bytes;
@@ -95,7 +96,8 @@ TEST(Describe, RoundTripsEveryField) {
       R"(od"d)", R"(//example/od\d:node)", manifest, kSlots,
       {{"/hw/request/drivetrain", naming::kSourceFlagExternal |
                                       naming::kSourceFlagOptional |
-                                      naming::kSourceFlagHardwareRequest},
+                                      naming::kSourceFlagHardwareRequest |
+                                      naming::kSourceFlagUntargetedOutputs},
        {"/drivetrain/target", naming::kSourceFlagOptional},
        {"/driver_station/state", naming::kSourceFlagObserver}});
   written.reads_graph = true;
@@ -107,7 +109,8 @@ TEST(Describe, RoundTripsEveryField) {
   ASSERT_EQ(written.sources.size(), 5u);
   ASSERT_EQ(written.sources[3].flags, naming::kSourceFlagExternal |
                                           naming::kSourceFlagOptional |
-                                          naming::kSourceFlagHardwareRequest);
+                                          naming::kSourceFlagHardwareRequest |
+                                          naming::kSourceFlagUntargetedOutputs);
   ASSERT_EQ(written.sources[3].slots, kSlots);
   ASSERT_EQ(written.sources[1].bfbs, bytes);
 

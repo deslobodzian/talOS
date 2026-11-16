@@ -229,6 +229,9 @@ inline std::string DescribeToJson(const Description& description) {
     // Only on the devices layer's request publisher; absent means false.
     if ((source.flags & naming::kSourceFlagHardwareRequest) != 0)
       out += ", \"hardware_request\": true";
+    // Only on a request publisher that lifted the live-target gate.
+    if ((source.flags & naming::kSourceFlagUntargetedOutputs) != 0)
+      out += ", \"untargeted_outputs\": true";
     // Only on a latest-only watcher; absent means a sequence watcher.
     if ((source.flags & naming::kSourceFlagLatestOnly) != 0)
       out += ", \"latest_only\": true";
@@ -439,6 +442,10 @@ class DescribeReader {
       if (Field(entry, "hardware_request", attribute) &&
           Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagHardwareRequest;
+      attribute = 0;
+      if (Field(entry, "untargeted_outputs", attribute) &&
+          Boolean(entry, attribute))
+        source.flags |= naming::kSourceFlagUntargetedOutputs;
       attribute = 0;
       if (Field(entry, "latest_only", attribute) && Boolean(entry, attribute))
         source.flags |= naming::kSourceFlagLatestOnly;
