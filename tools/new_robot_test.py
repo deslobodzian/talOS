@@ -38,8 +38,12 @@ def workspace(tmp):
     launcher = r.Rlocation("_main/talOS/launcher/launcher")
     root = os.environ.get("RUNFILES_DIR")
     if not root or not os.path.isdir(os.path.join(root, "_main")):
+        # Run outside `bazel test` (bazel-bin/tools/new_robot_test), with
+        # no RUNFILES_DIR: this file is <runfiles>/_main/tools/<it>. The
+        # launcher's Rlocation is then its real path in bazel-out, no
+        # runfiles tree.
         root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(launcher))))
+            os.path.abspath(__file__))))
     main = os.path.join(root, "_main")
     work = os.path.join(tmp, "ws")
     bazel_bin = os.path.join(work, "bazel-bin")
