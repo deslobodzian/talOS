@@ -1707,6 +1707,35 @@ TEST(LauncherGraphTest, ProbesRunInParallel) {
   std::filesystem::remove_all(started);
 }
 
+// REQ-SAFE-28: the hardware bridge is always critical. `critical` is read only
+// from a subsystem's table, so a config that replaces the bridge's binary and
+// marks every subsystem critical = false still lists the bridge critical.
+TEST(LauncherTest, TheHardwareBridgeIsAlwaysCritical) {
+  constexpr std::string_view kEveryNodeOptional = R"(
+[robot]
+name = "optional_everything"
+period_us = 5000
+hardware_node = "//example/bridge:node"
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+critical = false
+)";
+  const auto specs = DiscoverNodes(
+      config::ParseRobotConfigString(kEveryNodeOptional), LauncherOptions{});
+  const auto bridge = std::find_if(
+      specs.begin(), specs.end(),
+      [](const NodeSpec& spec) { return spec.name == kHardwareNodeName; });
+  ASSERT_NE(bridge, specs.end());
+  EXPECT_EQ(bridge->target, "//example/bridge:node");
+  EXPECT_TRUE(bridge->critical);
+  const auto alpha =
+      std::find_if(specs.begin(), specs.end(),
+                   [](const NodeSpec& spec) { return spec.name == "alpha"; });
+  ASSERT_NE(alpha, specs.end());
+  EXPECT_FALSE(alpha->critical);
+}
+
 // REQ-SAFE-28: a non-critical node that sends a target lane is a graph error.
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
   GraphFixture fixture{"optional_target",
