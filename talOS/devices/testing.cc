@@ -106,10 +106,7 @@ struct SimHardware::Impl {
   // Per motor, the sim time (µs) of the latest State that read it
   // connected: when its temperature signal last updated.
   std::map<std::uint16_t, std::uint64_t> temperature_read_us;
-  // PhoenixBackend::Read reports a temperature signal 500 ms old or older
-  // as 0 (Fresh(temperature, 500_ms), controller_processor/rio/src/main/
-  // cpp/PhoenixBackend.cpp:975); the RoboRIO program alone names the bound.
-  static constexpr std::uint64_t kTemperatureMaxAgeUs = 500'000;
+  static constexpr auto kTemperatureMaxAgeUs = hardware::kTemperatureMaxAgeUs;
   // Devices reset and not yet restored, with the States they stay masked
   // for; `masked` adds the chain restored with them: followers of a masked
   // motor and motors fed by a masked remote CANcoder. The RoboRIO reports a

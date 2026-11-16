@@ -1039,6 +1039,85 @@ TEST(SimBelievability, DisconnectIsIsolatedUntilAllDevicesAreLost) {
   EXPECT_TRUE(backend.Read(s));
 }
 
+// REQ-CONTRACT-32, REQ-DEV-10
+// A disconnected device reads as PhoenixBackend reports one whose frames
+// stopped: invalid, its ages growing from its last sample, its limit bits
+// held until the FaultField is kFaultFieldMaxAgeUs old (the simulator models
+// no fault bits, only limit switches) and its temperature held until it is
+// kTemperatureMaxAgeUs old, then 0. A node's age rule then sees in
+// simulation what it would see on the robot.
+TEST(SimBelievability, ADisconnectedDeviceAgesAsPhoenixReportsIt) {
+  Config c = SingleMotorConfig();
+  c.sensors.push_back({9, "imu", SensorKind::kPigeon2, 30, "rio"});
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(c));
+  backend.SetForwardLimitPressed(1, true);
+  State s{};
+  constexpr uint64_t kLastReadUs = 5000;
+  s.sample_time_us = kLastReadUs;
+  ASSERT_TRUE(backend.Read(s));
+  ASSERT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  ASSERT_DOUBLE_EQ(s.motors[0].temperature_c, 25.0);
+  backend.SetMotorConnected(1, false);
+  backend.SetSensorConnected(9, false);
+  const auto read_at = [&](uint64_t age_us) {
+    s.sample_time_us = kLastReadUs + age_us;
+    backend.Read(s);
+    EXPECT_FALSE(s.motors[0].valid);
+    EXPECT_EQ(s.motors[0].position_age_us, age_us);
+    EXPECT_EQ(s.motors[0].velocity_age_us, age_us);
+    EXPECT_FALSE(s.sensors[0].valid);
+    EXPECT_EQ(s.sensors[0].position_age_us, age_us);
+    EXPECT_EQ(s.sensors[0].velocity_age_us, age_us);
+  };
+  read_at(kFaultFieldMaxAgeUs - 1);
+  EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  read_at(kFaultFieldMaxAgeUs);
+  EXPECT_EQ(s.motors[0].fault_flags, 0u);
+  read_at(kTemperatureMaxAgeUs - 1);
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 25.0);
+  read_at(kTemperatureMaxAgeUs);
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 0.0);
+  // Reconnected, it reads current again.
+  backend.SetMotorConnected(1, true);
+  backend.SetSensorConnected(9, true);
+  s.sample_time_us += 5000;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_EQ(s.motors[0].position_age_us, 0u);
+  EXPECT_EQ(s.sensors[0].position_age_us, 0u);
+  EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 25.0);
+}
+
+// REQ-CONTRACT-32, REQ-DEV-10
+// Frozen feedback is a device whose frames stopped while its sample stays
+// valid: its held limit bits clear and its held temperature reads 0 by the
+// same ages as a disconnected one's.
+TEST(SimBelievability, FrozenFeedbackAgesItsTemperatureAndLimitBits) {
+  PhysicsSimBackend backend;
+  ASSERT_TRUE(backend.Configure(SingleMotorConfig()));
+  backend.SetForwardLimitPressed(1, true);
+  State s{};
+  constexpr uint64_t kLastReadUs = 5000;
+  s.sample_time_us = kLastReadUs;
+  ASSERT_TRUE(backend.Read(s));
+  backend.FreezeFeedback(1);
+  s.sample_time_us = kLastReadUs + kFaultFieldMaxAgeUs - 1;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_EQ(s.motors[0].fault_flags, kMotorForwardHardLimitFlag);
+  s.sample_time_us = kLastReadUs + kFaultFieldMaxAgeUs;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_EQ(s.motors[0].fault_flags, 0u);
+  s.sample_time_us = kLastReadUs + kTemperatureMaxAgeUs - 1;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 25.0);
+  s.sample_time_us = kLastReadUs + kTemperatureMaxAgeUs;
+  ASSERT_TRUE(backend.Read(s));
+  EXPECT_TRUE(s.motors[0].valid);
+  EXPECT_EQ(s.motors[0].position_age_us, kTemperatureMaxAgeUs);
+  EXPECT_DOUBLE_EQ(s.motors[0].temperature_c, 0.0);
+}
+
 TEST(SimBelievability, EmptyBusRemainsHealthy) {
   PhysicsSimBackend backend;
   ASSERT_TRUE(backend.Configure(Config{}));

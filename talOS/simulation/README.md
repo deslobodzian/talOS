@@ -84,8 +84,8 @@ Device targets use logical TOML device names, not physical CAN IDs.
 
 | Kind | Target | Effect |
 |---|---|---|
-| `motor_disconnect` | Motor name | Invalid feedback until the interval ends |
-| `sensor_disconnect` | Sensor name | Invalid feedback until the interval ends |
+| `motor_disconnect` | Motor name | Invalid feedback, its ages growing, until the interval ends ([as the RoboRIO reports it](../hardware/README.md#simulation-backends-ideal-vs-physics-backed)) |
+| `sensor_disconnect` | Sensor name | Invalid feedback, its ages growing, until the interval ends |
 | `freeze` | Motor name | Hold feedback, its age growing, until the interval ends; the gateway marks it invalid once it is `command_timeout_us` old |
 | `supply_voltage` | `all` | Require fifth field, volts in `[0,16]`; restore the resting 12.8 V at end |
 | `reset` | Motor or sensor name | One device-reset edge on the first tick at/after start |
