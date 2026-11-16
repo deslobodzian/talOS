@@ -1,6 +1,7 @@
 # Bundle relocation case for //bench/main_processor:bundle_test: a config one
 # directory away from the bench config it builds on, using every way a config
-# reaches another file. Not a robot configuration.
+# reaches another file, plus a Python node importing a native wheel. Not a
+# robot configuration.
 include = "../configuration/robot.toml"
 
 # A custom path outside subsystems/, layered over a parent-directory
@@ -14,3 +15,9 @@ defaults = "../configuration/subsystems/motor.toml"
 [[subsystems]]
 name = "swerve_module"
 node = "//bench/main_processor/swerve_module:node"
+
+# A Python node that imports numpy, so the bundle carries a third-party
+# native wheel (the bench robot's own nodes import none).
+[[subsystems]]
+name = "native_wheel"
+path = "mechanisms/native_wheel.toml"

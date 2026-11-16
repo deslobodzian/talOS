@@ -1,0 +1,7 @@
+# //bench/main_processor:bundle_test's numpy-importing Python node
+# (../native_wheel.py). No devices; a Python node's period (20 ms).
+[subsystem]
+name = "native_wheel"
+node = "//bench/main_processor/bundle_testdata:native_wheel"
+critical = false
+period_us = 20000
