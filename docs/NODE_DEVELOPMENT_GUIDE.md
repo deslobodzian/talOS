@@ -654,7 +654,9 @@ topics=[(M, topic)], motors=[...], digital_outputs=[...], pwms=[...])` fails
 at the first tick of a step (each boundary of the node's period), or step
 end, at which a listed topic's bytes or a requested or applied output differ
 (or a topic a `parity.require_published()` step names has no message at the
-step's end), naming the step, the tick and both decoded values. How a parity run
+step's end), naming the step, the tick and both decoded values; it also
+fails a step whose clock moved other than through `rig.advance` (an action
+calling `rig.sim.step` would skip the ticks it crosses). How a parity run
 stands in for a Python twin's matrix cases is in
 [TESTING.md §7](TESTING.md#7-the-node-test-matrix).
 
