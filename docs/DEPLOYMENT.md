@@ -156,14 +156,23 @@ the repository, or `talos/` as a submodule):
 `../talos/tools/deploy.sh install bazel-bin/robot_bundle`.
 A relative `--prefix` is resolved against the working directory.
 
-- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
-  any symlink kept as one), checks that the copy has an executable `run.sh`, runs
+- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
+  checks that the copy has an executable `run.sh`, runs
   `sync`, [warms the copy](#warm-up), [checks its graph](#graph-check),
   retains `previous`, and atomically replaces `current` using a temporary
   sibling symlink and rename (Linux and macOS). This selects the next bundle;
   restart the service to activate it. A bundle whose graph the launcher
   refuses is not installed: its copy is removed and `current` and `previous`
-  stay as they were.
+  stay as they were. A `talos_bundle` holds no symlinks, but a bundle Bazel's
+  sandbox staged, or one copied with its links, is a tree of links into a
+  build tree, which would dangle after a `bazel clean`: install copies a
+  link whose target leaves the bundle (an absolute target, a relative one
+  that climbs out, or one that resolves outside) as the file or directory
+  it names, and says how many in one line, `deploy: copied <n> links that
+  leave the bundle as the files they name`; a relative link that stays
+  inside stays a link. A link that names nothing (dangling, or a loop)
+  refuses the install before anything is copied, naming it, and `current`
+  and `previous` stay as they were.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
