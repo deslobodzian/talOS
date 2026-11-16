@@ -535,7 +535,8 @@ sleep precision. Releasing a lane is not a mechanical brake.
   (`ps -eLo pid,tid,cls,rtprio,comm`): the robot program's loop thread (its
   main thread, named after the program, `FF` 10), the interrupt threads
   (`FF` 15, `irq/61-atomiczy` `FF` 96), `talos_watchdog` (`FF` 30), the
-  Driver Station reader `talos-ds` (`FF` 5), the
+  Driver Station reader `talos-ds` (`FF` 5), the watchdog's reporter
+  `talos_wd_report` (`TS`), the
   robot program's other threads (`TS`, among them `can_psend` and
   `can_recv`; three unnamed ones `RR` 1-2), the Driver Station (netcomm)
   threads (`TS`) and Phoenix's threads; note whether any thread runs between

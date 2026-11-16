@@ -431,18 +431,16 @@ session panel; how it ended (a kill, a crash, its exit code) is never in
 the launcher's exit status: an operator's stop of a session whose bridge
 died still exits 0.
 
-A restart binds the same `[studio] http_port`. The bridge's listener sets
-`SO_REUSEADDR` (and `SO_REUSEPORT` where the OS has it), and the launcher
-kills a dead run's process group before it schedules the restart, so the
-port is free again for the restart. A program that holds the port without
-`SO_REUSEPORT` makes every run fail its listen and exit, which the bound
-above ends, with the reason in `studio_bridge.log`. One of the same user
-that also sets `SO_REUSEPORT`, such as another launcher's bridge on the
-same port (a developer's `./sim.sh` on the robot computer), does not: both
-listen, and new connections go to either, so a dashboard may show the
-other session. The launcher sees the bridge only through its
-exits: it takes no registry row, so a bridge that hangs without exiting is
-not detected or restarted.
+A restart binds the same `[studio] http_port`. The bridge holds its port
+exclusively (`SO_REUSEADDR`, never `SO_REUSEPORT`;
+[studio/bridge](../../studio/bridge/README.md)), and the launcher kills a dead
+run's process group before it schedules the restart, so the port is free again
+for the restart. A port another listener holds, such as another launcher's
+bridge on the same port (a developer's `./sim.sh` on the robot computer), is
+refused: every run prints `cannot listen on port <port>` and exits, which the
+bound above ends, with the reason in `studio_bridge.log`. The launcher sees
+the bridge only through its exits: it takes no registry row, so a bridge that
+hangs without exiting is not detected or restarted.
 
 ## Node output
 
@@ -1659,6 +1657,10 @@ bazel run //talOS/launcher:session_report -- --json /tmp/logs/session
 ```
 
 A repository that depends on talOS runs `@talos//talOS/launcher:session_report`.
+
+`bazel run //talOS/launcher:stop_paths -- <session> [--config robot.toml]`
+reads the bench's stop-path trials from a session's logs (`stop_paths.py`; see
+[BENCH.md "Reading a trial"](../../docs/BENCH.md)).
 
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config

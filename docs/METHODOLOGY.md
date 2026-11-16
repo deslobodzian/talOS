@@ -268,7 +268,7 @@ Rules:
   the first log gap or damaged stretch in a log that feeds the node: the run
   ends there, names the log, and exits 1; a feeding log that is capped, a
   run's log without its EXIT of a member the session manifest marks
-  `log_gap`, or one whose damage nothing bounds is refused before the node
+  `log_gap` or `recorder_failed`, or one whose damage nothing bounds is refused before the node
   runs. **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
