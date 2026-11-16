@@ -7,7 +7,8 @@ import org.gradle.language.cpp.tasks.CppCompile
 // tests (src/test/cpp) cover only this program's own sources: desktop
 // simulation regressions for the Phoenix backend, the config store, the
 // simulated Driver Station, the Driver Station reader, the logger, the
-// companion link reporter, the loop watchdog and the loop's wake schedule;
+// companion link reporter, the loop watchdog, the loop's wake schedule and
+// the loop's console lines;
 // there is no command-based framework.
 plugins {
     id "cpp"
@@ -462,7 +463,8 @@ model {
         // Desktop tests of this program's sources (src/test/cpp): the
         // PhoenixBackend simulation regressions, ConfigStore,
         // SimDriverStation, DriverStationReader, RioLog, CompanionLink,
-        // LoopWatchdog, SocketRetry, LoopSchedule and CanBusHealth.
+        // LoopWatchdog, SocketRetry, LoopSchedule, LoopConsole and
+        // CanBusHealth.
         // The suite itself is auto-created per component by the google-test
         // plugin; this only points it at our sources and dependencies.
         frcUserProgramTest {
@@ -488,13 +490,13 @@ tasks.register("buildRio") {
 // Stable entry point for the desktop tests in src/test/cpp (PhoenixBackend
 // simulation regressions, ConfigStore, SimDriverStation,
 // DriverStationReader, RioLog, CompanionLink, LoopWatchdog, SocketRetry,
-// LoopSchedule, CanBusHealth). The
+// LoopSchedule, LoopConsole, CanBusHealth). The
 // google-test plugin creates one RunTestExecutable task per desktop variant
 // (runFrcUserProgramTest<Platform><BuildType>GoogleTestExe),
 // so CI pins this aggregator instead of a platform-specific variant name.
 // It also runs rioBuildStampTest, the build's own revision-stamp check.
 tasks.register("phoenixTest") {
-    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, DriverStationReader, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth) and rioBuildStampTest'
+    description = 'Run the RoboRIO program desktop tests (PhoenixBackend sim, ConfigStore, SimDriverStation, DriverStationReader, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, LoopConsole, CanBusHealth) and rioBuildStampTest'
     group = 'verification'
     def runTasks = tasks.matching { it.name.startsWith('runFrcUserProgramTest') }
     dependsOn runTasks, 'rioBuildStampTest'
