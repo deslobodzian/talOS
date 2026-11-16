@@ -2308,6 +2308,7 @@ TEST(ConfigWire, RejectsCeilingViolations) {
 
 // Chunk headers and ACKs are little-endian on the wire whatever the host's
 // byte order, like every other payload (docs/DATA_FLOW.md).
+// REQ-CONTRACT-03
 TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
   const auto config = SwerveConfig(true);
   const auto chunks = CreateConfigChunks(config);
@@ -2332,6 +2333,88 @@ TEST(ConfigWire, ChunkHeaderAndAckAreLittleEndian) {
   ASSERT_EQ(EncodeConfigAck(ack, bytes), bytes.size());
   const std::array<uint8_t, 9> expected{8, 7, 6, 5, 4, 3, 2, 1, 4};
   EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+}
+
+// The serialized config body both ends agree on byte for byte, one device
+// of every kind: each integer (a signed one as its two's-complement bits)
+// and IEEE 754 double little-endian, each string a u16 length then its
+// bytes, each device list a u16 count.
+// REQ-CONTRACT-03
+TEST(ConfigWire, SerializedConfigIsLittleEndian) {
+  Config config;
+  config.period_us = 5000;
+  config.command_timeout_us = 100000;
+  config.status_hz = 200;
+  config.commissioned = true;
+  MotorConfig motor;
+  motor.id = 0x0102;
+  motor.name = "m";
+  motor.can_id = 0x01020304;
+  motor.feedback = Feedback::kRemoteCANcoder;
+  motor.feedback_sensor_id = 0x0506;
+  motor.reverse_limit_switch = LimitSwitch::kDisabled;
+  motor.slots[0].p = 1.5;
+  motor.slots[0].gravity_type = GravityType::kArmCosine;
+  motor.foc = true;
+  motor.max_torque_current_a = 0.5;
+  config.motors.push_back(motor);
+  config.sensors.push_back(
+      {0x0708, "s", SensorKind::kPigeon2, 0x11121314, "cv", true, -0.25});
+  config.digital_inputs.push_back({0x0901, "a", 0x21222324});
+  config.digital_outputs.push_back({0x0902, "b", 0x31323334});
+  config.analog_inputs.push_back({0x0903, "c", 0x41424344});
+  config.encoders.push_back(
+      {0x0904, "e", EncoderKind::kDutyCycle, 0x51525354, -1, 2048, 0.5});
+  config.pwm_outputs.push_back({0x0905, "p", 0x61626364});
+  std::vector<uint8_t> expected{
+      0x88, 0x13, 0,    0,    0xA0, 0x86, 0x01, 0,     // period, timeout
+      0,    0,    0,    0,    0,    0,    0x69, 0x40,  // status_hz 200
+      1,    1,    0,                                   // commissioned, motors
+      0x02, 0x01, 1,    0,    'm',                     // id, name
+      0x04, 0x03, 0x02, 0x01, 3,    0,    'r',  'i',  'o',  // can_id, bus
+      0,    1,    0,    0,    0,                            // inverted..oppose
+      0,    0,    0,    0,    0,    0,    0x44, 0x40,       // supply 40 A
+      0,    0,    0,    0,    0,    0,    0x54, 0x40,       // stator 80 A
+      0,    0,    0,    0,    0,    0,    0x28, 0x40,       // max_voltage 12 V
+      1,    0x06, 0x05,                                 // feedback, its sensor
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // rotor_to_sensor 1
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // sensor_to_mechanism 1
+      0,    0,                                          // wrap, soft limits
+      0,    0,    0,    0,    0,    0,    0xF0, 0xBF,   // reverse limit -1
+      0,    0,    0,    0,    0,    0,    0xF0, 0x3F,   // forward limit 1
+      0,    2,                                          // limit switches
+      0,    0,    0,    0,    0,    0,    0x59, 0x40,   // max velocity 100
+      0,    0,    0,    0,    0,    0,    0x34, 0x40,   // cruise 20
+      0,    0,    0,    0,    0,    0,    0x44, 0x40,   // acceleration 40
+      0,    0,    0,    0,    0,    0,    0,    0,      // jerk 0
+      0,    0,    0,    0,    0,    0,    0xF8, 0x3F};  // slot 0 p 1.5
+  // Slot 0's i, d, s, v, a and g, then its gravity type; slots 1 and 2.
+  expected.insert(expected.end(), size_t{6} * 8, uint8_t{0});
+  expected.push_back(1);
+  expected.insert(expected.end(), size_t{2} * (7 * 8 + 1), uint8_t{0});
+  expected.insert(
+      expected.end(),
+      {1,                                                  // foc
+       0,    0,    0,    0,    0,    0,    0xE0, 0x3F,     // torque current 0.5
+       1,    0,    0x08, 0x07, 1,    0,    's',  2,        // sensor, Pigeon 2
+       0x14, 0x13, 0x12, 0x11, 2,    0,    'c',  'v',  1,  // can_id, bus, inv
+       0,    0,    0,    0,    0,    0,    0xD0, 0xBF,     // offset -0.25
+       1,    0,    0x01, 0x09, 1,    0,    'a',            // digital input
+       0x24, 0x23, 0x22, 0x21,                             //
+       1,    0,    0x02, 0x09, 1,    0,    'b',            // digital output
+       0x34, 0x33, 0x32, 0x31,                             //
+       1,    0,    0x03, 0x09, 1,    0,    'c',            // analog input
+       0x44, 0x43, 0x42, 0x41,                             //
+       1,    0,    0x04, 0x09, 1,    0,    'e',  2,     // encoder, duty cycle
+       0x54, 0x53, 0x52, 0x51, 0xFF, 0xFF, 0xFF, 0xFF,  // dio_a, dio_b -1
+       0,    0,    0,    0,    0,    0,    0xA0, 0x40,  // counts_per_rev 2048
+       0,    0,    0,    0,    0,    0,    0xE0, 0x3F,  // offset 0.5
+       1,    0,    0x05, 0x09, 1,    0,    'p',         // PWM output
+       0x64, 0x63, 0x62, 0x61});
+  EXPECT_EQ(SerializeConfig(config), expected);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(expected, decoded));
+  EXPECT_EQ(decoded, config);
 }
 
 TEST(Gateway, StartsUnconfiguredAndRefusesEnableUntilReconfigured) {
