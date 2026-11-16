@@ -1280,7 +1280,8 @@ session directory and the file, or the file twice) is merged once
 - `--format text|jsonl|csv|summary`: default `text`; `jsonl` emits one JSON
   object per matching record; `csv` emits a header and RFC-4180 rows.
   Machine-readable formats omit the human-readable preamble and summary.
-  `summary` prints one block per topic instead of the records (below).
+  `summary` prints one block per topic, and one per process with a log gap,
+  instead of the records (below).
 - `--config robot.toml`: the config whose device names label the hardware
   packets (below). Without it, `log_dump` reads the `config_path` of the
   `manifest.json` in a session directory it was given, when that file still
@@ -1300,14 +1301,30 @@ can leave; see [log format](../events/README.md#log-format)), and once it ends
 `log_dump` prints `warning: damaged log <path>: <what was skipped, with byte
 offsets>` on stderr, which `session_report` reads.
 
+A log gap, the records an event-log writer dropped and capture resumed after
+(a GAP record; [log format](../events/README.md#log-format)), is a record of
+its process with no topic (`source_id` 65535, topic `?`, as an EXIT record
+shows it), merged at its start (`event_ms`, the earliest time a dropped
+record names) and ending at `now_ms`, when capture resumed (for a gap the
+writer's stop closed, the stop). It concerns every topic of its log, so no
+`--topic` pattern hides it; `--node` selects it by its process, and the time
+window by its whole span: a gap overlapping the window is shown. The text
+dump prints `      gap: <sentence>` under its record line, CSV puts the
+same sentence in `decoded`, and JSONL puts it in `decoded` and adds a `gap`
+object (below). Once a log with gaps ends, `log_dump` prints one line for
+it on stderr, however many it holds: `warning: log gap in <path>: <the first
+gap's sentence>[ (and <n> more)]`. The sentence is `DescribeGap`'s
+(`log_reader.h`): what was lost, over how long, which dispatches, the cause,
+and whether the first dispatch was partly recorded or the stop closed it.
+
 Records are printed in merge order: by event time, then the record's `now`,
 then its dispatch index, and on a full tie in the order the files are listed
 (sorted by path within a directory, so a rotated log's older segments come
 first). Every log is read through a fixed window (`WindowedLogReader`), never
 whole, so memory grows with the number of logs, not with their length. Each
 mode reads the session twice: once for the earliest event time every printed
-time is relative to and for the record count, printing the damage warnings
-then, before any output; once to print. On a generated 210 MiB session (8
+time is relative to and for the record count, printing the gap and damage
+warnings then, before any output; once to print. On a generated 210 MiB session (8
 logs, 1.72 million 128-byte records; `bazel run -c opt
 //talOS/launcher:log_memory_bench`, Linux x86-64) `log_dump`'s peak resident
 memory is 5.6 MiB, text or JSONL, where reading every log whole and holding
@@ -1346,6 +1363,23 @@ envelope, `<field>[i]` for an array element). The summary is folded in
 during the streaming pass, so its memory grows with the topics and their
 fields, not the records.
 
+After the topics, each process with a matching log gap gets one block,
+sorted by process: how many gaps, the records, dispatches and sends they
+lost, the earliest start and the latest end on the same baseline. GAP
+records are not a topic. The block holds totals, not one line per gap, so a
+session with any number of gaps costs a fixed size per process; the text
+dump and JSONL list each gap.
+
+```text
+gaps gamma
+  count 2
+  records 4
+  dispatches 4
+  sends 0
+  first_ms 15.000
+  last_ms 55.000
+```
+
 Both export formats contain `process`, `dispatch_index`, `kind`, `source_id`,
 `topic`, `event_ms`, `now_ms`, `publish_ms`, `sequence`, `aux`,
 `payload_bytes`, `schema`, `decoded` and `hardware`; JSONL also carries
@@ -1353,8 +1387,32 @@ Both export formats contain `process`, `dispatch_index`, `kind`, `source_id`,
 regardless of filters. `schema` is empty when the source has no schema;
 `decoded` is empty without a schema or payload, otherwise it contains the
 descriptor-decoded payload text (for a schema-less hardware Packet, a
-truncated hex preview). JSON strings are escaped; CSV fields containing
-commas, quotes, or newlines are quoted and embedded quotes are doubled.
+truncated hex preview; for a GAP record, the gap's sentence). JSON strings
+are escaped; CSV fields containing commas, quotes, or newlines are quoted
+and embedded quotes are doubled.
+
+A JSONL GAP record (`"kind":"GAP"`) also carries `gap`, which
+`session_report` reads:
+
+```json
+"gap":{"start_ms":15,"end_ms":35,"first_lost_ms":15,"last_lost_ms":25,
+       "first_dispatch_index":2,"last_dispatch_index":3,"records":2,
+       "bytes":144,"dispatches":2,"sends":0,"cause":"pool_full",
+       "splits_dispatch":false,"closed_at_flush":false}
+```
+
+`start_ms` and `end_ms` are the record's `event_ms` and `now_ms` (the
+dropped records lie in [`start_ms`, `last_lost_ms`]; capture stopped at
+`first_lost_ms`, the first dropped record's `now`, and resumed at
+`end_ms`); `first_dispatch_index` to `last_dispatch_index` are the dispatches
+it touched; `records`, `bytes`, `dispatches` (TIMER and MESSAGE records)
+and `sends` count what it dropped; `cause` is `pool_full` (the writer's
+buffers were all handed over), `record_too_large` or `unknown`;
+`splits_dispatch` says the first dispatch had records before the gap;
+`closed_at_flush` that capture never resumed and the writer's stop closed
+it. A GAP record without its detail payload, which this build never writes,
+has null `first_lost_ms` and `last_lost_ms`, zero counts and cause
+`unknown`.
 
 A JSONL record of a `status` topic (a topic whose role segment is `status`)
 also carries `alerts`, each alert field of its message in field order:

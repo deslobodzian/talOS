@@ -1,5 +1,6 @@
 #include "talOS/launcher/log_merge.h"
 
+#include <cstddef>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -30,18 +31,29 @@ bool MergeLogs(const std::vector<std::string>& log_paths,
   }
   const bool warn = warnings == MergeWarnings::kPrint;
 
-  // One open log: its reader's fixed window and the record at its head.
+  // One open log: its reader's fixed window, the record at its head and the
+  // first GAP record it returned (a fixed size per log, however many).
   struct Member {
     event::log::WindowedLogReader reader;
     MergedRecord current;
+    std::optional<event::log::LogGap> first_gap;
   };
   std::vector<Member> members;
   members.reserve(log_paths.size());
-  // Reads the member's next intact record. A log the reader skipped damage
-  // in still merges, and its damage is named once, when it ends.
+  // Reads the member's next intact record. A log the reader returned GAP
+  // records from, or skipped damage in, still merges, and each is named
+  // once, when it ends.
   const auto advance = [warn](Member& member) {
     event::log::LogReader::Record record;
     if (!member.reader.next(record)) {
+      if (const auto& gap = member.first_gap; warn && gap.has_value()) {
+        std::cerr << "warning: log gap in " << member.current.log->path << ": "
+                  << event::log::DescribeGap(*gap);
+        if (const std::size_t more = member.reader.gaps() - 1; more > 0) {
+          std::cerr << " (and " << more << " more)";
+        }
+        std::cerr << "\n";
+      }
       if (const std::string damage =
               event::log::DescribeDamage(member.reader.damage());
           warn && !damage.empty()) {
@@ -54,10 +66,15 @@ bool MergeLogs(const std::vector<std::string>& log_paths,
     current.header = record.header;
     current.payload = record.payload;
     current.offset = record.offset;
+    const auto gap = event::log::GapOf(record.header, record.payload);
+    if (gap.has_value() && !member.first_gap.has_value()) {
+      member.first_gap = gap;
+    }
+    const bool sourceless =
+        gap.has_value() || record.header.kind == static_cast<std::uint16_t>(
+                                                     event::EventKind::EXIT);
     current.source =
-        record.header.kind == static_cast<std::uint16_t>(event::EventKind::EXIT)
-            ? nullptr
-            : current.log->source(record.header.source_id);
+        sourceless ? nullptr : current.log->source(record.header.source_id);
     return true;
   };
 
