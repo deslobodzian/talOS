@@ -302,6 +302,14 @@ talos_messages(
     visibility = ["//visibility:private"],
 )
 
+# A message with an enum and an array, for log_dump_test's summary.
+talos_messages(
+    name = "summary_message",
+    srcs = ["testdata/summary_message.fbs"],
+    include_prefix = "summary_test",
+    visibility = ["//visibility:private"],
+)
+
 cc_test(
     name = "log_dump_test",
     size = "small",
@@ -311,6 +319,7 @@ cc_test(
     deps = [
         ":alert_message",
         ":continuity_message",
+        ":summary_message",
         "//talOS/configuration",
         "//talOS/driver_station",
         "//talOS/events:events_core",

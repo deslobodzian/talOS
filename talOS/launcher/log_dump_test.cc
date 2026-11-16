@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -20,6 +21,8 @@
 #include "continuity_test/continuity_message_descriptor.h"
 #include "continuity_test/continuity_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "summary_test/summary_message_descriptor.h"
+#include "summary_test/summary_message_generated.h"
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
@@ -55,12 +58,28 @@ class LogDumpTest : public testing::Test {
   void WriteLog(const std::string& process, const std::string& topic,
                 const std::vector<int>& times,
                 const std::vector<continuity_test::Count>& values = {}) {
-    using D = talos::Descriptor<continuity_test::Count>;
+    std::vector<std::vector<std::byte>> payloads;
+    for (std::size_t i = 0; i < times.size(); ++i) {
+      const continuity_test::Count value =
+          values.empty() ? continuity_test::Count{7, 9} : values.at(i);
+      const auto bytes = std::as_bytes(std::span{&value, 1});
+      payloads.emplace_back(bytes.begin(), bytes.end());
+    }
+    WriteRecords<continuity_test::Count>(process, topic, times, payloads);
+  }
+
+  // One timer record of message M per time, its payload as given (of any
+  // size), each published 3 ms before its event.
+  template <class M>
+  void WriteRecords(const std::string& process, const std::string& topic,
+                    const std::vector<int>& times,
+                    const std::vector<std::vector<std::byte>>& payloads) {
+    using D = talos::Descriptor<M>;
     talos::event::Registration source;
     source.id = 1;
     source.kind = talos::event::SourceKind::TIMER;
     source.name = topic;
-    source.message_bytes = sizeof(continuity_test::Count);
+    source.message_bytes = sizeof(M);
     source.schema = {std::string{D::kName}, D::kHash,
                      std::string{reinterpret_cast<const char*>(D::kBfbs.data()),
                                  D::kBfbs.size()}};
@@ -79,12 +98,22 @@ class LogDumpTest : public testing::Test {
       ctx.now = ctx.event_time;
       ctx.publish_time = ctx.event_time - std::chrono::milliseconds{3};
       ctx.sequence = i + 1;
-      const continuity_test::Count value =
-          values.empty() ? continuity_test::Count{7, 9} : values.at(i);
-      writer.dispatch(ctx, std::as_bytes(std::span{&value, 1}));
+      writer.dispatch(ctx, payloads.at(i));
     }
     writer.flush();
     ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+
+  static std::vector<std::string> SplitLines(const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream{text};
+    for (std::string line; std::getline(stream, line);) out.push_back(line);
+    return out;
+  }
+
+  static bool HasLine(const std::vector<std::string>& lines,
+                      const std::string& line) {
+    return std::find(lines.begin(), lines.end(), line) != lines.end();
   }
 
   std::string Run(std::vector<std::string> args, bool success = true) {
@@ -262,7 +291,21 @@ can_id = 2
   ASSERT_FALSE(writer.failed()) << writer.error();
 
   const auto json = Run({"--format", "jsonl", "--node", "shooter"});
+  // The summary reads the packet by name only: the hex its schema-less
+  // layout decodes to is no `latest` beside the decoded `hardware`.
+  const auto summary =
+      SplitLines(Run({"--format", "summary", "--node", "shooter"}));
   unsetenv("BUILD_WORKING_DIRECTORY");
+  EXPECT_TRUE(std::any_of(summary.begin(), summary.end(),
+                          [](const std::string& line) {
+                            return line.starts_with(
+                                "  hardware {\"type\":\"command\"");
+                          }))
+      << ::testing::PrintToString(summary);
+  EXPECT_FALSE(std::any_of(
+      summary.begin(), summary.end(),
+      [](const std::string& line) { return line.starts_with("  latest "); }))
+      << ::testing::PrintToString(summary);
   EXPECT_NE(json.find("\"payload_hex\":\""), std::string::npos) << json;
   EXPECT_NE(json.find("\"hardware\":{\"type\":\"command\""), std::string::npos)
       << json;
@@ -389,6 +432,10 @@ TEST_F(LogDumpTest, ManifestOfAnotherProtocolRefusesPacketsThatDecode) {
   EXPECT_EQ(output.find("\"hardware\""), std::string::npos) << output;
   EXPECT_NE(output.find("protocol " + std::to_string(other)), std::string::npos)
       << output;
+  // Undecoded, the summary keeps the bytes as the packet's `latest`.
+  const auto summary = Run({"--format", "summary", "--node", "shooter"});
+  EXPECT_NE(summary.find("\n  latest bytes="), std::string::npos) << summary;
+  EXPECT_EQ(summary.find("\n  hardware "), std::string::npos) << summary;
 }
 
 // Guards: a log named more than once (as itself, twice, and through its
@@ -437,6 +484,77 @@ TEST_F(LogDumpTest, SummaryGivesCountsLatestValueAndRangePerTopic) {
   EXPECT_TRUE(has(alpha, "topic /alpha/state continuity_test.Count"));
   EXPECT_TRUE(has(alpha, "  records alpha TIMER 2"));
   EXPECT_FALSE(has(alpha, "topic /gamma/state continuity_test.Count"));
+}
+
+// Guards: the summary of a message with an array and an enum. Each array
+// element gets its own range by index, and the enum, which has no range,
+// lists every value it took in the order first seen, so a mechanism that
+// went HOMED then FAILED and back says so though `latest` reads HOMED.
+// REQ-OPS-15
+TEST_F(LogDumpTest, SummaryRangesArrayElementsAndListsEnumValues) {
+  using summary_test::Phase;
+  const auto arm = [](float first, float second, Phase phase) {
+    std::vector<std::byte> bytes(sizeof(summary_test::Arm));
+    std::memcpy(bytes.data(), &first, sizeof first);
+    std::memcpy(bytes.data() + 4, &second, sizeof second);
+    bytes[8] = static_cast<std::byte>(phase);
+    return bytes;
+  };
+  WriteRecords<summary_test::Arm>(
+      "arm", "/arm/state", {5, 15, 25, 35},
+      {arm(0.5F, -1, Phase::IDLE), arm(2, 3, Phase::HOMED),
+       arm(1, -4, Phase::FAILED), arm(1.5F, 0, Phase::HOMED)});
+
+  const auto arm_summary =
+      SplitLines(Run({"--format", "summary", "--topic", "/arm/state"}));
+  const auto print = ::testing::PrintToString(arm_summary);
+  EXPECT_TRUE(HasLine(arm_summary, "topic /arm/state summary_test.Arm"))
+      << print;
+  EXPECT_TRUE(
+      HasLine(arm_summary, "  latest {position_m: [1.5, 0], phase: HOMED}"))
+      << print;
+  EXPECT_TRUE(HasLine(arm_summary, "  range position_m[0] 0.5 2")) << print;
+  EXPECT_TRUE(HasLine(arm_summary, "  range position_m[1] -4 3")) << print;
+  EXPECT_TRUE(HasLine(arm_summary, "  values phase IDLE HOMED FAILED"))
+      << print;
+  EXPECT_FALSE(std::any_of(arm_summary.begin(), arm_summary.end(),
+                           [](const std::string& line) {
+                             return line.starts_with("  range phase");
+                           }))
+      << print;
+}
+
+// Guards: a record its schema cannot decode (here 4 bytes of an 8-byte
+// message) is counted and shown as `latest` with why, but is no field's
+// value: the ranges keep the decoded records' values and no range or value
+// line is made of the error text.
+// REQ-OPS-15
+TEST_F(LogDumpTest, SummaryCountsAnUndecodableRecordButRangesNoneOfIt) {
+  const continuity_test::Count low{2, 9};
+  const continuity_test::Count high{11, 9};
+  const auto bytes = [](const continuity_test::Count& value) {
+    const auto span = std::as_bytes(std::span{&value, 1});
+    return std::vector<std::byte>(span.begin(), span.end());
+  };
+  WriteRecords<continuity_test::Count>(
+      "delta", "/delta/state", {5, 15, 25},
+      {bytes(low), bytes(high), std::vector<std::byte>(4, std::byte{0x7f})});
+
+  const auto delta =
+      SplitLines(Run({"--format", "summary", "--topic", "/delta/state"}));
+  const auto print = ::testing::PrintToString(delta);
+  EXPECT_TRUE(HasLine(delta, "  records delta TIMER 3")) << print;
+  EXPECT_TRUE(HasLine(delta, "  latest <4 bytes, continuity_test.Count is 8>"))
+      << print;
+  EXPECT_TRUE(HasLine(delta, "  range run_index 2 11")) << print;
+  EXPECT_TRUE(HasLine(delta, "  range sequence_count 9 9")) << print;
+  EXPECT_EQ(std::count_if(delta.begin(), delta.end(),
+                          [](const std::string& line) {
+                            return line.starts_with("  range ") ||
+                                   line.starts_with("  values ");
+                          }),
+            2)
+      << print;
 }
 
 // Guards: each record of a node's `status` topic carries every alert field's

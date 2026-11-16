@@ -1425,11 +1425,15 @@ topic /gamma/state continuity_test.Count
 `records` counts the matching records per process and kind (a topic read by
 two nodes is counted in each log). `first_ms` and `last_ms` are the earliest
 and latest publication times, on the same baseline as the other formats (a
-timer's event time). `latest` is the last merged record's decoded value
-(`hardware` too for a hardware packet), and each `range` line gives a
-numeric or bool field's smallest and largest value over the matching
-records, as decoded, in field order (`message.<field>` inside a target
-envelope, `<field>[i]` for an array element). The summary is folded in
+timer's event time). `latest` is the last merged record's decoded value (a
+record its schema cannot decode gives why, `<...>`, and no field value); a
+hardware packet `log_dump` decodes has a `hardware` line in its place. Each
+`range` line gives a numeric or bool field's smallest and largest value
+over the matching records, as decoded, in field order (`message.<field>`
+inside a target envelope, `<field>[i]` for an array element), and each
+`values` line an enum field's names, each once in the order first seen
+(`values phase IDLE HOMED FAILED`), so a state change shows though
+`latest` reads only the last. The summary is folded in
 during the streaming pass, so its memory grows with the topics and their
 fields, not the records.
 
