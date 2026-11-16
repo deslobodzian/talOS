@@ -929,6 +929,14 @@ class NewSubsystemTest(unittest.TestCase):
                 with open(os.path.join(root, "cfg", "robot_sim.toml"), "a",
                           encoding="utf-8") as f:
                     f.write(textwrap.dedent(block))
+                # Every comment saying which config never reads it names
+                # the one it includes, the robot's.
+                with open(os.path.join(root, "cfg", "robot_sim.toml"),
+                          encoding="utf-8") as f:
+                    sim_text = f.read()
+                self.assertEqual(
+                    set(re.findall(r"(\S+) never reads", sim_text)),
+                    {"practice.toml"}, sim_text)
                 subsystems, _ = new_subsystem.sync_manifest.effective(
                     root, "cfg/robot_sim.toml")
                 self.assertIn("feeder", subsystems)

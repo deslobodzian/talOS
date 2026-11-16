@@ -99,8 +99,10 @@ status_hz = 200.0
 # from a desk (docs/BRINGUP.md). A commissioned robot also requires target
 # coverage: the launcher refuses a subsystem that some Driver Station mode's
 # policy lanes leave without a writer. require_target_coverage = true asks
-# for that before commissioning, once every mechanism has a teleop binding
-# or other producer.
+# for that before commissioning: each mechanism then needs at least one
+# writer among each mode's lanes, or a [targets] listing no lane in any
+# mode, which keeps it neutral (new_subsystem writes one for each mechanism
+# it adds then).
 commissioned = false
 # The program that stands in for the RoboRIO under `./sim.sh --sim-gateway`.
 sim_gateway = "//talOS/simulation:sim_gateway"
