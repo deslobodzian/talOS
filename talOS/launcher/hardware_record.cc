@@ -1,5 +1,6 @@
 #include "talOS/launcher/hardware_record.h"
 
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/log/format.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/protocol/types.h"
@@ -386,23 +388,44 @@ std::size_t ManifestValue(const std::string& text, std::string_view key) {
   return text.find_first_not_of(" \t\r\n", at + 1);
 }
 
-// The "hardware_protocol_version" of a session's manifest.json (session.cc
-// SessionManifest::ToJson): nullopt when it has none, or a value that is not
-// a version (an integer from 1 to 65535).
-std::optional<std::uint16_t> ManifestProtocolVersion(
-    const std::filesystem::path& session) {
-  const std::string text = ManifestText(session);
-  const std::size_t at = ManifestValue(text, "hardware_protocol_version");
+// The unsigned integer member `key` of a manifest.json's text; nullopt when
+// it has none, or one that is not a decimal integer.
+std::optional<std::uint64_t> ManifestInteger(const std::string& text,
+                                             std::string_view key) {
+  const std::size_t at = ManifestValue(text, key);
   if (at == std::string::npos || text[at] < '0' || text[at] > '9') {
     return std::nullopt;
   }
   char* end = nullptr;
-  const unsigned long value = std::strtoul(text.c_str() + at, &end, 10);
-  if (value < 1 || value > 0xFFFF ||
+  errno = 0;
+  const unsigned long long value = std::strtoull(text.c_str() + at, &end, 10);
+  if (errno != 0 ||
       (*end != ',' && *end != '\n' && *end != ' ' && *end != '}')) {
     return std::nullopt;
   }
-  return static_cast<std::uint16_t>(value);
+  return value;
+}
+
+// The "hardware_protocol_version" of a manifest.json's text (session.cc
+// SessionManifest::ToJson): nullopt when it has none, or a value that is not
+// a version (an integer from 1 to 65535).
+std::optional<std::uint16_t> ManifestProtocolVersion(const std::string& text) {
+  const auto value = ManifestInteger(text, "hardware_protocol_version");
+  if (!value || *value < 1 || *value > 0xFFFF) return std::nullopt;
+  return static_cast<std::uint16_t>(*value);
+}
+
+// The session id in the header of the event log at `path`; nullopt when it
+// has no readable header of a talOS log.
+std::optional<std::uint64_t> LogSessionId(const std::filesystem::path& path) {
+  std::ifstream stream{path, std::ios::binary};
+  event::log::FileHeader header{};
+  if (!stream.read(reinterpret_cast<char*>(&header), sizeof header) ||
+      std::memcmp(header.magic, event::log::FILE_MAGIC, sizeof header.magic) !=
+          0) {
+    return std::nullopt;
+  }
+  return header.session_id;
 }
 
 // The "config_path" string of a session's manifest.json (session.cc
@@ -613,8 +636,21 @@ std::optional<std::uint16_t> RecordedProtocolVersion(
     const std::vector<std::string>& inputs) {
   for (const auto& input : inputs) {
     std::error_code ec;
-    if (!std::filesystem::is_directory(input, ec)) continue;
-    if (const auto version = ManifestProtocolVersion(input)) return version;
+    if (std::filesystem::is_directory(input, ec)) {
+      if (const auto version = ManifestProtocolVersion(ManifestText(input))) {
+        return version;
+      }
+      continue;
+    }
+    // A log named alone: the manifest beside it, if it is that log's
+    // session's.
+    const std::filesystem::path file{input};
+    const std::string text =
+        ManifestText(file.has_parent_path() ? file.parent_path()
+                                            : std::filesystem::path{"."});
+    const auto manifest_session = ManifestInteger(text, "session_id");
+    if (!manifest_session || manifest_session != LogSessionId(file)) continue;
+    if (const auto version = ManifestProtocolVersion(text)) return version;
   }
   return std::nullopt;
 }

@@ -16,6 +16,7 @@
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/launcher/session.h"
@@ -382,6 +383,37 @@ TEST(HardwareProtocolCheck, ManifestRecordsThisBuildsVersion) {
   manifest.hardware_protocol_version.reset();
   std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
   EXPECT_EQ(talos::launcher::RecordedProtocolVersion({dir}), std::nullopt);
+}
+
+// Guards: a .tlog named on its own (log_dump <session>/node.tlog) is read
+// under the version its session's manifest records: the manifest beside it,
+// when that manifest's session_id is the log's. A manifest of another
+// session beside it, or none, records nothing for it.
+// REQ-OPS-51
+TEST(HardwareProtocolCheck, ALogNamedAloneTakesItsSessionsManifest) {
+  const std::string dir = testing::TempDir() + "/log_named_alone";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const std::string log = dir + "/node.tlog";
+  {
+    talos::event::log::LogWriter writer{
+        log, "node", talos::event::log::LogWriterOptions{4096, 1, false}, 42};
+    writer.start({}, talos::event::MonotonicTime::from_nanos(1'000'000'000));
+    writer.flush();
+    ASSERT_FALSE(writer.failed()) << writer.error();
+  }
+  const std::uint16_t other = talos::protocol::kProtocolVersion - 1;
+  EXPECT_EQ(talos::launcher::RecordedProtocolVersion({log}), std::nullopt);
+  talos::launcher::SessionManifest manifest;
+  manifest.hardware_protocol_version = other;
+  for (const std::uint64_t session_id : {42, 43}) {
+    SCOPED_TRACE(session_id);
+    manifest.session_id = session_id;
+    std::ofstream{dir + "/manifest.json"} << manifest.ToJson();
+    EXPECT_EQ(talos::launcher::RecordedProtocolVersion({log}),
+              session_id == 42 ? std::optional{other} : std::nullopt);
+  }
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

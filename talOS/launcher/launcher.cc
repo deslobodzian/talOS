@@ -19,8 +19,10 @@
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/process/process.h"
+#include "talOS/protocol/types.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -927,6 +929,21 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
       spec->studio_bridge) {
     std::cerr << "launcher: " << spec->name
               << " is not a talos node and has no input replay\n";
+    return 1;
+  }
+
+  // A replay of another hardware protocol's session would hand the node's
+  // devices layer States in another layout, decoded with this build's (one
+  // that kept every length decodes, wrongly), and could not match the
+  // recording it is compared with. A session whose manifest records no
+  // version is replayed: its States that this build's codec rejects are no
+  // State to the node (hardware_record.h, "Which logs a build can read").
+  if (const auto recorded = RecordedProtocolVersion({options_.replay_inputs});
+      recorded && *recorded != protocol::kProtocolVersion) {
+    std::cerr << "launcher: --replay-inputs " << options_.replay_inputs
+              << " was recorded under hardware protocol " << *recorded
+              << "; this build's is " << protocol::kProtocolVersion
+              << " (manifest.json hardware_protocol_version): not replayed\n";
     return 1;
   }
 

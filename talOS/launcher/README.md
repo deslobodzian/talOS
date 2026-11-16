@@ -1178,11 +1178,14 @@ attached; nodes are read smallest first, each log streamed with
 `event::log::VisitLog`, until one does. A session none of whose logs does,
 but with a log of another format version or a packet this build cannot
 decode, cannot be classified. The verdict is cached in the session's
-`session_class` file and read before any log is opened: `match` for good,
-`other` until the session's event log bytes change, `unknown` until they
-change or this build's log format, `Packet` size or Driver Station codec
-differs. A session's logs are therefore read once while that file can be
-written.
+`session_class` file and read before any log is opened: `match` for good
+(dropping one could only let a match go first), `other` and `unknown` until
+the session's event log bytes change or this build's log format, `Packet`
+size, Driver Station codec sizes or hardware protocol differs. A session
+whose manifest records a hardware protocol other than this build's is
+`unknown` without its logs being read
+([which logs a build can read](#which-logs-a-build-can-read)). A session's
+logs are therefore read once while that file can be written.
 
 A directory named
 by a session id that holds nothing, or only what a launch writes before it
@@ -1378,7 +1381,11 @@ hardware packets of a session recorded under its own hardware protocol
 The logs do not store that version (a recorded Packet holds a frame's
 payload without its header, and its schema identity hashes only its size);
 the session's `manifest.json` does, as `hardware_protocol_version`
-([session manifest](#session-manifest)). `log_dump`, `tlog_to_wpilog` and
+([session manifest](#session-manifest)): a session directory's own, or for
+a `.tlog` file named on its own the `manifest.json` beside it when its
+`session_id` is the log header's (one of another session, or without a
+`session_id`, is not that log's and records nothing for it).
+`log_dump`, `tlog_to_wpilog` and
 `session_report` (through `log_dump`) decide once per session, before
 decoding any hardware packet (`HardwareProtocolCheck`,
 `hardware_record.h`), and when they refuse, print one line on stderr and
@@ -1392,8 +1399,7 @@ included:
   ```
 
 - **No version is recorded** (a session from before the field, or a
-  `.tlog` file named on its own: the version is read only from the
-  `manifest.json` of a session directory named on the command line). Every
+  `.tlog` file with no manifest of its session beside it). Every
   hardware packet is tried with this build's codecs. Every one decoded
   under the build that recorded it, since the bridge publishes only a State
   or Driver Station packet its codec accepted and every request and command
@@ -1426,10 +1432,20 @@ hardware packets with a build of the protocol it was recorded under: a
 stamped bundle's session names its source in `git_revision`; nothing else
 in a session does.
 
-A node replayed from such a session (`--replay-inputs`) fails safe: its
-devices layer decodes each `/hw/state` with this build's codec, so a
-rejected State is no State, `robot_enabled` stays false and every output
-is neutral.
+`--replay-inputs` refuses a session whose manifest records another
+hardware protocol, before it starts the node, with one line naming both
+versions and exit status 1: the node would get States of another layout,
+and its run could not match the recording. A session with no recorded
+version is replayed: the node's devices layer decodes each `/hw/state`
+with this build's codec, so a State it rejects is no State,
+`robot_enabled` stays false and every output is neutral, but a State of
+another protocol that kept its length is decoded, wrongly.
+
+Retention's match classification ([above](#session-segments-and-logs))
+reads Driver Station packets the same way: a session whose manifest
+records another protocol is `unknown` (kept like a match) without its
+packets being read, and one with no recorded version is read with this
+build's codec, `unknown` when that rejects a packet.
 
 ### Session measurements
 

@@ -119,9 +119,12 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
                                  std::span<const std::byte> payload,
                                  HardwarePacket& out);
 
-// The hardware protocol version recorded in the manifest.json of the first
-// directory among `inputs` whose manifest records one; nullopt when none
-// does (a session recorded before the field, or only .tlog files named).
+// The hardware protocol version a session's manifest.json records, for the
+// first of `inputs` that has one: a directory's own manifest.json, or for a
+// log file the manifest.json beside it when its session_id is the log
+// header's (not when it names another session, or has none, or the file has
+// no log header). nullopt when none does: a session recorded before the
+// field, or a log with no manifest of its session beside it.
 std::optional<std::uint16_t> RecordedProtocolVersion(
     const std::vector<std::string>& inputs);
 
