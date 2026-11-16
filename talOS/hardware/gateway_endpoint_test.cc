@@ -20,6 +20,7 @@
 #include <iterator>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "config_wire.h"
 #include "endpoint.h"
@@ -665,6 +666,111 @@ TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
   EXPECT_EQ(acknowledgement.status, ConfigAckStatus::kOk);
   EXPECT_EQ(backend.configure_calls, configure_calls);
   EXPECT_TRUE(gateway.Accept(Request(gateway), 1, 2000));
+}
+
+// REQ-SAFE-21: a partial or rejected transfer never replaces the active
+// config. After an accepted push, a transfer that stops one chunk short, one
+// whose bytes fail its CRC, and a changed config pushed while enabled each
+// leave the State's config id, the gateway's config and the devices it
+// drives as they were, with no backend configure.
+TEST(Endpoint, PartialOrRejectedTransferKeepsTheActiveConfig) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3013};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const auto active = SwerveConfig(true);
+  const auto accepted = PushConfig(endpoint, gateway, companion, active);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_EQ(accepted->status, ConfigAckStatus::kOk);
+  const int configures = backend.configure_calls;
+
+  auto partial = active;
+  partial.motors[0].slots[0].p = 1.0;
+  auto corrupt = active;
+  corrupt.motors[0].slots[0].p = 2.0;
+  auto changed = active;
+  changed.motors[0].slots[0].p = 3.0;
+  uint64_t now_us = 3000;
+  // Sends one transfer's chunks and ticks until the endpoint has received
+  // every one, so no two transfers' chunks interleave (UDP does not keep
+  // order, even on loopback). Order within one transfer cannot change the
+  // outcome: the assembler places each chunk by its index
+  // (ConfigWire.ReassemblesOutOfOrderIgnoresDuplicatesAndChecksTheCrc).
+  const auto deliver = [&](const std::vector<std::vector<uint8_t>>& chunks,
+                           bool enabled) {
+    const uint64_t received = endpoint.udp_stats().received_frames;
+    for (const auto& chunk : chunks) {
+      ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                    protocol::kFlagNone, 1000, chunk.data(),
+                                    chunk.size()),
+                protocol::UdpStatus::kOk);
+    }
+    ASSERT_TRUE(Eventually([&] {
+      endpoint.Tick(now_us, enabled);
+      now_us += 1000;
+      return endpoint.udp_stats().received_frames >= received + chunks.size();
+    }));
+  };
+  // Ticks until the endpoint's answer to the newest transfer arrives.
+  const auto await_ack = [&](bool enabled) {
+    std::optional<ConfigAckPayload> ack;
+    EXPECT_TRUE(Eventually([&] {
+      protocol::DecodedFrame frame;
+      while (!ack && companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+        if (frame.header.type != protocol::FrameType::kHardwareConfigAck)
+          continue;
+        ack.emplace();
+        EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, *ack));
+      }
+      if (ack) return true;
+      endpoint.Tick(now_us, enabled);
+      now_us += 1000;
+      return false;
+    }));
+    return ack;
+  };
+  const auto expect_active = [&](bool enabled) {
+    const auto state = TickForState(endpoint, companion, now_us, enabled);
+    now_us += 1000;
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->config_id, ConfigurationId(active));
+    EXPECT_TRUE(state->flags & kConfigured);
+    EXPECT_EQ(std::size_t{state->motor_count}, active.motors.size());
+    EXPECT_EQ(std::size_t{state->sensor_count}, active.sensors.size());
+    EXPECT_EQ(gateway.config(), active);
+    EXPECT_EQ(backend.configure_calls, configures);
+  };
+
+  {
+    SCOPED_TRACE("a transfer one chunk short");
+    auto chunks = CreateConfigChunks(partial, 200);
+    ASSERT_GT(chunks.size(), 1u);
+    chunks.pop_back();
+    deliver(chunks, false);
+    expect_active(false);
+  }
+  {
+    SCOPED_TRACE("a transfer failing its CRC");
+    auto chunks = CreateConfigChunks(corrupt, 200);
+    chunks.front().back() ^= 0xff;  // data; the header stays whole
+    deliver(chunks, false);
+    const auto ack = await_ack(false);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kInvalidCrc);
+    expect_active(false);
+  }
+  {
+    SCOPED_TRACE("a changed config pushed while enabled");
+    expect_active(true);
+    deliver(CreateConfigChunks(changed), true);
+    const auto ack = await_ack(true);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_NE(ack->status, ConfigAckStatus::kOk);
+    expect_active(true);
+  }
+  // Still the active config's devices: a command built for it drives.
+  EXPECT_TRUE(gateway.Accept(Request(gateway), 1, now_us));
 }
 
 TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {

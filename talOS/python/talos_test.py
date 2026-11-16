@@ -620,6 +620,25 @@ can_id = 3
                                     r"motor 'lift'.*outside update\(\)"):
             sim.step(0.05)
 
+    # REQ-SAFE-06: a DigitalOutput set() outside update() raises, naming the
+    # device
+    def test_digital_output_set_outside_update_raises(self):
+        class Light:
+            def __init__(self, node):
+                self.led = talos.DigitalOutput(node, "led")
+
+            def update(self):
+                pass
+
+        sim = Sim.from_toml(ROBOT_TOML + """
+[subsystems.lift.digital_outputs.led]
+dio = 1
+""")
+        light = sim.add(Light, "lift")
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"'led'.*outside update\(\)"):
+            light.led.set(True)
+
     # REQ-SAFE-43: set_torque_current reaches the request as stator amperes,
     # clamped to the motor's limit and counted, and on a motor whose config
     # lacks foc it raises naming the motor and the key

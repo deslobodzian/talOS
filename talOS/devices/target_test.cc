@@ -785,7 +785,9 @@ TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
 }
 
 // REQ-SAFE-12: once its node's Driver Station view is stale, a lane stamps 0
-// though the producer keeps sending and the robot stays enabled
+// though the producer keeps sending and the robot stays enabled: the view's
+// age is judged at send(), with no new Driver Station packet drained to
+// re-read it (State keeps flowing; only the packets stop)
 TEST(TargetLane, StampsZeroOnceItsNodesDriverStationViewIsStale) {
   auto sim = Sim::FromToml(kRobotToml);
   sim.add<Producer>("producer");
