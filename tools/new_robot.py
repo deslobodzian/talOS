@@ -7,7 +7,8 @@ on talOS as @talos: a copy of examples/robot_repo, the fixture talOS's CI
 builds and tests, as TEMPLATE below places each of its files. Only what must
 differ is substituted: the module and robot name, and where talOS is (a
 `local_path_override` to this checkout, relative to DIR unless the two share
-only the filesystem's root, and Studio's built pages under it). DIR is
+only the filesystem's root, Studio's built pages under it, and the same
+path in .bazelrc's import of talOS's talos.bazelrc). DIR is
 relative to the directory bazel runs from. The fixture's example mechanisms and its checks of talOS
 itself are left out, so the robot starts with the hardware bridge, teleop
 and telemetry; `bazel run @talos//tools:new_subsystem` adds a mechanism
@@ -380,8 +381,13 @@ LEAVE_OUT = "leave out"
 # only these paths. A key the fixture no longer has refuses it, and so does
 # a file of the fixture that git tracks and no key covers (template_sources).
 TEMPLATE = {
-    ".bazelrc": COPY,
+    # talOS's talos.bazelrc imported, and its status script for
+    # --config=release, from talOS's checkout.
+    ".bazelrc": SUBSTITUTE,
     ".bazelversion": COPY,
+    # .bazelrc's import, .bazelversion and the default Python agree with the
+    # talOS @talos is: every robot repository checks its own pin.
+    "talos_pin_test.py": COPY,
     "BUILD.bazel": COPY,
     # The module name, and talOS's checkout and its Studio pages' folder.
     "MODULE.bazel": SUBSTITUTE,
@@ -422,8 +428,10 @@ you add a mechanism.
 | `robot.toml` | the robot: tick, timeouts, target policy, Studio, and `[[subsystems]]`, the only list of its nodes |
 | `subsystems/*.toml` | one file per subsystem: its node, period, devices and parameters |
 | `robot_manifest.bzl` | generated from `robot.toml` (`bazel run @talos//tools:sync_manifest -- robot.toml`); Bazel reads it because it cannot read TOML |
-| `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test` |
+| `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test`, `talos_pin_test` |
 | `MODULE.bazel` | talOS as `@talos`, and where Studio's pages are |
+| `.bazelrc` | imports talOS's build flags (`talos.bazelrc`) from the same checkout; add this repository's own flags below the import |
+| `.bazelversion` | the Bazel version, talOS's (`talos_pin_test` checks it, the import and the default Python) |
 | `.bazelignore` | keeps `bazel test //...` out of `talos/`, where a git submodule of talOS goes (below); it does nothing while that directory does not exist |
 
 ```sh
@@ -452,12 +460,17 @@ bundle refuses a webroot without them; talOS's
 `MODULE.bazel` points `@talos` at the talOS checkout this repository was
 made from, `@TALOS@`, with
 `local_path_override`, and `studio_web` at the pages that checkout builds
-(`@TALOS@/bazel-bin/studio/dist`). Moving one directory without the other
-breaks both paths. Two other ways to hold talOS:
+(`@TALOS@/bazel-bin/studio/dist`); `.bazelrc` imports that checkout's
+`talos.bazelrc` and runs its `tools/workspace_status.sh` for
+`--config=release`. Moving one directory without the other breaks these
+paths, and `talos_pin_test` fails when `.bazelrc` imports another
+checkout's flags than `MODULE.bazel` builds. Two other ways to hold talOS:
 
 - **A git submodule** (what a team's robot repository does): `git submodule
-  add <talOS URL> talos`, then `path = "talos"` in `local_path_override`
-  and `path = "talos/bazel-bin/studio/dist"` in `studio_web`. The
+  add <talOS URL> talos`, then `path = "talos"` in `local_path_override`,
+  `path = "talos/bazel-bin/studio/dist"` in `studio_web`, and in
+  `.bazelrc` `import %workspace%/talos/talos.bazelrc` and
+  `--workspace_status_command=talos/tools/workspace_status.sh`. The
   repository records the talOS commit it builds against, and a clone with
   `--recurse-submodules` builds anywhere; Studio's pages are built with
   `(cd talos && bazel build //studio:web_dist)`. `.bazelignore` already
@@ -467,7 +480,11 @@ breaks both paths. Two other ways to hold talOS:
   "<commit>")`. Bazel fetches talOS itself, but there is no checkout to
   build Studio's pages in (`studio_web` then needs some other checkout's
   folder, else Studio answers 503), and `new_subsystem --standalone`
-  refuses a fetched talOS.
+  refuses a fetched talOS. Nor is there a `talos.bazelrc` on disk to
+  import: copy that commit's `talos.bazelrc` into this repository and
+  import `%workspace%/talos.bazelrc` (`talos_pin_test` then requires the
+  copy to match the fetched talOS's), and copy or replace
+  `tools/workspace_status.sh` the same way.
 
 `MODULE.bazel.lock` records the resolved module graph. While `@talos` is a
 `local_path_override` to a checkout that you update, it changes whenever
@@ -562,6 +579,18 @@ def replace_once(path, text, old, new):
 def substitute(path, text, name, talos):
     """The fixture's `path` as robot `name`'s repository holds it, with
     talOS's checkout at `talos` relative to it."""
+    if path == ".bazelrc":
+        # An import names %workspace%, the repository's root, or an
+        # absolute path; the status command is relative to that root.
+        root = talos if os.path.isabs(talos) else f"%workspace%/{talos}"
+        text = replace_once(path, text,
+                            "\nimport %workspace%/../../talos.bazelrc\n",
+                            f"\nimport {root}/talos.bazelrc\n")
+        return replace_once(
+            path, text,
+            "--workspace_status_command=../../tools/workspace_status.sh\n",
+            f"--workspace_status_command={talos}/tools/"
+            "workspace_status.sh\n")
     if path == "MODULE.bazel":
         text = replace_once(path, text, 'module(\n    name = "robot",\n',
                             f'module(\n    name = "{name}",\n')
@@ -744,8 +773,8 @@ def main_repository(args):
     path, absolute = talos_path(os.path.realpath(talos_root),
                                 os.path.realpath(target))
     if absolute:
-        print(f"new_robot: warning: MODULE.bazel names talOS by the absolute "
-              f"path {path}, which works only on this machine; for a path a "
+        print(f"new_robot: warning: MODULE.bazel and .bazelrc name talOS by "
+              f"the absolute path {path}, which works only on this machine; for a path a "
               "teammate's clone can use, keep the talOS checkout beside the "
               "repository (then run this again) or hold it as a git "
               "submodule (README.md)", file=sys.stderr)

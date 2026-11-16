@@ -3708,10 +3708,18 @@ def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
         '    module_name = "talos",\n'
         f'    path = "{talos_path}",\n'
         ")\n")
-    # talOS's C++23 flags and Bazel version are per workspace, not carried by
-    # the module, so the new workspace takes the checkout's own.
-    for config in (".bazelrc", ".bazelversion"):
-        files[config] = read(os.path.join(talos_root, config))
+    # talOS's build flags and Bazel version are per workspace, not carried
+    # by the module: the new workspace imports the flags from the checkout
+    # the override names (the same path) and takes its Bazel version.
+    if not os.path.isfile(os.path.join(talos_root, "talos.bazelrc")):
+        raise Refused(f"{talos_root} has no talos.bazelrc for the new "
+                      "repository's .bazelrc to import; it is not a talOS "
+                      "checkout this tool can build against")
+    files[".bazelrc"] = (
+        "# talOS's build flags, from the talOS checkout MODULE.bazel's\n"
+        "# local_path_override names (the same path).\n"
+        f"import %workspace%/{talos_path}/talos.bazelrc\n")
+    files[".bazelversion"] = read(os.path.join(talos_root, ".bazelversion"))
     return [(os.path.join(target_dir, path), None, content)
             for path, content in files.items()]
 
