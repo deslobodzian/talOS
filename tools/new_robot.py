@@ -700,7 +700,12 @@ def plan_repository(talos_root, target_dir, name, fixture=None):
     files[".gitignore"] = GITIGNORE
     files[".bazelignore"] = BAZELIGNORE
     check_manifest(files)
-    return [(os.path.join(target, path), content)
+    # Under the target as given, not resolved: write_repository places each
+    # file by its path relative to that same target, and a user reads the
+    # directory they named. The real path serves only the checks above and
+    # talOS's path from it.
+    typed = os.path.abspath(target_dir)
+    return [(os.path.join(typed, path), content)
             for path, content in sorted(files.items())]
 
 
