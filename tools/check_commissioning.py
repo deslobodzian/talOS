@@ -4,9 +4,9 @@
 
 RULES.md 4: an agent never sets `commissioned = true` or changes a physical
 CAN id in a robot config; a person does that at the robot
-(docs/BRINGUP.md "Human commissioning"). This checks each non-merge commit
-in `merge-base(<rev>, HEAD)..HEAD` on its own and reports every robot or
-bench config line it
+(docs/BRINGUP.md "Human commissioning"). This checks each commit in
+`merge-base(<rev>, HEAD)..HEAD` (a merged branch's commits included) on its
+own and reports every robot or bench config line it
 
 - adds that sets `commissioned = true`, or
 - adds or removes that holds a `can_id` key (the only key talOS/hardware
@@ -15,7 +15,16 @@ bench config line it
 in any spelling TOML accepts (bare, quoted or dotted key, inline table,
 trailing comment), but not in a comment or a string value. It over-reports
 rather than miss one: a config file moved, renamed or added whole, or a
-`can_id` line moved between files, also needs the trailer below.
+`can_id` line moved between files, also needs the trailer below. A merge
+commit's own change is its diff against git's automatic re-merge of its
+parents (`git show --remerge-diff`, git 2.36 or later; with an older git a
+range holding a merge fails with exit 2). A clean merge has none; a line
+written while resolving a conflict, or a stale copy of a config kept from
+one side (which can revert a person's change made on the other), shows.
+It over-reports a conflict resolved by picking one side of a `can_id`
+line: the side not picked reads as removed, and the merge then carries the
+trailer. git cannot re-merge an octopus merge, so one reports what its
+diff against any parent shows.
 
 A robot or bench config is any tracked `.toml` outside an `examples`,
 `tests` or `fixtures` directory and outside any directory whose name ends
@@ -28,8 +37,7 @@ the trailer `Commissioned-By: <name>` (`git commit --trailer
 earlier one, so it marks exactly the commit a person checked at the robot.
 Agents never write this trailer.
 
-Not checked: a change made while resolving a conflict in a merge commit
-(merges are skipped); a squash that keeps a person's `Commissioned-By`
+Not checked: a squash that keeps a person's `Commissioned-By`
 trailer exempts everything folded into it (only the commit's last trailer
 block is read); a force push to `main` checks only its last commit (CI's
 diff base for main is that push's parent).
@@ -111,6 +119,13 @@ def findings_in_diff(diff):
             continue
         if path is None or not is_robot_config(path):
             continue
+        if CONFLICT_MARKER.match(line):
+            # A re-merge's conflict marker: not config, but a line.
+            if line.startswith("+"):
+                new += 1
+            else:
+                old += 1
+            continue
         if line.startswith("+"):
             text = code(line[1:])
             if COMMISSIONED_TRUE.search(text):
@@ -124,24 +139,71 @@ def findings_in_diff(diff):
             old += 1
 
 
+# Fixed prefixes and no external diff: the output must not depend on the
+# user's git configuration (diff.noprefix, diff.external).
+DIFF_FLAGS = ("-U0", "--no-color", "--no-ext-diff", "--no-renames",
+              "--src-prefix=a/", "--dst-prefix=b/")
+
+
+# `git show --remerge-diff` (git 2.36) re-merges a merge's parents and
+# diffs the merge against that: exactly what the merge itself changed.
+REMERGE_DIFF_GIT = (2, 36)
+# A conflict marker in the re-merge, never a TOML line; the plain style,
+# whatever merge.conflictStyle says, so no base section is shown.
+CONFLICT_MARKER = re.compile(r"^[-+](?:<{7}|>{7}|\|{7})(?: |$)|^[-+]={7}$")
+
+
+class GitTooOld(Exception):
+    pass
+
+
+def require_remerge_diff():
+    version = git("version")
+    match = re.search(r"(\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < REMERGE_DIFF_GIT:
+        raise GitTooOld(
+            f"checking a merge commit needs git "
+            f"{'.'.join(map(str, REMERGE_DIFF_GIT))} or later "
+            f"(--remerge-diff); this is {version.strip()}")
+
+
+def merge_findings(commit, parents):
+    """The merge's own changes: its diff against git's automatic re-merge
+    of its parents. A clean merge's is empty; a resolution that writes a
+    new line, or keeps one side's stale copy of a file the other side
+    changed, shows. git cannot re-merge more than two parents, so an
+    octopus merge reports what its diff against any parent shows."""
+    if len(parents) > 2:
+        found = {}
+        for parent in parents:
+            diff = git("diff", *DIFF_FLAGS, parent, commit, "--", "*.toml")
+            for path, line, what in findings_in_diff(diff):
+                found.setdefault((path, what), line)
+        return [(path, line, what) for (path, what), line in found.items()]
+    require_remerge_diff()
+    diff = git("-c", "merge.conflictStyle=merge", "show", "--remerge-diff",
+               "--format=", *DIFF_FLAGS, commit, "--", "*.toml")
+    return findings_in_diff(diff)
+
+
 def check(base):
     """Every finding in merge-base(base, HEAD)..HEAD not covered by a trailer."""
     start = git("merge-base", base, "HEAD").strip()
-    commits = git("rev-list", "--no-merges", "--reverse",
-                  f"{start}..HEAD").split()
     found = []
-    for commit in commits:
+    for entry in git("rev-list", "--parents", "--reverse",
+                     f"{start}..HEAD").splitlines():
+        commit, *parents = entry.split()
         trailer = git("log", "-1",
                       f"--format=%(trailers:key={TRAILER},valueonly)",
                       commit).strip()
         if trailer:
             continue
-        # Fixed prefixes and no external diff: the output must not depend
-        # on the user's git configuration (diff.noprefix, diff.external).
-        diff = git("show", "--format=", "-U0", "--no-color", "--no-ext-diff",
-                   "--no-renames", "--src-prefix=a/", "--dst-prefix=b/",
-                   commit, "--", "*.toml")
-        for path, line, what in findings_in_diff(diff):
+        if len(parents) > 1:
+            findings = merge_findings(commit, parents)
+        else:
+            findings = findings_in_diff(git("show", "--format=", *DIFF_FLAGS,
+                                            commit, "--", "*.toml"))
+        for path, line, what in findings:
             found.append(f"{commit[:12]} {path}:{line}: {what}")
     return found
 
@@ -153,6 +215,9 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         found = check(args.base)
+    except GitTooOld as error:
+        print(f"check_commissioning: {error}", file=sys.stderr)
+        return 2
     except subprocess.CalledProcessError as error:
         print(f"check_commissioning: git {' '.join(error.cmd[1:])}: "
               f"{error.stderr.strip()}", file=sys.stderr)

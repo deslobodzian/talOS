@@ -6,10 +6,12 @@ change in an example, or by a person's commit carrying
 `Commissioned-By: <name>`, passes.
 """
 
+import io
 import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from tools import check_commissioning
 
@@ -112,6 +114,124 @@ class CheckCommissioningTest(unittest.TestCase):
         self.edit_configs("bench/main_processor/configuration")
         self.commit("bench: tidy the config")
         self.assertEqual(len(check_commissioning.check(self.base)), 3)
+
+    def branch_and_merge(self, side_edit, resolve=None):
+        """Commits side_edit on a branch and an unrelated change here, then
+        merges the branch; resolve() edits the merge result before its
+        commit. Returns the branch's commit."""
+        here = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "side")
+        side_edit()
+        self.commit("side: change")
+        side = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", here)
+        self.put("bench/main_processor/configuration/notes.toml", "a = 1\n")
+        self.commit("bench: notes")
+        self.git("merge", "-q", "--no-ff", "--no-commit", "side")
+        if resolve:
+            resolve()
+        self.commit("merge side")
+        return side
+
+    # REQ-DEV-33, RULES.md 4: a CAN id written while resolving a merge, in
+    # neither parent, is the merge's own change.
+    def test_can_id_added_by_a_merge_resolution_fails(self):
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        self.branch_and_merge(
+            lambda: self.put("bench/main_processor/configuration/side.toml",
+                             "b = 2\n"),
+            lambda: self.put(motor, MOTOR.replace("= 1", "= 9")))
+        merge = self.git("rev-parse", "HEAD").strip()[:12]
+        found = check_commissioning.check(self.base)
+        self.assertEqual(sorted(found), [
+            f"{merge} {motor}:3: removes a CAN id: can_id = 1",
+            f"{merge} {motor}:3: sets a CAN id: can_id = 9"], found)
+
+    # REQ-DEV-33, RULES.md 4: a clean merge repeats no finding; the merged
+    # branch's own commit is what is checked.
+    def test_clean_merge_reports_only_the_branch_commit(self):
+        side = self.branch_and_merge(
+            lambda: self.edit_configs("bench/main_processor/configuration"))
+        found = check_commissioning.check(self.base)
+        self.assertEqual(len(found), 3, found)
+        for line in found:
+            self.assertTrue(line.startswith(side[:12]), found)
+
+    def merge_keeps_the_old_id(self, merge_main_into_branch):
+        """A person renumbers a motor here (with the trailer) after branch
+        `old` forked; a merge of the two keeps `old`'s copy of the file.
+        Returns (the person's commit, the merge, the config)."""
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        here = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "old")
+        self.put("bench/main_processor/configuration/side.toml", "b = 2\n")
+        self.commit("old: unrelated")
+        self.git("checkout", "-q", here)
+        self.put(motor, MOTOR.replace("= 1", "= 5"))
+        self.commit("bench: renumber at the robot",
+                    "Commissioned-By: A Person")
+        person = self.git("rev-parse", "HEAD").strip()
+        if merge_main_into_branch:
+            self.git("checkout", "-q", "old")
+            self.git("merge", "-q", "--no-commit", here)
+            self.git("checkout", "HEAD", "--", motor)
+        else:
+            self.git("checkout", "-q", "-b", "feature")
+            self.git("merge", "-q", "--no-ff", "--no-commit", "old")
+            self.git("checkout", "old", "--", motor)
+        self.commit("merge")
+        return person, self.git("rev-parse", "HEAD").strip()[:12], motor
+
+    # REQ-DEV-33, RULES.md 4: a merge that takes a branch's stale copy of a
+    # config reverts a person's CAN id; the revert is the merge's change.
+    def test_merge_reverting_a_commissioned_can_id_fails(self):
+        for main_into_branch in (False, True):
+            with self.subTest(merge_main_into_branch=main_into_branch):
+                self.setUp()
+                person, merge, motor = self.merge_keeps_the_old_id(
+                    main_into_branch)
+                found = check_commissioning.check(person)
+                self.assertEqual(sorted(found), [
+                    f"{merge} {motor}:3: removes a CAN id: can_id = 5",
+                    f"{merge} {motor}:3: sets a CAN id: can_id = 1"], found)
+
+    # REQ-DEV-33, RULES.md 4: a git without --remerge-diff cannot tell a
+    # merge's own change, so the check fails closed instead of skipping it.
+    def test_merge_under_a_git_without_remerge_diff_fails_closed(self):
+        self.branch_and_merge(
+            lambda: self.put("bench/main_processor/configuration/side.toml",
+                             "b = 2\n"))
+        real = check_commissioning.git
+
+        def old_git(*args):
+            return "git version 2.35.8\n" if args == ("version",) else real(
+                *args)
+
+        with mock.patch.object(check_commissioning, "git", old_git), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(check_commissioning.main(["--base", self.base]),
+                             2)
+        self.assertIn("needs git 2.36 or later", err.getvalue())
+
+    # REQ-DEV-33, RULES.md 4: git cannot re-merge an octopus merge, so one
+    # that changes a robot config is reported rather than skipped.
+    def test_octopus_merge_changing_a_config_fails(self):
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        here = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        for name in ("a", "b"):
+            self.git("checkout", "-q", "-b", name, here)
+            self.put(f"bench/main_processor/configuration/{name}.toml",
+                     "x = 1\n")
+            self.commit(name)
+        self.git("checkout", "-q", here)
+        self.git("merge", "-q", "--no-ff", "--no-commit", "a", "b")
+        self.put(motor, MOTOR.replace("= 1", "= 9"))
+        self.commit("merge a and b")
+        merge = self.git("rev-parse", "HEAD").strip()[:12]
+        found = check_commissioning.check(self.base)
+        self.assertTrue(found, found)
+        self.assertTrue(all(line.startswith(merge) for line in found), found)
+        self.assertIn(motor, "\n".join(found))
 
     # REQ-DEV-33, RULES.md 4: examples carry placeholder ids.
     def test_example_config_passes(self):
