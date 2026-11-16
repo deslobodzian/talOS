@@ -50,13 +50,14 @@
 // latched with their publication time; getters read the latched state (0 before
 // the first one), while connected() requires both a valid sample and a
 // hardware state younger than [robot] command_timeout_us. While a device's
-// sample is invalid (for a motor, CANcoder or gyro, a stale state included),
-// a position getter (Motor, CANcoder and Encoder position(), Gyro::yaw())
-// reads the last valid sample's position, through the current rezero offset
-// (0 before any valid sample), rather than the zero an invalid sample
-// carries, which would read as a jump; every other numeric getter reads the
-// sample as it is (zero for a motor's or CAN sensor's rates and efforts,
-// hardware::MarkInvalid). Only connected() says whether a reading is live.
+// sample is invalid (for a motor, CANcoder, gyro or encoder, a stale state
+// included), a position getter (Motor, CANcoder and Encoder position(),
+// Gyro::yaw()) reads the last valid sample's position, through the current
+// rezero offset (0 before any valid sample), rather than the zero an invalid
+// sample carries, which would read as a jump; an encoder's velocity reads
+// zero, and every other numeric getter reads the sample as it is (zero for a
+// motor's or CAN sensor's rates and efforts, hardware::MarkInvalid). Only
+// connected() says whether a reading is live.
 // The link also watches the bridge's /hw/status for the clock mapping
 // sample_time() uses.
 

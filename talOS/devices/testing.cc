@@ -441,10 +441,13 @@ struct SimHardware::Impl {
         samples[i] = sample_of(configs[i]);
       }
     };
+    // A disconnected motor or CAN sensor reads as the gateway publishes a
+    // device that stopped answering: its last readings through
+    // hardware::MarkInvalid (ages and temperature kept, every measurement
+    // zero). Its limit switches read released, as Phoenix reports a stale
+    // FaultField.
     fill(state.motors, state.motor_count, hw.motors, [&](const auto& c) {
-      if (!Connected(Kind::kMotor, c.id)) {
-        return hardware::MotorSample{.id = c.id};
-      }
+      const bool connected = Connected(Kind::kMotor, c.id);
       const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
       hardware::MotorSample sample{
           .id = c.id,
@@ -454,18 +457,15 @@ struct SimHardware::Impl {
           .stator_current_a = axis.stator_current_a,
           .position_age_us = axis.position_age_us,
           .velocity_age_us = axis.velocity_age_us,
-          .fault_flags = ValueOr(motor_limit_flags, c.id, 0u),
+          .fault_flags = connected ? ValueOr(motor_limit_flags, c.id, 0u) : 0u,
           .temperature_c = axis.temperature_c,
           .supply_current_a = axis.supply_current_a};
-      if (!Fresh(axis) || masked.contains({Kind::kMotor, c.id})) {
+      if (!connected || !Fresh(axis) || masked.contains({Kind::kMotor, c.id})) {
         hardware::MarkInvalid(sample);
       }
       return sample;
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
-      if (!Connected(Kind::kCANcoder, c.id)) {
-        return hardware::SensorSample{.id = c.id};
-      }
       const Axis axis = ValueOr(sensors, c.id, Axis{});
       hardware::SensorSample sample{.id = c.id,
                                     .valid = true,
@@ -473,7 +473,9 @@ struct SimHardware::Impl {
                                     .velocity_rps = axis.velocity,
                                     .position_age_us = axis.position_age_us,
                                     .velocity_age_us = axis.velocity_age_us};
-      if (!Fresh(axis)) hardware::MarkInvalid(sample);
+      if (!Connected(Kind::kCANcoder, c.id) || !Fresh(axis)) {
+        hardware::MarkInvalid(sample);
+      }
       return sample;
     });
     fill(state.digital_inputs, state.digital_input_count, hw.digital_inputs,
