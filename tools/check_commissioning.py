@@ -39,12 +39,15 @@ Agents never write this trailer.
 
 Not checked: a squash that keeps a person's `Commissioned-By`
 trailer exempts everything folded into it (only the commit's last trailer
-block is read); a force push to `main` checks only its last commit (CI's
-diff base for main is that push's parent).
+block is read).
 
 Prints each finding as `<commit> <file>:<line>: <what>`; exits 1 when there
 is one, 2 on a usage or git error. CI's lint job and tools/prepush.sh run it
-through tools/source_lints.sh --base.
+through tools/source_lints.sh --base. CI's base covers every commit the
+event adds (a pull request's or topic branch's merge base with main; on
+main, the previous tip, or after a force push its merge base with HEAD),
+and the job fails, naming why, when no such base exists
+(.github/workflows/continuous-integration.yaml, "Choose the diff base").
 """
 
 import argparse
