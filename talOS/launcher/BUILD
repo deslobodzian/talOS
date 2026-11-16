@@ -807,6 +807,7 @@ cc_test(
         "no_macos_sanitizer",
     ],
     deps = [
+        ":child_output",
         ":first_exec",
         ":launcher_lib",
         ":registry_cleanup",
