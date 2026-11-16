@@ -98,6 +98,61 @@ class InstallCheckTest(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
                              [os.path.basename(good)], out)
 
+    # REQ-OPS-48: an installed bundle runs from its installed files alone.
+    # A bundle whose files link into a build tree (Bazel's sandbox stages a
+    # test's runfiles so; a bundle copied with its links) must not install
+    # as links that dangle once that tree is cleaned; a link that stays
+    # inside the bundle stays a link; a dangling link refuses the install
+    # before anything is copied, and the bundle installed before stays.
+    def test_install_copies_links_that_leave_the_bundle_as_files(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            src = os.path.join(tmp, "bundle")
+            build_tree = os.path.join(tmp, "build_tree")
+            os.makedirs(os.path.join(src, "config"))
+            os.makedirs(build_tree)
+            with open(os.path.join(src, "run.sh"), "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(src, "run.sh"), 0o755)
+            with open(os.path.join(src, "config", "robot.toml"), "w",
+                      encoding="utf-8") as f:
+                f.write("[robot]\n")
+            with open(os.path.join(build_tree, "node"), "w",
+                      encoding="utf-8") as f:
+                f.write("built\n")
+            os.symlink(os.path.join(build_tree, "node"),
+                       os.path.join(src, "node"))
+            os.symlink("config/robot.toml", os.path.join(src, "robot.toml"))
+            prefix = os.path.join(tmp, "prefix")
+            current = os.path.join(prefix, "current")
+
+            def install():
+                # No stub here is a member: nothing to warm.
+                return subprocess.run(
+                    ["bash", deploy_script(), "install", src, "--prefix",
+                     prefix, "--no-warm-up"],
+                    capture_output=True, text=True, timeout=60)
+
+            proc = install()
+            out = proc.stdout + proc.stderr
+            self.assertEqual(proc.returncode, 0, out)
+            installed = os.readlink(current)
+            node = os.path.join(installed, "node")
+            self.assertFalse(os.path.islink(node), out)
+            with open(node, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "built\n")
+            self.assertEqual(
+                os.readlink(os.path.join(installed, "robot.toml")),
+                "config/robot.toml", out)
+            os.symlink(os.path.join(build_tree, "cleaned"),
+                       os.path.join(src, "missing_library"))
+            proc = install()
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("missing_library", out)
+            self.assertEqual(os.readlink(current), installed, out)
+            self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
+                             [os.path.basename(installed)], out)
+
 
 if __name__ == "__main__":
     unittest.main()

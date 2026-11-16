@@ -334,12 +334,96 @@ check_graph() {
   return "$status"
 }
 
+# --- copy -------------------------------------------------------------------
+# Copies the bundle at $1 (a real path) to $2, which must not exist, so that
+# the copy runs whatever becomes of $1. talos_bundle writes no symlinks
+# (docs/DEPLOYMENT.md), but a bundle staged by Bazel's sandbox, or copied
+# with its links, is a tree of links into a build tree, which an install
+# must not keep: after a `bazel clean` it would dangle. So a link whose
+# target leaves the bundle (an absolute target, a relative one climbing out
+# of it, or one that resolves outside it) is copied as the file or
+# directory it names, and one line counts them; a relative link that stays
+# inside is copied as a link, as cp -RP does (GNU and BSD alike), since
+# dereferencing it would duplicate its target. A link that names nothing
+# (dangling, or a loop) refuses the install before anything is written,
+# naming each. Python, as elsewhere here: BSD's readlink has no -f before
+# macOS 12.3, and macOS's bash is 3.2.
+copy_bundle() {
+  python3 - "$1" "$2" <<'EOF'
+import os
+import shutil
+import stat
+import subprocess
+import sys
+
+bundle, dest = sys.argv[1:]
+
+
+def inside(path):
+    return os.path.commonpath([bundle, path]) == bundle
+
+
+leaving, dangling = [], []
+# Does not descend into a linked directory: the link is judged whole.
+for parent, dirs, files in os.walk(bundle):
+    for name in dirs + files:
+        path = os.path.join(parent, name)
+        if not os.path.islink(path):
+            continue
+        rel = os.path.relpath(path, bundle)
+        target = os.readlink(path)
+        if not os.path.exists(path):
+            dangling.append(f"{rel} -> {target}")
+            continue
+        named = os.path.normpath(os.path.join(os.path.dirname(rel), target))
+        if (os.path.isabs(target) or named == os.pardir
+                or named.startswith(os.pardir + os.sep)
+                or not inside(os.path.realpath(path))):
+            leaving.append(rel)
+for link in dangling:
+    print(f"deploy: error: {link}: the link names nothing", file=sys.stderr)
+if dangling:
+    sys.exit(1)
+if subprocess.call(["cp", "-RP", bundle, dest]) != 0:
+    sys.exit(1)
+try:
+    for rel in leaving:
+        path = os.path.join(dest, rel)
+        # cp gives a copied directory its source's mode, read-only in a
+        # Bazel tree; install makes the whole copy read-only next.
+        parent = os.path.dirname(path)
+        os.chmod(parent, os.stat(parent).st_mode | stat.S_IWUSR)
+        os.unlink(path)
+        source = os.path.join(bundle, rel)
+        if os.path.isdir(source):
+            shutil.copytree(source, path, symlinks=False)
+        else:
+            shutil.copy2(source, path)
+except (OSError, shutil.Error) as e:
+    print(f"deploy: error: copying a link's target: {e}", file=sys.stderr)
+    sys.exit(1)
+if leaving:
+    print(f"deploy: copied {len(leaving)} links that leave the bundle as "
+          "the files they name", flush=True)
+EOF
+}
+
+# What stays selected when an install fails.
+kept_selection() {
+  if [ -L "$PREFIX/current" ]; then
+    printf 'current stays %s' "$(readlink "$PREFIX/current")"
+  else
+    printf 'nothing is selected'
+  fi
+}
+
 # --- install ---------------------------------------------------------------
-# Copies the bundle, warms it in place, checks its graph and flips `current`
-# atomically, keeping `previous` for rollback. Selects only a complete copy,
-# synced to disk first: a power cut right after the flip must not boot a
-# half-written bundle. A copy the launcher refuses is removed, so neither a
-# selection nor prune's newest --keep N ever counts it.
+# Copies the bundle (copy_bundle), warms it in place, checks its graph and
+# flips `current` atomically, keeping `previous` for rollback. Selects only a
+# complete copy, synced to disk first: a power cut right after the flip must
+# not boot a half-written bundle. A copy that fails, or that the launcher
+# refuses, is removed, so neither a selection nor prune's newest --keep N
+# ever counts it.
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
@@ -348,28 +432,28 @@ cmd_install() {
   local dest="$PREFIX/bundles/$stamp"
   say "installing to $dest"
   run mkdir -p "$PREFIX/bundles"
-  # Resolve the operand first: -P would copy a symlinked bundle path (a
-  # runfiles entry, a link into bazel-out) as a link, not the bundle.
+  # Resolve the operand first: the copy would otherwise be of a symlinked
+  # bundle path (a runfiles entry, a link into bazel-out), not the bundle,
+  # and copy_bundle judges each link against the bundle's real path.
   bundle="$(cd "$bundle" && pwd -P)" || die "cannot resolve $bundle"
-  # talos_bundle writes no symlinks (Bazel's cache may hand one back as a
-  # copy, docs/DEPLOYMENT.md); -RP copies any other bundle's as links (GNU
-  # and BSD alike), never as copies of what they name.
-  run cp -RP "$bundle" "$dest"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '+ copy %s %s\n' "$bundle" "$dest"
+  elif ! copy_bundle "$bundle" "$dest"; then
+    chmod -R u+w "$dest" 2>/dev/null || true
+    rm -rf "$dest"
+    die "$bundle not installed; $(kept_selection)"
+  fi
   run chmod -R a-w "$dest" 2>/dev/null || true
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
   warm_up "$dest" install
   if ! check_graph "$dest"; then
-    local stays="nothing is selected"
-    if [ -L "$PREFIX/current" ]; then
-      stays="current stays $(readlink "$PREFIX/current")"
-    fi
     chmod -R u+w "$dest" 2>/dev/null || true
     rm -rf "$dest"
     # The launcher's paths name the removed copy and check directory; the
     # bundle given holds the same files at the same relative paths.
-    die "$bundle not installed (the paths above were its removed copy, $dest); $stays"
+    die "$bundle not installed (the paths above were its removed copy, $dest); $(kept_selection)"
   fi
   if [ -L "$PREFIX/current" ]; then
     select_bundle "$(readlink "$PREFIX/current")" "$PREFIX/previous"
