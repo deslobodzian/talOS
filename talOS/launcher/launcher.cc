@@ -31,6 +31,7 @@
 #include "talOS/launcher/session_lock.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
+#include "talOS/rtms/process_liveness.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -238,9 +239,10 @@ void PrintLogGap(const std::string& member, const std::string& log) {
 // What a launch that started the roster in a shared-memory namespace
 // (TALOS_SHM_NAMESPACE, Bazel's TEST_TMPDIR) leaves of its own besides its
 // topic segments, removed when RunSession returns: the registry segment and
-// its writer lock file, once no row of the registry is another session's,
-// and the session lock file. A namespace is rarely used twice, so each
-// would otherwise stay in /dev/shm (or TEST_TMPDIR) until reboot. Not done
+// its writer lock file, once no row of the registry is held by a running
+// process of another session, and the session lock file. A namespace is
+// rarely used twice, so each would otherwise stay in /dev/shm (or
+// TEST_TMPDIR) until reboot. Not done
 // outside a namespace: there the ordinary names are one set per host, which
 // a node or tool run without a launcher may share. Skipped while an
 // exception unwinds, when members may still run.
@@ -275,10 +277,15 @@ class NamespaceNames {
       {
         const introspect::RegistryMapping registry{introspect::kRegistryPath,
                                                    /*read_only=*/true};
+        // A row of another session keeps the registry while its claimant
+        // runs; one whose process is gone (a SIGKILLed node of an earlier
+        // session, not yet swept by a claim) is no one's.
         for (const auto& row : registry.header()->nodes) {
           if (row.state.load(std::memory_order_acquire) !=
                   static_cast<uint64_t>(introspect::SlotState::FREE) &&
-              row.session_id != session_id_)
+              row.session_id != session_id_ &&
+              talos::ProcessWordAlive((row.pid_start << kProcessPidBits) |
+                                      row.pid))
             return;
         }
       }
