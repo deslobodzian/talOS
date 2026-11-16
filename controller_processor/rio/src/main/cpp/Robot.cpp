@@ -615,7 +615,7 @@ void Robot::StartCompetition() {
   // integration test can make the identical assertions about either gateway.
   // Alone among this program's lines it has no ConsoleTime prefix: it is a
   // record for that test, which finds it by its start
-  // (tools/test_drivetrain.py SUMMARY), not a line to place in time.
+  // (tools/test_rio_in_the_loop.py SUMMARY), not a line to place in time.
   const auto final_state = gateway_->snapshot();
   // A configuration may have no motor (REQ-CONTRACT-35): then no wheel moved,
   // as sim_gateway prints it.
