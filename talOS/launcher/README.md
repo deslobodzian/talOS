@@ -636,7 +636,9 @@ whether it records on, deleting its oldest records, or stopped, which it
 tells by the segments beside the log), and one per run whose log has a gap
 (`[launcher] <member> event log <log> lost records (a gap)`); it reads the
 row in each supervision pass and once more when it reaps the run, from the
-row the run left, so a run killed during a gap is marked too. It marks the
+row the run left, so a run killed during a gap is marked too, once a sample
+of its row (every 250 ms, from a node and from the bridge) has shown the
+gap. It marks the
 member in the live manifest: `recorder_failed` for a failed
 log, `log_gap` and `recorder_failed` for one with a gap (a gapped log is
 incomplete evidence), `log_capped` for one whose byte share cost it records

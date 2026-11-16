@@ -495,7 +495,9 @@ is killed. Such a gap is still counted: `gaps()`, `lost_records()` and
 is what a node's and the bridge's exit status say, and the registry row's
 gap bit ([event log state](../introspection/README.md#event-log-state)),
 which the launcher reads in each supervision pass and once more from the row
-a run left when it reaps it, marks the member.
+a run left when it reaps it, marks the member once a sample of the row has
+shown the gap (a run killed sooner after its pool filled leaves no trace of
+it).
 
 `failed()` means only that capture is over: the disk refused a write or the
 log file could not be created. **Treat it as a robot fault**, next to a

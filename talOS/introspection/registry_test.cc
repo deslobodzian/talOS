@@ -929,7 +929,7 @@ TEST_F(Registry, TheReporterCopiesTheLoopsLogGapIntoTheRow) {
     }
   };
   timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
-  loop.run_for(5s);  // Bound only; exits once the row shows the gap.
+  loop.run_for(10s);  // Bound only; exits once the row shows the gap.
   ASSERT_EQ(loop.recorder().gaps(), 1u);
   EXPECT_TRUE(flagged) << "the row never showed the loop's log gap";
   ::unlink(log.c_str());
