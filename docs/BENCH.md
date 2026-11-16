@@ -585,7 +585,8 @@ sleep precision. Releasing a lane is not a mechanical brake.
   passes and the manifest shows a finished session with no quarantined,
   recorder-failed or log-capped recording node (Studio is exempt), no
   damaged log, and a "Delivery loss" section with no node's
-  `wake_failures`, `requests_skipped` or `wake_fallbacks` above 0 (NOT
+  `wake_failures`, `stalled_arms`, `requests_skipped` or `wake_fallbacks`
+  above 0 (NOT
   RECORDED there means a manifest written before the launcher recorded
   them, or a member whose registry row the launcher never saw: Studio's
   bridge, which takes none, or a run that failed to spawn). Its "Launcher output" section names any output whose bytes
