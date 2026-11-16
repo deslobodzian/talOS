@@ -80,7 +80,7 @@ std::uint64_t IdOf(const MergedRecord& r) {
   return id;
 }
 
-// Guards the merged order log_dump and tlog_to_wpilog print and convert in:
+// Guards the merged order log_dump prints and Studio's review reads in:
 // by event time, then now, then dispatch index, then input order (a rotated
 // member's older segment first, as LogInputFiles lists it), each record
 // named by its own log's process and source, and a cut log's intact prefix

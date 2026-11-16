@@ -285,9 +285,8 @@ a dispatch `record_read()` records nothing. An early shutdown stops
 further dispatch even when collecting divergences. External shutdown is
 represented by the terminal `EXIT` record.
 
-Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`, or
-convert it for AdvantageScope with `bazel run //talOS/launcher:tlog_to_wpilog --
-/tmp/run.tlog -o /tmp/run.wpilog` (talOS/launcher/README.md).
+Inspect a log with `bazel run //talOS/launcher:log_dump -- /tmp/run.tlog`
+(talOS/launcher/README.md).
 
 ## Replaying another session's inputs
 
@@ -405,7 +404,7 @@ as it does a truncated log's.
 `log::LogReader` holds the whole file; `log::WindowedLogReader` (and
 `VisitLog` on it) reads the same records, damage skipped the same way,
 through a fixed 64 KiB window, so a reader of a whole session (`log_dump`,
-`tlog_to_wpilog`) holds memory per log, not per record.
+Studio's review) holds memory per log, not per record.
 
 Every record a reader returns carries its byte offset in its file
 (`Record::offset`; a rotated log's segment is a file of its own, and the
@@ -479,7 +478,7 @@ later record until one that starts a new dispatch (or belongs to none, as
 the hardware bridge's do) finds at least half the pool free. That record is
 preceded in the log by one GAP record naming what was dropped, so the log
 holds every record the writer accepted, in order, and each dropped stretch is
-marked where it happened; `log_dump`, `tlog_to_wpilog` and Studio show the
+marked where it happened; `log_dump` and Studio show the
 mark ([filtering and exporting logs](../launcher/README.md#filtering-and-exporting-logs)).
 Resuming only with half the pool free (rounded up) means one GAP per half
 pool handed over at most,

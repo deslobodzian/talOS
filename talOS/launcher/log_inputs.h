@@ -1,6 +1,6 @@
 #pragma once
 
-// The log files a log tool's inputs name (log_dump, tlog_to_wpilog).
+// The log files a log tool's inputs name (log_dump, Studio's review).
 
 #include <string>
 #include <vector>
