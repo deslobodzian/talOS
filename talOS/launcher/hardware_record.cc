@@ -174,6 +174,91 @@ void Samples(Json& json, std::string_view key, const Array& samples,
   json.Raw("]");
 }
 
+// The names log_dump gives the State's, Command's and Driver Station
+// packet's enumerations.
+const char* CanBusReadStateName(hardware::CanBusReadState state) {
+  switch (state) {
+    case hardware::CanBusReadState::kNone:
+      return "none";
+    case hardware::CanBusReadState::kOk:
+      return "ok";
+    case hardware::CanBusReadState::kPending:
+      return "pending";
+    case hardware::CanBusReadState::kFailed:
+      return "failed";
+    case hardware::CanBusReadState::kStale:
+      return "stale";
+    case hardware::CanBusReadState::kSimulated:
+      return "simulated";
+  }
+  return "unknown";
+}
+
+const char* HardwareModeName(hardware::Mode mode) {
+  switch (mode) {
+    case hardware::Mode::kNeutral:
+      return "neutral";
+    case hardware::Mode::kDutyCycle:
+      return "duty_cycle";
+    case hardware::Mode::kVoltage:
+      return "voltage";
+    case hardware::Mode::kVelocity:
+      return "velocity";
+    case hardware::Mode::kPosition:
+      return "position";
+    case hardware::Mode::kMotionMagic:
+      return "motion_magic";
+    case hardware::Mode::kTorqueCurrent:
+      return "torque_current";
+  }
+  return "unknown";
+}
+
+const char* PwmModeName(hardware::PwmMode mode) {
+  switch (mode) {
+    case hardware::PwmMode::kOff:
+      return "off";
+    case hardware::PwmMode::kPulse:
+      return "pulse";
+  }
+  return "unknown";
+}
+
+// The mode the Driver Station selected (its flags), whether or not the robot
+// is enabled in it: "teleop", "autonomous", "test" or "none".
+const char* DriverStationModeName(std::uint32_t flags) {
+  if ((flags & ds::kTest) != 0) return "test";
+  if ((flags & ds::kAutonomous) != 0) return "autonomous";
+  if ((flags & ds::kTeleop) != 0) return "teleop";
+  return "none";
+}
+
+const char* AllianceName(ds::Alliance alliance) {
+  switch (alliance) {
+    case ds::Alliance::kRed:
+      return "red";
+    case ds::Alliance::kBlue:
+      return "blue";
+    case ds::Alliance::kUnknown:
+      break;
+  }
+  return "unknown";
+}
+
+const char* MatchTypeName(ds::MatchType type) {
+  switch (type) {
+    case ds::MatchType::kPractice:
+      return "practice";
+    case ds::MatchType::kQualification:
+      return "qualification";
+    case ds::MatchType::kElimination:
+      return "elimination";
+    case ds::MatchType::kNone:
+      break;
+  }
+  return "none";
+}
+
 void StateJson(Json& json, const hardware::State& s, const DeviceNames* n) {
   json.Key("config_id").Id(s.config_id);
   json.Key("boot_id").Id(s.boot_id);
@@ -517,87 +602,6 @@ std::optional<std::uint16_t> FirstBridgeStatusVersion(
 
 }  // namespace
 
-const char* CanBusReadStateName(hardware::CanBusReadState state) {
-  switch (state) {
-    case hardware::CanBusReadState::kNone:
-      return "none";
-    case hardware::CanBusReadState::kOk:
-      return "ok";
-    case hardware::CanBusReadState::kPending:
-      return "pending";
-    case hardware::CanBusReadState::kFailed:
-      return "failed";
-    case hardware::CanBusReadState::kStale:
-      return "stale";
-    case hardware::CanBusReadState::kSimulated:
-      return "simulated";
-  }
-  return "unknown";
-}
-
-const char* HardwareModeName(hardware::Mode mode) {
-  switch (mode) {
-    case hardware::Mode::kNeutral:
-      return "neutral";
-    case hardware::Mode::kDutyCycle:
-      return "duty_cycle";
-    case hardware::Mode::kVoltage:
-      return "voltage";
-    case hardware::Mode::kVelocity:
-      return "velocity";
-    case hardware::Mode::kPosition:
-      return "position";
-    case hardware::Mode::kMotionMagic:
-      return "motion_magic";
-    case hardware::Mode::kTorqueCurrent:
-      return "torque_current";
-  }
-  return "unknown";
-}
-
-const char* PwmModeName(hardware::PwmMode mode) {
-  switch (mode) {
-    case hardware::PwmMode::kOff:
-      return "off";
-    case hardware::PwmMode::kPulse:
-      return "pulse";
-  }
-  return "unknown";
-}
-
-const char* DriverStationModeName(std::uint32_t flags) {
-  if ((flags & ds::kTest) != 0) return "test";
-  if ((flags & ds::kAutonomous) != 0) return "autonomous";
-  if ((flags & ds::kTeleop) != 0) return "teleop";
-  return "none";
-}
-
-const char* AllianceName(ds::Alliance alliance) {
-  switch (alliance) {
-    case ds::Alliance::kRed:
-      return "red";
-    case ds::Alliance::kBlue:
-      return "blue";
-    case ds::Alliance::kUnknown:
-      break;
-  }
-  return "unknown";
-}
-
-const char* MatchTypeName(ds::MatchType type) {
-  switch (type) {
-    case ds::MatchType::kPractice:
-      return "practice";
-    case ds::MatchType::kQualification:
-      return "qualification";
-    case ds::MatchType::kElimination:
-      return "elimination";
-    case ds::MatchType::kNone:
-      break;
-  }
-  return "none";
-}
-
 std::string SessionConfigPath(const std::string& config,
                               const std::vector<std::string>& inputs) {
   std::string path = config;
@@ -665,6 +669,12 @@ DeviceNames DeviceNames::FromConfig(const hardware::Config& config) {
   return names;
 }
 
+namespace {
+
+// Decodes one recorded Packet payload (sizeof(hardware::Packet) bytes) into
+// `out`. Empty on success, else why it does not decode: a payload of the
+// wrong size, a Packet size past its buffer, or bytes the codec rejects.
+// Reads only inside `payload`; never throws.
 std::string DecodeHardwareRecord(HardwareRecord kind,
                                  std::span<const std::byte> payload,
                                  HardwarePacket& out) {
@@ -707,6 +717,8 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
     return e.what();
   }
 }
+
+}  // namespace
 
 std::optional<std::uint16_t> RecordedProtocol::version() const {
   if (bridge.size() == 1) return bridge.front();
