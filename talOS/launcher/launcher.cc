@@ -1186,6 +1186,13 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
   proc.exit_signal = 0;
   proc.BeginRun(pid);
   launch.NewRun(options_.supervision_clock());
+  // In the first start's form, so every run's pid is in the launcher's
+  // output, not only in the manifest. A first run whose first spawn failed
+  // starts here too, as a start.
+  std::cout << "[launcher] " << (restart > 0 ? "Restarted " : "Started ")
+            << proc.name << " (pid " << pid << ", target " << proc.target;
+  if (restart > 0) std::cout << ", restart " << restart;
+  std::cout << ")\n";
 }
 
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,

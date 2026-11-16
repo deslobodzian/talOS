@@ -1101,9 +1101,21 @@ TEST(Supervision, CriticalCleanExitRestarts) {
   EXPECT_EQ(ReadLines(runs), (std::vector<std::string>{
                                  options.output_dir + "/alpha.tlog",
                                  options.output_dir + "/alpha.restart1.tlog"}));
-  const auto alpha =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  // The restarted run's pid is printed as the first run's is, so an operator
+  // can find the process without reading the manifest (TODO.md DEPLOY-17).
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 2u) << manifest;
+  const long long restarted_pid = std::strtoll(
+      history[1].c_str() + std::string_view{"{\"pid\": "}.size(), nullptr, 10);
+  ASSERT_GT(restarted_pid, 0) << history[1];
+  const std::string output =
+      ReadFile(options.output_dir + "/" + std::string{kLauncherOutputFile});
+  EXPECT_NE(output.find("alpha (pid " + std::to_string(restarted_pid) + ","),
+            std::string::npos)
+      << "restarted pid " << restarted_pid << " not in " << output;
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(peers.c_str());
