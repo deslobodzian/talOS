@@ -25,7 +25,8 @@ Everything is checked before anything is written, so a refused run leaves the
 tree untouched. --standalone writes the package as its own Bzlmod repository
 in DIR instead, building against this checkout (from a robot repository:
 the talOS checkout the tool runs from, such as its talos/ submodule, or
---talos-checkout DIR; it refuses when talOS is a module Bazel fetched).
+--talos-checkout DIR, relative to the repository root; either is refused
+when it is not a talOS checkout or is a module Bazel fetched).
 
 From a robot repository that depends on talOS (sync_manifest's test: this
 script runs from the talOS module, not the main repository):
@@ -3597,17 +3598,22 @@ def sim_target_config(root):
             module = ast.parse(f.read())
     except SyntaxError:
         return None
-    configs = {}
+    # Every talos_sim, its config None when it is no string literal: a
+    # //:sim (or an only target) whose config cannot be read runs an
+    # unknown config, never another target's.
+    configs = []
     for node in ast.walk(module):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "talos_sim"):
             keywords = {k.arg: k.value for k in node.keywords}
             name, config = keywords.get("name"), keywords.get("config")
-            if (isinstance(name, ast.Constant) and isinstance(config, ast.Constant)
-                    and isinstance(config.value, str)):
-                configs[name.value] = config.value
-    label = configs.get("sim") or (
-        next(iter(configs.values())) if len(configs) == 1 else None)
+            configs.append((
+                getattr(name, "value", None),
+                config.value if isinstance(config, ast.Constant)
+                and isinstance(config.value, str) else None))
+    sims = [config for name, config in configs if name == "sim"]
+    label = (sims[0] if len(sims) == 1 else None) if sims else (
+        configs[0][1] if len(configs) == 1 else None)
     if label is None:
         return None
     if label.startswith("//"):
@@ -3679,27 +3685,64 @@ def robot_configs(root, directory):
     return found
 
 
-def talos_checkout(script):
-    """The talOS checkout `script` (this file, through its runfiles symlink)
-    lives in, or None when it is not a durable checkout: Bazel's copy of a
-    fetched module, under an output base's external/ directory, is
-    replaced or removed by Bazel, so nothing may point at it."""
-    top = os.path.dirname(os.path.dirname(os.path.realpath(script)))
-    try:
-        with open(os.path.join(top, "MODULE.bazel"), encoding="utf-8") as f:
-            module = f.read()
-    except OSError:
-        return None
-    if not re.search(r'name\s*=\s*"talos"', module):
-        return None
-    ancestor = top
+def resolution_chain(path):
+    """`path` made absolute, then each path one more symlink in it leads
+    to, ending at its real path."""
+    chain = [os.path.abspath(path)]
+    for _ in range(40):  # the kernel's own symlink-hop limit
+        parts = chain[-1].strip(os.sep).split(os.sep)
+        for i in range(1, len(parts) + 1):
+            prefix = os.sep + os.path.join(*parts[:i])
+            if os.path.islink(prefix):
+                target = os.path.join(os.path.dirname(prefix),
+                                      os.readlink(prefix))
+                chain.append(os.path.normpath(os.path.join(target,
+                                                           *parts[i:])))
+                break
+        else:
+            break
+    return chain + [os.path.realpath(path)]
+
+
+def in_output_base(path):
+    """Whether `path` is under a Bazel output base's external/ directory
+    (an `external` with an `execroot` beside it)."""
+    ancestor = path
     while os.path.dirname(ancestor) != ancestor:
         parent = os.path.dirname(ancestor)
         if (os.path.basename(ancestor) == "external"
                 and os.path.isdir(os.path.join(parent, "execroot"))):
-            return None
+            return True
         ancestor = parent
-    return top
+    return False
+
+
+def checkout_problem(top, found_through=None):
+    """Why `top` is no talOS checkout a new repository may point at, or
+    None. It needs a MODULE.bazel naming the module talos, and neither it
+    nor any path that leads to it by symlinks (from `found_through`, else
+    `top`) may be in a Bazel output base: Bazel's copy of a fetched module,
+    there or in the repository contents cache an external/ entry links to,
+    is replaced or removed by Bazel."""
+    try:
+        with open(os.path.join(top, "MODULE.bazel"), encoding="utf-8") as f:
+            module = f.read()
+    except OSError:
+        module = ""
+    if not re.search(r'name\s*=\s*"talos"', module):
+        return 'it has no MODULE.bazel with name = "talos"'
+    if any(in_output_base(path)
+           for path in resolution_chain(found_through or top)):
+        return ("it is Bazel's copy of a fetched module, under an output "
+                "base's external/ directory")
+    return None
+
+
+def talos_checkout(script):
+    """The talOS checkout `script` (this file, through its runfiles symlink)
+    lives in, or None when checkout_problem refuses it."""
+    top = os.path.dirname(os.path.dirname(os.path.realpath(script)))
+    return None if checkout_problem(top, found_through=script) else top
 
 
 def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
@@ -4424,9 +4467,10 @@ def main(argv):
                         "instead of wiring into --robot")
     parser.add_argument("--talos-checkout", metavar="DIR",
                         help="with --standalone in a robot repository: the "
-                        "talOS checkout the new repository builds against "
-                        "(default: the one this tool runs from, when it is "
-                        "a checkout such as the talos/ submodule)")
+                        "talOS checkout the new repository builds against, "
+                        "relative to the robot repository's root (default: "
+                        "the one this tool runs from, when it is a checkout "
+                        "such as the talos/ submodule)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print every file and edit without writing")
     args = parser.parse_args(argv)
@@ -4468,10 +4512,15 @@ def main(argv):
             # takes its .bazelrc: this one in talOS; from a robot
             # repository, the checkout this tool runs from (its submodule).
             talos_root = root
-            if talos:
-                talos_root = (os.path.join(root, args.talos_checkout)
-                              if args.talos_checkout
-                              else talos_checkout(__file__))
+            if talos and args.talos_checkout:
+                talos_root = os.path.join(root, args.talos_checkout)
+                if problem := checkout_problem(talos_root):
+                    raise Refused(f"--talos-checkout {args.talos_checkout} "
+                                  f"({talos_root}) is not a talOS checkout "
+                                  f"the new repository can point at: "
+                                  f"{problem}")
+            elif talos:
+                talos_root = talos_checkout(__file__)
                 if talos_root is None:
                     raise Refused(
                         "the talOS this tool runs from is Bazel's copy of a "
