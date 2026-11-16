@@ -570,9 +570,12 @@ inline std::optional<std::string> HardwareWriterProblem(
 // devices-layer flush, an `alert_` field that is not a bool or not
 // ParseAlertField's grammar). Warnings are normal during development or in a
 // partial launch (an unread topic, an owner not in this session, a policy
-// lane nobody writes yet, an alert outside a `status` topic). Required coverage
+// lane nobody writes yet, an alert outside a `status` topic, a node that
+// writes its hardware request but reads no target lane, a node whose
+// hardware request is marked untargeted_outputs). Required coverage
 // additionally rejects a target-consuming subsystem with no producer for a
-// nonempty mode policy. Timers are skipped: their names are labels, not topics.
+// nonempty mode policy, and makes untargeted_outputs an error. Timers are
+// skipped: their names are labels, not topics.
 // A subsystem absent from target_sources is not lane-checked.
 inline std::vector<Diagnostic> LintGraph(
     const std::vector<NodeShape>& nodes,
@@ -801,6 +804,44 @@ inline std::vector<Diagnostic> LintGraph(
     if (topic.readers.empty() && !topic.exempt)
       add(Severity::WARNING, topic.name,
           "is published but nothing subscribes to it");
+  }
+
+  // The devices flush drives a node's outputs only in a tick in which one of
+  // its talos::Targets returned a target (REQ-SAFE-41), unless its
+  // constructor lifted that gate (REQ-SAFE-42). Either is a finding about the
+  // node: the opt-out, which coverage refuses, or outputs that never drive.
+  for (const auto& node : nodes) {
+    const auto request = std::find_if(
+        node.sources.begin(), node.sources.end(), [](const SourceShape& s) {
+          return IsSender(s.kind) &&
+                 (s.flags & kSourceFlagHardwareRequest) != 0;
+        });
+    if (request == node.sources.end()) continue;
+    if ((request->flags & kSourceFlagUntargetedOutputs) != 0) {
+      std::string message =
+          "drives its outputs without a live target: its constructor called "
+          "AllowUntargetedOutputs, so the devices flush gates them on "
+          "robot_enabled alone, and no Driver Station mode, mode generation "
+          "or operator arming reaches them (RULES.md 1); for a test or bench "
+          "fixture only";
+      if (require_target_coverage)
+        message +=
+            "; [robot] require_target_coverage (which commissioned = true "
+            "sets) refuses it: drive the node from a talos::Target";
+      add(require_target_coverage ? Severity::ERROR : Severity::WARNING,
+          node.name, std::move(message));
+      continue;
+    }
+    const bool reads_a_lane = std::any_of(
+        node.sources.begin(), node.sources.end(), [](const SourceShape& s) {
+          return IsReader(s.kind) && !s.observer() && IsTargetLane(s.name);
+        });
+    if (!reads_a_lane)
+      add(Severity::WARNING, node.name,
+          "writes " + request->name +
+              " but reads no target lane and does not opt out, so the "
+              "devices flush keeps every output neutral (RULES.md 1); set "
+              "outputs only while a talos::Target's get() returns a target");
   }
 
   if (require_target_coverage) {

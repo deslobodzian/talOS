@@ -486,6 +486,97 @@ TEST(LintGraph, RequiredTargetCoverageIsCheckedPerMode) {
       << Describe(partial);
 }
 
+// The bridge reads `node`'s hardware request, which `node` writes with
+// `flags`, so the request itself is neither unread nor unwritten.
+std::vector<NodeShape> ActuatorGraph(const std::string& node,
+                                     std::uint32_t flags,
+                                     std::vector<SourceShape> others = {}) {
+  others.push_back(Sender(HardwareRequestTopic(node), 32,
+                          kSourceFlagHardwareRequest | flags));
+  return {{"hardware_node",
+           "//talOS/bridge:hardware_node",
+           {Watcher(HardwareRequestTopic(node))},
+           /*hardware_bridge=*/true},
+          {node, "//robot/" + node + ":node", std::move(others)}};
+}
+
+// The findings about `subject`.
+std::vector<Diagnostic> About(const std::vector<Diagnostic>& diagnostics,
+                              std::string_view subject) {
+  std::vector<Diagnostic> out;
+  for (const auto& diagnostic : diagnostics)
+    if (diagnostic.subject == subject) out.push_back(diagnostic);
+  return out;
+}
+
+// A node that opted out of the flush's live-target gate drives on
+// robot_enabled alone: the lint names it, a warning while the graph does not
+// require target coverage and an error while it does (commissioned = true
+// implies it). It is then one finding: the no-target-lane warning, which
+// the opt-out answers, stays silent.
+// REQ-SAFE-42
+TEST(LintGraph, UntargetedOutputsWarnAndErrorUnderTargetCoverage) {
+  const auto nodes = ActuatorGraph("fixture", kSourceFlagUntargetedOutputs);
+  for (const bool coverage : {false, true}) {
+    SCOPED_TRACE(coverage ? "coverage required" : "coverage not required");
+    const auto diagnostics = LintGraph(nodes, {}, {}, coverage);
+    const auto findings = About(diagnostics, "fixture");
+    ASSERT_EQ(findings.size(), 1u) << Describe(diagnostics);
+    EXPECT_EQ(findings[0].severity,
+              coverage ? Severity::ERROR : Severity::WARNING)
+        << Describe(diagnostics);
+    EXPECT_EQ(Errors(diagnostics), coverage ? 1 : 0) << Describe(diagnostics);
+  }
+}
+
+// A node that writes its hardware request but reads no target lane never
+// drives (the flush holds its outputs neutral without a live Target), so the
+// lint warns, naming it, before anyone enables. A lane reader of its own, even
+// of a lane nobody writes yet, silences it; so does having no outputs (no
+// request), and an observer's read of a lane is no consumer.
+// REQ-SAFE-41
+TEST(LintGraph, AnActuatorNodeThatReadsNoTargetLaneIsWarned) {
+  struct Case {
+    const char* label;
+    std::vector<NodeShape> nodes;
+    bool warned;
+  };
+  for (const auto& [label, nodes, warned] : std::vector<Case>{
+           {"request, no lane", ActuatorGraph("roller", 0), true},
+           {"request and its teleop lane",
+            ActuatorGraph(
+                "roller", 0,
+                {Watcher("/roller/target/teleop", 32, kSourceFlagOptional)}),
+            false},
+           {"request and a lane read as an observer",
+            ActuatorGraph("roller", 0,
+                          {Watcher("/roller/target/teleop", 32,
+                                   kSourceFlagOptional | kSourceFlagObserver)}),
+            true},
+           {"sensors only",
+            {{"hardware_node",
+              "//talOS/bridge:hardware_node",
+              {Sender("/hw/state")},
+              /*hardware_bridge=*/true},
+             {"roller", "//robot/roller:node", {Watcher("/hw/state")}}},
+            false},
+       }) {
+    SCOPED_TRACE(label);
+    const auto diagnostics = LintGraph(nodes);
+    EXPECT_FALSE(HasError(diagnostics)) << Describe(diagnostics);
+    const auto findings = About(diagnostics, "roller");
+    ASSERT_EQ(findings.size(), warned ? 1u : 0u) << Describe(diagnostics);
+    if (warned) {
+      EXPECT_EQ(findings[0].severity, Severity::WARNING);
+      // The request it writes is named, since that is what makes it an
+      // actuator node.
+      EXPECT_NE(findings[0].message.find("/hw/request/roller"),
+                std::string::npos)
+          << findings[0].ToString();
+    }
+  }
+}
+
 SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
                   std::uint32_t slots) {
   shape.schema = std::move(schema);
