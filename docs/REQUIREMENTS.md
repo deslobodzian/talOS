@@ -10,9 +10,9 @@ other in the same commit, and adding, changing or dropping a requirement is
 the user's decision, in its own commit ([DEVELOPMENT.md §1](DEVELOPMENT.md#1-intake-and-requirement)).
 IDs are one numbering across this catalogue and a robot repository's
 (`tools/trace.py --framework-catalogue` fails on an ID in both): REQ-SAFE-32
-to REQ-SAFE-34, REQ-CONTRACT-26, REQ-CONTRACT-27, REQ-DEV-11, REQ-DEV-27 and
-REQ-DEV-28 belong to the 2026 robot's catalogue, in its own repository, and
-are never reused here.
+to REQ-SAFE-34, REQ-CONTRACT-26, REQ-CONTRACT-27, REQ-CONTRACT-38,
+REQ-DEV-11, REQ-DEV-27 and REQ-DEV-28 belong to the 2026 robot's catalogue,
+in its own repository, and are never reused here.
 Open questions about what a requirement should say are TODO.md `SPEC-*`
 items.
 
