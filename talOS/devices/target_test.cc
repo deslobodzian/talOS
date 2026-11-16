@@ -1278,5 +1278,45 @@ TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
   EXPECT_TRUE(header.active);
 }
 
+// REQ-SAFE-31: a consumer that starts (or restarts) after a target was
+// published never drives on it, though that target stays active, younger than
+// command_timeout_us and stamped with the consumer's own generation: a
+// subscription delivers only what is published after it attached.
+TEST(Target, AConsumerStartedAfterATargetWasPublishedNeverDrivesOnIt) {
+  // The generation SimHardware stamps on its first teleop packet, from a run
+  // of the same setup: the target below carries it before anyone attached.
+  const std::uint64_t generation = [] {
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<ActuatingConsumer>("lift");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_driver_station(DsPacket(kTeleop));
+    sim.step(10ms);
+    return DriverStationGeneration(sim);
+  }();
+  ASSERT_NE(generation, 0U);
+
+  auto sim = Sim::FromToml(kRobotToml);
+  const Time published = sim.now();
+  PublishTarget(sim, "lift", "teleop", Goal{0.5}, generation);
+  auto& lift = sim.add<ActuatingConsumer>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  ASSERT_EQ(DriverStationGeneration(sim), generation);
+  ASSERT_TRUE(robot_enabled(sim.node("lift")));
+  // Every tick while the target is young enough for Target::get.
+  for (; sim.now() - published < 95ms; sim.step(5ms)) {
+    EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kNeutral)
+        << "target " << (sim.now() - published).count() / 1'000'000
+        << " ms old, update " << lift.updates;
+  }
+  // The same envelope, published once the consumer has attached, drives it.
+  PublishTarget(sim, "lift", "teleop", Goal{0.5}, generation);
+  sim.step(5ms);
+  EXPECT_EQ(hw.applied_motor("lift", "m").mode, hardware::Mode::kDutyCycle);
+}
+
 }  // namespace
 }  // namespace talos

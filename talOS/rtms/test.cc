@@ -813,6 +813,50 @@ TEST(SingleProcess, ReadNextLatestReportsDroppedThenEmpty) {
   queue.release_reader(id);
 }
 
+// REQ-SAFE-31: a reader starts at the writer's next publication, in both read
+// modes a node's subscriptions use: what the ring still holds from before it
+// registered is never handed to it, so a restarted node cannot act on a
+// target, Driver Station packet or hardware state its previous run was sent.
+TEST(LateJoin, AReaderReceivesNothingPublishedBeforeItRegistered) {
+  for (const ReadMode mode : {ReadMode::LATEST, ReadMode::SEQUENCE}) {
+    const bool latest = mode == ReadMode::LATEST;
+    SCOPED_TRACE(latest ? "ReadMode::LATEST" : "ReadMode::SEQUENCE");
+    RTMSQueue queue{
+        make_test_path(latest ? "late_latest" : "late_sequence"),
+        sizeof(Message::TestMessage),
+        alignof(Message::TestMessage),
+        kSchema,
+        8,
+        RTMSOptions{.overflow_policy = OverflowPolicy::OVERWRITE_OLDEST,
+                    .read_mode = mode},
+    };
+    for (int i = 0; i < 3; ++i) {
+      const Message::TestMessage before{i, static_cast<float>(i)};
+      ASSERT_EQ(queue.write(BytesOf(before)).result, WriteResult::SUCCESS);
+    }
+
+    const auto reader_id = queue.register_reader();
+    ASSERT_TRUE(reader_id.has_value());
+    const std::size_t id = reader_id.value_or(std::size_t{0});
+    std::array<std::byte, sizeof(Message::TestMessage)> buffer{};
+    MessageInfo info{};
+    EXPECT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
+              ReadResult::EMPTY)
+        << "handed message " << info.sequence << " of the 3 published before";
+
+    const Message::TestMessage after{3, 3.0F};
+    ASSERT_EQ(queue.write(BytesOf(after)).result, WriteResult::SUCCESS);
+    ASSERT_EQ(queue.read_next(id, std::span<std::byte>(buffer), info),
+              ReadResult::OK);
+    Message::TestMessage received{};
+    std::memcpy(&received, buffer.data(), sizeof(received));
+    EXPECT_EQ(received.id(), 3);
+    EXPECT_EQ(info.sequence, 3U);
+    EXPECT_EQ(info.dropped, 0U);
+    queue.release_reader(id);
+  }
+}
+
 TEST(SingleProcess, DropNewestBufferFullThenRecovers) {
   const std::string path = make_test_path("dn_recover");
 

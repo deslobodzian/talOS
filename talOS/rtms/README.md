@@ -89,6 +89,17 @@ claims a slot again. All claims of one process carry the same word, so a slot
 freed and claimed again by another queue of the same process before this one
 reads goes unnoticed.
 
+**Late join.** `register_reader()` starts a reader at the writer's next
+publication, in both read modes: nothing the ring held when the reader
+registered is ever handed to it, not even the newest message under
+`ReadMode::LATEST`, and a slot claimed again after being freed starts there
+too. Robot safety relies on this (REQ-SAFE-31): a node that starts or
+restarts within `command_timeout_us` never acts on a target, Driver Station
+packet or hardware state its previous run was sent
+([ARCHITECTURE.md](../../ARCHITECTURE.md#targets)), so no topic kind starts a
+reader at the retained latest message: a late reader waits for the next
+publication. `LateJoin` in `test.cc` holds the rule.
+
 ## Wake channel
 
 A reader need not poll a topic: it can sleep on a `talos::WakeReceiver`

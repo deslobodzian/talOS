@@ -246,8 +246,17 @@ and AprilTag detection, run below every loop thread
 
 Messages become visible when the consumer drains its topics, but `age()` and
 `fresh()` count from the writer's publication timestamp. Draining an expired
-message cannot revive it. Subscriptions without per-message callbacks dispatch
-only the newest available message, counting skipped messages as dropped;
+message cannot revive it. A subscription delivers only messages published
+after it attached, which it does when the node's constructor opens it (RTMS
+starts a new reader at the writer's next publication, and a simulated
+subscription likewise): a node that starts or restarts never acts on a target,
+a Driver Station packet or a hardware state published before then, however
+young, so a consumer restarted within `command_timeout_us` in an unchanged
+generation stays neutral until its producer publishes again. A node that
+attached earlier and drains late (paused, or a slow first tick) still judges
+what it drains by publication time. Subscriptions without per-message
+callbacks dispatch only the newest available message, counting skipped
+messages as dropped;
 callback subscriptions retain sequence delivery, capped at 64 messages per
 topic per drain; a drain that stops at the cap is followed at once by another,
 for a waking topic and a `kAtDrain` callback alike, with due timers between.

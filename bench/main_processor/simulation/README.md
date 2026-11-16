@@ -47,9 +47,13 @@ the whole run:
   requests before `teleop` resumes, all neutral from the first and at most
   30 ms apart. The restart is faster than `command_timeout_us`, so the lane's
   newest target is still young enough for `Target::get` at the first
-  request; the requests are neutral because a restarted node's subscription
-  receives only what is published after it attaches. The run prints the
-  restart latency and that target's age;
+  request; the requests are neutral because a subscription delivers only what
+  is published after it attached
+  ([ARCHITECTURE.md](../../../ARCHITECTURE.md#targets)): the restarted
+  owner's first requests also precede its first Driver Station packet, but
+  from that packet (one 20 ms packet period on, at most, plus a tick) until
+  the target expires, that rule alone keeps them neutral. The run prints the restart latency and that
+  target's age;
 - the launcher exits 0, nothing is quarantined, and each node's
   `restart_count` equals the number of times it was killed.
 
