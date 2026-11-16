@@ -605,7 +605,7 @@ time of the check that found the change or the stall, and so does their
 console copy (`Error at talos loop watchdog: [<s>.<ms>] ...`); so do the
 desktop simulation's `simulated Driver Station: ...` lines. Two lines carry
 none: the desktop simulation's exit summary (`sim_robot: ...`, a record that
-`tools/test_drivetrain.py` finds by its start), and the WPILib and Phoenix
+`tools/test_rio_in_the_loop.py` finds by its start), and the WPILib and Phoenix
 libraries' own lines, which this program does not write.
 
 `PhoenixBackend` marks a motor or CAN sensor invalid only for a signal error,
@@ -803,6 +803,48 @@ Station displays; whether the Driver Station
 disables the robot when those reports stop is unverified (the loop stall
 check in [BENCH.md](../../docs/BENCH.md#fault-injection-and-timing)), and
 the loop watchdog does not rely on it.
+
+### The RoboRIO program in the loop
+
+`tools/test_rio_in_the_loop.py` runs a gateway, the bridge, the bench's
+swerve module node and its `send_target` as separate processes on loopback,
+on the bench's loopback config
+([`robot.toml`](../../bench/main_processor/configuration/robot.toml)):
+
+```sh
+bazel build //bench/main_processor/swerve_module:all \
+  //talOS/simulation:sim_gateway //talOS/bridge:hardware_node
+python3 tools/test_rio_in_the_loop.py            # sim_gateway at the RoboRIO end
+python3 tools/test_rio_in_the_loop.py --wpilib   # this program, under WPILib simulation
+```
+
+Each mode drives the module for two seconds, checks from the gateway's exit
+summary that its drive wheel turned and that it ended neutral once the
+target, node and bridge had stopped, and replays the node's log. The
+summary reports the first motor by logical id, so these runs use
+`robot.toml` narrowed to the module's own subsystem (the script writes it
+from that file's `[robot]` tables and `swerve_module` entry; devices, CAN
+ids and buses unchanged). `--wpilib` swaps `sim_gateway` for
+`./gradlew simulateNative` in `controller_processor/rio/` and makes the same
+assertions, because both run the same `talos::hardware::Gateway`, then runs
+two more scenarios: with the Driver Station never enabled, the module must
+not move at all; and with it enabled and the wheel driven, a relay standing
+in for the main processor's socket cuts the link at once (the
+main-processor processes then stop cleanly; nothing they send past the cut
+reaches the RoboRIO), and the RoboRIO program alone must neutralize every
+output on its first tick at or past the last command's expiry, which the
+harness reads from the RoboRIO's own States at the relay. That scenario
+runs `robot.toml` whole, so the bench's undriven devices must read neutral
+too. It runs Gradle `--offline`, so the first run needs one online
+`./gradlew simulateNative` beforehand. CI's `rio-in-the-loop` job runs
+`--wpilib` on Linux with `--output-dir`, which puts each scenario's log
+directory under a directory it keeps when the run fails. Ports 5802/5803
+must be free. Both modes fail a run during which the host slept (more than
+50 ms of sleep), since a frozen host reads as a stalled robot; on macOS the
+harness holds `caffeinate -s` for the run, which also holds off a headless
+Mac's DarkWake maintenance sleep. `--wpilib` also fails when the RoboRIO
+loop's watchdog reports a stall or its timing report shows more than 250 ms
+between ticks, naming whether the tick overran or only started late.
 
 ## Simulation Backends: Ideal vs Physics-Backed
 

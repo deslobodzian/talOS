@@ -320,7 +320,7 @@ install_cxx() {
 }
 
 # --- python3 -----------------------------------------------------------------
-# rules_python bootstraps with a system python3; tools/test_drivetrain.py and
+# rules_python bootstraps with a system python3; tools/test_rio_in_the_loop.py and
 # the CI clang-tidy script use it directly.
 detect_python() {
   have python3 || { DETAIL="python3 not found"; return 1; }

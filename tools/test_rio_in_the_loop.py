@@ -1,25 +1,30 @@
-"""Run the loopback-only, multi-process swerve smoke test and replay its log.
+"""Run the loopback-only, multi-process RoboRIO-in-the-loop test.
 
-Two gateways can stand at the RoboRIO end of the UDP link, and both are tested
-the same way because both run the same `talos::hardware::Gateway`:
+Its subject is the bench's swerve module (bench/main_processor/swerve_module:
+a C++ node driving two Talon FXs from its target lane, fed by that package's
+send_target) on bench's loopback config
+(bench/main_processor/configuration/robot.toml), and the node's log is
+replayed. Two gateways can stand at the RoboRIO end of the UDP link, and
+both are tested the same way because both run the same
+`talos::hardware::Gateway`:
 
-    python3 tools/test_drivetrain.py            # //talOS/simulation:sim_gateway
-    python3 tools/test_drivetrain.py --wpilib   # controller_processor/rio/, under WPILib simulation
+    python3 tools/test_rio_in_the_loop.py            # //talOS/simulation:sim_gateway
+    python3 tools/test_rio_in_the_loop.py --wpilib   # controller_processor/rio/, under WPILib simulation
 
 The second one is the real RoboRIO program. It is slower to start, because it
 goes through Gradle, but it exercises the actual `Robot` loop and the actual
 Driver Station enable path, so it also runs two scenarios that the
 stand-alone gateway cannot: with the Driver Station never enabled, the
-drivetrain must not move at all; and with the Driver Station still enabled
-and the wheels driven, the main processor falls silent at once, and the
-RoboRIO program alone must neutralize every output on its first tick at or
-past the command's expiry (REQ-SAFE-16, REQ-SAFE-17, REQ-SAFE-18), judged
-from its own States on its own clock.
+module must not move at all; and with the Driver Station still enabled and
+the wheel driven, the main processor falls silent at once, and the RoboRIO
+program alone must neutralize every output on its first tick at or past the
+command's expiry (REQ-SAFE-16, REQ-SAFE-17, REQ-SAFE-18), judged from its
+own States on its own clock.
 
 Logs go to a new directory under the system temporary directory, or under
 --output-dir when given (CI keeps that directory when the run fails).
 
-First build: bazel build //2026-robot/main_processor/drivetrain:all \
+First build: bazel build //bench/main_processor/swerve_module:all \
                          //talOS/simulation:sim_gateway \
                          //talOS/bridge:hardware_node
              (for --wpilib, Gradle builds the robot program itself)
@@ -95,9 +100,19 @@ SILENT_TARGET_SECONDS = 3
 # Bounds a stop handler that hangs; past it the process is SIGKILLed and the
 # run fails, since a killed holder leaves its shared memory behind.
 STOP_SECONDS = 10
-# A drive motor under the 1 m/s target settles near 2.5 V and 3 rps in the
-# Phoenix simulation, and neutral reads exactly 0 V: past both of these on
-# its way up, the motor is plainly driven and turning.
+# The subject: the bench swerve module's package, node name and config.
+SUBJECT = "swerve_module"
+SUBJECT_PACKAGE = "bench/main_processor/swerve_module"
+SUBJECT_CONFIG = "bench/main_processor/configuration/robot.toml"
+# send_target's drive velocity (the drive motor's mechanism unit, rotor rps
+# while the bench module's reduction is 1) and wheel heading. The Phoenix
+# simulation turns a rotor at 100 rps per 12 V, so the drive settles near
+# 10 rps and 1.2 V (the config's provisional kV, 0.12 V/rps, is that plant's);
+# neutral reads exactly 0 V. Past both thresholds below on its way up, the
+# motor is plainly driven and turning. 10 rps is also the node's
+# max_drive_velocity_rps, which caps the target.
+DRIVE_RPS = 10.0
+STEER_ROT = 0.0
 DRIVEN_VOLTS = 1.0
 DRIVEN_RPS = 1.0
 # Bounds only a hang: every wait below ends on a State or a process exit.
@@ -153,23 +168,19 @@ def host_sleep_seconds():
 class Scenario:
     """One full run of gateway + bridge + node, cleaned up on the way out."""
 
-    def __init__(self, root, output, wpilib=False):
+    def __init__(self, root, output, config, wpilib=False):
         self.root = root
         self.wpilib = wpilib
         self.slept_at_start = host_sleep_seconds()
-        self.binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
-        # sim_gateway is talOS's (talOS/simulation), not the drivetrain
-        # package's, so it is spelled out separately: a stale binary left in
-        # the drivetrain package would otherwise be picked up silently.
+        self.binaries = root / "bazel-bin" / SUBJECT_PACKAGE
+        # sim_gateway and the bridge are talOS's (talOS/simulation,
+        # talOS/bridge), not the subject package's, so each is spelled out
+        # by its own package: a stale binary of that name left in the subject
+        # package would otherwise be picked up silently.
         self.sim_gateway = (
             root / "bazel-bin/talOS/simulation/sim_gateway")
-        # The bridge is framework code and lives under talOS, not with the
-        # robot's drivetrain. Pointing this at the drivetrain package silently
-        # picks up a stale binary left over from before the split instead of
-        # failing, so it is spelled out separately.
         self.bridge = root / "bazel-bin/talOS/bridge/hardware_node"
-        self.config = (
-            root / "2026-robot/main_processor/configuration/robot.toml")
+        self.config = config
         self.output = output
         self.children = []
         self.names = {}
@@ -222,8 +233,8 @@ class Scenario:
             # -Pheadless keeps the simulation GUI out of an automated run; the
             # TALOS_SIM_DS variables above stand in for it. The task is the
             # plain simulateNative the rest of the repo uses (sim.sh and the
-            # drivetrain/hardware/protocol READMEs), run from the Gradle
-            # project that owns the RoboRIO program.
+            # hardware README), run from the Gradle project that owns the
+            # RoboRIO program.
             ["./gradlew", "--offline", "--quiet", "-Pheadless",
              "simulateNative"],
             cwd=self.root / "controller_processor/rio",
@@ -271,8 +282,9 @@ class Scenario:
                                    "--log", str(log_path)])
         time.sleep(0.5)
         sender = self.start("send_target",
-                            [str(self.binaries / "send_target"), "1", "0",
-                             "0", str(target_seconds)])
+                            [str(self.binaries / "send_target"),
+                             str(DRIVE_RPS), str(STEER_ROT),
+                             str(target_seconds)])
         return node, sender
 
     def stop(self, processes):
@@ -418,6 +430,63 @@ def robot_settings(config, *keys):
     if missing:
         raise RuntimeError(f"{config} sets no [robot] {', '.join(missing)}")
     return [robot[key] for key in keys]
+
+
+TOML_HEADER = re.compile(r"^\s*(\[\[?)\s*([\w.-]+)\s*\]\]?\s*(?:#.*)?$")
+TOML_NAME = re.compile(r'^\s*name\s*=\s*"([^"]*)"\s*(?:#.*)?$')
+TOML_PATH = re.compile(r'^(\s*(?:path|defaults)\s*=\s*)"([^"]*)"(\s*(?:#.*)?)$')
+
+
+def subject_config(config, output):
+    """`config` narrowed to the subject's own subsystem, written in output.
+
+    The gateways' exit summary (the driving and disabled scenarios' verdict)
+    reports the first motor by logical id, and logical ids follow (subsystem,
+    device name) order (talOS/configuration/config_parser.h), so in bench's
+    robot.toml that is the bench motor's Kraken, which the subject never
+    drives. This config is that file's [robot] tables, verbatim, and the
+    subject's [[subsystems]] entry with its paths made absolute, so its
+    subsystem file is read in place: the same robot settings, devices, CAN
+    ids and buses, with the subject's drive motor first, and nothing copied
+    by hand. It is cut line by line, not through tomllib, which the system
+    python3 the sim_gateway mode supports (3.8) lacks; a top-level key or a
+    missing entry fails the run, and anything else the node and bridge
+    cannot load fails it there.
+    """
+    blocks = []  # (bracket, table name, lines)
+    for line in config.read_text().splitlines():
+        header = TOML_HEADER.match(line)
+        if header:
+            blocks.append((header.group(1), header.group(2), [line]))
+        elif blocks:
+            blocks[-1][2].append(line)
+        elif line.strip() and not line.lstrip().startswith("#"):
+            raise RuntimeError(f"{config}: top-level key {line.strip()!r} "
+                               f"is not copied")
+    kept = []
+    entries = 0
+    for bracket, name, lines in blocks:
+        if bracket == "[" and (name == "robot" or name.startswith("robot.")):
+            kept += lines
+        elif bracket == "[[" and name == "subsystems":
+            names = [m.group(1) for m in map(TOML_NAME.match, lines) if m]
+            if names != [SUBJECT]:
+                continue
+            entries += 1
+            for line in lines:
+                path = TOML_PATH.match(line)
+                if path:
+                    absolute = (config.parent / path.group(2)).resolve()
+                    line = f'{path.group(1)}"{absolute}"{path.group(3)}'
+                kept.append(line)
+    if entries != 1:
+        raise RuntimeError(f"{config} has {entries} [[subsystems]] entries "
+                           f"named '{SUBJECT}'; expected one")
+    narrowed = output / "subject.toml"
+    narrowed.write_text(f"# {config}, narrowed to [[subsystems]] {SUBJECT} "
+                        f"by tools/test_rio_in_the_loop.py\n" +
+                        "\n".join(kept) + "\n")
+    return narrowed
 
 
 def decode_frame(data):
@@ -662,8 +731,9 @@ def run_driving_scenario(root, wpilib, output_root):
     """The robot is enabled, is told to drive, and then loses its commands."""
     output = Path(tempfile.mkdtemp(prefix="talos-drive-", dir=output_root))
     log_path = output / "drive.tlog"
+    config = subject_config(root / SUBJECT_CONFIG, output)
 
-    with Scenario(root, output, wpilib) as scenario:
+    with Scenario(root, output, config, wpilib) as scenario:
         if wpilib:
             # Explicit bring-up order: the robot starts disabled, the bridge's
             # config push lands while it is disabled, and only then does the
@@ -687,7 +757,7 @@ def run_driving_scenario(root, wpilib, output_root):
         summary = scenario.summary()
 
         if rotations_of(summary) <= 1:
-            raise RuntimeError("The simulated drivetrain did not move")
+            raise RuntimeError("The simulated swerve module did not move")
         if "first_wheel_rps=0.000000 command_active=0" not in summary:
             raise RuntimeError(
                 "The gateway did not neutralize after communication stopped")
@@ -707,8 +777,9 @@ def run_disabled_scenario(root, output_root):
     (`--mode-schedule`) are covered by //talOS/simulation:sim_gateway_test.
     """
     output = Path(tempfile.mkdtemp(prefix="talos-disabled-", dir=output_root))
+    config = subject_config(root / SUBJECT_CONFIG, output)
 
-    with Scenario(root, output, wpilib=True) as scenario:
+    with Scenario(root, output, config, wpilib=True) as scenario:
         scenario.start_wpilib_gateway(6, enabled=False)
         scenario.drive(output / "drive.tlog", 4, 3)
         scenario.wait()
@@ -792,7 +863,7 @@ def judge_silence(states, commands, timeout_us, status_hz):
             f"{expiry_us - stop['sample_us']} us before its expiry: another "
             f"stop than the command timeout")
     # A steer motor holding its angle in position mode is a non-neutral
-    # command alone; the wheels must still be turning up to the stop.
+    # command alone; the wheel must still be turning up to the stop.
     if not turning(before):
         raise RuntimeError(
             f"State {before['sequence']}, the last before the stop, has no "
@@ -836,7 +907,7 @@ def judge_silence(states, commands, timeout_us, status_hz):
         settled += 1
         live = [(i, volts) for i, valid, _, volts in s["motors"]
                 if not valid or volts != 0.0]
-        # The 2026 config has no digital or PWM output, so these two lines
+        # The bench config has no digital or PWM output, so these two lines
         # check nothing there; they hold any config that has them.
         live += [(i, value) for i, _, value in s["digital_outputs"] if value]
         live += [(i, output) for i, _, output in s["pwm_outputs"]
@@ -867,7 +938,7 @@ def run_silent_main_processor_scenario(root, output_root):
 
     The relay cuts the link while a wheel turns: from then on nothing the
     main processor sends reaches the RoboRIO program, and the Driver Station
-    stays enabled, so only the RoboRIO program can stop the wheels. Its
+    stays enabled, so only the RoboRIO program can stop the wheel. Its
     States are read at the relay, not through the bridge.
 
     The cut is the death. The bridge's socket is connected to the relay
@@ -879,13 +950,18 @@ def run_silent_main_processor_scenario(root, output_root):
     stopped with SIGTERM and send_target ends on its own, because a killed
     process never closes its shared-memory queues and leaves their
     production-name segments in /dev/shm for every later run.
+
+    It runs bench's robot.toml whole, not narrowed: it judges every output
+    from the States, so the bench's other devices, which nothing drives,
+    must read neutral too.
     """
     output = Path(tempfile.mkdtemp(prefix="talos-silent-", dir=output_root))
-    config = root / "2026-robot/main_processor/configuration/robot.toml"
+    config = root / SUBJECT_CONFIG
     timeout_us, status_hz = robot_settings(config, "command_timeout_us",
                                            "status_hz")
 
-    with Relay() as relay, Scenario(root, output, wpilib=True) as scenario:
+    with Relay() as relay, Scenario(root, output, config,
+                                    wpilib=True) as scenario:
         gateway = scenario.start_wpilib_gateway(SILENT_GATEWAY_SECONDS,
                                                 enable_when_configured=True)
         bridge = scenario.start_bridge(
@@ -983,19 +1059,19 @@ def main():
         args.output_dir.mkdir(parents=True, exist_ok=True)
 
     root = Path(__file__).resolve().parents[1]
-    binaries = root / "bazel-bin/2026-robot/main_processor/drivetrain"
+    binaries = root / "bazel-bin" / SUBJECT_PACKAGE
     sim_gateway = (
         root / "bazel-bin/talOS/simulation/sim_gateway")
 
     needed = [binaries / "node", binaries / "send_target",
               root / "bazel-bin/talOS/bridge/hardware_node",
-              root / "2026-robot/main_processor/configuration/robot.toml"]
+              root / SUBJECT_CONFIG]
     if not args.wpilib:
         needed.append(sim_gateway)
     for path in needed:
         if not path.is_file():
             raise RuntimeError(
-                "Build //2026-robot/main_processor/drivetrain:all, "
+                f"Build //{SUBJECT_PACKAGE}:all, "
                 "//talOS/simulation:sim_gateway, and "
                 "//talOS/bridge:hardware_node first")
 
