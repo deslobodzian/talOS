@@ -281,6 +281,64 @@ TEST_F(Registry, ConcurrentProcessesNeverReceiveTheSameSlot) {
   EXPECT_TRUE(reader->nodes().empty());
 }
 
+// What a launcher session in a shared-memory namespace does to the registry
+// once its members are reaped (NamespaceNames::RemoveRegistry, launcher.cc),
+// step for step: the lock is not waited for, and a row of another session
+// whose claimant still runs keeps the registry. True when it removed it.
+bool RemoveRegistryAsALauncherSessionDoes(const std::string& path,
+                                          std::uint64_t session_id) {
+  const std::string mapped = ShmObjectName(path);
+  try {
+    const RegistryLock lock{mapped, std::chrono::milliseconds{0}};
+    {
+      const RegistryMapping registry{path, /*read_only=*/true};
+      for (const auto& row : registry.header()->nodes) {
+        if (row.state.load(std::memory_order_acquire) !=
+                static_cast<std::uint64_t>(SlotState::FREE) &&
+            row.session_id != session_id &&
+            ProcessWordAlive((row.pid_start << kProcessPidBits) | row.pid)) {
+          return false;
+        }
+      }
+    }
+    RegistryMapping::unlink(path);
+    ::unlink(LockFilePath(mapped).c_str());
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
+// The registry the `mapped` hook below removes, and how often it ran; a hook
+// is a plain function.
+std::string removal_path;
+int removal_attempts = 0;
+
+// REQ-OPS-17, REQ-OPS-03
+TEST_F(Registry, AClaimIsSeenThoughASessionRemovesTheRegistryAfterTheMap) {
+  // A node outside any session has mapped the registry and not yet claimed;
+  // a namespaced launcher session (99) ends then, holding no row, and
+  // removes the registry as it does once its members are reaped. The claim
+  // that follows must land in a segment a later reader maps, not in the
+  // unlinked one: else the node is invisible to Studio and to liveness.
+  removal_path = path_;
+  removal_attempts = 0;
+  const RegistryTestHooks hooks{.mapped = [](RegistryHeader*) {
+    ++removal_attempts;
+    static_cast<void>(RemoveRegistryAsALauncherSessionDoes(removal_path, 99));
+  }};
+  NodeRegistration registration{{.name = "outsider"}, path_, &hooks};
+  ASSERT_EQ(removal_attempts, 1);
+
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value())
+      << "the claim landed in a registry no later reader maps";
+  const auto nodes = reader->nodes();
+  ASSERT_EQ(nodes.size(), 1u);
+  EXPECT_EQ(nodes.front().name, "outsider");
+  EXPECT_TRUE(nodes.front().alive);
+}
+
 event::Manifest sample_manifest() {
   event::Manifest manifest;
   manifest.push_back({.id = 0,
