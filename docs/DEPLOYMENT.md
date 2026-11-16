@@ -188,10 +188,11 @@ A relative `--prefix` is resolved against the working directory.
   directory holding the link itself, the bundle or the install (which the
   copy would follow until it failed or the disk filled); `current` and
   `previous` stay as they were. Stopping `deploy.sh` (Ctrl-C, SIGTERM,
-  SIGHUP) while it copies, or makes the copy read-only and syncs it, stops
-  the copy's processes, removes the copy and exits 128 plus the signal's
-  number; a stop during the warm-up or the graph check selects nothing but
-  leaves the complete copy for `prune`.
+  SIGHUP) at any point before it selects the copy (while it copies, makes
+  the copy read-only and syncs it, warms it or checks its graph) stops
+  that step's processes, selects nothing, removes the copy and exits 128
+  plus the signal's number, so no stray `bundles/<stamp>` is left for
+  `prune` to count among the newest.
 - **enable-boot** starts `<prefix>/current/run.sh`, with no arguments, at
   boot as `--user` (default `talos`; the account must exist), so a booted
   robot serves the Studio its bundle carries ([above](#build-a-bundle)).
@@ -364,7 +365,8 @@ when everything finished it reads `deploy: warmed 5 members and 58 native
 libraries in 9.8 s`. A member that detaches a process
 into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
-member's process group, selects nothing and exits 1. Linux has no such
+member's process group, selects nothing and exits 128 plus the signal's
+number; `install` also removes its copy. Linux has no such
 charge; the warm-up runs there too. `--no-warm-up` skips it. After `install`, the
 [graph check](#graph-check) still runs every member and the launcher once,
 all at once inside the probes' deadline, so the first launch pays only, on
@@ -401,7 +403,8 @@ launcher or the warm-up, do not refuse; on acceptance the launcher's graph
 warnings (its `  warning: ` lines, among them a non-critical member that did
 not answer `--describe`, which the launch still starts, and a Studio bridge
 that did not, which it leaves out) are printed, prefixed the same way. Stopping `deploy.sh` during the
-check stops the launcher, selects nothing and exits 1.
+check stops the launcher, selects nothing, removes the copy and exits 128
+plus the signal's number.
 
 The check takes nothing a running robot holds: `--describe-only` takes no
 session lock, shared memory, registry row, controller link or realtime

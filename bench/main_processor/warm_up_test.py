@@ -39,6 +39,14 @@ case "$(basename "$0")" in
     [ -z "${STUB_PREWARM:-}" ] || exit 0
     [ -z "${STUB_FIFO:-}" ] || echo up > "$STUB_FIFO"
     exec tail -f /dev/null ;;
+  run.sh)
+    # The graph check's run: STUB_CHECK_FIFO says it is running and never
+    # exits.
+    if [ -n "${STUB_CHECK_FIFO:-}" ]; then
+      echo up > "$STUB_CHECK_FIFO"
+      exec tail -f /dev/null
+    fi
+    ;;
 esac
 printf 'end %s\\n' "$me" >> "$STUB_LOG"
 """
@@ -268,33 +276,55 @@ class WarmUpTest(unittest.TestCase):
         proc = self.deploy("rollback")
         self.assert_warmed_in_turn(old, nodes, new, proc)
 
-    # REQ-OPS-47
-    def test_a_stopped_warm_up_kills_its_member_and_selects_nothing(self):
+    def stop_install(self, nodes, fifo_var, number, *args):
+        """Starts an install of a stub bundle of `nodes`, sends `number` to
+        it once the stub that `fifo_var` names says it is running, and
+        asserts that deploy.sh exits 128 + `number`, selecting nothing and
+        leaving no copy under bundles/ for prune to count."""
         src = os.path.join(self.tmp, "bundle")
-        stub_bundle(src, ("alpha", "hangs", "omega"))
+        stub_bundle(src, nodes)
         fifo = os.path.join(self.tmp, "running")
         os.mkfifo(fifo)
         # Read and write: the stub's open never blocks, and no EOF wakes us.
         reader = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
         self.addCleanup(os.close, reader)
         deploy = subprocess.Popen(
-            ["bash", deploy_script(), "install", src, "--prefix", self.prefix],
-            env=dict(self.env, STUB_FIFO=fifo), stdout=subprocess.PIPE,
+            ["bash", deploy_script(), "install", src, "--prefix", self.prefix,
+             *args],
+            env=dict(self.env, **{fifo_var: fifo}), stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True)
         self.addCleanup(deploy.kill)
         ready, _, _ = select.select([reader], [], [], 60)
-        self.assertTrue(ready, "the hung member never started")
-        deploy.send_signal(signal.SIGTERM)
+        self.assertTrue(ready, "the stub never started")
+        deploy.send_signal(number)
         out, err = deploy.communicate(timeout=60)
-        self.assertNotEqual(deploy.returncode, 0, out + err)
+        self.assertEqual(os.listdir(os.path.join(self.prefix, "bundles")), [],
+                         out + err)
         self.assertFalse(os.path.lexists(os.path.join(self.prefix, "current")),
                          out + err)
+        self.assertEqual(deploy.returncode, 128 + number, out + err)
+
+    # REQ-OPS-47, REQ-OPS-48: a stop during the warm-up kills the running
+    # member, selects nothing and removes the copy.
+    def test_a_stopped_warm_up_kills_its_member_and_removes_the_copy(self):
+        self.stop_install(("alpha", "hangs", "omega"), "STUB_FIFO",
+                          signal.SIGTERM)
         records = self.records()
         started = [os.path.basename(r[1]) for r in records if r[0] == "start"]
         self.assertEqual(started, ["studio_bridge", "alpha", "hangs"], records)
         with self.assertRaises(ProcessLookupError, msg="hung member alive"):
             os.kill(int(records[-1][2]), 0)
 
+    # REQ-OPS-50, REQ-OPS-48: a stop during install's graph check (SIGINT,
+    # which bash leaves ignored in a background job) stops the launcher,
+    # selects nothing and removes the copy.
+    def test_a_stopped_graph_check_stops_it_and_removes_the_copy(self):
+        self.stop_install(("alpha",), "STUB_CHECK_FIFO", signal.SIGINT,
+                          "--no-warm-up")
+        log = self.records(check=True)
+        self.assertEqual([r[0] for r in log], ["start"], log)
+        with self.assertRaises(ProcessLookupError, msg="graph check alive"):
+            os.kill(int(log[0][2]), 0)
 
 if __name__ == "__main__":
     unittest.main()

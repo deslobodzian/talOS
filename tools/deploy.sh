@@ -60,7 +60,8 @@ finally:
 # the command: install's graph check judges members. The last line counts what
 # finished (members that exited 0, native libraries whose load returned) and
 # names each member that did not, with how it ended. A stop signal to deploy.sh kills the
-# running member's group and selects nothing. Members run as the invoking user
+# running member's group and selects nothing (stop traps, below). Members run
+# as the invoking user
 # (root under sudo). Linux pays no such charge but runs the same path, without
 # the native pass.
 WARM_UP=1
@@ -81,10 +82,10 @@ warm_up() {
     return 0
   fi
   say "warming up $bundle: each member's first run, one at a time"
-  # In the background so that a signal to deploy.sh reaches the warm-up,
-  # which kills its member before exiting: bash would otherwise die alone
-  # and leave the member running. Bash runs a background job with SIGINT
-  # ignored, so the trap forwards every stop as SIGTERM.
+  # In the background so that a stop reaches the warm-up, which kills its
+  # member before exiting: bash would otherwise die alone and leave the
+  # member running.
+  hold_stops "the warm-up"
   python3 - "$bundle" "${TALOS_DEPLOY_WARM_UP_TIMEOUT_S:-60}" <<'EOF' &
 import json
 import os
@@ -303,14 +304,10 @@ if missed:
     summary += "; not warmed: " + ", ".join(missed)
 print(summary, flush=True)
 EOF
-  local pid=$! status=0 stopped=0
-  trap 'stopped=1; kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP
-  wait "$pid" || status=$?
-  # A trapped signal ends the first wait early; the second waits for the
-  # warm-up to kill its member and exit.
-  if [ "$stopped" = "1" ]; then wait "$pid" 2>/dev/null || true; fi
-  trap - TERM INT HUP
-  [ "$stopped" = "0" ] || die "stopped during the warm-up; nothing selected"
+  STOP_CHILD=$!
+  local status=0
+  wait "$STOP_CHILD" || status=$?
+  STOP_CHILD=""
   [ "$status" = "0" ] ||
     printf 'deploy: warning: warm-up did not finish; the launch pays the rest\n' >&2
 }
@@ -334,7 +331,8 @@ EOF
 # --no-warm-up does not skip it; on macOS a fresh bundle's probes then pay
 # the first-run charge inside their deadline. There is no override: the
 # launcher accepts --allow-graph-errors only with --sim, so a robot could
-# never launch such a bundle.
+# never launch such a bundle. A stop stops the launcher and removes the
+# temporary root (stop traps, below).
 check_graph() {
   local bundle="$1"
   if [ "$DRY_RUN" = "1" ]; then
@@ -347,19 +345,15 @@ check_graph() {
   scratch="${TMPDIR:-/tmp}"
   scratch="$(mktemp -d "${scratch%/}/talos_install_check.XXXXXX")" ||
     die "cannot create a temporary directory for the graph check; nothing selected"
-  local pid status=0 stopped=0
+  local status=0
   # In the background, as the warm-up, so that a stop reaches the launcher.
+  hold_stops "the graph check"
+  STOP_SCRATCH="$scratch"
   PYTHONDONTWRITEBYTECODE=1 "$bundle/run.sh" --describe-only \
     --output-dir "$scratch" </dev/null >"$scratch/output" 2>&1 &
-  pid=$!
-  trap 'stopped=1; kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP
-  wait "$pid" || status=$?
-  if [ "$stopped" = "1" ]; then wait "$pid" 2>/dev/null || true; fi
-  trap - TERM INT HUP
-  if [ "$stopped" = "1" ]; then
-    rm -rf "$scratch"
-    die "stopped during the graph check; nothing selected"
-  fi
+  STOP_CHILD=$!
+  wait "$STOP_CHILD" || status=$?
+  STOP_CHILD=""
   if [ "$status" = "0" ]; then
     # PrintDeclaredGraph writes each diagnostic as "  warning: <subject>: ...".
     local warnings
@@ -375,6 +369,7 @@ check_graph() {
     sed 's/^/  | /' "$scratch/output" >&2
   fi
   rm -rf "$scratch"
+  STOP_SCRATCH=""
   return "$status"
 }
 
@@ -567,19 +562,46 @@ kept_selection() {
   fi
 }
 
-# A stop's trap while install copies: stops the copy (its Python, which
-# kills its `cp`), removes what it wrote and exits $1. Reads cmd_install's
-# `copier` and `dest`.
-stop_install() {
+# --- stop traps -------------------------------------------------------------
+# install holds them from its copy until it selects, rollback through its
+# warm-up and graph check. A stop (SIGTERM, SIGINT or SIGHUP to deploy.sh)
+# stops the step running in the background (STOP_CHILD: the copy's Python,
+# which kills its `cp`; the warm-up, which kills its member; the graph
+# check's launcher) and waits for it, removes the graph check's temporary
+# root (STOP_SCRATCH) and install's copy (STOP_DISCARD), selects nothing and
+# exits 128 + the signal. Bash runs a background job with SIGINT ignored, so
+# every stop is forwarded as SIGTERM. A stop during a foreground command
+# (install's chmod and sync) is handled once that command ends.
+STOP_PHASE="" STOP_CHILD="" STOP_SCRATCH="" STOP_DISCARD=""
+on_stop() {
   trap - TERM INT HUP
-  if [ -n "$copier" ]; then
-    kill -TERM "$copier" 2>/dev/null || true
-    wait "$copier" 2>/dev/null || true
+  if [ -n "$STOP_CHILD" ]; then
+    kill -TERM "$STOP_CHILD" 2>/dev/null || true
+    wait "$STOP_CHILD" 2>/dev/null || true
   fi
-  discard_copy "$dest"
-  printf 'deploy: error: stopped during the copy; %s removed, %s\n' \
-    "$dest" "$(kept_selection)" >&2
+  [ -z "$STOP_SCRATCH" ] || rm -rf "$STOP_SCRATCH"
+  if [ -n "$STOP_DISCARD" ]; then
+    discard_copy "$STOP_DISCARD"
+    printf 'deploy: error: stopped during %s; %s removed, %s\n' \
+      "$STOP_PHASE" "$STOP_DISCARD" "$(kept_selection)" >&2
+  else
+    printf 'deploy: error: stopped during %s; nothing selected, %s\n' \
+      "$STOP_PHASE" "$(kept_selection)" >&2
+  fi
   exit "$1"
+}
+
+# Holds the stop traps for the step $1 names (the error line says it).
+hold_stops() {
+  STOP_PHASE="$1"
+  trap 'on_stop 143' TERM
+  trap 'on_stop 130' INT
+  trap 'on_stop 129' HUP
+}
+
+release_stops() {
+  trap - TERM INT HUP
+  STOP_PHASE="" STOP_CHILD="" STOP_SCRATCH="" STOP_DISCARD=""
 }
 
 # --- test-only bundles -------------------------------------------------------
@@ -611,11 +633,10 @@ sys.exit(os.path.commonpath([test, prefix]) != test)
 # complete copy, synced to disk first: a power cut right after the flip must
 # not boot a half-written bundle. A copy that fails, or that the launcher
 # refuses, is removed, as is one stopped (SIGTERM, SIGINT or SIGHUP to
-# deploy.sh) while it is copied, made read-only or synced: the copy's
-# processes are stopped first, and deploy.sh exits 128 + the signal. So
-# neither a selection nor prune's newest --keep N ever counts it. Not
-# covered: SIGKILL, and a stop during the warm-up or graph check, which
-# select nothing but leave the complete copy for prune.
+# deploy.sh) while it is copied, made read-only, synced, warmed or checked
+# (stop traps, above): the step's processes are stopped first, and
+# deploy.sh exits 128 + the signal. So neither a selection nor prune's
+# newest --keep N ever counts it. Not covered: SIGKILL.
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
@@ -634,16 +655,15 @@ cmd_install() {
   else
     # In the background, as the warm-up, so that a stop reaches the copy;
     # a stop during the foreground chmod or sync below runs once it ends.
-    local copier="" status=0
-    trap 'stop_install 143' TERM
-    trap 'stop_install 130' INT
-    trap 'stop_install 129' HUP
+    local status=0
+    STOP_DISCARD="$dest"
+    hold_stops "the copy"
     copy_bundle "$bundle" "$dest" &
-    copier=$!
-    wait "$copier" || status=$?
-    copier=""
+    STOP_CHILD=$!
+    wait "$STOP_CHILD" || status=$?
+    STOP_CHILD=""
     if [ "$status" != "0" ]; then
-      trap - TERM INT HUP
+      release_stops
       discard_copy "$dest"
       die "$bundle not installed; $(kept_selection)"
     fi
@@ -652,14 +672,16 @@ cmd_install() {
   [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
     die "copy has no executable run.sh; current unchanged: $dest"
   run sync
-  trap - TERM INT HUP
   warm_up "$dest" install
   if ! check_graph "$dest"; then
+    release_stops
     discard_copy "$dest"
     # The launcher's paths name the removed copy and check directory; the
     # bundle given holds the same files at the same relative paths.
     die "$bundle not installed (the paths above were its removed copy, $dest); $(kept_selection)"
   fi
+  # Selected from here on: a stop must no longer remove the copy.
+  release_stops
   if [ -L "$PREFIX/current" ]; then
     select_bundle "$(readlink "$PREFIX/current")" "$PREFIX/previous"
   fi
@@ -1142,6 +1164,7 @@ cmd_rollback() {
     die "no previous bundle to roll back to ($PREFIX/previous missing or not a bundle)"
   local cur; cur="$(readlink "$PREFIX/current")"
   warm_up "$(cd "$PREFIX/previous" && pwd -P)" rollback
+  release_stops
   select_bundle "$(readlink "$PREFIX/previous")" "$PREFIX/current"
   select_bundle "$cur" "$PREFIX/previous"
   say "rolled back: current -> $(readlink "$PREFIX/current"); restart the service to activate"
