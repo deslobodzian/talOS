@@ -808,7 +808,13 @@ time has passed it disables PWM outputs, sets DIO outputs false and sends
 `NeutralOut` to every motor, on every check until a beat moves the time (so
 outputs a resumed loop re-applies on a stale clock reading before stalling
 again are neutralized again), and sends one Driver Station error per stall,
-`talos loop watchdog`, with the silence and a stall count. It touches only
+`talos loop watchdog`, with the silence and a stall count, from a reporter
+thread of its own at the default scheduling. A stall while four reports are
+still undelivered (that Driver Station call blocked) loses its report, and
+the loop's console then prints, once per rise in that count
+(`LoopWatchdog::dropped_reports()`, posted by `LoopConsole`), `RoboRIO loop
+watchdog: <k> stall report(s) dropped (<total> since start), <n> stalls in
+all: the Driver Station error channel was not taking them`. It touches only
 the device handles (Phoenix 6 serializes each device's control sends behind
 a per-device mutex; HAL DIO and PWM writes are safe from any thread), skips
 devices a configure is rebuilding, and does not act while the loop ticks on

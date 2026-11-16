@@ -19,6 +19,29 @@ void LoopConsole::ObserveGateway(const hardware::Gateway& gateway) {
   ReportRefusal(gateway.last_enabled_refusal());
 }
 
+void LoopConsole::ObserveWatchdog(const LoopWatchdog& watchdog) {
+  const uint64_t dropped = watchdog.dropped_reports();
+  if (dropped == reported_dropped_reports_) return;
+  const uint64_t new_drops = dropped - reported_dropped_reports_;
+  reported_dropped_reports_ = dropped;
+  // Read after the drops, so it normally covers every stall whose report
+  // was dropped (two relaxed loads; the loop was stalled while they rose).
+  const uint64_t stalls = watchdog.stall_count();
+  char text[160];
+  std::snprintf(text, sizeof(text),
+                "RoboRIO loop watchdog: %llu stall report%s dropped (%llu "
+                "since start), %llu stalls in all: the Driver Station error "
+                "channel was not taking them",
+                static_cast<unsigned long long>(new_drops),
+                new_drops == 1 ? "" : "s",
+                static_cast<unsigned long long>(dropped),
+                static_cast<unsigned long long>(stalls));
+  LogEvent event;
+  event.index = kWatchdogReportsDroppedMessage;
+  event.SetText(text);
+  log_.Post(event);
+}
+
 void LoopConsole::ReportRefusal(
     const hardware::Gateway::EnabledRefusal& refusal) {
   if (refusal.count == reported_refusals_) return;

@@ -591,6 +591,9 @@ void Robot::StartCompetition() {
     // tick's own work before its beat, so an on-time loop is never acted on.
     const uint64_t expiry_us = gateway_->command_expiry_us();
     watchdog_->Beat(now_us, expiry_us == 0 ? 0 : expiry_us + 2 * period_us);
+    // A stall report the watchdog dropped is a stall with no Driver Station
+    // error: the console says so.
+    loop_console.ObserveWatchdog(*watchdog_);
 
     // What the endpoint last heard, for the drive team's link report; atomic
     // stores only, the reporter thread does the publishing.

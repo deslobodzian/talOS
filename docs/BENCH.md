@@ -556,7 +556,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   the State it was built from) even though the loop cannot run; with a DIO
   output set and a PWM output driven (if the config has them), DIO false and
   PWM disabled; one `talos loop watchdog` Driver Station error per stall with
-  the silence and the stall count; late ticks on the RIO console; after the
+  the silence and the stall count, and no `RoboRIO loop watchdog: <k> stall
+  report(s) dropped` line on the RIO console (a stall whose error was lost;
+  record it if one appears); late ticks on the RIO console; after the
   spinners exit, the loop takes the outputs back through its own checks.
   Repeat at least 20 times and record every trial's stall-to-neutral time,
   not only the first: a stall that preempts the loop inside a device call
