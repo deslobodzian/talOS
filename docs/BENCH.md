@@ -1066,12 +1066,87 @@ REQ-SAFE-24); digital and PWM outputs (REQ-SAFE-03; the bench has none);
 position mechanisms and rezero (REQ-SAFE-05, REQ-SAFE-36 to REQ-SAFE-38);
 VELOCITY mode under the cap (buttons 1 and 2 are not pressed); the swerve
 module (TODO.md BENCH-4); a loss of the Driver Station's own link to the
-RoboRIO (TODO.md BENCH-3); a RoboRIO reboot under a running stack
+RoboRIO ([RoboRIO program checks](#roborio-program-checks-with-a-driver-station)); a RoboRIO reboot under a running stack
 (REQ-SAFE-11); the time the RoboRIO's expiry takes, which no record shows
 when the link, the bridge or the launcher is gone and which stop path 5,
 not run on a macOS main processor, would only bound (TODO.md BENCH-9); a
 cold boot without a person; and loop lateness under a match's load
 (REQ-RT-14, TODO.md PLATFORM-1): the Mini runs only the bench's six nodes.
+
+## RoboRIO program checks with a Driver Station
+
+The RoboRIO program's checks that need its reboot or a real Driver Station
+(TODO.md BENCH-3). They run on the commissioned bench of the
+[supervised session](#one-supervised-enabled-session), after its hour or as
+their own sitting, with its people, its two terminals on the Mini, its
+variables, the RoboRIO console recorded on the workstation, and the same
+rules for what may move: the driver drives only axis 1 at about half
+deflection, the spotter keeps the disable and e-stop. Each launch gets its
+own output root and `S` as there.
+
+1. **The saved configuration survives a reboot.** Robot disabled. In T1:
+   `./tools/deploy.sh run --prefix "$PREFIX" -- --no-studio --remote "$RIO" --output-dir "$ROOT/F1" --duration-s 60`.
+   Once the console shows `companion connected`, in T2:
+   `ssh admin@10.0.0.72 'ls -l /home/lvuser/talos_config.bin; md5sum /home/lvuser/talos_config.bin'`.
+   Expected: the file is listed and its checksum printed; record it. After
+   the session ends, reboot the RoboRIO: `ssh admin@10.0.0.72 reboot`. The
+   console recording ends with the link; once the Driver Station shows
+   robot code again, start it again into a second file
+   (`rio_console_<date>_2.log`) and repeat the `ssh ... md5sum` command.
+   Pass: the same checksum, and the program's start lines read
+   `[<s>.<ms>] hardware gateway config=<id> commissioned=1 (waiting for config push)`
+   with `<id>` not `0` (`config=0` is a missing or unreadable file:
+   [configuration](../talOS/hardware/README.md)).
+2. **The `[<s>.<ms>]` prefix on the Driver Station.** In the Driver
+   Station program's message view (not the console), from step 1's session
+   and a second launch into `"$ROOT/F2"` stopped with Ctrl-C in T1. Pass:
+   `[<s>.<ms>] companion connected` at each launch and
+   `[<s>.<ms>] companion lost: no frame for <x> s; every output is neutral`
+   after the stop, each with the prefix the console shows for the same
+   line. The loop watchdog's message, `[<s>.<ms>] RoboRIO loop stalled past
+   an expired command: ...` under `talos loop watchdog`, shows only during
+   the [loop stall check](#fault-injection-and-timing); when that check runs
+   with this Driver Station, the same pass applies to it.
+3. **A stick held through a disable and an enable stays released**
+   (REQ-SAFE-13). In T1:
+   `./tools/deploy.sh run --prefix "$PREFIX" -- --no-studio --remote "$RIO" --output-dir "$ROOT/F3"`.
+   Enable with the stick released, drive at about half deflection, and,
+   the stick held, the spotter disables, then re-enables after about 2 s;
+   the driver keeps holding for 3 s more, then centres the stick and pushes
+   it again. Disable, release, Ctrl-C in T1, then
+   `"$TRIALS" "$S" > "$S/stop_paths.txt"` ([reading a trial](#reading-a-trial)).
+   Pass: nothing moved between the re-enable and the push after centring;
+   in `stop_paths.txt`, from the disable on, `/motor/target/teleop` reads
+   `active: false` and `/hw/request/motor` `kraken=neutral`, and after the
+   re-enable the first `kraken=voltage` request comes after the first
+   lane line that reads `active: true` again (the stick returned to
+   neutral).
+4. **Pulling the Driver Station's network disables.** A session as in
+   step 3 into `"$ROOT/F4"`, enabled and driving with the stick held. On
+   the workstation find its interface to the RoboRIO,
+   `ip route get 10.0.0.72` (`dev <interface>`), then cut it, stamping the
+   RoboRIO's clock first:
+   `ssh admin@10.0.0.72 cat /proc/uptime; sudo ip link set <interface> down`.
+   The motor must stop; release the stick, `sudo ip link set <interface> up`
+   after about 5 s, leave the robot disabled, Ctrl-C in T1, and write
+   `stop_paths.txt` as in step 3. The console recording ends with the link:
+   restart it as in step 1. Pass: the first `/hw/state` line with
+   `enabled=False` also reads `active=False`, and a later one `kraken_v`
+   at 0; the Driver Station lines read `enabled=False` or `mode=none` from
+   then on until the person enables again. Record the pull to the disable,
+   that State's `sample_us` minus the first `/proc/uptime` figure in µs
+   (the uptime is the console's clock, that of `sample_us`, read one `ssh`
+   exit early). The bound is NetComm's detection time plus 20 ms (the
+   `talos-ds` refresh) plus one 5 ms tick (REQ-RT-24); no document states
+   NetComm's time, so record the value, not a verdict.
+5. **No WPILib joystick warning.** Over every console file of steps 1
+   to 4: `grep -ci joystick rio_console_<date>.log rio_console_<date>_2.log`.
+   Pass: each prints `0`. The program reads the Driver Station without the
+   getters that warn about a missing joystick, axis or button
+   (`DriverStationReader.cpp`); a WPILib warning there means a call that
+   goes through them.
+
+Record each step, dated, in [BENCH_RESULTS.md](BENCH_RESULTS.md).
 
 ## Boot operation
 
