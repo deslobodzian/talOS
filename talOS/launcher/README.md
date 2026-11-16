@@ -566,9 +566,11 @@ decision reads the stop flag again, so a node killed by the same `systemctl
 stop` that is stopping the launcher is not restarted. The backoff is
 scheduled inside the supervision loop, so a restarting node never delays
 another node or the deadline. Each restart prints
-one line:
+one line when it is scheduled and one, with the new run's pid, when it
+starts (a first run prints `Started` in the same form):
 
     [launcher] alpha exited (signal 11 SIGSEGV); restart 1 in 0 ms
+    [launcher] Restarted alpha (pid 4243, target //example/alpha:node, restart 1)
 
 When a non-critical node's rolling budget is exhausted, it is **quarantined**, not
 permanently abandoned. Exactly one retry is scheduled for the oldest restart
