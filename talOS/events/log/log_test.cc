@@ -1720,6 +1720,34 @@ TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
   }
 }
 
+// The registry's log-gap flag (Options::gap_flags) is set by the record that
+// opens the gap, not by a later sample: a run killed right after that record
+// has no GAP record, and the flag is all that says its log lost records. The
+// word's other bits are kept.
+// REQ-OPS-52
+TEST(LogGap, OpeningAGapSetsTheGapFlagAtOnce) {
+  constexpr std::uint32_t kOther = 1u << 3;
+  constexpr std::uint32_t kGap = 1u << 14;
+  std::atomic<std::uint32_t> flags{kOther};
+  const std::string path = TempPath("gap_flag");
+  LogWriter::Options options;
+  options.chunk_bytes = 512;
+  options.chunk_count = 1;
+  options.background = false;
+  options.gap_flags = &flags;
+  options.gap_flag = kGap;
+  LogWriter writer{path, "gap_flag", options};
+  writer.start({}, {});
+  RecordStep(writer, {EventKind::TIMER, 1, 20}, 0);
+  RecordStep(writer, {EventKind::SEND, 1, 20}, 1);
+  EXPECT_EQ(flags.load(), kOther) << "set before any record was dropped";
+  RecordStep(writer, {EventKind::SEND, 1, 1024}, 2);
+  ASSERT_TRUE(writer.losing());
+  EXPECT_EQ(flags.load(), kOther | kGap);
+  writer.flush();
+  ::unlink(path.c_str());
+}
+
 TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {
   const auto path = TempPath("reuse_chunks");
   LogWriter writer{path, "reuse", LogWriter::Options{256, 4, true}};

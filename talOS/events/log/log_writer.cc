@@ -510,6 +510,11 @@ void LogWriter::State::open_gap(const RecordHeader& header,
   losing_flag.store(true, std::memory_order_relaxed);
   gap_count.store(gap_count.load(std::memory_order_relaxed) + 1,
                   std::memory_order_relaxed);
+  // Reported now, not at a later sample: a run killed before its GAP
+  // record is written has said its log lost records.
+  if (options.gap_flags != nullptr) {
+    options.gap_flags->fetch_or(options.gap_flag, std::memory_order_relaxed);
+  }
   gap = GapRecord{};
   gap.cause = static_cast<std::uint16_t>(cause);
   gap.first_lost_ns = header.now_ns;
