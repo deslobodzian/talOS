@@ -1684,6 +1684,7 @@ TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
                                              {{"beta", {"teleop"}}})));
 }
 
+// REQ-SAFE-28
 TEST(LauncherGraphTest,
      NonCriticalActuatorOwnersAreErrorsAfterSuccessfulProbe) {
   GraphFixture fixture{"optional_actuator",

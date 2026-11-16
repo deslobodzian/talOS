@@ -3446,6 +3446,7 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
 }
 
 // Only a genuinely global failure keeps invalidate + three-strike latch.
+// REQ-SAFE-23
 TEST(Gateway, EveryMotorOrOutputApplyFailureStillLatches) {
   for (bool outputs : {false, true}) {
     SCOPED_TRACE(outputs ? "outputs" : "every motor");
