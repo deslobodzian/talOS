@@ -55,9 +55,8 @@ test('the parser accepts what the launcher actually writes', () => {
   assert.equal(graph.diagnostics.filter(d => d.severity === 'error').length, 0);
   assert.deepEqual(
       graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(), [
-        'warning /drivetrain/target/auto', 'warning /intake/state',
-        'warning /intake/target/auto', 'warning /pose_estimator/state',
-        'warning /shooter/state', 'warning /shooter/target/auto'
+        'warning /drivetrain/target/auto', 'warning /intake/target/auto',
+        'warning /shooter/target/auto'
       ]);
 });
 
@@ -136,9 +135,8 @@ test('the launcher\'s findings cross the language boundary intact', () => {
   // printed lowercase, which was a real guess in this parser.
   for (const d of graph.diagnostics)
     assert.ok(d.severity === 'error' || d.severity === 'warning', d.severity);
-  assert.equal(graph.diagnostics.length - errors.length, 6,
-               'the autonomous-lane, unread-state, and parameter-unit warnings are still ' +
-                   'there beside the errors');
+  assert.equal(graph.diagnostics.length - errors.length, 3,
+               'the autonomous-lane warnings are still there beside the errors');
 
   const subjects = errors.map(d => d.subject).sort();
   assert.deepEqual(subjects, ['/hw/req/drive', '/hw/request/drivetrain']);

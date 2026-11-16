@@ -168,7 +168,7 @@ struct TopicRow {
 enum class TopicHealth {
   OK,
   ORPHANED,     // Subscribed, and nothing in this system publishes it.
-  UNREAD,       // Published, and nothing in this system reads it.
+  UNREAD,       // Published, and nothing in this system reads or observes it.
   BRIDGED,      // The absent end is outside talOS; there is nothing to find.
   UNCONNECTED,  // The absent end is declared optional; absence is the design.
   // A non-latest-only end lost messages (TopicRow::dropped).
@@ -197,7 +197,12 @@ inline const char* HealthName(TopicHealth health) {
 }
 
 inline TopicHealth HealthOf(const TopicRow& row) {
-  if (row.publishers.empty() || row.subscribers.empty()) {
+  // An observer (naming::kSourceFlagObserver, telemetry) reads by design, so
+  // it counts as a reader here exactly as the launcher's "published but nothing
+  // subscribes to it" counts it (names.h, reader_count); it counts for nothing
+  // else, and stays listed apart from subscribers.
+  const bool read = !row.subscribers.empty() || !row.observers.empty();
+  if (row.publishers.empty() || !read) {
     // A missing end is a fault only when both ends were meant to be here.
     // EXTERNAL is checked first because it is the more specific statement: it
     // says where the far end actually is, not merely that it may be absent.

@@ -232,6 +232,16 @@ test('topic health names the fault, worst first', () => {
   assert.equal(topicHealth(row({subscribers: [], dropped: '3'})), 'unread');
 });
 
+// REQ-CONTRACT-09
+test('an observed topic is read, as the launcher\'s lint counts it', () => {
+  // The lint's "published but nothing subscribes to it" counts observers
+  // (telemetry) as readers; a badge that did not would name a topic the
+  // launcher no longer names.
+  assert.equal(
+      topicHealth(healthRow({subscribers: [], observers: ['telemetry']})), 'ok');
+  assert.equal(topicHealth(healthRow({subscribers: [], observers: []})), 'unread');
+});
+
 test('a graph too old to carry endpoint attributes is read, and marked as such',
      () => {
        // The version is how a reader knows whether "not external" was stated or

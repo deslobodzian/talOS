@@ -275,6 +275,20 @@ test('the attention list flags real orphans and leaves the design alone', () => 
   assert.ok(html.includes('/shooter/target/teleop'));
 });
 
+// REQ-CONTRACT-09
+test('the attention list calls no topic unread that only telemetry observes',
+     () => {
+       // No declared graph, so every note here is the panel's own. Telemetry
+       // alone observes /pose_estimator/state; nothing reads or observes
+       // /talos/telemetry.
+       const html = renderPanel(healthPanel, state(false));
+       assert.ok(
+           !html.includes('/pose_estimator/state is published but nobody reads it'),
+           'an observed topic was called unread');
+       assert.ok(html.includes('/talos/telemetry is published but nobody reads it'),
+                 'a topic nobody reads or observes was not called unread');
+     });
+
 const workspaceCallbacks: WorkspaceCallbacks = {
   onSplit() {}, onClose() {}, onSwitch() {}, onConfig() {}, onResize() {},
   onMaximize() {}, onFocusPanel() {}

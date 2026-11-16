@@ -646,23 +646,8 @@
     },
     {
       "severity": "warning",
-      "subject": "/intake/state",
-      "message": "is published but nothing subscribes to it"
-    },
-    {
-      "severity": "warning",
-      "subject": "/pose_estimator/state",
-      "message": "is published but nothing subscribes to it"
-    },
-    {
-      "severity": "warning",
       "subject": "/shooter/target/auto",
       "message": "is in the target policy of shooter but nothing writes it yet"
-    },
-    {
-      "severity": "warning",
-      "subject": "/shooter/state",
-      "message": "is published but nothing subscribes to it"
     }
   ]
 }
