@@ -26,9 +26,9 @@
 # without target coverage required, and into new_robot --standalone's copy
 # of it, then `bazel test //...` in each), robot-repository (when TALOS_ROBOT_REPOSITORY
 # names a robot repository's checkout: tools/check_robot_repository.sh on
-# it; unset, one `skipped` line that does not fail the run; set to a path
-# that is not a directory, the step FAILED, since it names no robot
-# repository),
+# it; unset, one `skipped` line that does not fail the run; set, empty
+# included, to something that is not a directory, the step FAILED, since it
+# names no robot repository; tools/prepush_robot_repository.sh decides),
 # checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
 # --offline`, for controller_processor/ and talOS/, whose headers
 # the RoboRIO program's build.gradle exports) and studio-test and
@@ -78,6 +78,8 @@ while [ $# -gt 0 ]; do
 done
 
 tools="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=tools/prepush_robot_repository.sh
+. "$tools/prepush_robot_repository.sh" || die "cannot read prepush_robot_repository.sh"
 repo="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not in a git checkout"
 commit="$(git -C "$repo" rev-parse --verify --quiet "$ref^{commit}")" ||
   die "not a commit: $ref"
@@ -274,21 +276,24 @@ fi
 # checkout), built and tested against this commit's talOS in a copy of its
 # committed tree; only read there. Until such a repository has CI of its
 # own, this is the only check of it against a talOS change.
-if [ -z "${TALOS_ROBOT_REPOSITORY:-}" ]; then
-  report "robot-repository skipped (TALOS_ROBOT_REPOSITORY unset)"
-elif ! robot_repository="$(cd "$TALOS_ROBOT_REPOSITORY" 2>/dev/null && pwd -P)"; then
-  # Set, it asks for the check; a path that names no checkout is a failure,
-  # not a skip.
-  report "robot-repository FAILED (TALOS_ROBOT_REPOSITORY names no robot repository: $TALOS_ROBOT_REPOSITORY is not a directory)"
-  failed=1
-elif [ ! -f "$wt/tools/check_robot_repository.sh" ]; then
-  skip robot-repository "this commit has no tools/check_robot_repository.sh"
-else
-  run_step robot-repository env "TMPDIR=$tmp" \
-    bash tools/check_robot_repository.sh "$robot_repository" \
-    --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
-    true
-fi
+robot_repository="$(robot_repository_decision)"
+case $? in
+  0)
+    if [ ! -f "$wt/tools/check_robot_repository.sh" ]; then
+      skip robot-repository "this commit has no tools/check_robot_repository.sh"
+    else
+      run_step robot-repository env "TMPDIR=$tmp" \
+        bash tools/check_robot_repository.sh "$robot_repository" \
+        --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
+        true
+    fi
+    ;;
+  1) report "robot-repository skipped ($robot_repository)" ;;
+  *)
+    report "robot-repository FAILED ($robot_repository)"
+    failed=1
+    ;;
+esac
 run_step checkout-unchanged sh -c \
   'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||
   true
