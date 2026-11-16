@@ -869,8 +869,11 @@ the reported voltage as its motor supply: a duty-cycle demand applies that
 fraction of it (0.5 is 6.4 V at rest), while voltage and closed-loop modes are
 clamped to `max_voltage` (12 V when unset) and the motor models keep their 12 V
 free-speed and stall ratings. Health is observable while disabled
-or without a live command. On the real backend, neutral disables PWM pulses
-(`PWM::SetDisabled`) rather than commanding servo centre, and de-energizes DIO.
+or without a live command. On the real backend, the gateway's own neutral (disabled, expired command,
+watchdog) disables PWM pulses (`PWM::SetDisabled`) and de-energizes DIO. A PWM
+output that a node did not set, or that the bridge neutralized for a silent
+owner, while the robot stays enabled is commanded 0 instead (`SetSpeed(0)`, a
+1.5 ms pulse): neutral for a motor controller, centre for a servo.
 
 | | Ideal (`SimBackend`) | Physics-backed (`sim::PhysicsSimBackend`) |
 |---|---|---|
