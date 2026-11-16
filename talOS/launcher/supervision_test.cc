@@ -875,7 +875,8 @@ TEST(Supervision, AnEarlierRunsActiveRowIsNotTheRunsRow) {
     introspect::RegistryMapping mapping;
     // Claims a row here and hands it to alpha's pid: the registration no
     // longer owns it, so its destructor leaves it active. A claim takes the
-    // first free row, so the earlier run's comes first.
+    // lowest free row whose heartbeat is old (never used, here), so the
+    // earlier run's comes first.
     const auto plant = [&](int64_t heartbeat, uint64_t wake_failures) {
       const introspect::NodeRegistration registration{
           {"alpha", "//example/alpha:node", session_id, 0}};

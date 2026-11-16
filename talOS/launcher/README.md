@@ -636,9 +636,10 @@ whether it records on, deleting its oldest records, or stopped, which it
 tells by the segments beside the log), and one per run whose log has a gap
 (`[launcher] <member> event log <log> lost records (a gap)`); it reads the
 row in each supervision pass and once more when it reaps the run, from the
-row the run left (which no other claim takes while another row is free),
-so a run killed during a gap is marked too, once a sample of its row (every
-250 ms, from a node and from the bridge) has shown the gap. It marks the
+row the run left, so a run killed during a gap is marked too, once a
+sample of its row (every 250 ms, from a node and from the bridge) has shown
+the gap, unless a restart storm reused that row first
+([session manifest](#session-manifest)). It marks the
 member in the live manifest: `recorder_failed` for a failed
 log, `log_gap` and `recorder_failed` for one with a gap (a gapped log is
 incomplete evidence), `log_capped` for one whose byte share cost it records
@@ -927,10 +928,14 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   included (the pass stops reading rows for liveness then), unless another
   process claims the row it released before the launcher reaps it: the
   run's values are then what the last supervision pass read, and an
-  increase in its final sample is lost. A claim takes a row released in the
-  last five seconds only when no other row is free
-  ([claiming a slot](../introspection/README.md#claiming-a-slot-and-liveness)),
-  so that needs every other row of the registry's 32 taken. The node's fields sum every run, dropped ones included, and
+  increase in its final sample is lost (its event log flags too, so a run
+  killed during a log gap is then not marked `log_gap`). A claim takes a
+  row released in the last five seconds only when every other of the
+  registry's 32 rows is held or was released after it
+  ([claiming a slot](../introspection/README.md#claiming-a-slot-and-liveness)):
+  in a restart storm, where held rows plus rows released in the last five
+  seconds reach 32 before the launcher reaps a run, that run's row can be
+  reused first. The node's fields sum every run, dropped ones included, and
   `requests_skipped_by_subsystem` splits the bridge's `requests_skipped` by
   the subsystem whose `/hw/request/<subsystem>` it passed over (only
   nonzero ones). A run, or a node, whose row was never seen (a spawn that

@@ -232,10 +232,14 @@ so an overrunning loop is visible even while its dispatch count keeps moving.
 A slot is FREE, CLAIMING or ACTIVE. `NodeRegistration` holds the same kernel
 lock from the stale-slot sweep through the claim's ACTIVE commit. It takes a
 FREE slot and writes identity, counts, heartbeat and generation before
-release-storing ACTIVE. A FREE slot whose heartbeat is younger than
-`kLivenessTimeout`, one its owner released moments ago, is taken only when no
-other is free: it keeps that run's last sample, delivery loss and event log
-flags included, until the launcher reaps the run and reads it. A claimant killed at any instruction before this
+release-storing ACTIVE. Of the FREE slots it takes the lowest whose
+heartbeat is at least `kLivenessTimeout` old (never used, swept, or released
+long ago), and failing that the one with the oldest heartbeat, the one
+released longest ago: a released row keeps its run's last sample, delivery
+loss and event log flags included, for the launcher's reap, and this order
+overwrites a recently released row only when every other slot is held or
+was released after it ([the limit](../launcher/README.md#session-manifest)).
+A claimant killed at any instruction before this
 commit cannot keep the lock held. Any CLAIMING slot observed by the next sweep
 under the lock is therefore abandoned, and is freed immediately, even if the
 claimant died before recording a pid or heartbeat. This also recovers a sweeper
@@ -262,8 +266,8 @@ count can see the records it describes.
 
 A registration releases its slot in its destructor, so a clean shutdown leaves
 no ghost row and a viewer sees the node disappear immediately. The released
-slot keeps its last sample, sources and wake counters included, until the
-next claim clears it: the launcher reads a reaped run's final
+slot keeps its last sample, sources and wake counters included, until a
+claim takes it (in the order above): the launcher reads a reaped run's final
 [wake loss](#wake-loss) there. A node that is
 killed leaves its slot ACTIVE until the next claim, or until the heartbeat goes
 stale; a crash-looping roster therefore cannot fill the registry.
