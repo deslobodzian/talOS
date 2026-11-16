@@ -105,6 +105,90 @@ class InstallCheckTest(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
                              [os.path.basename(good)], out)
 
+    def simulation_only(self, bundle):
+        """Makes the copy at `bundle`'s config `[robot] simulation_only`,
+        a graph --describe-only accepts and a launch without --sim (the
+        boot service's) refuses."""
+        robot = os.path.join(bundle, os.path.dirname(self.config),
+                             "robot.toml")
+        with open(robot, encoding="utf-8") as f:
+            text = f.read()
+        self.assertTrue(text.startswith("[robot]\n"), text)
+        os.chmod(robot, 0o644)
+        with open(robot, "w", encoding="utf-8") as f:
+            f.write(text.replace("[robot]\n",
+                                 "[robot]\nsimulation_only = true\n", 1))
+
+    def setUp(self):
+        self.src = runfiles.Create().Rlocation(
+            "_main/bench/main_processor/bench_bundle")
+        with open(os.path.join(self.src, "bundle_manifest.toml"), "rb") as f:
+            self.config = tomllib.load(f)["config_path"]
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def deploy(self, *args, prefix=None):
+        return subprocess.run(
+            ["bash", deploy_script(), *args, "--prefix",
+             prefix or os.path.join(self.tmp, "prefix"), "--no-warm-up"],
+            capture_output=True, text=True, timeout=120)
+
+    # REQ-OPS-50, REQ-SAFE-40: install and rollback judge the bundle as the
+    # boot service will launch it, without --sim, so a simulation-only
+    # config, which --describe-only alone accepts, is refused with the
+    # launcher's reason and selects nothing.
+    def test_install_and_rollback_refuse_a_simulation_only_config(self):
+        prefix = os.path.join(self.tmp, "prefix")
+        current = os.path.join(prefix, "current")
+        previous = os.path.join(prefix, "previous")
+        reason = "sets [robot] simulation_only = true"
+        simulation = os.path.join(self.tmp, "simulation")
+        shutil.copytree(self.src, simulation)
+        self.simulation_only(simulation)
+        proc = self.deploy("install", simulation)
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn(reason, out)
+        self.assertIn(f"{simulation} not installed", out)
+        self.assertFalse(os.path.lexists(current), out)
+        # rollback's check of `previous`, made simulation-only after its
+        # install (as a deploy.sh without this check would have let it in).
+        for _ in range(2):
+            proc = self.deploy("install", self.src)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        old, new = os.readlink(previous), os.readlink(current)
+        self.simulation_only(os.path.join(prefix, old))
+        proc = self.deploy("rollback")
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn(reason, out)
+        self.assertEqual(os.readlink(current), new, out)
+        self.assertEqual(os.readlink(previous), old, out)
+
+    # REQ-OPS-50: deploy.sh runs the bundle's own launcher, which may
+    # predate --describe-as-launch (a rollback to a bundle built before
+    # it). Its unknown-argument refusal is not taken for the bundle's: the
+    # check runs again with --describe-only alone and says what it did not
+    # check, and the bundle installs.
+    def test_a_launcher_without_describe_as_launch_is_checked_without_it(self):
+        old = os.path.join(self.tmp, "old")
+        shutil.copytree(self.src, old)
+        launcher = os.path.join(old, "launcher")
+        os.rename(launcher, launcher + ".real")
+        with open(launcher, "w", encoding="utf-8") as f:
+            f.write('#!/usr/bin/env bash\nfor arg in "$@"; do\n'
+                    '  if [ "$arg" = --describe-as-launch ]; then\n'
+                    '    echo "launcher error: unknown argument: $arg" >&2\n'
+                    '    exit 1\n  fi\ndone\n'
+                    'exec "$(dirname "$0")/launcher.real" "$@"\n')
+        os.chmod(launcher, 0o755)
+        proc = self.deploy("install", old)
+        out = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("predates --describe-as-launch", proc.stderr)
+        self.assertIn("the launcher accepts the graph", proc.stdout)
+
     # REQ-OPS-48: an installed bundle runs from its installed files alone.
     # A bundle whose files link into a build tree (Bazel's sandbox stages a
     # test's runfiles so; a bundle copied with its links) must not install

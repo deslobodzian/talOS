@@ -1420,18 +1420,27 @@ TEST(LauncherGraphTest, ASimulatorPortWrittenByHandIsRefusedBeforeAnyProbe) {
 // a simulation config that includes the deployable fixture) runs only with
 // --sim. Without it the launch is refused before any member is probed or
 // spawned and before any session directory exists; with --sim it runs, and
-// --describe-only, which touches no hardware, lints it.
-// REQ-SAFE-40
+// --describe-only, which touches no hardware, lints it. --describe-as-launch
+// makes --describe-only refuse it as the launch would (deploy.sh's install
+// check, which judges what the boot service will start), and is refused
+// without --describe-only, where it would start the roster.
+// REQ-SAFE-40, REQ-OPS-50
 TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
   struct Row {
     const char* name;
     bool simulation;
     bool describe_only;
+    bool as_launch;
     bool refused;
   };
   for (const Row row :
-       {Row{"launch", false, false, true}, Row{"--sim", true, false, false},
-        Row{"--describe-only", false, true, false}}) {
+       {Row{"launch", false, false, false, true},
+        Row{"--sim", true, false, false, false},
+        Row{"--describe-only", false, true, false, false},
+        Row{"--describe-only --describe-as-launch", false, true, true, true},
+        Row{"--sim --describe-only --describe-as-launch", true, true, true,
+            false},
+        Row{"--sim --describe-as-launch", true, false, true, true}}) {
     SCOPED_TRACE(row.name);
     const std::string invoked = TempPath("simulation_only_invoked");
     ::remove(invoked.c_str());
@@ -1449,6 +1458,7 @@ TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
     fixture.options.config_path = sim_config;
     fixture.options.simulation = row.simulation;
     fixture.options.describe_only = row.describe_only;
+    fixture.options.describe_as_launch = row.as_launch;
 
     EXPECT_EQ(Launcher{fixture.options}.Run(), row.refused ? 1 : 0);
     EXPECT_EQ(std::filesystem::exists(invoked), !row.refused)

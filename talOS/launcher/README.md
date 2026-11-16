@@ -77,6 +77,25 @@ once, and each probe's or the replayed node's guardian kills its group.
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
 
+`--describe-only` judges the graph, not whether this launch could start: it
+takes none of the refusals a launch makes before its probes that depend on
+the launch's own flags or on the host. `--describe-as-launch`, accepted only
+with `--describe-only` (alone it would start the roster, and is refused
+before the config is read), adds those that need nothing a running session
+holds; `deploy.sh`'s [graph check](../../docs/DEPLOYMENT.md#graph-check)
+passes it. Of a launch's refusals before its probes:
+
+| Refusal | `--describe-only` | with `--describe-as-launch` |
+|---|---|---|
+| `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; `--sim` with a remote other than `127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
+| [`[robot] simulation_only`](#lightweight-simulation-gateway) without `--sim` | accepted | refused |
+| the [session lock](#one-session-per-namespace) held by another launch | not checked | not checked: it is held by the session a check runs beside |
+| the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared or has no room | not checked | not checked: it is shared memory, and its rows are the running session's |
+
+A port the bridges bind is not checked either way: it is bound only by a
+member that has started (the hardware bridge's link, the Studio bridge's
+HTTP server).
+
 `--allow-graph-errors` overrides graph-error refusal, and the refusal of a
 [live endpoint mismatch](#live-endpoints), but not the refusal of a misnamed
 roster member ([node output](#node-output)). Missing descriptions cannot create
@@ -326,7 +345,8 @@ loading the config, before anything is probed or spawned:
     launcher: /path/robot_sim.toml sets [robot] simulation_only = true; run it with --sim (or --describe-only); nothing was started
 
 `--describe-only` and `--replay-inputs`, which touch no hardware, still run
-it. The key passes through `include` like every `[robot]` key, so a
+it, except `--describe-only --describe-as-launch`, which refuses it as the
+launch would ([two phases](#two-phases)). The key passes through `include` like every `[robot]` key, so a
 simulation config that includes `robot.toml` sets it in its own `[robot]`;
 config load refuses a file that sets it `false` over an included file that
 sets it `true`, naming both files.

@@ -127,6 +127,11 @@ struct LauncherOptions {
 
   // Probe and lint without spawning anything, as a pre-flight check.
   bool describe_only{false};
+  // With `describe_only`: also make the refusals a launch with the same
+  // options makes before it probes, those that need no lock, shared memory,
+  // socket or process (Launcher::RunSession). Launcher::Run refuses it
+  // without `describe_only`.
+  bool describe_as_launch{false};
 
   // Input replay: run only `only`, fed the topics the session in this
   // directory logged (talOS/events/input_replay.h), and nothing else.
