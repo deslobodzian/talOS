@@ -13,7 +13,11 @@
 #   --skip-gradle  do not run the RoboRIO program's gradle checks
 #   --skip-studio  do not run Studio's pnpm checks
 #
-# Steps, in order: read-only, `bazel build //...`, host-includes, `bazel test
+# Steps, in order: read-only, source-lints (tools/source_lints.sh, the
+# lints CI's "Source lints (no Bazel)" job runs: test time, links,
+# requirement trace, node test matrix; under a second; a commit without the
+# script prints `source-lints skipped`, which does not fail the run),
+# `bazel build //...`, host-includes, `bazel test
 # --nocache_test_results //...`, then, when the commits to push
 # (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
 # upstream) touch MODULE.bazel, REPO.bazel, third_party/, talOS/, tools/ or
@@ -184,6 +188,14 @@ run_step read-only python3 "$tools/make_sources_read_only.py" || {
   echo "prepush: cannot make the worktree read-only; stopping"
   exit 1
 }
+
+# CI's source lints, from the commit's own script (CI runs the same one).
+# A commit from before the script has none to run.
+if [ -f "$wt/tools/source_lints.sh" ]; then
+  run_step source-lints bash tools/source_lints.sh || true
+else
+  report "source-lints skipped (this commit has no tools/source_lints.sh)"
+fi
 
 bazel_started=1
 # A compile that hits the disk cache leaves no `.d` file on disk under

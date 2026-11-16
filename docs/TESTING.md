@@ -220,7 +220,7 @@ Every node gets a `Sim`/`SimHardware` (C++) or `talos.testing` (Python) test
 file with these cases, under these names (Python: `test_<snake_case>`).
 `bazel run //tools:check_node_matrix -- [PATH...]` reports each node test's
 cases as present, n/a, parity (below) or missing and fails on a missing one. **[enforced:
-the CI lint job runs it with `--baseline tools/check_node_matrix_baseline.txt`,
+the CI lint job and `tools/prepush.sh` run it (`tools/source_lints.sh`) with `--baseline tools/check_node_matrix_baseline.txt`,
 a list of known-missing cases that only shrinks and is empty today]**
 
 | # | Case | Arrange | Expect |
@@ -431,7 +431,9 @@ compiles against a workstation's installed package and fails in CI
 (`tools/check_host_includes.py` reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
-them.
+them. CI's source lints (test time, links, requirement trace, node test
+matrix) are one script, `tools/source_lints.sh`, which CI's lint job and
+prepush's `source-lints` step both run.
 
 No CI builds a robot repository that consumes talOS against a talOS change
 while that repository has no CI of its own. The check runs on the
