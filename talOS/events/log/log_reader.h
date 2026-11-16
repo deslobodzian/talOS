@@ -150,6 +150,8 @@ class LogReader {
   const Manifest& manifest() const noexcept { return manifest_; }
   MonotonicTime start_time() const noexcept { return start_time_; }
   std::string process_name() const { return process_name_; }
+  // The path it was opened with, as given.
+  const std::string& path() const noexcept { return path_; }
   std::int64_t start_wall_ns() const noexcept { return start_wall_ns_; }
   std::uint32_t format_version() const noexcept { return format_version_; }
   std::uint64_t session_id() const noexcept { return session_id_; }
@@ -176,6 +178,7 @@ class LogReader {
   std::size_t gaps() const noexcept { return gaps_; }
 
  private:
+  std::string path_;
   std::vector<std::byte> data_;
   std::vector<std::byte> payload_;  // zero-filled copy of the last payload
   Manifest manifest_;

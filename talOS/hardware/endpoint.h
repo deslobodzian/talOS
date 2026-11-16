@@ -22,6 +22,14 @@ struct PeerContact {
   uint16_t mismatched_version{};
 };
 
+// The newest command the last Tick decoded, accepted or not; present is
+// false when it decoded none.
+struct DrainedCommand {
+  bool present{false};
+  bool accepted{false};
+  uint64_t observed_time_us{0};  // gateway clock
+};
+
 // The same endpoint runs under WPILib on RoboRIO and under a future platform
 // adapter on SystemCore. Each Tick has a bounded receive budget.
 class Endpoint {
@@ -165,7 +173,12 @@ class Endpoint {
         command_sequence = frame.header.sequence;
       }
     }
-    if (have_command) gateway_.Accept(newest, command_sequence, now_us);
+    drained_ = {};
+    if (have_command) {
+      drained_.present = true;
+      drained_.observed_time_us = newest.observed_time_us;
+      drained_.accepted = gateway_.Accept(newest, command_sequence, now_us);
+    }
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
     const auto size = Encode(state, buffer_);
@@ -173,6 +186,10 @@ class Endpoint {
                 size);
   }
   const PeerContact& peer_contact() const { return contact_; }
+  // The RoboRIO ages its observation on its own clock (REQ-RT-25):
+  // observed_time_us is the sample_time_us of the State the command was
+  // built from, which this gateway stamped.
+  const DrainedCommand& drained() const { return drained_; }
   // Payload-agnostic passthrough for frames this endpoint does not own, so
   // their encoding stays with the caller rather than in the gateway layer.
   protocol::UdpStatus SendFrame(protocol::FrameType type, uint64_t now_us,
@@ -195,6 +212,7 @@ class Endpoint {
   static constexpr int kReceiveBudget = 64;
   bool send_enabled_{true};
   PeerContact contact_;
+  DrainedCommand drained_;
   uint64_t pending_probe_time_us_{};
   Gateway& gateway_;
   protocol::RuntimeUdpPeer peer_;

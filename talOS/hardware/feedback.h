@@ -46,9 +46,10 @@ inline double CANcoderAbsoluteRot(double rot) {
 }
 
 // Whether any motor or CAN sensor in `state` has a valid sample, or none is
-// configured. False is total feedback loss: the gateway raises
-// kHardwareFault, starts a new epoch (when it was healthy or a command was in
-// force) and holds every output neutral until a sample is valid again.
+// configured. The gateway and testing::SimHardware ask it of the State they
+// publish, after the age bound and their masks; false is total feedback
+// loss: kHardwareFault, a new epoch (when it was healthy or a command was in
+// force) and every output neutral until a published sample is valid again.
 inline bool AnyFeedbackValid(const State& state) {
   if (state.motor_count == 0 && state.sensor_count == 0) return true;
   for (std::size_t i = 0; i < state.motor_count; ++i) {
@@ -64,9 +65,10 @@ inline bool AnyFeedbackValid(const State& state) {
 // motor `i`, as PhoenixBackend widens it: a listed motor, a motor fed by a
 // listed remote CANcoder, and a follower of either. PhoenixBackend::Read
 // reports each such motor invalid from that call until PollRestore completes
-// its restore (a failed device stays invalid until a later one does), so the
-// total-loss judgment above sees it; SimBackend and PhysicsSimBackend do the
-// same. A CANcoder's own sample stays valid while it restores.
+// its restore (a failed device stays invalid until a later one does);
+// SimBackend and PhysicsSimBackend do the same. A CANcoder's own sample stays
+// valid while it restores. The gateway masks the whole chain, the CANcoder
+// included, either way.
 inline bool RestoredWith(std::span<const MotorConfig> motors, std::size_t i,
                          std::span<const uint16_t> ids) {
   const auto listed = [ids](uint16_t id) {

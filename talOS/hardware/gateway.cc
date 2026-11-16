@@ -127,7 +127,10 @@ bool Gateway::Reconfigure(const Config& config) {
     config_error_.reset();
     return true;
   }
-  if (enabled_) return false;
+  if (enabled_) {
+    RecordEnabledRefusal(config);
+    return false;
+  }
   try {
     Validate(config);
   } catch (...) {
@@ -156,7 +159,10 @@ bool Gateway::Reconfigure(const Config& config) {
 bool Gateway::BeginReconfigure(const Config& config) {
   if (configuring_ || restoring_) return false;
   if (configured_ && config == config_) return Reconfigure(config);
-  if (enabled_) return false;
+  if (enabled_) {
+    RecordEnabledRefusal(config);
+    return false;
+  }
   try {
     Validate(config);
   } catch (...) {
@@ -219,6 +225,16 @@ void Gateway::CommitConfiguration(const Config& config) {
   // other devices: nothing is a sample until this one's first Read.
   MarkUnread(state_);
   Invalidate();
+}
+void Gateway::RecordEnabledRefusal(const Config& refused) {
+  uint64_t refused_id = 0;
+  try {
+    refused_id = ConfigurationId(refused);  // validates it first
+  } catch (...) {
+    refused_id = 0;  // one that would not validate has no id
+  }
+  last_enabled_refusal_ = {last_enabled_refusal_.count + 1, refused_id,
+                           configured_ ? state_.config_id : 0};
 }
 void Gateway::Invalidate() {
   active_ = false;
@@ -442,8 +458,9 @@ void Gateway::FindPositionJumps(std::vector<uint16_t>& reset_ids) {
 
 // The backend judged each sample's status, value and isolation; the age bound
 // is the gateway's, the same for every backend. Returns whether any configured
-// motor or CAN sensor still has valid feedback (true with none configured):
-// false is total loss.
+// motor or CAN sensor still has valid feedback (true with none configured)
+// before the gateway's masks: false is total loss already, which Tick acts on
+// before PollResets. Tick judges the State again after the masks.
 bool Gateway::JudgeFeedbackAge() {
   const uint64_t bound = config_.command_timeout_us;
   const auto fresh = [bound](const auto& sample) {
@@ -459,6 +476,20 @@ bool Gateway::JudgeFeedbackAge() {
     sample.valid = sample.valid && fresh(sample);
   }
   return AnyFeedbackValid(state_);
+}
+
+// Total loss is judged on the State as published, the gateway's masks
+// included (an unavailable, restoring or send-failed device, a follower or
+// remote-feedback motor of one, a chain whose restore ends this tick): a
+// reset of every motor and CAN sensor is total loss from the tick that finds
+// it through the tick whose PollRestore ends the restore, whatever Read
+// reported for a restoring device.
+void Gateway::JudgeMaskedLoss(bool was_healthy) {
+  if (healthy_ && !AnyFeedbackValid(state_)) {
+    healthy_ = false;
+    if (was_healthy || active_) Invalidate();
+  }
+  if (!healthy_) outputs_drive_from_ = state_.sample_time_us + 1;
 }
 
 void Gateway::Tick(uint64_t now, bool enabled) {
@@ -499,21 +530,25 @@ void Gateway::Tick(uint64_t now, bool enabled) {
   if (active_ && (now < accepted_at_ || now < observed_at_ ||
                   now - accepted_at_ >= config_.command_timeout_us ||
                   now - observed_at_ >= config_.command_timeout_us)) {
+    last_command_expiry_ = {last_command_expiry_.count + 1, now, observed_at_,
+                            accepted_at_};
     Invalidate();
   }
   state_.sample_time_us = now;
   const bool was_healthy = healthy_;
-  // Judged before PollResets masks anything (Backend::Read).
   const bool read = configured_ && backend_.Read(state_);
   // The slot's place is the gateway's, whatever Read wrote over it.
   state_.health.can_bus_count = buses;
   state_.health.can_bus_index = bus_index;
+  // A failed read pass, or no valid sample in what Read reported: total loss
+  // before any mask, ended here so PollResets applies nothing more.
   healthy_ = configured_ && JudgeFeedbackAge() && read;
   read_us_ = clock_ != nullptr ? std::max(now, clock_()) : now;
   // Total loss starts a new epoch whether or not a command is in force: a
   // request built from a State before it must never drive after it.
   if (!healthy_ && (was_healthy || active_)) Invalidate();
   PollResets();
+  JudgeMaskedLoss(was_healthy);
   // A watchdog stop is not a one-shot: with no accepted command in force,
   // refresh neutral every tick (as disabled/fault do) so a dropped neutral is
   // retried until a fresh command supersedes it.
@@ -560,9 +595,25 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     return false;
   }
   if (fault_ || configuring_ || !healthy_ || mismatched) {
-    if (!superseded_neutral) ++state_.counters.rejected_command_count;
+    // During total loss every node flushes neutral (the State carries the
+    // hardware fault) and the bridge forwards the merge with the loss's own
+    // epoch: refusing that is the gate working too.
+    const bool loss_neutral =
+        !healthy_ && !mismatched && DrivesNothing(c, config_);
+    if (!superseded_neutral && !loss_neutral) {
+      ++state_.counters.rejected_command_count;
+    }
     return false;
   }
+  // Motor `i` may drive on this command only with valid feedback, observed
+  // after the last State in which it could not drive and after the last
+  // State of total loss: a failed read pass is total loss whatever samples
+  // the backend left valid.
+  const auto may_drive = [&](std::size_t i) {
+    return MotorFeedbackValid(config_.motors, state_, i) &&
+           c.observed_time_us >= motor_drives_from_[i] &&
+           c.observed_time_us >= outputs_drive_from_;
+  };
   // Structure errors reject the transaction; range/feedback errors isolate a
   // motor.
   std::array<MotorRequest, kMaxMotors> requests{};
@@ -574,10 +625,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
     requests[i] = r;
-    const bool feedback_valid = MotorFeedbackValid(config_.motors, state_, i) &&
-                                c.observed_time_us >= motor_drives_from_[i];
     const bool invalid =
-        (r.mode != Mode::kNeutral && !feedback_valid) ||
+        (r.mode != Mode::kNeutral && !may_drive(i)) ||
         !std::isfinite(r.demand) || !std::isfinite(r.feedforward_v) ||
         std::abs(r.feedforward_v) > m.max_voltage ||
         (r.mode == Mode::kDutyCycle && std::abs(r.demand) > 1) ||
@@ -601,8 +650,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto master_id = config_.motors[i].master_id;
     if (master_id == 0) continue;
-    const bool valid = MotorFeedbackValid(config_.motors, state_, i) &&
-                       c.observed_time_us >= motor_drives_from_[i];
+    const bool valid = may_drive(i);
     for (std::size_t j = 0; j < c.count; ++j) {
       if (config_.motors[j].id != master_id) continue;
       // Backends follow the master's output only for a non-neutral follower
@@ -638,9 +686,22 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     if (requests[i].mode == Mode::kNeutral && requests[i] != c.motors[i])
       ++state_.counters.neutralized_motor_count;
   }
+  // A command observing a State of total loss drives no output after the
+  // loss clears in its epoch: its motors are held (may_drive), its digital
+  // outputs go false and its PWM outputs off.
+  auto digital_outputs = c.digital_outputs;
+  auto pwm_outputs = c.pwm_outputs;
+  if (c.observed_time_us < outputs_drive_from_) {
+    for (std::size_t i = 0; i < c.digital_output_count; ++i) {
+      digital_outputs[i] = DigitalOutputRequest{digital_outputs[i].id};
+    }
+    for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
+      pwm_outputs[i] = PwmRequest{pwm_outputs[i].id};
+    }
+  }
   if (!ApplyMotors({requests.data(), c.count}) ||
-      !backend_.ApplyOutputs({c.digital_outputs.data(), c.digital_output_count},
-                             {c.pwm_outputs.data(), c.pwm_output_count})) {
+      !backend_.ApplyOutputs({digital_outputs.data(), c.digital_output_count},
+                             {pwm_outputs.data(), c.pwm_output_count})) {
     ++state_.counters.apply_failure_count;
     fault_ = ++consecutive_apply_failures_ >= kConsecutiveApplyFailureLimit;
     Invalidate();
@@ -657,6 +718,8 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   if (IsolateFailedMotors()) {
     MaskUnavailable();
     NeutralUnavailable();
+    // The Endpoint publishes the State as Accept leaves it.
+    JudgeMaskedLoss(true);
   }
   if (active_) consecutive_apply_failures_ = 0;
   return active_;

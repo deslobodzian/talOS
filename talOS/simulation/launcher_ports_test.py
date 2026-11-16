@@ -12,6 +12,7 @@ import unittest
 
 from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
+from talOS.memory.shm_name import shm_name
 
 # Each bounds a hang, not the run (docs/TESTING.md §6): the test waits for
 # the bridge's first accepted State, then stops the session. Together below
@@ -22,18 +23,9 @@ LOG_DUMP_TIMEOUT_S = 10
 # What hardware_node prints on the first State it accepts from a gateway
 # boot (HardwareNode::ReportGatewayBuild); the launcher echoes it.
 FIRST_STATE_LINE = "hardware_node: gateway boot "
-# talOS/introspection/registry.h kRegistryPath. The launcher leaves the
-# registry for later sessions, so the test unlinks its own.
+# talOS/introspection/registry.h kRegistryPath. A launcher killed before it
+# reaps its members leaves the registry, so the test unlinks its own.
 REGISTRY = "/talos_registry.6"
-
-
-def shm_name(topic, namespace):
-    """talos::ShmObjectName (talOS/memory/shared_memory_ptr.h)."""
-    mapped = "/" + topic.lstrip("/").replace("/", ".")
-    value = 0xCBF29CE484222325
-    for byte in namespace.encode() + b"\0" + mapped.encode():
-        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return f"/~{value:016x}"
 
 
 def unlink_registry(namespace):

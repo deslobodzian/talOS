@@ -2,11 +2,12 @@
 // namespace, for talos_sim_test (contract.bzl, sim_check.py) after its
 // session ends.
 //
-// The launcher leaves the registry for later sessions (RegistryMapping), so
-// each test that launches a session would otherwise leave one segment in
-// /dev/shm. Bazel's TEST_TMPDIR is the namespace (ShmObjectName), unique to
-// the test target and inherited by every process the test starts, so this
-// removes only what that test's sessions created. The name comes from
+// A namespaced launcher session removes the registry only when no row of
+// another session remains (NamespaceNames, launcher.cc), and nodes a test
+// runs outside a launcher register too, so a test could otherwise leave one
+// segment in /dev/shm. Bazel's TEST_TMPDIR is the namespace (ShmObjectName),
+// unique to the test target and inherited by every process the test starts, so
+// this removes only what that test's sessions created. The name comes from
 // ShmObjectName itself, so no copy of the mapping exists outside C++. When
 // the name is not namespaced (neither TALOS_SHM_NAMESPACE nor TEST_TMPDIR
 // set, or TALOS_SHM_NAMESPACE set and empty) it is the production registry,

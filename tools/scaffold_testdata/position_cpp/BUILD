@@ -45,11 +45,9 @@ cc_test(
         "testdata/neighbor.toml",
         "testdata/position_cpp.toml",
         "testdata/robot.toml",
-        ":node",
     ],
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-        "TALOS_TEST_NODE": "$(rlocationpath :node)",
     },
     deps = [
         ":position_cpp",

@@ -150,6 +150,11 @@ class Reporter {
     std::chrono::milliseconds period{kRefreshPeriod};
 
     std::string registry_path{kRegistryPath};
+
+    // Tests only: false leaves the event log flags to the writer (its
+    // LogWriterOptions::gap_flags), so a test can tell the writer's bit
+    // from a sample's copy. True otherwise.
+    bool copy_recording{true};
   };
 
   explicit Reporter(Options options) : options_{std::move(options)} {
@@ -250,6 +255,13 @@ class Reporter {
     return wakeups_.load(std::memory_order_relaxed);
   }
 
+  // The row's `flags` word and generation (NodeRegistration::flags_word()),
+  // all null without a row. Valid while this Reporter lives.
+  NodeRegistration::FlagsWord row_flags() {
+    return registration_ ? registration_->flags_word()
+                         : NodeRegistration::FlagsWord{};
+  }
+
   const std::string& error() const { return error_; }
 
  private:
@@ -328,9 +340,11 @@ class Reporter {
                     loop.recorder().capped();
                     loop.recorder().gaps();
                   }) {
-      registration.set_recording(loop.recorder().failed(),
-                                 loop.recorder().capped(),
-                                 loop.recorder().gaps() > 0);
+      if (options_.copy_recording) {
+        registration.set_recording(loop.recorder().failed(),
+                                   loop.recorder().capped(),
+                                   loop.recorder().gaps() > 0);
+      }
     }
 
     const event::SourceCounters* counters = loop.source_counters();

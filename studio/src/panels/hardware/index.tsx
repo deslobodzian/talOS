@@ -303,7 +303,7 @@ function HardwarePanel() {
     <section className="card">
       <div className="card-heading"><h2>Link</h2><span>HW/STATUS</span></div>
       <StatList>
-        <Stat label="Configured" channel={`${HW}configured`} tone={configured === false ? 'warn' : undefined}>
+        <Stat label="Config acknowledged" channel={`${HW}configured`} tone={configured === false ? 'warn' : undefined}>
           {configured === undefined ? '—' : configured ? 'yes' : 'no'}
         </Stat>
         <Stat label="Subsystems" channel={`${HW}subsystem_count`}>

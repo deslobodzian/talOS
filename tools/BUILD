@@ -47,7 +47,7 @@ py_test(
     # Its only instrumented code is the configuration resolver, which it
     # starts about 70 times (three per scaffold's plan). Under TSan on the
     # hosted macOS runner each start costs most of a second, past the small
-    # timeout (TODO.md CI-10); plain it takes 0.2 s. The resolver starts no
+    # timeout; plain it takes 0.2 s. The resolver starts no
     # thread; its library runs under TSan in //talOS/configuration:test and
     # :config_fuzz_test.
     tags = ["no_tsan"],  # ~70 resolver starts; single-threaded; see above
@@ -141,8 +141,45 @@ py_test(
     ],
     deps = [
         ":sync_manifest_lib",
+        "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],
+)
+
+# A scaffolded node's binary replays its own logged simulated run without
+# divergence: one target per language, so the generated node tests spawn no
+# binary.
+py_test(
+    name = "scaffold_replay_cc_test",
+    size = "small",
+    srcs = ["scaffold_replay_test.py"],
+    data = [
+        "//tools/scaffold_testdata/gripper:golden",
+        "//tools/scaffold_testdata/gripper:node",
+    ],
+    env = {"NODE_BINARY": "$(rlocationpath //tools/scaffold_testdata/gripper:node)"},
+    legacy_create_init = False,
+    main = "scaffold_replay_test.py",
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "scaffold_replay_py_test",
+    size = "small",
+    srcs = ["scaffold_replay_test.py"],
+    data = [
+        "//tools/scaffold_testdata/scaffold_py:golden",
+        "//tools/scaffold_testdata/scaffold_py:node",
+    ],
+    env = {"NODE_BINARY": "$(rlocationpath //tools/scaffold_testdata/scaffold_py:node)"},
+    legacy_create_init = False,
+    main = "scaffold_replay_test.py",
+    # The node's ctypes host cannot initialize sanitizer runtimes.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = ["@rules_python//python/runfiles"],
 )
 
 # ./sim.sh --config: which file a path names, and its refusals (missing,

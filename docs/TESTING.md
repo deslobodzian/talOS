@@ -179,7 +179,8 @@ Where RULES.md 12 is read too broadly or too narrowly:
    never sleep, read `steady_clock::now` or `time.time`, or wait on a real
    timer. Nodes use `node.now()`; `Sim` owns time. **[enforced:
    `tools/lint_test_time.py` over every test source; a test of a higher tier
-   that uses the real clock is listed with its reason in
+   that uses the real clock is listed with its reason and its number of
+   hit lines, which may only shrink, in
    `tools/lint_test_time_allowlist.txt`]**
 2. **Logic with a deadline takes its clock as a parameter**, so the policy
    (supervision deadlines, restart windows, retry intervals) is a component
@@ -257,8 +258,10 @@ actuator; a Python package that only wraps C++ nodes (`talos.cpp_node`) is
 checked in its C++ package. A package whose node rules all set
 `testonly = True` is a test fixture, such as the bundle test's
 `bench/main_processor/bundle_testdata`: no robot's bundle can carry it
-(Bazel refuses a target that is not testonly depending on one), so the lint
-skips it with a `[fixture]` row.
+(Bazel refuses a target that is not testonly depending on one, and
+`deploy.sh install` refuses a testonly bundle outside a Bazel test,
+[DEPLOYMENT.md](DEPLOYMENT.md#on-the-main-processor)), so the lint skips it
+with a `[fixture]` row.
 
 A node implemented in both languages (a C++ class and a Python class, not a
 `talos.cpp_node` wrapper) carries the full matrix in its C++ test. Its
@@ -270,8 +273,12 @@ topic byte for byte, and each listed output requested and applied, at every
 tick of every step (each boundary of the node's period on the Sim clock,
 one simulated instant on both sides) and at each step's end, so a
 divergence that converges again within a step still fails. The lint accepts a claim only when the file calls
-`assert_same_behaviour`, the C++ file has that case as a test, and every
-named step is a step of the scenario that call is given. Whether a named
+`assert_same_behaviour` outside a skipped test (no skip decorator on the
+test or its class, no `skipTest` in it), the C++ file has that case as a
+test, and every named step is a step of the scenario that call is given
+(a list literal, or the list a name is assigned where Python resolves it
+from the call: the calling function, an enclosing one, the module); a call
+whose scenario is built otherwise counts no steps. Whether a named
 step exercises its case the lint cannot check: that is a review item
 **[review]**. The scenario includes a Driver Station mode change (teleop, disabled, autonomous, teleop) with targets
 stamped under each earlier generation. Cases 9 and 12 cannot be claimed (a
@@ -428,14 +435,17 @@ copy contents, `shutil.copyfile`), test results never cached from an
 earlier run, and no host package headers: Bazel's autodetected toolchain
 searches `/usr/include`, so an include that no declared dependency provides
 compiles against a workstation's installed package and fails in CI
-(`tools/check_host_includes.py` reads the build's `.d` files for it).
+(`tools/check_host_includes.py`, which CI's Linux job runs after its
+build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
 matrix) are one script, `tools/source_lints.sh`, which CI's lint job and
 prepush's `source-lints` step both run; CI's sanitizer jobs are
 `tools/sanitizer_lane.sh asan|tsan`, which `tools/prepush.sh --full` also
-runs. Prepush also runs CI's RoboRIO-in-the-loop check, and under `--full`
+runs. Prepush also runs CI's clang-format and clang-tidy checks
+(`tools/format.sh`, `tools/tidy.sh`, which says when this host cannot run
+it), CI's RoboRIO-in-the-loop check, and under `--full`
 a short soak seed; when each runs, and the more-than-20-commits rule for
 `--full`, are in [DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder).
 

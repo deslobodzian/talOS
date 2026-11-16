@@ -722,6 +722,68 @@ ReadBack ReadAll(const std::string& path, bool windowed) {
   return back;
 }
 
+// A session merge (log_dump, session_report, Studio's review) holds a
+// WindowedLogReader per log at once: readers of more logs than the
+// descriptor limit all open and read, interleaved, exactly what each log
+// holds, since a reader holds a descriptor only while it reads.
+// REQ-OPS-15
+TEST(WindowedLogReaderLimits, MoreReadersThanTheDescriptorLimit) {
+  const std::string source = TempPath("fd_limit_source");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(source, LogWriter::kDefaultBufferBytes);
+  constexpr std::size_t kSpare = 4;
+  constexpr std::size_t kLogs = 4 * kSpare;
+  std::vector<std::string> paths;
+  for (std::size_t i = 0; i < kLogs; ++i) {
+    paths.push_back(TempPath("fd_limit_" + std::to_string(i)));
+    std::filesystem::copy_file(
+        source, paths.back(),
+        std::filesystem::copy_options::overwrite_existing);
+  }
+  // At most kSpare descriptors are free below the lowered limit.
+  std::size_t open_now = 0;
+  for (const auto& entry : std::filesystem::directory_iterator{"/dev/fd"}) {
+    (void)entry;
+    ++open_now;
+  }
+  rlimit saved{};
+  ASSERT_EQ(0, ::getrlimit(RLIMIT_NOFILE, &saved));
+  rlimit lowered = saved;
+  lowered.rlim_cur =
+      static_cast<rlim_t>(open_now) + static_cast<rlim_t>(kSpare);
+  ASSERT_EQ(0, ::setrlimit(RLIMIT_NOFILE, &lowered));
+  std::vector<std::vector<ReadBack::Read>> got(kLogs);
+  std::string error;
+  try {
+    std::vector<WindowedLogReader> readers;
+    readers.reserve(kLogs);
+    for (const std::string& path : paths) readers.emplace_back(path);
+    LogReader::Record record;
+    for (bool more = true; more;) {
+      more = false;
+      for (std::size_t i = 0; i < kLogs; ++i) {
+        if (!readers[i].next(record)) continue;
+        more = true;
+        got[i].push_back(
+            {record.header, {record.payload.begin(), record.payload.end()}});
+      }
+    }
+  } catch (const std::exception& e) {
+    error = e.what();
+  }
+  ASSERT_EQ(0, ::setrlimit(RLIMIT_NOFILE, &saved));
+  EXPECT_EQ(error, "");
+  for (std::size_t i = 0; i < kLogs; ++i) {
+    SCOPED_TRACE(i);
+    ASSERT_EQ(got[i].size(), expected.size());
+    for (std::size_t r = 0; r < expected.size(); ++r) {
+      ExpectRecordEquals(expected[r], got[i][r].view());
+    }
+    ::unlink(paths[i].c_str());
+  }
+  ::unlink(source.c_str());
+}
+
 // Where the fixture's record of `kind` in dispatch `dispatch` is.
 std::size_t FixtureIndex(const std::vector<ExpectedRecord>& expected,
                          std::uint64_t dispatch, EventKind kind) {
@@ -1659,6 +1721,53 @@ TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
   }
 }
 
+// The registry's log-gap flag (Options::gap_flags) is set by the record that
+// opens the gap, not by a later sample: a run killed right after that record
+// has no GAP record, and the flag is all that says its log lost records. The
+// word's other bits are kept. It is set only while the word is still the
+// writer's: a row the registry swept and gave another node (a new
+// generation) is left alone, so the new owner's run is not marked log_gap.
+// REQ-OPS-52
+TEST(LogGap, OpeningAGapSetsTheGapFlagAtOnceOnlyInItsOwnRow) {
+  constexpr std::uint32_t kOther = 1u << 3;
+  constexpr std::uint32_t kGap = 1u << 14;
+  constexpr std::uint64_t kClaimed = 5;
+  struct Row {
+    const char* name;
+    std::uint64_t generation_at_gap;
+    std::uint32_t flags_after;
+  };
+  const Row rows[] = {
+      {"its own row", kClaimed, kOther | kGap},
+      {"claimed again", kClaimed + 1, kOther},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    std::atomic<std::uint32_t> flags{kOther};
+    std::atomic<std::uint64_t> generation{kClaimed};
+    const std::string path = TempPath("gap_flag");
+    LogWriter::Options options;
+    options.chunk_bytes = 512;
+    options.chunk_count = 1;
+    options.background = false;
+    options.gap_flags = {.flags = &flags,
+                         .bit = kGap,
+                         .owner = &generation,
+                         .expected = kClaimed};
+    LogWriter writer{path, "gap_flag", options};
+    writer.start({}, {});
+    RecordStep(writer, {EventKind::TIMER, 1, 20}, 0);
+    RecordStep(writer, {EventKind::SEND, 1, 20}, 1);
+    EXPECT_EQ(flags.load(), kOther) << "set before any record was dropped";
+    generation.store(row.generation_at_gap);
+    RecordStep(writer, {EventKind::SEND, 1, 1024}, 2);
+    ASSERT_TRUE(writer.losing());
+    EXPECT_EQ(flags.load(), row.flags_after);
+    writer.flush();
+    ::unlink(path.c_str());
+  }
+}
+
 TEST(LogBackgroundWriter, RepeatedFlushReusesChunksInOrder) {
   const auto path = TempPath("reuse_chunks");
   LogWriter writer{path, "reuse", LogWriter::Options{256, 4, true}};
@@ -2243,6 +2352,52 @@ TEST(LogCapture, ByteCapStopsCaptureAndLeavesAValidMarkedLog) {
     EXPECT_EQ(reader.record_count(), 3u);
     EXPECT_FALSE(reader.truncated());
     EXPECT_EQ(SummarizeLog(path).record_count, 3u);
+    ::unlink(path.c_str());
+    ::unlink(marker.c_str());
+  }
+}
+
+// A gap whose GAP record would cross the cap of a log that cannot rotate
+// ends capture there: no gap is open any more (losing() false: nothing will
+// resume it), capture has stopped, and the gap is still counted, so
+// incomplete() reports the loss its missing GAP record cannot.
+// REQ-RT-11
+TEST(LogCapture, AGapWhoseResumeCrossesTheCapStopsCapture) {
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background);
+    const auto path = TempPath(background ? "gap_cap_bg" : "gap_cap_sync");
+    const std::string marker = CappedMarkerPath(path);
+    ::unlink(marker.c_str());
+    constexpr std::size_t kRecord = sizeof(RecordHeader) + 16;
+    // Room for one record and a GAP record's header, not its payload.
+    const std::uint64_t cap = RecordsOffset() + kRecord + sizeof(RecordHeader);
+    {
+      LogWriter writer{path, "gap_cap",
+                       LogWriter::Options{256, 4, background, cap}};
+      writer.start(MakeManifest(), {});
+      Context context{};
+      context.dispatch_index = 1;
+      writer.dispatch(context, MakePayload(16, 1));
+      // Larger than any chunk: dropped, a gap opens.
+      context.dispatch_index = 2;
+      writer.dispatch(context, MakePayload(1024, 2));
+      ASSERT_TRUE(writer.losing());
+      ASSERT_FALSE(writer.capture_stopped());
+      // A new dispatch resumes capture behind a GAP record the cap refuses.
+      context.dispatch_index = 3;
+      writer.dispatch(context, MakePayload(16, 3));
+      EXPECT_FALSE(writer.losing());
+      EXPECT_TRUE(writer.capture_stopped());
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_TRUE(writer.incomplete());
+      EXPECT_FALSE(writer.failed()) << writer.error();
+      writer.flush();
+    }
+    EXPECT_TRUE(std::ifstream{marker}.good());
+    const ReadBack back = ReadAll(path, false);
+    ASSERT_EQ(back.records.size(), 1u);
+    EXPECT_EQ(back.records[0].header.dispatch_index, 1u);
+    EXPECT_EQ(back.gaps, 0u);
     ::unlink(path.c_str());
     ::unlink(marker.c_str());
   }

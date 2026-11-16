@@ -922,6 +922,9 @@ def _talos_bundle_impl(ctx):
         "nodes": nodes_spec,
         "default_hardware_node": _bundle_label(_HARDWARE_NODE),
         "studio": studio_spec,
+        # deploy.sh install refuses a bundle built testonly (it may carry
+        # testonly nodes, test fixtures) outside a Bazel test.
+        "testonly": ctx.attr.testonly,
     }
 
     spec_file = ctx.actions.declare_file(ctx.label.name + "_spec.json")
@@ -1087,7 +1090,9 @@ def talos_bundle(name, config, **kwargs):
 
     bundle_manifest.toml records each node binary's SHA-256 and, in a --stamp
     build (--config=release), the source revision and dirty flag that
-    tools/workspace_status.sh reports.
+    tools/workspace_status.sh reports. A testonly bundle's manifest says
+    `testonly = true`, and tools/deploy.sh install refuses it outside a
+    Bazel test.
 
     Args:
       name: bundle target name.

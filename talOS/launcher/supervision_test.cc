@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -49,6 +50,7 @@
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
+#include "talOS/rtms/process_liveness.h"
 
 namespace talos::launcher {
 namespace {
@@ -1101,9 +1103,21 @@ TEST(Supervision, CriticalCleanExitRestarts) {
   EXPECT_EQ(ReadLines(runs), (std::vector<std::string>{
                                  options.output_dir + "/alpha.tlog",
                                  options.output_dir + "/alpha.restart1.tlog"}));
-  const auto alpha =
-      ManifestEntry(ReadFile(options.output_dir + "/manifest.json"), "alpha");
+  const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
+  const auto alpha = ManifestEntry(manifest, "alpha");
   EXPECT_NE(alpha.find("\"restart_count\": 1"), std::string::npos) << alpha;
+  // The restarted run's pid is printed as the first run's is, so an operator
+  // can find the process without reading the manifest (TODO.md DEPLOY-17).
+  const auto history = ManifestRuns(manifest, "alpha");
+  ASSERT_EQ(history.size(), 2u) << manifest;
+  const long long restarted_pid = std::strtoll(
+      history[1].c_str() + std::string_view{"{\"pid\": "}.size(), nullptr, 10);
+  ASSERT_GT(restarted_pid, 0) << history[1];
+  const std::string output =
+      ReadFile(options.output_dir + "/" + std::string{kLauncherOutputFile});
+  EXPECT_NE(output.find("alpha (pid " + std::to_string(restarted_pid) + ","),
+            std::string::npos)
+      << "restarted pid " << restarted_pid << " not in " << output;
   std::filesystem::remove_all(options.output_dir);
   ::remove(runs.c_str());
   ::remove(peers.c_str());
@@ -1605,27 +1619,44 @@ TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
   const int status = RunSession(options);
   mover.request_stop();
   mover.join();
-  ASSERT_TRUE(ran_its_duration) << "the bridge's loop never started";
+  // The ports were free when picked and released before the launch
+  // (docs/TESTING.md §6.4): a bridge that failed and restarted may have
+  // lost one to another process, which its own log names.
+  const std::string bridge_log =
+      "\nthe bridge's ports " + std::to_string(options.local_port) + " and " +
+      std::to_string(options.remote_port) +
+      " were released before the launch, so another process may have bound "
+      "one; hardware_node.log:\n" +
+      ReadFile(NodeOutputPath(options.output_dir, "hardware_node"));
+  ASSERT_TRUE(ran_its_duration)
+      << "the bridge's loop never started" << bridge_log;
   const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
-  EXPECT_EQ(status, 0) << manifest;
+  EXPECT_EQ(status, 0) << manifest << bridge_log;
   const std::string entry = ManifestEntry(manifest, "hardware_node");
-  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos) << entry;
+  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos)
+      << entry << bridge_log;
   const auto runs = ManifestRuns(manifest, "hardware_node");
-  ASSERT_EQ(runs.size(), 1u) << manifest;
+  ASSERT_EQ(runs.size(), 1u) << manifest << bridge_log;
   EXPECT_NE(runs[0].find("\"exit_code\": 0, \"exit_signal\": 0, "
                          "\"reason\": \"stop\""),
             std::string::npos)
-      << runs[0];
+      << runs[0] << bridge_log;
   std::filesystem::remove_all(options.output_dir);
 }
 
+// A config that cannot be read refuses the launch before its session
+// directory, <output-dir>/<session_id>/, holds a graph.json (README "Two
+// phases": nothing was described).
+// REQ-OPS-01
 TEST(Supervision, MissingConfigFailsFastWithClearError) {
   LauncherOptions options;
+  options.session_id = GenerateSessionId();
   options.output_dir = TempPath("missing_cfg_out");
   options.config_path = TempPath("does_not_exist") + ".toml";
-  Launcher launcher{options};
-  EXPECT_EQ(launcher.Run(), 1);
-  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/graph.json"));
+  EXPECT_EQ(RunSession(options), 1);
+  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/graph.json"))
+      << options.output_dir;
+  std::filesystem::remove_all(TempPath("missing_cfg_out"));
 }
 
 // Registry rows held by live processes outside the session are never swept, so
@@ -2110,6 +2141,110 @@ TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// The service watchdog is what bounds a deployed session whose launcher
+// hangs (README "Supervision passes"): with the loop held inside a pass (its
+// clock read blocked), no WATCHDOG=1 goes out for three watchdog intervals,
+// and the pings resume once the loop does. A watchdog thread, or any ping not
+// sent by the loop itself, fails it.
+// REQ-OPS-07
+TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
+  const std::string path = "/tmp/tw_" + std::to_string(::getpid());
+  ::unlink(path.c_str());
+  const int socket = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(socket, 0);
+  sockaddr_un address{};
+  address.sun_family = AF_UNIX;
+  std::memcpy(address.sun_path, path.c_str(), path.size() + 1);
+  ASSERT_EQ(::bind(socket, reinterpret_cast<const sockaddr*>(&address),
+                   static_cast<socklen_t>(offsetof(sockaddr_un, sun_path) +
+                                          path.size() + 1)),
+            0);
+  // 100 ms between pings (half of WATCHDOG_USEC).
+  constexpr auto kInterval = 100ms;
+  auto options = BaseOptions("watchdog_stall");
+  // Only bounds a hang: the test stops the session once it has judged it,
+  // and its own waits add up to at most about 30 s.
+  options.duration_s = 3 * kHangSeconds;
+  // The stubs never register; no heartbeat kill may end them meanwhile.
+  options.heartbeat_startup_grace_ms = 60'000;
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      WriteStub("watchdog_stall_hardware", kRunUntilStopped, "hardware_node");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("watchdog_stall_alpha", kRunUntilStopped);
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("watchdog_stall_beta", kRunUntilStopped);
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool stall = false;
+  bool stalled = false;
+  options.supervision_clock = [&] {
+    std::unique_lock lock{mutex};
+    if (stall) {
+      stalled = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return !stall; });
+    }
+    return std::chrono::steady_clock::now();
+  };
+  // Waits at most `bound` for one datagram: its text, or empty.
+  const auto receive =
+      [socket](std::chrono::milliseconds bound) -> std::string {
+    pollfd ready{socket, POLLIN, 0};
+    if (::poll(&ready, 1, static_cast<int>(bound.count())) <= 0) return {};
+    char buffer[64];
+    const auto size = ::recv(socket, buffer, sizeof(buffer), 0);
+    return size > 0 ? std::string(buffer, static_cast<std::size_t>(size))
+                    : std::string{};
+  };
+  bool pinged = false;
+  bool held = false;
+  std::string while_stalled;
+  bool resumed = false;
+  std::jthread driver{[&] {
+    for (int i = 0; i < 2 && !pinged; ++i)
+      pinged = receive(10s) == "WATCHDOG=1";
+    if (pinged) {
+      {
+        std::unique_lock lock{mutex};
+        stall = true;
+      }
+      SupervisionWakeup::Wake();
+      std::unique_lock lock{mutex};
+      held = changed.wait_for(lock, 10s, [&] { return stalled; });
+    }
+    if (held) {
+      // Sent before the loop stopped: queued already, drained here.
+      while (!receive(0ms).empty()) {
+      }
+      while_stalled = receive(3 * kInterval);
+    }
+    {
+      const std::lock_guard lock{mutex};
+      stall = false;
+    }
+    changed.notify_all();
+    if (held) resumed = receive(10s) == "WATCHDOG=1";
+    // Unpinged, the session is stuck before its loop; its deadline ends it.
+    if (pinged) ::kill(::getpid(), SIGTERM);
+  }};
+  ::setenv("NOTIFY_SOCKET", path.c_str(), 1);
+  ::setenv("WATCHDOG_USEC", "200000", 1);
+  const int status = RunSession(options);
+  ::unsetenv("NOTIFY_SOCKET");
+  ::unsetenv("WATCHDOG_USEC");
+  driver.join();
+  EXPECT_EQ(status, 0);
+  ASSERT_TRUE(pinged) << "no WATCHDOG=1 before the stall";
+  ASSERT_TRUE(held) << "the loop never read its clock once told to stall";
+  EXPECT_EQ(while_stalled, "")
+      << "a ping went out while the loop was held for "
+      << (3 * kInterval).count() << " ms (3 watchdog intervals)";
+  EXPECT_TRUE(resumed) << "no WATCHDOG=1 after the loop resumed";
+  ::close(socket);
+  ::unlink(path.c_str());
+  std::filesystem::remove_all(options.output_dir);
+}
+
 #ifdef __linux__
 TEST(Supervision, NotifierSupportsAbstractSocketNames) {
   // Abstract names live in the network namespace, which concurrent sandboxed
@@ -2248,6 +2383,167 @@ TEST(Supervision, SecondLaunchInTheNamespaceIsRefused) {
   for (const auto* options : {&second, &describe, &after}) {
     std::filesystem::remove_all(options->output_dir);
   }
+}
+
+// The talos-*.lock files in the lock directory (introspect::LockDirectory:
+// this test's TEST_TMPDIR under Bazel, /dev/shm under TALOS_SHM_NAMESPACE).
+std::vector<std::string> LockFiles() {
+  std::vector<std::string> names;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator{
+           introspect::LockDirectory(), error}) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with("talos-") && name.ends_with(".lock"))
+      names.push_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+// Whether the shared-memory object `mapped` (a ShmObjectName) exists.
+bool SegmentExists(const std::string& mapped) {
+  const int fd = ::shm_open(mapped.c_str(), O_RDONLY, 0);
+  if (fd >= 0) ::close(fd);
+  return fd >= 0;
+}
+
+// A session in a shared-memory namespace leaves none of its names behind:
+// the registry segment it prepared, the registry's writer lock file, and the
+// session lock file all exist while it runs and are gone once it has
+// returned, every member reaped (a host that runs namespaced sessions all
+// day otherwise collects three per session).
+// REQ-OPS-03
+TEST(Supervision, ANamespacedSessionLeavesNoNamesBehind) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  ASSERT_TRUE(registry.starts_with("/~"))
+      << "not in a test namespace: " << registry;
+  const std::string registry_lock = introspect::LockFilePath(registry);
+  const std::string session_lock =
+      introspect::LockFilePath(ShmObjectName(kSessionLockName));
+  auto options = BaseOptions("leaves_no_names");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("leaves_no_names_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("leaves_no_names_beta", "exit 0\n");
+  const std::vector<std::string> before = LockFiles();
+  bool held_all = false;
+  options.member_spawned = [&](const std::string&) {
+    held_all = SegmentExists(registry) &&
+               std::filesystem::exists(registry_lock) &&
+               std::filesystem::exists(session_lock);
+  };
+  EXPECT_EQ(RunSession(options), 0);
+  ASSERT_TRUE(held_all) << "the running session did not hold " << registry
+                        << ", " << registry_lock << " and " << session_lock;
+  EXPECT_FALSE(SegmentExists(registry)) << registry;
+  EXPECT_FALSE(std::filesystem::exists(registry_lock)) << registry_lock;
+  EXPECT_FALSE(std::filesystem::exists(session_lock)) << session_lock;
+  const std::vector<std::string> after = LockFiles();
+  std::vector<std::string> added;
+  std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                      std::back_inserter(added));
+  EXPECT_TRUE(added.empty()) << "left in " << introspect::LockDirectory()
+                             << ": " << ::testing::PrintToString(added);
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// Removes the namespace's registry segment and its lock file, which a test
+// that keeps them leaves behind, so the tests after it start as this binary's
+// first does.
+void RemoveRegistry() {
+  introspect::RegistryMapping::unlink();
+  ::unlink(introspect::LockFilePath(ShmObjectName(introspect::kRegistryPath))
+               .c_str());
+}
+
+// A namespaced session's end leaves the registry while a live process of
+// another session holds a row in it: removing the segment would take that
+// node's row out of every viewer, and its next restart would register in a
+// new segment. The row's claimant is this test process, which runs.
+// REQ-OPS-03
+TEST(Supervision, ALiveRowOfAnotherSessionKeepsTheRegistry) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  const std::string registry_lock = introspect::LockFilePath(registry);
+  auto options = BaseOptions("foreign_row");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("foreign_row_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("foreign_row_beta", "exit 0\n");
+  std::optional<introspect::NodeRegistration> foreign;
+  foreign.emplace(introspect::NodeRegistration::Identity{
+      "foreign", "//example/foreign:node", options.session_id + 1, 0});
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_TRUE(SegmentExists(registry))
+      << "removed under another session's live row: " << registry;
+  EXPECT_TRUE(std::filesystem::exists(registry_lock)) << registry_lock;
+  foreign.reset();
+  RemoveRegistry();
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// The same while another process holds the registry's writer lock (a node of
+// another session claiming a row): the session does not wait for it and
+// leaves the registry. Held here from before the session, once the registry
+// is prepared, so the launcher's own preparation needs no lock.
+// REQ-OPS-03
+TEST(Supervision, AHeldRegistryLockKeepsTheRegistry) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  const std::string registry_lock = introspect::LockFilePath(registry);
+  auto options = BaseOptions("held_registry_lock");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("held_registry_lock_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("held_registry_lock_beta", "exit 0\n");
+  introspect::PrepareRegistry();
+  std::optional<introspect::RegistryLock> held;
+  held.emplace(registry, 0ms);
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_TRUE(SegmentExists(registry))
+      << "removed while its lock was held: " << registry;
+  EXPECT_TRUE(std::filesystem::exists(registry_lock)) << registry_lock;
+  held.reset();
+  RemoveRegistry();
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// A row an earlier session left active, its claimant gone (SIGKILLed: its
+// heartbeat still fresh, its row not yet swept by a claim), is no live
+// session's and does not keep the registry for good. The planted row's
+// claimant word is this process's with its start time changed, which reads
+// as the pid reused by a later process (process_liveness.h).
+// REQ-OPS-03
+TEST(Supervision, ARowWhoseProcessIsGoneDoesNotKeepTheRegistry) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  auto options = BaseOptions("gone_row");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("gone_row_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("gone_row_beta", "exit 0\n");
+  const uint64_t gone = talos::OwnProcessWord() ^ (1ULL << kProcessPidBits);
+  ASSERT_FALSE(talos::ProcessWordAlive(gone));
+  // Held across the session and released at its end, so the row is freed
+  // whether or not the registry was removed.
+  const introspect::NodeRegistration registration{
+      {"gone", "//example/gone:node", options.session_id + 1, 0}};
+  bool planted = false;
+  {
+    introspect::RegistryMapping mapping;
+    for (auto& row : mapping.header()->nodes) {
+      if (row.state.load(std::memory_order_acquire) !=
+              static_cast<uint64_t>(introspect::SlotState::ACTIVE) ||
+          row.session_id != options.session_id + 1)
+        continue;
+      row.pid_start = gone >> kProcessPidBits;
+      planted = true;
+      break;
+    }
+  }
+  ASSERT_TRUE(planted) << "no row to plant";
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_FALSE(SegmentExists(registry))
+      << "kept for a row whose process is gone: " << registry;
+  RemoveRegistry();
+  std::filesystem::remove_all(options.output_dir);
 }
 
 // The loop never waits for the disk, yet every mid-session manifest is

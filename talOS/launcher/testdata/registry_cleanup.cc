@@ -1,9 +1,11 @@
 // Linked into a launcher process test (alwayslink): after its last test,
 // unlinks the registry segment of the test's shared-memory namespace.
 //
-// A launch prepares the registry and every node registers in it, and the
-// registry deliberately outlives its sessions (RegistryMapping), so each
-// such test target used to leave one ~356 KB segment in /dev/shm. Bazel's
+// A launch prepares the registry and every node registers in it. A
+// namespaced session removes it at its end only when no row of another
+// session remains (NamespaceNames, launcher.cc), so a test whose sessions
+// overlap, or that leaves a row behind, would otherwise leave one ~356 KB
+// segment in /dev/shm. Bazel's
 // TEST_TMPDIR is the namespace (ShmObjectName), unique to the target and its
 // shard and inherited by every process the test starts, so this removes only
 // what the test created, never another process's segment. Process segments

@@ -22,6 +22,58 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-16
+
+- **TEST-9, TEST-10, MAC-2: launcher and installing tests on macOS.** Mac mini,
+  macOS, 2026-11-16. `launcher_test` alone, uncached, three runs: 10.3, 10.0,
+  9.8 s; `supervision_test`: 13.5, 13.4, 13.1 s. `--runs_per_test=10` at load
+  about 3: `launcher_test` 40 of 40 shard runs (max 27.9 s), `supervision_test`
+  30 of 30 (max 50.7 s). Three full uncached `bazel test //...` runs after the
+  installing tests stopped overlapping: 234 of 234 each, `bundle_test` 29.4,
+  44.3, 42.0 s, `install_check_test` 13.4, 19.3, 21.2 s, `warm_up_test` 19.6,
+  14.3, 14.4 s; one run before the change: 234 of 234, 45.2, 46.2, 38.9 s.
+  `install_check_test` alone: 17.7 and 17.6 s before, 12.0 and 11.9 s after.
+  The earlier timeouts at load about 9 were not reproduced.
+- **RIO-1: stale-FaultField flake, mechanism observed.** Mac mini, macOS
+  (Darwin 25.3), desktop Phoenix simulation, load 0.5 to 1.5, talOS
+  6acdcf9f; one `StaleFaultFieldClearsLimitsAndKeepsFaults` per process.
+  Before the fix 8 of 40 Release and 2 of 20 Debug runs failed, every one
+  at the boot row's wait (`fault_flags 0`, after the 10 s bound); at
+  841a0fc0, before the torque-current work, 1 of 20 Release. Instrumented
+  reads of the boot row's TalonFX: it read valid with BootDuringEnable
+  from about 0.11 s after the backend was constructed until 0.51 to 0.53 s,
+  then valid without it, whether driven at 2 V or neutral; the 30-read
+  pump before the wait ended 0.46 to 0.53 s after construction, and the
+  four instrumented failures were exactly the runs whose pump ended after
+  the bit cleared. After the fix 0 of 40 Release, 0 of 20 Debug,
+  `--gtest_repeat=10` of the test 10 of 10 in each, and
+  `--gtest_filter='PhoenixBackend*' --gtest_repeat=5` 125 of 125 in each.
+
+- **CI-1, CI-2, CI-9, CI-10, INC-6: first green nightly.** GitHub hosted
+  macOS runners, `main` at 95f4878e, Nightly run 43905118119 (started by
+  hand): Bazel under AddressSanitizer, Bazel under ThreadSanitizer and the
+  macOS soak (seed 1) all passed. The ThreadSanitizer and soak jobs passed
+  on a rerun: on the first attempt no hosted runner picked them up
+  ("The job was not acquired by Runner of type hosted even after multiple
+  attempts"), which is no result of the code (TODO.md CI-11).
+- **BENCH-3: RoboRIO tests under ThreadSanitizer.** Linux workstation, gcc
+  16, talOS 2e6d720c (not pushed), `./gradlew --offline phoenixTest -Ptsan`:
+  the build compiles and 83 of 83 tests pass. ThreadSanitizer reported
+  nothing in talOS code; it reported three data races inside CTRE's
+  uninstrumented `libCTRE_PhoenixTools_Sim.so`, reached from a Pigeon 2's
+  construction in `PhoenixBackend::Configure`, and two thread leaks at
+  exit, so the Gradle task fails.
+- **BENCH-11: disabled dry run on the Mac mini.** Bench, RoboRIO build
+  6acdcf9f with companion 10.0.0.37, Mac mini (12 cores) as main
+  processor over Ethernet, bundle of 6acdcf9f (`git_dirty = false`),
+  disabled, uncommissioned, no Driver Station attached, launched over
+  ssh, 45 s, session 124490254188690328. Controller link up, 8995 States,
+  `send_failures=0`; Realtime `full` on all six nodes and no realtime
+  warning; `/hw/state` interval median 4.999 ms, p99 5.182 ms, max
+  7.434 ms; `/hw/status` `configured` true, `commissioned` false. Load
+  before the run 4.1 (a build had just finished), so the timing is not
+  acceptance evidence.
+
 ## 2026-11-15
 
 - **BENCH-5: CAN bus status slots on the bench.** Bench, RoboRIO build

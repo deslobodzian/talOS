@@ -33,9 +33,7 @@ py_test(
     data = [
         "position_py.py",
         "testdata/robot.toml",
-        ":node",
     ],
-    env = {"NODE_BINARY": "$(rlocationpath :node)"},
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [
@@ -46,7 +44,6 @@ py_test(
         ":messages_py",
         "//talOS/python:mechanisms",
         "//talOS/python:testing",
-        "@rules_python//python/runfiles",
     ],
 )
 

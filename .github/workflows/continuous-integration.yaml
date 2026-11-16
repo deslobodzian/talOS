@@ -36,6 +36,9 @@ jobs:
     timeout-minutes: 75
     env:
       TESTLOGS: linux
+      # The diff base step checks the whole branch on a topic-branch push,
+      # so clang-tidy checks again what an earlier push left failing.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -50,8 +53,8 @@ jobs:
       # so a commit whose earlier run was cancelled or failed is checked
       # again by every later run. A topic-branch push does the same, against
       # the merge base with main, in a job that sets DIFF_SCOPE=branch
-      # (buildifier and clang-format, which are cheap; clang-tidy keeps the
-      # pushed commits' scope, TODO.md CI-3). Otherwise a push
+      # (every job that uses it: buildifier, clang-format and the Linux
+      # job's clang-tidy). Otherwise (main) a push
       # checks the commits it pushed; on main, `before` is the old tip,
       # which is the merge base of what was merged. A new branch (all-zero
       # `before`) or a force push (`before` absent from the clone or not an
@@ -93,7 +96,24 @@ jobs:
 
     - name: Build
       id: build
-      run: bazel build //... --noshow_progress --test_output=errors
+      # The two flags write every compile's `.d` file to the output path,
+      # cache hits included, for the host-include step below (as
+      # tools/prepush.sh builds); the Test step repeats them so it keeps
+      # this build's analysis.
+      run: >-
+        bazel build //... --noshow_progress --test_output=errors
+        --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$'
+
+    - name: No compile read a host package header
+      # tools/check_host_includes.py over this build's `.d` files: a header
+      # under /usr/include (or another host prefix) that is not the C
+      # library's, the kernel's or the C++ standard library's compiled here
+      # only because the runner has the package (tools/prepush.sh's
+      # host-includes step).
+      run: >-
+        python3 tools/check_host_includes.py "$(bazel info
+        --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$'
+        output_path)"
 
     - name: Layer check (ARCHITECTURE.md "Allowed dependencies")
       # bazel query paths that must be empty; known exceptions are
@@ -144,6 +164,7 @@ jobs:
       run: |
         set -o pipefail
         bazel test //... --noshow_progress --test_output=errors \
+          --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$' \
           --test_env=TALOS_REQUIRE_NETNS=1 \
           --test_env=TALOS_REQUIRE_BROWSER=1 \
           --build_event_json_file="$RUNNER_TEMP/test-events.json" 2>&1 \

@@ -1,15 +1,22 @@
 #include "talOS/events/input_replay.h"
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
+#include "talOS/events/log/log_writer.h"
+#include "talOS/events/session_manifest.h"
 
 namespace talos::event {
 
@@ -17,6 +24,75 @@ namespace {
 
 std::string Shape(const schema::Identity& schema, std::uint32_t bytes) {
   return schema::Describe(schema) + ", " + std::to_string(bytes) + " bytes";
+}
+
+// The log a file of it belongs to: `<stem>.tlog` for a segment the byte cap
+// rotated out (`<stem>.segment<k>.tlog`, log::LogSegmentPath), else the file.
+std::string LogOfFile(const std::string& file) {
+  constexpr std::string_view kExtension = ".tlog";
+  constexpr std::string_view kSegment = ".segment";
+  std::string_view stem = file;
+  if (!stem.ends_with(kExtension)) return file;
+  stem.remove_suffix(kExtension.size());
+  std::size_t digits = 0;
+  while (digits < stem.size() && std::isdigit(static_cast<unsigned char>(
+                                     stem[stem.size() - 1 - digits])) != 0) {
+    ++digits;
+  }
+  if (digits == 0) return file;
+  stem.remove_suffix(digits);
+  if (!stem.ends_with(kSegment)) return file;
+  stem.remove_suffix(kSegment.size());
+  return std::string{stem} + std::string{kExtension};
+}
+
+// What the session manifest says a member's logs lost.
+struct ManifestMarks {
+  bool log_gap{false};
+  bool log_capped{false};
+  bool recorder_failed{false};
+};
+
+// By file name, the logs of every member the session manifest beside the
+// logs (`<directory>/manifest.json`, talOS/launcher/session.cc, read by
+// session_manifest::Parse) marks `log_gap`, `log_capped` or
+// `recorder_failed`, with those marks; empty when there is no manifest, or
+// it is another session's or has no session_id. Throws std::runtime_error
+// naming a manifest that is not JSON, or whose `log_gap`, `log_capped`,
+// `recorder_failed` or `log_paths` is not what the launcher writes.
+std::map<std::string, ManifestMarks> MarkedLogNames(
+    const std::filesystem::path& directory, std::uint64_t session_id) {
+  const std::optional<std::string> text = session_manifest::ReadText(directory);
+  if (!text) return {};
+  const auto error = [&](std::string_view what) {
+    return std::runtime_error(
+        "cannot read the session manifest " +
+        (directory / session_manifest::kFileName).string() + ": " +
+        std::string{what});
+  };
+  session_manifest::Fields manifest;
+  try {
+    manifest = session_manifest::Parse(*text);
+  } catch (const session_manifest::ManifestError& e) {
+    throw error(e.what());
+  }
+  if (manifest.session_id != session_id) return {};
+  std::map<std::string, ManifestMarks> names;
+  for (const session_manifest::Member& node : manifest.nodes) {
+    const ManifestMarks marks{.log_gap = node.log_gap,
+                              .log_capped = node.log_capped,
+                              .recorder_failed = node.recorder_failed};
+    if (!marks.log_gap && !marks.log_capped && !marks.recorder_failed) {
+      continue;
+    }
+    if (!node.log_paths) {
+      throw error("a marked member's log_paths is not an array of strings");
+    }
+    for (const std::string& log : *node.log_paths) {
+      names[std::filesystem::path{log}.filename().string()] = marks;
+    }
+  }
+  return names;
 }
 
 }  // namespace
@@ -43,14 +119,31 @@ RecordedSession::RecordedSession(const std::string& path,
   std::optional<std::pair<MonotonicTime, MonotonicTime>> replayed_run;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
-  // Each log with a GAP record: the earliest time one names, and the topics
-  // it recorded (with whether the replayed program watched them in it).
-  struct GappedLog {
+  // Each log read: the earliest time a GAP record of it names; its first
+  // damaged stretch's offset, and for each topic it recorded the earliest
+  // time a record lost there could be fed at (none where nothing bounds it);
+  // whether it holds its EXIT; and the topics it recorded (with whether the
+  // replayed program watched them in it).
+  struct ReadLog {
     std::string path;
-    MonotonicTime start;
+    std::optional<MonotonicTime> gap;
+    std::optional<std::uint64_t> damage_offset;
+    std::map<std::uint32_t, std::optional<MonotonicTime>> damage_bound;
+    bool exit{false};
     std::vector<std::pair<std::uint32_t, bool>> topics;
   };
-  std::vector<GappedLog> gapped;
+  std::vector<ReadLog> logs;
+  // Each file read, by path: its origin, then the now_ns of its last intact
+  // record and by source id its watchers' last intact receipts' publication
+  // times. A segment of the same log (LogSegmentFiles: the next one, with
+  // its origin and manifest) starts from them, so damage right after its
+  // header is bounded as it would be in one file.
+  struct Carried {
+    MonotonicTime origin;
+    std::optional<std::int64_t> last_now;
+    std::vector<std::optional<std::int64_t>> last_receipt;
+  };
+  std::map<std::string, Carried> carried;
   bool first = true;
 
   for (const std::string& log_path : log_paths_) {
@@ -91,8 +184,35 @@ RecordedSession::RecordedSession(const std::string& path,
     // The topics this log recorded, and whether the replayed program
     // watched each in it.
     std::vector<std::pair<std::uint32_t, bool>> recorded;
-    // The earliest time a GAP record of this log names.
+    // The earliest time a GAP record of this log names (gap), and the
+    // earliest loss of its timeline (gap_start: that, or the now_ns of the
+    // last intact record before a damaged stretch), which a run start taken
+    // from a timer firing after it must not precede.
+    std::optional<MonotonicTime> gap;
     std::optional<MonotonicTime> gap_start;
+    // The now_ns of the last intact record, and by source id the
+    // publication time of a watcher's last intact receipt: what bounds the
+    // records a damaged stretch after them lost.
+    std::optional<std::int64_t> last_now;
+    std::vector<std::optional<std::int64_t>> last_receipt(
+        reader.manifest().size());
+    {
+      const std::vector<std::string> segments =
+          log::LogSegmentFiles(LogOfFile(log_path));
+      const auto at = std::find(segments.begin(), segments.end(), log_path);
+      if (at != segments.end() && at != segments.begin()) {
+        const auto previous = carried.find(*std::prev(at));
+        if (previous != carried.end() &&
+            previous->second.origin == reader.start_time() &&
+            previous->second.last_receipt.size() == last_receipt.size()) {
+          last_now = previous->second.last_now;
+          last_receipt = previous->second.last_receipt;
+        }
+      }
+    }
+    ReadLog read{.path = log_path};
+    // Whether a record of a dispatch has been read from this file.
+    bool dispatched = false;
     for (const Registration& registration : reader.manifest()) {
       if (registration.kind == SourceKind::TIMER && registration.armed &&
           registration.id < timer_offset.size()) {
@@ -136,17 +256,67 @@ RecordedSession::RecordedSession(const std::string& path,
     log::LogReader::Record record;
     while (reader.next(record)) {
       const log::RecordHeader& header = record.header;
+      // The reader skipped a damaged stretch just before this record: the
+      // first one bounds what each topic's records lost there can be fed
+      // at (a later one bounds them no earlier).
+      if (reader.damage().spans != 0 && !read.damage_offset.has_value()) {
+        read.damage_offset = reader.damage().first_offset;
+        // Every record's now_ns is its dispatch's sample of the loop clock,
+        // which never decreases along the log, except a send made before
+        // the first dispatch, whose now_ns is 0.
+        const MonotonicTime since_last =
+            last_now
+                ? MonotonicTime::from_nanos(*last_now)
+                : std::min(MonotonicTime::from_nanos(0), reader.start_time());
+        gap_start = std::min(gap_start.value_or(since_last), since_last);
+        for (const Registration& source : reader.manifest()) {
+          if (source.id >= topic_of.size() || topic_of[source.id] == kNone) {
+            continue;
+          }
+          // A writer's send is fed at its publication time, which is its
+          // record's now_ns (LogWriter::send). A reader's receipt is fed at
+          // its publication time, and a watcher receives its topic in
+          // sequence order, whose publication times never decrease (one
+          // writer per topic, stamped from the monotonic clock); before its
+          // first receipt nothing bounds it. The replayed program's own
+          // receipt is fed at its drain's event time (a tick's deadline, or
+          // a prompt watcher's publication time), which need not follow the
+          // log's order: nothing bounds it.
+          std::optional<MonotonicTime> bound;
+          if (source.kind == SourceKind::SENDER) {
+            bound = since_last;
+          } else if (!own_log && last_receipt[source.id].has_value()) {
+            bound = MonotonicTime::from_nanos(*last_receipt[source.id]);
+          }
+          const std::uint32_t topic = topic_of[source.id];
+          const auto [it, inserted] =
+              read.damage_bound.try_emplace(topic, bound);
+          if (!inserted) {
+            it->second = it->second && bound
+                             ? std::optional{std::min(*it->second, *bound)}
+                             : std::nullopt;
+          }
+        }
+      }
+      last_now = header.now_ns;
+      if (header.dispatch_index != 0) dispatched = true;
       end_ = std::max(end_, MonotonicTime::from_nanos(header.now_ns));
       if (own_log) {
         replayed_end = std::max(replayed_end.value_or(reader.start_time()),
                                 MonotonicTime::from_nanos(header.now_ns));
       }
-      if (const auto gap = log::GapOf(header, record.payload)) {
-        const MonotonicTime start = MonotonicTime::from_nanos(gap->start_ns);
+      if (const auto marked = log::GapOf(header, record.payload)) {
+        const MonotonicTime start = MonotonicTime::from_nanos(marked->start_ns);
+        gap = std::min(gap.value_or(start), start);
         gap_start = std::min(gap_start.value_or(start), start);
         continue;
       }
       const auto kind = static_cast<EventKind>(header.kind);
+      if (kind == EventKind::EXIT) read.exit = true;
+      if (kind == EventKind::MESSAGE &&
+          header.source_id < last_receipt.size()) {
+        last_receipt[header.source_id] = header.publish_time_ns;
+      }
       // The first firing of a timer the run had not re-armed is at the run
       // start plus its manifest offset. A firing after a gap is one the live
       // loop made, so it fixes that timer's phase, but not the run start:
@@ -203,8 +373,19 @@ RecordedSession::RecordedSession(const std::string& path,
                       record.payload.end());
         continue;
       }
+      // A send made before the loop's first dispatch (a constructor's) is
+      // recorded with no clock (LogWriter::send from an empty Context:
+      // now_ns and publish_time_ns 0), but the transport stamped it with
+      // the loop's origin (monotonic_now() before the run), as its readers
+      // recorded: a restarted writer's initial message is fed at its
+      // restart, not at the session's start.
+      const bool before_first_dispatch = send && !dispatched &&
+                                         header.dispatch_index == 0 &&
+                                         header.now_ns == 0;
       const MonotonicTime time =
-          MonotonicTime::from_nanos(header.publish_time_ns);
+          before_first_dispatch
+              ? reader.start_time()
+              : MonotonicTime::from_nanos(header.publish_time_ns);
       const auto [it, inserted] =
           seen.try_emplace({topic, header.sequence}, messages_.size());
       if (!inserted) {
@@ -220,15 +401,20 @@ RecordedSession::RecordedSession(const std::string& path,
       messages_.push_back({time, time, topic, header.sequence, bytes_.size()});
       bytes_.insert(bytes_.end(), record.payload.begin(), record.payload.end());
     }
-    // The intact records still replay; say what was skipped.
+    // Say what was skipped: a damaged tail only shortens the log, but a run
+    // fed from it stops at a damaged stretch.
     if (const std::string damage = log::DescribeDamage(reader.damage());
         !damage.empty()) {
       std::cerr << "warning: damaged log " << log_path << ": " << damage
-                << "; replaying the intact records\n";
+                << (reader.damage().spans != 0
+                        ? "; a replay fed from it stops before the first "
+                          "damaged stretch, or is refused\n"
+                        : "; its intact records replay\n");
     }
-    if (gap_start.has_value()) {
-      gapped.push_back({log_path, *gap_start, std::move(recorded)});
-    }
+    carried[log_path] = {reader.start_time(), last_now, last_receipt};
+    read.gap = gap;
+    read.topics = std::move(recorded);
+    logs.push_back(std::move(read));
     // Its first run: the earliest origin among its logs (restarts included).
     if (own_log &&
         (!replayed_run || reader.start_time() < replayed_run->first)) {
@@ -248,16 +434,85 @@ RecordedSession::RecordedSession(const std::string& path,
   for (std::size_t topic = 0; topic < topics_.size(); ++topic) {
     if (watched_by_replayed[topic]) topics_[topic].recorded_by = replayed;
   }
-  // Where each topic's feed ends: the earliest gap in a log it is fed from,
-  // which for a topic the program watched live is one of its own logs that
-  // watched it, and otherwise any log that recorded it.
-  for (const GappedLog& gapped_log : gapped) {
-    for (const auto& [topic, watched_here] : gapped_log.topics) {
+  // Logs that lost records nothing in them marks: a capped one (its marker
+  // beside the log a segment belongs to, or the session manifest's
+  // log_capped for its member), and a run's log without its EXIT of a member
+  // the manifest marks log_gap or recorder_failed. A writer that reached its
+  // EXIT wrote a GAP record for every gap before it (LogWriter::gaps), so
+  // such a log is judged by its GAP records; one without it may have lost a
+  // gap's mark to its process's end, or its tail to a disk that failed (a
+  // failed recorder writes no GAP record). A run's EXIT is in its newest
+  // file, the log's path.
+  const std::filesystem::path directory =
+      std::filesystem::path{log_paths_.front()}.parent_path();
+  const std::map<std::string, ManifestMarks> marked = MarkedLogNames(
+      directory.empty() ? std::filesystem::path{"."} : directory, session_id_);
+  std::set<std::string> exited;
+  for (const ReadLog& log : logs) {
+    if (log.exit) exited.insert(log.path);
+  }
+  const auto refusal = [&](const std::string& file) -> std::string {
+    const std::string log = LogOfFile(file);
+    if (std::string marker = log::CappedMarkerPath(log);
+        std::filesystem::exists(marker)) {
+      return marker + " exists: no GAP record marks what the byte cap cost it";
+    }
+    const auto marks =
+        marked.find(std::filesystem::path{log}.filename().string());
+    if (marks == marked.end()) return {};
+    if (marks->second.log_capped) {
+      return "the session manifest marks its member log_capped: no GAP "
+             "record marks what the byte cap cost it";
+    }
+    if (marks->second.log_gap && !exited.contains(log)) {
+      return "the session manifest marks its member log_gap, and its run's "
+             "log has no EXIT record: a gap its process's end cut short has "
+             "no GAP record";
+    }
+    if (marks->second.recorder_failed && !exited.contains(log)) {
+      return "the session manifest marks its member recorder_failed, and its "
+             "run's log has no EXIT record: a recorder that failed (a disk "
+             "error) ends capture with no GAP record";
+    }
+    return {};
+  };
+  // Where each topic's feed ends, and whether it is refused: the earliest
+  // loss, and the first refused log, among the logs it is fed from, which
+  // for a topic the program watched live are its own logs that watched it,
+  // and otherwise every log that recorded it.
+  for (const ReadLog& log : logs) {
+    const std::string sign = refusal(log.path);
+    for (const auto& [topic, watched_here] : log.topics) {
       if (watched_by_replayed[topic] && !watched_here) continue;
       RecordedTopic& fed = topics_[topic];
-      if (gapped_log.start < fed.first_gap.value_or(MonotonicTime::max())) {
-        fed.first_gap = gapped_log.start;
-        fed.first_gap_log = gapped_log.path;
+      const auto loss = [&](MonotonicTime at,
+                            std::optional<std::uint64_t> damage_offset) {
+        if (at < fed.first_gap.value_or(MonotonicTime::max())) {
+          fed.first_gap = at;
+          fed.first_gap_log = log.path;
+          fed.first_gap_damage_offset = damage_offset;
+        }
+      };
+      if (log.gap.has_value()) loss(*log.gap, std::nullopt);
+      std::string reason = sign;
+      if (log.damage_offset.has_value()) {
+        const auto bound = log.damage_bound.find(topic);
+        if (bound != log.damage_bound.end() && bound->second.has_value()) {
+          loss(*bound->second, log.damage_offset);
+        } else if (reason.empty()) {
+          reason = "records are lost between intact ones at byte " +
+                   std::to_string(*log.damage_offset) + ", and nothing " +
+                   "bounds when they were to be fed (" +
+                   (watched_here ? "the program's own receipts, fed at their "
+                                   "drains' times"
+                                 : "no intact receipt of the topic precedes "
+                                   "them") +
+                   ")";
+        }
+      }
+      if (!reason.empty() && fed.refused_log.empty()) {
+        fed.refused_log = log.path;
+        fed.refused_reason = reason;
       }
     }
   }

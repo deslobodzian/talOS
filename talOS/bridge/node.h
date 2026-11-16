@@ -155,11 +155,11 @@ class HardwareNode {
   // that many seconds, then prints the exit summary, and, when no State
   // arrived, a `hardware_node warning: ended without receiving a State`
   // line on stderr. Returns the process's exit status: 1 when the packet
-  // log failed, or when the run ended at its own duration without having
-  // received one State; else 0, so a stop exits 0 whether or not the
-  // controller was ever heard. The duration's 1 applies only to a bridge
-  // run directly: the launcher ends a bounded session by stopping every
-  // member at its deadline, so there the warning line (and
+  // log failed or has a gap, or when the run ended at its own duration
+  // without having received one State; else 0, so a stop exits 0 whether
+  // or not the controller was ever heard. The duration's 1 applies only to
+  // a bridge run directly: the launcher ends a bounded session by stopping
+  // every member at its deadline, so there the warning line (and
   // session_report's controller-link verdict) is the evidence.
   int Run(int duration_s = 0);
 

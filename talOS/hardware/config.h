@@ -88,8 +88,9 @@ struct MotorConfig {
   bool foc{false};
   // [motors.*] max_torque_current_a: the largest stator current a
   // torque-current demand may ask for, amperes; 0 (the default) refuses the
-  // mode. Needs foc, at most stator_limit_a, refused on a follower. On the
-  // config wire and in ConfigurationId.
+  // mode. Needs foc, at most stator_limit_a, refused on a follower and on a
+  // motor with one (the mode drives a single motor). On the config wire and
+  // in ConfigurationId.
   double max_torque_current_a{0};
   // Main processor only (talOS/devices), not sent to the controller and not
   // part of ConfigurationId: [motors.*] position_frame = "absolute" (true)
@@ -219,7 +220,8 @@ struct Config {
 
 // Throws before any device is opened. Unknown references and duplicate names,
 // logical IDs, or CAN addresses on a bus are rejected, and so is a config
-// naming more than kMaxCanBuses - 1 CAN buses besides "rio" (CanBuses).
+// naming more than kMaxCanBuses - 1 CAN buses besides "rio" or two that
+// differ only by case (CanBuses).
 void Validate(const Config& config);
 uint64_t ConfigurationId(const Config& config);
 
@@ -235,6 +237,7 @@ struct CanBusList {
 };
 // The names view `config`'s own strings ("rio" excepted), so they live as
 // long as `config` does not change. Throws std::invalid_argument naming the
-// buses when there are more than kMaxCanBuses - 1 besides "rio".
+// buses when there are more than kMaxCanBuses - 1 besides "rio", or two names
+// (with "rio") that differ only by ASCII case, naming a device on each.
 CanBusList CanBuses(const Config& config);
 }  // namespace talos::hardware

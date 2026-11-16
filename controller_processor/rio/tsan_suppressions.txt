@@ -1,0 +1,29 @@
+# ThreadSanitizer suppressions for `./gradlew phoenixTest -Ptsan`
+# (build.gradle passes this file in TSAN_OPTIONS to the desktop test run).
+#
+# CTRE's Phoenix simulator, libCTRE_PhoenixTools_Sim.so, is a prebuilt
+# vendor library not built with -fsanitize=thread. ThreadSanitizer sees only
+# its calls into intercepted functions (malloc, pthread_mutex_lock), not the
+# atomics and fences that order them, so it reports races between the
+# library's own threads: at the first CTRE device's construction in
+# PhoenixBackend::Configure, and in FeedEnable on CTRE's enable notifier.
+#
+# This suppresses a race report when any stack in it (either access, the
+# heap block's allocation, a mutex's creation) has a frame inside that
+# library. A race between two talOS accesses to talOS memory has no such
+# frame and is still reported. It would also hide a race on memory the
+# library allocated, which talOS reaches only through Phoenix's API.
+#
+# called_from_lib:libCTRE_PhoenixTools_Sim.so is not used: it hides the
+# library's mutex locks but not the libstdc++ condition-variable waits it
+# makes on them, which then report every such wait as an unlock of an
+# unlocked mutex.
+race:libCTRE_PhoenixTools_Sim.so
+
+# CTRE's enable feeder (wpiutils/AutoFeedEnable.hpp) is a singleton it never
+# destroys, so its frc::Notifier thread is never joined. At exit the
+# simulated HAL's notifier teardown, which hal::init::InitializeNotifier
+# registers, wakes and frees the notifier that thread waits on, with nothing
+# ordering the two. Matches only races with a frame in that WPILib function
+# (HAL start-up and its exit-time teardown).
+race:hal::init::InitializeNotifier

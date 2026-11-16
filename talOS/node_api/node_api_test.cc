@@ -542,6 +542,73 @@ TEST(NodeApiTorque, TorqueCurrentModeReachesTheRequestAndTheNextIsRefused) {
   talos_sim_destroy(sim);
 }
 
+// Only velocity, position and motion magic carry a feedforward. In any other
+// mode a nonzero ff_volts is refused, naming the motor, and the motor goes
+// neutral: the gateway would neutralize that request on the robot while
+// SimHardware applied it as sent, so a binding's Sim test would pass where
+// the motor never moves. Scenario: a FOC motor allowed torque current asks
+// each mode for 0.5 with 0.5 V of feedforward.
+// REQ-SAFE-04
+TEST(NodeApiFeedforward, AModeWithoutFeedforwardRefusesOne) {
+  struct Asker {
+    TalosNode* node = nullptr;
+    int64_t wheel = -1;
+    int32_t mode = TALOS_MODE_VELOCITY;
+    int32_t result = TALOS_OK;
+    std::string error;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& a = *static_cast<Asker*>(user);
+    a.node = node;
+    a.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
+    if (a.wheel < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* u) -> int32_t {
+          auto& asker = *static_cast<Asker*>(u);
+          asker.result =
+              talos_motor_set(asker.node, asker.wheel, asker.mode, 0.5, 0.5, 0);
+          asker.error =
+              asker.result == TALOS_OK ? "" : std::string{talos_last_error()};
+          return 0;
+        },
+        &a);
+  };
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("can_id = 1\n") + 11,
+              "foc = true\nmax_torque_current_a = 5\n");
+  TalosSim* sim = talos_sim_from_toml(toml.c_str());
+  ASSERT_NE(sim, nullptr) << talos_last_error();
+  Asker asker;
+  ASSERT_NE(talos_sim_add(sim, "roller", build, &asker), nullptr)
+      << talos_last_error();
+  TalosSimHardware* hw = talos_sim_hardware_create(sim);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim, 30 * kMs), TALOS_OK) << talos_last_error();
+  ASSERT_EQ(asker.result, TALOS_OK) << asker.error;
+  TalosMotorRequest request{};
+  ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "roller", "wheel", &request),
+            TALOS_OK);
+  ASSERT_EQ(request.mode, TALOS_MODE_VELOCITY);
+  ASSERT_EQ(request.ff_volts, 0.5);
+
+  for (const int32_t mode : {TALOS_MODE_NEUTRAL, TALOS_MODE_DUTY_CYCLE,
+                             TALOS_MODE_VOLTAGE, TALOS_MODE_TORQUE_CURRENT}) {
+    asker.mode = mode;
+    ASSERT_EQ(talos_sim_step(sim, 30 * kMs), TALOS_OK) << talos_last_error();
+    EXPECT_EQ(asker.result, TALOS_ERR) << "mode " << mode;
+    EXPECT_NE(asker.error.find("'wheel'"), std::string::npos) << asker.error;
+    ASSERT_EQ(talos_sim_hardware_applied_motor(hw, "roller", "wheel", &request),
+              TALOS_OK);
+    EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL) << "mode " << mode;
+    EXPECT_EQ(request.ff_volts, 0.0) << "mode " << mode;
+  }
+  talos_sim_hardware_destroy(hw);
+  talos_sim_destroy(sim);
+}
+
 // The ABI takes raw handles, so it refuses an unknown device name and a
 // handle of another kind or out of range.
 TEST_F(NodeApi, DeviceHandlesAreCheckedByNameAndKind) {

@@ -298,12 +298,12 @@ wire resolution. They are observations, not automatic thermal derating.
 Check `connected`/link freshness before using readings. While a device's
 sample is invalid (disconnected, aged out, masked after a reset, or the
 gateway unconfigured: [fault scope](../talOS/hardware/README.md#runtime-contract);
-for a `Motor`, `CANcoder` or `Gyro`, a stale hardware link too), a position (`Motor`, `CANcoder` and `Encoder` `position()`, `Gyro` `yaw()`)
+for a `Motor`, `CANcoder`, `Gyro` or `Encoder`, a stale hardware link too), a position (`Motor`, `CANcoder` and `Encoder` `position()`, `Gyro` `yaw()`)
 reads the last valid one, in the current rezero frame (0 before any valid
 sample), since the zero an invalid sample carries would read as a jump; the
 rates and efforts (velocity, yaw rate, voltage, currents) read that zero.
-Motor temperature and the `Encoder`, `DigitalInput` and `AnalogInput` reads
-keep the last received sample across a stale link. The same reads reach Python through the C ABI. SimHardware
+Motor temperature and the `DigitalInput` and `AnalogInput` reads keep the
+last received sample across a stale link. The same reads reach Python through the C ABI. SimHardware
 `set_motor(..., temperature_c=..., supply_current_a=..., stator_current_a=...)`
 injects diagnostics and the stator current `current()` reads through the same
 wire codec (C++ takes these optional arguments after ages, in that order).
@@ -621,11 +621,12 @@ the others keep driving, and only a request observed after the last such
 State drives it again; a follower's sample reads invalid while its master's
 does. An invalid motor or CAN sensor sample reads zero in every measured
 field. As on the gateway, a State in which every motor and CAN sensor sample
-the RoboRIO reports is invalid (disconnected, too old, or a motor of a chain
-`reset_device` is restoring) raises the hardware fault (`robot_enabled`
-false) and starts a new epoch with every output neutral, digital and PWM
-included, until feedback returns; a follower or a reset CANcoder that only
-the gateway's masks invalidate still counts as feedback. Inspection never refreshes
+is invalid as published (disconnected, too old, masked by `reset_device`,
+or a follower of an invalid master) raises the hardware fault
+(`robot_enabled` false) and starts a new epoch with every output neutral,
+digital and PWM included, until feedback returns: `reset_device` on every
+motor and CAN sensor (a CAN brownout) is total loss until the restore ends.
+Inspection never refreshes
 freshness. With `ideal_motors()`, neutral velocity decays each tick by
 `min(1, period/tau)`, with `tau = 50 ms` for brake and `1 s` for coast;
 velocity below `0.01 rps` snaps to zero. Position continues integrating during
@@ -653,7 +654,9 @@ topics=[(M, topic)], motors=[...], digital_outputs=[...], pwms=[...])` fails
 at the first tick of a step (each boundary of the node's period), or step
 end, at which a listed topic's bytes or a requested or applied output differ
 (or a topic a `parity.require_published()` step names has no message at the
-step's end), naming the step, the tick and both decoded values. How a parity run
+step's end), naming the step, the tick and both decoded values; it also
+fails a step whose clock moved other than through `rig.advance` (an action
+calling `rig.sim.step` would skip the ticks it crosses). How a parity run
 stands in for a Python twin's matrix cases is in
 [TESTING.md §7](TESTING.md#7-the-node-test-matrix).
 

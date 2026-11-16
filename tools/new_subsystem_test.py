@@ -693,23 +693,43 @@ class NewSubsystemTest(unittest.TestCase):
         # robot's talos/ submodule) and whose .bazelrc imports that
         # checkout's talos.bazelrc by the same path, not the robot
         # repository's flags (no copied talOS-only lines);
-        # when that talOS is Bazel's copy of a fetched module (under an
-        # output base's external/), it refuses and writes nothing.
+        # when that talOS is Bazel's copy of a fetched module (a real
+        # directory under an output base's external/, or a symlink there
+        # into Bazel's repository contents cache), it refuses and writes
+        # nothing; reached through an external/ symlink to a checkout (a
+        # local_path_override), it is that checkout.
         def write(path, text):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(text)
 
-        for case in ("checkout", "fetched"):
+        for case in ("checkout", "fetched", "cached", "override"):
             with self.subTest(case=case), \
                     tempfile.TemporaryDirectory() as top, \
                     mock.patch.object(new_subsystem.sync_manifest,
                                       "current_repository",
                                       return_value="talos+"):
-                talos = (os.path.join(top, "robot", "talos")
-                         if case == "checkout" else
-                         os.path.join(top, "base", "external", "talos+"))
+                talos = {
+                    "checkout": os.path.join(top, "robot", "talos"),
+                    "fetched": os.path.join(top, "base", "external",
+                                            "talos+"),
+                    # Bazel's layout: <repository cache>/contents (with
+                    # its gc_lock) / <hash> / <uuid>.
+                    "cached": os.path.join(top, "cache", "repos", "v1",
+                                           "contents", "ab12", "cd34"),
+                    "override": os.path.join(top, "robot", "talos"),
+                }[case]
                 os.makedirs(os.path.join(top, "base", "execroot"))
+                script_root = talos
+                if case in ("cached", "override"):
+                    script_root = os.path.join(top, "base", "external",
+                                               "talos+")
+                    os.makedirs(talos)
+                    os.makedirs(os.path.dirname(script_root))
+                    os.symlink(talos, script_root)
+                if case == "cached":
+                    write(os.path.join(top, "cache", "repos", "v1",
+                                       "contents", "gc_lock"), "")
                 for directory, name in ((talos, "talos"),
                                         (os.path.join(top, "robot"),
                                          "robot")):
@@ -718,7 +738,8 @@ class NewSubsystemTest(unittest.TestCase):
                     write(os.path.join(directory, "talos.bazelrc"),
                           f"# {name}\n")
                     write(os.path.join(directory, ".bazelversion"), "8.4.2\n")
-                script = os.path.join(talos, "tools", "new_subsystem.py")
+                script = os.path.join(script_root, "tools",
+                                      "new_subsystem.py")
                 write(script, "")
                 target = os.path.join(top, "arm")
                 out = io.StringIO()
@@ -730,7 +751,7 @@ class NewSubsystemTest(unittest.TestCase):
                         contextlib.redirect_stderr(out):
                     status = new_subsystem.main(
                         ["arm", "--lang", "py", "--standalone", "../arm"])
-                if case == "fetched":
+                if case in ("fetched", "cached"):
                     self.assertNotEqual(status, 0, out.getvalue())
                     self.assertFalse(os.path.exists(target), out.getvalue())
                     continue
@@ -752,6 +773,80 @@ class NewSubsystemTest(unittest.TestCase):
                 imported = imported.replace("%workspace%", target)
                 with open(imported, encoding="utf-8") as f:
                     self.assertEqual(f.read(), "# talos\n", imported)
+
+    # REQ-DEV-02
+    def test_standalone_refuses_a_checkout_without_a_bazel_version(self):
+        # The new repository takes the checkout's .bazelversion; a checkout
+        # without one is refused, naming the file, not a traceback.
+        with tempfile.TemporaryDirectory() as top:
+            talos = os.path.join(top, "talos")
+            os.makedirs(talos)
+            for name, text in (("MODULE.bazel", 'module(name = "talos")\n'),
+                               ("talos.bazelrc", "# talos\n")):
+                with open(os.path.join(talos, name), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+            with self.assertRaisesRegex(new_subsystem.Refused,
+                                        r"\.bazelversion"):
+                new_subsystem.plan_standalone(os.path.join(top, "arm"),
+                                              "arm", "py", talos)
+
+    # REQ-DEV-01
+    def test_talos_checkout_flag_is_held_to_the_checkout_check(self):
+        # --talos-checkout DIR (relative to the robot repository's root)
+        # passes the check the default checkout does: a directory that is
+        # not a talOS checkout (the robot repository itself, a missing
+        # directory) or that is Bazel's copy of a fetched module is
+        # refused, naming the path, and nothing is written.
+        def write(path, text):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+        # ../base/external/linked+ is a local_path_override's symlink to
+        # the checkout.
+        cases = {".": False, "missing": False,
+                 "../base/external/talos+": False, "talos": True,
+                 "../base/external/linked+": True}
+        for flag, accepted in cases.items():
+            with self.subTest(flag=flag), \
+                    tempfile.TemporaryDirectory() as top, \
+                    mock.patch.object(new_subsystem.sync_manifest,
+                                      "current_repository",
+                                      return_value="talos+"):
+                robot = os.path.join(top, "robot")
+                os.makedirs(os.path.join(top, "base", "execroot"))
+                for directory, name in (
+                        (os.path.join(robot, "talos"), "talos"),
+                        (os.path.join(top, "base", "external", "talos+"),
+                         "talos"),
+                        (robot, "robot")):
+                    write(os.path.join(directory, "MODULE.bazel"),
+                          f'module(name = "{name}")\n')
+                    write(os.path.join(directory, "talos.bazelrc"),
+                          f"# {name}\n")
+                    write(os.path.join(directory, ".bazelversion"), "8.4.2\n")
+                os.symlink(os.path.join(robot, "talos"),
+                           os.path.join(top, "base", "external", "linked+"))
+                script = os.path.join(robot, "talos", "tools",
+                                      "new_subsystem.py")
+                write(script, "")
+                target = os.path.join(top, "arm")
+                out = io.StringIO()
+                with mock.patch.dict(os.environ,
+                                     BUILD_WORKSPACE_DIRECTORY=robot), \
+                        mock.patch.object(new_subsystem, "__file__", script), \
+                        contextlib.redirect_stdout(out), \
+                        contextlib.redirect_stderr(out):
+                    status = new_subsystem.main(
+                        ["arm", "--lang", "py", "--standalone", "../arm",
+                         "--talos-checkout", flag])
+                if accepted:
+                    self.assertEqual(status, 0, out.getvalue())
+                    continue
+                self.assertEqual(status, 1, out.getvalue())
+                self.assertIn(f"--talos-checkout {flag}", out.getvalue())
+                self.assertFalse(os.path.exists(target), out.getvalue())
 
     # REQ-DEV-01
     def test_robot_repository_simulation_steps_run_the_simulation_config(self):
@@ -775,14 +870,26 @@ class NewSubsystemTest(unittest.TestCase):
                           'exports_files(["practice.toml"])\n'),
             "roller/BUILD": "",
         }
-        for sim in ("//cfg:practice.toml", "//cfg:robot_sim.toml"):
-            with self.subTest(sim=sim), \
+        def talos_sim(name, config):
+            return (f'talos_sim(\n    name = "{name}",\n'
+                    f'    config = {config},\n)\n')
+
+        # A //:sim whose config is no string literal runs a config the
+        # scaffold cannot read, even beside another talos_sim that names
+        # the simulation config.
+        builds = {
+            "practice": (talos_sim("sim", '"//cfg:practice.toml"'), False),
+            "sim": (talos_sim("sim", '"//cfg:robot_sim.toml"'), True),
+            "unread sim": (talos_sim("sim", "SIM_CONFIG")
+                           + talos_sim("sim_alone", '"//cfg:robot_sim.toml"'),
+                           False),
+        }
+        for case, (build, runs_sim) in builds.items():
+            with self.subTest(case=case), \
                     tempfile.TemporaryDirectory() as root, \
                     mock.patch.object(new_subsystem.sync_manifest,
                                       "current_repository",
                                       return_value="talos+"):
-                build = (f'talos_sim(\n    name = "sim",\n'
-                         f'    config = "{sim}",\n)\n')
                 for path, text in {**files, "BUILD.bazel": build}.items():
                     os.makedirs(os.path.dirname(os.path.join(root, path)),
                                 exist_ok=True)
@@ -828,12 +935,54 @@ class NewSubsystemTest(unittest.TestCase):
                 (run,) = [line.strip() for line in steps.splitlines()
                           if line.strip().startswith("bazel run")
                           and "--duration-s" in line]
-                if sim.endswith("robot_sim.toml"):
+                if runs_sim:
                     self.assertTrue(run.startswith("bazel run //:sim --"),
                                     steps)
                 else:
                     self.assertIn("--config $PWD/cfg/robot_sim.toml --sim",
                                   run)
+
+    # REQ-DEV-01
+    def test_node_tests_spawn_no_binary(self):
+        # A generated node_test runs the node's class on Sim; the binary's
+        # logged run and replay is proved once per language by
+        # //tools:scaffold_replay_cc_test and :scaffold_replay_py_test
+        # (TEST-5). A node_test without the binary in its runfiles cannot
+        # spawn it.
+        for lang in ("cpp", "py"):
+            for kind, raw in (("velocity", False), ("position", False),
+                              ("position", True), ("estimator", False)):
+                with self.subTest(lang=lang, kind=kind, raw=raw):
+                    files = new_subsystem.package_files("arm", lang,
+                                                        kind=kind, raw=raw)
+                    rule = files["BUILD"].split('name = "node_test"')[1]
+                    self.assertNotIn('":node"', rule)
+                    test = files["node_test.cc" if lang == "cpp"
+                                 else "node_test.py"]
+                    self.assertNotIn("--replay", test)
+
+    # REQ-DEV-05
+    def test_sim_run_outlasts_its_schedule_however_late_the_gateway_starts(
+            self):
+        # The launcher counts --duration-s from its first spawn, but
+        # sim_gateway counts its schedules from its own loop start, which
+        # the launcher bounds only by killing a member that has not
+        # registered by its startup grace (talOS/launcher/roster.h
+        # heartbeat_startup_grace_ms, 5000 ms). Each printed run must
+        # outlast that grace plus the joystick schedule's last event, or a
+        # slow start ends the session before the button is held (TOOLS-18).
+        startup_grace_s = 5
+        for run in (new_subsystem.sim_run(3),
+                    new_subsystem.launcher_sim_run("@talos", "robot_sim.toml",
+                                                   3),
+                    new_subsystem.dependent_sim_run(3)):
+            duration_s = int(re.search(r"--duration-s (\d+)", run).group(1))
+            schedule = re.search(
+                r"--joystick-schedule (?:--sim-gateway-arg )?'([^']*)'",
+                run).group(1)
+            last_s = max(float(event.split(":", 1)[0])
+                         for event in schedule.split("|"))
+            self.assertGreater(duration_s, startup_grace_s + last_s, run)
 
     # REQ-DEV-01
     def test_simulation_test_loads_keep_the_build_parsing(self):

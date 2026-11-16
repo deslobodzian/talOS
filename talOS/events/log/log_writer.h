@@ -97,6 +97,20 @@ namespace talos::event::log {
 inline constexpr std::size_t DEFAULT_CHUNK_BYTES = 256u << 10;
 inline constexpr std::size_t DEFAULT_CHUNK_COUNT = 4;
 
+// A flags word a writer ORs `bit` into as a gap opens (LogWriterOptions::
+// gap_flags): a node's registry row, `flags` its flags word and `bit`
+// introspect::kFlagLogGap. `owner`, when set, says whose the word is: the
+// bit is set only while it still holds `expected` (an acquire load), so a
+// row another process has claimed since (the registry's generation) is
+// left alone. Every word must outlive the writer, or be taken back first
+// (LogWriter::set_gap_flags).
+struct GapFlagTarget {
+  std::atomic<std::uint32_t>* flags{nullptr};
+  std::uint32_t bit{0};
+  const std::atomic<std::uint64_t>* owner{nullptr};
+  std::uint64_t expected{0};
+};
+
 struct LogWriterOptions {
   // Minimum buffer size. start() grows all chunks to fit the manifest's largest
   // message and a GAP record; a record exceeding that capacity is dropped (a
@@ -153,6 +167,12 @@ struct LogWriterOptions {
   // the writer writes it to the file (see LogWriter): what a process killed
   // by a signal can lose, plus the writer's scheduling delay.
   std::chrono::nanoseconds write_interval{std::chrono::milliseconds{10}};
+
+  // Where a gap is reported the moment it opens (GapFlagTarget): one
+  // relaxed fetch_or, no lock or wait, as the producer drops the gap's
+  // first record, before any GAP record exists, so a process killed during
+  // the gap has already said so. Empty reports nowhere.
+  GapFlagTarget gap_flags{};
 
   // Tests only: the writer thread calls it, with its stop flag, each time it
   // has found nothing handed over and nothing due, before it checks for a
@@ -245,6 +265,11 @@ class LogWriter {
   // gap has no GAP record but is still counted here, so incomplete() and the
   // registry's kFlagLogGap report it.
   std::uint64_t gaps() const noexcept;
+  // Sets Options::gap_flags after construction, for a word that exists
+  // only once the writer does (a node's registry row, claimed after its
+  // loop is built); an empty target stops reporting, before the word goes.
+  // Only from the thread that records (the loop's), or before start().
+  void set_gap_flags(const GapFlagTarget& target) noexcept;
   // Records dropped in every gap so far. Lock-free; any thread.
   std::uint64_t lost_records() const noexcept;
   // A gap is open: records are being dropped now. Lock-free; any thread.

@@ -13,6 +13,8 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <list>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <system_error>
@@ -117,23 +119,84 @@ class SpanSource {
   std::span<const std::byte> data_;
 };
 
+// The descriptors every FileSource of the process holds, least recently
+// read last. A session merge keeps a reader per log, which may be more logs
+// than RLIMIT_NOFILE: at most kHeld stay open, and an open that finds the
+// process out of descriptors closes the least recently read one first. A
+// source whose descriptor was closed opens its path again at its next
+// refill, so a reader costs an open per window (kChunk bytes) at worst.
+class FileSource;
+
+class DescriptorCache {
+ public:
+  static constexpr std::size_t kHeld = 64;
+  static DescriptorCache& instance() {
+    static DescriptorCache cache;
+    return cache;
+  }
+  std::mutex& mutex() noexcept { return mutex_; }
+  // Opens `path` read-only, closing held descriptors while the process is
+  // out of them; -1 with errno set if it still fails. Under mutex().
+  int open(const std::string& path) {
+    while (true) {
+      const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      if (fd >= 0 || (errno != EMFILE && errno != ENFILE) || held_.empty()) {
+        return fd;
+      }
+      evict_oldest();
+    }
+  }
+  // Closes the least recently read held descriptor. Under mutex().
+  void evict_oldest();
+
+ private:
+  friend class FileSource;
+  std::mutex mutex_;
+  std::list<FileSource*> held_;  // most recently read first
+};
+
 class FileSource {
  public:
   static constexpr std::size_t kChunk = 64u << 10;
-  explicit FileSource(int fd) : fd_{fd} {
+  // Adopts `fd`, an open descriptor of `path` (opened by
+  // DescriptorCache::open).
+  FileSource(std::string path, int fd) : path_{std::move(path)} {
     struct stat st {};
-    if (::fstat(fd_, &st) != 0) {
-      throw std::system_error(errno, std::generic_category(),
+    if (::fstat(fd, &st) != 0) {
+      const int error = errno;
+      ::close(fd);
+      throw std::system_error(error, std::generic_category(),
                               "LogReader: fstat failed");
     }
     size_ = static_cast<std::uint64_t>(st.st_size);
+    device_ = st.st_dev;
+    inode_ = st.st_ino;
+    DescriptorCache& cache = DescriptorCache::instance();
+    const std::lock_guard lock{cache.mutex()};
+    fd_ = fd;
+    hold(cache);
   }
+  ~FileSource() {
+    DescriptorCache& cache = DescriptorCache::instance();
+    const std::lock_guard lock{cache.mutex()};
+    if (fd_ >= 0) {
+      cache.held_.erase(held_at_);
+      ::close(fd_);
+    }
+  }
+  FileSource(const FileSource&) = delete;
+  FileSource& operator=(const FileSource&) = delete;
+
   std::uint64_t size() const noexcept { return size_; }
   // Up to `n` (at most kChunk) bytes at `offset`, valid until the next call;
   // fewer only at the end of the file.
   std::span<const std::byte> view(std::uint64_t offset, std::size_t n) {
     if (offset < window_offset_ ||
         offset + n > window_offset_ + window_.size()) {
+      DescriptorCache& cache = DescriptorCache::instance();
+      // Held across the read, so no other source closes this descriptor.
+      const std::lock_guard lock{cache.mutex()};
+      reopen(cache);
       fill(offset);
     }
     if (offset < window_offset_ || offset >= window_offset_ + window_.size()) {
@@ -145,6 +208,39 @@ class FileSource {
   }
 
  private:
+  friend class DescriptorCache;
+
+  // Puts this source's open descriptor first in the cache, closing the
+  // least recently read ones beyond kHeld. Under the cache's mutex.
+  void hold(DescriptorCache& cache) {
+    while (cache.held_.size() >= DescriptorCache::kHeld) cache.evict_oldest();
+    cache.held_.push_front(this);
+    held_at_ = cache.held_.begin();
+  }
+
+  // Makes fd_ an open descriptor of the file this source was opened on,
+  // opening its path again if the cache closed it. Under the cache's mutex.
+  void reopen(DescriptorCache& cache) {
+    if (fd_ >= 0) {
+      cache.held_.splice(cache.held_.begin(), cache.held_, held_at_);
+      return;
+    }
+    const int fd = cache.open(path_);
+    if (fd < 0) {
+      throw std::system_error(errno, std::generic_category(),
+                              "LogReader: open failed for " + path_);
+    }
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || st.st_dev != device_ || st.st_ino != inode_) {
+      ::close(fd);
+      throw std::runtime_error("LogReader: " + path_ +
+                               " was replaced while it was read (a rotated "
+                               "or rewritten log); read it again");
+    }
+    fd_ = fd;
+    hold(cache);
+  }
+
   void fill(std::uint64_t offset) {
     window_offset_ = offset;
     window_.resize(static_cast<std::size_t>(
@@ -164,11 +260,22 @@ class FileSource {
     window_.resize(got);
   }
 
-  int fd_;
+  std::string path_;
+  int fd_{-1};  // -1 while the cache has closed it
+  std::list<FileSource*>::iterator held_at_;  // valid while fd_ >= 0
   std::uint64_t size_{0};
+  dev_t device_{};
+  ino_t inode_{};
   std::uint64_t window_offset_{0};
   std::vector<std::byte> window_;
 };
+
+void DescriptorCache::evict_oldest() {
+  FileSource* oldest = held_.back();
+  held_.pop_back();
+  ::close(oldest->fd_);
+  oldest->fd_ = -1;
+}
 
 // Folds the `size` bytes at `offset` into `crc`. False if the file ends
 // first.
@@ -298,19 +405,23 @@ Registration registration_of(const ManifestEntry& entry,
 // through one fixed buffer.
 class LogStream {
  public:
-  explicit LogStream(std::string_view path)
-      : fd_{::open(std::string{path}.c_str(), O_RDONLY | O_CLOEXEC)} {
+  explicit LogStream(const std::string& path) {
+    DescriptorCache& cache = DescriptorCache::instance();
+    const std::lock_guard lock{cache.mutex()};
+    fd_ = cache.open(path);
     if (fd_ < 0) {
-      throw std::system_error(
-          errno, std::generic_category(),
-          "LogReader: open failed for " + std::string{path});
+      throw std::system_error(errno, std::generic_category(),
+                              "LogReader: open failed for " + path);
     }
   }
-  ~LogStream() { ::close(fd_); }
+  ~LogStream() {
+    if (fd_ >= 0) ::close(fd_);
+  }
   LogStream(const LogStream&) = delete;
   LogStream& operator=(const LogStream&) = delete;
 
-  int fd() const noexcept { return fd_; }
+  // Hands the descriptor over (to a FileSource); the stream reads no more.
+  int release() noexcept { return std::exchange(fd_, -1); }
 
   // Fills `out`; fewer bytes only at the end of the file.
   std::size_t read(std::span<std::byte> out) {
@@ -355,13 +466,14 @@ class LogStream {
 
  private:
   static constexpr std::size_t kBuffer = 64u << 10;
-  int fd_;
+  int fd_{-1};
   std::vector<std::byte> buffer_ = std::vector<std::byte>(kBuffer);
 };
 
 }  // namespace
 
-LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
+LogReader::LogReader(std::string_view path)
+    : path_{path}, data_{read_whole_file(path)} {
   constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
   if (data_.size() < kVersionEnd) {
     throw IncompleteLogHeader("LogReader: file too short for a header");
@@ -494,9 +606,8 @@ bool LogReader::next(Record& out) {
 LogSummary SummarizeLog(std::string_view path) { return VisitLog(path, {}); }
 
 struct WindowedLogReader::State {
-  explicit State(std::string_view path) : path{path}, stream{path} {}
+  explicit State(std::string_view path) : path{path} {}
   std::string path;
-  LogStream stream;
   std::optional<FileSource> source;
   std::vector<ManifestEntry> entries;
   Manifest manifest;
@@ -516,7 +627,7 @@ struct WindowedLogReader::State {
 WindowedLogReader::WindowedLogReader(std::string_view path)
     : state_{std::make_unique<State>(path)} {
   State& state = *state_;
-  LogStream& stream = state.stream;
+  LogStream stream{state.path};
   constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
   FileHeader header{};
   const std::size_t header_read = stream.read(header);
@@ -583,7 +694,7 @@ WindowedLogReader::WindowedLogReader(std::string_view path)
       std::uint64_t{header.manifest_count} * sizeof(ManifestEntry) +
       header.schema_bytes;
   state.cursor = state.records_offset;
-  state.source.emplace(stream.fd());
+  state.source.emplace(state.path, stream.release());
 }
 
 WindowedLogReader::~WindowedLogReader() = default;

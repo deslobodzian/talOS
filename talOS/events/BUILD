@@ -160,8 +160,18 @@ cc_library(
         ":events",
         ":events_core",
         ":events_log",
+        ":session_manifest",
         "//talOS/schema:identity",
     ],
+)
+
+# The session manifest's reader and its key names, which the launcher's
+# writer uses too (session_manifest.h).
+cc_library(
+    name = "session_manifest",
+    srcs = ["session_manifest.cc"],
+    hdrs = ["session_manifest.h"],
+    visibility = ["//visibility:public"],
 )
 
 cc_test(

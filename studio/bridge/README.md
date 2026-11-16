@@ -31,7 +31,10 @@ a rebuilt bundle and restarting the service (first when the web directory is an 
 either way. Once listening, the
 bridge prints `listening <port>` on stdout; port 0 asks the OS for a free port,
 which that line reports (how the bridge tests avoid racing other processes for
-a port).
+a port). The port is held exclusively (uSockets' `LIBUS_LISTEN_EXCLUSIVE_PORT`:
+`SO_REUSEADDR`, never `SO_REUSEPORT`), so a port another listener holds, such
+as another session's bridge, is refused: the bridge prints `cannot listen on
+port <port>` and exits 1 (`//studio/bridge:listen_test`).
 
 These named options are removed before positional parsing:
 
@@ -162,7 +165,7 @@ Observer endpoints are listed separately from subscribers.
 The order of the fast values is the order `BuildSystemGraph` appends them;
 every reader of an update walks the document in that order (Studio's
 `fastSlots` in [`system.ts`](../src/system.ts), and this directory's Python
-harness, `fast_slots` in `integration_test.py`). Golden files,
+harness, `fast_slots` in `bridge_client.py`). Golden files,
 [`testdata/golden`](testdata/golden), pin it: `:system_test` requires the
 bridge to reproduce a graph, its next update and the graph after it byte for
 byte, and `//studio:system_test` and `:fast_slots_test` require each reader

@@ -285,6 +285,7 @@ const ds::DriverStationData& DriverStationReader::Read(uint64_t now_us,
              kIndexMask;
   }
   const Snapshot& snapshot = shared_->slots[front_];
+  refreshed_us_ = 0;
   if (!snapshot.refreshed) return kNoDriverStation;
   // A refresh completed after this tick's clock reading is current; one
   // command_timeout_us old is stale, as the gateway's own command expiry is.
@@ -292,6 +293,7 @@ const ds::DriverStationData& DriverStationReader::Read(uint64_t now_us,
       now_us - snapshot.refreshed_us >= stale_us) {
     return kNoDriverStation;
   }
+  refreshed_us_ = snapshot.refreshed_us;
   return snapshot.data;
 }
 

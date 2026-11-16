@@ -17,7 +17,7 @@ import unittest
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import BINARY, TEXT, bound_port, receive
+from bridge_client import BINARY, TEXT, bound_port, receive
 
 
 def connect(port, stalled=False):
@@ -248,16 +248,9 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True)
             processes.append(bridge)
+            # The bridge reports its port once it listens, so it accepts the
+            # clients below at once.
             port = bound_port(bridge)
-            deadline = time.monotonic() + 10
-            while True:
-                try:
-                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/system.json", timeout=1):
-                        break
-                except OSError:
-                    if time.monotonic() > deadline:
-                        raise
-                    time.sleep(.02)
             if stalled:
                 sock, headers = connect(port, True)
                 sockets.append(sock)

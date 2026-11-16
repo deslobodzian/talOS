@@ -1,7 +1,7 @@
 #pragma once
 
 // Merging one session's event logs into one time-ordered stream (log_dump,
-// tlog_to_wpilog), read through a fixed window per log: memory grows with the
+// Studio's review), read through a fixed window per log: memory grows with the
 // number of logs, not their records.
 
 #include <cstddef>

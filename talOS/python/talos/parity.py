@@ -39,7 +39,8 @@ A step is a name and one or more actions; an action is a callable taking
 the Rig (sim, hw, node). The functions below build the usual actions; each
 advances the clock by its `then` seconds afterwards. An action of your own
 advances the clock with rig.advance(seconds), never rig.sim.step, which
-would skip the ticks it crosses.
+would skip the ticks it crosses: a step whose clock moved any other way
+fails, naming the step.
 """
 
 import struct
@@ -64,10 +65,23 @@ class Rig:
         self.ticks = []
         self._observe = observe
         self._period_ns = round(self.sim.node(node).period * _NS)
+        # Where advance() last left the clock.
+        self._advanced_to_ns = self.sim.now_ns
+
+    def check_clock(self, where):
+        """Raises AssertionError when the clock is not where advance() left
+        it: something else stepped the Sim, skipping the ticks it crossed."""
+        if self.sim.now_ns != self._advanced_to_ns:
+            raise AssertionError(
+                f"{where}: the simulated clock moved from "
+                f"{self._advanced_to_ns / _NS:.6f} s to "
+                f"{self.sim.now_ns / _NS:.6f} s other than through "
+                f"Rig.advance, so the ticks it crossed were not compared")
 
     def advance(self, seconds):
         """Advances the clock by `seconds`, observing at each boundary of
         the node's period it reaches."""
+        self.check_clock("Rig.advance")
         now = self.sim.now_ns
         end = now + round(seconds * _NS)
         while now < end:
@@ -77,6 +91,7 @@ class Rig:
             now = self.sim.now_ns
             if now == boundary:
                 self.ticks.append((now, self.observe()))
+        self._advanced_to_ns = now
 
     def observe(self):
         """[(what, value)] now."""
@@ -240,7 +255,12 @@ def assert_same_behaviour(cpp_cls, py_cls, config, node, scenario, *,
         for language, rig in rigs.items():
             rig.ticks = []
             for action in actions:
-                action(rig)
+                try:
+                    action(rig)
+                    rig.check_clock("after the action")
+                except AssertionError as error:
+                    raise AssertionError(f"{step} ({language}): {error}") \
+                        from None
             ended[language] = rig.observe()
         cpp_ticks, py_ticks = rigs["C++"].ticks, rigs["Python"].ticks
         # The same actions advance both clocks alike, so both sides reach

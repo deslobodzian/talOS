@@ -9,6 +9,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -19,6 +20,7 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/devices/testing.h"
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/hardware/gateway.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/node/testing.h"
 
@@ -457,7 +459,7 @@ TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
   hw->set_connected("mech", "a", false);
   sim.step(10ms);
   EXPECT_FALSE(mech.a.connected());
-  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 0);
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 62.5);  // as last read
   EXPECT_DOUBLE_EQ(mech.a.supply_current_a(), 0);
 
   hw->set_connected("mech", "a", true);
@@ -1353,10 +1355,11 @@ TEST(Devices, InvalidSampleHoldsTheLastValidPosition) {
 // A stale link is an invalid sample too: connected() reads false, and a node
 // cannot tell it from the gateway's. Scenario: a rezeroed motor at 1 (raw 3)
 // turning at 2 rot/s and drawing current, a rezeroed gyro turning at -0.5
-// rot/s and a CANcoder at 0.2 turning at 0.3 rot/s, then no State for longer
-// than command_timeout_us. Each position holds its last valid value through
-// its rezero offset, and every rate and effort reads zero, not the last live
-// value (a yaw rate of -0.5 rot/s on a gyro reported disconnected).
+// rot/s, a CANcoder at 0.2 turning at 0.3 rot/s and a RoboRIO encoder at 0.4
+// turning at 0.6 rot/s, then no State for longer than command_timeout_us.
+// Each position holds its last valid value through its rezero offset, and
+// every rate and effort reads zero, not the last live value (a yaw rate of
+// -0.5 rot/s on a gyro reported disconnected).
 // REQ-CONTRACT-34
 TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
   auto sim = Sim::FromToml(kRobotToml);
@@ -1365,6 +1368,7 @@ TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
   hw->set_motor("mech", "b", 3, 2, 0, 0, 40.0, 18.0, 30.0);
   hw->set_gyro("mech", "gyro", 0.25, -0.5);
   hw->set_cancoder("mech", "cc", 0.2, 0.3);
+  hw->set_encoder("mech", "enc", 0.4, 0.6);
   sim.step(10ms);
   mech.b.rezero(1);
   mech.gyro.rezero();
@@ -1373,21 +1377,100 @@ TEST(Devices, StaleLinkHoldsPositionsAndZeroesRatesAndEfforts) {
   ASSERT_DOUBLE_EQ(mech.b.velocity(), 2);
   ASSERT_DOUBLE_EQ(mech.b.current(), 30.0);
   ASSERT_DOUBLE_EQ(mech.gyro.yaw_rate(), -0.5);
+  ASSERT_DOUBLE_EQ(mech.enc.velocity(), 0.6);
 
   hw.reset();       // the bridge goes silent
   sim.step(150ms);  // past [robot] command_timeout_us
   ASSERT_FALSE(mech.b.connected());
   ASSERT_FALSE(mech.gyro.connected());
   ASSERT_FALSE(mech.cc.connected());
+  ASSERT_FALSE(mech.enc.connected());
   EXPECT_DOUBLE_EQ(mech.b.position(), 1);
   EXPECT_DOUBLE_EQ(mech.gyro.yaw(), 0);
   EXPECT_DOUBLE_EQ(mech.cc.position(), 0.2);
+  EXPECT_DOUBLE_EQ(mech.enc.position(), 0.4);
   EXPECT_EQ(mech.b.velocity(), 0.0);
   EXPECT_EQ(mech.b.voltage(), 0.0);
   EXPECT_EQ(mech.b.current(), 0.0);
   EXPECT_EQ(mech.b.supply_current_a(), 0.0);
   EXPECT_EQ(mech.gyro.yaw_rate(), 0.0);
   EXPECT_EQ(mech.cc.velocity(), 0.0);
+  EXPECT_EQ(mech.enc.velocity(), 0.0);
+}
+
+// The newest /hw/state SimHardware published, decoded.
+hardware::State LatestState(const Sim& sim) {
+  const auto packet = sim.latest<Packet>(hardware::kStateTopic);
+  hardware::State state{};
+  EXPECT_TRUE(packet && hardware::Decode(packet->bytes(), state));
+  return state;
+}
+
+// A backend whose every Read returns `read`, as PhoenixBackend reports a
+// device that stopped answering: its last readings, marked invalid.
+class FixedReadBackend final : public hardware::Backend {
+ public:
+  explicit FixedReadBackend(const hardware::State& read) : read_{read} {}
+  bool Configure(const hardware::Config& /*config*/) override { return true; }
+  bool Read(hardware::State& state) override {
+    state.motors = read_.motors;
+    state.sensors = read_.sensors;
+    return true;
+  }
+  bool Apply(std::span<const hardware::MotorRequest> /*requests*/) override {
+    return true;
+  }
+  std::span<const std::uint16_t> ApplyFailedDevices() const override {
+    return {};
+  }
+  void Neutral() override {}
+
+ private:
+  hardware::State read_;
+};
+
+// A disconnected motor or CAN sensor in SimHardware publishes the sample the
+// gateway publishes for the same readings marked invalid
+// (hardware::MarkInvalid): every measurement zero, its ages and temperature
+// as last read, so a node reads in a Sim test what it reads on the robot.
+// Scenario: motor a at 1.5 rot, -2 rot/s, 62.5 C, 18.25 A supply and 40.04 A
+// stator, with 300 and 400 us ages, and CANcoder cc at 0.2 rot, 0.3 rot/s,
+// with 500 and 600 us ages, stop answering.
+// REQ-CONTRACT-34
+TEST(Devices, ADisconnectedDeviceIsTheGatewaysInvalidSample) {
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& mech = sim.add<Mech>("mech");
+  SimHardware hw{sim};
+  hw.set_motor("mech", "a", 1.5, -2.0, 300, 400, 62.5, 18.25, 40.04);
+  hw.set_cancoder("mech", "cc", 0.2, 0.3, 500, 600);
+  sim.step(5ms);
+  hardware::State read = LatestState(sim);  // as the devices last answered
+  ASSERT_TRUE(read.motors[0].valid);
+  ASSERT_TRUE(read.sensors[0].valid);
+
+  hw.set_connected("mech", "a", false);
+  hw.set_connected("mech", "cc", false);
+  sim.step(10ms);  // a State the node has drained
+  const hardware::State simulated = LatestState(sim);
+
+  // The gateway, reading the same devices as they stop answering.
+  read.motors[0].valid = false;   // motor a, the config's first
+  read.sensors[0].valid = false;  // CANcoder cc, its first sensor
+  FixedReadBackend backend{read};
+  hardware::Gateway gateway{
+      sim.node("mech").extension<HardwareLink>().config().hardware, backend, 1};
+  gateway.Tick(1'000'000, false);
+  Packet packet{};
+  packet.size = static_cast<std::uint32_t>(
+      hardware::Encode(gateway.snapshot(), packet.data));
+  hardware::State published{};
+  ASSERT_TRUE(hardware::Decode(packet.bytes(), published));
+
+  EXPECT_EQ(simulated.motors[0], published.motors[0]);
+  EXPECT_EQ(simulated.sensors[0], published.sensors[0]);
+  EXPECT_FALSE(mech.a.connected());
+  EXPECT_DOUBLE_EQ(mech.a.temperature_c(), 62.5);
+  EXPECT_EQ(mech.a.velocity(), 0.0);
 }
 
 // Two handles on one node share its subscription and both hear each packet.

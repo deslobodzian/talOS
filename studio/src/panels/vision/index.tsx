@@ -20,6 +20,7 @@ import {
   acceptancePct,
   counterDelta,
   fpsFromPeriod,
+  fpsSeries,
   latestValidPose,
   observationErrors,
   validObservationRate,
@@ -223,7 +224,7 @@ function VisionPanel() {
     const latency = col(channel(openCamera.name, 'status/last_latency_us'))(d);
     const tags = col(channel(openCamera.name, 'status/visible_tag_count'))(d);
     return {
-      fps: mapSeries(period, v => 1e6 / v),
+      fps: fpsSeries(period),
       latencyMs: mapSeries(latency, v => v / 1000),
       tags
     };

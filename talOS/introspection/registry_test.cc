@@ -534,7 +534,10 @@ TEST_F(Registry, ANewClaimSweepsSlotsLeftBehindByACrashedNode) {
 
 // A killed node's row is freed by the next claim, not once its heartbeat is
 // kLivenessTimeout old: a crash-looping roster leaves one row per run, and
-// those rows must not fill the registry for the restarts that follow.
+// those rows must not fill the registry for the restarts that follow. Until
+// then the row reads not alive at once, though its heartbeat is fresh: Studio
+// must not show a crashed node still driven by its last source.
+// REQ-OPS-17
 TEST_F(Registry, ADeadClaimantsRowIsFreedByTheNextClaim) {
   Pipe ready;
   Children children;
@@ -558,7 +561,8 @@ TEST_F(Registry, ADeadClaimantsRowIsFreedByTheNextClaim) {
   auto reader = RegistryReader::open(path_);
   ASSERT_TRUE(reader.has_value());
   ASSERT_EQ(reader->nodes().size(), 1u);
-  EXPECT_TRUE(reader->nodes().front().alive) << "the heartbeat is still fresh";
+  EXPECT_FALSE(reader->nodes().front().alive)
+      << "its process is gone, though its heartbeat is fresh";
 
   std::vector<std::unique_ptr<NodeRegistration>> registrations;
   for (std::size_t i = 0; i < kMaxNodes; ++i) {

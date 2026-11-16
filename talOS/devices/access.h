@@ -87,6 +87,9 @@ struct HardwareAccess {
       const HardwareLink& link, std::size_t index);
   static hardware::AnalogInputSample analog_input_sample(
       const HardwareLink& link, std::size_t index);
+  // Encoder::position / velocity / connected: an invalid sample, or any
+  // sample on a stale link, reads valid false, the last valid position and
+  // velocity 0.
   static hardware::EncoderSample encoder_sample(const HardwareLink& link,
                                                 std::size_t index);
   static void digital_output_set(HardwareLink& link, std::size_t index,

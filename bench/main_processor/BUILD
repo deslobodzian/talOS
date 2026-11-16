@@ -3,7 +3,7 @@ load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("//bench/main_processor/bundle_testdata:robot_manifest.bzl", RELOCATION_CONFIG_FILES = "CONFIG_FILES", RELOCATION_NODES = "NODES")
 load("//bench/main_processor/configuration:robot_bench_manifest.bzl", "CONFIG_FILES", "NODES")
 load("//bench/main_processor/configuration:robot_py_manifest.bzl", PY_CONFIG_FILES = "CONFIG_FILES", PY_NODES = "NODES")
-load("//talOS/build:contract.bzl", "talos_bundle")
+load("//talOS/build:contract.bzl", "talos_bundle", "talos_graph_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -37,6 +37,21 @@ talos_bundle(
     nodes = ["//talOS/bridge:hardware_node"] + RELOCATION_NODES,
 )
 
+# relocation_bundle's config, described and linted like every robot
+# config's: a graph error in it would otherwise surface only as an install
+# failure inside bundle_test.
+talos_graph_test(
+    name = "relocation_graph_test",
+    config = "//bench/main_processor/bundle_testdata:robot.toml",
+    data = RELOCATION_CONFIG_FILES,
+    nodes = RELOCATION_NODES,
+    # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+)
+
 # bundle_test only: prints the launcher's stop timeout in seconds.
 cc_binary(
     name = "bundle_test_stop_timeout",
@@ -67,6 +82,14 @@ cc_binary(
 
 # The deploy.sh that bundle_test, install_check_test and warm_up_test
 # install with.
+#
+# Each of the three carries "cpu:7", more than half of a 12-CPU Mac mini or
+# an 8-core workstation (a smaller host runs it when it has no other test):
+# Bazel then never runs two of them at once, nor much else beside one.
+# Every install copies a bundle as new files, and macOS charges each new
+# file's first exec about 100 ms one file at a time host-wide (MAC-2): three
+# installers at once under a full suite (load about 9) took over 60 s where
+# each alone takes under 30 s.
 py_library(
     name = "deploy_test_support",
     testonly = True,
@@ -91,6 +114,7 @@ py_test(
     legacy_create_init = False,
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
+        "cpu:7",
         "no_asan",
         "no_tsan",
     ],
@@ -101,7 +125,7 @@ py_test(
 )
 
 # Over 5 s: three real installs of bench_bundle, each paying deploy.sh's
-# warm-up and graph check (about 11 s on macOS); fast lane.
+# graph check without its warm-up (about 12 s on macOS); fast lane.
 py_test(
     name = "install_check_test",
     size = "small",
@@ -110,6 +134,7 @@ py_test(
     legacy_create_init = False,
     # Launches Python nodes; ctypes cannot load sanitizer runtimes in Python.
     tags = [
+        "cpu:7",
         "no_asan",
         "no_tsan",
     ],
@@ -119,7 +144,8 @@ py_test(
     ],
 )
 
-# Over 5 s: installs and rollbacks of stub bundles, one of which waits out a
+# Over 5 s: installs and rollbacks of stub bundles (a stop during the graph
+# check and rollback's graph check among them), one of which waits out a
 # 3 s warm-up bound for a member that never exits (about 9.5 s on macOS);
 # fast lane. Runs only stubs and deploy.sh, no node: no sanitizer tag.
 py_test(
@@ -128,6 +154,7 @@ py_test(
     srcs = ["warm_up_test.py"],
     data = [":bundle_test_native_mark.so"],
     legacy_create_init = False,
+    tags = ["cpu:7"],
     deps = [
         ":deploy_test_support",
         "@rules_python//python/runfiles",

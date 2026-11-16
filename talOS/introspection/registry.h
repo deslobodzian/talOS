@@ -234,10 +234,12 @@ static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
 
 // The node's event log has a gap: records its writer could not take were
 // dropped (LogWriter gaps() > 0). Capture resumes after a GAP record that
-// marks them; the bit is set from the moment the gap opens, so a run killed
-// or stopped by a disk failure or its byte cap during one has the bit and no
-// GAP record. An event log flag (above): set by set_recording, never
-// cleared.
+// marks them. The bit is set as the gap opens: the writer ORs it into the
+// row (LogWriterOptions::gap_flags, NodeRegistration::flags_word()) when it
+// drops the gap's first record, while the row is still its claim's, so a
+// run killed during a gap, which has no GAP record, still has the bit. Each
+// sample also copies gaps() > 0 (set_recording), for a writer not given the
+// row. An event log flag (above): never cleared.
 inline constexpr std::uint32_t kFlagLogGap = 1u << 14;
 static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,
               "kFlagLogGap must not share a bit with the realtime outcome");
@@ -458,9 +460,11 @@ struct RegistryTestHooks {
 // it. Use a regular file (LockFilePath): Darwin's shm descriptors are not
 // vnodes, so flock on them fails with ENOTSUP. Each acquisition opens a
 // separate file description, which also serializes threads in one process.
-// close (including process death) releases the lock. Nothing in talos
-// unlinks this file; if something else does, an acquirer that wins the old
-// inode finds it no longer current and starts over.
+// close (including process death) releases the lock. Only a launcher
+// session in a shared-memory namespace unlinks this file, under the lock,
+// once its members are reaped and no other session holds a row
+// (NamespaceNames, launcher.cc); if anything unlinks it, an acquirer that
+// wins the old inode finds it no longer current and starts over.
 class RegistryLock {
  public:
   explicit RegistryLock(const std::string& mapped_path)
@@ -536,9 +540,12 @@ inline void ShareRegistrySegment(int fd, const struct stat& status) {
 //
 // Deliberately not SharedMemoryPtr: that unlinks on destruction, which is right
 // for a topic owned by one publisher and wrong here. The registry outlives any
-// single node, so nothing unlinks it -- a stale segment is harmless because
-// slots are reclaimed by heartbeat or claimant death and the version is in the
-// name.
+// single node: outside a shared-memory namespace nothing unlinks it -- a
+// stale segment is harmless because slots are reclaimed by heartbeat or
+// claimant death and the version is in the name. A launcher session in a
+// namespace unlinks it once its members are reaped, unless a row of another
+// session whose claimant is still running remains (NamespaceNames,
+// launcher.cc).
 class RegistryMapping {
  public:
   explicit RegistryMapping(std::string_view path = kRegistryPath,
@@ -998,6 +1005,30 @@ class NodeRegistration {
     }
   }
 
+  // The row's `flags` word, for a writer that ORs an event log flag in the
+  // moment it applies (event::log::LogWriterOptions::gap_flags with
+  // kFlagLogGap) rather than at the next sample, with the row's
+  // `generation` and the value this claim took; all null when the slot is
+  // not this claim's. Lives as long as this registration. Every write to
+  // `flags` after the claim is an atomic read-modify-write (fetch_or /
+  // fetch_and of the bits it owns), so a writer of another bit never clears
+  // it. A writer sets its bit only while `generation` still holds
+  // `claimed`: a row swept from a live owner whose heartbeat went
+  // kLivenessTimeout stale and claimed by another node (a new generation)
+  // is left alone, so the new owner's run is not marked log_gap. The
+  // swept owner's own gap is then in no row: its row is gone, and a run
+  // the launcher kills during that gap has no GAP record either. A swept
+  // row nobody claimed keeps its generation and takes the bit.
+  struct FlagsWord {
+    std::atomic<std::uint32_t>* flags{nullptr};
+    const std::atomic<std::uint64_t>* generation{nullptr};
+    std::uint64_t claimed{0};
+  };
+  FlagsWord flags_word() noexcept {
+    if (!owns_slot()) return {};
+    return {&record_->flags, &record_->generation, generation_};
+  }
+
   const std::string& name() const { return identity_.name; }
   std::size_t slot() const {
     return static_cast<std::size_t>(record_ - mapping_.header()->nodes);
@@ -1393,7 +1424,7 @@ struct NodeSnapshot {
   }
   // kFlagOutputsHeld: the devices flush is holding back outputs it set.
   bool outputs_held() const { return (flags & kFlagOutputsHeld) != 0; }
-  // kFlagLogGap: the node's event log has dropped records (set when a gap
+  // kFlagLogGap: the node's event log has dropped records (set as a gap
   // opens).
   bool log_gap() const { return (flags & kFlagLogGap) != 0; }
   std::vector<SourceSnapshot> sources;
@@ -1496,6 +1527,8 @@ class RegistryReader {
         const std::uint64_t generation =
             record.generation.load(std::memory_order_acquire);
         auto node = copy_stable(record, i);
+        const std::uint64_t claimant =
+            (record.pid_start << kProcessPidBits) | record.pid;
         if (!node ||
             record.state.load(std::memory_order_acquire) !=
                 static_cast<std::uint64_t>(SlotState::ACTIVE) ||
@@ -1503,8 +1536,11 @@ class RegistryReader {
           continue;
         }
         node->generation = generation;
+        // A crashed owner's heartbeat stays fresh for kLivenessTimeout, so
+        // its process is checked too, as the claim sweep checks it.
         node->alive = now - node->heartbeat_monotonic_ns < timeout &&
-                      (node->flags & kFlagConstructing) == 0;
+                      (node->flags & kFlagConstructing) == 0 &&
+                      talos::ProcessWordAlive(claimant);
         out.push_back(std::move(*node));
         break;
       }

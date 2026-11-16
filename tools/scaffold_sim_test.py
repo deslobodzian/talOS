@@ -15,14 +15,19 @@ exits 0, and the bridge's last /hw/status is configured with no alert,
 reject or fault.
 
 The test times the match itself (sim_gateway's --schedule-start-file)
-rather than with the `--duration-s 8` the printed command passes, which
+rather than with the `--duration-s` the printed command passes, which
 counts from the launcher's first spawn while the schedules count from the
-gateway's start, spawned last: every second of start-up (a sanitizer
-build, a loaded host) would come off the last mechanism's window (TODO.md
-TOOLS-18). Once every member's loop has started and the bridge has
-accepted a State (talOS/build/sim_check.py wait_ready), it writes the
-schedules' time zero for sim_gateway's --schedule-start-file, and stops the
-session with SIGINT, as Ctrl-C does, the schedule's length after it."""
+gateway's start, spawned last. That duration is the schedules' length
+(new_subsystem.SIM_SCHEDULE_S) plus the launcher's startup grace, the
+longest the gateway's start can lag without the launcher killing it; but a
+node that comes up after the gateway (a sanitizer build, a loaded host)
+would still miss part of its button's window (TODO.md TOOLS-18), so the
+test starts the schedules itself, for the same length, from a time zero
+after the whole stack is up. Once every member's loop has started and the
+bridge has accepted a State (talOS/build/sim_check.py wait_ready), it
+writes the schedules' time zero for sim_gateway's --schedule-start-file,
+and stops the session with SIGINT, as Ctrl-C does, the schedule's length
+after it."""
 
 import json
 import os
@@ -37,6 +42,7 @@ from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
 
 from talOS.build import sim_check
+from talOS.memory.shm_name import shm_name
 from tools import new_robot_test as harness
 from tools import new_subsystem
 from tools import sync_manifest
@@ -44,12 +50,13 @@ from tools import sync_manifest
 # position_cpp first: the gripper's check uses when it reached its goal.
 MECHANISMS = (("position_cpp", "position"), ("gripper", "velocity"))
 
-# talOS/introspection/registry.h kRegistryPath. The launcher creates the
-# registry and deliberately leaves it for later sessions, so the test
-# unlinks its own after the run.
+# talOS/introspection/registry.h kRegistryPath. A launch in a namespace
+# removes the registry once its members are reaped (talOS/launcher/README.md
+# "One session per namespace"); one killed before then leaves it, so the
+# test unlinks the namespace's after the run.
 REGISTRY = "/talos_registry.6"
 
-# Bounds on a hang, not on a run (which lasts SIM_DURATION_S or
+# Bounds on a hang, not on a run (which lasts SIM_SCHEDULE_S or
 # NO_MECHANISM_DURATION_S from the schedules' time zero), so that one hang
 # fails with the test's diagnostics instead of being killed at Bazel's 60 s
 # `short` timeout. Per case: the wait for the session to be up, then the
@@ -69,20 +76,11 @@ LOG_DUMP_TIMEOUT_S = 5
 NO_MECHANISM_DURATION_S = 3
 # The launcher's --duration-s: only a backstop for a test killed outright,
 # which could stop nothing; it lies past every bound above.
-BACKSTOP_S = READY_TIMEOUT_S + new_subsystem.SIM_DURATION_S + 10
+BACKSTOP_S = READY_TIMEOUT_S + new_subsystem.SIM_SCHEDULE_S + 10
 # The main-processor node clock sim_gateway reads a schedule start on
 # (talOS/simulation/README.md): CLOCK_MONOTONIC_RAW on macOS.
 NODE_CLOCK = (time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin"
               else time.CLOCK_MONOTONIC)
-
-
-def shm_name(topic, namespace):
-    """talos::ShmObjectName (talOS/memory/shared_memory_ptr.h)."""
-    mapped = "/" + topic.lstrip("/").replace("/", ".")
-    value = 0xCBF29CE484222325
-    for byte in namespace.encode() + b"\0" + mapped.encode():
-        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return f"/~{value:016x}"
 
 
 def unlink_registry(namespace):
@@ -138,7 +136,7 @@ def joystick_schedule(buttons):
         return f"axes=0;buttons={1 << (buttons[mechanism] - 1)};pov=-1"
     return (f"0:axes=0;buttons=0;pov=-1|3:{held('position_cpp')}"
             f"|6:{held('gripper')}"
-            f"|{new_subsystem.SIM_DURATION_S}:axes=0;buttons=0;pov=-1")
+            f"|{new_subsystem.SIM_SCHEDULE_S}:axes=0;buttons=0;pov=-1")
 
 
 def records(log_dump, session, topic, node=None):
@@ -193,7 +191,8 @@ class ScaffoldSimTest(unittest.TestCase):
         gateway_port, bridge_port = udp_ports()
         # Bazel's TEST_TMPDIR is the shared-memory namespace
         # (ARCHITECTURE.md "Topics and messages") and holds the lock files,
-        # which Bazel removes with it; only the registry segment is left to
+        # which Bazel removes with it; only the registry segment, which a
+        # launch killed before its members are reaped leaves, may remain to
         # unlink.
         namespace = os.environ.get("TEST_TMPDIR") or tmp
         env.pop("TALOS_SHM_NAMESPACE", None)
@@ -294,7 +293,7 @@ class ScaffoldSimTest(unittest.TestCase):
             session, diagnostics = self.launch(
                 tmp, work, launcher, env, config,
                 ["--joystick-schedule", joystick_schedule(buttons)],
-                new_subsystem.SIM_DURATION_S)
+                new_subsystem.SIM_SCHEDULE_S)
 
             reached = []  # when position_cpp first reached its goal
             for mechanism, kind in MECHANISMS:

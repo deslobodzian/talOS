@@ -165,6 +165,11 @@ class DriverStationReader {
   // comment. The reference stays valid, and unchanged, until the next Read.
   const driver_station::DriverStationData& Read(uint64_t now_us,
                                                 uint64_t stale_us);
+  // The loop thread: the refresh time, on the clock's, of the snapshot the
+  // last Read returned, or 0 when it returned the neutral one (no refresh
+  // yet, or a stale one). The loop ages the packet it sends by it
+  // (REQ-RT-25).
+  uint64_t refreshed_us() const { return refreshed_us_; }
 
  private:
   // No Read yet.
@@ -206,6 +211,8 @@ class DriverStationReader {
   const std::chrono::microseconds stop_bound_;
   // The loop's slot.
   uint8_t front_{2};
+  // The loop's: refreshed_us().
+  uint64_t refreshed_us_{0};
   std::thread thread_;
 };
 

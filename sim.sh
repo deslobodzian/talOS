@@ -344,7 +344,7 @@ if [ "$WANT_RIO" = "1" ]; then
     ( cd "$RIO_DIR" && env ${RIO_ENV[@]+"${RIO_ENV[@]}"} TALOS_SIM_DS_SCHEDULE="$MODE_SCHEDULE" ./gradlew "${GRADLE_ARGS[@]}" ) \
       > "$LOG_DIR/rio.log" 2>&1 &
   elif [ "$HEADLESS" = "1" ]; then
-    say "  headless: enabling teleop through TALOS_SIM_DS=auto (once configured)"
+    say "  headless: enabling teleop through TALOS_SIM_DS=auto (once a push is acknowledged)"
     ( cd "$RIO_DIR" && env ${RIO_ENV[@]+"${RIO_ENV[@]}"} TALOS_SIM_DS=auto ./gradlew "${GRADLE_ARGS[@]}" ) \
       > "$LOG_DIR/rio.log" 2>&1 &
   else
