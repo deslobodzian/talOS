@@ -9,13 +9,15 @@
 //
 //   TALOS_SIM_DS=1                      enable in teleop at startup
 //   TALOS_SIM_DS=0                      attach a Driver Station, stay disabled
-//   TALOS_SIM_DS=auto                   stay disabled until the gateway is
-//                                       configured, then enable in teleop
+//   TALOS_SIM_DS=auto                   stay disabled until the gateway
+//                                       acknowledges a configuration push,
+//                                       then enable in teleop
 //   TALOS_SIM_DS_DISABLE_AFTER_MS=2000  ... then disable two seconds after
 //                                       program start
 //   TALOS_SIM_DS_SCHEDULE=teleop:60,auto:15,disabled:5
-//                                       stay disabled until the gateway is
-//                                       configured, then run these
+//                                       stay disabled until the gateway
+//                                       acknowledges a configuration push,
+//                                       then run these
 //                                       mode:seconds phases and hold the last;
 //                                       replaces TALOS_SIM_DS
 //   TALOS_SIM_JOYSTICK_SCHEDULE='2:axes=0,-0.5;buttons=0;pov=-1'
@@ -32,7 +34,7 @@
 // Both schedules use sim_gateway's --mode-schedule and --joystick-schedule
 // syntax and rules (talOS/driver_station/schedule.h). A mode schedule cannot be
 // combined with TALOS_SIM_DS_DISABLE_AFTER_MS. Joystick 0 is disconnected
-// before the first joystick event, including until the gateway is configured.
+// before the first joystick event, including until a push is acknowledged.
 // Like a real Driver Station it keeps reporting the stick in every mode;
 // disabling is what neutralizes the robot.
 
@@ -61,14 +63,14 @@ class SimDriverStation {
 
   struct Settings {
     bool active{false};
-    // TALOS_SIM_DS: 1 enables at once, auto once the gateway is configured.
+    // TALOS_SIM_DS: 1 enables at once, auto once a push is acknowledged.
     bool enabled{false};
     bool enable_when_configured{false};
     std::optional<std::chrono::milliseconds> disable_after;
     // When nonempty, replaces the three fields above.
     std::vector<driver_station::SchedulePhase> schedule;
     // Joystick 0 over time, from the same start as the schedule (the
-    // gateway's configuration); empty leaves it connected and centered.
+    // acknowledged push); empty leaves it connected and centered.
     std::vector<driver_station::JoystickEvent> joysticks;
     // Never kUnknown: the pose estimator trusts its seed only after a
     // disabled Driver Station view that names an alliance.
@@ -83,7 +85,15 @@ class SimDriverStation {
   // the settings are active.
   SimDriverStation(Settings settings, Clock::time_point started);
 
-  // Called every loop iteration with whether the gateway is configured.
+  // The gateway acknowledged a configuration the main processor pushed in
+  // this boot (Endpoint::OnConfigured, which a boot restore never calls).
+  void ConfigurationAcknowledged() { acknowledged_ = true; }
+
+  // Called every loop iteration with whether the gateway is configured. The
+  // schedules and TALOS_SIM_DS=auto start only once it is configured after
+  // ConfigurationAcknowledged(): a configuration restored from disk may be
+  // another robot config's, and the push that replaces it needs disabled
+  // operation.
   void Update(Clock::time_point now, bool configured);
 
  private:
@@ -93,6 +103,7 @@ class SimDriverStation {
 
   Settings settings_;
   Clock::time_point started_;
+  bool acknowledged_{false};
   std::optional<Clock::time_point> configured_at_;
   SimMode published_;
   std::size_t phase_{0};
