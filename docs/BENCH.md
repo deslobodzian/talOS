@@ -73,8 +73,11 @@ release all controls, and explicitly re-enable only after checking recovery.
   stopping every member, and a stop exits 0 whether or not a State ever
   arrived. Simulation overrides commissioning only in
   memory; it does not prove physical safety or voltage dynamics. Record manifest.
-- [ ] From `controller_processor/rio`, run
-  `./gradlew deploy -Pcompanion=10.0.0.37`. Expected: Gradle prints
+- [ ] Deploy the RIO program from either host. From the Linux workstation:
+  `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`;
+  from the Mini, whose Gradle needs a JDK and no daemon (TODO.md DEPLOY-5):
+  `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`.
+  Expected: Gradle prints
   `RoboRIO companion address built in: 10.0.0.37 (from -Pcompanion)`, the
   generic gateway starts on the RIO and its console line
   `[<s>.<ms>] hardware gateway build <commit> companion 10.0.0.37:5803` names
@@ -101,6 +104,11 @@ The bench LAN is `10.0.0.0/24`:
 | Mac mini, Ethernet `en0` | `10.0.0.37` | main processor: the launcher and every node |
 | Mac mini, Wi-Fi `en1` | `10.0.0.25` | never the link (below) |
 | Linux workstation | `10.0.0.251` | Driver Station only: no launcher, no node |
+
+The Mini's `en0` must keep `10.0.0.37` across a cable pull, and the
+RoboRIO `10.0.0.72` across its reboot (a DHCP reservation or a manual
+address on each): the RIO program is built for the one, and every launch
+names the other.
 
 Neither checked-in default fits it: the RIO program's built-in companion
 address (`10.56.87.11`) and `robot_bench.toml`'s `controller_address`
@@ -240,11 +248,14 @@ is the same graph for the physics simulator only (`simulation_only`; launch it w
   CANcoder rotation) and the CANcoder's `offset_rot` (heading 0 is the
   module's forward) in
   [its subsystem file](../bench/main_processor/configuration/subsystems/swerve_module.toml),
-  whose values are provisional until then, and checks each motor's and the
-  encoder's direction (`inverted`): a positive steer demand turns the wheel
-  the way `encoder_absolute_position_rot` rises, and a positive drive demand
-  rolls the wheel forward at heading 0. Record the reductions, the offset
-  and the directions.
+  whose values are provisional until then, and checks the encoder's
+  direction by hand (the [disabled checks](#uncommissioned-and-disabled-checks)).
+  Each motor's direction (`inverted`: a positive steer demand turns the
+  wheel the way `encoder_absolute_position_rot` rises, a positive drive
+  demand rolls it forward at heading 0) can be checked only once
+  commissioned, since the gateway refuses every command before that: in
+  the swerve module steps below (TODO.md BENCH-4). Record the reductions,
+  the offset and the encoder's direction.
 - [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling
   `max_voltage = 2.0` (every mode), node `max_bench_voltage_v = 2.0` (the
   axis scale), node `max_bench_torque_current_a = 0.0` (torque
@@ -344,11 +355,14 @@ Desktop simulation needs no licence, so `phoenixTest` proves EnableFOC on
 each request and the failed-device handling only through a stand-in for the
 licence read. Only hardware shows that the RoboRIO reads `IsProLicensed`
 truly at configure, whether a CANivore's licence shows in it, and that the
-Kraken runs FOC. The bench Kraken X44 (CAN id 1 on CANivore `Shooter`) is
-Phoenix Pro licensed, per the owner.
+Kraken runs FOC.
 
 This check and the [torque-current](#torque-current-hardware-only) one
-change the motor config locally: launch it from the Mini's checkout as
+need a host that runs Phoenix Tuner X (Windows, Android or iOS) on the
+[bench network](#bench-network); neither the Mini nor the Linux
+workstation is one. They change the motor config locally, and a person
+(never an agent) makes each change, after reading the licence in the first
+step below: launch it from the Mini's checkout as
 [bench network](#bench-network) gives (never edit an installed bundle), with
 the robot disabled, since an enabled RoboRIO refuses a changed
 configuration (TODO.md RESET-4). Such a session's revision is dirty: it is
@@ -357,7 +371,7 @@ evidence for these checks, not for the
 
 - [ ] In Tuner X, record whether the Kraken and the `Shooter` CANivore each
   carry a Phoenix Pro licence.
-- [ ] Set `foc = true` under `[motors.kraken]` in
+- [ ] A person (never an agent) sets `foc = true` under `[motors.kraken]` in
   [the motor config](../bench/main_processor/configuration/subsystems/motor.toml)
   as a local change, reverted after, and launch it. Expected: no
   `[phoenix] ... check_pro_license` line on the RoboRIO console, and
@@ -415,7 +429,7 @@ rps): about 21 rps at 2 V, where button 3 levels as button 2 does; a raised
 `max_voltage` would take it past the velocity buttons (about 42 rps at
 4 V).
 
-- [ ] As a local change, reverted after, set in
+- [ ] A person (never an agent) sets, as a local change, reverted after, in
   [the motor config](../bench/main_processor/configuration/subsystems/motor.toml)
   `max_bench_torque_current_a = 2.0` under `[subsystem]`, and `foc = true`
   and `max_torque_current_a = 5.0` under `[motors.kraken]`, keeping
@@ -520,8 +534,7 @@ sleep precision. Releasing a lane is not a mechanical brake.
   robot program's other threads (`TS`, among them `can_psend` and
   `can_recv`; three unnamed ones `RR` 1-2), the Driver Station (netcomm)
   threads (`TS`) and Phoenix's threads; note whether any thread runs between
-  `FF` 10 and 30, record `cat /proc/sys/kernel/sched_rt_runtime_us` (-1 on
-  2026-11-11: no throttling) and which CPU takes the interrupts
+  `FF` 10 and 30, record `cat /proc/sys/kernel/sched_rt_runtime_us` (-1: no throttling) and which CPU takes the interrupts
   (`cat /proc/interrupts`). While applying a small voltage, stand in for a
   loop that never sleeps: starve the loop and every thread below the
   interrupt threads with one `SCHED_FIFO` 12 spinner per core (above the
@@ -555,7 +568,9 @@ sleep precision. Releasing a lane is not a mechanical brake.
   interval) over 10 minutes of driving with an ssh session running `top` on
   the RoboRIO, and the gateway's State sample intervals (p50, p90, p99, max)
   from the session. Then `touch /home/lvuser/talos_loop_default_sched`,
-  restart robot code (the start line must read `[<s>.<ms>] hardware gateway
+  restart robot code (from the Driver Station, or where it has no such
+  button, `ssh admin@10.0.0.72 '. /etc/profile.d/natinst-path.sh; /usr/local/frc/bin/frcKillRobot.sh -t -r'`,
+  the command GradleRIO's deploy runs) (the start line must read `[<s>.<ms>] hardware gateway
   loop SCHED_OTHER 0, watchdog SCHED_FIFO 30
   (/home/lvuser/talos_loop_default_sched present)`), repeat
   the session and the stall check above, and `rm` the file. Record late
@@ -658,10 +673,11 @@ button 6 the swerve
 module, hold-to-run, with axis 4 its wheel heading (a centred stick asks
 heading 0, which with a provisional `offset_rot` can be up to half a turn
 from where the wheel rests) and axis 5 its drive velocity up to 10 rps.
-Never press buttons 1, 2, 3 or 6. Before session A, with the robot disabled,
-the driver identifies axis 1, axis 4, axis 5 and buttons 1, 2, 3 and 6 on the
-controller in the Driver Station's joystick view (do not go by the gamepad's
-printed labels). The swerve module stays clamped with its wheel off the
+Never press buttons 1, 2, 3 or 6. Axis and button numbers are the
+RoboRIO's (teleop's `axis` is a 0-based index, `button` 1-based); a
+Driver Station program may number them otherwise, and the gamepad's
+printed labels are no guide. Session A confirms them from the RoboRIO's
+side before anything is enabled. The swerve module stays clamped with its wheel off the
 ground all hour. Stop and disable at any unexpected motion.
 
 **The Driver Station** runs on the Linux workstation, whichever program the
@@ -672,6 +688,16 @@ side, in what it forwarded on `/hw/state/driver_station`. The program's
 messages from the RoboRIO (`companion connected`, `companion lost`) are
 also printed on the RoboRIO console, so either view serves where this
 section names the Driver Station log; keep whichever the team used.
+
+Record the RoboRIO console for the whole hour, on the workstation, not the
+Mini (stop path 6 pulls the Mini's cable):
+`ssh admin@10.0.0.72 'tail -F /var/local/natinst/log/FRC_UserProgram.log' | tee rio_console_<date>.log`.
+Before session A it must show the `hardware gateway build` line, and once
+the launcher runs, `companion connected`; if it does not, stop: the dead
+times below cannot be measured without it. Each line's `[<s>.<ms>]` is the
+RoboRIO's seconds since boot, the clock of State's `sample_time_us`, so a
+dead time is a difference of those stamps. The file goes in the hour's
+archive.
 
 Two terminals on the Mini's own screen and keyboard: T1 runs the launcher,
 T2 everything else, both in the root of the Mini's checkout of the session
@@ -708,8 +734,8 @@ Mini between sessions.
    until a person has done [human commissioning](#human-commissioning-and-first-spin):
    its device check, the swerve module's reductions and offset, the limits
    review and the commissioning commit (`commissioned = true` in
-   `robot.toml` and `robot_bench.toml`), and its disabled stick check, all
-   before session A. Its first enabled step (axis 1, slightly) is session B's
+   `robot.toml` and `robot_bench.toml`), all before session A; its disabled
+   stick check, which needs the commissioned stack running, is in session A. Its first enabled step (axis 1, slightly) is session B's
    first spell; its button 1 and 2 step and its swerve module steps are not
    part of this hour. `commissioned = true` makes every bench device live,
    the swerve module's drive (5) and steer (6) included. Every
@@ -747,8 +773,11 @@ Mini between sessions.
    read `commissioned = true` (`robot_bench.toml` overrides `robot.toml`),
    and all three `max_voltage` lines read `2.0`.
 5. **The RoboRIO program** of the same revision, from a clean checkout of
-   it on whichever host deploys (from the Mini, see TODO.md DEPLOY-5):
-   `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`.
+   it on either host: from the workstation
+   `(cd controller_processor/rio && ./gradlew deploy -Pcompanion=10.0.0.37)`,
+   from the Mini
+   `(cd controller_processor/rio && JAVA_HOME=~/wpilib/2026/jdk ./gradlew deploy --no-daemon -Pcompanion=10.0.0.37)`
+   (TODO.md DEPLOY-5).
    Pass: Gradle prints `RoboRIO companion address built in: 10.0.0.37 (from
    -Pcompanion)`, and the RoboRIO console prints `hardware gateway build
    <HEAD> companion 10.0.0.37:5803` without `(dirty)`, `hardware gateway
@@ -771,8 +800,9 @@ Mini between sessions.
    Pass now: `env | grep '^TALOS_'` prints nothing (`TALOS_REALTIME=0` is
    never acceptance).
 8. **A quiet host.** No Bazel build or test, no agent, no other heavy work
-   on the Mini during the hour (`bazel shutdown` in every checkout once
-   step 3 is done). The Mini must not sleep: `./tools/deploy.sh boot-check`
+   on the Mini during the hour (`bazel shutdown` in the session checkout
+   once step 3 is done; confirm no other checkout on the Mini is
+   building). The Mini must not sleep: `./tools/deploy.sh boot-check`
    prints `deploy: ok    pmset sleep 0` (its FileVault and `autorestart` lines
    concern the boot service, not this hour); otherwise keep it awake with
    `caffeinate -i` running in a third terminal until the hour ends. Record
@@ -783,7 +813,10 @@ Mini between sessions.
 
 Robot code green on the Driver Station, robot disabled, `ping -c 3 "$RIO"`
 answered. In T1:
-`"$PREFIX"/current/run.sh --no-studio --remote "$RIO" --output-dir "$ROOT/A" --duration-s 60`.
+`"$PREFIX"/current/run.sh --no-studio --remote "$RIO" --output-dir "$ROOT/A" --duration-s 120`.
+While it runs, robot disabled, the driver deflects what they take for axis
+1 and holds it, then centres it; then holds buttons 1, 2, 3 and 6 in turn,
+each about 2 s, one at a time. Nothing may move.
 Every launch passes `--no-studio`, so nothing but the robot runs on the
 Mini.
 
@@ -812,6 +845,17 @@ Mini.
   `joysticks` list has an entry with `"port":0`. A mode of `none` means no
   Driver Station is attached; a missing port 0, the gamepad is in another
   slot.
+- [ ] The axis and buttons are the ones the bench binds:
+  `"$DUMP" "$S" --format jsonl --topic /hw/state/driver_station | python3 -c 'import json,sys; js=[j for l in sys.stdin for j in (json.loads(l).get("hardware") or {}).get("joysticks", []) if j["port"] == 0]; a=[j["axes"][1] for j in js if len(j["axes"]) > 1]; print("axis 1:", min(a), max(a)); print("buttons:", sorted({b + 1 for j in js for b in range(32) if j["buttons"] >> b & 1}))'`.
+  Pass: axis 1 spans well past the 10 % deadband (towards -1 for the
+  stick pushed forward) and `buttons: [1, 2, 3, 6]`. Otherwise the
+  gamepad's numbering differs from the bench's: stop and remap the
+  controls the driver uses before going on.
+- [ ] The disabled stick check (commissioning's): nothing drove.
+  `"$DUMP" "$S" --format jsonl --topic /motor/state,/swerve_module/state | grep -cE 'mode: (VOLTAGE|VELOCITY|TORQUE_CURRENT|DRIVE)|source: TELEOP'`
+  prints `0`: `/motor/state` stayed `mode: NEUTRAL`, `source: NONE` and
+  `/swerve_module/state` `mode: NEUTRAL`, `source: NONE` while the stick
+  moved and the buttons were held. Record what was physically seen.
 - [ ] `"$DUMP" "$S" --format summary --topic /hw/status`: in the `latest`
   line the second `can_buses` entry (slot 1, `Shooter`) ends
   `read_state: OK`. `session_report` does not show it.
@@ -845,6 +889,14 @@ last time before the 420 s end. No other fault in this session.
 - [ ] The cap, before any stop path: `"$DUMP" "$S" --format summary --topic /motor/state`.
   Pass: `range applied_voltage_v` stays within -2.0 and 2.0. A sample
   outside it ends the hour: find why (TODO.md BENCH-2 (a)) before session C.
+- [ ] Latency (REQ-RT-25, REQ-RT-26), when the session revision prints it:
+  two RoboRIO console lines `[rio] latency: command age accepted
+  p50/p99/max ...` taken while enabled, and the report's "Latency
+  (REQ-RT-25)" rows. REQ-RT-26: an accepted command's observation is at
+  most 2 × `period_us` + 1000 µs old at p99 (11 ms) and 3 × `period_us` at
+  max (15 ms) when the RoboRIO applies it, and a Driver Station refresh on
+  the RoboRIO reaches the first command applied from it within 40 ms at
+  p99. Record each against its bound (TODO.md TIME-4).
 
 ### Sessions C1 and C2: stop paths (10 min each)
 
@@ -863,9 +915,9 @@ of the [reader](#reading-a-trial).
 |---|---|---|---|
 | 1 | (session B) the spotter presses Disable | REQ-SAFE-02, REQ-SAFE-18; no requirement states a time: the gateway neutralizes in the tick that reads the disable ([runtime contract](../talOS/hardware/README.md#runtime-contract)) | the first State with `enabled=False` has `active=False`; record its `sample_us` to the first with `kraken_v` at 0 (TODO.md BENCH-2 (b)) |
 | 2 | `kill -STOP <teleop pid>; sleep 0.3; kill -CONT <teleop pid>`, stick held throughout, then released and pushed again | REQ-SAFE-07, -08, -41: neutral within `command_timeout_us` (100 ms) plus one motor tick (5 ms); REQ-SAFE-13, -14 after it | 105 ms or less from the start of the teleop lane's `PAUSE` to the first `/hw/request/motor` with `kraken=neutral` (the motor's timer lateness, session B, comes on top: record it beside); no motion after `CONT` until the stick is released and pushed again (the lane reads `active: false` until then) |
-| 3 | `kill -STOP <motor pid>; sleep 0.3; kill -CONT <motor pid>`, stick held | REQ-SAFE-15: neutral at the bridge once the last request it heard is older than the owner timeout, `max(2 × 5 ms, 100 ms / 2)` = 50 ms ([the tick](../ARCHITECTURE.md#the-tick)) | from the start of the `motor` `/hw/request/motor` `PAUSE` to the first `/hw/command` with `kraken=neutral`: just over 50 ms (the bridge expires an owner only strictly past its timeout, counted from when it read the request). Pass at 50 ms plus the max of session B's `bridge request to command enabled` row or less; record the excess. After `CONT` the motor drives again at once with the stick held: expected, the motor node has no arming (REQ-SAFE-31) |
+| 3 | `kill -STOP <motor pid>; sleep 0.3; kill -CONT <motor pid>`, stick held | REQ-SAFE-15: neutral at the bridge once the last request it heard is older than the owner timeout, `max(2 × 5 ms, 100 ms / 2)` = 50 ms ([the tick](../ARCHITECTURE.md#the-tick)) | from the start of the `motor` `/hw/request/motor` `PAUSE` to the first `/hw/command` with `kraken=neutral`: just over 50 ms (the bridge expires an owner only strictly past its timeout, counted from when it read the request). Pass at 50 ms plus the max of session B's `bridge request to command hardware_node enabled` row or less; record the excess. After `CONT` the motor drives again at once with the stick held: expected, the motor node has no arming (REQ-SAFE-31) |
 | 4 | `kill -9 <motor pid>`, stick held | REQ-SAFE-29 (a critical member's first crash restarts at once), REQ-SAFE-31; no time stated | record the `PAUSE` in the `motor` request stream (it reads up to about 10 ms long: a killed node's log loses its last write interval, REQ-OPS-31), the new run's first request, and its first `kraken=voltage`; the manifest shows one run ended `crash` and a new one. This trial does not test the owner timeout: the restarted node's first request reaches the bridge within it |
-| 5 | not run on this bench: it drops only the main processor's outgoing datagrams while States keep arriving, which needs Linux's `tc netem`; the tree gives no macOS counterpart | REQ-SAFE-16: the RoboRIO neutralizes within `command_timeout_us` of the State the last command was built from, plus its loop's lateness ([the tick](../ARCHITECTURE.md#the-tick)) | record "not run (macOS main processor)". Lost with it: the only trial that bounds the RoboRIO's own expiry time; paths 6 to 8 show only that the expiry happened (TODO.md BENCH-9) |
+| 5 | not run on this bench: it drops only the main processor's outgoing datagrams while States keep arriving, which on Linux is `tc netem`; the tree has no tested macOS counterpart | REQ-SAFE-16: the RoboRIO neutralizes within `command_timeout_us` of the State the last command was built from, plus its loop's lateness ([the tick](../ARCHITECTURE.md#the-tick)) | record "not run (macOS main processor)". Lost with it: the only trial that bounds the RoboRIO's own expiry time; paths 6 to 8 show only that the expiry happened (TODO.md BENCH-9) |
 | 6 | (C2) pull the Ethernet cable at the **Mini's** port (`en0`; the Driver Station's link, workstation to RoboRIO, stays up), stick held; then release the stick, reconnect after about 5 s, robot still enabled | REQ-SAFE-16 (bound as in 5; nothing is recorded during the outage); REQ-SAFE-13 | the motor stops; the first State after the `/hw/state` `PAUSE` has `active=False` and a higher `epoch` than the last before it; no motion on reconnect; `route -n get "$RIO"` again names `interface: en0`; record the time until control returns (session D) |
 | 7 | `kill -9 <hardware_node pid>`, stick held | REQ-SAFE-16, REQ-SAFE-29 (the bridge restarts at once) | the motor stops; unless the `/hw/state` `PAUSE` is under 100 ms, the restarted bridge's first State has `active=False` and a higher `epoch` (the pause reads up to about 10 ms long, as in 4); record whether motion resumed before the stick was released and pushed again (it does only if the Driver Station view never went stale, REQ-SAFE-13) |
 | 8 | Ctrl-C in T1, stick held, then release (the robot stays enabled, with no main processor); this ends C2 | REQ-OPS-06, REQ-SAFE-16 | the motor stops; session D's first State has `active=False` and a higher `epoch` than C2's last |
@@ -1019,6 +1071,9 @@ Each trial is a few lines of `stop_paths.txt`. Where `kraken_v` reads
     `/hw/state` enabled median <...> ms, p99 <...> ms (bound 10), no
     enabled gap of 100 ms; target age at tick max <...> ms (bound 25);
     applied voltage within ±<cap> V. PASS
+  - Latency (REQ-RT-26): accepted command age p99 <...> ms (bound 11), max
+    <...> ms (bound 15); Driver Station refresh to command applied p99
+    <...> ms (bound 40). PASS|FAIL|not printed by this revision
   - Driver Station disable (3 trials): neutral in the disabling State
     <yes/no>; applied voltage at 0 after <...>, <...>, <...> ms. No stated
     bound.
