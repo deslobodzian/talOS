@@ -4042,12 +4042,50 @@ TEST(LauncherSessions, AStopWhileProbingKillsTheProbeAndStartsNothing) {
   ::remove(probe.c_str());
 }
 
+// --sim commissions in memory only with a loopback remote, so a physical
+// effective remote, from --remote or from the config's controller_address
+// when no --remote is given, is refused before any member is probed or
+// spawned and before any session directory exists; every member's stub
+// records each invocation, --describe or not.
+// REQ-SAFE-20
 TEST(LauncherRemoteTest, SimulationRefusesPhysicalEffectiveRemote) {
-  auto options = SessionFixture("sim_guard");
-  options.simulation = true;
-  options.remote = "10.12.34.2";
-  EXPECT_EQ(Launcher{options}.Run(), 1);
-  std::filesystem::remove_all(options.output_dir);
+  struct Row {
+    const char* name;
+    const char* remote_flag;
+    const char* controller_address;
+  };
+  for (const Row row : {Row{"--remote", "10.12.34.2", nullptr},
+                        Row{"controller_address", "", "10.56.87.2"}}) {
+    SCOPED_TRACE(row.name);
+    const std::string invoked = TempPath("sim_guard_invoked");
+    ::remove(invoked.c_str());
+    GraphFixture fixture{
+        "sim_guard", RecordingStub("alpha", "//example/alpha:node", invoked),
+        RecordingStub("beta", "//example/beta:node", invoked)};
+    fixture.options.binary_overrides["//talOS/bridge:hardware_node"] =
+        WriteStubNode("sim_guard_hardware",
+                      RecordingStub("hardware_node",
+                                    "//talOS/bridge:hardware_node", invoked));
+    if (row.controller_address != nullptr) {
+      std::string toml{kFixtureToml};
+      const std::string header = "[robot]\n";
+      toml.insert(toml.find(header) + header.size(),
+                  std::string{"controller_address = \""} +
+                      row.controller_address + "\"\n");
+      fixture.options.config_path = TempPath("sim_guard_config") + ".toml";
+      std::ofstream{fixture.options.config_path} << toml;
+    }
+    fixture.options.simulation = true;
+    fixture.options.remote = row.remote_flag;
+
+    EXPECT_EQ(Launcher{fixture.options}.Run(), 1);
+    EXPECT_FALSE(std::filesystem::exists(invoked)) << ReadFile(invoked);
+    EXPECT_FALSE(std::filesystem::exists(fixture.out_dir)) << fixture.out_dir;
+    ::remove(invoked.c_str());
+    if (row.controller_address != nullptr) {
+      ::remove(fixture.options.config_path.c_str());
+    }
+  }
 }
 
 // REQ-OPS-25, TODO.md DEPLOY-7: `--sim --remote 127.0.0.1` on a config whose
