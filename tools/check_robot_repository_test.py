@@ -110,15 +110,34 @@ class CheckRobotRepositoryTest(unittest.TestCase):
     # REQ-DEV-32
     def test_refuses_a_repository_that_does_not_depend_on_talos(self):
         # Built with Bzlmod off, Bazel would ignore --override_module and
-        # report a pass that never read this checkout.
-        put(os.path.join(self.robot, "MODULE.bazel"),
-            'module(name = "robot")\n# bazel_dep(name = "talos", version = "0.0.0")\n')
-        git(self.robot, "-c", "user.name=t", "-c", "user.email=t@t",
-            "commit", "-q", "-m", "no talos", "MODULE.bazel")
-        result = self.run_script(self.robot)
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("not a talOS-dependent repository", result.stderr)
-        self.assertEqual(self.calls(), [])
+        # report a pass that never read this checkout. Any spelling of a
+        # talos bazel_dep that Bazel accepts is a dependency.
+        for module, depends in (
+                ('# bazel_dep(name = "talos", version = "0.0.0")\n', False),
+                ('local_path_override(module_name = "talos", path = "t")\n',
+                 False),
+                ("bazel_dep(name = 'talos', version = '0.0.0')\n", True),
+                ('bazel_dep(version = "0.0.0", name = "talos")\n', True),
+                ('bazel_dep(\n    name = "talos",\n'
+                 '    dev_dependency = True,\n)\n', True)):
+            with self.subTest(module=module):
+                put(os.path.join(self.robot, "MODULE.bazel"),
+                    'module(name = "robot")\n' + module)
+                git(self.robot, "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "-m", "module", "MODULE.bazel")
+                if os.path.exists(self.log):
+                    os.remove(self.log)
+                result = self.run_script(self.robot)
+                if depends:
+                    self.assertEqual(result.returncode, 0,
+                                     result.stdout + result.stderr)
+                    self.assertNotEqual(self.calls(), [])
+                else:
+                    self.assertEqual(result.returncode, 2,
+                                     result.stdout + result.stderr)
+                    self.assertIn("not a talOS-dependent repository",
+                                  result.stderr)
+                    self.assertEqual(self.calls(), [])
 
     def test_builds_a_copy_and_never_writes_the_source(self):
         def status():
