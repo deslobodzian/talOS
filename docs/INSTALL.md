@@ -158,6 +158,38 @@ Third-party patches in `third_party/` that sanitizer runs depend on:
   safety only); intact photographs are decoded in
   `//talOS/vision/apriltag:cpu_apriltag_backend_test`.
 
+## Building without a network
+
+An event's pit may have no internet. Before going offline, in the checkout
+you will build there and at the commit you will build (and the same in a
+robot repository's checkout):
+
+```sh
+bazel fetch //...
+```
+
+This downloads every repository `//...` needs and runs rules_python's `pip`
+module extension. Afterwards `bazel build` and `bazel test` of `//...` in
+that checkout download nothing, also after a Bazel server restart or a
+changed flag (such as `--test_env` or `--config`).
+
+The `pip` extension is the step that needs the network again. Each time it
+runs, it reads two PyPI index pages, `https://pypi.org/simple/gevent/` and
+`https://pypi.org/simple/protobuf/`, for grpc's Python requirements (grpc is a
+dependency of flatbuffers), and `MODULE.bazel.lock` cannot store them. Bazel
+keeps the extension's result in the checkout's output base, and runs it again
+when:
+
+- the output base is new: a fresh clone, a moved or renamed checkout, a new
+  `git worktree`, or after `bazel clean --expunge`;
+- a requirements file changes (a changed comment in
+  `talOS/python/requirements.txt` counts, so a `git checkout` or rebase onto
+  such a commit does too), or `MODULE.bazel` changes a `pip.parse` or a
+  module version.
+
+Each of these needs the network: do it, then run `bazel fetch //...` again,
+before leaving.
+
 ## Realtime grant for deploy.sh run
 
 On Linux, [`deploy.sh run`](DEPLOYMENT.md#on-the-main-processor) starts a
