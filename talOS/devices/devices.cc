@@ -575,6 +575,19 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                 ": motor slot " + std::to_string(slot) +
                                 " is not 0, 1 or 2");
   }
+  if (ff_volts != 0 && mode != hardware::Mode::kVelocity &&
+      mode != hardware::Mode::kPosition &&
+      mode != hardware::Mode::kMotionMagic) {
+    // Only velocity, position and motion magic carry a feedforward; the
+    // gateway neutralizes any other request with one (Gateway::Accept), which
+    // testing::SimHardware would apply as sent. No Motor setter sends one: a
+    // raw caller (the C ABI) fails here, and this call sets nothing: a motor
+    // not otherwise set in the tick is sent neutral.
+    throw std::invalid_argument(std::string{link.impl_->node.name()} +
+                                ": motor '" + device.name +
+                                "' takes no feedforward in this mode; "
+                                "ff_volts must be 0");
+  }
   const auto& config = *device.motor_config;
   if (mode == hardware::Mode::kTorqueCurrent &&
       !(config.foc && config.max_torque_current_a > 0)) {
