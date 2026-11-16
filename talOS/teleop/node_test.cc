@@ -576,6 +576,8 @@ TEST(TeleopNode, AbsentSpareControllerDoesNotBlockRearm) {
   EXPECT_DOUBLE_EQ(roller.seen->velocity_rps(), 60.0);
 }
 
+// REQ-SAFE-31: started with a trigger held, teleop sends no target until it
+// is released
 TEST(TeleopNode, StartupHeldTriggerDoesNotCommandOrSynthesizeToggle) {
   for (const std::string action : {"while_held", "on_toggle"}) {
     std::string config{kRollerToml};

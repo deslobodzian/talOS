@@ -190,6 +190,8 @@ TEST(Target,
   EXPECT_EQ(hw.motor_request("lift", "m").mode, hardware::Mode::kNeutral);
 }
 
+// REQ-SAFE-31: the first request after a gap, as after a restart, is neutral
+// on a lane that expired before the consumer drained it
 TEST(Target, PausedConsumerNeverActuatesOnExpiredQueuedTargetAfterResume) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& lift = sim.add<ActuatingConsumer>("lift");
@@ -281,6 +283,7 @@ TEST(Target, EachSelectingUpdateLogsOneReadOfTheLane) {
   expect_no_reads("disabled");
 }
 
+// REQ-SAFE-31: a node's first drain judges a lane by its publication time
 TEST(Target, FirstDrainAfterCommandTimeoutDoesNotReviveAnOldTarget) {
   auto sim = Sim::FromToml(R"(
 [robot]
@@ -838,6 +841,7 @@ struct Operator {
 
 // A button held through any break in what the operator saw must be released
 // once, in the new view, before the lane drives again.
+// REQ-SAFE-31: started with the input held, it never arms
 // REQ-SAFE-13: a held input is released once after each break, then re-arms
 TEST(OperatorArming, HeldInputWaitsForNeutralAfterEveryBreak) {
   enum class Break { kDisable, kReboot, kEvaluationGap, kUnsampledRecovery };
