@@ -15,7 +15,6 @@ bench/main_processor/simulation/soak_test.py sleep 4 soak: injected kills and st
 bench/main_processor/swerve_module/send_target.cc clock 2 operator CLI beside the node, sends for a wall-clock duration; not node code
 bench/main_processor/swerve_module/send_target.cc sleep 1 operator CLI beside the node, sends for a wall-clock duration; not node code
 studio/bridge/bandwidth_test.py clock 6 integration: bounds a fixed-length load window on a real bridge and reports its measured rate (--measure)
-studio/bridge/bandwidth_test.py sleep 1 integration: paces /system.json polls during the load window; the bridge refreshes it every 250 ms (main.cc), and no event marks a refresh
 studio/bridge/client_timeout_test.py clock 8 integration: times a real bridge's idle-timeout close against its stated bound (main.cc kIdleTimeoutS)
 studio/bridge/integration_test.py clock 2 integration: divides a real bridge's own wake count by the run's duration (REQ-RT-21)
 studio/bridge/stop_test.py clock 3 integration: times a real bridge's stop against a quarter of the launcher's stop timeout (REQ-OPS-06, launcher.h kStopTimeout)
