@@ -388,13 +388,16 @@ bundle you would launch.
 
 ### Graph check
 
-After the warm-up, `install` runs the copy's own `run.sh --describe-only`
-with a temporary `--output-dir`: the bundle's launcher, on the config and
-with the Studio bridge `run.sh` gives it, probes every member with
-`--describe` and lints the graph, the first phase of every launch
-([two phases](../talOS/launcher/README.md#two-phases)), and exits. Whatever
-that refuses (a naming or graph rule, a critical member that does not
-answer, a parameter key no node reads) the boot service's launch would
+After the warm-up, `install` runs the copy's own `run.sh --describe-only
+--describe-as-launch` with a temporary `--output-dir`: the bundle's
+launcher, on the config and with the Studio bridge `run.sh` gives it,
+probes every member with `--describe` and lints the graph, the first phase
+of every launch ([two phases](../talOS/launcher/README.md#two-phases)), and
+exits, refusing too what the boot service's launch (`run.sh` without
+`--sim`) refuses before its probes, such as a config that sets `[robot]
+simulation_only = true`. Whatever that refuses (a naming or graph rule, a
+critical member that does not answer, a parameter key no node reads, a
+simulation config) the boot service's launch would
 refuse every time it restarts, with nothing running and the driver
 dashboard showing only a lost link. When the launcher exits nonzero, for
 that or for a host failure such as a full `TMPDIR`, the bundle is not
@@ -429,11 +432,25 @@ could never launch such a bundle. `rollback` runs the same check on
 as they were ([rollback](#on-the-main-processor)); stopping it during the
 check selects nothing.
 
+A bundle's launcher built before `--describe-as-launch` (a rollback to an
+older bundle) refuses the flag while it parses its arguments, before it
+reads the config, printing only `launcher error: unknown argument:
+--describe-as-launch`. On exactly that output `deploy.sh` runs the check
+again with `--describe-only` alone and warns
+
+```
+deploy: warning: this bundle's launcher predates --describe-as-launch: checked with --describe-only alone, so a config that sets [robot] simulation_only = true is not refused
+```
+
+Any refusal of the bundle prints other lines, so it is never retried.
+
 The check is not the whole launch. It does not cover:
 
-- `[robot] simulation_only = true`: `--describe-only` accepts such a config,
-  which a launch without `--sim` refuses, so a bundle built from a
-  simulation config installs and the boot service's launch then exits 1.
+- The refusals of a launch that need what a running robot holds: another
+  launcher holding the [session lock](../talOS/launcher/README.md#one-session-per-namespace)
+  (at boot the previous session has exited), a live registry that cannot
+  be prepared, and the ports the bridges bind once started
+  ([two phases](../talOS/launcher/README.md#two-phases) lists them).
 - The boot service's account and environment: the check runs as the person
   running `deploy.sh`, with their environment, while the service runs as
   its account with its own environment. What members find through the

@@ -795,7 +795,8 @@ Manifest ManifestOf(const std::string& unused) {
 const MonotonicTime kDrain = kOrigin + 10ms;
 
 // A reader's log, as a realtime loop writes one: one drain at kDrain hands
-// its watcher four readings published 1 to 4 ms after the origin, each
+// its watcher four readings published 1 to 4 ms after the origin, the
+// topic's sequences 0 to 3 (a topic's first message is sequence 0), each
 // dispatch sampling its own now 5 us after the last, so every dispatch's now
 // is after its event time. Returns each record's offset.
 std::vector<std::uint64_t> ReaderLog(const std::string& dir) {
@@ -812,7 +813,7 @@ std::vector<std::uint64_t> ReaderLog(const std::string& dir) {
                 .event_time = kDrain,
                 .now = kDrain + std::chrono::microseconds{5 * i},
                 .publish_time = kOrigin + std::chrono::milliseconds{i},
-                .sequence = static_cast<std::uint64_t>(i)},
+                .sequence = static_cast<std::uint64_t>(i - 1)},
         std::as_bytes(std::span{&reading, 1}));
   }
   writer.finish(Context{.kind = EventKind::EXIT,
@@ -823,8 +824,9 @@ std::vector<std::uint64_t> ReaderLog(const std::string& dir) {
   return RecordOffsets(path);
 }
 
-// A writer's log: a tick 1 to 4 ms after the origin, each sending a reading.
-// Returns each record's offset (tick, send, ..., EXIT).
+// A writer's log: a tick 1 to 4 ms after the origin, each sending a reading,
+// the sequences ReaderLog's receipts carry. Returns each record's offset
+// (tick, send, ..., EXIT).
 std::vector<std::uint64_t> WriterLog(const std::string& dir) {
   const std::string path = dir + "/writer.tlog";
   log::LogWriter writer{path, "writer",
@@ -840,7 +842,7 @@ std::vector<std::uint64_t> WriterLog(const std::string& dir) {
     writer.dispatch(tick, {});
     const EventsTest::SensorMessage reading{i, 1.0F, 1.0F};
     writer.send(tick, 0, std::as_bytes(std::span{&reading, 1}), 0,
-                static_cast<std::uint64_t>(i));
+                static_cast<std::uint64_t>(i - 1));
   }
   writer.finish(Context{.kind = EventKind::EXIT,
                         .dispatch_index = 5,
@@ -985,6 +987,147 @@ TEST(InputReplay, StopsAtOrRefusesDamageByWhenItsLostRecordsWereFed) {
           << what;
     }
     EXPECT_EQ(watcher.readings, 0);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+struct WatcherRun {
+  InputReplayReport report;
+  int readings{0};
+};
+
+// A watcher of the sensor, which the session never ran, fed from `session`.
+WatcherRun ReplayWatcher(const RecordedSession& session,
+                         const std::string& out) {
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/watcher.tlog", "watcher"},
+            Loop::Options{.start = session.start()}};
+  SensorWatcher watcher{loop};
+  InputReplayReport report = ReplayInputs(loop, environment, session);
+  return {std::move(report), watcher.readings};
+}
+
+// A reader's damaged stretch lost receipts whose sequences lie between its
+// intact receipts around it (a watcher receives in sequence order; from the
+// topic's first, 0, when none precedes it). Where the session's other logs
+// (the writer's sends) hold every one of those, the stretch lost nothing the
+// feed lacks, and a node that did not watch the topic live is fed it in
+// full; where they miss one, even with no loss of their own to show (a
+// damaged tail), or no intact receipt follows the stretch to cap its range,
+// the reader's damage still stops the run, naming its log and that
+// stretch's offset.
+// REQ-OPS-14
+TEST(InputReplay, AReadersDamageDoesNotStopATopicTheOtherLogsHoldInFull) {
+  {
+    SCOPED_TRACE("the writer holds every send");
+    const std::string dir = TempDir("held_reader");
+    const std::string out = TempDir("held_reader_out");
+    WriterLog(dir);
+    DamageRecord(dir + "/reader.tlog", ReaderLog(dir)[2]);  // the third
+    const RecordedSession session{dir};
+    const WatcherRun run = ReplayWatcher(session, out);
+    EXPECT_FALSE(run.report.stopped_at_gap.has_value());
+    ASSERT_EQ(run.report.fed.size(), 1u);
+    EXPECT_EQ(run.report.fed[0].recorded_by, "writer");
+    EXPECT_EQ(run.report.fed[0].messages, 4u);
+    EXPECT_EQ(run.readings, 4);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("the writer holds every send, the reader's first lost");
+    const std::string dir = TempDir("held_first");
+    const std::string out = TempDir("held_first_out");
+    WriterLog(dir);
+    DamageRecord(dir + "/reader.tlog", ReaderLog(dir)[0]);
+    const RecordedSession session{dir};
+    try {
+      const WatcherRun run = ReplayWatcher(session, out);
+      EXPECT_FALSE(run.report.stopped_at_gap.has_value());
+      EXPECT_EQ(run.readings, 4);
+    } catch (const ReplayError& e) {
+      ADD_FAILURE() << e.what();
+    }
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("the writer lost the same send");
+    const std::string dir = TempDir("held_both");
+    const std::string out = TempDir("held_both_out");
+    DamageRecord(dir + "/writer.tlog", WriterLog(dir)[5]);  // the third send
+    const std::uint64_t damaged = ReaderLog(dir)[2];
+    DamageRecord(dir + "/reader.tlog", damaged);
+    const RecordedSession session{dir};
+    const WatcherRun run = ReplayWatcher(session, out);
+    ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+    // The reader's bound, the second reading's publication, comes before
+    // the writer's, the third tick's now.
+    EXPECT_EQ(run.report.stopped_at_gap->log, dir + "/reader.tlog");
+    EXPECT_EQ(run.report.stopped_at_gap->at, kOrigin + 2ms);
+    EXPECT_EQ(run.report.stopped_at_gap->damage_offset, damaged);
+    EXPECT_EQ(run.readings, 1);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    // Cut at its third send: a log that only ends early shows no loss of
+    // its own, but does not hold the send the reader's stretch lost.
+    SCOPED_TRACE("the writer's log ends before the stretch");
+    const std::string dir = TempDir("held_short");
+    const std::string out = TempDir("held_short_out");
+    std::filesystem::resize_file(dir + "/writer.tlog", WriterLog(dir)[5]);
+    const std::uint64_t damaged = ReaderLog(dir)[2];
+    DamageRecord(dir + "/reader.tlog", damaged);
+    const RecordedSession session{dir};
+    const WatcherRun run = ReplayWatcher(session, out);
+    ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+    EXPECT_EQ(run.report.stopped_at_gap->log, dir + "/reader.tlog");
+    EXPECT_EQ(run.report.stopped_at_gap->at, kOrigin + 2ms);
+    EXPECT_EQ(run.report.stopped_at_gap->damage_offset, damaged);
+    EXPECT_EQ(run.readings, 1);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    // Its last receipt lost, only its EXIT after: nothing caps the
+    // sequences the stretch lost, so no log can show it held them all.
+    SCOPED_TRACE("no receipt follows the reader's stretch");
+    const std::string dir = TempDir("held_last");
+    const std::string out = TempDir("held_last_out");
+    WriterLog(dir);
+    const std::uint64_t damaged = ReaderLog(dir)[3];
+    DamageRecord(dir + "/reader.tlog", damaged);
+    const RecordedSession session{dir};
+    const WatcherRun run = ReplayWatcher(session, out);
+    ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+    EXPECT_EQ(run.report.stopped_at_gap->log, dir + "/reader.tlog");
+    // The third reading's publication.
+    EXPECT_EQ(run.report.stopped_at_gap->at, kOrigin + 3ms);
+    EXPECT_EQ(run.report.stopped_at_gap->damage_offset, damaged);
+    EXPECT_EQ(run.readings, 2);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    // The first stretch (the first receipt) is held; the second (the
+    // third) is not, the writer's log ending before it: the stop names the
+    // second's offset.
+    SCOPED_TRACE("a held stretch, then one not held");
+    const std::string dir = TempDir("held_second");
+    const std::string out = TempDir("held_second_out");
+    std::filesystem::resize_file(dir + "/writer.tlog", WriterLog(dir)[5]);
+    const std::vector<std::uint64_t> offsets = ReaderLog(dir);
+    DamageRecord(dir + "/reader.tlog", offsets[0]);
+    DamageRecord(dir + "/reader.tlog", offsets[2]);
+    const RecordedSession session{dir};
+    const WatcherRun run = ReplayWatcher(session, out);
+    ASSERT_TRUE(run.report.stopped_at_gap.has_value());
+    EXPECT_EQ(run.report.stopped_at_gap->log, dir + "/reader.tlog");
+    EXPECT_EQ(run.report.stopped_at_gap->at, kOrigin + 2ms);
+    EXPECT_EQ(run.report.stopped_at_gap->damage_offset, offsets[2]);
+    EXPECT_EQ(run.readings, 1);
     std::filesystem::remove_all(dir);
     std::filesystem::remove_all(out);
   }

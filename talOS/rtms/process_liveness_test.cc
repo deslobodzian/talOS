@@ -25,6 +25,7 @@ std::uint64_t DeadPid() {
 // its claimant as running, or a live process in a container sharing /dev/shm
 // loses its RTMS claims and registry row. The namespaces are faked, so this
 // runs on every platform.
+// REQ-CONTRACT-21
 TEST(ProcessLiveness, AWordFromAnotherPidNamespaceIsNeverProbed) {
   const std::uint64_t pid = DeadPid();
   const auto word = [pid](std::uint64_t space) {

@@ -27,6 +27,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "bridge/bridge_status_generated.h"
@@ -394,8 +395,11 @@ TEST(LauncherTest, DescribeOutputIsBounded) {
       "#!/bin/sh\nexec dd if=/dev/zero bs=4096 count=1025 2>/dev/null\n");
   introspect::Description description;
   std::string error;
-  EXPECT_FALSE(ProbeDescribe({binary, "--describe"}, std::chrono::seconds{5},
-                             description, error));
+  // Refused for its size, not cut off by the deadline, which only bounds a
+  // hang: a refusal by deadline would pass this test without the bound.
+  EXPECT_FALSE(
+      ProbeDescribe({binary, "--describe"}, kHang, description, error));
+  EXPECT_NE(error.find("exceeds"), std::string::npos) << error;
   std::filesystem::remove(binary);
 }
 
@@ -1178,6 +1182,39 @@ std::string WriteStubNode(std::string_view name, std::string_view script) {
   return testing::WriteWarmStub(dir + "/" + std::string{name}, script);
 }
 
+// first_exec.h's store of paid scripts goes with the process that made it,
+// so a test binary run outside Bazel (no TEST_TMPDIR to remove) does not
+// leave a directory per run; the stubs handed out stay runnable, and a
+// forked child's exit removes only its own store. No REQ row: test
+// infrastructure.
+TEST(FirstExecStubs, StoreIsRemovedWhenItsProcessExits) {
+  const std::string parent_stub = WriteStubNode("store_parent", "#!/bin/sh\n");
+  const std::string parent_store =
+      ::testing::TempDir() + "/talos_first_exec_" + std::to_string(::getpid());
+  ASSERT_TRUE(std::filesystem::is_directory(parent_store)) << parent_store;
+  const std::string child_tmp = TempPath("first_exec_child_tmp");
+  std::filesystem::remove_all(child_tmp);
+  std::filesystem::create_directories(child_tmp);
+  const std::string child_stub = child_tmp + "/stub";
+  std::fflush(nullptr);
+  const pid_t child = ::fork();
+  ASSERT_GE(child, 0) << std::strerror(errno);
+  if (child == 0) {
+    ::setenv("TEST_TMPDIR", child_tmp.c_str(), 1);
+    testing::WriteWarmStub(child_stub, "#!/bin/sh\nexit 7\n");
+    std::exit(0);  // Runs static destructors, as a test binary's exit does.
+  }
+  int status = 0;
+  ASSERT_EQ(::waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0) << status;
+  EXPECT_FALSE(std::filesystem::exists(child_tmp + "/talos_first_exec_" +
+                                       std::to_string(child)));
+  EXPECT_EQ(std::system(child_stub.c_str()), 7 << 8);
+  EXPECT_TRUE(std::filesystem::is_directory(parent_store)) << parent_store;
+  EXPECT_TRUE(std::filesystem::exists(parent_stub));
+  std::filesystem::remove_all(child_tmp);
+}
+
 // The JSON a real node prints, written by the real writer: a stub that answered
 // with hand-typed JSON would pass the day describe.h changed shape.
 std::string DescribeJson(
@@ -1420,18 +1457,27 @@ TEST(LauncherGraphTest, ASimulatorPortWrittenByHandIsRefusedBeforeAnyProbe) {
 // a simulation config that includes the deployable fixture) runs only with
 // --sim. Without it the launch is refused before any member is probed or
 // spawned and before any session directory exists; with --sim it runs, and
-// --describe-only, which touches no hardware, lints it.
-// REQ-SAFE-40
+// --describe-only, which touches no hardware, lints it. --describe-as-launch
+// makes --describe-only refuse it as the launch would (deploy.sh's install
+// check, which judges what the boot service will start), and is refused
+// without --describe-only, where it would start the roster.
+// REQ-SAFE-40, REQ-OPS-50
 TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
   struct Row {
     const char* name;
     bool simulation;
     bool describe_only;
+    bool as_launch;
     bool refused;
   };
   for (const Row row :
-       {Row{"launch", false, false, true}, Row{"--sim", true, false, false},
-        Row{"--describe-only", false, true, false}}) {
+       {Row{"launch", false, false, false, true},
+        Row{"--sim", true, false, false, false},
+        Row{"--describe-only", false, true, false, false},
+        Row{"--describe-only --describe-as-launch", false, true, true, true},
+        Row{"--sim --describe-only --describe-as-launch", true, true, true,
+            false},
+        Row{"--sim --describe-as-launch", true, false, true, true}}) {
     SCOPED_TRACE(row.name);
     const std::string invoked = TempPath("simulation_only_invoked");
     ::remove(invoked.c_str());
@@ -1449,6 +1495,7 @@ TEST(LauncherGraphTest, ASimulationOnlyConfigIsRefusedWithoutSim) {
     fixture.options.config_path = sim_config;
     fixture.options.simulation = row.simulation;
     fixture.options.describe_only = row.describe_only;
+    fixture.options.describe_as_launch = row.as_launch;
 
     EXPECT_EQ(Launcher{fixture.options}.Run(), row.refused ? 1 : 0);
     EXPECT_EQ(std::filesystem::exists(invoked), !row.refused)
@@ -1549,6 +1596,28 @@ TEST(LauncherGraphTest, MissingBinariesAreOneRefusalWithTheBuildCommand) {
       << errors[0];
   EXPECT_EQ(errors[0].find("//talOS/bridge:hardware_node"), std::string::npos)
       << "the built bridge is not to be rebuilt: " << errors[0];
+}
+
+// A bundle's reader is at the robot after deploy.sh install, with no Bazel
+// and no source tree: the refusal names the bundle and the missing binary,
+// and the cure is to rebuild and deploy it, never a `bazel build` there.
+// REQ-OPS-01
+TEST(LauncherGraphTest, MissingBundleBinaryNamesTheBundleNotABazelBuild) {
+  const NodeSpec missing{.name = "alpha",
+                         .target = "//example/alpha:node",
+                         .binary_path = "/opt/robot/bin/alpha",
+                         .owns_actuators = true};
+  const auto finding = MissingBinariesFinding({missing}, "/opt/robot");
+  ASSERT_TRUE(finding.has_value());
+  EXPECT_EQ(finding->severity, naming::Severity::ERROR);
+  EXPECT_NE(finding->message.find("/opt/robot/bin/alpha"), std::string::npos)
+      << finding->message;
+  EXPECT_NE(finding->message.find("bundle /opt/robot"), std::string::npos)
+      << finding->message;
+  EXPECT_NE(finding->message.find("deploy"), std::string::npos)
+      << finding->message;
+  EXPECT_EQ(finding->message.find("bazel"), std::string::npos)
+      << "a robot has no Bazel: " << finding->message;
 }
 
 // REQ-OPS-01
@@ -1664,6 +1733,35 @@ TEST(LauncherGraphTest, ProbesRunInParallel) {
   std::filesystem::remove_all(started);
 }
 
+// REQ-SAFE-28: the hardware bridge is always critical. `critical` is read only
+// from a subsystem's table, so a config that replaces the bridge's binary and
+// marks every subsystem critical = false still lists the bridge critical.
+TEST(LauncherTest, TheHardwareBridgeIsAlwaysCritical) {
+  constexpr std::string_view kEveryNodeOptional = R"(
+[robot]
+name = "optional_everything"
+period_us = 5000
+hardware_node = "//example/bridge:node"
+
+[subsystems.alpha]
+node = "//example/alpha:node"
+critical = false
+)";
+  const auto specs = DiscoverNodes(
+      config::ParseRobotConfigString(kEveryNodeOptional), LauncherOptions{});
+  const auto bridge = std::find_if(
+      specs.begin(), specs.end(),
+      [](const NodeSpec& spec) { return spec.name == kHardwareNodeName; });
+  ASSERT_NE(bridge, specs.end());
+  EXPECT_EQ(bridge->target, "//example/bridge:node");
+  EXPECT_TRUE(bridge->critical);
+  const auto alpha =
+      std::find_if(specs.begin(), specs.end(),
+                   [](const NodeSpec& spec) { return spec.name == "alpha"; });
+  ASSERT_NE(alpha, specs.end());
+  EXPECT_FALSE(alpha->critical);
+}
+
 // REQ-SAFE-28: a non-critical node that sends a target lane is a graph error.
 TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
   GraphFixture fixture{"optional_target",
@@ -1684,6 +1782,7 @@ TEST(LauncherGraphTest, NonCriticalTargetProducerIsAnError) {
                                              {{"beta", {"teleop"}}})));
 }
 
+// REQ-SAFE-28
 TEST(LauncherGraphTest,
      NonCriticalActuatorOwnersAreErrorsAfterSuccessfulProbe) {
   GraphFixture fixture{"optional_actuator",
@@ -3206,6 +3305,46 @@ TEST(LauncherSessions, AnUnlockedSessionIsLockedAtItsNextRefresh) {
   std::filesystem::remove_all(root);
 }
 
+// A filesystem that refuses an exclusive flock on a descriptor not open for
+// writing, with EBADF, as NFSv4 is reported to (not reproduced here: no NFS
+// on the test hosts). Every exclusive lock of a session.lock still takes it:
+// the launch's own (Create), its refresh after the file was removed
+// (Refresh), and a retention's (TakeIdle).
+// REQ-OPS-11
+TEST(LauncherSessions, ExclusiveLocksHoldWhereReadOnlyDescriptorsCannot) {
+  const std::string root = TempPath("lock_write_access");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path dir = root + "/1";
+  const FlockFunction lock = [](int fd, int operation) {
+    if ((operation & LOCK_EX) != 0 &&
+        (::fcntl(fd, F_GETFL) & O_ACCMODE) == O_RDONLY) {
+      errno = EBADF;
+      return -1;
+    }
+    return ::flock(fd, operation);
+  };
+  std::error_code error;
+  auto session = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& path, std::error_code& made) {
+        std::filesystem::create_directories(path, made);
+      },
+      error, lock);
+  ASSERT_TRUE(session.has_value()) << error.message();
+  EXPECT_TRUE(session->held());
+  std::filesystem::remove(session->path());
+  EXPECT_EQ(session->Refresh(lock), SessionDirectoryLock::Refreshed::kRetaken);
+  EXPECT_TRUE(SessionDirectoryLock::Held(dir, /*root_takes_no_locks=*/false));
+  session.reset();
+  bool held = false;
+  EXPECT_TRUE(SessionDirectoryLock::TakeIdle(dir, /*root_takes_no_locks=*/false,
+                                             held, error, lock)
+                  .has_value())
+      << error.message();
+  EXPECT_FALSE(held);
+  std::filesystem::remove_all(root);
+}
+
 // The flock of the launch's own session.lock failing as on a root without
 // locks (ENOLCK) while the root's probe locks: a call's refusal, not the
 // root's. The launch tries again; one whose lock keeps failing (all 100
@@ -3369,7 +3508,7 @@ TEST(LauncherSessions, AOneOffLockFailureLeavesARunningSession) {
 // refuses the launch, not the Studio bridge's warning that leaves it out of
 // the session. With --start-studio-bridge, the launcher's bridge would be a
 // second roster member of that name: the launch is refused naming the key.
-// REQ-OPS-30, REQ-OPS-01
+// REQ-OPS-30, REQ-OPS-01, REQ-CONTRACT-42
 TEST(LauncherSessions, ASubsystemNamedStudioBridgeIsAnOrdinaryNode) {
   auto options = SessionFixture("user_studio_bridge");
   const std::string root = options.output_dir;
@@ -3432,6 +3571,139 @@ TEST(LauncherSessions, ASubsystemNamedStudioBridgeNeverRunsTheBundledBridge) {
             options.binary_overrides[std::string{kStudioBridgeName}]);
 }
 
+// The launcher knows the hardware bridge by its roster name: the lint's `hw`
+// writer exemption, "always critical" and the bridge's log share all follow
+// it. A subsystem keyed `hardware_node` (non-critical, its own binary
+// claiming the bridge's name and `/hw/state`) would be a second member of that
+// name; it is refused before anything is probed or spawned, naming the key,
+// even with --sim --allow-graph-errors, which would override the lint's `hw`
+// writer error.
+// REQ-SAFE-28, REQ-CONTRACT-09, REQ-CONTRACT-42
+TEST(LauncherSessions, ASubsystemCannotTakeTheHardwareBridgesName) {
+  auto options = SessionFixture("subsystem_hardware_node");
+  std::filesystem::remove_all(options.output_dir);
+  const std::string invoked = options.output_dir + "_invoked";
+  std::filesystem::remove(invoked);
+  std::ofstream{options.config_path} << kFixtureToml
+                                     << "\n[subsystems.hardware_node]\nnode = "
+                                        "\"//example/hardware_node:node\"\n"
+                                        "period_us = 5000\ncritical = false\n";
+  options.binary_overrides["//example/hardware_node:node"] = WriteStubNode(
+      "subsystem_hardware_node",
+      RecordingStub("hardware_node", "//example/hardware_node:node", invoked,
+                    {Sender("/hw/state")}));
+  options.simulation = true;
+  options.remote = "127.0.0.1";
+  options.allow_graph_errors = true;
+  ::testing::internal::CaptureStderr();
+  EXPECT_EQ(Launcher{options}.Run(), 1);
+  const std::string refused = ::testing::internal::GetCapturedStderr();
+  EXPECT_NE(refused.find("[subsystems.hardware_node]"), std::string::npos)
+      << refused;
+  EXPECT_EQ(ReadFile(invoked), "") << "the subsystem's binary was run";
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// The sim gateway is known by the roster flag --start-sim-gateway sets, not by
+// its name. A robot's subsystem named `sim_gateway`, in a session where the
+// launcher adds no gateway, is an ordinary node: started under --sim with
+// --log (its event log in the manifest) and --sim, and replayable. The
+// launcher's own gateway is still started with --config and no --log, and
+// with it such a subsystem is refused, naming the key.
+// REQ-OPS-09, REQ-OPS-14, REQ-CONTRACT-42
+TEST(LauncherSessions, ASubsystemNamedSimGatewayIsAnOrdinaryNode) {
+  struct Outcome {
+    int status{-1};
+    std::string err;
+    std::string record;    // every invocation, --describe included
+    std::string launched;  // the last one that was not --describe
+    std::string manifest;
+    int replay_status{-1};
+    std::string replay_err;
+    std::string replay_line;  // the invocation --replay-inputs made
+  };
+  const auto run = [](std::string_view tag, bool subsystem, bool gateway) {
+    Outcome out;
+    auto options = SessionFixture(tag);
+    std::filesystem::remove_all(options.output_dir);
+    const std::string invoked = options.output_dir + "_invoked";
+    std::filesystem::remove(invoked);
+    std::ofstream config{options.config_path};
+    config << kFixtureToml;
+    if (subsystem) {
+      config << "\n[subsystems.sim_gateway]\nnode = "
+                "\"//example/sim_gateway:node\"\nperiod_us = 5000\n";
+    }
+    config.close();
+    options.binary_overrides["//example/sim_gateway:node"] = WriteStubNode(
+        std::string{tag} + "_subsystem",
+        RecordingStub("sim_gateway", "//example/sim_gateway:node", invoked));
+    // The stock gateway describes its own label, whose rule is its name.
+    options.binary_overrides["//example/sim:gateway"] =
+        WriteStubNode(std::string{tag} + "_gateway",
+                      RecordingStub("sim_gateway",
+                                    "//talOS/simulation:sim_gateway", invoked));
+    options.simulation = true;
+    options.remote = "127.0.0.1";
+    options.start_sim_gateway = gateway;
+    ::testing::internal::CaptureStderr();
+    out.status = Launcher{options}.Run();
+    out.err = ::testing::internal::GetCapturedStderr();
+    out.record = ReadFile(invoked);
+    std::istringstream lines{out.record};
+    for (std::string line; std::getline(lines, line);) {
+      if (line.find("--describe") == std::string::npos) out.launched = line;
+    }
+    const std::string session = options.output_dir;
+    out.manifest = ReadFile(session + "/1/manifest.json");
+    if (out.status == 0 && subsystem) {
+      options.replay_inputs = session + "/1";
+      options.only = "sim_gateway";
+      options.output_dir = session + "_replay";
+      ::testing::internal::CaptureStderr();
+      out.replay_status = Launcher{options}.Run();
+      out.replay_err = ::testing::internal::GetCapturedStderr();
+      const std::string record = ReadFile(invoked);
+      const std::string replayed =
+          "sim_gateway --replay-inputs " + options.replay_inputs + " ";
+      if (const auto at = record.find(replayed); at != std::string::npos) {
+        out.replay_line = record.substr(at, record.find('\n', at) - at);
+      }
+      std::filesystem::remove_all(options.output_dir);
+    }
+    std::filesystem::remove_all(session);
+    std::filesystem::remove(invoked);
+    return out;
+  };
+
+  const Outcome ordinary = run("subsystem_sim_gateway", true, false);
+  EXPECT_EQ(ordinary.status, 0) << ordinary.err;
+  EXPECT_NE(ordinary.launched.find(" --log "), std::string::npos)
+      << ordinary.launched;
+  EXPECT_NE(ordinary.launched.find(" --sim"), std::string::npos)
+      << ordinary.launched;
+  EXPECT_NE(ordinary.manifest.find("/sim_gateway.tlog\""), std::string::npos)
+      << ordinary.manifest;
+  // Replayable: --only sim_gateway runs it on the recorded session.
+  EXPECT_EQ(ordinary.replay_status, 0) << ordinary.replay_err;
+  EXPECT_NE(ordinary.replay_line.find(" --log "), std::string::npos)
+      << "no replay run of sim_gateway:\n"
+      << ordinary.replay_err;
+
+  const Outcome own = run("own_sim_gateway", false, true);
+  EXPECT_EQ(own.status, 0) << own.err;
+  EXPECT_EQ(own.launched.rfind("sim_gateway --config ", 0), 0u) << own.launched;
+  EXPECT_EQ(own.launched.find("--log"), std::string::npos) << own.launched;
+  EXPECT_EQ(own.manifest.find("sim_gateway.tlog"), std::string::npos)
+      << own.manifest;
+
+  const Outcome both = run("both_sim_gateway", true, true);
+  EXPECT_EQ(both.status, 1);
+  EXPECT_NE(both.err.find("[subsystems.sim_gateway]"), std::string::npos)
+      << both.err;
+  EXPECT_EQ(both.record, "") << "a member was run or probed";
+}
+
 TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   auto options = SessionFixture("killed_manifest");
   std::filesystem::remove_all(options.output_dir);
@@ -3442,20 +3714,21 @@ TEST(LauncherSessions, KilledLauncherLeavesCompleteManifest) {
   ASSERT_GE(child, 0);
   if (child == 0) ::_exit(Launcher{options}.Run());
   const std::string path = options.output_dir + "/1/manifest.json";
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{5};
-  std::string before;
+  const auto deadline = std::chrono::steady_clock::now() + kHang;
+  bool running = false;
   do {
-    before = ReadFile(path);
-    if (before.find("\"name\": \"alpha\"") != std::string::npos &&
-        before.find("\n      \"pid\": -1") == std::string::npos) {
-      break;
-    }
+    const std::string before = ReadFile(path);
+    running = before.find("\"name\": \"alpha\"") != std::string::npos &&
+              before.find("\n      \"pid\": -1") == std::string::npos;
+    if (running) break;
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
   } while (std::chrono::steady_clock::now() < deadline);
   ::kill(child, SIGKILL);
   int status = 0;
   ::waitpid(child, &status, 0);
+  // Killed while alpha ran, not before it started: the deadline only bounds a
+  // hang.
+  EXPECT_TRUE(running) << "the manifest never showed alpha running";
   // The killed launcher never unlinked its session's one topic segment.
   ::shm_unlink(ShmObjectName("/alpha/state").c_str());
   const std::string manifest = ReadFile(path);

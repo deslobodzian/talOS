@@ -341,6 +341,7 @@ class PhysicsSimBackend final : public Backend {
     held_at_us_.fill(0);
     motor_connected_.fill(true);
     sensor_connected_.fill(true);
+    sensor_read_at_us_.fill(0);
     motor_to_sensor_.fill(-1);
     forward_pressed_.fill(false);
     reverse_pressed_.fill(false);
@@ -395,14 +396,8 @@ class PhysicsSimBackend final : public Backend {
       out.position_age_us = 0;
       out.velocity_age_us = 0;
       if (!motor_connected_[i]) {
-        out.valid = false;
-        out.position_rot = 0;
-        out.velocity_rps = 0;
-        out.voltage = 0;
-        out.stator_current_a = 0;
-        out.temperature_c = 0;
-        out.supply_current_a = 0;
-        out.fault_flags = 0;
+        out = HeldSample(i, state.sample_time_us);
+        MarkInvalid(out);
         continue;
       }
       if (restoring_[i]) {
@@ -413,13 +408,8 @@ class PhysicsSimBackend final : public Backend {
       }
       healthy = true;
       if (frozen_[i]) {
-        // Stale, as a Phoenix signal that stops updating: its age grows.
-        out = held_[i];
-        const uint64_t age_us =
-            std::min<uint64_t>(state.sample_time_us - held_at_us_[i],
-                               std::numeric_limits<uint32_t>::max() - 1);
-        out.position_age_us = static_cast<uint32_t>(age_us);
-        out.velocity_age_us = static_cast<uint32_t>(age_us);
+        // Stale, as a Phoenix signal that stops updating, but still valid.
+        out = HeldSample(i, state.sample_time_us);
         continue;
       }
       const double gear = Gear(i);
@@ -449,11 +439,15 @@ class PhysicsSimBackend final : public Backend {
       out.position_age_us = 0;
       out.velocity_age_us = 0;
       if (!sensor_connected_[i]) {
-        out.valid = false;
-        out.position_rot = 0;
-        out.velocity_rps = 0;
+        // Its frames stopped: its ages grow from its last sample.
+        const uint32_t age_us =
+            AgeUs(state.sample_time_us, sensor_read_at_us_[i]);
+        out.position_age_us = age_us;
+        out.velocity_age_us = age_us;
+        MarkInvalid(out);
         continue;
       }
+      sensor_read_at_us_[i] = state.sample_time_us;
       healthy = true;
       if (s.kind == SensorKind::kPigeon2) {
         // Pigeon yaw comes from simulated chassis motion, never
@@ -882,6 +876,28 @@ class PhysicsSimBackend final : public Backend {
             m.reverse_limit_switch != LimitSwitch::kDisabled);
   }
 
+  // The age of a signal last read at `read_at_us`, as PhoenixBackend's Age
+  // reports it, below its UINT32_MAX "unknown".
+  static uint32_t AgeUs(uint64_t now_us, uint64_t read_at_us) {
+    return static_cast<uint32_t>(
+        std::min<uint64_t>(now_us - std::min(now_us, read_at_us),
+                           std::numeric_limits<uint32_t>::max() - 1));
+  }
+
+  // Motor i's last connected sample as PhoenixBackend reads a device whose
+  // frames stopped then: its ages grow from it, its FaultField's limit and
+  // limiter bits clear at kFaultFieldMaxAgeUs (its fault bits stay; none is
+  // modelled here) and its temperature reads 0 at kTemperatureMaxAgeUs.
+  MotorSample HeldSample(std::size_t i, uint64_t now_us) const {
+    MotorSample out = held_[i];
+    const uint32_t age_us = AgeUs(now_us, held_at_us_[i]);
+    out.position_age_us = age_us;
+    out.velocity_age_us = age_us;
+    if (age_us >= kFaultFieldMaxAgeUs) out.fault_flags &= ~kMotorNotFaultFlags;
+    if (age_us >= kTemperatureMaxAgeUs) out.temperature_c = 0;
+    return out;
+  }
+
   // The FaultField bits of motor i's asserted, enabled limit switches; a
   // follower's own switches are not modelled.
   uint32_t HardLimitFlags(std::size_t i) const {
@@ -1128,6 +1144,8 @@ class PhysicsSimBackend final : public Backend {
   std::array<bool, kMaxMotors> forward_pressed_{};
   std::array<bool, kMaxMotors> reverse_pressed_{};
   std::array<bool, kMaxSensors> sensor_connected_{};
+  // When each sensor last read connected (sample time, µs).
+  std::array<uint64_t, kMaxSensors> sensor_read_at_us_{};
   // Filled with -1 by Configure; valid only after Configure.
   std::array<int, kMaxMotors> motor_to_sensor_;
   std::unordered_map<uint16_t, bool> digital_inputs_{};

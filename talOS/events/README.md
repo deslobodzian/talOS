@@ -408,8 +408,13 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   own receipts, fed at their drains' event times (a tick's deadline, or a
   prompt watcher's publication time, which need not follow the log's
   order), nor a reader's topic with no intact receipt before the stretch:
-  such a log is refused (below), naming it and the offset. A damaged tail
-  only shortens its log.
+  such a log is refused (below), naming it and the offset. A reader's
+  stretch in another program's log is no loss when the session's logs (the
+  writer's sends) hold every message of the topic between that reader's
+  intact receipts around it, from sequence 0 when none precedes it (a
+  watcher receives in sequence order, and a session numbers a topic's
+  messages from 0, no two alike); it still is when no receipt of the topic
+  follows it in that file. A damaged tail only shortens its log.
 - Some losses leave no mark in the log. What the byte cap cost a log (its
   oldest segment, which may have held a GAP record, or the records after
   capture stopped) has no GAP record: `<log>.capped` beside the log, whichever

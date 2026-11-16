@@ -2081,7 +2081,9 @@ TEST(Supervision, GuardianKeepsNoLockHeldAtSpawn) {
   ASSERT_GT(node, 0) << error;
   // The node's own copy closes at its exec; then nothing may hold the lock.
   bool released = ::flock(probe, LOCK_EX | LOCK_NB) == 0;
-  for (const auto give_up = std::chrono::steady_clock::now() + 5s;
+  // The exec is the event; the deadline only bounds a hang (§6.3).
+  for (const auto give_up = std::chrono::steady_clock::now() +
+                            std::chrono::seconds{kHangSeconds};
        !released && std::chrono::steady_clock::now() < give_up;) {
     std::this_thread::sleep_for(10ms);
     released = ::flock(probe, LOCK_EX | LOCK_NB) == 0;

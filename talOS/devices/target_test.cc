@@ -394,6 +394,7 @@ TEST_F(TargetTest, FlapBetweenPublishedSamplesRejectsTheOldGeneration) {
 // where boot A's were high. A lane stamped under A's generation never drives
 // after the consumer has taken B's packets, not even after a delayed A packet
 // arrives, and B's own generation drives only while B is enabled and fresh.
+// REQ-SAFE-11
 TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
   hw.stop_driver_station();
   ds::ModeTracker boot_a, boot_b;
@@ -783,6 +784,30 @@ TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   EXPECT_EQ(seen_target.position_rot(), 0.75);
 }
 
+// REQ-SAFE-12: once its node's Driver Station view is stale, a lane stamps 0
+// though the producer keeps sending and the robot stays enabled: the view's
+// age is judged at send(), with no new Driver Station packet drained to
+// re-read it (State keeps flowing; only the packets stop)
+TEST(TargetLane, StampsZeroOnceItsNodesDriverStationViewIsStale) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Producer>("producer");
+  sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(envelope.has_value());
+  ASSERT_NE(envelope->mode_since_us(), 0u);
+
+  hw.stop_driver_station();
+  sim.step(150ms);  // past command_timeout_us (100 ms)
+  envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(envelope.has_value());
+  EXPECT_EQ(envelope->active, 1);
+  EXPECT_EQ(envelope->mode_since_us(), 0u);
+}
+
 // A producer with its own lane, for the remapped config.
 struct BlindProducer {
   explicit BlindProducer(Node& node) : lane{node, "lift", "align"} {}
@@ -790,6 +815,7 @@ struct BlindProducer {
   TargetLane<Goal> lane;
 };
 
+// REQ-SAFE-12: a producer that never saw a mode stamps 0
 TEST(TargetLane, AProducerThatSeesNoDriverStationNeverDrives) {
   auto sim = Sim::FromToml(kRemapToml);
   sim.add<BlindProducer>("blind_producer");

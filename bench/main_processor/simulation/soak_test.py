@@ -26,7 +26,10 @@ Checked from the recorded session, over the whole run:
 Each owner's records are read from each run's own event log (the manifest's
 log_paths: restart k writes <name>.restart<k>.tlog), so every request is
 judged by the inputs and crash of the process that sent it; a kill is
-stamped before and after, and no stamp decides which process sent what.
+stamped before and after, and no stamp decides which process sent what. A
+crash is the instant the launcher reaped it (the manifest run's
+end_wall_ns, mapped to the node clock at the kill): after the death, before
+the restart's spawn.
 
 - every actuator owner's /hw/request gaps stay within its bridge owner
   timeout except across a fault injected into that node, and a killed owner
@@ -174,6 +177,16 @@ class Soak(unittest.TestCase):
                             f"{what}: active output at {t:.1f} ms, after the expiry "
                             f"at {expiry:.1f} ms")
 
+    @staticmethod
+    def wall_minus_node_ns():
+        """CLOCK_REALTIME less the node clock, read between two node-clock
+        reads: maps a manifest wall time to the node clock to within those
+        reads' microseconds (and the clocks' slew since)."""
+        before = support.node_clock_ns()
+        wall = time.time_ns()
+        after = support.node_clock_ns()
+        return wall - (before + after) // 2
+
     def driving(self, rows, start, end, drive_ids, what):
         window = [r[1] for r in rows if start <= r[0] < end]
         self.assertGreater(len(window), 2, f"{what}: no outputs in [{start:.1f}, {end:.1f})")
@@ -243,6 +256,9 @@ class Soak(unittest.TestCase):
                 args.extend(["--sim-gateway-arg", arg])
             events = []  # (action, node, start_ns, end_ns)
             kills = {}
+            # DRIVE's kills in order: the wall-to-node clock offset read
+            # right after each, to map its run's reaped instant.
+            drive_offsets = []
             with (tmp / "launcher.txt").open("w+") as log:
                 launcher = subprocess.Popen(args, cwd=tmp, env=env, stdout=log,
                                             stderr=subprocess.STDOUT,
@@ -288,6 +304,8 @@ class Soak(unittest.TestCase):
                         send(name, signal.SIGKILL)
                         end_ns = support.node_clock_ns()
                         kills[name] = kills.get(name, 0) + 1
+                        if name == DRIVE:
+                            drive_offsets.append(self.wall_minus_node_ns())
                     elif action == "frozen_kill":
                         # Freeze the producer before killing the owner: the
                         # restarted owner must not actuate from a lane
@@ -296,6 +314,7 @@ class Soak(unittest.TestCase):
                         start_ns = support.node_clock_ns()
                         send(name, signal.SIGKILL)
                         kills[name] = kills.get(name, 0) + 1
+                        drive_offsets.append(self.wall_minus_node_ns())
                         time.sleep(STALL_S)
                         end_ns = support.node_clock_ns()
                         os.kill(stopped, signal.SIGCONT)
@@ -335,11 +354,14 @@ class Soak(unittest.TestCase):
             ds = {name: [] for name in OWNERS}  # (now, enabled, run)
             targets = []  # DRIVE's received active targets: (now, publish, run)
             lane = f"/{DRIVE}/target/{PRODUCER}"
+            empty_logs = {name: {} for name in OWNERS}  # run: its files
             for name in OWNERS:
                 for run, logs in support.run_logs(session, final[name]):
                     origin = support.log_baseline_ns(logs)
                     if origin is None:
-                        continue  # killed before it recorded anything
+                        # Killed before it recorded anything.
+                        empty_logs[name][run] = logs
+                        continue
                     shift = (origin - baseline) / 1e6
                     for row in self.dump(root, logs, name, f"/hw/request/{name},"
                                          f"/hw/state/driver_station,{lane}"):
@@ -392,10 +414,21 @@ class Soak(unittest.TestCase):
                                             f"{name} active while disabled at {t:.1f} ms")
 
             drive_rows = requests[DRIVE]
-            # Restart k follows the k-th kill (restart_count is checked above);
-            # each crash at the stamp before its kill.
-            crashes = sorted(s for a, n, s, _ in events
-                             if a in ("kill", "frozen_kill") and n == DRIVE)
+            # Restart k follows the k-th kill (restart_count is checked
+            # above): `stamps` orders the kills, and run k-1's manifest entry
+            # holds its crash, the instant the launcher reaped it.
+            stamps = sorted(s for a, n, s, _ in events
+                            if a in ("kill", "frozen_kill") and n == DRIVE)
+            runs = final[DRIVE]["runs"]
+            self.assertEqual(final[DRIVE]["runs_dropped"], 0, "runs dropped")
+            self.assertEqual(len(runs), len(stamps) + 1, runs)
+            crashes = []
+            for k, (run, offset) in enumerate(zip(runs, drive_offsets)):
+                self.assertEqual(run["exit_signal"], signal.SIGKILL,
+                                 f"{DRIVE} run {k} did not end by the kill: {run}")
+                crashes.append((run["end_wall_ns"] - offset - baseline) / 1e6)
+                self.assertGreaterEqual(crashes[-1], stamps[k],
+                                        f"{DRIVE} run {k} reaped before its kill")
             for action, name, s, e in events:
                 what = f"{action} {name} at {s:.1f} ms"
 
@@ -412,10 +445,20 @@ class Soak(unittest.TestCase):
                     # The restarted process's requests are those its own run
                     # log recorded before the producer resumed, from its
                     # first: no harness stamp decides which they are.
-                    run = crashes.index(s) + 1
-                    restarted = [r for r in drive_rows if r[3] == run and r[0] < e]
-                    self.assertGreater(len(restarted), 5,
-                                       f"{what}: owner did not restart during the pause")
+                    run = stamps.index(s) + 1
+                    self.assertNotIn(run, empty_logs[DRIVE],
+                                     f"{what}: the restarted owner's run log "
+                                     f"{[str(p) for p in empty_logs[DRIVE].get(run, [])]} "
+                                     "holds no record")
+                    every = [r for r in drive_rows if r[3] == run]
+                    self.assertTrue(every, f"{what}: the restarted owner's run log "
+                                    "holds no request")
+                    restarted = [r for r in every if r[0] < e]
+                    self.assertGreater(
+                        len(restarted), 5,
+                        f"{what}: the restarted owner sent {len(restarted)} requests "
+                        f"before the producer resumed (its first {every[0][0] - s:.1f} "
+                        "ms after the kill)")
                     first = restarted[0][0]
                     # The lane's newest value is the last target the frozen
                     # producer published (its own record: it was stopped,
@@ -438,9 +481,12 @@ class Soak(unittest.TestCase):
                                   if enabled and t >= enabled[0]), None)
                     self.assertIsNotNone(armed, f"{what}: the restarted owner received no "
                                          "enabled Driver Station packet before the resume")
-                    # s precedes the kill, so each latency is an upper bound.
-                    print(f"{what}: restarted owner's first request {first - s:.1f} ms "
-                          f"after the kill, its first enabled one {armed - s:.1f} ms; the "
+                    # s precedes the kill, so each latency is an upper bound;
+                    # the crash is the instant the launcher reaped it.
+                    crash = crashes[run - 1]
+                    print(f"{what}: crash reaped {crash - s:.1f} ms after the pre-kill stamp; "
+                          f"restarted owner's first request {first - crash:.1f} ms "
+                          f"after it, its first enabled one {armed - crash:.1f} ms; the "
                           f"lane's newest target was then {armed - published:.1f} ms old "
                           f"(command_timeout {timeout_ms:.0f} ms)", flush=True)
                     limit = timeout_ms - REGIME_TICKS * period_ms[DRIVE]
@@ -495,8 +541,9 @@ class Soak(unittest.TestCase):
                                     owner_timeout[DRIVE], what)
 
             # No swerve_module actuation without an active target received
-            # by the process that sent the request, published after that
-            # process's crash and younger than the timeout when the request
+            # by the process that sent the request, published after the
+            # previous run's crash (reaped, so no target published from then
+            # on was that run's) and younger than the timeout when the request
             # was sent, as Target::get() judges. "After the crash" holds
             # whatever the restart latency: a restarted owner's reader starts
             # at the lane's next publication (RTMSQueue::register_reader).

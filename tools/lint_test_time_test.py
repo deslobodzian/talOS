@@ -12,6 +12,8 @@ CLOCK = "auto t = std::chrono::steady_clock::" + "now();\n"
 ALIAS_CLOCK = ("using Clock = std::chrono::steady_clock; auto t = Clock::" +
                "now();\n")
 PY_CLOCK = "t = time." + "time()\n"
+TS_SLEEP = "await new Promise(r => set" + "Timeout(r, 150));\n"
+TS_CLOCK = "const t = performance." + "now();\n"
 FLAKY = "    flaky = " + "True,\n"
 ATTEMPTS = "bazel test --flaky" + "_test_attempts=3 //...\n"
 
@@ -39,6 +41,11 @@ class LintTestTimeTest(unittest.TestCase):
                 ("examples/arm/arm.py", PY_SLEEP,
                  {"examples/arm/BUILD.bazel":
                   "talos_py_node(name = 'node')\n"}),
+                # A framework node's own source is node code.
+                ("talOS/teleop/node.cc", SLEEP, {}),
+                ("talOS/telemetry/node.cc", CLOCK, {}),
+                ("studio/tests/agent.test.ts", TS_SLEEP, {}),
+                ("studio/tests/view.test.tsx", TS_CLOCK, {}),
                 ("talOS/node/BUILD", FLAKY, {}),
                 (".github/workflows/ci.yaml", ATTEMPTS, {}),
                 (".bazelrc", "test " + ATTEMPTS.split(" ", 2)[2], {})):
@@ -55,6 +62,8 @@ class LintTestTimeTest(unittest.TestCase):
             "examples/lib/helper.cc": CLOCK,
             "examples/lib/BUILD": "cc_library(name = 'helper')\n",
             "talOS/rtms/rtms_test.cc": "// " + SLEEP + "# " + PY_CLOCK,
+            "studio/src/worker.ts": TS_SLEEP + TS_CLOCK,
+            "studio/tests/view.test.tsx": "// " + TS_SLEEP,
         })
         self.assertEqual(failures, 0, out)
 

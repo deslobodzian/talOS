@@ -251,7 +251,8 @@ Rules:
 - Use `node.now()` only. Never `steady_clock`, `time.time()` or sleeps. This is
   what makes `Sim` and replay match the robot. **[enforced:
   `tools/lint_test_time.py` over the node packages under the robot, example,
-  bench and scaffold directories; review for framework nodes]**
+  bench and scaffold directories and the framework nodes, `talOS/teleop` and
+  `talOS/telemetry`]**
 - Estimators integrate on measurement sample times (`sample_time_ns`), never
   on arrival or publish time, and call wpimath's time-taking entry points
   (`UpdateWithTime`/`updateWithTime`), never `Update()`/`update()`, which read
@@ -269,7 +270,10 @@ Rules:
   ends there, names the log, and exits 1; a feeding log that is capped, a
   run's log without its EXIT of a member the session manifest marks
   `log_gap` or `recorder_failed`, or one whose damage nothing bounds is refused before the node
-  runs. **[enforced:
+  runs; another reader's damage is no loss only where an intact receipt
+  follows it and the session's other logs hold what it lost
+  ([rule](../talOS/events/README.md#replaying-another-sessions-inputs)).
+  **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present: an actuator node
@@ -332,7 +336,8 @@ A dependency is adopted when it meets all of these:
    never vendored by copy unless upstream has no build we can use.
 4. It stays off the hot path unless it meets §10 (no allocation per tick in
    `update()`).
-5. It is added in one change, with the reason, to this table.
+5. It is added in one change, with the reason, to the table below, and a
+   `bazel_dep` also to the "Bazel module" table after it.
 
 | Need | Use | Status |
 |---|---|---|
@@ -344,3 +349,29 @@ A dependency is adopted when it meets all of these:
 | Vision: AprilTag pose observations | `talOS/vision`: upstream AprilTag 3.4.5 (`@apriltag`), OpenCV 4.12 conversion/IO, Metal preprocessing/CCL on macOS, AVFoundation/V4L2 capture | in use: typed detector options, decode-margin/Hamming validity gates before localization, undistorted homography, robust joint single/multi-tag corner solving with floor/tilt priors, marginalized field-frame x/y/yaw covariance and configured uncertainty floors; ambiguity unknown=1, verified unique=0; one robot node per camera, no side-channel server |
 | Autonomous paths | Choreo `.traj` files (JSON, read with nlohmann/json 3.11.3 from the BCR, MIT), loaded and followed by `talOS/trajectory` | in use by the 2026 robot's autonomous node (its own repository), which plans with `MakeStraightLine` and follows with `HolonomicFollower`. wpimath's C++ controllers have no Bazel module, so the follower is talos code |
 | RoboRIO hardware | WPILib HAL and Phoenix 6 | in use |
+
+Every `bazel_dep` of the root `MODULE.bazel` is a row here
+(`tools/check_deps_listed.py`, a source lint, fails on a module missing from
+either). A module no BUILD or `.bzl` file of this repository loads is a
+root pin: it sets the lowest version the module graph may resolve for
+the dependencies that use it (Bzlmod picks the highest version any module
+asks for; only an override, such as `single_version_override`, fixes one).
+
+| Bazel module | For |
+|---|---|
+| `apple_support` | the Apple C++ toolchain on macOS (`repo_name` `build_bazel_apple_support`); root pin |
+| `rules_cc` | C++ rules |
+| `googletest` | C++ tests |
+| `platforms` | OS constraints (`@platforms//os:*`) in `select`s |
+| `flatbuffers` | message schemas, `flatc`, the C++ and Python runtimes |
+| `rules_foreign_cc` | root pin |
+| `aspect_bazel_lib` | `copy_to_bin` and build stamping |
+| `rules_go` | root pin |
+| `rules_java` | root pin |
+| `rules_python` | Python rules, the 3.11 toolchain and the pinned pip lock |
+| `nlohmann_json` | Choreo `.traj` and session manifest reading |
+| `opencv` | `talOS/vision` image conversion and IO (patched, root only) |
+| `wrist` | `examples/wrist_repo`, the standalone-subsystem example (dev only) |
+| `hedron_compile_commands` | `compile_commands.json` for clang-tidy (dev only) |
+| `aspect_rules_js` | Studio's npm dependency graph (dev only) |
+| `rules_nodejs` | Studio's Node runtime (dev only) |

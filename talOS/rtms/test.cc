@@ -1217,6 +1217,7 @@ talos::schema::Identity Reading(const char* env) {
 
 // The D2 gate: a field whose type changed while its size did not (level_m
 // float -> int, both 4 bytes) must not attach, however equal the layouts are.
+// REQ-CONTRACT-21
 TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
   const talos::schema::Identity before = Reading("TALOS_VARIANT_FLOAT_LEVEL");
   const talos::schema::Identity after = Reading("TALOS_VARIANT_INT_LEVEL");
@@ -1234,6 +1235,7 @@ TEST(RTMSSchema, AChangedFieldTypeOfTheSameSizeIsRejectedAtAttach) {
   EXPECT_EQ(same.schema_name(), "schema_variant.Reading");
 }
 
+// REQ-CONTRACT-21
 TEST(RTMSSchema, ANameMismatchIsRejectedEvenWithTheSameHash) {
   const std::string path = make_test_path("schema_name");
   shm_unlink(ShmObjectName(path).c_str());
@@ -1496,6 +1498,7 @@ TEST(RTMSDeadReader, SlotsOfKilledReadersAreReclaimedWhenNoneAreFree) {
 // its pid reused by the time it restarts (macOS wraps at 99,999), and a child
 // that exited stays a zombie until it is reaped; neither may keep the topic's
 // writer claim or a reader slot.
+// REQ-CONTRACT-21
 TEST(RTMSProcessIdentity, NeitherAReusedPidNorAZombieKeepsAClaim) {
   const std::string path = make_test_path("identity");
   RTMSQueue session{path,

@@ -18,7 +18,10 @@ and a test config that reaches its files through `include`, a
 parent-directory `defaults`, a custom `path` and an entry `node`, and adds
 a Python node importing numpy, gtsam and robotpy-wpimath (the bench robot's
 own nodes import no native wheel, and no other talOS target loads the gtsam
-and robotpy-wpimath talOS pins for robot repositories). A bundle that carries Studio is described by the command the boot service
+and robotpy-wpimath talOS pins for robot repositories), and a C++ node
+whose binary links a shared library, which the installed node must map from
+the bundle's own lib/ (the bench robot's C++ nodes link statically, so no
+other bundle has a lib/). A bundle that carries Studio is described by the command the boot service
 runs (deploy.sh enable-boot's systemd ExecStart and launchd
 ProgramArguments), which must run its bridge from the install, found through
 the manifest's [studio] table, beside the index page of the webroot that
@@ -39,6 +42,7 @@ import json
 import os
 import plistlib
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -95,6 +99,60 @@ if os.path.exists("/proc/self/maps"):
                 mapped.add(os.path.realpath(path))
 print(json.dumps({"files": files, "mapped": sorted(mapped)}))
 """
+
+# C++ nodes whose binary links a shared library the bundle stages in lib/,
+# and that library's file name.
+LINKED_LIBRARIES = {
+    "linked_library": "libfixture_library.so",
+}
+
+
+def mapped_library(argv, library, cwd):
+    """The real path of the file named `library` that the process `argv`
+    loads, or None where this host has no probe. Linux: the node runs until
+    its /proc/<pid>/maps shows the library (the loader maps it before main)
+    or it exits, then is stopped. macOS: the node is described with dyld
+    printing each image it loads, one line each: "dyld[PID]: <UUID> PATH",
+    PATH absolute."""
+    env = {k: v for k, v in CLEAN_ENV.items()
+           if not k.startswith(("LD_", "DYLD_"))}
+    suffix = os.sep + library
+    if sys.platform == "darwin":
+        proc = subprocess.run([argv[0], "--describe", *argv[1:]], cwd=cwd,
+                              env=dict(env, DYLD_PRINT_LIBRARIES="1"),
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        paths = [line[line.index(" /") + 1:].rstrip()
+                 for line in proc.stderr.splitlines()
+                 if line.startswith("dyld[") and line.rstrip().endswith(suffix)]
+        assert paths, proc.stderr
+        return os.path.realpath(paths[0])
+    if not os.path.exists("/proc/self/maps"):
+        return None
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, text=True)
+    path = None
+    try:
+        while path is None and proc.poll() is None:
+            try:
+                with open(f"/proc/{proc.pid}/maps", encoding="utf-8") as maps:
+                    lines = maps.read().splitlines()
+            except OSError:
+                break
+            path = next((line.split(maxsplit=5)[5] for line in lines
+                         if line.endswith(suffix)
+                         and len(line.split(maxsplit=5)) == 6), None)
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGINT)
+        try:
+            _, err = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            _, err = proc.communicate()
+    assert path is not None, f"{argv[0]} exited {proc.returncode}: {err}"
+    return os.path.realpath(path)
+
 
 def enable_boot(prefix, system):
     """What `deploy.sh enable-boot --dry-run` prints on `system` ("Linux"
@@ -219,6 +277,28 @@ class BundleTest(unittest.TestCase):
                 # REQ-OPS-48
                 self.assert_native_wheels_load_from(
                     os.path.realpath(where), manifest)
+                self.assert_linked_libraries_load_from(
+                    os.path.realpath(where), manifest, tmp)
+
+    def assert_linked_libraries_load_from(self, installed, manifest, tmp):
+        """Each LINKED_LIBRARIES node, started from `installed` with the
+        installed config, maps its library from `installed`/lib/: the copy
+        the bundle staged for talos_cc_node's rpath, not one in Bazel's
+        tree."""
+        for node in manifest["nodes"]:
+            library = LINKED_LIBRARIES.get(node["name"])
+            if not library:
+                continue
+            staged = os.path.join(installed, "lib", library)
+            self.assertTrue(os.path.isfile(staged), staged)
+            mapped = mapped_library(
+                [os.path.join(installed, node["binary"]),
+                 "--config", os.path.join(installed, manifest["config_path"]),
+                 "--log", os.path.join(tmp, node["name"] + ".tlog")],
+                library, installed)
+            if mapped is None:  # No /proc/<pid>/maps or dyld probe here.
+                continue
+            self.assertEqual(mapped, staged, node["name"])
 
     def assert_native_wheels_load_from(self, installed, manifest):
         """Each NATIVE_IMPORTS node's modules, imported by its installed venv

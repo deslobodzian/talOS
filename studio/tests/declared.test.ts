@@ -12,10 +12,15 @@
 //   bazel run @talos//talOS/launcher:launcher -- --describe-only \
 //     --config $PWD/main_processor/configuration/robot.toml
 //
-// in the 2026 robot's repository (talOS overridden to this checkout), with only `session_id` pinned so a diff is a diff in
-// shape rather than in session. If the launcher's envelope changes, this test
-// fails and names the field -- regenerate the fixture and fix the parser
-// together, in one commit.
+// in the 2026 robot's repository, with `session_id` and `config_path` pinned so
+// a diff is a diff in shape rather than in session or checkout path. A talOS
+// type's schema hash and size
+// (`talos.hardware.Packet`, `bridge.BridgeStatus`, `talos.Bytes`,
+// `geometry.PoseEstimate`, ...) can be refreshed from this repository alone,
+// from the same fields of a current graph.json; the robot's own types come
+// only from a run in its repository. If the launcher's
+// envelope changes, this test fails and names the field -- regenerate the
+// fixture and fix the parser together, in one commit.
 
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
@@ -26,7 +31,8 @@ import {demoSystemGraph} from '../src/demo';
 
 const fixture = readFileSync(new URL('./launcher_graph.json', import.meta.url), 'utf8');
 
-// The same robot with `/hw/req/drive` written for `/hw/request/drivetrain`, so
+// The same robot with `/hw/req/drive` written for `/hw/request/drivetrain` (and
+// the two errors the launcher reports for it appended to `diagnostics`), so
 // the diagnostic path is pinned against real launcher output too. A parser that
 // only ever sees clean documents is untested on the one case that matters.
 const faults =
@@ -36,28 +42,29 @@ const faults =
 test('the parser accepts what the launcher actually writes', () => {
   const graph = parseDeclaredGraph(fixture);
 
-  // The roster, as `--describe` found it (8 nodes now that teleop is present).
-  assert.equal(graph.nodes.length, 8);
+  // The roster, as `--describe` found it.
+  assert.equal(graph.nodes.length, 13);
   assert.deepEqual(graph.nodes.map(n => n.name).sort(), [
-    'driver', 'drivetrain', 'hardware_node', 'intake',
-    'pose_estimator', 'shooter', 'telemetry', 'teleop'
+    'autonomous', 'driver', 'drivetrain', 'front_left_camera',
+    'front_right_camera', 'hardware_node', 'intake', 'pose_estimator',
+    'rear_left_camera', 'rear_right_camera', 'shooter', 'telemetry', 'teleop'
   ]);
   for (const node of graph.nodes) {
-    assert.ok(node.target.startsWith('//'), `${node.name} has no build target`);
+    // A label in the robot's repository, or a canonical one in talOS's
+    // (`@@talos+//talOS/teleop:node`).
+    assert.match(node.target, /^(@@?[\w.+~-]*)?\/\/[^:]*:\w+$/,
+                 `${node.name} has no build target`);
     assert.ok(node.sources.length > 0, `${node.name} declared no sources`);
   }
 
-  // A launchable graph carries no errors, only the warnings for the autonomous
-  // lanes nothing writes yet. This is the assertion that would catch the
-  // launcher renaming `diagnostics` or nesting it per node: an absent key
+  // A launchable graph carries no errors, only the CAN load warning. This is
+  // the assertion that would catch the launcher renaming `diagnostics` or nesting it per node: an absent key
   // parses as empty, so naming the findings is the only thing that
   // distinguishes "no errors" from "findings the parser could not see".
   assert.equal(graph.diagnostics.filter(d => d.severity === 'error').length, 0);
   assert.deepEqual(
-      graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(), [
-        'warning /drivetrain/target/auto', 'warning /intake/target/auto',
-        'warning /shooter/target/auto'
-      ]);
+      graph.diagnostics.map(d => `${d.severity} ${d.subject}`).sort(),
+      ['warning rio']);
 });
 
 test('every topic end names its schema, and the ends of a topic agree', () => {
@@ -76,7 +83,7 @@ test('every topic end names its schema, and the ends of a topic agree', () => {
     }
   }
   assert.equal(schemas.get('/hw/state'),
-               'talos.hardware.Packet 0x33d3c5e0cdc00979');
+               'talos.hardware.Packet 0x33d751e0cdc32d34');
 });
 
 test('endpoint attributes survive the crossing', () => {
@@ -89,12 +96,14 @@ test('endpoint attributes survive the crossing', () => {
   const external = ends.filter(e => e.external).map(e => e.name).sort();
   assert.deepEqual(external, ['/hw/command', '/talos/telemetry']);
 
-  // Every target lane a consumer reads is optional, written or not.
+  // Every target lane a consumer reads is optional, written or not, and so
+  // is each camera state the estimator reads.
   const optional = ends.filter(e => e.optional).map(e => e.name).sort();
   assert.deepEqual(optional, [
     '/drivetrain/target/auto', '/drivetrain/target/teleop',
-    '/intake/target/auto', '/intake/target/teleop', '/shooter/target/auto',
-    '/shooter/target/teleop'
+    '/front_left_camera/state', '/front_right_camera/state',
+    '/intake/target/auto', '/intake/target/teleop', '/rear_left_camera/state',
+    '/rear_right_camera/state', '/shooter/target/auto', '/shooter/target/teleop'
   ]);
 
   // A lane is an envelope: the 16-byte header (mode generation, active), then
@@ -107,7 +116,7 @@ test('endpoint attributes survive the crossing', () => {
 
   // Everything else is an ordinary end, not an unset field read as false.
   assert.equal(ends.filter(e => !e.external && !e.optional).length,
-               ends.length - 8);
+               ends.length - 12);
 });
 
 
@@ -117,7 +126,7 @@ test('a node that never registered is named, with its cause', () => {
   // question the registry cannot answer alone: "was this supposed to be here?"
   const live = parseSystemGraph(demoSystemGraph(1500n));
   const status = declaredStatus(declared, live);
-  assert.equal(status!.declared, 8);
+  assert.equal(status!.declared, 13);
   assert.ok(status!.missing.length > 0,
             'the demo live graph declares every fixture node, so this proves nothing');
   for (const node of status!.missing)
@@ -135,8 +144,8 @@ test('the launcher\'s findings cross the language boundary intact', () => {
   // printed lowercase, which was a real guess in this parser.
   for (const d of graph.diagnostics)
     assert.ok(d.severity === 'error' || d.severity === 'warning', d.severity);
-  assert.equal(graph.diagnostics.length - errors.length, 3,
-               'the autonomous-lane warnings are still there beside the errors');
+  assert.equal(graph.diagnostics.length - errors.length, 1,
+               'the CAN load warning is still there beside the errors');
 
   const subjects = errors.map(d => d.subject).sort();
   assert.deepEqual(subjects, ['/hw/req/drive', '/hw/request/drivetrain']);

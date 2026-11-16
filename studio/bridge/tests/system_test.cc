@@ -296,9 +296,10 @@ TEST(TopicHealth, SeparatesADesignedDeadEndFromABrokenOne) {
 
 // REQ-CONTRACT-09
 TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
-  // The lint's "published but nothing subscribes to it" counts observers
-  // (naming::kSourceFlagObserver, telemetry) as readers; this verdict must
-  // agree, or Studio names a topic the launcher has stopped naming.
+  // The lint counts observers (naming::kSourceFlagObserver, telemetry) as
+  // readers of an owner's feed (state, status, event, telemetry) and of no
+  // instruction (target, request, command); this verdict must agree, or
+  // Studio and the launcher disagree about the same topic.
   introspect::NodeSnapshot gyro;
   gyro.name = "gyro";
   gyro.alive = true;
@@ -311,6 +312,11 @@ TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
                    .kind = event::SourceKind::SENDER,
                    .name = "/gyro/status",
                    .message_bytes = 16,
+                   .events = 10},
+                  {.id = 2,
+                   .kind = event::SourceKind::SENDER,
+                   .name = "/shooter/target/auto",
+                   .message_bytes = 24,
                    .events = 10}};
   introspect::NodeSnapshot telemetry;
   telemetry.name = "telemetry";
@@ -319,6 +325,12 @@ TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
                         .kind = event::SourceKind::WATCHER,
                         .name = "/gyro/state",
                         .message_bytes = 32,
+                        .flags = naming::kSourceFlagObserver,
+                        .events = 10},
+                       {.id = 1,
+                        .kind = event::SourceKind::WATCHER,
+                        .name = "/shooter/target/auto",
+                        .message_bytes = 24,
                         .flags = naming::kSourceFlagObserver,
                         .events = 10}};
 
@@ -332,6 +344,11 @@ TEST(TopicHealth, AnObservedTopicIsReadAsTheLaunchersLintCountsIt) {
 
   // Nobody reads it and nobody observes it: still unread.
   EXPECT_EQ(HealthOf(*Row(topics, "/gyro/status")), TopicHealth::UNREAD);
+
+  // An instruction only an observer records: nothing acts on it, so it is
+  // unread, as the lint's "is read only by observers" warning says.
+  EXPECT_EQ(HealthOf(*Row(topics, "/shooter/target/auto")),
+            TopicHealth::UNREAD);
 }
 
 TEST(TopicHealth, ExternalOutranksOptionalOnTheSameTopic) {

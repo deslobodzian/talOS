@@ -40,7 +40,7 @@ shared-memory topics only; its repository documents their rates.
 | RIO → hardware_node: State (type 20) | UDP source gateway 5802 → bridge 5803, wired robot switch | One snapshot per gateway tick, 200 Hz; echoes clock probe send time only after a subsequent gateway tick. |
 | hardware_node → RIO: Command (21) | UDP 5803 → 5802 | The bridge sleeps until a gateway datagram, a `/hw/request/<node>` publication or its next time-driven duty, and merges each request when it is published, within a CPU budget of 8 passes and 64 received datagrams per 1000 µs window (`HardwareNode::kDatagramBudget`), past which it sleeps through input to the window's end (`HardwareNode::kCpuWindowUs`); one pass receives at most 32 (`HardwareNode::kReceiveBudget`). While the latest State says the gateway can take a command (configured and commissioned, enabled, no fault), send immediately when the merged command changes, its observation included, so one command per accepted request that changes the merge; actuator nodes publish on their own `period_us`, each request carrying a new observation or demand, so in `robot.toml` at most motor 200 + swerve_module 200 = 400 commands/s, each a 138 B frame (3 motors: 98 B payload) ≈ 55 kB/s (in `robot_py.toml`, whose Python motor runs at 20000 µs, 50 + 200 = 250/s ≈ 34.5 kB/s). Otherwise heartbeat `clamp(command_timeout_us / 5, 5000, 20000)` µs: 20000 µs = 50 Hz with the configured 100000 µs timeout. While the latest State says it cannot (disabled, unconfigured, uncommissioned or faulted), a change of the observation alone waits for that heartbeat, so the bridge sends exactly one command per heartbeat (50/s × 138 B ≈ 6.9 kB/s) plus one at once per change of a demand, output or identity word, whatever the owners' periods and phases (`HardwareNode::CommandDueUs`). Only after observed state and while a subsystem request is active. The RIO receives at most 64 frames per 5000 µs hardware tick and applies only the highest-sequence command of each tick's batch (`endpoint.h` `kReceiveBudget`), about 2 commands per tick at 400/s, so a backlog queued during a RIO stall is skipped, not replayed. |
 | hardware_node → RIO: Config chunks (22) | UDP 5803 → 5802 | Whole config push on observed boot/config mismatch or while unacknowledged; retry on State after ≥50000 µs, doubling after rejected ACKs from 100 ms to 2 s. A changed boot ID pushes immediately and resets backoff. Commands continue during backoff; no pushes after successful matching acknowledgment. |
-| RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly and asynchronous reconfiguration, or rejected chunk/config; no per-chunk ACK for incomplete assemblies. An assembly completed while a configure is pending (every boot restore) gets no ACK; the bridge's ≥50000 µs retry pushes again. Per-device degraded configure succeeds, with invalid samples identifying unavailable devices. |
+| RIO → hardware_node: ConfigAck (23) | UDP 5802 → 5803 | On completed assembly and asynchronous reconfiguration, or rejected chunk/config; no per-chunk ACK for incomplete assemblies. An assembly completed while a configure is pending (every boot restore) gets no ACK; the bridge's ≥50000 µs retry pushes again. Per-device degraded configure succeeds, with invalid samples identifying unavailable devices. An ACK whose send fails is sent again at the start of each later gateway tick until a send succeeds or a newer transfer completes: its ACK replaces the old one, and one whose configure is pending drops it, so only the newest completed transfer's ACK goes out. |
 | RIO → hardware_node: DriverStation (24) | UDP 5802 → 5803 | 50 Hz on real RIO and standalone `sim_gateway`, independently of the hardware tick: snapshots are ≥20000 µs apart, except that the tick observing a new mode sends one at once. An enabled mode switch (autonomous to teleop) changes no State; only the new generation retires the old mode's target lanes. |
 | hardware_node → RIO: ClockProbe (25) | UDP 5803 → 5802 | Empty payload; bridge send time in frame header. At most 50 Hz, one outstanding, replaced after 100 ms unanswered (a lost probe or echo), well inside the 1 s exchange lifetime; independent of enable, commissioning and active requests. |
 | hardware_node → device-owning nodes / DS consumers / telemetry | Shared-memory `/hw/state`, `/hw/state/driver_station`, `/hw/status`; no port | State/DS when their frame arrives; bridge status first tick then every 20000 µs (50 Hz, `node.h`'s `kStatusPeriodUs`). Consumers run at their own periods. |
@@ -339,8 +339,9 @@ A writer holds one connected socket per reader slot it has notified, per
 topic it writes ([wake channel](../talOS/rtms/README.md#wake-channel)), so a
 node's wake sockets are at most the readers of the topics it writes, and never
 more than `MAX_READERS` (32) per topic: the bridge, which writes four
-topics, could hold 4 × 32 = 128 (139 descriptors with its 11 others, under
-the macOS limit below) only if 32 readers of each slept on it; what each
+topics, could hold 4 × 32 = 128 wake sockets (plus its few other
+descriptors, under the macOS limit below) only if 32 readers of each slept
+on it; what each
 armed reader adds to a publication is measured under "Publish cost" in the
 [wake channel](../talOS/rtms/README.md#wake-channel). In a robot's
 `--describe-only` graph, counting every reader as armed, the bridge is the
@@ -350,12 +351,12 @@ peak: its wake sockets are the readers of `/hw/state`,
 `graph.json`; `motor` reads `/hw/status` twice), and every other node's
 are its own topics' readers, a few each.
 
-Every node held 9 to 11 descriptors otherwise in a running `--sim` session on
-Linux (`/proc/<pid>/fd`: stdio and log pipes, the event-log file, the poller,
+Besides its wake sockets a node holds a few descriptors (`/proc/<pid>/fd`
+on Linux: stdio and log pipes, the event-log file, the poller,
 the stop pipe, its wake receiver; the bridge's UDP socket). The bench's
-peak, the bridge's 11 + 12 = 23, leaves 233 of macOS's default soft
-`RLIMIT_NOFILE` of 256 (and 1001 of Linux's usual 1024), so nodes do not
-raise the limit. A node
+peak, the bridge's 12 wake sockets, leaves 244 of macOS's default soft
+`RLIMIT_NOFILE` of 256 (and 1012 of Linux's usual 1024) for those few, so
+nodes do not raise the limit. A node
 that did run out would show it in its registry row's `wake_failures`, and in
 the session manifest, where `session_report --strict` rejects it.
 
@@ -396,7 +397,10 @@ age; input replay injects with the recorded publication time, at that time,
 or, for a node the session ran, at the drain that received it. Neither crosses
 a GAP record: exact replay stops before the gap's first dropped dispatch,
 input replay before the earliest gap or damaged stretch in a log it feeds
-from, and both exit 1
+from (another reader's stretch too, unless an intact receipt follows it and
+the session's other logs hold what it lost:
+[the rule](../talOS/events/README.md#replaying-another-sessions-inputs)),
+and both exit 1
 ([events](../talOS/events/README.md#recording-and-replaying)).
 Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
 GAP record) and reject any other with the recorded and supported versions; the

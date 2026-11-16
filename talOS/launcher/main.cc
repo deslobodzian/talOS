@@ -62,6 +62,8 @@ int main(int argc, char** argv) {
         options.allow_graph_errors = true;
       } else if (arg == "--describe-only") {
         options.describe_only = true;
+      } else if (arg == "--describe-as-launch") {
+        options.describe_as_launch = true;
       } else if (arg == "--describe-timeout-ms" && i + 1 < argc) {
         options.describe_timeout_ms = std::stoi(argv[++i]);
       } else if (arg == "--replay-inputs" && i + 1 < argc) {
@@ -86,7 +88,8 @@ int main(int argc, char** argv) {
                "[--duration-s N] [--session-id ID] [--sim] "
                "[--start-sim-gateway [--sim-gateway-arg ARG]...] "
                "[--start-studio-bridge] "
-               "[--studio-http-port PORT] [--describe-only] "
+               "[--studio-http-port PORT] "
+               "[--describe-only [--describe-as-launch]] "
                "[--allow-graph-errors] [--describe-timeout-ms MS] "
                "[--max-restarts N] "
                "[--remote IP] [--remote-port PORT] [--local-port PORT] "
@@ -108,6 +111,11 @@ int main(int argc, char** argv) {
                "what it is, lint the\n"
                "                         graph they describe, and exit "
                "without starting a robot\n"
+               "  --describe-as-launch   with --describe-only, also refuse "
+               "what the same\n"
+               "                         launch would refuse before its "
+               "probes ([robot]\n"
+               "                         simulation_only without --sim)\n"
                "  --allow-graph-errors   start anyway when the declared "
                "graph has errors;\n"
                "                         requires --sim\n"

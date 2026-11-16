@@ -18,8 +18,14 @@ A test source is a `*_test.cc`, `*_test.cpp`, `*_test.py` or `test_*.py`
 file (`*_test.cpp`: the RoboRIO program's GradleRIO tests). A node
 package is a directory whose BUILD declares a node (talos_cc_node,
 talos_py_node, talos_cc_shared_node) under bench, examples or
-tools/scaffold_testdata; a node package's tests are test sources. Comment
-lines are skipped.
+tools/scaffold_testdata, or one of the framework nodes' packages
+(talOS/teleop, talOS/telemetry); a node package's tests are test sources.
+Other talOS packages that declare a node (talOS/launcher, talOS/node,
+talOS/node_api) do so only for test fixtures beside framework code that
+runs on the real clock, so only their test sources are scanned.
+Studio's TypeScript tests (`studio/tests/**/*.ts`, `*.tsx`) are test
+sources too: there `sleep` is a `setTimeout(` call and `clock` a
+`Date.now(` or `performance.now(` call. Comment lines are skipped.
 
 An integration, e2e, soak or perf test may use the real clock (§2); it is
 listed in tools/lint_test_time_allowlist.txt, one `<path> <kind> [<count>]
@@ -38,6 +44,9 @@ import sys
 ALLOWLIST = "tools/lint_test_time_allowlist.txt"
 
 NODE_ROOTS = ("bench/", "examples/", "tools/scaffold_testdata/")
+# Framework nodes: packages outside NODE_ROOTS whose sources are node code.
+FRAMEWORK_NODE_PACKAGES = ("talOS/teleop", "talOS/telemetry")
+STUDIO_TESTS = "studio/tests/"
 NODE_MACRO = re.compile(r"\b(talos_cc_node|talos_py_node|talos_cc_shared_node)"
                         r"\s*\(")
 SOURCE_SUFFIXES = (".cc", ".h", ".cpp", ".hpp", ".py")
@@ -57,6 +66,10 @@ CLOCK_ALIAS = re.compile(r"\busing\s+(\w+)\s*=\s*(?:std\s*::\s*)?"
                          r"(?:chrono\s*::\s*)?"
                          r"(?:steady_clock|system_clock|high_resolution_clock)"
                          r"\s+(\w+)\s*;")
+TS_TIME_PATTERNS = {
+    "sleep": re.compile(r"\bsetTimeout\s*\("),
+    "clock": re.compile(r"\b(Date|performance)\.now\s*\("),
+}
 RETRY_PATTERN = re.compile(r"\bflaky\s*=\s*True\b|--flaky_test_attempts")
 
 
@@ -64,6 +77,10 @@ def is_test_source(path):
     name = os.path.basename(path)
     return (name.endswith(("_test.cc", "_test.cpp", "_test.py")) or
             (name.startswith("test_") and name.endswith(".py")))
+
+
+def is_studio_test(path):
+    return path.startswith(STUDIO_TESTS) and path.endswith((".ts", ".tsx"))
 
 
 def is_retry_config(path):
@@ -75,8 +92,9 @@ def is_retry_config(path):
 
 
 def node_packages(files, read):
-    """Directories under NODE_ROOTS whose BUILD declares a node."""
-    packages = set()
+    """Directories under NODE_ROOTS whose BUILD declares a node, and the
+    framework nodes' packages."""
+    packages = set(FRAMEWORK_NODE_PACKAGES)
     for path in files:
         if (path.startswith(NODE_ROOTS) and
                 os.path.basename(path) in ("BUILD", "BUILD.bazel") and
@@ -111,6 +129,8 @@ def scan(files, read):
                 patterns["clock"] = re.compile(
                     TIME_PATTERNS["clock"].pattern + r"|\b(" +
                     "|".join(sorted(aliases)) + r")::now\s*\(")
+        if is_studio_test(path):
+            patterns.update(TS_TIME_PATTERNS)
         if is_retry_config(path):
             patterns["retry"] = RETRY_PATTERN
         if not patterns:

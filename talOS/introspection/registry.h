@@ -448,23 +448,33 @@ inline std::string read_name(const char* value, std::size_t capacity) {
   return std::string{value, n};
 }
 
-// Optional startup-only fault-injection seams. Production callers leave these
-// null; tests stop a child while it owns the lock, before either commit.
+// Optional startup-only fault-injection seams, each called at most once per
+// mapping or registration, with RegistryLock held. Production callers leave
+// these null; tests stop a child while it owns the lock, before either
+// commit, or act between a registration's map and its claim (`mapped`).
+// `lock_file_opened` is RegistryLock's alone, called without the lock once
+// it has opened the lock file the first time, before it locks it: the point
+// after which unlinking the path leaves that acquirer on a stale file.
 struct RegistryTestHooks {
   void (*initializing)(RegistryHeader*){nullptr};
+  void (*mapped)(RegistryHeader*){nullptr};
   void (*claiming)(NodeRecord*){nullptr};
+  void (*lock_file_opened)(){nullptr};
 };
 
 // Serializes the writers: segment creation, sizing and initialization
-// (RegistryMapping) and slot claims (NodeRegistration); a reader never takes
-// it. Use a regular file (LockFilePath): Darwin's shm descriptors are not
-// vnodes, so flock on them fails with ENOTSUP. Each acquisition opens a
-// separate file description, which also serializes threads in one process.
-// close (including process death) releases the lock. Only a launcher
-// session in a shared-memory namespace unlinks this file, under the lock,
-// once its members are reaped and no other session holds a row
-// (NamespaceNames, launcher.cc); if anything unlinks it, an acquirer that
-// wins the old inode finds it no longer current and starts over.
+// (RegistryMapping, PrepareRegistry), a registration's map and slot claim,
+// taken once for both (NodeRegistration), and a namespaced launcher
+// session's removal of the registry; a reader never takes it. No holder
+// waits for another lock; the launcher holds its session locks while it
+// takes this one, and no holder of this one takes those. Use a regular file
+// (LockFilePath): Darwin's shm descriptors are not vnodes, so flock on them
+// fails with ENOTSUP. Each acquisition opens a separate file description, which
+// also serializes threads in one process. close (including process death)
+// releases the lock. Only a launcher session in a shared-memory namespace
+// unlinks this file, under the lock, once its members are reaped and no other
+// session holds a row (NamespaceNames, launcher.cc); if anything unlinks it, an
+// acquirer that wins the old inode finds it no longer current and starts over.
 class RegistryLock {
  public:
   explicit RegistryLock(const std::string& mapped_path)
@@ -473,7 +483,8 @@ class RegistryLock {
   // Waits at most `wait` when it is set, then throws: a holder that keeps
   // the lock that long is stuck (stopped mid-registration), not registering.
   RegistryLock(const std::string& mapped_path,
-               std::optional<std::chrono::milliseconds> wait) {
+               std::optional<std::chrono::milliseconds> wait,
+               const RegistryTestHooks* test_hooks = nullptr) {
     // Namespace selection is entirely ShmObjectName's job: the lock file is
     // named after its mapped result.
     const std::string file_path = LockFilePath(mapped_path);
@@ -491,6 +502,10 @@ class RegistryLock {
       if (fd_ < 0) {
         throw std::runtime_error("registry lock open failed for " + file_path +
                                  ": " + std::strerror(errno));
+      }
+      if (test_hooks != nullptr && test_hooks->lock_file_opened != nullptr) {
+        test_hooks->lock_file_opened();
+        test_hooks = nullptr;
       }
       while (::flock(fd_, operation) < 0) {
         const int error = errno;
@@ -565,11 +580,13 @@ class RegistryMapping {
   }
 
   // A writer's mapping for a caller that already holds `held`, this path's
-  // RegistryLock (PrepareRegistry); taking it again would wait on itself.
-  RegistryMapping(std::string_view path, const RegistryLock& held)
+  // RegistryLock (PrepareRegistry, NodeRegistration); taking it again would
+  // wait on itself.
+  RegistryMapping(std::string_view path, const RegistryLock& held,
+                  const RegistryTestHooks* test_hooks = nullptr)
       : path_{ShmObjectName(path)} {
     static_cast<void>(held);
-    map(false, nullptr);
+    map(false, test_hooks);
   }
 
   ~RegistryMapping() {
@@ -778,6 +795,44 @@ inline void PrepareRegistry(
   const RegistryMapping initialized{path, *lock};
 }
 
+// What a launcher session in a shared-memory namespace does to the registry
+// once its members are reaped (the launcher's NamespaceNames): removes the
+// segment and then its writer lock file, unless the lock is held or a row of
+// another session than `session_id` names a claimant that still runs. True
+// when it removed them; held, absent or not this layout, it leaves them.
+inline bool RemoveRegistryUnlessHeld(std::uint64_t session_id,
+                                     std::string_view path = kRegistryPath) {
+  const std::string mapped = ShmObjectName(path);
+  try {
+    // Not waited for: a holder now is no member of the session (every one is
+    // reaped), and the registry stays for it.
+    const RegistryLock lock{mapped, std::chrono::milliseconds{0}};
+    {
+      const RegistryMapping registry{path, /*read_only=*/true};
+      // A row of another session keeps the registry while its claimant runs;
+      // one whose process is gone (a SIGKILLed node of an earlier session,
+      // not yet swept by a claim) is no one's.
+      for (const auto& row : registry.header()->nodes) {
+        if (row.state.load(std::memory_order_acquire) !=
+                static_cast<std::uint64_t>(SlotState::FREE) &&
+            row.session_id != session_id &&
+            talos::ProcessWordAlive((row.pid_start << kProcessPidBits) |
+                                    row.pid)) {
+          return false;
+        }
+      }
+    }
+    RegistryMapping::unlink(path);
+    // Under the lock: a writer waiting on this file finds it no longer
+    // current once it locks it, and takes the one the path names anew
+    // (RegistryLock).
+    ::unlink(LockFilePath(mapped).c_str());
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 // One node's claim on a registry slot. Owns the slot for its lifetime and
 // frees it on destruction, so a clean shutdown leaves no ghost rows.
 class NodeRegistration {
@@ -789,20 +844,19 @@ class NodeRegistration {
     std::uint32_t flags{0};
   };
 
+  // Maps the registry and claims a slot under one RegistryLock acquisition,
+  // so a claim lands in the segment the path names: a launcher session that
+  // removes the registry (NamespaceNames, launcher.cc) does so under that
+  // lock, either before the map, and the map creates a new segment, or after
+  // the claim, when the row keeps it. Locked for microseconds: shm_open,
+  // mmap, a header check and a scan of kMaxNodes rows, all before the node's
+  // constructor and its loop run.
   explicit NodeRegistration(Identity identity,
                             std::string_view path = kRegistryPath,
                             const RegistryTestHooks* test_hooks = nullptr)
-      : mapping_{path, false, test_hooks}, identity_{std::move(identity)} {
-    const RegistryLock lock{mapping_.path()};
-    record_ = claim(mapping_.header(), identity_, test_hooks);
-    if (record_ == nullptr) {
-      throw std::runtime_error(
-          "registry is full: " + std::to_string(kMaxNodes) +
-          " nodes are already registered");
-    }
-    generation_ = record_->generation.load(std::memory_order_acquire);
-    pid_ = record_->pid;
-  }
+      // The temporary lock lives until the delegated constructor returns.
+      : NodeRegistration(std::move(identity), path, test_hooks,
+                         RegistryLock{ShmObjectName(path)}) {}
 
   ~NodeRegistration() { release(); }
 
@@ -1035,6 +1089,25 @@ class NodeRegistration {
   }
 
  private:
+  // The public constructor's work, with `held` taken for the map and the
+  // claim alike.
+  NodeRegistration(Identity identity, std::string_view path,
+                   const RegistryTestHooks* test_hooks,
+                   const RegistryLock& held)
+      : mapping_{path, held, test_hooks}, identity_{std::move(identity)} {
+    if (test_hooks != nullptr && test_hooks->mapped != nullptr) {
+      test_hooks->mapped(mapping_.header());
+    }
+    record_ = claim(mapping_.header(), identity_, test_hooks);
+    if (record_ == nullptr) {
+      throw std::runtime_error(
+          "registry is full: " + std::to_string(kMaxNodes) +
+          " nodes are already registered");
+    }
+    generation_ = record_->generation.load(std::memory_order_acquire);
+    pid_ = record_->pid;
+  }
+
   bool owns_slot() const noexcept {
     return record_ != nullptr &&
            record_->generation.load(std::memory_order_relaxed) == generation_ &&

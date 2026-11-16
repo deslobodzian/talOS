@@ -265,7 +265,11 @@ class SimHardware:
 
     def set_connected(self, node, device, connected):
         """A disconnected device reports connected False (a motor's sample
-        is invalid) and reads 0; every device of `node` named `device`."""
+        is invalid) and reads 0; a motor's or CAN sensor's ages grow from
+        the last state that read it connected, and a motor's limit bits
+        clear 50 ms after it, as on the RoboRIO (which counts the 50 ms
+        from the fault signal's last frame, so it can clear them sooner).
+        Every device of `node` named `device`."""
         self._set(lib.talos_sim_hardware_set_connected, node, device,
                   bool(connected))
 

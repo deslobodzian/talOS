@@ -17,7 +17,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -29,7 +29,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -41,19 +41,19 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
         {
           "kind": "SENDER",
           "name": "/hw/status",
-          "message_bytes": 184,
+          "message_bytes": 264,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xd214e0d047686efe",
+          "schema_hash": "0xb97101f222aa96a4",
           "alignment": 8,
           "slots": 1024
         },
@@ -65,7 +65,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -77,7 +77,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -89,20 +89,56 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         }
       ]
     },
     {
-      "name": "driver",
-      "target": "//2026-robot/main_processor/driver:node",
+      "name": "autonomous",
+      "target": "//main_processor/autonomous:node",
       "described": true,
       "sources": [
         {
+          "kind": "WATCHER",
+          "name": "/pose_estimator/state",
+          "message_bytes": 72,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "geometry.PoseEstimate",
+          "schema_hash": "0xa364046c97d85dfd",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/shooter/state",
+          "message_bytes": 32,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "shooter.ShooterState",
+          "schema_hash": "0x24ee4ff3f93dc643",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/intake/state",
+          "message_bytes": 20,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "intake.IntakeState",
+          "schema_hash": "0x233bcd0e0b8c8d02",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
           "kind": "SENDER",
-          "name": "/drivetrain/target/teleop",
+          "name": "/drivetrain/target/auto",
           "message_bytes": 40,
           "external": false,
           "optional": false,
@@ -120,10 +156,61 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
+        {
+          "kind": "SENDER",
+          "name": "/shooter/target/auto",
+          "message_bytes": 24,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<shooter.ShooterTarget>",
+          "schema_hash": "0x58c8d0e5410d74f7",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/intake/target/auto",
+          "message_bytes": 20,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<intake.IntakeTarget>",
+          "schema_hash": "0x611722557563b8ba",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/autonomous/state",
+          "message_bytes": 2,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "autonomous.AutonomousState",
+          "schema_hash": "0xab59283f7ecc1eac",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "autonomous",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
+    },
+    {
+      "name": "driver",
+      "target": "//main_processor/driver:node",
+      "described": true,
+      "sources": [
         {
           "kind": "WATCHER",
           "name": "/drivetrain/state",
@@ -133,6 +220,30 @@
           "observer": false,
           "schema": "drivetrain.DrivetrainState",
           "schema_hash": "0xa4bfcc84220ca6ea",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1436,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.hardware.Packet",
+          "schema_hash": "0x33d751e0cdc32d34",
+          "alignment": 4,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/drivetrain/target/teleop",
+          "message_bytes": 40,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.TargetEnvelope<drivetrain.ChassisTarget>",
+          "schema_hash": "0x6afed51452740f04",
           "alignment": 8,
           "slots": 1024
         },
@@ -148,7 +259,7 @@
     },
     {
       "name": "drivetrain",
-      "target": "//2026-robot/main_processor/drivetrain:node",
+      "target": "//main_processor/drivetrain:node",
       "described": true,
       "sources": [
         {
@@ -159,19 +270,31 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 184,
+          "message_bytes": 264,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xd214e0d047686efe",
+          "schema_hash": "0xb97101f222aa96a4",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/hw/status",
+          "message_bytes": 264,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "bridge.BridgeStatus",
+          "schema_hash": "0xb97101f222aa96a4",
           "alignment": 8,
           "slots": 1024
         },
@@ -183,7 +306,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -231,7 +354,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -246,8 +369,86 @@
       ]
     },
     {
+      "name": "front_left_camera",
+      "target": "//main_processor/vision:front_left_camera",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/front_left_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/front_left_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "front_left_camera",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
+    },
+    {
+      "name": "front_right_camera",
+      "target": "//main_processor/vision:front_right_camera",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/front_right_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/front_right_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "front_right_camera",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
+    },
+    {
       "name": "intake",
-      "target": "//2026-robot/main_processor/intake:node",
+      "target": "//main_processor/intake:node",
       "described": true,
       "sources": [
         {
@@ -258,19 +459,19 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 184,
+          "message_bytes": 264,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xd214e0d047686efe",
+          "schema_hash": "0xb97101f222aa96a4",
           "alignment": 8,
           "slots": 1024
         },
@@ -282,7 +483,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -294,7 +495,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -323,6 +524,18 @@
           "slots": 1024
         },
         {
+          "kind": "WATCHER",
+          "name": "/shooter/state",
+          "message_bytes": 32,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "shooter.ShooterState",
+          "schema_hash": "0x24ee4ff3f93dc643",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
           "kind": "SENDER",
           "name": "/intake/state",
           "message_bytes": 20,
@@ -330,7 +543,7 @@
           "optional": false,
           "observer": false,
           "schema": "intake.IntakeState",
-          "schema_hash": "0x79500160d91a3f73",
+          "schema_hash": "0x233bcd0e0b8c8d02",
           "alignment": 8,
           "slots": 1024
         },
@@ -346,7 +559,7 @@
     },
     {
       "name": "pose_estimator",
-      "target": "//2026-robot/main_processor/pose_estimator:node",
+      "target": "//main_processor/pose_estimator:node",
       "described": true,
       "sources": [
         {
@@ -362,6 +575,54 @@
           "slots": 1024
         },
         {
+          "kind": "WATCHER",
+          "name": "/front_left_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": true,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/front_right_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": true,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/rear_left_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": true,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/rear_right_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": true,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
           "kind": "SENDER",
           "name": "/pose_estimator/state",
           "message_bytes": 72,
@@ -369,8 +630,20 @@
           "optional": false,
           "observer": false,
           "schema": "geometry.PoseEstimate",
-          "schema_hash": "0x64a0ad522b244795",
+          "schema_hash": "0xa364046c97d85dfd",
           "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/hw/state/driver_station",
+          "message_bytes": 1436,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "talos.hardware.Packet",
+          "schema_hash": "0x33d751e0cdc32d34",
+          "alignment": 4,
           "slots": 1024
         },
         {
@@ -384,8 +657,86 @@
       ]
     },
     {
+      "name": "rear_left_camera",
+      "target": "//main_processor/vision:rear_left_camera",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/rear_left_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/rear_left_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "rear_left_camera",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
+    },
+    {
+      "name": "rear_right_camera",
+      "target": "//main_processor/vision:rear_right_camera",
+      "described": true,
+      "sources": [
+        {
+          "kind": "SENDER",
+          "name": "/rear_right_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "SENDER",
+          "name": "/rear_right_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": false,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "TIMER",
+          "name": "rear_right_camera",
+          "message_bytes": 0,
+          "external": false,
+          "optional": false,
+          "observer": false
+        }
+      ]
+    },
+    {
       "name": "shooter",
-      "target": "//2026-robot/main_processor/shooter:node",
+      "target": "//main_processor/shooter:node",
       "described": true,
       "sources": [
         {
@@ -396,19 +747,19 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 184,
+          "message_bytes": 264,
           "external": false,
           "optional": false,
           "observer": false,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xd214e0d047686efe",
+          "schema_hash": "0xb97101f222aa96a4",
           "alignment": 8,
           "slots": 1024
         },
@@ -420,7 +771,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -432,7 +783,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -484,7 +835,7 @@
     },
     {
       "name": "telemetry",
-      "target": "//talOS/telemetry:node",
+      "target": "@@talos+//talOS/telemetry:node",
       "described": true,
       "sources": [
         {
@@ -495,7 +846,7 @@
           "optional": false,
           "observer": true,
           "schema": "geometry.PoseEstimate",
-          "schema_hash": "0x64a0ad522b244795",
+          "schema_hash": "0xa364046c97d85dfd",
           "alignment": 8,
           "slots": 1024
         },
@@ -507,19 +858,31 @@
           "optional": false,
           "observer": true,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
         {
           "kind": "WATCHER",
           "name": "/hw/status",
-          "message_bytes": 184,
+          "message_bytes": 264,
           "external": false,
           "optional": false,
           "observer": true,
           "schema": "bridge.BridgeStatus",
-          "schema_hash": "0xd214e0d047686efe",
+          "schema_hash": "0xb97101f222aa96a4",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/autonomous/state",
+          "message_bytes": 2,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "autonomous.AutonomousState",
+          "schema_hash": "0xab59283f7ecc1eac",
           "alignment": 8,
           "slots": 1024
         },
@@ -537,13 +900,109 @@
         },
         {
           "kind": "WATCHER",
+          "name": "/front_left_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/front_left_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/front_right_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/front_right_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
           "name": "/intake/state",
           "message_bytes": 20,
           "external": false,
           "optional": false,
           "observer": true,
           "schema": "intake.IntakeState",
-          "schema_hash": "0x79500160d91a3f73",
+          "schema_hash": "0x233bcd0e0b8c8d02",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/rear_left_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/rear_left_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/rear_right_camera/state",
+          "message_bytes": 64,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "geometry.PoseObservation",
+          "schema_hash": "0xf132d29b14d8b5bc",
+          "alignment": 8,
+          "slots": 1024
+        },
+        {
+          "kind": "WATCHER",
+          "name": "/rear_right_camera/status",
+          "message_bytes": 88,
+          "external": false,
+          "optional": false,
+          "observer": true,
+          "schema": "vision.VisionStatus",
+          "schema_hash": "0x190c8b615f851eb6",
           "alignment": 8,
           "slots": 1024
         },
@@ -583,7 +1042,7 @@
     },
     {
       "name": "teleop",
-      "target": "//talOS/teleop:node",
+      "target": "@@talos+//talOS/teleop:node",
       "described": true,
       "sources": [
         {
@@ -594,7 +1053,7 @@
           "optional": false,
           "observer": false,
           "schema": "talos.hardware.Packet",
-          "schema_hash": "0x33d3c5e0cdc00979",
+          "schema_hash": "0x33d751e0cdc32d34",
           "alignment": 4,
           "slots": 1024
         },
@@ -636,18 +1095,8 @@
   "diagnostics": [
     {
       "severity": "warning",
-      "subject": "/drivetrain/target/auto",
-      "message": "is in the target policy of drivetrain but nothing writes it yet"
-    },
-    {
-      "severity": "warning",
-      "subject": "/intake/target/auto",
-      "message": "is in the target policy of intake but nothing writes it yet"
-    },
-    {
-      "severity": "warning",
-      "subject": "/shooter/target/auto",
-      "message": "is in the target policy of shooter but nothing writes it yet"
+      "subject": "rio",
+      "message": "estimated CAN bus utilization 1.07 (10 motors, 4 CANcoders, 1 gyros at status_hz 200, on classic CAN) is above 0.70; reduce status_hz or move devices to another CAN bus"
     }
   ]
 }

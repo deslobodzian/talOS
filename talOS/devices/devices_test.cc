@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include "bridge/bridge_status_generated.h"
@@ -1216,6 +1218,63 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
   EXPECT_THROW(sim.add<EagerLed>("mech"), std::logic_error);
 }
 
+// A message callback runs on the loop thread but outside update(); another
+// thread can call a setter while update() runs. Both would command the
+// hardware outside the tick that flushes it.
+// REQ-SAFE-06: a setter from a callback or off the loop thread throws naming
+// the device
+TEST(Devices, OutputSettersFromACallbackOrAnotherThreadThrow) {
+  struct Listener {
+    explicit Listener(Node& n)
+        : led{n, "led"},
+          poke{n.subscribe<::bridge::BridgeStatus>(
+              "/test/poke",
+              [this](const ::bridge::BridgeStatus&) { led.set(true); })} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {}
+    DigitalOutput led;
+    Subscription<::bridge::BridgeStatus> poke;
+  };
+  struct Threaded {
+    explicit Threaded(Node& n) : servo{n, "servo"} {
+      AllowUntargetedOutputs(n);
+    }
+    void update() {
+      std::thread other{[this] {
+        try {
+          servo.set(0.5);
+          error = "accepted";
+        } catch (const std::logic_error& thrown) {
+          error = thrown.what();
+        }
+      }};
+      other.join();
+    }
+    PwmOutput servo;
+    std::string error;
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    sim.add<Listener>("mech");
+    sim.publish("/test/poke", ::bridge::BridgeStatus{});
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << "a digital output set in a callback was accepted";
+    } catch (const std::logic_error& error) {
+      EXPECT_NE(std::string{error.what()}.find("'led'"), std::string::npos)
+          << error.what();
+    }
+  }
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& threaded = sim.add<Threaded>("mech");
+  sim.step(10ms);
+  EXPECT_NE(threaded.error.find("PwmOutput::set"), std::string::npos)
+      << threaded.error;
+  EXPECT_NE(threaded.error.find("'servo'"), std::string::npos)
+      << threaded.error;
+}
+
 // The opt-out is fixed with the node: from update() it is refused, naming
 // the node.
 // REQ-SAFE-42
@@ -1407,7 +1466,8 @@ hardware::State LatestState(const Sim& sim) {
 }
 
 // A backend whose every Read returns `read`, as PhoenixBackend reports a
-// device that stopped answering: its last readings, marked invalid.
+// device that stopped answering: its last readings, their ages grown since,
+// marked invalid.
 class FixedReadBackend final : public hardware::Backend {
  public:
   explicit FixedReadBackend(const hardware::State& read) : read_{read} {}
@@ -1431,8 +1491,10 @@ class FixedReadBackend final : public hardware::Backend {
 
 // A disconnected motor or CAN sensor in SimHardware publishes the sample the
 // gateway publishes for the same readings marked invalid
-// (hardware::MarkInvalid): every measurement zero, its ages and temperature
-// as last read, so a node reads in a Sim test what it reads on the robot.
+// (hardware::MarkInvalid): every measurement zero, its ages grown from its
+// last frame by the sample time since (as Phoenix reports a signal that
+// stopped) and, while the signal is younger than 500 ms, its temperature as
+// last read, so a node reads in a Sim test what it reads on the robot.
 // Scenario: motor a at 1.5 rot, -2 rot/s, 62.5 C, 18.25 A supply and 40.04 A
 // stator, with 300 and 400 us ages, and CANcoder cc at 0.2 rot, 0.3 rot/s,
 // with 500 and 600 us ages, stop answering.
@@ -1453,9 +1515,16 @@ TEST(Devices, ADisconnectedDeviceIsTheGatewaysInvalidSample) {
   sim.step(10ms);  // a State the node has drained
   const hardware::State simulated = LatestState(sim);
 
-  // The gateway, reading the same devices as they stop answering.
-  read.motors[0].valid = false;   // motor a, the config's first
+  // The gateway, reading the same devices since they stopped answering.
+  const auto since_us = static_cast<std::uint32_t>(simulated.sample_time_us -
+                                                   read.sample_time_us);
+  ASSERT_EQ(since_us, 10'000u);
+  read.motors[0].valid = false;  // motor a, the config's first
+  read.motors[0].position_age_us += since_us;
+  read.motors[0].velocity_age_us += since_us;
   read.sensors[0].valid = false;  // CANcoder cc, its first sensor
+  read.sensors[0].position_age_us += since_us;
+  read.sensors[0].velocity_age_us += since_us;
   FixedReadBackend backend{read};
   hardware::Gateway gateway{
       sim.node("mech").extension<HardwareLink>().config().hardware, backend, 1};

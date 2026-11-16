@@ -67,8 +67,10 @@ of the lint, which `--allow-graph-errors` overrides (accepted only with
 `--sim`; [launcher](launcher/README.md#two-phases)), a node's `publish` and
 `publish_bytes` (C++, or Python through `talOS/node_api`) refuse any topic
 under `/hw/request`, remapped or not, at construction. A topic nobody reads
-(telemetry's recording counts as a read, so a topic published for display
-is no finding), a policy lane nobody writes yet, a topic whose owner is not a node in the
+(telemetry's recording counts as a read only of an owner-published role,
+`state`, `status`, `event` or `telemetry`, so a topic published for display
+is no finding, while a `target`, `request` or `command` that only telemetry
+records still is), a policy lane nobody writes yet, a topic whose owner is not a node in the
 session, a node whose hardware request carries `untargeted_outputs` without
 that coverage, or a node that writes its hardware request but reads no target
 lane of its own and has not opted out (its outputs never drive; REQ-SAFE-41), is a
@@ -82,7 +84,13 @@ operator interface), `/drivetrain/target/auto`, `/hw/state`,
 
 A node name follows the segment rules, is not a reserved owner, and is the
 `[subsystems.<name>]` key, the `node_name` in `talos_cc_node`/`talos_py_node`,
-the log file stem and the registry row. The node's Bazel label must match the
+the log file stem and the registry row. A subsystem cannot share its name
+with a member the launcher adds itself: `hardware_node` always, and
+`sim_gateway` or `studio_bridge` when `--start-sim-gateway` or
+`--start-studio-bridge` adds that member; the launch, `--describe-only`
+included and `--allow-graph-errors` or not, is refused naming the
+`[subsystems.<name>]` key. Without its flag, a subsystem named `sim_gateway`
+or `studio_bridge` is an ordinary node. The node's Bazel label must match the
 name in its package leaf, its repository (at a repository root), or its rule:
 `//bench/main_processor/swerve_module:node`, `@wrist//:node`,
 `//examples/superstructure/cpp:elevator`.

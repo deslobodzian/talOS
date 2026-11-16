@@ -48,13 +48,14 @@ jobs:
 
     - &diff-base
       name: Choose the diff base
-      # Reused by buildifier, clang-format and clang-tidy. A pull request
+      # Reused by buildifier, clang-format, clang-tidy and the source lints'
+      # commissioning check. A pull request
       # checks every file its branch changed since it left the base branch,
       # so a commit whose earlier run was cancelled or failed is checked
       # again by every later run. A topic-branch push does the same, against
       # the merge base with main, in a job that sets DIFF_SCOPE=branch
-      # (every job that uses it: buildifier, clang-format and the Linux
-      # job's clang-tidy). Otherwise (main) a push
+      # (every job that uses it: buildifier, clang-format, lint and the
+      # Linux job's clang-tidy). Otherwise (main) a push
       # checks the commits it pushed; on main, `before` is the old tip,
       # which is the merge base of what was merged. A new branch (all-zero
       # `before`) or a force push (`before` absent from the clone or not an
@@ -708,16 +709,25 @@ jobs:
     name: Source lints (no Bazel)
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      # The diff base step checks the whole branch on a topic-branch push,
+      # so the commissioning lint checks every commit the branch adds.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
+      with:
+        # Full history: the commissioning lint reads each commit since $BASE.
+        fetch-depth: 0
 
-    - name: Test time, links, requirement trace, node test matrix
+    - *diff-base
+
+    - name: Test time, links, requirement trace, node test matrix, deps, commissioning
       # tools/source_lints.sh, which tools/prepush.sh's source-lints step
       # also runs, so the two cannot drift; its header lists each lint. It
       # runs every lint whatever the others find and prints one line per
       # lint.
-      run: bash tools/source_lints.sh
+      run: bash tools/source_lints.sh --base "$BASE"
 
   gate:
     name: CI gate

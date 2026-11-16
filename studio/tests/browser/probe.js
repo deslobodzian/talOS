@@ -64,27 +64,6 @@
     return {text, content};
   }
 
-  // The text of a single-text-node element as rendered: whole, or the
-  // characters that fit before its ellipsis.
-  function renderedText(el) {
-    const node = [...el.childNodes].find(n => n.nodeType === 3);
-    if (!node) return el.textContent;
-    const {text, content} = textFit(el);
-    if (text <= content + TEXT_EPS) return node.textContent;
-    const canvas = renderedText.canvas ??= document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    ctx.font = getComputedStyle(el).font;
-    const ellipsis = ctx.measureText('…').width;
-    const range = document.createRange();
-    for (let k = node.textContent.length - 1; k >= 0; k--) {
-      range.setStart(node, 0);
-      range.setEnd(node, k);
-      if (range.getBoundingClientRect().width + ellipsis <= content + TEXT_EPS)
-        return node.textContent.slice(0, k) + '…';
-    }
-    return '…';
-  }
-
   // How many rows of a list body are out of view, from the rows' boxes.
   function outOfView(body) {
     const c = clipBox(body);
@@ -201,15 +180,10 @@
           failures.push(failure('widget without a value', t, t.textContent));
     }
     failures.push(...listChecks(page));
-
-    // Camera rows tell one camera from another as rendered.
-    const cameras = [...page.querySelectorAll('.nodes .name')].filter(n => /camera/.test(n.textContent));
-    const shown = cameras.map(renderedText);
-    for (let i = 0; i < cameras.length; i++)
-      for (let j = i + 1; j < cameras.length; j++)
-        if (shown[i] === shown[j])
-          failures.push(failure('camera rows alike', cameras[j],
-                                `"${cameras[i].textContent}" and "${cameras[j].textContent}" both show "${shown[j]}"`));
+    // That subsystem rows whose names differ only past the cell's width
+    // (front_left_camera, front_right_camera) still read differently is
+    // studio/tests/drive.test.ts's "a 2026 subsystems row keeps a readable
+    // name beside its widest state word": this subject has no such rows.
     return failures;
   }
 
@@ -270,5 +244,5 @@
     return armedAt;
   }
 
-  window.__probe = {audit, listState, waitFor, frames, current, valued, allUp, status, armStale, renderedText};
+  window.__probe = {audit, listState, waitFor, frames, current, valued, allUp, status, armStale};
 })();

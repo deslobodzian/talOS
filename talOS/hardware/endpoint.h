@@ -51,6 +51,14 @@ class Endpoint {
   // Link fault injection drops outbound traffic, never inbound commands or
   // gateway safety ticks. Suppressed datagrams are not queued for recovery.
   void SetSendEnabled(bool enabled) { send_enabled_ = enabled; }
+  // Ticks the gateway, drains received frames and sends this tick's State.
+  // A configuration ACK whose send fails is kept and sent again at the start
+  // of each later Tick until a send succeeds or a newer transfer completes
+  // (its ACK replaces it, or, while its configure is pending, none is sent),
+  // so only the newest completed transfer's ACK ever goes out (the bridge
+  // would otherwise wait for its next push). Returns the State send's
+  // status, or, when that succeeded, the first failed ACK send's: either way a
+  // send that found the socket unable to send reaches the caller.
   protocol::UdpStatus Tick(uint64_t now_us, bool enabled) {
     gateway_.Tick(now_us, enabled);
     // Only echo probes received on a previous tick: now_us was sampled before
@@ -71,11 +79,11 @@ class Endpoint {
       }
       if (ack.status == ConfigAckStatus::kOk && on_configured_)
         on_configured_(gateway_.config());
-      std::array<uint8_t, 128> bytes{};
-      const auto size = EncodeConfigAck(ack, bytes);
-      Send(protocol::FrameType::kHardwareConfigAck, now_us, bytes.data(), size);
+      QueueAck(ack);
       pending_ack_ = false;
     }
+    // This one, or one whose send failed on an earlier tick.
+    auto ack_status = SendAck(now_us);
     // Only the newest command of the drained batch reaches the gateway: after
     // a stall the socket holds a backlog, and applying each queued command
     // would replay superseded demands back-to-back as CAN bursts.
@@ -117,6 +125,9 @@ class Endpoint {
           if (ok && gateway_.configuring()) {
             pending_ack_ = true;
             pending_config_id_ = assembler_.config_id();
+            // An ACK still unsent answers a superseded push: only this
+            // configure's goes out.
+            ack_size_ = 0;
             continue;
           }
           ConfigAckPayload ack{};
@@ -140,10 +151,8 @@ class Endpoint {
                             "Backend configuration failed");
             }
           }
-          std::array<uint8_t, 128> ack_buf{};
-          const auto ack_size = EncodeConfigAck(ack, ack_buf);
-          Send(protocol::FrameType::kHardwareConfigAck, now_us, ack_buf.data(),
-               ack_size);
+          QueueAck(ack);
+          ack_status = Worse(ack_status, SendAck(now_us));
         } else if (status != ConfigAssembler::Status::kIncomplete) {
           ConfigAckPayload ack{};
           ack.config_id = assembler_.config_id();
@@ -155,10 +164,8 @@ class Endpoint {
             ack.status = ConfigAckStatus::kMalformed;
           }
           std::snprintf(ack.reason, sizeof(ack.reason), "%s", err.c_str());
-          std::array<uint8_t, 128> ack_buf{};
-          const auto ack_size = EncodeConfigAck(ack, ack_buf);
-          Send(protocol::FrameType::kHardwareConfigAck, now_us, ack_buf.data(),
-               ack_size);
+          QueueAck(ack);
+          ack_status = Worse(ack_status, SendAck(now_us));
         }
         continue;
       }
@@ -182,8 +189,9 @@ class Endpoint {
     auto state = gateway_.snapshot();
     state.clock_probe_time_us = clock_probe_time_us;
     const auto size = Encode(state, buffer_);
-    return Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(),
-                size);
+    return Worse(
+        Send(protocol::FrameType::kHardwareState, now_us, buffer_.data(), size),
+        ack_status);
   }
   const PeerContact& peer_contact() const { return contact_; }
   // The RoboRIO ages its observation on its own clock (REQ-RT-25):
@@ -206,6 +214,23 @@ class Endpoint {
     return peer_.SendFrame(type, protocol::kFlagNone, now_us, payload,
                            payload_size);
   }
+  // `first` unless it succeeded, then `second`.
+  static protocol::UdpStatus Worse(protocol::UdpStatus first,
+                                   protocol::UdpStatus second) {
+    return first != protocol::UdpStatus::kOk ? first : second;
+  }
+  // Replaces any ACK not yet sent: the newest answers the bridge's newest
+  // push.
+  void QueueAck(const ConfigAckPayload& ack) {
+    ack_size_ = EncodeConfigAck(ack, ack_bytes_);
+  }
+  protocol::UdpStatus SendAck(uint64_t now_us) {
+    if (ack_size_ == 0) return protocol::UdpStatus::kOk;
+    const auto status = Send(protocol::FrameType::kHardwareConfigAck, now_us,
+                             ack_bytes_.data(), ack_size_);
+    if (status == protocol::UdpStatus::kOk) ack_size_ = 0;
+    return status;
+  }
   // Frames drained per Tick. Receiving only decodes and the gateway applies at
   // most one command per Tick, so a post-stall backlog drains in a few Ticks
   // with one CAN write pass each.
@@ -219,6 +244,10 @@ class Endpoint {
   ConfigAssembler assembler_;
   bool pending_ack_{false};
   uint64_t pending_config_id_{};
+  // The last ACK, encoded, while no send of it has succeeded; 0 bytes when
+  // there is none.
+  std::array<uint8_t, 128> ack_bytes_{};
+  std::size_t ack_size_{0};
   std::function<void(const Config&)> on_configured_;
   std::array<uint8_t, protocol::kMaxPayloadSize> buffer_{};
 };

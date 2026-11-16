@@ -128,14 +128,17 @@ manifest_sync_test(
     manifest = "robot_physics_sim_manifest.bzl",
 )
 
-# studio/tests/browser/robot.toml repeats robot_physics_sim.toml's overrides
-# (config load refuses a nested include) plus its own [studio] table.
+# robot_physics_sim.toml repeats robot_py.toml's overrides plus
+# simulation_only, and studio/tests/browser/robot.toml repeats
+# robot_physics_sim.toml's plus its own [studio] table (config load refuses a
+# nested include).
 py_test(
     name = "physics_sim_copy_test",
     size = "small",
     srcs = ["physics_sim_copy_test.py"],
     data = [
         "robot_physics_sim.toml",
+        "robot_py.toml",
         "//studio:tests/browser/robot.toml",
     ],
     legacy_create_init = False,

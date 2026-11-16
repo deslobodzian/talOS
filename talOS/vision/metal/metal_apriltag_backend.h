@@ -72,9 +72,6 @@ class MetalAprilTagBackend : public talos::vision::ComputeBackend {
 
   MTL::Device* device() const;
   MTL::CommandQueue* queue() const;
-  MTL::Buffer* thresh_buffer() const;
-  MTL::Buffer* min_buffer() const;
-  MTL::Buffer* max_buffer() const;
 
  private:
   struct Impl;
