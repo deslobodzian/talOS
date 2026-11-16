@@ -5,6 +5,16 @@
 # (which disables the robot).
 include = "../../configuration/robot.toml"
 
+# Torque mode on, as docs/BENCH.md "Torque current (hardware only)" has a
+# person set it at the bench: a test config only. The committed bench config
+# keeps it off (node_test.cc's TorqueModeOffAtTheCommittedCap).
+[subsystems.motor]
+max_bench_torque_current_a = 2.0
+
+[subsystems.motor.motors.kraken]
+foc = true
+max_torque_current_a = 5.0
+
 [subsystems.neighbor.motors.wheel]
 type = "TalonFX"
 bus = "rio"

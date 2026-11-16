@@ -18,6 +18,9 @@ cc_library(
         ":messages",
         "//talOS/bridge:messages",
         "//talOS/devices",
+        "//talOS/hardware:config",
+        # MotorConfigOf: the kraken's foc and max_torque_current_a.
+        "//talOS/mechanisms",
         "//talOS/node",
     ],
 )
@@ -80,9 +83,13 @@ py_test(
         "motor.py",
         "testdata/robot.toml",
         ":libbench_motor.so",
+        "//bench/main_processor/configuration:robot.toml",
         "//bench/main_processor/configuration:robot_config",
     ],
-    env = {"TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)"},
+    env = {
+        "TALOS_BENCH_CONFIG": "$(rlocationpath //bench/main_processor/configuration:robot.toml)",
+        "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
+    },
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [
