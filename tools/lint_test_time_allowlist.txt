@@ -46,8 +46,8 @@ talOS/launcher/outputs_held_test.cc clock 4 integration: a gateway in the test p
 talOS/launcher/outputs_held_test.cc sleep 2 integration: paces the in-process gateway's 5 ms tick and the registry poll
 talOS/launcher/supervision_test.cc clock 46 integration: one real spawn or kill per mechanism; deadlines (10-20 s) bound polls of the manifest, registry and pid files, and a measured supervision-pass window
 talOS/launcher/supervision_test.cc sleep 28 integration: paces polls of files the spawned processes write (no notification exists) and stub registry heartbeats every 5 ms for the launcher's real-time stall check
-talOS/node/node_stop_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
-talOS/node/node_stop_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
+talOS/node/node_binary_test.cc clock 4 integration: a 20 s deadline bounds the wait for a spawned node's registry row, and the stop latency shows SIGTERM did not wait out --duration-s
+talOS/node/node_binary_test.cc sleep 1 integration: paces the poll for a spawned node's registry row (no notification exists)
 talOS/simulation/sim_gateway_test.py clock 4 integration: the simulator as a child process; deadlines on its UDP datagrams only bound a hang (TESTING.md §6)
 talOS/vision/pipeline_test.cc clock 2 integration: pipeline worker threads, condition wait with a deadline
 talOS/vision/pipeline_test.cc sleep 1 integration: pipeline worker threads, condition wait with a deadline

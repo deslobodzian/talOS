@@ -138,33 +138,13 @@ talos_cc_node(
     deps = ["//talOS/process"],
 )
 
-# Integration tier (fork/exec, SIGTERM, the live registry): its own target,
-# out of node_test's lane.
+# Integration tier (fork/exec, signals, a node run on the real clock, the live
+# registry): node binaries run as the launcher runs them, out of node_test's
+# component lane.
 cc_test(
-    name = "node_stop_test",
+    name = "node_binary_test",
     size = "small",
-    srcs = ["node_stop_test.cc"],
-    data = [
-        "testdata/robot.toml",
-        ":blocked_node",
-    ],
-    env = {
-        "TALOS_BLOCKED_NODE": "$(rlocationpath :blocked_node)",
-        "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-    },
-    tags = ["integration"],
-    deps = [
-        "//talOS/introspection:registry",
-        "@googletest//:gtest",
-        "@googletest//:gtest_main",
-        "@rules_cc//cc/runfiles",
-    ],
-)
-
-cc_test(
-    name = "node_test",
-    size = "small",
-    srcs = ["node_test.cc"],
+    srcs = ["node_binary_test.cc"],
     data = [
         "testdata/robot.toml",
         ":blocked_node",
@@ -179,12 +159,11 @@ cc_test(
         "TALOS_GRAPH_NODE": "$(rlocationpath :graph_node)",
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
     },
+    tags = ["integration"],
     deps = [
-        ":loop_port",
         ":node",
         ":test_messages",
         ":testing",
-        "//talOS/configuration",
         "//talOS/events",
         "//talOS/events:events_log",
         "//talOS/events:gap_testing",
@@ -192,6 +171,28 @@ cc_test(
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
         "//talOS/introspection:reporter",
+        "//talOS/process",
+        "//talOS/rtms",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
+    name = "node_test",
+    size = "small",
+    srcs = ["node_test.cc"],
+    data = ["testdata/robot.toml"],
+    env = {"TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)"},
+    deps = [
+        ":loop_port",
+        ":node",
+        ":test_messages",
+        ":testing",
+        "//talOS/configuration",
+        "//talOS/events",
+        "//talOS/introspection:describe",
         "//talOS/memory:shared_memory",
         "//talOS/process",
         "//talOS/rtms",
