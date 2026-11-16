@@ -2248,6 +2248,52 @@ TEST(LogCapture, ByteCapStopsCaptureAndLeavesAValidMarkedLog) {
   }
 }
 
+// A gap whose GAP record would cross the cap of a log that cannot rotate
+// ends capture there: no gap is open any more (losing() false: nothing will
+// resume it), capture has stopped, and the gap is still counted, so
+// incomplete() reports the loss its missing GAP record cannot.
+// REQ-RT-11
+TEST(LogCapture, AGapWhoseResumeCrossesTheCapStopsCapture) {
+  for (const bool background : {false, true}) {
+    SCOPED_TRACE(background);
+    const auto path = TempPath(background ? "gap_cap_bg" : "gap_cap_sync");
+    const std::string marker = CappedMarkerPath(path);
+    ::unlink(marker.c_str());
+    constexpr std::size_t kRecord = sizeof(RecordHeader) + 16;
+    // Room for one record and a GAP record's header, not its payload.
+    const std::uint64_t cap = RecordsOffset() + kRecord + sizeof(RecordHeader);
+    {
+      LogWriter writer{path, "gap_cap",
+                       LogWriter::Options{256, 4, background, cap}};
+      writer.start(MakeManifest(), {});
+      Context context{};
+      context.dispatch_index = 1;
+      writer.dispatch(context, MakePayload(16, 1));
+      // Larger than any chunk: dropped, a gap opens.
+      context.dispatch_index = 2;
+      writer.dispatch(context, MakePayload(1024, 2));
+      ASSERT_TRUE(writer.losing());
+      ASSERT_FALSE(writer.capture_stopped());
+      // A new dispatch resumes capture behind a GAP record the cap refuses.
+      context.dispatch_index = 3;
+      writer.dispatch(context, MakePayload(16, 3));
+      EXPECT_FALSE(writer.losing());
+      EXPECT_TRUE(writer.capture_stopped());
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_TRUE(writer.incomplete());
+      EXPECT_FALSE(writer.failed()) << writer.error();
+      writer.flush();
+    }
+    EXPECT_TRUE(std::ifstream{marker}.good());
+    const ReadBack back = ReadAll(path, false);
+    ASSERT_EQ(back.records.size(), 1u);
+    EXPECT_EQ(back.records[0].header.dispatch_index, 1u);
+    EXPECT_EQ(back.gaps, 0u);
+    ::unlink(path.c_str());
+    ::unlink(marker.c_str());
+  }
+}
+
 TEST(LogCapture, BudgetTooSmallForHeaderDoesNotGrowOrStopTheNode) {
   for (const bool background : {false, true}) {
     SCOPED_TRACE(background);
