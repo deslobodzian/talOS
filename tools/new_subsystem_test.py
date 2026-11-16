@@ -241,6 +241,36 @@ class NewSubsystemTest(unittest.TestCase):
             buttons = [button(steps) for steps in (first, second, third)]
             self.assertEqual(len(set(buttons)), 3, buttons)
 
+    # REQ-DEV-01
+    def test_talos_names_its_robots_when_none_is_given(self):
+        # Inside talOS no robot is the default: without --robot (or
+        # --standalone) the scaffold is refused, naming the robot
+        # directories at the workspace root, and nothing is written.
+        with tempfile.TemporaryDirectory() as root:
+            for robot in ("my_robot", "bench"):
+                configuration = os.path.join(root, robot, "main_processor",
+                                             "configuration")
+                os.makedirs(configuration)
+                with open(os.path.join(configuration, "robot.toml"), "w",
+                          encoding="utf-8") as f:
+                    f.write(f'[robot]\nname = "{robot}"\n')
+            os.makedirs(os.path.join(root, "examples", "main_processor"))
+
+            def tree():
+                return sorted(os.path.relpath(os.path.join(d, f), root)
+                              for d, _, files in os.walk(root) for f in files)
+
+            before = tree()
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, BUILD_WORKSPACE_DIRECTORY=root), \
+                    contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(out):
+                status = new_subsystem.main(["wrist", "--lang", "py"])
+            self.assertEqual(status, 1, out.getvalue())
+            self.assertIn("--robot", out.getvalue())
+            self.assertIn("bench, my_robot", out.getvalue())
+            self.assertEqual(tree(), before)
+
     def test_plan_sees_inherited_subsystems_and_can_ids(self):
         # Ids and names reach robot.toml only through an include, a custom
         # path outside subsystems/ and a parent-directory defaults file.
@@ -545,7 +575,6 @@ class NewSubsystemTest(unittest.TestCase):
                             written[path] = f.read()
                     for path, text in written.items():
                         self.assertIsNone(talos_label.search(text), path)
-                        self.assertNotIn("2026-robot", text, path)
                     self.assertIn(
                         'load("@talos//talOS/build:contract.bzl"',
                         written[posixpath.join(package, "BUILD")])
@@ -581,6 +610,12 @@ class NewSubsystemTest(unittest.TestCase):
                             new_subsystem.sync_manifest.generate(root,
                                                                  config))
                         self.assertIn(f'    "//{package}:node",\n', manifest)
+                # The first mechanism gave the repository its simulation
+                # config; the second kept its manifest current.
+                sim = posixpath.join(posixpath.dirname(configs[0]),
+                                     "robot_sim.toml")
+                self.assertEqual(
+                    new_subsystem.sync_manifest.check(root, sim), "", sim)
                 with open(os.path.join(root, "talos", "robot_manifest.bzl"),
                           encoding="utf-8") as f:
                     self.assertEqual(f.read(), "")
@@ -718,16 +753,24 @@ class NewSubsystemTest(unittest.TestCase):
 
     # REQ-DEV-01
     def test_robot_repository_simulation_steps_run_the_simulation_config(self):
-        # The simulation config `Next:` has the student create includes the
-        # robot config by its own name, from its own directory, so it
-        # resolves with the new subsystem in it; and the printed run runs
-        # that config: `bazel run //:sim` only when the root talos_sim names
-        # it, else the launcher on it directly with --sim.
+        # A robot repository has no simulation config until its first
+        # mechanism, whose scaffold writes one (TODO TOOLS-14): it includes
+        # the robot config by its own name, from its own directory, so it
+        # resolves with the new subsystem in it; its manifest is current;
+        # and the config's BUILD gains the manifest_sync_test and
+        # talos_graph_test that make `bazel test //...` check it, with
+        # their loads among the BUILD's own (buildifier's order, one load
+        # per file). The block `Next:` prints is appended to it, and the
+        # printed run runs that config: `bazel run //:sim` only when the
+        # root talos_sim names it, else the launcher on it with --sim.
         files = {
             "MODULE.bazel": 'module(name = "robot")\n',
             "cfg/practice.toml": ROBOT_WITH_ROLLER,
             "cfg/subsystems/roller.toml": ROLLER,
-            "cfg/BUILD": "",
+            "cfg/BUILD": ('load("@talos//talOS/build:contract.bzl", '
+                          '"talos_bundle")\n'
+                          'load(":practice_manifest.bzl", "NODES")\n\n'
+                          'exports_files(["practice.toml"])\n'),
             "roller/BUILD": "",
         }
         for sim in ("//cfg:practice.toml", "//cfg:robot_sim.toml"):
@@ -754,9 +797,27 @@ class NewSubsystemTest(unittest.TestCase):
                          "cfg/practice.toml"])
                 steps = out.getvalue()
                 self.assertEqual(status, 0, steps)
-                block = steps.split("gains zero:\n")[1].split(
-                    "\n  and generate")[0]
-                with open(os.path.join(root, "cfg", "robot_sim.toml"), "w",
+                self.assertEqual(new_subsystem.sync_manifest.check(
+                    root, "cfg/robot_sim.toml"), "", steps)
+                with open(os.path.join(root, "cfg", "BUILD"),
+                          encoding="utf-8") as f:
+                    build = f.read()
+                self.assertEqual(
+                    re.findall(r"^load\((.*)\)$", build, re.M),
+                    ['"@talos//talOS/build:contract.bzl", "talos_bundle", '
+                     '"talos_graph_test"',
+                     '"@talos//tools:sync_manifest.bzl", "manifest_sync_test"',
+                     '":practice_manifest.bzl", "NODES"',
+                     '":robot_sim_manifest.bzl", SIM_CONFIG_FILES = '
+                     '"CONFIG_FILES", SIM_NODES = "NODES"'])
+                for rule, name in (("manifest_sync_test",
+                                    "sim_manifest_sync_test"),
+                                   ("talos_graph_test", "sim_graph_test")):
+                    self.assertRegex(
+                        build, rf'\n{rule}\(\n    name = "{name}",\n'
+                        r'    config = "robot_sim\.toml",\n')
+                block = steps.split("gains zero:\n")[1].split("\n  Then")[0]
+                with open(os.path.join(root, "cfg", "robot_sim.toml"), "a",
                           encoding="utf-8") as f:
                     f.write(textwrap.dedent(block))
                 subsystems, _ = new_subsystem.sync_manifest.effective(

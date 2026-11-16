@@ -1,12 +1,13 @@
 """Scaffolds a talos subsystem: a node package plus its robot wiring.
 
     bazel run //tools:new_subsystem -- <name> --lang cpp|py \\
-        [--type velocity|position|estimator] [--raw] [--robot 2026-robot] \\
-        [--standalone DIR] [--dry-run]
+        [--type velocity|position|estimator] [--raw] \\
+        (--robot DIR | --standalone DIR) [--dry-run]
 
 Writes <robot>/main_processor/<name>/ (messages, node, Sim test, testdata),
-modelled on that robot's shooter (C++) and intake (Python) packages (a
---type position node wraps talos::mechanisms::PositionMechanism, in Python
+<robot> being --robot, a robot directory at the workspace root like bench/
+(without it the tool refuses, naming the robots it found): a velocity node
+driving one motor (a --type position node wraps talos::mechanisms::PositionMechanism, in Python
 talos.mechanisms.PositionMechanism; with --raw it writes the homing and
 limits out in the node's own file instead, on its Motor), or for
 --type estimator a hardware-free node publishing geometry.PoseEstimate from
@@ -449,7 +450,7 @@ class @PASCAL@ {
 
 # --type position --raw: the same mechanism with every homing and limit rule
 # written out in the student's own file, no talOS/mechanisms. The behaviour
-# is docs/FIRST_MECHANISM.md §6's.
+# is talOS/mechanisms/README.md's "Writing the arm yourself".
 CC_POSITION_RAW_HEADER = """\
 #pragma once
 
@@ -472,8 +473,8 @@ namespace @NAME@ {
 // RoboRIO reboot drops that zero, a live goal pushes toward the switch at
 // kHomingVolts instead. A push that runs past its bound, or the switch still
 // reading closed after the first move off it, latches FAILED, neutral, until
-// the Driver Station reports disabled. docs/FIRST_MECHANISM.md §6 in the
-// talos repository explains each rule.
+// the Driver Station reports disabled. "Writing the arm yourself" in the
+// talos repository's mechanisms README explains each rule.
 class @PASCAL@ {
  public:
   using Target = @PASCAL@Target;
@@ -1283,8 +1284,8 @@ the switch has zeroed the motor, and again after a motor reset or a RoboRIO
 reboot drops that zero, a live goal pushes toward the switch at HOMING_VOLTS
 instead. A push that runs past its bound, or the switch still reading closed
 after the first move off it, latches FAILED, neutral, until the Driver
-Station reports disabled. docs/FIRST_MECHANISM.md §6 in the talos repository
-explains each rule.
+Station reports disabled. "Writing the arm yourself" in the talos
+repository's mechanisms README explains each rule.
 """
 
 import math
@@ -3280,6 +3281,15 @@ class Layout(typing.NamedTuple):
         return posixpath.join(self.packages, name)
 
 
+def talos_robots(root):
+    """The robot directories at the root of the talOS workspace `root`: each
+    holds main_processor/configuration/robot.toml (layout_of)."""
+    return sorted(
+        entry for entry in os.listdir(root)
+        if not entry.startswith((".", "bazel-")) and os.path.isfile(
+            os.path.join(root, layout_of(entry).config)))
+
+
 def layout_of(robot):
     """`robot` as a Layout: a Layout as it is, a robot directory of talOS
     (`<robot>/main_processor/{configuration/robot.toml,<name>}`) otherwise."""
@@ -3503,6 +3513,10 @@ def plan(root, robot, name, lang, kind="velocity", raw=False):
         manifest_file = os.path.join(root, sync_manifest.manifest_path(path))
         old = read(manifest_file) if os.path.isfile(manifest_file) else None
         writes.append((manifest_file, old, manifest))
+    # A robot repository has no simulation config until its first
+    # mechanism: give it one, with the tests that check it.
+    if layout.talos and kind != "estimator":
+        writes += robot_sim_files(root, layout, overrides)
     return writes, can_id
 
 
@@ -3794,8 +3808,9 @@ def dependent_sim_run(button):
 
 # The robot's simulation-only configs, in the order next_steps looks for
 # one: `include = "robot.toml"` plus each mechanism's simulation block.
-# new_robot writes robot_sim.toml with its manifest; 2026-robot's is
-# robot_physics_sim.toml.
+# new_robot writes robot_sim.toml with its manifest (in a robot
+# repository the first mechanism's scaffold does: robot_sim_files); bench's
+# is robot_physics_sim.toml.
 SIM_CONFIGS = ("robot_sim.toml", "robot_physics_sim.toml")
 
 SIM_CONFIG_HEADER = """\
@@ -3818,6 +3833,134 @@ def sim_config(root, robot):
         if os.path.isfile(os.path.join(root, configuration, name)):
             return posixpath.join(configuration, name), True
     return posixpath.join(configuration, SIM_CONFIGS[0]), False
+
+
+def sim_config_header(robot, sim_path):
+    """The opening of a new simulation config `sim_path` of `robot` (a robot
+    directory or a Layout): it includes the robot's config. In a robot
+    repository the launcher, not ./sim.sh, runs it."""
+    layout = layout_of(robot)
+    header = fill(SIM_CONFIG_HEADER, CONFIG=sim_path)
+    if layout.talos:
+        header = header.replace(f"./sim.sh --config {sim_path} --sim-gateway",
+                                "the launcher runs it with --sim")
+    # The include is resolved from this file's directory, which is the
+    # config's (sim_config), so it is the config's file name.
+    base = posixpath.basename(layout.config)
+    return header.replace('include = "robot.toml"',
+                          f'include = "{base}"').replace(
+                              "# robot.toml never reads", f"# {base} never reads")
+
+
+SIM_TESTS = """
+# @SIM@, the simulation-only config, includes @CONFIG@ (new_subsystem
+# wrote it, its manifest and these): stale manifest or broken graph fails
+# `bazel test //...`.
+manifest_sync_test(
+    name = "sim_manifest_sync_test",
+    config = "@SIM@",
+    config_files = SIM_CONFIG_FILES,
+    manifest = "@MANIFEST@",
+)
+
+# The graph lint of the simulation config, with its bindings.
+talos_graph_test(
+    name = "sim_graph_test",
+    config = "@SIM@",
+    data = SIM_CONFIG_FILES,
+    nodes = SIM_NODES,
+    # A Python node cannot load the sanitizer runtimes through ctypes.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+)
+"""
+
+LOAD = re.compile(r'^load\(\s*"([^"]+)"([^)]*)\)\n', re.M)
+
+
+def load_order(module):
+    """Buildifier's load order: @external, then //absolute, then :local."""
+    return (0 if module.startswith("@") else
+            1 if module.startswith("//") else 2), module
+
+
+def with_load(build, module, symbols):
+    """`build` loading `symbols` (each `"name"`, or `ALIAS = "name"`) from
+    `module`: added to its load of `module`, sorted, else a new load in
+    buildifier's order among the others. The loads are single statements at
+    the top, as buildifier leaves them."""
+    loads = list(LOAD.finditer(build))
+    for match in loads:
+        if match.group(1) != module:
+            continue
+        have = [item.strip() for item in match.group(2).split(",")
+                if item.strip()]
+        missing = [s for s in symbols if s not in have]
+        if not missing:
+            return build
+        items = sorted(have + missing,
+                       key=lambda item: item.split("=")[0].strip(' "'))
+        statement = f'load("{module}", {", ".join(items)})\n'
+        return build[:match.start()] + statement + build[match.end():]
+    statement = f'load("{module}", {", ".join(symbols)})\n'
+    after = [m for m in loads if load_order(m.group(1)) < load_order(module)]
+    if after:
+        at = after[-1].end()
+    elif loads:
+        at = loads[0].start()
+    else:
+        return statement + "\n" + build
+    return build[:at] + statement + build[at:]
+
+
+def robot_sim_files(root, layout, overrides):
+    """[(path, old, new)] that give the robot repository of `layout` its
+    simulation config: robot_sim.toml (sim_config_header), its manifest from
+    `overrides` (the pending files), and its manifest_sync_test and
+    talos_graph_test in the BUILD of its package, so that a mistake in it
+    fails `bazel test //...`. [] when the scaffold cannot place the tests
+    (no BUILD there, or one that already declares their names); next_steps
+    then says nothing checks it."""
+    sim_path, exists = sim_config(root, layout)
+    if exists:
+        return []
+    try:
+        package = sync_manifest.package_of(root, sim_path)
+    except sync_manifest.ManifestError:
+        return []
+    build_file = next((os.path.join(root, package, name)
+                       for name in ("BUILD.bazel", "BUILD")
+                       if os.path.isfile(os.path.join(root, package, name))))
+    old_build = read(build_file)
+    taken = ("sim_manifest_sync_test", "sim_graph_test", "SIM_CONFIG_FILES",
+             "SIM_NODES")
+    if any(re.search(rf"\b{name}\b", old_build) for name in taken):
+        return []
+    in_package = posixpath.relpath(sim_path, package or ".")
+    manifest = sync_manifest.manifest_path(sim_path)
+    manifest_in_package = posixpath.relpath(manifest, package or ".")
+    text = sim_config_header(layout, sim_path)
+    try:
+        generated = sync_manifest.generate(
+            root, sim_path, overrides={**overrides, sim_path: text})
+    except sync_manifest.ManifestError as err:
+        raise Refused(f"cannot generate the manifest of {sim_path}: {err}")
+    talos = layout.talos
+    build = with_load(old_build, f"{talos}//talOS/build:contract.bzl",
+                      ['"talos_graph_test"'])
+    build = with_load(build, f"{talos}//tools:sync_manifest.bzl",
+                      ['"manifest_sync_test"'])
+    build = with_load(build, f":{manifest_in_package}",
+                      ['SIM_CONFIG_FILES = "CONFIG_FILES"',
+                       'SIM_NODES = "NODES"'])
+    build = build.rstrip("\n") + "\n" + fill(
+        SIM_TESTS, SIM=in_package, CONFIG=posixpath.basename(layout.config),
+        MANIFEST=manifest_in_package)
+    return [(os.path.join(root, sim_path), None, text),
+            (os.path.join(root, manifest), None, generated),
+            (build_file, old_build, build)]
 
 
 def simulation_block(name, kind, button=TELEOP_BUTTONS[0], raw=False):
@@ -3889,7 +4032,7 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
                programs=()):
     """What to do after scaffolding `name` into `robot`. `golden_test`: the
     robot pins its hardware config in configuration/config_golden_test.cc
-    (2026-robot does; a new_robot robot does not). `sim`: sim_config's
+    (bench does; a new_robot robot does not). `sim`: sim_config's
     (path, exists) for the robot; default, a robot_sim.toml that exists.
     `button`: teleop_button's choice for the robot before the scaffold.
     `raw`: a --raw position node, whose constants are in its own file
@@ -3923,7 +4066,10 @@ def next_steps(robot, name, can_id, kind="velocity", lang="cpp",
                    f"  bazel build {' '.join(programs)}\n"
                    f"  {launcher_sim_run(talos, sim_path, button)}")
         sync = f"bazel run {talos}//tools:sync_manifest --"
-        checks = "a talos_sim or graph test of it reads"
+        # The scaffold writes the config and its tests itself
+        # (robot_sim_files) unless it cannot edit the BUILD they go in.
+        checks = ("nothing reads until that BUILD has a manifest_sync_test "
+                  "and talos_graph_test of it")
     else:
         build = (f"  bazel build //talOS/launcher //talOS/bridge:hardware_node "
                  f"//{layout.packages}/...")
@@ -3945,19 +4091,7 @@ Next:
         step, manifest = "append these lines to", ""
     else:
         step = "create"
-        header = fill(SIM_CONFIG_HEADER, CONFIG=sim_path)
-        if talos:
-            header = header.replace(
-                f"./sim.sh --config {sim_path} --sim-gateway",
-                "the launcher runs it with --sim")
-        # The include is resolved from this file's directory, which is the
-        # config's (sim_config), so it is the config's file name.
-        base = posixpath.basename(layout.config)
-        header = header.replace('include = "robot.toml"',
-                                f'include = "{base}"').replace(
-                                    "# robot.toml never reads",
-                                    f"# {base} never reads")
-        lines = header + lines
+        lines = sim_config_header(layout, sim_path) + lines
         manifest = (
             f"\n  and generate its manifest, which {checks}:\n"
             f"  {sync} {sim_path}")
@@ -4095,9 +4229,9 @@ def main(argv):
                         "homing and limits in the node's own file, with its "
                         "tests, instead of using talOS/mechanisms' "
                         "PositionMechanism (less code, shared behaviour)")
-    parser.add_argument("--robot",
-                        help="in talOS: robot directory (default: "
-                        "2026-robot)")
+    parser.add_argument("--robot", metavar="DIR",
+                        help="in talOS, required unless --standalone: the "
+                        "robot directory at the workspace root, e.g. bench")
     parser.add_argument("--config", metavar="PATH",
                         help="in a robot repository: the robot config that "
                         "gets the [[subsystems]] entry (default: "
@@ -4138,8 +4272,14 @@ def main(argv):
               f"`bazel run {talos}//tools:new_subsystem -- ...`",
               file=sys.stderr)
         return 2
-    robot = args.robot or "2026-robot"
+    robot = args.robot
     try:
+        if not talos and not args.standalone and not robot:
+            robots = talos_robots(root)
+            raise Refused(
+                "name the robot with --robot DIR: "
+                + (f"the robots here are {', '.join(robots)}" if robots else
+                   "there is none here (//tools:new_robot makes one)"))
         if talos and not args.standalone:
             robot = dependent_layout(root, args.config, args.package_dir,
                                      talos)
@@ -4168,6 +4308,11 @@ def main(argv):
             # Plan's choice, from the robot as it stands before the writes.
             button = (teleop_button(root, robot)
                       if can_id is not None else None)
+            # The simulation config as the writes leave it (robot_sim_files
+            # may create it), whether or not they are made (--dry-run).
+            sim_path, sim_exists = sim_config(root, robot)
+            sim = (sim_path, sim_exists or any(
+                path == os.path.join(root, sim_path) for path, _, _ in writes))
     except Refused as refused:
         print(f"new_subsystem: refused: {refused}", file=sys.stderr)
         return 1
@@ -4196,7 +4341,7 @@ def main(argv):
             sim_target = sim_target_config(root)
             programs = sim_programs(root, layout.config, layout.talos)
         print(next_steps(robot, args.name, can_id, args.kind, args.lang,
-                         golden_test, sim_config(root, robot), button,
+                         golden_test, sim, button,
                          args.raw, coverage, sim_target, programs or ()))
     return 0
 

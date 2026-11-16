@@ -52,8 +52,13 @@ regenerates `robot_manifest.bzl` and the manifest of every other config that
 includes `robot.toml`. Its labels name talOS by `@talos//`. `--config PATH`
 names another robot config (default `robot.toml`, else
 `main_processor/configuration/robot.toml`); `--package-dir DIR` puts the
-package elsewhere. Its `Next:` lists the placeholders to replace (the CAN
-id) and simulation-only lines for a `robot_sim.toml`, then the command that
+package elsewhere. A repository without a simulation config gets one with
+its first mechanism: `robot_sim.toml` beside the config (it includes the
+config, which never reads it), `robot_sim_manifest.bzl`, and its
+`sim_manifest_sync_test` and `sim_graph_test` in the config's `BUILD`, so
+`bazel test //...` checks it. Its `Next:` lists the placeholders to replace
+(the CAN id) and simulation-only lines to append to `robot_sim.toml`, then
+the command that
 runs it: `bazel run //:sim` when the root `talos_sim` names that file, else
 (as here, where `//:sim` runs `robot.toml`) `@talos//talOS/launcher` on it
 with `--sim --start-sim-gateway`.
