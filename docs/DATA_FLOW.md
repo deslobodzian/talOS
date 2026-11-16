@@ -452,7 +452,7 @@ construction (`MeasurePages` in `talOS/telemetry/frames.h`):
 | Graph | Channels | Value pages per tick (worst case) | Dictionary |
 |---|---:|---:|---:|
 | Bench `robot.toml`, `robot_bench.toml`, `robot_py.toml` | 129 | 2, 1864 B (largest 1168 / 1200 B) | 1 page, 8400 B |
-| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1944 B (largest 1168 / 1200 B) | 1 page, 8784 B |
+| Bench `robot_physics_sim.toml` with its physics `sim_gateway` (`./sim.sh --sim-gateway`, the soak's and Studio browser test's graph), whose `/sim/state` telemetry reads | 136 | 2, 1952 B (largest 1168 / 1200 B) | 1 page, 8784 B |
 
 Studio's bridge sends each client its own updates
 (`ClientFeed` in [`studio/bridge/telemetry.h`](../studio/bridge/telemetry.h)):
@@ -533,8 +533,8 @@ bandwidth limit that WPILib's networking documentation and the FMS whitepaper
 state, citing 2026 manual rule R704. Both the figure and the rule number are
 unverified against the 2026 manual text itself; the event's current
 allocation is authoritative. A full keyframe every tick of the bench's
-physics-simulation graph would be its 1944 B worst case (the telemetry
-table above), 194,400 B/s at 100 Hz, more than the whole budget; the
+physics-simulation graph would be its 1952 B worst case (the telemetry
+table above), 195,200 B/s at 100 Hz, more than the whole budget; the
 change-only updates carry only what changed. The system graph goes to a
 client whole only on connect and when its structure changes; otherwise its
 fast values go at most every 500 ms when they changed
