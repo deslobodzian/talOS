@@ -390,10 +390,28 @@ log, or larger than the scan accepts), or a record boundary of another file
 with the same layout. So an offset is only meaningful for the file it came
 from, and only one a reader returned.
 
-Format details live in `log/format.h`. The version field is checked on read;
-readers reject a version they do not know rather than guessing.
-Readers reject unsupported versions with both recorded and supported versions
-in the error.
+Format details live in `log/format.h`. The version field is checked on read:
+this build writes version 8 (`FORMAT_VERSION`) and reads versions 7 and 8
+(from `OLDEST_READABLE_VERSION`; a version-7 log is a version-8 log without
+a GAP record), and refuses any other before reading a record, naming the
+version read and those supported. A build from before version 8 therefore
+refuses a version-8 log ([which logs a build can
+read](../launcher/README.md#which-logs-a-build-can-read)).
+
+Version 8 adds the GAP record (`EventKind::GAP`), which stands where a
+writer dropped records it could not take: a record header whose `source_id`
+is `GAP_SOURCE_ID` (no source), whose `dispatch_index` is the first dropped
+record's, `event_time_ns` the earliest time a dropped record names and
+`now_ns` when capture resumed, then a 64 B `GapRecord` (cause, flags, the
+first and last dropped `now_ns`, the last dropped dispatch index, and the
+records, bytes, dispatches and sends dropped): 128 B in all
+(`GAP_RECORD_BYTES`). Both readers return it like any record and count it
+(`gaps()`, `LogSummary::gaps`); `GapOf` decodes it and `DescribeGap` states
+it in one line. A damaged GAP record is skipped as damage like any other.
+This build's writer writes none: an exhausted pool stops capture (below).
+Tests make one with `CopyWithGap` (`log/gap_testing.h`, testonly
+`//talOS/events:gap_testing`).
+
 Records are copied into preallocated chunks and handed to a background thread
 through an atomic ring. Dispatch does not lock, wait for disk, or resize buffers.
 The writer writes a record to the file within `write_interval` (10 ms) of

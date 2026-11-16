@@ -1388,13 +1388,18 @@ begin a complete UTF-8 character is written as `\u00XX`.
 
 ### Which logs a build can read
 
-A build reads every topic with a schema in any log of its log format
-version ([events](../events/README.md#log-format)), whatever build recorded
-it: the schema travels in the log. The hardware packets do not carry one,
-and a build decodes them with its own wire codecs, so it decodes only the
-hardware packets of a session recorded under its own hardware protocol
-(`protocol::kProtocolVersion`;
-[DATA_FLOW.md](../../docs/DATA_FLOW.md)).
+A build reads every topic with a schema in any log of a log format version
+it reads ([events](../events/README.md#log-format)), versions 7 and 8,
+whatever build recorded it: the schema travels in the log. A build from
+before version 8 refuses a version-8 log, naming both versions, so a
+rolled-back bundle (`tools/deploy.sh rollback`) cannot dump or replay the
+sessions a newer build recorded, and its retention classifies them
+`unknown` ([session segments and logs](#session-segments-and-logs)). The
+hardware packets carry no schema, and a build decodes them with its own
+wire codecs, so it decodes only the hardware packets of a session recorded
+under its own hardware protocol (`protocol::kProtocolVersion`;
+[DATA_FLOW.md](../../docs/DATA_FLOW.md)), a version of its own: a log format
+change leaves it as it is.
 
 <a id="replay-after-a-schema-change"></a>Reading is not replaying:
 `--replay-inputs` feeds a node a topic only when the node reads it as the

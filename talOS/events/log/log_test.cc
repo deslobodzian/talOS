@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 
@@ -296,7 +297,7 @@ TEST(LogRoundTrip, AllFieldsAndManifestMatch) {
   EXPECT_EQ(index, expected.size());
   EXPECT_EQ(reader.record_count(), expected.size());
   EXPECT_FALSE(reader.truncated());
-  EXPECT_EQ(reader.format_version(), 7u);
+  EXPECT_EQ(reader.format_version(), 8u);
   EXPECT_EQ(reader.session_id(), kFixtureSession);
 
   ::unlink(path.c_str());
@@ -622,25 +623,291 @@ TEST(LogCorruption, DamagedHeaderOrManifestThrowsOnOpen) {
   ::unlink(path.c_str());
 }
 
-// Legacy and future log versions must be rejected before reading records.
-TEST(LogFormatErrors, RejectsUnsupportedVersions) {
-  const std::string path = TempPath("unsupported_version");
-  for (const std::uint32_t version : {4u, 6u, 8u}) {
+// Overwrites the log's format version (the header checksum covers only the
+// manifest and schema blocks).
+void SetVersion(const std::string& path, std::uint32_t version) {
+  std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
+  ASSERT_TRUE(file.is_open());
+  file.seekp(static_cast<std::streamoff>(offsetof(FileHeader, version)));
+  file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+}
+
+// Version 7 (no GAP records) reads exactly as version 8 does, through both
+// readers; legacy and future versions are refused before any record, naming
+// the version read and those supported.
+// REQ-CONTRACT-20
+TEST(LogFormatErrors, ReadsVersionsSevenAndEightAndRejectsOthers) {
+  const std::string path = TempPath("versions");
+  for (const std::uint32_t version : {7u, 8u}) {
+    SCOPED_TRACE(version);
+    const std::vector<ExpectedRecord> expected =
+        WriteFixture(path, LogWriter::kDefaultBufferBytes);
+    SetVersion(path, version);
+    LogReader reader{path};
+    EXPECT_EQ(reader.format_version(), version);
+    LogReader::Record record;
+    for (const ExpectedRecord& want : expected) {
+      ASSERT_TRUE(reader.next(record));
+      ExpectRecordEquals(want, record);
+    }
+    EXPECT_FALSE(reader.next(record));
+    EXPECT_TRUE(reader.damage().clean());
+    WindowedLogReader windowed{path};
+    std::size_t count = 0;
+    while (windowed.next(record)) ++count;
+    EXPECT_EQ(count, expected.size());
+  }
+  for (const std::uint32_t version : {4u, 6u, 9u}) {
     SCOPED_TRACE(version);
     WriteFixture(path, LogWriter::kDefaultBufferBytes);
-    {
-      std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
-      ASSERT_TRUE(file.is_open());
-      file.seekp(static_cast<std::streamoff>(offsetof(FileHeader, version)));
-      file.write(reinterpret_cast<const char*>(&version), sizeof(version));
-    }
+    SetVersion(path, version);
     if (version == 4) {
       // An empty v4 file is shorter than the current FileHeader.
       ASSERT_EQ(0, ::truncate(path.c_str(), 112));
     }
-    EXPECT_THROW((LogReader{path}), std::runtime_error);
+    for (const bool windowed : {false, true}) {
+      SCOPED_TRACE(windowed);
+      try {
+        if (windowed) {
+          WindowedLogReader reader{path};
+        } else {
+          LogReader reader{path};
+        }
+        ADD_FAILURE() << "version " << version << " was read";
+      } catch (const std::runtime_error& error) {
+        const std::string what = error.what();
+        EXPECT_NE(what.find("version " + std::to_string(version)),
+                  std::string::npos)
+            << what;
+        EXPECT_NE(what.find("7 to 8"), std::string::npos) << what;
+      }
+    }
   }
   ::unlink(path.c_str());
+}
+
+// Everything one reader returns from a log, and what it counted.
+struct ReadBack {
+  struct Read {
+    RecordHeader header{};
+    std::vector<std::byte> payload;
+    LogReader::Record view() const { return {header, payload, 0}; }
+  };
+  std::vector<Read> records;
+  std::size_t gaps{0};
+  LogDamage damage;
+};
+
+ReadBack ReadAll(const std::string& path, bool windowed) {
+  ReadBack back;
+  const auto take = [&](auto& reader) {
+    LogReader::Record record;
+    while (reader.next(record)) {
+      back.records.push_back(
+          {record.header, {record.payload.begin(), record.payload.end()}});
+    }
+    back.gaps = reader.gaps();
+    back.damage = reader.damage();
+  };
+  if (windowed) {
+    WindowedLogReader reader{path};
+    take(reader);
+  } else {
+    LogReader reader{path};
+    take(reader);
+  }
+  return back;
+}
+
+// Where the fixture's record of `kind` in dispatch `dispatch` is.
+std::size_t FixtureIndex(const std::vector<ExpectedRecord>& expected,
+                         std::uint64_t dispatch, EventKind kind) {
+  for (std::size_t i = 0; i < expected.size(); ++i) {
+    if (expected[i].dispatch_index == dispatch &&
+        expected[i].kind == static_cast<std::uint16_t>(kind)) {
+      return i;
+    }
+  }
+  ADD_FAILURE() << "no " << to_string(kind) << " in dispatch " << dispatch;
+  return 0;
+}
+
+// The header and payload size of each of records [first, end).
+std::uint64_t FixtureBytes(const std::vector<ExpectedRecord>& expected,
+                           std::size_t first, std::size_t end) {
+  std::uint64_t bytes = 0;
+  for (std::size_t i = first; i < end; ++i) {
+    bytes += sizeof(RecordHeader) + expected[i].payload.size();
+  }
+  return bytes;
+}
+
+// A GAP record reads back through both readers as a record of kind GAP, in
+// place of the records it stands for, counted in gaps() and the summary, its
+// payload decoding to the stretch dropped; damage to it, or next to it, and a
+// cut through or after it, are handled as for any record.
+// REQ-CONTRACT-20
+TEST(LogGap, ReadersReturnAGapAndCountIt) {
+  const std::string path = TempPath("gap_source");
+  const std::string gapped = TempPath("gapped");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  // Dropped: dispatch 12's SEND (its TIMER was recorded) to dispatch 19.
+  const std::size_t first = FixtureIndex(expected, 12, EventKind::SEND);
+  const std::size_t end = FixtureIndex(expected, 20, EventKind::TIMER);
+  ASSERT_EQ(end - first, 9u);
+  const LogGap made = CopyWithGap(path, gapped, first, end);
+  const std::size_t gap_offset = FixtureRecordOffset(expected, first);
+
+  for (const bool windowed : {false, true}) {
+    SCOPED_TRACE(windowed);
+    const ReadBack back = ReadAll(gapped, windowed);
+    ASSERT_EQ(back.records.size(), expected.size() - (end - first) + 1);
+    for (std::size_t i = 0; i < first; ++i) {
+      ExpectRecordEquals(expected[i], back.records[i].view());
+    }
+    const ReadBack::Read& gap = back.records[first];
+    EXPECT_EQ(gap.header.kind, static_cast<std::uint16_t>(EventKind::GAP));
+    EXPECT_EQ(gap.header.source_id, GAP_SOURCE_ID);
+    EXPECT_EQ(gap.header.dispatch_index, 12u);
+    // Dispatch 12's SEND is the earliest: dispatched at 12 us, sent at
+    // 12.02 us. Capture resumed with dispatch 20, at 20 us.
+    EXPECT_EQ(gap.header.event_time_ns, 12'000);
+    EXPECT_EQ(gap.header.now_ns, 20'000);
+    EXPECT_EQ(gap.header.publish_time_ns, 0);
+    EXPECT_EQ(gap.header.sequence, 0u);
+    EXPECT_EQ(gap.header.aux, 0u);
+    ASSERT_EQ(gap.payload.size(), sizeof(GapRecord));
+    const std::optional<LogGap> decoded = GapOf(gap.header, gap.payload);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_TRUE(decoded->detailed);
+    EXPECT_EQ(decoded->first_dispatch_index, 12u);
+    EXPECT_EQ(decoded->start_ns, 12'000);
+    EXPECT_EQ(decoded->resumed_ns, 20'000);
+    const GapRecord& detail = decoded->detail;
+    EXPECT_EQ(detail.cause, static_cast<std::uint16_t>(GapCause::POOL_FULL));
+    EXPECT_EQ(detail.flags, GAP_SPLITS_DISPATCH);
+    EXPECT_EQ(detail.reserved, 0u);
+    EXPECT_EQ(detail.first_lost_ns, 12'020);  // the SEND's now
+    EXPECT_EQ(detail.last_lost_ns, 19'040);
+    EXPECT_EQ(detail.last_dispatch_index, 19u);
+    EXPECT_EQ(detail.records, 9u);
+    EXPECT_EQ(detail.bytes, FixtureBytes(expected, first, end));
+    EXPECT_EQ(detail.dispatches, 7u);  // 13 to 19
+    EXPECT_EQ(detail.sends, 2u);       // dispatches 12 and 17
+    EXPECT_EQ(0, std::memcmp(&detail, &made.detail, sizeof(GapRecord)));
+    // Decoded from the stored bytes alone (trailing zeros trimmed) too.
+    const std::optional<LogGap> from_stored = GapOf(
+        gap.header,
+        std::span<const std::byte>{gap.payload}.first(gap.header.stored_bytes));
+    ASSERT_TRUE(from_stored.has_value());
+    EXPECT_EQ(0, std::memcmp(&from_stored->detail, &detail, sizeof(detail)));
+    for (std::size_t i = end; i < expected.size(); ++i) {
+      ExpectRecordEquals(expected[i], back.records[i - end + first + 1].view());
+    }
+    EXPECT_EQ(back.gaps, 1u);
+    EXPECT_TRUE(back.damage.clean());
+    EXPECT_FALSE(
+        GapOf(back.records[0].header, back.records[0].payload).has_value());
+  }
+  const std::string sentence = DescribeGap(made);
+  EXPECT_NE(sentence.find("9 records"), std::string::npos) << sentence;
+  EXPECT_NE(sentence.find("12 to 19"), std::string::npos) << sentence;
+
+  const LogSummary summary = SummarizeLog(gapped);
+  EXPECT_EQ(summary.gaps, 1u);
+  EXPECT_EQ(summary.record_count, expected.size() - (end - first) + 1);
+  {
+    LogReader reader{gapped};
+    LogReader::Record record;
+    while (reader.next(record)) {
+    }
+    reader.rewind();
+    EXPECT_EQ(reader.gaps(), 0u);
+  }
+
+  // A damaged GAP is skipped and counted as damage; the record after it
+  // still reads.
+  const std::size_t gap_bytes =
+      sizeof(RecordHeader) +
+      ReadAll(gapped, false).records[first].header.stored_bytes;
+  FlipByte(gapped, gap_offset + sizeof(RecordHeader));  // its cause
+  for (const bool windowed : {false, true}) {
+    SCOPED_TRACE(windowed);
+    const ReadBack back = ReadAll(gapped, windowed);
+    EXPECT_EQ(back.gaps, 0u);
+    EXPECT_EQ(back.records.size(), expected.size() - (end - first));
+    EXPECT_EQ(back.damage.spans, 1u);
+    EXPECT_EQ(back.damage.first_offset, gap_offset);
+    EXPECT_EQ(back.damage.skipped_bytes, gap_bytes);
+    ASSERT_GT(back.records.size(), first);
+    ExpectRecordEquals(expected[end], back.records[first].view());
+  }
+
+  // Damage to the record before it: the scan resumes at the GAP.
+  CopyWithGap(path, gapped, first, end);
+  ASSERT_NE(StoredSize(expected[first - 1].payload), 0u);
+  FlipByte(gapped,
+           FixtureRecordOffset(expected, first - 1) + sizeof(RecordHeader));
+  for (const bool windowed : {false, true}) {
+    SCOPED_TRACE(windowed);
+    const ReadBack back = ReadAll(gapped, windowed);
+    EXPECT_EQ(back.gaps, 1u);
+    EXPECT_EQ(back.damage.spans, 1u);
+    ASSERT_GT(back.records.size(), first - 1);
+    EXPECT_EQ(back.records[first - 1].header.kind,
+              static_cast<std::uint16_t>(EventKind::GAP));
+  }
+
+  // A cut through the GAP leaves the records before it; a cut after it
+  // keeps it.
+  for (const std::size_t cut : {gap_offset + 20, gap_offset + gap_bytes + 20}) {
+    SCOPED_TRACE(cut);
+    CopyWithGap(path, gapped, first, end);
+    ASSERT_EQ(0, ::truncate(gapped.c_str(), static_cast<off_t>(cut)));
+    const bool kept = cut > gap_offset + gap_bytes;
+    for (const bool windowed : {false, true}) {
+      SCOPED_TRACE(windowed);
+      const ReadBack back = ReadAll(gapped, windowed);
+      EXPECT_EQ(back.records.size(), first + (kept ? 1 : 0));
+      EXPECT_EQ(back.gaps, kept ? 1u : 0u);
+      EXPECT_EQ(back.damage.tail_bytes, 20u);
+    }
+  }
+  ::unlink(path.c_str());
+  ::unlink(gapped.c_str());
+}
+
+// CopyWithGap marks what the writer would: a gap reaching the end of the log
+// is closed at the stop, the EXIT the writer holds follows it and gives it
+// its time, and a range whose next record continues a dropped dispatch is
+// refused, since capture never resumes there.
+TEST(LogGap, CopyWithGapClosesAtTheStopAndKeepsTheExit) {
+  const std::string path = TempPath("gap_end_source");
+  const std::string gapped = TempPath("gap_end");
+  const std::vector<ExpectedRecord> expected =
+      WriteFixture(path, LogWriter::kDefaultBufferBytes);
+  const std::size_t first = FixtureIndex(expected, 40, EventKind::TIMER);
+  CopyWithGap(path, gapped, first, expected.size());
+
+  const ReadBack back = ReadAll(gapped, false);
+  ASSERT_EQ(back.records.size(), first + 2);
+  const ReadBack::Read& gap = back.records[first];
+  ASSERT_EQ(gap.header.kind, static_cast<std::uint16_t>(EventKind::GAP));
+  EXPECT_EQ(gap.header.now_ns, expected.back().now_ns);  // the held EXIT's
+  const std::optional<LogGap> decoded = GapOf(gap.header, gap.payload);
+  ASSERT_TRUE(decoded.has_value());
+  EXPECT_EQ(decoded->detail.flags, GAP_CLOSED_AT_FLUSH);
+  EXPECT_EQ(decoded->detail.records, expected.size() - 1 - first);
+  EXPECT_EQ(decoded->detail.last_dispatch_index, 49u);
+  ExpectRecordEquals(expected.back(), back.records.back().view());
+
+  const std::size_t send = FixtureIndex(expected, 12, EventKind::SEND);
+  EXPECT_THROW(CopyWithGap(path, gapped, send - 1, send),
+               std::invalid_argument);
+  EXPECT_THROW(CopyWithGap(path, gapped, first, first), std::invalid_argument);
+  ::unlink(path.c_str());
+  ::unlink(gapped.c_str());
 }
 
 // Writes must be identical whether they went to disk on the loop thread or

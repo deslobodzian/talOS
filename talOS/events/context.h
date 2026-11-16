@@ -19,6 +19,9 @@ enum class EventKind : std::uint16_t {
   // A handler used the current value of watcher `source_id` (published at
   // `publish_time`, RTMS `sequence`). A measurement, not an input or output.
   READ = 9,
+  // Records the writer dropped before capture resumed (log/format.h
+  // GapRecord): payload GapRecord, source_id log::GAP_SOURCE_ID.
+  GAP = 10,
 };
 
 constexpr const char* to_string(EventKind kind) {
@@ -39,6 +42,8 @@ constexpr const char* to_string(EventKind kind) {
       return "HANDLER_EXIT";
     case EventKind::READ:
       return "READ";
+    case EventKind::GAP:
+      return "GAP";
   }
   return "UNKNOWN";
 }

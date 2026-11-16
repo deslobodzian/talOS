@@ -390,13 +390,21 @@ feedback—is fresh and finite; invalid feedback neutralizes the follower.
 
 ## Dispatch logs
 
-`.tlog` version **7** carries a publication timestamp on each message dispatch
+`.tlog` version **8** carries a publication timestamp on each message dispatch
 and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects with the recorded publication time, at that time,
 or, for a node the session ran, at the drain that received it.
-Older formats are rejected with the recorded and supported versions. The packed
-file header is **120 B**, manifest entry **112 B**, and record header **64 B**,
-followed by stored payload bytes (`talOS/events/log/format.h`).
+Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
+GAP record) and reject any other with the recorded and supported versions; the
+log format version is not the hardware protocol version
+([`kProtocolVersion`](#protocol-version)), which a log format change leaves
+unchanged. The packed file header is **120 B**, manifest entry **112 B**, and
+record header **64 B**, followed by stored payload bytes
+(`talOS/events/log/format.h`). A GAP record (version 8), which stands where a
+writer dropped records, is a record header and a **64 B** `GapRecord`
+(`static_assert(sizeof(GapRecord) == 64)`): **128 B**, `GAP_RECORD_BYTES`,
+less the `GapRecord`'s trailing zero bytes as stored
+([events](../talOS/events/README.md#log-format)).
 `Target::get` adds one payload-free READ record (a 64 B header) per `Target`
 per `update()` that selects a lane, however often it calls `get()` or
 `source()`: 6.4 KB/s for a 100 Hz consumer of one target.
@@ -404,7 +412,7 @@ per `update()` that selects a lane, however often it calls `get()` or
 A byte-capped log (`LogWriterOptions::max_bytes`, the launcher's per-member
 share of `[robot] log_max_bytes`, in proportion to the bytes the member's log
 is expected to store per second: [log budget](../talOS/launcher/README.md#session-segments-and-logs)) is split into n = min(8, cap / (prefix +
-largest record)) segments of cap / n bytes, each a complete version-7 log
+largest record)) segments of cap / n bytes, each a complete version-8 log
 (its own header, manifest and schema block, then whole records). A segment
 ends when the next record would cross cap / n, or, with a window
 (`LogWriterOptions::window`, the launcher's `--log-window-us`), at the first

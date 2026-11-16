@@ -87,6 +87,26 @@ inline bool IsAcceptedSend(const RecordHeader& header) noexcept {
 // One line naming what `damage` skipped, offsets included; empty if clean.
 std::string DescribeDamage(const LogDamage& damage);
 
+// What a GAP record (format.h) says its writer dropped: the records lie in
+// [start_ns, resumed_ns] and from dispatch first_dispatch_index on.
+struct LogGap {
+  std::uint64_t first_dispatch_index{0};  // header.dispatch_index
+  std::int64_t start_ns{0};               // header.event_time_ns
+  std::int64_t resumed_ns{0};             // header.now_ns
+  GapRecord detail{};                     // zero unless detailed
+  bool detailed{false};                   // payload_bytes == sizeof(GapRecord)
+};
+// The gap a record marks; nullopt for any other kind. `payload` is the
+// record's payload, whole or as stored (its trailing zeros restored here).
+std::optional<LogGap> GapOf(const RecordHeader& header,
+                            std::span<const std::byte> payload) noexcept;
+// "capture lost <records> records (<dispatches> dispatches, <sends> sends,
+// <bytes> bytes) over <s> s, dispatches <a> to <b>: <cause>[; dispatch <a>
+// was partly recorded][; closed by the stop]", <s> being resumed_ns less
+// start_ns. A gap without detail: "capture lost records over <s> s from
+// dispatch <a>".
+std::string DescribeGap(const LogGap& gap);
+
 // Reads a dispatch log written by LogWriter.
 //
 // The whole file is read into memory up front: these logs are meant to be
@@ -106,6 +126,9 @@ std::string DescribeDamage(const LogDamage& damage);
 // so one false magic costs at most that much checksumming and one crafted
 // header at most that much memory. A caller that must not see a gap (exact
 // replay) refuses a log whose damage().spans is nonzero.
+//
+// A GAP record (format.h, version 8) is returned like any other record and
+// counted in gaps(); GapOf decodes it. Damage to it is damage like any.
 class LogReader {
  public:
   struct Record {
@@ -119,8 +142,9 @@ class LogReader {
   };
 
   // Reads and validates the header and manifest block. Throws
-  // std::runtime_error on a bad magic, an unsupported format version (naming
-  // actual and supported versions), a checksum mismatch, or a short file.
+  // std::runtime_error on a bad magic, a format version outside
+  // OLDEST_READABLE_VERSION to FORMAT_VERSION (naming the version read and
+  // those supported), a checksum mismatch, or a short file.
   explicit LogReader(std::string_view path);
 
   const Manifest& manifest() const noexcept { return manifest_; }
@@ -148,6 +172,9 @@ class LogReader {
   // rewind(); call after iterating to completion for the file's total.
   std::size_t record_count() const noexcept { return record_count_; }
 
+  // GAP records next() returned since construction or rewind().
+  std::size_t gaps() const noexcept { return gaps_; }
+
  private:
   std::vector<std::byte> data_;
   std::vector<std::byte> payload_;  // zero-filled copy of the last payload
@@ -163,6 +190,7 @@ class LogReader {
   LogDamage damage_;
   std::optional<RecordHeader> last_;  // the last record next() returned
   std::size_t record_count_{0};
+  std::size_t gaps_{0};
 };
 
 // Reads a log as LogReader does, but through a fixed window instead of the
@@ -209,6 +237,8 @@ class WindowedLogReader {
   const LogDamage& damage() const noexcept;
   bool truncated() const noexcept { return damage().tail_bytes != 0; }
   std::size_t record_count() const noexcept;
+  // GAP records next() returned since construction or seek().
+  std::size_t gaps() const noexcept;
 
  private:
   struct State;
@@ -216,11 +246,12 @@ class WindowedLogReader {
 };
 
 // What LogReader would report after reading a log to its end -- record
-// count, truncation and damage -- without holding the file: it reads through
-// a fixed buffer, so memory does not grow with the log. It validates exactly
-// what LogReader does and throws the same errors.
+// count, GAP records, truncation and damage -- without holding the file: it
+// reads through a fixed buffer, so memory does not grow with the log. It
+// validates exactly what LogReader does and throws the same errors.
 struct LogSummary {
   std::size_t record_count{0};
+  std::size_t gaps{0};
   bool truncated{false};
   LogDamage damage;
 };

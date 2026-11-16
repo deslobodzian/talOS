@@ -300,7 +300,8 @@ handlers.
   an existing `/~` name is idempotent. Production runs with neither variable
   retain their ordinary names; publishers, subscribers, launcher session
   cleanup, the registry and Studio all use the same mapping.
-- Dispatch logs (`.tlog` format version 7) carry each logged topic's schema
+- Dispatch logs (`.tlog` format version 8; a build also reads version 7)
+  carry each logged topic's schema
   descriptor, allowing `log_dump` to decode payloads to named fields without
   the recording build, and `tlog_to_wpilog` to convert a session to a WPILib
   `.wpilog` that AdvantageScope opens (one entry per message field;

@@ -2477,7 +2477,7 @@ void WriteOldFormatSession(const std::string& dir, uint64_t id,
   WriteDriverStationLog(dir, "late", id, {true});
   std::fstream log{dir + "/late.tlog",
                    std::ios::binary | std::ios::in | std::ios::out};
-  const uint32_t old_version = event::log::FORMAT_VERSION - 1;
+  const uint32_t old_version = event::log::OLDEST_READABLE_VERSION - 1;
   log.seekp(offsetof(event::log::FileHeader, version));
   log.write(reinterpret_cast<const char*>(&old_version), sizeof old_version);
 }
