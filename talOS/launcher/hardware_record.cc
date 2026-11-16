@@ -508,6 +508,8 @@ std::optional<std::uint16_t> FirstBridgeStatusVersion(
       return status.protocol_version_id();
     }
   } catch (const std::exception&) {
+    // An unreadable bridge log records no version: the manifest's is used.
+    return std::nullopt;
   }
   return std::nullopt;
 }
@@ -719,8 +721,10 @@ std::string RecordedProtocol::Refusal() const {
            "protocol_version_id); this build's is " +
            build;
   }
-  return "recorded under hardware protocol " + std::to_string(*version()) +
-         "; this build's is " + build +
+  // refused() with at most one bridge version: version() holds the one that
+  // differs from this build's.
+  return "recorded under hardware protocol " +
+         std::to_string(version().value_or(0)) + "; this build's is " + build +
          (bridge.empty() ? " (manifest.json hardware_protocol_version)"
                          : " (/hw/status protocol_version_id, the bridge's)");
 }

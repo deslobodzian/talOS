@@ -1171,6 +1171,8 @@ int Convert(const Options& options) {
                       ? "a packet's config_id is not that of " + config_path
                       : "config " + config_path + ": " + config_error;
   }
+  const talos::launcher::DeviceNames* names = nullptr;
+  if (device_names.has_value()) names = &device_names.value();
 
   Totals totals;
   // Written once, or, when a packet of another protocol turns up part way,
@@ -1182,8 +1184,7 @@ int Convert(const Options& options) {
     try {
       talos::wpilog::Writer writer{
           out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
-      totals = WriteItems(items, start_ns, protocol,
-                          device_names ? &*device_names : nullptr, writer);
+      totals = WriteItems(items, start_ns, protocol, names, writer);
       out.flush();
       const bool written = writer.ok() && out.good();
       out.close();
