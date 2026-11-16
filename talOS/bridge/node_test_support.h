@@ -5,6 +5,7 @@
 // configs, and requests, States and commands as the two ends exchange them.
 
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -21,6 +22,11 @@
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware::bridge_test {
+
+// How long a wait for an event (a datagram, a State ingested) may take before
+// the test fails: it only bounds a hang (docs/TESTING.md §6.3). No wait here
+// is a test's proof that something did not happen.
+inline constexpr std::chrono::seconds kHangBound{10};
 
 // Binds a loopback UDP socket to a port the OS chooses and connects it to
 // itself, so it accepts no datagram from another socket: a bridge sending to
@@ -175,8 +181,9 @@ inline void PublishCommand(ipc::Publisher<talos::hardware::Packet>& pub,
 }
 
 // Sends one controller state frame from a fake gateway, then ticks until the
-// node ingests it. False means the state never arrived (a test failure, not a
-// hang).
+// node ingests it, each further Tick only once the bridge's socket is readable
+// (a datagram, or a pending error that Tick consumes alone). False means the
+// state never arrived within kHangBound (a test failure, not a hang).
 inline bool InjectState(HardwareNode& node, protocol::RuntimeUdpPeer& gateway,
                         const State& state, uint64_t now_us) {
   talos::hardware::Packet buf{};
@@ -187,20 +194,25 @@ inline bool InjectState(HardwareNode& node, protocol::RuntimeUdpPeer& gateway,
     return false;
   }
   const uint64_t before = node.states_received();
-  for (int i = 0; i < 200; ++i) {
+  const auto give_up = std::chrono::steady_clock::now() + kHangBound;
+  while (true) {
     node.Tick(now_us);
     if (node.states_received() > before) return true;
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+        give_up - std::chrono::steady_clock::now());
+    pollfd readable{node.udp_fd(), POLLIN, 0};
+    if (left.count() <= 0 ||
+        ::poll(&readable, 1, static_cast<int>(left.count()) + 1) != 1) {
+      return false;
+    }
   }
-  return false;
 }
 
 // UDP send completion does not imply that the peer's receive queue is ready,
 // even on loopback (notably on BSD). Wait for the protocol event, without
 // advancing the bridge's simulated clock or causing another retry.
 inline unsigned ReceiveConfigs(protocol::RuntimeUdpPeer& gateway) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  const auto deadline = std::chrono::steady_clock::now() + kHangBound;
   protocol::DecodedFrame frame;
   while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
          protocol::UdpStatus::kOk) {
@@ -224,11 +236,10 @@ inline State TrustState(uint64_t config_id, uint64_t boot_id, uint64_t epoch,
   return state;
 }
 
-// Polls `done` until it holds; false after 10 s, a bound on a hang only.
+// Polls `done` until it holds; false after kHangBound, a bound on a hang only.
 template <class Done>
 inline bool WaitFor(Done done) {
-  const auto give_up =
-      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  const auto give_up = std::chrono::steady_clock::now() + kHangBound;
   while (!done()) {
     if (std::chrono::steady_clock::now() >= give_up) return false;
     std::this_thread::sleep_for(std::chrono::microseconds{100});
@@ -263,11 +274,10 @@ struct SentCommand {
 };
 
 // The next command frame the gateway receives, skipping every other frame;
-// nullopt after 10 s, a bound on a hang only.
+// nullopt after kHangBound, a bound on a hang only.
 inline std::optional<SentCommand> NextCommand(
     protocol::RuntimeUdpPeer& gateway) {
-  const auto give_up =
-      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  const auto give_up = std::chrono::steady_clock::now() + kHangBound;
   protocol::DecodedFrame frame;
   while (protocol::testing::ReceiveFrame(gateway, &frame, give_up) ==
          protocol::UdpStatus::kOk) {
