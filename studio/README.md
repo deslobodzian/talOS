@@ -345,7 +345,14 @@ remembers, are not there (the browser keeps them per origin).
 While a recording is open it replaces the live view on every page, and the
 footer becomes its transport: step back and forward by the step size, play
 and pause at 1x, 2x or 4x, a slider over the whole session, and the playhead
-as session time (from the session's start) and wall time. **Close recording**,
+as session time (from the session's start) and wall time. Each stretch where
+a process's event log dropped records (a log gap in `bounds.json`'s `gaps`)
+is a warning-coloured band over the slider, at least a sliver wide, whose
+tooltip names the process, the duration, the records, dispatches and sends
+lost, and whether the stop closed it; the status line adds `· N log gaps`
+(nothing when there are none). The Session panel lists a run whose manifest
+sets `log_gap` with the problem "log gap", beside "recorder failed".
+**Close recording**,
 going live (`L`) or connecting returns to live data. A failed request (the
 server unreachable, an HTTP error, a malformed answer) pauses playback and is
 shown in the footer with **Retry**; panels keep what they last showed.

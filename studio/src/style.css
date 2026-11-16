@@ -1112,6 +1112,18 @@ th.sortable i {
   width: 100%;
   accent-color: var(--accent);
 }
+/* A recorded session's log gaps (REQ-OPS-41), drawn over the slider. */
+.scrub-track {
+  position: relative;
+}
+.scrub-gap {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: var(--warn);
+  opacity: .45;
+  border-radius: 2px;
+}
 
 .timeline {
   flex-shrink: 0;

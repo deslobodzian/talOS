@@ -1,11 +1,11 @@
 // The footer while a recorded session is open, in place of the live Timeline:
 // step, play/pause at 1x/2x/4x, a scrub slider over the session, the playhead
-// as session time and wall time, the review error if any, and Close.
+// as session time and wall time, a band over each log gap (REQ-OPS-41), the review error if any, and Close.
 
 import {useSyncExternalStore} from 'react';
 
 import {usePlayback} from '../data/hooks';
-import {PLAY_RATES, type PlayRate, type RecordedSource} from '../data/recorded';
+import {gapBands, PLAY_RATES, type PlayRate, type RecordedSource} from '../data/recorded';
 import {wallTimeNs} from '../data/review';
 import {sessionTime, timestamp, wallDateTime} from '../ui/formatters';
 
@@ -46,12 +46,17 @@ export function RecordedTransport({source, stepNs, onStepNs, onClose}: {
         <code>{sessionTime(cursor - start)} · {wallDateTime(
             wallTimeNs(source.bounds, cursor.toString()))}</code>
       </div>
-      <input type="range" className="scrub-range" aria-label="Recorded session time"
-             min={0} max={Math.max(1, spanMs)} step={1}
-             value={Number((cursor - start) / 1000000n)}
-             onChange={e => source.seek(
-                 (start + BigInt(Math.round(Number(e.target.value))) * 1000000n)
-                     .toString())}/>
+      <div className="scrub-track">
+        <input type="range" className="scrub-range" aria-label="Recorded session time"
+               min={0} max={Math.max(1, spanMs)} step={1}
+               value={Number((cursor - start) / 1000000n)}
+               onChange={e => source.seek(
+                   (start + BigInt(Math.round(Number(e.target.value))) * 1000000n)
+                       .toString())}/>
+        {gapBands(source.bounds).map((band, i) =>
+          <span key={i} className="scrub-gap" title={band.title} aria-label={band.title}
+                style={{left: `${band.left * 100}%`, width: `${band.width * 100}%`}}/>)}
+      </div>
       <div className="scrub-bounds">
         <span>{sessionTime(0n)}</span>
         <span>{timestamp(playback.cursor_ns)}</span>

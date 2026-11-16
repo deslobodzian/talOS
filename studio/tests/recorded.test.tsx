@@ -17,6 +17,8 @@ import {
   POINT_SIZES,
   quantizePoints,
   RecordedSource,
+  GAP_MIN_WIDTH,
+  gapBands,
   SERIES_SLOTS,
   type ReviewClock
 } from '../src/data/recorded';
@@ -25,12 +27,14 @@ import {
   detectReviewServer,
   parseBounds,
   ReviewError,
+  type ReviewGap,
   type FetchLike,
   type ReviewBounds
 } from '../src/data/review';
 import {createStaticStudio, StudioProvider} from '../src/data/studio';
 import type {ChannelInfo} from '../src/data/types';
 import {Header} from '../src/shell/Header';
+import {RecordedTransport} from '../src/shell/RecordedTransport';
 import {ReviewPicker} from '../src/shell/ReviewPicker';
 
 const SERVER = 'http://review.test';
@@ -42,7 +46,7 @@ const MAX_SERIES_VALUES = 262_144;
 const MAX_SERIES_CHANNELS = 256;
 const BOUNDS: ReviewBounds = {
   start_ns: START.toString(), end_ns: END.toString(), origin_wall_ns: '0',
-  max_series_values: MAX_SERIES_VALUES, max_series_channels: MAX_SERIES_CHANNELS
+  max_series_values: MAX_SERIES_VALUES, max_series_channels: MAX_SERIES_CHANNELS, gaps: []
 };
 
 type Column = {t: number[]; min: number[]; max: number[]; last: number[]; count: number[]};
@@ -539,4 +543,66 @@ test('a session whose hardware packets were not decoded says why in its status',
   assert.match(header, /&lt;b&gt;x&lt;\/b&gt;/);
   refused.close();
   intact.close();
+});
+
+// REQ-OPS-41: bounds.json lists every GAP record; the parser keeps the well
+// formed ones, reads an absent list (an older server) as none, and drops a
+// malformed entry without losing the session.
+test('bounds.json gaps parse; absent is none; a malformed entry is dropped', () => {
+  const wire = {process: 'bridge', start_ns: '3000000000', end_ns: '4000000000',
+                records: 12, dispatches: 3, sends: 4, closed_at_flush: false};
+  const {gaps: _, ...older} = BOUNDS;
+  assert.deepEqual(parseBounds(older).gaps, []);
+  const parsed = parseBounds({...BOUNDS, gaps: [wire, {process: 'x', start_ns: -1},
+                                                {...wire, end_ns: '2000000000'}]});
+  assert.deepEqual(parsed.gaps, [wire]);
+  assert.equal(parsed.start_ns, BOUNDS.start_ns);
+});
+
+const gap = (over: Partial<ReviewGap> = {}): ReviewGap => ({
+  process: 'bridge', start_ns: '3500000000', end_ns: '4500000000', records: 120,
+  dispatches: 30, sends: 40, closed_at_flush: false, ...over
+});
+
+// REQ-OPS-41: a gap is a band over its stretch of the scrub bar, never too
+// narrow to see, and one at the very end stays inside the bar.
+test('gap bands sit at their fraction of the session with a minimum width', () => {
+  const bounds = {...BOUNDS, gaps: [
+    gap(),
+    gap({process: 'shooter', start_ns: '6000000000', end_ns: '6000000001'}),
+    gap({start_ns: END.toString(), end_ns: END.toString(), closed_at_flush: true})
+  ]};
+  const [known, thin, last] = gapBands(bounds);
+  // 2.5 s into a 10 s session, 1 s long.
+  assert.ok(Math.abs(known.left - 0.25) < 1e-9);
+  assert.ok(Math.abs(known.width - 0.1) < 1e-9);
+  assert.match(known.title, /bridge/);
+  assert.match(known.title, /1\.000 s/);
+  assert.match(known.title, /120 records, 30 dispatches, 40 sends/);
+  assert.doesNotMatch(known.title, /stop/);
+  assert.ok(Math.abs(thin.left - 0.5) < 1e-9);
+  assert.equal(thin.width, GAP_MIN_WIDTH);
+  assert.ok(Math.abs(last.left + last.width - 1) < 1e-9);
+  assert.equal(last.width, GAP_MIN_WIDTH);
+  assert.match(last.title, /closed at the stop/);
+});
+
+// REQ-OPS-41: the status line counts the session's gaps, and says nothing
+// when there are none; the transport draws one band per gap.
+test('the recorded transport counts and draws log gaps', () => {
+  const server = fakeServer(echoSnapshot);
+  const plain = source(server);
+  assert.equal(plain.playback.status, 'Recorded session s1');
+  const gapped = new RecordedSource(SERVER, 's1', [], {...BOUNDS, gaps: [gap(), gap()]},
+                                    server.fetchFn, fakeClock().clock);
+  assert.equal(gapped.playback.status, 'Recorded session s1 · 2 log gaps');
+  const noop = () => {};
+  const html = (s: RecordedSource) => renderToStaticMarkup(
+      <StudioProvider studio={createStaticStudio({playback: s.playback})}>
+        <RecordedTransport source={s} stepNs="1000000" onStepNs={noop} onClose={noop}/>
+      </StudioProvider>);
+  assert.equal(html(gapped).match(/class="scrub-gap"/g)?.length, 2);
+  assert.doesNotMatch(html(plain), /scrub-gap/);
+  plain.close();
+  gapped.close();
 });

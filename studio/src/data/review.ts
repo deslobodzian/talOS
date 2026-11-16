@@ -40,7 +40,14 @@ export type ReviewSession = {
 // text from the server's files, shown as text, never as markup.
 export type ReviewBounds = {start_ns: string; end_ns: string; origin_wall_ns: string;
                             max_series_values: number; max_series_channels: number;
-                            hardware_not_decoded?: string};
+                            hardware_not_decoded?: string; gaps: ReviewGap[]};
+
+// A stretch where a process's event log dropped records (a GAP record,
+// REQ-OPS-41): its first lost event time and the time capture resumed, what
+// was lost, and whether the stop, not resumed capture, closed it.
+export type ReviewGap = {process: string; start_ns: string; end_ns: string;
+                         records: number; dispatches: number; sends: number;
+                         closed_at_flush: boolean};
 
 export type ReviewSample = {value: number; exact?: string; sample_ns: string};
 export type ReviewSnapshot = {t_ns: string; channels: Map<string, ReviewSample>};
@@ -161,7 +168,41 @@ export function parseBounds(raw: unknown): ReviewBounds {
     fail('bounds.hardware_not_decoded must be a string or null');
   if (BigInt(bounds.end_ns) < BigInt(bounds.start_ns))
     fail('bounds.end_ns is before bounds.start_ns');
-  return typeof reason === 'string' ? {...bounds, hardware_not_decoded: reason} : bounds;
+  const out = {...bounds, gaps: parseGaps(source.gaps)};
+  return typeof reason === 'string' ? {...out, hardware_not_decoded: reason} : out;
+}
+
+// bounds.json gaps: absent (a server from before GAP records) is none, and a
+// malformed entry is dropped rather than losing the session it annotates.
+function parseGaps(raw: unknown): ReviewGap[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ReviewGap[] = [];
+  for (const entry of raw) {
+    try {
+      const g = record(entry, 'gap');
+      const count = (key: string) => {
+        const value = g[key];
+        if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+          fail(`gap.${key} must be a non-negative integer`);
+        return value as number;
+      };
+      if (typeof g.closed_at_flush !== 'boolean') fail('gap.closed_at_flush must be a boolean');
+      const gap: ReviewGap = {
+        process: str(g, 'process', 'gap'),
+        start_ns: u64(g.start_ns, 'gap.start_ns'),
+        end_ns: u64(g.end_ns, 'gap.end_ns'),
+        records: count('records'),
+        dispatches: count('dispatches'),
+        sends: count('sends'),
+        closed_at_flush: g.closed_at_flush as boolean
+      };
+      if (BigInt(gap.end_ns) < BigInt(gap.start_ns)) fail('gap.end_ns is before gap.start_ns');
+      out.push(gap);
+    } catch (error) {
+      if (!(error instanceof ReviewError)) throw error;
+    }
+  }
+  return out;
 }
 
 // A sample as the bridge writes one: a number; "NaN", "Infinity" or
