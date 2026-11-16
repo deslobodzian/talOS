@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import sys
@@ -56,14 +57,18 @@ def ds_snapshot(row):
     return data["flags"], stick["axes"][1]
 
 
-def log_baseline_ns(session):
+def log_baseline_ns(logs):
     """Find log_dump's exact origin without assuming a Python/C++ clock epoch.
 
-    Walk v7 record headers only (events/log/format.h); payload decoding remains
-    log_dump's job. On macOS Node time is MONOTONIC_RAW, not steady_clock.
+    `logs` is a session directory (every *.tlog in it) or the log files
+    log_dump is given; None when they hold no record. Walk v7 record headers
+    only (events/log/format.h); payload decoding remains log_dump's job. On
+    macOS Node time is MONOTONIC_RAW, not steady_clock.
     """
+    if isinstance(logs, Path) and logs.is_dir():
+        logs = logs.glob("*.tlog")
     baseline = None
-    for path in session.glob("*.tlog"):
+    for path in logs:
         with path.open("rb") as stream:
             header = stream.read(120)
             magic, version, header_bytes = struct.unpack_from("<8sII", header)
@@ -79,9 +84,25 @@ def log_baseline_ns(session):
                 baseline = timestamp if baseline is None else min(baseline, timestamp)
                 stored, = struct.unpack_from("<I", record, 60)
                 stream.seek(stored, 1)
-    if baseline is None:
-        raise ValueError("no recorded events")
     return baseline
+
+
+def run_logs(session, node):
+    """[(k, [files])]: each run of a manifest node with the event logs that
+    run wrote, first run (k = 0) first. Restart k writes
+    `<name>.restart<k>.tlog` (the manifest's `log_paths`), and a log over its
+    byte share keeps older segments beside it as `<stem>.segment<j>.tlog`
+    (talOS/launcher/README.md)."""
+    runs = []
+    for logged in node["log_paths"]:
+        path = session / Path(logged).name
+        match = re.fullmatch(rf"{re.escape(node['name'])}(?:\.restart(\d+))?\.tlog",
+                             path.name)
+        if match is None:
+            raise ValueError(f"unexpected run log name: {path}")
+        segments = sorted(session.glob(f"{path.name[:-len('.tlog')]}.segment*.tlog"))
+        runs.append((int(match.group(1) or 0), [path, *segments]))
+    return sorted(runs, key=lambda run: run[0])
 
 
 def launcher_env(**extra):
