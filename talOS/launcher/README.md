@@ -377,17 +377,51 @@ and stderr land in `<output_dir>/<session_id>/studio_bridge.log`
 
 The bridge is the one roster member supervised differently (`StudioBridge` in
 `studio_bridge.h`); it waits for the telemetry segment itself (see the
-[bridge README](../../studio/bridge/README.md#publisher-and-serving-constraints)). Its
-first attempt spawns with the nodes; a quick exit is retried at most once a
-second for up to 60 seconds, inside the supervision loop, so it never delays the
-session or its `--duration-s` deadline. While it is still starting it does not
-hold the session open. Once it has survived a second it is supervised like any
-node, except that it is never restarted under the policy below. If it never
-comes up it is marked failed in the manifest and the session runs on without
-Studio. A bridge still starting when the session stops is SIGKILLed once the
-other members have ended. How the bridge ended (that kill, a crash, its exit
-code) is in its manifest entry and never in the launcher's exit status: an
-operator's stop of a session whose bridge died still exits 0.
+[bridge README](../../studio/bridge/README.md#publisher-and-serving-constraints)).
+It is an observer: its spawns, exits, restarts and final give-up never start,
+stop, restart or delay another member, and never change the launcher's exit
+status. Its first run spawns with the nodes. Every ending of a run while the
+session is not stopping is a failure, exit 0 included (a server that ends
+before the stop has failed), and so is a spawn that fails; each is restarted
+on a non-critical member's schedule ([restarts](#restarts)): 50 ms, doubling
+to 1 s, at most `max_restarts` starts (default 5) in any restart window
+(default 60 s), inside the supervision loop, so a restart never delays the
+session, another member or the `--duration-s` deadline. Each restart prints
+the line a node's does:
+
+    [launcher] studio_bridge exited (signal 11 SIGSEGV); restart 1 in 50 ms
+
+Where a node would be quarantined, the bridge is left for the rest of the
+session instead: one line names it and says it will not be restarted again,
+its manifest entry is marked `recorder_failed`, and the session runs on
+without Studio. A bridge that fails at once on every run therefore costs at
+most `max_restarts` + 1 spawns, 6 by default, all within about 1.6 s of the
+first (50 + 100 + 200 + 400 + 800 ms of backoff), then none: no busy loop
+and no fork storm, and since it takes no registry row, no registry churn.
+`--max-restarts 0` leaves it at its first ending. A stop cancels a pending
+restart, so no bridge is spawned once the stop has begun, and the session
+ends without waiting out the backoff. A run counts as up once it has run
+for a second (`kStudioBridgeSettleInterval`, printed as `Started
+studio_bridge ... on http://localhost:PORT`); a run not yet up and a pending
+restart do not hold the session open, and a run not yet up when the session
+ends is SIGKILLed once the other members have ended. A bridge none of whose
+runs came up is marked failed when the session ends on its deadline or its
+roster's completion. Its restarts are in its manifest entry
+(`restart_count`, `retry_at_monotonic_ns` while one is pending, and each
+run's `runs[]` entry with the reason it ended), and so in
+[`session_report`](#session-measurements)'s node and run tables and Studio's
+session panel; how it ended (a kill, a crash, its exit code) is never in
+the launcher's exit status: an operator's stop of a session whose bridge
+died still exits 0.
+
+A restart binds the same `[studio] http_port`. The bridge's listener sets
+`SO_REUSEADDR` (and `SO_REUSEPORT` where the OS has it), and the launcher
+kills a dead run's process group before it schedules the restart, so the
+port is free again for the restart; a port another program holds makes
+every run fail its listen and exit, which the bound above ends, with the
+reason in `studio_bridge.log`. The launcher sees the bridge only through its
+exits: it takes no registry row, so a bridge that hangs without exiting is
+not detected or restarted.
 
 ## Node output
 
@@ -479,6 +513,9 @@ A roster member — `hardware_node`, every subsystem node, `sim_gateway` — tha
 exits with a nonzero status or by a signal while the session is not stopping is
 restarted. So is a critical member that exits cleanly (status 0) while the
 session is not stopping: its peers still run, so it did not finish anything.
+The [Studio bridge](#studio-bridge) restarts on the non-critical schedule
+below after any ending, exit 0 included, and is left for the rest of the
+session where a non-critical node would be quarantined.
 A run that cannot be spawned, a first run included, is retried the same way
 and marks the member `recorder_failed`: a pipe or the fork failing (as under
 `EAGAIN` or `EMFILE`), or the child failing before or at its exec (its process
@@ -516,8 +553,8 @@ Nothing is restarted once a signal (requested stop, launcher shutdown) or the
 `--duration-s` deadline has started stopping the session; each restart
 decision reads the stop flag again, so a node killed by the same `systemctl
 stop` that is stopping the launcher is not restarted. The backoff is
-scheduled inside the supervision loop, like the Studio bridge's retries, so a
-restarting node never delays another node or the deadline. Each restart prints
+scheduled inside the supervision loop, so a restarting node never delays
+another node or the deadline. Each restart prints
 one line:
 
     [launcher] alpha exited (signal 11 SIGSEGV); restart 1 in 0 ms
@@ -679,8 +716,8 @@ hold and touches no disk. The times it sleeps until:
 | Deadline | Decides |
 |---|---|
 | each running member's next look at its registry row (`RunLiveness::NextLook`): one look interval (its heartbeat timeout / 4) after the last, its stall deadline (the startup grace's end or one heartbeat timeout after the progress last seen, whichever is later), and its construction deadline until a look sees it constructed | `stalled`, `heartbeat_missing`, `construction_deadline`; the row's endpoints, recording and realtime flags and delivery counts, read at each look |
-| each pending restart's start | the restart backoff, a quarantined member's retry |
-| one retry interval (1 s) after the Studio bridge's last spawn, while it starts | its stability, retry or abandonment ([Studio bridge](#studio-bridge)) |
+| each pending restart's start, the Studio bridge's included | the restart backoff, a quarantined member's retry |
+| one settle interval (1 s) after the Studio bridge's last spawn, until that run is up | whether it holds the session open ([Studio bridge](#studio-bridge)) |
 | `--duration-s`'s end, until the stop is sent | the stop |
 | the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |

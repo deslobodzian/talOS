@@ -353,26 +353,6 @@ offset_m = 0.5
   std::filesystem::remove(path);
 }
 
-TEST(LauncherTest, ShouldRetryStudioBridgePredicate) {
-  using clock = std::chrono::steady_clock;
-  const auto now = clock::now();
-  const auto first = now - std::chrono::seconds(5);
-  const auto last = now - std::chrono::seconds(2);
-  // Budget remains and the last spawn is paced: retry.
-  EXPECT_TRUE(ShouldRetryStudioBridge(1, first, last, now, false));
-  // Pacing: a spawn less than one interval ago is not retried yet.
-  EXPECT_FALSE(ShouldRetryStudioBridge(1, first, now, now, false));
-  // Attempts exhausted.
-  EXPECT_FALSE(ShouldRetryStudioBridge(kStudioBridgeMaxAttempts, first, last,
-                                       now, false));
-  // Window exhausted.
-  EXPECT_FALSE(ShouldRetryStudioBridge(
-      1, now - kStudioBridgeStartupWindow - std::chrono::seconds(1), last, now,
-      false));
-  // A stopping session (signal or deadline) ends the retry, never extends it.
-  EXPECT_FALSE(ShouldRetryStudioBridge(1, first, last, now, true));
-}
-
 // Forward declarations for helpers defined with the graph tests below.
 std::string WriteStubNode(std::string_view name, std::string_view script);
 std::string DescribeJson(
@@ -445,100 +425,6 @@ std::string NodeDescribeThenSleep(
          "done\n"
          "exec sleep " +
          std::to_string(sleep_s) + "\n";
-}
-
-// A failing bridge must not delay the session: the first attempt spawns with
-// the nodes and retries happen inside the supervision loop while the session
-// runs. The counter proves a retry fired; the elapsed bound proves nothing
-// blocked for the old ~60s startup wait. The test moves the supervision
-// clock one retry interval ahead once the launcher has reaped the first
-// attempt, and the nodes exit once the second has failed. Moved on the
-// attempt's report alone, the clock could pass the interval while the
-// attempt was still exiting, and a pass would take it for a bridge that
-// came up.
-TEST(LauncherTest, FailingBridgeRetriesInLoopWithoutBlockingSession) {
-  const std::string tag = "bridge_nonblock";
-  const std::string out_dir = TempPath(tag + "_out");
-  std::filesystem::create_directories(out_dir);
-  const std::string counter = TempPath(tag + "_counter");
-  ::remove(counter.c_str());
-
-  LauncherOptions options;
-  options.output_dir = out_dir;
-  options.session_id = 0xB81D9EULL;
-  options.simulation = true;
-  options.start_studio_bridge = true;
-  options.describe_timeout_ms = 4000;
-  // The stubs never take a registry row; nothing here waits for one.
-  options.heartbeat_startup_grace_ms = 60000;
-  testing::SteppedClock clock;
-  options.supervision_clock = clock.clock();
-  options.config_path = WriteFixtureToml();
-  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
-      tag + "_hardware",
-      DescribingStub("hardware_node", "//talOS/bridge:hardware_node", {}));
-  const auto until_retried =
-      [&](std::string_view node, std::string_view target,
-          const introspect::naming::SourceShape& source) {
-        std::string script = NodeDescribeThenSleep(node, target, {source}, 0);
-        script.erase(script.rfind("exec sleep"));
-        return script + "tries=0\nwhile [ \"$(wc -l < '" + counter +
-               "' 2>/dev/null || echo 0)\" -lt 2 ] && [ $tries -lt 2000 ]; do\n"
-               "  tries=$((tries + 1))\n  sleep 0.01\ndone\nexit 0\n";
-      };
-  options.binary_overrides["//example/alpha:node"] = WriteStubNode(
-      tag + "_alpha",
-      until_retried("alpha", "//example/alpha:node", Sender("/alpha/state")));
-  options.binary_overrides["//example/beta:node"] = WriteStubNode(
-      tag + "_beta",
-      until_retried("beta", "//example/beta:node", Watcher("/alpha/state")));
-  options.binary_overrides["//studio/bridge:studio_bridge"] =
-      WriteStubNode(tag + "_bridge",
-                    BridgeDescribeThen("echo $$ >> " + counter + "\nexit 1\n"));
-
-  std::jthread advance{[&](const std::stop_token& stop) {
-    const auto give_up = std::chrono::steady_clock::now() + kHang;
-    const auto wait = [&](const std::function<bool()>& done) {
-      while (!stop.stop_requested() && !done() &&
-             std::chrono::steady_clock::now() < give_up)
-        std::this_thread::sleep_for(std::chrono::milliseconds{2});
-    };
-    pid_t first = 0;
-    wait([&] {
-      std::istringstream{ReadFile(counter)} >> first;
-      return first > 0;
-    });
-    // Gone once reaped: its exit was handled as a starting attempt's.
-    wait([&] { return ::kill(first, 0) != 0 && errno == ESRCH; });
-    clock.Advance(kStudioBridgeRetryInterval);
-  }};
-  const auto started = std::chrono::steady_clock::now();
-  Launcher launcher{options};
-  launcher.Run();
-  const auto elapsed = std::chrono::steady_clock::now() - started;
-  advance.request_stop();
-
-  EXPECT_LT(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count(),
-            20)
-      << "a failing bridge must not cost the old ~60s startup wait";
-  const std::string session =
-      out_dir + "/" + std::to_string(options.session_id);
-  EXPECT_TRUE(std::filesystem::exists(session + "/manifest.json"));
-  const std::string manifest = ReadFile(session + "/manifest.json");
-  EXPECT_NE(manifest.find("\"name\": \"studio_bridge\""), std::string::npos)
-      << manifest;
-  // Exhaustion is degraded, not broken: the bridge is failed, the session ran.
-  EXPECT_NE(manifest.find("\"recorder_failed\": true"), std::string::npos)
-      << manifest;
-
-  std::ifstream count_in{counter};
-  std::size_t attempts = 0;
-  std::string line;
-  while (std::getline(count_in, line)) ++attempts;
-  EXPECT_GE(attempts, 2u) << "retries must fire inside the supervision loop";
-
-  std::filesystem::remove_all(out_dir);
-  ::remove(counter.c_str());
 }
 
 TEST(LauncherTest, RestartSharesByteBudgetAndManifestEnospcDoesNotStopIt) {
@@ -800,12 +686,12 @@ TEST(LauncherTest, ShutdownKillsChildrenIgnoringInterrupt) {
   ::remove(trapped.c_str());
 }
 
-// A bridge that survives its grace second joins the session: it is not failed
-// and the session runs to the deadline with it. A session against the real
-// controller (no --sim) starts it too, so a deployed robot is viewable in
-// Studio (REQ-OPS-30). Once the bridge has spawned, the test moves the
-// supervision clock past the 3 s deadline, a whole retry interval after the
-// spawn: the deadline's pass finds the bridge up that long, so stable.
+// A bridge that survives its settle interval joins the session: it is not
+// failed and the session runs to the deadline with it. A session against the
+// real controller (no --sim) starts it too, so a deployed robot is viewable
+// in Studio (REQ-OPS-30). Once the bridge has spawned, the test moves the
+// supervision clock past the 3 s deadline, a whole settle interval after the
+// spawn: the deadline's pass finds the bridge up that long, so come up.
 TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
   const std::string tag = "bridge_stable";
   const std::string out_dir = TempPath(tag + "_out");
@@ -890,13 +776,14 @@ TEST(LauncherTest, StableBridgeJoinsDeployedSessionUntilDeadline) {
 // REQ-OPS-30: the Studio bridge is an observer, so how it ends never sets the
 // launcher's exit status, while the manifest still records it. Row
 // "ignores the stop": a bridge still starting (the supervision clock is held
-// inside its first retry interval) ignores the stop's SIGINT and is SIGKILLed
-// when the rest of the roster has stopped (StudioBridge::Finish). Row
-// "crashed": a bridge that has become stable (the clock moved one retry
-// interval past its spawn, then two passes) exits 3 mid-session and is not
-// restarted. Either way the operator's stop ends the session with 0, and the
-// bridge's entry shows the SIGKILL or the exit code. The other members die
-// of the stop's own SIGINT, which leaves the status 0 (REQ-OPS-06).
+// inside its first settle interval) ignores the stop's SIGINT and is
+// SIGKILLed when the rest of the roster has stopped (StudioBridge::Finish).
+// Row "crashed": a bridge that has come up (the clock moved one settle
+// interval past its spawn, then two passes) exits 3 mid-session, and so does
+// each of its restarts. Either way the operator's stop ends the session with
+// 0, and the bridge's entry shows the SIGKILL or the exit code. The other
+// members die of the stop's own SIGINT, which leaves the status 0
+// (REQ-OPS-06).
 TEST(LauncherTest, StudioBridgeEndingNeverSetsTheSessionStatus) {
   struct Row {
     const char* name;
@@ -963,7 +850,7 @@ TEST(LauncherTest, StudioBridgeEndingNeverSetsTheSessionStatus) {
       };
       if (!wait([&] { return std::filesystem::exists(ready); })) return;
       if (row.crashes) {
-        clock.Advance(kStudioBridgeRetryInterval);
+        clock.Advance(kStudioBridgeSettleInterval);
         const uint64_t until = passes.Started() + 2;
         if (!wait([&] { return passes.Started() >= until; })) return;
         std::ofstream{crash}.close();

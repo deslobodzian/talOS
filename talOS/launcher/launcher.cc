@@ -723,8 +723,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     }
     proc.described = described[i].answered;
     if (spec.studio_bridge) {
-      studio.emplace(i, spec, proc, robot_config, options_, described,
-                     graph_path, *output_);
+      studio.emplace(i, spec, proc, robot_config, options_, restart_limits_,
+                     described, graph_path, *output_);
     }
     if (!proc.log_path.empty()) proc.log_paths.push_back(proc.log_path);
   }
@@ -804,8 +804,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // Whose last exit leaves the status alone: a run the stop's own signal
   // ended (its manifest run's stopped_by_session, so the two never
   // disagree), the Studio bridge however it ended (an observer, REQ-OPS-30:
-  // killed while still starting, crashed, or stopped), which the manifest
-  // records all the same, and a member the stop left unstarted (no run).
+  // killed while still settling, crashed, left, or stopped), which the
+  // manifest records all the same, and a member the stop left unstarted (no
+  // run).
   std::vector<bool> exit_not_counted;
   exit_not_counted.reserve(procs.size());
   for (std::size_t i = 0; i < procs.size(); ++i) {
@@ -1054,17 +1055,6 @@ std::chrono::milliseconds Launcher::ScheduleRestart(NodeProcessInfo& proc,
   const auto delay = launch.restart.Schedule(now, restart_limits_);
   ShowRestart(proc, launch.restart);
   return delay;
-}
-
-void Launcher::ShowRestart(NodeProcessInfo& proc,
-                           const RestartSchedule& restart) {
-  proc.quarantined = restart.quarantined();
-  // steady_clock's epoch, which introspect::monotonic_now_ns() shares.
-  proc.retry_at_monotonic_ns =
-      restart.pending() ? std::chrono::duration_cast<std::chrono::nanoseconds>(
-                              restart.due_at().time_since_epoch())
-                              .count()
-                        : 0;
 }
 
 void Launcher::NodeLaunch::NewRun(SupervisionTime spawned) {
@@ -1444,10 +1434,14 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // run, which the exit status reads too (exit_not_counted).
       proc.EndRun(RunEndReason(launch.kill_reason, stop_arrived(), status),
                   EndedByOwnStopSignal(launch.kill_reason, status));
-      const bool is_bridge = studio && i == studio->index();
-      if (is_bridge && studio->Starting(i)) continue;
+      // An observer's restarts are its own, on a non-critical schedule that
+      // touches no other member (StudioBridge).
+      if (studio && i == studio->index()) {
+        studio->Exited(proc, status, now, stop_arrived());
+        continue;
+      }
       launch.restart.RunEnded(clean);
-      if (!is_bridge && !launch.endpoints_stopped &&
+      if (!launch.endpoints_stopped &&
           ShouldRestartNode(clean, launch.restart.critical(),
                             restart_limits_.max_restarts, stop_arrived())) {
         const auto delay = ScheduleRestart(proc, launch, now);
@@ -1484,13 +1478,17 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       }
     }
     if (studio) {
-      const auto& before = procs[studio->index()];
-      const auto pid = before.pid;
-      const bool exited = before.exited;
-      const bool failed = before.failed;
+      const auto& bridge = procs[studio->index()];
+      // Every run it begins, spawned or not, dropped from the history or not.
+      const auto runs = [&bridge] {
+        return bridge.runs.size() + bridge.runs_dropped;
+      };
+      const uint64_t began = runs();
+      const int64_t retry_at = bridge.retry_at_monotonic_ns;
+      const bool failed = bridge.failed;
       studio->Supervise(procs[studio->index()], now, stop_arrived());
-      const auto& after = procs[studio->index()];
-      if (pid != after.pid || exited != after.exited || failed != after.failed)
+      if (began != runs() || retry_at != bridge.retry_at_monotonic_ns ||
+          failed != bridge.failed)
         manifest_changed = true;
     }
     // Posted after the pass's restarts and the bridge's: the manifest

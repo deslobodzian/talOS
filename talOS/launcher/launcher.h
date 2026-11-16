@@ -318,12 +318,6 @@ class Launcher {
                                             NodeLaunch& launch,
                                             SupervisionTime now);
 
-  // The manifest's view of `restart`: `quarantined`, and
-  // `retry_at_monotonic_ns` (0 with no pending start). Written after every
-  // change to it.
-  static void ShowRestart(NodeProcessInfo& proc,
-                          const RestartSchedule& restart);
-
   // A run that cannot be spawned is rescheduled like a crash (Restarts in
   // supervision_policy.h); with restarts disabled it stays down, as a
   // crashed one does.
@@ -393,10 +387,11 @@ class Launcher {
   // Waits until every node has exited, SIGINTing them all once on a signal or
   // at the deadline. A crashed node is restarted per supervision_policy.h
   // without blocking the loop; a pending restart holds the session open until
-  // it fires or the session stops. A bridge that is still starting does not
-  // hold it open. Between passes it sleeps until the earliest deadline a
-  // pass decides on, woken at once by a child's exit or a stop signal
-  // (SupervisionWakeup; README "Supervision passes").
+  // it fires or the session stops. The Studio bridge restarts on its own
+  // schedule (StudioBridge); a run of it still settling and its pending
+  // restart do not hold the session open. Between passes it sleeps until
+  // the earliest deadline a pass decides on, woken at once by a child's exit
+  // or a stop signal (SupervisionWakeup; README "Supervision passes").
   void Supervise(std::vector<NodeProcessInfo>& procs,
                  std::vector<NodeLaunch>& launches,
                  std::optional<StudioBridge>& studio,
