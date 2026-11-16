@@ -3877,7 +3877,129 @@ talos_graph_test(
 )
 """
 
-LOAD = re.compile(r'^load\(\s*"([^"]+)"([^)]*)\)\n', re.M)
+# Starlark's tokens, as far as reading a BUILD file's loads needs them. An
+# unterminated string leaves its quote to `op`, which load_statements refuses.
+STARLARK_TOKEN = re.compile(r'''
+    (?P<comment>\#[^\n]*)
+  | (?P<string>[rRbB]{0,2}(?:"""(?:\\.|[^\\])*?"""|\'\'\'(?:\\.|[^\\])*?\'\'\'
+                         |"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'))
+  | (?P<name>[A-Za-z_]\w*)
+  | (?P<newline>\n)
+  | (?P<space>[ \t\r\f]+|\\\n)
+  | (?P<op>.)
+''', re.X | re.S)
+
+
+class Load(typing.NamedTuple):
+    start: int  # the `l` of `load`, at the start of a line
+    end: int  # past the newline that ends its last line (or the file)
+    module: str
+    items: list  # [(local name, loaded name)]
+    trailing: str  # a comment after its `)`, else ""
+    plain: bool  # double-quoted and no comment inside: with_load rewrites it
+
+
+def load_statements(build):
+    """[Load] for each top-level load of `build`, or None when the file's
+    tokens cannot be read (an unterminated string or bracket) or a load is
+    in a shape other than `load("m", "a", b = "c")` with an optional comment
+    after it."""
+    tokens = []
+    for match in STARLARK_TOKEN.finditer(build):
+        if match.lastgroup == "op" and match.group() in "\"'":
+            return None
+        tokens.append((match.lastgroup, match.group(), match.start(),
+                       match.end()))
+    loads, depth, i = [], 0, 0
+    while i < len(tokens):
+        kind, text, start, _ = tokens[i]
+        if (depth == 0 and kind == "name" and text == "load"
+                and (start == 0 or build[start - 1] == "\n")):
+            load = read_load(build, tokens, i)
+            if load is None:
+                return None
+            statement, i = load
+            loads.append(statement)
+            continue
+        if kind == "op" and text in "([{":
+            depth += 1
+        elif kind == "op" and text in ")]}":
+            depth -= 1
+            if depth < 0:
+                return None
+        i += 1
+    return None if depth else loads
+
+
+def read_load(build, tokens, i):
+    """(Load, index of the token after it) for the load at tokens[i], or
+    None when it is not in a shape load_statements reads."""
+    start = tokens[i][2]
+    significant, commented, i = [], False, i + 1
+    while i < len(tokens) and tokens[i][0] in ("space", "newline"):
+        i += 1
+    if i == len(tokens) or tokens[i][:2] != ("op", "("):
+        return None
+    i += 1
+    while i < len(tokens) and tokens[i][:2] != ("op", ")"):
+        kind, text = tokens[i][:2]
+        if kind == "comment":
+            commented = True
+        elif kind == "op" and text in "([{}]":
+            return None
+        elif kind not in ("space", "newline"):
+            significant.append((kind, text))
+        i += 1
+    if i == len(tokens):
+        return None
+    i += 1
+    trailing, end = "", len(build)
+    while i < len(tokens):
+        kind, text, _, token_end = tokens[i]
+        i += 1
+        if kind == "space":
+            continue
+        if kind == "comment" and not trailing:
+            trailing = text
+            continue
+        if kind == "newline":
+            end = token_end
+            break
+        return None
+    groups, group = [], []
+    for token in significant:
+        if token == ("op", ","):
+            groups.append(group)
+            group = []
+        else:
+            group.append(token)
+    if group:
+        groups.append(group)
+
+    def value(token):
+        if token[0] != "string":
+            return None
+        try:
+            literal = ast.literal_eval(token[1])
+        except (SyntaxError, ValueError):
+            return None
+        return literal if isinstance(literal, str) else None
+
+    if not groups or len(groups[0]) != 1 or value(groups[0][0]) is None:
+        return None
+    items = []
+    for group in groups[1:]:
+        if len(group) == 1 and value(group[0]) is not None:
+            items.append((value(group[0]), value(group[0])))
+        elif (len(group) == 3 and group[0][0] == "name"
+              and group[1] == ("op", "=") and value(group[2]) is not None):
+            items.append((group[0][1], value(group[2])))
+        else:
+            return None
+    plain = not commented and all(
+        text.startswith('"') and not text.startswith('"""')
+        for kind, text in significant if kind == "string")
+    return Load(start, end, value(groups[0][0]), items, trailing, plain), i
 
 
 def load_order(module):
@@ -3886,33 +4008,94 @@ def load_order(module):
             1 if module.startswith("//") else 2), module
 
 
-def with_load(build, module, symbols):
-    """`build` loading `symbols` (each `"name"`, or `ALIAS = "name"`) from
-    `module`: added to its load of `module`, sorted, else a new load in
-    buildifier's order among the others. The loads are single statements at
-    the top, as buildifier leaves them."""
-    loads = list(LOAD.finditer(build))
-    for match in loads:
-        if match.group(1) != module:
+def load_item(local, name):
+    return f'"{name}"' if local == name else f'{local} = "{name}"'
+
+
+def header_end(build):
+    """Where a first load goes in a BUILD without one: below its header (the
+    leading comments up to a blank line, and a docstring), above a comment
+    that belongs to the first statement."""
+    at, blank, docstring, seen = 0, True, False, False
+    for match in STARLARK_TOKEN.finditer(build):
+        kind = match.lastgroup
+        if kind == "space":
             continue
-        have = [item.strip() for item in match.group(2).split(",")
-                if item.strip()]
-        missing = [s for s in symbols if s not in have]
-        if not missing:
-            return build
-        items = sorted(have + missing,
-                       key=lambda item: item.split("=")[0].strip(' "'))
-        statement = f'load("{module}", {", ".join(items)})\n'
-        return build[:match.start()] + statement + build[match.end():]
-    statement = f'load("{module}", {", ".join(symbols)})\n'
-    after = [m for m in loads if load_order(m.group(1)) < load_order(module)]
-    if after:
-        at = after[-1].end()
+        if kind == "newline":
+            if blank or docstring:
+                at = match.end()
+            blank, docstring = True, False
+        elif kind == "comment":
+            blank = False
+        elif kind == "string" and blank and not seen:
+            blank, docstring, seen = False, True, True
+        else:
+            return at
+    return len(build)
+
+
+def with_load(build, module, symbols):
+    """`build` loading `symbols` (each (local name, loaded name)) from
+    `module`, or None when a local name is already bound to something else
+    or the loads cannot be read. Missing symbols join a plain load of
+    `module`, sorted; else (none, or one with a comment inside or other
+    quotes, which is left as it is) they get a load of their own in
+    buildifier's order among the others."""
+    if build is None:
+        return None
+    loads = load_statements(build)
+    if loads is None:
+        return None
+    bound = {local: (load.module, name)
+             for load in loads for local, name in load.items}
+    missing = []
+    for local, name in symbols:
+        if local not in bound:
+            missing.append((local, name))
+        elif bound[local] != (module, name):
+            return None
+    if not missing:
+        return build
+    for load in loads:
+        if load.module != module or not load.plain:
+            continue
+        items = sorted(load.items + missing, key=lambda item: item[0])
+        trailing = f"  {load.trailing}" if load.trailing else ""
+        statement = (f'load("{module}", '
+                     f'{", ".join(load_item(*item) for item in items)})'
+                     f"{trailing}\n")
+        return build[:load.start] + statement + build[load.end:]
+    statement = (f'load("{module}", '
+                 f'{", ".join(load_item(*item) for item in missing)})\n')
+    before = [load for load in loads
+              if load_order(load.module) <= load_order(module)]
+    if before:
+        at = before[-1].end
     elif loads:
-        at = loads[0].start()
+        at = loads[0].start
     else:
-        return statement + "\n" + build
-    return build[:at] + statement + build[at:]
+        head, rest = build[:header_end(build)], build[header_end(build):]
+        if head and not head.endswith("\n\n"):
+            head += "\n"
+        rest = rest.lstrip("\n")
+        return head + statement + ("\n" + rest if rest else "")
+    head = build[:at]
+    if head and not head.endswith("\n"):
+        head += "\n"
+    return head + statement + build[at:]
+
+
+def sim_test_loads(build, talos, manifest):
+    """`build` with the loads SIM_TESTS needs (`manifest` is the simulation
+    manifest's path in the package), or None when they cannot be added
+    without risking a file that does not parse or binds a name twice."""
+    build = with_load(build, f"{talos}//talOS/build:contract.bzl",
+                      [("talos_graph_test", "talos_graph_test")])
+    build = with_load(build, f"{talos}//tools:sync_manifest.bzl",
+                      [("manifest_sync_test", "manifest_sync_test")])
+    return with_load(build, f":{manifest}",
+                     [("SIM_CONFIG_FILES", "CONFIG_FILES"),
+                      ("SIM_NODES", "NODES")])
 
 
 def robot_sim_files(root, layout, overrides):
@@ -3921,7 +4104,8 @@ def robot_sim_files(root, layout, overrides):
     `overrides` (the pending files), and its manifest_sync_test and
     talos_graph_test in the BUILD of its package, so that a mistake in it
     fails `bazel test //...`. [] when the scaffold cannot place the tests
-    (no BUILD there, or one that already declares their names); next_steps
+    (no BUILD there, one that already declares their names, or one whose
+    loads sim_test_loads cannot extend without risking it); next_steps
     then says nothing checks it."""
     sim_path, exists = sim_config(root, layout)
     if exists:
@@ -3947,14 +4131,9 @@ def robot_sim_files(root, layout, overrides):
             root, sim_path, overrides={**overrides, sim_path: text})
     except sync_manifest.ManifestError as err:
         raise Refused(f"cannot generate the manifest of {sim_path}: {err}")
-    talos = layout.talos
-    build = with_load(old_build, f"{talos}//talOS/build:contract.bzl",
-                      ['"talos_graph_test"'])
-    build = with_load(build, f"{talos}//tools:sync_manifest.bzl",
-                      ['"manifest_sync_test"'])
-    build = with_load(build, f":{manifest_in_package}",
-                      ['SIM_CONFIG_FILES = "CONFIG_FILES"',
-                       'SIM_NODES = "NODES"'])
+    build = sim_test_loads(old_build, layout.talos, manifest_in_package)
+    if build is None:
+        return []
     build = build.rstrip("\n") + "\n" + fill(
         SIM_TESTS, SIM=in_package, CONFIG=posixpath.basename(layout.config),
         MANIFEST=manifest_in_package)
