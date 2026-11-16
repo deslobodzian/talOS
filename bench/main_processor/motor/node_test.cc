@@ -27,7 +27,8 @@ using talos::testing::PublishTarget;
 using talos::testing::ReleaseTarget;
 namespace ds = talos::driver_station;
 // The bench config plus a neighbor motor that stays connected, with torque
-// mode on (foc, max_torque_current_a 5 A, max_bench_torque_current_a 2 A).
+// mode on (foc, max_torque_current_a 5 A, max_bench_torque_current_a 2 A)
+// and max_voltage 4 V, above the node's 2 V cap.
 constexpr const char* kConfig =
     "bench/main_processor/motor/testdata/robot.toml";
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
@@ -326,8 +327,8 @@ TEST_P(DrivingTest, UpdateDoesNotAllocate) {
   EXPECT_EQ(Applied().mode, GetParam().applied);
 }
 
-// The node's own cap (max_bench_voltage_v, 2 V) holds below the motor's
-// configured max_voltage (4 V), and scales the teleop axis.
+// The node's own cap (max_bench_voltage_v, 2 V) holds below the test
+// config's max_voltage (4 V), and scales the teleop axis.
 TEST_F(MotorTest, VoltageIsClampedAndAxisUsesNodeScale) {
   Enable();
   Send(Voltage(20.0));

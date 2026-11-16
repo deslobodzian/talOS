@@ -30,7 +30,8 @@ from talos.testing import Sim, SimHardware, Stick
 HERE = os.path.dirname(os.path.abspath(__file__))
 _RUNFILES = runfiles.Create()
 # testdata/robot.toml: torque mode on (foc, max_torque_current_a 5 A,
-# max_bench_torque_current_a 2 A).
+# max_bench_torque_current_a 2 A) and max_voltage 4 V, above the node's
+# 2 V cap.
 CONFIG = _RUNFILES.Rlocation(os.environ["TALOS_TEST_CONFIG"])
 # configuration/robot.toml as committed: torque mode off.
 BENCH_CONFIG = _RUNFILES.Rlocation(os.environ["TALOS_BENCH_CONFIG"])

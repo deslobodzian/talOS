@@ -103,6 +103,22 @@ TEST(SimGravity, ClosedLoopUsesSelectedSlotAndMechanismAngle) {
   }
 }
 
+// A velocity request whose feedforward alone (slot v times demand) exceeds
+// max_voltage applies max_voltage, as the Talon's peak voltage holds
+// VelocityVoltage: 0.1 V/rps at ±30 rps asks ±3 V of a 2 V motor.
+// REQ-DEV-10
+TEST(SimVoltageCeiling, VelocityIsClampedToMaxVoltage) {
+  MotorConfig cfg = TestMotor(1, "roller", 1);
+  cfg.max_voltage = 2.0;
+  cfg.slots[0].v = 0.1;
+  for (const double sign : {1.0, -1.0}) {
+    const MotorRequest req{1, Mode::kVelocity, 0, sign * 30.0, 0.0};
+    double volts = 0.0;
+    ASSERT_TRUE(sim::DriveVoltage(req, cfg, 0.0, 0.0, 12.0, volts));
+    EXPECT_DOUBLE_EQ(volts, sign * 2.0);
+  }
+}
+
 TEST(SimGravity, ProfiledMotionMagicIncludesGravityAndClampsVoltage) {
   for (const auto type :
        {GravityType::kElevatorStatic, GravityType::kArmCosine}) {

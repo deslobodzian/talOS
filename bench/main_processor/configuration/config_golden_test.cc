@@ -33,7 +33,7 @@ struct ExpectedSensor {
 // named Shooter.
 constexpr const char* kBus = "Shooter";
 constexpr ExpectedMotor kMotors[] = {
-    {"kraken", 1, MotorType::kKrakenX44, 4.0, 30.0, 40.0},
+    {"kraken", 1, MotorType::kKrakenX44, 2.0, 30.0, 40.0},
     {"drive", 5, MotorType::kKrakenX60, 4.0, 20.0, 40.0},
     {"steer", 6, MotorType::kKrakenX44, 4.0, 20.0, 40.0},
 };
