@@ -736,6 +736,10 @@ TEST_F(Registry, PreparedRegistryIsOpenableWhateverTheUmask) {
   EXPECT_EQ(reader->nodes().size(), 1u);
 }
 
+// Raised by the waiter below once it has opened the lock file, before it
+// locks it; a hook is a plain function.
+std::atomic<bool> lock_file_opened{false};
+
 // A writer that wins the lock on a file a /tmp cleaner unlinked while it
 // waited takes the lock again on the file the path now names, so a writer
 // opening the path anew is still excluded. A Bazel test's lock files live in
@@ -749,13 +753,19 @@ TEST_F(Registry, AWriterNeverHoldsAnUnlinkedLockFile) {
   int holder = OpenLockFile(lock, O_RDONLY);
   ASSERT_GE(holder, 0);
   ASSERT_EQ(::flock(holder, LOCK_EX), 0);
+  lock_file_opened = false;
+  const RegistryTestHooks hooks{.lock_file_opened = [] {
+    lock_file_opened = true;
+    lock_file_opened.notify_all();
+  }};
   std::atomic<bool> locked{false};
   std::atomic<bool> release{false};
   std::jthread waiter{[&] {
-    const RegistryLock writer{mapped};
+    const RegistryLock writer{mapped, std::nullopt, &hooks};
     locked = true;
+    locked.notify_all();
     // Released once the main thread has tried the path's file.
-    while (!release) std::this_thread::sleep_for(1ms);
+    release.wait(false);
   }};
   // Destroyed before `waiter` joins, so a failed ASSERT below unblocks the
   // waiter (its lock freed, its hold released) instead of hanging the test.
@@ -765,14 +775,18 @@ TEST_F(Registry, AWriterNeverHoldsAnUnlinkedLockFile) {
     ~Unblock() {
       if (holder >= 0) ::close(holder);
       release = true;
+      release.notify_all();
     }
   } unblock{holder, release};
-  std::this_thread::sleep_for(100ms);  // The waiter blocks on `holder`'s file.
+  // The waiter holds a descriptor of `holder`'s file from here, so whether
+  // its flock already blocks or starts after the close below, it wins that
+  // file only once the path names another one.
+  lock_file_opened.wait(false);
   ASSERT_EQ(::unlink(lock.c_str()), 0);
   ::close(holder);
   // Read by `unblock`'s destructor, which the analyzer cannot see.
   holder = -1;  // NOLINT(clang-analyzer-deadcode.DeadStores)
-  while (!locked) std::this_thread::sleep_for(1ms);
+  locked.wait(false);
   const int newcomer = OpenLockFile(lock, O_RDONLY);
   ASSERT_GE(newcomer, 0);
   EXPECT_NE(::flock(newcomer, LOCK_EX | LOCK_NB), 0);
@@ -868,9 +882,7 @@ TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
                                      .selected =
                                          [&] {
                                            held = true;
-                                           while (hold) {
-                                             std::this_thread::sleep_for(1ms);
-                                           }
+                                           hold.wait(true);
                                            return 0;
                                          }}},
                      .registry_path = path_}};
@@ -896,11 +908,13 @@ TEST_F(Registry, LoopStoresItsProgressWhileTheReporterIsBlocked) {
     after = row();
     loop_count = loop.dispatch_count();
     hold = false;
+    hold.notify_all();
     loop.exit();
   };
   timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
   loop.run_for(5s);  // Bound only; exits once the reporter has been held.
   hold = false;
+  hold.notify_all();
 
   ASSERT_TRUE(held) << reporter.error();
   ASSERT_TRUE(at_hold) << "the loop never ticked with the reporter held";
@@ -1216,7 +1230,10 @@ TEST_F(Registry, ReporterPublishesARunningLoopWithoutTouchingItsManifest) {
     EXPECT_EQ(nodes.front().session_id, 42u);
     EXPECT_TRUE(nodes.front().sources.empty());
     const auto first_beat = nodes.front().heartbeat_monotonic_ns;
-    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    // The construction heartbeat beats every 10 ms on the reporter's own
+    // thread and signals nothing, so the row is polled; the deadline only
+    // bounds a hang (docs/TESTING.md §6.3).
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
     while (reader.nodes().front().heartbeat_monotonic_ns == first_beat &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(2ms);

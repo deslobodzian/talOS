@@ -33,8 +33,8 @@ talOS/events/realtime_event_loop_test.cc clock 4 integration: the realtime loop 
 talOS/events/realtime_event_loop_test.cc sleep 4 integration: the sleeps are the subject: a handler that takes 10 ms or overruns 22 ms, setup before run(), and a publisher's seeded jitter
 talOS/hardware/gateway_endpoint_test.cc clock 2 integration: Endpoint on a real UDP socket; Eventually polls until a 10 s deadline that only bounds a hang (TESTING.md §6.3)
 talOS/hardware/gateway_endpoint_test.cc sleep 1 integration: Endpoint on a real UDP socket; Eventually polls 1 ms apart
-talOS/introspection/registry_test.cc clock 5 seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
-talOS/introspection/registry_test.cc sleep 5 seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
+talOS/introspection/registry_test.cc clock 5 integration: the reporter's real threads; counts refresh wakeups over a real window (REQ-RT-21), times stop() against a 30 s refresh, and a 10 s deadline bounds the construction-heartbeat wait
+talOS/introspection/registry_test.cc sleep 1 integration: the construction heartbeat beats every 10 ms on the reporter's own thread and signals nothing; its row is polled 2 ms apart
 talOS/launcher/continuity_test.cc sleep 3 integration: spawned processes; polls a restarted node's log and its writer claim (no notification exists), ended by the session ending, and spaces the test's ten publications 20 ms
 talOS/launcher/launcher_death_test.cc clock 6 integration: deadlines of waits on a spawned launcher's processes, and the measured kill latency
 talOS/launcher/launcher_test.cc clock 22 integration: spawned processes; elapsed bounds show a probe deadline or a stop fired far inside the wait it cuts short, and deadlines bound polls of files the children write
