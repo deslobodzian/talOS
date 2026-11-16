@@ -571,8 +571,8 @@ inline std::optional<std::string> HardwareWriterProblem(
 // ParseAlertField's grammar). Warnings are normal during development or in a
 // partial launch (an unread topic, an owner not in this session, a policy
 // lane nobody writes yet, an alert outside a `status` topic, a node that
-// writes its hardware request but reads no target lane, a node whose
-// hardware request is marked untargeted_outputs). Required coverage
+// writes its hardware request but reads no target lane of its own, a node
+// whose hardware request is marked untargeted_outputs). Required coverage
 // additionally rejects a target-consuming subsystem with no producer for a
 // nonempty mode policy, and makes untargeted_outputs an error. Timers are
 // skipped: their names are labels, not topics.
@@ -832,9 +832,12 @@ inline std::vector<Diagnostic> LintGraph(
           node.name, std::move(message));
       continue;
     }
+    // Its own lanes only: a node's Target reads no other subsystem's.
     const bool reads_a_lane = std::any_of(
-        node.sources.begin(), node.sources.end(), [](const SourceShape& s) {
-          return IsReader(s.kind) && !s.observer() && IsTargetLane(s.name);
+        node.sources.begin(), node.sources.end(),
+        [&node](const SourceShape& s) {
+          return IsReader(s.kind) && !s.observer() && IsTargetLane(s.name) &&
+                 detail::Segments(s.name)[0] == node.name;
         });
     if (!reads_a_lane)
       add(Severity::WARNING, node.name,
