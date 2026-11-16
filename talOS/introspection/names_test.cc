@@ -280,7 +280,7 @@ TEST(LintGraph, ACorrectGraphProducesNoFindings) {
 // an error naming the topic and the limit. Nine is the first count the
 // eight-slot table refused; 32 is about twice the Driver Station readers of
 // a robot with six mechanisms.
-// REQ-CONTRACT-36
+// REQ-CONTRACT-36, REQ-CONTRACT-09
 TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
   // Written out, not MAX_READERS, so that a smaller table fails here.
   constexpr std::size_t kRequiredReaders = 32;
@@ -311,6 +311,7 @@ TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
 
 // The defect this protocol exists to catch: both ends present, both valid
 // names, different strings, so the reader is waiting on a topic nobody writes.
+// REQ-CONTRACT-09
 TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
@@ -334,6 +335,7 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
 // one error on that topic. The bridge is its roster slot, not its name: a
 // replacement bridge binary may call itself anything, and a node calling
 // itself hardware_node gains nothing.
+// REQ-CONTRACT-09
 TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
   struct Case {
     const char* writer;
@@ -416,6 +418,7 @@ TEST(LintGraph, OwnerRolesFlowTheRightWay) {
 
 // A lane whose source no mode of the subsystem's policy lists is never read:
 // a dead producer, refused before launch.
+// REQ-CONTRACT-09
 TEST(LintGraph, ALaneOutsideTheTargetPolicyIsAnError) {
   const std::vector<NodeShape> nodes = {
       {"aligner",
@@ -440,6 +443,7 @@ TEST(LintGraph, ALaneOutsideTheTargetPolicyIsAnError) {
 // Required coverage: each nonempty mode of a target-consuming subsystem's
 // policy needs a writer on at least one of its lanes, judged per mode rather
 // than over the union. Without it the gap is only a per-lane warning.
+// REQ-CONTRACT-09
 TEST(LintGraph, RequiredTargetCoverageIsCheckedPerMode) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
@@ -596,6 +600,7 @@ SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
 // (a registry snapshot), else by schema name and hash (a field can change type
 // without changing size), and on the ring layout the segment is created with.
 // A disagreement is exactly one error on the topic, naming both nodes.
+// REQ-CONTRACT-09
 TEST(LintGraph, BothEndsMustAgreeOnTypeAndRingLayout) {
   struct Case {
     std::uint32_t bytes;

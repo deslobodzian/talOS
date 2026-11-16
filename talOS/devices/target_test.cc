@@ -394,6 +394,7 @@ TEST_F(TargetTest, FlapBetweenPublishedSamplesRejectsTheOldGeneration) {
 // where boot A's were high. A lane stamped under A's generation never drives
 // after the consumer has taken B's packets, not even after a delayed A packet
 // arrives, and B's own generation drives only while B is enabled and fresh.
+// REQ-SAFE-11
 TEST_F(TargetTest, RebootedGatewayRetiresTheOldBootsGeneration) {
   hw.stop_driver_station();
   ds::ModeTracker boot_a, boot_b;
@@ -790,6 +791,7 @@ struct BlindProducer {
   TargetLane<Goal> lane;
 };
 
+// REQ-SAFE-12: a producer that never saw a mode stamps 0
 TEST(TargetLane, AProducerThatSeesNoDriverStationNeverDrives) {
   auto sim = Sim::FromToml(kRemapToml);
   sim.add<BlindProducer>("blind_producer");

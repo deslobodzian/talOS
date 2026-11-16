@@ -585,6 +585,7 @@ TEST(LogCorruption, FalseMagicInsideAPayloadIsNotARecord) {
   ::unlink(path.c_str());
 }
 
+// REQ-CONTRACT-20
 TEST(LogTruncation, IncompleteTrailingRecordIsNotAnError) {
   const std::string path = TempPath("truncated");
   const std::vector<ExpectedRecord> expected =
@@ -611,6 +612,7 @@ TEST(LogTruncation, IncompleteTrailingRecordIsNotAnError) {
 // A damaged file header, manifest entry or schema block (the schema bytes
 // are covered by the manifest checksum, so a flipped name byte cannot decode
 // the log as the wrong type) is refused before any record is read.
+// REQ-CONTRACT-20
 TEST(LogCorruption, DamagedHeaderOrManifestThrowsOnOpen) {
   const std::string path = TempPath("header_corrupt");
   const std::size_t magic = 0;

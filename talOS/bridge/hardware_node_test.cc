@@ -110,6 +110,7 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
 // Commissioning is forced by --sim alone, the flag every node also reads
 // (HardwareLink). A loopback bridge without --sim keeps the config's own id,
 // as nodes launched without --sim do, or they would drop every State.
+// REQ-SAFE-20
 TEST(HardwareNodeTest, OnlySimulationForcesCommissioning) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   EXPECT_THROW((HardwareNode{cfg, "10.56.87.2", 5802, 5803, true}),
@@ -390,6 +391,7 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
 // /hw/status names the build of the gateway boot the bridge accepted, and a
 // new boot's build replaces it: after a RoboRIO rollback the record shows the
 // build that drove the robot, not the first one the bridge heard.
+// REQ-CONTRACT-30
 TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -1085,6 +1087,7 @@ TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
   }
 }
 
+// REQ-CONTRACT-04
 TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
   auto cfg = config::ParseRobotConfigString(kTestToml);
   Link link;
