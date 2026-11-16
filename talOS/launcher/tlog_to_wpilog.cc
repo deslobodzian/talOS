@@ -806,7 +806,9 @@ using Publication = std::tuple<std::size_t, std::uint64_t, std::int64_t>;
 
 // A record that becomes values or a dropped count, kept past the merge: its
 // log (process and manifest, shared, not copied), source, kind, dropped
-// count, and its payload only when it carries values.
+// count, and its payload only when it carries values. A GAP record is two
+// items of no source, its gap's start (`gap_step` +1) and its resumed time
+// (-1), stamped with those times rather than a publication's.
 struct Item {
   std::int64_t time_ns;
   std::shared_ptr<const MergedLog> log;
@@ -815,6 +817,7 @@ struct Item {
   std::uint32_t aux;
   bool values;
   std::vector<std::byte> payload;
+  int gap_step;
 };
 
 // The records that become values or dropped counts, in publish-time order.
@@ -864,13 +867,32 @@ bool SelectItems(const std::vector<std::string>& files,
                                          r.header.kind,
                                          r.header.aux,
                                          values,
-                                         {}});
+                                         {},
+                                         0});
     if (values) item.payload.assign(r.payload.begin(), r.payload.end());
   };
   if (!talos::launcher::MergeLogs(
           files,
           [&](const MergedRecord& r) {
             ++records;
+            if (const auto gap = talos::event::log::GapOf(r.header, r.payload);
+                gap.has_value()) {
+              // A damaged record's resumed time before its start still
+              // closes the gap after opening it.
+              const std::int64_t resumed =
+                  std::max(gap->start_ns, gap->resumed_ns);
+              items.push_back(Item{gap->start_ns,
+                                   r.log,
+                                   nullptr,
+                                   r.header.kind,
+                                   0,
+                                   false,
+                                   {},
+                                   +1});
+              items.push_back(Item{
+                  resumed, r.log, nullptr, r.header.kind, 0, false, {}, -1});
+              return true;
+            }
             if (r.source == nullptr) return true;
             if (is(r, EventKind::SEND)) {
               if (r.header.aux == kSendOk && taken.insert(key(r)).second) {
@@ -887,7 +909,8 @@ bool SelectItems(const std::vector<std::string>& files,
           error, talos::launcher::MergeWarnings::kQuiet)) {
     return false;
   }
-  // MergeLogs orders by event time; a WPILOG is stamped by publication.
+  // MergeLogs orders by event time; a WPILOG is stamped by publication. A
+  // stable sort keeps each gap's resumed item after its start item.
   std::stable_sort(
       items.begin(), items.end(),
       [](const Item& a, const Item& b) { return a.time_ns < b.time_ns; });
@@ -926,6 +949,12 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
       Metadata("geometry.Pose2d", {}, "[x_m, y_m, yaw_rad]");
   const std::string dropped_metadata =
       Metadata({}, {}, "messages this node's subscription lapped");
+  const std::string gap_metadata =
+      Metadata({}, {}, "true while this node's event log lost records");
+  // Each process's gaps open at this instant: a gap may start before the
+  // previous one resumed (a late dispatch resumed capture), and the entry
+  // stays true until the last of them resumes.
+  std::map<std::string, int, std::less<>> gaps_open;
   const auto write = [&](const std::string& name, std::string_view owner,
                          std::string_view suffix, const std::string& type,
                          const std::string& metadata, std::uint64_t time_us) {
@@ -959,6 +988,18 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
   for (const Item& item : items) {
     const std::uint64_t time_us = Micros(item.time_ns, start_ns);
     const std::string& process = item.log->process_name;
+    if (item.gap_step != 0) {
+      int& open = gaps_open[process];
+      const bool was_open = open > 0;
+      open += item.gap_step;
+      if ((open > 0) == was_open) continue;
+      payload.clear();
+      talos::wpilog::AppendBoolean(payload, open > 0);
+      const std::string suffix = "gap/" + process;
+      write(Join(kCounterOwner, suffix), kCounterOwner, suffix, "boolean",
+            gap_metadata, time_us);
+      continue;
+    }
     const std::string& topic = item.source->name;
     if (item.kind == static_cast<std::uint16_t>(EventKind::MESSAGE) &&
         item.aux > 0) {

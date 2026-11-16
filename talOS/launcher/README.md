@@ -1780,6 +1780,7 @@ Mapping:
 | a target lane (`TargetEnvelope<M>`) | `<topic>/mode_since_us`, `<topic>/active`, `<topic>/message/<field>` | `int64`, `boolean`, as above |
 | a `geometry.Pose2d` (talOS/msgs), as well as its three fields | `<topic>/<path to it>`, or `<topic>/pose` when the Pose2d is the whole message | `double[]` `[x_m, y_m, yaw_rad]`, AdvantageScope's legacy number-array pose |
 | a reader's dropped count (`aux` of a MESSAGE record) | `/talos_log/dropped/<node><topic>`, cumulative | `int64` |
+| a log gap (a GAP record: records the event-log writer dropped) | `/talos_log/gap/<process>`, below | `boolean` |
 | a hardware packet (`/hw/state`, `/hw/state/driver_station`, `/hw/request/<node>`, `/hw/command`) | `<topic>/<field>`, below | `boolean`, `int64`, `double`, `string`, arrays |
 
 Field names keep their unit suffix (`position_m`), and each entry's metadata
@@ -1869,6 +1870,18 @@ Which records, and when:
   (`FileHeader::start_monotonic_ns`) of the input. A dropped count is
   stamped with the publish time of the message after the gap. Wall-clock
   time is not used.
+- Each GAP record ([log format](../events/README.md#log-format)) sets its
+  process's `/talos_log/gap/<process>` true at the gap's start (the
+  earliest time a dropped record names) and false when capture resumed (the
+  GAP record's `now`). A gap still open when its writer stopped is closed by
+  the stop, and its GAP record's `now` is the stop's (the run's EXIT
+  record's, else the last dropped record's), so the entry goes false there.
+  The entry stays true while any gap of its process is open, since a gap can
+  start before the previous one resumed (a late dispatch resumed capture),
+  and a process with no gap has no entry. A publication the gap lost is
+  written only when another log holds it (a reader's copy, above, or its
+  writer's `SEND`); each log with gaps is named once on stderr
+  (`warning: log gap in <path>: ...`, as `log_dump` prints it).
 - Timer, exit, scheduling and READ records carry no message and are skipped. Byte
   topics (`talos.Bytes`, such as `/talos/telemetry`) and any topic whose
   schema cannot be read are skipped, each named once on stderr.
