@@ -712,8 +712,7 @@ Next:
   Add a mechanism, then write its node (docs/FIRST_MECHANISM.md):
     bazel run @talos//tools:new_subsystem -- <name> --lang cpp|py
   Studio: its pages are built in the talOS checkout, once and after each talOS
-  update; until then / and /drive answer 503 with the build command (it reads
-  `cd talos`; here the checkout is {talos}):
+  update; until then / and /drive answer 503 with the build command:
     (cd {talos} && bazel build //studio:web_dist)
     bazel run //:sim -- --start-studio-bridge   # http://localhost:5800, /drive
   Nothing is under version control yet: `git init` when you want it
