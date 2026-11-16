@@ -144,6 +144,17 @@ Bazel, whose `TEST_TMPDIR` holds them and is removed with the test.
 Outside a namespace the ordinary names, one set per host that tools and
 hand-run nodes share, are left in place.
 
+The session owns, creates and unlinks only the topics its probes declared
+(`DescribeGraph`). A run that opens an undeclared topic (a member whose live
+endpoints differ from its probe, or one with no description under
+`--allow-graph-errors`) creates that segment itself, as a node run without
+the launcher does ([ARCHITECTURE.md](../../ARCHITECTURE.md#topics-and-messages)):
+its last queue to close unlinks it, but a run killed while it is the last
+holder (the SIGKILL of a [live endpoint](#live-endpoints) mismatch, a stall,
+the stop timeout) leaves it in shared memory until the next queue to open
+that name reuses it, someone unlinks it, or the host restarts; neither the
+session's end nor a namespace's cleanup removes it.
+
 Locking an existing lock file allocates nothing on disk; creating an absent
 one does. macOS empties `/tmp` at boot and keeps it on the same container as
 a log root on the internal disk, so on a full disk the first launch after a
@@ -813,7 +824,7 @@ hold and touches no disk. The times it sleeps until:
 | `--duration-s`'s end, until the stop is sent | the stop |
 | the stop timeout (2 s after the stop), until its SIGKILLs are sent | `stop_timeout` |
 | half of `WATCHDOG_USEC`, when systemd sets it | `WATCHDOG=1` |
-| the hourly refresh of the session lock and of the session directory's `session.lock` | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
+| the hourly refresh of the session lock and of the session directory's `session.lock` and quiet files | [one session per namespace](#one-session-per-namespace), [retention](#session-segments-and-logs) |
 
 Everything else a pass does follows an event or another pass: reaping exits
 (with one more read of the run's row for its final delivery counts),
@@ -1220,9 +1231,19 @@ so no launch writes into a directory being removed. A
 `.talos-removing-<session_id>` directory a removal cut short goes at the
 next launch's retention. The supervision loop touches its `session.lock`
 hourly, with the session lock (one `futimens` on the held descriptor, which
-writes and syncs nothing itself), so a cleaner of `/tmp` files unused for
-days (macOS's after 3, systemd-tmpfiles' after 10) never deletes it under a
-long session in the default `/tmp/talos_logs`. If the path stops naming the
+writes and syncs nothing itself), and with it the session's files a launch
+writes once and may leave for days (`manifest.json` in a quiet session,
+`graph.json`, `declared_graph.json`, `retention.txt`, named by
+`kSessionQuietFiles`; one `utimensat` each, never creating an absent one),
+so a cleaner of `/tmp` files unused for
+days (macOS's after 3, systemd-tmpfiles' after 10) never deletes them under a
+long session in the default `/tmp/talos_logs`. A member's `<name>.log`, a
+finished run's event log and `talos.log` are not touched: a cleaner can still
+delete one that has been quiet that long. The touches, and the `fstat` and
+`lstat` that check the lock file, run one after another on the supervision
+thread; on a network log root each is a call to the server, which a dead
+server blocks for as long as the mount retries it (without end on a hard
+mount), and with it supervision and the watchdog's ping. If the path stops naming the
 locked file (removed by hand, or by a cleaner before a refresh), retention
 could take the directory from then on; the next refresh locks the file the
 path names (creating it, never the directory) and says so once on stderr. That adds
@@ -1247,12 +1268,20 @@ RPC retries, and with it supervision and the service watchdog's ping, so the
 log root should be on a local disk. Whether a log root takes no locks is
 decided once by retention, and once by the session directory's creation,
 by a shared lock of the root's `.talos-lock-probe` file, never by one
-failing call: on a root whose probe locked, a session whose `session.lock`
+failing call. A lock daemon already down at that probe therefore makes a
+root whose locks work read as one that takes none for that whole retention
+(`LogRootTakesNoLocks`): while the daemon stays down, a running session's
+`session.lock` fails the same way, reads as unheld, and that retention may
+remove the session. On a root whose probe locked, a session whose `session.lock`
 cannot be locked for such a reason (an NFS lock daemon that stops
 answering) is passed over, with a warning, and a launch whose own lock
 fails so tries again rather than running without it: up to 100 attempts
 1 ms apart (about 0.1 s), after which the launch is refused (`cannot create
-the session directory ...; nothing was started`, exit 1).
+the session directory ...; nothing was started`, exit 1). NFSv4 is reported
+to refuse an exclusive `flock` on a descriptor opened read-only, so every
+exclusive lock of a `session.lock` is taken on a read-write one (the shared
+locks, `Held` and the root's probe, stay read-only); whether NFSv4 does so
+is unverified, since no NFS root has been tested.
 
 The newest 16
 sessions (`kProtectedMatches`, `session_retention.h`) that ran a match or
