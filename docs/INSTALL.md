@@ -25,7 +25,7 @@ by `.bazelversion` (8.6.0) and fetched by bazelisk.
 | bazelisk (as `bazel`) | runs pinned Bazel 8.6.0 | release binary (sha256-verified) → `/usr/local/bin/bazel` | `brew install bazelisk` | in WSL |
 | C++23 compiler | talOS (`std::format`, `std::jthread`) | setup checks GCC ≥ 13 | Xcode CLT | in WSL |
 | git, curl, unzip, zip, build-essential | Bazel fetches, builds | apt/dnf/pacman | Xcode CLT / brew | in WSL |
-| system `python3` | rules_python bootstrap, `tools/test_drivetrain.py`, clang-tidy script | package | Xcode CLT / brew | in WSL |
+| system `python3` | rules_python bootstrap, `tools/test_rio_in_the_loop.py`, clang-tidy script | package | Xcode CLT / brew | in WSL |
 | JDK 17 | RoboRIO Gradle project, `./sim.sh` WPILib sim | package (OpenJDK) | `brew install --cask temurin@17` | in WSL |
 | Node 22 + pnpm 9.15.9 (corepack) | Studio dev loop outside Bazel | package | brew | in WSL |
 | `flatc` | none: `pnpm generate` runs Bazel's pinned `@flatbuffers//:flatc` (same as the `//studio:telemetry_ts` genrule) | – | – | run `pnpm generate` in WSL |

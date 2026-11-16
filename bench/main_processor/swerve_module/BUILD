@@ -1,3 +1,4 @@
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 load("//talOS/build:contract.bzl", "talos_cc_node", "talos_messages")
@@ -26,6 +27,23 @@ talos_cc_node(
     srcs = ["swerve_module.cc"],
     node_name = "swerve_module",
     deps = [":swerve_module"],
+)
+
+# Dev tool: publish a module target lane by hand (sim/bench only: it bypasses
+# the operator interface). tools/test_rio_in_the_loop.py drives the module
+# with it.
+cc_binary(
+    name = "send_target",
+    srcs = ["send_target.cc"],
+    deps = [
+        ":messages",
+        "//talOS/devices",
+        "//talOS/driver_station",
+        "//talOS/events:events_os",
+        "//talOS/hardware",
+        "//talOS/introspection:names",
+        "//talOS/ipc",
+    ],
 )
 
 cc_test(

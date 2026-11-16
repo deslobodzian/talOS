@@ -144,51 +144,6 @@ transport contracts.
 
 ## Run the Simulation
 
-Build and run the automated loopback-only integration test:
-
-```sh
-bazel build //2026-robot/main_processor/drivetrain:all \
-  //talOS/simulation:sim_gateway //talOS/bridge:hardware_node
-python3 tools/test_drivetrain.py
-```
-
-It starts four processes, drives the ideal simulated wheels, verifies a stop
-after communication ends, and replays the recorded drivetrain log. It reports
-the directory containing the log and process output. Ports 5802/5803 must be
-unused, and no other process should publish these local topics.
-
-### Against the real RoboRIO program
-
-`sim_gateway` is a stand-in for the RoboRIO end of the UDP link. To drive the
-actual robot program instead, under WPILib simulation:
-
-```sh
-python3 tools/test_drivetrain.py --wpilib
-```
-
-This swaps `sim_gateway` for `./gradlew simulateNative` in `controller_processor/rio/` and
-makes the same assertions, because both run the same
-`talos::hardware::Gateway`. The harness also runs two more WPILib scenarios:
-with the Driver Station never enabled, the drivetrain must not move at all;
-and with it enabled and the wheels driven, a relay standing in for the main
-processor's socket cuts the link at once (the main-processor processes then
-stop cleanly; nothing they send past the cut reaches the RoboRIO), and the RoboRIO program alone
-must neutralize every output on its first tick at or past the last command's
-expiry, which the harness reads from the RoboRIO's own States at the relay.
-It runs Gradle `--offline`, so the first run needs one online
-`./gradlew simulateNative` beforehand. CI's
-`rio-in-the-loop` job runs it on Linux with `--output-dir`, which puts each
-scenario's log directory under a directory it keeps when the run fails.
-Both modes fail a run during which the host slept (more than 50 ms of
-sleep), since a frozen host reads as a stalled robot; on macOS the harness
-holds `caffeinate -s` for the run, which also holds off a headless Mac's
-DarkWake maintenance sleep. `--wpilib` also fails when the RoboRIO loop's
-watchdog reports a stall or its timing report shows more than 250 ms between
-ticks, naming whether the tick overran or only started late.
-The standalone gateway also supports disabled operation through
-`--mode-schedule`; see [simulation](../simulation/README.md).
-
-
 ### Interactive
 
 Start each command in a separate terminal:

@@ -541,14 +541,15 @@ jobs:
     name: RoboRIO program in the loop (WPILib sim)
     # The deployed RoboRIO program (Robot.cpp: its Driver Station loop,
     # gateway and Phoenix 6 backend) run as a desktop simulation against the
-    # Bazel-built bridge and drivetrain node: tools/test_drivetrain.py
-    # --wpilib drives, checks the robot ends neutral after the target, node,
-    # bridge and Driver Station have stopped in turn, replays the node's log,
-    # checks a never-enabled robot does not move, and, with the Driver Station
-    # still enabled, cuts the main processor off mid-drive and checks
-    # from the RoboRIO program's own States that it neutralizes every output
-    # on its first tick at or past the command's expiry. -Pheadless (set by
-    # the script) loads no simulation GUI, so no display is needed.
+    # Bazel-built bridge and the bench's swerve module node:
+    # tools/test_rio_in_the_loop.py --wpilib drives, checks the robot ends
+    # neutral after the target, node, bridge and Driver Station have stopped
+    # in turn, replays the node's log, checks a never-enabled robot does not
+    # move, and, with the Driver Station still enabled, cuts the main
+    # processor off mid-drive and checks from the RoboRIO program's own
+    # States that it neutralizes every output on its first tick at or past
+    # the command's expiry. -Pheadless (set by the script) loads no
+    # simulation GUI, so no display is needed.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -575,7 +576,7 @@ jobs:
     - name: Build the main-processor side
       run: >-
         bazel build --noshow_progress
-        //2026-robot/main_processor/drivetrain:all
+        //bench/main_processor/swerve_module:all
         //talOS/bridge:hardware_node
 
     - name: Install RoboRIO toolchain
@@ -606,9 +607,9 @@ jobs:
         TALOS_SIM_RUN_MS: '2000'
       run: timeout 900 ./gradlew -Pheadless simulateNative
 
-    - name: Drivetrain against the RoboRIO program
+    - name: Swerve module against the RoboRIO program
       timeout-minutes: 10
-      run: python3 tools/test_drivetrain.py --wpilib --output-dir "$RUNNER_TEMP/rio-in-the-loop"
+      run: python3 tools/test_rio_in_the_loop.py --wpilib --output-dir "$RUNNER_TEMP/rio-in-the-loop"
 
     - name: Keep the failed run's logs
       if: ${{ failure() }}

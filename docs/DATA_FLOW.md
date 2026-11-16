@@ -183,7 +183,7 @@ current, supply current and device temperature use signed little-endian int16
 in 0.1 A / 0.1 °C units, rounded to nearest (ties away from zero), saturated
 to [-3276.8, 3276.7]; nonfinite inputs fail encoding.
 Two Python tests decode these layouts inline and change with them:
-`tools/test_drivetrain.py` (frame header, State, Command) and
+`tools/test_rio_in_the_loop.py` (frame header, State, Command) and
 `talOS/simulation/sim_gateway_test.py` (State counts and digital inputs, the
 Driver Station payload).
 

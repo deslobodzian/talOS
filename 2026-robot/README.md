@@ -158,7 +158,6 @@ From the repository root:
 ./sim.sh --headless --no-studio --mode-schedule teleop:30,disabled:5 \
   --joystick-schedule '0:axes=0,0,0;buttons=0;pov=-1|3:axes=0,-0.5,0;buttons=0;pov=-1'
                                      # ... and a scripted joystick 0
-python3 tools/test_drivetrain.py     # drivetrain smoke test with log replay
 ```
 
 With the WPILib simulation, its GUI is the Driver Station: enable Teleoperated.
