@@ -9,6 +9,9 @@ the session finds exactly those, stops the launch with no wait for SIGINT
 or SIGTERM to work, and then finds no process of the session. Killing only
 the launch's own process (what `subprocess.run(timeout=...)` does) leaves
 both children running.
+
+RunningInSessionTest is a unit test of the /proc stat reading that listing
+uses.
 """
 
 import os
@@ -100,6 +103,39 @@ class SimCheckHangTest(unittest.TestCase):
                     raise RuntimeError("the wait broke")
         self.assertEqual(sim_check.session_processes(launch.sid), set(),
                          f"left running of {sorted(pids)}")
+
+
+def stat_line(state, sid, comm=b"python3"):
+    """A /proc/<pid>/stat line of pid 19 in session `sid` (proc_pid_stat(5):
+    pid (comm) state ppid pgrp session tty_nr ...)."""
+    return (b"19 (" + comm + b") " + state + b" 1 18 " + str(sid).encode() +
+            b" 0 -1 4194560 120 0 0 0 0 0 20 0 1 0 1234 0 0\n")
+
+
+class RunningInSessionTest(unittest.TestCase):
+    # REQ-DEV-30: a process the reaper has taken but the kernel has not yet
+    # removed reads `X` (EXIT_DEAD); counting it left a reaped orphan
+    # "left running" in the sandbox's pid namespace.
+    def test_an_exited_process_is_not_running(self):
+        for state in (b"Z", b"X"):
+            with self.subTest(state=state):
+                self.assertFalse(
+                    sim_check.running_in_session(stat_line(state, 18), 18))
+
+    # REQ-DEV-30
+    def test_a_live_process_of_the_session_is_running(self):
+        for state in (b"R", b"S", b"D", b"T", b"t", b"I"):
+            with self.subTest(state=state):
+                self.assertTrue(
+                    sim_check.running_in_session(stat_line(state, 18), 18))
+        self.assertFalse(
+            sim_check.running_in_session(stat_line(b"R", 17), 18))
+
+    # REQ-DEV-30: comm is the executable's name, which may hold anything.
+    def test_a_comm_with_spaces_and_parentheses_parses(self):
+        stat = stat_line(b"S", 18, comm=b"a) b (c) 7 8 9")
+        self.assertTrue(sim_check.running_in_session(stat, 18))
+        self.assertFalse(sim_check.running_in_session(stat, 9))
 
 
 if __name__ == "__main__":
