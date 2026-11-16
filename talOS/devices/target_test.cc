@@ -859,6 +859,10 @@ struct Operator {
   void update() {
     if (!ds.connected()) saw_stale = true;
     const bool held = ds.joystick(0).button(1);
+    if (disarm_next) {
+      arming.disarm();
+      disarm_next = false;
+    }
     if (!paused) arming.evaluate(/*neutral=*/!held);
     if (held) {
       lane.send(Goal{0.5});
@@ -871,6 +875,7 @@ struct Operator {
   TargetLane<Goal> lane;
   bool paused = false;
   bool saw_stale = false;
+  bool disarm_next = false;  // disarm() on the next update(), then evaluate
 };
 
 // The Operator above driving the lift, its button held or not.
@@ -977,6 +982,19 @@ TEST_F(OperatorArmingTest,
   Packet(kTeleop, true);
   sim.step(20ms);
   ASSERT_FALSE(op.saw_stale);
+  ASSERT_EQ(DriverStationGeneration(sim), generation);
+  ExpectReleasedUntilNeutralThenDriving();
+}
+
+// REQ-SAFE-13: disarm(), the producer's own reason (a joystick reconnecting),
+// holds the lane released with nothing else changed: same mode, generation,
+// boot and a fresh Driver Station, the button still held.
+TEST_F(OperatorArmingTest, InputHeldThroughADisarmWaitsForNeutral) {
+  ASSERT_NO_FATAL_FAILURE(ArmAndHold());
+  const std::uint64_t generation = DriverStationGeneration(sim);
+  op.disarm_next = true;
+  sim.step(20ms);
+  ASSERT_FALSE(op.disarm_next);
   ASSERT_EQ(DriverStationGeneration(sim), generation);
   ExpectReleasedUntilNeutralThenDriving();
 }
