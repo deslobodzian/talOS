@@ -438,19 +438,16 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     cfg.Audio.BeepOnConfig = false;
     cfg.Voltage.PeakForwardVoltage = units::volt_t{m.max_voltage};
     cfg.Voltage.PeakReverseVoltage = units::volt_t{-m.max_voltage};
-    // TorqueCurrentFOC's peak, both ways: max_torque_current_a, or for a
-    // follower, which copies its master's torque output and may not set the
-    // key, its master's; 0 A on a motor without the mode, so a torque
-    // request produces nothing there. The stator limit above applies in
+    // TorqueCurrentFOC's peak, both ways: max_torque_current_a, 0 A on a
+    // motor without the mode, so a torque request produces nothing there.
+    // Validate refuses the key on a follower and on a motor with one, so no
+    // Follower copies a torque output. The stator limit above applies in
     // addition, the supply limit in every mode; TorqueNeutralDeadband keeps
     // Phoenix's 0 A.
-    double torque_peak_a = m.max_torque_current_a;
-    for (const auto& master : c.motors)
-      if (m.master_id != 0 && master.id == m.master_id)
-        torque_peak_a = master.max_torque_current_a;
-    cfg.TorqueCurrent.PeakForwardTorqueCurrent = units::ampere_t{torque_peak_a};
+    cfg.TorqueCurrent.PeakForwardTorqueCurrent =
+        units::ampere_t{m.max_torque_current_a};
     cfg.TorqueCurrent.PeakReverseTorqueCurrent =
-        units::ampere_t{-torque_peak_a};
+        units::ampere_t{-m.max_torque_current_a};
     cfg.Feedback.RotorToSensorRatio = m.rotor_to_sensor_ratio;
     cfg.Feedback.SensorToMechanismRatio = m.sensor_to_mechanism_ratio;
     if (m.feedback == hw::Feedback::kRemoteCANcoder) {
@@ -511,21 +508,6 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetDeviceTemp(false));
     signals_.push_back(&motor->GetSupplyCurrent(false));
     for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
-    // Phoenix's Follower contract (controls/Follower.hpp): "The leader must
-    // ensure the status signal corresponding to its control output type
-    // (DutyCycle, MotorVoltage, TorqueCurrent) is enabled ... no slower than
-    // 20 Hz." So a master that may run TorqueCurrentFOC and has a follower
-    // asks for TorqueCurrent at status_hz, which OptimizeBusUtilization then
-    // keeps. In SDK 26.3 it shares a frame the motion feedback already holds
-    // at status_hz, so no simulation test can tell; asked for, it does not
-    // depend on that layout.
-    if (m.max_torque_current_a > 0 &&
-        std::any_of(c.motors.begin(), c.motors.end(), [&m](const auto& other) {
-          return other.master_id == m.id;
-        })) {
-      signals_.push_back(&motor->GetTorqueCurrent(false));
-      signal_ids_.push_back(m.id);
-    }
     motors_.push_back(std::move(motor));
   }
   // FOC needs a Phoenix Pro licence, and so does a follower of a foc master,

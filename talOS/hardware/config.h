@@ -88,8 +88,9 @@ struct MotorConfig {
   bool foc{false};
   // [motors.*] max_torque_current_a: the largest stator current a
   // torque-current demand may ask for, amperes; 0 (the default) refuses the
-  // mode. Needs foc, at most stator_limit_a, refused on a follower. On the
-  // config wire and in ConfigurationId.
+  // mode. Needs foc, at most stator_limit_a, refused on a follower and on a
+  // motor with one (the mode drives a single motor). On the config wire and
+  // in ConfigurationId.
   double max_torque_current_a{0};
   // Main processor only (talOS/devices), not sent to the controller and not
   // part of ConfigurationId: [motors.*] position_frame = "absolute" (true)

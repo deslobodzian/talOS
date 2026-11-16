@@ -119,10 +119,12 @@ void Validate(const Config& c) {
     Require(Positive(m.supply_limit_a) && Positive(m.stator_limit_a) &&
                 Positive(m.max_voltage) && m.max_voltage <= 12,
             "invalid motor limits");
-    // TorqueCurrentFOC is a Phoenix Pro request and a follower copies its
-    // master's output, so the limit needs foc and is refused on a follower;
-    // the TalonFX applies stator_limit_a in torque mode too.
-    const auto torque_limit = [&m](bool ok, const char* why) {
+    // TorqueCurrentFOC is a Phoenix Pro request, so the limit needs foc; the
+    // TalonFX applies stator_limit_a in torque mode too. The mode drives a
+    // single motor: a Follower copies its master's torque current but not
+    // its MaxAbsDutyCycle, so max_voltage would not hold a pair. The limit
+    // is therefore refused on a follower and on a motor that has one.
+    const auto torque_limit = [&m](bool ok, const std::string& why) {
       if (!ok) {
         throw std::invalid_argument("max_torque_current_a for motor '" +
                                     m.name + "' " + why);
@@ -132,11 +134,21 @@ void Validate(const Config& c) {
         std::isfinite(m.max_torque_current_a) && m.max_torque_current_a >= 0,
         "must be a finite number of amperes, 0 or more");
     if (m.max_torque_current_a > 0) {
-      // One rule: the limit needs foc, which a follower may not set (above).
-      torque_limit(m.foc, m.master_id != 0
-                              ? "is set on a follower, which follows its "
-                                "master's output; set it on the master"
-                              : "needs foc = true (TorqueCurrentFOC)");
+      for (const auto& other : c.motors) {
+        if (m.master_id != 0 && other.id == m.master_id) {
+          torque_limit(false, "is set on a follower of motor '" + other.name +
+                                  "'; torque-current mode drives a single "
+                                  "motor");
+        }
+        if (other.master_id == m.id) {
+          torque_limit(false, "is set on a motor that motor '" + other.name +
+                                  "' follows; a follower copies its "
+                                  "master's torque current but not its duty "
+                                  "cap, so torque-current mode drives a "
+                                  "single motor");
+        }
+      }
+      torque_limit(m.foc, "needs foc = true (TorqueCurrentFOC)");
       torque_limit(m.max_torque_current_a <= m.stator_limit_a,
                    "exceeds stator_limit_a");
     }
