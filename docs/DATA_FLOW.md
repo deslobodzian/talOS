@@ -395,7 +395,8 @@ and send, separate from event/dispatch time. Exact replay preserves publication
 age; input replay injects with the recorded publication time, at that time,
 or, for a node the session ran, at the drain that received it. Neither crosses
 a GAP record: exact replay stops before the gap's first dropped dispatch,
-input replay before the earliest gap in a log it feeds from, and both exit 1
+input replay before the earliest gap or damaged stretch in a log it feeds
+from, and both exit 1
 ([events](../talOS/events/README.md#recording-and-replaying)).
 Readers accept versions 7 and 8 (a version-7 log is a version-8 log without a
 GAP record) and reject any other with the recorded and supported versions; the
@@ -430,9 +431,12 @@ is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
 `log_dump` and `--replay-inputs` read every segment in a
 session directory, and `log_dump` given one log's file
-reads that log's kept segments with it;
-exact `--replay` needs the first segment, since a later one starts
-mid-session. Rotation syncs each finished segment and the next one's header
+reads that log's kept segments with it; `--replay-inputs` refuses to feed a
+node from a log whose `<log>.capped` marker exists (or whose member the
+session manifest marks `log_capped`), since no GAP record
+marks what the cap cost it (its oldest segment, or the records after
+capture stopped). Exact `--replay` refuses a log whose first
+dispatch is not 1, since a later segment starts mid-session. Rotation syncs each finished segment and the next one's header
 before renaming it into place, and the cap marker before deleting the oldest,
 so a power loss leaves whole segments; a session reader skips (with a
 warning) a file cut before its header was complete. A cap below two segments

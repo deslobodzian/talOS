@@ -361,7 +361,8 @@ class LogStream {
 
 }  // namespace
 
-LogReader::LogReader(std::string_view path) : data_{read_whole_file(path)} {
+LogReader::LogReader(std::string_view path)
+    : path_{path}, data_{read_whole_file(path)} {
   constexpr std::size_t kVersionEnd = offsetof(FileHeader, header_bytes);
   if (data_.size() < kVersionEnd) {
     throw IncompleteLogHeader("LogReader: file too short for a header");

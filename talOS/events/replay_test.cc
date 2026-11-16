@@ -52,10 +52,11 @@ constexpr std::size_t WALL_CLOCK_BYTES = 8;
 // Drives a robot through a fixed script of inputs. Everything the handlers see
 // is injected here, so the run is reproducible by construction.
 std::vector<float> record_run(const std::string& path, float gain,
-                              Delivery delivery = Delivery::POLL) {
+                              Delivery delivery = Delivery::POLL,
+                              const log::LogWriterOptions& options = {}) {
   SimulationEnvironment environment;
-  SimulatedEventLoop<log::LogWriter> loop{environment,
-                                          log::LogWriter{path, "test_robot"}};
+  SimulatedEventLoop<log::LogWriter> loop{
+      environment, log::LogWriter{path, "test_robot", options}};
   loop.set_delivery(delivery);
 
   TestRobot<SimulatedEventLoop<log::LogWriter>> robot{loop, test_topics(),
@@ -234,7 +235,14 @@ TEST(Replay, RejectsALogFromADifferentProgram) {
   // One extra source: the log can no longer describe this program.
   loop.register_timer("extra", Thunk{});
 
-  EXPECT_THROW(loop.run(), ReplayError);
+  // Refused before the first dispatch, naming the log.
+  try {
+    loop.run();
+    ADD_FAILURE() << "replay ran a program its log does not describe";
+  } catch (const ReplayError& e) {
+    EXPECT_NE(std::string{e.what()}.find(path), std::string::npos) << e.what();
+  }
+  EXPECT_EQ(robot.efforts().size(), 0u);
 
   std::remove(path.c_str());
 }
@@ -517,45 +525,6 @@ TEST(Replay, DetectsAReadOfADifferentSource) {
   std::remove(path.c_str());
 }
 
-// A log that stops mid-record still replays everything it did capture. A robot
-// that lost power should not cost you the whole match.
-TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
-  const std::string path = temp_path("truncated");
-  const std::vector<float> recorded = record_run(path, 2.5F);
-
-  std::vector<char> bytes = read_file(path);
-  ASSERT_GT(bytes.size(), 200u);
-
-  const std::string truncated_path = temp_path("truncated_cut");
-  {
-    std::ofstream out{truncated_path, std::ios::binary};
-    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size() - 37));
-  }
-
-  log::LogReader reader{truncated_path};
-  ReplayEventLoop<> loop{reader};
-  TestRobot<ReplayEventLoop<>> robot{loop, test_topics(), 2.5F};
-  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
-                                       1ms);
-
-  loop.run();
-
-  EXPECT_FALSE(loop.diverged());
-  EXPECT_FALSE(loop.reached_exit());
-  EXPECT_TRUE(reader.truncated());
-
-  ASSERT_FALSE(robot.efforts().empty());
-  EXPECT_LE(robot.efforts().size(), recorded.size());
-
-  // Everything that did replay matches what was originally computed.
-  for (std::size_t i = 0; i < robot.efforts().size(); ++i) {
-    EXPECT_FLOAT_EQ(robot.efforts()[i], recorded[i]) << "at cycle " << i;
-  }
-
-  std::remove(path.c_str());
-  std::remove(truncated_path.c_str());
-}
-
 struct LogRecords {
   std::vector<log::RecordHeader> headers;
   std::vector<std::uint64_t> offsets;
@@ -699,6 +668,110 @@ TEST(Replay, StopsBeforeTheDispatchAGapStartsIn) {
   std::remove(original_path.c_str());
 }
 
+// A log that ends without its EXIT (a power loss cut it inside a record, or
+// its writer was killed) may end inside its last dispatch, as a gap may split
+// one: every dispatch before that one replays and matches the recorded run,
+// that dispatch's recorded part does not replay, and the replay names it,
+// with no divergence for the sends the cut lost.
+// REQ-OPS-13
+TEST(Replay, ALogCutInsideItsLastDispatchReplaysTheDispatchesBeforeIt) {
+  const std::string path = temp_path("truncated");
+  const std::string cut_path = temp_path("truncated_cut");
+  const std::vector<float> recorded = record_run(path, 2.5F);
+  const LogRecords original = read_records(path);
+  const auto is = [&](std::size_t i, EventKind kind) {
+    return original.headers[i].kind == static_cast<std::uint16_t>(kind);
+  };
+
+  // The last control send: the cut falls inside it, after its dispatch's
+  // TIMER record.
+  std::size_t send = original.headers.size() - 1;
+  while (send > 0 && !is(send, EventKind::SEND)) --send;
+  ASSERT_GT(send, 0u);
+  ASSERT_TRUE(is(send - 1, EventKind::TIMER));
+  const std::uint64_t dispatch = original.headers[send].dispatch_index;
+  ASSERT_EQ(original.headers[send - 1].dispatch_index, dispatch);
+  std::size_t controls_before = 0;
+  for (std::size_t i = 0; i + 1 < send; ++i) {
+    if (is(i, EventKind::TIMER)) ++controls_before;
+  }
+  ASSERT_GT(controls_before, 0u);
+  {
+    const std::vector<char> bytes = read_file(path);
+    std::ofstream out{cut_path, std::ios::binary};
+    out.write(bytes.data(),
+              static_cast<std::streamsize>(original.offsets[send] + 10));
+  }
+
+  log::LogReader reader{cut_path};
+  ReplayEventLoop<> loop{reader};
+  TestRobot<ReplayEventLoop<>> robot{loop, test_topics(), 2.5F};
+  robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
+                                       1ms);
+  loop.run();
+
+  EXPECT_TRUE(reader.truncated());
+  EXPECT_FALSE(loop.diverged());
+  EXPECT_FALSE(loop.reached_exit());
+  EXPECT_FALSE(loop.stopped_at_gap().has_value());
+  ASSERT_TRUE(loop.ended_in_dispatch().has_value());
+  EXPECT_EQ(loop.ended_in_dispatch().value(), dispatch);
+  EXPECT_EQ(robot.efforts(),
+            std::vector<float>(recorded.begin(),
+                               recorded.begin() + static_cast<std::ptrdiff_t>(
+                                                      controls_before)));
+
+  std::remove(path.c_str());
+  std::remove(cut_path.c_str());
+}
+
+// A later segment of a rotated log starts mid-run: replayed as a run, it
+// would hand the program inputs out of their context. Exact replay refuses it
+// before anything runs, naming the log and the dispatch it starts at.
+// REQ-OPS-13
+TEST(Replay, RefusesALogThatDoesNotStartAtItsFirstDispatch) {
+  const std::string path = temp_path("rotated");
+  // Room for a few dozen records in each of eight segments.
+  const std::uint64_t prefix = [&] {
+    const std::string whole = temp_path("rotated_whole");
+    record_run(whole, 2.5F);
+    const std::uint64_t first = read_records(whole).offsets.front();
+    std::remove(whole.c_str());
+    return first;
+  }();
+  record_run(path, 2.5F, Delivery::POLL,
+             log::LogWriterOptions{.background = false,
+                                   .max_bytes = 8 * (prefix + 2048)});
+  const std::vector<std::string> segments = log::LogSegmentFiles(path);
+  ASSERT_GE(segments.size(), 2u);
+  ASSERT_EQ(segments.back(), path);
+
+  std::uint64_t first_dispatch = 0;
+  for (const log::RecordHeader& header : read_records(path).headers) {
+    if (header.dispatch_index != 0) {
+      first_dispatch = header.dispatch_index;
+      break;
+    }
+  }
+  ASSERT_GT(first_dispatch, 1u);
+
+  log::LogReader reader{path};
+  try {
+    ReplayEventLoop<> loop{reader};
+    ADD_FAILURE() << "replay accepted a log starting at dispatch "
+                  << first_dispatch;
+  } catch (const ReplayError& e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find(path), std::string::npos) << what;
+    EXPECT_NE(what.find("dispatch " + std::to_string(first_dispatch)),
+              std::string::npos)
+        << what;
+  }
+
+  for (const std::string& segment : segments) std::remove(segment.c_str());
+  std::remove(log::CappedMarkerPath(path).c_str());
+}
+
 // Sends three commands from its constructor, outside any dispatch, as a
 // node announcing its initial state does, then ticks.
 template <typename Loop>
@@ -762,8 +835,55 @@ TEST(Replay, AGapOutsideAnyDispatchStopsBeforeTheFirstDispatch) {
   std::remove(gapped_path.c_str());
 }
 
+// A log cut while its program was constructed (inside a send from its
+// constructor, so with no record at all or some of those sends) ends before
+// the first dispatch, as a gap there does: the replayed constructor's sends
+// past the cut are not divergences, no dispatch replays, and the replay
+// names the cut.
+// REQ-OPS-13
+TEST(Replay, ALogCutDuringConstructionEndsBeforeTheFirstDispatch) {
+  const std::string original_path = temp_path("startup_cut_original");
+  {
+    SimulationEnvironment environment;
+    SimulatedEventLoop<log::LogWriter> loop{
+        environment, log::LogWriter{original_path, "startup"}};
+    StartupSender program{loop};
+    loop.run_for(3ms);
+    loop.finish();
+    ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+  }
+  const LogRecords original = read_records(original_path);
+  ASSERT_GE(original.headers.size(), 4u);
+  ASSERT_EQ(original.headers[1].dispatch_index, 0u);
+  const std::vector<char> bytes = read_file(original_path);
+  // Cut inside the first send, then inside the second.
+  for (const std::size_t send : {std::size_t{0}, std::size_t{1}}) {
+    SCOPED_TRACE(send == 0 ? "no record" : "one of three sends");
+    const std::string cut_path = temp_path("startup_cut");
+    {
+      std::ofstream out{cut_path, std::ios::binary | std::ios::trunc};
+      out.write(bytes.data(),
+                static_cast<std::streamsize>(original.offsets[send] + 10));
+    }
+    log::LogReader reader{cut_path};
+    ReplayEventLoop<> loop{reader};
+    std::optional<StartupSender<ReplayEventLoop<>>> program;
+    EXPECT_NO_THROW(program.emplace(loop));
+    ASSERT_TRUE(program.has_value());
+    EXPECT_NO_THROW(loop.run());
+    EXPECT_FALSE(loop.diverged());
+    EXPECT_FALSE(loop.reached_exit());
+    ASSERT_TRUE(loop.ended_in_dispatch().has_value());
+    EXPECT_EQ(loop.ended_in_dispatch().value(), 0u);
+    EXPECT_EQ(program->ticks, 0);
+    std::remove(cut_path.c_str());
+  }
+  std::remove(original_path.c_str());
+}
+
 // Records lost between intact ones would replay a run the program never
-// made, so exact replay refuses the log; input replay is what uses the rest.
+// made, so exact replay refuses the log (input replay stops at them or
+// refuses them).
 TEST(Replay, RefusesALogMissingADamagedRecord) {
   const std::string path = temp_path("damaged");
   record_run(path, 2.5F);

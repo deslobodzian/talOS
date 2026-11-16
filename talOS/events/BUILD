@@ -161,6 +161,7 @@ cc_library(
         ":events_core",
         ":events_log",
         "//talOS/schema:identity",
+        "@nlohmann_json//:json",
     ],
 )
 
