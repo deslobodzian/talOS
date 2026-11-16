@@ -1240,7 +1240,8 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // runs (a ReplayError, exit 1): one with a `.capped` marker or whose member
 // the session manifest marks log_capped, a run's log without its EXIT record
 // of a member it marks log_gap or recorder_failed, and one whose damaged
-// stretch nothing bounds.
+// stretch nothing bounds. So is the node's own first-run log when it arms a
+// timer and the byte cap deleted its first segment: the run start was in it.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
