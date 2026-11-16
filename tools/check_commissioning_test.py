@@ -217,8 +217,45 @@ class CheckCommissioningTest(unittest.TestCase):
                     f"{merge} {motor}:3: removes a CAN id: can_id = 5",
                     f"{merge} {motor}:3: sets a CAN id: can_id = 1"], found)
 
-    # REQ-DEV-33, RULES.md 4: a git without --remerge-diff cannot tell a
-    # merge's own change, so the check fails closed instead of skipping it.
+    # REQ-DEV-33, RULES.md 4: a `-merge` attribute committed on the branch
+    # (a .gitattributes, which nothing else checks) does not make git's
+    # re-merge keep the same stale side the merge kept.
+    def test_merge_attribute_does_not_hide_a_reverted_can_id(self):
+        motor = "bench/main_processor/configuration/subsystems/motor.toml"
+        here = self.git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        self.git("checkout", "-q", "-b", "f")
+        self.put(".gitattributes", "*.toml -merge\n")
+        self.put(motor, MOTOR.replace("TalonFX", "Kraken"))
+        self.commit("f: attributes and a type")
+        self.git("checkout", "-q", here)
+        self.put(motor, MOTOR.replace("= 1", "= 5"))
+        self.commit("bench: renumber at the robot",
+                    "Commissioned-By: A Person")
+        person = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-q", "f")
+        subprocess.run(["git", "merge", "-q", "--no-commit", here],
+                       cwd=self.repo, env=self.env, capture_output=True,
+                       check=False)  # Conflicts: the file merges as binary.
+        self.git("checkout", "--ours", "--", motor)
+        self.commit("merge")
+        found = check_commissioning.check(person)
+        self.assertIn("removes a CAN id: can_id = 5", "\n".join(found))
+
+    # REQ-DEV-33, RULES.md 4: .git/info/attributes applies whatever the
+    # attribute source, so a rule there fails the check closed.
+    def test_local_info_attributes_fail_closed(self):
+        info = os.path.join(self.repo, ".git", "info", "attributes")
+        os.makedirs(os.path.dirname(info), exist_ok=True)
+        with open(info, "w", encoding="utf-8") as f:
+            f.write("# a comment is fine\n*.toml -merge\n")
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.assertEqual(check_commissioning.main(["--base", self.base]),
+                             2)
+        self.assertIn("info/attributes sets attributes", err.getvalue())
+
+    # REQ-DEV-33, RULES.md 4: a git without --attr-source or --remerge-diff
+    # cannot tell a merge's own change or ignore a committed attribute, so
+    # the check fails closed instead of skipping it.
     def test_merge_under_a_git_without_remerge_diff_fails_closed(self):
         self.branch_and_merge(
             lambda: self.put("bench/main_processor/configuration/side.toml",
@@ -233,7 +270,7 @@ class CheckCommissioningTest(unittest.TestCase):
                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             self.assertEqual(check_commissioning.main(["--base", self.base]),
                              2)
-        self.assertIn("needs git 2.36 or later", err.getvalue())
+        self.assertIn("needs git 2.40 or later", err.getvalue())
 
     # REQ-DEV-33, RULES.md 4: git cannot re-merge an octopus merge, so one
     # that changes a robot config is reported rather than skipped.
