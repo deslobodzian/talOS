@@ -96,6 +96,12 @@ inline constexpr std::uint32_t kSourceFlagLatestOnly = 1u << 3;
 // the existing flags word: an older registry reader ignores it, and an older
 // `--describe`, which never wrote it, reads as "not the flush".
 inline constexpr std::uint32_t kSourceFlagHardwareRequest = 1u << 4;
+// A node's hardware request whose node lifted the flush's live-target gate
+// with talos::AllowUntargetedOutputs (REQ-SAFE-42), so its outputs are gated
+// on robot_enabled alone. Set only together with kSourceFlagHardwareRequest.
+// A bit of the existing flags word, like the two above: an older registry
+// reader ignores it, and an older `--describe` reads as "targeted".
+inline constexpr std::uint32_t kSourceFlagUntargetedOutputs = 1u << 5;
 
 // The hardware bridge's roster name: the launcher lists the bridge under it
 // (launcher kHardwareNodeName), whatever binary `[robot] hardware_node` names,

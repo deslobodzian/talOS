@@ -89,6 +89,14 @@ format version is unchanged). `LintGraph` refuses a `/hw/request` writer
 without it. Like `kSourceFlagLatestOnly` it is a bit of the existing `flags`
 word with no registry layout or version change.
 
+`kSourceFlagUntargetedOutputs` marks a `/hw/request/<node>` publisher (it is
+set only together with `kSourceFlagHardwareRequest`) whose node lifted the
+devices flush's live-target gate, leaving its outputs gated on
+`robot_enabled` alone (REQ-SAFE-42). `--describe` writes it as
+`"untargeted_outputs": true` on that endpoint alone (absent means false, so
+the format version is unchanged), and the registry carries it as another bit
+of the same `flags` word with no layout or version change.
+
 
 `publish` checks node and topic names against `names.h` and prints findings to
 stderr without refusing publication. Timer labels are not checked as topics.
