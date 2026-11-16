@@ -34,7 +34,8 @@ struct MergedRecord {
   // The record's log, shared so a caller may keep it past the merge.
   std::shared_ptr<const MergedLog> log;
   // The record's source in its log's manifest, schema included (format.h);
-  // null for an EXIT record or an id the manifest lacks.
+  // null for an EXIT record, a GAP record (format.h; it concerns every
+  // source of its log) or an id the manifest lacks.
   const event::Registration* source{nullptr};
   event::log::RecordHeader header{};
   // The full header.payload_bytes; valid only during the visit.
@@ -50,9 +51,11 @@ struct MergedRecord {
 };
 
 // Whether a merge prints its warnings on stderr: a log skipped for a header
-// cut while it was created, and, once it ends, a log the reader skipped
-// damage in ("warning: damaged log <path>: ...", which session_report
-// parses). A caller that merges a session twice warns on one pass.
+// cut while it was created, and, once it ends, a log holding GAP records in
+// one line however many ("warning: log gap in <path>: <DescribeGap of the
+// first>[ (and <n> more)]") and a log the reader skipped damage in
+// ("warning: damaged log <path>: ...", which session_report parses). A
+// caller that merges a session twice warns on one pass.
 enum class MergeWarnings { kPrint, kQuiet };
 
 // Hands every intact record of `log_paths` to `visit`, ordered by event

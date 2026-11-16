@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -19,6 +20,8 @@
 
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
+#include "talOS/events/log/format.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/hardware_record.h"
@@ -110,12 +113,27 @@ bool ParseOptions(int argc, char** argv, Options& options, std::string& error) {
   return true;
 }
 
+// The gap a GAP record (talOS/events/log/format.h) marks; nullopt for any
+// other record.
+std::optional<talos::event::log::LogGap> RecordGap(
+    const talos::launcher::MergedRecord& r) {
+  return talos::event::log::GapOf(r.header, r.payload);
+}
+
+// A GAP record concerns every topic of its log, so no --topic pattern hides
+// it, and the window selects it by its whole span, [start, resumed].
 bool Matches(const Options& options, const talos::launcher::MergedRecord& r,
              std::int64_t base_ns) {
   if (!options.nodes.empty() &&
       std::find(options.nodes.begin(), options.nodes.end(), r.process_name()) ==
           options.nodes.end()) {
     return false;
+  }
+  if (const auto gap = RecordGap(r); gap.has_value()) {
+    const std::int64_t low = std::min(gap->start_ns, gap->resumed_ns);
+    const std::int64_t high = std::max(gap->start_ns, gap->resumed_ns);
+    return ToMillis(base_ns, high) >= options.since_ms &&
+           ToMillis(base_ns, low) <= options.until_ms;
   }
   if (!options.topics.empty() &&
       !std::any_of(options.topics.begin(), options.topics.end(),
@@ -208,14 +226,63 @@ std::string HardwareJson(const talos::launcher::MergedRecord& r,
 // Defined after DecodedFields, which it walks.
 std::string AlertsJson(std::string_view topic, const std::string& decoded);
 
+const char* GapCauseName(std::uint16_t cause) {
+  using talos::event::log::GapCause;
+  if (cause == static_cast<std::uint16_t>(GapCause::POOL_FULL)) {
+    return "pool_full";
+  }
+  if (cause == static_cast<std::uint16_t>(GapCause::RECORD_TOO_LARGE)) {
+    return "record_too_large";
+  }
+  return "unknown";
+}
+
+// A GAP record's `gap` member (README.md, "Filtering and exporting logs"):
+// its span and what its writer dropped, times on the session baseline. A
+// record without the detail payload has null loss times and zero counts.
+std::string GapJson(const talos::event::log::LogGap& gap,
+                    std::int64_t base_ns) {
+  const auto& d = gap.detail;
+  const auto ms = [base_ns](std::int64_t ns) {
+    std::ostringstream text;
+    text << std::setprecision(std::numeric_limits<double>::max_digits10)
+         << ToMillis(base_ns, ns);
+    return text.str();
+  };
+  const auto flag = [&d](std::uint16_t bit) {
+    return (d.flags & bit) != 0 ? "true" : "false";
+  };
+  std::string json = "{\"start_ms\":" + ms(gap.start_ns) +
+                     ",\"end_ms\":" + ms(gap.resumed_ns) +
+                     ",\"first_lost_ms\":";
+  json += gap.detailed ? ms(d.first_lost_ns) : "null";
+  json += ",\"last_lost_ms\":";
+  json += gap.detailed ? ms(d.last_lost_ns) : "null";
+  json +=
+      ",\"first_dispatch_index\":" + std::to_string(gap.first_dispatch_index) +
+      ",\"last_dispatch_index\":" + std::to_string(d.last_dispatch_index) +
+      ",\"records\":" + std::to_string(d.records) +
+      ",\"bytes\":" + std::to_string(d.bytes) +
+      ",\"dispatches\":" + std::to_string(d.dispatches) +
+      ",\"sends\":" + std::to_string(d.sends) + ",\"cause\":\"" +
+      GapCauseName(d.cause) +
+      "\",\"splits_dispatch\":" + flag(talos::event::log::GAP_SPLITS_DISPATCH) +
+      ",\"closed_at_flush\":" + flag(talos::event::log::GAP_CLOSED_AT_FLUSH) +
+      "}";
+  return json;
+}
+
 void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
                   bool json, const HardwareDecoding& decoding) {
   const std::string schema = r.source == nullptr ? "" : r.source->schema.name;
   const std::string hardware = HardwareJson(r, decoding);
-  const std::string decoded =
-      !schema.empty() && !r.payload.empty()
-          ? talos::schema::DecodeToText(r.source->schema, r.payload)
-          : "";
+  const auto gap = RecordGap(r);
+  std::string decoded;
+  if (!schema.empty() && !r.payload.empty()) {
+    decoded = talos::schema::DecodeToText(r.source->schema, r.payload);
+  } else if (gap.has_value()) {
+    decoded = talos::event::log::DescribeGap(*gap);
+  }
   const auto quote = json ? JsonString : CsvString;
   std::cout << std::setprecision(std::numeric_limits<double>::max_digits10);
   if (json) {
@@ -239,6 +306,7 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
       std::cout << ",\"alerts\":" << alerts;
     }
     if (!hardware.empty()) std::cout << ",\"hardware\":" << hardware;
+    if (gap.has_value()) std::cout << ",\"gap\":" << GapJson(*gap, base_ns);
     if (decoding.decode &&
         r.source_name() == talos::hardware::kDriverStationTopic &&
         r.payload.size() == sizeof(talos::hardware::Packet)) {
@@ -489,6 +557,41 @@ class TopicSummary {
   std::map<std::string, std::size_t> range_index_;
 };
 
+// --format summary: one process's GAP records folded into totals, so a
+// session with any number of gaps costs a fixed size per process (and so per
+// log), never one entry per gap; JSONL and the text dump list each gap.
+class GapSummary {
+ public:
+  void Add(const talos::event::log::LogGap& gap, std::int64_t base_ns) {
+    ++count_;
+    records_ += gap.detail.records;
+    dispatches_ += gap.detail.dispatches;
+    sends_ += gap.detail.sends;
+    first_ms_ = std::min(
+        first_ms_, ToMillis(base_ns, std::min(gap.start_ns, gap.resumed_ns)));
+    last_ms_ = std::max(
+        last_ms_, ToMillis(base_ns, std::max(gap.start_ns, gap.resumed_ns)));
+  }
+
+  void Print(const std::string& process) const {
+    std::printf(
+        "gaps %s\n  count %llu\n  records %llu\n  dispatches %llu\n"
+        "  sends %llu\n  first_ms %.3f\n  last_ms %.3f\n",
+        process.c_str(), static_cast<unsigned long long>(count_),
+        static_cast<unsigned long long>(records_),
+        static_cast<unsigned long long>(dispatches_),
+        static_cast<unsigned long long>(sends_), first_ms_, last_ms_);
+  }
+
+ private:
+  std::uint64_t count_{0};
+  std::uint64_t records_{0};
+  std::uint64_t dispatches_{0};
+  std::uint64_t sends_{0};
+  double first_ms_{std::numeric_limits<double>::infinity()};
+  double last_ms_{-std::numeric_limits<double>::infinity()};
+};
+
 // Device names for the hardware packets: from --config, else from the config
 // a session directory's manifest names, when that file can still be read
 // (hardware_record.h). Without one, devices are identified by logical id only.
@@ -587,8 +690,17 @@ int main(int argc, char** argv) {
 
   if (options.format == "summary") {
     std::map<std::string, TopicSummary, std::less<>> topics;
+    std::map<std::string, GapSummary, std::less<>> gaps;  // by process
     const bool read = print([&](const MergedRecord& r) {
       if (r.header.kind == static_cast<std::uint16_t>(EventKind::EXIT)) return;
+      if (const auto gap = RecordGap(r); gap.has_value()) {
+        auto at = gaps.find(r.process_name());
+        if (at == gaps.end()) {
+          at = gaps.emplace(r.process_name(), GapSummary{}).first;
+        }
+        at->second.Add(*gap, base_ns);
+        return;
+      }
       auto at = topics.find(r.source_name());
       if (at == topics.end()) {
         at = topics.emplace(std::string{r.source_name()}, TopicSummary{}).first;
@@ -601,6 +713,11 @@ int main(int argc, char** argv) {
       std::printf("%s", separator);
       separator = "\n";
       summary.Print(topic);
+    }
+    for (const auto& [process, summary] : gaps) {
+      std::printf("%s", separator);
+      separator = "\n";
+      summary.Print(process);
     }
     return 0;
   }
@@ -635,7 +752,9 @@ int main(int argc, char** argv) {
     ++counts_by_process[r.process_name()];
     ++counts_by_kind[r.header.kind];
 
+    const auto gap = RecordGap(r);
     const bool has_source =
+        !gap.has_value() &&
         r.header.kind != static_cast<std::uint16_t>(EventKind::EXIT);
 
     const std::string source_id =
@@ -664,6 +783,10 @@ int main(int argc, char** argv) {
     }
     if (const auto hardware = HardwareJson(r, decoding); !hardware.empty()) {
       std::printf("      hardware %s\n", hardware.c_str());
+    }
+    if (gap.has_value()) {
+      std::printf("      gap: %s\n",
+                  talos::event::log::DescribeGap(*gap).c_str());
     }
   });
   if (!printed) return 1;

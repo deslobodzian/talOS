@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +23,8 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
+#include "talOS/events/log/gap_testing.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
@@ -487,6 +490,178 @@ TEST_F(LogDumpTest, StatusRecordsCarryTheirAlerts) {
     EXPECT_NE(json.find("\"topic\":\"" + topic + "\""), std::string::npos)
         << json;
     EXPECT_EQ(json.find("\"alerts\""), std::string::npos) << json;
+  }
+}
+
+// A session whose `gamma` log lost dispatches 2-3 (records at 15 and 25 ms,
+// capture resumed at 35 ms) and dispatches 5-6 (45 and 55 ms, closed by the
+// stop), beside the fixture's alpha and beta: two GAP records in one file.
+class LogDumpGapTest : public LogDumpTest {
+ protected:
+  void SetUp() override {
+    LogDumpTest::SetUp();
+    if (HasFatalFailure()) return;
+    namespace log = talos::event::log;
+    gamma_ = directory_ + "/gamma.tlog";
+    WriteLog("gamma", "/gamma/state", {5, 15, 25, 35, 45, 55});
+    const std::string staged = directory_ + "/gamma.staged";
+    first_ = log::CopyWithGap(gamma_, staged, 1, 3);
+    // Records now: 5, GAP, 35, 45, 55.
+    last_ = log::CopyWithGap(staged, gamma_, 3, 5);
+    std::filesystem::remove(staged);
+  }
+
+  static std::vector<std::string> Lines(const std::string& text) {
+    std::vector<std::string> out;
+    std::istringstream stream{text};
+    for (std::string line; std::getline(stream, line);) out.push_back(line);
+    return out;
+  }
+
+  // The output lines holding `text`.
+  static std::size_t CountLines(const std::string& output,
+                                const std::string& text) {
+    const auto lines = Lines(output);
+    return static_cast<std::size_t>(
+        std::count_if(lines.begin(), lines.end(), [&](const std::string& l) {
+          return l.find(text) != std::string::npos;
+        }));
+  }
+
+  std::string gamma_;
+  talos::event::log::LogGap first_;
+  talos::event::log::LogGap last_;
+};
+
+// Guards: each GAP record reaches every export with the facts a reader of
+// the session needs (where the hole is, what it lost, why, whether it
+// closed at the stop): text prints the gap's sentence under its record,
+// JSONL a `gap` object, CSV the sentence in `decoded`. Times are on the
+// session baseline (alpha's first record).
+// REQ-OPS-15
+TEST_F(LogDumpGapTest, EachGapIsPrintedAndExported) {
+  using talos::event::log::DescribeGap;
+  const auto json = Run({"--format", "jsonl", "--node", "gamma"});
+  EXPECT_NE(json.find("{\"process\":\"gamma\",\"dispatch_index\":2,\"kind\":"
+                      "\"GAP\",\"source_id\":65535,\"topic\":\"?\","
+                      "\"event_ms\":15,\"now_ms\":35,"),
+            std::string::npos)
+      << json;
+  EXPECT_NE(
+      json.find(",\"gap\":{\"start_ms\":15,\"end_ms\":35,\"first_lost_ms\":15,"
+                "\"last_lost_ms\":25,\"first_dispatch_index\":2,"
+                "\"last_dispatch_index\":3,\"records\":2,\"bytes\":144,"
+                "\"dispatches\":2,\"sends\":0,\"cause\":\"pool_full\","
+                "\"splits_dispatch\":false,\"closed_at_flush\":false}}\n"),
+      std::string::npos)
+      << json;
+  EXPECT_NE(
+      json.find(",\"gap\":{\"start_ms\":45,\"end_ms\":55,\"first_lost_ms\":45,"
+                "\"last_lost_ms\":55,\"first_dispatch_index\":5,"
+                "\"last_dispatch_index\":6,\"records\":2,\"bytes\":144,"
+                "\"dispatches\":2,\"sends\":0,\"cause\":\"pool_full\","
+                "\"splits_dispatch\":false,\"closed_at_flush\":true}}\n"),
+      std::string::npos)
+      << json;
+
+  const auto csv = Run({"--format", "csv", "--node", "gamma"});
+  EXPECT_EQ(CountLines(csv, ",GAP,65535,?,"), 2U) << csv;
+  for (const auto& gap : {first_, last_}) {
+    // `decoded` holds the gap's sentence, quoted for its commas.
+    EXPECT_NE(csv.find("\"" + DescribeGap(gap) + "\",\r\n"), std::string::npos)
+        << csv;
+  }
+  EXPECT_NE(csv.find("gamma,2,GAP,65535,?,15,35,"), std::string::npos) << csv;
+
+  const auto text = Lines(Run({"--node", "gamma"}));
+  for (const auto& gap : {first_, last_}) {
+    const auto at =
+        std::find(text.begin(), text.end(), "      gap: " + DescribeGap(gap));
+    ASSERT_NE(at, text.end()) << DescribeGap(gap);
+    ASSERT_NE(at, text.begin());
+    EXPECT_NE((at - 1)->find("[gamma       ] #" +
+                             std::to_string(gap.first_dispatch_index)),
+              std::string::npos)
+        << *(at - 1);
+    EXPECT_NE((at - 1)->find(" GAP "), std::string::npos) << *(at - 1);
+  }
+}
+
+// Guards: a gap concerns every topic of its log, so no --topic filter hides
+// it; --node selects it by its process; the time window selects it by its
+// whole span, so a window the gap only overlaps shows it and one wholly
+// outside it does not.
+// REQ-OPS-15
+TEST_F(LogDumpGapTest, FiltersSelectAGapByItsProcessAndSpan) {
+  const std::string kGap = "\"kind\":\"GAP\"";
+  const auto topic = Run({"--format", "jsonl", "--topic", "/alpha/state"});
+  EXPECT_EQ(CountLines(topic, kGap), 2U) << topic;
+  EXPECT_EQ(CountLines(topic, "\"process\":\"beta\""), 0U) << topic;
+
+  const auto other = Run({"--format", "jsonl", "--node", "alpha,beta"});
+  EXPECT_EQ(CountLines(other, kGap), 0U) << other;
+
+  // [20, 30] lies inside the first gap's [15, 35] and before the second's.
+  const auto inside =
+      Run({"--format", "jsonl", "--since-ms", "20", "--until-ms", "30"});
+  EXPECT_EQ(CountLines(inside, kGap), 1U) << inside;
+  EXPECT_NE(inside.find("\"dispatch_index\":2,\"kind\":\"GAP\""),
+            std::string::npos)
+      << inside;
+  // [50, 60] overlaps only the second's [45, 55].
+  const auto tail = Run({"--format", "jsonl", "--since-ms", "50"});
+  EXPECT_EQ(CountLines(tail, kGap), 1U) << tail;
+  EXPECT_NE(tail.find("\"dispatch_index\":5,\"kind\":\"GAP\""),
+            std::string::npos)
+      << tail;
+  // [36, 44] lies between them.
+  const auto between =
+      Run({"--format", "jsonl", "--since-ms", "36", "--until-ms", "44"});
+  EXPECT_EQ(CountLines(between, kGap), 0U) << between;
+}
+
+// Guards: --format summary lists each process's gaps after the topics, in
+// numbers a reader adds up (how many, records, dispatches and sends lost,
+// earliest start, latest end), and never as a topic; a process with none,
+// or filtered out, has no block.
+// REQ-OPS-15
+TEST_F(LogDumpGapTest, SummaryListsGapsPerProcess) {
+  const auto summary = Lines(Run({"--format", "summary"}));
+  const auto block = std::find(summary.begin(), summary.end(), "gaps gamma");
+  ASSERT_NE(block, summary.end()) << ::testing::PrintToString(summary);
+  const std::vector<std::string> expected{
+      "gaps gamma", "  count 2",         "  records 4",      "  dispatches 4",
+      "  sends 0",  "  first_ms 15.000", "  last_ms 55.000",
+  };
+  ASSERT_GE(summary.end() - block,
+            static_cast<std::ptrdiff_t>(expected.size()));
+  EXPECT_EQ(std::vector<std::string>(block, block + expected.size()), expected);
+  // After every topic block.
+  EXPECT_EQ(std::find_if(block, summary.end(),
+                         [](const std::string& line) {
+                           return line.starts_with("topic ");
+                         }),
+            summary.end());
+  EXPECT_EQ(CountLines(Run({"--format", "summary", "--topic", "/alpha/state"}),
+                       "gaps gamma"),
+            1U);
+  const auto alpha = Run({"--format", "summary", "--node", "alpha"});
+  EXPECT_EQ(CountLines(alpha, "gaps "), 0U) << alpha;
+  EXPECT_EQ(CountLines(alpha, "topic ?"), 0U) << alpha;
+}
+
+// Guards: a log with gaps is named once on stderr, whatever the format and
+// however many gaps it holds, so a reader of a whole session sees which
+// file has a hole without one line per gap.
+// REQ-OPS-15
+TEST_F(LogDumpGapTest, ALogWithGapsIsWarnedOnce) {
+  for (const std::string format : {"text", "jsonl", "csv", "summary"}) {
+    const auto output = Run({"--format", format});
+    EXPECT_EQ(CountLines(output, "warning: log gap in "), 1U) << format << "\n"
+                                                              << output;
+    EXPECT_EQ(CountLines(output, "warning: log gap in " + gamma_ + ": "), 1U)
+        << format << "\n"
+        << output;
   }
 }
 
