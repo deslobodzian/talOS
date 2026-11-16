@@ -135,7 +135,10 @@ Expected: the launcher prints `Controller <roborio-ipv4>:5802`, and
 [`robot_py.toml`](../bench/main_processor/configuration/robot_py.toml) is
 `robot.toml` with the bare motor's node swapped for its Python twin,
 [`motor.py`](../bench/main_processor/motor/motor.py) (same devices,
-parameters, gating and `/motor/state`). Its motor subsystem file,
+parameters, gating and `/motor/state`; only its construction checks differ:
+it cannot refuse a positive `max_bench_torque_current_a` on a motor without
+`foc` and `max_torque_current_a`, see
+[torque current](#torque-current-hardware-only)). Its motor subsystem file,
 [`motor_py.toml`](../bench/main_processor/configuration/subsystems/motor_py.toml),
 is `motor.toml` (its `defaults`) at `period_us` 20000, since a Python
 actuator owner runs at 20 ms or slower
@@ -210,7 +213,8 @@ is the same graph for the physics simulator only (`simulation_only`; launch it w
   rolls the wheel forward at heading 0. Record the reductions, the offset
   and the directions.
 - [ ] Review supply 30 A, stator 40 A, hardware voltage ceiling 4 V, node
-  `max_bench_voltage_v = 2.0`, ratio 1.0, velocity ceiling 30 rps and slot0 gains
+  `max_bench_voltage_v = 2.0`, node `max_bench_torque_current_a = 0.0` (torque
+  mode off), ratio 1.0, velocity ceiling 30 rps and slot0 gains
   (measured feedforward 0.095 V/rotor-rps). Expected: these match the bare
   motor and power source. Record reviewed limits; raise deliberately only after
   the first spin, never to hide a fault.
@@ -236,6 +240,9 @@ is the same graph for the physics simulator only (`simulation_only`; launch it w
   on release. Button 1 wins if both are held; buttons override axis mode.
   Record requested/measured speed, voltage, current and overshoot. A 4 V ceiling
   may prevent reaching 30 rps under load; do not raise limits automatically.
+  Then hold button 3 (torque current): NEUTRAL/NONE and no motion, since
+  `max_bench_torque_current_a = 0.0` keeps torque mode off
+  ([torque current](#torque-current-hardware-only) turns it on).
 - [ ] Swerve module, wheel off the ground. Its
   [bindings](../bench/main_processor/configuration/subsystems/swerve_module.toml)
   are hold-to-run: it moves only while button 6 is held; the axes alone
@@ -335,6 +342,77 @@ Phoenix Pro licensed, per the owner.
   `check_pro_license`; `/hw/status` `motor_fault_mask` carries its bit; axis
   and buttons move nothing; the other bench devices are unaffected. Record
   the lines.
+
+### Torque current (hardware only)
+
+In desktop simulation Phoenix runs TorqueCurrentFOC as a current loop
+against the RoboRIO program's own rotor model, so `phoenixTest` shows the
+request's fields (the demand and the duty cap), the peak torque current in
+the applied configuration (a follower's from its master) and NeutralOut for
+a request out of contract; it asserts nothing about Phoenix's simulated
+current loop. Only hardware shows that the Kraken tracks the stator
+current and honours the peak and the duty cap. This check needs the FOC
+check above passed (a licensed Kraken). The bench motor node's
+`TORQUE_CURRENT` mode is bound to joystick 0 button 3 at 2 A
+([`motor.toml`](../bench/main_processor/configuration/subsystems/motor.toml);
+buttons 1 and 2 win over it) and clamped to the node parameter
+`max_bench_torque_current_a`, which the committed config sets to 0: torque
+mode off, so button 3 drives nothing until a person raises it.
+
+It runs inside or after the
+[supervised enabled session](#one-supervised-enabled-session), under its
+rule for people: a spotter whose only job is the Driver Station's disable
+and e-stop, hands on them for every enabled step. Leave `max_voltage` as
+committed (the session's commissioning commit sets it to `2.0`; it is `4.0`
+before that): torque mode is bounded only by that duty cap.
+`max_velocity_rps` (30) bounds velocity demands alone, so at
+`max_voltage = 4.0` button 3 reaches about 42 rps, faster than the velocity
+buttons. The rotor's free speed is about `max_voltage` / 0.095 rps (slot0
+`v`, 0.095 V per rps): about 21 rps at 2 V, 42 rps at 4 V.
+
+- [ ] As a local change, reverted after, set in
+  [the motor config](../bench/main_processor/configuration/subsystems/motor.toml)
+  `max_bench_torque_current_a = 2.0` under `[subsystem]`, and `foc = true`
+  and `max_torque_current_a = 5.0` under `[motors.kraken]`, keeping
+  `stator_limit_a = 40.0` and `brake = false`; deploy
+  and launch, the bare motor restrained with nothing on its shaft. The C++
+  motor node refuses to start with a positive `max_bench_torque_current_a`
+  unless both motor keys are set, naming them. The Python one
+  (`robot_py.toml`) cannot read the motor's config, so it starts, and fails
+  only while enabled, at the first torque target: `Motor.set_torque_current`
+  raises naming the motor and the key, the node exits and the launcher
+  restarts it, again and again for as long as button 3 is held. The motor
+  stays neutral, and the axis and the other buttons do nothing meanwhile;
+  release button 3, disable and fix the config. Expected: Tuner X reads the
+  Kraken's `PeakForwardTorqueCurrent` 5 A and `PeakReverseTorqueCurrent`
+  -5 A.
+- [ ] Enable teleop and hold button 3. Expected: `/motor/state` `mode`
+  `TORQUE_CURRENT` and `source` `TELEOP` while held (`NEUTRAL` and `NONE`
+  once released); Tuner X control mode
+  `TorqueCurrentFOC`; `/motor/state` stator current about 2 A while the rotor
+  accelerates; the speed levelling near the free speed at the committed
+  `max_voltage` (above), not the X44's full free speed, with applied
+  voltage at most `max_voltage` and Tuner X duty cycle about `max_voltage`
+  over the battery voltage; the stator current then falling to what friction
+  takes.
+  Release: neutral, the rotor coasting down. Record the stator current while
+  accelerating, the levelled speed, the applied and battery voltages, the
+  duty cycle and the coast-down.
+- [ ] Hold button 3 and `kill -STOP` the motor node: `NeutralOut` within about
+  55 ms (the 50 ms owner timeout, then the next gateway tick); `kill -CONT`
+  and release. Hold button 3 and disable: `NeutralOut` at once. Record the
+  stop times.
+- [ ] What the motor does at exactly 0 A (TODO.md DEVICES-12). As a further
+  local change set button 3's binding to `torque_current_a = 0.0`. Spin the
+  rotor with the axis (voltage), then hold button 3 with the axis still
+  deflected (the button wins): Tuner X control mode `TorqueCurrentFOC` at
+  0 A. Record whether the rotor coasts down as it does with every control
+  released (NeutralOut), or stops sooner; repeat with `brake = true` under `[motors.kraken]` and
+  record the same.
+
+Pass: `TorqueCurrentFOC` only while button 3 is held, `NeutralOut` on
+release, stop and disable; stator current never above 5 A; applied voltage
+never above `max_voltage`.
 
 ## Fault injection and timing
 
@@ -524,12 +602,14 @@ turns at about 1 V. The bench teleop config
 ([`motor.toml`](../bench/main_processor/configuration/subsystems/motor.toml),
 [`swerve_module.toml`](../bench/main_processor/configuration/subsystems/swerve_module.toml))
 binds joystick 0: axis 1 the bare motor's voltage; buttons 1 and 2 its
-VELOCITY 10 and 30 rps (they override the axis); button 6 the swerve
+VELOCITY 10 and 30 rps (they override the axis); button 3 its
+TORQUE_CURRENT 2 A, off at the committed `max_bench_torque_current_a = 0.0`;
+button 6 the swerve
 module, hold-to-run, with axis 4 its wheel heading (a centred stick asks
 heading 0, which with a provisional `offset_rot` can be up to half a turn
 from where the wheel rests) and axis 5 its drive velocity up to 10 rps.
-Never press buttons 1, 2 or 6. Before session A, with the robot disabled,
-the driver identifies axis 1, axis 4, axis 5 and buttons 1, 2 and 6 on the
+Never press buttons 1, 2, 3 or 6. Before session A, with the robot disabled,
+the driver identifies axis 1, axis 4, axis 5 and buttons 1, 2, 3 and 6 on the
 controller in the Driver Station's USB tab (do not go by the gamepad's
 printed labels). The swerve module stays clamped with its wheel off the
 ground all hour. Stop and disable at any unexpected motion.
@@ -574,10 +654,11 @@ workstation between sessions.
    the swerve module's drive (5) and steer (6) included. The node's
    `max_bench_voltage_v = 2.0` bounds only VOLTAGE mode (TODO.md BENCH-1).
    Every voltage-based request the bench sends (VoltageOut, VelocityVoltage,
-   PositionVoltage; no bench node sends DutyCycleOut) is bounded by the
+   PositionVoltage; no bench node sends DutyCycleOut, nor TorqueCurrentFOC
+   at the committed `max_bench_torque_current_a = 0.0`) is bounded by the
    motor's `max_voltage`, which the Talon is configured with as its peak
    voltage; the gateway neutralizes that motor for a command whose VOLTAGE
-   demand or feedforward exceeds it. It is `4.0` on line 19 of `motor.toml`
+   demand or feedforward exceeds it. It is `4.0` on line 24 of `motor.toml`
    (`[motors.kraken]`) and on lines 32 and 50 of `swerve_module.toml`
    (`[motors.drive]`, `[motors.steer]`). In the same reviewed commit the
    person sets all three to `2.0` and updates the golden test

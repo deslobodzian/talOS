@@ -8,7 +8,9 @@ libbench_motor.so) and motor.py on SCENARIO through talos.parity, which
 requires the same /motor/state bytes and the same requested and applied
 motor output after every step; the `matrix: parity` comments name the steps
 that cover each case. What a parity run cannot compare is tested here:
-construction (case 9) and the framework teleop node driving motor.py.
+construction (case 9), the framework teleop node driving motor.py, and
+torque mode off at the committed config's cap (the scenario's config turns
+it on).
 """
 
 import math
@@ -26,7 +28,12 @@ from talos import parity, teleop
 from talos.testing import Sim, SimHardware, Stick
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CONFIG = runfiles.Create().Rlocation(os.environ["TALOS_TEST_CONFIG"])
+_RUNFILES = runfiles.Create()
+# testdata/robot.toml: torque mode on (foc, max_torque_current_a 5 A,
+# max_bench_torque_current_a 2 A).
+CONFIG = _RUNFILES.Rlocation(os.environ["TALOS_TEST_CONFIG"])
+# configuration/robot.toml as committed: torque mode off.
+BENCH_CONFIG = _RUNFILES.Rlocation(os.environ["TALOS_BENCH_CONFIG"])
 bench = talos.load(os.path.join(HERE, "motor.py"))
 CppBenchMotor = talos.cpp_node(
     "bench/main_processor/motor/libbench_motor.so", "motor")
@@ -44,19 +51,55 @@ TIMEOUT_S = 0.1
 class BenchMotorTest(unittest.TestCase):
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
-    # REQ-CONTRACT-18
+    # REQ-CONTRACT-18. Unlike node_test.cc's, no row for a positive
+    # max_bench_torque_current_a on a motor without foc: motor.py cannot
+    # read the motor's config (see its docstring).
     def test_bad_parameter_fails_construction(self):
-        for value in ("0.0", "-1.0", "nan", "inf"):
-            with self.subTest(max_bench_voltage_v=value):
+        for key, value in (("max_bench_voltage_v", "0.0"),
+                           ("max_bench_voltage_v", "-1.0"),
+                           ("max_bench_voltage_v", "nan"),
+                           ("max_bench_voltage_v", "inf"),
+                           ("max_bench_torque_current_a", "-1.0"),
+                           ("max_bench_torque_current_a", "nan"),
+                           ("max_bench_torque_current_a", "inf")):
+            with self.subTest(key=key, value=value):
                 sim = Sim.from_toml(
                     "[robot]\nperiod_us = 5000\n"
                     "command_timeout_us = 100000\n"
-                    f"[subsystems.motor]\nmax_bench_voltage_v = {value}\n"
+                    f"[subsystems.motor]\n{key} = {value}\n"
                     "[subsystems.motor.motors.kraken]\n"
-                    'type = "TalonFX"\ncan_id = 1\n')
+                    'type = "TalonFX"\ncan_id = 1\n'
+                    "foc = true\nmax_torque_current_a = 5.0\n")
                 with self.assertRaisesRegex((ValueError, talos.TalosError),
-                                            "max_bench_voltage_v"):
+                                            key):
                     sim.add(bench.BenchMotor, "motor")
+
+    # REQ-SAFE-43: the committed bench config drives nothing for a torque
+    # target, while a voltage target still drives. (ParityTest runs with
+    # torque mode on.)
+    def test_torque_mode_off_at_the_committed_cap(self):
+        sim = Sim(BENCH_CONFIG)
+        sim.add(bench.BenchMotor, "motor")
+        hw = SimHardware(sim)
+        hw.enable()
+        hw.set_driver_station(enabled=True, teleop=True)
+        sim.step(0.05)
+
+        def send(mode, voltage_v=0.0, torque_current_a=0.0):
+            sim.publish_target(MotorTarget, "motor", "teleop", mode=mode,
+                               voltage_v=voltage_v, velocity_rps=0.0,
+                               voltage_frac=0.0,
+                               torque_current_a=torque_current_a)
+            sim.step(0.01)
+
+        send(ControlMode.TORQUE_CURRENT, torque_current_a=1.5)
+        self.assertEqual(hw.motor_request("motor", "kraken").mode, NEUTRAL)
+        self.assertEqual(hw.applied_motor("motor", "kraken").mode, NEUTRAL)
+        self.assertEqual(sim.latest(MotorState, topics.STATE).mode,
+                         ControlMode.NEUTRAL)
+        send(ControlMode.VOLTAGE, voltage_v=1.0)
+        self.assertEqual(hw.applied_motor("motor", "kraken")[:2],
+                         (VOLTAGE, 1.0))
 
 
 class ModuleLaneReader:
@@ -101,17 +144,19 @@ class BenchTeleopTest(unittest.TestCase):
 
 
 def target(mode, generation=None, voltage_v=0.0, velocity_rps=0.0,
-           voltage_frac=0.0):
+           voltage_frac=0.0, torque_current_a=0.0):
     """A teleop MotorTarget stamped with the current generation, or with
     the one remembered as `generation`, then 10 ms."""
     return parity.send(MotorTarget, "teleop", generation=generation,
                        mode=mode, voltage_v=voltage_v,
-                       velocity_rps=velocity_rps, voltage_frac=voltage_frac)
+                       velocity_rps=velocity_rps, voltage_frac=voltage_frac,
+                       torque_current_a=torque_current_a)
 
 
 # The matrix cases node_test.cc proves for the C++ node, and the steps that
 # put motor.py through the same inputs:
 # matrix: parity 1 node_test.cc "velocity", "teleop, current generation"
+# matrix: parity 1 node_test.cc "torque current"
 # matrix: parity 2 node_test.cc "gateway disabled"
 # matrix: parity 3 node_test.cc "stale lane"
 # matrix: parity 4 node_test.cc "released"
@@ -121,12 +166,16 @@ def target(mode, generation=None, voltage_v=0.0, velocity_rps=0.0,
 # matrix: parity 8 node_test.cc "NaN voltage", "infinite voltage"
 # matrix: parity 8 node_test.cc "NaN axis", "infinite axis"
 # matrix: parity 8 node_test.cc "NaN velocity", "infinite velocity"
+# matrix: parity 8 node_test.cc "NaN torque current"
+# matrix: parity 8 node_test.cc "infinite torque current"
 # matrix: parity 10 node_test.cc "autonomous, teleop lane"
 # matrix: parity 11 node_test.cc "autonomous, earlier teleop generation"
 # matrix: parity 11 node_test.cc "teleop, autonomous generation"
 # matrix: parity 11 node_test.cc "teleop, first teleop generation"
 # node_test.cc's VoltageIsClampedAndAxisUsesNodeScale: the three voltage
-# steps; ReportsInjectedFeedbackAndAcquisitionAges: "feedback" and
+# steps; TorqueCurrentIsClampedToTheNodeCapAndZeroIsSent: the two torque
+# current steps past the cap and "zero torque current";
+# ReportsInjectedFeedbackAndAcquisitionAges: "feedback" and
 # "disconnected"; ReportsLimitSwitchesAndClearsThemOnStaleState: "limit
 # switches" and "hardware state lost".
 SCENARIO = [
@@ -138,6 +187,14 @@ SCENARIO = [
     ("voltage and axis",
      target(ControlMode.VOLTAGE, voltage_v=0.5, voltage_frac=-1.5)),
     ("velocity", target(ControlMode.VELOCITY, velocity_rps=10.0)),
+    ("torque current",
+     target(ControlMode.TORQUE_CURRENT, torque_current_a=1.5)),
+    ("torque current above the cap",
+     target(ControlMode.TORQUE_CURRENT, torque_current_a=8.0)),
+    ("torque current below the cap",
+     target(ControlMode.TORQUE_CURRENT, torque_current_a=-8.0)),
+    ("zero torque current",
+     target(ControlMode.TORQUE_CURRENT, torque_current_a=0.0)),
     ("explicit neutral", target(ControlMode.NEUTRAL, voltage_v=2.0)),
     ("feedback",
      parity.device("set_motor", "kraken", 4.5, -7.0, 2000, 1000, 42.5, 6.25,
@@ -150,6 +207,10 @@ SCENARIO = [
     ("infinite axis", target(ControlMode.VOLTAGE, voltage_frac=math.inf)),
     ("NaN velocity", target(ControlMode.VELOCITY, velocity_rps=math.nan)),
     ("infinite velocity", target(ControlMode.VELOCITY, velocity_rps=math.inf)),
+    ("NaN torque current",
+     target(ControlMode.TORQUE_CURRENT, torque_current_a=math.nan)),
+    ("infinite torque current",
+     target(ControlMode.TORQUE_CURRENT, torque_current_a=math.inf)),
     ("stale lane", target(ControlMode.VOLTAGE, voltage_frac=0.25),
      parity.wait(TIMEOUT_S + 0.01)),
     ("limit switches",

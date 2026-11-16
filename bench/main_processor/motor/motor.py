@@ -7,10 +7,19 @@ configuration/robot_py.toml launches it in place of the C++ node.
 The motor drives only while robot_enabled, with a live teleop lane
 (talos.Target) and connected feedback: VOLTAGE adds voltage_v to
 voltage_frac (clamped to [-1, 1]) times max_bench_voltage_v and clamps the sum
-to +-max_bench_voltage_v; VELOCITY passes velocity_rps to the onboard PID. A
+to +-max_bench_voltage_v; VELOCITY passes velocity_rps to the onboard PID;
+TORQUE_CURRENT sends torque_current_a clamped to +-max_bench_torque_current_a
+as stator amperes, and nothing while that parameter is 0 (the default). A
 non-finite field, a NEUTRAL target or anything else leaves it unset, which the
 flush sends neutral. /motor/state is published every tick, byte for byte what
 the C++ node publishes (node_py_test.py's ParityTest).
+
+Unlike motor.h, construction does not check that a positive
+max_bench_torque_current_a has [motors.kraken] foc = true and
+max_torque_current_a > 0: the Python devices layer exposes no motor config.
+With either missing, the first TORQUE_CURRENT target makes
+Motor.set_torque_current raise TalosError naming the motor and the key, in
+update().
 """
 
 import math
@@ -51,6 +60,12 @@ class BenchMotor:
         self.max_voltage_v = node.param("max_bench_voltage_v", 2.0)
         if not math.isfinite(self.max_voltage_v) or self.max_voltage_v <= 0:
             raise ValueError("max_bench_voltage_v must be finite and > 0")
+        self.max_torque_current_a = node.param(
+            "max_bench_torque_current_a", 0.0)
+        if (not math.isfinite(self.max_torque_current_a)
+                or self.max_torque_current_a < 0):
+            raise ValueError(
+                "max_bench_torque_current_a must be finite and >= 0")
 
     def update(self):
         enabled = talos.robot_enabled(self.node)
@@ -70,6 +85,14 @@ class BenchMotor:
                   and math.isfinite(target.velocity_rps)):
                 self.motor.set_velocity(target.velocity_rps)
                 mode = ControlMode.VELOCITY
+            elif (target.mode == ControlMode.TORQUE_CURRENT
+                  and self.max_torque_current_a > 0
+                  and math.isfinite(target.torque_current_a)):
+                self.motor.set_torque_current(
+                    _clamp(target.torque_current_a,
+                           -self.max_torque_current_a,
+                           self.max_torque_current_a))
+                mode = ControlMode.TORQUE_CURRENT
         position_time = self.motor.position_time
         velocity_time = self.motor.velocity_time
         now_ns = self.node.now_ns
