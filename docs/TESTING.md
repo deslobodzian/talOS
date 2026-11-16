@@ -82,6 +82,15 @@ counts too); an ID later in a sentence is prose, not a tag.
   `tools/trace_waivers.txt`, which only shrinks; gap: LANE-1 for the tier,
   which the lane tags (§9) record but nothing checks]** `python3 tools/trace.py --report`
   prints each requirement's tests.
+- A robot repository's catalogue, its own `docs/REQUIREMENTS.md`, holds only
+  its own rows, in talOS's one numbering; its tests also tag talOS's rows.
+  **[enforced: its `trace_test`, `@talos//tools:trace.py --check
+  --talos-catalogue` (examples/robot_repo/BUILD.bazel): a tag naming a row of
+  neither catalogue, an ID in both, and its own SAFE, CONTRACT or P0 row
+  without a tagged test fail; talOS's rows need no test there; with no
+  catalogue of its own, only the tags are checked]** From its root, with
+  talOS as the submodule `talos/`: `python3 talos/tools/trace.py --check
+  --framework-catalogue talos/docs/REQUIREMENTS.md`.
 - Most SAFE requirements are provable in process on a deterministic clock
   (the catalogue's last column), so the safety case rests on unit and
   component tests. e2e and soak are **composition evidence**: they do not

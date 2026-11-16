@@ -48,6 +48,28 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# talOS's requirement trace (docs/TESTING.md §3) on this repository: every
+# test tag names a row of talOS's catalogue or of this repository's
+# docs/REQUIREMENTS.md, and each SAFE, CONTRACT or P0 row of its own has a
+# tagged test. With no docs/REQUIREMENTS.md, as here, only tags are checked.
+# Reads this repository's tracked files and the catalogue of the talOS
+# checkout @talos is built from, which are not Bazel inputs, so it is never
+# cached (`external`); well under a second.
+py_test(
+    name = "trace_test",
+    size = "small",
+    srcs = ["@talos//tools:trace.py"],
+    args = [
+        "--check",
+        "--root-of",
+        "$(rootpath MODULE.bazel)",
+        "--talos-catalogue",
+    ],
+    data = ["MODULE.bazel"],
+    main = "@talos//tools:trace.py",
+    tags = ["external"],
+)
+
 # Runs every node with --describe and lints the graph, as
 # `launcher --describe-only` does.
 talos_graph_test(
