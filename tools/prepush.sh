@@ -311,16 +311,19 @@ bazel_flags=(--noshow_progress "--disk_cache=$disk_cache"
   --experimental_inmemory_dotd_files=false '--remote_download_regex=.*\.d$')
 # Before the build, every `.d` in the reused output base is deleted, so
 # host-includes reads only this build's: the build rewrites or downloads
-# each one it needs, and one of a target since deleted is gone.
+# each one it needs, and one of a target since deleted is gone. The output
+# path is asked for once, here: a `bazel info` between the build and the
+# test makes the test re-run rules_python's pip extension, which fetches
+# pypi index pages, so a network blip there failed the test at analysis.
 built=0
 if run_step build sh -c \
-    'out="$(bazel info "$@" output_path)" &&
+    'out="$(bazel info "$@" output_path)" && printf "%s\n" "$out" >"$0" &&
      { [ ! -d "$out" ] || find "$out" -name "*.d" -type f -delete; } &&
-     bazel build //... "$@"' _ "${bazel_flags[@]}"; then
+     bazel build //... "$@"' "$logs/output_path" "${bazel_flags[@]}"; then
   built=1
   run_step host-includes sh -c \
-    'python3 "$1" "$(shift; bazel info "$@" output_path)"' _ \
-    "$tools/check_host_includes.py" "${bazel_flags[@]}" || true
+    'python3 "$1" "$(cat "$2")"' _ \
+    "$tools/check_host_includes.py" "$logs/output_path" || true
   # The same probe as the test's: a user and network namespace that can
   # create a tap device.
   netns=()
