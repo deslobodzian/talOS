@@ -341,19 +341,19 @@ struct SimHardware::Impl {
     }
   }
 
+  // The chain the gateway restores with the reset devices, by its own rule
+  // (hardware::RestoredWith; logical ids are unique across device tables).
   void MaskResets() {
     masked.clear();
-    for (const auto& [key, states] : resetting) masked.insert(key);
-    for (std::size_t pass = 0; pass < config.hardware.motors.size(); ++pass) {
-      for (const auto& m : config.hardware.motors) {
-        const bool master =
-            m.master_id != 0 && masked.contains({Kind::kMotor, m.master_id});
-        const bool sensor =
-            m.feedback == hardware::Feedback::kRemoteCANcoder &&
-            masked.contains({Kind::kCANcoder, m.feedback_sensor_id});
-        if (master || sensor) {
-          masked.insert({Kind::kMotor, m.id});
-        }
+    std::vector<std::uint16_t> ids;
+    for (const auto& [key, states] : resetting) {
+      masked.insert(key);
+      ids.push_back(key.second);
+    }
+    const auto& motors = config.hardware.motors;
+    for (std::size_t i = 0; i < motors.size(); ++i) {
+      if (hardware::RestoredWith(motors, i, ids)) {
+        masked.insert({Kind::kMotor, motors[i].id});
       }
     }
     std::erase_if(resetting, [](auto& entry) { return --entry.second <= 0; });
