@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -85,6 +86,42 @@ TEST_F(LoopConsoleTest, EachCommandExpiryPrintsOneLineWithItsTime) {
   ASSERT_EQ(lines_.size(), 2u);
   EXPECT_NE(lines_[1].find("[2.200]"), std::string::npos) << lines_[1];
   EXPECT_NE(lines_[1].find("(expiry 2)"), std::string::npos) << lines_[1];
+}
+
+// After a deploy that changed the hardware configuration, the RoboRIO
+// restores the old one and the Driver Station may already be enabled: the
+// gateway refuses the changed push, every node stays neutral, and only the
+// console says why. It names each refused push once, both configurations
+// and what to do; disabled, the same push is accepted.
+// REQ-SAFE-21
+TEST_F(LoopConsoleTest, APushRefusedWhileEnabledNamesTheFixOncePerPush) {
+  hw::Config changed = Commissioned();
+  changed.status_hz = 100;
+  const std::string expected =
+      "hardware gateway refused configuration " +
+      std::to_string(hw::ConfigurationId(changed)) +
+      " while enabled (running " +
+      std::to_string(hw::ConfigurationId(Commissioned())) +
+      "): disable to accept the new configuration";
+  TickEnabled(1'000'000, 1'000'000);
+  uint64_t now_us = 1'005'000;
+  for (std::size_t push = 1; push <= 2; ++push) {
+    EXPECT_FALSE(gateway_.BeginReconfigure(changed));
+    // A second of ticks after each push.
+    TickEnabled(now_us, now_us + 1'000'000);
+    now_us += 1'000'000 + kPeriodUs;
+    log_.Drain(push * 10'000'000);
+    ASSERT_EQ(lines_.size(), push) << "one line per refused push";
+    EXPECT_NE(lines_.back().find(expected), std::string::npos) << lines_.back();
+  }
+
+  gateway_.Tick(now_us, false);
+  ASSERT_TRUE(gateway_.BeginReconfigure(changed));
+  gateway_.Tick(now_us + kPeriodUs, false);  // the configure completes
+  console_.ObserveGateway(gateway_);
+  EXPECT_EQ(gateway_.snapshot().config_id, hw::ConfigurationId(changed));
+  log_.Drain(30'000'000);
+  EXPECT_EQ(lines_.size(), 2u);
 }
 
 }  // namespace

@@ -9,7 +9,9 @@
 // that no State field carries: each command expiry, with its time and its
 // delay from the command's observation, so a link, bridge or launcher loss
 // that leaves no State on the main processor still records when the RoboRIO
-// went neutral.
+// went neutral; and each changed configuration the gateway refused because
+// it was enabled, which otherwise leaves every node neutral with nothing
+// naming the cause.
 //
 // Called on the loop thread, it only compares counters and posts a
 // fixed-size RioLog event when one rose; RioLog's logger thread writes the
@@ -22,16 +24,23 @@ class LoopConsole {
   // RioLog kMessage indices (rate-limit keys) of its lines; Robot.cpp uses 1
   // to 6, PhoenixBackend 0, 7, 8 and 16 to 31.
   static constexpr uint16_t kCommandExpiryMessage = 9;
+  static constexpr uint16_t kConfigRefusedMessage = 10;
 
   explicit LoopConsole(RioLog& log) : log_{log} {}
 
   // The loop thread, after each tick's gateway work: one line for the
-  // gateway's last command expiry when one happened since the previous call.
+  // gateway's last command expiry and one for its last refusal of a changed
+  // configuration while enabled, each when one happened since the previous
+  // call.
   void ObserveGateway(const hardware::Gateway& gateway);
 
  private:
+  void ReportExpiry(const hardware::Gateway::CommandExpiry& expiry);
+  void ReportRefusal(const hardware::Gateway::EnabledRefusal& refusal);
+
   RioLog& log_;
   uint64_t reported_expiries_{0};
+  uint64_t reported_refusals_{0};
 };
 
 }  // namespace talos::rio

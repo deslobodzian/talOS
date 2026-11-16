@@ -127,7 +127,10 @@ bool Gateway::Reconfigure(const Config& config) {
     config_error_.reset();
     return true;
   }
-  if (enabled_) return false;
+  if (enabled_) {
+    RecordEnabledRefusal(config);
+    return false;
+  }
   try {
     Validate(config);
   } catch (...) {
@@ -156,7 +159,10 @@ bool Gateway::Reconfigure(const Config& config) {
 bool Gateway::BeginReconfigure(const Config& config) {
   if (configuring_ || restoring_) return false;
   if (configured_ && config == config_) return Reconfigure(config);
-  if (enabled_) return false;
+  if (enabled_) {
+    RecordEnabledRefusal(config);
+    return false;
+  }
   try {
     Validate(config);
   } catch (...) {
@@ -219,6 +225,16 @@ void Gateway::CommitConfiguration(const Config& config) {
   // other devices: nothing is a sample until this one's first Read.
   MarkUnread(state_);
   Invalidate();
+}
+void Gateway::RecordEnabledRefusal(const Config& refused) {
+  uint64_t refused_id = 0;
+  try {
+    refused_id = ConfigurationId(refused);  // validates it first
+  } catch (...) {
+    refused_id = 0;  // one that would not validate has no id
+  }
+  last_enabled_refusal_ = {last_enabled_refusal_.count + 1, refused_id,
+                           configured_ ? state_.config_id : 0};
 }
 void Gateway::Invalidate() {
   active_ = false;

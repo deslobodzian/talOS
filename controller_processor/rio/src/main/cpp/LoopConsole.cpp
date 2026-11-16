@@ -15,7 +15,27 @@ double DelayMs(uint64_t from_us, uint64_t to_us) {
 }  // namespace
 
 void LoopConsole::ObserveGateway(const hardware::Gateway& gateway) {
-  const auto& expiry = gateway.last_command_expiry();
+  ReportExpiry(gateway.last_command_expiry());
+  ReportRefusal(gateway.last_enabled_refusal());
+}
+
+void LoopConsole::ReportRefusal(
+    const hardware::Gateway::EnabledRefusal& refusal) {
+  if (refusal.count == reported_refusals_) return;
+  reported_refusals_ = refusal.count;
+  char text[160];
+  std::snprintf(text, sizeof(text),
+                "hardware gateway refused configuration %llu while enabled "
+                "(running %llu): disable to accept the new configuration",
+                static_cast<unsigned long long>(refusal.refused_id),
+                static_cast<unsigned long long>(refusal.active_id));
+  LogEvent event;
+  event.index = kConfigRefusedMessage;
+  event.SetText(text);
+  log_.Post(event);
+}
+
+void LoopConsole::ReportExpiry(const hardware::Gateway::CommandExpiry& expiry) {
   if (expiry.count == reported_expiries_) return;
   reported_expiries_ = expiry.count;
   // The neutral's own time, not the line's: RioLog writes it up to a drain
