@@ -543,7 +543,8 @@ inline void ShareRegistrySegment(int fd, const struct stat& status) {
 // stale segment is harmless because slots are reclaimed by heartbeat or
 // claimant death and the version is in the name. A launcher session in a
 // namespace unlinks it once its members are reaped, unless a row of another
-// session remains (NamespaceNames, launcher.cc).
+// session whose claimant is still running remains (NamespaceNames,
+// launcher.cc).
 class RegistryMapping {
  public:
   explicit RegistryMapping(std::string_view path = kRegistryPath,

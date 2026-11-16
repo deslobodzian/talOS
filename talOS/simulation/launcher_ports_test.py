@@ -23,8 +23,8 @@ LOG_DUMP_TIMEOUT_S = 10
 # What hardware_node prints on the first State it accepts from a gateway
 # boot (HardwareNode::ReportGatewayBuild); the launcher echoes it.
 FIRST_STATE_LINE = "hardware_node: gateway boot "
-# talOS/introspection/registry.h kRegistryPath. The launcher leaves the
-# registry for later sessions, so the test unlinks its own.
+# talOS/introspection/registry.h kRegistryPath. A launcher killed before it
+# reaps its members leaves the registry, so the test unlinks its own.
 REGISTRY = "/talos_registry.6"
 
 

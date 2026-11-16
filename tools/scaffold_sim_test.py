@@ -45,9 +45,10 @@ from tools import sync_manifest
 # position_cpp first: the gripper's check uses when it reached its goal.
 MECHANISMS = (("position_cpp", "position"), ("gripper", "velocity"))
 
-# talOS/introspection/registry.h kRegistryPath. The launcher creates the
-# registry and deliberately leaves it for later sessions, so the test
-# unlinks its own after the run.
+# talOS/introspection/registry.h kRegistryPath. A launch in a namespace
+# removes the registry once its members are reaped (talOS/launcher/README.md
+# "One session per namespace"); one killed before then leaves it, so the
+# test unlinks the namespace's after the run.
 REGISTRY = "/talos_registry.6"
 
 # Bounds on a hang, not on a run (which lasts SIM_DURATION_S or
@@ -185,7 +186,8 @@ class ScaffoldSimTest(unittest.TestCase):
         gateway_port, bridge_port = udp_ports()
         # Bazel's TEST_TMPDIR is the shared-memory namespace
         # (ARCHITECTURE.md "Topics and messages") and holds the lock files,
-        # which Bazel removes with it; only the registry segment is left to
+        # which Bazel removes with it; only the registry segment, which a
+        # launch killed before its members are reaped leaves, may remain to
         # unlink.
         namespace = os.environ.get("TEST_TMPDIR") or tmp
         env.pop("TALOS_SHM_NAMESPACE", None)

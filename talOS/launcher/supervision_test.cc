@@ -2142,10 +2142,10 @@ TEST(Supervision, SendsReadyThenWatchdogDatagrams) {
 }
 
 // The service watchdog is what bounds a deployed session whose launcher
-// hangs (README "Supervision passes"; TODO.md LAUNCH-2): with the loop held
-// inside a pass (its clock read blocked), no WATCHDOG=1 goes out for three
-// watchdog intervals, and the pings resume once the loop does. A watchdog
-// thread, or any ping not sent by the loop itself, fails it.
+// hangs (README "Supervision passes"): with the loop held inside a pass (its
+// clock read blocked), no WATCHDOG=1 goes out for three watchdog intervals,
+// and the pings resume once the loop does. A watchdog thread, or any ping not
+// sent by the loop itself, fails it.
 // REQ-OPS-07
 TEST(Supervision, AStalledLoopStopsFeedingTheServiceWatchdog) {
   const std::string path = "/tmp/tw_" + std::to_string(::getpid());
@@ -2410,8 +2410,8 @@ bool SegmentExists(const std::string& mapped) {
 // A session in a shared-memory namespace leaves none of its names behind:
 // the registry segment it prepared, the registry's writer lock file, and the
 // session lock file all exist while it runs and are gone once it has
-// returned, every member reaped (TODO.md LAUNCH-3: a host that runs
-// namespaced sessions all day otherwise collects three per session).
+// returned, every member reaped (a host that runs namespaced sessions all
+// day otherwise collects three per session).
 // REQ-OPS-03
 TEST(Supervision, ANamespacedSessionLeavesNoNamesBehind) {
   const std::string registry = ShmObjectName(introspect::kRegistryPath);
