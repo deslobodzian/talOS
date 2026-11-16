@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -196,8 +197,11 @@ std::uint64_t LogWriter::session_id() const noexcept {
 }
 
 LogWriter::State::~State() {
-  // Explicit flush is optional; destruction drains the accepted prefix too.
-  if (active != nullptr && active->used > 0) {
+  // Explicit flush is optional; destruction drains the accepted prefix too,
+  // and marks an open gap closed, with the writer still running to make room.
+  if (losing || held_exit) {
+    settle();
+  } else if (active != nullptr && active->used > 0) {
     submit_active();
   }
   stop_writer();
@@ -242,6 +246,7 @@ void LogWriter::State::write_chunk(Chunk& chunk) noexcept {
                                : chunk.used;
 
   if (failed || size == 0) return;
+  if (options.background && options.before_write) options.before_write();
   // The chunk's segment is read only once it holds records: the producer set
   // it before committing the first.
   if (chunk.written == 0 && chunk.segment != file_segment) {
@@ -415,36 +420,37 @@ void LogWriter::State::submit_active() noexcept {
 }
 
 // Only the producer selects free chunks. The consumer returns ownership by
-// advancing completed after finishing the write.
-void LogWriter::State::acquire_chunk() noexcept {
+// advancing completed after finishing the write. False when every chunk is
+// handed over and not yet written: the pool is full.
+bool LogWriter::State::acquire_chunk() noexcept {
   if (active != nullptr) {
-    return;
+    return true;
   }
 
   const auto next = submitted.load(std::memory_order_relaxed);
   if (next - completed.load(std::memory_order_acquire) >= pool.size()) {
-    capture_error.store(CaptureError::POOL_FULL);
-    return;
+    return false;
   }
 
   active = &pool[next % pool.size()];
   active->used = 0;
   active->segment = segment;
+  return true;
 }
 
-void LogWriter::State::append(RecordHeader header,
-                              std::span<const std::byte> payload) noexcept {
-  if (failed || capture_error.load() != CaptureError::NONE) return;
-
-  payload = SealRecord(header, payload);
-
-  const std::size_t total = sizeof(RecordHeader) + payload.size();
+LogWriter::State::Take LogWriter::State::take(
+    const RecordHeader& header, std::span<const std::byte> stored) noexcept {
+  const std::size_t total = sizeof(RecordHeader) + stored.size();
+  // Capacity is fixed before dispatch begins: a record larger than a chunk
+  // is dropped (a gap), never allocated for, before it can end a segment or
+  // hand a chunk over.
+  if (total > pool.front().data.size()) return Take::kTooLarge;
   const std::uint64_t limit =
       segment_bytes != 0 ? segment_bytes : options.max_bytes;
   const bool full = limit != 0 && segment_used + total > limit;
   if (full && (segment_bytes == 0 || prefix.size() + total > segment_bytes)) {
     capture_error.store(CaptureError::BYTE_CAP);
-    return;
+    return Take::kStopped;
   }
   // Options::window: the segment's records span a window / n of record time.
   // Nonzero only for a rotating log; the segment holds a record (the first
@@ -463,38 +469,20 @@ void LogWriter::State::append(RecordHeader header,
     segment_used = prefix.size();
     if (active != nullptr) {
       active->segment = segment;  // Synchronous: the same, emptied chunk.
-    } else {
-      acquire_chunk();
-      if (active == nullptr) return;
     }
   }
 
-  if (active == nullptr) {
-    acquire_chunk();
-    if (active == nullptr) {
-      return;
-    }
-  }
+  if (!acquire_chunk()) return Take::kPoolFull;
 
   if (active->used + total > active->data.size()) {
     submit_active();
-    acquire_chunk();
-    if (active == nullptr) {
-      return;
-    }
-  }
-
-  // Capacity is fixed before dispatch begins. Preserve the accepted prefix
-  // and make failure visible instead of allocating or leaving a hole.
-  if (total > active->data.size()) {
-    capture_error.store(CaptureError::RECORD_TOO_LARGE);
-    return;
+    if (!acquire_chunk()) return Take::kPoolFull;
   }
 
   std::memcpy(active->data.data() + active->used, &header, sizeof(header));
-  if (!payload.empty()) {
+  if (!stored.empty()) {
     std::memcpy(active->data.data() + active->used + sizeof(header),
-                payload.data(), payload.size());
+                stored.data(), stored.size());
   }
   active->used += total;
   if (segment_used == prefix.size()) segment_first_ns = header.now_ns;
@@ -513,10 +501,187 @@ void LogWriter::State::append(RecordHeader header,
     submit_active();
     sync(/*durable=*/false);
   }
+  return Take::kTaken;
+}
+
+void LogWriter::State::open_gap(const RecordHeader& header,
+                                GapCause cause) noexcept {
+  losing = true;
+  losing_flag.store(true, std::memory_order_relaxed);
+  gap_count.store(gap_count.load(std::memory_order_relaxed) + 1,
+                  std::memory_order_relaxed);
+  gap = GapRecord{};
+  gap.cause = static_cast<std::uint16_t>(cause);
+  gap.first_lost_ns = header.now_ns;
+  gap.last_lost_ns = std::numeric_limits<std::int64_t>::min();
+  // The dispatch the gap starts in had records taken before it.
+  if (header.dispatch_index != 0 &&
+      header.dispatch_index == last_accepted_dispatch) {
+    gap.flags |= GAP_SPLITS_DISPATCH;
+  }
+  gap_first_dispatch = header.dispatch_index;
+  gap_start_ns = std::numeric_limits<std::int64_t>::max();
+}
+
+// A dropped record: counted in the open gap, or, an EXIT, held for the stop.
+// No copy, no checksum, no trailing-zero scan.
+void LogWriter::State::lose(const RecordHeader& header,
+                            std::size_t payload_bytes) noexcept {
+  const auto kind = static_cast<EventKind>(header.kind);
+  if (kind == EventKind::EXIT) {
+    held_exit = header;
+    return;
+  }
+  ++gap.records;
+  gap.bytes += sizeof(RecordHeader) + payload_bytes;
+  const bool opens = kind == EventKind::TIMER || kind == EventKind::MESSAGE;
+  const bool sends = kind == EventKind::SEND;
+  if (opens) ++gap.dispatches;
+  if (sends) ++gap.sends;
+  // Operation records (READ, ARM_TIMER, ...) name no time of their own: they
+  // belong to a dispatch whose opener is counted or was recorded.
+  if (opens || sends) {
+    gap_start_ns = std::min(gap_start_ns, header.event_time_ns);
+  }
+  if (kind == EventKind::MESSAGE || sends) {
+    gap_start_ns = std::min(gap_start_ns, header.publish_time_ns);
+  }
+  gap.last_lost_ns = std::max(gap.last_lost_ns, header.now_ns);
+  gap.last_dispatch_index = header.dispatch_index;
+  lost_records.store(lost_records.load(std::memory_order_relaxed) + 1,
+                     std::memory_order_relaxed);
+}
+
+// Capture resumes only with half the pool free (at least one chunk): a gap
+// opens only once every chunk is handed over, so between two GAP records of
+// a full pool the loop hands over at least half the pool, and the writer
+// still has the other half queued when capture resumes.
+bool LogWriter::State::room_to_resume() const noexcept {
+  if (!options.background) return true;
+  const std::uint64_t outstanding = submitted.load(std::memory_order_relaxed) -
+                                    completed.load(std::memory_order_acquire);
+  const std::uint64_t half = std::max<std::uint64_t>(1, pool.size() / 2);
+  return outstanding + half <= pool.size();
+}
+
+LogWriter::State::Take LogWriter::State::take_gap(
+    std::int64_t now_ns) noexcept {
+  RecordHeader header{};
+  header.kind = static_cast<std::uint16_t>(EventKind::GAP);
+  header.source_id = GAP_SOURCE_ID;
+  header.dispatch_index = gap_first_dispatch;
+  // With only operation records dropped, none named a time: the first
+  // dropped record's.
+  header.event_time_ns =
+      gap_start_ns == std::numeric_limits<std::int64_t>::max()
+          ? gap.first_lost_ns
+          : gap_start_ns;
+  header.now_ns = now_ns;
+  const std::span<const std::byte> stored =
+      SealRecord(header, as_bytes(&gap, sizeof(gap)));
+  return take(header, stored);
+}
+
+void LogWriter::State::append(RecordHeader header,
+                              std::span<const std::byte> payload) noexcept {
+  if (failed || capture_error.load() != CaptureError::NONE) return;
+  const std::size_t payload_bytes = payload.size();
+
+  if (losing) {
+    // Resume only at a record that starts a new dispatch (or belongs to
+    // none), so the records after a GAP are whole dispatches.
+    const bool opens = header.dispatch_index == 0 ||
+                       header.dispatch_index != gap.last_dispatch_index;
+    if (!opens || !room_to_resume()) {
+      lose(header, payload_bytes);
+      return;
+    }
+    payload = SealRecord(header, payload);
+    if (sizeof(RecordHeader) + payload.size() > pool.front().data.size()) {
+      lose(header, payload_bytes);
+      return;
+    }
+    switch (take_gap(header.now_ns)) {
+      case Take::kTaken:
+        break;
+      case Take::kStopped:
+        // The byte cap ended capture: that gap stays unmarked.
+        losing = false;
+        losing_flag.store(false, std::memory_order_relaxed);
+        return;
+      case Take::kPoolFull:
+      case Take::kTooLarge:
+        lose(header, payload_bytes);  // Still open.
+        return;
+    }
+    losing = false;
+    losing_flag.store(false, std::memory_order_relaxed);
+  } else {
+    payload = SealRecord(header, payload);
+  }
+
+  const Take taken = take(header, payload);
+  if (taken == Take::kTaken) {
+    last_accepted_dispatch = header.dispatch_index;
+    return;
+  }
+  if (taken == Take::kStopped) return;
+  // An EXIT that finds no room opens no gap: it is held for the stop.
+  if (static_cast<EventKind>(header.kind) != EventKind::EXIT) {
+    open_gap(header, taken == Take::kTooLarge ? GapCause::RECORD_TOO_LARGE
+                                              : GapCause::POOL_FULL);
+  }
+  lose(header, payload_bytes);
+}
+
+bool LogWriter::State::close_at_stop() noexcept {
+  const auto open = [this] {
+    return !failed && capture_error.load() == CaptureError::NONE;
+  };
+  bool took = false;
+  if (losing) {
+    losing = false;
+    losing_flag.store(false, std::memory_order_relaxed);
+    if (open()) {
+      gap.flags |= GAP_CLOSED_AT_FLUSH;
+      took = take_gap(held_exit ? held_exit->now_ns : gap.last_lost_ns) ==
+             Take::kTaken;
+    }
+  }
+  if (held_exit) {
+    RecordHeader exit = *held_exit;
+    held_exit.reset();
+    if (open() && take(exit, SealRecord(exit, {})) == Take::kTaken) {
+      last_accepted_dispatch = exit.dispatch_index;
+      took = true;
+    }
+  }
+  return took;
+}
+
+void LogWriter::State::wait_written() noexcept {
+  if (!options.background || !writer.joinable()) return;
+  wake.post();
+  std::unique_lock lock{mutex};
+  chunk_ready.wait(lock, [this] {
+    return file_ready && completed.load() == submitted.load();
+  });
+}
+
+void LogWriter::State::settle() noexcept {
+  submit_active();
+  // Not started: nothing was handed over and no file exists.
+  if (options.background && !writer.joinable()) return;
+  wait_written();
+  // Every chunk is written, so the pool has room for what the stop adds.
+  if (close_at_stop()) {
+    submit_active();
+    wait_written();
+  }
 }
 
 void LogWriter::State::drain() noexcept {
-  submit_active();
+  settle();
 
   if (!options.background) {
     sync(/*durable=*/true);
@@ -526,13 +691,9 @@ void LogWriter::State::drain() noexcept {
   // Not started: nothing was handed over and no file exists.
   if (!writer.joinable()) return;
 
-  wake.post();
-  std::unique_lock lock{mutex};
-  chunk_ready.wait(lock, [this] {
-    return file_ready && completed.load() == submitted.load();
-  });
   // All submitted chunks have reached the descriptor; serialize the sync with
   // the worker's periodic one, which also runs under this mutex.
+  std::lock_guard lock{mutex};
   sync(/*durable=*/true);
 }
 
@@ -684,7 +845,8 @@ void LogWriter::State::stop_writer() noexcept {
 void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
   State& state = *state_;
 
-  std::size_t largest_record = sizeof(RecordHeader);
+  // Every chunk and every segment holds a GAP record.
+  std::size_t largest_record = GAP_RECORD_BYTES;
   for (const auto& reg : manifest) {
     largest_record =
         std::max(largest_record, sizeof(RecordHeader) + reg.message_bytes);
@@ -775,7 +937,7 @@ void LogWriter::start(const Manifest& manifest, MonotonicTime start_time) {
       if (state.options.window.count() > 0) {
         // Never sooner than sync_interval: each rotation syncs durably and
         // takes a chunk, so a window whose segments end faster than the
-        // writer syncs could exhaust the pool and stop capture for good.
+        // writer syncs could exhaust the pool and drop records.
         state.segment_span_ns = std::max<std::uint64_t>(
             static_cast<std::uint64_t>(
                 std::max<std::int64_t>(1, state.options.sync_interval.count())),
@@ -838,22 +1000,9 @@ void LogWriter::finish(const Context& context) noexcept {
 
 void LogWriter::flush() noexcept { state_->drain(); }
 
-bool LogWriter::failed() const noexcept {
-  const auto capture = state_->capture_error.load();
-  return state_->failed || (capture != State::CaptureError::NONE &&
-                            capture != State::CaptureError::BYTE_CAP);
-}
+bool LogWriter::failed() const noexcept { return state_->failed; }
 
 std::string LogWriter::error() const {
-  switch (state_->capture_error.load()) {
-    case State::CaptureError::POOL_FULL:
-      return "LogWriter: buffer pool exhausted; capture stopped";
-    case State::CaptureError::RECORD_TOO_LARGE:
-      return "LogWriter: record exceeds preallocated capacity; capture stopped";
-    case State::CaptureError::BYTE_CAP:
-    case State::CaptureError::NONE:
-      break;
-  }
   std::lock_guard lock{state_->error_mutex};
   if (state_->error.empty() &&
       state_->capture_error.load() == State::CaptureError::BYTE_CAP) {
@@ -865,7 +1014,19 @@ std::string LogWriter::error() const {
 }
 
 bool LogWriter::capture_stopped() const noexcept {
-  return state_->capture_error.load() != State::CaptureError::NONE;
+  return state_->capture_error.load() == State::CaptureError::BYTE_CAP;
+}
+
+std::uint64_t LogWriter::gaps() const noexcept {
+  return state_->gap_count.load(std::memory_order_relaxed);
+}
+
+std::uint64_t LogWriter::lost_records() const noexcept {
+  return state_->lost_records.load(std::memory_order_relaxed);
+}
+
+bool LogWriter::losing() const noexcept {
+  return state_->losing_flag.load(std::memory_order_relaxed);
 }
 
 std::uint64_t LogWriter::wakeups() const noexcept {

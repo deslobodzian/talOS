@@ -345,7 +345,7 @@ TEST_F(Registry, OutputsHeldSetsAndClearsWithoutTouchingTheOtherFlags) {
   NodeRegistration registration{{.name = "gate"}, path_};
   registration.publish(sample_manifest());
   registration.set_realtime({.tier = process::LoopTier::kControl});
-  registration.set_recording(/*failed=*/false, /*capped=*/true);
+  registration.set_recording(/*failed=*/false, /*capped=*/true, /*gap=*/false);
   auto reader = RegistryReader::open(path_);
   ASSERT_TRUE(reader.has_value());
   const auto row = [&reader] {
@@ -840,7 +840,7 @@ TEST_F(Registry, ARefusedRealtimeGrantIsVisibleInTheRow) {
   NodeRegistration registration{{.name = "lift", .flags = kFlagSimulation},
                                 path_};
   registration.publish(sample_manifest());
-  registration.set_recording(/*failed=*/false, /*capped=*/true);
+  registration.set_recording(/*failed=*/false, /*capped=*/true, /*gap=*/false);
   auto reader = RegistryReader::open(path_);
   ASSERT_TRUE(reader.has_value());
   const auto row = [&reader] {
@@ -863,6 +863,34 @@ TEST_F(Registry, ARefusedRealtimeGrantIsVisibleInTheRow) {
   EXPECT_NE(node.flags & kFlagSimulation, 0u);
   EXPECT_NE(node.flags & kFlagLogCapped, 0u);
   EXPECT_EQ(node.flags & kFlagRecorderFailed, 0u);
+}
+
+// A log with a gap is not a failed one: the launcher reads kFlagLogGap from
+// the row to mark the member log_gap, and kFlagRecorderFailed only for a log
+// whose capture is over. The bit stays once the gap has closed, since the
+// records it marks stay lost.
+// REQ-OPS-52
+TEST_F(Registry, ALogGapIsItsOwnFlagAndOutlivesTheGap) {
+  NodeRegistration registration{{.name = "lift"}, path_};
+  registration.publish(sample_manifest());
+  auto reader = RegistryReader::open(path_);
+  ASSERT_TRUE(reader.has_value());
+  const auto row = [&reader] {
+    const auto nodes = reader->nodes();
+    EXPECT_EQ(nodes.size(), 1u);
+    return nodes.front();
+  };
+  registration.set_recording(/*failed=*/false, /*capped=*/false,
+                             /*gap=*/false);
+  EXPECT_FALSE(row().log_gap());
+
+  registration.set_recording(/*failed=*/false, /*capped=*/false,
+                             /*gap=*/true);
+  registration.set_recording(/*failed=*/false, /*capped=*/false,
+                             /*gap=*/false);
+  const NodeSnapshot node = row();
+  EXPECT_TRUE(node.log_gap());
+  EXPECT_EQ(node.flags & (kFlagRecorderFailed | kFlagLogCapped), 0u);
 }
 
 // A notification its writer could not send -- here no descriptor is left for

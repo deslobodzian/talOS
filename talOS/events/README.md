@@ -408,8 +408,7 @@ records, bytes, dispatches and sends dropped): 128 B in all
 (`GAP_RECORD_BYTES`). Both readers return it like any record and count it
 (`gaps()`, `LogSummary::gaps`); `GapOf` decodes it and `DescribeGap` states
 it in one line. A damaged GAP record is skipped as damage like any other.
-This build's writer writes none: an exhausted pool stops capture (below).
-Tests make one with `CopyWithGap` (`log/gap_testing.h`, testonly
+The writer writes one where it dropped records (below). Tests make one with `CopyWithGap` (`log/gap_testing.h`, testonly
 `//talOS/events:gap_testing`).
 
 Records are copied into preallocated chunks and handed to a background thread
@@ -434,21 +433,34 @@ a lock, and a post made before the writer waits is kept. A node logging
 more often than every 10 ms posts a record only when its stream starts.
 The writer runs under the normal scheduling
 policy (`SCHED_OTHER` on Linux, the standard policy on macOS) even when the
-thread that started it runs realtime. If the pool is exhausted,
-capture stops permanently: `failed()` becomes true and `error()` explains why.
-Previously accepted records are drained in order, leaving a prefix without a
-clean `EXIT`, rather than a log with holes.
+thread that started it runs realtime.
 
-Capture never resumes, because resuming would put a hole in the middle of the
-log and replay would skip it without saying so. **Treat `failed()` as a robot
-fault**, next to a brownout or a lost CAN device: it means the rest of the match
-is not replayable. `error()` says why, and `capture_stopped()` distinguishes
-"the loop outran the writer" from a disk error.
+`start()` sizes every chunk for the manifest's largest payload and a GAP
+record. A record the writer cannot take, because every chunk is handed over
+and not yet written (the pool is full: the disk fell behind) or because it is
+larger than a chunk, is dropped whole, without allocating, and so is every
+later record until one that starts a new dispatch (or belongs to none, as
+the hardware bridge's do) finds at least half the pool free. That record is
+preceded in the log by one GAP record naming what was dropped, so the log
+holds every record the writer accepted, in order, and each dropped stretch is
+marked where it happened; replay and the log tools read the mark. Resuming
+only with half the pool free means one GAP per half pool handed over at most,
+however slow the disk. Dropping, counting and resuming are the loop thread's
+own work: O(1) per record, no lock, no allocation, no wait. An `EXIT` that
+finds no room is held, not dropped: `flush()` and destruction write it after
+the gap's GAP record, which is marked closed at the stop when capture had not
+resumed by then. A process killed during a gap leaves no GAP record; its
+registry row ([event log state](../introspection/README.md#event-log-state))
+told the launcher. `gaps()`, `lost_records()` and `losing()` report a gap to
+any thread.
 
-`start()` sizes every chunk for the manifest's largest payload. A record larger
-than that capacity also stops capture without allocating. Header writing at
-startup, explicit `flush()`, shutdown, and the opt-in synchronous writer can
-still block on disk; do not call `flush()` from a control callback.
+`failed()` means only that capture is over: the disk refused a write or the
+log file could not be created. **Treat it as a robot fault**, next to a
+brownout or a lost CAN device: the rest of the match is not recorded.
+`error()` says why. `capture_stopped()` is the byte cap ending a log that
+cannot rotate. Header writing at startup, explicit `flush()`, shutdown, and
+the opt-in synchronous writer can still block on disk; do not call `flush()`
+from a control callback.
 
 ## Lateness
 

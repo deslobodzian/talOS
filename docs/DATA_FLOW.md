@@ -412,7 +412,8 @@ per `update()` that selects a lane, however often it calls `get()` or
 A byte-capped log (`LogWriterOptions::max_bytes`, the launcher's per-member
 share of `[robot] log_max_bytes`, in proportion to the bytes the member's log
 is expected to store per second: [log budget](../talOS/launcher/README.md#session-segments-and-logs)) is split into n = min(8, cap / (prefix +
-largest record)) segments of cap / n bytes, each a complete version-8 log
+largest record, at least the 128 B GAP record)) segments of cap / n bytes,
+each a complete version-8 log
 (its own header, manifest and schema block, then whole records). A segment
 ends when the next record would cross cap / n, or, with a window
 (`LogWriterOptions::window`, the launcher's `--log-window-us`), at the first
@@ -421,7 +422,7 @@ so a log that stays within its bytes keeps between (n - 1) / n of the window
 and the window. Time never ends a segment sooner than the writer's
 `sync_interval` (1 s) after its first record, whatever the window: a
 rotation syncs durably and takes a buffer chunk, so faster rotation could
-exhaust the writer's pool and stop capture. The newest
+exhaust the writer's pool and drop records (a gap). The newest
 is at the log's path, older ones at `<stem>.segment<k>.tlog`, and starting
 segment n + 1 deletes the oldest, so the log keeps its tail within the cap.
 `log_dump`, `tlog_to_wpilog` and `--replay-inputs` read every segment in a

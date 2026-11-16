@@ -139,6 +139,13 @@ int64_t WallClockNanos() {
       .count();
 }
 
+bool NodeProcessInfo::RecordLogGap() {
+  failed = true;
+  if (log_gap) return false;
+  log_gap = true;
+  return true;
+}
+
 bool NodeProcessInfo::RecordRealtime(const process::RealtimeOutcome& outcome) {
   if (realtime && realtime->grant() >= outcome.grant()) return false;
   realtime = outcome;
@@ -274,6 +281,7 @@ std::string SessionManifest::ToJson() const {
        << ",\n";
     ss << "      \"log_capped\": " << (n.log_capped ? "true" : "false")
        << ",\n";
+    ss << "      \"log_gap\": " << (n.log_gap ? "true" : "false") << ",\n";
     ss << "      \"described\": " << (n.described ? "true" : "false") << ",\n";
     ss << "      \"endpoint_mismatch\": "
        << (n.endpoint_mismatch ? "true" : "false") << ",\n";

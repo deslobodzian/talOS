@@ -189,7 +189,8 @@ double ExpectedLogRate(const introspect::Description& declared,
 
 uint64_t SmallestRotatingShare(const introspect::Description& declared) {
   uint64_t prefix = sizeof(event::log::FileHeader);
-  uint64_t largest = sizeof(event::log::RecordHeader);
+  // At least a GAP record: every segment holds one (LogWriter::start).
+  uint64_t largest = event::log::GAP_RECORD_BYTES;
   for (const auto& source : declared.sources) {
     if (IsByteTopic(source)) continue;  // Not in the loop's manifest.
     prefix += sizeof(event::log::ManifestEntry) + source.schema.size() +

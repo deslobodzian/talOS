@@ -571,6 +571,96 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
   std::filesystem::remove_all(out_dir);
 }
 
+// A run whose event log holds a GAP record is marked at shutdown: log_gap,
+// and recorder_failed with it (a gapped log is incomplete evidence), with one
+// line naming the member and the log. The stub leaves the log a writer makes
+// when it drops an oversized record and resumes at the next dispatch; a
+// member whose log has none is marked neither.
+// REQ-OPS-52
+TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
+  const std::string tag = "log_gap";
+  const std::string out_dir = TempPath(tag + "_out");
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::create_directories(out_dir);
+  const std::string gapped = TempPath(tag + "_source.tlog");
+  {
+    event::log::LogWriter writer{
+        gapped, "alpha",
+        event::log::LogWriterOptions{512, 1, /*background=*/false}};
+    writer.start({}, {});
+    const std::vector<std::byte> small(16, std::byte{1});
+    const std::vector<std::byte> oversized(1024, std::byte{1});
+    for (uint64_t d = 1; d <= 3; ++d) {
+      event::Context context{};
+      context.kind = event::EventKind::TIMER;
+      context.dispatch_index = d;
+      writer.dispatch(context, d == 2 ? oversized : small);
+    }
+    writer.flush();
+    ASSERT_EQ(writer.gaps(), 1u);
+  }
+
+  LauncherOptions options;
+  options.output_dir = out_dir;
+  options.session_id = 0x6A9;
+  options.simulation = true;
+  options.duration_s = 1;
+  options.config_path = WriteFixtureToml();
+  std::string alpha = NodeDescribeThenSleep("alpha", "//example/alpha:node",
+                                            {Sender("/alpha/state")}, 30);
+  alpha.erase(alpha.rfind("exec sleep"));
+  alpha +=
+      "while [ $# -gt 0 ]; do\n"
+      " [ \"$1\" = --log ] && { shift; cp '" +
+      gapped +
+      "' \"$1\"; }\n"
+      " shift\n done\n"
+      "exec sleep 30\n";
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStubNode(tag + "_alpha", alpha);
+  options.binary_overrides["//example/beta:node"] = WriteStubNode(
+      tag + "_beta", NodeDescribeThenSleep("beta", "//example/beta:node",
+                                           {Watcher("/alpha/state")}, 30));
+  options.binary_overrides["//talOS/bridge:hardware_node"] = WriteStubNode(
+      tag + "_hardware",
+      NodeDescribeThenSleep("hardware_node", "//talOS/bridge:hardware_node", {},
+                            30));
+
+  ::testing::internal::CaptureStderr();
+  Launcher{options}.Run();
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+
+  const std::string manifest = ReadFile(
+      out_dir + "/" + std::to_string(options.session_id) + "/manifest.json");
+  const auto entry = [&manifest](std::string_view name) {
+    const std::size_t at =
+        manifest.find("\"name\": \"" + std::string{name} + "\"");
+    if (at == std::string::npos) return std::string{};
+    return manifest.substr(at, manifest.find("\"runs\": [", at) - at);
+  };
+  const std::string gapped_entry = entry("alpha");
+  EXPECT_NE(gapped_entry.find("\"log_gap\": true"), std::string::npos)
+      << gapped_entry;
+  EXPECT_NE(gapped_entry.find("\"recorder_failed\": true"), std::string::npos)
+      << gapped_entry;
+  const std::string whole_entry = entry("beta");
+  EXPECT_NE(whole_entry.find("\"log_gap\": false"), std::string::npos)
+      << whole_entry;
+  // One line, naming the member and its log.
+  std::size_t lines = 0;
+  std::istringstream text{stderr_text};
+  for (std::string line; std::getline(text, line);) {
+    if (line.find("alpha event log") != std::string::npos &&
+        line.find("lost records") != std::string::npos) {
+      ++lines;
+      EXPECT_NE(line.find("/alpha.tlog"), std::string::npos) << line;
+    }
+  }
+  EXPECT_EQ(lines, 1u) << stderr_text;
+  std::filesystem::remove_all(out_dir);
+  std::filesystem::remove(gapped);
+}
+
 // A member that ignores SIGINT is killed (SIGKILL, run reason stop_timeout)
 // at the stop timeout (kStopTimeout), neither before nor after. The test
 // freezes the supervision clock at the stop, holds it 100 ms short of the

@@ -628,13 +628,22 @@ A run whose event log stops early says so in its registry row while it runs
 creates its log on the writer thread once its loop starts, never on the loop
 thread, so one whose log cannot be created (a missing or unwritable session
 directory) keeps running with its row flagged, and exits 1 when stopped; the
-hardware bridge also prints the reason once. The launcher prints one line per member and kind (for a capped log, whether it records on, deleting its oldest records, or stopped, which it tells by the segments beside the log), and marks the member in the live
-manifest: `recorder_failed` for a failed log, `log_capped` for one whose byte
-share cost it records (its oldest segment deleted, or, with a share too small
-for two segments, capture stopped at the share). At normal shutdown it also
-marks a truncated, damaged or unreadable log `recorder_failed` and a capped one
-(`<log>.capped`) `log_capped`; a log whose capture stopped at a record
-boundary looks complete there, so only the live row reports it.
+hardware bridge also prints the reason once. A node or the bridge whose log
+has a gap (records dropped and marked while capture went on) also exits 1
+when stopped, and prints `recording_gaps=` and `records_lost=` on its exit
+line. The launcher prints one line per member and kind (for a capped log,
+whether it records on, deleting its oldest records, or stopped, which it
+tells by the segments beside the log; for a gap, `[launcher] <member> event
+log <log> lost records (a gap); the rest of this run is still recorded`),
+and marks the member in the live manifest: `recorder_failed` for a failed
+log, `log_gap` and `recorder_failed` for one with a gap (a gapped log is
+incomplete evidence), `log_capped` for one whose byte share cost it records
+(its oldest segment deleted, or, with a share too small for two segments,
+capture stopped at the share). At normal shutdown it also marks a truncated,
+damaged or unreadable log `recorder_failed`, one holding a GAP record
+`log_gap` and `recorder_failed` (with the gap line, if the live row had not
+shown it: a run killed during a gap leaves no GAP record, only the row), and
+a capped one (`<log>.capped`) `log_capped`.
 
 A run reports in its registry row the realtime scheduling its loop asked for
 and got ([realtime scheduling](../introspection/README.md#realtime-scheduling)).
@@ -919,6 +928,8 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
   version the launcher posts anyway, at the latest the one the run's end
   posts, so a healthy session adds no version, and a killed launcher loses
   only the increases after a count's first.
+- per node, `recorder_failed`, `log_gap` and `log_capped`: what its runs'
+  event logs lost ([restarts](#restarts)).
 - `stopped_before_start`: a stop request arrived before every member had
   started ([two phases](#two-phases)); the members without `runs` were
   never started.
@@ -1035,7 +1046,7 @@ one per actuator owner's request: the rate while owners change their
 demands. Byte topics are never logged. A member that did not answer `--describe`
 weighs as the mean of the others, and every member gets at least the
 smallest share at which its log rotates (two segments of its prefix and
-largest record) while those fit in the budget.
+largest record, at least a 128 B GAP record) while those fit in the budget.
 
 The shares give the session's log window, printed as the `Event-log window`
 line. T is the budget left after the floors over the summed rates of the
