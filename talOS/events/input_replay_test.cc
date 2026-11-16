@@ -15,6 +15,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
@@ -256,6 +257,56 @@ TEST(InputReplay, ReaderOnlyLogFeedsAtPublicationRatherThanDelayedReceipt) {
   ASSERT_EQ(replayed.contexts.size(), 1u);
   EXPECT_EQ(replayed.contexts[0].now, kOrigin + 2ms);
   EXPECT_EQ(replayed.contexts[0].publish_time, kOrigin + 2ms);
+  std::filesystem::remove_all(dir);
+}
+
+// Sends one reading from its constructor, before its loop's first dispatch.
+class InitialSender {
+ public:
+  InitialSender(Loop& loop, int value)
+      : sensor_{make_sender<EventsTest::SensorMessage>(loop, kTopics.sensor)} {
+    sensor_.send(EventsTest::SensorMessage{value, 1.0F, 1.0F});
+  }
+
+ private:
+  Sender<Loop, EventsTest::SensorMessage> sensor_;
+};
+
+// A send made before the first dispatch (a constructor's initial state) is
+// published at its loop's origin, which is what its readers saw; a node the
+// session did not run is fed it then, so a restarted writer's initial
+// message arrives at the restart, not at the session's start.
+// REQ-OPS-14
+TEST(InputReplay, FeedsAConstructorSendAtItsRunsOrigin) {
+  const std::string dir = TempDir("constructor_send");
+  const MonotonicTime restart = kOrigin + 50ms;
+  {
+    // One environment: the restarted writer continues the topic's sequence,
+    // as it does on a session's shared memory.
+    SimulationEnvironment environment;
+    for (const auto& [name, start, value] :
+         {std::tuple{"/writer.tlog", kOrigin, 1},
+          std::tuple{"/writer_restarted.tlog", restart, 2}}) {
+      Loop loop{environment, log::LogWriter{dir + name, "writer"},
+                Loop::Options{.start = start}};
+      const InitialSender sender{loop, value};
+      loop.run_until(start + 10ms);
+      loop.finish();
+      ASSERT_FALSE(loop.recorder().failed()) << loop.recorder().error();
+    }
+  }
+  const RecordedSession session{dir};
+  SimulationEnvironment environment;
+  SimulatedEventLoop<> loop{
+      environment, SimulatedEventLoop<>::Options{.start = session.start()}};
+  MessageTimes replayed;
+  watch<EventsTest::SensorMessage, &MessageTimes::receive>(loop, kTopics.sensor,
+                                                           &replayed);
+  ReplayInputs(loop, environment, session);
+  ASSERT_EQ(replayed.contexts.size(), 2u);
+  EXPECT_EQ(replayed.contexts[0].publish_time, kOrigin);
+  EXPECT_EQ(replayed.contexts[1].publish_time, restart);
+  EXPECT_EQ(replayed.contexts[1].now, restart);
   std::filesystem::remove_all(dir);
 }
 

@@ -90,8 +90,10 @@ struct RecordedMessage {
 //
 // Every other topic is fed from all logs: a message's time is its producer's
 // publish time, preserved in both SEND and MESSAGE records even when only a
-// delayed reader logged it, and one message seen in several logs is kept
-// once, by topic and transport sequence.
+// delayed reader logged it (a send recorded before its loop's first
+// dispatch, with no clock, at its log's origin, the transport's stamp), and
+// one message seen in several logs is kept once, by topic and transport
+// sequence.
 //
 // A log with a GAP record (log/format.h), or a damaged stretch (records lost
 // between intact ones, log::LogDamage::spans), lost records there: each

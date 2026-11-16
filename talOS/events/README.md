@@ -335,9 +335,13 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   `/hw/status`) and its
   readers' receipts carry the same transport sequence and publication time,
   so a program that did not watch a topic live is fed each of its
-  publications once, at its publication time. One message seen
-  in several logs is kept once, by topic and transport sequence, at the
-  earliest time recorded. Logs from two sessions, or a topic recorded with
+  publications once, at its publication time. A `SEND` made before its
+  loop's first dispatch (a constructor's initial state) is recorded with no
+  clock (`now_ns` and `publish_time_ns` 0); the transport stamped it with
+  the loop's origin, which its readers recorded, so it is fed at its log's
+  origin: a restarted writer's initial message at its restart. One message
+  seen in several logs is kept once, by topic and transport sequence, at
+  the earliest time recorded. Logs from two sessions, or a topic recorded with
   two schemas, are refused.
 - A program the session ran (logs carrying its process name) replays on its
   own recorded timeline. Each process's log has its own origin, and its
