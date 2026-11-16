@@ -1298,6 +1298,106 @@ TEST(InputReplay, ARunWhoseLogRotatedPastTenSegmentsKeepsItsTimeline) {
   std::filesystem::remove_all(out);
 }
 
+// The deadline of every timer firing the log at `path` recorded.
+std::vector<std::int64_t> TimerFirings(const std::string& path) {
+  log::LogReader reader{path};
+  std::vector<std::int64_t> firings;
+  log::LogReader::Record record;
+  while (reader.next(record)) {
+    if (record.header.kind == static_cast<std::uint16_t>(EventKind::TIMER)) {
+      firings.push_back(record.header.event_time_ns);
+    }
+  }
+  return firings;
+}
+
+// Records a Ticker, its run starting kLateRun after its origin, into
+// `<dir>/ticker.tlog` up to kSessionMs after the origin.
+void RecordLateTicker(const std::string& dir) {
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{dir + "/ticker.tlog", "ticker"},
+            Loop::Options{.start = kOrigin, .run_start = kOrigin + kLateRun}};
+  const Ticker ticker{loop};
+  loop.run_until(kOrigin + std::chrono::milliseconds{kSessionMs});
+  loop.finish();
+}
+
+// A replayed program's run start is its first timer firing less that
+// timer's offset, read from its first run's log. A byte cap that deleted
+// that log's first segment (its `<log>.capped` marker says so) took that
+// firing with it: the oldest kept segment's first firing is whole periods
+// later. A program that watches no topic its log recorded, so that no fed
+// topic refuses the log, would replay every timer that many periods late;
+// input replay refuses, before anything runs, to read the run start from
+// such a log, naming the file it would read it from and the sign. A capped
+// log that kept its first segment (capture stopped at the cap) still gives
+// the run start: its timers fire at their live deadlines.
+// REQ-OPS-14
+TEST(InputReplay, RefusesARunStartFromALogWhoseFirstSegmentIsGone) {
+  {
+    SCOPED_TRACE("its first segment deleted by the byte cap");
+    const std::string dir = TempDir("head_gone");
+    const std::string out = TempDir("head_gone_out");
+    RecordLateTicker(dir);
+    const std::string path = dir + "/ticker.tlog";
+    const std::vector<std::int64_t> live = TimerFirings(path);
+    ASSERT_FALSE(live.empty());
+    RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+    std::filesystem::remove(log::LogSegmentPath(path, 0));
+    CreateEmptyFile(log::CappedMarkerPath(path));
+    const RecordedSession session{dir, "ticker"};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    try {
+      ReplayInputs(loop, environment, session);
+      const std::vector<std::int64_t> replayed =
+          TimerFirings(out + "/ticker.tlog");
+      ADD_FAILURE() << "replayed from " << log::LogSegmentPath(path, 1)
+                    << ": first firing "
+                    << (replayed.empty() ? -1
+                                         : replayed.front() - kOrigin.nanos())
+                    << " ns after the origin, live "
+                    << live.front() - kOrigin.nanos() << " ns";
+    } catch (const ReplayError& e) {
+      const std::string what = e.what();
+      EXPECT_NE(what.find(log::LogSegmentPath(path, 1)), std::string::npos)
+          << what;
+      EXPECT_NE(what.find(log::CappedMarkerPath(path)), std::string::npos)
+          << what;
+      EXPECT_EQ(loop.dispatch_count(), 0u);
+    }
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("capture stopped at the cap, its first segment kept");
+    const std::string dir = TempDir("head_kept");
+    const std::string out = TempDir("head_kept_out");
+    RecordLateTicker(dir);
+    const std::string path = dir + "/ticker.tlog";
+    const std::size_t live = TimerFirings(path).size();
+    std::filesystem::resize_file(path, RecordOffsets(path)[20]);
+    CreateEmptyFile(log::CappedMarkerPath(path));
+    const std::vector<std::int64_t> kept = TimerFirings(path);
+    ASSERT_LT(kept.size(), live);
+    const RecordedSession session{dir, "ticker"};
+    EXPECT_EQ(session.run_start(), kOrigin + kLateRun);
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(TimerFirings(out + "/ticker.tlog"), kept);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
 // Closes this process's descriptor of the file at `path`, as a disk that
 // refuses every later write leaves its writer.
 bool CloseLogDescriptor(const std::string& path) {

@@ -430,7 +430,15 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   one with a damaged stretch nothing bounds (`RecordedTopic::refused_log`,
   `refused_reason`), by the same rule as gaps, and `ReplayInputs` throws a
   `ReplayError` before anything runs, naming the log, the sign and the topic;
-  a node binary prints it and exits 1. `RecordedSession` reads the
+  a node binary prints it and exits 1. The replayed program's own first
+  run's log is refused the same way, fed topic or not, when its manifest
+  arms a timer and the byte cap deleted its first segment
+  (`<stem>.segment0.tlog`): the firing `run_start()` is read from was there,
+  and the oldest kept segment's first firing may be whole periods later
+  (`RecordedSession::run_start_refused_log`, naming the file it would be
+  read from and the `.capped` marker or `log_capped`). A capped log that
+  kept its first segment (capture stopped at the cap) still gives the run
+  start. `RecordedSession` reads the
   `manifest.json` in the directory holding the logs when its `session_id` is
   the logs', and matches a member's `log_paths` to the logs by file name, so
   a session copied elsewhere still matches; logs without one (outside a

@@ -124,11 +124,15 @@ struct RecordedMessage {
 // log with its EXIT holds a GAP record for every gap (LogWriter::gaps) and
 // is judged by them. Each topic notes the first such log it is fed from
 // (refused_log), which ReplayInputs refuses, as it does a damaged stretch
-// that nothing bounds. The manifest is `manifest.json` in the directory
-// holding the logs (talOS/launcher/README.md, "Session manifest"), used
-// when its session_id is the logs'; it names a member's logs by the paths
-// they were recorded at (`nodes[].log_paths`), matched here by file name, so
-// a session read from another directory still matches. Logs with no such
+// that nothing bounds. The replayed program's run start is read from its
+// first run's log: one whose first segment the byte cap deleted lost the
+// firing it is read from, and ReplayInputs refuses it
+// (run_start_refused_log), fed topic or not. The manifest is
+// `manifest.json` in the directory holding the logs
+// (talOS/launcher/README.md, "Session manifest"), used when its session_id
+// is the logs'; it names a member's logs by the paths they were recorded at
+// (`nodes[].log_paths`), matched here by file name, so a session read from
+// another directory still matches. Logs with no such
 // manifest beside them (a directory outside a launcher session, another
 // session's manifest) are judged by their `.capped` markers alone.
 class RecordedSession {
@@ -162,6 +166,22 @@ class RecordedSession {
   MonotonicTime run_start() const { return run_start_; }
   MonotonicTime loop_end() const { return loop_end_; }
 
+  // The file of the replayed program's first run's log its run start would
+  // be read from, when that log's manifest arms a timer and the byte cap
+  // deleted its first segment (log::LogSegmentPath(log, 0); a rotated log
+  // keeps its later ones), and why, naming the sign: its `<log>.capped`
+  // marker, the session manifest's `log_capped`, or else only that the
+  // segment is gone. The run start's firing
+  // was in that segment; the oldest kept one's first firing may be whole
+  // periods later, so ReplayInputs refuses the log, whatever it feeds.
+  // Empty when none.
+  const std::string& run_start_refused_log() const {
+    return run_start_refused_log_;
+  }
+  const std::string& run_start_refused_reason() const {
+    return run_start_refused_reason_;
+  }
+
   const std::vector<RecordedTopic>& topics() const { return topics_; }
   // The topic called `name`, or null when no log recorded it.
   const RecordedTopic* find(std::string_view name) const;
@@ -181,6 +201,8 @@ class RecordedSession {
   MonotonicTime loop_start_;
   MonotonicTime run_start_;
   MonotonicTime loop_end_;
+  std::string run_start_refused_log_;
+  std::string run_start_refused_reason_;
   std::vector<RecordedTopic> topics_;
   std::vector<RecordedMessage> messages_;
   std::vector<std::byte> bytes_;
@@ -230,8 +252,9 @@ const RecordedTopic* MatchRecordedTopic(const RecordedSession& session,
 // session.loop_start() with its run starting at session.run_start()
 // (SimulatedEventLoop::Options::start, run_start). Finishes the loop, which
 // closes its recorder's log. Throws ReplayError before running on a schema
-// mismatch, and on a topic it would feed from a refused log (refused_log),
-// naming the log, the sign and the topic.
+// mismatch, on a topic it would feed from a refused log (refused_log),
+// naming the log, the sign and the topic, and on a run start read from a
+// refused log (run_start_refused_log), naming the log and the sign.
 template <RecorderPolicy Recorder>
 InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
                                SimulationEnvironment& environment,
@@ -240,6 +263,13 @@ InputReplayReport ReplayInputs(SimulatedEventLoop<Recorder>& loop,
     throw std::logic_error(
         "input replay needs a loop that starts at the recorded origin "
         "(RecordedSession::loop_start)");
+  }
+  if (!session.run_start_refused_log().empty()) {
+    throw ReplayError("input replay refuses " +
+                      session.run_start_refused_log() +
+                      ", which the replayed program's run start would be "
+                      "read from: " +
+                      session.run_start_refused_reason());
   }
 
   InputReplayReport report;

@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "talOS/events/context.h"
+#include "talOS/events/log/format.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/session_manifest.h"
@@ -117,6 +118,10 @@ RecordedSession::RecordedSession(const std::string& path,
   std::vector<bool> watched_by_replayed;
   // The replayed program's first recorded run: its log's origin and run start.
   std::optional<std::pair<MonotonicTime, MonotonicTime>> replayed_run;
+  // The file of that run's log it was read from, and whether that log's
+  // manifest arms a timer (the run start is then read from a firing).
+  std::string replayed_run_file;
+  bool replayed_run_timed = false;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
   // What one damaged stretch of a log cost one of its topic sources: the
@@ -198,6 +203,7 @@ RecordedSession::RecordedSession(const std::string& path,
     std::vector<std::optional<std::int64_t>> timer_offset(
         reader.manifest().size());
     std::optional<MonotonicTime> run_start;
+    bool timed = false;
     // The topics this log recorded, and whether the replayed program
     // watched each in it.
     std::vector<std::pair<std::uint32_t, bool>> recorded;
@@ -247,6 +253,7 @@ RecordedSession::RecordedSession(const std::string& path,
       if (registration.kind == SourceKind::TIMER && registration.armed &&
           registration.id < timer_offset.size()) {
         timer_offset[registration.id] = registration.offset_ns;
+        timed = true;
       }
       if (registration.kind != SourceKind::SENDER &&
           registration.kind != SourceKind::WATCHER) {
@@ -463,6 +470,8 @@ RecordedSession::RecordedSession(const std::string& path,
       replayed_run.emplace(reader.start_time(),
                            std::max(reader.start_time(),
                                     run_start.value_or(reader.start_time())));
+      replayed_run_file = log_path;
+      replayed_run_timed = timed;
     }
   }
   if (first) throw std::runtime_error("no readable .tlog files in " + path);
@@ -574,6 +583,39 @@ RecordedSession::RecordedSession(const std::string& path,
         fed.refused_log = log.path;
         fed.refused_reason = reason;
       }
+    }
+  }
+  // The replayed program's run start is its first timer firing less that
+  // timer's offset, which only its first run's log's first segment is sure
+  // to hold. Once the byte cap deleted that segment (a rotated log whose
+  // oldest kept file is not LogSegmentPath(log, 0)), the oldest kept
+  // segment's first firing may be whole periods after the run's, and every
+  // timer would replay that late: the log is refused, as a fed topic's
+  // capped log is, whether or not a topic is fed from it. With no armed
+  // timer the run start is the log's origin, which every segment holds.
+  if (replayed_run_timed) {
+    const std::string log = LogOfFile(replayed_run_file);
+    const std::vector<std::string> files = log::LogSegmentFiles(log);
+    const std::string head = log::LogSegmentPath(log, 0);
+    if (!files.empty() && files.front() != log && files.front() != head) {
+      const std::string marker = log::CappedMarkerPath(log);
+      const auto marks =
+          marked.find(std::filesystem::path{log}.filename().string());
+      std::string sign;
+      if (std::filesystem::exists(marker)) {
+        sign = marker + " exists: the byte cap deleted its first segment ";
+      } else if (marks != marked.end() && marks->second.log_capped) {
+        sign =
+            "the session manifest marks its member log_capped: the byte cap "
+            "deleted its first segment ";
+      } else {
+        sign = "its first segment is gone: ";
+      }
+      run_start_refused_log_ = replayed_run_file;
+      run_start_refused_reason_ =
+          sign + head +
+          ", which held the first timer firing the run start is read from, "
+          "and a later segment's first firing may be whole periods after it";
     }
   }
   for (const RecordedMessage& message : messages_) {
