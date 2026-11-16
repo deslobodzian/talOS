@@ -7,13 +7,19 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "events_test/events_test_message_generated.h"
 #include "talOS/events/handles.h"
+#include "talOS/events/log/format.h"
+#include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/simulated_event_loop.h"
@@ -318,6 +324,208 @@ TEST(InputReplay, ReportsTopicsTheSessionNeverRecorded) {
   ASSERT_EQ(report.fed.size(), 1u);
   EXPECT_EQ(wanderer.readings, kSessionMs / 2);
   std::filesystem::remove_all(dir);
+}
+
+// Replaces `path`'s records from the first dispatch that starts at or after
+// `at` through the next two with the GAP record the writer would write for
+// them (log/gap_testing.h).
+log::LogGap MarkGap(const std::string& path, MonotonicTime at) {
+  std::vector<log::RecordHeader> headers;
+  {
+    log::LogReader reader{path};
+    log::LogReader::Record record;
+    while (reader.next(record)) headers.push_back(record.header);
+  }
+  const auto starts = [&](std::size_t i) {
+    const auto kind = static_cast<EventKind>(headers[i].kind);
+    return (kind == EventKind::TIMER || kind == EventKind::MESSAGE) &&
+           (i == 0 ||
+            headers[i].dispatch_index != headers[i - 1].dispatch_index);
+  };
+  std::size_t first = 0;
+  while (first < headers.size() &&
+         !(starts(first) && headers[first].now_ns >= at.nanos())) {
+    ++first;
+  }
+  std::size_t end = first + 1;
+  for (int dispatches = 0; end < headers.size(); ++end) {
+    if (starts(end) && ++dispatches == 3) break;
+  }
+  if (end >= headers.size()) {
+    throw std::invalid_argument("MarkGap: " + path + " ends before the gap");
+  }
+  const std::string copy = path + ".gap";
+  const log::LogGap gap = log::CopyWithGap(path, copy, first, end);
+  std::filesystem::rename(copy, path);
+  return gap;
+}
+
+// The consumer's control ticks (one per millisecond from the origin) before
+// `at`.
+std::size_t TicksBefore(MonotonicTime at) {
+  std::size_t ticks = 0;
+  for (int ms = 1; ms <= kSessionMs; ++ms) {
+    if (kOrigin + std::chrono::milliseconds{ms} < at) ++ticks;
+  }
+  return ticks;
+}
+
+// Reads the session's setpoints and nothing else.
+class SetpointWatcher {
+ public:
+  explicit SetpointWatcher(Loop& loop) {
+    watch<EventsTest::SetpointMessage, &SetpointWatcher::on_setpoint>(
+        loop, kTopics.setpoint, this);
+  }
+
+ private:
+  void on_setpoint(const Context&, const EventsTest::SetpointMessage&) {}
+};
+
+// A run fed from a log with a GAP record ends before the gap's start, the
+// earliest time it names, and reports the topic, the log and that time: what
+// came before is fed as without the gap. Which logs count: for a program the
+// session did not run, every log that recorded a topic it watches (the
+// observer, the only log of /input/setpoint; the producer, the writer of
+// /input/sensor); for one it ran, its own logs for a topic it watched live, so
+// the producer's earlier gap does not stop the observer. A gap in a log that
+// recorded nothing it watches does not stop it; of two gaps, the earlier.
+// REQ-OPS-14
+TEST(InputReplay, EndsBeforeTheFirstGapOfALogItIsFedFrom) {
+  {
+    SCOPED_TRACE("another process's log");
+    const std::string dir = TempDir("gap_observer");
+    const std::string out = TempDir("gap_observer_out");
+    const std::vector<float> live = RecordSession(dir, out + "/live.tlog");
+    const log::LogGap gap = MarkGap(dir + "/observer.tlog", kOrigin + 20ms);
+    const MonotonicTime at = MonotonicTime::from_nanos(gap.start_ns);
+    const RecordedSession session{dir};
+    const Replayed replayed = ReplayConsumer(session, out + "/replayed.tlog");
+    ASSERT_TRUE(replayed.report.stopped_at_gap.has_value());
+    const InputReplayReport::Gap& stopped =
+        replayed.report.stopped_at_gap.value();
+    EXPECT_EQ(stopped.log, dir + "/observer.tlog");
+    EXPECT_EQ(stopped.at.nanos(), gap.start_ns);
+    // Both topics are fed from the observer's log: the first fed is named.
+    EXPECT_EQ(stopped.topic, kTopics.sensor);
+    const std::size_t ticks = TicksBefore(at);
+    ASSERT_GT(ticks, 0u);
+    ASSERT_LT(ticks, live.size());
+    EXPECT_EQ(
+        replayed.efforts,
+        std::vector<float>(live.begin(),
+                           live.begin() + static_cast<std::ptrdiff_t>(ticks)));
+    const std::vector<Sent> live_sends = Sends(out + "/live.tlog");
+    EXPECT_EQ(Sends(out + "/replayed.tlog"),
+              std::vector<Sent>(
+                  live_sends.begin(),
+                  live_sends.begin() + static_cast<std::ptrdiff_t>(ticks)));
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("a log that feeds it nothing");
+    const std::string dir = TempDir("gap_unfed");
+    const std::string out = TempDir("gap_unfed_out");
+    RecordSession(dir, out + "/live.tlog");
+    MarkGap(dir + "/producer.tlog", kOrigin + 20ms);
+    const RecordedSession session{dir};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/setpoints.tlog", "setpoints"},
+              Loop::Options{.start = session.start()}};
+    SetpointWatcher watcher{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    ASSERT_EQ(report.fed.size(), 1u);
+    EXPECT_EQ(report.fed[0].messages, 6u);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("its own log");
+    const std::string dir = TempDir("gap_own");
+    const std::string out = TempDir("gap_own_out");
+    RecordSession(dir, out + "/live.tlog");
+    MarkGap(dir + "/producer.tlog", kOrigin + 10ms);
+    const log::LogGap gap = MarkGap(dir + "/observer.tlog", kOrigin + 30ms);
+    // What it received live, at drains before the gap's start.
+    std::size_t received = 0;
+    {
+      log::LogReader reader{dir + "/observer.tlog"};
+      log::LogReader::Record record;
+      while (reader.next(record)) {
+        if (record.header.kind ==
+                static_cast<std::uint16_t>(EventKind::MESSAGE) &&
+            record.header.event_time_ns < gap.start_ns) {
+          ++received;
+        }
+      }
+    }
+    ASSERT_GT(received, 0u);
+    const RecordedSession session{dir, "observer"};
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/observer.tlog", "observer"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    Observer observer{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    ASSERT_TRUE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(report.stopped_at_gap.value().log, dir + "/observer.tlog");
+    EXPECT_EQ(report.stopped_at_gap.value().at.nanos(), gap.start_ns);
+    ASSERT_EQ(report.fed.size(), 2u);
+    EXPECT_EQ(report.fed[0].messages + report.fed[1].messages, received);
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+  {
+    SCOPED_TRACE("two gaps");
+    const std::string dir = TempDir("gap_two");
+    const std::string out = TempDir("gap_two_out");
+    RecordSession(dir, out + "/live.tlog");
+    // The later gap is in the log read first.
+    MarkGap(dir + "/observer.tlog", kOrigin + 30ms);
+    const log::LogGap gap = MarkGap(dir + "/producer.tlog", kOrigin + 14ms);
+    const RecordedSession session{dir};
+    const Replayed replayed = ReplayConsumer(session, out + "/replayed.tlog");
+    ASSERT_TRUE(replayed.report.stopped_at_gap.has_value());
+    EXPECT_EQ(replayed.report.stopped_at_gap.value().log,
+              dir + "/producer.tlog");
+    EXPECT_EQ(replayed.report.stopped_at_gap.value().topic, kTopics.sensor);
+    EXPECT_EQ(replayed.report.stopped_at_gap.value().at.nanos(), gap.start_ns);
+    EXPECT_EQ(replayed.efforts.size(),
+              TicksBefore(MonotonicTime::from_nanos(gap.start_ns)));
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(out);
+  }
+}
+
+// Two replays of a session with a gap write the same log, to the stop.
+// REQ-OPS-14
+TEST(InputReplay, TwoReplaysOfAGappedSessionWriteIdenticalLogs) {
+  const std::string dir = TempDir("gap_twice");
+  const std::string out = TempDir("gap_twice_out");
+  RecordSession(dir, out + "/live.tlog");
+  MarkGap(dir + "/observer.tlog", kOrigin + 20ms);
+  const RecordedSession session{dir};
+  const Replayed first = ReplayConsumer(session, out + "/first.tlog");
+  const Replayed second = ReplayConsumer(session, out + "/second.tlog");
+  ASSERT_TRUE(first.report.stopped_at_gap.has_value());
+  const auto bytes = [](const std::string& path) {
+    std::ifstream in{path, std::ios::binary};
+    std::vector<char> data{std::istreambuf_iterator<char>{in},
+                           std::istreambuf_iterator<char>{}};
+    // Wall clock is informational and differs between runs.
+    const std::size_t wall = offsetof(log::FileHeader, start_wall_ns);
+    if (data.size() >= wall + 8) {
+      std::fill_n(data.begin() + static_cast<std::ptrdiff_t>(wall), 8, '\0');
+    }
+    return data;
+  };
+  const std::vector<char> written = bytes(out + "/first.tlog");
+  ASSERT_GT(written.size(), sizeof(log::FileHeader));
+  EXPECT_EQ(bytes(out + "/second.tlog"), written);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
 }
 
 }  // namespace

@@ -1220,7 +1220,9 @@ class OfflinePort final : public LoopPortFor<Loop> {
 // recorded deadlines) and is handed what it received live, at the drains it
 // received it in. What it sends is logged to --log. A topic recorded with
 // another schema fails before anything runs; topics nobody recorded are
-// listed.
+// listed. The run ends before the earliest gap in a log it is fed from, says
+// where, and exits 1 (event::ReplayInputs), as does a run whose own output
+// log has a gap.
 int RunOnRecordedInputs(const char* node_name, const Flags& flags,
                         const InstanceFactory& make) {
   using Loop = event::SimulatedEventLoop<event::log::LogWriter>;
@@ -1249,11 +1251,31 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
   for (const auto& topic : report.unrecorded) {
     std::printf("  not recorded: %s\n", topic.c_str());
   }
-  std::printf("%s: dispatches=%llu recording_failed=%d log=%s\n", node_name,
-              static_cast<unsigned long long>(loop.dispatch_count()),
-              loop.recorder().failed(), flags.log_path.c_str());
+  // A log it was fed from lost records there: the run ended before them.
+  if (report.stopped_at_gap.has_value()) {
+    const event::InputReplayReport::Gap& gap = *report.stopped_at_gap;
+    std::printf(
+        "replay-inputs: stopped before a log gap in %s at %.6f s after the "
+        "session start (topic %s)\n",
+        gap.log.c_str(),
+        static_cast<double>((gap.at - session.start()).count()) / 1e9,
+        gap.topic.c_str());
+  }
+  std::printf(
+      "%s: dispatches=%llu recording_failed=%d recording_gaps=%llu "
+      "records_lost=%llu log=%s\n",
+      node_name, static_cast<unsigned long long>(loop.dispatch_count()),
+      loop.recorder().failed(),
+      static_cast<unsigned long long>(loop.recorder().gaps()),
+      static_cast<unsigned long long>(loop.recorder().lost_records()),
+      flags.log_path.c_str());
   if (loop.recorder().failed()) {
     std::fprintf(stderr, "%s\n", loop.recorder().error().c_str());
+    return 1;
+  }
+  // An output log with a gap is incomplete evidence, like a failed one; and
+  // a run that stopped before a gap did not replay the whole session.
+  if (loop.recorder().gaps() > 0 || report.stopped_at_gap.has_value()) {
     return 1;
   }
   return 0;
@@ -1391,8 +1413,19 @@ int RunMain(int argc, char** argv, const char* node_name,
           Host(std::make_unique<OfflinePort<event::ReplayEventLoop<>>>(loop),
                node_name, flags, make);
       loop.run();
-      std::printf("replay: diverged=%d clean_exit=%d\n", loop.diverged(),
-                  loop.reached_exit());
+      // The log ends at its first gap for replay: what came before it
+      // replayed, and nothing after it did.
+      const std::optional<event::log::LogGap>& gap = loop.stopped_at_gap();
+      if (gap.has_value()) {
+        std::printf(
+            "replay: stopped at a log gap in %s before dispatch %llu: "
+            "%s\n",
+            flags.replay_path.c_str(),
+            static_cast<unsigned long long>(gap->first_dispatch_index),
+            event::log::DescribeGap(*gap).c_str());
+      }
+      std::printf("replay: diverged=%d clean_exit=%d stopped_at_gap=%d\n",
+                  loop.diverged(), loop.reached_exit(), gap.has_value());
       return loop.diverged() || !loop.reached_exit() ? 1 : 0;
     }
     if (!flags.replay_inputs.empty()) {

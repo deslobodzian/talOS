@@ -263,7 +263,9 @@ Rules:
   every topic it subscribes to that the session logged arrives at its recorded
   time, its outputs go to a new log, and two runs write identical logs. A topic
   recorded with another schema fails naming both types; topics nothing
-  recorded are listed (`talOS/launcher/README.md`). **[enforced:
+  recorded are listed (`talOS/launcher/README.md`). Inputs arrive only up to
+  the first log gap in a log that feeds the node: the run ends there, names
+  the log, and exits 1. **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present: an actuator node

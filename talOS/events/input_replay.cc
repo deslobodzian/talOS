@@ -43,6 +43,14 @@ RecordedSession::RecordedSession(const std::string& path,
   std::optional<std::pair<MonotonicTime, MonotonicTime>> replayed_run;
   // The latest time any of its logs recorded: its last run's exit.
   std::optional<MonotonicTime> replayed_end;
+  // Each log with a GAP record: the earliest time one names, and the topics
+  // it recorded (with whether the replayed program watched them in it).
+  struct GappedLog {
+    std::string path;
+    MonotonicTime start;
+    std::vector<std::pair<std::uint32_t, bool>> topics;
+  };
+  std::vector<GappedLog> gapped;
   bool first = true;
 
   for (const std::string& log_path : log_paths_) {
@@ -80,6 +88,11 @@ RecordedSession::RecordedSession(const std::string& path,
     std::vector<std::optional<std::int64_t>> timer_offset(
         reader.manifest().size());
     std::optional<MonotonicTime> run_start;
+    // The topics this log recorded, and whether the replayed program
+    // watched each in it.
+    std::vector<std::pair<std::uint32_t, bool>> recorded;
+    // The earliest time a GAP record of this log names.
+    std::optional<MonotonicTime> gap_start;
     for (const Registration& registration : reader.manifest()) {
       if (registration.kind == SourceKind::TIMER && registration.armed &&
           registration.id < timer_offset.size()) {
@@ -117,6 +130,7 @@ RecordedSession::RecordedSession(const std::string& path,
       if (registration.id < topic_of.size()) {
         topic_of[registration.id] = it->second;
       }
+      recorded.emplace_back(it->second, own_log && !writer);
     }
 
     log::LogReader::Record record;
@@ -127,8 +141,16 @@ RecordedSession::RecordedSession(const std::string& path,
         replayed_end = std::max(replayed_end.value_or(reader.start_time()),
                                 MonotonicTime::from_nanos(header.now_ns));
       }
+      if (const auto gap = log::GapOf(header, record.payload)) {
+        const MonotonicTime start = MonotonicTime::from_nanos(gap->start_ns);
+        gap_start = std::min(gap_start.value_or(start), start);
+        continue;
+      }
       const auto kind = static_cast<EventKind>(header.kind);
-      if (own_log && !run_start && header.source_id < timer_offset.size()) {
+      // A timer firing after a gap may follow dropped re-arms: only one
+      // before the first gap says when the run began.
+      if (own_log && !run_start && !gap_start &&
+          header.source_id < timer_offset.size()) {
         if (kind == EventKind::ARM_TIMER || kind == EventKind::DISARM_TIMER) {
           timer_offset[header.source_id].reset();
         } else if (kind == EventKind::TIMER && timer_offset[header.source_id]) {
@@ -192,6 +214,9 @@ RecordedSession::RecordedSession(const std::string& path,
       std::cerr << "warning: damaged log " << log_path << ": " << damage
                 << "; replaying the intact records\n";
     }
+    if (gap_start.has_value()) {
+      gapped.push_back({log_path, *gap_start, std::move(recorded)});
+    }
     // Its first run: the earliest origin among its logs (restarts included).
     if (own_log &&
         (!replayed_run || reader.start_time() < replayed_run->first)) {
@@ -210,6 +235,19 @@ RecordedSession::RecordedSession(const std::string& path,
   messages_.insert(messages_.end(), own.begin(), own.end());
   for (std::size_t topic = 0; topic < topics_.size(); ++topic) {
     if (watched_by_replayed[topic]) topics_[topic].recorded_by = replayed;
+  }
+  // Where each topic's feed ends: the earliest gap in a log it is fed from,
+  // which for a topic the program watched live is one of its own logs that
+  // watched it, and otherwise any log that recorded it.
+  for (const GappedLog& gapped_log : gapped) {
+    for (const auto& [topic, watched_here] : gapped_log.topics) {
+      if (watched_by_replayed[topic] && !watched_here) continue;
+      RecordedTopic& fed = topics_[topic];
+      if (gapped_log.start < fed.first_gap.value_or(MonotonicTime::max())) {
+        fed.first_gap = gapped_log.start;
+        fed.first_gap_log = gapped_log.path;
+      }
+    }
   }
   for (const RecordedMessage& message : messages_) {
     ++topics_[message.topic].message_count;

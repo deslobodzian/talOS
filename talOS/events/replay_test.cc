@@ -14,6 +14,7 @@
 
 #include "events_test/events_test_message_generated.h"
 #include "talOS/events/handles.h"
+#include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/replay_event_loop.h"
@@ -553,6 +554,149 @@ TEST(Replay, ReplaysTheCompletePrefixOfATruncatedLog) {
 
   std::remove(path.c_str());
   std::remove(truncated_path.c_str());
+}
+
+struct LogRecords {
+  std::vector<log::RecordHeader> headers;
+  std::vector<std::uint64_t> offsets;
+};
+
+LogRecords read_records(const std::string& path) {
+  log::LogReader reader{path};
+  LogRecords records;
+  log::LogReader::Record record;
+  while (reader.next(record)) {
+    records.headers.push_back(record.header);
+    records.offsets.push_back(record.offset);
+  }
+  return records;
+}
+
+// A log with a GAP record replays every dispatch before the gap's first
+// dropped dispatch and stops there: no divergence, no clean exit, the gap
+// named, the controller's efforts the recorded run's up to there, and a
+// re-recording of the replay is the log's bytes before that dispatch, then
+// the replay's own EXIT. Rows: the gap starts a dispatch; it splits one, whose
+// recorded part is not replayed as if whole; it lasts to the stop (closed by
+// it, the EXIT after it).
+// REQ-OPS-13
+TEST(Replay, StopsBeforeTheDispatchAGapStartsIn) {
+  const std::string original_path = temp_path("gap_original");
+  const std::vector<float> recorded = record_run(original_path, 1.75F);
+  const LogRecords original = read_records(original_path);
+  const std::size_t n = original.headers.size();
+
+  std::uint16_t control = 0;
+  {
+    log::LogReader reader{original_path};
+    for (const Registration& source : reader.manifest()) {
+      if (source.name == "control") control = source.id;
+    }
+  }
+  const auto is = [&](std::size_t i, EventKind kind) {
+    return original.headers[i].kind == static_cast<std::uint16_t>(kind);
+  };
+  // A control dispatch past the middle, its send, and the record three
+  // dispatches later, where capture resumes.
+  std::size_t timer = n / 2;
+  while (timer < n && !(is(timer, EventKind::TIMER) &&
+                        original.headers[timer].source_id == control)) {
+    ++timer;
+  }
+  ASSERT_LT(timer + 1, n);
+  ASSERT_TRUE(is(timer + 1, EventKind::SEND));
+  ASSERT_EQ(original.headers[timer + 1].dispatch_index,
+            original.headers[timer].dispatch_index);
+  std::size_t resume = timer + 1;
+  for (int dispatches = 0; resume < n; ++resume) {
+    if (original.headers[resume].dispatch_index !=
+            original.headers[resume - 1].dispatch_index &&
+        ++dispatches == 3) {
+      break;
+    }
+  }
+  ASSERT_LT(resume, n - 1);
+  const std::uint64_t dispatch = original.headers[timer].dispatch_index;
+  std::size_t controls_before = 0;
+  for (std::size_t i = 0; i < timer; ++i) {
+    if (is(i, EventKind::TIMER) && original.headers[i].source_id == control) {
+      ++controls_before;
+    }
+  }
+  ASSERT_GT(controls_before, 0u);
+
+  struct Row {
+    const char* name;
+    std::size_t first;
+    std::size_t end;
+    std::uint16_t flags;
+  };
+  const Row rows[] = {
+      {"starts_a_dispatch", timer, resume, 0},
+      {"splits_a_dispatch", timer + 1, resume, log::GAP_SPLITS_DISPATCH},
+      {"lasts_to_the_stop", timer, n, log::GAP_CLOSED_AT_FLUSH},
+  };
+  for (const Row& row : rows) {
+    SCOPED_TRACE(row.name);
+    const std::string gapped_path =
+        temp_path(std::string{"gapped_"} + row.name);
+    const std::string replayed_path =
+        temp_path(std::string{"gap_replayed_"} + row.name);
+    const log::LogGap gap =
+        log::CopyWithGap(original_path, gapped_path, row.first, row.end);
+    ASSERT_EQ(gap.detail.flags, row.flags);
+    ASSERT_EQ(gap.first_dispatch_index, dispatch);
+
+    std::vector<float> efforts;
+    {
+      log::LogReader reader{gapped_path};
+      ReplayEventLoop<log::LogWriter> loop{
+          reader, log::LogWriter{replayed_path, "test_robot"}};
+      TestRobot<ReplayEventLoop<log::LogWriter>> robot{loop, test_topics(),
+                                                       1.75F};
+      robot.control_timer().setup_periodic(MonotonicTime::from_nanos(1'000'000),
+                                           1ms);
+      loop.run();
+      EXPECT_FALSE(loop.diverged());
+      EXPECT_FALSE(loop.reached_exit());
+      ASSERT_TRUE(loop.stopped_at_gap().has_value());
+      const log::LogGap& stopped = loop.stopped_at_gap().value();
+      EXPECT_EQ(stopped.first_dispatch_index, gap.first_dispatch_index);
+      EXPECT_EQ(stopped.start_ns, gap.start_ns);
+      EXPECT_EQ(stopped.resumed_ns, gap.resumed_ns);
+      EXPECT_EQ(stopped.detail.records, gap.detail.records);
+      EXPECT_EQ(stopped.detail.last_dispatch_index,
+                gap.detail.last_dispatch_index);
+      EXPECT_EQ(stopped.detail.flags, row.flags);
+      efforts = robot.efforts();
+    }
+    EXPECT_EQ(efforts, std::vector<float>(
+                           recorded.begin(),
+                           recorded.begin() +
+                               static_cast<std::ptrdiff_t>(controls_before)));
+
+    // The bytes before the dispatch the gap starts in, then one EXIT.
+    const std::uint64_t cut = original.offsets[timer];
+    std::vector<char> gapped = read_file(gapped_path);
+    std::vector<char> replayed = read_file(replayed_path);
+    ASSERT_EQ(replayed.size(), cut + sizeof(log::RecordHeader));
+    for (std::size_t i = 0; i < WALL_CLOCK_BYTES; ++i) {
+      gapped[WALL_CLOCK_OFFSET + i] = 0;
+      replayed[WALL_CLOCK_OFFSET + i] = 0;
+    }
+    EXPECT_TRUE(std::equal(replayed.begin(),
+                           replayed.begin() + static_cast<std::ptrdiff_t>(cut),
+                           gapped.begin()));
+    const LogRecords rerecorded = read_records(replayed_path);
+    ASSERT_EQ(rerecorded.headers.size(), timer + 1);
+    EXPECT_EQ(rerecorded.headers.back().kind,
+              static_cast<std::uint16_t>(EventKind::EXIT));
+    EXPECT_EQ(rerecorded.headers.back().dispatch_index, dispatch);
+
+    std::remove(gapped_path.c_str());
+    std::remove(replayed_path.c_str());
+  }
+  std::remove(original_path.c_str());
 }
 
 // Records lost between intact ones would replay a run the program never

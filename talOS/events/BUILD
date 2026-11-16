@@ -172,6 +172,7 @@ cc_test(
         ":events",
         ":events_log",
         ":events_test_message",
+        ":gap_testing",
         ":input_replay",
         ":test_robot",
         "@googletest//:gtest",
@@ -210,6 +211,7 @@ cc_test(
     deps = [
         ":events",
         ":events_test_message",
+        ":gap_testing",
         ":test_robot",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
