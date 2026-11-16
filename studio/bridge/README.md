@@ -162,7 +162,7 @@ Observer endpoints are listed separately from subscribers.
 The order of the fast values is the order `BuildSystemGraph` appends them;
 every reader of an update walks the document in that order (Studio's
 `fastSlots` in [`system.ts`](../src/system.ts), and this directory's Python
-harness, `fast_slots` in `integration_test.py`). Golden files,
+harness, `fast_slots` in `bridge_client.py`). Golden files,
 [`testdata/golden`](testdata/golden), pin it: `:system_test` requires the
 bridge to reproduce a graph, its next update and the graph after it byte for
 byte, and `//studio:system_test` and `:fast_slots_test` require each reader

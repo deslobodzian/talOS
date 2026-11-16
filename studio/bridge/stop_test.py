@@ -10,7 +10,7 @@ import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import bound_port, receive, upgrade
+from bridge_client import bound_port, receive, upgrade
 
 # The launcher SIGKILLs a member still alive kStopTimeout (2 s,
 # talOS/launcher/launcher.h; REQ-OPS-06) after its stop signal, kStopSignal

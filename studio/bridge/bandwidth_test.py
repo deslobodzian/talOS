@@ -17,7 +17,7 @@ import unittest
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import BINARY, TEXT, bound_port, receive
+from bridge_client import BINARY, TEXT, bound_port, receive
 
 
 def connect(port, stalled=False):

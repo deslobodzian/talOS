@@ -6,7 +6,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from integration_test import fast_slots
+from bridge_client import fast_slots
 
 
 class FastSlotsTest(unittest.TestCase):
