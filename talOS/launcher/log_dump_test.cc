@@ -614,6 +614,9 @@ TEST_F(LogDumpGapTest, FiltersSelectAGapByItsProcessAndSpan) {
   EXPECT_NE(tail.find("\"dispatch_index\":5,\"kind\":\"GAP\""),
             std::string::npos)
       << tail;
+  // A window ending exactly at a gap's start still meets it.
+  const auto edge = Run({"--format", "jsonl", "--until-ms", "15"});
+  EXPECT_EQ(CountLines(edge, kGap), 1U) << edge;
   // [36, 44] lies between them.
   const auto between =
       Run({"--format", "jsonl", "--since-ms", "36", "--until-ms", "44"});

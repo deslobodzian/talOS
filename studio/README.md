@@ -471,7 +471,7 @@ Every time is
 nanoseconds on the recording's monotonic clock (the merge's event time), and
 every value carries its publication time; `origin_wall_ns + t_ns` is the
 wall-clock time. A damaged log is read and warned about as `log_dump` reads
-it, a record claiming more payload than its source declares being damage
+it, and a log holding GAP records is named on stderr as `log_dump` names it, a record claiming more payload than its source declares being damage
 ([dispatch log](../talOS/events/README.md)); a topic whose recorded schema
 the channel model refuses ([telemetry](../talOS/telemetry/README.md#automatic-channels-and-units))
 is not reviewed and is named on stderr; a log of another format version, or
