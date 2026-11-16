@@ -470,16 +470,23 @@ later record until one that starts a new dispatch (or belongs to none, as
 the hardware bridge's do) finds at least half the pool free. That record is
 preceded in the log by one GAP record naming what was dropped, so the log
 holds every record the writer accepted, in order, and each dropped stretch is
-marked where it happened; replay and the log tools read the mark. Resuming
-only with half the pool free means one GAP per half pool handed over at most,
+marked where it happened; `log_dump`, `tlog_to_wpilog` and Studio show the
+mark ([filtering and exporting logs](../launcher/README.md#filtering-and-exporting-logs)).
+Resuming only with half the pool free (rounded up) means one GAP per half
+pool handed over at most,
 however slow the disk. Dropping, counting and resuming are the loop thread's
 own work: O(1) per record, no lock, no allocation, no wait. An `EXIT` that
 finds no room is held, not dropped: `flush()` and destruction write it after
 the gap's GAP record, which is marked closed at the stop when capture had not
-resumed by then. A process killed during a gap leaves no GAP record; its
-registry row ([event log state](../introspection/README.md#event-log-state))
-told the launcher. `gaps()`, `lost_records()` and `losing()` report a gap to
-any thread.
+resumed by then. A gap gets no GAP record when capture ends during it: the
+disk fails (`failed()`), the GAP record itself would cross the byte cap of a
+log too small to rotate (`capture_stopped()`, `<log>.capped`), or the process
+is killed. Such a gap is still counted: `gaps()`, `lost_records()` and
+`losing()` report a gap to any thread, `incomplete()` (`failed()` or a gap)
+is what a node's and the bridge's exit status say, and the registry row's
+gap bit ([event log state](../introspection/README.md#event-log-state)),
+which the launcher reads in each supervision pass and once more from the row
+a run left when it reaps it, marks the member.
 
 `failed()` means only that capture is over: the disk refused a write or the
 log file could not be created. **Treat it as a robot fault**, next to a

@@ -30,6 +30,7 @@
 #include <thread>
 #include <vector>
 
+#include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/events/realtime_event_loop.h"
 #include "talOS/introspection/describe.h"
@@ -891,6 +892,47 @@ TEST_F(Registry, ALogGapIsItsOwnFlagAndOutlivesTheGap) {
   const NodeSnapshot node = row();
   EXPECT_TRUE(node.log_gap());
   EXPECT_EQ(node.flags & (kFlagRecorderFailed | kFlagLogCapped), 0u);
+}
+
+// The Reporter copies a gap in the loop's own event log into the row, which
+// is all the launcher has of a run killed during one: a running loop whose
+// LogWriter dropped one record too large for its buffers shows kFlagLogGap.
+// REQ-OPS-52
+TEST_F(Registry, TheReporterCopiesTheLoopsLogGapIntoTheRow) {
+  const std::string log = ::testing::TempDir() + "/registry_gap_" +
+                          std::to_string(::getpid()) + ".tlog";
+  event::RealtimeEventLoop<event::log::LogWriter> loop{
+      event::log::LogWriter{log, "gapped", 512}};
+  struct Handler {
+    std::function<void()> on_tick;
+    void OnTick(const event::Context&) { on_tick(); }
+  } handler;
+  auto timer = event::make_timer<&Handler::OnTick>(loop, "gap_tick", &handler);
+  Reporter reporter{{.name = "gapped", .period = 5ms, .registry_path = path_}};
+  reporter.start(loop);
+  RegistryReader reader{path_};
+  const std::vector<std::byte> oversized(1024, std::byte{1});
+  bool dropped = false;
+  bool flagged = false;
+  handler.on_tick = [&] {
+    if (!dropped) {
+      event::Context context{};
+      context.kind = event::EventKind::TIMER;
+      loop.recorder().dispatch(context, oversized);
+      dropped = true;
+      return;
+    }
+    const auto nodes = reader.nodes();
+    if (nodes.size() == 1 && nodes.front().log_gap()) {
+      flagged = true;
+      loop.exit();
+    }
+  };
+  timer.setup_periodic(event::Poller::now() + 1ms, 2ms);
+  loop.run_for(5s);  // Bound only; exits once the row shows the gap.
+  ASSERT_EQ(loop.recorder().gaps(), 1u);
+  EXPECT_TRUE(flagged) << "the row never showed the loop's log gap";
+  ::unlink(log.c_str());
 }
 
 // A notification its writer could not send -- here no descriptor is left for

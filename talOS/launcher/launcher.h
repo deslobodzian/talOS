@@ -353,11 +353,13 @@ class Launcher {
   // which also makes the member recorder_failed (NodeProcessInfo::
   // RecordLogGap); or reached its byte share (kFlagLogCapped): it either
   // stopped there too or deletes its oldest records as it records on, which
-  // the line says (CappedLogStopped). Reported once per member and kind, and
-  // recorded as the member's recorder_failed, log_gap or log_capped while the
-  // node still runs -- in the live manifest Studio reads, and so in the final
-  // one, where a run killed during a gap leaves no GAP record to find.
-  // Returns whether `proc` changed.
+  // the line says (CappedLogStopped). Reported once per member and kind (a
+  // gap once per run's log), and recorded as the member's recorder_failed,
+  // log_gap or log_capped while the node still runs -- in the live manifest
+  // Studio reads, and so in the final one, where a run killed during a gap
+  // leaves no GAP record to find. Called by each supervision pass that reads
+  // the run's row, and once more when the run is reaped, from the row it
+  // left. Returns whether `proc` changed.
   static bool NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
                             uint32_t flags);
 

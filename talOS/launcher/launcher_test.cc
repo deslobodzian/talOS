@@ -573,9 +573,10 @@ TEST(LauncherTest, DurationDeadlineIsNotDelayedByFailingBridge) {
 
 // A run whose event log holds a GAP record is marked at shutdown: log_gap,
 // and recorder_failed with it (a gapped log is incomplete evidence), with one
-// line naming the member and the log. The stub leaves the log a writer makes
-// when it drops an oversized record and resumes at the next dispatch; a
-// member whose log has none is marked neither.
+// line naming the member and that run's log. The stub leaves the log a
+// writer makes when it drops an oversized record and resumes at the next
+// dispatch, in its first run, which crashes, and in its restart: each run's
+// log is named once. A member whose log has none is marked neither.
 // REQ-OPS-52
 TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   const std::string tag = "log_gap";
@@ -611,11 +612,12 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   alpha.erase(alpha.rfind("exec sleep"));
   alpha +=
       "while [ $# -gt 0 ]; do\n"
-      " [ \"$1\" = --log ] && { shift; cp '" +
+      " [ \"$1\" = --log ] && { shift; log=\"$1\"; cp '" +
       gapped +
       "' \"$1\"; }\n"
       " shift\n done\n"
-      "exec sleep 30\n";
+      "case \"$log\" in *.restart*) exec sleep 30 ;; esac\n"
+      "exit 1\n";
   options.binary_overrides["//example/alpha:node"] =
       WriteStubNode(tag + "_alpha", alpha);
   options.binary_overrides["//example/beta:node"] = WriteStubNode(
@@ -646,17 +648,22 @@ TEST(LauncherTest, ALogWithAGapMarksTheMemberAtShutdown) {
   const std::string whole_entry = entry("beta");
   EXPECT_NE(whole_entry.find("\"log_gap\": false"), std::string::npos)
       << whole_entry;
-  // One line, naming the member and its log.
-  std::size_t lines = 0;
+  // One line per run, naming the member and that run's log.
+  std::vector<std::string> named;
   std::istringstream text{stderr_text};
   for (std::string line; std::getline(text, line);) {
     if (line.find("alpha event log") != std::string::npos &&
         line.find("lost records") != std::string::npos) {
-      ++lines;
-      EXPECT_NE(line.find("/alpha.tlog"), std::string::npos) << line;
+      const std::size_t at = line.find("/alpha.");
+      named.push_back(at == std::string::npos
+                          ? line
+                          : line.substr(at + 1, line.find(' ', at) - at - 1));
     }
   }
-  EXPECT_EQ(lines, 1u) << stderr_text;
+  std::sort(named.begin(), named.end());
+  EXPECT_EQ(named,
+            (std::vector<std::string>{"alpha.restart1.tlog", "alpha.tlog"}))
+      << stderr_text;
   std::filesystem::remove_all(out_dir);
   std::filesystem::remove(gapped);
 }

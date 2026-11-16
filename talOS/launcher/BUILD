@@ -760,8 +760,10 @@ cc_test(
     tags = ["integration"],
     deps = [
         ":launcher_lib",
+        ":log_budget",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/introspection:describe",
         "@googletest//:gtest_main",
     ],
 )

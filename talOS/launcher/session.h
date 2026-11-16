@@ -202,10 +202,12 @@ struct NodeProcessInfo {
   // it was.
   bool RecordRealtime(const process::RealtimeOutcome& outcome);
 
-  // Marks a run's event log gapped: log_gap and failed (a gapped log is
-  // incomplete evidence). Returns whether the member had no gap before, so
-  // its one line is printed once.
-  bool RecordLogGap();
+  // Marks the run whose event log is `log` gapped: log_gap and failed (a
+  // gapped log is incomplete evidence). Returns whether `log` was not named
+  // before, so each gapped run's log gets its one line.
+  bool RecordLogGap(const std::string& log);
+  // The logs RecordLogGap has named. Not in the manifest.
+  std::vector<std::string> gap_logs;
 
   // Every run, first first, capped at kMaxRecordedRuns: the first run and
   // the newest; `runs_dropped` counts the ones between that were dropped.
