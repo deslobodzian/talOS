@@ -164,7 +164,10 @@ A relative `--prefix` is resolved against the working directory.
   flag. The one exception is how talOS's own tests install their fixture
   bundles: install accepts a test-only bundle when `TEST_TARGET` is set and
   the prefix lies inside the directory `TEST_TMPDIR` names, as Bazel sets
-  both for a test. Otherwise it
+  both for a test. It then refuses, also before writing anything, a bundle
+  whose `#!/usr/bin/env` interpreter (a Python node's `python3`) the boot
+  service's `PATH` cannot run ([host interpreters](#host-interpreters)).
+  Otherwise it
   copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
   checks that the copy has an executable `run.sh`, runs
   `sync`, [warms the copy](#warm-up), [checks its graph](#graph-check),
@@ -425,9 +428,36 @@ The check is not the whole launch. It does not cover:
   simulation config installs and the boot service's launch then exits 1.
 - The boot service's account and environment: the check runs as the person
   running `deploy.sh`, with their environment, while the service runs as
-  its account with its own `PATH`, so a member that resolves a program
-  through `PATH` (a Python member's `#!/usr/bin/env python3`) can find a
-  different one at boot (TODO.md DEPLOY-10).
+  its account with its own environment. What members find through the
+  service's `PATH` is checked separately ([host
+  interpreters](#host-interpreters)); anything else a member reads from
+  the environment can differ at boot.
+
+### Host interpreters
+
+A bundle needs a host `python3` when it carries a Python node: each Python
+node's entry script, `bin/<name>`, starts `#!/usr/bin/env python3`, and
+that interpreter only starts the node, which then runs on the bundle's own
+runtime in `python/` ([bundle layout](#build-a-bundle)). `run.sh` starts
+`#!/usr/bin/env bash`. `env` resolves both on the `PATH` the boot service
+starts `run.sh` with, the bundle's `bin/` first and then the service
+manager's default, not the installer's: `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+under systemd, `/usr/bin:/bin:/usr/sbin:/sbin` under launchd, where neither
+Homebrew's nor a pyenv `python3` is. So `install`, before writing anything,
+runs each program that `run.sh`, the launcher, a `bin/` entry or the Studio
+bridge names after `#!/usr/bin/env`, once, as `<program> --version` with
+only that `PATH`, and refuses the bundle when one does not run, absent or
+failing (macOS's `/usr/bin/python3` without the Command Line Tools fails):
+
+```
+deploy: error: bin/<name> starts #!/usr/bin/env python3, which the boot service resolves on its PATH, <path>, where python3 does not run; nothing was written to <prefix>. Install python3 in a directory on that PATH (...)
+```
+
+The fix is a `python3` on that `PATH`: on macOS `xcode-select --install`
+(the Command Line Tools provide the `/usr/bin/python3` launchd finds), on
+Linux the distribution's `python3` package. The check runs as the
+installer; the service account resolves the same `PATH`, and `enable-boot`
+checks that account's access to the bundle.
 
 ### Boot service output
 

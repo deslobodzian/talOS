@@ -324,7 +324,8 @@ EOF
 # is one) do not refuse and are printed. Not covered: --describe-only skips
 # the `[robot] simulation_only` refusal a launch without --sim makes, and the
 # check runs as the installing person with their environment, not as the
-# boot service's account with its PATH (TODO.md DEPLOY-10). The check needs
+# boot service's account (check_interpreters runs what members find through
+# the service's PATH). The check needs
 # no controller, shared memory, registry, session lock or realtime
 # privilege: --describe-only takes none of them and a --describe run opens no
 # device. Its session directory goes to a temporary root, removed afterwards.
@@ -371,6 +372,52 @@ check_graph() {
   rm -rf "$scratch"
   STOP_SCRATCH=""
   return "$status"
+}
+
+# --- interpreters -----------------------------------------------------------
+# A member that starts `#!/usr/bin/env <program>` (run.sh: bash; a Python
+# node's entry script under bin/: python3) finds <program> on the PATH it is
+# started with, and the boot service starts run.sh with its service
+# manager's default PATH, not the installer's: systemd's for a system unit,
+# launchd's /usr/bin:/bin:/usr/sbin:/sbin for a LaunchDaemon, where neither
+# Homebrew's nor a pyenv python3 is. run.sh puts the bundle's bin/ first. So
+# install runs each such program once, `<program> --version` with only that
+# PATH and no other environment, and refuses the bundle before writing
+# anything when one does not run: absent from that PATH, or macOS's
+# /usr/bin/python3 without the Command Line Tools. It runs as the installer;
+# the service account reads the same PATH, and enable-boot checks the
+# account's access to the bundle. TALOS_DEPLOY_SERVICE_PATH replaces the
+# service manager's PATH (tests).
+service_path() {
+  if [ -n "${TALOS_DEPLOY_SERVICE_PATH:-}" ]; then
+    printf '%s' "$TALOS_DEPLOY_SERVICE_PATH"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    printf '/usr/bin:/bin:/usr/sbin:/sbin'
+  else
+    printf '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+  fi
+}
+
+check_interpreters() {
+  local bundle="$1" path file line program rel checked=" "
+  path="$bundle/bin:$(service_path)"
+  for file in "$bundle/run.sh" "$bundle/launcher" "$bundle"/bin/* \
+      "$bundle/studio/studio_bridge"; do
+    [ -f "$file" ] || continue
+    # The first two bytes, so that no binary is read as a line.
+    [ "$(head -c 2 "$file" 2>/dev/null)" = '#!' ] || continue
+    line=""
+    IFS= read -r line <"$file" || true
+    case "$line" in '#!/usr/bin/env '*) ;; *) continue ;; esac
+    program="${line#'#!/usr/bin/env '}"
+    program="${program%% *}"
+    case "$checked" in *" $program "*) continue ;; esac
+    checked="$checked$program "
+    env -i PATH="$path" "$program" --version </dev/null >/dev/null 2>&1 &&
+      continue
+    rel="${file#"$bundle/"}"
+    die "$rel starts #!/usr/bin/env $program, which the boot service resolves on its PATH, $path, where $program does not run; nothing was written to $PREFIX. Install $program in a directory on that PATH (python3 on macOS: xcode-select --install, whose /usr/bin/python3 launchd finds; on Linux: the distribution's python3 package)"
+  done
 }
 
 # --- copy -------------------------------------------------------------------
@@ -636,11 +683,14 @@ sys.exit(os.path.commonpath([test, prefix]) != test)
 # deploy.sh) while it is copied, made read-only, synced, warmed or checked
 # (stop traps, above): the step's processes are stopped first, and
 # deploy.sh exits 128 + the signal. So neither a selection nor prune's
-# newest --keep N ever counts it. Not covered: SIGKILL.
+# newest --keep N ever counts it. Not covered: SIGKILL. A bundle whose
+# `#!/usr/bin/env` interpreter the boot service cannot run is refused before
+# anything is written (check_interpreters).
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
   refuse_testonly "$bundle"
+  check_interpreters "$bundle"
   # PID-suffixed: two installs in the same second must not share a dir.
   local stamp; stamp="$(date +%Y%m%d_%H%M%S)_$$"
   local dest="$PREFIX/bundles/$stamp"

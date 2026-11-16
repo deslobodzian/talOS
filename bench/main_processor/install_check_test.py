@@ -11,6 +11,7 @@ import select
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -181,6 +182,47 @@ class InstallCheckTest(unittest.TestCase):
                 self.assertEqual(os.readlink(current), installed, out)
                 self.assertEqual(os.listdir(os.path.join(prefix, "bundles")),
                                  [os.path.basename(installed)], out)
+
+    # REQ-OPS-48: a Python node's entry script starts `#!/usr/bin/env
+    # python3`, which the boot service resolves on its own PATH (systemd's
+    # or launchd's default, not the installer's). Install refuses, before
+    # writing anything, a bundle whose interpreter that PATH cannot run,
+    # and installs it once the PATH can.
+    def test_install_refuses_an_interpreter_the_service_cannot_find(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            src = os.path.join(tmp, "bundle")
+            os.makedirs(os.path.join(src, "bin"))
+            with open(os.path.join(src, "run.sh"), "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(src, "run.sh"), 0o755)
+            with open(os.path.join(src, "bin", "vision"), "w",
+                      encoding="utf-8") as f:
+                f.write("#!/usr/bin/env python3\n")
+            os.chmod(os.path.join(src, "bin", "vision"), 0o755)
+            service_bin = os.path.join(tmp, "service_bin")
+            os.makedirs(service_bin)
+            prefix = os.path.join(tmp, "prefix")
+
+            def install():
+                return subprocess.run(
+                    ["bash", deploy_script(), "install", src, "--prefix",
+                     prefix, "--no-warm-up"],
+                    env=dict(os.environ,
+                             TALOS_DEPLOY_SERVICE_PATH=service_bin),
+                    capture_output=True, text=True, timeout=60)
+
+            proc = install()
+            out = proc.stdout + proc.stderr
+            self.assertNotEqual(proc.returncode, 0, out)
+            self.assertIn("python3", out)
+            self.assertIn("bin/vision", out)
+            self.assertIn(service_bin, out)
+            self.assertFalse(os.path.lexists(prefix), out)
+            os.symlink(os.path.realpath(sys.executable),
+                       os.path.join(service_bin, "python3"))
+            proc = install()
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(os.path.islink(os.path.join(prefix, "current")))
 
     # REQ-OPS-48: a stop during install's copy (Ctrl-C, SIGTERM, SIGHUP to
     # deploy.sh) stops the copy's processes and removes the partial copy,
