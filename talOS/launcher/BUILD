@@ -347,7 +347,6 @@ cc_binary(
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/hardware",
-        "//talOS/protocol",
     ],
 )
 

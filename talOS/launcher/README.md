@@ -852,10 +852,13 @@ ended (when it is written: [session segments and logs](#session-segments-and-log
 - `config_path`: the config, made absolute against the launcher's working
   directory (also in `graph.json`, and passed to every member as `--config`).
 - `hardware_protocol_version`: the hardware protocol of the launcher's build
-  (`protocol::kProtocolVersion`), the one its bridge and nodes speak, so a
-  later build decodes the session's hardware packets only under it
+  (`protocol::kProtocolVersion`), so a later build decodes the session's
+  hardware packets only under it
   ([which logs a build can read](#which-logs-a-build-can-read)); absent in a
-  manifest written before the field.
+  manifest written before the field. It is the launcher's constant: the
+  bridge and node binaries it ran are not asked, and are of another build
+  when they were not rebuilt with it (`bazel run //talOS/launcher` rebuilds
+  the launcher only); a bundle builds them all from one checkout.
 - `config_sha256`, `git_revision`, `git_dirty`: the bundle's config identity
   and the source revision of a `--config=release` build
   ([deployment](../../docs/DEPLOYMENT.md#build-a-bundle)); empty (and
@@ -1407,7 +1410,7 @@ included:
   protocol:
 
   ```
-  log_dump: warning: hardware packets not decoded: recorded under a hardware protocol other than this build's protocol <N> (the session records no protocol version); this build's codecs reject <k> of <n>, the first on <topic>: <reason>
+  log_dump: warning: hardware packets not decoded: recorded under a hardware protocol other than this build's protocol <N> (the session records no protocol version); this build's codecs reject <k> of the <n> tried, the first on <topic>: <reason>
   ```
 
   A session of another protocol whose hardware packets all happen to
@@ -1415,11 +1418,12 @@ included:
   way and decodes with this build's layout, possibly wrongly.
 
 - **The manifest records this build's version.** Every packet is still
-  tried; one this build rejects was not written by its codec (made by hand,
-  or altered), which is not another protocol:
+  tried, since the version is the launcher's: one this build rejects was
+  written by another codec than the launcher's (a bridge or node binary of
+  another build) or by hand:
 
   ```
-  log_dump: warning: hardware packets not decoded: recorded under this build's hardware protocol <N>, yet this build's codecs reject <k> of <n>, the first on <topic>: <reason> (packets its codec did not write, not another protocol)
+  log_dump: warning: hardware packets not decoded: recorded under this build's hardware protocol <N> (the launcher's), yet this build's codecs reject <k> of the <n> tried, the first on <topic>: <reason>; the session's bridge or nodes may be of another build
   ```
 
 `tlog_to_wpilog` prints the same lines prefixed `tlog_to_wpilog:`. A record
@@ -1428,9 +1432,16 @@ and names the log (above). When `log_dump` refuses, it exports no `hardware`
 and no `ds_enabled` member (JSONL), an empty `hardware` field (CSV) and no
 hardware line (text, summary); `payload_hex` keeps the bytes. Every other
 record is exported as before, and the exit status is 0. Read a session's
-hardware packets with a build of the protocol it was recorded under: a
-stamped bundle's session names its source in `git_revision`; nothing else
-in a session does.
+hardware packets with a build of the protocol its manifest names
+(`hardware_protocol_version`); a stamped bundle's session also names its
+source revision (`git_revision`).
+
+Each publication's bytes are the same in every log that recorded it, so the
+check tries one copy: the writer's SEND records, and readers' copies only of
+a topic whose SEND it has not seen. `tlog_to_wpilog` decodes each packet
+once, as it writes it, and writes the file again without hardware entries
+when a rejected one turns up part way; `log_dump`, which streams the session
+in bounded memory, decodes a printed packet a second time.
 
 `--replay-inputs` refuses a session whose manifest records another
 hardware protocol, before it starts the node, with one line naming both
@@ -1551,9 +1562,11 @@ lateness and bridge request-to-command rows are informational and not
 required. The enabled-only verdicts (enabled state median, p99 and gaps,
 target age at tick) cannot be measured in a session that never enabled, and
 the report says so in one line; `--strict` still fails them, so acceptance
-needs an enabled session. In a session recorded under another hardware
-protocol ([which logs a build can read](#which-logs-a-build-can-read)),
-`log_dump` decodes no Driver Station packet, so the same verdicts are NOT
+needs an enabled session. In a session whose hardware packets `log_dump`
+does not decode ([which logs a build can read](#which-logs-a-build-can-read):
+its manifest records another hardware protocol, or this build's codecs
+reject one of its packets, whatever version it records), `log_dump`
+decodes no Driver Station packet, so the same verdicts are NOT
 MEASURED with `log_dump`'s line in their detail (target age at tick too:
 without the enabled bit a lane `Target` never selected cannot be found),
 the line is a session issue (`hardware_not_decoded` in `--json`), and

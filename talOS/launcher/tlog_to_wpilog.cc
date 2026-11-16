@@ -908,11 +908,13 @@ talos::launcher::HardwareRecord HardwareKind(const Item& item) {
 }
 
 // Writes `items` to `writer`; see README.md for the mapping. The hardware
-// packets are written only with `decode_hardware` (the session was recorded
-// under this build's protocol: HardwareProtocolCheck), their devices named
-// from `names` (may be null).
+// packets are decoded by `protocol` (hardware_record.h), which tries each
+// once, and written only while it has found none of another protocol; their
+// devices are named from `names` (may be null). When it finds one part way,
+// the hardware values already written stay: the caller writes the items
+// again, and `protocol` then decodes none.
 Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
-                  bool decode_hardware,
+                  talos::launcher::HardwareProtocolCheck& protocol,
                   const talos::launcher::DeviceNames* names,
                   talos::wpilog::Writer& writer) {
   Totals totals;
@@ -938,7 +940,6 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
   // few distinct ones, written for every value.
   std::map<std::string, std::string, std::less<>> hardware_metadata;
   std::map<std::string, std::uint32_t> joysticks_seen;  // topic -> ports
-  talos::launcher::HardwarePacket packet;
   const std::string* hardware_topic = nullptr;
   std::uint64_t hardware_time_us = 0;
   HardwareValues hardware{
@@ -973,13 +974,13 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
     const talos::schema::Identity& identity = item.source->schema;
     const auto kind = HardwareKind(item);
     if (kind != talos::launcher::HardwareRecord::kNone) {
-      // Every packet decodes once HardwareProtocolCheck found none this
-      // build rejects.
-      if (!decode_hardware ||
-          !talos::launcher::DecodeHardwareRecord(kind, item.payload, packet)
-               .empty()) {
-        continue;
-      }
+      // Items are one per publication, so none is a reader's copy here.
+      const talos::launcher::HardwarePacket* decoded =
+          protocol.foreign()
+              ? nullptr
+              : protocol.Add(kind, topic, /*reader_copy=*/false, item.payload);
+      if (decoded == nullptr || protocol.foreign()) continue;
+      const talos::launcher::HardwarePacket& packet = *decoded;
       hardware_topic = &topic;
       hardware_time_us = time_us;
       switch (kind) {
@@ -1145,17 +1146,11 @@ int Convert(const Options& options) {
   std::size_t records = 0;
   if (!SelectItems(files, items, records, error)) return Fail(error);
 
-  // Whether the session's hardware packets are of this build's protocol,
-  // judged by the version its manifest records, then on every one, before
-  // any is converted (hardware_record.h).
+  // Whether the session's hardware packets are of this build's protocol:
+  // by the version its manifest records, then as WriteItems decodes each
+  // (hardware_record.h).
   talos::launcher::HardwareProtocolCheck protocol{
       talos::launcher::RecordedProtocolVersion(options.inputs)};
-  for (const Item& item : items) {
-    const auto kind = HardwareKind(item);
-    if (item.values && kind != talos::launcher::HardwareRecord::kNone) {
-      protocol.Add(kind, item.source->name, item.payload);
-    }
-  }
 
   // Device names for the hardware packets, as log_dump finds them: --config,
   // else the config the session's manifest names. Without one, a device's
@@ -1174,22 +1169,28 @@ int Convert(const Options& options) {
                       : "config " + config_path + ": " + config_error;
   }
 
-  std::ofstream out{temp.path(), std::ios::binary | std::ios::trunc};
-  if (!out) return Fail("cannot write " + options.output);
   Totals totals;
-  try {
-    talos::wpilog::Writer writer{
-        out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
-    totals = WriteItems(items, start_ns, !protocol.foreign(),
-                        device_names ? &*device_names : nullptr, writer);
-    out.flush();
-    const bool written = writer.ok() && out.good();
-    out.close();
-    if (!written || out.fail()) {
-      return Fail("writing " + options.output + " failed");
+  // Written once, or, when a packet of another protocol turns up part way,
+  // again with no hardware packet (the check then decodes none).
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    const bool foreign_before = protocol.foreign();
+    std::ofstream out{temp.path(), std::ios::binary | std::ios::trunc};
+    if (!out) return Fail("cannot write " + options.output);
+    try {
+      talos::wpilog::Writer writer{
+          out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
+      totals = WriteItems(items, start_ns, protocol,
+                          device_names ? &*device_names : nullptr, writer);
+      out.flush();
+      const bool written = writer.ok() && out.good();
+      out.close();
+      if (!written || out.fail()) {
+        return Fail("writing " + options.output + " failed");
+      }
+    } catch (const std::exception& e) {
+      return Fail(options.output + ": " + e.what());
     }
-  } catch (const std::exception& e) {
-    return Fail(options.output + ": " + e.what());
+    if (foreign_before || !protocol.foreign()) break;
   }
   if (!temp.commit(options.output, error)) return Fail(error);
   for (const auto& [topic, why] : totals.skipped) {

@@ -663,14 +663,23 @@ bool HardwareProtocolCheck::refused_by_version() const {
   return recorded_ && *recorded_ != protocol::kProtocolVersion;
 }
 
-void HardwareProtocolCheck::Add(HardwareRecord kind, std::string_view topic,
-                                std::span<const std::byte> payload) {
-  if (refused_by_version()) return;
+const HardwarePacket* HardwareProtocolCheck::Add(
+    HardwareRecord kind, std::string_view topic, bool reader_copy,
+    std::span<const std::byte> payload) {
+  if (refused_by_version()) return nullptr;
+  if (!reader_copy) {
+    if (!sent_.contains(topic)) sent_.emplace(topic);
+  } else if (sent_.contains(topic)) {
+    return nullptr;
+  }
   ++packets_;
   std::string why = DecodeHardwareRecord(kind, payload, scratch_);
-  if (why.empty() || rejected_++ != 0) return;
-  first_topic_ = topic;
-  first_why_ = std::move(why);
+  if (why.empty()) return &scratch_;
+  if (rejected_++ == 0) {
+    first_topic_ = topic;
+    first_why_ = std::move(why);
+  }
+  return nullptr;
 }
 
 std::string HardwareProtocolCheck::Warning() const {
@@ -682,14 +691,14 @@ std::string HardwareProtocolCheck::Warning() const {
            std::to_string(*recorded_) + "; this build's is " + build +
            " (manifest.json hardware_protocol_version)";
   }
-  const std::string rejected = "this build's codecs reject " +
-                               std::to_string(rejected_) + " of " +
-                               std::to_string(packets_) + ", the first on " +
-                               first_topic_ + ": " + first_why_;
+  const std::string rejected =
+      "this build's codecs reject " + std::to_string(rejected_) + " of the " +
+      std::to_string(packets_) + " tried, the first on " + first_topic_ + ": " +
+      first_why_;
   if (recorded_) {
     return prefix + "recorded under this build's hardware protocol " + build +
-           ", yet " + rejected +
-           " (packets its codec did not write, not another protocol)";
+           " (the launcher's), yet " + rejected +
+           "; the session's bridge or nodes may be of another build";
   }
   return prefix +
          "recorded under a hardware protocol other than this build's "

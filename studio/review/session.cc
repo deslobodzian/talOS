@@ -219,7 +219,9 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (const auto kind = talos::launcher::HardwareRecordOf(
             r.source->name, r.source->schema.name);
         kind != HardwareRecord::kNone) {
-      protocol.Add(kind, r.source->name, r.payload);
+      protocol.Add(kind, r.source->name,
+                   r.header.kind != static_cast<std::uint16_t>(EventKind::SEND),
+                   r.payload);
     }
     if (build.topic[id] < 0) return true;
     build.kinds[id] |=
