@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -37,6 +38,9 @@
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
+#include "talOS/events/log/format.h"
+#include "talOS/events/log/gap_testing.h"
+#include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
 #include "talOS/hardware/config.h"
@@ -701,6 +705,124 @@ TEST_F(TlogToWpilogTest, CutLogConvertsItsIntactRecords) {
   std::ifstream stream{out, std::ios::binary};
   const Wpilog log = ParseWpilog({std::istreambuf_iterator<char>{stream}, {}});
   EXPECT_EQ(log.of("/robot/state/position_m").size(), 2u);
+}
+
+// A boolean entry's values as (value, microseconds after kStartNs) pairs.
+std::vector<std::pair<bool, std::uint64_t>> Booleans(
+    const std::vector<Value>& values) {
+  std::vector<std::pair<bool, std::uint64_t>> out;
+  for (const Value& value : values) {
+    out.emplace_back(value.payload == Bytes{1}, value.time_us);
+  }
+  return out;
+}
+
+std::uint64_t MicrosOf(std::int64_t ns) {
+  return static_cast<std::uint64_t>(ns - kStartNs) / 1000;
+}
+
+// Guards: each GAP record becomes its process's boolean entry
+// /talos_log/gap/<process>, true at the gap's start and false when capture
+// resumed: for a gap closed at the stop (no resume), its GAP record's
+// resumed time, which is when the stop closed it. Each process has its own
+// entry, a log with no gap none, and each file with gaps is named on stderr
+// once, however many it holds.
+// REQ-OPS-26
+TEST_F(TlogToWpilogTest, AGapBecomesABooleanEntryOfItsProcess) {
+  namespace log = talos::event::log;
+  const auto gap_entries = [](const Wpilog& wpilog) {
+    std::vector<std::string> names;
+    for (const auto& [name, id] : wpilog.ids) {
+      if (name.starts_with("/talos_log/gap/")) names.push_back(name);
+    }
+    return names;
+  };
+  EXPECT_TRUE(gap_entries(Convert({session_})).empty());
+
+  // robot loses its second dispatch (records 6-8) until the stop; viewer
+  // loses its second message, resumes at the third, then loses the fourth
+  // until the stop.
+  const std::string robot = session_ + "/robot.tlog";
+  const std::string viewer = session_ + "/viewer.tlog";
+  std::filesystem::rename(robot, root_ + "/robot.staged");
+  std::filesystem::rename(viewer, root_ + "/viewer.staged");
+  const log::LogGap robot_gap =
+      log::CopyWithGap(root_ + "/robot.staged", robot, 6, 9);
+  const log::LogGap viewer_first =
+      log::CopyWithGap(root_ + "/viewer.staged", root_ + "/viewer.once", 1, 2);
+  // Records now: message 1, GAP, message 3, message 4.
+  const log::LogGap viewer_last =
+      log::CopyWithGap(root_ + "/viewer.once", viewer, 3, 4);
+  ASSERT_NE(robot_gap.detail.flags & log::GAP_CLOSED_AT_FLUSH, 0);
+  ASSERT_LT(viewer_first.resumed_ns, viewer_last.start_ns);
+
+  const std::string out = root_ + "/gapped.wpilog";
+  const Result result = Run({session_, "-o", out});
+  ASSERT_EQ(result.exit_code, 0) << result.output;
+  const Wpilog wpilog = Read(out);
+  EXPECT_EQ(gap_entries(wpilog),
+            (std::vector<std::string>{"/talos_log/gap/robot",
+                                      "/talos_log/gap/viewer"}));
+  const Entry* entry = wpilog.entry("/talos_log/gap/robot");
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(entry->type, "boolean");
+  EXPECT_EQ(Booleans(wpilog.of("/talos_log/gap/robot")),
+            (std::vector<std::pair<bool, std::uint64_t>>{
+                {true, MicrosOf(robot_gap.start_ns)},
+                {false, MicrosOf(robot_gap.resumed_ns)}}));
+  EXPECT_EQ(Booleans(wpilog.of("/talos_log/gap/viewer")),
+            (std::vector<std::pair<bool, std::uint64_t>>{
+                {true, MicrosOf(viewer_first.start_ns)},
+                {false, MicrosOf(viewer_first.resumed_ns)},
+                {true, MicrosOf(viewer_last.start_ns)},
+                {false, MicrosOf(viewer_last.resumed_ns)}}));
+
+  std::istringstream lines{result.output};
+  std::map<std::string, int> named;
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find("log gap in ") == std::string::npos) continue;
+    for (const std::string& path : {robot, viewer}) {
+      if (line.find(path + ":") != std::string::npos) ++named[path];
+    }
+  }
+  EXPECT_EQ(named, (std::map<std::string, int>{{robot, 1}, {viewer, 1}}))
+      << result.output;
+}
+
+// Guards: a process's gap entry stays true while any of its gaps is open. A
+// timer that ran late resumes capture (at 40 ms) after its deadline (22 ms),
+// and the next timer, due at 35 ms, is dropped: the second gap starts before
+// the first resumed, and the entry must not read false between them.
+// REQ-OPS-26
+TEST_F(TlogToWpilogTest, OverlappingGapsOfAProcessStayTrue) {
+  namespace log = talos::event::log;
+  talos::event::Registration timer;
+  timer.id = 1;
+  timer.kind = talos::event::SourceKind::TIMER;
+  timer.name = "update";
+  const std::string staged = root_ + "/late.staged";
+  WriteLog(staged, "late", {timer}, [](log::LogWriter& writer) {
+    const std::vector<std::pair<double, double>> ticks{
+        {10, 10}, {20, 20}, {22, 40}, {35, 50}, {60, 60}};
+    std::uint64_t index = 0;
+    for (const auto& [event_ms, now_ms] : ticks) {
+      writer.dispatch(At(talos::event::EventKind::TIMER, 1, ++index, event_ms,
+                         now_ms, event_ms),
+                      {});
+    }
+  });
+  const log::LogGap first =
+      log::CopyWithGap(staged, root_ + "/late.once", 1, 2);
+  // Records now: tick 1, GAP, tick 3, tick 4, tick 5.
+  std::filesystem::create_directories(root_ + "/late");
+  const log::LogGap second =
+      log::CopyWithGap(root_ + "/late.once", root_ + "/late/late.tlog", 3, 4);
+  ASSERT_LT(second.start_ns, first.resumed_ns);
+  const Wpilog wpilog = Convert({root_ + "/late"});
+  EXPECT_EQ(Booleans(wpilog.of("/talos_log/gap/late")),
+            (std::vector<std::pair<bool, std::uint64_t>>{
+                {true, MicrosOf(first.start_ns)},
+                {false, MicrosOf(second.resumed_ns)}}));
 }
 
 // Guards: a fixed array of structs inside a target-lane envelope is named

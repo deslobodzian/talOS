@@ -466,6 +466,7 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
         "//talOS/hardware",
         "//talOS/hardware:config",
         "//talOS/msgs:geometry",
