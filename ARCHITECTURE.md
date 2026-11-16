@@ -15,6 +15,58 @@ In simulation `//talOS/simulation:sim_gateway`, which the launcher starts on
 the ports it gives the bridge, or the RoboRIO program under WPILib
 simulation takes the RoboRIO's place.
 
+The split puts every motor behind the main processor. Because the RoboRIO
+runs no robot logic, anything that stops the main processor commanding (a
+pulled Ethernet cable, a brownout reset, a crash, a boot not yet finished)
+stops the whole robot: the RoboRIO neutralizes every output once the last
+command expires, and its loop watchdog does so if its own loop stalls
+([the tick](#the-tick); [watchdog](talOS/hardware/README.md#roborio)), while
+the Driver Station shows a `talos companion link` error. The robot stays
+neutral until the main processor is back with its nodes running and, for
+operator input, the sticks have returned to neutral ([targets](#targets)).
+A design that ran its control on the RoboRIO would lose only what the
+coprocessor adds, such as vision. What the split buys: robot logic runs off
+the RoboRIO's two cores, which its CAN, NetComm and gateway threads share,
+on a Linux or macOS host with realtime loop tiers and shared-memory topics;
+every node runs and is tested without WPILib, in `testing::Sim` or against
+`sim_gateway`; a node is a function of its logged inputs and their times, so
+a session replays ([talOS/events](talOS/events/README.md#recording-and-replaying));
+and Python nodes run the same framework through `talOS/node_api`. The main
+processor's power, brownout ride-through and boot time are properties of the
+robot's integration, not of this software, and are measured at the bench
+([docs/BENCH.md](docs/BENCH.md)).
+
+A controller processor is a program at the gateway end of `talOS/protocol`.
+The RoboRIO program, its WPILib simulation and `sim_gateway` all run the
+same `hardware::Gateway` and `hardware::Endpoint` (configuration, command
+checks, expiry, State, clock-probe echo) with the protocol and Driver Station
+codecs unchanged, and each supplies only:
+
+- a `hardware::Backend` (`talOS/hardware/gateway.h`) for its devices
+  (`PhoenixBackend`; `SimBackend`, `sim::PhysicsSimBackend`);
+- a fixed-period loop that ticks the `Endpoint` on a monotonic clock
+  (`Gateway::SetClock`) with the Driver Station's enable, observes the same
+  flags in one `driver_station::ModeTracker` every tick, and sends Driver
+  Station packets stamped by it and carrying the gateway's boot id (random
+  and nonzero per program start, the one its State carries);
+- its Driver Station source (the RoboRIO's NetComm reader, a scripted one in
+  simulation);
+- a UDP socket connected to one companion address (built into the RoboRIO
+  program, loopback for `sim_gateway`), on hardware reopened until a route
+  exists and replaced when `protocol::SendErrorNeedsNewSocket` says so;
+- on hardware, a watchdog outside the loop thread that neutralizes the
+  outputs when the loop stalls past the command's expiry, since the gateway
+  acts only when ticked;
+- its `hardware::GatewayProgram` in the State's build; adding one changes
+  the State codec and so `protocol::kProtocolVersion`.
+
+The wire format names RoboRIO hardware: CAN bus slot 0 is `"rio"`, and the
+device kinds are TalonFX, CANcoder, Pigeon2 and the RoboRIO's digital,
+analog, encoder and PWM I/O; a controller with other devices adds a device
+type ([where a new thing goes](#where-a-new-thing-goes)). The RoboRIO
+program's saved configuration, companion-link report and console log are
+its own; the bridge relies on none of them.
+
 See [Data flow and byte budgets](docs/DATA_FLOW.md) for every transport,
 producer/consumer, rate, dynamic payload, and shared-memory slot size.
 
