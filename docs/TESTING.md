@@ -254,7 +254,11 @@ takes the role from the package's sources (a `Motor`, `DigitalOutput`,
 observer). A
 `// matrix: role <role> (reason)` comment overrides it, never away from
 actuator; a Python package that only wraps C++ nodes (`talos.cpp_node`) is
-checked in its C++ package.
+checked in its C++ package. A package whose node rules all set
+`testonly = True` is a test fixture, such as the bundle test's
+`bench/main_processor/bundle_testdata`: no robot's bundle can carry it
+(Bazel refuses a target that is not testonly depending on one), so the lint
+skips it with a `[fixture]` row.
 
 A node implemented in both languages (a C++ class and a Python class, not a
 `talos.cpp_node` wrapper) carries the full matrix in its C++ test. Its

@@ -589,6 +589,7 @@ def talos_cc_node(
         deps = [],
         node_target = None,
         visibility = None,
+        testonly = None,
         **kwargs):
     """A C++ talOS node: sources ending in TALOS_NODE(Class).
 
@@ -604,6 +605,9 @@ def talos_cc_node(
       deps: libraries the sources use (messages, talOS/devices, ...).
       node_target: defaults to this label.
       visibility: of the talos_node target (public by default).
+      testonly: of every rule generated: True for a test fixture, which only
+        a testonly bundle or a test can carry. check_node_matrix skips a
+        package whose node rules all set it.
       **kwargs: passed to the cc_binary.
     """
 
@@ -629,6 +633,7 @@ def talos_cc_node(
             'TALOS_NODE_NAME=\\"%s\\"' % node_name,
             'TALOS_NODE_TARGET=\\"%s\\"' % node_target,
         ],
+        testonly = testonly,
         visibility = ["//visibility:private"],
         **kwargs
     )
@@ -638,6 +643,7 @@ def talos_cc_node(
         node_name = node_name,
         node_target = node_target,
         language = "cpp",
+        testonly = testonly,
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
@@ -711,6 +717,7 @@ def talos_py_node(
         data = [],
         node_target = None,
         visibility = None,
+        testonly = None,
         **kwargs):
     """A Python talOS node: class `class_name` of the file `main`.
 
@@ -727,6 +734,7 @@ def talos_py_node(
       data: runtime files.
       node_target: defaults to this label.
       visibility: of the talos_node target (public by default).
+      testonly: of every rule generated, as in talos_cc_node.
       **kwargs: passed to the py_binary.
     """
     if not node_target:
@@ -743,6 +751,7 @@ def talos_py_node(
         name = name + "_runner_gen",
         outs = [runner_py],
         cmd = "cat << 'EOF' > $@\n" + content + "EOF\n",
+        testonly = testonly,
         visibility = ["//visibility:private"],
     )
 
@@ -754,6 +763,7 @@ def talos_py_node(
         legacy_create_init = False,
         deps = deps + [Label("//talOS/python:talos")],
         data = data,
+        testonly = testonly,
         visibility = ["//visibility:private"],
         **kwargs
     )
@@ -764,6 +774,7 @@ def talos_py_node(
         node_name = node_name,
         node_target = node_target,
         language = "python",
+        testonly = testonly,
         visibility = visibility if visibility != None else ["//visibility:public"],
     )
 
