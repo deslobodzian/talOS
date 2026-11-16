@@ -41,12 +41,13 @@ case "$(basename "$0")" in
     exec tail -f /dev/null ;;
   run.sh)
     # The graph check's run: STUB_CHECK_FIFO says it is running and never
-    # exits.
+    # exits; STUB_CHECK_EXIT is its exit status (the launcher refusing).
     if [ -n "${STUB_CHECK_FIFO:-}" ]; then
       echo up > "$STUB_CHECK_FIFO"
       exec tail -f /dev/null
     fi
-    ;;
+    printf 'end %s\\n' "$me" >> "$STUB_LOG"
+    exit "${STUB_CHECK_EXIT:-0}" ;;
 esac
 printf 'end %s\\n' "$me" >> "$STUB_LOG"
 """
@@ -325,6 +326,33 @@ class WarmUpTest(unittest.TestCase):
         self.assertEqual([r[0] for r in log], ["start"], log)
         with self.assertRaises(ProcessLookupError, msg="graph check alive"):
             os.kill(int(log[0][2]), 0)
+
+    # REQ-OPS-50: rollback selects `previous` only after its own launcher
+    # accepts it, as install does; a refused rollback leaves `current` and
+    # `previous` as they were.
+    def test_rollback_refuses_a_bundle_the_launcher_refuses(self):
+        self.install("old", ("alpha",), "--no-warm-up")
+        old = os.readlink(os.path.join(self.prefix, "current"))
+        self.install("new", ("alpha",), "--no-warm-up")
+        new = os.readlink(os.path.join(self.prefix, "current"))
+        proc = subprocess.run(
+            ["bash", deploy_script(), "rollback", "--prefix", self.prefix,
+             "--no-warm-up"],
+            capture_output=True, text=True, timeout=60,
+            env=dict(self.env, STUB_CHECK_EXIT="4"))
+        out = proc.stdout + proc.stderr
+        self.assertNotEqual(proc.returncode, 0, out)
+        self.assertIn("failed (exit 4)", out)
+        self.assertEqual(os.readlink(os.path.join(self.prefix, "current")),
+                         new, out)
+        self.assertEqual(os.readlink(os.path.join(self.prefix, "previous")),
+                         old, out)
+        # The check ran on `previous`, from its installed path.
+        log = self.records(check=True)
+        self.assertEqual(log[-2][:2],
+                         ["start", os.path.join(os.path.realpath(old),
+                                                "run.sh")], log)
+
 
 if __name__ == "__main__":
     unittest.main()

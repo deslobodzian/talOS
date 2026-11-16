@@ -288,7 +288,11 @@ A relative `--prefix` is resolved against the working directory.
   holds a bundle. It [warms](#warm-up) `previous` before selecting it: one
   installed by a `deploy.sh` without the warm-up and never launched has never
   run. A bundle that has already run needs none, and its warm-up costs about
-  10 ms a member. Selection does not change already-running processes: a
+  10 ms a member. It then runs install's [graph check](#graph-check) on
+  `previous` and, when the launcher refuses it (one installed by a
+  `deploy.sh` without the check, say), exits 1 with `deploy: error: not
+  rolled back: the launcher refuses <bundle>; current stays <bundle>`,
+  changing neither link. Selection does not change already-running processes: a
   running launcher restarts nodes from the bundle it started in.
   With the robot disabled, activate install/rollback with
   `sudo systemctl restart talos` on Linux, or
@@ -358,8 +362,7 @@ them), and the first `--describe-only` after it 0.4 to 0.5 s idle
 ([BENCH_RESULTS.md](BENCH_RESULTS.md#2026-11-13): DEPLOY-10, MAC-2). A
 member that exits nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
-succeeds: install's [graph check](#graph-check), and rollback's launch, judge
-the members. The warm-up's last line counts what finished, members that
+succeeds: the [graph check](#graph-check) that follows judges the members. The warm-up's last line counts what finished, members that
 exited 0 and native libraries whose load returned (failing or not), and
 names each member that did not with how it ended:
 `deploy: warmed 4 of 5 members and 40 of 58 native libraries in 6.2 s; not
@@ -370,11 +373,11 @@ into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
 member's process group, selects nothing and exits 128 plus the signal's
 number; `install` also removes its copy. Linux has no such
-charge; the warm-up runs there too. `--no-warm-up` skips it. After `install`, the
-[graph check](#graph-check) still runs every member and the launcher once,
-all at once inside the probes' deadline, so the first launch pays only, on
-macOS, each native library's first load; after `rollback`, which has no
-check, the first launch pays every first run.
+charge; the warm-up runs there too. `--no-warm-up` skips it. The
+[graph check](#graph-check) that `install` and `rollback` run next still
+runs every member and the launcher once, all at once inside the probes'
+deadline, so the first launch pays only, on macOS, each native library's
+first load.
 
 The members run as the user that runs `deploy.sh`, root under `sudo`: the
 bundle's code runs at install time with that privilege, so install only a
@@ -418,8 +421,10 @@ on macOS a fresh bundle's probes then pay the first-run charge inside their
 deadline, as its first launch would, so a probe that times out there is
 answered by installing again without `--no-warm-up`. There is no override:
 the launcher accepts `--allow-graph-errors` only with `--sim`, so a robot
-could never launch such a bundle. `rollback` does not check: it selects a
-bundle that was selected before.
+could never launch such a bundle. `rollback` runs the same check on
+`previous` after warming it, and a refusal leaves `current` and `previous`
+as they were ([rollback](#on-the-main-processor)); stopping it during the
+check selects nothing.
 
 The check is not the whole launch. It does not cover:
 
