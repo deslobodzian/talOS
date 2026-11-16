@@ -196,23 +196,12 @@ inline const char* HealthName(TopicHealth health) {
   return "ok";
 }
 
-// Whether an observer (naming::kSourceFlagObserver, telemetry) alone reads
-// `topic` by design: its role is one its owner publishes (state, status,
-// event, telemetry), the same test naming::LintGraph applies before its "is
-// read only by observers" warning. Nothing acts on an instruction (target,
-// request, command) an observer only records.
-inline bool ObserverReads(std::string_view topic) {
-  const auto segments = naming::detail::Segments(topic);
-  return segments.size() >= 2 &&
-         naming::detail::OneOf(naming::kOwnerPublishedRoles, segments[1]);
-}
-
 inline TopicHealth HealthOf(const TopicRow& row) {
   // An observer counts as a reader here exactly where the launcher's lint
-  // counts it (ObserverReads); it counts for nothing else, and stays listed
-  // apart from subscribers.
+  // counts it (naming::ObserverReads); it counts for nothing else, and stays
+  // listed apart from subscribers.
   const bool read = !row.subscribers.empty() ||
-                    (!row.observers.empty() && ObserverReads(row.name));
+                    (!row.observers.empty() && naming::ObserverReads(row.name));
   if (row.publishers.empty() || !read) {
     // A missing end is a fault only when both ends were meant to be here.
     // EXTERNAL is checked first because it is the more specific statement: it

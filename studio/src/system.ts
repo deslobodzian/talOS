@@ -668,9 +668,9 @@ export function topicEnds(nodes: readonly EndHolder[]): Map<string, TopicEnds> {
 }
 
 // Whether an observer alone reads `topic` by design: its role (the second
-// segment) is one its owner publishes. Mirrors studio/bridge/system.h's
-// ObserverReads, which applies naming::kOwnerPublishedRoles
-// (talOS/introspection/names.h) as naming::LintGraph does; keep the set equal.
+// segment) is one its owner publishes. Mirrors naming::ObserverReads
+// (talOS/introspection/names.h), the one test the launcher's lint and the
+// Studio bridge both call; keep the set equal to naming::kOwnerPublishedRoles.
 const OWNER_PUBLISHED_ROLES = new Set(['state', 'status', 'event', 'telemetry']);
 const observerReads = (topic: string): boolean =>
   OWNER_PUBLISHED_ROLES.has(topic.split('/')[2] ?? '');
