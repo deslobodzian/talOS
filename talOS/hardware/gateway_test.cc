@@ -2042,6 +2042,45 @@ TEST(ConfigWire, FullyCappedSerializationMatchesAssemblyLimit) {
   EXPECT_EQ(assembler.config(), config);
 }
 
+// UDP reorders and duplicates datagrams: chunks reassemble in any order, a
+// repeated chunk is ignored even when its bytes differ, and a transfer whose
+// bytes do not match the header's CRC is refused.
+// REQ-CONTRACT-04: out-of-order reassembly, duplicates ignored, CRC checked
+TEST(ConfigWire, ReassemblesOutOfOrderIgnoresDuplicatesAndChecksTheCrc) {
+  const auto config = SwerveConfig(false);
+  const auto chunks = CreateConfigChunks(config, 200);
+  ASSERT_GT(chunks.size(), 2u);
+  const auto corrupted = [](std::vector<uint8_t> chunk) {
+    chunk.back() ^= 0xff;  // a data byte; the header stays consistent
+    return chunk;
+  };
+  ConfigAssembler assembler;
+  std::string error;
+  for (std::size_t i = chunks.size(); i > 0; --i) {
+    const bool last = i == 1;
+    SCOPED_TRACE(i - 1);
+    EXPECT_EQ(assembler.AddChunk(chunks[i - 1], error),
+              last ? ConfigAssembler::Status::kComplete
+                   : ConfigAssembler::Status::kIncomplete)
+        << error;
+    if (!last) {
+      EXPECT_EQ(assembler.AddChunk(corrupted(chunks[i - 1]), error),
+                ConfigAssembler::Status::kIncomplete)
+          << error;
+    }
+  }
+  EXPECT_EQ(assembler.config(), config);
+
+  ConfigAssembler damaged;
+  for (std::size_t i = 0; i < chunks.size(); ++i) {
+    EXPECT_EQ(
+        damaged.AddChunk(i == 1 ? corrupted(chunks[i]) : chunks[i], error),
+        i + 1 == chunks.size() ? ConfigAssembler::Status::kCrcMismatch
+                               : ConfigAssembler::Status::kIncomplete)
+        << error;
+  }
+}
+
 // REQ-CONTRACT-04: oversized chunk metadata is rejected before allocation
 TEST(ConfigWire, RejectsUnboundedChunkMetadataAndRecovers) {
   const auto config = SwerveConfig(false);
