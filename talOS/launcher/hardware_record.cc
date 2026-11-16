@@ -193,6 +193,8 @@ const char* CanBusReadStateName(hardware::CanBusReadState state) {
   return "unknown";
 }
 
+}  // namespace
+
 const char* HardwareModeName(hardware::Mode mode) {
   switch (mode) {
     case hardware::Mode::kNeutral:
@@ -222,6 +224,8 @@ const char* PwmModeName(hardware::PwmMode mode) {
   }
   return "unknown";
 }
+
+namespace {
 
 // The mode the Driver Station selected (its flags), whether or not the robot
 // is enabled in it: "teleop", "autonomous", "test" or "none".

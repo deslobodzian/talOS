@@ -1293,5 +1293,38 @@ TEST(HardwareChannelsTest, PwmModeReadsOffApartFromACentrePulse) {
   }
 }
 
+// A neutral motor request and a 0 V voltage request both carry demand 0;
+// review tells them apart by the request's mode channel, its wire value.
+// REQ-OPS-41
+TEST(HardwareChannelsTest, MotorModeReadsNeutralApartFromZeroVolts) {
+  talos::hardware::Command command;
+  command.count = 2;
+  command.motors[0] = {1, talos::hardware::Mode::kNeutral, 0, 0.0, 0.0};
+  command.motors[1] = {2, talos::hardware::Mode::kVoltage, 0, 0.0, 0.0};
+  talos::hardware::Packet packet{};
+  packet.size =
+      static_cast<std::uint32_t>(talos::hardware::Encode(command, packet.data));
+  ASSERT_GT(packet.size, 0u);
+  std::vector<HardwareSample> samples;
+  FlattenHardware(talos::hardware::kCommandTopic,
+                  talos::launcher::HardwareRecord::kCommand,
+                  std::as_bytes(std::span{&packet, 1}), samples);
+  std::map<std::string, double> values;
+  for (const HardwareSample& sample : samples) {
+    values[sample.name] = talos::telemetry::DoubleFromRaw(sample.raw);
+  }
+  const std::map<std::string, double> expected{
+      {"hw/command/motors/1/mode",
+       static_cast<double>(talos::hardware::Mode::kNeutral)},
+      {"hw/command/motors/1/demand", 0.0},
+      {"hw/command/motors/2/mode",
+       static_cast<double>(talos::hardware::Mode::kVoltage)},
+      {"hw/command/motors/2/demand", 0.0}};
+  for (const auto& [name, value] : expected) {
+    ASSERT_TRUE(values.contains(name)) << name;
+    EXPECT_EQ(values[name], value) << name;
+  }
+}
+
 }  // namespace
 }  // namespace studio::review
