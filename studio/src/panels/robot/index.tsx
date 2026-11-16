@@ -395,7 +395,7 @@ function RobotPanel() {
                  {status.link.stateAge_us === null ? '—' :
                      duration(status.link.stateAge_us * 1e3)}
                </Stat>
-               <Stat label="Configured" channel="hw/status/configured" tone={status.link.configured === false ? 'warn' : undefined}>
+               <Stat label="Config acknowledged" channel="hw/status/configured" tone={status.link.configured === false ? 'warn' : undefined}>
                  {status.link.configured === null ? '—' : status.link.configured ? 'yes' : 'no'}
                </Stat>
                <Stat label="Motor faults" channel="hw/status/motor_fault_mask" tone={status.link.faultMask ? 'warn' : undefined}>
