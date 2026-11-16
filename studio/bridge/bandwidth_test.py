@@ -110,14 +110,17 @@ def frames_in(buffer):
         yield first, payload, header + length
 
 
-def read_all(sockets, stop, served, end, filling=None):
+def read_all(sockets, stop, served, end, filling=None, wake=None):
     """Drains every reader's socket on one thread until `stop` is readable.
 
     One thread reads whichever socket has bytes, so no reader falls behind
     because another reader's thread was scheduled first. Returns, per
     reader, what arrived in order: ("binary", sequence) for each telemetry
     update after the dictionary page, ("text", None) for each graph message.
-    Sets `filling`, if given, once every reader has FILL_AT frames.
+    Sets `filling`, if given, once every reader has FILL_AT frames. Sets
+    `wake`, if given, whenever it sets either event and on every graph
+    message: the bridge sends one only after a refresh of the system graph
+    (system.h GraphFeed), so the caller polls /system.json on that event.
     """
     selector = selectors.DefaultSelector()
     selector.register(stop, selectors.EVENT_READ)
@@ -142,6 +145,8 @@ def read_all(sockets, stop, served, end, filling=None):
                 reader["bytes"] += size
                 if opcode != BINARY:
                     reader["received"].append(("text", None))
+                    if wake:
+                        wake.set()
                     continue
                 # The first binary is the dictionary page, whose
                 # timestamp is the tick it was published on.
@@ -151,9 +156,15 @@ def read_all(sockets, stop, served, end, filling=None):
                     reader["received"].append(("binary", field(payload, SEQUENCE)))
                 reader["frames"] += 1
         if filling and all(reader["frames"] >= FILL_AT for reader in readers):
-            filling.set()
+            if not filling.is_set():
+                filling.set()
+                if wake:
+                    wake.set()
         if all(reader["frames"] >= SERVED_FRAMES for reader in readers):
-            served.set()
+            if not served.is_set():
+                served.set()
+                if wake:
+                    wake.set()
     selector.close()
     results = []
     for reader in readers:
@@ -265,15 +276,16 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
                 sock, headers = connect(port)
                 sockets.append(sock)
                 refused = b"503 " in headers
-            served, filling = threading.Event(), threading.Event()
+            served, filling, wake = threading.Event(), threading.Event(), threading.Event()
             stop, stopped = socket.socketpair()
             end = time.monotonic() + (seconds if seconds is not None else 5)
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 reading = pool.submit(read_all, sockets[int(stalled):int(stalled) + active],
-                                      stopped, served, end, filling if stalled else None)
+                                      stopped, served, end, filling if stalled else None, wake)
                 served_ns, filled = None, False
                 try:
                     while True:
+                        wake.clear()
                         with urllib.request.urlopen(f"http://127.0.0.1:{port}/system.json") as response:
                             document = json.load(response)
                         stats = document["bridge"]
@@ -289,14 +301,17 @@ def probe(binaries, clients, seconds=None, stalled=False, excess=False, limit=4)
                             # /system.json is the bridge's last refresh, taken
                             # every 250 ms (main.cc), so it can predate the
                             # clients connecting; finish on the first refresh
-                            # taken after every reader was served.
+                            # taken after every reader was served. A later
+                            # refresh changes the graph's values, which the
+                            # bridge then sends every reader (wake).
                             if served_ns is not None and int(document["wall_ns"]) >= served_ns:
                                 break
-                        if time.monotonic() >= end:
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
                             if seconds is None:
                                 raise AssertionError("bridge made no progress before deadline")
                             break
-                        time.sleep(.005)
+                        wake.wait(timeout=remaining)
                 finally:
                     stop.send(b"x")
                 results = reading.result()
