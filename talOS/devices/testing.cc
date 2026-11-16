@@ -333,8 +333,10 @@ struct SimHardware::Impl {
           axis.position = request.demand;
           axis.velocity = 0;
           break;
-        default:
-          break;
+        case hardware::Mode::kDutyCycle:
+        case hardware::Mode::kVoltage:
+        case hardware::Mode::kTorqueCurrent:
+          break;  // not modeled: the axis keeps its velocity and position
       }
     }
   }

@@ -258,7 +258,7 @@ Handles are named by their device key in the subsystem config
 
 | C++ | Python |
 |---|---|
-| `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()`, `forward_limit()`, `reverse_limit()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
+| `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `set_torque_current` (stator amperes; throws `std::invalid_argument` naming the motor and the key unless its `[motors.*]` sets `foc = true` and `max_torque_current_a > 0`, [Configuration](../talOS/hardware/README.md#configuration); 0 A is a driving request, not neutral: [what is known of 0 A](../talOS/hardware/README.md#supported-hardware-requests)), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()`, `forward_limit()`, `reverse_limit()` | `talos.Motor(node, "roller")`, getters as properties (`set_torque_current` raises `TalosError` where C++ throws); demands/feedforward clamp to configured limits (torque current to ±`max_torque_current_a`), non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
 | `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`, `stop()`) | same names; `DigitalInput.value`; DIO/PWM commands, like motor commands, are gated on `robot_enabled` and a live `Target` (false/off while disabled, while state is stale, and in a tick in which no `Target` returned a target: see [Targets](#targets)). A PWM output's neutral is off, no pulse: a servo goes limp and a PWM motor controller sees no signal. `set(0.0)` is the 1.5 ms centre pulse, which holds a motor controller at neutral but drives a servo to centre, so it counts as actuation; `stop()`, a non-finite `set()` and not setting it in `update()` send no pulse |
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
@@ -386,8 +386,8 @@ A position needs a frame no reset has restarted, which the motor's
   steering). Otherwise a reset shifts the mechanism frame by whole CANcoder
   rotations: at a ratio of 2, a reset at 0.7 rereads -0.3, half a turn off.
 
-Velocity, voltage and duty cycle are never held, and the substitution does
-not count in `clamped_count`.
+Velocity, voltage, duty cycle and torque current are never held, and the
+substitution does not count in `clamped_count`.
 
 ### Signal acquisition times
 

@@ -771,6 +771,115 @@ TEST(Devices, NonFiniteDemandIsNeutral) {
   }
 }
 
+// kRobotToml with `keys` added to motor a's table.
+std::string WithMotorAKeys(std::string_view keys) {
+  std::string toml{kRobotToml};
+  toml.insert(toml.find("can_id = 1\n") + 11, keys);
+  return toml;
+}
+constexpr std::string_view kTorqueKeys =
+    "foc = true\nmax_torque_current_a = 5\n";
+
+// Asks motor a for `amperes` of torque current while it holds one, and
+// drives b at 3 V every tick, so a neutralized a shows b untouched.
+struct Torquer {
+  explicit Torquer(Node& n) : a{n, "a"}, b{n, "b"} {
+    AllowUntargetedOutputs(n);
+  }
+  void update() {
+    if (amperes) a.set_torque_current(*amperes);
+    b.set_voltage(3);
+  }
+  Motor a, b;
+  std::optional<double> amperes;
+};
+
+// A torque-current demand goes out as stator amperes with no feedforward on
+// slot 0, and 0 A stays a torque-current request, not neutral. Not a
+// position mode, so no rezero holds it: motor a, on rotor feedback, has never
+// been rezeroed.
+// REQ-SAFE-43
+TEST(Devices, TorqueCurrentGoesOutAsStatorAmperesOnSlotZero) {
+  auto sim = Sim::FromToml(WithMotorAKeys(kTorqueKeys));
+  auto& mech = sim.add<Torquer>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  mech.amperes = 2.5;
+  sim.step(10ms);
+  ASSERT_FALSE(mech.a.zeroed());
+  const auto a = hw.motor_request("mech", "a");
+  EXPECT_EQ(a.mode, Mode::kTorqueCurrent);
+  EXPECT_EQ(a.demand, 2.5);
+  EXPECT_EQ(a.feedforward_v, 0.0);
+  EXPECT_EQ(a.slot, 0);
+
+  mech.amperes = 0.0;
+  sim.step(10ms);
+  EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kTorqueCurrent);
+  EXPECT_EQ(hw.motor_request("mech", "a").demand, 0.0);
+}
+
+// A torque-current demand is clamped to +-max_torque_current_a, and each
+// adjusted call counts once (the limit itself is not adjusted); a non-finite
+// one neutralizes that motor alone, and counts too.
+// REQ-SAFE-43
+TEST(Devices, TorqueCurrentClampsToItsLimitAndNeutralizesNonFinite) {
+  auto sim = Sim::FromToml(WithMotorAKeys(kTorqueKeys));
+  auto& mech = sim.add<Torquer>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  mech.amperes = 1;
+  sim.step(10ms);
+  struct Row {
+    double amperes;
+    Mode mode;
+    double sent;
+    std::uint64_t counted;
+  };
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  for (const Row& row :
+       {Row{5, Mode::kTorqueCurrent, 5, 0},
+        Row{-5, Mode::kTorqueCurrent, -5, 0},
+        Row{5.5, Mode::kTorqueCurrent, 5, 1},
+        Row{-80, Mode::kTorqueCurrent, -5, 1},
+        Row{std::numeric_limits<double>::quiet_NaN(), Mode::kNeutral, 0, 1},
+        Row{kInf, Mode::kNeutral, 0, 1}, Row{-kInf, Mode::kNeutral, 0, 1}}) {
+    SCOPED_TRACE(row.amperes);
+    const std::uint64_t before = mech.a.clamped_count();
+    mech.amperes = row.amperes;
+    sim.step(5ms);  // one tick
+    const auto a = hw.motor_request("mech", "a");
+    EXPECT_EQ(a.mode, row.mode);
+    EXPECT_EQ(a.demand, row.sent);
+    EXPECT_EQ(mech.a.clamped_count() - before, row.counted);
+    EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kVoltage);
+  }
+}
+
+// A motor whose config does not allow torque current refuses the demand in
+// update(), enabled or not, naming the motor and the key it lacks.
+// REQ-SAFE-43
+TEST(Devices, TorqueCurrentThrowsUnlessTheMotorAllowsIt) {
+  struct Case {
+    std::string_view keys;
+    std::string_view missing;
+  };
+  for (const auto& [keys, missing] :
+       {Case{"", "foc = true"}, Case{"foc = true\n", "max_torque_current_a"}}) {
+    SCOPED_TRACE(missing);
+    auto sim = Sim::FromToml(WithMotorAKeys(keys));
+    sim.add<Torquer>("mech").amperes = 1;
+    try {
+      sim.step(10ms);
+      ADD_FAILURE() << "a torque-current demand was accepted";
+    } catch (const std::invalid_argument& error) {
+      const std::string what = error.what();
+      EXPECT_NE(what.find("'a'"), std::string::npos) << what;
+      EXPECT_NE(what.find(missing), std::string::npos) << what;
+    }
+  }
+}
+
 struct Watcher {
   explicit Watcher(Node& n) : node{n}, sw{n, "switch"} {}
   Node& node;

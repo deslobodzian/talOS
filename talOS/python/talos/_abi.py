@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 34
+_EXPECTED_ABI_VERSION = 35
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -49,6 +49,7 @@ MODE_VOLTAGE = 2
 MODE_VELOCITY = 3
 MODE_POSITION = 4
 MODE_MOTION_MAGIC = 5
+MODE_TORQUE_CURRENT = 6
 DS_MAX_JOYSTICKS = 6
 DS_MAX_AXES = 12
 DS_MAX_POVS = 4

@@ -83,8 +83,9 @@ class SimHardware {
   // velocity decays by min(1, period/tau) each tick, with tau = 50 ms for
   // brake motors and 1 s for coast motors (the Phoenix desktop sim's
   // constants), snapping below 0.01 rps. Position integrates the decayed
-  // velocity. Other drive modes are not modeled; use the physics simulator
-  // to model voltage/duty-cycle drive.
+  // velocity. Other drive modes (duty cycle, voltage, torque current) are not
+  // modeled: the axis keeps its velocity and position. Use the physics
+  // simulator to model them.
   void ideal_motors(bool on = true);
 
   // Feedback. Ages are microseconds before the gateway State sample time;

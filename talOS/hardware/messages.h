@@ -14,8 +14,11 @@ enum class Mode : uint8_t {
   kVoltage,
   kVelocity,
   kPosition,
-  kMotionMagic
+  kMotionMagic,
+  kTorqueCurrent,  // stator amperes: Phoenix TorqueCurrentFOC (needs foc)
 };
+// Decode rejects a mode above it; adding one bumps protocol::kProtocolVersion.
+inline constexpr Mode kLastMode = Mode::kTorqueCurrent;
 enum StateFlags : uint32_t {
   kConfigured = 1,  // a config applied and commissioned
   kEnabled = 2,
@@ -26,7 +29,9 @@ struct MotorRequest {
   uint16_t id{};
   Mode mode{Mode::kNeutral};
   uint8_t slot{};
-  double demand{};  // duty ratio, volts, mechanism rotations/s, or rotations.
+  // Duty ratio, volts, mechanism rotations/s, rotations, or stator amperes.
+  double demand{};
+  // Volts; 0 unless velocity, position or motion magic.
   double feedforward_v{};
   bool operator==(const MotorRequest&) const = default;
 };

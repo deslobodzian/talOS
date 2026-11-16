@@ -285,6 +285,26 @@ TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
   }
 }
 
+// The motor mode byte runs to kLastMode, torque current (6), and no further:
+// a torque-current request round-trips as sent, and a mode byte past it is
+// refused, so a peer of a later protocol is never misread.
+// REQ-SAFE-43, REQ-CONTRACT-03
+TEST(Messages, MotorModeRunsToTorqueCurrentAndNoFurther) {
+  Command command;
+  command.count = 1;
+  command.motors[0] = {0x0102, Mode::kTorqueCurrent, 0, -2.5, 0.0};
+  std::array<uint8_t, kMaxCommandSize> bytes{};
+  const auto size = Encode(command, bytes);
+  ASSERT_EQ(size, kCommandBaseSize + kMotorRequestSize);
+  const std::size_t mode_at = kCommandBaseSize + 2;
+  ASSERT_EQ(bytes[mode_at], 6);
+  Command decoded;
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_EQ(decoded, command);
+  bytes[mode_at] = 7;
+  EXPECT_FALSE(Decode(std::span{bytes}.first(size), decoded));
+}
+
 // The State the RoboRIO sends, byte for byte: integers, doubles, the float
 // CAN utilization and the signed-tenths diagnostics all little-endian.
 // REQ-CONTRACT-03
@@ -669,6 +689,21 @@ TEST(Config, FocTravelsOnTheWireAndFingerprintAndAFollowerCannotSetIt) {
   EXPECT_NO_THROW(Validate(follower));
   follower.motors[1].foc = true;
   EXPECT_THROW(Validate(follower), std::invalid_argument);
+}
+
+// The gateway checks a torque-current demand against max_torque_current_a
+// and the RoboRIO sets its peak torque current from it, so both ends must
+// agree on it: it travels on the config wire and changes the config id.
+// REQ-SAFE-43
+TEST(Config, TorqueCurrentLimitTravelsOnTheWireAndFingerprint) {
+  auto c = SwerveConfig(true);
+  c.motors[0].foc = true;
+  const auto no_limit_id = ConfigurationId(c);
+  c.motors[0].max_torque_current_a = 12.5;
+  EXPECT_NE(ConfigurationId(c), no_limit_id);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(c), decoded));
+  EXPECT_EQ(decoded, c);
 }
 
 // A RoboRIO's saved configuration written before foc existed (each motor
@@ -3802,6 +3837,60 @@ TEST(Gateway, RangeErrorsNeutralizeOnlyTheirMotor) {
     EXPECT_DOUBLE_EQ(g.snapshot().motors[1].velocity_rps, 1);
   }
   EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, invalid.size());
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+}
+
+// A torque-current request reaches the backend as sent only for a motor with
+// foc and a positive max_torque_current_a, within that limit and with no
+// feedforward; 0 A is a driving request, applied as sent, not neutral. Any
+// other torque-current request neutralizes that motor alone (counted), while
+// the rest of the command drives. A follower takes its master's mode, torque
+// current included, and goes neutral with it.
+// REQ-SAFE-43
+TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
+  FakeBackend backend;
+  auto config = SwerveConfig(true);
+  config.motors[0].foc = true;
+  config.motors[0].max_torque_current_a = 10;
+  config.motors[2].foc = true;  // No limit: the mode stays refused.
+  config.motors[4].master_id = config.motors[0].id;
+  ASSERT_EQ(config.motors[4].bus, config.motors[0].bus);
+  Gateway g{config, backend, 1};
+  const struct {
+    const char* label;
+    std::size_t motor;
+    double demand, feedforward_v;
+    bool sent;
+  } rows[] = {
+      {"at the limit", 0, -10, 0, true},
+      {"0 A", 0, 0, 0, true},
+      {"over the limit", 0, 10.5, 0, false},
+      {"with feedforward", 0, 5, 0.5, false},
+      {"no foc, no limit", 1, 0, 0, false},
+      {"foc, no limit", 2, 0, 0, false},
+  };
+  uint64_t now = 1000, sequence = 1;
+  uint32_t neutralized = 0;
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    g.Tick(now, true);
+    auto command = Request(g);
+    const MotorRequest torque{config.motors[row.motor].id, Mode::kTorqueCurrent,
+                              0, row.demand, row.feedforward_v};
+    command.motors[row.motor] = torque;
+    ASSERT_TRUE(g.Accept(command, sequence++, now++));
+    ASSERT_EQ(backend.last_requests.size(), config.motors.size());
+    const MotorRequest neutral{torque.id, Mode::kNeutral, 0, 0, 0};
+    EXPECT_EQ(backend.last_requests[row.motor], row.sent ? torque : neutral);
+    // A neutralized motor 0 takes its follower with it; both count.
+    neutralized += row.sent ? 0 : row.motor == 0 ? 2 : 1;
+    EXPECT_EQ(backend.last_requests[3], command.motors[3]);
+    if (row.motor == 0) {
+      EXPECT_EQ(backend.last_requests[4].mode,
+                row.sent ? Mode::kTorqueCurrent : Mode::kNeutral);
+    }
+  }
+  EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, neutralized);
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
 }
 

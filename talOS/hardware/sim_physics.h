@@ -20,7 +20,9 @@
 // emulate a TalonFX-style P+FF loop producing volts from the configured gain
 // slot; the volts then drive the rotor, whose position/velocity are written
 // back as mechanism units (rotor / gear ratio), per CTRE sim guidance that
-// sim state is fed from the device's voltage output, not from the demand.
+// sim state is fed from the device's voltage output, not from the demand. A
+// torque-current demand becomes the volts that pass that current through the
+// winding at the rotor's speed (TorqueCurrentVolts).
 // Rotor state is physical (counterclockwise positive, the sim's mounting). A
 // TalonFX's `inverted` flips its output and its own position and velocity
 // together, as Phoenix 6's MotorOutput.Inverted does, so its closed loops run
@@ -219,7 +221,9 @@ inline double GravityVoltage(const Gains& gains, double mech_pos) {
 // Emulated controller voltage. Closed-loop modes run a P+FF loop on
 // the configured gain slot and clamp to the motor's voltage ceiling, so
 // missing gains honestly produce ~0 V. Returns false for commanded neutral
-// (unpowered); otherwise writes volts.
+// (unpowered); otherwise writes volts. Torque current needs the rotor's
+// speed and motor type, so PhysicsSimBackend computes it
+// (TorqueCurrentVolts); here it returns false.
 inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
                          double mech_pos, double mech_vel, double supply_v,
                          double& volts_out) {
@@ -261,6 +265,8 @@ inline bool DriveVoltage(const MotorRequest& req, const MotorConfig& cfg,
                 ceiling);
       return true;
     }
+    case Mode::kTorqueCurrent:
+      return false;
   }
   return false;
 }
@@ -907,6 +913,28 @@ class PhysicsSimBackend final : public Backend {
     return std::min(m.stator_limit_a, std::abs(net_v) / resistance_ohm);
   }
 
+  // The volts TorqueCurrentFOC applies for a demand of `amperes`: the volts
+  // that pass that stator current through the winding at the rotor's speed,
+  // V = I R + back-EMF (R = 12 V over the stall current), in the motor's
+  // output direction. The current is clamped to the peak torque current
+  // (max_torque_current_a) and the stator limit, the volts to max_voltage
+  // and the supply, as the RoboRIO's duty cap of max_voltage over the
+  // battery does. FOC itself is not modelled.
+  double TorqueCurrentVolts(std::size_t i, const MotorConfig& m,
+                            double amperes) const {
+    const MotorModel motor = MotorModelFor(m.motor_type.value);
+    const double peak_a =
+        std::max(0.0, std::min(m.max_torque_current_a, m.stator_limit_a));
+    const double current_a = std::clamp(amperes, -peak_a, peak_a);
+    const double resistance_ohm = 12.0 / motor.stall_current_a_at_12v;
+    const double back_emf_v =
+        12.0 * axes_[i].rotor_velocity_rps / motor.free_speed_rps_at_12v;
+    const double ceiling =
+        std::min(m.max_voltage > 0.0 ? m.max_voltage : 12.0, supply_v_);
+    return std::clamp(current_a * resistance_ohm + Direction(i) * back_emf_v,
+                      -ceiling, ceiling);
+  }
+
   bool FeedbackValid(std::size_t i) const {
     if (!motor_connected_[i]) return false;
     if (config_.motors[i].feedback != Feedback::kRemoteCANcoder) return true;
@@ -952,6 +980,11 @@ class PhysicsSimBackend final : public Backend {
                 gains.d * (velocity - mech_vel) +
                 GravityVoltage(gains, mech_pos),
             -ceiling, ceiling);
+        want_power = FeedbackValid(i);
+      } else if (req.mode == Mode::kTorqueCurrent) {
+        // Powered at any demand: 0 A is zero torque, not neutral.
+        profile.active = false;
+        volts = TorqueCurrentVolts(i, m, req.demand);
         want_power = FeedbackValid(i);
       } else {
         profile.active = false;

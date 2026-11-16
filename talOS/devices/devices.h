@@ -176,6 +176,14 @@ class Motor {
   void set_velocity(double rps, double ff_volts = 0, int slot = 0);  // PID
   void set_position(double rot, double ff_volts = 0, int slot = 0);  // PID
   void set_motion_magic(double rot, double ff_volts = 0, int slot = 0);
+  // Stator current, amperes, through Phoenix TorqueCurrentFOC. Needs
+  // [motors.*] foc = true and max_torque_current_a > 0, else it throws
+  // std::invalid_argument naming the motor and the key. Clamped to
+  // +-max_torque_current_a (clamped_count counts it); non-finite: neutral.
+  // 0 A is a driving request, not neutral; stop() is neutral. What the motor
+  // does at exactly 0 A: talOS/hardware/README.md, Supported Hardware
+  // Requests.
+  void set_torque_current(double amperes);
   void stop();  // neutral
   // Commands adjusted to configured limits or neutralized for non-finite
   // values, counted once per setter call over this handle's device lifetime.
@@ -195,8 +203,8 @@ class Motor {
   // position_frame = "absolute". A dropped zero keeps its offset (dropping
   // does not move position()). set_position and set_motion_magic go out
   // neutral while no rezero holds, unless position_frame = "absolute" (a
-  // remote CANcoder's frame, usable from the first state). Other modes are
-  // never held.
+  // remote CANcoder's frame, usable from the first state). Other modes,
+  // torque current included, are never held.
   bool zeroed() const;
 
   double position() const;  // rotations; the last valid one while invalid

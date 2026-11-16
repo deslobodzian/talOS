@@ -576,13 +576,26 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
                                 " is not 0, 1 or 2");
   }
   const auto& config = *device.motor_config;
+  if (mode == hardware::Mode::kTorqueCurrent &&
+      !(config.foc && config.max_torque_current_a > 0)) {
+    // TorqueCurrentFOC is a Phoenix Pro request bounded only by the motor's
+    // own limit: a motor without both keys could only be neutralized by the
+    // gateway, so a node asking for it fails in its first update(), in Sim
+    // too, naming what to set.
+    throw std::invalid_argument(
+        std::string{link.impl_->node.name()} +
+        ": Motor::set_torque_current on motor '" + device.name +
+        "' needs [motors." + device.name + "] " +
+        (config.foc ? "max_torque_current_a > 0"
+                    : "foc = true and max_torque_current_a > 0"));
+  }
   if (mode == hardware::Mode::kPosition ||
       mode == hardware::Mode::kMotionMagic) {
     // A position needs a frame that no reset has restarted since it was
     // taken: a rezero that still holds, or a remote CANcoder's absolute frame
     // ([motors.*] position_frame = "absolute"). The rotor position a TalonFX
     // powers on or resets with is no frame: neutral until the node rezeroes.
-    // Other modes need no frame.
+    // Other modes, torque current included, need no frame.
     if (!device.zeroed && !config.absolute_position_frame.value) {
       device.motor = {.id = device.id};
       link.impl_->Commanded(device);
@@ -618,6 +631,10 @@ void HardwareAccess::motor_set(HardwareLink& link, std::size_t index,
           demand = std::clamp(demand, config.reverse_limit_rot,
                               config.forward_limit_rot);
         }
+        break;
+      case hardware::Mode::kTorqueCurrent:  // 0 A drives: not neutral
+        demand = std::clamp(demand, -config.max_torque_current_a,
+                            config.max_torque_current_a);
         break;
       case hardware::Mode::kNeutral:
         break;
@@ -853,6 +870,10 @@ void Motor::set_position(double rot, double ff_volts, int slot) {
 void Motor::set_motion_magic(double rot, double ff_volts, int slot) {
   HardwareAccess::motor_set(*link_, index_, Mode::kMotionMagic, rot, ff_volts,
                             slot);
+}
+void Motor::set_torque_current(double amperes) {
+  HardwareAccess::motor_set(*link_, index_, Mode::kTorqueCurrent, amperes, 0,
+                            0);
 }
 void Motor::stop() {
   HardwareAccess::motor_set(*link_, index_, Mode::kNeutral, 0, 0, 0);

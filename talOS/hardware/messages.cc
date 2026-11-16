@@ -131,7 +131,7 @@ bool Decode(std::span<const uint8_t> data, Command& out) {
     m.slot = r.Int(1);
     m.demand = r.Real();
     m.feedforward_v = r.Real();
-    if (m.mode > Mode::kMotionMagic || m.slot > 2) return false;
+    if (m.mode > kLastMode || m.slot > 2) return false;
   }
   for (std::size_t i = 0; i < c.digital_output_count; ++i) {
     auto& d = c.digital_outputs[i];

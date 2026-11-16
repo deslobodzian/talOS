@@ -569,7 +569,7 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
   for (std::size_t i = 0; i < c.count; ++i) {
     const auto& r = c.motors[i];
     const auto& m = config_.motors[i];
-    if (r.id != m.id || r.slot > 2 || r.mode > Mode::kMotionMagic) {
+    if (r.id != m.id || r.slot > 2 || r.mode > kLastMode) {
       ++state_.counters.rejected_command_count;
       return false;
     }
@@ -587,6 +587,9 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
         ((r.mode == Mode::kPosition || r.mode == Mode::kMotionMagic) &&
          m.soft_limits &&
          (r.demand < m.reverse_limit_rot || r.demand > m.forward_limit_rot)) ||
+        // TorqueCurrentFOC: the mode's whole rule, feedforward included
+        // (gate.h); it holds whatever the config.
+        (r.mode == Mode::kTorqueCurrent && !TorqueCurrentAllowed(m, r)) ||
         ((r.mode == Mode::kNeutral || r.mode == Mode::kDutyCycle ||
           r.mode == Mode::kVoltage) &&
          r.feedforward_v != 0);

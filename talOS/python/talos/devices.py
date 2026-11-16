@@ -39,6 +39,7 @@ class Mode(enum.IntEnum):
     VELOCITY = _abi.MODE_VELOCITY
     POSITION = _abi.MODE_POSITION
     MOTION_MAGIC = _abi.MODE_MOTION_MAGIC
+    TORQUE_CURRENT = _abi.MODE_TORQUE_CURRENT
 
 
 def robot_enabled(node):
@@ -221,6 +222,16 @@ class Motor(_Input):
 
     def set_motion_magic(self, rot, ff_volts=0.0, slot=0):  # onboard profile
         self._set(Mode.MOTION_MAGIC, rot, ff_volts, slot)
+
+    def set_torque_current(self, amperes):
+        """Stator current, amperes, through Phoenix TorqueCurrentFOC
+        (Motor::set_torque_current). Raises TalosError naming the motor and
+        the key unless its config sets foc = true and
+        max_torque_current_a > 0; clamped to +-max_torque_current_a
+        (clamped_count counts it); non-finite is neutral. 0.0 is a driving
+        request, not neutral; stop() is neutral. What the motor does at
+        exactly 0 A: talOS/hardware/README.md, Supported Hardware Requests."""
+        self._set(Mode.TORQUE_CURRENT, amperes)
 
     def stop(self):
         self._set(Mode.NEUTRAL, 0.0)

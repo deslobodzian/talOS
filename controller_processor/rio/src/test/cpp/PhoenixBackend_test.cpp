@@ -6,7 +6,9 @@
 // the gateway to judge, per-device recovery, the loop watchdog's neutral, and
 // a PWM output that is off sending no pulse rather than the centre pulse,
 // and a motor's foc setting: EnableFOC on its requests, and a motor not read
-// Phoenix Pro licensed held failed until the next configure.
+// Phoenix Pro licensed held failed until the next configure; and a
+// torque-current request: TorqueCurrentFOC within its peak and duty cap, and
+// NeutralOut for one out of contract.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -22,11 +24,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctre/phoenix6/controls/TorqueCurrentFOC.hpp>
 #include <ctre/phoenix6/controls/VoltageOut.hpp>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -1405,13 +1409,20 @@ class PhoenixBackendFoc : public ::testing::Test {
     const auto control = backend.motors_[i]->GetAppliedControl();
     return std::string{control->GetName()};
   }
-  // The EnableFOC field of motor `i`'s last control request, as Phoenix
-  // reports a request's fields.
+  // Motor `i`'s last control request, every field as Phoenix reports it.
+  static std::map<std::string, std::string> AppliedFields(
+      PhoenixBackend& backend, std::size_t i) {
+    return backend.motors_[i]->GetAppliedControl()->GetControlInfo();
+  }
+  // The EnableFOC field of motor `i`'s last control request.
   static std::string AppliedEnableFoc(PhoenixBackend& backend, std::size_t i) {
-    const auto control = backend.motors_[i]->GetAppliedControl();
-    const auto info = control->GetControlInfo();
+    const auto info = AppliedFields(backend, i);
     const auto field = info.find("EnableFOC");
     return field == info.end() ? "(no EnableFOC field)" : field->second;
+  }
+  static ctre::phoenix6::hardware::TalonFX& Motor(PhoenixBackend& backend,
+                                                  std::size_t i) {
+    return *backend.motors_[i];
   }
   static std::string EnableFoc(bool enabled) {
     return ctre::phoenix6::controls::VoltageOut{units::volt_t{0}}
@@ -1559,8 +1570,11 @@ class Console {
 // A follower of a licensed master is read for itself: read unlicensed, it
 // fails alone and its master drives. Each failed motor gets its own line,
 // though only the first is the configure's error. It is not left to the
-// restore loop. The next configure that reads it licensed clears it.
+// restore loop. The next configure that reads it licensed clears it. The
+// intake asks for torque current, which needs the licence too: NeutralOut
+// all the same.
 // REQ-CONTRACT-39
+// REQ-SAFE-43
 TEST_F(PhoenixBackendFoc,
        AnUnlicensedMotorAndItsFollowerFailUntilReconfigured) {
   EnsureHal();
@@ -1574,6 +1588,7 @@ TEST_F(PhoenixBackendFoc,
   roller.foc = true;
   auto intake = TestMotor(40, "intake", 4);
   intake.foc = true;
+  intake.max_torque_current_a = 5.0;
   auto roller_follower = TestMotor(50, "roller_follower", 5);
   roller_follower.master_id = 30;
   config.motors = {lift, follower, roller, intake, roller_follower};
@@ -1614,7 +1629,7 @@ TEST_F(PhoenixBackendFoc,
       Request(10, hw::Mode::kVoltage, 6.0),
       Request(20, hw::Mode::kVoltage, 0.0),
       Request(30, hw::Mode::kVoltage, 6.0),
-      Request(40, hw::Mode::kVoltage, 6.0),
+      Request(40, hw::Mode::kTorqueCurrent, 2.0),
       Request(50, hw::Mode::kVoltage, 0.0)};
   hw::State state;
   PumpReads(backend, state, commands, 30);
@@ -1738,4 +1753,159 @@ TEST_F(PhoenixBackendFoc, ALicenceNotReadIsReadAgainByTheRestoreLoop) {
   EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
   EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut");
   EXPECT_TRUE(backend.UnavailableDevices().empty());
+}
+
+namespace {
+
+// The simulated RoboRIO's battery reading for one test; 12 V, the
+// simulator's default, again when it goes.
+class SimBattery {
+ public:
+  explicit SimBattery(double volts) { Set(volts); }
+  ~SimBattery() { Set(12.0); }
+  SimBattery(const SimBattery&) = delete;
+  SimBattery& operator=(const SimBattery&) = delete;
+  static void Set(double volts) {
+    frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{volts});
+  }
+};
+
+}  // namespace
+
+class PhoenixBackendTorque : public PhoenixBackendFoc {
+ protected:
+  // A motor that may run torque current: foc, up to 5 A, at most 4 V.
+  static hw::MotorConfig TorqueMotor(uint16_t id, const std::string& name,
+                                     int can_id) {
+    auto m = TestMotor(id, name, can_id);
+    m.foc = true;
+    m.max_torque_current_a = 5.0;
+    m.max_voltage = 4.0;
+    return m;
+  }
+  // Every field of the request Apply should send for `amperes` under the
+  // duty cap `duty`.
+  static std::map<std::string, std::string> TorqueCurrentFoc(double amperes,
+                                                             double duty) {
+    return ctre::phoenix6::controls::TorqueCurrentFOC{units::ampere_t{amperes}}
+        .WithMaxAbsDutyCycle(duty)
+        .WithUpdateFreqHz(units::hertz_t{0})
+        .GetControlInfo();
+  }
+  static ::testing::AssertionResult AppliedConfig(
+      PhoenixBackend& backend, std::size_t i,
+      ctre::phoenix6::configs::TalonFXConfiguration& applied) {
+    const auto status = AwaitAnswer(
+        [&] { return Motor(backend, i).GetConfigurator().Refresh(applied); });
+    if (status.IsOK()) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << status.GetName();
+  }
+};
+
+// A torque-current request is TorqueCurrentFOC with the demand in amperes,
+// peak torque current +-max_torque_current_a, and a duty cap of max_voltage
+// over the last battery reading: none before the first reading (cap 0, no
+// output), following the battery, and kept over a lost reading. A neutral
+// after it is NeutralOut.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
+  EnsureHal();
+  EnabledDs ds;
+  SimBattery battery{0.0};  // No reading yet.
+  hw::Config config;
+  config.motors.push_back(TorqueMotor(1, "gripper", 1));
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(AppliedConfig(backend, 0, applied));
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
+                   -5.0);
+
+  const std::array<hw::MotorRequest, 1> torque{
+      Request(1, hw::Mode::kTorqueCurrent, -2.5)};
+  ASSERT_TRUE(ApplySent(backend, torque));
+  EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 0.0))
+      << "before a battery reading";
+  hw::State state;
+  for (const double battery_v : {12.5, 8.0}) {
+    battery.Set(battery_v);
+    backend.Read(state);
+    ASSERT_TRUE(ApplySent(backend, torque));
+    EXPECT_EQ(AppliedFields(backend, 0),
+              TorqueCurrentFoc(-2.5, 4.0 / battery_v))
+        << battery_v << " V";
+  }
+  battery.Set(0.0);
+  backend.Read(state);
+  ASSERT_TRUE(ApplySent(backend, torque));
+  EXPECT_EQ(AppliedFields(backend, 0), TorqueCurrentFoc(-2.5, 4.0 / 8.0))
+      << "a lost reading keeps the last";
+
+  const std::array<hw::MotorRequest, 1> neutral{
+      Request(1, hw::Mode::kNeutral, 0.0)};
+  ASSERT_TRUE(ApplySent(backend, neutral));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+}
+
+// A torque-current request the gateway would have neutralized never drives
+// when it reaches Apply anyway: over the limit, not finite, with a
+// feedforward, or for a motor whose config does not allow the mode (foc
+// without max_torque_current_a; config load refuses the limit without foc).
+// Each is that motor's NeutralOut, not an apply failure.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  config.motors.push_back(TorqueMotor(1, "gripper", 1));
+  auto no_limit = TorqueMotor(2, "roller", 2);
+  no_limit.max_torque_current_a = 0;
+  config.motors.push_back(no_limit);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+
+  auto with_feedforward = Request(1, hw::Mode::kTorqueCurrent, 2.0);
+  with_feedforward.feedforward_v = 1.0;
+  const std::array<std::pair<hw::MotorRequest, std::string_view>, 4> bad{{
+      {Request(1, hw::Mode::kTorqueCurrent, 5.5), "over the limit"},
+      {Request(1, hw::Mode::kTorqueCurrent, -5.5), "under the limit"},
+      {Request(1, hw::Mode::kTorqueCurrent, std::nan("")), "not finite"},
+      {with_feedforward, "with a feedforward"},
+  }};
+  for (const auto& [request, why] : bad) {
+    const std::array<hw::MotorRequest, 2> good{
+        Request(1, hw::Mode::kTorqueCurrent, 5.0),
+        Request(2, hw::Mode::kTorqueCurrent, 1.0)};
+    ASSERT_TRUE(ApplySent(backend, good)) << why;
+    ASSERT_EQ(AppliedControl(backend, 0), "TorqueCurrentFOC") << why;
+    EXPECT_EQ(AppliedControl(backend, 1), "NeutralOut") << "without a limit";
+    const std::array<hw::MotorRequest, 2> commands{request, good[1]};
+    ASSERT_TRUE(ApplySent(backend, commands)) << why;
+    EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut") << why;
+  }
+}
+
+// A follower may not set max_torque_current_a, yet its Follower copies its
+// master's torque output, so it takes its master's peak torque current: with
+// its own 0 A, Phoenix's simulation held a follower at 0 V and 0 A while its
+// master drove 2 A.
+// REQ-SAFE-43
+TEST_F(PhoenixBackendTorque, AFollowerTakesItsMastersPeakTorqueCurrent) {
+  EnsureHal();
+  hw::Config config;
+  config.motors.push_back(TorqueMotor(10, "climber", 1));
+  auto follower = TestMotor(20, "climber_follower", 2);
+  follower.master_id = 10;
+  config.motors.push_back(follower);
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  ctre::phoenix6::configs::TalonFXConfiguration applied;
+  ASSERT_TRUE(AppliedConfig(backend, 1, applied));
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
+  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
+                   -5.0);
 }

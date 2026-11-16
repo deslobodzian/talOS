@@ -549,6 +549,8 @@ const char* HardwareModeName(hardware::Mode mode) {
       return "position";
     case hardware::Mode::kMotionMagic:
       return "motion_magic";
+    case hardware::Mode::kTorqueCurrent:
+      return "torque_current";
   }
   return "unknown";
 }
