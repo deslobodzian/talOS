@@ -15,9 +15,11 @@
 //       channel's level, studio::AlertLevelName; stream_id "0")
 //   GET /review/<id>/bounds.json
 //       {"start_ns","end_ns","origin_wall_ns","max_series_values",
-//        "max_series_channels"}: the last two, plain numbers, are
-//       kMaxSeriesValues and kMaxSeriesChannels, which a client splits its
-//       series requests by
+//        "max_series_channels","hardware_not_decoded"}: the two max_ ones,
+//       plain numbers, are kMaxSeriesValues and kMaxSeriesChannels, which a
+//       client splits its series requests by; hardware_not_decoded is null,
+//       or log_dump's line for a session whose hardware packets are not
+//       served (Session::hardware_not_decoded)
 //       wall time of a session time t_ns is origin_wall_ns + t_ns
 //   GET /review/<id>/snapshot?t_ns=
 //       {"t_ns","channels":{name:{"value","sample_ns"}}}

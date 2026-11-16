@@ -33,6 +33,13 @@
 // names it; the Driver Station packet as telemetry reads it; the other
 // hardware packets by log_dump's own decoder (hardware_channels.h).
 //
+// Hardware packets are served only from a session recorded under this
+// build's hardware protocol, decided once while indexing as log_dump decides
+// it (talos::launcher::HardwareProtocolCheck: the version manifest.json
+// records, then this build's codecs on every packet). Otherwise no hardware
+// topic is served, the Driver Station's included, and
+// hardware_not_decoded() holds log_dump's line, also printed on stderr.
+//
 // A read selects records by publication time but walks a file by event
 // time, so it reads one second either side of the range: a message received
 // or sent more than a second from its publication time is not found.
@@ -158,6 +165,13 @@ class Session {
   }
   std::optional<ChannelRef> Find(std::string_view name) const;
 
+  // log_dump's line for a session whose hardware packets are not served
+  // (another protocol, or packets this build's codecs reject), without its
+  // "warning: " prefix; empty when they are.
+  const std::string& hardware_not_decoded() const {
+    return hardware_not_decoded_;
+  }
+
   // The index's checkpoints: what grows with the session's length.
   std::size_t index_bytes() const;
   std::size_t log_seconds() const;
@@ -196,6 +210,7 @@ class Session {
   std::int64_t start_ns_{0};
   std::int64_t end_ns_{0};
   std::int64_t origin_wall_ns_{0};
+  std::string hardware_not_decoded_;
 };
 
 // The value of a raw telemetry sample of `kind` as a double (a bucket's).

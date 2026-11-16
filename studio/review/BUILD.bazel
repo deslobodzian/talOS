@@ -112,6 +112,7 @@ cc_test(
         ":review_test_message",
         "//talOS/events:events_core",
         "//talOS/events:events_log",
+        "//talOS/protocol",
         "@flatbuffers//:runtime_cc",
         "@googletest//:gtest_main",
         "@nlohmann_json//:json",

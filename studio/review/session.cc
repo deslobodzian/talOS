@@ -176,6 +176,8 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
   std::size_t file = 0;
   bool any = false;
   std::vector<HardwareSample> samples;
+  talos::launcher::HardwareProtocolCheck protocol{
+      talos::launcher::RecordedProtocolVersion({dir.string()})};
 
   const auto visit = [&](const talos::launcher::MergedRecord& r) {
     const auto* merged = r.log.get();
@@ -214,6 +216,11 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     if (build.topic[id] == kUnresolved) {
       build.topic[id] = indexer.Resolve(*r.source, merged->path);
     }
+    if (const auto kind = talos::launcher::HardwareRecordOf(
+            r.source->name, r.source->schema.name);
+        kind != HardwareRecord::kNone) {
+      protocol.Add(kind, r.source->name, r.payload);
+    }
     if (build.topic[id] < 0) return true;
     build.kinds[id] |=
         r.header.kind == static_cast<std::uint16_t>(EventKind::SEND) ? 1 : 2;
@@ -236,6 +243,12 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
     throw std::runtime_error(error);
   }
   if (!any) throw std::runtime_error("no records in " + dir.string());
+  if (protocol.foreign()) {
+    constexpr std::string_view kWarning = "warning: ";
+    session->hardware_not_decoded_ = protocol.Warning().substr(kWarning.size());
+    std::cerr << "studio_review: " << dir.string() << ": "
+              << session->hardware_not_decoded_ << '\n';
+  }
 
   // Each topic's process: the one that sent it, else the one whose log
   // path sorts first among those that received it.
@@ -258,6 +271,9 @@ std::unique_ptr<Session> Session::Open(const fs::path& dir) {
       }
     }
     if (!sender && !receiver) continue;
+    if (protocol.foreign() && build.hardware != HardwareRecord::kNone) {
+      continue;
+    }
     Topic topic;
     topic.name = build.name;
     topic.decoder = build.decoder;

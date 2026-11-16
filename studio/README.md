@@ -440,7 +440,14 @@ it, a record claiming more payload than its source declares being damage
 the channel model refuses ([telemetry](../talOS/telemetry/README.md#automatic-channels-and-units))
 is not reviewed and is named on stderr; a log of another format version, or
 a session with no intact record, is refused (422) naming the file, and only
-that session's requests fail.
+that session's requests fail. A session whose hardware packets `log_dump`
+would not decode (its manifest records another hardware protocol, or this
+build's codecs reject one of its packets:
+[which logs a build can read](../talOS/launcher/README.md#which-logs-a-build-can-read))
+serves no hardware channel, the Driver Station's included, while its other
+topics are served; its `bounds.json` carries `log_dump`'s line, without its
+`warning: ` prefix, as `hardware_not_decoded` (null otherwise), and the
+server prints it on stderr. The Studio page does not show that field.
 
 Opening a session streams it once, merged, and keeps per log file one
 24-byte checkpoint per second of event time that holds records (where that

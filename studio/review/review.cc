@@ -367,6 +367,12 @@ Response Review::Bounds(const Session& session) const {
   out += std::to_string(kMaxSeriesValues);
   out += ",\"max_series_channels\":";
   out += std::to_string(kMaxSeriesChannels);
+  out += ",\"hardware_not_decoded\":";
+  if (session.hardware_not_decoded().empty()) {
+    out += "null";
+  } else {
+    AppendEscaped(out, session.hardware_not_decoded());
+  }
   out += '}';
   return {200, "application/json", std::move(out)};
 }
