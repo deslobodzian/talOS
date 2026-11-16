@@ -154,6 +154,15 @@ struct LogWriterOptions {
   // by a signal can lose, plus the writer's scheduling delay.
   std::chrono::nanoseconds write_interval{std::chrono::milliseconds{10}};
 
+  // Where a gap is reported the moment it opens: the producer ORs
+  // `gap_flag` into `*gap_flags` (one relaxed fetch_or, no lock or wait) as
+  // it drops the gap's first record, before any GAP record exists, so a
+  // process killed during the gap has already said so. A node points it at
+  // its registry row's flags with introspect::kFlagLogGap; null reports
+  // nowhere. The word must outlive the writer.
+  std::atomic<std::uint32_t>* gap_flags{nullptr};
+  std::uint32_t gap_flag{0};
+
   // Tests only: the writer thread calls it, with its stop flag, each time it
   // has found nothing handed over and nothing due, before it checks for a
   // stop; a test holds it there to order a stop against that check. Empty
