@@ -1721,6 +1721,50 @@ TEST(Gateway, NeutralRefusedDuringTotalLossIsNotARejection) {
   EXPECT_EQ(backend.applied, 0);
 }
 
+// Total loss is not latched and clears in its own epoch, so a command built
+// on a State of the loss still matches once the feedback returns. It drives
+// nothing: its motors go neutral (motor_drives_from_) and so do its digital
+// and PWM outputs, sent false and off; a command observing the recovered
+// State applies them as sent.
+// REQ-SAFE-18, REQ-SAFE-22
+TEST(Gateway, ACommandObservingTotalLossDrivesNoOutputAfterIt) {
+  auto config = SwerveConfig(true);
+  config.digital_outputs.push_back({40, "solenoid", 1});
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const auto with_outputs = [](Command c) {
+    c.digital_output_count = 1;
+    c.digital_outputs[0] = {40, true};
+    c.pwm_output_count = 1;
+    c.pwm_outputs[0] = {41, PwmMode::kPulse, 0.5};
+    return c;
+  };
+  FakeBackend backend;
+  Gateway g{config, backend, 1};
+  g.Tick(1000, true);
+  backend.healthy = false;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  const auto during = with_outputs(Request(g));
+  backend.healthy = true;
+  g.Tick(11000, true);
+  ASSERT_FALSE(g.snapshot().flags & kHardwareFault);
+  ASSERT_EQ(g.snapshot().epoch, during.epoch);
+  ASSERT_TRUE(g.Accept(during, 1, 11000));
+  for (const auto& request : backend.last_requests) {
+    EXPECT_EQ(request.mode, Mode::kNeutral);
+  }
+  ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
+  EXPECT_FALSE(backend.last_digital_outputs[0].value);
+  ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
+  EXPECT_EQ(backend.last_pwm_outputs[0].mode, PwmMode::kOff);
+  EXPECT_EQ(backend.last_pwm_outputs[0].output, 0.0);
+
+  ASSERT_TRUE(g.Accept(with_outputs(Request(g)), 2, 11000));
+  EXPECT_TRUE(backend.last_digital_outputs[0].value);
+  EXPECT_EQ(backend.last_pwm_outputs[0],
+            (PwmRequest{41, PwmMode::kPulse, 0.5}));
+}
+
 // Total loss is judged on the State as published, the gateway's masks
 // included: a follower of an invalid master, or the motor a reset CANcoder
 // feeds, counts as lost though the backend reads it valid. With such a pair as
