@@ -221,7 +221,8 @@ A relative `--prefix` is resolved against the working directory.
   the job's CPU and I/O (`man launchd.plist`), `Background` throttles harder,
   and `Adaptive` follows XPC activity the launcher has none of.
   Both use sudo. Before enabling, it checks bundle read/traversal access as
-  the selected account and creates `<prefix>/logs` owned by that account,
+  the selected account, with the `python3` the boot service's `PATH`
+  resolves ([host interpreters](#host-interpreters)), and creates `<prefix>/logs` owned by that account,
   mode 0755. Bundles stay read-only. An inaccessible bundle fails clearly;
   fix ancestor traversal/read permissions rather than granting bundle writes.
   `--dry-run` prints these provisioning/check commands and the unit, or the
