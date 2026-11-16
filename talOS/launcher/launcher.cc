@@ -99,7 +99,9 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
 // does not, even when the run itself claimed none. Of those, the newest
 // heartbeat wins; a row claimed again during the read is passed over. A
 // released row another process claims before the reap is no longer the
-// run's, and the run's counts are then what the supervision pass last read.
+// run's, and the run's counts are then what the supervision pass last read;
+// a claim takes a just-released row only when no other row is free
+// (NodeRegistration::claim).
 // Loads from the mapped segment only: no lock, no disk.
 std::optional<DeliveryCounts> FinalDeliveryCounts(
     const introspect::RegistryMapping& registry, pid_t pid, uint64_t session_id,

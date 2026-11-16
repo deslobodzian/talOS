@@ -232,7 +232,10 @@ so an overrunning loop is visible even while its dispatch count keeps moving.
 A slot is FREE, CLAIMING or ACTIVE. `NodeRegistration` holds the same kernel
 lock from the stale-slot sweep through the claim's ACTIVE commit. It takes a
 FREE slot and writes identity, counts, heartbeat and generation before
-release-storing ACTIVE. A claimant killed at any instruction before this
+release-storing ACTIVE. A FREE slot whose heartbeat is younger than
+`kLivenessTimeout`, one its owner released moments ago, is taken only when no
+other is free: it keeps that run's last sample, delivery loss and event log
+flags included, until the launcher reaps the run and reads it. A claimant killed at any instruction before this
 commit cannot keep the lock held. Any CLAIMING slot observed by the next sweep
 under the lock is therefore abandoned, and is freed immediately, even if the
 claimant died before recording a pid or heartbeat. This also recovers a sweeper

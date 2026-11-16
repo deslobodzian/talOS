@@ -1088,8 +1088,10 @@ class NodeRegistration {
       // reclaimed after this owner went quiet (see sweep_stale), and freeing
       // it then would yank the new owner's row out from under it. The row
       // keeps its last sample, sources included, until the next claim clears
-      // it: the launcher reads a reaped run's final delivery loss there
-      // (DeliveryLossOf; TODO.md RT-7).
+      // it, which takes it only once no other row is free or its heartbeat
+      // is kLivenessTimeout old (claim): the launcher reads a reaped run's
+      // final delivery loss and event log flags there (DeliveryLossOf;
+      // TODO.md RT-7).
       if (owns_slot()) {
         record_->state.store(static_cast<std::uint64_t>(SlotState::FREE),
                              std::memory_order_release);
@@ -1157,11 +1159,19 @@ class NodeRegistration {
   // Takes a free slot, or -- only when none is free -- one whose owner stopped
   // heartbeating long enough ago to be considered gone. Rows of gone owners
   // are swept first (see sweep_stale), so the fallback below only fires for a
-  // slot that went quiet between the sweep and the claim.
+  // slot that went quiet between the sweep and the claim. A free slot whose
+  // last heartbeat is younger than kLivenessTimeout -- a row its owner
+  // released moments ago -- is taken only when no other is free: it holds
+  // that run's last sample until the launcher reaps the run and reads it
+  // (its delivery loss and event log flags), and a peer starting meanwhile
+  // must not overwrite it.
   static NodeRecord* claim(RegistryHeader* header, const Identity& identity,
                            const RegistryTestHooks* test_hooks) {
     sweep_stale(header);
-    NodeRecord* record = claim_where(header, SlotState::FREE, false);
+    NodeRecord* record = claim_where(header, SlotState::FREE, true);
+    if (record == nullptr) {
+      record = claim_where(header, SlotState::FREE, false);
+    }
     if (record == nullptr) {
       record = claim_where(header, SlotState::ACTIVE, true);
     }

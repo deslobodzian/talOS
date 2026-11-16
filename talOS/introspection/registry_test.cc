@@ -898,6 +898,40 @@ TEST_F(Registry, ALogGapIsItsOwnFlagAndOutlivesTheGap) {
 // is all the launcher has of a run killed during one: a running loop whose
 // LogWriter dropped one record too large for its buffers shows kFlagLogGap.
 // REQ-OPS-52
+// A run that exits right after its row showed a log gap is marked only from
+// the row it released, which the launcher reads when it reaps the run. A
+// claim made before that reap (a peer starting, or a restart storm) must not
+// take that row while another is free, or the run's last sample, its gap bit
+// among it, is gone before the launcher reads it.
+// REQ-OPS-52
+TEST_F(Registry, AClaimTakesARecentlyReleasedRowOnlyWhenNoOtherIsFree) {
+  std::size_t released = 0;
+  {
+    NodeRegistration ended{{.name = "ended", .session_id = 7}, path_};
+    ended.publish(sample_manifest());
+    ended.set_recording(/*failed=*/false, /*capped=*/false, /*gap=*/true);
+    released = ended.slot();
+  }
+  NodeRegistration next{{.name = "next", .session_id = 7}, path_};
+  next.publish(sample_manifest());
+  EXPECT_NE(next.slot(), released);
+  RegistryMapping mapping{path_};
+  const NodeRecord& row = mapping.header()->nodes[released];
+  EXPECT_NE(row.flags.load(std::memory_order_relaxed) & kFlagLogGap, 0u)
+      << "the released row's last sample was overwritten";
+
+  // With every other row taken, the released one is reused.
+  std::vector<std::unique_ptr<NodeRegistration>> others;
+  while (others.size() + 2 < kMaxNodes) {
+    others.push_back(std::make_unique<NodeRegistration>(
+        NodeRegistration::Identity{.name =
+                                       "other" + std::to_string(others.size())},
+        path_));
+  }
+  NodeRegistration last{{.name = "last"}, path_};
+  EXPECT_EQ(last.slot(), released);
+}
+
 TEST_F(Registry, TheReporterCopiesTheLoopsLogGapIntoTheRow) {
   const std::string log = ::testing::TempDir() + "/registry_gap_" +
                           std::to_string(::getpid()) + ".tlog";
