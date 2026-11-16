@@ -1697,6 +1697,30 @@ TEST(Gateway, TotalLossWhileInactiveAdvancesTheEpoch) {
   EXPECT_TRUE(g.Accept(Request(g), 2, 11000));
 }
 
+// During total loss every node flushes neutral (its State carries
+// kHardwareFault, so robot_enabled is false) and the bridge keeps forwarding
+// that merge, stamped with the loss's own epoch. Refusing it is the gate
+// working, as while disabled, so it is not counted; a command of the same
+// epoch that drives an output is still refused and counted.
+// REQ-SAFE-17
+TEST(Gateway, NeutralRefusedDuringTotalLossIsNotARejection) {
+  FakeBackend backend;
+  Gateway g{SwerveConfig(true), backend, 1};
+  g.Tick(1000, true);
+  backend.healthy = false;
+  g.Tick(6000, true);
+  ASSERT_TRUE(g.snapshot().flags & kHardwareFault);
+  const auto neutral = AllMotorsNeutral(Request(g));
+  ASSERT_EQ(neutral.epoch, g.snapshot().epoch);
+  for (uint64_t sequence = 1; sequence <= 3; ++sequence) {
+    EXPECT_FALSE(g.Accept(neutral, sequence, 6000));
+  }
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
+  EXPECT_FALSE(g.Accept(Request(g), 4, 6000));
+  EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  EXPECT_EQ(backend.applied, 0);
+}
+
 // Total loss is judged on the State as published, the gateway's masks
 // included: a follower of an invalid master, or the motor a reset CANcoder
 // feeds, counts as lost though the backend reads it valid. With such a pair as

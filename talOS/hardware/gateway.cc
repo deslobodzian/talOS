@@ -575,7 +575,14 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
     return false;
   }
   if (fault_ || configuring_ || !healthy_ || mismatched) {
-    if (!superseded_neutral) ++state_.counters.rejected_command_count;
+    // During total loss every node flushes neutral (the State carries the
+    // hardware fault) and the bridge forwards the merge with the loss's own
+    // epoch: refusing that is the gate working too.
+    const bool loss_neutral =
+        !healthy_ && !mismatched && DrivesNothing(c, config_);
+    if (!superseded_neutral && !loss_neutral) {
+      ++state_.counters.rejected_command_count;
+    }
     return false;
   }
   // Structure errors reject the transaction; range/feedback errors isolate a
