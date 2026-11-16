@@ -170,7 +170,7 @@ class ConfigPersister {
 
   // Saver-thread state: the configuration being saved, read outside the
   // mutex. One saved while stopping, when the loop no longer ticks to collect
-  // done_, stays here for the destructor to free.
+  // done_, stays here for Stop() to free after the join.
   std::optional<Persisted> saving_;
 
   bool started_{false};
