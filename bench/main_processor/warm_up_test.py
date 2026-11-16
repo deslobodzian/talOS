@@ -9,6 +9,7 @@ out a short bound: there every member has already run once from its
 installed path, so only the stub that never exits can reach it."""
 
 import os
+import re
 import select
 import shutil
 import signal
@@ -31,6 +32,7 @@ current="$(readlink "$STUB_PREFIX/current" || echo -)"
 printf 'start %s %s %s %s\\n' "$me" "$$" "$current" "$*" >> "$STUB_LOG"
 case "$(basename "$0")" in
   fails) printf 'end %s\\n' "$me" >> "$STUB_LOG"; exit 3 ;;
+  dies) kill -KILL $$ ;;
   hangs)
     # STUB_PREWARM: run once to pay a first exec, then exit. STUB_FIFO: say
     # it is running.
@@ -43,8 +45,8 @@ printf 'end %s\\n' "$me" >> "$STUB_LOG"
 
 def stub_bundle(root, nodes):
     """A bundle laid out as talos_bundle writes one, every executable a
-    stub: `nodes` (`fails` exits 3, `hangs` never exits, any other exits
-    0), a Studio bridge, the launcher and run.sh."""
+    stub: `nodes` (`fails` exits 3, `dies` is killed by SIGKILL, `hangs`
+    never exits, any other exits 0), a Studio bridge, the launcher and run.sh."""
     for sub in ("bin", "config", "studio"):
         os.makedirs(os.path.join(root, sub))
     with open(os.path.join(root, "config", "robot.toml"), "w",
@@ -67,6 +69,24 @@ def stub_bundle(root, nodes):
     with open(os.path.join(root, "bundle_manifest.toml"), "w",
               encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
+
+
+NATIVE_MARK = "bin/alpha.runfiles/site/mark.cpython-311-darwin.so"
+
+
+def native_bundle(src):
+    """A stub bundle with two native libraries: one that fails to load
+    (`broken.so`, sorted first) and the marking library, at NATIVE_MARK,
+    which it returns."""
+    stub_bundle(src, ("alpha",))
+    site = os.path.dirname(os.path.join(src, NATIVE_MARK))
+    os.makedirs(site)
+    shutil.copy(runfiles.Create().Rlocation(
+        "_main/bench/main_processor/bundle_test_native_mark.so"),
+        os.path.join(src, NATIVE_MARK))
+    with open(os.path.join(site, "broken.so"), "wb") as f:
+        f.write(b"not a Mach-O file")
+    return NATIVE_MARK
 
 
 class WarmUpTest(unittest.TestCase):
@@ -178,22 +198,26 @@ class WarmUpTest(unittest.TestCase):
                          old)
         self.assert_warmed_in_turn(os.path.realpath(old), nodes, new, proc)
 
+    # REQ-OPS-47: the warm-up's last line is what was warmed. A member that
+    # died or failed is counted as not warmed and named with how it ended,
+    # not only in a warning above (DEPLOY-11).
+    def test_summary_counts_only_members_that_finished(self):
+        proc = self.install("bundle", ("alpha", "dies", "fails"))
+        summary = [line for line in proc.stdout.splitlines()
+                   if line.startswith("deploy: warmed ")]
+        self.assertEqual(len(summary), 1, proc.stdout + proc.stderr)
+        counted, _, missed = summary[0].partition("; not warmed: ")
+        # Of studio_bridge, alpha, dies, fails and the launcher.
+        self.assertIn(" 3 of 5 members ", counted, summary)
+        self.assertEqual(re.findall(r"(\w+) \(", missed), ["dies", "fails"],
+                         summary)
 
     # REQ-OPS-47
     @unittest.skipUnless(sys.platform == "darwin",
                          "only macOS charges a native library's first load")
     def test_install_loads_each_native_library_once_before_selecting(self):
         src = os.path.join(self.tmp, "bundle")
-        stub_bundle(src, ("alpha",))
-        rel = "bin/alpha.runfiles/site/mark.cpython-311-darwin.so"
-        os.makedirs(os.path.dirname(os.path.join(src, rel)))
-        shutil.copy(runfiles.Create().Rlocation(
-            "_main/bench/main_processor/bundle_test_native_mark.so"),
-            os.path.join(src, rel))
-        # A library that fails to load (sorted first) stops nothing.
-        with open(os.path.join(os.path.dirname(os.path.join(src, rel)),
-                               "broken.so"), "wb") as f:
-            f.write(b"not a Mach-O file")
+        rel = native_bundle(src)
         proc = self.deploy("install", src)
         bundle = os.path.realpath(os.path.join(self.prefix, "current"))
         # The installed copy (the charge is per file), loaded once, while
@@ -202,6 +226,25 @@ class WarmUpTest(unittest.TestCase):
                  for r in self.records() if r[0] == "native"]
         self.assertEqual(marks, [(os.path.join(bundle, rel), "-")],
                          proc.stdout + proc.stderr)
+
+    # REQ-OPS-47: a native-library pass that dies counts only the libraries
+    # it loaded and is named as not warmed (DEPLOY-11).
+    @unittest.skipUnless(sys.platform == "darwin",
+                         "only macOS charges a native library's first load")
+    def test_summary_counts_only_native_libraries_loaded(self):
+        src = os.path.join(self.tmp, "bundle")
+        native_bundle(src)
+        # The marking library's load kills its process.
+        self.env["STUB_NATIVE_KILL"] = "1"
+        proc = self.deploy("install", src)
+        summary = [line for line in proc.stdout.splitlines()
+                   if line.startswith("deploy: warmed ")]
+        self.assertEqual(len(summary), 1, proc.stdout + proc.stderr)
+        counted, _, missed = summary[0].partition("; not warmed: ")
+        # broken.so's load returned (failing); the marking one never did.
+        self.assertIn(" 3 members and 1 of 2 native libraries ", counted,
+                      summary)
+        self.assertTrue(missed.startswith("native libraries ("), summary)
 
     # REQ-OPS-47
     def test_a_hung_member_is_killed_at_its_bound(self):

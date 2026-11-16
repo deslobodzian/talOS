@@ -56,7 +56,9 @@ finally:
 # native pass runs only the libraries' static initializers, in a process of its
 # own. A member that fails or outlives its bound (TALOS_DEPLOY_WARM_UP_TIMEOUT_S
 # seconds, default 60; tests shorten it) is a warning naming it and never fails
-# the command: install's graph check judges members. A stop signal to deploy.sh kills the
+# the command: install's graph check judges members. The last line counts what
+# finished (members that exited 0, native libraries whose load returned) and
+# names each member that did not, with how it ended. A stop signal to deploy.sh kills the
 # running member's group and selects nothing. Members run as the invoking user
 # (root under sudo). Linux pays no such charge but runs the same path, without
 # the native pass.
@@ -157,6 +159,8 @@ members.append(("launcher", "launcher", ["--help"]))
 # each failure: their static initializers run there, nothing calls into them,
 # and it exits without running any destructor. Linux charges nothing, so it is
 # skipped there.
+# It writes a line to stdout as each load returns, unbuffered, so a loader
+# that dies part way says how many it loaded.
 NATIVE_LOADER = r"""
 import ctypes, os, sys
 for root, _, files in os.walk(sys.argv[1]):
@@ -167,7 +171,7 @@ for root, _, files in os.walk(sys.argv[1]):
                 ctypes.CDLL(path, mode=os.RTLD_LAZY | os.RTLD_LOCAL)
             except OSError:
                 pass
-sys.stdout.flush()
+            os.write(1, b"loaded\n")
 os._exit(0)
 """
 natives = 0
@@ -216,48 +220,83 @@ def kill_group(proc):
     proc.wait()
 
 
-def warm(label, binary, args, err):
+def ended(code):
+    if code < 0:
+        try:
+            return f"killed by {signal.Signals(-code).name}"
+        except ValueError:
+            return f"killed by signal {-code}"
+    return f"exited {code}"
+
+
+def warm(label, binary, args, out, err):
+    """Runs one member; returns None when it exited 0, else how it ended."""
     proc = None
     try:
         # Its own process group, so a hung member is killed whole.
         proc = subprocess.Popen(
             [os.path.join(bundle, binary)] + args, cwd=bundle, env=env,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=err, start_new_session=True)
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+            start_new_session=True)
     except OSError as e:
         warn(f"{label}: cannot run {binary}: {e}")
-        return
+        return "could not run"
     try:
         code = proc.wait(timeout=bound)
     except subprocess.TimeoutExpired:
         warn(f"{label}: still running after {bound:g} s; killed")
-        return
+        return f"killed at the {bound:g} s bound"
     finally:
         # Whatever ends the wait (the bound, an interrupt), the member and
         # its group go with it.
         kill_group(proc)
-    if code != 0:
-        err.seek(0)
-        lines = err.read()[-4096:].decode(errors="replace").splitlines()
-        # Its last line naming an error, else its last line.
-        said = [line.strip() for line in lines if line.strip()]
-        cause = next((line for line in reversed(said)
-                      if "error" in line.lower()), said[-1] if said else "")
-        warn(f"{label}: exited {code}" + (f": {cause}" if cause else ""))
+    if code == 0:
+        return None
+    err.seek(0)
+    lines = err.read()[-4096:].decode(errors="replace").splitlines()
+    # Its last line naming an error, else its last line.
+    said = [line.strip() for line in lines if line.strip()]
+    cause = next((line for line in reversed(said)
+                  if "error" in line.lower()), said[-1] if said else "")
+    warn(f"{label}: {ended(code)}" + (f": {cause}" if cause else ""))
+    return ended(code)
 
 
 began = time.monotonic()
+finished = 0
+loaded = 0
+missed = []
 try:
-    for label, binary, args in members:
-        with tempfile.TemporaryFile() as err:
-            warm(label, binary, args, err)
+    for index, (label, binary, args) in enumerate(members):
+        native = natives and index == len(members) - 1
+        with tempfile.TemporaryFile() as out, \
+                tempfile.TemporaryFile() as err:
+            why = warm(label, binary, args,
+                       out if native else subprocess.DEVNULL, err)
+            if native:
+                out.seek(0)
+                loaded = out.read().count(b"\n")
+        if why is not None:
+            missed.append(f"{label} ({why})")
+        elif not native:
+            finished += 1
 except Interrupted:
     print("deploy: warm-up interrupted; its member was killed",
           file=sys.stderr, flush=True)
     sys.exit(130)
-loaded = f" and {natives} native libraries" if natives else ""
-print(f"deploy: warmed {len(members) - bool(natives)} members{loaded} in "
-      f"{time.monotonic() - began:.1f} s", flush=True)
+
+
+def of(done, total):
+    return f"{done}" if done == total else f"{done} of {total}"
+
+
+summary = f"deploy: warmed {of(finished, len(members) - bool(natives))} members"
+if natives:
+    summary += f" and {of(loaded, natives)} native libraries"
+summary += f" in {time.monotonic() - began:.1f} s"
+if missed:
+    summary += "; not warmed: " + ", ".join(missed)
+print(summary, flush=True)
 EOF
   local pid=$! status=0 stopped=0
   trap 'stopped=1; kill -TERM "$pid" 2>/dev/null || true' TERM INT HUP

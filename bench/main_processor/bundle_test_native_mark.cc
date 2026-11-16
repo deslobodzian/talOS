@@ -1,11 +1,13 @@
 // warm_up_test only: a native library whose load leaves a mark. Its
 // constructor appends `native <its path> <what $STUB_PREFIX/current selects,
 // or ->` to $STUB_LOG, as warm_up_test.py's stub executables record a run.
+// With $STUB_NATIVE_KILL set, it then kills the loading process.
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <climits>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 
@@ -33,6 +35,7 @@ __attribute__((constructor)) void Mark() {
     // Nothing to report to: the test then finds no mark.
   }
   close(fd);
+  if (std::getenv("STUB_NATIVE_KILL") != nullptr) std::raise(SIGKILL);
 }
 
 }  // namespace
