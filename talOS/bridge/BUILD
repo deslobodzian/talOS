@@ -161,6 +161,7 @@ cc_test(
         "//talOS/introspection:registry",
         "//talOS/ipc",
         "//talOS/node:allocation_probe",
+        "//talOS/process",
         "//talOS/protocol:udp_test_helpers",
         "//talOS/rtms",
         "//talOS/schema:identity",

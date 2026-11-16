@@ -52,6 +52,7 @@
 #include "talOS/hardware/gateway.h"
 #include "talOS/introspection/registry.h"
 #include "talOS/node/allocation_probe.h"
+#include "talOS/process/process.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
 namespace talos::hardware {
@@ -1688,6 +1689,35 @@ TEST(HardwareNodeTest, ItsRowHasTheLogGapBitAsTheGapOpens) {
   EXPECT_TRUE(PassUntilTheRowShowsAGap(*link.node, 1'000'000, *reader))
       << "no kFlagLogGap in the bridge's row before its next sample";
   held.Release();
+  link.node.reset();
+  std::filesystem::remove(log_path);
+}
+
+// A bridge run whose own --log has a gap exits 1 when stopped, as a node
+// does (Run()'s incomplete() call), and says recording_gaps=1. The writer
+// is held until the gap opens, then released before the stop, so no second
+// gap can open.
+// REQ-OPS-52
+TEST(HardwareNodeTest, ARunWhoseOwnLogHasAGapExits1) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const std::string log_path = ::testing::TempDir() + "/bridge_exit_gap_" +
+                               std::to_string(getpid()) + ".tlog";
+  Link link;  // destroyed after `held` lets its writer go
+  HeldBridgeLog held;
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 52));
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  ASSERT_TRUE(PassUntilTheRowShowsAGap(*link.node, 1'000'000, *reader));
+  held.Release();
+  // Stopped before its first wait: it exits through the summary at once,
+  // having reached no duration of its own.
+  process::stop_requested.store(true);
+  ::testing::internal::CaptureStdout();
+  const int status = link.node->Run();
+  const std::string output = ::testing::internal::GetCapturedStdout();
+  process::stop_requested.store(false);
+  EXPECT_EQ(status, 1) << output;
+  EXPECT_NE(output.find("recording_gaps=1 "), std::string::npos) << output;
   link.node.reset();
   std::filesystem::remove(log_path);
 }
