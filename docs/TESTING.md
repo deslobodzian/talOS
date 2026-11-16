@@ -276,19 +276,22 @@ A case that does not apply is a comment in the test file naming why:
   beside a replaced glibc `malloc`; those cases skip and plain builds run
   them.
 
-For a node without the opt-out, the neutral half of the disabled, stale
-and released cases (2 to 6, 10 and 11) is the devices flush's: it sends
-every output neutral while `robot_enabled(node)` is false (REQ-SAFE-02) and
-in any tick in which none of the node's `talos::Target`s returned a target
-(REQ-SAFE-41), whatever the node's code does, and `talOS/devices` proves
-both (`devices_test.cc`, `target_test.cc`), so a node's case 2 carries no
-REQ-SAFE-02 tag. The node's own evidence is case 1, which a node that reads
-its lane through a plain subscription or a joystick fails (it never
-drives), and what each case asserts the node reports (`state` still
-published, its validity, no demand latched across the disable:
-REQ-CONTRACT-25). A node that calls `talos::AllowUntargetedOutputs` is
-not held by the flush's target gate, so for it those cases are its own
-safety evidence and must assert the applied outputs.
+For a node without the opt-out, the neutral half of cases 2 to 6, 10 and
+11 is the devices flush's, so it cannot fail from the node's code: the
+flush sends every output neutral while `robot_enabled(node)` is false
+(REQ-SAFE-02) and in any tick in which none of the node's `talos::Target`s
+returned a target (REQ-SAFE-41), and a stale, released, earlier-generation
+or other mode's lane makes `Target::get` return null. `talOS/devices`
+proves both (`devices_test.cc`, `target_test.cc`), so those cases carry no
+REQ-SAFE-02, REQ-SAFE-07 or REQ-SAFE-09 tag for their neutral assertion.
+The node's falsifiable evidence is case 1, that it drives through its
+`Target` (a node that takes its demand from a plain subscription or a
+joystick fails it: it never drives), the current mode's lane driving it in
+case 10, and what each case asserts about its published `state`
+(REQ-CONTRACT-25). A node that calls `talos::AllowUntargetedOutputs` is
+held by the flush only while disabled (case 2, `robot_enabled`), so for it
+cases 3 to 6, 10 and 11 are its own safety evidence and must assert the
+applied outputs.
 
 Publish targets with `talos::testing::PublishTarget` / `sim.publish_target`,
 with `hw.enable()` and a teleop-enabled Driver Station

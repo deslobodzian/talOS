@@ -275,7 +275,9 @@ TEST_F(VelocityMechanismTest, DisabledRobotGoesNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-07
+// Matrix case 3: once the lane is stale the mechanism is stopped and reports
+// nothing asked. The neutral request is the devices flush's (Target::get
+// returns no target: REQ-SAFE-41, proved in talOS/devices).
 // REQ-SAFE-37
 TEST_F(VelocityMechanismTest, StaleLaneGoesNeutral) {
   hw.ideal_motors();

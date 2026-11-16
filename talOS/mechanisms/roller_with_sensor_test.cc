@@ -355,8 +355,10 @@ TEST(RollerWithSensor, DisabledRobotGoesNeutral) {
   EXPECT_TRUE(intake.roller().has_piece());
 }
 
-// REQ-SAFE-07: a stale or released target drives nothing; a timed eject still
-// finishes its clock, without driving.
+// Matrix cases 3 and 4: a stale or released target ends the ask (idle), and a
+// timed eject still finishes its clock, without driving. The neutral request is
+// the devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices).
 // REQ-SAFE-38
 TEST(RollerWithSensor, StaleLaneGoesNeutral) {
   Rig intake{"intake"};

@@ -592,7 +592,10 @@ TEST_F(ElevatorAlone, DisabledRobotGoesNeutral) {
   ExpectNeutral();  // and the status is still published
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 3, the status holds no goal and reports MOVING,
+// not AT_GOAL, once its lane is stale. The neutral request is the devices
+// flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(ElevatorAlone, StaleLaneGoesNeutral) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
@@ -604,7 +607,9 @@ TEST_F(ElevatorAlone, StaleLaneGoesNeutral) {
   EXPECT_EQ(Status().state(), ElevatorState::MOVING);
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 4, the status holds no goal after a release. The
+// neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(ElevatorAlone, ReleasedLaneGoesNeutral) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
@@ -613,14 +618,20 @@ TEST_F(ElevatorAlone, ReleasedLaneGoesNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 5, the status reports STOWED with no goal while
+// no target was ever sent. The neutral request is the devices flush's
+// (Target::get returns no target: REQ-SAFE-41, proved in talOS/devices), not
+// this node's evidence.
 TEST_F(ElevatorAlone, NeverSentGoesNeutral) {
   sim.step(100ms);
   ExpectNeutral();
   EXPECT_EQ(Status().state(), ElevatorState::STOWED);
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 6, the status holds no goal once the Driver
+// Station view is stale. The neutral request is the devices flush's
+// (Target::get returns no target: REQ-SAFE-41, proved in talOS/devices), not
+// this node's evidence.
 TEST_F(ElevatorAlone, DriverStationLossGoesNeutral) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
@@ -673,7 +684,10 @@ TEST_F(ElevatorAlone, OtherModesLaneIsIgnored) {
   EXPECT_EQ(Applied().mode, Mode::kMotionMagic);
 }
 
-// REQ-SAFE-09
+// REQ-CONTRACT-25: matrix case 11, the status holds no goal from an earlier
+// generation's target, and it drives again on the current one. The neutral
+// request is the devices flush's (Target::get returns no target: REQ-SAFE-41,
+// proved in talOS/devices), not this node's evidence.
 TEST_F(ElevatorAlone, EarlierGenerationTargetIsIgnored) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
@@ -991,7 +1005,10 @@ TEST_F(IntakeAlone, DisabledRobotGoesNeutral) {
   EXPECT_EQ(Status().state(), IntakeState::IDLE);  // still published
 }
 
-// REQ-SAFE-07: the state machine carries on, the roller is neutral.
+// REQ-CONTRACT-25: matrix case 3, the status keeps HOLDING its piece once its
+// lane is stale. The neutral request is the devices flush's (Target::get
+// returns no target: REQ-SAFE-41, proved in talOS/devices), not this node's
+// evidence.
 TEST_F(IntakeAlone, StaleLaneGoesNeutral) {
   Drive(IntakeCommand::INTAKE, 5);
   hw.set_digital_input("intake", "beam_break", true);
@@ -1005,7 +1022,9 @@ TEST_F(IntakeAlone, StaleLaneGoesNeutral) {
   EXPECT_TRUE(Status().has_piece());
 }
 
-// REQ-SAFE-09
+// Matrix case 11: the node drives again on a target of the current generation.
+// Refusing the earlier one is Target's and the flush's (REQ-SAFE-09 in
+// talOS/devices/target_test.cc, and REQ-SAFE-41).
 TEST_F(IntakeAlone, EarlierGenerationTargetIsIgnored) {
   Drive(IntakeCommand::INTAKE, 3);
   ASSERT_EQ(Applied().mode, Mode::kVoltage);

@@ -181,7 +181,10 @@ TEST_F(ShooterTest, DisconnectedFeedbackGoesNeutral) {
   EXPECT_TRUE(State().at_speed());
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 5, the node's `state` published with no target
+// speed and not at speed while no target was ever sent. The neutral request is
+// the devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(ShooterTest, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
@@ -189,7 +192,10 @@ TEST_F(ShooterTest, NeverSentGoesNeutral) {
   EXPECT_TRUE(State().enabled());
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 3, the node's `state` drops its target speed and
+// `at_speed` on the first stale tick, not before. The neutral request is the
+// devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(ShooterTest, StaleLaneGoesNeutral) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
@@ -201,7 +207,10 @@ TEST_F(ShooterTest, StaleLaneGoesNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 4, the node's `state` drops its target speed and
+// `at_speed` on the tick after a release. The neutral request is the devices
+// flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(ShooterTest, ReleasedLaneGoesNeutral) {
   Teleop();
   hw.set_motor("shooter", "flywheel", 0.0, 80.0);
@@ -228,7 +237,10 @@ TEST_F(ShooterTest, DisabledRobotGoesNeutral) {
   EXPECT_FALSE(State().enabled());
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 6, the node's `state` drops its target speed and
+// `at_speed` once the Driver Station view is stale. The neutral request is the
+// devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(ShooterTest, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(80.0, 40ms);
@@ -239,7 +251,9 @@ TEST_F(ShooterTest, DriverStationLossGoesNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-07
+// REQ-SAFE-07: matrix case 10, the current mode's lane drives the node end to
+// end through its Target; the other mode's lane going neutral is the
+// flush's (REQ-SAFE-41).
 TEST_F(ShooterTest, OtherModesLaneIsIgnored) {
   Teleop();
   Hold(80.0, 40ms, "auto");  // autonomous's lane, live, in teleop
@@ -259,7 +273,10 @@ TEST_F(ShooterTest, OtherModesLaneIsIgnored) {
   EXPECT_DOUBLE_EQ(request.demand, 60.0);
 }
 
-// REQ-SAFE-09
+// REQ-CONTRACT-25: matrix case 11, the node's `state` keeps no target speed
+// from an earlier generation's target, and it drives again on the current one.
+// The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(ShooterTest, EarlierGenerationTargetIsIgnored) {
   Teleop();
   Hold(80.0, 40ms);

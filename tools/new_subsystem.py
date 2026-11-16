@@ -701,7 +701,10 @@ TEST_F(@PASCAL@Test, DisabledRobotGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 3, the node's `state` still published, `enabled`
+// false, once its lane is stale. The neutral request is the devices flush's
+// (Target::get returns no target: REQ-SAFE-41, proved in talOS/devices), not
+// this node's evidence.
 TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -713,7 +716,9 @@ TEST_F(@PASCAL@Test, StaleLaneGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
-// REQ-SAFE-07
+// Matrix case 4: the node keeps running when its lane is released. The neutral
+// request is the devices flush's (Target::get returns no target: REQ-SAFE-41,
+// proved in talOS/devices), not this node's evidence.
 TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -724,7 +729,10 @@ TEST_F(@PASCAL@Test, ReleasedLaneGoesNeutral) {
   EXPECT_EQ(Request(), Mode::kNeutral);
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 5, the node's `state` published, `enabled`
+// false, while no target was ever sent. The neutral request is the devices
+// flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
@@ -732,7 +740,9 @@ TEST_F(@PASCAL@Test, NeverSentGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
-// REQ-SAFE-07
+// Matrix case 6: the node keeps running once the Driver Station view is stale.
+// The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(@PASCAL@Test, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -770,7 +780,9 @@ TEST_F(@PASCAL@Test, NonFiniteDemandGoesNeutral) {
 
 // matrix: n/a 9 (the @NAME@ reads no parameters)
 
-// REQ-SAFE-07
+// REQ-SAFE-07: matrix case 10, the current mode's lane drives the node end to
+// end through its Target; the other mode's lane going neutral is the
+// flush's (REQ-SAFE-41).
 TEST_F(@PASCAL@Test, OtherModesLaneIsIgnored) {
   Teleop();
   Hold(30.0, 40ms, "auto");  // autonomous's lane, live, in teleop
@@ -787,7 +799,9 @@ TEST_F(@PASCAL@Test, OtherModesLaneIsIgnored) {
   EXPECT_DOUBLE_EQ(request.demand, 20.0);
 }
 
-// REQ-SAFE-09
+// Matrix case 11: the node drives again on a target of the current generation.
+// Refusing the earlier one is Target's and the flush's (REQ-SAFE-09 in
+// talOS/devices/target_test.cc, and REQ-SAFE-41).
 TEST_F(@PASCAL@Test, EarlierGenerationTargetIsIgnored) {
   Teleop();
   Hold(30.0, 40ms);
@@ -1461,7 +1475,10 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    # REQ-SAFE-07
+    # REQ-CONTRACT-25: matrix case 3, the node's `state` still published,
+    # `enabled` false, once its lane is stale. The neutral request is the
+    # devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+    # talOS/devices), not this node's evidence.
     def test_stale_lane_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
@@ -1471,7 +1488,9 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertEqual(self.applied(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    # REQ-SAFE-07
+    # Matrix case 4: the node keeps running when its lane is released. The
+    # neutral request is the devices flush's (Target::get returns no
+    # target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
     def test_released_lane_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
@@ -1480,14 +1499,19 @@ class @PASCAL@Test(unittest.TestCase):
         self.sim.step(0.04)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
 
-    # REQ-SAFE-07
+    # REQ-CONTRACT-25: matrix case 5, the node's `state` published, `enabled`
+    # false, while no target was ever sent. The neutral request is the devices
+    # flush's (Target::get returns no target: REQ-SAFE-41, proved in
+    # talOS/devices), not this node's evidence.
     def test_never_sent_goes_neutral(self):
         self.teleop()
         self.sim.step(0.06)
         self.assertEqual(self.mode(), talos.Mode.NEUTRAL)
         self.assertFalse(self.state().enabled)
 
-    # REQ-SAFE-07
+    # Matrix case 6: the node keeps running once the Driver Station view is
+    # stale. The neutral request is the devices flush's (Target::get returns no
+    # target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
     def test_driver_station_loss_goes_neutral(self):
         self.teleop()
         self.hold(30.0, 0.04)
@@ -1520,7 +1544,9 @@ class @PASCAL@Test(unittest.TestCase):
 
     # matrix: n/a 9 (the @NAME@ reads no parameters)
 
-    # REQ-SAFE-07
+    # REQ-SAFE-07: matrix case 10, the current mode's lane drives the node end
+    # to end through its Target; the other mode's lane going neutral is the
+    # flush's (REQ-SAFE-41).
     def test_other_modes_lane_is_ignored(self):
         self.teleop()
         self.hold(30.0, 0.04, source="auto")  # autonomous's lane, in teleop
@@ -1535,7 +1561,9 @@ class @PASCAL@Test(unittest.TestCase):
         self.assertEqual(request.mode, talos.Mode.VELOCITY)
         self.assertEqual(request.demand, 20.0)
 
-    # REQ-SAFE-09
+    # Matrix case 11: the node drives again on a target of the current
+    # generation. Refusing the earlier one is Target's and the
+    # flush's (REQ-SAFE-09 in talOS/devices/target_test.cc, and REQ-SAFE-41).
     def test_earlier_generation_target_is_ignored(self):
         self.teleop()
         self.hold(30.0, 0.04)

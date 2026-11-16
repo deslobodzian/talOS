@@ -716,7 +716,10 @@ TEST_F(DrivetrainFieldSlewTest, ConstantFieldVelocityWhileRotatingIsReached) {
   EXPECT_NEAR(std::atan2(field_vy, field_vx), 0.0, 0.1);
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 5, the node's `state` published, modules valid,
+// while no target was ever sent. The neutral request is the devices flush's
+// (Target::get returns no target: REQ-SAFE-41, proved in talOS/devices), not
+// this node's evidence.
 TEST_F(DrivetrainTest, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
@@ -742,7 +745,9 @@ TEST_F(DrivetrainTest, DisabledRobotGoesNeutral) {
   EXPECT_TRUE(State().yaw_valid());
 }
 
-// REQ-SAFE-07
+// Matrix case 6: the node keeps running once the Driver Station view is stale.
+// The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(DrivetrainTest, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
@@ -754,7 +759,9 @@ TEST_F(DrivetrainTest, DriverStationLossGoesNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-07
+// REQ-SAFE-07: matrix case 10, the current mode's lane drives the node end to
+// end through its Target; the other mode's lane going neutral is the
+// flush's (REQ-SAFE-41).
 TEST_F(DrivetrainTest, OtherModesLaneIsIgnored) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms, "auto");  // auto's lane, in teleop
@@ -771,7 +778,9 @@ TEST_F(DrivetrainTest, OtherModesLaneIsIgnored) {
   EXPECT_EQ(Request("front_left_drive").mode, Mode::kVelocity);
 }
 
-// REQ-SAFE-07
+// Matrix case 4: the node keeps running when its lane is released. The neutral
+// request is the devices flush's (Target::get returns no target: REQ-SAFE-41,
+// proved in talOS/devices), not this node's evidence.
 TEST_F(DrivetrainTest, ReleasedLaneGoesNeutral) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
@@ -805,7 +814,9 @@ TEST_F(DrivetrainTest, NonFiniteDemandGoesNeutral) {
   }
 }
 
-// REQ-SAFE-07
+// Matrix case 3: the node drives until its lane is stale and keeps running
+// after. The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(DrivetrainTest, StaleLaneGoesNeutral) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
@@ -817,7 +828,9 @@ TEST_F(DrivetrainTest, StaleLaneGoesNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-09
+// Matrix case 11: the node drives again on a target of the current generation.
+// Refusing the earlier one is Target's and the flush's (REQ-SAFE-09 in
+// talOS/devices/target_test.cc, and REQ-SAFE-41).
 TEST_F(DrivetrainTest, EarlierGenerationTargetIsIgnored) {
   Teleop();
   Hold(ChassisTarget{1.0, 0, 0}, 40ms);
