@@ -1,0 +1,55 @@
+"""Studio's browser test config runs robot_physics_sim.toml's graph.
+
+//studio:drive_browser_test opens Studio's driver dashboard against
+studio/tests/browser/robot.toml, which must be the bench's physics
+simulation graph plus a [studio] table naming its own dashboard. Config load
+refuses a nested include, so that file repeats robot_physics_sim.toml's
+overrides on the same include instead of including it. This fails when the
+two differ in anything but [studio]: the include, the [robot] overrides, or
+the [[subsystems]] entries, with every path resolved from its own file.
+"""
+
+import os
+import tomllib
+import unittest
+
+from python.runfiles import runfiles
+
+PHYSICS = "_main/bench/main_processor/configuration/robot_physics_sim.toml"
+COPIES = ("_main/studio/tests/browser/robot.toml",)
+
+
+def overrides(path):
+    """The config at `path` as it overlays its include: everything but
+    [studio], with `include` and each subsystem's `path` and `defaults`
+    resolved from the file's directory."""
+    with open(path, "rb") as f:
+        config = tomllib.load(f)
+    config.pop("studio", None)
+    here = os.path.dirname(path)
+
+    def resolve(rel):
+        return os.path.normpath(os.path.join(here, rel))
+
+    if "include" in config:
+        config["include"] = resolve(config["include"])
+    for entry in config.get("subsystems", []):
+        for key in ("path", "defaults"):
+            if key in entry:
+                entry[key] = resolve(entry[key])
+    return config
+
+
+class PhysicsSimCopyTest(unittest.TestCase):
+    # REQ-OPS-36, REQ-OPS-49: drive_browser_test's evidence for them is
+    # taken on the bench's simulated graph, not a drifted copy of it.
+    def test_copies_repeat_the_physics_sim_overrides(self):
+        r = runfiles.Create()
+        want = overrides(r.Rlocation(PHYSICS))
+        for copy in COPIES:
+            with self.subTest(copy):
+                self.assertEqual(overrides(r.Rlocation(copy)), want)
+
+
+if __name__ == "__main__":
+    unittest.main()

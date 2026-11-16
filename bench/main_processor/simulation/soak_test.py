@@ -1,9 +1,12 @@
 """Soak the bench's simulated graph for minutes while killing and stalling nodes.
 
-The subject is soak.toml: the C++ swerve_module (an actuator owner at 5 ms),
-the Python motor (an actuator owner at 20 ms), the framework teleop node (the
-operator producer of both lanes, with OperatorArming), the Python gyro
-observer, telemetry, the hardware bridge and the Studio bridge.
+The subject is the bench's robot_physics_sim.toml: the C++ swerve_module (an
+actuator owner at 5 ms), the Python motor (an actuator owner at 20 ms), the
+framework teleop node (the operator producer of both lanes, with
+OperatorArming), the Python gyro observer, telemetry, the hardware bridge,
+and the Studio bridge (--start-studio-bridge, every [studio] key at its
+default: the bridge target, the webroot under bazel-bin/ of the working
+directory, and the telemetry topic).
 
 The scripted Driver Station holds teleop for TALOS_SOAK_SECONDS (default 180,
 at most 600 so the run fits Bazel's long timeout)
@@ -169,7 +172,7 @@ class Soak(unittest.TestCase):
         seed = int(os.environ.get("TALOS_SOAK_SEED", "0"))
         rng = random.Random(seed)
         root = support.workspace()
-        config = root / "bench/main_processor/simulation/soak.toml"
+        config = root / "bench/main_processor/configuration/robot_physics_sim.toml"
         robot, subsystem_files = support.load_config(config)
         timeout_ms = robot["command_timeout_us"] / 1000
         period_ms = {}
@@ -178,7 +181,7 @@ class Soak(unittest.TestCase):
             sub = support.tomllib.loads(subsystem_files[name].read_text())
             period_ms[name] = sub["subsystem"].get("period_us", robot["period_us"]) / 1000
             owner_timeout[name] = min(max(2 * period_ms[name], timeout_ms / 2), timeout_ms)
-        # soak.toml's motor file takes its devices from motor.toml (`defaults`),
+        # Its motor file takes its devices from motor.toml (`defaults`),
         # so the device order is robot.toml's.
         layout = support.device_layout(root / "bench/main_processor/configuration/robot.toml")
         motor_ids = {name: [i for i, sub, _, kind in layout

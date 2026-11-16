@@ -10,12 +10,12 @@ bazel test --test_output=errors --test_env=TALOS_SOAK_SECONDS=180 \
 teleop on Linux for `hardening/**` and `feature/**` pushes (seed 0) and for
 pushes to `main` (seed 1), and on macOS nightly (seed 1, `nightly.yaml`).
 
-Its graph is `soak.toml`: the bench's
-[`robot_physics_sim.toml`](../configuration/robot_physics_sim.toml) graph
-(the C++ `swerve_module` owner at 5 ms, the Python `motor` owner at 20 ms, the
-Python `gyro` observer, the framework `teleop` producing both lanes, and
-`telemetry`) with a `[studio]` table, so the launcher also supervises the
-Studio bridge. It runs against the physics simulator
+Its graph is the bench's
+[`robot_physics_sim.toml`](../configuration/robot_physics_sim.toml) (the C++
+`swerve_module` owner at 5 ms, the Python `motor` owner at 20 ms, the Python
+`gyro` observer, the framework `teleop` producing both lanes, and
+`telemetry`), launched with `--start-studio-bridge`, so the launcher also
+supervises the Studio bridge with every `[studio]` key at its default. It runs against the physics simulator
 ([`sim_gateway --physics`](../../../talOS/simulation/README.md)) with
 ephemeral ports and its own `TALOS_SHM_NAMESPACE`, which its first line
 prints. It holds teleop for `TALOS_SOAK_SECONDS` (3 to 600; the test refuses
@@ -67,6 +67,3 @@ realtime scheduling paragraph), and fails if the launcher log reports
 `talos: realtime scheduling incomplete`, so a silent fallback cannot pass.
 Linux runs keep timeshare: they pass without it, and `SCHED_FIFO` has no
 per-thread fail-safe.
-
-After editing `soak.toml`, regenerate its manifest:
-`bazel run //tools:sync_manifest -- bench/main_processor/simulation/soak.toml`.
