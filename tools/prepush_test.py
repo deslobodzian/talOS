@@ -181,6 +181,24 @@ class PrepushTest(unittest.TestCase):
         self.assert_cleaned_up()
 
     # REQ-DEV-25
+    def test_a_failing_source_lint_fails_the_run(self):
+        # CI's lint job runs tools/source_lints.sh; a pushed commit whose
+        # lint failed there passed a prepush that never ran it.
+        path = "tools/source_lints.sh"
+        put(os.path.join(self.repo, path),
+            '#!/bin/sh\n[ -w src/a.txt ] && echo "lint: writable"\n'
+            'echo "lint: node-matrix FAILED"; exit 1\n', 0o755)
+        self.git("add", path)
+        self.git("commit", "-qm", "lints")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: source-lints FAILED", out)
+        self.assertIn("lint: node-matrix FAILED", out)
+        self.assertNotIn("lint: writable", out)
+        self.assertIn("prepush: build ok", out)
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25
     def test_host_includes_reads_only_this_builds_depfiles(self):
         # A `.d` file an earlier run left in the reused output base, for a
         # target this commit no longer has.

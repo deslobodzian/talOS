@@ -692,30 +692,12 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v7
 
-    - name: No wall clock in tests or node code, no test retries
-      # docs/TESTING.md §6.1, §8.1; exceptions with their reasons in
-      # tools/lint_test_time_allowlist.txt, which may only shrink.
-      run: python3 tools/lint_test_time.py
-
-    - name: Every relative markdown link and anchor resolves
-      if: ${{ !cancelled() }}
-      run: python3 tools/check_links.py
-
-    - name: Every SAFE, CONTRACT and P0 requirement has a tagged test
-      # docs/TESTING.md §3, docs/DESIGN.md §6; known gaps with their TODO
-      # item in tools/trace_waivers.txt, which may only shrink.
-      if: ${{ !cancelled() }}
-      run: python3 tools/trace.py --check
-
-    - name: Every node test has its matrix cases
-      # docs/TESTING.md §7; the cases missing today are listed in
-      # tools/check_node_matrix_baseline.txt (TODO.md MATRIX-1), which may
-      # only shrink: an unlisted missing case or a listed case no longer
-      # missing fails.
-      if: ${{ !cancelled() }}
-      run: >-
-        python3 tools/check_node_matrix.py
-        --baseline tools/check_node_matrix_baseline.txt
+    - name: Test time, links, requirement trace, node test matrix
+      # tools/source_lints.sh, which tools/prepush.sh's source-lints step
+      # also runs, so the two cannot drift; its header lists each lint. It
+      # runs every lint whatever the others find and prints one line per
+      # lint.
+      run: bash tools/source_lints.sh
 
   gate:
     name: CI gate
