@@ -110,11 +110,16 @@ that client with a fresh keyframe.
 The system graph includes the bridge itself and refreshes every 250 ms of
 the monotonic clock (see [Waking](#waking)). `/system.json` serves the whole document,
 with a `structure` id covering everything but its fast values (wall time,
-counters, heartbeats, liveness, selected sources, topic verdicts). Each node
+counters, heartbeats, liveness, selected sources, held outputs, topic
+verdicts). Each node
 carries `delivery`, its registry row's wake loss and skipped requests
 (`wake_failures`, `stalled_arms`, `wake_fallbacks`, `requests_skipped`;
 [wake loss](../../talOS/introspection/README.md#wake-loss)), which Studio's
-node card shows as a badge only when nonzero. Each
+node card shows as a badge only when nonzero, and `outputs_held`, its row's
+`kFlagOutputsHeld`
+([who drives](../../talOS/introspection/README.md#who-drives-a-subsystem)):
+the devices flush is holding back outputs the node set with no live target.
+Each
 WebSocket client (`GraphFeed` in [`system.h`](system.h)) is sent the whole
 document on connect and when the structure changes (a node starts, stops or
 restarts), and otherwise `{"kind":"talos.system_graph.update","structure":...,
