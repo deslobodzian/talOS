@@ -96,11 +96,17 @@ class StudioBridgeInSession(unittest.TestCase):
                     status, body = answer.status, answer.read().decode()
             except urllib.error.HTTPError as error:
                 status, body = error.code, error.read().decode()
-            # The page, or (pages not built) the command that builds them,
-            # naming the folder the bridge was given: //:studio_webroot, an
-            # existing directory, so a webroot the config or //:sim's data
-            # miswires (a folder that does not exist) fails here too.
-            if status == 200:
+            # Which state this run is in is known before asking: studio_web
+            # leaves NOT_BUILT.txt in //:studio_webroot exactly while the
+            # talOS checkout has not built the pages. Built: /drive is the
+            # page. Not built: 503 with the command that builds them, naming
+            # the folder the bridge was given (//:studio_webroot, an existing
+            # directory, so a webroot the config or //:sim's data miswires
+            # fails here too) and the talOS checkout to build in.
+            webroot = runfiles.Create().Rlocation("_main/studio_webroot")
+            built = not os.path.exists(os.path.join(webroot, "NOT_BUILT.txt"))
+            if built:
+                self.assertEqual(status, 200, body)
                 self.assertIn("<html", body.lower())
             else:
                 self.assertEqual(status, 503, body)

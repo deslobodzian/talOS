@@ -118,11 +118,13 @@ layout, so `/drive` shows no widgets
 ([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
 
 `studio_test` runs `//:sim --start-studio-bridge` on free ports until the
-launcher reports the bridge up, requires `/drive` to answer with the page or
-with that command naming `//:studio_webroot`'s folder and a talOS checkout
-that exists (so a webroot the
-config or `//:sim`'s `data` miswires fails it), stops the session, and requires the bridge to have run
-once and exited 0. It is not a `talos_sim_test`, which waits for every
+launcher reports the bridge up. It requires `/drive` to answer with the page
+when `//:studio_webroot` holds no `NOT_BUILT.txt`, else with that command
+naming `//:studio_webroot`'s folder and a talOS checkout that exists (so a
+webroot the config or `//:sim`'s `data` miswires fails it). It then stops
+the session and requires the bridge to have run once and exited 0. It runs
+outside Bazel's sandbox, which would stage each page as a link out of the
+webroot, a file the bridge does not serve. It is not a `talos_sim_test`, which waits for every
 member's registry row; the bridge takes none.
 
 `robot_bundle` carries no Studio: `talos_bundle` refuses a webroot without
