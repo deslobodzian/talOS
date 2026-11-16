@@ -1,5 +1,5 @@
 // The desktop-only simulated Driver Station that headless runs (sim.sh
-// --headless, tools/test_drivetrain.py --wpilib) enable the robot with.
+// --headless, tools/test_rio_in_the_loop.py --wpilib) enable the robot with.
 #include "SimDriverStation.h"
 
 #ifndef __FRC_ROBORIO__
@@ -86,7 +86,7 @@ TEST_F(SimDriverStationTest, ScheduleStartsAtConfigurationAndHoldsLastPhase) {
   EXPECT_TRUE(Published().enabled);
 }
 
-// TALOS_SIM_DS=auto with a disable deadline (tools/test_drivetrain.py
+// TALOS_SIM_DS=auto with a disable deadline (tools/test_rio_in_the_loop.py
 // --wpilib) must stay disabled once it disables, not re-enable on the next
 // tick because the gateway is still configured.
 TEST_F(SimDriverStationTest, AutoEnableDisablesOnceAtDeadline) {
