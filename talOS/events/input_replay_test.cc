@@ -572,6 +572,73 @@ TEST(InputReplay, EndsBeforeTheFirstGapOfALogItIsFedFrom) {
   }
 }
 
+// A program with a timer every millisecond and no input.
+class Ticker {
+ public:
+  explicit Ticker(Loop& loop)
+      : tick_{make_timer<&Ticker::on_tick>(loop, "tick", this)} {
+    tick_.setup_periodic(loop.monotonic_now() + 1ms, 1ms);
+  }
+
+ private:
+  void on_tick(const Context&) {}
+
+  Timer<Loop> tick_;
+};
+
+// A gap in a log a run is fed from that starts after the replayed program's
+// recorded exit (loop_end()) is never reached: the run neither stops at it
+// nor runs past its exit. Here the consumer ran live as a ticker that read
+// nothing and exited at kExit; the producer ran on and has a gap after that.
+// Replayed, the consumer reads the producer's sensor, every reading before
+// kExit, and ticks to kExit.
+// REQ-OPS-14
+TEST(InputReplay, AGapAfterTheReplayedRunsExitDoesNotStopIt) {
+  constexpr MonotonicTime kExit = kOrigin + 30ms;
+  const std::string dir = TempDir("gap_after_exit");
+  const std::string out = TempDir("gap_after_exit_out");
+  {
+    SimulationEnvironment environment;
+    Loop producer_loop{environment,
+                       log::LogWriter{dir + "/producer.tlog", "producer"},
+                       Loop::Options{.start = kOrigin}};
+    Loop consumer_loop{environment,
+                       log::LogWriter{dir + "/consumer.tlog", "consumer"},
+                       Loop::Options{.start = kOrigin}};
+    Producer producer{producer_loop};
+    Ticker ticker{consumer_loop};
+    consumer_loop.run_until(kExit);
+    consumer_loop.finish();
+    producer_loop.run_until(kOrigin + std::chrono::milliseconds{kSessionMs});
+    producer_loop.finish();
+  }
+  const log::LogGap gap = MarkGap(dir + "/producer.tlog", kOrigin + 40ms);
+  ASSERT_GT(gap.start_ns, kExit.nanos());
+  const RecordedSession session{dir, "consumer"};
+  ASSERT_EQ(session.loop_end(), kExit);
+  const RecordedTopic* sensor = session.find(kTopics.sensor);
+  ASSERT_NE(sensor, nullptr);
+  ASSERT_TRUE(sensor->first_gap.has_value());
+  EXPECT_EQ(sensor->first_gap->nanos(), gap.start_ns);
+
+  SimulationEnvironment environment;
+  Loop loop{environment, log::LogWriter{out + "/consumer.tlog", "consumer"},
+            Loop::Options{.start = session.loop_start(),
+                          .run_start = session.run_start()}};
+  TestRobot<Loop> consumer{loop, kTopics, kGain};
+  consumer.control_timer().setup_periodic(kOrigin + 1ms, 1ms);
+  const InputReplayReport report = ReplayInputs(loop, environment, session);
+  EXPECT_FALSE(report.stopped_at_gap.has_value());
+  ASSERT_EQ(report.fed.size(), 1u);
+  EXPECT_EQ(report.fed[0].topic, kTopics.sensor);
+  // The readings every 2 ms up to the exit, the one at it included.
+  EXPECT_EQ(report.fed[0].messages, 15u);
+  EXPECT_EQ(consumer.efforts().size(), TicksBefore(kExit + 1ns));
+  EXPECT_EQ(loop.monotonic_now(), kExit);
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
 // Flips one bit of the header of the record at `offset`, so a reader skips
 // it as damage and resumes at the next.
 void DamageRecord(const std::string& path, std::uint64_t offset) {
