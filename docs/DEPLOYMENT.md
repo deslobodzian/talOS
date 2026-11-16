@@ -6,16 +6,18 @@ bundles, starts one on boot, shows logs, rolls back and prunes old bundles.
 
 ## Build a bundle
 
-A robot is built and deployed from its own repository, which pins talOS as
-the git submodule `talos/` ([examples/robot_repo](../examples/robot_repo/README.md#deployment)
+A robot is built and deployed from its own repository, which pins a talOS
+checkout beside it or as a git submodule
+([robot repository](GLOSSARY.md); [examples/robot_repo](../examples/robot_repo/README.md#deployment)
 is the template `new_robot --standalone` copies). From that repository's root:
 
 ```sh
-bazel build --config=release //main_processor:robot_bundle
+bazel build --config=release //:robot_bundle
 ```
 
-with the label of the robot's own `talos_bundle` (the fixture's is
-`//:robot_bundle`). talOS's in-tree example is the bench robot's:
+`//:robot_bundle` is the template's `talos_bundle`; a repository that keeps
+its bundle elsewhere uses its own label, here and below. talOS's in-tree
+example is the bench robot's:
 
 ```sh
 bazel build --config=release //bench/main_processor:bench_bundle
@@ -27,7 +29,8 @@ The config (`build:release --stamp`) is in [`talos.bazelrc`](../talos.bazelrc),
 which talOS's `.bazelrc` and every robot repository's import; the revision
 comes from the `--workspace_status_command` each workspace's own `.bazelrc`
 sets beside that import (talOS's `tools/workspace_status.sh`, which a robot
-repository runs from its `talos/` checkout). Without it the bundle builds the
+repository runs from the talOS checkout its `MODULE.bazel` names; the
+template's `.bazelrc` sets it). Without it the bundle builds the
 same but records no revision.
 
 `talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config` (the
@@ -147,8 +150,10 @@ simulation. A launch that changes the ports with `--remote-port` and
 ./tools/deploy.sh prune [--prefix /opt/talos] [--keep 3]
 ```
 
-From a talOS checkout, as shown; from a robot repository, the same script
-in its talOS submodule: `talos/tools/deploy.sh install bazel-bin/main_processor/robot_bundle`.
+From a talOS checkout, as shown; from a robot repository's root, the same
+script in the talOS checkout its `MODULE.bazel` names (`../talos` beside
+the repository, or `talos/` as a submodule):
+`../talos/tools/deploy.sh install bazel-bin/robot_bundle`.
 A relative `--prefix` is resolved against the working directory.
 
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
@@ -477,7 +482,7 @@ differs, then `./gradlew deploy -Pcompanion=<ipv4>`
 git history, add `-PtalosRevision=<first 16 hex digits of its commit>` so its
 State still names the build ([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the talOS checkout the main-processor bundle was built
-against (a robot repository's `talos/` submodule): each side
+against (the one a robot repository's `MODULE.bazel` names): each side
 rejects frames of another protocol version (currently 8; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
 when that happens; the RoboRIO reports it in the Driver Station message log

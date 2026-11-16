@@ -8,7 +8,8 @@ separate checkout you do not edit. Every command here was run on Linux;
 macOS differs only in how `tools/setup.sh` installs tools.
 
 The main path, sections [1](#1-set-up) to [4](#4-make-it-move-in-simulation),
-is seven commands, the first of them the install, and one file you paste.
+is seven commands, the first of them the install, and lines you append to
+one file.
 When a step fails,
 [section 5](#5-if-it-does-not-work) lists the checks. Terms are explained
 where they first matter; [the glossary](GLOSSARY.md) has all of them.
@@ -81,7 +82,8 @@ write its code. What is in it:
   into a scratch directory and checks that the installed copy describes
   every node; `talos_pin_test`, which checks that `.bazelrc`,
   `.bazelversion` and the default Python match the talOS checkout `@talos`
-  is built from), `//:sim`, the robot against the simulator, and
+  is built from; `trace_test`, which checks every requirement tag against
+  talOS's catalogue), `//:sim`, the robot against the simulator, and
   `robot_bundle`, what [deployment](DEPLOYMENT.md) installs.
 - `MODULE.bazel` points `@talos` at your talOS checkout, relative to the
   repository, so the two directories move together (absolute, with a
@@ -103,12 +105,18 @@ wrote flywheel/testdata/robot.toml
 wrote subsystems/flywheel.toml
 wrote robot.toml
 wrote robot_manifest.bzl
+wrote robot_sim.toml
+wrote robot_sim_manifest.bzl
+wrote BUILD.bazel
 Type: velocity, a motor held at a speed, such as a flywheel or roller.
 ...
 ```
 
 It wrote the node package `flywheel/`, its subsystem file, its
-`[[subsystems]]` entry and the regenerated manifest. `--type position` makes
+`[[subsystems]]` entry and the regenerated manifest, and, since this is the
+repository's first mechanism, the simulation config `robot_sim.toml`
+([section 4](#4-make-it-move-in-simulation)), its manifest, and the two
+checks of it it added to `BUILD.bazel`. `--type position` makes
 an arm or elevator instead ([section 9](#9-position-mechanisms-the-library-or-your-own-code)),
 and `--lang cpp` a C++ node ([section 6](#6-the-c-track)). The package is
 yours: the scaffold is a starting point, not a framework you must keep
@@ -190,8 +198,9 @@ process. When you change what the node does, change the test with it.
 leaves it unable to move: its teleop binding is commented out and every
 gain is zero ("untuned"), so it never drives a real mechanism on values
 nobody measured. What makes it move in simulation goes in `robot_sim.toml`,
-the **simulation config**, beside `robot.toml`. The first mechanism's
-`Next:` prints the whole file; paste it:
+the **simulation config**, beside `robot.toml`. The scaffold wrote its first
+seven lines; `Next:` prints the flywheel's lines to append to it. Append
+them as printed, and the file reads:
 
 ```toml
 # Simulation only: the launcher runs it with --sim
@@ -223,8 +232,10 @@ slot0 = { p = 0.0, i = 0.0, d = 0.0, s = 0.0, v = 0.12, a = 0.0, g = 0.0 }
 `include = "robot.toml"` takes the whole robot, and these tables are merged
 over the flywheel's subsystem file. The binding tells the `teleop` node to
 write a target on `/flywheel/target/teleop` while joystick button 3 is held.
-`Next:` also prints a `sync_manifest` command for this file; nothing in the
-repository reads that manifest yet, so this page skips it.
+The scaffold also wrote `robot_sim_manifest.bzl`, this file's manifest, and
+added `sim_manifest_sync_test` and `sim_graph_test` to `BUILD.bazel`, so
+`bazel test //...` lints this config's graph too and fails, with the
+regenerate command, when its manifest goes stale.
 
 Build and test everything, then run the simulation config with the launcher,
 as `Next:` prints it (`//:sim` runs `robot.toml`, which binds no button):
@@ -238,19 +249,24 @@ bazel run @talos//talOS/launcher -- --config $PWD/robot_sim.toml --sim --duratio
 ```
 
 ```text
-//:graph_test                                                            PASSED in 0.2s
+//:bundle_install_test                                                   PASSED in 3.0s
+//:graph_test                                                            PASSED in 0.3s
 //:manifest_sync_test                                                    PASSED in 0.1s
-//:sim_smoke_test                                                        PASSED in 1.5s
-//:studio_test                                                           PASSED in 1.8s
+//:sim_graph_test                                                        PASSED in 0.2s
+//:sim_manifest_sync_test                                                PASSED in 0.1s
+//:sim_smoke_test                                                        PASSED in 1.6s
+//:studio_test                                                           PASSED in 1.7s
+//:talos_pin_test                                                        PASSED in 0.1s
+//:trace_test                                                            PASSED in 0.1s
 //flywheel:node_test                                                     PASSED in 1.4s
 
-Executed 5 out of 5 tests: 5 tests pass.
+Executed 10 out of 10 tests: 10 tests pass.
 ...
-[launcher] Started flywheel (pid 343890, target //flywheel:node)
+[launcher] Started flywheel (pid 912946, target //flywheel:node)
 ...
-Output Dir: /tmp/talos_logs/3500574835644784081
+Output Dir: /tmp/talos_logs/8357740337952040940
 ...
-  • flywheel (pid=343890, exit=0, records=4040, restarts=0, failed=no, log=/tmp/talos_logs/3500574835644784081/flywheel.tlog)
+  • flywheel (pid=912946, exit=0, records=4035, restarts=0, failed=no, log=/tmp/talos_logs/8357740337952040940/flywheel.tlog)
 ```
 
 The first `bazel test //...` in a new repository compiles what it needs of
@@ -270,8 +286,8 @@ bazel run @talos//talOS/launcher:log_dump -- --format summary --node flywheel --
 ```text
 topic /flywheel/state flywheel.FlywheelState
   records flywheel SEND 397
-  first_ms 66.434
-  last_ms 7986.430
+  first_ms 58.410
+  last_ms 7978.421
   latest {enabled: false, velocity_rps: 0, connected: true}
   range enabled false true
   range velocity_rps 0 19.999999999999986
@@ -327,6 +343,7 @@ wrote claw/testdata/neighbor.toml
 wrote subsystems/claw.toml
 wrote robot.toml
 wrote robot_manifest.bzl
+wrote robot_sim_manifest.bzl
 ...
 ```
 
@@ -355,8 +372,9 @@ class Claw {
 
 It is the Python node line for line; the framework is written once and
 wrapped for Python ([node guide](NODE_DEVELOPMENT_GUIDE.md#node) lists each
-call in both languages). This time `Next:` prints lines to append to
-`robot_sim.toml`; append them as printed. Each mechanism needs a button of
+call in both languages). `Next:` again prints lines to append to
+`robot_sim.toml`; append them as printed (the scaffold regenerated
+`robot_sim_manifest.bzl` already). Each mechanism needs a button of
 its own: the scaffold gives a new mechanism the lowest button no binding in
 the robot's configs uses, and prints it in `Next:`. Here that is button 4,
 since the flywheel holds 3. The launcher does not warn about a shared
@@ -387,7 +405,7 @@ bazel run @talos//talOS/launcher:log_dump -- --node claw --topic /claw/state <se
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
-      claw.ClawState {enabled: true, velocity_rps: 19.999999976116708, connected: true}
+      claw.ClawState {enabled: true, velocity_rps: 19.999999976103876, connected: true}
       claw.ClawState {enabled: true, velocity_rps: 19.999999999999986, connected: true}
       claw.ClawState {enabled: true, velocity_rps: 19.999999999999986, connected: true}
       claw.ClawState {enabled: false, velocity_rps: 0, connected: true}
