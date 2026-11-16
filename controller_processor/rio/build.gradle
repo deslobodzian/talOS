@@ -100,6 +100,23 @@ if (project.hasProperty("tsan")) {
         it.cppCompiler.args.add('-fsanitize=thread')
         it.linker.args.add('-fsanitize=thread')
     }
+    // tsan_suppressions.txt says what it suppresses and why. Thread leaks
+    // are not reported: CTRE's simulator starts threads it never joins (its
+    // CAN network thread among them), and ThreadSanitizer records a thread's
+    // creation only through instrumented frames, so no suppression can name
+    // the vendor library. Every thread of this program is a std::thread or
+    // std::async its owner joins, so one leaks only with its owner: a memory
+    // leak, which is LeakSanitizer's (-Pasan) to find. Options already in
+    // TSAN_OPTIONS follow, and override these.
+    tasks.matching { it.name.startsWith('runFrcUserProgramTest') }.configureEach {
+        def options = "suppressions=${file('tsan_suppressions.txt')} report_thread_leaks=0"
+        def inherited = System.getenv('TSAN_OPTIONS')
+        def value = inherited ? "${options} ${inherited}" : options
+        it.environment('TSAN_OPTIONS', value)
+        // A changed suppression or option reruns a passed test task.
+        it.inputs.file('tsan_suppressions.txt')
+        it.inputs.property('tsanOptions', value)
+    }
 }
 
 if (project.hasProperty("ubsan")) {
