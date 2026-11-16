@@ -33,7 +33,12 @@ Checked from the recorded session, over the whole run:
   swerve_module is neutralized by the bridge's /hw/command within its owner
   timeout plus a period of its last request;
 - swerve_module, restarted under the frozen producer, sends more than five
-  requests before the producer resumes, all neutral and at most 30 ms apart;
+  requests before the producer resumes, all neutral from the first and at
+  most 30 ms apart. Its restart (under 10 ms here) is faster than the
+  lane's newest target takes to expire, so this holds not by that target's
+  age but because a restarted node's subscription receives only what is
+  published after it attaches; the run prints the restart latency and that
+  target's age at the first request;
 - the launcher exits 0, nothing is quarantined, and each node's restart_count
   equals the number of times it was killed.
 """
@@ -351,8 +356,13 @@ class Soak(unittest.TestCase):
                                         f"{name} active while disabled at {t:.1f} ms")
 
             # No swerve_module actuation without a received active target,
-            # published after the latest crash (not retained) and younger than
-            # the timeout when the request was sent, as Target::get() judges.
+            # published after the latest crash and younger than the timeout
+            # when the request was sent, as Target::get() judges. "After the
+            # crash" holds whatever the restart latency: the restarted owner's
+            # reader starts at the lane's next publication
+            # (RTMSQueue::register_reader), so what it receives was published
+            # after it attached, and the killed owner's receipts all precede
+            # the crash.
             target_times = [t for t, _ in targets]
             crashes = sorted(s for a, n, s, _ in events
                              if a in ("kill", "frozen_kill") and n == DRIVE)
@@ -385,11 +395,34 @@ class Soak(unittest.TestCase):
                     # SIGKILL loses the killed process's unflushed recording,
                     # so pre-kill actuation is read from what the bridge sent.
                     self.driving(commands(s - 300, s), s - 150, s, drive_ids, what)
-                    restarted = [r for r in drive_rows if s + 10 < r[0] < e]
+                    # From s, stamped after the kill: the restart takes under
+                    # 10 ms here, and its first request is the one a retained
+                    # target would drive.
+                    restarted = [r for r in drive_rows if s < r[0] < e]
                     self.assertGreater(len(restarted), 5,
                                        f"{what}: owner did not restart during the pause")
-                    self.neutral_by(drive_rows, restarted[0][0], restarted[0][0], e,
-                                    motor_ids[DRIVE], RESTARTED_GAP_MS, what)
+                    # Which regime the run was in: the restart against the
+                    # age of the lane's newest value, the last target the
+                    # frozen producer published (its own record: it was
+                    # stopped, not killed). Faster than command_timeout,
+                    # Target::get would accept that target by its age; the
+                    # restarted owner still never receives it, because a new
+                    # reader starts at the writer's next publication
+                    # (RTMSQueue::register_reader), and the producer
+                    # publishes none until it resumes. So every request of
+                    # the restarted owner is neutral, whatever the latency.
+                    published = max((r["now_ms"] for r in self.dump(
+                        root, session, PRODUCER, f"/{DRIVE}/target/{PRODUCER}",
+                        s - 300, e) if r["kind"] == "SEND" and r["now_ms"] < e),
+                        default=None)
+                    self.assertIsNotNone(published, f"{what}: no target published")
+                    first = restarted[0][0]
+                    print(f"{what}: restarted owner's first request {first - s:.1f} ms "
+                          f"after the kill; the lane's newest target was then "
+                          f"{first - published:.1f} ms old (command_timeout "
+                          f"{timeout_ms:.0f} ms)", flush=True)
+                    self.neutral_by(drive_rows, first, first, e, motor_ids[DRIVE],
+                                    RESTARTED_GAP_MS, what)
                 if action != "stop":
                     continue
                 # Each stall is judged from the input it starves, as recorded,
