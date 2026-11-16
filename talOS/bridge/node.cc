@@ -1232,6 +1232,12 @@ int HardwareNode::Run(int duration_s) {
   // nodes.
   bool log_incomplete = false;
   if (log_) {
+    // The run's EXIT, as an event loop's end_run writes: a log with it holds
+    // a GAP record for every gap (the flush closes one still open), so input
+    // replay judges it by them rather than refusing it as cut short.
+    const event::MonotonicTime now = event::Poller::now();
+    log_->finish(event::Context{
+        .kind = event::EventKind::EXIT, .event_time = now, .now = now});
     log_->flush();
     ReportLogFailure();
     std::printf(
