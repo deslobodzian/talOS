@@ -1,4 +1,9 @@
-"""Studio's browser test config runs robot_physics_sim.toml's graph.
+"""Two hand-kept config copies stay equal to what they copy.
+
+robot_physics_sim.toml is robot_py.toml run against the physics simulator.
+Config load refuses a nested include, so it repeats robot_py.toml's overrides
+on the same include instead of including it, and adds only
+[robot] simulation_only. This fails when the two differ in anything else.
 
 //studio:drive_browser_test opens Studio's driver dashboard against
 studio/tests/browser/robot.toml, which must be the bench's physics
@@ -16,6 +21,7 @@ import unittest
 from python.runfiles import runfiles
 
 PHYSICS = "_main/bench/main_processor/configuration/robot_physics_sim.toml"
+PYTHON = "_main/bench/main_processor/configuration/robot_py.toml"
 COPIES = ("_main/studio/tests/browser/robot.toml",)
 
 
@@ -40,7 +46,26 @@ def overrides(path):
     return config
 
 
+def without_simulation_only(config):
+    """`config` less the one override robot_physics_sim.toml adds to
+    robot_py.toml: [robot] simulation_only (and [robot] if that empties it)."""
+    robot = config.get("robot", {})
+    robot.pop("simulation_only", None)
+    if not robot:
+        config.pop("robot", None)
+    return config
+
+
 class PhysicsSimCopyTest(unittest.TestCase):
+    # REQ-CONTRACT-19: as below; here the physics sim graph against the
+    # Python bench robot it runs.
+    def test_physics_sim_repeats_the_python_bench_overrides(self):
+        r = runfiles.Create()
+        self.assertEqual(
+            without_simulation_only(overrides(r.Rlocation(PHYSICS))),
+            overrides(r.Rlocation(PYTHON)),
+        )
+
     # REQ-CONTRACT-19: a config derived from another fails a test when it
     # goes stale, as a manifest does; here drive_browser_test's config
     # against the bench's simulated graph it copies.
