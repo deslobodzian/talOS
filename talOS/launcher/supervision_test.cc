@@ -1617,17 +1617,28 @@ TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
   const int status = RunSession(options);
   mover.request_stop();
   mover.join();
-  ASSERT_TRUE(ran_its_duration) << "the bridge's loop never started";
+  // The ports were free when picked and released before the launch
+  // (docs/TESTING.md §6.4): a bridge that failed and restarted may have
+  // lost one to another process, which its own log names.
+  const std::string bridge_log =
+      "\nthe bridge's ports " + std::to_string(options.local_port) + " and " +
+      std::to_string(options.remote_port) +
+      " were released before the launch, so another process may have bound "
+      "one; hardware_node.log:\n" +
+      ReadFile(NodeOutputPath(options.output_dir, "hardware_node"));
+  ASSERT_TRUE(ran_its_duration)
+      << "the bridge's loop never started" << bridge_log;
   const std::string manifest = ReadFile(options.output_dir + "/manifest.json");
-  EXPECT_EQ(status, 0) << manifest;
+  EXPECT_EQ(status, 0) << manifest << bridge_log;
   const std::string entry = ManifestEntry(manifest, "hardware_node");
-  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos) << entry;
+  EXPECT_NE(entry.find("\"restart_count\": 0"), std::string::npos)
+      << entry << bridge_log;
   const auto runs = ManifestRuns(manifest, "hardware_node");
-  ASSERT_EQ(runs.size(), 1u) << manifest;
+  ASSERT_EQ(runs.size(), 1u) << manifest << bridge_log;
   EXPECT_NE(runs[0].find("\"exit_code\": 0, \"exit_signal\": 0, "
                          "\"reason\": \"stop\""),
             std::string::npos)
-      << runs[0];
+      << runs[0] << bridge_log;
   std::filesystem::remove_all(options.output_dir);
 }
 
