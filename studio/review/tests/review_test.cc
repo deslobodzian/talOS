@@ -577,8 +577,11 @@ TEST_F(ReviewTest, SessionOfAnotherHardwareProtocolServesNoHardwareChannel) {
   Review review{Library(), 1u << 20};
   const Response channels = review.Get("/review/older/channels.json", "");
   ASSERT_EQ(channels.status, 200) << channels.body;
+  // Held in a local: a range-for over a member of the temporary would read
+  // the document after its destruction.
+  const json listed = json::parse(channels.body);
   std::vector<std::string> names;
-  for (const auto& channel : json::parse(channels.body)["channels"]) {
+  for (const auto& channel : listed["channels"]) {
     names.push_back(channel["name"]);
   }
   EXPECT_EQ(std::count_if(names.begin(), names.end(),
