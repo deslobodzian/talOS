@@ -824,6 +824,7 @@ TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {
 
 // After a stall the socket holds a command backlog; replaying it would put
 // every superseded demand on the CAN bus back-to-back.
+// REQ-SAFE-17: only the newest command a tick drains is applied.
 TEST(Endpoint, AppliesOnlyTheNewestQueuedCommand) {
   FakeBackend backend;
   Gateway gateway{backend, 3012};
