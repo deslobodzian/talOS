@@ -1517,11 +1517,14 @@ int RunMain(int argc, char** argv, const char* node_name,
     // writer takes it here, on the loop's thread, before any send; and lets
     // go of it before the Reporter (and the row's mapping) goes, ahead of
     // the node's destruction, which may still send.
-    loop.recorder().set_gap_flags(reporter.row_flags(),
-                                  introspect::kFlagLogGap);
+    const introspect::NodeRegistration::FlagsWord row = reporter.row_flags();
+    loop.recorder().set_gap_flags({.flags = row.flags,
+                                   .bit = introspect::kFlagLogGap,
+                                   .owner = row.generation,
+                                   .expected = row.claimed});
     struct GapFlagsRelease {
       event::log::LogWriter& writer;
-      ~GapFlagsRelease() { writer.set_gap_flags(nullptr, 0); }
+      ~GapFlagsRelease() { writer.set_gap_flags({}); }
     } const gap_flags_release{loop.recorder()};
     hosted.emplace(Host(loop, node_name, flags, make));
     if (process::stop_requested.load()) {
