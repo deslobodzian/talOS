@@ -480,8 +480,10 @@ reader's time namespace, so a node in another would judge live claims dead.
 was built with, port 5803: `10.56.87.11` unless the main processor's address
 differs, then `./gradlew deploy -Pcompanion=<ipv4>`
 ([RoboRIO](../talOS/hardware/README.md#roborio)). Deployed from a copy with no
-git history, add `-PtalosRevision=<first 16 hex digits of its commit>` so its
-State still names the build ([build stamp](../talOS/hardware/README.md#roborio)).
+git history, add `-PtalosRevision=<first 16 hex digits of its commit>
+-PtalosDirty=true|false` (whether the copy differs from that commit) so its
+State still names the build; from a git checkout the build refuses them
+([build stamp](../talOS/hardware/README.md#roborio)).
 Deploy it from the talOS checkout the main-processor bundle was built
 against (the one a robot repository's `MODULE.bazel` names): each side
 rejects frames of another protocol version (currently 8; see
