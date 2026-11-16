@@ -299,7 +299,7 @@ The node test matrix and the rest of the testing method: [TESTING.md](TESTING.md
 
 | Adding | Do | Never |
 |---|---|---|
-| A mechanism | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py`; fill in the TOML; write the [node test matrix](TESTING.md#7-the-node-test-matrix) | edit `operator_interface` or `telemetry` code |
+| A mechanism | `bazel run @talos//tools:new_subsystem -- <name> --lang cpp\|py` from the robot repository's root ([first mechanism](FIRST_MECHANISM.md#3-add-a-mechanism)); fill in the TOML; write the [node test matrix](TESTING.md#7-the-node-test-matrix) | edit `operator_interface` or `telemetry` code |
 | A producer of a target (auto routine, auto-align, operator input) | a `talos::TargetLane` on `/<sub>/target/<source>`, opened with a `talos::OperatorArming` for operator input; list `<source>` in `[robot.targets]` or that subsystem's `[targets]` (the launcher refuses a lane no mode lists) | subscribe to another producer's lane, or write a lane someone else writes |
 | A process without hardware (pose estimator, vision, auto) | a node with no devices; subscribe to `state` topics; publish state with validity while disabled too; [estimator walkthrough](NODE_DEVELOPMENT_GUIDE.md#adding-a-pose-estimator) | duplicate shared geometry or hand-roll a Kalman filter |
 | A message | the owning package's `.fbs` and `talos_messages(topics = ...)`; §6 and §7 | a hand-written C++/Python mirror |

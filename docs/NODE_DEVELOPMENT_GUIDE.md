@@ -665,7 +665,7 @@ both. Absolute measurements arrive as
 `yaw_std_rad`, `valid`) on each camera node's `/<camera>/state`.
 
 ```sh
-bazel run //tools:new_subsystem -- localizer --lang py --type estimator   # or --lang cpp
+bazel run @talos//tools:new_subsystem -- localizer --lang py --type estimator   # or --lang cpp
 ```
 
 writes the package (topics-only `talos_messages`, the node, a Sim test of the

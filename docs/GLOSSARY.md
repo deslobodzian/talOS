@@ -23,9 +23,16 @@ mode and carries joystick input. Nodes read it through `talos::DriverStation`.
 test. A target policy lists lanes per mode.
 [Targets](../ARCHITECTURE.md#targets).
 
-**Robot repository.** A team's robot in its own Bazel repository, holding
-talOS as the git submodule `talos/` and naming it by `@talos//` labels;
-`new_robot --standalone` makes one from `examples/robot_repo`.
+**Robot repository.** A team's robot in its own Bazel repository, naming
+talOS by `@talos//` labels. Its `MODULE.bazel` points `@talos` at a talOS
+checkout with `local_path_override`, in one of two layouts: the checkout
+beside the repository (a relative `path` such as `"../talos"`), which is
+what `new_robot --standalone` writes when it makes one from
+`examples/robot_repo`, or a git submodule inside it (`path = "talos"`, the
+checkout `talos/`). A command that needs a file of talOS runs it from the
+checkout `MODULE.bazel` names. In the template the
+bundle is `//:robot_bundle`; a repository that keeps its `talos_bundle`
+elsewhere uses its own label.
 [examples/robot_repo](../examples/robot_repo/README.md),
 [Where a new thing goes](../ARCHITECTURE.md#where-a-new-thing-goes).
 
@@ -199,8 +206,9 @@ something it builds or runs; a label is its name. `BUILD` files declare them.
 [Install](INSTALL.md#what-bazel-provides-vs-what-the-host-needs).
 
 **Scaffold.** `bazel run @talos//tools:new_subsystem` in a robot repository
-(`//tools:new_subsystem` inside talOS): writes a node package, its subsystem
-file and manifest entry.
+(`//tools:new_subsystem --robot <dir>` inside talOS): writes a node package,
+its subsystem file and manifest entry, and, with a robot repository's first
+mechanism, its simulation config `robot_sim.toml`.
 `bazel run //tools:new_robot -- <name> --standalone DIR` makes a whole robot
 repository, with no mechanism yet.
 [Where a new thing goes](../ARCHITECTURE.md#where-a-new-thing-goes).
