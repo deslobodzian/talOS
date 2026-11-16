@@ -690,7 +690,7 @@ class NewSubsystemTest(unittest.TestCase):
         # overrides @talos with the talOS checkout the tool runs from (the
         # robot's talos/ submodule) and whose .bazelrc imports that
         # checkout's talos.bazelrc by the same path, not the robot
-        # repository's flags (TODO TOOLS-10: no copied talOS-only lines);
+        # repository's flags (no copied talOS-only lines);
         # when that talOS is Bazel's copy of a fetched module (under an
         # output base's external/), it refuses and writes nothing.
         def write(path, text):
@@ -754,7 +754,7 @@ class NewSubsystemTest(unittest.TestCase):
     # REQ-DEV-01
     def test_robot_repository_simulation_steps_run_the_simulation_config(self):
         # A robot repository has no simulation config until its first
-        # mechanism, whose scaffold writes one (TODO TOOLS-14): it includes
+        # mechanism, whose scaffold writes one: it includes
         # the robot config by its own name, from its own directory, so it
         # resolves with the new subsystem in it; its manifest is current;
         # and the config's BUILD gains the manifest_sync_test and
