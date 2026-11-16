@@ -101,6 +101,111 @@ class SessionReportTest(unittest.TestCase):
         self.assertRegex(named[0], r"protocol \d+ ")
         self.assertIsNone(report["never_enabled"])
 
+    # REQ-OPS-16 (TODO LOG-15): the default session with its enabled States at
+    # 5 to 135 ms lost in a log gap. The 0 -> 140 ms interval across the hole
+    # is the disk's, not the robot's: it is not measured, so the enabled rows,
+    # left with no interval, are NOT MEASURED rather than a 140 ms FAIL; the
+    # gap is listed in the text and JSON, and --strict names it.
+    def test_a_log_gap_is_listed_not_measured_and_fails_strict(self):
+        files = runfiles.Create()
+        fixture = files.Rlocation("_main/talOS/launcher/session_report_fixture")
+        binary = files.Rlocation("_main/talOS/launcher/session_report")
+        with tempfile.TemporaryDirectory() as directory:
+            subprocess.run([fixture, directory, "log-gap"], check=True)
+            result = subprocess.run([binary, "--json", "--strict", directory],
+                                    capture_output=True, text=True)
+            text = subprocess.run([binary, directory], capture_output=True, text=True,
+                                  check=True).stdout
+        self.assertEqual(result.returncode, 2, result.stderr)
+        report = json.loads(result.stdout)
+        verdicts = {v["measurement"]: v["verdict"] for v in report["verdicts"]}
+        for name in ("enabled state median", "enabled state p99", "enabled state gaps"):
+            with self.subTest(verdict=name):
+                self.assertEqual(verdicts[name], "NOT MEASURED")
+        self.assertIsNone(report["state_enabled"])
+        self.assertEqual(report["state_overall"]["count"], 2)
+        # log_dump's times count from the first record's event time, 1 ms
+        # before the fixture's 0; the gap starts at the 5 ms State's event time.
+        self.assertEqual(report["log_gaps"], [{
+            "process": "fixture", "start_ms": 5, "end_ms": 141, "first_lost_ms": 6,
+            "last_lost_ms": 136, "first_dispatch_index": 3, "last_dispatch_index": 6,
+            "records": 4, "bytes": report["log_gaps"][0]["bytes"], "dispatches": 0,
+            "sends": 4, "cause": "pool_full", "splits_dispatch": False,
+            "closed_at_flush": False}])
+        line = "fixture: log gap from 5 to 141 ms, 4 records lost (pool_full)"
+        self.assertIn("- " + line, text.splitlines())
+        self.assertIn("session_report: strict: " + line, result.stderr.splitlines())
+
+    # REQ-OPS-16: a gap makes unmeasured only the intervals of the logs a
+    # measurement reads (a stream's own log; for request to command, the
+    # bridge's and the requesters'), and fails --strict on its own.
+    def test_a_gap_suppresses_only_the_intervals_of_its_own_logs(self):
+        def record(process, kind, topic, now, age_ms=0, **extra):
+            return dict(process=process, kind=kind, topic=topic, now_ms=now,
+                        event_ms=now, publish_ms=now - age_ms, decoded="", **extra)
+        def gap(process, first, last, records):
+            return record(process, "GAP", "?", last + 1, gap={
+                "start_ms": first, "end_ms": last + 1, "first_lost_ms": first,
+                "last_lost_ms": last, "records": records, "cause": "pool_full",
+                "closed_at_flush": False})
+        def strict(records):
+            return session_report.strict_failures(
+                session_report.analyze({"end_wall_ns": 1, "nodes": []}, records))
+        lane = record("lift", "MESSAGE", "/lift/target/teleop", 50)
+        lane["decoded"] = "{mode_since_us: 1200, active: true, message: {position_rot: 0.5}}"
+        passing = [record("hardware_node", "SEND", "/hw/state/driver_station", 0,
+                          ds_enabled=True), lane,
+                   record("lift", "READ", "/lift/target/teleop", 51, 1)]
+        passing += [record("hardware_node", "SEND", "/hw/state", t) for t in range(0, 105, 5)]
+        self.assertEqual(strict(passing), [])
+        camera = "camera: log gap from 20 to 61 ms, 3 records lost (pool_full)"
+        # The bridge lost its 25 ms State: the 10 ms interval across the
+        # hole is not measured, so it fails no p99; the camera's gap at the
+        # same time is in another log and changes no measurement.
+        lost_state = [r for r in passing if r["now_ms"] != 25 or r["topic"] != "/hw/state"]
+        for label, records, failures, count in (
+                ("another log", passing + [gap("camera", 20, 60, 3)], [camera], 20),
+                ("the bridge's log", lost_state + [gap("hardware_node", 25, 25, 1)],
+                 ["hardware_node: log gap from 25 to 26 ms, 1 records lost (pool_full)"], 18)):
+            with self.subTest(label):
+                self.assertEqual(strict(records), failures)
+                self.assertEqual(session_report.analyze({"nodes": []}, records)
+                                 ["state_overall"]["count"], count)
+
+        # Request to command spans two logs. lift's request at 20 ms carrying
+        # observation 2 is lost, so the next one, 25 ms, would read as a 1 ms
+        # reaction to the 26 ms command; with that sample unmeasured, only
+        # observation 1's 0.25 ms remains, whatever the camera lost.
+        def hardware(process, topic, now, observed):
+            return record(process, "SEND", topic, now,
+                          hardware={"boot_id": 1, "observed_time_us": observed})
+        traffic = [hardware("lift", "/hw/request/lift", 10, 1),
+                   hardware("hardware_node", "/hw/command", 10.25, 1),
+                   hardware("lift", "/hw/request/lift", 25, 2),
+                   hardware("hardware_node", "/hw/command", 26, 2)]
+        for label, gaps, latency in (
+                ("requester's log", [gap("lift", 20, 20, 1), gap("camera", 0, 30, 9)],
+                 {"count": 1, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25}),
+                ("both logs", [gap("lift", 20, 20, 1), gap("hardware_node", 10, 10, 1)],
+                 None)):
+            with self.subTest(label):
+                report = session_report.analyze({"nodes": []}, traffic + gaps)
+                self.assertEqual(report["bridge_request_to_command"]["latency"], latency)
+        self.assertIn("| bridge request to command hardware_node | NOT MEASURED | — | — | — |",
+                      session_report.markdown(report).splitlines())
+
+        # An alert's active span across its stream's gap still counts as an
+        # activation, but its clearing record could be lost: it is not timed.
+        def status(publish, active):
+            return record("watchdog", "SEND", "/watchdog/status", publish, alerts=[
+                {"name": "alert_error_link_lost", "level": "error", "active": active}])
+        alert = session_report.analyze({"nodes": []}, [
+            status(20, True), gap("watchdog", 30, 30, 1), status(40, False)])["alerts"]
+        self.assertEqual(alert["/watchdog/status/alert_error_link_lost"], {
+            "level": "error", "stream": "watchdog/SEND", "first_active_ms": 20,
+            "activations": 1, "longest_ms": None, "total_ms": None,
+            "active_at_end": False, "spans_across_gap": 1})
+
     # REQ-RT-20, REQ-OPS-16: an owner timeout's neutral command adopts State
     # S; the node resumes with a request observing S after that command. The
     # request is not what the command reacted to, so it yields no sample (and
@@ -109,7 +214,7 @@ class SessionReportTest(unittest.TestCase):
         def send(topic, now):
             return dict(process="hardware_node", kind="SEND", topic=topic, now_ms=now,
                         hardware={"boot_id": 1, "observed_time_us": 5000})
-        _, delays = session_report.request_to_command(
+        _, delays, _ = session_report.request_to_command(
             [send("/hw/command", 10.0), send("/hw/request/lift", 12.0)])
         self.assertEqual(delays, [])
 

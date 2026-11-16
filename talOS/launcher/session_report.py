@@ -184,15 +184,56 @@ def launcher_drops(session, manifest):
     return [line for _, line in sorted(found)]
 
 
-def request_to_command(records):
+def log_gaps(records):
+    """Every GAP record log_dump exported (a stretch of records its log's
+    writer dropped, talOS/events/log/format.h), as its `gap` member with the
+    process whose log holds it."""
+    return [{"process": r["process"], **r["gap"]} for r in records if r["kind"] == "GAP"]
+
+
+def gap_issue(gap):
+    """A gap as a session issue: its process, span, loss and cause."""
+    return (f"{gap['process']}: log gap from {gap['start_ms']:.6g} to {gap['end_ms']:.6g} ms, "
+            f"{gap['records']} records lost ({gap['cause']}"
+            + (", closed at the stop)" if gap["closed_at_flush"] else ")"))
+
+
+def lost_spans(gaps):
+    """Per process, each of its log's gaps as the span holding every time a
+    record it dropped named (its now, event and publish times):
+    [min(start_ms, first_lost_ms), last_lost_ms], or [start_ms, end_ms] for a
+    GAP without its detail. The record capture resumed with, at end_ms, was
+    kept, so a detailed span stops at the last record lost."""
+    spans = {}
+    for gap in gaps:
+        first, last = gap.get("first_lost_ms"), gap.get("last_lost_ms")
+        low = gap["start_ms"] if first is None else min(gap["start_ms"], first)
+        spans.setdefault(gap["process"], []).append(
+            (low, gap["end_ms"] if last is None else last))
+    return spans
+
+
+def across_gap(spans, processes, low, high):
+    """Whether [low, high] meets a lost span of any of these processes' logs:
+    a record of theirs could be missing inside it, so an interval it bounds
+    is not measured."""
+    return any(start <= high and low <= end
+               for process in processes for start, end in spans.get(process, ()))
+
+
+def request_to_command(records, spans=None):
     """The event-driven bridge's reaction to requests (REQ-RT-20), as
-    (process, delays): for each observation (boot_id, observed_time_us) a
-    merged /hw/command carries, its first command's time minus the first
-    /hw/request/<node> carrying it. A command repeating an observation (the
-    heartbeat) is no reaction, and one no request carried by then (a timeout's
-    neutral command adopting the State, even if a request observing that State
-    follows it) is skipped."""
-    first_request, commands, process = {}, [], None
+    (process, delays, unmeasured): for each observation (boot_id,
+    observed_time_us) a merged /hw/command carries, its first command's time
+    minus the first /hw/request/<node> carrying it. A command repeating an
+    observation (the heartbeat) is no reaction, and one no request carried by
+    then (a timeout's neutral command adopting the State, even if a request
+    observing that State follows it) is skipped. A sample spans from the
+    request before that first one in its node's request stream (where an
+    earlier request carrying the observation could be missing) to the
+    command; it is unmeasured, and counted, when that span meets a log gap
+    (lost_spans) of the bridge or of any node whose requests were searched."""
+    requests, commands, process = [], [], None
     for r in records:
         hardware = r.get("hardware")
         if r["kind"] != "SEND" or not isinstance(hardware, dict) \
@@ -200,19 +241,30 @@ def request_to_command(records):
             continue
         key = (hardware.get("boot_id"), hardware["observed_time_us"])
         if r["topic"].startswith("/hw/request/"):
-            first_request[key] = min(first_request.get(key, r["now_ms"]), r["now_ms"])
+            requests.append((r["now_ms"], (r["process"], r["topic"]), key))
         elif r["topic"] == "/hw/command":
             commands.append((r["now_ms"], key))
             process = r["process"]
-    delays, seen = [], set()
+    # Each observation's first request, and the request before it in its stream.
+    first_request, last = {}, {}
+    for now, request_stream, key in sorted(requests, key=lambda q: q[0]):
+        if key not in first_request:
+            first_request[key] = (now, last.get(request_stream, now))
+        last[request_stream] = now
+    logs = {process} | {request_stream[0] for _, request_stream, _ in requests}
+    delays, seen, unmeasured = [], set(), 0
     for now, key in sorted(commands, key=lambda c: c[0]):
-        if key not in seen and first_request.get(key, math.inf) <= now:
-            delays.append(now - first_request[key])
+        if key not in seen and first_request.get(key, (math.inf,))[0] <= now:
+            requested, since = first_request[key]
+            if across_gap(spans or {}, logs, since, now):
+                unmeasured += 1
+            else:
+                delays.append(now - requested)
         seen.add(key)
-    return process, delays
+    return process, delays, unmeasured
 
 
-def alert_summary(records):
+def alert_summary(records, spans=None):
     """Each alert that was ever active, as `<topic>/<field path>`: its level,
     the stream it was read from, its first activation, activation count, and
     longest and total active time, from the `alerts` log_dump puts on a status
@@ -220,7 +272,10 @@ def alert_summary(records):
     Times are publication times (publish_ms), so a reader's receipt delay
     does not stretch an interval: an alert is active from the first record
     showing it true to the first showing it false, or, still active at the
-    end, to its topic's last record."""
+    end, to its topic's last record. An active span that meets a log gap of
+    its stream's log (lost_spans) is counted as an activation but timed in
+    neither longest nor total (None when no span is left), and
+    `spans_across_gap` counts it."""
     summary = {}
     for topic in sorted({r["topic"] for r in records if r.get("alerts")}):
         source, rows = stream(records, topic)
@@ -237,15 +292,19 @@ def alert_summary(records):
                     intervals[name].append((since.pop(name), r["publish_ms"]))
         for name, start in since.items():
             intervals[name].append((start, rows[-1]["publish_ms"]))
-        for name, spans in intervals.items():
-            if not spans:
+        for name, active in intervals.items():
+            if not active:
                 continue
-            durations = [end - start for start, end in spans]
+            durations = [end - start for start, end in active
+                         if not across_gap(spans or {}, {rows[0]["process"]}, start, end)]
             summary[f"{topic}/{name}"] = {
                 "level": levels[name], "stream": source,
-                "first_active_ms": spans[0][0], "activations": len(spans),
-                "longest_ms": max(durations), "total_ms": sum(durations),
+                "first_active_ms": active[0][0], "activations": len(active),
+                "longest_ms": max(durations, default=None),
+                "total_ms": sum(durations) if durations else None,
                 "active_at_end": name in since}
+            if len(durations) < len(active):
+                summary[f"{topic}/{name}"]["spans_across_gap"] = len(active) - len(durations)
     return dict(sorted(summary.items()))
 
 
@@ -292,23 +351,44 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     # another hardware protocol. Its Driver Station packets were not decoded,
     # so nothing that needs the enabled bit is measured; /hw/state cadence
     # uses only record times and still is.
+    gap_list = log_gaps(records)
+    spans = lost_spans(gap_list)
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
+    # Each stream is one process's records, so a gap of that process's log is
+    # the only one that can hide a record of it.
+    state_logs = {r["process"] for r in states[:1]}
+    ds_logs = {r["process"] for r in ds[:1]}
     ds = [r for r in ds if "ds_enabled" in r]
     ds_times = [r["now_ms"] for r in ds]
     overall, enabled = [], []
+    # Intervals not measured because a log gap meets them: of the /hw/state
+    # log (in neither row), or of the Driver Station log while the bit is
+    # held (neither enabled nor disabled).
+    across_state, across_ds = 0, 0
+
+    def held_since(index):
+        return ds_times[index] if index >= 0 else -math.inf
 
     def enabled_at(time):
-        # The logged DS enabled bit, held until its next observation.
+        # The logged DS enabled bit, held until its next observation; unknown
+        # (not enabled) when a DS record could be missing since it.
         index = bisect.bisect_right(ds_times, time) - 1
-        return index >= 0 and ds[index]["ds_enabled"]
+        return (index >= 0 and ds[index]["ds_enabled"]
+                and not across_gap(spans, ds_logs, held_since(index), time))
     for previous, current in zip(states, states[1:]):
         start, end = previous["now_ms"], current["now_ms"]
+        if across_gap(spans, state_logs, start, end):
+            across_state += 1
+            continue
         gap = end - start
         overall.append(gap)
         # Count a gap if any part overlaps a logged enabled interval, including
         # transitions inside the gap. Before the first DS observation is unknown.
         index = bisect.bisect_right(ds_times, start) - 1
+        if across_gap(spans, ds_logs, held_since(index), end):
+            across_ds += 1
+            continue
         active = index >= 0 and ds[index]["ds_enabled"]
         transitions = ds[max(index + 1, 0):bisect.bisect_left(ds_times, end)]
         if active or any(r["ds_enabled"] for r in transitions):
@@ -361,20 +441,27 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     link_measured, link_passes, first_state_ms, link_detail = controller_link(
         states, source, status_records, status_source)
     verdict("controller link", link_measured, link_passes, link_detail)
+    # Named in a row's detail only when a gap left an interval unmeasured.
+    across = {"overall": "" if not across_state else
+              f"; {across_state} intervals across a /hw/state log gap not measured",
+              "enabled": "" if not across_state + across_ds else
+              f"; {across_state + across_ds} intervals across a /hw/state or "
+              "Driver Station log gap not measured"}
     for name, values in (("overall", overall), ("enabled", enabled)):
         s = stats(values)
         verdict(name + " state median", s is not None,
                 s is not None and 4 <= s["median_ms"] <= 6,
-                "about 5 ms interpreted as 4–6 ms (analysis tolerance, not an additional bring-up requirement)",
+                "about 5 ms interpreted as 4–6 ms (analysis tolerance, not an additional "
+                "bring-up requirement)" + across[name],
                 needs_hardware=name == "enabled")
         verdict(name + " state p99", s is not None,
-                s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank",
+                s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank" + across[name],
                 needs_hardware=name == "enabled")
     gaps = sum(v >= 100 for v in enabled)
     # No count for a row that is not measured: 0 would read as a result.
     verdict("enabled state gaps", bool(enabled), gaps == 0,
-            f"{gaps} gaps >= 100 ms" if enabled and not hardware_not_decoded
-            else "gaps >= 100 ms", needs_hardware=True)
+            (f"{gaps} gaps >= 100 ms" if enabled and not hardware_not_decoded
+             else "gaps >= 100 ms") + across["enabled"], needs_hardware=True)
     worst = max(((max(v), k) for k, v in tick_ages.items()), default=None)
     unselected = sorted(enabled_lane_processes - {k.split(":", 1)[0] for k in tick_ages})
     bound = (f"selected target age at the tick <= {TARGET_AGE_LIMIT_MS} ms per process:lane "
@@ -399,7 +486,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     verdict("timer lateness", False, False,
             "Measured where TIMER dispatches exist; no acceptance threshold is specified.",
             required=False)
-    bridge, bridge_delays = request_to_command(records)
+    bridge, bridge_delays, across_bridge = request_to_command(records, spans)
     # The enabled-only rows above stay required (REQ-RT-15); in a session
     # that never enabled they cannot be measured, which is no tool fault.
     never_enabled = None
@@ -411,9 +498,13 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     # Only recording nodes (non-empty log_path) are acceptance evidence. Host
     # processes without an event log (studio_bridge, sim_gateway) are not.
     issues += [f"{n.get('name')}: {flag}" for n in manifest["nodes"] if n.get("log_path")
-               for flag in ("quarantined", "recorder_failed", "log_capped") if n.get(flag)]
+               for flag in ("quarantined", "recorder_failed", "log_capped", "log_gap")
+               if n.get(flag)]
     # A record the reader skipped is missing from every measurement above.
     issues += list(log_damage)
+    # Records a writer dropped: only the intervals they could fall in went
+    # unmeasured, but the session is not whole evidence.
+    issues += [gap_issue(gap) for gap in gap_list]
     if hardware_not_decoded:
         issues.append(hardware_not_decoded)
     simulation = bool(manifest.get("simulation"))
@@ -466,13 +557,21 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             "status_stream": status_source, "status": status_summary,
             # alert_summary(); informational, as the operator-visibility
             # design has it: --strict does not judge alerts.
-            "alerts": alert_summary(records), "verdicts": verdicts,
+            "alerts": alert_summary(records, spans), "verdicts": verdicts,
             "limitations": ["State timing is bridge IPC publication or one consumer dispatch stream, not raw UDP arrival; never pooled duplicate readers.",
                             "Enabled uses the logged DS enabled bit, held until its next observation; DS silence is not proof of continued physical enablement.",
                             "Bridge request to command runs from the requesting tick's start to the command's publication on /hw/command, not its delivery to the RoboRIO: a command whose UDP send failed is still counted (the bridge's send_failures, on its exit line, says whether any did); with several owners the merged observation can be another owner's older request, overstating it.",
                             "Alert times are publication times of their status topic: an alert is timed from the first record showing it active to the first showing it clear (or that topic's last record), so a topic published every P ms resolves them to P, and a publisher that stops (a crash) holds its last state until its next record.",
                             "Counter deltas exclude unknown increments before the first sample and during resets; clock mapping is not absolute synchronization.",
-                            "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."]}
+                            "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."],
+            # Only in a session with a log gap, so a session without one
+            # reports exactly as before: every gap (log_dump's `gap` member
+            # and its process), and the intervals each row left unmeasured.
+            **({"log_gaps": gap_list,
+                "intervals_across_gaps": {"state_overall": across_state,
+                                          "state_enabled": across_state + across_ds,
+                                          "bridge_request_to_command": across_bridge}}
+               if gap_list else {})}
 
 
 def strict_failures(report):
@@ -548,6 +647,10 @@ def markdown(report):
             lines.append(f"{n['name']} timer lateness: NOT MEASURED (no TIMER dispatches).")
     if not bridge["process"]:
         lines.append("Bridge request to command: NOT MEASURED (no /hw/command SEND records).")
+    across = report.get("intervals_across_gaps", {}).get("bridge_request_to_command")
+    if across:
+        lines.append(f"Bridge request to command: {across} samples across a log gap "
+                     "not measured.")
     lines += ["", "## /hw/status", f"Stream: {report['status_stream'] or 'NOT MEASURED'}"]
     for field, values in report["status"].items():
         lines.append(f"- {field}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
@@ -557,8 +660,11 @@ def markdown(report):
     if report["alerts"]:
         lines += ["| Alert | Level | First active | Activations | Longest | Total | Active at end |",
                   "|---|---|---:|---:|---:|---:|---|"]
+        def timed(value):
+            # None: every active span met a log gap (alert_summary).
+            return "NOT MEASURED" if value is None else f"{value:.6g}"
         lines += [f"| {name} | {a['level']} | {a['first_active_ms']:.6g} | {a['activations']} | "
-                  f"{a['longest_ms']:.6g} | {a['total_ms']:.6g} | "
+                  f"{timed(a['longest_ms'])} | {timed(a['total_ms'])} | "
                   f"{'yes' if a['active_at_end'] else 'no'} |"
                   for name, a in report["alerts"].items()]
     else:
