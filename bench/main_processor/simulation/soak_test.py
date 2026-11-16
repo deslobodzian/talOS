@@ -1,27 +1,39 @@
-"""Soak the full simulated graph for minutes while killing and stalling nodes.
+"""Soak the bench's simulated graph for minutes while killing and stalling nodes.
+
+The subject is soak.toml: the C++ swerve_module (an actuator owner at 5 ms),
+the Python motor (an actuator owner at 20 ms), the framework teleop node (the
+operator producer of both lanes, with OperatorArming), the Python gyro
+observer, telemetry, the hardware bridge and the Studio bridge.
 
 The scripted Driver Station holds teleop for TALOS_SOAK_SECONDS (default 180,
 at most 600 so the run fits Bazel's long timeout)
 with the stick centred for 0.5 s at the start of every 3 s cycle and driving
-the rest. Each cycle, 1.8 s in, one fault is injected into a running process,
-in a seeded order (TALOS_SOAK_SEED, default 0) that cycles through every kind:
+the rest (swerve hold-to-run button 6 and drive axis 5, the motor's voltage
+axis 1). Each cycle, 1.8 s in, one fault is injected into a running process.
+The first cycle's fault is always the owner restart under a frozen producer:
+teleop is SIGSTOPped, swerve_module SIGKILLed, and teleop resumed 300 ms
+later, so the owner restarts (at once: its first crash) while its lane holds
+only targets published before the crash. Every later cycle's fault follows a
+seeded order (TALOS_SOAK_SEED, default 0) that cycles through every kind:
 SIGKILL (restarted by the launcher) or a 300 ms SIGSTOP (below the 500 ms
 progress floor, so the launcher must not restart it). The Studio bridge is
-launched too and only stalled: the launcher never restarts a stable bridge.
+launched too and only stalled, never killed.
 
 Checked from the recorded session, over the whole run:
 - every actuator owner's /hw/request gaps stay within its bridge owner
   timeout except across a fault injected into that node, and a killed owner
   sends again within RESTART_LIMIT_MS;
 - no request actuates while that node's latest Driver Station view is
-  disabled, and no drivetrain request actuates without a received active
+  disabled, and no swerve_module request actuates without a received active
   teleop target published after its latest crash and younger than
   command_timeout;
-- across a stalled driver (or hardware bridge) every drivetrain request is
+- across a stalled teleop (or hardware bridge) every swerve_module request is
   neutral from command_timeout after the newest active target (or /hw/state)
-  the drivetrain received, and the first was due on its first tick after that;
-  a stalled drivetrain is neutralized by the bridge's /hw/command within its
-  owner timeout plus a period of its last request;
+  it received, and the first was due on its first tick after that; a stalled
+  swerve_module is neutralized by the bridge's /hw/command within its owner
+  timeout plus a period of its last request;
+- swerve_module, restarted under the frozen producer, sends more than five
+  requests before the producer resumes, all neutral and at most 30 ms apart;
 - the launcher exits 0, nothing is quarantined, and each node's restart_count
   equals the number of times it was killed.
 """
@@ -33,15 +45,13 @@ from pathlib import Path
 import random
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import time
 import unittest
 import uuid
 
-import autonomous_progress
-import startup_test as support
+import support
 
 CYCLE_S = 3.0
 CENTER_S = 0.5
@@ -49,34 +59,35 @@ FAULT_AT_S = 1.8
 STALL_S = 0.3
 LEAD_S = 2.0  # disabled before and after teleop
 RESTART_LIMIT_MS = 5000
+# The restarted owner's output gap while its producer is frozen: its 5 ms
+# tick with margin, as the match rehearsal bounds it.
+RESTARTED_GAP_MS = 30
 # Teleop length cap: with startup, shutdown and log analysis the run stays
 # inside Bazel's "long" timeout (900 s).
 MAX_SOAK_S = 600
 
+DRIVE = "swerve_module"  # the C++ owner whose lane the checks follow
+PRODUCER = "teleop"  # the operator producer of every lane
+# The first cycle's fault: SIGSTOP the producer, SIGKILL the owner, resume
+# the producer STALL_S later.
+FROZEN_KILL = ("frozen_kill", DRIVE)
 # (action, node). Kills of non-critical telemetry stay under max_restarts (5)
 # per rolling minute: one kind in this list runs once per len(FAULTS) cycles.
 FAULTS = [
-    ("stop", "driver"),
-    ("kill", "drivetrain"),
+    ("stop", PRODUCER),
+    ("kill", DRIVE),
     ("stop", "hardware_node"),
     ("kill", "telemetry"),
-    ("stop", "drivetrain"),
+    ("stop", DRIVE),
     ("stop", "studio_bridge"),
-    ("kill", "driver"),
+    ("kill", PRODUCER),
     ("stop", "telemetry"),
-    ("kill", "intake"),
+    ("kill", "motor"),
     ("kill", "hardware_node"),
-    ("stop", "shooter"),
-    ("kill", "teleop"),
+    ("stop", "motor"),
 ]
-OWNERS = ("drivetrain", "intake", "shooter")
+OWNERS = (DRIVE, "motor")
 NEUTRAL = support.NEUTRAL
-
-
-def tcp_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
 
 def joystick_schedule(teleop_s):
@@ -84,11 +95,11 @@ def joystick_schedule(teleop_s):
     cycle = 0
     while cycle * CYCLE_S < teleop_s:
         start = LEAD_S + cycle * CYCLE_S
-        entries.append(f"{start:.3f}:axes=0,0,0;buttons=0;pov=-1")
-        entries.append(f"{start + CENTER_S:.3f}:axes=0,-0.6,0;buttons=5;pov=-1")
+        entries.append(f"{start:.3f}:axes=0,0,0,0,0,0;buttons=0;pov=-1")
+        entries.append(f"{start + CENTER_S:.3f}:axes=0,-0.6,0,0,0,-0.6;buttons=32;pov=-1")
         cycle += 1
-    entries.append(f"{LEAD_S + teleop_s:.3f}:axes=0,0,0;buttons=0;pov=-1")
-    return "0:axes=0,0,0;buttons=0;pov=-1|" + "|".join(entries)
+    entries.append(f"{LEAD_S + teleop_s:.3f}:axes=0,0,0,0,0,0;buttons=0;pov=-1")
+    return "0:axes=0,0,0,0,0,0;buttons=0;pov=-1|" + "|".join(entries)
 
 
 class Soak(unittest.TestCase):
@@ -151,29 +162,28 @@ class Soak(unittest.TestCase):
         self.assertTrue(CYCLE_S <= teleop_s <= MAX_SOAK_S,
                         f"TALOS_SOAK_SECONDS must be in [{CYCLE_S:.0f}, {MAX_SOAK_S}]")
         seed = int(os.environ.get("TALOS_SOAK_SEED", "0"))
-        print(f"soak: {teleop_s:.0f} s teleop, seed {seed}", flush=True)
         rng = random.Random(seed)
         root = support.workspace()
-        config_dir = root / "2026-robot/main_processor/configuration"
-        config = config_dir / "robot_physics_sim.toml"
-        robot = support.tomllib.loads((config_dir / "robot.toml").read_text())
-        timeout_ms = robot["robot"]["command_timeout_us"] / 1000
+        config = root / "bench/main_processor/simulation/soak.toml"
+        robot, subsystem_files = support.load_config(config)
+        timeout_ms = robot["command_timeout_us"] / 1000
         period_ms = {}
         owner_timeout = {}
         for name in OWNERS:
-            sub = support.tomllib.loads(
-                (config_dir / "subsystems" / f"{name}.toml").read_text())
-            period_ms[name] = sub["subsystem"].get(
-                "period_us", robot["robot"]["period_us"]) / 1000
+            sub = support.tomllib.loads(subsystem_files[name].read_text())
+            period_ms[name] = sub["subsystem"].get("period_us", robot["period_us"]) / 1000
             owner_timeout[name] = min(max(2 * period_ms[name], timeout_ms / 2), timeout_ms)
-        layout = support.device_layout(config_dir / "robot.toml")
+        # soak.toml's motor file takes its devices from motor.toml (`defaults`),
+        # so the device order is robot.toml's.
+        layout = support.device_layout(root / "bench/main_processor/configuration/robot.toml")
         motor_ids = {name: [i for i, sub, _, kind in layout
                             if sub == name and kind == "motors"] for name in OWNERS}
         drive_ids = [i for i, sub, name, kind in layout
-                     if sub == "drivetrain" and kind == "motors" and name.endswith("_drive")]
+                     if sub == DRIVE and kind == "motors" and name == "drive"]
+        self.assertEqual(len(drive_ids), 1, layout)
 
         cycles = int(teleop_s // CYCLE_S)
-        order = []
+        order = [FROZEN_KILL]
         while len(order) < cycles:
             batch = list(FAULTS)
             rng.shuffle(batch)
@@ -185,6 +195,8 @@ class Soak(unittest.TestCase):
                                     dir=os.environ.get("TEST_UNDECLARED_OUTPUTS_DIR")))
         output = tmp / "sessions"
         env = support.launcher_env(TALOS_SHM_NAMESPACE=f"soak-{uuid.uuid4().hex}")
+        print(f"soak: {teleop_s:.0f} s teleop, seed {seed}, "
+              f"TALOS_SHM_NAMESPACE={env['TALOS_SHM_NAMESPACE']}", flush=True)
         launcher = None
         stopped = None
         success = False
@@ -193,7 +205,7 @@ class Soak(unittest.TestCase):
             duration = 2 * LEAD_S + teleop_s
             args = [str(root / "talOS/launcher/launcher"), "--config", str(config),
                     "--sim", "--start-sim-gateway", "--start-studio-bridge",
-                    "--studio-http-port", str(tcp_port()),
+                    "--studio-http-port", str(support.tcp_port()),
                     "--remote", "127.0.0.1", "--remote-port", str(gw_port),
                     "--local-port", str(bridge_port), "--output-dir", str(output),
                     "--duration-s", f"{duration:.0f}"]
@@ -228,34 +240,47 @@ class Soak(unittest.TestCase):
                     at = anchor + LEAD_S + cycle * CYCLE_S + FAULT_AT_S
                     time.sleep(max(0, at - time.monotonic()))
                     self.assertIsNone(launcher.poll(), "launcher exited during soak")
-                    pid = self.read_nodes(manifest_path).get(name, {}).get("pid", 0)
-                    self.assertGreater(pid, 0, f"{name} not running at cycle {cycle}")
+                    nodes = self.read_nodes(manifest_path)
 
-                    def send(sig):
+                    def send(target, sig):
                         # A pid the manifest still lists but that has exited
                         # is a failure of the run, named, not a skip.
+                        pid = nodes.get(target, {}).get("pid", 0)
+                        self.assertGreater(pid, 0, f"{target} not running at cycle {cycle}")
                         try:
                             os.kill(pid, sig)
                         except ProcessLookupError:
-                            self.fail(f"{name} (pid {pid}) gone at cycle {cycle} "
+                            self.fail(f"{target} (pid {pid}) gone at cycle {cycle} "
                                       f"({action}, {signal.Signals(sig).name})")
+                        return pid
 
                     if action == "kill":
-                        send(signal.SIGKILL)
+                        send(name, signal.SIGKILL)
                         # Stamped after the kill: the crash bound for the
                         # fresh-target check must not precede a request the
                         # dying process sent just before it.
                         start_ns = end_ns = support.node_clock_ns()
                         kills[name] = kills.get(name, 0) + 1
+                    elif action == "frozen_kill":
+                        # Freeze the producer before killing the owner: the
+                        # restarted owner must not actuate from a lane
+                        # published before its crash.
+                        stopped = send(PRODUCER, signal.SIGSTOP)
+                        send(name, signal.SIGKILL)
+                        start_ns = support.node_clock_ns()
+                        kills[name] = kills.get(name, 0) + 1
+                        time.sleep(STALL_S)
+                        end_ns = support.node_clock_ns()
+                        os.kill(stopped, signal.SIGCONT)
+                        stopped = None
                     else:
                         # Stamped before the stop: the neutral deadline
                         # counts from no later than the stall's start.
                         start_ns = support.node_clock_ns()
-                        stopped = pid
-                        send(signal.SIGSTOP)
+                        stopped = send(name, signal.SIGSTOP)
                         time.sleep(STALL_S)
                         end_ns = support.node_clock_ns()
-                        send(signal.SIGCONT)
+                        os.kill(stopped, signal.SIGCONT)
                         stopped = None
                     events.append((action, name, start_ns, end_ns))
                     print(f"cycle {cycle}: {action} {name}", flush=True)
@@ -280,14 +305,14 @@ class Soak(unittest.TestCase):
             targets = []
             for row in self.dump(root, session, ",".join(OWNERS),
                                  "/hw/request/*,/hw/state/driver_station,"
-                                 "/drivetrain/target/teleop"):
+                                 f"/{DRIVE}/target/{PRODUCER}"):
                 name, topic = row["process"], row["topic"]
                 if topic == f"/hw/request/{name}" and row["kind"] == "SEND":
                     requests[name].append((row["now_ms"], support.motor_requests(row),
                                            row["event_ms"]))
                 elif topic == "/hw/state/driver_station" and row["kind"] == "MESSAGE":
                     ds[name].append((row["now_ms"], support.ds_snapshot(row)[0] & 4))
-                elif (name == "drivetrain" and topic == "/drivetrain/target/teleop" and
+                elif (name == DRIVE and topic == f"/{DRIVE}/target/{PRODUCER}" and
                       row["kind"] == "MESSAGE" and
                       bytes.fromhex(row["payload_hex"])[8] != 0):
                     targets.append((row["now_ms"], row["publish_ms"]))
@@ -325,13 +350,13 @@ class Soak(unittest.TestCase):
                         self.assertTrue(all(m == NEUTRAL for m in motors.values()),
                                         f"{name} active while disabled at {t:.1f} ms")
 
-            # No drivetrain actuation without a received active target,
+            # No swerve_module actuation without a received active target,
             # published after the latest crash (not retained) and younger than
             # the timeout when the request was sent, as Target::get() judges.
             target_times = [t for t, _ in targets]
             crashes = sorted(s for a, n, s, _ in events
-                             if a == "kill" and n == "drivetrain")
-            for t, motors, _ in requests["drivetrain"]:
+                             if a in ("kill", "frozen_kill") and n == DRIVE)
+            for t, motors, _ in requests[DRIVE]:
                 if all(m[0] == "neutral" for m in motors.values()):
                     continue
                 crash = crashes[bisect.bisect_right(crashes, t) - 1] if (
@@ -344,52 +369,65 @@ class Soak(unittest.TestCase):
                         fresh = True
                         break
                     j -= 1
-                self.assertTrue(fresh, f"drivetrain active without fresh target at {t:.1f} ms")
+                self.assertTrue(fresh, f"{DRIVE} active without fresh target at {t:.1f} ms")
 
-            drive_rows = requests["drivetrain"]
+            drive_rows = requests[DRIVE]
             for action, name, s, e in events:
                 what = f"{action} {name} at {s:.1f} ms"
+
+                def commands(since, until):
+                    rows = [(r["now_ms"], support.motor_requests(r)) for r in self.dump(
+                        root, session, "hardware_node", "/hw/command", since, until)
+                        if r["kind"] == "SEND"]
+                    return sorted(rows, key=lambda r: r[0])
+
+                if action == "frozen_kill":
+                    # SIGKILL loses the killed process's unflushed recording,
+                    # so pre-kill actuation is read from what the bridge sent.
+                    self.driving(commands(s - 300, s), s - 150, s, drive_ids, what)
+                    restarted = [r for r in drive_rows if s + 10 < r[0] < e]
+                    self.assertGreater(len(restarted), 5,
+                                       f"{what}: owner did not restart during the pause")
+                    self.neutral_by(drive_rows, restarted[0][0], restarted[0][0], e,
+                                    motor_ids[DRIVE], RESTARTED_GAP_MS, what)
                 if action != "stop":
                     continue
                 # Each stall is judged from the input it starves, as recorded,
                 # not from the harness's SIGSTOP: the last target (or State)
                 # can precede the stop by a producer tick or more.
-                if name == "driver":
+                if name == PRODUCER:
                     self.driving(drive_rows, s - 150, s, drive_ids, what)
                     # The lane expires a timeout after the newest active
-                    # target the drivetrain received before the resume.
+                    # target the owner received before the resume.
                     newest = max((p for r, p in targets if r < e), default=None)
                     self.assertIsNotNone(newest, f"{what}: no active target received")
                     self.neutral_from(drive_rows, newest + timeout_ms, e,
-                                      motor_ids["drivetrain"], owner_timeout["drivetrain"],
-                                      period_ms["drivetrain"], what)
+                                      motor_ids[DRIVE], owner_timeout[DRIVE],
+                                      period_ms[DRIVE], what)
                 elif name == "hardware_node":
                     self.driving(drive_rows, s - 150, s, drive_ids, what)
                     # robot_enabled() turns false a timeout after the
-                    # publication of the newest /hw/state the drivetrain
+                    # publication of the newest /hw/state the owner
                     # received before the resume.
                     states = [r["publish_ms"] for r in self.dump(
-                        root, session, "drivetrain", "/hw/state", s - 300, e)
+                        root, session, DRIVE, "/hw/state", s - 300, e)
                         if r["kind"] == "MESSAGE" and r["now_ms"] < e]
                     self.assertTrue(states, f"{what}: no /hw/state received")
                     self.neutral_from(drive_rows, max(states) + timeout_ms, e,
-                                      motor_ids["drivetrain"], owner_timeout["drivetrain"],
-                                      period_ms["drivetrain"], what)
-                elif name == "drivetrain":
-                    commands = [(r["now_ms"], support.motor_requests(r)) for r in self.dump(
-                        root, session, "hardware_node", "/hw/command", s - 300, e + 300)
-                        if r["kind"] == "SEND"]
-                    commands.sort(key=lambda r: r[0])
-                    self.driving(commands, s - 150, s, drive_ids, what)
-                    # The bridge times the drivetrain out an owner timeout
-                    # after it read the last request, on its 1 ms check; it
-                    # does not record that read, so a drivetrain period past
-                    # the request's send covers the read and the check.
+                                      motor_ids[DRIVE], owner_timeout[DRIVE],
+                                      period_ms[DRIVE], what)
+                elif name == DRIVE:
+                    sent = commands(s - 300, e + 300)
+                    self.driving(sent, s - 150, s, drive_ids, what)
+                    # The bridge times the owner out an owner timeout after
+                    # it read the last request, on its 1 ms check; it does
+                    # not record that read, so an owner period past the
+                    # request's send covers the read and the check.
                     last = drive_rows[bisect.bisect_left(
                         [r[0] for r in drive_rows], e) - 1][0]
-                    self.neutral_by(commands, s, last + owner_timeout["drivetrain"] +
-                                    period_ms["drivetrain"], e, motor_ids["drivetrain"],
-                                    owner_timeout["drivetrain"], what)
+                    self.neutral_by(sent, s, last + owner_timeout[DRIVE] +
+                                    period_ms[DRIVE], e, motor_ids[DRIVE],
+                                    owner_timeout[DRIVE], what)
             success = True
         finally:
             if stopped is not None:
@@ -405,7 +443,6 @@ class Soak(unittest.TestCase):
                         pass
                 launcher.wait(timeout=10)
             (tmp / "bazel-bin").unlink(missing_ok=True)
-            autonomous_progress.remove(env["TALOS_SHM_NAMESPACE"])
             if success:
                 shutil.rmtree(tmp)
             else:

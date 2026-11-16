@@ -1,0 +1,24 @@
+# The soak's graph (soak_test.py): robot_physics_sim.toml (the bench with
+# the Python motor owner at 20 ms, the C++ swerve_module at 5 ms, the Python
+# gyro observer, teleop and telemetry, against the physics simulator) plus a
+# [studio] table, so the launcher can supervise the Studio bridge
+# (--start-studio-bridge). Config load refuses a nested include, so this file
+# includes robot.toml and repeats robot_physics_sim.toml's overrides; keep
+# them alike. Devices, CAN ids and buses are robot.toml's, unchanged.
+include = "../configuration/robot.toml"
+
+[robot]
+# The physics gateway's config: the launcher and hardware_node refuse it
+# without --sim.
+simulation_only = true
+
+# The soak passes --studio-http-port, and the test's runfiles hold
+# //studio:web_dist under bazel-bin/ of its working directory.
+[studio]
+bridge = "//studio/bridge:studio_bridge"
+webroot = "bazel-bin/studio/dist"
+topic = "/talos/telemetry"
+
+[[subsystems]]
+name = "motor"
+path = "../configuration/subsystems/motor_py.toml"
