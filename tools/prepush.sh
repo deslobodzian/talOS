@@ -24,7 +24,8 @@
 # or set an upstream); the steps still run, and the run exits 1.
 # Steps, in order: read-only, source-lints (tools/source_lints.sh, the
 # lints CI's "Source lints (no Bazel)" job runs: test time, links,
-# requirement trace, node test matrix; under a second), format
+# requirement trace, node test matrix, and commissioning against format's
+# base, not run when format checks every file; under a second), format
 # (tools/format.sh --check: clang-format 18 on the C/C++ files changed since
 # the merge base with origin/main, else with the upstream, else every file;
 # CI's clang-format job checks the same branch diff; FAILED also when
@@ -274,15 +275,8 @@ run_step read-only python3 "$tools/make_sources_read_only.py" || {
   exit 1
 }
 
-# CI's source lints, from the commit's own script (CI runs the same one).
-if [ -f "$wt/tools/source_lints.sh" ]; then
-  run_step source-lints bash tools/source_lints.sh || true
-else
-  no_tool source-lints tools/source_lints.sh
-fi
-
-# CI's clang-format and clang-tidy check a topic branch's whole diff against
-# its merge base with main; so do these, through the commit's own
+# CI's clang-format, clang-tidy and commissioning lint check a topic
+# branch's whole diff against its merge base with main; so do these, through the commit's own
 # tools/format.sh and tools/tidy.sh (which take that merge base). Without
 # origin/main, the diff is the upstream's; without either, every file.
 if main_ref="$(git -C "$repo" rev-parse --verify --quiet refs/remotes/origin/main)"; then
@@ -294,6 +288,19 @@ elif [ -n "$upstream" ]; then
 else
   diff_base=(--all)
   report "format and tidy check every file (no origin/main and no upstream)"
+fi
+
+# CI's source lints, from the commit's own script (CI runs the same one).
+# Its commissioning lint diffs against format's base; with none, it does
+# not run.
+if [ -f "$wt/tools/source_lints.sh" ]; then
+  lint_base=()
+  [ "${diff_base[0]}" = --base ] && lint_base=("${diff_base[@]}")
+  # The `+` form: bash 3.2 (macOS) rejects an empty array under set -u.
+  run_step source-lints bash tools/source_lints.sh \
+    ${lint_base[@]+"${lint_base[@]}"} || true
+else
+  no_tool source-lints tools/source_lints.sh
 fi
 if [ -f "$wt/tools/format.sh" ]; then
   run_step format bash tools/format.sh --check "${diff_base[@]}" || true
