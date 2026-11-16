@@ -244,6 +244,54 @@ class NewSubsystemTest(unittest.TestCase):
             self.assertEqual(len(set(buttons)), 3, buttons)
 
     # REQ-DEV-01
+    def test_next_creates_a_missing_simulation_config_that_resolves(self):
+        # A talOS robot with no simulation config: `Next:` says to create
+        # one and prints its whole text and the command that generates its
+        # manifest. Done as printed, the config includes the robot's, holds
+        # the new subsystem beside the robot's own, and is the one the
+        # printed graph check names.
+        with tempfile.TemporaryDirectory() as root:
+            configuration = "bot/main_processor/configuration"
+            for path, text in (
+                    ("BUILD", ""),
+                    ("robot.toml",
+                     '[robot]\nname = "bot"\n\n[[subsystems]]\n'
+                     'name = "teleop"\npath = "subsystems/teleop.toml"\n'),
+                    ("subsystems/teleop.toml",
+                     '[subsystem]\nname = "teleop"\n'
+                     'node = "//talOS/teleop:node"\n')):
+                os.makedirs(os.path.dirname(
+                    os.path.join(root, configuration, path)), exist_ok=True)
+                with open(os.path.join(root, configuration, path), "w",
+                          encoding="utf-8") as f:
+                    f.write(text)
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, BUILD_WORKSPACE_DIRECTORY=root), \
+                    contextlib.redirect_stdout(out):
+                status = new_subsystem.main(
+                    ["wrist", "--robot", "bot", "--lang", "py"])
+            steps = out.getvalue()
+            self.assertEqual(status, 0, steps)
+            (created,) = re.findall(r"To see it move in simulation, create "
+                                    r"(\S+),", steps)
+            self.assertFalse(os.path.exists(os.path.join(root, created)))
+            text = steps.split("gains zero:\n")[1].split(
+                "\n  and generate its manifest")[0]
+            with open(os.path.join(root, created), "w",
+                      encoding="utf-8") as f:
+                f.write(textwrap.dedent(text) + "\n")
+            (sync,) = re.findall(r"bazel run //tools:sync_manifest -- (\S+)$",
+                                 steps, re.M)
+            self.assertEqual(sync, created)
+            new_subsystem.sync_manifest.write(root, sync)
+            self.assertEqual(
+                new_subsystem.sync_manifest.check(root, created), "", steps)
+            subsystems, _ = new_subsystem.sync_manifest.effective(root,
+                                                                 created)
+            self.assertLessEqual({"teleop", "wrist"}, set(subsystems))
+            self.assertIn(f"--config $PWD/{created} --describe-only", steps)
+
+    # REQ-DEV-01
     def test_talos_names_its_robots_when_none_is_given(self):
         # Inside talOS no robot is the default: without --robot (or
         # --standalone) the scaffold is refused, naming the robot
