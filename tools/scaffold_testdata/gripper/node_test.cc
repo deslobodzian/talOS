@@ -113,7 +113,10 @@ TEST_F(GripperTest, DisabledRobotGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 3, the node's `state` still published, `enabled`
+// false, once its lane is stale. The neutral request is the devices flush's
+// (Target::get returns no target: REQ-SAFE-41, proved in talOS/devices), not
+// this node's evidence.
 TEST_F(GripperTest, StaleLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -125,7 +128,9 @@ TEST_F(GripperTest, StaleLaneGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());  // state keeps publishing
 }
 
-// REQ-SAFE-07
+// Matrix case 4: the node keeps running when its lane is released. The neutral
+// request is the devices flush's (Target::get returns no target: REQ-SAFE-41,
+// proved in talOS/devices), not this node's evidence.
 TEST_F(GripperTest, ReleasedLaneGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -136,7 +141,10 @@ TEST_F(GripperTest, ReleasedLaneGoesNeutral) {
   EXPECT_EQ(Request(), Mode::kNeutral);
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 5, the node's `state` published, `enabled`
+// false, while no target was ever sent. The neutral request is the devices
+// flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(GripperTest, NeverSentGoesNeutral) {
   Teleop();
   sim.step(60ms);
@@ -144,7 +152,9 @@ TEST_F(GripperTest, NeverSentGoesNeutral) {
   EXPECT_FALSE(Latest().enabled());
 }
 
-// REQ-SAFE-07
+// Matrix case 6: the node keeps running once the Driver Station view is stale.
+// The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(GripperTest, DriverStationLossGoesNeutral) {
   Teleop();
   Hold(30.0, 40ms);
@@ -182,7 +192,9 @@ TEST_F(GripperTest, NonFiniteDemandGoesNeutral) {
 
 // matrix: n/a 9 (the gripper reads no parameters)
 
-// REQ-SAFE-07
+// REQ-SAFE-07: matrix case 10, the current mode's lane drives the node end to
+// end through its Target; the other mode's lane going neutral is the
+// flush's (REQ-SAFE-41).
 TEST_F(GripperTest, OtherModesLaneIsIgnored) {
   Teleop();
   Hold(30.0, 40ms, "auto");  // autonomous's lane, live, in teleop
@@ -199,7 +211,9 @@ TEST_F(GripperTest, OtherModesLaneIsIgnored) {
   EXPECT_DOUBLE_EQ(request.demand, 20.0);
 }
 
-// REQ-SAFE-09
+// Matrix case 11: the node drives again on a target of the current generation.
+// Refusing the earlier one is Target's and the flush's (REQ-SAFE-09 in
+// talOS/devices/target_test.cc, and REQ-SAFE-41).
 TEST_F(GripperTest, EarlierGenerationTargetIsIgnored) {
   Teleop();
   Hold(30.0, 40ms);

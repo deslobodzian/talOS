@@ -150,7 +150,10 @@ TEST_F(SwerveModuleTest, DisabledRobotGoesNeutral) {
   EXPECT_TRUE(State().drive_connected());
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 3, the node's `state` reports no mode and no
+// source once its lane is stale, the robot still enabled. The neutral request
+// is the devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(SwerveModuleTest, StaleLaneGoesNeutral) {
   hw.set_cancoder(kNode, "encoder", -0.2, 0.0);
   Enable();
@@ -164,7 +167,10 @@ TEST_F(SwerveModuleTest, StaleLaneGoesNeutral) {
   EXPECT_DOUBLE_EQ(State().encoder_absolute_position_rot(), -0.2);
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 4, the node's `state` reports no mode and no
+// source after a release. The neutral request is the devices flush's
+// (Target::get returns no target: REQ-SAFE-41, proved in talOS/devices), not
+// this node's evidence.
 TEST_F(SwerveModuleTest, ReleasedLaneGoesNeutral) {
   Enable();
   Send(Drive(5.0, 0.0));
@@ -174,7 +180,10 @@ TEST_F(SwerveModuleTest, ReleasedLaneGoesNeutral) {
   Neutral();
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 5, the node's `state` reports no mode and no
+// source while no target was ever sent. The neutral request is the devices
+// flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(SwerveModuleTest, NeverSentGoesNeutral) {
   Enable();
   sim.step(50ms);
@@ -182,7 +191,10 @@ TEST_F(SwerveModuleTest, NeverSentGoesNeutral) {
   EXPECT_TRUE(State().enabled());
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 6, the node's `state` reports no mode and no
+// source once the Driver Station view is stale. The neutral request is the
+// devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+// talOS/devices), not this node's evidence.
 TEST_F(SwerveModuleTest, DriverStationLossGoesNeutral) {
   Enable();
   Send(Drive(5.0, 0.0));
@@ -260,7 +272,10 @@ TEST(SwerveModuleParameters, BadParameterFailsConstruction) {
   }
 }
 
-// REQ-SAFE-07
+// REQ-CONTRACT-25: matrix case 10, the node's `state` reports no mode and no
+// source for another mode's lane, and for its own lane in a mode whose policy
+// lists none. The neutral request is the devices flush's (Target::get returns
+// no target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(SwerveModuleTest, OtherModesLaneIsIgnored) {
   Enable();
   // The bench policy lists teleop's lane in teleop and none in autonomous.
@@ -277,7 +292,10 @@ TEST_F(SwerveModuleTest, OtherModesLaneIsIgnored) {
   Neutral();
 }
 
-// REQ-SAFE-09
+// REQ-CONTRACT-25: matrix case 11, the node's `state` reports no mode and no
+// source for an earlier generation's target, and it drives again on the current
+// one. The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
 TEST_F(SwerveModuleTest, EarlierGenerationTargetIsIgnored) {
   Enable();
   Send(Drive(5.0, 0.0));

@@ -279,7 +279,9 @@ TEST(PositionMechanism, DisabledRobotGoesNeutral) {
   EXPECT_EQ(arm.mech().phase(), PositionPhase::kReady);
 }
 
-// REQ-SAFE-07: no live target is stop(): neutral, never the old goal.
+// Matrix case 3: no live target is stop(), and the mechanism reports no goal.
+// The neutral request is the devices flush's (Target::get returns no
+// target: REQ-SAFE-41, proved in talOS/devices).
 // REQ-SAFE-36
 TEST(PositionMechanism, StaleLaneGoesNeutral) {
   Rig arm{"arm"};

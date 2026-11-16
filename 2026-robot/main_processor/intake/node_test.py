@@ -111,7 +111,10 @@ class IntakeTest(unittest.TestCase):
         self.assertNeutral(Inhibit.GATEWAY_NOT_READY)
         self.assertFalse(self.state().enabled)  # state keeps publishing
 
-    # REQ-SAFE-07
+    # REQ-CONTRACT-25: matrix case 3, the node's `state` reports TARGET_STALE
+    # and no requested velocity once its lane is stale. The neutral request is
+    # the devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+    # talOS/devices), not this node's evidence.
     def test_stale_lane_goes_neutral(self):
         self.teleop()
         self.hold(25.0)
@@ -121,7 +124,10 @@ class IntakeTest(unittest.TestCase):
         self.sim.step(0.1)
         self.assertNeutral(Inhibit.TARGET_STALE)
 
-    # REQ-SAFE-07
+    # REQ-CONTRACT-25: matrix case 4, the node's `state` reports TARGET_STALE
+    # and no requested velocity after a release. The neutral request is the
+    # devices flush's (Target::get returns no target: REQ-SAFE-41, proved in
+    # talOS/devices), not this node's evidence.
     def test_released_lane_goes_neutral(self):
         self.teleop()
         self.hold(25.0)
@@ -130,13 +136,18 @@ class IntakeTest(unittest.TestCase):
         self.sim.step(0.02)
         self.assertNeutral(Inhibit.TARGET_STALE)
 
-    # REQ-SAFE-07
+    # REQ-CONTRACT-25: matrix case 5, the node's `state` reports TARGET_STALE
+    # and no requested velocity while no target was ever sent. The neutral
+    # request is the devices flush's (Target::get returns no
+    # target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
     def test_never_sent_goes_neutral(self):
         self.teleop()
         self.sim.step(0.06)
         self.assertNeutral(Inhibit.TARGET_STALE)
 
-    # REQ-SAFE-07
+    # Matrix case 6: the node keeps running once the Driver Station view is
+    # stale. The neutral request is the devices flush's (Target::get returns no
+    # target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
     def test_driver_station_loss_goes_neutral(self):
         self.teleop()
         self.hold(25.0)
@@ -212,7 +223,9 @@ class IntakeTest(unittest.TestCase):
 
     # matrix: n/a 9 (the intake reads no parameters: its devices are config)
 
-    # REQ-SAFE-07
+    # REQ-SAFE-07: matrix case 10, the current mode's lane drives the node end
+    # to end through its Target; the other mode's lane going neutral is the
+    # flush's (REQ-SAFE-41).
     def test_other_modes_lane_is_ignored(self):
         self.teleop()
         self.hold(25.0, source="auto")  # autonomous's lane, live, in teleop
@@ -228,7 +241,10 @@ class IntakeTest(unittest.TestCase):
         self.assertEqual(applied.mode, talos.Mode.VELOCITY)
         self.assertEqual(applied.demand, 15.0)
 
-    # REQ-SAFE-09
+    # REQ-CONTRACT-25: matrix case 11, the node's `state` reports TARGET_STALE
+    # for an earlier generation's target, and it drives again on the current
+    # one. The neutral request is the devices flush's (Target::get returns no
+    # target: REQ-SAFE-41, proved in talOS/devices), not this node's evidence.
     def test_earlier_generation_target_is_ignored(self):
         self.teleop()
         self.hold(25.0)
