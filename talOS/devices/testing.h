@@ -134,7 +134,10 @@ class SimHardware {
   // so its handle reads connected() == false. A motor or CAN sensor carries
   // what the gateway publishes for a device that stopped answering
   // (hardware::MarkInvalid of its last readings: ages and temperature kept,
-  // every measurement zero, limit switches released); any other device
+  // every measurement zero, limit switches released), except that a motor's
+  // temperature reads 0 from the State 500 ms after the last one that read
+  // it connected (0 at once if none did), as the RoboRIO reports a stale
+  // temperature signal; any other device
   // carries zero values. Every device
   // of that node named `device` is affected, whatever its kind; an unknown
   // name throws std::invalid_argument.

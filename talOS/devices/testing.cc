@@ -103,6 +103,13 @@ struct SimHardware::Impl {
   };
   std::map<std::string, RequestTracker> requests;
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
+  // Per motor, the sim time (µs) of the latest State that read it
+  // connected: when its temperature signal last updated.
+  std::map<std::uint16_t, std::uint64_t> temperature_read_us;
+  // PhoenixBackend::Read reports a temperature signal 500 ms old or older
+  // as 0 (Fresh(temperature, 500_ms), controller_processor/rio/src/main/
+  // cpp/PhoenixBackend.cpp:975); the RoboRIO program alone names the bound.
+  static constexpr std::uint64_t kTemperatureMaxAgeUs = 500'000;
   // Devices reset and not yet restored, with the States they stay masked
   // for; `masked` adds the chain restored with them: followers of a masked
   // motor and motors fed by a masked remote CANcoder. The RoboRIO reports a
@@ -445,10 +452,19 @@ struct SimHardware::Impl {
     // device that stopped answering: its last readings through
     // hardware::MarkInvalid (ages and temperature kept, every measurement
     // zero). Its limit switches read released, as Phoenix reports a stale
-    // FaultField.
+    // FaultField, and its temperature reads 0 once its signal is
+    // kTemperatureMaxAgeUs old, as PhoenixBackend reports a stale one.
+    const std::uint64_t sampled_us = Micros(sim.now());
     fill(state.motors, state.motor_count, hw.motors, [&](const auto& c) {
       const bool connected = Connected(Kind::kMotor, c.id);
-      const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
+      MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
+      if (connected) {
+        temperature_read_us[c.id] = sampled_us;
+      } else if (const auto read = temperature_read_us.find(c.id);
+                 read == temperature_read_us.end() ||
+                 sampled_us - read->second >= kTemperatureMaxAgeUs) {
+        axis.temperature_c = 0;  // never read, or too old
+      }
       hardware::MotorSample sample{
           .id = c.id,
           .valid = true,
