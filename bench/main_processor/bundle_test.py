@@ -26,7 +26,10 @@ table names; one that does not is asked for Studio with
 --start-studio-bridge and must describe without a bridge rather than fail on
 its absence. Every Python node's venv runs its runtime's one interpreter,
 which its bundle holds once under python/<repository>/. The boot service
-stops the session through the launcher alone. Install's refusal of a graph
+stops the session through the launcher alone. Only the deployable bundle's
+manifest lacks `testonly = true`, which makes deploy.sh install refuse the
+others outside a Bazel test (bundle_builder_test proves the refusal), so
+they are installed inside TEST_TMPDIR. Install's refusal of a graph
 its launcher refuses is install_check_test's; install's warm-up is
 warm_up_test's."""
 
@@ -161,13 +164,20 @@ class BundleTest(unittest.TestCase):
         r = runfiles.Create()
         for name in BUNDLES:
             # deploy.sh installs read-only, so cleanup cannot remove it all;
-            # Bazel clears TEST_TMPDIR.
+            # Bazel clears TEST_TMPDIR. Inside it, since deploy.sh installs a
+            # test-only bundle nowhere else.
             with self.subTest(name), tempfile.TemporaryDirectory(
+                    dir=os.environ["TEST_TMPDIR"],
                     ignore_cleanup_errors=True) as tmp:
                 src = r.Rlocation(f"_main/{name}")
                 self.assertTrue(src and os.path.isdir(src), src)
                 with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
                     manifest = tomllib.load(f)
+                # REQ-OPS-53: only the deployable bundle is not testonly, and
+                # each manifest says which, for deploy.sh install to refuse.
+                self.assertEqual(manifest.get("testonly", False),
+                                 name != "bench/main_processor/bench_bundle",
+                                 name)
                 studio = manifest.get("studio")
                 prefix = os.path.join(tmp, "prefix")
                 if studio:

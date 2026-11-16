@@ -581,6 +581,29 @@ stop_install() {
   exit "$1"
 }
 
+# --- test-only bundles -------------------------------------------------------
+# A testonly talos_bundle (one that may carry testonly nodes, test fixtures)
+# writes `testonly = true` in its bundle_manifest.toml's top table
+# (talOS/build/bundle_builder.py). Install refuses such a bundle before
+# writing anything, unless the prefix lies inside the directory TEST_TMPDIR
+# names and TEST_TARGET is set, as Bazel sets both for a test: the tests that
+# install their fixture bundles do so there, and a stale TEST_TMPDIR left
+# exported in a robot's shell is not enough. There is no flag to override it.
+refuse_testonly() {
+  local bundle="$1" manifest="$1/bundle_manifest.toml"
+  [ -f "$manifest" ] || return 0
+  awk '/^\[/ { exit } $0 == "testonly = true" { found = 1 } END { exit !found }' \
+    "$manifest" || return 0
+  if [ -n "${TEST_TMPDIR:-}" ] && [ -n "${TEST_TARGET:-}" ] && python3 -c '
+import os, sys
+test, prefix = map(os.path.realpath, sys.argv[1:])
+sys.exit(os.path.commonpath([test, prefix]) != test)
+' "$TEST_TMPDIR" "$PREFIX"; then
+    return 0
+  fi
+  die "$bundle is a test-only bundle (its bundle_manifest.toml says testonly = true: a testonly talos_bundle, which may carry test fixtures); install refuses it outside a Bazel test (TEST_TMPDIR and TEST_TARGET), so nothing was written to $PREFIX; install the robot's own bundle"
+}
+
 # --- install ---------------------------------------------------------------
 # Copies the bundle (copy_bundle), warms it in place, checks its graph and
 # flips `current` atomically, keeping `previous` for rollback. Selects only a
@@ -595,6 +618,7 @@ stop_install() {
 cmd_install() {
   local bundle="${1:?usage: deploy.sh install <bundle> [--prefix DIR]}"
   [ -x "$bundle/run.sh" ] || die "not a bundle (no executable run.sh): $bundle"
+  refuse_testonly "$bundle"
   # PID-suffixed: two installs in the same second must not share a dir.
   local stamp; stamp="$(date +%Y%m%d_%H%M%S)_$$"
   local dest="$PREFIX/bundles/$stamp"

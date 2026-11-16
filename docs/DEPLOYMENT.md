@@ -65,7 +65,7 @@ It writes the bundle directory `bazel-bin/<package>/<name>/`
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
 | `config/` | the robot config and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
-| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
+| `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; from a `testonly` `talos_bundle`, `testonly = true` ([install](#on-the-main-processor) refuses it); with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
 
 The bundle holds no symlinks. Bazel may restore a tree artifact from its
 disk or remote cache with each symlink in it replaced by a copy of its
@@ -156,7 +156,15 @@ the repository, or `talos/` as a submodule):
 `../talos/tools/deploy.sh install bazel-bin/robot_bundle`.
 A relative `--prefix` is resolved against the working directory.
 
-- **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
+- **install** refuses a test-only bundle, one whose `bundle_manifest.toml`
+  says `testonly = true` (a `talos_bundle` with `testonly = True`, which may
+  carry test fixtures), before writing anything: it exits 1 with
+  `deploy: error: <bundle> is a test-only bundle ...`. There is no override
+  flag. The one exception is how talOS's own tests install their fixture
+  bundles: install accepts a test-only bundle when `TEST_TARGET` is set and
+  the prefix lies inside the directory `TEST_TMPDIR` names, as Bazel sets
+  both for a test. Otherwise it
+  copies the bundle to `<prefix>/bundles/<stamp>/` (read-only),
   checks that the copy has an executable `run.sh`, runs
   `sync`, [warms the copy](#warm-up), [checks its graph](#graph-check),
   retains `previous`, and atomically replaces `current` using a temporary
