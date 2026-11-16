@@ -1406,6 +1406,23 @@ std::vector<std::string> GraphErrors(const std::string& graph) {
   return errors;
 }
 
+// A node that calls talos::AllowUntargetedOutputs only when it is not
+// describing gives the lint a probe without the opt-out, so the run's live
+// hardware request, which carries it, differs from the probe's. The same
+// opt-out described openly is no mismatch.
+// REQ-SAFE-42, REQ-CONTRACT-11
+TEST(LauncherGraphTest, AnOptOutTheProbeDidNotDescribeIsAnEndpointMismatch) {
+  auto described = Sender("/hw/request/alpha", 64);
+  described.flags = introspect::naming::kSourceFlagHardwareRequest;
+  auto opted_out = described;
+  opted_out.flags |= introspect::naming::kSourceFlagUntargetedOutputs;
+
+  const std::string hidden = EndpointMismatch({described}, {opted_out});
+  EXPECT_NE(hidden.find("/hw/request/alpha"), std::string::npos) << hidden;
+  EXPECT_NE(hidden.find("untargeted_outputs"), std::string::npos) << hidden;
+  EXPECT_EQ(EndpointMismatch({opted_out}, {opted_out}), "");
+}
+
 // TOOLS-3: a launch before the build finds no binaries. That is one refusal
 // carrying the build command for every missing node, not one "did not
 // answer" per node; a binary that exists but does not answer keeps its own.
