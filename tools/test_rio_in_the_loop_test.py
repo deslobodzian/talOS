@@ -1,9 +1,10 @@
 """Tests for tools/test_rio_in_the_loop.py's subject config.
 
-REQ-SAFE-16, REQ-SAFE-17, REQ-SAFE-18: the RoboRIO-in-the-loop run judges
-the subject on the robot's own settings. subject_config narrows the bench
-config to the subject's subsystem by text; it must keep every robot table,
-and refuse a table it does not know rather than drop it unseen.
+REQ-DEV-06: the RoboRIO-in-the-loop run (the real RoboRIO program against
+the Bazel-built bridge and node) judges the subject on the robot's own
+settings. subject_config narrows the bench config to the subject's
+subsystem by text; it must keep every robot table, and refuse a table it
+does not know rather than drop it unseen.
 """
 
 import os

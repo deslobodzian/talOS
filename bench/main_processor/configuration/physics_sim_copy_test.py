@@ -41,8 +41,9 @@ def overrides(path):
 
 
 class PhysicsSimCopyTest(unittest.TestCase):
-    # REQ-OPS-36, REQ-OPS-49: drive_browser_test's evidence for them is
-    # taken on the bench's simulated graph, not a drifted copy of it.
+    # REQ-CONTRACT-19: a config derived from another fails a test when it
+    # goes stale, as a manifest does; here drive_browser_test's config
+    # against the bench's simulated graph it copies.
     def test_copies_repeat_the_physics_sim_overrides(self):
         r = runfiles.Create()
         want = overrides(r.Rlocation(PHYSICS))
