@@ -173,6 +173,9 @@ constexpr double kSimNeutralCoastTauS = 1.0;
 // Friction holds a nearly-stopped unpowered rotor instead of creeping forever
 // (same standstill snap as StepAxis).
 constexpr double kSimNeutralStandstillRps = 0.01;
+// The slowest a master's output status signal may run under a Phoenix
+// Follower ("no slower than 20 Hz", controls/Follower.hpp).
+constexpr double kFollowerSignalMinHz = 20.0;
 // RioLog kMessage indices (rate-limit keys) of this file's lines; Robot.cpp
 // uses 1 to 6. A licence refusal's line is keyed by its motor (16 to 31),
 // so the logger coalesces no motor's line into another's.
@@ -507,7 +510,14 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
     signals_.push_back(&motor->GetFaultField(false));
     signals_.push_back(&motor->GetDeviceTemp(false));
     signals_.push_back(&motor->GetSupplyCurrent(false));
-    for (int i = 0; i < 7; ++i) signal_ids_.push_back(m.id);
+    // A follower copies its master's output signal (MotorVoltage above for
+    // voltage-based requests, DutyCycle for duty-cycle ones), which the rate
+    // loop below keeps at kFollowerSignalMinHz or more for a master.
+    if (std::any_of(c.motors.begin(), c.motors.end(), [&m](const auto& other) {
+          return other.master_id == m.id;
+        }))
+      signals_.push_back(&motor->GetDutyCycle(false));
+    signal_ids_.resize(signals_.size(), m.id);
     motors_.push_back(std::move(motor));
   }
   // FOC needs a Phoenix Pro licence, and so does a follower of a foc master,
@@ -602,6 +612,18 @@ bool PhoenixBackend::Configure(const hw::Config& c) {
           signal == &motor.GetFaultField(false))
         hz = std::min(hz, 50.0);
       if (signal == &motor.GetDeviceTemp(false)) hz = std::min(hz, 4.0);
+      // Phoenix's Follower (controls/Follower.hpp) updates the follower's
+      // output at the rate of its master's output signal, which must be no
+      // slower than 20 Hz; a status_hz as slow as config load allows (8 Hz
+      // at the 500 ms timeout) or OptimizeBusUtilization's 4 Hz would not
+      // be. TorqueCurrent is not needed: no motor with a follower runs
+      // torque-current requests (config load).
+      const bool master = std::any_of(
+          c.motors.begin(), c.motors.end(),
+          [&m](const auto& other) { return other.master_id == m.id; });
+      if (master && (signal == &motor.GetMotorVoltage(false) ||
+                     signal == &motor.GetDutyCycle(false)))
+        hz = std::max(hz, kFollowerSignalMinHz);
     }
     for (const auto& s : c.sensors) {
       if (s.id != id) continue;
