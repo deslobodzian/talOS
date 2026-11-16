@@ -72,8 +72,8 @@ enum class TickPhase : uint8_t {
   // encoding that snapshot as its packet. The refresh, the snapshot and the
   // mode report are that thread's, outside every phase.
   kDriverStation,
-  // The loop's: the watchdog beat, the companion report, the config
-  // persister's tick.
+  // The loop's: the console's checks (LoopConsole), the watchdog beat, the
+  // companion report, the config persister's tick.
   kLoop,
   kCount,
 };

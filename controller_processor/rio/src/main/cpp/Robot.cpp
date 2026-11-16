@@ -14,6 +14,7 @@
 
 #include "ConfigStore.h"
 #include "DriverStationReader.h"
+#include "LoopConsole.h"
 #include "LoopSchedule.h"
 #include "PhoenixBackend.h"
 #include "RioBuild.h"
@@ -61,8 +62,9 @@ constexpr const char* kConfigPath = "/home/lvuser/talos_config.bin";
 constexpr const char* kConfigPath = "talos_config.bin";
 #endif
 
-// RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7 and
-// 8 are PhoenixBackend's (configure failure, CAN bus status, CAN bus reader).
+// RioLog kMessage indices (rate-limit keys) of this file's reports; 0, 7, 8
+// and 16 to 31 are PhoenixBackend's (configure failure, CAN bus status, CAN
+// bus reader, licence refusals), 9 and up LoopConsole's.
 constexpr uint16_t kSocketMessage = 1;
 constexpr uint16_t kPersistMessage = 2;
 constexpr uint16_t kSocketOpenMessage = 3;
@@ -375,6 +377,9 @@ void Robot::StartCompetition() {
   // the reader's thread.
   talos::driver_station::ModeTracker ds_mode;
 
+  // Posts the loop's findings no State carries to the logger (LoopConsole.h).
+  talos::rio::LoopConsole loop_console{*log_};
+
   // Tick starts, so the logger can report a loop woken late (starved of the
   // CPU) even when each tick's own work is short.
   std::optional<uint64_t> previous_tick_start_us;
@@ -583,6 +588,10 @@ void Robot::StartCompetition() {
       // The socket retry and the gateway's tick.
       log_->ClosePhase(TickPhase::kLink, NowNs());
     }
+
+    // A console line for each command expiry this tick found: no State
+    // reaches the main processor when its loss caused the expiry.
+    loop_console.ObserveGateway(*gateway_);
 
     // Arms the watchdog only while a command is in force (a tick without one
     // neutralized every output itself), with the time by which this loop's

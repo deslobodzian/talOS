@@ -923,15 +923,17 @@ of the [reader](#reading-a-trial).
 | 2 | `kill -STOP <teleop pid>; sleep 0.3; kill -CONT <teleop pid>`, stick held throughout, then released and pushed again | REQ-SAFE-07, -08, -41: neutral within `command_timeout_us` (100 ms) plus one motor tick (5 ms); REQ-SAFE-13, -14 after it | 105 ms or less from the start of the teleop lane's `PAUSE` to the first `/hw/request/motor` with `kraken=neutral` (the motor's timer lateness, session B, comes on top: record it beside); no motion after `CONT` until the stick is released and pushed again (the lane reads `active: false` until then) |
 | 3 | `kill -STOP <motor pid>; sleep 0.3; kill -CONT <motor pid>`, stick held | REQ-SAFE-15: neutral at the bridge once the last request it heard is older than the owner timeout, `max(2 × 5 ms, 100 ms / 2)` = 50 ms ([the tick](../ARCHITECTURE.md#the-tick)) | from the start of the `motor` `/hw/request/motor` `PAUSE` to the first `/hw/command` with `kraken=neutral`: just over 50 ms (the bridge expires an owner only strictly past its timeout, counted from when it read the request). Pass at 50 ms plus the max of session B's `bridge request to command hardware_node enabled` row or less; record the excess. After `CONT` the motor drives again at once with the stick held: expected, the motor node has no arming (REQ-SAFE-31) |
 | 4 | `kill -9 <motor pid>`, stick held | REQ-SAFE-29 (a critical member's first crash restarts at once), REQ-SAFE-31; no time stated | record the `PAUSE` in the `motor` request stream (it reads up to about 10 ms long: a killed node's log loses its last write interval, REQ-OPS-31), the new run's first request, and its first `kraken=voltage`; the manifest shows one run ended `crash` and a new one. This trial does not test the owner timeout: the restarted node's first request reaches the bridge within it |
-| 5 | not run on this bench: it drops only the main processor's outgoing datagrams while States keep arriving, which on Linux is `tc netem`; the tree has no tested macOS counterpart | REQ-SAFE-16: the RoboRIO neutralizes within `command_timeout_us` of the State the last command was built from, plus its loop's lateness ([the tick](../ARCHITECTURE.md#the-tick)) | record "not run (macOS main processor)". Lost with it: the only trial that bounds the RoboRIO's own expiry time; paths 6 to 8 show only that the expiry happened (TODO.md BENCH-9) |
-| 6 | (C2) pull the Ethernet cable at the **Mini's** port (`en0`; the Driver Station's link, workstation to RoboRIO, stays up), stick held; then release the stick, reconnect after about 5 s, robot still enabled | REQ-SAFE-16 (bound as in 5; nothing is recorded during the outage); REQ-SAFE-13 | the motor stops; the first State after the `/hw/state` `PAUSE` has `active=False` and a higher `epoch` than the last before it; no motion on reconnect; `route -n get "$RIO"` again names `interface: en0`; record the time until control returns (session D) |
-| 7 | `kill -9 <hardware_node pid>`, stick held | REQ-SAFE-16, REQ-SAFE-29 (the bridge restarts at once) | the motor stops; unless the `/hw/state` `PAUSE` is under 100 ms, the restarted bridge's first State has `active=False` and a higher `epoch` (the pause reads up to about 10 ms long, as in 4); record whether motion resumed before the stick was released and pushed again (it does only if the Driver Station view never went stale, REQ-SAFE-13) |
-| 8 | Ctrl-C in T1, stick held, then release (the robot stays enabled, with no main processor); this ends C2 | REQ-OPS-06, REQ-SAFE-16 | the motor stops; session D's first State has `active=False` and a higher `epoch` than C2's last |
+| 5 | not run on this bench: it drops only the main processor's outgoing datagrams while States keep arriving, which on Linux is `tc netem`; the tree has no tested macOS counterpart | REQ-SAFE-16: the RoboRIO neutralizes within `command_timeout_us` of the State the last command was built from, plus its loop's lateness ([the tick](../ARCHITECTURE.md#the-tick)) | record "not run (macOS main processor)"; paths 6 to 8 read the RoboRIO's own expiry time from its console instead |
+| 6 | (C2) pull the Ethernet cable at the **Mini's** port (`en0`; the Driver Station's link, workstation to RoboRIO, stays up), stick held; then release the stick, reconnect after about 5 s, robot still enabled | REQ-SAFE-16 (bound as in 5); REQ-SAFE-13 | the motor stops; one RoboRIO console line `hardware gateway command expired: outputs neutral at [<s>.<ms>], <x> ms after its observation, ...`: pass at `<x>` of 105 ms or less (`command_timeout_us` plus one 5 ms loop period), recording `<x>` and any excess (the loop's lateness); the first State after the `/hw/state` `PAUSE` has `active=False` and a higher `epoch` than the last before it; no motion on reconnect; `route -n get "$RIO"` again names `interface: en0`; record the time until control returns (session D) |
+| 7 | `kill -9 <hardware_node pid>`, stick held | REQ-SAFE-16, REQ-SAFE-29 (the bridge restarts at once) | the motor stops; unless the `/hw/state` `PAUSE` is under 100 ms, the restarted bridge's first State has `active=False` and a higher `epoch` (the pause reads up to about 10 ms long, as in 4); when the command expired, the console's expiry line, read and passed as in 6; record whether motion resumed before the stick was released and pushed again (it does only if the Driver Station view never went stale, REQ-SAFE-13) |
+| 8 | Ctrl-C in T1, stick held, then release (the robot stays enabled, with no main processor); this ends C2 | REQ-OPS-06, REQ-SAFE-16 | the motor stops; the console's expiry line, read and passed as in 6; session D's first State has `active=False` and a higher `epoch` than C2's last |
 
-Paths 6 to 8 leave no record of the instant the RoboRIO went neutral (no
-State reaches the Mini, and the RoboRIO prints no line for an expired
-command), and stop path 5, which would bound that expiry, is not run here:
-6 to 8 check only that it happened. The Driver Station log's `companion lost: no frame for
+No State reaches the Mini during paths 6 to 8, so the instant the RoboRIO
+went neutral is its console's expiry line
+([RoboRIO](../talOS/hardware/README.md#roborio)): `[<s>.<ms>]` is the tick
+that invalidated the command, on the clock of `sample_us`, and `<x>` its
+delay from the State the command was built from, the bound stop path 5 would
+have measured. The Driver Station log's `companion lost: no frame for
 <x> s; every output is neutral` follows each loss by 0.5 s.
 
 ### Session D: relaunch and e-stop (10 min)
@@ -1067,9 +1069,7 @@ position mechanisms and rezero (REQ-SAFE-05, REQ-SAFE-36 to REQ-SAFE-38);
 VELOCITY mode under the cap (buttons 1 and 2 are not pressed); the swerve
 module (TODO.md BENCH-4); a loss of the Driver Station's own link to the
 RoboRIO ([RoboRIO program checks](#roborio-program-checks-with-a-driver-station)); a RoboRIO reboot under a running stack
-(REQ-SAFE-11); the time the RoboRIO's expiry takes, which no record shows
-when the link, the bridge or the launcher is gone and which stop path 5,
-not run on a macOS main processor, would only bound (TODO.md BENCH-9); a
+(REQ-SAFE-11); a
 cold boot without a person; and loop lateness under a match's load
 (REQ-RT-14, TODO.md PLATFORM-1): the Mini runs only the bench's six nodes.
 

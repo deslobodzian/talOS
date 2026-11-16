@@ -180,6 +180,21 @@ class Gateway {
     return (accepted_at_ < observed_at_ ? accepted_at_ : observed_at_) +
            config_.command_timeout_us;
   }
+  // The last command expiry: a Tick that found the command in force at or
+  // past command_expiry_us() (or its clock behind that command) and
+  // invalidated it. `count` is the expiries since construction, `neutral_us`
+  // that Tick's time, and `observed_us` and `accepted_us` the expired
+  // command's observation and acceptance, all on Tick's clock. Reporting
+  // only (the RoboRIO's console line); nothing in the gateway reads it.
+  struct CommandExpiry {
+    uint64_t count{};
+    uint64_t neutral_us{};
+    uint64_t observed_us{};
+    uint64_t accepted_us{};
+  };
+  const CommandExpiry& last_command_expiry() const {
+    return last_command_expiry_;
+  }
   // Precise failure behind the last rejected configuration, if the
   // backend could say more than "it failed".
   std::optional<ConfigError> config_error() const { return config_error_; }
@@ -249,6 +264,7 @@ class Gateway {
   uint32_t restore_attempt_count_{};
   uint32_t consecutive_apply_failures_{};
   uint64_t accepted_at_{}, observed_at_{};
+  CommandExpiry last_command_expiry_{};
   std::optional<ConfigError> config_error_;
 };
 }  // namespace talos::hardware

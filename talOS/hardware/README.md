@@ -665,6 +665,19 @@ socket sending again: <n> sends failed over <s> s (errno <n>[, last errno <m>])`
 raises no `SIGPIPE` on either end
 ([protocol](../protocol/README.md)).
 
+A tick that invalidates the command in force because it reached its expiry
+(`command_timeout_us` after the older of its acceptance and the State it was
+built from) prints, once per expiry, `hardware gateway command expired:
+outputs neutral at [<s>.<ms>], <x> ms after its observation, <y> ms after
+its acceptance (expiry <n>)`: that tick's time on the gateway's clock, its
+delay from the State the command was built from and from its acceptance, and
+the expiries since the program started (`Gateway::last_command_expiry()`,
+posted by `src/main/include/LoopConsole.h`). When a lost link, bridge or
+launcher caused the expiry, no State reaches the main processor and this
+line is the only record of the instant. The first expiry prints at once;
+further expiries within that second print as one line carrying the last
+one's time and the count.
+
 That loop enforces the command timeout and output neutral, so it never
 writes a report itself. `PhoenixBackend` and the adapter
 post fixed-size events (fault-field, feedback-validity, late-feedback, apply
@@ -702,7 +715,8 @@ packet's send, less the backend phases inside them (link), taking the
 Driver Station reader's latest snapshot and copying and encoding it as the
 Driver Station packet (driver station; the refresh, the snapshot and the
 mode report are the reader's, outside every phase, below), and
-the watchdog beat, companion report and config persister (loop). A tick's
+the console's checks (`LoopConsole`), watchdog beat, companion report and
+config persister (loop). A tick's
 phases sum to its work, the time the loop timing line's longest work
 measures. `PhoenixBackend` takes one
 steady-clock reading per phase boundary, ten per disabled tick, and adds
@@ -947,7 +961,7 @@ Build without deploying:
 ```sh
 cd controller_processor/rio
 ./gradlew buildRio
-./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
+./gradlew phoenixTest   # desktop tests: PhoenixBackend sim, ConfigStore, SimDriverStation, RioLog, CompanionLink, LoopWatchdog, LoopConsole, SocketRetry, LoopSchedule, CanBusHealth, DriverStationReader; and rioBuildStampTest
 ```
 
 WPILib desktop simulation (`./gradlew simulateNative`) runs the same gateway
