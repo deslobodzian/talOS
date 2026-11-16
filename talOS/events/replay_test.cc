@@ -939,9 +939,13 @@ struct PaddedEcho {
 
   void echo(const Context&, std::span<const std::byte> payload) {
     received.emplace_back(payload.begin(), payload.end());
-    std::vector<std::byte> out{payload.begin(), payload.end()};
-    out.back() = mark;
-    loop.send_message(sender, out);
+    // A Padded, whatever the payload's size: a fixed-size copy has a last
+    // byte to mark, where a copy of an empty payload would not.
+    Padded out{};
+    std::copy_n(payload.begin(), std::min(payload.size(), out.bytes.size()),
+                out.bytes.begin());
+    out.bytes.back() = mark;
+    loop.send_message(sender, std::as_bytes(std::span{&out, std::size_t{1}}));
   }
 };
 
