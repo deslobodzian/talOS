@@ -276,13 +276,19 @@ A case that does not apply is a comment in the test file naming why:
   beside a replaced glibc `malloc`; those cases skip and plain builds run
   them.
 
-Cases 2, 3 and 11 guard REQ-SAFE-02, REQ-SAFE-07 and REQ-SAFE-09. The
-framework proves the mechanism once (`talOS/devices/target_test.cc`,
-`TargetQueuedBeforeTheModeChangeIsRejectedInTheSameDrain` and its
-neighbours); a node's matrix proves the node **uses** it. A node that reads
-its lane through a plain subscription gated on `fresh()` passes every
-framework test and case 3, but fails cases 10 and 11 (and 4, if it ignores
-the envelope's `active` flag).
+For a node without the opt-out, the neutral half of the disabled, stale
+and released cases (2 to 6, 10 and 11) is the devices flush's: it sends
+every output neutral while `robot_enabled(node)` is false (REQ-SAFE-02) and
+in any tick in which none of the node's `talos::Target`s returned a target
+(REQ-SAFE-41), whatever the node's code does, and `talOS/devices` proves
+both (`devices_test.cc`, `target_test.cc`), so a node's case 2 carries no
+REQ-SAFE-02 tag. The node's own evidence is case 1, which a node that reads
+its lane through a plain subscription or a joystick fails (it never
+drives), and what each case asserts the node reports (`state` still
+published, its validity, no demand latched across the disable:
+REQ-CONTRACT-25). A node that calls `talos::AllowUntargetedOutputs` is
+not held by the flush's target gate, so for it those cases are its own
+safety evidence and must assert the applied outputs.
 
 Publish targets with `talos::testing::PublishTarget` / `sim.publish_target`,
 with `hw.enable()` and a teleop-enabled Driver Station

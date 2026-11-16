@@ -581,7 +581,9 @@ TEST_F(ElevatorAlone, DrivesAtALiveLane) {
   EXPECT_DOUBLE_EQ(Status().goal_rot(), kHighRot);
 }
 
-// REQ-SAFE-02
+// REQ-CONTRACT-25: matrix case 2, the status still published while
+// disabled, holding no goal. The neutral request is the devices flush's
+// (REQ-SAFE-02, proved in talOS/devices), not this node's evidence.
 TEST_F(ElevatorAlone, DisabledRobotGoesNeutral) {
   Drive(kHighRot, 50ms);
   ASSERT_EQ(Applied().mode, Mode::kMotionMagic);
@@ -977,7 +979,9 @@ TEST_F(IntakeAlone, DrivesAtALiveLane) {
   EXPECT_EQ(Status().state(), IntakeState::INTAKING);
 }
 
-// REQ-SAFE-02
+// REQ-CONTRACT-25: matrix case 2, the status still published while
+// disabled, back to IDLE. The neutral request is the devices flush's
+// (REQ-SAFE-02, proved in talOS/devices), not this node's evidence.
 TEST_F(IntakeAlone, DisabledRobotGoesNeutral) {
   Drive(IntakeCommand::INTAKE, 3);
   ASSERT_EQ(Applied().mode, Mode::kVoltage);

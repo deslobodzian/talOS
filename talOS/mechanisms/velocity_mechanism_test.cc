@@ -262,7 +262,9 @@ TEST_F(VelocityMechanismTest, SpinDownLimitsALiveDropButNotNeutral) {
   ExpectNeutral();
 }
 
-// REQ-SAFE-02
+// Matrix case 2: while disabled the mechanism reports itself disabled,
+// asks for nothing and is not at speed. The neutral output is the devices
+// flush's (REQ-SAFE-02, proved in talOS/devices).
 // REQ-SAFE-37
 TEST_F(VelocityMechanismTest, DisabledRobotGoesNeutral) {
   hw.ideal_motors();

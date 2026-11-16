@@ -101,7 +101,10 @@ class IntakeTest(unittest.TestCase):
                 self.assertEqual(state.roller_velocity_rps, 12.5)
                 self.assertEqual(state.beam_broken, beam)
 
-    # REQ-SAFE-02
+    # REQ-CONTRACT-25: matrix case 2, `state` still published with
+    # `enabled` false while disabled. The neutral request is the
+    # devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
+    # node's evidence.
     def test_disabled_robot_goes_neutral(self):
         self.teleop(enabled=False)
         self.hold(25.0)

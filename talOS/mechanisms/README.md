@@ -129,7 +129,7 @@ goal, no homing without a goal. It also drives nothing while
 disconnected motor, while `RollerWithSensor` reads no motor feedback and
 relies on the gateway, which neutralizes a motor whose feedback is invalid.
 It does not read a lane itself: gating on a live `Target` is the owner's call,
-as in the example above.
+as in the example above, and the devices flush enforces it too (REQ-SAFE-41).
 
 Each class allocates only in its constructor. A bad parameter throws
 `std::invalid_argument` naming `<name>.<key>` at construction.

@@ -725,7 +725,10 @@ TEST_F(DrivetrainTest, NeverSentGoesNeutral) {
   EXPECT_TRUE(State().enabled());
 }
 
-// REQ-SAFE-02
+// REQ-CONTRACT-25: matrix case 2, `state` still published with
+// `enabled == false` while disabled. The neutral request is the
+// devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
+// node's evidence.
 TEST_F(DrivetrainTest, DisabledRobotGoesNeutral) {
   Teleop();
   hw.enable(false);
