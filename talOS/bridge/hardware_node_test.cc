@@ -329,9 +329,10 @@ TEST(HardwareNodeTest, ReportsTheBusesOfAnAsynchronouslyAppliedConfiguration) {
   EXPECT_EQ(node.Status(now).can_bus_count(), 2);
 }
 
-// A RoboRIO program one protocol version behind (version 7 States carry no
-// CAN bus slot) is refused frame by frame: no State is accepted, so the link
-// stays lost, and the bridge names the version on stderr once, not per frame.
+// A RoboRIO program one protocol version behind (whose States and Commands
+// another build's codecs would misread) is refused frame by frame: no State
+// is accepted, so the link stays lost and nothing is commanded, and the
+// bridge names the version on stderr once, not per frame.
 // REQ-CONTRACT-01
 TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
@@ -369,6 +370,7 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
   const std::string err = ::testing::internal::GetCapturedStderr();
   ASSERT_TRUE(delivered);
   EXPECT_EQ(node.states_received(), 0u);
+  EXPECT_EQ(node.commands_sent(), 0u);
   EXPECT_TRUE(node.Status(1'000'000).alert_error_link_lost());
   const std::string version =
       "protocol " + std::to_string(protocol::kProtocolVersion - 1);

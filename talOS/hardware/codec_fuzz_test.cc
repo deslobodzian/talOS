@@ -84,6 +84,9 @@ TEST(HardwareCodecFuzzTest, BoundedMutations) {
       command.count = kMaxMotors;
       command.digital_output_count = kMaxDigitalOutputs;
       command.pwm_output_count = kMaxPwmOutputs;
+      // A pulse of 0 beside outputs that send no pulse (every other request
+      // is value-initialized off).
+      command.pwm_outputs[1] = {1, PwmMode::kPulse, 0.0};
       state.motor_count = kMaxMotors;
       state.sensor_count = kMaxSensors;
       state.digital_input_count = kMaxDigitalInputs;

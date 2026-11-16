@@ -512,10 +512,7 @@ class PhysicsSimBackend final : public Backend {
       state.encoders[i] = {id, true, pos, vel, 0};
     }
     for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
-      const auto id = config_.pwm_outputs[i].id;
-      const auto it = pwm_outputs_.find(id);
-      state.pwm_outputs[i] = {id, true,
-                              it != pwm_outputs_.end() ? it->second : 0.0};
+      state.pwm_outputs[i] = PwmSampleOf(GetPwm(config_.pwm_outputs[i].id));
     }
     return healthy;
   }
@@ -529,12 +526,12 @@ class PhysicsSimBackend final : public Backend {
   bool ApplyOutputs(std::span<const DigitalOutputRequest> digital_outputs,
                     std::span<const PwmRequest> pwm_outputs) override {
     for (const auto& d : digital_outputs) digital_outputs_[d.id] = d.value;
-    for (const auto& p : pwm_outputs) pwm_outputs_[p.id] = p.output;
+    for (const auto& p : pwm_outputs) pwm_outputs_[p.id] = p;
     return true;
   }
 
   // Safe-state policy mirrors SimBackend: every output type turns off on
-  // disable, command timeout, and failure (motors to kNeutral, PWM to 0,
+  // disable, command timeout, and failure (motors to kNeutral, PWM off,
   // digital outputs de-energized). Neutral removes drive but does NOT zero
   // the rotors: they decay per brake/coast. Use RestartController
   // to zero motion state.
@@ -696,9 +693,10 @@ class PhysicsSimBackend final : public Backend {
     const auto it = digital_outputs_.find(id);
     return it != digital_outputs_.end() ? it->second : false;
   }
-  double GetPwm(uint16_t id) const {
+  // As SimBackend::GetPwm: off ({.id = id}) when none since Neutral().
+  PwmRequest GetPwm(uint16_t id) const {
     const auto it = pwm_outputs_.find(id);
-    return it != pwm_outputs_.end() ? it->second : 0.0;
+    return it != pwm_outputs_.end() ? it->second : PwmRequest{.id = id};
   }
 
  private:
@@ -1103,7 +1101,7 @@ class PhysicsSimBackend final : public Backend {
   std::unordered_map<uint16_t, bool> digital_outputs_{};
   std::unordered_map<uint16_t, double> analog_inputs_{};
   std::unordered_map<uint16_t, ManualEncoder> encoders_{};
-  std::unordered_map<uint16_t, double> pwm_outputs_{};
+  std::unordered_map<uint16_t, PwmRequest> pwm_outputs_{};
   // By motor name; SetLocalMotorTypes.
   std::unordered_map<std::string, MotorType> local_motor_types_{};
   // SetHomeSwitches, and those of them config_ names, by index.

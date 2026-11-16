@@ -90,6 +90,7 @@ struct Mech {
     if (b_motion_magic) b.set_motion_magic(*b_motion_magic);
     if (led_on) led.set(*led_on);
     if (servo_out) servo.set(*servo_out);
+    if (servo_stop) servo.stop();
     enabled_in_update = robot_enabled(node);
   }
 
@@ -105,6 +106,7 @@ struct Mech {
 
   std::optional<double> a_velocity, b_motion_magic, servo_out;
   std::optional<bool> led_on;
+  bool servo_stop = false;
   bool enabled_in_update = false;
 };
 
@@ -330,7 +332,8 @@ TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kNeutral);
 }
 
-// REQ-SAFE-03: DIO and PWM go neutral while disabled or after requests stop
+// REQ-SAFE-03: DIO goes false and PWM off (no pulse) while disabled or after
+// requests stop
 TEST(Devices, DigitalAndPwmOutputsNeutralizeWhileDisabledOrStale) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -339,15 +342,15 @@ TEST(Devices, DigitalAndPwmOutputsNeutralizeWhileDisabledOrStale) {
   mech.servo_out = 0.75;
   sim.step(10ms);
   EXPECT_FALSE(hw->digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw->pwm("mech", "servo"), 0);
+  EXPECT_EQ(hw->pwm("mech", "servo"), std::nullopt);
   hw->enable();
   sim.step(10ms);
   EXPECT_TRUE(hw->digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw->pwm("mech", "servo"), 0.75);
+  EXPECT_EQ(hw->pwm("mech", "servo"), 0.75);
   hw->enable(false);
   sim.step(10ms);
   EXPECT_FALSE(hw->digital_output("mech", "led"));
-  EXPECT_DOUBLE_EQ(hw->pwm("mech", "servo"), 0);
+  EXPECT_EQ(hw->pwm("mech", "servo"), std::nullopt);
   hw->enable();
   sim.step(10ms);
   hw.reset();
@@ -360,32 +363,56 @@ TEST(Devices, DigitalAndPwmOutputsNeutralizeWhileDisabledOrStale) {
   ASSERT_EQ(last_command.digital_output_count, 1);
   ASSERT_EQ(last_command.pwm_output_count, 1);
   EXPECT_FALSE(last_command.digital_outputs[0].value);
-  EXPECT_DOUBLE_EQ(last_command.pwm_outputs[0].output, 0);
+  EXPECT_EQ(last_command.pwm_outputs[0],
+            hardware::PwmRequest{.id = last_command.pwm_outputs[0].id});
 }
 
-TEST(Devices, PwmClampsFiniteOutputsWithoutRejectingMotorCommands) {
+// REQ-SAFE-03: in a tick that drives, a finite set() pulses, clamped to
+// [-1, 1], and 0 is the centre pulse; stop() and a non-finite set() send no
+// pulse. None of them touches the motor command beside it.
+TEST(Devices, PwmPulsesOnlyForAFiniteSetAndStopSendsNoPulse) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
   SimHardware hw{sim};
   hw.enable();
   mech.a_velocity = 10;
-  for (const auto& [output, expected] :
-       {std::pair{2.0, 1.0}, std::pair{-2.0, -1.0}, std::pair{0.25, 0.25},
-        std::pair{std::numeric_limits<double>::infinity(), 0.0},
-        std::pair{std::numeric_limits<double>::quiet_NaN(), 0.0}}) {
-    SCOPED_TRACE(output);
-    mech.servo_out = output;
+  struct Case {
+    const char* label;
+    std::optional<double> set;
+    bool stop;
+    std::optional<double> pulse;  // nullopt: no pulse
+  };
+  constexpr double kInf = std::numeric_limits<double>::infinity();
+  constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+  for (const auto& [label, set, stop, pulse] :
+       {Case{"above range", 2.0, false, 1.0},
+        Case{"below range", -2.0, false, -1.0},
+        Case{"in range", 0.25, false, 0.25}, Case{"centre", 0.0, false, 0.0},
+        Case{"stop", {}, true, {}}, Case{"infinite", kInf, false, {}},
+        Case{"NaN", kNaN, false, {}}, Case{"set then stop", 0.5, true, {}}}) {
+    SCOPED_TRACE(label);
+    mech.servo_out = set;
+    mech.servo_stop = stop;
     sim.step(10ms);
-    EXPECT_DOUBLE_EQ(hw.pwm("mech", "servo"), expected);
+    EXPECT_EQ(hw.pwm("mech", "servo"), pulse);
+    EXPECT_EQ(hw.applied_pwm("mech", "servo"), pulse);
     EXPECT_EQ(hw.motor_request("mech", "a").mode, Mode::kVelocity);
     EXPECT_DOUBLE_EQ(hw.motor_request("mech", "a").demand, 10);
     const auto command = LastCommand(sim);
     ASSERT_TRUE(command.has_value());
     ASSERT_EQ(command->pwm_output_count, 1);
-    EXPECT_DOUBLE_EQ(command->pwm_outputs[0].output, expected);
+    const hardware::PwmRequest& request = command->pwm_outputs[0];
+    hardware::PwmRequest expected{.id = request.id};
+    if (pulse) {
+      expected.mode = hardware::PwmMode::kPulse;
+      expected.output = *pulse;
+    }
+    EXPECT_EQ(request, expected);
   }
 }
 
+// REQ-SAFE-03: an output update() did not set is omitted from the request,
+// and the bridge applies it neutral
 TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -411,6 +438,8 @@ TEST(Devices, DigitalAndPwmOutputsRideAlongOnlyWhenSet) {
   }
   EXPECT_EQ(command->digital_output_count, 0);
   EXPECT_EQ(command->pwm_output_count, 0);
+  // The bridge applies an omitted PWM output as no pulse.
+  EXPECT_EQ(hw.applied_pwm("mech", "servo"), std::nullopt);
 }
 
 TEST(Devices, MotorHealthFeedbackRoundTripsWithoutEnablingOutputs) {
@@ -1048,6 +1077,17 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
     void update() {}
     DigitalOutput led;
   };
+  // stop() is an output setter too: no pulse from the constructor would
+  // still be a command outside update().
+  struct EagerServo {
+    explicit EagerServo(Node& node) : servo{node, "servo"} { servo.stop(); }
+    void update() {}
+    PwmOutput servo;
+  };
+  {
+    auto sim = Sim::FromToml(kRobotToml);
+    EXPECT_THROW(sim.add<EagerServo>("mech"), std::logic_error);
+  }
   {
     auto sim = Sim::FromToml(kRobotToml);
     sim.add<Pulser>("mech");

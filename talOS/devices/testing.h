@@ -165,21 +165,26 @@ class SimHardware {
   void stop_driver_station();
 
   // Raw outputs: the last value explicitly requested for each device
-  // (neutral, false and 0 before any). Timeout, omission from a later
-  // request, and disable do not change these inspection values.
+  // (neutral, false and no pulse before any). Timeout, omission from a later
+  // request, and disable do not change these inspection values. A PWM
+  // output's is the pulse its last request asked for (0 is the centre
+  // pulse), nullopt when that request asked for no pulse or none carried it.
   hardware::MotorRequest motor_request(std::string_view node,
                                        std::string_view device) const;
   bool digital_output(std::string_view node, std::string_view device) const;
-  double pwm(std::string_view node, std::string_view device) const;
+  std::optional<double> pwm(std::string_view node,
+                            std::string_view device) const;
 
   // Applied outputs after per-node expiry, the gateway's merged-observation
   // check, omitted-output neutralization and the enabled gate. Inspecting
-  // outputs never refreshes a request.
+  // outputs never refreshes a request. A PWM output's is nullopt while it
+  // sends no pulse, its neutral.
   hardware::MotorRequest applied_motor(std::string_view node,
                                        std::string_view device) const;
   bool applied_digital_output(std::string_view node,
                               std::string_view device) const;
-  double applied_pwm(std::string_view node, std::string_view device) const;
+  std::optional<double> applied_pwm(std::string_view node,
+                                    std::string_view device) const;
 
  private:
   struct Impl;

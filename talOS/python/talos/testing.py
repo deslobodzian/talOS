@@ -340,11 +340,13 @@ class SimHardware:
             self._handle, _abi.encode(node), _abi.encode(device))))
 
     def pwm(self, node, device):
-        """Last explicitly requested PWM value (0 before any)."""
+        """The pulse the last request carrying this PWM output asked for (0
+        is the centre pulse), None when it asked for no pulse or none
+        carried it."""
         out = ctypes.c_double()
-        _abi.ok(lib.talos_sim_hardware_pwm(self._handle, _abi.encode(node),
-                                           _abi.encode(device), out))
-        return out.value
+        pulsing = _abi.ok(lib.talos_sim_hardware_pwm(
+            self._handle, _abi.encode(node), _abi.encode(device), out))
+        return out.value if pulsing else None
 
     def applied_motor(self, node, device):
         """Applied (mode, demand, ff_volts, slot), after expiry/neutral gates."""
@@ -360,11 +362,12 @@ class SimHardware:
             self._handle, _abi.encode(node), _abi.encode(device))))
 
     def applied_pwm(self, node, device):
-        """Applied PWM value, 0 on expiry, omission or disable."""
+        """Applied PWM pulse; None (no pulse) on expiry, omission, disable,
+        stop() or a non-finite set."""
         out = ctypes.c_double()
-        _abi.ok(lib.talos_sim_hardware_applied_pwm(
+        pulsing = _abi.ok(lib.talos_sim_hardware_applied_pwm(
             self._handle, _abi.encode(node), _abi.encode(device), out))
-        return out.value
+        return out.value if pulsing else None
 
     def _set(self, function, node, device, *values):
         _abi.ok(function(self._handle, _abi.encode(node), _abi.encode(device),

@@ -8,7 +8,7 @@ import ctypes
 import os
 import threading
 
-_EXPECTED_ABI_VERSION = 33
+_EXPECTED_ABI_VERSION = 34
 _LIBRARIES = ("libtalos_node_testing.so", "libtalos_node.so")
 
 c_int32, c_int64, c_uint32, c_uint64 = (
@@ -226,6 +226,7 @@ _SIGNATURES = {
     "talos_gyro_zeroed": (c_int32, [c_void_p, c_int64]),
     "talos_digital_output_set": (c_int32, [c_void_p, c_int64, c_int32]),
     "talos_pwm_set": (c_int32, [c_void_p, c_int64, c_double]),
+    "talos_pwm_stop": (c_int32, [c_void_p, c_int64]),
     "talos_motor_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_sensor_sample": (c_int32, [c_void_p, c_int64, _P(Sample)]),
     "talos_motor_time": (c_int32, [c_void_p, c_int64, c_int32, _P(c_int64)]),

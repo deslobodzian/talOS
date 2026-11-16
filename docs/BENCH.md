@@ -269,6 +269,30 @@ mapping.
 Fault validity is separate from a false fault value. Sample time in this state
 is the node observation time; acquisition ages use the mapped hardware clock.
 
+### PWM output: no pulse when off (hardware only)
+
+The bench has no PWM device and no node that drives one, so this check is
+recorded "not run" until a servo (or an oscilloscope) is on RoboRIO PWM 0.
+Only hardware shows that an output that is off sends no pulse on the FPGA
+and that a pulse of 0 is 1.5 ms; `phoenixTest` proves it only on the
+simulated HAL.
+
+- [ ] Add `[pwm_outputs.servo] channel = 0` to a fixture subsystem whose
+  node (`period_us` at most 25 ms) reads its target lane with `talos::Target`
+  and sets the servo to 0.5 for one target value, to 0.0 for another, and
+  leaves it unset otherwise; map joystick 0 buttons 3 and 4 to those two
+  targets in `[teleop]`. (A node that read the joystick itself would have no
+  live target, so the flush would hold its output off whatever it set.)
+  Expected, enabled in teleop: no button, no pulse (a flat line)
+  and the servo turns freely by hand; button 3, a pulse wider than 1.5 ms,
+  the servo moves and holds; button 4, a 1.5 ms pulse, the servo centred and
+  holding; release, no pulse and the servo where it was, not centred (most
+  servos go limp without a pulse; some digital ones hold their last position).
+  Hold button 3 and `kill -STOP` the node: no pulse within about 55 ms (the
+  50 ms owner timeout, then the next gateway tick); `kill -CONT`, release,
+  then hold button 3 again and disable: no pulse. Record the pulse widths
+  and the stop time.
+
 ## Fault injection and timing
 
 Use the launcher's recorded PIDs (or Studio's system view); never signal an

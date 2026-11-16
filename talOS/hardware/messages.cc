@@ -67,6 +67,13 @@ struct Reader {
   }
   bool Done() const { return ok && pos == data.size(); }
 };
+// A PWM request off or a pulse, and off in its one encoding: mode 0 and
+// output +0.0 (all eight bytes zero), so off and a pulse of 0 never read as
+// each other.
+bool PwmRequestCanonical(const PwmRequest& p) {
+  return p.mode <= kLastPwmMode &&
+         (p.mode != PwmMode::kOff || std::bit_cast<uint64_t>(p.output) == 0);
+}
 }  // namespace
 std::size_t Encode(const Command& c, std::span<uint8_t> data) {
   if (c.count > kMaxMotors || c.digital_output_count > kMaxDigitalOutputs ||
@@ -96,7 +103,9 @@ std::size_t Encode(const Command& c, std::span<uint8_t> data) {
   }
   for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
     const auto& p = c.pwm_outputs[i];
+    if (!PwmRequestCanonical(p)) return 0;
     w.Int(p.id, 2);
+    w.Int(static_cast<uint8_t>(p.mode), 1);
     w.Real(p.output);
   }
   return w.ok ? w.pos : 0;
@@ -134,7 +143,9 @@ bool Decode(std::span<const uint8_t> data, Command& out) {
   for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
     auto& p = c.pwm_outputs[i];
     p.id = r.Int(2);
+    p.mode = static_cast<PwmMode>(r.Int(1));
     p.output = r.Real();
+    if (!PwmRequestCanonical(p)) return false;
   }
   if (!r.Done()) return false;
   out = c;

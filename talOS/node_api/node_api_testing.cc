@@ -45,6 +45,13 @@ const SimHardware& AsHardware(const TalosSimHardware* hw) {
   return *reinterpret_cast<const SimHardware*>(hw);
 }
 
+// A PWM inspection as the ABI returns it: 1 with `out` the pulse, or 0 with
+// `out` 0 when the output sends no pulse.
+int32_t Pulse(std::optional<double> pulse, double& out) {
+  out = pulse.value_or(0.0);
+  return pulse.has_value() ? 1 : 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -426,8 +433,9 @@ int32_t talos_sim_hardware_pwm(const TalosSimHardware* hw, const char* node,
                                const char* device, double* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out == nullptr) throw std::invalid_argument("null output");
-    *out = AsHardware(hw).pwm(NonNull(node, "node"), NonNull(device, "device"));
-    return TALOS_OK;
+    return Pulse(
+        AsHardware(hw).pwm(NonNull(node, "node"), NonNull(device, "device")),
+        *out);
   });
 }
 
@@ -464,9 +472,9 @@ int32_t talos_sim_hardware_applied_pwm(const TalosSimHardware* hw,
                                        double* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     if (out == nullptr) throw std::invalid_argument("null output");
-    *out = AsHardware(hw).applied_pwm(NonNull(node, "node"),
-                                      NonNull(device, "device"));
-    return TALOS_OK;
+    return Pulse(AsHardware(hw).applied_pwm(NonNull(node, "node"),
+                                            NonNull(device, "device")),
+                 *out);
   });
 }
 

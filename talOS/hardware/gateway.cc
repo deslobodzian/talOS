@@ -13,8 +13,9 @@ namespace talos::hardware {
 namespace {
 // Whether `c` addresses exactly the configured outputs, in manifest order, and
 // drives none of them: motors neutral with zero demand and feedforward, digital
-// outputs off, PWM outputs zero. The bridge forwards this merge while every
-// node's devices layer flushes neutral.
+// outputs off, PWM outputs sending no pulse (a pulse of 0 is the centre pulse,
+// which drives). The bridge forwards this merge while every node's devices
+// layer flushes neutral.
 bool DrivesNothing(const Command& c, const Config& config) {
   if (c.count != config.motors.size() ||
       c.digital_output_count != config.digital_outputs.size() ||
@@ -36,7 +37,7 @@ bool DrivesNothing(const Command& c, const Config& config) {
   }
   for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
     if (c.pwm_outputs[i].id != config.pwm_outputs[i].id ||
-        c.pwm_outputs[i].output != 0) {
+        c.pwm_outputs[i].mode != PwmMode::kOff) {
       return false;
     }
   }
@@ -619,10 +620,13 @@ bool Gateway::Accept(const Command& c, uint64_t sequence, uint64_t now) {
       return false;
     }
   }
+  // Off is applied as off whatever its output (decode admits only +0.0); a
+  // pulse must be finite and within [-1, 1].
   for (std::size_t i = 0; i < c.pwm_output_count; ++i) {
     const auto& p = c.pwm_outputs[i];
-    if (p.id != config_.pwm_outputs[i].id || !std::isfinite(p.output) ||
-        p.output < -1.0 || p.output > 1.0) {
+    if (p.id != config_.pwm_outputs[i].id || p.mode > kLastPwmMode ||
+        (p.mode == PwmMode::kPulse &&
+         (!std::isfinite(p.output) || p.output < -1.0 || p.output > 1.0))) {
       ++state_.counters.rejected_command_count;
       return false;
     }

@@ -211,6 +211,17 @@ Besides motors and CAN sensors, the manifest accepts RIO digital inputs and
 outputs, analog inputs, quadrature and duty-cycle encoders, and PWM outputs.
 Phoenix and both sims implement all of them.
 
+A PWM output's request is off or a pulse (`PwmMode`, `messages.h`). Off sends
+no pulse (`PWM::SetDisabled`): a servo goes limp and a PWM motor controller
+sees no signal. A pulse is `output` on `PWM::SetSpeed`'s scale, -1 to +1,
+where 0 is the 1.5 ms centre pulse that centres a servo and holds a PWM motor
+controller at neutral. Off is the PWM output's neutral, as `kNeutral` is a
+motor's: the bridge sends it for an output its owner's request omits, after
+the owner timeout and when a transition invalidates the cached requests, and
+the gateway's own neutral turns every PWM output off. A pulse that is not
+finite or lies outside -1 to +1 rejects the whole command. A State's PWM
+sample reads 0 while its output sends no pulse.
+
 CAN bus load and measured sensor age must be checked on the actual bus before
 choosing production frequencies. Motion feedback requests the manifest status
 rate; motor voltage, stator current and fault field request
@@ -327,7 +338,7 @@ demands/feedforward neutralize only that motor. Per-boot counters report refused
 commands, neutralized motors, apply failures, and device resets. The refused
 count omits two refusals of an all-neutral command (every motor neutral with
 zero demand and feedforward, every digital output off, every PWM output
-zero): a current one while the gateway is disabled, uncommissioned or
+off): a current one while the gateway is disabled, uncommissioned or
 unconfigured, since the bridge keeps forwarding those while the robot cannot
 drive; and one that passes every other check but carries an earlier epoch
 while no command is in force, since the bridge built it from a State read
@@ -873,11 +884,9 @@ the reported voltage as its motor supply: a duty-cycle demand applies that
 fraction of it (0.5 is 6.4 V at rest), while voltage and closed-loop modes are
 clamped to `max_voltage` (12 V when unset) and the motor models keep their 12 V
 free-speed and stall ratings. Health is observable while disabled
-or without a live command. On the real backend, the gateway's own neutral (disabled, expired command,
-watchdog) disables PWM pulses (`PWM::SetDisabled`) and de-energizes DIO. A PWM
-output that a node did not set, or that the bridge neutralized for a silent
-owner, while the robot stays enabled is commanded 0 instead (`SetSpeed(0)`, a
-1.5 ms pulse): neutral for a motor controller, centre for a servo.
+or without a live command. Both keep each PWM output's last request
+(`GetPwm`, off when there is none) and read an output that sends no pulse as
+0, as the RoboRIO's `PWM::GetSpeed()` does after `SetDisabled`.
 
 | | Ideal (`SimBackend`) | Physics-backed (`sim::PhysicsSimBackend`) |
 |---|---|---|

@@ -63,6 +63,9 @@ class Backend {
   // through BeginRestoreAfterReset(). Backends whose sends cannot fail per
   // device return an empty span.
   virtual std::span<const uint16_t> ApplyFailedDevices() const = 0;
+  // Each PWM request, in config order, is off (PwmMode::kOff: stop the
+  // output's pulse) or a pulse (kPulse: `output` in [-1, 1], 0 the centre);
+  // the gateway has refused any other. Neutral() turns every PWM output off.
   virtual bool ApplyOutputs(
       std::span<const DigitalOutputRequest> /*digital_outputs*/,
       std::span<const PwmRequest> /*pwm_outputs*/) {

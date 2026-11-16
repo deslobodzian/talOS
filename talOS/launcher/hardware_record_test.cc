@@ -53,6 +53,9 @@ period_us = 10000
 [subsystems.shooter.motors.flywheel]
 type = "TalonFX"
 can_id = 2
+
+[subsystems.shooter.pwm_outputs.hood]
+channel = 0
 )";
 
 std::vector<std::byte> Record(const talos::hardware::Packet& packet) {
@@ -269,7 +272,10 @@ TEST_F(HardwareRecordTest, StateNamesItsCanBusSlotFromTheRunConfig) {
 }
 
 // After a match the per-motor demand and the applied output, current, faults
-// and limit bits must be readable by device name, not by byte offset.
+// and limit bits must be readable by device name, not by byte offset, and a
+// PWM request says whether it pulsed (a pulse of 0 centres a servo) or sent
+// no pulse.
+// REQ-OPS-15
 TEST_F(HardwareRecordTest, StateAndCommandNameDevicesOfTheRunConfig) {
   ASSERT_EQ(HardwareRecordOf("/hw/state", "talos.hardware.Packet"),
             HardwareRecord::kState);
@@ -315,6 +321,9 @@ TEST_F(HardwareRecordTest, StateAndCommandNameDevicesOfTheRunConfig) {
   command.motors[0] = {flywheel_, talos::hardware::Mode::kVelocity, 1, 40.0,
                        0.5};
   command.motors[1] = {drive_, talos::hardware::Mode::kNeutral, 0, 0.0, 0.0};
+  const std::uint16_t hood = config_.pwm_outputs.at(0).id;
+  command.pwm_output_count = 1;
+  command.pwm_outputs[0] = {hood, talos::hardware::PwmMode::kPulse, 0.0};
   const auto command_json = Members(
       HardwareRecordJson(HardwareRecord::kCommand, Encoded(command), &names_));
   motor = Find(command_json.at("motors"), "name", "\"flywheel\"");
@@ -325,6 +334,15 @@ TEST_F(HardwareRecordTest, StateAndCommandNameDevicesOfTheRunConfig) {
   EXPECT_EQ(motor["feedforward_v"], "0.5");
   EXPECT_EQ(Find(command_json.at("motors"), "name", "\"drive\"")["mode"],
             "\"neutral\"");
+  auto pwm = Find(command_json.at("pwm_outputs"), "name", "\"hood\"");
+  EXPECT_EQ(pwm["mode"], "\"pulse\"");
+  EXPECT_EQ(pwm["output"], "0");
+  command.pwm_outputs[0] = {.id = hood};
+  pwm = Find(Members(HardwareRecordJson(HardwareRecord::kCommand,
+                                        Encoded(command), &names_))
+                 .at("pwm_outputs"),
+             "name", "\"hood\"");
+  EXPECT_EQ(pwm["mode"], "\"off\"");
 
   // A packet of another config (edited since the match) keeps ids only.
   command.config_id += 1;

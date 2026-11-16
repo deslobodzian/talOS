@@ -1132,9 +1132,17 @@ bool PhoenixBackend::ApplyOutputs(
        i < digital_outputs.size() && i < digital_outputs_.size(); ++i) {
     digital_outputs_[i]->Set(digital_outputs[i].value);
   }
+  // Off is the output's neutral, no pulse; SetSpeed(0) would be the 1.5 ms
+  // centre pulse, which drives a servo to its centre. The gateway has refused
+  // any other mode.
   for (std::size_t i = 0; i < pwm_outputs.size() && i < pwm_outputs_.size();
        ++i) {
-    pwm_outputs_[i]->SetSpeed(pwm_outputs[i].output);
+    const auto& request = pwm_outputs[i];
+    if (request.mode == hw::PwmMode::kPulse) {
+      pwm_outputs_[i]->SetSpeed(request.output);
+    } else {
+      pwm_outputs_[i]->SetDisabled();
+    }
   }
   return true;
 }

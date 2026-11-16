@@ -473,6 +473,39 @@ class DevicesTest(unittest.TestCase):
                 with self.assertRaises(talos.TalosError):
                     accessor("lift", "missing")
 
+    # REQ-SAFE-03: PwmOutput.set(0.0) is the centre pulse and stop() no pulse
+    # (None), and stop() outside update() raises naming the device
+    def test_pwm_stop_sends_no_pulse_and_set_zero_is_the_centre(self):
+        class Servo:
+            def __init__(self, node):
+                talos.allow_untargeted_outputs(node)
+                self.servo = talos.PwmOutput(node, "servo")
+                self.stop = False
+
+            def update(self):
+                if self.stop:
+                    self.servo.stop()
+                else:
+                    self.servo.set(0.0)
+
+        sim = Sim.from_toml(ROBOT_TOML + """
+[subsystems.lift.pwm_outputs.servo]
+channel = 0
+""")
+        servo = sim.add(Servo, "lift")
+        with self.assertRaisesRegex(talos.TalosError,
+                                    r"'servo'.*outside update\(\)"):
+            servo.servo.stop()
+        hw = SimHardware(sim)
+        hw.enable()
+        sim.step(0.03)
+        self.assertEqual(hw.pwm("lift", "servo"), 0.0)
+        self.assertEqual(hw.applied_pwm("lift", "servo"), 0.0)
+        servo.stop = True
+        sim.step(0.03)
+        self.assertIsNone(hw.pwm("lift", "servo"))
+        self.assertIsNone(hw.applied_pwm("lift", "servo"))
+
     def test_signal_acquisition_times_preserve_unequal_ages(self):
         class Signals:
             def __init__(self, node):

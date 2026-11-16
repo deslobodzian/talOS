@@ -61,13 +61,13 @@ A node belongs to the thread that builds it, which also runs its loop (a
 `Sim` builds and steps its nodes on the calling thread). Sends (`send` on a
 publisher, byte topic or `TargetLane`, and `release`) and device commands
 (`Motor` setters, `stop` and `rezero`, `Gyro.rezero`, `DigitalOutput.set`,
-`PwmOutput.set`) are accepted only there: in the constructor, `update()`,
+`PwmOutput.set` and `stop`) are accepted only there: in the constructor, `update()`,
 `every()` and message callbacks. From any other thread they throw
 `std::logic_error` (`TalosError` in Python, whose C calls release the GIL), so
 a worker thread hands its results to `update()` instead.
 
 Output commands (`Motor` setters and `stop`, `DigitalOutput.set`,
-`PwmOutput.set`) are narrower: they are accepted only inside `update()`. The
+`PwmOutput.set` and `stop`) are narrower: they are accepted only inside `update()`. The
 flush after each `update()` sends neutral for every output that `update()` did
 not set, so a command from the constructor, `every()` or a callback would
 reach the hardware for at most one tick (a 20 ms `every()` on a 5 ms node
@@ -259,7 +259,7 @@ Handles are named by their device key in the subsystem config
 | C++ | Python |
 |---|---|
 | `talos::Motor m{node, "roller"}`: `set_duty_cycle`, `set_voltage`, `set_velocity`, `set_position`, `set_motion_magic` (`ff_volts`, `slot`), `stop`; `position()`, `velocity()`, `voltage()`, `current()` (stator A), `temperature_c()`, `supply_current_a()`, `connected()`, `clamped_count()`, `forward_limit()`, `reverse_limit()` | `talos.Motor(node, "roller")`, getters as properties; demands/feedforward clamp to configured limits, non-finite input neutralizes the motor; `clamped_count` counts adjusted setter calls |
-| `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`) | same names; `DigitalInput.value`; DIO/PWM commands, like motor commands, are gated on `robot_enabled` and a live `Target` (false/zero while disabled, while state is stale, and in a tick in which no `Target` returned a target: see [Targets](#targets)). A PWM zero is a 1.5 ms pulse, neutral for a motor controller but centre for a servo: while the robot is enabled a `PwmOutput` has no "no pulse" state, so a servo that must go limp or hold when its target is released is not safe on one ([hardware](../talOS/hardware/README.md)) |
+| `CANcoder`, `Gyro` (`yaw`, `yaw_rate`), `Encoder`, `DigitalInput` (`get()`), `AnalogInput` (`voltage()`), `DigitalOutput`, `PwmOutput` (`set()`, `stop()`) | same names; `DigitalInput.value`; DIO/PWM commands, like motor commands, are gated on `robot_enabled` and a live `Target` (false/off while disabled, while state is stale, and in a tick in which no `Target` returned a target: see [Targets](#targets)). A PWM output's neutral is off, no pulse: a servo goes limp and a PWM motor controller sees no signal. `set(0.0)` is the 1.5 ms centre pulse, which holds a motor controller at neutral but drives a servo to centre, so it counts as actuation; `stop()`, a non-finite `set()` and not setting it in `update()` send no pulse |
 | `talos::DriverStation ds{node}`: `connected()`, `enabled()`, `autonomous()`, `teleop()`, `test()`, `estop()`, `alliance()`, `match_time()`, `joystick(port)` → `axis(i)`, `button(n)` (1-based), `pov(i)` | `talos.DriverStation(node)`, same as properties/methods |
 | `talos::robot_enabled(node)` | `talos.robot_enabled(node)` |
 | `talos::AllowUntargetedOutputs(node)` (constructor only; a test or bench fixture with no producer): outputs drive on `robot_enabled` alone, and `--describe` marks the hardware request `untargeted_outputs` | `talos.allow_untargeted_outputs(node)` (in `__init__`; later raises `TalosError`) |
@@ -442,11 +442,12 @@ if (arming_.evaluate(/*neutral=*/!held) && held) {
 only in a tick in which `robot_enabled(node)` holds and one of the node's
 `Target`s returned a target from a `get()` (or `source()`) made during that
 `update()`. Anything else sends every motor neutral, every digital output
-false and every PWM output 0, and the request still goes out: a node that
+false and every PWM output off (no pulse), and the request still goes out: a node that
 drives straight from a joystick, a plain subscription or a target it kept
 from an earlier tick never moves, nor does one that asks its `Target` only
 in `every()` or a callback. The first such tick of each enabled spell in
-which `update()` set an output non-neutral prints one line on the node's stderr naming
+which `update()` set an output non-neutral (a PWM output to any pulse, 0
+included) prints one line on the node's stderr naming
 it. While such ticks last, Studio's system view shows the node's card
 `driven by none · outputs held: no live target` (a node that sets nothing
 shows only `none`), within a registry refresh (250 ms); it clears at the
@@ -603,7 +604,9 @@ new gateway boot id; every output neutral until a request built from it),
 `LatestTarget<M>(sim, sub, source)` reads a lane a node under test wrote.
 
 `motor_request`, `digital_output`, and `pwm` retain each device's last
-explicitly requested value. Use `applied_motor`, `applied_digital_output`, and
+explicitly requested value; `pwm` and `applied_pwm` return the pulse
+(`std::optional<double>`, Python `float`), 0 being the centre pulse, or
+`std::nullopt` (`None`) for no pulse. Use `applied_motor`, `applied_digital_output`, and
 `applied_pwm` to inspect effective outputs: requests merge by the bridge's
 rules (`//talOS/bridge:merge`), so a node's outputs go neutral at its
 [owner timeout](../ARCHITECTURE.md#the-tick) and every output stops, as the

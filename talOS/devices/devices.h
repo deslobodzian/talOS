@@ -36,12 +36,14 @@
 //     get() from the constructor, every(), a callback or an earlier
 //     update() does not count, and any one of the node's Targets will do;
 //   - in a tick that drives, every owned motor not set during that update()
-//     is neutral, and digital/PWM outputs set during it are included as set;
+//     is neutral, and digital/PWM outputs set during it are included as set
+//     (a PWM output stopped or set non-finite as off: no pulse);
 //   - in a tick that does not drive, every motor is neutral, every digital
-//     output false and every PWM output 0, and the command still goes out;
-//     the first such tick of each enabled spell in which update() set an
-//     output non-neutral prints one line on stderr naming the node, and
-//     every such tick marks the node's registry row outputs held
+//     output false and every PWM output off, and the command still goes
+//     out; the first such tick of each enabled spell in which update() set
+//     an output non-neutral (a PWM output to any pulse, 0 included) prints
+//     one line on stderr naming the node, and every such tick marks the
+//     node's registry row outputs held
 //     (detail::NodeAccess::set_outputs_held), which the next flush that
 //     drives, sets nothing or runs disabled clears.
 // Incoming states pass hardware::AcceptState for this config's id and are
@@ -158,10 +160,10 @@ Duration RezeroAgeBound(const hardware::Config& config);
 Duration ReadinessAgeBound(const hardware::Config& config);
 
 // Hardware handles: cheap copyable values. Output setters (Motor's set_* and
-// stop(), DigitalOutput::set, PwmOutput::set) are taken only inside the
-// node's update() and apply to the flush right after it; anything not set in
-// that update() is neutral. From the constructor, every() or a message
-// callback they throw std::logic_error naming the device, since such a
+// stop(), DigitalOutput::set, PwmOutput::set and stop()) are taken only
+// inside the node's update() and apply to the flush right after it; anything
+// not set in that update() is neutral. From the constructor, every() or a
+// message callback they throw std::logic_error naming the device, since such a
 // command would reach the hardware for at most one tick. Feedback is in
 // mechanism units (sensor_to_mechanism_ratio is applied on the controller).
 class Motor {
@@ -321,7 +323,13 @@ class PwmOutput {
  public:
   PwmOutput() = default;
   PwmOutput(Node& node, std::string_view name);
+  // A pulse for `output`, clamped to [-1, 1] on frc::PWM::SetSpeed's scale:
+  // 0 is the 1.5 ms centre pulse, which centres a servo and holds a PWM
+  // motor controller at neutral. A non-finite output sends no pulse.
   void set(double output);
+  // No pulse in this tick's flush: a servo goes limp and a PWM motor
+  // controller sees no signal. The same as not calling set() in this update().
+  void stop();
 
  private:
   HardwareLink* link_{nullptr};

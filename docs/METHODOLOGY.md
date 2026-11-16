@@ -148,9 +148,10 @@ There are exactly two kinds of input, and they are treated differently.
    override a set made earlier in the same tick. **[review]**
 3. Actuator setters apply for one flush. Unset motors default to neutral;
    the bridge replaces omitted digital outputs with `false` and PWM outputs
-   with `0.0`. Disable gates explicitly set outputs too. PWM zero and
-   backend-wide pulse suppression are different operations; verify the
-   attached device's physical response. **[enforced; hardware qualification]**
+   with off (no pulse). Disable gates explicitly set outputs too. A PWM
+   output set to 0 pulses at its 1.5 ms centre, which holds a PWM motor
+   controller at neutral but drives a servo to centre; leave it unset (or
+   `stop()` it) for no pulse. **[enforced; hardware qualification]**
 4. Never write `/hw/request/<node>` and never send hardware requests outside
    `update()`. **[enforced: `publish` refuses `/hw/request`, graph lint; gap: ARCH-2, node code can still reach `detail::NodeAccess` and raw RTMS publishers]**
 5. Closed loops run on the Talon (`set_velocity`, `set_position`,

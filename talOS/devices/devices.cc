@@ -179,7 +179,7 @@ struct HardwareLink::Impl {
     // the latched sample is invalid (HeldPosition).
     double held_position = 0;
     bool digital = false;
-    double pwm = 0;
+    hardware::PwmRequest pwm{};  // off: no pulse
     // Where this device's sample was in the state arrays last time it was
     // read; a hint only, checked against the id on every read.
     mutable std::size_t sample_index = 0;
@@ -376,15 +376,16 @@ struct HardwareLink::Impl {
   }
 
   // Whether update() `tick` set an output to something other than neutral: a
-  // motor mode other than neutral, a digital output true or a PWM output not
-  // 0.
+  // motor mode other than neutral, a digital output true or a PWM output to
+  // a pulse (0, the centre pulse, included).
   bool SetNonNeutral(std::uint64_t tick) const {
     for (const Device& device : devices) {
       if (device.set_update != tick) continue;
       if ((device.kind == Kind::kMotor &&
            device.motor.mode != hardware::Mode::kNeutral) ||
           (device.kind == Kind::kDigitalOutput && device.digital) ||
-          (device.kind == Kind::kPwm && device.pwm != 0.0)) {
+          (device.kind == Kind::kPwm &&
+           device.pwm.mode != hardware::PwmMode::kOff)) {
         return true;
       }
     }
@@ -417,8 +418,8 @@ struct HardwareLink::Impl {
               device.id, drive && device.digital};
         } else if (device.kind == Kind::kPwm &&
                    command.pwm_output_count < hardware::kMaxPwmOutputs) {
-          command.pwm_outputs[command.pwm_output_count++] = {
-              device.id, drive ? device.pwm : 0.0};
+          command.pwm_outputs[command.pwm_output_count++] =
+              drive ? device.pwm : hardware::PwmRequest{.id = device.id};
         }
       }
       Packet packet{};
@@ -807,7 +808,18 @@ void HardwareAccess::digital_output_set(HardwareLink& link, std::size_t index,
 void HardwareAccess::pwm_set(HardwareLink& link, std::size_t index,
                              double output) {
   auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::set");
-  device.pwm = std::isfinite(output) ? std::clamp(output, -1.0, 1.0) : 0.0;
+  device.pwm =
+      std::isfinite(output)
+          ? hardware::PwmRequest{.id = device.id,
+                                 .mode = hardware::PwmMode::kPulse,
+                                 .output = std::clamp(output, -1.0, 1.0)}
+          : hardware::PwmRequest{.id = device.id};
+  link.impl_->Commanded(device);
+}
+
+void HardwareAccess::pwm_stop(HardwareLink& link, std::size_t index) {
+  auto& device = link.impl_->Output(index, Kind::kPwm, "PwmOutput::stop");
+  device.pwm = hardware::PwmRequest{.id = device.id};
   link.impl_->Commanded(device);
 }
 
@@ -984,6 +996,7 @@ PwmOutput::PwmOutput(Node& node, std::string_view name)
 void PwmOutput::set(double output) {
   HardwareAccess::pwm_set(*link_, index_, output);
 }
+void PwmOutput::stop() { HardwareAccess::pwm_stop(*link_, index_); }
 
 // --- Driver Station ----------------------------------------------------------
 

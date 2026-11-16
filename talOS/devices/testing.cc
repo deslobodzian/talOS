@@ -90,6 +90,7 @@ struct SimHardware::Impl {
   std::map<std::uint16_t, hardware::MotorRequest> motor_requests;
   std::map<std::uint16_t, hardware::MotorRequest> applied_motors;
   std::map<std::uint16_t, bool> digital_outputs;
+  // A PWM output absent here sends no pulse; present, the pulse it sends.
   std::map<std::uint16_t, double> pwm_outputs;
   std::map<std::uint16_t, bool> applied_digital_outputs;
   std::map<std::uint16_t, double> applied_pwm_outputs;
@@ -195,7 +196,17 @@ struct SimHardware::Impl {
       applied_digital_outputs[id] = false;
     }
     for (const auto id : devices.pwm_outputs) {
-      applied_pwm_outputs[id] = 0.0;
+      applied_pwm_outputs.erase(id);
+    }
+  }
+
+  // Records `request` in `outputs`: its pulse, or no entry when it is off.
+  static void SetPwm(std::map<std::uint16_t, double>& outputs,
+                     const hardware::PwmRequest& request) {
+    if (request.mode == hardware::PwmMode::kOff) {
+      outputs.erase(request.id);
+    } else {
+      outputs[request.id] = request.output;
     }
   }
 
@@ -230,8 +241,7 @@ struct SimHardware::Impl {
               command.digital_outputs[i].value;
         }
         for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
-          pwm_outputs[command.pwm_outputs[i].id] =
-              command.pwm_outputs[i].output;
+          SetPwm(pwm_outputs, command.pwm_outputs[i]);
         }
         // The gateway refuses every request while the latest State showed
         // total feedback loss, so none enters the merge.
@@ -260,8 +270,7 @@ struct SimHardware::Impl {
               command.digital_outputs[i].value;
         }
         for (std::size_t i = 0; i < command.pwm_output_count; ++i) {
-          applied_pwm_outputs[command.pwm_outputs[i].id] =
-              command.pwm_outputs[i].output;
+          SetPwm(applied_pwm_outputs, command.pwm_outputs[i]);
         }
       }
       if (tracker.owner.Expire(Micros(sim.now())) || !enabled) {
@@ -763,10 +772,13 @@ bool SimHardware::digital_output(std::string_view node,
   return ValueOr(impl_->digital_outputs, id, false);
 }
 
-double SimHardware::pwm(std::string_view node, std::string_view device) const {
+std::optional<double> SimHardware::pwm(std::string_view node,
+                                       std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kPwm, device);
   impl_->Collect();
-  return ValueOr(impl_->pwm_outputs, id, 0.0);
+  const auto found = impl_->pwm_outputs.find(id);
+  if (found == impl_->pwm_outputs.end()) return std::nullopt;
+  return found->second;
 }
 
 hardware::MotorRequest SimHardware::applied_motor(
@@ -783,11 +795,13 @@ bool SimHardware::applied_digital_output(std::string_view node,
   return impl_->applied_digital_outputs.at(id);
 }
 
-double SimHardware::applied_pwm(std::string_view node,
-                                std::string_view device) const {
+std::optional<double> SimHardware::applied_pwm(std::string_view node,
+                                               std::string_view device) const {
   const std::uint16_t id = impl_->Id(node, Kind::kPwm, device);
   impl_->Collect();
-  return impl_->applied_pwm_outputs.at(id);
+  const auto found = impl_->applied_pwm_outputs.find(id);
+  if (found == impl_->applied_pwm_outputs.end()) return std::nullopt;
+  return found->second;
 }
 
 driver_station::DriverStationData DsPacket(std::uint32_t flags) {
