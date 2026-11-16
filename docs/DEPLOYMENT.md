@@ -6,44 +6,62 @@ bundles, starts one on boot, shows logs, rolls back and prunes old bundles.
 
 ## Build a bundle
 
+A robot is built and deployed from its own repository, which pins talOS as
+the git submodule `talos/` ([examples/robot_repo](../examples/robot_repo/README.md#deployment)
+is the template `new_robot --standalone` copies). From that repository's root:
+
 ```sh
-bazel build --config=release //2026-robot/main_processor:robot_bundle
+bazel build --config=release //main_processor:robot_bundle
 ```
 
-`--config=release` (`.bazelrc`) stamps the build: the bundle records the git
-revision it was built from and whether the tree had uncommitted changes
-(`tools/workspace_status.sh`). Without it the bundle builds the same but
-records no revision.
+with the label of the robot's own `talos_bundle` (the fixture's is
+`//:robot_bundle`). talOS's in-tree example is the bench robot's:
 
-`talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config`
-(`robot_field.toml`) and `config_files`; the robot's BUILD passes the hardware
-node plus `NODES`, and `CONFIG_FILES`, from the generated [field manifest](../2026-robot/main_processor/configuration/robot_field_manifest.bzl)
-(`bazel run //tools:sync_manifest -- 2026-robot/main_processor/configuration/robot_field.toml`).
+```sh
+bazel build --config=release //bench/main_processor:bench_bundle
+```
+
+`--config=release` stamps the build: the bundle records the git revision of
+the workspace Bazel runs in and whether that tree had uncommitted changes.
+The config (`build:release --stamp`) is in [`talos.bazelrc`](../talos.bazelrc),
+which talOS's `.bazelrc` and every robot repository's import; the revision
+comes from the `--workspace_status_command` each workspace's own `.bazelrc`
+sets beside that import (talOS's `tools/workspace_status.sh`, which a robot
+repository runs from its `talos/` checkout). Without it the bundle builds the
+same but records no revision.
+
+`talos_bundle` (`talOS/build/contract.bzl`) takes `nodes`, `config` (the
+robot's field config, the bench's `robot_bench.toml`) and `config_files`; the
+robot's BUILD passes the hardware node plus `NODES`, and `CONFIG_FILES`, from
+that config's generated manifest (the bench's
+[`robot_bench_manifest.bzl`](../bench/main_processor/configuration/robot_bench_manifest.bzl),
+from `bazel run //tools:sync_manifest -- bench/main_processor/configuration/robot_bench.toml`;
+in a robot repository `bazel run @talos//tools:sync_manifest -- <config>`).
 The build fails unless `nodes` is exactly what the config launches: its
 subsystems' nodes and its hardware node, `[robot] hardware_node` or by default
 `//talOS/bridge:hardware_node`. A robot viewed with Studio also sets
 `studio_bridge` (`//studio/bridge:studio_bridge`) and `studio_webroot`
 (`//studio:web_dist`, the built site), both or neither; the build fails when
 `studio_bridge` is not the config's `[studio] bridge` (when it sets one) or
-the site has no `index.html`. The 2026 robot, the bench rig and
-`tools/new_robot`'s robots inside talOS set both, which add about 2.5 MB; a
-robot repository's (`new_robot --standalone`) sets neither, so its deployed
-robot has no driver dashboard until someone builds the pages and adds
+the site has no `index.html`. The bench robot and `tools/new_robot`'s robots
+inside talOS set both, which add about 2.5 MB; a robot repository made by
+`new_robot --standalone` sets neither, so its deployed robot has no driver
+dashboard until someone builds the pages and adds
 `studio_bridge = "@talos//studio/bridge:studio_bridge"` and
 `studio_webroot = ":studio_webroot"` to its `talos_bundle`
 ([examples/robot_repo](../examples/robot_repo/README.md#studio)).
-It writes
-`bazel-bin/2026-robot/main_processor/robot_bundle/`:
+It writes the bundle directory `bazel-bin/<package>/<name>/`
+(`bazel-bin/bench/main_processor/bench_bundle/`):
 
 | Entry | What |
 |---|---|
-| `run.sh` | runs `./launcher --bundle <dir> --config config/robot_field.toml "$@"` from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set and, in a bundle that carries Studio, `--start-studio-bridge` unless given `--no-studio` (which it does not pass on); a `--config`/`--output-dir` argument replaces the default |
+| `run.sh` | runs `./launcher --bundle <dir> --config config/<config> "$@"` (the robot config's path below `config/`, `config/robot_bench.toml` in the bench bundle) from `<dir>`, its own directory with symlinks resolved, adding `--output-dir "$TALOS_LOG_DIR"` when that is set and, in a bundle that carries Studio, `--start-studio-bridge` unless given `--no-studio` (which it does not pass on); a `--config`/`--output-dir` argument replaces the default |
 | `launcher` | `//talOS/launcher` |
 | `bin/` | node binaries; a Python node's runfiles beside it (its wheels, e.g. `robotpy-wpimath` and `gtsam`, and `libtalos_node.so`) |
 | `python/` | with a Python node: the Python runtime (interpreter and standard library) every Python node runs, one directory per runtime repository however many nodes carry it |
 | `lib/` | any shared libraries C++ nodes link, one copy per name; no C++ WPILib libraries are staged. `talos_cc_node` binaries carry the rpath `@loader_path/../lib` (macOS) or `$ORIGIN/../lib` (Linux) |
 | `studio/` | with `studio_bridge` and `studio_webroot` only: the bridge binary (`studio/studio_bridge`) and the site it serves (`studio/webroot/`) |
-| `config/` | `robot_field.toml` and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
+| `config/` | the robot config and every file it reads (`include`, `path`, `defaults`), at the same paths relative to each other as in the source tree |
 | `bundle_manifest.toml` | node names, targets, binaries, each binary's SHA-256 (`binary_sha256`), languages, config SHA-256; in a stamped build `git_revision` and `git_dirty`; with Studio, a `[studio]` table naming its bridge (path, SHA-256, label) and webroot |
 
 The bundle holds no symlinks. Bazel may restore a tree artifact from its
@@ -75,14 +93,15 @@ config tree or copying the bundle elsewhere keeps the identity; editing,
 renaming or moving any one file relative to the others (the root config too)
 changes it.
 
-The bundle uses `2026-robot/main_processor/configuration/robot_field.toml`,
-which includes the base [robot config](../2026-robot/main_processor/configuration/robot.toml)
-and changes only `[robot] controller_address`, to the RoboRIO's `10.56.87.2` (it also restates the base's `require_target_coverage = true`).
-Simulation and its tests keep using that base config with loopback (`127.0.0.1`);
-no source edits are needed when switching between
-simulation and the field bundle. The overlay does not
-change CAN ids or commissioning: hardware must still be checked and
-commissioned through the normal bring-up process.
+A robot's bundle config is a field overlay of its simulation config: the
+bench's `robot_bench.toml` includes the base
+[robot config](../bench/main_processor/configuration/robot.toml) and changes
+only `[robot] controller_address`, to the RoboRIO's `10.56.87.2` (and restates
+`commissioned = false`). Simulation and its tests keep using the base config
+with loopback (`127.0.0.1`), so no source edits are needed when switching
+between simulation and the field bundle. Such an overlay does not change CAN
+ids or commissioning: hardware must still be checked and commissioned through
+the [bring-up](BRINGUP.md) process.
 
 A bundle that carries Studio serves it whenever `run.sh` runs, by hand or
 from the boot service: `run.sh` passes the launcher `--start-studio-bridge`,
@@ -128,6 +147,8 @@ simulation. A launch that changes the ports with `--remote-port` and
 ./tools/deploy.sh prune [--prefix /opt/talos] [--keep 3]
 ```
 
+From a talOS checkout, as shown; from a robot repository, the same script
+in its talOS submodule: `talos/tools/deploy.sh install bazel-bin/main_processor/robot_bundle`.
 A relative `--prefix` is resolved against the working directory.
 
 - **install** copies the bundle to `<prefix>/bundles/<stamp>/` (read-only,
@@ -239,7 +260,7 @@ recovery and what is synced to disk when, see [session segments and logs](../tal
 macOS charges the first exec, and first load, of every newly written
 executable file about 100 ms, one file at a time host-wide; the charge is per
 file and paid only by running or loading it, not by reading it. A fresh
-install of the 2026 bundle is about 5,500 new files, and its first launch
+install of the 2026 robot's bundle (built in its own repository) is about 5,500 new files, and its first launch
 would pay that inside the launcher's per-probe `--describe` deadline
 ([below](#supervision-and-service-recovery)), every probe at once: with
 other new executables being written on the Mac mini, `pose_estimator` (the
@@ -455,7 +476,8 @@ differs, then `./gradlew deploy -Pcompanion=<ipv4>`
 ([RoboRIO](../talOS/hardware/README.md#roborio)). Deployed from a copy with no
 git history, add `-PtalosRevision=<first 16 hex digits of its commit>` so its
 State still names the build ([build stamp](../talOS/hardware/README.md#roborio)).
-Deploy it from the same checkout as the main-processor bundle: each side
+Deploy it from the talOS checkout the main-processor bundle was built
+against (a robot repository's `talos/` submodule): each side
 rejects frames of another protocol version (currently 8; see
 [DATA_FLOW.md](DATA_FLOW.md)), and `hardware_node` logs both versions once
 when that happens; the RoboRIO reports it in the Driver Station message log
