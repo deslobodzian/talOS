@@ -1171,16 +1171,25 @@ TEST_F(PhoenixBackendRecovery, LateFeedbackStaysValidAndIsReportedLate) {
 // bit, since an old switch or limiter state is a wrong display (a motor
 // driven into its pressed forward switch, or stalled at its stator limit),
 // but keeps the fault bits it last had: losing the signal never un-faults a
-// motor (BootDuringEnable here: that row's TalonFX, CAN id 57, which no other
-// test uses, first boots inside it, while enabled). Each row first waits
-// until a read shows its bit: the reads that PumpReads gates on fresh motion
-// feedback say nothing of the separate 50 Hz FaultField, and one that finds
-// it 50 ms old reports no limit by this same rule.
+// motor (BootDuringEnable here, raised by a TalonFX that boots while enabled).
+// Each row first waits until a read shows its bit: the reads that PumpReads
+// gates on fresh motion feedback say nothing of the separate 50 Hz
+// FaultField, and one that finds it 50 ms old reports no limit by this same
+// rule. A simulated TalonFX raises BootDuringEnable only on its first boot in
+// the process, and clears it about 0.5 s after that boot, driven or not; so
+// the boot row takes a CAN id no device here has used, and waits for the bit
+// straight after AwaitReady, without the limit rows' 30-read pump, which
+// takes about as long as the bit lasts.
 // REQ-CONTRACT-32
 TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
   enum class Row { kForwardHardLimit, kStatorLimiter, kBootFault };
   // FaultField bit 4, BootDuringEnable: a fault (hw::MotorFaulted).
   constexpr uint32_t kBootDuringEnableFlag = uint32_t{1} << 4;
+  // CAN ids no other test here uses: one boot row per run of this test
+  // (--gtest_repeat), up to the last TalonFX id.
+  constexpr int kFirstBootCanId = 45;
+  constexpr int kLastCanId = 62;
+  static int next_boot_can_id = kFirstBootCanId;
   for (const Row row :
        {Row::kForwardHardLimit, Row::kStatorLimiter, Row::kBootFault}) {
     const uint32_t bit =
@@ -1193,7 +1202,12 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
     EnsureHal();
     EnabledDs ds;
     hw::Config config;
-    auto motor = TestMotor(1, "motor", row == Row::kBootFault ? 57 : 1);
+    if (row == Row::kBootFault) {
+      ASSERT_LE(next_boot_can_id, kLastCanId)
+          << "every CAN id the boot row may take has booted in this process";
+    }
+    auto motor =
+        TestMotor(1, "motor", row == Row::kBootFault ? next_boot_can_id++ : 1);
     motor.stator_limit_a = 10;
     config.motors.push_back(motor);
     PhoenixBackend backend(true);
@@ -1205,7 +1219,7 @@ TEST_F(PhoenixBackendRecovery, StaleFaultFieldClearsLimitsAndKeepsFaults) {
     auto& sim = Motor(backend, 0).GetSimState();
     if (row == Row::kStatorLimiter) StallRotor(backend);
     if (row == Row::kForwardHardLimit) sim.SetForwardLimit(true);
-    PumpReads(backend, state, commands, 30);
+    if (row != Row::kBootFault) PumpReads(backend, state, commands, 30);
     auto& faults = Motor(backend, 0).GetFaultField(false);
     ASSERT_TRUE(ReadUntil(backend, state,
                           [&] {
