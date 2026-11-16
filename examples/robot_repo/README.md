@@ -110,15 +110,17 @@ bazel run //:sim -- --start-studio-bridge     # Studio at http://localhost:5800,
 one directory in `//:sim`'s `data`, and `robot.toml`'s `[studio] webroot`
 names it (`bazel-bin/studio_webroot`); `@talos//studio/bridge:webroot.bzl`
 says how. Until the pages are built, `//:studio_webroot` holds only
-`NOT_BUILT.txt` (Bazel leaves an empty directory out of runfiles), and `/`
-and `/drive` answer 503 with the command above; Bazel fetches the folder again when they are built, so the
+`NOT_BUILT.txt` (Bazel leaves an empty directory out of runfiles), naming
+the talOS checkout `studio_web`'s `path` lies in, and `/` and `/drive`
+answer 503 with the command above for that checkout; Bazel fetches the folder again when they are built, so the
 next `bazel run //:sim` serves them. This robot has no `[studio] dashboard`
 layout, so `/drive` shows no widgets
 ([talOS/telemetry](../../talOS/telemetry/README.md#dashboard-layout)).
 
 `studio_test` runs `//:sim --start-studio-bridge` on free ports until the
 launcher reports the bridge up, requires `/drive` to answer with the page or
-with that command naming `//:studio_webroot`'s folder (so a webroot the
+with that command naming `//:studio_webroot`'s folder and a talOS checkout
+that exists (so a webroot the
 config or `//:sim`'s `data` miswires fails it), stops the session, and requires the bridge to have run
 once and exited 0. It is not a `talos_sim_test`, which waits for every
 member's registry row; the bridge takes none.

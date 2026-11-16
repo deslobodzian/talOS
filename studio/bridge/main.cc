@@ -606,9 +606,29 @@ std::string mime(const fs::path& p) {
   if (ext == ".wasm") return "application/wasm";
   return "application/octet-stream";
 }
+
+// Where to build the pages is known only to whoever made the webroot: a
+// robot repository's `studio_webroot` (webroot.bzl) leaves NOT_BUILT.txt
+// there naming the talOS checkout its `studio_web` reads, and its first line
+// is the command; without one the answer names no directory, since this
+// bridge cannot know which checkout (talOS's own, a submodule, a sibling
+// `local_path_override`) the reader uses.
+std::string NotBuiltCommand(const fs::path& webroot) {
+  std::ifstream file(webroot / "NOT_BUILT.txt");
+  std::string line;
+  constexpr std::size_t kMaxLine = 1024;
+  if (file && std::getline(file, line) && !line.empty() &&
+      line.size() <= kMaxLine) {
+    return line;
+  }
+  return "build them with `bazel build //studio:web_dist` in the talOS "
+         "checkout this workspace uses (talOS itself, or the one a robot "
+         "repository's MODULE.bazel `talos` override names)";
+}
+
 // What `/` and `/drive` answer, 503, while the webroot holds no such page,
 // and what the bridge logs at startup. Two readers see it: a developer whose
-// checkout (or robot repository's talOS submodule) never built the pages, and
+// talOS checkout never built the pages, and
 // a drive team whose installed bundle lost them. `talos_bundle` places the
 // webroot at `<bundle>/studio/webroot` beside `bundle_manifest.toml`, so a
 // webroot with that manifest two levels up is served from a bundle and the
@@ -622,9 +642,7 @@ std::string MissingPage(const fs::path& webroot, std::string_view page) {
           webroot.parent_path().parent_path() / "bundle_manifest.toml", absent);
   const std::string where = webroot.string() + " has no " + std::string(page);
   const std::string build =
-      "build them with `bazel build //studio:web_dist` in talOS's checkout "
-      "(from a robot repository: `cd talos && bazel build //studio:web_dist`), "
-      "then start the session again";
+      NotBuiltCommand(webroot) + ", then start the session again";
   const std::string install =
       "install a bundle built from the current checkout with "
       "`tools/deploy.sh install <bundle>`, then restart the service "

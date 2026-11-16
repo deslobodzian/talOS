@@ -22,9 +22,29 @@ examples/robot_repo/README.md, "Studio".
 
 # Written into the directory while the pages are not built: Bazel leaves an
 # empty directory out of a target's runfiles, and the bridge must still be
-# given a folder that exists (to answer its pages with this command).
+# given a folder that exists (to answer its pages with this text, which it
+# reads from there). studio_web writes it naming the talOS checkout its
+# `path` lies in; this one, naming none, only when srcs bring no such file.
 _NOT_BUILT = "NOT_BUILT.txt"
-_NOT_BUILT_TEXT = "The Studio pages are not built: cd talos && bazel build //studio:web_dist"
+_NOT_BUILT_TEXT = ("build them with `bazel build //studio:web_dist` in the talOS " +
+                   "checkout this repository uses (see MODULE.bazel's talos override)")
+
+# What `//studio:web_dist` leaves in a talOS checkout, below its root.
+_DIST = "/bazel-bin/studio/dist"
+
+def _not_built_text(rctx, path):
+    """The build command naming the talOS checkout that writes `path`.
+
+    The checkout is named when `path` is an existing checkout's
+    bazel-bin/studio/dist; otherwise the text points at MODULE.bazel.
+    """
+    if path.endswith(_DIST):
+        checkout = rctx.path(path[:-len(_DIST)])
+        if checkout.exists:
+            root = str(checkout.realpath)
+            return ("build them with `bazel build //studio:web_dist` in the talOS " +
+                    "checkout at %s: `(cd %s && bazel build //studio:web_dist)`") % (root, root)
+    return _NOT_BUILT_TEXT + ", which writes %s" % path
 
 def _studio_web_impl(rctx):
     path = rctx.attr.path
@@ -40,11 +60,13 @@ def _studio_web_impl(rctx):
     built = all([page.exists for page in pages])
     if built:
         rctx.symlink(folder, "dist")
+    else:
+        rctx.file("dist/" + _NOT_BUILT, _not_built_text(rctx, path) + "\n")
     rctx.file("BUILD.bazel", "\n".join([
         "# The pages at %s%s." % (path, "" if built else ", not built yet"),
         "filegroup(",
         "    name = \"files\",",
-        "    srcs = %s," % ("glob([\"dist/**\"])" if built else "[]"),
+        "    srcs = glob([\"dist/**\"]),",
         "    visibility = [\"//visibility:public\"],",
         ")",
         "",
@@ -60,8 +82,9 @@ studio_web = repository_rule(
                   "or relative to the root module's directory.",
         ),
     },
-    doc = "The folder of Studio's built pages as `:files`, empty until both " +
-          "index.html and drive.html exist there.",
+    doc = "The folder of Studio's built pages as `:files`; until both " +
+          "index.html and drive.html exist there, only NOT_BUILT.txt, naming " +
+          "the talOS checkout to build them in.",
 )
 
 def _studio_webroot_impl(ctx):
@@ -82,7 +105,8 @@ def _studio_webroot_impl(ctx):
                   "while [ $# -gt 0 ]; do " +
                   "mkdir -p \"$out/$(dirname \"$2\")\" && cp \"$1\" \"$out/$2\" || exit 1; " +
                   "shift 2; done; " +
-                  ("[ -e \"$out/index.html\" ] || echo '%s' > \"$out/%s\"" % (_NOT_BUILT_TEXT, _NOT_BUILT)),
+                  ("[ -e \"$out/index.html\" ] || [ -e \"$out/{f}\" ] || " +
+                   "echo \"{t}\" > \"$out/{f}\"").format(f = _NOT_BUILT, t = _NOT_BUILT_TEXT.replace("`", "\\`")),
         mnemonic = "StudioWebroot",
         progress_message = "Collecting Studio's pages into %{output}",
     )

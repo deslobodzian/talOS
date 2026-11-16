@@ -700,8 +700,8 @@ Target //studio:web_dist up-to-date:
 That folder is what `MODULE.bazel`'s `studio_web` names. Until it is built,
 the robot still runs and `bazel test //...` passes, but Studio's `/` and
 `/drive` answer 503 with "Studio's pages are not built" and the build
-command, which reads `cd talos`, the layout of a robot repository holding
-talOS as a submodule; here it is the command above. `studio_test` passes
+command for the talOS checkout `studio_web` reads: the command above.
+`studio_test` passes
 either way: it accepts that 503 as long as it names the folder `robot.toml`
 gives the bridge. Bazel notices the pages when they appear, so the next run
 serves them.
