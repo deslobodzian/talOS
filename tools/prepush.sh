@@ -23,7 +23,10 @@
 # and examples/wrist_repo, the repositories that depend on talOS) and
 # scaffold-robot_repo (tools/check_robot_repo_scaffold.sh: a C++ and a
 # Python subsystem scaffolded into a copy of examples/robot_repo, then
-# `bazel test //...` there), checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
+# `bazel test //...` there), robot-repository (when TALOS_ROBOT_REPOSITORY
+# names a robot repository's checkout: tools/check_robot_repository.sh on
+# it; otherwise one SKIPPED line that does not fail the run),
+# checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
 # --offline`, for controller_processor/ and talOS/, whose headers
 # the RoboRIO program's build.gradle exports) and studio-test and
 # studio-build (`pnpm test`, `pnpm build`, for studio/).
@@ -261,6 +264,22 @@ else
       --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
       true
   fi
+fi
+# A robot repository that consumes talOS (TALOS_ROBOT_REPOSITORY, its
+# checkout), built and tested against this commit's talOS in a copy of its
+# committed tree; only read there. Until such a repository has CI of its
+# own, this is the only check of it against a talOS change.
+if [ -z "${TALOS_ROBOT_REPOSITORY:-}" ]; then
+  report "robot-repository skipped (TALOS_ROBOT_REPOSITORY unset)"
+elif ! robot_repository="$(cd "$TALOS_ROBOT_REPOSITORY" 2>/dev/null && pwd -P)"; then
+  skip robot-repository "TALOS_ROBOT_REPOSITORY is not a directory: $TALOS_ROBOT_REPOSITORY"
+elif [ ! -f "$wt/tools/check_robot_repository.sh" ]; then
+  skip robot-repository "this commit has no tools/check_robot_repository.sh"
+else
+  run_step robot-repository env "TMPDIR=$tmp" \
+    bash tools/check_robot_repository.sh "$robot_repository" \
+    --noshow_progress --nocache_test_results "--disk_cache=$disk_cache" ||
+    true
 fi
 run_step checkout-unchanged sh -c \
   'out="$(git status --porcelain --untracked-files=all)"; [ -z "$out" ] || { printf "%s\n" "$out"; exit 1; }' ||

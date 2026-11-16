@@ -285,6 +285,22 @@ py_test(
     deps = ["@rules_python//python/runfiles"],
 )
 
+# tools/check_robot_repository.sh PATH [BAZEL_FLAG...] (tools/prepush.sh,
+# when TALOS_ROBOT_REPOSITORY is set) builds and tests a copy of a robot
+# repository's committed tree against this talOS checkout. The test runs it
+# with a stub bazel against a throwaway repository.
+py_test(
+    name = "check_robot_repository_test",
+    size = "small",
+    srcs = ["check_robot_repository_test.py"],
+    data = [
+        "check_copy_lock.sh",
+        "check_robot_repository.sh",
+    ],
+    legacy_create_init = False,
+    deps = ["@rules_python//python/runfiles"],
+)
+
 # python3 tools/check_host_includes.py DIR (tools/prepush.sh, after the build)
 # No compile read a header from the host's include tree but the C library's,
 # the kernel's and the C++ standard library's.

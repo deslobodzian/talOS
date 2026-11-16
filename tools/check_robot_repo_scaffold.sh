@@ -52,20 +52,10 @@ fresh="$tmp/talos-scaffold-new-$(id -u)"
 lock="$copy.lock"
 start=$SECONDS
 
-# One run at a time owns the copy's path (and its output base); the pid file
-# appears whole, as in tools/prepush.sh.
-if ! mkdir "$lock" 2>/dev/null; then
-  [ -f "$lock/pid" ] ||
-    die "$lock has no pid yet: another check is starting (if none is, rmdir $lock)"
-  holder="$(cat "$lock/pid" 2>/dev/null || true)"
-  if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
-    die "another check (pid $holder) is using $copy"
-  fi
-  rm -rf "$lock"
-  mkdir "$lock" 2>/dev/null || die "cannot take $lock"
-fi
-{ echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
-  die "cannot write $lock/pid"
+# One run at a time owns the copy's path (and its output base).
+# shellcheck source=tools/check_copy_lock.sh
+. "$talos/tools/check_copy_lock.sh" || die "cannot read check_copy_lock.sh"
+take_copy_lock "$lock" "$copy"
 
 bazel_started=0
 remove_copy() {
