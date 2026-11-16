@@ -319,9 +319,15 @@ remote. On hardware, commissioning gates commands; see
 
 `--sim --start-sim-gateway` starts the binary named by `[robot] sim_gateway`
 (`//talOS/simulation:sim_gateway`, [its README](../simulation/README.md)) as
-a roster member. The launcher passes it the bridge's ports
-(`SimulatorArgs`): `--port` is the effective controller port the bridge sends
-to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
+a roster member, under the name `sim_gateway`. It is started with
+`--config` and `--session-id` and no `--log`, so it writes no event log, and
+`--replay-inputs --only` refuses it. These hold for the member the launcher
+adds only, which it does when `--sim`, `--start-sim-gateway` and a
+`[robot] sim_gateway` key are all present: a robot's own subsystem named
+`sim_gateway` is otherwise an ordinary node, and with that member the launch
+is refused naming its `[subsystems.sim_gateway]` key. The launcher passes the gateway the bridge's
+ports (`SimulatorArgs`): `--port` is the effective controller port the bridge
+sends to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
 effective local port the bridge listens on (`[robot] local_port`, or
 `--local-port`), so the two always agree. Repeat `--sim-gateway-arg ARG` to
 forward further arguments verbatim, in order, after those, to **both** its

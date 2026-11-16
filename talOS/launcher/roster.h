@@ -42,6 +42,11 @@ struct NodeSpec {
   // Set nowhere else, so a robot's subsystem named kStudioBridgeName is an
   // ordinary node.
   bool studio_bridge{false};
+  // The launcher's own simulation gateway, which DiscoverNodes adds under
+  // --sim --start-sim-gateway: started with --config and no event log, and
+  // never replayed. Set nowhere else, so a robot's subsystem named
+  // kSimGatewayName is an ordinary node.
+  bool sim_gateway{false};
 };
 
 struct LauncherOptions {
