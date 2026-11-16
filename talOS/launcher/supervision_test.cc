@@ -2446,6 +2446,65 @@ TEST(Supervision, ANamespacedSessionLeavesNoNamesBehind) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// Removes the namespace's registry segment and its lock file, which a test
+// that keeps them leaves behind, so the tests after it start as this binary's
+// first does.
+void RemoveRegistry() {
+  introspect::RegistryMapping::unlink();
+  ::unlink(introspect::LockFilePath(ShmObjectName(introspect::kRegistryPath))
+               .c_str());
+}
+
+// A namespaced session's end leaves the registry while a live process of
+// another session holds a row in it: removing the segment would take that
+// node's row out of every viewer, and its next restart would register in a
+// new segment. The row's claimant is this test process, which runs.
+// REQ-OPS-03
+TEST(Supervision, ALiveRowOfAnotherSessionKeepsTheRegistry) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  const std::string registry_lock = introspect::LockFilePath(registry);
+  auto options = BaseOptions("foreign_row");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("foreign_row_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("foreign_row_beta", "exit 0\n");
+  std::optional<introspect::NodeRegistration> foreign;
+  foreign.emplace(introspect::NodeRegistration::Identity{
+      "foreign", "//example/foreign:node", options.session_id + 1, 0});
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_TRUE(SegmentExists(registry))
+      << "removed under another session's live row: " << registry;
+  EXPECT_TRUE(std::filesystem::exists(registry_lock)) << registry_lock;
+  foreign.reset();
+  RemoveRegistry();
+  std::filesystem::remove_all(options.output_dir);
+}
+
+// The same while another process holds the registry's writer lock (a node of
+// another session claiming a row): the session does not wait for it and
+// leaves the registry. Held here from before the session, once the registry
+// is prepared, so the launcher's own preparation needs no lock.
+// REQ-OPS-03
+TEST(Supervision, AHeldRegistryLockKeepsTheRegistry) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  const std::string registry_lock = introspect::LockFilePath(registry);
+  auto options = BaseOptions("held_registry_lock");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("held_registry_lock_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("held_registry_lock_beta", "exit 0\n");
+  introspect::PrepareRegistry();
+  std::optional<introspect::RegistryLock> held;
+  held.emplace(registry, 0ms);
+  EXPECT_EQ(RunSession(options), 0);
+  EXPECT_TRUE(SegmentExists(registry))
+      << "removed while its lock was held: " << registry;
+  EXPECT_TRUE(std::filesystem::exists(registry_lock)) << registry_lock;
+  held.reset();
+  RemoveRegistry();
+  std::filesystem::remove_all(options.output_dir);
+}
+
 // The loop never waits for the disk, yet every mid-session manifest is
 // synced. With every sync stuck from alpha's first run on, the critical
 // alpha's crash is still restarted at once; once the disk recovers, a synced
