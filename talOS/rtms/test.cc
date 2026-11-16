@@ -1897,11 +1897,19 @@ namespace {
 constexpr std::size_t kRequiredReaders = 32;
 
 // One reader process of the full-table test: claims a slot, arms it on its
-// own receiver, reports that on `armed_fd`, sleeps until a publication wakes
-// it, then reads `burst` messages in order with none dropped, sleeping again
-// whenever it catches up. Returns 0, or the step that failed.
+// own receiver, reports that on `armed_fd`, waits for the parent to close
+// `go_fd` (every reader armed), sleeps until a publication wakes it, then
+// reads `burst` messages in order with none dropped, sleeping again whenever
+// it catches up. Returns 0, or the step that failed.
+//
+// The hang bound starts at the go, not at the arm: the first publication
+// follows the last of 32 forks, which under a sanitizer on a slow host
+// (about 375 ms each) can come after an early reader's bound would have run
+// out. Waiting for the go first loses no wake: the receiver's fd is a
+// datagram socket, readable while a notification is queued (wake.h, fd()),
+// so a notification that arrived before the wait still shows.
 int ReadBurstOnceWoken(const std::string& path, std::size_t slots, int burst,
-                       int armed_fd) {
+                       int armed_fd, int go_fd) {
   try {
     RTMSQueue queue{path,
                     sizeof(Message::TestMessage),
@@ -1916,6 +1924,13 @@ int ReadBurstOnceWoken(const std::string& path, std::size_t slots, int burst,
     if (!queue.arm_wake(*reader)) return 2;
     const char armed = 1;
     if (::write(armed_fd, &armed, 1) != 1) return 3;
+    // End of file once the parent closes its end; a byte is never written.
+    char go = 0;
+    ssize_t got = 0;
+    do {
+      got = ::read(go_fd, &go, 1);
+    } while (got < 0 && errno == EINTR);
+    if (got != 0) return 9;
     if (WakeReadable(receiver, kWakeHangBoundMs) != 1) return 4;
     receiver.drain();
     for (int expected = 0; expected < burst;) {
@@ -1943,8 +1958,9 @@ int ReadBurstOnceWoken(const std::string& path, std::size_t slots, int burst,
 
 // A topic read by 32 processes, as the Driver Station topic of a robot with
 // six mechanisms is: every reader holds a slot at once, the first
-// publication wakes all 32 asleep on it, each reads every message of the
-// burst, and a 33rd claim finds no slot.
+// publication wakes all 32 armed on it (one still on its way to poll()
+// finds the wake pending), each reads every message of the burst, and a
+// 33rd claim finds no slot.
 // REQ-CONTRACT-36
 TEST(RTMSReaderTable, ThirtyTwoReaderProcessesAreEachWokenAndReadEverything) {
   constexpr std::size_t kSlots = 64;
@@ -1959,18 +1975,26 @@ TEST(RTMSReaderTable, ThirtyTwoReaderProcessesAreEachWokenAndReadEverything) {
 
   int armed[2];
   ASSERT_EQ(::pipe(armed), 0);
+  // Closed once every reader has armed (or the count fell short), so each
+  // reader's wake bound starts with the publication, not with its own fork.
+  int go[2];
+  ASSERT_EQ(::pipe(go), 0);
   std::vector<pid_t> children;
   for (std::size_t i = 0; i < kRequiredReaders; ++i) {
     const pid_t child = ::fork();
     if (child == 0) {
       ::close(armed[0]);
-      ::_exit(ReadBurstOnceWoken(path, kSlots, kBurst, armed[1]));
+      ::close(go[1]);
+      ::_exit(ReadBurstOnceWoken(path, kSlots, kBurst, armed[1], go[0]));
     }
     if (child < 0) break;
     children.push_back(child);
   }
+  const int fork_error = errno;
   ::close(armed[1]);
-  ASSERT_EQ(children.size(), kRequiredReaders) << std::strerror(errno);
+  ::close(go[0]);
+  if (children.size() != kRequiredReaders) ::close(go[1]);
+  ASSERT_EQ(children.size(), kRequiredReaders) << std::strerror(fork_error);
 
   // Each byte is one reader holding its slot, armed. A reader that failed
   // first closes its end without writing, so the count falls short instead
@@ -1985,6 +2009,7 @@ TEST(RTMSReaderTable, ThirtyTwoReaderProcessesAreEachWokenAndReadEverything) {
     armed_readers += static_cast<std::size_t>(got);
   }
   ::close(armed[0]);
+  ::close(go[1]);
   EXPECT_EQ(armed_readers, kRequiredReaders);
   EXPECT_FALSE(writer.register_reader().has_value())
       << "a 33rd reader claimed a slot";
@@ -2002,6 +2027,7 @@ TEST(RTMSReaderTable, ThirtyTwoReaderProcessesAreEachWokenAndReadEverything) {
     EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
         << "reader " << i << " exited with " << WEXITSTATUS(status)
         << " (1: no slot, 2: arm, 3: report, 4: never woken, 5: wrong or "
-           "dropped message, 6: read failed, 7: not woken again, 8: threw)";
+           "dropped message, 6: read failed, 7: not woken again, 8: threw, "
+           "9: go pipe)";
   }
 }
