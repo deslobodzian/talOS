@@ -564,6 +564,19 @@ TEST_F(SimHardwareTest, ADisconnectedMotorsTemperatureReadsZeroAt500Ms) {
   EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
 }
 
+// REQ-DEV-07: a rebooted RoboRIO has never received the temperature signal
+// of a motor that has been disconnected since before the reboot, so it
+// reads 0 at once.
+TEST_F(SimHardwareTest, ARebootForgetsADisconnectedMotorsTemperature) {
+  hw.set_motor("mech", "braked", 0, 0, 0, 0, 62.5);
+  sim.step(5ms);
+  ASSERT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
+  hw.set_connected("mech", "braked", false);
+  hw.reboot();
+  sim.step(5ms);
+  EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 0.0);
+}
+
 // The RoboRIO reports a CANcoder's absolute position with
 // AbsoluteSensorDiscontinuityPoint = 0.5, so in [-0.5, 0.5) rotations;
 // set_cancoder's position goes out wrapped the same way.

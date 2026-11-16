@@ -136,9 +136,10 @@ class SimHardware {
   // (hardware::MarkInvalid of its last readings: ages and temperature kept,
   // every measurement zero, limit switches released), except that a motor's
   // temperature reads 0 from the State 500 ms after the last one that read
-  // it connected (0 at once if none did), as the RoboRIO reports a stale
-  // temperature signal; any other device
-  // carries zero values. Every device
+  // it connected (0 at once if none did this boot), as the RoboRIO reports a
+  // stale temperature signal. The robot counts from the signal's last frame,
+  // up to 250 ms before that State at its 4 Hz, so it can read 0 up to
+  // 250 ms sooner. Any other device carries zero values. Every device
   // of that node named `device` is affected, whatever its kind; an unknown
   // name throws std::invalid_argument.
   void set_connected(std::string_view node, std::string_view device,
