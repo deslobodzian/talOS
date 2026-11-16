@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -62,12 +63,23 @@ namespace talos::hardware {
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
 
-// Waits until a datagram is queued on the bridge's socket, so the next Tick
-// reads it: a loopback send can complete before the datagram is queued
-// (notably on BSD). The 10 s deadline only bounds a hang (TESTING.md 6.3).
+// Waits until the bridge's socket is readable, so the next Tick reads what is
+// there: a loopback send can complete before the datagram is queued (notably
+// on BSD). Readable is not "a datagram is queued": after the bridge sent to a
+// port nobody had bound, the connected socket is readable for the pending
+// error alone (macOS: POLLIN with FIONREAD 0), and the Tick that reads it
+// consumes only the error. A caller waiting for a datagram's effect therefore
+// ticks until it sees that effect, or checks QueuedBytes. The 10 s deadline
+// only bounds a hang (TESTING.md 6.3).
 bool DatagramQueued(const HardwareNode& node) {
   pollfd readable{node.udp_fd(), POLLIN, 0};
   return ::poll(&readable, 1, 10'000) == 1 && (readable.revents & POLLIN) != 0;
+}
+
+// Bytes of datagrams queued on the bridge's socket (FIONREAD), 0 when none.
+int QueuedBytes(const HardwareNode& node) {
+  int bytes = 0;
+  return ::ioctl(node.udp_fd(), FIONREAD, &bytes) == 0 ? bytes : -1;
 }
 
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
@@ -104,8 +116,12 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
     ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 2,
                                      2000, bytes, size),
               protocol::UdpStatus::kOk);
+    // Nothing has been sent to an unbound port, but a "nothing forwarded"
+    // check must not pass on a datagram the tick never read.
     ASSERT_TRUE(DatagramQueued(node));
+    ASSERT_GT(QueuedBytes(node), 0);
     node.Tick(30000);
+    ASSERT_EQ(QueuedBytes(node), 0);
   };
   const uint8_t malformed[] = {1, 2, 3};
   send(malformed, sizeof malformed);
@@ -842,8 +858,14 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
                               999500, ack_bytes.data(), ack_bytes.size()),
             protocol::UdpStatus::kOk);
-  ASSERT_TRUE(DatagramQueued(node));
-  node.Tick(999500);
+  // The first tick sent to the gateway port before anything was bound there,
+  // so the socket may first be readable for that error alone: tick until the
+  // ACK has been read. Each wait is bounded; with no ACK accepted the last one
+  // times out.
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
+    node.Tick(999500);
+  }
   ASSERT_TRUE(node.is_configured());
   EXPECT_TRUE(node.Status(999500).configured());
 
