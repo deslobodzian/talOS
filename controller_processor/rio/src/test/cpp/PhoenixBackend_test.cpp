@@ -43,6 +43,7 @@
 
 #include "hardware/gate.h"
 #include "hardware/gateway.h"
+#include "hardware/sim_backend.h"
 
 namespace hw = talos::hardware;
 
@@ -598,6 +599,20 @@ TEST(PhoenixBackendHealth, ReportsBatteryVoltage) {
   EXPECT_TRUE(state.health.valid);
   EXPECT_DOUBLE_EQ(state.health.battery_v, 7.1);
   frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});
+}
+
+// WPILib's simulated battery reads 12 V, which fails a pre-match battery
+// check (the 2026 dashboard's asks for 12.5 V). The desktop simulation's
+// backend rests it at the charged supply sim_gateway reports, so both
+// simulated gateways read the same battery at rest.
+// REQ-DEV-06
+TEST(PhoenixBackendHealth, SimulationRestsTheBatteryAtTheChargedSupply) {
+  EnsureHal();
+  frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{12.0});  // WPILib's
+  PhoenixBackend backend(true);
+  hw::State state;
+  backend.Read(state);
+  EXPECT_DOUBLE_EQ(state.health.battery_v, hw::kSimRestingSupplyV);
 }
 
 // Under WPILib simulation no CAN bus is read: the slot the gateway asks for
@@ -1911,10 +1926,11 @@ class PhoenixBackendTorque : public PhoenixBackendFoc {
 TEST_F(PhoenixBackendTorque, ARequestIsTorqueCurrentFocCappedAtMaxVoltage) {
   EnsureHal();
   EnabledDs ds;
-  SimBattery battery{0.0};  // No reading yet.
   hw::Config config;
   config.motors.push_back(TorqueMotor(1, "gripper", 1));
   PhoenixBackend backend(true);
+  // After the backend, which rests the simulated battery at 12.8 V.
+  SimBattery battery{0.0};  // No reading yet.
   ASSERT_TRUE(backend.Configure(config));
   ASSERT_TRUE(AwaitReady(backend, config));
   ctre::phoenix6::configs::TalonFXConfiguration applied;

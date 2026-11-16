@@ -21,6 +21,13 @@
 
 #include "hardware/gate.h"
 
+#ifndef __FRC_ROBORIO__
+#include <frc/simulation/RoboRioSim.h>
+#include <units/voltage.h>
+
+#include "hardware/sim_backend.h"
+#endif
+
 namespace ph = ctre::phoenix6;
 namespace hw = talos::hardware;
 using namespace units::literals;
@@ -264,6 +271,13 @@ PhoenixBackend::PhoenixBackend(bool is_simulation, talos::rio::RioLog* log)
                    }},
       is_simulation_{is_simulation} {
   if (owned_log_) owned_log_->Start();
+#ifndef __FRC_ROBORIO__
+  // WPILib's simulated battery defaults to 12 V, below a pre-match battery
+  // check; rest at the charged supply sim_gateway reports instead.
+  if (is_simulation_) {
+    frc::sim::RoboRioSim::SetVInVoltage(units::volt_t{hw::kSimRestingSupplyV});
+  }
+#endif
 }
 
 std::optional<hw::ConfigError> PhoenixBackend::last_config_error() const {
