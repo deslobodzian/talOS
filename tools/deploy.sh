@@ -5,12 +5,13 @@
 #
 # Layout under the prefix (default /opt/talos):
 #   bundles/<stamp>/   one installed bundle each (immutable after install)
-#   current -> bundles/<stamp>   what boot and `run` use
+#   current -> bundles/<stamp>   what boot and `run` start
 #   previous -> bundles/<stamp>  rollback target
 #
 #   ./tools/deploy.sh install <bundle> [--prefix DIR] [--no-warm-up]
 #   ./tools/deploy.sh enable-boot [--prefix DIR] [--user NAME] [--dry-run]
 #   ./tools/deploy.sh boot-check
+#   ./tools/deploy.sh run [--prefix DIR] [--dry-run] [--] [run.sh arguments]
 #   ./tools/deploy.sh logs [--prefix DIR] [LOG_ROOT]
 #   ./tools/deploy.sh fetch [--prefix DIR] DEST
 #   ./tools/deploy.sh rollback [--prefix DIR] [--no-warm-up]
@@ -887,6 +888,84 @@ $stderr_log $user:$group 644 4 1024 * NB"
   say "boot start enabled (talos.service)"
 }
 
+# --- run --------------------------------------------------------------------
+# Starts the selected bundle by hand, in the foreground, as the boot service
+# does: <prefix>/current/run.sh with TALOS_LOG_DIR=<prefix>/logs and every
+# argument after `run` (all of them after `--`) passed on, so `--remote
+# <address>` reaches the launcher. On Linux it first takes the boot unit's
+# LimitRTPRIO=49 and LimitMEMLOCK=infinity with `ulimit` (soft and hard, as
+# systemd sets them), which needs no privilege when the caller's hard limits
+# already allow them (docs/INSTALL.md gives the one-time grant); otherwise
+# it starts nothing. macOS's realtime policy needs no limit. It then execs
+# run.sh, which execs the launcher, so the launcher runs in this process:
+# the pid printed first is the launcher's, and Ctrl-C reaches it alone.
+# Refused while the boot service is running the same run.sh: the launcher
+# would refuse a second session in its namespace anyway, but this says why.
+
+# The program the boot service is running, empty when it is not running or
+# cannot be asked. Read-only, no sudo.
+boot_service_program() {
+  if [ "$1" = "1" ]; then
+    command -v launchctl >/dev/null 2>&1 || return 0
+    local status
+    status="$(launchctl print system/org.talos.robot 2>/dev/null)" || return 0
+    printf '%s\n' "$status" | grep -q '^[[:space:]]*state = running$' || return 0
+    printf '%s\n' "$status" |
+      awk '$1 == "program" && $2 == "=" { print $3; exit }'
+  else
+    command -v systemctl >/dev/null 2>&1 || return 0
+    case "$(systemctl show -p ActiveState --value talos.service 2>/dev/null)" in
+      active|activating|reloading|deactivating|refreshing) ;;
+      *) return 0 ;;
+    esac
+    systemctl show -p ExecStart --value talos.service 2>/dev/null |
+      sed -n 's/.*path=\([^ ;]*\) ;.*/\1/p' | sed -n 1p
+  fi
+}
+
+cmd_run() {
+  local run_sh="$PREFIX/current/run.sh"
+  [ -x "$run_sh" ] ||
+    die "no bundle selected: $run_sh is not an executable run.sh (deploy.sh install one first)"
+  local darwin=0
+  [ "$(uname -s)" = "Darwin" ] && darwin=1
+  local running; running="$(boot_service_program "$darwin")"
+  # -ef: the same file however a link spells it.
+  if [ -n "$running" ] && [ "$running" -ef "$run_sh" ]; then
+    if [ "$darwin" = "1" ]; then
+      die "the boot service is running $run_sh; stop it first (sudo launchctl bootout system/org.talos.robot; deploy.sh enable-boot restores it)"
+    fi
+    die "the boot service is running $run_sh; stop it first (sudo systemctl stop talos)"
+  fi
+  # run.sh's own rule: an --output-dir argument replaces TALOS_LOG_DIR.
+  local root="$PREFIX/logs" arg
+  for arg in "$@"; do
+    case "$arg" in --output-dir|--output-dir=*) root="" ;; esac
+  done
+  if [ -n "$root" ] && [ -d "$root" ] && [ ! -w "$root" ]; then
+    die "cannot write the session root $root (enable-boot gives it to the service account); pass --output-dir DIR"
+  fi
+  if [ "$darwin" = "0" ]; then
+    # Through `run`, a function, so the builtin sets this shell's limits
+    # and --dry-run prints exactly these commands.
+    if ! { run ulimit -r 49 && run ulimit -l unlimited; } 2>/dev/null; then
+      die "the realtime limits the boot service has need a one-time grant: your hard rtprio is $(ulimit -H -r) (need 49) and hard memlock $(ulimit -H -l) KiB (need unlimited); add /etc/security/limits.d/talos.conf for $(id -un) and log in again (docs/INSTALL.md \"Realtime grant for deploy.sh run\"), or for this terminal only: sudo prlimit --pid $PPID --rtprio=49:49 --memlock=unlimited:unlimited"
+    fi
+  fi
+  local where="$root"
+  [ -n "$where" ] || where="the --output-dir given"
+  local pid="launcher pid $$"
+  [ "$DRY_RUN" = "0" ] || pid="would start the launcher"
+  say "$pid; its session directory is a new <session id>/ under $where (the launcher prints it as Output Dir)"
+  if [ "$DRY_RUN" = "1" ]; then
+    printf '+ exec env TALOS_LOG_DIR=%s %s' "$PREFIX/logs" "$run_sh"
+    [ $# -eq 0 ] || printf ' %s' "$@"
+    printf '\n'
+    return 0
+  fi
+  exec env TALOS_LOG_DIR="$PREFIX/logs" "$run_sh" "$@"
+}
+
 # --- logs -------------------------------------------------------------------
 # List session directories under the output root, oldest first by the start
 # time their manifest records (a session id is not a time), and summarize the
@@ -1109,15 +1188,17 @@ cmd_prune() {
   done
 }
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd="${1:-}"; shift || true
   # Global flags ride anywhere on the command line; subcommand flags
   # (--user, --keep) are consumed by each subcommand below.
   local rest=()
+  # After `--` nothing is read here: `run` passes it all to run.sh.
   while [ $# -gt 0 ]; do
     case "$1" in
+      --) shift; [ $# -eq 0 ] || rest+=("$@"); break ;;
       --prefix) PREFIX="$2"; shift 2 ;;
       --dry-run) DRY_RUN=1; shift ;;
       --no-warm-up) WARM_UP=0; shift ;;
@@ -1139,6 +1220,7 @@ main() {
     boot-check) cmd_boot_check "$@" ;;
     logs) cmd_logs "$@" ;;
     fetch) cmd_fetch "$@" ;;
+    run) cmd_run "$@" ;;
     rollback) cmd_rollback "$@" ;;
     prune) cmd_prune "$@" ;;
     *) usage; exit 2 ;;

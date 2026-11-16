@@ -144,6 +144,7 @@ simulation. A launch that changes the ports with `--remote-port` and
 ./tools/deploy.sh install <bundle> [--prefix /opt/talos] [--no-warm-up]
 ./tools/deploy.sh enable-boot [--prefix /opt/talos] [--user talos] [--dry-run]
 ./tools/deploy.sh boot-check
+./tools/deploy.sh run [--prefix /opt/talos] [--dry-run] [--] [run.sh arguments]
 ./tools/deploy.sh logs [--prefix /opt/talos] [LOG_ROOT]
 ./tools/deploy.sh fetch [--prefix /opt/talos] DEST
 ./tools/deploy.sh rollback [--prefix /opt/talos] [--no-warm-up]
@@ -228,6 +229,33 @@ A relative `--prefix` is resolved against the working directory.
   updates install on their own (which restarts the Mini); `enable-boot`
   changes neither FileVault nor updates, which a person sets in System
   Settings. `tools/mac_qualify.sh` runs it as a step.
+- **run** starts the selected bundle by hand, in the foreground, as the
+  boot service starts it: `<prefix>/current/run.sh` with
+  `TALOS_LOG_DIR=<prefix>/logs`, every argument after `run` passed to
+  `run.sh` and so to the launcher (`deploy.sh run --remote 10.0.0.72
+  --duration-s 60` for a RoboRIO on another network; after `--`,
+  `deploy.sh`'s own `--prefix`, `--dry-run` and `--no-warm-up` are passed
+  on too). On Linux it first takes the boot unit's limits, `ulimit -r 49` and
+  `ulimit -l unlimited`, which needs no privilege once the account's hard limits allow
+  them ([the one-time grant](INSTALL.md#realtime-grant-for-deploysh-run));
+  without it, it starts nothing and exits 1 with one line naming the hard
+  limits it found, the grant and, for one terminal only, `sudo prlimit --pid
+  <its shell> --rtprio=49:49 --memlock=unlimited:unlimited`. macOS's
+  realtime policy needs no limit, so there it just starts. It prints
+  `deploy: launcher pid <pid>; its session directory is a new <session
+  id>/ under <root> ...` and then execs `run.sh`, which execs the launcher
+  in the same process, so that pid is the launcher's and Ctrl-C reaches it
+  alone; the launcher prints the session directory as `Output Dir:`. An
+  `--output-dir` argument replaces the root, as it does for `run.sh`
+  (give an absolute path: `run.sh` changes into the bundle directory, so a
+  relative one resolves inside it); a
+  root the person cannot write (`enable-boot` gives `<prefix>/logs` to the
+  service account) is refused, naming `--output-dir`. It refuses to start
+  while the boot service is running the same `run.sh` (`systemctl show
+  talos.service`, `launchctl print system/org.talos.robot`, read without
+  sudo), naming the command that stops it; one it cannot ask is left to the
+  launcher's [one session per namespace](../talOS/launcher/README.md#one-session-per-namespace).
+  `--dry-run` prints the `ulimit` (Linux) and the `exec` it would run.
 - **logs** lists session directories under `<prefix>/logs` (or `LOG_ROOT`),
   oldest first by the `start_wall_ns` their manifest records (the directory's
   modification time without one; session ids are not ordered in time), each
@@ -265,8 +293,10 @@ A relative `--prefix` is resolved against the working directory.
   and the ones `current` and `previous` select, however old. Prune after
   activating the selection, so the running bundle is among those kept.
 
-Run by hand: `/opt/talos/current/run.sh --duration-s 30`. Stop the boot
-service first (`sudo systemctl stop talos`; on macOS
+Run by hand: `./tools/deploy.sh run --duration-s 30` (above), which gives
+the launcher the boot service's realtime limits on Linux, or
+`/opt/talos/current/run.sh --duration-s 30`, which runs with the caller's
+limits. Stop the boot service first (`sudo systemctl stop talos`; on macOS
 `sudo launchctl bootout system/org.talos.robot`, and `enable-boot` again
 afterwards): only one launcher may run a session in a shared-memory namespace,
 so a second is refused with the running one's pid
@@ -276,8 +306,9 @@ Boot services set `TALOS_LOG_DIR=<prefix>/logs`. The generated `run.sh` passes
 that directory as the launcher's output **root**, unless an explicit
 `--output-dir ROOT` is supplied. The launcher appends a unique session id on
 every invocation, so recordings live in `<prefix>/logs/<session-id>/` and
-restarts of the service never reuse a previous session folder. For a manual
-run to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
+restarts of the service never reuse a previous session folder. `deploy.sh run`
+sets it the same way; for a manual
+run of `run.sh` to use the same root, set `TALOS_LOG_DIR=/opt/talos/logs` or pass
 `--output-dir /opt/talos/logs`; `logs LOG_ROOT` can inspect another output root.
 
 Each node's stdout and stderr, every run of it, land in
