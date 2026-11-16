@@ -33,10 +33,13 @@ class InstallCheckTest(unittest.TestCase):
             prefix = os.path.join(tmp, "prefix")
             current = os.path.join(prefix, "current")
 
+            # The graph check is the subject, not the warm-up (warm_up_test's,
+            # and bundle_test's for every real bundle): without it the check
+            # pays each member's first exec itself, about 2 s on macOS.
             def install(bundle, to=prefix):
                 return subprocess.run(
                     ["bash", deploy_script(), "install", bundle,
-                     "--prefix", to],
+                     "--prefix", to, "--no-warm-up"],
                     capture_output=True, text=True, timeout=120)
 
             def shown(proc):
