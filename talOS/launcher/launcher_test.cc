@@ -35,12 +35,14 @@
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/events/input_replay.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/events/session_manifest.h"
 #include "talOS/hardware/packet.h"
 #include "talOS/introspection/describe.h"
 #include "talOS/introspection/names.h"
 #include "talOS/launcher/file_digest.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/log_merge.h"
+#include "talOS/launcher/session_lock.h"
 #include "talOS/launcher/session_retention.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
@@ -2165,15 +2167,18 @@ TEST(LauncherGraphTest, AGraphFileThatCannotBeWrittenRefusesTheLaunch) {
   const std::string record = TempPath("unwritable_graph_record");
   std::filesystem::create_directories(record);
   for (const auto& [tag, file] :
-       {std::pair{"unwritable_declared_graph", "declared_graph.json"},
-        std::pair{"unwritable_graph", "graph.json"}}) {
+       // kSessionQuietFiles' names, so the hourly refresh touches the files
+       // a launch writes, renamed or not.
+       {std::pair{"unwritable_declared_graph", kSessionQuietFiles[2]},
+        std::pair{"unwritable_graph", kSessionQuietFiles[1]}}) {
     GraphFixture fixture{
         tag,
         DescribingStub("alpha", "//example/alpha:node",
                        {Sender("/alpha/state")}),
         GraphReaderStub("beta", "//example/beta:node", record)};
     // A directory where the file belongs: no write replaces it, even as root.
-    std::filesystem::create_directories(fixture.out_dir + "/" + file);
+    std::filesystem::create_directories(fixture.out_dir + "/" +
+                                        std::string{file});
     EXPECT_EQ(Launcher{fixture.options}.Run(), 1) << file;
     EXPECT_FALSE(fixture.has_manifest()) << file;
   }
@@ -3301,6 +3306,47 @@ TEST(LauncherSessions, AnUnlockedSessionIsLockedAtItsNextRefresh) {
                    dir, /*root_takes_no_locks=*/false, held, error)
                    .has_value());
   EXPECT_TRUE(held) << error.message();
+  session.reset();
+  std::filesystem::remove_all(root);
+}
+
+// The files a launch writes once and then leaves (manifest.json in a quiet
+// session, the graphs, the retention record) age past a /tmp cleaner's limit
+// under a long session while session.lock stays fresh; the cleaner would
+// delete them, and the session would read as abandoned or unreplayable.
+// Each refresh touches them with the lock, whether or not the lock is held;
+// one that does not exist is not created.
+// REQ-OPS-11
+TEST(LauncherSessions, ARefreshTouchesTheSessionsQuietFiles) {
+  const std::string root = TempPath("quiet_files");
+  std::filesystem::remove_all(root);
+  const std::filesystem::path dir = root + "/1";
+  std::error_code error;
+  auto session = SessionDirectoryLock::Create(
+      dir,
+      [](const std::filesystem::path& path, std::error_code& made) {
+        std::filesystem::create_directories(path, made);
+      },
+      error);
+  ASSERT_TRUE(session.has_value()) << error.message();
+  constexpr time_t kAged = 1'000'000;  // 1970: older than any cleaner's age.
+  // The writers' names: the manifest's, graph.json (held to launcher.cc by
+  // AGraphFileThatCannotBeWrittenRefusesTheLaunch), the retention record's.
+  const std::vector<std::string> quiet = {
+      std::string{event::session_manifest::kFileName},
+      std::string{kSessionQuietFiles[1]}, std::string{kRetentionRecordFile}};
+  for (const auto& name : quiet) {
+    std::ofstream{dir / name} << "{}";
+    const timespec times[2] = {{kAged, 0}, {kAged, 0}};
+    ASSERT_EQ(::utimensat(AT_FDCWD, (dir / name).c_str(), times, 0), 0);
+  }
+  EXPECT_EQ(session->Refresh(), SessionDirectoryLock::Refreshed::kHeld);
+  for (const auto& name : quiet) {
+    struct stat status {};
+    ASSERT_EQ(::stat((dir / name).c_str(), &status), 0) << name;
+    EXPECT_NE(status.st_mtime, kAged) << name << " was not touched";
+  }
+  EXPECT_FALSE(std::filesystem::exists(dir / kSessionQuietFiles[2]));
   session.reset();
   std::filesystem::remove_all(root);
 }

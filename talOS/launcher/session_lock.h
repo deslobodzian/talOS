@@ -17,7 +17,9 @@
 #include <thread>
 #include <utility>
 
+#include "talOS/events/session_manifest.h"
 #include "talOS/introspection/lock_file.h"
+#include "talOS/launcher/session_retention.h"
 #include "talOS/memory/shared_memory_ptr.h"
 
 namespace talos::launcher {
@@ -171,6 +173,14 @@ class SessionLock {
 // The file in a session directory whose lock the launch writing that
 // directory holds while it runs (SessionDirectoryLock).
 inline constexpr std::string_view kSessionDirectoryLockFile = "session.lock";
+
+// The files a launch writes once in its session directory and may not write
+// again for days, which SessionDirectoryLock::Refresh touches. graph.json
+// (launcher.cc) and the declared graph (DeclaredGraphPath) have no constant
+// of their own; launcher_test holds both names to what a launch writes.
+inline constexpr std::string_view kSessionQuietFiles[] = {
+    event::session_manifest::kFileName, "graph.json", "declared_graph.json",
+    kRetentionRecordFile};
 
 // flock(2), or what a test puts in its place
 // (LauncherOptions::lock_session_directory).
@@ -393,7 +403,13 @@ class SessionDirectoryLock {
   // and unlocked, a retention whose probe locks once the daemon answers
   // again would take and remove the running session. kTaken once it locks;
   // kNone while it cannot (a root that takes no locks).
+  //
+  // It also touches the files a launch writes once and may not write again
+  // for days (TouchQuietFiles), with the same cleaner in mind: a quiet
+  // session's manifest, its graphs and its retention record. One that is absent
+  // stays absent: the touch is a utimensat(2) of the path, never a create.
   Refreshed Refresh(const FlockFunction& lock = ::flock) {
+    TouchQuietFiles();
     if (fd_ < 0) {
       const int fd = TakeCurrent(lock);
       if (fd < 0) return Refreshed::kNone;
@@ -436,6 +452,13 @@ class SessionDirectoryLock {
  private:
   SessionDirectoryLock(int fd, std::string path)
       : fd_{fd}, path_{std::move(path)} {}
+
+  void TouchQuietFiles() const {
+    const std::filesystem::path dir =
+        std::filesystem::path{path_}.parent_path();
+    for (const std::string_view name : kSessionQuietFiles)
+      ::utimensat(AT_FDCWD, (dir / name).c_str(), nullptr, AT_SYMLINK_NOFOLLOW);
+  }
 
   // The file path_ names, opened (created when absent, never its directory)
   // and exclusively locked; -1 when it cannot be.

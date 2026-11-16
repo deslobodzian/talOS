@@ -571,6 +571,7 @@ cc_test(
         "//talOS/driver_station",
         "//talOS/events:events_log",
         "//talOS/events:input_replay",
+        "//talOS/events:session_manifest",
         "//talOS/hardware",
         "//talOS/introspection:describe",
         "//talOS/introspection:names",
