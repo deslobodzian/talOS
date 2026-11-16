@@ -693,9 +693,9 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
                              bool live_complete) {
   using Key =
       std::tuple<std::string, int, std::uint32_t, std::uint32_t, std::uint32_t>;
-  constexpr std::uint32_t kLinted = naming::kSourceFlagExternal |
-                                    naming::kSourceFlagOptional |
-                                    naming::kSourceFlagObserver;
+  constexpr std::uint32_t kLinted =
+      naming::kSourceFlagExternal | naming::kSourceFlagOptional |
+      naming::kSourceFlagObserver | naming::kSourceFlagUntargetedOutputs;
   const auto keys = [](const std::vector<naming::SourceShape>& sources) {
     std::vector<Key> out;
     for (const auto& source : sources) {
@@ -717,6 +717,9 @@ std::string EndpointMismatch(const std::vector<naming::SourceShape>& declared,
       if ((flags & naming::kSourceFlagExternal) != 0) out += ", external";
       if ((flags & naming::kSourceFlagOptional) != 0) out += ", optional";
       if ((flags & naming::kSourceFlagObserver) != 0) out += ", observer";
+      if ((flags & naming::kSourceFlagUntargetedOutputs) != 0) {
+        out += ", untargeted_outputs";
+      }
       out += ")";
     }
     return out;

@@ -206,8 +206,10 @@ endpoints whether or not `Node::describing()`
 checks that each run did. Once per run of every member that answered
 `--describe`, in the first supervision pass that finds the run's registry row
 active with its sources published, it compares the row's topic ends with the
-probe's: kind, topic, message size, alignment and the `external`, `optional`
-and `observer` attributes, as multisets. Timers are not endpoints, and the
+probe's: kind, topic, message size, alignment and the `external`, `optional`,
+`observer` and `untargeted_outputs` attributes, as multisets, so a node that
+lifts its flush's target gate only when it is not describing
+(REQ-SAFE-42) is refused as below. Timers are not endpoints, and the
 loop's latest-only flag, which a probe reports, is a delivery detail, not an
 endpoint attribute. The schema hash is not in
 the registry; it needs no comparison, because every declared topic's
