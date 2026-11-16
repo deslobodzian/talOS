@@ -56,11 +56,36 @@ cc_library(
     ],
 )
 
+# The swerve configuration, recording backend and command builder the
+# gateway tests share.
+cc_library(
+    name = "gateway_test_support",
+    testonly = True,
+    hdrs = ["gateway_test_support.h"],
+    deps = [":hardware"],
+)
+
 cc_test(
     name = "gateway_test",
     size = "small",
     srcs = ["gateway_test.cc"],
     deps = [
+        ":gateway_test_support",
+        ":hardware",
+        "//talOS/protocol",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# The Endpoint over a loopback UDP socket: its waits poll the socket on the
+# real clock, so it runs in the integration lane, apart from gateway_test.
+cc_test(
+    name = "gateway_endpoint_test",
+    size = "small",
+    srcs = ["gateway_endpoint_test.cc"],
+    tags = ["integration"],
+    deps = [
+        ":gateway_test_support",
         ":hardware",
         "//talOS/protocol",
         "@googletest//:gtest_main",

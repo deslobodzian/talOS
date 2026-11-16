@@ -32,8 +32,8 @@ talOS/events/log/log_test.cc sleep 8 seeded: integration, writer thread; TEST-8 
 talOS/events/os/poller_test.cc sleep 2 integration: real kqueue/epoll timer delivery across threads
 talOS/events/realtime_event_loop_test.cc clock 4 seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
 talOS/events/realtime_event_loop_test.cc sleep 4 seeded: integration, the realtime loop on the real clock; sleeps unaudited against TESTING.md §6.3
-talOS/hardware/gateway_test.cc clock 2 seeded: a UDP wait helper in a component target; move the case to its own target (TESTING.md §2)
-talOS/hardware/gateway_test.cc sleep 1 seeded: a UDP wait helper in a component target; move the case to its own target (TESTING.md §2)
+talOS/hardware/gateway_endpoint_test.cc clock 2 integration: Endpoint on a real UDP socket; Eventually polls until a 10 s deadline that only bounds a hang (TESTING.md §6.3)
+talOS/hardware/gateway_endpoint_test.cc sleep 1 integration: Endpoint on a real UDP socket; Eventually polls 1 ms apart
 talOS/introspection/registry_test.cc clock 5 seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
 talOS/introspection/registry_test.cc sleep 5 seeded: integration, file locks across threads and processes; sleeps unaudited against TESTING.md §6.3
 talOS/launcher/continuity_test.cc sleep 3 seeded: integration, spawned processes; sleeps unaudited against TESTING.md §6.3
