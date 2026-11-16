@@ -106,7 +106,8 @@ class LoopWatchdog {
   uint64_t stall_count() const {
     return stalls_.load(std::memory_order_relaxed);
   }
-  // Reports dropped because kReportSlots were still undelivered.
+  // Reports dropped because kReportSlots were still undelivered: stalls
+  // with no Driver Station error. The loop prints each rise (LoopConsole.h).
   uint64_t dropped_reports() const {
     return dropped_reports_.load(std::memory_order_relaxed);
   }

@@ -1,7 +1,9 @@
 // The RoboRIO console's lines for what the loop finds after a tick and no
 // State carries: each command expiry once, with its time and its delay from
-// the command's observation. Driven through a real gateway on explicit
-// times, as the loop drives it.
+// the command's observation; each changed configuration refused while
+// enabled; and each rise in the loop watchdog's dropped stall reports.
+// Driven through a real gateway and watchdog on explicit times, as the loop
+// drives them.
 #include "LoopConsole.h"
 
 #include <gtest/gtest.h>
@@ -12,6 +14,7 @@
 #include <string_view>
 #include <vector>
 
+#include "LoopWatchdog.h"
 #include "RioLog.h"
 #include "hardware/config.h"
 #include "hardware/gateway.h"
@@ -122,6 +125,55 @@ TEST_F(LoopConsoleTest, APushRefusedWhileEnabledNamesTheFixOncePerPush) {
   EXPECT_EQ(gateway_.snapshot().config_id, hw::ConfigurationId(changed));
   log_.Drain(30'000'000);
   EXPECT_EQ(lines_.size(), 2u);
+}
+
+// Watchdog outputs whose reports are never delivered: the reporter thread
+// blocked in a Driver Station call.
+class UndeliveredOutputs final : public talos::rio::WatchdogOutputs {
+ public:
+  bool Neutralize() override { return true; }
+  void Report(std::string_view) override {}
+};
+
+// One Driver Station error per stall is the watchdog's contract; a stall
+// past its kReportSlots undelivered reports loses its error. The console
+// says so whenever the dropped count rises, with the stalls in all, so a
+// lost stall report is never silent.
+// REQ-SAFE-25
+TEST_F(LoopConsoleTest, DroppedWatchdogReportsArePrintedWhenTheyRise) {
+  UndeliveredOutputs outputs;
+  talos::rio::LoopWatchdog watchdog{outputs};
+  uint64_t now_us = 1'000'000;
+  // Each stall: a beat whose deadline then passes, and a poll that finds it.
+  const auto stall = [&] {
+    watchdog.Beat(now_us, now_us + 1);
+    watchdog.Poll(now_us + 1);
+    now_us += kPeriodUs;
+  };
+  for (std::size_t i = 0; i < talos::rio::LoopWatchdog::kReportSlots; ++i)
+    stall();
+  console_.ObserveWatchdog(watchdog);
+  log_.Drain(5'000'000);
+  ASSERT_TRUE(lines_.empty()) << "nothing was dropped yet: " << lines_[0];
+
+  stall();
+  ASSERT_EQ(watchdog.dropped_reports(), 1u);
+  console_.ObserveWatchdog(watchdog);
+  console_.ObserveWatchdog(watchdog);  // the next tick: no new drop
+  log_.Drain(10'000'000);
+  ASSERT_EQ(lines_.size(), 1u);
+  EXPECT_NE(lines_[0].find("1 stall report dropped (1 since start), 5 stalls"),
+            std::string::npos)
+      << lines_[0];
+
+  stall();
+  stall();
+  console_.ObserveWatchdog(watchdog);
+  log_.Drain(20'000'000);
+  ASSERT_EQ(lines_.size(), 2u);
+  EXPECT_NE(lines_[1].find("2 stall reports dropped (3 since start), 7 stalls"),
+            std::string::npos)
+      << lines_[1];
 }
 
 }  // namespace
