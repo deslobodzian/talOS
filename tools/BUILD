@@ -1,7 +1,8 @@
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_test")
 
 # manifest_sync_test (sync_manifest.bzl) runs the script as its main;
-# //bench/main_processor:bundle_test installs bundles with deploy.sh; a robot
+# //bench/main_processor:bundle_test, :install_check_test and :warm_up_test
+# install bundles with deploy.sh; a robot
 # repository's trace_test runs trace.py as its main
 # (examples/robot_repo/BUILD.bazel).
 exports_files([
