@@ -48,8 +48,9 @@ struct RecordedTopic {
   // before the stretch (a send is fed at its publication time, its record's
   // now_ns, and now_ns never decreases along a log); for a reader's
   // receipts, the publication time of its last intact receipt of the topic
-  // (a watcher receives in sequence order). Where nothing bounds it, the
-  // log is refused instead (below).
+  // (a watcher receives in sequence order); both counted along the log
+  // across its segments (a later segment starts from the one before it,
+  // when read). Where nothing bounds it, the log is refused instead (below).
   std::optional<MonotonicTime> first_gap;
   std::string first_gap_log;
   // Where that loss is a damaged stretch: its byte offset in first_gap_log.
