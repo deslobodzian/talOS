@@ -68,6 +68,27 @@ TEST(ConfigTest, RejectsInvalidFollowerAndGravityDeclarations) {
       "follow = \"other\"\n[subsystems.other.motors.other]\ncan_id = 2\n");
 }
 
+// REQ-CONTRACT-39: foc defaults off, so a config written before the key
+// sends no Phoenix Pro request; a follower copies its master's output, so
+// foc on one is refused, naming the follower, the key and the master.
+TEST(ConfigTest, MotorFocDefaultsOffAndIsRefusedOnAFollower) {
+  EXPECT_FALSE(Parse("").hardware.motors.at(0).foc);
+  EXPECT_TRUE(Parse("foc = true\n").hardware.motors.at(0).foc);
+  ExpectRejected("foc = 1\n");
+  constexpr std::string_view kFollower =
+      "foc = true\n[subsystems.test.motors.m2]\ncan_id = 2\nfollow = \"m1\"\n";
+  EXPECT_FALSE(Parse(kFollower).hardware.motors.at(1).foc);
+  try {
+    Parse(std::string(kFollower) + "foc = true\n");
+    ADD_FAILURE() << "loaded a follower with foc";
+  } catch (const std::invalid_argument& e) {
+    // The key, the follower and its master, whatever the wording.
+    const std::string what = e.what();
+    for (const auto* name : {"foc", "m2", "m1"})
+      EXPECT_NE(what.find(name), std::string::npos) << name << ": " << what;
+  }
+}
+
 // An absent key keeps Phoenix's default (an enabled normally open switch), so
 // a robot that never names its limit inputs behaves as before the keys existed.
 TEST(ConfigTest, MotorLimitSwitchesDefaultToPhoenixAndRejectUnknownTypes) {

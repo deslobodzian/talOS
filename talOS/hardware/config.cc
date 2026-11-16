@@ -115,6 +115,7 @@ void Validate(const Config& c) {
               "follower master must exist on the same CAN bus");
       Require(master->master_id == 0, "follower chains are not supported");
     }
+    Require(m.master_id == 0 || !m.foc, "a follower cannot set foc");
     Require(Positive(m.supply_limit_a) && Positive(m.stator_limit_a) &&
                 Positive(m.max_voltage) && m.max_voltage <= 12,
             "invalid motor limits");
@@ -270,6 +271,7 @@ uint64_t ConfigurationId(const Config& c) {
       for (double x : {g.p, g.i, g.d, g.s, g.v, g.a, g.g}) h.Number(x);
       h.Add(static_cast<uint8_t>(g.gravity_type));
     }
+    h.Add(m.foc);
   }
   for (const auto& s : c.sensors) {
     h.Add(s.id);

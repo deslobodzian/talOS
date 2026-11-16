@@ -132,10 +132,10 @@ DRIVEN_RPS = 1.0
 SILENT_WAIT_SECONDS = 30
 
 # What the scenario decodes of the RoboRIO link, as talOS/hardware/messages.cc
-# and talOS/protocol/frame.h encode it at protocol version 9. A frame of
+# and talOS/protocol/frame.h encode it at protocol version 10. A frame of
 # another version fails the run rather than being misread: a layout change
 # updates this decoder (RULES.md 9).
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 FRAME_MAGIC = 0x4F4952534F4C4154
 FRAME_HEADER = struct.Struct("<QHHHHQQII")
 STATE_FRAME, COMMAND_FRAME, DRIVER_STATION_FRAME = 20, 21, 24

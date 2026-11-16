@@ -1,10 +1,11 @@
-// The State and Command encodings, pinned to the protocol version they are
-// spoken under (docs/DATA_FLOW.md, "UDP frame and payload sizes"). Recorded
-// sessions keep these bytes and are decoded by later builds' codecs only
-// under the version their manifest records (REQ-OPS-51), so an encoding
+// The State, Command and config encodings, pinned to the protocol version
+// they are spoken under (docs/DATA_FLOW.md, "UDP frame and payload sizes").
+// Recorded sessions keep these bytes and are decoded by later builds' codecs
+// only under the version their manifest records (REQ-OPS-51), so an encoding
 // change that keeps every length, made without bumping kProtocolVersion,
-// would decode every earlier session wrongly with no warning. This test
-// fails on any change to the bytes of a fully populated packet: bump
+// would decode every earlier session wrongly with no warning; and the two
+// ends of the link refuse each other only by version. This test fails on any
+// change to the bytes of a fully populated packet or configuration: bump
 // kProtocolVersion with the change and regenerate the constants it prints.
 // Every value is exactly representable (dyadic fractions, tenths that the
 // signed-tenths fields hold exactly), so the bytes are the same on every
@@ -18,7 +19,9 @@
 #include <cstdio>
 #include <span>
 #include <string>
+#include <vector>
 
+#include "talOS/hardware/config_wire.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/protocol/types.h"
 
@@ -26,11 +29,13 @@ namespace talos::hardware {
 namespace {
 
 // The encodings this file pins and the protocol version they belong to.
-constexpr std::uint16_t kGoldenVersion = 9;
+constexpr std::uint16_t kGoldenVersion = 10;
 constexpr std::size_t kStateBytes = 1419;
 constexpr std::uint64_t kStateHash = 0x270781b104f788b0;
 constexpr std::size_t kCommandBytes = 414;
 constexpr std::uint64_t kCommandHash = 0xe43b8a06779c5ed5;
+constexpr std::size_t kConfigBytes = 10099;
+constexpr std::uint64_t kConfigHash = 0x0e91cec772122683;
 
 std::uint64_t Fnv1a64(std::span<const std::uint8_t> bytes) {
   std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -160,6 +165,97 @@ Command FullCommand() {
   return c;
 }
 
+// Every device slot filled, every name and bus at its 63-byte limit, every
+// field a value of its own: the largest configuration the wire carries.
+Config FullConfig() {
+  Config c;
+  c.period_us = 0x01020304;
+  c.command_timeout_us = 0x11121314;
+  c.status_hz = 187.5;
+  c.commissioned = true;
+  std::uint16_t next_id = 1;
+  const auto name = [&next_id](char fill) {
+    const auto suffix = std::to_string(next_id);
+    return std::string(63 - suffix.size(), fill) + suffix;
+  };
+  for (std::size_t i = 0; i < kMaxMotors; ++i) {
+    const double k = static_cast<double>(i);
+    MotorConfig m;
+    m.name = name('m');
+    m.id = next_id++;
+    m.can_id = static_cast<int>(i);
+    m.bus = std::string(63, static_cast<char>('a' + i % 4));
+    m.inverted = i % 2 == 0;
+    m.brake = i % 3 == 0;
+    m.master_id = i % 2 == 1 ? static_cast<std::uint16_t>(i) : 0;
+    m.oppose_master = i % 4 == 1;
+    m.supply_limit_a = 20.5 + k;
+    m.stator_limit_a = 40.25 + k;
+    m.max_voltage = 6.125 + k / 4;
+    m.feedback = i % 3 == 1 ? Feedback::kRemoteCANcoder : Feedback::kRotor;
+    m.feedback_sensor_id = static_cast<std::uint16_t>(0x200 + i);
+    m.rotor_to_sensor_ratio = 1.5 + k;
+    m.sensor_to_mechanism_ratio = 2.75 + k;
+    m.continuous_wrap = i % 2 == 1;
+    m.soft_limits = i % 3 == 2;
+    m.reverse_limit_rot = -3.5 - k;
+    m.forward_limit_rot = 4.5 + k;
+    m.forward_limit_switch = static_cast<LimitSwitch>(i % 3);
+    m.reverse_limit_switch = static_cast<LimitSwitch>((i + 1) % 3);
+    m.max_velocity_rps = 50.5 + k;
+    m.cruise_velocity_rps = 25.25 + k;
+    m.acceleration_rps2 = 60.75 + k;
+    m.jerk_rps3 = 100.0 + k;
+    for (std::size_t s = 0; s < m.slots.size(); ++s) {
+      const double j = k + static_cast<double>(s) / 8;
+      m.slots[s] = {
+          0.5 + j,  0.25 + j, 0.125 + j, 0.0625 + j,
+          0.75 + j, 1.5 + j,  2.25 + j,  static_cast<GravityType>((i + s) % 2)};
+    }
+    m.foc = i % 2 == 0;
+    c.motors.push_back(m);
+  }
+  for (std::size_t i = 0; i < kMaxSensors; ++i) {
+    SensorConfig s;
+    s.name = name('s');
+    s.id = next_id++;
+    s.kind = i % 2 == 0 ? SensorKind::kCANcoder : SensorKind::kPigeon2;
+    s.can_id = static_cast<int>(20 + i);
+    s.bus = std::string(63, static_cast<char>('e' + i % 4));
+    s.inverted = i % 2 == 1;
+    s.offset_rot = -0.5 + static_cast<double>(i) / 16;
+    c.sensors.push_back(s);
+  }
+  for (std::size_t i = 0; i < kMaxDigitalInputs; ++i) {
+    c.digital_inputs.push_back({next_id, name('i'), static_cast<int>(i)});
+    ++next_id;
+  }
+  for (std::size_t i = 0; i < kMaxDigitalOutputs; ++i) {
+    c.digital_outputs.push_back({next_id, name('o'), static_cast<int>(10 + i)});
+    ++next_id;
+  }
+  for (std::size_t i = 0; i < kMaxAnalogInputs; ++i) {
+    c.analog_inputs.push_back({next_id, name('a'), static_cast<int>(i)});
+    ++next_id;
+  }
+  for (std::size_t i = 0; i < kMaxEncoders; ++i) {
+    EncoderConfig e;
+    e.name = name('e');
+    e.id = next_id++;
+    e.kind = i % 2 == 0 ? EncoderKind::kQuadrature : EncoderKind::kDutyCycle;
+    e.dio_a = static_cast<int>(14 + 2 * i);
+    e.dio_b = i % 2 == 0 ? static_cast<int>(15 + 2 * i) : -1;
+    e.counts_per_rev = 2048 + static_cast<double>(i);
+    e.offset_rot = 0.125 * static_cast<double>(i);
+    c.encoders.push_back(e);
+  }
+  for (std::size_t i = 0; i < kMaxPwmOutputs; ++i) {
+    c.pwm_outputs.push_back({next_id, name('p'), static_cast<int>(i)});
+    ++next_id;
+  }
+  return c;
+}
+
 // Guards: the State and Command bytes of protocol kGoldenVersion. A failure
 // here is a wire change: bump kProtocolVersion (docs/DATA_FLOW.md) and
 // regenerate the constants above from the values this prints.
@@ -184,6 +280,20 @@ TEST(WireGolden, StateAndCommandBytesBelongToTheirProtocolVersion) {
       << "the Command encoding changed: bump kProtocolVersion and regenerate "
          "this constant (now "
       << command_size << " bytes, hash " << Hex(command_hash) << ")";
+}
+
+// Guards: the config bytes of protocol kGoldenVersion, which the bridge
+// pushes and the RoboRIO saves. A failure here is a wire change: bump
+// kProtocolVersion (docs/DATA_FLOW.md) and regenerate the constants above.
+// REQ-OPS-51, REQ-CONTRACT-39
+TEST(WireGolden, ConfigBytesBelongToTheirProtocolVersion) {
+  ASSERT_EQ(protocol::kProtocolVersion, kGoldenVersion);
+  const std::vector<std::uint8_t> config = SerializeConfig(FullConfig());
+  const std::uint64_t config_hash = Fnv1a64(config);
+  EXPECT_TRUE(config.size() == kConfigBytes && config_hash == kConfigHash)
+      << "the config encoding changed: bump kProtocolVersion and regenerate "
+         "this constant (now "
+      << config.size() << " bytes, hash " << Hex(config_hash) << ")";
 }
 
 }  // namespace

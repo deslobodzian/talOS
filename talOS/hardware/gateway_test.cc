@@ -639,6 +639,69 @@ TEST(Config, LimitSwitchesTravelOnTheWireAndFingerprint) {
   EXPECT_FALSE(DeserializeConfig(bytes, decoded));
 }
 
+// The RoboRIO sets EnableFOC from foc, so both ends must agree on it: it
+// travels on the config wire as one byte, 0 or 1, and changes the config id.
+// A follower copies its master's output, so it cannot set foc.
+// REQ-CONTRACT-39
+TEST(Config, FocTravelsOnTheWireAndFingerprintAndAFollowerCannotSetIt) {
+  auto c = SwerveConfig(true);
+  const auto default_id = ConfigurationId(c);
+  c.motors[0].foc = true;
+  EXPECT_NE(ConfigurationId(c), default_id);
+  Config decoded;
+  ASSERT_TRUE(DeserializeConfig(SerializeConfig(c), decoded));
+  EXPECT_EQ(decoded, c);
+
+  // The one byte that differs from foc = false is foc's; 2 is refused.
+  auto bytes = SerializeConfig(c);
+  auto off = c;
+  off.motors[0].foc = false;
+  const auto off_bytes = SerializeConfig(off);
+  ASSERT_EQ(bytes.size(), off_bytes.size());
+  const auto at = std::mismatch(bytes.begin(), bytes.end(), off_bytes.begin());
+  ASSERT_NE(at.first, bytes.end());
+  EXPECT_EQ(*at.first, 1);
+  *at.first = 2;
+  EXPECT_FALSE(DeserializeConfig(bytes, decoded));
+
+  auto follower = c;
+  follower.motors[1].master_id = follower.motors[0].id;
+  EXPECT_NO_THROW(Validate(follower));
+  follower.motors[1].foc = true;
+  EXPECT_THROW(Validate(follower), std::invalid_argument);
+}
+
+// A RoboRIO's saved configuration written before foc existed (each motor
+// record one byte shorter) is refused at startup rather than misread, so the
+// RoboRIO boots unconfigured, as with a corrupt file, until the bridge
+// pushes its configuration.
+// REQ-CONTRACT-39
+TEST(ConfigWire, APersistedConfigWithoutTheFocByteIsRefused) {
+  const auto c = SwerveConfig(true);
+  ASSERT_GT(c.motors.size(), 1u);
+  auto bytes = SerializeConfig(c);
+  // Each motor's foc byte is the one that differs when only its foc does.
+  std::vector<std::ptrdiff_t> foc_offsets;
+  for (std::size_t i = 0; i < c.motors.size(); ++i) {
+    auto on = c;
+    on.motors[i].foc = true;
+    const auto on_bytes = SerializeConfig(on);
+    ASSERT_EQ(on_bytes.size(), bytes.size());
+    const auto at = std::mismatch(bytes.begin(), bytes.end(), on_bytes.begin());
+    ASSERT_NE(at.first, bytes.end());
+    foc_offsets.push_back(at.first - bytes.begin());
+  }
+  for (auto it = foc_offsets.rbegin(); it != foc_offsets.rend(); ++it)
+    bytes.erase(bytes.begin() + *it);
+  const uint32_t crc = ComputeCrc32(bytes);
+  for (int i = 0; i < 4; ++i)
+    bytes.push_back(static_cast<uint8_t>(crc >> (8 * i)));
+  Config loaded;
+  EXPECT_FALSE(LoadPersistedConfig(bytes, loaded));
+  ASSERT_TRUE(LoadPersistedConfig(PersistedConfig(c), loaded));
+  EXPECT_EQ(loaded, c);
+}
+
 TEST(SimBackend, PigeonMountCalibrationReachesIdealBackend) {
   auto config = SwerveConfig(true);
   for (auto& sensor : config.sensors) {

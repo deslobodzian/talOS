@@ -21,10 +21,11 @@ while a configure is still pending (every boot restore) is dropped without an
 ACK; the bridge pushes again after its 50 ms retry gate. The manifest holds
 logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
-gearing, three gain slots, soft limits, TalonFX limit switches, and Motion
-Magic cruise velocity, acceleration, and jerk. Changed configurations require
-disabled operation. Identical pushes may succeed while enabled without device
-traffic, but not while faulted or while configuration/restoration is pending.
+gearing, three gain slots, soft limits, TalonFX limit switches, FOC, and
+Motion Magic cruise velocity, acceleration, and jerk. Changed configurations
+require disabled operation. Identical pushes may succeed while enabled
+without device traffic, but not while faulted or while
+configuration/restoration is pending.
 
 The RoboRIO atomically and durably (synced file, rename, synced directory)
 saves acknowledged configuration bytes with a CRC32 to
@@ -44,8 +45,12 @@ again. Startup validates
 them and starts their restoration on the configure worker without waiting for
 it, so robot code reports ready at once; the gateway stays unconfigured,
 refusing commands, until the worker finishes. Missing or corrupt files leave
-the gateway unconfigured. A stale file cannot accept commands from a different
-configuration ID.
+the gateway unconfigured. A file with a motor saved before `foc` existed
+(protocol 9 or older) does not decode either, its motor records being a
+byte shorter, so the RoboRIO boots unconfigured, printing the same
+`hardware gateway config=0 ... (waiting for config push)` line as for a
+missing file, until the bridge pushes its configuration on link.
+A stale file cannot accept commands from a different configuration ID.
 
 A structurally valid configuration succeeds in degraded mode when individual
 Phoenix devices time out or are absent. Failed devices publish invalid samples;
@@ -106,6 +111,39 @@ the same subsystem on the same CAN bus; self-follow and follower chains are
 rejected. Followers use the master's output rather than their own demand,
 and neutralize when the master is neutral or loses valid feedback.
 Both simulation backends support same-direction and opposed followers.
+
+`foc = true` (default false) makes the RoboRIO send that motor every
+duty-cycle, voltage, velocity, position and Motion Magic request with
+Phoenix's `EnableFOC` set (FOC commutation; without it, none is). FOC needs a
+Phoenix Pro licence; the device reports whether it is licensed (whether a
+CANivore's licence shows there is a bench check). Config load refuses
+`foc` on a follower (`foc for <follower>: a follower follows its master's
+output; set foc on <master>`): the follower copies its master's output. The
+key is in the configuration fingerprint and wire format.
+
+At each configure the RoboRIO reads the `IsProLicensed` signal (waiting up
+to 0.5 s, one motor after another) of each motor whose own or whose
+master's `foc` is set, except a follower whose master was already read
+unlicensed. A restore reads it again only for a motor whose read got no
+answer, so a reset of a motor read licensed or unlicensed costs no read.
+A motor read not licensed is a failed device until
+the next configure, which is a changed configuration or a restart of the
+RoboRIO program (a push of the same configuration touches no device):
+invalid samples, `NeutralOut` whatever it is asked, and its bit in
+`/hw/status` `motor_fault_mask`. A follower of such a master fails with it,
+licensed or not; a master whose follower alone is unlicensed drives while
+the follower stays neutral, as with an absent follower. Each failed motor
+is named on the RoboRIO console (`[phoenix] config failed for '<motor>' ...
+during check_pro_license`). The configure still succeeds and is
+acknowledged, so no configure error crosses the link; the backend keeps the
+configure's first error (`last_config_error`, RoboRIO-side) only. A read
+that gets no answer (the device absent, or its frame late) is not a refusal:
+the motor is an unavailable device, and each restore, with the rest of its
+configuration, reads the licence again until one gets an answer. The rest
+of the robot drives,
+unless every motor and CAN sensor has failed: then the gateway's total
+feedback loss also holds DIO and PWM outputs neutral. Desktop simulation
+needs no licence and checks none.
 
 `position_frame` is `"rezero"` (the default) or `"absolute"`, which config
 load accepts only with `feedback = "RemoteCANcoder"`, since a TalonFX reset
@@ -202,9 +240,10 @@ message. Rejections before backend configuration need not populate it.
 
 Each closed-loop request selects gain slot 0, 1, or 2. Drive motors use rotor
 feedback divided by the configured mechanism ratio. Steering uses
-`RemoteCANcoder` with continuous wrapping. The backend uses standard voltage
-controls and does not require Phoenix Pro. TorqueCurrentFOC, FusedCANcoder,
-and dynamic Motion Magic requests are not implemented. Duty-cycle
+`RemoteCANcoder` with continuous wrapping. The backend uses Phoenix's voltage
+controls, which need Phoenix Pro only for a motor configured `foc = true`
+(above). TorqueCurrentFOC, FusedCANcoder, and dynamic Motion Magic requests
+are not implemented. Duty-cycle
 encoder velocity is finite-difference across Reads.
 
 Besides motors and CAN sensors, the manifest accepts RIO digital inputs and

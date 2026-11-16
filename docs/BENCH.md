@@ -293,6 +293,49 @@ simulated HAL.
   then hold button 3 again and disable: no pulse. Record the pulse widths
   and the stop time.
 
+### FOC and the Phoenix Pro check (hardware only)
+
+Desktop simulation needs no licence, so `phoenixTest` proves EnableFOC on
+each request and the failed-device handling only through a stand-in for the
+licence read. Only hardware shows that the RoboRIO reads `IsProLicensed`
+truly at configure, whether a CANivore's licence shows in it, and that the
+Kraken runs FOC. The bench Kraken X44 (CAN id 1 on CANivore `Shooter`) is
+Phoenix Pro licensed, per the owner.
+
+- [ ] In Tuner X, record whether the Kraken and the `Shooter` CANivore each
+  carry a Phoenix Pro licence.
+- [ ] Set `foc = true` under `[motors.kraken]` in
+  [the motor config](../bench/main_processor/configuration/subsystems/motor.toml)
+  as a local change, reverted after; deploy and launch. Expected: no
+  `[phoenix] ... check_pro_license` line on the RoboRIO console, and
+  `/hw/status` `motor_fault_mask` clear. Enable teleop and deflect axis 1:
+  Tuner X shows control mode `VoltageFOC`; hold button 1 (10 rps):
+  `VelocityVoltageFOC`, the speed settling at 10 rps; disable: `NeutralOut`.
+  Record applied voltage, stator and supply current at 10 rps with `foc`
+  true and false (the same speed is expected; recheck slot0 `v` if the
+  voltage differs by more than 10 %).
+- [ ] The configure time the licence read adds. No console line marks a
+  push or its acknowledgement, so read it from the session's `/hw/status`
+  records (`bazel run //talOS/launcher:log_dump -- <session-dir>`): the
+  time from the first record with `alert_error_link_lost` false to the
+  first with `configured` true. Take it at the first launch after each
+  change of `foc` (true, then false): a RoboRIO already holding the pushed
+  configuration does not configure again. Record both times.
+- [ ] A licence read with no answer. With `foc = true`, boot the RoboRIO
+  with the Kraken unpowered, launch, then power the Kraken. Expected: until
+  it is powered, the kraken's feedback is invalid and axis and buttons move
+  nothing; the console may show the configure's first error for it (a
+  timeout, during `apply_talonfx_config` or `check_pro_license`) but no
+  `foc needs a Phoenix Pro licence` line; within a few seconds of power
+  (the restore backoff, at most 2 s, then the restore), it drives in
+  `VoltageFOC` and `motor_fault_mask` clears. Record the times.
+- [ ] If a device without a licence is at hand (or the licence is not
+  confirmed), the same change with it: the console prints one `[phoenix]`
+  line for each failed motor, naming the motor, its bus, its CAN id and
+  `check_pro_license`; `/hw/status` `motor_fault_mask` carries its bit; axis
+  and buttons move nothing; the other bench devices are unaffected. Record
+  the lines.
+
 ## Fault injection and timing
 
 Use the launcher's recorded PIDs (or Studio's system view); never signal an

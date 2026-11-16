@@ -79,12 +79,25 @@ class PhoenixBackend final : public talos::hardware::Backend {
   RestoreStatus PollRestore() override;
 
  private:
+  friend class PhoenixBackendFoc;
   friend class PhoenixBackendFollowerFeedback;
   friend class PhoenixBackendRecovery;
   friend class PhoenixBackendWatchdog;
   void UpdateSimulation(double dt);
   // Builds refresh_signals_ and refresh_groups_ from signals_ (Configure).
   void GroupSignalsByNetwork(const talos::hardware::Config& c);
+  // The licence check of the motor at `index` (MotorConfig::foc), on the
+  // configure or restore worker. ReadProLicence: true or false as read;
+  // nullopt, with the status in `status`, when the read got no answer (up
+  // to 0.5 s). RefuseProLicence: marks the motor and its followers in
+  // licence_refused_ and posts a console line naming each; with
+  // `record_error`, the first becomes last_error_ unless one is set.
+  // RestoreProLicence: the restore loop's step: false while still unread;
+  // reads only a motor whose licence got no answer before.
+  std::optional<bool> ReadProLicence(std::size_t index,
+                                     ctre::phoenix::StatusCode& status);
+  void RefuseProLicence(std::size_t index, bool record_error);
+  bool RestoreProLicence(std::size_t index);
 
   // Declared first, so destroyed last: the configure worker (configure_) may
   // still post while the backend is destroyed.
@@ -156,6 +169,31 @@ class PhoenixBackend final : public talos::hardware::Backend {
   std::vector<uint16_t> signal_ids_;
   std::vector<uint16_t> unavailable_;
   std::vector<uint16_t> restoring_ids_;
+  // Motors with foc set, or following a master with it, read not Phoenix Pro
+  // licensed (MotorConfig::foc), and the followers of such a master, by
+  // logical id: failed devices until the next Configure. Read reports them
+  // invalid and Apply sends them NeutralOut. They are not in
+  // UnavailableDevices(): a licence does not arrive by retrying, so the
+  // restore loop never churns on them. The loop thread's copy of
+  // licence_refused_, taken at Configure and at each finished restore;
+  // reserved for every motor, so PollRestore adds to it without allocating.
+  std::vector<uint16_t> foc_unlicensed_;
+  // By motor index, the motors refused as foc_unlicensed_ describes. Written
+  // only by the configure and restore workers (ReadProLicence's callers);
+  // the loop thread reads it once the worker's future is ready.
+  std::array<bool, talos::hardware::kMaxMotors> licence_refused_{};
+  // By motor index, whether the motor's licence was read (true or false)
+  // under this configuration: a restore reads only one that got no answer,
+  // so a device reset costs no read. Written only by the configure and
+  // restore workers, read by the next of them; the gateway never runs a
+  // configure and a restore at once, and each starts after the last one's
+  // future was taken, which orders their accesses.
+  std::array<bool, talos::hardware::kMaxMotors> licence_read_{};
+  // Whether the motor at `motor_index` of the configuration is Phoenix Pro
+  // licensed: true or false as read, nullopt when the read got no answer.
+  // Empty: its IsProLicensed signal off simulation, and true under
+  // simulation, which needs no licence. phoenixTest sets it.
+  std::function<std::optional<bool>(std::size_t motor_index)> pro_licensed_;
 
   bool is_simulation_{false};
   std::optional<std::chrono::steady_clock::time_point> last_sim_time_;
