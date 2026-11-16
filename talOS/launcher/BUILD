@@ -337,8 +337,18 @@ py_test(
     data = [
         ":session_report",
         ":session_report_fixture",
+        ":target_lane_probe",
     ],
     deps = ["@rules_python//python/runfiles"],
+)
+
+# naming::IsTargetLane over stdin, for session_report_test's comparison of
+# session_report.py's lane grammar with the authority.
+cc_binary(
+    name = "target_lane_probe",
+    testonly = True,
+    srcs = ["testdata/target_lane_probe.cc"],
+    deps = ["//talOS/introspection:names"],
 )
 
 cc_binary(
@@ -364,7 +374,10 @@ py_binary(
     srcs = ["restart_latency.py"],
     data = [":launcher"],
     visibility = ["//visibility:public"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 py_test(
@@ -375,7 +388,10 @@ py_test(
         "restart_latency_test.py",
     ],
     data = [":restart_latency_fixture"],
-    deps = ["@rules_python//python/runfiles"],
+    deps = [
+        "//talOS/memory:shm_name",
+        "@rules_python//python/runfiles",
+    ],
 )
 
 cc_binary(

@@ -141,6 +141,7 @@ py_test(
     ],
     deps = [
         ":sync_manifest_lib",
+        "//talOS/memory:shm_name",
         "@rules_python//python/runfiles",
     ],
 )

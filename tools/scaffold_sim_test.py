@@ -37,6 +37,7 @@ from _posixshmem import shm_unlink  # what multiprocessing.shared_memory uses
 from python.runfiles import runfiles
 
 from talOS.build import sim_check
+from talOS.memory.shm_name import shm_name
 from tools import new_robot_test as harness
 from tools import new_subsystem
 from tools import sync_manifest
@@ -74,15 +75,6 @@ BACKSTOP_S = READY_TIMEOUT_S + new_subsystem.SIM_DURATION_S + 10
 # (talOS/simulation/README.md): CLOCK_MONOTONIC_RAW on macOS.
 NODE_CLOCK = (time.CLOCK_MONOTONIC_RAW if sys.platform == "darwin"
               else time.CLOCK_MONOTONIC)
-
-
-def shm_name(topic, namespace):
-    """talos::ShmObjectName (talOS/memory/shared_memory_ptr.h)."""
-    mapped = "/" + topic.lstrip("/").replace("/", ".")
-    value = 0xCBF29CE484222325
-    for byte in namespace.encode() + b"\0" + mapped.encode():
-        value = ((value ^ byte) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    return f"/~{value:016x}"
 
 
 def unlink_registry(namespace):
