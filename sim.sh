@@ -310,8 +310,10 @@ fi
 if [ "$WANT_STUDIO" = "1" ]; then
   BUILD_TARGETS="$BUILD_TARGETS $(target studio_bridge) //studio:web_dist"
 fi
+# Errors still print; the per-target "up-to-date" lines and progress do not.
 # shellcheck disable=SC2086
-bazel build $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
+bazel build --noshow_progress --ui_event_filters=-info --show_result=0 \
+  $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
 
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then
