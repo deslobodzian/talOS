@@ -49,6 +49,11 @@ std::string temp_path(std::string_view name) {
 
 using RecordingLoop = RealtimeEventLoop<log::LogWriter>;
 
+// How long a wait for an event, or a run that ends on one, may take before the
+// test fails: it only bounds a hang (docs/TESTING.md §6.3), and is far below
+// the 30 s backstop of on_publish(), so no delivery can wait for that.
+constexpr auto kHangBound = 10s;
+
 std::uint16_t register_sensor_watcher(RealtimeEventLoop<>& loop,
                                       const std::string& topic,
                                       Thunk callback = Thunk{}) {
@@ -92,11 +97,11 @@ class SensorWriter {
   RTMSQueue queue_;
 };
 
-// Spins (yielding) until `ready`, for at most five seconds; false on giving
-// up, so a loop that never gets there fails its test instead of hanging it.
+// Spins (yielding) until `ready`, for at most kHangBound; false on giving up,
+// so a loop that never gets there fails its test instead of hanging it.
 template <typename Ready>
 bool await(Ready ready) {
-  const auto give_up = std::chrono::steady_clock::now() + 5s;
+  const auto give_up = std::chrono::steady_clock::now() + kHangBound;
   while (!ready()) {
     if (std::chrono::steady_clock::now() > give_up) return false;
     std::this_thread::yield();
@@ -170,7 +175,7 @@ TEST(RealtimeEventLoop, SetupBeforeTheRunIsNotReportedAsLateness) {
   loop.arm_timer(id, loop.monotonic_now() + 5ms, 5ms);
   std::this_thread::sleep_for(100ms);
   const MonotonicTime run_start = Poller::now();
-  loop.run_for(5s);  // Bound only; exits after three ticks.
+  loop.run_for(kHangBound);  // Bound only; exits after three ticks.
   const Duration ran = Poller::now() - run_start;
   ASSERT_EQ(ticks.size(), 3u);
   EXPECT_GE(ticks.front().event_time, run_start + 5ms);
@@ -190,7 +195,7 @@ TEST(RealtimeEventLoop, OverrunPeriodsCountAsTheTimersDrops) {
   };
   const auto id = loop.register_timer("tick", make_thunk(&handler));
   loop.arm_timer(id, loop.monotonic_now() + 5ms, 5ms);
-  loop.run_for(5s);  // Bound only; exits after three ticks.
+  loop.run_for(kHangBound);  // Bound only; exits after three ticks.
   ASSERT_EQ(ticks.size(), 3u);
   std::uint64_t missed = 0;
   for (const Context& tick : ticks) missed += tick.sequence - 1;
@@ -394,18 +399,13 @@ TEST(RealtimeEventLoop, RejectsTimerChangesFromAnotherThread) {
   const auto id = loop.register_timer("tick", make_thunk(&handler));
   loop.arm_timer(id, loop.monotonic_now() + 1ms, 1ms);
   std::thread other{[&] {
-    // Bounded, so a loop that never dispatches fails the test instead of
-    // hanging until the harness kills it.
-    const auto give_up = std::chrono::steady_clock::now() + 5s;
-    while (!started.load() && std::chrono::steady_clock::now() < give_up) {
-      std::this_thread::yield();
-    }
-    EXPECT_TRUE(started.load()) << "the timer never fired";
+    EXPECT_TRUE(await([&] { return started.load(); }))
+        << "the timer never fired";
     EXPECT_THROW(loop.arm_timer(id, Poller::now(), 1ms), std::logic_error);
     EXPECT_THROW(loop.disarm_timer(id), std::logic_error);
     loop.exit();
   }};
-  loop.run_for(1s);
+  loop.run_for(kHangBound);  // Bound only; the other thread exits.
   other.join();
 }
 
@@ -494,7 +494,7 @@ TEST(RealtimeEventLoop, AWatcherWhoseSlotIsFreedClaimsOneAgain) {
   loop.arm_timer(first, origin, {});
   loop.arm_timer(second, origin + 1ms, {});
   loop.arm_timer(third, origin + 2ms, {});
-  loop.run_for(1s);
+  loop.run_for(kHangBound);  // Bound only; the stop timer exits.
   ASSERT_EQ(delivered.size(), 2u);
   EXPECT_EQ(delivered[0].sequence, 0u);
   EXPECT_EQ(delivered[0].dropped, 0u);
@@ -702,8 +702,9 @@ TEST(RealtimeEventLoop, OnPublishSleepsWhileNothingIsPublished) {
 
 // A loop with no timer is woken by each publication on its prompt
 // watcher, and delivers every message in order without a drop: one at a time
-// while it sleeps, then a burst past the per-drain cap. The 30 s backstop and
-// 5 s bound mean no delivery may wait for anything but the publication.
+// while it sleeps, then a burst past the per-drain cap. The 30 s backstop,
+// beyond kHangBound, means no delivery may wait for anything but the
+// publication.
 // REQ-RT-19
 TEST(RealtimeEventLoop, OnPublishDeliversEveryPublicationInOrder) {
   constexpr int kOneByOne = 20;
@@ -731,7 +732,7 @@ TEST(RealtimeEventLoop, OnPublishDeliversEveryPublicationInOrder) {
       EXPECT_TRUE(writer.publish(i));
     }
   }};
-  loop.run_for(5s);
+  loop.run_for(kHangBound);  // Bound only; the last delivery exits.
   publisher.join();
 
   ASSERT_EQ(delivered.size(), static_cast<std::size_t>(kOneByOne + kBurst));
@@ -771,7 +772,7 @@ TEST(RealtimeEventLoop, OnPublishDrainsAQuietWatcherOnlyBeforeTimers) {
   const auto second = loop.register_timer("read", make_thunk(&read));
   loop.arm_timer(first, loop.monotonic_now() + 10ms, {});
   loop.arm_timer(second, loop.monotonic_now() + 60ms, {});
-  loop.run_for(5s);  // Bound only; the second timer exits.
+  loop.run_for(kHangBound);  // Bound only; the second timer exits.
 
   ASSERT_EQ(delivered.size(), 1u);
   EXPECT_EQ(delivered[0].event_time, read_at);  // the second timer's drain
@@ -802,7 +803,7 @@ TEST(RealtimeEventLoop, AWakeStampsOnlyPromptMessagesWithTheirPublication) {
   ASSERT_TRUE(quiet_writer.publish(1));  // waits: nothing wakes the loop
 
   std::thread publisher{[&] { EXPECT_TRUE(prompt_writer.publish(2)); }};
-  loop.run_for(5s);  // Bound only; the quiet watcher's handler exits.
+  loop.run_for(kHangBound);  // Bound only; the quiet watcher's handler exits.
   publisher.join();
 
   ASSERT_TRUE(woke.has_value());
@@ -848,7 +849,7 @@ TEST(RealtimeEventLoop, ADrainCappedOnAQuietWatcherDrainsAgainAtOnce) {
   for (int i = 0; i < kWaiting; ++i) ASSERT_TRUE(quiet_writer.publish(i));
   ASSERT_TRUE(prompt_writer.publish(0));  // its failed arm drains the loop
 
-  loop.run_for(5s);  // Bound only; the quiet handler exits.
+  loop.run_for(kHangBound);  // Bound only; the quiet handler exits.
 
   ASSERT_EQ(heard.size(), static_cast<std::size_t>(kWaiting))
       << "the rest waited for a wake or a timer";
@@ -882,7 +883,7 @@ TEST(RealtimeEventLoop, TheBackstopDrainsWhatNoNotificationAnnounced) {
   ASSERT_TRUE(writer.publish(1));
 
   const MonotonicTime start = Poller::now();
-  loop.run_for(5s);  // Bound only; the handler exits.
+  loop.run_for(kHangBound);  // Bound only; the handler exits.
 
   ASSERT_EQ(delivered.size(), 1u);
   EXPECT_GE(delivered[0].event_time, start + options.wake_backstop);
@@ -939,7 +940,7 @@ TEST(RealtimeEventLoop, WithoutAWakeReceiverTheLoopFallsBackToPolling) {
   ASSERT_TRUE(writer.publish(1));
 
   ::testing::internal::CaptureStderr();
-  loop.run_for(5s);  // Bound only; the handler exits.
+  loop.run_for(kHangBound);  // Bound only; the handler exits.
   const std::string stderr_text = ::testing::internal::GetCapturedStderr();
 
   ASSERT_EQ(delivered.size(), 1u);  // by a poll tick: nothing else drains
@@ -999,7 +1000,7 @@ TEST(RealtimeEventLoop, APromptWatcherWhoseSlotIsFreedIsWokenOnItsNewSlot) {
       EXPECT_TRUE(writer->publish(2 + i));
     }
   }};
-  loop.run_for(5s);
+  loop.run_for(kHangBound);  // Bound only; the last delivery exits.
   publisher.join();
 
   ASSERT_EQ(delivered.size(), static_cast<std::size_t>(1 + kAfter));
@@ -1029,7 +1030,7 @@ TEST(RealtimeEventLoop, PollDeliveryDrainsBeforeATimerDueWithTheTick) {
   loop.arm_timer(stop_id, loop.start_time() + 1ms, Duration::zero());
   ipc::Publisher<EventsTest::SetpointMessage> setpoint{topics.setpoint};
   setpoint.write(EventsTest::SetpointMessage{1, 5.0F});
-  loop.run_for(5s);  // Bound only; the stop timer exits.
+  loop.run_for(kHangBound);  // Bound only; the stop timer exits.
   ASSERT_EQ(robot.control_count(), 1u);
   // 5 less the dispatch latency in seconds; 0 less it without the drain.
   EXPECT_GT(robot.efforts().front(), 4.0F);
@@ -1044,7 +1045,7 @@ TEST(RealtimeEventLoop, DeliveryIsFixedOnceTheRunStarts) {
   const std::uint16_t id = loop.register_timer("tick", make_thunk(&handler));
   loop.arm_timer(id, loop.monotonic_now() + 1ms, Duration::zero());
   loop.set_delivery(Delivery::BEFORE_TIMERS);
-  loop.run_for(1s);
+  loop.run_for(kHangBound);  // Bound only; the handler exits.
   EXPECT_EQ(loop.delivery(), Delivery::BEFORE_TIMERS);
 }
 

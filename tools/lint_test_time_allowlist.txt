@@ -27,7 +27,7 @@ talOS/events/log/log_kill_test.cc sleep 2 integration: kills a writer process, w
 talOS/events/log/log_test.cc clock 4 integration: the writer thread; Eventually's 10 s deadline only bounds a hang, and UncreatableLogFailsWithoutThrowing needs its periodic sync due
 talOS/events/log/log_test.cc sleep 6 integration: the writer thread; Eventually polls 1 ms apart, and the wakeup tests (REQ-RT-21) space records and count wakeups over a real-time window
 talOS/events/os/poller_test.cc sleep 2 integration: real kqueue/epoll timer delivery across threads
-talOS/events/realtime_event_loop_test.cc clock 4 integration: the realtime loop on the real clock; 5 s deadlines of two yield-waits only bound a hang
+talOS/events/realtime_event_loop_test.cc clock 2 integration: the realtime loop on the real clock; await()'s kHangBound (10 s) deadline only bounds a hang
 talOS/events/realtime_event_loop_test.cc sleep 4 integration: the sleeps are the subject: a handler that takes 10 ms or overruns 22 ms, setup before run(), and a publisher's seeded jitter
 talOS/hardware/gateway_endpoint_test.cc clock 2 integration: Endpoint on a real UDP socket; Eventually polls until a 10 s deadline that only bounds a hang (TESTING.md §6.3)
 talOS/hardware/gateway_endpoint_test.cc sleep 1 integration: Endpoint on a real UDP socket; Eventually polls 1 ms apart
