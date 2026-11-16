@@ -1,6 +1,6 @@
-// bundle_test only: a native library whose load leaves a mark. Its
+// warm_up_test only: a native library whose load leaves a mark. Its
 // constructor appends `native <its path> <what $STUB_PREFIX/current selects,
-// or ->` to $STUB_LOG, as bundle_test.py's stub executables record a run.
+// or ->` to $STUB_LOG, as warm_up_test.py's stub executables record a run.
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
