@@ -6,21 +6,30 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <system_error>
 #include <utility>
 
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
+#include "talOS/introspection/lock_file.h"
+#include "talOS/introspection/registry.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_budget.h"
+#include "talOS/launcher/session_lock.h"
+#include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
@@ -225,6 +234,68 @@ void PrintLogGap(const std::string& member, const std::string& log) {
   std::cerr << "[launcher] " << member << " event log " << log
             << " lost records (a gap)\n";
 }
+
+// What a launch that started the roster in a shared-memory namespace
+// (TALOS_SHM_NAMESPACE, Bazel's TEST_TMPDIR) leaves of its own besides its
+// topic segments, removed when RunSession returns: the registry segment and
+// its writer lock file, once no row of the registry is another session's,
+// and the session lock file. A namespace is rarely used twice, so each
+// would otherwise stay in /dev/shm (or TEST_TMPDIR) until reboot. Not done
+// outside a namespace: there the ordinary names are one set per host, which
+// a node or tool run without a launcher may share. Skipped while an
+// exception unwinds, when members may still run.
+class NamespaceNames {
+ public:
+  NamespaceNames(const std::optional<SessionLock>& session_lock,
+                 uint64_t session_id)
+      : session_lock_{session_lock}, session_id_{session_id} {}
+  NamespaceNames(const NamespaceNames&) = delete;
+  NamespaceNames& operator=(const NamespaceNames&) = delete;
+
+  // The registry is removed only once the launch has prepared it.
+  void RegistryPrepared() { registry_prepared_ = true; }
+
+  ~NamespaceNames() {
+    if (std::uncaught_exceptions() > 0 || !session_lock_) return;
+    const std::string registry = ShmObjectName(introspect::kRegistryPath);
+    if (!registry.starts_with("/~")) return;
+    if (registry_prepared_) RemoveRegistry(registry);
+    // Still held, so no other launch's: removed before the lock is released
+    // (SessionLock's destructor, after this one). Not when the path names
+    // another file (Refresh false): that may be another launch's.
+    if (session_lock_->Refresh()) ::unlink(session_lock_->path().c_str());
+  }
+
+ private:
+  void RemoveRegistry(const std::string& mapped) const {
+    try {
+      // Not waited for: a holder now is no member of this session (every
+      // one is reaped), and the registry stays for it.
+      const introspect::RegistryLock lock{mapped, std::chrono::milliseconds{0}};
+      {
+        const introspect::RegistryMapping registry{introspect::kRegistryPath,
+                                                   /*read_only=*/true};
+        for (const auto& row : registry.header()->nodes) {
+          if (row.state.load(std::memory_order_acquire) !=
+                  static_cast<uint64_t>(introspect::SlotState::FREE) &&
+              row.session_id != session_id_)
+            return;
+        }
+      }
+      introspect::RegistryMapping::unlink();
+      // Under the lock: a writer waiting on this file finds it no longer
+      // current once it locks it, and takes the one the path names anew
+      // (RegistryLock).
+      ::unlink(introspect::LockFilePath(mapped).c_str());
+    } catch (const std::runtime_error&) {  // NOLINT(bugprone-empty-catch)
+      // Held, absent or not this layout: left as it is.
+    }
+  }
+
+  const std::optional<SessionLock>& session_lock_;
+  uint64_t session_id_;
+  bool registry_prepared_{false};
+};
 
 // Totals every run's event log into `procs` once the session has ended --
 // record counts, capped, gapped and damaged logs -- and returns the session's
@@ -460,6 +531,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   };
   session_lock_ = nullptr;
   std::optional<SessionLock> session_lock;
+  // Destroyed before the lock, after the topic segments (declared later).
+  NamespaceNames namespace_names{session_lock, options_.session_id};
   // The lock file is absent and the log root's full filesystem has no room
   // to create it (SessionLock::Acquire, LockSharesLogFilesystem): retention,
   // which may free that room, runs without the lock (Pruning::kUnlocked),
@@ -614,6 +687,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // Before any probe, so an unusable registry refuses the launch at once
   // rather than after the roster is described.
   if (starts_roster) {
+    namespace_names.RegistryPrepared();
     try {
       introspect::PrepareRegistry();
       // Every member but Studio's bridge registers a row; the sim gateway

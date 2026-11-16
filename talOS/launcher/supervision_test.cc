@@ -34,6 +34,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -2381,6 +2382,68 @@ TEST(Supervision, SecondLaunchInTheNamespaceIsRefused) {
   for (const auto* options : {&second, &describe, &after}) {
     std::filesystem::remove_all(options->output_dir);
   }
+}
+
+// The talos-*.lock files in the lock directory (introspect::LockDirectory:
+// this test's TEST_TMPDIR under Bazel, /dev/shm under TALOS_SHM_NAMESPACE).
+std::vector<std::string> LockFiles() {
+  std::vector<std::string> names;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::directory_iterator{
+           introspect::LockDirectory(), error}) {
+    const std::string name = entry.path().filename().string();
+    if (name.starts_with("talos-") && name.ends_with(".lock"))
+      names.push_back(name);
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+// Whether the shared-memory object `mapped` (a ShmObjectName) exists.
+bool SegmentExists(const std::string& mapped) {
+  const int fd = ::shm_open(mapped.c_str(), O_RDONLY, 0);
+  if (fd >= 0) ::close(fd);
+  return fd >= 0;
+}
+
+// A session in a shared-memory namespace leaves none of its names behind:
+// the registry segment it prepared, the registry's writer lock file, and the
+// session lock file all exist while it runs and are gone once it has
+// returned, every member reaped (TODO.md LAUNCH-3: a host that runs
+// namespaced sessions all day otherwise collects three per session).
+// REQ-OPS-03
+TEST(Supervision, ANamespacedSessionLeavesNoNamesBehind) {
+  const std::string registry = ShmObjectName(introspect::kRegistryPath);
+  ASSERT_TRUE(registry.starts_with("/~"))
+      << "not in a test namespace: " << registry;
+  const std::string registry_lock = introspect::LockFilePath(registry);
+  const std::string session_lock =
+      introspect::LockFilePath(ShmObjectName(kSessionLockName));
+  auto options = BaseOptions("leaves_no_names");
+  options.binary_overrides["//example/alpha:node"] =
+      WriteStub("leaves_no_names_alpha", "exit 0\n");
+  options.binary_overrides["//example/beta:node"] =
+      WriteStub("leaves_no_names_beta", "exit 0\n");
+  const std::vector<std::string> before = LockFiles();
+  bool held_all = false;
+  options.member_spawned = [&](const std::string&) {
+    held_all = SegmentExists(registry) &&
+               std::filesystem::exists(registry_lock) &&
+               std::filesystem::exists(session_lock);
+  };
+  EXPECT_EQ(RunSession(options), 0);
+  ASSERT_TRUE(held_all) << "the running session did not hold " << registry
+                        << ", " << registry_lock << " and " << session_lock;
+  EXPECT_FALSE(SegmentExists(registry)) << registry;
+  EXPECT_FALSE(std::filesystem::exists(registry_lock)) << registry_lock;
+  EXPECT_FALSE(std::filesystem::exists(session_lock)) << session_lock;
+  const std::vector<std::string> after = LockFiles();
+  std::vector<std::string> added;
+  std::set_difference(after.begin(), after.end(), before.begin(), before.end(),
+                      std::back_inserter(added));
+  EXPECT_TRUE(added.empty()) << "left in " << introspect::LockDirectory()
+                             << ": " << ::testing::PrintToString(added);
+  std::filesystem::remove_all(options.output_dir);
 }
 
 // The loop never waits for the disk, yet every mid-session manifest is

@@ -111,6 +111,16 @@ three days never deletes it under a long session, and reports it if the path
 stops naming the locked file; acquiring it checks that it locked the file the
 path still names.
 
+In a namespace (`TALOS_SHM_NAMESPACE`, or Bazel's `TEST_TMPDIR`) a launch
+that started the roster removes, once every member is reaped, what it leaves
+besides its topic segments: the session lock file, while it still names the
+locked file, and the namespace's registry segment with its writer lock file,
+unless the registry's writer lock is held at that instant or a row is held
+by something outside the session (a node or tool run without the launcher).
+A namespace is rarely used twice, so these would otherwise stay in
+`/dev/shm` until reboot. Outside a namespace the ordinary names, one set per
+host that tools and hand-run nodes share, are left in place.
+
 Locking an existing lock file allocates nothing on disk; creating an absent
 one does. macOS empties `/tmp` at boot and keeps it on the same container as
 a log root on the internal disk, so on a full disk the first launch after a

@@ -221,6 +221,7 @@ cc_library(
         "//talOS/introspection:lock_file",
         "//talOS/introspection:names",
         "//talOS/introspection:registry",
+        "//talOS/memory:shared_memory",
         "//talOS/process",
         "//talOS/rtms",
         "@tomlplusplus//:toml++",
