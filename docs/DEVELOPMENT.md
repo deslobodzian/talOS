@@ -103,7 +103,7 @@ and runs the gradle and pnpm checks when the commits to push touch the
 RoboRIO program or anything under `talOS/` (its `build.gradle` takes
 headers from all of it) or `studio/`; every robot and example config's
 `--describe-only` runs as its `talos_graph_test` (the bundle test's
-fixture, `2026-robot/main_processor/bundle_testdata`, has only a
+fixture, `bench/main_processor/bundle_testdata`, has only a
 `manifest_sync_test`). It differs from CI in three places, and says which
 applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so

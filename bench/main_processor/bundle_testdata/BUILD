@@ -1,11 +1,11 @@
 load("//tools:sync_manifest.bzl", "manifest_sync_test")
 load(":robot_manifest.bzl", "CONFIG_FILES")
 
-package(default_visibility = ["//2026-robot/main_processor:__pkg__"])
+package(default_visibility = ["//bench/main_processor:__pkg__"])
 
 exports_files([
     "robot.toml",
-    "mechanisms/shooter.toml",
+    "mechanisms/motor.toml",
 ])
 
 manifest_sync_test(

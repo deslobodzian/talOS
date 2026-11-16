@@ -6,9 +6,11 @@ into a fresh prefix, which runs every member once without a warning), then
 C++ node that cannot load a shared library it links, a
 Python node that cannot import its wheels or start its interpreter (as
 when Bazel restored the bundle from its cache with links copied) fails
-here. The bench
-rig's bundle, which link and stop qualification install, is checked too.
-A bundle that carries Studio is described by the command the boot service
+here. The subjects are the bench robot's bundles: the deployable one, which
+carries Studio and which link and stop qualification install; the Python
+bench robot's, with two Python nodes; and a test config that reaches its
+files through `include`, a parent-directory `defaults`, a custom `path` and
+an entry `node`. A bundle that carries Studio is described by the command the boot service
 runs (deploy.sh enable-boot's systemd ExecStart and launchd
 ProgramArguments), which must run its bridge from the install, found through
 the manifest's [studio] table, beside the index page of the webroot that
@@ -43,9 +45,9 @@ import unittest
 from python.runfiles import runfiles
 
 BUNDLES = (
-    "2026-robot/main_processor/robot_bundle",
-    "2026-robot/main_processor/relocation_bundle",
     "bench/main_processor/bench_bundle",
+    "bench/main_processor/bench_py_bundle",
+    "bench/main_processor/relocation_bundle",
 )
 
 
@@ -163,7 +165,8 @@ class BundleTest(unittest.TestCase):
     def test_every_python_node_runs_its_runtimes_one_interpreter(self):
         # The interpreter is most of a bundle's bytes, which a deploy copies
         # to the robot: one copy per Python node, and per name rules_python
-        # gives it, made the 2026 bundle 749 MB.
+        # gives it, made a 14-member robot bundle 749 MB. bench_py_bundle
+        # runs two Python nodes, so a second copy fails here.
         r = runfiles.Create()
         env = {k: v for k, v in os.environ.items()
                if k not in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}
@@ -279,7 +282,7 @@ def launcher_stop_timeout_s():
     still alive kStopTimeout (talOS/launcher/launcher.h) later, then the
     final manifest. Printed by a binary built from that constant."""
     path = runfiles.Create().Rlocation(
-        "_main/2026-robot/main_processor/bundle_test_stop_timeout")
+        "_main/bench/main_processor/bundle_test_stop_timeout")
     return int(subprocess.run([path], check=True, capture_output=True,
                               text=True, timeout=60).stdout)
 
@@ -472,7 +475,7 @@ class WarmUpTest(unittest.TestCase):
         rel = "bin/alpha.runfiles/site/mark.cpython-311-darwin.so"
         os.makedirs(os.path.dirname(os.path.join(src, rel)))
         shutil.copy(runfiles.Create().Rlocation(
-            "_main/2026-robot/main_processor/bundle_test_native_mark.so"),
+            "_main/bench/main_processor/bundle_test_native_mark.so"),
             os.path.join(src, rel))
         # A library that fails to load (sorted first) stops nothing.
         with open(os.path.join(os.path.dirname(os.path.join(src, rel)),
