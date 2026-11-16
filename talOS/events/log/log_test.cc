@@ -749,7 +749,8 @@ TEST(WindowedLogReaderLimits, MoreReadersThanTheDescriptorLimit) {
   rlimit saved{};
   ASSERT_EQ(0, ::getrlimit(RLIMIT_NOFILE, &saved));
   rlimit lowered = saved;
-  lowered.rlim_cur = static_cast<rlim_t>(open_now + kSpare);
+  lowered.rlim_cur =
+      static_cast<rlim_t>(open_now) + static_cast<rlim_t>(kSpare);
   ASSERT_EQ(0, ::setrlimit(RLIMIT_NOFILE, &lowered));
   std::vector<std::vector<ReadBack::Read>> got(kLogs);
   std::string error;
