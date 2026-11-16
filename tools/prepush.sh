@@ -24,8 +24,7 @@
 # or set an upstream); the steps still run, and the run exits 1.
 # Steps, in order: read-only, source-lints (tools/source_lints.sh, the
 # lints CI's "Source lints (no Bazel)" job runs: test time, links,
-# requirement trace, node test matrix; under a second; a commit without the
-# script prints `source-lints skipped`, which does not fail the run),
+# requirement trace, node test matrix; under a second),
 # `bazel build //...`, host-includes, `bazel test
 # --nocache_test_results //...`, then, when the commits to push
 # (<ref>@{upstream}..<ref>; every file when <ref> is not a branch with an
@@ -49,11 +48,9 @@
 # CI's job of that name, on the build step's bazel-bin; about 30 s with a
 # warm Gradle daemon; under --full, or when the commits touch
 # tools/test_rio_in_the_loop.py, bench/, controller_processor/, talOS/,
-# MODULE.bazel, third_party/, .bazelversion or talos.bazelrc; a commit
-# without the tool prints `rio-in-the-loop skipped`, which does not fail
-# the run), under --full only tsan and asan (tools/sanitizer_lane.sh, CI's
-# sanitizer jobs; 5 to 10 minutes each cold; a commit without the script
-# prints `<lane> skipped`, which does not fail the run) and soak (CI's
+# MODULE.bazel, third_party/, .bazelversion or talos.bazelrc), under
+# --full only tsan and asan (tools/sanitizer_lane.sh, CI's sanitizer
+# jobs; 5 to 10 minutes each cold) and soak (CI's
 # soak_test with seed 0 for TALOS_SOAK_SECONDS=36, the shortest run that
 # injects every fault kind); after a failed build, rio-in-the-loop, tsan,
 # asan and soak are SKIPPED; checkout-unchanged, then, when the commits
@@ -61,7 +58,11 @@
 # studio-test and studio-build (`pnpm test`, `pnpm build`).
 # Each step prints one line (`prepush: <step> ok`, `prepush: <step> FAILED
 # (see <log>)`, `prepush: <step> SKIPPED (<reason>)`); logs stay in a
-# directory under ${TMPDIR:-/tmp}.
+# directory under ${TMPDIR:-/tmp}. A commit without the tool a step runs
+# (source_lints.sh, test_rio_in_the_loop.py, sanitizer_lane.sh) has that
+# step SKIPPED, unless --ref names another commit than the checkout's HEAD
+# and the upstream it goes to (if any) lacks the tool too: then it predates
+# the tool, and the line says `skipped`, which does not fail the run.
 #
 # The worktree is ${TMPDIR:-/tmp}/talos-prepush-<uid>, a fixed path so that
 # every run reuses one Bazel output base; it is removed on exit, interrupt
@@ -228,17 +229,32 @@ if [ "$full" = 0 ] && [ "${pushing:-0}" -gt "$full_after_commits" ]; then
   skip full "$pushing commits $pushing_from: docs/DEVELOPMENT.md §5 requires --full for a push of more than $full_after_commits; $way_out"
 fi
 
+# no_tool NAME PATH: the commit has no PATH, the tool step NAME runs. It
+# predates the tool, nothing to run and not a failure, only when it is
+# checked by --ref as another commit than the checkout's HEAD and the
+# upstream it goes to (if any) lacks PATH too; a commit that deletes or
+# renames the tool would otherwise pass with the step unrun.
+head="$(git -C "$repo" rev-parse --verify --quiet HEAD)"
+no_tool() {
+  if [ "$commit" != "$head" ] &&
+      { [ -z "$upstream" ] ||
+        ! git -C "$repo" cat-file -e "$upstream:$2" 2>/dev/null; }; then
+    report "$1 skipped (this commit, older than the tool, has no $2)"
+  else
+    skip "$1" "this commit has no $2"
+  fi
+}
+
 run_step read-only python3 "$tools/make_sources_read_only.py" || {
   echo "prepush: cannot make the worktree read-only; stopping"
   exit 1
 }
 
 # CI's source lints, from the commit's own script (CI runs the same one).
-# A commit from before the script has none to run.
 if [ -f "$wt/tools/source_lints.sh" ]; then
   run_step source-lints bash tools/source_lints.sh || true
 else
-  report "source-lints skipped (this commit has no tools/source_lints.sh)"
+  no_tool source-lints tools/source_lints.sh
 fi
 
 bazel_started=1
@@ -383,7 +399,7 @@ if [ "$skip_gradle" = 1 ]; then
 elif [ "$full" = 0 ] && ! touches "${rio_loop_paths[@]}"; then
   report "rio-in-the-loop not needed (nothing under ${rio_loop_paths[*]} since $upstream)"
 elif [ ! -f "$wt/tools/test_rio_in_the_loop.py" ]; then
-  report "rio-in-the-loop skipped (this commit has no tools/test_rio_in_the_loop.py)"
+  no_tool rio-in-the-loop tools/test_rio_in_the_loop.py
 elif [ "$built" = 0 ]; then
   skip rio-in-the-loop "the build failed"
 else
@@ -400,7 +416,7 @@ if [ "$full" = 1 ] && [ "$built" = 0 ]; then
 elif [ "$full" = 1 ]; then
   for lane in tsan asan; do
     if [ ! -f "$wt/tools/sanitizer_lane.sh" ]; then
-      report "$lane skipped (this commit has no tools/sanitizer_lane.sh)"
+      no_tool "$lane" tools/sanitizer_lane.sh
       continue
     fi
     run_step "$lane" bash tools/sanitizer_lane.sh "$lane" \

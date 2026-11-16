@@ -81,6 +81,16 @@ class PrepushTest(unittest.TestCase):
             GIT_COMMITTER_EMAIL="t@example.com")
         put(os.path.join(self.repo, "src", "a.txt"), "a\n")
         put(os.path.join(self.repo, "MODULE.bazel.lock"), "{}\n")
+        # The commit's own tools prepush runs; a commit without one fails
+        # the run. The RoboRIO-in-the-loop stub records each run in
+        # self.full_log (full_calls()).
+        self.full_log = os.path.join(self.tmp, "full_calls")
+        put(os.path.join(self.repo, "tools", "source_lints.sh"),
+            "#!/bin/sh\nexit 0\n", 0o755)
+        put(os.path.join(self.repo, "tools", "test_rio_in_the_loop.py"),
+            "import os, sys\n"
+            f"with open({self.full_log!r}, 'a', encoding='utf-8') as f:\n"
+            "    f.write('|'.join([os.getcwd(), 'rio', *sys.argv[1:]]) + '\\n')\n")
         for args in (["init", "-q"], ["add", "."], ["commit", "-qm", "one"]):
             self.git(*args)
         self.addCleanup(self.git, "worktree", "prune")
@@ -124,25 +134,18 @@ class PrepushTest(unittest.TestCase):
             os.remove(self.gradle_log)
         return ran
 
-    def add_full_steps(self):
-        """Commits stubs of the RoboRIO-in-the-loop tool and the sanitizer
-        lane script, each recording its working directory and arguments
-        in self.full_log; STUB_LANE_FAIL fails that sanitizer lane."""
-        self.full_log = os.path.join(self.tmp, "full_calls")
-        log = shlex.quote(self.full_log)
-        put(os.path.join(self.repo, "tools", "test_rio_in_the_loop.py"),
-            "import os, sys\n"
-            f"with open({self.full_log!r}, 'a', encoding='utf-8') as f:\n"
-            "    f.write('|'.join([os.getcwd(), 'rio', *sys.argv[1:]]) + '\\n')\n")
+    def add_sanitizer_lane(self):
+        """Commits a stub sanitizer lane script that records each run in
+        self.full_log; STUB_LANE_FAIL fails that lane."""
         put(os.path.join(self.repo, "tools", "sanitizer_lane.sh"),
-            f'#!/bin/sh\necho "$PWD|lane|$*" >> {log}\n'
+            f'#!/bin/sh\necho "$PWD|lane|$*" >> {shlex.quote(self.full_log)}\n'
             '[ "$1" = "${STUB_LANE_FAIL:-}" ] && { echo "stub: $1 failed"; exit 1; }\n'
             "exit 0\n", 0o755)
         self.git("add", "tools")
-        self.git("commit", "-qm", "full steps")
+        self.git("commit", "-qm", "sanitizer lane")
 
     def full_calls(self):
-        """The runs add_full_steps' stubs recorded since the last call."""
+        """The runs the rio and lane stubs recorded since the last call."""
         if not os.path.exists(self.full_log):
             return []
         with open(self.full_log, encoding="utf-8") as f:
@@ -285,7 +288,6 @@ class PrepushTest(unittest.TestCase):
         # A RoboRIO-in-the-loop scenario broken by an unpushed change was
         # seen only in CI's job, after the push.
         self.add_gradlew()
-        self.add_full_steps()
         self.git("branch", "pushed")
         self.git("branch", "--set-upstream-to=pushed")
         self.commit("talOS/bridge/x.h", "bridge")
@@ -316,7 +318,7 @@ class PrepushTest(unittest.TestCase):
 
     # REQ-DEV-25
     def test_full_runs_rio_in_the_loop_the_sanitizer_lanes_and_a_soak(self):
-        self.add_full_steps()
+        self.add_sanitizer_lane()
         self.git("branch", "pushed")
         self.git("branch", "--set-upstream-to=pushed")
         self.commit("docs/x.md", "docs")
@@ -334,8 +336,8 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("--nocache_test_results", soak[0])
 
     # REQ-DEV-25
-    def test_a_failing_sanitizer_lane_fails_the_run_naming_it(self):
-        self.add_full_steps()
+    def test_full_fails_naming_a_failed_lane_and_skips_lanes_after_a_failed_build(self):
+        self.add_sanitizer_lane()
         status, out, _ = self.prepush("--full", "--skip-studio",
                                       STUB_LANE_FAIL="tsan")
         self.assertEqual(status, 1, out)
@@ -357,10 +359,10 @@ class PrepushTest(unittest.TestCase):
         self.assertFalse([a for _, _, a in calls if "soak_test" in a], out)
 
     # REQ-DEV-25
-    def test_a_push_of_more_than_twenty_commits_needs_full(self):
+    def test_more_than_twenty_commits_since_upstream_or_on_no_remote_need_full(self):
         # 110 commits passed the default steps and were red in CI on a
         # sanitizer lane and the RoboRIO-in-the-loop job.
-        self.add_full_steps()
+        self.add_sanitizer_lane()
         # What is already on a remote, for the count without an upstream.
         remote = os.path.join(self.tmp, "remote.git")
         self.git("init", "-q", "--bare", remote)
@@ -390,6 +392,36 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("prepush: full SKIPPED (21 commits on no "
                       "remote-tracking branch", out)
         self.assertIn("set an upstream or pass --full", out)
+
+    # REQ-DEV-25
+    def test_a_missing_tool_fails_the_run_unless_the_commit_predates_it(self):
+        # A commit that deletes a tool prepush runs must not pass with the
+        # step unrun. The fixture has no tools/sanitizer_lane.sh.
+        self.add_gradlew()
+        old = self.git("rev-parse", "HEAD").strip()
+        status, out, _ = self.prepush("--full", "--skip-studio")
+        self.assertEqual(status, 1, out)
+        for lane in ("tsan", "asan"):
+            self.assertIn(f"prepush: {lane} SKIPPED (this commit has no "
+                          "tools/sanitizer_lane.sh", out)
+
+        # An older commit than the tool, checked by --ref: nothing to run.
+        self.add_sanitizer_lane()
+        status, out, _ = self.prepush("--ref", old, "--full", "--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertIn("prepush: tsan skipped", out)
+
+        # Another branch deleting a tool its upstream has fails the run.
+        self.git("branch", "has_lints")
+        self.git("checkout", "-q", "-b", "deletes_lints")
+        self.git("rm", "-q", "tools/source_lints.sh")
+        self.git("commit", "-qm", "delete lints")
+        self.git("branch", "--set-upstream-to=has_lints")
+        self.git("checkout", "-q", "-")
+        status, out, _ = self.prepush("--ref", "deletes_lints")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: source-lints SKIPPED (this commit has no "
+                      "tools/source_lints.sh", out)
 
     # REQ-DEV-25
     def test_full_is_refused_with_skip_gradle(self):
