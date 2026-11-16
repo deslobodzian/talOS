@@ -155,9 +155,12 @@ pid_t StudioBridge::Spawn(std::string& error) {
 }
 
 void StudioBridge::Restart(NodeProcessInfo& proc, SupervisionTime now) {
-  // The attempt counts against the window whether or not it spawns.
+  // The attempt is a restart whether or not it spawns: it counts against the
+  // window and in restart_count, so the restart lines, the give-up line's
+  // count and the manifest agree even when a spawn fails.
   restart_.Started(now);
   ShowRestart(proc, restart_);
+  ++proc.restart_count;
   std::string error;
   const pid_t pid = Spawn(error);
   if (pid < 0) {
@@ -165,8 +168,6 @@ void StudioBridge::Restart(NodeProcessInfo& proc, SupervisionTime now) {
     Failed(proc, "cannot spawn studio_bridge (" + error + ")", now);
     return;
   }
-  // Only a spawned run sets a pid: the first one spawned is run 0.
-  if (proc.pid > 0) ++proc.restart_count;
   proc.pid = pid;
   proc.exited = false;
   proc.exit_code = -1;
@@ -183,8 +184,9 @@ void StudioBridge::Failed(NodeProcessInfo& proc, std::string_view what,
   if (!ShouldRestartNode(/*clean_exit=*/false, restart_.critical(),
                          limits_.max_restarts, /*stopping=*/false)) {
     std::cerr << "[launcher] " << what
-              << "; restarts are disabled: studio_bridge will not be "
-                 "restarted; session runs without Studio (see "
+              << "; restarts are disabled (--max-restarts 0): studio_bridge "
+                 "will not be restarted again; session runs without Studio "
+                 "(see "
               << log_path_ << ")\n";
     Leave(proc);
     return;
