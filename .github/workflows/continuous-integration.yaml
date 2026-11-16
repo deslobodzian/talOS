@@ -36,6 +36,9 @@ jobs:
     timeout-minutes: 75
     env:
       TESTLOGS: linux
+      # The diff base step checks the whole branch on a topic-branch push,
+      # so clang-tidy checks again what an earlier push left failing.
+      DIFF_SCOPE: branch
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v7
@@ -50,8 +53,8 @@ jobs:
       # so a commit whose earlier run was cancelled or failed is checked
       # again by every later run. A topic-branch push does the same, against
       # the merge base with main, in a job that sets DIFF_SCOPE=branch
-      # (buildifier and clang-format, which are cheap; clang-tidy keeps the
-      # pushed commits' scope, TODO.md CI-3). Otherwise a push
+      # (every job that uses it: buildifier, clang-format and the Linux
+      # job's clang-tidy). Otherwise (main) a push
       # checks the commits it pushed; on main, `before` is the old tip,
       # which is the merge base of what was merged. A new branch (all-zero
       # `before`) or a force push (`before` absent from the clone or not an
