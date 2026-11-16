@@ -5,6 +5,8 @@
 #include <sched.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#include "talOS/launcher/console_line.h"
 #ifdef __linux__
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -208,11 +210,12 @@ std::optional<ChildReport> ReadChildReports(int errors,
     }
     if (got != static_cast<ssize_t>(sizeof report)) return std::nullopt;
     if (report.fatal) return report;
-    notes << "[launcher] " << program << " (pid " << pid
-          << "): setpgid: " << std::strerror(report.code) << " ("
-          << DescribeProcessGroupRefusal(report, launcher_code)
-          << (report.new_session ? "); it leads a new session instead\n"
-                                 : "); it leads its own group\n");
+    ConsoleLine(notes) << "[launcher] " << program << " (pid " << pid
+                       << "): setpgid: " << std::strerror(report.code) << " ("
+                       << DescribeProcessGroupRefusal(report, launcher_code)
+                       << (report.new_session
+                               ? "); it leads a new session instead\n"
+                               : "); it leads its own group\n");
   }
 }
 

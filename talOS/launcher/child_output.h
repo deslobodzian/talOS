@@ -125,7 +125,8 @@ class LauncherOutput {
 
   // A streambuf that hands every byte written to it to State::Say.
   // Unbuffered, so several threads may write through one (each call is
-  // atomic, as on a descriptor; their lines can interleave).
+  // atomic, as on a descriptor; a line written in several calls can
+  // interleave with another thread's, so launcher lines use ConsoleLine).
   class Sink : public std::streambuf {
    public:
     Sink(State& state, int fd) : state_{state}, fd_{fd} {}

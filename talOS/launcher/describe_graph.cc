@@ -26,6 +26,7 @@
 #include <utility>
 
 #include "talOS/hardware/config.h"
+#include "talOS/launcher/console_line.h"
 #include "talOS/launcher/session.h"
 #include "talOS/launcher/spawn.h"
 #include "talOS/schema/identity.h"
@@ -177,8 +178,9 @@ bool ProbeDescribe(const std::vector<std::string>& args,
       if (pid >= 0) {
         // Absorbed, but said: how often the process limit is reached.
         if (attempt > 1)
-          std::cerr << "[launcher] probe of " << args.front() << " spawned on "
-                    << "attempt " << attempt << " (after " << error << ")\n";
+          ConsoleLine(std::cerr)
+              << "[launcher] probe of " << args.front() << " spawned on "
+              << "attempt " << attempt << " (after " << error << ")\n";
         error.clear();
         break;
       }

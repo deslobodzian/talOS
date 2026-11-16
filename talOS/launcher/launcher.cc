@@ -26,6 +26,7 @@
 #include "talOS/events/log/log_writer.h"
 #include "talOS/introspection/lock_file.h"
 #include "talOS/introspection/registry.h"
+#include "talOS/launcher/console_line.h"
 #include "talOS/launcher/hardware_record.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/session_lock.h"
@@ -148,25 +149,28 @@ void PrintDeclaredGraph(const std::vector<NodeDescription>& described,
   std::size_t answered = 0;
   for (const auto& node : described) answered += node.answered ? 1 : 0;
 
-  std::cout << "\n================ Declared Graph ==================\n";
-  std::cout << "Nodes described: " << answered << "/" << described.size()
-            << ", topics: " << declared_topics << "\n";
+  ConsoleLine(std::cout)
+      << "\n================ Declared Graph ==================\n";
+  ConsoleLine(std::cout) << "Nodes described: " << answered << "/"
+                         << described.size() << ", topics: " << declared_topics
+                         << "\n";
   for (const auto& node : described) {
-    std::cout << "  " << (node.answered ? "\u2022" : "?") << " "
-              << node.roster_name;
+    ConsoleLine line{std::cout};
+    line << "  " << (node.answered ? "\u2022" : "?") << " " << node.roster_name;
     if (node.answered) {
-      std::cout << " (" << node.declared.sources.size() << " sources)\n";
+      line << " (" << node.declared.sources.size() << " sources)\n";
     } else {
-      std::cout << (node.missing ? " (not built)\n" : " (not described)\n");
+      line << (node.missing ? " (not built)\n" : " (not described)\n");
     }
   }
   for (const auto& diagnostic : diagnostics) {
     auto& out =
         diagnostic.severity == naming::Severity::ERROR ? std::cerr : std::cout;
-    out << "  " << diagnostic.ToString() << "\n";
+    ConsoleLine(out) << "  " << diagnostic.ToString() << "\n";
   }
-  std::cout << "Graph written to: " << graph_path << "\n";
-  std::cout << "==================================================\n";
+  ConsoleLine(std::cout) << "Graph written to: " << graph_path << "\n";
+  ConsoleLine(std::cout)
+      << "==================================================\n";
 }
 
 void PrintManifest(const SessionManifest& manifest) {
@@ -179,28 +183,33 @@ void PrintManifest(const SessionManifest& manifest) {
     roster += n.name;
   }
 
-  std::cout << "\n================ Session Manifest ================\n";
-  std::cout << "Session ID: " << manifest.session_id << "\n";
-  std::cout << "Output Dir: " << manifest.output_dir << "\n";
-  std::cout << "Declared: " << described << "/" << manifest.nodes.size()
-            << " nodes answered --describe, " << manifest.declared_topics
-            << " topics\n";
-  std::cout << "Declared nodes: " << (roster.empty() ? "none" : roster) << "\n";
-  std::cout << "Nodes (" << manifest.nodes.size() << "):\n";
+  ConsoleLine(std::cout)
+      << "\n================ Session Manifest ================\n";
+  ConsoleLine(std::cout) << "Session ID: " << manifest.session_id << "\n";
+  ConsoleLine(std::cout) << "Output Dir: " << manifest.output_dir << "\n";
+  ConsoleLine(std::cout) << "Declared: " << described << "/"
+                         << manifest.nodes.size()
+                         << " nodes answered --describe, "
+                         << manifest.declared_topics << " topics\n";
+  ConsoleLine(std::cout) << "Declared nodes: "
+                         << (roster.empty() ? "none" : roster) << "\n";
+  ConsoleLine(std::cout) << "Nodes (" << manifest.nodes.size() << "):\n";
   for (const auto& n : manifest.nodes) {
-    std::cout << "  \u2022 " << n.name << " (pid=" << n.pid
-              << ", exit=" << n.exit_code
-              << (n.exit_signal != 0
-                      ? " (signal " + SignalText(n.exit_signal) + ")"
-                      : std::string{})
-              << ", records=" << n.record_count
-              << ", restarts=" << n.restart_count
-              << ", failed=" << (n.failed ? "yes" : "no")
-              << ", log=" << n.log_path << ")\n";
+    ConsoleLine(std::cout) << "  \u2022 " << n.name << " (pid=" << n.pid
+                           << ", exit=" << n.exit_code
+                           << (n.exit_signal != 0
+                                   ? " (signal " + SignalText(n.exit_signal) +
+                                         ")"
+                                   : std::string{})
+                           << ", records=" << n.record_count
+                           << ", restarts=" << n.restart_count
+                           << ", failed=" << (n.failed ? "yes" : "no")
+                           << ", log=" << n.log_path << ")\n";
   }
-  std::cout << "Manifest written to: " << manifest.output_dir
-            << "/manifest.json\n";
-  std::cout << "==================================================\n";
+  ConsoleLine(std::cout) << "Manifest written to: " << manifest.output_dir
+                         << "/manifest.json\n";
+  ConsoleLine(std::cout)
+      << "==================================================\n";
 }
 
 // Each logging member's share of the session's log budget, in proportion to
@@ -231,8 +240,8 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
 // stop leaves nothing recorded after the gap, and a run killed during one
 // leaves no GAP record.
 void PrintLogGap(const std::string& member, const std::string& log) {
-  std::cerr << "[launcher] " << member << " event log " << log
-            << " lost records (a gap)\n";
+  ConsoleLine(std::cerr) << "[launcher] " << member << " event log " << log
+                         << " lost records (a gap)\n";
 }
 
 // What a launch that started the roster in a shared-memory namespace
@@ -301,8 +310,8 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
           if (summary.gaps > 0) gapped = true;
         } catch (const event::log::IncompleteLogHeader& e) {
           // Cut while it was being created: no records to count.
-          std::cerr << "[launcher] skipping " << file << ": " << e.what()
-                    << "\n";
+          ConsoleLine(std::cerr)
+              << "[launcher] skipping " << file << ": " << e.what() << "\n";
         } catch (...) {
           proc.failed = true;
         }
@@ -424,7 +433,8 @@ int Launcher::Run() {
   try {
     launcher_output_.emplace();
   } catch (const std::exception& e) {
-    std::cerr << "launcher: " << e.what() << "; nothing was started\n";
+    ConsoleLine(std::cerr) << "launcher: " << e.what()
+                           << "; nothing was started\n";
     return 1;
   }
   const int status = RunSession(stop_signals);
@@ -443,39 +453,44 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // real controller: --sim requires the loopback remote (below). Refused
   // before the config is read, so nothing is probed, written or spawned.
   if (options_.allow_graph_errors && !options_.simulation) {
-    std::cerr << "launcher: --allow-graph-errors is accepted only with --sim; "
-                 "nothing was described or started\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --allow-graph-errors is accepted only with --sim; "
+           "nothing was described or started\n";
     return 1;
   }
   // Alone it would start the roster, which whoever passed it meant to check.
   if (options_.describe_as_launch && !options_.describe_only) {
-    std::cerr << "launcher: --describe-as-launch requires --describe-only; "
-                 "nothing was described or started\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --describe-as-launch requires --describe-only; "
+           "nothing was described or started\n";
     return 1;
   }
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
-    std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;
   }
   // The launcher gives the simulator the bridge's ports (SimulatorArgs); a
   // port written by hand as well could only disagree with the bridge's.
   for (const std::string& arg : options_.sim_gateway_args) {
     if (IsSimulatorPortArg(arg)) {
-      std::cerr << "launcher: --sim-gateway-arg " << arg
-                << " is refused: the launcher passes the simulator --port "
-                   "and --remote-port from [robot] controller_port and "
-                   "local_port, or from its --remote-port and --local-port; "
-                   "set those instead\n";
+      ConsoleLine(std::cerr)
+          << "launcher: --sim-gateway-arg " << arg
+          << " is refused: the launcher passes the simulator --port "
+             "and --remote-port from [robot] controller_port and "
+             "local_port, or from its --remote-port and --local-port; "
+             "set those instead\n";
       return 1;
     }
   }
   std::string bundle_error;
   if (!LoadBundle(options_, bundle_error)) {
-    std::cerr << "launcher: " << bundle_error << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << bundle_error << "\n";
     return 1;
   }
   if (options_.config_path.empty()) {
-    std::cerr << "launcher: --config PATH or --bundle PATH is required\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --config PATH or --bundle PATH is required\n";
     return 1;
   }
   // Recorded absolute (manifest.json, graph.json, every member's --config):
@@ -490,8 +505,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     if (!cwd_error) options_.config_path = absolute.lexically_normal().string();
   }
   if (options_.replay_inputs.empty() != options_.only.empty()) {
-    std::cerr << "launcher: --replay-inputs SESSION_DIR and --only NODE go "
-                 "together\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --replay-inputs SESSION_DIR and --only NODE go "
+           "together\n";
     return 1;
   }
   // A run that starts the roster owns the namespace's topics and registry
@@ -507,12 +523,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // The launch stops before its roster starts: only what a launch that
   // recorded nothing holds exists yet (README "Session segments and logs"),
   // and the stop's exit status is 0, as for any requested stop.
-  const auto stopped_before_start = [&] {
-    if (!starts_roster || !process::stop_requested.load()) return false;
-    std::cout << "[launcher] stop requested before the session started; "
-                 "nothing was started\n";
-    return true;
-  };
+  const auto stopped_before_start =
+      [&] {
+        if (!starts_roster || !process::stop_requested.load()) return false;
+        ConsoleLine(std::cout)
+            << "[launcher] stop requested before the session started; "
+               "nothing was started\n";
+        return true;
+      };
   session_lock_ = nullptr;
   std::optional<SessionLock> session_lock;
   // Destroyed before the lock, after the topic segments (declared later).
@@ -534,12 +552,13 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   };
   if (starts_roster) {
     if (!take_lock()) {
-      std::cerr << "launcher: " << lock_error << "\n";
+      ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
       return 1;
     }
     if (lock_needs_room) {
-      std::cerr << "[launcher] " << lock_error
-                << "; retention runs first, then the lock is taken\n";
+      ConsoleLine(std::cerr)
+          << "[launcher] " << lock_error
+          << "; retention runs first, then the lock is taken\n";
     }
   }
   // Nothing is written to the log root until retention has run: on a full
@@ -549,13 +568,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   try {
     robot_config = config::ParseRobotConfig(options_.config_path);
   } catch (const std::exception& e) {
-    std::cerr << "launcher: failed to load config from " << options_.config_path
-              << ": " << e.what() << "\n";
+    ConsoleLine(std::cerr) << "launcher: failed to load config from "
+                           << options_.config_path << ": " << e.what() << "\n";
     if (config_was_relative) {
-      std::cerr << "launcher: working directory is "
-                << std::filesystem::current_path()
-                << "; run from the repository root or pass an absolute "
-                   "--config path\n";
+      ConsoleLine(std::cerr)
+          << "launcher: working directory is "
+          << std::filesystem::current_path()
+          << "; run from the repository root or pass an absolute "
+             "--config path\n";
     }
     return 1;
   }
@@ -568,33 +588,35 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   // preparation and capacity stay the launch's alone.
   if (robot_config.simulation_only && !options_.simulation &&
       (starts_roster || options_.describe_as_launch)) {
-    std::cerr << "launcher: " << options_.config_path
-              << " sets [robot] simulation_only = true; "
-              << (options_.describe_as_launch
-                      ? "a launch of it without --sim is refused, so it "
-                        "cannot be installed as the robot's; nothing was "
-                        "started\n"
-                      : "run it with --sim (or --describe-only); nothing "
-                        "was started\n");
+    ConsoleLine(std::cerr)
+        << "launcher: " << options_.config_path
+        << " sets [robot] simulation_only = true; "
+        << (options_.describe_as_launch
+                ? "a launch of it without --sim is refused, so it "
+                  "cannot be installed as the robot's; nothing was "
+                  "started\n"
+                : "run it with --sim (or --describe-only); nothing "
+                  "was started\n");
     return 1;
   }
   std::string effective_remote;
   try {
     effective_remote = EffectiveRemoteAddress(robot_config, options_);
   } catch (const std::exception& e) {
-    std::cerr << "launcher: " << e.what() << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
     return 1;
   }
   if (options_.simulation && effective_remote != "127.0.0.1") {
-    std::cerr << "launcher: --sim requires remote 127.0.0.1; effective remote "
-              << effective_remote << "\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --sim requires remote 127.0.0.1; effective remote "
+        << effective_remote << "\n";
     return 1;
   }
   std::string restart_error;
   int max_restarts = kDefaultMaxRestarts;
   if (!ResolveMaxRestarts(robot_config, options_, max_restarts,
                           restart_error)) {
-    std::cerr << "launcher: " << restart_error << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << restart_error << "\n";
     return 1;
   }
   if (options_.restart_window_ms <= 0 || options_.heartbeat_periods <= 0 ||
@@ -609,12 +631,13 @@ int Launcher::RunSession(StopSignals& stop_signals) {
 
   auto node_specs = DiscoverNodes(robot_config, options_);
   if (options_.start_studio_bridge && BundleWithoutStudio(options_)) {
-    std::cerr << "[launcher] this bundle carries no Studio (its talos_bundle "
-                 "sets no studio_bridge and studio_webroot); session runs "
-                 "without Studio\n";
+    ConsoleLine(std::cerr)
+        << "[launcher] this bundle carries no Studio (its talos_bundle "
+           "sets no studio_bridge and studio_webroot); session runs "
+           "without Studio\n";
   }
   if (node_specs.empty()) {
-    std::cerr << "launcher: no nodes declared in config\n";
+    ConsoleLine(std::cerr) << "launcher: no nodes declared in config\n";
     return 1;
   }
   // A member's name is its file names (<name>.log, <name>.tlog) and its
@@ -628,12 +651,13 @@ int Launcher::RunSession(StopSignals& stop_signals) {
       if (node_specs[i].name != node_specs[j].name) continue;
       const NodeSpec& added =
           node_specs[i].studio_bridge ? node_specs[i] : node_specs[j];
-      std::cerr << "launcher: [subsystems." << node_specs[i].name
-                << "] has the name of the launcher's own "
-                << (added.studio_bridge
-                        ? "Studio bridge, which --start-studio-bridge adds"
-                        : "roster member of that name")
-                << "; rename the subsystem\n";
+      ConsoleLine(std::cerr)
+          << "launcher: [subsystems." << node_specs[i].name
+          << "] has the name of the launcher's own "
+          << (added.studio_bridge
+                  ? "Studio bridge, which --start-studio-bridge adds"
+                  : "roster member of that name")
+          << "; rename the subsystem\n";
       return 1;
     }
   }
@@ -646,17 +670,18 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   for (const NodeSpec& spec : node_specs) {
     const auto problem = naming::CheckNodeName(spec.name);
     if (!problem) continue;
-    std::cerr << "launcher: roster member '" << spec.name << "': " << *problem
-              << "; refused even with --allow-graph-errors, since the name "
-                 "is its output and event log file names (the launcher's own "
-                 "is "
-              << kLauncherOutputFile << ")\n";
+    ConsoleLine(std::cerr)
+        << "launcher: roster member '" << spec.name << "': " << *problem
+        << "; refused even with --allow-graph-errors, since the name "
+           "is its output and event log file names (the launcher's own "
+           "is "
+        << kLauncherOutputFile << ")\n";
     return 1;
   }
   // Checked again right before retention lists the log root: another
   // launch may have taken the lock meanwhile.
   if (lock_needs_room && !take_lock()) {
-    std::cerr << "launcher: " << lock_error << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
     return 1;
   }
   const Pruning pruning = session_lock      ? Pruning::kLocked
@@ -666,7 +691,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   const uint64_t session_log_budget = ApplyRetention(
       robot_config, node_specs.size(), pruning, retention_record);
   if (lock_needs_room && (!take_lock() || !session_lock)) {
-    std::cerr << "launcher: " << lock_error << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << lock_error << "\n";
     ReportUnwrittenRetention(retention_record);
     return 1;
   }
@@ -693,11 +718,11 @@ int Launcher::RunSession(StopSignals& stop_signals) {
       const std::string full =
           RegistryCapacityError(introspect::RegistryReader{}, registering);
       if (!full.empty()) {
-        std::cerr << "launcher: " << full << "\n";
+        ConsoleLine(std::cerr) << "launcher: " << full << "\n";
         return 1;
       }
     } catch (const std::exception& e) {
-      std::cerr << "launcher: " << e.what() << "\n";
+      ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
       return 1;
     }
   }
@@ -711,7 +736,7 @@ int Launcher::RunSession(StopSignals& stop_signals) {
         TargetModeSourcesOf(robot_config), robot_config.require_target_coverage,
         starts_roster ? process::StopFd() : -1);
   } catch (const std::exception& e) {
-    std::cerr << "launcher: " << e.what() << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
     return 1;
   }
   // A stop kills the probes it finds running (ProbeDescribe), so their
@@ -739,8 +764,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
           GraphToJson(options_.session_id, options_.config_path, described,
                       diagnostics, options_.bundle_config_sha256),
           options_.sync_file, graph_error)) {
-    std::cerr << "launcher: cannot write " << graph_path << " (" << graph_error
-              << "); nothing was started\n";
+    ConsoleLine(std::cerr) << "launcher: cannot write " << graph_path << " ("
+                           << graph_error << "); nothing was started\n";
     return 1;
   }
   PrintDeclaredGraph(described, diagnostics, declared_topics, graph_path);
@@ -748,13 +773,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   DropUnansweredStudioBridge(node_specs, described);
 
   if (naming::HasError(diagnostics) && !options_.allow_graph_errors) {
-    std::cerr << "launcher: the declared graph has errors; refusing to "
-                 "start. Fix the errors above, or, in simulation, pass "
-                 "--allow-graph-errors with --sim to launch anyway.\n";
+    ConsoleLine(std::cerr)
+        << "launcher: the declared graph has errors; refusing to "
+           "start. Fix the errors above, or, in simulation, pass "
+           "--allow-graph-errors with --sim to launch anyway.\n";
     return 1;
   }
   if (options_.describe_only) {
-    std::cout << "[launcher] describe-only: nothing was started\n";
+    ConsoleLine(std::cout) << "[launcher] describe-only: nothing was started\n";
     return 0;
   }
   if (stopped_before_start()) return 0;
@@ -765,11 +791,11 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   try {
     segments = CreateSessionSegments(described);
   } catch (const std::exception& e) {
-    std::cerr << "launcher: " << e.what() << "\n";
+    ConsoleLine(std::cerr) << "launcher: " << e.what() << "\n";
     return 1;
   }
-  std::cout << "[launcher] Created " << segments.size()
-            << " session-owned topic segments\n";
+  ConsoleLine(std::cout) << "[launcher] Created " << segments.size()
+                         << " session-owned topic segments\n";
   if (options_.session_segments_created) options_.session_segments_created();
 
   SessionManifest manifest;
@@ -792,7 +818,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   try {
     output_.emplace(&*launcher_output_);
   } catch (const std::exception& e) {
-    std::cerr << "launcher: " << e.what() << "; nothing was started\n";
+    ConsoleLine(std::cerr) << "launcher: " << e.what()
+                           << "; nothing was started\n";
     return 1;
   }
 
@@ -820,11 +847,12 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   }
   const LogSplit log_split =
       LogBudgets(procs, described, robot_config, session_log_budget);
-  std::cout << "[launcher] Event-log window "
-            << (log_split.window.count() > 0
-                    ? std::to_string(log_split.window.count()) + " us"
-                    : std::string{"none (segments end on bytes)"})
-            << "\n";
+  ConsoleLine(std::cout) << "[launcher] Event-log window "
+                         << (log_split.window.count() > 0
+                                 ? std::to_string(log_split.window.count()) +
+                                       " us"
+                                 : std::string{"none (segments end on bytes)"})
+                         << "\n";
   // Synced before any node starts; from here on every version is synced,
   // off this thread (PersistManifest).
   PersistManifest(procs, /*durable=*/true);
@@ -840,10 +868,12 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   const std::string remote = EffectiveRemoteAddress(robot_config, options_);
   const uint16_t remote_port = EffectiveRemotePort(robot_config, options_);
   const uint16_t local_port = EffectiveLocalPort(robot_config, options_);
-  std::cout << "[launcher] Starting session " << options_.session_id << " with "
-            << procs.size() << " nodes...\n";
-  std::cout << "[launcher] Controller " << remote << ":" << remote_port
-            << " (local port " << local_port << ")\n";
+  ConsoleLine(std::cout) << "[launcher] Starting session "
+                         << options_.session_id << " with " << procs.size()
+                         << " nodes...\n";
+  ConsoleLine(std::cout) << "[launcher] Controller " << remote << ":"
+                         << remote_port << " (local port " << local_port
+                         << ")\n";
 
   // From the segments on, a stop ends the session through supervision and
   // the final manifest, as any stop does: a member it finds not yet started
@@ -872,8 +902,8 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     proc.pid = pid;
     proc.BeginRun(pid);
     PersistManifest(procs);
-    std::cout << "[launcher] Started " << proc.name << " (pid " << pid
-              << ", target " << proc.target << ")\n";
+    ConsoleLine(std::cout) << "[launcher] Started " << proc.name << " (pid "
+                           << pid << ", target " << proc.target << ")\n";
     if (options_.member_spawned) options_.member_spawned(proc.name);
   }
   if (studio && !stop_skips_start())
@@ -887,8 +917,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
   for (const auto& proc : procs) {
     const std::string path = NodeOutputPath(options_.output_dir, proc.name);
     if (const uint64_t dropped = output_->Dropped(path); dropped != 0)
-      std::cerr << "[launcher] " << proc.name << ": " << dropped
-                << " bytes of output dropped (marked in " << path << ")\n";
+      ConsoleLine(std::cerr)
+          << "[launcher] " << proc.name << ": " << dropped
+          << " bytes of output dropped (marked in " << path << ")\n";
   }
 
   // Whose last exit leaves the status alone: a run the stop's own signal
@@ -992,8 +1023,9 @@ void Launcher::PersistManifest(const std::vector<NodeProcessInfo>& procs,
 int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   std::error_code ec;
   if (!std::filesystem::is_directory(options_.replay_inputs, ec)) {
-    std::cerr << "launcher: --replay-inputs " << options_.replay_inputs
-              << " is not a session directory\n";
+    ConsoleLine(std::cerr) << "launcher: --replay-inputs "
+                           << options_.replay_inputs
+                           << " is not a session directory\n";
     return 1;
   }
   // The new log must not land among the logs being read.
@@ -1001,22 +1033,24 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
                             .lexically_relative(std::filesystem::canonical(
                                 options_.replay_inputs));
   if (!relative.empty() && *relative.begin() != "..") {
-    std::cerr << "launcher: --output-dir must not be the replayed session's "
-                 "directory\n";
+    ConsoleLine(std::cerr)
+        << "launcher: --output-dir must not be the replayed session's "
+           "directory\n";
     return 1;
   }
   const auto spec =
       std::find_if(specs.begin(), specs.end(),
                    [&](const NodeSpec& s) { return s.name == options_.only; });
   if (spec == specs.end()) {
-    std::cerr << "launcher: --only " << options_.only
-              << " names no roster member of " << options_.config_path << "\n";
+    ConsoleLine(std::cerr) << "launcher: --only " << options_.only
+                           << " names no roster member of "
+                           << options_.config_path << "\n";
     return 1;
   }
   if (spec->name == kHardwareNodeName || spec->sim_gateway ||
       spec->studio_bridge) {
-    std::cerr << "launcher: " << spec->name
-              << " is not a talos node and has no input replay\n";
+    ConsoleLine(std::cerr) << "launcher: " << spec->name
+                           << " is not a talos node and has no input replay\n";
     return 1;
   }
 
@@ -1030,12 +1064,13 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   const RecordedProtocol recorded =
       RecordedProtocolVersion({options_.replay_inputs});
   if (const std::string line = recorded.Disagreement(); !line.empty()) {
-    std::cerr << "launcher: --replay-inputs " << options_.replay_inputs << ": "
-              << line << "\n";
+    ConsoleLine(std::cerr) << "launcher: --replay-inputs "
+                           << options_.replay_inputs << ": " << line << "\n";
   }
   if (recorded.refused()) {
-    std::cerr << "launcher: --replay-inputs " << options_.replay_inputs
-              << " was " << recorded.Refusal() << ": not replayed\n";
+    ConsoleLine(std::cerr) << "launcher: --replay-inputs "
+                           << options_.replay_inputs << " was "
+                           << recorded.Refusal() << ": not replayed\n";
     return 1;
   }
 
@@ -1046,10 +1081,11 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   // says; without one, this launch's --sim does.
   const bool simulation =
       SessionSimulation(options_.replay_inputs).value_or(options_.simulation);
-  std::cout << "[launcher] Replaying session " << options_.replay_inputs
-            << " into " << spec->name << " (" << spec->target << ")"
-            << (simulation ? " under --sim" : "") << "; log " << log_path
-            << "\n";
+  ConsoleLine(std::cout) << "[launcher] Replaying session "
+                         << options_.replay_inputs << " into " << spec->name
+                         << " (" << spec->target << ")"
+                         << (simulation ? " under --sim" : "") << "; log "
+                         << log_path << "\n";
   std::vector<std::string> args{spec->binary_path,
                                 "--replay-inputs",
                                 options_.replay_inputs,
@@ -1063,8 +1099,8 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   std::string error;
   const pid_t pid = SpawnProcess(std::move(args), error);
   if (pid < 0) {
-    std::cerr << "[launcher] cannot spawn " << spec->name << " (" << error
-              << ")\n";
+    ConsoleLine(std::cerr) << "[launcher] cannot spawn " << spec->name << " ("
+                           << error << ")\n";
     return 1;
   }
   int status = 0;
@@ -1073,8 +1109,8 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
   }
   FinishProcessGroup(pid);
   const bool clean = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-  std::cout << "[launcher] " << spec->name << " finished ("
-            << ExitReason(status) << ")\n";
+  ConsoleLine(std::cout) << "[launcher] " << spec->name << " finished ("
+                         << ExitReason(status) << ")\n";
   return clean ? 0 : (WIFEXITED(status) ? WEXITSTATUS(status) : 1);
 }
 
@@ -1178,18 +1214,18 @@ void Launcher::SpawnFailed(NodeProcessInfo& proc, NodeLaunch& launch,
                            SupervisionTime now, const std::string& error) {
   proc.failed = true;
   proc.RecordSpawnFailure();
-  std::cerr << "[launcher] cannot spawn " << proc.name << " (" << error
-            << "); ";
+  ConsoleLine line{std::cerr};
+  line << "[launcher] cannot spawn " << proc.name << " (" << error << "); ";
   // Never `stopping` here: Supervise cancels a pending restart once the
   // session stops.
   if (!ShouldRestartNode(/*clean_exit=*/false, launch.restart.critical(),
                          restart_limits_.max_restarts, /*stopping=*/false)) {
-    std::cerr << "restarts are disabled\n";
+    line << "restarts are disabled\n";
     return;
   }
   const auto delay = ScheduleRestart(proc, launch, now);
-  std::cerr << (proc.quarantined ? "quarantined; retry" : "retry") << " in "
-            << delay.count() << " ms\n";
+  line << (proc.quarantined ? "quarantined; retry" : "retry") << " in "
+       << delay.count() << " ms\n";
 }
 
 uint64_t Launcher::RestartLogBudget(NodeProcessInfo& proc, uint64_t budget) {
@@ -1228,7 +1264,8 @@ uint64_t Launcher::RestartLogBudget(NodeProcessInfo& proc, uint64_t budget) {
 void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
                        SupervisionTime now) {
   if (launch.restart.quarantined())
-    std::cout << "[launcher] " << proc.name << " retrying after quarantine\n";
+    ConsoleLine(std::cout) << "[launcher] " << proc.name
+                           << " retrying after quarantine\n";
   // The attempt counts against the rolling budget whether or not it spawns.
   launch.restart.Started(now);
   ShowRestart(proc, launch.restart);
@@ -1259,10 +1296,11 @@ void Launcher::Restart(NodeProcessInfo& proc, NodeLaunch& launch,
   // In the first start's form, so every run's pid is in the launcher's
   // output, not only in the manifest. A first run whose first spawn failed
   // starts here too, as a start.
-  std::cout << "[launcher] " << (restart > 0 ? "Restarted " : "Started ")
-            << proc.name << " (pid " << pid << ", target " << proc.target;
-  if (restart > 0) std::cout << ", restart " << restart;
-  std::cout << ")\n";
+  ConsoleLine line{std::cout};
+  line << "[launcher] " << (restart > 0 ? "Restarted " : "Started ")
+       << proc.name << " (pid " << pid << ", target " << proc.target;
+  if (restart > 0) line << ", restart " << restart;
+  line << ")\n";
 }
 
 bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
@@ -1274,7 +1312,7 @@ bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
   launch.realtime_reported = true;
   const std::string warning =
       RealtimeWarning(proc.name, proc.pid, *outcome, options_.simulation);
-  if (!warning.empty()) std::cerr << warning;
+  if (!warning.empty()) ConsoleLine(std::cerr) << warning;
   return proc.RecordRealtime(*outcome);
 }
 
@@ -1293,16 +1331,17 @@ bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
   launch.recording_reported |= fresh;
   if ((fresh & introspect::kFlagRecorderFailed) != 0) {
     proc.failed = true;
-    std::cerr << "[launcher] " << proc.name << " event log " << log
-              << " failed; the rest of this run is not recorded\n";
+    ConsoleLine(std::cerr) << "[launcher] " << proc.name << " event log " << log
+                           << " failed; the rest of this run is not recorded\n";
   }
   if ((fresh & introspect::kFlagLogCapped) != 0) {
     proc.log_capped = true;
-    std::cerr << "[launcher] " << proc.name << " event log " << log
-              << " reached its byte budget; "
-              << (CappedLogStopped(log)
-                      ? "the rest of this run is not recorded\n"
-                      : "it keeps recording, deleting its oldest records\n");
+    ConsoleLine(std::cerr)
+        << "[launcher] " << proc.name << " event log " << log
+        << " reached its byte budget; "
+        << (CappedLogStopped(log)
+                ? "the rest of this run is not recorded\n"
+                : "it keeps recording, deleting its oldest records\n");
   }
   return true;
 }
@@ -1314,27 +1353,28 @@ bool Launcher::CheckEndpoints(NodeProcessInfo& proc, NodeLaunch& launch,
       EndpointMismatch(launch.declared, live, complete);
   if (mismatch.empty()) return false;
   proc.endpoint_mismatch = true;
-  std::cerr << "[launcher] error: " << proc.name << " (pid " << proc.pid
-            << "): live endpoints differ from its --describe probe, the "
-               "graph the lint checked: "
-            << mismatch << "; ";
+  ConsoleLine line{std::cerr};
+  line << "[launcher] error: " << proc.name << " (pid " << proc.pid
+       << "): live endpoints differ from its --describe probe, the "
+          "graph the lint checked: "
+       << mismatch << "; ";
   if (options_.allow_graph_errors) {
-    std::cerr << "running anyway (--allow-graph-errors)\n";
+    line << "running anyway (--allow-graph-errors)\n";
   } else if (!launch.restart.critical()) {
     launch.endpoints_stopped = true;
     launch.heartbeat_killed = true;
     launch.kill_reason = kRunEndpointMismatch;
     SignalProcessGroup(proc.pid, SIGKILL);
-    std::cerr << "non-critical: killing it, without restarts this "
-                 "session\n";
+    line << "non-critical: killing it, without restarts this "
+            "session\n";
   } else if (proc.restart_count == 0) {
     endpoints_refused_ = true;
     launch.kill_reason = kRunEndpointMismatch;
-    std::cerr << "stopping the session. A node must declare the same "
-                 "endpoints whether or not Node::describing(); in "
-                 "simulation, --sim --allow-graph-errors runs anyway.\n";
+    line << "stopping the session. A node must declare the same "
+            "endpoints whether or not Node::describing(); in "
+            "simulation, --sim --allow-graph-errors runs anyway.\n";
   } else {
-    std::cerr << "a critical member's restart: the session keeps running\n";
+    line << "a critical member's restart: the session keeps running\n";
   }
   return true;
 }
@@ -1418,13 +1458,14 @@ bool Launcher::WatchRun(NodeProcessInfo& proc, NodeLaunch& launch,
   }
   if (!check.kill.empty()) {
     const bool constructing = (recording & introspect::kFlagConstructing) != 0;
-    std::cerr << "[launcher] " << proc.name
-              << (check.kill == kRunConstructionDeadline
-                      ? " construction deadline exceeded"
-                  : check.kill == kRunHeartbeatMissing
-                      ? " heartbeat missing"
-                      : StallReport(launch, constructing, check.judged_at))
-              << "; killing pid " << proc.pid << "\n";
+    ConsoleLine(std::cerr) << "[launcher] " << proc.name
+                           << (check.kill == kRunConstructionDeadline
+                                   ? " construction deadline exceeded"
+                               : check.kill == kRunHeartbeatMissing
+                                   ? " heartbeat missing"
+                                   : StallReport(launch, constructing,
+                                                 check.judged_at))
+                           << "; killing pid " << proc.pid << "\n";
     SignalProcessGroup(proc.pid, SIGKILL);
     launch.heartbeat_killed = true;
     launch.kill_reason = check.kill;
@@ -1474,9 +1515,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       if (session_lock_ != nullptr && !session_lock_->Refresh() &&
           !lock_lost_reported) {
         lock_lost_reported = true;
-        std::cerr << "[launcher] the session lock " << session_lock_->path()
-                  << " was removed; a second launcher in this namespace "
-                     "would no longer be refused\n";
+        ConsoleLine(std::cerr)
+            << "[launcher] the session lock " << session_lock_->path()
+            << " was removed; a second launcher in this namespace "
+               "would no longer be refused\n";
       }
       using Refreshed = SessionDirectoryLock::Refreshed;
       // An unheld session.lock is retried only here, at supervision start
@@ -1490,23 +1532,26 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
               : Refreshed::kHeld;
       if (directory == Refreshed::kTaken) {
         // Once: a lock taken stays held.
-        std::cerr << "[launcher] locked " << session_directory_->path()
-                  << ", which could not be locked when the session started; "
-                     "retention passes over this session from now on\n";
+        ConsoleLine(std::cerr)
+            << "[launcher] locked " << session_directory_->path()
+            << ", which could not be locked when the session started; "
+               "retention passes over this session from now on\n";
       } else if (directory == Refreshed::kRetaken &&
                  !directory_lock_retaken_reported) {
         directory_lock_retaken_reported = true;
-        std::cerr << "[launcher] " << session_directory_->path()
-                  << " was removed while this session held it; locked it "
-                     "again on a new file, so retention passes over this "
-                     "session again\n";
+        ConsoleLine(std::cerr)
+            << "[launcher] " << session_directory_->path()
+            << " was removed while this session held it; locked it "
+               "again on a new file, so retention passes over this "
+               "session again\n";
       } else if (directory == Refreshed::kLost &&
                  !directory_lock_lost_reported) {
         directory_lock_lost_reported = true;
-        std::cerr << "[launcher] " << session_directory_->path()
-                  << " was removed and cannot be locked again (retention "
-                     "holds it, or the session directory was moved away); "
-                     "retention may remove this running session\n";
+        ConsoleLine(std::cerr)
+            << "[launcher] " << session_directory_->path()
+            << " was removed and cannot be locked again (retention "
+               "holds it, or the session directory was moved away); "
+               "retention may remove this running session\n";
       }
     }
     // Read-only, the attach takes no lock (RegistryMapping): no node can
@@ -1570,15 +1615,16 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
           ShouldRestartNode(clean, launch.restart.critical(),
                             restart_limits_.max_restarts, stop_arrived())) {
         const auto delay = ScheduleRestart(proc, launch, now);
-        std::cout << "[launcher] " << proc.name << " exited ("
-                  << ExitReason(status) << "); "
-                  << (proc.quarantined ? "quarantined; retry" : "restart")
-                  << " " << proc.restart_count + 1 << " in " << delay.count()
-                  << " ms\n";
+        ConsoleLine(std::cout)
+            << "[launcher] " << proc.name << " exited (" << ExitReason(status)
+            << "); " << (proc.quarantined ? "quarantined; retry" : "restart")
+            << " " << proc.restart_count + 1 << " in " << delay.count()
+            << " ms\n";
         continue;
       }
-      std::cout << "[launcher] Process " << proc.name << " (pid " << proc.pid
-                << ") exited (" << ExitReason(status) << ")\n";
+      ConsoleLine(std::cout)
+          << "[launcher] Process " << proc.name << " (pid " << proc.pid
+          << ") exited (" << ExitReason(status) << ")\n";
     }
     for (std::size_t i = 0; i < procs.size(); ++i) {
       auto& launch = launches[i];
@@ -1593,9 +1639,10 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
             !RosterContinues(procs, launches, studio, i)) {
           launch.restart.Cancel();
           ShowRestart(procs[i], launch.restart);
-          std::cout << "[launcher] " << procs[i].name
-                    << " finished with the rest of the roster; not "
-                       "restarted\n";
+          ConsoleLine(std::cout)
+              << "[launcher] " << procs[i].name
+              << " finished with the rest of the roster; not "
+                 "restarted\n";
         } else {
           Restart(procs[i], launch, now);
         }
@@ -1647,7 +1694,7 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
                        endpoints_refused_)) {
       stop_sent = true;
       shutdown_deadline = now + kStopTimeout;
-      std::cout << "[launcher] Stopping children...\n";
+      ConsoleLine(std::cout) << "[launcher] Stopping children...\n";
       for (std::size_t i = 0; i < procs.size(); ++i) {
         const auto& proc = procs[i];
         if (proc.pid <= 0 || proc.exited) continue;
