@@ -146,7 +146,7 @@ class Node:
         return lib.talos_node_now_ns(self._handle)
 
     @property
-    def tick(self):  # update() calls completed so far
+    def tick(self):  # update() calls so far, one that threw included
         return lib.talos_node_tick(self._handle)
 
     @property
