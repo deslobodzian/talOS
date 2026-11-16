@@ -314,6 +314,42 @@ TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
   EXPECT_EQ(hw.motor_request("mech", "b").mode, Mode::kMotionMagic);
 }
 
+// REQ-SAFE-04: clamped_count() rises exactly once per adjusted setter call,
+// counted per call, not per tick or per clamped field: two calls in one
+// update() that each clamp both demand and feedforward add two, and an
+// in-range call adds none.
+TEST(Devices, ClampedCountRisesOncePerAdjustedCall) {
+  struct Twice {
+    explicit Twice(Node& node) : motor{node, "a"} {
+      AllowUntargetedOutputs(node);
+    }
+    void update() {
+      for (int i = 0; i < calls; ++i) motor.set_velocity(demand, ff);
+      ++updates;
+    }
+    Motor motor;
+    int updates = 0;
+    int calls = 2;
+    double demand = 1000;  // past max_velocity_rps
+    double ff = 1000;      // past max_voltage
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  auto& twice = sim.add<Twice>("mech");
+  SimHardware hw{sim};
+  hw.enable();
+  sim.step(5ms);
+  const std::uint64_t before = twice.motor.clamped_count();
+  const int updates = twice.updates;
+  sim.step(5ms);  // one update(), two clamping calls
+  ASSERT_EQ(twice.updates, updates + 1);
+  EXPECT_EQ(twice.motor.clamped_count(), before + 2);
+  twice.calls = 1;
+  twice.demand = 1;
+  twice.ff = 0.5;
+  sim.step(5ms);  // in range
+  EXPECT_EQ(twice.motor.clamped_count(), before + 2);
+}
+
 TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   struct Limited {
     explicit Limited(Node& node) : motor{node, "a"} {
