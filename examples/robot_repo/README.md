@@ -27,7 +27,7 @@ this fixture means saying there whether a robot repository gets the file.
 
 ```sh
 cd examples/robot_repo
-bazel test //...                       # graph test, node tests, sim smoke, Studio, bundle install, pin and session_report tests
+bazel test //...                       # graph test, node tests, sim smoke, Studio, bundle install, pin, trace and session_report tests
 bazel build //:robot_bundle            # the deployable bundle (--config=release records the revision)
 bazel run //:sim -- --duration-s 10    # the robot against the simulator
 bazel run //:sim -- --start-studio-bridge   # with Studio (below)
@@ -158,6 +158,19 @@ that leaves it or a file naming Bazel's output base or either checkout, so
 the bundle runs where the build tree is not. A robot repository gets the
 same test: talOS's own bundle tests install bundles built inside talOS,
 never one built under `@talos`'s external name.
+
+## Requirements
+
+Its tests tag the talOS requirements they guard
+([docs/TESTING.md §3](../../docs/TESTING.md#3-requirements-and-traceability)).
+`trace_test` runs talOS's `tools/trace.py --check` on this repository's
+tracked files (every file, before `git init`) with talOS's catalogue, the
+one in the checkout `@talos` is built from: a tag naming no row of it fails.
+This fixture has no rows of its own, so it has no `docs/REQUIREMENTS.md`; a
+robot repository that adds one, holding only its own rows in talOS's
+numbering and its own package scope table, is checked against it from then
+on, as talOS's is against its own, and an ID in both catalogues fails. The
+test reads files Bazel does not track, so it runs every time (`external`).
 
 ## What it shares with talOS
 

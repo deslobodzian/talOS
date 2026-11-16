@@ -14,7 +14,8 @@ reading the existing tags follow (`// REQ-SAFE-09`, `# REQ-A, REQ-B: why`).
 
 `--check` fails on:
 
-- a tag naming an ID docs/REQUIREMENTS.md's catalogue lacks (file:line);
+- a tag naming an ID docs/REQUIREMENTS.md's catalogue lacks (file:line),
+  and every framework catalogue's too (below);
 - a SAFE or CONTRACT requirement, or any P0, with no tagged test and no
   verification cited in its row: an open TODO.md item's ID (`- [ ] **ID`),
   a quoted BRINGUP.md heading after `BR`, or a BENCH.md heading after
@@ -34,6 +35,21 @@ is not derivable from the tree today: tiers are defined by the resources a
 test touches (TESTING.md §2) and the lanes are not yet Bazel tags (LANE-1),
 so `--report` prints each requirement's Cheapest tier beside its tests for a
 reviewer to judge, and the check asks only for a tagged test.
+
+Framework catalogues. A robot repository keeps its own rows in its
+docs/REQUIREMENTS.md and tags its tests with talOS's rows too. Each
+`--framework-catalogue PATH` (repeatable) names another catalogue whose IDs
+are valid tags here; its rows need no tagged test here, and its scope table,
+sources and waivers are not checked. An ID in two catalogues fails, naming
+both (IDs are one numbering). `--talos-catalogue` names the
+docs/REQUIREMENTS.md of the talOS checkout this file is in. With a framework
+catalogue and no docs/REQUIREMENTS.md here, the repository has no rows and
+no scope table: only tags are checked, until it adds one.
+
+`--root-of FILE` checks the repository holding FILE, links followed: a
+Bazel test's files are links into the source tree, so a robot repository's
+`py_test` runs `@talos//tools:trace.py` with `--root-of
+$(rootpath MODULE.bazel) --talos-catalogue` (examples/robot_repo/BUILD.bazel).
 
 Waivers. tools/trace_waivers.txt lists known gaps, one
 `<REQ-ID | package path> <YYYY-MM-DD> <TODO-ID> [note]` per line: the date the
@@ -254,10 +270,34 @@ def parse_waivers(text, today):
     return waivers, errors
 
 
-def trace(files, read, today):
+def framework_ids(catalogue, frameworks, read):
+    """({id: the framework catalogue holding it}, [failures]): a framework
+    catalogue with no rows, and an ID in two catalogues, fail."""
+    owners, failures = {}, []
+    for path in frameworks:
+        ids = parse_requirements(read(path))[0]
+        if not ids:
+            failures.append(f"{path}: framework catalogue holds no "
+                            f"requirement")
+        for req_id in ids:
+            other = REQUIREMENTS if req_id in catalogue else owners.get(req_id)
+            if other:
+                failures.append(f"{other}: {req_id} is also in {path}; IDs "
+                                f"are one numbering across catalogues")
+            owners.setdefault(req_id, path)
+    return owners, failures
+
+
+def trace(files, read, today, frameworks=()):
     """(failures, {id: [(path, line)]}, {id: citation}, catalogue)."""
     failures = []
     catalogue, scope = parse_requirements(read(REQUIREMENTS))
+    # A repository with no catalogue of its own has no scope table either.
+    check_scope = REQUIREMENTS in files or not frameworks
+    framework, errors = framework_ids(catalogue, frameworks, read)
+    failures.extend(errors)
+    catalogues = " or ".join(([REQUIREMENTS] if check_scope else []) +
+                             list(frameworks))
     todo_text = read(TODO)
     todo_items = open_todo_items(todo_text)
     bench_headings = headings(read(BENCH))
@@ -269,10 +309,10 @@ def trace(files, read, today):
     quarantined_sources = {s for _, _, sources in quarantined for s in sources}
     tests = {}
     for path, number, req_id in find_tags(files, read):
-        if req_id not in catalogue:
+        if req_id not in catalogue and req_id not in framework:
             failures.append(f"{path}:{number}: tag {req_id} is not in "
-                            f"{REQUIREMENTS}")
-        elif path not in quarantined_sources:
+                            f"{catalogues}")
+        elif req_id in catalogue and path not in quarantined_sources:
             tests.setdefault(req_id, []).append((path, number))
 
     for label, build, _ in quarantined:
@@ -311,7 +351,7 @@ def trace(files, read, today):
             failures.append(f"{WAIVERS}:{waiver[2]}: stale waiver: {req.id} "
                             f"{why}; delete the line")
 
-    packages = bazel_packages(files)
+    packages = bazel_packages(files) if check_scope else set()
     for package in sorted(packages):
         waiver = waivers.pop(package, None)
         if not in_scope(package, scope) and not waiver:
@@ -339,21 +379,23 @@ def trace(files, read, today):
     return failures, tests, citations, catalogue
 
 
-def check(files, read, today, out=sys.stdout):
+def check(files, read, today, out=sys.stdout, frameworks=()):
     """Prints each failure; returns how many there were."""
-    failures, tests, _, catalogue = trace(files, read, today)
+    failures, tests, _, catalogue = trace(files, read, today, frameworks)
     for failure in failures:
         print(failure, file=out)
     if not failures:
         waived = len(parse_waivers(read(WAIVERS), today)[0])
         print(f"trace: {len(catalogue)} requirements, {len(tests)} with "
-              f"tagged tests, {waived} waived; tier not checked (LANE-1)",
+              f"tagged tests, {waived} waived; tier not checked (LANE-1)" +
+              "".join(f"; tags of {path} accepted" for path in frameworks),
               file=out)
     return len(failures)
 
 
-def report(files, read, today, out=sys.stdout):
-    failures, tests, citations, catalogue = trace(files, read, today)
+def report(files, read, today, out=sys.stdout, frameworks=()):
+    failures, tests, citations, catalogue = trace(files, read, today,
+                                                  frameworks)
     for req in catalogue.values():
         print(f"{req.id} {req.priority} [{req.tier}]", file=out)
         for path, number in tests.get(req.id, []):
@@ -367,9 +409,30 @@ def report(files, read, today, out=sys.stdout):
 
 
 def tracked_files():
-    listing = subprocess.run(["git", "ls-files", "-z"], capture_output=True,
-                             check=True).stdout.decode()
-    return [path for path in listing.split("\0") if path]
+    """git's tracked files; outside a git work tree (a repository new_robot
+    has just written), every file but Bazel's output links, hidden
+    directories and what .bazelignore names."""
+    try:
+        inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True).returncode == 0
+    except OSError:
+        inside = False
+    if inside:
+        listing = subprocess.run(["git", "ls-files", "-z"],
+                                 capture_output=True, check=True).stdout
+        return [path for path in listing.decode().split("\0") if path]
+    ignored = {line.strip().rstrip("/") for line in
+               read_file(".bazelignore").splitlines()
+               if line.strip() and not line.startswith("#")}
+    files = []
+    for top, dirs, names in os.walk("."):
+        top = os.path.relpath(top)
+        dirs[:] = sorted(
+            d for d in dirs if not d.startswith((".", "bazel-")) and
+            os.path.normpath(os.path.join(top, d)) not in ignored)
+        files.extend(os.path.normpath(os.path.join(top, name))
+                     for name in sorted(names))
+    return files
 
 
 def read_file(path):
@@ -385,12 +448,22 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--report", action="store_true")
+    parser.add_argument("--framework-catalogue", action="append", default=[],
+                        metavar="PATH")
+    parser.add_argument("--talos-catalogue", action="store_true")
+    parser.add_argument("--root-of", metavar="FILE")
     args = parser.parse_args()
+    frameworks = [os.path.abspath(p) for p in args.framework_catalogue]
+    if args.talos_catalogue:
+        talos = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+        frameworks.append(os.path.join(talos, REQUIREMENTS))
+    if args.root_of:
+        os.chdir(os.path.dirname(os.path.realpath(args.root_of)))
     files, today = tracked_files(), datetime.date.today()
     if args.report:
-        report(files, read_file, today)
+        report(files, read_file, today, frameworks=frameworks)
         return 0
-    return 1 if check(files, read_file, today) else 0
+    return 1 if check(files, read_file, today, frameworks=frameworks) else 0
 
 
 if __name__ == "__main__":

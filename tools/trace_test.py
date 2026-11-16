@@ -2,7 +2,10 @@
 
 import datetime
 import io
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 from tools import trace
 
@@ -130,6 +133,60 @@ class TraceTest(unittest.TestCase):
         report = io.StringIO()
         trace.report(sorted(files), lambda p: files.get(p, ""), TODAY, report)
         self.assertIn("REQ-OPS-02 P0 [unit]", report.getvalue())
+
+    # REQ-DEV-30: a robot repository's tests tag talOS's rows, which its own
+    # catalogue does not hold, and its check passes on exactly its own rows.
+    def test_a_framework_catalogue_validates_tags_and_requires_no_tests(self):
+        framework = "talos/docs/REQUIREMENTS.md"
+        rows = (row("REQ-RT-06", "P0"), row("REQ-SAFE-09", "P0"))
+        talos = catalogue(*rows, scope=("`talOS/nowhere`",))
+        tagged = "// REQ-SAFE-01\n// REQ-RT-06\nTEST(Node, Neutral) {}\n"
+        for name, files, expected, needles in (
+                # The untested P0 there, REQ-SAFE-09, is no gap here, and
+                # talOS's scope entry naming no directory here is not
+                # checked.
+                ("framework tag", {"talOS/node/node_test.cc": tagged}, 0, ()),
+                ("duplicate ID", {framework: catalogue(
+                    *rows, row("REQ-SAFE-01", "P1"))},
+                 1, ("REQ-SAFE-01", "docs/REQUIREMENTS.md:", framework)),
+                ("tag in neither", {"talOS/node/other_test.cc":
+                                    "// REQ-RT-99\n"},
+                 1, ("other_test.cc:1:", "REQ-RT-99",
+                     f"docs/REQUIREMENTS.md or {framework}")),
+                # No rows of its own: no scope table, only tags checked.
+                ("no local catalogue", {"docs/REQUIREMENTS.md": None,
+                                        "talOS/node/node_test.cc": tagged},
+                 1, ("REQ-SAFE-01", f"not in {framework}"))):
+            with self.subTest(name):
+                files = tree(**{framework: talos, **files})
+                out = io.StringIO()
+                failures = trace.check(sorted(files),
+                                       lambda p, f=files: f.get(p, ""), TODAY,
+                                       out, frameworks=[framework])
+                self.assertEqual(failures, expected, out.getvalue())
+                for needle in needles:
+                    self.assertIn(needle, out.getvalue())
+
+    # REQ-DEV-30: the repository new_robot writes passes `bazel test //...`
+    # before `git init`; its trace then reads every file but Bazel's output
+    # links and the talOS checkout .bazelignore keeps out.
+    def test_outside_git_every_file_but_output_links_and_ignored_is_read(self):
+        with tempfile.TemporaryDirectory() as root:
+            for path in ("gate/node_test.py", "bazel-out/x_test.py",
+                         "talos/tools/trace_test.py", ".git/x_test.py"):
+                os.makedirs(os.path.dirname(os.path.join(root, path)),
+                            exist_ok=True)
+                open(os.path.join(root, path), "w").close()
+            with open(os.path.join(root, ".bazelignore"), "w") as f:
+                f.write("# a submodule of talOS\ntalos\n")
+            cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent"}):
+                    files = trace.tracked_files()
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(files, [".bazelignore", "gate/node_test.py"])
 
     def test_package_missing_from_scope_table_fails_naming_it(self):
         failures, out = check(tree(**{
