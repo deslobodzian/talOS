@@ -447,7 +447,11 @@ them. CI's source lints (test time, links, requirement trace, node test
 matrix, METHODOLOGY.md §13's `bazel_dep` table, and the RULES.md 4
 commissioning check against the diff base) are
 one script, `tools/source_lints.sh`, which CI's lint job and
-prepush's `source-lints` step both run; CI's sanitizer jobs are
+prepush's `source-lints` step both run. One doc check needs the compiler
+and so runs in the suite instead: `//tools:check_data_flow_sizes_test`
+(`tools/check_data_flow_sizes.py`) fails unless every marked number in
+[DATA_FLOW.md](DATA_FLOW.md) equals the size `//tools:data_flow_sizes`
+prints from the defining headers (RULES.md 9). CI's sanitizer jobs are
 `tools/sanitizer_lane.sh asan|tsan`, which `tools/prepush.sh --full` also
 runs. Prepush also runs CI's clang-format and clang-tidy checks
 (`tools/format.sh`, `tools/tidy.sh`, which says when this host cannot run
