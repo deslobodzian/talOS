@@ -83,7 +83,7 @@ A node name follows the segment rules, is not a reserved owner, and is the
 `[subsystems.<name>]` key, the `node_name` in `talos_cc_node`/`talos_py_node`,
 the log file stem and the registry row. The node's Bazel label must match the
 name in its package leaf, its repository (at a repository root), or its rule:
-`//2026-robot/main_processor/shooter:node`, `@wrist//:node`,
+`//bench/main_processor/swerve_module:node`, `@wrist//:node`,
 `//examples/superstructure/cpp:elevator`.
 
 Message types are PascalCase in the package's FlatBuffers namespace

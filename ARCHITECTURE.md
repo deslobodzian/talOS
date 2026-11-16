@@ -21,7 +21,7 @@ producer/consumer, rate, dynamic payload, and shared-memory slot size.
 ## Layers
 
 ```
-robot code        2026-robot/main_processor/*, examples/*
+robot code        a robot repository's nodes; bench/main_processor/*, examples/*
 talOS/devices     Motor, CANcoder, Gyro, DigitalInput, ..., robot_enabled, Target, TargetLane, OperatorArming, testing::SimHardware
 talOS/node        Node, Subscription, Publisher, StateMachine, TALOS_NODE, testing::Sim
 talOS/python      the same API in Python, ctypes over talOS/node_api (libtalos_node.so)
@@ -125,7 +125,7 @@ a node that stops hearing its target goes neutral on its own.
 A node that stops sending requests goes neutral at the bridge once its last
 accepted request is older than its owner timeout,
 `max(2 × period_us, command_timeout_us / 2)` and never more than
-`command_timeout_us` (50 ms for every 2026-robot subsystem): the bridge,
+`command_timeout_us` (50 ms for every bench subsystem): the bridge,
 which otherwise sleeps until a gateway datagram or a request arrives, wakes
 for that instant. A shorter gap, such as a late or missed tick, keeps its
 last demand. Whatever the bridge does, the RoboRIO neutralizes it within
@@ -363,15 +363,15 @@ manifest fails the build with the regenerate command.
 
 | New thing | Where |
 |---|---|
-| a mechanism | a node package under `<robot>/main_processor/<name>/`, plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; `bazel run //tools:new_subsystem -- <name> --lang cpp\|py` does all of it (walkthrough in [examples/superstructure](examples/superstructure/README.md)); in a robot repository that depends on talOS, `bazel run @talos//tools:new_subsystem -- <name> --lang cpp\|py` from its root does the same there, beside the config's other nodes ([examples/robot_repo](examples/robot_repo/README.md#add-a-subsystem)). A node is best a thin wrapper over a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block (`talos.mechanisms` in Python), as `examples/superstructure/cpp/elevator.h` and the generated `--type position` node are |
+| a mechanism | a node package beside the robot config's other nodes (`main_processor/<name>/`), plus a subsystem file and a `[[subsystems]]` entry, then regenerate the manifest; in a robot repository `bazel run @talos//tools:new_subsystem -- <name> --lang cpp\|py`, from its root, does all of it ([examples/robot_repo](examples/robot_repo/README.md#add-a-subsystem)); inside talOS `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --robot <robot>` does it for `<robot>/main_processor/<name>/` (walkthrough in [examples/superstructure](examples/superstructure/README.md)). A node is best a thin wrapper over a [`talOS/mechanisms`](talOS/mechanisms/README.md) building block (`talos.mechanisms` in Python), as `examples/superstructure/cpp/elevator.h` and the generated `--type position` node are |
 | a mechanism in its own repository | `bazel run //tools:new_subsystem -- <name> --lang cpp\|py --standalone DIR` writes a Bzlmod repo (overriding `@talos` with this checkout); the robot adds `bazel_dep` + `local_path_override`, a subsystem file naming `@<name>//:node`, and its `[[subsystems]]` entry |
-| a camera | its calibrated `configuration/subsystems/<camera>.toml`, a name in `vision/BUILD`'s `CAMERAS`, a `[[subsystems]]` entry and regenerated manifest; list it in the pose estimator's `cameras` |
+| a camera | a camera node of the robot's, built on `talOS/vision`, with its calibrated `configuration/subsystems/<camera>.toml` ([calibration](docs/BRINGUP.md#camera-intrinsics-calibration)), a `[[subsystems]]` entry and regenerated manifest |
 | a trajectory | a Choreo `.traj` file (beside its `.chor` project) in `<robot>/main_processor/configuration/trajectories/`, named in the following node's subsystem file under `[trajectories]` and loaded with `talOS/trajectory`; regenerate the manifest so `CONFIG_FILES`, and the bundle, carry it |
 | a message or topic | the owning package's `.fbs` and `BUILD` declaration via `talos_messages(topics = ...)`, which generates `topics.h` |
 | a producer of an existing target | a `talos::TargetLane` on `/<sub>/target/<source>` (opened with a `talos::OperatorArming` when it maps operator input), and `<source>` in that subsystem's policy (`[robot.targets]` or its `[targets]`); the launcher refuses a lane no mode lists |
 | a device type | `talOS/hardware` (config + wire), `talOS/devices`, `talOS/python/talos/devices.py`, and the RoboRIO program |
 | a node-API feature | `talOS/node`, mirrored in `talOS/node_api` and `talOS/python/talos` |
-| a robot | its own repository (next row): `bazel run //tools:new_robot -- <name> --standalone DIR`, from a talOS checkout, makes one ([docs/FIRST_MECHANISM.md](docs/FIRST_MECHANISM.md)). Inside talOS, for its own tests, a sibling of `2026-robot/`: `bazel run //tools:new_robot -- <name> --mechanism <mech> --lang cpp\|py` writes its configuration (teleop, telemetry), manifest, graph test, bundle and first mechanism; `./sim.sh --config <name>/main_processor/configuration/robot.toml` runs it |
-| a robot in its own repository | a Bzlmod repository holding talOS as a git submodule at a commit, pinned with `bazel_dep` + `local_path_override`, its configs naming talOS's programs by `@talos//` labels, with `talos_graph_test`, `talos_bundle`, `talos_sim` and `talos_sim_test`; [examples/robot_repo](examples/robot_repo/README.md) is one, and lists what it copies from talOS; `new_robot --standalone` copies it without its example mechanisms |
+| a robot | its own repository (next row): `bazel run //tools:new_robot -- <name> --standalone DIR`, from a talOS checkout, makes one ([docs/FIRST_MECHANISM.md](docs/FIRST_MECHANISM.md)). Inside talOS, for its own tests, a directory at the workspace root like `bench/`: `bazel run //tools:new_robot -- <name> --mechanism <mech> --lang cpp\|py` writes its configuration (teleop, telemetry), manifest, graph test, bundle and first mechanism; `./sim.sh --config <name>/main_processor/configuration/robot.toml` runs it |
+| a robot in its own repository | a Bzlmod repository holding talOS as a git submodule at a commit, pinned with `bazel_dep` + `local_path_override`, its configs naming talOS's programs by `@talos//` labels, with `talos_graph_test`, `talos_bundle`, `talos_sim` and `talos_sim_test`; [examples/robot_repo](examples/robot_repo/README.md) is one, and says what it shares with talOS (`talos.bazelrc`, imported by its `.bazelrc`; `.bazelversion`; the default Python); `new_robot --standalone` copies it without its example mechanisms |
 | a controller processor | a sibling of `controller_processor/rio/` speaking `talOS/protocol` |
 | a viewer tab | `studio/` |
