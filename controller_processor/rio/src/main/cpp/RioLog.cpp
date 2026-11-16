@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sstream>
+#include <string>
 
 #include "hardware/messages.h"
 
@@ -34,6 +35,10 @@ uint64_t SteadyNowUs() {
 const char* Or(const char* value, const char* fallback) {
   return value ? value : fallback;
 }
+
+// The least age that is a difference of two readings of one clock gone
+// negative, not an age (RioLog::RecordCommandAge).
+constexpr uint64_t kWrappedAgeUs = uint64_t{1} << 63;
 
 }  // namespace
 
@@ -139,10 +144,14 @@ void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
   raise(max_interval_us_, interval_us);
 
   // Hand the logger the window it asked for, without this tick, which opens
-  // the next one. The fence runs only on a new request, once per window.
-  const uint32_t request = phase_request_.load(std::memory_order_relaxed);
-  if (request != phase_served_local_) {
-    std::atomic_thread_fence(std::memory_order_acquire);
+  // the next one. The acquire re-load runs only on a new request, once per
+  // window: it reads the value the logger stored with release (it is the only
+  // writer, and does not store again until this handover is served), so the
+  // logger's clear of the latency set it printed happens-before this
+  // switch back to it, in a form ThreadSanitizer models (it does not model a
+  // standalone fence).
+  if (phase_request_.load(std::memory_order_relaxed) != phase_served_local_) {
+    const uint32_t request = phase_request_.load(std::memory_order_acquire);
     published_ticks_.store(phase_window_.ticks, std::memory_order_relaxed);
     for (std::size_t i = 0; i < kPhaseCount; ++i) {
       published_sum_ns_[i].store(phase_window_.sum_ns[i],
@@ -152,6 +161,8 @@ void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
     }
     published_motors_.store(phase_window_.motors, std::memory_order_relaxed);
     published_sensors_.store(phase_window_.sensors, std::memory_order_relaxed);
+    latency_published_ = latency_front_;
+    latency_front_ ^= 1;
     phase_served_.store(request, std::memory_order_release);
     phase_served_local_ = request;
     phase_window_ = {};
@@ -167,6 +178,64 @@ void RioLog::RecordTick(uint64_t interval_us, uint64_t duration_us,
   boundary_total_ns_ = 0;
   phase_window_.motors = tick_motors_;
   phase_window_.sensors = tick_sensors_;
+  FoldCommandAge();
+  FoldDriverStationAge();
+}
+
+void RioLog::RecordCommandAge(uint64_t age_us, bool accepted) {
+  if (age_us >= kWrappedAgeUs) return;
+  FoldCommandAge();
+  tick_command_age_ = {true, accepted, age_us};
+}
+
+void RioLog::RecordDriverStationAge(uint64_t age_us) {
+  if (age_us >= kWrappedAgeUs) return;
+  FoldDriverStationAge();
+  tick_driver_station_age_ = {true, false, age_us};
+}
+
+void RioLog::FoldCommandAge() {
+  if (!tick_command_age_.present) return;
+  auto& window = latency_[latency_front_];
+  (tick_command_age_.accepted ? window.accepted : window.refused)
+      .Add(tick_command_age_.age_us);
+  tick_command_age_.present = false;
+}
+
+void RioLog::FoldDriverStationAge() {
+  if (!tick_driver_station_age_.present) return;
+  latency_[latency_front_].driver_station.Add(tick_driver_station_age_.age_us);
+  tick_driver_station_age_.present = false;
+}
+
+void RioLog::LatencyHistogram::Add(uint64_t age_us) {
+  const uint64_t bucket = age_us / kLatencyBucketUs;
+  ++counts[bucket < kLatencyBuckets ? bucket : kLatencyBuckets];
+  ++samples;
+  max_us = std::max(max_us, age_us);
+}
+
+std::string RioLog::LatencyHistogram::Summary() const {
+  if (samples == 0) return "-/-/- us over 0";
+  // Nearest rank: the upper edge of the bucket holding the ceil(p% of n)th
+  // smallest sample, never above the exact max (so the overflow bucket's
+  // percentiles read as the max).
+  const auto percentile = [this](uint64_t percent) {
+    const uint64_t rank = (samples * percent + 99) / 100;
+    uint64_t seen = 0;
+    for (std::size_t i = 0; i < kLatencyBuckets; ++i) {
+      seen += counts[i];
+      if (seen >= rank) return std::min((i + 1) * kLatencyBucketUs, max_us);
+    }
+    return max_us;
+  };
+  char text[96];
+  std::snprintf(text, sizeof(text), "%llu/%llu/%llu us over %llu",
+                static_cast<unsigned long long>(percentile(50)),
+                static_cast<unsigned long long>(percentile(99)),
+                static_cast<unsigned long long>(max_us),
+                static_cast<unsigned long long>(samples));
+  return text;
 }
 
 void RioLog::AddPhase(TickPhase phase, uint64_t duration_ns) {
@@ -236,7 +305,15 @@ void RioLog::WritePhases(uint64_t now_us, bool force) {
           static_cast<unsigned>(
               published_sensors_.load(std::memory_order_relaxed)));
       sink_(text);
+      LatencyWindow& latency = latency_[latency_published_];
+      sink_("[rio] latency: command age accepted p50/p99/max " +
+            latency.accepted.Summary() + ", refused " +
+            latency.refused.Summary() + "; driver station refresh to send " +
+            latency.driver_station.Summary() + "\n");
     }
+    // Empty for the loop's next switch to it, before the next request's
+    // release store.
+    latency_[latency_published_] = {};
   }
   // A flush asks for nothing: the stopped loop would never answer.
   if (force) return;

@@ -505,7 +505,16 @@ void Robot::StartCompetition() {
           now_us, (mode_flags & talos::driver_station::kEnabled) != 0 &&
                       (mode_flags & talos::driver_station::kEStop) == 0));
       // The socket retry and the endpoint's tick.
-      log_->ClosePhase(TickPhase::kLink, NowNs());
+      const uint64_t ticked_ns = NowNs();
+      log_->ClosePhase(TickPhase::kLink, ticked_ns);
+      // The age of the drained command's observation at the end of the tick
+      // that drained it, on this clock: observed_time_us is the
+      // sample_time_us of a State this gateway sent (REQ-RT-25). RioLog drops
+      // a difference that wrapped (an observation in this clock's future).
+      if (const auto& drained = endpoint_->drained(); drained.present) {
+        log_->RecordCommandAge(ticked_ns / 1000 - drained.observed_time_us,
+                               drained.accepted);
+      }
 
       // The Driver Station only produces new data at 50 Hz, so sampling it on
       // every hardware tick would put three duplicate packets on the link, and
@@ -533,9 +542,19 @@ void Robot::StartCompetition() {
         const auto ds_size = talos::driver_station::Encode(ds, ds_buffer);
         log_->ClosePhase(TickPhase::kDriverStation, NowNs());
         if (ds_size) {
-          sent(endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
-                                    now_us, ds_buffer.data(), ds_size));
-          log_->ClosePhase(TickPhase::kLink, NowNs());
+          const auto ds_status =
+              endpoint_->SendFrame(talos::protocol::FrameType::kDriverStation,
+                                   now_us, ds_buffer.data(), ds_size);
+          sent(ds_status);
+          const uint64_t ds_sent_ns = NowNs();
+          log_->ClosePhase(TickPhase::kLink, ds_sent_ns);
+          // The sent snapshot's refresh age at its send (REQ-RT-25); none
+          // for the neutral snapshot, which no refresh made.
+          if (ds_status == talos::protocol::UdpStatus::kOk &&
+              driver_station.refreshed_us() != 0) {
+            log_->RecordDriverStationAge(ds_sent_ns / 1000 -
+                                         driver_station.refreshed_us());
+          }
         }
       }
     } else {

@@ -340,6 +340,30 @@ TEST(DriverStationReader, AViewNotRefreshedWithinTheTimeoutHasNoDriverStation) {
       << "the mode came back under the generation issued before the gap";
 }
 
+// The loop ages each Driver Station packet it sends by the refresh of the
+// snapshot that packet carries. The neutral snapshot no refresh made (none
+// yet, or the last one stale) has no refresh time: aged by its stale
+// refresh, a dead reader would read as a 100 ms Driver Station age.
+// REQ-RT-25
+TEST(DriverStationReader, RefreshTimeIsTheReturnedSnapshotsAndNoneForNeutral) {
+  auto gate = std::make_shared<Gate>();
+  const TestClock clock = MakeClock();
+  DriverStationReader reader{CallsThrough(gate), ClockThrough(clock), NoReport,
+                             kNeverAbandon};
+  reader.Start(0);
+  reader.Read(kT0, kTimeoutUs);
+  EXPECT_EQ(reader.refreshed_us(), 0u) << "before any refresh";
+
+  clock->store(kT0 + 2'000);
+  gate->SetSample(kA);
+  ASSERT_TRUE(gate->Step());
+  reader.Read(kT0 + 5'000, kTimeoutUs);
+  EXPECT_EQ(reader.refreshed_us(), kT0 + 2'000);
+
+  reader.Read(kT0 + 2'000 + kTimeoutUs, kTimeoutUs);
+  EXPECT_EQ(reader.refreshed_us(), 0u) << "a stale view";
+}
+
 // The Driver Station shows the mode robot code reports (TimedRobot reports
 // it each iteration). The helper reports it after each refresh only while the
 // loop's last Read is at most 20 ms old, so a stalled loop stops the reports,

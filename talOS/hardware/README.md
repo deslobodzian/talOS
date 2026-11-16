@@ -695,6 +695,42 @@ steady-clock reading per phase boundary, ten per disabled tick, and adds
 them on the loop thread without locks; the window passes to the logger at
 the loop's next tick ([bench measurement](../../docs/BENCH.md#fault-injection-and-timing)).
 `State` has no field for these, so they are RIO-local.
+
+Beside it, from the same window (REQ-RT-25):
+
+```
+[rio] latency: command age accepted p50/p99/max <a>/<b>/<c> us over <n>, refused <a>/<b>/<c> us over <n>; driver station refresh to send <a>/<b>/<c> us over <n>
+```
+
+Every figure is a difference of two readings of the RoboRIO's own clock,
+never a subtraction across processors. The command age is, for each tick
+that drained a command (`Endpoint::drained()`, the newest of the batch), the
+clock read just after the endpoint's tick less the command's
+`observed_time_us`, the `sample_time_us` of the State this gateway sent and
+the command was built from; accepted and refused (`Gateway::Accept`'s
+answer) are counted apart. An accepted age is that State's sample-to-apply
+time to within the endpoint's encode and send of its next State, which
+follows `SetControl` in the same tick; it is not the age of the CAN feedback
+in that State, nor the time the motor acts. A refused age while disabled
+includes the bridge's hold: while the gateway cannot drive, the bridge sends
+a merge whose only change is its observation on its heartbeat
+(`command_timeout_us / 5`, 5 to 20 ms), not at once. The Driver
+Station figure is, for each packet sent, the clock read after its send less
+the refresh time of the snapshot it carries (`DriverStationReader::refreshed_us`);
+the neutral snapshot sent while no refresh is current is not counted. It is
+not the Driver Station's own packet age (radio and NetComm come before the
+refresh). p50 and p99 are nearest-rank to the 100 µs bucket, never above the
+exact max; ages from 51.2 ms on land in one overflow bucket, where the
+percentiles read as the max; a figure with no samples reads `-/-/- us over
+0`. The clock runs on across a restart of the program, so a command built
+from a previous run's State (its boot id refused) is counted as refused with
+its age on this clock: after a redeploy with the launcher running, the first
+window's refused max is the restart gap. Only an observation ahead of this
+clock (one from before an OS reboot, a corrupt stamp) wraps and is dropped. The loop
+adds at most two counts a tick, reusing the phase boundaries' clock reads
+(the work falls in the phase after each); the logger takes the window by switching
+the loop to a second set of histograms (about 6 KiB each), which it clears
+after printing.
 Each of these lines, and the program's start lines, begins with
 `[<seconds>.<milliseconds>]` on the gateway's steady clock: on the RoboRIO,
 time since its kernel booted, the clock of State's `sample_time_us`, so a
