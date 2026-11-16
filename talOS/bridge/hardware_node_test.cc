@@ -49,7 +49,6 @@
 #include "talOS/hardware/endpoint.h"
 #include "talOS/hardware/gateway.h"
 #include "talOS/introspection/registry.h"
-#include "talOS/launcher/hardware_record.h"
 #include "talOS/node/allocation_probe.h"
 #include "talOS/protocol/udp_test_helpers.h"
 
@@ -410,6 +409,12 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   EXPECT_EQ(status.gateway_build_id(), 0x00fedcba98765432ull);
 }
 
+// Guards: hardware_node --log records the merged /hw/command, the decoded
+// /hw/state and every /hw/status it publishes, each status SEND with the
+// transport sequence and publication stamp a live reader received for it
+// (what tlog_to_wpilog and input replay match a reader's copy to the
+// bridge's SEND by), its payload the status with the bridge's protocol.
+// REQ-OPS-21
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   const std::string base = ::testing::TempDir() + "bridge";
   const std::string config_path = base + ".toml";
@@ -442,6 +447,18 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   ASSERT_EQ(gateway.Open("127.0.0.1", gateway_port, "127.0.0.1", node_port),
             protocol::UdpStatus::kOk);
   ipc::Publisher<Packet> pub{RequestTopic("intake")};
+  // A live /hw/status reader, in sequence, registered before the bridge
+  // starts: every status it publishes, (transport sequence, publish stamp).
+  RTMSQueue status_reader{
+      bridge::topics::kStatus,
+      sizeof(bridge::BridgeStatus),
+      alignof(bridge::BridgeStatus),
+      schema::Of<bridge::BridgeStatus>(),
+      MAX_SLOTS,
+      RTMSOptions{OverflowPolicy::OVERWRITE_OLDEST, ReadMode::SEQUENCE}};
+  const std::optional<std::size_t> status_reader_id =
+      status_reader.register_reader();
+  ASSERT_TRUE(status_reader_id);
   Release(node_reservation);
   const pid_t child = fork();
   ASSERT_GE(child, 0);
@@ -502,15 +519,40 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   ASSERT_EQ(WEXITSTATUS(status), 0);
   ASSERT_TRUE(received_command);
   ASSERT_TRUE(published_request);
+  // The ring holds the run's ~50 statuses (1 s at 50 Hz) well within its
+  // window, so reading after the bridge exited loses none.
+  std::vector<std::pair<uint64_t, int64_t>> statuses_seen;
+  {
+    bridge::BridgeStatus published{};
+    MessageInfo info{};
+    while (status_reader.read_next(
+               *status_reader_id,
+               std::as_writable_bytes(std::span{&published, 1}),
+               info) == ReadResult::OK) {
+      statuses_seen.emplace_back(info.sequence, info.publish_time_ns);
+    }
+  }
+  ASSERT_FALSE(statuses_seen.empty());
   event::log::LogReader reader(log_path);
   bool logged_command = false;
   bool logged_neutral = false;
   bool logged_state = false;
+  std::vector<std::pair<uint64_t, int64_t>> statuses_logged;
   event::log::LogReader::Record record;
   while (reader.next(record)) {
     ASSERT_LT(record.header.source_id, reader.manifest().size());
     const auto& source = reader.manifest()[record.header.source_id];
-    if (source.name == bridge::topics::kStatus) continue;
+    if (source.name == bridge::topics::kStatus) {
+      ASSERT_EQ(record.header.kind,
+                static_cast<std::uint16_t>(event::EventKind::SEND));
+      ASSERT_EQ(record.payload.size(), sizeof(bridge::BridgeStatus));
+      bridge::BridgeStatus logged{};
+      std::memcpy(&logged, record.payload.data(), sizeof(logged));
+      EXPECT_EQ(logged.protocol_version_id(), protocol::kProtocolVersion);
+      statuses_logged.emplace_back(record.header.sequence,
+                                   record.header.publish_time_ns);
+      continue;
+    }
     ASSERT_EQ(record.payload.size(), sizeof(Packet));
     Packet logged{};
     std::memcpy(&logged, record.payload.data(), sizeof(logged));
@@ -540,6 +582,7 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   EXPECT_TRUE(logged_command);
   EXPECT_TRUE(logged_neutral);
   EXPECT_TRUE(logged_state);
+  EXPECT_EQ(statuses_logged, statuses_seen);
 }
 
 // A config that declares itself for simulation only (here
@@ -826,37 +869,48 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   EXPECT_TRUE(later.configured());
 }
 
-// Guards: a session whose launcher is of another build than its bridge (a
-// manifest naming another hardware protocol) is read under the protocol the
-// bridge spoke, which the bridge's own --log records in its /hw/status SENDs;
-// the log tools then say the two disagree and decode the packets.
+// Guards: the bridge's --log registers /hw/status as a sender of this build's
+// BridgeStatus schema and records a status SEND among its first Tick's
+// records, carrying the bridge's own hardware protocol. That is what the log
+// tools' reader of a session's protocol relies on
+// (talOS/launcher/hardware_record.cc FirstBridgeStatusVersion, which takes
+// the first such SEND within a log's first second, else falls back to the
+// manifest's version, the launcher's).
 // REQ-OPS-51
-TEST(HardwareNodeTest, ASessionIsReadUnderTheProtocolItsBridgeLogged) {
-  constexpr uint64_t kSession = 43;
-  constexpr uint16_t kLauncher = protocol::kProtocolVersion - 1;
-  const std::filesystem::path session = ::testing::TempDir() +
-                                        "/bridge_protocol_session_" +
-                                        std::to_string(::getpid());
-  std::filesystem::remove_all(session);
-  std::filesystem::create_directories(session);
-  std::ofstream{session / "manifest.json"}
-      << "{\"session_id\": " << kSession
-      << ", \"hardware_protocol_version\": " << kLauncher << "}\n";
+TEST(HardwareNodeTest, TheFirstTickLogsTheBridgesProtocol) {
+  const std::string log_path = ::testing::TempDir() + "/bridge_first_tick_" +
+                               std::to_string(::getpid()) + ".tlog";
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
-  ASSERT_TRUE(link.Open(cfg, true, (session / "hardware_node.tlog").string(),
-                        kSession));
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 43));
   link.node->Tick(1000);
   link.node.reset();  // flushes the bridge's log
 
-  const launcher::RecordedProtocol recorded =
-      launcher::RecordedProtocolVersion({session.string()});
-  EXPECT_EQ(recorded.manifest, kLauncher);
-  EXPECT_EQ(recorded.bridge, std::vector<uint16_t>{protocol::kProtocolVersion});
-  EXPECT_EQ(recorded.version(), protocol::kProtocolVersion);
-  EXPECT_FALSE(recorded.refused());
-  EXPECT_FALSE(recorded.Disagreement().empty());
-  std::filesystem::remove_all(session);
+  event::log::LogReader reader{log_path};
+  std::optional<uint16_t> status_id;
+  for (const auto& source : reader.manifest()) {
+    if (source.kind == event::SourceKind::SENDER &&
+        source.name == bridge::topics::kStatus &&
+        source.schema == schema::Of<bridge::BridgeStatus>()) {
+      status_id = source.id;
+    }
+  }
+  ASSERT_TRUE(status_id) << "no /hw/status sender of this build's schema";
+  std::vector<uint16_t> versions;
+  event::log::LogReader::Record record;
+  while (reader.next(record)) {
+    if (record.header.source_id != *status_id ||
+        record.header.kind !=
+            static_cast<std::uint16_t>(event::EventKind::SEND)) {
+      continue;
+    }
+    ASSERT_EQ(record.payload.size(), sizeof(bridge::BridgeStatus));
+    bridge::BridgeStatus status;
+    std::memcpy(&status, record.payload.data(), sizeof status);
+    versions.push_back(status.protocol_version_id());
+  }
+  EXPECT_EQ(versions, std::vector<uint16_t>{protocol::kProtocolVersion});
+  std::filesystem::remove(log_path);
 }
 
 // REQ-OPS-20: /hw/status.configured is the current gateway boot's
