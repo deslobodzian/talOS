@@ -213,7 +213,7 @@ class BundleTest(unittest.TestCase):
 
 
 class InstallCheckTest(unittest.TestCase):
-    # REQ-OPS-01, REQ-CONTRACT-09: install selects only a bundle its own
+    # REQ-OPS-50, REQ-OPS-01, REQ-CONTRACT-09: install selects only a bundle its own
     # launcher accepts, so the boot service never restarts a launcher that
     # refuses every launch.
     def test_install_refuses_a_bundle_the_launcher_refuses(self):
