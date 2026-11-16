@@ -405,7 +405,9 @@ TEST_F(MotorTest, ReportsInjectedFeedbackAndAcquisitionAges) {
   sim.step(10ms);
   EXPECT_FALSE(State().connected());
   EXPECT_FALSE(State().acquisition_valid());
-  EXPECT_DOUBLE_EQ(State().temperature_degc(), 0.0);
+  // An invalid sample zeroes what was measured and keeps the last
+  // temperature (hardware::MarkInvalid).
+  EXPECT_DOUBLE_EQ(State().temperature_degc(), 42.5);
   EXPECT_DOUBLE_EQ(State().supply_current_a(), 0.0);
 }
 

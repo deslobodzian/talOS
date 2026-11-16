@@ -130,8 +130,12 @@ class SimHardware {
   // period or more makes the next states no newer than the last, dropped as
   // on a robot. Throws for negative latency or a gateway clock before 0.
   void set_gateway_clock(Duration gateway_offset, Duration latency);
-  // A disconnected device keeps its slot in /hw/state with valid == false
-  // and zero values, so its handle reads connected() == false. Every device
+  // A disconnected device keeps its slot in /hw/state with valid == false,
+  // so its handle reads connected() == false. A motor or CAN sensor carries
+  // what the gateway publishes for a device that stopped answering
+  // (hardware::MarkInvalid of its last readings: ages and temperature kept,
+  // every measurement zero, limit switches released); any other device
+  // carries zero values. Every device
   // of that node named `device` is affected, whatever its kind; an unknown
   // name throws std::invalid_argument.
   void set_connected(std::string_view node, std::string_view device,
