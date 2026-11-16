@@ -22,6 +22,23 @@ Hosts named below: the **bench** is BENCH.md's RoboRIO (image
 FRC_roboRIO_2026_v1.2, two cores) and CAN devices; the **Linux workstation**
 has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
 
+## 2026-11-16
+
+- **RIO-1: stale-FaultField flake, mechanism observed.** Mac mini, macOS
+  (Darwin 25.3), desktop Phoenix simulation, load 0.5 to 1.5, talOS
+  6acdcf9f; one `StaleFaultFieldClearsLimitsAndKeepsFaults` per process.
+  Before the fix 8 of 40 Release and 2 of 20 Debug runs failed, every one
+  at the boot row's wait (`fault_flags 0`, after the 10 s bound); at
+  841a0fc0, before the torque-current work, 1 of 20 Release. Instrumented
+  reads of the boot row's TalonFX: it read valid with BootDuringEnable
+  from about 0.11 s after the backend was constructed until 0.51 to 0.53 s,
+  then valid without it, whether driven at 2 V or neutral; the 30-read
+  pump before the wait ended 0.46 to 0.53 s after construction, and the
+  four instrumented failures were exactly the runs whose pump ended after
+  the bit cleared. After the fix 0 of 40 Release, 0 of 20 Debug,
+  `--gtest_repeat=10` of the test 10 of 10 in each, and
+  `--gtest_filter='PhoenixBackend*' --gtest_repeat=5` 125 of 125 in each.
+
 ## 2026-11-15
 
 - **BENCH-5: CAN bus status slots on the bench.** Bench, RoboRIO build
