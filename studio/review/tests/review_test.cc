@@ -540,7 +540,8 @@ TEST_F(ReviewTest, UnknownLogVersionIsRefusedNamingFileAndVersions) {
   const std::string path = dir + "/observer.tlog";
   {
     std::fstream file{path, std::ios::in | std::ios::out | std::ios::binary};
-    const std::uint32_t version = talos::event::log::FORMAT_VERSION - 1;
+    const std::uint32_t version =
+        talos::event::log::OLDEST_READABLE_VERSION - 1;
     file.seekp(offsetof(talos::event::log::FileHeader, version));
     file.write(reinterpret_cast<const char*>(&version), sizeof version);
   }
@@ -548,11 +549,13 @@ TEST_F(ReviewTest, UnknownLogVersionIsRefusedNamingFileAndVersions) {
   const Response response = review.Get("/review/old/bounds.json", "");
   EXPECT_EQ(response.status, 422);
   EXPECT_NE(response.body.find(path), std::string::npos) << response.body;
-  for (const std::uint32_t version : {talos::event::log::FORMAT_VERSION - 1,
-                                      talos::event::log::FORMAT_VERSION}) {
-    EXPECT_NE(response.body.find("version " + std::to_string(version)),
-              std::string::npos)
-        << response.body;
+  // The version read, then those this build reads.
+  for (const std::string& version :
+       {"version " +
+            std::to_string(talos::event::log::OLDEST_READABLE_VERSION - 1),
+        std::to_string(talos::event::log::OLDEST_READABLE_VERSION) + " to " +
+            std::to_string(talos::event::log::FORMAT_VERSION)}) {
+    EXPECT_NE(response.body.find(version), std::string::npos) << response.body;
   }
   std::filesystem::remove_all(dir);
 }

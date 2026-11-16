@@ -61,9 +61,11 @@ def log_baseline_ns(logs):
     """Find log_dump's exact origin without assuming a Python/C++ clock epoch.
 
     `logs` is a session directory (every *.tlog in it) or the log files
-    log_dump is given; None when they hold no record. Walk v7 record headers
-    only (events/log/format.h); payload decoding remains log_dump's job. On
-    macOS Node time is MONOTONIC_RAW, not steady_clock.
+    log_dump is given; None when they hold no record. Walk version 7 and 8
+    record headers only (events/log/format.h); payload decoding remains
+    log_dump's job. A GAP record (version 8) counts like any record, as in
+    log_dump's origin: its event time is the earliest a dropped record
+    named. On macOS Node time is MONOTONIC_RAW, not steady_clock.
     """
     if isinstance(logs, Path) and logs.is_dir():
         logs = logs.glob("*.tlog")
@@ -72,7 +74,7 @@ def log_baseline_ns(logs):
         with path.open("rb") as stream:
             header = stream.read(120)
             magic, version, header_bytes = struct.unpack_from("<8sII", header)
-            if magic != b"TALOSLOG" or version != 7:
+            if magic != b"TALOSLOG" or version not in (7, 8):
                 raise ValueError(f"unsupported log format: {path}")
             manifests, = struct.unpack_from("<I", header, 40)
             schema_bytes, = struct.unpack_from("<Q", header, 112)

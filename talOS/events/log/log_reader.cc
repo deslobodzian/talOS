@@ -10,6 +10,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <optional>
@@ -74,13 +75,20 @@ void check_identity(const FileHeader& header) {
   if (std::memcmp(header.magic, FILE_MAGIC, sizeof(header.magic)) != 0) {
     throw std::runtime_error("LogReader: bad file magic");
   }
-  if (header.version != FORMAT_VERSION) {
+  // A version-7 log is a version-8 log without a GAP record.
+  if (header.version < OLDEST_READABLE_VERSION ||
+      header.version > FORMAT_VERSION) {
     throw std::runtime_error(
         "LogReader: unsupported format version " +
-        std::to_string(header.version) + " (supported version " +
+        std::to_string(header.version) + " (supported versions " +
+        std::to_string(OLDEST_READABLE_VERSION) + " to " +
         std::to_string(FORMAT_VERSION) +
         "); dump or replay it with the build that recorded it");
   }
+}
+
+bool IsGap(const RecordHeader& header) noexcept {
+  return header.kind == static_cast<std::uint16_t>(EventKind::GAP);
 }
 
 // The CRC of a record's header with its crc32 field zeroed: the seed its
@@ -453,6 +461,7 @@ void LogReader::rewind() noexcept {
   damage_ = LogDamage{};
   last_.reset();
   record_count_ = 0;
+  gaps_ = 0;
 }
 
 bool LogReader::next(Record& out) {
@@ -478,6 +487,7 @@ bool LogReader::next(Record& out) {
   }
   cursor_ += sizeof(RecordHeader) + header->stored_bytes;
   ++record_count_;
+  if (IsGap(*header)) ++gaps_;
   return true;
 }
 
@@ -500,6 +510,7 @@ struct WindowedLogReader::State {
   std::optional<RecordHeader> last;  // the last record next() returned
   std::vector<std::byte> payload;
   std::size_t record_count{0};
+  std::size_t gaps{0};
 };
 
 WindowedLogReader::WindowedLogReader(std::string_view path)
@@ -602,6 +613,7 @@ const LogDamage& WindowedLogReader::damage() const noexcept {
 std::size_t WindowedLogReader::record_count() const noexcept {
   return state_->record_count;
 }
+std::size_t WindowedLogReader::gaps() const noexcept { return state_->gaps; }
 
 bool WindowedLogReader::next(LogReader::Record& out) {
   State& state = *state_;
@@ -615,6 +627,7 @@ bool WindowedLogReader::next(LogReader::Record& out) {
   const std::uint64_t body = state.cursor + sizeof(RecordHeader);
   state.cursor = body + record->stored_bytes;
   ++state.record_count;
+  if (IsGap(*record)) ++state.gaps;
   // locate() checked that the stored bytes are within the file.
   state.payload.assign(record->payload_bytes, std::byte{0});
   for (std::size_t at = 0; at < record->stored_bytes;) {
@@ -648,6 +661,7 @@ void WindowedLogReader::seek(std::uint64_t offset) {
   state.damage = LogDamage{};
   state.last.reset();
   state.record_count = 0;
+  state.gaps = 0;
 }
 
 LogSummary VisitLog(std::string_view path, const LogVisitor& visitor,
@@ -663,6 +677,7 @@ LogSummary VisitLog(std::string_view path, const LogVisitor& visitor,
     if (visitor.record && !visitor.record(record)) break;
   }
   summary.record_count = reader.record_count();
+  summary.gaps = reader.gaps();
   summary.damage = reader.damage();
   summary.truncated = reader.truncated();
   return summary;
@@ -681,6 +696,56 @@ std::string DescribeDamage(const LogDamage& damage) {
             std::to_string(damage.tail_bytes) + " bytes (from byte " +
             std::to_string(damage.tail_offset) + ")";
   }
+  return text;
+}
+
+std::optional<LogGap> GapOf(const RecordHeader& header,
+                            std::span<const std::byte> payload) noexcept {
+  if (!IsGap(header)) return std::nullopt;
+  LogGap gap;
+  gap.first_dispatch_index = header.dispatch_index;
+  gap.start_ns = header.event_time_ns;
+  gap.resumed_ns = header.now_ns;
+  // The stored bytes are the payload less its trailing zeros: restored by
+  // the zero-initialised detail.
+  if (header.payload_bytes == sizeof(GapRecord) &&
+      payload.size() <= sizeof(GapRecord)) {
+    if (!payload.empty()) {
+      std::memcpy(&gap.detail, payload.data(), payload.size());
+    }
+    gap.detailed = true;
+  }
+  return gap;
+}
+
+std::string DescribeGap(const LogGap& gap) {
+  char seconds[32];
+  std::snprintf(seconds, sizeof(seconds), "%.3f",
+                static_cast<double>(gap.resumed_ns - gap.start_ns) / 1e9);
+  if (!gap.detailed) {
+    return std::string{"capture lost records over "} + seconds +
+           " s from dispatch " + std::to_string(gap.first_dispatch_index);
+  }
+  const GapRecord& d = gap.detail;
+  std::string text =
+      "capture lost " + std::to_string(d.records) + " records (" +
+      std::to_string(d.dispatches) + " dispatches, " + std::to_string(d.sends) +
+      " sends, " + std::to_string(d.bytes) + " bytes) over " + seconds +
+      " s, dispatches " + std::to_string(gap.first_dispatch_index) + " to " +
+      std::to_string(d.last_dispatch_index) + ": ";
+  if (d.cause == static_cast<std::uint16_t>(GapCause::POOL_FULL)) {
+    text += "buffer pool full";
+  } else if (d.cause ==
+             static_cast<std::uint16_t>(GapCause::RECORD_TOO_LARGE)) {
+    text += "record larger than the buffers";
+  } else {
+    text += "cause " + std::to_string(d.cause);
+  }
+  if ((d.flags & GAP_SPLITS_DISPATCH) != 0) {
+    text += "; dispatch " + std::to_string(gap.first_dispatch_index) +
+            " was partly recorded";
+  }
+  if ((d.flags & GAP_CLOSED_AT_FLUSH) != 0) text += "; closed by the stop";
   return text;
 }
 

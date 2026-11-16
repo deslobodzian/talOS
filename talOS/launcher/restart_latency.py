@@ -31,12 +31,15 @@ import uuid
 
 from python.runfiles import runfiles
 
-# talOS/events/log/format.h (version 7). EventKind (events/context.h) and
-# SourceKind (events/manifest.h) both number TIMER 1; EventKind SEND is 4.
+# talOS/events/log/format.h (versions 7 and 8). EventKind (events/context.h)
+# and SourceKind (events/manifest.h) both number TIMER 1; EventKind SEND is 4.
+# Only TIMER and SEND records are read, so a GAP record (10, version 8) is
+# passed over like any other kind.
 _FILE = struct.Struct("<8sIIQqqII64sQ")
 _ENTRY = struct.Struct("<HHIIIqq64sQII")
 _RECORD = struct.Struct("<IHHQqqqQIIII")
 _RECORD_MAGIC = 0x54524543
+_VERSIONS = (7, 8)  # OLDEST_READABLE_VERSION to FORMAT_VERSION
 TIMER, SEND = 1, 4
 
 STAGES = [("kill_to_origin", "SIGKILL → event-loop origin"),
@@ -77,8 +80,8 @@ def read_tlog(path):
             raise ValueError(f"{path}: truncated file header")
         (magic, version, header_bytes, _, origin, _, count, _, process,
          schema_bytes) = _FILE.unpack(header)
-        if magic != b"TALOSLOG" or version != 7:
-            raise ValueError(f"{path}: not a version 7 .tlog")
+        if magic != b"TALOSLOG" or version not in _VERSIONS:
+            raise ValueError(f"{path}: not a version 7 or 8 .tlog")
         stream.seek(header_bytes)
         sources = {}
         for _ in range(count):

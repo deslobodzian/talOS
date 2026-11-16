@@ -52,12 +52,27 @@ cc_library(
     ],
 )
 
+# Tests only: a copy of a log with a stretch of records replaced by the GAP
+# record the writer would write for them (log/gap_testing.h).
+cc_library(
+    name = "gap_testing",
+    testonly = True,
+    srcs = ["log/gap_testing.cc"],
+    hdrs = ["log/gap_testing.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":events_core",
+        ":events_log",
+    ],
+)
+
 cc_test(
     name = "log_test",
     size = "small",
     srcs = ["log/log_test.cc"],
     deps = [
         ":events_log",
+        ":gap_testing",
         "@googletest//:gtest",
         "@googletest//:gtest_main",
     ],
