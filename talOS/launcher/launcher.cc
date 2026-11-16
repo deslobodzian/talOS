@@ -477,6 +477,12 @@ int Launcher::RunSession(StopSignals& stop_signals) {
                  "nothing was described or started\n";
     return 1;
   }
+  // Alone it would start the roster, which whoever passed it meant to check.
+  if (options_.describe_as_launch && !options_.describe_only) {
+    std::cerr << "launcher: --describe-as-launch requires --describe-only; "
+                 "nothing was described or started\n";
+    return 1;
+  }
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
     std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;
@@ -584,8 +590,14 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     return 1;
   }
   // A simulation config (its gains, bindings and travel) never drives real
-  // hardware. --describe-only and --replay-inputs touch none.
-  if (robot_config.simulation_only && !options_.simulation && starts_roster) {
+  // hardware. --describe-only and --replay-inputs touch none, but
+  // --describe-as-launch asks --describe-only for the launch's verdict.
+  // Of the launch's other refusals before its probes, this is the only one
+  // that needs no lock, shared memory, socket or process: the session lock
+  // (held by the session a check runs beside) and the registry's
+  // preparation and capacity stay the launch's alone.
+  if (robot_config.simulation_only && !options_.simulation &&
+      (starts_roster || options_.describe_as_launch)) {
     std::cerr << "launcher: " << options_.config_path
               << " sets [robot] simulation_only = true; run it with --sim "
                  "(or --describe-only); nothing was started\n";
