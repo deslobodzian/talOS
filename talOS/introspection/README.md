@@ -169,8 +169,8 @@ stopped at the cap). The `Reporter` copies them into the row's `flags` in
 each full sample, when the loop's recorder reports them, as
 `kFlagRecorderFailed`, `kFlagLogGap` and `kFlagLogCapped`; the hardware
 bridge does the same for its own log (`NodeRegistration::set_recording`;
-`NodeSnapshot::log_gap()` reads the gap bit). A node's log writer also
-sets `kFlagLogGap` itself as a gap opens, with one atomic OR into the row's
+`NodeSnapshot::log_gap()` reads the gap bit). A node's log writer, and the
+bridge's, also sets `kFlagLogGap` itself as a gap opens, with one atomic OR into the row's
 `flags` word (`LogWriterOptions::gap_flags`,
 `NodeRegistration::flags_word()`, `Reporter::row_flags()`), so a run
 killed before the next sample, whose gap has no GAP record, is still

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -21,6 +22,12 @@
 #include "talOS/process/process.h"
 
 namespace talos::hardware {
+
+// Tests only: when set, called with the options of the bridge's --log just
+// before its writer is made, so a test can hold the writer thread
+// (LogWriterOptions::before_write) until its pool fills and the log opens a
+// gap. Empty otherwise. hardware_node_test declares it where it uses it.
+std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
 
 // The name the stock bridge describes itself by is the roster name the
 // launcher lists it under.
@@ -172,6 +179,7 @@ void HardwareNode::OpenTopics() {
     event::log::LogWriter::Options options;
     options.max_bytes = log_max_bytes_;
     options.window = log_window_;
+    if (log_options_for_test) log_options_for_test(options);
     log_ = std::make_unique<event::log::LogWriter>(log_path_, kNodeName,
                                                    options, session_id_);
     log_->start(introspection_manifest_, event::Poller::now());
@@ -191,6 +199,13 @@ void HardwareNode::OpenTopics() {
   } catch (const std::exception& e) {
     std::fprintf(stderr, "hardware_node: node registry unavailable: %s\n",
                  e.what());
+  }
+  // The log marks the row as a gap opens (kFlagLogGap), not at the next
+  // full registry sample, so a bridge killed during a gap is marked. Set on
+  // this thread, which also makes every record, before the first one;
+  // registration_ is declared before log_, so the row outlives the writer.
+  if (log_ && registration_) {
+    log_->set_gap_flags(registration_->flags_word(), introspect::kFlagLogGap);
   }
 }
 

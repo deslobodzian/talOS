@@ -569,7 +569,8 @@ is what a node's and the bridge's exit status say, and the registry row's
 gap bit ([event log state](../introspection/README.md#event-log-state)),
 which the launcher reads in each supervision pass and once more from the row
 a run left when it reaps it, marks the member. A writer given
-`LogWriterOptions::gap_flags` (a node's, pointed at its row) ORs its
+`LogWriterOptions::gap_flags` (a node's or the bridge's, pointed at its
+row) ORs its
 `gap_flag` into that word as it drops the gap's first record, so a run
 killed at any point after that is marked.
 
