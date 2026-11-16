@@ -1398,6 +1398,36 @@ TEST(InputReplay, RefusesARunStartFromALogWhoseFirstSegmentIsGone) {
   }
 }
 
+// RecordedSession takes one log as well as a session directory. A log the
+// byte cap rotated is all its kept files (log::LogSegmentFiles), whichever
+// of them is named, as a directory reads them: its run start comes from
+// its first segment's first firing, not the newest file's, so its timers
+// replay at their live deadlines.
+// REQ-OPS-14
+TEST(InputReplay, OneFileOfARotatedLogReadsTheWholeLog) {
+  const std::string dir = TempDir("one_file");
+  const std::string out = TempDir("one_file_out");
+  RecordLateTicker(dir);
+  const std::string path = dir + "/ticker.tlog";
+  const std::vector<std::int64_t> live = TimerFirings(path);
+  RotateAt(path, {kOrigin + 20ms, kOrigin + 40ms});
+  for (const std::string& named : {path, log::LogSegmentPath(path, 1)}) {
+    SCOPED_TRACE(named);
+    const RecordedSession session{named, "ticker"};
+    EXPECT_EQ(session.log_paths(), log::LogSegmentFiles(path));
+    SimulationEnvironment environment;
+    Loop loop{environment, log::LogWriter{out + "/ticker.tlog", "ticker"},
+              Loop::Options{.start = session.loop_start(),
+                            .run_start = session.run_start()}};
+    const Ticker ticker{loop};
+    const InputReplayReport report = ReplayInputs(loop, environment, session);
+    EXPECT_FALSE(report.stopped_at_gap.has_value());
+    EXPECT_EQ(TimerFirings(out + "/ticker.tlog"), live);
+  }
+  std::filesystem::remove_all(dir);
+  std::filesystem::remove_all(out);
+}
+
 // Closes this process's descriptor of the file at `path`, as a disk that
 // refuses every later write leaves its writer.
 bool CloseLogDescriptor(const std::string& path) {

@@ -10,6 +10,7 @@
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -45,6 +46,25 @@ std::string LogOfFile(const std::string& file) {
   if (!stem.ends_with(kSegment)) return file;
   stem.remove_suffix(kSegment.size());
   return std::string{stem} + std::string{kExtension};
+}
+
+// The files RecordedSession reads for `path`: every *.tlog of a directory
+// (log::FindLogFiles), or every kept file of the log a file belongs to
+// (log::LogSegmentFiles, oldest segment first): a log the byte cap rotated
+// is all of them, whichever is named, as a directory reads it. A file of no
+// such log (missing, say) is read alone, so its reader names it.
+std::vector<std::string> SessionFiles(const std::string& path) {
+  std::error_code ec;
+  if (std::filesystem::is_directory(path, ec)) return log::FindLogFiles(path);
+  // LogSegmentFiles names a segment by its directory, "." for a bare name.
+  std::filesystem::path file{path};
+  if (!file.has_parent_path()) file = std::filesystem::path{"."} / file;
+  std::vector<std::string> files =
+      log::LogSegmentFiles(LogOfFile(file.string()));
+  if (std::find(files.begin(), files.end(), file.string()) == files.end()) {
+    return {path};
+  }
+  return files;
 }
 
 // What the session manifest says a member's logs lost.
@@ -100,7 +120,7 @@ std::map<std::string, ManifestMarks> MarkedLogNames(
 
 RecordedSession::RecordedSession(const std::string& path,
                                  std::string_view replayed)
-    : log_paths_{log::FindLogFiles(path)} {
+    : log_paths_{SessionFiles(path)} {
   if (log_paths_.empty()) {
     throw std::runtime_error("no .tlog files in " + path);
   }

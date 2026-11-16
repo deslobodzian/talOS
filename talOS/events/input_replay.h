@@ -138,13 +138,14 @@ struct RecordedMessage {
 class RecordedSession {
  public:
   // `path` is a session directory (every *.tlog in it, restarts included)
-  // or one log; `replayed` is the process name of the program to be
-  // replayed, or empty for none. Throws std::runtime_error on an unreadable
-  // log, on logs from two sessions, on a topic the logs record with two
-  // schemas, and on a manifest.json beside them that is not JSON. A log's
-  // damaged records are skipped (log::LogReader) and mark a loss or a
-  // refusal (above); what was skipped is printed to stderr as a warning
-  // naming the file and byte offsets.
+  // or one log: any file of a log the byte cap rotated reads every kept
+  // file of it (log::LogSegmentFiles), as a directory does; `replayed` is the
+  // process name of the program to be replayed, or empty for none. Throws
+  // std::runtime_error on an unreadable log, on logs from two sessions, on a
+  // topic the logs record with two schemas, and on a manifest.json beside them
+  // that is not JSON. A log's damaged records are skipped (log::LogReader) and
+  // mark a loss or a refusal (above); what was skipped is printed to stderr as
+  // a warning naming the file and byte offsets.
   explicit RecordedSession(const std::string& path,
                            std::string_view replayed = {});
 

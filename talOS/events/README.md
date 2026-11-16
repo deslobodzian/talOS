@@ -328,7 +328,9 @@ Estimator estimator{loop};                 // registers its watchers
 const InputReplayReport report = ReplayInputs(loop, environment, session);
 ```
 
-- `RecordedSession` reads every log of a session directory. A topic's
+- `RecordedSession` reads every log of a session directory, or one log:
+  named by any of its files, a log the byte cap rotated is read whole (every
+  kept segment and the log), as in a directory. A topic's
   messages come from whichever logs recorded them: the writer's accepted
   `SEND`s or readers' receipts. A writer's `SEND` (an event loop's, or the
   hardware bridge's `--log` of `/hw/state`, `/hw/command` and
