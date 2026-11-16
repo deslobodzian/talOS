@@ -254,6 +254,12 @@ class LogWriter {
   // gap has no GAP record but is still counted here, so incomplete() and the
   // registry's kFlagLogGap report it.
   std::uint64_t gaps() const noexcept;
+  // Sets Options::gap_flags and gap_flag after construction, for a word
+  // that exists only once the writer does (a node's registry row, claimed
+  // after its loop is built); null stops reporting, before the word goes.
+  // Only from the thread that records (the loop's), or before start().
+  void set_gap_flags(std::atomic<std::uint32_t>* flags,
+                     std::uint32_t flag) noexcept;
   // Records dropped in every gap so far. Lock-free; any thread.
   std::uint64_t lost_records() const noexcept;
   // A gap is open: records are being dropped now. Lock-free; any thread.

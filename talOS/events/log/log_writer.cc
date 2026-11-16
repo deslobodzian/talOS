@@ -1026,6 +1026,12 @@ std::uint64_t LogWriter::gaps() const noexcept {
   return state_->gap_count.load(std::memory_order_relaxed);
 }
 
+void LogWriter::set_gap_flags(std::atomic<std::uint32_t>* flags,
+                              std::uint32_t flag) noexcept {
+  state_->options.gap_flags = flags;
+  state_->options.gap_flag = flag;
+}
+
 std::uint64_t LogWriter::lost_records() const noexcept {
   return state_->lost_records.load(std::memory_order_relaxed);
 }

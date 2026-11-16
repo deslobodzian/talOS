@@ -1039,6 +1039,10 @@ namespace detail {
 // (LogWriterOptions::before_write) and see what a run whose own log has a
 // gap reports. Empty otherwise. node_test declares it where it uses it.
 std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+// Tests only, likewise: called with a live run's Reporter options before the
+// Reporter is made (a test lengthens its refresh period to hold its
+// samples). Empty otherwise.
+std::function<void(introspect::Reporter::Options&)> reporter_options_for_test;
 
 namespace {
 
@@ -1500,10 +1504,25 @@ int RunMain(int argc, char** argv, const char* node_name,
     // publishing identity before any user constructor or backend
     // initialization.
     std::optional<Hosted> hosted;
-    introspect::Reporter reporter{{.name = node_name,
-                                   .target = node_target,
-                                   .session_id = flags.session_id,
-                                   .simulation = flags.simulation}};
+    introspect::Reporter::Options reporter_options{
+        .name = node_name,
+        .target = node_target,
+        .session_id = flags.session_id,
+        .simulation = flags.simulation};
+    if (reporter_options_for_test) reporter_options_for_test(reporter_options);
+    introspect::Reporter reporter{std::move(reporter_options)};
+    // The log marks its row as a gap opens (kFlagLogGap), not at the
+    // reporter's next refresh, so a run killed during a gap is marked. The
+    // row is claimed only now, after the loop and its writer exist, so the
+    // writer takes it here, on the loop's thread, before any send; and lets
+    // go of it before the Reporter (and the row's mapping) goes, ahead of
+    // the node's destruction, which may still send.
+    loop.recorder().set_gap_flags(reporter.row_flags(),
+                                  introspect::kFlagLogGap);
+    struct GapFlagsRelease {
+      event::log::LogWriter& writer;
+      ~GapFlagsRelease() { writer.set_gap_flags(nullptr, 0); }
+    } const gap_flags_release{loop.recorder()};
     hosted.emplace(Host(loop, node_name, flags, make));
     if (process::stop_requested.load()) {
       // Stopped while constructing: a clean stop, without running the loop.

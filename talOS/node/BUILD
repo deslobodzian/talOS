@@ -168,6 +168,7 @@ cc_test(
         "//talOS/events:input_replay",
         "//talOS/introspection:describe",
         "//talOS/introspection:registry",
+        "//talOS/introspection:reporter",
         "//talOS/memory:shared_memory",
         "//talOS/process",
         "//talOS/rtms",

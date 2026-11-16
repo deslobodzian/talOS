@@ -234,11 +234,12 @@ static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
 
 // The node's event log has a gap: records its writer could not take were
 // dropped (LogWriter gaps() > 0). Capture resumes after a GAP record that
-// marks them. The bit is set at the first sample after the gap opens (the
-// Reporter's, every kRefreshPeriod; the bridge's), not as it opens: a run
-// stopped by a disk failure or its byte cap during a gap has the bit and no
-// GAP record, but one killed before that sample has neither. An event log
-// flag (above): set by set_recording, never cleared.
+// marks them. The bit is set as the gap opens: the writer ORs it into the
+// row (LogWriterOptions::gap_flags, NodeRegistration::flags_word()) when it
+// drops the gap's first record, so a run killed during a gap, which has no
+// GAP record, still has the bit. Each sample also copies gaps() > 0
+// (set_recording), for a writer not given the row. An event log flag
+// (above): never cleared.
 inline constexpr std::uint32_t kFlagLogGap = 1u << 14;
 static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,
               "kFlagLogGap must not share a bit with the realtime outcome");
@@ -1004,6 +1005,19 @@ class NodeRegistration {
     }
   }
 
+  // The row's `flags` word, for a writer that ORs an event log flag in the
+  // moment it applies (event::log::LogWriterOptions::gap_flags with
+  // kFlagLogGap) rather than at the next sample; null when the slot is not
+  // this claim's. Lives as long as this registration. Every write to the
+  // word after the claim is an atomic read-modify-write (fetch_or /
+  // fetch_and of the bits it owns), so a writer of another bit never clears
+  // it. A row swept from a live owner whose heartbeat went kLivenessTimeout
+  // stale, and claimed again, would take that bit on the new owner's row: a
+  // false log_gap, never a lost one.
+  std::atomic<std::uint32_t>* flags_word() noexcept {
+    return owns_slot() ? &record_->flags : nullptr;
+  }
+
   const std::string& name() const { return identity_.name; }
   std::size_t slot() const {
     return static_cast<std::size_t>(record_ - mapping_.header()->nodes);
@@ -1399,8 +1413,8 @@ struct NodeSnapshot {
   }
   // kFlagOutputsHeld: the devices flush is holding back outputs it set.
   bool outputs_held() const { return (flags & kFlagOutputsHeld) != 0; }
-  // kFlagLogGap: the node's event log has dropped records (set at the first
-  // sample after a gap opens).
+  // kFlagLogGap: the node's event log has dropped records (set as a gap
+  // opens).
   bool log_gap() const { return (flags & kFlagLogGap) != 0; }
   std::vector<SourceSnapshot> sources;
   std::uint32_t declared_selection_count{0};
