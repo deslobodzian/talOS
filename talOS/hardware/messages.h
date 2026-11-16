@@ -51,7 +51,9 @@ inline constexpr PwmMode kLastPwmMode = PwmMode::kPulse;
 struct PwmRequest {
   uint16_t id{};
   PwmMode mode{PwmMode::kOff};
-  double output{};  // [-1, 1] under kPulse; +0.0 under kOff
+  // [-1, 1] under kPulse. Under kOff, Encode sends +0.0 whatever it holds and
+  // Decode yields +0.0.
+  double output{};
   bool operator==(const PwmRequest&) const = default;
 };
 struct Command {
