@@ -605,7 +605,11 @@ When the session ends, the launcher exits with 0, or with the last nonzero
 `exit_code` among the members (-1, so 255, for one a signal ended), or 1 for
 refused [live endpoints](#live-endpoints). The [Studio bridge](#studio-bridge)
 never counts, however it ended, nor does a member a stop left unstarted
-([two phases](#two-phases)). A member whose last run ended by
+([two phases](#two-phases)). Only a member's last run counts: a critical
+member that crashed, was restarted, and whose last run then ended at the
+session's stop (exiting 0, or by the stop's own signal) leaves the status
+0, although the session lost it mid-run; the crash is in its `runs`
+(reason `crash`). A member whose last run ended by
 the stop's own signal does not count: one that was not yet handling a stop
 (between its exec and its stop handlers, which a member started with the stop
 held never is: [node output](#node-output)) when the stop's SIGINT
