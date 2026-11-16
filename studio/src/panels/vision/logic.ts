@@ -78,6 +78,16 @@ export function fpsFromPeriod(periodUs: number|null|undefined): number|null {
   return 1e6 / periodUs;
 }
 
+// Frame-rate series from a frame-period series (microseconds), point by point
+// as fpsFromPeriod: an absent or nonpositive period is NaN, a gap in the
+// sparkline, never an infinite or negative rate.
+export function fpsSeries(periodUs: ArrayLike<number>): Float64Array {
+  const out = new Float64Array(periodUs.length);
+  for (let i = 0; i < periodUs.length; i++)
+    out[i] = fpsFromPeriod(periodUs[i]) ?? NaN;
+  return out;
+}
+
 // Accepted fraction over the last window, from the accepted/rejected deltas.
 // Null when there is no delta to divide (no observations at all).
 export function acceptancePct(
