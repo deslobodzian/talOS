@@ -1622,7 +1622,7 @@ A repository that depends on talOS runs `@talos//talOS/launcher:session_report`.
 The offline Python tool reuses `log_dump` and its events reader/embedded
 descriptor decoder, without robot-specific schemas. It reports manifest config
 identity and source revision, node exits/restarts/quarantine/recorder
-failures/caps, each node's loop tier and realtime outcome, each node's
+failures/caps, every log gap, each node's loop tier and realtime outcome, each node's
 delivery loss (its nonzero `wake_failures`, `stalled_arms`, `wake_fallbacks`
 and `requests_skipped`, the bridge's split per subsystem, as the manifest's
 per-node fields of those names carry them; "none" when all are 0, NOT
@@ -1688,13 +1688,45 @@ for each Driver Station packet that decodes.
 State timing selects one publisher stream (bridge IPC publications), or one
 consumer stream if there is no publisher recording; duplicate readers are never
 pooled. Enabled intervals hold the logged DS enabled bit until its next sample,
-not a reconstructed safety gate. A gap overlapping an enabled interval counts.
+not a reconstructed safety gate. A `/hw/state` interval overlapping an
+enabled interval counts.
+
+A log gap (a GAP record, `log_dump`'s JSONL `kind` `GAP` with its `gap`
+member) is a stretch of records its log's writer dropped. The report lists
+each one as a session issue, `<process>: log gap from <start_ms> to <end_ms>
+ms, <records> records lost (<cause>[, closed at the stop])`, and in `--json`
+as `log_gaps` (each `gap` member with its `process`), so `--strict` fails a
+session with one, naming it, even when every verdict passes; the manifest's
+`log_gap` is a session issue as `recorder_failed` is. An interval is measured
+only if no record it depends on could be missing inside it. Every time a
+dropped record named (its now, event and publish times) lies in the gap's
+lost span, `[min(start_ms, first_lost_ms), last_lost_ms]`, or `[start_ms,
+end_ms]` for a GAP without its detail; the record capture resumed with was
+kept, so the span stops at the last record lost. An interval `[a, b]` is not
+measured when it meets (closed at both ends) a lost span of a log it reads:
+
+| Measurement | Interval | Logs whose gaps make it unmeasured |
+|---|---|---|
+| `/hw/state` overall and enabled | two consecutive records of the selected stream | that stream's process |
+| enabled or not (enabled rows, and an active lane "while enabled" for target age at tick) | from the Driver Station record whose bit is held (from the log's start before the first) to the interval's end or the lane's time | the Driver Station stream's process: such an interval is neither enabled nor disabled |
+| bridge request to command | from the request before the first one carrying the observation in that node's `/hw/request/<node>` stream (where an earlier request carrying it could be missing) to the command | the bridge's, and that of every node that sent a request |
+| alert active time | an alert's active span (publication times) | its status stream's process; the span still counts as an activation, but is not timed (`spans_across_gap` in `--json`, NOT MEASURED when no span is left) |
+
+Target receipt age, target age at the tick and timer lateness each read one
+record, and the `/hw/status` counter deltas difference cumulative counts, so a
+gap changes none of them (a counter reset inside one goes uncounted); the
+report counts no missed ticks or overruns. A row whose intervals all meet a
+gap is NOT MEASURED, never a pass, and its detail (or, for request to
+command, a line under the timing table) names how many intervals were left
+out; `--json` gives the counts in `intervals_across_gaps`. A session without
+a gap reports exactly as before, with neither key.
+
 Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
 must be below 10 ms. `--strict` exits 2 unless every required verdict is PASS
 and the manifest shows a finished session (`end_wall_ns` nonzero) with no
-recording node (non-empty `log_path`) `quarantined`, `recorder_failed` or
-`log_capped`; host processes without an event log (`studio_bridge`,
-`sim_gateway`) are not acceptance evidence and are exempt, with no log
+recording node (non-empty `log_path`) `quarantined`, `recorder_failed`,
+`log_capped` or `log_gap`, and no log gap (above); host processes without
+an event log (`studio_bridge`, `sim_gateway`) are not acceptance evidence and are exempt, with no log
 `log_dump` reports damaged (above), each named with its file and byte offsets,
 and with every bridge and control loop holding its full realtime grant. Off
 `--sim` a `partial`, `refused` or `not_requested` outcome fails; under `--sim`

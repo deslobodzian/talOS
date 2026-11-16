@@ -351,6 +351,7 @@ cc_binary(
         ":session",
         "//talOS/driver_station",
         "//talOS/events:events_log",
+        "//talOS/events:gap_testing",
         "//talOS/hardware",
     ],
 )

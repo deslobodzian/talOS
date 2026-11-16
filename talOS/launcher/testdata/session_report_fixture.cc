@@ -7,6 +7,7 @@
 #include <string>
 
 #include "talOS/driver_station/driver_station.h"
+#include "talOS/events/log/gap_testing.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
@@ -112,36 +113,16 @@ int DisabledBridgeSession(const std::string& directory) {
   record(bridge, 41'250, 2, EventKind::SEND, CommandPacket(20'000));
   bridge.flush();
   motor.flush();
-  return bridge.failed() || motor.failed() ? 1 : 0;
+  // A gap no mode asked for is a fixture fault, as a failed write is.
+  return bridge.failed() || motor.failed() || bridge.gaps() > 0 ||
+                 motor.gaps() > 0
+             ? 1
+             : 0;
 }
 
-}  // namespace
-
-// session_report_fixture <directory> [disabled-bridge | foreign-protocol]
-//
-// foreign-protocol: the default session recorded before manifests named
-// their hardware protocol, its States recorded under protocol 7
-// (StatePacket); its Driver Station packets still decode.
-int main(int argc, char** argv) {
-  if (argc != 2 && argc != 3) return 1;
-  const std::string directory = argv[1];
-  std::filesystem::create_directories(directory);
-  const std::string mode = argc == 3 ? argv[2] : "";
-  if (mode == "disabled-bridge") return DisabledBridgeSession(directory);
-  if (!mode.empty() && mode != "foreign-protocol") return 1;
-  const bool foreign = mode == "foreign-protocol";
-  talos::launcher::SessionManifest manifest;
-  manifest.session_id = 42;
-  manifest.config_sha256 = "fixture-sha256";
-  manifest.end_wall_ns = 1;
-  if (foreign) manifest.hardware_protocol_version.reset();
-  talos::launcher::NodeProcessInfo node;
-  node.name = "fixture";
-  node.exit_code = -1;   // a signal ended it
-  node.exit_signal = 9;  // SIGKILL
-  node.exited = true;
-  manifest.nodes.push_back(node);
-  std::ofstream{directory + "/manifest.json"} << manifest.ToJson();
+// The default session's log (see main), as one node "fixture" recorded it;
+// false when a write failed or the writer dropped records.
+bool RecordFixtureLog(const std::string& directory, bool foreign) {
   using namespace talos::event;
   Registration state;
   state.id = 0;
@@ -193,6 +174,7 @@ int main(int argc, char** argv) {
     packet.size = talos::driver_station::Encode(data, packet.data);
     record(ms, 1, EventKind::SEND, packet);
   };
+  // Records 0 to 12, each its own dispatch but the READ (12).
   driver_station(0, true);
   for (int ms : {0, 5, 10, 130, 135}) {
     record(ms, 0, EventKind::SEND, StatePacket(foreign));
@@ -213,5 +195,56 @@ int main(int argc, char** argv) {
   read.sequence = lane.sequence;
   writer.dispatch(read, {});
   writer.flush();
-  return writer.failed() ? 1 : 0;
+  // A gap no mode asked for is a fixture fault, as a failed write is.
+  return !writer.failed() && writer.gaps() == 0;
+}
+
+}  // namespace
+
+// session_report_fixture <directory>
+//                        [disabled-bridge | foreign-protocol | log-gap]
+//
+// foreign-protocol: the default session recorded before manifests named
+// their hardware protocol, its States recorded under protocol 7
+// (StatePacket); its Driver Station packets still decode.
+// log-gap: the default session with its log's records 2 to 5 (the States
+// sent at 5, 10, 130 and 135 ms, all while enabled) replaced by the GAP record
+// a full writer pool leaves, and its manifest marking the gap as the launcher
+// does (log_gap, recorder_failed).
+int main(int argc, char** argv) {
+  if (argc != 2 && argc != 3) return 1;
+  const std::string directory = argv[1];
+  std::filesystem::create_directories(directory);
+  const std::string mode = argc == 3 ? argv[2] : "";
+  if (mode == "disabled-bridge") return DisabledBridgeSession(directory);
+  if (!mode.empty() && mode != "foreign-protocol" && mode != "log-gap") {
+    return 1;
+  }
+  const bool foreign = mode == "foreign-protocol";
+  const bool gap = mode == "log-gap";
+  talos::launcher::SessionManifest manifest;
+  manifest.session_id = 42;
+  manifest.config_sha256 = "fixture-sha256";
+  manifest.end_wall_ns = 1;
+  if (foreign) manifest.hardware_protocol_version.reset();
+  talos::launcher::NodeProcessInfo node;
+  node.name = "fixture";
+  node.exit_code = -1;   // a signal ended it
+  node.exit_signal = 9;  // SIGKILL
+  node.exited = true;
+  if (gap) {
+    node.log_path = directory + "/fixture.tlog";
+    node.log_paths = {node.log_path};
+    node.log_gap = true;
+    node.failed = true;
+  }
+  manifest.nodes.push_back(node);
+  std::ofstream{directory + "/manifest.json"} << manifest.ToJson();
+  if (!RecordFixtureLog(directory, foreign)) return 1;
+  if (gap) {
+    const std::string log = directory + "/fixture.tlog";
+    talos::event::log::CopyWithGap(log, log + ".gapped", 2, 6);
+    std::filesystem::rename(log + ".gapped", log);
+  }
+  return 0;
 }
