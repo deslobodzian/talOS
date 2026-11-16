@@ -124,6 +124,32 @@ class PrepushTest(unittest.TestCase):
             os.remove(self.gradle_log)
         return ran
 
+    def add_full_steps(self):
+        """Commits stubs of the RoboRIO-in-the-loop tool and the sanitizer
+        lane script, each recording its working directory and arguments
+        in self.full_log; STUB_LANE_FAIL fails that sanitizer lane."""
+        self.full_log = os.path.join(self.tmp, "full_calls")
+        log = shlex.quote(self.full_log)
+        put(os.path.join(self.repo, "tools", "test_rio_in_the_loop.py"),
+            "import os, sys\n"
+            f"with open({self.full_log!r}, 'a', encoding='utf-8') as f:\n"
+            "    f.write('|'.join([os.getcwd(), 'rio', *sys.argv[1:]]) + '\\n')\n")
+        put(os.path.join(self.repo, "tools", "sanitizer_lane.sh"),
+            f'#!/bin/sh\necho "$PWD|lane|$*" >> {log}\n'
+            '[ "$1" = "${STUB_LANE_FAIL:-}" ] && { echo "stub: $1 failed"; exit 1; }\n'
+            "exit 0\n", 0o755)
+        self.git("add", "tools")
+        self.git("commit", "-qm", "full steps")
+
+    def full_calls(self):
+        """The runs add_full_steps' stubs recorded since the last call."""
+        if not os.path.exists(self.full_log):
+            return []
+        with open(self.full_log, encoding="utf-8") as f:
+            calls = [line.rstrip("\n").split("|") for line in f]
+        os.remove(self.full_log)
+        return calls
+
     def worktree_paths(self):
         return [line.split(" ", 1)[1]
                 for line in self.git("worktree", "list", "--porcelain")
@@ -253,6 +279,84 @@ class PrepushTest(unittest.TestCase):
         status, out, _ = self.prepush("--skip-studio")
         self.assertEqual(status, 0, out)
         self.assertFalse(self.gradle_ran(), out)
+
+    # REQ-DEV-25
+    def test_rio_in_the_loop_runs_when_the_commits_touch_what_it_runs(self):
+        # A RoboRIO-in-the-loop scenario broken by an unpushed change was
+        # seen only in CI's job, after the push.
+        self.add_gradlew()
+        self.add_full_steps()
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+        self.commit("talOS/bridge/x.h", "bridge")
+        status, out, _ = self.prepush("--skip-studio")
+        self.assertEqual(status, 0, out)
+        rio = [c for c in self.full_calls() if c[1] == "rio"]
+        self.assertEqual(len(rio), 1, out)
+        cwd, _, *args = rio[0]
+        self.assertTrue(cwd.startswith(self.tmpdir + os.sep), cwd)
+        self.assertEqual(args[0], "--wpilib", out)
+        self.assertEqual(args[1], "--output-dir", out)
+        self.assertTrue(args[2].startswith(self.tmpdir + os.sep), args)
+        self.assertIn("prepush: rio-in-the-loop ok", out)
+
+        self.git("branch", "-f", "pushed", "HEAD")
+        self.commit("docs/x.md", "docs")
+        status, out, _ = self.prepush("--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertEqual(self.full_calls(), [], out)
+
+    # REQ-DEV-25
+    def test_full_runs_rio_in_the_loop_the_sanitizer_lanes_and_a_soak(self):
+        self.add_full_steps()
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+        self.commit("docs/x.md", "docs")
+        status, out, calls = self.prepush("--full", "--skip-studio")
+        self.assertEqual(status, 0, out)
+        ran = self.full_calls()
+        self.assertEqual([c[1] for c in ran], ["rio", "lane", "lane"], out)
+        self.assertEqual([c[2].split()[0] for c in ran[1:]],
+                         ["tsan", "asan"], out)
+        self.assertIn("--nocache_test_results", ran[1][2].split())
+        soak = [args.split() for _, _, args in calls
+                if "//bench/main_processor/simulation:soak_test" in args]
+        self.assertEqual(len(soak), 1, out)
+        self.assertIn("--test_env=TALOS_SOAK_SECONDS=36", soak[0])
+        self.assertIn("--nocache_test_results", soak[0])
+
+    # REQ-DEV-25
+    def test_a_failing_sanitizer_lane_fails_the_run_naming_it(self):
+        self.add_full_steps()
+        status, out, _ = self.prepush("--full", "--skip-studio",
+                                      STUB_LANE_FAIL="tsan")
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: tsan FAILED", out)
+        self.assertIn("stub: tsan failed", out)
+        self.assertIn("prepush: asan ok", out)
+        self.assert_cleaned_up()
+
+    # REQ-DEV-25
+    def test_a_push_of_more_than_twenty_commits_needs_full(self):
+        # 110 commits passed the default steps and were red in CI on a
+        # sanitizer lane and the RoboRIO-in-the-loop job.
+        self.add_full_steps()
+        self.git("branch", "pushed")
+        self.git("branch", "--set-upstream-to=pushed")
+        for i in range(20):
+            self.commit(f"docs/{i}.md", f"docs {i}")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 0, out)
+        self.assertNotIn("prepush: full", out)
+
+        self.commit("docs/20.md", "docs 20")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: full SKIPPED (21 commits since pushed", out)
+        self.assertIn("prepush: test ok", out)
+
+        status, out, _ = self.prepush("--full", "--skip-studio")
+        self.assertEqual(status, 0, out)
 
     # REQ-DEV-25
     def test_optional_steps_follow_the_checked_refs_own_upstream(self):

@@ -390,10 +390,9 @@ jobs:
       id: test
       run: |
         set -o pipefail
-        # Every lane but the soak; the config's own filter leaves out the
-        # no_asan / no_tsan targets.
-        bazel test --config=${{ matrix.sanitizer }} \
-          --test_output=errors //... 2>&1 \
+        # tools/sanitizer_lane.sh, which tools/prepush.sh --full also runs,
+        # so the two cannot drift; its header says what it runs.
+        bash tools/sanitizer_lane.sh ${{ matrix.sanitizer }} 2>&1 \
           | tee "$RUNNER_TEMP/bazel-test.log"
     - *collect-failed-tests
     - *upload-failed-tests

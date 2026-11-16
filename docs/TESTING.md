@@ -433,7 +433,11 @@ compiles against a workstation's installed package and fails in CI
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
 matrix) are one script, `tools/source_lints.sh`, which CI's lint job and
-prepush's `source-lints` step both run.
+prepush's `source-lints` step both run; CI's sanitizer jobs are
+`tools/sanitizer_lane.sh asan|tsan`, which `tools/prepush.sh --full` also
+runs. Prepush also runs CI's RoboRIO-in-the-loop check, and under `--full`
+a short soak seed; when each runs, and the more-than-20-commits rule for
+`--full`, are in [DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder).
 
 No CI builds a robot repository that consumes talOS against a talOS change
 while that repository has no CI of its own. The check runs on the

@@ -272,7 +272,7 @@ py_test(
     main = "slow_tests_test.py",
 )
 
-# tools/prepush.sh [--ref C] [--keep] [--skip-gradle] [--skip-studio]
+# tools/prepush.sh [--ref C] [--keep] [--full] [--skip-gradle] [--skip-studio]
 # (docs/DEVELOPMENT.md §5 rung 3) RULES.md 11's pre-push checks on a clean,
 # read-only worktree of the commit; tools/make_sources_read_only.py is CI's
 # read-only step, and tools/check_host_includes.py runs after the build. The
