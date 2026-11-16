@@ -35,8 +35,12 @@ export type ReviewSession = {
 // The session's bounds, and the server's series limits (studio/review/review.h
 // kMaxSeriesValues, kMaxSeriesChannels): a series request asks for at most
 // max_series_values channels x points over at most max_series_channels.
+// hardware_not_decoded: the server's one-line reason it serves no hardware
+// channel of this session (REQ-OPS-51), absent when it serves them. It is
+// text from the server's files, shown as text, never as markup.
 export type ReviewBounds = {start_ns: string; end_ns: string; origin_wall_ns: string;
-                            max_series_values: number; max_series_channels: number};
+                            max_series_values: number; max_series_channels: number;
+                            hardware_not_decoded?: string};
 
 export type ReviewSample = {value: number; exact?: string; sample_ns: string};
 export type ReviewSnapshot = {t_ns: string; channels: Map<string, ReviewSample>};
@@ -152,9 +156,12 @@ export function parseBounds(raw: unknown): ReviewBounds {
     max_series_values: limit(source.max_series_values, 'bounds.max_series_values'),
     max_series_channels: limit(source.max_series_channels, 'bounds.max_series_channels')
   };
+  const reason = source.hardware_not_decoded ?? null;
+  if (reason !== null && typeof reason !== 'string')
+    fail('bounds.hardware_not_decoded must be a string or null');
   if (BigInt(bounds.end_ns) < BigInt(bounds.start_ns))
     fail('bounds.end_ns is before bounds.start_ns');
-  return bounds;
+  return typeof reason === 'string' ? {...bounds, hardware_not_decoded: reason} : bounds;
 }
 
 // A sample as the bridge writes one: a number; "NaN", "Infinity" or

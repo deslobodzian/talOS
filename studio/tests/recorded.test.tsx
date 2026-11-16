@@ -23,6 +23,7 @@ import {
 import {
   decodeSeries,
   detectReviewServer,
+  parseBounds,
   ReviewError,
   type FetchLike,
   type ReviewBounds
@@ -503,4 +504,39 @@ test('a Studio served by the review server reviews its own origin', async () => 
   assert.doesNotMatch(
       render(<ReviewPicker onClose={noop} fetchFn={fetchNothing} server={origin}/>),
       /Review server address/);
+});
+
+// REQ-OPS-51: a session whose hardware packets the server refused serves no
+// hw/ channel, and its bounds.json says why. The page shows that line once,
+// in the session status the header and the health panel read, as text: it
+// is data from the session's files, so markup in it is escaped.
+test('a session whose hardware packets were not decoded says why in its status', async () => {
+  const reason = 'hardware packets not decoded: recorded under hardware protocol 7; ' +
+      "this build's is 8 (manifest.json hardware_protocol_version) <b>x</b>";
+  const document = {...BOUNDS, hardware_not_decoded: reason};
+  assert.equal(parseBounds(document).hardware_not_decoded, reason);
+  assert.equal(parseBounds({...BOUNDS, hardware_not_decoded: null}).hardware_not_decoded,
+               undefined);
+  assert.throws(() => parseBounds({...BOUNDS, hardware_not_decoded: 7}), ReviewError);
+
+  const server = fakeServer(url => url.pathname.endsWith('/bounds.json') ?
+      json(document) : url.pathname.endsWith('/channels.json') ?
+      json({channels: []}) : echoSnapshot(url));
+  const refused = await RecordedSource.open(SERVER, 's1', {fetch: server.fetchFn,
+                                                           clock: fakeClock().clock});
+  assert.equal(refused.playback.status, `Recorded session s1 · ${reason}`);
+  const intact = source(server);
+  assert.equal(intact.playback.status, 'Recorded session s1');
+
+  const noop = () => {};
+  const header = renderToStaticMarkup(
+      <StudioProvider studio={createStaticStudio({playback: refused.playback})}>
+        <Header url="ws://x" onUrl={noop} onConnect={noop} onDemo={noop} onImportClick={noop}
+                onExport={noop} onReset={noop} onReview={noop} review/>
+      </StudioProvider>);
+  assert.match(header, /recorded under hardware protocol 7/);
+  assert.doesNotMatch(header, /<b>/);
+  assert.match(header, /&lt;b&gt;x&lt;\/b&gt;/);
+  refused.close();
+  intact.close();
 });

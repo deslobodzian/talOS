@@ -37,7 +37,7 @@ export function Header({url, onUrl, onConnect, onDemo, onImportClick, onExport, 
     <div className="connection">
       <StatusDot active={playback.connection === 'live' ||
                          playback.connection === 'demo'}/>
-      <span>{playback.status}</span>
+      <span title={playback.status}>{playback.status}</span>
       {!review && <>
         <input aria-label="WebSocket URL" value={url}
                onChange={e => onUrl(e.target.value)}/>

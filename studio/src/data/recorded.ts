@@ -192,7 +192,12 @@ export class RecordedSource implements DataSource {
       clock_ns: this.snapshot?.timestamp_ns ?? null,
       bounds: {start: this.bounds.start_ns, end: this.bounds.end_ns},
       stats: {skipped: 0, late: 0, invalid: 0},
-      status: this.error ? `Review error: ${this.error}` : `Recorded session ${this.id}`,
+      // A session whose hardware packets the server refused says why, so
+      // its empty hardware panels are explained (REQ-OPS-51).
+      status: this.error ? `Review error: ${this.error}` :
+          this.bounds.hardware_not_decoded ?
+          `Recorded session ${this.id} · ${this.bounds.hardware_not_decoded}` :
+          `Recorded session ${this.id}`,
       connection: this.error ? 'error' : 'replay'
     };
   }

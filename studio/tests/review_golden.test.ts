@@ -56,6 +56,9 @@ test('sessions, channels and bounds decode to the fixture session', () => {
   // The server's series limits (review.h), which RecordedSource splits by.
   assert.equal(bounds.max_series_values, 262_144);
   assert.equal(bounds.max_series_channels, 256);
+  // The fixture is recorded under this build's hardware protocol (REQ-OPS-51):
+  // its null reason leaves no notice.
+  assert.equal(bounds.hardware_not_decoded, undefined);
 });
 
 test('a snapshot keeps NaN, an integer past 2^53 exactly, and each sample time', () => {

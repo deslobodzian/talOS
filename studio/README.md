@@ -447,7 +447,9 @@ build's codecs reject one of its packets:
 serves no hardware channel, the Driver Station's included, while its other
 topics are served; its `bounds.json` carries `log_dump`'s line, without its
 `warning: ` prefix, as `hardware_not_decoded` (null otherwise), and the
-server prints it on stderr. The Studio page does not show that field.
+server prints it on stderr. The Studio page shows that line, as text, after
+the session id in its status (the header, where hovering shows it whole, and
+the Health panel's Status).
 
 Opening a session streams it once, merged, and keeps per log file one
 24-byte checkpoint per second of event time that holds records (where that
