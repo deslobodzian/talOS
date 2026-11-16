@@ -23,9 +23,15 @@ mode and carries joystick input. Nodes read it through `talos::DriverStation`.
 test. A target policy lists lanes per mode.
 [Targets](../ARCHITECTURE.md#targets).
 
-**2026-robot.** The project's simulation testbed robot, a sibling of the
-platform in `talOS/`, with its own nodes and config.
+**Robot repository.** A team's robot in its own Bazel repository, holding
+talOS as the git submodule `talos/` and naming it by `@talos//` labels;
+`new_robot --standalone` makes one from `examples/robot_repo`.
+[examples/robot_repo](../examples/robot_repo/README.md),
 [Where a new thing goes](../ARCHITECTURE.md#where-a-new-thing-goes).
+
+**Bench robot.** talOS's own robot, `bench/`: the RoboRIO and main-processor
+test bench, with its own nodes and configs, which talOS's tests and `sim.sh`
+run. [BENCH.md](BENCH.md).
 
 ## Nodes and messages
 

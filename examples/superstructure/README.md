@@ -268,8 +268,8 @@ a position-controlled wrist, from that repository's root:
 bazel run @talos//tools:new_subsystem -- wrist --lang cpp --type position
 ```
 
-Do not scaffold into `2026-robot`, the project's testbed: its graph is
-full. `--dry-run` inspects the changes without writing them. Use `--lang py` for a
+Do not scaffold into talOS's own robots (`bench/`, these examples): a
+team's mechanism belongs in its robot repository. `--dry-run` inspects the changes without writing them. Use `--lang py` for a
 Python implementation. Omitting `--type position` generates a velocity
 mechanism, not an angle-controlled wrist. With `new_subsystem`, adding
 `--raw` to `--type position` writes the wrist's homing and limits in
