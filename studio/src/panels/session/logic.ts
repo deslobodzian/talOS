@@ -12,14 +12,14 @@
 // the registry. Merging by name and saying which sources actually said
 // something is the only honest way to present "how every process has fared".
 
-import type {ManifestNode, SessionManifest} from '../../data/manifest';
+import type {ManifestDelivery, ManifestNode, SessionManifest} from '../../data/manifest';
 import {rateKey, type DeclaredGraph, type SystemGraph, type SystemNode} from '../../system';
 
 // A problem worth the top of the list and a visible mark, in the order a
 // person cares about them.
 export type ProcessProblem =
-    'dead'|'restarted'|'recorder_failed'|'log_gap'|'nonzero_exit'|'killed_by_signal'|
-    'endpoint_mismatch'|'never_registered';
+    'dead'|'restarted'|'recorder_failed'|'log_gap'|'delivery_loss'|'nonzero_exit'|
+    'killed_by_signal'|'endpoint_mismatch'|'never_registered';
 
 export type ProcessRow = {
   name: string;
@@ -47,6 +47,9 @@ export type ProcessRow = {
   // Null for a manifest from before runs were recorded.
   endReason: string|null;
   recorderFailed: boolean;
+  // What the manifest says the node lost in delivery (REQ-OPS-43); null when
+  // it does not say (no manifest node, or a row the launcher never saw).
+  delivery: ManifestDelivery|null;
   records: string|null;
   loopRate: number|null;
   worstLatency: number|null;
@@ -101,6 +104,27 @@ export function worstLatency(node: SystemNode): number|null {
   return latencies.length ? Math.max(...latencies) : null;
 }
 
+// Any count `session_report --strict` fails a session for (REQ-OPS-43).
+export function hasDeliveryLoss(d: ManifestDelivery): boolean {
+  return d.wake_failures > 0 || d.stalled_arms > 0 || d.wake_fallbacks > 0 ||
+      d.requests_skipped > 0;
+}
+
+// The nonzero counts, as `session_report` lists them, with the bridge's
+// skipped requests per subsystem; "none" when every count is 0.
+export function deliveryText(d: ManifestDelivery): string {
+  const parts: string[] = [];
+  if (d.wake_failures) parts.push(`wake failures ${d.wake_failures}`);
+  if (d.stalled_arms) parts.push(`stalled arms ${d.stalled_arms}`);
+  if (d.wake_fallbacks) parts.push(`wake fallbacks ${d.wake_fallbacks}`);
+  if (d.requests_skipped) {
+    const split = Object.entries(d.requests_skipped_by_subsystem)
+                      .map(([subsystem, n]) => `${subsystem} ${n}`).join(', ');
+    parts.push(`skipped requests ${d.requests_skipped}` + (split ? ` (${split})` : ''));
+  }
+  return parts.join(' · ') || 'none';
+}
+
 // `graphStale`: the registry graph is last-known (data/freshness.ts), so it
 // says who held a slot but not who is alive now.
 export function mergeProcesses(
@@ -137,6 +161,7 @@ export function mergeProcesses(
     if (m && m.restart_count > 0) problems.push('restarted');
     if (m && m.recorder_failed) problems.push('recorder_failed');
     if (m && m.log_gap) problems.push('log_gap');
+    if (m?.delivery && hasDeliveryLoss(m.delivery)) problems.push('delivery_loss');
     if (m && m.exit_code > 0) problems.push('nonzero_exit');
     const lastRun = m?.runs?.at(-1);
     // The launcher's own stop signal ending a member before it handled stops
@@ -166,6 +191,7 @@ export function mergeProcesses(
       endReason: lastRun && lastRun.reason !== 'running' &&
               lastRun.reason !== 'exit' ? lastRun.reason : null,
       recorderFailed: m?.recorder_failed ?? false,
+      delivery: m?.delivery ?? null,
       records: m ? m.record_count : null,
       loopRate: r ? loopRate(r, rates) : null,
       worstLatency: r ? worstLatency(r) : null,

@@ -9,7 +9,10 @@
 //               crashed before claiming a slot still shows up (declared, never
 //               registered) and a process started outside the launcher is not
 //               lost (registry only). The exit column adds why the launcher
-//               ended the last run (stalled, stop, ...) when it says.
+//               ended the last run (stalled, stop, ...) when it says, and the
+//               delivery column what the node lost in delivery (wake
+//               failures, stalled arms, wake fallbacks, the bridge's skipped
+//               requests per subsystem; REQ-OPS-43).
 //   Counts    — running / total processes and total restarts.
 //
 // The manifest is served by the bridge at /manifest.json only when it was
@@ -26,7 +29,7 @@ import {duration, hertz, integer} from '../../ui/formatters';
 import {EmptyState, StatusDot} from '../../ui/primitives';
 import {GraphFreshnessNotice} from '../../ui/FreshnessNotice';
 import type {PanelDefinition} from '../types';
-import {mergeProcesses, summarize, type ProcessProblem} from './logic';
+import {deliveryText, mergeProcesses, summarize, type ProcessProblem} from './logic';
 import './session.css';
 
 export type SessionConfig = Record<string, never>;
@@ -65,6 +68,7 @@ const PROBLEM_META: Record<ProcessProblem, {label: string; cls: string}> = {
   restarted: {label: 'restarted', cls: 'restarted'},
   recorder_failed: {label: 'recorder failed', cls: 'recorder'},
   log_gap: {label: 'log gap', cls: 'recorder'},
+  delivery_loss: {label: 'delivery loss', cls: 'recorder'},
   nonzero_exit: {label: 'nonzero exit', cls: 'exit'},
   killed_by_signal: {label: 'killed by signal', cls: 'exit'},
   endpoint_mismatch: {label: 'endpoint mismatch', cls: 'missing'},
@@ -207,6 +211,7 @@ function SessionPanel() {
                   <th className="right">Restarts</th>
                   <th className="right">Exit</th>
                   <th>Recorder</th>
+                  <th>Delivery</th>
                   <th className="right">Records</th>
                   <th className="right">Loop</th>
                   <th className="right">Latency</th>
@@ -248,6 +253,10 @@ function SessionPanel() {
                   <td className={row.recorderFailed ? 'text-warn' : ''}>
                     {!row.hasManifest ? '—' :
                      row.recorderFailed ? 'failed' : 'ok'}
+                  </td>
+                  <td className={row.problems.includes('delivery_loss') ? 'text-warn' : ''}>
+                    {!row.hasManifest ? '—' :
+                     row.delivery === null ? 'not recorded' : deliveryText(row.delivery)}
                   </td>
                   <td className="right mono">
                     {row.records === null ? '—' : integer(row.records)}
