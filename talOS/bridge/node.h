@@ -180,10 +180,14 @@ class HardwareNode {
   // `send_error`, when set, is asked before each send to the gateway: a
   // nonzero errno fails that send with it, unsent, as if the OS had
   // returned it (a test reaches the errors a loopback socket never gives).
+  // `before_wait`, when set, is called on Run()'s thread right before each
+  // wait that input can end, after every request subscriber is armed (a
+  // test publishes there what the bridge must then wake for).
   struct Seams {
     WakeReceiver (*make_wake_receiver)(){nullptr};
     bool (*arm_request)(ipc::Subscriber<Packet>& subscriber){nullptr};
     int (*send_error)(){nullptr};
+    void (*before_wait)(){nullptr};
   };
   void set_seams(Seams seams) { seams_ = seams; }
 
