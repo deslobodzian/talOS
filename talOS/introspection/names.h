@@ -77,11 +77,12 @@ inline constexpr std::string_view kDirectionSuffixes[] = {
 // lint can tell a designed dead end from a fault: `/hw/command` is consumed
 // over UDP (external); `/drivetrain/target/auto` has no publisher yet
 // (optional). An observer is a framework node reading a topic it found in the
-// declared graph (telemetry): it is not a consumer, so the lint never names
-// it among a topic's readers, but an owner's feed it records (state, status,
-// event, telemetry) is read by design, so such a topic only observers read is
-// no "published but nothing subscribes to it" finding; an instruction
-// (target, request, command) only observers read still is one.
+// declared graph (telemetry, which records state and status topics and its
+// configured pose topic): it is not a consumer, so the lint never names it
+// among a topic's readers. A topic of a role its owner publishes (state,
+// status, event, telemetry; ObserverReads) that only observers read is read
+// by design, no "published but nothing subscribes to it" finding; an
+// instruction (target, request, command) only observers read still is one.
 inline constexpr std::uint32_t kSourceFlagExternal = 1u << 0;
 inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
 inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
@@ -173,6 +174,13 @@ inline std::optional<std::string> CheckSegment(std::string_view segment,
 }
 
 }  // namespace detail
+
+// The role, a topic name's second segment (`status` of `/hw/status`).
+// Unchecked: empty when `topic` does not start with '/' or has one segment.
+inline std::string_view Role(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() >= 2 ? segments[1] : std::string_view{};
+}
 
 // One segment of a topic name, e.g. a target lane's source
 // (`/drivetrain/target/<source>`); `what` names it in the message.

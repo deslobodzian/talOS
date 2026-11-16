@@ -433,8 +433,7 @@ const char* AlertLevelName(talos::introspect::naming::AlertLevel level) {
 // of {name: its field path, level, active}; empty for any other record, or a
 // status message with no alert field.
 std::string AlertsJson(std::string_view topic, const std::string& decoded) {
-  const auto segments = talos::introspect::naming::detail::Segments(topic);
-  if (segments.size() < 2 || segments[1] != "status" || decoded.empty()) {
+  if (talos::introspect::naming::Role(topic) != "status" || decoded.empty()) {
     return "";
   }
   std::string alerts;

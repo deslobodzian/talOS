@@ -539,9 +539,7 @@ class Telemetry {
         if (source.kind != event::SourceKind::SENDER) continue;
         if (seen_topics.contains(source.name)) continue;
 
-        const auto segments = introspect::naming::detail::Segments(source.name);
-        if (segments.size() < 2) continue;
-        const std::string_view role = segments[1];
+        const std::string_view role = introspect::naming::Role(source.name);
         if (role != "state" && role != "status") continue;
 
         if (!detail::MatchesGlobs(source.name, include_globs_,
