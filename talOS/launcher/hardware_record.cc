@@ -9,11 +9,13 @@
 #include <fstream>
 #include <iterator>
 #include <system_error>
+#include <utility>
 
 #include "talOS/configuration/config_parser.h"
 #include "talOS/driver_station/driver_station.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/protocol/types.h"
 #include "talOS/schema/identity.h"
 
 namespace talos::launcher {
@@ -574,6 +576,26 @@ std::string DecodeHardwareRecord(HardwareRecord kind,
   } catch (const std::exception& e) {
     return e.what();
   }
+}
+
+void HardwareProtocolCheck::Add(HardwareRecord kind, std::string_view topic,
+                                std::span<const std::byte> payload) {
+  ++packets_;
+  std::string why = DecodeHardwareRecord(kind, payload, scratch_);
+  if (why.empty() || rejected_++ != 0) return;
+  first_topic_ = topic;
+  first_why_ = std::move(why);
+}
+
+std::string HardwareProtocolCheck::Warning() const {
+  if (!foreign()) return "";
+  return "warning: hardware packets not decoded: recorded under a hardware "
+         "protocol other than this build's protocol " +
+         std::to_string(protocol::kProtocolVersion) +
+         " (a recording does not store its protocol version); this build's "
+         "codecs reject " +
+         std::to_string(rejected_) + " of " + std::to_string(packets_) +
+         ", the first on " + first_topic_ + ": " + first_why_;
 }
 
 std::string HardwareRecordJson(HardwareRecord kind,

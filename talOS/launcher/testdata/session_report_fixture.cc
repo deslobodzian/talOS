@@ -24,6 +24,18 @@ talos::hardware::Packet CommandPacket(std::uint64_t observed_time_us) {
   return packet;
 }
 
+// A State this build's codec accepts, as every State the bridge publishes
+// is; with `foreign`, one of the length protocol 7 gave it (13 bytes
+// shorter: protocol 8 added one CAN bus sample per State), as a session
+// recorded under that protocol holds.
+talos::hardware::Packet StatePacket(bool foreign = false) {
+  talos::hardware::Packet packet;
+  packet.size = static_cast<std::uint32_t>(
+      talos::hardware::Encode(talos::hardware::State{}, packet.data));
+  if (foreign) packet.size -= 13;
+  return packet;
+}
+
 // A disabled session of an event-driven bridge, which has no timer, and one
 // control node: the bridge publishes a State every 5 ms after a disabled
 // Driver Station packet; the node's tick 1 ms after each State sends a
@@ -92,7 +104,7 @@ int DisabledBridgeSession(const std::string& directory) {
   record(bridge, 0, 1, EventKind::SEND, ds_packet);
   for (int us = 0; us <= 20'000; us += 5'000) {
     const auto observed_us = static_cast<std::uint64_t>(us);
-    record(bridge, us, 0, EventKind::SEND, {});
+    record(bridge, us, 0, EventKind::SEND, StatePacket());
     record(motor, us + 1'000, 0, EventKind::TIMER, {});
     record(motor, us + 1'000, 1, EventKind::SEND, CommandPacket(observed_us));
     record(bridge, us + 1'250, 2, EventKind::SEND, CommandPacket(observed_us));
@@ -105,16 +117,18 @@ int DisabledBridgeSession(const std::string& directory) {
 
 }  // namespace
 
-// session_report_fixture <directory> [disabled-bridge]
+// session_report_fixture <directory> [disabled-bridge | foreign-protocol]
+//
+// foreign-protocol: the default session, its States recorded under protocol
+// 7 (StatePacket); its Driver Station packets still decode.
 int main(int argc, char** argv) {
   if (argc != 2 && argc != 3) return 1;
   const std::string directory = argv[1];
   std::filesystem::create_directories(directory);
-  if (argc == 3) {
-    return std::string{argv[2]} == "disabled-bridge"
-               ? DisabledBridgeSession(directory)
-               : 1;
-  }
+  const std::string mode = argc == 3 ? argv[2] : "";
+  if (mode == "disabled-bridge") return DisabledBridgeSession(directory);
+  if (!mode.empty() && mode != "foreign-protocol") return 1;
+  const bool foreign = mode == "foreign-protocol";
   talos::launcher::SessionManifest manifest;
   manifest.session_id = 42;
   manifest.config_sha256 = "fixture-sha256";
@@ -178,9 +192,13 @@ int main(int argc, char** argv) {
     record(ms, 1, EventKind::SEND, packet);
   };
   driver_station(0, true);
-  for (int ms : {0, 5, 10, 130, 135}) record(ms, 0, EventKind::SEND, {});
+  for (int ms : {0, 5, 10, 130, 135}) {
+    record(ms, 0, EventKind::SEND, StatePacket(foreign));
+  }
   driver_station(140, false);
-  for (int ms : {140, 340, 345}) record(ms, 0, EventKind::SEND, {});
+  for (int ms : {140, 340, 345}) {
+    record(ms, 0, EventKind::SEND, StatePacket(foreign));
+  }
   const Context lane = record(346, 3, EventKind::MESSAGE, {});
   const Context update = record(347, 2, EventKind::TIMER, {});
   // Target::get selecting that lane inside the update: a READ record with an

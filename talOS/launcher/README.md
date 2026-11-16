@@ -1319,13 +1319,51 @@ object in JSONL, its text in CSV and the text dump, absent (JSONL) or empty
 
 64-bit ids are decimal strings. A device's `name` appears only when the
 packet's `config_id` is that config's (as written, or commissioned as `--sim`
-runs it), so a config edited after the match never mislabels a device. A
-payload that will not decode gives `{"type": ..., "error": "..."}` and the
-export continues. Driver Station strings are cut at a fixed length, so a byte
-that does not begin a complete UTF-8 character is written as `\u00XX`. The
-codecs are the reading build's: the Packet's schema identity hashes only its
-size, so a log recorded before a wire change that kept that size decodes with
-the new layout, wrongly or as an error; `payload_hex` keeps the bytes.
+runs it), so a config edited after the match never mislabels a device.
+Driver Station strings are cut at a fixed length, so a byte that does not
+begin a complete UTF-8 character is written as `\u00XX`.
+
+### Which logs a build can read
+
+A build reads every topic with a schema in any log of its log format
+version ([events](../events/README.md#log-format)), whatever build recorded
+it: the schema travels in the log. The hardware packets do not carry one,
+and a build decodes them with its own wire codecs, so it decodes only the
+hardware packets of a session recorded under its own hardware protocol
+(`protocol::kProtocolVersion`;
+[DATA_FLOW.md](../../docs/DATA_FLOW.md)).
+
+A recording does not store that version: a recorded Packet holds a frame's
+payload without its header, and its schema identity hashes only its size.
+What it does show is that every hardware packet in it decoded under the
+build that recorded it, since the bridge publishes only a State or Driver
+Station packet its codec accepted, and every request and command is its
+codec's encoding. So `log_dump`, `tlog_to_wpilog` and `session_report`
+(through `log_dump`) first try every hardware packet of the session with
+this build's codecs (`HardwareProtocolCheck`, `hardware_record.h`), before
+decoding any. If one is rejected, the session was recorded under another
+protocol, and the tool prints one line on stderr and decodes none of its
+hardware packets, the ones that happen to decode included:
+
+```
+log_dump: warning: hardware packets not decoded: recorded under a hardware protocol other than this build's protocol <N> (a recording does not store its protocol version); this build's codecs reject <k> of <n>, the first on <topic>: <reason>
+```
+
+`log_dump` then exports no `hardware` and no `ds_enabled` member (JSONL),
+an empty `hardware` field (CSV) and no hardware line (text, summary);
+`payload_hex` keeps the bytes. Every other record is exported as before,
+and the exit status is 0. A session of another protocol whose hardware
+packets all happen to decode, because the change kept every length,
+cannot be told apart and decodes with this build's layout, possibly
+wrongly. Read a session's hardware packets with a build of the protocol
+it was recorded under: a stamped bundle's session names its source in
+`git_revision` ([session manifest](#session-manifest)); nothing else in a
+session does.
+
+A node replayed from such a session (`--replay-inputs`) fails safe: its
+devices layer decodes each `/hw/state` with this build's codec, so a
+rejected State is no State, `robot_enabled` stays false and every output
+is neutral.
 
 ### Session measurements
 
@@ -1431,7 +1469,16 @@ lateness and bridge request-to-command rows are informational and not
 required. The enabled-only verdicts (enabled state median, p99 and gaps,
 target age at tick) cannot be measured in a session that never enabled, and
 the report says so in one line; `--strict` still fails them, so acceptance
-needs an enabled session.
+needs an enabled session. In a session recorded under another hardware
+protocol ([which logs a build can read](#which-logs-a-build-can-read)),
+`log_dump` decodes no Driver Station packet, so the same verdicts are NOT
+MEASURED with `log_dump`'s line in their detail (target age at tick too:
+without the enabled bit a lane `Target` never selected cannot be found),
+the line is a session issue (`hardware_not_decoded` in `--json`), and
+`--strict` names it and exits 2. The `/hw/state` cadence rows (overall
+median and p99) and the controller link use only record times and are
+still judged. Read such a session with a build of its protocol for
+acceptance.
 
 Target receipt age is `now - publish_time` of a target MESSAGE dispatch, not
 target age at a control tick. Target age at the tick comes from the READ record
@@ -1546,11 +1593,11 @@ modes and states `string`.
 Not exported, though `log_dump` prints them: the gateway build
 (`gateway_program`, `gateway_build_id`, `gateway_build_dirty`), the raw
 Driver Station `flags` word, the game-specific message, the event name and
-joystick names. A hardware packet that does not decode (a payload of the
-wrong size, a `Packet` size past its buffer, bytes the codec rejects) is
-skipped alone and counted on stderr per topic with the first reason; the
-topic's other packets convert. The codecs are this build's, as for
-`log_dump`.
+joystick names. A session recorded under another hardware protocol
+converts none of its hardware packets, the rest of it converts, the
+converter prints the one line `log_dump` does (prefixed `tlog_to_wpilog:`),
+and the exit status is 0; see
+[which logs a build can read](#which-logs-a-build-can-read).
 
 An entry name belongs to the first topic to publish a value under it. A
 topic whose field path lands on a name another topic owns (`/arm/state`
