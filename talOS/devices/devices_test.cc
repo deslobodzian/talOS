@@ -1489,8 +1489,9 @@ class FixedReadBackend final : public hardware::Backend {
 
 // A disconnected motor or CAN sensor in SimHardware publishes the sample the
 // gateway publishes for the same readings marked invalid
-// (hardware::MarkInvalid): every measurement zero, its ages and temperature
-// as last read, so a node reads in a Sim test what it reads on the robot.
+// (hardware::MarkInvalid): every measurement zero, its ages as last read and,
+// while the signal is younger than 500 ms, its temperature as last read, so
+// a node reads in a Sim test what it reads on the robot.
 // Scenario: motor a at 1.5 rot, -2 rot/s, 62.5 C, 18.25 A supply and 40.04 A
 // stator, with 300 and 400 us ages, and CANcoder cc at 0.2 rot, 0.3 rot/s,
 // with 500 and 600 us ages, stop answering.

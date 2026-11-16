@@ -281,12 +281,33 @@ struct HardwareLink::Impl {
     }
     return device;
   }
+  // Called off the loop thread. The lock covers only reads and a copy into
+  // capacity reserved before it was taken, never an allocation, so the loop
+  // thread in add_device never waits on this thread's allocator: the first
+  // pass reads the name's size, the reserve happens unlocked, and the
+  // second pass assigns within that capacity (a name never changes once
+  // added, so its size cannot have grown).
   std::string OffThreadLabel(std::size_t index, Kind kind) const {
-    const std::lock_guard lock{devices_growth};
-    if (index >= devices.size() || devices[index].kind != kind) {
+    std::string name;
+    bool found = false;
+    for (;;) {
+      std::size_t size = 0;
+      {
+        const std::lock_guard lock{devices_growth};
+        found = index < devices.size() && devices[index].kind == kind;
+        if (!found) break;
+        size = devices[index].name.size();
+        if (size <= name.capacity()) {
+          name.assign(devices[index].name);
+          break;
+        }
+      }
+      name.reserve(size);
+    }
+    if (!found) {
       return std::string{KindLabel(kind)} + " handle " + std::to_string(index);
     }
-    return std::string{KindLabel(kind)} + " '" + devices[index].name + "'";
+    return std::string{KindLabel(kind)} + " '" + name + "'";
   }
   const Device& SensorAt(std::size_t index) const {
     if (index < devices.size() && (devices[index].kind == Kind::kGyro ||
