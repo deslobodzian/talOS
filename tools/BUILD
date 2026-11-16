@@ -146,6 +146,42 @@ py_test(
     ],
 )
 
+# A scaffolded node's binary replays its own logged simulated run without
+# divergence: one target per language, so the generated node tests spawn no
+# binary.
+py_test(
+    name = "scaffold_replay_cc_test",
+    size = "small",
+    srcs = ["scaffold_replay_test.py"],
+    data = [
+        "//tools/scaffold_testdata/gripper:golden",
+        "//tools/scaffold_testdata/gripper:node",
+    ],
+    env = {"NODE_BINARY": "$(rlocationpath //tools/scaffold_testdata/gripper:node)"},
+    legacy_create_init = False,
+    main = "scaffold_replay_test.py",
+    deps = ["@rules_python//python/runfiles"],
+)
+
+py_test(
+    name = "scaffold_replay_py_test",
+    size = "small",
+    srcs = ["scaffold_replay_test.py"],
+    data = [
+        "//tools/scaffold_testdata/scaffold_py:golden",
+        "//tools/scaffold_testdata/scaffold_py:node",
+    ],
+    env = {"NODE_BINARY": "$(rlocationpath //tools/scaffold_testdata/scaffold_py:node)"},
+    legacy_create_init = False,
+    main = "scaffold_replay_test.py",
+    # The node's ctypes host cannot initialize sanitizer runtimes.
+    tags = [
+        "no_asan",
+        "no_tsan",
+    ],
+    deps = ["@rules_python//python/runfiles"],
+)
+
 # ./sim.sh --config: which file a path names, and its refusals (missing,
 # outside the repository, ambiguous, stale manifest), with a stub bazel and
 # resolver so nothing builds or starts.

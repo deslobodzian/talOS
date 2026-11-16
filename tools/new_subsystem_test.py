@@ -925,6 +925,25 @@ class NewSubsystemTest(unittest.TestCase):
                     self.assertIn("--config $PWD/cfg/robot_sim.toml --sim",
                                   run)
 
+    # REQ-DEV-01
+    def test_node_tests_spawn_no_binary(self):
+        # A generated node_test runs the node's class on Sim; the binary's
+        # logged run and replay is proved once per language by
+        # //tools:scaffold_replay_cc_test and :scaffold_replay_py_test
+        # (TEST-5). A node_test without the binary in its runfiles cannot
+        # spawn it.
+        for lang in ("cpp", "py"):
+            for kind, raw in (("velocity", False), ("position", False),
+                              ("position", True), ("estimator", False)):
+                with self.subTest(lang=lang, kind=kind, raw=raw):
+                    files = new_subsystem.package_files("arm", lang,
+                                                        kind=kind, raw=raw)
+                    rule = files["BUILD"].split('name = "node_test"')[1]
+                    self.assertNotIn('":node"', rule)
+                    test = files["node_test.cc" if lang == "cpp"
+                                 else "node_test.py"]
+                    self.assertNotIn("--replay", test)
+
     # REQ-DEV-05
     def test_sim_run_outlasts_its_schedule_however_late_the_gateway_starts(
             self):

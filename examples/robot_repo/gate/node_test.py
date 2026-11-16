@@ -1,4 +1,4 @@
-"""Node tests: the class on talos.testing.Sim, and the binary.
+"""Node tests: the class on talos.testing.Sim.
 
 GateTest is the node test matrix, docs/TESTING.md §7 in the talos
 repository: the case names are the matrix's, which talos's
@@ -6,15 +6,12 @@ repository: the case names are the matrix's, which talos's
 """
 
 import os
-import subprocess
-import tempfile
 import unittest
 
 import talos
 from gate import topics
 from gate.GateState import GateState
 from gate.GateTarget import GateTarget
-from python.runfiles import runfiles
 from talos.testing import Sim, SimHardware
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -197,26 +194,6 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.mode(), talos.Mode.VELOCITY)
 
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
-
-
-class BinaryTest(unittest.TestCase):
-    def run_binary(self, *argv):
-        resolver = runfiles.Create()
-        binary = resolver.Rlocation(os.environ["NODE_BINARY"])
-        env = dict(os.environ, **resolver.EnvVars())
-        env.pop("PYTHONPATH", None)
-        with tempfile.TemporaryDirectory() as cwd:
-            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
-                                  capture_output=True, text=True, timeout=120)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout
-
-    def test_sim_run_replays_without_divergence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, "node_test.tlog")
-            self.run_binary("--sim", "--duration-s", "1", "--config", CONFIG,
-                            "--log", log)
-            self.run_binary("--replay", log, "--config", CONFIG)
 
 
 if __name__ == "__main__":

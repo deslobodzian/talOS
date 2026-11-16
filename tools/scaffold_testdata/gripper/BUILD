@@ -44,11 +44,9 @@ cc_test(
         "testdata/gripper.toml",
         "testdata/neighbor.toml",
         "testdata/robot.toml",
-        ":node",
     ],
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-        "TALOS_TEST_NODE": "$(rlocationpath :node)",
     },
     deps = [
         ":gripper",

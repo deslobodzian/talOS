@@ -324,7 +324,6 @@ cc_test(
     data = @DATA@,
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-        "TALOS_TEST_NODE": "$(rlocationpath :node)",
     },
     deps = [
         ":@NAME@",
@@ -594,11 +593,9 @@ TALOS_NODE(@NAME@::@PASCAL@)
 
 CC_TEST = """\
 #include <gtest/gtest.h>
-#include <sys/wait.h>
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -844,42 +841,12 @@ TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
   EXPECT_EQ(Request(), Mode::kVelocity);
 }
 
-struct Result {
-  int status;
-  std::string output;
-};
-
-Result RunNode(const std::string& args) {
-  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
-                              " --config '" + Runfile("TALOS_TEST_CONFIG") +
-                              "' 2>&1";
-  FILE* pipe = ::popen(command.c_str(), "r");
-  if (pipe == nullptr) throw std::runtime_error("popen failed");
-  Result result{0, {}};
-  char buffer[4096];
-  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
-    result.output.append(buffer, n);
-  }
-  const int status = ::pclose(pipe);
-  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  return result;
-}
-
-TEST(@PASCAL@Binary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/node_test.tlog";
-  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
-  ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunNode("--replay '" + log + "'");
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
-}
-
 }  // namespace
 }  // namespace @NAME@
 """
+
+# The end of a generated node_test.cc, before which the position tests go.
+NAMESPACE_END = "}}  // namespace\n}}  // namespace {name}\n"
 
 # Inserted into CC_TEST for a position mechanism: its fixture starts on the
 # home switch, and the homing tests start off it.
@@ -909,7 +876,7 @@ CC_POSITION_PARAMETERS = """\
 # mechanism's phase reaches /@NAME@/state. The homing rules themselves are
 # talOS/mechanisms' and tested there.
 CC_POSITION_TESTS = """\
-// The mechanism library's behaviour. The tests from here to the binary test
+// The mechanism library's behaviour. The tests from here to the end
 // cover what talos::mechanisms::PositionMechanism does for this node: it
 // homes on the switch before the first goal, counts positions from there,
 // clamps goals to min_rot..max_rot and latches FAILED when homing does not
@@ -1160,7 +1127,6 @@ py_test(
     size = "small",
     srcs = ["node_test.py"],
     data = @DATA@,
-    env = {"NODE_BINARY": "$(rlocationpath :node)"},
     legacy_create_init = False,
     # ctypes cannot initialize sanitizer runtimes inside the Python host.
     tags = [
@@ -1170,7 +1136,6 @@ py_test(
     deps = [
         ":messages_py",
         "//talOS/python:testing",
-        "@rules_python//python/runfiles",
     ],
 )
 """
@@ -1395,7 +1360,7 @@ class @PASCAL@:
 '''
 
 PY_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary.
+"""Node tests: the class on talos.testing.Sim.
 
 @PASCAL@Test is the node test matrix, docs/TESTING.md §7 in the talos
 repository: the case names are the matrix's, which talos's
@@ -1403,8 +1368,6 @@ repository: the case names are the matrix's, which talos's
 """
 
 import os
-import subprocess
-import tempfile
 import unittest
 
 import talos
@@ -1592,26 +1555,6 @@ class @PASCAL@Test(unittest.TestCase):
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
-class BinaryTest(unittest.TestCase):
-    def run_binary(self, *argv):
-        resolver = runfiles.Create()
-        binary = resolver.Rlocation(os.environ["NODE_BINARY"])
-        env = dict(os.environ, **resolver.EnvVars())
-        env.pop("PYTHONPATH", None)
-        with tempfile.TemporaryDirectory() as cwd:
-            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
-                                  capture_output=True, text=True, timeout=120)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout
-
-    def test_sim_run_replays_without_divergence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, "node_test.tlog")
-            self.run_binary("--sim", "--duration-s", "1", "--config", CONFIG,
-                            "--log", log)
-            self.run_binary("--replay", log, "--config", CONFIG)
-
-
 if __name__ == "__main__":
     unittest.main()
 '''
@@ -1621,12 +1564,12 @@ PY_POSITION_PARAMETERS = '''\
     # matrix: n/a 9 (PositionMechanism parameters, tested in talos)
 '''
 
-# Inserted into PY_TEST for a position mechanism before BinaryTest: the
+# Inserted into PY_TEST for a position mechanism at its end: the
 # node's own logic over the mechanism (the config homes it, and the
 # mechanism's phase reaches /@NAME@/state). The homing rules themselves are
 # talOS/mechanisms' and tested there.
 PY_POSITION_TESTS = '''
-    # The mechanism library's behaviour. The tests from here to BinaryTest
+    # The mechanism library's behaviour. The tests from here to the end
     # cover what talos.mechanisms.PositionMechanism does for this node: it
     # homes on the switch before the first goal, counts positions from
     # there, clamps goals to min_rot..max_rot and latches FAILED when homing
@@ -2393,11 +2336,9 @@ class @PASCAL@ {
 
 CC_ESTIMATOR_TEST = """\
 #include <gtest/gtest.h>
-#include <sys/wait.h>
 
 #include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -2562,39 +2503,6 @@ TEST_F(@PASCAL@Test, UpdateDoesNotAllocate) {
   EXPECT_EQ(Latest().observation_accepted_count(), 1u);
 }
 
-struct Result {
-  int status;
-  std::string output;
-};
-
-Result RunNode(const std::string& args) {
-  const std::string command = "'" + Runfile("TALOS_TEST_NODE") + "' " + args +
-                              " --config '" + Runfile("TALOS_TEST_CONFIG") +
-                              "' 2>&1";
-  FILE* pipe = ::popen(command.c_str(), "r");
-  if (pipe == nullptr) throw std::runtime_error("popen failed");
-  Result result{0, {}};
-  char buffer[4096];
-  while (const std::size_t n = std::fread(buffer, 1, sizeof buffer, pipe)) {
-    result.output.append(buffer, n);
-  }
-  const int status = ::pclose(pipe);
-  result.status = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-  return result;
-}
-
-TEST(@PASCAL@Binary, LoggedSimRunReplaysWithoutDivergence) {
-  const char* tmp = std::getenv("TEST_TMPDIR");
-  const std::string log =
-      std::string{tmp != nullptr ? tmp : "/tmp"} + "/node_test.tlog";
-  const Result run = RunNode("--sim --duration-s 1 --log '" + log + "'");
-  ASSERT_EQ(run.status, 0) << run.output;
-  const Result replay = RunNode("--replay '" + log + "'");
-  EXPECT_EQ(replay.status, 0) << replay.output;
-  EXPECT_NE(replay.output.find("diverged=0 clean_exit=1"), std::string::npos)
-      << replay.output;
-}
-
 }  // namespace
 }  // namespace @NAME@
 """
@@ -2687,7 +2595,7 @@ class @PASCAL@:
 '''
 
 PY_ESTIMATOR_TEST = '''\
-"""Node tests: the class on talos.testing.Sim, and the binary.
+"""Node tests: the class on talos.testing.Sim.
 
 @PASCAL@Test is the node test matrix for an observer, docs/TESTING.md §7 in
 the talos repository: the case names are the matrix's, which talos's
@@ -2696,8 +2604,6 @@ the talos repository: the case names are the matrix's, which talos's
 
 import math
 import os
-import subprocess
-import tempfile
 import unittest
 
 import talos
@@ -2801,26 +2707,6 @@ class @PASCAL@Test(unittest.TestCase):
     # matrix: n/a 12 (a Python tick allocates in the interpreter)
 
 
-class BinaryTest(unittest.TestCase):
-    def run_binary(self, *argv):
-        resolver = runfiles.Create()
-        binary = resolver.Rlocation(os.environ["NODE_BINARY"])
-        env = dict(os.environ, **resolver.EnvVars())
-        env.pop("PYTHONPATH", None)
-        with tempfile.TemporaryDirectory() as cwd:
-            proc = subprocess.run([binary, *argv], cwd=cwd, env=env,
-                                  capture_output=True, text=True, timeout=120)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        return proc.stdout
-
-    def test_sim_run_replays_without_divergence(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = os.path.join(tmp, "node_test.tlog")
-            self.run_binary("--sim", "--duration-s", "1", "--config", CONFIG,
-                            "--log", log)
-            self.run_binary("--replay", log, "--config", CONFIG)
-
-
 if __name__ == "__main__":
     unittest.main()
 '''
@@ -2886,8 +2772,7 @@ def estimator_files(name, lang):
                          "talOS/node/allocation_probe.h",
                          "talOS/node/testing.h"]
         build = fill(CC_BUILD, MESSAGES=messages,
-                     DATA="[\n" + string_list(["testdata/robot.toml", ":node"],
-                                              4), **values)
+                     DATA="[\n" + string_list(["testdata/robot.toml"], 4), **values)
         # The node reads no devices; only its test drives SimHardware.
         build = build.replace('        "//talOS/devices",\n', "", 1)
         files.update({
@@ -2905,7 +2790,6 @@ def estimator_files(name, lang):
             name: "topics",
             "geometry.PoseEstimate": "PoseEstimate",
             "geometry.PoseObservation": "PoseObservation",
-            "python.runfiles": "runfiles",
             "talos.testing": "Sim, SimHardware",
         }
         from_imports = "\n".join(
@@ -2914,7 +2798,7 @@ def estimator_files(name, lang):
         files.update({
             "BUILD": fill(PY_BUILD, MESSAGES=messages,
                           DATA="[\n" + string_list(
-                              [f"{name}.py", "testdata/robot.toml", ":node"],
+                              [f"{name}.py", "testdata/robot.toml"],
                               4), **values),
             f"{name}.py": fill(PY_ESTIMATOR_NODE, DOC=doc, **values),
             "node_test.py": fill(PY_ESTIMATOR_TEST, FROM_IMPORTS=from_imports,
@@ -3005,7 +2889,7 @@ def mechanism_files(name, lang, kind, raw=False):
                          "talOS/node/testing.h"]
         neighbor = values["NEIGHBOR"]
         data = ["testdata/robot.toml", f"testdata/{name}.toml",
-                f"testdata/{neighbor}.toml", ":node"]
+                f"testdata/{neighbor}.toml"]
         build = fill(CC_BUILD, MESSAGES=messages,
                      DATA="[\n" + string_list(data, 4), **values)
         hdr_template = CC_POSITION_HEADER if kind == "position" else CC_HEADER
@@ -3056,8 +2940,9 @@ def mechanism_files(name, lang, kind, raw=False):
                  '  Hold(1.0, 40ms, "auto");\n'),
                 ("  EXPECT_DOUBLE_EQ(request.demand, 20.0);\n",
                  "  EXPECT_DOUBLE_EQ(request.demand, 1.0);\n"),
-                ("struct Result {",
-                 fill(CC_POSITION_RAW_TESTS, **values) + "struct Result {"),
+                (NAMESPACE_END.format(name=name),
+                 fill(CC_POSITION_RAW_TESTS, **values)
+                 + NAMESPACE_END.format(name=name)),
             ])
             testdata_subsystem = CC_POSITION_RAW_TESTDATA_SUBSYSTEM
         elif kind == "position":
@@ -3079,8 +2964,9 @@ def mechanism_files(name, lang, kind, raw=False):
                  "    sim.step(60ms);\n"),
                 (f"// matrix: n/a 9 (the {name} reads no parameters)\n",
                  fill(CC_POSITION_PARAMETERS, **values)),
-                ("struct Result {",
-                 fill(CC_POSITION_TESTS, **values) + "struct Result {"),
+                (NAMESPACE_END.format(name=name),
+                 fill(CC_POSITION_TESTS, **values)
+                 + NAMESPACE_END.format(name=name)),
             ])
             testdata_subsystem = CC_POSITION_TESTDATA_SUBSYSTEM
         files.update({
@@ -3094,14 +2980,13 @@ def mechanism_files(name, lang, kind, raw=False):
             f"testdata/{neighbor}.toml": fill(CC_TESTDATA_NEIGHBOR, **values),
         })
     else:
-        data = [f"{name}.py", "testdata/robot.toml", ":node"]
+        data = [f"{name}.py", "testdata/robot.toml"]
         pascal_name = pascal(name)
         # isort order: by module, case-insensitively.
         imports = {
             name: "topics",
             f"{name}.{pascal_name}State": f"{pascal_name}State",
             f"{name}.{pascal_name}Target": f"{pascal_name}Target",
-            "python.runfiles": "runfiles",
             "talos.testing": "Sim, SimHardware",
         }
         if kind == "position":
@@ -3164,9 +3049,9 @@ def mechanism_files(name, lang, kind, raw=False):
                  '        self.hold(1.0, 0.04, source="auto")\n'),
                 ("        self.assertEqual(request.demand, 20.0)\n",
                  "        self.assertEqual(request.demand, 1.0)\n"),
-                ("\n\nclass BinaryTest",
+                ("\n\nif __name__",
                  fill(PY_POSITION_RAW_TESTS, **values)
-                 + "\n\nclass BinaryTest"),
+                 + "\n\nif __name__"),
             ])
             testdata_robot = PY_POSITION_RAW_TESTDATA_ROBOT
         elif kind == "position":
@@ -3190,8 +3075,8 @@ def mechanism_files(name, lang, kind, raw=False):
                 # A motor on its home switch zeroes after home_samples ticks.
                 ("        self.sim.step(0.01)\n",
                  "        self.sim.step(0.06)  # home_samples ticks on a switch\n"),
-                ("\n\nclass BinaryTest",
-                 fill(PY_POSITION_TESTS, **values) + "\n\nclass BinaryTest"),
+                ("\n\nif __name__",
+                 fill(PY_POSITION_TESTS, **values) + "\n\nif __name__"),
             ])
             testdata_robot = PY_POSITION_TESTDATA_ROBOT
         files.update({

@@ -41,11 +41,9 @@ cc_test(
     srcs = ["node_test.cc"],
     data = [
         "testdata/robot.toml",
-        ":node",
     ],
     env = {
         "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
-        "TALOS_TEST_NODE": "$(rlocationpath :node)",
     },
     deps = [
         ":localizer",
