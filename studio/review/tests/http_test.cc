@@ -256,4 +256,83 @@ TEST_F(HttpTest, ListensOnLoopbackOnly) {
   freeifaddrs(interfaces);
 }
 
+// Guards that a second server cannot share a port: uSockets sets SO_REUSEPORT
+// on a listener unless told LIBUS_LISTEN_EXCLUSIVE_PORT, so a second
+// studio_review on a used port bound beside the first and the kernel split
+// its connections between two libraries. Held here as uSockets holds a
+// shared listener, the port is refused, and the server says which.
+// REQ-OPS-41
+TEST(HttpListen, RefusesAPortAnotherListenerHolds) {
+  const int holder = socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_GE(holder, 0);
+  const int on = 1;
+  ASSERT_EQ(setsockopt(holder, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on), 0);
+  ASSERT_EQ(setsockopt(holder, SOL_SOCKET, SO_REUSEPORT, &on, sizeof on), 0);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  ASSERT_EQ(bind(holder, reinterpret_cast<sockaddr*>(&address), sizeof address),
+            0);
+  ASSERT_EQ(listen(holder, 1), 0);
+  socklen_t length = sizeof address;
+  ASSERT_EQ(getsockname(holder, reinterpret_cast<sockaddr*>(&address), &length),
+            0);
+  const std::string port = std::to_string(ntohs(address.sin_port));
+
+  const std::string library =
+      testing::TempDir() + "/review_listen_" + std::to_string(getpid());
+  std::filesystem::create_directories(library);
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error));
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* server = std::getenv("TALOS_STUDIO_REVIEW");
+  ASSERT_NE(server, nullptr) << "TALOS_STUDIO_REVIEW is not set";
+  const std::string binary = runfiles->Rlocation(server);
+  int out[2];
+  int err[2];
+  ASSERT_EQ(pipe(out), 0);
+  ASSERT_EQ(pipe(err), 0);
+  const pid_t child = fork();
+  if (child == 0) {
+    for (const auto& [name, value] : runfiles->EnvVars()) {
+      setenv(name.c_str(), value.c_str(), 1);
+    }
+    dup2(out[1], STDOUT_FILENO);
+    dup2(err[1], STDERR_FILENO);
+    close(out[0]);
+    close(err[0]);
+    close(holder);
+    execl(binary.c_str(), binary.c_str(), "--library", library.c_str(),
+          "--port", port.c_str(), static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  close(out[1]);
+  close(err[1]);
+  // A server that listens prints its line and runs on; one refused exits,
+  // and the line is EOF.
+  FILE* stream = fdopen(out[0], "r");
+  char line[256] = {};
+  const bool listened = fgets(line, sizeof line, stream) != nullptr;
+  fclose(stream);
+  if (listened) kill(child, SIGTERM);
+  int status = 0;
+  waitpid(child, &status, 0);
+  std::string messages;
+  char buffer[4096];
+  for (ssize_t n; (n = read(err[0], buffer, sizeof buffer)) > 0;) {
+    messages.append(buffer, static_cast<std::size_t>(n));
+  }
+  close(err[0]);
+  close(holder);
+  std::filesystem::remove_all(library);
+
+  EXPECT_FALSE(listened) << "listened beside the holder: " << line;
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) != 0) << status;
+  EXPECT_NE(messages.find("cannot listen on 127.0.0.1:" + port),
+            std::string::npos)
+      << messages;
+}
+
 }  // namespace

@@ -253,6 +253,18 @@ py_test(
     deps = [":bridge_client"],
 )
 
+# A second listener on a port another holds: the bridge refuses it and exits.
+py_test(
+    name = "listen_test",
+    size = "small",
+    srcs = ["listen_test.py"],
+    data = [":studio_bridge"],
+    tags = [
+        "integration",
+        "local",
+    ],
+)
+
 # --describe answers with no ports, shm, or robot, so this stays hermetic.
 py_test(
     name = "describe_test",
