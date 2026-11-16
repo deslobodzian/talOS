@@ -2,11 +2,67 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace talos::driver_station {
 namespace {
+
+// A Driver Station packet the RoboRIO and the main processor agree on byte
+// for byte, whatever either host's byte order: the fields in the order
+// docs/DATA_FLOW.md gives, every integer and float little-endian, each string
+// a length byte then its bytes, a disconnected joystick one zero byte.
+// REQ-CONTRACT-03
+TEST(DriverStationTest, PacketIsLittleEndianOnTheWire) {
+  DriverStationData ds;
+  ds.sample_time_us = 0x0102030405060708ull;
+  ds.mode_since_us = 0x1112131415161718ull;
+  ds.boot_id = 0x2122232425262728ull;
+  ds.fms.flags = 0x31323334u;
+  ds.fms.alliance = Alliance::kBlue;
+  ds.fms.station = 3;
+  ds.fms.match_type = MatchType::kElimination;
+  ds.fms.match_number = 0x0A0B;
+  ds.fms.replay_number = 5;
+  ds.fms.match_time_s = 97.5f;
+  std::memcpy(ds.fms.game_specific_message, "ab", 2);
+  std::memcpy(ds.fms.event_name, "c", 1);
+  auto& stick = ds.joysticks[1];
+  stick.connected = true;
+  stick.axis_count = 2;
+  stick.button_count = 3;
+  stick.pov_count = 1;
+  stick.buttons = 0x41424344u;
+  stick.axes[0] = 0.5f;
+  stick.axes[1] = -1.0f;
+  stick.povs[0] = -1;
+  std::memcpy(stick.name, "x", 1);
+  const std::vector<uint8_t> expected{
+      0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,  // sample_time_us
+      0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,  // mode_since_us
+      0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,  // boot_id
+      0x34, 0x33, 0x32, 0x31,                          // flags
+      2,    3,    3,                                   // alliance..match_type
+      0x0B, 0x0A, 5,                                   // match, replay number
+      0x00, 0x00, 0xC3, 0x42,                          // match_time_s 97.5f
+      2,    'a',  'b',  1,    'c',                     // game message, event
+      0,                                               // joystick 0
+      1,    2,    3,    1,                             // joystick 1, counts
+      0x44, 0x43, 0x42, 0x41,                          // buttons
+      0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x80, 0xBF,  // axes 0.5f, -1.0f
+      0xFF, 0xFF, 1,    'x',                           // POV -1, name
+      0,    0,    0,    0};                            // joysticks 2..5
+  std::array<uint8_t, kMaxEncodedSize> bytes{};
+  const auto size = Encode(ds, bytes);
+  ASSERT_EQ(size, expected.size());
+  EXPECT_TRUE(std::equal(expected.begin(), expected.end(), bytes.begin()));
+  DriverStationData decoded;
+  ASSERT_TRUE(Decode(expected, decoded));
+  EXPECT_EQ(decoded, ds);
+}
 
 // REQ-CONTRACT-02
 TEST(DriverStationTest, FullyPopulatedEncodingReachesMaximumSize) {
