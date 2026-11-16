@@ -203,8 +203,11 @@ function requireDeclared(context: RpcContext): DeclaredGraph {
   return context.declared;
 }
 
+// `nowMs` is now on the performance.now() clock that `systemArrivalMs` is on;
+// get_system_graph judges the graph's age and staleness at it.
 export function dispatch(
-    context: RpcContext, method: string, params: Params = {}): unknown {
+    context: RpcContext, method: string, params: Params = {},
+    nowMs: number = performance.now()): unknown {
   const {timeline} = context;
 
   // The newest retained sample, with its dictionary context. The zero-history
@@ -374,7 +377,7 @@ export function dispatch(
   if (method === 'get_system_graph') {
     const system = requireSystem(context);
     const arrival = context.systemArrivalMs ?? null;
-    const now = performance.now();
+    const now = nowMs;
     const rates = ratesFor(context, system);
     const health = topicHealthOf(system);
     // One tally per state, so an agent does not have to know which of them are
