@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <initializer_list>
 #include <limits>
@@ -1465,7 +1466,8 @@ hardware::State LatestState(const Sim& sim) {
 }
 
 // A backend whose every Read returns `read`, as PhoenixBackend reports a
-// device that stopped answering: its last readings, marked invalid.
+// device that stopped answering: its last readings, their ages grown since,
+// marked invalid.
 class FixedReadBackend final : public hardware::Backend {
  public:
   explicit FixedReadBackend(const hardware::State& read) : read_{read} {}
@@ -1489,9 +1491,10 @@ class FixedReadBackend final : public hardware::Backend {
 
 // A disconnected motor or CAN sensor in SimHardware publishes the sample the
 // gateway publishes for the same readings marked invalid
-// (hardware::MarkInvalid): every measurement zero, its ages as last read and,
-// while the signal is younger than 500 ms, its temperature as last read, so
-// a node reads in a Sim test what it reads on the robot.
+// (hardware::MarkInvalid): every measurement zero, its ages grown from its
+// last frame by the sample time since (as Phoenix reports a signal that
+// stopped) and, while the signal is younger than 500 ms, its temperature as
+// last read, so a node reads in a Sim test what it reads on the robot.
 // Scenario: motor a at 1.5 rot, -2 rot/s, 62.5 C, 18.25 A supply and 40.04 A
 // stator, with 300 and 400 us ages, and CANcoder cc at 0.2 rot, 0.3 rot/s,
 // with 500 and 600 us ages, stop answering.
@@ -1512,9 +1515,16 @@ TEST(Devices, ADisconnectedDeviceIsTheGatewaysInvalidSample) {
   sim.step(10ms);  // a State the node has drained
   const hardware::State simulated = LatestState(sim);
 
-  // The gateway, reading the same devices as they stop answering.
-  read.motors[0].valid = false;   // motor a, the config's first
+  // The gateway, reading the same devices since they stopped answering.
+  const auto since_us = static_cast<std::uint32_t>(simulated.sample_time_us -
+                                                   read.sample_time_us);
+  ASSERT_EQ(since_us, 10'000u);
+  read.motors[0].valid = false;  // motor a, the config's first
+  read.motors[0].position_age_us += since_us;
+  read.motors[0].velocity_age_us += since_us;
   read.sensors[0].valid = false;  // CANcoder cc, its first sensor
+  read.sensors[0].position_age_us += since_us;
+  read.sensors[0].velocity_age_us += since_us;
   FixedReadBackend backend{read};
   hardware::Gateway gateway{
       sim.node("mech").extension<HardwareLink>().config().hardware, backend, 1};
