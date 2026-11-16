@@ -1037,12 +1037,15 @@ TEST(TargetGate, OutputsSetWithoutATargetAreSentNeutral) {
   EXPECT_EQ(lines, 2u) << err;
 }
 
-// What a Target-driven node does: drive only from what get() returned.
+// What a Target-driven node does: drive only from what get() returned. It
+// has a second Target it never asks: any one of the node's Targets
+// returning a target lets the tick drive.
 struct Targeted {
-  explicit Targeted(Node& n) : target{n}, devices{n} {}
+  explicit Targeted(Node& n) : unasked{n}, target{n}, devices{n} {}
   void update() {
     if (const Goal* goal = target.get()) devices.Drive(goal->position_rot());
   }
+  Target<Goal> unasked;
   Target<Goal> target;
   GateDevices devices;
 };
@@ -1181,30 +1184,75 @@ TEST(TargetGate, OnlyAGetInsideThisUpdateCounts) {
   }
 }
 
-// Two Targets: it asks only the second, and drives from it.
-struct TwoTargets {
-  explicit TwoTargets(Node& n) : first{n}, second{n}, devices{n} {}
+// Drives from a live target each tick until told to throw: that update()
+// asks its Target, sets every output from the target, then throws. The
+// next update() asks and sets only as `ask` and `set` say.
+struct Throwing {
+  explicit Throwing(Node& n) : target{n}, devices{n} {}
   void update() {
-    if (const Goal* goal = second.get()) devices.Drive(goal->position_rot());
+    ++updates;
+    if (throw_now) {
+      throw_now = false;
+      if (target.get() != nullptr) devices.Drive(0.5);
+      throw std::runtime_error{"gate: update() failed"};
+    }
+    const bool live = ask && target.get() != nullptr;
+    if (set && (live || !ask)) devices.Drive(0.5);
   }
-  Target<Goal> first;
-  Target<Goal> second;
+  Target<Goal> target;
   GateDevices devices;
+  bool throw_now = false;
+  bool ask = true;
+  bool set = true;
+  int updates = 0;
 };
 
-// REQ-SAFE-41: per node, any one of its Targets lets the tick drive.
-TEST(TargetGate, AnyOfTheNodesTargetsLetsTheTickDrive) {
-  auto sim = Sim::FromToml(kGateToml);
-  sim.add<TwoTargets>("gate");
-  SimHardware hw{sim};
-  hw.enable();
-  hw.set_driver_station(DsPacket(kTeleop));
-  sim.step(10ms);
-  for (auto t = 0ms; t < 20ms; t += 5ms) {
+// An update() that throws after its Target returned a target and it set
+// every output leaves neither to the next tick's flush: the next update()
+// has an index of its own, so a tick that sets outputs without asking, or
+// that asks but sets nothing, is neutral. Only a harness that keeps
+// stepping after the throw (testing::Sim) reaches that tick.
+// REQ-SAFE-41, REQ-SAFE-03
+TEST(TargetGate, AThrownUpdateLeavesNothingToTheNextTick) {
+  struct Case {
+    const char* label;
+    bool ask;
+    bool set;
+  };
+  for (const auto& [label, ask, set] :
+       {Case{"sets without asking", false, true},
+        Case{"asks and sets nothing", true, false}}) {
+    SCOPED_TRACE(label);
+    auto sim = Sim::FromToml(kGateToml);
+    auto& gate = sim.add<Throwing>("gate");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_driver_station(DsPacket(kTeleop));
+    sim.step(10ms);
+    for (auto t = 0ms; t < 20ms; t += 5ms) {
+      PublishTarget(sim, "gate", "teleop", Goal{0.5});
+      sim.step(5ms);
+    }
+    ExpectDriving(hw, 0.5);
+
+    gate.throw_now = true;
     PublishTarget(sim, "gate", "teleop", Goal{0.5});
-    sim.step(5ms);
+    EXPECT_THROW(sim.step(5ms), std::runtime_error);
+    gate.ask = ask;
+    gate.set = set;
+    // Up to the next update(), wherever the throw left the Sim's clock.
+    const int before = gate.updates;
+    for (int i = 0; i < 4 && gate.updates == before; ++i) {
+      PublishTarget(sim, "gate", "teleop", Goal{0.5});
+      sim.step(5ms);
+    }
+    ASSERT_EQ(gate.updates, before + 1) << "one update() after the throw";
+    // Applied, not requested: an output the request omits keeps its last
+    // requested value in SimHardware's inspection view.
+    EXPECT_EQ(hw.applied_motor("gate", "m").mode, hardware::Mode::kNeutral);
+    EXPECT_FALSE(hw.applied_digital_output("gate", "led"));
+    EXPECT_EQ(hw.applied_pwm("gate", "servo"), 0.0);
   }
-  ExpectDriving(hw, 0.5);
 }
 
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {

@@ -73,7 +73,7 @@ The rules are ARCHITECTURE.md
 | Python reaches talOS only through `talOS/node_api` | **[enforced]** for the ABI: `//talOS/python:api_parity_test`, `node_api.cc` `static_assert`s; for Bazel dependencies: `tools/check_layers.py`; **[review]** for "reimplements no wire format" |
 | Only the devices-layer flush writes `/hw/request/<node>` | **[enforced]** for `publish`/`publish_bytes` and `LintGraph`; **[gap: ARCH-2]** for `detail::NodeAccess` and raw RTMS publishers, which node code can still reach |
 | Output setters only inside `update()` | **[enforced]**: they throw elsewhere |
-| Actuation needs `robot_enabled` and a live `Target` | **[enforced]**: the devices flush (REQ-SAFE-41); its opt-out, `AllowUntargetedOutputs`, is marked on the node's hardware request in `--describe` and the registry (REQ-SAFE-42) |
+| Actuation needs `robot_enabled` and a live `Target` | **[enforced]** for "a live target exists this tick": the devices flush (REQ-SAFE-41); its opt-out, `AllowUntargetedOutputs`, is marked on the node's hardware request in `--describe` and the registry (REQ-SAFE-42); **[review]** for "the outputs derive from that target": the flush cannot tell a demand taken from the target from one taken from a joystick or a value kept from an earlier tick |
 | One writer per topic; naming; schema identity; reader cap | **[enforced]**: `LintGraph` at launch and `--describe-only`, `talos_graph_test`, `talos_messages` at BUILD load, `//talOS/build:topic_grammar_test` |
 | `[[subsystems]]` is the only node list | **[enforced]**: `manifest_sync_test`, the `talos_bundle` build action |
 

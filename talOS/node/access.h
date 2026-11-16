@@ -122,8 +122,11 @@ struct NodeAccess {
   // subscription wakes it regardless. Call before start(); throws
   // std::out_of_range for an index add_subscription did not return.
   static void require_immediate_delivery(Node& node, std::size_t subscription);
-  // Index of the update() currently running, or of the next one between
-  // ticks. State machines stamp transitions with it.
+  // Index of the update() currently running (1 for the first), or between
+  // ticks of the last one to run, which the after_update hooks read; an
+  // update() that threw keeps its index, so the next one never shares it.
+  // State machines stamp transitions with it, a Target its READ log entry
+  // and its live target, and the devices layer each output it sets.
   static std::uint64_t next_update(const Node& node);
   // [robot] command_timeout_us: how old a message may be and still be fresh.
   static std::chrono::nanoseconds freshness_timeout(const Node& node);

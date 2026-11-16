@@ -842,9 +842,10 @@ inline std::vector<Diagnostic> LintGraph(
     if (!reads_a_lane)
       add(Severity::WARNING, node.name,
           "writes " + request->name +
-              " but reads no target lane and does not opt out, so the "
-              "devices flush keeps every output neutral (RULES.md 1); set "
-              "outputs only while a talos::Target's get() returns a target");
+              " but reads no target lane of its own and does not opt out, so "
+              "the devices flush keeps every output neutral (RULES.md 1); "
+              "set each output from the target its talos::Target's get() "
+              "returns");
   }
 
   if (require_target_coverage) {

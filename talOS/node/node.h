@@ -145,7 +145,7 @@ class Node {
   // declares otherwise. False under testing::Sim, in replay and in a run.
   bool describing() const;
   Time now() const;
-  std::uint64_t tick() const;  // update() calls completed so far
+  std::uint64_t tick() const;  // update() calls so far, one that threw included
   Duration period() const;     // [subsystem] period_us, else [robot] period_us
   const std::string& config_path() const;  // the robot config (--config)
   // The session output directory the launcher started this node under: the

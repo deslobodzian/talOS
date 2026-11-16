@@ -264,15 +264,24 @@ struct Node::Impl {
       slot->updated = slot->pending;
       slot->pending = false;
     }
-    if (impl->update) {
-      struct InUpdate {
-        bool& flag;
-        explicit InUpdate(bool& f) : flag{f} { flag = true; }
-        ~InUpdate() { flag = false; }
-      } in_update{impl->in_update};
-      impl->update();
+    {
+      // The call counts even when update() throws, so the next update()
+      // has an index of its own (NodeAccess::next_update): nothing stamped
+      // with this one's, a live target, a set output, a state entered or a
+      // logged READ, is taken for the next one's.
+      struct Counted {
+        std::uint64_t& ticks;
+        ~Counted() { ++ticks; }
+      } counted{impl->ticks};
+      if (impl->update) {
+        struct InUpdate {
+          bool& flag;
+          explicit InUpdate(bool& f) : flag{f} { flag = true; }
+          ~InUpdate() { flag = false; }
+        } in_update{impl->in_update};
+        impl->update();
+      }
     }
-    ++impl->ticks;
     for (const auto& hook : impl->after_update) hook();
   }
 };
