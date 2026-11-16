@@ -226,6 +226,9 @@ class WarmUpTest(unittest.TestCase):
                  for r in self.records() if r[0] == "native"]
         self.assertEqual(marks, [(os.path.join(bundle, rel), "-")],
                          proc.stdout + proc.stderr)
+        # Counted as loaded, not by what a library prints when loaded
+        # (the marking one prints two lines).
+        self.assertIn(" and 2 native libraries in ", proc.stdout)
 
     # REQ-OPS-47: a native-library pass that dies counts only the libraries
     # it loaded and is named as not warmed.

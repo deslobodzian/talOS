@@ -159,8 +159,9 @@ members.append(("launcher", "launcher", ["--help"]))
 # each failure: their static initializers run there, nothing calls into them,
 # and it exits without running any destructor. Linux charges nothing, so it is
 # skipped there.
-# It writes a line to stdout as each load returns, unbuffered, so a loader
-# that dies part way says how many it loaded.
+# It writes a line to the descriptor it is given (argv[2]; not stdout,
+# which a loaded library may print to) as each load returns, unbuffered,
+# so a loader that dies part way says how many it loaded.
 NATIVE_LOADER = r"""
 import ctypes, os, sys
 for root, _, files in os.walk(sys.argv[1]):
@@ -171,7 +172,7 @@ for root, _, files in os.walk(sys.argv[1]):
                 ctypes.CDLL(path, mode=os.RTLD_LAZY | os.RTLD_LOCAL)
             except OSError:
                 pass
-            os.write(1, b"loaded\n")
+            os.write(int(sys.argv[2]), b"loaded\n")
 os._exit(0)
 """
 natives = 0
@@ -229,15 +230,19 @@ def ended(code):
     return f"exited {code}"
 
 
-def warm(label, binary, args, out, err):
-    """Runs one member; returns None when it exited 0, else how it ended."""
+def warm(label, binary, args, err, marks=None):
+    """Runs one member; returns None when it exited 0, else how it ended.
+    With `marks`, a file, the member gets its descriptor as its last
+    argument."""
     proc = None
+    passed = (marks.fileno(),) if marks else ()
     try:
         # Its own process group, so a hung member is killed whole.
         proc = subprocess.Popen(
-            [os.path.join(bundle, binary)] + args, cwd=bundle, env=env,
-            stdin=subprocess.DEVNULL, stdout=out, stderr=err,
-            start_new_session=True)
+            [os.path.join(bundle, binary)] + args
+            + [str(fd) for fd in passed], cwd=bundle, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+            pass_fds=passed, start_new_session=True)
     except OSError as e:
         warn(f"{label}: cannot run {binary}: {e}")
         return "could not run"
@@ -269,13 +274,12 @@ missed = []
 try:
     for index, (label, binary, args) in enumerate(members):
         native = natives and index == len(members) - 1
-        with tempfile.TemporaryFile() as out, \
+        with tempfile.TemporaryFile() as marks, \
                 tempfile.TemporaryFile() as err:
-            why = warm(label, binary, args,
-                       out if native else subprocess.DEVNULL, err)
+            why = warm(label, binary, args, err, marks if native else None)
             if native:
-                out.seek(0)
-                loaded = out.read().count(b"\n")
+                marks.seek(0)
+                loaded = marks.read().count(b"\n")
         if why is not None:
             missed.append(f"{label} ({why})")
         elif not native:

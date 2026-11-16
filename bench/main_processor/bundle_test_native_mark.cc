@@ -1,7 +1,9 @@
 // warm_up_test only: a native library whose load leaves a mark. Its
 // constructor appends `native <its path> <what $STUB_PREFIX/current selects,
 // or ->` to $STUB_LOG, as warm_up_test.py's stub executables record a run.
-// With $STUB_NATIVE_KILL set, it then kills the loading process.
+// It then writes two lines to its process's stdout, as a library that
+// prints when loaded does, and with $STUB_NATIVE_KILL set kills the loading
+// process.
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -35,6 +37,10 @@ __attribute__((constructor)) void Mark() {
     // Nothing to report to: the test then finds no mark.
   }
   close(fd);
+  constexpr char kPrinted[] = "loaded\nloaded\n";
+  if (write(STDOUT_FILENO, kPrinted, sizeof kPrinted - 1) < 0) {
+    // Nobody reads it: the count must not either.
+  }
   if (std::getenv("STUB_NATIVE_KILL") != nullptr) std::raise(SIGKILL);
 }
 
