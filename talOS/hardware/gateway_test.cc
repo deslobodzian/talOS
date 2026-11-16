@@ -3234,8 +3234,7 @@ TEST(PhysicsSimBackend, RestoringChainIsInvalidAsOnTheRobot) {
 // it (retried at the gateway's backoff, 250 ms then 500 ms), so every State
 // until then is total loss; the pair drives again only once a restore
 // succeeds, on a command observing a State read after it. The gateway's mask
-// of the unavailable pair decides this, whatever the backend reads for it
-// (TODO.md SIM-12).
+// of the unavailable pair decides this, whatever the backend reads for it.
 template <typename SimulatedBackend>
 void ExpectFailingRestoreKeepsPairInvalid(SimulatedBackend& backend) {
   Gateway g{MasterFollowerConfig(), backend, 1};
