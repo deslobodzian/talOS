@@ -169,9 +169,13 @@ bazel fetch //...
 ```
 
 This downloads every repository `//...` needs and runs rules_python's `pip`
-module extension. Afterwards `bazel build` and `bazel test` of `//...` in
-that checkout download nothing, also after a Bazel server restart or a
-changed flag (such as `--test_env` or `--config`).
+module extension. Afterwards, in a fresh output base with the network off,
+that checkout downloads nothing to analyse all of `//...` (`bazel build
+--nobuild //...`), build `//talOS/mechanisms:all` and `//talOS/python/...`,
+or test a package with a changed `--test_env`, also after a Bazel server
+restart. Unchecked offline: a full `bazel build //...` and `bazel test
+//...`, a changed `--config`, the RoboRIO program's Gradle build and
+Studio's pnpm build.
 
 The `pip` extension is the step that needs the network again. Each time it
 runs, it reads two PyPI index pages, `https://pypi.org/simple/gevent/` and
