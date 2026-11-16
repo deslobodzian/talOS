@@ -784,6 +784,28 @@ TEST(TargetLane, StampsTheGenerationItsNodeDrained) {
   EXPECT_EQ(seen_target.position_rot(), 0.75);
 }
 
+// REQ-SAFE-12: once its node's Driver Station view is stale, a lane stamps 0
+// though the producer keeps sending and the robot stays enabled
+TEST(TargetLane, StampsZeroOnceItsNodesDriverStationViewIsStale) {
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Producer>("producer");
+  sim.add<Consumer<Goal>>("lift");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(20ms);
+  auto envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(envelope.has_value());
+  ASSERT_NE(envelope->mode_since_us(), 0u);
+
+  hw.stop_driver_station();
+  sim.step(150ms);  // past command_timeout_us (100 ms)
+  envelope = LatestTarget<Goal>(sim, "lift", "teleop");
+  ASSERT_TRUE(envelope.has_value());
+  EXPECT_EQ(envelope->active, 1);
+  EXPECT_EQ(envelope->mode_since_us(), 0u);
+}
+
 // A producer with its own lane, for the remapped config.
 struct BlindProducer {
   explicit BlindProducer(Node& node) : lane{node, "lift", "align"} {}
