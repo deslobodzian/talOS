@@ -68,11 +68,13 @@ std::optional<bool> SessionSimulation(const std::filesystem::path& dir);
 // Nodes are read smallest first, each log streamed, until one holds such a
 // packet (event::log::VisitLog). kUnknown when none does but a log is of
 // another format version (or not a log), or holds a packet this build cannot
-// decode. The verdict is cached in kSessionClassFile and read before any log
-// is opened: a match for good, kOther until the session's event log bytes
-// change, kUnknown until they change or this build's reader (log format,
-// Packet size, Driver Station codec) differs; with ClassCache::kReadOnly it
-// is read but never written. Never throws.
+// decode; and when the session's manifest records a hardware protocol other
+// than this build's (its Driver Station packets are not decoded). The verdict
+// is cached in kSessionClassFile and read before any log is opened: a match for
+// good, kOther and kUnknown until the session's event log bytes change or this
+// build's reader (log format, Packet size, Driver Station codec sizes, hardware
+// protocol) differs; with ClassCache::kReadOnly it is read but never written.
+// Never throws.
 MatchVerdict RecordedMatch(const std::filesystem::path& dir,
                            ClassCache cache = ClassCache::kReadWrite);
 

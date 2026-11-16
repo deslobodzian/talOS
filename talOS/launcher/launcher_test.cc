@@ -38,8 +38,10 @@
 #include "talOS/launcher/file_digest.h"
 #include "talOS/launcher/log_budget.h"
 #include "talOS/launcher/log_merge.h"
+#include "talOS/launcher/session_retention.h"
 #include "talOS/launcher/testdata/first_exec.h"
 #include "talOS/launcher/testdata/supervision_events.h"
+#include "talOS/protocol/types.h"
 
 namespace talos::launcher {
 namespace {
@@ -2514,6 +2516,34 @@ TEST(LauncherSessions, RetentionProtectsOnlyTheNewestUnclassifiableSessions) {
   for (const int id : {2, unknown, pit, pit + 1}) {
     EXPECT_TRUE(std::filesystem::exists(dir(id) + "/manifest.json")) << id;
   }
+  std::filesystem::remove_all(root);
+}
+
+// REQ-OPS-51: retention reads a session's Driver Station packets only under
+// the hardware protocol they were recorded in. A session whose manifest
+// records another is unknown (kept like a match), not `other` (removed
+// first) from packets decoded in this build's layout. An `other` verdict a
+// build of another protocol cached is read again, not trusted: here a
+// session the cached line calls `other` whose log shows the FMS.
+TEST(LauncherSessions, ClassifiesOnlyUnderTheRecordedHardwareProtocol) {
+  const std::string root = TempPath("protocol_class");
+  std::filesystem::remove_all(root);
+  SessionManifest manifest;
+  manifest.session_id = 1;
+  manifest.start_wall_ns = 1'001'000'000'000;
+  manifest.hardware_protocol_version = protocol::kProtocolVersion - 1;
+  const std::string other = root + "/1";
+  std::filesystem::create_directories(other);
+  std::ofstream{other + "/manifest.json"} << manifest.ToJson();
+  WriteDriverStationLog(other, "late", 1, {false});
+  EXPECT_EQ(InspectSession(other).verdict, MatchVerdict::kUnknown);
+
+  const std::string cached = root + "/2";
+  WriteSessionManifest(cached, 2, 1002);
+  WriteDriverStationLog(cached, "late", 2, {true});
+  std::ofstream{cached + "/" + std::string{kSessionClassFile}}
+      << "other " << std::filesystem::file_size(cached + "/late.tlog") << "\n";
+  EXPECT_EQ(InspectSession(cached).verdict, MatchVerdict::kMatch);
   std::filesystem::remove_all(root);
 }
 

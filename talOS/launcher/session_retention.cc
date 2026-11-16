@@ -22,6 +22,8 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/manifest.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/launcher/hardware_record.h"
+#include "talOS/protocol/types.h"
 
 namespace talos::launcher {
 namespace {
@@ -44,12 +46,15 @@ std::string_view JsonValue(std::string_view json, std::string_view key) {
   return json.substr(0, json.find_first_of(",\n}"));
 }
 
-// What this build can read: an unknown verdict holds until it changes.
+// What this build can read: an `other` or `unknown` verdict holds until it
+// changes. The hardware protocol is in it because the Driver Station codec
+// changes with it whatever its sizes do.
 std::string ReaderIdentity() {
   return "log" + std::to_string(tlog::FORMAT_VERSION) + ".packet" +
          std::to_string(sizeof(hardware::Packet)) + ".ds" +
          std::to_string(driver_station::kFixedEncodedSize) + "-" +
-         std::to_string(driver_station::kMaxEncodedSize);
+         std::to_string(driver_station::kMaxEncodedSize) + ".hw" +
+         std::to_string(protocol::kProtocolVersion);
 }
 
 enum class Seen : std::uint8_t { kNothing, kDriverStation, kUnreadable, kFms };
@@ -164,13 +169,23 @@ MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {
     std::string verdict;
     std::string identity;
     std::uintmax_t bytes = 0;
+    // A match holds whichever build cached it: dropping it could only
+    // let a match go first. `other` and `unknown` hold for this reader.
     if (cached >> verdict >> bytes) {
       if (verdict == "match") return MatchVerdict::kMatch;
-      if (verdict == "other" && bytes == log_bytes) return MatchVerdict::kOther;
-      if (verdict == "unknown" && bytes == log_bytes && cached >> identity &&
-          identity == reader)
-        return MatchVerdict::kUnknown;
+      if ((verdict == "other" || verdict == "unknown") && bytes == log_bytes &&
+          cached >> identity && identity == reader) {
+        return verdict == "other" ? MatchVerdict::kOther
+                                  : MatchVerdict::kUnknown;
+      }
     }
+  }
+  // Packets of another protocol are not read with this build's codec
+  // (REQ-OPS-51). A session whose manifest records no version is read as
+  // before: a packet the codec rejects makes it unknown.
+  if (const auto recorded = RecordedProtocolVersion({dir.string()});
+      recorded && *recorded != protocol::kProtocolVersion) {
+    return MatchVerdict::kUnknown;
   }
 
   // Each node's logs (`<name>.tlog`, `<name>.restart<k>.tlog`,
@@ -208,7 +223,7 @@ MatchVerdict RecordedMatch(const fs::path& dir, ClassCache cache_mode) {
       out << "match " << log_bytes << "\n";
       break;
     case MatchVerdict::kOther:
-      out << "other " << log_bytes << "\n";
+      out << "other " << log_bytes << " " << reader << "\n";
       break;
     case MatchVerdict::kUnknown:
       out << "unknown " << log_bytes << " " << reader << "\n";

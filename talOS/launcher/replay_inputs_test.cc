@@ -20,6 +20,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -48,6 +49,7 @@
 #include "talOS/launcher/launcher.h"
 #include "talOS/launcher/spawn.h"
 #include "talOS/launcher/testdata/first_exec.h"
+#include "talOS/protocol/types.h"
 
 namespace talos::launcher {
 namespace {
@@ -619,6 +621,33 @@ TEST_F(ReplayInputsTest, AReplayedNodeKeepsNoSessionState) {
   EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_graph_reader.record"));
 
   std::filesystem::remove_all(out);
+}
+
+// REQ-OPS-51: a session whose manifest records another hardware protocol is
+// not replayed: its States would reach the node's devices layer decoded
+// with this build's layout (an equal-length change decodes, wrongly), and a
+// replay is compared with the recording, which another protocol's run
+// cannot match. The node is not started, so it writes no log.
+TEST_F(ReplayInputsTest, ASessionOfAnotherHardwareProtocolIsRefused) {
+  Record();
+  const std::string session = CopyOfSession("other_protocol");
+  {
+    std::ifstream in{session + "/manifest.json"};
+    std::string text{std::istreambuf_iterator<char>{in}, {}};
+    const std::string field = "\"hardware_protocol_version\": ";
+    const auto at = text.find(field);
+    ASSERT_NE(at, std::string::npos) << text;
+    const auto end = text.find(',', at);
+    text.replace(at + field.size(), end - at - field.size(),
+                 std::to_string(protocol::kProtocolVersion - 1));
+    std::ofstream{session + "/manifest.json"} << text;
+  }
+  const std::string out = TempPath("other_protocol_out");
+  std::filesystem::remove_all(out);
+  EXPECT_NE(Replay("replay_consumer", out, session), 0);
+  EXPECT_FALSE(std::filesystem::exists(out + "/1/replay_consumer.tlog"));
+  std::filesystem::remove_all(out);
+  std::filesystem::remove_all(TempPath("other_protocol"));
 }
 
 TEST_F(ReplayInputsTest, RefusesToWriteIntoTheSessionItReads) {
