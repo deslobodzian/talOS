@@ -20,10 +20,12 @@
 #include "continuity_test/continuity_message_generated.h"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "talOS/configuration/config_parser.h"
+#include "talOS/driver_station/driver_station.h"
 #include "talOS/events/context.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/protocol/types.h"
 
 namespace {
 
@@ -265,6 +267,85 @@ can_id = 2
                       "\"demand\":6,"),
             std::string::npos)
       << json;
+}
+
+// Guards: a session recorded under another hardware protocol (here a State
+// of protocol 7's length, 13 bytes shorter than this build's) is said so in
+// one line naming this build's version, and none of its hardware packets is
+// decoded with this build's codecs, the Driver Station packet that happens
+// to decode included: no per-record error, no `hardware`, no `ds_enabled`.
+// Topics with a schema decode as before, and the dump exits 0.
+// REQ-OPS-15
+TEST_F(LogDumpTest, HardwarePacketsOfAnotherProtocolAreNamedOnceNotDecoded) {
+  namespace hw = talos::hardware;
+  using D = talos::Descriptor<hw::Packet>;
+  const auto topic = [](std::uint16_t id, const char* name) {
+    talos::event::Registration source;
+    source.id = id;
+    source.kind = talos::event::SourceKind::SENDER;
+    source.name = name;
+    source.message_bytes = sizeof(hw::Packet);
+    source.schema = {std::string{D::kName}, D::kHash, {}};
+    return source;
+  };
+  talos::event::log::LogWriter writer{
+      directory_ + "/hardware_node.tlog", "hardware_node",
+      talos::event::log::LogWriterOptions{1 << 16, 1, false}, 42};
+  writer.start({topic(1, hw::kStateTopic), topic(2, hw::kDriverStationTopic)},
+               talos::event::MonotonicTime::from_nanos(1'000'000'000));
+  const auto send = [&](std::uint16_t source, int ms, const hw::Packet& p) {
+    talos::event::Context ctx{};
+    ctx.kind = talos::event::EventKind::SEND;
+    ctx.source_id = source;
+    ctx.dispatch_index = static_cast<std::uint64_t>(ms) + 1;
+    ctx.event_time =
+        talos::event::MonotonicTime::from_nanos(1'000'000'000 + ms * 1'000'000);
+    ctx.now = ctx.event_time;
+    ctx.publish_time = ctx.event_time;
+    writer.dispatch(ctx, std::as_bytes(std::span{&p, 1}));
+  };
+  talos::driver_station::DriverStationData enabled;
+  enabled.fms.flags =
+      talos::driver_station::kDsAttached | talos::driver_station::kEnabled;
+  hw::Packet ds{};
+  ds.size = static_cast<std::uint32_t>(
+      talos::driver_station::Encode(enabled, ds.data));
+  send(2, 1, ds);
+  for (const int ms : {2, 7, 12}) {
+    // Protocol 8 grew the State by 13 bytes (one CAN bus sample per State).
+    hw::Packet state{};
+    state.size =
+        static_cast<std::uint32_t>(hw::Encode(hw::State{}, state.data)) - 13;
+    send(1, ms, state);
+  }
+  writer.flush();
+  ASSERT_FALSE(writer.failed()) << writer.error();
+
+  const auto output = Run({"--format", "jsonl"});
+  std::vector<std::string> lines;
+  std::istringstream stream{output};
+  for (std::string line; std::getline(stream, line);) lines.push_back(line);
+  const auto named = std::count_if(lines.begin(), lines.end(), [](auto& l) {
+    return l.find("hardware packets not decoded") != std::string::npos;
+  });
+  ASSERT_EQ(named, 1) << output;
+  const auto line = *std::find_if(lines.begin(), lines.end(), [](auto& l) {
+    return l.find("hardware packets not decoded") != std::string::npos;
+  });
+  EXPECT_NE(line.find("protocol " +
+                      std::to_string(talos::protocol::kProtocolVersion)),
+            std::string::npos)
+      << line;
+  EXPECT_NE(line.find(hw::kStateTopic), std::string::npos) << line;
+  EXPECT_EQ(output.find("\"error\""), std::string::npos) << output;
+  EXPECT_EQ(output.find("\"hardware\""), std::string::npos) << output;
+  EXPECT_EQ(output.find("\"ds_enabled\""), std::string::npos) << output;
+  EXPECT_NE(output.find("\"process\":\"alpha\",\"dispatch_index\":2,"),
+            std::string::npos)
+      << output;
+  EXPECT_NE(output.find("\"decoded\":\"{run_index: 7, sequence_count: 9}\""),
+            std::string::npos)
+      << output;
 }
 
 // Guards: a log named more than once (as itself, twice, and through its

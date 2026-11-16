@@ -174,24 +174,44 @@ void ExportPayloadHex(std::span<const std::byte> payload) {
   std::cout << '"';
 }
 
+// The hardware packet topic a record carries (hardware_record.h); kNone for
+// any other record and for one without a payload.
+talos::launcher::HardwareRecord HardwareKind(
+    const talos::launcher::MergedRecord& r) {
+  if (r.source == nullptr || r.payload.empty()) {
+    return talos::launcher::HardwareRecord::kNone;
+  }
+  return talos::launcher::HardwareRecordOf(r.source_name(),
+                                           r.source->schema.name);
+}
+
+// How the hardware packets are decoded: with this build's codecs only when
+// the session was recorded under this build's protocol
+// (HardwareProtocolCheck), and their devices named from `names` (may be
+// null).
+struct HardwareDecoding {
+  bool decode{true};
+  const talos::launcher::DeviceNames* names{nullptr};
+};
+
 // The hardware packet topics' decoded JSON object (hardware_record.h), or
-// empty for any other record.
+// empty for any other record and while `hardware.decode` is false.
 std::string HardwareJson(const talos::launcher::MergedRecord& r,
-                         const talos::launcher::DeviceNames* names) {
-  if (r.source == nullptr || r.payload.empty()) return "";
-  const auto kind =
-      talos::launcher::HardwareRecordOf(r.source_name(), r.source->schema.name);
-  if (kind == talos::launcher::HardwareRecord::kNone) return "";
-  return talos::launcher::HardwareRecordJson(kind, r.payload, names);
+                         const HardwareDecoding& hardware) {
+  const auto kind = HardwareKind(r);
+  if (!hardware.decode || kind == talos::launcher::HardwareRecord::kNone) {
+    return "";
+  }
+  return talos::launcher::HardwareRecordJson(kind, r.payload, hardware.names);
 }
 
 // Defined after DecodedFields, which it walks.
 std::string AlertsJson(std::string_view topic, const std::string& decoded);
 
 void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
-                  bool json, const talos::launcher::DeviceNames* names) {
+                  bool json, const HardwareDecoding& decoding) {
   const std::string schema = r.source == nullptr ? "" : r.source->schema.name;
-  const std::string hardware = HardwareJson(r, names);
+  const std::string hardware = HardwareJson(r, decoding);
   const std::string decoded =
       !schema.empty() && !r.payload.empty()
           ? talos::schema::DecodeToText(r.source->schema, r.payload)
@@ -219,7 +239,8 @@ void ExportRecord(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
       std::cout << ",\"alerts\":" << alerts;
     }
     if (!hardware.empty()) std::cout << ",\"hardware\":" << hardware;
-    if (r.source_name() == talos::hardware::kDriverStationTopic &&
+    if (decoding.decode &&
+        r.source_name() == talos::hardware::kDriverStationTopic &&
         r.payload.size() == sizeof(talos::hardware::Packet)) {
       talos::hardware::Packet packet{};
       std::memcpy(&packet, r.payload.data(), sizeof(packet));
@@ -377,7 +398,7 @@ std::string AlertsJson(std::string_view topic, const std::string& decoded) {
 class TopicSummary {
  public:
   void Add(const talos::launcher::MergedRecord& r, std::int64_t base_ns,
-           const talos::launcher::DeviceNames* names) {
+           const HardwareDecoding& decoding) {
     ++records_[{r.process_name(), EventKindName(r.header.kind)}];
     // A timer's record has no publication; its event time stands in.
     const std::int64_t published = r.header.publish_time_ns != 0
@@ -386,7 +407,7 @@ class TopicSummary {
     first_ms_ = std::min(first_ms_, ToMillis(base_ns, published));
     last_ms_ = std::max(last_ms_, ToMillis(base_ns, published));
     if (r.source == nullptr || r.payload.empty()) return;
-    if (const auto hardware = HardwareJson(r, names); !hardware.empty()) {
+    if (const auto hardware = HardwareJson(r, decoding); !hardware.empty()) {
       hardware_ = hardware;
     }
     if (r.source->schema.name.empty()) return;
@@ -510,27 +531,36 @@ int main(int argc, char** argv) {
   }
 
   const auto device_names = LoadDeviceNames(options);
-  const talos::launcher::DeviceNames* names =
-      device_names ? &*device_names : nullptr;
+  HardwareDecoding decoding{.names = device_names ? &*device_names : nullptr};
 
   // The session is streamed twice, a fixed window per log, never held: once
   // for the baseline every time is relative to (the earliest event time of
-  // any record, not necessarily the first merged) and the record count,
-  // warning about damage then, before any output; once to print.
+  // any record, not necessarily the first merged), the record count and
+  // whether its hardware packets are of this build's protocol, warning about
+  // damage and another protocol then, before any output; once to print.
   using talos::launcher::MergedRecord;
   std::int64_t base_ns = 0;
   std::size_t total_count = 0;
+  talos::launcher::HardwareProtocolCheck protocol;
   if (!talos::launcher::MergeLogs(
           log_files,
           [&](const MergedRecord& r) {
             if (total_count++ == 0 || r.header.event_time_ns < base_ns) {
               base_ns = r.header.event_time_ns;
             }
+            if (const auto kind = HardwareKind(r);
+                kind != talos::launcher::HardwareRecord::kNone) {
+              protocol.Add(kind, r.source_name(), r.payload);
+            }
             return true;
           },
           error)) {
     std::fprintf(stderr, "log_dump error: %s\n", error.c_str());
     return 1;
+  }
+  if (protocol.foreign()) {
+    std::fprintf(stderr, "log_dump: %s\n", protocol.Warning().c_str());
+    decoding.decode = false;
   }
   const auto print = [&](const std::function<void(const MergedRecord&)>& each) {
     if (!talos::launcher::MergeLogs(
@@ -554,7 +584,7 @@ int main(int argc, char** argv) {
       if (at == topics.end()) {
         at = topics.emplace(std::string{r.source_name()}, TopicSummary{}).first;
       }
-      at->second.Add(r, base_ns, names);
+      at->second.Add(r, base_ns, decoding);
     });
     if (!read) return 1;
     const char* separator = "";
@@ -574,7 +604,7 @@ int main(int argc, char** argv) {
              "hardware\r\n";
     }
     return print([&](const MergedRecord& r) {
-      ExportRecord(r, base_ns, options.format == "jsonl", names);
+      ExportRecord(r, base_ns, options.format == "jsonl", decoding);
     })
                ? 0
                : 1;
@@ -623,7 +653,7 @@ int main(int argc, char** argv) {
           "      %s %s\n", r.source->schema.name.c_str(),
           talos::schema::DecodeToText(r.source->schema, r.payload).c_str());
     }
-    if (const auto hardware = HardwareJson(r, names); !hardware.empty()) {
+    if (const auto hardware = HardwareJson(r, decoding); !hardware.empty()) {
       std::printf("      hardware %s\n", hardware.c_str());
     }
   });

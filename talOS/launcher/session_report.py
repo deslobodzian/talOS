@@ -66,6 +66,12 @@ TARGET_AGE_LIMIT_MS = 25
 # damaged tail: the file, then its byte offsets (LogReader, DescribeDamage).
 DAMAGED_LOG = re.compile(r"^warning: (damaged log .*)$", re.MULTILINE)
 
+# log_dump's one stderr line for a session whose hardware packets this
+# build's codecs reject: recorded under another hardware protocol, so
+# log_dump decoded none of them (talOS/launcher/hardware_record.h).
+HARDWARE_NOT_DECODED = re.compile(r"^log_dump: warning: (hardware packets not decoded: .*)$",
+                                  re.MULTILINE)
+
 
 # The loops on the actuation path (talOS/process LoopTier): a gap in one is a
 # gap in a hardware request (ARCHITECTURE.md "The tick").
@@ -276,7 +282,11 @@ def controller_link(states, state_source, status_records, status_source):
     return False, False, None, "no /hw/state or /hw/status record"
 
 
-def analyze(manifest, records, log_damage=(), output_drops=None):
+def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_decoded=None):
+    # hardware_not_decoded: log_dump's line for a session recorded under
+    # another hardware protocol. Its Driver Station packets were not decoded,
+    # so nothing that needs the enabled bit is measured; /hw/state cadence
+    # uses only record times and still is.
     source, states = stream(records, "/hw/state")
     _, ds = stream(records, "/hw/state/driver_station")
     ds = [r for r in ds if "ds_enabled" in r]
@@ -336,9 +346,11 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
             item["fraction"] = sum(values) / len(values)
         status_summary[field] = item
     verdicts = []
-    def verdict(name, measured, passes, detail, required=True):
+    def verdict(name, measured, passes, detail, required=True, needs_hardware=False):
         # --strict requires every required verdict to PASS. Informational rows
         # have no recorded input or no acceptance threshold and never pass.
+        if needs_hardware and hardware_not_decoded:
+            measured, detail = False, f"{detail}; {hardware_not_decoded}"
         verdicts.append({"measurement": name, "verdict": "NOT MEASURED" if not measured else
                          "PASS" if passes else "FAIL", "required": required, "detail": detail})
     link_measured, link_passes, first_state_ms, link_detail = controller_link(
@@ -348,11 +360,14 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
         s = stats(values)
         verdict(name + " state median", s is not None,
                 s is not None and 4 <= s["median_ms"] <= 6,
-                "about 5 ms interpreted as 4–6 ms (analysis tolerance, not an additional bring-up requirement)")
+                "about 5 ms interpreted as 4–6 ms (analysis tolerance, not an additional bring-up requirement)",
+                needs_hardware=name == "enabled")
         verdict(name + " state p99", s is not None,
-                s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank")
+                s is not None and s["p99_ms"] < 10, "p99 < 10 ms; nearest rank",
+                needs_hardware=name == "enabled")
     gaps = sum(v >= 100 for v in enabled)
-    verdict("enabled state gaps", bool(enabled), gaps == 0, f"{gaps} gaps >= 100 ms")
+    verdict("enabled state gaps", bool(enabled), gaps == 0, f"{gaps} gaps >= 100 ms",
+            needs_hardware=True)
     worst = max(((max(v), k) for k, v in tick_ages.items()), default=None)
     unselected = sorted(enabled_lane_processes - {k.split(":", 1)[0] for k in tick_ages})
     bound = (f"selected target age at the tick <= {TARGET_AGE_LIMIT_MS} ms per process:lane "
@@ -369,8 +384,11 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
         detail = f"{bound}; no target-lane MESSAGE records"
     else:
         detail = f"{bound}; no active target lane dispatched while enabled"
+    # Without the enabled bit a lane Target never selected cannot be found,
+    # so the worst selected age alone would pass a session that has one.
     verdict("target age at tick", worst is not None or bool(unselected),
-            worst is not None and not unselected and worst[0] <= TARGET_AGE_LIMIT_MS, detail)
+            worst is not None and not unselected and worst[0] <= TARGET_AGE_LIMIT_MS, detail,
+            needs_hardware=True)
     verdict("timer lateness", False, False,
             "Measured where TIMER dispatches exist; no acceptance threshold is specified.",
             required=False)
@@ -378,7 +396,7 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
     # The enabled-only rows above stay required (REQ-RT-15); in a session
     # that never enabled they cannot be measured, which is no tool fault.
     never_enabled = None
-    if not enabled and not any(r["ds_enabled"] for r in ds):
+    if not hardware_not_decoded and not enabled and not any(r["ds_enabled"] for r in ds):
         never_enabled = ("robot never enabled (no Driver Station packet with enabled set)"
                          if ds else "no Driver Station packet recorded")
     issues = [] if manifest.get("end_wall_ns") else [
@@ -389,6 +407,8 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
                for flag in ("quarantined", "recorder_failed", "log_capped") if n.get(flag)]
     # A record the reader skipped is missing from every measurement above.
     issues += list(log_damage)
+    if hardware_not_decoded:
+        issues.append(hardware_not_decoded)
     simulation = bool(manifest.get("simulation"))
     realtime_issues = [issue for issue in (realtime_issue(n, simulation)
                                            for n in manifest["nodes"]) if issue]
@@ -433,6 +453,9 @@ def analyze(manifest, records, log_damage=(), output_drops=None):
             "timer_lateness": {k: stats(v) for k, v in sorted(timers.items())},
             "bridge_request_to_command": {"process": bridge, "latency": stats(bridge_delays)},
             "never_enabled": never_enabled,
+            # log_dump's line, or null: the session's hardware packets were
+            # recorded under another protocol and not decoded.
+            "hardware_not_decoded": hardware_not_decoded,
             "status_stream": status_source, "status": status_summary,
             # alert_summary(); informational, as the operator-visibility
             # design has it: --strict does not judge alerts.
@@ -570,9 +593,11 @@ def main():
         manifest = json.loads((args.session / "manifest.json").read_text())
         result = subprocess.run([log_dump_path(), "--format", "jsonl", str(args.session)],
                                 capture_output=True, text=True, check=True)
+        not_decoded = HARDWARE_NOT_DECODED.search(result.stderr)
         report = analyze(manifest, [json.loads(line) for line in result.stdout.splitlines()],
                          DAMAGED_LOG.findall(result.stderr),
-                         launcher_drops(args.session, manifest))
+                         launcher_drops(args.session, manifest),
+                         not_decoded[1] if not_decoded else None)
         print(json.dumps(report, indent=2) if args.json else markdown(report))
         if not args.strict:
             return 0

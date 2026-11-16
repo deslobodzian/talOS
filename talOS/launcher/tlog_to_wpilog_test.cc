@@ -42,6 +42,7 @@
 #include "talOS/hardware/config.h"
 #include "talOS/hardware/messages.h"
 #include "talOS/hardware/packet.h"
+#include "talOS/protocol/types.h"
 #include "talOS/schema/identity.h"
 #include "wpilog_test/wpilog_message_descriptor.h"
 #include "wpilog_test/wpilog_message_generated.h"
@@ -879,13 +880,15 @@ talos::hardware::Packet EncodedDriverStation(
 
 // A session as the bridge and a shooter node record it: the bridge sends
 // /hw/state/driver_station (disabled at 10 ms, enabled at 30 ms with a
-// joystick, disabled at 50 ms) and /hw/state (the flywheel at 20 and 40 ms,
-// then two packets that do not decode at 45 ms: one whose Packet size
-// claims more than its buffer, one the State codec rejects); the shooter
-// sends /hw/request/shooter at 35 ms. The packets are the wire codecs'
-// bytes. `dir`/robot.toml is the run config, which manifest.json names when
-// `manifest` is true. Returns the flywheel's logical id.
-std::uint16_t WriteHardwareSession(const std::string& dir, bool manifest) {
+// joystick, disabled at 50 ms) and /hw/state (the flywheel at 20 and 40 ms);
+// the shooter sends /hw/request/shooter at 35 ms. The packets are the wire
+// codecs' bytes. With `foreign`, the bridge also sends a State at 45 ms of
+// the length protocol 7 gave it (13 bytes shorter than this build's), as a
+// session recorded under another protocol holds. `dir`/robot.toml is the
+// run config, which manifest.json names when `manifest` is true. Returns
+// the flywheel's logical id.
+std::uint16_t WriteHardwareSession(const std::string& dir, bool manifest,
+                                   bool foreign = false) {
   namespace hw = talos::hardware;
   namespace ds = talos::driver_station;
   using talos::event::EventKind;
@@ -946,13 +949,11 @@ std::uint16_t WriteHardwareSession(const std::string& dir, bool manifest) {
       state.motors[0].supply_current_a = 12.5;
       send(1, ms, Encoded(state));
     }
-    hw::Packet hostile{};
-    hostile.size = 0xFFFFFFFFU;
-    send(1, 45, hostile);
-    hw::Packet garbage{};
-    garbage.size = 3;
-    garbage.data = {0xFF, 0xFF, 0xFF};
-    send(1, 45.5, garbage);
+    if (foreign) {
+      hw::Packet older = Encoded(hw::State{});
+      older.size -= 13;  // Protocol 8 added one CAN bus sample per State.
+      send(1, 45, older);
+    }
     writer.flush();
     EXPECT_FALSE(writer.failed()) << writer.error();
   }
@@ -1045,25 +1046,34 @@ TEST_F(TlogToWpilogTest, HardwarePacketsBecomeNamedTypedEntries) {
   EXPECT_EQ(AsDouble(log.of(request + "demand")[0].payload), 50.0);
 }
 
-// Guards: a hardware packet that does not decode (a Packet size past its
-// buffer, bytes the codec rejects) is skipped alone, counted and named on
-// stderr; the topic's other packets and the rest of the session convert.
+// Guards: a session recorded under another hardware protocol (a State this
+// build's codec rejects) converts none of its hardware packets, the ones
+// that happen to decode included, and says so in one line naming this
+// build's protocol version instead of one line per topic; the output is
+// still written and the exit status is 0.
 // REQ-OPS-26
-TEST_F(TlogToWpilogTest, UndecodableHardwarePacketIsSkippedAlone) {
+TEST_F(TlogToWpilogTest, HardwarePacketsOfAnotherProtocolAreNotConverted) {
   const std::string dir = root_ + "/hardware";
-  WriteHardwareSession(dir, true);
+  WriteHardwareSession(dir, true, true);
   const std::string out = root_ + "/hardware.wpilog";
   const Result result = Run({dir, "-o", out});
   ASSERT_EQ(result.exit_code, 0) << result.output;
-  EXPECT_NE(result.output.find("skipped 2 /hw/state packets that do not "
-                               "decode; the first: Packet size 4294967295 "
-                               "exceeds its"),
-            std::string::npos)
+  const std::string named = "hardware packets not decoded";
+  const auto first = result.output.find(named);
+  ASSERT_NE(first, std::string::npos) << result.output;
+  EXPECT_EQ(result.output.find(named, first + 1), std::string::npos)
+      << result.output;
+  EXPECT_NE(
+      result.output.find("protocol " +
+                         std::to_string(talos::protocol::kProtocolVersion)),
+      std::string::npos)
+      << result.output;
+  EXPECT_EQ(result.output.find("do not decode;"), std::string::npos)
       << result.output;
   const Wpilog log = Read(out);
-  EXPECT_EQ(log.of("/hw/state/motors/flywheel/velocity_rps").size(), 2u);
-  EXPECT_EQ(log.of("/hw/state/enabled").size(), 2u);
-  EXPECT_EQ(log.of("/hw/state/driver_station/enabled").size(), 3u);
+  EXPECT_EQ(log.entry("/hw/state/motors/flywheel/velocity_rps"), nullptr);
+  EXPECT_EQ(log.entry("/hw/state/driver_station/enabled"), nullptr);
+  EXPECT_EQ(log.entry("/hw/request/shooter/motors/flywheel/demand"), nullptr);
 }
 
 // Guards: a session whose run config cannot be found still converts its

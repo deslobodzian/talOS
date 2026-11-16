@@ -894,22 +894,25 @@ bool SelectItems(const std::vector<std::string>& files,
   return true;
 }
 
-struct Damaged {
-  std::size_t count{0};
-  std::string first;  // why the first one did not decode
-};
-
 struct Totals {
   std::size_t entries{0};
   std::size_t values{0};
   std::map<std::string, std::string> skipped;  // topic -> why
-  std::map<std::string, Damaged> damaged;      // hardware topic -> records
   bool hardware_unnamed{false};  // a hardware packet's devices by id
 };
 
-// Writes `items` to `writer`; see README.md for the mapping. `names` (may be
-// null) labels the hardware packets' devices.
+// The hardware packet topic an item carries (hardware_record.h), or kNone.
+talos::launcher::HardwareRecord HardwareKind(const Item& item) {
+  return talos::launcher::HardwareRecordOf(item.source->name,
+                                           item.source->schema.name);
+}
+
+// Writes `items` to `writer`; see README.md for the mapping. The hardware
+// packets are written only with `decode_hardware` (the session was recorded
+// under this build's protocol: HardwareProtocolCheck), their devices named
+// from `names` (may be null).
 Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
+                  bool decode_hardware,
                   const talos::launcher::DeviceNames* names,
                   talos::wpilog::Writer& writer) {
   Totals totals;
@@ -968,15 +971,13 @@ Totals WriteItems(const std::vector<Item>& items, std::int64_t start_ns,
     }
     if (!item.values) continue;
     const talos::schema::Identity& identity = item.source->schema;
-    const auto kind = talos::launcher::HardwareRecordOf(topic, identity.name);
+    const auto kind = HardwareKind(item);
     if (kind != talos::launcher::HardwareRecord::kNone) {
-      // A packet that does not decode (damaged, cut, from another wire
-      // version) is skipped alone; the topic's other packets still convert.
-      const std::string why =
-          talos::launcher::DecodeHardwareRecord(kind, item.payload, packet);
-      if (!why.empty()) {
-        Damaged& damaged = totals.damaged[topic];
-        if (damaged.count++ == 0) damaged.first = why;
+      // Every packet decodes once HardwareProtocolCheck found none this
+      // build rejects.
+      if (!decode_hardware ||
+          !talos::launcher::DecodeHardwareRecord(kind, item.payload, packet)
+               .empty()) {
         continue;
       }
       hardware_topic = &topic;
@@ -1144,6 +1145,16 @@ int Convert(const Options& options) {
   std::size_t records = 0;
   if (!SelectItems(files, items, records, error)) return Fail(error);
 
+  // Whether the session's hardware packets are of this build's protocol,
+  // judged on every one before any is converted (hardware_record.h).
+  talos::launcher::HardwareProtocolCheck protocol;
+  for (const Item& item : items) {
+    const auto kind = HardwareKind(item);
+    if (item.values && kind != talos::launcher::HardwareRecord::kNone) {
+      protocol.Add(kind, item.source->name, item.payload);
+    }
+  }
+
   // Device names for the hardware packets, as log_dump finds them: --config,
   // else the config the session's manifest names. Without one, a device's
   // entries are named by its logical id.
@@ -1167,7 +1178,7 @@ int Convert(const Options& options) {
   try {
     talos::wpilog::Writer writer{
         out, "talos tlog_to_wpilog session_id=" + std::to_string(session_id)};
-    totals = WriteItems(items, start_ns,
+    totals = WriteItems(items, start_ns, !protocol.foreign(),
                         device_names ? &*device_names : nullptr, writer);
     out.flush();
     const bool written = writer.ok() && out.good();
@@ -1183,11 +1194,8 @@ int Convert(const Options& options) {
     std::fprintf(stderr, "tlog_to_wpilog: skipped %s: %s\n", topic.c_str(),
                  why.c_str());
   }
-  for (const auto& [topic, damaged] : totals.damaged) {
-    std::fprintf(stderr,
-                 "tlog_to_wpilog: skipped %zu %s packets that do not decode; "
-                 "the first: %s\n",
-                 damaged.count, topic.c_str(), damaged.first.c_str());
+  if (protocol.foreign()) {
+    std::fprintf(stderr, "tlog_to_wpilog: %s\n", protocol.Warning().c_str());
   }
   if (totals.hardware_unnamed) {
     std::fprintf(stderr,

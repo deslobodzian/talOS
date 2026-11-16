@@ -25,10 +25,19 @@
 // are given only for a packet whose config_id is that config's, so a config
 // edited after the match never mislabels a device; the logical id always is.
 //
-// The codecs are this build's. The Packet's schema identity hashes only its
-// size, so a log recorded before a wire change that kept sizeof(Packet)
-// decodes with today's layout: wrongly, or as an error when the lengths no
-// longer agree. payload_hex keeps the recorded bytes either way.
+// The codecs are this build's (protocol::kProtocolVersion), and a recording
+// does not store the protocol version it was made under: a recorded Packet
+// holds a frame's payload without its header, and the Packet's schema
+// identity hashes only its size. What a recording does show is that every
+// hardware packet in it decoded under the build that recorded it (the
+// bridge publishes only a State or Driver Station packet its codec
+// accepted; requests and commands are its codec's encodings), so a packet
+// this build's codecs reject means the session was recorded under another
+// protocol. HardwareProtocolCheck is that check, run once over a session
+// before any packet is decoded; a tool then decodes none of its hardware
+// packets. A recording of another protocol whose packets all happen to
+// decode (a change that kept every length) cannot be told apart, and
+// decodes with this build's layout.
 
 #include <cstddef>
 #include <cstdint>
@@ -103,6 +112,32 @@ struct HardwarePacket {
 std::string DecodeHardwareRecord(HardwareRecord kind,
                                  std::span<const std::byte> payload,
                                  HardwarePacket& out);
+
+// Whether a session's hardware packets were recorded under this build's
+// protocol (see above), from every recorded hardware packet payload Add()ed
+// to it before the tool decodes one. Every tool that decodes recorded
+// hardware packets runs it and, when foreign(), prints Warning() once and
+// decodes none.
+class HardwareProtocolCheck {
+ public:
+  // One recorded payload of a hardware packet topic (`kind` not kNone).
+  void Add(HardwareRecord kind, std::string_view topic,
+           std::span<const std::byte> payload);
+  // A packet this build's codecs reject was added.
+  bool foreign() const { return rejected_ != 0; }
+  // The one line a tool prints after its own name when foreign(), else
+  // empty: "warning: hardware packets not decoded: recorded under a
+  // hardware protocol other than this build's protocol <N> (...)", then
+  // how many packets were rejected and the first one's topic and reason.
+  std::string Warning() const;
+
+ private:
+  std::uint64_t packets_{0};
+  std::uint64_t rejected_{0};
+  std::string first_topic_;
+  std::string first_why_;
+  HardwarePacket scratch_;
+};
 
 // The names log_dump gives these values, shared so every tool spells them
 // alike.
