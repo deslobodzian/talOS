@@ -217,6 +217,8 @@ class RioWatchdogOutputs final : public talos::rio::WatchdogOutputs {
     std::snprintf(details, sizeof(details), "%.*s",
                   static_cast<int>(text.size()), text.data());
     // printMsg also copies it to the console (the RoboRIO's netconsole log).
+    // A NetComm round trip: on the watchdog's reporter thread, at the default
+    // scheduling, never on its SCHED_FIFO thread (LoopWatchdog.h).
     HAL_SendError(1, 1, 0, details, "talos loop watchdog", "", 1);
   }
 
