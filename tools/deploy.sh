@@ -341,8 +341,14 @@ check_graph() {
   local scratch
   # macOS's TMPDIR ends in a slash; the launcher prints paths under this.
   scratch="${TMPDIR:-/tmp}"
-  scratch="$(mktemp -d "${scratch%/}/talos_install_check.XXXXXX")" ||
-    die "cannot create a temporary directory for the graph check; nothing selected"
+  if ! scratch="$(mktemp -d "${scratch%/}/talos_install_check.XXXXXX")"; then
+    # install's copy (STOP_DISCARD; rollback has none) goes as a refused
+    # bundle's does.
+    local discard="$STOP_DISCARD"
+    release_stops
+    [ -z "$discard" ] || discard_copy "$discard"
+    die "cannot create a temporary directory for the graph check; nothing selected${discard:+, $discard removed}"
+  fi
   local status=0
   # In the background, as the warm-up, so that a stop reaches the launcher.
   hold_stops "the graph check"
@@ -675,8 +681,8 @@ sys.exit(os.path.commonpath([test, prefix]) != test)
 # Copies the bundle (copy_bundle), warms it in place, checks its graph and
 # flips `current` atomically, keeping `previous` for rollback. Selects only a
 # complete copy, synced to disk first: a power cut right after the flip must
-# not boot a half-written bundle. A copy that fails, or that the launcher
-# refuses, is removed, as is one stopped (SIGTERM, SIGINT or SIGHUP to
+# not boot a half-written bundle. A copy that fails, that the launcher
+# refuses, or whose later step fails before the selection, is removed, as is one stopped (SIGTERM, SIGINT or SIGHUP to
 # deploy.sh) while it is copied, made read-only, synced, warmed or checked
 # (stop traps, above): the step's processes are stopped first, and
 # deploy.sh exits 128 + the signal. So neither a selection nor prune's
@@ -716,8 +722,11 @@ cmd_install() {
     fi
   fi
   run chmod -R a-w "$dest" 2>/dev/null || true
-  [ "$DRY_RUN" = "1" ] || [ -x "$dest/run.sh" ] ||
-    die "copy has no executable run.sh; current unchanged: $dest"
+  if [ "$DRY_RUN" != "1" ] && [ ! -x "$dest/run.sh" ]; then
+    release_stops
+    discard_copy "$dest"
+    die "copy has no executable run.sh, removed: $dest; $(kept_selection)"
+  fi
   run sync
   warm_up "$dest"
   if ! check_graph "$dest"; then
