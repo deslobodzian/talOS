@@ -320,29 +320,48 @@ class InstallCheckTest(unittest.TestCase):
             prefix = os.path.join(tmp, "prefix")
             current = os.path.join(prefix, "current")
 
-            def install(bundle):
+            def install(bundle, to=prefix):
                 return subprocess.run(
                     ["bash", deploy_script(), "install", bundle,
-                     "--prefix", prefix],
+                     "--prefix", to],
                     capture_output=True, text=True, timeout=120)
+
+            def shown(proc):
+                return [line for line in proc.stdout.splitlines()
+                        if line.startswith("  | ")]
 
             proc = install(src)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             good = os.readlink(current)
-            # Accepted, the launcher's warnings are shown, and only they:
-            # the bench graph has topics nobody reads.
-            shown = [line for line in proc.stdout.splitlines()
-                     if line.startswith("  | ")]
-            self.assertTrue(shown, proc.stdout)
-            for line in shown:
+            # Accepted: nothing of the launcher's is shown but a warning.
+            for line in shown(proc):
+                self.assertTrue(line.startswith("  |   warning: "), proc.stdout)
+            with open(os.path.join(src, "bundle_manifest.toml"), "rb") as f:
+                config = tomllib.load(f)["config_path"]
+            # A graph the launcher accepts with a warning (a policy lane
+            # nobody writes yet) installs, and the warning is shown.
+            # The sandbox links each input file; copy what they name.
+            warned = os.path.join(tmp, "warned")
+            shutil.copytree(src, warned)
+            robot = os.path.join(warned, os.path.dirname(config), "robot.toml")
+            with open(robot, encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn('teleop = ["teleop"]\n', text)
+            os.chmod(robot, 0o644)
+            with open(robot, "w", encoding="utf-8") as f:
+                f.write(text.replace('teleop = ["teleop"]\n',
+                                     'teleop = ["teleop", "align"]\n'))
+            proc = install(warned, os.path.join(tmp, "warned_prefix"))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = shown(proc)
+            self.assertTrue(any("/target/align" in line for line in lines),
+                            proc.stdout)
+            for line in lines:
                 self.assertTrue(line.startswith("  |   warning: "), proc.stdout)
             # The smallest graph error a person makes: a misspelled
             # parameter, a key no node reads.
-            # The sandbox links each input file; copy what they name.
             bad = os.path.join(tmp, "bad")
             shutil.copytree(src, bad)
-            with open(os.path.join(bad, "bundle_manifest.toml"), "rb") as f:
-                config = tomllib.load(f)["config_path"]
             motor = os.path.join(bad, os.path.dirname(config), "subsystems",
                                  "motor.toml")
             with open(motor, encoding="utf-8") as f:
