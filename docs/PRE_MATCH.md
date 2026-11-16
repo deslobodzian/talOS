@@ -3,7 +3,9 @@
 For the drive team, at the field before each match, with the robot on and
 disabled. The Driver Station's green robot code and communications only say
 the RoboRIO program runs; whether the main processor is driving it is on the
-driver dashboard.
+driver dashboard. This is what every robot on talOS shares; the widgets
+beyond these, and how the robot's routine is chosen, are in its own
+repository's checklist, beside its `[studio] dashboard` layout.
 
 Open the driver dashboard on the Driver Station laptop:
 `http://10.56.87.11:5800/drive` (`http://<main processor>:5800/drive`; what
@@ -16,8 +18,7 @@ check below.
 
 ## Driver Station
 
-- [ ] Robot code and communications green, joysticks in the expected slots
-  (joystick 0 also selects the autonomous routine).
+- [ ] Robot code and communications green, joysticks in the expected slots.
 - [ ] Battery: a freshly charged battery, resting voltage on the Driver
   Station at or above the team's threshold.
 - [ ] Message log: no `talos companion link` error since the last check (link
@@ -44,11 +45,10 @@ check below.
   processor gets no Driver Station packets through the RoboRIO. `E-STOP`: the
   robot is e-stopped.
 - [ ] Battery: a voltage, with no `LOW` and no `BROWNOUT` tag.
-- [ ] Auto routine: the intended routine by name. With the robot disabled,
-  step it with joystick 0's POV right/left; the name follows. `routine #N`
-  means an index outside `routines` in the deployed
-  [autonomous config](../2026-robot/main_processor/configuration/subsystems/autonomous.toml)
-  ([BRINGUP.md](BRINGUP.md#autonomous-selection)).
+- [ ] Auto routine: the intended routine by name. `routine #N` means an
+  index outside the routine channel's labels, the list `telemetry.toml`'s
+  `[[subsystem.labels]]` names in the deployed config
+  ([automatic channels](../talOS/telemetry/README.md#automatic-channels-and-units)).
 - [ ] Alerts: Active reads `none`. Each alert names its owner and its
   condition (`hw link lost`, `hw not configured`, `hw uncommissioned`,
   `hw motor fault`, `hw owner timed out`, `hw brownout`, `hw can bus
@@ -60,25 +60,23 @@ check below.
   RoboRIO console names it). The Raised list
   keeps every alert seen this match with its count: read it after the match.
 - [ ] Field: the robot drawn at its starting position, with no `POSE NOT
-  VALID` (odometry not integrating fresh input) or `NOT LOCALIZED` (the
-  pose estimator has neither trusted its seed nor seen a field tag) tag.
+  VALID` (the layout's `valid` channel false) or `NOT LOCALIZED` (its
+  `localized` channel false) tag.
 - [ ] Subsystems: every node `UP`, none `FAILING`, and `restarts` not
   rising between checks (hover a name whose row is too narrow to show them).
   `DOWN`: not running; in red, a critical node. `FAILING`: the node failed
   too often and the launcher paused its restarts (quarantined); it is not
   running. `unknown`: the bridge could not read the live registry, so the
   rows say nothing.
-- [ ] Pre-match: every item `OK` (bounds in the
-  [layout](../2026-robot/main_processor/configuration/dashboard.toml)):
+- [ ] Pre-match: every item `OK`. The robot's layout's `checks` widget sets
+  the items and their bounds; these read the hardware bridge's status, and
+  a robot adds its own mechanisms' and estimator's:
 
   | Item | Reads | FAIL means |
   |---|---|---|
   | Battery | `/hw/status` `battery_v` at the layout's bound or above | swap the battery |
   | Hardware configured | `/hw/status` `configured`: the RoboRIO's current boot acknowledged the main processor's hardware configuration, so it hears the main processor | the RoboRIO has no configuration from it yet and holds every output neutral |
   | Commissioned | `/hw/status` `commissioned`: the configuration is marked commissioned | the RoboRIO holds every output neutral; a person commissions the robot ([BRINGUP.md](BRINGUP.md#human-commissioning)) |
-  | Swerve modules | `/drivetrain/state` `modules_valid` | a swerve module's motor or CANcoder feedback is invalid |
-  | Gyro | `/drivetrain/state` `yaw_valid` | no usable heading: neither the gyro's yaw nor one integrated from valid modules |
-  | Localized | `/pose_estimator/state` `localized` | as the Field widget's `NOT LOCALIZED` |
 
 ## Main processor not reachable
 
