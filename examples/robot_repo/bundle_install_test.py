@@ -93,10 +93,9 @@ class BundleInstallTest(unittest.TestCase):
         # deploy.sh installs read-only, so cleanup cannot remove it all;
         # Bazel clears TEST_TMPDIR.
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-            # The bundle as Bazel wrote it (bazel-bin/robot_bundle), links
-            # kept: the sandbox stages each of its files as a link into
-            # that directory, which `deploy.sh install` would copy as links
-            # back into the build.
+            # The bundle as Bazel wrote it (bazel-bin/robot_bundle), not the
+            # sandbox's tree of links into that directory: this is the
+            # directory a person installs from.
             built = os.path.dirname(os.path.realpath(
                 os.path.join(bundle, "bundle_manifest.toml")))
             staging = os.path.join(tmp, "staging", "robot_bundle")
