@@ -415,8 +415,11 @@ TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
 // /hw/state and every /hw/status it publishes, each status SEND with the
 // transport sequence and publication stamp a live reader received for it
 // (what input replay matches a reader's copy to the bridge's SEND by),
-// its payload the status with the bridge's protocol.
-// REQ-OPS-21
+// its payload the status with the bridge's protocol. A run that ends on its
+// own (here at --duration-s) ends the log with an EXIT record, as an event
+// loop's does: input replay judges a log_gap session's log with its EXIT by
+// its GAP records, and refuses one without it.
+// REQ-OPS-21, REQ-OPS-44, REQ-OPS-14
 TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   const std::string base = ::testing::TempDir() + "bridge";
   const std::string config_path = base + ".toml";
@@ -540,8 +543,13 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   bool logged_neutral = false;
   bool logged_state = false;
   std::vector<std::pair<uint64_t, int64_t>> statuses_logged;
+  std::optional<event::EventKind> last_kind;
   event::log::LogReader::Record record;
   while (reader.next(record)) {
+    const auto kind = static_cast<event::EventKind>(record.header.kind);
+    ASSERT_NE(last_kind, event::EventKind::EXIT) << "a record after the EXIT";
+    last_kind = kind;
+    if (kind == event::EventKind::EXIT) continue;
     ASSERT_LT(record.header.source_id, reader.manifest().size());
     const auto& source = reader.manifest()[record.header.source_id];
     if (source.name == bridge::topics::kStatus) {
@@ -585,6 +593,8 @@ TEST(HardwareNodeTest, LogOptionRecordsSentCommandsAndReceivedStates) {
   EXPECT_TRUE(logged_neutral);
   EXPECT_TRUE(logged_state);
   EXPECT_EQ(statuses_logged, statuses_seen);
+  EXPECT_EQ(last_kind, event::EventKind::EXIT)
+      << "the log of a run that ended on its own has no EXIT record";
 }
 
 // A config that declares itself for simulation only (here
