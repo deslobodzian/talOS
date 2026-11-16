@@ -9,6 +9,8 @@
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -61,6 +63,25 @@ namespace talos::hardware {
 namespace {
 using namespace bridge_test;  // NOLINT(google-build-using-namespace)
 
+// Waits until the bridge's socket is readable, so the next Tick reads what is
+// there: a loopback send can complete before the datagram is queued (notably
+// on BSD). Readable is not "a datagram is queued": after the bridge sent to a
+// port nobody had bound, the connected socket is readable for the pending
+// error alone (macOS: POLLIN with FIONREAD 0), and the Tick that reads it
+// consumes only the error. A caller waiting for a datagram's effect therefore
+// ticks until it sees that effect, or checks QueuedBytes. The 10 s deadline
+// only bounds a hang (TESTING.md 6.3).
+bool DatagramQueued(const HardwareNode& node) {
+  pollfd readable{node.udp_fd(), POLLIN, 0};
+  return ::poll(&readable, 1, 10'000) == 1 && (readable.revents & POLLIN) != 0;
+}
+
+// Bytes of datagrams queued on the bridge's socket (FIONREAD), 0 when none.
+int QueuedBytes(const HardwareNode& node) {
+  int bytes = 0;
+  return ::ioctl(node.udp_fd(), FIONREAD, &bytes) == 0 ? bytes : -1;
+}
+
 TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
   auto cfg = talos::config::ParseRobotConfigString(kTestToml);
   Link link;
@@ -79,11 +100,8 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
                                    dummy_payload.data(), dummy_payload.size()),
             protocol::UdpStatus::kOk);
 
-  for (int i = 0; i < 20; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-    node.Tick(2000 + i * 1000);
-    if (node.driver_station_packets_received() > 0) break;
-  }
+  ASSERT_TRUE(DatagramQueued(node));
+  node.Tick(2000);
 
   EXPECT_EQ(node.driver_station_packets_received(), 1u);
   auto pkt = ds_sub.read();
@@ -98,8 +116,12 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
     ASSERT_EQ(gateway_peer.SendFrame(protocol::FrameType::kDriverStation, 2,
                                      2000, bytes, size),
               protocol::UdpStatus::kOk);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    // Nothing has been sent to an unbound port, but a "nothing forwarded"
+    // check must not pass on a datagram the tick never read.
+    ASSERT_TRUE(DatagramQueued(node));
+    ASSERT_GT(QueuedBytes(node), 0);
     node.Tick(30000);
+    ASSERT_EQ(QueuedBytes(node), 0);
   };
   const uint8_t malformed[] = {1, 2, 3};
   send(malformed, sizeof malformed);
@@ -110,6 +132,7 @@ TEST(HardwareNodeTest, RejectsMalformedDriverStationPackets) {
 // Commissioning is forced by --sim alone, the flag every node also reads
 // (HardwareLink). A loopback bridge without --sim keeps the config's own id,
 // as nodes launched without --sim do, or they would drop every State.
+// REQ-SAFE-20
 TEST(HardwareNodeTest, OnlySimulationForcesCommissioning) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   EXPECT_THROW((HardwareNode{cfg, "10.56.87.2", 5802, 5803, true}),
@@ -390,6 +413,7 @@ TEST(HardwareNodeTest, RefusesAnOlderProtocolsStatesAndSaysSoOnce) {
 // /hw/status names the build of the gateway boot the bridge accepted, and a
 // new boot's build replaces it: after a RoboRIO rollback the record shows the
 // build that drove the robot, not the first one the bridge heard.
+// REQ-CONTRACT-30
 TEST(HardwareNodeTest, ReportsTheBuildOfTheAcceptedGatewayBoot) {
   auto cfg = config::ParseRobotConfigString(kTrustToml);
   Link link;
@@ -834,9 +858,13 @@ TEST(HardwareNodeTest, PublishesBridgeStatus) {
   ASSERT_EQ(gateway.SendFrame(protocol::FrameType::kHardwareConfigAck, 1,
                               999500, ack_bytes.data(), ack_bytes.size()),
             protocol::UdpStatus::kOk);
-  for (int i = 0; i < 200 && !node.is_configured(); ++i) {
+  // The first tick sent to the gateway port before anything was bound there,
+  // so the socket may first be readable for that error alone: tick until the
+  // ACK has been read. Each wait is bounded; with no ACK accepted the last one
+  // times out.
+  while (!node.is_configured()) {
+    ASSERT_TRUE(DatagramQueued(node)) << "no config ACK configured the bridge";
     node.Tick(999500);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   ASSERT_TRUE(node.is_configured());
   EXPECT_TRUE(node.Status(999500).configured());
@@ -988,6 +1016,21 @@ TEST(HardwareNodeTest, ConfiguredDropsOnGatewayRebootUntilAcknowledged) {
   EXPECT_TRUE(node.Status(1053500).configured());
 }
 
+// The send time of the next clock probe the gateway receives, skipping other
+// frames; nullopt when none arrives within kHangBound, a bound on a hang only:
+// every caller expects a probe a Tick already sent.
+std::optional<uint64_t> NextProbeUs(protocol::RuntimeUdpPeer& gateway) {
+  const auto deadline = std::chrono::steady_clock::now() + kHangBound;
+  protocol::DecodedFrame frame;
+  while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
+         protocol::UdpStatus::kOk) {
+    if (frame.header.type == protocol::FrameType::kClockProbe) {
+      return frame.header.monotonic_time_us;
+    }
+  }
+  return std::nullopt;
+}
+
 // REQ-RT-20
 TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   auto cfg = talos::config::ParseRobotConfigString(kTrustToml);
@@ -996,11 +1039,9 @@ TEST(HardwareNodeTest, TwoWayClockBoundNeedsNoActiveRequests) {
   HardwareNode& node = link.node.value();
   protocol::RuntimeUdpPeer& gateway = link.gateway;
   node.Tick(2000000);
-  protocol::DecodedFrame probe;
-  ASSERT_EQ(protocol::testing::ReceiveFrame(gateway, &probe),
-            protocol::UdpStatus::kOk);
-  ASSERT_EQ(probe.header.type, protocol::FrameType::kClockProbe);
-  const auto sent = probe.header.monotonic_time_us;
+  const auto probe = NextProbeUs(gateway);
+  ASSERT_TRUE(probe.has_value());
+  const uint64_t sent = *probe;
   auto state = TrustState(NodeConfigId(cfg), 11, 1, 1000);
   state.flags = 0;
   state.clock_probe_time_us = sent;
@@ -1032,19 +1073,6 @@ TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
   ASSERT_TRUE(link.Open(cfg));
   HardwareNode& node = link.node.value();
   protocol::RuntimeUdpPeer& gateway = link.gateway;
-  // The next clock probe the bridge sent, skipping config pushes.
-  const auto next_probe = [&gateway]() -> std::optional<uint64_t> {
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-    protocol::DecodedFrame frame;
-    while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
-           protocol::UdpStatus::kOk) {
-      if (frame.header.type == protocol::FrameType::kClockProbe) {
-        return frame.header.monotonic_time_us;
-      }
-    }
-    return std::nullopt;
-  };
   // The gateway clock runs 2'004'000 us behind the bridge's.
   constexpr uint64_t kBehindUs = 2'004'000;
   auto state = TrustState(NodeConfigId(cfg), 11, 1, 0);
@@ -1057,7 +1085,7 @@ TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
 
   // One answered exchange (completed on the 2'006'000 tick) and eight States.
   node.Tick(2'000'000);
-  const auto first = next_probe();
+  const auto first = NextProbeUs(gateway);
   ASSERT_TRUE(first.has_value());
   ASSERT_TRUE(inject(2'005'000, *first));
   for (uint64_t t = 2'006'000; t <= 2'012'000; t += 1000) {
@@ -1067,7 +1095,7 @@ TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
 
   // The next probe is lost.
   node.Tick(2'020'000);
-  ASSERT_TRUE(next_probe().has_value());
+  ASSERT_TRUE(NextProbeUs(gateway).has_value());
 
   // A gateway that answers every later probe in its next State. The first
   // exchange expires 1 s after 2'006'000; validity must not lapse.
@@ -1085,6 +1113,7 @@ TEST(HardwareNodeTest, OneLostClockProbeLeavesTheMappingValid) {
   }
 }
 
+// REQ-CONTRACT-04
 TEST(HardwareNodeTest, FailedConfigPushBacksOffWithoutStoppingCommands) {
   auto cfg = config::ParseRobotConfigString(kTestToml);
   Link link;
@@ -1206,12 +1235,21 @@ TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
   // Every frame went out at a duty instant: the request's command, the two
   // heartbeats, the timeout's neutral command, and the clock probe with its
   // retry 100 ms and 1 us after it, the next 20 ms after the answered
-  // retry, and that one's retry.
+  // retry, and that one's retry. A Tick a second later sends at least the
+  // unanswered probe's retry, stamped with its own instant; one socket's
+  // datagrams arrive in order, so its frame ends the stream, and the read
+  // waits for that event rather than for nothing to arrive.
+  const uint64_t end_us = kStartUs + 1'300'000;
+  node.Tick(end_us);
   std::vector<SentCommand> commands;
   std::vector<uint64_t> probe_us;
   protocol::DecodedFrame frame;
-  while (protocol::testing::ReceiveFrame(gateway, &frame) ==
-         protocol::UdpStatus::kOk) {
+  bool ended = false;
+  const auto give_up = std::chrono::steady_clock::now() + kHangBound;
+  while (!ended && protocol::testing::ReceiveFrame(gateway, &frame, give_up) ==
+                       protocol::UdpStatus::kOk) {
+    ended = frame.header.monotonic_time_us == end_us;
+    if (ended) continue;
     if (frame.header.type == protocol::FrameType::kClockProbe) {
       probe_us.push_back(frame.header.monotonic_time_us);
     } else if (frame.header.type == protocol::FrameType::kHardwareCommand) {
@@ -1222,6 +1260,7 @@ TEST(HardwareNodeTest, NextDutyUsIsWhenTickNextHasWork) {
       commands.push_back(sent);
     }
   }
+  ASSERT_TRUE(ended) << "no frame from the Tick at " << end_us;
   const uint64_t heartbeat_us = node.heartbeat_us();
   ASSERT_EQ(heartbeat_us, 20'000u);
   const uint64_t timeout_us =
@@ -1476,21 +1515,6 @@ TEST(HardwareNodeTest, AnArmThatNeverCatchesUpCannotSpinTheLoop) {
   }
   ASSERT_TRUE(bridge.has_value());
   EXPECT_EQ(bridge->delivery_loss().stalled_arms, 3u);
-}
-
-// The send time of the next clock probe the gateway receives, skipping other
-// frames; nullopt when none arrives within 200 ms.
-std::optional<uint64_t> NextProbeUs(protocol::RuntimeUdpPeer& gateway) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-  protocol::DecodedFrame frame;
-  while (protocol::testing::ReceiveFrame(gateway, &frame, deadline) ==
-         protocol::UdpStatus::kOk) {
-    if (frame.header.type == protocol::FrameType::kClockProbe) {
-      return frame.header.monotonic_time_us;
-    }
-  }
-  return std::nullopt;
 }
 
 // A UDP socket bound to `port` on every address, so binding the port again

@@ -8,6 +8,7 @@
 #include <cstring>
 #include <functional>
 #include <iterator>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -191,6 +192,11 @@ struct HardwareLink::Impl {
   Duration timeout{};
 
   std::vector<Device> devices;
+  // Held while add_device grows `devices` and while an off-loop-thread
+  // setter reads a device's kind and name for its error (OffThreadLabel):
+  // the only access to `devices` from another thread. The loop thread's own
+  // reads take no lock, since only it writes.
+  mutable std::mutex devices_growth;
   std::vector<std::uint16_t> motor_ids;    // flush order
   std::vector<std::size_t> motor_devices;  // devices[] index, same order
   bool has_outputs = false;
@@ -254,8 +260,16 @@ struct HardwareLink::Impl {
   // neutral for every output that update() did not set, so a command from
   // the constructor, every() or a message callback would reach the hardware
   // for at most one tick (from a timer slower than the tick, a pulse).
+  // Off the loop thread a setter throws naming its device, read under
+  // devices_growth: the kind and name, fixed once the device is added.
   Device& Output(std::size_t index, Kind kind, std::string_view setter) {
-    detail::NodeAccess::require_loop_thread(node, setter);
+    try {
+      detail::NodeAccess::require_loop_thread(node, setter);
+    } catch (const std::logic_error&) {
+      throw std::logic_error(
+          std::string{node.name()} + ": " + std::string{setter} + " on " +
+          OffThreadLabel(index, kind) + " must run on the node's loop thread");
+    }
     Device& device = At(index, kind);
     if (!detail::NodeAccess::in_update(node)) {
       throw std::logic_error(
@@ -266,6 +280,34 @@ struct HardwareLink::Impl {
           "not set");
     }
     return device;
+  }
+  // Called off the loop thread. The lock covers only reads and a copy into
+  // capacity reserved before it was taken, never an allocation, so the loop
+  // thread in add_device never waits on this thread's allocator: the first
+  // pass reads the name's size, the reserve happens unlocked, and the
+  // second pass assigns within that capacity (a name never changes once
+  // added, so its size cannot have grown).
+  std::string OffThreadLabel(std::size_t index, Kind kind) const {
+    std::string name;
+    bool found = false;
+    for (;;) {
+      std::size_t size = 0;
+      {
+        const std::lock_guard lock{devices_growth};
+        found = index < devices.size() && devices[index].kind == kind;
+        if (!found) break;
+        size = devices[index].name.size();
+        if (size <= name.capacity()) {
+          name.assign(devices[index].name);
+          break;
+        }
+      }
+      name.reserve(size);
+    }
+    if (!found) {
+      return std::string{KindLabel(kind)} + " handle " + std::to_string(index);
+    }
+    return std::string{KindLabel(kind)} + " '" + name + "'";
   }
   const Device& SensorAt(std::size_t index) const {
     if (index < devices.size() && (devices[index].kind == Kind::kGyro ||
@@ -553,7 +595,10 @@ std::size_t HardwareAccess::add_device(HardwareLink& link, Kind kind,
     impl.motor_ids.push_back(id);
     impl.motor_devices.push_back(impl.devices.size());
   }
-  impl.devices.push_back({.kind = kind, .id = id, .name = std::string{name}});
+  {
+    const std::lock_guard lock{impl.devices_growth};
+    impl.devices.push_back({.kind = kind, .id = id, .name = std::string{name}});
+  }
   if (kind == Kind::kMotor) {
     for (const auto& motor : impl.config.hardware.motors) {
       if (motor.id == id) {

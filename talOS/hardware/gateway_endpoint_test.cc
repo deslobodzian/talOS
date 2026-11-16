@@ -20,6 +20,7 @@
 #include <iterator>
 #include <optional>
 #include <thread>
+#include <vector>
 
 #include "config_wire.h"
 #include "endpoint.h"
@@ -82,6 +83,7 @@ class Companion {
         ::getsockname(fd_, reinterpret_cast<sockaddr*>(&address), &length) != 0)
       return Failed("bind port 0");
     const auto port = ntohs(address.sin_port);
+    port_ = port;
     if (endpoint.Open("127.0.0.1", 0, "127.0.0.1", port) !=
         protocol::UdpStatus::kOk)
       return ::testing::AssertionFailure()
@@ -109,6 +111,40 @@ class Companion {
     if (::connect(fd_, reinterpret_cast<const sockaddr*>(&from), from_length) !=
         0)
       return Failed("connect");
+    return ::testing::AssertionSuccess();
+  }
+
+  // The endpoint's socket, the one connected to this companion (the Endpoint
+  // does not expose it), or -1: for a test to make its sends fail.
+  int EndpointFd() const {
+    for (int fd = 0; fd < 1024; ++fd) {
+      if (fd == fd_) continue;
+      sockaddr_in peer{};
+      socklen_t length = sizeof(peer);
+      int type = 0;
+      socklen_t type_length = sizeof(type);
+      if (::getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &type_length) == 0 &&
+          type == SOCK_DGRAM &&
+          ::getpeername(fd, reinterpret_cast<sockaddr*>(&peer), &length) == 0 &&
+          peer.sin_family == AF_INET && ntohs(peer.sin_port) == port_)
+        return fd;
+    }
+    return -1;
+  }
+
+  // Connects to the endpoint's socket again, after Endpoint::Reopen: opened
+  // on port 0, the new socket has a port of its own.
+  ::testing::AssertionResult Reconnect() {
+    const int endpoint_fd = EndpointFd();
+    if (endpoint_fd < 0)
+      return ::testing::AssertionFailure() << "no endpoint socket";
+    sockaddr_in address{};
+    socklen_t length = sizeof(address);
+    if (::getsockname(endpoint_fd, reinterpret_cast<sockaddr*>(&address),
+                      &length) != 0 ||
+        ::connect(fd_, reinterpret_cast<const sockaddr*>(&address), length) !=
+            0)
+      return Failed("reconnect");
     return ::testing::AssertionSuccess();
   }
 
@@ -172,6 +208,7 @@ class Companion {
   }
 
   int fd_{-1};
+  uint16_t port_{0};
   uint64_t next_send_sequence_{1};
   std::array<uint8_t, protocol::kMaxFrameSize> rx_{};
 };
@@ -436,6 +473,138 @@ TEST(Endpoint, FailedConfigurationAcknowledgementBoundsReason) {
   EXPECT_EQ(ack->reason[sizeof(ack->reason) - 1], '\0');
 }
 
+// A configuration ACK whose send fails is sent again on a later tick, here
+// once the socket that could not send it is replaced, as the RoboRIO program
+// replaces it (Endpoint::Reopen). Lost, it would leave the bridge reporting
+// the link unconfigured until its next push, at least 50 ms later. The tick
+// reports the failed send, so the program learns the socket is lost.
+// REQ-CONTRACT-04
+TEST(Endpoint, SendsAgainAConfigAckWhoseSendFailed) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3006};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const int endpoint_fd = companion.EndpointFd();
+  ASSERT_GE(endpoint_fd, 0) << "the endpoint's socket was not found";
+  const auto cfg = SwerveConfig(true);
+  for (const auto& chunk : CreateConfigChunks(cfg)) {
+    ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                  protocol::kFlagNone, 1000, chunk.data(),
+                                  chunk.size()),
+              protocol::UdpStatus::kOk);
+  }
+  // The socket can no longer send (EPIPE): the ACK of the tick that
+  // completes the configuration fails, with that tick's State.
+  ASSERT_EQ(::shutdown(endpoint_fd, SHUT_WR), 0);
+  ASSERT_TRUE(Eventually([&] {
+    EXPECT_EQ(endpoint.Tick(2000, false), protocol::UdpStatus::kSocketError);
+    return gateway.configured();
+  }));
+  EXPECT_EQ(endpoint.udp_stats().last_send_error, EPIPE);
+
+  ASSERT_EQ(endpoint.Reopen(), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(companion.Reconnect());
+  ASSERT_EQ(endpoint.Tick(3000, false), protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame))
+      << "the ACK whose send failed was never sent again";
+  ConfigAckPayload ack{};
+  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
+  EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
+  // Sent once it went out: no further copy follows.
+  ASSERT_EQ(endpoint.Tick(4000, false), protocol::UdpStatus::kOk);
+  while (companion.Receive(&frame) == protocol::UdpStatus::kOk) {
+    EXPECT_NE(frame.header.type, protocol::FrameType::kHardwareConfigAck);
+    State state;
+    if (frame.header.type == protocol::FrameType::kHardwareState &&
+        Decode({frame.payload, frame.payload_size}, state) &&
+        state.sample_time_us == 4000)
+      break;
+  }
+}
+
+// An ACK still unsent when a newer transfer completes into a pending
+// configure answers a superseded push and is never sent: only the pending
+// configure's ACK goes out. Here the bridge, hearing no answer to a push
+// whose configure failed, pushes the same configuration again; the stale
+// failure ACK arriving during that configure would double its push backoff.
+// REQ-CONTRACT-04
+TEST(Endpoint, DropsAnUnsentAckOnceANewerTransferBeginsConfiguring) {
+  class SwitchingBackend : public FakeBackend {
+   public:
+    void BeginConfigure(const Config& config) override {
+      if (!pending) {
+        FakeBackend::BeginConfigure(config);
+        return;
+      }
+      started = true;
+    }
+    ConfigureStatus PollConfigure() override {
+      if (!pending) return FakeBackend::PollConfigure();
+      return complete ? ConfigureStatus::kDone : ConfigureStatus::kPending;
+    }
+    bool pending{}, started{}, complete{};
+  } backend;
+  backend.configure_ok = false;
+  Gateway gateway{backend, 3012};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const int endpoint_fd = companion.EndpointFd();
+  ASSERT_GE(endpoint_fd, 0) << "the endpoint's socket was not found";
+  const auto cfg = SwerveConfig(true);
+  const auto push = [&] {
+    for (const auto& chunk : CreateConfigChunks(cfg)) {
+      ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                    protocol::kFlagNone, 1000, chunk.data(),
+                                    chunk.size()),
+                protocol::UdpStatus::kOk);
+    }
+  };
+  // The first push's configure fails at once; its failure ACK cannot leave.
+  ASSERT_EQ(::shutdown(endpoint_fd, SHUT_WR), 0);
+  push();
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(2000, false);
+    return backend.configure_calls == 1;
+  }));
+  ASSERT_FALSE(gateway.configured());
+  // The second begins a configure that stays pending.
+  backend.pending = true;
+  push();
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(3000, false);
+    return backend.started;
+  }));
+  ASSERT_TRUE(gateway.configuring());
+
+  // Sends work again; ticks while the configure is pending send no ACK.
+  ASSERT_EQ(endpoint.Reopen(), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(companion.Reconnect());
+  ASSERT_EQ(endpoint.Tick(4000, false), protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  while (companion.Receive(&frame) == protocol::UdpStatus::kOk) {
+    EXPECT_NE(frame.header.type, protocol::FrameType::kHardwareConfigAck)
+        << "an ACK went out while the newest push was still configuring";
+    State state;
+    if (frame.header.type == protocol::FrameType::kHardwareState &&
+        Decode({frame.payload, frame.payload_size}, state) &&
+        state.sample_time_us == 4000)
+      break;
+  }
+  backend.complete = true;
+  ASSERT_EQ(endpoint.Tick(5000, false), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame));
+  ConfigAckPayload ack{};
+  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
+  EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
+}
+
 // The ACK is a frame type, not a flag: its header flags stay zero no matter
 // which incoming sequence it answers.
 TEST(Endpoint, ConfigAckFlagsIgnoreIncomingSequence) {
@@ -497,6 +666,111 @@ TEST(Endpoint, RestoredGatewayAcknowledgesIdenticalConfigWhileEnabled) {
   EXPECT_EQ(acknowledgement.status, ConfigAckStatus::kOk);
   EXPECT_EQ(backend.configure_calls, configure_calls);
   EXPECT_TRUE(gateway.Accept(Request(gateway), 1, 2000));
+}
+
+// REQ-SAFE-21: a partial or rejected transfer never replaces the active
+// config. After an accepted push, a transfer that stops one chunk short, one
+// whose bytes fail its CRC, and a changed config pushed while enabled each
+// leave the State's config id, the gateway's config and the devices it
+// drives as they were, with no backend configure.
+TEST(Endpoint, PartialOrRejectedTransferKeepsTheActiveConfig) {
+  FakeBackend backend;
+  Gateway gateway{backend, 3013};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const auto active = SwerveConfig(true);
+  const auto accepted = PushConfig(endpoint, gateway, companion, active);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_EQ(accepted->status, ConfigAckStatus::kOk);
+  const int configures = backend.configure_calls;
+
+  auto partial = active;
+  partial.motors[0].slots[0].p = 1.0;
+  auto corrupt = active;
+  corrupt.motors[0].slots[0].p = 2.0;
+  auto changed = active;
+  changed.motors[0].slots[0].p = 3.0;
+  uint64_t now_us = 3000;
+  // Sends one transfer's chunks and ticks until the endpoint has received
+  // every one, so no two transfers' chunks interleave (UDP does not keep
+  // order, even on loopback). Order within one transfer cannot change the
+  // outcome: the assembler places each chunk by its index
+  // (ConfigWire.ReassemblesOutOfOrderIgnoresDuplicatesAndChecksTheCrc).
+  const auto deliver = [&](const std::vector<std::vector<uint8_t>>& chunks,
+                           bool enabled) {
+    const uint64_t received = endpoint.udp_stats().received_frames;
+    for (const auto& chunk : chunks) {
+      ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                    protocol::kFlagNone, 1000, chunk.data(),
+                                    chunk.size()),
+                protocol::UdpStatus::kOk);
+    }
+    ASSERT_TRUE(Eventually([&] {
+      endpoint.Tick(now_us, enabled);
+      now_us += 1000;
+      return endpoint.udp_stats().received_frames >= received + chunks.size();
+    }));
+  };
+  // Ticks until the endpoint's answer to the newest transfer arrives.
+  const auto await_ack = [&](bool enabled) {
+    std::optional<ConfigAckPayload> ack;
+    EXPECT_TRUE(Eventually([&] {
+      protocol::DecodedFrame frame;
+      while (!ack && companion.TryReceive(&frame) == protocol::UdpStatus::kOk) {
+        if (frame.header.type != protocol::FrameType::kHardwareConfigAck)
+          continue;
+        ack.emplace();
+        EXPECT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, *ack));
+      }
+      if (ack) return true;
+      endpoint.Tick(now_us, enabled);
+      now_us += 1000;
+      return false;
+    }));
+    return ack;
+  };
+  const auto expect_active = [&](bool enabled) {
+    const auto state = TickForState(endpoint, companion, now_us, enabled);
+    now_us += 1000;
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(state->config_id, ConfigurationId(active));
+    EXPECT_TRUE(state->flags & kConfigured);
+    EXPECT_EQ(std::size_t{state->motor_count}, active.motors.size());
+    EXPECT_EQ(std::size_t{state->sensor_count}, active.sensors.size());
+    EXPECT_EQ(gateway.config(), active);
+    EXPECT_EQ(backend.configure_calls, configures);
+  };
+
+  {
+    SCOPED_TRACE("a transfer one chunk short");
+    auto chunks = CreateConfigChunks(partial, 200);
+    ASSERT_GT(chunks.size(), 1u);
+    chunks.pop_back();
+    deliver(chunks, false);
+    expect_active(false);
+  }
+  {
+    SCOPED_TRACE("a transfer failing its CRC");
+    auto chunks = CreateConfigChunks(corrupt, 200);
+    chunks.front().back() ^= 0xff;  // data; the header stays whole
+    deliver(chunks, false);
+    const auto ack = await_ack(false);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_EQ(ack->status, ConfigAckStatus::kInvalidCrc);
+    expect_active(false);
+  }
+  {
+    SCOPED_TRACE("a changed config pushed while enabled");
+    expect_active(true);
+    deliver(CreateConfigChunks(changed), true);
+    const auto ack = await_ack(true);
+    ASSERT_TRUE(ack.has_value());
+    EXPECT_NE(ack->status, ConfigAckStatus::kOk);
+    expect_active(true);
+  }
+  // Still the active config's devices: a command built for it drives.
+  EXPECT_TRUE(gateway.Accept(Request(gateway), 1, now_us));
 }
 
 TEST(Endpoint, PendingDegradedConfigureDoesNotBlockTicksAndRecoversDevice) {

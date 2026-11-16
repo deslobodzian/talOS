@@ -632,6 +632,7 @@ topic /arm/state arm.ArmState
   range position_rot -0.16360441150836713 1.0107984456544017
   range connected true true
   range at_goal false true
+  values homing HOMING HOMED
 ```
 
 ### Writing the arm yourself

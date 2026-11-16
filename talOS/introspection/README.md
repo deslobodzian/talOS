@@ -50,9 +50,17 @@ holding it, therefore cannot block a reader such as the launcher's supervision
 loop. Outside a shared-memory namespace lock files deliberately persist,
 even across explicit segment unlinks. A launcher session in a namespace
 removes the registry segment and its registry and session lock files once its
-members are reaped, unless the registry holds a row of another session; it
-unlinks the registry lock while holding it, and a waiter that then wins the
-unlinked inode finds it no longer current and retries on the new file.
+members are reaped (`RemoveRegistryUnlessHeld`), unless the registry holds a
+row of another session; it unlinks the registry lock while holding it, and a
+waiter that then wins the unlinked inode finds it no longer current and
+retries on the new file. A `NodeRegistration` maps the segment and claims its
+slot under one
+acquisition of the lock, so a removal falls before the map, which creates a
+new segment, or after the claim, whose row keeps the registry: a claim is
+never left in an unlinked segment that no later reader maps. No taker of the
+registry lock waits for another lock while holding it; the launcher holds
+its session locks while it takes the registry lock (preparing and removing
+the registry), and no holder of the registry lock takes those.
 
 
 `RegistryMapping` owns its mapping but does not unlink the registry on
@@ -241,7 +249,8 @@ so an overrunning loop is visible even while its dispatch count keeps moving.
 ## Claiming a slot, and liveness
 
 A slot is FREE, CLAIMING or ACTIVE. `NodeRegistration` holds the same kernel
-lock from the stale-slot sweep through the claim's ACTIVE commit. It takes a
+lock from the segment's map through the stale-slot sweep and the claim's
+ACTIVE commit. It takes a
 FREE slot and writes identity, counts, heartbeat and generation before
 release-storing ACTIVE. Of the FREE slots it takes the lowest whose
 heartbeat is at least `kLivenessTimeout` old (never used, swept, or released

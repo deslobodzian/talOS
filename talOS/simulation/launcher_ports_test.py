@@ -21,7 +21,10 @@ FIRST_STATE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 20
 LOG_DUMP_TIMEOUT_S = 10
 # What hardware_node prints on the first State it accepts from a gateway
-# boot (HardwareNode::ReportGatewayBuild); the launcher echoes it.
+# boot (HardwareNode::ReportGatewayBuild); the launcher echoes it. The echo
+# is one write, but it can land inside a line the launcher itself is still
+# printing in pieces ("[launcher] Started sim_gateway (pid ..."), so it is
+# looked for anywhere in a line, not at its start.
 FIRST_STATE_LINE = "hardware_node: gateway boot "
 # talOS/introspection/registry.h kRegistryPath. A launcher killed before it
 # reaps its members leaves the registry, so the test unlinks its own.
@@ -94,7 +97,7 @@ class LauncherPortsTest(unittest.TestCase):
             def drain(stream):
                 for line in stream:
                     lines.append(line)
-                    if line.startswith(FIRST_STATE_LINE):
+                    if FIRST_STATE_LINE in line:
                         first_state.set()
 
             with subprocess.Popen(args, cwd=work, stdout=subprocess.PIPE,

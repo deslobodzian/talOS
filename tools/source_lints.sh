@@ -4,7 +4,7 @@
 # "Source lints (no Bazel)" job and tools/prepush.sh's source-lints step
 # both run this script, so they cannot drift apart.
 #
-#   tools/source_lints.sh
+#   tools/source_lints.sh [--base <rev>]
 #
 # From the workspace that holds this script, whatever the working
 # directory, it runs, in order:
@@ -23,12 +23,32 @@
 #                tools/check_node_matrix_baseline.txt: every node test has
 #                its matrix cases (docs/TESTING.md §7; the baseline may only
 #                shrink)
+#   deps         tools/check_deps_listed.py: docs/METHODOLOGY.md §13's
+#                "Bazel module" table lists exactly MODULE.bazel's
+#                bazel_deps
+#   commissioning  tools/check_commissioning.py --base <rev>: no commit
+#                since the merge base with <rev> sets `commissioned = true`
+#                or changes a CAN id in a robot or bench config (RULES.md 4)
+#                unless it carries `Commissioned-By: <name>`; without
+#                --base (no history to diff against) the line
+#                `source-lints: commissioning not run (no --base)`, which
+#                does not fail the run
 #
 # Each lint runs whatever the others find and prints its own output, then
 # `source-lints: <lint> ok` or `source-lints: <lint> FAILED`.
 #
-# Exit: 0 every lint passed, 1 one failed, 2 the workspace is unreachable.
+# Exit: 0 every lint passed, 1 one failed, 2 a usage error or the workspace
+# is unreachable.
 set -uo pipefail
+
+base=
+case "${1:-}" in
+  --base) [ $# -eq 2 ] && [ -n "$2" ] ||
+            { echo "source-lints: --base needs one revision" >&2; exit 2; }
+          base="$2" ;;
+  "") ;;
+  *) echo "source-lints: unknown argument: $1" >&2; exit 2 ;;
+esac
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." ||
   { echo "source-lints: cannot enter the workspace" >&2; exit 2; }
@@ -50,4 +70,10 @@ lint links python3 tools/check_links.py
 lint trace python3 tools/trace.py --check
 lint node-matrix python3 tools/check_node_matrix.py \
   --baseline tools/check_node_matrix_baseline.txt
+lint deps python3 tools/check_deps_listed.py
+if [ -n "$base" ]; then
+  lint commissioning python3 tools/check_commissioning.py --base "$base"
+else
+  echo "source-lints: commissioning not run (no --base)"
+fi
 exit "$failed"

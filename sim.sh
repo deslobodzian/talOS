@@ -253,7 +253,10 @@ if [ "$WANT_GATEWAY" = "1" ] && [ -z "$(target sim_gateway)" ]; then
   die "$CONFIG sets no [robot] sim_gateway for --sim-gateway to start"
 fi
 
-SESSION_ID="$(date +%s)"
+# The launcher takes a number (uint64). The second alone collides for two
+# starts in one second; the shell's pid (below 2^22 on Linux, 99999 on macOS,
+# so seven digits) makes the key unique among concurrent runs.
+SESSION_ID="$(date +%s)$(printf '%07d' "$$")"
 OUT_DIR="/tmp/talos_logs"
 SESSION_DIR="${OUT_DIR}/${SESSION_ID}"
 LOG_DIR="${SESSION_DIR}/sim"
@@ -307,8 +310,10 @@ fi
 if [ "$WANT_STUDIO" = "1" ]; then
   BUILD_TARGETS="$BUILD_TARGETS $(target studio_bridge) //studio:web_dist"
 fi
+# Errors still print; the per-target "up-to-date" lines and progress do not.
 # shellcheck disable=SC2086
-bazel build $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
+bazel build --noshow_progress --ui_event_filters=-info --show_result=0 \
+  $BUILD_TARGETS 2>&1 | tail -5 || die "build failed"
 
 # --- 1. the controller processor (WPILib sim) -------------------------------
 if [ "$WANT_RIO" = "1" ]; then
@@ -404,11 +409,14 @@ track "$LAUNCHER_PID" "launcher"
 GRAPH="$SESSION_DIR/graph.json"
 for _ in $(seq 1 60); do
   [ -f "$GRAPH" ] && break
+  # A launcher that already exited (a refused graph, or another session in
+  # this shared-memory namespace) said why in its log: show it now.
+  kill -0 "$LAUNCHER_PID" 2>/dev/null || break
   sleep 0.5
 done
 if [ ! -f "$GRAPH" ]; then
   tail -25 "$LOG_DIR/launcher.log" >&2
-  die "the launcher never wrote $GRAPH; the declared graph probably has errors"
+  die "the launcher never wrote $GRAPH (its reason above)"
 fi
 say "  declared graph: $GRAPH"
 

@@ -199,6 +199,19 @@ threads, which the library creates, each call it from a task
 (`EnsureBackgroundWorkerPool`). Threads a Python node starts have no such
 call: start none whose work is unbounded.
 
+A Python node's `update()` also needs the interpreter lock, which a worker
+thread holding it gives up only at the switch interval
+(`sys.getswitchinterval()`, 5 ms) or, inside one C call that keeps the lock,
+when that call returns. Measured on the Mac mini
+([2026-11-16](BENCH_RESULTS.md#2026-11-16)): a worker running pure-Python
+code delayed a 5 ms `update()` by up to 7.5 ms (half its ticks over 1 ms
+late) and a 20 ms one by up to 2.3 ms; a worker inside one 224 ms `sorted()`
+delayed `update()` by the whole 224 ms; a worker blocked in a call that
+releases the lock (a socket read, `time.sleep`) delayed it by nothing
+measurable. So a Python node's worker thread only waits in such calls (I/O,
+or a C extension that releases the lock while it computes); computation
+goes to another process, which hands its result over a topic.
+
 ### Stopping
 
 Once `talos::Run` / `talos.run` starts a live node, SIGINT or SIGTERM stops it
@@ -233,12 +246,8 @@ blocked for life), inherits the blocked signals.
 built, before its loop runs: everything alive after construction (modules,
 config, the node and what its constructor built) moves to the collector's
 permanent generation, and later collections scan only objects allocated
-since. For the 2026 robot's pose estimator, in its own repository (about 33 000 tracked objects after
-construction with the Kalman backend, 53 000 with the factor graph) a full
-collection drops from 1.9–2.5 ms (4.9 ms for the first in a run) to under
-15 µs, and the longest middle-generation collection from about 0.25 ms to
-0.05 ms (desktop Ryzen 9 7950X3D, CPython 3.11, `update_benchmark`).
-Young-generation collections still run, about 20 µs each. A reference cycle
+since, so a full collection no longer rescans what construction built.
+Young-generation collections still run. A reference cycle
 built before the freeze and dropped afterwards is never collected, so drop
 construction-time scratch inside the constructor. `talos.testing.Sim` does
 not freeze.
@@ -595,7 +604,10 @@ ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
 `SimHardware` also has `set_motor`, `set_digital_input`, `set_analog_input`,
 `set_encoder`, `set_cancoder`, `set_gyro`, `set_driver_station`,
 `stop_driver_station()` (the DS goes silent), `set_connected(node, device,
-false)` (the device reports disconnected), `reset_device(node, device)` (the
+false)` (the device reports disconnected; as on the RoboRIO, a motor's or CAN
+sensor's ages grow from the last State that read it connected and a motor's
+limit bits clear 50 ms after it; the robot counts the 50 ms from the fault
+signal's last frame, so it can clear them sooner), `reset_device(node, device)` (the
 gateway reports that motor, CANcoder or gyro reset and masks it, with its
 followers and remote-sensor consumers, for two States; any other name throws),
 `lose_states(count)` (the next gateway ticks publish nothing), `reboot()` (a

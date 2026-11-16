@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -103,6 +104,20 @@ struct SimHardware::Impl {
   };
   std::map<std::string, RequestTracker> requests;
   std::set<std::pair<Kind, std::uint16_t>> disconnected;
+  // Per motor, the sim time (µs) of the latest State that read it
+  // connected: when its temperature signal last updated.
+  std::map<std::uint16_t, std::uint64_t> temperature_read_us;
+  static constexpr auto kTemperatureMaxAgeUs = hardware::kTemperatureMaxAgeUs;
+  // Per motor and CAN sensor (keyed by table), what the latest State that
+  // read it connected this boot reported: its sample time, its ages and, for
+  // a motor, its fault field. A disconnected device's frames stopped there.
+  struct LastFrame {
+    std::uint64_t sample_time_us = 0;
+    std::uint32_t position_age_us = 0;
+    std::uint32_t velocity_age_us = 0;
+    std::uint32_t fault_flags = 0;
+  };
+  std::map<std::pair<Kind, std::uint16_t>, LastFrame> last_frames;
   // Devices reset and not yet restored, with the States they stay masked
   // for; `masked` adds the chain restored with them: followers of a masked
   // motor and motors fed by a masked remote CANcoder. The RoboRIO reports a
@@ -165,6 +180,34 @@ struct SimHardware::Impl {
     const std::uint64_t bound = config.hardware.command_timeout_us;
     return hardware::FeedbackFresh(axis.position_age_us, bound) &&
            hardware::FeedbackFresh(axis.velocity_age_us, bound);
+  }
+  // The ages and fault field of a device whose frames stopped, in the State
+  // sampled at `sample_time_us`, as PhoenixBackend::Read reports them: its
+  // ages grow from its last frame (an unknown one stays unknown), its limit
+  // and limiter bits clear once that frame is kFaultFieldMaxAgeUs old and its
+  // fault bits stay. A device not read this boot has unknown ages and no
+  // bits.
+  LastFrame StoppedFrame(Kind kind, std::uint16_t id,
+                         std::uint64_t sample_time_us) const {
+    constexpr auto kUnknown = std::numeric_limits<std::uint32_t>::max();
+    const auto it = last_frames.find({TableOf(kind), id});
+    if (it == last_frames.end()) {
+      return {.position_age_us = kUnknown, .velocity_age_us = kUnknown};
+    }
+    LastFrame frame = it->second;
+    const std::uint64_t since_us =
+        sample_time_us - std::min(sample_time_us, frame.sample_time_us);
+    const auto grow = [&](std::uint32_t age_us) {
+      if (age_us == kUnknown) return kUnknown;
+      return static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(age_us + since_us, kUnknown));
+    };
+    frame.position_age_us = grow(frame.position_age_us);
+    frame.velocity_age_us = grow(frame.velocity_age_us);
+    if (since_us >= hardware::kFaultFieldMaxAgeUs) {
+      frame.fault_flags &= ~hardware::kMotorNotFaultFlags;
+    }
+    return frame;
   }
   // Every device of `node` named `device`, whatever its kind, keyed by
   // table; throws std::invalid_argument when there is none.
@@ -442,38 +485,71 @@ struct SimHardware::Impl {
       }
     };
     // A disconnected motor or CAN sensor reads as the gateway publishes a
-    // device that stopped answering: its last readings through
-    // hardware::MarkInvalid (ages and temperature kept, every measurement
-    // zero). Its limit switches read released, as Phoenix reports a stale
-    // FaultField.
+    // device that stopped answering: hardware::MarkInvalid (every measurement
+    // zero) of what its last frame left (StoppedFrame: its ages grown since,
+    // its limit bits held for kFaultFieldMaxAgeUs). Its temperature reads 0
+    // once its signal is kTemperatureMaxAgeUs old, as PhoenixBackend reports
+    // a stale one. A connected device carries its injected ages unchanged.
+    const std::uint64_t sampled_us = Micros(sim.now());
     fill(state.motors, state.motor_count, hw.motors, [&](const auto& c) {
       const bool connected = Connected(Kind::kMotor, c.id);
-      const MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
-      hardware::MotorSample sample{
-          .id = c.id,
-          .valid = true,
-          .position_rot = axis.position,
-          .velocity_rps = axis.velocity,
-          .stator_current_a = axis.stator_current_a,
-          .position_age_us = axis.position_age_us,
-          .velocity_age_us = axis.velocity_age_us,
-          .fault_flags = connected ? ValueOr(motor_limit_flags, c.id, 0u) : 0u,
-          .temperature_c = axis.temperature_c,
-          .supply_current_a = axis.supply_current_a};
+      MotorAxis axis = ValueOr(motors, c.id, MotorAxis{});
+      std::uint32_t fault_flags = ValueOr(motor_limit_flags, c.id, 0u);
+      if (connected) {
+        temperature_read_us[c.id] = sampled_us;
+        last_frames[{Kind::kMotor, c.id}] = {
+            .sample_time_us = state.sample_time_us,
+            .position_age_us = axis.position_age_us,
+            .velocity_age_us = axis.velocity_age_us,
+            .fault_flags = fault_flags};
+      } else {
+        const LastFrame frame =
+            StoppedFrame(Kind::kMotor, c.id, state.sample_time_us);
+        axis.position_age_us = frame.position_age_us;
+        axis.velocity_age_us = frame.velocity_age_us;
+        fault_flags = frame.fault_flags;
+        if (const auto read = temperature_read_us.find(c.id);
+            read == temperature_read_us.end() ||
+            sampled_us - read->second >= kTemperatureMaxAgeUs) {
+          axis.temperature_c = 0;  // never read, or too old
+        }
+      }
+      hardware::MotorSample sample{.id = c.id,
+                                   .valid = true,
+                                   .position_rot = axis.position,
+                                   .velocity_rps = axis.velocity,
+                                   .stator_current_a = axis.stator_current_a,
+                                   .position_age_us = axis.position_age_us,
+                                   .velocity_age_us = axis.velocity_age_us,
+                                   .fault_flags = fault_flags,
+                                   .temperature_c = axis.temperature_c,
+                                   .supply_current_a = axis.supply_current_a};
       if (!connected || !Fresh(axis) || masked.contains({Kind::kMotor, c.id})) {
         hardware::MarkInvalid(sample);
       }
       return sample;
     });
     fill(state.sensors, state.sensor_count, hw.sensors, [&](const auto& c) {
-      const Axis axis = ValueOr(sensors, c.id, Axis{});
+      const bool connected = Connected(Kind::kCANcoder, c.id);
+      Axis axis = ValueOr(sensors, c.id, Axis{});
+      if (connected) {
+        last_frames[{Kind::kCANcoder, c.id}] = {
+            .sample_time_us = state.sample_time_us,
+            .position_age_us = axis.position_age_us,
+            .velocity_age_us = axis.velocity_age_us};
+      } else {
+        const LastFrame frame =
+            StoppedFrame(Kind::kCANcoder, c.id, state.sample_time_us);
+        axis.position_age_us = frame.position_age_us;
+        axis.velocity_age_us = frame.velocity_age_us;
+      }
       hardware::SensorSample sample{.id = c.id,
                                     .valid = true,
                                     .position_rot = axis.position,
                                     .velocity_rps = axis.velocity,
                                     .position_age_us = axis.position_age_us,
                                     .velocity_age_us = axis.velocity_age_us};
-      if (!Connected(Kind::kCANcoder, c.id) || !Fresh(axis)) {
+      if (!connected || !Fresh(axis)) {
         hardware::MarkInvalid(sample);
       }
       return sample;
@@ -752,6 +828,10 @@ void SimHardware::reboot() {
   impl_->resetting.clear();
   impl_->unable.clear();
   impl_->motor_drives_from.clear();
+  // The rebooted RoboRIO has received no frame yet: no temperature signal,
+  // no fault field, no ages.
+  impl_->temperature_read_us.clear();
+  impl_->last_frames.clear();
   impl_->ds_mode = driver_station::ModeTracker{};
 }
 

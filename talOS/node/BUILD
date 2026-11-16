@@ -138,6 +138,29 @@ talos_cc_node(
     deps = ["//talOS/process"],
 )
 
+# Integration tier (fork/exec, SIGTERM, the live registry): its own target,
+# out of node_test's lane.
+cc_test(
+    name = "node_stop_test",
+    size = "small",
+    srcs = ["node_stop_test.cc"],
+    data = [
+        "testdata/robot.toml",
+        ":blocked_node",
+    ],
+    env = {
+        "TALOS_BLOCKED_NODE": "$(rlocationpath :blocked_node)",
+        "TALOS_TEST_CONFIG": "$(rlocationpath testdata/robot.toml)",
+    },
+    tags = ["integration"],
+    deps = [
+        "//talOS/introspection:registry",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 cc_test(
     name = "node_test",
     size = "small",

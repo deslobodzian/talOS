@@ -9,6 +9,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -35,7 +36,22 @@ namespace hw = talos::hardware;
 // frees a watched block, for
 // ConfigPersister.TheSaverThreadNeitherAllocatesNorFrees. Global new and delete
 // are replaced for this test binary with malloc and free (the pair the default
-// ones use), so every block passes through Allocate() and Freed().
+// ones use), so every block passes through Allocate() and Freed(). With glibc
+// (the RoboRIO's C library) and no sanitizer, which brings its own allocator,
+// malloc, calloc, realloc, the aligned forms and free are replaced too, over
+// glibc's own (__libc_malloc, ...), so a C allocation on the saver thread
+// (the C library's, or a vendor library's) counts as well; elsewhere only new
+// and delete count.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || \
+    __has_feature(memory_sanitizer)
+#define TALOS_TEST_SANITIZER 1
+#endif
+#endif
+#if defined(__GLIBC__) && !defined(__SANITIZE_ADDRESS__) && \
+    !defined(__SANITIZE_THREAD__) && !defined(TALOS_TEST_SANITIZER)
+#define TALOS_TEST_COUNTS_MALLOC 1
+#endif
 namespace {
 std::array<std::atomic<const void*>, 8> watched{};
 std::atomic<int> freed_by_loop{0};
@@ -71,7 +87,6 @@ void Watch(const void* block) {
 
 void Freed(void* block) {
   if (block == nullptr) return;
-  CountOnSaver(saver_frees);
   for (auto& slot : watched) {
     const void* expected = block;
     if (slot.load(std::memory_order_relaxed) == block &&
@@ -84,7 +99,9 @@ void Freed(void* block) {
 }
 
 void* MaybeAllocate(std::size_t size) {
-  CountOnSaver(saver_allocations);
+#ifndef TALOS_TEST_COUNTS_MALLOC
+  CountOnSaver(saver_allocations);  // Otherwise malloc counts it.
+#endif
   return std::malloc(size == 0 ? 1 : size);
 }
 
@@ -92,7 +109,66 @@ void* Allocate(std::size_t size) {
   if (void* block = MaybeAllocate(size)) return block;
   throw std::bad_alloc{};
 }
+
+// The free side of the replaced deletes, counted once.
+void Release(void* block) {
+  Freed(block);
+#ifndef TALOS_TEST_COUNTS_MALLOC
+  if (block != nullptr) CountOnSaver(saver_frees);
+#endif
+  std::free(block);
+}
 }  // namespace
+
+#ifdef TALOS_TEST_COUNTS_MALLOC
+// glibc's allocator under its exported internal names, which the
+// replacements below forward to.
+extern "C" {
+// NOLINTBEGIN(bugprone-reserved-identifier): glibc's own names.
+void* __libc_malloc(std::size_t size);
+void* __libc_calloc(std::size_t count, std::size_t size);
+void* __libc_realloc(void* block, std::size_t size);
+void* __libc_memalign(std::size_t alignment, std::size_t size);
+void __libc_free(void* block);
+// NOLINTEND(bugprone-reserved-identifier)
+
+void* malloc(std::size_t size) noexcept {
+  CountOnSaver(saver_allocations);
+  return __libc_malloc(size);
+}
+void* calloc(std::size_t count, std::size_t size) noexcept {
+  CountOnSaver(saver_allocations);
+  return __libc_calloc(count, size);
+}
+void* realloc(void* block, std::size_t size) noexcept {
+  CountOnSaver(saver_allocations);
+  return __libc_realloc(block, size);
+}
+void* memalign(std::size_t alignment, std::size_t size) noexcept {
+  CountOnSaver(saver_allocations);
+  return __libc_memalign(alignment, size);
+}
+void* aligned_alloc(std::size_t alignment, std::size_t size) noexcept {
+  CountOnSaver(saver_allocations);
+  return __libc_memalign(alignment, size);
+}
+int posix_memalign(void** block, std::size_t alignment,
+                   std::size_t size) noexcept {
+  CountOnSaver(saver_allocations);
+  if (alignment == 0 || alignment % sizeof(void*) != 0 ||
+      (alignment & (alignment - 1)) != 0)
+    return EINVAL;
+  void* allocated = __libc_memalign(alignment, size);
+  if (allocated == nullptr) return ENOMEM;
+  *block = allocated;
+  return 0;
+}
+void free(void* block) noexcept {
+  if (block != nullptr) CountOnSaver(saver_frees);
+  __libc_free(block);
+}
+}  // extern "C"
+#endif
 
 // Every unaligned form, so a sanitizer's own new is never paired with free.
 void* operator new(std::size_t size) { return Allocate(size); }
@@ -104,29 +180,15 @@ void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
   return MaybeAllocate(size);
 }
 void operator delete(void* block, const std::nothrow_t&) noexcept {
-  Freed(block);
-  std::free(block);
+  Release(block);
 }
 void operator delete[](void* block, const std::nothrow_t&) noexcept {
-  Freed(block);
-  std::free(block);
+  Release(block);
 }
-void operator delete(void* block) noexcept {
-  Freed(block);
-  std::free(block);
-}
-void operator delete[](void* block) noexcept {
-  Freed(block);
-  std::free(block);
-}
-void operator delete(void* block, std::size_t) noexcept {
-  Freed(block);
-  std::free(block);
-}
-void operator delete[](void* block, std::size_t) noexcept {
-  Freed(block);
-  std::free(block);
-}
+void operator delete(void* block) noexcept { Release(block); }
+void operator delete[](void* block) noexcept { Release(block); }
+void operator delete(void* block, std::size_t) noexcept { Release(block); }
+void operator delete[](void* block, std::size_t) noexcept { Release(block); }
 
 namespace {
 
@@ -414,8 +476,10 @@ uint32_t Trailer(std::span<const uint8_t> persisted) {
 // and the saver starts after HAL, WPILib and Phoenix threads exist), and the
 // saver
 // preempted holding it would stall the loop's next allocation. So once
-// started it does neither, across saves that succeed, one that fails (its
-// directory does not exist) and the save Stop() runs while the last saved
+// started it does neither (with glibc, malloc and free included), across
+// saves that succeed, one that fails after writing and syncing its temporary
+// file (the rename over a directory fails, so the save unlinks the temporary
+// and leaves none behind) and the save Stop() runs while the last saved
 // configuration is still uncollected; each handed-over configuration's bytes
 // are freed on the loop thread (watched from the save until freed), and the
 // file holds the newest one handed over.
@@ -428,9 +492,11 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
   saver_frees = 0;
   const auto directory = std::filesystem::temp_directory_path();
   const auto path = (directory / "talos_config_saver_test.bin").string();
-  const auto unwritable =
-      (directory / "talos_no_such_directory" / "talos_config.bin").string();
+  // A directory where the file should be: the rename over it fails.
+  const auto unrenamable = directory / "talos_config_saver_test_directory";
   std::filesystem::remove(path);
+  std::filesystem::remove_all(unrenamable);
+  ASSERT_TRUE(std::filesystem::create_directory(unrenamable));
   const std::array<hw::Config, 4> configs{
       ConfigWithMotor(1), ConfigWithMotor(2), ConfigWithMotor(3),
       ConfigWithMotor(4)};
@@ -438,7 +504,7 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
   for (std::size_t i = 0; i < configs.size(); ++i)
     expected[i] = Trailer(hw::PersistedConfig(configs[i]));
   const talos::rio::ConfigFile file{path};
-  const talos::rio::ConfigFile unwritable_file{unwritable};
+  const talos::rio::ConfigFile unrenamable_file{unrenamable.string()};
   constexpr std::chrono::seconds kHang{10};
 
   std::mutex mutex;
@@ -462,7 +528,7 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
           const bool fail = fail_next;
           fail_next = false;
           lock.unlock();
-          const bool ok = (fail ? unwritable_file : file).Save(persisted);
+          const bool ok = (fail ? unrenamable_file : file).Save(persisted);
           lock.lock();
           if (finished < saved.size()) saved[finished] = Trailer(persisted);
           ++finished;
@@ -534,7 +600,10 @@ TEST(ConfigPersister, TheSaverThreadNeitherAllocatesNorFrees) {
       << "handed-over configurations the saver thread freed";
   EXPECT_EQ(freed_by_loop.load(), 4);
   EXPECT_EQ(talos::rio::LoadConfigFile(path), configs[3]);
+  EXPECT_FALSE(std::filesystem::exists(unrenamable.string() + ".tmp"))
+      << "the failed save left its temporary file";
   std::filesystem::remove(path);
+  std::filesystem::remove_all(unrenamable);
   on_loop_thread = false;
 }
 }  // namespace

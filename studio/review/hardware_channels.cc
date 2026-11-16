@@ -25,19 +25,39 @@ std::string ElementKey(const json& element, std::size_t index) {
   return std::to_string(index);
 }
 
-// Whether `prefix` names an element of a `pwm_outputs` array:
-// ".../pwm_outputs/<id>".
-bool IsPwmOutput(std::string_view prefix) {
+// Whether `prefix` names an element of an `array` array: ".../<array>/<id>".
+bool IsElementOf(std::string_view prefix, std::string_view array) {
   const auto slash = prefix.rfind('/');
-  return slash != std::string_view::npos &&
-         prefix.substr(0, slash).ends_with("/pwm_outputs");
+  if (slash == std::string_view::npos) return false;
+  const std::string_view parent = prefix.substr(0, slash);
+  return parent.size() > array.size() && parent.ends_with(array) &&
+         parent[parent.size() - array.size() - 1] == '/';
 }
 
-// The wire value (hardware::PwmMode) of a PWM request's mode as log_dump
-// names it (talOS/launcher/hardware_record.cc); none for another name.
-std::optional<talos::hardware::PwmMode> PwmModeNamed(std::string_view name) {
-  if (name == "off") return talos::hardware::PwmMode::kOff;
-  if (name == "pulse") return talos::hardware::PwmMode::kPulse;
+// The wire value of the mode log_dump names `name` (`name_of` is
+// talOS/launcher/hardware_record.h's HardwareModeName or PwmModeName, so the
+// names are spelled once); none for another name.
+template <typename Mode>
+std::optional<int> ModeNamed(std::string_view name, Mode last,
+                             const char* (*name_of)(Mode)) {
+  for (int value = 0; value <= static_cast<int>(last); ++value) {
+    if (name == name_of(static_cast<Mode>(value))) return value;
+  }
+  return std::nullopt;
+}
+
+// The wire value of a motor or PWM request's mode at `prefix`; none for any
+// other string member called mode.
+std::optional<int> RequestModeAt(std::string_view prefix,
+                                 std::string_view name) {
+  if (IsElementOf(prefix, "motors")) {
+    return ModeNamed(name, talos::hardware::kLastMode,
+                     &talos::launcher::HardwareModeName);
+  }
+  if (IsElementOf(prefix, "pwm_outputs")) {
+    return ModeNamed(name, talos::hardware::kLastPwmMode,
+                     &talos::launcher::PwmModeName);
+  }
   return std::nullopt;
 }
 
@@ -49,16 +69,15 @@ void FlattenObject(const json& object, const std::string& prefix,
   for (const auto& [key, member] : object.items()) {
     // The element's own key is its path segment; its name is a string.
     if (key == "id" || key == "port") continue;
-    // A PWM request's mode is a channel of its wire value, so off (no
-    // pulse) and a centre pulse, both an output of 0, read apart.
-    if (key == "mode" && member.is_string() && IsPwmOutput(prefix)) {
-      if (const auto mode = PwmModeNamed(member.get<std::string>())) {
+    // A motor or PWM request's mode is a channel of its wire value, so a
+    // neutral motor and a 0 V demand, or a PWM output off and a centre
+    // pulse, both a demand of 0, read apart.
+    if (key == "mode" && member.is_string()) {
+      if (const auto mode = RequestModeAt(prefix, member.get<std::string>())) {
         out.push_back({prefix + "/mode", Talos::Telemetry::ChannelKind_Double,
-                       talos::telemetry::RawFromDouble(
-                           static_cast<double>(static_cast<int>(*mode))),
-                       false});
+                       talos::telemetry::RawFromDouble(*mode), false});
+        continue;
       }
-      continue;
     }
     Flatten(member, prefix + "/" + key, out);
   }

@@ -178,9 +178,10 @@ Where RULES.md 12 is read too broadly or too narrowly:
 1. **No wall clock below integration.** Unit, component and contract tests
    never sleep, read `steady_clock::now` or `time.time`, or wait on a real
    timer. Nodes use `node.now()`; `Sim` owns time. **[enforced:
-   `tools/lint_test_time.py` over every test source; a test of a higher tier
-   that uses the real clock is listed with its reason and its number of
-   hit lines, which may only shrink, in
+   `tools/lint_test_time.py` over every test source, Studio's TypeScript
+   tests included (`setTimeout`, `Date.now`, `performance.now`); a test of
+   a higher tier that uses the real clock is listed with its reason and its
+   number of hit lines, which may only shrink, in
    `tools/lint_test_time_allowlist.txt`]**
 2. **Logic with a deadline takes its clock as a parameter**, so the policy
    (supervision deadlines, restart windows, retry intervals) is a component
@@ -440,7 +441,9 @@ build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
-matrix) are one script, `tools/source_lints.sh`, which CI's lint job and
+matrix, METHODOLOGY.md §13's `bazel_dep` table, and the RULES.md 4
+commissioning check against the diff base) are
+one script, `tools/source_lints.sh`, which CI's lint job and
 prepush's `source-lints` step both run; CI's sanitizer jobs are
 `tools/sanitizer_lane.sh asan|tsan`, which `tools/prepush.sh --full` also
 runs. Prepush also runs CI's clang-format and clang-tidy checks

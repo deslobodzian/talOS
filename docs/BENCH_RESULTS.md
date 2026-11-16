@@ -34,6 +34,31 @@ has 8 cores; the **Mac mini** is the deployment host (M4 Pro, 12 cores).
   14.3, 14.4 s; one run before the change: 234 of 234, 45.2, 46.2, 38.9 s.
   `install_check_test` alone: 17.7 and 17.6 s before, 12.0 and 11.9 s after.
   The earlier timeouts at load about 9 were not reproduced.
+
+- **RT-22: a Python worker thread delays `update()`.** Mac mini, macOS
+  (Darwin 25.3), idle (load 1.25 to 1.75), talOS f8d6dcad, Python 3.11.14,
+  `sys.getswitchinterval()` 0.005 s. A scratch `talos_py_node` (not kept)
+  owning no output, so an observer: timeshare, not the time-constraint
+  policy of a control node. Live run, `--duration-s 32`, the first 2 s
+  dropped; `update()` start-to-start intervals from `time.monotonic_ns()`
+  at its first line, against a worker thread started in the constructor:
+
+  | period | worker | p50 | p99 | max | over 1 ms late |
+  |---|---|---|---|---|---|
+  | 5 ms | none | 5.00 ms | 5.01 ms | 5.04 ms | 0 of 5998 |
+  | 5 ms | pure-Python loop | 7.51 ms | 11.91 ms | 12.51 ms | 2999 of 5988 |
+  | 5 ms | blocked in `socket.recv` | 5.00 ms | 5.03 ms | 5.07 ms | 0 of 5998 |
+  | 5 ms | `sorted()` of 2 M floats (224 ms) | 224.1 ms | 225.5 ms | 225.8 ms | 158 of 166 |
+  | 20 ms | none | 20.00 ms | 20.02 ms | 20.06 ms | 0 of 1498 |
+  | 20 ms | pure-Python loop | 20.00 ms | 21.31 ms | 22.28 ms | 20 of 1498 |
+  | 20 ms | blocked in `socket.recv` | 20.00 ms | 20.02 ms | 20.05 ms | 0 of 1498 |
+  | 20 ms | `sorted()` of 2 M floats (224 ms) | 224.3 ms | 225.8 ms | 226.0 ms | 183 of 189 |
+
+  A pure-Python worker costs `update()` up to the switch interval plus part
+  of a period; one C call that keeps the interpreter lock costs the whole
+  call; a worker waiting in a call that releases the lock costs nothing
+  measurable.
+
 - **RIO-1: stale-FaultField flake, mechanism observed.** Mac mini, macOS
   (Darwin 25.3), desktop Phoenix simulation, load 0.5 to 1.5, talOS
   6acdcf9f; one `StaleFaultFieldClearsLimitsAndKeepsFaults` per process.

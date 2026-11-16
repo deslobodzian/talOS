@@ -100,19 +100,20 @@ judges is in `talos_sim_test`'s docstring (`talOS/build/contract.bzl`).
 as a session member: Studio at `http://localhost:5800` (`[studio]
 http_port`, or `--studio-http-port PORT`) and the driver dashboard at
 `/drive`. The pages come from the talOS checkout, which builds them as its
-own workspace. In a robot repository, whose talOS is the submodule
-`talos/`, a student types:
+own workspace, so a student builds them there once, and again after moving
+the talOS version:
 
 ```sh
-(cd talos && bazel build //studio:web_dist)   # once, and after moving the talOS pin
+(cd <talOS checkout> && bazel build //studio:web_dist)
 bazel run //:sim -- --start-studio-bridge     # Studio at http://localhost:5800, the driver dashboard at /drive
 ```
 
-(here, `(cd ../.. && bazel build //studio:web_dist)`).
-
-`MODULE.bazel`'s `studio_web` reads that build's folder (`path`, here
-`../../bazel-bin/studio/dist`, in a robot repository
-`talos/bazel-bin/studio/dist`), `BUILD.bazel`'s `//:studio_webroot` makes it
+The checkout is whichever one `MODULE.bazel`'s `local_path_override` names:
+here `../..`; in a repository from `tools/new_robot.py`, the checkout it was
+made from (beside the repository, by a relative path, or an absolute one);
+with a git submodule, `talos`. A `git_override` leaves no checkout to build
+in. `MODULE.bazel`'s `studio_web` reads that build's folder (`path`,
+`<checkout>/bazel-bin/studio/dist`: here `../../bazel-bin/studio/dist`), `BUILD.bazel`'s `//:studio_webroot` makes it
 one directory in `//:sim`'s `data`, and `robot.toml`'s `[studio] webroot`
 names it (`bazel-bin/studio_webroot`); `@talos//studio/bridge:webroot.bzl`
 says how. Until the pages are built, `//:studio_webroot` holds only

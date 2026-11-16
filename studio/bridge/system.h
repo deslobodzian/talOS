@@ -197,11 +197,11 @@ inline const char* HealthName(TopicHealth health) {
 }
 
 inline TopicHealth HealthOf(const TopicRow& row) {
-  // An observer (naming::kSourceFlagObserver, telemetry) reads by design, so
-  // it counts as a reader here exactly as the launcher's "published but nothing
-  // subscribes to it" counts it (names.h, reader_count); it counts for nothing
-  // else, and stays listed apart from subscribers.
-  const bool read = !row.subscribers.empty() || !row.observers.empty();
+  // An observer counts as a reader here exactly where the launcher's lint
+  // counts it (naming::ObserverReads); it counts for nothing else, and stays
+  // listed apart from subscribers.
+  const bool read = !row.subscribers.empty() ||
+                    (!row.observers.empty() && naming::ObserverReads(row.name));
   if (row.publishers.empty() || !read) {
     // A missing end is a fault only when both ends were meant to be here.
     // EXTERNAL is checked first because it is the more specific statement: it

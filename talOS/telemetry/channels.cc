@@ -162,10 +162,7 @@ class Flattener {
     channels_.push_back(std::move(channel));
   }
 
-  bool IsStatusTopic() const {
-    const auto segments = naming::detail::Segments(topic_);
-    return segments.size() >= 2 && segments[1] == "status";
-  }
+  bool IsStatusTopic() const { return naming::Role(topic_) == "status"; }
 
   const reflection::Schema& schema_;
   std::string_view topic_;

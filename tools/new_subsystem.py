@@ -4084,11 +4084,13 @@ def robot_sim_files(root, layout, overrides):
             (build_file, old_build, build)]
 
 
-def simulation_block(name, kind, button=TELEOP_BUTTONS[0], raw=False):
+def simulation_block(name, kind, button=TELEOP_BUTTONS[0], raw=False,
+                     config="robot.toml"):
     """The TOML a student appends to the robot's simulation config so that
     `name` moves under `./sim.sh --sim-gateway` with joystick 0's `button`
     held (teleop_button's choice). A --raw position node's travel is a
-    constant in its file, so its block sets none.
+    constant in its file, so its block sets none. `config` is the file name
+    of the robot config the simulation config includes.
 
     The values go there, not in the subsystem file, because the robot's own
     configs never read the simulation config: a live button binding, gains
@@ -4105,7 +4107,7 @@ def simulation_block(name, kind, button=TELEOP_BUTTONS[0], raw=False):
     else:
         motor, demand, measure = f"{name}_motor", "velocity_rps = 20.0", ""
     block = f"""\
-# {name}: simulation values only. robot.toml never reads this file; before
+# {name}: simulation values only. {config} never reads this file; before
 # a real robot drives the {name}, tune slot0 on the mechanism{measure}.
 # Holding joystick button {button} writes {demand} on {lane}.
 [[{sub}.teleop.bindings]]
@@ -4207,7 +4209,8 @@ Next:
   {subsystem}
     List the camera nodes in `cameras`; point telemetry at the pose with
     [studio] pose_topic = "/{name}/state"."""
-    lines = simulation_block(name, kind, button, raw)
+    lines = simulation_block(name, kind, button, raw,
+                             posixpath.basename(layout.config))
     if sim_exists:
         step, manifest = "append these lines to", ""
     else:

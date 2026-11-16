@@ -241,8 +241,9 @@ reads OK, it asserts from the live DOM:
   STALE (the pre-match checks render whole; whether they pass is the
   simulator's data); every state word, tag and heading is whole, its text no
   wider than its box by even one 1/64 px layout unit; no text is under 12 px;
-  the subsystems and checks lists fit without scrolling; camera rows, where
-  the subject has any (the bench has none), read differently as rendered;
+  the subsystems and checks lists fit without scrolling (that rows whose
+  names differ only past the cell's width read differently is
+  `tests/drive.test.ts`'s, on the 2026 layout: the bench has no such rows);
 - at 1366x500, where the subsystems list scrolls: every visible row is whole
   and the heading's `N above` / `+N below` equals the rows the boxes show,
   after a scroll by script too; scrolled to the bottom and to the middle, the

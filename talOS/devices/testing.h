@@ -101,7 +101,8 @@ class SimHardware {
                  double supply_current_a = 0, double stator_current_a = 0);
   // The motor's TalonFX limit switches, asserted or not, reported from the
   // next state on as its ForwardHardLimit/ReverseHardLimit fault bits
-  // (Motor::forward_limit, reverse_limit) while it is connected. Reported
+  // (Motor::forward_limit, reverse_limit) while it is connected (held 50 ms
+  // past a disconnect, as set_connected says). Reported
   // only: like soft limits, an asserted switch does not stop the request or
   // the ideal motor.
   void set_limit_switches(std::string_view node, std::string_view device,
@@ -132,12 +133,21 @@ class SimHardware {
   void set_gateway_clock(Duration gateway_offset, Duration latency);
   // A disconnected device keeps its slot in /hw/state with valid == false,
   // so its handle reads connected() == false. A motor or CAN sensor carries
-  // what the gateway publishes for a device that stopped answering
-  // (hardware::MarkInvalid of its last readings: ages and temperature kept,
-  // every measurement zero, limit switches released); any other device
-  // carries zero values. Every device
-  // of that node named `device` is affected, whatever its kind; an unknown
-  // name throws std::invalid_argument.
+  // what the gateway publishes for a device whose frames stopped
+  // (hardware::MarkInvalid: every measurement zero), counted from the last
+  // State that read it connected this boot: its position and velocity ages
+  // are the ages injected at that State plus the sample time since (an
+  // unknown age stays unknown; UINT32_MAX if no State read it connected this
+  // boot); a motor's limit and limiter fault bits are those of that State
+  // until 50 ms after it (hardware::kFaultFieldMaxAgeUs), then clear; its
+  // temperature reads 0 from the State 500 ms after it (0 at once if none),
+  // as the RoboRIO reports a stale temperature signal. The robot counts both
+  // from the signal's last frame, which is older than that State (the
+  // temperature's by up to 250 ms at its 4 Hz), so it can clear the bits and
+  // read 0 that much sooner. A connected device
+  // carries its injected ages unchanged. Any other device carries zero
+  // values. Every device of that node named `device` is affected, whatever
+  // its kind; an unknown name throws std::invalid_argument.
   void set_connected(std::string_view node, std::string_view device,
                      bool connected);
   // A device reset, as the gateway reports one: the next state counts it in
@@ -157,7 +167,8 @@ class SimHardware {
   // built from a State of the new boot, later states and Driver Station
   // packets carry a new boot id, the tick sequence and device reset count
   // start over, and the Driver Station mode generation restarts. Feedback and
-  // the gateway clock carry on.
+  // the gateway clock carry on, but a device disconnected since before the
+  // reboot has had no frame this boot (set_connected).
   void reboot();
 
   // The Driver Station packet to forward from now on, stamped with the sim

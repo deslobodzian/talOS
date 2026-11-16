@@ -77,10 +77,12 @@ inline constexpr std::string_view kDirectionSuffixes[] = {
 // lint can tell a designed dead end from a fault: `/hw/command` is consumed
 // over UDP (external); `/drivetrain/target/auto` has no publisher yet
 // (optional). An observer is a framework node reading a topic it found in the
-// declared graph (telemetry): it is not a consumer, so the lint never names
-// it among a topic's readers, but a topic it records is read by design, so a
-// topic only observers read is no "published but nothing subscribes to it"
-// finding.
+// declared graph (telemetry, which records state and status topics and its
+// configured pose topic): it is not a consumer, so the lint never names it
+// among a topic's readers. A topic of a role its owner publishes (state,
+// status, event, telemetry; ObserverReads) that only observers read is read
+// by design, no "published but nothing subscribes to it" finding; an
+// instruction (target, request, command) only observers read still is one.
 inline constexpr std::uint32_t kSourceFlagExternal = 1u << 0;
 inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
 inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
@@ -108,8 +110,10 @@ inline constexpr std::uint32_t kSourceFlagUntargetedOutputs = 1u << 5;
 // The hardware bridge's roster name: the launcher lists the bridge under it
 // (launcher kHardwareNodeName), whatever binary `[robot] hardware_node` names,
 // and the stock bridge describes itself by it (talOS/bridge kNodeName; both
-// are held to this one). The graph lint knows the bridge by its roster slot
-// (NodeShape::hardware_bridge), not by the name a binary describes.
+// are held to this one). The graph lint knows the bridge by this roster name
+// (NodeShape::hardware_bridge), not by the name a binary describes; no
+// subsystem can take it, since Launcher::Run refuses a roster in which two
+// members share a name.
 inline constexpr std::string_view kHardwareBridgeNode = "hardware_node";
 
 inline bool IsSender(event::SourceKind kind) {
@@ -172,6 +176,13 @@ inline std::optional<std::string> CheckSegment(std::string_view segment,
 }
 
 }  // namespace detail
+
+// The role, a topic name's second segment (`status` of `/hw/status`).
+// Unchecked: empty when `topic` does not start with '/' or has one segment.
+inline std::string_view Role(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() >= 2 ? segments[1] : std::string_view{};
+}
 
 // One segment of a topic name, e.g. a target lane's source
 // (`/drivetrain/target/<source>`); `what` names it in the message.
@@ -364,8 +375,8 @@ struct NodeShape {
   std::string name;
   std::string target;
   std::vector<SourceShape> sources;
-  // The roster's hardware bridge (the launcher marks the node in the
-  // kHardwareBridgeNode slot, whatever its binary calls itself): the one node
+  // The roster's hardware bridge (the launcher marks the member named
+  // kHardwareBridgeNode, whatever its binary calls itself): the one node
   // that writes the `hw` namespace, except each node's own request.
   bool hardware_bridge{false};
 };
@@ -494,6 +505,17 @@ inline std::string JoinTargetLane(std::string_view subsystem,
   return "/" + std::string{subsystem} + "/target/" + std::string{source};
 }
 }  // namespace detail
+
+// Whether an observer (kSourceFlagObserver: telemetry) alone reads `topic` by
+// design: its role is one its owner publishes (kOwnerPublishedRoles: state,
+// status, event, telemetry). Nothing acts on an instruction (target, request,
+// command) an observer only records. LintGraph's "is read only by observers"
+// warning and Studio's topic health both apply this one test.
+inline bool ObserverReads(std::string_view topic) {
+  const auto segments = detail::Segments(topic);
+  return segments.size() >= 2 &&
+         detail::OneOf(kOwnerPublishedRoles, segments[1]);
+}
 
 // Whether `topic` is in the hardware request namespace: `/hw/request` or any
 // topic below it, well formed or not. Only a node's devices-layer flush
@@ -803,10 +825,20 @@ inline std::vector<Diagnostic> LintGraph(
           "is in the target policy of " + join(topic.readers) +
               " but nothing writes it yet");
     }
-    // reader_count counts observers too (kSourceFlagObserver).
-    if (topic.reader_count == 0 && !topic.exempt)
+    // reader_count counts observers too (kSourceFlagObserver); readers does
+    // not. An observer reads an owner's feed by design, but no instruction
+    // is acted on by an observer alone.
+    const std::string role{detail::Segments(topic.name)[1]};
+    if (!topic.exempt && topic.reader_count == 0) {
       add(Severity::WARNING, topic.name,
           "is published but nothing subscribes to it");
+    } else if (!topic.exempt && topic.readers.empty() &&
+               !ObserverReads(topic.name)) {
+      add(Severity::WARNING, topic.name,
+          "is read only by observers (telemetry); nothing acts on a '" + role +
+              "' topic, so its reader is missing or subscribes to a "
+              "differently spelled topic");
+    }
   }
 
   // The devices flush drives a node's outputs only in a tick in which one of

@@ -77,6 +77,25 @@ once, and each probe's or the replayed node's guardian kills its group.
 `--describe-only` stops after phase one, which makes the check useful on its own
 — in CI, in a pit before a match, or after a rename that touched two packages.
 
+`--describe-only` judges the graph, not whether this launch could start: it
+takes none of the refusals a launch makes before its probes that depend on
+the launch's own flags or on the host. `--describe-as-launch`, accepted only
+with `--describe-only` (alone it would start the roster, and is refused
+before the config is read), adds those that need nothing a running session
+holds; `deploy.sh`'s [graph check](../../docs/DEPLOYMENT.md#graph-check)
+passes it. Of a launch's refusals before its probes:
+
+| Refusal | `--describe-only` | with `--describe-as-launch` |
+|---|---|---|
+| `--allow-graph-errors` without `--sim`; `--sim-gateway-arg` without `--start-sim-gateway` or naming a port; an unloadable bundle or config; `--sim` with a remote other than `127.0.0.1`; a bad restart setting; a duplicate or misnamed member | refused | refused |
+| [`[robot] simulation_only`](#lightweight-simulation-gateway) without `--sim` | accepted | refused |
+| the [session lock](#one-session-per-namespace) held by another launch | not checked | not checked: it is held by the session a check runs beside |
+| the [live registry](../introspection/README.md#prepared-by-the-launcher) cannot be prepared or has no room | not checked | not checked: it is shared memory, and its rows are the running session's |
+
+A port the bridges bind is not checked either way: it is bound only by a
+member that has started (the hardware bridge's link, the Studio bridge's
+HTTP server).
+
 `--allow-graph-errors` overrides graph-error refusal, and the refusal of a
 [live endpoint mismatch](#live-endpoints), but not the refusal of a misnamed
 roster member ([node output](#node-output)). Missing descriptions cannot create
@@ -300,9 +319,15 @@ remote. On hardware, commissioning gates commands; see
 
 `--sim --start-sim-gateway` starts the binary named by `[robot] sim_gateway`
 (`//talOS/simulation:sim_gateway`, [its README](../simulation/README.md)) as
-a roster member. The launcher passes it the bridge's ports
-(`SimulatorArgs`): `--port` is the effective controller port the bridge sends
-to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
+a roster member, under the name `sim_gateway`. It is started with
+`--config` and `--session-id` and no `--log`, so it writes no event log, and
+`--replay-inputs --only` refuses it. These hold for the member the launcher
+adds only, which it does when `--sim`, `--start-sim-gateway` and a
+`[robot] sim_gateway` key are all present: a robot's own subsystem named
+`sim_gateway` is otherwise an ordinary node, and with that member the launch
+is refused naming its `[subsystems.sim_gateway]` key. The launcher passes the gateway the bridge's
+ports (`SimulatorArgs`): `--port` is the effective controller port the bridge
+sends to (`[robot] controller_port`, or `--remote-port`) and `--remote-port` the
 effective local port the bridge listens on (`[robot] local_port`, or
 `--local-port`), so the two always agree. Repeat `--sim-gateway-arg ARG` to
 forward further arguments verbatim, in order, after those, to **both** its
@@ -326,7 +351,13 @@ loading the config, before anything is probed or spawned:
     launcher: /path/robot_sim.toml sets [robot] simulation_only = true; run it with --sim (or --describe-only); nothing was started
 
 `--describe-only` and `--replay-inputs`, which touch no hardware, still run
-it. The key passes through `include` like every `[robot]` key, so a
+it, except `--describe-only --describe-as-launch`, which refuses it as the
+launch would ([two phases](#two-phases)), saying what that means for an
+install:
+
+    launcher: /path/robot_sim.toml sets [robot] simulation_only = true; a launch of it without --sim is refused, so it cannot be installed as the robot's; nothing was started
+
+The key passes through `include` like every `[robot]` key, so a
 simulation config that includes `robot.toml` sets it in its own `[robot]`;
 config load refuses a file that sets it `false` over an included file that
 sets it `true`, naming both files.
@@ -787,28 +818,29 @@ pass looks at every one.
 
 ### Restart latency
 
-From SIGKILL of a critical member to its first hardware request, measured on
-a Linux x86-64 desktop (8 threads) by killing `drivetrain` 20 times in a
-`--sim` session of the 2026 robot's `robot_physics_sim.toml` with the physics gateway under
+From the restart's `fork` to the restarted member's first hardware request,
+measured in the 2026 robot's own repository (not dated; no BENCH_RESULTS.md
+entry) on a Linux x86-64 desktop (8 threads) by killing its `drivetrain` 20
+times in a `--sim` session with the physics gateway under
 `--restart-window-ms 1500`, so each is a first restart, session directory on
-btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the killer's, the
-launcher's `waitpid` and `fork` and the restarted node's first constructor (an
-`LD_PRELOAD` shim), and the restarted run's `.tlog` origin, first tick deadline
-less its offset (`run()`) and first `/hw/request/drivetrain` send:
+btrfs. The stages come from `CLOCK_MONOTONIC` stamps: the launcher's `fork`
+and the restarted node's first constructor (an `LD_PRELOAD` shim), and the
+restarted run's `.tlog` origin, first tick deadline less its offset (`run()`)
+and first `/hw/request/drivetrain` send. The kill-to-reap and reap-to-`fork`
+stages (the SIGCHLD wakeup of the supervision loop; restart bookkeeping,
+where `RestartLogBudget` lists the session directory and the pass posts its
+manifest version to the writer thread) are not in it:
 
 | Stage | ms, median (range) | Set by |
 |---|---|---|
-| SIGKILL → launcher reaps the exit | not yet measured | the SIGCHLD wakeup of the supervision loop |
-| reap → `fork` of the restart | not yet measured | restart bookkeeping (`RestartLogBudget` lists the session directory); the pass posts its manifest version to the writer thread after its restarts |
 | `fork` → first constructor | 1.2 (1.1–1.2) | group and guardian setup, exec, dynamic loading |
 | first constructor → event-loop origin | 0.4 (0.4–0.5) | flags; the event-log file is created on the log's writer thread, not here |
 | origin → `run()` | 1.5 (1.4–1.6) | robot config parse, topic attach |
 | `run()` → first tick | 5.0 | one `period_us` |
 | first tick → first `/hw/request/drivetrain` | 0.0 | that tick's flush, which needs a `/hw/state` received since the node attached |
-| **total** | not yet measured | |
 
 `restart_latency` repeats the `.tlog` part of this measurement on any host:
-SIGKILL → origin (the first four rows together), origin → `run()`, `run()` →
+SIGKILL → origin (the two stages above and the first two rows together), origin → `run()`, `run()` →
 first tick, first tick → first request and the total, as median (range). The
 config's nodes come from `bazel-bin`, so build them first:
 
@@ -877,7 +909,11 @@ naming the log and the sign, and the launcher exits 1: one with a
 `log_capped`, a run's log without its EXIT record of a member it marks
 `log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
 one whose damaged
-records nothing bounds the time of. See
+records nothing bounds the time of. A damaged stretch in another reader's
+log of a topic is no loss only where an intact receipt of the topic follows
+it in that file and the session's other logs (the writer's sends) hold
+every message that reader could have lost there
+([the rule](../events/README.md#replaying-another-sessions-inputs)). See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
 timing and schema checks.
 
@@ -1372,7 +1408,15 @@ first). Every log is read through a fixed window (`WindowedLogReader`), never
 whole, so memory grows with the number of logs, not with their length. Each
 mode reads the session twice: once for the earliest event time every printed
 time is relative to and for the record count, printing the gap and damage
-warnings then, before any output; once to print. On a generated 210 MiB session (8
+warnings then, before any output; once to print. That baseline is the
+earliest event time over every record of the logs named, before any
+`--node`, `--topic`, `--since-ms` or `--until-ms` filter, so a filter never
+moves it: a log file named alone is timed from its own earliest record, so
+its times are not session-relative; name the session directory (with
+`--node` to keep the one process) for times from the session's earliest
+record. The text dump names the baseline under its file list
+(`times: ms after event time <ns> ns, the earliest record of these logs`),
+so two dumps' baselines can be compared. On a generated 210 MiB session (8
 logs, 1.72 million 128-byte records; `bazel run -c opt
 //talOS/launcher:log_memory_bench`, Linux x86-64) `log_dump`'s peak resident
 memory is 5.6 MiB, text or JSONL, where reading every log whole and holding
@@ -1404,11 +1448,15 @@ topic /gamma/state continuity_test.Count
 `records` counts the matching records per process and kind (a topic read by
 two nodes is counted in each log). `first_ms` and `last_ms` are the earliest
 and latest publication times, on the same baseline as the other formats (a
-timer's event time). `latest` is the last merged record's decoded value
-(`hardware` too for a hardware packet), and each `range` line gives a
-numeric or bool field's smallest and largest value over the matching
-records, as decoded, in field order (`message.<field>` inside a target
-envelope, `<field>[i]` for an array element). The summary is folded in
+timer's event time). `latest` is the last merged record's decoded value (a
+record its schema cannot decode gives why, `<...>`, and no field value); a
+hardware packet `log_dump` decodes has a `hardware` line in its place. Each
+`range` line gives a numeric or bool field's smallest and largest value
+over the matching records, as decoded, in field order (`message.<field>`
+inside a target envelope, `<field>[i]` for an array element), and each
+`values` line an enum field's names, each once in the order first seen
+(`values phase IDLE HOMED FAILED`), so a state change shows though
+`latest` reads only the last. The summary is folded in
 during the streaming pass, so its memory grows with the topics and their
 fields, not the records.
 
@@ -1916,7 +1964,11 @@ language can check the other. `studio/tests/launcher_graph.json` and
     bazel run @talos//talOS/launcher:launcher -- --describe-only \
       --config $PWD/main_processor/configuration/robot.toml
 
-in the 2026 robot's repository (talOS overridden to this checkout), with only `session_id` pinned, and `//studio:declared_test` parses both. So a
+in the 2026 robot's repository, with `session_id` and `config_path` pinned,
+and `//studio:declared_test` parses both. A talOS type's schema hash and size
+can be refreshed from this repository's own `--describe-only` graph (the
+bench's); the robot-defined types come only from a run there (the header
+comment of `studio/tests/declared.test.ts`). So a
 change to the envelope here fails there rather than reaching a viewer as a
 silently empty panel. Regenerate the fixtures and fix the parser in the same
 commit; the faults fixture is the same robot with `drivetrain` publishing the

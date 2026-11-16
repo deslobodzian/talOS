@@ -17,6 +17,10 @@
 #   ./tools/deploy.sh rollback [--prefix DIR] [--no-warm-up]
 #   ./tools/deploy.sh prune [--prefix DIR] [--keep N]
 #
+# install and rollback select a bundle only once its own launcher accepts it
+# as the boot service will start it: run.sh --describe-only
+# --describe-as-launch (a config with [robot] simulation_only is refused).
+#
 set -euo pipefail
 
 PREFIX="/opt/talos"
@@ -311,33 +315,44 @@ EOF
 
 # --- graph check ------------------------------------------------------------
 # The launch's own first phase, run on the installed copy before anything
-# selects it: the copy's run.sh with --describe-only, so the bundle's launcher
-# probes every member with --describe on the config run.sh passes (Studio's
-# bridge included when the bundle carries it), lints the graph and exits. A
-# graph it refuses (a naming or graph-lint error, a critical member that does
-# not answer, a parameter key no node reads) would make the boot service
-# restart a refusing launcher forever, so install refuses it. Its warnings
-# (the graph's `  warning: ` lines; a non-critical member that did not answer
-# is one) do not refuse and are printed. Not covered: --describe-only skips
-# the `[robot] simulation_only` refusal a launch without --sim makes, and the
-# check runs as the installing person with their environment, not as the
-# boot service's account (check_interpreters runs what members find through
-# the service's PATH). The check needs
-# no controller, shared memory, registry, session lock or realtime
-# privilege: --describe-only takes none of them and a --describe run opens no
-# device. Its session directory goes to a temporary root, removed afterwards.
-# --no-warm-up does not skip it; on macOS a fresh bundle's probes then pay
-# the first-run charge inside their deadline. There is no override: the
-# launcher accepts --allow-graph-errors only with --sim, so a robot could
-# never launch such a bundle. rollback runs it too, on `previous`. A stop
-# stops the launcher and removes the temporary root (stop traps, below).
+# selects it: the copy's run.sh with --describe-only --describe-as-launch, so
+# the bundle's launcher probes every member with --describe on the config
+# run.sh passes (Studio's bridge included when the bundle carries it), lints
+# the graph and exits, and refuses too what the boot service's launch (run.sh
+# bare, so without --sim) would refuse before its probes: a config that sets
+# `[robot] simulation_only = true`. A graph it refuses (a naming or
+# graph-lint error, a critical member that does not answer, a parameter key
+# no node reads) would make the boot service restart a refusing launcher
+# forever, so install refuses it. Its warnings (the graph's `  warning: `
+# lines; a non-critical member that did not answer is one) do not refuse and
+# are printed. A bundle's launcher built before --describe-as-launch refuses
+# the flag while it parses its arguments, before it reads the config, with
+# exactly one line, `launcher error: unknown argument: --describe-as-launch`;
+# on that output alone the check runs again with --describe-only only, which
+# judges everything but simulation_only, and warns that it did not check
+# that (a refusal prints other lines, so it is never retried). Not covered:
+# the refusals of a launch that need what the check must not take beside a
+# running robot (the session lock, the live registry, the bridges' sockets),
+# and the check runs as the installing person with their environment, not
+# as the boot service's account (check_interpreters runs what members find
+# through the service's PATH). The check needs no controller, shared memory,
+# registry, session lock or realtime privilege: --describe-only takes none
+# of them and a --describe run opens no device. Its session directory goes
+# to a temporary root, removed afterwards. --no-warm-up does not skip it; on
+# macOS a fresh bundle's probes then pay the first-run charge inside their
+# deadline. There is no override: the launcher accepts --allow-graph-errors
+# only with --sim, so a robot could never launch such a bundle. rollback
+# runs it too, on `previous`. A stop stops the launcher and removes the
+# temporary root (stop traps, below).
+AS_LAUNCH=--describe-as-launch
 check_graph() {
   local bundle="$1"
   if [ "$DRY_RUN" = "1" ]; then
-    printf '+ %s/run.sh --describe-only --output-dir <temporary root>\n' "$bundle"
+    printf '+ %s/run.sh --describe-only --output-dir <temporary root> %s\n' \
+      "$bundle" "$AS_LAUNCH"
     return 0
   fi
-  say "checking the graph: $bundle/run.sh --describe-only"
+  say "checking the graph: $bundle/run.sh --describe-only $AS_LAUNCH"
   local scratch
   # macOS's TMPDIR ends in a slash; the launcher prints paths under this.
   scratch="${TMPDIR:-/tmp}"
@@ -354,10 +369,20 @@ check_graph() {
   hold_stops "the graph check"
   STOP_SCRATCH="$scratch"
   PYTHONDONTWRITEBYTECODE=1 "$bundle/run.sh" --describe-only \
-    --output-dir "$scratch" </dev/null >"$scratch/output" 2>&1 &
+    --output-dir "$scratch" "$AS_LAUNCH" </dev/null >"$scratch/output" 2>&1 &
   STOP_CHILD=$!
   wait "$STOP_CHILD" || status=$?
   STOP_CHILD=""
+  if [ "$status" = "1" ] && [ "$(cat "$scratch/output")" = \
+      "launcher error: unknown argument: $AS_LAUNCH" ]; then
+    printf "deploy: warning: this bundle's launcher predates %s: checked with --describe-only alone, so a config that sets [robot] simulation_only = true is not refused\n" "$AS_LAUNCH" >&2
+    status=0
+    PYTHONDONTWRITEBYTECODE=1 "$bundle/run.sh" --describe-only \
+      --output-dir "$scratch" </dev/null >"$scratch/output" 2>&1 &
+    STOP_CHILD=$!
+    wait "$STOP_CHILD" || status=$?
+    STOP_CHILD=""
+  fi
   if [ "$status" = "0" ]; then
     # PrintDeclaredGraph writes each diagnostic as "  warning: <subject>: ...".
     local warnings
@@ -1276,7 +1301,7 @@ cmd_prune() {
   done
 }
 
-usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
   local cmd="${1:-}"; shift || true

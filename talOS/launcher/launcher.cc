@@ -31,7 +31,6 @@
 #include "talOS/launcher/session_lock.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
-#include "talOS/rtms/process_liveness.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -262,7 +261,8 @@ class NamespaceNames {
     if (std::uncaught_exceptions() > 0 || !session_lock_) return;
     const std::string registry = ShmObjectName(introspect::kRegistryPath);
     if (!registry.starts_with("/~")) return;
-    if (registry_prepared_) RemoveRegistry(registry);
+    if (registry_prepared_)
+      static_cast<void>(introspect::RemoveRegistryUnlessHeld(session_id_));
     // Still held, so no other launch's: removed before the lock is released
     // (SessionLock's destructor, after this one). Not when the path names
     // another file (Refresh false): that may be another launch's.
@@ -270,36 +270,6 @@ class NamespaceNames {
   }
 
  private:
-  void RemoveRegistry(const std::string& mapped) const {
-    try {
-      // Not waited for: a holder now is no member of this session (every
-      // one is reaped), and the registry stays for it.
-      const introspect::RegistryLock lock{mapped, std::chrono::milliseconds{0}};
-      {
-        const introspect::RegistryMapping registry{introspect::kRegistryPath,
-                                                   /*read_only=*/true};
-        // A row of another session keeps the registry while its claimant
-        // runs; one whose process is gone (a SIGKILLed node of an earlier
-        // session, not yet swept by a claim) is no one's.
-        for (const auto& row : registry.header()->nodes) {
-          if (row.state.load(std::memory_order_acquire) !=
-                  static_cast<uint64_t>(introspect::SlotState::FREE) &&
-              row.session_id != session_id_ &&
-              talos::ProcessWordAlive((row.pid_start << kProcessPidBits) |
-                                      row.pid))
-            return;
-        }
-      }
-      introspect::RegistryMapping::unlink();
-      // Under the lock: a writer waiting on this file finds it no longer
-      // current once it locks it, and takes the one the path names anew
-      // (RegistryLock).
-      ::unlink(introspect::LockFilePath(mapped).c_str());
-    } catch (const std::runtime_error&) {  // NOLINT(bugprone-empty-catch)
-      // Held, absent or not this layout: left as it is.
-    }
-  }
-
   const std::optional<SessionLock>& session_lock_;
   uint64_t session_id_;
   bool registry_prepared_{false};
@@ -477,6 +447,12 @@ int Launcher::RunSession(StopSignals& stop_signals) {
                  "nothing was described or started\n";
     return 1;
   }
+  // Alone it would start the roster, which whoever passed it meant to check.
+  if (options_.describe_as_launch && !options_.describe_only) {
+    std::cerr << "launcher: --describe-as-launch requires --describe-only; "
+                 "nothing was described or started\n";
+    return 1;
+  }
   if (!options_.sim_gateway_args.empty() && !options_.start_sim_gateway) {
     std::cerr << "launcher: --sim-gateway-arg requires --start-sim-gateway\n";
     return 1;
@@ -584,11 +560,22 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     return 1;
   }
   // A simulation config (its gains, bindings and travel) never drives real
-  // hardware. --describe-only and --replay-inputs touch none.
-  if (robot_config.simulation_only && !options_.simulation && starts_roster) {
+  // hardware. --describe-only and --replay-inputs touch none, but
+  // --describe-as-launch asks --describe-only for the launch's verdict.
+  // Of the launch's other refusals before its probes, this is the only one
+  // that needs no lock, shared memory, socket or process: the session lock
+  // (held by the session a check runs beside) and the registry's
+  // preparation and capacity stay the launch's alone.
+  if (robot_config.simulation_only && !options_.simulation &&
+      (starts_roster || options_.describe_as_launch)) {
     std::cerr << "launcher: " << options_.config_path
-              << " sets [robot] simulation_only = true; run it with --sim "
-                 "(or --describe-only); nothing was started\n";
+              << " sets [robot] simulation_only = true; "
+              << (options_.describe_as_launch
+                      ? "a launch of it without --sim is refused, so it "
+                        "cannot be installed as the robot's; nothing was "
+                        "started\n"
+                      : "run it with --sim (or --describe-only); nothing "
+                        "was started\n");
     return 1;
   }
   std::string effective_remote;
@@ -819,8 +806,9 @@ int Launcher::RunSession(StopSignals& stop_signals) {
     proc.target = spec.target;
     proc.binary_path = spec.binary_path;
     proc.binary_sha256 = FileSha256(spec.binary_path);
-    // The gateway is started without --log, so it writes no event log.
-    if (spec.name != kSimGatewayName) {
+    // The launcher's gateway is started without --log, so it writes no
+    // event log.
+    if (!spec.sim_gateway) {
       proc.log_path = NodeLogPath(options_.output_dir, spec.name, 0);
     }
     proc.described = described[i].answered;
@@ -948,7 +936,7 @@ void Launcher::PrepareLaunch(const NodeSpec& spec,
       options_.construction_timeout};
   auto& args = launch.args;
   args.push_back(spec.binary_path);
-  if (proc.name == kSimGatewayName) {
+  if (spec.sim_gateway) {
     // The gateway stamps the config's config_id; unconfigured it stamps
     // 0, which every mechanism rejects.
     args.insert(args.end(), {"--config", options_.config_path, "--session-id",
@@ -1025,7 +1013,7 @@ int Launcher::RunOnRecordedInputs(const std::vector<NodeSpec>& specs) {
               << " names no roster member of " << options_.config_path << "\n";
     return 1;
   }
-  if (spec->name == kHardwareNodeName || spec->name == kSimGatewayName ||
+  if (spec->name == kHardwareNodeName || spec->sim_gateway ||
       spec->studio_bridge) {
     std::cerr << "launcher: " << spec->name
               << " is not a talos node and has no input replay\n";

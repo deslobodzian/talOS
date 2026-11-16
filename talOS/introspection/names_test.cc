@@ -280,7 +280,7 @@ TEST(LintGraph, ACorrectGraphProducesNoFindings) {
 // an error naming the topic and the limit. Nine is the first count the
 // eight-slot table refused; 32 is about twice the Driver Station readers of
 // a robot with six mechanisms.
-// REQ-CONTRACT-36
+// REQ-CONTRACT-36, REQ-CONTRACT-09
 TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
   // Written out, not MAX_READERS, so that a smaller table fails here.
   constexpr std::size_t kRequiredReaders = 32;
@@ -311,6 +311,7 @@ TEST(LintGraph, ReaderLimitIncludesObserversAndAllowsExactlyTheLimit) {
 
 // The defect this protocol exists to catch: both ends present, both valid
 // names, different strings, so the reader is waiting on a topic nobody writes.
+// REQ-CONTRACT-09
 TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
@@ -334,6 +335,7 @@ TEST(LintGraph, AReadTopicNobodyWritesIsAnError) {
 // one error on that topic. The bridge is its roster slot, not its name: a
 // replacement bridge binary may call itself anything, and a node calling
 // itself hardware_node gains nothing.
+// REQ-CONTRACT-09
 TEST(LintGraph, OnlyTheBridgeAndEachNodesFlushWriteTheHwNamespace) {
   struct Case {
     const char* writer;
@@ -416,6 +418,7 @@ TEST(LintGraph, OwnerRolesFlowTheRightWay) {
 
 // A lane whose source no mode of the subsystem's policy lists is never read:
 // a dead producer, refused before launch.
+// REQ-CONTRACT-09
 TEST(LintGraph, ALaneOutsideTheTargetPolicyIsAnError) {
   const std::vector<NodeShape> nodes = {
       {"aligner",
@@ -440,6 +443,7 @@ TEST(LintGraph, ALaneOutsideTheTargetPolicyIsAnError) {
 // Required coverage: each nonempty mode of a target-consuming subsystem's
 // policy needs a writer on at least one of its lanes, judged per mode rather
 // than over the union. Without it the gap is only a per-lane warning.
+// REQ-CONTRACT-09
 TEST(LintGraph, RequiredTargetCoverageIsCheckedPerMode) {
   const std::vector<NodeShape> nodes = {
       {"drivetrain",
@@ -596,6 +600,7 @@ SourceShape Typed(SourceShape shape, std::string schema, std::uint64_t hash,
 // (a registry snapshot), else by schema name and hash (a field can change type
 // without changing size), and on the ring layout the segment is created with.
 // A disagreement is exactly one error on the topic, naming both nodes.
+// REQ-CONTRACT-09
 TEST(LintGraph, BothEndsMustAgreeOnTypeAndRingLayout) {
   struct Case {
     std::uint32_t bytes;
@@ -665,28 +670,41 @@ TEST(LintGraph, DevelopmentGapsAreWarningsNotErrors) {
   }
 }
 
-// A topic no node reads warns; one an observer records (telemetry) is read,
-// so it is no finding: a mechanism's state published for display is a
-// design, not a dead end, and a warning on every such topic of a robot reads
-// as a fault.
-TEST(LintGraph, AnUnreadTopicWarnsUnlessAnObserverRecordsIt) {
+// REQ-CONTRACT-09: a topic no node reads warns. One an observer records
+// (telemetry) is read when the owner publishes it (state, status, event,
+// telemetry): a mechanism's state published for display is a design, not a
+// dead end, and a warning on every such topic of a robot reads as a fault.
+// An instruction (target, request, command) only an observer reads still
+// warns: telemetry observes every topic, so otherwise a writer whose only
+// reader subscribed `optional` to a misspelled topic has no finding at all.
+TEST(LintGraph, AnUnreadTopicWarnsUnlessAnObserverRecordsItsOwnersFeed) {
   const NodeShape motor{
       "motor", "//robot/motor:node", {Sender("/motor/state")}};
-  for (const auto& [name, nodes, warned] :
-       std::vector<std::tuple<const char*, std::vector<NodeShape>, bool>>{
-           {"no reader", {motor}, true},
+  const auto telemetry = [](const char* observed) {
+    return NodeShape{"telemetry",
+                     "//talOS/telemetry:node",
+                     {Watcher(observed, 32, kSourceFlagObserver),
+                      Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+  };
+  for (const auto& [name, nodes, subject, warned] : std::vector<
+           std::tuple<const char*, std::vector<NodeShape>, const char*, bool>>{
+           {"no reader", {motor}, "/motor/state", true},
            {"an observer only",
-            {motor,
-             {"telemetry",
-              "//talOS/telemetry:node",
-              {Watcher("/motor/state", 32, kSourceFlagObserver),
-               Sender("/talos/telemetry", 32, kSourceFlagExternal)}}},
+            {motor, telemetry("/motor/state")},
+            "/motor/state",
             false},
+           {"an instruction its reader misspelled, observed",
+            {telemetry("/arm/command"),
+             {"planner", "//robot/planner:node", {Sender("/arm/command")}},
+             {"arm",
+              "//robot/arm:node",
+              {Watcher("/arm/command/goal", 32, kSourceFlagOptional)}}},
+            "/arm/command",
+            true},
        }) {
     SCOPED_TRACE(name);
     const auto diagnostics = LintGraph(nodes);
-    EXPECT_EQ(Find(diagnostics, Severity::WARNING, "/motor/state") != nullptr,
-              warned)
+    EXPECT_EQ(Find(diagnostics, Severity::WARNING, subject) != nullptr, warned)
         << Describe(diagnostics);
     EXPECT_EQ(diagnostics.size(), warned ? 1u : 0u) << Describe(diagnostics);
   }

@@ -16,9 +16,14 @@ tests and `sim_gateway`.
 The bridge (`//talOS/bridge:hardware_node`) parses the robot's TOML
 configuration and pushes it to the gateway as chunked `kHardwareConfig`
 frames; `Endpoint` reassembles them, starts `Gateway::BeginReconfigure`, and
-answers with a `kHardwareConfigAck` when the worker finishes. A push completed
-while a configure is still pending (every boot restore) is dropped without an
-ACK; the bridge pushes again after its 50 ms retry gate. The manifest holds
+answers with a `kHardwareConfigAck` when the worker finishes. An ACK whose
+send fails is sent again at the start of each later tick until a send
+succeeds or a newer transfer completes (only the newest completed transfer's
+ACK goes out), and `Endpoint::Tick` returns the failure,
+so the RoboRIO program replaces a socket that can no longer send. A push
+completed while a configure is still pending (every boot restore) is dropped
+without an ACK; the bridge pushes again after its 50 ms retry gate. The
+manifest holds
 logical device IDs, names, CAN
 addresses and bus names, inversion, encoder offsets, current/voltage limits,
 gearing, three gain slots, soft limits, TalonFX limit switches, FOC, the
@@ -462,7 +467,20 @@ every status; a refused State is not published) as `SEND`s in a `.tlog`
 raw `Packet`s, each with the transport sequence and
 publication time its readers receive, and the pass that produced it as its
 event time. A clean stop ends the log with an EXIT record, as an event
-loop's does.
+loop's does. It holds no `/hw/state/driver_station`: the bridge forwards
+each Driver Station packet with a plain write, so a session has that topic
+only in its readers' logs (receipts), and none when no node reads it;
+`/hw/status` `driver_station_packet_count` counts the packets forwarded.
+
+The bridge's exit lines (stdout, so the session's
+`<output_dir>/<session_id>/hardware_node.log`, [node
+output](../launcher/README.md#node-output)) carry counters `/hw/status` does
+not: `passes`, the wake reasons, `wait_fallbacks`, `send_failures`,
+`socket_reopens`, and `throttled`, the passes that spent the loop's CPU
+budget (8 passes or 64 received datagrams in a 1 ms window,
+`HardwareNode::kCpuWindowUs`) and so slept through input until the window
+ended. A nonzero `throttled` means a gateway or a node flooded the bridge;
+normal traffic stays far below the budget.
 
 Nodes read the gateway's poll timestamp in their own clock through
 `HardwareLink::sample_time()` (C `talos_hardware_sample_time`, Python
@@ -1069,7 +1087,7 @@ or without a live command. Both keep each PWM output's last request
 | Torque current | Not modelled: velocity and voltage read 0, as for duty cycle | The volts that pass the demand through the winding at the rotor's speed, I R + back-EMF in the motor's direction (`TorqueCurrentVolts`), the current clamped to `max_torque_current_a` and `stator_limit_a`, the volts to `max_voltage` and the supply; powered at 0 A, modelled as zero torque, so a free rotor spins on (hardware unmeasured: [Supported Hardware Requests](#supported-hardware-requests)). FOC is not modelled |
 | Stator current | Zero | (applied volts - back-EMF) / R, clamped to `stator_limit_a`; R and free speed from the motor type's published 12 V stall current and free speed (`MotorModelFor`: Kraken X60 366 A and 6000 rpm, the default; Kraken X44 275 A and 7530 rpm; Falcon 500 257 A and 6380 rpm). A motor held at a soft limit is stalled. The type is the motor's `motor_type` key (above) |
 | Home switch | None: a digital input reads what `SetDigitalInput` set, false if unset | `SetHomeSwitches` (`sim::HomeSwitch`): a named digital input reads closed exactly while a named motor's reported position is at or beyond a point (below or above it), with no hysteresis, and reads `closed_reads` while closed (default false: normally open); bound by name, it survives a pushed config. `sim_gateway` binds each input's `sim_motor` keys (above); an input without them reads false at every position |
-| Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid, its age growing), per-device disconnect, controller restart |
+| Faults | Device resets, digital/analog/encoder setters | Plus frozen feedback (valid) and per-device disconnect (invalid), each read as `PhoenixBackend` reads a device whose frames stopped: ages growing from its last sample, limit bits cleared once that sample is 50 ms old and temperature 0 once it is 500 ms old (`kFaultFieldMaxAgeUs`, `kTemperatureMaxAgeUs`, `feedback.h`); controller restart |
 | Device restore | The chain `BeginRestoreAfterReset` reapplies (its motors, their followers, motors on a listed remote CANcoder: `RestoredWith`, `feedback.h`) reads invalid until `PollRestore` completes it, as `PhoenixBackend::Read` reports it (the gateway masks it in those States either way); completes at the next poll, unless `SetRestoreFails` fails restores: the chain then stays invalid until one succeeds | The same |
 
 Tests live in `sim_physics_test.cc`. The standalone `sim_gateway` runs the
