@@ -7,15 +7,17 @@ into a fresh prefix, which runs every member once without a warning. Then
 --describe runs every node binary from there, so a C++ node that cannot
 load a shared library it links, or a Python node that cannot import its
 wheels or start its interpreter (as when Bazel restored the bundle from its
-cache with links copied), fails here. A Python node's native wheel (numpy's
-extension modules and the libraries the wheel bundles) must also load from
-the installed files and nowhere else. The subjects are the bench robot's
+cache with links copied), fails here. A Python node's native wheels (numpy's,
+gtsam's and robotpy-wpimath's extension modules and the libraries the
+wheels bundle or depend on) must also load from the installed files and
+nowhere else. The subjects are the bench robot's
 bundles: the deployable one, which carries Studio and which link and stop
 qualification install; the Python bench robot's, with two Python nodes;
 and a test config that reaches its files through `include`, a
 parent-directory `defaults`, a custom `path` and an entry `node`, and adds
-a Python node importing numpy (the bench robot's own nodes import no native
-wheel). A bundle that carries Studio is described by the command the boot service
+a Python node importing numpy, gtsam and robotpy-wpimath (the bench robot's
+own nodes import no native wheel, and no other talOS target loads the gtsam
+and robotpy-wpimath talOS pins for robot repositories). A bundle that carries Studio is described by the command the boot service
 runs (deploy.sh enable-boot's systemd ExecStart and launchd
 ProgramArguments), which must run its bridge from the install, found through
 the manifest's [studio] table, beside the index page of the webroot that
@@ -56,11 +58,16 @@ BUNDLES = (
     "bench/main_processor/relocation_bundle",
 )
 
-# Python nodes whose bundle holds a native wheel, and the modules of it that
-# must load from the installed files: the package, and the extension module
-# that links the libraries the wheel bundles.
+# Python nodes whose bundle holds native wheels, and the modules of them
+# that must load from the installed files: each package, and the extension
+# module that links the libraries the wheel bundles (gtsam.libs/) or its
+# robotpy-native wheel holds (native/wpimath/, native/wpiutil/). On Linux
+# each module's first name must also name a mapped file.
 NATIVE_IMPORTS = {
-    "native_wheel": ("numpy", "numpy._core._multiarray_umath"),
+    "native_wheel": ("numpy", "numpy._core._multiarray_umath",
+                     "gtsam", "gtsam.gtsam",
+                     "wpimath.geometry", "wpimath.geometry._geometry",
+                     "wpiutil._wpiutil"),
 }
 
 # What a Python node's interpreter must not inherit from the test: the
@@ -253,7 +260,10 @@ class BundleTest(unittest.TestCase):
                              f"{node['name']}: {proc.stderr}")
             loaded = json.loads(proc.stdout)
             if sys.platform == "linux":
-                self.assertTrue(loaded["mapped"], (node["name"], loaded))
+                for root in {module.split(".")[0] for module in modules}:
+                    self.assertTrue(
+                        [path for path in loaded["mapped"] if root in path],
+                        (node["name"], root, loaded))
             for path in loaded["files"] + loaded["mapped"]:
                 self.assertTrue(path.startswith(installed + os.sep),
                                 f"{node['name']}: {path} is not under "

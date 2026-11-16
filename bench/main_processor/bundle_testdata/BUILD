@@ -10,15 +10,20 @@ exports_files([
     "mechanisms/native_wheel.toml",
 ])
 
-# bundle_test only: a Python node importing numpy, a native wheel, so
-# relocation_bundle carries a wheel's extension modules and the shared
-# libraries it bundles.
+# bundle_test only: a Python node importing native wheels (numpy, and the
+# gtsam and robotpy-wpimath that talOS pins for robot repositories and no
+# other talOS target loads), so relocation_bundle carries wheels' extension
+# modules and the shared libraries they bundle.
 talos_py_node(
     name = "native_wheel",
     class_name = "NativeWheel",
     main = "native_wheel.py",
     node_name = "native_wheel",
-    deps = ["@pypi//numpy"],
+    deps = [
+        "@pypi//gtsam",
+        "@pypi//numpy",
+        "@pypi//robotpy_wpimath",
+    ],
 )
 
 manifest_sync_test(
