@@ -2769,6 +2769,7 @@ TEST(Gateway, RestoredCANcoderIsInvalidInTheTickItsRestoreEnds) {
 // A dropped watchdog neutral must not leave the last demand in force: every
 // Tick without an accepted command refreshes neutral until a fresh command
 // supersedes it, matching the disabled and unhealthy paths.
+// REQ-SAFE-17
 TEST(Gateway, WatchdogNeutralRefreshesEveryTickUntilFreshCommand) {
   FakeBackend backend;
   const auto config = SwerveConfig(true);

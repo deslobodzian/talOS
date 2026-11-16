@@ -489,6 +489,8 @@ TEST_F(TargetTest, DriverStationLossIsNull) {
   EXPECT_EQ(Seen(), std::nullopt);
 }
 
+// REQ-SAFE-10: a link that drops and returns in the same mode keeps its
+// generation.
 TEST_F(TargetTest, SameModeRecoveryKeepsTheGeneration) {
   Hold("teleop", 1.0, 20ms);
   const std::uint64_t teleop = DriverStationGeneration(sim);
