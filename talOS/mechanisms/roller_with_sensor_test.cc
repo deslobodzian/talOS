@@ -338,8 +338,8 @@ TEST(RollerWithSensor, InvalidSensorSampleRestartsTheDebounce) {
   EXPECT_EQ(indexer.roller().phase(), RollerPhase::kIntaking);
 }
 
-// REQ-SAFE-02: a disabled robot drives nothing, while the state machine keeps
-// the held piece.
+// Matrix case 2: losing enable keeps the held piece. The neutral output is
+// the devices flush's (REQ-SAFE-02, proved in talOS/devices).
 // REQ-SAFE-38
 TEST(RollerWithSensor, DisabledRobotGoesNeutral) {
   Rig intake{"intake"};

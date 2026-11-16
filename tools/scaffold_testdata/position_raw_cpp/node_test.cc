@@ -114,7 +114,10 @@ TEST_F(PositionRawCppTest, DrivesAtALiveLane) {
   EXPECT_TRUE(state.connected());
 }
 
-// REQ-SAFE-02
+// REQ-CONTRACT-25: matrix case 2, `state` still published with
+// `enabled == false` while disabled. The neutral request is the
+// devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
+// node's evidence.
 TEST_F(PositionRawCppTest, DisabledRobotGoesNeutral) {
   hw.set_driver_station(DsPacket(ds::kEnabled | ds::kTeleop));
   hw.enable(false);

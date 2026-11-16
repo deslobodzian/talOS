@@ -135,7 +135,10 @@ TEST_F(SwerveModuleTest, ReversesPastAQuarterTurn) {
   EXPECT_TRUE(State().reversed());
 }
 
-// REQ-SAFE-02
+// REQ-CONTRACT-25: matrix case 2, `state` still published with
+// `enabled == false` while disabled. The neutral request is the
+// devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
+// node's evidence.
 TEST_F(SwerveModuleTest, DisabledRobotGoesNeutral) {
   Enable();
   Send(Drive(5.0, 0.0));

@@ -73,7 +73,10 @@ class ScaffoldPyTest(unittest.TestCase):
         self.assertEqual(state.velocity_rps, 12.5)
         self.assertTrue(state.connected)
 
-    # REQ-SAFE-02
+    # REQ-CONTRACT-25: matrix case 2, `state` still published with
+    # `enabled` false while disabled. The neutral request is the
+    # devices flush's (REQ-SAFE-02, proved in talOS/devices), not this
+    # node's evidence.
     def test_disabled_robot_goes_neutral(self):
         self.teleop(enabled=False)
         self.hold(30.0, 0.06)

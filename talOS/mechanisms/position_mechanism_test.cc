@@ -263,7 +263,9 @@ TEST(PositionMechanism, DrivesAtALiveLane) {
   EXPECT_DOUBLE_EQ(state.position_rot(), 0.2);
 }
 
-// REQ-SAFE-02
+// Matrix case 2: while disabled the mechanism reports itself disabled with
+// no goal and stays homed. The neutral output is the devices flush's
+// (REQ-SAFE-02, proved in talOS/devices).
 // REQ-SAFE-36
 TEST(PositionMechanism, DisabledRobotGoesNeutral) {
   Rig arm{"arm"};
