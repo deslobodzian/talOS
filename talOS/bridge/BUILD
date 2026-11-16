@@ -160,6 +160,7 @@ cc_test(
         "//talOS/hardware",
         "//talOS/introspection:registry",
         "//talOS/ipc",
+        "//talOS/launcher:hardware_record",
         "//talOS/node:allocation_probe",
         "//talOS/protocol:udp_test_helpers",
         "//talOS/rtms",

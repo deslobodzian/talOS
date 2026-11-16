@@ -134,11 +134,14 @@ struct RecordedProtocol {
   std::optional<std::uint16_t> manifest;
   // The bridge's: the protocol_version_id of the first /hw/status SEND in
   // each of the session's logs whose manifest registers /hw/status as a
-  // sender of this build's BridgeStatus schema, the distinct values in log
-  // path order. One bridge build writes one value, so two mean bridge runs
-  // of different builds in one session (which one bundle cannot launch).
-  // A /hw/status of another schema (a bridge from before the field), or
-  // whose field is 0 (no version: one a test wrote), adds none.
+  // sender of this build's BridgeStatus schema (the bridge's --log, which
+  // records every status it publishes), the distinct values in log path
+  // order. One bridge build writes one value, so two mean bridge runs of
+  // different builds in one session (which one bundle cannot launch). A
+  // /hw/status of another schema (a bridge from before the field), one
+  // whose field is 0 (no version: one a test wrote), or none in a log's
+  // first second of records (a bridge that did not log its statuses) adds
+  // none.
   std::vector<std::uint16_t> bridge;
 
   // The version the session's packets are read under: the bridge's when it
@@ -168,10 +171,11 @@ struct RecordedProtocol {
 // when the manifest.json beside it has the log header's session_id: that
 // manifest and the logs beside it of that session; otherwise (another
 // session's manifest, none, or no log header) the file alone. Each log is
-// read only to its first /hw/status record, and a log that registers no
-// /hw/status sender only to its manifest: the bridge publishes a status on
-// its first tick, so this costs about one header read per log, not a pass
-// over the session. Never throws: an unreadable log records nothing.
+// read only to its first /hw/status SEND, and never past its first second
+// of records, and a log that registers no /hw/status sender only to its
+// manifest: the bridge logs a status on its first pass and every 20 ms
+// after, so this costs about one header read per log, not a pass over the
+// session. Never throws: an unreadable log records nothing.
 RecordedProtocol RecordedProtocolVersion(
     const std::vector<std::string>& inputs);
 

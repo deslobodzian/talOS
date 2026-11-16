@@ -46,8 +46,9 @@ TopicLoads DeclaredTopicLoads(const std::vector<NodeDescription>& described,
 
 // A member's expected event-log bytes per second: per declared source,
 // records per second x (sizeof(event::log::RecordHeader) + stored bytes).
-// Timers and senders at the member's rate (the hardware bridge: /hw/state
-// and /hw/command only, the two it logs); a watcher at its topic's rate, at
+// Timers and senders at the member's rate (the hardware bridge: /hw/state,
+// /hw/command and /hw/status only, the three it logs, each at its topic's
+// rate); a watcher at its topic's rate, at
 // most the member's rate when latest-only; one READ per tick when it reads
 // its own target lanes. Byte topics are never logged. An estimate to weight
 // shares by, not a bound: a callback can send more often, an idle node less.

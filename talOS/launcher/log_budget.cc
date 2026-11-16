@@ -138,10 +138,12 @@ double ExpectedLogRate(const introspect::Description& declared,
   };
   double bytes = 0;
   if (hardware_bridge) {
-    // It logs the State it publishes and each command it sends, nothing else.
+    // It logs the State it publishes, each command it sends and each
+    // /hw/status, nothing else.
     for (const std::string_view topic :
          {std::string_view{hardware::kStateTopic},
-          std::string_view{hardware::kCommandTopic}}) {
+          std::string_view{hardware::kCommandTopic},
+          std::string_view{::bridge::topics::kStatus}}) {
       if (const auto it = loads.find(topic); it != loads.end()) {
         bytes += it->second.per_second *
                  (kRecordHeaderBytes + it->second.stored_bytes);

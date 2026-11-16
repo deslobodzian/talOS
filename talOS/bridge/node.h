@@ -403,13 +403,16 @@ class HardwareNode {
   void ReopenSocket(uint64_t now_us);
   // OpenWaits()'s fallback: no poller, inputs polled every kRetryUs.
   void FallBackToPolling(const char* reason);
-  // Publishes `packet` on `publisher` stamped with the Poller clock now, and
+  // Publishes `message` on `publisher` stamped with the Poller clock now, and
   // logs it as a SEND of manifest source `source_id` carrying that stamp and
   // the transport sequence, which every reader's MESSAGE record of it also
   // carries (so a replay or a merge counts it once), with `now_us` (the pass
-  // that produced it) as its event time.
-  void Publish(ipc::Publisher<Packet>& publisher, uint16_t source_id,
-               const Packet& packet, uint64_t now_us);
+  // that produced it) as its event time. Every /hw/state, /hw/command and
+  // /hw/status goes through it (the log tools read a session's hardware
+  // protocol from the logged /hw/status, REQ-OPS-51).
+  template <class M>
+  void Publish(ipc::Publisher<M>& publisher, uint16_t source_id,
+               const M& message, uint64_t now_us);
   // One stderr line per gateway boot naming its program and build (the
   // launcher keeps it in the node's session log; /hw/status carries it too).
   static void ReportGatewayBuild(const State& state);
