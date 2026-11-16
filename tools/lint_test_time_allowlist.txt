@@ -2,8 +2,7 @@
 # `<path> sleep|clock|retry [<count>] <reason>`.
 # A line lets that file use the real clock (sleep, clock) or a test retry
 # (retry) on <count> lines. Only an integration, e2e, soak or perf test, or
-# code outside a node, belongs here (docs/TESTING.md §2, §6). "seeded:"
-# marks a line carried over when the lint was added and not yet audited.
+# code outside a node, belongs here (docs/TESTING.md §2, §6).
 # More hits than the count fail the lint, and so do fewer (lower the count)
 # or none (delete the line), so the list only shrinks.
 
