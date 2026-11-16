@@ -427,7 +427,8 @@ RealtimeOutcome ConfigureRealtime(const RealtimeOptions& options) noexcept {
   SetThreadPolicy(PolicyFor(options), problems);
   outcome.refused = problems.refused();
   if (problems.empty()) return outcome;
-  // Tests and docs look for this prefix (startup_test, BRINGUP.md).
+  // Tests and docs look for this prefix (the bench simulation's support.py,
+  // BRINGUP.md).
   std::fprintf(stderr,
                "talos: realtime scheduling incomplete (%s tier, grant %s): "
                "%s\n",
