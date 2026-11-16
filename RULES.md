@@ -54,7 +54,7 @@ Breaking one of these is a review blocker.
    or to what it decodes, even one that keeps every length, bumps
    `protocol::kProtocolVersion` and regenerates the `wire_golden_test`
    constants in the same change: recorded sessions are decoded only under the
-   version their manifest records
+   version they record (the bridge's `/hw/status`, else the manifest's)
    ([protocol version](docs/DATA_FLOW.md#protocol-version)).
 
 ## Verification
