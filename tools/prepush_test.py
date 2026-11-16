@@ -306,6 +306,14 @@ class PrepushTest(unittest.TestCase):
         self.assertEqual(status, 0, out)
         self.assertEqual(self.full_calls(), [], out)
 
+        # Anything the scenario's binaries are built from, not only the
+        # packages on its command path.
+        self.git("branch", "-f", "pushed", "HEAD")
+        self.commit("talOS/events/x.h", "events")
+        status, out, _ = self.prepush("--skip-studio")
+        self.assertEqual(status, 0, out)
+        self.assertEqual([c[1] for c in self.full_calls()], ["rio"], out)
+
     # REQ-DEV-25
     def test_full_runs_rio_in_the_loop_the_sanitizer_lanes_and_a_soak(self):
         self.add_full_steps()
@@ -336,11 +344,28 @@ class PrepushTest(unittest.TestCase):
         self.assertIn("prepush: asan ok", out)
         self.assert_cleaned_up()
 
+        # After a failed build every later Bazel step is skipped, failing
+        # the run, rather than spending a quarter hour on a failed run.
+        self.full_calls()
+        os.remove(self.log)
+        status, out, calls = self.prepush("--full", "--skip-studio",
+                                          STUB_FAIL="build")
+        self.assertEqual(status, 1, out)
+        for step in ("rio-in-the-loop", "tsan", "asan", "soak"):
+            self.assertIn(f"prepush: {step} SKIPPED (the build failed)", out)
+        self.assertEqual(self.full_calls(), [], out)
+        self.assertFalse([a for _, _, a in calls if "soak_test" in a], out)
+
     # REQ-DEV-25
     def test_a_push_of_more_than_twenty_commits_needs_full(self):
         # 110 commits passed the default steps and were red in CI on a
         # sanitizer lane and the RoboRIO-in-the-loop job.
         self.add_full_steps()
+        # What is already on a remote, for the count without an upstream.
+        remote = os.path.join(self.tmp, "remote.git")
+        self.git("init", "-q", "--bare", remote)
+        self.git("remote", "add", "origin", remote)
+        self.git("push", "-q", "origin", "HEAD:refs/heads/main")
         self.git("branch", "pushed")
         self.git("branch", "--set-upstream-to=pushed")
         for i in range(20):
@@ -357,6 +382,22 @@ class PrepushTest(unittest.TestCase):
 
         status, out, _ = self.prepush("--full", "--skip-studio")
         self.assertEqual(status, 0, out)
+
+        # A new branch: the commits on no remote-tracking branch.
+        self.git("branch", "--unset-upstream")
+        status, out, _ = self.prepush()
+        self.assertEqual(status, 1, out)
+        self.assertIn("prepush: full SKIPPED (21 commits on no "
+                      "remote-tracking branch", out)
+        self.assertIn("set an upstream or pass --full", out)
+
+    # REQ-DEV-25
+    def test_full_is_refused_with_skip_gradle(self):
+        # --full promises rio-in-the-loop, which runs through Gradle.
+        status, out, calls = self.prepush("--full", "--skip-gradle")
+        self.assertEqual(status, 2, out)
+        self.assertIn("drop --skip-gradle", out)
+        self.assertEqual(calls, [], out)
 
     # REQ-DEV-25
     def test_optional_steps_follow_the_checked_refs_own_upstream(self):
