@@ -50,10 +50,11 @@ holding it, therefore cannot block a reader such as the launcher's supervision
 loop. Outside a shared-memory namespace lock files deliberately persist,
 even across explicit segment unlinks. A launcher session in a namespace
 removes the registry segment and its registry and session lock files once its
-members are reaped, unless the registry holds a row of another session; it
-unlinks the registry lock while holding it, and a waiter that then wins the
-unlinked inode finds it no longer current and retries on the new file. A
-`NodeRegistration` maps the segment and claims its slot under one
+members are reaped (`RemoveRegistryUnlessHeld`), unless the registry holds a
+row of another session; it unlinks the registry lock while holding it, and a
+waiter that then wins the unlinked inode finds it no longer current and
+retries on the new file. A `NodeRegistration` maps the segment and claims its
+slot under one
 acquisition of the lock, so a removal falls before the map, which creates a
 new segment, or after the claim, whose row keeps the registry: a claim is
 never left in an unlinked segment that no later reader maps. No taker of the

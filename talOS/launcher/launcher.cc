@@ -31,7 +31,6 @@
 #include "talOS/launcher/session_lock.h"
 #include "talOS/memory/shared_memory_ptr.h"
 #include "talOS/process/process.h"
-#include "talOS/rtms/process_liveness.h"
 #include "talOS/rtms/rtms.h"
 #include "toml.hpp"
 
@@ -262,7 +261,8 @@ class NamespaceNames {
     if (std::uncaught_exceptions() > 0 || !session_lock_) return;
     const std::string registry = ShmObjectName(introspect::kRegistryPath);
     if (!registry.starts_with("/~")) return;
-    if (registry_prepared_) RemoveRegistry(registry);
+    if (registry_prepared_)
+      static_cast<void>(introspect::RemoveRegistryUnlessHeld(session_id_));
     // Still held, so no other launch's: removed before the lock is released
     // (SessionLock's destructor, after this one). Not when the path names
     // another file (Refresh false): that may be another launch's.
@@ -270,36 +270,6 @@ class NamespaceNames {
   }
 
  private:
-  void RemoveRegistry(const std::string& mapped) const {
-    try {
-      // Not waited for: a holder now is no member of this session (every
-      // one is reaped), and the registry stays for it.
-      const introspect::RegistryLock lock{mapped, std::chrono::milliseconds{0}};
-      {
-        const introspect::RegistryMapping registry{introspect::kRegistryPath,
-                                                   /*read_only=*/true};
-        // A row of another session keeps the registry while its claimant
-        // runs; one whose process is gone (a SIGKILLed node of an earlier
-        // session, not yet swept by a claim) is no one's.
-        for (const auto& row : registry.header()->nodes) {
-          if (row.state.load(std::memory_order_acquire) !=
-                  static_cast<uint64_t>(introspect::SlotState::FREE) &&
-              row.session_id != session_id_ &&
-              talos::ProcessWordAlive((row.pid_start << kProcessPidBits) |
-                                      row.pid))
-            return;
-        }
-      }
-      introspect::RegistryMapping::unlink();
-      // Under the lock: a writer waiting on this file finds it no longer
-      // current once it locks it, and takes the one the path names anew
-      // (RegistryLock).
-      ::unlink(introspect::LockFilePath(mapped).c_str());
-    } catch (const std::runtime_error&) {  // NOLINT(bugprone-empty-catch)
-      // Held, absent or not this layout: left as it is.
-    }
-  }
-
   const std::optional<SessionLock>& session_lock_;
   uint64_t session_id_;
   bool registry_prepared_{false};

@@ -795,6 +795,44 @@ inline void PrepareRegistry(
   const RegistryMapping initialized{path, *lock};
 }
 
+// What a launcher session in a shared-memory namespace does to the registry
+// once its members are reaped (the launcher's NamespaceNames): removes the
+// segment and then its writer lock file, unless the lock is held or a row of
+// another session than `session_id` names a claimant that still runs. True
+// when it removed them; held, absent or not this layout, it leaves them.
+inline bool RemoveRegistryUnlessHeld(std::uint64_t session_id,
+                                     std::string_view path = kRegistryPath) {
+  const std::string mapped = ShmObjectName(path);
+  try {
+    // Not waited for: a holder now is no member of the session (every one is
+    // reaped), and the registry stays for it.
+    const RegistryLock lock{mapped, std::chrono::milliseconds{0}};
+    {
+      const RegistryMapping registry{path, /*read_only=*/true};
+      // A row of another session keeps the registry while its claimant runs;
+      // one whose process is gone (a SIGKILLed node of an earlier session,
+      // not yet swept by a claim) is no one's.
+      for (const auto& row : registry.header()->nodes) {
+        if (row.state.load(std::memory_order_acquire) !=
+                static_cast<std::uint64_t>(SlotState::FREE) &&
+            row.session_id != session_id &&
+            talos::ProcessWordAlive((row.pid_start << kProcessPidBits) |
+                                    row.pid)) {
+          return false;
+        }
+      }
+    }
+    RegistryMapping::unlink(path);
+    // Under the lock: a writer waiting on this file finds it no longer
+    // current once it locks it, and takes the one the path names anew
+    // (RegistryLock).
+    ::unlink(LockFilePath(mapped).c_str());
+    return true;
+  } catch (const std::runtime_error&) {
+    return false;
+  }
+}
+
 // One node's claim on a registry slot. Owns the slot for its lifetime and
 // frees it on destruction, so a clean shutdown leaves no ghost rows.
 class NodeRegistration {
