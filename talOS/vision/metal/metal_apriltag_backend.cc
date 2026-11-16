@@ -1189,28 +1189,4 @@ MTL::CommandQueue* MetalAprilTagBackend::queue() const {
 #endif
 }
 
-MTL::Buffer* MetalAprilTagBackend::thresh_buffer() const {
-#if defined(__APPLE__)
-  return impl_->cached_thresh_buf;
-#else
-  return nullptr;
-#endif
-}
-
-MTL::Buffer* MetalAprilTagBackend::min_buffer() const {
-#if defined(__APPLE__)
-  return impl_->cached_im_min_buf;
-#else
-  return nullptr;
-#endif
-}
-
-MTL::Buffer* MetalAprilTagBackend::max_buffer() const {
-#if defined(__APPLE__)
-  return impl_->cached_im_max_buf;
-#else
-  return nullptr;
-#endif
-}
-
 }  // namespace talos::vision::metal
