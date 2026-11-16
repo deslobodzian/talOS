@@ -151,6 +151,8 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
   EXPECT_TRUE(mech.a.connected());
 }
 
+// REQ-SAFE-01: a motor update() did not set (b throughout, a once its demand
+// is dropped) goes out neutral in that tick's request.
 // REQ-SAFE-02
 // REQ-SAFE-42: the opt-out keeps the robot_enabled half of the gate.
 TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
