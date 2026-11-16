@@ -352,9 +352,8 @@ Phoenix Pro licensed, per the owner.
 In desktop simulation Phoenix runs TorqueCurrentFOC as a current loop
 against the RoboRIO program's own rotor model, so `phoenixTest` shows the
 request's fields (the demand and the duty cap), the peak torque current in
-the applied configuration (a follower's from its master) and NeutralOut for
-a request out of contract; it asserts nothing about Phoenix's simulated
-current loop. Only hardware shows that the Kraken tracks the stator
+the applied configuration and NeutralOut for a request out of contract; it
+asserts nothing about Phoenix's simulated current loop. Only hardware shows that the Kraken tracks the stator
 current and honours the peak and the duty cap. This check needs the FOC
 check above passed (a licensed Kraken). The bench motor node's
 `TORQUE_CURRENT` mode is bound to joystick 0 button 3 at 2 A

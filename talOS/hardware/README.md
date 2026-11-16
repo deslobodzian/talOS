@@ -45,8 +45,9 @@ configuration`, keeps the previous file, and an identical push saves it
 again. Startup validates
 them and starts their restoration on the configure worker without waiting for
 it, so robot code reports ready at once; the gateway stays unconfigured,
-refusing commands, until the worker finishes. Missing or corrupt files leave
-the gateway unconfigured. A file with a motor saved before `foc` or
+refusing commands, until the worker finishes. Missing or corrupt files, and
+a saved configuration this build's validation refuses, leave the gateway
+unconfigured. A file with a motor saved before `foc` or
 `max_torque_current_a` existed (protocol 10 or older) does not decode
 either, its motor records being shorter, so the RoboRIO boots unconfigured,
 printing the same `hardware gateway config=0 ... (waiting for config push)`
@@ -150,8 +151,12 @@ needs no licence and checks none.
 `max_torque_current_a` (amperes, default 0) is the largest stator current a
 torque-current demand may ask of the motor; 0 refuses the mode. Config load
 refuses a value that is negative or non-finite, above `stator_limit_a`, set
-without `foc = true` (TorqueCurrentFOC is a Phoenix Pro request) or set on a
-follower, naming the motor and the key (`hardware::Validate`). The key is in
+without `foc = true` (TorqueCurrentFOC is a Phoenix Pro request), set on a
+follower, or set on a motor another motor follows, naming the motor and the
+key, and for a follower relation both motors (`hardware::Validate`, which the
+RoboRIO also runs on a pushed config). Torque-current mode drives a single
+motor: Phoenix's Follower copies its master's torque current but not its
+`MaxAbsDutyCycle`, so `max_voltage` would not hold a follower. The key is in
 the configuration fingerprint and wire format.
 
 `position_frame` is `"rezero"` (the default) or `"absolute"`, which config
@@ -253,8 +258,7 @@ feedback divided by the configured mechanism ratio. Steering uses
 `RemoteCANcoder` with continuous wrapping. The backend uses Phoenix's voltage
 controls, which need Phoenix Pro only for a motor configured `foc = true`
 (above). A torque-current request is TorqueCurrentFOC with peak torque
-current ±`max_torque_current_a` (a follower, which copies its master's
-torque output, takes its master's; a motor without the key gets 0 A) and a
+current ±`max_torque_current_a` (0 A on a motor without the key) and a
 maximum duty cycle of `max_voltage` over the RoboRIO's last battery reading
 that was finite and above 1 V (0, no output, before the first);
 `stator_limit_a` and `supply_limit_a` apply too. Positive amperes drive the
@@ -264,11 +268,7 @@ while the demand changes, at most the bridge's command heartbeat otherwise
 ([DATA_FLOW.md](../../docs/DATA_FLOW.md)). It divides by the RoboRIO's input
 voltage reading, not the TalonFX's bus voltage, so a reading taken in a sag
 raises that interval's ceiling in proportion (read 9 V, actually 12.5 V:
-4 V becomes 5.6 V) and a stale high reading errs low. A follower of a
-torque-current master has no duty cap of its own (Phoenix's Follower copies
-the master's torque current, not its `MaxAbsDutyCycle`): a mechanically
-coupled pair is held to the cap through the master, an uncoupled follower
-is not. The gateway neutralizes a torque-current request that
+4 V becomes 5.6 V) and a stale high reading errs low. The gateway neutralizes a torque-current request that
 `TorqueCurrentAllowed` (`gate.h`) refuses: its motor lacks `foc = true` or a
 positive `max_torque_current_a`, its demand exceeds that limit, or its
 feedforward is not 0; the RoboRIO sends NeutralOut for any such request

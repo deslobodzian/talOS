@@ -1887,25 +1887,3 @@ TEST_F(PhoenixBackendTorque, AnOutOfContractRequestIsNeutralOut) {
     EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut") << why;
   }
 }
-
-// A follower may not set max_torque_current_a, yet its Follower copies its
-// master's torque output, so it takes its master's peak torque current: with
-// its own 0 A, Phoenix's simulation held a follower at 0 V and 0 A while its
-// master drove 2 A.
-// REQ-SAFE-43
-TEST_F(PhoenixBackendTorque, AFollowerTakesItsMastersPeakTorqueCurrent) {
-  EnsureHal();
-  hw::Config config;
-  config.motors.push_back(TorqueMotor(10, "climber", 1));
-  auto follower = TestMotor(20, "climber_follower", 2);
-  follower.master_id = 10;
-  config.motors.push_back(follower);
-  PhoenixBackend backend(true);
-  ASSERT_TRUE(backend.Configure(config));
-  ASSERT_TRUE(AwaitReady(backend, config));
-  ctre::phoenix6::configs::TalonFXConfiguration applied;
-  ASSERT_TRUE(AppliedConfig(backend, 1, applied));
-  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakForwardTorqueCurrent.value(), 5.0);
-  EXPECT_DOUBLE_EQ(applied.TorqueCurrent.PeakReverseTorqueCurrent.value(),
-                   -5.0);
-}

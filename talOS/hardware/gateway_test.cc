@@ -1368,6 +1368,10 @@ TEST(Gateway, NeutralizedMasterAlsoNeutralizesFollowerRegardlessOfOrder) {
       ASSERT_TRUE(gateway.Accept(command, 1, 1000));
       EXPECT_EQ(backend.last_requests[master].mode, Mode::kNeutral);
       EXPECT_EQ(backend.last_requests[follower].mode, Mode::kNeutral);
+      if (failure == 3) {
+        // A sanitized master takes its follower with it; both count.
+        EXPECT_EQ(gateway.snapshot().counters.neutralized_motor_count, 2u);
+      }
     }
   }
 }
@@ -3844,8 +3848,8 @@ TEST(Gateway, RangeErrorsNeutralizeOnlyTheirMotor) {
 // foc and a positive max_torque_current_a, within that limit and with no
 // feedforward; 0 A is a driving request, applied as sent, not neutral. Any
 // other torque-current request neutralizes that motor alone (counted), while
-// the rest of the command drives. A follower takes its master's mode, torque
-// current included, and goes neutral with it.
+// the rest of the command drives. (A torque-current motor has no follower:
+// config load refuses one.)
 // REQ-SAFE-43
 TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
   FakeBackend backend;
@@ -3853,8 +3857,6 @@ TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
   config.motors[0].foc = true;
   config.motors[0].max_torque_current_a = 10;
   config.motors[2].foc = true;  // No limit: the mode stays refused.
-  config.motors[4].master_id = config.motors[0].id;
-  ASSERT_EQ(config.motors[4].bus, config.motors[0].bus);
   Gateway g{config, backend, 1};
   const struct {
     const char* label;
@@ -3882,13 +3884,8 @@ TEST(Gateway, TorqueCurrentDrivesOnlyAFocMotorWithinItsLimit) {
     ASSERT_EQ(backend.last_requests.size(), config.motors.size());
     const MotorRequest neutral{torque.id, Mode::kNeutral, 0, 0, 0};
     EXPECT_EQ(backend.last_requests[row.motor], row.sent ? torque : neutral);
-    // A neutralized motor 0 takes its follower with it; both count.
-    neutralized += row.sent ? 0 : row.motor == 0 ? 2 : 1;
+    neutralized += row.sent ? 0 : 1;
     EXPECT_EQ(backend.last_requests[3], command.motors[3]);
-    if (row.motor == 0) {
-      EXPECT_EQ(backend.last_requests[4].mode,
-                row.sent ? Mode::kTorqueCurrent : Mode::kNeutral);
-    }
   }
   EXPECT_EQ(g.snapshot().counters.neutralized_motor_count, neutralized);
   EXPECT_EQ(g.snapshot().counters.rejected_command_count, 0u);
