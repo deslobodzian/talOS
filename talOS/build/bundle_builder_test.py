@@ -721,6 +721,58 @@ class DeployTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(
                 os.path.join(tmp, "robot", "current", "run.sh")))
 
+    # REQ-OPS-53
+    def test_install_refuses_a_testonly_bundle_outside_a_test(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            def stub(name, manifest):
+                path = os.path.join(tmp, name)
+                put(os.path.join(path, "run.sh"), "#!/bin/sh\n")
+                os.chmod(os.path.join(path, "run.sh"), 0o755)
+                put(os.path.join(path, "bundle_manifest.toml"), manifest)
+                return path
+
+            header = 'bundle_version = 1\nconfig_path = "config/robot.toml"\n'
+            fixture = stub("fixture", header + "testonly = true\n")
+            robot = stub("robot", header)
+            # As a person on a robot runs it: no Bazel test around it.
+            robot_env = {k: v for k, v in os.environ.items()
+                         if k not in ("TEST_TMPDIR", "TEST_TARGET")}
+            test_dir = os.path.join(tmp, "x")
+            test_env = dict(robot_env, TEST_TMPDIR=test_dir,
+                            TEST_TARGET="//talOS/build:bundle_builder_test")
+            stale_env = dict(robot_env, TEST_TMPDIR=test_dir)
+            inside = os.path.join(test_dir, "prefix")
+            for name, bundle, env, prefix, installs in (
+                    ("test-only, on a robot", fixture, robot_env,
+                     os.path.join(tmp, "robot_prefix"), False),
+                    ("ordinary, on a robot", robot, robot_env,
+                     os.path.join(tmp, "ordinary_prefix"), True),
+                    # A sibling whose name extends TEST_TMPDIR's is outside.
+                    ("test-only, beside the test's directory", fixture,
+                     test_env, os.path.join(tmp, "xy", "prefix"), False),
+                    # A stale TEST_TMPDIR alone is not a Bazel test.
+                    ("test-only, TEST_TARGET unset", fixture, stale_env,
+                     inside, False),
+                    ("test-only, in a test", fixture, test_env, inside,
+                     True)):
+                with self.subTest(name):
+                    proc = subprocess.run(
+                        ["bash", os.path.abspath(runfiles.Create().Rlocation(
+                            "_main/tools/deploy.sh")),
+                         "install", bundle, "--prefix", prefix,
+                         "--no-warm-up"],
+                        capture_output=True, text=True, env=env)
+                    if installs:
+                        self.assertEqual(proc.returncode, 0, proc.stderr)
+                        self.assertTrue(os.path.isfile(
+                            os.path.join(prefix, "current", "run.sh")))
+                        continue
+                    self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                    self.assertIn(bundle, proc.stderr)
+                    self.assertIn("testonly", proc.stderr)
+                    # Refused before anything is written.
+                    self.assertFalse(os.path.lexists(prefix), proc.stdout)
+
     def test_rollback_refuses_a_previous_bundle_that_is_gone(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             current = self.bundle(tmp, "20260102_000000_1")

@@ -452,6 +452,11 @@ def main():
         f"config_path = {json.dumps(config_rel)}",
         f"config_sha256 = {json.dumps(config_sha256)}",
     ]
+    # A testonly talos_bundle says so, and tools/deploy.sh install refuses
+    # it outside a Bazel test. Before any table: the installer reads only
+    # the top table.
+    if spec.get("testonly"):
+        lines.append("testonly = true")
     if args.stable_status:
         lines += source_revision(args.stable_status)
     lines += studio_lines
