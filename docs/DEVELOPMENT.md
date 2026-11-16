@@ -120,7 +120,8 @@ a robot repository that consumes talOS, it also runs
 `tools/check_robot_repository.sh` on it: `bazel build //...` and `bazel
 test //...` in a copy of that repository's committed tree, with `@talos`
 overridden to the commit being pushed (the repository itself is only read).
-Unset, the step prints SKIPPED and does not fail the run.
+Unset, the step says skipped and does not fail the run; set to a path that
+is not a directory, it names no robot repository, and the step FAILED.
 
 A local macOS run does not exercise the Linux paths (`epoll`, glibc
 allocation counting, `clang-tidy`): say so in `Tests:`; such a change is

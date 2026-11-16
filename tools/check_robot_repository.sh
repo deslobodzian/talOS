@@ -9,8 +9,9 @@
 # PATH is the robot repository's git checkout. Its committed tree (`git
 # archive HEAD`, which holds no submodule content) is copied to
 # ${TMPDIR:-/tmp}/talos-robot-check-<uid>; PATH itself is only read, never
-# built in or written to. Uncommitted changes there are not checked (one
-# line says so). In the copy it runs
+# built in or written to (its git commands take no optional locks, so not
+# even its index is refreshed). Uncommitted changes there are not checked
+# (one line says so). In the copy it runs
 #
 #   bazel build --override_module=talos=<this checkout> //...
 #   bazel test  --override_module=talos=<this checkout> --test_output=errors //...
@@ -24,8 +25,9 @@
 # one run holds it at a time. On success its Bazel server is shut down and
 # the copy removed; on failure the copy is kept and its path printed.
 # The last line is the verdict: `robot-check: <PATH> at <commit> passed
-# against talOS <commit> (<s> s)`, or `... FAILED: <phase>`, followed by the
-# failing targets.
+# against talOS <commit> (<s> s)`, or `... FAILED: <phase>`, after the
+# failing targets (the test phase's Bazel result lines, or the build
+# phase's ERROR lines).
 #
 # Exit: 0 build and test passed, 1 either failed, 2 usage or setup error.
 set -uo pipefail
@@ -42,10 +44,10 @@ bazel_flags=("$@")
 talos="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 [ -d "$source_repo" ] || die "not a directory: $source_repo"
 source_repo="$(cd "$source_repo" && pwd -P)"
-top="$(git -C "$source_repo" rev-parse --show-toplevel 2>/dev/null)" ||
+top="$(git --no-optional-locks -C "$source_repo" rev-parse --show-toplevel 2>/dev/null)" ||
   die "not a git repository: $source_repo"
 [ "$top" = "$source_repo" ] || die "not the top of a git repository: $source_repo (its top is $top)"
-robot_commit="$(git -C "$source_repo" rev-parse --short --verify --quiet 'HEAD^{commit}')" ||
+robot_commit="$(git --no-optional-locks -C "$source_repo" rev-parse --short --verify --quiet 'HEAD^{commit}')" ||
   die "$source_repo has no commit"
 [ "$source_repo" != "$talos" ] || die "$source_repo is this talOS checkout, not a robot repository"
 talos_commit="$(git -C "$talos" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -82,21 +84,28 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-if [ -n "$(git -C "$source_repo" status --porcelain)" ]; then
+if [ -n "$(git --no-optional-locks -C "$source_repo" status --porcelain)" ]; then
   echo "robot-check: $source_repo has uncommitted changes; checking its commit $robot_commit only"
 fi
 
 remove_copy
 rm -f "$copy".*.log
 mkdir -p "$copy" || die "cannot make $copy"
-git -C "$source_repo" archive --format=tar HEAD | tar -xf - -C "$copy" ||
+git --no-optional-locks -C "$source_repo" archive --format=tar HEAD | tar -xf - -C "$copy" ||
   die "cannot copy $source_repo's HEAD to $copy"
 echo "robot-check: $source_repo at $robot_commit, against talOS $talos at $talos_commit, in $copy"
 
 verdict_failed() {  # verdict_failed PHASE LOG
   echo "robot-check: failing targets:"
-  grep -E '^(ERROR: |//|@).*(FAILED|NO STATUS|TIMEOUT|INCOMPLETE|error|ERROR)' "$2" |
-    sort -u | sed 's/^/  /'
+  if [ "$1" = test ]; then
+    # Bazel's own result lines (`//pkg:t   FAILED in 1.2 s`, TIMEOUT, NO
+    # STATUS, INCOMPLETE, FAILED TO BUILD) only: the test logs that
+    # --test_output=errors prints may hold any text.
+    grep -E '^(@@?[^ /]*)?//[^ ]+ +(\(cached\) )?(FAILED|TIMEOUT|NO STATUS|INCOMPLETE)( |$)' "$2"
+  else
+    # A build prints no test log; its errors are Bazel's.
+    grep -E '^ERROR: ' "$2"
+  fi | sort -u | sed 's/^/  /'
   echo "robot-check: copy kept at $copy, log $2"
   echo "robot-check: $source_repo at $robot_commit FAILED against talOS $talos_commit: $1 ($((SECONDS - start)) s)"
   exit 1

@@ -26,7 +26,9 @@
 # without target coverage required, and into new_robot --standalone's copy
 # of it, then `bazel test //...` in each), robot-repository (when TALOS_ROBOT_REPOSITORY
 # names a robot repository's checkout: tools/check_robot_repository.sh on
-# it; otherwise one SKIPPED line that does not fail the run),
+# it; unset, one `skipped` line that does not fail the run; set to a path
+# that is not a directory, the step FAILED, since it names no robot
+# repository),
 # checkout-unchanged; then, when the commits touch them: gradle (`phoenixTest buildRio -Pheadless
 # --offline`, for controller_processor/ and talOS/, whose headers
 # the RoboRIO program's build.gradle exports) and studio-test and
@@ -273,7 +275,10 @@ fi
 if [ -z "${TALOS_ROBOT_REPOSITORY:-}" ]; then
   report "robot-repository skipped (TALOS_ROBOT_REPOSITORY unset)"
 elif ! robot_repository="$(cd "$TALOS_ROBOT_REPOSITORY" 2>/dev/null && pwd -P)"; then
-  skip robot-repository "TALOS_ROBOT_REPOSITORY is not a directory: $TALOS_ROBOT_REPOSITORY"
+  # Set, it asks for the check; a path that names no checkout is a failure,
+  # not a skip.
+  report "robot-repository FAILED (TALOS_ROBOT_REPOSITORY names no robot repository: $TALOS_ROBOT_REPOSITORY is not a directory)"
+  failed=1
 elif [ ! -f "$wt/tools/check_robot_repository.sh" ]; then
   skip robot-repository "this commit has no tools/check_robot_repository.sh"
 else

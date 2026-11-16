@@ -29,10 +29,11 @@ def git(cwd, *args):
 
 
 def listing(root):
-    out = []
+    # The index too: a plain `git status` rewrites it to refresh its stat
+    # cache, and the check only reads the repository.
+    index = os.stat(os.path.join(root, ".git", "index"))
+    out = [(".git/index", index.st_mode, index.st_mtime_ns)]
     for d, dirs, files in os.walk(root):
-        # `git status` itself refreshes the index; the work tree is what
-        # the check must not touch.
         if d == root:
             dirs.remove(".git")
         for name in dirs + files:
@@ -59,7 +60,11 @@ class CheckRobotRepositoryTest(unittest.TestCase):
             "#!/bin/sh\n"
             f'echo "$PWD|$*" >> {shlex.quote(self.log)}\n'
             "touch bazel-out MODULE.bazel.lock\n"
-            '[ "$1" = "${STUB_FAIL:-}" ] && { echo "//x:y_test FAILED in 1s"; exit 3; }\n'
+            # A failing test: its log, as --test_output=errors prints it,
+            # then Bazel's result line.
+            '[ "$1" = "${STUB_FAIL:-}" ] && { '
+            'echo "//x/y_test.cc:3: error: expected 1"; '
+            'echo "//x:y_test FAILED in 1s"; exit 3; }\n'
             "exit 0\n",
             0o755)
         self.env = dict(os.environ,
@@ -120,9 +125,14 @@ class CheckRobotRepositoryTest(unittest.TestCase):
             if args.startswith(("build", "test")):
                 self.assertIn("--override_module=talos=", args)
                 self.assertIn("--jobs=1", args)
-        # The failing run says what failed and keeps its copy.
-        self.assertIn("FAILED", result.stdout.splitlines()[-1])
-        self.assertIn("//x:y_test FAILED", result.stdout)
+        # The failing run names the failing target, and only it, and keeps
+        # its copy.
+        lines = result.stdout.splitlines()
+        self.assertIn("FAILED", lines[-1])
+        listed = lines[lines.index("robot-check: failing targets:") + 1:]
+        listed = listed[:next(i for i, line in enumerate(listed)
+                              if not line.startswith("  "))]
+        self.assertEqual(listed, ["  //x:y_test FAILED in 1s"], result.stdout)
 
 
 if __name__ == "__main__":
