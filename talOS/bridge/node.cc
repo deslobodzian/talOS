@@ -1229,7 +1229,7 @@ int HardwareNode::Run(int duration_s) {
               static_cast<unsigned long long>(socket_counters_.reopens));
   // A log that failed or has a gap exits 1, as RunMain does for event-loop
   // nodes.
-  bool log_failed = false;
+  bool log_incomplete = false;
   if (log_) {
     log_->flush();
     ReportLogFailure();
@@ -1239,7 +1239,7 @@ int HardwareNode::Run(int duration_s) {
         log_->failed(), log_->capped(),
         static_cast<unsigned long long>(log_->gaps()),
         static_cast<unsigned long long>(log_->lost_records()));
-    log_failed = log_->failed() || log_->gaps() > 0;
+    log_incomplete = log_->incomplete();
   }
   // A run without one State never heard the controller. It says so on
   // stderr either way, beside the summary, since under the launcher the
@@ -1258,7 +1258,7 @@ int HardwareNode::Run(int duration_s) {
                  static_cast<double>(ran_us) / 1e6);
   }
   const bool unheard = states_received_ == 0 && reached_duration;
-  return log_failed || unheard ? 1 : 0;
+  return log_incomplete || unheard ? 1 : 0;
 }
 
 bool HardwareNode::HasRequestIdentity(const SubsystemTracker& tracker,

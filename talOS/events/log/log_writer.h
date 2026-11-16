@@ -237,13 +237,21 @@ class LogWriter {
   bool failed() const noexcept;
   std::string error() const;
 
-  // Gaps opened so far, each marked by one GAP record once capture resumes or
-  // the writer is flushed or destroyed. Lock-free; any thread.
+  // Gaps opened so far. Lock-free; any thread. A gap is marked by one GAP
+  // record when capture resumes or when the writer is flushed or destroyed,
+  // unless capture ends first: the disk fails during the gap (failed()), the
+  // GAP record itself crosses the byte cap of a log that cannot rotate
+  // (capture_stopped(), `<path>.capped`), or the process is killed. Such a
+  // gap has no GAP record but is still counted here, so incomplete() and the
+  // registry's kFlagLogGap report it.
   std::uint64_t gaps() const noexcept;
   // Records dropped in every gap so far. Lock-free; any thread.
   std::uint64_t lost_records() const noexcept;
   // A gap is open: records are being dropped now. Lock-free; any thread.
   bool losing() const noexcept;
+  // The log is not a complete record of its run: failed() or gaps() > 0.
+  // What a node's and the bridge's exit status say. Lock-free; any thread.
+  bool incomplete() const noexcept;
 
   // True once capture ended for good at the byte cap (a log that cannot
   // rotate). Never waits.

@@ -1005,6 +1005,7 @@ TEST(LogDurability, FlushReportsFsyncFailure) {
     EXPECT_FALSE(writer.failed());
     writer.flush();
     EXPECT_TRUE(writer.failed());
+    EXPECT_TRUE(writer.incomplete());  // what the node's exit status says
     writer.flush();
     EXPECT_TRUE(writer.failed());
   }
@@ -1088,8 +1089,8 @@ struct OpenAtExit {
 
 // A background writer of four 4096-byte chunks behind `gate`: 32 records of
 // 128 bytes to a chunk, and nothing written but a handed-over chunk.
-LogWriter::Options GatedOptions(WriteGate& gate) {
-  LogWriter::Options options{4096, 4, /*background=*/true};
+LogWriter::Options GatedOptions(WriteGate& gate, std::size_t chunks = 4) {
+  LogWriter::Options options{4096, chunks, /*background=*/true};
   options.write_interval = std::chrono::hours{24};
   options.sync_interval = std::chrono::hours{24};
   options.before_write = gate.hook();
@@ -1269,6 +1270,38 @@ TEST(LogBackgroundWriter, FullPoolOpensAGapAndHalfAFreePoolResumesIt) {
 // the time of the run's EXIT, which found no room and was held, then that
 // EXIT, so the log ends in order. A second flush() adds nothing.
 // REQ-OPS-44
+// Half the pool is rounded up: a pool of three resumes with two chunks free,
+// not one, so between two GAP records the loop still hands over at least
+// half the pool.
+// REQ-RT-11
+TEST(LogBackgroundWriter, AnOddPoolResumesWithHalfOfItRoundedUpFree) {
+  const std::string path = TempPath("odd_pool");
+  WriteGate gate;
+  {
+    LogWriter writer{path, "gated", GatedOptions(gate, 3)};
+    const OpenAtExit open_at_exit{gate};
+    writer.start({}, {});
+    GatedDispatch(writer, 1);
+    writer.flush();
+    const std::uint64_t base = gate.entries();
+    gate.close();
+    // Three chunks of 16 dispatches handed over; dispatch 50 is dropped.
+    for (std::uint64_t d = 2; d <= 50; ++d) GatedDispatch(writer, d);
+    ASSERT_TRUE(writer.losing());
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 1; }));
+    gate.permit();
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 2; }));
+    GatedDispatch(writer, 51);
+    EXPECT_TRUE(writer.losing()) << "resumed with one chunk of three free";
+    gate.permit();
+    ASSERT_TRUE(Eventually([&] { return gate.entries() == base + 3; }));
+    GatedDispatch(writer, 52);
+    EXPECT_FALSE(writer.losing());
+    EXPECT_EQ(writer.gaps(), 1u);
+  }
+  ::unlink(path.c_str());
+}
+
 TEST(LogBackgroundWriter, FlushOrDestructionClosesAnOpenGapAndKeepsTheExit) {
   for (const bool flush : {true, false}) {
     SCOPED_TRACE(flush ? "flush" : "destruction");
@@ -1491,10 +1524,12 @@ TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
     std::int64_t start_ns;  // the earliest time a dropped record names
   };
   const Row rows[] = {
+      // A dropped MESSAGE names its publication, 500 ns before its drain:
+      // the gap starts there, so nothing published inside it is fed past.
       {"starts_a_dispatch",
        {{EventKind::TIMER, 1, 20},
         {EventKind::SEND, 1, 20},
-        {EventKind::TIMER, 2, kOversized},
+        {EventKind::MESSAGE, 2, kOversized},
         {EventKind::SEND, 2, 20},
         {EventKind::MESSAGE, 3, 20},
         {EventKind::SEND, 3, 20},
@@ -1504,7 +1539,7 @@ TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
        0,
        1,
        1,
-       2000},
+       1500},
       {"splits_a_dispatch",
        {{EventKind::TIMER, 1, 20},
         {EventKind::SEND, 1, 20},
@@ -1541,9 +1576,11 @@ TEST(LogGap, OversizedRecordOpensAGapTheNextDispatchCloses) {
       writer.start({}, {});
       for (std::size_t k = 0; k < row.steps.size(); ++k) {
         RecordStep(writer, row.steps[k], k);
-        // Dropped from the oversized record until the one that resumes.
+        // Dropped from the oversized record until the one that resumes;
+        // the log is incomplete from the first drop on.
         EXPECT_EQ(writer.losing(), k >= row.first && k < row.end)
             << "after step " << k;
+        EXPECT_EQ(writer.incomplete(), k >= row.first) << "after step " << k;
       }
       writer.flush();
       EXPECT_EQ(writer.gaps(), 1u);
