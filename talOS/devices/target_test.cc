@@ -919,6 +919,290 @@ TEST(OperatorArming, HeldInputWaitsForNeutralAfterEveryBreak) {
   }
 }
 
+// The live-target gate at the devices flush (RULES.md 1): a tick drives only
+// when one of the node's Targets returned a target from a get() made during
+// that update(). Every node here owns a motor, a digital output and a PWM
+// output and sets them in update(); the robot is enabled in teleop.
+constexpr const char* kGateToml = R"(
+[robot]
+period_us = 5000
+command_timeout_us = 100000
+
+[subsystems.gate.motors.m]
+can_id = 1
+[subsystems.gate.digital_outputs.led]
+dio = 0
+[subsystems.gate.pwm_outputs.servo]
+channel = 0
+)";
+
+// The gate node's outputs as its last request carried them.
+struct GateOutputs {
+  hardware::Mode mode;
+  bool led;
+  double servo;
+};
+GateOutputs Requested(const SimHardware& hw) {
+  return {hw.motor_request("gate", "m").mode, hw.digital_output("gate", "led"),
+          hw.pwm("gate", "servo")};
+}
+void ExpectNeutral(const SimHardware& hw) {
+  const GateOutputs out = Requested(hw);
+  EXPECT_EQ(out.mode, hardware::Mode::kNeutral);
+  EXPECT_FALSE(out.led);
+  EXPECT_EQ(out.servo, 0.0);
+}
+void ExpectDriving(const SimHardware& hw, double value) {
+  const GateOutputs out = Requested(hw);
+  EXPECT_EQ(out.mode, hardware::Mode::kDutyCycle);
+  EXPECT_DOUBLE_EQ(hw.motor_request("gate", "m").demand, value);
+  EXPECT_TRUE(out.led);
+  EXPECT_DOUBLE_EQ(out.servo, value);
+}
+
+std::uint64_t GateRequests(const Sim& sim) {
+  return detail::SimAccess::message_count(sim, "/hw/request/gate",
+                                          sizeof(hardware::Packet));
+}
+
+// Every output from one value: what a node drives from its target.
+struct GateDevices {
+  explicit GateDevices(Node& n)
+      : motor{n, "m"}, led{n, "led"}, servo{n, "servo"} {}
+  void Drive(double value) {
+    motor.set_duty_cycle(value);
+    led.set(true);
+    servo.set(value);
+  }
+  Motor motor;
+  DigitalOutput led;
+  PwmOutput servo;
+};
+
+// A joystick-direct node: it reads the Driver Station and has no Target.
+struct StickDirect {
+  explicit StickDirect(Node& n)
+      : ds{n}, motor{n, "m"}, led{n, "led"}, servo{n, "servo"} {}
+  void update() {
+    const Joystick stick = ds.joystick(0);
+    motor.set_voltage(12.0 * stick.axis(0));
+    led.set(stick.button(1));
+    servo.set(stick.axis(0));
+  }
+  DriverStation ds;
+  Motor motor;
+  DigitalOutput led;
+  PwmOutput servo;
+};
+
+// REQ-SAFE-41
+TEST(TargetGate, OutputsSetWithoutATargetAreSentNeutral) {
+  auto sim = Sim::FromToml(kGateToml);
+  sim.add<StickDirect>("gate");
+  SimHardware hw{sim};
+  auto held = DsPacket(kTeleop);
+  held.joysticks[0].connected = true;
+  held.joysticks[0].axis_count = 1;
+  held.joysticks[0].axes = {0.5f};
+  held.joysticks[0].button_count = 1;
+  held.joysticks[0].buttons = 1;
+  hw.set_driver_station(held);
+  ::testing::internal::CaptureStderr();
+  hw.enable();
+  sim.step(20ms);
+  ASSERT_TRUE(robot_enabled(sim.node("gate")));
+  ExpectNeutral(hw);
+  // The request still goes out every tick.
+  const std::uint64_t sent = GateRequests(sim);
+  sim.step(20ms);
+  EXPECT_EQ(GateRequests(sim), sent + 4);
+  ExpectNeutral(hw);
+
+  // One line per enabled spell: this one, and the next after a disable.
+  hw.enable(false);
+  sim.step(20ms);
+  hw.enable();
+  sim.step(20ms);
+  ExpectNeutral(hw);
+  const std::string err = ::testing::internal::GetCapturedStderr();
+  std::size_t lines = 0;
+  for (std::size_t at = err.find("gate: "); at != std::string::npos;
+       at = err.find("gate: ", at + 1)) {
+    ++lines;
+  }
+  EXPECT_EQ(lines, 2u) << err;
+}
+
+// What a Target-driven node does: drive only from what get() returned.
+struct Targeted {
+  explicit Targeted(Node& n) : target{n}, devices{n} {}
+  void update() {
+    if (const Goal* goal = target.get()) devices.Drive(goal->position_rot());
+  }
+  Target<Goal> target;
+  GateDevices devices;
+};
+
+// REQ-SAFE-41
+TEST(TargetGate, ALiveTargetDrivesEveryOutputItsTickSet) {
+  auto sim = Sim::FromToml(kGateToml);
+  sim.add<Targeted>("gate");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  for (auto t = 0ms; t < 20ms; t += 5ms) {
+    PublishTarget(sim, "gate", "teleop", Goal{0.5});
+    sim.step(5ms);
+  }
+  ExpectDriving(hw, 0.5);
+}
+
+// Keeps driving from the last target it got, whatever get() says now.
+struct Latching {
+  explicit Latching(Node& n) : target{n}, devices{n} {}
+  void update() {
+    if (const Goal* goal = target.get()) latched = *goal;
+    if (latched) devices.Drive(latched->position_rot());
+  }
+  Target<Goal> target;
+  GateDevices devices;
+  std::optional<Goal> latched;
+};
+
+// REQ-SAFE-41
+TEST(TargetGate, ATickWithoutALiveTargetIsNeutralWhateverUpdateSet) {
+  enum class Loss { kReleased, kStale, kEarlierGeneration };
+  for (const Loss loss :
+       {Loss::kReleased, Loss::kStale, Loss::kEarlierGeneration}) {
+    SCOPED_TRACE(static_cast<int>(loss));
+    auto sim = Sim::FromToml(kGateToml);
+    auto& gate = sim.add<Latching>("gate");
+    SimHardware hw{sim};
+    hw.enable();
+    hw.set_driver_station(DsPacket(kTeleop));
+    sim.step(10ms);
+    for (auto t = 0ms; t < 20ms; t += 5ms) {
+      PublishTarget(sim, "gate", "teleop", Goal{0.5});
+      sim.step(5ms);
+    }
+    ExpectDriving(hw, 0.5);
+    switch (loss) {
+      case Loss::kReleased:
+        ReleaseTarget<Goal>(sim, "gate", "teleop");
+        sim.step(5ms);  // the next tick
+        break;
+      case Loss::kStale:
+        // The last publication is 5 ms old: at 95 ms it still drives, and
+        // the first tick at an age of command_timeout_us does not.
+        sim.step(90ms);
+        ExpectDriving(hw, 0.5);
+        sim.step(5ms);
+        break;
+      case Loss::kEarlierGeneration: {
+        const std::uint64_t before = DriverStationGeneration(sim);
+        hw.set_driver_station(DsPacket(kAuto));
+        sim.step(10ms);
+        ASSERT_NE(DriverStationGeneration(sim), before);
+        PublishTarget(sim, "gate", "auto", Goal{0.5}, before);
+        sim.step(5ms);  // the drain that takes it
+        break;
+      }
+    }
+    ASSERT_TRUE(gate.latched.has_value());
+    EXPECT_TRUE(robot_enabled(sim.node("gate")));
+    ExpectNeutral(hw);
+  }
+}
+
+// Asks its Target only where the test says: from every(), or in update() on
+// some ticks; it drives every tick from what was seen last.
+struct Asking {
+  explicit Asking(Node& n) : target{n}, devices{n} {
+    n.every(5ms, [this] {
+      if (ask_in_every && target.get() != nullptr) seen_in_every = true;
+    });
+  }
+  void update() {
+    asked = ask_in_update && (tick++ % 2 == 0);
+    if (asked && target.get() != nullptr) seen = true;
+    if (seen || seen_in_every) devices.Drive(0.5);
+  }
+  Target<Goal> target;
+  GateDevices devices;
+  bool ask_in_every = false;
+  bool ask_in_update = false;
+  bool seen = false;
+  bool seen_in_every = false;
+  bool asked = false;
+  int tick = 0;
+};
+
+// REQ-SAFE-41
+TEST(TargetGate, OnlyAGetInsideThisUpdateCounts) {
+  auto sim = Sim::FromToml(kGateToml);
+  auto& gate = sim.add<Asking>("gate");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  const auto hold = [&](std::chrono::milliseconds d) {
+    for (auto t = 0ms; t < d; t += 5ms) {
+      PublishTarget(sim, "gate", "teleop", Goal{0.5});
+      sim.step(5ms);
+    }
+  };
+
+  // A live get() in every() alone leaves every tick neutral.
+  gate.ask_in_every = true;
+  hold(20ms);
+  ASSERT_TRUE(gate.seen_in_every);
+  ExpectNeutral(hw);
+
+  // Asked on alternate ticks: each tick drives exactly when it asked.
+  gate.ask_in_every = false;
+  gate.seen_in_every = false;
+  gate.ask_in_update = true;
+  hold(10ms);
+  ASSERT_TRUE(gate.seen);
+  for (int i = 0; i < 6; ++i) {
+    SCOPED_TRACE(i);
+    hold(5ms);
+    const auto packet = sim.latest<hardware::Packet>("/hw/request/gate");
+    ASSERT_TRUE(packet.has_value());
+    hardware::Command command{};
+    ASSERT_TRUE(hardware::Decode(packet->bytes(), command));
+    EXPECT_EQ(command.motors[0].mode, gate.asked ? hardware::Mode::kDutyCycle
+                                                 : hardware::Mode::kNeutral);
+  }
+}
+
+// Two Targets: it asks only the second, and drives from it.
+struct TwoTargets {
+  explicit TwoTargets(Node& n) : first{n}, second{n}, devices{n} {}
+  void update() {
+    if (const Goal* goal = second.get()) devices.Drive(goal->position_rot());
+  }
+  Target<Goal> first;
+  Target<Goal> second;
+  GateDevices devices;
+};
+
+// REQ-SAFE-41: per node, any one of its Targets lets the tick drive.
+TEST(TargetGate, AnyOfTheNodesTargetsLetsTheTickDrive) {
+  auto sim = Sim::FromToml(kGateToml);
+  sim.add<TwoTargets>("gate");
+  SimHardware hw{sim};
+  hw.enable();
+  hw.set_driver_station(DsPacket(kTeleop));
+  sim.step(10ms);
+  for (auto t = 0ms; t < 20ms; t += 5ms) {
+    PublishTarget(sim, "gate", "teleop", Goal{0.5});
+    sim.step(5ms);
+  }
+  ExpectDriving(hw, 0.5);
+}
+
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {
   EXPECT_EQ(detail::TargetEnvelopeBytes(24, 8), 40u);
   EXPECT_EQ(detail::TargetEnvelopeBytes(4, 4), 20u);

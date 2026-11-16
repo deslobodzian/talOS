@@ -7,12 +7,13 @@
     class Elevator:
         def __init__(self, node):
             self.lift = talos.Motor(node, "lift")
-            self.goal = node.subscribe(ElevatorGoal, "/elevator/goal")
+            self.goal = talos.Target(node, ElevatorGoal)  # its target lanes
             self.status = node.publish(ElevatorStatus, "/elevator/status")
 
         def update(self):  # every node.period seconds
-            if self.goal.fresh():  # neutral until the lift is rezeroed
-                self.lift.set_motion_magic(self.goal.value.height_rot)
+            goal = self.goal.get()  # None: disabled, stale or released
+            if goal is not None:  # neutral until the lift is rezeroed
+                self.lift.set_motion_magic(goal.height_rot)
             self.status.send(height_rot=self.lift.position)
 
 The class is built with the node and registers everything in __init__;
@@ -37,14 +38,16 @@ from talos.devices import (Alliance, AnalogInput, CANcoder, DigitalInput,
                            DigitalOutput, DriverStation, Encoder, Gyro, HardwareLink,
                            Joystick, Mode, Motor, OperatorArming, PwmOutput,
                            Target, TargetLane, _OnNode,
-                           hardware_sample_time_ns, robot_enabled)
+                           allow_untargeted_outputs, hardware_sample_time_ns,
+                           robot_enabled)
 
 __all__ = [
     "Alliance", "AnalogInput", "BytePublisher", "CANcoder", "DigitalInput",
     "DigitalOutput", "DriverStation", "Encoder", "Gyro", "HardwareLink", "Joystick", "Message",
     "Mode", "Motor", "Node", "OperatorArming", "Publisher", "PwmOutput",
     "StateMachine",
-    "Subscription", "TalosError", "Target", "TargetLane", "Wake", "cpp_node",
+    "Subscription", "TalosError", "Target", "TargetLane", "Wake",
+    "allow_untargeted_outputs", "cpp_node",
     "load", "hardware_sample_time_ns", "robot_enabled", "run",
 ]
 

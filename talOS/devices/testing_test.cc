@@ -548,7 +548,9 @@ TEST(SimHardwareTotalLoss, LosingEveryFeedbackSampleFaultsAndNeutralizesAll) {
         : node{n},
           motor{n, "motor"},
           led{n, "other_led"},
-          servo{n, "other_servo"} {}
+          servo{n, "other_servo"} {
+      AllowUntargetedOutputs(n);
+    }
     void update() {
       enabled = robot_enabled(node);
       motor.set_voltage(3.0);
@@ -667,7 +669,9 @@ bus = "Shooter"
 // REQ-CONTRACT-35
 TEST(SimHardwareTotalLoss, ARobotWithNoMotorIsNoFeedbackLoss) {
   struct Lights {
-    explicit Lights(Node& n) : node{n}, led{n, "led"} {}
+    explicit Lights(Node& n) : node{n}, led{n, "led"} {
+      AllowUntargetedOutputs(n);
+    }
     void update() {
       enabled = robot_enabled(node);
       led.set(true);

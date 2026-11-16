@@ -374,6 +374,7 @@ int32_t BuildRoller(TalosNode* node, void* user) {
   r.wheel = talos_device(node, TALOS_DEVICE_MOTOR, "wheel");
   r.beam = talos_device(node, TALOS_DEVICE_DIGITAL_INPUT, "beam");
   if (r.wheel < 0 || r.beam < 0) return 1;
+  if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
   return talos_node_set_update(
       node,
       [](void* u) -> int32_t {
@@ -394,6 +395,8 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   Roller roller;
   TalosNode* node = talos_sim_add(sim_, "roller", &BuildRoller, &roller);
   ASSERT_NE(node, nullptr) << talos_last_error();
+  // REQ-SAFE-42: the opt-out is the factory's alone.
+  EXPECT_EQ(talos_allow_untargeted_outputs(node), TALOS_ERR);
   TalosSimHardware* hw = talos_sim_hardware_create(sim_);
   ASSERT_NE(hw, nullptr) << talos_last_error();
   ASSERT_EQ(talos_sim_hardware_set_motor(hw, "roller", "wheel", 3.0, 1.5, 0, 0,

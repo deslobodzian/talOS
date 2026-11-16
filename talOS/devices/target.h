@@ -26,6 +26,10 @@
 //   - is fresh (younger than [robot] command_timeout_us), and
 //   - carries the consumer's current mode generation,
 // and only while robot_enabled(node). Otherwise it returns null: neutral.
+// The devices flush enforces it: a tick in which no Target of the node
+// returned a target from a get() or source() made during that update() sends
+// every output neutral, whatever update() set (devices.h;
+// AllowUntargetedOutputs exempts a test or bench fixture).
 //
 // The mode generation is the invariant that a target issued under an earlier
 // Driver Station enable or mode never actuates. The sampler on the far side of

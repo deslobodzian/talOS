@@ -92,6 +92,11 @@ struct HardwareAccess {
   static void digital_output_set(HardwareLink& link, std::size_t index,
                                  bool value);
   static void pwm_set(HardwareLink& link, std::size_t index, double output);
+  // A talos::Target of the link's node returned a target inside the
+  // update() running now: the flush right after it may send that update()'s
+  // outputs (devices.h). Target::get() calls it on every selecting call made
+  // inside update().
+  static void note_live_target(HardwareLink& link);
 };
 
 // The Driver Station mode a target policy is keyed by: none while the DS is

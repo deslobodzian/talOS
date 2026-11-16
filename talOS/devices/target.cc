@@ -241,10 +241,15 @@ const void* TargetAccess::target_get(Node& node, std::size_t target,
     // was (an EventKind::READ record), which is how a session's tick-time
     // target age is measured. Only the first selecting get() or source() of
     // each update() logs one, so a tick is one READ however often it asks.
-    if (NodeAccess::in_update(node) &&
-        state.read_update != NodeAccess::next_update(node)) {
-      state.read_update = NodeAccess::next_update(node);
-      NodeAccess::record_read(node, subscription);
+    // Every selecting call inside update() also tells the devices flush that
+    // this tick has a live target (RULES.md 1); a selection from the
+    // constructor, every() or a callback does not.
+    if (NodeAccess::in_update(node)) {
+      HardwareAccess::note_live_target(node.extension<HardwareLink>());
+      if (state.read_update != NodeAccess::next_update(node)) {
+        state.read_update = NodeAccess::next_update(node);
+        NodeAccess::record_read(node, subscription);
+      }
     }
     return envelope + kTargetEnvelopeHeaderBytes;
   }

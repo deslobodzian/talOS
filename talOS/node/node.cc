@@ -102,6 +102,8 @@ struct Node::Impl {
   bool writes_target_lane = false;
   // The topic add_hardware_request registered, or empty.
   std::string hardware_request;
+  // NodeAccess::mark_untargeted_outputs was called.
+  bool untargeted_outputs = false;
   Duration period{};
   Duration timeout{};
 
@@ -834,6 +836,15 @@ std::string_view NodeAccess::hardware_request(const Node& node) {
   return node.impl_->hardware_request;
 }
 
+void NodeAccess::mark_untargeted_outputs(Node& node) {
+  node.impl_->CheckOpen("AllowUntargetedOutputs");
+  node.impl_->untargeted_outputs = true;
+}
+
+bool NodeAccess::untargeted_outputs(const Node& node) {
+  return node.impl_->untargeted_outputs;
+}
+
 bool NodeAccess::publisher_send(Node& node, std::size_t index, const void* data,
                                 std::size_t bytes) {
   require_loop_thread(node, "Publisher::send");
@@ -1224,7 +1235,8 @@ int RunOnRecordedInputs(const char* node_name, const Flags& flags,
 }
 
 // Endpoint attributes of the loop's sources: the optional subscriptions, the
-// observers and the devices layer's hardware request.
+// observers and the devices layer's hardware request, marked when the node
+// lifted the flush's live-target gate (mark_untargeted_outputs).
 std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   std::vector<introspect::EndpointAttribute> attributes;
   for (const std::string_view topic : NodeAccess::optional_topics(node)) {
@@ -1235,8 +1247,12 @@ std::vector<introspect::EndpointAttribute> Endpoints(const Node& node) {
   }
   if (const std::string_view topic = NodeAccess::hardware_request(node);
       !topic.empty()) {
+    const std::uint32_t untargeted =
+        NodeAccess::untargeted_outputs(node)
+            ? introspect::naming::kSourceFlagUntargetedOutputs
+            : 0u;
     attributes.push_back(
-        {topic, introspect::naming::kSourceFlagHardwareRequest});
+        {topic, introspect::naming::kSourceFlagHardwareRequest | untargeted});
   }
   return attributes;
 }

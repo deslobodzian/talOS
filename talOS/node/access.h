@@ -238,6 +238,13 @@ struct NodeAccess {
   // The topic add_hardware_request registered, or empty: for describe and
   // the registry.
   static std::string_view hardware_request(const Node& node);
+  // talos::AllowUntargetedOutputs (talOS/devices/devices.h): the devices
+  // flush gates this node's outputs on robot_enabled alone, and describe and
+  // the registry mark its hardware request with
+  // naming::kSourceFlagUntargetedOutputs. Constructor only: afterwards it
+  // throws std::logic_error naming the node.
+  static void mark_untargeted_outputs(Node& node);
+  static bool untargeted_outputs(const Node& node);
   static bool publisher_send(Node& node, std::size_t index, const void* data,
                              std::size_t bytes);
 

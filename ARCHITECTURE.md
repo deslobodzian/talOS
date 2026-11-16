@@ -33,7 +33,8 @@ Allowed dependencies:
 
 - Each layer depends only on layers below it. `talOS/node` drives no
   hardware: it knows the hardware request topic, `/hw/request/<node>`, only to
-  open it for the devices layer's flush and refuse it to every other publisher
+  open it for the devices layer's flush, carry that layer's
+  `untargeted_outputs` attribute on it, and refuse it to every other publisher
   ([NAMING.md](talOS/NAMING.md#topics)), and reads the hardware config only
   for timeouts and actuator ownership (its loop tier). `talOS/devices` is
   built on `Node`'s public API (`extension<T>()`, `after_update()`) and the
@@ -94,11 +95,15 @@ A node's `update()` runs every `period_us` (the subsystem's, else `[robot]`).
 After each tick the devices layer flushes one hardware request for the node:
 
 - a motor not set during that tick is sent neutral;
-- every motor is neutral while `robot_enabled(node)` is false (no accepted
-  hardware state, gateway not enabled, a fault, or a state older than
-  `[robot] command_timeout_us`);
-- digital and PWM outputs set during the tick are sent as set only while
-  `robot_enabled(node)` is true; otherwise DIO is false and PWM is zero;
+- the tick drives only while `robot_enabled(node)` is true (an accepted
+  hardware state, gateway enabled, no fault, and that state younger than
+  `[robot] command_timeout_us`) and one of the node's `talos::Target`s
+  returned a target from a `get()` made during that `update()`
+  ([Targets](#targets)); a node whose constructor called
+  `talos::AllowUntargetedOutputs` drives on `robot_enabled(node)` alone;
+- in a tick that does not drive every motor is neutral, DIO false and PWM
+  zero, and the request is still sent; in one that drives, digital and PWM
+  outputs set during it are sent as set;
 - motor demand and feedforward are clamped to that motor's configured limits;
   non-finite values neutralize only that motor. `Motor::clamped_count()` counts
   adjusted setter calls for the lifetime of the device;
@@ -157,7 +162,12 @@ has nothing to say). The consumer resolves its own lanes with
 `talos::Target<M>`: `get()` returns the first lane, in the priority order the
 config gives for the current Driver Station mode, that is active, fresh and
 stamped with the consumer's current mode generation, and only while
-`robot_enabled(node)`; otherwise null, and the node goes neutral. The policy
+`robot_enabled(node)`; otherwise null, and the node goes neutral. The devices
+flush enforces it: a tick in which no Target of the node returned a target
+sends every output neutral, whatever `update()` set.
+`talos::AllowUntargetedOutputs(node)` (`talos.allow_untargeted_outputs`)
+exempts a test or bench fixture; `--describe` marks its hardware request
+`untargeted_outputs`. The policy
 is `[robot.targets]` (defaults: teleop `["teleop"]`, autonomous `["auto"]`,
 test none) with a per-subsystem `[targets]` override. No process sits between
 a producer and its subsystem, so a subsystem's safety depends only on its own

@@ -81,7 +81,9 @@ struct Mech {
         pressure{n, "pressure"},
         enc{n, "enc"},
         cc{n, "cc"},
-        gyro{n, "gyro"} {}
+        gyro{n, "gyro"} {
+    AllowUntargetedOutputs(n);
+  }
 
   void update() {
     if (a_velocity) a.set_velocity(*a_velocity, 0.5, 1);
@@ -144,6 +146,7 @@ TEST(Devices, NothingIsSentBeforeTheFirstAcceptedState) {
 }
 
 // REQ-SAFE-02
+// REQ-SAFE-42: the opt-out keeps the robot_enabled half of the gate.
 TEST(Devices, MotorsAreNeutralUntilEnabledAndEchoTheStateIdentity) {
   auto sim = Sim::FromToml(kRobotToml);
   auto& mech = sim.add<Mech>("mech");
@@ -266,7 +269,9 @@ TEST(Devices, MotorDemandsClampPerDeviceAndCountAdjustedCalls) {
 
 TEST(Devices, MotorVoltageDutyPositionAndFeedforwardUseConfiguredLimits) {
   struct Limited {
-    explicit Limited(Node& node) : motor{node, "a"} {}
+    explicit Limited(Node& node) : motor{node, "a"} {
+      AllowUntargetedOutputs(node);
+    }
     void update() {
       switch (mode) {
         case Mode::kDutyCycle:
@@ -663,7 +668,9 @@ TEST(Devices, RezeroIsDroppedWhenTheHardwareFrameMayHaveRestarted) {
 // from the first state and keeps its zero through its own reset.
 TEST(Devices, PositionGoalsWaitForARezeroUnlessTheFrameIsAbsolute) {
   struct Positioner {
-    explicit Positioner(Node& n) : absolute{n, "a"}, rotor{n, "b"} {}
+    explicit Positioner(Node& n) : absolute{n, "a"}, rotor{n, "b"} {
+      AllowUntargetedOutputs(n);
+    }
     void update() {
       absolute.set_position(0.25);
       if (rotor_voltage) {
@@ -1056,6 +1063,27 @@ TEST(Devices, OutputSettersOutsideUpdateThrow) {
   }
   auto sim = Sim::FromToml(kRobotToml);
   EXPECT_THROW(sim.add<EagerLed>("mech"), std::logic_error);
+}
+
+// The opt-out is fixed with the node: from update() it is refused, naming
+// the node.
+// REQ-SAFE-42
+TEST(Devices, AllowUntargetedOutputsOnlyInTheConstructor) {
+  struct Late {
+    explicit Late(Node& n) : node{n}, motor{n, "a"} {}
+    void update() { AllowUntargetedOutputs(node); }
+    Node& node;
+    Motor motor;
+  };
+  auto sim = Sim::FromToml(kRobotToml);
+  sim.add<Late>("mech");
+  try {
+    sim.step(10ms);
+    ADD_FAILURE() << "AllowUntargetedOutputs from update() was accepted";
+  } catch (const std::logic_error& error) {
+    EXPECT_NE(std::string{error.what()}.find("mech"), std::string::npos)
+        << error.what();
+  }
 }
 
 // RequireInUpdate is the output setters' rule for a layer that holds a
