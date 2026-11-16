@@ -88,8 +88,13 @@ release all controls, and explicitly re-enable only after checking recovery.
   bundle remains available. Record installed version and config hash. Never
   edit the installed bundle; rebuild/reinstall changes.
 - [ ] Start it by hand:
-  `"$HOME/talos-bench/current/run.sh" --remote 10.0.0.72 --output-dir "$HOME/talos-bench/logs" --duration-s 30`,
-  then `./tools/deploy.sh logs --prefix "$HOME/talos-bench"`. Expected: one
+  `./tools/deploy.sh run --prefix "$HOME/talos-bench" -- --remote 10.0.0.72 --output-dir "$HOME/talos-bench/logs" --duration-s 30`,
+  then `./tools/deploy.sh logs --prefix "$HOME/talos-bench"`. `deploy.sh run`
+  starts the selected bundle's `run.sh` with every argument after `--`
+  unchanged, under the boot service's realtime limits on Linux (it stops,
+  naming the one-time grant, when the hard limits are too low; macOS needs
+  none), refuses while the boot service runs that bundle, and first prints
+  `deploy: launcher pid <n>; ...`. Expected: that line, then one
   unique session below the output root, with the deployed config hash and
   each node's log paths. Record paths. Exactly one stack may run: stop any
   boot-managed launcher first ([boot operation](#boot-operation)).
@@ -814,7 +819,7 @@ Mini between sessions.
 
 Robot code green on the Driver Station, robot disabled, `ping -c 3 "$RIO"`
 answered. In T1:
-`"$PREFIX"/current/run.sh --no-studio --remote "$RIO" --output-dir "$ROOT/A" --duration-s 120`.
+`./tools/deploy.sh run --prefix "$PREFIX" -- --no-studio --remote "$RIO" --output-dir "$ROOT/A" --duration-s 120`.
 While it runs, robot disabled, the driver deflects what they take for axis
 1 and holds it, then centres it; then holds buttons 1, 2, 3 and 6 in turn,
 each about 2 s, one at a time. Nothing may move.
@@ -872,7 +877,7 @@ Any failure here ends the hour: fix it at the desk.
 
 ### Session B: enabled acceptance (10 min)
 
-In T1: `"$PREFIX"/current/run.sh --no-studio --remote "$RIO" --output-dir "$ROOT/B" --duration-s 420`.
+In T1: `./tools/deploy.sh run --prefix "$PREFIX" -- --no-studio --remote "$RIO" --output-dir "$ROOT/B" --duration-s 420`.
 Enable teleop with the stick released; the first spell is commissioning's
 first enabled step (axis 1 slightly, then centre). Then drive in spells of
 about 20 s separated by 10 s released, for at least 3 minutes enabled.
@@ -904,7 +909,7 @@ last time before the 420 s end. No other fault in this session.
 C1 runs stop paths 2 to 4 and ends with the robot disabled and Ctrl-C in
 T1; C2 runs paths 6 to 8. Each launch, in T1, without
 `--duration-s`:
-`"$PREFIX"/current/run.sh --no-studio --remote "$RIO" --output-dir "$ROOT/C1"`
+`./tools/deploy.sh run --prefix "$PREFIX" -- --no-studio --remote "$RIO" --output-dir "$ROOT/C1"`
 (`C2` for the second). Take the pids from T1's `Started` lines; after a
 restart the manifest holds each node's newest:
 `python3 -c 'import json,sys; [print(n["name"], n["pid"]) for n in json.load(open(sys.argv[1]))["nodes"]]' "$S/manifest.json"`.
@@ -932,7 +937,7 @@ command), and stop path 5, which would bound that expiry, is not run here:
 ### Session D: relaunch and e-stop (10 min)
 
 At once after C2, the robot still enabled and the stick released, in T1:
-`"$PREFIX"/current/run.sh --no-studio --remote "$RIO" --output-dir "$ROOT/D"`.
+`./tools/deploy.sh run --prefix "$PREFIX" -- --no-studio --remote "$RIO" --output-dir "$ROOT/D"`.
 
 - [ ] Control returns (TODO.md ARCH-4, a process restart): the dead time is
   the first State with `active=True` in session D (`sample_us`, the
