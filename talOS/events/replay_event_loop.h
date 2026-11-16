@@ -55,7 +55,10 @@ class ReplayDivergence : public std::runtime_error {
 // records: it replays every dispatch before the gap's first dropped dispatch
 // (none of a dispatch the gap split) and stops, as at the end of a truncated
 // log, with stopped_at_gap() naming the gap. Recording that replay gives the
-// log's records before that dispatch, then the replay's own EXIT.
+// log's records before that dispatch, then the replay's own EXIT. A gap that
+// starts outside any dispatch (sends during construction) stops it before
+// the first dispatch; the program's sends past the gap are refused
+// (SendStatus::FAILED), not reported.
 template <RecorderPolicy Recorder = NullRecorder>
 class ReplayEventLoop
     : public EventLoopBase<ReplayEventLoop<Recorder>, Recorder> {
@@ -309,6 +312,14 @@ class ReplayEventLoop
   // Consumes the record a handler operation must correspond to, or reports the
   // mismatch. Returns nullptr when there is nothing usable.
   const Recorded* take(EventKind expected, std::uint16_t source_id) {
+    // A gap that starts outside any dispatch (sends before the first, from
+    // the program's construction) leaves the rest of them unrecorded: they
+    // are past the replayed prefix, not divergences.
+    if (cursor_ >= records_.size() && active_dispatch_ == 0 &&
+        stopped_at_gap_.has_value() &&
+        stopped_at_gap_->first_dispatch_index == 0) {
+      return nullptr;
+    }
     if (cursor_ >= records_.size()) {
       report(Divergence{active_dispatch_, source_id,
                         std::string{"program performed an extra "} +

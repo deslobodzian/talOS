@@ -239,7 +239,11 @@ first dropped dispatch and stops there, with no divergence, `reached_exit()`
 false and `stopped_at_gap()` naming the gap. A dispatch the gap split (its
 first records kept, the rest dropped) is not replayed at all, since it was
 not recorded whole. Recording that replay gives the log's records before that
-dispatch, byte for byte, then the replay's own `EXIT`. A node binary's
+dispatch, byte for byte, then the replay's own `EXIT`. A gap that starts
+outside any dispatch (`dispatch_index` 0: sends a program made while it was
+constructed) stops the replay before the first dispatch; the program's sends
+past it are refused (`SendStatus::FAILED`, and recorded so by a re-recording),
+not reported as divergences. A node binary's
 `--replay` prints `replay: stopped at a log gap in <log> before dispatch <n>:`
 and the gap (`DescribeGap`: records dropped, the first and last dropped
 dispatch), then `replay: diverged=0 clean_exit=0 stopped_at_gap=1`, and exits
@@ -352,8 +356,13 @@ const InputReplayReport report = ReplayInputs(loop, environment, session);
   log and time in `InputReplayReport::stopped_at_gap`. A gap in a log that
   feeds the program nothing does not stop it; a gap after the run's end
   (`loop_end()`) is never reached. The stop is conservative: another log may
-  hold what the gapped one dropped. A timer firing after its own log's first
-  gap does not set `run_start()`, since the re-arms before it may be lost.
+  hold what the gapped one dropped. When its own log's first gap comes
+  before any timer firing, `run_start()` comes from the first firing after
+  the gap (its deadline less the timer's manifest offset, never before the
+  gap's start less that offset): no live firing preceded the gap, so none is
+  replayed before it, where a run fed from that log stops. The gap may have
+  dropped earlier firings of that timer, so a run nothing stops at the gap
+  replays the timers after it up to that many of its periods late.
   A node binary prints `replay-inputs: stopped before a log gap in <log> at
   <t> s after the session start (topic <name>)` and exits 1.
 
