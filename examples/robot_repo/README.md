@@ -20,7 +20,8 @@ checkout, copies it to DIR as `TEMPLATE` in `tools/new_robot.py` places each
 file, without `roller/`, `gate/` and `talos_checks/`, naming the new robot
 and pointing `@talos` at that checkout
 ([docs/FIRST_MECHANISM.md](../../docs/FIRST_MECHANISM.md) walks it). A file
-added here that `TEMPLATE` does not place makes `new_robot` refuse, which
+git tracks here that `TEMPLATE` does not place makes `new_robot` refuse
+(untracked files are ignored and never copied), which
 `tools/check_robot_repo_scaffold.sh` (prepush and CI) catches, so changing
 this fixture means saying there whether a robot repository gets the file.
 

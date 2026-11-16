@@ -44,10 +44,11 @@ def free_ports():
 class StudioBridgeInSession(unittest.TestCase):
     # REQ-DEV-30
     def test_the_bridge_serves_drive_and_exits_zero(self):
-        """Before, `@talos//studio/bridge` did not load from a repository
-        that depends on talOS (it loaded rules_js), so this target did not
-        build; and a bridge the launcher drops leaves no manifest row, so
-        the row is required here rather than only its exit."""
+        """Guards this repository's Studio wiring: talOS's bridge builds
+        here through @talos, robot.toml's [studio] webroot and //:sim's
+        data give it a folder that exists, and the launcher runs it as a
+        member. A bridge the launcher drops leaves no manifest row, so the
+        row is required here rather than only its exit."""
         out = tempfile.mkdtemp(dir=os.environ.get("TEST_TMPDIR"))
         try:
             self.check_session(out)

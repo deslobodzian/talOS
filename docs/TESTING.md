@@ -300,8 +300,9 @@ repository builds and passes `bazel test //...` there, with and without
 target coverage required (`tools/check_robot_repo_scaffold.sh`, in a copy
 of `examples/robot_repo`), and in the repository
 `bazel run //tools:new_robot -- <name> --standalone DIR` makes of that
-fixture, which also fails when the fixture has a file `new_robot`'s
-template does not place **[enforced: CI's dependent-repositories job and
+fixture, which also fails when the fixture has a tracked file
+`new_robot`'s template does not place, and whose packages load with talOS
+held at `talos/` as its README's submodule would be **[enforced: CI's dependent-repositories job and
 `tools/prepush.sh`]**.
 
 ## 8. Flakes
