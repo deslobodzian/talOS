@@ -440,7 +440,8 @@ build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
-matrix, and the RULES.md 4 commissioning check against the diff base) are
+matrix, METHODOLOGY.md §13's `bazel_dep` table, and the RULES.md 4
+commissioning check against the diff base) are
 one script, `tools/source_lints.sh`, which CI's lint job and
 prepush's `source-lints` step both run; CI's sanitizer jobs are
 `tools/sanitizer_lane.sh asan|tsan`, which `tools/prepush.sh --full` also

@@ -722,7 +722,7 @@ jobs:
 
     - *diff-base
 
-    - name: Test time, links, requirement trace, node test matrix, commissioning
+    - name: Test time, links, requirement trace, node test matrix, deps, commissioning
       # tools/source_lints.sh, which tools/prepush.sh's source-lints step
       # also runs, so the two cannot drift; its header lists each lint. It
       # runs every lint whatever the others find and prints one line per

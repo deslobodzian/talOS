@@ -23,6 +23,9 @@
 #                tools/check_node_matrix_baseline.txt: every node test has
 #                its matrix cases (docs/TESTING.md §7; the baseline may only
 #                shrink)
+#   deps         tools/check_deps_listed.py: docs/METHODOLOGY.md §13's
+#                "Bazel module" table lists exactly MODULE.bazel's
+#                bazel_deps
 #   commissioning  tools/check_commissioning.py --base <rev>: no commit
 #                since the merge base with <rev> sets `commissioned = true`
 #                or changes a CAN id in a robot or bench config (RULES.md 4)
@@ -67,6 +70,7 @@ lint links python3 tools/check_links.py
 lint trace python3 tools/trace.py --check
 lint node-matrix python3 tools/check_node_matrix.py \
   --baseline tools/check_node_matrix_baseline.txt
+lint deps python3 tools/check_deps_listed.py
 if [ -n "$base" ]; then
   lint commissioning python3 tools/check_commissioning.py --base "$base"
 else
