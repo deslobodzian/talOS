@@ -58,8 +58,9 @@ class SessionReportTest(unittest.TestCase):
         # repeats an observation 20 ms later is not a reaction to a request.
         bridge = report["bridge_request_to_command"]
         self.assertEqual(bridge["process"], "hardware_node")
-        self.assertEqual(bridge["latency"]["count"], 5)
-        self.assertAlmostEqual(bridge["latency"]["max_ms"], 0.25)
+        self.assertEqual(bridge["disabled"]["count"], 5)
+        self.assertAlmostEqual(bridge["disabled"]["max_ms"], 0.25)
+        self.assertIsNone(bridge["enabled"])
         self.assertNotIn("hardware_node timer lateness: NOT MEASURED", result.stdout)
         # Never enabled: only the enabled-only rows stay unmeasured, each
         # still failing --strict (REQ-RT-15), and the report says why.
@@ -179,7 +180,10 @@ class SessionReportTest(unittest.TestCase):
         def hardware(process, topic, now, observed):
             return record(process, "SEND", topic, now,
                           hardware={"boot_id": 1, "observed_time_us": observed})
-        traffic = [hardware("lift", "/hw/request/lift", 10, 1),
+        traffic = [record("hardware_node", "SEND", "/hw/state", 0, hardware={
+                       "boot_id": 1, "sample_time_us": 0, "configured": True,
+                       "enabled": False, "hardware_fault": False}),
+                   hardware("lift", "/hw/request/lift", 10, 1),
                    hardware("hardware_node", "/hw/command", 10.25, 1),
                    hardware("lift", "/hw/request/lift", 25, 2),
                    hardware("hardware_node", "/hw/command", 26, 2)]
@@ -190,15 +194,15 @@ class SessionReportTest(unittest.TestCase):
                  None)):
             with self.subTest(label):
                 report = session_report.analyze({"nodes": []}, traffic + gaps)
-                self.assertEqual(report["bridge_request_to_command"]["latency"], latency)
-        self.assertIn("| bridge request to command hardware_node | NOT MEASURED | — | — | — |",
-                      session_report.markdown(report).splitlines())
+                self.assertEqual(report["bridge_request_to_command"]["disabled"], latency)
+        self.assertIn("| bridge request to command hardware_node disabled | NOT MEASURED "
+                      "| — | — | — |", session_report.markdown(report).splitlines())
 
         # A gap at the head of lift's log, before its first kept request:
         # a request carrying observation 1 could be lost there, so the
         # 0.25 ms sample is no measurement.
-        report = session_report.analyze({"nodes": []}, traffic[:2] + [gap("lift", 2, 2, 1)])
-        self.assertIsNone(report["bridge_request_to_command"]["latency"])
+        report = session_report.analyze({"nodes": []}, traffic[:3] + [gap("lift", 2, 2, 1)])
+        self.assertIsNone(report["bridge_request_to_command"]["disabled"])
 
         # The bridge drops only the Driver Station packet disabling the robot
         # at 50 ms and keeps its States; until its next kept packet, at 70 ms,
@@ -275,6 +279,217 @@ class SessionReportTest(unittest.TestCase):
         _, delays, _ = session_report.request_to_command(
             [send("/hw/command", 10.0), send("/hw/request/lift", 12.0)])
         self.assertEqual(delays, [])
+
+    # REQ-RT-25: each motor's and CAN sensor's feedback age is the older of
+    # its position and velocity ages, as the RoboRIO measured them, over
+    # every State of the bridge's own stream (a reader's copies are not
+    # pooled), skipping a sample the State marks invalid. Phoenix's
+    # unknown-stamp sentinel (UINT32_MAX, about 4295 s) is no age: it is
+    # counted apart, never in the statistics.
+    def test_feedback_age_per_device(self):
+        def state(process, kind, now, motor_ages, sensor_valid=True):
+            return dict(process=process, kind=kind, topic="/hw/state", now_ms=now,
+                        event_ms=now, publish_ms=now, decoded="", hardware={
+                            "type": "state", "boot_id": "7", "sample_time_us": now * 1000,
+                            "motors": [{"id": 3, "valid": True, "position_age_us": motor_ages[0],
+                                        "velocity_age_us": motor_ages[1]}],
+                            "sensors": [{"id": 9, "valid": sensor_valid,
+                                         "position_age_us": 400, "velocity_age_us": 900}]})
+        records = [state("hardware_node", "SEND", 0, (1200, 300)),
+                   state("hardware_node", "SEND", 5, (2500, 2600), sensor_valid=False),
+                   state("hardware_node", "SEND", 10, (100, 4000)),
+                   state("hardware_node", "SEND", 15, (2**32 - 1, 300)),
+                   state("lift", "MESSAGE", 1, (99999, 99999))]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["feedback_age_us"], {
+            "motor 3": {"count": 3, "median_us": 2600, "p99_us": 4000, "max_us": 4000,
+                        "sentinel": 1},
+            "sensor 9": {"count": 3, "median_us": 900, "p99_us": 900, "max_us": 900,
+                         "sentinel": 0}})
+
+    # REQ-RT-25: State to request joins a State's (boot_id, sample_time_us),
+    # a RoboRIO time, to an owner's first request carrying it as
+    # (boot_id, observed_time_us), and subtracts only main-processor times:
+    # the State's publication from the request's tick. The RoboRIO's clock
+    # reads 7000 s here, so a cross-clock difference would be seconds, not
+    # the 2 ms and 4 ms the owners took. A later request repeating the
+    # observation, and one of another boot with the same sample time, are
+    # not that State's first request.
+    def test_state_to_request_joins_on_observation_and_one_clock(self):
+        def send(process, topic, now, **hardware):
+            return dict(process=process, kind="SEND", topic=topic, now_ms=now, event_ms=now,
+                        publish_ms=now, decoded="", hardware=hardware)
+        sample_us = 7_000_000_000
+        records = [send("hardware_node", "/hw/state", 10, boot_id="7", sample_time_us=sample_us),
+                   send("lift", "/hw/request/lift", 12, boot_id="7", observed_time_us=sample_us),
+                   send("lift", "/hw/request/lift", 17, boot_id="7", observed_time_us=sample_us),
+                   send("arm", "/hw/request/arm", 3, boot_id="8", observed_time_us=sample_us),
+                   send("arm", "/hw/request/arm", 14, boot_id="7", observed_time_us=sample_us)]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["state_to_request_ms"], {
+            "arm": {"count": 1, "median_ms": 4, "p99_ms": 4, "max_ms": 4},
+            "lift": {"count": 1, "median_ms": 2, "p99_ms": 2, "max_ms": 2}})
+
+    # REQ-RT-25, REQ-OPS-16: a sample whose span meets a gap of the owner's
+    # log is NOT MEASURED, not a pass and not a shorter figure: lift's log
+    # lost a record between the State and its kept request, which could be
+    # an earlier request carrying the observation. The row stays listed.
+    def test_a_gap_makes_state_to_request_not_measured(self):
+        def send(process, topic, now, **hardware):
+            return dict(process=process, kind="SEND", topic=topic, now_ms=now, event_ms=now,
+                        publish_ms=now, decoded="", hardware=hardware)
+        records = [send("hardware_node", "/hw/state", 10, boot_id="7", sample_time_us=5000),
+                   send("lift", "/hw/request/lift", 18, boot_id="7", observed_time_us=5000),
+                   dict(process="lift", kind="GAP", topic="?", now_ms=16, event_ms=16,
+                        publish_ms=0, decoded="", gap={
+                            "start_ms": 12, "end_ms": 16, "first_lost_ms": 13,
+                            "last_lost_ms": 13, "records": 1, "cause": "pool_full",
+                            "closed_at_flush": False})]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["state_to_request_ms"], {"lift": None})
+        self.assertEqual(report["intervals_across_gaps"]["state_to_request"], 1)
+
+    # REQ-RT-25: a Driver Station packet's publication (its publish time,
+    # which a reader's copy carries; teleop received this one 3 ms later) to
+    # the producer's next lane publication, a release included.
+    def test_driver_station_to_lane_counts_from_publication(self):
+        def record(kind, topic, publish, now, decoded=""):
+            return dict(process="teleop", kind=kind, topic=topic, now_ms=now, event_ms=now,
+                        publish_ms=publish, decoded=decoded)
+        records = [record("MESSAGE", "/hw/state/driver_station", 0, 3),
+                   record("MESSAGE", "/hw/state/driver_station", 20, 23),
+                   record("SEND", "/lift/target/teleop", 5, 5),
+                   record("SEND", "/lift/target/teleop", 10, 10),
+                   record("SEND", "/lift/target/teleop", 26, 26)]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["driver_station_to_lane_ms"],
+                         {"teleop": {"count": 2, "median_ms": 5.5, "p99_ms": 6, "max_ms": 6}})
+
+    # Driver Station to command's records: a packet, a tick in which a
+    # Target selected a lane and its node sent a request, a merged command.
+    @staticmethod
+    def chain_record(process, kind, topic, now, publish=None, index=0, **extra):
+        return dict(process=process, kind=kind, topic=topic, now_ms=now, event_ms=now,
+                    publish_ms=now if publish is None else publish, decoded="",
+                    dispatch_index=index, **extra)
+
+    def ds_packet(self, publish, enabled, mode="teleop"):
+        return self.chain_record("hardware_node", "SEND", "/hw/state/driver_station", publish,
+                                 ds_enabled=enabled, hardware={"type": "driver_station",
+                                                               "mode": mode})
+
+    def selecting_tick(self, now, lane_publish, index, observed, lane="teleop"):
+        return [self.chain_record("lift", "READ", f"/lift/target/{lane}", now, lane_publish,
+                                  index),
+                self.chain_record("lift", "SEND", "/hw/request/lift", now, index=index,
+                                  hardware={"boot_id": "7", "observed_time_us": observed})]
+
+    def merged_command(self, now, observed):
+        return self.chain_record("hardware_node", "SEND", "/hw/command", now,
+                                 hardware={"boot_id": "7", "observed_time_us": observed})
+
+    # REQ-RT-25: Driver Station to command follows one teleop packet to the
+    # first command built from it, in enabled time only. The packet
+    # published at 0 ms; lift's tick at 6 ms selected a lane published at
+    # 4 ms and sent a request observing (7, 5000). The bridge's command at
+    # 6.1 ms still carries (7, 4000): with two owners it merges the older
+    # observation, so lift's request reaches a command only once the other
+    # owner observes a newer State, at 6.3 ms: 6.3 ms. A tick selecting a
+    # lane published before the packet is not built from it. The packet at
+    # 20 ms shows the robot disabled and gives no sample; the one at 40 ms
+    # is enabled, but the robot is disabled (60 ms) by the command its chain
+    # reaches (at 62 ms); the autonomous one at 80 ms reaches a command
+    # through the auto lane, which is no operator path.
+    def test_driver_station_to_command_follows_one_packet_while_enabled(self):
+        ds, tick, command = self.ds_packet, self.selecting_tick, self.merged_command
+        records = [ds(0, True), *tick(1, -2, 1, 4000), command(1.2, 4000),
+                   *tick(6, 4, 2, 5000), command(6.1, 4000), command(6.3, 5000),
+                   ds(20, False), *tick(26, 24, 3, 6000), command(26.2, 6000),
+                   ds(40, True), ds(60, False), *tick(61, 45, 4, 7000), command(62, 7000),
+                   ds(80, True, "autonomous"), *tick(81, 80.5, 5, 8000, "auto"),
+                   command(81.2, 8000)]
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertEqual(report["driver_station_to_command_ms"],
+                         {"count": 1, "median_ms": 6.3, "p99_ms": 6.3, "max_ms": 6.3})
+
+    # REQ-RT-25: a tick is built from a packet only if its lane was
+    # published before the next packet. Enabled with the sticks neutral the
+    # lane is released and Target logs no READ for a second; the first
+    # selection, at 1005 ms of a lane published at 1003 ms, follows only the
+    # packet at 1000 ms, not the 50 before it.
+    def test_driver_station_to_command_takes_no_tick_after_the_next_packet(self):
+        records = [self.ds_packet(t, True) for t in range(0, 1001, 20)]
+        records += [*self.selecting_tick(1005, 1003, 1, 5000),
+                    self.merged_command(1005.25, 5000)]
+        self.assertEqual(session_report.analyze({"nodes": []}, records)
+                         ["driver_station_to_command_ms"],
+                         {"count": 1, "median_ms": 5.25, "p99_ms": 5.25, "max_ms": 5.25})
+
+    # REQ-RT-25: a restarted node logs under its name again from dispatch 0,
+    # so a READ joins a request only within one run. lift's first run
+    # selects and requests at dispatch 2 (21 ms) and runs to dispatch 3; its
+    # second, a minute later, starts again at dispatch 1 and reuses 2: each
+    # packet follows its own run's request (1.25 ms and 11.25 ms), never the
+    # other's.
+    def test_driver_station_to_command_joins_within_one_run(self):
+        records = [self.ds_packet(20, True), *self.selecting_tick(21, 20.5, 2, 2000),
+                   self.merged_command(21.25, 2000),
+                   self.chain_record("lift", "TIMER", "update", 30, index=3),
+                   self.ds_packet(59990, True),
+                   self.chain_record("lift", "TIMER", "update", 59995, index=1),
+                   *self.selecting_tick(60001, 60000.5, 2, 9000),
+                   self.merged_command(60001.25, 9000)]
+        row = session_report.analyze({"nodes": []}, records)["driver_station_to_command_ms"]
+        self.assertEqual((row["count"], row["median_ms"], row["max_ms"]), (2, 6.25, 11.25))
+
+    # REQ-RT-25: bridge request to command is split as the bridge decides
+    # its send: by the State it holds (GatewayReady: configured, enabled, no
+    # hardware fault), held over the whole sample. Ready, it sends a changed
+    # merge at once; not ready, only on its heartbeat. The Driver Station
+    # shows enabled throughout, but the State latches a fault at 50 ms, so
+    # 60 -> 80 ms is not-ready time, and a sample across the change
+    # (49 -> 51 ms) is in neither.
+    def test_request_to_command_is_split_into_enabled_and_disabled_time(self):
+        def send(topic, now, observed=None, **extra):
+            hardware = None if observed is None else {"boot_id": "7",
+                                                      "observed_time_us": observed}
+            return dict(process="lift" if topic.startswith("/hw/request/") else "hardware_node",
+                        kind="SEND", topic=topic, now_ms=now, event_ms=now, publish_ms=now,
+                        decoded="", hardware=hardware, **extra)
+        def state(now, fault):
+            return dict(send("/hw/state", now), hardware={
+                "type": "state", "boot_id": "7", "sample_time_us": now * 1000,
+                "configured": True, "enabled": True, "hardware_fault": fault})
+        records = [send("/hw/state/driver_station", 0, ds_enabled=True),
+                   state(0, False), state(50, True),
+                   send("/hw/request/lift", 10, 1), send("/hw/command", 10.25, 1),
+                   send("/hw/request/lift", 49, 2), send("/hw/command", 51, 2),
+                   send("/hw/request/lift", 60, 3), send("/hw/command", 80, 3)]
+        bridge = session_report.analyze({"nodes": []}, records)["bridge_request_to_command"]
+        self.assertEqual(bridge, {
+            "process": "hardware_node",
+            "enabled": {"count": 1, "median_ms": 0.25, "p99_ms": 0.25, "max_ms": 0.25},
+            "disabled": {"count": 1, "median_ms": 20, "p99_ms": 20, "max_ms": 20}})
+
+    # REQ-RT-25: the clocks' relative drift is the slope of the bridge's
+    # valid clock_offset_us over its /hw/status publication times, fitted
+    # within one estimator: offsets rising 50 µs per second are 50 ppm,
+    # whatever the jump a gateway reboot (a new clock_boot_id) makes, and an
+    # invalid offset is ignored.
+    def test_clock_drift_is_the_offset_slope_within_one_boot(self):
+        def status(publish, boot, offset, valid=True):
+            return dict(process="hardware_node", kind="SEND", topic="/hw/status",
+                        now_ms=publish, event_ms=publish, publish_ms=publish,
+                        decoded=f"{{clock_boot_id: {boot}, clock_offset_us: {offset}, "
+                                f"clock_resets_count: {boot}, "
+                                f"clock_offset_valid: {'true' if valid else 'false'}}}")
+        records = [status(t, 1, -3000 + t * 0.05) for t in range(0, 10_000, 1000)]
+        records += [status(t, 2, 900_000 + t * 0.05) for t in range(10_000, 20_000, 1000)]
+        records += [status(4500, 1, 77_777, valid=False)]
+        records.sort(key=lambda r: r["publish_ms"])
+        report = session_report.analyze({"nodes": []}, records)
+        self.assertAlmostEqual(report["clock_drift_ppm"], 50)
+        self.assertIsNone(session_report.analyze({"nodes": []}, records[:1])["clock_drift_ppm"])
 
     def test_strict_names_a_damaged_log_and_its_offset(self):
         files = runfiles.Create()

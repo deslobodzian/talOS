@@ -13,12 +13,14 @@ import sys
 from python.runfiles import runfiles
 
 
-def stats(values):
+def stats(values, unit="ms"):
+    """Count, median, nearest-rank p99 and max, each named with its unit;
+    None for no values (a row with no sample is not measured, not 0)."""
     values = sorted(values)
     if not values:
         return None
-    return {"count": len(values), "median_ms": statistics.median(values),
-            "p99_ms": values[math.ceil(.99 * len(values)) - 1], "max_ms": values[-1]}
+    return {"count": len(values), f"median_{unit}": statistics.median(values),
+            f"p99_{unit}": values[math.ceil(.99 * len(values)) - 1], f"max_{unit}": values[-1]}
 
 
 def scalars(decoded):
@@ -222,7 +224,8 @@ def across_gap(spans, processes, low, high):
 
 def request_to_command(records, spans=None):
     """The event-driven bridge's reaction to requests (REQ-RT-20), as
-    (process, delays, unmeasured): for each observation (boot_id,
+    (process, samples, unmeasured), each sample (request ms, command ms):
+    for each observation (boot_id,
     observed_time_us) a merged /hw/command carries, its first command's time
     minus the first /hw/request/<node> carrying it. A command repeating an
     observation (the heartbeat) is no reaction, and one no request carried by
@@ -254,16 +257,245 @@ def request_to_command(records, spans=None):
             first_request[key] = (now, last.get(request_stream, -math.inf))
         last[request_stream] = now
     logs = {process} | {request_stream[0] for _, request_stream, _ in requests}
-    delays, seen, unmeasured = [], set(), 0
+    samples, seen, unmeasured = [], set(), 0
     for now, key in sorted(commands, key=lambda c: c[0]):
         if key not in seen and first_request.get(key, (math.inf,))[0] <= now:
             requested, since = first_request[key]
             if across_gap(spans or {}, logs, since, now):
                 unmeasured += 1
             else:
-                delays.append(now - requested)
+                samples.append((requested, now))
         seen.add(key)
-    return process, delays, unmeasured
+    return process, samples, unmeasured
+
+
+# REQ-RT-25: each latency row is the difference of two readings of one
+# clock. Every time subtracted below is a main-processor time (a record's
+# now or publish); a RoboRIO time (sample_time_us, observed_time_us) is
+# only matched or ordered against another of the same boot, never
+# subtracted from a main-processor one, whose mapping to it is uncertain by
+# milliseconds (docs/DATA_FLOW.md).
+
+
+def observations(records, prefix):
+    """The SEND records on topics starting with `prefix` that carry an
+    observation, as (now_ms, record, (boot_id, observed_time_us)), by time."""
+    found = []
+    for r in records:
+        hardware = r.get("hardware")
+        if (r["kind"] == "SEND" and r["topic"].startswith(prefix)
+                and isinstance(hardware, dict) and "observed_time_us" in hardware):
+            found.append((r["now_ms"], r, (hardware.get("boot_id"),
+                                           hardware["observed_time_us"])))
+    return sorted(found, key=lambda f: f[0])
+
+
+# The age the RoboRIO reports for a signal whose timestamp Phoenix could not
+# give (PhoenixBackend.cpp Age(): UINT32_MAX, while the sample is valid).
+UNKNOWN_AGE_US = 2**32 - 1
+
+
+def feedback_age(states):
+    """Per motor and CAN sensor ("motor <id>", "sensor <id>"), the age of
+    its motion feedback in each State of the selected /hw/state stream: the
+    older of its position_age_us and velocity_age_us. The RoboRIO measured
+    each (the signal's age at its read), so each is already a difference of
+    its one clock; a sample the State marks invalid is skipped. An age of
+    UNKNOWN_AGE_US (Phoenix's timestamp was unknown) is no age: the sample
+    is left out of the statistics and counted in `sentinel`. A device with
+    only such samples reads count 0, NOT MEASURED."""
+    ages, sentinels = {}, {}
+    for r in states:
+        hardware = r.get("hardware")
+        if not isinstance(hardware, dict):
+            continue
+        for kind, member in (("motor", "motors"), ("sensor", "sensors")):
+            for sample in hardware.get(member, ()):
+                if not sample.get("valid"):
+                    continue
+                device = (kind, sample["id"])
+                values = ages.setdefault(device, [])
+                age = (sample["position_age_us"], sample["velocity_age_us"])
+                if UNKNOWN_AGE_US in age:
+                    sentinels[device] = sentinels.get(device, 0) + 1
+                else:
+                    values.append(max(age))
+    return {f"{kind} {device}": {**(stats(values, "us") or {"count": 0}),
+                                 "sentinel": sentinels.get((kind, device), 0)}
+            for (kind, device), values in sorted(ages.items())}
+
+
+def state_to_request(states, records, spans):
+    """Per actuator owner (the process sending /hw/request/<node>), the
+    tick time of its first request carrying each State's observation less
+    that State's /hw/state publication: request_to_command's join, keyed
+    (boot_id, sample_time_us) to (boot_id, observed_time_us). It ends at the
+    tick's start, where request to command begins, so the two rows add up
+    along the path. A State the stream lacks gives no sample; one whose span
+    meets a log gap of the owner's log, which could hide an earlier request
+    carrying it, is unmeasured and counted. Returns ({node: [ms]}, count)."""
+    published = {}
+    for r in states:
+        hardware = r.get("hardware")
+        if isinstance(hardware, dict) and "sample_time_us" in hardware:
+            published.setdefault((hardware.get("boot_id"), hardware["sample_time_us"]),
+                                 r["publish_ms"])
+    first = {}
+    for now, r, key in observations(records, "/hw/request/"):
+        first.setdefault((r["process"], key), now)
+    delays, unmeasured = {}, 0
+    for (node, key), now in first.items():
+        since = published.get(key)
+        if since is None:
+            continue
+        # A node whose every sample met a gap is listed, as not measured.
+        samples = delays.setdefault(node, [])
+        if across_gap(spans, {node}, since, now):
+            unmeasured += 1
+        else:
+            samples.append(now - since)
+    return delays, unmeasured
+
+
+def driver_station_to_lane(packets, records, spans):
+    """Per producer (a process publishing a target lane), each Driver
+    Station packet's /hw/state/driver_station publication to that
+    producer's next lane publication at or after it, a release included.
+    It ends where target age at the tick begins. A sample whose span meets
+    a log gap of the producer's log, which could hide an earlier send, is
+    unmeasured and counted. Returns ({node: [ms]}, count)."""
+    sends = {}
+    for r in records:
+        if r["kind"] == "SEND" and is_target_lane(r["topic"]):
+            sends.setdefault(r["process"], []).append(r["publish_ms"])
+    delays, unmeasured = {}, 0
+    for node, times in sorted(sends.items()):
+        times.sort()
+        samples = delays.setdefault(node, [])
+        for packet in packets:
+            since = packet["publish_ms"]
+            index = bisect.bisect_left(times, since)
+            if index == len(times):
+                continue
+            if across_gap(spans, {node}, since, times[index]):
+                unmeasured += 1
+            else:
+                samples.append(times[index] - since)
+    return delays, unmeasured
+
+
+def dispatches(records):
+    """Each record's dispatch as (process, run, dispatch_index), keyed by
+    the record's position in `records`. A restarted node logs under the same
+    process name with its dispatch index counting from 0 again
+    (EventLoopBase::begin_run), so a process's records start a new run
+    after its EXIT record or where, in time order, the index decreases."""
+    runs, found = {}, {}
+    order = sorted((r["process"], r["now_ms"], r["dispatch_index"], position, r["kind"])
+                   for position, r in enumerate(records)
+                   if r.get("dispatch_index") is not None and r["kind"] != "GAP")
+    for process, _, index, position, kind in order:
+        run, last, exited = runs.get(process, (0, -1, False))
+        if exited or index < last:
+            run += 1
+        runs[process] = (run, index, kind == "EXIT")
+        found[position] = (process, run, index)
+    return found
+
+
+def driver_station_to_command(packets, records, spans, enabled_at, bridge):
+    """For each teleop Driver Station packet that shows the robot enabled,
+    its /hw/state/driver_station publication to the first /hw/command built
+    from it: the earliest tick in which a Target selected a lane published
+    at or after this packet and before the next one (its READ record) and
+    its node sent a request (the same dispatch of the same run), then the
+    bridge's first command at or after that tick that merged it: of the
+    same boot, with an observation no older than the request's (a merged
+    command carries its oldest owner's, so with two owners it waits for the
+    other's next request). Observations are only compared. The robot must
+    still be enabled at the command (enabled_at). A sample whose span meets
+    a log gap of the bridge's log, or of a node that selected a lane or sent
+    a request, is unmeasured and counted. Returns ([ms], count)."""
+    keys = dispatches(records)
+    requests = {}
+    for position, r in enumerate(records):
+        hardware = r.get("hardware")
+        if (r["kind"] == "SEND" and r["topic"].startswith("/hw/request/")
+                and isinstance(hardware, dict) and "observed_time_us" in hardware
+                and position in keys):
+            requests[keys[position]] = (r["now_ms"], (hardware.get("boot_id"),
+                                                      hardware["observed_time_us"]))
+    selections = [(position, r) for position, r in enumerate(records)
+                  if r["kind"] == "READ" and is_target_lane(r["topic"])]
+    packets = sorted(packets, key=lambda p: p["publish_ms"])
+    published = [p["publish_ms"] for p in packets]
+    # Each packet's earliest selection: a tick whose lane was published in
+    # its window [this packet, the next packet). One pass over the ticks.
+    first_tick = {}
+    for now, lane, request in sorted((r["now_ms"], r["publish_ms"], requests[keys[position]])
+                                     for position, r in selections
+                                     if keys.get(position) in requests):
+        packet = bisect.bisect_right(published, lane) - 1
+        if packet >= 0 and packet not in first_tick:
+            first_tick[packet] = request
+    commands = [(now, key) for now, _, key in observations(records, "/hw/command")]
+    command_times = [now for now, _ in commands]
+    logs = {bridge} | {r["process"] for _, r in selections} | {key[0] for key in requests}
+    delays, unmeasured = [], 0
+    for packet, (requested, (boot, observed)) in sorted(first_tick.items()):
+        if not packets[packet].get("ds_enabled") \
+                or (packets[packet].get("hardware") or {}).get("mode") != "teleop":
+            continue
+        since = published[packet]
+        command = None
+        # Walk from the request; the walk ends at the first command that
+        # merged it, of another boot, or once the robot is disabled.
+        for index in range(bisect.bisect_left(command_times, requested), len(commands)):
+            now, (command_boot, command_observed) = commands[index]
+            if command_boot != boot or not enabled_at(now):
+                break
+            if command_observed >= observed:
+                command = now
+                break
+        if command is None:
+            continue
+        if across_gap(spans, logs, since, command):
+            unmeasured += 1
+        else:
+            delays.append(command - since)
+    return delays, unmeasured
+
+
+def clock_drift_ppm(status_records, spans):
+    """How fast the bridge's clock_offset_us (its mapping of gateway time to
+    node time) changes per main-processor second, in ppm: the least-squares
+    slope of the valid offsets against their /hw/status publication times,
+    fitted within each run of one estimator (one clock_boot_id and
+    clock_resets_count, and no log gap of the status stream's log between
+    two samples) and pooled across runs. It is the two oscillators' relative
+    drift; no latency is computed across the clocks. None without two valid
+    samples at different times in one run."""
+    lost = sorted(span for process in {r["process"] for r in status_records[:1]}
+                  for span in spans.get(process, ()))
+    runs = {}
+    for r in status_records:
+        fields = scalars(r["decoded"])
+        time = r["publish_ms"]
+        if (fields.get("clock_offset_valid") is not True or "clock_offset_us" not in fields
+                or any(start <= time <= end for start, end in lost)):
+            continue
+        run = (fields.get("clock_boot_id"), fields.get("clock_resets_count"),
+               sum(end < time for _, end in lost))
+        runs.setdefault(run, []).append((time, fields["clock_offset_us"]))
+    covariance = variance = 0.0
+    for samples in runs.values():
+        mean_time = statistics.fmean(time for time, _ in samples)
+        mean_offset = statistics.fmean(offset for _, offset in samples)
+        covariance += sum((time - mean_time) * (offset - mean_offset)
+                          for time, offset in samples)
+        variance += sum((time - mean_time) ** 2 for time, _ in samples)
+    # µs of offset per ms of time, × 1000: µs per s, which is ppm.
+    return covariance / variance * 1000 if variance else None
 
 
 def alert_summary(records, spans=None):
@@ -361,6 +593,8 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     # the only one that can hide a record of it.
     state_logs = {r["process"] for r in states[:1]}
     ds_logs = {r["process"] for r in ds[:1]}
+    # Every packet's publication, whether or not it decodes.
+    ds_packets = ds
     ds = [r for r in ds if "ds_enabled" in r]
     ds_times = [r["now_ms"] for r in ds]
     overall, enabled = [], []
@@ -378,6 +612,27 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
         index = bisect.bisect_right(ds_times, time) - 1
         return (index >= 0 and ds[index]["ds_enabled"]
                 and not across_gap(spans, ds_logs, held_since(index), time))
+
+    state_times = [r["now_ms"] for r in states]
+
+    def ready(state):
+        # The bridge's GatewayReady (talOS/hardware/gate.h) of a decoded
+        # State, or None when it did not decode.
+        hardware = state.get("hardware")
+        if not isinstance(hardware, dict) or "enabled" not in hardware:
+            return None
+        return (hardware.get("configured") is True and hardware["enabled"] is True
+                and hardware.get("hardware_fault") is False)
+
+    def held_ready(low, high):
+        # Whether the State the bridge held was ready from low through high,
+        # or None: no State yet at low, a State record could be missing in
+        # between, or readiness changed or is unknown.
+        index = bisect.bisect_right(state_times, low) - 1
+        if index < 0 or across_gap(spans, state_logs, state_times[index], high):
+            return None
+        held = {ready(r) for r in states[index:bisect.bisect_right(state_times, high)]}
+        return held.pop() if len(held) == 1 and None not in held else None
     for previous, current in zip(states, states[1:]):
         start, end = previous["now_ms"], current["now_ms"]
         if across_gap(spans, state_logs, start, end):
@@ -504,7 +759,21 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     verdict("timer lateness", False, False,
             "Measured where TIMER dispatches exist; no acceptance threshold is specified."
             + lost_samples(processes(timers)), required=False)
-    bridge, bridge_delays, across_bridge = request_to_command(records, spans)
+    bridge, bridge_samples, across_bridge = request_to_command(records, spans)
+    # Split as the bridge decides its send (CommandDueUs): while its State
+    # is not ready, a changed observation waits for the heartbeat. A sample
+    # whose readiness is unknown or changes between its ends is in neither.
+    bridge_split = {"enabled": [], "disabled": []}
+    for requested, commanded in bridge_samples:
+        bit = held_ready(requested, commanded)
+        if bit is not None:
+            bridge_split["enabled" if bit else "disabled"].append(commanded - requested)
+    # REQ-RT-25's rows; informational, no verdict (REQ-RT-26 is judged at
+    # the bench).
+    to_request, across_to_request = state_to_request(states, records, spans)
+    to_lane, across_to_lane = driver_station_to_lane(ds_packets, records, spans)
+    to_command, across_to_command = driver_station_to_command(ds, records, spans,
+                                                              enabled_at, bridge)
     # The enabled-only rows above stay required (REQ-RT-15); in a session
     # that never enabled they cannot be measured, which is no tool fault.
     never_enabled = None
@@ -567,7 +836,13 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             "target_receipt_age": {k: stats(v) for k, v in sorted(targets.items())},
             "target_age_at_tick": {k: stats(v) for k, v in sorted(tick_ages.items())},
             "timer_lateness": {k: stats(v) for k, v in sorted(timers.items())},
-            "bridge_request_to_command": {"process": bridge, "latency": stats(bridge_delays)},
+            "bridge_request_to_command": {"process": bridge,
+                                          **{k: stats(v) for k, v in bridge_split.items()}},
+            "feedback_age_us": feedback_age(states),
+            "state_to_request_ms": {k: stats(v) for k, v in sorted(to_request.items())},
+            "driver_station_to_lane_ms": {k: stats(v) for k, v in sorted(to_lane.items())},
+            "driver_station_to_command_ms": stats(to_command),
+            "clock_drift_ppm": clock_drift_ppm(status_records, spans),
             "never_enabled": never_enabled,
             # log_dump's line, or null: the session's hardware packets were
             # recorded under another protocol and not decoded.
@@ -589,7 +864,10 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
             **({"log_gaps": gap_list, "records_lost": records_lost,
                 "intervals_across_gaps": {"state_overall": across_state,
                                           "state_enabled": across_state + across_ds,
-                                          "bridge_request_to_command": across_bridge}}
+                                          "bridge_request_to_command": across_bridge,
+                                          "state_to_request": across_to_request,
+                                          "driver_station_to_lane": across_to_lane,
+                                          "driver_station_to_command": across_to_command}}
                if gap_list else {})}
 
 
@@ -598,6 +876,54 @@ def strict_failures(report):
     return [f"{v['measurement']}: {v['verdict']}" for v in report["verdicts"]
             if v["required"] and v["verdict"] != "PASS"] + report["session_issues"] \
         + report["realtime_issues"] + report["delivery_issues"]
+
+
+def stats_row(name, s, unit="ms"):
+    """One table row of stats(); NOT MEASURED for a row with no sample."""
+    if s is None or not s["count"]:
+        return f"| {name} | NOT MEASURED | — | — | — |"
+    return (f"| {name} | {s['count']} | {s[f'median_{unit}']:.6g} | {s[f'p99_{unit}']:.6g} "
+            f"| {s[f'max_{unit}']:.6g} |")
+
+
+# The REQ-RT-25 rows, each named as the report states it and keyed as in
+# intervals_across_gaps.
+LATENCY_ROWS = (("state_to_request_ms", "state to request", "state_to_request"),
+                ("driver_station_to_lane_ms", "driver station to lane",
+                 "driver_station_to_lane"))
+
+
+def latency_lines(report):
+    """The Latency section: REQ-RT-25's rows, informational (no verdict)."""
+    lines = ["", "## Latency (REQ-RT-25)",
+             "Informational, not judged by --strict. Each value is the difference of two "
+             "readings of one clock.", "| Measurement | Count | Median | p99 | Max |",
+             "|---|---:|---:|---:|---:|"]
+    devices = report["feedback_age_us"]
+    # A sentinel (unknown) age is named in the row, never in its figures.
+    lines += [stats_row(f"feedback age {name} (µs"
+                        + (f"; {s['sentinel']} unknown ages)" if s["sentinel"] else ")"), s, "us")
+              for name, s in devices.items()]
+    if not devices:
+        lines.append(stats_row("feedback age (µs)", None))
+    for key, name, _ in LATENCY_ROWS:
+        rows = report[key]
+        lines += [stats_row(f"{name} {node}", s) for node, s in rows.items()]
+        if not rows:
+            lines.append(stats_row(name, None))
+    lines.append(stats_row("driver station to command, enabled",
+                           report["driver_station_to_command_ms"]))
+    drift = report["clock_drift_ppm"]
+    lines.append("Clock drift: " + ("NOT MEASURED (fewer than two valid clock offsets "
+                                    "of one estimator)" if drift is None else
+                                    f"{drift:.6g} ppm (slope of clock_offset_us)"))
+    across = report.get("intervals_across_gaps", {})
+    for _, name, key in LATENCY_ROWS + (("", "driver station to command",
+                                         "driver_station_to_command"),):
+        if across.get(key):
+            lines.append(f"{name[0].upper()}{name[1:]}: {across[key]} samples across a "
+                         "log gap not measured.")
+    return lines
 
 
 def markdown(report):
@@ -647,10 +973,9 @@ def markdown(report):
                **{"timer " + k: v for k, v in report["timer_lateness"].items()}}
     bridge = report["bridge_request_to_command"]
     if bridge["process"]:
-        entries["bridge request to command " + bridge["process"]] = bridge["latency"]
-    for name, s in entries.items():
-        lines.append(f"| {name} | " + ("NOT MEASURED | — | — | — |" if s is None else
-                     f"{s['count']} | {s['median_ms']:.6g} | {s['p99_ms']:.6g} | {s['max_ms']:.6g} |"))
+        for split in ("enabled", "disabled"):
+            entries[f"bridge request to command {bridge['process']} {split}"] = bridge[split]
+    lines += [stats_row(name, s) for name, s in entries.items()]
     if not report["target_receipt_age"]:
         lines.append("Target receipt age: NOT MEASURED (no target MESSAGE dispatches).")
     if not report["target_age_at_tick"]:
@@ -677,6 +1002,7 @@ def markdown(report):
     if across:
         lines.append(f"Bridge request to command: {across} samples across a log gap "
                      "not measured.")
+    lines += latency_lines(report)
     lines += ["", "## /hw/status", f"Stream: {report['status_stream'] or 'NOT MEASURED'}"]
     for field, values in report["status"].items():
         lines.append(f"- {field}: " + ", ".join(f"{k}={v}" for k, v in values.items()))
