@@ -14,7 +14,10 @@
 #include <iostream>
 #include <random>
 #include <sstream>
+#include <string_view>
 #include <utility>
+
+#include "talOS/events/session_manifest.h"
 
 namespace talos::launcher {
 
@@ -238,11 +241,20 @@ std::string RealtimeWarning(std::string_view name, pid_t pid,
   return line + "; the reasons are in its log\n";
 }
 
+namespace {
+
+// `"key": `, for a member that event::session_manifest reads back by the
+// same name.
+std::string Key(std::string_view key) { return Quoted(key) + ": "; }
+
+}  // namespace
+
 std::string SessionManifest::ToJson() const {
+  namespace keys = event::session_manifest;
   std::ostringstream ss;
   ss << "{\n";
-  ss << "  \"session_id\": " << session_id << ",\n";
-  ss << "  \"config_path\": " << Quoted(config_path) << ",\n";
+  ss << "  " << Key(keys::kSessionId) << session_id << ",\n";
+  ss << "  " << Key(keys::kConfigPath) << Quoted(config_path) << ",\n";
   ss << "  \"config_sha256\": " << Quoted(config_sha256) << ",\n";
   ss << "  \"git_revision\": " << Quoted(git_revision) << ",\n";
   ss << "  \"git_dirty\": " << (git_dirty ? "true" : "false") << ",\n";
@@ -250,14 +262,14 @@ std::string SessionManifest::ToJson() const {
   ss << "  \"launcher_log\": " << Quoted(launcher_log) << ",\n";
   ss << "  \"simulation\": " << (simulation ? "true" : "false") << ",\n";
   if (hardware_protocol_version) {
-    ss << "  \"hardware_protocol_version\": " << *hardware_protocol_version
-       << ",\n";
+    ss << "  " << Key(keys::kHardwareProtocolVersion)
+       << *hardware_protocol_version << ",\n";
   }
   ss << "  \"start_wall_ns\": " << start_wall_ns << ",\n";
   ss << "  \"end_wall_ns\": " << end_wall_ns << ",\n";
   ss << "  \"stopped_before_start\": "
      << (stopped_before_start ? "true" : "false") << ",\n";
-  ss << "  \"nodes\": [\n";
+  ss << "  " << Key(keys::kNodes) << "[\n";
   for (std::size_t i = 0; i < nodes.size(); ++i) {
     const auto& n = nodes[i];
     ss << "    {\n";
@@ -266,7 +278,7 @@ std::string SessionManifest::ToJson() const {
     ss << "      \"binary_path\": " << Quoted(n.binary_path) << ",\n";
     ss << "      \"binary_sha256\": " << Quoted(n.binary_sha256) << ",\n";
     ss << "      \"log_path\": " << Quoted(n.log_path) << ",\n";
-    ss << "      \"log_paths\": [";
+    ss << "      " << Key(keys::kLogPaths) << "[";
     for (std::size_t j = 0; j < n.log_paths.size(); ++j) {
       ss << (j ? ", " : "") << Quoted(n.log_paths[j]);
     }
@@ -279,11 +291,12 @@ std::string SessionManifest::ToJson() const {
        << ",\n";
     ss << "      \"retry_at_monotonic_ns\": " << n.retry_at_monotonic_ns
        << ",\n";
-    ss << "      \"recorder_failed\": " << (n.failed ? "true" : "false")
+    ss << "      " << Key(keys::kRecorderFailed)
+       << (n.failed ? "true" : "false") << ",\n";
+    ss << "      " << Key(keys::kLogCapped) << (n.log_capped ? "true" : "false")
        << ",\n";
-    ss << "      \"log_capped\": " << (n.log_capped ? "true" : "false")
+    ss << "      " << Key(keys::kLogGap) << (n.log_gap ? "true" : "false")
        << ",\n";
-    ss << "      \"log_gap\": " << (n.log_gap ? "true" : "false") << ",\n";
     ss << "      \"described\": " << (n.described ? "true" : "false") << ",\n";
     ss << "      \"endpoint_mismatch\": "
        << (n.endpoint_mismatch ? "true" : "false") << ",\n";
