@@ -15,12 +15,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -1606,6 +1608,88 @@ std::int64_t BridgeHeartbeat(const introspect::RegistryReader& reader) {
     heartbeat_ns = row.heartbeat_monotonic_ns;
   }
   return heartbeat_ns;
+}
+
+}  // namespace
+
+// node.cc: tests only, applied to the options of the bridge's --log.
+extern std::function<void(event::log::LogWriterOptions&)> log_options_for_test;
+
+namespace {
+
+// Whether this process's newest bridge row in the live registry has
+// kFlagLogGap.
+bool BridgeHasLogGap(const introspect::RegistryReader& reader) {
+  bool gap = false;
+  std::uint64_t generation = 0;
+  for (const auto& row : reader.nodes()) {
+    if (row.name != kNodeName ||
+        row.pid != static_cast<std::uint64_t>(getpid()) ||
+        row.generation < generation)
+      continue;
+    generation = row.generation;
+    gap = row.log_gap();
+  }
+  return gap;
+}
+
+// A bridge with a --log whose writer is held before its first write, so
+// its two chunks (each sized for one hardware packet) fill with /hw/status
+// records and the log opens a gap. Release() lets the writer go.
+struct HeldBridgeLog {
+  HeldBridgeLog() {
+    log_options_for_test = [this](event::log::LogWriterOptions& options) {
+      options.chunk_bytes = 1;
+      options.chunk_count = 2;
+      options.before_write = [this] { released.wait(false); };
+    };
+  }
+  ~HeldBridgeLog() {
+    Release();
+    log_options_for_test = nullptr;
+  }
+  HeldBridgeLog(const HeldBridgeLog&) = delete;
+  HeldBridgeLog& operator=(const HeldBridgeLog&) = delete;
+  void Release() {
+    released.store(true);
+    released.notify_all();
+  }
+  std::atomic<bool> released{false};
+};
+
+// Passes from `start_us` every 5 ms until the bridge's row shows a log gap
+// or the next full registry sample (kIntrospectionPeriodUs after the first
+// pass's) would be due, so the bit can only be the writer's. Returns
+// whether the row showed it.
+bool PassUntilTheRowShowsAGap(HardwareNode& node, uint64_t start_us,
+                              const introspect::RegistryReader& reader) {
+  for (uint64_t now_us = start_us; now_us < start_us + 250'000;
+       now_us += 5'000) {
+    node.Pass(now_us);
+    if (BridgeHasLogGap(reader)) return true;
+  }
+  return false;
+}
+
+// The bridge's registry row says its log has a gap as the gap opens, not
+// at its next full registry sample: a bridge killed in between is still
+// marked log_gap. /hw/status is published every 20 ms, so its records fill
+// the held writer's pool within the 250 ms between two samples.
+// REQ-OPS-52
+TEST(HardwareNodeTest, ItsRowHasTheLogGapBitAsTheGapOpens) {
+  auto cfg = config::ParseRobotConfigString(kTrustToml);
+  const std::string log_path = ::testing::TempDir() + "/bridge_row_gap_" +
+                               std::to_string(getpid()) + ".tlog";
+  Link link;  // destroyed after `held` lets its writer go
+  HeldBridgeLog held;
+  ASSERT_TRUE(link.Open(cfg, true, log_path, 51));
+  const auto reader = introspect::RegistryReader::open();
+  ASSERT_TRUE(reader.has_value());
+  EXPECT_TRUE(PassUntilTheRowShowsAGap(*link.node, 1'000'000, *reader))
+      << "no kFlagLogGap in the bridge's row before its next sample";
+  held.Release();
+  link.node.reset();
+  std::filesystem::remove(log_path);
 }
 
 // The registry's liveness sample (heartbeat and dispatch count, which the
