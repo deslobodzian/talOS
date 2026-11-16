@@ -1796,6 +1796,64 @@ TEST_F(PhoenixBackendFoc, ALicenceNotReadIsReadAgainByTheRestoreLoop) {
   EXPECT_TRUE(backend.UnavailableDevices().empty());
 }
 
+// A restore pass that fails for one device ends (kDone, so the gateway reads
+// UnavailableDevices() and retries with backoff) with that device still
+// unavailable: invalid and sent NeutralOut. A device restored in the same
+// pass leaves the set and drives. The failure here is the licence read the
+// restore repeats (no answer); any failed restore operation takes the same
+// path.
+// REQ-SAFE-24
+TEST_F(PhoenixBackendFoc, AFailedRestoreLeavesOnlyItsDeviceUnavailable) {
+  EnsureHal();
+  EnabledDs ds;
+  hw::Config config;
+  auto lift = TestMotor(10, "lift", 1);
+  lift.foc = true;
+  config.motors = {lift, TestMotor(30, "roller", 3)};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(config));
+  ASSERT_TRUE(AwaitReady(backend, config));
+  SetProLicensed(backend, [](std::size_t i) -> std::optional<bool> {
+    return i == 0 ? std::nullopt : std::optional<bool>{true};
+  });
+  ASSERT_TRUE(ConfigureAnswered(backend, config));
+  const auto contains = [](const std::vector<uint16_t>& ids, uint16_t id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+  ASSERT_TRUE(contains(backend.UnavailableDevices(), 10));
+
+  // Both in one pass, as after a reset of the roller while the lift waits.
+  // The roller's own restore can lose a transport answer to a stalled
+  // simulator; such a pass is repeated, and each must leave the lift.
+  const std::array<uint16_t, 2> ids{10, 30};
+  const auto deadline = std::chrono::steady_clock::now() + kReadyTimeout;
+  do {
+    backend.BeginRestoreAfterReset(ids);
+    auto status = backend.PollRestore();
+    while (status == hw::Backend::RestoreStatus::kPending) {
+      ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+          << "restore still pending";
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      status = backend.PollRestore();
+    }
+    ASSERT_EQ(status, hw::Backend::RestoreStatus::kDone);
+    ASSERT_TRUE(contains(backend.UnavailableDevices(), 10));
+    ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+        << "roller still unavailable";
+  } while (contains(backend.UnavailableDevices(), 30));
+
+  const std::array<hw::MotorRequest, 2> commands{
+      Request(10, hw::Mode::kVoltage, 6.0),
+      Request(30, hw::Mode::kVoltage, 6.0)};
+  hw::State state;
+  PumpReads(backend, state, commands, 30);
+  EXPECT_FALSE(state.motors[0].valid);
+  EXPECT_TRUE(state.motors[1].valid);
+  ASSERT_TRUE(ApplySent(backend, commands));
+  EXPECT_EQ(AppliedControl(backend, 0), "NeutralOut");
+  EXPECT_EQ(AppliedControl(backend, 1), "VoltageOut");
+}
+
 namespace {
 
 // The simulated RoboRIO's battery reading for one test; 12 V, the
