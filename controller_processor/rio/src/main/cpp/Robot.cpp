@@ -27,9 +27,13 @@
 #include <sched.h>
 #include <unistd.h>
 #else
+#include <frc/simulation/RoboRioSim.h>
+#include <units/voltage.h>
+
 #include <cstdlib>
 
 #include "SimDriverStation.h"
+#include "hardware/sim_backend.h"
 #endif
 
 namespace {
@@ -223,6 +227,12 @@ class RioWatchdogOutputs final : public talos::rio::WatchdogOutputs {
 }  // namespace
 
 void Robot::StartCompetition() {
+#ifndef __FRC_ROBORIO__
+  // WPILib's simulated battery defaults to 12 V, below a pre-match battery
+  // check; rest at the charged supply sim_gateway reports instead.
+  frc::sim::RoboRioSim::SetVInVoltage(
+      units::volt_t{talos::hardware::kSimRestingSupplyV});
+#endif
   log_ = std::make_unique<talos::rio::RioLog>();
   log_->Start();
   auto phoenix = std::make_unique<PhoenixBackend>(IsSimulation(), log_.get());
