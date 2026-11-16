@@ -944,7 +944,7 @@ channel = 0
 struct GateOutputs {
   hardware::Mode mode;
   bool led;
-  double servo;
+  std::optional<double> servo;  // nullopt: no pulse
 };
 GateOutputs Requested(const SimHardware& hw) {
   return {hw.motor_request("gate", "m").mode, hw.digital_output("gate", "led"),
@@ -954,14 +954,14 @@ void ExpectNeutral(const SimHardware& hw) {
   const GateOutputs out = Requested(hw);
   EXPECT_EQ(out.mode, hardware::Mode::kNeutral);
   EXPECT_FALSE(out.led);
-  EXPECT_EQ(out.servo, 0.0);
+  EXPECT_EQ(out.servo, std::nullopt);
 }
 void ExpectDriving(const SimHardware& hw, double value) {
   const GateOutputs out = Requested(hw);
   EXPECT_EQ(out.mode, hardware::Mode::kDutyCycle);
   EXPECT_DOUBLE_EQ(hw.motor_request("gate", "m").demand, value);
   EXPECT_TRUE(out.led);
-  EXPECT_DOUBLE_EQ(out.servo, value);
+  EXPECT_EQ(out.servo, value);
 }
 
 std::uint64_t GateRequests(const Sim& sim) {
@@ -1251,7 +1251,7 @@ TEST(TargetGate, AThrownUpdateLeavesNothingToTheNextTick) {
     // requested value in SimHardware's inspection view.
     EXPECT_EQ(hw.applied_motor("gate", "m").mode, hardware::Mode::kNeutral);
     EXPECT_FALSE(hw.applied_digital_output("gate", "led"));
-    EXPECT_EQ(hw.applied_pwm("gate", "servo"), 0.0);
+    EXPECT_EQ(hw.applied_pwm("gate", "servo"), std::nullopt);
   }
 }
 
@@ -1314,6 +1314,32 @@ TEST(TargetGate, TheNodeReportsOutputsHeldOnlyWhileTheFlushHoldsThem) {
   sim.step(20ms);
   ASSERT_FALSE(robot_enabled(gate.node));
   EXPECT_FALSE(held());
+}
+
+// A PWM output set to 0 is the 1.5 ms centre pulse, which moves a servo to
+// centre: an actuation like any other. Set with no live target, the flush
+// sends it as no pulse and the node reports outputs held.
+// REQ-SAFE-41
+TEST(TargetGate, ACentrePulseWithoutATargetIsHeld) {
+  struct Centring {
+    explicit Centring(Node& n) : node{n}, target{n}, servo{n, "servo"} {}
+    void update() {
+      if (target.get() == nullptr) servo.set(0.0);
+    }
+    Node& node;
+    Target<Goal> target;
+    PwmOutput servo;
+  };
+  auto sim = Sim::FromToml(kGateToml);
+  auto& gate = sim.add<Centring>("gate");
+  SimHardware hw{sim};
+  hw.set_driver_station(DsPacket(kTeleop));
+  hw.enable();
+  sim.step(20ms);
+  ASSERT_TRUE(robot_enabled(gate.node));
+  EXPECT_EQ(hw.pwm("gate", "servo"), std::nullopt);
+  EXPECT_EQ(hw.applied_pwm("gate", "servo"), std::nullopt);
+  EXPECT_TRUE(detail::NodeAccess::outputs_held(gate.node));
 }
 
 TEST(TargetEnvelope, IsTheHeaderThenTheMessage) {

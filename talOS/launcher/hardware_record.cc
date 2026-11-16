@@ -310,6 +310,7 @@ void CommandJson(Json& json, const hardware::Command& c, const DeviceNames* n) {
   Samples(json, "pwm_outputs", c.pwm_outputs, c.pwm_output_count,
           [&](const hardware::PwmRequest& x) {
             Name(json, n ? &n->pwm_outputs : nullptr, x.id);
+            json.Key("mode").Text(PwmModeName(x.mode));
             json.Key("output").Number(x.output);
           });
 }
@@ -548,6 +549,16 @@ const char* HardwareModeName(hardware::Mode mode) {
       return "position";
     case hardware::Mode::kMotionMagic:
       return "motion_magic";
+  }
+  return "unknown";
+}
+
+const char* PwmModeName(hardware::PwmMode mode) {
+  switch (mode) {
+    case hardware::PwmMode::kOff:
+      return "off";
+    case hardware::PwmMode::kPulse:
+      return "pulse";
   }
   return "unknown";
 }

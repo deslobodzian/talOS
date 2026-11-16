@@ -34,6 +34,13 @@ inline void ReadSimulatedCanBus(HealthSample& health, std::size_t bus_count) {
     health.can_bus = {.read_state = CanBusReadState::kSimulated};
   }
 }
+// The State sample of a simulated PWM output: valid, with its pulse's output,
+// or 0 while it sends no pulse, as the RoboRIO's PWM::GetSpeed() reads after
+// SetDisabled().
+inline PwmSample PwmSampleOf(const PwmRequest& request) {
+  return {request.id, true,
+          request.mode == PwmMode::kPulse ? request.output : 0.0};
+}
 // A deterministic ideal-actuator fake for integration tests, not a motor or
 // tire physics model. Real hardware always uses the Phoenix backend.
 class SimBackend final : public Backend {
@@ -143,7 +150,7 @@ class SimBackend final : public Backend {
     }
     for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
       const auto id = config_.pwm_outputs[i].id;
-      state.pwm_outputs[i] = {id, true, pwm_outputs_[id]};
+      state.pwm_outputs[i] = PwmSampleOf(GetPwm(id));
     }
     return AnyFeedbackValid(state);
   }
@@ -158,18 +165,18 @@ class SimBackend final : public Backend {
       digital_outputs_[d.id] = d.value;
     }
     for (const auto& p : pwm_outputs) {
-      pwm_outputs_[p.id] = p.output;
+      pwm_outputs_[p.id] = p;
     }
     return true;
   }
   // Safe-state policy: every output type turns off on disable, command
   // timeout, and failure. The gateway invokes this Neutral() identically for
   // all three transitions, so they share one safe state: motors fall back to
-  // kNeutral with zero demand, PWM outputs go to 0.0, and digital outputs go
-  // to false (de-energized). Nothing holds its last demand and nothing takes
-  // a configured value — DigitalOutputConfig/PwmConfig carry no safe-state
-  // field. Clearing the maps reads back as off: a missing digital entry
-  // reports false and a missing PWM entry reports 0.0.
+  // kNeutral with zero demand, PWM outputs send no pulse (PwmMode::kOff), and
+  // digital outputs go to false (de-energized). Nothing holds its last demand
+  // and nothing takes a configured value — DigitalOutputConfig/PwmConfig
+  // carry no safe-state field. Clearing the maps reads back as off: a missing
+  // digital entry reports false and a missing PWM entry reports off.
   void Neutral() override {
     commands_ = {};
     digital_outputs_ = {};
@@ -219,9 +226,11 @@ class SimBackend final : public Backend {
     auto it = digital_outputs_.find(id);
     return it != digital_outputs_.end() ? it->second : false;
   }
-  double GetPwm(uint16_t id) const {
+  // The request the output last applied; off ({.id = id}) when none has
+  // been applied since the last Neutral().
+  PwmRequest GetPwm(uint16_t id) const {
     auto it = pwm_outputs_.find(id);
-    return it != pwm_outputs_.end() ? it->second : 0.0;
+    return it != pwm_outputs_.end() ? it->second : PwmRequest{.id = id};
   }
 
  private:
@@ -242,6 +251,6 @@ class SimBackend final : public Backend {
   std::unordered_map<uint16_t, bool> digital_outputs_{};
   std::unordered_map<uint16_t, double> analog_inputs_{};
   std::unordered_map<uint16_t, SimEncoder> encoders_{};
-  std::unordered_map<uint16_t, double> pwm_outputs_{};
+  std::unordered_map<uint16_t, PwmRequest> pwm_outputs_{};
 };
 }  // namespace talos::hardware

@@ -107,7 +107,7 @@ has no reflected radio channels; only the bench motor state adds these scalars.
 
 ## UDP frame and payload sizes
 
-One datagram contains exactly one protocol frame, version **8**.
+One datagram contains exactly one protocol frame, version **9**.
 The explicit little-endian header is **40 B**: magic u64 (8),
 version/header_size/type/flags u16 (8 total),
 sequence u64 (8), monotonic_time_us u64 (8), payload_size u32 (4), reserved u32
@@ -134,7 +134,7 @@ current version and fail on any change until it is bumped.
 | Payload | Fixed vs dynamic formula (bytes) | Maximum payload | Maximum frame | Payload headroom |
 |---|---|---:|---:|---:|
 | State, type 20 | `84 + 45M + 27S + 4DI + 4DO + 15AI + 23E + 11PWM + 47` | 1419 | 1459 | 13 |
-| Command, type 21 | `38 + 20M + 3DO + 10PWM` | 410 | 450 | 1022 |
+| Command, type 21 | `38 + 20M + 3DO + 11PWM` | 414 | 454 | 1018 |
 | Config chunk, type 22 | 24-byte header (config_id u64, total_crc32 u32, total_bytes u32, chunk_index u16, chunk_count u16, chunk_bytes u32) + ≤1408 data | 1432 | 1472 | 0 for full chunk |
 | ConfigAck, type 23 | u64 config_id + u8 status + char[64] reason | 73 | 113 | 1359 |
 | DriverStation, type 24 | 40 fixed + two FMS strings + six variable joysticks | 678 | 718 | 754 |
@@ -182,7 +182,7 @@ and every State the bridge's `--log` records names its build.
 | Digital output | 4 | 3 | State id2 + valid1 + value1; command id2 + value1 |
 | Analog input | 15 | — | id2 + valid1 + voltage8 + age4 |
 | Encoder | 23 | — | id2 + valid1 + position8 + velocity8 + age4 |
-| PWM output | 11 | 10 | State id2 + valid1 + output8; command id2 + output8 |
+| PWM output | 11 | 11 | State id2 + valid1 + output8 (0 while it sends no pulse); command id2 + mode1 (0 off: no pulse, output +0.0; 1 a pulse, output in [-1, 1]; a decoder rejects any other mode, or an off output that is not +0.0) + output8 |
 
 These are codec sizes (`talOS/hardware/messages.h`, `messages.cc`), not native
 struct padding. Position, velocity and voltage remain binary64. Motor stator
@@ -296,7 +296,7 @@ per topic per drain by default. Dispatch scheduling latency remains separate.
 | Topic / owner → consumer | Slot bytes | Meaning / rate |
 |---|---:|---|
 | `/hw/state`: bridge → devices/telemetry | 1448 | 1436 B `hardware::Packet`: u32 size + 1432 data; occupied data 320 on the bench ([actual bench robot](#actual-bench-robot)), ≤1419 |
-| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data 98 on the bench, ≤410 |
+| `/hw/command`: bridge → observers/logging | 1448 | 1436 B Packet; merged Command occupied data 98 on the bench, ≤414 |
 | `/hw/state/driver_station`: bridge → DS consumers/telemetry | 1448 | 1436 B Packet; DS occupied data 46–678 |
 | `/hw/request/<node>`: device owner → bridge | 1448 | 1436 B Packet; only that owner's actuator requests, not a full-capacity command |
 | `/hw/status`: bridge → telemetry/observers | 272 | 264 B fixed `bridge.BridgeStatus`, alignment 8; `commissioned` and six of the alerts fill the padding after `configured`, and the u16 `protocol_version_id` (the bridge's `kProtocolVersion`) the padding after `gateway_build_dirty`; `can_buses` is four 20 B `CanBusStatus` slots at the end. A shared-memory message, in no UDP payload: a change to it is not a hardware protocol change, but a change to its layout makes earlier sessions unreplayable into every node with devices ([replay after a schema change](../talOS/launcher/README.md#replay-after-a-schema-change)) |

@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-#define TALOS_NODE_ABI_VERSION 33u
+#define TALOS_NODE_ABI_VERSION 34u
 
 enum {
   TALOS_OK = 0,
@@ -250,7 +250,12 @@ int32_t talos_gyro_rezero(TalosNode* node, int64_t index, double yaw_rot);
 int32_t talos_motor_zeroed(TalosNode* node, int64_t index);
 int32_t talos_gyro_zeroed(TalosNode* node, int64_t index);
 int32_t talos_digital_output_set(TalosNode* node, int64_t index, int32_t value);
+// PwmOutput::set: a pulse for `output`, clamped to [-1, 1]; 0 is the 1.5 ms
+// centre pulse, and a non-finite output sends no pulse.
 int32_t talos_pwm_set(TalosNode* node, int64_t index, double output);
+// PwmOutput::stop: no pulse in this tick's flush. Fails (naming the device)
+// outside the node's update() callback, like talos_pwm_set.
+int32_t talos_pwm_stop(TalosNode* node, int64_t index);
 
 // The latched feedback of device `index`, zeros (valid == 0) until an
 // accepted hardware state carries it. Fields a kind lacks stay 0.
@@ -627,10 +632,13 @@ int32_t talos_sim_hardware_motor_request(const TalosSimHardware* hw,
 // Returns 0/1, or TALOS_ERR.
 int32_t talos_sim_hardware_digital_output(const TalosSimHardware* hw,
                                           const char* node, const char* device);
+// SimHardware::pwm, and talos_sim_hardware_applied_pwm below
+// (SimHardware::applied_pwm): 1 with *out set while the output pulses, 0
+// when it sends no pulse (*out = 0), TALOS_ERR on error.
 int32_t talos_sim_hardware_pwm(const TalosSimHardware* hw, const char* node,
                                const char* device, double* out);
 // Applied outputs after per-node timeout, omission, and the enabled gate.
-// Motor/PWM return TALOS_OK or TALOS_ERR; digital returns 0/1 or TALOS_ERR.
+// Motor returns TALOS_OK or TALOS_ERR; digital returns 0/1 or TALOS_ERR.
 int32_t talos_sim_hardware_applied_motor(const TalosSimHardware* hw,
                                          const char* node, const char* device,
                                          TalosMotorRequest* out);

@@ -90,8 +90,7 @@ HardwareNode::HardwareNode(config::RobotConfig robot_config,
   full_cmd_.pwm_output_count =
       static_cast<uint16_t>(config_.pwm_outputs.size());
   for (std::size_t i = 0; i < config_.pwm_outputs.size(); ++i) {
-    full_cmd_.pwm_outputs[i].id = config_.pwm_outputs[i].id;
-    full_cmd_.pwm_outputs[i].output = 0.0;
+    full_cmd_.pwm_outputs[i] = PwmRequest{.id = config_.pwm_outputs[i].id};
   }
 
   // Setup subsystem trackers. Input-only subsystems own no actuators, so they
@@ -499,7 +498,8 @@ void HardwareNode::Tick(uint64_t now_us) {
             full_cmd_.digital_outputs[j].value = false;
           }
           for (auto j : tracker.pwm_output_slots) {
-            full_cmd_.pwm_outputs[j].output = 0.0;
+            full_cmd_.pwm_outputs[j] =
+                PwmRequest{.id = full_cmd_.pwm_outputs[j].id};
           }
           for (std::size_t i = 0; i < partial.count; ++i) {
             const auto& pm = partial.motors[i];
@@ -549,7 +549,8 @@ void HardwareNode::Tick(uint64_t now_us) {
         full_cmd_.digital_outputs[j].value = false;
       }
       for (auto j : tracker.pwm_output_slots) {
-        full_cmd_.pwm_outputs[j].output = 0.0;
+        full_cmd_.pwm_outputs[j] =
+            PwmRequest{.id = full_cmd_.pwm_outputs[j].id};
       }
     } else {
       any_subsystem_active = true;
@@ -1302,7 +1303,7 @@ void HardwareNode::NeutralizeAll() {
     full_cmd_.digital_outputs[j].value = false;
   }
   for (std::size_t j = 0; j < full_cmd_.pwm_output_count; ++j) {
-    full_cmd_.pwm_outputs[j].output = 0.0;
+    full_cmd_.pwm_outputs[j] = PwmRequest{.id = full_cmd_.pwm_outputs[j].id};
   }
 }
 

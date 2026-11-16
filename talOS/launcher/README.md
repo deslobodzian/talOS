@@ -1449,7 +1449,8 @@ object in JSONL, its text in CSV and the text dump, absent (JSONL) or empty
 - `command` (requests and the merged command): `config_id`, `boot_id`,
   `epoch`, `observed_time_us`, and per motor `id`, `name`, `mode`
   (`neutral`, `duty_cycle`, `voltage`, `velocity`, `position`,
-  `motion_magic`), `slot`, `demand`, `feedforward_v`; digital and PWM outputs.
+  `motion_magic`), `slot`, `demand`, `feedforward_v`; digital outputs; per PWM
+  output `mode` (`off`, no pulse, or `pulse`) and `output`.
 - `state`: the gateway build that sent it (`gateway_program`: `roborio`,
   `roborio_simulation`, `sim_gateway` or `unknown`; `gateway_build_id`, the
   first 16 hex digits of its git commit, null when unknown;
@@ -1875,7 +1876,8 @@ modes and states `string`.
   `observed_time_us`; `motors/<motor>/` `mode` (`string`: `neutral`,
   `duty_cycle`, `voltage`, `velocity`, `position`, `motion_magic`), `slot`,
   `demand` (in the mode's unit), `feedforward_v`;
-  `digital_outputs/<device>/value`, `pwm_outputs/<device>/output`
+  `digital_outputs/<device>/value`, `pwm_outputs/<device>/` `mode`
+  (`string`: `off`, no pulse, or `pulse`) and `output`
   (`/hw/request/shooter/motors/flywheel/demand`).
 - `/hw/state/driver_station`: `sample_time_us`, `mode_since_us` (the mode
   generation), `boot_id`; the flags `ds_attached`, `fms_attached`,

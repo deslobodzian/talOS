@@ -26,11 +26,11 @@ namespace talos::hardware {
 namespace {
 
 // The encodings this file pins and the protocol version they belong to.
-constexpr std::uint16_t kGoldenVersion = 8;
+constexpr std::uint16_t kGoldenVersion = 9;
 constexpr std::size_t kStateBytes = 1419;
 constexpr std::uint64_t kStateHash = 0x270781b104f788b0;
-constexpr std::size_t kCommandBytes = 410;
-constexpr std::uint64_t kCommandHash = 0xa6c18926236cb10d;
+constexpr std::size_t kCommandBytes = 414;
+constexpr std::uint64_t kCommandHash = 0xe43b8a06779c5ed5;
 
 std::uint64_t Fnv1a64(std::span<const std::uint8_t> bytes) {
   std::uint64_t hash = 0xcbf29ce484222325ull;
@@ -149,9 +149,13 @@ Command FullCommand() {
   for (std::size_t i = 0; i < kMaxDigitalOutputs; ++i) {
     c.digital_outputs[i] = {static_cast<std::uint16_t>(0x900 + i), i % 2 == 1};
   }
+  // Pulses and outputs that send none, alternately.
   for (std::size_t i = 0; i < kMaxPwmOutputs; ++i) {
-    c.pwm_outputs[i] = {static_cast<std::uint16_t>(0xA00 + i),
-                        0.75 - static_cast<double>(i) / 2};
+    const auto id = static_cast<std::uint16_t>(0xA00 + i);
+    c.pwm_outputs[i] =
+        i % 2 == 0
+            ? PwmRequest{id, PwmMode::kPulse, 0.75 - static_cast<double>(i) / 2}
+            : PwmRequest{.id = id};
   }
   return c;
 }

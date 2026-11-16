@@ -723,6 +723,13 @@ int32_t talos_pwm_set(TalosNode* node, int64_t index, double output) {
   });
 }
 
+int32_t talos_pwm_stop(TalosNode* node, int64_t index) {
+  return Guard<int32_t>(TALOS_ERR, [&] {
+    HardwareAccess::pwm_stop(Link(node), Index(index));
+    return TALOS_OK;
+  });
+}
+
 int32_t talos_motor_sample(TalosNode* node, int64_t index, TalosSample* out) {
   return Guard<int32_t>(TALOS_ERR, [&] {
     TalosSample& o = *Out(out);

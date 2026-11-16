@@ -5,11 +5,12 @@
     self.ds = talos.DriverStation(node)          # what the bridge forwards
 
 Take handles in __init__. Output commands (Motor.set_* and stop(),
-DigitalOutput.set, PwmOutput.set) are taken only inside update() and apply
-to the flush right after it; outputs that update() did not set are neutral.
-From __init__, an every() timer or a callback they raise TalosError naming
-the device, since such a command would reach the hardware for at most one
-tick. Motors, digital outputs and PWM outputs are neutral while
+DigitalOutput.set, PwmOutput.set and stop()) are taken only inside update()
+and apply to the flush right after it; outputs that update() did not set are
+neutral (a PWM output's neutral is off: no pulse; set(0.0) is the centre
+pulse). From __init__, an every() timer or a callback they raise TalosError
+naming the device, since such a command would reach the hardware for at most
+one tick. Motors, digital outputs and PWM outputs are neutral while
 talos.robot_enabled(node) is false, and in any tick in which no talos.Target
 of the node returned a target from a get() (or source) made during that
 update(): drive only from what get() returns. The request still goes out,
@@ -357,7 +358,14 @@ class PwmOutput(_Device):
     _KIND = _abi.DEVICE_PWM
 
     def set(self, output):
+        """A pulse for `output`, clamped to [-1, 1]: 0 is the 1.5 ms centre
+        pulse. A non-finite output sends no pulse."""
         _abi.ok(lib.talos_pwm_set(self._node, self._index, output))
+
+    def stop(self):
+        """No pulse in this tick's flush, the same as not calling set() in
+        this update()."""
+        _abi.ok(lib.talos_pwm_stop(self._node, self._index))
 
 
 class Alliance(enum.IntEnum):

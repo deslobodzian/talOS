@@ -33,6 +33,8 @@ mixed = [1.0, "back"]
 can_id = 1
 [subsystems.roller.digital_inputs.beam]
 dio = 0
+[subsystems.roller.pwm_outputs.servo]
+channel = 0
 [subsystems.roller.sensors.gyro]
 type = "Pigeon2"
 can_id = 2
@@ -432,6 +434,57 @@ TEST_F(NodeApi, DevicesCommandOnlyWhenEnabled) {
   ASSERT_EQ(talos_sim_hardware_motor_request(hw, "roller", "wheel", &request),
             TALOS_OK);
   EXPECT_EQ(request.mode, TALOS_MODE_NEUTRAL);
+  talos_sim_hardware_destroy(hw);
+}
+
+// A PWM output set to 0 pulses at the centre; after talos_pwm_stop it sends
+// no pulse, and the inspection calls tell the two apart. Like every setter,
+// talos_pwm_stop fails outside update().
+// REQ-SAFE-03
+TEST_F(NodeApi, PwmStopSendsNoPulseAndSetZeroIsTheCentrePulse) {
+  struct Servo {
+    TalosNode* node = nullptr;
+    int64_t servo = -1;
+    bool stop = false;
+  };
+  auto build = [](TalosNode* node, void* user) -> int32_t {
+    auto& s = *static_cast<Servo*>(user);
+    s.node = node;
+    s.servo = talos_device(node, TALOS_DEVICE_PWM, "servo");
+    if (s.servo < 0) return 1;
+    if (talos_allow_untargeted_outputs(node) != TALOS_OK) return 1;
+    return talos_node_set_update(
+        node,
+        [](void* u) -> int32_t {
+          auto& servo = *static_cast<Servo*>(u);
+          return servo.stop ? talos_pwm_stop(servo.node, servo.servo)
+                            : talos_pwm_set(servo.node, servo.servo, 0.0);
+        },
+        &s);
+  };
+  Servo servo;
+  TalosNode* node = talos_sim_add(sim_, "roller", build, &servo);
+  ASSERT_NE(node, nullptr) << talos_last_error();
+  EXPECT_EQ(talos_pwm_stop(node, servo.servo), TALOS_ERR);
+  TalosSimHardware* hw = talos_sim_hardware_create(sim_);
+  ASSERT_NE(hw, nullptr) << talos_last_error();
+  ASSERT_EQ(talos_sim_hardware_enable(hw, 1), TALOS_OK);
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
+  double out = -1;
+  EXPECT_EQ(talos_sim_hardware_pwm(hw, "roller", "servo", &out), 1);
+  EXPECT_EQ(out, 0.0);
+  out = -1;
+  EXPECT_EQ(talos_sim_hardware_applied_pwm(hw, "roller", "servo", &out), 1);
+  EXPECT_EQ(out, 0.0);
+
+  servo.stop = true;
+  ASSERT_EQ(talos_sim_step(sim_, 30 * kMs), TALOS_OK) << talos_last_error();
+  out = -1;
+  EXPECT_EQ(talos_sim_hardware_pwm(hw, "roller", "servo", &out), 0);
+  EXPECT_EQ(out, 0.0);
+  out = -1;
+  EXPECT_EQ(talos_sim_hardware_applied_pwm(hw, "roller", "servo", &out), 0);
+  EXPECT_EQ(out, 0.0);
   talos_sim_hardware_destroy(hw);
 }
 

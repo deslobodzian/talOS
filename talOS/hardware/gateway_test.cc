@@ -55,7 +55,7 @@ TEST(Messages, FullyCappedEncodingsHaveExactSizes) {
   command.digital_output_count = kMaxDigitalOutputs;
   command.pwm_output_count = kMaxPwmOutputs;
   std::array<uint8_t, kMaxCommandSize> command_bytes{};
-  ASSERT_EQ(Encode(command, command_bytes), 410u);
+  ASSERT_EQ(Encode(command, command_bytes), 414u);
   Command decoded_command;
   ASSERT_TRUE(Decode(command_bytes, decoded_command));
   EXPECT_EQ(decoded_command, command);
@@ -210,7 +210,7 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
   command.digital_output_count = 1;
   command.digital_outputs[0] = {0x0304, true};
   command.pwm_output_count = 1;
-  command.pwm_outputs[0] = {0x0506, 0.5};
+  command.pwm_outputs[0] = {0x0506, PwmMode::kPulse, 0.5};
   const std::vector<uint8_t> expected{
       0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,   // config_id
       0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,   // boot_id
@@ -222,6 +222,7 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
       0,    0,    0,    0,    0,    0,    0,    0xC0,   // feedforward_v -2.0
       0x04, 0x03, 1,                                    // digital output
       0x06, 0x05,                                       // pwm id
+      1,                                                // pwm mode pulse
       0,    0,    0,    0,    0,    0,    0xE0, 0x3F};  // pwm output 0.5
   std::array<uint8_t, kMaxCommandSize> bytes{};
   const auto size = Encode(command, bytes);
@@ -230,6 +231,58 @@ TEST(Messages, CommandIsLittleEndianOnTheWire) {
   Command decoded;
   ASSERT_TRUE(Decode(expected, decoded));
   EXPECT_EQ(decoded, command);
+}
+
+// A PWM request is off (no pulse) or a pulse, and off has one byte string:
+// mode 0 and output +0.0. A pulse of 0 (the 1.5 ms centre, which centres a
+// servo) and off both round-trip as sent, never one for the other. A mode
+// byte above kLastPwmMode, or an off request whose output bytes are not all
+// zero (-0.0 included), neither encodes nor decodes: a peer reading such
+// bytes cannot know which of the two was meant.
+// REQ-SAFE-03, REQ-CONTRACT-03
+TEST(Messages, PwmRequestIsOffOrAPulseAndOffHasOneEncoding) {
+  Command command;
+  command.pwm_output_count = 2;
+  command.pwm_outputs[0] = {0x0506, PwmMode::kOff, 0.0};
+  command.pwm_outputs[1] = {0x0708, PwmMode::kPulse, 0.0};
+  std::array<uint8_t, kMaxCommandSize> bytes{};
+  const auto size = Encode(command, bytes);
+  ASSERT_EQ(size, kCommandBaseSize + 2 * kPwmRequestSize);
+  Command decoded;
+  ASSERT_TRUE(Decode(std::span{bytes}.first(size), decoded));
+  EXPECT_EQ(decoded.pwm_outputs[0], command.pwm_outputs[0]);
+  EXPECT_EQ(decoded.pwm_outputs[1], command.pwm_outputs[1]);
+
+  // Byte offsets of the first request's mode and output.
+  const std::size_t mode_at = kCommandBaseSize + 2;
+  const std::size_t output_at = mode_at + 1;
+  const struct {
+    const char* label;
+    PwmRequest request;
+    std::size_t byte;
+    uint8_t value;
+  } rows[] = {
+      {"mode 2", {0x0506, static_cast<PwmMode>(2), 0.0}, mode_at, 2},
+      {"mode 255", {0x0506, static_cast<PwmMode>(255), 0.0}, mode_at, 255},
+      {"off with a nonzero output",
+       {0x0506, PwmMode::kOff, 0.5},
+       output_at + 7,
+       0x3F},
+      {"off with output -0.0",
+       {0x0506, PwmMode::kOff, -0.0},
+       output_at + 7,
+       0x80},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    Command bad = command;
+    bad.pwm_outputs[0] = row.request;
+    std::array<uint8_t, kMaxCommandSize> refused{};
+    EXPECT_EQ(Encode(bad, refused), 0u);
+    auto corrupted = bytes;
+    corrupted[row.byte] = row.value;
+    EXPECT_FALSE(Decode(std::span{corrupted}.first(size), decoded));
+  }
 }
 
 // The State the RoboRIO sends, byte for byte: integers, doubles, the float
@@ -1040,7 +1093,8 @@ TEST(Gateway, NeutralInFlightAcrossAnEpochChangeIsNotARejection) {
 }
 // Only a neutral that can have been in flight across the epoch change is
 // exempt. An older-epoch command that drives any output (the counter's
-// safety case), one arriving while a command of the new epoch is in force,
+// safety case; a PWM pulse of 0 is the 1.5 ms centre pulse, so it drives),
+// one arriving while a command of the new epoch is in force,
 // one of a newer or never-issued epoch, and one that fails another check too
 // are each refused and counted.
 // REQ-SAFE-17
@@ -1054,7 +1108,7 @@ TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
     c.digital_output_count = 1;
     c.digital_outputs[0] = {40, false};
     c.pwm_output_count = 1;
-    c.pwm_outputs[0] = {41, 0.0};
+    c.pwm_outputs[0] = {41, PwmMode::kOff, 0.0};
     return c;
   };
   enum class Epoch { kOlder, kNewer, kNeverIssued };
@@ -1073,8 +1127,8 @@ TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
        }},
       {"older epoch, digital output on", Epoch::kOlder, false, false,
        [](Command& c) { c.digital_outputs[0].value = true; }},
-      {"older epoch, PWM output on", Epoch::kOlder, false, false,
-       [](Command& c) { c.pwm_outputs[0].output = 0.5; }},
+      {"older epoch, PWM pulsing at its centre", Epoch::kOlder, false, false,
+       [](Command& c) { c.pwm_outputs[0].mode = PwmMode::kPulse; }},
       {"older epoch, a command in force", Epoch::kOlder, true, false, none},
       {"newer epoch", Epoch::kNewer, false, false, none},
       {"epoch never issued", Epoch::kNeverIssued, false, false, none},
@@ -1100,6 +1154,47 @@ TEST(Gateway, RefusedCommandsAroundAnEpochChangeStillCount) {
     EXPECT_FALSE(g.Accept(command, 2, now));
     EXPECT_EQ(backend.applied, applied);
     EXPECT_EQ(g.snapshot().counters.rejected_command_count, 1u);
+  }
+}
+// The gateway hands each PWM request to the backend as the command carries
+// it: off as off (no pulse), a pulse of 0 as a pulse (the centre). A pulse
+// outside [-1, 1] or not finite, or a mode the wire does not define, rejects
+// the whole command and applies nothing.
+// REQ-SAFE-03, REQ-SAFE-17
+TEST(Gateway, PwmRequestsReachTheBackendAsSentAndABadOneRejectsTheCommand) {
+  auto config = SwerveConfig(true);
+  config.pwm_outputs.push_back({41, "servo", 0});
+  const struct {
+    const char* label;
+    PwmRequest request;
+    bool accepted;
+  } rows[] = {
+      {"off", {41, PwmMode::kOff, 0.0}, true},
+      {"a pulse of 0", {41, PwmMode::kPulse, 0.0}, true},
+      {"a pulse of -1", {41, PwmMode::kPulse, -1.0}, true},
+      {"a pulse above 1", {41, PwmMode::kPulse, 1.5}, false},
+      {"a pulse not finite", {41, PwmMode::kPulse, std::nan("")}, false},
+      {"mode 2", {41, static_cast<PwmMode>(2), 0.0}, false},
+  };
+  for (const auto& row : rows) {
+    SCOPED_TRACE(row.label);
+    FakeBackend backend;
+    Gateway g{config, backend, 1};
+    g.Tick(1000, true);
+    auto command = Request(g);
+    command.pwm_output_count = 1;
+    command.pwm_outputs[0] = row.request;
+    const int applied = backend.applied;
+    EXPECT_EQ(g.Accept(command, 1, 1000), row.accepted);
+    EXPECT_EQ(backend.applied - applied, row.accepted ? 1 : 0);
+    EXPECT_EQ(g.snapshot().counters.rejected_command_count,
+              row.accepted ? 0u : 1u);
+    if (row.accepted) {
+      ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
+      EXPECT_EQ(backend.last_pwm_outputs[0], row.request);
+    } else {
+      EXPECT_TRUE(backend.last_pwm_outputs.empty());
+    }
   }
 }
 // The RoboRIO's loop watchdog arms on command_expiry_us, so it must be the
@@ -1685,7 +1780,7 @@ TEST(Wire, ExplicitEncodingRoundTripsAndRejectsMalformedFrames) {
   c.digital_output_count = 1;
   c.digital_outputs[0] = {4, true};
   c.pwm_output_count = 1;
-  c.pwm_outputs[0] = {7, 0.85};
+  c.pwm_outputs[0] = {7, PwmMode::kPulse, 0.85};
   std::array<uint8_t, protocol::kMaxPayloadSize> bytes{};
   const auto size = Encode(c, bytes);
   Command decoded;
@@ -2432,7 +2527,10 @@ TEST(Endpoint, OutboundBlackoutPreservesReceiveAndSafetyTicks) {
 // The RoboRIO program reports to the drive team whether its companion is
 // talking, and in which protocol. A clock probe alone (all the bridge sends
 // while nothing is commanded) is contact; a frame of another protocol version
-// is recorded with that version, not dropped unseen.
+// is recorded with that version, not dropped unseen, and is not contact: a
+// Command from a bridge one protocol behind (whose PWM requests, for one,
+// have another layout) never reaches the gateway.
+// REQ-CONTRACT-01
 TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
   SimBackend backend;
   Gateway gateway{backend, 2004};
@@ -2465,14 +2563,15 @@ TEST(Endpoint, PeerContactRecordsProbesCommandsAndForeignProtocolVersions) {
   EXPECT_EQ(contact.command_us, 2000u);
   EXPECT_EQ(contact.version_mismatch_us, 0u);
 
-  const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion + 1);
-  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kClockProbe, 0, 0, nullptr,
-                                0, foreign),
+  const auto foreign = static_cast<uint16_t>(protocol::kProtocolVersion - 1);
+  ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareCommand, 0, 0,
+                                command.data(), command_size, foreign),
             protocol::UdpStatus::kOk);
   ASSERT_TRUE(tick_until(3000, contact.version_mismatch_us));
   EXPECT_EQ(contact.version_mismatch_us, 3000u);
   EXPECT_EQ(contact.mismatched_version, foreign);
   EXPECT_EQ(contact.frame_us, 2000u);
+  EXPECT_EQ(contact.command_us, 2000u);
 }
 
 TEST(Endpoint, PushesConfigOverUdpAndAcknowledgesIt) {
@@ -2567,12 +2666,12 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
     cmd.digital_output_count = 1;
     cmd.digital_outputs[0] = {4, true};
     cmd.pwm_output_count = 1;
-    cmd.pwm_outputs[0] = {7, 0.85};
+    cmd.pwm_outputs[0] = {7, PwmMode::kPulse, 0.85};
     return cmd;
   };
   auto expect_driven = [](FailableSim& backend, const State& s) {
     EXPECT_TRUE(backend.sim.GetDigitalOutput(4));
-    EXPECT_DOUBLE_EQ(backend.sim.GetPwm(7), 0.85);
+    EXPECT_EQ(backend.sim.GetPwm(7), (PwmRequest{7, PwmMode::kPulse, 0.85}));
     ASSERT_GT(s.motor_count, 0u);
     EXPECT_DOUBLE_EQ(s.motors[0].velocity_rps, 10.0);
     EXPECT_EQ(s.digital_outputs[0].value, true);
@@ -2580,7 +2679,8 @@ TEST(SimBackend, NeutralTurnsOffEveryOutputOnDisableTimeoutAndFailure) {
   };
   auto expect_safe_backends = [](FailableSim& backend) {
     EXPECT_FALSE(backend.sim.GetDigitalOutput(4));
-    EXPECT_DOUBLE_EQ(backend.sim.GetPwm(7), 0.0);
+    // No pulse: off, not a pulse of 0 (which centres a servo).
+    EXPECT_EQ(backend.sim.GetPwm(7), (PwmRequest{.id = 7}));
   };
   auto expect_safe_state = [](const State& s) {
     ASSERT_GT(s.motor_count, 0u);
@@ -3330,7 +3430,7 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
     c.digital_output_count = 1;
     c.digital_outputs[0] = {40, true};
     c.pwm_output_count = 1;
-    c.pwm_outputs[0] = {41, 0.5};
+    c.pwm_outputs[0] = {41, PwmMode::kPulse, 0.5};
     return c;
   };
   const auto expect_isolated = [&](const char* phase) {
@@ -3342,7 +3442,8 @@ TEST(Gateway, DeviceLocalApplyFailureIsolatesOnlyThatChain) {
     ASSERT_EQ(backend.last_digital_outputs.size(), 1u);
     EXPECT_TRUE(backend.last_digital_outputs[0].value);
     ASSERT_EQ(backend.last_pwm_outputs.size(), 1u);
-    EXPECT_DOUBLE_EQ(backend.last_pwm_outputs[0].output, 0.5);
+    EXPECT_EQ(backend.last_pwm_outputs[0],
+              (PwmRequest{41, PwmMode::kPulse, 0.5}));
     const auto s = g.snapshot();
     EXPECT_FALSE(s.motors[0].valid);
     EXPECT_FALSE(s.motors[1].valid);

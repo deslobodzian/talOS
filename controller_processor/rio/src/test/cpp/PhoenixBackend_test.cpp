@@ -3,7 +3,8 @@
 // and connection validity, no demand teleport when controller voltage is zero
 // (missing gains exposed), neutral keeping rotor momentum with
 // brake/coast-dependent decay, follower gating, late feedback left valid for
-// the gateway to judge, per-device recovery and the loop watchdog's neutral.
+// the gateway to judge, per-device recovery, the loop watchdog's neutral, and
+// a PWM output that is off sending no pulse rather than the centre pulse.
 #include "PhoenixBackend.h"
 
 #include <frc/simulation/DriverStationSim.h>
@@ -427,6 +428,13 @@ TEST(PhoenixBackendEncoders, DutyCycleVelocityWrapsAndReconnectStartsAtRest) {
   EXPECT_DOUBLE_EQ(state.encoders[0].velocity_rps, 0.0);
 }
 
+// The HAL's default PWM centre pulse, which frc::PWM::SetSpeed(0) gives: the
+// backend sets no bounds of its own.
+constexpr int32_t kCentrePulseUs = 1500;
+
+// Neutral stops the pulse, the centre pulse included: a servo goes limp
+// rather than to its centre.
+// REQ-SAFE-03
 TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EnsureHal();
   hw::Config c;
@@ -448,7 +456,8 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
 
   const std::array<hw::DigitalOutputRequest, 1> dos{
       hw::DigitalOutputRequest{20, true}};
-  const std::array<hw::PwmRequest, 1> pwms{hw::PwmRequest{30, 0.75}};
+  const std::array<hw::PwmRequest, 1> pwms{
+      hw::PwmRequest{30, hw::PwmMode::kPulse, 0.0}};
   ASSERT_TRUE(backend.ApplyOutputs(dos, pwms));
 
   // Read back through the real HAL adapter path: outputs are driven.
@@ -456,10 +465,8 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   ASSERT_TRUE(backend.Read(s));
   EXPECT_TRUE(s.digital_outputs[0].valid);
   EXPECT_TRUE(s.digital_outputs[0].value);
-  EXPECT_TRUE(s.pwm_outputs[0].valid);
-  EXPECT_GT(s.pwm_outputs[0].output, 0.5);
   frc::sim::PWMSim pwm_sim{0};
-  EXPECT_GT(pwm_sim.GetPulseMicrosecond(), 0);
+  ASSERT_EQ(pwm_sim.GetPulseMicrosecond(), kCentrePulseUs);
 
   backend.Neutral();
 
@@ -469,6 +476,60 @@ TEST(PhoenixBackendNeutral, NeutralDeEnergizesDigitalOutputsAndDisablesPwm) {
   EXPECT_TRUE(s.pwm_outputs[0].valid);
   EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
   EXPECT_EQ(pwm_sim.GetPulseMicrosecond(), 0);
+}
+
+// A PWM request's mode decides whether its output pulses: off sends no pulse
+// (frc::PWM::SetDisabled), even right after a pulse, and its State sample
+// reads 0; a pulse of 0 is the centre pulse and 0.75 lies above it; a pulse
+// after off pulses again; each output follows only its own request.
+// REQ-SAFE-03
+TEST(PhoenixBackendPwm, OffSendsNoPulseAndAPulseOfZeroIsTheCentre) {
+  EnsureHal();
+  hw::Config c;
+  hw::PwmConfig servo;
+  servo.id = 30;
+  servo.name = "servo";
+  servo.channel = 0;
+  hw::PwmConfig blower;
+  blower.id = 31;
+  blower.name = "blower";
+  blower.channel = 1;
+  c.pwm_outputs = {servo, blower};
+  PhoenixBackend backend(true);
+  ASSERT_TRUE(backend.Configure(c));
+  ASSERT_TRUE(AwaitReady(backend, c));
+  const frc::sim::PWMSim servo_sim{0};
+  const frc::sim::PWMSim blower_sim{1};
+  hw::State s;
+  const auto apply = [&](hw::PwmRequest a, hw::PwmRequest b) {
+    ASSERT_TRUE(backend.ApplyOutputs({}, std::array{a, b}));
+    ASSERT_TRUE(backend.Read(s));
+  };
+
+  {
+    SCOPED_TRACE("servo pulse 0.0, blower pulse 0.75");
+    apply({30, hw::PwmMode::kPulse, 0.0}, {31, hw::PwmMode::kPulse, 0.75});
+    EXPECT_EQ(servo_sim.GetPulseMicrosecond(), kCentrePulseUs);
+    EXPECT_GT(blower_sim.GetPulseMicrosecond(), kCentrePulseUs);
+    EXPECT_DOUBLE_EQ(s.pwm_outputs[0].output, 0.0);
+    EXPECT_NEAR(s.pwm_outputs[1].output, 0.75, 0.01);
+  }
+  {
+    SCOPED_TRACE("both off after their pulses");
+    apply({30}, {31});
+    EXPECT_EQ(servo_sim.GetPulseMicrosecond(), 0);
+    EXPECT_EQ(blower_sim.GetPulseMicrosecond(), 0);
+    for (std::size_t i = 0; i < 2; ++i) {
+      EXPECT_TRUE(s.pwm_outputs[i].valid) << i;
+      EXPECT_DOUBLE_EQ(s.pwm_outputs[i].output, 0.0) << i;
+    }
+  }
+  {
+    SCOPED_TRACE("servo pulse 0.0 again, blower stays off");
+    apply({30, hw::PwmMode::kPulse, 0.0}, {31});
+    EXPECT_EQ(servo_sim.GetPulseMicrosecond(), kCentrePulseUs);
+    EXPECT_EQ(blower_sim.GetPulseMicrosecond(), 0);
+  }
 }
 
 // A configuration with no motor, or no device at all, is valid: the backend
@@ -1301,7 +1362,7 @@ TEST_F(PhoenixBackendWatchdog, NeutralizesEveryOutputUnlessAConfigureHoldsIt) {
       Request(20, hw::Mode::kVoltage, 6.0)};
   ASSERT_TRUE(backend.ApplyOutputs(
       std::array<hw::DigitalOutputRequest, 1>{{{40, true}}},
-      std::array<hw::PwmRequest, 1>{{{50, 0.75}}}));
+      std::array<hw::PwmRequest, 1>{{{50, hw::PwmMode::kPulse, 0.75}}}));
   hw::State state;
   PumpReads(backend, state, commands, 5);
   frc::sim::PWMSim pwm_sim{0};
