@@ -78,9 +78,10 @@ inline constexpr std::string_view kDirectionSuffixes[] = {
 // over UDP (external); `/drivetrain/target/auto` has no publisher yet
 // (optional). An observer is a framework node reading a topic it found in the
 // declared graph (telemetry): it is not a consumer, so the lint never names
-// it among a topic's readers, but a topic it records is read by design, so a
-// topic only observers read is no "published but nothing subscribes to it"
-// finding.
+// it among a topic's readers, but an owner's feed it records (state, status,
+// event, telemetry) is read by design, so such a topic only observers read is
+// no "published but nothing subscribes to it" finding; an instruction
+// (target, request, command) only observers read still is one.
 inline constexpr std::uint32_t kSourceFlagExternal = 1u << 0;
 inline constexpr std::uint32_t kSourceFlagOptional = 1u << 1;
 inline constexpr std::uint32_t kSourceFlagObserver = 1u << 2;
@@ -803,10 +804,20 @@ inline std::vector<Diagnostic> LintGraph(
           "is in the target policy of " + join(topic.readers) +
               " but nothing writes it yet");
     }
-    // reader_count counts observers too (kSourceFlagObserver).
-    if (topic.reader_count == 0 && !topic.exempt)
+    // reader_count counts observers too (kSourceFlagObserver); readers does
+    // not. An observer reads an owner's feed by design, but no instruction
+    // is acted on by an observer alone.
+    const std::string role{detail::Segments(topic.name)[1]};
+    if (!topic.exempt && topic.reader_count == 0) {
       add(Severity::WARNING, topic.name,
           "is published but nothing subscribes to it");
+    } else if (!topic.exempt && topic.readers.empty() &&
+               !detail::OneOf(kOwnerPublishedRoles, role)) {
+      add(Severity::WARNING, topic.name,
+          "is read only by observers (telemetry); nothing acts on a '" + role +
+              "' topic, so its reader is missing or subscribes to a "
+              "differently spelled topic");
+    }
   }
 
   // The devices flush drives a node's outputs only in a tick in which one of

@@ -670,28 +670,41 @@ TEST(LintGraph, DevelopmentGapsAreWarningsNotErrors) {
   }
 }
 
-// A topic no node reads warns; one an observer records (telemetry) is read,
-// so it is no finding: a mechanism's state published for display is a
-// design, not a dead end, and a warning on every such topic of a robot reads
-// as a fault.
-TEST(LintGraph, AnUnreadTopicWarnsUnlessAnObserverRecordsIt) {
+// REQ-CONTRACT-09: a topic no node reads warns. One an observer records
+// (telemetry) is read when the owner publishes it (state, status, event,
+// telemetry): a mechanism's state published for display is a design, not a
+// dead end, and a warning on every such topic of a robot reads as a fault.
+// An instruction (target, request, command) only an observer reads still
+// warns: telemetry observes every topic, so otherwise a writer whose only
+// reader subscribed `optional` to a misspelled topic has no finding at all.
+TEST(LintGraph, AnUnreadTopicWarnsUnlessAnObserverRecordsItsOwnersFeed) {
   const NodeShape motor{
       "motor", "//robot/motor:node", {Sender("/motor/state")}};
-  for (const auto& [name, nodes, warned] :
-       std::vector<std::tuple<const char*, std::vector<NodeShape>, bool>>{
-           {"no reader", {motor}, true},
+  const auto telemetry = [](const char* observed) {
+    return NodeShape{"telemetry",
+                     "//talOS/telemetry:node",
+                     {Watcher(observed, 32, kSourceFlagObserver),
+                      Sender("/talos/telemetry", 32, kSourceFlagExternal)}};
+  };
+  for (const auto& [name, nodes, subject, warned] : std::vector<
+           std::tuple<const char*, std::vector<NodeShape>, const char*, bool>>{
+           {"no reader", {motor}, "/motor/state", true},
            {"an observer only",
-            {motor,
-             {"telemetry",
-              "//talOS/telemetry:node",
-              {Watcher("/motor/state", 32, kSourceFlagObserver),
-               Sender("/talos/telemetry", 32, kSourceFlagExternal)}}},
+            {motor, telemetry("/motor/state")},
+            "/motor/state",
             false},
+           {"an instruction its reader misspelled, observed",
+            {telemetry("/arm/command"),
+             {"planner", "//robot/planner:node", {Sender("/arm/command")}},
+             {"arm",
+              "//robot/arm:node",
+              {Watcher("/arm/command/goal", 32, kSourceFlagOptional)}}},
+            "/arm/command",
+            true},
        }) {
     SCOPED_TRACE(name);
     const auto diagnostics = LintGraph(nodes);
-    EXPECT_EQ(Find(diagnostics, Severity::WARNING, "/motor/state") != nullptr,
-              warned)
+    EXPECT_EQ(Find(diagnostics, Severity::WARNING, subject) != nullptr, warned)
         << Describe(diagnostics);
     EXPECT_EQ(diagnostics.size(), warned ? 1u : 0u) << Describe(diagnostics);
   }
