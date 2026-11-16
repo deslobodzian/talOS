@@ -11,9 +11,11 @@ only the filesystem's root, and Studio's built pages under it). DIR is
 relative to the directory bazel runs from. The fixture's example mechanisms and its checks of talOS
 itself are left out, so the robot starts with the hardware bridge, teleop
 and telemetry; `bazel run @talos//tools:new_subsystem` adds a mechanism
-there. A fixture file TEMPLATE does not place refuses the copy, so the
-template cannot drift from the fixture. It writes a README and .gitignore
-of its own, runs no git command, and prints the next commands.
+there. A file git tracks in the fixture that TEMPLATE does not place
+refuses the copy, so the template cannot drift from the fixture; untracked
+files are ignored. It writes a README, .gitignore and .bazelignore of its
+own, all at once (nothing is left at DIR when a write fails), runs only
+`git ls-files` on the fixture, and prints the next commands.
 
 Inside talOS (the layout of 2026-robot/, which talOS's own tests use):
 
@@ -61,6 +63,8 @@ import difflib
 import os
 import posixpath
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -372,8 +376,9 @@ REPLACE = "replace"
 LEAVE_OUT = "leave out"
 
 # Every path of the fixture, and what a new robot repository takes of it. A
-# key ending in "/" is a directory and everything under it. A fixture file
-# no key covers, or a key the fixture no longer has, refuses the copy.
+# key ending in "/" is a directory and everything under it. The copy reads
+# only these paths. A key the fixture no longer has refuses it, and so does
+# a file of the fixture that git tracks and no key covers (template_sources).
 TEMPLATE = {
     ".bazelrc": COPY,
     ".bazelversion": COPY,
@@ -403,9 +408,6 @@ TEMPLATE = {
     "talos_checks/": LEAVE_OUT,
 }
 
-# What a build in the fixture leaves there; never part of the template.
-BUILD_LEFTOVERS = ("MODULE.bazel.lock",)
-
 REPOSITORY_README = """\
 # @NAME@
 
@@ -422,6 +424,7 @@ you add a mechanism.
 | `robot_manifest.bzl` | generated from `robot.toml` (`bazel run @talos//tools:sync_manifest -- robot.toml`); Bazel reads it because it cannot read TOML |
 | `BUILD.bazel` | `manifest_sync_test`, `graph_test`, `robot_bundle`, `//:sim` (the robot against the simulator), `sim_smoke_test`, `studio_test` |
 | `MODULE.bazel` | talOS as `@talos`, and where Studio's pages are |
+| `.bazelignore` | keeps `bazel test //...` out of `talos/`, where a git submodule of talOS goes (below); it does nothing while that directory does not exist |
 
 ```sh
 bazel test //...                                              # every check above
@@ -436,6 +439,14 @@ The walkthrough is talOS's
 Device ids in subsystem files are placeholders until a person checks them
 at the robot and sets `commissioned = true`.
 
+`robot_bundle` is what deployment installs on the robot's main processor. It
+carries no Studio, so a deployed robot has no driver dashboard until its
+`talos_bundle` in `BUILD.bazel` also names
+`studio_bridge = "@talos//studio/bridge:studio_bridge"` and
+`studio_webroot = ":studio_webroot"`, after Studio's pages are built (the
+bundle refuses a webroot without them; talOS's
+`examples/robot_repo/README.md`, "Studio").
+
 ## Where talOS comes from
 
 `MODULE.bazel` points `@talos` at the talOS checkout this repository was
@@ -449,59 +460,83 @@ breaks both paths. Two other ways to hold talOS:
   and `path = "talos/bazel-bin/studio/dist"` in `studio_web`. The
   repository records the talOS commit it builds against, and a clone with
   `--recurse-submodules` builds anywhere; Studio's pages are built with
-  `(cd talos && bazel build //studio:web_dist)`.
+  `(cd talos && bazel build //studio:web_dist)`. `.bazelignore` already
+  names `talos`, so `//...` does not descend into talOS's own packages.
 - **`git_override`** in place of `local_path_override`:
   `git_override(module_name = "talos", remote = "<talOS URL>", commit =
   "<commit>")`. Bazel fetches talOS itself, but there is no checkout to
   build Studio's pages in (`studio_web` then needs some other checkout's
   folder, else Studio answers 503), and `new_subsystem --standalone`
   refuses a fetched talOS.
+
+`MODULE.bazel.lock` records the resolved module graph. While `@talos` is a
+`local_path_override` to a checkout that you update, it changes whenever
+talOS's dependencies do, so `.gitignore` leaves it out; once talOS is pinned
+by a submodule or `git_override`, delete that line and commit the lock.
 """
 
 GITIGNORE = """\
 # Bazel's output links.
 /bazel-*
+# Churns with an unpinned talOS; commit it once talOS is pinned (README.md).
+/MODULE.bazel.lock
+"""
+
+# Where README.md's git submodule of talOS goes: not packages of this
+# repository.
+BAZELIGNORE = """\
+# A git submodule of talOS (README.md): its packages are @talos's, not this
+# repository's.
+talos
 """
 
 
+def tracked_files(fixture):
+    """Fixture-relative paths of the files git tracks under `fixture`, or
+    None when it is not in a git work tree (a tarball, a Bazel runfiles
+    copy) or git is missing."""
+    try:
+        result = subprocess.run(["git", "-C", fixture, "ls-files", "-z"],
+                                capture_output=True, check=False)
+    except OSError:
+        return None
+    if result.returncode:
+        return None
+    return [p for p in result.stdout.decode().split("\0") if p]
+
+
+def action_of(path):
+    """TEMPLATE's action for fixture file `path`, or None."""
+    if path in TEMPLATE:
+        return TEMPLATE[path]
+    return next((action for key, action in TEMPLATE.items()
+                 if key.endswith("/") and path.startswith(key)), None)
+
+
 def template_sources(fixture):
-    """{fixture-relative path: TEMPLATE action} of every file of the fixture
-    at `fixture`; refuses one TEMPLATE does not place, or a TEMPLATE key the
-    fixture no longer has."""
-    found = {}
-    unplaced = []
-    for current, dirs, files in os.walk(fixture):
-        relative = rel(fixture, current)
-        top = relative == "."
-        dirs[:] = sorted(d for d in dirs if d != "__pycache__"
-                         and not (top and d.startswith("bazel-")))
-        for f in sorted(files):
-            if top and (f.startswith("bazel-") or f in BUILD_LEFTOVERS):
-                continue
-            if f.endswith(".pyc"):
-                continue
-            path = f if top else f"{relative}/{f}"
-            action = TEMPLATE.get(path)
-            if action is None:
-                action = next((TEMPLATE[key] for key in TEMPLATE
-                               if key.endswith("/") and path.startswith(key)),
-                              None)
-            if action is None:
-                unplaced.append(path)
-            else:
-                found[path] = action
+    """{fixture-relative path: TEMPLATE action} of each file TEMPLATE
+    copies, substitutes or replaces (directory keys are only left out).
+
+    Refuses a TEMPLATE key the fixture lacks, and a file git tracks there
+    that no key covers. Untracked files (a .DS_Store, an editor's backup)
+    are neither copied nor refused. Where git cannot say what is tracked,
+    the copy still reads only TEMPLATE's paths, so nothing unplaced reaches
+    a robot; the tracked check runs where the fixture is a git checkout,
+    as in talOS's CI and prepush (tools/check_robot_repo_scaffold.sh)."""
+    missing = [key for key in TEMPLATE if not (
+        os.path.isdir(os.path.join(fixture, key)) if key.endswith("/")
+        else os.path.isfile(os.path.join(fixture, key)))]
+    if missing:
+        raise Refused(f"TEMPLATE (tools/new_robot.py) places "
+                      f"{', '.join(missing)}, which {FIXTURE} no longer has")
+    unplaced = [path for path in tracked_files(fixture) or ()
+                if action_of(path) is None]
     if unplaced:
         raise Refused(f"{FIXTURE} has {', '.join(unplaced)}, which "
                       "TEMPLATE (tools/new_robot.py) does not place; say "
                       "there whether a robot repository copies it")
-    missing = [key for key in TEMPLATE
-               if not any(path == key or (key.endswith("/")
-                                          and path.startswith(key))
-                          for path in found)]
-    if missing:
-        raise Refused(f"TEMPLATE (tools/new_robot.py) places "
-                      f"{', '.join(missing)}, which {FIXTURE} no longer has")
-    return found
+    return {key: action for key, action in TEMPLATE.items()
+            if not key.endswith("/")}
 
 
 def left_out(path):
@@ -589,6 +624,18 @@ def check_manifest(files):
                       f"{diff}")
 
 
+def talos_path(talos_real, target):
+    """(path, absolute) of the talOS checkout as `target`'s MODULE.bazel
+    names it: relative, so the two directories can move together, as
+    new_subsystem --standalone writes it; absolute when the only common
+    ancestor is the filesystem's root, which a relative path would climb
+    to."""
+    common = os.path.commonpath([talos_real, target])
+    if os.path.dirname(common) == common:
+        return talos_real, True
+    return os.path.relpath(talos_real, target).replace(os.sep, "/"), False
+
+
 def plan_repository(talos_root, target_dir, name, fixture=None):
     """[(path, content)] of robot `name`'s repository at `target_dir`,
     copied from the fixture (default: `talos_root`'s), naming the talOS
@@ -605,12 +652,7 @@ def plan_repository(talos_root, target_dir, name, fixture=None):
                                     or os.listdir(target)):
         raise Refused(f"{target_dir} already exists and is not empty")
     fixture = fixture or os.path.join(talos_real, FIXTURE)
-    # Relative, so the two directories can move together, as
-    # new_subsystem --standalone writes it; absolute when the only common
-    # ancestor is the filesystem's root.
-    talos = (talos_real if os.path.dirname(os.path.commonpath(
-        [talos_real, target])) == os.path.commonpath([talos_real, target])
-        else os.path.relpath(talos_real, target).replace(os.sep, "/"))
+    talos, _ = talos_path(talos_real, target)
     files = {}
     for path, action in template_sources(fixture).items():
         if action in (LEAVE_OUT, REPLACE):
@@ -622,9 +664,41 @@ def plan_repository(talos_root, target_dir, name, fixture=None):
         files[path] = text
     files["README.md"] = fill(REPOSITORY_README, NAME=name, TALOS=talos)
     files[".gitignore"] = GITIGNORE
+    files[".bazelignore"] = BAZELIGNORE
     check_manifest(files)
     return [(os.path.join(target, path), content)
             for path, content in sorted(files.items())]
+
+
+def write_repository(target, writes):
+    """Writes `writes` ([(path under target, content)]) as the directory
+    `target`, all or nothing: into a hidden sibling, renamed into place
+    (over an empty `target`) at the end, and removed on failure. An OSError
+    is Refused."""
+    parent = os.path.dirname(os.path.abspath(target))
+    scratch = None
+    try:
+        os.makedirs(parent, exist_ok=True)
+        scratch = tempfile.mkdtemp(
+            prefix=f".{os.path.basename(target)}.new-", dir=parent)
+        for path, content in writes:
+            full = os.path.join(scratch, os.path.relpath(path, target))
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w", encoding="utf-8", newline="\n") as f:
+                f.write(content)
+        # mkdtemp's 0700, as a directory made by hand would be.
+        os.chmod(scratch, 0o777 & ~current_umask())
+        os.rename(scratch, target)
+    except OSError as err:
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+        raise Refused(f"cannot write {target}: {err}") from err
+
+
+def current_umask():
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
 
 
 def repository_next_steps(target, talos):
@@ -657,18 +731,25 @@ def main_repository(args):
                 or os.environ["BUILD_WORKSPACE_DIRECTORY"])
         target = os.path.join(base, os.path.expanduser(args.standalone))
         writes = plan_repository(talos_root, target, args.name)
+        target = os.path.abspath(target)
+        if not args.dry_run:
+            write_repository(target, writes)
     except Refused as refused:
         print(f"new_robot: refused: {refused}", file=sys.stderr)
         return 1
-    target = os.path.abspath(target)
     if args.dry_run:
         new_subsystem.show(target, [(p, None, c) for p, c in writes])
     else:
-        for path, content in writes:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8", newline="\n") as f:
-                f.write(content)
+        for path, _ in writes:
             print(f"wrote {path}")
+    path, absolute = talos_path(os.path.realpath(talos_root),
+                                os.path.realpath(target))
+    if absolute:
+        print(f"new_robot: warning: MODULE.bazel names talOS by the absolute "
+              f"path {path}, which works only on this machine; for a path a "
+              "teammate's clone can use, keep the talOS checkout beside the "
+              "repository (then run this again) or hold it as a git "
+              "submodule (README.md)", file=sys.stderr)
     print(repository_next_steps(target, talos_root))
     return 0
 

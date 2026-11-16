@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from python.runfiles import runfiles
 
@@ -367,10 +368,11 @@ def subsystem(name, node):
             "period_us = 20000\n")
 
 
-def fake_talos(tmp):
+def fake_talos(tmp, tracked=True):
     """A talOS checkout at tmp/talos whose examples/robot_repo has a file at
     every TEMPLATE entry, shaped as the real fixture's where new_robot
-    substitutes; returns (checkout, fixture)."""
+    substitutes, each tracked in a git work tree unless `tracked` is false
+    (a tarball); returns (checkout, fixture)."""
     talos = os.path.join(tmp, "talos")
     fixture = os.path.join(talos, new_robot.FIXTURE)
     files = {
@@ -389,7 +391,15 @@ def fake_talos(tmp):
         files.setdefault(path, f"# {path}\n")
     for path, content in files.items():
         write(os.path.join(fixture, path), content)
+    if tracked:
+        git(talos, "init", "-q")
+        git(talos, "add", "-A")
     return talos, fixture
+
+
+def git(work, *args):
+    subprocess.run(["git", "-C", work, *args], check=True,
+                   capture_output=True)
 
 
 def write(path, content):
@@ -409,7 +419,8 @@ class RobotRepositoryTest(unittest.TestCase):
             files = {rel_path(target, path): content for path, content in
                      new_robot.plan_repository(talos, target, "my_robot")}
             self.assertEqual(sorted(files), [
-                ".bazelrc", ".bazelversion", ".gitignore", "BUILD.bazel",
+                ".bazelignore", ".bazelrc", ".bazelversion", ".gitignore",
+                "BUILD.bazel",
                 "MODULE.bazel", "README.md", "robot.toml",
                 "robot_manifest.bzl", "studio_test.py",
                 "subsystems/telemetry.toml", "subsystems/teleop.toml"])
@@ -442,27 +453,19 @@ class RobotRepositoryTest(unittest.TestCase):
                                             "subsystems/teleop.toml"])
 
     # REQ-DEV-23
-    def test_refuses_a_bad_name_a_directory_in_talos_or_a_used_one(self):
+    def test_refuses_a_directory_in_talos_or_a_used_one(self):
+        # The name's rules are check_robot_name's (NewRobotTest).
         with tempfile.TemporaryDirectory() as tmp:
             talos, _ = fake_talos(tmp)
             used = os.path.join(tmp, "used")
             write(os.path.join(used, "notes.txt"), "mine\n")
-            free = os.path.join(tmp, "free")
-            cases = (
-                ("My_robot", free, "robot name"),
-                ("hw", free, "robot name"),
-                ("my_robot", talos, "inside the talOS checkout"),
-                ("my_robot", os.path.join(talos, "robots", "my_robot"),
-                 "inside the talOS checkout"),
-                ("my_robot", used, "not empty"),
-                ("my_robot", os.path.join(used, "notes.txt"), "not empty"),
-            )
-            for name, target, why in cases:
-                with self.subTest(name=name, target=target):
-                    with self.assertRaisesRegex(new_subsystem.Refused, why):
-                        new_robot.plan_repository(talos, target, name)
-            self.assertFalse(os.path.exists(free))
+            for target in (talos, os.path.join(talos, "robots", "my_robot"),
+                           used, os.path.join(used, "notes.txt")):
+                with self.subTest(target=target):
+                    with self.assertRaises(new_subsystem.Refused):
+                        new_robot.plan_repository(talos, target, "my_robot")
             self.assertFalse(os.path.exists(os.path.join(talos, "robots")))
+            self.assertEqual(os.listdir(used), ["notes.txt"])
 
     # REQ-DEV-23
     def test_a_fixture_the_template_does_not_match_refuses_the_copy(self):
@@ -491,11 +494,67 @@ class RobotRepositoryTest(unittest.TestCase):
                     tempfile.TemporaryDirectory() as tmp:
                 talos, fixture = fake_talos(tmp)
                 change(fixture, path)
+                git(talos, "add", "-A")
                 target = os.path.join(tmp, "my_robot")
                 with self.assertRaisesRegex(new_subsystem.Refused,
                                             re.escape(path)):
                     new_robot.plan_repository(talos, target, "my_robot")
                 self.assertFalse(os.path.exists(target))
+
+    # REQ-DEV-23
+    def test_an_untracked_file_in_the_fixture_is_not_copied_or_refused(self):
+        # A student's checkout gathers files nobody committed (.DS_Store
+        # once Finder opens the folder); a tarball or runfiles copy has no
+        # index to tell them apart. The copy takes TEMPLATE's paths only.
+        for tracked in (True, False):
+            with self.subTest(tracked=tracked), \
+                    tempfile.TemporaryDirectory() as tmp:
+                talos, fixture = fake_talos(tmp, tracked)
+                write(os.path.join(fixture, ".DS_Store"), "finder\n")
+                write(os.path.join(fixture, "intake", "BUILD.bazel"), "#\n")
+                target = os.path.join(tmp, "my_robot")
+                paths = [rel_path(target, path) for path, _ in
+                         new_robot.plan_repository(talos, target, "my_robot")]
+                self.assertNotIn(".DS_Store", paths)
+                self.assertNotIn("intake/BUILD.bazel", paths)
+
+    # REQ-DEV-23
+    def test_talos_path_is_absolute_only_when_sharing_just_the_root(self):
+        self.assertEqual(new_robot.talos_path("/home/a/talos", "/home/a/r"),
+                         ("../talos", False))
+        self.assertEqual(new_robot.talos_path("/home/a/talos", "/tmp/r"),
+                         ("/home/a/talos", True))
+
+    # REQ-DEV-23
+    def test_a_write_that_fails_leaves_nothing_at_the_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            talos, _ = fake_talos(tmp)
+            target = os.path.join(tmp, "robots", "my_robot")
+            writes = new_robot.plan_repository(talos, target, "my_robot")
+            real_open, opened = open, []
+
+            def failing_open(*args, **kwargs):
+                opened.append(args[0])
+                if len(opened) == 3:
+                    raise OSError(28, "No space left on device")
+                return real_open(*args, **kwargs)
+
+            with mock.patch("builtins.open", failing_open):
+                with self.assertRaises(new_subsystem.Refused):
+                    new_robot.write_repository(target, writes)
+            self.assertEqual(len(opened), 3)
+            self.assertEqual(os.listdir(os.path.join(tmp, "robots")), [])
+            # An unwritable parent: refused too, not a traceback.
+            locked = os.path.join(tmp, "locked")
+            os.makedirs(locked)
+            os.chmod(locked, 0o500)
+            try:
+                with self.assertRaises(new_subsystem.Refused):
+                    new_robot.write_repository(
+                        os.path.join(locked, "my_robot"), writes)
+            finally:
+                os.chmod(locked, 0o700)
+            self.assertEqual(os.listdir(locked), [])
 
 
 def rel_path(base, path):

@@ -3,10 +3,11 @@ module(
     version = "0.1.0",
 )
 
-# talOS, as the checkout `path` names builds it (relative to this
-# directory). A team's robot repository usually holds talOS as a git
-# submodule at the commit it builds against and points path at it
-# (`path = "talos"`); README.md says how.
+# talOS, as the checkout `path` names builds it (a path relative to this
+# directory, or an absolute one, which holds only on the machine that wrote
+# it). A team's robot repository usually holds talOS as a git submodule at
+# the commit it builds against and points path at it (`path = "talos"`);
+# README.md says how.
 bazel_dep(name = "talos", version = "0.1.0")
 local_path_override(
     module_name = "talos",

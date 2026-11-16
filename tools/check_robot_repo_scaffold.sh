@@ -22,7 +22,12 @@
 #              the copy, whose output base has built it, into a sibling
 #              directory, then moved into the copy's path so that the
 #              build reuses that output base (its talOS path, relative to
-#              a sibling or absolute, holds there too).
+#              a sibling or absolute, holds there too). Then talOS goes in
+#              as its README's git submodule would: a `git archive` of this
+#              checkout at talos/, the overrides pointed there, and
+#              `bazel build --nobuild //...`, which loads every package and
+#              fails if //... descends into talos/ (the .bazelignore
+#              new_robot writes keeps it out).
 # The copy's MODULE.bazel points @talos (and studio_web) at the talOS
 # checkout holding this script. BAZEL_FLAGs go to every `bazel run` and
 # `bazel test` (tools/prepush.sh passes its --disk_cache and
@@ -137,6 +142,21 @@ new_robot() {
     rm -rf "$fresh"
 }
 
+# talOS held at talos/ as a submodule is, the overrides pointed there, and
+# every package of //... loaded.
+as_submodule() {
+  mkdir talos && git -C "$talos" archive HEAD | tar -xf - -C talos ||
+    return 1
+  sed -e 's|^    path = "[^"]*/bazel-bin/studio/dist",$|    path = "talos/bazel-bin/studio/dist",|' \
+    -e '/talos\/bazel-bin/!s|^    path = "[^"]*",$|    path = "talos",|' \
+    MODULE.bazel > MODULE.bazel.new && mv MODULE.bazel.new MODULE.bazel ||
+    return 1
+  grep -qxF '    path = "talos",' MODULE.bazel &&
+    grep -qxF '    path = "talos/bazel-bin/studio/dist",' MODULE.bazel ||
+    { echo "MODULE.bazel: no override to point at talos/" >&2; return 1; }
+  bazel build --nobuild ${bazel_flags[@]+"${bazel_flags[@]}"} //...
+}
+
 scaffold() {  # scaffold NAME LANG
   bazel run ${bazel_flags[@]+"${bazel_flags[@]}"} @talos//tools:new_subsystem -- "$1" --lang "$2"
 }
@@ -154,5 +174,9 @@ for variant in plain coverage new_robot; do
   phase "$variant: scaffold feeder (py)" scaffold feeder py
   phase "$variant: bazel test //..." \
     bazel test --test_output=errors ${bazel_flags[@]+"${bazel_flags[@]}"} //...
+  if [ "$variant" = new_robot ]; then
+    phase "$variant: talOS as a submodule, bazel build --nobuild //..." \
+      as_submodule
+  fi
 done
 echo "scaffold-check: every variant passed in $((SECONDS - start)) s"
