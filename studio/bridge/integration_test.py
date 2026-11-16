@@ -197,23 +197,10 @@ class BridgeIntegration(unittest.TestCase):
                 processes.append(bare)
                 http_port = bound_port(bridge)
                 bare_port = bound_port(bare)
-                # Wait until both bridges listen. A bridge signalled before it
-                # is listening has not installed its SIGTERM handler yet and
-                # dies with -15 instead of exiting 0.
-                deadline = time.monotonic() + 10
-                for port in (bare_port, http_port):
-                    while True:
-                        self.assertIsNone(bridge.poll(), "bridge exited")
-                        self.assertIsNone(bare.poll(), "bridge without --declared exited")
-                        try:
-                            ws = socket.create_connection(("127.0.0.1", port), timeout=1)
-                            break
-                        except OSError:
-                            if time.monotonic() > deadline:
-                                raise
-                            time.sleep(0.02)
-                    if port == bare_port:
-                        ws.close()
+                # A bridge reports its port only once it listens, with its
+                # SIGTERM handler installed, so each accepts at once.
+                socket.create_connection(("127.0.0.1", bare_port), timeout=1).close()
+                ws = socket.create_connection(("127.0.0.1", http_port), timeout=1)
                 mock = subprocess.Popen([str(binaries / "studio_mock"), topic],
                                         stdout=subprocess.PIPE, text=True)
                 processes.append(mock)
@@ -522,20 +509,18 @@ class BridgeIntegration(unittest.TestCase):
                                           stdout=subprocess.PIPE, text=True)
                 processes.append(bridge)
                 port = bound_port(bridge)
+                # The live JSON answers 503 until the mock's dictionary and
+                # first tick arrive; a client is sent both, as a dictionary
+                # and then a value page, once the bridge holds them.
+                with socket.create_connection(("127.0.0.1", port), timeout=5) as ws:
+                    self.assertIn(b"101 ", upgrade(ws))
+                    self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
+                    self.assertEqual(frame_of(ws, BINARY)[8:12], b"TLM3")
 
                 def cache_control(path):
-                    # The live JSON answers 503 until the mock's dictionary
-                    # and first tick arrive.
-                    deadline = time.monotonic() + 10
-                    while True:
-                        try:
-                            with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
-                                                        timeout=3) as response:
-                                return response.headers.get("Cache-Control")
-                        except urllib.error.HTTPError as error:
-                            if error.code != 503 or time.monotonic() > deadline:
-                                raise
-                            time.sleep(0.02)
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}",
+                                                timeout=3) as response:
+                        return response.headers.get("Cache-Control")
 
                 immutable = "public, max-age=31536000, immutable"
                 expected = {
