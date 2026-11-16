@@ -1642,13 +1642,19 @@ TEST(Supervision, ABoundedSessionEndsAtItsStopNotAtAMembersOwnDuration) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// A config that cannot be read refuses the launch before its session
+// directory, <output-dir>/<session_id>/, holds a graph.json (README "Two
+// phases": nothing was described).
+// REQ-OPS-01
 TEST(Supervision, MissingConfigFailsFastWithClearError) {
   LauncherOptions options;
+  options.session_id = GenerateSessionId();
   options.output_dir = TempPath("missing_cfg_out");
   options.config_path = TempPath("does_not_exist") + ".toml";
-  Launcher launcher{options};
-  EXPECT_EQ(launcher.Run(), 1);
-  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/graph.json"));
+  EXPECT_EQ(RunSession(options), 1);
+  EXPECT_FALSE(std::filesystem::exists(options.output_dir + "/graph.json"))
+      << options.output_dir;
+  std::filesystem::remove_all(TempPath("missing_cfg_out"));
 }
 
 // Registry rows held by live processes outside the session are never swept, so
