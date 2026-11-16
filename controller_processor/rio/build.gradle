@@ -175,22 +175,31 @@ logger.quiet("RoboRIO companion address built in: ${companionAddress}" +
 // rewrites the header only when its text changes, so an unchanged checkout
 // and address recompile nothing, and a changed address recompiles Robot.cpp.
 //
-// -PtalosRevision=<16 lowercase hex digits> stamps that revision instead, for
-// a build from a copy with no git history (which would otherwise report
-// revision 0): git is not read, the commit is those digits and the build is
-// reported clean. Like -Pcompanion it is taken only from the command line, so
-// a value left in a gradle.properties or the environment cannot stamp a later
-// build, and a malformed value fails the build. 0000000000000000 is refused:
-// revision 0 means unknown.
-def revisionFromCommandLine = gradle.startParameter.projectProperties.containsKey('talosRevision')
-if (project.hasProperty('talosRevision') && !revisionFromCommandLine) {
-    throw new GradleException(
-            "talosRevision=${project.property('talosRevision')} is set outside the command " +
-            "line (gradle.properties or ORG_GRADLE_PROJECT_talosRevision); remove it there: " +
-            "it is accepted only as -PtalosRevision=<16 hex digits> on the command line")
+// -PtalosRevision=<16 lowercase hex digits> -PtalosDirty=true|false stamps
+// that revision and dirty state instead, for a build from a copy with no git
+// history (which would otherwise report revision 0); whoever made the copy
+// knows whether it differs from that commit. The two are required together:
+// a revision without -PtalosDirty, a -PtalosDirty without a revision, or a
+// -PtalosDirty that is not exactly true or false fails the build, so no
+// caller gets "clean" by omission. The override is refused while git sees a
+// work tree here (generateRioBuild asks before writing the header): git then
+// stamps the commit and dirty state itself, and an override could only hide
+// uncommitted changes. Like -Pcompanion both are taken only from the command
+// line, so a value left in a gradle.properties or the environment cannot
+// stamp a later build. A malformed revision fails the build, and
+// 0000000000000000 is refused: revision 0 means unknown.
+['talosRevision', 'talosDirty'].each { name ->
+    if (project.hasProperty(name) &&
+            !gradle.startParameter.projectProperties.containsKey(name)) {
+        throw new GradleException(
+                "${name}=${project.property(name)} is set outside the command line " +
+                "(gradle.properties or ORG_GRADLE_PROJECT_${name}); remove it there: " +
+                "-PtalosRevision=<16 hex digits> -PtalosDirty=true|false are accepted " +
+                "only on the command line")
+    }
 }
-def revisionOverride = revisionFromCommandLine ?
-        gradle.startParameter.projectProperties['talosRevision'].toString() : null
+def revisionOverride = gradle.startParameter.projectProperties['talosRevision']?.toString()
+def dirtyOverride = gradle.startParameter.projectProperties['talosDirty']?.toString()
 def revisionRefusal = { String text ->
     if (!(text ==~ /[0-9a-f]{16}/)) {
         return 'it is not exactly 16 lowercase hex digits (the first 16 of a git commit)'
@@ -198,12 +207,33 @@ def revisionRefusal = { String text ->
     if (text ==~ /0{16}/) return 'revision 0 means unknown'
     return null
 }
-if (revisionOverride != null) {
-    def revisionRefused = revisionRefusal(revisionOverride)
-    if (revisionRefused != null) {
-        throw new GradleException("-PtalosRevision=${revisionOverride} refused: ${revisionRefused}")
+// Why the -PtalosRevision / -PtalosDirty pair (either may be null) is
+// refused, or null when it is accepted or absent.
+def overrideRefusal = { String revision, String dirty ->
+    if (revision == null) {
+        return dirty == null ? null :
+                "-PtalosDirty=${dirty} refused: it is given without -PtalosRevision, " +
+                'so it would stamp nothing; pass both or neither'
     }
-    logger.quiet("RoboRIO program revision stamped: ${revisionOverride} (from -PtalosRevision)")
+    def revisionRefused = revisionRefusal(revision)
+    if (revisionRefused != null) return "-PtalosRevision=${revision} refused: ${revisionRefused}"
+    if (dirty == null) {
+        return "-PtalosRevision=${revision} refused: it needs -PtalosDirty=true|false, " +
+                'whether the copy differs from that commit'
+    }
+    if (!(dirty in ['true', 'false'])) {
+        return "-PtalosDirty=${dirty} refused: it is not exactly true or false " +
+                "(it stamps -PtalosRevision=${revision})"
+    }
+    return null
+}
+def overrideRefused = overrideRefusal(revisionOverride, dirtyOverride)
+if (overrideRefused != null) {
+    throw new GradleException(overrideRefused)
+}
+if (revisionOverride != null) {
+    logger.quiet("RoboRIO program revision stamped: ${revisionOverride}, dirty " +
+            "${dirtyOverride} (from -PtalosRevision -PtalosDirty)")
 }
 
 def rioBuildHeaderDir = layout.buildDirectory.dir('generated/talos/include').get().asFile
@@ -220,9 +250,20 @@ def runGit = { List<String> args ->
 }
 
 // [commit, dirty]: the override when given, else what `git` (runGit, or a
-// stand-in in rioBuildStampTest) reports.
-def rioBuildStamp = { String override, Closure git ->
-    if (override != null) return [override, false]
+// stand-in in rioBuildStampTest) reports. An override is refused while git
+// sees a work tree here.
+def rioBuildStamp = { String override, String overrideDirty, Closure git ->
+    if (override != null) {
+        def workTree = git(['rev-parse', '--show-toplevel'])
+        if (workTree != null) {
+            throw new GradleException(
+                    "-PtalosRevision=${override} -PtalosDirty=${overrideDirty} refused: " +
+                    "git sees the work tree ${workTree}, which stamps its own commit and " +
+                    'uncommitted changes; drop both properties (they are for a copy ' +
+                    'with no git history)')
+        }
+        return [override, overrideDirty == 'true']
+    }
     def head = git(['rev-parse', 'HEAD'])
     def commit = head != null && head ==~ /[0-9a-f]{16,}/ ? head : 'unknown'
     // A status that cannot be read is not evidence of a clean tree.
@@ -245,7 +286,8 @@ inline constexpr const char* kBuildCommit = "${commit}";
 // Its first 16 hex digits as one number, 0 when unknown
 // (hardware::GatewayBuild::revision).
 inline constexpr uint64_t kBuildRevision = ${revision}ull;
-// Built with uncommitted changes, untracked files included.
+// Built with uncommitted changes, untracked files included (or the
+// -PtalosDirty value).
 inline constexpr bool kBuildDirty = ${dirty};
 // The companion (main processor) this program sends State to and accepts
 // frames from, set by -Pcompanion at build time.
@@ -255,15 +297,16 @@ inline constexpr const char* kCompanionAddress = "${companion}";
 }
 
 tasks.register("generateRioBuild") {
-    description = 'Write the checkout\'s git commit (or -PtalosRevision), dirty flag and companion address to RioBuild.h'
+    description = 'Write the checkout\'s git commit and dirty flag (or -PtalosRevision -PtalosDirty) and companion address to RioBuild.h'
     group = 'build'
     def header = new File(rioBuildHeaderDir, 'RioBuild.h')
     inputs.property('companion', companionAddress)
     inputs.property('talosRevision', revisionOverride ?: '')
+    inputs.property('talosDirty', dirtyOverride ?: '')
     outputs.file(header)
     outputs.upToDateWhen { false }
     doLast {
-        def (commit, dirty) = rioBuildStamp(revisionOverride, runGit)
+        def (commit, dirty) = rioBuildStamp(revisionOverride, dirtyOverride, runGit)
         def text = rioBuildHeaderText(commit, dirty, companionAddress)
         if (!header.exists() || header.text != text) {
             header.parentFile.mkdirs()
@@ -272,40 +315,78 @@ tasks.register("generateRioBuild") {
     }
 }
 
-// REQ-CONTRACT-30: the revision a State names is the one the build was
-// given. -PtalosRevision reaches kBuildRevision and replaces git; a malformed
-// or zero value is refused; without it a commit gives its first 16 digits,
-// and no git gives "unknown" and revision 0. phoenixTest runs it.
+// REQ-CONTRACT-30: the revision and dirty state a State names are the ones
+// the build was given. In a copy git cannot see, -PtalosRevision and
+// -PtalosDirty reach kBuildRevision and kBuildDirty; a revision without
+// -PtalosDirty (or the reverse), a -PtalosDirty that is not true or false, a
+// malformed or zero revision, and an override where git sees a work tree are
+// refused, naming the properties; without the override a commit gives its
+// first 16 digits, and no git gives "unknown" and revision 0. phoenixTest
+// runs it.
 tasks.register("rioBuildStampTest") {
-    description = 'Check the RioBuild.h revision stamp: -PtalosRevision, its refusals, git'
+    description = 'Check the RioBuild.h build stamp: -PtalosRevision -PtalosDirty, their refusals, git'
     group = 'verification'
     doLast {
         def failures = []
         def check = { boolean ok, String what -> if (!ok) failures << what }
-        def noGit = { List<String> args -> throw new GradleException("git ran: ${args}") }
+        // A copy with no git history: git finds no work tree, and nothing
+        // else may be asked.
+        def noWorkTree = { List<String> args ->
+            if (args != ['rev-parse', '--show-toplevel']) throw new GradleException("git ran: ${args}")
+            return null
+        }
 
-        def (commit, dirty) = rioBuildStamp('0123456789abcdef', noGit)
+        def (commit, dirty) = rioBuildStamp('0123456789abcdef', 'true', noWorkTree)
         def text = rioBuildHeaderText(commit, dirty, '10.0.0.5')
         check(text.contains('kBuildRevision = 0x0123456789abcdefull;'),
                 "the -PtalosRevision revision is not in the header:\n${text}")
         check(text.contains('kBuildCommit = "0123456789abcdef";'),
                 'the -PtalosRevision commit is not in the header')
-        check(text.contains('kBuildDirty = false;'), 'a -PtalosRevision build is not reported clean')
+        check(text.contains('kBuildDirty = true;'), 'a -PtalosDirty=true build is reported clean')
+        def (cleanCommit, cleanDirty) = rioBuildStamp('0123456789abcdef', 'false', noWorkTree)
+        check(cleanCommit == '0123456789abcdef' && !cleanDirty,
+                'a -PtalosDirty=false build is not reported clean')
 
-        check(revisionRefusal('0123456789abcdef') == null, 'a valid revision is refused')
+        check(overrideRefusal('0123456789abcdef', 'true') == null &&
+                overrideRefusal('0123456789abcdef', 'false') == null &&
+                overrideRefusal(null, null) == null, 'a valid override, or none, is refused')
+        def refused = { String revision, String dirtyText, List<String> names ->
+            def why = overrideRefusal(revision, dirtyText)
+            check(why != null && names.every { why.contains(it) },
+                    "-PtalosRevision=${revision} -PtalosDirty=${dirtyText}: ${why ?: 'accepted'}")
+        }
+        refused('0123456789abcdef', null, ['-PtalosRevision', '-PtalosDirty'])
+        refused(null, 'false', ['-PtalosRevision', '-PtalosDirty'])
+        ['', 'TRUE', '1', 'yes', 'false '].each {
+            refused('0123456789abcdef', it, ['-PtalosRevision', '-PtalosDirty'])
+        }
         ['', '0123456789ABCDEF', '0123456789abcde', '0123456789abcdef0', '0x0123456789abcd',
          '0123456789abcdeg', '0000000000000000'].each {
-            check(revisionRefusal(it) != null, "-PtalosRevision=${it} is accepted")
+            refused(it, 'false', ['-PtalosRevision'])
+        }
+
+        // Where git sees a work tree it stamps the build itself: the override
+        // cannot hide that tree's uncommitted changes.
+        def inWorkTree = { List<String> args ->
+            args == ['rev-parse', '--show-toplevel'] ? '/robot/talos' : ''
+        }
+        try {
+            rioBuildStamp('0123456789abcdef', 'false', inWorkTree)
+            check(false, 'an override is accepted where git sees a work tree')
+        } catch (GradleException e) {
+            check(e.message.contains('/robot/talos') && e.message.contains('-PtalosRevision') &&
+                    e.message.contains('-PtalosDirty'),
+                    "the work-tree refusal names neither the tree nor both properties: ${e.message}")
         }
 
         def sha = '89abcdef0123456789abcdef0123456789abcdef'
-        def (gitCommit, gitDirty) = rioBuildStamp(null) { List<String> args ->
+        def (gitCommit, gitDirty) = rioBuildStamp(null, null) { List<String> args ->
             args[0] == 'rev-parse' ? sha : ''
         }
         check(rioBuildHeaderText(gitCommit, gitDirty, '10.0.0.5')
                 .contains('kBuildRevision = 0x89abcdef01234567ull;'), 'the git commit is not stamped')
         check(!gitDirty, 'a clean checkout is reported dirty')
-        def (noCommit, noDirty) = rioBuildStamp(null) { List<String> args -> null }
+        def (noCommit, noDirty) = rioBuildStamp(null, null) { List<String> args -> null }
         check(noCommit == 'unknown' && !noDirty &&
                 rioBuildHeaderText(noCommit, noDirty, '10.0.0.5').contains('kBuildRevision = 0ull;'),
                 'a build without git does not report revision 0')
