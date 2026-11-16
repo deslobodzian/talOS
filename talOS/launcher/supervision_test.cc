@@ -684,6 +684,80 @@ TEST(Supervision, DeliveryLossDuringTheStopReachesTheFinalManifest) {
   std::filesystem::remove_all(options.output_dir);
 }
 
+// A run killed during a log gap leaves no GAP record, so its registry row
+// is the only signal: the launcher marks the member log_gap and
+// recorder_failed from the row's kFlagLogGap and names the run's log in one
+// line. alpha's row shows the bit while it runs (a supervision pass reads
+// it); beta's first run sets it in one sample and exits at once, so the
+// launcher reads it from the row the run left when it reaps it; its restart
+// shows none and is not named. Neither stub writes a log.
+// REQ-OPS-52
+TEST(Supervision, ALogGapInTheRowMarksTheMemberThoughItsLogHasNoGapRecord) {
+  auto options = BaseOptions("row_gap");
+  options.simulation = true;
+  options.duration_s = kHangSeconds;
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles{
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(BAZEL_CURRENT_REPOSITORY,
+                                                      &error)};
+  ASSERT_NE(runfiles, nullptr) << error;
+  const char* stub = std::getenv("TALOS_DELIVERY_LOSS_NODE");
+  ASSERT_NE(stub, nullptr);
+  const std::string binary = runfiles->Rlocation(stub);
+  const auto member = [&](std::string_view name, std::string_view target,
+                          std::string_view runs) {
+    return WriteStub("row_gap_" + std::string{name},
+                     "exec " + binary + " " + std::string{name} + " " +
+                         std::string{target} + " " + std::string{runs} +
+                         " \"$@\"\n",
+                     name);
+  };
+  options.binary_overrides["//talOS/bridge:hardware_node"] =
+      member("hardware_node", "//talOS/bridge:hardware_node", "0,0,0,0,run");
+  options.binary_overrides["//example/alpha:node"] =
+      member("alpha", "//example/alpha:node", "0,0,0,0,gap");
+  options.binary_overrides["//example/beta:node"] =
+      member("beta", "//example/beta:node", "0,0,0,0,gapexit 0,0,0,0,run");
+  std::string seen;
+  ::testing::internal::CaptureStderr();
+  const int status = RunSessionUntil(
+      options,
+      [](const std::string& live) {
+        return ManifestEntry(live, "alpha").find("\"log_gap\": true") !=
+                   std::string::npos &&
+               ManifestRuns(live, "beta").size() == 2 &&
+               ManifestEntry(live, "beta").find("\"log_gap\": true") !=
+                   std::string::npos;
+      },
+      seen);
+  const std::string stderr_text = ::testing::internal::GetCapturedStderr();
+  EXPECT_EQ(status, 0);
+  ASSERT_FALSE(seen.empty()) << "no live manifest carried both gaps";
+  const auto manifest = ReadFile(options.output_dir + "/manifest.json");
+  for (const char* name : {"alpha", "beta"}) {
+    const auto entry = ManifestEntry(manifest, name);
+    EXPECT_NE(entry.find("\"log_gap\": true"), std::string::npos) << entry;
+    EXPECT_NE(entry.find("\"recorder_failed\": true"), std::string::npos)
+        << entry;
+  }
+  std::vector<std::string> named;
+  std::istringstream text{stderr_text};
+  for (std::string line; std::getline(text, line);) {
+    if (line.find("lost records") == std::string::npos) continue;
+    const std::size_t at = line.rfind('/');
+    named.push_back(at == std::string::npos
+                        ? line
+                        : line.substr(at + 1, line.find(' ', at) - at - 1));
+  }
+  std::sort(named.begin(), named.end());
+  EXPECT_EQ(named, (std::vector<std::string>{"alpha.tlog", "beta.tlog"}))
+      << stderr_text;
+  for (const char* log : {"/alpha.tlog", "/beta.tlog"}) {
+    EXPECT_FALSE(std::filesystem::exists(options.output_dir + log)) << log;
+  }
+  std::filesystem::remove_all(options.output_dir);
+}
+
 // A run that ends before it claims a registry row has no counts of its own,
 // however a row left in the session by an earlier run whose pid it reuses
 // reads: the launcher's read at the reap takes only a row claimed since the

@@ -139,10 +139,12 @@ int64_t WallClockNanos() {
       .count();
 }
 
-bool NodeProcessInfo::RecordLogGap() {
+bool NodeProcessInfo::RecordLogGap(const std::string& log) {
   failed = true;
-  if (log_gap) return false;
   log_gap = true;
+  if (std::find(gap_logs.begin(), gap_logs.end(), log) != gap_logs.end())
+    return false;
+  gap_logs.push_back(log);
   return true;
 }
 

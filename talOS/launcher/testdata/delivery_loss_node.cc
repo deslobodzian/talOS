@@ -12,7 +12,10 @@
 // zeros until the stop, then the counts, in one last sample before it
 // releases the row; `exit` exits 3 once the session's manifest.json shows
 // wake_failures at this run's (nonzero) count, as the launcher posts it
-// when a count first leaves 0.
+// when a count first leaves 0. `gap` runs as `run` with its row's event log
+// gap bit set (introspect::kFlagLogGap), though it writes no log; `gapexit`
+// sets it in one sample, releases the row and exits 3 at once, as a node
+// killed during a gap leaves its row.
 
 #include <chrono>
 #include <csignal>
@@ -43,6 +46,8 @@ struct Run {
   std::uint64_t requests_skipped{0};
   bool exits{false};
   bool late{false};  // The counts appear only once the run is stopped.
+  bool gap{false};   // The row shows an event log gap.
+  bool gap_exit{false};
 };
 
 Run ParseRun(const std::string& spec) {
@@ -56,7 +61,9 @@ Run ParseRun(const std::string& spec) {
           .wake_fallbacks = std::stoull(fields[2]),
           .requests_skipped = std::stoull(fields[3]),
           .exits = fields[4] == "exit",
-          .late = fields[4] == "stop"};
+          .late = fields[4] == "stop",
+          .gap = fields[4] == "gap" || fields[4] == "gapexit",
+          .gap_exit = fields[4] == "gapexit"};
 }
 
 // Restart k's event log is `<name>.restart<k>.tlog`; the first run's has no
@@ -116,11 +123,13 @@ int main(int argc, char** argv) {
                       shown.wake_fallbacks);
     if (run.requests_skipped != 0)
       row.set_source(0, dispatch, shown.requests_skipped, dispatch, 0, 0, 0);
+    row.set_recording(/*failed=*/false, /*capped=*/false, /*gap=*/run.gap);
     row.end_sample();
   };
   std::uint64_t dispatch = 1;
   for (; stop == 0; ++dispatch) {
     sample(dispatch, run.late ? none : run);
+    if (run.gap_exit) return 3;
     if (run.exits) {
       std::ifstream in{manifest};
       const std::string text{std::istreambuf_iterator<char>{in}, {}};

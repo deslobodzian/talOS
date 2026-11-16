@@ -18,7 +18,9 @@
 #include "talOS/events/log/log_reader.h"
 #include "talOS/events/log/log_writer.h"
 #include "talOS/events/manifest.h"
+#include "talOS/introspection/describe.h"
 #include "talOS/launcher/launcher.h"
+#include "talOS/launcher/log_budget.h"
 
 namespace talos::launcher {
 namespace {
@@ -109,6 +111,63 @@ TEST(CappedLog, RotatingLogRecordsOnAndOneThatCannotRotateStopped) {
         << event::log::LogSegmentFiles(path).size();
     EXPECT_EQ(writer.capture_stopped(), row.stopped);
     writer.flush();
+    RemoveLog(path);
+  }
+}
+
+// REQ-RT-11, REQ-OPS-32
+// Every chunk and every segment must hold a GAP record (128 B), even for a
+// member whose records are smaller: otherwise the record that resumes
+// capture after a gap could never be taken (a chunk too small for its GAP),
+// or its GAP would cross the byte cap of a fresh segment and stop capture
+// for good. A writer with the smallest chunks, under the launcher's floor
+// share for OneSource() (SmallestRotatingShare) and under a share of eight
+// segments of its bare records, drops an oversized record and resumes with
+// a GAP record, recording on.
+TEST(CappedLog, AGapFitsEverySegmentAtTheFloorShare) {
+  introspect::Description declared;
+  declared.sources.push_back({.kind = event::SourceKind::WATCHER,
+                              .name = "sample",
+                              .message_bytes = kMessageBytes,
+                              .alignment = 4});
+  const std::uint64_t floor = SmallestRotatingShare(declared);
+  const std::uint64_t record = sizeof(event::log::RecordHeader) + kMessageBytes;
+  const std::vector<std::byte> payload(kMessageBytes, std::byte{1});
+  const std::vector<std::byte> oversized(512, std::byte{1});
+  for (const std::uint64_t max_bytes : {floor, 8 * (PrefixBytes() + record)}) {
+    SCOPED_TRACE(max_bytes);
+    const std::string path = TempPath("gap_floor");
+    RemoveLog(path);
+    {
+      // Chunks of 64 bytes: start() must grow them to a GAP record.
+      LogWriter writer{
+          path, "floor",
+          LogWriter::Options{64, 1, /*background=*/false, max_bytes}};
+      writer.start(OneSource(), {});
+      event::Context context{};
+      context.kind = event::EventKind::MESSAGE;
+      // Two records, the oversized one, then the one that resumes: the
+      // kept segments then hold the GAP.
+      for (std::uint64_t i = 1; i <= 4; ++i) {
+        context.dispatch_index = i;
+        writer.dispatch(context, i == 3 ? oversized : payload);
+      }
+      EXPECT_EQ(writer.gaps(), 1u);
+      EXPECT_FALSE(writer.losing()) << "capture never resumed";
+      EXPECT_FALSE(writer.capture_stopped()) << "the GAP record hit the cap";
+      writer.flush();
+      std::size_t gaps = 0;
+      for (const auto& file : event::log::LogSegmentFiles(path)) {
+        gaps += event::log::SummarizeLog(file).gaps;
+      }
+      EXPECT_EQ(gaps, 1u);
+      // And it rotates: a share that cannot would stop at its cap.
+      for (std::uint64_t i = 5; i <= 20; ++i) {
+        context.dispatch_index = i;
+        writer.dispatch(context, payload);
+      }
+      EXPECT_FALSE(writer.capture_stopped()) << "the share does not rotate";
+    }
     RemoveLog(path);
   }
 }

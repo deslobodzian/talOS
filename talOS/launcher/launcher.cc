@@ -85,7 +85,8 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
   return counts;
 }
 
-// What a reaped run's row says it lost as the run ended. A run that exits
+// What a reaped run's row says it lost as the run ended, and its `flags`
+// (the event log flags among them, set into `flags`). A run that exits
 // takes a last sample and then releases its row, which keeps that sample
 // until the next claim (NodeRegistration::release); a killed run leaves its
 // row as its last sample left it. The supervision pass reads rows only
@@ -102,7 +103,7 @@ DeliveryCounts DeliveryCountsOf(const introspect::NodeRecord& record) {
 // Loads from the mapped segment only: no lock, no disk.
 std::optional<DeliveryCounts> FinalDeliveryCounts(
     const introspect::RegistryMapping& registry, pid_t pid, uint64_t session_id,
-    int64_t spawned_ns) {
+    int64_t spawned_ns, uint32_t& flags) {
   const auto claiming = static_cast<uint64_t>(introspect::SlotState::CLAIMING);
   std::optional<DeliveryCounts> counts;
   int64_t newest = 0;
@@ -116,11 +117,13 @@ std::optional<DeliveryCounts> FinalDeliveryCounts(
         record.heartbeat_monotonic_ns.load(std::memory_order_relaxed);
     if (beat < spawned_ns || (counts && beat <= newest)) continue;
     DeliveryCounts read = DeliveryCountsOf(record);
+    const uint32_t read_flags = record.flags.load(std::memory_order_relaxed);
     std::atomic_thread_fence(std::memory_order_acquire);
     if (record.generation.load(std::memory_order_relaxed) != generation ||
         record.state.load(std::memory_order_relaxed) == claiming)
       continue;
     counts = std::move(read);
+    flags = read_flags;
     newest = beat;
   }
   return counts;
@@ -213,10 +216,13 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
 }
 
 // The one line a member whose event log has a gap gets (RecordLogGap).
+// The one line each gapped run's log gets (NodeProcessInfo::RecordLogGap).
+// It says no more than that records were lost: a stall that lasts until the
+// stop leaves nothing recorded after the gap, and a run killed during one
+// leaves no GAP record.
 void PrintLogGap(const std::string& member, const std::string& log) {
   std::cerr << "[launcher] " << member << " event log " << log
-            << " lost records (a gap); the rest of this run is still "
-               "recorded\n";
+            << " lost records (a gap)\n";
 }
 
 // Totals every run's event log into `procs` once the session has ended --
@@ -234,6 +240,7 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
     for (const auto& path : proc.log_paths) {
       if (std::filesystem::exists(event::log::CappedMarkerPath(path)))
         proc.log_capped = true;
+      bool gapped = false;
       // The segments a capped log kept, then the newest (LogSegmentFiles).
       for (const auto& file : event::log::LogSegmentFiles(path)) {
         // Streamed: shutdown memory does not grow with the logs' size.
@@ -241,10 +248,7 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
           const auto summary = event::log::SummarizeLog(file);
           proc.record_count += summary.record_count;
           if (!summary.damage.clean()) proc.failed = true;
-          // A gap the live row did not show (a run killed before a sample
-          // saw it, or a reporter that never sampled) is said here.
-          if (summary.gaps > 0 && proc.RecordLogGap())
-            PrintLogGap(proc.name, file);
+          if (summary.gaps > 0) gapped = true;
         } catch (const event::log::IncompleteLogHeader& e) {
           // Cut while it was being created: no records to count.
           std::cerr << "[launcher] skipping " << file << ": " << e.what()
@@ -253,6 +257,9 @@ int SummarizeLogs(std::vector<NodeProcessInfo>& procs,
           proc.failed = true;
         }
       }
+      // A gap the live row did not show (a reporter that never sampled it)
+      // is named here, once per run's log.
+      if (gapped && proc.RecordLogGap(path)) PrintLogGap(proc.name, path);
     }
     if (proc.exit_code != 0 && !exit_not_counted[i])
       exit_status = proc.exit_code;
@@ -1195,20 +1202,21 @@ bool Launcher::NoteRealtime(NodeProcessInfo& proc, NodeLaunch& launch,
 
 bool Launcher::NoteRecording(NodeProcessInfo& proc, NodeLaunch& launch,
                              uint32_t flags) {
-  const uint32_t fresh = flags & ~launch.recording_reported &
-                         (introspect::kFlagRecorderFailed |
-                          introspect::kFlagLogCapped | introspect::kFlagLogGap);
-  if (fresh == 0) return false;
-  launch.recording_reported |= fresh;
   const std::string& log =
       proc.log_paths.empty() ? proc.log_path : proc.log_paths.back();
+  // Once per run's log: each run that dropped records is named.
+  const bool gap =
+      (flags & introspect::kFlagLogGap) != 0 && proc.RecordLogGap(log);
+  if (gap) PrintLogGap(proc.name, log);
+  const uint32_t fresh =
+      flags & ~launch.recording_reported &
+      (introspect::kFlagRecorderFailed | introspect::kFlagLogCapped);
+  if (fresh == 0) return gap;
+  launch.recording_reported |= fresh;
   if ((fresh & introspect::kFlagRecorderFailed) != 0) {
     proc.failed = true;
     std::cerr << "[launcher] " << proc.name << " event log " << log
               << " failed; the rest of this run is not recorded\n";
-  }
-  if ((fresh & introspect::kFlagLogGap) != 0 && proc.RecordLogGap()) {
-    PrintLogGap(proc.name, log);
   }
   if ((fresh & introspect::kFlagLogCapped) != 0) {
     proc.log_capped = true;
@@ -1452,10 +1460,15 @@ void Launcher::Supervise(std::vector<NodeProcessInfo>& procs,
       // The run's counts as it ended, before EndRun closes the run. Studio's
       // bridge takes no row.
       if (registry && !(studio && i == studio->index())) {
+        uint32_t flags = 0;
         if (const auto loss =
                 FinalDeliveryCounts(*registry, proc.pid, options_.session_id,
-                                    launch.spawned_monotonic_ns))
+                                    launch.spawned_monotonic_ns, flags)) {
           proc.RecordDeliveryLoss(*loss);
+          // A run that ended before a supervision pass saw its row's event
+          // log flags (one killed during a gap) is marked from them here.
+          NoteRecording(proc, launch, flags);
+        }
       }
       proc.exited = true;
       proc.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;

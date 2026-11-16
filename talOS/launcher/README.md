@@ -633,16 +633,18 @@ has a gap (records dropped and marked while capture went on) also exits 1
 when stopped, and prints `recording_gaps=` and `records_lost=` on its exit
 line. The launcher prints one line per member and kind (for a capped log,
 whether it records on, deleting its oldest records, or stopped, which it
-tells by the segments beside the log; for a gap, `[launcher] <member> event
-log <log> lost records (a gap); the rest of this run is still recorded`),
-and marks the member in the live manifest: `recorder_failed` for a failed
+tells by the segments beside the log), and one per run whose log has a gap
+(`[launcher] <member> event log <log> lost records (a gap)`); it reads the
+row in each supervision pass and once more when it reaps the run, from the
+row the run left, so a run killed during a gap is marked too. It marks the
+member in the live manifest: `recorder_failed` for a failed
 log, `log_gap` and `recorder_failed` for one with a gap (a gapped log is
 incomplete evidence), `log_capped` for one whose byte share cost it records
 (its oldest segment deleted, or, with a share too small for two segments,
 capture stopped at the share). At normal shutdown it also marks a truncated,
 damaged or unreadable log `recorder_failed`, one holding a GAP record
-`log_gap` and `recorder_failed` (with the gap line, if the live row had not
-shown it: a run killed during a gap leaves no GAP record, only the row), and
+`log_gap` and `recorder_failed` (with the gap line, if the row had not
+shown it), and
 a capped one (`<log>.capped`) `log_capped`.
 
 A run reports in its registry row the realtime scheduling its loop asked for

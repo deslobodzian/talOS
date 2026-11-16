@@ -58,7 +58,8 @@ double ExpectedLogRate(const introspect::Description& declared,
 
 // The smallest log cap at which a member's log rotates rather than stops at
 // the cap: two segments, each its log's prefix (file header, manifest and
-// schemas) and its largest record (LogWriter's segment rule).
+// schemas) and its largest record, at least a GAP record
+// (event::log::GAP_RECORD_BYTES; LogWriter's segment rule).
 uint64_t SmallestRotatingShare(const introspect::Description& declared);
 
 // Shares of `budget` and the window they hold (see SplitLogBudget).
