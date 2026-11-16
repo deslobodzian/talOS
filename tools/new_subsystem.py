@@ -3655,6 +3655,10 @@ def plan_standalone(target_dir, name, lang, talos_root, kind="velocity",
         raise Refused(f"{talos_root} has no talos.bazelrc for the new "
                       "repository's .bazelrc to import; it is not a talOS "
                       "checkout this tool can build against")
+    if not os.path.isfile(os.path.join(talos_root, ".bazelversion")):
+        raise Refused(f"{talos_root} has no .bazelversion for the new "
+                      "repository to take its Bazel version from; it is not "
+                      "a talOS checkout this tool can build against")
     files[".bazelrc"] = (
         "# talOS's build flags, from the talOS checkout MODULE.bazel's\n"
         "# local_path_override names (the same path).\n"
