@@ -389,8 +389,8 @@ check_graph() {
 # anything when one does not run: absent from that PATH, or macOS's
 # /usr/bin/python3 without the Command Line Tools. It runs as the installer;
 # the service account reads the same PATH, and enable-boot checks the
-# account's access to the bundle. TALOS_DEPLOY_SERVICE_PATH replaces the
-# service manager's PATH (tests).
+# account's access to the bundle with that PATH's python3.
+# TALOS_DEPLOY_SERVICE_PATH replaces the service manager's PATH (tests).
 service_path() {
   if [ -n "${TALOS_DEPLOY_SERVICE_PATH:-}" ]; then
     printf '%s' "$TALOS_DEPLOY_SERVICE_PATH"
@@ -827,8 +827,10 @@ cmd_enable_boot() {
   fi
   # Check with the actual service identity, including ancestor traversal and
   # symlink targets. Never make the immutable bundle writable to fix access.
+  # The python3 the service's PATH resolves, as check_interpreters runs it,
+  # not the one on sudo's secure_path.
   run id -u "$user"
-  run sudo -u "$user" python3 -c '
+  run sudo -u "$user" env -i PATH="$(service_path)" python3 -c '
 import os, sys
 root = sys.argv[1]
 def require(path, mode):

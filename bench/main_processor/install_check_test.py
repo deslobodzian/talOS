@@ -6,6 +6,7 @@ accepts with a warning installs and shows it; a copy with a misspelled
 parameter is refused with the launcher's own finding, and `current` stays
 on the bundle installed before."""
 
+import getpass
 import os
 import select
 import shutil
@@ -223,6 +224,51 @@ class InstallCheckTest(unittest.TestCase):
             proc = install()
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertTrue(os.path.islink(os.path.join(prefix, "current")))
+
+    # REQ-OPS-48: enable-boot checks the service account's access to the
+    # bundle with the python3 the boot service's PATH resolves, not the one
+    # on sudo's secure_path. A `sudo` first on PATH runs `-u` commands as
+    # the caller (and refuses the rest, ending the run after the check); the
+    # service PATH's python3 records that it ran.
+    def test_enable_boot_checks_access_with_the_service_python(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            current = os.path.join(tmp, "prefix", "current")
+            os.makedirs(current)
+            with open(os.path.join(current, "run.sh"), "w",
+                      encoding="utf-8") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(os.path.join(current, "run.sh"), 0o755)
+            fake = os.path.join(tmp, "fake")
+            service_bin = os.path.join(tmp, "service_bin")
+            marker = os.path.join(tmp, "service_python_ran")
+            scripts = {
+                os.path.join(fake, "sudo"):
+                    '#!/bin/sh\n[ "$1" = "-u" ] || exit 1\nshift 2\n'
+                    'exec "$@"\n',
+                # macOS's check, before the account's: FileVault is off.
+                os.path.join(fake, "fdesetup"):
+                    "#!/bin/sh\necho 'FileVault is Off.'\n",
+                os.path.join(service_bin, "python3"):
+                    f"#!/bin/sh\necho \"$@\" > '{marker}'\n"
+                    f"exec '{os.path.realpath(sys.executable)}' \"$@\"\n",
+            }
+            for path, text in scripts.items():
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                os.chmod(path, 0o755)
+            proc = subprocess.run(
+                ["bash", deploy_script(), "enable-boot", "--prefix",
+                 os.path.join(tmp, "prefix"), "--user",
+                 getpass.getuser()],
+                env=dict(os.environ, TALOS_DEPLOY_SERVICE_PATH=service_bin,
+                         PATH=fake + os.pathsep + os.environ["PATH"]),
+                capture_output=True, text=True, timeout=60)
+            out = proc.stdout + proc.stderr
+            self.assertTrue(os.path.exists(marker), out)
+            with open(marker, encoding="utf-8") as f:
+                self.assertIn(current, f.read(), out)
+            self.assertNotIn("service account cannot", out)
 
     # REQ-OPS-48: a stop during install's copy (Ctrl-C, SIGTERM, SIGHUP to
     # deploy.sh) stops the copy's processes and removes the partial copy,
