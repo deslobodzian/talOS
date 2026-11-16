@@ -60,10 +60,12 @@ A failure prints the launch's output.
 
 Shared memory. The launch runs in the test's namespace (TEST_TMPDIR, which
 ShmObjectName maps every name into), so it never touches a robot's. The
-launcher unlinks its session's topics when it stops in order; the live
-registry it leaves for later sessions is unlinked by registry_unlink,
-which takes the name from ShmObjectName itself. A launch killed past its
-stop leaves its topics in the namespace.
+launcher unlinks its session's topics when it stops in order, and in a
+namespace also the live registry once its members are reaped
+(talOS/launcher/README.md "One session per namespace"). A launch killed
+past its stop leaves both: registry_unlink, which takes the name from
+ShmObjectName itself, removes the registry after every check, and the
+topics stay in the namespace.
 """
 
 import argparse

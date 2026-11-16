@@ -118,10 +118,12 @@ locked file, and the namespace's registry segment with its writer lock file,
 unless the registry's writer lock is held at that instant or a row is held
 by a running process outside the session (a node or tool run without the
 launcher; a row whose process is gone, such as a SIGKILLed node's of an
-earlier session, does not count). A namespace is rarely used twice, so these
-would otherwise stay in `/dev/shm` until reboot. Outside a namespace the
-ordinary names, one set per host that tools and hand-run nodes share, are
-left in place.
+earlier session, does not count). A namespace is rarely used twice, so the
+segment would otherwise stay in shared memory (`/dev/shm` on Linux) until
+reboot, and so would the lock files in the lock directory, except under
+Bazel, whose `TEST_TMPDIR` holds them and is removed with the test.
+Outside a namespace the ordinary names, one set per host that tools and
+hand-run nodes share, are left in place.
 
 Locking an existing lock file allocates nothing on disk; creating an absent
 one does. macOS empties `/tmp` at boot and keeps it on the same container as

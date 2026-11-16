@@ -241,11 +241,12 @@ void PrintLogGap(const std::string& member, const std::string& log) {
 // topic segments, removed when RunSession returns: the registry segment and
 // its writer lock file, once no row of the registry is held by a running
 // process of another session, and the session lock file. A namespace is
-// rarely used twice, so each would otherwise stay in /dev/shm (or
-// TEST_TMPDIR) until reboot. Not done
-// outside a namespace: there the ordinary names are one set per host, which
-// a node or tool run without a launcher may share. Skipped while an
-// exception unwinds, when members may still run.
+// rarely used twice, so each would otherwise stay until reboot: the segment
+// in shared memory, the lock files in introspect::LockDirectory() (but for
+// Bazel's TEST_TMPDIR, removed with the test). Not done outside a
+// namespace: there the ordinary names are one set per host, which a node or
+// tool run without a launcher may share. Skipped while an exception unwinds,
+// when members may still run.
 class NamespaceNames {
  public:
   NamespaceNames(const std::optional<SessionLock>& session_lock,
