@@ -265,22 +265,23 @@ recovery and what is synced to disk when, see [session segments and logs](../tal
 macOS charges the first exec, and first load, of every newly written
 executable file about 100 ms, one file at a time host-wide; the charge is per
 file and paid only by running or loading it, not by reading it. A fresh
-install of the 2026 robot's bundle (built in its own repository) is about 5,500 new files, and its first launch
-would pay that inside the launcher's per-probe `--describe` deadline
-([below](#supervision-and-service-recovery)), every probe at once: with
-other new executables being written on the Mac mini, `pose_estimator` (the
-bundle's Python interpreter and about 54 native libraries) took over 15 s
-alone, and the launch was refused.
+install is thousands of new files (2,347 in the Linux bundle of the
+two-mechanism robot [FIRST_MECHANISM.md](FIRST_MECHANISM.md) builds, 2,286
+of them its Python runtime), and a first launch would pay the charge of
+every file it runs or loads inside the launcher's per-probe `--describe`
+deadline ([below](#supervision-and-service-recovery)), every probe at once;
+a probe that missed its deadline on the Mac mini right after a build is in
+[BENCH_RESULTS.md](BENCH_RESULTS.md#2026-11-13) (MAC-2).
 
 So `install` and `rollback` run every member of the bundle they are about to
 select once, one at a time, from its final path: each `[[nodes]]` binary of
 `bundle_manifest.toml` and the `[studio]` bridge with
 `--describe --config <config_path>`, as the launcher's probe runs them, and
 the launcher with `--help`. On macOS one more member then loads every
-`.so` and `.dylib` in the bundle once (58 in the 2026 bundle), in a process
+`.so` and `.dylib` in the bundle once, in a process
 of its own, ignoring each failure: `--describe` imports no backend, so a
-node's first imports (about 2 s of `pose_estimator`'s numpy and wpimath)
-would otherwise still pay. dyld's first mapping of a file pays its charge
+node's first imports (a Python node's numpy, for one) would otherwise still
+pay. dyld's first mapping of a file pays its charge
 even when the load then fails on an unresolved symbol; reading the file or
 `codesign -v` does not. The loaded libraries' static initializers run in that
 process, nothing calls into them, and it exits without running a destructor.
@@ -289,9 +290,10 @@ first on `PATH`, Bazel's and Python's environment variables unset (as
 `run.sh` does), and `PYTHONDONTWRITEBYTECODE=1`, so the read-only bundle
 stays as installed even under sudo. A `--describe` run opens no topic,
 socket or registry row, so the warm-up touches no hardware and no network
-and can run beside a running robot. On the Mac mini it takes about 11 s
-(5 s without the native libraries), and the first launch then describes in
-under a second and constructs `pose_estimator` as fast as the second. A
+and can run beside a running robot. On the Mac mini it took about 11 s for
+the 2026 robot's 14-member bundle, 58 native libraries (about 4.5 s without
+them), and the first `--describe-only` after it 0.4 to 0.5 s idle
+([BENCH_RESULTS.md](BENCH_RESULTS.md#2026-11-13): DEPLOY-10, MAC-2). A
 member that exits nonzero, or is still running after 60 s (then its process group is killed),
 is a `deploy: warning: warm-up: <name>: ...` line and the command still
 succeeds: install's [graph check](#graph-check), and rollback's launch, judge
@@ -299,8 +301,7 @@ the members. A member that detaches a process
 into a new session (`setsid()`) leaves the group that kill reaches. Stopping
 `deploy.sh` during the warm-up (Ctrl-C, SIGTERM, SIGHUP) kills the running
 member's process group, selects nothing and exits 1. Linux has no such
-charge; the warm-up runs there too (0.4 s for the 2026 bundle on a Linux
-workstation). `--no-warm-up` skips it. After `install`, the
+charge; the warm-up runs there too. `--no-warm-up` skips it. After `install`, the
 [graph check](#graph-check) still runs every member and the launcher once,
 all at once inside the probes' deadline, so the first launch pays only, on
 macOS, each native library's first load; after `rollback`, which has no
@@ -341,8 +342,8 @@ check stops the launcher, selects nothing and exits 1.
 The check takes nothing a running robot holds: `--describe-only` takes no
 session lock, shared memory, registry row, controller link or realtime
 priority, and a `--describe` run opens no device, so it needs neither the
-RoboRIO nor a camera and can run beside a live session. It adds about 0.3 s
-for the 2026 bundle on a Linux workstation. `--no-warm-up` does not skip it;
+RoboRIO nor a camera and can run beside a live session. It adds one
+`--describe-only` to the install. `--no-warm-up` does not skip it;
 on macOS a fresh bundle's probes then pay the first-run charge inside their
 deadline, as its first launch would, so a probe that times out there is
 answered by installing again without `--no-warm-up`. There is no override:

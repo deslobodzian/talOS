@@ -29,7 +29,7 @@ repository, or `talos/` as a submodule; [robot repository](GLOSSARY.md)),
 - [ ] Run `./tools/deploy.sh enable-boot --user <service account>` (use `--dry-run` first to inspect; it uses sudo, including `pmset -a autorestart 1 sleep 0`). Expected: it ends with `boot-check` passing; bundle read/traversal checks pass as that account, `/opt/talos/logs` is owned by it with mode 0755, and the installed bundle remains read-only. Start as that account and verify a session manifest appears without permission repair.
 - [ ] Start exactly one launcher with `/opt/talos/current/run.sh --output-dir /opt/talos/logs`; stop any boot-managed instance first. Expected: nodes stay running and a unique `/opt/talos/logs/<session-id>/` logging session is created. The launcher appends the session id; pass the output root, not a session path. Do not edit the installed bundle; rebuild and reinstall configuration changes.
 - [ ] Run `./tools/deploy.sh logs` (add `--prefix` for a custom installation). Expected: session directories are listed oldest first by start time, each with its revision, match class and run outcomes, and the newest manifest identifies the deployed config hash, revision and node log paths. Retain that session and the RIO console output for every check below.
-- [ ] On a disposable session with a small `[robot] log_max_bytes`, exceed each event writer's share. Expected: control processes continue, each log keeps its newest records in whole-record segments within its share (the oldest `<stem>.segment<k>.tlog` deleted), the completed manifest reports `log_capped: true` for incomplete captures, and every capped member's kept records span between 7/8 of the session's log window and the window, a member storing more than its expected rate less (REQ-OPS-32; `log_dump` on the session directory: each process's first record; the window is `talos.log`'s `Event-log window` line). Every roster member, the Studio bridge included, also writes `<name>.log` (its stdout and stderr), up to 64 MiB per member per session outside the event-log share (and the launcher's own `talos.log` up to 64 MiB), and each recording camera up to its `[recording] max_bytes` of frames. Older sessions count all of it within the other half of `log_max_bytes`, except the 16 newest matches, which only a disk without room for the next session (retention's free floor) removes: size the disk by the [retention sizing](../talOS/launcher/README.md#session-segments-and-logs), and after a session in which retention removed anything read its `retention.txt`.
+- [ ] On a disposable session with a small `[robot] log_max_bytes`, exceed each event writer's share. Expected: control processes continue, each log keeps its newest records in whole-record segments within its share (the oldest `<stem>.segment<k>.tlog` deleted), the completed manifest reports `log_capped: true` for incomplete captures, and every capped member's kept records span between 7/8 of the session's log window and the window, a member storing more than its expected rate less (REQ-OPS-32; `log_dump` on the session directory: each process's first record; the window is `talos.log`'s `Event-log window` line). Every roster member, the Studio bridge included, also writes `<name>.log` (its stdout and stderr), up to 64 MiB per member per session outside the event-log share (and the launcher's own `talos.log` up to 64 MiB), and each recording camera up to its frame recorder's `max_bytes` ([frame recording](#vision-frame-recording-and-replay)). Older sessions count all of it within the other half of `log_max_bytes`, except the 16 newest matches, which only a disk without room for the next session (retention's free floor) removes: size the disk by the [retention sizing](../talOS/launcher/README.md#session-segments-and-logs), and after a session in which retention removed anything read its `retention.txt`.
 - [ ] For live inspection, use the Studio the installed bundle serves: the boot service's `run.sh` starts its bridge ([DEPLOYMENT.md](DEPLOYMENT.md#build-a-bundle)). The bundle carries the `studio_bridge` binary and the Studio webroot ([DEPLOYMENT.md](DEPLOYMENT.md#build-a-bundle)); a session log line saying the bundle carries no Studio means it was built without them. Open `http://127.0.0.1:5800` and select Studio's system view. Expected: live node rows, source selections and loop timing are visible. Run only one bridge; follow its [operating limits and load probe](../studio/bridge/README.md#websocket-operating-limits) on the field link with other traffic.
 
 ## Camera capture check
@@ -55,6 +55,11 @@ on an idle host, and the capture thread below the node loops (`nice 10`) when
 run inside a node. Timing from a busy host is not evidence (TESTING.md §6).
 
 ## Camera intrinsics calibration
+
+The camera keys and status fields named below (`camera.device`,
+`frame_timeout_us`, `stall_count`, ...) are those of the 2026 robot's camera
+node (its own repository), an example of a node built on `talOS/vision`;
+another node names its own.
 
 1. With the robot disabled and the camera at its deployment focus and resolution,
    generate a ChArUco board:
@@ -108,25 +113,25 @@ run inside a node. Timing from a busy host is not evidence (TESTING.md §6).
    or rotation, align camera observations against independent odometry/gyro
    history; repeat both directions and several speeds to distinguish a time
    shift from fixed mounting bias. A timestamped LED/blink exposure test is an
-   alternative. Set `[camera] latency_offset_us` in that camera's TOML to the
-   measured nonnegative delay (default 0, finite and below 1,000,000 µs).
-   This offset applies to every stamp kind, after the kind's own correction:
-   V4L2 SOE adds half exposure; EOF subtracts half exposure plus configured
-   `readout_us` (default zero if unknown). Exposure contributes only when
-   requested controls succeeded and auto exposure is off. uvcvideo cameras'
-   SOE-labelled stamps are host arrival times and get no exposure correction.
-   Do not subtract processing delay already excluded by a hardware timestamp.
-   Rebuild/redeploy and repeat the motion check: timestamp alignment should
-   improve, and status `last_latency_us` now includes the correction. Leave
-   `sim_timestamp_lag_us = 0` on the robot; it is a sim-only injection, ignored
-   live, not a calibration setting.
-7. Set positive `camera.exposure_ms` / `camera.gain` for manual capture (or
-   explicitly set `auto_exposure` / `auto_gain`). On Linux a control the
-   camera lacks, refuses or cannot hold fails the open, naming it in the
-   node's log; `v4l2-ctl -d <device> -L` lists what it offers. Check with
+   alternative. Give the measured nonnegative delay to the camera node as
+   the `latency_offset_ns` that `talOS/vision/frame.h`'s `CaptureMidpoint`
+   subtracts (under the key its node reads). The offset applies to every
+   stamp kind, after the kind's own correction: start of exposure (V4L2 SOE)
+   adds half the exposure; end of frame (EOF) subtracts the readout time
+   plus half the exposure. uvcvideo cameras' SOE-labelled stamps are host
+   arrival times (`V4L2TimestampKind`, `talOS/vision/capture/v4l2_source.h`)
+   and get no exposure correction. Do not subtract processing delay already
+   excluded by a hardware timestamp. Rebuild/redeploy and repeat the motion
+   check: timestamp alignment should improve.
+7. Give the camera node positive manual exposure and gain (or automatic
+   exposure and gain): the `exposure_ms`, `gain`, `auto_exposure` and
+   `auto_gain` of `talOS/vision/camera_source.h`'s `CameraControls`, under
+   the keys its node reads. On Linux a control the camera lacks, refuses or
+   cannot hold fails the open, naming it in the node's log;
+   `v4l2-ctl -d <device> -L` lists what it offers. Check with
    `v4l2-ctl -d <device> -C auto_exposure,exposure_time_absolute,gain` while
-   the node runs. On macOS confirm status `controls_applied = true` and
-   `control_failure_count = 0`; AVFoundation does not expose custom
+   the node runs. On macOS confirm that the source's `controls_applied()` is
+   true, as the node reports it; AVFoundation does not expose custom
    duration/ISO, so manual requests report failure there. Verify with a
    blink/motion test rather than assuming a configured value reached hardware.
 8. Test a USB stall/unplug while disabled. With a connected source,
@@ -144,12 +149,14 @@ Brown–Conrady model (no rational/thin-prism extensions).
 
 ## Vision frame recording and replay
 
-With `recording.enabled = true` (the default) and a session directory, cameras
-record available frames as 8-bit grayscale PNGs with detection-context JSON
-sidecars in `<session>/frames/<camera>/`. Capture must be configured and recorder
-initialization must succeed. Recording is rate-limited by `recording.sample_hz`
-and `recording.rejected_hz` and capped by `recording.max_bytes` (oldest pairs
-deleted first). Fetch a session with `./tools/deploy.sh fetch` as usual; the
+A camera node that records with `talOS/vision/recording`'s `FrameRecorder`
+writes frames as 8-bit grayscale PNGs with detection-context JSON sidecars
+under the directory it gives, `<session>/frames/<camera>/` by convention
+(the node's [`session_dir()`](NODE_DEVELOPMENT_GUIDE.md#node), so nothing is
+recorded without a session). The recorder is rate-limited by its
+`sample_hz` and `rejected_hz` (1 each by default) and capped by `max_bytes`
+(256 MiB per camera by default), deleting the oldest pairs first; whether a
+node records, and the keys that set these, are the node's. Fetch a session with `./tools/deploy.sh fetch` as usual; the
 frames come along. Re-run the detector and localization offline over a camera's
 frames with:
 

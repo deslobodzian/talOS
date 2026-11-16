@@ -15,13 +15,13 @@ the constructor; `update()` runs every period.
 | `node.subscribe<M>(topic, fn, talos::Wake::kAtDrain)` | `node.subscribe(M, topic, callback=fn, wake=talos.Wake.AT_DRAIN)` | every message to the callback, in sequence, at the node's next drain; wakes nothing ([when messages arrive](#when-messages-arrive)) |
 | `node.publish<M>(topic)` | `node.publish(M, topic)` | |
 | `node.param<T>("key")`, `param<T>("key", fallback)` | `node.param("key")`, `param("key", fallback)` | this subsystem's TOML keys; dotted keys reach nested tables and an index reaches an array element (`"geometry.modules[0].x_m"`; past the end is absent). `T`: `bool`, integers, `double`, `std::string`, and TOML arrays as `std::vector<std::string>` / `std::vector<double>` (integer elements convert; `[]` is valid). Python returns arrays as `list[str]` / `list[float]`; a list default asks for an array. A wrong element type is an error naming the key and element index |
-| `node.param_of<T>("sub", "key")`, `param_of<T>("sub", "key", fallback)` | `node.param_of("sub", "key")`, `param_of("sub", "key", fallback)` | the same, read-only, from another subsystem's table (`[subsystems.<sub>]`), for a value that subsystem owns so it is configured once (the pose estimator reads the drivetrain's module offsets). Constructor only: later it throws `std::logic_error` (`TalosError`). A subsystem the config lacks is an error even with a fallback, so the node fails construction and its launcher `--describe` probe |
+| `node.param_of<T>("sub", "key")`, `param_of<T>("sub", "key", fallback)` | `node.param_of("sub", "key")`, `param_of("sub", "key", fallback)` | the same, read-only, from another subsystem's table (`[subsystems.<sub>]`), for a value that subsystem owns so it is configured once (a pose estimator reading the drivetrain's module offsets, for one). Constructor only: later it throws `std::logic_error` (`TalosError`). A subsystem the config lacks is an error even with a fallback, so the node fails construction and its launcher `--describe` probe |
 | `node.every(period, fn)` | `node.every(seconds, fn)` | extra timer |
 | `name()`, `now()`, `tick()`, `period()`, `simulation()`, `config_path()` | same, as properties (seconds) | |
 | `now().nanos()` | `node.now_ns` | the node clock in integer ns, for a message time such as `sample_time_ns` (`round(node.now * 1e9)` is exact only below 2^51 ns, 26 days of node clock) |
 | `session_dir()` → `std::optional<std::filesystem::path>` | `node.session_dir` → `str \| None` | the session output directory the launcher started this node under (the parent of `--log`), `nullopt`/`None` without `--log` (tests) and in every offline run, `--log` or not (`--describe`, `--replay`, `--replay-inputs`). Nodes that record per-session artifacts (e.g. vision frame recording) write under `<session_dir>/<artifact>/`; state a node keeps per session or across restarts (an autonomous node's routine selection and progress, for one) is gated on it, so a replay never reads or writes the robot's copy |
 | `trajectory_path("name")` → `std::filesystem::path` | `node.trajectory_path("name")` → `str` | the absolute path of this subsystem's [`[trajectories]`](#parameters) entry; an undeclared name is an error naming the subsystem and `trajectories.<name>` |
-| `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (the pose estimator imports neither wpimath nor gtsam then). Validate every parameter and declare every subscription and publication either way: the endpoints must be identical, since the launcher builds the graph from the probe, and it [compares each run's live endpoints with the probe](../talOS/launcher/README.md#live-endpoints) and refuses a run that differs |
+| `describing()` → `bool` | `node.describing` → `bool` | true only while the binary builds the node for `--describe`, the launcher's probe, which has a deadline (`--describe-timeout-ms`) and never runs `update()`, `every()` or a callback; false under `Sim`, `--sim`, `--replay` and on the robot (a `talos.cpp_node` shares its host's node). Use it to skip building heavy native backends (a pose estimator need not import wpimath or GTSAM then). Validate every parameter and declare every subscription and publication either way: the endpoints must be identical, since the launcher builds the graph from the probe, and it [compares each run's live endpoints with the probe](../talOS/launcher/README.md#live-endpoints) and refuses a run that differs |
 | `sub.value()`, `sub->field()`, `has_value()` | `sub.value` (`None` before the first), `has_value` | |
 | `sub.fresh()`, `fresh(max_age)`, `age()`, `updated()` | `sub.fresh()`, `fresh(max_age)`, `age`, `updated` | fresh: younger than `[robot] command_timeout_us` |
 | `pub.send(M{...})` | `pub.send(field=value, ...)` or `send(message)` | Python names every field, as the C++ constructor takes every one: an omitted field raises `TypeError` naming it (also for `TargetLane.send`, `sim.publish`, `sim.publish_target`) |
@@ -44,7 +44,8 @@ key, the file that sets it and the nearest declared key
 (`config::kFrameworkSubsystemKeys`: `node`, `period_us`, `motors`,
 `targets`, ...) are not parameters. So read every key a config may set in
 the constructor, including those of a branch the config does not select (the
-pose estimator validates both backends' tables); a key read only in
+2026 robot's pose estimator, in its own repository, validates both
+backends' tables); a key read only in
 `update()` or a callback is undeclared, and a table read without `param`
 declares nothing.
 
@@ -97,8 +98,8 @@ sees:
   than 1023 unread between two drains are lost (counted as dropped). The
   2026 robot's `driver` takes `/drivetrain/state` headings this way: the
   drivetrain's 5 ms ticks never wake it, and an invalid state cannot hide the
-  valid one before it. The pose estimator queues its camera frames this way
-  for `update()` to fuse.
+  valid one before it. A `--type estimator` scaffold queues its camera
+  observations this way for `update()` to fuse.
 - A **latest-value read** (`subscribe(topic)`, no callback) keeps only the
   newest message per drain: for a value read at the tick whose intermediate
   values do not matter.
@@ -117,7 +118,7 @@ loop thread under a realtime policy chosen by its tier
 (`hardware_node`) is the highest tier; a node on the actuation path, whose own
 subsystem owns a motor, digital output or PWM output or which writes a target
 lane (`teleop`, a driver or autonomous node), is a control node; every other node
-(telemetry, cameras, the pose estimator, Python observers) is an observer.
+(telemetry, cameras, a pose estimator, Python observers) is an observer.
 
 - Linux: `SCHED_FIFO` priority 49 for the bridge, 45 for control nodes and 40
   for observers, so a runnable loop preempts every loop of a lower tier. All
@@ -232,7 +233,7 @@ blocked for life), inherits the blocked signals.
 built, before its loop runs: everything alive after construction (modules,
 config, the node and what its constructor built) moves to the collector's
 permanent generation, and later collections scan only objects allocated
-since. For the pose estimator (about 33 000 tracked objects after
+since. For the 2026 robot's pose estimator, in its own repository (about 33 000 tracked objects after
 construction with the Kalman backend, 53 000 with the factor graph) a full
 collection drops from 1.9–2.5 ms (4.9 ms for the first in a run) to under
 15 µs, and the longest middle-generation collection from about 0.25 ms to
