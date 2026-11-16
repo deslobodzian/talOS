@@ -112,8 +112,8 @@ def mapped_library(argv, library, cwd):
     loads, or None where this host has no probe. Linux: the node runs until
     its /proc/<pid>/maps shows the library (the loader maps it before main)
     or it exits, then is stopped. macOS: the node is described with dyld
-    printing each image it loads. NOT RUN ON macOS YET: the dyld branch is
-    unverified."""
+    printing each image it loads, one line each: "dyld[PID]: <UUID> PATH",
+    PATH absolute."""
     env = {k: v for k, v in CLEAN_ENV.items()
            if not k.startswith(("LD_", "DYLD_"))}
     suffix = os.sep + library
@@ -122,7 +122,7 @@ def mapped_library(argv, library, cwd):
                               env=dict(env, DYLD_PRINT_LIBRARIES="1"),
                               capture_output=True, text=True, timeout=120)
         assert proc.returncode == 0, proc.stderr
-        paths = [line.split(" ", 1)[1].strip()
+        paths = [line[line.index(" /") + 1:].rstrip()
                  for line in proc.stderr.splitlines()
                  if line.startswith("dyld[") and line.rstrip().endswith(suffix)]
         assert paths, proc.stderr
