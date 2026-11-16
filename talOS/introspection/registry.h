@@ -184,8 +184,8 @@ inline constexpr std::chrono::seconds kConstructionTimeout{30};
 // mirrors LogWriter::failed() -- the disk refused a write or the log file
 // could not be created, so the rest of the run is not recorded --
 // kFlagLogCapped mirrors capped(), the log reaching its byte budget, and
-// kFlagLogGap (below) mirrors gaps() > 0, records dropped and marked by a
-// GAP record while capture went on. Set while the node runs
+// kFlagLogGap (below) mirrors gaps() > 0, records dropped while capture
+// went on. Set while the node runs
 // (NodeRegistration::set_recording) and never cleared: each says what the
 // run's log lost, which stays lost; a new claim starts without them.
 inline constexpr std::uint32_t kFlagRecorderFailed = 1u << 3;
@@ -233,8 +233,10 @@ static_assert((kFlagOutputsHeld & kFlagRealtimeMask) == 0,
               "outcome");
 
 // The node's event log has a gap: records its writer could not take were
-// dropped, and capture resumed after a GAP record marking them (LogWriter
-// gaps() > 0). An event log flag (above): set by set_recording, never
+// dropped (LogWriter gaps() > 0). Capture resumes after a GAP record that
+// marks them; the bit is set from the moment the gap opens, so a run killed
+// or stopped by a disk failure or its byte cap during one has the bit and no
+// GAP record. An event log flag (above): set by set_recording, never
 // cleared.
 inline constexpr std::uint32_t kFlagLogGap = 1u << 14;
 static_assert((kFlagLogGap & kFlagRealtimeMask) == 0,

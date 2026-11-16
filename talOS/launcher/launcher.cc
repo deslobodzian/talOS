@@ -215,7 +215,6 @@ LogSplit LogBudgets(const std::vector<NodeProcessInfo>& procs,
   return SplitLogBudget(session_log_budget, logs, rates, floors);
 }
 
-// The one line a member whose event log has a gap gets (RecordLogGap).
 // The one line each gapped run's log gets (NodeProcessInfo::RecordLogGap).
 // It says no more than that records were lost: a stall that lasts until the
 // stop leaves nothing recorded after the gap, and a run killed during one
