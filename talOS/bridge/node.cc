@@ -1206,6 +1206,7 @@ int HardwareNode::Run(int duration_s) {
       if (!wait.ignore_input) ++wakeups_.deadline;
       continue;
     }
+    if (seams_.before_wait != nullptr) seams_.before_wait();
     const auto reason = poller_->wait_until(event::MonotonicTime::from_nanos(
         static_cast<std::int64_t>(until_us * 1000)));
     if (reason == event::Poller::WakeReason::DEADLINE) {
