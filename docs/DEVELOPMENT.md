@@ -120,11 +120,10 @@ touch; after a failed build those steps are SKIPPED. **A push of more
 than 20 commits runs `tools/prepush.sh --full`**: without it, such a range
 (since the branch's upstream; with none, the commits on no remote-tracking
 branch) is reported first as the step `full` SKIPPED, the other steps still
-run, and the run exits nonzero. Every robot
-and example config's
-`--describe-only` runs as its `talos_graph_test` (the bundle test's
-fixture, `bench/main_processor/bundle_testdata`, has only a
-`manifest_sync_test`). Beyond those, it differs from CI in three places
+run, and the run exits nonzero. Every robot and example config's
+`--describe-only` runs as its `talos_graph_test`, the bundle test's fixture
+`bench/main_processor/bundle_testdata` included. Beyond those, it differs
+from CI in three places
 where the host decides, and says which applies: where the host refuses an unprivileged network namespace it
 leaves `TALOS_REQUIRE_NETNS=1` unset, so
 `//talOS/protocol:udp_address_change_test` may skip where CI fails it;

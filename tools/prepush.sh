@@ -138,6 +138,11 @@ start=$SECONDS
 # One run at a time owns the worktree path.
 # The pid file appears whole (written beside it, then renamed), so a lock
 # without one is being taken, or its run was killed while taking it.
+# A dead holder's lock is retaken under a second lock, $lock.retake, which
+# is held until the new pid is written: two runs that both read the dead pid
+# cannot both remove and retake it, since the second finds the retake lock
+# (or, after it, a live pid).
+write_pid() { echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; }
 if ! mkdir "$lock" 2>/dev/null; then
   [ -f "$lock/pid" ] ||
     die "$lock has no pid yet: another prepush is starting (if none is, rmdir $lock)"
@@ -145,11 +150,22 @@ if ! mkdir "$lock" 2>/dev/null; then
   if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
     die "another prepush (pid $holder) is using $wt"
   fi
+  mkdir "$lock.retake" 2>/dev/null ||
+    die "another prepush is retaking $lock from a dead run (if none is, rmdir $lock.retake)"
+  # Under the retake lock: the lock must still be the dead holder's.
+  if [ "$(cat "$lock/pid" 2>/dev/null || true)" != "$holder" ]; then
+    rmdir "$lock.retake"
+    die "another prepush took $lock first"
+  fi
   rm -rf "$lock"
-  mkdir "$lock" 2>/dev/null || die "cannot take $lock"
+  if ! { mkdir "$lock" 2>/dev/null && write_pid; }; then
+    rmdir "$lock.retake"
+    die "cannot take $lock"
+  fi
+  rmdir "$lock.retake"
+else
+  write_pid || die "cannot write $lock/pid"
 fi
-{ echo $$ > "$lock/pid.$$" && mv -f "$lock/pid.$$" "$lock/pid"; } ||
-  die "cannot write $lock/pid"
 
 bazel_started=0
 remove_worktree() {

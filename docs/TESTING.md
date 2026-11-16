@@ -431,7 +431,8 @@ copy contents, `shutil.copyfile`), test results never cached from an
 earlier run, and no host package headers: Bazel's autodetected toolchain
 searches `/usr/include`, so an include that no declared dependency provides
 compiles against a workstation's installed package and fails in CI
-(`tools/check_host_includes.py` reads the build's `.d` files for it).
+(`tools/check_host_includes.py`, which CI's Linux job runs after its
+build, reads the build's `.d` files for it).
 `tools/prepush.sh`, the pre-push rung
 ([DEVELOPMENT.md §5](DEVELOPMENT.md#5-verification-ladder)), reproduces
 them. CI's source lints (test time, links, requirement trace, node test
