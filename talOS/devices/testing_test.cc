@@ -564,17 +564,62 @@ TEST_F(SimHardwareTest, ADisconnectedMotorsTemperatureReadsZeroAt500Ms) {
   EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
 }
 
-// REQ-DEV-07: a rebooted RoboRIO has never received the temperature signal
-// of a motor that has been disconnected since before the reboot, so it
-// reads 0 at once.
-TEST_F(SimHardwareTest, ARebootForgetsADisconnectedMotorsTemperature) {
+// REQ-DEV-07, REQ-CONTRACT-32: a disconnected motor's frames stopped, as
+// PhoenixBackend::Read reads it: its FaultField's limit bits hold until that
+// field is kFaultFieldMaxAgeUs (50 ms) old, then clear; its position and
+// velocity ages, and a disconnected CANcoder's, grow from the last State that
+// read it connected (the age injected then, plus the sample time since).
+// Reconnected, it reads its injected ages and switches again.
+TEST_F(SimHardwareTest, ADisconnectedDeviceAgesAsPhoenixReportsIt) {
+  hw.set_motor("mech", "braked", 0, 0, 3000, 1000);
+  hw.set_cancoder("mech", "angle", 0, 0, 2000, 4000);
+  hw.set_limit_switches("mech", "braked", true, false);
+  sim.step(5ms);
+  const std::uint64_t read_us = State().sample_time_us;
+  ASSERT_EQ(Motor("braked").fault_flags, hardware::kMotorForwardHardLimitFlag);
+  hw.set_connected("mech", "braked", false);
+  hw.set_connected("mech", "angle", false);
+  // The sample time steps 1 µs from 49 999 to 50 000 across one 5 ms tick:
+  // the latency grows by 4999 µs, under a period.
+  sim.step(45ms);
+  hw.set_gateway_clock(0us, 1us);
+  sim.step(5ms);
+  ASSERT_EQ(State().sample_time_us - read_us, 49'999u);
+  EXPECT_FALSE(Motor("braked").valid);
+  EXPECT_EQ(Motor("braked").fault_flags, hardware::kMotorForwardHardLimitFlag);
+  EXPECT_EQ(Motor("braked").position_age_us, 3000u + 49'999u);
+  EXPECT_EQ(Motor("braked").velocity_age_us, 1000u + 49'999u);
+  EXPECT_EQ(Sensor("angle").position_age_us, 2000u + 49'999u);
+  EXPECT_EQ(Sensor("angle").velocity_age_us, 4000u + 49'999u);
+  hw.set_gateway_clock(0us, 5000us);
+  sim.step(5ms);
+  ASSERT_EQ(State().sample_time_us - read_us, 50'000u);
+  EXPECT_EQ(Motor("braked").fault_flags, 0u);
+  EXPECT_EQ(Motor("braked").position_age_us, 3000u + 50'000u);
+  EXPECT_EQ(Sensor("angle").velocity_age_us, 4000u + 50'000u);
+  hw.set_connected("mech", "braked", true);
+  hw.set_connected("mech", "angle", true);
+  sim.step(5ms);
+  EXPECT_EQ(Motor("braked").fault_flags, hardware::kMotorForwardHardLimitFlag);
+  EXPECT_EQ(Motor("braked").position_age_us, 3000u);
+  EXPECT_EQ(Sensor("angle").velocity_age_us, 4000u);
+}
+
+// REQ-DEV-07: a rebooted RoboRIO has never received a frame from a device
+// that has been disconnected since before the reboot: its temperature reads
+// 0, its limit bits clear and its ages are unknown at once.
+TEST_F(SimHardwareTest, ARebootForgetsADisconnectedMotorsLastSample) {
   hw.set_motor("mech", "braked", 0, 0, 0, 0, 62.5);
+  hw.set_limit_switches("mech", "braked", true, true);
   sim.step(5ms);
   ASSERT_DOUBLE_EQ(Motor("braked").temperature_c, 62.5);
   hw.set_connected("mech", "braked", false);
   hw.reboot();
   sim.step(5ms);
   EXPECT_DOUBLE_EQ(Motor("braked").temperature_c, 0.0);
+  EXPECT_EQ(Motor("braked").fault_flags, 0u);
+  EXPECT_EQ(Motor("braked").position_age_us,
+            std::numeric_limits<std::uint32_t>::max());
 }
 
 // The RoboRIO reports a CANcoder's absolute position with

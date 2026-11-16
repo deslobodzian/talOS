@@ -604,7 +604,10 @@ ReleaseTarget<ShooterTarget>(sim, "shooter", "teleop");
 `SimHardware` also has `set_motor`, `set_digital_input`, `set_analog_input`,
 `set_encoder`, `set_cancoder`, `set_gyro`, `set_driver_station`,
 `stop_driver_station()` (the DS goes silent), `set_connected(node, device,
-false)` (the device reports disconnected), `reset_device(node, device)` (the
+false)` (the device reports disconnected; as on the RoboRIO, a motor's or CAN
+sensor's ages grow from the last State that read it connected and a motor's
+limit bits clear 50 ms after it; the robot counts the 50 ms from the fault
+signal's last frame, so it can clear them sooner), `reset_device(node, device)` (the
 gateway reports that motor, CANcoder or gyro reset and masks it, with its
 followers and remote-sensor consumers, for two States; any other name throws),
 `lose_states(count)` (the next gateway ticks publish nothing), `reboot()` (a
