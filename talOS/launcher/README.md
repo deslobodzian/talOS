@@ -903,7 +903,11 @@ naming the log and the sign, and the launcher exits 1: one with a
 `log_capped`, a run's log without its EXIT record of a member it marks
 `log_gap` or `recorder_failed` ([session manifest](#session-manifest)), and
 one whose damaged
-records nothing bounds the time of. See
+records nothing bounds the time of. A damaged stretch in another reader's
+log of a topic is no loss only where an intact receipt of the topic follows
+it in that file and the session's other logs (the writer's sends) hold
+every message that reader could have lost there
+([the rule](../events/README.md#replaying-another-sessions-inputs)). See
 [input replay](../events/README.md#replaying-another-sessions-inputs) for
 timing and schema checks.
 

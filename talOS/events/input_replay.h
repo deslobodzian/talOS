@@ -51,6 +51,11 @@ struct RecordedTopic {
   // (a watcher receives in sequence order); both counted along the log
   // across its segments (a later segment starts from the one before it,
   // when read). Where nothing bounds it, the log is refused instead (below).
+  // A reader's stretch, in a log other than the replayed program's, costs
+  // nothing where the session's logs hold every message of the topic whose
+  // sequence lies between its intact receipts around the stretch (from 0
+  // when none precedes it; never when none follows it in its file): the
+  // writer's sends restore all it could have lost.
   std::optional<MonotonicTime> first_gap;
   std::string first_gap_log;
   // Where that loss is a damaged stretch: its byte offset in first_gap_log.
@@ -63,7 +68,9 @@ struct RecordedTopic {
   // (its byte offset) before which no receipt bounds the topic's lost
   // records (the replayed program's own receipts, fed at their drains'
   // event times, which need not follow the log's order; a reader's topic
-  // with no intact receipt before it). Empty when none.
+  // with no intact receipt before it, unless an intact receipt of it
+  // follows the stretch in its file and the session's logs hold every
+  // message of the topic before that receipt's sequence). Empty when none.
   std::string refused_log;
   std::string refused_reason;
 };
@@ -98,7 +105,9 @@ struct RecordedMessage {
 // A log with a GAP record (log/format.h), or a damaged stretch (records lost
 // between intact ones, log::LogDamage::spans), lost records there: each
 // topic notes the earliest such loss in a log it is fed from (first_gap),
-// which is where ReplayInputs ends a run that feeds it. When the replayed
+// which is where ReplayInputs ends a run that feeds it, except a reader's
+// stretch whose lost receipts the session's other logs all hold (first_gap
+// says how). When the replayed
 // program's own log has a loss before any timer firing, run_start() comes
 // from the first firing after it, never before the loss's start less that
 // timer's offset: no replayed timer then fires before it, as none did live.

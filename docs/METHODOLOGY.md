@@ -269,7 +269,10 @@ Rules:
   ends there, names the log, and exits 1; a feeding log that is capped, a
   run's log without its EXIT of a member the session manifest marks
   `log_gap` or `recorder_failed`, or one whose damage nothing bounds is refused before the node
-  runs. **[enforced:
+  runs; another reader's damage is no loss only where an intact receipt
+  follows it and the session's other logs hold what it lost
+  ([rule](../talOS/events/README.md#replaying-another-sessions-inputs)).
+  **[enforced:
   `input_replay_test`, `replay_inputs_test`]**
 - **Restart safety.** A node can be restarted mid-match (`max_restarts`). Its
   initial state must be safe with every input present: an actuator node
