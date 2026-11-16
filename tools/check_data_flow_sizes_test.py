@@ -23,12 +23,12 @@ def doc(payload="1432", serialized="10,227"):
 
 
 class CheckDataFlowSizesTest(unittest.TestCase):
-    # RULES.md 9
+    # REQ-DEV-35, RULES.md 9
     def test_matching_doc_passes(self):
         sizes = check_data_flow_sizes.parse_sizes(SIZES)
         self.assertEqual(check_data_flow_sizes.check(sizes, doc()), [])
 
-    # RULES.md 9
+    # REQ-DEV-35, RULES.md 9
     def test_differing_missing_and_unknown_sizes_fail(self):
         sizes = check_data_flow_sizes.parse_sizes(SIZES + "state.bytes 1419\n")
         text = doc(payload="1400") + "<!-- size: gone.bytes -->12\n"
@@ -39,7 +39,7 @@ class CheckDataFlowSizesTest(unittest.TestCase):
              "docs/DATA_FLOW.md:3: gone.bytes is no size the code prints",
              "docs/DATA_FLOW.md: no marker states state.bytes (1419)"])
 
-    # RULES.md 9
+    # REQ-DEV-35, RULES.md 9
     def test_marker_without_a_number_fails(self):
         sizes = check_data_flow_sizes.parse_sizes(SIZES)
         text = doc() + "<!-- size: frame.max_payload_bytes --> B\n"
@@ -48,7 +48,7 @@ class CheckDataFlowSizesTest(unittest.TestCase):
             ["docs/DATA_FLOW.md:3: frame.max_payload_bytes's marker has no "
              "number"])
 
-    # RULES.md 9: the real doc against the compiled sizes.
+    # REQ-DEV-35, RULES.md 9: the real doc against the compiled sizes.
     def test_data_flow_doc_states_the_code_sizes(self):
         sizes_text = subprocess.run(
             [os.environ["DATA_FLOW_SIZES"]], check=True, capture_output=True,
