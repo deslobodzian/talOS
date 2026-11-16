@@ -18,7 +18,8 @@ configuration and pushes it to the gateway as chunked `kHardwareConfig`
 frames; `Endpoint` reassembles them, starts `Gateway::BeginReconfigure`, and
 answers with a `kHardwareConfigAck` when the worker finishes. An ACK whose
 send fails is sent again at the start of each later tick until a send
-succeeds or a newer ACK replaces it, and `Endpoint::Tick` returns the failure,
+succeeds or a newer transfer completes (only the newest completed transfer's
+ACK goes out), and `Endpoint::Tick` returns the failure,
 so the RoboRIO program replaces a socket that can no longer send. A push
 completed while a configure is still pending (every boot restore) is dropped
 without an ACK; the bridge pushes again after its 50 ms retry gate. The

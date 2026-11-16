@@ -525,6 +525,85 @@ TEST(Endpoint, SendsAgainAConfigAckWhoseSendFailed) {
   }
 }
 
+// An ACK still unsent when a newer transfer completes into a pending
+// configure answers a superseded push and is never sent: only the pending
+// configure's ACK goes out. Here the bridge, hearing no answer to a push
+// whose configure failed, pushes the same configuration again; the stale
+// failure ACK arriving during that configure would double its push backoff.
+// REQ-CONTRACT-04
+TEST(Endpoint, DropsAnUnsentAckOnceANewerTransferBeginsConfiguring) {
+  class SwitchingBackend : public FakeBackend {
+   public:
+    void BeginConfigure(const Config& config) override {
+      if (!pending) {
+        FakeBackend::BeginConfigure(config);
+        return;
+      }
+      started = true;
+    }
+    ConfigureStatus PollConfigure() override {
+      if (!pending) return FakeBackend::PollConfigure();
+      return complete ? ConfigureStatus::kDone : ConfigureStatus::kPending;
+    }
+    bool pending{}, started{}, complete{};
+  } backend;
+  backend.configure_ok = false;
+  Gateway gateway{backend, 3012};
+  Endpoint endpoint{gateway};
+  Companion companion;
+  ASSERT_TRUE(companion.Connect(endpoint));
+  const int endpoint_fd = companion.EndpointFd();
+  ASSERT_GE(endpoint_fd, 0) << "the endpoint's socket was not found";
+  const auto cfg = SwerveConfig(true);
+  const auto push = [&] {
+    for (const auto& chunk : CreateConfigChunks(cfg)) {
+      ASSERT_EQ(companion.SendFrame(protocol::FrameType::kHardwareConfig,
+                                    protocol::kFlagNone, 1000, chunk.data(),
+                                    chunk.size()),
+                protocol::UdpStatus::kOk);
+    }
+  };
+  // The first push's configure fails at once; its failure ACK cannot leave.
+  ASSERT_EQ(::shutdown(endpoint_fd, SHUT_WR), 0);
+  push();
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(2000, false);
+    return backend.configure_calls == 1;
+  }));
+  ASSERT_FALSE(gateway.configured());
+  // The second begins a configure that stays pending.
+  backend.pending = true;
+  push();
+  ASSERT_TRUE(Eventually([&] {
+    endpoint.Tick(3000, false);
+    return backend.started;
+  }));
+  ASSERT_TRUE(gateway.configuring());
+
+  // Sends work again; ticks while the configure is pending send no ACK.
+  ASSERT_EQ(endpoint.Reopen(), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(companion.Reconnect());
+  ASSERT_EQ(endpoint.Tick(4000, false), protocol::UdpStatus::kOk);
+  protocol::DecodedFrame frame;
+  while (companion.Receive(&frame) == protocol::UdpStatus::kOk) {
+    EXPECT_NE(frame.header.type, protocol::FrameType::kHardwareConfigAck)
+        << "an ACK went out while the newest push was still configuring";
+    State state;
+    if (frame.header.type == protocol::FrameType::kHardwareState &&
+        Decode({frame.payload, frame.payload_size}, state) &&
+        state.sample_time_us == 4000)
+      break;
+  }
+  backend.complete = true;
+  ASSERT_EQ(endpoint.Tick(5000, false), protocol::UdpStatus::kOk);
+  ASSERT_TRUE(
+      companion.Receive(protocol::FrameType::kHardwareConfigAck, &frame));
+  ConfigAckPayload ack{};
+  ASSERT_TRUE(DecodeConfigAck({frame.payload, frame.payload_size}, ack));
+  EXPECT_EQ(ack.status, ConfigAckStatus::kOk);
+  EXPECT_EQ(ack.config_id, ConfigurationId(cfg));
+}
+
 // The ACK is a frame type, not a flag: its header flags stay zero no matter
 // which incoming sequence it answers.
 TEST(Endpoint, ConfigAckFlagsIgnoreIncomingSequence) {
