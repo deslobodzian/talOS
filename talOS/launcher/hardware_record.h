@@ -110,21 +110,14 @@ std::string SessionConfigPath(const std::string& config,
 std::optional<DeviceNames> LoadDeviceNames(const std::string& path,
                                            std::string& error);
 
-// One recorded Packet decoded with its wire codec: `state` for kState,
-// `command` for kCommand, `driver_station` for kDriverStation.
+// One recorded Packet decoded with its wire codec (HardwareProtocolCheck::Add):
+// `state` for kState, `command` for kCommand, `driver_station` for
+// kDriverStation.
 struct HardwarePacket {
   hardware::State state;
   hardware::Command command;
   driver_station::DriverStationData driver_station;
 };
-
-// Decodes one recorded Packet payload (sizeof(hardware::Packet) bytes) into
-// `out`. Empty on success, else why it does not decode: a payload of the
-// wrong size, a Packet size past its buffer, or bytes the codec rejects.
-// Reads only inside `payload`; never throws.
-std::string DecodeHardwareRecord(HardwareRecord kind,
-                                 std::span<const std::byte> payload,
-                                 HardwarePacket& out);
 
 // The hardware protocol versions a session records (see above).
 struct RecordedProtocol {
@@ -226,18 +219,6 @@ class HardwareProtocolCheck {
   std::set<std::string, std::less<>> sent_;
   HardwarePacket scratch_;
 };
-
-// The names log_dump gives these values, shared so every tool spells them
-// alike.
-const char* HardwareModeName(hardware::Mode mode);
-// "off" (no pulse) or "pulse".
-const char* PwmModeName(hardware::PwmMode mode);
-const char* CanBusReadStateName(hardware::CanBusReadState state);
-// The mode the Driver Station selected (its flags), whether or not the robot
-// is enabled in it: "teleop", "autonomous", "test" or "none".
-const char* DriverStationModeName(std::uint32_t flags);
-const char* AllianceName(driver_station::Alliance alliance);
-const char* MatchTypeName(driver_station::MatchType type);
 
 // The JSON object for one recorded Packet payload (sizeof(hardware::Packet)
 // bytes). Never throws: a payload of the wrong size or one the codec rejects
