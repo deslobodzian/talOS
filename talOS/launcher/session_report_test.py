@@ -194,6 +194,29 @@ class SessionReportTest(unittest.TestCase):
         self.assertIn("| bridge request to command hardware_node | NOT MEASURED | — | — | — |",
                       session_report.markdown(report).splitlines())
 
+        # A gap at the head of lift's log, before its first kept request:
+        # a request carrying observation 1 could be lost there, so the
+        # 0.25 ms sample is no measurement.
+        report = session_report.analyze({"nodes": []}, traffic[:2] + [gap("lift", 2, 2, 1)])
+        self.assertIsNone(report["bridge_request_to_command"]["latency"])
+
+        # The bridge drops only the Driver Station packet disabling the robot
+        # at 50 ms and keeps its States; until its next kept packet, at 70 ms,
+        # the bit is unknown, so 55 -> 70 ms is neither enabled nor disabled,
+        # and a lane dispatched at 60 ms is not one dispatched while enabled
+        # (Target never selecting it is no FAIL).
+        def ds(now, enabled):
+            return record("hardware_node", "SEND", "/hw/state/driver_station", now,
+                          ds_enabled=enabled)
+        hidden = [ds(0, True), ds(70, False), gap("hardware_node", 50, 50, 1)]
+        hidden += [record("hardware_node", "SEND", "/hw/state", t) for t in range(0, 105, 5)]
+        lane_at_60 = dict(lane, now_ms=60, event_ms=60, publish_ms=60)
+        report = session_report.analyze({"nodes": []}, hidden + [lane_at_60])
+        # 0 -> 45 ms only: 45 -> 55 ms meets the gap in the State log too.
+        self.assertEqual(report["state_enabled"]["count"], 9)
+        self.assertEqual({v["measurement"]: v["verdict"] for v in report["verdicts"]}
+                         ["target age at tick"], "NOT MEASURED")
+
         # An alert's active span across its stream's gap still counts as an
         # activation, but its clearing record could be lost: it is not timed.
         def status(publish, active):
@@ -205,6 +228,41 @@ class SessionReportTest(unittest.TestCase):
             "level": "error", "stream": "watchdog/SEND", "first_active_ms": 20,
             "activations": 1, "longest_ms": None, "total_ms": None,
             "active_at_end": False, "spans_across_gap": 1})
+
+    # REQ-OPS-16: a row of one-record samples spans no gap, but the samples a
+    # gap dropped are missing: lift lost the READs of a slow stretch, so the
+    # worst age it shows is not the worst it had, and the row says so where
+    # it is read. A manifest's log_gap (a run killed during a gap leaves no
+    # GAP record) still names the member under --strict.
+    def test_rows_of_a_process_that_lost_records_say_so(self):
+        def record(kind, topic, now, age_ms=0):
+            return dict(process="lift", kind=kind, topic=topic, now_ms=now, event_ms=now - 1,
+                        publish_ms=now - age_ms, decoded="")
+        def gap(first, last, records):
+            return dict(process="lift", kind="GAP", topic="?", now_ms=last + 1,
+                        event_ms=first, publish_ms=0, decoded="", gap={
+                            "start_ms": first, "end_ms": last + 1, "first_lost_ms": first,
+                            "last_lost_ms": last, "records": records, "cause": "pool_full",
+                            "closed_at_flush": False})
+        session = [record("READ", "/lift/target/teleop", 10, 12),
+                   record("TIMER", "update", 10), gap(20, 40, 5), gap(60, 60, 2)]
+        manifest = {"end_wall_ns": 1, "nodes": [
+            {"name": "lift", "log_path": "/s/lift.tlog", "log_gap": True,
+             "recorder_failed": False}]}
+        report = session_report.analyze(manifest, session)
+        details = {v["measurement"]: v["detail"] for v in report["verdicts"]}
+        lost = "; lift lost 7 records in 2 log gaps"
+        for name in ("target age at tick", "timer lateness"):
+            with self.subTest(row=name):
+                self.assertTrue(details[name].endswith(lost), details[name])
+        self.assertIn("lift lost 7 records in 2 log gaps: its target receipt, target at "
+                      "tick and timer rows lack the samples those held.",
+                      session_report.markdown(report).splitlines())
+        self.assertIn("lift: log_gap", session_report.strict_failures(report))
+        # Without a gap, nothing is appended.
+        quiet = session_report.analyze({"nodes": []}, session[:2])
+        self.assertNotIn("lost", {v["measurement"]: v["detail"]
+                                  for v in quiet["verdicts"]}["timer lateness"])
 
     # REQ-RT-20, REQ-OPS-16: an owner timeout's neutral command adopts State
     # S; the node resumes with a request observing S after that command. The

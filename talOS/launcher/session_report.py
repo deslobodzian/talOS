@@ -229,8 +229,9 @@ def request_to_command(records, spans=None):
     observation (the heartbeat) is no reaction, and one no request carried by
     then (a timeout's neutral command adopting the State, even if a request
     observing that State follows it) is skipped. A sample spans from the
-    request before that first one in its node's request stream (where an
-    earlier request carrying the observation could be missing) to the
+    request before that first one in its node's request stream, or the
+    stream's start (where an earlier request carrying the observation could
+    be missing), to the
     command; it is unmeasured, and counted, when that span meets a log gap
     (lost_spans) of the bridge or of any node whose requests were searched."""
     requests, commands, process = [], [], None
@@ -245,11 +246,13 @@ def request_to_command(records, spans=None):
         elif r["topic"] == "/hw/command":
             commands.append((r["now_ms"], key))
             process = r["process"]
-    # Each observation's first request, and the request before it in its stream.
+    # Each observation's first request, and the request before it in its
+    # stream (the log's start before its first: a gap at its head could hold
+    # one).
     first_request, last = {}, {}
     for now, request_stream, key in sorted(requests, key=lambda q: q[0]):
         if key not in first_request:
-            first_request[key] = (now, last.get(request_stream, now))
+            first_request[key] = (now, last.get(request_stream, -math.inf))
         last[request_stream] = now
     logs = {process} | {request_stream[0] for _, request_stream, _ in requests}
     delays, seen, unmeasured = [], set(), 0
@@ -414,6 +417,21 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
         if r["kind"] == "TIMER":
             timers.setdefault(r["process"] + ":" + r["topic"], []).append(
                 r["now_ms"] - r["event_ms"])
+
+    def processes(rows):
+        return {key.split(":", 1)[0] for key in rows}
+
+    def lost_samples(names):
+        # No one-record sample spans a gap, but a gap of its process's log
+        # dropped samples: say so where the row is read.
+        return "".join(f"; {name} lost {lost['records']} records in {lost['gaps']} log gaps"
+                       for name, lost in records_lost.items() if name in names)
+    # Per process, the records its log's gaps dropped and how many gaps.
+    records_lost = {}
+    for gap in sorted(gap_list, key=lambda g: g["process"]):
+        lost = records_lost.setdefault(gap["process"], {"records": 0, "gaps": 0})
+        lost["records"] += gap["records"]
+        lost["gaps"] += 1
     status_source, status_records = stream(records, "/hw/status")
     for r in status_records:
         for field, value in scalars(r["decoded"]).items():
@@ -481,11 +499,12 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
     # Without the enabled bit a lane Target never selected cannot be found,
     # so the worst selected age alone would pass a session that has one.
     verdict("target age at tick", worst is not None or bool(unselected),
-            worst is not None and not unselected and worst[0] <= TARGET_AGE_LIMIT_MS, detail,
+            worst is not None and not unselected and worst[0] <= TARGET_AGE_LIMIT_MS,
+            detail + lost_samples(processes(targets) | processes(tick_ages)),
             needs_hardware=True)
     verdict("timer lateness", False, False,
-            "Measured where TIMER dispatches exist; no acceptance threshold is specified.",
-            required=False)
+            "Measured where TIMER dispatches exist; no acceptance threshold is specified."
+            + lost_samples(processes(timers)), required=False)
     bridge, bridge_delays, across_bridge = request_to_command(records, spans)
     # The enabled-only rows above stay required (REQ-RT-15); in a session
     # that never enabled they cannot be measured, which is no tool fault.
@@ -566,8 +585,9 @@ def analyze(manifest, records, log_damage=(), output_drops=None, hardware_not_de
                             "Capped, truncated or unfinished sessions cannot establish whole-session acceptance; retain raw logs."],
             # Only in a session with a log gap, so a session without one
             # reports exactly as before: every gap (log_dump's `gap` member
-            # and its process), and the intervals each row left unmeasured.
-            **({"log_gaps": gap_list,
+            # and its process), each process's records lost and gaps, and
+            # the intervals each row left unmeasured.
+            **({"log_gaps": gap_list, "records_lost": records_lost,
                 "intervals_across_gaps": {"state_overall": across_state,
                                           "state_enabled": across_state + across_ds,
                                           "bridge_request_to_command": across_bridge}}
@@ -647,6 +667,13 @@ def markdown(report):
             lines.append(f"{n['name']} timer lateness: NOT MEASURED (no TIMER dispatches).")
     if not bridge["process"]:
         lines.append("Bridge request to command: NOT MEASURED (no /hw/command SEND records).")
+    sampled = {key.split(":", 1)[0] for rows in ("target_receipt_age", "target_age_at_tick",
+                                                 "timer_lateness") for key in report[rows]}
+    for name, lost in report.get("records_lost", {}).items():
+        if name in sampled:
+            lines.append(f"{name} lost {lost['records']} records in {lost['gaps']} log gaps: "
+                         "its target receipt, target at tick and timer rows lack the samples "
+                         "those held.")
     across = report.get("intervals_across_gaps", {}).get("bridge_request_to_command")
     if across:
         lines.append(f"Bridge request to command: {across} samples across a log gap "

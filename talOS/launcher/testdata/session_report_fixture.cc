@@ -114,10 +114,7 @@ int DisabledBridgeSession(const std::string& directory) {
   bridge.flush();
   motor.flush();
   // A gap no mode asked for is a fixture fault, as a failed write is.
-  return bridge.failed() || motor.failed() || bridge.gaps() > 0 ||
-                 motor.gaps() > 0
-             ? 1
-             : 0;
+  return bridge.incomplete() || motor.incomplete() ? 1 : 0;
 }
 
 // The default session's log (see main), as one node "fixture" recorded it;
@@ -196,7 +193,7 @@ bool RecordFixtureLog(const std::string& directory, bool foreign) {
   writer.dispatch(read, {});
   writer.flush();
   // A gap no mode asked for is a fixture fault, as a failed write is.
-  return !writer.failed() && writer.gaps() == 0;
+  return !writer.incomplete();
 }
 
 }  // namespace

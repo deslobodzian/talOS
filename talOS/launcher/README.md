@@ -1713,17 +1713,23 @@ measured when it meets (closed at both ends) a lost span of a log it reads:
 |---|---|---|
 | `/hw/state` overall and enabled | two consecutive records of the selected stream | that stream's process |
 | enabled or not (enabled rows, and an active lane "while enabled" for target age at tick) | from the Driver Station record whose bit is held (from the log's start before the first) to the interval's end or the lane's time | the Driver Station stream's process: such an interval is neither enabled nor disabled |
-| bridge request to command | from the request before the first one carrying the observation in that node's `/hw/request/<node>` stream (where an earlier request carrying it could be missing) to the command | the bridge's, and that of every node that sent a request |
+| bridge request to command | from the request before the first one carrying the observation in that node's `/hw/request/<node>` stream, or from the log's start before that stream's first request (where an earlier request carrying it could be missing), to the command | the bridge's, and that of every node that sent a request |
 | alert active time | an alert's active span (publication times) | its status stream's process; the span still counts as an activation, but is not timed (`spans_across_gap` in `--json`, NOT MEASURED when no span is left) |
 
 Target receipt age, target age at the tick and timer lateness each read one
-record, and the `/hw/status` counter deltas difference cumulative counts, so a
-gap changes none of them (a counter reset inside one goes uncounted); the
-report counts no missed ticks or overruns. A row whose intervals all meet a
-gap is NOT MEASURED, never a pass, and its detail (or, for request to
-command, a line under the timing table) names how many intervals were left
-out; `--json` gives the counts in `intervals_across_gaps`. A session without
-a gap reports exactly as before, with neither key.
+record, so no value of theirs spans a gap, but the samples a gap dropped are
+missing: their worst value is the worst the log kept, not the worst the run
+had. For a process whose log has a gap, the target age at tick and timer
+lateness details end with `; <process> lost <n> records in <m> log gaps`,
+and a line under the timing table says its receipt, target at tick and timer
+rows lack those samples (`records_lost` in `--json`). The `/hw/status`
+counter deltas difference cumulative counts, so a gap leaves them whole but
+for a counter reset inside one, which goes uncounted; the report counts no
+missed ticks or overruns. A row whose intervals all meet a gap is NOT
+MEASURED, never a pass, and its detail (or, for request to command, a line
+under the timing table) names how many intervals were left out; `--json`
+gives the counts in `intervals_across_gaps`. A session without a gap reports
+exactly as before, with none of these keys.
 
 Median “about 5 ms” uses an explicitly labeled 4–6 ms analysis tolerance; p99
 must be below 10 ms. `--strict` exits 2 unless every required verdict is PASS
